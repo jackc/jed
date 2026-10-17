@@ -1,0 +1,153 @@
+# timestamp(p) / timestamptz(p) / interval qualifier typmods through the catalog (spec/design/
+# timestamp.md §8, interval.md §6.1): jed_columns and jed_type_fields show PostgreSQL's format_type
+# spelling with jed's canonical names (timestamp(3), timestamptz(0), interval day to second(3),
+# interval(2), interval year), a declared precision above 6 shows as 6 (PostgreSQL reduces it too,
+# with a warning jed has no channel for), CREATE TABLE AS keeps the typmod a column reference or a
+# typmod cast carries (PostgreSQL's exprTypmod — create-table-as.md §2), ALTER COLUMN TYPE re-rounds
+# the stored values, and a constant DEFAULT is stored rounded. jed-specific catalog text, so
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: introspect.columns, introspect.type_fields, ddl.create_table, ddl.create_table_as, ddl.alter_table, ddl.primary_key, ddl.column_default, dml.insert, query.select, query.where_eq, query.order_by, query.union, query.cte, query.derived_table, cast.explicit, types.i32, types.timestamp, types.timestamptz, types.interval, types.composite, types.timestamp_precision, types.interval_qualifier
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a timestamp(3), b timestamptz(0), c timestamp(6), d timestamp(9), e interval day to second(3), f interval(2), g interval year, h interval minute to second, i interval, j timestamp)
+
+query IT nosort
+SELECT ordinal, type FROM jed_columns WHERE table_name = 't' ORDER BY ordinal
+----
+1
+i32
+2
+timestamp(3)
+3
+timestamptz(0)
+4
+timestamp(6)
+5
+timestamp(6)
+6
+interval day to second(3)
+7
+interval(2)
+8
+interval year
+9
+interval minute to second
+10
+interval
+11
+timestamp
+
+# p > 6 stores like 6
+statement ok
+INSERT INTO t (id, d) VALUES (1, '2020-01-01 00:00:00.1234567')
+
+query T nosort
+SELECT d FROM t WHERE id = 1
+----
+2020-01-01 00:00:00.123457
+
+# --- CREATE TABLE AS keeps the typmod a column or a typmod cast carries --------------------------
+statement ok
+CREATE TABLE c1 AS SELECT a, b, e, f, g, j::timestamp(1) AS j1, a + interval '1 day' AS a1, i::interval hour AS ih, e AS e2 FROM t
+
+query IT nosort
+SELECT ordinal, type FROM jed_columns WHERE table_name = 'c1' ORDER BY ordinal
+----
+1
+timestamp(3)
+2
+timestamptz(0)
+3
+interval day to second(3)
+4
+interval(2)
+5
+interval year
+6
+timestamp(1)
+7
+timestamp
+8
+interval hour
+9
+interval day to second(3)
+
+# through a CTE and a derived table too
+statement ok
+CREATE TABLE c3 AS WITH w AS (SELECT a, e FROM t) SELECT w.a, d.e FROM w, (SELECT e FROM t) d
+
+query IT nosort
+SELECT ordinal, type FROM jed_columns WHERE table_name = 'c3' ORDER BY ordinal
+----
+1
+timestamp(3)
+2
+interval day to second(3)
+
+# a set operation keeps a typmod only when every arm agrees
+statement ok
+CREATE TABLE c2 AS SELECT a AS same, a AS mixed FROM t UNION ALL SELECT a, c FROM t
+
+query IT nosort
+SELECT ordinal, type FROM jed_columns WHERE table_name = 'c2' ORDER BY ordinal
+----
+1
+timestamp(3)
+2
+timestamp
+
+# --- ALTER COLUMN TYPE changes the typmod and re-rounds the stored values ------------------------
+statement ok
+CREATE TABLE al (id i32 PRIMARY KEY, ts timestamp, iv interval)
+
+statement ok
+INSERT INTO al VALUES (1, '2020-01-01 00:00:00.5', '1 day 02:03:04.5')
+
+statement ok
+ALTER TABLE al ALTER COLUMN ts TYPE timestamp(0), ALTER COLUMN iv TYPE interval day to minute
+
+query TT nosort
+SELECT ts, iv FROM al
+----
+2020-01-01 00:00:01
+1 day 02:03:00
+
+query IT nosort
+SELECT ordinal, type FROM jed_columns WHERE table_name = 'al' ORDER BY ordinal
+----
+1
+i32
+2
+timestamp(0)
+3
+interval day to minute
+
+# --- a constant DEFAULT is stored rounded ---------------------------------------------------------
+statement ok
+CREATE TABLE df (id i32 PRIMARY KEY, ts timestamp(1) DEFAULT '2020-01-01 00:00:00.75', iv interval hour DEFAULT '1 day 02:03')
+
+statement ok
+INSERT INTO df (id) VALUES (1)
+
+query TT nosort
+SELECT ts, iv FROM df
+----
+2020-01-01 00:00:00.8
+1 day 02:00:00
+
+query T nosort
+SELECT column_default FROM jed_columns WHERE table_name = 'df' AND name = 'ts'
+----
+'2020-01-01 00:00:00.8'
+
+# --- a composite field shows its typmod -----------------------------------------------------------
+statement ok
+CREATE TYPE stamp AS (at timestamp(2), dur interval hour to second(1))
+
+query IT nosort
+SELECT ordinal, type FROM jed_type_fields WHERE type_name = 'stamp' ORDER BY ordinal
+----
+1
+timestamp(2)
+2
+interval hour to second(1)

@@ -345,6 +345,36 @@ fn parse_wall(input: &str, type_name: &str) -> Result<Wall> {
     Ok(Wall::Finite(micros, offset_secs))
 }
 
+/// Microseconds from the Unix epoch (jed's) to 2000-01-01 (PostgreSQL's), where PostgreSQL's
+/// typmod rounding takes its sign.
+const PG_EPOCH_MICROS: i64 = 946_684_800 * MICROS_PER_SEC;
+
+/// The largest `timestamp(p)` / `timestamptz(p)` precision (PostgreSQL's
+/// `MAX_TIMESTAMP_PRECISION`); a larger declared precision is reduced to it.
+pub const MAX_TIMESTAMP_PRECISION: u8 = 6;
+
+/// Round a timestamp / timestamptz to `precision` fractional-second digits — PostgreSQL's
+/// `AdjustTimestampForTypmod` (spec/design/timestamp.md §8). Half rounds away from zero measured
+/// from PostgreSQL's 2000-01-01 epoch, so `1985-06-01 12:00:00.5` rounds down to `12:00:00` and
+/// `2005-06-01 12:00:00.5` up to `12:00:01`. `±infinity` and precision 6 pass through. A result
+/// that leaves the range (or lands on an infinity sentinel) is 22008.
+pub fn adjust_timestamp_for_typmod(micros: i64, precision: u8) -> Result<i64> {
+    if micros == NEG_INFINITY || micros == POS_INFINITY || precision >= MAX_TIMESTAMP_PRECISION {
+        return Ok(micros);
+    }
+    let scale = 10i128.pow(u32::from(MAX_TIMESTAMP_PRECISION - precision));
+    let offset = scale / 2;
+    let t = i128::from(micros) - i128::from(PG_EPOCH_MICROS);
+    let rounded = if t >= 0 {
+        (t + offset) / scale * scale
+    } else {
+        -((-t + offset) / scale * scale)
+    };
+    i64::try_from(rounded + i128::from(PG_EPOCH_MICROS))
+        .map_err(|_| field_overflow("timestamp out of range"))
+        .and_then(|m| finite_instant(m).map_err(|_| field_overflow("timestamp out of range")))
+}
+
 /// Parse a `timestamp` (zoneless) literal: an offset in the text is accepted and ignored.
 pub fn parse_timestamp(s: &str) -> Result<i64> {
     parse(s, "timestamp")

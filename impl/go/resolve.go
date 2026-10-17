@@ -946,7 +946,7 @@ func bindParamsWithLabels(supplied []Value, types []colType, labels []string, iz
 		if ty.isScalar() {
 			// A text value bound to a timestamptz parameter reads an offset-less string in the session
 			// zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
-			v, err = storeValue(supplied[i], ty.Scalar, nil, nil, false, labels[i], iz)
+			v, err = storeValue(supplied[i], ty.Scalar, typmod{}, false, labels[i], iz)
 		} else {
 			v, err = bindContainerParam(supplied[i], ty, labels[i], iz)
 		}
@@ -998,7 +998,7 @@ func bindContainerParam(v Value, ty colType, label string, iz *inputZone) (Value
 		}
 		return RangeValue(out), nil
 	}
-	return coerceForStore(v, ty, nil, nil, false, label, iz)
+	return coerceForStore(v, ty, typmod{}, false, label, iz)
 }
 
 // coerceRangeParamBound coerces a bound range value's finite bound to the element type (nil, an
@@ -1007,7 +1007,7 @@ func coerceRangeParamBound(b *Value, elem scalarType, label string, iz *inputZon
 	if b == nil {
 		return nil, nil
 	}
-	v, err := storeValue(*b, elem, nil, nil, false, label, iz)
+	v, err := storeValue(*b, elem, typmod{}, false, label, iz)
 	if err != nil {
 		return nil, err
 	}
@@ -2331,7 +2331,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			params.noteInputZone(iz)
 			return node, rt, positionError(err, e.Pos)
 		}
-		target, _, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
+		target, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -2343,7 +2343,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			}
 		}
 		iz := s.catalog.inputZone()
-		node, rt, err := coerceStringLiteral(e.TypeLitText, target, nil, nil, iz)
+		node, rt, err := coerceStringLiteral(e.TypeLitText, target, typmod{}, iz)
 		params.noteInputZone(iz)
 		return node, rt, positionError(err, e.Pos)
 	case exprScalarSubquery:
@@ -2581,9 +2581,19 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 					"casting to a composite type is only supported from a string literal")
 			}
 		}
-		target, typmod, varcharLen, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
+		target, tm, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
 		if err != nil {
 			return nil, resolvedType{}, err
+		}
+		decTypmod, varcharLen := tm.Decimal, tm.VarcharLen
+		// A timestamp(p) / timestamptz(p) / qualified-interval target rounds or cuts the converted
+		// value — PostgreSQL's timestamp_scale / interval_scale (timestamp.md §8, interval.md §6.1):
+		// a non-literal operand gets a scaling reCast over its conversion.
+		scale := func(node *rExpr) *rExpr {
+			if tm.Temporal == nil {
+				return node
+			}
+			return &rExpr{kind: reCast, operand: node, result: target, temporal: tm.Temporal}
 		}
 		// A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the
 		// same primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The
@@ -2601,7 +2611,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			iz := s.catalog.inputZone()
 			// The literal's input error points at the literal (PostgreSQL coerces it at parse time —
 			// spec/design/error-fields.md §10.2).
-			node, rt, err := coerceStringLiteral(in.Literal.Str, target, typmod, varcharLen, iz)
+			node, rt, err := coerceStringLiteral(in.Literal.Str, target, tm, iz)
 			params.noteInputZone(iz)
 			return node, rt, positionError(err, in.Pos)
 		}
@@ -2728,7 +2738,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
-				return pinner, resolvedTypeOf(target), nil
+				return scale(pinner), resolvedTypeOf(target), nil
 			}
 			inner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 			if err != nil {
@@ -2739,12 +2749,13 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			case ity.kind == rtNull:
 				return inner, toRt, nil
 			case ity.kind == rtTimestamp && target.IsTimestamp(),
-				ity.kind == rtTimestamptz && target.IsTimestamptz(),
-				ity.kind == rtDate && target.IsDate():
+				ity.kind == rtTimestamptz && target.IsTimestamptz():
+				return scale(inner), ity, nil
+			case ity.kind == rtDate && target.IsDate():
 				return inner, ity, nil
 			case ity.kind == rtTimestamp || ity.kind == rtTimestamptz || ity.kind == rtDate:
 				params.nonimmutable = params.nonimmutable || ity.kind == rtTimestamptz || target == scalarTimestamptz
-				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
+				return scale(&rExpr{kind: reDateConvert, operand: inner, result: target}), toRt, nil
 			case ity.kind == rtText:
 				// The runtime text → date / timestamp / timestamptz casts (date.md §6, types.md §5):
 				// a NON-literal text source (a string LITERAL operand was already folded by the
@@ -2753,7 +2764,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				// zone. STABLE, not immutable — like PostgreSQL's date_in / timestamp_in /
 				// timestamptz_in — so it flags the plan non-immutable (42P17 in an index expression).
 				params.nonimmutable = true
-				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
+				return scale(&rExpr{kind: reDateConvert, operand: inner, result: target}), toRt, nil
 			default:
 				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to " + target.CanonicalName())
 			}
@@ -2770,18 +2781,22 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
-				return pinner, resolvedType{kind: rtInterval}, nil
+				return scale(pinner), resolvedType{kind: rtInterval}, nil
 			}
 			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
 			switch ity.kind {
-			case rtNull, rtInterval:
+			case rtNull:
 				return rinner, resolvedType{kind: rtInterval}, nil
+			case rtInterval:
+				return scale(rinner), resolvedType{kind: rtInterval}, nil
 			case rtText:
+				// A qualified target cuts the parsed text (interval.md §6.1), so the one reCast both
+				// parses and scales.
 				params.nonimmutable = true
-				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtInterval}, nil
+				return &rExpr{kind: reCast, operand: rinner, result: target, temporal: tm.Temporal}, resolvedType{kind: rtInterval}, nil
 			default:
 				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to interval")
 			}
@@ -2819,7 +2834,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			// literal uses. A string LITERAL operand was already coerced above, so a text source
 			// here is non-literal (a column / expression).
 			if (ity.kind == rtInt && ity.intTy == scalarInt32) || ity.kind == rtNull || ity.kind == rtBool || ity.kind == rtText {
-				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod, trap: castTrapClass(ity, target, typmod)},
+				return &rExpr{kind: reCast, operand: inner, result: target, typmod: decTypmod, trap: castTrapClass(ity, target, decTypmod)},
 					resolvedType{kind: rtBool}, nil
 			}
 			return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to boolean")
@@ -2827,7 +2842,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if ity.kind == rtBool {
 			// boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
 			if target == scalarInt32 {
-				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod, trap: castTrapClass(ity, target, typmod)},
+				return &rExpr{kind: reCast, operand: inner, result: target, typmod: decTypmod, trap: castTrapClass(ity, target, decTypmod)},
 					resolvedType{kind: rtInt, intTy: scalarInt32}, nil
 			}
 			return nil, resolvedType{}, typeError("cannot cast boolean to " + target.CanonicalName())
@@ -2875,7 +2890,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// float cast is explicit (spec/design/float.md Â§6) â the only implicit float edge,
 		// f32->f64, is the tower, never a CAST.
 		resultRt := resolvedTypeOf(target)
-		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod, trap: castTrapClass(ity, target, typmod)}, resultRt, nil
+		return &rExpr{kind: reCast, operand: inner, result: target, typmod: decTypmod, trap: castTrapClass(ity, target, decTypmod)}, resultRt, nil
 	case exprUnary:
 		if e.Unary.Op == opNeg {
 			rop, ty, err := resolve(s, e.Unary.Operand, ctx, ag, params)
@@ -3440,24 +3455,32 @@ func combineDerivList(s *scope, args []exprNode) (deriv, error) {
 	return d, nil
 }
 
-// typmod is a query output column's type modifier (spec/design/create-table-as.md §2): the
-// numeric(p,s) precision and scale, or the varchar(n) length, that a `CREATE TABLE … AS` column keeps.
-// Both nil is no typmod. Only a decimal or text scalar carries one; an array's element typmod is not
-// tracked (an array column cannot declare one — array.md §12). The zero value is no typmod.
+// typmod is a type modifier — a column's, a cast target's, or a query output column's
+// (spec/design/create-table-as.md §2): the numeric(p,s) precision and scale, the varchar(n) length,
+// or the timestamp precision / interval qualifier and precision, that a `CREATE TABLE … AS` column
+// keeps. All nil is no typmod. Only a decimal, text, timestamp, timestamptz, or interval scalar
+// carries one; an array's element typmod is not tracked (an array column cannot declare one —
+// array.md §12). The zero value is no typmod.
 type typmod struct {
 	Decimal    *decimalTypmod
 	VarcharLen *uint32
+	Temporal   *temporalTypmod
 }
 
 // columnTypmod is a column's declared typmod (a catalog column, or a synthetic one that recorded its
 // body's).
 func columnTypmod(col *catColumn) typmod {
-	return typmod{Decimal: col.Decimal, VarcharLen: col.VarcharLen}
+	return typmod{Decimal: col.Decimal, VarcharLen: col.VarcharLen, Temporal: col.Temporal}
 }
 
 // fieldTypmod is the typmod of a composite field (PostgreSQL's FieldSelect keeps it).
 func fieldTypmod(f *compositeField) typmod {
-	return typmod{Decimal: f.Decimal, VarcharLen: f.VarcharLen}
+	return typmod{Decimal: f.Decimal, VarcharLen: f.VarcharLen, Temporal: f.Temporal}
+}
+
+// colFieldTypmod is the typmod of a resolved composite field (the codec/coercion path's view of one).
+func colFieldTypmod(f *colField) typmod {
+	return typmod{Decimal: f.Typmod, VarcharLen: f.VarcharLen, Temporal: f.Temporal}
 }
 
 // equal reports whether two typmods are the same (by value — the pointers may differ).
@@ -3468,12 +3491,15 @@ func (t typmod) equal(o typmod) bool {
 	if t.Decimal != nil && *t.Decimal != *o.Decimal {
 		return false
 	}
+	if !temporalTypmodEqual(t.Temporal, o.Temporal) {
+		return false
+	}
 	return t.VarcharLen == nil || *t.VarcharLen == *o.VarcharLen
 }
 
 // commonTypmod is the common typmod of several inputs (PostgreSQL's select_common_typmod, and
 // exprTypmod for CASE / COALESCE / GREATEST / LEAST): their typmod when every input has the same one,
-// else none. Typmods only exist on decimal and text values, so equal typmods mean one type.
+// else none. Each typmod kind belongs to its own types, so equal typmods mean one type family.
 func commonTypmod(inputs []typmod) typmod {
 	if len(inputs) == 0 {
 		return typmod{}
@@ -3510,8 +3536,8 @@ func deriveTypmod(s *scope, e exprNode) typmod {
 		if e.Cast.TypeMod == nil || strings.HasSuffix(e.Cast.TypeName, "[]") {
 			return typmod{}
 		}
-		if _, d, vl, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod); err == nil {
-			return typmod{Decimal: d, VarcharLen: vl}
+		if _, tm, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod); err == nil {
+			return tm
 		}
 		return typmod{}
 	case exprCase:

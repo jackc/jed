@@ -94,7 +94,7 @@ import {
 import { starHiddenCount } from "./search_cycle.ts";
 import { castTrapClass } from "./trap_class.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
-import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
+import type { DecimalTypmod, ScalarType, TemporalTypmod, Type } from "./types.ts";
 import { followLayer } from "./view_write.ts";
 import {
   classifyComparable,
@@ -1361,7 +1361,9 @@ function resolveTypedLiteralExpr(
     if (clock !== null) return clock;
   }
   return atPosition(e.loc, () =>
-    foldInSessionZone(scope, params, (iz) => coerceStringLiteral(e.text, target, null, null, iz)),
+    foldInSessionZone(scope, params, (iz) =>
+      coerceStringLiteral(e.text, target, null, null, null, iz),
+    ),
   );
 }
 
@@ -1908,7 +1910,14 @@ function resolveCastExpr(
       "casting to a composite type is only supported from a string literal",
     );
   }
-  const [target, typmod, varcharLen] = resolveTypeAndTypmod(e.typeName, e.typeMod);
+  const [target, typmod, varcharLen, temporal] = resolveTypeAndTypmod(e.typeName, e.typeMod);
+  // A timestamp(p) / timestamptz(p) / qualified-interval target rounds or cuts the converted value
+  // — PostgreSQL's timestamp_scale / interval_scale (timestamp.md §8, interval.md §6.1): a
+  // non-literal operand gets a scaling cast over its conversion.
+  const scale = (node: RExpr): RExpr =>
+    temporal === null
+      ? node
+      : { kind: "cast", target, typmod: null, varcharLen: null, temporal, operand: node };
   // A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the same
   // primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The ONLY
   // text→T cast admitted ahead of the general cast slice; a non-literal text operand still
@@ -1926,7 +1935,7 @@ function resolveCastExpr(
     // spec/design/error-fields.md §10.2).
     return atPosition(e.inner.loc, () =>
       foldInSessionZone(scope, params, (iz) =>
-        coerceStringLiteral(text, target, typmod, varcharLen, iz),
+        coerceStringLiteral(text, target, typmod, varcharLen, temporal, iz),
       ),
     );
   }
@@ -1965,7 +1974,14 @@ function resolveCastExpr(
     }
     if (ik === "text" || ik === "uuid") {
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        node: {
+          kind: "cast",
+          target,
+          typmod,
+          varcharLen: null,
+          temporal: null,
+          operand: inner.node,
+        },
         type: { kind: "bytea" },
       };
     }
@@ -1988,7 +2004,14 @@ function resolveCastExpr(
     }
     if (ik === "text" || ik === "bytea") {
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        node: {
+          kind: "cast",
+          target,
+          typmod,
+          varcharLen: null,
+          temporal: null,
+          operand: inner.node,
+        },
         type: { kind: "uuid" },
       };
     }
@@ -2002,7 +2025,7 @@ function resolveCastExpr(
   if (isTimestamp(target) || isTimestamptz(target) || isDate(target)) {
     if (e.inner.kind === "param") {
       const pinner = resolve(scope, e.inner, target, ag, params);
-      return { node: pinner.node, type: resolvedTypeOf(target) };
+      return { node: scale(pinner.node), type: resolvedTypeOf(target) };
     }
     const inner = resolve(scope, e.inner, null, ag, params);
     const toRt = resolvedTypeOf(target);
@@ -2010,14 +2033,16 @@ function resolveCastExpr(
     if (ik === "null") return { node: inner.node, type: toRt };
     if (
       (ik === "timestamp" && isTimestamp(target)) ||
-      (ik === "timestamptz" && isTimestamptz(target)) ||
-      (ik === "date" && isDate(target))
+      (ik === "timestamptz" && isTimestamptz(target))
     ) {
+      return { node: scale(inner.node), type: inner.type };
+    }
+    if (ik === "date" && isDate(target)) {
       return { node: inner.node, type: inner.type };
     }
     if (ik === "timestamp" || ik === "timestamptz" || ik === "date") {
       params.nonimmutable ||= ik === "timestamptz" || isTimestamptz(target);
-      return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
+      return { node: scale({ kind: "dateConvert", inner: inner.node, to: target }), type: toRt };
     }
     if (ik === "text") {
       // The runtime text → date / timestamp / timestamptz casts (date.md §6, types.md §5): a
@@ -2027,7 +2052,7 @@ function resolveCastExpr(
       // not immutable — like PostgreSQL's date_in / timestamp_in / timestamptz_in — so it flags
       // the plan non-immutable (42P17 in an index expression).
       params.nonimmutable = true;
-      return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
+      return { node: scale({ kind: "dateConvert", inner: inner.node, to: target }), type: toRt };
     }
     throw typeError(`cannot cast ${rtName(inner.type)} to ${canonicalName(target)}`);
   }
@@ -2039,17 +2064,18 @@ function resolveCastExpr(
   if (isInterval(target)) {
     if (e.inner.kind === "param") {
       const pinner = resolve(scope, e.inner, "interval", ag, params);
-      return { node: pinner.node, type: { kind: "interval" } };
+      return { node: scale(pinner.node), type: { kind: "interval" } };
     }
     const inner = resolve(scope, e.inner, null, ag, params);
     const ik = inner.type.kind;
-    if (ik === "null" || ik === "interval") {
-      return { node: inner.node, type: { kind: "interval" } };
-    }
+    if (ik === "null") return { node: inner.node, type: { kind: "interval" } };
+    if (ik === "interval") return { node: scale(inner.node), type: { kind: "interval" } };
+    // A qualified target cuts the parsed text (interval.md §6.1), so the one cast both parses and
+    // scales.
     if (ik === "text") {
       params.nonimmutable = true;
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        node: { kind: "cast", target, typmod, varcharLen: null, temporal, operand: inner.node },
         type: { kind: "interval" },
       };
     }
@@ -2072,7 +2098,14 @@ function resolveCastExpr(
     if (ik === "null") return { node: inner.node, type: toRt };
     if (ik === "text" || ik === "json" || ik === "jsonb") {
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        node: {
+          kind: "cast",
+          target,
+          typmod,
+          varcharLen: null,
+          temporal: null,
+          operand: inner.node,
+        },
         type: toRt,
       };
     }
@@ -2108,7 +2141,7 @@ function resolveCastExpr(
     ) {
       const trap = castTrapClass(inner.type, target, typmod);
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node, trap },
+        node: { kind: "cast", target, typmod, varcharLen: null, temporal: null, operand: inner.node, trap },
         type: { kind: "bool" },
       };
     }
@@ -2119,7 +2152,7 @@ function resolveCastExpr(
     if (target === "i32") {
       const trap = castTrapClass(inner.type, target, typmod);
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node, trap },
+        node: { kind: "cast", target, typmod, varcharLen: null, temporal: null, operand: inner.node, trap },
         type: { kind: "int", ty: "i32" },
       };
     }
@@ -2177,7 +2210,7 @@ function resolveCastExpr(
       : { kind: "int", ty: target };
   const trap = castTrapClass(inner.type, target, typmod);
   return {
-    node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node, trap },
+    node: { kind: "cast", target, typmod, varcharLen: null, temporal: null, operand: inner.node, trap },
     type: resultType,
   };
 }
@@ -2769,21 +2802,27 @@ export function combineDerivs(scope: Scope, args: Expr[]): Deriv {
 }
 
 // Typmod is a query output column's type modifier (spec/design/create-table-as.md §2): the
-// numeric(p,s) precision and scale, or the varchar(n) length, that a `CREATE TABLE … AS` column
-// keeps. Both null is no typmod. Only a decimal or text scalar carries one; an array's element typmod
+// numeric(p,s) precision and scale, the varchar(n) length, or the timestamp precision / interval
+// qualifier and precision, that a `CREATE TABLE … AS` column keeps. All null is no typmod. Only a
+// decimal, text, timestamp, timestamptz, or interval scalar carries one; an array's element typmod
 // is not tracked (an array column cannot declare one — array.md §12).
-export type Typmod = { decimal: DecimalTypmod | null; varcharLen: number | null };
+export type Typmod = {
+  decimal: DecimalTypmod | null;
+  varcharLen: number | null;
+  temporal: TemporalTypmod | null;
+};
 
 // TYPMOD_NONE is no typmod. Typmods are never mutated, so it is shared.
-export const TYPMOD_NONE: Typmod = { decimal: null, varcharLen: null };
+export const TYPMOD_NONE: Typmod = { decimal: null, varcharLen: null, temporal: null };
 
 // typmodOfColumn is a column's declared typmod (a catalog column, or a synthetic one that recorded
 // its body's). A composite field (PostgreSQL's FieldSelect keeps its typmod) has the same shape.
 export function typmodOfColumn(col: {
   decimal: DecimalTypmod | null;
   varcharLen: number | null;
+  temporal: TemporalTypmod | null;
 }): Typmod {
-  return { decimal: col.decimal, varcharLen: col.varcharLen };
+  return { decimal: col.decimal, varcharLen: col.varcharLen, temporal: col.temporal };
 }
 
 // typmodEqual reports whether two typmods are the same.
@@ -2792,12 +2831,16 @@ export function typmodEqual(a: Typmod, b: Typmod): boolean {
     a.decimal === null || b.decimal === null
       ? a.decimal === b.decimal
       : a.decimal.precision === b.decimal.precision && a.decimal.scale === b.decimal.scale;
-  return decEq && a.varcharLen === b.varcharLen;
+  const tempEq =
+    a.temporal === null || b.temporal === null
+      ? a.temporal === b.temporal
+      : a.temporal.fields === b.temporal.fields && a.temporal.precision === b.temporal.precision;
+  return decEq && tempEq && a.varcharLen === b.varcharLen;
 }
 
 // commonTypmod is the common typmod of several inputs (PostgreSQL's select_common_typmod, and
 // exprTypmod for CASE / COALESCE / GREATEST / LEAST): their typmod when every input has the same one,
-// else none. Typmods only exist on decimal and text values, so equal typmods mean one type.
+// else none. Each typmod kind belongs to its own types, so equal typmods mean one type family.
 export function commonTypmod(inputs: Typmod[]): Typmod {
   if (inputs.length === 0) return TYPMOD_NONE;
   const first = inputs[0]!;
@@ -2821,8 +2864,8 @@ export function deriveTypmod(scope: Scope, e: Expr): Typmod {
     case "cast": {
       if (e.typeMod === null || e.typeName.endsWith("[]")) return TYPMOD_NONE;
       try {
-        const [, decimal, varcharLen] = resolveTypeAndTypmod(e.typeName, e.typeMod);
-        return { decimal, varcharLen };
+        const [, decimal, varcharLen, temporal] = resolveTypeAndTypmod(e.typeName, e.typeMod);
+        return { decimal, varcharLen, temporal };
       } catch {
         return TYPMOD_NONE;
       }
@@ -4554,6 +4597,7 @@ export function resolveJsonPassing(
       target: "jsonb",
       typmod: null,
       varcharLen: null,
+      temporal: null,
       operand: r.node,
     });
     if (p.encoding !== null) {
@@ -5099,7 +5143,15 @@ export function castToText(
 ): RExpr {
   // The planner's trap classification (casts.toml, planner.md §3.5).
   const trap = castTrapClass(t, "text", null);
-  const cast: RExpr = { kind: "cast", target, typmod: null, varcharLen, operand: node, trap };
+  const cast: RExpr = {
+    kind: "cast",
+    target,
+    typmod: null,
+    varcharLen,
+    temporal: null,
+    operand: node,
+    trap,
+  };
   switch (t.kind) {
     // A NULL adapts (NULL → NULL, no truncation needed).
     case "null":

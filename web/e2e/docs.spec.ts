@@ -58,6 +58,19 @@ test('the types page autoruns the varchar(n) truncation demo', async ({ page }) 
   await expect(rows).not.toContainText('jedi');
 });
 
+test('the types page autoruns the timestamp precision / interval fields demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // timestamp(1) rounds .678 to .7; timestamp(0) rounds .5 up (after 2000); interval HOUR cuts to
+  // 1 day 02:00:00; '2:03' MINUTE TO SECOND is 00:02:03; '5' DAY is 5 days; interval(2) rounds.
+  const rows = livePanel(page, 'precisionDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('2024-01-15 10:30:45.7');
+  await expect(rows).toContainText('2024-01-15 10:30:46');
+  await expect(rows).toContainText('1 day 02:00:00');
+  await expect(rows).toContainText('00:02:03');
+  await expect(rows).toContainText('5 days');
+  await expect(rows).toContainText('00:00:01.23');
+});
+
 test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The uuid cast demo: text→uuid (canonical lowercase), uuid→text, uuid→bytea

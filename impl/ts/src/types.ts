@@ -53,6 +53,15 @@ export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
 // resolve (1 <= precision <= 1000, 0 <= scale <= precision; else 22023).
 export type DecimalTypmod = { precision: number; scale: number };
 
+// TemporalTypmod is a timestamp(p) / timestamptz(p) / interval type modifier
+// (spec/design/timestamp.md §8, interval.md §6.1). A timestamp always carries a precision and no
+// qualifier; an interval carries a field qualifier (`interval DAY TO SECOND`), a precision
+// (`interval(3)`), or both (`interval DAY TO SECOND(3)`). An unmodified column carries null instead.
+// fields is the qualifier's stable code (spec/types/datetime_units.toml `interval_qualifier`,
+// 1..13), or 0 for none — always 0 for a timestamp; precision is 0..6, or null for full
+// (microsecond) precision.
+export type TemporalTypmod = { fields: number; precision: number | null };
+
 // isText reports whether this is the variable-width text type (vs a fixed-width integer).
 // text has collation C (UTF-8 byte / code-point order — spec/design/types.md §11). The
 // integer-only helpers below (widthBytes/minOf/maxOf/rank) throw on "text"/"boolean"/"decimal";

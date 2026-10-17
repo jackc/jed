@@ -1513,7 +1513,7 @@ impl Parser {
         let name = self.expect_identifier()?;
         let type_pos = self.here();
         let base_type = self.expect_type_name()?;
-        let type_mod = self.parse_type_mod()?;
+        let type_mod = self.parse_type_mod_for(&base_type)?;
         let is_array = self.consume_array_brackets()?;
         let type_name = if is_array {
             format!("{base_type}[]")
@@ -1698,7 +1698,66 @@ impl Parser {
             None
         };
         self.expect(&Token::RParen)?;
-        Ok(Some(TypeMod { precision, scale }))
+        Ok(Some(TypeMod {
+            precision: Some(precision),
+            scale,
+            interval_fields: 0,
+        }))
+    }
+
+    /// The type modifier after `base_type`: for `interval`, a field qualifier
+    /// (`interval DAY TO SECOND(3)`) or a precision `interval(3)` — PostgreSQL's `opt_interval` /
+    /// `INTERVAL '(' Iconst ')'`, never both (spec/design/grammar.md §6, interval.md §6.1); for every
+    /// other type the parenthesized modifier.
+    fn parse_type_mod_for(&mut self, base_type: &str) -> Result<Option<TypeMod>> {
+        if base_type == "interval"
+            && let Some(tm) = self.parse_interval_qualifier()?
+        {
+            return Ok(Some(tm));
+        }
+        self.parse_type_mod()
+    }
+
+    /// An interval field qualifier, if the next word starts one: a field (`YEAR`, `MONTH`, `DAY`,
+    /// `HOUR`, `MINUTE`, `SECOND`) or `<field> TO <field>` naming one of the thirteen qualifiers
+    /// (spec/types/datetime_units.toml), with an optional `(p)` after a trailing `SECOND`. Any other
+    /// `TO` pairing is 42601. Bare words only — a quoted `"day"` is not a qualifier.
+    fn parse_interval_qualifier(&mut self) -> Result<Option<TypeMod>> {
+        const FIELDS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
+        let first = match self.peek() {
+            Token::Word(w) if FIELDS.contains(&w.as_str()) => w.clone(),
+            _ => return Ok(None),
+        };
+        self.advance();
+        let mut name = first;
+        if name != "second" && self.peek_keyword().as_deref() == Some("to") {
+            self.advance(); // TO
+            let last = match self.advance() {
+                Token::Word(w) if FIELDS.contains(&w.as_str()) => w,
+                other => {
+                    return Err(syntax(format!(
+                        "expected an interval field after TO, found {other:?}"
+                    )));
+                }
+            };
+            name = format!("{name} to {last}");
+        }
+        let Some(q) = crate::interval::qualifier_by_name(&name) else {
+            return Err(syntax(format!("invalid interval qualifier: {name}")));
+        };
+        let precision = if q.least == "second" && matches!(self.peek(), Token::LParen) {
+            self.advance(); // '('
+            let p = self.expect_typmod_int()?;
+            self.expect(&Token::RParen)?;
+            Some(p)
+        } else {
+            None
+        };
+        Ok(Some(TypeMod {
+            precision,
+            scale: None,
+            interval_fields: q.code,
+        }))
     }
 
     fn expect_typmod_int(&mut self) -> Result<u64> {
@@ -2174,7 +2233,7 @@ impl Parser {
         loop {
             let fname = self.expect_identifier()?;
             let base_type = self.expect_type_name()?;
-            let type_mod = self.parse_type_mod()?;
+            let type_mod = self.parse_type_mod_for(&base_type)?;
             // An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
             // (spec/design/array.md §1); the canonical spelling carries the brackets.
             let type_name = if self.consume_array_brackets()? {
@@ -2827,7 +2886,7 @@ impl Parser {
 
     fn parse_alter_column_type(&mut self) -> Result<AlterColumnKind> {
         let base = self.expect_type_name()?;
-        let type_mod = self.parse_type_mod()?;
+        let type_mod = self.parse_type_mod_for(&base)?;
         let type_name = if self.consume_array_brackets()? {
             format!("{base}[]")
         } else {
@@ -5967,7 +6026,7 @@ impl Parser {
                     self.advance();
                     let type_pos = self.here();
                     let base_type = self.expect_type_name()?;
-                    let type_mod = self.parse_type_mod()?;
+                    let type_mod = self.parse_type_mod_for(&base_type)?;
                     let is_array = self.consume_array_brackets()?;
                     let type_name = if is_array {
                         format!("{base_type}[]")
@@ -6123,7 +6182,7 @@ impl Parser {
                 self.expect_keyword("as")?;
                 let type_pos = self.here();
                 let base_type = self.expect_type_name()?;
-                let type_mod = self.parse_type_mod()?;
+                let type_mod = self.parse_type_mod_for(&base_type)?;
                 let is_array = self.consume_array_brackets()?;
                 let type_name = if is_array {
                     format!("{base_type}[]")
@@ -6254,6 +6313,21 @@ impl Parser {
                 let type_name = self.expect_identifier()?;
                 let pos = self.here();
                 if let Token::Str(text) = self.advance() {
+                    // `INTERVAL '…' DAY TO SECOND` — a trailing field qualifier makes the literal
+                    // `CAST('…' AS interval DAY TO SECOND)` (PostgreSQL's `ConstInterval Sconst
+                    // opt_interval`, interval.md §6.1).
+                    if type_name == "interval"
+                        && let Some(tm) = self.parse_interval_qualifier()?
+                    {
+                        return Ok(Expr::Cast {
+                            inner: Box::new(Expr::Literal(Literal::Text(text), pos)),
+                            type_name,
+                            type_mod: Some(tm),
+                            pos,
+                            cast_pos: type_pos,
+                            type_pos,
+                        });
+                    }
                     return Ok(Expr::TypedLiteral {
                         type_name,
                         text,

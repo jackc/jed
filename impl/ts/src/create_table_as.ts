@@ -83,6 +83,7 @@ export function ctasColumns(
       type: ty,
       decimal: typmod.decimal,
       varcharLen: typmod.varcharLen,
+      temporal: typmod.temporal,
       primaryKey: false,
       notNull: false,
       default: null,

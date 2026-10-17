@@ -1073,6 +1073,7 @@ pub(crate) fn coerce_compatible_arg(
             typmod: None,
             varchar_len: None,
             trap: TrapClass::May,
+            temporal: None,
         }
     } else {
         RExpr::ArrayCast {

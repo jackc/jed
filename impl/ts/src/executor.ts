@@ -81,7 +81,13 @@ import {
   restartPlanning,
   withPlanValues,
 } from "./plan_params.ts";
-import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
+import {
+  cteBodyAsQuery,
+  cteBodyIsDataModifying,
+  emptySeqOptions,
+  renderTypeMod,
+  seqOptionsHasAny,
+} from "./ast.ts";
 import { chooseObjectName, indexColumnNames, nameAddition } from "./autoname.ts";
 import {
   type CheckConstraint,
@@ -377,6 +383,7 @@ import {
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
+  type TemporalTypmod,
   type ScalarType,
   type Type,
   canonicalName,
@@ -424,7 +431,13 @@ import {
 } from "./types.ts";
 import { StmtRng } from "./seam.ts";
 import { ginJsonbIndexTerms, ginJsonbKeyTerm } from "./gin_jsonb.ts";
-import { type Interval, intervalEncodeKey, intervalLerp, intervalSpan } from "./interval.ts";
+import {
+  type Interval,
+  intervalEncodeKey,
+  intervalLerp,
+  intervalQualifier,
+  intervalSpan,
+} from "./interval.ts";
 import {
   AGGREGATES,
   type AggregateDesc,
@@ -751,7 +764,7 @@ function resolveScalarAssign(
     const text = e.literal.text;
     return atPosition(
       exprLocation(e),
-      () => coerceStringLiteral(text, colTy, null, null, scope.catalog.inputZone()).node,
+      () => coerceStringLiteral(text, colTy, null, null, null, scope.catalog.inputZone()).node,
     );
   }
   const { node, type } = resolve(
@@ -6494,6 +6507,7 @@ export class Engine {
       let colType: Type;
       let decimal: DecimalTypmod | null;
       let varcharLen: number | null = null;
+      let temporal: TemporalTypmod | null = null;
       const ctype = this.compositeType(def.typeName);
       if (serialKind !== undefined) {
         // A serial column takes no typmod (serial(5) is 42601) and no [] (the array branch).
@@ -6542,7 +6556,7 @@ export class Engine {
         colType = rangeT(scalarT(elementScalar(rdesc)));
         decimal = null;
       } else if (scalarTypeFromName(def.typeName) !== undefined) {
-        const [s, d, vl] = resolveTypeAndTypmod(def.typeName, def.typeMod);
+        const [s, d, vl, tm] = resolveTypeAndTypmod(def.typeName, def.typeMod);
         // jsonpath is literal-only this slice (P1a) — a jsonpath COLUMN is 0A000, like a J0-stage
         // json column (a storable jsonpath is a follow-on).
         if (s === "jsonpath") {
@@ -6551,6 +6565,7 @@ export class Engine {
         colType = scalarT(s);
         decimal = d;
         varcharLen = vl;
+        temporal = tm;
       } else if (ctype !== undefined) {
         if (def.typeMod !== null) {
           throw engineError(
@@ -6707,7 +6722,7 @@ export class Engine {
         if (def.default.expr.kind === "literal" && !clockDefault) {
           const lit = literalToValue(def.default.expr.literal);
           def_default = withAssignmentHint(() =>
-            storeValue(lit, sty, decimal, varcharLen, false, def.name, this.inputZone()),
+            storeValue(lit, sty, decimal, varcharLen, temporal, false, def.name, this.inputZone()),
           );
         } else {
           rejectDefaultStructure(def.default.expr);
@@ -6748,6 +6763,7 @@ export class Engine {
         type: colType,
         decimal,
         varcharLen,
+        temporal,
         primaryKey: def.primaryKey,
         // PRIMARY KEY ⇒ NOT NULL; a serial or IDENTITY column is NOT NULL too (sequences.md §12/§13).
         notNull: def.primaryKey || def.notNull || serialKind !== undefined || def.identity !== null,
@@ -7589,6 +7605,7 @@ export class Engine {
           colTypes[i]!,
           col.decimal,
           col.varcharLen,
+          col.temporal,
           col.notNull,
           col.name,
           this.inputZone(),
@@ -8828,10 +8845,13 @@ export class Engine {
                 };
                 resolve(Scope.empty(this), defaultCast, null, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
                 const tm = edit.action.typeMod,
+                  tmText = tm === null ? "" : renderTypeMod(tm),
                   typeSql =
                     tm === null
                       ? edit.action.typeName
-                      : `${edit.action.typeName} (${tm.precision}${tm.scale === null ? "" : `, ${tm.scale}`})`;
+                      : tmText.startsWith(" ")
+                        ? `${edit.action.typeName}${tmText}`
+                        : `${edit.action.typeName} ${tmText}`;
                 target = {
                   ...target,
                   defaultExpr: {
@@ -8980,6 +9000,7 @@ export class Engine {
                 step.colType,
                 step.column.decimal,
                 step.column.varcharLen,
+                step.column.temporal,
                 step.column.notNull,
                 step.column.name,
                 this.inputZone(),
@@ -9282,7 +9303,7 @@ export class Engine {
       return {
         ...col,
         default: withAssignmentHint(() =>
-          storeValue(lit, sty, col.decimal, col.varcharLen, false, col.name, this.inputZone()),
+          storeValue(lit, sty, col.decimal, col.varcharLen, col.temporal, false, col.name, this.inputZone()),
         ),
         defaultExpr: null,
       };
@@ -9314,6 +9335,7 @@ export class Engine {
     let type: Type;
     let decimal: DecimalTypmod | null = null;
     let varcharLen: number | null = null;
+    let temporal: TemporalTypmod | null = null;
     if (serialKind !== undefined) {
       if (def.typeMod !== null)
         throw engineError(
@@ -9344,12 +9366,13 @@ export class Engine {
         );
       type = rangeT(scalarT(elementScalar(rangeByName(def.typeName)!)));
     } else if (scalarTypeFromName(def.typeName) !== undefined) {
-      const [scalar, d, vl] = resolveTypeAndTypmod(def.typeName, def.typeMod);
+      const [scalar, d, vl, tm] = resolveTypeAndTypmod(def.typeName, def.typeMod);
       if (scalar === "jsonpath")
         throw engineError("feature_not_supported", "a jsonpath column is not supported yet");
       type = scalarT(scalar);
       decimal = d;
       varcharLen = vl;
+      temporal = tm;
     } else {
       const composite = this.compositeType(def.typeName);
       if (composite === undefined)
@@ -9387,6 +9410,7 @@ export class Engine {
       type,
       decimal,
       varcharLen,
+      temporal,
       primaryKey: def.primaryKey,
       notNull:
         def.primaryKey ||
@@ -10263,6 +10287,7 @@ export class Engine {
       let fty: Type;
       let fdecimal: DecimalTypmod | null = null;
       let fvarchar: number | null = null;
+      let ftemporal: TemporalTypmod | null = null;
       if (f.typeName.endsWith("[]")) {
         // An array-typed field (spec/design/array.md §12 — the mirror of an array-of-composite
         // element). The element is a scalar or a previously-defined composite (element_type_code
@@ -10285,10 +10310,11 @@ export class Engine {
           throw engineError("undefined_object", "type does not exist: " + base);
         }
       } else if (scalarTypeFromName(f.typeName) !== undefined) {
-        const [s, d, vl] = resolveTypeAndTypmod(f.typeName, f.typeMod);
+        const [s, d, vl, tm] = resolveTypeAndTypmod(f.typeName, f.typeMod);
         fty = scalarT(s);
         fdecimal = d;
         fvarchar = vl;
+        ftemporal = tm;
       } else if (rangeByName(f.typeName) !== undefined) {
         // A range-typed field (spec/design/composite.md §3, format_version 41): the element is
         // carried inline like a range column's, and a range takes no typmod.
@@ -10315,6 +10341,7 @@ export class Engine {
         type: fty,
         decimal: fdecimal,
         varcharLen: fvarchar,
+        temporal: ftemporal,
         notNull: f.notNull,
       });
     }
@@ -12308,6 +12335,7 @@ export class Engine {
           target: "i32",
           decimal: col.decimal,
           varcharLen: col.varcharLen,
+          temporal: col.temporal,
           notNull: col.notNull,
           source,
           colType: scope.catalog.colTypeOf(col.type),
@@ -12327,6 +12355,7 @@ export class Engine {
         target: targetScalar,
         decimal: col.decimal,
         varcharLen: col.varcharLen,
+        temporal: col.temporal,
         notNull: col.notNull,
         source,
       });
@@ -13548,6 +13577,7 @@ export class Engine {
             target: col.type.scalar,
             decimal: col.decimal,
             varcharLen: col.varcharLen,
+            temporal: col.temporal,
             notNull: col.notNull,
             source,
           });
@@ -13558,6 +13588,7 @@ export class Engine {
             target: "i32",
             decimal: col.decimal,
             varcharLen: col.varcharLen,
+            temporal: col.temporal,
             notNull: col.notNull,
             source,
             colType: scope.catalog.colTypeOf(col.type),
@@ -13577,6 +13608,7 @@ export class Engine {
           target: targetScalar,
           decimal: col.decimal,
           varcharLen: col.varcharLen,
+          temporal: col.temporal,
           notNull: col.notNull,
           source: node,
         });
@@ -13598,6 +13630,7 @@ export class Engine {
           target: "i32", // unused (colType drives checkAssign)
           decimal: col.decimal,
           varcharLen: col.varcharLen,
+          temporal: col.temporal,
           notNull: col.notNull,
           source: node,
           colType: scope.catalog.colTypeOf(col.type),
@@ -18133,12 +18166,13 @@ export class Engine {
           "a composite/array column in a record column-definition list is not supported yet",
         );
       }
-      const [st, decimal, varcharLen] = resolveTypeAndTypmod(d.typeName, d.typeMod);
+      const [st, decimal, varcharLen, temporal] = resolveTypeAndTypmod(d.typeName, d.typeMod);
       columns.push({
         name: d.name,
         type: scalarT(st),
         decimal,
         varcharLen,
+        temporal,
         primaryKey: false,
         notNull: false,
         default: null,
@@ -18200,6 +18234,7 @@ export class Engine {
       type: f.type,
       decimal: f.decimal,
       varcharLen: f.varcharLen,
+      temporal: f.temporal,
       primaryKey: false,
       notNull: false,
       default: null,
@@ -18686,7 +18721,7 @@ export class Engine {
           textValue(t.name),
           textValue(c.name),
           intValue(BigInt(i + 1)),
-          textValue(catalogTypeText(c.type, c.decimal, c.varcharLen)),
+          textValue(catalogTypeText(c.type, c.decimal, c.varcharLen, c.temporal)),
           boolValue(c.notNull || c.primaryKey),
           k >= 0 ? intValue(BigInt(k + 1)) : nullValue(),
           columnDefault === null ? nullValue() : textValue(columnDefault),
@@ -18855,7 +18890,7 @@ export class Engine {
           textValue(ty.name),
           textValue(f.name),
           intValue(BigInt(i + 1)),
-          textValue(catalogTypeText(f.type, f.decimal, f.varcharLen)),
+          textValue(catalogTypeText(f.type, f.decimal, f.varcharLen, f.temporal)),
           boolValue(f.notNull),
         ]);
       }
@@ -29456,6 +29491,8 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
         b.typmod === null &&
         a.varcharLen === null &&
         b.varcharLen === null &&
+        a.temporal === null &&
+        b.temporal === null &&
         rexprEqShifted(a.operand, b.operand, offset)
       );
     case "neg":
@@ -30610,6 +30647,7 @@ function groupColumn(
     type,
     decimal: null,
     varcharLen: null,
+    temporal: null,
     primaryKey: false,
     notNull: false,
     default: null,
@@ -30792,6 +30830,7 @@ function joinGroupOutputs(
     );
     col.decimal = c.decimal;
     col.varcharLen = c.varcharLen;
+    col.temporal = c.temporal;
     group.columns.push(col);
   }
   for (const r of s.rels) {
@@ -31946,6 +31985,11 @@ export type RExpr =
       // A varchar(n) text target's max length — truncate the result to n code points (the
       // explicit-cast rule, spec/design/types.md §15). null for any non-text / unbounded target.
       varcharLen: number | null;
+      // For a timestamp(p) / timestamptz(p) / qualified interval target, the typmod the result is
+      // rounded / cut to — PostgreSQL's timestamp_scale / interval_scale — and, for a text source,
+      // the qualifier the interval text is read under (spec/design/timestamp.md §8, interval.md
+      // §6.1). null for every other target.
+      temporal: TemporalTypmod | null;
       operand: RExpr;
       // The cast's trap classification (functions.md §15), recorded at resolve from its source and
       // target types (casts.toml); absent ⇒ "may". Read only by the planner's safe-conjunct gate
@@ -32912,6 +32956,7 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
     type: ty,
     decimal: null,
     varcharLen: null,
+    temporal: null,
     primaryKey: false,
     notNull,
     default: null,
@@ -33028,8 +33073,18 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
 // (varchar(10), decimal(8,2)), a composite's name as created, a range's canonical id (i32range,
 // numrange, …), and `[]` appended for an array (the typmod applies to the element: varchar(5)[]).
 // This text is a compatibility surface the moment it ships — pinned by the corpus.
-export function catalogTypeText(ty: Type, dec: DecimalTypmod | null, vlen: number | null): string {
-  if (ty.kind === "array") return catalogTypeText(ty.elem, dec, vlen) + "[]";
+export function catalogTypeText(
+  ty: Type,
+  dec: DecimalTypmod | null,
+  vlen: number | null,
+  temporal: TemporalTypmod | null,
+): string {
+  if (ty.kind === "array") return catalogTypeText(ty.elem, dec, vlen, temporal) + "[]";
+  // `timestamp(3)`, `timestamptz(0)`, `interval day to second(3)`, `interval(2)` — the canonical
+  // name with PostgreSQL's format_type modifier spelling.
+  if (ty.kind === "scalar" && temporal !== null) {
+    return typeCanonicalName(ty) + temporalTypmodText(temporal);
+  }
   if (ty.kind === "scalar" && ty.scalar === "text" && vlen !== null) {
     return `varchar(${vlen})`;
   }
@@ -33039,6 +33094,14 @@ export function catalogTypeText(ty: Type, dec: DecimalTypmod | null, vlen: numbe
   // The scalar / composite / range canonical rendering is shared with error messages (types.ts):
   // composite → its name as created, range → the ranges.toml id.
   return typeCanonicalName(ty);
+}
+
+// temporalTypmodText renders a timestamp / interval typmod as SQL text after the type name
+// (PostgreSQL's timestamptypmodout / intervaltypmodout): `(3)`, ` day to second(3)`, ` year`.
+export function temporalTypmodText(tm: TemporalTypmod): string {
+  const prec = tm.precision === null ? "" : `(${tm.precision})`;
+  const q = intervalQualifier(tm.fields);
+  return q === null ? prec : ` ${q.name}${prec}`;
 }
 
 // JtPlan is a resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the
@@ -33096,6 +33159,7 @@ export function srfTable(funcName: string, alias: string | null, colTy: Type): T
         type: colTy,
         decimal: null,
         varcharLen: null,
+        temporal: null,
         primaryKey: false,
         notNull: false,
         default: null,
@@ -33158,6 +33222,7 @@ export function srfTableCols(
       type,
       decimal: null,
       varcharLen: null,
+      temporal: null,
       primaryKey: false,
       notNull: false,
       default: null,
@@ -33189,7 +33254,7 @@ export function jsonRecordRow(node: JsonNode, cols: Column[], env: EvalEnv, mete
     if (member === undefined || member.kind === "null") {
       row.push(nullValue()); // missing / JSON null → SQL NULL
     } else {
-      row.push(coerceJsonMember(member, col.type, col.decimal, env, meter));
+      row.push(coerceJsonMember(member, col.type, typmodOfColumn(col), env, meter));
     }
   }
   return row;
@@ -33202,7 +33267,7 @@ export function jsonRecordRow(node: JsonNode, cols: Column[], env: EvalEnv, mete
 export function coerceJsonMember(
   node: JsonNode,
   colTy: Type,
-  decimal: DecimalTypmod | null,
+  tm: Typmod,
   env: EvalEnv,
   meter: Meter,
 ): Value {
@@ -33217,7 +33282,14 @@ export function coerceJsonMember(
   if (st === "json") return jsonValue(jsonbOut(node));
   const text = nodeToText(node);
   if (text === null) return nullValue();
-  const { node: rexpr } = coerceStringLiteral(text, st, decimal, null, env.exec.inputZone());
+  const { node: rexpr } = coerceStringLiteral(
+    text,
+    st,
+    tm.decimal,
+    tm.varcharLen,
+    tm.temporal,
+    env.exec.inputZone(),
+  );
   return evalExpr(rexpr, [], env, meter);
 }
 
@@ -33289,7 +33361,7 @@ export function jsonNodeAsReturning(
   env: EvalEnv,
   meter: Meter,
 ): Value {
-  return coerceJsonMember(node, scalarT(returning), null, env, meter);
+  return coerceJsonMember(node, scalarT(returning), TYPMOD_NONE, env, meter);
 }
 
 // evalJsonSqlResult applies the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an
@@ -33356,7 +33428,13 @@ export function evalJsonSqlResult(
       // Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is a
       // SQL/JSON error honored by ON ERROR.
       try {
-        return coerceJsonMember(item, scalarT(returning), decimal, env, meter);
+        return coerceJsonMember(
+          item,
+          scalarT(returning),
+          { ...TYPMOD_NONE, decimal },
+          env,
+          meter,
+        );
       } catch (e) {
         if (isSqljsonError(e)) {
           return applyJsonBehavior(onError, "error", defaults, e, returning, env, meter);
@@ -33433,6 +33511,7 @@ export function jtColumn(name: string, ty: ScalarType, decimal: DecimalTypmod | 
     type: scalarT(ty),
     decimal,
     varcharLen: null,
+    temporal: null,
     primaryKey: false,
     notNull: false,
     default: null,
@@ -39269,7 +39348,7 @@ export function coerceCompatibleArg(
     target = "f64";
   else return r;
   if (slot === "anycompatible") {
-    return { kind: "cast", target, typmod: null, varcharLen: null, operand: r };
+    return { kind: "cast", target, typmod: null, varcharLen: null, temporal: null, operand: r };
   }
   return { kind: "arrayCast", toElem: { kind: "scalar", scalar: target }, operand: r };
 }

@@ -115,6 +115,31 @@ func (t scalarType) BtreeOpclass() string {
 	return ""
 }
 
+// noTemporalPrecision is the "no precision" value of temporalTypmod.Precision — also the on-disk
+// "none" byte of the temporal typmod slot (format.md v43).
+const noTemporalPrecision uint8 = 0xFF
+
+// temporalTypmod is a timestamp(p) / timestamptz(p) / interval type modifier
+// (spec/design/timestamp.md §8, interval.md §6.1). A timestamp always carries a precision and no
+// qualifier; an interval carries a field qualifier (`interval DAY TO SECOND`), a precision
+// (`interval(3)`), or both (`interval DAY TO SECOND(3)`). An unmodified column carries nil instead.
+type temporalTypmod struct {
+	// Fields is the interval field qualifier's stable code (spec/types/datetime_units.toml
+	// interval_qualifier, 1..=13), or 0 for none — always 0 for a timestamp.
+	Fields uint8
+	// Precision is the fractional-second precision, 0..=6, or noTemporalPrecision for full
+	// (microsecond) precision.
+	Precision uint8
+}
+
+// temporalTypmodEqual reports whether two optional temporal typmods are the same (by value).
+func temporalTypmodEqual(a, b *temporalTypmod) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 // CanonicalName is the single name used in all output (determinism — CLAUDE.md §10).
 func (t scalarType) CanonicalName() string {
 	switch t {

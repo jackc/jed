@@ -3,6 +3,7 @@ package jed
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"strings"
 )
 
@@ -229,6 +230,73 @@ type datetimeWall struct {
 	offsetSecs int64
 	hasOffset  bool
 	infinite   bool
+}
+
+// pgEpochMicros is the microseconds from the Unix epoch (jed's) to 2000-01-01 (PostgreSQL's),
+// where PostgreSQL's typmod rounding takes its sign.
+const pgEpochMicros int64 = 946_684_800 * microsPerSec
+
+// maxTimestampPrecision is PostgreSQL's MAX_TIMESTAMP_PRECISION; a larger declared precision is
+// reduced to it.
+const maxTimestampPrecision = 6
+
+// adjustTimestampForTypmod rounds a timestamp / timestamptz to precision fractional-second digits
+// — PostgreSQL's AdjustTimestampForTypmod (spec/design/timestamp.md §8). Half rounds away from zero
+// measured from PostgreSQL's 2000-01-01 epoch, so `1985-06-01 12:00:00.5` rounds down to `12:00:00`
+// and `2005-06-01 12:00:00.5` up to `12:00:01`. ±infinity and precision 6 pass through. A result
+// that leaves the range (or lands on an infinity sentinel) is 22008. The arithmetic is exact
+// (math/big — Go has no int128, Rust uses i128).
+func adjustTimestampForTypmod(micros int64, precision uint8) (int64, error) {
+	if micros == negInfinity || micros == posInfinity || precision >= maxTimestampPrecision {
+		return micros, nil
+	}
+	scale := int64(1)
+	for i := precision; i < maxTimestampPrecision; i++ {
+		scale *= 10
+	}
+	bScale := big.NewInt(scale)
+	offset := big.NewInt(scale / 2)
+	epoch := big.NewInt(pgEpochMicros)
+	t := new(big.Int).Sub(big.NewInt(micros), epoch)
+	r := new(big.Int)
+	if t.Sign() >= 0 {
+		r.Add(t, offset)
+		r.Quo(r, bScale)
+		r.Mul(r, bScale)
+	} else {
+		r.Neg(t)
+		r.Add(r, offset)
+		r.Quo(r, bScale)
+		r.Mul(r, bScale)
+		r.Neg(r)
+	}
+	r.Add(r, epoch)
+	if !r.IsInt64() {
+		return 0, datetimeFieldOverflow("timestamp out of range")
+	}
+	m, err := finiteInstant(r.Int64())
+	if err != nil {
+		return 0, datetimeFieldOverflow("timestamp out of range")
+	}
+	return m, nil
+}
+
+// adjustTimestampTypmod rounds a timestamp / timestamptz to a timestamp(p) typmod (timestamp.md
+// §8); no typmod (or no precision) passes it through.
+func adjustTimestampTypmod(m int64, tm *temporalTypmod) (int64, error) {
+	if tm == nil || tm.Precision == noTemporalPrecision {
+		return m, nil
+	}
+	return adjustTimestampForTypmod(m, tm.Precision)
+}
+
+// adjustIntervalTypmod cuts an interval to its qualifier and precision typmod (interval.md §6.1);
+// no typmod passes it through.
+func adjustIntervalTypmod(iv Interval, tm *temporalTypmod) (Interval, error) {
+	if tm == nil {
+		return iv, nil
+	}
+	return adjustIntervalForTypmod(iv, *tm)
 }
 
 // finiteInstant rejects a finite instant landing on a ±infinity sentinel (22008).

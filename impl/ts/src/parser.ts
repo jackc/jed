@@ -70,11 +70,15 @@ import { cteBodyAsQuery, emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
 import type { OnCommitAction } from "./catalog.ts";
 import { EngineError, engineError } from "./errors.ts";
+import { intervalQualifierByName } from "./interval.ts";
 import { lex, lexWithPositions } from "./lexer.ts";
 import type { Token, TokenKind } from "./token.ts";
 
 const I64_MIN = -9223372036854775808n;
 const I64_MAX = 9223372036854775807n;
+
+// INTERVAL_FIELDS are the six interval field words a qualifier is built from (interval.md §6.1).
+const INTERVAL_FIELDS = ["year", "month", "day", "hour", "minute", "second"];
 
 // isIdentKind reports whether a token kind can be an identifier: a bare word (folded) or a quoted
 // identifier (exact) — spec/design/grammar.md §3.
@@ -1578,7 +1582,7 @@ class Parser {
     const name = this.expectIdentifier();
     const typeLoc = this.here();
     const baseType = this.expectTypeName();
-    const typeMod = this.parseTypeMod();
+    const typeMod = this.parseTypeModFor(baseType);
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     // Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
     // [CONSTRAINT name] CHECK ( expr ), and [CONSTRAINT name] UNIQUE. A boolean constraint
@@ -1722,7 +1726,47 @@ class Parser {
       scale = this.expectTypmodInt();
     }
     this.expect("rparen");
-    return { precision, scale };
+    return { precision, scale, intervalFields: 0 };
+  }
+
+  // parseTypeModFor parses the type modifier after baseType: for `interval`, a field qualifier
+  // (`interval DAY TO SECOND(3)`) or a precision `interval(3)` — PostgreSQL's opt_interval /
+  // `INTERVAL '(' Iconst ')'`, never both (spec/design/grammar.md §6, interval.md §6.1); for every
+  // other type the parenthesized modifier.
+  private parseTypeModFor(baseType: string): TypeMod | null {
+    if (baseType === "interval") {
+      const tm = this.parseIntervalQualifier();
+      if (tm !== null) return tm;
+    }
+    return this.parseTypeMod();
+  }
+
+  // parseIntervalQualifier parses an interval field qualifier, if the next word starts one: a field
+  // (YEAR, MONTH, DAY, HOUR, MINUTE, SECOND) or `<field> TO <field>` naming one of the thirteen
+  // qualifiers (spec/types/datetime_units.toml), with an optional `(p)` after a trailing SECOND.
+  // Any other TO pairing is 42601. Bare words only — a quoted "day" is not a qualifier.
+  private parseIntervalQualifier(): TypeMod | null {
+    const first = this.peekKeyword();
+    if (!INTERVAL_FIELDS.includes(first)) return null;
+    this.advance();
+    let name = first;
+    if (name !== "second" && this.peekKeyword() === "to") {
+      this.advance(); // TO
+      const t = this.advance();
+      if (t.kind !== "word" || !INTERVAL_FIELDS.includes(t.word!)) {
+        throw engineError("syntax_error", `expected an interval field after TO, found ${t.kind}`);
+      }
+      name = `${name} to ${t.word!}`;
+    }
+    const q = intervalQualifierByName(name);
+    if (q === null) throw engineError("syntax_error", `invalid interval qualifier: ${name}`);
+    let precision: bigint | null = null;
+    if (q.least === "second" && this.peek().kind === "lparen") {
+      this.advance(); // "("
+      precision = this.expectTypmodInt();
+      this.expect("rparen");
+    }
+    return { precision, scale: null, intervalFields: q.code };
   }
 
   private expectTypmodInt(): bigint {
@@ -1892,7 +1936,7 @@ class Parser {
     for (;;) {
       const fname = this.expectIdentifier();
       const baseType = this.expectTypeName();
-      const typeMod = this.parseTypeMod();
+      const typeMod = this.parseTypeModFor(baseType);
       // An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
       // (spec/design/array.md §12); the canonical spelling carries the brackets.
       const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
@@ -2421,7 +2465,7 @@ class Parser {
 
   private parseAlterColumnType(): Extract<AlterColumnAction["action"], { kind: "setType" }> {
     let typeName = this.expectTypeName();
-    const typeMod = this.parseTypeMod();
+    const typeMod = this.parseTypeModFor(typeName);
     if (this.consumeArrayBrackets()) typeName += "[]";
     let using: Expr | null = null;
     if (this.peekKeyword() === "using") {
@@ -5077,7 +5121,7 @@ class Parser {
     this.advance();
     const typeLoc = this.here();
     const baseType = this.expectTypeName();
-    const typeMod = this.parseTypeMod();
+    const typeMod = this.parseTypeModFor(baseType);
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     return { kind: "cast", inner: expr, typeName, typeMod, castLoc, typeLoc };
   }
@@ -5326,6 +5370,23 @@ class Parser {
     const typeName = this.expectIdentifier(); // the named type (folded or quoted — exact)
     const loc = this.here();
     const t = this.advance();
+    // `INTERVAL '…' DAY TO SECOND` — a trailing field qualifier makes the literal
+    // `CAST('…' AS interval DAY TO SECOND)` (PostgreSQL's `ConstInterval Sconst opt_interval`,
+    // interval.md §6.1).
+    if (typeName === "interval") {
+      const tm = this.parseIntervalQualifier();
+      if (tm !== null) {
+        return {
+          kind: "cast",
+          inner: { kind: "literal", literal: { kind: "text", text: t.str! }, loc },
+          typeName,
+          typeMod: tm,
+          loc,
+          castLoc: typeLoc,
+          typeLoc,
+        };
+      }
+    }
     return { kind: "typedLiteral", typeName, text: t.str!, loc, typeLoc };
   }
 
@@ -5408,7 +5469,7 @@ class Parser {
     this.expectKeyword("as");
     const typeLoc = this.here();
     const baseType = this.expectTypeName();
-    const typeMod = this.parseTypeMod();
+    const typeMod = this.parseTypeModFor(baseType);
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     this.expect("rparen");
     return { kind: "cast", inner, typeName, typeMod, loc, castLoc: loc, typeLoc };

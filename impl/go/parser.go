@@ -1647,7 +1647,7 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 	if err != nil {
 		return columnDef{}, err
 	}
-	typeMod, err := p.parseTypeMod()
+	typeMod, err := p.parseTypeModFor(typeName)
 	if err != nil {
 		return columnDef{}, err
 	}
@@ -1843,7 +1843,71 @@ func (p *parser) parseTypeMod() (*typeMod, error) {
 	if err := p.expect(tokRParen); err != nil {
 		return nil, err
 	}
-	return &typeMod{Precision: precision, Scale: scale}, nil
+	return &typeMod{Precision: &precision, Scale: scale}, nil
+}
+
+// parseTypeModFor parses the type modifier after baseType: for `interval`, a field qualifier
+// (`interval DAY TO SECOND(3)`) or a precision `interval(3)` — PostgreSQL's opt_interval /
+// `INTERVAL '(' Iconst ')'`, never both (spec/design/grammar.md §6, interval.md §6.1); for every
+// other type the parenthesized modifier.
+func (p *parser) parseTypeModFor(baseType string) (*typeMod, error) {
+	if baseType == "interval" {
+		tm, err := p.parseIntervalQualifier()
+		if err != nil {
+			return nil, err
+		}
+		if tm != nil {
+			return tm, nil
+		}
+	}
+	return p.parseTypeMod()
+}
+
+// intervalFieldWord reports whether w is one of the six interval field words.
+func intervalFieldWord(w string) bool {
+	switch w {
+	case "year", "month", "day", "hour", "minute", "second":
+		return true
+	}
+	return false
+}
+
+// parseIntervalQualifier parses an interval field qualifier, if the next word starts one: a field
+// (YEAR, MONTH, DAY, HOUR, MINUTE, SECOND) or `<field> TO <field>` naming one of the thirteen
+// qualifiers (spec/types/datetime_units.toml), with an optional `(p)` after a trailing SECOND. Any
+// other TO pairing is 42601. Bare words only — a quoted "day" is not a qualifier.
+func (p *parser) parseIntervalQualifier() (*typeMod, error) {
+	t := p.peek()
+	if t.Kind != tokWord || !intervalFieldWord(t.Word) {
+		return nil, nil
+	}
+	p.advance()
+	name := t.Word
+	if name != "second" && p.peekKeyword() == "to" {
+		p.advance() // TO
+		last := p.advance()
+		if last.Kind != tokWord || !intervalFieldWord(last.Word) {
+			return nil, newError(SyntaxError, fmt.Sprintf("expected an interval field after TO, found %v", last))
+		}
+		name = name + " to " + last.Word
+	}
+	q, ok := intervalQualifierByName(name)
+	if !ok {
+		return nil, newError(SyntaxError, "invalid interval qualifier: "+name)
+	}
+	var precision *uint64
+	if q.least == "second" && p.peek().Kind == tokLParen {
+		p.advance() // '('
+		v, err := p.expectTypmodInt()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return nil, err
+		}
+		precision = &v
+	}
+	return &typeMod{Precision: precision, IntervalFields: q.code}, nil
 }
 
 func (p *parser) expectTypmodInt() (uint64, error) {
@@ -2387,7 +2451,7 @@ func (p *parser) parseFieldDefList() ([]typeFieldDef, error) {
 		if err != nil {
 			return nil, err
 		}
-		typeMod, err := p.parseTypeMod()
+		typeMod, err := p.parseTypeModFor(typeName)
 		if err != nil {
 			return nil, err
 		}
@@ -3107,7 +3171,7 @@ func (p *parser) parseAlterColumnType(a *alterColumnAction) error {
 	if err != nil {
 		return err
 	}
-	tm, err := p.parseTypeMod()
+	tm, err := p.parseTypeModFor(base)
 	if err != nil {
 		return err
 	}
@@ -6488,7 +6552,7 @@ func (p *parser) parsePostfix() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			typeMod, err := p.parseTypeMod()
+			typeMod, err := p.parseTypeModFor(typeName)
 			if err != nil {
 				return exprNode{}, err
 			}
@@ -6732,7 +6796,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
-		typeMod, err := p.parseTypeMod()
+		typeMod, err := p.parseTypeModFor(typeName)
 		if err != nil {
 			return exprNode{}, err
 		}
@@ -6793,6 +6857,19 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		name := p.advance().Word // the named type (folded or quoted; resolved byte-exactly)
 		pos := p.here()
 		t := p.advance()
+		// `INTERVAL '…' DAY TO SECOND` — a trailing field qualifier makes the literal
+		// `CAST('…' AS interval DAY TO SECOND)` (PostgreSQL's ConstInterval Sconst opt_interval,
+		// interval.md §6.1).
+		if name == "interval" {
+			tm, err := p.parseIntervalQualifier()
+			if err != nil {
+				return exprNode{}, err
+			}
+			if tm != nil {
+				lit := exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalText, Str: t.Word}, Pos: pos}
+				return exprNode{Kind: exprCast, Cast: &castExpr{Inner: lit, TypeName: name, TypeMod: tm, CastPos: typePos, TypePos: typePos}, Pos: pos}, nil
+			}
+		}
 		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, TypeLitPos: typePos, Pos: pos}, nil
 	}
 	// The two-word `character varying '...'` typed literal (types.md §15).

@@ -42,7 +42,7 @@ pub(crate) use crate::privileges::{Privilege, PrivilegeSet};
 pub(crate) use crate::stack::outline;
 pub(crate) use crate::storage::{Row, TableStore};
 pub(crate) use crate::timestamp::{InputZone, parse_timestamp};
-pub(crate) use crate::types::{DecimalTypmod, ScalarType, Type};
+pub(crate) use crate::types::{DecimalTypmod, ScalarType, TemporalTypmod, Type};
 pub(crate) use crate::value::{
     ArrayVal, RangeVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
 };
@@ -3834,6 +3834,11 @@ pub(crate) enum RExpr {
         /// and target types (casts.toml); `May` unless classified. Read only by the planner's
         /// safe-conjunct gate (planner.md §3.5).
         trap: TrapClass,
+        /// For a `timestamp(p)` / `timestamptz(p)` / qualified interval target, the typmod the
+        /// result is rounded / cut to — PostgreSQL's `timestamp_scale` / `interval_scale` — and,
+        /// for a text source, the qualifier the interval text is read under
+        /// (spec/design/timestamp.md §8, interval.md §6.1). `None` for every other target.
+        temporal: Option<TemporalTypmod>,
     },
     /// A cast that *involves* an array type (spec/design/array.md §7) — the three follow-on array
     /// casts, none expressible by the scalar [`RExpr::Cast`] node (whose `target` is a `ScalarType`):
@@ -5123,6 +5128,7 @@ fn cte_synthetic_table_cols(
                 ty: type_from_resolved(t)?,
                 decimal: None,
                 varchar_len: None,
+                temporal: None,
                 primary_key: false,
                 not_null: false,
                 default: None,
@@ -5137,6 +5143,7 @@ fn cte_synthetic_table_cols(
             let t = body_typmods.map_or(Typmod::NONE, |ts| ts[i]);
             col.decimal = t.decimal;
             col.varchar_len = t.varchar_len;
+            col.temporal = t.temporal;
             Ok(col)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -5621,6 +5628,7 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
         ty,
         decimal: None,
         varchar_len: None,
+        temporal: None,
         primary_key: false,
         not_null,
         default: None,
@@ -5795,6 +5803,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
             ty: col_ty,
             decimal: None,
             varchar_len: None,
+            temporal: None,
             primary_key: false,
             not_null: false,
             default: None,
@@ -5879,7 +5888,7 @@ fn json_record_row(
         let member = members.iter().find(|(k, _)| k == &col.name).map(|(_, v)| v);
         let val = match member {
             None | Some(JsonNode::Null) => Value::Null, // missing / JSON null → SQL NULL
-            Some(v) => coerce_json_member(v, &col.ty, col.decimal.clone(), env, meter)?,
+            Some(v) => coerce_json_member(v, &col.ty, Typmod::of_column(col), env, meter)?,
         };
         row.push(val);
     }
@@ -6132,6 +6141,7 @@ pub(crate) fn resolve_json_passing(
             typmod: None,
             varchar_len: None,
             trap: TrapClass::May,
+            temporal: None,
         };
         if let Some(enc) = &p.encoding {
             if !matches!(ty, ResolvedType::Bytea) {
@@ -6296,8 +6306,8 @@ fn apply_json_behavior(
             let expr = expr.expect("a DEFAULT behavior carries its expression");
             match expr.eval(defaults.row, env, meter)? {
                 Value::Jsonb(node) if !returning.is_jsonb() => {
-                    coerce_json_member(&node, &Type::Scalar(returning), None, env, meter).map_err(
-                        |e| {
+                    coerce_json_member(&node, &Type::Scalar(returning), Typmod::NONE, env, meter)
+                        .map_err(|e| {
                             if !is_sqljson_error(&e) {
                                 return e;
                             }
@@ -6308,8 +6318,7 @@ fn apply_json_behavior(
                         ),
                     )
                     .with_detail(Some(e.message.clone()))
-                        },
-                    )
+                        })
                 }
                 v => Ok(v),
             }
@@ -6336,7 +6345,7 @@ fn json_node_as_returning(
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Value> {
-    coerce_json_member(&node, &Type::Scalar(returning), None, env, meter)
+    coerce_json_member(&node, &Type::Scalar(returning), Typmod::NONE, env, meter)
 }
 
 /// Apply the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an evaluated sequence.
@@ -6401,7 +6410,11 @@ fn eval_json_sql_result(
             }
             // Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is
             // a SQL/JSON error honored by ON ERROR.
-            match coerce_json_member(item, &Type::Scalar(returning), decimal, env, meter) {
+            let tm = Typmod {
+                decimal,
+                ..Typmod::NONE
+            };
+            match coerce_json_member(item, &Type::Scalar(returning), tm, env, meter) {
                 Ok(v) => Ok(v),
                 Err(e) if is_sqljson_error(&e) => apply_json_behavior(
                     on_error,
@@ -6478,7 +6491,7 @@ fn eval_json_sql_result(
 fn coerce_json_member(
     node: &JsonNode,
     col_ty: &Type,
-    decimal: Option<DecimalTypmod>,
+    tm: Typmod,
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Value> {
@@ -6488,8 +6501,7 @@ fn coerce_json_member(
         Type::Scalar(st) => match json::node_to_text(node) {
             None => Ok(Value::Null),
             Some(text) => {
-                let (rexpr, _) =
-                    coerce_string_literal(&text, *st, decimal, None, &env.exec.input_zone())?;
+                let (rexpr, _) = coerce_string_literal(&text, *st, tm, &env.exec.input_zone())?;
                 rexpr.eval(&[], env, meter)
             }
         },
@@ -6515,6 +6527,7 @@ fn jt_column(name: &str, ty: ScalarType, decimal: Option<DecimalTypmod>) -> Colu
         ty: Type::Scalar(ty),
         decimal,
         varchar_len: None,
+        temporal: None,
         primary_key: false,
         not_null: false,
         default: None,
@@ -6786,6 +6799,7 @@ fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>)
                 ty,
                 decimal: None,
                 varchar_len: None,
+                temporal: None,
                 primary_key: false,
                 not_null: false,
                 default: None,

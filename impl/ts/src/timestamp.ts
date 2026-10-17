@@ -303,6 +303,32 @@ export function parseTimestamp(s: string): bigint {
   return parseDatetime(s, "timestamp");
 }
 
+// PG_EPOCH_MICROS is the microseconds from the Unix epoch (jed's) to 2000-01-01 (PostgreSQL's),
+// where PostgreSQL's typmod rounding takes its sign.
+const PG_EPOCH_MICROS = 946_684_800n * MICROS_PER_SEC;
+
+// MAX_TIMESTAMP_PRECISION is the largest timestamp(p) / timestamptz(p) precision (PostgreSQL's
+// MAX_TIMESTAMP_PRECISION); a larger declared precision is reduced to it.
+export const MAX_TIMESTAMP_PRECISION = 6;
+
+// adjustTimestampForTypmod rounds a timestamp / timestamptz to `precision` fractional-second
+// digits — PostgreSQL's AdjustTimestampForTypmod (spec/design/timestamp.md §8). Half rounds away
+// from zero measured from PostgreSQL's 2000-01-01 epoch, so `1985-06-01 12:00:00.5` rounds down to
+// `12:00:00` and `2005-06-01 12:00:00.5` up to `12:00:01`. ±infinity and precision 6 pass through.
+// A result that leaves the range (or lands on an infinity sentinel) is 22008.
+export function adjustTimestampForTypmod(micros: bigint, precision: number): bigint {
+  if (micros === NEG_INFINITY || micros === POS_INFINITY || precision >= MAX_TIMESTAMP_PRECISION) {
+    return micros;
+  }
+  const scale = 10n ** BigInt(MAX_TIMESTAMP_PRECISION - precision);
+  const offset = scale / 2n;
+  const t = micros - PG_EPOCH_MICROS;
+  const rounded = t >= 0n ? ((t + offset) / scale) * scale : -(((-t + offset) / scale) * scale);
+  const m = rounded + PG_EPOCH_MICROS;
+  if (m <= NEG_INFINITY || m >= POS_INFINITY) throw fieldOverflow("timestamp out of range");
+  return m;
+}
+
 // makeTimestamp builds a zoneless timestamp (µs since the 1970 epoch) from calendar fields — the
 // workhorse for make_timestamp / make_timestamptz (functions.md §11; PG make_timestamp_internal). A
 // negative year denotes BC (PG). Field validation mirrors the timestamp parser and traps 22008: the

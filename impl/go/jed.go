@@ -667,6 +667,11 @@ var SupportedCapabilities = []string{
 	// assignment traps 22001 (trailing-space exception truncates); an explicit ::varchar(n) cast
 	// truncates. format_version 22 (text column/field u32 varchar_max_len typmod slot).
 	"types.varchar_length",
+	// timestamp(p) / timestamptz(p) precision typmods (spec/design/timestamp.md §8): stored and
+	// cast values round to p fractional digits. format_version 43 (the temporal typmod slot).
+	"types.timestamp_precision",
+	// Interval field qualifiers + interval(p) / SECOND(p) (spec/design/interval.md §6.1).
+	"types.interval_qualifier",
 	// Storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean
 	// comparison and ORDER BY. boolean is also keyable — a boolean PRIMARY KEY / index uses the
 	// bool-byte key encoding (the second non-integer key after uuid, encoding.md §2.9); casts

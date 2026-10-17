@@ -2518,6 +2518,7 @@ fn join_group_outputs(
             ty: c.ty.clone(),
             decimal: c.decimal,
             varchar_len: c.varchar_len,
+            temporal: c.temporal,
             primary_key: false,
             not_null: false,
             default: None,

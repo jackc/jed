@@ -922,6 +922,25 @@ func compositeTypeTableDB(t *testing.T) *Session {
 	return db
 }
 
+// temporalTypmodTableDB pins timestamp precision and interval qualifier typmods (v43 —
+// spec/design/timestamp.md §8, interval.md §6.1): the temporal typmod slot on columns and composite
+// fields; stored values are rounded/cut on INSERT. Must match spec/fileformat/verify.rb's
+// TEMPORAL_TYPMOD_TABLE.
+func temporalTypmodTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TYPE stamp AS (at timestamp(1), d interval minute)")
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp(3), tz timestamptz(0), "+
+		"iv interval day to second(2))")
+	run(t, db, "CREATE TABLE u (id i32 PRIMARY KEY, iy interval year, ip interval(4))")
+	run(t, db, "CREATE TABLE v (id i32 PRIMARY KEY, s stamp)")
+	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00.1234', '2024-01-01 12:00:00.4+00', "+
+		"'1 day 02:03:04.567'), (2, NULL, NULL, NULL)")
+	run(t, db, "INSERT INTO u VALUES (1, '2 years 5 months', '1.23449'), (2, NULL, NULL)")
+	run(t, db, "INSERT INTO v VALUES (1, ROW('2024-01-01 12:00:00.05', '3 minutes 20 seconds')), "+
+		"(2, NULL)")
+	return db
+}
+
 // compositeKeyTableDB has a composite-TYPED column as the PRIMARY KEY (the third container key,
 // composite-field-slots, encoding.md §2.15 / composite.md §6) — distinct from compositePkTableDB (a
 // flat tuple of scalar columns). The stored key is the per-field §2.2 nullable slots. Rows are
@@ -1163,6 +1182,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"gin_decimal_bytea_table.jed", ginDecimalByteaTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
+		{"temporal_typmod_table.jed", temporalTypmodTableDB},
 		{"composite_key_table.jed", compositeKeyTableDB},
 		{"nested_composite_table.jed", nestedCompositeTableDB},
 		{"array_table.jed", arrayTableDB},
@@ -1249,6 +1269,9 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"gin_decimal_bytea_table.jed", ginDecimalByteaTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
+		{"temporal_typmod_table.jed", temporalTypmodTableDB, "t"},
+		{"temporal_typmod_table.jed", temporalTypmodTableDB, "u"},
+		{"temporal_typmod_table.jed", temporalTypmodTableDB, "v"},
 		{"composite_key_table.jed", compositeKeyTableDB, "t"},
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
 		{"array_table.jed", arrayTableDB, "t"},

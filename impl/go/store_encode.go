@@ -21,15 +21,15 @@ import (
 // nullability for re-checking, and the resolved RHS expression (evaluated against the
 // old row).
 type assignPlan struct {
-	idx     int
-	name    string
-	target  scalarType
-	decimal *decimalTypmod
-	// varcharLen is the varchar(n) length for a text column (spec/design/types.md §15) — UPDATE
-	// re-checks the new value's length exactly like INSERT (over-length 22001, trailing-space truncate).
-	varcharLen *uint32
-	notNull    bool
-	source     *rExpr
+	idx    int
+	name   string
+	target scalarType
+	// typmod is the column's typmod — UPDATE re-coerces the new value exactly like INSERT (a varchar(n)
+	// over-length 22001 / trailing-space truncate, a numeric(p,s) rescale, a timestamp(p) rounding, an
+	// interval qualifier cut).
+	typmod  typmod
+	notNull bool
+	source  *rExpr
 	// colType is the resolved ColType for a NON-scalar column — when set, check stores through
 	// coerceForStore; nil for a scalar column, which stays on the storeValue fast path. Composite
 	// columns reach this only through SET col = DEFAULT; ordinary composite assignment is deferred.
@@ -43,9 +43,9 @@ type assignPlan struct {
 // is assignable.
 func (p assignPlan) check(v Value, iz *inputZone) (Value, error) {
 	if p.colType != nil {
-		return coerceForStore(v, *p.colType, p.decimal, p.varcharLen, p.notNull, p.name, iz)
+		return coerceForStore(v, *p.colType, p.typmod, p.notNull, p.name, iz)
 	}
-	return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name, iz)
+	return storeValue(v, p.target, p.typmod, p.notNull, p.name, iz)
 }
 
 // storeValue coerces a value into a column for storage (shared by INSERT and UPDATE). NULL
@@ -53,7 +53,9 @@ func (p assignPlan) check(v Value, iz *inputZone) (Value, error) {
 // integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
 // a decimal column coerces to the typmod (rounds to scale, precision-checks → 22003); a
 // cross-family value (decimal→int, text→int, etc.) is a 42804 (decimal→int is explicit-CAST only).
-func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *uint32, notNull bool, colName string, iz *inputZone) (Value, error) {
+func storeValue(v Value, colTy scalarType, tm typmod, notNull bool, colName string, iz *inputZone) (Value, error) {
+	decTypmod := tm.Decimal
+	varcharLen := tm.VarcharLen
 	switch v.Kind {
 	case ValNull:
 		if notNull {
@@ -68,7 +70,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 			return IntValue(v.Int), nil
 		}
 		if colTy.IsDecimal() {
-			d, err := coerceDecimal(decimalFromInt64(v.Int), typmod)
+			d, err := coerceDecimal(decimalFromInt64(v.Int), decTypmod)
 			if err != nil {
 				return Value{}, err
 			}
@@ -86,7 +88,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		return Value{}, typeError("cannot store an integer value in " + colTy.CanonicalName() + " column " + colName)
 	case ValDecimal:
 		if colTy.IsDecimal() {
-			d, err := coerceDecimal(*v.decimal(), typmod)
+			d, err := coerceDecimal(*v.decimal(), decTypmod)
 			if err != nil {
 				return Value{}, err
 			}
@@ -140,9 +142,13 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		}
 		if colTy.IsTimestamp() {
 			// A string literal adapts to a timestamp column (spec/design/timestamp.md);
-			// malformed input traps 22007, an out-of-range field 22008.
+			// malformed input traps 22007, an out-of-range field 22008. A timestamp(p) column
+			// rounds it (§8).
 			m, err := parseTimestamp(v.str())
 			if err != nil {
+				return Value{}, err
+			}
+			if m, err = adjustTimestampTypmod(m, tm.Temporal); err != nil {
 				return Value{}, err
 			}
 			return TimestampValue(m), nil
@@ -151,6 +157,9 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 			// An offset-less string reads in the session zone (timezones.md §9.3).
 			m, err := iz.parseTimestamptz(v.str())
 			if err != nil {
+				return Value{}, err
+			}
+			if m, err = adjustTimestampTypmod(m, tm.Temporal); err != nil {
 				return Value{}, err
 			}
 			return TimestamptzValue(m), nil
@@ -180,8 +189,9 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		}
 		if colTy.IsInterval() {
 			// A string literal adapts to an interval column (spec/design/interval.md);
-			// malformed input traps 22007, an out-of-range field 22008.
-			iv, err := parseInterval(v.str())
+			// malformed input traps 22007, an out-of-range field 22008. A qualified column reads it
+			// under its qualifier and cuts it (§6.1).
+			iv, err := parseIntervalTypmod(v.str(), tm.Temporal)
 			if err != nil {
 				return Value{}, err
 			}
@@ -216,12 +226,26 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		return Value{}, typeError("cannot store a uuid value in " + colTy.CanonicalName() + " column " + colName)
 	case ValTimestamp:
 		if colTy.IsTimestamp() {
-			return v, nil
+			if tm.Temporal == nil {
+				return v, nil
+			}
+			m, err := adjustTimestampTypmod(v.Int, tm.Temporal)
+			if err != nil {
+				return Value{}, err
+			}
+			return TimestampValue(m), nil
 		}
 		return Value{}, typeError("cannot store a timestamp value in " + colTy.CanonicalName() + " column " + colName)
 	case ValTimestamptz:
 		if colTy.IsTimestamptz() {
-			return v, nil
+			if tm.Temporal == nil {
+				return v, nil
+			}
+			m, err := adjustTimestampTypmod(v.Int, tm.Temporal)
+			if err != nil {
+				return Value{}, err
+			}
+			return TimestamptzValue(m), nil
 		}
 		return Value{}, typeError("cannot store a timestamptz value in " + colTy.CanonicalName() + " column " + colName)
 	case ValDate:
@@ -231,7 +255,14 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		return Value{}, typeError("cannot store a date value in " + colTy.CanonicalName() + " column " + colName)
 	case ValInterval:
 		if colTy.IsInterval() {
-			return v, nil
+			if tm.Temporal == nil {
+				return v, nil
+			}
+			iv, err := adjustIntervalForTypmod(v.interval(), *tm.Temporal)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(iv), nil
 		}
 		return Value{}, typeError("cannot store an interval value in " + colTy.CanonicalName() + " column " + colName)
 	case ValFloat32:
@@ -273,7 +304,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 
 // coerceForStore coerces a value into a column of resolved type ty for storage
 // (spec/design/composite.md §4): a scalar dispatches to storeValue; a composite to storeComposite.
-func coerceForStore(v Value, ty colType, typmod *decimalTypmod, varcharLen *uint32, notNull bool, colName string, iz *inputZone) (Value, error) {
+func coerceForStore(v Value, ty colType, tm typmod, notNull bool, colName string, iz *inputZone) (Value, error) {
 	if ty.Elem != nil {
 		return storeArray(v, *ty.Elem, notNull, colName, iz)
 	}
@@ -283,7 +314,7 @@ func coerceForStore(v Value, ty colType, typmod *decimalTypmod, varcharLen *uint
 	if ty.Composite {
 		return storeComposite(v, ty.Name, ty.Fields, notNull, colName, iz)
 	}
-	return storeValue(v, ty.Scalar, typmod, varcharLen, notNull, colName, iz)
+	return storeValue(v, ty.Scalar, tm, notNull, colName, iz)
 }
 
 // storeRange coerces a value into a RANGE column (spec/design/ranges.md §4): NULL honours NOT NULL
@@ -310,7 +341,7 @@ func storeRange(v Value, elem colType, notNull bool, colName string, iz *inputZo
 			if b == nil {
 				return nil, nil
 			}
-			cv, err := coerceForStore(*b, elem, nil, nil, false, colName, iz)
+			cv, err := coerceForStore(*b, elem, typmod{}, false, colName, iz)
 			if err != nil {
 				return nil, err
 			}
@@ -352,7 +383,7 @@ func storeArray(v Value, elem colType, notNull bool, colName string, iz *inputZo
 		for i, el := range a.Elements {
 			// Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[]
 			// and varchar(n)[] are deferred — §12, types.md §15).
-			cv, err := coerceForStore(el, elem, nil, nil, false, colName, iz)
+			cv, err := coerceForStore(el, elem, typmod{}, false, colName, iz)
 			if err != nil {
 				return Value{}, err
 			}
@@ -384,7 +415,7 @@ func storeComposite(v Value, typeName string, fields []colField, notNull bool, c
 		}
 		out := make([]Value, len(vals))
 		for i, f := range fields {
-			cv, err := coerceForStore(vals[i], f.Type, f.Typmod, f.VarcharLen, f.NotNull, f.Name, iz)
+			cv, err := coerceForStore(vals[i], f.Type, colFieldTypmod(&f), f.NotNull, f.Name, iz)
 			if err != nil {
 				return Value{}, err
 			}
@@ -703,7 +734,7 @@ func coerceRecordTextToValue(text string, ct colType, iz *inputZone) (Value, err
 			}
 		default:
 			var node *rExpr
-			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Typmod, f.VarcharLen, iz)
+			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, colFieldTypmod(&f), iz)
 			if err == nil {
 				v, err = rExprConstToValue(node)
 			}
@@ -720,7 +751,7 @@ func coerceRecordTextToValue(text string, ct colType, iz *inputZone) (Value, err
 // element scalar type, via the same string-literal coercion the typed-literal path uses (22P02 /
 // 22003 on bad input).
 func coerceStringLiteralToValue(s string, target scalarType, iz *inputZone) (Value, error) {
-	node, _, err := coerceStringLiteral(s, target, nil, nil, iz)
+	node, _, err := coerceStringLiteral(s, target, typmod{}, iz)
 	if err != nil {
 		return Value{}, err
 	}

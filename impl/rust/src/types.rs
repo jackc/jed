@@ -437,6 +437,19 @@ pub struct DecimalTypmod {
     pub scale: u16,
 }
 
+/// A `timestamp(p)` / `timestamptz(p)` / interval type modifier (spec/design/timestamp.md §8,
+/// interval.md §6.1). A timestamp always carries a precision and no qualifier; an interval carries
+/// a field qualifier (`interval DAY TO SECOND`), a precision (`interval(3)`), or both
+/// (`interval DAY TO SECOND(3)`). An unmodified column carries `None` instead of this struct.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TemporalTypmod {
+    /// The interval field qualifier's stable code (spec/types/datetime_units.toml
+    /// `interval_qualifier`, 1..=13), or 0 for none — always 0 for a timestamp.
+    pub fields: u8,
+    /// The fractional-second precision, 0..=6, or `None` for full (microsecond) precision.
+    pub precision: Option<u8>,
+}
+
 /// A column / value type: either a built-in `ScalarType` or a reference to a user-defined
 /// **composite** (row) type (spec/design/composite.md). This is the *open* wrapper above the
 /// closed `ScalarType` enum (CLAUDE.md §4): the scalar set stays a fixed compiled-in enum, but a

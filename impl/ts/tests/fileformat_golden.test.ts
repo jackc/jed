@@ -942,6 +942,33 @@ function compositeTypeTableDB(): Engine {
   return db;
 }
 
+// temporalTypmodTableDB: timestamp precision and interval qualifier typmods (v43 —
+// spec/design/timestamp.md §8, interval.md §6.1): the temporal typmod slot on columns and composite
+// fields; stored values are rounded/cut on INSERT. Must match spec/fileformat/verify.rb's
+// TEMPORAL_TYPMOD_TABLE.
+function temporalTypmodTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TYPE stamp AS (at timestamp(1), d interval minute)");
+  run(
+    db,
+    "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp(3), tz timestamptz(0), " +
+      "iv interval day to second(2))",
+  );
+  run(db, "CREATE TABLE u (id i32 PRIMARY KEY, iy interval year, ip interval(4))");
+  run(db, "CREATE TABLE v (id i32 PRIMARY KEY, s stamp)");
+  run(
+    db,
+    "INSERT INTO t VALUES (1, '2024-01-01 12:00:00.1234', '2024-01-01 12:00:00.4+00', " +
+      "'1 day 02:03:04.567'), (2, NULL, NULL, NULL)",
+  );
+  run(db, "INSERT INTO u VALUES (1, '2 years 5 months', '1.23449'), (2, NULL, NULL)");
+  run(
+    db,
+    "INSERT INTO v VALUES (1, ROW('2024-01-01 12:00:00.05', '3 minutes 20 seconds')), (2, NULL)",
+  );
+  return db;
+}
+
 // compositeKeyTableDB: a composite-TYPED column used as the PRIMARY KEY (the third container key,
 // composite-field-slots, encoding.md §2.15 / composite.md §6) — distinct from compositePkTableDB (a
 // flat tuple of scalars). The stored key is the per-field §2.2 nullable slots. Rows are INSERTed in
@@ -1202,6 +1229,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "gin_decimal_bytea_table.jed", build: ginDecimalByteaTableDB },
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
+    { name: "temporal_typmod_table.jed", build: temporalTypmodTableDB },
     { name: "composite_key_table.jed", build: compositeKeyTableDB },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
     { name: "sequence_table.jed", build: sequenceTableDB },
@@ -1285,6 +1313,9 @@ test("read goldens reproduces rows", () => {
     { name: "gin_decimal_bytea_table.jed", build: ginDecimalByteaTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
+    { name: "temporal_typmod_table.jed", build: temporalTypmodTableDB, table: "t" },
+    { name: "temporal_typmod_table.jed", build: temporalTypmodTableDB, table: "u" },
+    { name: "temporal_typmod_table.jed", build: temporalTypmodTableDB, table: "v" },
     { name: "composite_key_table.jed", build: compositeKeyTableDB, table: "t" },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },
     { name: "sequence_table.jed", build: sequenceTableDB, table: "t" },
@@ -1354,6 +1385,7 @@ test("read golden reconstructs catalog", () => {
     type: scalarT("i32"),
     decimal: null,
     varcharLen: null,
+    temporal: null,
     primaryKey: true,
     notNull: true,
     default: null,
@@ -1366,6 +1398,7 @@ test("read golden reconstructs catalog", () => {
     type: scalarT("i16"),
     decimal: null,
     varcharLen: null,
+    temporal: null,
     primaryKey: false,
     notNull: false,
     default: null,

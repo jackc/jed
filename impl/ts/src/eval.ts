@@ -55,6 +55,7 @@ import {
   zoneRenderCount,
 } from "./value.ts";
 import { parseNameText } from "./parser.ts";
+import { adjustIntervalTypmod, adjustTimestampTypmod } from "./store.ts";
 import { COSTS } from "./costs.ts";
 import { makeDate } from "./date.ts";
 import {
@@ -258,7 +259,7 @@ import type { ExtractSrc } from "./datetime_fn.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
 import { textVariadic } from "./text_build.ts";
 import type { BinaryOp } from "./ast.ts";
-import type { DecimalTypmod, ScalarType } from "./types.ts";
+import type { DecimalTypmod, ScalarType, TemporalTypmod } from "./types.ts";
 import { OPERATORS } from "./operators.ts";
 import {
   arrayToJson,
@@ -604,7 +605,9 @@ function evalCastNode(e: Of<"cast">, row: Row, env: EvalEnv, m: Meter): Value {
   // session zone.
   const out = isText(e.target)
     ? textValue(scalarToText(v, env, m))
-    : evalCast(v, e.target, e.typmod);
+    : e.temporal !== null
+      ? evalTemporalCast(v, e.target, e.temporal)
+      : evalCast(v, e.target, e.typmod);
   // Rendering bytea (hex) or jsonb (escapes) to text, and jsonb to json, is a growth kernel
   // (cost.md §8.1). The full render is charged, before any varchar(n) truncation below.
   if (
@@ -618,6 +621,26 @@ function evalCastNode(e: Of<"cast">, row: Row, env: EvalEnv, m: Meter): Value {
   if (e.varcharLen !== null && out.kind === "text") {
     return textValue(truncateToChars(out.text, e.varcharLen));
   }
+  return out;
+}
+
+// evalTemporalCast is a cast to a timestamp(p) / timestamptz(p) / qualified interval target: a
+// value already of the type is rounded / cut (the typmod scaling Cast — timestamp.md §8, interval.md
+// §6.1). A runtime text is read WITHOUT the qualifier and then cut to it, as PostgreSQL's
+// CoerceViaIO + interval_scale does — only a literal or an assigned/record string is read under the
+// qualifier.
+function evalTemporalCast(v: Value, target: ScalarType, tm: TemporalTypmod): Value {
+  if (v.kind === "timestamp" && target === "timestamp") {
+    return timestampValue(adjustTimestampTypmod(v.micros, tm));
+  }
+  if (v.kind === "timestamptz" && target === "timestamptz") {
+    return timestamptzValue(adjustTimestampTypmod(v.micros, tm));
+  }
+  if (v.kind === "interval" && target === "interval") {
+    return intervalValue(adjustIntervalTypmod(v.iv, tm));
+  }
+  const out = evalCast(v, target, null);
+  if (out.kind === "interval") return intervalValue(adjustIntervalTypmod(out.iv, tm));
   return out;
 }
 

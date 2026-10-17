@@ -18,6 +18,7 @@ import {
   widthBucketErr,
 } from "./executor.ts";
 import {
+  adjustTimestampTypmod,
   assignmentError,
   coerceStringToArray,
   overflow,
@@ -29,7 +30,7 @@ import type { BinaryOp, Expr } from "./ast.ts";
 import type { AggCtx, RExpr, ResolvedType } from "./executor.ts";
 import { atPosition, engineError, positionedAt } from "./errors.ts";
 import { exprLocation } from "./eval_ops.ts";
-import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
+import type { DecimalTypmod, ScalarType, TemporalTypmod, Type } from "./types.ts";
 import { emptyRangeValue, parseByteaHex, parseRecordTokens, parseUuid } from "./value.ts";
 import { canonicalName, minOf, rank, roundToWidth, typeCanonicalName } from "./types.ts";
 import { radixDigitValue } from "./lexer.ts";
@@ -41,7 +42,7 @@ import type { Value } from "./value.ts";
 import { parseTimestamp } from "./timestamp.ts";
 import type { InputZone } from "./timezone.ts";
 import { parseDate } from "./date.ts";
-import { parseFactorDecimal, parseInterval } from "./interval.ts";
+import { parseFactorDecimal, parseIntervalTypmod } from "./interval.ts";
 import { jsonbIn, validateJson } from "./json.ts";
 import { compile as jsonPathCompile, render as jsonPathRender } from "./jsonpath.ts";
 export function widthBucketNumeric(
@@ -572,7 +573,7 @@ export function coerceStringToRange(text: string, desc: RangeDesc, iz: InputZone
   const elem = elementScalar(desc);
   const coerceBound = (b: string | null): Value | null => {
     if (b === null) return null;
-    const { node } = coerceStringLiteral(b, elem, null, null, iz);
+    const { node } = coerceStringLiteral(b, elem, null, null, null, iz);
     return rexprConstToValue(node);
   };
   const lower = coerceBound(parsed.lower);
@@ -585,12 +586,15 @@ export function coerceStringToRange(text: string, desc: RangeDesc, iz: InputZone
 // (spec/design/grammar.md §36, types.md §5). Every scalar is reachable: the string-native types
 // parse by their own input, text is identity, and int/decimal/boolean are the cast from text
 // admitted only for a literal operand. 22P02 malformed / 22003 out of range / the type's parse
-// code. typmod (decimal only) re-scales the result.
+// code. typmod (decimal only) re-scales the result; a timestamp(p) target rounds the parsed value
+// (timestamp.md §8) and a qualified interval target reads the text under its qualifier and cuts it
+// (interval.md §6.1).
 export function coerceStringLiteral(
   s: string,
   target: ScalarType,
   typmod: DecimalTypmod | null,
   varcharLen: number | null,
+  temporal: TemporalTypmod | null,
   iz: InputZone,
 ): { node: RExpr; type: ResolvedType } {
   switch (target) {
@@ -606,12 +610,15 @@ export function coerceStringLiteral(
       };
     case "timestamp":
       return {
-        node: { kind: "constTimestamp", value: parseTimestamp(s) },
+        node: { kind: "constTimestamp", value: adjustTimestampTypmod(parseTimestamp(s), temporal) },
         type: { kind: "timestamp" },
       };
     case "timestamptz":
       return {
-        node: { kind: "constTimestamptz", value: iz.parseTimestamptz(s) },
+        node: {
+          kind: "constTimestamptz",
+          value: adjustTimestampTypmod(iz.parseTimestamptz(s), temporal),
+        },
         type: { kind: "timestamptz" },
       };
     case "date":
@@ -621,7 +628,7 @@ export function coerceStringLiteral(
       };
     case "interval":
       return {
-        node: { kind: "constInterval", value: parseInterval(s) },
+        node: { kind: "constInterval", value: parseIntervalTypmod(s, temporal) },
         type: { kind: "interval" },
       };
     case "json":
@@ -742,7 +749,14 @@ export function coerceStringToComposite(
       // A record is never a catalog composite's field type (composite.md §1).
       throw new Error("a composite field is never an anonymous record");
     } else {
-      const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal, f.varcharLen, iz);
+      const { node, type } = coerceStringLiteral(
+        tok,
+        f.type.scalar,
+        f.decimal,
+        f.varcharLen,
+        f.temporal,
+        iz,
+      );
       nodes.push(node);
       fieldTypes.push({ name: f.name, type });
     }
@@ -1018,7 +1032,7 @@ export function FLOAT_GRAMMAR_OK(t: string): boolean {
 export function widenFloatTo(node: RExpr, from: ScalarType, to: ScalarType): RExpr {
   return from === to
     ? node
-    : { kind: "cast", target: to, typmod: null, varcharLen: null, operand: node };
+    : { kind: "cast", target: to, typmod: null, varcharLen: null, temporal: null, operand: node };
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the

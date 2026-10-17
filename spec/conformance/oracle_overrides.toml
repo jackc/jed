@@ -1892,3 +1892,9 @@ reason = "jed has no schemas; an inference element's operator class is a bare na
 file = "dml/insert_on_conflict_rekey.test"
 sql = "INSERT INTO rs VALUES (2, 0), (101, 0) ON CONFLICT (id) DO UPDATE SET id = CASE WHEN rs.id = 2 THEN 101 ELSE 2 END RETURNING *"
 reason = "jed validates a re-keying DO UPDATE against the statement's END STATE (two-phase / all-or-nothing, upsert.md §3), where the two rows have exchanged keys without a collision, so the swap succeeds. PostgreSQL applies each update immediately and its first update collides with row 101 (23505) — the same end-state divergence the standalone re-keying UPDATE and UNIQUE carry (constraints.md §6.5, indexes.md §8)."
+
+# --- interval qualifiers (interval.md §6.1): the same 22008-for-22015 code divergence --------------
+[[override]]
+file = "types/interval_qualifier.test"
+sql = "SELECT interval '90:30' minute to second"
+reason = "jed: under MINUTE TO SECOND, `90:30` reads as 90 minutes 30 seconds and a minutes field past 59 is an interval field overflow, reported with jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. The same documented code divergence as `100000000000 years`."

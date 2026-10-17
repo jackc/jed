@@ -10,7 +10,7 @@ import { EngineError, Environment, close, execute, loadEngine } from "../src/too
 import { specPath } from "./tomlmini.ts";
 
 const PAGE_HEADER = 16;
-const FORMAT_VERSION = 42;
+const FORMAT_VERSION = 43;
 const MASK64 = (1n << 64n) - 1n;
 
 // splitmix64, so a failing case is reproducible from its seed (the Go test's resealedRNG).

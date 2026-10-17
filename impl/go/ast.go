@@ -676,10 +676,15 @@ type columnDef struct {
 
 // TypeMod is a parsed type modifier: a precision and an optional scale, as written
 // (numeric(p) → Scale nil, numeric(p,s) → Scale set). The values are the raw lexed magnitudes;
-// range validation (1..=1000, 0..=p; else 22023) is at resolve.
+// range validation (1..=1000, 0..=p; else 22023) is at resolve. An interval type name may instead
+// carry a field qualifier (`interval DAY TO SECOND(3)` — spec/design/interval.md §6.1):
+// IntervalFields is its datetime_units.toml code and Precision the optional `SECOND(p)`. Only an
+// interval has no precision, so Precision is non-nil for every other type modifier.
 type typeMod struct {
-	Precision uint64
+	Precision *uint64
 	Scale     *uint64
+	// IntervalFields is the interval field qualifier's code (1..=13), or 0 for none.
+	IntervalFields uint8
 }
 
 // Insert is an INSERT ... [(col, ..)] whose rows come from DEFAULT VALUES, a VALUES list (each

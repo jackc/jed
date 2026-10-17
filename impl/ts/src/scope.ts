@@ -1589,6 +1589,7 @@ export function cteSyntheticTableCols(
     type: typeFromResolved(bodyTypes[i]!),
     decimal: null,
     varcharLen: null,
+    temporal: null,
     primaryKey: false,
     notNull: false,
     default: null,
@@ -1601,6 +1602,7 @@ export function cteSyntheticTableCols(
     const t = bodyTypmods === null ? TYPMOD_NONE : bodyTypmods[i]!;
     col.decimal = t.decimal;
     col.varcharLen = t.varcharLen;
+    col.temporal = t.temporal;
   });
   return { name, columns, pk: [], checks: [], indexes: [], fks: [], exclusions: [] };
 }
@@ -1771,6 +1773,8 @@ function colTypeEqual(a: ColType, b: ColType): boolean {
             f.name === g.name &&
             f.notNull === g.notNull &&
             f.varcharLen === g.varcharLen &&
+            f.temporal?.fields === g.temporal?.fields &&
+            f.temporal?.precision === g.temporal?.precision &&
             f.typmod?.precision === g.typmod?.precision &&
             f.typmod?.scale === g.typmod?.scale &&
             colTypeEqual(f.type, g.type)
@@ -1803,7 +1807,7 @@ export function bindParams(
   // as PostgreSQL's text-format parameter input does (timezones.md §9.3).
   return types.map((ty, i) =>
     ty.kind === "scalar"
-      ? storeValue(supplied[i]!, ty.scalar, null, null, false, labels[i]!, iz)
+      ? storeValue(supplied[i]!, ty.scalar, null, null, null, false, labels[i]!, iz)
       : bindContainerParam(supplied[i]!, ty, labels[i]!, iz),
   );
 }
@@ -1821,7 +1825,7 @@ function bindContainerParam(v: Value, ty: ColType, label: string, iz: InputZone)
   if (v.kind === "range" && ty.kind === "range" && !v.empty) {
     const elem = colTypeScalar(ty.elem);
     const bound = (b: Value | null): Value | null =>
-      b === null ? null : storeValue(b, elem, null, null, false, label, iz);
+      b === null ? null : storeValue(b, elem, null, null, null, false, label, iz);
     return finalizeRange(
       rangeParamDesc(ty),
       bound(v.lower),
@@ -1830,7 +1834,7 @@ function bindContainerParam(v: Value, ty: ColType, label: string, iz: InputZone)
       v.upperInc,
     );
   }
-  return coerceForStore(v, ty, null, null, false, label, iz);
+  return coerceForStore(v, ty, null, null, null, false, label, iz);
 }
 
 // rangeParamDesc is the range descriptor of a range parameter type.

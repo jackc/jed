@@ -11,6 +11,7 @@
 import type { Decimal } from "./decimal.ts";
 import type { FkKeyedTarget } from "./executor.ts";
 import type { OnCommitAction } from "./catalog.ts";
+import { intervalQualifier } from "./interval.ts";
 
 export type Literal =
   | { kind: "null" }
@@ -25,8 +26,24 @@ export type Literal =
 
 // TypeMod is a parsed type modifier: a precision and an optional scale, as written
 // (numeric(p) → scale null, numeric(p,s) → scale set). The values are the raw lexed magnitudes;
-// range validation (1..=1000, 0..=p; else 22023) is at resolve.
-export type TypeMod = { precision: bigint; scale: bigint | null };
+// range validation (1..=1000, 0..=p; else 22023) is at resolve. An `interval` type name may instead
+// carry a field qualifier (`interval DAY TO SECOND(3)` — spec/design/interval.md §6.1):
+// intervalFields is its datetime_units.toml code (0 for none) and precision the optional
+// `SECOND(p)`. Only an interval has no precision, so precision is non-null for every other type
+// modifier.
+export type TypeMod = { precision: bigint | null; scale: bigint | null; intervalFields: number };
+
+// renderTypeMod renders a type modifier as SQL text after its type name, in persisted-token
+// spacing: `(p)`, `(p, s)`, ` day to second (3)`.
+export function renderTypeMod(tm: TypeMod): string {
+  let prec = "";
+  if (tm.precision !== null) {
+    prec = tm.scale !== null ? `(${tm.precision}, ${tm.scale})` : `(${tm.precision})`;
+  }
+  const q = intervalQualifier(tm.intervalFields);
+  if (q === null) return prec;
+  return prec === "" ? ` ${q.name}` : ` ${q.name} ${prec}`;
+}
 
 // UnaryOp: arithmetic negation `-x` or logical negation `NOT x`.
 export type UnaryOp = "neg" | "not";

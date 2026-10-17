@@ -201,6 +201,7 @@ func (db *engine) ctasColumns(ct *createTable, plan *queryPlan, targetTemp bool)
 			Type:       ty,
 			Decimal:    tm.Decimal,
 			VarcharLen: tm.VarcharLen,
+			Temporal:   tm.Temporal,
 			Collation:  collation,
 		})
 	}

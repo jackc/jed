@@ -135,6 +135,7 @@ impl RExpr {
                 target,
                 typmod,
                 varchar_len,
+                temporal,
                 ..
             } => outline(|| {
                 m.charge(COSTS.operator_eval);
@@ -218,9 +219,12 @@ impl RExpr {
                     Value::Text(s) if target.is_uuid() => Ok(Value::Uuid(decode_uuid_literal(&s)?)),
                     // text → interval / bytea (types.md §5): the literal's own input per row —
                     // parse_interval (22007/22008) and the bytea input — `\x` hex or escape format (22P02).
-                    Value::Text(s) if target.is_interval() => {
-                        Ok(Value::Interval(crate::interval::parse_interval(&s)?))
-                    }
+                    // A runtime text is read WITHOUT the qualifier and then cut to it, as
+                    // PostgreSQL's CoerceViaIO + interval_scale does (interval.md §6.1) — only a
+                    // literal or an assigned/record string is read under the qualifier.
+                    Value::Text(s) if target.is_interval() => Ok(Value::Interval(
+                        adjust_interval_typmod(crate::interval::parse_interval(&s)?, *temporal)?,
+                    )),
                     Value::Text(s) if target.is_bytea() => {
                         Ok(Value::Bytea(decode_bytea_literal(&s)?))
                     }
@@ -258,6 +262,17 @@ impl RExpr {
                     // §14). uuid → text is the any-scalar → text arm above.
                     Value::Uuid(u) if target.is_bytea() => Ok(Value::Bytea(u.to_vec())),
                     Value::Uuid(_) => unreachable!("resolver rejects a uuid cast operand"),
+                    // timestamp(p) / timestamptz(p) / a qualified interval over a value already of
+                    // the type (the typmod scaling Cast — timestamp.md §8, interval.md §6.1).
+                    Value::Timestamp(t) if target.is_timestamp() => {
+                        Ok(Value::Timestamp(adjust_timestamp_typmod(t, *temporal)?))
+                    }
+                    Value::Timestamptz(t) if target.is_timestamptz() => {
+                        Ok(Value::Timestamptz(adjust_timestamp_typmod(t, *temporal)?))
+                    }
+                    Value::Interval(iv) if target.is_interval() => {
+                        Ok(Value::Interval(adjust_interval_typmod(iv, *temporal)?))
+                    }
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
                         unreachable!("resolver rejects a timestamp cast operand")
                     }

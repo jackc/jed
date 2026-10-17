@@ -478,11 +478,28 @@ alter_sequence_option ::= sequence_option | "RESTART" ("WITH"? signed_integer)?
  *  alias i32range/i64range; the other four match PostgreSQL. timestamp/timestamptz/interval/
  *  date and user composite type names are also accepted here, resolved by the catalog.)
  * An unknown name is rejected at execution time (42704), not by the grammar. The typmod
- * is accepted ONLY for decimal/numeric: numeric(p) (= numeric(p,0)) and numeric(p,s),
- * with 1 <= p <= 1000 and 0 <= s <= p (a bad typmod traps 22023; ../design/grammar.md).
- * A typmod on a non-decimal type, or empty parens `numeric()`, is a 42601 syntax error.
- * type_name appears in a column_def and in CAST(expr AS type_name). */
+ * is meaningful for decimal/numeric: numeric(p) (= numeric(p,0)) and numeric(p,s), with
+ * 1 <= p <= 1000 and 0 <= s <= p (a bad typmod traps 22023; ../design/grammar.md); for
+ * varchar(n) (../design/types.md §15); and for timestamp(p) / timestamptz(p) (0 <= p, a p above 6
+ * reduced to 6 — ../design/timestamp.md §8). A typmod on a type that takes none is 0A000 at
+ * resolve; empty parens `numeric()` are a 42601 syntax error. After the type word `interval` the
+ * modifier is instead PostgreSQL's opt_interval — a field qualifier, with an optional precision
+ * after a trailing SECOND — or a bare precision, never both (interval_typmod;
+ * ../design/interval.md §6.1). type_name appears in a column_def and in CAST(expr AS type_name). */
 type_name      ::= type_word ("(" integer ("," integer)? ")")?
+                 | "interval" interval_typmod?
+/* The thirteen SQL interval qualifiers (../types/datetime_units.toml interval_qualifier), bare
+ * words only; any other TO pairing, or a precision after a field other than a trailing SECOND, is
+ * 42601. A following word that is not a field leaves the type unqualified. */
+interval_typmod ::= "(" integer ")"
+                  | interval_field_q
+interval_field_q ::= "year" ("to" "month")?
+                   | "month"
+                   | "day" ("to" ("hour" | "minute" | interval_second))?
+                   | "hour" ("to" ("minute" | interval_second))?
+                   | "minute" ("to" interval_second)?
+                   | interval_second
+interval_second ::= "second" ("(" integer ")")?
 /* The one two-word type name: PostgreSQL's "character varying" (two BARE words — a quoted
  * "character" is an ordinary identifier), the alias of text/varchar, so `character varying(n)` is
  * varchar(n) (../design/types.md §15). Every type position (column/field definition, ALTER … TYPE,
@@ -1301,8 +1318,14 @@ primary        ::= number
  * typmod here: a "(" after the name breaks the lookahead, so `NUMERIC(10,2) '…'` is not a typed
  * literal — typmod rides only on CAST). For the native-syntax types (integer/decimal/boolean) the
  * coercion is PostgreSQL's input function (pg_strtoint* / numeric_in / boolin, including the 0x/0o/0b
- * and `_` forms), except that a decimal takes no NaN/Infinity (a documented §36 divergence). */
+ * and `_` forms), except that a decimal takes no NaN/Infinity (a documented §36 divergence). An
+ * INTERVAL literal may take a trailing field qualifier — `INTERVAL '1' DAY`, `INTERVAL '1 2:03' DAY
+ * TO MINUTE`, `INTERVAL '1.5' SECOND(0)` — PostgreSQL's `ConstInterval Sconst opt_interval`, which
+ * is `CAST('…' AS interval <qualifier>)`: the text is read under the qualifier and cut to it
+ * (../design/interval.md §6.1). (`INTERVAL(p) '…'` is not accepted — the same "(" lookahead rule;
+ * write `'…'::interval(p)`.) */
 typed_literal  ::= type_word string
+                 | "interval" string interval_field_q
 
 /* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). A parameter
  * is bound by the host API (../design/api.md; the corpus binds through the `# params:`

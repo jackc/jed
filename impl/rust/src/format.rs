@@ -35,7 +35,7 @@ use crate::pager::Pager;
 use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
 use crate::storage::{Row, TableStore};
-use crate::types::{DecimalTypmod, ScalarType, Type};
+use crate::types::{DecimalTypmod, ScalarType, TemporalTypmod, Type};
 use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
@@ -128,7 +128,11 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v41: a composite-type entry admits a range-typed field — `field_type_code 17` followed by the
 // one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3);
 // no other byte layout change.
-pub(crate) const FORMAT_VERSION: u16 = 42;
+// v43: timestamp(p) / interval qualifier typmods — a timestamp / timestamptz column or composite
+// field appends `u8 precision` (0xFF = none, else 0..6), an interval one `u8 interval_fields ‖ u8
+// precision` (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod
+// slot (spec/design/timestamp.md §8, interval.md §6.1); no other byte layout change.
+pub(crate) const FORMAT_VERSION: u16 = 43;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -4117,6 +4121,9 @@ fn table_entry_bytes(
                 if s.is_text() {
                     out.extend_from_slice(&col.varchar_len.unwrap_or(0).to_be_bytes());
                 }
+                // A timestamp / timestamptz / interval column appends its precision / qualifier
+                // typmod (v43, spec/design/timestamp.md §8, interval.md §6.1).
+                push_temporal_typmod(&mut out, *s, col.temporal);
                 // A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default
                 // value via the value codec rows use — AFTER the typmod, presence-gated. A
                 // `DEFAULT NULL` is one 0x01. An EXPRESSION default (flags bit3, v8) instead
@@ -5121,6 +5128,8 @@ fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
             if s.is_text() {
                 out.extend_from_slice(&f.varchar_len.unwrap_or(0).to_be_bytes());
             }
+            // A timestamp / timestamptz / interval field appends its typmod (v43).
+            push_temporal_typmod(&mut out, *s, f.temporal);
         }
     }
     out
@@ -5167,6 +5176,7 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
         }
         let not_null = flags & 0b1 != 0;
         let mut varchar_len: Option<u32> = None;
+        let mut temporal: Option<TemporalTypmod> = None;
         if let Type::Scalar(s) = &ty {
             if s.is_decimal() {
                 decimal = read_decimal_typmod(buf, pos)?;
@@ -5176,12 +5186,15 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
                 let n = read_u32(buf, pos)?;
                 varchar_len = if n == 0 { None } else { Some(n) };
             }
+            // A timestamp / timestamptz / interval field carries its typmod (v43).
+            temporal = read_temporal_typmod(buf, pos, *s)?;
         }
         fields.push(CompositeField {
             name: fname,
             ty,
             decimal,
             varchar_len,
+            temporal,
             not_null,
         });
     }
@@ -5665,6 +5678,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 ty: Type::Composite(crate::types::CompositeRef { name: tname }),
                 decimal: None,
                 varchar_len: None,
+                temporal: None,
                 primary_key: false,
                 not_null: flags & 0b10 != 0,
                 default: None,
@@ -5699,6 +5713,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 ty: Type::Array(Box::new(elem)),
                 decimal: None,
                 varchar_len: None,
+                temporal: None,
                 primary_key: false,
                 not_null: flags & 0b10 != 0,
                 default: None,
@@ -5723,6 +5738,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 ty: Type::Range(Box::new(elem)),
                 decimal: None,
                 varchar_len: None,
+                temporal: None,
                 primary_key: false,
                 not_null: flags & 0b10 != 0,
                 default: None,
@@ -5771,6 +5787,9 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         } else {
             None
         };
+        // A timestamp / timestamptz / interval column carries its precision / qualifier typmod
+        // (v43, spec/design/timestamp.md §8, interval.md §6.1).
+        let temporal = read_temporal_typmod(buf, pos, ty)?;
         // The default follows the typmod (spec/fileformat/format.md): a CONSTANT default
         // (flags bit2) is a value via the same value codec rows use — never externalized, so no
         // overflow reader is needed (a `0x02` tag here would be a corrupt catalog). An
@@ -5813,6 +5832,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             ty: Type::Scalar(ty),
             decimal,
             varchar_len,
+            temporal,
             primary_key: false, // set from the pk list below
             not_null: flags & 0b10 != 0,
             default,
@@ -6830,6 +6850,54 @@ fn read_decimal_typmod(buf: &[u8], pos: &mut usize) -> Result<Option<DecimalTypm
     Ok(Some(DecimalTypmod { precision, scale }))
 }
 
+/// The "no precision" byte of a temporal typmod slot (format.md v43).
+const NO_TEMPORAL_PRECISION: u8 = 0xFF;
+
+/// Append a timestamp / timestamptz / interval column's or field's typmod slot (format.md v43): a
+/// timestamp writes `u8 precision`, an interval `u8 interval_fields ‖ u8 precision`, with precision
+/// `0xFF` for none and fields `0` for no qualifier. Other types write nothing.
+fn push_temporal_typmod(out: &mut Vec<u8>, s: ScalarType, tm: Option<TemporalTypmod>) {
+    let precision = tm
+        .and_then(|t| t.precision)
+        .unwrap_or(NO_TEMPORAL_PRECISION);
+    if s.is_timestamp() || s.is_timestamptz() {
+        out.push(precision);
+    } else if s.is_interval() {
+        out.push(tm.map_or(0, |t| t.fields));
+        out.push(precision);
+    }
+}
+
+/// Read the typmod slot [`push_temporal_typmod`] writes. A precision above 6 (other than `0xFF`),
+/// an unknown qualifier code, or a precision on a qualifier that does not end in SECOND is XX001.
+fn read_temporal_typmod(
+    buf: &[u8],
+    pos: &mut usize,
+    s: ScalarType,
+) -> Result<Option<TemporalTypmod>> {
+    let is_ts = s.is_timestamp() || s.is_timestamptz();
+    if !is_ts && !s.is_interval() {
+        return Ok(None);
+    }
+    let fields = if is_ts { 0 } else { read_u8(buf, pos)? };
+    let precision = match read_u8(buf, pos)? {
+        NO_TEMPORAL_PRECISION => None,
+        p if p <= crate::timestamp::MAX_TIMESTAMP_PRECISION => Some(p),
+        _ => return Err(corrupt("invalid timestamp or interval precision")),
+    };
+    if fields != 0 {
+        let q = crate::interval::qualifier(fields)
+            .ok_or_else(|| corrupt("unknown interval qualifier"))?;
+        if precision.is_some() && q.least != "second" {
+            return Err(corrupt("interval precision on a qualifier without SECOND"));
+        }
+    }
+    if is_ts && precision.is_none() || !is_ts && fields == 0 && precision.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(TemporalTypmod { fields, precision }))
+}
+
 fn read_string(buf: &[u8], pos: &mut usize) -> Result<String> {
     let len = read_u16(buf, pos)? as usize;
     let bytes = take(buf, pos, len)?.to_vec();
@@ -7413,6 +7481,7 @@ mod tests {
             ty,
             typmod: None,
             varchar_len: None,
+            temporal: None,
             not_null: false,
         };
 

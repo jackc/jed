@@ -1099,7 +1099,7 @@ func adjustYears(val int64, scale int32, itm *itmIn) dtErr {
 // decodeTimeForInterval is PG's DecodeTimeForInterval (DecodeTimeCommon): a time field H:M,
 // H:M:S[.f], or M:S.f (two parts with a fraction are minutes and seconds). The time REPLACES
 // itm.usec, as in PG — so a fractional unit to the time's left (read earlier) loses its µs part.
-func decodeTimeForInterval(s []byte, itm *itmIn) dtErr {
+func decodeTimeForInterval(s []byte, mmSS bool, itm *itmIn) dtErr {
 	hour, n, e := strtoi64(s)
 	if e != dtOK {
 		return e
@@ -1116,6 +1116,14 @@ func decodeTimeForInterval(s []byte, itm *itmIn) dtErr {
 	var sec int32
 	var fsec int64
 	switch {
+	case len(cp) == 0 && mmSS:
+		// `a:b` under MINUTE TO SECOND is minutes:seconds (PG DecodeTimeCommon).
+		if hour < -2147483648 || hour > 2147483647 {
+			return dtFieldOverflow
+		}
+		sec = minute
+		minute = int32(hour)
+		hour = 0
 	case len(cp) == 0:
 	case cp[0] == '.':
 		// mm:ss.fff
@@ -1170,8 +1178,13 @@ func decodeTimeForInterval(s []byte, itm *itmIn) dtErr {
 // fields right to left, so a unit word is met before the number it applies to. A number with no
 // unit takes the last unit read: seconds at the right end, then whatever unit was read last —
 // except that after an hour or a time field the next unitless number is days ('1 1:00',
-// '5 1 hour'). N-M is years-months. infinite reports `infinity` / `-infinity`.
-func decodeInterval(fields []dtField, itm *itmIn) (infinite bool, err dtErr) {
+// '5 1 hour'). N-M is years-months. A field qualifier (rng, its datetime_units.toml code, 0 for
+// none) gives the rightmost unitless number its least field's unit ('5' DAY is 5 days) and makes
+// a:b read as mm:ss under MINUTE TO SECOND (interval.md §6.1). infinite reports `infinity` /
+// `-infinity`.
+func decodeInterval(fields []dtField, rng uint8, itm *itmIn) (infinite bool, err dtErr) {
+	qual, hasQual := intervalQualifierByCode(rng)
+	mmSS := hasQual && qual.mmSS
 	isBefore := false
 	parsingUnitVal := false
 	var fmask uint32
@@ -1182,7 +1195,7 @@ func decodeInterval(fields []dtField, itm *itmIn) (infinite bool, err dtErr) {
 		var tmask uint32
 		ftype := f.ftype
 		if ftype == ftTime {
-			if e := decodeTimeForInterval(f.text, itm); e != dtOK {
+			if e := decodeTimeForInterval(f.text, mmSS, itm); e != dtOK {
 				return false, e
 			}
 			tmask = fieldTime
@@ -1190,7 +1203,7 @@ func decodeInterval(fields []dtField, itm *itmIn) (infinite bool, err dtErr) {
 			parsingUnitVal = false
 		} else if ftype == ftTZ {
 			// A signed time (-1:00, +02:03) — else a signed number, read below.
-			if strings.IndexByte(string(f.text[1:]), ':') >= 0 && decodeTimeForInterval(f.text[1:], itm) == dtOK {
+			if strings.IndexByte(string(f.text[1:]), ':') >= 0 && decodeTimeForInterval(f.text[1:], mmSS, itm) == dtOK {
 				if f.text[0] == '-' {
 					u, ok := neg64(itm.usec)
 					if !ok {
@@ -1209,7 +1222,22 @@ func decodeInterval(fields []dtField, itm *itmIn) (infinite bool, err dtErr) {
 		case ftTime, ftTZ:
 		case ftNumber, ftDate:
 			if ty == ignoreDTF {
+				// the qualifier's least field decides what the rightmost number is
 				ty = dtkSecond
+				if hasQual {
+					switch qual.least {
+					case "year":
+						ty = dtkYear
+					case "month":
+						ty = dtkMonth
+					case "day":
+						ty = dtkDay
+					case "hour":
+						ty = dtkHour
+					case "minute":
+						ty = dtkMinute
+					}
+				}
 			}
 			s := f.text
 			val, n, e := strtoi64(s)
@@ -1860,11 +1888,134 @@ func decodeISO8601Interval(s string, itm *itmIn) dtErr {
 // (spec/design/interval.md §3): the PostgreSQL / SQL-standard field syntax, else ISO 8601.
 // Malformed input is 22007; a field beyond its range is 22008 (PG's 22015).
 func parseInterval(input string) (Interval, error) {
+	return parseIntervalRanged(input, 0)
+}
+
+// parseIntervalTypmod parses interval text for a target carrying a type modifier — PostgreSQL's
+// interval_in with a typmod (interval.md §6.1): the qualifier steers the parse, then the value is
+// cut to it and rounded to its precision (adjustIntervalForTypmod). nil is plain parseInterval.
+func parseIntervalTypmod(input string, tm *temporalTypmod) (Interval, error) {
+	if tm == nil {
+		return parseInterval(input)
+	}
+	iv, err := parseIntervalRanged(input, tm.Fields)
+	if err != nil {
+		return Interval{}, err
+	}
+	return adjustIntervalForTypmod(iv, *tm)
+}
+
+// render is a parsed type modifier as SQL text after its type name, in persisted-token spacing:
+// `(p)`, `(p, s)`, ` day to second (3)`.
+func (tm *typeMod) render() string {
+	prec := ""
+	switch {
+	case tm.Precision != nil && tm.Scale != nil:
+		prec = fmt.Sprintf("(%d, %d)", *tm.Precision, *tm.Scale)
+	case tm.Precision != nil:
+		prec = fmt.Sprintf("(%d)", *tm.Precision)
+	}
+	q, ok := intervalQualifierByCode(tm.IntervalFields)
+	switch {
+	case ok && prec == "":
+		return " " + q.name
+	case ok:
+		return " " + q.name + " " + prec
+	default:
+		return prec
+	}
+}
+
+// temporalTypmodText is a timestamp / interval typmod as SQL text after the type name
+// (PostgreSQL's timestamptypmodout / intervaltypmodout): `(3)`, ` day to second(3)`, ` year`.
+func temporalTypmodText(tm temporalTypmod) string {
+	prec := ""
+	if tm.Precision != noTemporalPrecision {
+		prec = fmt.Sprintf("(%d)", tm.Precision)
+	}
+	if q, ok := intervalQualifierByCode(tm.Fields); ok {
+		return " " + q.name + prec
+	}
+	return prec
+}
+
+// maxIntervalPrecision is PostgreSQL's MAX_INTERVAL_PRECISION; a larger declared precision is
+// reduced to it.
+const maxIntervalPrecision = 6
+
+// intervalQualifierByCode is the interval field qualifier with stable code
+// (spec/types/datetime_units.toml); ok=false for code 0 (no qualifier) or an unknown code.
+func intervalQualifierByCode(code uint8) (intervalQualifier, bool) {
+	for _, q := range intervalQualifiers {
+		if q.code == code {
+			return q, true
+		}
+	}
+	return intervalQualifier{}, false
+}
+
+// intervalQualifierByName is the qualifier written as name ("day to second"), if it is one of the
+// thirteen.
+func intervalQualifierByName(name string) (intervalQualifier, bool) {
+	for _, q := range intervalQualifiers {
+		if q.name == name {
+			return q, true
+		}
+	}
+	return intervalQualifier{}, false
+}
+
+// adjustIntervalForTypmod cuts an interval to a type modifier — PostgreSQL's
+// AdjustIntervalForTypmod: the fields below the qualifier's least field go (YEAR keeps whole years
+// of the months and zeroes days and time; MONTH zeroes days and time; DAY zeroes the time; HOUR and
+// MINUTE truncate the time toward zero — higher fields are kept), then the time rounds half away
+// from zero to the precision. A rounding that overflows is 22008.
+func adjustIntervalForTypmod(iv Interval, tm temporalTypmod) (Interval, error) {
+	out := iv
+	if q, ok := intervalQualifierByCode(tm.Fields); ok {
+		switch q.least {
+		case "year":
+			out.Months = out.Months / int32(monthsPerYear) * int32(monthsPerYear)
+			out.Days = 0
+			out.Micros = 0
+		case "month":
+			out.Days = 0
+			out.Micros = 0
+		case "day":
+			out.Micros = 0
+		case "hour":
+			out.Micros = out.Micros / usecsPerHour * usecsPerHour
+		case "minute":
+			out.Micros = out.Micros / usecsPerMinute * usecsPerMinute
+		}
+	}
+	if tm.Precision != noTemporalPrecision && tm.Precision < maxIntervalPrecision {
+		scale := int64(1)
+		for i := tm.Precision; i < maxIntervalPrecision; i++ {
+			scale *= 10
+		}
+		offset := scale / 2
+		var shifted int64
+		var ok bool
+		if out.Micros >= 0 {
+			shifted, ok = add64(out.Micros, offset)
+		} else {
+			shifted, ok = add64(out.Micros, -offset)
+		}
+		if !ok {
+			return Interval{}, intervalFieldOverflow("interval out of range")
+		}
+		out.Micros = shifted - shifted%scale
+	}
+	return out, nil
+}
+
+func parseIntervalRanged(input string, rng uint8) (Interval, error) {
 	var itm itmIn
 	infinite := false
 	fields, e := parseDateTime(input)
 	if e == dtOK {
-		infinite, e = decodeInterval(fields, &itm)
+		infinite, e = decodeInterval(fields, rng, &itm)
 	}
 	if e == dtBadFormat {
 		infinite = false

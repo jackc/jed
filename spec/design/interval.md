@@ -16,7 +16,7 @@ its stored representation, and the slice that lights up the engine's **first tim
 
 The type accepts PostgreSQL's full interval input — its unit syntax, the SQL-standard forms, and
 ISO 8601 (§3) — and **full arithmetic**; field qualifiers (`YEAR TO MONTH`) and the `interval(p)`
-precision typmod are deferred (§6).
+precision typmod (§6.1).
 
 ## 1. Representation — three independent fields
 
@@ -78,7 +78,7 @@ container element text.
 
 The parser is a **port of PostgreSQL 18's `interval_in`** (`datetime.c`), step for step, under
 `IntervalStyle = postgres` (jed has no `IntervalStyle` setting; the oracle profile pins `postgres`)
-and with no field qualifier (§6). It accepts every form PostgreSQL does — the PostgreSQL unit
+and with no field qualifier (a qualifier changes two rules — §6.1). It accepts every form PostgreSQL does — the PostgreSQL unit
 syntax, the SQL-standard forms, and ISO 8601 — with the few differences listed at the end.
 
 ```
@@ -228,9 +228,9 @@ Each is a consequence of an existing jed rule, and each is pinned in
    (`mm`, `min`, `mon`).
 3. **`infinity` / `-infinity`** are PG's infinite intervals; jed has no infinite interval (§5.1), so
    they are malformed (`22007`).
-4. **Field qualifiers** (`INTERVAL '1' YEAR TO MONTH`, `interval(p)`) are not implemented (§6), so
-   the rightmost unitless number is always seconds and a two-part time without a fraction is always
-   `H:M`.
+4. **Field qualifiers** (`INTERVAL '1' YEAR TO MONTH`) change two rules when the text is read under
+   one (§6.1): the rightmost unitless number takes the qualifier's least field, and a two-part time
+   is `M:S` under `MINUTE TO SECOND`. Unqualified, the number is seconds and the time `H:M`, as here.
 
 ## 4. Rendering — PostgreSQL `IntervalStyle = postgres`
 
@@ -393,9 +393,9 @@ one-argument form one for the current day and, for `timestamptz`, one for its mi
   [decimal.md](decimal.md)). The stored *value* still keeps each interval's own three fields (the
   value codec below) and renders them distinctly; only the *key* canonicalizes. Pinned by
   [../encoding/interval.toml](../encoding/interval.toml) and the `interval_pk_table.jed` golden.
-- **Field qualifiers — deferred.** `INTERVAL '1' YEAR TO MONTH`, `interval(p)`, and a typmod
-  on an interval column are not implemented (grammar + typmod work); without one, input reads as
-  PG's unqualified `interval` does (§3).
+- **Field qualifiers and precision** (`interval YEAR TO MONTH`, `INTERVAL '1' DAY`, `interval(3)`,
+  `interval DAY TO SECOND(3)`) are a type modifier — §6.1. Without one, input reads as PG's
+  unqualified `interval` does (§3).
 - **On-disk value codec** (type code **11**, [format.md](../fileformat/format.md)): a fixed 16-byte
   body — `i32 months`, `i32 days`, `i64 micros`, big-endian two's-complement, no sign-flip, no
   length prefix.
@@ -405,6 +405,84 @@ one-argument form one for the current day and, for `timestamptz`, one for its mi
   work** (the factor is digit-capped, the math is `i128` / a fixed bignum, not unbounded decimal
   limbs), so no size-scaled `decimal_work` is needed; an untrusted query's cascade is already
   bounded. No new cost unit.
+
+### 6.1 Field qualifiers and precision — the interval typmod
+
+An interval column, composite field, or cast target may carry a **field qualifier**, a
+**precision**, or both — PostgreSQL's interval type modifier. Like `numeric(p,s)` and `varchar(n)`
+([types.md](types.md) §12/§15) it is a modifier, not a type: comparison, the span key, and the
+value codec are unchanged.
+
+**Grammar** (PostgreSQL's `opt_interval` / `INTERVAL '(' Iconst ')'`, [grammar.md](grammar.md) §6):
+after the type name `interval` — in a column or field definition, `ALTER … TYPE`, `CAST(… AS …)`,
+`::` — and after an `INTERVAL '…'` typed literal (which then means `CAST('…' AS interval
+<qualifier>)`), one of
+
+- a qualifier: `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `YEAR TO MONTH`, `DAY TO HOUR`,
+  `DAY TO MINUTE`, `DAY TO SECOND`, `HOUR TO MINUTE`, `HOUR TO SECOND`, `MINUTE TO SECOND` — the
+  thirteen of [datetime_units.toml](../types/datetime_units.toml) `interval_qualifier`, bare
+  (unquoted) words; a qualifier ending in `SECOND` may take `(p)`: `SECOND(3)`, `DAY TO SECOND(3)`;
+- or a precision alone: `interval(p)`.
+
+Any other `TO` pairing (`DAY TO MONTH`, `SECOND TO MINUTE`, `YEAR TO SECOND`), a precision on a
+qualifier not ending in `SECOND` (`YEAR(2)`), `interval(p)` followed by a qualifier, and a second
+modifier (`interval(1, 2)`) are `42601`. `0 ≤ p ≤ 6`; a larger `p` is reduced to 6 (PostgreSQL also
+warns; jed has no warning channel). Because the field words follow the type, `SELECT interval '1'
+day` is the qualified literal, not a column alias `day` — PostgreSQL's reading. The words stay
+non-reserved everywhere else.
+
+**Reading text under a qualifier** — PostgreSQL's `DecodeInterval` with a `range`. Only text that
+PostgreSQL reads with the target's typmod is read this way: a string literal cast or adapted to the
+type, a string assigned to a qualified column or field, and a field of `'(…)'` record text. Two
+differences from the unqualified parse (§3):
+
+- the **rightmost unitless number** takes the qualifier's least field instead of seconds:
+  `interval '5' DAY` is `5 days`, `interval '5' HOUR TO MINUTE` is `00:05:00`, `interval '1.5'
+  YEAR TO MONTH` is 1.5 months (then cut, below). After an `hour` or a time field the next unitless
+  number is still days, as §3.
+- under **`MINUTE TO SECOND`**, a two-field time `a:b` (no seconds) reads as **minutes:seconds**:
+  `interval '2:03' MINUTE TO SECOND` is `00:02:03`, where every other qualifier reads `02:03:00`. A
+  minutes field past 59 is then `22008`, PG's `22015` (the §3 code divergence).
+
+A **runtime** text value cast to a qualified interval (`col::interval MINUTE TO SECOND`) is parsed
+**without** the qualifier and then cut, because PostgreSQL's run-time text→interval cast
+(`CoerceViaIO`) calls `interval_in` with no typmod and applies `interval_scale` after — so
+`'2:03'::text::interval MINUTE TO SECOND` is `02:03:00`.
+
+**Cutting** — PostgreSQL's `AdjustIntervalForTypmod`, applied after every read and to every value
+stored in or cast to a qualified type: the fields **below the least field** go, the fields above are
+**kept** (PG's "fields to the right of the last one specified are zeroed out, but those to the left
+of it remain valid"):
+
+| least field | qualifiers | months | days | time |
+|---|---|---|---|---|
+| year | `YEAR` | truncated toward zero to whole years | 0 | 0 |
+| month | `MONTH`, `YEAR TO MONTH` | kept | 0 | 0 |
+| day | `DAY` | kept | kept | 0 |
+| hour | `HOUR`, `DAY TO HOUR` | kept | kept | truncated toward zero to whole hours |
+| minute | `MINUTE`, `DAY TO MINUTE`, `HOUR TO MINUTE` | kept | kept | truncated toward zero to whole minutes |
+| second | `SECOND`, `… TO SECOND` | kept | kept | kept |
+
+So `interval '1 year 2 months 3 days 04:05:06' HOUR` is `1 year 2 mons 3 days 04:00:00` and
+`interval '-23 months' YEAR` is `-1 years`. Then, if a precision is declared, the microseconds field
+**rounds half away from zero** to `10^(6−p)` µs (`interval '1.2345' SECOND(2)` → `00:00:01.23`,
+`interval '-0.5' SECOND(0)` → `-00:00:01`); a rounding that overflows the `i64` is `22008`
+("interval out of range").
+
+**Where it applies** — the same places as a timestamp precision (timestamp.md §8): literal casts
+(folded at resolve), runtime casts of an interval or text value (a scaling `Cast`, one extra
+`operator_eval`), `INSERT`/`UPDATE` assignment, a constant `DEFAULT`, composite fields, and
+`ALTER COLUMN … TYPE`. A query output keeps the typmod as [create-table-as.md](create-table-as.md) §2
+describes. `jed_columns.type` shows PostgreSQL's spelling: `interval day to second(3)`,
+`interval(2)`, `interval year` ([introspection.md](introspection.md) §5). A typmod on `interval[]`
+stays `0A000`.
+
+**On disk** (`format_version` 43, [format.md](../fileformat/format.md)): an interval column entry
+or composite field appends `u8 interval_fields` (the qualifier code, 0 for none) then `u8 precision`
+(`0xFF` for none). The value codec is unchanged.
+
+Pinned by suites/types/interval_qualifier.test (oracle-checked) and
+suites/introspection/temporal_typmod.test.
 
 ## 7. Determinism traps (the cross-core checklist)
 

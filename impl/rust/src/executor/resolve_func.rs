@@ -1930,7 +1930,7 @@ pub(crate) fn bind_params_with_labels(
         // A text value bound to a timestamptz parameter reads an offset-less string in the session
         // zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
         bound.push(match ty {
-            ColType::Scalar(s) => store_value(v.clone(), *s, None, None, false, &labels[i], iz)?,
+            ColType::Scalar(s) => store_value(v.clone(), *s, Typmod::NONE, false, &labels[i], iz)?,
             _ => bind_container_param(v.clone(), ty, &labels[i], iz)?,
         });
     }
@@ -1956,7 +1956,7 @@ fn bind_container_param(v: Value, ty: &ColType, label: &str, iz: &InputZone) -> 
                 unreachable!("a range element is a scalar")
             };
             let bound = |b: Option<Box<Value>>| -> Result<Option<Value>> {
-                b.map(|b| store_value(*b, *es, None, None, false, label, iz))
+                b.map(|b| store_value(*b, *es, Typmod::NONE, false, label, iz))
                     .transpose()
             };
             let lower = bound(rv.lower)?;
@@ -1970,7 +1970,7 @@ fn bind_container_param(v: Value, ty: &ColType, label: &str, iz: &InputZone) -> 
                 rv.upper_inc,
             )?))
         }
-        (v, _) => coerce_for_store(v, ty, None, None, false, label, iz),
+        (v, _) => coerce_for_store(v, ty, Typmod::NONE, false, label, iz),
     }
 }
 
@@ -5052,7 +5052,7 @@ fn resolve_node(
                 })
                 .map_err(|e| e.with_position(pos.0));
             }
-            let (target, _, _) = resolve_type_and_typmod(type_name, &None)?;
+            let (target, _) = resolve_type_and_typmod(type_name, &None)?;
             // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE
             // DateClock node, exactly like the ctx-adaptation form (date.md §6).
             if target.is_date() {
@@ -5061,7 +5061,7 @@ fn resolve_node(
                 }
             }
             fold_in_session_zone(scope, params, |iz| {
-                coerce_string_literal(text, target, None, None, iz)
+                coerce_string_literal(text, target, Typmod::NONE, iz)
             })
             .map_err(|e| e.with_position(pos.0))
         }),
@@ -5396,7 +5396,23 @@ fn resolve_node(
                     )),
                 };
             }
-            let (target, typmod, varchar_len) = resolve_type_and_typmod(type_name, type_mod)?;
+            let (target, tm) = resolve_type_and_typmod(type_name, type_mod)?;
+            let typmod = tm.decimal;
+            let varchar_len = tm.varchar_len;
+            // A `timestamp(p)` / `timestamptz(p)` / qualified-interval target rounds or cuts the
+            // converted value — PostgreSQL's `timestamp_scale` / `interval_scale` (timestamp.md §8,
+            // interval.md §6.1): a non-literal operand gets a scaling `Cast` over its conversion.
+            let scale = |node: RExpr| match tm.temporal {
+                Some(t) => RExpr::Cast {
+                    inner: Box::new(node),
+                    target,
+                    typmod: None,
+                    varchar_len: None,
+                    trap: TrapClass::May,
+                    temporal: Some(t),
+                },
+                None => node,
+            };
             // A string LITERAL operand is coerced to the target at resolve — `CAST('42' AS int)`,
             // the same primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5).
             // This is the ONLY text→T cast admitted ahead of the general cast slice; a non-literal
@@ -5413,7 +5429,7 @@ fn resolve_node(
                 // The literal's input error points at the literal (PostgreSQL coerces it at parse
                 // time — spec/design/error-fields.md §10.2).
                 return fold_in_session_zone(scope, params, |iz| {
-                    coerce_string_literal(s, target, typmod, varchar_len, iz)
+                    coerce_string_literal(s, target, tm, iz)
                 })
                 .map_err(|e| e.with_position(pos.0));
             }
@@ -5428,23 +5444,25 @@ fn resolve_node(
                     // `$1::timestamp` declares the parameter as the target type (the cast-target
                     // parameter-typing case, api.md §5), exactly like the generic path below.
                     let (rinner, _) = resolve(scope, inner, Some(target), agg, params)?;
-                    return Ok((rinner, resolved_type_of(target)));
+                    return Ok((scale(rinner), resolved_type_of(target)));
                 }
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
                 let to_rt = resolved_type_of(target);
                 return match ity {
                     ResolvedType::Null => Ok((rinner, to_rt)),
-                    ResolvedType::Timestamp if target.is_timestamp() => Ok((rinner, ity)),
-                    ResolvedType::Timestamptz if target.is_timestamptz() => Ok((rinner, ity)),
+                    ResolvedType::Timestamp if target.is_timestamp() => Ok((scale(rinner), ity)),
+                    ResolvedType::Timestamptz if target.is_timestamptz() => {
+                        Ok((scale(rinner), ity))
+                    }
                     ResolvedType::Date if target.is_date() => Ok((rinner, ity)),
                     ResolvedType::Timestamp | ResolvedType::Timestamptz | ResolvedType::Date => {
                         params.nonimmutable |=
                             matches!(ity, ResolvedType::Timestamptz) || target.is_timestamptz();
                         Ok((
-                            RExpr::DateConvert {
+                            scale(RExpr::DateConvert {
                                 inner: Box::new(rinner),
                                 to: target,
-                            },
+                            }),
                             to_rt,
                         ))
                     }
@@ -5458,10 +5476,10 @@ fn resolve_node(
                         // an index expression, as in PG).
                         params.nonimmutable = true;
                         Ok((
-                            RExpr::DateConvert {
+                            scale(RExpr::DateConvert {
                                 inner: Box::new(rinner),
                                 to: target,
-                            },
+                            }),
                             to_rt,
                         ))
                     }
@@ -5493,6 +5511,7 @@ fn resolve_node(
                             typmod: None,
                             varchar_len: None,
                             trap: TrapClass::May,
+                            temporal: None,
                         },
                         to_rt,
                     )),
@@ -5543,6 +5562,7 @@ fn resolve_node(
                             typmod: None,
                             varchar_len: None,
                             trap: TrapClass::May,
+                            temporal: None,
                         },
                         ResolvedType::Bytea,
                     )),
@@ -5572,6 +5592,7 @@ fn resolve_node(
                             typmod: None,
                             varchar_len: None,
                             trap: TrapClass::May,
+                            temporal: None,
                         },
                         ResolvedType::Uuid,
                     )),
@@ -5590,13 +5611,14 @@ fn resolve_node(
                 if matches!(inner.as_ref(), Expr::Param(_, _)) {
                     let (rinner, _) =
                         resolve(scope, inner, Some(ScalarType::Interval), agg, params)?;
-                    return Ok((rinner, ResolvedType::Interval));
+                    return Ok((scale(rinner), ResolvedType::Interval));
                 }
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
                 return match ity {
-                    ResolvedType::Null | ResolvedType::Interval => {
-                        Ok((rinner, ResolvedType::Interval))
-                    }
+                    ResolvedType::Null => Ok((rinner, ResolvedType::Interval)),
+                    ResolvedType::Interval => Ok((scale(rinner), ResolvedType::Interval)),
+                    // A qualified target cuts the parsed text (interval.md §6.1), so the one Cast
+                    // both parses and scales.
                     ResolvedType::Text => {
                         params.nonimmutable = true;
                         Ok((
@@ -5606,6 +5628,7 @@ fn resolve_node(
                                 typmod: None,
                                 varchar_len: None,
                                 trap: TrapClass::May,
+                                temporal: tm.temporal,
                             },
                             ResolvedType::Interval,
                         ))
@@ -5658,6 +5681,7 @@ fn resolve_node(
                             trap: cast_trap_class(&ity, target, typmod.as_ref()),
                             typmod,
                             varchar_len: None,
+                            temporal: None,
                         },
                         ResolvedType::Bool,
                     )),
@@ -5676,6 +5700,7 @@ fn resolve_node(
                             trap: cast_trap_class(&ity, target, typmod.as_ref()),
                             typmod,
                             varchar_len: None,
+                            temporal: None,
                         },
                         ResolvedType::Int(ScalarType::Int32),
                     ));
@@ -5787,6 +5812,7 @@ fn resolve_node(
                     trap: cast_trap_class(&ity, target, typmod.as_ref()),
                     typmod,
                     varchar_len: None,
+                    temporal: None,
                 },
                 result_ty,
             ))
@@ -6544,20 +6570,24 @@ pub(crate) fn combine_derivs(scope: &Scope, args: &[Expr]) -> Result<Deriv> {
     Ok(d)
 }
 
-/// A query output column's type modifier (spec/design/create-table-as.md §2): the `numeric(p,s)`
-/// precision and scale, or the `varchar(n)` length, that a `CREATE TABLE … AS` column keeps. Both
-/// `None` is no typmod. Only a decimal or text scalar carries one; an array's element typmod is not
-/// tracked (an array column cannot declare one — array.md §12).
+/// A type modifier — a column's, a cast target's, or a query output column's
+/// (spec/design/create-table-as.md §2): the `numeric(p,s)` precision and scale, the `varchar(n)`
+/// length, or the timestamp precision / interval qualifier and precision, that a `CREATE TABLE … AS`
+/// column keeps. All `None` is no typmod. Only a decimal, text, timestamp, timestamptz, or interval
+/// scalar carries one; an array's element typmod is not tracked (an array column cannot declare one —
+/// array.md §12).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Typmod {
     pub(crate) decimal: Option<DecimalTypmod>,
     pub(crate) varchar_len: Option<u32>,
+    pub(crate) temporal: Option<TemporalTypmod>,
 }
 
 impl Typmod {
     pub(crate) const NONE: Typmod = Typmod {
         decimal: None,
         varchar_len: None,
+        temporal: None,
     };
 
     /// A column's declared typmod (a catalog column, or a synthetic one that recorded its body's).
@@ -6565,21 +6595,32 @@ impl Typmod {
         Typmod {
             decimal: col.decimal,
             varchar_len: col.varchar_len,
+            temporal: col.temporal,
         }
     }
 
     /// The typmod of a composite field (PostgreSQL's FieldSelect keeps it).
-    fn of_field(field: &crate::catalog::CompositeField) -> Typmod {
+    pub(crate) fn of_field(field: &crate::catalog::CompositeField) -> Typmod {
         Typmod {
             decimal: field.decimal,
             varchar_len: field.varchar_len,
+            temporal: field.temporal,
+        }
+    }
+
+    /// The typmod of a resolved composite field (the codec/coercion path's view of one).
+    pub(crate) fn of_col_field(field: &ColField) -> Typmod {
+        Typmod {
+            decimal: field.typmod,
+            varchar_len: field.varchar_len,
+            temporal: field.temporal,
         }
     }
 }
 
 /// The common typmod of several inputs (PostgreSQL's `select_common_typmod`, and `exprTypmod` for
 /// `CASE` / `COALESCE` / `GREATEST` / `LEAST`): their typmod when every input has the same one, else
-/// none. Typmods only exist on decimal and text values, so equal typmods mean one type.
+/// none. Each typmod kind belongs to its own types, so equal typmods mean one type family.
 pub(crate) fn common_typmod(inputs: impl IntoIterator<Item = Typmod>) -> Typmod {
     let mut it = inputs.into_iter();
     let Some(first) = it.next() else {
@@ -6617,10 +6658,7 @@ pub(crate) fn derive_typmod(scope: &Scope, e: &Expr) -> Typmod {
             ..
         } if type_mod.is_some() && !type_name.ends_with("[]") => {
             match resolve_type_and_typmod(type_name, type_mod) {
-                Ok((_, decimal, varchar_len)) => Typmod {
-                    decimal,
-                    varchar_len,
-                },
+                Ok((_, tm)) => tm,
                 Err(_) => Typmod::NONE,
             }
         }
@@ -6993,6 +7031,7 @@ pub(crate) fn cast_to_text(
         typmod: None,
         varchar_len,
         trap,
+        temporal: None,
     };
     match ity {
         // A NULL adapts (NULL → NULL, no truncation needed).

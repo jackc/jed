@@ -39,7 +39,8 @@ import {
   rtName,
 } from "./executor.ts";
 import { classifyComparable } from "./kernels.ts";
-import type { DecimalTypmod, ScalarType } from "./types.ts";
+import type { DecimalTypmod, ScalarType, TemporalTypmod } from "./types.ts";
+import { MAX_TIMESTAMP_PRECISION } from "./timestamp.ts";
 import {
   finalizeRange,
   parseBoundFlags,
@@ -205,7 +206,7 @@ export function evalRangeCtor(elem: ScalarType, vals: Value[], iz: InputZone): V
 // an integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses,
 // and a non-assignable value is 42804 (the resolver already screened the common 42883 cases).
 export function coerceRangeBound(v: Value, elem: ScalarType, iz: InputZone): Value | null {
-  const stored = storeValue(v, elem, null, null, false, "range bound", iz);
+  const stored = storeValue(v, elem, null, null, null, false, "range bound", iz);
   return stored.kind === "null" ? null : stored;
 }
 
@@ -233,13 +234,13 @@ export function evalRangeOp(
   switch (op) {
     // `range @> element`: l is the range, r the element (coerced to the range's element type).
     case "containsElem": {
-      const e = storeValue(r, elem, null, null, false, "range element", iz);
+      const e = storeValue(r, elem, null, null, null, false, "range element", iz);
       result = rangeContainsElem(expectRange(l), e);
       break;
     }
     // `element <@ range`: l is the element, r the range.
     case "elemContainedBy": {
-      const e = storeValue(l, elem, null, null, false, "range element", iz);
+      const e = storeValue(l, elem, null, null, null, false, "range element", iz);
       result = rangeContainsElem(expectRange(r), e);
       break;
     }
@@ -1279,20 +1280,24 @@ export function requireAssignable(t: ResolvedType, colTy: ScalarType, col: strin
 export const MAX_VARCHAR_LEN = 10485760;
 
 // resolveTypeAndTypmod resolves a scalar type name + optional type modifier, returning the type,
-// the decimal typmod (decimal), and the varchar(n) max length (text — spec/design/types.md §15).
-// At most one typmod is ever non-null (they belong to different types); a typmod on any other type
-// is 0A000.
+// the decimal typmod (decimal), the varchar(n) max length (text — spec/design/types.md §15), and the
+// timestamp precision / interval qualifier and precision (timestamp/timestamptz/interval —
+// spec/design/timestamp.md §8, interval.md §6.1). At most one typmod is ever non-null (each belongs
+// to its own types); a typmod on any other type is 0A000.
 export function resolveTypeAndTypmod(
   name: string,
   typeMod: TypeMod | null,
-): [ScalarType, DecimalTypmod | null, number | null] {
+): [ScalarType, DecimalTypmod | null, number | null, TemporalTypmod | null] {
   const ty = scalarTypeFromName(name);
   if (ty === undefined) {
     throw engineError("undefined_object", "type does not exist: " + name);
   }
-  if (typeMod === null) return [ty, null, null];
-  if (isDecimal(ty)) return [ty, validateDecimalTypmod(typeMod), null];
-  if (isText(ty)) return [ty, null, validateVarcharTypmod(typeMod)];
+  if (typeMod === null) return [ty, null, null, null];
+  if (isDecimal(ty)) return [ty, validateDecimalTypmod(typeMod), null, null];
+  if (isText(ty)) return [ty, null, validateVarcharTypmod(typeMod), null];
+  if (ty === "timestamp" || ty === "timestamptz" || ty === "interval") {
+    return [ty, null, null, validateTemporalTypmod(typeMod)];
+  }
   throw engineError(
     "feature_not_supported",
     "a type modifier is not supported for type " + canonicalName(ty),
@@ -1306,7 +1311,7 @@ export function validateVarcharTypmod(tm: TypeMod): number {
   if (tm.scale !== null) {
     throw engineError("syntax_error", "varchar takes exactly one type modifier (a length)");
   }
-  const n = tm.precision;
+  const n = tm.precision ?? 0n;
   if (n < 1n) {
     throw engineError("invalid_parameter_value", "length for type varchar must be at least 1");
   }
@@ -1319,10 +1324,26 @@ export function validateVarcharTypmod(tm: TypeMod): number {
   return Number(n);
 }
 
+// validateTemporalTypmod validates a timestamp(p) / timestamptz(p) / interval type modifier
+// (spec/design/timestamp.md §8, interval.md §6.1). A precision above 6 is reduced to 6, as
+// PostgreSQL does (it also warns; jed has no warning channel). A second modifier
+// (`timestamp(3, 1)`) is 42601. The parser attaches a field qualifier only to `interval`, and never a
+// negative precision (42601 there).
+export function validateTemporalTypmod(tm: TypeMod): TemporalTypmod {
+  if (tm.scale !== null) {
+    throw engineError("syntax_error", "a timestamp or interval takes at most one precision");
+  }
+  const max = BigInt(MAX_TIMESTAMP_PRECISION);
+  return {
+    fields: tm.intervalFields,
+    precision: tm.precision === null ? null : Number(tm.precision < max ? tm.precision : max),
+  };
+}
+
 // validateDecimalTypmod validates a decimal numeric(p[,s]) type modifier: 1 <= p <= 1000,
 // 0 <= s <= p; else trap 22023 (spec/design/decimal.md §2). numeric(p) means scale 0.
 export function validateDecimalTypmod(tm: TypeMod): DecimalTypmod {
-  const p = tm.precision;
+  const p = tm.precision ?? 0n;
   if (p < 1n || p > BigInt(MAX_PRECISION)) {
     throw engineError(
       "invalid_parameter_value",

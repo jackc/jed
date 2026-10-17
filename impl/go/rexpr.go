@@ -1136,18 +1136,19 @@ type rExpr struct {
 	index int // reColumn, reParam
 	// plan is a reParam's planning frame (plan_params.go): what the estimator may know of its value.
 	plan     *planFrame
-	cInt     int64          // reConstInt
-	cBool    bool           // reConstBool
-	cText    string         // reConstText
-	cDec     Decimal        // reConstDecimal
-	cBytea   []byte         // reConstBytea
-	cIv      Interval       // reConstInterval
-	cFloat   float64        // reConstFloat32 / reConstFloat64 (a f32 const is held as the f64 of its value)
-	op       binaryOp       // reArith, reCompare
-	result   scalarType     // reCast target; reNeg / reArith result type
-	typmod   *decimalTypmod // reCast: a decimal target's numeric(p,s) typmod
-	varchar  *uint32        // reCast: a varchar(n) text target's max length — truncate (types.md §15)
-	castElem *colType       // reArrayCast: the target element ColType (nil ⇒ array → text)
+	cInt     int64           // reConstInt
+	cBool    bool            // reConstBool
+	cText    string          // reConstText
+	cDec     Decimal         // reConstDecimal
+	cBytea   []byte          // reConstBytea
+	cIv      Interval        // reConstInterval
+	cFloat   float64         // reConstFloat32 / reConstFloat64 (a f32 const is held as the f64 of its value)
+	op       binaryOp        // reArith, reCompare
+	result   scalarType      // reCast target; reNeg / reArith result type
+	typmod   *decimalTypmod  // reCast: a decimal target's numeric(p,s) typmod
+	varchar  *uint32         // reCast: a varchar(n) text target's max length — truncate (types.md §15)
+	temporal *temporalTypmod // reCast: a timestamp(p) / timestamptz(p) / qualified-interval target's typmod (timestamp.md §8, interval.md §6.1)
+	castElem *colType        // reArrayCast: the target element ColType (nil ⇒ array → text)
 	// trap is a reCast's trap classification (functions.md §15), recorded at resolve from the
 	// cast's source and target types (casts.toml); the zero value may trap. Read only by the
 	// planner's safe-conjunct gate (planner.md §3.5).

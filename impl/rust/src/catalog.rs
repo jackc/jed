@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::ast::Expr;
-use crate::types::{DecimalTypmod, ScalarType, Type};
+use crate::types::{DecimalTypmod, ScalarType, TemporalTypmod, Type};
 use crate::value::Value;
 
 /// A column definition: name, declared type, nullability, primary-key flag, default.
@@ -23,6 +23,11 @@ pub struct Column {
     /// code points; an over-length assignment traps `22001`. Persisted as a `u32` in the
     /// column entry's typmod slot when `type_code == 4` (format_version 22).
     pub varchar_len: Option<u32>,
+    /// The `timestamp(p)` / `timestamptz(p)` precision or the interval qualifier and precision
+    /// (spec/design/timestamp.md §8, interval.md §6.1), or `None` for any other column OR an
+    /// unmodified timestamp/interval. A stored value is rounded/cut to it. Persisted in the column
+    /// entry's typmod slot when `type_code` is 9, 10, or 11 (format_version 43).
+    pub temporal: Option<TemporalTypmod>,
     pub primary_key: bool,
     /// A PRIMARY KEY column is implicitly NOT NULL.
     pub not_null: bool,
@@ -84,7 +89,12 @@ impl Column {
     /// composite's name, a range's canonical id. It re-parses to the same declared type, so a tool
     /// (the CLI's dump) can write it back into `CREATE TABLE`.
     pub fn type_text(&self) -> String {
-        catalog_type_text(&self.ty, self.decimal.as_ref(), self.varchar_len)
+        catalog_type_text(
+            &self.ty,
+            self.decimal.as_ref(),
+            self.varchar_len,
+            self.temporal,
+        )
     }
 }
 
@@ -97,9 +107,19 @@ pub(crate) fn catalog_type_text(
     ty: &Type,
     dec: Option<&DecimalTypmod>,
     vlen: Option<u32>,
+    temporal: Option<TemporalTypmod>,
 ) -> String {
     match ty {
-        Type::Array(elem) => format!("{}[]", catalog_type_text(elem, dec, vlen)),
+        Type::Array(elem) => format!("{}[]", catalog_type_text(elem, dec, vlen, temporal)),
+        // `timestamp(3)`, `timestamptz(0)`, `interval day to second(3)`, `interval(2)` — the
+        // canonical name with PostgreSQL's format_type modifier spelling.
+        Type::Scalar(s) if temporal.is_some() => {
+            format!(
+                "{}{}",
+                s.canonical_name(),
+                temporal_typmod_text(temporal.unwrap())
+            )
+        }
         Type::Scalar(ScalarType::Text) if vlen.is_some() => {
             format!("varchar({})", vlen.unwrap())
         }
@@ -110,6 +130,16 @@ pub(crate) fn catalog_type_text(
         // The scalar / composite / range canonical rendering is shared with error messages
         // (types.rs): composite → its name as created, range → the ranges.toml id.
         _ => ty.canonical_name(),
+    }
+}
+
+/// A timestamp / interval typmod as SQL text after the type name (PostgreSQL's
+/// `timestamptypmodout` / `intervaltypmodout`): `(3)`, ` day to second(3)`, ` year`.
+pub(crate) fn temporal_typmod_text(tm: TemporalTypmod) -> String {
+    let prec = tm.precision.map_or(String::new(), |p| format!("({p})"));
+    match crate::interval::qualifier(tm.fields) {
+        Some(q) => format!(" {}{prec}", q.name),
+        None => prec,
     }
 }
 
@@ -390,6 +420,8 @@ pub struct CompositeField {
     /// The `varchar(n)` max-length typmod when `ty` is `text`, else `None` (mirrors `Column`,
     /// spec/design/types.md §15).
     pub varchar_len: Option<u32>,
+    /// The timestamp precision / interval qualifier typmod (mirrors `Column`).
+    pub temporal: Option<TemporalTypmod>,
     /// Whether the field was declared `NOT NULL`.
     pub not_null: bool,
 }
@@ -618,6 +650,8 @@ pub struct ColField {
     pub typmod: Option<DecimalTypmod>,
     /// The `varchar(n)` max-length typmod when `ty` is `text` (spec/design/types.md §15).
     pub varchar_len: Option<u32>,
+    /// The timestamp precision / interval qualifier typmod (mirrors `Column`).
+    pub temporal: Option<TemporalTypmod>,
     pub not_null: bool,
 }
 
@@ -643,6 +677,7 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
                         ty: resolve_col_type(&f.ty, types),
                         typmod: f.decimal,
                         varchar_len: f.varchar_len,
+                        temporal: f.temporal,
                         not_null: f.not_null,
                     })
                     .collect(),
@@ -665,6 +700,7 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
                     ty: resolve_col_type(ty, types),
                     typmod: None,
                     varchar_len: None,
+                    temporal: None,
                     not_null: false,
                 })
                 .collect(),

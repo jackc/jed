@@ -632,11 +632,34 @@ pub struct ColumnDef {
 
 /// A parsed type modifier: a precision and an optional scale, as written
 /// (`numeric(p)` → `scale = None`, `numeric(p,s)` → `scale = Some(s)`). The values are the
-/// raw lexed magnitudes; range validation (1..=1000, 0..=p; else 22023) is at resolve.
+/// raw lexed magnitudes; range validation (1..=1000, 0..=p; else 22023) is at resolve. An
+/// `interval` type name may instead carry a field qualifier (`interval DAY TO SECOND(3)` —
+/// spec/design/interval.md §6.1): `interval_fields` is its datetime_units.toml code and
+/// `precision` the optional `SECOND(p)`. Only an interval has no precision, so `precision` is
+/// `Some` for every other type modifier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TypeMod {
-    pub precision: u64,
+    pub precision: Option<u64>,
     pub scale: Option<u64>,
+    /// The interval field qualifier's code (1..=13), or 0 for none.
+    pub interval_fields: u8,
+}
+
+impl TypeMod {
+    /// The modifier as SQL text after its type name, in persisted-token spacing: `(p)`,
+    /// `(p, s)`, ` day to second (3)`.
+    pub fn render(&self) -> String {
+        let prec = match (self.precision, self.scale) {
+            (Some(p), Some(s)) => format!("({p}, {s})"),
+            (Some(p), None) => format!("({p})"),
+            (None, _) => String::new(),
+        };
+        match crate::interval::qualifier(self.interval_fields) {
+            Some(q) if prec.is_empty() => format!(" {}", q.name),
+            Some(q) => format!(" {} {prec}", q.name),
+            None => prec,
+        }
+    }
 }
 
 /// `INSERT INTO <table> [(col, ..)] ( DEFAULT VALUES | VALUES (..)[, (..)]* | <query> )`. The

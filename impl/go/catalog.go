@@ -20,6 +20,11 @@ type catColumn struct {
 	// over-length assignment traps 22001. Persisted as a u32 in the typmod slot (type_code 4,
 	// format_version 22).
 	VarcharLen *uint32
+	// Temporal is the timestamp(p) / timestamptz(p) precision or the interval qualifier and
+	// precision (spec/design/timestamp.md §8, interval.md §6.1), or nil for any other column OR an
+	// unmodified timestamp/interval. A stored value is rounded/cut to it. Persisted in the column
+	// entry's typmod slot when type_code is 9, 10, or 11 (format_version 43).
+	Temporal   *temporalTypmod
 	PrimaryKey bool
 	// NotNull is implied true for a PRIMARY KEY column.
 	NotNull bool
@@ -528,6 +533,8 @@ type compositeField struct {
 	// VarcharLen is the varchar(n) max-length typmod when Type is text, else nil (mirrors Column,
 	// spec/design/types.md §15).
 	VarcharLen *uint32
+	// Temporal is the timestamp precision / interval qualifier typmod (mirrors Column).
+	Temporal *temporalTypmod
 	// NotNull is whether the field was declared NOT NULL.
 	NotNull bool
 }
@@ -571,7 +578,9 @@ type colField struct {
 	Typmod *decimalTypmod
 	// VarcharLen is the varchar(n) max-length typmod when Type is text (spec/design/types.md §15).
 	VarcharLen *uint32
-	NotNull    bool
+	// Temporal is the timestamp precision / interval qualifier typmod (mirrors catColumn).
+	Temporal *temporalTypmod
+	NotNull  bool
 }
 
 // ScalarColType wraps a scalar type as a (scalar) ColType.
@@ -643,6 +652,7 @@ func resolveColType(ty dataType, types map[string]*compositeType) colType {
 			Type:       resolveColType(f.Type, types),
 			Typmod:     f.Decimal,
 			VarcharLen: f.VarcharLen,
+			Temporal:   f.Temporal,
 			NotNull:    f.NotNull,
 		}
 	}

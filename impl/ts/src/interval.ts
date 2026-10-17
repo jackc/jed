@@ -15,6 +15,8 @@ import {
   NEG_INFINITY,
   POS_INFINITY,
 } from "./timestamp.ts";
+import { INTERVAL_QUALIFIERS, type IntervalQualifier } from "./datetime_units_gen.ts";
+import type { TemporalTypmod } from "./types.ts";
 
 const MICROS_PER_SEC = 1_000_000n;
 // Microseconds in one day — the canonical "1 day = 24 h" span weight.
@@ -1058,8 +1060,9 @@ function adjustYears(val: bigint, scale: bigint, itm: ItmIn): void {
 
 // PG's DecodeTimeForInterval (DecodeTimeCommon): a time field H:M, H:M:S[.f], or M:S.f (two parts
 // with a fraction are minutes and seconds). The time REPLACES itm.usec, as in PG — so a fractional
-// unit to the time's left (read earlier) loses its µs part.
-function decodeTimeForInterval(s: string, itm: ItmIn): void {
+// unit to the time's left (read earlier) loses its µs part. Under MINUTE TO SECOND (mmSS) a bare
+// `a:b` is minutes:seconds (PG DecodeTimeCommon).
+function decodeTimeForInterval(s: string, mmSS: boolean, itm: ItmIn): void {
   const h = strtoi64(s);
   let hour = h[0];
   let cp = s.slice(h[1]);
@@ -1070,7 +1073,14 @@ function decodeTimeForInterval(s: string, itm: ItmIn): void {
   let sec = 0n;
   let fsec = 0n;
   if (cp.length === 0) {
-    // H:M
+    if (mmSS) {
+      // M:S under MINUTE TO SECOND
+      if (hour < I32_MIN || hour > I32_MAX) throw OVERFLOW;
+      sec = minute;
+      minute = hour;
+      hour = 0n;
+    }
+    // else H:M
   } else if (cp.charCodeAt(0) === CH_DOT) {
     // mm:ss.fff
     fsec = parseFractionalSecond(cp);
@@ -1101,8 +1111,12 @@ function decodeTimeForInterval(s: string, itm: ItmIn): void {
 // so a unit word is met before the number it applies to. A number with no unit takes the last unit
 // read: seconds at the right end, then whatever unit was read last — except that after an hour or
 // a time field the next unitless number is days ('1 1:00', '5 1 hour'). N-M is years-months.
-// Returns whether the input was `infinity` / `-infinity`.
-function decodeInterval(fields: DtField[], itm: ItmIn): boolean {
+// A field qualifier (`range`, its datetime_units.toml code, 0 for none) gives the rightmost unitless
+// number its least field's unit ('5' DAY is 5 days) and makes `a:b` read as mm:ss under MINUTE TO
+// SECOND (interval.md §6.1). Returns whether the input was `infinity` / `-infinity`.
+function decodeInterval(fields: DtField[], range: number, itm: ItmIn): boolean {
+  const qual = intervalQualifier(range);
+  const mmSS = qual?.mmSS === true;
   let isBefore = false;
   let parsingUnitVal = false;
   let infinite = false;
@@ -1114,7 +1128,7 @@ function decodeInterval(fields: DtField[], itm: ItmIn): boolean {
     let tmask = 0;
     let ftype = f.ftype;
     if (ftype === "time") {
-      decodeTimeForInterval(f.text, itm);
+      decodeTimeForInterval(f.text, mmSS, itm);
       tmask = FIELD_TIME;
       ty = DTK_DAY;
       parsingUnitVal = false;
@@ -1123,7 +1137,7 @@ function decodeInterval(fields: DtField[], itm: ItmIn): boolean {
       let isTime = false;
       if (f.text.slice(1).includes(":")) {
         try {
-          decodeTimeForInterval(f.text.slice(1), itm);
+          decodeTimeForInterval(f.text.slice(1), mmSS, itm);
           isTime = true;
         } catch (e) {
           if (!(e instanceof DtError)) throw e;
@@ -1139,7 +1153,8 @@ function decodeInterval(fields: DtField[], itm: ItmIn): boolean {
       }
     }
     if (ftype === "number" || ftype === "date") {
-      if (ty === IGNORE_DTF) ty = DTK_SECOND;
+      // the qualifier's least field decides what the rightmost number is
+      if (ty === IGNORE_DTF) ty = leastFieldDtk(qual);
       const s = f.text;
       const parsed = strtoi64(s);
       let val = parsed[0];
@@ -1551,11 +1566,42 @@ function decodeIso8601Interval(s: string, itm: ItmIn): void {
 // (spec/design/interval.md §3): the PostgreSQL / SQL-standard field syntax, else ISO 8601.
 // Malformed input is 22007; a field beyond its range is 22008 (PG's 22015).
 export function parseInterval(input: string): Interval {
+  return parseIntervalRanged(input, 0);
+}
+
+// parseIntervalTypmod parses interval text for a target carrying a type modifier — PostgreSQL's
+// interval_in with a typmod (interval.md §6.1): the qualifier steers the parse, then the value is
+// cut to it and rounded to its precision (adjustIntervalForTypmod). null is plain parseInterval.
+export function parseIntervalTypmod(input: string, typmod: TemporalTypmod | null): Interval {
+  if (typmod === null) return parseInterval(input);
+  return adjustIntervalForTypmod(parseIntervalRanged(input, typmod.fields), typmod);
+}
+
+// leastFieldDtk is the DTK unit a qualifier's least field gives the rightmost unitless number
+// (seconds with no qualifier).
+function leastFieldDtk(q: IntervalQualifier | null): number {
+  switch (q?.least) {
+    case "year":
+      return DTK_YEAR;
+    case "month":
+      return DTK_MONTH;
+    case "day":
+      return DTK_DAY;
+    case "hour":
+      return DTK_HOUR;
+    case "minute":
+      return DTK_MINUTE;
+    default:
+      return DTK_SECOND;
+  }
+}
+
+function parseIntervalRanged(input: string, range: number): Interval {
   const itm: ItmIn = { usec: 0n, mday: 0n, mon: 0n, year: 0n };
   let infinite = false;
   try {
     try {
-      infinite = decodeInterval(parseDateTime(input), itm);
+      infinite = decodeInterval(parseDateTime(input), range, itm);
     } catch (e) {
       if (e !== BAD) throw e;
       decodeIso8601Interval(input, itm);
@@ -1571,6 +1617,62 @@ export function parseInterval(input: string): Interval {
   const months = itm.year * MONTHS_PER_YEAR + itm.mon;
   if (months < I32_MIN || months > I32_MAX) throw intervalFieldOverflow("interval out of range");
   return { months: Number(months), days: Number(itm.mday), micros: itm.usec };
+}
+
+// --- type modifiers (interval.md §6.1) ----------------------------------------
+
+// MAX_INTERVAL_PRECISION is the largest interval precision (PostgreSQL's MAX_INTERVAL_PRECISION); a
+// larger declared precision is reduced to it.
+export const MAX_INTERVAL_PRECISION = 6;
+
+// intervalQualifier is the interval field qualifier with stable `code`
+// (spec/types/datetime_units.toml), or null for code 0 (no qualifier) or an unknown code.
+export function intervalQualifier(code: number): IntervalQualifier | null {
+  return INTERVAL_QUALIFIERS.find((q) => q.code === code) ?? null;
+}
+
+// intervalQualifierByName is the qualifier written as `name` ("day to second"), if it is one of the
+// thirteen.
+export function intervalQualifierByName(name: string): IntervalQualifier | null {
+  return INTERVAL_QUALIFIERS.find((q) => q.name === name) ?? null;
+}
+
+// adjustIntervalForTypmod cuts an interval to a type modifier — PostgreSQL's
+// AdjustIntervalForTypmod: the fields below the qualifier's least field go (YEAR keeps whole years
+// of the months and zeroes days and time; MONTH zeroes days and time; DAY zeroes the time; HOUR and
+// MINUTE truncate the time toward zero — higher fields are kept), then the time rounds half away
+// from zero to the precision. A rounding that overflows is 22008.
+export function adjustIntervalForTypmod(iv: Interval, typmod: TemporalTypmod): Interval {
+  const out: Interval = { months: iv.months, days: iv.days, micros: iv.micros };
+  switch (intervalQualifier(typmod.fields)?.least) {
+    case "year":
+      out.months = Math.trunc(out.months / 12) * 12;
+      out.days = 0;
+      out.micros = 0n;
+      break;
+    case "month":
+      out.days = 0;
+      out.micros = 0n;
+      break;
+    case "day":
+      out.micros = 0n;
+      break;
+    case "hour":
+      out.micros = (out.micros / USECS_PER_HOUR) * USECS_PER_HOUR;
+      break;
+    case "minute":
+      out.micros = (out.micros / USECS_PER_MINUTE) * USECS_PER_MINUTE;
+      break;
+  }
+  if (typmod.precision !== null && typmod.precision < MAX_INTERVAL_PRECISION) {
+    const scale = 10n ** BigInt(MAX_INTERVAL_PRECISION - typmod.precision);
+    const offset = scale / 2n;
+    const shifted = out.micros >= 0n ? out.micros + offset : out.micros - offset;
+    if (shifted < I64_MIN || shifted > I64_MAX)
+      throw intervalFieldOverflow("interval out of range");
+    out.micros = shifted - (shifted % scale);
+  }
+  return out;
 }
 
 // --- rendering ---------------------------------------------------------------
