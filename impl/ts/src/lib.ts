@@ -199,6 +199,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json[b]_object_agg[_unique] (B4) — the JSON-object aggregate builders (json-sql-functions.md §4).
   // Aggregate a group's (key, value) pairs into one JSON object; _unique errors 22030 on a dup key.
   "func.json_object_agg",
+  // regr_r2(Y, X) — the square of the correlation coefficient (aggregates.md §23).
+  "func.regr_r2",
   // regr_intercept(Y, X) — the least-squares intercept (aggregates.md §23).
   "func.regr_intercept",
   // regr_slope(Y, X) — the least-squares slope (aggregates.md §23).

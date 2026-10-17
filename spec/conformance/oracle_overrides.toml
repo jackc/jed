@@ -2045,3 +2045,33 @@ reason = "jed: regr_intercept over integer/decimal arguments is exact (aggregate
 file = "aggregates/regr_intercept.test"
 sql = "SELECT regr_intercept(fy, x) FROM t"
 reason = "jed: float is a strict island — no implicit integer↔float conversion — so regr_intercept(f64, i32) matches neither the float nor the exact overload: 42883. PostgreSQL casts both arguments to float8."
+
+[[override]]
+file = "aggregates/regr_r2.test"
+sql = "SELECT regr_r2(y, x) FROM t"
+reason = "jed: regr_r2 over integer/decimal arguments is exact (aggregates.md §23), equal to PostgreSQL's numeric evaluation of its formula; PostgreSQL defines regr_r2 only over float8."
+
+[[override]]
+file = "aggregates/regr_r2.test"
+sql = "SELECT regr_r2(dy, dx), regr_r2(y, dx) FROM t"
+reason = "jed: regr_r2 over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/regr_r2.test"
+sql = "SELECT g, regr_r2(dy, x) FROM t GROUP BY g"
+reason = "jed: regr_r2 over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/regr_r2.test"
+sql = "SELECT regr_r2(DISTINCT y, y) FROM t"
+reason = "jed: regr_r2 over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/regr_r2.test"
+sql = "SELECT regr_r2(y, x) FROM big"
+reason = "jed: regr_r2 over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/regr_r2.test"
+sql = "SELECT regr_r2(fy, x) FROM t"
+reason = "jed: float is a strict island — no implicit integer↔float conversion — so regr_r2(f64, i32) matches neither the float nor the exact overload: 42883. PostgreSQL casts both arguments to float8."

@@ -6229,6 +6229,26 @@ result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
 
+[[aggregate]]
+name         = "regr_r2"
+kind         = "aggregate"
+surface      = "regr_r2"
+arg          = "expr"
+arg_families = ["exact_numeric", "exact_numeric"]
+result       = "decimal"
+null         = "aggregate"
+errors       = ["22003"]
+
+[[aggregate]]
+name         = "regr_r2"
+kind         = "aggregate"
+surface      = "regr_r2"
+arg          = "expr"
+arg_families = ["float", "float"]
+result       = "f64"
+null         = "aggregate"
+errors       = ["22003"]
+
 # array_agg(any) -> array_of_input (aggregates.md §23): the inputs, NULLs included, in fold order —
 # a 1-D T[] for a non-array T; over an array input, the inputs stacked into one more dimension of the
 # same array type (each input non-NULL, non-empty, and the first input's shape: 22004 / 2202E; 54000

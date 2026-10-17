@@ -772,6 +772,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `regr_sxy(y, x)` | two exact / two float | `decimal` / `f64` | the sum of products of the deviations |
 | `regr_slope(y, x)` | two exact / two float | `decimal` / `f64` | the least-squares slope |
 | `regr_intercept(y, x)` | two exact / two float | `decimal` / `f64` | the least-squares intercept |
+| `regr_r2(y, x)` | two exact / two float | `decimal` / `f64` | the square of the correlation coefficient |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -900,3 +901,4 @@ with the one-argument float forms (`float-moment-order`).
 | `regr_sxy(y, x)` | `numXY / N` | `Sxy` | no pair |
 | `regr_slope(y, x)` | `numXY / numX` | `Sxy / Sxx` | no pair, or `numX` / `Sxx` is 0 |
 | `regr_intercept(y, x)` | `(Σy·Σx² − Σx·Σxy) / numX` | `(Σy − Σx·Sxy / Sxx) / N` | no pair, or `numX` / `Sxx` is 0 |
+| `regr_r2(y, x)` | `(numXY·numXY) / (numX·numY)`; 1 when `numY` is 0 | `(Sxy·Sxy) / (Sxx·Syy)`; 1 when `Syy` is 0 | no pair, or `numX` / `Sxx` is 0 |

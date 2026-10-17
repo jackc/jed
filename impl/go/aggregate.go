@@ -228,6 +228,8 @@ const (
 	planRegrSlopeFloat
 	planRegrIntercept
 	planRegrInterceptFloat
+	planRegrR2
+	planRegrR2Float
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -635,9 +637,9 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		return a.exact.fold(v, m)
 	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		return a.float.fold(v)
-	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy, planRegrSxy, planRegrSlope, planRegrIntercept:
+	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy, planRegrSxy, planRegrSlope, planRegrIntercept, planRegrR2:
 		return a.pairs.fold(v, m)
-	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat, planRegrSyyFloat, planRegrSxyFloat, planRegrSlopeFloat, planRegrInterceptFloat:
+	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat, planRegrSyyFloat, planRegrSxyFloat, planRegrSlopeFloat, planRegrInterceptFloat, planRegrR2Float:
 		return a.fpair.fold(v)
 	case planRegrCount:
 		if f := *v.composite(); !f[0].IsNull() && !f[1].IsNull() {
@@ -978,9 +980,9 @@ func (a *acc) finalize() (Value, error) {
 	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		st := momentStats[a.plan]
 		return a.float.variance(st.sample, st.stddev), nil
-	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy, planRegrSxy, planRegrSlope, planRegrIntercept:
+	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy, planRegrSxy, planRegrSlope, planRegrIntercept, planRegrR2:
 		return a.pairs.finalize(pairStats[a.plan])
-	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat, planRegrSyyFloat, planRegrSxyFloat, planRegrSlopeFloat, planRegrInterceptFloat:
+	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat, planRegrSyyFloat, planRegrSxyFloat, planRegrSlopeFloat, planRegrInterceptFloat, planRegrR2Float:
 		return a.fpair.finalize(pairStats[a.plan]), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()

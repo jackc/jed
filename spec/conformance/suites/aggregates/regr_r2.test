@@ -1,0 +1,133 @@
+# Aggregate regr_r2(Y, X) (spec/design/aggregates.md §23): the square of the correlation coefficient of the pairs whose arguments are both non-NULL — 1 when Y is constant, NULL when X is. Over two float arguments it is
+# PostgreSQL's float8 algorithm with an f64 result; over two integer/decimal arguments it is exact, a
+# decimal result — a jed divergence (PostgreSQL defines it only over float8), ledgered in
+# oracle_overrides.toml, whose expected values are PostgreSQL's numeric evaluation of the formula in
+# aggregates.md §23. A pair with a NULL is skipped. Output name `regr_r2`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.regr_r2, func.covar_pop
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, y i32, x i32, dy numeric(6,2), dx numeric(6,1), fy f64, fx f64, ry f32, rx f32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1, 2, 1.50, 2.0, 1, 2, 1, 2), (2, 1, 3, 5, 2.25, 5.5, 3, 5, 3, 5), (3, 1, 4, 4, NULL, 4.5, 4, 4, 4, 4), (4, 1, 8, 9, 8.00, 9.0, 8, 9, 8, 9), (5, 2, NULL, 1, 1.00, NULL, NULL, 1, NULL, 1), (6, 2, 2, 3, 2.00, 3.0, 2, 3, 2, 3)
+
+# The arguments travel as one row: 6 rows read + 1 leaf page read + 6 row packs + 6 accumulated + 1
+# produced.
+# names: regr_r2
+# cost: 20
+query R nosort
+SELECT regr_r2(fy, fx) FROM t
+----
+0.9326796772377557
+
+# f32 arguments widen to f64.
+# names: regr_r2
+query R nosort
+SELECT regr_r2(ry, rx) FROM t
+----
+0.9326796772377557
+
+# names: g, regr_r2
+query IR rowsort
+SELECT g, regr_r2(fy, fx) FROM t GROUP BY g
+----
+1
+0.9245562130177515
+2
+NULL
+
+# One pair, and none (a pair with a NULL is skipped).
+# names: regr_r2
+query R nosort
+SELECT regr_r2(fy, fx) FROM t WHERE id = 6
+----
+NULL
+
+# names: regr_r2
+query R nosort
+SELECT regr_r2(fy, fx) FROM t WHERE id = 5
+----
+NULL
+
+# names: regr_r2
+query R nosort
+SELECT regr_r2(fy, fx * 2) FILTER (WHERE id > 1) FROM t
+----
+0.9059370010161126
+
+# names: id, regr_r2
+query IR nosort
+SELECT id, regr_r2(fy, fx) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+NULL
+2
+1
+3
+0.6173469387755102
+4
+0.9245562130177515
+5
+0.9245562130177515
+6
+0.9326796772377557
+
+# names: regr_r2
+query R nosort
+SELECT regr_r2(y, x) FROM (VALUES (1.0::f64, 'Infinity'::f64), (2.0::f64, 3.0::f64)) v(y, x)
+----
+NaN
+
+statement error 22003
+SELECT regr_r2(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
+
+# Over integer and decimal arguments: exact.
+# names: regr_r2
+# cost: 20
+query D nosort
+SELECT regr_r2(y, x) FROM t
+----
+0.93267967723775567649
+
+# names: regr_r2, regr_r2
+query DD nosort
+SELECT regr_r2(dy, dx), regr_r2(y, dx) FROM t
+----
+0.84776174598724746948
+0.92291598485202674272
+
+# names: g, regr_r2
+query ID rowsort
+SELECT g, regr_r2(dy, x) FROM t GROUP BY g
+----
+1
+0.89150229306736720246
+2
+1.00000000000000000000
+
+# names: regr_r2
+query D nosort
+SELECT regr_r2(DISTINCT y, y) FROM t
+----
+1.00000000000000000000
+
+# Wide decimals charge decimal_work for each pair's three products and five sums.
+statement ok
+CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
+
+statement ok
+INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
+
+# names: regr_r2
+# cost: 180
+query D nosort
+SELECT regr_r2(y, x) FROM big
+----
+0.16780821980207764727836576
+
+# A float argument beside an exact one has no overload.
+statement error 42883
+SELECT regr_r2(fy, x) FROM t
+
+statement error 42883
+SELECT regr_r2(y) FROM t
