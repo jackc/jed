@@ -32259,6 +32259,8 @@ export type AggPlan =
   // The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
   | "covarPop"
   | "covarPopFloat"
+  | "covarSamp"
+  | "covarSampFloat"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32801,13 +32803,16 @@ function foldFloatMoment(a: Acc, v: Value): void {
 // The two-argument statistical aggregates (aggregates.md §23) over (Y, X) pairs whose arguments are
 // both non-NULL. PAIR_SURFACES maps each to its exact and float plans; PAIR_STATS gives each plan its
 // statistic.
-type PairStat = "covarPop";
+type PairStat = "covarPop" | "covarSamp";
 const PAIR_SURFACES: Record<string, [AggPlan, AggPlan]> = {
   covar_pop: ["covarPop", "covarPopFloat"],
+  covar_samp: ["covarSamp", "covarSampFloat"],
 };
 const PAIR_STATS: Partial<Record<AggPlan, PairStat>> = {
   covarPop: "covarPop",
   covarPopFloat: "covarPop",
+  covarSamp: "covarSamp",
+  covarSampFloat: "covarSamp",
 };
 
 // pairArgs splits a two-argument statistical aggregate's Row(Y, X) operand; null for a pair with a
@@ -32834,9 +32839,10 @@ function foldExactPair(a: Acc, v: Value, m: Meter): void {
   a.momN += 1n;
 }
 
-// finalizeExactPair evaluates a two-argument statistic over the exact sums. With
-// numXY = N·Σxy − Σx·Σy computed exactly, covar_pop = numXY / (N·N); "/" is jed's decimal division
-// (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair.
+// finalizeExactPair evaluates a two-argument statistic over the exact sums, with the exact numerators
+// numX = N·Σx² − Σx·Σx, numY = N·Σy² − Σy·Σy, and numXY = N·Σxy − Σx·Σy; "/" is jed's decimal
+// division (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair, and where
+// the table in aggregates.md §23 says.
 function finalizeExactPair(stat: PairStat, n: bigint, sums: Decimal[]): Value {
   if (n === 0n) return nullValue();
   const [sx, , sy, , sxy] = sums as [Decimal, Decimal, Decimal, Decimal, Decimal];
@@ -32845,6 +32851,9 @@ function finalizeExactPair(stat: PairStat, n: bigint, sums: Decimal[]): Value {
   switch (stat) {
     case "covarPop":
       return decimalValue(numXY.div(count.mulExact(count)));
+    case "covarSamp":
+      if (n < 2n) return nullValue();
+      return decimalValue(numXY.div(count.mulExact(Decimal.fromBigInt(n - 1n))));
   }
 }
 
@@ -32896,13 +32905,15 @@ function foldFloatPair(a: Acc, v: Value): void {
 }
 
 // finalizeFloatPair is PostgreSQL's float8 final function for a two-argument statistic over
-// [N, Σx, Sxx, Σy, Syy, Sxy]: covar_pop = Sxy / N. NULL over no pair.
+// [N, Σx, Sxx, Σy, Syy, Sxy] (the table in aggregates.md §23). NULL over no pair.
 function finalizeFloatPair(stat: PairStat, t: number[]): Value {
   const [n, , , , , sxy] = t as [number, number, number, number, number, number];
   if (n < 1) return nullValue();
   switch (stat) {
     case "covarPop":
       return float64Value(sxy / n);
+    case "covarSamp":
+      return n < 2 ? nullValue() : float64Value(sxy / (n - 1));
   }
 }
 
@@ -32986,9 +32997,11 @@ export function cloneAcc(a: Acc): Acc {
 export function foldAcc(a: Acc, v: Value, m: Meter): void {
   switch (a.plan) {
     case "covarPop":
+    case "covarSamp":
       foldExactPair(a, v, m);
       break;
     case "covarPopFloat":
+    case "covarSampFloat":
       foldFloatPair(a, v);
       break;
     case "varPop":
@@ -33225,8 +33238,10 @@ export function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
 export function finalizeAcc(a: Acc): Value {
   switch (a.plan) {
     case "covarPop":
+    case "covarSamp":
       return finalizeExactPair(PAIR_STATS[a.plan]!, a.momN, a.pairSums);
     case "covarPopFloat":
+    case "covarSampFloat":
       return finalizeFloatPair(PAIR_STATS[a.plan]!, a.pairF);
     case "varPop":
     case "varPopFloat":

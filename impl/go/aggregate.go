@@ -208,6 +208,8 @@ const (
 	// The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
 	planCovarPop
 	planCovarPopFloat
+	planCovarSamp
+	planCovarSampFloat
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -615,9 +617,9 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		return a.exact.fold(v, m)
 	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		return a.float.fold(v)
-	case planCovarPop:
+	case planCovarPop, planCovarSamp:
 		return a.pairs.fold(v, m)
-	case planCovarPopFloat:
+	case planCovarPopFloat, planCovarSampFloat:
 		return a.fpair.fold(v)
 	case planStringAgg:
 		// A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
@@ -954,9 +956,9 @@ func (a *acc) finalize() (Value, error) {
 	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		st := momentStats[a.plan]
 		return a.float.variance(st.sample, st.stddev), nil
-	case planCovarPop:
+	case planCovarPop, planCovarSamp:
 		return a.pairs.finalize(pairStats[a.plan])
-	case planCovarPopFloat:
+	case planCovarPopFloat, planCovarSampFloat:
 		return a.fpair.finalize(pairStats[a.plan]), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
