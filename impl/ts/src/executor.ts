@@ -1883,7 +1883,7 @@ export class Engine {
   // TS models a "storage" it is an Engine, so this rides here.
   reclaimWithinSession: boolean;
   // liveAtCompaction is the reachable page count recorded at the last compaction — the cheap trigger
-  // basis: compaction re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit
+  // basis: compaction re-runs only once the pages off the free list pass ~2× it (periodic ~2× bound, no per-commit
   // walk).
   liveAtCompaction: number;
   // freeGenTxid is the version the current freePages list is "as of" — the last compaction's txid, or the

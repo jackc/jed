@@ -435,10 +435,10 @@ async function runOne(
     for (const sql of setupSqlFor(b, cfg.engine)) {
       await eng.exec(sql);
     }
-    // A scratch write_rollback table is built by setup_sql, so its expected post-run count is the
+    // A scratch write table is built by setup_sql, so its expected post-run count starts from the
     // count observed now rather than a dataset spec row count (benchmarks.md §8).
     const scratchRows =
-      b.kind === "write_rollback" && b.dataset === "scratch"
+      b.kind !== "query" && b.dataset === "scratch"
         ? await eng.queryInt(`SELECT count(*) FROM ${writeTable(b.sql)}`)
         : 0n;
 
@@ -545,7 +545,7 @@ async function runOne(
       const n = await eng.queryInt(`SELECT count(*) FROM ${table}`);
       const expect =
         b.kind !== "write_rollback"
-          ? BigInt(b.warmup + b.iterations)
+          ? scratchRows + (isInsert(b.sql) ? BigInt(b.warmup + b.iterations) : 0n)
           : b.dataset === "scratch"
             ? scratchRows
             : datasetTableRows(corpusDir, b.dataset, table);
@@ -655,6 +655,12 @@ async function runColdOpen(
 // preserves the historical lower-median definition for p50.
 export function percentile(sorted: bigint[], pct: number): bigint {
   return sorted[Math.floor(((sorted.length - 1) * pct) / 100)];
+}
+
+// isInsert reports whether a write bench's statement adds one row per iteration (an INSERT) rather
+// than changing rows in place (an UPDATE).
+export function isInsert(sql: string): boolean {
+  return /^\s*INSERT\b/i.test(sql);
 }
 
 // The target table of a write statement — the word after INTO (INSERT), UPDATE, or FROM (DELETE) —

@@ -551,9 +551,9 @@ fn run_one(
         eng.exec(sql)
             .map_err(|e| format!("setup_sql {sql:?}: {e}"))?;
     }
-    // A scratch write_rollback table is built by setup_sql, so its expected post-run count is the
+    // A scratch write table is built by setup_sql, so its expected post-run count starts from the
     // count observed now rather than a dataset spec row count (benchmarks.md §8).
-    let scratch_rows = if b.kind == "write_rollback" && b.dataset == "scratch" {
+    let scratch_rows = if b.kind != "query" && b.dataset == "scratch" {
         eng.query_int(&format!("SELECT count(*) FROM {}", write_table(&b.sql)))?
     } else {
         0
@@ -627,7 +627,8 @@ fn run_one(
         let expect = match b.kind.as_str() {
             "write_rollback" if b.dataset == "scratch" => scratch_rows,
             "write_rollback" => dataset_table_rows(corpus_dir, &b.dataset, &table)?,
-            _ => (b.warmup + b.iterations) as i64,
+            _ if is_insert(&b.sql) => scratch_rows + (b.warmup + b.iterations) as i64,
+            _ => scratch_rows,
         };
         if n != expect {
             return Err(format!("post-run count(*) of {table}: got {n}, want {expect}").into());
@@ -786,6 +787,14 @@ fn run_concurrent(
 /// preserves the historical lower-median definition for p50.
 fn percentile(sorted: &[i64], pct: usize) -> i64 {
     sorted[(sorted.len() - 1) * pct / 100]
+}
+
+/// Whether a write bench's statement adds one row per iteration (an INSERT) rather than changing
+/// rows in place (an UPDATE).
+fn is_insert(sql: &str) -> bool {
+    sql.split_whitespace()
+        .next()
+        .is_some_and(|f| f.eq_ignore_ascii_case("INSERT"))
 }
 
 // The target table of a write statement — the word after INTO (INSERT), UPDATE, or FROM (DELETE) —

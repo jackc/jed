@@ -2794,20 +2794,31 @@ pub(crate) fn reachable_pages(
 /// that, a short open→commit→close session would leak them forever (open no longer reconstructs the
 /// free-list, v25). Two modes:
 ///
-/// - **Compact** (periodic — the high-water has grown past ~2× the live count at the last compaction,
-///   and no reader pins an older version): the persisted list is the full reachable-complement
+/// - **Compact** (periodic — the pages off the free list have grown past ~2× the live count at the
+///   last compaction, [`reclaim_due`], and no reader pins an older version): the persisted list is the full reachable-complement
 ///   `[2, page_count) − reached`, reclaiming every dead page. `written` (the pages this commit wrote)
 ///   is unioned into the live set so a wholesale-rewritten GiST R-tree is never freed; the catalog +
 ///   new overflow are covered by reading the just-written pages back (`reachable_pages`). The
 ///   O(live) walk is amortized to O(height)/commit by the ~2× trigger.
 /// - **Carry** (otherwise): the persisted list is `free_remaining` (the pages already free minus what
 ///   this commit consumed) — this commit's orphans wait for the next compaction (the file stays
-///   bounded in `[live, 2×live]`).
+///   within ~2× live).
 ///
 /// Either way the chain's own pages are drawn from `free_remaining` (safe to overwrite — dead at the
 /// fallback snapshot too), so persisting never grows the file (`serialize_free_list`). Returns the
 /// chain pages, its head, the list to keep as the new free-list, the new high-water, and the live
 /// count to remember (unchanged when not compacting). The caller has gated on the reader watermark.
+/// The periodic reclamation trigger (format.md *Reclamation*; the constants are shared data,
+/// memory.md §8.4): the pages below the high-water that are not on the free list — live pages plus
+/// dead ones no list holds yet — exceed `compact_min_pages` and `compact_growth` × the live count at
+/// the last reclamation. The high-water alone never shrinks, so it cannot be the measure: once a file
+/// crossed 2× live it would stay there and every later commit would walk.
+pub(crate) fn reclaim_due(page_count: u32, free: usize, live_at_compaction: u32) -> bool {
+    use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES};
+    let unlisted = (page_count as u64).saturating_sub(free as u64);
+    unlisted > COMPACT_MIN_PAGES as u64 && unlisted > COMPACT_GROWTH * live_at_compaction as u64
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_free_list(
     snap: &Snapshot,
@@ -2824,14 +2835,12 @@ pub(crate) fn plan_free_list(
     can_reuse: bool,
     live_pages: u32,
 ) -> Result<CommitPlan> {
-    use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES}; // shared data (memory.md §8.4)
     // `live_at_compaction == 0` marks a store whose reclaimable set is unknown, so a commit that may
     // reclaim reconstructs it immediately even for a small file. Ordinary stores retain the amortized
-    // >16-page / >2× trigger.
+    // periodic trigger.
     let compact = can_reclaim
         && (live_at_compaction == 0
-            || (page_count > COMPACT_MIN_PAGES
-                && (page_count as u64) > COMPACT_GROWTH * live_at_compaction as u64));
+            || reclaim_due(page_count, free_remaining.len(), live_at_compaction));
     let (persist_list, new_live, new_gen) = if compact {
         let mut reached = reachable_pages(snap, paging, cat_root)?;
         for (index, _) in written {

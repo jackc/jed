@@ -59,7 +59,7 @@ type engine struct {
 	freePages []uint32
 	// liveAtCompaction is the live (reachable) page count recorded at this handle's last within-session
 	// compaction — the cheap periodic trigger basis (v25): a bare-engine file commit re-runs the
-	// reclamation walk only once the high-water passes ~2× it, mirroring storage (shared.go). 0 for an
+	// reclamation walk only once the pages off the free list pass ~2× it, mirroring storage (shared.go). 0 for an
 	// in-memory database (no persistence).
 	liveAtCompaction uint32
 	// live is the live-page accounting of the committed file state (spec/design/memory.md §8.7): read

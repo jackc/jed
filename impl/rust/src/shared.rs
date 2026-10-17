@@ -302,7 +302,7 @@ pub(crate) struct Storage {
     /// `temp_buffers` instead of pinned. Always `false` for a main or attached domain.
     spilled: bool,
     /// The reachable page count recorded at the last compaction — the cheap trigger basis: compaction
-    /// re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).
+    /// re-runs only once the pages off the free list pass ~2× it (periodic ~2× bound, no per-commit walk).
     live_at_compaction: u32,
     /// The version the current `free_pages` list is "as of" — the last compaction's txid, or the
     /// committed version at open. It gates within-session reuse under the reader-liveness watermark
@@ -878,8 +878,8 @@ impl Storage {
     /// (session temp, in-memory attachments, in-memory main), which need no *persisted* free-list. (A
     /// file-backed store instead reclaims **in-commit** so the reclaimed list is durable — `plan_free_list`.)
     /// A no-op for a non-reclaim domain; deferred while an older version is pinned (`can_reclaim` false);
-    /// periodic — walks (O(pages)) only once the high-water passes ~2× the live count at the last
-    /// compaction, so `page_count` oscillates in `[live, 2×live]` and the walk is amortized
+    /// periodic — walks (O(pages)) only once the pages off the free list pass ~2× the live count at
+    /// the last compaction ([`reclaim_due`](crate::format::reclaim_due)), so the walk is amortized
     /// O(height)/commit. `written` is the pages **this commit wrote** — unioned into the live set so a
     /// live GiST R-tree (rewritten wholesale each commit, invisible to `reachable_pages`) is never freed.
     pub(crate) fn maybe_compact(
@@ -889,13 +889,14 @@ impl Storage {
         written: &[u32],
         can_reclaim: bool,
     ) -> Result<()> {
-        use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES}; // shared data (memory.md §8.4)
         if !self.reclaim_within_session || !can_reclaim {
             return Ok(());
         }
-        if self.page_count <= COMPACT_MIN_PAGES
-            || (self.page_count as u64) <= COMPACT_GROWTH * self.live_at_compaction as u64
-        {
+        if !crate::format::reclaim_due(
+            self.page_count,
+            self.free_pages.len(),
+            self.live_at_compaction,
+        ) {
             return Ok(());
         }
         let mut reached = crate::format::reachable_pages(snap, &self.paging, cat_root)?;
@@ -4339,6 +4340,73 @@ mod temp_reclaim_internal_tests {
             after - with_reader_open <= 64,
             "after the reader closed, compaction should reuse pages, not keep growing: {with_reader_open} then {after}",
         );
+    }
+
+    /// The periodic reclamation trigger (format.md *Reclamation*) measures the pages off the free
+    /// list, not the high-water, which never shrinks: measured by the high-water, every commit after
+    /// the first crossing walked the whole database again. Churns one row past the threshold, then
+    /// counts walks (each moves `free_gen_txid` to its commit's snapshot) over further commits.
+    fn churn_counting_walks(db: &Database) -> usize {
+        const ROUNDS: usize = 200;
+        let mut sess = db.session(SessionOptions::default());
+        sess.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+            .unwrap();
+        sess.query_outcome(
+            "INSERT INTO t SELECT g, 'pad-pad-pad-pad-pad-pad-pad-pad' FROM generate_series(1, 1000) g",
+            &[],
+        )
+        .unwrap();
+        let update = |sess: &mut Session, k: usize| {
+            sess.query_outcome(&format!("UPDATE t SET pad = 'r{k}' WHERE id = 500"), &[])
+                .unwrap();
+        };
+        let generation = || db.0.storage.lock().unwrap().free_gen_txid;
+        for k in 0..ROUNDS {
+            update(&mut sess, k);
+        }
+        assert_ne!(generation(), 0, "the warm-up churn never reclaimed");
+        let mut walks = 0;
+        for k in 0..ROUNDS {
+            let before = generation();
+            update(&mut sess, ROUNDS + k);
+            if generation() != before {
+                walks += 1;
+            }
+        }
+        assert!(
+            walks > 0 && walks <= ROUNDS / 10,
+            "{walks} of {ROUNDS} steady commits walked the database (want between 1 and {})",
+            ROUNDS / 10,
+        );
+        walks
+    }
+
+    #[test]
+    fn reclaim_trigger_file_commits_do_not_walk_every_time() {
+        let path =
+            std::env::temp_dir().join(format!("jed_reclaim_trigger_{}.jed", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::create(CreateOptions {
+            path: Some(path.clone()),
+            skip_fsync: true,
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
+        churn_counting_walks(&db);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reclaim_trigger_in_memory_commits_do_not_walk_every_time() {
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
+        db.0.storage.lock().unwrap().reclaim_within_session = true;
+        churn_counting_walks(&db);
     }
 
     #[test]

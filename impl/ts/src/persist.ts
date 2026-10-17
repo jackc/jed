@@ -9,7 +9,6 @@
 
 import type { Engine, Snapshot } from "./executor.ts";
 import { buildCommitManifest, metaChecksum } from "./commit_manifest.ts";
-import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import { engineError } from "./errors.ts";
 import type { FileHost } from "./filehost.ts";
 import { cacheLeaves } from "./paging.ts";
@@ -23,6 +22,7 @@ import {
   metaPage,
   planFreeList,
   reachablePages,
+  reclaimDue,
   ROOT_PAGE,
   unassignPages,
   verifyLiveCount,
@@ -409,8 +409,8 @@ export function commitDurableAttachment(
 //   - a no-op for a non-reclaim domain (reclaimWithinSession false);
 //   - deferred while any older version is pinned (canReclaim false): compaction frees pages unreachable
 //     from the committed root, which an older reader may still observe, so it waits for the pins to drain;
-//   - periodic: it walks (O(pages)) only once the high-water passes ~2× the live count at the last
-//     compaction, so pageCount oscillates in [live, 2×live] and the walk is amortized O(height)/commit.
+//   - periodic: it walks (O(pages)) only once the pages off the free list pass ~2× the live count at
+//     the last compaction (reclaimDue), so the walk is amortized O(height)/commit.
 // written is the pages THIS commit wrote — unioned into the live set so a live GiST R-tree (rewritten
 // wholesale each commit, invisible to reachablePages) is never freed. canReclaim is the caller's
 // watermark decision.
@@ -422,9 +422,7 @@ export function maybeCompact(
   canReclaim: boolean,
 ): void {
   if (!db.reclaimWithinSession || !canReclaim || db.paging === null) return;
-  // The trigger constants are shared data (memory.md §8.4).
-  if (db.pageCount <= COMPACT_MIN_PAGES || db.pageCount <= COMPACT_GROWTH * db.liveAtCompaction)
-    return;
+  if (!reclaimDue(db.pageCount, db.freePages.length, db.liveAtCompaction)) return;
   const reached = reachablePages(snap, db.paging, catRoot);
   for (const p of written) reached.add(p);
   const free: number[] = [];

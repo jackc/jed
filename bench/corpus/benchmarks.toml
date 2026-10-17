@@ -1565,6 +1565,42 @@ gen = "text"
 min_len = 8
 max_len = 32
 
+# Durable single-row UPDATE churn over a preloaded 100k-row table: the steady state of a long-lived
+# file. Each commit orphans its root→leaf path, and the free list absorbs them until the periodic
+# reclamation walk (format.md *Reclamation*) rebuilds it. The warmup crosses that walk's threshold,
+# so the measured commits show whether the O(live) walk stays amortized or runs on every commit.
+[[bench]]
+name = "update_commit_durable"
+description = "Durable single-row UPDATE commits over a preloaded 100k-row table: one UPDATE per commit, full fsync path"
+dataset = "scratch"
+kind = "write_durable"
+sql = "UPDATE churn SET v = $2 WHERE id = $1"
+warmup = 400
+iterations = 400
+seed = 4290
+setup_sql = [
+  "DROP TABLE IF EXISTS churn",
+  "CREATE TABLE churn (id bigint PRIMARY KEY, v integer)",
+  "INSERT INTO churn WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 100000) SELECT x, 0 FROM g"
+]
+
+[bench.setup_sql_override]
+sqlite = [
+  "DROP TABLE IF EXISTS churn",
+  "CREATE TABLE churn (id INTEGER PRIMARY KEY, v INTEGER)",
+  "INSERT INTO churn WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 100000) SELECT x, 0 FROM g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 99999
+
 # Text-heavy rows (benchmarks.md §11) over the `text` dataset: 5,000 bodies of 1,000–16,000
 # compressible characters, so most rows store their body LZ4-compressed and the longest ones in an
 # overflow chain (datasets.toml). The scan reads and decompresses every body; the point read returns

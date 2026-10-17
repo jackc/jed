@@ -1627,10 +1627,20 @@ the new one no longer does. Two mechanisms recover them; through v24 only the fi
 
 - **Continuous within-session reclamation (v25).** Pages an old root orphans **during** the
   session are returned to the free-list **within the session** (not only at the next open):
-  periodically — once the high-water passes ~2× the live page count — the writer rebuilds the
-  free-list as `[2, page_count)` minus the pages reachable from the committed root (the catalog
-  chain, every table/index node, live overflow chains, **and** the current free-list pages), so
-  `page_count` oscillates in `[live, 2×live]` and the rebuild is amortized O(height)/commit. This
+  periodically, the writer rebuilds the free-list as `[2, page_count)` minus the pages reachable
+  from the committed root (the catalog chain, every table/index node, live overflow chains, **and**
+  the current free-list pages). **The trigger** measures the pages **off the free list** —
+  `page_count − |free-list|`, the live pages plus the dead ones no list holds yet — not the
+  high-water: a commit rebuilds when that count, taken after its own tree and catalog pages are
+  allocated, exceeds both `compact_min_pages` and `compact_growth × L`, where `L` is the live count
+  the last rebuild found (seeded at open with `page_count − |free-list|`; the constants are
+  `[reclamation]` in `spec/cost/schedule.toml`). The high-water never shrinks (nothing truncates
+  the file), so a trigger on `page_count` alone would, once a file first passed `2 × L`, stay true
+  and walk the whole database on every later commit. Measured off the list, a rebuild returns the
+  count to `L`, the next one waits until about `L` more dead pages have accumulated, and the
+  rebuild is amortized O(height)/commit. The file grows only when the free-list is empty, when
+  every page below the high-water is off the list, so `page_count` stays within about `2 ×` the
+  largest live count. This
   is what keeps the **persisted** free-list bounded: without it, orphans would accumulate untouched
   (reconstruct-on-open used to sweep them, but v25 no longer walks on open), so the file would grow
   without bound across sessions. A pure in-memory database (no meta, never reopened) gets this

@@ -556,6 +556,8 @@ struct SimDb {
     // engine's reclamation trigger compares against, and what the previous commit left.
     /// The page high-water now.
     high: u32,
+    /// The free list the next commit allocates from.
+    free: u32,
     /// ≥ the engine's live-at-last-reclamation.
     lac_bound: u32,
     /// The previous commit in this lifetime.
@@ -583,6 +585,7 @@ impl SimDb {
             floor: 0,
             max_attempted: 0,
             high: 0,
+            free: 0,
             lac_bound: 0,
             last: Growth::default(),
         }
@@ -1929,18 +1932,22 @@ impl<'a> Runner<'a> {
         let (pc, free) = self.allocator(name);
         let d = self.sdb(name);
         d.high = pc;
+        d.free = free;
         d.lac_bound = pc.wrapping_sub(free);
         d.last = Growth::default();
     }
 
     /// Check the reader-aware bounded-growth invariant after a commit published a new version of
     /// database `name` (simulation-testing.md §8.3). With no reader pinned, no other process, and no
-    /// fault, the engine reclaims in the commit once the high-water passes compact_growth × the live
-    /// count at its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so
-    /// a commit with one open is not checked. Two checks follow:
-    ///   - a quiet commit that began past max(compact_min_pages, compact_growth × an upper bound on
-    ///     that live count) must have reclaimed: every page below the high-water is meta, live, free,
-    ///     or written by the commit itself (its manifest and free-list pages);
+    /// fault, the engine reclaims in the commit once the pages off its free list pass compact_growth
+    /// × the live count at its last reclamation (memory.md §8.4); readers legitimately hold
+    /// reclamation back, so a commit with one open is not checked. A commit only adds pages off the
+    /// list (each page it allocates leaves the list or grows the file), so the count it began with is
+    /// a lower bound. Two checks follow:
+    ///   - a quiet commit that began with more pages off the list than max(compact_min_pages,
+    ///     compact_growth × an upper bound on that live count) must have reclaimed: every page below
+    ///     the high-water is meta, live, free, or written by the commit itself (its manifest and
+    ///     free-list pages);
     ///   - the next quiet commit reuses that free list before it grows the file.
     fn check_growth(&mut self, i: usize, name: &str, quiet: bool) {
         if self.service {
@@ -1961,9 +1968,9 @@ impl<'a> Runner<'a> {
                 disk.written_pages(id).iter().filter(|pg| **pg >= 2).count() as u32
             })
         };
-        let (before, high, lac_bound) = {
+        let (before, unlisted, lac_bound) = {
             let d = &self.dbs[name];
-            (d.last, d.high, d.lac_bound)
+            (d.last, d.high.wrapping_sub(d.free), d.lac_bound)
         };
         if quiet
             && before.reclaimed
@@ -1980,7 +1987,8 @@ impl<'a> Runner<'a> {
             return;
         }
         let mut reclaimed = false;
-        if quiet && high as u64 > (COMPACT_MIN_PAGES as u64).max(COMPACT_GROWTH * lac_bound as u64)
+        if quiet
+            && unlisted as u64 > (COMPACT_MIN_PAGES as u64).max(COMPACT_GROWTH * lac_bound as u64)
         {
             reclaimed = true;
             let leaked = pc.wrapping_sub(2).wrapping_sub(live).wrapping_sub(free);
@@ -1996,6 +2004,7 @@ impl<'a> Runner<'a> {
         }
         let d = self.sdb(name);
         d.high = pc;
+        d.free = free;
         d.lac_bound = d.lac_bound.max(live.wrapping_add(written));
         d.last = Growth {
             reclaimed,
