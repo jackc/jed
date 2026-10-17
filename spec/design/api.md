@@ -149,9 +149,12 @@ unsupported requested mode fails closed `0A000`.
 
 A fifth value, **`service`**, is **test-only** until the page service's handoff phase replaces shared
 mode ([page-service.md](page-service.md) §16): the opener that takes `presence EX` becomes the
-page-service owner and serves a same-user endpoint; any other opener becomes a read-only page client
-of it (phase 2), whose writes are `25006`. Unix only (`0A000` elsewhere); file attachments reject it
-(`0A000`). It is spelled `Locking::Service` / `LockingService` / `"service"`, is never documented as
+page-service owner and serves a same-user endpoint; any other opener becomes a page client of it,
+reading pages through it and committing through it (phases 2–3); a client opened `read_only` gets a
+read-only connection. Unix only (`0A000` elsewhere); file attachments reject it (`0A000`). Under
+`service` only, `idle_in_transaction_timeout_ms` (Go `IdleInTransactionTimeoutMs`, TS
+`idleInTransactionTimeoutMs`; default **60000**, `0` disables) is the owner's idle-in-transaction
+timeout for client write transactions (page-service.md §11.1). It is spelled `Locking::Service` / `LockingService` / `"service"`, is never documented as
 a production option, and must never share a database with a shared or exclusive opener.
 
 `file_lock_timeout_ms` (default **5000**, `0` = fail immediately) bounds shared join / exclusive open

@@ -39,7 +39,13 @@ import {
   registerFileCompactor,
 } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
-import { canonicalOpenPath, FileCoordinator, osLocks, resolvedLocking } from "./coordinator.ts";
+import {
+  canonicalOpenPath,
+  FileCoordinator,
+  osLocks,
+  resolvedLocking,
+  timeoutValue,
+} from "./coordinator.ts";
 import { openPageClient } from "./pageservice/client.ts";
 import { electService } from "./pageservice/election.ts";
 import { ServiceOwner } from "./pageservice/owner.ts";
@@ -63,7 +69,8 @@ export type DatabaseOptions = { pageSize?: number; noSync?: boolean; environment
 // durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database (no
 // path) which never fsyncs. Byte/cost/result-neutral; default false.
 // "service" is the TEST-ONLY page-service mode (spec/design/page-service.md §16): the opener becomes the
-// owner when it can take presence EX, otherwise a read-only page client of the owner. It exists until
+// owner when it can take presence EX, otherwise a page client of the owner (read-only exactly when the
+// handle is opened read-only). It exists until
 // the page service's handoff phase replaces shared mode; never mix it with shared or exclusive openers
 // of one database. Unix only (0A000 elsewhere).
 export type Locking = "auto" | "shared" | "exclusive" | "none" | "service";
@@ -74,6 +81,9 @@ export type CreateOptions = {
   skipFsync?: boolean;
   locking?: Locking;
   fileLockTimeoutMs?: number;
+  // idleInTransactionTimeoutMs is OpenOptions.idleInTransactionTimeoutMs for a creator that becomes the
+  // page-service owner.
+  idleInTransactionTimeoutMs?: number;
   // The handle's Environment (spec/design/environment.md): its loaded Unicode and time-zone data,
   // host functions, and random + clock sources, fixed for the handle's lifetime and shared by every
   // session, attachment, and temp domain. Not stored in the file — a reopening host supplies its own.
@@ -169,6 +179,11 @@ export type OpenOptions = {
   skipFsync?: boolean;
   locking?: Locking;
   fileLockTimeoutMs?: number;
+  // idleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write
+  // transactions (spec/design/page-service.md §11.1): a client holding the writer gate that sends
+  // nothing for this long is revoked (25P03 at its next request). Absent is the 60 s default; 0
+  // disables it. Only `locking = "service"` reads it.
+  idleInTransactionTimeoutMs?: number;
   // The handle's Environment (spec/design/environment.md): the file's referenced collations, zones,
   // and host functions resolve against it at open, and it supplies the random + clock sources. A
   // handle setting like the rest — not stored in the file. Absent ⇒ a fresh empty environment (§7).
@@ -445,7 +460,9 @@ export function createDatabase(opts: CreateOptions = {}): Database {
         environment: opts.environment,
       });
       engine.storageBudget.limit = maxStorageBytes;
-      if (opts.locking === "service") return startServiceOwner(engine, coordinator!);
+      if (opts.locking === "service") {
+        return startServiceOwner(engine, coordinator!, opts.idleInTransactionTimeoutMs);
+      }
       return Database.fromEngine(engine, coordinator);
     } catch (error) {
       coordinator?.close();
@@ -477,14 +494,15 @@ export function openDatabase(path: string, opts: OpenOptions = {}): Database {
 }
 
 // openServiceDatabase opens path under the test-only `locking = service` (spec/pageservice/README.md
-// §6.1): as the serving owner when the election takes presence EX, otherwise as a read-only page client.
+// §6.1): as the serving owner when the election takes presence EX, otherwise as a page client.
 function openServiceDatabase(path: string, opts: OpenOptions): Database {
   resolvedLocking("service");
   const real = canonicalOpenPath(path);
-  const election = electService(osLocks, real, opts.fileLockTimeoutMs);
+  const election = electService(osLocks, real, opts.fileLockTimeoutMs, opts.readOnly ?? false);
   const environment = opts.environment ?? new Environment();
   if (election.client !== null) {
     const client = election.client;
+    client.timeoutMs = timeoutValue(opts.fileLockTimeoutMs);
     try {
       const engine = openPageClient(client, opts, environment);
       return Database.fromEngine(engine, null, { client });
@@ -501,15 +519,19 @@ function openServiceDatabase(path: string, opts: OpenOptions): Database {
     coordinator.close();
     throw error;
   }
-  return startServiceOwner(engine, coordinator);
+  return startServiceOwner(engine, coordinator, opts.idleInTransactionTimeoutMs);
 }
 
 // startServiceOwner lifts an opened or created engine into a serving owner's handle; the caller's
 // coordinator holds presence EX. A failure to serve closes the handle (releasing presence).
-function startServiceOwner(engine: Engine, coordinator: FileCoordinator): Database {
+function startServiceOwner(
+  engine: Engine,
+  coordinator: FileCoordinator,
+  idleTimeoutMs?: number,
+): Database {
   let service: ServiceOwner;
   try {
-    service = ServiceOwner.start(engine, coordinator.path);
+    service = ServiceOwner.start(engine, coordinator.path, idleTimeoutMs);
   } catch (error) {
     Database.fromEngine(engine, coordinator).close();
     throw error;

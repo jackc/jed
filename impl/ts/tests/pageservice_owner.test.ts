@@ -1,6 +1,7 @@
 // The TS page-service owner's internals the process corpus cannot reach (spec/pageservice/README.md
-// §4, §5.2; spec/design/page-service.md §14): the shared-memory pin table and written-index window the
-// engine thread and the service worker share, and the endpoint path selection.
+// §3.5, §4, §5.2; spec/design/page-service.md §14): the shared-memory pin table, written-index and
+// resolution windows the engine thread and the service worker share, the CommitDelta validation, and
+// the endpoint path selection.
 
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -8,9 +9,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { PS_INVALIDATION_WINDOW_COMMITS } from "../src/pageservice/codec.ts";
+import {
+  buildCommitManifest,
+  crc64Update,
+  manifestInlineCapacity,
+  manifestOverflowCapacity,
+} from "../src/commit_manifest.ts";
+import "../src/crc32_node.ts";
+import { makePage, metaPage } from "../src/format.ts";
+import {
+  PS_COMMIT_STATUS_COMMITTED,
+  PS_COMMIT_STATUS_NOT_COMMITTED,
+  PS_COMMIT_STATUS_UNKNOWN,
+  PS_INVALIDATION_WINDOW_COMMITS,
+  type PsCommitBegin,
+  type PsIndexedPage,
+} from "../src/pageservice/codec.ts";
+import { Delta, type DeltaBase, DeltaFailure, legal } from "../src/pageservice/delta.ts";
 import { endpointPath } from "../src/pageservice/endpoint.ts";
-import { ServiceState, WINDOW_ARENA } from "../src/pageservice/shared_state.ts";
+import {
+  PS_RESOLUTION_WINDOW_COMMITS,
+  ServiceState,
+  WINDOW_ARENA,
+} from "../src/pageservice/shared_state.ts";
 
 function meta(pageCount: number): Uint8Array {
   const m = new Uint8Array(256);
@@ -138,4 +159,187 @@ test("pageservice endpoint: the bundle directory when the path fits, else a runt
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// testDelta builds a valid CommitDelta over a committed state of committedPages pages: dirty pages at
+// the given indices (the first is the catalog root), its meta, and its manifest chain.
+function testDelta(
+  ps: number,
+  committedPages: number,
+  indices: number[],
+): { cb: PsCommitBegin; body: PsIndexedPage[] } {
+  let pageCount = committedPages;
+  const dirty = indices.map((index, i) => {
+    pageCount = Math.max(pageCount, index + 1);
+    return { index, bytes: makePage(ps, i === 0 ? 1 : 2, 1, 0, Uint8Array.of(i, i >> 8, 7)) };
+  });
+  const left = Math.max(0, dirty.length - manifestInlineCapacity(ps));
+  const overflow = Math.ceil(left / manifestOverflowCapacity(ps));
+  const ids: number[] = [];
+  for (let i = 0; i < overflow; i++) ids.push(pageCount++);
+  const manifest = buildCommitManifest(ps, 6n, dirty, ids);
+  const meta = metaPage(ps, 6n, indices[0]!, pageCount, 0, indices.length, manifest);
+  return {
+    cb: {
+      kind: "commit_begin",
+      txid: 6n,
+      meta,
+      manifestPages: manifest.pages.map((pg) => ({ index: pg.index, page: pg.bytes })),
+    },
+    body: dirty.map((pg) => ({ index: pg.index, page: pg.bytes })),
+  };
+}
+
+// applyDelta runs the owner's three checks over a delta, rethrowing the first failure.
+function applyDelta(base: DeltaBase, cb: PsCommitBegin, body: PsIndexedPage[]): void {
+  const d = Delta.begin(base, cb);
+  for (const pg of body) {
+    if (!legal(base, pg.index, d.parsed.pageCount)) {
+      throw new DeltaFailure("accepted an illegal page");
+    }
+    d.checkPage(pg);
+  }
+  d.complete();
+}
+
+function cloneDelta(
+  cb: PsCommitBegin,
+  body: PsIndexedPage[],
+): { cb: PsCommitBegin; body: PsIndexedPage[] } {
+  return {
+    cb: {
+      kind: "commit_begin",
+      txid: cb.txid,
+      meta: cb.meta.slice(),
+      manifestPages: cb.manifestPages.map((pg) => ({ index: pg.index, page: pg.page.slice() })),
+    },
+    body: body.map((pg) => ({ index: pg.index, page: pg.page.slice() })),
+  };
+}
+
+test("pageservice delta: a valid delta passes; each structural fault is refused", () => {
+  const ps = 512;
+  const base: DeltaBase = { committedTxid: 5n, pageSize: ps, pageCount: 10, granted: new Set([3]) };
+  // 40 dirty pages overflow the 512-byte meta's 37 inline entries into one manifest page.
+  const indices = [12, 3];
+  for (let i = 13; indices.length < 40; i++) indices.push(i);
+  const { cb, body } = testDelta(ps, 10, indices);
+  assert.equal(cb.manifestPages.length, 1);
+  applyDelta(base, cb, body);
+  type Mutation = (b: DeltaBase, c: PsCommitBegin, pages: PsIndexedPage[]) => PsIndexedPage[];
+  const cases: [string, Mutation][] = [
+    [
+      "txid does not follow",
+      (_b, c, p) => {
+        c.txid = 7n;
+        return p;
+      },
+    ],
+    [
+      "committed txid moved",
+      (b, _c, p) => {
+        b.committedTxid = 4n;
+        return p;
+      },
+    ],
+    [
+      "no reuse grant",
+      (b, _c, p) => {
+        b.granted = null;
+        return p;
+      },
+    ],
+    [
+      "page count shrinks",
+      (b, _c, p) => {
+        b.pageCount = 80;
+        return p;
+      },
+    ],
+    [
+      "page size differs",
+      (b, _c, p) => {
+        b.pageSize = 1024;
+        return p;
+      },
+    ],
+    [
+      "manifest page missing",
+      (_b, c, p) => {
+        c.manifestPages = [];
+        return p;
+      },
+    ],
+    ["body page missing", (_b, _c, p) => p.slice(1)],
+    ["body page twice", (_b, _c, p) => [...p, p[0]!]],
+    [
+      "unlisted page",
+      (_b, _c, p) => {
+        p[0]!.index = 99;
+        return p;
+      },
+    ],
+    [
+      "page swapped",
+      (_b, _c, p) => {
+        const first = p[0]!.page;
+        p[0]!.page = p[1]!.page;
+        p[1]!.page = first;
+        return p;
+      },
+    ],
+  ];
+  for (const [name, mutate] of cases) {
+    const b = { ...base };
+    const m = cloneDelta(cb, body);
+    const pages = mutate(b, m.cb, m.body);
+    assert.throws(() => applyDelta(b, m.cb, pages), DeltaFailure, name);
+  }
+  // Every single-byte change to the meta, the manifest, or a body page is caught: each is covered by
+  // a CRC the owner checks before writing anything it guards.
+  let rng = 0x9e3779b97f4a7c15n;
+  const next = (n: number): number => {
+    rng ^= (rng << 13n) & 0xffff_ffff_ffff_ffffn;
+    rng ^= rng >> 7n;
+    rng ^= (rng << 17n) & 0xffff_ffff_ffff_ffffn;
+    return Number(rng % BigInt(n));
+  };
+  for (let trial = 0; trial < 3000; trial++) {
+    const m = cloneDelta(cb, body);
+    const which = next(3);
+    const target =
+      which === 0
+        ? m.cb.meta
+        : which === 1
+          ? m.cb.manifestPages[0]!.page
+          : m.body[next(m.body.length)]!.page;
+    target[next(target.length)]! ^= 1 + next(255);
+    assert.throws(() => applyDelta(base, m.cb, m.body), DeltaFailure, `trial ${trial}`);
+  }
+});
+
+test("pageservice state: the resolution window answers commit_status", () => {
+  const s = new ServiceState();
+  const metaOf = (txid: bigint): Uint8Array => {
+    const m = new Uint8Array(64);
+    m[0] = Number(txid & 0xffn);
+    return m;
+  };
+  s.lock();
+  s.resetLocked(10n, metaOf(10n), false);
+  s.publishLocked(11n, metaOf(11n), [2]);
+  s.publishLocked(12n, metaOf(12n), [2]);
+  const digest = (txid: bigint): bigint => crc64Update(0n, metaOf(txid));
+  assert.equal(s.resolveLocked(11n, digest(11n)), PS_COMMIT_STATUS_COMMITTED);
+  // Another commit took the txid; a txid above the committed one; one below the window.
+  assert.equal(s.resolveLocked(11n, digest(99n)), PS_COMMIT_STATUS_NOT_COMMITTED);
+  assert.equal(s.resolveLocked(13n, digest(13n)), PS_COMMIT_STATUS_NOT_COMMITTED);
+  assert.equal(s.resolveLocked(9n, digest(9n)), PS_COMMIT_STATUS_UNKNOWN);
+  for (let txid = 13n; txid < 13n + BigInt(PS_RESOLUTION_WINDOW_COMMITS); txid++) {
+    s.publishLocked(txid, metaOf(txid), [2]);
+  }
+  const kept = s.resolutionTxidsLocked();
+  assert.equal(kept.length, PS_RESOLUTION_WINDOW_COMMITS);
+  assert.equal(kept[0], 13n);
+  s.unlock();
 });

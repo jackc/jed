@@ -119,6 +119,11 @@ type OpenOptions struct {
 	Locking   Locking
 	// nil is the 5s default; a non-nil pointer (including &0) is an explicit deadline.
 	FileLockTimeoutMs *uint64
+	// IdleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write
+	// transactions (spec/design/page-service.md §11.1): a client holding the writer gate that sends
+	// nothing for this long is revoked (25P03 at its next request). nil is the 60 s default; &0
+	// disables it. Only LockingService reads it.
+	IdleInTransactionTimeoutMs *uint64
 	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
 	// time-zone data the file's references resolve against, the host functions, and the random + clock
 	// sources. Shared by the handle's sessions, attachments, and temp domains; not stored in the file,

@@ -1,6 +1,6 @@
 schema_version = 1
 name = "service-owner-exit-and-reelection"
-description = "Page service phase 2: a client whose owner dies fails with 08006 (no promotion until phase 4); presence is released by process death, so the next opener is elected owner."
+description = "Page service: a client whose owner dies fails with 08006 (no promotion until phase 4); presence is released by process death, so the next opener is elected owner."
 requires = ["file.page_service"]
 
 [[step]]
@@ -70,7 +70,12 @@ expect = "1,2,3,4"
 actor = "a"
 command = "exec"
 sql = "INSERT INTO t VALUES (5)"
-expect_error = "25006"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3,4,5"
 
 [[step]]
 actor = "a"

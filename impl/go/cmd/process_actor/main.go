@@ -31,6 +31,12 @@ func run() error {
 	if len(os.Args) > 3 {
 		timeout, _ = strconv.ParseUint(os.Args[3], 10, 64)
 	}
+	// The page-service owner's idle-in-transaction timeout (spec/design/page-service.md §11.1).
+	var idle *uint64
+	if len(os.Args) > 4 {
+		ms, _ := strconv.ParseUint(os.Args[4], 10, 64)
+		idle = &ms
+	}
 	var db *jed.Database
 	var err error
 	if os.Args[1] == "owner-idle" {
@@ -42,14 +48,15 @@ func run() error {
 	switch os.Args[1] {
 	case "open-exclusive":
 		locking = jed.LockingExclusive
-	case "create-service", "open-service":
+	case "create-service", "open-service", "open-service-read-only":
 		// The test-only page-service mode (spec/design/page-service.md §16).
 		locking = jed.LockingService
 	}
+	readOnly := os.Args[1] == "open-service-read-only"
 	if os.Args[1] == "create" || os.Args[1] == "create-service" {
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout})
+		db, err = jed.CreateDatabase(jed.CreateOptions{Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle})
 	} else {
-		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{Locking: locking, FileLockTimeoutMs: &timeout})
+		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle, ReadOnly: readOnly})
 	}
 	if err != nil {
 		return err
@@ -110,6 +117,9 @@ func run() error {
 		case "TIME_LOOKUPS", "TIME_SCAN", "TIME_COMMITS":
 			// The page-service benchmark's timed loops (spec/design/benchmarks.md §12).
 			value, err = timed(db, command, argument)
+		case "HANGUP_NEXT_ACK":
+			// The commit-resolution test hook (spec/pageservice/README.md §6.4).
+			jed.HangUpNextPageServiceAckForTesting(db)
 		case "TXID":
 			value = strconv.FormatUint(db.Txid(), 10)
 		case "PAGE_COUNT":

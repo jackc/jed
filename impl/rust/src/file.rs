@@ -24,13 +24,16 @@ pub enum Locking {
     Exclusive,
     None,
     /// The TEST-ONLY page-service mode (spec/design/page-service.md §16): the opener becomes the
-    /// owner when it can take presence EX, otherwise a read-only page client of the owner. It exists
+    /// owner when it can take presence EX, otherwise a page client of the owner. It exists
     /// until the page service's handoff phase replaces shared mode; never mix it with shared or
     /// exclusive openers of one database. Unix only (`0A000` elsewhere).
     Service,
 }
 
 pub const DEFAULT_FILE_LOCK_TIMEOUT_MS: u64 = 5_000;
+
+/// A page-service owner's default idle-in-transaction timeout (spec/design/page-service.md §11.1).
+pub const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS: u64 = 60_000;
 
 /// Settings for a newly-created database file (spec/design/api.md §2). `page_size` is fixed
 /// into the file's meta at creation and cannot change thereafter.
@@ -82,6 +85,12 @@ pub struct CreateOptions {
     /// §8.7). Zero or negative is unlimited (the default). Not stored anywhere;
     /// [`Database::set_max_storage_bytes`] changes it.
     pub max_storage_bytes: i64,
+    /// A page-service owner's idle-in-transaction timeout for client write transactions
+    /// (spec/design/page-service.md §11.1): a client holding the writer gate that sends nothing for
+    /// this long is revoked (`25P03` at its next request). `0` disables it. Only
+    /// [`Locking::Service`] reads it. Default
+    /// [`DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS`] (60 s).
+    pub idle_in_transaction_timeout_ms: u64,
 }
 
 impl Default for CreateOptions {
@@ -94,6 +103,7 @@ impl Default for CreateOptions {
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
             environment: Environment::default(),
             max_storage_bytes: 0,
+            idle_in_transaction_timeout_ms: DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
         }
     }
 }
@@ -144,6 +154,12 @@ pub struct OpenOptions {
     /// unlimited (the default). A handle setting, not stored in the file;
     /// [`Database::set_max_storage_bytes`] changes it.
     pub max_storage_bytes: i64,
+    /// A page-service owner's idle-in-transaction timeout for client write transactions
+    /// (spec/design/page-service.md §11.1): a client holding the writer gate that sends nothing for
+    /// this long is revoked (`25P03` at its next request). `0` disables it. Only
+    /// [`Locking::Service`] reads it. Default
+    /// [`DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS`] (60 s).
+    pub idle_in_transaction_timeout_ms: u64,
 }
 
 impl Default for OpenOptions {
@@ -157,6 +173,7 @@ impl Default for OpenOptions {
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
             environment: Environment::default(),
             max_storage_bytes: 0,
+            idle_in_transaction_timeout_ms: DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
         }
     }
 }

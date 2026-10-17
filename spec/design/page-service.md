@@ -145,7 +145,10 @@ no keyless owner.
 
 ### 5.2 Operations
 
-All requests carry a request id; a client may pipeline. Responses return in request order.
+All requests carry a request id; a client may pipeline. Responses return in request order, except
+that `begin_write`'s reply arrives when its wait for the writer gate ends, while the owner keeps
+answering the connection's later requests, so a writer waiting for the gate never stalls its process's
+readers.
 
 | Operation | Effect |
 |---|---|
@@ -293,8 +296,9 @@ carry everything required.
   process committed, which is fine for the cross-core contract (each role's rule is specified and
   identical in every core) but must be modeled by simulation testing (§15). Letting clients rebuild
   too was rejected at ratification: a remote client would fetch the whole database to walk it.
-- **The maintenance commit is a new commit kind.** It changes only the free list, yet it writes
-  pages, issues a barrier, and advances `txid`. [transactions.md](transactions.md) §2.1 (no mutation,
+- **The maintenance commit is a new commit kind.** It changes no table, yet it writes pages (the
+  rebuilt free list, and the catalog chain, which every commit's manifest must name — format.md), issues
+  a barrier, and advances `txid`. [transactions.md](transactions.md) §2.1 (no mutation,
   no barrier, no `txid` advance) needs an explicit carve-out for it, and it is a distinct delta kind
   in the replication log (§10) and in simulation histories (§15).
 - **Compaction** is an ordinary owner operation: it requires the owner's watermark drained (now
@@ -649,8 +653,10 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
 2. ✅ **Read path** in Rust, Go, and TS (landed, under the test-only `locking = service`): election,
    endpoint, `hello`/`begin_read`/`read_pages`/`end_read`, client cache coherence, read-only clients
    ([spec/pageservice/README.md](../pageservice/README.md) §6–§7).
-3. **Write path**: writer gate, reuse grant, `commit` with validation, owner adoption, the
-   reclamation rule, `commit_status`.
+3. ✅ **Write path** in Rust, Go, and TS (landed, under the test-only `locking = service`): writer
+   gate, reuse grant, `commit` with validation, owner adoption, the reclamation rule, `commit_status`,
+   the idle-in-transaction timeout ([spec/pageservice/README.md](../pageservice/README.md) §3.5, §6.4).
+   File attachments under the service, with the cross-owner gate order of §5.5, follow separately.
 4. **Handoff**: promotion, yield, graceful close, timeouts; the process-corpus rewrite; simulation
    testing; retire shared mode and the `shared` option; the new bundle marker.
 5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree

@@ -751,8 +751,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   protocol cannot coordinate with a process that does not participate.
 - **Page service: the ratified successor to shared mode (`spec/design/page-service.md`), being built
   in phases.** One **owner** process (the `presence EX` holder) alone touches the file; every other
-  process is a **page client** running its own engine, whose pager reads pages from, and (phase 3)
-  commits whole `CommitDelta`s through, the owner over a same-user local socket (later SSH). Pages are
+  process is a **page client** running its own engine, whose pager reads pages from, and commits
+  whole `CommitDelta`s through, the owner over a same-user local socket (later SSH). Phases 1–3 (spec,
+  read path, write path) have landed; free-list rebuilds are owner-only maintenance commits. Pages are
   logical cost units, so a query's rows, plan, and cost are identical through the service. The wire
   contract is shared data with byte fixtures (`spec/pageservice/`). **locking.md stays the binding
   protocol until phase 4 (handoff) lands**: until then `auto` means shared mode and the service is

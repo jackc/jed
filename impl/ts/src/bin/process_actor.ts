@@ -12,15 +12,18 @@ import {
   type Environment,
   EnvironmentBuilder,
   attachFile,
+  hangUpNextPageServiceAckForTesting,
   intValue,
   openDatabase,
   render,
   type Session,
 } from "../tooling.ts";
 
-const [action, path, timeoutText] = process.argv.slice(2);
+const [action, path, timeoutText, idleText] = process.argv.slice(2);
 if (action === undefined || path === undefined) {
-  throw new Error("usage: process_actor.ts create|open PATH [timeout_ms] | owner-idle REPO_ROOT");
+  throw new Error(
+    "usage: process_actor.ts create|open PATH [timeout_ms [idle_timeout_ms]] | owner-idle REPO_ROOT",
+  );
 }
 if (action === "owner-idle") {
   // The corpus-through-a-client driver (spec/pageservice/README.md §7): open and close databases as
@@ -29,20 +32,26 @@ if (action === "owner-idle") {
   process.exit(0);
 }
 const fileLockTimeoutMs = timeoutText === undefined ? 5000 : Number(timeoutText);
-// create-service / open-service use the test-only page-service mode (spec/design/page-service.md §16).
+// The page-service owner's idle-in-transaction timeout (spec/design/page-service.md §11.1).
+const idleInTransactionTimeoutMs = idleText === undefined ? undefined : Number(idleText);
+// create-service / open-service / open-service-read-only use the test-only page-service mode
+// (spec/design/page-service.md §16).
 const locking =
   action === "open-exclusive"
     ? "exclusive"
-    : action === "create-service" || action === "open-service"
+    : action === "create-service" ||
+        action === "open-service" ||
+        action === "open-service-read-only"
       ? "service"
       : "shared";
+const readOnly = action === "open-service-read-only";
 
 let database: Database;
 try {
   database =
     action === "create" || action === "create-service"
-      ? createDatabase({ path, locking, fileLockTimeoutMs })
-      : openDatabase(path, { locking, fileLockTimeoutMs });
+      ? createDatabase({ path, locking, fileLockTimeoutMs, idleInTransactionTimeoutMs })
+      : openDatabase(path, { locking, fileLockTimeoutMs, idleInTransactionTimeoutMs, readOnly });
 } catch (error) {
   replyError(error);
   process.exit(1);
@@ -108,6 +117,10 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
       case "TIME_COMMITS":
         // The page-service benchmark's timed loops (spec/design/benchmarks.md §12).
         value = timed(database, command, argument);
+        break;
+      case "HANGUP_NEXT_ACK":
+        // The commit-resolution test hook (spec/pageservice/README.md §6.4).
+        hangUpNextPageServiceAckForTesting(database);
         break;
       case "TXID":
         value = database.txid.toString();

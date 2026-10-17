@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-#MISE description="Benchmark the page service: alone-owner fast path and warm/cold page-client reads, every core pairing"
+#MISE description="Benchmark the page service: alone-owner fast path, warm/cold page-client reads, and client commits, every core pairing"
 #MISE depends=["ts:lock_build"]
 #USAGE arg "[cores]" help="Comma-separated cores to include (default rust,go,node)"
 
@@ -14,7 +14,10 @@
 #   client cold  a freshly opened page client's first scan / first point lookups (every leaf fetched
 #                through read_pages);
 #   client warm  the same reads once the client's buffer pool holds the pages (one begin_read round
-#                trip per query).
+#                trip per query);
+#   client commit durable single-row UPDATE commits from a page client: begin_write, the CommitDelta,
+#                and the owner's validation, write, and barrier (compare owner_commit, the same loop
+#                run by the owner itself).
 #
 # Tunables: JED_PS_BENCH_ROWS (default 200000), JED_PS_BENCH_LOOKUPS (default 20000),
 # JED_PS_BENCH_COMMITS (default 200). Results: bench/results/page-service-<stamp>.jsonl.
@@ -97,6 +100,12 @@ Dir.mktmpdir("jed-page-service-bench-") do |dir|
       record("client_cold_lookup", owner_core, client_core, LOOKUPS / 4, *time(client, "TIME_LOOKUPS", LOOKUPS / 4))
       time(client, "TIME_LOOKUPS", LOOKUPS / 4)
       record("client_warm_lookup", owner_core, client_core, LOOKUPS, *time(client, "TIME_LOOKUPS", LOOKUPS))
+      client.close
+    end
+    # Commits change the rows, so they run after every pairing's reads (the read checksums must agree).
+    BENCH_CORES.each do |client_core|
+      client = Actor.new(client_core, "open-service", path)
+      record("client_commit", owner_core, client_core, COMMITS, *time(client, "TIME_COMMITS", COMMITS))
       client.close
     end
     record("owner_commit", owner_core, nil, COMMITS, *time(owner, "TIME_COMMITS", COMMITS))

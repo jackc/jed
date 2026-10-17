@@ -115,6 +115,13 @@ reuse continues to require the existing conservative absence of any live reader.
 writer check counts changed file domains. No-op completion must not enter validated COW, including
 recovered-generation stabilization; the next actual write still performs all required barriers.
 
+**Carve-out: the page-service maintenance commit** ([page-service.md](page-service.md) §6). A page
+client never rebuilds the free list, so after a client commit crosses the reclamation threshold the
+owner commits the unchanged snapshot at the next `txid` with in-commit reclamation. It mutates no
+table, sequence, statistic, or catalog fact, yet it writes pages (the catalog chain, which every
+commit's manifest must name, and the rebuilt free list), issues the durability barrier, and advances
+main's `txid`. It is not a transaction and no session observes it except as a newer version.
+
 Detection must not scan rows, fault pages, or serialize an image for comparison. The current cores
 use catalog/data-metadata generations and structurally shared table/index roots (plus rowid state)
 to refine the transaction's candidate dirty domains. Generations are runtime-only and clone with

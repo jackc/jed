@@ -1,35 +1,53 @@
 package jed
 
-// The page client (spec/design/page-service.md §4.2, §5.3–§5.4; spec/pageservice/README.md §3): a
-// process that is not the owner runs its own engine over a pager whose byte store reads pages from the
-// owner's page service instead of the file. Phase 2: reads only — a client handle is read-only.
+// The page client (spec/design/page-service.md §4.2, §5.3–§5.6; spec/pageservice/README.md §3, §6): a
+// process that is not the owner runs its own engine over a pager whose byte store reads pages from, and
+// commits whole CommitDeltas through, the owner's page service instead of the file.
 //
 // Pins (README.md §6.3). The client holds exactly one owner pin on each version a local reader pins
 // (core.live), and none while idle, so it never holds back compaction. begin_read's pin is kept for
 // the local reader that follows every read begin; when that reader's version has no local reader
-// left, the client sends end_read. Page reads name the newest pinned version: the page count only
-// grows between compactions, and a pin blocks compaction, so it bounds every older pinned snapshot.
+// left, the client sends end_read. A write transaction holds the owner's write pin on its base instead.
+// Page reads name the newest pinned version: the page count only grows between compactions, and a pin
+// blocks compaction, so it bounds every older pinned snapshot.
+//
+// The connection is multiplexed (README.md §2): one goroutine reads every reply and hands it to the
+// request it answers, so a begin_write waiting for the gate never stalls this process's page reads.
 
 import (
 	"errors"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-// psClient is one page-service connection. mu serializes request/reply pairs on the connection
-// (phase 2 sends one request at a time); it is the innermost lock — callers may hold core.liveMu or
-// the pager lock when they take it, and nothing is taken while it is held.
+// psReply is one reply frame (or the connection's failure) for a waiting request.
+type psReply struct {
+	msg psMessage
+	err error
+}
+
+// psClient is one page-service connection. sendMu serializes frames onto the connection and request
+// numbering; a request's contents may depend on state read under it (readTxid). It is the innermost
+// lock — callers may hold core.liveMu, refreshMu, or the pager lock when they take it.
 type psClient struct {
-	dbPath   string
-	conn     net.Conn
-	mu       sync.Mutex
-	nextID   uint32
-	pageSize uint32
-	connID   uint64
-	// broken is the sticky failure after the connection is lost (08006) or poisoned by a fatal error.
-	broken error
+	dbPath    string
+	conn      net.Conn
+	sendMu    sync.Mutex
+	nextID    uint32
+	pageSize  atomic.Uint32
+	connID    uint64
+	readOnly  bool // hello_ok: the connection is read-only
+	timeoutMs uint64
+
+	// pendMu guards pending and broken. broken is the sticky failure after the connection is lost
+	// (08006) or poisoned by a fatal error.
+	pendMu  sync.Mutex
+	pending map[uint32]chan psReply
+	broken  error
 
 	// incarnation and adopted name the cache this process holds (README.md §3.2); refreshMu
 	// serializes begin_read + adoption so the cache always matches exactly one adopted version.
@@ -40,14 +58,24 @@ type psClient struct {
 	metaMu sync.Mutex
 	meta   []byte
 
-	// held is the set of versions this connection pins at the owner, guarded by core.liveMu once the
-	// core exists. readTxid is its maximum (0 when empty), updated under core.liveMu before any
-	// end_read is sent and read under mu, so a read_pages never names a version already released.
-	held     map[uint64]bool
-	readTxid atomic.Uint64
+	// held is the set of versions this connection pins at the owner for local readers, guarded by
+	// core.liveMu once the core exists. writeTxid is the write transaction's base while this process
+	// holds the owner's gate (0 otherwise). readTxid is max(held ∪ {writeTxid}) (0 when empty), updated
+	// before any end_read or abort is sent and read under sendMu, so a read_pages never names a version
+	// already released.
+	held map[uint64]bool
+	// heldMax is the newest version in held, so readTxid can be recomputed without core.liveMu.
+	heldMax   atomic.Uint64
+	writeTxid atomic.Uint64
+	readTxid  atomic.Uint64
 	// reserved counts begin_read pins whose local reader has not registered yet; releasePin keeps a
 	// reserved version's pin (README.md §6.3). Guarded by core.liveMu.
 	reserved map[uint64]int
+
+	// gateHeld and reuseGrant describe the write transaction; touched only by the local writer, which
+	// holds core.writeMu.
+	gateHeld   bool
+	reuseGrant bool
 
 	// release frees the process-local open-path claim when the client closes.
 	release   func()
@@ -60,15 +88,20 @@ func connectionLost(err error) error {
 
 // connectPageClient dials the endpoint and runs hello. A dial or handshake failure the opener may
 // retry is returned as retry=true; an owner's refusal (0A000: protocol or format mismatch) is final.
-func connectPageClient(dbPath, endpoint string) (cl *psClient, retry bool, err error) {
+func connectPageClient(dbPath, endpoint string, readOnly bool) (cl *psClient, retry bool, err error) {
 	conn, err := dialEndpoint(endpoint)
 	if err != nil {
 		return nil, true, err
 	}
-	cl = &psClient{dbPath: dbPath, conn: conn, held: map[uint64]bool{}, reserved: map[uint64]int{}}
-	reply, err := cl.roundTrip(psHello{protocolMin: psProtocolVersion, protocolMax: psProtocolVersion, formatVersion: formatVersion, flags: psHelloFlagReadOnly, clientName: "jed-go"})
+	cl = &psClient{dbPath: dbPath, conn: conn, pending: map[uint32]chan psReply{}, held: map[uint64]bool{}, reserved: map[uint64]int{}}
+	go cl.readLoop()
+	var flags uint8
+	if readOnly {
+		flags = psHelloFlagReadOnly
+	}
+	reply, err := cl.roundTrip(psHello{protocolMin: psProtocolVersion, protocolMax: psProtocolVersion, formatVersion: formatVersion, flags: flags, clientName: "jed-go"})
 	if err != nil {
-		_ = conn.Close()
+		cl.close()
 		var engine *EngineError
 		if errors.As(err, &engine) && engine.Code() != "08006" {
 			return nil, false, err
@@ -77,12 +110,65 @@ func connectPageClient(dbPath, endpoint string) (cl *psClient, retry bool, err e
 	}
 	ok, isOK := reply.(psHelloOK)
 	if !isOK || !pageSizeValid(int(ok.pageSize)) {
-		_ = conn.Close()
+		cl.close()
 		return nil, false, newError(ProtocolViolation, "unexpected reply to hello")
 	}
-	cl.pageSize = ok.pageSize
+	cl.pageSize.Store(ok.pageSize)
 	cl.connID = ok.connectionID
+	cl.readOnly = ok.flags&psHelloOKFlagReadOnly != 0
 	return cl, false, nil
+}
+
+// readLoop reads every reply frame and hands it to the request it answers. On a lost connection or a
+// frame no request is waiting for, it breaks the client and fails every waiting request.
+func (cl *psClient) readLoop() {
+	for {
+		id, msg, err := readPSFrame(cl.conn, cl.pageSize.Load())
+		if err != nil {
+			var engine *EngineError
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || !errors.As(err, &engine) {
+				err = connectionLost(err)
+			}
+			cl.breakWith(err)
+			return
+		}
+		if ok, isOK := msg.(psHelloOK); isOK && pageSizeValid(int(ok.pageSize)) {
+			// Later frames carry pages of this size: set it before reading the next one.
+			cl.pageSize.Store(ok.pageSize)
+		}
+		cl.pendMu.Lock()
+		ch := cl.pending[id]
+		delete(cl.pending, id)
+		cl.pendMu.Unlock()
+		if ch == nil {
+			cl.breakWith(newError(ProtocolViolation, "the owner sent a reply no request is waiting for"))
+			return
+		}
+		ch <- psReply{msg: msg}
+	}
+}
+
+// breakWith makes err the client's sticky failure, closes the connection, and fails every waiting
+// request with it.
+func (cl *psClient) breakWith(err error) {
+	cl.pendMu.Lock()
+	if cl.broken == nil {
+		cl.broken = err
+	}
+	pending := cl.pending
+	cl.pending = map[uint32]chan psReply{}
+	broken := cl.broken
+	cl.pendMu.Unlock()
+	_ = cl.conn.Close()
+	for _, ch := range pending {
+		ch <- psReply{err: broken}
+	}
+}
+
+func (cl *psClient) brokenErr() error {
+	cl.pendMu.Lock()
+	defer cl.pendMu.Unlock()
+	return cl.broken
 }
 
 // roundTrip sends one request and returns its reply. An error reply comes back as the engine error it
@@ -91,75 +177,79 @@ func (cl *psClient) roundTrip(m psMessage) (psMessage, error) {
 	return cl.roundTripWith(func() (psMessage, error) { return m, nil })
 }
 
-// roundTripWith builds the request while holding the connection, so a request may depend on state
-// that changes only before a send (readTxid).
+// roundTripWith builds the request while holding sendMu, so a request may depend on state that changes
+// only before a send (readTxid).
 func (cl *psClient) roundTripWith(build func() (psMessage, error)) (psMessage, error) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	if cl.broken != nil {
-		return nil, cl.broken
-	}
+	cl.sendMu.Lock()
 	m, err := build()
 	if err != nil {
+		cl.sendMu.Unlock()
 		return nil, err
 	}
-	id, err := cl.sendLocked(m)
+	ch, err := cl.sendLocked(m, true)
+	cl.sendMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	gotID, reply, err := readPSFrame(cl.conn, cl.pageSize)
-	if err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			cl.broken = connectionLost(err)
-			return nil, cl.broken
-		}
-		var engine *EngineError
-		if !errors.As(err, &engine) {
-			cl.broken = connectionLost(err)
-			return nil, cl.broken
-		}
-		cl.broken = err
-		return nil, err
+	return cl.await(ch)
+}
+
+// await waits for a request's reply and decodes an error frame.
+func (cl *psClient) await(ch chan psReply) (psMessage, error) {
+	r := <-ch
+	if r.err != nil {
+		return nil, r.err
 	}
-	if e, ok := reply.(psError); ok {
+	if e, ok := r.msg.(psError); ok {
 		failure := errorFromCode(e.sqlstate, e.message)
 		if e.flags&psErrorFlagFatal != 0 {
-			cl.broken = failure
-			_ = cl.conn.Close()
+			cl.breakWith(failure)
 		}
 		return nil, failure
 	}
-	if gotID != id {
-		cl.broken = newError(ProtocolViolation, "reply out of request order")
-		_ = cl.conn.Close()
-		return nil, cl.broken
-	}
-	return reply, nil
+	return r.msg, nil
 }
 
-// send sends a request that has no reply (end_read).
+// send sends a request that has no reply (end_read, abort).
 func (cl *psClient) send(m psMessage) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	if cl.broken == nil {
-		_, _ = cl.sendLocked(m)
-	}
+	cl.sendMu.Lock()
+	defer cl.sendMu.Unlock()
+	_, _ = cl.sendLocked(m, false)
 }
 
-func (cl *psClient) sendLocked(m psMessage) (uint32, error) {
+// sendLocked numbers and writes one frame; with reply set it registers the request's reply channel
+// first. Caller holds sendMu.
+func (cl *psClient) sendLocked(m psMessage, reply bool) (chan psReply, error) {
+	frame, err := encodePSFrame(cl.nextID+1, m)
+	if err != nil {
+		return nil, err
+	}
+	cl.pendMu.Lock()
+	if cl.broken != nil {
+		err := cl.broken
+		cl.pendMu.Unlock()
+		return nil, err
+	}
 	cl.nextID++
 	if cl.nextID == 0 {
 		cl.nextID = 1
+		if frame, err = encodePSFrame(1, m); err != nil {
+			cl.pendMu.Unlock()
+			return nil, err
+		}
 	}
-	frame, err := encodePSFrame(cl.nextID, m)
-	if err != nil {
-		return 0, err
+	var ch chan psReply
+	if reply {
+		ch = make(chan psReply, 1)
+		cl.pending[cl.nextID] = ch
 	}
+	cl.pendMu.Unlock()
 	if _, err := cl.conn.Write(frame); err != nil {
-		cl.broken = connectionLost(err)
-		return 0, cl.broken
+		lost := connectionLost(err)
+		cl.breakWith(lost)
+		return nil, lost
 	}
-	return cl.nextID, nil
+	return ch, nil
 }
 
 // beginRead runs begin_read for the client's cache. The reply carries one new owner pin on its txid.
@@ -196,7 +286,7 @@ func (cl *psClient) readPage(index uint32) ([]byte, error) {
 	reply, err := cl.roundTripWith(func() (psMessage, error) {
 		txid := cl.readTxid.Load()
 		if txid == 0 {
-			return nil, newError(ObjectNotInPrerequisiteState, "a page client read a page outside any read transaction")
+			return nil, newError(ObjectNotInPrerequisiteState, "a page client read a page outside any transaction")
 		}
 		return psReadPages{txid: txid, indices: []uint32{index}}, nil
 	})
@@ -210,15 +300,10 @@ func (cl *psClient) readPage(index uint32) ([]byte, error) {
 	return append([]byte(nil), pages.pages[0]...), nil
 }
 
-// close drops the connection; the owner releases every pin at EOF.
+// close drops the connection; the owner releases every pin and the gate at EOF.
 func (cl *psClient) close() {
 	cl.closeOnce.Do(func() {
-		cl.mu.Lock()
-		if cl.broken == nil {
-			cl.broken = newError(ConnectionFailure, "the page-service connection is closed")
-		}
-		_ = cl.conn.Close()
-		cl.mu.Unlock()
+		cl.breakWith(newError(ConnectionFailure, "the page-service connection is closed"))
 		if cl.release != nil {
 			cl.release()
 		}
@@ -226,13 +311,19 @@ func (cl *psClient) close() {
 }
 
 // serviceBlockStore is the client pager's byte store: page indices 0 and 1 are the adopted meta page,
-// every other page comes from the owner. Read-only.
+// every other page comes from the owner. A commit's writes collect here and its sync sends them as one
+// CommitDelta (page-service.md §5.6).
 type serviceBlockStore struct {
 	client *psClient
+	// pending holds the commit in progress: its body pages by index and its meta. The pager reads a
+	// pending page back from here (a commit re-reads what it wrote while planning).
+	pending     map[uint32][]byte
+	pendingMeta []byte
+	reserved    int64
 }
 
 func (s *serviceBlockStore) readAt(off int64, length int) ([]byte, error) {
-	ps := int64(s.client.pageSize)
+	ps := int64(s.client.pageSize.Load())
 	index := off / ps
 	within := off - index*ps
 	if length < 0 || within+int64(length) > ps {
@@ -241,6 +332,8 @@ func (s *serviceBlockStore) readAt(off int64, length int) ([]byte, error) {
 	var page []byte
 	if index < 2 {
 		page = s.client.currentMeta()
+	} else if p, ok := s.pending[uint32(index)]; ok {
+		page = p
 	} else {
 		var err error
 		if page, err = s.client.readPage(uint32(index)); err != nil {
@@ -251,20 +344,61 @@ func (s *serviceBlockStore) readAt(off int64, length int) ([]byte, error) {
 }
 
 func errClientReadOnly() error {
-	return newError(ReadOnlySqlTransaction, "a page client cannot write the database")
+	return newError(ReadOnlySqlTransaction, "cannot write through a read-only page-service connection")
 }
 
-func (s *serviceBlockStore) writeAt(int64, []byte) error { return errClientReadOnly() }
-func (s *serviceBlockStore) sync() error                 { return errClientReadOnly() }
-func (s *serviceBlockStore) setSize(int64) error         { return errClientReadOnly() }
+func (s *serviceBlockStore) writeAt(off int64, data []byte) error {
+	ps := int64(s.client.pageSize.Load())
+	if s.client.readOnly {
+		return errClientReadOnly()
+	}
+	if off%ps != 0 || int64(len(data)) != ps {
+		return newError(IoError, "page-service write must be one whole page")
+	}
+	index := uint32(off / ps)
+	page := append([]byte(nil), data...)
+	if index < 2 {
+		s.pendingMeta = page
+		return nil
+	}
+	if s.pending == nil {
+		s.pending = map[uint32][]byte{}
+	}
+	s.pending[index] = page
+	return nil
+}
 
-// size is the adopted snapshot's page count: every page a reader of it may name lies below it.
+// sync sends the pending commit (its meta written last) and waits for the owner's answer.
+func (s *serviceBlockStore) sync() error {
+	if s.pendingMeta == nil {
+		return nil
+	}
+	meta, pages := s.pendingMeta, s.pending
+	s.pendingMeta, s.pending = nil, nil
+	return s.client.commit(meta, pages)
+}
+
+// discard drops a commit that never reached sync.
+func (s *serviceBlockStore) discard() {
+	s.pendingMeta, s.pending = nil, nil
+}
+
+func (s *serviceBlockStore) setSize(n int64) error {
+	if s.client.readOnly {
+		return errClientReadOnly()
+	}
+	s.reserved = max(s.reserved, n)
+	return nil
+}
+
+// size is the adopted snapshot's page count (every page a reader of it may name lies below it), or the
+// space a commit in progress reserved.
 func (s *serviceBlockStore) size() (int64, error) {
 	m, ok := parseMeta(s.client.currentMeta())
 	if !ok {
 		return 0, newError(DataCorrupted, "invalid meta page")
 	}
-	return int64(m.pageCount) * int64(s.client.pageSize), nil
+	return max(int64(m.pageCount)*int64(s.client.pageSize.Load()), s.reserved), nil
 }
 
 func (s *serviceBlockStore) close() error {
@@ -272,9 +406,9 @@ func (s *serviceBlockStore) close() error {
 	return nil
 }
 
-// openPageClient builds a read-only engine over a connected client (README.md §3.2): one begin_read
-// pins and adopts the owner's committed snapshot, then the ordinary loader reads the catalog skeleton
-// through the service.
+// openPageClient builds an engine over a connected client (README.md §3.2): one begin_read pins and
+// adopts the owner's committed snapshot, then the ordinary loader reads the catalog skeleton through the
+// service. A read-only connection gives a read-only handle.
 func openPageClient(cl *psClient, opts OpenOptions, env *Environment) (*engine, error) {
 	rb, err := cl.beginRead()
 	if err != nil {
@@ -282,7 +416,7 @@ func openPageClient(cl *psClient, opts OpenOptions, env *Environment) (*engine, 
 	}
 	cl.incarnation, cl.adopted = rb.incarnation, rb.txid
 	cl.held[rb.txid] = true
-	cl.readTxid.Store(rb.txid)
+	cl.updateReadTxid()
 	cl.setMeta(rb.meta)
 	p, err := pagerFromStore(&serviceBlockStore{client: cl})
 	if err != nil {
@@ -300,7 +434,7 @@ func openPageClient(cl *psClient, opts OpenOptions, env *Environment) (*engine, 
 	// No local reader follows the open; every read begins with its own begin_read.
 	cl.releasePin(rb.txid)
 	db.path = cl.dbPath
-	db.readOnly = true
+	db.readOnly = cl.readOnly
 	if opts.WorkMem != 0 {
 		db.session.workMem = opts.WorkMem
 	}
@@ -327,42 +461,239 @@ func (c *sharedCore) clientRefresh() (uint64, error) {
 	}
 	cl.reserved[rb.txid]++
 	c.liveMu.Unlock()
+	if err := c.clientAdopt(rb.incarnation, rb.txid, rb.invalidate, rb.indices, rb.meta); err != nil {
+		c.unreserveAndRelease(rb.txid)
+		return 0, err
+	}
+	return rb.txid, nil
+}
+
+// clientAdopt applies a read_begun / write_begun cache answer: it drops the listed pages (or the whole
+// cache) and, when the owner's version is newer than the adopted one (or the cache was dropped
+// wholesale), adopts its meta and reloads the catalog/interior skeleton. Caller holds refreshMu.
+func (c *sharedCore) clientAdopt(incarnation id16, txid uint64, invalidate uint8, indices []uint32, meta []byte) error {
+	cl := c.client
 	pool := c.storage.paging.pool
-	all := rb.invalidate == psInvalidateAll || rb.incarnation != cl.incarnation
+	all := invalidate == psInvalidateAll || incarnation != cl.incarnation
 	if all {
 		pool.invalidateAll()
 	} else {
-		for _, index := range rb.indices {
+		for _, index := range indices {
 			pool.invalidate(index)
 		}
 	}
-	if !all && rb.txid <= cl.adopted {
-		return rb.txid, nil
+	if !all && txid <= cl.adopted {
+		return nil
 	}
-	cl.setMeta(rb.meta)
+	cl.setMeta(meta)
 	c.storage.mu.Lock()
 	if err := c.storage.paging.withPager(func(p *pager) error { return p.refreshAllocatedPages() }); err != nil {
 		c.storage.mu.Unlock()
-		c.unreserveAndRelease(rb.txid)
-		return 0, err
+		return err
 	}
 	loaded, err := loadEngineSharedPaging(c.storage.paging, c.env)
 	if err != nil {
 		c.storage.mu.Unlock()
-		c.unreserveAndRelease(rb.txid)
-		return 0, err
+		return err
 	}
 	c.storage.pageCount = loaded.pageCount
 	c.storage.freePages = loaded.freePages
 	c.storage.live = loaded.live
 	c.storage.mu.Unlock()
 	c.liveMu.Lock()
-	cl.incarnation, cl.adopted = rb.incarnation, rb.txid
+	cl.incarnation, cl.adopted = incarnation, txid
 	rt := c.roots.Load()
 	c.roots.Store(&roots{committed: loaded.committed, attached: rt.attached})
 	c.liveMu.Unlock()
 	c.planEpoch.Add(1)
-	return rb.txid, nil
+	return nil
+}
+
+// clientBeginWrite takes the owner's writer gate for this process's writer (README.md §3.5) and adopts
+// the snapshot it pins, so the write transaction starts from the newest commit. The caller holds
+// core.writeMu. The wait does not hold the connection: this process's readers keep reading.
+func (c *sharedCore) clientBeginWrite(timeoutMs uint64) error {
+	cl := c.client
+	if cl.readOnly {
+		return errClientReadOnly()
+	}
+	cl.refreshMu.Lock()
+	request := psBeginWrite{incarnation: cl.incarnation, lastTxid: cl.adopted, lockTimeoutMs: timeoutMs}
+	cl.refreshMu.Unlock()
+	reply, err := cl.roundTrip(request)
+	if err != nil {
+		return err
+	}
+	wb, ok := reply.(psWriteBegun)
+	if !ok {
+		return newError(ProtocolViolation, "unexpected reply to begin_write")
+	}
+	if _, ok := parseMeta(wb.meta); !ok {
+		cl.abortWrite()
+		return newError(DataCorrupted, "the owner sent an invalid meta page")
+	}
+	cl.gateHeld, cl.reuseGrant = true, wb.reuseGrant
+	cl.sendMu.Lock()
+	cl.writeTxid.Store(wb.txid)
+	cl.updateReadTxidLocked()
+	cl.sendMu.Unlock()
+	cl.refreshMu.Lock()
+	err = c.clientAdopt(wb.incarnation, wb.txid, wb.invalidate, wb.indices, append([]byte(nil), wb.meta...))
+	cl.refreshMu.Unlock()
+	if err != nil {
+		c.clientEndWrite()
+		return err
+	}
+	return nil
+}
+
+// clientAdoptOwnCommit records this process's own published commit as its adopted version: the
+// owner published exactly it, with no commit between the write base and it, so the cache is current.
+func (c *sharedCore) clientAdoptOwnCommit(txid uint64) {
+	cl := c.client
+	cl.refreshMu.Lock()
+	defer cl.refreshMu.Unlock()
+	if txid <= cl.adopted {
+		return
+	}
+	cl.setMeta(append([]byte(nil), c.storage.lastMeta...))
+	c.liveMu.Lock()
+	cl.adopted = txid
+	c.liveMu.Unlock()
+}
+
+// clientEndWrite releases the gate of a write transaction that did not commit (README.md §3.5).
+func (c *sharedCore) clientEndWrite() {
+	cl := c.client
+	if !cl.gateHeld {
+		return
+	}
+	cl.gateHeld = false
+	cl.abortWrite()
+}
+
+// abortWrite clears the write pin's readTxid contribution and sends abort, both under sendMu so no
+// later read_pages names the released version.
+func (cl *psClient) abortWrite() {
+	cl.sendMu.Lock()
+	defer cl.sendMu.Unlock()
+	cl.writeTxid.Store(0)
+	cl.updateReadTxidLocked()
+	_, _ = cl.sendLocked(psAbort{}, false)
+}
+
+// psCommitNotCommitted marks a commit failure after which the owner certainly did not commit (the
+// delta never completed, or the owner refused it): the client's pager may continue.
+type psCommitNotCommitted struct{ err error }
+
+func (e *psCommitNotCommitted) Error() string { return e.err.Error() }
+func (e *psCommitNotCommitted) Unwrap() error { return e.err }
+
+// commit sends a CommitDelta (README.md §3.5): commit_begin with the meta and the manifest chain, the
+// body pages in ascending index order in frame-sized chunks, then commit_end, and waits for the owner.
+// A connection lost after commit_end was sent leaves the outcome unknown; resolveCommit asks.
+func (cl *psClient) commit(meta []byte, pages map[uint32][]byte) error {
+	m, ok := parseMeta(meta)
+	if !ok {
+		return &psCommitNotCommitted{newError(DataCorrupted, "a page-client commit built an invalid meta page")}
+	}
+	ps := int(cl.pageSize.Load())
+	var manifest []psIndexedPage
+	isManifest := map[uint32]bool{}
+	for id, n := m.manifestHead, uint32(0); n < m.manifestPages; n++ {
+		page, ok := pages[id]
+		if !ok {
+			return &psCommitNotCommitted{newError(DataCorrupted, "a page-client commit lost a manifest page")}
+		}
+		manifest = append(manifest, psIndexedPage{index: id, page: page})
+		isManifest[id] = true
+		parsed, err := parsePage(page)
+		if err != nil {
+			return &psCommitNotCommitted{err}
+		}
+		id = parsed.nextPage
+	}
+	body := make([]uint32, 0, len(pages))
+	for index := range pages {
+		if !isManifest[index] {
+			body = append(body, index)
+		}
+	}
+	sort.Slice(body, func(i, j int) bool { return body[i] < body[j] })
+	// A frame holds length's 5 bytes of code + request id, the list count, and (index, page) items.
+	perFrame := (psMaxFrameLength - 5 - 4) / (4 + ps)
+	if 5+8+ps+4+len(manifest)*(4+ps) > psMaxFrameLength {
+		return &psCommitNotCommitted{newError(ProgramLimitExceeded, "the transaction is too large to commit through the page service")}
+	}
+	digest := commitCRC64(0, meta)
+	cl.sendMu.Lock()
+	if _, err := cl.sendLocked(psCommitBegin{txid: m.txid, meta: meta, manifestPages: manifest}, false); err != nil {
+		cl.sendMu.Unlock()
+		return &psCommitNotCommitted{err}
+	}
+	for start := 0; start < len(body); start += perFrame {
+		chunk := body[start:min(start+perFrame, len(body))]
+		items := make([]psIndexedPage, len(chunk))
+		for i, index := range chunk {
+			items[i] = psIndexedPage{index: index, page: pages[index]}
+		}
+		if _, err := cl.sendLocked(psCommitPages{pages: items}, false); err != nil {
+			cl.sendMu.Unlock()
+			return &psCommitNotCommitted{err}
+		}
+	}
+	ch, err := cl.sendLocked(psCommitEnd{}, true)
+	// The owner releases the write pin and the gate when it processes commit_end, whatever its outcome,
+	// so no later request may name the write base.
+	cl.writeTxid.Store(0)
+	cl.updateReadTxidLocked()
+	cl.gateHeld = false
+	cl.sendMu.Unlock()
+	if err != nil {
+		return &psCommitNotCommitted{err}
+	}
+	reply, err := cl.await(ch)
+	if err != nil {
+		var engine *EngineError
+		if errors.As(err, &engine) && engine.Code() == "08006" {
+			return cl.resolveCommit(m.txid, digest, err)
+		}
+		return &psCommitNotCommitted{err}
+	}
+	if done, ok := reply.(psCommitted); !ok || done.txid != m.txid {
+		return newError(ProtocolViolation, "unexpected reply to commit_end")
+	}
+	return nil
+}
+
+// resolveCommit settles a commit whose acknowledgement was lost (page-service.md §8.4): it reconnects
+// to whichever process owns the database until file_lock_timeout_ms passes and asks commit_status. The
+// handle stays broken (08006) either way; only this commit's outcome is resolved.
+func (cl *psClient) resolveCommit(txid, digest uint64, lost error) error {
+	// The open timeout bounds the search; 0 makes one attempt, as at open.
+	deadline := time.Now().Add(time.Duration(cl.timeoutMs) * time.Millisecond)
+	for {
+		if record, ok := readOwnerRecord(cl.dbPath); ok && record.serving && record.uid == currentUID() {
+			if other, _, err := connectPageClient(cl.dbPath, record.endpoint, true); err == nil {
+				reply, err := other.roundTrip(psCommitStatus{txid: txid, digest: digest})
+				other.close()
+				if status, ok := reply.(psCommitStatusReply); err == nil && ok {
+					switch status.status {
+					case psCommitStatusCommitted:
+						return nil
+					case psCommitStatusNotCommitted:
+						return &psCommitNotCommitted{lost}
+					default:
+						return newError(TransactionResolutionUnknown, "lost the connection to the database owner during commit; whether the transaction committed is unknown")
+					}
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return newError(TransactionResolutionUnknown, "lost the connection to the database owner during commit, and no owner answered whether it committed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // unreserveAndRelease drops a reservation whose read begin failed, releasing the pin if unused.
@@ -382,14 +713,22 @@ func (cl *psClient) unreserve(v uint64) {
 	}
 }
 
-// updateReadTxid sets readTxid to the newest held version. Caller holds liveMu (or owns the client
-// exclusively, before the core exists).
+// updateReadTxid recomputes heldMax after held changed, then readTxid. Caller holds liveMu (or owns
+// the client exclusively, before the core exists).
 func (cl *psClient) updateReadTxid() {
 	newest := uint64(0)
 	for v := range cl.held {
 		newest = max(newest, v)
 	}
-	cl.readTxid.Store(newest)
+	cl.heldMax.Store(newest)
+	cl.sendMu.Lock()
+	defer cl.sendMu.Unlock()
+	cl.updateReadTxidLocked()
+}
+
+// updateReadTxidLocked sets readTxid to the newest held or write-pinned version. Caller holds sendMu.
+func (cl *psClient) updateReadTxidLocked() {
+	cl.readTxid.Store(max(cl.heldMax.Load(), cl.writeTxid.Load()))
 }
 
 // releasePin sends end_read for a held version v; readTxid moves off it first. Caller holds liveMu
@@ -399,8 +738,15 @@ func (cl *psClient) releasePin(v uint64) {
 		return
 	}
 	delete(cl.held, v)
-	cl.updateReadTxid()
-	cl.send(psEndRead{txid: v})
+	newest := uint64(0)
+	for h := range cl.held {
+		newest = max(newest, h)
+	}
+	cl.heldMax.Store(newest)
+	cl.sendMu.Lock()
+	defer cl.sendMu.Unlock()
+	cl.updateReadTxidLocked()
+	_, _ = cl.sendLocked(psEndRead{txid: v}, false)
 }
 
 // errorFromCode rebuilds an engine error from an error frame's SQLSTATE. An unknown code (a newer

@@ -1,20 +1,23 @@
 // The page-service owner, engine-thread half (spec/design/page-service.md §4.1, §14;
-// spec/pageservice/README.md §6.2): it draws the incarnation, records the committed meta, writes the
-// owner record, and asks the process's service worker (owner_worker.ts, one per process, reused across
-// opens) to bind the endpoint and serve.
+// spec/pageservice/README.md §6.2, §6.4): it draws the incarnation, records the committed meta, writes
+// the owner record, and asks the process's service worker (owner_worker.ts, one per process, reused
+// across opens) to bind the endpoint and serve.
 // Afterwards the engine thread touches the shared state only to publish a main-database commit, to
-// read client pins into its reader watermark, and to reset the window at compaction — the owner's
-// own sessions keep the alone fast path. Node-only.
+// read client pins into its reader watermark, to reset the window at compaction, to take the writer
+// gate, and — when a client commit was published or the gate handed over, which one atomic load at each
+// transaction begin notices — to adopt client commits and run maintenance commits. The owner's own
+// sessions otherwise keep the alone fast path. Node-only.
 
 import { randomFillSync } from "node:crypto";
 import process from "node:process";
+import { MessageChannel, type MessagePort } from "node:worker_threads";
 
 import { parseCommitMeta } from "../commit_manifest.ts";
 import { engineError } from "../errors.ts";
 import type { Engine } from "../executor.ts";
 import { FORMAT_VERSION } from "../format.ts";
 import type { SharedPaging } from "../paging.ts";
-import type { ServiceOwnerHandle } from "../shared.ts";
+import type { ServiceEngineFacts, ServiceOwnerHandle, ServicePending } from "../shared.ts";
 import { type BlockingChannel, ProcessWorker } from "./blocking.ts";
 import {
   currentUid,
@@ -23,12 +26,16 @@ import {
   removeQuietly,
   writeOwnerRecord,
 } from "./endpoint.ts";
-import type { OwnerServe, OwnerStop } from "./owner_worker.ts";
-import { ServiceState } from "./shared_state.ts";
+import type { OwnerPoison, OwnerServe, OwnerStop } from "./owner_worker.ts";
+import { GATE_ENGINE, GATE_FREE, GATE_HANDED, ServiceState } from "./shared_state.ts";
 
 // The process's one service worker, shared by every database it owns and reused across opens.
 const serviceWorker = new ProcessWorker(new URL("./owner_worker.ts", import.meta.url));
 let nextServedId = 0;
+
+// DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS is the owner's idle-in-transaction timeout for client write
+// transactions (page-service.md §11.1).
+export const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = 60000;
 
 function newIncarnation(): Uint8Array {
   const id = new Uint8Array(16);
@@ -55,6 +62,9 @@ export class ServiceOwner implements ServiceOwnerHandle {
   // channel is the service worker's while this owner serves (id names it there); null otherwise.
   private channel: BlockingChannel | null = null;
   private readonly id = ++nextServedId;
+  // notify receives the worker's gate handoffs; handoff is the core's handler for them.
+  private notify: MessagePort | null = null;
+  private handoff: (() => void) | null = null;
 
   private constructor(dbPath: string, endpoint: string) {
     this.dbPath = dbPath;
@@ -63,14 +73,25 @@ export class ServiceOwner implements ServiceOwnerHandle {
 
   // start makes the storage engine at dbPath a serving owner. The caller holds presence EX. An owner
   // that cannot pick a private endpoint directory still owns and records flags = 0.
-  static start(storage: Engine, dbPath: string): ServiceOwner {
+  static start(storage: Engine, dbPath: string, idleTimeoutMs?: number): ServiceOwner {
     const paging = storage.paging;
     if (paging === null) throw engineError("io_error", "database storage is closed");
     const incarnation = newIncarnation();
     const txid = storage.committed.txid;
     const uid = currentUid();
     const owner = new ServiceOwner(dbPath, endpointPath(dbPath, uid, incarnation));
-    owner.state.resetLocked(txid, readCommittedMeta(paging, txid), false);
+    const meta = readCommittedMeta(paging, txid);
+    // The resolution window starts with the recovered meta slots (README §4): the committed one and,
+    // when the other slot holds the commit just before it, that one too.
+    if (txid > 0n) {
+      const other = paging.readBlock(Number(txid & 1n) ^ 1);
+      const parsed = parseCommitMeta(other, paging.pageSize(), paging.physicalPages());
+      if (parsed !== null && parsed.txid === txid - 1n) {
+        owner.state.recordResolutionLocked(parsed.txid, other);
+      }
+    }
+    owner.state.resetLocked(txid, meta, false);
+    owner.state.setEngineFactsLocked(storage.freeGenTxid, storage.liveAtCompaction, null);
     writeOwnerRecord(dbPath, {
       serving: owner.endpoint !== "",
       uid,
@@ -82,6 +103,7 @@ export class ServiceOwner implements ServiceOwnerHandle {
     // Only a presence-EX holder reaches here, so a socket already at the path is a dead owner's.
     removeQuietly(owner.endpoint);
     const channel = serviceWorker.acquire();
+    const { port1, port2 } = new MessageChannel();
     const serve: OwnerServe = {
       op: "serve",
       id: owner.id,
@@ -92,13 +114,22 @@ export class ServiceOwner implements ServiceOwnerHandle {
       formatVersion: FORMAT_VERSION,
       incarnation,
       ownerReadOnly: storage.readOnly,
+      noSync: paging.skipsSync(),
+      idleTimeoutMs: idleTimeoutMs ?? DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+      notify: port2,
     };
-    const answer = channel.request(serve) as { ok?: boolean; error?: string };
+    const answer = channel.request(serve, [port2]) as { ok?: boolean; error?: string };
     if (answer.ok !== true) {
+      port1.close();
       serviceWorker.release();
       removeQuietly(ownerRecordPath(dbPath));
       throw engineError("io_error", `bind page-service endpoint: ${answer.error ?? "failed"}`);
     }
+    // A gate handed over between transactions is taken at the next event-loop turn; the port never
+    // keeps the process alive.
+    port1.on("message", () => owner.handoff?.());
+    port1.unref();
+    owner.notify = port1;
     owner.channel = channel;
     return owner;
   }
@@ -116,19 +147,94 @@ export class ServiceOwner implements ServiceOwnerHandle {
   }
 
   // published records a main-database commit with its root swap (README §4, §6.2).
-  published(txid: bigint, meta: Uint8Array, written: number[]): void {
+  published(txid: bigint, meta: Uint8Array, written: number[], facts: ServiceEngineFacts): void {
     this.state.lock();
     try {
       this.state.publishLocked(txid, meta, written);
+      this.state.setEngineFactsLocked(facts.freeGenTxid, facts.liveAtCompaction, facts.localOldest);
     } finally {
       this.state.unlock();
     }
   }
 
   // compactedLocked resets the window after compaction replaced the file at txid: every older cache is
-  // invalid, and the worker reopens its read handle. The caller holds the lock (and no pin exists).
-  compactedLocked(txid: bigint, paging: SharedPaging): void {
+  // invalid, and the worker reopens its file handle. The caller holds the lock (and no pin exists).
+  compactedLocked(txid: bigint, paging: SharedPaging, facts: ServiceEngineFacts): void {
     this.state.resetLocked(txid, readCommittedMeta(paging, txid), true);
+    this.state.setEngineFactsLocked(facts.freeGenTxid, facts.liveAtCompaction, facts.localOldest);
+  }
+
+  epoch(): number {
+    return this.state.epoch();
+  }
+
+  // pending reports the client commits published after since: the newest txid and meta, and the pages
+  // written in between.
+  pending(since: bigint): ServicePending {
+    this.state.lock();
+    try {
+      const txid = this.state.committedTxidLocked();
+      if (txid <= since) return { txid, meta: new Uint8Array(0), all: false, indices: [] };
+      const inv = this.state.invalidationLocked(true, since, txid);
+      return { txid, meta: this.state.metaLocked(), all: inv.all, indices: inv.indices };
+    } finally {
+      this.state.unlock();
+    }
+  }
+
+  // acquireGate waits in Atomics.wait for the writer gate (README §4): free, or handed over by the
+  // worker for a maintenance commit (returns true). timeoutMs 0 waits without a deadline; on expiry
+  // 55P03.
+  acquireGate(timeoutMs: number): boolean {
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY;
+    for (;;) {
+      if (this.state.tryGate(GATE_ENGINE)) return false;
+      const seen = this.state.gate();
+      if (seen === GATE_HANDED && this.state.takeHanded()) return true;
+      if (seen === GATE_FREE || seen === GATE_HANDED) continue;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw engineError("lock_not_available", "could not obtain the database writer lock");
+      }
+      this.state.waitGate(seen, remaining);
+    }
+  }
+
+  tryGate(): boolean {
+    return this.state.tryGate(GATE_ENGINE);
+  }
+
+  takeHanded(): boolean {
+    return this.state.takeHanded();
+  }
+
+  releaseGate(): void {
+    this.state.releaseGate();
+  }
+
+  poisoned(): boolean {
+    return this.state.poisoned();
+  }
+
+  // stopServing poisons the owner after its own handle failed a maintenance commit: the worker closes
+  // every connection and accepts no more.
+  stopServing(): void {
+    this.state.poison();
+    this.channel?.request({ op: "poison", id: this.id } satisfies OwnerPoison);
+  }
+
+  clearLocalOldest(): void {
+    this.state.lock();
+    this.state.clearEngineOldestLocked();
+    this.state.unlock();
+  }
+
+  onHandoff(handler: () => void): void {
+    this.handoff = handler;
+  }
+
+  hangUpNextAck(): void {
+    this.state.armHangUp();
   }
 
   // close stops serving: every client sees EOF, then the endpoint and owner record are removed. The
@@ -140,6 +246,9 @@ export class ServiceOwner implements ServiceOwnerHandle {
       serviceWorker.release();
       removeQuietly(this.endpoint);
     }
+    this.notify?.close();
+    this.notify = null;
+    this.handoff = null;
     removeQuietly(ownerRecordPath(this.dbPath));
   }
 }

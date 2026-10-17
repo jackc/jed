@@ -443,10 +443,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     `ci`); `bench:page_service` measures the alone-owner fast path and warm/cold client reads
     (benchmarks.md §12). Known gaps for later phases: a plain `BEGIN` on a client takes no owner pin;
     the TS owner bounds distinct pinned versions at 4096 (`54000`).
-  - [ ] **Phase 3 — write path.** The writer gate across processes, the reuse grant, `commit`
-    (`CommitDelta`) with owner validation (`08P01`), owner adoption, owner-only free-list rebuilds by
-    maintenance commits (a transactions.md §2.1 carve-out), `commit_status`, the idle-in-transaction
-    timeout (`25P03`), cross-owner attachment gate ordering.
+  - [x] **Phase 3 — write path.** ✅ **landed** (test-only `locking = service`): Rust, Go, TS
+    page clients commit through the owner. The owner's writer gate is shared by its own writers and
+    client `begin_write` (waited on without stalling the connection's reads; `55P03` at the session
+    lock timeout); the reuse grant; the `CommitDelta` stream (`commit_begin`/`commit_pages`/
+    `commit_end`) with owner validation (`08P01`) and the point of no return; structural owner
+    publication with lazy catalog adoption at owner transaction begins; owner-only free-list rebuilds
+    by maintenance commits (the transactions.md §2.1 carve-out); the resolution window and
+    `commit_status`, which a client uses to resolve a lost acknowledgement; the idle-in-transaction
+    timeout (`25P03`); read-only connections only on request. Proven by the `service_*` scenarios
+    in every pairing and by `conformance:service` now running every record, writes included, on a
+    page client; `bench:page_service` adds `client_commit`.
+  - [ ] **File attachments under the service.** A file attachment under `locking = service` (owner
+    or client of the attached file; `0A000` today), taking every writer gate, local or remote, in
+    real-path order with `lock_timeout_ms` as the backstop (page-service.md §5.5).
   - [ ] **Phase 4 — handoff.** Promotion, ownership preference and yield, graceful close, the grace
     periods; the process-corpus rewrite; simulation testing of owner + clients; retire shared mode,
     the `shared` and test-only `service` values, and locking.md §4–§5; a new bundle marker.

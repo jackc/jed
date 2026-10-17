@@ -1,0 +1,83 @@
+schema_version = 1
+name = "service-idle-in-transaction-timeout"
+description = "Page service phase 3: an owner revokes a client write transaction that sends nothing for its idle-in-transaction timeout (here 300 ms). The gate frees for other writers, and the client's COMMIT fails 25P03 without committing; its next transaction works."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service 5000 300"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "a"
+command = "sleep"
+argument = "900"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "5000"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (10)"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (2)"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+expect_error = "25P03"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "10"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (3)"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "3,10"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

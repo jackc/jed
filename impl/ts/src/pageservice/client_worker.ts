@@ -15,16 +15,21 @@ import { PS_MAX_FRAME_LENGTH } from "./codec.ts";
 // The engine thread's requests, each for connection `conn`: connect to an endpoint, send a frame
 // (reply: whether it waits for the next frame; otherwise it waits until the frame is handed to the
 // kernel, so a request with no reply, such as end_read, is on the wire before the engine thread moves
-// on), drop the connection (no answer), or forget it entirely (no answer).
+// on), wait for the connection's next frame without sending (the engine thread skipping a frame that
+// answers another request), drop the connection (no answer), or forget it entirely (no answer).
 export type ClientRequest =
   | { op: "connect"; conn: number; endpoint: string }
   | { op: "send"; conn: number; frame: Uint8Array; reply: boolean }
+  | { op: "next"; conn: number }
   | { op: "disconnect"; conn: number }
   | { op: "forget"; conn: number };
 
 // The worker's answers: connected (or a reply-less frame written), a reply frame, or the connection
-// is gone.
-export type ClientAnswer = { ok: true } | { frame: Uint8Array } | { lost: string };
+// is gone (unsent: it was already gone before the frame could be written).
+export type ClientAnswer =
+  | { ok: true }
+  | { frame: Uint8Array }
+  | { lost: string; unsent?: boolean };
 
 const { flag, port } = workerData as { flag: Int32Array; port: MessagePort };
 
@@ -105,7 +110,7 @@ class Connection {
   send(frame: Uint8Array, reply: boolean): void {
     const socket = this.socket;
     if (this.lost !== null || socket === null) {
-      this.answer({ lost: this.lost ?? "not connected" });
+      this.answer({ lost: this.lost ?? "not connected", unsent: true });
       return;
     }
     if (reply) {
@@ -118,6 +123,19 @@ class Connection {
         if (this.acking) this.answer({ ok: true });
       });
     }
+  }
+
+  // next waits for the next frame (or the connection's loss) without sending.
+  next(): void {
+    if (this.frames.length > 0) {
+      this.answer({ frame: this.frames.shift()! });
+      return;
+    }
+    if (this.lost !== null || this.socket === null) {
+      this.answer({ lost: this.lost ?? "not connected" });
+      return;
+    }
+    this.waiting = true;
   }
 
   disconnect(): void {
@@ -140,8 +158,12 @@ port.on("message", (request: ClientRequest) => {
       c.connect(request.endpoint);
       return;
     case "send":
-      if (c === undefined) signalAnswer(port, flag, { lost: "not connected" });
+      if (c === undefined) signalAnswer(port, flag, { lost: "not connected", unsent: true });
       else c.send(request.frame, request.reply);
+      return;
+    case "next":
+      if (c === undefined) signalAnswer(port, flag, { lost: "not connected" });
+      else c.next();
       return;
     case "disconnect":
       c?.disconnect();

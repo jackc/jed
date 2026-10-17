@@ -1,28 +1,38 @@
-//! The page client (spec/design/page-service.md §4.2, §5.3–§5.4; spec/pageservice/README.md §6.3):
-//! a process that is not the owner runs its own engine over a pager whose byte store reads pages from
-//! the owner's page service instead of the file. Phase 2: reads only — a client handle is read-only.
+//! The page client (spec/design/page-service.md §4.2, §5.3–§5.6; spec/pageservice/README.md §3, §6):
+//! a process that is not the owner runs its own engine over a pager whose byte store reads pages from,
+//! and commits whole CommitDeltas through, the owner's page service instead of the file.
 //!
 //! Pins. The client holds exactly one owner pin on each version a local reader pins, and no other
 //! ([`ClientPins`], kept in the shared core's reader registry). A read begin's pin is kept for the
-//! reader that follows it; when a version's last local reader ends the client sends `end_read`. Page
-//! reads name the newest held version, chosen under the connection lock, so an `end_read` for it can
-//! never overtake the `read_pages` that names it.
+//! reader that follows it; when a version's last local reader ends the client sends `end_read`. A
+//! write transaction holds the owner's write pin on its base instead. Page reads name the newest
+//! pinned version, chosen under the send lock, so an `end_read`, `abort`, or `commit_end` releasing
+//! it can never overtake the `read_pages` that names it.
+//!
+//! The connection is multiplexed (README.md §2): one reader thread reads every reply and hands it to
+//! the request it answers, so a `begin_write` waiting for the owner's gate never stalls this
+//! process's page reads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::blockstore::BlockStore;
 use crate::coordinator::LockHost;
 use crate::error::{EngineError, Result, SqlState};
 use crate::pageservice::codec::{
-    BeginRead, ERROR_FLAG_FATAL, EndRead, HELLO_FLAG_READ_ONLY, Hello, Id16, Message,
-    PROTOCOL_VERSION, ReadBegun, ReadPages, encode_frame, read_frame,
+    BeginRead, BeginWrite, COMMIT_STATUS_COMMITTED, COMMIT_STATUS_NOT_COMMITTED, CommitBegin,
+    CommitPages, CommitStatus, ERROR_FLAG_FATAL, EndRead, HELLO_FLAG_READ_ONLY,
+    HELLO_OK_FLAG_CONNECTION_READ_ONLY, Hello, Id16, IndexedPage, MAX_FRAME_LENGTH, Message,
+    PROTOCOL_VERSION, ReadBegun, ReadPages, WriteBegun, encode_frame, read_frame,
 };
+use crate::pageservice::endpoint;
 
 /// The process-local open-path claim a client keeps while connected (the duplicate-open guard,
 /// locking.md §3.1); released when the client closes.
@@ -37,10 +47,18 @@ impl Drop for PathClaim {
     }
 }
 
-/// The request/reply half of a connection, behind [`PsConnection::io`].
-struct ConnIo {
+/// The send half of a connection, behind [`PsConnection::outbox`]: the send lock.
+struct Outbox {
     stream: UnixStream,
     next_id: u32,
+}
+
+/// A request's reply, or the connection's failure.
+type Reply = Result<Message>;
+
+/// The requests waiting for replies, behind [`PsConnection::waiters`].
+struct Waiters {
+    pending: HashMap<u32, mpsc::Sender<Reply>>,
     /// The sticky failure after the connection is lost (`08006`) or poisoned by a fatal error.
     broken: Option<EngineError>,
 }
@@ -52,19 +70,33 @@ pub(crate) struct CacheId {
     pub(crate) adopted: u64,
 }
 
-/// One page-service connection. `io` serializes request/reply pairs (phase 2 sends one request at a
-/// time); it is the innermost lock — callers may hold the reader registry or the pager lock when they
-/// take it, and nothing is taken while it is held.
+/// One page-service connection. The send lock (`outbox`) serializes frames and request numbering;
+/// a request's contents may depend on state that changes only under it (the version `read_pages`
+/// names). It is the innermost lock — callers may hold the reader registry, the cache, the storage,
+/// or the pager lock when they take it.
 pub(crate) struct PsConnection {
     db_path: PathBuf,
-    io: Mutex<ConnIo>,
-    /// A second handle on the socket, so [`close`](Self::close) can shut it down without waiting
-    /// for a request in flight.
+    outbox: Mutex<Outbox>,
+    waiters: Mutex<Waiters>,
+    /// A second handle on the socket, so [`close`](Self::close) can shut it down while the reader
+    /// thread is blocked on it.
     control: UnixStream,
-    page_size: u32,
-    /// The newest version this connection pins at the owner (0 when none): what `read_pages` names.
-    /// Updated under the reader-registry lock before any `end_read` is sent.
-    read_txid: AtomicU64,
+    page_size: AtomicU32,
+    /// `hello_ok` said the connection is read-only.
+    read_only: AtomicBool,
+    /// The open timeout, which also bounds resolving a commit whose acknowledgement was lost.
+    timeout_ms: u64,
+    /// The newest version a local reader pins (0 when none). With `write_txid`, what `read_pages`
+    /// names; both change under the send lock before any message releasing a version is sent.
+    held_max: AtomicU64,
+    /// The write transaction's base while this process holds the owner's gate (0 otherwise).
+    write_txid: AtomicU64,
+    /// The write transaction holds the owner's gate, and whether it may reuse free pages. Touched
+    /// only by the local writer, which holds the in-process writer gate.
+    gate_held: AtomicBool,
+    reuse_grant: AtomicBool,
+    /// The last commit failed and the owner certainly did not commit it (the pager may continue).
+    uncommitted: AtomicBool,
     /// The adopted version's meta page, served for page indices 0 and 1.
     meta: Mutex<Vec<u8>>,
     pub(crate) cache: Mutex<CacheId>,
@@ -76,6 +108,10 @@ fn connection_lost(detail: &str) -> EngineError {
         SqlState::ConnectionFailure,
         format!("lost the connection to the database owner: {detail}"),
     )
+}
+
+fn violation(message: &str) -> EngineError {
+    EngineError::new(SqlState::ProtocolViolation, message)
 }
 
 /// The engine error an `error` frame names. An unknown code (a newer owner) is a protocol
@@ -99,49 +135,68 @@ pub(crate) enum Connect {
     Refused(EngineError),
 }
 
-/// Dial the owner's endpoint and run `hello`.
-pub(crate) fn connect(db_path: &Path, endpoint: &str) -> Connect {
+/// Dial the owner's endpoint, start the reader thread, and run `hello`, asking for a read-only
+/// connection when `read_only`. `timeout_ms` is the open timeout.
+pub(crate) fn connect(db_path: &Path, endpoint: &str, read_only: bool, timeout_ms: u64) -> Connect {
     let Ok(stream) = UnixStream::connect(endpoint) else {
         return Connect::Retry;
     };
-    let Ok(control) = stream.try_clone() else {
+    let (Ok(control), Ok(reader)) = (stream.try_clone(), stream.try_clone()) else {
         return Connect::Retry;
     };
-    let mut conn = PsConnection {
+    let conn = Arc::new(PsConnection {
         db_path: db_path.to_path_buf(),
-        io: Mutex::new(ConnIo {
-            stream,
-            next_id: 0,
+        outbox: Mutex::new(Outbox { stream, next_id: 0 }),
+        waiters: Mutex::new(Waiters {
+            pending: HashMap::new(),
             broken: None,
         }),
         control,
-        page_size: 0,
-        read_txid: AtomicU64::new(0),
+        page_size: AtomicU32::new(0),
+        read_only: AtomicBool::new(false),
+        timeout_ms,
+        held_max: AtomicU64::new(0),
+        write_txid: AtomicU64::new(0),
+        gate_held: AtomicBool::new(false),
+        reuse_grant: AtomicBool::new(false),
+        uncommitted: AtomicBool::new(false),
         meta: Mutex::new(Vec::new()),
         cache: Mutex::new(CacheId {
             incarnation: [0; 16],
             adopted: 0,
         }),
         claim: Mutex::new(None),
-    };
+    });
+    let reading = Arc::clone(&conn);
+    std::thread::spawn(move || reading.read_loop(reader));
     let hello = Message::Hello(Hello {
         protocol_min: PROTOCOL_VERSION,
         protocol_max: PROTOCOL_VERSION,
         format_version: crate::format::FORMAT_VERSION,
-        flags: HELLO_FLAG_READ_ONLY,
+        flags: if read_only { HELLO_FLAG_READ_ONLY } else { 0 },
         client_name: "jed-rust".into(),
     });
     match conn.round_trip(|| Ok(hello)) {
         Ok(Message::HelloOk(ok)) if crate::format::page_size_valid(ok.page_size as usize) => {
-            conn.page_size = ok.page_size;
-            Connect::Connected(Arc::new(conn))
+            conn.page_size.store(ok.page_size, Ordering::Release);
+            conn.read_only.store(
+                ok.flags & HELLO_OK_FLAG_CONNECTION_READ_ONLY != 0,
+                Ordering::Release,
+            );
+            Connect::Connected(conn)
         }
-        Ok(_) => Connect::Refused(EngineError::new(
-            SqlState::ProtocolViolation,
-            "unexpected reply to hello",
-        )),
-        Err(e) if e.state == SqlState::ConnectionFailure => Connect::Retry,
-        Err(e) => Connect::Refused(e),
+        Ok(_) => {
+            conn.close();
+            Connect::Refused(violation("unexpected reply to hello"))
+        }
+        Err(e) if e.state == SqlState::ConnectionFailure => {
+            conn.close();
+            Connect::Retry
+        }
+        Err(e) => {
+            conn.close();
+            Connect::Refused(e)
+        }
     }
 }
 
@@ -150,69 +205,159 @@ impl PsConnection {
         &self.db_path
     }
 
+    /// Whether the connection (and so the client's handle) is read-only.
+    pub(crate) fn read_only(&self) -> bool {
+        self.read_only.load(Ordering::Acquire)
+    }
+
     /// Hold `claim` until the client closes.
     pub(crate) fn keep_claim(&self, claim: PathClaim) {
         *self.claim.lock().expect("claim lock poisoned") = Some(claim);
     }
 
-    /// Send the request `build` returns (built under the connection lock) and read its reply. An
-    /// error reply comes back as the engine error it names; a lost connection is `08006` and breaks
-    /// the connection for good.
-    fn round_trip(&self, build: impl FnOnce() -> Result<Message>) -> Result<Message> {
-        let mut io = self
-            .io
-            .lock()
-            .expect("page-service connection lock poisoned");
-        if let Some(broken) = &io.broken {
-            return Err(broken.clone());
-        }
-        let request = build()?;
-        let id = Self::send_locked(&mut io, &request)?;
-        let reply = match read_frame(&mut io.stream, self.page_size) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => {
-                let lost = connection_lost("the owner closed the connection");
-                io.broken = Some(lost.clone());
-                return Err(lost);
+    /// Read every reply frame and hand it to the request it answers. On a lost connection or a
+    /// frame no request is waiting for, break the connection and fail every waiting request.
+    fn read_loop(self: Arc<Self>, mut stream: UnixStream) {
+        loop {
+            let (id, message) =
+                match read_frame(&mut stream, self.page_size.load(Ordering::Acquire)) {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => {
+                        self.break_with(connection_lost("the owner closed the connection"));
+                        return;
+                    }
+                    Err(e) => {
+                        self.break_with(e);
+                        return;
+                    }
+                };
+            if let Message::HelloOk(ok) = &message
+                && crate::format::page_size_valid(ok.page_size as usize)
+            {
+                // Later frames carry pages of this size: set it before reading the next one.
+                self.page_size.store(ok.page_size, Ordering::Release);
             }
-            Err(e) => {
-                let _ = io.stream.shutdown(Shutdown::Both);
-                io.broken = Some(e.clone());
-                return Err(e);
-            }
-        };
-        match reply {
-            (_, Message::Error(e)) => {
-                let failure = error_from_frame(&e.sqlstate, &e.message);
-                if e.flags & ERROR_FLAG_FATAL != 0 {
-                    let _ = io.stream.shutdown(Shutdown::Both);
-                    io.broken = Some(failure.clone());
+            let waiter = self
+                .waiters
+                .lock()
+                .expect("page-service waiters lock poisoned")
+                .pending
+                .remove(&id);
+            match waiter {
+                Some(waiter) => {
+                    let _ = waiter.send(Ok(message));
                 }
-                Err(failure)
-            }
-            (got, message) if got == id => Ok(message),
-            _ => {
-                let failure =
-                    EngineError::new(SqlState::ProtocolViolation, "reply out of request order");
-                let _ = io.stream.shutdown(Shutdown::Both);
-                io.broken = Some(failure.clone());
-                Err(failure)
+                None => {
+                    self.break_with(violation(
+                        "the owner sent a reply no request is waiting for",
+                    ));
+                    return;
+                }
             }
         }
     }
 
-    fn send_locked(io: &mut ConnIo, message: &Message) -> Result<u32> {
-        io.next_id = io.next_id.wrapping_add(1);
-        if io.next_id == 0 {
-            io.next_id = 1;
+    /// Make `error` the connection's sticky failure, shut the socket down, and fail every waiting
+    /// request with it.
+    fn break_with(&self, error: EngineError) {
+        let (pending, broken) = {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .expect("page-service waiters lock poisoned");
+            if waiters.broken.is_none() {
+                waiters.broken = Some(error);
+            }
+            (
+                std::mem::take(&mut waiters.pending),
+                waiters.broken.clone().expect("set above"),
+            )
+        };
+        let _ = self.control.shutdown(Shutdown::Both);
+        for waiter in pending.into_values() {
+            let _ = waiter.send(Err(broken.clone()));
         }
-        let frame = encode_frame(io.next_id, message)?;
-        if let Err(e) = io.stream.write_all(&frame) {
+    }
+
+    fn broken(&self) -> EngineError {
+        self.waiters
+            .lock()
+            .expect("page-service waiters lock poisoned")
+            .broken
+            .clone()
+            .unwrap_or_else(|| connection_lost("the reply was lost"))
+    }
+
+    /// Number and write one frame; with `reply` set, register the request's reply channel first.
+    /// The caller holds the send lock.
+    fn send_locked(
+        &self,
+        outbox: &mut Outbox,
+        message: &Message,
+        reply: bool,
+    ) -> Result<Option<mpsc::Receiver<Reply>>> {
+        outbox.next_id = outbox.next_id.wrapping_add(1);
+        if outbox.next_id == 0 {
+            outbox.next_id = 1;
+        }
+        let frame = encode_frame(outbox.next_id, message)?;
+        let receiver = {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .expect("page-service waiters lock poisoned");
+            if let Some(broken) = &waiters.broken {
+                return Err(broken.clone());
+            }
+            if reply {
+                let (sender, receiver) = mpsc::channel();
+                waiters.pending.insert(outbox.next_id, sender);
+                Some(receiver)
+            } else {
+                None
+            }
+        };
+        if let Err(e) = outbox.stream.write_all(&frame) {
             let lost = connection_lost(&e.to_string());
-            io.broken = Some(lost.clone());
+            self.break_with(lost.clone());
             return Err(lost);
         }
-        Ok(io.next_id)
+        Ok(receiver)
+    }
+
+    /// Wait for a request's reply. An error reply comes back as the engine error it names; a fatal
+    /// one breaks the connection.
+    fn await_reply(&self, receiver: mpsc::Receiver<Reply>) -> Result<Message> {
+        let reply = receiver.recv().unwrap_or_else(|_| Err(self.broken()))?;
+        match reply {
+            Message::Error(e) => {
+                let failure = error_from_frame(&e.sqlstate, &e.message);
+                if e.flags & ERROR_FLAG_FATAL != 0 {
+                    self.break_with(failure.clone());
+                }
+                Err(failure)
+            }
+            message => Ok(message),
+        }
+    }
+
+    /// Send the request `build` returns (built under the send lock) and wait for its reply. A lost
+    /// connection is `08006` and breaks the connection for good.
+    fn round_trip(&self, build: impl FnOnce() -> Result<Message>) -> Result<Message> {
+        let receiver = {
+            let mut outbox = self.outbox.lock().expect("page-service send lock poisoned");
+            let request = build()?;
+            self.send_locked(&mut outbox, &request, true)?
+                .expect("a request with a reply registers a channel")
+        };
+        self.await_reply(receiver)
+    }
+
+    /// Send a message that has no reply. A broken connection sends nothing: the owner already
+    /// released every pin and the gate at EOF.
+    fn send(&self, message: &Message) {
+        let mut outbox = self.outbox.lock().expect("page-service send lock poisoned");
+        let _ = self.send_locked(&mut outbox, message, false);
     }
 
     /// `begin_read` for the cache `(incarnation, last_txid)`. The reply carries one new owner pin
@@ -225,10 +370,7 @@ impl PsConnection {
             }))
         })?;
         let Message::ReadBegun(begun) = reply else {
-            return Err(EngineError::new(
-                SqlState::ProtocolViolation,
-                "unexpected reply to begin_read",
-            ));
+            return Err(violation("unexpected reply to begin_read"));
         };
         if crate::format::meta_txid_and_page_count(&begun.meta).is_none() {
             return Err(EngineError::new(
@@ -239,31 +381,92 @@ impl PsConnection {
         Ok(begun)
     }
 
-    /// Send `end_read` for `txid` (no reply). A broken connection sends nothing: the owner already
-    /// released every pin at EOF.
-    pub(crate) fn end_read(&self, txid: u64) {
-        let mut io = self
-            .io
-            .lock()
-            .expect("page-service connection lock poisoned");
-        if io.broken.is_none() {
-            let _ = Self::send_locked(&mut io, &Message::EndRead(EndRead { txid }));
+    /// `begin_write` with the session's lock timeout (README.md §3.5). The wait for the owner's
+    /// gate does not hold the send lock, so this process's readers keep reading.
+    pub(crate) fn begin_write(
+        &self,
+        incarnation: Id16,
+        last_txid: u64,
+        lock_timeout_ms: u64,
+    ) -> Result<WriteBegun> {
+        let reply = self.round_trip(|| {
+            Ok(Message::BeginWrite(BeginWrite {
+                incarnation,
+                last_txid,
+                lock_timeout_ms,
+            }))
+        })?;
+        let Message::WriteBegun(begun) = reply else {
+            return Err(violation("unexpected reply to begin_write"));
+        };
+        if crate::format::meta_txid_and_page_count(&begun.meta).is_none() {
+            self.abort_write();
+            return Err(EngineError::new(
+                SqlState::DataCorrupted,
+                "the owner sent an invalid meta page",
+            ));
+        }
+        Ok(begun)
+    }
+
+    /// Record a granted write transaction on `txid`: it holds the gate, and page reads may name its
+    /// write pin.
+    pub(crate) fn start_write(&self, txid: u64, reuse_grant: bool) {
+        self.gate_held.store(true, Ordering::Release);
+        self.reuse_grant.store(reuse_grant, Ordering::Release);
+        let _outbox = self.outbox.lock().expect("page-service send lock poisoned");
+        self.write_txid.store(txid, Ordering::Release);
+    }
+
+    /// Whether the write transaction may reuse the committed free list (page-service.md §6).
+    pub(crate) fn reuse_grant(&self) -> bool {
+        self.reuse_grant.load(Ordering::Acquire)
+    }
+
+    /// End a write transaction that did not commit: send `abort` if it still holds the gate.
+    pub(crate) fn end_write(&self) {
+        if self.gate_held.swap(false, Ordering::AcqRel) {
+            self.abort_write();
         }
     }
 
-    /// Record the newest held version (the caller holds the reader-registry lock).
-    pub(crate) fn set_read_txid(&self, txid: u64) {
-        self.read_txid.store(txid, Ordering::Release);
+    /// Clear the write pin's part in `read_pages` and send `abort`, both under the send lock, so
+    /// no later `read_pages` names the released version.
+    fn abort_write(&self) {
+        let mut outbox = self.outbox.lock().expect("page-service send lock poisoned");
+        self.write_txid.store(0, Ordering::Release);
+        let _ = self.send_locked(&mut outbox, &Message::Abort, false);
+    }
+
+    /// Send `end_read` for a duplicate pin a `read_begun` carried.
+    pub(crate) fn end_read(&self, txid: u64) {
+        self.send(&Message::EndRead(EndRead { txid }));
+    }
+
+    /// Record that the newest version a local reader pins is now `newest`.
+    pub(crate) fn set_held_max(&self, newest: u64) {
+        let _outbox = self.outbox.lock().expect("page-service send lock poisoned");
+        self.held_max.store(newest, Ordering::Release);
+    }
+
+    /// Release the pin on `txid`: `read_pages` moves to `newest` before `end_read` is sent.
+    pub(crate) fn release_pin(&self, txid: u64, newest: u64) {
+        let mut outbox = self.outbox.lock().expect("page-service send lock poisoned");
+        self.held_max.store(newest, Ordering::Release);
+        let _ = self.send_locked(&mut outbox, &Message::EndRead(EndRead { txid }), false);
     }
 
     /// Fetch one page under the newest pinned version.
     fn read_page(&self, index: u32) -> Result<Vec<u8>> {
         let reply = self.round_trip(|| {
-            let txid = self.read_txid.load(Ordering::Acquire);
+            let txid = self
+                .held_max
+                .load(Ordering::Acquire)
+                .max(self.write_txid.load(Ordering::Acquire));
             if txid == 0 {
                 return Err(EngineError::new(
                     SqlState::ObjectNotInPrerequisiteState,
-                    "a page client read a page outside any read transaction",
+                    "a page client read a page outside any transaction",
                 ));
             }
             Ok(Message::ReadPages(ReadPages {
@@ -273,10 +476,7 @@ impl PsConnection {
         })?;
         match reply {
             Message::Pages(mut pages) if pages.pages.len() == 1 => Ok(pages.pages.remove(0)),
-            _ => Err(EngineError::new(
-                SqlState::ProtocolViolation,
-                "unexpected reply to read_pages",
-            )),
+            _ => Err(violation("unexpected reply to read_pages")),
         }
     }
 
@@ -288,29 +488,151 @@ impl PsConnection {
         self.meta.lock().expect("meta lock poisoned").clone()
     }
 
-    /// Close the connection (the owner releases every pin at EOF) and release the open-path claim.
-    /// Idempotent.
-    pub(crate) fn close(&self) {
-        let _ = self.control.shutdown(Shutdown::Both);
-        {
-            let mut io = self
-                .io
-                .lock()
-                .expect("page-service connection lock poisoned");
-            if io.broken.is_none() {
-                io.broken = Some(EngineError::new(
-                    SqlState::ConnectionFailure,
-                    "the page-service connection is closed",
+    /// Whether the last commit failed with the owner certainly not committing it; clears the mark.
+    pub(crate) fn take_uncommitted(&self) -> bool {
+        self.uncommitted.swap(false, Ordering::AcqRel)
+    }
+
+    /// Mark `error` as a commit failure after which the owner certainly did not commit.
+    fn not_committed(&self, error: EngineError) -> EngineError {
+        self.uncommitted.store(true, Ordering::Release);
+        error
+    }
+
+    /// Send a CommitDelta (README.md §3.5): `commit_begin` with the meta and the manifest chain,
+    /// the body pages in ascending index order in frame-sized chunks, then `commit_end`, and wait
+    /// for the owner. A connection lost after `commit_end` was sent leaves the outcome unknown;
+    /// [`resolve_commit`](Self::resolve_commit) asks.
+    fn commit(&self, meta: Vec<u8>, mut pages: BTreeMap<u32, Vec<u8>>) -> Result<()> {
+        self.uncommitted.store(false, Ordering::Release);
+        let Some(m) = crate::format::meta_fields(&meta) else {
+            return Err(self.not_committed(EngineError::new(
+                SqlState::DataCorrupted,
+                "a page-client commit built an invalid meta page",
+            )));
+        };
+        let ps = self.page_size.load(Ordering::Acquire) as usize;
+        let mut manifest = Vec::new();
+        let mut id = m.manifest_head;
+        for _ in 0..m.manifest_pages {
+            let Some(page) = pages.remove(&id) else {
+                return Err(self.not_committed(EngineError::new(
+                    SqlState::DataCorrupted,
+                    "a page-client commit lost a manifest page",
+                )));
+            };
+            let next = crate::format::page_header(&page)
+                .map_err(|e| self.not_committed(e))?
+                .next_page;
+            manifest.push(IndexedPage { index: id, page });
+            id = next;
+        }
+        let max_frame = MAX_FRAME_LENGTH as usize;
+        // A frame holds the length's 5 bytes of code and request id, the list count, and the
+        // (index, page) items.
+        let per_frame = (max_frame - 5 - 4) / (4 + ps);
+        if 5 + 8 + ps + 4 + manifest.len() * (4 + ps) > max_frame {
+            return Err(self.not_committed(EngineError::new(
+                SqlState::ProgramLimitExceeded,
+                "the transaction is too large to commit through the page service",
+            )));
+        }
+        let digest = crate::format::commit_crc64(0, &meta);
+        let body: Vec<IndexedPage> = pages
+            .into_iter()
+            .map(|(index, page)| IndexedPage { index, page })
+            .collect();
+        let receiver = {
+            let mut outbox = self.outbox.lock().expect("page-service send lock poisoned");
+            let begin = Message::CommitBegin(CommitBegin {
+                txid: m.txid,
+                meta,
+                manifest_pages: manifest,
+            });
+            self.send_locked(&mut outbox, &begin, false)
+                .map_err(|e| self.not_committed(e))?;
+            let mut body = body.into_iter().peekable();
+            while body.peek().is_some() {
+                let chunk: Vec<IndexedPage> = body.by_ref().take(per_frame).collect();
+                self.send_locked(
+                    &mut outbox,
+                    &Message::CommitPages(CommitPages { pages: chunk }),
+                    false,
+                )
+                .map_err(|e| self.not_committed(e))?;
+            }
+            let receiver = self.send_locked(&mut outbox, &Message::CommitEnd, true);
+            // The owner releases the write pin and the gate when it processes commit_end, whatever
+            // its outcome, so no later request may name the write base.
+            self.write_txid.store(0, Ordering::Release);
+            self.gate_held.store(false, Ordering::Release);
+            receiver
+                .map_err(|e| self.not_committed(e))?
+                .expect("a request with a reply registers a channel")
+        };
+        match self.await_reply(receiver) {
+            Ok(Message::Committed(done)) if done.txid == m.txid => Ok(()),
+            Ok(_) => Err(violation("unexpected reply to commit_end")),
+            Err(e) if e.state == SqlState::ConnectionFailure => {
+                self.resolve_commit(m.txid, digest, e)
+            }
+            Err(e) => Err(self.not_committed(e)),
+        }
+    }
+
+    /// Settle a commit whose acknowledgement was lost (page-service.md §8.4): reconnect to whichever
+    /// process owns the database until the open timeout passes and ask `commit_status`. This
+    /// connection stays broken (`08006`) either way; only this commit's outcome is resolved.
+    fn resolve_commit(&self, txid: u64, digest: u64, lost: EngineError) -> Result<()> {
+        // The open timeout bounds the search; 0 makes one attempt, as at open.
+        let timeout = self.timeout_ms;
+        let deadline = Instant::now() + Duration::from_millis(timeout);
+        loop {
+            let uid = endpoint::current_uid(&endpoint::bundle_dir(&self.db_path)).ok();
+            if let Some(record) = endpoint::read_owner_record(&self.db_path)
+                && record.serving
+                && Some(record.uid) == uid
+                && let Connect::Connected(other) =
+                    connect(&self.db_path, &record.endpoint, true, timeout)
+            {
+                let reply =
+                    other.round_trip(|| Ok(Message::CommitStatus(CommitStatus { txid, digest })));
+                other.close();
+                if let Ok(Message::CommitStatusReply(status)) = reply {
+                    return match status.status {
+                        COMMIT_STATUS_COMMITTED => Ok(()),
+                        COMMIT_STATUS_NOT_COMMITTED => Err(self.not_committed(lost)),
+                        _ => Err(EngineError::new(
+                            SqlState::TransactionResolutionUnknown,
+                            "lost the connection to the database owner during commit; whether the transaction committed is unknown",
+                        )),
+                    };
+                }
+            }
+            if Instant::now() > deadline {
+                return Err(EngineError::new(
+                    SqlState::TransactionResolutionUnknown,
+                    "lost the connection to the database owner during commit, and no owner answered whether it committed",
                 ));
             }
+            std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Close the connection (the owner releases every pin and the gate at EOF) and release the
+    /// open-path claim. Idempotent.
+    pub(crate) fn close(&self) {
+        self.break_with(EngineError::new(
+            SqlState::ConnectionFailure,
+            "the page-service connection is closed",
+        ));
         self.claim.lock().expect("claim lock poisoned").take();
     }
 }
 
-/// The versions a client pins at its owner (README.md §6.3): exactly the versions a local reader
-/// pins, plus a read begin's pin until its reader registers. Kept in the reader registry, under its
-/// lock; the methods say what to send, the caller sends it.
+/// The versions a client pins at its owner for local readers (README.md §6.3): exactly the
+/// versions a local reader pins, plus a read begin's pin until its reader registers. Kept in the
+/// reader registry, under its lock; the methods say what to send, the caller sends it.
 #[derive(Default)]
 pub(crate) struct ClientPins {
     held: BTreeSet<u64>,
@@ -328,7 +650,7 @@ impl ClientPins {
         self.held.remove(&txid)
     }
 
-    /// The newest held version (0 when none) — what `read_pages` names.
+    /// The newest held version (0 when none) — what `read_pages` names outside a write.
     pub(crate) fn newest(&self) -> u64 {
         self.held.last().copied().unwrap_or(0)
     }
@@ -346,35 +668,56 @@ impl ClientLink {
         if self.pins.take(txid) {
             self.conn.end_read(txid);
         } else {
-            self.conn.set_read_txid(self.pins.newest());
+            self.conn.set_held_max(self.pins.newest());
         }
     }
 
     /// Release the pin on `txid` if held: `read_pages` moves off it before `end_read` is sent.
     pub(crate) fn release(&mut self, txid: u64) {
         if self.pins.release(txid) {
-            self.conn.set_read_txid(self.pins.newest());
-            self.conn.end_read(txid);
+            self.conn.release_pin(txid, self.pins.newest());
         }
     }
 }
 
 /// The client pager's byte store: page indices 0 and 1 are the adopted meta page, every other page
-/// comes from the owner. Read-only.
+/// comes from the owner. A commit's writes collect here and its sync sends them as one CommitDelta
+/// (page-service.md §5.6).
 pub(crate) struct ServiceBlockStore {
-    pub(crate) conn: Arc<PsConnection>,
+    conn: Arc<PsConnection>,
+    /// The commit in progress: its body pages by index and its meta. The pager reads a pending page
+    /// back from here (a commit re-reads what it wrote while planning).
+    pending: BTreeMap<u32, Vec<u8>>,
+    pending_meta: Option<Vec<u8>>,
+    /// The size a commit in progress reserved.
+    reserved: u64,
+}
+
+impl ServiceBlockStore {
+    pub(crate) fn new(conn: Arc<PsConnection>) -> ServiceBlockStore {
+        ServiceBlockStore {
+            conn,
+            pending: BTreeMap::new(),
+            pending_meta: None,
+            reserved: 0,
+        }
+    }
+
+    fn page_size(&self) -> u64 {
+        u64::from(self.conn.page_size.load(Ordering::Acquire))
+    }
 }
 
 fn client_read_only() -> EngineError {
     EngineError::new(
         SqlState::ReadOnlySqlTransaction,
-        "a page client cannot write the database",
+        "cannot write through a read-only page-service connection",
     )
 }
 
 impl BlockStore for ServiceBlockStore {
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let page_size = u64::from(self.conn.page_size);
+        let page_size = self.page_size();
         let index = offset / page_size;
         let within = (offset - index * page_size) as usize;
         if within + len > page_size as usize {
@@ -385,6 +728,8 @@ impl BlockStore for ServiceBlockStore {
         }
         let page = if index < 2 {
             self.conn.meta()
+        } else if let Some(page) = self.pending.get(&(index as u32)) {
+            page.clone()
         } else {
             self.conn.read_page(index as u32)?
         };
@@ -397,23 +742,54 @@ impl BlockStore for ServiceBlockStore {
         Ok(page[within..within + len].to_vec())
     }
 
-    fn write_at(&mut self, _offset: u64, _bytes: &[u8]) -> Result<()> {
-        Err(client_read_only())
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        if self.conn.read_only() {
+            return Err(client_read_only());
+        }
+        let page_size = self.page_size();
+        if !offset.is_multiple_of(page_size) || bytes.len() as u64 != page_size {
+            return Err(EngineError::new(
+                SqlState::IoError,
+                "page-service write must be one whole page",
+            ));
+        }
+        let index = (offset / page_size) as u32;
+        if index < 2 {
+            self.pending_meta = Some(bytes.to_vec());
+        } else {
+            self.pending.insert(index, bytes.to_vec());
+        }
+        Ok(())
     }
 
+    /// Send the pending commit (its meta written last) and wait for the owner's answer.
     fn sync(&mut self) -> Result<()> {
-        Err(client_read_only())
+        let Some(meta) = self.pending_meta.take() else {
+            return Ok(());
+        };
+        let pages = std::mem::take(&mut self.pending);
+        self.conn.commit(meta, pages)
     }
 
-    /// The adopted snapshot's page count: every page a reader of it may name lies below it.
+    /// The adopted snapshot's page count (every page a reader of it may name lies below it), or the
+    /// space a commit in progress reserved.
     fn size(&mut self) -> Result<u64> {
         let (_, page_count) = crate::format::meta_txid_and_page_count(&self.conn.meta())
             .ok_or_else(|| EngineError::new(SqlState::DataCorrupted, "invalid meta page"))?;
-        Ok(u64::from(page_count) * u64::from(self.conn.page_size))
+        Ok((u64::from(page_count) * self.page_size()).max(self.reserved))
     }
 
-    fn set_size(&mut self, _bytes: u64) -> Result<()> {
-        Err(client_read_only())
+    fn set_size(&mut self, bytes: u64) -> Result<()> {
+        if self.conn.read_only() {
+            return Err(client_read_only());
+        }
+        self.reserved = self.reserved.max(bytes);
+        Ok(())
+    }
+
+    fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.pending_meta = None;
     }
 }
 

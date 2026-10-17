@@ -1,6 +1,7 @@
 //! The corpus through a page client (spec/pageservice/README.md §7): in `service` mode another
-//! core's process actor owns the database while each query record runs here as a page client of it,
-//! so rows, errors, plans, and costs are checked across the page service and across cores.
+//! core's process actor owns the database while every record, writes included, runs here as a page
+//! client of it, so rows, errors, plans, and costs are checked across the page service and across
+//! cores.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,10 +22,8 @@ pub struct OwnerActor {
 /// The owner actor in service mode; `None` in the memory and disk modes.
 static ACTOR: Mutex<Option<OwnerActor>> = Mutex::new(None);
 
-/// The query records a page client answered, and those it refused as writes (`25006`) that the
-/// owner then ran.
-pub static CLIENT_QUERIES: AtomicU32 = AtomicU32::new(0);
-pub static OWNER_RETRIES: AtomicU32 = AtomicU32::new(0);
+/// The records a page client ran.
+pub static CLIENT_RECORDS: AtomicU32 = AtomicU32::new(0);
 
 /// Start the owner actor of `core` (`rust`, `go`, or `node`) for the repository at `root`.
 pub fn start(core: &str, root: &Path) -> Result<(), String> {
@@ -149,10 +148,6 @@ pub fn stop() {
     }
 }
 
-pub fn count_client_query() {
-    CLIENT_QUERIES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn count_owner_retry() {
-    OWNER_RETRIES.fetch_add(1, Ordering::Relaxed);
+pub fn count_client_record() {
+    CLIENT_RECORDS.fetch_add(1, Ordering::Relaxed);
 }

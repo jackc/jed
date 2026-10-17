@@ -82,6 +82,8 @@ import {
   type RunResult,
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
+import { metaChecksum } from "./commit_manifest.ts";
+import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import { engineError } from "./errors.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
 import { Pager } from "./pager.ts";
@@ -114,18 +116,56 @@ import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
 import { renderIn, type Value } from "./value.ts";
 
+// ServiceEngineFacts are the owner's page-accounting facts its service needs to grant free-page reuse
+// and to decide a maintenance commit (spec/pageservice/README.md §3.5, §6.4): the free list's
+// generation, the live count at the last reclamation, and the oldest version a local reader pins (null
+// when none does).
+export type ServiceEngineFacts = {
+  freeGenTxid: bigint;
+  liveAtCompaction: number;
+  localOldest: bigint | null;
+};
+
+// ServicePending is what the owner's engine thread adopts from client commits (README §6.4): the
+// newest published txid and its meta, and every page index written by a commit after `since` (all:
+// the window no longer covers them).
+export type ServicePending = { txid: bigint; meta: Uint8Array; all: boolean; indices: number[] };
+
 // ServiceOwnerHandle is a serving page-service owner as the core sees it (spec/design/page-service.md
 // §4.1, §14; the Node implementation is pageservice/owner.ts, injected by file.ts so this module stays
-// browser-clean). Its lock orders client pins against the core's commit publication and watermark.
+// browser-clean). Its lock orders client pins against the core's commit publication and watermark; its
+// writer gate is shared by the owner's writers, compaction, and client write transactions (README §4).
 export interface ServiceOwnerHandle {
   lock(): void;
   unlock(): void;
   // oldestPinnedLocked is the oldest version any client connection pins, or null (lock held).
   oldestPinnedLocked(): bigint | null;
-  // published records a main-database commit: its version, meta page, and written page indices.
-  published(txid: bigint, meta: Uint8Array, written: number[]): void;
+  // published records a main-database commit: its version, meta page, written page indices, and the
+  // engine's facts after it.
+  published(txid: bigint, meta: Uint8Array, written: number[], facts: ServiceEngineFacts): void;
   // compactedLocked resets the service after compaction published txid over paging (lock held).
-  compactedLocked(txid: bigint, paging: SharedPaging): void;
+  compactedLocked(txid: bigint, paging: SharedPaging, facts: ServiceEngineFacts): void;
+  // epoch changes whenever a client commit is published or the gate is handed to the engine thread:
+  // one atomic load, the owner's whole per-transaction cost while nothing changed.
+  epoch(): number;
+  // pending reports the client commits published after since.
+  pending(since: bigint): ServicePending;
+  // acquireGate waits for the writer gate at most timeoutMs (0: no deadline; 55P03 on expiry). It
+  // returns true when the gate was handed over for a maintenance commit rather than free.
+  acquireGate(timeoutMs: number): boolean;
+  tryGate(): boolean;
+  // takeHanded takes the gate when the service handed it to the engine thread.
+  takeHanded(): boolean;
+  releaseGate(): void;
+  // poisoned reports a failed client commit (the owner stopped serving); stopServing poisons it.
+  poisoned(): boolean;
+  stopServing(): void;
+  // clearLocalOldest records that no local reader pins an old version any more.
+  clearLocalOldest(): void;
+  // onHandoff installs the engine thread's handler for a gate handed over between transactions.
+  onHandoff(handler: () => void): void;
+  // hangUpNextAck arms the commit-resolution test hook (README §6.4).
+  hangUpNextAck(): void;
   // close stops serving (clients see EOF) and removes the endpoint and owner record.
   close(): void;
 }
@@ -145,10 +185,27 @@ export type ClientReadBegun = {
 export interface PageClientHandle {
   readonly held: Set<bigint>;
   readonly adopted: bigint;
+  // readOnly is whether the connection is read-only (hello_ok).
+  readonly readOnly: boolean;
+  // reuseGrant is the current write transaction's reuse grant (README §3.5).
+  readonly reuseGrant: boolean;
   // beginRead runs begin_read and records the pin it carries (a duplicate is released at once).
   beginRead(): ClientReadBegun;
-  // adopt makes reply's version the client's cache version (its meta then serves pages 0 and 1).
-  adopt(reply: ClientReadBegun): void;
+  // beginWrite runs begin_write (waiting at most timeoutMs for the owner's gate) and holds the write
+  // pin it carries until endWrite or the commit.
+  beginWrite(timeoutMs: number): ClientReadBegun;
+  // endWrite ends a write transaction whose commit never reached the owner (abort).
+  endWrite(): void;
+  // setMeta makes meta serve page indices 0 and 1 (before a reload reads it); markAdopted records the
+  // version the cache now corresponds to.
+  setMeta(meta: Uint8Array): void;
+  markAdopted(incarnation: Uint8Array, txid: bigint): void;
+  // adoptOwnCommit records this process's own published commit as its adopted version.
+  adoptOwnCommit(txid: bigint, meta: Uint8Array): void;
+  // discardPending drops a commit's buffered pages after a failure; failedCommit unwraps a commit
+  // failure, saying whether the owner certainly did not commit it.
+  discardPending(): void;
+  failedCommit(error: unknown): { error: unknown; notCommitted: boolean };
   // releasePin sends end_read for a held version.
   releasePin(v: bigint): void;
   close(): void;
@@ -229,6 +286,11 @@ class SharedCore {
   // at most one is set, and only under the test-only `locking = service`.
   service: ServiceOwnerHandle | null = null;
   client: PageClientHandle | null = null;
+  // On a page-service owner: whether this thread holds the service's writer gate, the service epoch it
+  // last caught up with, and whether its last publication reported a local reader to the service.
+  private serviceGateHeld = false;
+  private serviceEpoch = 0;
+  private serviceLocalOldest = false;
   planEpoch = 0;
   // The handle's Environment (spec/design/environment.md §3): fixed at open/create and shared (by
   // reference) by every minted session, attachment, and temp domain — the storage owner's.
@@ -246,6 +308,36 @@ class SharedCore {
       throw engineError("active_sql_transaction", "there is already a writer in progress");
     }
     this.writerActive = true;
+    if (this.client !== null) {
+      // A page client's writer takes the owner's gate (page-service.md §5.5).
+      try {
+        this.clientBeginWrite(timeoutMs);
+      } catch (error) {
+        this.writerActive = false;
+        throw error;
+      }
+      return;
+    }
+    if (this.service !== null) {
+      // A page-service owner's writer shares the gate with client write transactions, then adopts
+      // any client commit published since its last transaction (page-service.md §5.5, §7).
+      try {
+        this.serviceTakeGate(timeoutMs);
+      } catch (error) {
+        this.releaseServiceGate();
+        this.writerActive = false;
+        throw error;
+      }
+    }
+    try {
+      this.acquireCoordinators(timeoutMs);
+    } catch (error) {
+      this.releaseServiceGate();
+      throw error;
+    }
+  }
+
+  private acquireCoordinators(timeoutMs: number): void {
     if (this.attachments.size === 0) {
       const coordinator = this.coordinator;
       if (coordinator === null) return;
@@ -296,7 +388,160 @@ class SharedCore {
       for (const coordinator of this.heldWriterCoordinators.reverse()) coordinator.unlockWriter();
       this.heldWriterCoordinators.length = 0;
     }
+    this.client?.endWrite();
+    this.releaseServiceGate();
     this.writerActive = false;
+  }
+
+  // --- the page-service owner (spec/pageservice/README.md §6.4) ---
+
+  // serviceTakeGate waits for the service's writer gate; a gate handed over for a maintenance commit
+  // runs it first and is kept. A poisoned service (a failed client commit) refuses the writer.
+  private serviceTakeGate(timeoutMs: number): void {
+    const service = this.service!;
+    const handed = service.acquireGate(timeoutMs);
+    this.serviceGateHeld = true;
+    if (handed) this.runMaintenance();
+    if (service.poisoned()) {
+      this.storage.paging?.poison();
+      throw engineError(
+        "io_error",
+        "a page-service client commit failed to write; close and reopen the database",
+      );
+    }
+    const epoch = service.epoch();
+    this.adoptForeign();
+    this.serviceEpoch = epoch;
+  }
+
+  // tryServiceGate takes the service's gate only if it is free now (compaction never waits).
+  tryServiceGate(): boolean {
+    if (!this.service!.tryGate()) return false;
+    this.serviceGateHeld = true;
+    return true;
+  }
+
+  private releaseServiceGate(): void {
+    if (!this.serviceGateHeld) return;
+    this.serviceGateHeld = false;
+    this.service!.releaseGate();
+  }
+
+  // serviceRefresh is an owner's transaction begin: one atomic load while no client committed and no
+  // gate was handed over; otherwise run a handed-over maintenance commit and adopt client commits.
+  serviceRefresh(): void {
+    const service = this.service!;
+    const epoch = service.epoch();
+    if (epoch === this.serviceEpoch) return;
+    this.serviceHandoff();
+    this.adoptForeign();
+    this.serviceEpoch = epoch;
+  }
+
+  // serviceHandoff runs a maintenance commit when the service handed the gate over, then releases it
+  // (the event-loop handler, and every transaction begin that noticed a new epoch).
+  serviceHandoff(): void {
+    const service = this.service;
+    if (service === null || !service.takeHanded()) return;
+    try {
+      this.runMaintenance();
+    } finally {
+      service.releaseGate();
+    }
+  }
+
+  // runMaintenance adopts the client commits and runs the maintenance commit, holding the gate. A
+  // failure here fails nothing: the client commit stands, and the next transaction retries adoption.
+  private runMaintenance(): void {
+    try {
+      this.adoptForeign();
+      this.maintenanceCommit();
+    } catch {
+      // Adoption fails only the transaction that needs it (README §6.4); maintenance is best effort.
+    }
+  }
+
+  // adoptForeign brings the owner's committed root up to the newest client commit (page-service.md
+  // §7): the service published it structurally; its catalog is loaded here, at an owner transaction
+  // begin, never in the commit path. Pages the client commits wrote are dropped from the pool (a reused
+  // free page may be cached from before it was freed). A failure (a collation this owner's environment
+  // lacks, say) fails only the transaction that needed it. The free list's generation and the live
+  // count at the last reclamation stay the owner's: a client commit's free list is the committed one
+  // minus the pages it reused.
+  private adoptForeign(): void {
+    const own = this.committed.txid;
+    const pending = this.service!.pending(own);
+    if (pending.txid <= own) return;
+    const paging = this.storage.paging;
+    if (paging === null) throw engineError("io_error", "database storage is closed");
+    if (pending.all) paging.invalidateAll();
+    else for (const index of pending.indices) paging.invalidate(index);
+    // The client commit is durable (the service synced it): no recovery barrier is owed for it, and a
+    // single commit's written pages are exactly the indices its manifest protects.
+    paging.finishDurableCommit(pending.txid, metaChecksum(pending.meta));
+    if (!pending.all && pending.txid === own + 1n) {
+      paging.cacheValidation(pending.meta, new Set(pending.indices));
+    }
+    paging.refreshAllocatedPages();
+    const loaded = loadEnginePaged(paging, this.environment);
+    // A commit published while this reload ran: its written pages were not dropped above.
+    if (loaded.committed.txid !== pending.txid) paging.invalidateAll();
+    if (loaded.committed.txid <= own) return;
+    this.storage.pageCount = loaded.pageCount;
+    this.storage.freePages = loaded.freePages;
+    this.storage.live = loaded.live;
+    this.committed = loaded.committed;
+    this.planEpoch++;
+  }
+
+  // maintenanceCommit is the owner-only free-list rebuild after client commits (page-service.md §6): a
+  // client commit never walks the database, so when the high-water passes the reclamation threshold
+  // and no pin holds back reclamation, the owner commits the unchanged snapshot at the next txid with
+  // in-commit reclamation. Called holding the gate, after adoption.
+  private maintenanceCommit(): void {
+    const st = this.storage;
+    const prev = this.committed;
+    const newTxid = prev.txid + 1n;
+    if (this.oldestLiveVersion(newTxid) !== newTxid) return;
+    if (
+      !(
+        st.liveAtCompaction === 0 ||
+        (st.pageCount > COMPACT_MIN_PAGES && st.pageCount > COMPACT_GROWTH * st.liveAtCompaction)
+      )
+    ) {
+      return;
+    }
+    const snap = prev.clone();
+    snap.txid = newTxid;
+    try {
+      persistImpl(st, snap, true, true, {
+        name: "main",
+        prev,
+        canCompact: true,
+        stagesRows: false,
+      });
+    } catch (error) {
+      if (st.paging?.commitRequiresReopen()) this.service!.stopServing();
+      throw error;
+    }
+    snap.demoteCleanLeaves();
+    this.committed = snap;
+    this.publishService(snap.txid);
+    this.planEpoch++;
+  }
+
+  // publishService records a main-database commit of this engine in the service (README §4).
+  publishService(txid: bigint): void {
+    const st = this.storage;
+    if (st.lastCommitMeta === null) return;
+    let localOldest: bigint | null = null;
+    for (const v of this.live.keys()) if (localOldest === null || v < localOldest) localOldest = v;
+    this.serviceLocalOldest = localOldest !== null;
+    this.service!.published(txid, st.lastCommitMeta, st.lastCommitWritten, {
+      freeGenTxid: st.freeGenTxid,
+      liveAtCompaction: st.liveAtCompaction,
+      localOldest,
+    });
   }
 
   private writableCoordinators(): FileCoordinatorHost[] {
@@ -328,6 +573,7 @@ class SharedCore {
   // (refreshAndPin), since a pin taken where no reader follows would leak (README §6.3).
   refreshShared(): void {
     if (this.client !== null) return;
+    if (this.service !== null) this.serviceRefresh();
     if (!this.hasSharedCoordinator()) return;
     const coordinator = this.coordinator;
     if (coordinator?.state === "shared") {
@@ -362,21 +608,68 @@ class SharedCore {
   // wholesale — the adoption of its meta, catalog/interior skeleton, and a new plan epoch. The pin the
   // reply carries is held for the local reader that follows.
   private clientRefresh(): void {
+    this.clientAdopt(this.client!.beginRead());
+  }
+
+  // clientAdopt applies a read_begun / write_begun cache answer: it drops the listed pages (or the
+  // whole cache) and, when the owner's version is newer than the adopted one (or the cache was dropped
+  // wholesale), adopts its meta and reloads the catalog/interior skeleton and page accounting.
+  private clientAdopt(reply: ClientReadBegun): void {
     const client = this.client!;
     const paging = this.storage.paging;
     if (paging === null) throw engineError("io_error", "database storage is closed");
-    const reply = client.beginRead();
     if (reply.invalidateAll) paging.invalidateAll();
     else for (const index of reply.indices) paging.invalidate(index);
     if (!reply.invalidateAll && reply.txid <= client.adopted) return;
-    client.adopt(reply);
+    client.setMeta(reply.meta);
     paging.refreshAllocatedPages();
     const loaded = loadEnginePaged(paging, this.environment);
+    client.markAdopted(reply.incarnation, reply.txid);
     this.storage.pageCount = loaded.pageCount;
     this.storage.freePages = loaded.freePages;
+    this.storage.liveAtCompaction = loaded.liveAtCompaction;
+    this.storage.freeGenTxid = loaded.freeGenTxid;
     this.storage.live = loaded.live;
     this.committed = loaded.committed;
     this.planEpoch++;
+  }
+
+  // clientBeginWrite takes the owner's writer gate for this process's writer (README §3.5) and adopts
+  // the snapshot it pins, so the write transaction starts from the owner's newest commit.
+  private clientBeginWrite(timeoutMs: number): void {
+    const client = this.client!;
+    if (client.readOnly) {
+      throw engineError(
+        "read_only_sql_transaction",
+        "cannot write through a read-only page-service connection",
+      );
+    }
+    const reply = client.beginWrite(timeoutMs);
+    try {
+      this.clientAdopt(reply);
+    } catch (error) {
+      client.endWrite();
+      throw error;
+    }
+  }
+
+  // persistClient is a page client's commit (page-service.md §5.6, §6): the ordinary validated-COW
+  // recipe over the service store, never reclaiming (free-list rebuilds are owner-only), reusing the
+  // free list only under the owner's reuse grant, and never compacting for its storage budget. The
+  // store's sync sends the CommitDelta. A failure after which the owner certainly did not commit leaves
+  // the pager usable; any other (the outcome unknown) keeps it refusing commits until reopen.
+  private persistClient(snap: Snapshot, stagesRows: boolean): void {
+    const client = this.client!;
+    const budget: BudgetCtx = { name: "main", prev: this.committed, canCompact: false, stagesRows };
+    try {
+      persistImpl(this.storage, snap, false, client.reuseGrant, budget);
+    } catch (error) {
+      client.discardPending();
+      const settled = client.failedCommit(error);
+      if (settled.notCommitted) this.storage.paging?.abandonDurableCommit();
+      this.storage.paging?.invalidateAll();
+      throw settled.error;
+    }
   }
 
   // refreshAndPin is a read begin that pins a local reader: refresh to the latest committed version and
@@ -552,7 +845,11 @@ class SharedCore {
       const compacted = compactStorage(this.storageFor(lname), prev, prev.txid + 1n);
       if (main) {
         this.committed = compacted;
-        service?.compactedLocked(compacted.txid, this.storage.paging!);
+        service?.compactedLocked(compacted.txid, this.storage.paging!, {
+          freeGenTxid: this.storage.freeGenTxid,
+          liveAtCompaction: this.storage.liveAtCompaction,
+          localOldest: null,
+        });
       } else {
         const attached = new Map(this.attached);
         attached.set(lname, compacted);
@@ -580,6 +877,10 @@ class SharedCore {
   // stagesRows is whether the commit staged any record version (the committed-storage repair
   // exemption, memory.md §8.3).
   persist(snap: Snapshot, stagesRows: boolean): void {
+    if (this.client !== null) {
+      this.persistClient(snap, stagesRows);
+      return;
+    }
     // The reader-liveness watermark (transactions.md §8) gates two things at the main-domain commit:
     //   - canReclaim (oldest_live == the new version, i.e. no reader live at an older version) lets the
     //     periodic COMPACT recompute the free-list (freeing this commit's fresh orphans);
@@ -661,7 +962,9 @@ class SharedCore {
     // An unchanged main does not persist, so it has no budget to check (transactions.md §2.1).
     if (main === null) return;
     const oldest = this.oldestLiveVersion(this.committed.txid + 1n);
-    precheckBudget(this.storage, main, oldest >= this.storage.freeGenTxid, {
+    const reuse =
+      this.client !== null ? this.client.reuseGrant : oldest >= this.storage.freeGenTxid;
+    precheckBudget(this.storage, main, reuse, {
       name: "main",
       prev: this.committed,
       canCompact,
@@ -728,6 +1031,11 @@ class SharedCore {
       this.live.delete(version);
       // A page client's owner pin on a version lives only while a local reader pins it (README §6.3).
       if (this.client?.held.has(version)) this.client.releasePin(version);
+      // A page-service owner told its service about a local reader at its last commit: none is left.
+      if (this.serviceLocalOldest && this.live.size === 0) {
+        this.serviceLocalOldest = false;
+        this.service?.clearLocalOldest();
+      }
     } else this.live.set(version, c);
   }
 
@@ -913,6 +1221,8 @@ export class Database {
     core.readOnly = engine.readOnly;
     core.service = pageService.service ?? null;
     core.client = pageService.client ?? null;
+    // A gate the service hands over between transactions is taken at the next event-loop turn.
+    core.service?.onHandoff(() => core.serviceHandoff());
     // No local reader follows an open, so a client's open-time pin is released at once.
     core.releaseIdlePins();
     coordinator?.startProbe(() => core.coordinationTick());
@@ -1074,6 +1384,14 @@ export class Database {
         `cannot compact database "${name}": its storage host cannot replace the file atomically`,
       );
     }
+    if (c.client !== null && lname === "main") {
+      // Compaction is an owner operation (page-service.md §6).
+      throw engineError(
+        "object_in_use",
+        `cannot compact database "${name}" while another process has it open`,
+      );
+    }
+    if (c.service !== null && lname === "main") c.serviceRefresh();
     if (!c.tryAcquireLocalWriter()) {
       throw engineError(
         "object_in_use",
@@ -1081,6 +1399,17 @@ export class Database {
       );
     }
     try {
+      if (c.service !== null && lname === "main") {
+        // The owner's gate is shared with client write transactions (page-service.md §6): taken
+        // without waiting, then any client commit is adopted before the rewrite.
+        if (!c.tryServiceGate()) {
+          throw engineError(
+            "object_in_use",
+            `cannot compact database "${name}" while a write transaction is open`,
+          );
+        }
+        c.serviceRefresh();
+      }
       c.compactLocked(lname, name);
     } finally {
       c.releaseWriter();
@@ -1346,6 +1675,8 @@ export class Database {
   }
   // txid is the latest committed transaction id (equal to version).
   get txid(): bigint {
+    // A page-service owner first adopts any client commit (one atomic load when there is none).
+    if (this.core.service !== null) this.core.serviceRefresh();
     return this.core.committed.txid;
   }
   // pageSize is the page payload size this database serializes at.
@@ -1355,6 +1686,7 @@ export class Database {
   // pageCount is the byte store's page high-water (since B3 an in-memory database has a real one —
   // its MemoryBlockStore's committed page count).
   get pageCount(): number {
+    if (this.core.service !== null) this.core.serviceRefresh();
     return this.core.storage.pageCount;
   }
   // setMaxStorageBytes sets the committed-storage limit of database name — main or an attachment — in
@@ -1521,14 +1853,34 @@ export class Session {
     // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
     // re-pins the latest committed so the snapshot is current; a read-only session uses its existing
     // pin, and an open block uses its working set.
+    // On a page client that re-pin is a begin_read whose pin stays registered for this statement
+    // (spec/pageservice/README.md §6.3); a cursor that outlives it registers its own.
+    let autoPin: bigint | null = null;
     if (
       this.access !== "ro" &&
       this.engine.session.tx === null &&
       !this.engine.stmtIsWriteWithViews(stmt)
     ) {
-      this.core.refreshShared();
+      if (this.core.client !== null) autoPin = this.core.refreshAndPin();
+      else this.core.refreshShared();
       this.refreshCommitted();
     }
+    if (autoPin === null) return this.routeStmt(stmt, params, holder, insertHolder);
+    try {
+      return this.routeStmt(stmt, params, holder, insertHolder);
+    } finally {
+      this.core.deregister(autoPin);
+    }
+  }
+
+  // routeStmt is queryStmt after the autocommit re-pin: the plan-cache epoch check, the lazy lanes,
+  // and the materialized dispatch.
+  private routeStmt(
+    stmt: Statement,
+    params: Value[],
+    holder: ScanCacheHolder | null,
+    insertHolder: InsertCacheHolder | null,
+  ): Rows {
     if (this.planEpoch !== this.core.planEpoch) {
       if (holder !== null) holder.cache = null;
       if (insertHolder !== null) insertHolder.cache = null;
@@ -1798,15 +2150,19 @@ export class Session {
       this.engine.committed = snap;
       this.baseVersion += 1n;
     }
-    this.core.committed = snap;
-    const service = this.core.service;
-    if (changes.main && service !== null && this.core.storage.lastCommitMeta !== null) {
+    // A page client's reader may already have adopted a newer version through begin_read; never move
+    // the root back.
+    if (this.core.client === null || snap.txid > this.core.committed.txid) {
+      this.core.committed = snap;
+    }
+    if (changes.main && this.core.service !== null) {
       // The page service publishes the same version with its meta and written pages (README.md §4).
-      service.published(
-        snap.txid,
-        this.core.storage.lastCommitMeta,
-        this.core.storage.lastCommitWritten,
-      );
+      this.core.publishService(snap.txid);
+    }
+    if (changes.main && this.core.client !== null && this.core.storage.lastCommitMeta !== null) {
+      // A page client adopts its own commit: the owner published exactly this version, and no other
+      // commit came between its base and it (README.md §6.4).
+      this.core.client.adoptOwnCommit(snap.txid, this.core.storage.lastCommitMeta);
     }
     // The N-root commit (attached-databases.md §5): publish the new attached roots the commit adopted
     // (commitTx already staged each dirtied attachment's working root into its in-RAM store and adopted

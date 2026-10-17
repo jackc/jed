@@ -1,8 +1,8 @@
 package main
 
 // The corpus through a page client (spec/pageservice/README.md §7): in `service` mode another core's
-// process actor owns the database while each query record runs here as a page client of it, so
-// rows, errors, plans, and costs are checked across the page service and across cores.
+// process actor owns the database while every record, writes included, runs here as a page client of
+// it, so rows, errors, plans, and costs are checked across the page service and across cores.
 
 import (
 	"bufio"
@@ -97,9 +97,8 @@ func (a *ownerActor) stop() {
 // serviceOwner is the owner actor in service mode; nil in the memory and disk modes.
 var serviceOwner *ownerActor
 
-// clientQueries counts the query records a page client answered; ownerRetries those it refused as
-// writes (25006) and the owner then ran.
-var clientQueries, ownerRetries int
+// clientRecords counts the records a page client ran.
+var clientRecords int
 
 // serviceLocking is the file locking mode the harness opens with: the test-only page-service mode in
 // service mode, the default otherwise.

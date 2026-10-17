@@ -1,0 +1,68 @@
+schema_version = 1
+name = "service-commit-resolution"
+description = "Page service phase 3: when the owner drops the connection after a client commit is durable but before acknowledging it (a test hook), the client resolves the outcome with commit_status on a new connection: the commit succeeded, and only later requests on the lost connection fail 08006."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "a"
+command = "hangup_next_ack"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (2)"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect_error = "08006"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

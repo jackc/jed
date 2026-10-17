@@ -169,7 +169,7 @@ func run() int {
 
 	fmt.Printf("\n[%s] %d passed, %d failed, %d skipped\n", mode, passed, failed, skipped)
 	if serviceOwner != nil {
-		fmt.Printf("[%s] %d query records answered by a page client; %d writing queries run by the owner\n", mode, clientQueries, ownerRetries)
+		fmt.Printf("[%s] %d records run on a page client\n", mode, clientRecords)
 	}
 	if forced >= 0 {
 		spills := jed.TempSpills()
@@ -1088,9 +1088,6 @@ func runFile(text string, disk bool) error {
 			removeTempDB(tmpPath)
 		}
 	}
-	// afterPrev is the line just after the previous record: a service-mode query the client refuses as
-	// a write (25006) rewinds there and runs again, its directives re-read, as the owner.
-	afterPrev, recordDone, forceOwner := 0, false, false
 	defer func() { cleanup() }()
 	i := 0
 	// A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
@@ -1129,9 +1126,6 @@ func runFile(text string, disk bool) error {
 	var pendingVars []varPair
 	var pendingTimezone *string
 	for i < len(lines) {
-		if recordDone {
-			afterPrev, recordDone = i, false
-		}
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			i++
@@ -1276,13 +1270,13 @@ func runFile(text string, disk bool) error {
 		// committed state carries on the file; the fresh session re-receives the per-record directives
 		// applied just below). Writes reopen too — an UPDATE/DELETE over a faulted leaf exercises the
 		// resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
-		recordDone = true
-		clientRecord := false
 		if disk && onTemp {
-			clientRecord = serviceOwner != nil && strings.HasPrefix(line, "query") && !forceOwner
-			forceOwner = false
-			if err := reopenDisk(clientRecord); err != nil {
+			// In service mode every record, writes included, runs on a page client.
+			if err := reopenDisk(serviceOwner != nil); err != nil {
 				return err
+			}
+			if serviceOwner != nil {
+				clientRecords++
 			}
 		}
 		// This record consumes any pending assertions (so they never leak forward).
@@ -1472,15 +1466,6 @@ func runFile(text string, disk bool) error {
 				cols = 1
 			}
 			actual, names, types, cost, err := drainQuery(sess, sql, params, sortmode, cols)
-			if err != nil && clientRecord && codeOf(err) == "25006" {
-				// A writing query: run it again as the owner.
-				i, recordDone, forceOwner = afterPrev, false, true
-				ownerRetries++
-				continue
-			}
-			if clientRecord {
-				clientQueries++
-			}
 			if err != nil {
 				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
 			}

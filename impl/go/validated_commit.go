@@ -80,6 +80,13 @@ func (p *pager) beginValidatedCommit() error {
 	return nil
 }
 
+// abandonValidatedCommit ends a commit whose meta was never written: the pages it wrote are unreachable
+// orphans of the committed state (beyond its high-water or in its free list), so the handle stays
+// usable. Only the page-service owner calls it, for a client delta it rejected or aborted.
+func (p *pager) abandonValidatedCommit() {
+	p.commitInProgress = false
+}
+
 func (p *pager) finishValidatedCommit(m []byte) {
 	p.validatedMeta = append(p.validatedMeta[:0], m...)
 	// Rebuild protection when a shared reload next parses this locally-published root.

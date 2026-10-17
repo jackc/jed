@@ -102,8 +102,8 @@ fn main() -> ExitCode {
     // disk through the demand-paged buffer pool. The two modes catch DIVERGENCES between resident and
     // on-disk-faulted reads (the window-operand touched-set bug the in-memory pass could not see).
     // Every record's SQL-in → rows/error/cost-out must be IDENTICAL in both modes.
-    // The SERVICE mode (spec/pageservice/README.md §7) is the disk mode with each query record run
-    // as a page client of another core's owner (JED_SERVICE_OWNER = rust | go | node).
+    // The SERVICE mode (spec/pageservice/README.md §7) is the disk mode with every record run as a
+    // page client of another core's owner (JED_SERVICE_OWNER = rust | go | node).
     let service_mode = std::env::args().any(|a| a == "service");
     let disk = service_mode || std::env::args().any(|a| a == "disk");
     let mut mode = if disk { "disk" } else { "memory" }.to_string();
@@ -204,9 +204,8 @@ fn main() -> ExitCode {
     println!("\n[{mode}] {passed} passed, {failed} failed, {skipped} skipped");
     if service_mode {
         println!(
-            "[{mode}] {} query records answered by a page client; {} writing queries run by the owner",
-            service::CLIENT_QUERIES.load(Ordering::Relaxed),
-            service::OWNER_RETRIES.load(Ordering::Relaxed)
+            "[{mode}] {} records run on a page client",
+            service::CLIENT_RECORDS.load(Ordering::Relaxed)
         );
         service::stop();
     }
@@ -1070,17 +1069,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     let mut pending_vars: Vec<(String, String)> = Vec::new();
     let mut pending_timezone: Option<String> = None;
 
-    // Service mode: `after_prev` is the position just after the previous record — a query the page
-    // client refuses as a write (25006) rewinds there and runs again, its directives re-read, as the
-    // owner (spec/pageservice/README.md §7).
-    let mut after_prev = lines.clone();
-    let mut record_done = false;
-    let mut force_owner = false;
     loop {
-        if record_done {
-            after_prev = lines.clone();
-            record_done = false;
-        }
         let Some(line) = lines.next() else {
             break;
         };
@@ -1215,17 +1204,16 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         // Drop the session and handle explicitly before reopening. Assignment evaluates its right-hand
         // side before dropping the previous value, which shared coordination correctly rejects as a
         // duplicate in-process open of the same path.
-        // In service mode the reopened handle is a page client of the owner actor for a `query`
-        // record and the owner itself for any other (spec/pageservice/README.md §7).
-        record_done = true;
-        let mut client_record = false;
+        // In service mode every record, writes included, runs on a page client of the owner actor
+        // (spec/pageservice/README.md §7).
         if disk && on_temp {
             let p = tmp_path.as_ref().expect("disk mode has a temp path");
-            client_record = service_mode && trimmed.starts_with("query") && !force_owner;
-            force_owner = false;
             drop(sess);
             drop(db);
-            service::prepare_reopen(p, client_record)?;
+            service::prepare_reopen(p, service_mode)?;
+            if service_mode {
+                service::count_client_record();
+            }
             db = Database::open_with_options(
                 p,
                 jed::OpenOptions {
@@ -1384,16 +1372,6 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                     expected.push(l.trim().to_string());
                 }
                 let result = drain_query(&mut sess, &sql, &params);
-                if client_record {
-                    if matches!(&result, Err(e) if e.code() == "25006") {
-                        // A writing query: run it again as the owner.
-                        lines = after_prev.clone();
-                        force_owner = true;
-                        service::count_owner_retry();
-                        continue;
-                    }
-                    service::count_client_query();
-                }
                 let outcome = result.map_err(|e| {
                     format!(
                         "query failed with {}: {}\n  SQL: {sql}",

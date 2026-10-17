@@ -1,0 +1,49 @@
+schema_version = 1
+name = "service-client-churn-bounded"
+description = "Page service phase 3: a client never rebuilds the free list; after a client commit crosses the reclamation threshold the owner runs a maintenance commit, so a client rewriting the same rows repeatedly keeps the file bounded."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, v text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 40) FROM generate_series(1, 200) g"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "UPDATE t SET v = repeat('y', 40)"
+repeat = 80
+
+[[step]]
+actor = "a"
+command = "page_count"
+expect_max = 64
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), count(*) FILTER (WHERE v = repeat('y', 40)) FROM t"
+expect = "200:200"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

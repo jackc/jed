@@ -2186,7 +2186,7 @@ fn serialize_free_list(
 /// 28) through the pager, collecting every free page index. `head == 0` is an empty free-list. The
 /// inverse of the free-list serialization in [`Snapshot::incremental_image`]; replaces the v24
 /// reconstruct-on-open reachability walk (spec/fileformat/format.md *Reclamation*).
-fn read_free_list(
+pub(crate) fn read_free_list(
     paging: &SharedPaging,
     head: u32,
     page_count: u32,
@@ -4216,6 +4216,85 @@ pub(crate) fn sim_meta_of(image: &[u8], ps: u32, v: u64) -> Option<(u32, u32)> {
 /// page service's view of a meta page (spec/pageservice/README.md §3.2–§3.3).
 pub(crate) fn meta_txid_and_page_count(m: &[u8]) -> Option<(u64, u32)> {
     parse_meta(m).map(|meta| (meta.txid, meta.page_count))
+}
+
+/// The page service's view of a meta page (spec/pageservice/README.md §3.5): the fields an owner
+/// checks a page client's commit delta against. `None` when `m` is not a valid meta page.
+pub(crate) struct MetaFields {
+    pub(crate) txid: u64,
+    pub(crate) root_page: u32,
+    pub(crate) page_count: u32,
+    pub(crate) free_list_head: u32,
+    pub(crate) manifest_head: u32,
+    /// The number of pages the commit manifest lists (meta offset 40).
+    pub(crate) dirty_count: u32,
+    /// The length of the manifest overflow chain (meta offset 44).
+    pub(crate) manifest_pages: u32,
+    /// The CRC-64 over the manifest chain (meta offset 48).
+    pub(crate) manifest_crc: u64,
+}
+
+pub(crate) fn meta_fields(m: &[u8]) -> Option<MetaFields> {
+    let meta = parse_meta(m)?;
+    let u32_at = |at: usize| u32::from_be_bytes(m[at..at + 4].try_into().unwrap());
+    Some(MetaFields {
+        txid: meta.txid,
+        root_page: meta.root_page,
+        page_count: meta.page_count,
+        free_list_head: meta.free_list_head,
+        manifest_head: u32_at(36),
+        dirty_count: u32_at(40),
+        manifest_pages: u32_at(44),
+        manifest_crc: u64::from_be_bytes(m[48..56].try_into().unwrap()),
+    })
+}
+
+/// CRC-64/ECMA-182 continuing from `crc`: the validated-COW page identity and manifest-chain
+/// digest (spec/design/validated-cow.md), and the page service's commit digest.
+pub(crate) fn commit_crc64(crc: u64, bytes: &[u8]) -> u64 {
+    commit_manifest::extend(crc, bytes)
+}
+
+/// How many manifest entries a meta page of `ps` bytes holds inline, and how many one manifest
+/// overflow page holds (spec/fileformat/format.md).
+pub(crate) fn manifest_capacities(ps: usize) -> (usize, usize) {
+    commit_manifest::capacities(ps)
+}
+
+/// `page_type` for a manifest overflow page.
+pub(crate) const PAGE_MANIFEST_TYPE: u8 = commit_manifest::PAGE_MANIFEST;
+
+/// A body page's header fields, after its CRC-32 is checked (`XX001` otherwise).
+pub(crate) struct PageHeaderFields {
+    pub(crate) page_type: u8,
+    pub(crate) item_count: u32,
+    pub(crate) next_page: u32,
+}
+
+pub(crate) fn page_header(block: &[u8]) -> Result<PageHeaderFields> {
+    let page = parse_page(block)?;
+    Ok(PageHeaderFields {
+        page_type: page.page_type,
+        item_count: page.item_count,
+        next_page: page.next_page,
+    })
+}
+
+/// Encode a commit manifest into `meta` for the pages `written` on overflow pages `ids` (tests
+/// that build a commit delta by hand).
+#[cfg(test)]
+pub(crate) fn encode_manifest(
+    meta: Vec<u8>,
+    written: &[(u32, Vec<u8>)],
+    ids: &[u32],
+) -> (Vec<u8>, Vec<(u32, Vec<u8>)>) {
+    commit_manifest::encode(meta, written, &[], ids)
+}
+
+/// A body page of type `page_type` (tests that build a commit delta by hand).
+#[cfg(test)]
+pub(crate) fn test_page(ps: usize, page_type: u8, payload: &[u8]) -> Vec<u8> {
+    make_page(ps, page_type, 1, 0, payload)
 }
 
 /// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole

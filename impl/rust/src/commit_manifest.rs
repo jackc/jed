@@ -4,7 +4,7 @@ use super::*;
 const HEADER: usize = 64;
 const ENTRY: usize = 12;
 const OVERFLOW_HEADER: usize = 32;
-const PAGE_MANIFEST: u8 = 8;
+pub(super) const PAGE_MANIFEST: u8 = 8;
 
 const fn crc64_table() -> [u64; 256] {
     let mut table = [0; 256];
@@ -26,7 +26,7 @@ const fn crc64_table() -> [u64; 256] {
     table
 }
 const CRC64: [u64; 256] = crc64_table();
-fn extend(mut crc: u64, bytes: &[u8]) -> u64 {
+pub(super) fn extend(mut crc: u64, bytes: &[u8]) -> u64 {
     for &byte in bytes {
         crc = (crc << 8) ^ CRC64[((crc >> 56) as u8 ^ byte) as usize];
     }
@@ -37,6 +37,11 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 }
 fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+/// The inline (meta page) and per-overflow-page entry capacities for a page of `ps` bytes.
+pub(super) fn capacities(ps: usize) -> (usize, usize) {
+    ((ps - HEADER) / ENTRY, (ps - OVERFLOW_HEADER) / ENTRY)
 }
 
 pub(super) fn overflow_needed(ps: usize, entries: usize) -> usize {

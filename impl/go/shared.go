@@ -52,6 +52,7 @@ package jed
 // drives the single-handle path and mints additional concurrent sessions.
 
 import (
+	"errors"
 	"math"
 	"path/filepath"
 	"sort"
@@ -137,6 +138,28 @@ type sharedCore struct {
 
 func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
 	c.writeMu.Lock()
+	if c.client != nil {
+		// A page client's writer takes the owner's gate (page-service.md §5.5).
+		if err := c.clientBeginWrite(timeoutMs); err != nil {
+			c.writeMu.Unlock()
+			return err
+		}
+		return nil
+	}
+	if c.service != nil {
+		// A page-service owner's writer shares the gate with client write transactions, then adopts
+		// any client commit published since its last transaction (page-service.md §5.5, §7).
+		if err := c.service.acquireGate(timeoutMs, nil); err != nil {
+			c.writeMu.Unlock()
+			return err
+		}
+		if err := c.adoptForeign(); err != nil {
+			c.service.releaseGate()
+			c.writeMu.Unlock()
+			return err
+		}
+		return nil
+	}
 	if c.attachmentCount.Load() == 0 {
 		if c.coordinator == nil {
 			return nil
@@ -190,6 +213,11 @@ func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
 }
 
 func (c *sharedCore) releaseWriter() {
+	if c.client != nil {
+		c.clientEndWrite()
+	} else if c.service != nil {
+		c.service.releaseGate()
+	}
 	for i := len(c.heldCoordinators) - 1; i >= 0; i-- {
 		c.heldCoordinators[i].unlockWriter()
 	}
@@ -214,7 +242,7 @@ func (c *sharedCore) writableCoordinators() []*fileCoordinator {
 }
 
 func (c *sharedCore) hasSharedCoordinator() bool {
-	if c.client != nil {
+	if c.client != nil || c.service != nil {
 		return true
 	}
 	if c.coordinator != nil && c.coordinator.lease() == leaseShared {
@@ -261,6 +289,9 @@ func (c *sharedCore) attachment(name string) *attachment {
 }
 
 func (c *sharedCore) refreshShared() error {
+	if c.service != nil {
+		return c.adoptForeign()
+	}
 	if c.client != nil {
 		// A page client refreshes only at a read begin that pins a local reader (refreshAndPin): a
 		// begin_read pin taken here would have no reader to keep it (spec/pageservice/README.md §6.3).
@@ -567,6 +598,9 @@ type storage struct {
 	recordCommits bool
 	lastMeta      []byte
 	lastWritten   []uint32
+	// serviceClient is set on a page client's storage: its file is the owner's, reached through the
+	// service store (page-service.md §4.2).
+	serviceClient bool
 }
 
 // syncDirectoryOnce makes the database file's directory durable before the first durable commit after
@@ -576,7 +610,7 @@ type storage struct {
 // makes its directory entry durable, so the first writer does it once. Best effort, like every
 // directory sync, and skipped under fsync=off.
 func (st *storage) syncDirectoryOnce() {
-	if st.dirSynced || st.path == "" {
+	if st.dirSynced || st.path == "" || st.serviceClient {
 		return
 	}
 	st.dirSynced = true
@@ -695,6 +729,9 @@ func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 	//     page dead at generation G is only safe to overwrite once no reader pins a version older than G.
 	// Both consult the SAME registry; single-handle / all-readers-current keeps oldest_live == committed, so
 	// both hold and the behavior (and on-disk bytes) are identical to an ungated commit.
+	if c.client != nil {
+		return c.persistClient(snap, stagesRows)
+	}
 	oldest := c.oldestLiveVersion(snap.txid)
 	shared := c.coordinator != nil && c.coordinator.lease() == leaseShared
 	canReclaim := !shared && oldest == snap.txid
@@ -713,6 +750,33 @@ func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 		return err
 	}
 	return c.storage.commitDurable(snap, canReclaim, canReuse, budget)
+}
+
+// persistClient is a page client's commit (page-service.md §5.6, §6): the ordinary validated-COW
+// recipe over the service store, never reclaiming (free-list rebuilds are owner-only), reusing the free
+// list only under the owner's reuse grant, and never compacting for its storage budget. The store's
+// sync sends the CommitDelta. A failure after which the owner certainly did not commit leaves the
+// pager usable; any other (the outcome unknown) keeps it poisoned until reopen.
+func (c *sharedCore) persistClient(snap *snapshot, stagesRows bool) error {
+	budget := &budgetCtx{name: "main", prev: c.roots.Load().committed, stagesRows: stagesRows}
+	err := c.storage.commitDurable(snap, false, c.client.reuseGrant, budget)
+	if err == nil {
+		return nil
+	}
+	_ = c.storage.paging.withPager(func(p *pager) error {
+		if store, ok := p.store.(*serviceBlockStore); ok {
+			store.discard()
+		}
+		var notCommitted *psCommitNotCommitted
+		if errors.As(err, &notCommitted) {
+			p.poisoned = false
+			p.abandonValidatedCommit()
+			err = notCommitted.err
+		}
+		return nil
+	})
+	c.storage.paging.pool.invalidateAll()
+	return err
 }
 
 // commitShared is the co-resident (append-only) file commit: admitted under the file form of
@@ -1574,6 +1638,9 @@ type CreateOptions struct {
 	Locking   Locking
 	// nil is the 5s default; &0 requests one immediate acquisition attempt.
 	FileLockTimeoutMs *uint64
+	// IdleInTransactionTimeoutMs is OpenOptions.IdleInTransactionTimeoutMs for a creator that becomes
+	// the page-service owner.
+	IdleInTransactionTimeoutMs *uint64
 	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
 	// time-zone data, the host functions, and the random + clock sources, shared by every session,
 	// attachment, and temp domain of the handle. Not stored in the file — a host reopens with its own.
@@ -1617,7 +1684,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		return nil, err
 	}
 	if opts.Locking == LockingService {
-		return startServiceOwner(e, coordinator, path, opts.MaxStorageBytes)
+		return startServiceOwner(e, coordinator, path, opts.MaxStorageBytes, idleInTransactionTimeoutMs(opts.IdleInTransactionTimeoutMs))
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
@@ -1944,11 +2011,25 @@ func (db *Database) Compact(name string) error {
 	if readOnly {
 		return newError(ReadOnlySqlTransaction, `cannot compact read-only database "`+name+`"`)
 	}
+	if c.client != nil && lname == "main" {
+		// Compaction is an owner operation (page-service.md §6).
+		return newError(ObjectInUse, `cannot compact database "`+name+`" while another process has it open`)
+	}
 	// Compaction never waits for the writer gate (api.md §2.6).
 	if !c.writeMu.TryLock() {
 		return newError(ObjectInUse, `cannot compact database "`+name+`" while a write transaction is open`)
 	}
 	defer c.writeMu.Unlock()
+	if c.service != nil {
+		// The owner's gate is shared with client write transactions (page-service.md §6).
+		if !c.service.tryGate() {
+			return newError(ObjectInUse, `cannot compact database "`+name+`" while a write transaction is open`)
+		}
+		defer c.service.releaseGate()
+		if err := c.adoptForeign(); err != nil {
+			return err
+		}
+	}
 	return c.compactLocked(lname, name)
 }
 
@@ -2304,23 +2385,10 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	if s.pendingErr != nil {
 		return nil, s.pendingErr
 	}
-	if s.engine.session.tx == nil && !s.engine.stmtIsWriteWithViews(stmt) {
-		if s.access == accessReadOnly {
-			if err := s.refreshInitialRead(); err != nil {
-				return nil, err
-			}
-		} else if err := s.core.refreshShared(); err != nil {
+	if s.engine.session.tx == nil && !s.engine.stmtIsWriteWithViews(stmt) && s.access == accessReadOnly {
+		if err := s.refreshInitialRead(); err != nil {
 			return nil, err
 		}
-	}
-	if epoch := s.core.planEpoch.Load(); epoch != s.planEpoch {
-		if sc != nil {
-			sc.p.Store(nil)
-		}
-		if ic != nil {
-			ic.p.Store(nil)
-		}
-		s.planEpoch = epoch
 	}
 	// Route the read before building the streaming cursor (spec/design/streaming.md §4): an autocommit
 	// (non-block, writable access) read re-pins the latest committed so the snapshot is current
@@ -2332,20 +2400,32 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	autoPin := false
 	var autoPinVer uint64
 	if s.access != accessReadOnly && s.engine.session.tx == nil && !s.engine.stmtIsWriteWithViews(stmt) {
-		s.core.liveMu.Lock()
-		rt := s.core.roots.Load()
-		s.baseVersion = rt.committed.txid
+		// refreshAndPin: shared mode's meta refresh or a page client's begin_read, then the atomic
+		// load+register.
+		rt, v, err := s.core.refreshAndPin()
+		if err != nil {
+			return nil, err
+		}
+		s.baseVersion = v
 		s.engine.committed = rt.committed
 		s.engine.attachedCommitted = rt.attached
-		autoPinVer = s.baseVersion
-		s.core.live[autoPinVer]++
-		s.core.liveMu.Unlock()
+		autoPinVer = v
 		autoPin = true
 		defer func() {
 			if autoPin { // no cursor adopted the provisional pin — release it
 				s.core.deregisterPin(autoPinVer)
 			}
 		}()
+	}
+	// After the refresh: a reload it adopted invalidates cached plans.
+	if epoch := s.core.planEpoch.Load(); epoch != s.planEpoch {
+		if sc != nil {
+			sc.p.Store(nil)
+		}
+		if ic != nil {
+			ic.p.Store(nil)
+		}
+		s.planEpoch = epoch
 	}
 	// A read served by a lazy lane never reaches the materialized dispatch, so enforce the read-path
 	// admission gates (failed-block 25P02 / lifetime 54P02 / privilege 42501) here — after refreshing so
@@ -2638,13 +2718,22 @@ func (s *Session) publish() error {
 	// pins EITHER the old committed (and is counted at that version) OR the new one, never a version the
 	// reclamation watermark could miss.
 	s.core.liveMu.Lock()
-	s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
+	// A page client's reader may already have adopted this version, or the owner's maintenance commit
+	// after it, through begin_read; never move the roots back.
+	if s.core.client == nil || snap.txid > s.core.roots.Load().committed.txid {
+		s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
+	}
 	if changes.main && s.core.service != nil {
 		// The page service publishes the same version with its meta and written pages (README.md §4).
 		st := s.core.storage
 		s.core.service.published(snap.txid, st.lastMeta, st.lastWritten)
 	}
 	s.core.liveMu.Unlock()
+	if changes.main && s.core.client != nil {
+		// A page client adopts its own commit: the owner published exactly this version, and no other
+		// commit came between its base and it (README.md §6.4).
+		s.core.clientAdoptOwnCommit(snap.txid)
+	}
 	s.core.adoptAttachments(staged, s.engine.attachedCommitted)
 	return nil
 }

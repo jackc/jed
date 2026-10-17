@@ -298,6 +298,13 @@ export class Pager {
     }
   }
 
+  // abandonDurableCommit ends a commit whose meta never reached the storage: a page client's commit
+  // the owner certainly did not commit (spec/pageservice/README.md §6.4). The pages it buffered are
+  // dropped, so the handle stays usable.
+  abandonDurableCommit(): void {
+    this.durableCommitActive = false;
+  }
+
   finishDurableCommit(txid: bigint, checksum: number): void {
     this.acknowledgedMeta = `${txid}:${checksum}`;
     this.adoptedNeedsSync = false;

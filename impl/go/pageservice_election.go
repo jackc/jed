@@ -20,7 +20,7 @@ type serviceElection struct {
 // electService runs the election for the database at path (already resolved as prepareOpenCoordinator
 // resolves it). It retries until the open timeout: presence may free up, and a new owner may not have
 // bound its endpoint yet.
-func electService(host lockHost, path string, timeoutOpt *uint64) (serviceElection, error) {
+func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool) (serviceElection, error) {
 	if !host.claimPath(path) {
 		return serviceElection{}, newError(ObjectInUse, "database is already open in this process: "+path+" (share one Database handle)")
 	}
@@ -65,7 +65,7 @@ func electService(host lockHost, path string, timeoutOpt *uint64) (serviceElecti
 			reason = "owned by a non-serving process"
 		default:
 			reason = ""
-			cl, retry, err := connectPageClient(path, record.endpoint)
+			cl, retry, err := connectPageClient(path, record.endpoint, readOnly)
 			if err == nil {
 				// A client holds no bundle lock while connected (page-service.md §4.2).
 				_ = host.unlock(files.arrival)
@@ -120,7 +120,7 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
-	election, err := electService(osLocks, real, opts.FileLockTimeoutMs)
+	election, err := electService(osLocks, real, opts.FileLockTimeoutMs, opts.ReadOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +137,13 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 		e.spill = osSpillHost{dir: os.TempDir()}
 		c := sharedCoreFromEngineCoordinated(e, nil)
 		c.client = election.client
+		c.client.timeoutMs = defaultFileLockTimeoutMs
+		if opts.FileLockTimeoutMs != nil {
+			c.client.timeoutMs = *opts.FileLockTimeoutMs
+		}
+		c.storage.serviceClient = true
+		c.storage.recordCommits = true
+		c.storage.budget.limit = opts.MaxStorageBytes
 		return databaseOver(c), nil
 	}
 	opts.Locking = LockingNone
@@ -146,14 +153,22 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 		election.owner.close()
 		return nil, err
 	}
-	return startServiceOwner(e, election.owner, real, opts.MaxStorageBytes)
+	return startServiceOwner(e, election.owner, real, opts.MaxStorageBytes, idleInTransactionTimeoutMs(opts.IdleInTransactionTimeoutMs))
+}
+
+// idleInTransactionTimeoutMs resolves the owner's idle-in-transaction timeout option (nil: 60 s).
+func idleInTransactionTimeoutMs(value *uint64) uint64 {
+	if value == nil {
+		return defaultIdleInTransactionTimeoutMs
+	}
+	return *value
 }
 
 // startServiceOwner lifts an opened or created engine into a serving owner's shared core.
-func startServiceOwner(e *engine, coord *fileCoordinator, real string, maxStorageBytes int64) (*Database, error) {
+func startServiceOwner(e *engine, coord *fileCoordinator, real string, maxStorageBytes int64, idleTimeoutMs uint64) (*Database, error) {
 	c := sharedCoreFromEngineCoordinated(e, coord)
 	c.storage.budget.limit = maxStorageBytes
-	service, err := startPageServiceOwner(c, real)
+	service, err := startPageServiceOwner(c, real, idleTimeoutMs)
 	if err != nil {
 		db := databaseOver(c)
 		_ = db.Close()

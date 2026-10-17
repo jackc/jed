@@ -1,6 +1,6 @@
 //! Election at open under the test-only `Locking::Service` (spec/pageservice/README.md §6.1): the
 //! opener that takes presence EX owns the database and serves it; every other opener connects to
-//! the owner's endpoint as a read-only page client (phase 2). The OS lock is the only authority — the
+//! the owner's endpoint as a page client. The OS lock is the only authority — the
 //! owner record only tells a client where to connect and words its timeout error.
 
 use std::path::{Path, PathBuf};
@@ -22,8 +22,8 @@ pub(crate) enum Election {
 
 /// Run the election for the database at `path` (already resolved as a coordinated open resolves
 /// it), retrying until `timeout_ms`: presence may free up, and a new owner may not have bound its
-/// endpoint yet.
-pub(crate) fn elect(path: PathBuf, timeout_ms: u64) -> Result<Election> {
+/// endpoint yet. A client asks for a read-only connection when `read_only`.
+pub(crate) fn elect(path: PathBuf, timeout_ms: u64, read_only: bool) -> Result<Election> {
     let host: Arc<dyn LockHost> = Arc::new(OsLockHost);
     if !host.claim_path(&path) {
         return Err(EngineError::new(
@@ -41,7 +41,7 @@ pub(crate) fn elect(path: PathBuf, timeout_ms: u64) -> Result<Election> {
             return Err(e);
         }
     };
-    match run(host.as_ref(), &path, &files, timeout_ms) {
+    match run(host.as_ref(), &path, &files, timeout_ms, read_only) {
         Ok(None) => Ok(Election::Owner(FileCoordinator::elected_owner(
             host, path, files,
         ))),
@@ -69,6 +69,7 @@ fn run(
     path: &Path,
     files: &LockFiles,
     timeout_ms: u64,
+    read_only: bool,
 ) -> Result<Option<Arc<PsConnection>>> {
     let deadline = deadline(host, timeout_ms);
     lock_until(host, &files.arrival, false, deadline, path, false)?;
@@ -87,7 +88,7 @@ fn run(
                     "owned by another user's process"
                 }
                 Some(record) if !record.serving => "owned by a non-serving process",
-                Some(record) => match connect(path, &record.endpoint) {
+                Some(record) => match connect(path, &record.endpoint, read_only, timeout_ms) {
                     Connect::Connected(conn) => return Ok(Some(conn)),
                     Connect::Retry => "",
                     Connect::Refused(e) => return Err(e),

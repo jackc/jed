@@ -57,7 +57,7 @@ export type CommitMeta = {
 export function metaChecksum(block: Uint8Array): number {
   return crc32Update(crc32Update(0, block.subarray(0, 32)), block.subarray(36));
 }
-function pageChecksum(block: Uint8Array): number {
+export function pageChecksum(block: Uint8Array): number {
   return crc32Update(crc32Update(0, block.subarray(0, 12)), block.subarray(16));
 }
 function view(block: Uint8Array): DataView {

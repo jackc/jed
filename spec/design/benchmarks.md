@@ -1657,6 +1657,7 @@ timed loop returns a checksum; the run fails if any engine or pairing disagrees.
 | `owner_*` | a page-service owner with no client: the alone-owner fast path, which must match `alone_*` |
 | `client_cold_scan` / `client_cold_lookup` | a freshly opened page client's first reads: every leaf it touches is fetched with `read_pages` |
 | `client_warm_scan` / `client_warm_lookup` | the same reads with the client's buffer pool warm: one `begin_read` round trip per query |
+| `client_commit` | the same single-row durable commits run by a page client: `begin_write`, the `CommitDelta`, and the owner's validation, write, and barrier. Compare `owner_commit`. Commit lanes run after every pairing's reads, since they change the rows |
 
 It is a wall-clock benchmark outside `mise run ci` (§10); results go to
 `bench/results/page-service-<stamp>.jsonl`. The before/after check that the page-service hooks cost the

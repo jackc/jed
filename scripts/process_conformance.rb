@@ -29,7 +29,10 @@ class Actor
               when "node" then ["node", File.join(ROOT, "impl/ts/src/bin/process_actor.ts")]
               else raise "unknown actor core #{core}"
               end
-    @stdin, @stdout, @stderr, @wait = Open3.popen3(*command, action, path)
+    # `action` may carry extra actor arguments after the action word ("create-service 5000 300": the
+    # open timeout, then the owner's idle-in-transaction timeout), passed after the path.
+    action, *extra = action.split
+    @stdin, @stdout, @stderr, @wait = Open3.popen3(*command, action, path, *extra)
     line = read_line(START_TIMEOUT)
     raise "#{core} actor failed to start: #{line || @stderr.read}" unless line == "READY\n"
   end
@@ -99,6 +102,8 @@ end
 def step_satisfied?(step, result)
   if (expected = step["expect_error"])
     result[0] == :error && result[1] == expected
+  elsif (bound = step["expect_max"])
+    result[0] == :ok && Integer(result[1]) <= bound
   else
     result[0] == :ok && result[1] == step.fetch("expect", "")
   end
@@ -127,6 +132,11 @@ def run_scenario(path, first_core, second_core)
             actors[actor_name] = Actor.new(core, step.fetch("argument"), actor_path)
             next
           end
+          if command == "sleep"
+            # A pause between steps, for a timeout to expire (the idle-in-transaction timeout).
+            sleep Integer(step.fetch("argument")) / 1000.0
+            next
+          end
           actor = actors.fetch(actor_name)
           if command == "kill"
             actor.kill
@@ -139,6 +149,11 @@ def run_scenario(path, first_core, second_core)
             next
           end
           wire, argument = actor_command(step, dir)
+          # `repeat`: run the command this many times; every run must satisfy the step.
+          (step.fetch("repeat", 1) - 1).times do
+            result = actor.command(wire, argument)
+            raise "repeated run failed: #{result.inspect}" unless step_satisfied?(step, result)
+          end
           result = actor.command(wire, argument)
           # `retry_ms`: an outcome that holds only eventually, such as an owner observing a page
           # client's asynchronous end_read (spec/pageservice/README.md §6.3), is retried until the
@@ -154,6 +169,8 @@ def run_scenario(path, first_core, second_core)
             unless result[0] == :error && result[1] == expected
               raise "expected #{expected}, got #{result.inspect}"
             end
+          elsif (bound = step["expect_max"])
+            raise "expected at most #{bound}, got #{result.inspect}" unless step_satisfied?(step, result)
           else
             raise "command failed: #{result.inspect}" unless result[0] == :ok
             expected = step.fetch("expect", "")
@@ -188,7 +205,9 @@ end
 # whatever the completion order; JED_PROCESS_JOBS=1 runs serially.
 JOBS = [Integer(ENV.fetch("JED_PROCESS_JOBS", "8")), 1].max
 
-jobs = Dir[File.join(CORPUS, "*.process.toml")].sort.flat_map do |path|
+# JED_PROCESS_FILTER=service runs only the scenarios whose file name contains it.
+filter = ENV["JED_PROCESS_FILTER"]
+jobs = Dir[File.join(CORPUS, "*.process.toml")].sort.select { |path| filter.nil? || File.basename(path).include?(filter) }.flat_map do |path|
   CORES.product(CORES).map { |first, second| { path: path, first: first, second: second } }
 end
 queue = Queue.new

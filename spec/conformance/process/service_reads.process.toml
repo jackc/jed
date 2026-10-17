@@ -1,6 +1,6 @@
 schema_version = 1
 name = "service-election-and-reads"
-description = "Page service phase 2: the creator owns and serves; a second opener becomes a read-only page client whose reads follow the owner's commits, keep a pinned snapshot, see reused pages correctly, and hold back compaction."
+description = "Page service: the creator owns and serves; a second opener becomes a page client whose reads follow the owner's commits, keep a pinned snapshot, see reused pages correctly, and hold back compaction."
 requires = ["file.page_service"]
 
 [[step]]
@@ -103,12 +103,27 @@ command = "query_i64"
 sql = "SELECT count(*) FILTER (WHERE v = 'w'), count(*) FILTER (WHERE v = repeat('z', 40)) FROM t"
 expect = "300:0"
 
-# A page client is read-only in phase 2.
+# A client opened read-only gets a read-only connection: it reads, and a write is 25006.
 [[step]]
-actor = "b"
+actor = "c"
+command = "start"
+argument = "open-service-read-only"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*) FROM t WHERE v = 'w'"
+expect = "300"
+
+[[step]]
+actor = "c"
 command = "exec"
 sql = "INSERT INTO t VALUES (1, 'nope')"
 expect_error = "25006"
+
+[[step]]
+actor = "c"
+command = "close"
 
 # With no client pin left, compaction succeeds; the next read begin is told to drop its whole cache.
 # end_read has no reply, so the owner may see the client's last release a moment later: retry.

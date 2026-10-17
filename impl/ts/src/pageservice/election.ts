@@ -1,6 +1,7 @@
 // Election at open under the test-only `locking = service` (spec/design/page-service.md §4.3,
 // spec/pageservice/README.md §6.1): the opener that takes presence EX owns the database and serves it;
-// every other opener connects to the owner's endpoint as a read-only page client (phase 2). The OS
+// every other opener connects to the owner's endpoint as a page client (read-only exactly when the
+// opener asked for a read-only handle). The OS
 // lock is the only authority — the owner record only tells a client where to connect and words its
 // timeout error. Node-only.
 
@@ -16,7 +17,12 @@ export type Election = { owner: LockFiles; client: null } | { owner: null; clien
 
 // electService runs the election for the database at path (already canonical). It retries until the
 // open timeout: presence may free up, and a new owner may not have bound its endpoint yet.
-export function electService(host: LockHost, path: string, timeoutMs?: number): Election {
+export function electService(
+  host: LockHost,
+  path: string,
+  timeoutMs?: number,
+  readOnly = false,
+): Election {
   if (!host.claimPath(path)) {
     throw engineError(
       "object_in_use",
@@ -49,7 +55,7 @@ export function electService(host: LockHost, path: string, timeoutMs?: number): 
       else {
         reason = "";
         client ??= new PageClient(path);
-        const result = client.connect(record.endpoint);
+        const result = client.connect(record.endpoint, readOnly);
         if (result.ok) {
           // A client holds no bundle lock while connected (page-service.md §4.2).
           host.unlock(files.arrival);

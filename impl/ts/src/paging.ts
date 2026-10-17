@@ -122,6 +122,9 @@ export class SharedPaging {
   finishDurableCommit(txid: bigint, checksum: number): void {
     this.pager.finishDurableCommit(txid, checksum);
   }
+  abandonDurableCommit(): void {
+    this.pager.abandonDurableCommit();
+  }
   cachedValidation(meta: Uint8Array): Set<number> | null {
     return this.pager.cachedValidation(meta);
   }

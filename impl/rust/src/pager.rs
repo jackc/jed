@@ -252,6 +252,25 @@ impl Pager {
         Ok(())
     }
 
+    /// End a commit whose meta was never written: the pages it wrote are unreachable orphans of the
+    /// committed state (beyond its high-water or in its free list), so the handle stays usable. Only
+    /// the page-service owner calls it, for a client delta it rejected or aborted.
+    pub(crate) fn abandon_commit(&mut self) {
+        self.commit_in_progress = false;
+    }
+
+    /// Recover from a page client's commit the owner certainly did not commit (page-service.md
+    /// §5.6): the failed send poisoned nothing durable, so the handle stays usable.
+    pub(crate) fn recover_uncommitted(&mut self) {
+        self.poisoned = false;
+        self.commit_in_progress = false;
+    }
+
+    /// Drop any write the store buffered for a commit that failed (a page client's store).
+    pub(crate) fn discard_pending(&mut self) {
+        self.store.discard_pending();
+    }
+
     pub(crate) fn finish_commit(&mut self, meta: &[u8]) {
         self.validation = None;
         let generation = Some((

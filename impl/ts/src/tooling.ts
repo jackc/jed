@@ -112,3 +112,11 @@ export function setSpillDirForTest(db: object, dir: string): void {
   const internal = db as { core: { storage: Engine } };
   internal.core.storage.spillSink = new FileSpillSink(dir);
 }
+
+// hangUpNextPageServiceAckForTesting makes a serving page-service owner drop the connection instead of
+// acknowledging its next client commit, after the commit is durable — the case commit_status resolves
+// (spec/pageservice/README.md §6.4). Test-only; no effect on a handle that is not a page-service owner.
+export function hangUpNextPageServiceAckForTesting(db: object): void {
+  const internal = db as { core: { service: { hangUpNextAck(): void } | null } };
+  internal.core.service?.hangUpNextAck();
+}

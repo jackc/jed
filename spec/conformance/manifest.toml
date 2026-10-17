@@ -1609,7 +1609,7 @@ description = "Crash-clean shared multi-process access to one file (and independ
 
 [[capability]]
 id = "file.page_service"
-description = "The page service's read path under the test-only `locking = service` value (spec/design/page-service.md phase 2, spec/pageservice/README.md §6): election by presence EX, the owner record and same-user endpoint, hello/begin_read/read_pages/end_read, incarnation-scoped client cache invalidation, client pins in the owner's watermark, read-only page clients (25006), and 08006 after the owner dies. Host/process conformance, not SQL corpus records."
+description = "The page service's read and write paths under the test-only `locking = service` value (spec/design/page-service.md phases 2-3, spec/pageservice/README.md §6): election by presence EX, the owner record and same-user endpoint, hello/begin_read/read_pages/end_read, incarnation-scoped client cache invalidation, client pins in the owner's watermark, read-only connections on request (25006), the shared writer gate (55P03), the reuse grant, validated CommitDelta commits (08P01), owner maintenance commits, the idle-in-transaction timeout (25P03), commit_status resolution, and 08006 after the owner dies. Host/process conformance, not SQL corpus records."
 
 [[capability]]
 id = "storage.unparsable_definitions"

@@ -49,6 +49,9 @@ pub(crate) trait BlockStore: Send {
     fn skips_sync(&self) -> bool {
         false
     }
+    /// Drop writes buffered for a commit that failed. Only a page client's store buffers them
+    /// (spec/design/page-service.md §5.6); every other host writes through.
+    fn discard_pending(&mut self) {}
 }
 
 /// The **file** storage host (spec/design/hosts.md §4): a `std::fs::File`, safe positioned reads on

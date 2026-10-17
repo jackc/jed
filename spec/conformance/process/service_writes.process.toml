@@ -1,0 +1,230 @@
+schema_version = 1
+name = "service-client-writes"
+description = "Page service phase 3: page clients commit through the owner. The owner and clients of both cores see each other's commits, explicit transactions commit and roll back, DDL crosses roles, and compaction after client commits keeps every reader correct."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, v text)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+# A client's autocommit write is a CommitDelta the owner validates, writes, and publishes.
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 40) FROM generate_series(1, 1000) g"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64 FROM t"
+expect = "1000:500500"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "UPDATE t SET v = 'y' WHERE id <= 100"
+
+# The owner writes on top of the client's commit, and the client reads the owner's.
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (2001, 'owner')"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), count(*) FILTER (WHERE v = 'y'), max(id) FROM t"
+expect = "1001:100:2001"
+
+# An explicit client transaction reads its own writes and commits them whole.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "DELETE FROM t WHERE id > 900"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "UPDATE t SET v = 'z' WHERE id = 900"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), count(*) FILTER (WHERE v = 'z') FROM t"
+expect = "900:1"
+
+# A rolled-back client transaction leaves nothing behind.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "DELETE FROM t"
+
+[[step]]
+actor = "b"
+command = "write_rollback"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "900"
+
+# A second client of the second core writes too; each client sees the other's commits.
+[[step]]
+actor = "c"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "c"
+command = "exec"
+sql = "INSERT INTO t VALUES (3000, 'c')"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), max(id) FROM t"
+expect = "901:3000"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "DELETE FROM t WHERE id = 3000"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*), max(id) FROM t"
+expect = "900:900"
+
+# DDL committed by a client reaches the owner's catalog, and the other way round.
+[[step]]
+actor = "b"
+command = "exec"
+sql = "CREATE TABLE u (k i64 PRIMARY KEY, w text)"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "CREATE INDEX t_v ON t (v)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO u VALUES (1, 'one')"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*) FROM u"
+expect = "1"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE w (k i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO w SELECT g FROM generate_series(1, 50) g"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), (SELECT count(*) FROM t WHERE v = 'y') FROM w"
+expect = "50:100"
+
+# Churn from a client: freed pages are reused under the owner's reuse grant, and every role keeps reading correct rows.
+[[step]]
+actor = "b"
+command = "exec"
+sql = "UPDATE t SET v = repeat('q', 40) WHERE id <= 300"
+
+[[step]]
+actor = "c"
+command = "exec"
+sql = "DELETE FROM t WHERE id BETWEEN 400 AND 499"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, 'n' FROM generate_series(5001, 5200) g"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64, count(*) FILTER (WHERE v = repeat('q', 40)) FROM t"
+expect = "1000:1380600:300"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64, count(*) FILTER (WHERE v = 'n') FROM t"
+expect = "1000:1380600:200"
+
+# The owner compacts after client commits (end_read is asynchronous: retry); every client's next read begin drops its cache, and a client commits again on the compacted file.
+[[step]]
+actor = "a"
+command = "compact"
+retry_ms = 2000
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (6000, 'after')"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*), max(id) FROM t"
+expect = "1001:6000"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), max(id) FROM t"
+expect = "1001:6000"
+
+# A client cannot compact: compaction is an owner operation.
+[[step]]
+actor = "b"
+command = "compact"
+expect_error = "55006"
+
+[[step]]
+actor = "c"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

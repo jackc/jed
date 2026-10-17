@@ -7,6 +7,7 @@ import {
   MessageChannel,
   type MessagePort,
   receiveMessageOnPort,
+  type Transferable,
   Worker,
 } from "node:worker_threads";
 
@@ -29,9 +30,9 @@ export class BlockingChannel {
     this.port.postMessage(message);
   }
 
-  // request sends a message and waits for the worker's answer.
-  request(message: unknown): unknown {
-    this.port.postMessage(message);
+  // request sends a message (moving the transfer list's objects) and waits for the worker's answer.
+  request(message: unknown, transfer: Transferable[] = []): unknown {
+    this.port.postMessage(message, transfer);
     return this.wait();
   }
 

@@ -1,6 +1,6 @@
 // The corpus through a page client (spec/pageservice/README.md §7): in `service` mode another core's
-// process actor owns the database while each query record runs here as a page client of it, so rows,
-// errors, plans, and costs are checked across the page service and across cores.
+// process actor owns the database while every record, writes included, runs here as a page client of
+// it, so rows, errors, plans, and costs are checked across the page service and across cores.
 //
 // The harness is synchronous, so the actor's pipes are driven from a worker thread: the harness posts
 // a command line and blocks in Atomics.wait (BlockingChannel) until the worker relays the reply line.

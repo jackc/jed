@@ -1,12 +1,24 @@
-//! The page-service owner (spec/design/page-service.md §4.1, §5; spec/pageservice/README.md §6.2):
-//! the presence-EX holder serves pages of its database to page clients over its endpoint. Each
-//! connection runs on its own thread, so a client request never blocks the owner's own sessions. A
-//! connection's pins join the owner's reader registry, so the reclamation watermark covers every
-//! process (transactions.md §8). Phase 2: read path only — every connection is read-only.
+//! The page-service owner (spec/design/page-service.md §4.1, §5; spec/pageservice/README.md §6.2,
+//! §6.4): the presence-EX holder serves pages of its database to page clients over its endpoint and
+//! commits their CommitDeltas. Each connection runs on its own thread, so a client request never
+//! blocks the owner's own sessions. A connection's pins join the owner's reader registry, so the
+//! reclamation watermark covers every process (transactions.md §8).
 //!
-//! The registry-side state — the published meta and the invalidation window ([`ServiceWindow`]) —
-//! lives in the shared core's reader registry, under the lock that orders reader pins against
-//! publication, so a `begin_read` always sees a consistent (snapshot, meta, window) triple.
+//! The registry-side state — the published meta, the invalidation window, and the resolution window
+//! ([`ServiceWindow`]) — lives in the shared core's reader registry, under the lock that orders reader
+//! pins against publication, so a `begin_read` always sees a consistent (snapshot, meta, window)
+//! triple.
+//!
+//! The writer gate (page-service.md §5.5) is [`WriterGate`], shared by the owner's own writers (after
+//! the in-process writer gate), its compaction, and client write transactions (`begin_write`). A
+//! client commit is published structurally — meta, page accounting, invalidation and resolution
+//! windows — and the owner's own sessions adopt its catalog at their next transaction begin
+//! (`Shared::adopt_foreign`), so nothing a client commits can fail after it is durable
+//! (page-service.md §7).
+//!
+//! Lock order: the commit lock, then a connection's state, then the reader registry; a connection's
+//! state before the storage and the gate's own mutex. Nothing takes a connection's state while
+//! holding the registry, the storage, or the gate's mutex.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::File;
@@ -15,18 +27,26 @@ use std::net::Shutdown;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::error::{EngineError, Result, SqlState};
 use crate::pageservice::codec::{
-    ERROR_FLAG_FATAL, ErrorReply, HELLO_OK_FLAG_CONNECTION_READ_ONLY,
-    HELLO_OK_FLAG_OWNER_READ_ONLY, Hello, HelloOk, INVALIDATE_ALL, INVALIDATE_EXACT,
-    INVALIDATION_WINDOW_COMMITS, Id16, MAX_INVALIDATION_ENTRIES, MAX_READ_PAGES_CAP, Message,
-    OwnerRecord, PROTOCOL_VERSION, Pages, encode_frame, max_read_pages, read_frame,
+    BeginWrite, COMMIT_STATUS_COMMITTED, COMMIT_STATUS_NOT_COMMITTED, COMMIT_STATUS_UNKNOWN,
+    CommitBegin, CommitPages, CommitStatusReply, Committed, ERROR_FLAG_FATAL, ErrorReply,
+    HELLO_FLAG_READ_ONLY, HELLO_OK_FLAG_CONNECTION_READ_ONLY, HELLO_OK_FLAG_OWNER_READ_ONLY, Hello,
+    HelloOk, INVALIDATE_ALL, INVALIDATE_EXACT, INVALIDATION_WINDOW_COMMITS, Id16,
+    MAX_INVALIDATION_ENTRIES, MAX_READ_PAGES_CAP, Message, OwnerRecord, PROTOCOL_VERSION, Pages,
+    encode_frame, max_read_pages, read_frame,
 };
+use crate::pageservice::delta::{Delta, DeltaBase, begin_delta};
 use crate::pageservice::endpoint;
 use crate::shared::Shared;
+
+/// The resolution window keeps the newest commits, like the invalidation window (README.md §4).
+const RESOLUTION_WINDOW_COMMITS: usize = INVALIDATION_WINDOW_COMMITS as usize;
 
 /// A fresh incarnation id: 16 random bytes, redrawn if all zero (README.md §4).
 pub(crate) fn new_incarnation() -> Result<Id16> {
@@ -58,29 +78,56 @@ pub(crate) fn committed_meta(paging: &crate::paging::SharedPaging, txid: u64) ->
     ))
 }
 
-/// The owner's published meta and invalidation window (README.md §4). Lives in the reader registry
-/// and changes only together with the published root.
+/// The meta in the slot other than `txid`'s when it holds the commit just before it — the second
+/// seed of the resolution window (README.md §4).
+pub(crate) fn previous_meta(paging: &crate::paging::SharedPaging, txid: u64) -> Option<Vec<u8>> {
+    if txid == 0 {
+        return None;
+    }
+    let block = paging.pager().read_block(((txid & 1) ^ 1) as u32).ok()?;
+    crate::format::meta_txid_and_page_count(&block)
+        .is_some_and(|(t, _)| t == txid - 1)
+        .then_some(block)
+}
+
+/// The owner's published meta, invalidation window, and resolution window (README.md §4). Lives in
+/// the reader registry and changes only together with the published version.
 pub(crate) struct ServiceWindow {
     incarnation: Id16,
     meta: Vec<u8>,
+    /// The published version: what `begin_read` and `begin_write` pin. A client commit is published
+    /// here before the owner's own roots adopt it.
+    txid: u64,
     page_count: u32,
     /// The written page indices of the most recent commits, oldest first, each sorted.
     window: VecDeque<(u64, Vec<u32>)>,
     /// Every commit after this txid is in `window`.
     window_start: u64,
+    /// The `(txid, digest)` pairs of the most recent published commits, oldest first.
+    resolution: VecDeque<(u64, u64)>,
 }
 
 impl ServiceWindow {
     /// The window of an owner whose committed snapshot is `txid` with meta page `meta`.
     pub(crate) fn new(incarnation: Id16, txid: u64, meta: Vec<u8>) -> ServiceWindow {
         let page_count = crate::format::meta_txid_and_page_count(&meta).map_or(0, |(_, n)| n);
+        let mut resolution = VecDeque::new();
+        resolution.push_back((txid, crate::format::commit_crc64(0, &meta)));
         ServiceWindow {
             incarnation,
             meta,
+            txid,
             page_count,
             window: VecDeque::new(),
             window_start: txid,
+            resolution,
         }
+    }
+
+    /// Seed the resolution window with the commit before the recovered one (README.md §4).
+    pub(crate) fn seed_previous(&mut self, txid: u64, meta: &[u8]) {
+        self.resolution
+            .push_front((txid, crate::format::commit_crc64(0, meta)));
     }
 
     pub(crate) fn incarnation(&self) -> Id16 {
@@ -91,17 +138,24 @@ impl ServiceWindow {
         &self.meta
     }
 
+    /// The published version.
+    pub(crate) fn txid(&self) -> u64 {
+        self.txid
+    }
+
     /// The current snapshot's page count. Page counts only grow between compactions and a pin
     /// blocks compaction, so it bounds every page of every pinned snapshot.
     pub(crate) fn page_count(&self) -> u32 {
         self.page_count
     }
 
-    /// Record a main-database commit: its meta page and the indices it wrote (body, free-list, and
-    /// manifest pages; never the meta slots).
+    /// Record a main-database commit: its meta page, the indices it wrote (body, free-list, and
+    /// manifest pages; never the meta slots), and its resolution pair.
     pub(crate) fn published(&mut self, txid: u64, meta: Vec<u8>, mut written: Vec<u32>) {
         self.page_count = crate::format::meta_txid_and_page_count(&meta).map_or(0, |(_, n)| n);
+        self.record_resolution(txid, &meta);
         self.meta = meta;
+        self.txid = txid;
         written.sort_unstable();
         written.dedup();
         self.window.push_back((txid, written));
@@ -111,9 +165,23 @@ impl ServiceWindow {
         }
     }
 
-    /// Restart the window at a compacted snapshot: every older cache is invalid.
+    fn record_resolution(&mut self, txid: u64, meta: &[u8]) {
+        self.resolution
+            .push_back((txid, crate::format::commit_crc64(0, meta)));
+        while self.resolution.len() > RESOLUTION_WINDOW_COMMITS {
+            self.resolution.pop_front();
+        }
+    }
+
+    /// Restart the invalidation window at a compacted snapshot: every older cache is invalid. The
+    /// compaction joins the resolution window.
     pub(crate) fn reset(&mut self, txid: u64, meta: Vec<u8>) {
-        *self = ServiceWindow::new(self.incarnation, txid, meta);
+        self.page_count = crate::format::meta_txid_and_page_count(&meta).map_or(0, |(_, n)| n);
+        self.record_resolution(txid, &meta);
+        self.meta = meta;
+        self.txid = txid;
+        self.window.clear();
+        self.window_start = txid;
     }
 
     /// Answer `begin_read`'s cache question for a client whose cache is `(incarnation, last_txid)`
@@ -143,9 +211,124 @@ impl ServiceWindow {
         }
         (INVALIDATE_EXACT, indices.into_iter().collect())
     }
+
+    /// Answer `commit_status` (page-service.md §8.4): committed when the window holds `txid` with
+    /// this digest, not committed when it holds another digest or `txid` is above the published
+    /// version, unknown otherwise.
+    pub(crate) fn resolve(&self, txid: u64, digest: u64) -> u8 {
+        if txid > self.txid {
+            return COMMIT_STATUS_NOT_COMMITTED;
+        }
+        match self.resolution.iter().find(|(t, _)| *t == txid) {
+            Some((_, d)) if *d == digest => COMMIT_STATUS_COMMITTED,
+            Some(_) => COMMIT_STATUS_NOT_COMMITTED,
+            None => COMMIT_STATUS_UNKNOWN,
+        }
+    }
 }
 
-/// One connection's pins, counted per txid; each is also one count in the reader registry.
+/// The writer gate (page-service.md §5.5): a one-slot semaphore held by whoever is writing the
+/// database — an owner write transaction, a compaction, or a client between `write_begun` and its
+/// commit's publication.
+pub(crate) struct WriterGate {
+    state: Mutex<GateState>,
+    freed: Condvar,
+}
+
+struct GateState {
+    held: bool,
+    /// The owner stopped serving: waiters give up.
+    closing: bool,
+}
+
+impl WriterGate {
+    fn new() -> WriterGate {
+        WriterGate {
+            state: Mutex::new(GateState {
+                held: false,
+                closing: false,
+            }),
+            freed: Condvar::new(),
+        }
+    }
+
+    /// Take the gate, waiting at most `timeout_ms` (0: no deadline): `55P03` on expiry. A wait
+    /// also ends (`08006`) when `cancelled` turns true or the owner stops serving; whoever sets
+    /// either calls [`wake`](Self::wake).
+    pub(crate) fn acquire(&self, timeout_ms: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+        let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
+        let mut state = self.state.lock().expect("writer gate lock poisoned");
+        loop {
+            if !state.held {
+                state.held = true;
+                return Ok(());
+            }
+            if state.closing {
+                return Err(EngineError::new(
+                    SqlState::ConnectionFailure,
+                    "the database owner is closing",
+                ));
+            }
+            if cancelled() {
+                return Err(EngineError::new(
+                    SqlState::ConnectionFailure,
+                    "the connection closed while waiting for the writer gate",
+                ));
+            }
+            match deadline {
+                None => {
+                    state = self.freed.wait(state).expect("writer gate lock poisoned");
+                }
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(EngineError::new(
+                            SqlState::LockNotAvailable,
+                            "could not obtain the database writer lock",
+                        ));
+                    }
+                    state = self
+                        .freed
+                        .wait_timeout(state, deadline - now)
+                        .expect("writer gate lock poisoned")
+                        .0;
+                }
+            }
+        }
+    }
+
+    /// Take the gate only if it is free (compaction never waits).
+    pub(crate) fn try_acquire(&self) -> bool {
+        let mut state = self.state.lock().expect("writer gate lock poisoned");
+        if state.held {
+            return false;
+        }
+        state.held = true;
+        true
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.lock().expect("writer gate lock poisoned").held = false;
+        self.freed.notify_all();
+    }
+
+    /// Wake every waiter to re-check its cancellation.
+    fn wake(&self) {
+        let _state = self.state.lock().expect("writer gate lock poisoned");
+        self.freed.notify_all();
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("writer gate lock poisoned")
+            .closing = true;
+        self.freed.notify_all();
+    }
+}
+
+/// One connection's pins, counted per txid, the write pin included; each is also one count in the
+/// reader registry.
 pub(crate) type ConnPins = BTreeMap<u64, usize>;
 
 struct Conns {
@@ -156,13 +339,84 @@ struct Conns {
     threads: Vec<JoinHandle<()>>,
 }
 
-/// The serving state of an owner: its read handle, endpoint, and connections. Shut down explicitly
-/// ([`shutdown`](Self::shutdown)) before the owner releases presence.
+/// A client write transaction: the connection holds the gate and a write pin on `base`.
+struct WriteTxn {
+    base: u64,
+    check: DeltaBase,
+    /// The CommitDelta being received (between `commit_begin` and `commit_end`).
+    delta: Option<Delta>,
+    /// A rejected delta: its remaining frames are discarded and `commit_end` reports it.
+    failure: Option<EngineError>,
+    /// Whether the owner's pager has begun this commit (a page was written).
+    started: bool,
+    /// Set at the point of no return: the commit completes whatever the connection does.
+    finishing: bool,
+}
+
+/// One connection's mutable state, behind [`ServerConn::state`].
+struct ConnState {
+    read_only: bool,
+    pins: ConnPins,
+    write: Option<WriteTxn>,
+    /// A `begin_write` is waiting for the gate.
+    waiting: bool,
+    /// The base of a write transaction the idle-in-transaction timeout revoked; the next
+    /// write-path request reports `25P03`.
+    revoked: Option<u64>,
+    closed: bool,
+    /// When the held write transaction is revoked unless a frame arrives first.
+    idle_deadline: Option<Instant>,
+}
+
+/// One client connection on the owner side.
+struct ServerConn {
+    id: u64,
+    /// The write half: replies come from the serve thread and from a `begin_write`'s gate waiter.
+    sender: Mutex<UnixStream>,
+    /// Set when the serve thread ends, so a gate waiter gives up.
+    closed: AtomicBool,
+    state: Mutex<ConnState>,
+    /// Wakes the idle watchdog when the deadline moves or the connection closes.
+    idle: Condvar,
+    watchdog: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ServerConn {
+    fn send(&self, request_id: u32, message: &Message) -> bool {
+        match encode_frame(request_id, message) {
+            Ok(frame) => self
+                .sender
+                .lock()
+                .expect("page-service sender lock poisoned")
+                .write_all(&frame)
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Answer a request with a fatal error; the caller then closes the connection.
+    fn fail(&self, request_id: u32, error: &EngineError) {
+        self.send(request_id, &error_reply(error, ERROR_FLAG_FATAL));
+    }
+
+    /// Drop the connection (the commit-resolution test hook).
+    fn hang_up(&self) {
+        let _ = self
+            .sender
+            .lock()
+            .expect("page-service sender lock poisoned")
+            .shutdown(Shutdown::Both);
+    }
+}
+
+/// The serving state of an owner: its read handle, endpoint, connections, and writer gate. Shut down
+/// explicitly ([`shutdown`](Self::shutdown)) before the owner releases presence.
 pub(crate) struct PageServiceOwner {
     shared: Weak<Shared>,
     db_path: PathBuf,
     page_size: u32,
     read_only: bool,
+    idle_timeout: Option<Duration>,
     /// The owner's own read handle on the database: page reads are positioned reads on it,
     /// independent of the pager's lock, so a client never waits on the owner's commit. Compaction
     /// replaces it.
@@ -170,18 +424,30 @@ pub(crate) struct PageServiceOwner {
     endpoint: Option<PathBuf>,
     conns: Mutex<Conns>,
     accept: Mutex<Option<JoinHandle<()>>>,
+    pub(crate) gate: WriterGate,
+    /// Held from a client commit's point of no return through its publication, and by adoption,
+    /// so neither observes a half-published commit and `commit_status` can wait for one.
+    pub(crate) commit_lock: Mutex<()>,
+    /// The txid of the newest client commit published here; the owner's roots adopt it at their
+    /// next transaction begin (`Shared::adopt_foreign`).
+    pub(crate) foreign: AtomicU64,
+    /// The commit-resolution test hook: drop the connection instead of acknowledging the next
+    /// client commit.
+    hang_up_next_ack: AtomicBool,
 }
 
 impl PageServiceOwner {
     /// Serve the database at `db_path` for `shared`, whose registry already holds the window for
     /// `incarnation`: write the owner record, bind the endpoint, and start accepting. An owner that
     /// cannot bind (no private endpoint directory) still owns and records `flags = 0`.
+    /// `idle_timeout_ms` is the idle-in-transaction timeout (0 disables it).
     pub(crate) fn start(
         shared: &Arc<Shared>,
         db_path: &Path,
         incarnation: Id16,
         page_size: u32,
         read_only: bool,
+        idle_timeout_ms: u64,
     ) -> Result<Arc<PageServiceOwner>> {
         let file = File::open(db_path).map_err(|e| {
             EngineError::new(
@@ -207,6 +473,7 @@ impl PageServiceOwner {
             db_path: db_path.to_path_buf(),
             page_size,
             read_only,
+            idle_timeout: (idle_timeout_ms > 0).then(|| Duration::from_millis(idle_timeout_ms)),
             file: RwLock::new(file),
             endpoint: endpoint_path.clone(),
             conns: Mutex::new(Conns {
@@ -216,6 +483,10 @@ impl PageServiceOwner {
                 threads: Vec::new(),
             }),
             accept: Mutex::new(None),
+            gate: WriterGate::new(),
+            commit_lock: Mutex::new(()),
+            foreign: AtomicU64::new(0),
+            hang_up_next_ack: AtomicBool::new(false),
         });
         let Some(path) = endpoint_path else {
             return Ok(owner);
@@ -258,6 +529,11 @@ impl PageServiceOwner {
         }
     }
 
+    /// Make the next client commit drop its connection instead of acknowledging (test hook).
+    pub(crate) fn hang_up_next_ack(&self) {
+        self.hang_up_next_ack.store(true, Ordering::Release);
+    }
+
     /// Reopen the read handle after compaction replaced the file. The caller holds the writer gate
     /// and no pin exists, so no page read is in flight.
     pub(crate) fn reopen_file(&self) -> Result<()> {
@@ -271,9 +547,11 @@ impl PageServiceOwner {
         Ok(())
     }
 
-    /// Stop serving: no new connections, every client sees EOF (releasing its pins), and the
-    /// endpoint and owner record are removed. The caller still holds presence EX.
+    /// Stop serving: no new connections, every client sees EOF (releasing its pins and the gate),
+    /// and the endpoint and owner record are removed. The caller still holds presence EX. A client
+    /// commit past its point of no return finishes first (its serve thread is joined).
     pub(crate) fn shutdown(&self) {
+        self.gate.close();
         let (streams, threads) = {
             let mut conns = self.conns.lock().expect("connections lock poisoned");
             conns.closed = true;
@@ -300,14 +578,55 @@ impl PageServiceOwner {
         let _ = std::fs::remove_file(endpoint::owner_record_path(&self.db_path));
     }
 
-    /// Run one connection until EOF or a protocol violation, then release its pins.
-    fn serve(self: Arc<Self>, id: u64, mut stream: UnixStream) {
-        let mut pins = ConnPins::new();
-        self.serve_frames(id, &mut stream, &mut pins);
-        let _ = stream.shutdown(Shutdown::Both);
-        if let Some(shared) = self.shared.upgrade() {
-            shared.page_service_release_pins(&mut pins);
+    /// The owner's response to a write or sync failure in a client commit (page-service.md §5.6):
+    /// its storage handle is poisoned, so it closes every connection and accepts no more. The
+    /// owner's own handle then refuses commits until it is reopened.
+    pub(crate) fn stop_serving(&self) {
+        self.gate.close();
+        {
+            let mut conns = self.conns.lock().expect("connections lock poisoned");
+            conns.closed = true;
+            for stream in conns.open.values() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
         }
+        if let Some(path) = &self.endpoint {
+            // Wake the blocking accept; it sees `closed` and returns.
+            let _ = UnixStream::connect(path);
+        }
+    }
+
+    /// Run one connection until EOF or a protocol violation, then abort its write transaction
+    /// (unless past the point of no return) and release its pins.
+    fn serve(self: Arc<Self>, id: u64, mut stream: UnixStream) {
+        let Ok(sender) = stream.try_clone() else {
+            return;
+        };
+        let conn = Arc::new(ServerConn {
+            id,
+            sender: Mutex::new(sender),
+            closed: AtomicBool::new(false),
+            state: Mutex::new(ConnState {
+                read_only: false,
+                pins: ConnPins::new(),
+                write: None,
+                waiting: false,
+                revoked: None,
+                closed: false,
+                idle_deadline: None,
+            }),
+            idle: Condvar::new(),
+            watchdog: Mutex::new(None),
+        });
+        if self.idle_timeout.is_some() {
+            let owner = Arc::clone(&self);
+            let watched = Arc::clone(&conn);
+            *conn.watchdog.lock().expect("watchdog lock poisoned") =
+                Some(thread::spawn(move || owner.watch_idle(watched)));
+        }
+        self.serve_frames(&conn, &mut stream);
+        let _ = stream.shutdown(Shutdown::Both);
+        self.end_connection(&conn);
         self.conns
             .lock()
             .expect("connections lock poisoned")
@@ -315,7 +634,31 @@ impl PageServiceOwner {
             .remove(&id);
     }
 
-    fn serve_frames(&self, id: u64, stream: &mut UnixStream, pins: &mut ConnPins) {
+    /// The end of a connection: abort its write transaction unless it is past the point of no
+    /// return, release its pins, and stop its watchdog.
+    fn end_connection(&self, conn: &Arc<ServerConn>) {
+        conn.closed.store(true, Ordering::Release);
+        self.gate.wake();
+        // Declared before the state guard, so a final drop of the core never runs under it.
+        let shared = self.shared.upgrade();
+        {
+            let mut state = conn.state.lock().expect("connection state lock poisoned");
+            state.closed = true;
+            if state.write.as_ref().is_some_and(|w| !w.finishing) {
+                self.abort_write_locked(shared.as_deref(), &mut state);
+            }
+            if let Some(shared) = &shared {
+                shared.page_service_release_pins(&mut state.pins);
+            }
+            conn.idle.notify_all();
+        }
+        let watchdog = conn.watchdog.lock().expect("watchdog lock poisoned").take();
+        if let Some(watchdog) = watchdog {
+            join_unless_current(watchdog);
+        }
+    }
+
+    fn serve_frames(self: &Arc<Self>, conn: &Arc<ServerConn>, stream: &mut UnixStream) {
         let mut hello_done = false;
         loop {
             let (request_id, message) = match read_frame(stream, self.page_size) {
@@ -323,21 +666,18 @@ impl PageServiceOwner {
                 Ok(None) => return,
                 Err(e) => {
                     if e.state != SqlState::ConnectionFailure {
-                        fail(stream, 0, &e);
+                        conn.fail(0, &e);
                     }
                     return;
                 }
             };
+            self.touch(conn);
             if !hello_done {
                 let Message::Hello(hello) = message else {
-                    fail(
-                        stream,
-                        request_id,
-                        &violation("the first frame must be hello"),
-                    );
+                    conn.fail(request_id, &violation("the first frame must be hello"));
                     return;
                 };
-                if !self.hello(stream, request_id, id, &hello) {
+                if !self.hello(conn, request_id, &hello) {
                     return;
                 }
                 hello_done = true;
@@ -348,14 +688,20 @@ impl PageServiceOwner {
             };
             let reply = match message {
                 Message::BeginRead(m) => {
-                    match shared.page_service_begin_read(pins, &m.incarnation, m.last_txid) {
+                    let mut state = conn.state.lock().expect("connection state lock poisoned");
+                    match shared.page_service_begin_read(
+                        &mut state.pins,
+                        &m.incarnation,
+                        m.last_txid,
+                    ) {
                         Some(begun) => Ok(Some(Message::ReadBegun(begun))),
                         None => return,
                     }
                 }
-                Message::ReadPages(m) => self.read_pages(&shared, pins, m.txid, &m.indices),
+                Message::ReadPages(m) => self.read_pages(&shared, conn, m.txid, &m.indices),
                 Message::EndRead(m) => {
-                    if shared.page_service_end_read(pins, m.txid) {
+                    let mut state = conn.state.lock().expect("connection state lock poisoned");
+                    if shared.page_service_end_read(&mut state.pins, m.txid) {
                         Ok(None)
                     } else {
                         Err(violation(
@@ -363,24 +709,30 @@ impl PageServiceOwner {
                         ))
                     }
                 }
-                Message::BeginWrite(_) => Ok(Some(Message::Error(ErrorReply {
-                    sqlstate: "25006".into(),
-                    message: "cannot write through a read-only page-service connection".into(),
-                    detail: String::new(),
-                    flags: 0,
-                }))),
+                Message::BeginWrite(m) => self.begin_write(conn, request_id, m),
+                Message::CommitBegin(m) => self.commit_begin(&shared, conn, m),
+                Message::CommitPages(m) => self.commit_pages(&shared, conn, m),
+                Message::CommitEnd => self.commit_end(&shared, conn, request_id),
+                Message::Abort => self.abort(&shared, conn),
+                Message::CommitStatus(m) => {
+                    // A commit past its point of no return holds the commit lock until published.
+                    drop(self.commit_lock.lock().expect("commit lock poisoned"));
+                    Ok(Some(Message::CommitStatusReply(CommitStatusReply {
+                        status: shared.page_service_resolve(m.txid, m.digest),
+                    })))
+                }
                 other => Err(violation(format!("unexpected {} message", other.name()))),
             };
             drop(shared);
             match reply {
                 Ok(Some(reply)) => {
-                    if !send(stream, request_id, &reply) {
+                    if !conn.send(request_id, &reply) {
                         return;
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    fail(stream, request_id, &e);
+                    conn.fail(request_id, &e);
                     return;
                 }
             }
@@ -388,10 +740,9 @@ impl PageServiceOwner {
     }
 
     /// Negotiate the protocol and the format (README.md §3.1). False closes the connection.
-    fn hello(&self, stream: &mut UnixStream, request_id: u32, id: u64, m: &Hello) -> bool {
+    fn hello(&self, conn: &ServerConn, request_id: u32, m: &Hello) -> bool {
         if m.protocol_min > PROTOCOL_VERSION || m.protocol_max < PROTOCOL_VERSION {
-            fail(
-                stream,
+            conn.fail(
                 request_id,
                 &EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -401,8 +752,7 @@ impl PageServiceOwner {
             return false;
         }
         if m.format_version != crate::format::FORMAT_VERSION {
-            fail(
-                stream,
+            conn.fail(
                 request_id,
                 &EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -414,19 +764,25 @@ impl PageServiceOwner {
             );
             return false;
         }
-        // Phase 2: every connection is read-only.
-        let mut flags = HELLO_OK_FLAG_CONNECTION_READ_ONLY;
+        // A connection is read-only exactly when the client asked for it.
+        let mut flags = 0;
+        if m.flags & HELLO_FLAG_READ_ONLY != 0 {
+            conn.state
+                .lock()
+                .expect("connection state lock poisoned")
+                .read_only = true;
+            flags |= HELLO_OK_FLAG_CONNECTION_READ_ONLY;
+        }
         if self.read_only {
             flags |= HELLO_OK_FLAG_OWNER_READ_ONLY;
         }
-        send(
-            stream,
+        conn.send(
             request_id,
             &Message::HelloOk(HelloOk {
                 protocol: PROTOCOL_VERSION,
                 format_version: crate::format::FORMAT_VERSION,
                 page_size: self.page_size,
-                connection_id: id,
+                connection_id: conn.id,
                 flags,
                 max_read_pages: max_read_pages(self.page_size),
             }),
@@ -437,14 +793,25 @@ impl PageServiceOwner {
     fn read_pages(
         &self,
         shared: &Shared,
-        pins: &ConnPins,
+        conn: &ServerConn,
         txid: u64,
         indices: &[u32],
     ) -> Result<Option<Message>> {
-        let Some(page_count) = shared.page_service_page_count(pins, txid) else {
-            return Err(violation(
-                "read_pages names a txid this connection has not pinned",
-            ));
+        let page_count = {
+            let mut state = conn.state.lock().expect("connection state lock poisoned");
+            match shared.page_service_page_count(&state.pins, txid) {
+                Some(page_count) => page_count,
+                None => {
+                    if state.revoked == Some(txid) {
+                        // A read under a revoked write transaction's snapshot: report the revocation.
+                        state.revoked = None;
+                        return Ok(Some(idle_revoked()));
+                    }
+                    return Err(violation(
+                        "read_pages names a txid this connection has not pinned",
+                    ));
+                }
+            }
         };
         let limit = max_read_pages(self.page_size).min(MAX_READ_PAGES_CAP) as usize;
         if indices.is_empty() || indices.len() > limit {
@@ -467,6 +834,332 @@ impl PageServiceOwner {
         }
         Ok(Some(Message::Pages(Pages { pages })))
     }
+
+    /// Start a client write transaction (README.md §3.5). The gate wait runs on its own thread, so
+    /// the connection keeps serving reads meanwhile; `write_begun` (or the wait's error) is sent
+    /// when the wait ends.
+    fn begin_write(
+        self: &Arc<Self>,
+        conn: &Arc<ServerConn>,
+        request_id: u32,
+        m: BeginWrite,
+    ) -> Result<Option<Message>> {
+        let mut state = conn.state.lock().expect("connection state lock poisoned");
+        if state.read_only {
+            return Ok(Some(read_only_reply(
+                "cannot write through a read-only page-service connection",
+            )));
+        }
+        if self.read_only {
+            return Ok(Some(read_only_reply(
+                "the database owner opened the file read-only",
+            )));
+        }
+        if state.write.is_some() || state.waiting {
+            return Err(violation("begin_write while a write transaction is open"));
+        }
+        if state.revoked.take().is_some() {
+            return Ok(Some(idle_revoked()));
+        }
+        state.waiting = true;
+        let owner = Arc::clone(self);
+        let waiter = Arc::clone(conn);
+        thread::spawn(move || owner.wait_for_gate(waiter, request_id, m));
+        Ok(None)
+    }
+
+    /// Acquire the gate for a `begin_write`, then pin the published snapshot and answer.
+    fn wait_for_gate(&self, conn: Arc<ServerConn>, request_id: u32, m: BeginWrite) {
+        let result = self
+            .gate
+            .acquire(m.lock_timeout_ms, &|| conn.closed.load(Ordering::Acquire));
+        // Declared before the state guard, so a final drop of the core never runs under it.
+        let shared = self.shared.upgrade();
+        let mut state = conn.state.lock().expect("connection state lock poisoned");
+        state.waiting = false;
+        let shared = match (&shared, state.closed) {
+            (Some(shared), false) => shared,
+            _ => {
+                if result.is_ok() {
+                    self.gate.release();
+                }
+                return;
+            }
+        };
+        if let Err(e) = result {
+            conn.send(request_id, &error_reply(&e, 0));
+            return;
+        }
+        let Some((begun, check)) =
+            shared.page_service_begin_write(&mut state.pins, &m.incarnation, m.last_txid)
+        else {
+            self.gate.release();
+            return;
+        };
+        state.write = Some(WriteTxn {
+            base: begun.txid,
+            check,
+            delta: None,
+            failure: None,
+            started: false,
+            finishing: false,
+        });
+        self.arm_idle(&conn, &mut state);
+        conn.send(request_id, &Message::WriteBegun(begun));
+    }
+
+    /// Restart the idle-in-transaction timer on every received frame.
+    fn touch(&self, conn: &ServerConn) {
+        let mut state = conn.state.lock().expect("connection state lock poisoned");
+        if state.write.as_ref().is_some_and(|w| !w.finishing) {
+            self.arm_idle(conn, &mut state);
+        }
+    }
+
+    fn arm_idle(&self, conn: &ServerConn, state: &mut ConnState) {
+        if let Some(timeout) = self.idle_timeout {
+            state.idle_deadline = Some(Instant::now() + timeout);
+            conn.idle.notify_all();
+        }
+    }
+
+    /// The connection's idle watchdog: revoke a write transaction that received nothing for the
+    /// idle-in-transaction timeout (page-service.md §11.1).
+    fn watch_idle(&self, conn: Arc<ServerConn>) {
+        let mut state = conn.state.lock().expect("connection state lock poisoned");
+        loop {
+            if state.closed {
+                return;
+            }
+            let Some(deadline) = state.idle_deadline else {
+                state = conn
+                    .idle
+                    .wait(state)
+                    .expect("connection state lock poisoned");
+                continue;
+            };
+            let now = Instant::now();
+            if now < deadline {
+                state = conn
+                    .idle
+                    .wait_timeout(state, deadline - now)
+                    .expect("connection state lock poisoned")
+                    .0;
+                continue;
+            }
+            // Upgrade the core outside the state guard, so its final drop never runs under it.
+            drop(state);
+            let shared = self.shared.upgrade();
+            state = conn.state.lock().expect("connection state lock poisoned");
+            if state
+                .idle_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                state.idle_deadline = None;
+                self.revoke_locked(shared.as_deref(), &mut state);
+            }
+            drop(state);
+            drop(shared);
+            state = conn.state.lock().expect("connection state lock poisoned");
+        }
+    }
+
+    /// End a write transaction for the idle-in-transaction timeout: the gate is released, and the
+    /// next write-path request reports `25P03`.
+    fn revoke_locked(&self, shared: Option<&Shared>, state: &mut ConnState) {
+        let base = match &state.write {
+            Some(w) if !w.finishing && !state.closed => w.base,
+            _ => return,
+        };
+        self.abort_write_locked(shared, state);
+        state.revoked = Some(base);
+    }
+
+    /// End the write transaction without committing: delta pages already written are unreachable
+    /// orphans; the write pin and the gate are released.
+    fn abort_write_locked(&self, shared: Option<&Shared>, state: &mut ConnState) {
+        let Some(w) = state.write.take() else {
+            return;
+        };
+        state.idle_deadline = None;
+        if let Some(shared) = shared {
+            if w.started {
+                shared.page_service_abandon_commit();
+            }
+            shared.page_service_end_read(&mut state.pins, w.base);
+        }
+        self.gate.release();
+    }
+
+    /// End the write transaction at the client's request (README.md §3.5).
+    fn abort(&self, shared: &Shared, conn: &ServerConn) -> Result<Option<Message>> {
+        let mut state = conn.state.lock().expect("connection state lock poisoned");
+        if state.write.is_some() {
+            self.abort_write_locked(Some(shared), &mut state);
+            return Ok(None);
+        }
+        if state.revoked.take().is_some() {
+            return Ok(None);
+        }
+        Err(violation("abort without a write transaction"))
+    }
+
+    /// Check A, then write the manifest pages (README.md §3.5).
+    fn commit_begin(
+        &self,
+        shared: &Shared,
+        conn: &ServerConn,
+        m: CommitBegin,
+    ) -> Result<Option<Message>> {
+        let mut state = conn.state.lock().expect("connection state lock poisoned");
+        let revoked = state.revoked.is_some();
+        let Some(w) = state.write.as_mut() else {
+            if revoked {
+                return Ok(None); // the revoked transaction's delta is discarded; commit_end reports 25P03
+            }
+            return Err(violation("commit_begin without a write transaction"));
+        };
+        if w.delta.is_some() || w.failure.is_some() {
+            return Err(violation("commit_begin twice in one write transaction"));
+        }
+        let delta = match begin_delta(&w.check, m) {
+            Ok(delta) => delta,
+            Err(e) => {
+                w.failure = Some(e);
+                return Ok(None);
+            }
+        };
+        let result =
+            shared.page_service_write_delta(&mut w.started, delta.page_count, &delta.manifest);
+        w.delta = Some(delta);
+        if result.is_err() {
+            self.stop_serving();
+        }
+        result.map(|()| None)
+    }
+
+    /// Check B on each page, then write them (README.md §3.5).
+    fn commit_pages(
+        &self,
+        shared: &Shared,
+        conn: &ServerConn,
+        m: CommitPages,
+    ) -> Result<Option<Message>> {
+        let mut state = conn.state.lock().expect("connection state lock poisoned");
+        let revoked = state.revoked.is_some();
+        let Some(w) = state.write.as_mut() else {
+            if revoked {
+                return Ok(None);
+            }
+            return Err(violation("commit_pages without a write transaction"));
+        };
+        if w.failure.is_some() {
+            return Ok(None);
+        }
+        let Some(delta) = w.delta.as_mut() else {
+            return Err(violation("commit_pages before commit_begin"));
+        };
+        for page in &m.pages {
+            if let Err(e) = delta.check_page(page) {
+                w.failure = Some(e);
+                return Ok(None);
+            }
+        }
+        let result = shared.page_service_write_delta(&mut w.started, delta.page_count, &m.pages);
+        if result.is_err() {
+            self.stop_serving();
+        }
+        result.map(|()| None)
+    }
+
+    /// Check C; past it (the point of no return) the commit completes whatever the connection does
+    /// (README.md §3.5).
+    fn commit_end(
+        &self,
+        shared: &Shared,
+        conn: &ServerConn,
+        request_id: u32,
+    ) -> Result<Option<Message>> {
+        let mut state = conn.state.lock().expect("connection state lock poisoned");
+        if state.write.is_none() {
+            if state.revoked.take().is_some() {
+                return Ok(Some(idle_revoked()));
+            }
+            return Err(violation("commit_end without a write transaction"));
+        }
+        let w = state.write.as_mut().expect("checked above");
+        if w.failure.is_none() {
+            match &w.delta {
+                None => return Err(violation("commit_end before commit_begin")),
+                Some(delta) => w.failure = delta.complete().err(),
+            }
+        }
+        if let Some(failure) = w.failure.take() {
+            self.abort_write_locked(Some(shared), &mut state);
+            return Err(failure);
+        }
+        w.finishing = true;
+        let base = w.base;
+        let delta = w.delta.take().expect("checked above");
+        state.idle_deadline = None;
+        drop(state);
+        self.finish_client_commit(shared, conn, request_id, base, delta)
+    }
+
+    /// Publish a validated delta (page-service.md §5.6): meta, the single durable barrier,
+    /// structural adoption (page accounting, the invalidation and resolution windows), the
+    /// acknowledgement, then — still holding the gate — the catalog adoption and a maintenance commit
+    /// if one is due. A write or sync failure poisons the owner, which stops serving.
+    fn finish_client_commit(
+        &self,
+        shared: &Shared,
+        conn: &ServerConn,
+        request_id: u32,
+        base: u64,
+        delta: Delta,
+    ) -> Result<Option<Message>> {
+        let commit = self.commit_lock.lock().expect("commit lock poisoned");
+        if shared.page_service_commit_delta(&delta).is_err() {
+            drop(commit);
+            self.stop_serving();
+            {
+                let mut state = conn.state.lock().expect("connection state lock poisoned");
+                state.write = None;
+                shared.page_service_end_read(&mut state.pins, base);
+            }
+            self.gate.release();
+            // The meta may be durable: the outcome is unknown, so the client sees a lost connection
+            // and resolves it with commit_status (under the next owner) rather than an error frame.
+            conn.hang_up();
+            return Ok(None);
+        }
+        {
+            let mut state = conn.state.lock().expect("connection state lock poisoned");
+            shared.page_service_publish_commit(
+                &mut state.pins,
+                base,
+                delta.txid,
+                delta.meta,
+                delta.written,
+                &self.foreign,
+            );
+            state.write = None;
+        }
+        drop(commit);
+        if self.hang_up_next_ack.swap(false, Ordering::AcqRel) {
+            conn.hang_up();
+        } else {
+            conn.send(
+                request_id,
+                &Message::Committed(Committed { txid: delta.txid }),
+            );
+        }
+        if shared.adopt_foreign().is_ok() {
+            shared.maintenance_commit();
+        }
+        self.gate.release();
+        Ok(None)
+    }
 }
 
 fn join_unless_current(handle: JoinHandle<()>) {
@@ -479,25 +1172,32 @@ fn violation(message: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::ProtocolViolation, message)
 }
 
-fn send(stream: &mut UnixStream, request_id: u32, message: &Message) -> bool {
-    match encode_frame(request_id, message) {
-        Ok(frame) => stream.write_all(&frame).is_ok(),
-        Err(_) => false,
-    }
+/// The `error` frame for `error`.
+fn error_reply(error: &EngineError, flags: u8) -> Message {
+    Message::Error(ErrorReply {
+        sqlstate: error.code().to_string(),
+        message: error.message.clone(),
+        detail: String::new(),
+        flags,
+    })
 }
 
-/// Answer a request with a fatal error; the caller then closes the connection.
-fn fail(stream: &mut UnixStream, request_id: u32, error: &EngineError) {
-    send(
-        stream,
-        request_id,
-        &Message::Error(ErrorReply {
-            sqlstate: error.code().to_string(),
-            message: error.message.clone(),
-            detail: String::new(),
-            flags: ERROR_FLAG_FATAL,
-        }),
-    );
+fn read_only_reply(message: &str) -> Message {
+    error_reply(
+        &EngineError::new(SqlState::ReadOnlySqlTransaction, message),
+        0,
+    )
+}
+
+/// The non-fatal `25P03` a revoked write transaction's next write-path request reports.
+fn idle_revoked() -> Message {
+    error_reply(
+        &EngineError::new(
+            SqlState::IdleInTransactionSessionTimeout,
+            "terminating the write transaction due to the idle-in-transaction timeout",
+        ),
+        0,
+    )
 }
 
 #[cfg(test)]
@@ -551,5 +1251,30 @@ mod tests {
         let mut w = ServiceWindow::new(me, 1, meta(1));
         w.published(2, meta(2), (0..=MAX_INVALIDATION_ENTRIES).collect());
         assert_eq!(w.invalidation(&me, 1, 2).0, INVALIDATE_ALL);
+    }
+
+    #[test]
+    fn the_resolution_window_answers_commit_status() {
+        let me = [1u8; 16];
+        let mut w = ServiceWindow::new(me, 10, meta(10));
+        w.published(11, meta(11), vec![]);
+        w.published(12, meta(12), vec![]);
+        let digest = |txid: u64| crate::format::commit_crc64(0, &meta(txid));
+        assert_eq!(w.resolve(11, digest(11)), COMMIT_STATUS_COMMITTED);
+        // Another commit took the txid.
+        assert_eq!(w.resolve(11, digest(99)), COMMIT_STATUS_NOT_COMMITTED);
+        // Above the published version.
+        assert_eq!(w.resolve(13, digest(13)), COMMIT_STATUS_NOT_COMMITTED);
+        // Below the window.
+        assert_eq!(w.resolve(9, digest(9)), COMMIT_STATUS_UNKNOWN);
+        // The window keeps the newest 256 commits.
+        for txid in 13..13 + RESOLUTION_WINDOW_COMMITS as u64 {
+            w.published(txid, meta(txid), vec![]);
+        }
+        assert_eq!(w.resolution.len(), RESOLUTION_WINDOW_COMMITS);
+        assert_eq!(w.resolution.front().map(|r| r.0), Some(13));
+        // A compaction joins it.
+        w.reset(300, meta(300));
+        assert_eq!(w.resolve(300, digest(300)), COMMIT_STATUS_COMMITTED);
     }
 }

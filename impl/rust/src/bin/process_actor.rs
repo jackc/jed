@@ -25,10 +25,15 @@ fn run() -> Result<(), EngineError> {
         return owner_idle(&path);
     }
     let timeout = args.next().and_then(|s| s.parse().ok()).unwrap_or(5000);
+    // The page-service owner's idle-in-transaction timeout (spec/design/page-service.md §11.1).
+    let idle = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(jed::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS);
     let locking = match action.as_str() {
         "open-exclusive" => Locking::Exclusive,
         // The test-only page-service mode (spec/design/page-service.md §16).
-        "create-service" | "open-service" => Locking::Service,
+        "create-service" | "open-service" | "open-service-read-only" => Locking::Service,
         _ => Locking::Shared,
     };
     let mut database = if action == "create" || action == "create-service" {
@@ -36,6 +41,7 @@ fn run() -> Result<(), EngineError> {
             path: Some(path),
             locking,
             file_lock_timeout_ms: timeout,
+            idle_in_transaction_timeout_ms: idle,
             ..CreateOptions::default()
         })?
     } else {
@@ -44,6 +50,8 @@ fn run() -> Result<(), EngineError> {
             OpenOptions {
                 locking,
                 file_lock_timeout_ms: timeout,
+                idle_in_transaction_timeout_ms: idle,
+                read_only: action == "open-service-read-only",
                 ..OpenOptions::default()
             },
         )?
@@ -130,6 +138,11 @@ fn run() -> Result<(), EngineError> {
             // The page-service benchmark's timed loops (spec/design/benchmarks.md §12).
             "TIME_LOOKUPS" | "TIME_SCAN" | "TIME_COMMITS" => {
                 timed(&mut database, command, argument)
+            }
+            "HANGUP_NEXT_ACK" => {
+                // The commit-resolution test hook (spec/pageservice/README.md §6.4).
+                database.hang_up_next_page_service_ack_for_testing();
+                Ok(String::new())
             }
             "TXID" => Ok(database.txid().to_string()),
             "PAGE_COUNT" => Ok(database.page_count().to_string()),

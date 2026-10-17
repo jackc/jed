@@ -1,0 +1,145 @@
+schema_version = 1
+name = "service-writer-gate"
+description = "Page service phase 3: the owner's writer gate is shared by its own writers and client write transactions. A writer waiting on the gate fails 55P03 at its lock timeout while readers keep reading, and a client killed while holding the gate releases it at EOF without committing."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+# The owner holds the gate: a client writer times out, and its reads still work.
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "300"
+expect_error = "55P03"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "0"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "1"
+
+# A client holds the gate: an owner writer times out, and the owner's reads still work.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (2)"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "300"
+expect_error = "55P03"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "1"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+# A client killed while holding the gate: EOF aborts its transaction and frees the gate.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (3)"
+
+[[step]]
+actor = "b"
+command = "kill"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "5000"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (4)"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,4"
+
+# A new client sees the same state and can take the gate.
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (5)"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,4,5"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"
