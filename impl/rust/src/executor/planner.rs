@@ -1068,7 +1068,7 @@ impl Engine {
             let expanded = expand_group_by(&sel.group_by)?;
             let input_width = scope.width();
             let mut group_keys: Vec<usize> = Vec::new();
-            let mut group_key_exprs: Vec<Option<(Expr, ResolvedType)>> = Vec::new();
+            let mut group_key_exprs: Vec<Option<GroupKeyExpr>> = Vec::new();
             let mut group_exprs: Vec<RExpr> = Vec::new();
             let mut resolved_sets: Vec<Vec<usize>> = Vec::with_capacity(expanded.len());
             for set in &expanded {
@@ -1107,17 +1107,22 @@ impl Engine {
                                     )
                                     .no_hint());
                                 }
-                                // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
-                                match group_key_exprs
-                                    .iter()
-                                    .position(|gk| matches!(gk, Some((e, _)) if *e == canon))
-                                {
+                                // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`);
+                                // a bare enclosing-query column key is matched by the column it names,
+                                // whatever its spelling (query.group_by_correlated).
+                                let outer = match rexpr {
+                                    RExpr::OuterColumn { level, index } => Some((level, index)),
+                                    _ => None,
+                                };
+                                match group_key_exprs.iter().position(|gk| {
+                                    matches!(gk, Some((e, _, o)) if *e == canon || (outer.is_some() && *o == outer))
+                                }) {
                                     Some(p) => group_keys[p],
                                     None => {
                                         let synth = input_width + group_exprs.len();
                                         group_exprs.push(rexpr);
                                         group_keys.push(synth);
-                                        group_key_exprs.push(Some((canon, ty)));
+                                        group_key_exprs.push(Some((canon, ty, outer)));
                                         synth
                                     }
                                 }

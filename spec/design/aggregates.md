@@ -511,6 +511,10 @@ alias / expression in any grouping set). An expression grouping key that has typ
 (no equality), like a `json` column. `GROUPING(…)` arguments stay **columns only** this slice (a
 `GROUPING(a+b)` over an expression key is a deferred sub-follow-on).
 
+A key may also be, or contain, a column of an **enclosing** query (`query.group_by_correlated`,
+[grammar.md](grammar.md) §26): it is materialized like an expression key, and a bare outer column key
+is matched by the column it resolves to, so `x` and `t.x` read the same group value.
+
 **Cost** (the cross-core contract, §8). A materialized grouping expression is evaluated **once per
 post-`WHERE` row** (its `operator_eval`s charged, like an aggregate operand) and the value cached in
 a synthetic column reused across grouping sets; a plain column key adds nothing. The bucketing /

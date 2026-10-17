@@ -1719,6 +1719,13 @@ func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
 			return true
 		}
 	}
+	// A materialized GROUP BY key may likewise be (or contain) an enclosing-query column
+	// (query.group_by_correlated): a subquery correlated only through its GROUP BY re-executes per outer row.
+	for _, ge := range sp.groupExprs {
+		if rexprReferencesOuter(ge, depth) {
+			return true
+		}
+	}
 	// A set-returning relation's arguments may carry a correlated reference (an implicitly-lateral
 	// SRF arg sees params / outer / an earlier sibling — functions.md §10, grammar.md §44), making
 	// the enclosing query correlated.
@@ -1995,10 +2002,27 @@ func expandGroupBy(items []groupItem) ([][]*exprNode, error) {
 
 // groupKeyExpr records a general-expression GROUP BY key (`GROUP BY a + b`, aggregates.md §15): its
 // canonical AST (so a matching projection / HAVING / ORDER BY expression resolves to its synthetic
-// slot) and its resolved type.
+// slot) and its resolved type. A key that is a bare enclosing-query column (query.group_by_correlated)
+// also records that column's (level, index), so any spelling of the same outer column — `x` or `o.x` —
+// matches it, as PostgreSQL matches grouping expressions by the resolved column.
 type groupKeyExpr struct {
 	canon exprNode
 	ty    resolvedType
+	outer *rExpr // the reOuterColumn node when the key is a bare enclosing-query column
+}
+
+// matchGroupOuter reports whether the enclosing-query column at (level, index) is a GROUP BY key in
+// this aggregate context, returning that group's master position (query.group_by_correlated).
+func matchGroupOuter(ag *aggCtx, level, index int) (int, resolvedType, bool) {
+	if ag == nil {
+		return 0, resolvedType{}, false
+	}
+	for p, gk := range ag.groupKeyExprs {
+		if gk != nil && gk.outer != nil && gk.outer.level == level && gk.outer.index == index {
+			return p, gk.ty, true
+		}
+	}
+	return 0, resolvedType{}, false
 }
 
 // groupKeyResolved is the resolution of one GROUP BY grouping term (aggregates.md §15): either an
@@ -2065,7 +2089,9 @@ func resolveGroupNamed(s *scope, term exprNode, items selectItems, params *param
 			return groupKeyResolved{}, err
 		}
 		if r.level != 0 {
-			return groupKeyResolved{}, newError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
+			// An enclosing-query column is a per-evaluation constant: materialize it as an
+			// expression key (query.group_by_correlated, grammar.md §26).
+			return resolveGroupExpr(s, term, params)
 		}
 		return groupKeyResolved{isColumn: true, index: r.index}, nil
 	case exprQualifiedColumn:
@@ -2074,7 +2100,7 @@ func resolveGroupNamed(s *scope, term exprNode, items selectItems, params *param
 			return groupKeyResolved{}, err
 		}
 		if r.level != 0 {
-			return groupKeyResolved{}, newError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
+			return resolveGroupExpr(s, term, params)
 		}
 		return groupKeyResolved{isColumn: true, index: r.index}, nil
 	default:
@@ -2217,6 +2243,9 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 		// the correlated subquery re-executes against NULL — a memory-vs-disk divergence.
 		for _, oe := range sp.orderExprs {
 			collectTouched(oe, depth, touched)
+		}
+		for _, ge := range sp.groupExprs {
+			collectTouched(ge, depth, touched)
 		}
 		for i := range sp.rels {
 			if sp.rels[i].srf != nil {

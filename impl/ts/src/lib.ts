@@ -493,6 +493,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.order_by_alias",
   // A correlated ORDER BY key — an inner ORDER BY referencing an enclosing-query column (grammar.md §26).
   "query.order_by_correlated",
+  "query.group_by_correlated",
   // A window function inside an ORDER BY key (`ORDER BY row_number() OVER (...)`, window.md §5.1).
   "query.order_by_window",
   // A GROUPING() call inside an ORDER BY key (`ORDER BY GROUPING(a)`, aggregates.md §12).

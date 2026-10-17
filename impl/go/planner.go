@@ -773,9 +773,19 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint()
 				}
 				// Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
+				// A bare enclosing-query column key is matched by the column it names, whatever its
+				// spelling (query.group_by_correlated).
+				var outer *rExpr
+				if gr.node.kind == reOuterColumn {
+					outer = gr.node
+				}
 				pos := -1
 				for p, gk := range groupKeyExprs {
 					if gk != nil && exprEqual(gk.canon, gr.canon) {
+						pos = p
+						break
+					}
+					if gk != nil && outer != nil && gk.outer != nil && gk.outer.level == outer.level && gk.outer.index == outer.index {
 						pos = p
 						break
 					}
@@ -786,7 +796,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					synth := inputWidth + len(groupExprs)
 					groupExprs = append(groupExprs, gr.node)
 					groupKeys = append(groupKeys, synth)
-					groupKeyExprs = append(groupKeyExprs, &groupKeyExpr{canon: gr.canon, ty: gr.ty})
+					groupKeyExprs = append(groupKeyExprs, &groupKeyExpr{canon: gr.canon, ty: gr.ty, outer: outer})
 					idx = synth
 				}
 			}

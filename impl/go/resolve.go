@@ -1413,6 +1413,13 @@ func resolveColumnRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, re
 	if r.level == 0 {
 		return collectColumn(s, ag, r.index, name)
 	}
+	// An enclosing-query column that is itself a GROUP BY key of this query reads the group's key
+	// slot (query.group_by_correlated) — so a ROLLUP grand-total row sees it NULL, as in PostgreSQL.
+	if ag != nil && ag.collecting {
+		if slot, ty, ok := matchGroupOuter(ag, r.level, r.index); ok {
+			return &rExpr{kind: reColumn, index: slot}, ty, nil
+		}
+	}
 	return &rExpr{kind: reOuterColumn, level: r.level, index: r.index}, resolvedTypeOfCol(s.columnOf(r).Type, s.catalog.readSnap()), nil
 }
 
