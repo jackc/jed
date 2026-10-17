@@ -1026,6 +1026,25 @@ pub(super) fn open_service(path: &Path, opts: OpenOptions) -> Result<Database> {
     open_service_with(ServiceHosts::os(), &real, opts, true)
 }
 
+/// Open a database served over `command`'s stdio (`Database::open_remote`,
+/// spec/pageservice/README.md §5.4): a page client over the remote lock host, which never owns.
+pub(super) fn open_remote(
+    host: crate::pageservice::remote::RemoteLockHost,
+    name: &str,
+    opts: OpenOptions,
+) -> Result<Database> {
+    use crate::pageservice::remote::{remote_open_error, remote_options};
+    let host = Arc::new(host);
+    let hosts = ServiceHosts {
+        host: Arc::clone(&host) as Arc<dyn LockHost>,
+        files: None,
+        spill: None,
+        background: true,
+    };
+    open_service_with(hosts, Path::new(name), remote_options(opts), true)
+        .map_err(|e| remote_open_error(&host, e))
+}
+
 /// Run the election for the database at `real` (already resolved) over `hosts` and open the handle
 /// in the role it wins. `claim` is false when the caller already holds the process-local path claim.
 pub(crate) fn open_service_with(

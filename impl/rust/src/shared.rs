@@ -2748,6 +2748,71 @@ impl Database {
         self.0.path()
     }
 
+    /// Open a database that another machine (or process) serves over a stream: a page client whose
+    /// connection is the standard input and output of `command`, run once per connection
+    /// (spec/pageservice/README.md §5.4). The CLI opens `ssh://host/path` as
+    /// `["ssh", "host", "jed", "pages", "/path"]`. `name` identifies the database in this process
+    /// (one handle per name, like a path) and is what [`path`](Self::path) reports.
+    ///
+    /// The handle is an ordinary page client: it runs its own engine over pages fetched through the
+    /// command, commits through it, and when the connection ends it runs the command again
+    /// (re-election, README.md §6.5) — it never becomes the owner, whatever `opts.ownership` says.
+    /// An open that cannot reach the database in `opts.file_lock_timeout_ms` fails `08006` with the
+    /// command's standard error; an error the remote side reports (`58P01`, `0A000`, …) is returned
+    /// as is. Unix only.
+    #[cfg(unix)]
+    pub fn open_remote(command: Vec<String>, name: &str, opts: OpenOptions) -> Result<Database> {
+        handoff::open_remote(
+            crate::pageservice::remote::RemoteLockHost::new(command),
+            name,
+            opts,
+        )
+    }
+
+    /// [`open_remote`](Self::open_remote) over an in-process `jed pages` for the database at `path`
+    /// (tests): each connection is a [`serve_page_stream`](Self::serve_page_stream) thread over OS
+    /// pipes.
+    #[cfg(all(unix, test))]
+    pub(crate) fn open_remote_in_process(
+        path: &Path,
+        read_only: bool,
+        name: &str,
+        opts: OpenOptions,
+    ) -> Result<Database> {
+        handoff::open_remote(
+            crate::pageservice::remote::RemoteLockHost::with_dialer(
+                crate::pageservice::remote::in_process_dialer(path.to_path_buf(), read_only),
+            ),
+            name,
+            opts,
+        )
+    }
+
+    /// Serve one page-service connection on `input`/`output` for the database at `path` until it
+    /// ends: the serving side of [`open_remote`](Self::open_remote), run by `jed pages`
+    /// (spec/pageservice/README.md §5.4). The stream is relayed to the database's live owner when it
+    /// has one; otherwise this process opens the database as a `yield` owner (read-only when
+    /// `read_only`), which keeps serving its local endpoint too. `read_only` also makes the
+    /// connection read-only whatever the client asks. Unix only.
+    #[cfg(unix)]
+    pub fn serve_page_stream(
+        path: &Path,
+        opts: OpenOptions,
+        read_only: bool,
+        input: Box<dyn std::io::Read + Send>,
+        output: Box<dyn std::io::Write + Send>,
+    ) -> Result<()> {
+        crate::pageservice::remote::serve_pages(path, opts, read_only, input, output)
+    }
+
+    /// The serving owner of this handle's current role, if it is one.
+    #[cfg(unix)]
+    pub(crate) fn page_service_owner(
+        &self,
+    ) -> Option<Arc<crate::pageservice::owner::PageServiceOwner>> {
+        self.0.service_owner()
+    }
+
     /// Make a serving page-service owner drop the connection instead of acknowledging its next
     /// client commit, after the commit is durable — the case `commit_status` resolves
     /// (spec/pageservice/README.md §6.4). Test-only; no effect on a handle that is not a

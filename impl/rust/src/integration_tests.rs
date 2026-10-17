@@ -169,6 +169,8 @@ mod range_storage;
 mod reclamation;
 #[path = "../tests/regex_vectors.rs"]
 mod regex_vectors;
+#[path = "../tests/remote_stream.rs"]
+mod remote_stream;
 #[path = "../tests/resealed_corruption.rs"]
 mod resealed_corruption;
 #[path = "../tests/returning.rs"]
