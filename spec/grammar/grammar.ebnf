@@ -262,7 +262,12 @@ drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
 
 /* ALTER TABLE (../design/alter.md §1). RENAME is standalone; every other action participates in the
  * comma-separated, left-to-right, all-or-nothing frame. Slices 1-5 implement every planned form
- * here; identity management remains a separate deferred surface. */
+ * here; slice 6 adds identity management (../design/alter.md §2.8): ADD GENERATED … AS IDENTITY on a
+ * NOT NULL, default-less integer column (22023 for a non-integer type, then 55000 for a nullable /
+ * defaulted / identity column); the identity_alter_option list (order-free, each at most once —
+ * 42601; "SET" followed by DEFAULT / DATA / NOT is the column edit above, not an identity option;
+ * SET AS / SET RESTART / SET SEQUENCE NAME are 42601), 55000 on a non-identity column; DROP IDENTITY
+ * (55000 on a non-identity column unless IF EXISTS). */
 alter_table    ::= "ALTER" "TABLE" ("IF" "EXISTS")? qualified_table
                    ( "RENAME" ( "COLUMN"? identifier "TO" identifier
                                 | "CONSTRAINT" identifier "TO" identifier
@@ -279,6 +284,13 @@ alter_column_action ::= "SET" "DEFAULT" expr
                       | "SET" "NOT" "NULL"
                       | "DROP" "NOT" "NULL"
                       | ("SET" "DATA")? "TYPE" type_name ("USING" expr)?
+                      | "ADD" "GENERATED" ("ALWAYS" | "BY" "DEFAULT") "AS" "IDENTITY"
+                            ("(" sequence_option* ")")?
+                      | identity_alter_option+
+                      | "DROP" "IDENTITY" ("IF" "EXISTS")?
+identity_alter_option ::= "SET" "GENERATED" ("ALWAYS" | "BY" "DEFAULT")
+                        | "SET" sequence_option
+                        | "RESTART" ("WITH"? signed_integer)?
 
 /* CREATE INDEX declares a secondary index over one or more named columns of one table
  * (../design/indexes.md). "CREATE UNIQUE INDEX" makes it a UNIQUE index: building it over
@@ -356,7 +368,9 @@ create_sequence ::= "CREATE" "SEQUENCE" ("IF" "NOT" "EXISTS")? identifier sequen
  * which fixes the default + validated MINVALUE/MAXVALUE; a non-integer type is 22023. "AS" is also a
  * sequence_option here, so it may appear anywhere among the others (PG order-freedom). The same
  * sequence_option list is reused inside an IDENTITY column's "( … )" — EXCEPT "AS" there is 42601
- * (the column type already fixes it). */
+ * (the column type already fixes it). "SEQUENCE NAME" is valid ONLY in an identity column's "( … )"
+ * (CREATE TABLE, ADD COLUMN, ALTER … ADD GENERATED), where it names the owned sequence (42P07 if the
+ * name is taken); in CREATE / ALTER SEQUENCE it is 42601, as in PostgreSQL. */
 sequence_option ::= "AS" type_name
                   | "INCREMENT" "BY"? signed_integer
                   | "MINVALUE" signed_integer | "NO" "MINVALUE"
@@ -364,6 +378,7 @@ sequence_option ::= "AS" type_name
                   | "START" "WITH"? signed_integer
                   | "CACHE" signed_integer
                   | "CYCLE" | "NO" "CYCLE"
+                  | "SEQUENCE" "NAME" identifier
 signed_integer ::= "-"? integer
 drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
 

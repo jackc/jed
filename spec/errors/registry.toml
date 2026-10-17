@@ -889,7 +889,9 @@ template = "storage of database \"{database}\" exceeded the limit of {limit} byt
 
 # --- invalid object state (class 55) ----------------------------------------
 # currval/lastval before nextval has defined the value in this session
-# (../design/sequences.md §6).
+# (../design/sequences.md §6); an ALTER TABLE identity action on a column in the wrong state — ADD
+# GENERATED on a nullable, defaulted, or identity column, SET / DROP IDENTITY on a non-identity
+# column (../design/alter.md §2.8).
 [[error]]
 code = "55000"
 name = "object_not_in_prerequisite_state"
