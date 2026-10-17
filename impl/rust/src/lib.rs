@@ -991,6 +991,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "txn.explicit",
     "txn.read_only",
     "txn.failed_state",
+    "txn.savepoint",
     // Shared-handle concurrency — the Database schedule format (spec/design/concurrency-testing.md
     // §4). Declared because this core implements Database/ReadHandle/WriteHandle + the watermark
     // (shared.rs); a core lacking them skips suites/concurrency files via the capability gate. This

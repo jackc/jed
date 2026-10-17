@@ -1592,6 +1592,10 @@ description = "Transaction access modes — BEGIN READ ONLY / READ WRITE (defaul
 id = "txn.failed_state"
 description = "Failed-block poisoning — a statement error inside an explicit block aborts the transaction; every later statement but ROLLBACK/COMMIT is 25P02 (in_failed_sql_transaction), and COMMIT of a failed block acts as ROLLBACK (PostgreSQL). The whole working set is discarded, including statements that succeeded before the error. spec/design/transactions.md §6"
 
+[[capability]]
+id = "txn.savepoint"
+description = "Savepoints inside an explicit block — SAVEPOINT name, RELEASE [SAVEPOINT] name, ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT] name, with PostgreSQL semantics: names shadow (RELEASE/ROLLBACK TO act on the newest of a name), RELEASE destroys the savepoint and every later one keeping their changes, ROLLBACK TO restores the marked state (rows, DDL, sequences, temp tables, attachment writes) and destroys every later savepoint but keeps itself, and is the recovery path out of a failed block. Outside a block every form is 25P01; an unknown name is 3B001 (aborting a clean block, leaving a failed one failed); SAVEPOINT/RELEASE in a failed block are 25P02. spec/design/transactions.md §11"
+
 # Shared-handle concurrency (Phase 5 P5.3b, spec/design/transactions.md §8/§10). Tested by the
 # deterministic schedule format — a `# format: concurrency` .test file under suites/concurrency/,
 # an explicit total order over named read/write sessions (spec/design/concurrency-testing.md §4).
@@ -1891,6 +1895,7 @@ capabilities = [
   "txn.explicit",
   "txn.read_only",
   "txn.failed_state",
+  "txn.savepoint",
 ]
 
 [[profile]]

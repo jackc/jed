@@ -936,6 +936,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "txn.explicit",
   "txn.read_only",
   "txn.failed_state",
+  "txn.savepoint",
   // Shared-handle concurrency — the Database schedule format (spec/design/concurrency-testing.md
   // §4). Declared because this core implements Database + read/write Sessions + the watermark
   // (shared.ts); a core lacking them skips suites/concurrency files via the capability gate. This

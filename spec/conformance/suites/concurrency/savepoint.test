@@ -1,0 +1,72 @@
+# Savepoints inside a shared-handle write session (spec/design/transactions.md §11, §10). A
+# savepoint lives in the writer's private working set: SAVEPOINT / ROLLBACK TO / RELEASE never
+# publish, never release the single-writer gate, and never advance the committed version, so a
+# concurrent reader sees only the committed state throughout and a second writer stays queued until
+# the holder commits. The commit publishes exactly the state left after the ROLLBACK TO, as one
+# version.
+# format: concurrency
+# requires: txn.savepoint, txn.gate_blocking, txn.shared, txn.read_handle, txn.watermark, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.i32
+
+open w write
+on w statement ok
+CREATE TABLE t (id i32 PRIMARY KEY)
+on w statement ok
+INSERT INTO t VALUES (1)
+commit w
+expect version 1
+
+# --- w1 stages a row, marks a savepoint, stages more, rolls back to it -------
+open w1 write
+on w1 statement ok
+INSERT INTO t VALUES (2)
+on w1 statement ok
+SAVEPOINT a
+on w1 statement ok
+INSERT INTO t VALUES (3)
+
+open r read
+on r query I rowsort
+SELECT id FROM t
+----
+1
+
+on w1 statement ok
+ROLLBACK TO SAVEPOINT a
+expect version 1
+
+# the rollback-to released nothing: a second writer still blocks on the gate
+open w2 write blocks
+
+on w1 query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+on w1 statement ok
+RELEASE SAVEPOINT a
+
+# the pinned reader is undisturbed by every savepoint operation
+on r query I rowsort
+SELECT id FROM t
+----
+1
+
+commit w1
+expect version 2
+
+# w2 acquired the gate at w1's commit and sees exactly the post-ROLLBACK TO state
+on w2 query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+rollback w2
+
+close r
+open fresh read
+on fresh query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+close fresh

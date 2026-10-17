@@ -3,7 +3,7 @@
 //! ParamTypes/PrivReq helpers that fall in this range.
 
 use super::*;
-use crate::ast::{FrameBound, WindowFrame};
+use crate::ast::{FrameBound, SavepointOp, WindowFrame};
 
 /// Resolve a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar function
 /// (abs/round/…, spec/design/functions.md §9), the named/defaulted `make_interval` (§11), or
@@ -3175,7 +3175,10 @@ pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
         // PG). Plain EXPLAIN never executes, but authorization is checked on the inner regardless
         // (spec/design/explain.md §1).
         Statement::Explain { inner, .. } => collect_stmt_privs(inner, req),
-        Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {}
+        Statement::Begin { .. }
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::Savepoint { .. } => {}
     }
 }
 
@@ -3673,6 +3676,11 @@ pub(crate) fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::Begin { .. } => "BEGIN",
         Statement::Commit => "COMMIT",
         Statement::Rollback => "ROLLBACK",
+        Statement::Savepoint { op, .. } => match op {
+            SavepointOp::Define => "SAVEPOINT",
+            SavepointOp::Release => "RELEASE",
+            SavepointOp::RollbackTo => "ROLLBACK",
+        },
     }
 }
 

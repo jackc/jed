@@ -230,12 +230,14 @@ subsequent statements run within it until it ends:
   to autocommit. Committing a **failed** block (§6) performs a `ROLLBACK` instead (PostgreSQL).
 - **`ROLLBACK`** (`ROLLBACK [TRANSACTION|WORK]`) discards `working` and returns to autocommit;
   it also clears a **failed** block.
-- **`BEGIN` while already in an explicit block** has no defined action (no nesting without
-  `SAVEPOINT` — §11) → **`25001 active_sql_transaction`**.
+- **`BEGIN` while already in an explicit block** has no defined action (nesting is
+  `SAVEPOINT`'s job — §11) → **`25001 active_sql_transaction`**. PostgreSQL only warns here;
+  jed has no warning channel, and silently ignoring the statement would hide a nesting bug, so
+  it errors without aborting the block.
 - **`COMMIT`/`ROLLBACK` in autocommit mode** (no open block) → a **lenient no-op success**.
   PostgreSQL warns ("there is no transaction in progress"); jed has no warning channel
   (CLAUDE.md §4), so it silently succeeds rather than raising — a documented, deliberate
-  divergence. (No `25P01` is raised.)
+  divergence. (No `25P01` is raised; only the savepoint statements raise it — §11.)
 
 The asymmetry — `BEGIN`-in-block errors, `COMMIT`/`ROLLBACK`-with-no-block do not — is
 principled: `COMMIT`/`ROLLBACK` always have a well-defined action (publish/discard the current
@@ -312,8 +314,9 @@ top of it and **depends on the mode**, faithfully mirroring PostgreSQL:
   corpus stays green.
 - **Explicit block** (§4.2): a statement error **aborts the transaction** — it enters the
   **failed** state. Every subsequent statement except `ROLLBACK` (and `COMMIT`, treated as
-  `ROLLBACK`) is rejected with **`25P02 in_failed_sql_transaction`** until the block ends.
-  `ROLLBACK` clears the failed state. This matches PostgreSQL's "current transaction is aborted,
+  `ROLLBACK`) and `ROLLBACK TO` a savepoint is rejected with **`25P02
+  in_failed_sql_transaction`** until the block ends. `ROLLBACK` clears the failed state, and so
+  does `ROLLBACK TO` an existing savepoint, which returns the block to that savepoint's state (§11). This matches PostgreSQL's "current transaction is aborted,
   commands ignored until end of transaction block."
 
 New error codes (class 25, *invalid transaction state*), in
@@ -323,10 +326,12 @@ New error codes (class 25, *invalid transaction state*), in
 |---|---|---|
 | `25001` | `active_sql_transaction` | `BEGIN` issued inside an explicit block (no nesting — §4.2) |
 | `25006` | `read_only_sql_transaction` | a write statement issued in a READ ONLY transaction (§4.3) |
-| `25P02` | `in_failed_sql_transaction` | any statement but `ROLLBACK`/`COMMIT` in a failed block (§6) |
+| `25P01` | `no_active_sql_transaction` | `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` with no open block (§11) |
+| `25P02` | `in_failed_sql_transaction` | any statement but `ROLLBACK`/`COMMIT`/`ROLLBACK TO` in a failed block (§6) |
+| `3B001` | `invalid_savepoint_specification` | `RELEASE` / `ROLLBACK TO` naming no savepoint of the block (§11) |
 
-A `COMMIT`/`ROLLBACK` with no open block is a no-op success, **not** an error — so `25P01` is
-deliberately *not* registered (§4.2). These class-25 codes are a per-core SQL/API surface,
+A `COMMIT`/`ROLLBACK` with no open block is a no-op success, **not** an error (§4.2); `25P01` is
+raised only by the savepoint statements, which have no meaning outside a block. These class-25 codes are a per-core SQL/API surface,
 asserted by the shared corpus only via the deterministic `BEGIN/…/ROLLBACK` visibility tests
 (§10).
 
@@ -571,11 +576,73 @@ a temp image before every record to exercise the on-disk read path, where the fs
     interleaved calls — exactly as the `$N` bind parameters are tested per-core, not in the
     corpus ([conformance.md](conformance.md) §1.2).
 
-## 11. Deferred / explicitly not foreclosed
+## 11. Savepoints
 
-- **`SAVEPOINT` / nested transactions** — deferred. The structure anticipates them: `working`
-  becomes a **stack** of snapshots (a `SAVEPOINT` pushes, `ROLLBACK TO` pops to a marked root).
-  Until then a nested `BEGIN` is `25001` (§4.2). Not built; not foreclosed.
+`SAVEPOINT name`, `RELEASE [SAVEPOINT] name`, and `ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT]
+name` ([grammar.md](grammar.md) §27) nest work inside an explicit block, with PostgreSQL's
+semantics. ORMs use them for nested transactions.
+
+**Model.** The open transaction carries a **stack of savepoint frames**, oldest first. A frame
+captures everything about the transaction that a statement can change: the main `working`
+snapshot, the session temp snapshot (`temp_working`), the per-attachment working snapshots, the
+dirty flags, and the session's `currval`/`lastval` state. The snapshots are persistent structures,
+so a frame is an O(1) copy that shares every unchanged node with `working`. (In the Go and TS cores
+the clone also invalidates the working map's mutation generation, so later writes path-copy instead
+of editing a node the frame shares.) `SAVEPOINT` pushes a frame; nothing is published, the writer
+gate is not touched, and no page is written. Because each of these is snapshot state, restoring the
+snapshots restores, together:
+
+- table and index roots (rows, index entries, the synthetic rowid counters — §7);
+- the catalog, so DDL since the savepoint is undone;
+- sequence counters, which are snapshot fields because `nextval` is transactional
+  ([sequences.md](sequences.md) §5) — a rolled-back advance is handed out again, a divergence
+  from PostgreSQL that follows from the existing one;
+- P9 statistics and estimator revisions ([statistics.md](statistics.md));
+- session temp tables, including their `ON COMMIT` actions, which apply at the top-level commit
+  to whatever the working temp snapshot then holds ([temp-tables.md](temp-tables.md) §5.1);
+- the writes to each host-attached database, including the absence of any write
+  ([attached-databases.md](attached-databases.md) §5);
+- the pending-write bytes ([memory.md](memory.md) §7). They are counted per store and travel with
+  the snapshots, so after `ROLLBACK TO` the balance is the frame's. The balance is cumulative, so
+  the older versions a frame retains were already charged when they were staged; savepoints add
+  no unaccounted residency.
+
+Prepared-plan caches need no invalidation. A cache entry is filled only from committed state
+([api.md](api.md) §2.4), and catalog generations and estimator revisions are snapshot fields: after
+`ROLLBACK TO` the visible signature is exactly the one the savepoint saw, which either equals the
+committed signature (with committed schema) or names a working state no entry was filled from.
+
+**Statements.**
+
+- **`SAVEPOINT name`** pushes a frame. Names may repeat; a later one **shadows** an earlier one.
+- **`RELEASE name`** finds the newest frame named `name` and removes it and every later frame.
+  Their changes stay in the transaction.
+- **`ROLLBACK TO name`** finds the newest frame named `name`, restores its state, and removes every
+  later frame. The frame itself stays, so it can be rolled back to again. It also **clears the
+  failed state** (§6): it is the way to keep a block alive after an error.
+- **`COMMIT`** publishes the current state regardless of open savepoints; **`ROLLBACK`** discards
+  everything. Both drop the stack. A failed block's `COMMIT` is still a `ROLLBACK`.
+- Names are identifiers: unquoted names fold to lower case, quoted names are exact. The
+  `SAVEPOINT` noise word after `RELEASE`/`ROLLBACK TO` is consumed only when a name follows it, so
+  `RELEASE savepoint` releases a savepoint named `savepoint`.
+
+**Errors** (PostgreSQL's):
+
+- No open block: every form is `25P01` (no_active_sql_transaction). There is no block to abort.
+- Failed block: `SAVEPOINT` and `RELEASE` are `25P02`. `ROLLBACK TO` an unknown name is `3B001`
+  and the block stays failed.
+- Clean block: an unknown name is `3B001`, which aborts the block like any other statement error.
+- Inside `execute_script` every savepoint statement is `0A000`, like the other transaction-control
+  statements ([session.md](session.md) §4.2).
+
+Savepoints work the same in a READ ONLY block (its frames pin the same snapshot) and in a shared
+write session: the frames are the session's private working state, so a concurrent reader never
+sees them and a queued writer stays queued until the holder's top-level commit
+(`concurrency/savepoint.test`). The host API needs no savepoint methods: `tx.execute("SAVEPOINT
+a")` drives the same mechanism ([api.md](api.md) §2.2).
+
+## 12. Deferred / explicitly not foreclosed
+
 - **Lazy write-lock acquisition** — a READ WRITE transaction takes the write lock at `begin`
   (bbolt's model), holding it across any read-only prologue. Deferring acquisition until the
   first write (more read concurrency) is a future optimization; not foreclosed, but it carries

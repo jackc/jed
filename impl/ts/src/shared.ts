@@ -2212,6 +2212,7 @@ export class Session {
       stmt.kind !== "begin" &&
       stmt.kind !== "commit" &&
       stmt.kind !== "rollback" &&
+      stmt.kind !== "savepoint" &&
       !this.engine.stmtIsWriteWithViews(stmt);
     // pin registers the cursor's snapshot version in the watermark (streaming.md §5); the deregister
     // runs on cursor close (JS has no destructor), advancing oldestLiveTxid.

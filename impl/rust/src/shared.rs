@@ -3105,7 +3105,10 @@ impl Session {
         // safe-total-`query` contract, CLAUDE.md §13).
         if !matches!(
             ast,
-            Statement::Begin { .. } | Statement::Commit | Statement::Rollback
+            Statement::Begin { .. }
+                | Statement::Commit
+                | Statement::Rollback
+                | Statement::Savepoint { .. }
         ) && !self.engine.stmt_is_write_with_views(ast)
         {
             if let Err(e) = self.engine.gate_read_lanes(ast) {

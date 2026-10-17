@@ -1,8 +1,7 @@
 //! The shared execution core (spec/design/cli.md): script mode and the TUI both drive a
 //! `Session`, so their behavior cannot drift. A CLI session wraps one engine [`jed::Session`]
-//! handle and tracks the one piece of state it does not expose directly — whether the open
-//! transaction has FAILED (a statement errored inside it, so everything but
-//! COMMIT/ROLLBACK now answers 25P02).
+//! handle; the transaction state it displays (autocommit / open / failed — a failed block answers
+//! 25P02 to everything but COMMIT/ROLLBACK/ROLLBACK TO) is the engine session's own status.
 
 use jed::{EngineError, Value};
 
@@ -50,31 +49,17 @@ pub struct Session {
     pub db: jed::Session,
     /// Display name: the file path, or "memory" for an in-memory database.
     pub source: String,
-    tx_failed: bool,
 }
 
 impl Session {
     pub fn new(db: jed::Session, source: String) -> Session {
-        Session {
-            db,
-            source,
-            tx_failed: false,
-        }
+        Session { db, source }
     }
 
     /// Execute one already-split statement. Errors pass through for the caller to
-    /// display; transaction state is tracked either way.
+    /// display; the transaction state is the engine's (cli.md §6).
     pub fn run(&mut self, sql: &str) -> Result<ExecOutput, EngineError> {
-        let result = self.exec_output(sql);
-        // Failed-transaction tracking (cli.md §6): an error while a transaction is open
-        // poisons it (the engine answers 25P02 from then on); any path that leaves the
-        // transaction (COMMIT/ROLLBACK, or autocommit all along) clears the flag.
-        if !self.db.in_transaction() {
-            self.tx_failed = false;
-        } else if result.is_err() {
-            self.tx_failed = true;
-        }
-        result
+        self.exec_output(sql)
     }
 
     /// Run one statement through the one total `query` seam (spec/design/api.md §11) and materialize
@@ -102,13 +87,13 @@ impl Session {
         }
     }
 
+    /// The session's transaction state (cli.md §6): the engine's own status, so a statement
+    /// error inside a block shows it failed and a ROLLBACK TO a savepoint shows it recovered.
     pub fn tx_state(&self) -> TxState {
-        if !self.db.in_transaction() {
-            TxState::Autocommit
-        } else if self.tx_failed {
-            TxState::Failed
-        } else {
-            TxState::Open
+        match self.db.status() {
+            jed::TxStatus::Idle => TxState::Autocommit,
+            jed::TxStatus::Open => TxState::Open,
+            jed::TxStatus::Failed => TxState::Failed,
         }
     }
 }
@@ -122,6 +107,8 @@ fn statement_tag(sql: &str) -> &'static str {
         "begin" => "BEGIN",
         "commit" => "COMMIT",
         "rollback" => "ROLLBACK",
+        "savepoint" => "SAVEPOINT",
+        "release" => "RELEASE",
         _ => "OK",
     }
 }
@@ -210,6 +197,26 @@ mod tests {
             ExecOutput::Statement { tag, .. } => assert_eq!(tag, "ROLLBACK"),
             _ => panic!("expected statement"),
         }
+        assert!(matches!(s.tx_state(), TxState::Autocommit));
+
+        // ROLLBACK TO a savepoint recovers a failed block (transactions.md §11).
+        s.run("BEGIN").unwrap();
+        match s.run("SAVEPOINT a").unwrap() {
+            ExecOutput::Statement { tag, .. } => assert_eq!(tag, "SAVEPOINT"),
+            _ => panic!("expected statement"),
+        }
+        assert!(s.run("INSERT INTO t VALUES (1), (1)").is_err());
+        assert!(matches!(s.tx_state(), TxState::Failed));
+        match s.run("ROLLBACK TO a").unwrap() {
+            ExecOutput::Statement { tag, .. } => assert_eq!(tag, "ROLLBACK"),
+            _ => panic!("expected statement"),
+        }
+        assert!(matches!(s.tx_state(), TxState::Open));
+        match s.run("RELEASE a").unwrap() {
+            ExecOutput::Statement { tag, .. } => assert_eq!(tag, "RELEASE"),
+            _ => panic!("expected statement"),
+        }
+        s.run("COMMIT").unwrap();
         assert!(matches!(s.tx_state(), TxState::Autocommit));
 
         // An autocommit error never leaves a failed state behind.

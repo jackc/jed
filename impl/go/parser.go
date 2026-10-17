@@ -350,6 +350,20 @@ func (p *parser) parseStatement() (statement, error) {
 		return p.parseCommit()
 	case "rollback":
 		return p.parseRollback()
+	case "savepoint":
+		p.advance() // SAVEPOINT
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Savepoint: &savepointStmt{Op: savepointDefine, Name: name}}, nil
+	case "release":
+		p.advance() // RELEASE
+		name, err := p.parseSavepointName()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Savepoint: &savepointStmt{Op: savepointRelease, Name: name}}, nil
 	case "":
 		// A leading `(` can only begin a parenthesized query (grammar.md §25).
 		if p.peek().Kind == tokLParen {
@@ -670,7 +684,26 @@ func (p *parser) parseRollback() (statement, error) {
 		return statement{}, err
 	}
 	p.consumeTransactionOrWork()
+	// ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT] name (transactions.md §11).
+	if p.peekKeyword() == "to" {
+		p.advance() // TO
+		name, err := p.parseSavepointName()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Savepoint: &savepointStmt{Op: savepointRollbackTo, Name: name}}, nil
+	}
 	return statement{Rollback: &rollback{}}, nil
+}
+
+// parseSavepointName parses the [SAVEPOINT] name tail of RELEASE / ROLLBACK TO (grammar.md §27). The
+// noise word SAVEPOINT is consumed only when a name follows it, so `RELEASE savepoint` names a
+// savepoint called savepoint (PostgreSQL's grammar).
+func (p *parser) parseSavepointName() (string, error) {
+	if p.peekKeyword() == "savepoint" && isIdentKind(p.peekKindAt(1)) {
+		p.advance() // SAVEPOINT
+	}
+	return p.expectIdentifier()
 }
 
 // consumeTransactionOrWork consumes the optional trailing TRANSACTION / WORK noise word.

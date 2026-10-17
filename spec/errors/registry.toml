@@ -369,6 +369,16 @@ name = "read_only_sql_transaction"
 class = "invalid transaction state"
 template = "cannot execute {statement} in a read-only transaction"
 
+# Raised by SAVEPOINT / RELEASE [SAVEPOINT] / ROLLBACK TO [SAVEPOINT] with no open explicit
+# block (spec/design/transactions.md §11): a savepoint exists only inside a block. PostgreSQL's
+# code and message. COMMIT/ROLLBACK with no block stay lenient no-op successes (§4.2), so this
+# is raised only by the savepoint statements.
+[[error]]
+code = "25P01"
+name = "no_active_sql_transaction"
+class = "invalid transaction state"
+template = "{statement} can only be used in transaction blocks"
+
 [[error]]
 code = "25P02"
 name = "in_failed_sql_transaction"
@@ -394,6 +404,16 @@ code = "2BP01"
 name = "dependent_objects_still_exist"
 class = "dependent objects still exist"
 template = "cannot drop type {name} because other objects depend on it: {detail}"
+
+# --- invalid savepoint specification (class 3B) -----------------------------
+# RELEASE / ROLLBACK TO naming no savepoint of the open block (spec/design/transactions.md §11).
+# PostgreSQL's code. Like any statement error inside a block it aborts a clean block; in an
+# already-failed block ROLLBACK TO of an unknown name leaves it failed.
+[[error]]
+code = "3B001"
+name = "invalid_savepoint_specification"
+class = "invalid savepoint specification"
+template = "savepoint does not exist: {name}"
 
 # --- external routine exception (class 38) ---------------------------------
 # 38000 external_routine_exception — a host function's kernel failed in a way that

@@ -56,9 +56,11 @@ export type SqlState =
   | "exclusion_violation" // 23P01 — conflicting key value violates exclusion constraint: {name}
   | "active_sql_transaction" // 25001 — there is already a transaction in progress
   | "read_only_sql_transaction" // 25006 — cannot execute {statement} in a read-only transaction
+  | "no_active_sql_transaction" // 25P01 — {statement} can only be used in transaction blocks
   | "in_failed_sql_transaction" // 25P02 — current transaction is aborted, commands ignored until end of transaction block
   | "idle_in_transaction_session_timeout" // 25P03 — {detail}
   | "dependent_objects_still_exist" // 2BP01 — cannot drop type {name} because other objects depend on it: {detail}
+  | "invalid_savepoint_specification" // 3B001 — savepoint does not exist: {name}
   | "external_routine_exception" // 38000 — host function {name} raised {detail}
   | "syntax_error" // 42601 — syntax error: {detail}
   | "invalid_name" // 42602 — invalid name syntax
@@ -160,9 +162,11 @@ const CODES: Record<SqlState, string> = {
   exclusion_violation: "23P01",
   active_sql_transaction: "25001",
   read_only_sql_transaction: "25006",
+  no_active_sql_transaction: "25P01",
   in_failed_sql_transaction: "25P02",
   idle_in_transaction_session_timeout: "25P03",
   dependent_objects_still_exist: "2BP01",
+  invalid_savepoint_specification: "3B001",
   external_routine_exception: "38000",
   syntax_error: "42601",
   invalid_name: "42602",
@@ -280,9 +284,11 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "23P01", name: "exclusion_violation", class: "integrity constraint violation" },
   { code: "25001", name: "active_sql_transaction", class: "invalid transaction state" },
   { code: "25006", name: "read_only_sql_transaction", class: "invalid transaction state" },
+  { code: "25P01", name: "no_active_sql_transaction", class: "invalid transaction state" },
   { code: "25P02", name: "in_failed_sql_transaction", class: "invalid transaction state" },
   { code: "25P03", name: "idle_in_transaction_session_timeout", class: "invalid transaction state" },
   { code: "2BP01", name: "dependent_objects_still_exist", class: "dependent objects still exist" },
+  { code: "3B001", name: "invalid_savepoint_specification", class: "invalid savepoint specification" },
   { code: "38000", name: "external_routine_exception", class: "external routine exception" },
   { code: "42601", name: "syntax_error", class: "syntax error or access rule violation" },
   { code: "42602", name: "invalid_name", class: "syntax error or access rule violation" },

@@ -222,7 +222,7 @@ func (db *engine) runScriptBody(sql string) (ScriptSummary, error) {
 		}
 		// Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
 		// wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
-		if ast.Begin != nil || ast.Commit != nil || ast.Rollback != nil {
+		if ast.Begin != nil || ast.Commit != nil || ast.Rollback != nil || ast.Savepoint != nil {
 			return ScriptSummary{}, newError(FeatureNotSupported,
 				"transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; "+
 					"use SplitStatements to run a self-managed multi-statement transaction")

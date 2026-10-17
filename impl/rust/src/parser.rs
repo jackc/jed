@@ -13,9 +13,9 @@ use crate::ast::{
     GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
     JoinClause, JoinKind, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper,
     JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause,
-    Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement,
-    SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update,
-    WindowDef, WithExpr, WithQuery,
+    SavepointOp, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos,
+    Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
+    Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::ast::{CycleClause, SearchClause};
@@ -264,6 +264,20 @@ impl Parser {
             Some("begin") | Some("start") => self.parse_begin(),
             Some("commit") | Some("end") => self.parse_commit(),
             Some("rollback") => self.parse_rollback(),
+            Some("savepoint") => {
+                self.advance(); // SAVEPOINT
+                Ok(Statement::Savepoint {
+                    op: SavepointOp::Define,
+                    name: self.expect_identifier()?,
+                })
+            }
+            Some("release") => {
+                self.advance(); // RELEASE
+                Ok(Statement::Savepoint {
+                    op: SavepointOp::Release,
+                    name: self.parse_savepoint_name()?,
+                })
+            }
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
             // A leading `(` can only begin a parenthesized query (grammar.md §25).
             None if matches!(self.peek(), Token::LParen) => self.parse_query_expr(),
@@ -563,7 +577,27 @@ impl Parser {
     fn parse_rollback(&mut self) -> Result<Statement> {
         self.expect_keyword("rollback")?;
         self.consume_transaction_or_work();
+        // `ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT] name` (transactions.md §11).
+        if self.peek_keyword().as_deref() == Some("to") {
+            self.advance(); // TO
+            return Ok(Statement::Savepoint {
+                op: SavepointOp::RollbackTo,
+                name: self.parse_savepoint_name()?,
+            });
+        }
         Ok(Statement::Rollback)
+    }
+
+    /// The `[SAVEPOINT] name` tail of `RELEASE` / `ROLLBACK TO` (grammar.md §27). The noise word
+    /// `SAVEPOINT` is consumed only when a name follows it, so `RELEASE savepoint` names a savepoint
+    /// called `savepoint` (PostgreSQL's grammar).
+    fn parse_savepoint_name(&mut self) -> Result<String> {
+        if self.peek_keyword().as_deref() == Some("savepoint")
+            && matches!(self.peek_at(1), Token::Word(_) | Token::QuotedIdent(_))
+        {
+            self.advance(); // SAVEPOINT
+        }
+        self.expect_identifier()
     }
 
     /// Consume the optional trailing `TRANSACTION` / `WORK` noise word on a COMMIT/ROLLBACK.

@@ -104,12 +104,16 @@ pub enum SqlState {
     ActiveSqlTransaction,
     /// 25006 — cannot execute {statement} in a read-only transaction
     ReadOnlySqlTransaction,
+    /// 25P01 — {statement} can only be used in transaction blocks
+    NoActiveSqlTransaction,
     /// 25P02 — current transaction is aborted, commands ignored until end of transaction block
     InFailedSqlTransaction,
     /// 25P03 — {detail}
     IdleInTransactionSessionTimeout,
     /// 2BP01 — cannot drop type {name} because other objects depend on it: {detail}
     DependentObjectsStillExist,
+    /// 3B001 — savepoint does not exist: {name}
+    InvalidSavepointSpecification,
     /// 38000 — host function {name} raised {detail}
     ExternalRoutineException,
     /// 42601 — syntax error: {detail}
@@ -268,9 +272,11 @@ impl SqlState {
             SqlState::ExclusionViolation => "23P01",
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::ReadOnlySqlTransaction => "25006",
+            SqlState::NoActiveSqlTransaction => "25P01",
             SqlState::InFailedSqlTransaction => "25P02",
             SqlState::IdleInTransactionSessionTimeout => "25P03",
             SqlState::DependentObjectsStillExist => "2BP01",
+            SqlState::InvalidSavepointSpecification => "3B001",
             SqlState::ExternalRoutineException => "38000",
             SqlState::SyntaxError => "42601",
             SqlState::InvalidName => "42602",
@@ -378,9 +384,11 @@ impl SqlState {
             "23P01" => Some(SqlState::ExclusionViolation),
             "25001" => Some(SqlState::ActiveSqlTransaction),
             "25006" => Some(SqlState::ReadOnlySqlTransaction),
+            "25P01" => Some(SqlState::NoActiveSqlTransaction),
             "25P02" => Some(SqlState::InFailedSqlTransaction),
             "25P03" => Some(SqlState::IdleInTransactionSessionTimeout),
             "2BP01" => Some(SqlState::DependentObjectsStillExist),
+            "3B001" => Some(SqlState::InvalidSavepointSpecification),
             "38000" => Some(SqlState::ExternalRoutineException),
             "42601" => Some(SqlState::SyntaxError),
             "42602" => Some(SqlState::InvalidName),
@@ -497,9 +505,11 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "23P01", name: "exclusion_violation", class: "integrity constraint violation" },
     ErrorDesc { code: "25001", name: "active_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25006", name: "read_only_sql_transaction", class: "invalid transaction state" },
+    ErrorDesc { code: "25P01", name: "no_active_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25P02", name: "in_failed_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25P03", name: "idle_in_transaction_session_timeout", class: "invalid transaction state" },
     ErrorDesc { code: "2BP01", name: "dependent_objects_still_exist", class: "dependent objects still exist" },
+    ErrorDesc { code: "3B001", name: "invalid_savepoint_specification", class: "invalid savepoint specification" },
     ErrorDesc { code: "38000", name: "external_routine_exception", class: "external routine exception" },
     ErrorDesc { code: "42601", name: "syntax_error", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42602", name: "invalid_name", class: "syntax error or access rule violation" },

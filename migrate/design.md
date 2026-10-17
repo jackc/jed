@@ -96,7 +96,7 @@ introduces **no new engine surface**.
   returning an `O(1)` `ScriptSummary { statements_run, rows_affected_total, cost }`. Run on an
   **already-open** transaction it **joins** that transaction (no wrapper, no auto-commit — the caller
   owns the boundary); a mid-script error stops the run and leaves the block `Failed` for the caller to
-  roll back. Crucially, an explicit `BEGIN`/`COMMIT`/`ROLLBACK` **inside** a script is rejected
+  roll back. Crucially, an explicit `BEGIN`/`COMMIT`/`ROLLBACK` (or a savepoint statement) **inside** a script is rejected
   `0A000 feature_not_supported` — which is exactly the guard we want: a migration file must not manage
   its own transactions, because the migrator owns that boundary (§6).
 

@@ -113,6 +113,9 @@ fn in_script_transaction_control_is_feature_not_supported() {
         "INSERT INTO t VALUES (1); COMMIT; INSERT INTO t VALUES (2)",
         "INSERT INTO t VALUES (1); BEGIN; INSERT INTO t VALUES (2)",
         "INSERT INTO t VALUES (1); ROLLBACK",
+        "INSERT INTO t VALUES (1); SAVEPOINT a; INSERT INTO t VALUES (2)",
+        "INSERT INTO t VALUES (1); ROLLBACK TO a",
+        "INSERT INTO t VALUES (1); RELEASE a",
     ] {
         let err = db.execute_script(script).err().unwrap();
         assert_eq!(err.code(), "0A000", "script: {script}");

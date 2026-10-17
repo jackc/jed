@@ -263,7 +263,9 @@ The reasoning, recorded here and in the override ledger:
   unchanged; PG's `s` keeps the advance. After a failed statement inside a transaction, same. Within a
   *committed* transaction the behavior is identical to PG (the advance persists, `currval` sees it).
   Two successful `nextval`s in autocommit also match PG (each commits). The divergence surfaces
-  **only** on rollback/abort.
+  **only** on rollback/abort — including `ROLLBACK TO` a savepoint ([transactions.md](transactions.md)
+  §11), which returns the counter and the session's `currval`/`lastval` to their values at the
+  savepoint, so the rolled-back values are handed out again (`transactions/savepoint_jed.test`).
 
 This makes the entire feature deterministic with no new seam: a sequence's value is a pure function of
 `(CREATE options, the committed sequence of nextval/setval calls)`, identical on every core.

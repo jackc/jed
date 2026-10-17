@@ -4,6 +4,7 @@
 //! check_lifetime_admission) — as Engine methods.
 
 use super::*;
+use crate::ast::SavepointOp;
 use crate::executor::dml::insert_default_needs;
 
 impl Engine {
@@ -685,6 +686,7 @@ impl Engine {
             Statement::Begin { writable } => return self.begin_tx(writable),
             Statement::Commit => return self.commit_tx(),
             Statement::Rollback => return self.rollback_tx(),
+            Statement::Savepoint { op, name } => return self.savepoint_stmt(op, &name),
             _ => {}
         }
         self.estimator_touched.clear();
@@ -754,18 +756,12 @@ impl Engine {
                 ),
             ));
         }
-        self.session.tx = Some(ActiveTx {
-            writable: true,
-            failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            working: self.committed.clone(),
-            saved_session_seq: self.session.session_seq.clone(),
-            saved_session_last_name: self.session.session_last_name.clone(),
-            temp_working: self.session.temp_committed.clone(),
-            main_dirty: false,
-            temp_dirty: false,
-            attach_working: HashMap::new(),
-            attach_dirty: HashSet::new(),
-        });
+        self.session.tx = Some(ActiveTx::open(
+            true,
+            self.committed.clone(),
+            self.session.temp_committed.clone(),
+            &self.session,
+        ));
         match self.dispatch_stmt_cached(stmt, params, insert_cache, true) {
             Ok(outcome) => {
                 // Enforce the post-statement budgets before committing: an over-budget implicit
@@ -813,18 +809,12 @@ impl Engine {
                 "cannot set transaction read-write mode on a read-only database",
             ));
         }
-        self.session.tx = Some(ActiveTx {
-            writable: writable.unwrap_or(!self.read_only),
-            failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            working: self.committed.clone(),
-            saved_session_seq: self.session.session_seq.clone(),
-            saved_session_last_name: self.session.session_last_name.clone(),
-            temp_working: self.session.temp_committed.clone(),
-            main_dirty: false,
-            temp_dirty: false,
-            attach_working: HashMap::new(),
-            attach_dirty: HashSet::new(),
-        });
+        self.session.tx = Some(ActiveTx::open(
+            writable.unwrap_or(!self.read_only),
+            self.committed.clone(),
+            self.session.temp_committed.clone(),
+            &self.session,
+        ));
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -1051,6 +1041,95 @@ impl Engine {
             cost: 0,
             rows_affected: None,
         })
+    }
+
+    /// `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (spec/design/transactions.md §11), PostgreSQL's
+    /// semantics:
+    ///
+    /// - With no open block every form is `25P01` (no_active_sql_transaction); there is no block to
+    ///   abort.
+    /// - In a failed block `SAVEPOINT` and `RELEASE` are `25P02`; `ROLLBACK TO` of an existing
+    ///   savepoint is the recovery path (it clears the failed state), and of an unknown one is
+    ///   `3B001`, leaving the block failed.
+    /// - In a clean block an unknown name is `3B001`, which — like any statement error inside a
+    ///   block — aborts it.
+    ///
+    /// Names shadow: `RELEASE`/`ROLLBACK TO` act on the newest savepoint of that name. `RELEASE`
+    /// destroys it and every later savepoint, keeping their changes; `ROLLBACK TO` restores the state
+    /// it marked and destroys every later savepoint but keeps it, so it can be rolled back to again.
+    pub(crate) fn savepoint_stmt(&mut self, op: SavepointOp, name: &str) -> Result<Outcome> {
+        let done = Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        });
+        let Some(tx) = self.session.tx.as_mut() else {
+            let what = match op {
+                SavepointOp::Define => "SAVEPOINT",
+                SavepointOp::Release => "RELEASE SAVEPOINT",
+                SavepointOp::RollbackTo => "ROLLBACK TO SAVEPOINT",
+            };
+            return Err(EngineError::new(
+                SqlState::NoActiveSqlTransaction,
+                format!("{what} can only be used in transaction blocks"),
+            ));
+        };
+        let failed = tx.is_failed();
+        if failed && op != SavepointOp::RollbackTo {
+            return Err(EngineError::new(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ));
+        }
+        let missing = || {
+            EngineError::new(
+                SqlState::InvalidSavepointSpecification,
+                format!("savepoint does not exist: {name}"),
+            )
+        };
+        match op {
+            SavepointOp::Define => {
+                let frame = SavepointFrame {
+                    name: name.to_string(),
+                    working: tx.working.clone(),
+                    temp_working: tx.temp_working.clone(),
+                    attach_working: tx.attach_working.clone(),
+                    main_dirty: tx.main_dirty,
+                    temp_dirty: tx.temp_dirty,
+                    attach_dirty: tx.attach_dirty.clone(),
+                    session_seq: self.session.session_seq.clone(),
+                    session_last_name: self.session.session_last_name.clone(),
+                };
+                tx.savepoints.push(frame);
+            }
+            SavepointOp::Release => {
+                let Some(at) = tx.find_savepoint(name) else {
+                    tx.mark_failed();
+                    return Err(missing());
+                };
+                tx.savepoints.truncate(at);
+            }
+            SavepointOp::RollbackTo => {
+                let Some(at) = tx.find_savepoint(name) else {
+                    // A clean block aborts; a failed one stays failed (PostgreSQL).
+                    tx.mark_failed();
+                    return Err(missing());
+                };
+                tx.savepoints.truncate(at + 1);
+                let frame = &tx.savepoints[at];
+                tx.working = frame.working.clone();
+                tx.temp_working = frame.temp_working.clone();
+                tx.attach_working = frame.attach_working.clone();
+                tx.main_dirty = frame.main_dirty;
+                tx.temp_dirty = frame.temp_dirty;
+                tx.attach_dirty = frame.attach_dirty.clone();
+                self.session.session_seq = frame.session_seq.clone();
+                self.session.session_last_name = frame.session_last_name.clone();
+                // Recovery: the block is usable again. The flag is cleared in place, so a cursor
+                // born earlier in the block still poisons it if its drain later fails.
+                tx.failed.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        done
     }
 
     /// Enforce the session's authorization envelope for `stmt` (spec/design/session.md §5.3).

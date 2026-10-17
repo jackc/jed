@@ -498,7 +498,10 @@ impl Engine {
         // bare-engine `query` a safe total seam (CLAUDE.md §13).
         if !matches!(
             ast,
-            Statement::Begin { .. } | Statement::Commit | Statement::Rollback
+            Statement::Begin { .. }
+                | Statement::Commit
+                | Statement::Rollback
+                | Statement::Savepoint { .. }
         ) && !self.stmt_is_write_with_views(ast)
         {
             if let Err(e) = self.gate_read_lanes(ast) {
@@ -590,7 +593,10 @@ impl Engine {
             // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
             if matches!(
                 ast,
-                Statement::Begin { .. } | Statement::Commit | Statement::Rollback
+                Statement::Begin { .. }
+                    | Statement::Commit
+                    | Statement::Rollback
+                    | Statement::Savepoint { .. }
             ) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,

@@ -1404,6 +1404,57 @@ pub(crate) struct ActiveTx {
     /// Which attachments this transaction mutated (exact names) — the per-attachment analogue of
     /// `main_dirty`/`temp_dirty`, the set the commit persists + publishes.
     attach_dirty: HashSet<String>,
+    /// The block's savepoints, oldest first (spec/design/transactions.md §11). `SAVEPOINT` pushes a
+    /// frame, `RELEASE` truncates to below the newest frame of that name, `ROLLBACK TO` restores the
+    /// newest frame of that name and truncates to just above it. Empty outside any savepoint.
+    savepoints: Vec<SavepointFrame>,
+}
+
+/// One savepoint's marked state (spec/design/transactions.md §11): every piece of the open
+/// transaction that a statement can change, captured at `SAVEPOINT`. The snapshots are persistent
+/// structures, so the copy is O(1) and shares every unchanged node with `working`. Restoring the
+/// snapshots restores the table/index roots, the catalog (DDL), sequences, statistics and estimator
+/// revisions, temp tables, attachment writes, and the staged pending-write bytes (memory.md §7) at
+/// once, because each of those is snapshot state.
+pub(crate) struct SavepointFrame {
+    name: String,
+    working: Snapshot,
+    temp_working: Snapshot,
+    attach_working: HashMap<String, Snapshot>,
+    main_dirty: bool,
+    temp_dirty: bool,
+    attach_dirty: HashSet<String>,
+    session_seq: HashMap<String, i64>,
+    session_last_name: Option<String>,
+}
+
+impl ActiveTx {
+    /// A fresh transaction over the given base snapshots (no savepoints, nothing dirty).
+    pub(crate) fn open(
+        writable: bool,
+        working: Snapshot,
+        temp_working: Snapshot,
+        session: &SessionState,
+    ) -> ActiveTx {
+        ActiveTx {
+            writable,
+            failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            working,
+            saved_session_seq: session.session_seq.clone(),
+            saved_session_last_name: session.session_last_name.clone(),
+            temp_working,
+            main_dirty: false,
+            temp_dirty: false,
+            attach_working: HashMap::new(),
+            attach_dirty: HashSet::new(),
+            savepoints: Vec::new(),
+        }
+    }
+
+    /// The index of the newest savepoint named exactly `name` (names shadow — PostgreSQL).
+    fn find_savepoint(&self, name: &str) -> Option<usize> {
+        self.savepoints.iter().rposition(|f| f.name == name)
+    }
 }
 
 impl ActiveTx {

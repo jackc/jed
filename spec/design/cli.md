@@ -205,8 +205,8 @@ sessions run in `UTC`, where the canonical render equals the session render the 
   `NULL`** (the engine's canonical rendering — a deliberate divergence from psql's blank
   cell, which is ambiguous against the empty string). Footers: query → `(N rows, cost C)`;
   DML without RETURNING → `OK, N rows (cost C)` (the engine's affected-row count, api.md
-  §4); other non-query statements → `OK (cost C)`; `BEGIN`/`COMMIT`/`ROLLBACK` → the bare
-  tag. **Cost is shown by default**: it is deterministic, reproducible, and a headline
+  §4); other non-query statements → `OK (cost C)`; `BEGIN`/`COMMIT`/`ROLLBACK` (`ROLLBACK TO`
+  included)/`SAVEPOINT`/`RELEASE` → the bare tag. **Cost is shown by default**: it is deterministic, reproducible, and a headline
   feature (§13) — wall-clock time is not printed at all in script mode (nondeterministic
   output breaks golden tests and diffs).
 - **`box`**: the `aligned` layout framed in Unicode box-drawing rules (`┌─┬─┐` / `├─┼─┤` /
@@ -267,10 +267,10 @@ tui-textarea) · **results grid** (bottom right) · **status bar** (bottom) · a
   DEFAULTs) — table → columns (`name type`, PK / NOT NULL markers), indexes (UNIQUE flag), CHECK
   names. Refreshed after any successful statement batch. Enter on a table name inserts it
   into the editor.
-- **Status bar**: db file path or `memory` · transaction state from `db.in_transaction()`
-  — `autocommit` / `TX` / `TX FAILED` (failed is CLI-tracked: set when a statement errors
-  while a transaction is open, cleared when the transaction ends; the engine's `25P02`
-  then explains itself) · `max_cost` when set.
+- **Status bar**: db file path or `memory` · transaction state from the session's
+  `status()` — `autocommit` / `TX` / `TX FAILED` (the engine's own Idle/Open/Failed, so a
+  `ROLLBACK TO` a savepoint shows the block recovered; the engine's `25P02` then explains a
+  failed block itself) · `max_cost` when set.
 - **History**: session statements persisted to `~/.jed_history` (override:
   `JED_HISTFILE`); `Ctrl+R` opens a pick-list, Enter loads the entry into the editor.
 - **Keys**: `Tab`/`Shift+Tab` cycle pane focus · `Esc` leaves the editor · `F1` (or `?`
