@@ -1772,3 +1772,94 @@ reason = "jed: a boolean DEFAULT for a RETURNING type other than boolean or i32 
 file = "json/json_behavior_default.test"
 sql = "SELECT JSON_VALUE(jsonb '{\"a\": 1}', '$.a' RETURNING i32 DEFAULT 1 / 0 ON EMPTY)"
 reason = "jed: a DEFAULT expression is evaluated only when its clause fires, so an unused `1 / 0` raises nothing and the item is returned. PostgreSQL's planner constant-folds an immutable DEFAULT expression, raising 22012 before execution whether or not the behavior fires. jed does no plan-time folding (a documented divergence, json-sql-functions.md §5.3)."
+
+# --- to_char on a date argument: jed has no implicit date->timestamp cast in function resolution
+# (the date_trunc rule), so there is no matching overload. PostgreSQL implicitly casts the date to
+# timestamptz and formats it.
+[[override]]
+file = "expr/to_char_datetime.test"
+sql = "SELECT to_char(date '2024-01-01', 'YYYY')"
+reason = "jed: to_char has no (date, text) overload — jed has no implicit date -> timestamp[tz] cast in function resolution (timezones.md §9.1, the date_trunc rule), so 42883; cast explicitly (::timestamp). PostgreSQL implicitly casts the date to timestamptz and returns 2024 (formatting.md §8)."
+
+# --- to_char(int4, '…V…') overflow: the live oracle is PostgreSQL 18.6, whose int4_to_char
+# multiplied by (int32) pow(10, n) in C int arithmetic, so an overflowing product wrapped (and a
+# 10^10 multiplier was an undefined float-to-int conversion). REL_18_STABLE commit ec434db1f49
+# ("Fix integer to_char() overflow with V format", in 18.7) multiplies through dtoi4 / int4mul, so
+# both overflows raise 22003 "integer out of range". jed follows the fixed code.
+[[override]]
+file = "expr/to_char_number.test"
+sql = "SELECT to_char(3::i32, '9V999999999')"
+reason = "jed follows PostgreSQL's fixed int4_to_char (REL_18_STABLE ec434db1f49, 18.7): 3 * 10^9 overflows int4, 22003. The 18.6 oracle wraps it to -1294967296 (formatting.md §6.3)."
+
+[[override]]
+file = "expr/to_char_number.test"
+sql = "SELECT to_char(1::i32, '9V9999999999')"
+reason = "jed follows PostgreSQL's fixed int4_to_char (REL_18_STABLE ec434db1f49, 18.7): the 10^10 multiplier does not fit int4 (dtoi4), 22003. The 18.6 oracle converts it with an undefined float-to-int cast and prints -2147483648 (formatting.md §6.3)."
+
+[[override]]
+file = "expr/to_char_number.test"
+sql = "SELECT to_char((-2147483648)::i32, '9V9')"
+reason = "jed follows PostgreSQL's fixed int4_to_char (REL_18_STABLE ec434db1f49, 18.7): -2147483648 * 10 overflows int4, 22003. The 18.6 oracle wraps it (formatting.md §6.3)."
+
+# --- to_char of a bare integer literal: jed types a context-free integer literal as i64
+# (types.md §6), PostgreSQL as int4, so the call takes int8_to_char rather than int4_to_char. The
+# two differ only in EEEE (int4 rounds the float8 half to even, int8 the numeric half away) and in
+# where V overflows.
+[[override]]
+file = "expr/to_char_number.test"
+sql = "SELECT '[' || to_char(125, '9.9EEEE') || ']'"
+reason = "jed: the bare literal 125 is i64 (types.md §6, the no-context default), so to_char takes PostgreSQL's int8 path, whose EEEE rounds through numeric half away from zero: 1.3e+02. PostgreSQL reads 125 as int4 and rounds through float8 half to even: 1.2e+02. Write 125::i32 for the int4 path (formatting.md §6.3)."
+
+# --- to_timestamp TZ with a zone ABBREVIATION: PostgreSQL resolves the letters against its
+# timezone_abbreviations table (and the session zone's own abbreviations); jed has no abbreviation
+# table yet (timezones.md §15, the deferred abbreviation-input decision), so a letter where TZ reads
+# a zone is 0A000. A numeric offset under TZ is read as OF, as in PostgreSQL.
+
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('2011-12-18 11:38 EST', 'YYYY-MM-DD HH12:MI TZ')"
+reason = "jed: a zone abbreviation under TZ is 0A000 — jed has no timezone_abbreviations table (timezones.md §15; formatting.md §5.4). PostgreSQL returns 2011-12-18 16:38:00+00."
+
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('2011-12-18 11:38 MSK', 'YYYY-MM-DD HH12:MI TZ')"
+reason = "jed: a zone abbreviation under TZ is 0A000 — jed has no timezone_abbreviations table (timezones.md §15; formatting.md §5.4). PostgreSQL returns 2011-12-18 07:38:00+00."
+
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('2011-12-18 00:00 LMT', 'YYYY-MM-DD HH24:MI TZ')"
+reason = "jed: a zone abbreviation under TZ is 0A000 — jed has no timezone_abbreviations table (timezones.md §15; formatting.md §5.4). PostgreSQL raises 22007 (LMT is not a known abbreviation under a UTC session)."
+
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('2011-12-18 11:38ESTFOO24', 'YYYY-MM-DD HH12:MITZFOOSS')"
+reason = "jed: a zone abbreviation under TZ is 0A000 — jed has no timezone_abbreviations table (timezones.md §15; formatting.md §5.4). PostgreSQL returns 2011-12-18 16:38:24+00."
+
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('2011-12-18 11:38 JUNK', 'YYYY-MM-DD HH12:MI TZ')"
+reason = "jed: a zone abbreviation under TZ is 0A000 — jed has no timezone_abbreviations table (timezones.md §15; formatting.md §5.4). PostgreSQL raises 22007 (an unknown abbreviation)."
+
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('2024 EST', 'YYYY TZ')"
+reason = "jed: a zone abbreviation under TZ is 0A000 — jed has no timezone_abbreviations table (timezones.md §15; formatting.md §5.4). PostgreSQL returns 2024-01-01 05:00:00+00."
+
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('2024 UTC', 'YYYY TZ')"
+reason = "jed: a zone abbreviation under TZ is 0A000 — jed has no timezone_abbreviations table (timezones.md §15; formatting.md §5.4). PostgreSQL returns 2024-01-01 00:00:00+00."
+
+# --- to_timestamp / to_date beyond PostgreSQL's datetime range: jed's timestamp range is the finite
+# int64 microseconds and its date range the finite int32 days (timestamp.md §1, date.md §1), wider
+# than PostgreSQL's 4714 BC lower bound, so a reading PG rejects as out of range can be a valid jed
+# value. (At the top PG's range is wider: year 294276 overflows jed's int64 microseconds — both 22008.)
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('-5', 'J')"
+reason = "jed: Julian day -5 is 4714-11-19 BC, inside jed's int64-microsecond timestamp range (timestamp.md §1, 'we own this range'). PostgreSQL's range starts at Julian day 0 (4714-11-24 BC), so it raises 22008 timestamp out of range."
+
+[[override]]
+file = "expr/to_timestamp.test"
+sql = "SELECT to_timestamp('294276-12-31', 'YYYY-MM-DD')"
+reason = "jed: year 294276 is past the end of jed's finite int64-microsecond timestamp range (about 294247 AD, timestamp.md §1), so 22008 timestamp out of range. PostgreSQL's 2000-epoch range reaches 294276-12-31 and returns it."

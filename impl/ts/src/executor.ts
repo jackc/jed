@@ -30982,6 +30982,16 @@ export type ScalarFuncName =
   // md5(text | bytea) → text — the MD5 digest as 32 lowercase hex digits; text hashes its UTF-8
   // bytes (§4).
   | "md5"
+  // to_char(x, template) → text — the data-type formatting renderers (formatting.md §3, §6) over a
+  // timestamp, a timestamptz (decomposed in the session zone), an interval, an integer (i16/i32 take
+  // PostgreSQL's int4 path, i64 the int8 path — the node's argWidth records which), a decimal, an
+  // f32, or an f64; the kernel dispatches on the operand value. A growth kernel (cost.md §8.1).
+  | "to_char"
+  // to_timestamp(text, template) → timestamptz; to_timestamp(f64) → timestamptz (Unix seconds);
+  // to_date(text, template) → date; to_number(text, template) → decimal (formatting.md §5, §7).
+  | "to_timestamp"
+  | "to_date"
+  | "to_number"
   // sha224/sha256/sha384/sha512(bytea) → bytea — the raw SHA-2 digest (§4).
   | "sha224"
   | "sha256"
@@ -37378,6 +37388,10 @@ export function resolveScalarFunc(
     rargs[1] = widenFloatTo(rargs[1]!, tys[1].ty, argWidth);
   } else if (tys.length >= 1 && tys[0].kind === "float") {
     argWidth = tys[0].ty;
+  } else if (func === "to_char" && tys[0]!.kind === "int") {
+    // PostgreSQL has int4 and int8 overloads of to_char (a smallint widens to int4); they differ
+    // in EEEE, so the integer width picks the kernel path (formatting.md §6).
+    argWidth = tys[0]!.ty;
   }
   const epoch = name === "date_part" &&
     rargs[0]?.kind === "constText" && rargs[0].value.toLowerCase() === "epoch";

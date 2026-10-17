@@ -3251,6 +3251,20 @@ pub(crate) enum ScalarFunc {
     /// per row; a date source WIDENS TO MIDNIGHT (the timestamp matrix applies — PG's own
     /// definition); a timestamptz source decomposes in the session zone.
     DatePart,
+    /// to_char(x, template) → text — PostgreSQL's data-type formatting renderer
+    /// (spec/design/formatting.md §3, §6) over timestamp / timestamptz / interval / decimal / float
+    /// and the int4 integer overload (i16 / i32); the overload is recovered from the value. A
+    /// growth kernel (cost.md §8.1); a timestamptz is decomposed in the session zone.
+    ToChar,
+    /// to_char(i64, template) → text — PostgreSQL's int8 overload (its EEEE goes through numeric).
+    ToCharInt8,
+    /// to_timestamp(text, template) → timestamptz (formatting.md §5), or to_timestamp(f64) →
+    /// timestamptz (Unix seconds); the arity picks the form.
+    ToTimestamp,
+    /// to_date(text, template) → date (formatting.md §5).
+    ToDate,
+    /// to_number(text, template) → decimal (formatting.md §7).
+    ToNumber,
     /// justify_hours / justify_days / justify_interval(interval) → interval — PostgreSQL's interval
     /// normalizers (spec/design/interval.md §5.1); a field beyond i32 traps 22008.
     JustifyHours,

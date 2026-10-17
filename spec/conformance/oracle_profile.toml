@@ -115,9 +115,11 @@ backslash_quote = "safe_encoding"
 # Timezone abbreviation table used when parsing/rendering zone abbreviations.
 timezone_abbreviations = "Default"
 
-# to_char/to_number formatting and the money type. jed implements NONE of those today (no to_char,
-# no to_number, no money), so these have no consumer in the oracle path — pinned to the
-# locale-independent C so they cannot acquire one silently.
+# to_char / to_timestamp / to_number formatting and the money type. jed has no locale and is DEFINED
+# as PostgreSQL under C here: TM renders the English names, and the number patterns D / G / L / S are
+# ".", ",", " ", "-"/"+" (spec/design/formatting.md §4). Load-bearing for suites/expr/to_char_*.test,
+# to_timestamp.test, and to_number.test — another value would change the oracle's answers. (jed has
+# no money type.)
 lc_numeric = "C"
 lc_time = "C"
 lc_monetary = "C"

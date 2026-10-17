@@ -2459,6 +2459,88 @@ impl RExpr {
                             }
                         }
                     }
+                    // to_char(x, template) → text (formatting.md §3, §6). A growth kernel: the
+                    // output is a bounded multiple of the template (cost.md §8.1), free over constant
+                    // operands. A timestamptz is decomposed in the session zone (one timezone unit).
+                    ScalarFunc::ToChar | ScalarFunc::ToCharInt8 => {
+                        let tmpl = match &vals[1] {
+                            Value::Text(t) => t.as_str(),
+                            _ => unreachable!("resolver restricts to_char's template to text"),
+                        };
+                        let text = match &vals[0] {
+                            Value::Timestamp(mc) => {
+                                crate::formatting::to_char_timestamp(*mc, tmpl)?
+                            }
+                            Value::Timestamptz(mc) => {
+                                let zr = env.exec.session.time_zone.clone();
+                                crate::formatting::to_char_timestamptz(*mc, &zr, tmpl, m)?
+                            }
+                            Value::Interval(iv) => crate::formatting::to_char_interval(iv, tmpl)?,
+                            Value::Int(n) => Some(crate::formatting_num::to_char_int(
+                                *n,
+                                matches!(func, ScalarFunc::ToCharInt8),
+                                tmpl,
+                            )?),
+                            Value::Decimal(d) => {
+                                Some(crate::formatting_num::to_char_decimal(d, tmpl)?)
+                            }
+                            Value::Float32(f) => {
+                                Some(crate::formatting_num::to_char_float(*f as f64, true, tmpl)?)
+                            }
+                            Value::Float64(f) => {
+                                Some(crate::formatting_num::to_char_float(*f, false, tmpl)?)
+                            }
+                            _ => unreachable!("resolver restricts to_char's source type"),
+                        };
+                        let out = match text {
+                            Some(t) => Value::Text(t),
+                            None => Value::Null,
+                        };
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
+                    // to_timestamp(text, template) → timestamptz (formatting.md §5): an offset-less
+                    // reading is interpreted in the session zone (one timezone unit). The one-argument
+                    // form is to_timestamp(f64): Unix-epoch seconds.
+                    ScalarFunc::ToTimestamp => {
+                        if vals.len() == 1 {
+                            let secs = match &vals[0] {
+                                Value::Float64(f) => *f,
+                                Value::Float32(f) => *f as f64,
+                                Value::Int(n) => *n as f64,
+                                _ => unreachable!("resolver restricts to_timestamp(x) to a float"),
+                            };
+                            return Ok(Value::Timestamptz(crate::formatting::to_timestamp_float(
+                                secs,
+                            )?));
+                        }
+                        match (&vals[0], &vals[1]) {
+                            (Value::Text(input), Value::Text(tmpl)) => {
+                                let zr = env.exec.session.time_zone.clone();
+                                Ok(Value::Timestamptz(crate::formatting::to_timestamp_text(
+                                    input, tmpl, &zr, m,
+                                )?))
+                            }
+                            _ => unreachable!("resolver restricts to_timestamp to (text, text)"),
+                        }
+                    }
+                    ScalarFunc::ToDate => match (&vals[0], &vals[1]) {
+                        (Value::Text(input), Value::Text(tmpl)) => {
+                            Ok(Value::Date(crate::formatting::to_date_text(input, tmpl)?))
+                        }
+                        _ => unreachable!("resolver restricts to_date to (text, text)"),
+                    },
+                    ScalarFunc::ToNumber => match (&vals[0], &vals[1]) {
+                        (Value::Text(input), Value::Text(tmpl)) => {
+                            match crate::formatting_num::to_number_text(input, tmpl, m)? {
+                                Some(d) => Ok(Value::Decimal(d)),
+                                None => Ok(Value::Null),
+                            }
+                        }
+                        _ => unreachable!("resolver restricts to_number to (text, text)"),
+                    },
                     // interval normalizers (spec/design/interval.md §5.1). The NULL-input case is
                     // already handled above.
                     ScalarFunc::JustifyHours

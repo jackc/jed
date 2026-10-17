@@ -35,6 +35,8 @@ const (
 	InvalidDatetimeFormat
 	// DatetimeFieldOverflow is 22008 — date/time field value out of range: {detail}.
 	DatetimeFieldOverflow
+	// InvalidTimeZoneDisplacementValue is 22009 — time zone displacement out of range: {detail}.
+	InvalidTimeZoneDisplacementValue
 	// DivisionByZero is 22012 — division by zero.
 	DivisionByZero
 	// InvalidArgumentForNtile is 22014 — argument of ntile must be greater than zero.
@@ -252,6 +254,8 @@ func (s SqlState) Code() string {
 		return "22007"
 	case DatetimeFieldOverflow:
 		return "22008"
+	case InvalidTimeZoneDisplacementValue:
+		return "22009"
 	case DivisionByZero:
 		return "22012"
 	case InvalidArgumentForNtile:
@@ -470,6 +474,7 @@ var errorDescs = []errorDesc{
 	{Code: "22004", Name: "null_value_not_allowed", Class: "data exception"},
 	{Code: "22007", Name: "invalid_datetime_format", Class: "data exception"},
 	{Code: "22008", Name: "datetime_field_overflow", Class: "data exception"},
+	{Code: "22009", Name: "invalid_time_zone_displacement_value", Class: "data exception"},
 	{Code: "22012", Name: "division_by_zero", Class: "data exception"},
 	{Code: "22014", Name: "invalid_argument_for_ntile", Class: "data exception"},
 	{Code: "22016", Name: "invalid_argument_for_nth_value", Class: "data exception"},

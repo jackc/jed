@@ -20,6 +20,7 @@ export type SqlState =
   | "null_value_not_allowed" // 22004 — {detail}
   | "invalid_datetime_format" // 22007 — invalid input syntax for type {type}: {detail}
   | "datetime_field_overflow" // 22008 — date/time field value out of range: {detail}
+  | "invalid_time_zone_displacement_value" // 22009 — time zone displacement out of range: {detail}
   | "division_by_zero" // 22012 — division by zero
   | "invalid_argument_for_ntile" // 22014 — argument of ntile must be greater than zero
   | "invalid_argument_for_nth_value" // 22016 — argument of nth_value must be greater than zero
@@ -128,6 +129,7 @@ const CODES: Record<SqlState, string> = {
   null_value_not_allowed: "22004",
   invalid_datetime_format: "22007",
   datetime_field_overflow: "22008",
+  invalid_time_zone_displacement_value: "22009",
   division_by_zero: "22012",
   invalid_argument_for_ntile: "22014",
   invalid_argument_for_nth_value: "22016",
@@ -252,6 +254,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "22004", name: "null_value_not_allowed", class: "data exception" },
   { code: "22007", name: "invalid_datetime_format", class: "data exception" },
   { code: "22008", name: "datetime_field_overflow", class: "data exception" },
+  { code: "22009", name: "invalid_time_zone_displacement_value", class: "data exception" },
   { code: "22012", name: "division_by_zero", class: "data exception" },
   { code: "22014", name: "invalid_argument_for_ntile", class: "data exception" },
   { code: "22016", name: "invalid_argument_for_nth_value", class: "data exception" },

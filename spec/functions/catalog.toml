@@ -3130,6 +3130,133 @@ null           = "propagates"
 errors         = ["22023", "0A000"]
 volatility     = "immutable"
 
+# --- data-type formatting functions --------------------------------------------
+# PostgreSQL's template-driven formatting surface (../design/formatting.md): to_char renders a
+# datetime, interval, or number through a template; to_timestamp / to_date / to_number parse text
+# through one. The template vocabulary is shared data (../types/formatting.toml); the processors
+# are hand-written per core as transcriptions of PostgreSQL 18's formatting.c. jed has no locale, so
+# every locale-dependent piece behaves as PostgreSQL does under the C locale the oracle pins (TM
+# names are the English names; D, G, L, S, MI, PL are ".", ",", " ", "-", "+").
+#
+# Volatility is jed's per-operation rule (../design/index-dependencies.md), not PostgreSQL's blanket
+# STABLE (which exists for lc_numeric / lc_time): an overload that reads only its arguments is
+# immutable; to_char(timestamptz, …) decomposes in the session zone and to_timestamp(text, text)
+# reads an offset-less input in it, so those two are stable. An empty template makes the datetime
+# to_char NULL and the number to_char '' (PostgreSQL). NULL propagates.
+[[operator]]
+name           = "to_char"
+kind           = "function"
+arity          = 2
+arg_families   = ["timestamp", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22007", "22P02"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "to_char"
+kind           = "function"
+arity          = 2
+arg_families   = ["timestamptz", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22007", "22008", "22P02"]
+volatility     = "stable"
+
+[[operator]]
+name           = "to_char"
+kind           = "function"
+arity          = 2
+arg_families   = ["interval", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22007", "22P02"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "to_char"
+kind           = "function"
+arity          = 2
+arg_families   = ["integer", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["42601", "22003", "22P02"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "to_char"
+kind           = "function"
+arity          = 2
+arg_families   = ["decimal", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["42601", "22003", "22P02"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "to_char"
+kind           = "function"
+arity          = 2
+arg_families   = ["float", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["42601", "22P02"]
+volatility     = "immutable"
+
+# to_timestamp(text, template) → timestamptz: an input without TZH/TZM/OF/TZ is read in the session
+# zone (stable). to_date reads no zone. 22009 is a TZH/TZM displacement past ±15:59.
+[[operator]]
+name           = "to_timestamp"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+errors         = ["22007", "22008", "22009", "0A000"]
+volatility     = "stable"
+
+[[operator]]
+name           = "to_date"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "date"
+null           = "propagates"
+errors         = ["22007", "22008", "0A000"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "to_number"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["42601", "22P02", "22003", "0A000"]
+volatility     = "immutable"
+
+# to_timestamp(seconds) → timestamptz: Unix epoch seconds, PostgreSQL's float8_timestamptz (±Infinity
+# give ±infinity; NaN or a value past the timestamp range is 22008).
+[[operator]]
+name           = "to_timestamp"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "immutable"
+
 # --- uuid functions (extractors) ---------------------------------------------
 # PURE inspectors of a uuid's bits (../design/functions.md §12), oracle-checked against
 # PostgreSQL 18. Both gate on the RFC 4122 variant ((b[8] & 0xC0) == 0x80) and return NULL on

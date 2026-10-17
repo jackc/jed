@@ -411,6 +411,15 @@ does not use the text: it is a jsonpath number by `float8_numeric` / `float4_num
 `%.6g` of the exact value), and NaN/±Infinity, numeric NaN/Infinity items in PostgreSQL, are a
 deferred `0A000` because jed's `decimal` is finite.
 
+### 9.2 Floats in `to_char`
+
+`to_char(f32 | f64, template)` does not use the §9 text either: PostgreSQL's `float4_to_char` /
+`float8_to_char` format with C `printf` (`"%.*f"`, `"%+.*e"`) at a template-chosen precision capped
+at `FLT_DIG` / `DBL_DIG` significant digits. jed reproduces those conversions from the float's
+exact decimal expansion (§6), rounded half to even as glibc does, with PostgreSQL's own `snprintf`
+spellings `NaN` / `Infinity` — pure integer digit arithmetic, so the result is in contract and
+byte-identical across cores ([formatting.md](formatting.md) §6.3).
+
 ## 10. On-disk, keys, and cost
 
 - **On-disk value codec** — stable **type code 12** (`f64`, 8 bytes) and **13** (`f32`,

@@ -3416,6 +3416,54 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return ByteaValue(r), nil
+		case sfToCharTimestamp, sfToCharTimestamptz, sfToCharInterval, sfToCharInt4, sfToCharInt8,
+			sfToCharDecimal, sfToCharFloat4, sfToCharFloat8:
+			// to_char(x, template) → text (formatting.md §3, §6). A growth kernel: the output is a
+			// bounded multiple of the template (cost.md §8.1). A timestamptz is decomposed in the
+			// session zone (one timezone unit).
+			var out Value
+			var err error
+			tmpl := vals[1].str()
+			switch e.sfunc {
+			case sfToCharTimestamp:
+				out, err = toCharTimestamp(vals[0].Int, tmpl)
+			case sfToCharTimestamptz:
+				out, err = toCharTimestamptz(vals[0].Int, env.exec.session.timeZone, tmpl, m)
+			case sfToCharInterval:
+				out, err = toCharInterval(vals[0].interval(), tmpl)
+			case sfToCharInt4, sfToCharInt8:
+				out, err = toCharInt(vals[0].Int, e.sfunc == sfToCharInt8, tmpl)
+			case sfToCharDecimal:
+				out, err = toCharDecimal(*vals[0].decimal(), tmpl)
+			default:
+				out, err = toCharFloat(vals[0].asF64(), e.sfunc == sfToCharFloat4, tmpl)
+			}
+			if err != nil {
+				return Value{}, err
+			}
+			return growthResult(m, e.sargs, out)
+		case sfToTimestamp:
+			// to_timestamp(text, template) → timestamptz (formatting.md §5): an offset-less reading is
+			// interpreted in the session zone (one timezone unit).
+			inst, err := toTimestampText(vals[0].str(), vals[1].str(), env.exec.session.timeZone, m)
+			if err != nil {
+				return Value{}, err
+			}
+			return TimestamptzValue(inst), nil
+		case sfToDate:
+			d, err := toDateText(vals[0].str(), vals[1].str())
+			if err != nil {
+				return Value{}, err
+			}
+			return DateValue(d), nil
+		case sfToNumber:
+			return toNumberText(vals[0].str(), vals[1].str(), m)
+		case sfToTimestampEpoch:
+			inst, err := toTimestampFloat(vals[0].asF64())
+			if err != nil {
+				return Value{}, err
+			}
+			return TimestamptzValue(inst), nil
 		case sfMd5:
 			// md5(text | bytea) → text — 32 lowercase hex digits. Text is held as UTF-8 and bytea as
 			// raw bytes, both in Str, so one kernel serves both overloads.

@@ -164,6 +164,30 @@ test('the types page autoruns the bytea digest demo', async ({ page }) => {
   await expect(rows).toContainText('64');
 });
 
+test('the types page autoruns the to_char demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // to_char over a timestamp (FM, TH, AM), an ISO week, an interval, grouping, PR, and RN.
+  const panel = livePanel(page, 'toCharDemo');
+  const rows = panel.getByTestId('result-rows');
+  await expect(rows).toContainText('Tuesday, 5th March 2024 01:04 PM');
+  await expect(rows).toContainText('2024-W10-2');
+  await expect(rows).toContainText('26:05');
+  await expect(rows).toContainText('1,234,567.89');
+  await expect(rows).toContainText('<42.5>');
+  await expect(rows).toContainText('MCMLXXXVII');
+});
+
+test('the types page autoruns the template parsing demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // to_timestamp with and without an offset, to_date by day of year, to_number, and epoch seconds.
+  const panel = livePanel(page, 'parseDemo');
+  const rows = panel.getByTestId('result-rows');
+  await expect(rows).toContainText('2024-03-05 13:04:00+00');
+  await expect(rows).toContainText('2024-03-05 07:34:00+00');
+  await expect(rows).toContainText('-1234.56');
+  await expect(rows).toContainText('2023-11-14 22:13:20+00');
+});
+
 test('the types page autoruns the array cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and

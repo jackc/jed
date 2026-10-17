@@ -44,6 +44,11 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   `DEFAULT`, expression or partial index) that this binary's parser rejects, as when a newer jed wrote
   it: the load keeps the object unparsed and byte-for-byte, only statements that need it fail with
   `XX003`, reads skip such an index, and every drop works.
+- [formatting.md](formatting.md) — PostgreSQL's data-type formatting functions (`to_char` over
+  datetimes, intervals, and numbers; `to_timestamp`, `to_date`, `to_number`): `formatting.c`
+  transcribed byte for byte over UTF-8, the template vocabulary as shared codegen'd data, C-locale
+  behavior with no locale, C `printf` reproduced from a float's exact value, and the ledgered
+  divergences.
 - [timezones.md](timezones.md) — time zones for `timestamptz` (design decided, not yet built):
   the **host-loaded `JTZ` bundle** (manifest + per-zone **RFC 8536 TZif** sections + alias links,
   byte format in [../tz/README.md](../tz/README.md)), the privileged `LoadTimeZoneData` environment-builder seam, the

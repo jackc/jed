@@ -313,6 +313,14 @@ impl Decimal {
         (self.neg, mag_from_decimal_str(&digits), scale)
     }
 
+    /// The value-canonical form as `(neg, coefficient digits, scale)` — the coefficient as a decimal
+    /// digit string without leading zeros (`"0"` for zero), trailing fractional zeros stripped. Used
+    /// by the number formatter (formatting.md §6), which lays out digits rather than limbs.
+    pub(crate) fn canonical_digits(&self) -> (bool, String, u32) {
+        let (neg, limbs, scale) = self.canonical();
+        (neg, mag_to_decimal_str(&limbs), scale)
+    }
+
     /// Total order over finite decimals by value (sign then scale-aligned magnitude).
     pub fn cmp_value(&self, other: &Decimal) -> std::cmp::Ordering {
         use std::cmp::Ordering;

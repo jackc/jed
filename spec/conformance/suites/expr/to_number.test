@@ -1,0 +1,356 @@
+# to_number(text, template) → decimal (spec/design/formatting.md §7; PostgreSQL's "Data Type
+# Formatting Functions", manual §9.8): digits read under 9 / 0 / . / D, grouping skipped under
+# , / G, signs before or after the digits (S / MI / PL / SG / PR), L, TH, RN, V, and the result
+# as numeric(precision, scale) of the digits read. Most shapes come from PostgreSQL's numeric
+# regression test. PostgreSQL-oracle-verified (postgres:18, lc_numeric = C).
+# requires: query.select, query.select_no_from, query.set_returning, query.aggregates, types.i32, types.text, types.decimal, func.to_char, func.to_number
+
+query D nosort
+SELECT to_number('-34,338,492', '99G999G999')
+----
+-34338492
+
+query D nosort
+SELECT to_number('-34,338,492.654,878', '99G999G999D999G999')
+----
+-34338492.654878
+
+query D nosort
+SELECT to_number('<564646.654564>', '999999.999999PR')
+----
+-564646.654564
+
+query D nosort
+SELECT to_number('0.00001-', '9.999999S')
+----
+-0.00001
+
+query D nosort
+SELECT to_number('5.01-', 'FM9.999999S')
+----
+-5.01
+
+query D nosort
+SELECT to_number('5.01-', 'FM9.999999MI')
+----
+-5.01
+
+query D nosort
+SELECT to_number('5 4 4 4 4 8 . 7 8', '9 9 9 9 9 9 . 9 9')
+----
+544448.78
+
+query D nosort
+SELECT to_number('.01', 'FM9.99')
+----
+0.01
+
+query D nosort
+SELECT to_number('.0', '99999999.99999999')
+----
+0.0
+
+query D nosort
+SELECT to_number('0', '99.99')
+----
+0
+
+query D nosort
+SELECT to_number('.-01', 'S99.99')
+----
+-0.01
+
+query D nosort
+SELECT to_number('.01-', '99.99S')
+----
+-0.01
+
+query D nosort
+SELECT to_number(' . 0 1-', ' 9 9 . 9 9 S')
+----
+-0.01
+
+query D nosort
+SELECT to_number('34,50','999,99')
+----
+3450
+
+query D nosort
+SELECT to_number('123,000','999G')
+----
+123
+
+query D nosort
+SELECT to_number('123456','999G999')
+----
+123456
+
+query D nosort
+SELECT to_number('$1234.56','L9,999.99')
+----
+1234.56
+
+query D nosort
+SELECT to_number('$1234.56','L99,999.99')
+----
+1234.56
+
+query D nosort
+SELECT to_number('$1,234.56','L99,999.99')
+----
+1234.56
+
+query D nosort
+SELECT to_number('1234.56','L99,999.99')
+----
+1234.56
+
+query D nosort
+SELECT to_number('1,234.56','L99,999.99')
+----
+1234.56
+
+query D nosort
+SELECT to_number('42nd', '99th')
+----
+42
+
+query D nosort
+SELECT to_number('123456', '99999V99')
+----
+1234.560000000000000000
+
+query D nosort
+SELECT to_number('CvIiI', 'rn')
+----
+108
+
+query D nosort
+SELECT to_number('MMXX  ', 'RN')
+----
+2020
+
+query D nosort
+SELECT to_number('  XIV', '  RN')
+----
+14
+
+query D nosort
+SELECT to_number('  XIV  ', '  RN')
+----
+14
+
+query D nosort
+SELECT to_number('M CC', 'RN')
+----
+1000
+
+statement error 22P02
+SELECT to_number('viv', 'RN')
+
+statement error 22P02
+SELECT to_number('DCCCD', 'RN')
+
+statement error 22P02
+SELECT to_number('XIXL', 'RN')
+
+statement error 22P02
+SELECT to_number('MCCM', 'RN')
+
+statement error 22P02
+SELECT to_number('MMMM', 'RN')
+
+statement error 22P02
+SELECT to_number('VV', 'RN')
+
+statement error 22P02
+SELECT to_number('IL', 'RN')
+
+statement error 22P02
+SELECT to_number('VIX', 'RN')
+
+statement error 22P02
+SELECT to_number('LXC', 'RN')
+
+statement error 22P02
+SELECT to_number('DCM', 'RN')
+
+statement error 22P02
+SELECT to_number('MMMDCM', 'RN')
+
+statement error 22P02
+SELECT to_number('CLXC', 'RN')
+
+statement error 42601
+SELECT to_number('CM', 'MIRN')
+
+statement error 42601
+SELECT to_number('CM', 'RNRN')
+
+statement error 22P02
+SELECT to_number('qiv', 'RN')
+
+statement error 22P02
+SELECT to_number('', 'RN')
+
+statement error 22P02
+SELECT to_number(' ', 'RN')
+
+query D nosort
+SELECT to_number('12.34', '99.99')
+----
+12.34
+
+query D nosort
+SELECT to_number('12.3', '99.99')
+----
+12.3
+
+query D nosort
+SELECT to_number('12', '99.99')
+----
+12
+
+query D nosort
+SELECT to_number('12.345', '99.99')
+----
+12.34
+
+query D nosort
+SELECT to_number('1234', '99')
+----
+12
+
+statement error 22003
+SELECT to_number('5', '.')
+
+query D nosort
+SELECT to_number('-12', '99')
+----
+-12
+
+query D nosort
+SELECT to_number('12-', '99MI')
+----
+-12
+
+query D nosort
+SELECT to_number('12+', '99PL')
+----
+12
+
+query D nosort
+SELECT to_number('+12', 'SG99')
+----
+12
+
+query D nosort
+SELECT to_number('<12>', '99PR')
+----
+-12
+
+statement error 22P02
+SELECT to_number('abc', '999')
+
+statement error 22P02
+SELECT to_number('', '999')
+
+query D nosort
+SELECT to_number('1 2 3', '9 9 9')
+----
+123
+
+statement error 0A000
+SELECT to_number('1.5e3', '9.9EEEE')
+
+query D nosort
+SELECT to_number('12', '')
+----
+NULL
+
+query D nosort
+SELECT to_number(NULL, '99')
+----
+NULL
+
+query D nosort
+SELECT to_number('12', NULL)
+----
+NULL
+
+query D nosort
+SELECT to_number('0012', '0099')
+----
+12
+
+statement error 42601
+SELECT to_number('12', '9.9.9')
+
+query D nosort
+SELECT to_number('1,234,567', '9,999,999')
+----
+1234567
+
+query D nosort
+SELECT to_number('1234567', 'FM9,999,999')
+----
+1234567
+
+query D nosort
+SELECT to_number('$ 12.50', 'L99.99')
+----
+12.50
+
+statement error 22P02
+SELECT to_number('12', 'RN')
+
+query D nosort
+SELECT to_number('mmxxiv', 'rn')
+----
+2024
+
+query D nosort
+SELECT to_number('MMXXIV', 'FMRN')
+----
+2024
+
+query D nosort
+SELECT to_number('123', '99V9')
+----
+12.30000000000000000
+
+query D nosort
+SELECT to_number('12345', '9V9999')
+----
+1.23450000000000000000
+
+query D nosort
+SELECT to_number('-1.5', 'S9.9')
+----
+-1.5
+
+query D nosort
+SELECT to_number('1.5-', '9.9S')
+----
+-1.5
+
+query D nosort
+SELECT to_number('7th', '9th')
+----
+7
+
+query D nosort
+SELECT to_number('  42', '9999')
+----
+42
+
+# every Roman numeral round-trips through to_char and to_number
+query B nosort
+SELECT bool_and(to_number(to_char(i::i32, 'RN'), 'RN') = i) FROM generate_series(1, 3999) AS g(i)
+----
+true
+
+query I nosort
+SELECT count(*) FROM generate_series(1, 3999) AS g(i) WHERE to_number(to_char(i::i32, 'FMrn'), 'rn') <> i
+----
+0

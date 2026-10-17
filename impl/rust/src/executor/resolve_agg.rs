@@ -727,6 +727,12 @@ pub(crate) fn scalar_func_id(name: &str) -> ScalarFunc {
         "make_date" => ScalarFunc::MakeDate,
         "current_date" => ScalarFunc::CurrentDate,
         "date_part" => ScalarFunc::DatePart,
+        // data-type formatting (formatting.md); to_char's int8 overload is refined by its
+        // argument type in adopt_scalar_overload.
+        "to_char" => ScalarFunc::ToChar,
+        "to_timestamp" => ScalarFunc::ToTimestamp,
+        "to_date" => ScalarFunc::ToDate,
+        "to_number" => ScalarFunc::ToNumber,
         // interval normalizers (interval.md §5.1).
         "justify_hours" => ScalarFunc::JustifyHours,
         "justify_days" => ScalarFunc::JustifyDays,

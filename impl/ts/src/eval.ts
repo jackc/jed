@@ -12,6 +12,15 @@ import type { ThreeValued, Value } from "./value.ts";
 import { resolveUnfetchedSelf } from "./format.ts";
 import { md5Hex, sha2Digest } from "./digest.ts";
 import {
+  toCharInterval,
+  toCharTimestamp,
+  toCharTimestamptz,
+  toDateText,
+  toTimestampFloat,
+  toTimestampText,
+} from "./formatting.ts";
+import { toCharDecimal, toCharFloat, toCharInt, toNumberText } from "./formatting_num.ts";
+import {
   arrayOutZoned,
   arrayValue,
   boolAnd,
@@ -2019,6 +2028,42 @@ function evalScalarFuncNode(e: Of<"scalarFunc">, row: Row, env: EvalEnv, m: Mete
     const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
     const n = (vals[1] as { int: bigint }).int;
     return byteaValue(setBit(bytes, n, (vals[2] as { int: bigint }).int));
+  }
+  if (e.func === "to_char") {
+    // to_char(x, template) → text (formatting.md §3, §6), the kernel picked by the operand. A growth
+    // kernel: the output is a bounded multiple of the template (cost.md §8.1). A timestamptz is
+    // decomposed in the session zone (one timezone unit). An empty datetime template is NULL.
+    const v = vals[0]!;
+    const tmpl = (vals[1] as { text: string }).text;
+    let out: string | null;
+    if (v.kind === "timestamp") out = toCharTimestamp(v.micros, tmpl);
+    else if (v.kind === "timestamptz") {
+      out = toCharTimestamptz(v.micros, env.exec.session.timeZone, tmpl, m);
+    } else if (v.kind === "interval") out = toCharInterval(v.iv, tmpl);
+    else if (v.kind === "int") out = toCharInt(v.int, e.argWidth === "i64", tmpl);
+    else if (v.kind === "decimal") out = toCharDecimal(v.dec, tmpl);
+    else if (v.kind === "f32" || v.kind === "f64") {
+      out = toCharFloat(v.value, v.kind === "f32", tmpl);
+    } else throw new Error("unreachable: resolver restricts to_char's operand");
+    return growthResult(m, e.args, out === null ? nullValue() : textValue(out));
+  }
+  if (e.func === "to_timestamp") {
+    // to_timestamp(text, template) → timestamptz (formatting.md §5): an offset-less reading is
+    // interpreted in the session zone (one timezone unit). to_timestamp(f64) reads Unix seconds.
+    const v = vals[0]!;
+    if (v.kind === "f32" || v.kind === "f64") return timestamptzValue(toTimestampFloat(v.value));
+    const input = (v as { text: string }).text;
+    const tmpl = (vals[1] as { text: string }).text;
+    return timestamptzValue(toTimestampText(input, tmpl, env.exec.session.timeZone, m));
+  }
+  if (e.func === "to_date") {
+    const input = (vals[0] as { text: string }).text;
+    return dateValue(toDateText(input, (vals[1] as { text: string }).text));
+  }
+  if (e.func === "to_number") {
+    const input = (vals[0] as { text: string }).text;
+    const d = toNumberText(input, (vals[1] as { text: string }).text, m);
+    return d === null ? nullValue() : decimalValue(d);
   }
   if (e.func === "md5") {
     // md5(text | bytea) → text — 32 lowercase hex digits; text hashes its UTF-8 bytes.

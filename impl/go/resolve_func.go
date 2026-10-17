@@ -498,6 +498,35 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfSetBit
 	case "md5":
 		return sfMd5
+	case "to_char":
+		switch tys[0].kind {
+		case rtTimestamp:
+			return sfToCharTimestamp
+		case rtTimestamptz:
+			return sfToCharTimestamptz
+		case rtInterval:
+			return sfToCharInterval
+		case rtDecimal:
+			return sfToCharDecimal
+		case rtFloat32:
+			return sfToCharFloat4
+		case rtFloat64:
+			return sfToCharFloat8
+		}
+		// PostgreSQL has int4 and int8 overloads (a smallint widens to int4); they differ in EEEE.
+		if tys[0].intTy == scalarInt64 {
+			return sfToCharInt8
+		}
+		return sfToCharInt4
+	case "to_timestamp":
+		if len(tys) == 1 {
+			return sfToTimestampEpoch
+		}
+		return sfToTimestamp
+	case "to_date":
+		return sfToDate
+	case "to_number":
+		return sfToNumber
 	case "sha224":
 		return sfSha224
 	case "sha256":

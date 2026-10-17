@@ -1,0 +1,97 @@
+# Output-constructing kernels (spec/design/cost.md §8.1): to_char is a growth kernel. Its output is a
+# bounded multiple of its template (at most 13 bytes per template byte: J, SSSS, and an interval's HH
+# expand), so it charges scalar_byte × the rendered UTF-8 bytes after rendering, never reserves the
+# scalar allowance, and is free over constant operands. A timestamptz is decomposed in the session
+# zone (one timezone unit); to_timestamp reads an offset-less input in it (one timezone unit) and
+# builds a fixed-size value, so it charges no output bytes; nor does to_number or to_date.
+# jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, types.i32, types.text, types.timestamp, types.timestamptz, types.decimal, resource.cost_metering, resource.cost_limit, func.to_char, func.to_timestamp, func.to_number
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp, tz timestamptz, n decimal, s text)
+
+statement ok
+INSERT INTO t VALUES (1, '2024-03-05 13:04:05', '2024-03-05 13:04:05+00', 1234.5, '2024-03-05')
+
+# The baseline scan for the column cases below.
+# cost: 3
+query I nosort
+SELECT id FROM t
+----
+1
+
+# to_char charges its 10 rendered bytes over its operator_eval.
+# cost: 14
+query T nosort
+SELECT to_char(ts, 'YYYY-MM-DD') FROM t
+----
+2024-03-05
+
+# A timestamptz adds the session-zone lookup: 4 bytes, one operator_eval, one timezone unit.
+# cost: 9
+query T nosort
+SELECT to_char(tz, 'YYYY') FROM t
+----
+2024
+
+# A number: '1,234.5' is 7 bytes.
+# cost: 11
+query T nosort
+SELECT to_char(n, 'FM9,999.99') FROM t
+----
+1,234.5
+
+# The template, too, may be computed from a column: J expands one template byte to seven (the
+# substr and the || charge their own evaluation and the || its one output byte).
+# cost: 14
+query T nosort
+SELECT to_char(ts, substr(s, 1, 0) || 'J') FROM t
+----
+2460375
+
+# Constant operands are free.
+# cost: 2
+query T nosort
+SELECT to_char(timestamp '2024-03-05 13:04:05', 'YYYY-MM-DD')
+----
+2024-03-05
+
+# An empty template's NULL charges nothing.
+# cost: 4
+query T nosort
+SELECT to_char(ts, '') FROM t
+----
+NULL
+
+# to_timestamp: one operator_eval and, with no offset in the input, one timezone unit.
+# cost: 5
+query T nosort
+SELECT to_timestamp(s, 'YYYY-MM-DD') FROM t
+----
+2024-03-05 00:00:00+00
+
+# An explicit offset reads no zone (the || charges its evaluation and its 14 output bytes).
+# cost: 19
+query T nosort
+SELECT to_timestamp(s || ' +02', 'YYYY-MM-DD TZH') FROM t
+----
+2024-03-04 22:00:00+00
+
+# to_date and to_number charge only their operator_eval.
+# cost: 4
+query T nosort
+SELECT to_date(s, 'YYYY-MM-DD') FROM t
+----
+2024-03-05
+
+# cost: 4
+query D nosort
+SELECT to_number(s, '9999') FROM t
+----
+2024
+
+# A recursive chain feeding to_char's output back as its template grows it (Day renders 9 bytes for
+# 3), so the per-byte charge lets the cost ceiling stop it.
+# max_cost: 100000
+statement error 54P01
+WITH RECURSIVE r(n, f) AS (SELECT 1, 'Day' UNION ALL SELECT n + 1, to_char(timestamp '2024-03-06', f) || f FROM r WHERE n < 60) SELECT max(length(f)) FROM r

@@ -100,6 +100,14 @@ name = "datetime_field_overflow"
 class = "data exception"
 template = "date/time field value out of range: {detail}"
 
+# A to_timestamp TZH / TZM / OF zone displacement outside ±15:59 (../design/formatting.md §5).
+# PostgreSQL's code.
+[[error]]
+code = "22009"
+name = "invalid_time_zone_displacement_value"
+class = "data exception"
+template = "time zone displacement out of range: {detail}"
+
 [[error]]
 code = "22012"
 name = "division_by_zero"

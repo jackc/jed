@@ -337,9 +337,11 @@ exactly as PostgreSQL does. Each is oracle-checked against `postgres:18` (CLAUDE
 **Already built** (clock seam, [entropy.md §5](entropy.md)): `now()` / `current_timestamp` (STABLE),
 `clock_timestamp()` (VOLATILE) → `timestamptz`.
 
-**Still deferred** (each oracle-checked against PG when it lands, CLAUDE.md §7): `to_char` /
-`to_timestamp` (a parsing/formatting surface, a different axis from "in a zone").
-**`age`** has landed ([interval.md](interval.md) §5.2): `age(timestamptz, timestamptz)` decomposes
+**`to_char` / `to_timestamp`** have landed ([formatting.md](formatting.md)): `to_char(timestamptz, …)`
+decomposes in the session zone (its `TZ` is the zone's abbreviation, `OF` its offset), and
+`to_timestamp(text, text)` reads an offset-less input as a wall clock in the session zone, both one
+`timezone` unit and STABLE; a zone **abbreviation** in `to_timestamp` input is `0A000` until the
+abbreviation decision (§15). **`age`** has landed ([interval.md](interval.md) §5.2): `age(timestamptz, timestamptz)` decomposes
 both instants in the session zone, and the one-argument forms read the current day there.
 Session-zone rendering of a `timestamptz` — the `::text` cast, nested in `array → text`, and result
 cells through the host's session render — has landed (§9.5). The runtime `text → date` /
@@ -721,8 +723,8 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
   `date_trunc` / `EXTRACT` / the cross-family casts (§9); the runtime `text → date` cast and
   `date_part` (§9.2) have since landed ([date.md §6](date.md)), and so have the runtime
   `text → timestamp`/`timestamptz` casts and offset-less `timestamptz` input in the session zone on
-  every path (§9.3), and session-zone rendering everywhere a `timestamptz` becomes text (§9.5). Still
-  deferred: `to_char` and `age`.
+  every path (§9.3), and session-zone rendering everywhere a `timestamptz` becomes text (§9.5), and
+  `to_char` / `to_timestamp` ([formatting.md](formatting.md)) and `age` have landed.
   (`make_timestamptz` landed with the make_timestamp slice — [functions.md §11](functions.md).)
 - **Persisted dependencies.** Format 32 adds per-index timezone pins for derived keys and partial
   predicates ([index-dependencies.md](index-dependencies.md)); plain values keep their UTC encoding.
@@ -747,7 +749,8 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
 **Still open (later follow-ons):**
 
 4. **Abbreviation input** (§15 below) — deferred (accept IANA names + fixed `±HH:MM` only); decide later
-   whether to load a curated abbreviation table.
+   whether to load a curated abbreviation table. Its second consumer is `to_timestamp`'s `TZ` field,
+   which is `0A000` on a zone abbreviation until then ([formatting.md](formatting.md) §5).
 5. **When the latent skew machinery lands** (§8) — it activates with functional indexes / STORED
    generated columns; confirm tz reuses [compatibility.md](compatibility.md)'s manifest then, not a
    bespoke mechanism.
