@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // var_samp(x) — the sample variance (aggregates.md §23).
+    "func.var_samp",
     // var_pop(x) — the population variance; exact over integer/decimal (aggregates.md §23).
     "func.var_pop",
     // string_agg(value, delimiter) — the non-NULL values joined (aggregates.md §23).

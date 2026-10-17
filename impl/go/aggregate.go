@@ -197,8 +197,10 @@ const (
 	planStringAgg
 	// The statistical aggregates (aggregates.md §23): exact over integer/decimal input (decimal
 	// result), PostgreSQL's float8 algorithms over float input (f64 result). See aggregate_stats.go.
-	planVarPop         // var_pop(x) over integer/decimal
-	planVarPopFloat    // var_pop(x) over f32/f64
+	planVarPop      // var_pop(x) over integer/decimal
+	planVarPopFloat // var_pop(x) over f32/f64
+	planVarSamp
+	planVarSampFloat
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -600,9 +602,9 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				a.cur = IntValue(bitFold(a.plan, a.cur.Int, v.Int))
 			}
 		}
-	case planVarPop:
+	case planVarPop, planVarSamp:
 		return a.exact.fold(v, m)
-	case planVarPopFloat:
+	case planVarPopFloat, planVarSampFloat:
 		return a.float.fold(v)
 	case planStringAgg:
 		// A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
@@ -933,10 +935,12 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), nil
 		}
 		return finalizeStringAgg(a.strRows), nil
-	case planVarPop:
-		return a.exact.variance(false, false)
-	case planVarPopFloat:
-		return a.float.variance(false, false), nil
+	case planVarPop, planVarSamp:
+		st := momentStats[a.plan]
+		return a.exact.variance(st.sample, st.stddev)
+	case planVarPopFloat, planVarSampFloat:
+		st := momentStats[a.plan]
+		return a.float.variance(st.sample, st.stddev), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
 	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:

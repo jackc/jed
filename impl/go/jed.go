@@ -863,6 +863,8 @@ var SupportedCapabilities = []string{
 	// (key, value) pairs into one JSON object; _unique errors 22030 on a duplicate key
 	// (json-sql-functions.md §4).
 	"func.json_object_agg",
+	// var_samp(x) — the sample variance (aggregates.md §23).
+	"func.var_samp",
 	// var_pop(x) — the population variance; exact over integer/decimal (aggregates.md §23).
 	"func.var_pop",
 	// string_agg(value, delimiter) — the non-NULL values joined (aggregates.md §23).
