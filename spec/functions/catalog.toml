@@ -5600,7 +5600,8 @@ errors         = ["22023", "22004", "0A000"]
 #               are not reserved (grammar.md §3).
 # arg           "star" = the COUNT(*) no-expression row counter; "expr" = general expression
 #               arguments, one per arg_families slot (string_agg takes two).
-# arg_families  required family of each expression argument ("any" = unconstrained).
+# arg_families  required family of each expression argument ("any" = unconstrained;
+#               "exact_numeric" = the integer or decimal family).
 #               Omitted for arg = "star". SUM/AVG take a numeric family (integer/decimal —
 #               one row per family); COUNT(expr)/MIN/MAX take "any".
 # result        a scalar id (i64, decimal) OR a reserved widening id — "sum_widen"
@@ -5997,6 +5998,33 @@ kind         = "aggregate"
 surface      = "stddev"
 arg          = "expr"
 arg_families = ["float"]
+result       = "f64"
+null         = "aggregate"
+errors       = ["22003"]
+
+# The two-argument statistical aggregates (aggregates.md §23) over (Y, X) — covariance, correlation,
+# and the regr_* family. A pair with a NULL is skipped. Over two exact arguments (the
+# "exact_numeric" pseudo-family: integer or decimal) they are exact — the decimal sums Σx, Σx², Σy,
+# Σy², Σxy finalized by decimal expressions (a jed divergence: PostgreSQL defines them only over
+# float8). Over two float arguments they are PostgreSQL's float8 algorithms (float8_regr_accum, a
+# finite overflow traps 22003) with an f64 result. A float argument beside an exact one is 42883:
+# float stays a strict island.
+[[aggregate]]
+name         = "covar_pop"
+kind         = "aggregate"
+surface      = "covar_pop"
+arg          = "expr"
+arg_families = ["exact_numeric", "exact_numeric"]
+result       = "decimal"
+null         = "aggregate"
+errors       = ["22003"]
+
+[[aggregate]]
+name         = "covar_pop"
+kind         = "aggregate"
+surface      = "covar_pop"
+arg          = "expr"
+arg_families = ["float", "float"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]

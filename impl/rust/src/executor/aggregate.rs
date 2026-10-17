@@ -137,6 +137,12 @@ impl Acc {
                 sx: 0.0,
                 sxx: 0.0,
             },
+            AggPlan::Pair { stat, float: false } => Acc::PairsExact {
+                stat,
+                n: 0,
+                sums: Box::new(std::array::from_fn(|_| Decimal::from_i64(0))),
+            },
+            AggPlan::Pair { stat, float: true } => Acc::PairsFloat { stat, t: [0.0; 6] },
             AggPlan::StringAgg => Acc::StringAgg {
                 rows: Vec::new(),
                 seen: false,
@@ -333,6 +339,8 @@ impl Acc {
                 };
                 fold_float_moment(n, sx, sxx, x)?;
             }
+            Acc::PairsExact { n, sums, .. } => fold_exact_pair(n, sums, value, m)?,
+            Acc::PairsFloat { t, .. } => fold_float_pair(t, value)?,
             Acc::StringAgg { rows, seen } => {
                 // A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL
                 // string_agg_transfn).
@@ -569,6 +577,8 @@ impl Acc {
                 let (sample, stddev) = stat.sample_stddev();
                 float_moment_variance(n, sxx, sample, stddev)
             }
+            Acc::PairsExact { stat, n, sums } => finalize_exact_pair(stat, n, &sums)?,
+            Acc::PairsFloat { stat, t } => finalize_float_pair(stat, &t),
             Acc::StringAgg { rows, seen } => {
                 if seen {
                     finalize_string_agg(rows)
@@ -911,4 +921,148 @@ fn float_moment_variance(n: f64, sxx: f64, sample: bool, stddev: bool) -> Value 
     }
     let r = sxx / if sample { n - 1.0 } else { n };
     Value::Float64(if stddev { r.sqrt() } else { r })
+}
+
+/// Split a two-argument statistical aggregate's Row(Y, X) operand; `None` for a pair with a NULL.
+fn pair_args(value: Value) -> Option<(Value, Value)> {
+    let Value::Composite(mut fields) = value else {
+        unreachable!("a two-argument statistical aggregate's operand is a 2-field Row")
+    };
+    let x = fields.pop().unwrap();
+    let y = fields.pop().unwrap();
+    if matches!(y, Value::Null) || matches!(x, Value::Null) {
+        None
+    } else {
+        Some((y, x))
+    }
+}
+
+/// Add one (Y, X) pair to the exact two-argument moments (aggregates.md §23), skipping a pair with a
+/// NULL. `sums` is [Σx, Σx², Σy, Σy², Σxy]. Each fold charges decimal_work for the three products
+/// and five additions, by the `*` and `+` formulas (spec/design/cost.md §3).
+fn fold_exact_pair(
+    n: &mut i64,
+    sums: &mut [Decimal; 5],
+    value: Value,
+    m: &mut Meter,
+) -> Result<()> {
+    let Some((y, x)) = pair_args(value) else {
+        return Ok(());
+    };
+    let (y, x) = (to_decimal(y), to_decimal(x));
+    let terms = [
+        x.clone(),
+        x.mul_exact(&x),
+        y.clone(),
+        y.mul_exact(&y),
+        x.mul_exact(&y),
+    ];
+    let work = decimal::work_mul(&x, &x)
+        + decimal::work_mul(&y, &y)
+        + decimal::work_mul(&x, &y)
+        + (0..5)
+            .map(|i| decimal::work_linear(&sums[i], &terms[i]))
+            .sum::<u64>()
+        - 8;
+    m.charge(COSTS.decimal_work * work as i64);
+    m.guard()?;
+    for (sum, term) in sums.iter_mut().zip(&terms) {
+        *sum = sum.add_uncapped(term);
+    }
+    *n += 1;
+    Ok(())
+}
+
+/// Evaluate a two-argument statistic over the exact sums (aggregates.md §23). With
+/// numXY = N·Σxy − Σx·Σy computed exactly, covar_pop = numXY / (N·N); "/" is jed's decimal division
+/// (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair.
+fn finalize_exact_pair(stat: PairStat, n: i64, sums: &[Decimal; 5]) -> Result<Value> {
+    if n == 0 {
+        return Ok(Value::Null);
+    }
+    let [sx, _sxx, sy, _syy, sxy] = sums;
+    let count = Decimal::from_i64(n);
+    let num_xy = count.mul_exact(sxy).add_uncapped(&sx.mul_exact(sy).neg());
+    let r = match stat {
+        PairStat::CovarPop => num_xy.div(&count.mul_exact(&count))?,
+    };
+    Ok(Value::Decimal(r))
+}
+
+/// PostgreSQL's float8_regr_accum over one (Y, X) pair (f32 widened to f64), skipping a pair with a
+/// NULL: the two-variable Youngs-Cramer update of `t` = [N, Σx, Sxx, Σy, Syy, Sxy]. A finite input
+/// whose update overflows to ±Inf traps 22003; an infinite or NaN input makes the dependent sums NaN.
+fn fold_float_pair(t: &mut [f64; 6], value: Value) -> Result<()> {
+    let Some((y, x)) = pair_args(value) else {
+        return Ok(());
+    };
+    let f = |v: Value| match v {
+        Value::Float32(f) => f as f64,
+        Value::Float64(f) => f,
+        _ => unreachable!("the resolver gives a float pair float operands"),
+    };
+    let (y, x) = (f(y), f(x));
+    let [n0, sx0, sxx0, sy0, syy0, sxy0] = *t;
+    let n = n0 + 1.0;
+    let (sx, sy) = (sx0 + x, sy0 + y);
+    let (mut sxx, mut syy, mut sxy) = (sxx0, syy0, sxy0);
+    if n0 > 0.0 {
+        let tmp_x = x * n - sx;
+        let tmp_y = y * n - sy;
+        let scale = 1.0 / (n * n0);
+        sxx += tmp_x * tmp_x * scale;
+        syy += tmp_y * tmp_y * scale;
+        sxy += tmp_x * tmp_y * scale;
+        if sx.is_infinite()
+            || sxx.is_infinite()
+            || sy.is_infinite()
+            || syy.is_infinite()
+            || sxy.is_infinite()
+        {
+            if ((sx.is_infinite() || sxx.is_infinite()) && !sx0.is_infinite() && !x.is_infinite())
+                || ((sy.is_infinite() || syy.is_infinite())
+                    && !sy0.is_infinite()
+                    && !y.is_infinite())
+                || (sxy.is_infinite()
+                    && !sx0.is_infinite()
+                    && !x.is_infinite()
+                    && !sy0.is_infinite()
+                    && !y.is_infinite())
+            {
+                return Err(overflow(ScalarType::Float64));
+            }
+            if sxx.is_infinite() {
+                sxx = f64::NAN;
+            }
+            if syy.is_infinite() {
+                syy = f64::NAN;
+            }
+            if sxy.is_infinite() {
+                sxy = f64::NAN;
+            }
+        }
+    } else {
+        if x.is_nan() || x.is_infinite() {
+            sxx = f64::NAN;
+            sxy = f64::NAN;
+        }
+        if y.is_nan() || y.is_infinite() {
+            syy = f64::NAN;
+            sxy = f64::NAN;
+        }
+    }
+    *t = [n, sx, sxx, sy, syy, sxy];
+    Ok(())
+}
+
+/// PostgreSQL's float8 final function for a two-argument statistic over `t` = [N, Σx, Sxx, Σy,
+/// Syy, Sxy]: covar_pop = Sxy / N. NULL over no pair.
+fn finalize_float_pair(stat: PairStat, t: &[f64; 6]) -> Value {
+    let [n, _sx, _sxx, _sy, _syy, sxy] = *t;
+    if n < 1.0 {
+        return Value::Null;
+    }
+    Value::Float64(match stat {
+        PairStat::CovarPop => sxy / n,
+    })
 }

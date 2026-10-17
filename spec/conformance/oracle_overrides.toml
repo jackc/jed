@@ -1735,3 +1735,38 @@ file = "params/containers.test"
 sql = "SELECT id FROM c WHERE p = $1"
 params = "'(3,4)'"
 reason = "jed types a parameter compared with a named composite as that composite (api.md §5), so a text value is read by its record input. PostgreSQL types the parameter as the anonymous record (record_eq's argument type) and cannot read text into it (0A000, input of anonymous composite types is not implemented)."
+
+# --- The exact two-argument statistical aggregates (aggregates.md §23): over integer/decimal
+# arguments jed computes covar_pop and the regr_* family exactly in decimal; PostgreSQL defines them
+# only over float8 (it casts the arguments) and returns float8. Each expected value equals PostgreSQL's
+# numeric evaluation of the documented formula over the same rows. And float stays a strict island:
+# a float argument beside an exact one is 42883 where PostgreSQL casts both to float8.
+[[override]]
+file = "aggregates/covar_pop.test"
+sql = "SELECT covar_pop(y, x) FROM t"
+reason = "jed: covar_pop over integer/decimal arguments is exact — (N·Σxy − Σx·Σy) / (N·N) in decimal (aggregates.md §23), equal to PostgreSQL's numeric evaluation of that formula. PostgreSQL defines covar_pop only over float8 and returns its float8 approximation."
+
+[[override]]
+file = "aggregates/covar_pop.test"
+sql = "SELECT covar_pop(dy, dx), covar_pop(y, dx) FROM t"
+reason = "jed: covar_pop over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/covar_pop.test"
+sql = "SELECT g, covar_pop(dy, x) FROM t GROUP BY g"
+reason = "jed: covar_pop over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/covar_pop.test"
+sql = "SELECT covar_pop(DISTINCT y, y) FROM t"
+reason = "jed: covar_pop over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/covar_pop.test"
+sql = "SELECT covar_pop(fy, x) FROM t"
+reason = "jed: float is a strict island (types.md; scalars.toml) — no implicit integer↔float conversion — so covar_pop(f64, i32) matches neither the float overload nor the exact one: 42883. PostgreSQL casts both arguments to float8."
+
+[[override]]
+file = "aggregates/covar_pop.test"
+sql = "SELECT covar_pop(y, x) FROM big"
+reason = "jed: covar_pop over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
