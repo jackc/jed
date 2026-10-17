@@ -935,6 +935,13 @@ committed (the workspace `references/` directory is in `.gitignore`).
 > present in `references/`, either **work without it** or **ask the user to run
 > `mise run references:setup`** (or for permission to). The same rule applies to any
 > heavy/expensive operation: surface it and let the user decide, don't auto-trigger it.
+>
+> **Exception — the cheap link.** When every mirror is already present and valid at the
+> machine-level mirror path (below), `mise run references:setup` downloads nothing: it only
+> adds `git worktree` checkouts of those mirrors into this checkout's `references/`. In that
+> case you may run it on your own initiative (e.g. in a fresh git worktree that lacks
+> `references/`). Confirm first that each `<name>.git` mirror exists and has refs; if any is
+> missing, the rule above applies. `references:update` (a network fetch) is never covered.
 
 Provision or refresh them with mise tasks (§10):
 
