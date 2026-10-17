@@ -973,9 +973,10 @@ fn fold_exact_pair(
     Ok(())
 }
 
-/// Evaluate a two-argument statistic over the exact sums (aggregates.md §23). With
-/// numXY = N·Σxy − Σx·Σy computed exactly, covar_pop = numXY / (N·N); "/" is jed's decimal division
-/// (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair.
+/// Evaluate a two-argument statistic over the exact sums (aggregates.md §23), with the exact
+/// numerators numX = N·Σx² − Σx·Σx, numY = N·Σy² − Σy·Σy, and numXY = N·Σxy − Σx·Σy; "/" is jed's
+/// decimal division (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair,
+/// and where the table in aggregates.md §23 says.
 fn finalize_exact_pair(stat: PairStat, n: i64, sums: &[Decimal; 5]) -> Result<Value> {
     if n == 0 {
         return Ok(Value::Null);
@@ -985,6 +986,12 @@ fn finalize_exact_pair(stat: PairStat, n: i64, sums: &[Decimal; 5]) -> Result<Va
     let num_xy = count.mul_exact(sxy).add_uncapped(&sx.mul_exact(sy).neg());
     let r = match stat {
         PairStat::CovarPop => num_xy.div(&count.mul_exact(&count))?,
+        PairStat::CovarSamp => {
+            if n < 2 {
+                return Ok(Value::Null);
+            }
+            num_xy.div(&count.mul_exact(&Decimal::from_i64(n - 1)))?
+        }
     };
     Ok(Value::Decimal(r))
 }
@@ -1056,7 +1063,7 @@ fn fold_float_pair(t: &mut [f64; 6], value: Value) -> Result<()> {
 }
 
 /// PostgreSQL's float8 final function for a two-argument statistic over `t` = [N, Σx, Sxx, Σy,
-/// Syy, Sxy]: covar_pop = Sxy / N. NULL over no pair.
+/// Syy, Sxy] (the table in aggregates.md §23). NULL over no pair.
 fn finalize_float_pair(stat: PairStat, t: &[f64; 6]) -> Value {
     let [n, _sx, _sxx, _sy, _syy, sxy] = *t;
     if n < 1.0 {
@@ -1064,5 +1071,11 @@ fn finalize_float_pair(stat: PairStat, t: &[f64; 6]) -> Value {
     }
     Value::Float64(match stat {
         PairStat::CovarPop => sxy / n,
+        PairStat::CovarSamp => {
+            if n < 2.0 {
+                return Value::Null;
+            }
+            sxy / (n - 1.0)
+        }
     })
 }

@@ -762,6 +762,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `stddev_samp(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the sample standard deviation |
 | `stddev(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | PostgreSQL's alias of `stddev_samp` |
 | `covar_pop(y, x)` | two exact / two float | `decimal` / `f64` | the population covariance |
+| `covar_samp(y, x)` | two exact / two float | `decimal` / `f64` | the sample covariance |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -879,3 +880,4 @@ with the one-argument float forms (`float-moment-order`).
 | Aggregate | Exact result | Float result (PostgreSQL) | NULL when |
 |---|---|---|---|
 | `covar_pop(y, x)` | `numXY / (N·N)` | `Sxy / N` | no pair |
+| `covar_samp(y, x)` | `numXY / (N·(N − 1))` | `Sxy / (N − 1)` | fewer than two pairs |

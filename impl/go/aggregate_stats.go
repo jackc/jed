@@ -155,16 +155,19 @@ type pairStat int
 
 const (
 	pairCovarPop pairStat = iota
+	pairCovarSamp
 )
 
 // pairSurfaces maps each two-argument statistical aggregate to its exact and float plans.
 var pairSurfaces = map[string][2]aggPlan{
-	"covar_pop": {planCovarPop, planCovarPopFloat},
+	"covar_pop":  {planCovarPop, planCovarPopFloat},
+	"covar_samp": {planCovarSamp, planCovarSampFloat},
 }
 
 // pairStats gives each two-argument plan its statistic.
 var pairStats = map[aggPlan]pairStat{
 	planCovarPop: pairCovarPop, planCovarPopFloat: pairCovarPop,
+	planCovarSamp: pairCovarSamp, planCovarSampFloat: pairCovarSamp,
 }
 
 // pairsExact is the exact two-argument moment state: the count of pairs and the decimal sums.
@@ -195,9 +198,10 @@ func (s *pairsExact) fold(v Value, m *costMeter) error {
 	return nil
 }
 
-// finalize evaluates the statistic over the exact sums (aggregates.md §23). With
-// numXY = N·Σxy − Σx·Σy computed exactly, covar_pop = numXY / (N·N); "/" is jed's decimal division
-// (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair.
+// finalize evaluates the statistic over the exact sums (aggregates.md §23), with the exact numerators
+// numX = N·Σx² − Σx·Σx, numY = N·Σy² − Σy·Σy, and numXY = N·Σxy − Σx·Σy; "/" is jed's decimal
+// division (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair, and where
+// the table in aggregates.md §23 says.
 func (s *pairsExact) finalize(stat pairStat) (Value, error) {
 	if s.n == 0 {
 		return NullValue(), nil
@@ -207,8 +211,15 @@ func (s *pairsExact) finalize(stat pairStat) (Value, error) {
 	var r Decimal
 	var err error
 	switch stat {
-	default: // pairCovarPop
+	case pairCovarPop:
 		r, err = numXY.Div(n.mulExact(n))
+	case pairCovarSamp:
+		if s.n < 2 {
+			return NullValue(), nil
+		}
+		r, err = numXY.Div(n.mulExact(decimalFromInt64(s.n - 1)))
+	default:
+		panic("unhandled pair statistic")
 	}
 	if err != nil {
 		return NullValue(), err
@@ -271,14 +282,21 @@ func (s *pairsFloat) fold(v Value) error {
 	return nil
 }
 
-// finalize is PostgreSQL's float8 final function for the statistic: covar_pop = Sxy / N. NULL over
-// no pair.
+// finalize is PostgreSQL's float8 final function for the statistic (the table in aggregates.md §23).
+// NULL over no pair.
 func (s *pairsFloat) finalize(stat pairStat) Value {
 	if s.n < 1 {
 		return NullValue()
 	}
 	switch stat {
-	default: // pairCovarPop
+	case pairCovarPop:
 		return Float64Value(s.sxy / s.n)
+	case pairCovarSamp:
+		if s.n < 2 {
+			return NullValue()
+		}
+		return Float64Value(s.sxy / (s.n - 1))
+	default:
+		panic("unhandled pair statistic")
 	}
 }

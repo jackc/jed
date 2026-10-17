@@ -1770,3 +1770,33 @@ reason = "jed: float is a strict island (types.md; scalars.toml) — no implicit
 file = "aggregates/covar_pop.test"
 sql = "SELECT covar_pop(y, x) FROM big"
 reason = "jed: covar_pop over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/covar_samp.test"
+sql = "SELECT covar_samp(y, x) FROM t"
+reason = "jed: covar_samp over integer/decimal arguments is exact (aggregates.md §23), equal to PostgreSQL's numeric evaluation of its formula; PostgreSQL defines covar_samp only over float8."
+
+[[override]]
+file = "aggregates/covar_samp.test"
+sql = "SELECT covar_samp(dy, dx), covar_samp(y, dx) FROM t"
+reason = "jed: covar_samp over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/covar_samp.test"
+sql = "SELECT g, covar_samp(dy, x) FROM t GROUP BY g"
+reason = "jed: covar_samp over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/covar_samp.test"
+sql = "SELECT covar_samp(DISTINCT y, y) FROM t"
+reason = "jed: covar_samp over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/covar_samp.test"
+sql = "SELECT covar_samp(y, x) FROM big"
+reason = "jed: covar_samp over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/covar_samp.test"
+sql = "SELECT covar_samp(fy, x) FROM t"
+reason = "jed: float is a strict island — no implicit integer↔float conversion — so covar_samp(f64, i32) matches neither the float nor the exact overload: 42883. PostgreSQL casts both arguments to float8."
