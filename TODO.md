@@ -60,7 +60,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
 - [ ] **Common aggregates** — PARTIAL ([aggregates.md §23](spec/design/aggregates.md)). Landed:
   `bool_and`, `bool_or`, `every`, `bit_and`, `bit_or`, `bit_xor`, `array_agg`, `string_agg`, `var_pop`, `var_samp`, `variance`, `stddev_pop`, `stddev_samp`, `stddev`, `covar_pop`,
-  `covar_samp`, `corr`, `regr_count`, `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`. Still missing: the rest of the two-argument statistical
+  `covar_samp`, `corr`, `regr_count`, `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`, `regr_sxy`. Still missing: the rest of the two-argument statistical
   set — the other `regr_*` (exact over `decimal`, PostgreSQL's `float8` results over floats). Each needs its
   spill/query-memory accounting (memory.md §6). _(size: M)_
 - [ ] **`NULLIF(a, b)`** — the SQL conditional beside `COALESCE`/`GREATEST`/`LEAST` (grammar.md §51–§52);
