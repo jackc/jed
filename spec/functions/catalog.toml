@@ -95,6 +95,17 @@ volatility     = "immutable"
 #                 varlen_compare / collate / regex_step / …), never this field. Codegen'd into
 #                 OperatorDesc.cost (0 = absent ⇒ use operator_eval); the evaluator prefers it over
 #                 operator_eval, so tuning a built-in's base later is a pure DATA-ONLY change here.
+# traps          OPTIONAL boolean (scalar functions — functions.md §15), absent ⇒ true. false
+#                 asserts the kernel raises no error for ANY argument values of ANY overload, is
+#                 immutable, and reads only its arguments + the handle's immutable Environment data
+#                 (cost/memory guardrail aborts are not traps). The planner moves a predicate
+#                 containing such a call to rows the written plan would not evaluate it on
+#                 (planner.md §3.5). NAME-level: overloads sharing a name must agree; false requires
+#                 errors = [] and volatility = "immutable" (verify.rb). Codegen'd into
+#                 OperatorDesc.traps.
+# preserves_equality  REQUIRED boolean when traps = false (functions.md §15): true asserts equal
+#                 arguments give equal results, so the call may move below DISTINCT / a grouping / a
+#                 window / a set operation's row match (planner.md §3.2). NAME-level.
 # -----------------------------------------------------------------------------
 
 # --- logical connectives -----------------------------------------------------
@@ -4129,6 +4140,8 @@ arg_resolution = "none"
 result         = "anyelement"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 [[operator]]
 volatility     = "immutable"
@@ -4140,6 +4153,8 @@ arg_resolution = "none"
 result         = "anyelement"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # --- the text casing functions (../design/collation.md §16, Slice 3e) -------------------------
 # `lower(text)`/`upper(text)` — Unicode case folding, the text OVERLOAD of the range accessors above
@@ -4158,6 +4173,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 [[operator]]
 volatility     = "immutable"
@@ -4169,6 +4186,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # --- string / text scalar functions (../design/string-functions.md) ---------------------------
 # Pure text-processing built-ins (PG's string functions, manual §9.4), STRICT (null = "propagates":
@@ -4188,6 +4207,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # length(bytea) → int — the number of BYTES (PG's byteaoctetlen; string-functions.md §4).
 [[operator]]
@@ -4200,6 +4221,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # char_length / character_length — SQL-standard aliases of length(text): the same code-point count,
 # same kernel. PG exposes all three (char_length and character_length are the SQL spellings).
@@ -4213,6 +4236,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 [[operator]]
 volatility     = "immutable"
@@ -4224,6 +4249,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # octet_length(text) → int — the number of BYTES in the UTF-8 encoding (NOT characters):
 # octet_length('héllo') = 6 (é is 2 bytes). The byte counterpart of length.
@@ -4237,6 +4264,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # octet_length(bytea) → int — the number of bytes (string-functions.md §4).
 [[operator]]
@@ -4249,6 +4278,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # bit_length(text) → int — the number of BITS in the UTF-8 encoding = octet_length × 8.
 # bit_length('héllo') = 48.
@@ -4262,6 +4293,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # bit_length(bytea) → int — the number of bits = bytes × 8 (string-functions.md §4).
 [[operator]]
@@ -4274,6 +4307,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # substr(text, start[, count]) → text — the FUNCTION spelling of SUBSTRING (1-based, code-point
 # indexed). substr(s, S) returns the characters from position S to the end; substr(s, S, L) the L
@@ -4535,6 +4570,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 [[operator]]
 volatility     = "immutable"
@@ -4546,6 +4583,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # btrim(bytea, bytes bytea) → bytea — remove from BOTH ends the longest run of bytes that each
 # appear in the `bytes` SET (string-functions.md §4). No 1-arg bytea form (PG has none).
@@ -4559,6 +4598,8 @@ arg_resolution = "none"
 result         = "bytea"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # ltrim(text[, characters text]) → text — like btrim but trims only the LEADING (left) run. The
 # function form of TRIM(LEADING …). ltrim('xxhixx','x') = 'hixx'. NULL args propagate.
@@ -4572,6 +4613,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 [[operator]]
 volatility     = "immutable"
@@ -4583,6 +4626,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # ltrim(bytea, bytes bytea) → bytea — the LEADING run only (PG 14+; string-functions.md §4).
 [[operator]]
@@ -4595,6 +4640,8 @@ arg_resolution = "none"
 result         = "bytea"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # rtrim(text[, characters text]) → text — like btrim but trims only the TRAILING (right) run. The
 # function form of TRIM(TRAILING …). rtrim('xxhixx','x') = 'xxhi'. NULL args propagate.
@@ -4608,6 +4655,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 [[operator]]
 volatility     = "immutable"
@@ -4619,6 +4668,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # rtrim(bytea, bytes bytea) → bytea — the TRAILING run only (PG 14+; string-functions.md §4).
 [[operator]]
@@ -4631,6 +4682,8 @@ arg_resolution = "none"
 result         = "bytea"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # replace(text, from text, to text) → text — replace every (non-overlapping) occurrence of the
 # SUBSTRING `from` with `to`. replace('abcabc','bc','X') = 'aXaX'. An EMPTY `from` replaces nothing
@@ -4688,6 +4741,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # strpos(text, substring text) → int — the 1-based CHARACTER (code-point) position of the first
 # occurrence of `substring` in the string, or 0 if absent; an empty substring is 1. The function form
@@ -4702,6 +4757,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # position(string, substring) → int — the 1-based position of the first occurrence of `substring`,
 # else 0; an empty substring is 1 (text: code points, the strpos kernel; bytea: bytes). This is the
@@ -4719,6 +4776,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 [[operator]]
 volatility     = "immutable"
@@ -4730,6 +4789,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # split_part(text, delimiter text, n int) → text — split the string on `delimiter` and return the
 # n-th field (1-based; a NEGATIVE n counts from the end, PG 14+). Out of range → ''; n = 0 traps
@@ -4759,6 +4820,8 @@ arg_resolution = "none"
 result         = "boolean"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # ascii(text) → int — the Unicode CODE POINT of the first character (the full code point, not a
 # UTF-16 unit — ascii('😀') = 128512); the empty string is 0. The inverse of chr. NULL propagates.
@@ -4772,6 +4835,8 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # chr(int) → text — the one-character string for the Unicode code point. chr(65) = 'A', chr(128512) =
 # '😀'. A NEGATIVE code point is 22023 ("character number must be positive"); 0 / a value above
@@ -4801,6 +4866,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # to_hex(int) → text — the hexadecimal (lowercase, no leading zeros) representation. to_hex(255) =
 # 'ff'. A negative value renders its 64-bit two's-complement bit pattern (jed renders at i64 width =
@@ -4918,6 +4985,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 [[operator]]
 volatility     = "immutable"
@@ -4929,6 +4998,8 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = []
+traps          = false
+preserves_equality = true
 
 # sha224/sha256/sha384/sha512(bytea) → bytea — the SHA-2 digest (FIPS 180-4) as raw bytes: 28, 32,
 # 48, or 64 bytes. bytea only, as in PG: there is no text overload, and a bare literal is read as

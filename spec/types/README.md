@@ -13,7 +13,7 @@ The reasoning behind these tables lives in
 |---|---|
 | [scalars.toml](scalars.toml) | Scalar type definitions: id, aliases, width, range, overflow behavior, key-encoding rule, promotion rank. |
 | [compare.toml](compare.toml) | Comparison & promotion: comparability classes, the numeric promotion tower, three-valued NULL logic. |
-| [casts.toml](casts.toml) | Coercion matrix: which casts exist and their mode (implicit / assignment / explicit). Anything unlisted is forbidden. |
+| [casts.toml](casts.toml) | Coercion matrix: which casts exist and their mode (implicit / assignment / explicit), plus the planner's trap classification (`traps` / `preserves_equality`, codegen'd — ../design/functions.md §15). Anything unlisted is forbidden. |
 | [datetime_units.toml](datetime_units.toml) | PostgreSQL's datetime unit-name tables (`deltatktbl`, `datetktbl`): the unit names and aliases `EXTRACT` / `date_part` / `date_trunc` accept. Codegen'd to the per-core `DELTA_TOKENS` / `DATE_TOKENS` tables; see [../design/timezones.md](../design/timezones.md) §9.6. |
 | [formatting.toml](formatting.toml) | PostgreSQL's data-type formatting vocabulary (`DCH_keywords`, `DCH_suff`, `NUM_keywords`, the month / day / Roman-numeral / AM-PM / AD-BC / ordinal word lists) for `to_char` / `to_timestamp` / `to_date` / `to_number`. Codegen'd to the per-core `formatting_gen` tables; see [../design/formatting.md](../design/formatting.md). |
 | [ranges.toml](ranges.toml) | The six built-in range types (a structural range over a scalar element): id, element subtype, aliases, discreteness. Codegen'd to the per-core `RANGES` table; see [../design/ranges.md](../design/ranges.md). |

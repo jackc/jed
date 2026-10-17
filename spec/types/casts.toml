@@ -93,6 +93,15 @@
 #   explicit    only via an explicit CAST(...) ; may fail at runtime
 # on_overflow:
 #   trap        raise the named error when the value does not fit `to` (CLAUDE.md §8)
+# traps (OPTIONAL, absent => true) / preserves_equality (REQUIRED when traps = false):
+#   the planner's trap classification (../design/functions.md §15, ../design/planner.md §3.5).
+#   traps = false asserts the cast raises nothing for any source value (no on_overflow row, and
+#   not text parsing — text -> boolean above has no on_overflow field yet still traps 22P02), is
+#   immutable (so not timestamptz -> text, which renders in the session zone), and reads only its
+#   operand. preserves_equality = true asserts equal sources give equal results (false: decimal and
+#   float renders, where 1.5 = 1.50 and -0 = 0 render differently). A decimal target's numeric(p,s)
+#   typmod can still trap 22003; the resolver drops the classification for such a cast. Codegen'd
+#   by scripts/gen_catalog.rb into each core's operators table (NON_TRAPPING_CASTS).
 
 schema_version = 1
 
@@ -101,16 +110,22 @@ schema_version = 1
 from = "i16"
 to = "i32"
 mode = "implicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i16"
 to = "i64"
 mode = "implicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i32"
 to = "i64"
 mode = "implicit"
+traps = false
+preserves_equality = true
 
 # --- narrowing: lossy, assignment (storage) or explicit CAST, traps on overflow ---
 # PostgreSQL's int8->int4, int8->int2 and int4->int2 casts are assignment casts, and jed matches
@@ -148,16 +163,22 @@ overflow_error = "22003"
 from = "i16"
 to = "decimal"
 mode = "implicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i32"
 to = "decimal"
 mode = "implicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i64"
 to = "decimal"
 mode = "implicit"
+traps = false
+preserves_equality = true
 
 # --- decimal -> integer: lossy, explicit CAST only, traps on overflow -----------------
 # A decimal is rounded to scale 0 (HALF AWAY FROM ZERO — the one engine rounding mode,
@@ -206,16 +227,22 @@ overflow_error = "22003"
 from = "i16"
 to = "f64"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i32"
 to = "f64"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i64"
 to = "f64"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "decimal"
@@ -273,6 +300,8 @@ overflow_error = "22003"
 from = "f32"
 to = "f64"
 mode = "implicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "f64"
@@ -291,16 +320,22 @@ overflow_error = "22003"
 from = "i16"
 to = "f32"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i32"
 to = "f32"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i64"
 to = "f32"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "decimal"
@@ -347,11 +382,15 @@ overflow_error = "22003"
 from = "boolean"
 to = "i32"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i32"
 to = "boolean"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 # --- cross-family datetime casts (timestamp / timestamptz / date) -----------------------------
 # The tz conversion slice (../design/timezones.md §9.3). All EXPLICIT. The pairs that cross the
@@ -410,6 +449,8 @@ overflow_error = "22P02"
 from = "uuid"
 to = "text"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "uuid"
@@ -562,36 +603,50 @@ overflow_error = "22P02"
 from = "i16"
 to = "text"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i32"
 to = "text"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "i64"
 to = "text"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "decimal"
 to = "text"
 mode = "explicit"
+traps = false
+preserves_equality = false
 
 [[cast]]
 from = "f32"
 to = "text"
 mode = "explicit"
+traps = false
+preserves_equality = false
 
 [[cast]]
 from = "f64"
 to = "text"
 mode = "explicit"
+traps = false
+preserves_equality = false
 
 [[cast]]
 from = "boolean"
 to = "text"
 mode = "explicit"
+traps = false
+preserves_equality = true
 
 [[cast]]
 from = "bytea"

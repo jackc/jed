@@ -307,7 +307,10 @@ pub(crate) fn rewrite_where(plan: &mut SelectPlan) {
         if plan.rels[ri].lateral || !pushdown_safe(c) {
             return None;
         }
+        // A conjunct that may separate equal values moves only into a body that matches no rows
+        // (planner.md §3.2).
         if let Some(body) = bodies[ri]
+            && (!conjunct_lossy(c) || non_matching_body(body))
             && let Some(moved) = body_conjunct(c, plan.rels[ri].offset, body)
         {
             return Some((moved, true));
@@ -481,16 +484,16 @@ fn body_input_column(b: &SelectPlan, j: usize) -> Option<usize> {
     (gk < width).then_some(gk)
 }
 
-/// Whether output column `j` of a body-pushable plan reads a bare body column of type `want` in
-/// every SELECT it combines: a set operation's arms (and its own unified column) must already have
-/// that exact type, so no arm value is widened after the pushed conjunct would have judged it.
+/// Whether output column `j` of a body-pushable plan reads a bare body column in every SELECT it
+/// combines, each of a type the set operations widen to `want` without a value change or through a
+/// widening cast ([`arm_widening`], planner.md §3.6).
 fn body_output_pushable(q: &QueryPlan, j: usize, want: &ResolvedType) -> bool {
     match q {
-        QueryPlan::Select(b) => body_input_column(b, j).is_some() && b.column_types[j] == *want,
+        QueryPlan::Select(b) => {
+            body_input_column(b, j).is_some() && arm_widening(&b.column_types[j], want).is_some()
+        }
         QueryPlan::SetOp(so) => {
-            so.column_types[j] == *want
-                && body_output_pushable(&so.lhs, j, want)
-                && body_output_pushable(&so.rhs, j, want)
+            body_output_pushable(&so.lhs, j, want) && body_output_pushable(&so.rhs, j, want)
         }
         _ => false,
     }
@@ -504,15 +507,33 @@ fn body_conjunct(e: &RExpr, offset: usize, body: &QueryPlan) -> Option<RExpr> {
     let types = body.column_types();
     map_pushdown_safe(e, &|slot| {
         let j = slot.checked_sub(offset)?;
-        (j < types.len() && body_output_pushable(body, j, &types[j])).then_some(j)
+        (j < types.len() && body_output_pushable(body, j, &types[j])).then_some(RExpr::Column(j))
     })
 }
 
 /// Clone a conjunct in a SELECT body's output-column numbering with every column replaced by the
-/// FROM slot that output reads. [`body_conjunct`] already proved each reference maps.
-pub(crate) fn substitute_body_columns(e: &RExpr, body: &SelectPlan) -> RExpr {
-    map_pushdown_safe(e, &|j| body_input_column(body, j))
-        .expect("body_conjunct proved every output column maps")
+/// FROM slot that output reads. `want` is the outermost body's output types, which the conjunct was
+/// resolved against: an output the set operations widen with a value change is read through the
+/// widening cast (planner.md §3.6). [`body_conjunct`] already proved each reference maps.
+pub(crate) fn substitute_body_columns(
+    e: &RExpr,
+    body: &SelectPlan,
+    want: &[ResolvedType],
+) -> RExpr {
+    map_pushdown_safe(e, &|j| {
+        let col = RExpr::Column(body_input_column(body, j)?);
+        Some(match arm_widening(&body.column_types[j], &want[j])? {
+            None => col,
+            Some(target) => RExpr::Cast {
+                inner: Box::new(col),
+                target,
+                typmod: None,
+                varchar_len: None,
+                trap: TrapClass::None,
+            },
+        })
+    })
+    .expect("body_conjunct proved every output column maps")
 }
 
 /// Flatten a WHERE's top-level AND-chain and apply the plan-time contradiction proof. UPDATE/DELETE
@@ -592,9 +613,8 @@ fn literal_comparison_false(c: &RExpr) -> bool {
         .is_some_and(|order| !estimator_comparison_satisfied(order, *op))
 }
 
-/// The one relation whose columns `c` references; `None` when it references none or several. Only
-/// the pushdown-safe node kinds are walked: any other node makes the conjunct ineligible anyway
-/// (`pushdown_safe`), so it reports `None` without deciding an owner.
+/// The one relation whose columns `c` references; `None` when it references none or several. Every
+/// child is walked; a node the gate rejects makes the conjunct ineligible anyway (`pushdown_safe`).
 fn conjunct_single_relation(plan: &SelectPlan, c: &RExpr) -> Option<usize> {
     fn walk(plan: &SelectPlan, e: &RExpr, owner: &mut Option<usize>) -> bool {
         match e {
@@ -608,13 +628,9 @@ fn conjunct_single_relation(plan: &SelectPlan, c: &RExpr) -> Option<usize> {
                 *owner = Some(ri);
                 true
             }
-            RExpr::And(l, r) | RExpr::Or(l, r) => walk(plan, l, owner) && walk(plan, r, owner),
-            RExpr::Compare { lhs, rhs, .. } | RExpr::Distinct { lhs, rhs, .. } => {
-                walk(plan, lhs, owner) && walk(plan, rhs, owner)
-            }
-            RExpr::Not(operand) | RExpr::IsNull { operand, .. } => walk(plan, operand, owner),
-            RExpr::Param(_) => true,
-            _ => estimator_literal(e),
+            _ => estimator_expression_children(e)
+                .into_iter()
+                .all(|child| walk(plan, child, owner)),
         }
     }
     let mut owner = None;
@@ -631,19 +647,19 @@ fn relation_of_slot(plan: &SelectPlan, slot: usize) -> Option<usize> {
         .position(|rel| slot >= rel.offset && slot < rel.offset + rel.col_count)
 }
 
-/// The structural safety gate (planner.md §3.2): the conjunct must be unable to trap and must read
+/// The safe-conjunct gate (planner.md §3.5): the conjunct must be unable to trap and must read
 /// nothing but the row, constants and parameters — so evaluating it on a row the join would never
 /// have produced can raise no error a non-pushed plan would not, and its value is the same wherever
 /// it runs. The admitted shapes are boolean combinations (AND/OR/NOT) of comparisons, IS [NOT] NULL,
-/// and IS [NOT] DISTINCT FROM over bare columns, literals and parameters, plus a bare boolean
-/// column. A collated ordering comparison is excluded (its sort-key kernel can fail on unloaded
-/// data); every other node kind — casts, arithmetic, functions, subqueries, outer references —
-/// stays in the residual.
+/// IS [NOT] DISTINCT FROM, and LIKE / ILIKE with a proven pattern, over non-trapping value
+/// expressions ([`non_trapping`]: columns, literals, parameters, and the classified casts and
+/// functions), plus a boolean-valued non-trapping expression. A collated ordering comparison is
+/// excluded (its sort-key kernel can fail on unloaded data); every other node kind — arithmetic,
+/// trapping casts and functions, subqueries, outer references — stays in the residual.
 fn pushdown_safe(e: &RExpr) -> bool {
     match e {
         RExpr::And(l, r) | RExpr::Or(l, r) => pushdown_safe(l) && pushdown_safe(r),
         RExpr::Not(operand) => pushdown_safe(operand),
-        RExpr::Column(_) => true,
         RExpr::Compare {
             op,
             lhs,
@@ -653,16 +669,13 @@ fn pushdown_safe(e: &RExpr) -> bool {
             if collation.is_some() && !matches!(op, CmpOp::Eq | CmpOp::Ne) {
                 return false;
             }
-            pushdown_leaf(lhs) && pushdown_leaf(rhs)
+            non_trapping(lhs) && non_trapping(rhs)
         }
-        RExpr::Distinct { lhs, rhs, .. } => pushdown_leaf(lhs) && pushdown_leaf(rhs),
-        RExpr::IsNull { operand, .. } => pushdown_leaf(operand),
-        _ => false,
+        RExpr::Distinct { lhs, rhs, .. } => non_trapping(lhs) && non_trapping(rhs),
+        RExpr::IsNull { operand, .. } => non_trapping(operand),
+        RExpr::Like { lhs, rhs, .. } => non_trapping(lhs) && like_pattern_proven(rhs),
+        _ => non_trapping(e),
     }
-}
-
-fn pushdown_leaf(e: &RExpr) -> bool {
-    matches!(e, RExpr::Column(_) | RExpr::Param(_)) || estimator_literal(e)
 }
 
 /// Append `c` to a left-deep AND chain (source order is preserved by the caller).
@@ -682,15 +695,16 @@ fn clone_pushdown_safe(e: &RExpr) -> RExpr {
 /// Clone a pushdown-safe tree with every column slot shifted down by `offset`, so it evaluates
 /// against the relation's own row. Only the `pushdown_safe` node kinds reach it.
 fn rebase_columns(e: &RExpr, offset: usize) -> RExpr {
-    map_pushdown_safe(e, &|slot| Some(slot - offset)).expect("every column slot is rebased")
+    map_pushdown_safe(e, &|slot| Some(RExpr::Column(slot - offset)))
+        .expect("every column slot is rebased")
 }
 
-/// Clone a pushdown-safe tree with every column slot mapped through `column` (`None` from it fails
-/// the clone). Only the `pushdown_safe` node kinds and the `estimator_literal` leaves reach it.
-fn map_pushdown_safe(e: &RExpr, column: &dyn Fn(usize) -> Option<usize>) -> Option<RExpr> {
+/// Clone a pushdown-safe tree with every column node replaced by `column(slot)` (`None` from it
+/// fails the clone). Only the `pushdown_safe` node kinds and the `estimator_literal` leaves reach it.
+fn map_pushdown_safe(e: &RExpr, column: &dyn Fn(usize) -> Option<RExpr>) -> Option<RExpr> {
     let boxed = |e: &RExpr| map_pushdown_safe(e, column).map(Box::new);
     Some(match e {
-        RExpr::Column(i) => RExpr::Column(column(*i)?),
+        RExpr::Column(i) => column(*i)?,
         RExpr::Param(i) => RExpr::Param(*i),
         RExpr::And(l, r) => RExpr::And(boxed(l)?, boxed(r)?),
         RExpr::Or(l, r) => RExpr::Or(boxed(l)?, boxed(r)?),
@@ -714,6 +728,42 @@ fn map_pushdown_safe(e: &RExpr, column: &dyn Fn(usize) -> Option<usize>) -> Opti
         RExpr::IsNull { operand, negated } => RExpr::IsNull {
             operand: boxed(operand)?,
             negated: *negated,
+        },
+        RExpr::Like {
+            lhs,
+            rhs,
+            negated,
+            insensitive,
+        } => RExpr::Like {
+            lhs: boxed(lhs)?,
+            rhs: boxed(rhs)?,
+            negated: *negated,
+            insensitive: *insensitive,
+        },
+        RExpr::Cast {
+            inner,
+            target,
+            typmod,
+            varchar_len,
+            trap,
+        } => RExpr::Cast {
+            inner: boxed(inner)?,
+            target: *target,
+            typmod: typmod.clone(),
+            varchar_len: *varchar_len,
+            trap: *trap,
+        },
+        RExpr::ScalarFunc { func, args, result } => RExpr::ScalarFunc {
+            func: *func,
+            args: args
+                .iter()
+                .map(|a| map_pushdown_safe(a, column))
+                .collect::<Option<Vec<_>>>()?,
+            result: *result,
+        },
+        RExpr::Casing { upper, arg } => RExpr::Casing {
+            upper: *upper,
+            arg: boxed(arg)?,
         },
         RExpr::ConstInt(v) => RExpr::ConstInt(*v),
         RExpr::ConstBool(v) => RExpr::ConstBool(*v),

@@ -122,6 +122,12 @@
 #              aggregates, a never-pushed non-partition column, a grouped window body, single-reference
 #              CTEs (joined, chained, grouped, windowed, NULL-extended) and a two-reference
 #              (materialized) CTE must match by-construction rows.
+#   safe_conjunct_pushdown — conjuncts calling `traps = false` functions and casts, and LIKE / ILIKE
+#              with a proven pattern, move to their relation; a conjunct over a set operation moves into
+#              an arm the set operation widens, through the widening cast (planner.md §3.5/§3.6). The
+#              spelling over `col || ''` / `col + 0` never moves. Every join kind, a grouped body, a
+#              DISTINCT body the lossy decimal render must stay out of, a UNION ALL body it moves into,
+#              and i32/decimal, i32/i64, and f32/f64 arms must match by-construction rows.
 #   agg_order — an in-aggregate ORDER BY (aggregates.md §22) folds its input in key order; the same
 #              aggregate WITHOUT the clause over a derived table ordered by the same keys folds in that
 #              (input) order. Whole-table and grouped jsonb_agg, every direction / NULL placement, a
@@ -4684,6 +4690,184 @@ def gen_cte_window_pushdown(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: the broader safe-conjunct gate + widened set-operation arms ----------------------
+# A WHERE conjunct that calls a `traps = false` function or cast, or a LIKE / ILIKE with a proven
+# literal pattern, moves to its relation (planner.md §3.5); a conjunct over a set operation moves into
+# an arm the set operation widens, through the widening cast (§3.6). The unpushed spelling reads the
+# text column through `col || ''` (a concat, never classified) or an integer through `col + 0`
+# (arithmetic traps), the same values. Each template is [sql over column c, 3VL evaluator].
+def norec_like_regex(pattern, insensitive)
+  body = pattern.chars.map { |ch| ch == "%" ? ".*" : (ch == "_" ? "." : Regexp.escape(ch)) }.join
+  Regexp.new('\A' + body + '\z', insensitive ? Regexp::IGNORECASE : 0)
+end
+
+SAFE_TEXT_TEMPLATES = [
+  lambda { |c, r| k = r.rand(0..4); ["length(#{c}) > #{k}", ->(x) { x.nil? ? nil : x.length > k }] },
+  lambda { |c, r| k = r.rand(0..4); ["octet_length(#{c}) <= #{k}", ->(x) { x.nil? ? nil : x.bytesize <= k }] },
+  lambda { |c, r| w = %w[ab abc b ba].sample(random: r); ["lower(#{c}) = '#{w}'", ->(x) { x.nil? ? nil : x.downcase == w }] },
+  lambda { |c, r| w = %w[AB ABC B BA].sample(random: r); ["upper(#{c}) <> '#{w}'", ->(x) { x.nil? ? nil : x.upcase != w }] },
+  lambda { |c, r| p = %w[a ab A b].sample(random: r); ["starts_with(#{c}, '#{p}')", ->(x) { x.nil? ? nil : x.start_with?(p) }] },
+  lambda { |c, r| p = %w[a ab A b].sample(random: r); ["NOT starts_with(#{c}, '#{p}')", ->(x) { x.nil? ? nil : !x.start_with?(p) }] },
+  lambda { |c, r| s = %w[b a c].sample(random: r); k = r.rand(0..2); ["strpos(#{c}, '#{s}') = #{k}", ->(x) { x.nil? ? nil : ((i = x.index(s)) ? i + 1 : 0) == k }] },
+  lambda { |c, r| p = %w[a% %b _b% %b% ab].sample(random: r); ["#{c} LIKE '#{p}'", ->(x) { x.nil? ? nil : norec_like_regex(p, false).match?(x) }] },
+  lambda { |c, r| p = %w[a% %b _b% %B%].sample(random: r); ["#{c} NOT ILIKE '#{p}'", ->(x) { x.nil? ? nil : !norec_like_regex(p, true).match?(x) }] },
+  lambda { |c, r| p = %w[A% %B].sample(random: r); ["upper(#{c}) LIKE '#{p}'", ->(x) { x.nil? ? nil : norec_like_regex(p, false).match?(x.upcase) }] },
+  lambda { |c, _| ["#{c} IS NOT NULL AND length(#{c}) = length(btrim(#{c}))", ->(x) { x.nil? ? false : true }] },
+].freeze
+
+SAFE_INT_TEMPLATES = [
+  lambda { |c, r| k = r.rand(0..6); ["CAST(#{c} AS text) = '#{k}'", ->(x) { x.nil? ? nil : x.to_s == k.to_s }] },
+  lambda { |c, r| k = r.rand(0..6); ["CAST(#{c} AS decimal) >= #{k}", ->(x) { x.nil? ? nil : x >= k }] },
+  lambda { |c, r| k = r.rand(0..6); ["CAST(#{c} AS f64) < #{k}", ->(x) { x.nil? ? nil : x < k }] },
+  lambda { |c, r| k = r.rand(0..6); ["length(CAST(#{c} AS text)) = 1 AND CAST(#{c} AS i64) <> #{k}", ->(x) { x.nil? ? nil : (x.to_s.length == 1 && x != k) }] },
+].freeze
+
+SAFE_CONJUNCT_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                       query.where_eq query.comparison_order query.logical_connectives query.order_by
+                       query.order_by_keys query.qualified_column query.join_inner query.join_left
+                       query.join_right query.join_full query.distinct query.aggregates
+                       query.group_by query.union query.derived_table query.is_null
+                       query.where_pushdown query.derived_pushdown query.safe_conjunct_gate expr.like
+                       expr.ilike expr.text_concat expr.arithmetic func.casing cast.explicit
+                       cast.scalar_text null.three_valued types.i32 types.i64 types.text
+                       types.decimal types.f32 types.f64].freeze
+
+def gen_safe_conjunct_pushdown(seed)
+  rng = Random.new(seed)
+  vocab = ["ab", "Abc", "b", "abcd", "BA", "x", nil, "xab", "aB"]
+  decs = ["1.5", "1.50", "2", "2.0", "0.25", nil, "3"]
+  floats = [0.5, 1.25, 2.5, -0.75, 3, nil]
+  a = (1..20).to_a.sample(7, random: rng).sort.map do |id|
+    [id, rng.rand < 0.15 ? nil : rng.rand(1..5), vocab.sample(random: rng), decs.sample(random: rng)]
+  end
+  b = (101..120).to_a.sample(6, random: rng).sort.map { |id| [id, rng.rand(2..6), vocab.sample(random: rng)] }
+  r = (1..10).to_a.sample(4, random: rng).sort.map { |id| [id, floats.sample(random: rng)] }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  tlit = ->(x) { x.nil? ? "NULL" : "'#{x}'" }
+  rat = ->(x) { x.nil? ? nil : Rational(x.to_s) }
+  fmt_f = ->(x) { x.nil? ? "NULL" : (x == x.to_i ? x.to_i.to_s : x.to_s) }
+  nkey = ->(x) { x.nil? ? [1, ""] : [0, x] }
+  flat = lambda do |rows|
+    rows.sort_by { |row| row.flat_map { |x| nkey.call(x) } }.flat_map { |row| row.map { |x| lit.call(x) } }
+  end
+  pick_text = lambda do |col|
+    sql, fn = SAFE_TEXT_TEMPLATES.sample(random: rng).call(col, rng)
+    [sql, fn, sql.gsub(col, "(#{col} || '')")]
+  end
+  pick_int = lambda do |col|
+    sql, fn = SAFE_INT_TEMPLATES.sample(random: rng).call(col, rng)
+    [sql, fn, sql.gsub(col, "#{col} + 0")]
+  end
+  pair = lambda do |out, cols, sql, exp, sort: "nosort"|
+    out << "# pushed spelling"
+    out << "query #{cols} #{sort}" << sql.call(0) << "----"
+    out.concat(exp) << ""
+    out << "# unpushed spelling (a concat / arithmetic operand) — MUST match"
+    out << "query #{cols} #{sort}" << sql.call(1) << "----"
+    out.concat(exp) << ""
+  end
+
+  out = header(seed, SAFE_CONJUNCT_REQ, "safe-conjunct gate and widened set-operation arm pushdown")
+  stmt(out, "CREATE TABLE a (id i32 PRIMARY KEY, k i32, s text, d decimal)")
+  stmt(out, "CREATE TABLE b (id i32 PRIMARY KEY, k i32, t text)")
+  stmt(out, "CREATE TABLE r (id i32 PRIMARY KEY, v f32)")
+  stmt(out, "CREATE TABLE n (id i64 PRIMARY KEY, f f64)")
+  stmt(out, "INSERT INTO a VALUES #{a.map { |id, k, s, d| "(#{id}, #{lit.call(k)}, #{tlit.call(s)}, #{lit.call(d)})" }.join(', ')}")
+  stmt(out, "INSERT INTO b VALUES #{b.map { |id, k, t| "(#{id}, #{k}, #{tlit.call(t)})" }.join(', ')}")
+  stmt(out, "INSERT INTO r VALUES #{r.map { |id, v| "(#{id}, #{lit.call(v)})" }.join(', ')}")
+  n = [[2, 0.5], [5_000_000_000, -2], [7, nil]]
+  stmt(out, "INSERT INTO n VALUES #{n.map { |id, f| "(#{id}, #{lit.call(f)})" }.join(', ')}")
+
+  # Join shapes: a function / LIKE conjunct per side, pushed only where the side is preserved.
+  matched = a.flat_map { |ar| b.select { |br| br[1] == ar[1] }.map { |br| [ar, br] } }
+  left = a.flat_map { |ar| (m = b.select { |br| br[1] == ar[1] }).empty? ? [[ar, nil]] : m.map { |br| [ar, br] } }
+  right_only = b.reject { |br| a.any? { |ar| ar[1] == br[1] } }.map { |br| [nil, br] }
+  left_only = a.reject { |ar| b.any? { |br| br[1] == ar[1] } }.map { |ar| [ar, nil] }
+  [["INNER", "JOIN", matched], ["LEFT", "LEFT JOIN", left], ["RIGHT", "RIGHT JOIN", matched + right_only],
+   ["FULL", "FULL JOIN", matched + left_only + right_only]].each do |title, join, rows|
+    pa_sql, pa, pa_scan = pick_text.call("a.s")
+    pb_sql, pb, pb_scan = pick_text.call("b.t")
+    exp = rows.select { |ar, br| pa.call(ar&.at(2)) == true && pb.call(br&.at(2)) == true }
+              .map { |ar, br| [ar&.first, br&.first] }
+    out << "# #{title}: a classified-function conjunct per side"
+    pair.call(out, "II", lambda { |m|
+      "SELECT a.id, b.id FROM a #{join} b ON a.k = b.k WHERE #{[pa_sql, pa_scan][m]} AND #{[pb_sql, pb_scan][m]} " \
+        "ORDER BY a.id, b.id"
+    }, flat.call(exp))
+  end
+
+  # A classified cast of an integer column in a join.
+  pk_sql, pk, pk_scan = pick_int.call("a.k")
+  exp = matched.select { |ar, _| pk.call(ar[1]) == true }.map { |ar, br| [ar.first, br.first] }
+  out << "# INNER: a classified-cast conjunct"
+  pair.call(out, "II", lambda { |m|
+    "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE #{[pk_sql, pk_scan][m]} ORDER BY a.id, b.id"
+  }, flat.call(exp))
+
+  # A function over a grouping column moves below the grouping.
+  ps_sql, ps, ps_scan = pick_text.call("g.s")
+  groups = a.group_by { |row| row[2] }.map { |s, rows| [s, rows.size] }
+  exp = groups.select { |s, _| ps.call(s) == true }
+  out << "# a grouped body: the function conjunct moves below the grouping"
+  pair.call(out, "TI", lambda { |m|
+    "SELECT g.s, g.n FROM (SELECT s, count(*) AS n FROM a GROUP BY s) g WHERE #{[ps_sql, ps_scan][m]} ORDER BY g.s"
+  }, exp.sort_by { |s, _| nkey.call(s) }.flat_map { |s, c| [s.nil? ? "NULL" : s, c.to_s] })
+
+  # A decimal render can separate equal values: kept above a DISTINCT body (which keeps the first of
+  # equal rows in scan order), moved into a UNION ALL body.
+  want = decs.compact.sample(random: rng)
+  firsts = []
+  a.each { |row| firsts << row[3] unless firsts.any? { |f| rat.call(f) == rat.call(row[3]) } }
+  exp = firsts.select { |d| !d.nil? && d == want }
+  out << "# a DISTINCT body: the lossy decimal render stays above it"
+  pair.call(out, "D", lambda { |m|
+    col = ["q.d", "q.d + 0"][m]
+    "SELECT q.d FROM (SELECT DISTINCT d FROM a) q WHERE CAST(#{col} AS text) = '#{want}' ORDER BY q.d"
+  }, exp)
+  exp = (a + a).map { |row| row[3] }.select { |d| d == want }
+  out << "# a UNION ALL body: the lossy render moves into each arm"
+  pair.call(out, "D", lambda { |m|
+    col = ["q.d", "q.d + 0"][m]
+    "SELECT q.d FROM (SELECT d FROM a UNION ALL SELECT d FROM a) q WHERE CAST(#{col} AS text) = '#{want}' ORDER BY q.d"
+  }, exp)
+
+  # Widened arms: i32 under decimal (CAST), i32 under i64 (bare), f32 under f64 (CAST).
+  k = rng.rand(1..4)
+  vals = a.map { |row| [row[1].nil? ? nil : row[1].to_s, rat.call(row[1])] } + a.map { |row| [row[3], rat.call(row[3])] }
+  exp = vals.select { |_, v| !v.nil? && v >= k }.map(&:first)
+  out << "# UNION ALL of i32 and decimal arms: the i32 arm reads k through CAST(… AS decimal)"
+  pair.call(out, "D", lambda { |m|
+    col = ["s.x", "s.x + 0"][m]
+    "SELECT s.x FROM (SELECT k AS x FROM a UNION ALL SELECT d FROM a) s WHERE #{col} >= #{k}"
+  }, exp, sort: "rowsort")
+  uniq = []
+  vals.each { |str, v| uniq << [str, v] unless uniq.any? { |_, u| u == v } }
+  exp = uniq.select { |_, v| !v.nil? && v < k }.map(&:first)
+  out << "# UNION of i32 and decimal arms (first of equal values kept)"
+  pair.call(out, "D", lambda { |m|
+    col = ["s.x", "s.x + 0"][m]
+    "SELECT s.x FROM (SELECT k AS x FROM a UNION SELECT d FROM a) s WHERE #{col} < #{k}"
+  }, exp, sort: "rowsort")
+  ids = a.map(&:first) + n.map(&:first)
+  want_id = [ids.sample(random: rng), 5_000_000_000].sample(random: rng)
+  exp = ids.select { |id| id == want_id }.map(&:to_s)
+  out << "# UNION ALL of i32 and i64 arms: the i32 arm takes the conjunct as written"
+  pair.call(out, "I", lambda { |m|
+    col = ["s.id", "s.id + 0"][m]
+    "SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM n) s WHERE #{col} = #{want_id}"
+  }, exp, sort: "rowsort")
+  fk = [0, 1, 2].sample(random: rng)
+  fvals = r.map { |_, v| v } + n.map { |_, f| f }
+  exp = fvals.select { |v| !v.nil? && v > fk }.map { |v| fmt_f.call(v) }
+  out << "# UNION ALL of f32 and f64 arms: the f32 arm reads v through CAST(… AS f64)"
+  pair.call(out, "R", lambda { |m|
+    col = ["s.v", "s.v + 0"][m]
+    "SELECT s.v FROM (SELECT v FROM r UNION ALL SELECT f FROM n) s WHERE #{col} > #{fk}"
+  }, exp, sort: "rowsort")
+
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
   "pushdown" => method(:gen_pushdown),
   "composite_pk" => method(:gen_composite_pk),
@@ -4747,6 +4931,7 @@ SCENARIOS = {
   "derived_pushdown" => method(:gen_derived_pushdown),
   "grouped_setop_pushdown" => method(:gen_grouped_setop_pushdown),
   "cte_window_pushdown" => method(:gen_cte_window_pushdown),
+  "safe_conjunct_pushdown" => method(:gen_safe_conjunct_pushdown),
   "view" => method(:gen_view),
   "view_write" => method(:gen_view_write),
 }.freeze

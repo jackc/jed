@@ -32,6 +32,11 @@ pub struct OperatorDesc {
     /// in place of `operator_eval`. 0 = absent ⇒ use the uniform `operator_eval`. Size-scaled
     /// cost (decimal_work / varlen_compare / …) is separate from this static base.
     pub cost: i64,
+    /// Trap classification (functions.md §15): false asserts the kernel raises nothing for any
+    /// arguments, is immutable, and reads only its arguments. Name-level. Default true.
+    pub traps: bool,
+    /// With `traps = false`: equal arguments give equal results (functions.md §15).
+    pub preserves_equality: bool,
 }
 
 /// Every operator in the catalog, in catalog order.
@@ -53,6 +58,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "and",
@@ -70,6 +77,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "not",
@@ -87,6 +96,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -104,6 +115,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -121,6 +134,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -138,6 +153,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -155,6 +172,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -172,6 +191,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -189,6 +210,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -206,6 +229,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -223,6 +248,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -240,6 +267,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -257,6 +286,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -274,6 +305,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -291,6 +324,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -308,6 +343,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -325,6 +362,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -342,6 +381,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -359,6 +400,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "like",
@@ -376,6 +419,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ilike",
@@ -393,6 +438,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regex_match",
@@ -410,6 +457,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regex_imatch",
@@ -427,6 +476,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -444,6 +495,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -461,6 +514,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -478,6 +533,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -495,6 +552,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -512,6 +571,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -529,6 +590,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -546,6 +609,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -563,6 +628,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -580,6 +647,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -597,6 +666,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -614,6 +685,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -631,6 +704,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -648,6 +723,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -665,6 +742,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -682,6 +761,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -699,6 +780,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -716,6 +799,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -733,6 +818,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -750,6 +837,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -767,6 +856,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -784,6 +875,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -801,6 +894,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -818,6 +913,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -835,6 +932,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -852,6 +951,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -869,6 +970,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -886,6 +989,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -903,6 +1008,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -920,6 +1027,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -937,6 +1046,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -954,6 +1065,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -971,6 +1084,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -988,6 +1103,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -1005,6 +1122,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -1022,6 +1141,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -1039,6 +1160,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -1056,6 +1179,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -1073,6 +1198,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -1090,6 +1217,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -1107,6 +1236,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -1124,6 +1255,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -1141,6 +1274,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -1158,6 +1293,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -1175,6 +1312,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -1192,6 +1331,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -1209,6 +1350,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -1226,6 +1369,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -1243,6 +1388,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -1260,6 +1407,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -1277,6 +1426,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -1294,6 +1445,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -1311,6 +1464,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -1328,6 +1483,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -1345,6 +1502,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -1362,6 +1521,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -1379,6 +1540,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "eq",
@@ -1396,6 +1559,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ne",
@@ -1413,6 +1578,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lt",
@@ -1430,6 +1597,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gt",
@@ -1447,6 +1616,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "le",
@@ -1464,6 +1635,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ge",
@@ -1481,6 +1654,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -1498,6 +1673,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -1515,6 +1692,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_null",
@@ -1532,6 +1711,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "is_not_null",
@@ -1549,6 +1730,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -1566,6 +1749,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -1583,6 +1768,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mul",
@@ -1600,6 +1787,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "div",
@@ -1617,6 +1806,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mod",
@@ -1634,6 +1825,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "neg",
@@ -1651,6 +1844,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -1668,6 +1863,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -1685,6 +1882,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mul",
@@ -1702,6 +1901,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "div",
@@ -1719,6 +1920,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mod",
@@ -1736,6 +1939,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "neg",
@@ -1753,6 +1958,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -1770,6 +1977,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -1787,6 +1996,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "neg",
@@ -1804,6 +2015,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -1821,6 +2034,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -1838,6 +2053,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -1855,6 +2072,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -1872,6 +2091,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -1889,6 +2110,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -1906,6 +2129,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -1923,6 +2148,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -1940,6 +2167,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mul",
@@ -1957,6 +2186,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mul",
@@ -1974,6 +2205,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mul",
@@ -1991,6 +2224,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mul",
@@ -2008,6 +2243,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "div",
@@ -2025,6 +2262,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "div",
@@ -2042,6 +2281,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -2059,6 +2300,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -2076,6 +2319,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -2093,6 +2338,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -2110,6 +2357,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -2127,6 +2376,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -2144,6 +2395,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -2161,6 +2414,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "add",
@@ -2178,6 +2433,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sub",
@@ -2195,6 +2452,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mul",
@@ -2212,6 +2471,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "div",
@@ -2229,6 +2490,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "mod",
@@ -2246,6 +2509,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "neg",
@@ -2263,6 +2528,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "abs",
@@ -2280,6 +2547,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "abs",
@@ -2297,6 +2566,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "round",
@@ -2314,6 +2585,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "round",
@@ -2331,6 +2604,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "round",
@@ -2348,6 +2623,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "round",
@@ -2365,6 +2642,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ceil",
@@ -2382,6 +2661,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ceil",
@@ -2399,6 +2680,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ceiling",
@@ -2416,6 +2699,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ceiling",
@@ -2433,6 +2718,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "floor",
@@ -2450,6 +2737,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "floor",
@@ -2467,6 +2756,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "trunc",
@@ -2484,6 +2775,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "trunc",
@@ -2501,6 +2794,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "trunc",
@@ -2518,6 +2813,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "trunc",
@@ -2535,6 +2832,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "abs",
@@ -2552,6 +2851,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ceil",
@@ -2569,6 +2870,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ceiling",
@@ -2586,6 +2889,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "floor",
@@ -2603,6 +2908,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "trunc",
@@ -2620,6 +2927,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "round",
@@ -2637,6 +2946,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "round",
@@ -2654,6 +2965,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sqrt",
@@ -2671,6 +2984,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "exp",
@@ -2688,6 +3003,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ln",
@@ -2705,6 +3022,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "log10",
@@ -2722,6 +3041,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "pow",
@@ -2739,6 +3060,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "power",
@@ -2756,6 +3079,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sqrt",
@@ -2773,6 +3098,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "exp",
@@ -2790,6 +3117,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "ln",
@@ -2807,6 +3136,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "log",
@@ -2824,6 +3155,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "log10",
@@ -2841,6 +3174,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "log",
@@ -2858,6 +3193,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "power",
@@ -2875,6 +3212,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "pow",
@@ -2892,6 +3231,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sin",
@@ -2909,6 +3250,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "cos",
@@ -2926,6 +3269,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "tan",
@@ -2943,6 +3288,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "cbrt",
@@ -2960,6 +3307,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "pi",
@@ -2977,6 +3326,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "radians",
@@ -2994,6 +3345,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "degrees",
@@ -3011,6 +3364,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "asin",
@@ -3028,6 +3383,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "acos",
@@ -3045,6 +3402,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "atan",
@@ -3062,6 +3421,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "atan2",
@@ -3079,6 +3440,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "cot",
@@ -3096,6 +3459,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sinh",
@@ -3113,6 +3478,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "cosh",
@@ -3130,6 +3497,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "tanh",
@@ -3147,6 +3516,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "asinh",
@@ -3164,6 +3535,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "acosh",
@@ -3181,6 +3554,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "atanh",
@@ -3198,6 +3573,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sign",
@@ -3215,6 +3592,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sign",
@@ -3232,6 +3611,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "factorial",
@@ -3249,6 +3630,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "scale",
@@ -3266,6 +3649,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "min_scale",
@@ -3283,6 +3668,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "trim_scale",
@@ -3300,6 +3687,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "make_interval",
@@ -3317,6 +3706,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "justify_hours",
@@ -3334,6 +3725,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "justify_days",
@@ -3351,6 +3744,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "justify_interval",
@@ -3368,6 +3763,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "age",
@@ -3385,6 +3782,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "age",
@@ -3402,6 +3801,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "age",
@@ -3419,6 +3820,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "age",
@@ -3436,6 +3839,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "make_timestamp",
@@ -3453,6 +3858,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "make_timestamptz",
@@ -3470,6 +3877,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "make_timestamptz",
@@ -3487,6 +3896,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "make_date",
@@ -3504,6 +3915,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "current_date",
@@ -3521,6 +3934,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "date_part",
@@ -3538,6 +3953,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "date_part",
@@ -3555,6 +3972,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "date_part",
@@ -3572,6 +3991,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "date_part",
@@ -3589,6 +4010,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_char",
@@ -3776,6 +4199,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "uuid_extract_timestamp",
@@ -3793,6 +4218,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "uuidv4",
@@ -3810,6 +4237,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "gen_random_uuid",
@@ -3844,6 +4273,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "uuidv7",
@@ -3861,6 +4292,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "now",
@@ -3878,6 +4311,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "clock_timestamp",
@@ -3895,6 +4330,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "nextval",
@@ -3912,6 +4349,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "currval",
@@ -3929,6 +4368,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "setval",
@@ -3946,6 +4387,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "setval",
@@ -3963,6 +4406,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lastval",
@@ -3980,6 +4425,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "current_setting",
@@ -3997,6 +4444,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "current_setting",
@@ -4014,6 +4463,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "num_nulls",
@@ -4031,6 +4482,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "num_nonnulls",
@@ -4048,6 +4501,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_ndims",
@@ -4065,6 +4520,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_length",
@@ -4082,6 +4539,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_lower",
@@ -4099,6 +4558,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_upper",
@@ -4116,6 +4577,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "cardinality",
@@ -4133,6 +4596,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_dims",
@@ -4150,6 +4615,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_to_json",
@@ -4167,6 +4634,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_to_json",
@@ -4184,6 +4653,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_append",
@@ -4201,6 +4672,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_prepend",
@@ -4218,6 +4691,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_cat",
@@ -4235,6 +4710,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_remove",
@@ -4252,6 +4729,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_replace",
@@ -4269,6 +4748,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_position",
@@ -4286,6 +4767,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_position",
@@ -4303,6 +4786,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_positions",
@@ -4320,6 +4805,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_to_string",
@@ -4405,6 +4892,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "concat",
@@ -4422,6 +4911,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "concat",
@@ -4439,6 +4930,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "concat",
@@ -4456,6 +4949,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "concat",
@@ -4473,6 +4968,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "contains",
@@ -4490,6 +4987,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "contained_by",
@@ -4507,6 +5006,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "overlaps",
@@ -4524,6 +5025,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "contains",
@@ -4541,6 +5044,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "contains",
@@ -4558,6 +5063,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "contained_by",
@@ -4575,6 +5082,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "contained_by",
@@ -4592,6 +5101,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "overlaps",
@@ -4609,6 +5120,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "strictly_left",
@@ -4626,6 +5139,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "strictly_right",
@@ -4643,6 +5158,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "not_extend_right",
@@ -4660,6 +5177,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "not_extend_left",
@@ -4677,6 +5196,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "adjacent",
@@ -4694,6 +5215,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lower",
@@ -4711,6 +5234,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "upper",
@@ -4728,6 +5253,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "lower",
@@ -4745,6 +5272,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "upper",
@@ -4762,6 +5291,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "length",
@@ -4779,6 +5310,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "length",
@@ -4796,6 +5329,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "char_length",
@@ -4813,6 +5348,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "character_length",
@@ -4830,6 +5367,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "octet_length",
@@ -4847,6 +5386,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "octet_length",
@@ -4864,6 +5405,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "bit_length",
@@ -4881,6 +5424,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "bit_length",
@@ -4898,6 +5443,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "substr",
@@ -4915,6 +5462,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "substr",
@@ -4932,6 +5481,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "substr",
@@ -4949,6 +5500,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "substr",
@@ -4966,6 +5519,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "substring",
@@ -4983,6 +5538,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "substring",
@@ -5000,6 +5557,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "substring",
@@ -5017,6 +5576,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "substring",
@@ -5034,6 +5595,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "substring",
@@ -5068,6 +5631,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "overlay",
@@ -5085,6 +5650,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "overlay",
@@ -5102,6 +5669,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "overlay",
@@ -5119,6 +5688,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "left",
@@ -5136,6 +5707,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "right",
@@ -5153,6 +5726,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lpad",
@@ -5170,6 +5745,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lpad",
@@ -5187,6 +5764,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "rpad",
@@ -5204,6 +5783,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "rpad",
@@ -5221,6 +5802,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "btrim",
@@ -5238,6 +5821,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "btrim",
@@ -5255,6 +5840,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "btrim",
@@ -5272,6 +5859,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "ltrim",
@@ -5289,6 +5878,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "ltrim",
@@ -5306,6 +5897,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "ltrim",
@@ -5323,6 +5916,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "rtrim",
@@ -5340,6 +5935,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "rtrim",
@@ -5357,6 +5954,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "rtrim",
@@ -5374,6 +5973,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "replace",
@@ -5391,6 +5992,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "translate",
@@ -5408,6 +6011,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "repeat",
@@ -5425,6 +6030,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "reverse",
@@ -5442,6 +6049,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "strpos",
@@ -5459,6 +6068,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "position",
@@ -5476,6 +6087,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "position",
@@ -5493,6 +6106,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "split_part",
@@ -5510,6 +6125,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "starts_with",
@@ -5527,6 +6144,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "ascii",
@@ -5544,6 +6163,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "chr",
@@ -5561,6 +6182,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "initcap",
@@ -5578,6 +6201,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "to_hex",
@@ -5595,6 +6220,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "encode",
@@ -5612,6 +6239,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "decode",
@@ -5629,6 +6258,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "get_byte",
@@ -5646,6 +6277,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "set_byte",
@@ -5663,6 +6296,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "get_bit",
@@ -5680,6 +6315,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "set_bit",
@@ -5697,6 +6334,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "md5",
@@ -5714,6 +6353,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "md5",
@@ -5731,6 +6372,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: false,
+        preserves_equality: true,
     },
     OperatorDesc {
         name: "sha224",
@@ -5748,6 +6391,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sha256",
@@ -5765,6 +6410,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sha384",
@@ -5782,6 +6429,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "sha512",
@@ -5799,6 +6448,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "quote_literal",
@@ -5816,6 +6467,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "quote_ident",
@@ -5833,6 +6486,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "quote_nullable",
@@ -5850,6 +6505,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "like_escape",
@@ -5867,6 +6524,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "concat",
@@ -5935,6 +6594,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_replace",
@@ -5952,6 +6613,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_match",
@@ -5969,6 +6632,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_match",
@@ -5986,6 +6651,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_split_to_array",
@@ -6003,6 +6670,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_split_to_array",
@@ -6020,6 +6689,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_like",
@@ -6037,6 +6708,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_like",
@@ -6054,6 +6727,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_count",
@@ -6071,6 +6746,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_count",
@@ -6088,6 +6765,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_count",
@@ -6105,6 +6784,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_substr",
@@ -6122,6 +6803,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_substr",
@@ -6139,6 +6822,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_substr",
@@ -6156,6 +6841,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_substr",
@@ -6173,6 +6860,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_substr",
@@ -6190,6 +6879,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_instr",
@@ -6207,6 +6898,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_instr",
@@ -6224,6 +6917,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_instr",
@@ -6241,6 +6936,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_instr",
@@ -6258,6 +6955,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_instr",
@@ -6275,6 +6974,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_instr",
@@ -6292,6 +6993,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "isempty",
@@ -6309,6 +7012,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lower_inc",
@@ -6326,6 +7031,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "upper_inc",
@@ -6343,6 +7050,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "lower_inf",
@@ -6360,6 +7069,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "upper_inf",
@@ -6377,6 +7088,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "i32range",
@@ -6394,6 +7107,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "i32range",
@@ -6411,6 +7126,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "i64range",
@@ -6428,6 +7145,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "i64range",
@@ -6445,6 +7164,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "numrange",
@@ -6462,6 +7183,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "numrange",
@@ -6479,6 +7202,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "tsrange",
@@ -6496,6 +7221,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "tsrange",
@@ -6513,6 +7240,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "tstzrange",
@@ -6530,6 +7259,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "tstzrange",
@@ -6547,6 +7278,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "daterange",
@@ -6564,6 +7297,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "daterange",
@@ -6581,6 +7316,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "range_union",
@@ -6598,6 +7335,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "range_difference",
@@ -6615,6 +7354,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "range_intersect",
@@ -6632,6 +7373,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "range_merge",
@@ -6649,6 +7392,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "jsonb_typeof",
@@ -6666,6 +7411,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "json_typeof",
@@ -6683,6 +7430,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "jsonb_array_length",
@@ -6700,6 +7449,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "json_array_length",
@@ -6717,6 +7468,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "jsonb_strip_nulls",
@@ -6734,6 +7487,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "json_strip_nulls",
@@ -6751,6 +7506,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "jsonb_pretty",
@@ -6768,6 +7525,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_jsonb",
@@ -6785,6 +7544,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_json",
@@ -6802,6 +7563,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "json_scalar",
@@ -6819,6 +7582,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "json_serialize",
@@ -6836,6 +7601,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "json_serialize",
@@ -6853,6 +7620,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "jsonb_build_array",
@@ -6870,6 +7639,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "json_build_array",
@@ -6887,6 +7658,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "jsonb_build_object",
@@ -6904,6 +7677,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "json_build_object",
@@ -6921,6 +7696,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
 ];
 
@@ -7803,4 +8580,41 @@ pub const WINDOWS: &[WindowDesc] = &[
         null: "frame",
         errors: &["22016"],
     },
+];
+
+/// One cast spec/types/casts.toml classifies `traps = false` (functions.md §15): it raises
+/// nothing for any source value. `preserves_equality` says equal sources give equal results.
+pub struct CastTrapDesc {
+    pub from: &'static str,
+    pub to: &'static str,
+    pub preserves_equality: bool,
+}
+
+/// Every non-trapping cast, in casts.toml order (the planner's safe-conjunct gate,
+/// planner.md §3.5). A cast absent from this table may trap.
+#[rustfmt::skip]
+pub const NON_TRAPPING_CASTS: &[CastTrapDesc] = &[
+    CastTrapDesc { from: "i16", to: "i32", preserves_equality: true },
+    CastTrapDesc { from: "i16", to: "i64", preserves_equality: true },
+    CastTrapDesc { from: "i32", to: "i64", preserves_equality: true },
+    CastTrapDesc { from: "i16", to: "decimal", preserves_equality: true },
+    CastTrapDesc { from: "i32", to: "decimal", preserves_equality: true },
+    CastTrapDesc { from: "i64", to: "decimal", preserves_equality: true },
+    CastTrapDesc { from: "i16", to: "f64", preserves_equality: true },
+    CastTrapDesc { from: "i32", to: "f64", preserves_equality: true },
+    CastTrapDesc { from: "i64", to: "f64", preserves_equality: true },
+    CastTrapDesc { from: "f32", to: "f64", preserves_equality: true },
+    CastTrapDesc { from: "i16", to: "f32", preserves_equality: true },
+    CastTrapDesc { from: "i32", to: "f32", preserves_equality: true },
+    CastTrapDesc { from: "i64", to: "f32", preserves_equality: true },
+    CastTrapDesc { from: "boolean", to: "i32", preserves_equality: true },
+    CastTrapDesc { from: "i32", to: "boolean", preserves_equality: true },
+    CastTrapDesc { from: "uuid", to: "text", preserves_equality: true },
+    CastTrapDesc { from: "i16", to: "text", preserves_equality: true },
+    CastTrapDesc { from: "i32", to: "text", preserves_equality: true },
+    CastTrapDesc { from: "i64", to: "text", preserves_equality: true },
+    CastTrapDesc { from: "decimal", to: "text", preserves_equality: false },
+    CastTrapDesc { from: "f32", to: "text", preserves_equality: false },
+    CastTrapDesc { from: "f64", to: "text", preserves_equality: false },
+    CastTrapDesc { from: "boolean", to: "text", preserves_equality: true },
 ];

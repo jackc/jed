@@ -55,6 +55,10 @@
 #  16. OPTIONAL cost (functions.md §8): if present, a positive integer — the per-operator
 #      evaluation base. Absent ⇒ the uniform operator_eval. NAME-level: overloads sharing a name
 #      must agree.
+#  17. OPTIONAL traps (functions.md §15): if present, a boolean, only on a scalar function
+#      (kind = "function"); absent ⇒ true. traps = false requires errors = [], volatility =
+#      "immutable", and a boolean preserves_equality (which is otherwise absent). NAME-level: every
+#      overload sharing a name agrees on both (the planner looks them up by name).
 #
 # Exit 0 = catalog is internally coherent and cross-references resolve; nonzero =
 # the offending problem.
@@ -155,6 +159,7 @@ def main
   symbol_sigs = [] # [symbol, kind, arity, arg_families] — unique per overload
   param_pos = {}   # [name, param_name] => position — cross-overload name→slot consistency
   costs_by_name = Hash.new { |h, k| h[k] = [] } # name => [explicit cost weights] — must agree (16)
+  traps_by_name = Hash.new { |h, k| h[k] = [] } # name => [[traps, preserves_equality]] — must agree (17)
 
   operators.each do |op|
     id = op["name"] || "(unnamed)"
@@ -275,6 +280,24 @@ def main
       costs_by_name[op["name"]] << c
     end
 
+    # (17) optional trap classification (functions.md §15); absent ⇒ traps. NAME-level (checked
+    # after the loop) — the planner's safe-conjunct gate looks it up by the call's name.
+    if op.key?("traps")
+      tr = op["traps"]
+      fail!("operator #{id}: traps #{tr.inspect} must be a boolean") unless [true, false].include?(tr)
+      fail!("operator #{id}: traps is valid only on a scalar function (kind = \"function\")") unless kind == "function"
+    end
+    traps = op.fetch("traps", true)
+    if traps
+      fail!("operator #{id}: preserves_equality is meaningful only with traps = false") if op.key?("preserves_equality")
+    else
+      fail!("operator #{id}: traps = false requires errors = []") unless (op["errors"] || []).empty?
+      fail!("operator #{id}: traps = false requires volatility = \"immutable\"") unless op["volatility"] == "immutable"
+      pe = op["preserves_equality"]
+      fail!("operator #{id}: traps = false requires a boolean preserves_equality") unless [true, false].include?(pe)
+    end
+    traps_by_name[op["name"]] << [traps, op["preserves_equality"]] if kind == "function"
+
     # (9) collect for uniqueness — keyed by operand-family signature, so an operator
     # overloaded across families (one row per arg_families) is allowed; a true
     # duplicate (same name AND same operand families) is still rejected.
@@ -286,6 +309,12 @@ def main
   costs_by_name.each do |name, cs|
     next if cs.uniq.length <= 1
     fail!("operator #{name.inspect}: overloads disagree on cost (#{cs.uniq.sort.join(', ')}); the base is name-level")
+  end
+
+  # (17) same-named functions must agree on their trap classification (it is looked up by name).
+  traps_by_name.each do |name, cls|
+    next if cls.uniq.length <= 1
+    fail!("function #{name.inspect}: overloads disagree on traps/preserves_equality (#{cls.uniq.inspect}); the classification is name-level")
   end
 
   # (9) uniqueness of overload signatures

@@ -32,6 +32,11 @@ export interface OperatorDesc {
   // place of operatorEval. 0 = absent ⇒ use the uniform operatorEval. Size-scaled cost
   // (decimalWork / varlenCompare / …) is separate from this static base.
   cost: number;
+  // Trap classification (functions.md §15): false asserts the kernel raises nothing for any
+  // arguments, is immutable, and reads only its arguments. Name-level. Default true.
+  traps: boolean;
+  // With traps = false: equal arguments give equal results (functions.md §15).
+  preservesEquality: boolean;
 }
 
 // Every operator in the catalog, in catalog order.
@@ -51,6 +56,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "and",
@@ -67,6 +74,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "not",
@@ -83,6 +92,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -100,6 +111,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -117,6 +130,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -134,6 +149,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -151,6 +168,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -168,6 +187,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -185,6 +206,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -201,6 +224,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -217,6 +242,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -234,6 +261,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -251,6 +280,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -268,6 +299,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -285,6 +318,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -302,6 +337,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -319,6 +356,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -335,6 +374,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -351,6 +392,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "like",
@@ -367,6 +410,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ilike",
@@ -383,6 +428,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regex_match",
@@ -400,6 +447,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regex_imatch",
@@ -417,6 +466,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -434,6 +485,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -451,6 +504,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -468,6 +523,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -485,6 +542,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -502,6 +561,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -519,6 +580,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -535,6 +598,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -551,6 +616,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -568,6 +635,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -585,6 +654,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -602,6 +673,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -619,6 +692,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -636,6 +711,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -653,6 +730,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -669,6 +748,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -685,6 +766,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -702,6 +785,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -719,6 +804,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -736,6 +823,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -753,6 +842,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -770,6 +861,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -787,6 +880,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -803,6 +898,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -819,6 +916,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -836,6 +935,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -853,6 +954,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -870,6 +973,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -887,6 +992,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -904,6 +1011,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -921,6 +1030,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -937,6 +1048,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -953,6 +1066,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -970,6 +1085,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -987,6 +1104,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -1004,6 +1123,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -1021,6 +1142,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -1038,6 +1161,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -1055,6 +1180,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -1071,6 +1198,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -1087,6 +1216,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -1104,6 +1235,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -1121,6 +1254,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -1138,6 +1273,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -1155,6 +1292,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -1172,6 +1311,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -1189,6 +1330,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -1205,6 +1348,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -1221,6 +1366,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -1238,6 +1385,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -1255,6 +1404,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -1272,6 +1423,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -1289,6 +1442,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -1306,6 +1461,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -1323,6 +1480,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -1339,6 +1498,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -1355,6 +1516,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "eq",
@@ -1372,6 +1535,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ne",
@@ -1389,6 +1554,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lt",
@@ -1406,6 +1573,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gt",
@@ -1423,6 +1592,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "le",
@@ -1440,6 +1611,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ge",
@@ -1457,6 +1630,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_distinct_from",
@@ -1473,6 +1648,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_distinct_from",
@@ -1489,6 +1666,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_null",
@@ -1505,6 +1684,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "is_not_null",
@@ -1521,6 +1702,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -1538,6 +1721,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -1555,6 +1740,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mul",
@@ -1572,6 +1759,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "div",
@@ -1589,6 +1778,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mod",
@@ -1606,6 +1797,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "neg",
@@ -1623,6 +1816,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -1640,6 +1835,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -1657,6 +1854,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mul",
@@ -1674,6 +1873,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "div",
@@ -1691,6 +1892,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mod",
@@ -1708,6 +1911,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "neg",
@@ -1725,6 +1930,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -1742,6 +1949,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -1759,6 +1968,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "neg",
@@ -1776,6 +1987,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -1793,6 +2006,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -1810,6 +2025,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -1827,6 +2044,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -1844,6 +2063,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -1861,6 +2082,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -1878,6 +2101,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -1895,6 +2120,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -1912,6 +2139,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mul",
@@ -1929,6 +2158,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mul",
@@ -1946,6 +2177,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mul",
@@ -1963,6 +2196,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mul",
@@ -1980,6 +2215,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "div",
@@ -1997,6 +2234,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "div",
@@ -2014,6 +2253,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -2031,6 +2272,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -2048,6 +2291,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -2065,6 +2310,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -2082,6 +2329,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -2099,6 +2348,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -2116,6 +2367,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -2133,6 +2386,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "add",
@@ -2150,6 +2405,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sub",
@@ -2167,6 +2424,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mul",
@@ -2184,6 +2443,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "div",
@@ -2201,6 +2462,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "mod",
@@ -2218,6 +2481,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "neg",
@@ -2235,6 +2500,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "abs",
@@ -2251,6 +2518,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "abs",
@@ -2267,6 +2536,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "round",
@@ -2283,6 +2554,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "round",
@@ -2299,6 +2572,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "round",
@@ -2315,6 +2590,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "round",
@@ -2331,6 +2608,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ceil",
@@ -2347,6 +2626,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ceil",
@@ -2363,6 +2644,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ceiling",
@@ -2379,6 +2662,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ceiling",
@@ -2395,6 +2680,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "floor",
@@ -2411,6 +2698,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "floor",
@@ -2427,6 +2716,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "trunc",
@@ -2443,6 +2734,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "trunc",
@@ -2459,6 +2752,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "trunc",
@@ -2475,6 +2770,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "trunc",
@@ -2491,6 +2788,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "abs",
@@ -2507,6 +2806,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ceil",
@@ -2523,6 +2824,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ceiling",
@@ -2539,6 +2842,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "floor",
@@ -2555,6 +2860,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "trunc",
@@ -2571,6 +2878,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "round",
@@ -2587,6 +2896,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "round",
@@ -2603,6 +2914,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sqrt",
@@ -2619,6 +2932,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "exp",
@@ -2635,6 +2950,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ln",
@@ -2651,6 +2968,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "log10",
@@ -2667,6 +2986,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "pow",
@@ -2683,6 +3004,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "power",
@@ -2699,6 +3022,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sqrt",
@@ -2715,6 +3040,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "exp",
@@ -2731,6 +3058,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "ln",
@@ -2747,6 +3076,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "log",
@@ -2763,6 +3094,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "log10",
@@ -2779,6 +3112,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "log",
@@ -2795,6 +3130,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "power",
@@ -2811,6 +3148,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "pow",
@@ -2827,6 +3166,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sin",
@@ -2843,6 +3184,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "cos",
@@ -2859,6 +3202,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "tan",
@@ -2875,6 +3220,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "cbrt",
@@ -2891,6 +3238,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "pi",
@@ -2907,6 +3256,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "radians",
@@ -2923,6 +3274,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "degrees",
@@ -2939,6 +3292,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "asin",
@@ -2955,6 +3310,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "acos",
@@ -2971,6 +3328,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "atan",
@@ -2987,6 +3346,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "atan2",
@@ -3003,6 +3364,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "cot",
@@ -3019,6 +3382,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sinh",
@@ -3035,6 +3400,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "cosh",
@@ -3051,6 +3418,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "tanh",
@@ -3067,6 +3436,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "asinh",
@@ -3083,6 +3454,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "acosh",
@@ -3099,6 +3472,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "atanh",
@@ -3115,6 +3490,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sign",
@@ -3131,6 +3508,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sign",
@@ -3147,6 +3526,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "factorial",
@@ -3163,6 +3544,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "scale",
@@ -3179,6 +3562,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "min_scale",
@@ -3195,6 +3580,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "trim_scale",
@@ -3211,6 +3598,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "make_interval",
@@ -3227,6 +3616,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "justify_hours",
@@ -3243,6 +3634,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "justify_days",
@@ -3259,6 +3652,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "justify_interval",
@@ -3275,6 +3670,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "age",
@@ -3291,6 +3688,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "age",
@@ -3307,6 +3706,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "age",
@@ -3323,6 +3724,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "age",
@@ -3339,6 +3742,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "make_timestamp",
@@ -3355,6 +3760,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "make_timestamptz",
@@ -3371,6 +3778,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "make_timestamptz",
@@ -3387,6 +3796,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "make_date",
@@ -3403,6 +3814,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "current_date",
@@ -3419,6 +3832,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "date_part",
@@ -3435,6 +3850,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "date_part",
@@ -3451,6 +3868,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "date_part",
@@ -3467,6 +3886,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "date_part",
@@ -3483,6 +3904,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_char",
@@ -3659,6 +4082,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "uuid_extract_timestamp",
@@ -3675,6 +4100,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "uuidv4",
@@ -3691,6 +4118,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "gen_random_uuid",
@@ -3723,6 +4152,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "uuidv7",
@@ -3739,6 +4170,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "now",
@@ -3755,6 +4188,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "clock_timestamp",
@@ -3771,6 +4206,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "nextval",
@@ -3787,6 +4224,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "currval",
@@ -3803,6 +4242,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "setval",
@@ -3819,6 +4260,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "setval",
@@ -3835,6 +4278,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lastval",
@@ -3851,6 +4296,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "current_setting",
@@ -3867,6 +4314,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "current_setting",
@@ -3883,6 +4332,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "num_nulls",
@@ -3899,6 +4350,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "num_nonnulls",
@@ -3915,6 +4368,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_ndims",
@@ -3931,6 +4386,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_length",
@@ -3947,6 +4404,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_lower",
@@ -3963,6 +4422,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_upper",
@@ -3979,6 +4440,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "cardinality",
@@ -3995,6 +4458,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_dims",
@@ -4011,6 +4476,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_to_json",
@@ -4027,6 +4494,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_to_json",
@@ -4043,6 +4512,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_append",
@@ -4059,6 +4530,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_prepend",
@@ -4075,6 +4548,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_cat",
@@ -4091,6 +4566,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_remove",
@@ -4107,6 +4584,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_replace",
@@ -4123,6 +4602,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_position",
@@ -4139,6 +4620,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_position",
@@ -4155,6 +4638,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_positions",
@@ -4171,6 +4656,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_to_string",
@@ -4252,6 +4739,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "concat",
@@ -4269,6 +4758,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "concat",
@@ -4286,6 +4777,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "concat",
@@ -4303,6 +4796,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "concat",
@@ -4320,6 +4815,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "contains",
@@ -4337,6 +4834,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "contained_by",
@@ -4354,6 +4853,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "overlaps",
@@ -4371,6 +4872,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "contains",
@@ -4388,6 +4891,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "contains",
@@ -4405,6 +4910,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "contained_by",
@@ -4422,6 +4929,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "contained_by",
@@ -4439,6 +4948,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "overlaps",
@@ -4456,6 +4967,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "strictly_left",
@@ -4473,6 +4986,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "strictly_right",
@@ -4490,6 +5005,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "not_extend_right",
@@ -4507,6 +5024,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "not_extend_left",
@@ -4524,6 +5043,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "adjacent",
@@ -4541,6 +5062,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lower",
@@ -4557,6 +5080,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "upper",
@@ -4573,6 +5098,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "lower",
@@ -4589,6 +5116,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "upper",
@@ -4605,6 +5134,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "length",
@@ -4621,6 +5152,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "length",
@@ -4637,6 +5170,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "char_length",
@@ -4653,6 +5188,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "character_length",
@@ -4669,6 +5206,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "octet_length",
@@ -4685,6 +5224,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "octet_length",
@@ -4701,6 +5242,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "bit_length",
@@ -4717,6 +5260,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "bit_length",
@@ -4733,6 +5278,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "substr",
@@ -4749,6 +5296,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "substr",
@@ -4765,6 +5314,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "substr",
@@ -4781,6 +5332,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "substr",
@@ -4797,6 +5350,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "substring",
@@ -4813,6 +5368,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "substring",
@@ -4829,6 +5386,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "substring",
@@ -4845,6 +5404,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "substring",
@@ -4861,6 +5422,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "substring",
@@ -4893,6 +5456,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "overlay",
@@ -4909,6 +5474,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "overlay",
@@ -4925,6 +5492,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "overlay",
@@ -4941,6 +5510,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "left",
@@ -4957,6 +5528,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "right",
@@ -4973,6 +5546,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lpad",
@@ -4989,6 +5564,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lpad",
@@ -5005,6 +5582,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "rpad",
@@ -5021,6 +5600,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "rpad",
@@ -5037,6 +5618,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "btrim",
@@ -5053,6 +5636,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "btrim",
@@ -5069,6 +5654,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "btrim",
@@ -5085,6 +5672,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "ltrim",
@@ -5101,6 +5690,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "ltrim",
@@ -5117,6 +5708,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "ltrim",
@@ -5133,6 +5726,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "rtrim",
@@ -5149,6 +5744,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "rtrim",
@@ -5165,6 +5762,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "rtrim",
@@ -5181,6 +5780,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "replace",
@@ -5197,6 +5798,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "translate",
@@ -5213,6 +5816,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "repeat",
@@ -5229,6 +5834,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "reverse",
@@ -5245,6 +5852,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "strpos",
@@ -5261,6 +5870,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "position",
@@ -5277,6 +5888,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "position",
@@ -5293,6 +5906,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "split_part",
@@ -5309,6 +5924,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "starts_with",
@@ -5325,6 +5942,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "ascii",
@@ -5341,6 +5960,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "chr",
@@ -5357,6 +5978,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "initcap",
@@ -5373,6 +5996,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "to_hex",
@@ -5389,6 +6014,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "encode",
@@ -5405,6 +6032,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "decode",
@@ -5421,6 +6050,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "get_byte",
@@ -5437,6 +6068,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "set_byte",
@@ -5453,6 +6086,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "get_bit",
@@ -5469,6 +6104,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "set_bit",
@@ -5485,6 +6122,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "md5",
@@ -5501,6 +6140,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "md5",
@@ -5517,6 +6158,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: false,
+    preservesEquality: true,
   },
   {
     name: "sha224",
@@ -5533,6 +6176,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sha256",
@@ -5549,6 +6194,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sha384",
@@ -5565,6 +6212,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "sha512",
@@ -5581,6 +6230,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "quote_literal",
@@ -5597,6 +6248,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "quote_ident",
@@ -5613,6 +6266,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "quote_nullable",
@@ -5629,6 +6284,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "like_escape",
@@ -5645,6 +6302,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "concat",
@@ -5709,6 +6368,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_replace",
@@ -5725,6 +6386,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_match",
@@ -5741,6 +6404,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_match",
@@ -5757,6 +6422,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_split_to_array",
@@ -5773,6 +6440,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_split_to_array",
@@ -5789,6 +6458,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_like",
@@ -5805,6 +6476,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_like",
@@ -5821,6 +6494,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_count",
@@ -5837,6 +6512,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_count",
@@ -5853,6 +6530,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_count",
@@ -5869,6 +6548,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_substr",
@@ -5885,6 +6566,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_substr",
@@ -5901,6 +6584,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_substr",
@@ -5917,6 +6602,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_substr",
@@ -5933,6 +6620,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_substr",
@@ -5949,6 +6638,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_instr",
@@ -5965,6 +6656,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_instr",
@@ -5981,6 +6674,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_instr",
@@ -5997,6 +6692,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_instr",
@@ -6013,6 +6710,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_instr",
@@ -6029,6 +6728,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_instr",
@@ -6045,6 +6746,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "isempty",
@@ -6061,6 +6764,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lower_inc",
@@ -6077,6 +6782,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "upper_inc",
@@ -6093,6 +6800,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "lower_inf",
@@ -6109,6 +6818,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "upper_inf",
@@ -6125,6 +6836,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "i32range",
@@ -6141,6 +6854,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "i32range",
@@ -6157,6 +6872,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "i64range",
@@ -6173,6 +6890,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "i64range",
@@ -6189,6 +6908,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "numrange",
@@ -6205,6 +6926,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "numrange",
@@ -6221,6 +6944,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "tsrange",
@@ -6237,6 +6962,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "tsrange",
@@ -6253,6 +6980,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "tstzrange",
@@ -6269,6 +6998,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "tstzrange",
@@ -6285,6 +7016,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "daterange",
@@ -6301,6 +7034,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "daterange",
@@ -6317,6 +7052,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "range_union",
@@ -6334,6 +7071,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "range_difference",
@@ -6351,6 +7090,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "range_intersect",
@@ -6368,6 +7109,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "range_merge",
@@ -6384,6 +7127,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "jsonb_typeof",
@@ -6400,6 +7145,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "json_typeof",
@@ -6416,6 +7163,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "jsonb_array_length",
@@ -6432,6 +7181,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "json_array_length",
@@ -6448,6 +7199,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "jsonb_strip_nulls",
@@ -6464,6 +7217,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "json_strip_nulls",
@@ -6480,6 +7235,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "jsonb_pretty",
@@ -6496,6 +7253,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_jsonb",
@@ -6512,6 +7271,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_json",
@@ -6528,6 +7289,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "json_scalar",
@@ -6544,6 +7307,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "json_serialize",
@@ -6560,6 +7325,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "json_serialize",
@@ -6576,6 +7343,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "jsonb_build_array",
@@ -6592,6 +7361,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "json_build_array",
@@ -6608,6 +7379,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "jsonb_build_object",
@@ -6624,6 +7397,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "json_build_object",
@@ -6640,6 +7415,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
 ];
 
@@ -7519,4 +8296,40 @@ export const WINDOWS: readonly WindowDesc[] = [
     null: "frame",
     errors: ["22016"],
   },
+];
+
+// One cast spec/types/casts.toml classifies traps = false (functions.md §15): it raises nothing
+// for any source value. `preservesEquality` says equal sources give equal results.
+export interface CastTrapDesc {
+  from: string;
+  to: string;
+  preservesEquality: boolean;
+}
+
+// Every non-trapping cast, in casts.toml order (the planner's safe-conjunct gate,
+// planner.md §3.5). A cast absent from this table may trap.
+export const NON_TRAPPING_CASTS: readonly CastTrapDesc[] = [
+  { from: "i16", to: "i32", preservesEquality: true },
+  { from: "i16", to: "i64", preservesEquality: true },
+  { from: "i32", to: "i64", preservesEquality: true },
+  { from: "i16", to: "decimal", preservesEquality: true },
+  { from: "i32", to: "decimal", preservesEquality: true },
+  { from: "i64", to: "decimal", preservesEquality: true },
+  { from: "i16", to: "f64", preservesEquality: true },
+  { from: "i32", to: "f64", preservesEquality: true },
+  { from: "i64", to: "f64", preservesEquality: true },
+  { from: "f32", to: "f64", preservesEquality: true },
+  { from: "i16", to: "f32", preservesEquality: true },
+  { from: "i32", to: "f32", preservesEquality: true },
+  { from: "i64", to: "f32", preservesEquality: true },
+  { from: "boolean", to: "i32", preservesEquality: true },
+  { from: "i32", to: "boolean", preservesEquality: true },
+  { from: "uuid", to: "text", preservesEquality: true },
+  { from: "i16", to: "text", preservesEquality: true },
+  { from: "i32", to: "text", preservesEquality: true },
+  { from: "i64", to: "text", preservesEquality: true },
+  { from: "decimal", to: "text", preservesEquality: false },
+  { from: "f32", to: "text", preservesEquality: false },
+  { from: "f64", to: "text", preservesEquality: false },
+  { from: "boolean", to: "text", preservesEquality: true },
 ];

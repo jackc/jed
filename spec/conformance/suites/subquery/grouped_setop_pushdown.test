@@ -3,10 +3,10 @@
 # column it references is a grouping column — a bare input column of the body's single grouping set —
 # and is appended to the body's WHERE, below the grouping: it keeps or drops whole groups, since every
 # member of a group judges it alike. A set-operation body takes the conjunct into each arm when every
-# arm is itself pushable and its referenced columns are bare columns of exactly the unified output
-# type. ROLLUP/CUBE/several grouping sets, an expression grouping key, an aggregate output, a window
-# function, a LIMIT/OFFSET (on the body, an arm, or the set operation), and an arm type that the
-# set operation widens all keep the conjunct outside. The rows are PostgreSQL's; the `# cost:` pins
+# arm is itself pushable and its referenced columns are bare columns (an arm the set operation widens
+# reads its column through the widening, planner.md §3.6). ROLLUP/CUBE/several grouping sets, an
+# expression grouping key, an aggregate output, a window function, and a LIMIT/OFFSET (on the body,
+# an arm, or the set operation) keep the conjunct outside. The rows are PostgreSQL's; the `# cost:` pins
 # are jed's cross-core contract.
 # requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.column_alias, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.limit, query.distinct, query.aggregates, query.group_by, query.group_by_expr, query.group_by_functional_dependency, query.grouping_sets, query.having, query.union, query.intersect, query.except, query.derived_table, query.point_lookup, query.composite_pk_pushdown, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.is_null, expr.arithmetic, null.three_valued, types.i32, types.i64, resource.cost_metering
 
@@ -248,9 +248,9 @@ SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id FROM u INTERSECT SELECT k
 2
 2
 
-# An arm whose column type differs from the unified output type (i32 widened to i64) blocks it:
-# the conjunct stays outside.
-# cost: 46
+# An arm the set operation widens without changing a value (i32 under an i64 output) takes the
+# conjunct as written, so each arm seeks its own primary key (planner.md §3.6).
+# cost: 10
 query I nosort
 SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id FROM n) s WHERE s.id = 2
 ----

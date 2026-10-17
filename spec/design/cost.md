@@ -1187,7 +1187,7 @@ is pinned here because, with no reference implementation, the count is a cross-c
   is fixed so the per-combination evals accrue in the same sequence in every core (a §8 surface;
   it fixes the cost-ceiling abort point even though only the total is asserted today).
 - **WHERE and ON `operator_eval`** are split by the stage-2 pushdown ([planner.md](planner.md)
-  §3.2–§3.3). A **scan-pushed** conjunct — single relation, structurally non-trapping, from the WHERE
+  §3.2–§3.5). A **scan-pushed** conjunct — single relation, non-trapping (planner.md §3.5), from the WHERE
   on a side no outer join NULL-extends or from an ON on a side its join allows — is charged per row
   its relation delivers: for a base table per row its access path admits (after that row's
   `storage_row_read`; per fetched row of each per-outer-row INL probe), for a derived table, CTE
@@ -1240,7 +1240,7 @@ at an INNER island step when a newly-ready authored `ON` tree supplies equality 
 accumulated physical prefix and the appended relation. Every newly-ready tree remains an
 authoritative residual recheck in authored order.
 
-The complete newly-ready predicate set must pass the structurally non-trapping safe-conjunct gate;
+The complete newly-ready predicate set must pass the hash join's structural non-trapping leaf gate (bare-column comparisons; not the broader pushdown gate of planner.md §3.5);
 expression keys and arithmetic/function predicates therefore retain nested loop at that step.
 RIGHT/FULL and wider outer-join barrier steps also retain their fixed operator. Keys admit the
 existing key-encodable scalars plus scalar-element arrays/ranges; composite and

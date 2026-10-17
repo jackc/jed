@@ -2268,7 +2268,7 @@ fn debug_snake(value: impl std::fmt::Debug) -> String {
     out
 }
 
-fn explain_scalar_func(func: ScalarFunc) -> String {
+pub(crate) fn explain_scalar_func(func: ScalarFunc) -> String {
     if func == ScalarFunc::ToCharInt8 {
         return "to_char".to_string();
     }
@@ -5475,6 +5475,7 @@ fn resolve_node(
                             target,
                             typmod: None,
                             varchar_len: None,
+                            trap: TrapClass::May,
                         },
                         to_rt,
                     )),
@@ -5524,6 +5525,7 @@ fn resolve_node(
                             target,
                             typmod: None,
                             varchar_len: None,
+                            trap: TrapClass::May,
                         },
                         ResolvedType::Bytea,
                     )),
@@ -5552,6 +5554,7 @@ fn resolve_node(
                             target,
                             typmod: None,
                             varchar_len: None,
+                            trap: TrapClass::May,
                         },
                         ResolvedType::Uuid,
                     )),
@@ -5585,6 +5588,7 @@ fn resolve_node(
                                 target,
                                 typmod: None,
                                 varchar_len: None,
+                                trap: TrapClass::May,
                             },
                             ResolvedType::Interval,
                         ))
@@ -5634,6 +5638,7 @@ fn resolve_node(
                         RExpr::Cast {
                             inner: Box::new(rinner),
                             target,
+                            trap: cast_trap_class(&ity, target, typmod.as_ref()),
                             typmod,
                             varchar_len: None,
                         },
@@ -5651,6 +5656,7 @@ fn resolve_node(
                         RExpr::Cast {
                             inner: Box::new(rinner),
                             target,
+                            trap: cast_trap_class(&ity, target, typmod.as_ref()),
                             typmod,
                             varchar_len: None,
                         },
@@ -5761,6 +5767,7 @@ fn resolve_node(
                 RExpr::Cast {
                     inner: Box::new(rinner),
                     target,
+                    trap: cast_trap_class(&ity, target, typmod.as_ref()),
                     typmod,
                     varchar_len: None,
                 },
@@ -6949,11 +6956,14 @@ pub(crate) fn cast_to_text(
     varchar_len: Option<u32>,
     params: &mut ParamTypes,
 ) -> Result<RExpr> {
+    // The planner's trap classification (casts.toml, planner.md §3.5).
+    let trap = cast_trap_class(&ity, ScalarType::Text, None);
     let cast = |rinner: RExpr| RExpr::Cast {
         inner: Box::new(rinner),
         target,
         typmod: None,
         varchar_len,
+        trap,
     };
     match ity {
         // A NULL adapts (NULL → NULL, no truncation needed).

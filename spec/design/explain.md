@@ -147,7 +147,8 @@ Attributes are separated by `; `. A node with no attributes is `-`.
   `on=<expr>` counts or spells only its residual ON, omitted when nothing remains. A conjunct moved
   into a derived body appears in the body's own plan (its Filter, a pushed filter on its Scan, or its
   access bound) — below a grouped body's `Aggregate` and below a `Window`, and once under each SELECT
-  of a set operation, in that SELECT's own column slots.
+  of a set operation, in that SELECT's own column slots; an arm the set operation widens shows the
+  widening cast on its column (`cast(#2 as decimal)`, [planner.md](planner.md) §3.6).
 - A CTE inlined at its reference ([planner.md](planner.md) §3.4) renders the body planned there as
   the children of its `CTE Scan` node, exactly as a `Subquery` node renders its body, and its actual
   cost is attributed there. Its `CTE <name>` definition node under `WITH` keeps its `inlined` detail

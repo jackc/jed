@@ -135,6 +135,7 @@ impl RExpr {
                 target,
                 typmod,
                 varchar_len,
+                ..
             } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let out = match inner.eval(row, env, m)? {

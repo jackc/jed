@@ -88,6 +88,7 @@ import {
   unifyCaseTypes,
 } from "./eval_ops.ts";
 import { starHiddenCount } from "./search_cycle.ts";
+import { castTrapClass } from "./trap_class.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import { followLayer } from "./view_write.ts";
@@ -2067,8 +2068,9 @@ function resolveCastExpr(
       inner.type.kind === "bool" ||
       inner.type.kind === "text"
     ) {
+      const trap = castTrapClass(inner.type, target, typmod);
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node, trap },
         type: { kind: "bool" },
       };
     }
@@ -2077,8 +2079,9 @@ function resolveCastExpr(
   if (inner.type.kind === "bool") {
     // boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
     if (target === "i32") {
+      const trap = castTrapClass(inner.type, target, typmod);
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node, trap },
         type: { kind: "int", ty: "i32" },
       };
     }
@@ -2134,8 +2137,9 @@ function resolveCastExpr(
     : isFloat(target)
       ? { kind: "float", ty: target }
       : { kind: "int", ty: target };
+  const trap = castTrapClass(inner.type, target, typmod);
   return {
-    node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+    node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node, trap },
     type: resultType,
   };
 }
@@ -5048,7 +5052,9 @@ export function castToText(
   varcharLen: number | null,
   params: ParamTypes,
 ): RExpr {
-  const cast: RExpr = { kind: "cast", target, typmod: null, varcharLen, operand: node };
+  // The planner's trap classification (casts.toml, planner.md §3.5).
+  const trap = castTrapClass(t, "text", null);
+  const cast: RExpr = { kind: "cast", target, typmod: null, varcharLen, operand: node, trap };
   switch (t.kind) {
     // A NULL adapts (NULL → NULL, no truncation needed).
     case "null":

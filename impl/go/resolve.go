@@ -2798,7 +2798,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			// literal uses. A string LITERAL operand was already coerced above, so a text source
 			// here is non-literal (a column / expression).
 			if (ity.kind == rtInt && ity.intTy == scalarInt32) || ity.kind == rtNull || ity.kind == rtBool || ity.kind == rtText {
-				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod},
+				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod, trap: castTrapClass(ity, target, typmod)},
 					resolvedType{kind: rtBool}, nil
 			}
 			return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to boolean")
@@ -2806,7 +2806,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if ity.kind == rtBool {
 			// boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
 			if target == scalarInt32 {
-				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod},
+				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod, trap: castTrapClass(ity, target, typmod)},
 					resolvedType{kind: rtInt, intTy: scalarInt32}, nil
 			}
 			return nil, resolvedType{}, typeError("cannot cast boolean to " + target.CanonicalName())
@@ -2854,7 +2854,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// float cast is explicit (spec/design/float.md Â§6) â the only implicit float edge,
 		// f32->f64, is the tower, never a CAST.
 		resultRt := resolvedTypeOf(target)
-		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod}, resultRt, nil
+		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod, trap: castTrapClass(ity, target, typmod)}, resultRt, nil
 	case exprUnary:
 		if e.Unary.Op == opNeg {
 			rop, ty, err := resolve(s, e.Unary.Operand, ctx, ag, params)
@@ -4419,6 +4419,8 @@ func castToText(rinner *rExpr, ity resolvedType, target scalarType, varcharLen *
 		return cast, nil
 	case rtInt, rtDecimal, rtFloat32, rtFloat64, rtBool, rtBytea, rtUuid, rtTimestamp, rtDate,
 		rtInterval, rtJson, rtJsonb, rtJsonPath:
+		// The planner's trap classification (casts.toml, planner.md §3.5).
+		cast.trap = castTrapClass(ity, scalarText, nil)
 		return cast, nil
 	case rtArray:
 		// array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only,

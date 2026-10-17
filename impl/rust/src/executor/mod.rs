@@ -110,6 +110,8 @@ mod access_encode;
 pub(crate) use access_encode::*;
 mod rewrite;
 pub(crate) use rewrite::*;
+mod trap_class;
+pub(crate) use trap_class::*;
 mod engine;
 mod host_batch;
 pub(crate) use host_batch::{HostBatch, ReadAhead, read_ahead_cap};
@@ -3806,6 +3808,10 @@ pub(crate) enum RExpr {
         /// **truncate** to — an explicit cast silently truncates, never raising 22001
         /// (spec/design/types.md §15). `None` for any non-text / unbounded target.
         varchar_len: Option<u32>,
+        /// The cast's trap classification (functions.md §15), recorded at resolve from its source
+        /// and target types (casts.toml); `May` unless classified. Read only by the planner's
+        /// safe-conjunct gate (planner.md §3.5).
+        trap: TrapClass,
     },
     /// A cast that *involves* an array type (spec/design/array.md §7) — the three follow-on array
     /// casts, none expressible by the scalar [`RExpr::Cast`] node (whose `target` is a `ScalarType`):
@@ -6078,6 +6084,7 @@ pub(crate) fn resolve_json_passing(
             target: ScalarType::Jsonb,
             typmod: None,
             varchar_len: None,
+            trap: TrapClass::May,
         };
         if let Some(enc) = &p.encoding {
             if !matches!(ty, ResolvedType::Bytea) {

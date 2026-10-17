@@ -53,6 +53,13 @@ operator's `name`, `symbol`, `kind`, `arity`, `arg_families`, `arg_resolution`, 
 The generated table describes the operators; the hand-written evaluator decides *how* to
 evaluate them. A generated descriptor never contains executable comparison logic.
 
+The same files also carry the planner's trap classification ([functions.md](functions.md) §15):
+each descriptor's `traps` / `preserves_equality` fields, and a `NON_TRAPPING_CASTS` table
+(`nonTrappingCasts` in Go) generated from the `traps = false` rows of
+[../types/casts.toml](../types/casts.toml). The hand-written safe-conjunct gate
+([planner.md](planner.md) §3.5) reads them; the generator rejects a classified cast row that
+carries an `on_overflow` trap or omits `preserves_equality`.
+
 ## 3. The mechanism
 
 - **Generator:** [../../scripts/gen_catalog.rb](../../scripts/gen_catalog.rb) (Ruby +

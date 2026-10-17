@@ -264,9 +264,12 @@ discount work the executor still performs.
 ## Pushed filters and contradictions
 
 Before choosing access paths, jed rewrites the `WHERE` in two ways. In a join, a condition that
-mentions only one base table — and only non-trapping comparisons, `IS [NOT] NULL`, `IS [NOT] DISTINCT
-FROM`, and `AND`/`OR`/`NOT` over columns, literals, and parameters — runs **inside that table's scan**,
-so rejected rows never reach the join. EXPLAIN shows it on the `Scan` as `filter:conjuncts=N`
+mentions only one base table and **cannot raise an error** runs **inside that table's scan**, so
+rejected rows never reach the join. That covers comparisons, `IS [NOT] NULL`, `IS [NOT] DISTINCT
+FROM`, and `AND`/`OR`/`NOT` over columns, literals, and parameters, plus the casts and functions that
+never fail (`length`, `lower`/`upper`, the trims, `starts_with`, `strpos`, integer → `text`/`decimal`/
+float casts, …) and a `LIKE`/`ILIKE` whose pattern is known not to end in a lone `\` (a bound
+parameter counts, see below). Arithmetic and anything else that can fail stays where you wrote it. EXPLAIN shows it on the `Scan` as `filter:conjuncts=N`
 (`VERBOSE` spells the expression), and the `Filter` node above the join keeps only what still needs
 both sides (it disappears when nothing is left). Conditions on the NULL-extended side of an outer join
 stay above the join, where they see the NULL-extended rows.
@@ -319,8 +322,10 @@ once into a buffer, so a condition is only applied to the rows each use reads fr
 
 A `UNION`, `INTERSECT`, or `EXCEPT` subquery takes the condition into **every branch**, and each branch
 plans it on its own table: here it is a primary-key lookup on `city` and a filter on `trip`'s scan.
-A branch whose column jed widens to the combined type (an `i32` branch of an `i64` column, say) keeps
-the condition outside.
+A branch whose column jed widens to the combined type gets the condition with the widening applied: an
+`i32` branch of an `i64` column takes it as written, and an `i32` branch of a `decimal` column (or an
+`f32` branch of an `f64` one) reads its column through `cast(… as decimal)`, exactly the value the
+combined column holds.
 
 <LiveSql demo="setopPushdown" seed={seed} query={setopPushdown} rows={6} />
 

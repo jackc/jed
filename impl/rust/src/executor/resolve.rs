@@ -2437,6 +2437,7 @@ pub(crate) fn widen_float_to_f64(node: RExpr, ty: &ResolvedType) -> RExpr {
             target: ScalarType::Float64,
             typmod: None,
             varchar_len: None,
+            trap: TrapClass::May,
         }
     } else {
         node

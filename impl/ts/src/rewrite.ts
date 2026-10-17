@@ -31,8 +31,14 @@ import {
   estimatorLiteral,
   estimatorLiteralCmp,
   estimatorValue,
-  resolvedTypeEqual,
 } from "./executor.ts";
+import {
+  armWidening,
+  conjunctLossy,
+  likePatternProven,
+  nonMatchingBody,
+  nonTrapping,
+} from "./trap_class.ts";
 
 // WherePushdown is the stage-2 predicate split. relFilters / relLocal hold one entry per relation
 // (null: nothing scan-pushed); residual is the post-join WHERE when whereSplit (null when every
@@ -150,7 +156,9 @@ export function rewriteWhere(plan: SelectPlan): void {
   const target = (c: RExpr, ri: number): PushedConjunct | null => {
     if (plan.rels[ri]!.lateral === true || !pushdownSafe(c)) return null;
     const body = bodies[ri];
-    if (body !== null && body !== undefined) {
+    // A conjunct that may separate equal values moves only into a body that matches no rows
+    // (planner.md §3.2).
+    if (body !== null && body !== undefined && (!conjunctLossy(c) || nonMatchingBody(body))) {
       const moved = bodyConjunct(c, plan.rels[ri]!.offset, body);
       if (moved !== null) return { expr: moved, ri, body: true, on: false };
     }
@@ -354,19 +362,14 @@ function bodyInputColumn(b: SelectPlan, j: number): number | null {
 }
 
 // bodyOutputPushable reports whether output column j of a body-pushable plan reads a bare body
-// column of type want in every SELECT it combines: a set operation's arms (and its own unified
-// column) must already have that exact type, so no arm value is widened after the pushed conjunct
-// would have judged it.
+// column in every SELECT it combines, each of a type the set operations widen to want without a
+// value change or through a widening cast (armWidening, planner.md §3.6).
 function bodyOutputPushable(q: QueryPlan, j: number, want: ResolvedType): boolean {
   switch (q.kind) {
     case "select":
-      return bodyInputColumn(q, j) !== null && resolvedTypeEqual(q.columnTypes[j]!, want);
+      return bodyInputColumn(q, j) !== null && armWidening(q.columnTypes[j]!, want) !== null;
     case "setOp":
-      return (
-        resolvedTypeEqual(q.columnTypes[j]!, want) &&
-        bodyOutputPushable(q.lhs, j, want) &&
-        bodyOutputPushable(q.rhs, j, want)
-      );
+      return bodyOutputPushable(q.lhs, j, want) && bodyOutputPushable(q.rhs, j, want);
     default:
       return false;
   }
@@ -381,51 +384,84 @@ function bodyConjunct(c: RExpr, offset: number, body: QueryPlan): RExpr | null {
   let ok = true;
   const walk = (e: RExpr): void => {
     if (!ok) return;
-    switch (e.kind) {
-      case "column": {
-        const j = e.index - offset;
-        ok = j >= 0 && j < types.length && bodyOutputPushable(body, j, types[j]!);
-        return;
-      }
-      case "and":
-      case "or":
-      case "compare":
-      case "distinct":
-        walk(e.lhs);
-        walk(e.rhs);
-        return;
-      case "not":
-      case "isNull":
-        walk(e.operand);
-        return;
-      default:
-        return;
+    if (e.kind === "column") {
+      const j = e.index - offset;
+      ok = j >= 0 && j < types.length && bodyOutputPushable(body, j, types[j]!);
+      return;
     }
+    pushedChildren(e).forEach(walk);
   };
   walk(c);
   return ok ? rebaseColumns(c, offset) : null;
 }
 
 // substituteBodyColumns clones a conjunct in a SELECT body's output-column numbering with every
-// column replaced by the FROM slot that output reads. bodyConjunct already proved each reference
-// maps. Only the pushdownSafe node kinds reach it; their leaves (literals, parameters) are shared,
-// never mutated.
-export function substituteBodyColumns(e: RExpr, body: SelectPlan): RExpr {
+// column replaced by the FROM slot that output reads. want is the outermost body's output types,
+// which the conjunct was resolved against: an output the set operations widen with a value change is
+// read through the widening cast (planner.md §3.6). bodyConjunct already proved each reference maps.
+export function substituteBodyColumns(e: RExpr, body: SelectPlan, want: ResolvedType[]): RExpr {
+  return mapPushedColumns(e, (col) => {
+    const slot: RExpr = { ...col, index: bodyInputColumn(body, col.index)! };
+    const widen = armWidening(body.columnTypes[col.index]!, want[col.index]!);
+    if (widen === null || widen === "noop") return slot;
+    return {
+      kind: "cast",
+      target: widen,
+      typmod: null,
+      varcharLen: null,
+      operand: slot,
+      trap: "none",
+    };
+  });
+}
+
+// pushedChildren is a pushdown-safe node's children: the node kinds pushdownSafe admits (any other
+// node is rejected by the gate, so its children are moot).
+function pushedChildren(e: RExpr): RExpr[] {
   switch (e.kind) {
-    case "column":
-      return { ...e, index: bodyInputColumn(body, e.index)! };
     case "and":
     case "or":
     case "compare":
     case "distinct":
-      return {
-        ...e,
-        lhs: substituteBodyColumns(e.lhs, body),
-        rhs: substituteBodyColumns(e.rhs, body),
-      };
+    case "like":
+      return [e.lhs, e.rhs];
     case "not":
     case "isNull":
-      return { ...e, operand: substituteBodyColumns(e.operand, body) };
+    case "cast":
+      return [e.operand];
+    case "scalarFunc":
+      return e.args;
+    case "casing":
+      return [e.arg];
+    default:
+      return [];
+  }
+}
+
+// mapPushedColumns clones a pushdown-safe tree with every column node replaced by column(node). Only
+// the pushdownSafe node kinds reach it; their leaves (literals, parameters) are shared, never
+// mutated.
+function mapPushedColumns(e: RExpr, column: (col: RExpr & { kind: "column" }) => RExpr): RExpr {
+  const map = (c: RExpr): RExpr => mapPushedColumns(c, column);
+  switch (e.kind) {
+    case "column":
+      return column(e);
+    case "and":
+    case "or":
+      return { kind: e.kind, lhs: map(e.lhs), rhs: map(e.rhs) };
+    case "compare":
+    case "distinct":
+    case "like":
+      return { ...e, lhs: map(e.lhs), rhs: map(e.rhs) };
+    case "not":
+      return { kind: "not", operand: map(e.operand) };
+    case "isNull":
+    case "cast":
+      return { ...e, operand: map(e.operand) };
+    case "scalarFunc":
+      return { ...e, args: e.args.map(map) };
+    case "casing":
+      return { ...e, arg: map(e.arg) };
     default:
       return e;
   }
@@ -497,30 +533,16 @@ function conjunctSingleRelation(plan: SelectPlan, c: RExpr): number {
   let ok = true;
   const walk = (e: RExpr): void => {
     if (!ok) return;
-    switch (e.kind) {
-      case "column": {
-        const ri = relationOfSlot(plan, e.index);
-        if (ri < 0 || (owner >= 0 && owner !== ri)) {
-          ok = false;
-          return;
-        }
-        owner = ri;
+    if (e.kind === "column") {
+      const ri = relationOfSlot(plan, e.index);
+      if (ri < 0 || (owner >= 0 && owner !== ri)) {
+        ok = false;
         return;
       }
-      case "and":
-      case "or":
-      case "compare":
-      case "distinct":
-        walk(e.lhs);
-        walk(e.rhs);
-        return;
-      case "not":
-      case "isNull":
-        walk(e.operand);
-        return;
-      default:
-        return;
+      owner = ri;
+      return;
     }
+    pushedChildren(e).forEach(walk);
   };
   walk(c);
   return ok ? owner : -1;
@@ -534,14 +556,15 @@ function relationOfSlot(plan: SelectPlan, slot: number): number {
   return -1;
 }
 
-// pushdownSafe is the structural safety gate (planner.md §3.2): the conjunct must be unable to
-// trap and must read nothing but the row, constants and parameters — so evaluating it on a row the
-// join would never have produced can raise no error a non-pushed plan would not, and its value is
-// the same wherever it runs. The admitted shapes are boolean combinations (AND/OR/NOT) of
-// comparisons, IS [NOT] NULL, and IS [NOT] DISTINCT FROM over bare columns, literals and parameters,
-// plus a bare boolean column. A collated ordering comparison is excluded (its sort-key kernel can
-// fail on unloaded data); every other node kind — casts, arithmetic, functions, subqueries, outer
-// references — stays in the residual.
+// pushdownSafe is the safe-conjunct gate (planner.md §3.5): the conjunct must be unable to trap and
+// must read nothing but the row, constants and parameters — so evaluating it on a row the join would
+// never have produced can raise no error a non-pushed plan would not, and its value is the same
+// wherever it runs. The admitted shapes are boolean combinations (AND/OR/NOT) of comparisons, IS
+// [NOT] NULL, IS [NOT] DISTINCT FROM, and LIKE / ILIKE with a proven pattern, over non-trapping
+// value expressions (nonTrapping: columns, literals, parameters, and the classified casts and
+// functions), plus a boolean-valued non-trapping expression. A collated ordering comparison is
+// excluded (its sort-key kernel can fail on unloaded data); every other node kind — arithmetic,
+// trapping casts and functions, subqueries, outer references — stays in the residual.
 function pushdownSafe(e: RExpr): boolean {
   switch (e.kind) {
     case "and":
@@ -549,22 +572,18 @@ function pushdownSafe(e: RExpr): boolean {
       return pushdownSafe(e.lhs) && pushdownSafe(e.rhs);
     case "not":
       return pushdownSafe(e.operand);
-    case "column":
-      return true;
     case "compare":
       if (e.collation !== null && e.op !== "eq" && e.op !== "ne") return false;
-      return pushdownLeaf(e.lhs) && pushdownLeaf(e.rhs);
+      return nonTrapping(e.lhs) && nonTrapping(e.rhs);
     case "distinct":
-      return pushdownLeaf(e.lhs) && pushdownLeaf(e.rhs);
+      return nonTrapping(e.lhs) && nonTrapping(e.rhs);
     case "isNull":
-      return pushdownLeaf(e.operand);
+      return nonTrapping(e.operand);
+    case "like":
+      return nonTrapping(e.lhs) && likePatternProven(e.rhs);
     default:
-      return false;
+      return nonTrapping(e);
   }
-}
-
-function pushdownLeaf(e: RExpr): boolean {
-  return e.kind === "column" || e.kind === "param" || estimatorLiteral(e);
 }
 
 // andConjunct appends c to a left-deep AND chain (source order is preserved by the caller).
@@ -577,29 +596,5 @@ function andConjunct(acc: RExpr | null, c: RExpr): RExpr {
 // evaluates against the relation's own row. Only the pushdownSafe node kinds reach it; their leaves
 // (literals, parameters) are shared, never mutated.
 function rebaseColumns(e: RExpr, offset: number): RExpr {
-  switch (e.kind) {
-    case "column":
-      return { ...e, index: e.index - offset };
-    case "and":
-    case "or":
-      return { kind: e.kind, lhs: rebaseColumns(e.lhs, offset), rhs: rebaseColumns(e.rhs, offset) };
-    case "not":
-      return { kind: "not", operand: rebaseColumns(e.operand, offset) };
-    case "compare":
-      return {
-        ...e,
-        lhs: rebaseColumns(e.lhs, offset),
-        rhs: rebaseColumns(e.rhs, offset),
-      };
-    case "distinct":
-      return {
-        ...e,
-        lhs: rebaseColumns(e.lhs, offset),
-        rhs: rebaseColumns(e.rhs, offset),
-      };
-    case "isNull":
-      return { ...e, operand: rebaseColumns(e.operand, offset) };
-    default:
-      return e;
-  }
+  return mapPushedColumns(e, (col) => ({ ...col, index: col.index - offset }));
 }
