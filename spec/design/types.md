@@ -215,8 +215,13 @@ listed).
 
 - **Widening** (`i16→i32`, `i16→i64`, `i32→i64`) is lossless, so it is
   **implicit** — inserted automatically wherever a wider integer is wanted.
-- **Narrowing** (`i64→i32`, `i64→i16`, `i32→i16`) is lossy in general, so it
-  requires an **explicit** `CAST(...)` and **traps** (`22003`) when the value does not fit.
+- **Narrowing** (`i64→i32`, `i64→i16`, `i32→i16`) is lossy in general, so it is never
+  implicit: it happens through an explicit `CAST(...)` or on **assignment** — storing a value
+  into a narrower integer column (`UPDATE t SET i32_col = i64_col`, `INSERT ... SELECT`, an
+  `INSERT ... VALUES` expression, `ON CONFLICT DO UPDATE`, an expression `DEFAULT`). Either way it
+  **traps** (`22003`) when the value does not fit, so a stored value is always the exact value.
+  This is PostgreSQL's assignment mode for `int8→int4`, `int8→int2`, and `int4→int2`. A comparison
+  or arithmetic never narrows: the narrower operand widens (§4).
 - **Text casts** split by operand. A **string LITERAL** coerces to a named type — the
   `type 'string'` typed literal and `CAST(<string literal> AS T)` ([grammar.md](grammar.md) §36) —
   for every scalar `T`, folded at resolve (`INTEGER '42'`, `NUMERIC '1.5'`, `BOOLEAN 'true'`,
@@ -227,7 +232,8 @@ listed).
   the **same per-type coercion per-row in the evaluator** for the **numeric + boolean** scalars —
   `i16`/`i32`/`i64`, `decimal`/`numeric` (typmod re-scale applied), `f32`/`f64`, and `boolean` —
   reusing the identical parse functions as the literal form (so jed's own grammar still governs: hex
-  / underscore / `NaN` trap `22P02`), metered by the cast node's `operator_eval`, trapping
+  / underscore trap `22P02`, and so does `NaN` for an integer or decimal target), metered by the
+  cast node's `operator_eval`, trapping
   `22P02` / `22003` **per row**. The runtime `text → uuid` cast also landed (the uuid cast slice,
   §14: `uuid_in` at eval), and so did `text → date` (the literal's `parse_date` per row,
   `22007`/`22008` — STABLE and un-indexable, [date.md](date.md) §6). The remaining
@@ -270,15 +276,19 @@ listed).
   literal form) — never to int/decimal/boolean. So `type 'string'` admits the *explicit* spelling
   of a text→scalar cast without weakening the implicit rules.
 
-Cast modes are `implicit` / `assignment` / `explicit`. `assignment` (allowed on
-INSERT/UPDATE into a column but not in general expressions) is part of the vocabulary for
-future types; for the integer set, widenings are fully implicit so no edge needs the
-weaker `assignment` mode yet.
+Cast modes are `implicit` / `assignment` / `explicit`. `assignment` (applied when a value is
+stored into a column, but not in comparisons or operators) is the mode of the three integer
+narrowings above, and of `jsonb → json` ([json.md](json.md) §6.1). The storage gate is the
+family-level assignability check ([grammar.md](grammar.md) §24) plus the per-value store
+coercion ([constraints.md](constraints.md) §2). Every other lossy numeric cast — `decimal → int`,
+int/decimal → float, `f64 → f32`, float → int — stays explicit-only on storage, because it can
+round rather than store the exact value or trap ([decimal.md](decimal.md) §6,
+[float.md](float.md) §6).
 
 **Two spellings, one cast.** An explicit cast is written either `CAST(expr AS type)` or, with
 PostgreSQL's postfix operator, `expr :: type` ([grammar.md](grammar.md) §37). The two are
 identical — the parsers desugar `::` to the same `CAST` node — so the matrix above, the
-string-literal coercion, the deferred narrowings, and every resolve code apply unchanged to both.
+string-literal coercion, the integer narrowings, and every resolve code apply unchanged to both.
 `::` binds tighter than unary minus (so `-5 :: int` is `-(5 :: int)`), and a bind-parameter operand
 takes the cast target as its type (`$1 :: int` types `$1` as int — [api.md](api.md) §5).
 
@@ -481,7 +491,7 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   overloaded over the integer, text, and boolean families (§4).
 - **`boolean × boolean` comparability** — ✅ landed (§4, §9): comparing two booleans
   (`(a = b) = (c = d)`) is now allowed; a boolean vs a non-boolean is still `42804`.
-- **`assignment`-mode casts** — vocabulary reserved; first used by non-integer types.
+- **`assignment`-mode casts** — ✅ in use: the integer narrowings (§5) and `jsonb → json`.
 - **`text`** — ✅ landed as the first storable non-integer scalar, with one collation `C`
   (§11). Its deferred sub-features (`varchar(n)` length limits, text⇄other casts, string
   functions / `||` / `LIKE`, text in keys, and locale/ICU multi-collation) are enumerated in §11.

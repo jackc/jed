@@ -1743,10 +1743,15 @@ analysis. So a type-incompatible projection is rejected with `42804` **even over
 source** (`INSERT INTO t(int_col) SELECT text_col FROM src WHERE 1=0` errors; it does not
 silently insert nothing). The assignability test is the **family-level subset of the per-value
 store coercion** ([constraints.md](constraints.md) §2) and must agree with it: an integer
-projection is assignable to an integer **or** decimal column (int→decimal widens), a decimal
-only to a decimal column (decimal→int is explicit-`CAST` only), a text projection to text/uuid/
-bytea (the documented text-adaptation, [types.md](types.md) §6), boolean→boolean, uuid→uuid,
-bytea→bytea, and a **NULL-typed** projection to **any** column (a `NOT NULL` target then traps
+projection is assignable to an integer column of **any** width — a narrowing (`i64` into `i32`,
+say) is an assignment cast that traps `22003` per row when the value does not fit, as in
+PostgreSQL ([types.md](types.md) §5) — **or** to a decimal column (int→decimal widens); a
+decimal only to a decimal column (decimal→int is explicit-`CAST` only); `f32` to an `f32` or
+`f64` column and `f64` only to `f64` (an integer or decimal never assigns to a float column); a
+text projection to text/uuid/bytea/timestamp/timestamptz/date/interval (the documented
+text-adaptation, [types.md](types.md) §6 — the per-row store parses); `jsonb` to `jsonb` or
+`json` (the `jsonb → json` assignment cast, [json.md](json.md) §6.1); every other scalar only to
+its own type; and a **NULL-typed** projection to **any** column (a `NOT NULL` target then traps
 `23502` per row, if any). A column the list omits is not type-checked — it takes its default
 else NULL.
 
@@ -2675,7 +2680,7 @@ just "coerce the string `x` to that type, with the type named explicitly." The p
 | `uuid` | PG-flexible uuid input ([types.md](types.md) §14) | `22P02` |
 | `text` | identity (the string itself) | — |
 | `i16` / `i32` / `i64` | optional sign + decimal digits, surrounding whitespace trimmed | `22P02` malformed / `22003` out of range |
-| `decimal` / `numeric` | jed's decimal-literal grammar (sign, digits, one `.`), whitespace trimmed; capped | `22P02` malformed / `22003` over cap |
+| `decimal` / `numeric` | jed's decimal-literal grammar (sign, digits, one `.`, an optional `e`-notation exponent — §14), whitespace trimmed; capped | `22P02` malformed / `22003` over cap |
 | `boolean` | PG's `boolin`: `t`/`tr`/`tru`/`true`, `f`/`fa`/`fal`/`fals`/`false`, `y`/`ye`/`yes`, `n`/`no`, `on`/`off`, `1`, `0` (case-insensitive, trimmed) | `22P02` malformed |
 
 The native-syntax types (`integer`/`decimal`/`boolean`) are where `type 'string'` is a genuine
@@ -2686,8 +2691,9 @@ per-row in the evaluator** (`evalCast`), so it is now admitted for the **numeric
 targets — `i16`/`i32`/`i64`, `decimal`/`numeric` (with the typmod re-scale), `f32`/`f64`, and
 `boolean`. "One coercion, three syntaxes" extends to "one coercion, literal **or** runtime": the
 runtime path calls the identical `parse_int_literal` / `parse_decimal_literal` / `parse_f*_literal`
-/ `parse_bool_literal`, so jed's **own** literal grammar still governs (hex / digit-underscore /
-`NaN` / `±Infinity` trap `22P02`, the same documented PG divergences as the literal form), the cast
+/ `parse_bool_literal`, so jed's **own** literal grammar still governs (hex / digit-underscore trap
+`22P02`, as do `NaN` / `±Infinity` for the integer and decimal targets — the same documented PG
+divergences as the literal form; a float target accepts `NaN` / `±Infinity`, float.md §4), the cast
 node's existing `operator_eval` charge meters it, and a malformed / out-of-range value traps
 `22P02` / `22003` **per row** during the scan rather than at plan time. The runtime text→`T` cast to
 the **string-native** targets has landed by the same rule — each runs its literal's parser per row:
@@ -2711,17 +2717,19 @@ value literals, so `true 'x'` is not `CAST('x' AS true)`.)
 **Documented divergences from PostgreSQL** (we own our surface, CLAUDE.md §1):
 
 - For `integer`/`decimal`, jed coerces by its **own literal grammar**, not PG's input-function
-  extras: **hex/octal/binary** (`integer '0x10'`), **digit underscores** (`integer '1_000'`),
-  **scientific notation** (`numeric '1.5e3'`), and **`NaN` / `±Infinity`** (`numeric 'NaN'` — jed's
-  decimal is always finite, [decimal.md](decimal.md) §2) all trap `22P02` where PG accepts them.
-  This keeps `type 'string'` coercion identical to writing the value as a native jed literal.
+  extras: **hex/octal/binary** (`integer '0x10'`), **digit underscores** (`integer '1_000'`,
+  `numeric '1_000.5'`), and **`NaN` / `±Infinity`** (`numeric 'NaN'` — jed's decimal is always
+  finite, [decimal.md](decimal.md) §2) all trap `22P02` where PG accepts them. **Scientific
+  notation** is part of the decimal-literal grammar (§14), so `numeric '1.5e3'` is `1500`, as in
+  PG (an integer target rejects it, as PG's `int4in` does). This keeps `type 'string'` coercion
+  identical to writing the value as a native jed literal.
 - jed uses the **canonical single-word** type names: PG's multi-word `TIMESTAMP WITH TIME ZONE
   '…'` and the **precision typmod** form `TIMESTAMP(p) '…'` / `NUMERIC(p,s) '…'` are not typed
   literals here (a `(` after the name breaks the lookahead; typmod rides only on `CAST`).
 - **ISO-8601 / SQL-standard combined interval forms** inside `INTERVAL '…'` remain deferred
   ([interval.md](interval.md) §3) — a parse-subset gap, not a literal-syntax one.
 
-`DATE '…'` / `TIME '…'` are absent only because those types are not in the scalar set.
+`TIME '…'` is absent only because `time` is not in the scalar set (`42704`).
 
 ## 37. The `::` cast operator (`expr :: type`)
 
@@ -2773,17 +2781,16 @@ the cast **target** as its inferred type ([api.md](../design/api.md) §5): `$1 :
 as `int`, `$1 :: numeric(10,2)` declares it `decimal` and re-scales the bound value to `(10,2)`.
 This is the same parameter-typing rule the `CAST($1 AS int)` spelling already documents; both now
 infer the type rather than reporting `42P18`. (A *bare* `SELECT $1` with no cast and no other
-context is still `42P18` indeterminate.) Casting a parameter to a deferred target (`$1 :: text`) is
-`0A000`, like any non-literal cast to text.
+context is still `42P18` indeterminate.) `$1 :: text` declares `$1` as text, and `$1 ::
+varchar(n)` truncates the bound value.
 
 **Lexing.** `::` is two colons scanned greedily as one token; a **lone** `:` is a `42601` syntax
 error (jed has no `:name` host parameters, array slices, or `psql` meta-syntax — nothing else uses
 a colon). See [grammar.ebnf](../grammar/grammar.ebnf) `double_colon`.
 
-**Divergence note.** Because casting to non-string-literal text/boolean/etc. is still the deferred
-`0A000` narrowing (§36, [types.md](types.md) §5), `5 :: text`, `x :: boolean`, etc. are `0A000`
-where PostgreSQL succeeds — the *same* documented divergence the `CAST(... AS ...)` spelling
-already carries, not a new one. `::` adds no behavior of its own; it only adds the spelling.
+**No divergence of its own.** `::` adds no behavior; it only adds the spelling. Any divergence
+of a cast from PostgreSQL (a forbidden pair is `42804` where PG says `42846`, the to-text casts are
+explicit-only, [types.md](types.md) §5) is the same for both spellings.
 
 ## 38. Composite field selection (`(expr).field` / `(expr).*`)
 
