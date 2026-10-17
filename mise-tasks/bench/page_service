@@ -17,10 +17,13 @@
 #                trip per query);
 #   client commit durable single-row UPDATE commits from a page client: begin_write, the CommitDelta,
 #                and the owner's validation, write, and barrier (compare owner_commit, the same loop
-#                run by the owner itself).
+#                run by the owner itself);
+#   stream       a Rust page client over the stream transport (what `jed ssh://` runs), relayed to
+#                each owner, its every request held JED_PS_BENCH_LATENCY_US: a cold scan with
+#                read-ahead and one without.
 #
 # Tunables: JED_PS_BENCH_ROWS (default 200000), JED_PS_BENCH_LOOKUPS (default 20000),
-# JED_PS_BENCH_COMMITS (default 200). Results: bench/results/page-service-<stamp>.jsonl.
+# JED_PS_BENCH_COMMITS (default 200), JED_PS_BENCH_LATENCY_US (default 500). Results: bench/results/page-service-<stamp>.jsonl.
 
 require "json"
 require "tmpdir"
@@ -33,6 +36,7 @@ require_relative "../../scripts/process_conformance"
 ROWS = Integer(ENV.fetch("JED_PS_BENCH_ROWS", "200000"))
 LOOKUPS = Integer(ENV.fetch("JED_PS_BENCH_LOOKUPS", "20000"))
 COMMITS = Integer(ENV.fetch("JED_PS_BENCH_COMMITS", "200"))
+LATENCY_US = Integer(ENV.fetch("JED_PS_BENCH_LATENCY_US", "500"))
 BENCH_CORES = (ENV["usage_cores"]&.split(",") || %w[rust go node]).freeze
 Actor.command_timeout = 600
 
@@ -106,6 +110,14 @@ Dir.mktmpdir("jed-page-service-bench-") do |dir|
       record("client_cold_lookup", owner_core, client_core, LOOKUPS / 4, *time(client, "TIME_LOOKUPS", LOOKUPS / 4))
       time(client, "TIME_LOOKUPS", LOOKUPS / 4)
       record("client_warm_lookup", owner_core, client_core, LOOKUPS, *time(client, "TIME_LOOKUPS", LOOKUPS))
+      client.close
+    end
+    # The stream transport (page-service.md §5.3): a Rust stream client whose transport holds each
+    # request for LATENCY_US (a network round trip) and relays it to this owner, cold scans with and
+    # without read-ahead.
+    [["stream_cold_scan", ""], ["stream_cold_scan_no_read_ahead", " read_ahead=off"]].each do |lane, extra|
+      client = Actor.new("rust", "open-remote 5000 latency_us=#{LATENCY_US}#{extra}", path)
+      record(lane, owner_core, "rust", 1, *time(client, "TIME_SCAN", 1))
       client.close
     end
     # Commits change the rows, so they run after every pairing's reads (the read checksums must agree).

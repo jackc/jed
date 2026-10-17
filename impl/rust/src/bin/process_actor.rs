@@ -27,13 +27,21 @@ fn run() -> Result<(), EngineError> {
     if action == "pages" || action == "pages-read-only" {
         // The serving side of the stream transport (spec/pageservice/README.md §5.4), as `jed pages`:
         // the actor's stdin/stdout are one page-service connection.
+        // An optional third argument delays every client request by that many microseconds, a
+        // network round trip for the page-service benchmark's stream lanes.
         // A failure was already answered on the stream; stdout must carry nothing else.
+        let latency_us: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let input: Box<dyn io::Read + Send> = if latency_us == 0 {
+            Box::new(io::stdin())
+        } else {
+            Box::new(Delayed(io::stdin(), std::time::Duration::from_micros(latency_us)))
+        };
         #[cfg(unix)]
         if let Err(error) = Database::serve_page_stream(
             &path,
             OpenOptions::default(),
             action == "pages-read-only",
-            Box::new(io::stdin()),
+            input,
             Box::new(io::stdout()),
         ) {
             eprintln!("ERROR {}: {}", error.code(), error.message);
@@ -92,12 +100,19 @@ fn run() -> Result<(), EngineError> {
             } else {
                 "pages-read-only"
             };
+            if options.get("read_ahead").map(String::as_str) == Some("off") {
+                Database::set_page_client_read_ahead_for_testing(false);
+            }
+            let mut transport = vec![
+                exe.to_string_lossy().into_owned(),
+                serve.to_string(),
+                path.to_string_lossy().into_owned(),
+            ];
+            if let Some(latency) = options.get("latency_us") {
+                transport.push(latency.clone());
+            }
             Database::open_remote(
-                vec![
-                    exe.to_string_lossy().into_owned(),
-                    serve.to_string(),
-                    path.to_string_lossy().into_owned(),
-                ],
+                transport,
                 &format!("remote:{}", path.display()),
                 OpenOptions {
                     file_lock_timeout_ms: timeout,
@@ -369,6 +384,18 @@ fn timed(database: &mut Database, command: &str, argument: &str) -> Result<Strin
         }
     }
     Ok(format!("{}:{checksum}", start.elapsed().as_nanos()))
+}
+
+/// A reader that holds what each read returns for a fixed delay: the client's requests arrive one
+/// network delay late.
+struct Delayed<R>(R, std::time::Duration);
+
+impl<R: io::Read> io::Read for Delayed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        std::thread::sleep(self.1);
+        Ok(n)
+    }
 }
 
 trait QueryHandle {

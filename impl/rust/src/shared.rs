@@ -2805,6 +2805,16 @@ impl Database {
         crate::pageservice::remote::serve_pages(path, opts, read_only, input, output)
     }
 
+    /// Turn page-client read-ahead (spec/design/page-service.md §5.3) on or off for connections this
+    /// process makes afterwards. On by default for the stream transport. Test- and benchmark-only:
+    /// the page-service benchmark's no-read-ahead baseline.
+    #[cfg(unix)]
+    #[doc(hidden)]
+    pub fn set_page_client_read_ahead_for_testing(enabled: bool) {
+        crate::pageservice::client::READ_AHEAD_DISABLED
+            .store(!enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The serving owner of this handle's current role, if it is one.
     #[cfg(unix)]
     pub(crate) fn page_service_owner(
