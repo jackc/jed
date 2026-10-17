@@ -1883,7 +1883,7 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 	}
 
 	if len(plan.order) > 0 {
-		if err := sortRows(rows, plan.order); err != nil {
+		if err := sortRows(rows, plan.order, acct); err != nil {
 			return selectResult{}, err
 		}
 		if rootNode != "Sort" {

@@ -35,11 +35,16 @@ type tableStore struct {
 	// table created in-session (fully resident until the file is reopened); attached by the
 	// demand-paged file load. Shared (pointer) — a snapshot clone shares the one pool per database.
 	paging *sharedPaging
-	// staged is the stored bytes (recordFootprint) of every record version written since this store
-	// was last published — the transaction's pending writes (spec/design/memory.md §7). Cumulative: a
-	// rewrite charges again. It travels with the store, so discarding a working snapshot discards it
-	// too; a commit clears it before publishing.
+	// staged is the stored bytes (recordFootprint) of the record versions written since this store was
+	// last published that it still holds — the transaction's pending writes (spec/design/memory.md
+	// §7). Net: replacing or removing a version written since publication returns that version's
+	// bytes. It travels with the store, so discarding a working snapshot discards it too; a commit
+	// clears it before publishing.
 	staged int64
+	// stagedKeys is the stored bytes of each version written since publication that the store still
+	// holds, by key (a one-value [Int] row): what a replace or remove of that key returns (memory.md
+	// §7.1). A persistent map, so a snapshot clone stays O(1).
+	stagedKeys pMap
 }
 
 // NewTableStore builds an empty store for a table whose columns have the given resolved types,
@@ -53,7 +58,11 @@ func newTableStore(cap int, colTypes []colType) *tableStore {
 // dirty suffix (transactions.md §3). The shared paging context is shared, not copied (one pool per
 // database).
 func (s *tableStore) clone() *tableStore {
-	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, staged: s.staged}
+	var stagedKeys pMap
+	if !s.stagedKeys.IsEmpty() {
+		stagedKeys = s.stagedKeys.clone()
+	}
+	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, staged: s.staged, stagedKeys: stagedKeys}
 }
 
 func (s *tableStore) freezeMutationGeneration() { s.rows.freezeMutationGeneration() }
@@ -161,11 +170,48 @@ func (s *tableStore) weight(key []byte, row storedRow) (uint32, int64) {
 	return uint32(size), int64(stored)
 }
 
-// stagedBytes is the stored bytes written since this store was last published (memory.md §7).
+// stagedBytes is the net stored bytes of the versions written since this store was last published
+// (memory.md §7).
 func (s *tableStore) stagedBytes() int64 { return s.staged }
 
+// hasStaging reports whether the store changed since publication (it holds staging state to clear).
+func (s *tableStore) hasStaging() bool { return s.staged != 0 || !s.stagedKeys.IsEmpty() }
+
 // clearStaged forgets the staged bytes — the store is being published by a commit (memory.md §7).
-func (s *tableStore) clearStaged() { s.staged = 0 }
+func (s *tableStore) clearStaged() {
+	s.staged = 0
+	s.stagedKeys = pMap{}
+}
+
+// stage records key's new version as staged with stored bytes, displacing the staged version it
+// replaces, if any (memory.md §7.1): the pending bytes are net.
+func (s *tableStore) stage(key []byte, stored int64) error {
+	w := uint32(len(key)) + 8 // any weight: this in-memory map never serializes
+	old, _, err := s.stagedKeys.Insert(append([]byte(nil), key...), storedRow{IntValue(stored)}, w, s.cap, leafShapeFor(nil), nil)
+	if err != nil {
+		return err
+	}
+	s.staged = saturatingCostAdd(s.staged, stored) - stagedOf(old)
+	return nil
+}
+
+// unstage returns the bytes of key's staged version, if it has one (memory.md §7.1).
+func (s *tableStore) unstage(key []byte) error {
+	old, _, err := s.stagedKeys.Remove(key, s.cap, leafShapeFor(nil), nil)
+	if err != nil {
+		return err
+	}
+	s.staged -= stagedOf(old)
+	return nil
+}
+
+// stagedOf is the stored bytes a staged-key entry records (zero for none).
+func stagedOf(entry storedRow) int64 {
+	if len(entry) == 1 && entry[0].Kind == ValInt {
+		return entry[0].Int
+	}
+	return 0
+}
 
 // Insert adds a row under its encoded key. Returns (false, nil) if the key already exists
 // (primary-key uniqueness); the caller decides how to surface that. May fault the target leaf through
@@ -178,10 +224,12 @@ func (s *tableStore) Insert(key []byte, row storedRow) (bool, error) {
 		return false, nil
 	}
 	weight, stored := s.weight(key, row)
+	if err := s.stage(key, stored); err != nil {
+		return false, err
+	}
 	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.shape, src); err != nil {
 		return false, err
 	}
-	s.staged = saturatingCostAdd(s.staged, stored)
 	return true, nil
 }
 
@@ -205,10 +253,12 @@ func (s *tableStore) BumpRowidTo(n int64) {
 // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
 func (s *tableStore) Replace(key []byte, row storedRow) error {
 	weight, stored := s.weight(key, row)
+	if err := s.stage(key, stored); err != nil {
+		return err
+	}
 	if _, _, err := s.rows.Insert(key, row, weight, s.cap, s.shape, s.leafSrc()); err != nil {
 		return err
 	}
-	s.staged = saturatingCostAdd(s.staged, stored)
 	return nil
 }
 
@@ -216,7 +266,13 @@ func (s *tableStore) Replace(key []byte, row storedRow) error {
 // delete descends into / rebalances against.
 func (s *tableStore) Remove(key []byte) (bool, error) {
 	_, ok, err := s.rows.Remove(key, s.cap, s.shape, s.leafSrc())
-	return ok, err
+	if err != nil || !ok {
+		return ok, err
+	}
+	if err := s.unstage(key); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Get looks up a row by its exact encoded key. May fault the holding leaf through the buffer pool.

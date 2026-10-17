@@ -2168,9 +2168,11 @@ The exact charge sites are specified alongside the kernels in decimal.md.
 
 ### 8.1 Output-constructing kernels
 
-> **Status: S1–S4 implemented** in all three cores (`resource/scalar_output.test`,
+> **Status: S1–S5 implemented** in all three cores (`resource/scalar_output.test`,
 > `resource/scalar_output_json.test`, `resource/scalar_output_render.test`,
-> `resource/scalar_output_regexp.test`).
+> `resource/scalar_output_regexp.test`, `resource/scalar_output_extract.test`). S5 closed the last
+> constructing kernels a survey of the function catalog found unclassified: the text forms of jsonb
+> extraction, which render an object or array member with escapes.
 
 The `repeat`/pad rule generalizes. A kernel that **builds** a variable-width value
 can produce bytes that no earlier charge paid for. It can combine operands
@@ -2229,6 +2231,7 @@ count (up to about 16k groups under `MAX_REGEX_PROGRAM`, [regex.md](regex.md) §
 | `encode`, `quote_literal`, `quote_ident`, `quote_nullable`, `like_escape`; casts from an array, `bytea`, or `jsonb` to `text`, and from `jsonb` to `json` | growth | S3 | — | UTF-8 bytes of the result |
 | element-wise `bytea[]` → `text[]` cast | growth | S3 | — | `payload(array)` |
 | `to_char` (every overload) | growth | — | — | UTF-8 bytes of the result |
+| jsonb `->>`, `#>>`, `jsonb_each_text`, `jsonb_array_elements_text`, when the member they return is an object or array | growth | S5 | — | UTF-8 bytes of the rendered member |
 
 The amplifiers' exact sizes:
 
@@ -2321,9 +2324,12 @@ Rules for both classes:
   `(a, b) > (1, 'x')` for no protection.
 - Results that are an operand or part of one, or an operand-sized copy:
   substrings (including `regexp_substr` and the regex `substring`), trims, `split_part`, `set_byte` / `set_bit`,
-  subscripts and slices, jsonb extraction (`->`, `->>`, `#>`, `#>>`),
-  `jsonb_strip_nulls`, `array_remove`, jsonb `-`, `CASE`, `COALESCE`,
-  `GREATEST`/`LEAST`.
+  subscripts and slices, jsonb extraction that returns jsonb (`->`, `#>`, `jsonb_each`,
+  `jsonb_array_elements`) or a member's own text (a string, number, or boolean through
+  `->>`, `#>>`, and the `_text` set-returning functions), `json` extraction (its members'
+  verbatim text), `jsonb_strip_nulls`, `array_remove`, jsonb `-`, `CASE`, `COALESCE`,
+  `GREATEST`/`LEAST`, and range set operations (`range_merge`, `*`, `+`, `-`), whose bounds
+  are operand bounds.
 - Kernels whose output stays within a constant multiple of the original input no
   matter how often they are applied: `translate` (each character maps to at most
   one character of at most 4 bytes), `upper`/`lower`/`initcap`, `reverse`,
@@ -2350,7 +2356,8 @@ Rules for both classes:
 - Aggregates (`json_agg`, `jsonb_object_agg`, `array_agg`, `string_agg`, …): each input came from a
   charged row, and the retained inputs are Q2 operator state ([memory.md](memory.md) §6).
 - Set-returning functions: each row they produce charges `generated_row`. The
-  exception is `regexp_matches`, whose rows are capture arrays (above).
+  exceptions are `regexp_matches`, whose rows are capture arrays, and the jsonb `_text`
+  forms, whose container members are renders (above).
 - Host functions: outside the engine's guarantees (CLAUDE.md §13).
 
 **Follow-ons.** New constructing kernels (`concat`, `format`, `array_fill`) join this table when

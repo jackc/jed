@@ -346,7 +346,14 @@ import {
   ScratchRow,
 } from "./span_filter.ts";
 import { type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
-import { RowSpool, SpillMap, SpillMultiMap, SpillSet, SpoolSorter } from "./blocking.ts";
+import {
+  RowSpool,
+  type SortedSpool,
+  SpillMap,
+  SpillMultiMap,
+  SpillSet,
+  SpoolSorter,
+} from "./blocking.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -455,6 +462,7 @@ import {
   jsonbOut,
   makeObject as jsonMakeObject,
   nodeToText,
+  isContainer as isJsonContainer,
   verbatimArrayElements,
   verbatimObjectMembers,
   parsePreservingJsonUnlessRoot,
@@ -3527,7 +3535,9 @@ export class Engine {
     }
     // Adopt the transaction's temp changes into the committed temp snapshot (temp-tables.md §5) — the
     // temp analogue of publishing committed, but purely in memory. Session-local temp lives on the
-    // session.
+    // session. Its stores' staging state resets like main's (memory.md §7), though temp writes are never
+    // pending.
+    tx.tempWorking.clearStaged();
     tx.tempWorking.freezeMutationGenerations();
     this.session.tempCommitted = tx.tempWorking;
     // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit):
@@ -3721,6 +3731,15 @@ export class Engine {
   private checkStatementBudgets(cost: bigint): void {
     this.checkTempBudget();
     this.checkPendingWrites(cost);
+  }
+
+  // syncPendingWrites is the within-statement pending-write check (spec/design/memory.md §7.3), run
+  // after each write phase: the statement's account brings the pending writes it holds to the
+  // transaction's current pending bytes, so they must fit beside the statement's live reservations
+  // (54P05, cost first). Inert, and free, without a finite budget.
+  private syncPendingWrites(meter: Meter): void {
+    if (!meter.queryMemoryActive()) return;
+    meter.syncPending(this.session.pendingWriteBytes());
   }
 
   // checkPendingWrites enforces the query-memory budget on the open transaction's pending writes after a
@@ -11818,6 +11837,7 @@ export class Engine {
         }
       }
     }
+    this.syncPendingWrites(meter);
     return returned;
   }
 
@@ -11965,6 +11985,7 @@ export class Engine {
         if (!istore.insert(entry, [])) throw uniqueViolation(table.name, def.name);
       }
     }
+    this.syncPendingWrites(meter);
     return returned;
   }
 
@@ -12606,6 +12627,7 @@ export class Engine {
         }
       }
     }
+    this.syncPendingWrites(meter);
     this.applyFkUpdateActions(table, fkUpdates, meter, this.fkDomain(dbScope, table.name));
     return { affected, returned };
   }
@@ -13161,6 +13183,7 @@ export class Engine {
       const istore = this.writeIndexStoreScoped(del.db, def.name);
       for (const ek of toRemove[kx]!) istore.remove(ek);
     }
+    this.syncPendingWrites(meter);
     if (matched.length > 0) this.markEstimatorMutation(del.db, del.table);
     this.applyFkDeleteActions(
       table,
@@ -13750,6 +13773,7 @@ export class Engine {
         }
       }
     }
+    this.syncPendingWrites(meter);
     if (updates.length > 0) this.markEstimatorMutation(upd.db, upd.table);
     this.applyFkUpdateActions(table, updates, meter, this.fkDomain(upd.db, upd.table));
     return dmlOutcome(
@@ -15908,7 +15932,7 @@ export class Engine {
       this.recordExplainActualParent(setOpNodeName(plan.op), cost);
 
     if (plan.order.length > 0) {
-      sortRows(rows, plan.order);
+      sortRows(rows, plan.order, acct);
       if (rootNode !== "Sort") this.recordExplainActualParent("Sort", cost);
     }
 
@@ -18818,10 +18842,15 @@ export class Engine {
         for (const e of node.elements) {
           meter.guard();
           meter.charge(COSTS.generatedRow);
-          const v =
-            srf.kind === "jsonb_array_elements_text"
-              ? ((t) => (t === null ? nullValue() : textValue(t)))(nodeToText(e))
-              : jsonbValue(e);
+          let v: Value;
+          if (srf.kind === "jsonb_array_elements_text") {
+            const t = nodeToText(e);
+            v = t === null ? nullValue() : textValue(t);
+            // A container element's render is a growth kernel (cost.md §8.1, S5).
+            if (isJsonContainer(e) && !rexprIsConstant(srf.args[0]!)) chargeOutput(meter, v);
+          } else {
+            v = jsonbValue(e);
+          }
           out.push([v]);
         }
         break;
@@ -18856,6 +18885,9 @@ export class Engine {
           if (srf.kind === "jsonb_each_text") {
             const t = nodeToText(m.value);
             value = t === null ? nullValue() : textValue(t);
+            // A container member's render is a growth kernel (cost.md §8.1, S5).
+            if (isJsonContainer(m.value) && !rexprIsConstant(srf.args[0]!))
+              chargeOutput(meter, value);
           } else {
             value = jsonbValue(m.value);
           }
@@ -19946,9 +19978,10 @@ export class Engine {
       if (plan.phys.topK !== null) {
         // The selection discards rows: release the buffer, re-reserve the kept rows.
         charge.releaseAll();
-        retained = topKRows(rows, plan.order, plan.phys.topK);
+        const topK = plan.phys.topK;
+        retained = meter.costFirst(() => topKRows(rows, plan.order, topK, meter.query));
         if (charge.active()) for (const row of retained) charge.reserve(meter, rowBytes(row));
-      } else sortRows(retained, plan.order);
+      } else meter.costFirst(() => sortRows(retained, plan.order, meter.query));
       sorted = new SortedRows(retained, null, charge);
     } else {
       // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
@@ -22434,9 +22467,14 @@ export class Engine {
         // Rows the top-k selection drops are discarded (memory.md §5.3): release the input, then
         // re-reserve the kept rows (never more than was released).
         meter.releaseRowsMasked(rows, memMask);
-        rows = topKRows(rows, plan.order, plan.phys.topK);
+        const topK = plan.phys.topK;
+        const input = rows;
+        rows = meter.costFirst(() => topKRows(input, plan.order, topK, meter.query));
         for (const row of rows) meter.admitRowMasked(row, memMask);
-      } else sortRows(rows, plan.order);
+      } else {
+        const input = rows;
+        meter.costFirst(() => sortRows(input, plan.order, meter.query));
+      }
       if (selectActualRootNode(plan) !== "Sort")
         this.recordExplainActualParent("Sort", meter.accrued);
     }
@@ -22639,7 +22677,7 @@ export class Engine {
               srow.push(finalizeAcc(inner));
               continue;
             }
-            srow.push(finalizeAcc(a));
+            srow.push(finalizeAccMetered(a, meter));
           }
           for (const positions of plan.groupingSpecs) {
             srow.push(intValue(groupingValue(positions, gset.mask)));
@@ -22678,7 +22716,7 @@ export class Engine {
       // expression key is materialized against the grouped row and appended — grammar.md §10).
       if (plan.order.length > 0) {
         materializeOrderExprs(groupRows, plan.orderExprs, env, meter);
-        sortRows(groupRows, plan.order);
+        meter.costFirst(() => sortRows(groupRows, plan.order, meter.query));
         if (selectActualRootNode(plan) !== "Sort")
           this.recordExplainActualParent("Sort", meter.accrued);
       }
@@ -34092,6 +34130,20 @@ export function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
 
 // finalizeAcc produces the aggregate's final value over the group. COUNT → its count (0 over
 // empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
+// finalizeAccMetered is finalizeAcc with the statement meter in reach, so an ordered-set aggregate's
+// collated finalize sort charges its decorations (memory.md §6.8).
+export function finalizeAccMetered(a: Acc, meter: Meter): Value {
+  switch (a.plan) {
+    case "mode":
+    case "percentileDisc":
+    case "percentileCont":
+    case "orderedSetContInterval":
+      return finalizeOrderedSet(a, meter);
+    default:
+      return finalizeAcc(a);
+  }
+}
+
 export function finalizeAcc(a: Acc): Value {
   switch (a.plan) {
     case "covarPop":
@@ -34217,7 +34269,9 @@ export function finalizeAcc(a: Acc): Value {
 // order); percentileDisc → an actual value at 1-based row ceil(p·N); percentileCont → the
 // interpolated f64. The fraction range check (22003) fires here, after the NULL-fraction check and
 // before the empty-group check — matching PG.
-export function finalizeOrderedSet(a: Acc): Value {
+//
+// With meter, a collated finalize sort charges its decorations (memory.md §6.8).
+export function finalizeOrderedSet(a: Acc, meter: Meter | null = null): Value {
   const desc = a.osaDesc === true;
   if (a.plan === "mode") {
     const vals = a.osaVals!;
@@ -34225,7 +34279,7 @@ export function finalizeOrderedSet(a: Acc): Value {
     // Sort by the WITHIN GROUP order (honoring the key's collation), then take the first value of the
     // longest run of equal values. Run equality is value-canonical (byte equality), so the collation
     // affects only which tied value comes first.
-    sortOsaVals(vals, a.osaCollation ?? null, desc);
+    sortOsaVals(vals, a.osaCollation ?? null, desc, meter);
     // The first value of the longest run of equal values — the most frequent, ties broken by sort
     // order (the first such run).
     let bestIdx = 0;
@@ -34249,7 +34303,7 @@ export function finalizeOrderedSet(a: Acc): Value {
     // array (aggregates.md §18); finalizePercentile dispatches and applies the NULL / range-check /
     // empty rules per PG, computing each percentile over the sorted vals.
     const vals = a.osaVals!;
-    sortOsaVals(vals, a.osaCollation ?? null, desc);
+    sortOsaVals(vals, a.osaCollation ?? null, desc, meter);
     return finalizePercentile(a.osaFrac, vals.length === 0, (p) => percentileDiscAt(vals, p));
   }
   if (a.plan === "orderedSetContInterval") {
@@ -34257,7 +34311,7 @@ export function finalizeOrderedSet(a: Acc): Value {
     // aggregates.md §13). Values are sorted by their canonical span (interval has no collation, so
     // sortOsaVals uses the value order).
     const vals = a.osaVals!;
-    sortOsaVals(vals, a.osaCollation ?? null, desc);
+    sortOsaVals(vals, a.osaCollation ?? null, desc, meter);
     return finalizePercentile(a.osaFrac, vals.length === 0, (p) => {
       const n = vals.length;
       const pos = p * (n - 1);
@@ -34378,22 +34432,35 @@ export function dirCmp(c: number, desc: boolean): number {
 // key bytes (a collated key is always text; an unmapped code point fails 0A000 at this deterministic
 // point, like the query ORDER BY). JS Array.prototype.sort is stable, so a comparator that returns 0
 // for collation-equal keys keeps them in scan order — deterministic and cross-core identical.
-export function sortOsaVals(vals: Value[], collation: Collation | null, desc: boolean): void {
+//
+// With meter, the decorations are transient operator state (memory.md §6.8): each reserves its sort
+// key's bytea value bytes as it is built, all released once the values are undecorated.
+export function sortOsaVals(
+  vals: Value[],
+  collation: Collation | null,
+  desc: boolean,
+  meter: Meter | null = null,
+): void {
   if (collation === null) {
     vals.sort((a, b) => dirCmp(valueCmp(a, b), desc));
     return;
   }
+  const charge = meter !== null ? meter.stateCharge() : new StateCharge();
   // Decorate each value with its collation sort key (text / text[]), sort stably by the key bytes, then
   // undecorate. The keys are built once up front so a sortKey failure (0A000 for an unmapped code
   // point) surfaces at this deterministic point rather than inside the comparator.
-  const deco: { key: Uint8Array; val: Value }[] = vals.map((v) => {
+  const deco: { key: Uint8Array; val: Value }[] = [];
+  for (const v of vals) {
     if (v.kind !== "text" && v.kind !== "array") {
       throw new Error("a collated WITHIN GROUP key buffers only text or text[]");
     }
-    return { key: collatedSortKey(collation, v)!, val: v };
-  });
+    const key = collatedSortKey(collation, v)!;
+    if (meter !== null && charge.active()) charge.reserve(meter, MEMORY_VALUE + key.length);
+    deco.push({ key, val: v });
+  }
   deco.sort((a, b) => dirCmp(cmpBytes(a.key, b.key), desc));
   for (let i = 0; i < deco.length; i++) vals[i] = deco[i]!.val;
+  charge.releaseAll();
 }
 
 // finalizeHypothetical computes a hypothetical-set aggregate's value (aggregates.md §19): given the
@@ -38991,7 +39058,7 @@ function finalizeBlockingCollection(
       sink,
       new StateCharge(acct),
     );
-    let sorted: RowSpool | null = null;
+    let sorted: SortedSpool | null = null;
     const folded = new SpillMultiMap(budget, sink, new StateCharge(acct));
     const unique = new SpillMap(budget, sink, new StateCharge(acct));
     try {
@@ -39115,7 +39182,7 @@ function finalizeBlockingCollection(
       sink,
       new StateCharge(acct),
     );
-    let sorted: RowSpool | null = null;
+    let sorted: SortedSpool | null = null;
     try {
       // The values were converted as they were folded, in input order.
       for (const pair of collections.get(key)) {
@@ -39162,7 +39229,7 @@ function finalizeBlockingCollection(
     sink,
     new StateCharge(acct),
   );
-  let sorted: RowSpool | null = null;
+  let sorted: SortedSpool | null = null;
   let ordered: RowSpool | null = null;
   try {
     for (const row of collections.get(key)) {

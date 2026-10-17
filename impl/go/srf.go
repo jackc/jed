@@ -1562,6 +1562,12 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 				} else {
 					v = NullValue()
 				}
+				// A container element's render is a growth kernel (cost.md §8.1, S5).
+				if jsonIsContainer(&e) && !rexprIsConstant(sp.args[0]) {
+					if err := chargeOutput(m, v); err != nil {
+						return nil, err
+					}
+				}
 			} else {
 				v = JsonbValue(e)
 			}
@@ -1595,6 +1601,12 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 					value = TextValue(s)
 				} else {
 					value = NullValue()
+				}
+				// A container member's render is a growth kernel (cost.md §8.1, S5).
+				if jsonIsContainer(&node.Obj[i].Val) && !rexprIsConstant(sp.args[0]) {
+					if err := chargeOutput(m, value); err != nil {
+						return nil, err
+					}
 				}
 			} else {
 				value = JsonbValue(node.Obj[i].Val)

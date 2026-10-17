@@ -277,3 +277,73 @@ func TestSpillingSortIsStableOnTies(t *testing.T) {
 		}
 	}
 }
+
+// drainSorted pulls every row of a sorted output, returning the count.
+func drainSorted(t *testing.T, rows *sortedRows) int {
+	t.Helper()
+	count := 0
+	for {
+		_, ok, err := rows.next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			return count
+		}
+		count++
+	}
+}
+
+// memory.md §6.8: each head read back from a spilled run reserves its row_bytes while it is in the
+// merge heap; the final in-memory buffer's rows are already charged with the buffer. A head the
+// account rejects is held uncharged: the merge cannot spill further.
+func TestMergeHeadsOfSpilledRunsAreCharged(t *testing.T) {
+	dir := t.TempDir()
+	rowSize := memRowBytes(storedRow{IntValue(0), IntValue(0)})
+	acct := queryAccount{used: new(int64), limit: 1 << 40}
+	sort := newSorter([]orderSlot{{idx: 0}}, int(rowSize*3), osSpillHost{dir: dir}, newStateCharge(acct))
+	for i := 0; i < 10; i++ {
+		if err := sort.push(storedRow{IntValue(int64(i % 3)), IntValue(int64(i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buffered := int64(len(sort.buf))
+	runs := int64(len(sort.runs))
+	if runs == 0 {
+		t.Fatal("expected spilled runs")
+	}
+	rows, err := sort.finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := *acct.used, (runs+buffered)*rowSize; got != want {
+		t.Fatalf("after finish: used %d, want %d", got, want)
+	}
+	if n := drainSorted(t, rows); n != 10 {
+		t.Fatalf("merged %d rows, want 10", n)
+	}
+	rows.release()
+	if *acct.used != 0 {
+		t.Fatalf("after release: used %d, want 0", *acct.used)
+	}
+	rows.close()
+
+	tight := queryAccount{used: new(int64), limit: 1}
+	sort = newSorter([]orderSlot{{idx: 0}}, int(rowSize*3), osSpillHost{dir: dir}, newStateCharge(tight))
+	for i := 0; i < 10; i++ {
+		if err := sort.push(storedRow{IntValue(int64(i % 3)), IntValue(int64(i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err = sort.finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := drainSorted(t, rows); n != 10 {
+		t.Fatalf("merged %d rows, want 10", n)
+	}
+	rows.close()
+	if *tight.used != 0 {
+		t.Fatalf("tight: used %d, want 0", *tight.used)
+	}
+}

@@ -813,12 +813,14 @@ impl Engine {
                     // Rows the top-k selection drops are discarded (memory.md §5.3): release the input,
                     // then re-reserve the kept rows (never more than was released).
                     meter.release_rows_masked(&rows, &mem_mask);
-                    rows = top_k_rows(rows, &plan.order, k)?;
+                    let acct = meter.query.clone();
+                    rows = meter.cost_first(top_k_rows(rows, &plan.order, k, &acct))?;
                     for row in &rows {
                         meter.admit_row_masked(row, &mem_mask)?;
                     }
                 } else {
-                    sort_rows(&mut rows, &plan.order)?;
+                    let acct = meter.query.clone();
+                    meter.cost_first(sort_rows(&mut rows, &plan.order, &acct))?;
                 }
                 if select_actual_root_node(plan) != "Sort"
                     && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
@@ -1084,7 +1086,7 @@ impl Engine {
                                 }
                                 inner.finalize()?
                             } else {
-                                acc.finalize()?
+                                acc.finalize_metered(meter)?
                             };
                             srow.push(result);
                         }
@@ -1142,7 +1144,8 @@ impl Engine {
                 // expression key is materialized against the grouped row and appended — grammar.md §10).
                 if !plan.order.is_empty() {
                     materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, meter)?;
-                    sort_rows(&mut group_rows, &plan.order)?;
+                    let acct = meter.query.clone();
+                    meter.cost_first(sort_rows(&mut group_rows, &plan.order, &acct))?;
                     if select_actual_root_node(plan) != "Sort"
                         && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
                     {

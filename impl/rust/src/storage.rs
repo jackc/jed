@@ -157,11 +157,16 @@ pub struct TableStore {
     /// and for a table created in-session (fully resident until the file is reopened); attached by
     /// the demand-paged file load. `Arc` so a snapshot clone shares the one pool per database.
     paging: Option<Arc<SharedPaging>>,
-    /// The stored bytes ([`crate::format::record_footprint`]) of every record version written since
-    /// this store was last published — the transaction's pending writes (spec/design/memory.md §7).
-    /// Cumulative: a rewrite charges again. It travels with the store, so discarding a working
-    /// snapshot discards it too; a commit clears it before publishing.
+    /// The stored bytes ([`crate::format::record_footprint`]) of the record versions written since
+    /// this store was last published that it still holds — the transaction's pending writes
+    /// (spec/design/memory.md §7). Net: replacing or removing a version written since publication
+    /// returns that version's bytes. It travels with the store, so discarding a working snapshot
+    /// discards it too; a commit clears it before publishing.
     staged: i64,
+    /// The stored bytes of each version written since publication that the store still holds, by
+    /// key (a one-value `[Int]` row): what a replace or remove of that key returns (memory.md §7.1).
+    /// A persistent map, so a snapshot clone stays O(1).
+    staged_keys: PMap,
 }
 
 impl TableStore {
@@ -177,6 +182,7 @@ impl TableStore {
             shape,
             paging: None,
             staged: 0,
+            staged_keys: PMap::new(),
         }
     }
 
@@ -192,6 +198,7 @@ impl TableStore {
             shape: self.shape,
             paging: self.paging.clone(),
             staged: 0,
+            staged_keys: PMap::new(),
         }
     }
 
@@ -216,25 +223,61 @@ impl TableStore {
     /// through the buffer pool (an I/O error then propagates).
     pub fn insert(&mut self, key: Vec<u8>, row: Row) -> Result<bool> {
         let (w, stored) = self.weight(&key, &row); // full `&self` borrow — before the leaf source
+        {
+            let src = make_src(&self.paging, &self.col_types);
+            let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+            if self.rows.get(&key, src_ref)?.is_some() {
+                return Ok(false);
+            }
+        }
+        self.stage(&key, stored)?;
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        if self.rows.get(&key, src_ref)?.is_some() {
-            return Ok(false);
-        }
         self.rows
             .insert(key, row, w, self.cap, self.shape, src_ref)?;
-        self.staged = self.staged.saturating_add(stored);
         Ok(true)
     }
 
-    /// The stored bytes written since this store was last published (memory.md §7).
+    /// The net stored bytes of the versions written since this store was last published (memory.md
+    /// §7).
     pub(crate) fn staged_bytes(&self) -> i64 {
         self.staged
+    }
+
+    /// Whether the store changed since publication (it holds staging state to clear).
+    pub(crate) fn has_staging(&self) -> bool {
+        self.staged != 0 || !self.staged_keys.is_empty()
     }
 
     /// Forget the staged bytes — the store is being published by a commit (memory.md §7).
     pub(crate) fn clear_staged(&mut self) {
         self.staged = 0;
+        self.staged_keys = PMap::new();
+    }
+
+    /// Record `key`'s new version as staged with `stored` bytes, returning the bytes of the staged
+    /// version it displaces, if any (memory.md §7.1): the pending bytes are net.
+    fn stage(&mut self, key: &[u8], stored: i64) -> Result<()> {
+        let w = key.len() as u32 + 8; // any weight: this in-memory map never serializes
+        let old = self.staged_keys.insert(
+            key.to_vec(),
+            vec![Value::Int(stored)],
+            w,
+            self.cap,
+            crate::format::leaf_shape(&[]),
+            None,
+        )?;
+        self.staged = self.staged.saturating_add(stored) - staged_of(old);
+        Ok(())
+    }
+
+    /// Return the bytes of `key`'s staged version, if it has one (memory.md §7.1).
+    fn unstage(&mut self, key: &[u8]) -> Result<()> {
+        let old = self
+            .staged_keys
+            .remove(key, self.cap, crate::format::leaf_shape(&[]), None)?;
+        self.staged -= staged_of(old);
+        Ok(())
     }
 
     /// Allocate the next monotonic rowid (for a table with no primary key) and
@@ -262,11 +305,11 @@ impl TableStore {
     /// just found, so the overwrite always lands on a present key. May fault the target leaf.
     pub fn replace(&mut self, key: &[u8], row: Row) -> Result<()> {
         let (w, stored) = self.weight(key, &row);
+        self.stage(key, stored)?;
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows
             .insert(key.to_vec(), row, w, self.cap, self.shape, src_ref)?;
-        self.staged = self.staged.saturating_add(stored);
         Ok(())
     }
 
@@ -275,10 +318,14 @@ impl TableStore {
     pub fn remove(&mut self, key: &[u8]) -> Result<bool> {
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        Ok(self
+        let removed = self
             .rows
             .remove(key, self.cap, self.shape, src_ref)?
-            .is_some())
+            .is_some();
+        if removed {
+            self.unstage(key)?;
+        }
+        Ok(removed)
     }
 
     /// Look up a row by its exact encoded key. Returns an **owned** row — under demand paging the
@@ -704,6 +751,14 @@ impl TableStore {
     /// footprint measure the temp-table budget sums (spec/design/temp-tables.md §7).
     pub(crate) fn stored_bytes(&self) -> u64 {
         self.rows.resident_record_bytes()
+    }
+}
+
+/// The stored bytes a staged-key entry records (zero for none).
+fn staged_of(entry: Option<Row>) -> i64 {
+    match entry.as_deref() {
+        Some([Value::Int(n)]) => *n,
+        _ => 0,
     }
 }
 

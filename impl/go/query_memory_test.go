@@ -159,7 +159,8 @@ func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 // the statement's own reservations is an accounting bug, clamped at that floor and counted.
 func TestQueryMemoryReleaseNeverDipsIntoThePendingWriteFloor(t *testing.T) {
 	used := int64(30)
-	acct := queryAccount{used: &used, limit: 100, floor: 30}
+	floor := int64(30)
+	acct := queryAccount{used: &used, limit: 100, floor: &floor}
 	if err := acct.reserve(20); err != nil {
 		t.Fatal(err)
 	}

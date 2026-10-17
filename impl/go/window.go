@@ -44,10 +44,12 @@ func not3(a ThreeValued) ThreeValued {
 // sortRowsCollated decorate sorter runs instead (it can fail — an unmapped code point is 0A000).
 // The row type is generic over Row (the scan path) and [][]Value (the setop / aggregate paths):
 // both have the core type []Value, so a single comparator family serves every sort site.
-func sortRows[R ~[]Value](rows []R, order []orderSlot) error {
+// A collated sort's decorations are transient operator state charged to acct (memory.md §6.8); a
+// rejected reservation is returned for the caller's cost-first check.
+func sortRows[R ~[]Value](rows []R, order []orderSlot, acct queryAccount) error {
 	for _, k := range order {
 		if k.collation != nil {
-			return sortRowsCollated(rows, order)
+			return sortRowsCollated(rows, order, acct)
 		}
 	}
 	slices.SortStableFunc(rows, func(a, b R) int { return cmpRowsByOrder(a, b, order) })
@@ -550,7 +552,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 		}
 		// Collated UCA sort-key bytes for the shared order's collated slots (window.md §3/§5); nil
 		// when no key is collated, an unmapped code point fails 0A000 here.
-		collKeys, err := windowCollKeys(rows, rep.order)
+		collKeys, err := windowCollKeys(rows, rep.order, partCharge, meter)
 		if err != nil {
 			return err
 		}
@@ -678,11 +680,21 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 				// sorted position. The value is evaluated for every row; offset once (NULL → all
 				// NULL); the default per out-of-range row.
 				np := len(ordered)
+				// The partition's operand cache is transient operator state (memory.md §6.8),
+				// released once the partition's results are computed.
+				opCache := meter.stateCharge()
 				vals := make([]Value, np)
 				for pos, ri := range ordered {
 					v, err := spec.args[0].eval(rows[ri], env, meter)
 					if err != nil {
+						opCache.releaseAll()
 						return err
+					}
+					if opCache.active() {
+						if err := opCache.reserve(meter, memValueBytes(v)); err != nil {
+							opCache.releaseAll()
+							return err
+						}
 					}
 					vals[pos] = v
 				}
@@ -724,6 +736,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 						} else if len(spec.args) == 3 {
 							v, err := spec.args[2].eval(rows[ri], env, meter)
 							if err != nil {
+								opCache.releaseAll()
 								return err
 							}
 							results[ri] = v
@@ -732,6 +745,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 						}
 					}
 				}
+				opCache.releaseAll()
 			case planAgg:
 				np := len(ordered)
 				hasOperand := len(spec.args) > 0 // COUNT(*) has no operand
@@ -832,6 +846,9 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					exclude := newFrameExclusion(spec.frame)
 					vals := make([]Value, np)
 					valSet := make([]bool, np)
+					// The cached operands are transient operator state (memory.md §6.8): each reserves
+					// its value_bytes when first cached, all released at the end of the partition.
+					opCache := meter.stateCharge()
 					evalAt := func(k int) (Value, error) {
 						if !hasOperand {
 							return NullValue(), nil
@@ -840,6 +857,11 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							v, err := spec.args[0].eval(rows[ordered[k]], env, meter)
 							if err != nil {
 								return NullValue(), err
+							}
+							if opCache.active() {
+								if err := opCache.reserve(meter, memValueBytes(v)); err != nil {
+									return NullValue(), err
+								}
 							}
 							vals[k], valSet[k] = v, true
 						}
@@ -957,16 +979,24 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 						}
 						meter.releaseQuery(accCharge)
 					}
+					opCache.releaseAll()
 				}
 			case planFirstValue, planLastValue, planNthValue:
 				// Frame-sensitive value pickers (S4, window.md §4): first/last/nth row of the frame.
 				np := len(ordered)
-				// The value expression, evaluated once per row (sorted order).
+				// The value expression, evaluated once per row (sorted order) — the partition's
+				// operand cache, transient operator state (memory.md §6.8).
+				opCache := meter.stateCharge()
 				vals := make([]Value, np)
 				for pos, ri := range ordered {
 					v, err := spec.args[0].eval(rows[ri], env, meter)
 					if err != nil {
 						return err
+					}
+					if opCache.active() {
+						if err := opCache.reserve(meter, memValueBytes(v)); err != nil {
+							return err
+						}
 					}
 					vals[pos] = v
 				}
@@ -1032,6 +1062,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					}
 					results[ordered[pos]] = out
 				}
+				opCache.releaseAll()
 			}
 		}
 		for i := range rows {
@@ -1085,7 +1116,9 @@ func cmpRowsByOrder[R ~[]Value](a, b R, order []orderSlot) int {
 // slots (if any), indexed in parallel with rows, so the partition sort AND peer determination
 // (ranking, frame peer groups) honor the collation identically (window.md §3/§5). Returns nil when no
 // key is collated. An unmapped code point fails 0A000 here, at this deterministic per-row point.
-func windowCollKeys(rows []storedRow, order []orderSlot) ([][][]byte, error) {
+// Each row's keys are transient operator state (memory.md §6.8): reserved on charge as they are built
+// and held until the window stage completes.
+func windowCollKeys(rows []storedRow, order []orderSlot, charge *stateCharge, meter *costMeter) ([][][]byte, error) {
 	collated := false
 	for _, k := range order {
 		if k.collation != nil {
@@ -1111,6 +1144,11 @@ func windowCollKeys(rows []storedRow, order []orderSlot) ([][][]byte, error) {
 				keys = append(keys, sk)
 			} else {
 				keys = append(keys, nil) // NULL (a collated slot is text / text[]) — handled by NULL placement
+			}
+		}
+		if charge.active() {
+			if err := charge.reserve(meter, memSortKeyBytes(keys)); err != nil {
+				return nil, err
 			}
 		}
 		all[i] = keys
@@ -1171,16 +1209,26 @@ func cmpWindowRows(a, b int, rows []storedRow, order []orderSlot, collKeys [][][
 // for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
 // (cost.md §3); the collate cost is charged at the comparison evaluator (collation.md §11). A
 // collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
-func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot) error {
+// Each row's decoration reserves its memSortKeyBytes as it is built; all are released once the rows
+// are undecorated (memory.md §6.8).
+func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot, acct queryAccount) error {
 	type deco struct {
 		keys [][]byte // one per collated slot, in slot order; nil entry ⇒ a NULL value
 		row  R
 	}
+	charge := newStateCharge(acct)
 	d := make([]deco, len(rows))
 	for i, row := range rows {
 		keys, err := collationKeysForRow(row, order)
 		if err != nil {
+			charge.releaseAll()
 			return err
+		}
+		if charge.active() {
+			if err := charge.reserveDirect(memSortKeyBytes(keys)); err != nil {
+				charge.releaseAll()
+				return err
+			}
 		}
 		d[i] = deco{keys: keys, row: row}
 	}
@@ -1190,6 +1238,7 @@ func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot) error {
 	for i := range d {
 		rows[i] = d[i].row
 	}
+	charge.releaseAll()
 	return nil
 }
 

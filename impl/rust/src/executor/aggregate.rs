@@ -526,6 +526,30 @@ impl Acc {
 
     /// Produce the aggregate's final value over the group. COUNT → its count (0 over empty);
     /// SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
+    /// [`finalize`](Self::finalize) with the statement meter in reach, so an ordered-set aggregate's
+    /// collated finalize sort charges its decorations (memory.md §6.8).
+    pub(crate) fn finalize_metered(self, meter: &mut Meter) -> Result<Value> {
+        match self {
+            Acc::OrderedSet {
+                kind,
+                desc,
+                frac,
+                collation,
+                vals,
+                floats,
+            } => finalize_ordered_set(
+                kind,
+                desc,
+                collation.as_deref(),
+                frac.as_ref(),
+                vals,
+                floats,
+                Some(meter),
+            ),
+            other => other.finalize(),
+        }
+    }
+
     pub(crate) fn finalize(self) -> Result<Value> {
         Ok(match self {
             Acc::CountStar(n) | Acc::Count(n) | Acc::RegrCount(n) => Value::Int(n),
@@ -668,6 +692,7 @@ impl Acc {
                 frac.as_ref(),
                 vals,
                 floats,
+                None,
             )?,
             // A hypothetical-set aggregate is finalized in the group-emission loop (it needs the
             // spec's per-key sort specs), never through `Acc::finalize` (aggregates.md §19).

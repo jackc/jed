@@ -969,7 +969,7 @@ func (a *acc) finalize() (Value, error) {
 	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy, planRegrSxy, planRegrSlope, planRegrIntercept, planRegrR2:
 		return a.pairs.finalize(pairStats[a.plan]), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
-		return a.finalizeOrderedSet()
+		return a.finalizeOrderedSet(nil)
 	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:
 		// A hypothetical-set aggregate is finalized in the group-emission loop (it needs the spec's
 		// per-key sort specs), never through acc.finalize (aggregates.md §19).
@@ -1015,7 +1015,9 @@ func finalizeStringAgg(rows []Value) Value {
 // order); percentile_disc → an actual value at 1-based row ceil(p·N); percentile_cont → the
 // interpolated f64. The fraction range check (22003) fires here, after the NULL-fraction check and
 // before the empty-group check — matching PG.
-func (a *acc) finalizeOrderedSet() (Value, error) {
+//
+// With meter, the collated finalize sort charges its decorations (memory.md §6.8).
+func (a *acc) finalizeOrderedSet(meter *costMeter) (Value, error) {
 	desc := a.osaDesc
 	switch a.plan {
 	case planMode:
@@ -1026,7 +1028,7 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 		// Sort by the WITHIN GROUP order (honoring the key's collation), then take the first value of
 		// the longest run of equal values. Run equality is value-canonical (byte equality), so the
 		// collation affects only which tied value comes first.
-		if err := sortOsaVals(vals, a.osaCollation, desc); err != nil {
+		if err := sortOsaVals(vals, a.osaCollation, desc, meter); err != nil {
 			return NullValue(), err
 		}
 		// The first value of the longest run of equal values — the most frequent, ties broken by
@@ -1047,7 +1049,7 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 		// an array (aggregates.md §18); finalizePercentile dispatches and applies the NULL /
 		// range-check / empty rules per PG, computing each percentile over the sorted vals.
 		vals := a.osaVals
-		if err := sortOsaVals(vals, a.osaCollation, desc); err != nil {
+		if err := sortOsaVals(vals, a.osaCollation, desc, meter); err != nil {
 			return NullValue(), err
 		}
 		return finalizePercentile(a.osaFrac, len(vals) == 0, func(p float64) (Value, error) {
@@ -1066,7 +1068,7 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 		// — aggregates.md §13). Values are sorted by their canonical span (interval has no collation,
 		// so sortOsaVals uses the value order).
 		vals := a.osaVals
-		if err := sortOsaVals(vals, a.osaCollation, desc); err != nil {
+		if err := sortOsaVals(vals, a.osaCollation, desc, meter); err != nil {
 			return NullValue(), err
 		}
 		return finalizePercentile(a.osaFrac, len(vals) == 0, func(p float64) (Value, error) {
@@ -1310,7 +1312,10 @@ func dirCmp(c int, desc bool) int {
 // key bytes (a collated key is always text; an unmapped code point fails 0A000 at this deterministic
 // point, like the query ORDER BY). The stable sort keeps collation-equal values in scan order, so
 // the result is deterministic and cross-core identical.
-func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
+//
+// With meter, the decorations are transient operator state (memory.md §6.8): each reserves its sort
+// key's bytea value bytes as it is built, all released once the values are undecorated.
+func sortOsaVals(vals []Value, collation *Collation, desc bool, meter *costMeter) error {
 	if collation == nil {
 		slices.SortStableFunc(vals, func(a, b Value) int {
 			return dirCmp(valueCmp(a, b), desc)
@@ -1324,6 +1329,10 @@ func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 		key []byte
 		val Value
 	}
+	var charge *stateCharge
+	if meter != nil {
+		charge = meter.stateCharge()
+	}
 	d := make([]deco, len(vals))
 	for i, v := range vals {
 		if v.Kind != ValText && v.Kind != ValArray {
@@ -1331,7 +1340,14 @@ func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 		}
 		sk, err := collationSortKey(collation, v)
 		if err != nil {
+			charge.releaseAll()
 			return err
+		}
+		if charge.active() {
+			if err := charge.reserve(meter, memoryValue+int64(len(sk))); err != nil {
+				charge.releaseAll()
+				return err
+			}
 		}
 		d[i] = deco{key: sk, val: v}
 	}
@@ -1341,7 +1357,18 @@ func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 	for i := range d {
 		vals[i] = d[i].val
 	}
+	charge.releaseAll()
 	return nil
+}
+
+// finalizeMetered is finalize with the statement meter in reach, so an ordered-set aggregate's
+// collated finalize sort charges its decorations (memory.md §6.8).
+func (a *acc) finalizeMetered(meter *costMeter) (Value, error) {
+	switch a.plan {
+	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
+		return a.finalizeOrderedSet(meter)
+	}
+	return a.finalize()
 }
 
 // finalizeHypothetical computes a hypothetical-set aggregate's value (aggregates.md §19): given the

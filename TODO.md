@@ -349,7 +349,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ **in-place trailing-free truncation** — lower `page_count` and truncate when the top pages are all free (the SQLite `incremental_vacuum` flavor): no rewrite, but sequenced against the two-meta fallback and the watermark. _(size: M)_
   - [ ] _follow-on:_ compaction options — repack half-empty leaves (today nodes are kept as-is so costs are unchanged), change `page_size` during the rewrite, and stream the GiST R-tree pages instead of building one index's pages at a time. _(size: M)_
 - [x] **Blocking sort and hash-operator spill** — `ORDER BY`, hash `JOIN`, `GROUP BY`/aggregate and `DISTINCT` use bounded row/state buffers under `work_mem` on native file hosts. Ordered disk hash partitions preserve JOIN candidate order, aggregate fold order, first occurrence and exact costs; direct scan feeds and cost prepasses stream. Aggregate DISTINCT and growing ordered-set/hypothetical collections spill, with bounded external ordering and descriptor counts. Shared forced-spill corpus checks run in CI; `mise run bench:spill` checks wide-input results/costs and measures RSS. → [spill.md](spec/design/spill.md)
-  - [ ] **Remaining query-memory owners** — Q1 (row buffers, result collectors), Q2 (operator state), Q3 (pending writes), and the storage limit (Q4a in-memory, Q4c file-backed — memory.md §8.7) have landed; remaining scalar kernels and host scratch support for OPFS/WASI remain. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
+  - [ ] **Remaining query-memory owners** — Q1 (row buffers, result collectors), Q2 (operator state), Q3 (pending writes), and the storage limit (Q4a in-memory, Q4c file-backed — memory.md §8.7) have landed, as has every constructing scalar kernel (cost.md §8.1, S1–S5); host scratch support for OPFS/WASI remains. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
 - [x] **Point-lookup, cold-read, and INSERT performance work** — the measured point-lookup,
   checksum/PAX/buffer-pool, concurrent-fault, and INSERT execution/tree slices have landed; final
   timings, allocation evidence, checksums, and decisions live in
@@ -605,18 +605,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   columnar lanes, and spill structures' resident elements; spill residency is measured on
   the same schedule so every core spills at the same row and releases on spill. Thresholds
   pinned by `resource/query_memory_state.test`; `mise run conformance:query_memory` compares
-  every record's peak across cores in memory, disk, and forced-spill modes. See
-  [memory.md](spec/design/memory.md) §6.
-  - [ ] _follow-on:_ the transient owners §6.8 leaves out (collation sort-key decorations,
-    window-frame operand caches, merge-heap heads). (The budget-aware spill trigger has landed:
-    a spill-capable structure spills when the account rejects it — memory.md §6.6.)
+  every record's peak across cores in memory, disk, and forced-spill modes. The transient owners
+  are charged too: collation sort-key decorations, window operand caches, and merge-heap heads
+  (`resource/query_memory_transient.test`). A spill-capable structure spills when the account
+  rejects it. See [memory.md](spec/design/memory.md) §6.
 - [x] **Q3 — pending writes.** Every record version a transaction stages into a table or index
   reserves its stored bytes (on-disk record + out-of-line payload) against
-  `max_query_memory_bytes` until commit/rollback; each statement's account opens holding them,
+  `max_query_memory_bytes` until commit/rollback, net of the versions it later replaced or deleted;
+  each statement's account opens holding them, takes on its own staged bytes after each write phase,
   and they must fit after every statement. Thresholds pinned by
   `resource/query_memory_pending.test`. See [memory.md](spec/design/memory.md) §7.
-  - [ ] _follow-on:_ a within-statement check (today a statement's own writes are checked once it
-    completes, like `max_temp_storage_bytes`), and a net-residency measure (today a rewrite charges again).
 - [x] **Q4a — committed in-memory storage.** A database-owned `max_storage_bytes` (create/attach
   option + handle setter, unlimited by default; the file form, Q4c, has landed — memory.md §8.7) over
   `page_count × page_size`, checked at commit before any write; a commit that raises the

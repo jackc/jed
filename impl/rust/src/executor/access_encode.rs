@@ -6535,6 +6535,7 @@ pub(crate) fn finalize_ordered_set(
     frac: Option<&Value>,
     mut vals: Vec<Value>,
     mut floats: Vec<f64>,
+    mut meter: Option<&mut Meter>,
 ) -> Result<Value> {
     match kind {
         AggPlan::OrderedSetMode => {
@@ -6545,7 +6546,7 @@ pub(crate) fn finalize_ordered_set(
             // value of the longest run of equal values — the most frequent, ties broken by sort
             // order (the first such run). Run equality is value-canonical (byte equality), so the
             // collation affects only which tied value comes first.
-            sort_osa_vals(&mut vals, collation, desc)?;
+            sort_osa_vals(&mut vals, collation, desc, meter.as_deref_mut())?;
             let mut best_idx = 0usize;
             let mut best_count = 1usize;
             let mut run_start = 0usize;
@@ -6566,7 +6567,7 @@ pub(crate) fn finalize_ordered_set(
             // percentile_disc: an actual sorted value at row ceil(p·N). The fraction may be a scalar
             // or an array (aggregates.md §18); `finalize_percentile` dispatches and applies the
             // NULL / range-check / empty rules per PG, computing each percentile over the sorted vals.
-            sort_osa_vals(&mut vals, collation, desc)?;
+            sort_osa_vals(&mut vals, collation, desc, meter.as_deref_mut())?;
             finalize_percentile(frac, vals.is_empty(), |p| Ok(percentile_disc_at(&vals, p)))
         }
         AggPlan::OrderedSetCont => {
@@ -6579,7 +6580,7 @@ pub(crate) fn finalize_ordered_set(
             // percentile_cont over interval input: interpolate in the interval domain (PG
             // `interval_lerp` — aggregates.md §13). Values are sorted by their canonical span
             // (interval has no collation, so `sort_osa_vals` uses the value order).
-            sort_osa_vals(&mut vals, collation, desc)?;
+            sort_osa_vals(&mut vals, collation, desc, meter.as_deref_mut())?;
             finalize_percentile(frac, vals.is_empty(), |p| {
                 let n = vals.len();
                 let pos = p * ((n - 1) as f64);
@@ -6883,10 +6884,14 @@ pub(crate) fn dir_cmp(ord: std::cmp::Ordering, desc: bool) -> std::cmp::Ordering
 /// collated key is always text; an unmapped code point fails `0A000` at this deterministic point,
 /// like the query ORDER BY). The stable sort keeps collation-equal values in scan order, so the
 /// result is deterministic and cross-core identical.
+///
+/// With `meter`, the decorations are transient operator state (memory.md §6.8): each reserves its
+/// sort key's `bytea` value bytes as it is built, all released once the values are undecorated.
 pub(crate) fn sort_osa_vals(
     vals: &mut Vec<Value>,
     collation: Option<&Collation>,
     desc: bool,
+    meter: Option<&mut Meter>,
 ) -> Result<()> {
     match collation {
         None => {
@@ -6894,6 +6899,11 @@ pub(crate) fn sort_osa_vals(
             Ok(())
         }
         Some(c) => {
+            let mut meter = meter;
+            let mut charge = match meter.as_deref() {
+                Some(m) => m.state_charge(),
+                None => crate::cost::StateCharge::default(),
+            };
             let mut decorated: Vec<(Vec<u8>, Value)> = Vec::with_capacity(vals.len());
             for v in vals.drain(..) {
                 let key = match collation_sort_key(c, &v)? {
@@ -6902,10 +6912,16 @@ pub(crate) fn sort_osa_vals(
                         "a collated WITHIN GROUP key buffers only text or text[]: {v:?}"
                     ),
                 };
+                if let Some(m) = meter.as_deref_mut()
+                    && charge.active()
+                {
+                    charge.reserve(m, crate::costs::MEMORY_VALUE + key.len() as i64)?;
+                }
                 decorated.push((key, v));
             }
             decorated.sort_by(|a, b| dir_cmp(a.0.cmp(&b.0), desc));
             vals.extend(decorated.into_iter().map(|(_, v)| v));
+            charge.release_all();
             Ok(())
         }
     }

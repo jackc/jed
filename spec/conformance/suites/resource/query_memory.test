@@ -289,12 +289,13 @@ SELECT count(*) FROM sink
 ----
 3
 
-# RETURNING rows are a buffered result.
-# max_query_memory_bytes: 196
+# RETURNING rows are a buffered result. They are still held when the write's 27 staged bytes (the
+# two records, memory.md §7.3) join the account, so the statement needs both.
+# max_query_memory_bytes: 223
 statement error 54P05
 INSERT INTO sink VALUES (10, 'abc'), (11, 'de') RETURNING id, v
 
-# max_query_memory_bytes: 197
+# max_query_memory_bytes: 224
 query IT nosort
 INSERT INTO sink VALUES (10, 'abc'), (11, 'de') RETURNING id, v
 ----
@@ -303,11 +304,11 @@ abc
 11
 de
 
-# max_query_memory_bytes: 196
+# max_query_memory_bytes: 223
 statement error 54P05
 UPDATE sink SET v = upper(v) WHERE id >= 10 RETURNING id, v
 
-# max_query_memory_bytes: 197
+# max_query_memory_bytes: 224
 query IT rowsort
 UPDATE sink SET v = upper(v) WHERE id >= 10 RETURNING id, v
 ----

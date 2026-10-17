@@ -178,7 +178,11 @@ export class Sorter {
       throw e;
     }
     sources.push(new MemSource(this.buf));
-    return new SortedRows(null, new Merger(sources, this.compare), this.charge);
+    return new SortedRows(
+      null,
+      new Merger(sources, this.compare, this.charge.sibling()),
+      this.charge,
+    );
   }
 }
 
@@ -220,25 +224,46 @@ class Merger {
   private sources: MergeSource[];
   private compare: RowCompare;
   private heap: HeapItem[] = [];
-  constructor(sources: MergeSource[], compare: RowCompare) {
+  // The heads read back from spilled runs (memory.md §6.8): each reserves its rowBytes as it enters the
+  // heap and is released when it leaves. The final in-memory buffer's rows are already charged with it,
+  // so its heads reserve nothing. The merge cannot spill further, so a head whose reservation the
+  // account rejects is held uncharged (at most one row per run).
+  private heads: StateCharge;
+  // Reads each source's first row into the heap, in source order.
+  constructor(sources: MergeSource[], compare: RowCompare, heads: StateCharge = new StateCharge()) {
     this.sources = sources;
     this.compare = compare;
+    this.heads = heads;
     for (let i = 0; i < sources.length; i++) {
       const row = sources[i]!.next();
-      if (row !== null) this.heapPush({ row, source: i });
+      if (row !== null) this.heapPush({ row, source: i, charged: this.chargeHead(i, row) });
     }
   }
 
+  // chargeHead reserves a head from source i if it fits, returning the bytes it holds: a spilled run's
+  // row is new memory; a rejected head, and the in-memory buffer's, hold nothing.
+  private chargeHead(i: number, row: Row): number {
+    if (!this.heads.active() || !(this.sources[i] instanceof RunSource)) return 0;
+    const bytes = rowBytes(row);
+    return this.heads.tryReserveDirect(bytes) ? bytes : 0;
+  }
+
+  // next is the next row in order. The popped head's source replaces it (reserved first), then the
+  // popped head's charge is released as the row leaves the merge.
   next(): Row | null {
     if (this.heap.length === 0) return null;
     const top = this.heapPop();
     const row = this.sources[top.source]!.next();
-    if (row !== null) this.heapPush({ row, source: top.source });
+    if (row !== null) {
+      this.heapPush({ row, source: top.source, charged: this.chargeHead(top.source, row) });
+    }
+    this.heads.release(top.charged);
     return top.row;
   }
 
   close(): void {
     for (const s of this.sources) s.close();
+    this.heads.releaseAll();
   }
 
   // less(a, b) is true when a should come out first: smaller by the order keys, ties by lower source.
@@ -282,7 +307,8 @@ class Merger {
   }
 }
 
-type HeapItem = { row: Row; source: number };
+// charged is the query-memory bytes this head holds (zero for the in-memory buffer's rows).
+type HeapItem = { row: Row; source: number; charged: number };
 
 // A merge input: a spilled run file (read back lazily, one row at a time) or the final in-memory buffer.
 interface MergeSource {

@@ -667,7 +667,15 @@ impl RExpr {
                         Ok(Value::Jsonb(n.clone()))
                     }
                     (JsonGetOp::ArrowText | JsonGetOp::HashArrowText, Some(n)) => {
-                        Ok(json::node_to_text(n).map_or(Value::Null, Value::Text))
+                        let out = json::node_to_text(n).map_or(Value::Null, Value::Text);
+                        // Rendering a container escapes it, so it can grow: a growth kernel (cost.md
+                        // §8.1, S5), free when both operands are constant.
+                        if json::is_container(n)
+                            && !(rexpr_is_constant(base) && rexpr_is_constant(arg))
+                        {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                 }
             }),

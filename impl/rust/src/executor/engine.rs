@@ -790,6 +790,17 @@ impl Engine {
         self.check_pending_writes(cost)
     }
 
+    /// The within-statement pending-write check (spec/design/memory.md §7.3), run after each write
+    /// phase: the statement's account brings the pending writes it holds to the transaction's
+    /// current pending bytes, so they must fit beside the statement's live reservations (`54P05`,
+    /// cost first). Inert, and free, without a finite budget.
+    pub(crate) fn sync_pending_writes(&self, meter: &mut Meter) -> Result<()> {
+        if !meter.query_memory_active() {
+            return Ok(());
+        }
+        meter.sync_pending(self.session.pending_write_bytes())
+    }
+
     /// Enforce the query-memory budget on the open transaction's pending writes after a statement
     /// (spec/design/memory.md §7): the stored bytes its working snapshots have staged must fit
     /// `max_query_memory_bytes`, or the statement fails `54P05` — after a reached cost ceiling, which

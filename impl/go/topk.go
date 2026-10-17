@@ -63,10 +63,23 @@ type topKKeeper struct {
 	// streaming-sort lane, memory.md §6.4); nil (inert) for the eager top-k selection, whose rows
 	// are Q1 buffer rows. A rejected reservation returns 54P05 from push for the caller's costFirst.
 	charge *stateCharge
+	// decorations is the retained items' collation decorations (memory.md §6.8), when the heap is
+	// collated: each retained item reserves its sort keys with its row, released when it is evicted
+	// or the heap is finished. nil (inert) unless withDecorations.
+	decorations *stateCharge
 }
 
 func newTopKKeeper(k int64, order []orderSlot, collated bool) *topKKeeper {
 	return &topKKeeper{k: k, collated: collated, selection: topKHeap{order: order, collated: collated}}
+}
+
+// withDecorations charges the retained items' collation decorations to acct (memory.md §6.8). A
+// rejected reservation returns 54P05 from push for the caller's costFirst.
+func (t *topKKeeper) withDecorations(acct queryAccount) *topKKeeper {
+	if t.collated {
+		t.decorations = newStateCharge(acct)
+	}
+	return t
 }
 
 func (t *topKKeeper) push(row storedRow) error {
@@ -90,6 +103,11 @@ func (t *topKKeeper) push(row storedRow) error {
 				return err
 			}
 		}
+		if t.decorations.active() {
+			if err := t.decorations.reserveDirect(memSortKeyBytes(item.keys)); err != nil {
+				return err
+			}
+		}
 		heap.Push(&t.selection, item)
 		return nil
 	}
@@ -100,6 +118,12 @@ func (t *topKKeeper) push(row storedRow) error {
 				return err
 			}
 			t.charge.release(memRowBytes(t.selection.items[0].row))
+		}
+		if t.decorations.active() {
+			if err := t.decorations.reserveDirect(memSortKeyBytes(item.keys)); err != nil {
+				return err
+			}
+			t.decorations.release(memSortKeyBytes(t.selection.items[0].keys))
 		}
 		t.selection.items[0] = item
 		heap.Fix(&t.selection, 0)
@@ -113,6 +137,8 @@ func (t *topKKeeper) finish() []storedRow {
 	slices.SortFunc(items, func(a, b topKItem) int {
 		return compareTopKItems(a, b, t.selection.order, t.collated)
 	})
+	// Undecorated: the decorations go (memory.md §6.8).
+	t.decorations.releaseAll()
 	rows := make([]storedRow, len(items))
 	for i := range items {
 		rows[i] = items[i].row
@@ -123,7 +149,7 @@ func (t *topKKeeper) finish() []storedRow {
 // topKRows consumes the already-materialized pre-sort sequence. Expression ORDER BY values have
 // already been appended by the caller; collated sort keys are built for every input row, in input
 // order, before any output is returned, preserving the full sort's error timing.
-func topKRows(rows []storedRow, order []orderSlot, k int64) ([]storedRow, error) {
+func topKRows(rows []storedRow, order []orderSlot, k int64, acct queryAccount) ([]storedRow, error) {
 	collated := false
 	for _, key := range order {
 		if key.collation != nil {
@@ -131,9 +157,10 @@ func topKRows(rows []storedRow, order []orderSlot, k int64) ([]storedRow, error)
 			break
 		}
 	}
-	t := newTopKKeeper(k, order, collated)
+	t := newTopKKeeper(k, order, collated).withDecorations(acct)
 	for i, row := range rows {
 		if err := t.push(row); err != nil {
+			t.decorations.releaseAll()
 			return nil, err
 		}
 		rows[i] = nil // release discarded rows as the consumed input backing slice is walked

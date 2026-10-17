@@ -1690,8 +1690,8 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 			// The selection discards rows: release the buffer, re-reserve the kept rows.
 			charge.releaseAll()
 			var err error
-			rows, err = topKRows(rows, plan.order, *plan.phys.topK)
-			if err != nil {
+			rows, err = topKRows(rows, plan.order, *plan.phys.topK, meter.query)
+			if err = meter.costFirst(err); err != nil {
 				return emitter{}, err
 			}
 			if charge.active() {
@@ -1701,7 +1701,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 					}
 				}
 			}
-		} else if err := sortRows(rows, plan.order); err != nil {
+		} else if err := meter.costFirst(sortRows(rows, plan.order, meter.query)); err != nil {
 			return emitter{}, err
 		}
 		sorted = &sortedRows{mem: rows, charge: charge}

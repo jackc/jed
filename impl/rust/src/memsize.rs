@@ -104,3 +104,12 @@ pub(crate) fn map_entry_bytes(key: &[Value], value: &[Value]) -> i64 {
 pub(crate) fn hash_row_bytes(row: &[Value]) -> i64 {
     MEMORY_ENTRY + row_bytes(row)
 }
+
+/// A collation decoration's measure (memory.md §6.8): each non-NULL collated key counts as the
+/// `bytea` value of its sort key, `VALUE + length`; a NULL key (an absent slot) counts nothing.
+pub(crate) fn sort_key_bytes(keys: &[Option<Vec<u8>>]) -> i64 {
+    keys.iter()
+        .flatten()
+        .map(|k| MEMORY_VALUE + k.len() as i64)
+        .sum()
+}

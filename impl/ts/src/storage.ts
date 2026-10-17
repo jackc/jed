@@ -31,6 +31,15 @@ import { isInteger } from "./types.ts";
 // The reusable span scratch for laneScanUnits (single-threaded).
 const LANE_SPAN: Span = { start: 0, end: 0 };
 
+// STAGED_SHAPE is the leaf shape of a store's staged-key map: no value columns (memory.md §7.1).
+const STAGED_SHAPE: LeafShape = leafShape([]);
+
+// stagedOf is the stored bytes a staged-key entry records (zero for none).
+function stagedOf(entry: Row | undefined): number {
+  const v = entry?.[0];
+  return v !== undefined && v.kind === "int" ? Number(v.int) : 0;
+}
+
 // Row is a stored row: one value per column, in column order.
 export type Row = Value[];
 
@@ -74,11 +83,16 @@ export class TableStore {
   // table created in-session (fully resident until the file is reopened); attached by the demand-paged
   // file load. Shared (reference) — a snapshot clone shares the one pool per database.
   private paging: SharedPaging | null;
-  // staged is the stored bytes (recordFootprint) of every record version written since this store was
-  // last published — the transaction's pending writes (spec/design/memory.md §7). Cumulative: a
-  // rewrite charges again. It travels with the store, so discarding a working snapshot discards it
-  // too; a commit clears it before publishing.
+  // staged is the stored bytes (recordFootprint) of the record versions written since this store was
+  // last published that it still holds — the transaction's pending writes (spec/design/memory.md §7).
+  // Net: replacing or removing a version written since publication returns that version's bytes. It
+  // travels with the store, so discarding a working snapshot discards it too; a commit clears it
+  // before publishing.
   private staged = 0;
+  // stagedKeys is the stored bytes of each version written since publication that the store still
+  // holds, by key (a one-value [int] row): what a replace or remove of that key returns (memory.md
+  // §7.1). A persistent map, so a snapshot clone stays O(1).
+  private stagedKeys = new PMap();
 
   constructor(
     cap: number,
@@ -107,6 +121,7 @@ export class TableStore {
       this.paging,
     );
     store.staged = this.staged;
+    store.stagedKeys = this.stagedKeys.clone();
     return store;
   }
 
@@ -117,14 +132,42 @@ export class TableStore {
     return new TableStore(this.cap, this.colTypes, new PMap(), this.nextRowid, this.paging);
   }
 
-  // stagedBytes is the stored bytes written since this store was last published (memory.md §7).
+  // stagedBytes is the net stored bytes of the versions written since this store was last published
+  // (memory.md §7).
   stagedBytes(): number {
     return this.staged;
+  }
+
+  // hasStaging reports whether the store changed since publication (it holds staging state to clear).
+  hasStaging(): boolean {
+    return this.staged !== 0 || !this.stagedKeys.isEmpty();
   }
 
   // clearStaged forgets the staged bytes — the store is being published by a commit (memory.md §7).
   clearStaged(): void {
     this.staged = 0;
+    this.stagedKeys = new PMap();
+  }
+
+  // stage records key's new version as staged with stored bytes, returning the bytes of the staged
+  // version it displaces, if any (memory.md §7.1): the pending bytes are net.
+  private stage(key: Uint8Array, stored: number): void {
+    const w = key.length + 8; // any weight: this in-memory map never serializes
+    const old = this.stagedKeys.insert(
+      key,
+      [{ kind: "int", int: BigInt(stored) }],
+      w,
+      this.cap,
+      STAGED_SHAPE,
+      null,
+    );
+    this.staged = this.staged + stored - stagedOf(old);
+  }
+
+  // unstage returns the bytes of key's staged version, if it has one (memory.md §7.1).
+  private unstage(key: Uint8Array): void {
+    const old = this.stagedKeys.remove(key, this.cap, STAGED_SHAPE, null);
+    this.staged -= stagedOf(old);
   }
 
   freezeMutationGeneration(): void {
@@ -157,8 +200,8 @@ export class TableStore {
     const src = this.leafSrc();
     if (this.rows.get(key, src) !== undefined) return false;
     const [weight, stored] = this.weight(key, row);
+    this.stage(key, stored);
     this.rows.insert(key, row, weight, this.cap, this.shape, src);
-    this.staged += stored;
     return true;
   }
 
@@ -184,14 +227,16 @@ export class TableStore {
   // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
   replace(key: Uint8Array, row: Row): void {
     const [weight, stored] = this.weight(key, row);
+    this.stage(key, stored);
     this.rows.insert(key, row, weight, this.cap, this.shape, this.leafSrc());
-    this.staged += stored;
   }
 
   // remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the
   // delete descends into / rebalances against.
   remove(key: Uint8Array): boolean {
-    return this.rows.remove(key, this.cap, this.shape, this.leafSrc()) !== undefined;
+    const removed = this.rows.remove(key, this.cap, this.shape, this.leafSrc()) !== undefined;
+    if (removed) this.unstage(key);
+    return removed;
   }
 
   // get looks up a row by its exact encoded key. May fault the holding leaf through the buffer pool.

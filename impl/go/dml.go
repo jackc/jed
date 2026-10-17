@@ -2132,6 +2132,9 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			}
 		}
 	}
+	if err := db.syncPendingWrites(meter); err != nil {
+		return nil, err
+	}
 	return returned, nil
 }
 
@@ -2298,6 +2301,9 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 				return nil, newUniqueViolation(table.Name, def.Name)
 			}
 		}
+	}
+	if err := db.syncPendingWrites(meter); err != nil {
+		return nil, err
 	}
 	return returned, nil
 }
@@ -2950,6 +2956,9 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				}
 			}
 		}
+	}
+	if err := db.syncPendingWrites(meter); err != nil {
+		return 0, nil, err
 	}
 	fkTemp, hasFKs := db.fkDomain(dbScope, table.Name)
 	if err := db.applyFkUpdateActions(table, fkUpdates, meter, fkTemp, hasFKs); err != nil {
@@ -3647,6 +3656,9 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 				return outcome{}, err
 			}
 		}
+	}
+	if err := db.syncPendingWrites(meter); err != nil {
+		return outcome{}, err
 	}
 	if len(matched) > 0 {
 		db.markEstimatorMutation(del.DB, del.Table)
@@ -4410,6 +4422,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				}
 			}
 		}
+	}
+	if err := db.syncPendingWrites(meter); err != nil {
+		return outcome{}, err
 	}
 	if len(updates) > 0 {
 		db.markEstimatorMutation(upd.DB, upd.Table)
