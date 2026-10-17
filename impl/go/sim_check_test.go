@@ -68,15 +68,20 @@ func simIntegrity(image []byte, want uint64) (live, pages, free uint32, err erro
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	claimed := map[uint32]bool{}
 	for _, name := range names {
-		if err := simCheckTable(snap, name); err != nil {
+		if err := simCheckTable(snap, name, e.paging, claimed); err != nil {
 			return 0, 0, 0, fmt.Errorf("table %s: %w", name, err)
 		}
 	}
 	return mt.livePages, mt.pageCount, uint32(len(e.freePages)), nil
 }
 
-func simCheckTable(snap *snapshot, name string) error {
+// simCheckTable also checks chain exclusivity (large-values.md §15): every overflow page the snapshot
+// reaches is named by exactly one stored value, across all tables (claimed). A rewritten record may
+// keep an unchanged value's chain, but two records of one snapshot never share one.
+func simCheckTable(snap *snapshot, name string, paging *sharedPaging, claimed map[uint32]bool) error {
+	fetch := func(p uint32) ([]byte, error) { return paging.readBlock(p) }
 	table := snap.tables[name]
 	store := snap.stores[name]
 	if store == nil {
@@ -93,6 +98,22 @@ func simCheckTable(snap *snapshot, name string) error {
 		}
 	}
 	for i := range entries {
+		for _, v := range entries[i].Row {
+			first, length, ok := simExternalRef(v)
+			if !ok {
+				continue
+			}
+			pages, err := chainPages(first, length, fetch)
+			if err != nil {
+				return fmt.Errorf("row %d: an overflow chain: %w", i, err)
+			}
+			for _, pg := range pages {
+				if claimed[pg] {
+					return fmt.Errorf("overflow page %d is referenced twice", pg)
+				}
+				claimed[pg] = true
+			}
+		}
 		row, err := store.resolveAll(entries[i].Row)
 		if err != nil {
 			return fmt.Errorf("row %d: %w", i, err)
@@ -180,6 +201,7 @@ func simCheckLive(db *Database) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	claimed := map[uint32]bool{}
 	for _, name := range names {
 		store := snap.stores[name]
 		nodes := map[uint32]bool{}
@@ -195,14 +217,11 @@ func simCheckLive(db *Database) error {
 		}
 		for _, e := range entries {
 			for _, v := range e.Row {
-				if v.Kind != ValUnfetched {
+				first, length, ok := simExternalRef(v)
+				if !ok {
 					continue
 				}
-				u := v.unfetched()
-				if u.Form != tagExternal && u.Form != tagExternalComp {
-					continue
-				}
-				pages, err := chainPages(u.FirstPage, int(u.StoredLen), fetch)
+				pages, err := chainPages(first, length, fetch)
 				if err != nil {
 					return fmt.Errorf("table %s: an overflow chain: %w", name, err)
 				}
@@ -210,6 +229,12 @@ func simCheckLive(db *Database) error {
 					if err := check("table "+name+"'s overflow chain", pg); err != nil {
 						return err
 					}
+					// Chain exclusivity (large-values.md §15): a kept chain moves to the rewritten
+					// record; two committed records never share one.
+					if claimed[pg] {
+						return fmt.Errorf("table %s: overflow page %d is referenced twice", name, pg)
+					}
+					claimed[pg] = true
 				}
 			}
 		}
@@ -224,4 +249,17 @@ func simCheckLive(db *Database) error {
 		}
 	}
 	return nil
+}
+
+// simExternalRef returns the overflow chain a stored value names — its first page and the bytes the
+// chain carries — or ok false for an inline or resident value.
+func simExternalRef(v Value) (first uint32, length int, ok bool) {
+	if v.Kind != ValUnfetched {
+		return 0, 0, false
+	}
+	u := v.unfetched()
+	if u.Form != tagExternal && u.Form != tagExternalComp {
+		return 0, 0, false
+	}
+	return u.FirstPage, int(u.StoredLen), true
 }

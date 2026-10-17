@@ -509,6 +509,44 @@ func (s *tableStore) resolveColumns(row storedRow, mask []bool) (storedRow, erro
 	return out, nil
 }
 
+// resolveValue materializes one deferred value of column col through this store's pager.
+func (s *tableStore) resolveValue(col int, u *Unfetched) (Value, error) {
+	if s.paging == nil {
+		panic("an unfetched value implies a paged store")
+	}
+	return resolveUnfetched(s.colTypes[col], u, func(p uint32) ([]byte, error) { return s.paging.readBlock(p) })
+}
+
+// settleCarried settles the deferred values an UPDATE's new row carries over (large-values.md §15):
+// one stays deferred only where the row's disposition plan, under its storage key, stores it in its
+// stored form — so the commit writes it from its stored bytes and keeps its chain. Any other is
+// resolved (unmetered, part of the rewrite), so a stored row's deferred values always equal its own
+// plan's output — the invariant the scan cost walk and the commit encoder rely on. row is the
+// caller's own copy and is updated in place.
+func (s *tableStore) settleCarried(key []byte, row storedRow) (storedRow, error) {
+	deferred := false
+	for _, v := range row {
+		if v.Kind == ValUnfetched {
+			deferred = true
+			break
+		}
+	}
+	if !deferred {
+		return row, nil
+	}
+	kept := deferredInStoredForm(s.colTypes, key, row, s.cap)
+	for i, v := range row {
+		if v.Kind == ValUnfetched && !kept[i] {
+			r, err := s.resolveValue(i, v.unfetched())
+			if err != nil {
+				return nil, err
+			}
+			row[i] = r
+		}
+	}
+	return row, nil
+}
+
 // resolveInlineColumns returns row with only its inline-deferred values — the Form 0x00 Unfetched
 // form L2 introduces (lazy-record.md §5b) — materialized, leaving the large-value forms
 // (tagExternal/tagInlineComp/tagExternalComp) deferred for the §14 touched-set path. The internal

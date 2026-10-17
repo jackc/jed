@@ -94,13 +94,24 @@ pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), Stri
         seen.insert(pg);
     }
 
+    let mut claimed: HashSet<u32> = HashSet::new();
     for name in snap.table_names() {
-        check_table(snap, &name).map_err(|e| format!("table {name}: {e}"))?;
+        check_table(snap, &name, &paging, &mut claimed)
+            .map_err(|e| format!("table {name}: {e}"))?;
     }
     Ok((mt.live_pages, mt.page_count, engine.free_pages.len() as u32))
 }
 
-fn check_table(snap: &Snapshot, name: &str) -> Result<(), String> {
+/// Also checks chain exclusivity (large-values.md §15): every overflow page the snapshot reaches is
+/// named by exactly one stored value, across all tables (`claimed`). A rewritten record may keep an
+/// unchanged value's chain, but two records of one snapshot never share one.
+fn check_table(
+    snap: &Snapshot,
+    name: &str,
+    paging: &crate::paging::SharedPaging,
+    claimed: &mut HashSet<u32>,
+) -> Result<(), String> {
+    let fetch = |p: u32| paging.pager().read_block(p);
     let table = snap.table(name).ok_or("no table definition")?;
     let store = snap.sim_store(name).ok_or("no row store")?;
     let mut entries = store.iter_entries().map_err(|e| e.to_string())?;
@@ -116,6 +127,17 @@ fn check_table(snap: &Snapshot, name: &str) -> Result<(), String> {
         .collect();
     let col_types = store.col_types();
     for i in 0..entries.len() {
+        for v in &entries[i].1 {
+            if let Some((first, len)) = external_ref(v) {
+                let pages = chain_pages(first, len as usize, &fetch)
+                    .map_err(|e| format!("row {i}: an overflow chain: {e}"))?;
+                for pg in pages {
+                    if !claimed.insert(pg) {
+                        return Err(format!("overflow page {pg} is referenced twice"));
+                    }
+                }
+            }
+        }
         store
             .resolve_all(&mut entries[i].1)
             .map_err(|e| format!("row {i}: {e}"))?;
@@ -209,6 +231,7 @@ pub(crate) fn check_live(db: &Database) -> Result<(), String> {
         v.sort();
         v
     };
+    let mut claimed: HashSet<u32> = HashSet::new();
     for name in snap.sim_store_names() {
         let store = snap.sim_store(&name).expect("a listed store exists");
         let mut nodes = HashSet::new();
@@ -223,21 +246,20 @@ pub(crate) fn check_live(db: &Database) -> Result<(), String> {
             .map_err(|e| format!("table {name}: {e}"))?;
         for (_, row) in &entries {
             for v in row {
-                let (first, len) = match v {
-                    Value::Unfetched(Unfetched::External {
-                        first_page, len, ..
-                    }) => (*first_page, *len),
-                    Value::Unfetched(Unfetched::ExternalComp {
-                        first_page,
-                        stored_len,
-                        ..
-                    }) => (*first_page, *stored_len),
-                    _ => continue,
+                let Some((first, len)) = external_ref(v) else {
+                    continue;
                 };
                 let pages = chain_pages(first, len as usize, &fetch)
                     .map_err(|e| format!("table {name}: an overflow chain: {e}"))?;
                 for pg in pages {
                     check(&format!("table {name}'s overflow chain"), pg)?;
+                    // Chain exclusivity (large-values.md §15): a kept chain moves to the
+                    // rewritten record; two committed records never share one.
+                    if !claimed.insert(pg) {
+                        return Err(format!(
+                            "table {name}: overflow page {pg} is referenced twice"
+                        ));
+                    }
                 }
             }
         }
@@ -253,4 +275,20 @@ pub(crate) fn check_live(db: &Database) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The overflow chain a stored value names — its first page and the bytes the chain carries — or
+/// `None` for an inline or resident value.
+fn external_ref(v: &Value) -> Option<(u32, u32)> {
+    match v {
+        Value::Unfetched(Unfetched::External {
+            first_page, len, ..
+        }) => Some((*first_page, *len)),
+        Value::Unfetched(Unfetched::ExternalComp {
+            first_page,
+            stored_len,
+            ..
+        }) => Some((*first_page, *stored_len)),
+        _ => None,
+    }
 }

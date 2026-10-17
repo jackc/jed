@@ -1555,6 +1555,14 @@ the cap (the design rationale and decisions are in
   no values, so no overflow page ever hangs off an interior separator. This fixes the byte layout
   the goldens pin (`overflow_table.jed`).
 
+- **Kept chains (incremental commit).** A record rewritten by an incremental commit keeps each
+  unchanged external value's chain: it stores the same pointer and allocates nothing for it, so in
+  a dirty leaf only the values written fresh allocate chains, still in (record, column) order
+  ([../design/large-values.md](../design/large-values.md) §15). A chain stays referenced by exactly
+  one record of a snapshot; two snapshots may share it, which reclamation already allows (it unions
+  over live records). A from-scratch image copies a kept chain's stored bytes into fresh pages.
+  Nothing a reader decodes changes.
+
 A record that still exceeds `RECORD_MAX` after compressing and externalizing **every** spillable
 value (pathological: a huge key, or very many columns at a tiny page) remains a write-side
 `feature_not_supported` (`0A000`).

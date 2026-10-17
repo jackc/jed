@@ -27,6 +27,8 @@ use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{ColumnStatistics, Engine, Snapshot, StatisticsValue};
+use std::borrow::Cow;
+
 use crate::interval::Interval;
 use crate::json::{self, JsonNode};
 use crate::pager::Pager;
@@ -851,7 +853,7 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
             out
         }
         // An unfetched reference is resolved before any encode/plan (the scan layer for reads,
-        // the mutation path for stores, `resolve_for_encode` at commit — large-values.md §14).
+        // the commit encoder writes a deferred value from its stored bytes — large-values.md §15).
         Value::Unfetched(_) => panic!("BUG: encoding an unfetched large value"),
         // A composite value is encoded by `encode_value`'s composite arm, never here.
         Value::Composite(_) => panic!("BUG: a composite value reached the scalar codec"),
@@ -1001,9 +1003,37 @@ pub(crate) fn leaf_overhead(n: usize, shape: LeafShape) -> usize {
 /// variants carry the LZ4 block the plan produced, so the serializer never re-compresses.
 enum Disp {
     Inline,
-    InlineComp(Vec<u8>),
+    InlineComp(CompBlock),
     External,
-    ExternalComp(Vec<u8>),
+    ExternalComp(CompBlock),
+}
+
+/// The LZ4 block a compressed disposition stores (large-values.md §13). A deferred value whose
+/// stored form is already compressed supplies its block without a fresh compression attempt
+/// (large-values.md §15): an inline-compressed reference carries it, and an external-compressed
+/// one names it by length — its bytes stay on the chain the rewritten record shares.
+enum CompBlock {
+    Owned(Vec<u8>),
+    OnChain(usize),
+}
+
+impl CompBlock {
+    fn len(&self) -> usize {
+        match self {
+            CompBlock::Owned(c) => c.len(),
+            CompBlock::OnChain(n) => *n,
+        }
+    }
+}
+
+/// The inline-plain value-codec header ahead of a content payload `P(v)` (format.md "Value
+/// codec"): the present tag plus, for the length-prefixed `text` / `bytea` / `json` bodies, the
+/// `u16` length; just the tag for every other spillable body (whose payload is the body itself).
+fn inline_header_len(ty: &ColType) -> usize {
+    match ty {
+        ColType::Scalar(s) if s.is_text() || s.is_bytea() || s.is_json() => 3,
+        _ => 1,
+    }
 }
 
 /// A record's resolved disposition plan: per-column form, the on-disk record size (the B-tree
@@ -1015,6 +1045,37 @@ struct RecordPlan {
     /// The bytes externalized values occupy on their overflow chains — the raw payload of an
     /// external-plain value, the compressed block of an external-compressed one.
     external: usize,
+    /// Each spillable, non-NULL value's content-payload length `|P(v)|` (`0` otherwise) — the raw
+    /// length a compressed form records.
+    payload_len: Vec<usize>,
+}
+
+/// The planning facts of one variable-width value: its inline-plain encoded size and its
+/// content-payload length. A deferred value supplies both from its stored fields, without reading
+/// its chain or decompressing its block (large-values.md §15).
+fn value_facts(ty: &ColType, v: &Value) -> (usize, usize) {
+    match v {
+        Value::Null => (0, 0),
+        Value::Unfetched(u) => {
+            let payload = match u {
+                Unfetched::Inline { len, .. } => (1 + *len as usize) - inline_header_len(ty),
+                Unfetched::External { len, .. } => *len as usize,
+                Unfetched::InlineComp { raw_len, .. } | Unfetched::ExternalComp { raw_len, .. } => {
+                    *raw_len as usize
+                }
+            };
+            (payload + inline_header_len(ty), payload)
+        }
+        v => {
+            let inline = encode_value(ty, v).len();
+            let payload = if is_spillable(ty) {
+                value_payload(ty, v).len()
+            } else {
+                0
+            };
+            (inline, payload)
+        }
+    }
 }
 
 /// Decide each column's on-disk disposition for a record (spec/design/large-values.md §3/§12/§13;
@@ -1027,19 +1088,35 @@ struct RecordPlan {
 /// chain of the compressed block) until the record fits. The size is the **weight** the
 /// page-backed B-tree splits on, shared by the serializer and `record_size`: in-memory node
 /// boundaries must match the serialized pages.
+///
+/// The plan is a function of the row's logical values alone. A deferred value (large-values.md
+/// §15) contributes its sizes from its stored fields, and the outcome of a compression attempt on
+/// it is already known from its stored form: an external-plain value was attempted and rejected
+/// (pass 2 ran, so pass 1 visited every candidate first), and an inline- or external-compressed
+/// one was adopted with the block it stores. Only an inline-deferred value, whose stored form
+/// records no outcome, is compressed when an attempt reaches it — from the bytes it holds.
 fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usize) -> RecordPlan {
     // Each column's inline-plain contribution to `record_size` (the v24 basis — format.md
     // "Record"): a fixed-width column always its width (a NULL occupies a zero-filled slot); a
     // variable-width column 0 when NULL (a zero-length span) else its tagged inline encoding.
-    let inline: Vec<usize> = col_types
+    let facts: Vec<(usize, usize)> = col_types
         .iter()
         .zip(row.iter())
         .map(|(ty, v)| match fixed_value_width(ty) {
-            Some(w) => w,
-            None => match v {
-                Value::Null => 0,
-                _ => encode_value(ty, v).len(),
-            },
+            Some(w) => (w, 0),
+            None => value_facts(ty, v),
+        })
+        .collect();
+    let inline: Vec<usize> = facts.iter().map(|f| f.0).collect();
+    // Each spillable, non-NULL value's raw payload length (0 otherwise) — the compress threshold's
+    // input, and an external-plain value's chain payload in pass 2.
+    let payload_len: Vec<usize> = (0..row.len())
+        .map(|i| {
+            if is_spillable(&col_types[i]) && !matches!(row[i], Value::Null) {
+                facts[i].1
+            } else {
+                0
+            }
         })
         .collect();
     let mut disp: Vec<Disp> = (0..row.len()).map(|_| Disp::Inline).collect();
@@ -1053,22 +1130,14 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
             size,
             compress_units,
             external: 0,
+            payload_len,
         };
     }
     // Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ S_COMPRESS; largest
     // inline-plain encoded size first, ties by ascending index. Every attempt is metered
-    // (ceil(raw/cap) value_compress slabs) whether or not store-smaller adopts it.
-    // Each spillable, non-NULL value's raw payload length (0 otherwise) — the compress threshold's
-    // input, and an external-plain value's chain payload in pass 2.
-    let payload_len: Vec<usize> = (0..row.len())
-        .map(|i| {
-            if is_spillable(&col_types[i]) && !matches!(row[i], Value::Null) {
-                value_payload(&col_types[i], &row[i]).len()
-            } else {
-                0
-            }
-        })
-        .collect();
+    // (ceil(raw/cap) value_compress slabs) whether or not store-smaller adopts it — including an
+    // attempt whose outcome a deferred value's stored form already records (cost.md §3: the unit
+    // counts the logical attempt).
     let mut cand: Vec<usize> = (0..row.len())
         .filter(|&i| payload_len[i] >= S_COMPRESS)
         .collect();
@@ -1077,10 +1146,24 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
         if size <= max {
             break;
         }
-        let payload = value_payload(&col_types[i], &row[i]);
-        compress_units += payload.len().div_ceil(cap);
-        let comp = crate::lz4::compress(&payload);
-        if INLINE_COMP_OVERHEAD + comp.len() < inline[i] {
+        compress_units += payload_len[i].div_ceil(cap);
+        let comp = match &row[i] {
+            // Stored external-plain: the attempt was made and rejected.
+            Value::Unfetched(Unfetched::External { .. }) => None,
+            Value::Unfetched(Unfetched::InlineComp { comp, .. }) => {
+                Some(CompBlock::Owned(comp.clone()))
+            }
+            Value::Unfetched(Unfetched::ExternalComp { stored_len, .. }) => {
+                Some(CompBlock::OnChain(*stored_len as usize))
+            }
+            v => Some(CompBlock::Owned(crate::lz4::compress(&planning_payload(
+                &col_types[i],
+                v,
+            )))),
+        };
+        if let Some(comp) = comp
+            && INLINE_COMP_OVERHEAD + comp.len() < inline[i]
+        {
             size = size - cur[i] + INLINE_COMP_OVERHEAD + comp.len();
             cur[i] = INLINE_COMP_OVERHEAD + comp.len();
             disp[i] = Disp::InlineComp(comp);
@@ -1092,6 +1175,7 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
             size,
             compress_units,
             external: 0,
+            payload_len,
         };
     }
     // Pass 2 — externalize: anything whose current encoded size beats its pointer, largest
@@ -1131,6 +1215,54 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
         size,
         compress_units,
         external,
+        payload_len,
+    }
+}
+
+/// For each column, whether the value is deferred **and** the record's plan stores it in exactly
+/// its stored form (large-values.md §15) — the deferred values a rewritten record may keep, written
+/// from their stored bytes with their chains kept.
+pub(crate) fn deferred_in_stored_form(
+    col_types: &[ColType],
+    key: &[u8],
+    row: &[Value],
+    cap: usize,
+) -> Vec<bool> {
+    let plan = plan_dispositions(col_types, key, row, cap);
+    row.iter()
+        .zip(plan.disp.iter())
+        .map(|(v, d)| {
+            matches!(
+                (v, d),
+                (Value::Unfetched(Unfetched::Inline { .. }), Disp::Inline)
+                    | (
+                        Value::Unfetched(Unfetched::InlineComp { .. }),
+                        Disp::InlineComp(_)
+                    )
+                    | (Value::Unfetched(Unfetched::External { .. }), Disp::External)
+                    | (
+                        Value::Unfetched(Unfetched::ExternalComp { .. }),
+                        Disp::ExternalComp(_)
+                    )
+            )
+        })
+        .collect()
+}
+
+/// The content payload `P(v)` of a value the planner compresses: a resident value's, or an
+/// inline-deferred value's, read straight from the inline body it holds — the body after a
+/// `text`/`bytea`/`json` value's `u16` length, every other spillable body whole (format.md "Value
+/// codec"). No decode, so a corrupt span cannot fail planning; resolving it later reports it.
+fn planning_payload(ty: &ColType, v: &Value) -> Vec<u8> {
+    match v {
+        Value::Unfetched(Unfetched::Inline {
+            block, off, len, ..
+        }) => {
+            let body = &block[*off as usize..*off as usize + *len as usize];
+            body[(inline_header_len(ty) - 1).min(body.len())..].to_vec()
+        }
+        Value::Unfetched(_) => unreachable!("a stored large form's compression outcome is known"),
+        v => value_payload(ty, v),
     }
 }
 
@@ -1178,11 +1310,16 @@ pub(crate) fn record_scan_units(
         decompress: 0,
     };
     // A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
-    // §14): read the units straight off them — no disposition re-plan, which would need the
-    // unfetched bytes. The numbers equal the resident plan below by construction (the
-    // references ARE that plan's stored output), so a paged and an in-memory database charge
-    // identically (cost.md §3, logical cost).
-    if row.iter().any(|v| matches!(v, Value::Unfetched(_))) {
+    // §14): read the units straight off them — no disposition re-plan. The numbers equal the
+    // plan below by construction (the references ARE that plan's stored output, and a rewritten
+    // row keeps a deferred value only where its plan stores it in its stored form — §15), so a
+    // paged and an in-memory database charge identically (cost.md §3, logical cost). A row that
+    // also holds a resident variable-width value (an UPDATE's new row) takes the plan.
+    let deferred = row.iter().any(|v| matches!(v, Value::Unfetched(_)));
+    let resident_var = col_types.iter().zip(row.iter()).any(|(ty, v)| {
+        fixed_value_width(ty).is_none() && !matches!(v, Value::Null | Value::Unfetched(_))
+    });
+    if deferred && !resident_var {
         for (i, v) in row.iter().enumerate() {
             if !mask[i] {
                 continue;
@@ -1220,14 +1357,14 @@ pub(crate) fn record_scan_units(
         match d {
             Disp::Inline => {}
             Disp::External => {
-                units.pages += value_payload(&col_types[i], &row[i]).len().div_ceil(cap);
+                units.pages += plan.payload_len[i].div_ceil(cap);
             }
             Disp::InlineComp(_) => {
-                units.decompress += value_payload(&col_types[i], &row[i]).len().div_ceil(cap);
+                units.decompress += plan.payload_len[i].div_ceil(cap);
             }
             Disp::ExternalComp(c) => {
                 units.pages += c.len().div_ceil(cap);
-                units.decompress += value_payload(&col_types[i], &row[i]).len().div_ceil(cap);
+                units.decompress += plan.payload_len[i].div_ceil(cap);
             }
         }
     }
@@ -1634,19 +1771,21 @@ fn serialize_node(
     let (page_type, payload) = if node.children.is_empty() {
         // A leaf may be **Packed** here: a demand-paged load keeps leaves as page blocks and
         // `to_image` re-serializes them. Materialize through the accessor seam (`decoded_rows`
-        // reconstructs a Packed leaf, clones a Decoded one), then resolve any lazily-deferred
-        // large values through the store's pager (large-values.md §14) so encode sees resident
-        // bytes. Whole-image serialize is not a hot path (create's empty image / golden
-        // generator / `to_image` canonical), so the clones are acceptable (packed-leaf.md §7).
-        let mut leaf_rows = node.decoded_rows()?;
-        for row in &mut leaf_rows {
-            store.resolve_all(row)?;
-        }
+        // reconstructs a Packed leaf, clones a Decoded one). A deferred large value is written
+        // from its stored bytes, its chain copied into the renumbered image (large-values.md
+        // §15). Whole-image serialize is not a hot path (create's empty image / golden generator /
+        // `to_image` canonical / compaction), so the clones are acceptable (packed-leaf.md §7).
+        let leaf_rows = node.decoded_rows()?;
         let rows: Vec<&[Value]> = leaf_rows.iter().map(Vec::as_slice).collect();
         let keys: Vec<&[u8]> = (0..node.len()).map(|i| node.key_at(i)).collect();
+        let mut src = ChainSource {
+            paging: store.paging(),
+            share: false,
+            shared: Vec::new(),
+        };
         (
             PAGE_LEAF,
-            encode_leaf_pax(col_types, &keys, &rows, cap, &mut take, &mut ovf),
+            encode_leaf_pax(col_types, &keys, &rows, cap, &mut take, &mut ovf, &mut src)?,
         )
     } else {
         (PAGE_INTERIOR, encode_interior(&node.keys, &child_pages))
@@ -1670,30 +1809,6 @@ fn serialize_node(
     Ok(index)
 }
 
-/// Materialize any unfetched values in `row` for re-encoding at commit
-/// (spec/design/large-values.md §14): a dirty leaf may carry rows the lazy load left as
-/// references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
-/// like all commit work. Returns `None` when nothing is unfetched (the common case — no clone).
-fn resolve_for_encode(
-    row: &Row,
-    col_types: &[ColType],
-    paging: Option<&SharedPaging>,
-) -> Result<Option<Row>> {
-    if !row.iter().any(|v| matches!(v, Value::Unfetched(_))) {
-        return Ok(None);
-    }
-    let paging = paging.ok_or_else(|| corrupt("unfetched large value with no pager at commit"))?;
-    let fetch = |p: u32| paging.pager().read_block(p);
-    let mut out = row.clone();
-    for (i, v) in out.iter_mut().enumerate() {
-        if let Value::Unfetched(u) = v {
-            let resolved = resolve_unfetched(&col_types[i], u, &fetch)?;
-            *v = resolved;
-        }
-    }
-    Ok(Some(out))
-}
-
 /// The pages an incremental commit must write durably, plus the new catalog root and high-water for
 /// the meta slot (spec/fileformat/format.md, P6.1 part B). Each `pages` entry is a full `page_size`
 /// image keyed by its page index; `file.rs` pwrites them, then publishes `root_page`/`page_count` in
@@ -1713,6 +1828,10 @@ pub(crate) struct IncrementalWrite {
     /// Their subtrees are shared with the previous snapshot, so the live-page delta skips them
     /// ([`LiveCount::after`], spec/design/memory.md §8.7).
     pub(crate) kept: HashSet<u32>,
+    /// The first page of every overflow chain a rewritten record kept (large-values.md §15): the
+    /// chain is shared with the previous snapshot, so the live-page delta does not count it as
+    /// orphaned with the leaf that held it before.
+    pub(crate) shared_chains: HashSet<u32>,
     /// How many of `pages` are catalog pages, and how many are GiST R-tree pages. Both are
     /// rewritten whole every commit.
     pub(crate) catalog_pages: u32,
@@ -1744,7 +1863,13 @@ impl LiveCount {
         paging: &SharedPaging,
         page_size: u32,
     ) -> Result<LiveCount> {
-        let orphaned = orphaned_tree_pages(prev, &write.kept, paging, page_payload(page_size))?;
+        let orphaned = orphaned_tree_pages(
+            prev,
+            &write.kept,
+            &write.shared_chains,
+            paging,
+            page_payload(page_size),
+        )?;
         let live = i64::from(self.live) + write.pages.len() as i64
             - i64::from(self.catalog)
             - i64::from(self.gist)
@@ -1761,13 +1886,15 @@ impl LiveCount {
 /// The B-tree pages of `prev` (table data trees and B-tree/GIN index trees) that the new snapshot no
 /// longer references, plus the overflow pages their leaves own (spec/design/memory.md §8.7). A
 /// subtree whose root page is in `kept` is shared and skipped whole: a persisted node is immutable,
-/// so everything under it is shared too. Overflow chains are never shared between leaf versions — a
-/// dirty leaf re-encodes every value into fresh chains — so an orphaned leaf orphans every chain it
-/// points at, and its chain page count follows from each external pointer's stored length. The walk
-/// reads only orphaned leaves of tables with spillable columns.
+/// so everything under it is shared too. An orphaned leaf orphans every chain it points at except the
+/// ones a rewritten record kept (`shared`, large-values.md §15) — a chain is referenced by exactly one
+/// record of a snapshot, so a kept chain's only old referrer is in an orphaned leaf — and each chain's
+/// page count follows from its external pointer's stored length. The walk reads only orphaned leaves
+/// of tables with spillable columns.
 pub(crate) fn orphaned_tree_pages(
     prev: &Snapshot,
     kept: &HashSet<u32>,
+    shared: &HashSet<u32>,
     paging: &SharedPaging,
     cap: usize,
 ) -> Result<u64> {
@@ -1776,14 +1903,14 @@ pub(crate) fn orphaned_tree_pages(
         if let Some(root) = st.tree_root() {
             let col_types =
                 any_spillable(st.col_types()).then(|| Arc::new(st.col_types().to_vec()));
-            count += orphaned_node_pages(root, kept, paging, col_types.as_ref(), cap)?;
+            count += orphaned_node_pages(root, kept, shared, paging, col_types.as_ref(), cap)?;
         }
     }
     // A GiST leaf-key store is never serialized (its nodes keep page 0); its R-tree pages are
     // counted wholesale through `LiveCount::gist`.
     for st in prev.index_stores_iter() {
         if let Some(root) = st.tree_root() {
-            count += orphaned_node_pages(root, kept, paging, None, cap)?;
+            count += orphaned_node_pages(root, kept, shared, paging, None, cap)?;
         }
     }
     Ok(count)
@@ -1792,6 +1919,7 @@ pub(crate) fn orphaned_tree_pages(
 fn orphaned_node_pages(
     node: &Node,
     kept: &HashSet<u32>,
+    shared: &HashSet<u32>,
     paging: &SharedPaging,
     col_types: Option<&Arc<Vec<ColType>>>,
     cap: usize,
@@ -1801,14 +1929,14 @@ fn orphaned_node_pages(
         return Ok(0);
     }
     if node.children.is_empty() {
-        return orphaned_leaf_pages(page, paging, col_types, cap);
+        return orphaned_leaf_pages(page, shared, paging, col_types, cap);
     }
     let mut count = 1;
     for child in &node.children {
         count += match child {
-            Child::Resident(n) => orphaned_node_pages(n, kept, paging, col_types, cap)?,
+            Child::Resident(n) => orphaned_node_pages(n, kept, shared, paging, col_types, cap)?,
             Child::OnDisk(p) if kept.contains(p) => 0,
-            Child::OnDisk(p) => orphaned_leaf_pages(*p, paging, col_types, cap)?,
+            Child::OnDisk(p) => orphaned_leaf_pages(*p, shared, paging, col_types, cap)?,
         };
     }
     Ok(count)
@@ -1817,6 +1945,7 @@ fn orphaned_node_pages(
 /// One orphaned leaf page plus the overflow pages its external values own.
 fn orphaned_leaf_pages(
     page_idx: u32,
+    kept_chains: &HashSet<u32>,
     paging: &SharedPaging,
     col_types: Option<&Arc<Vec<ColType>>>,
     cap: usize,
@@ -1847,8 +1976,14 @@ fn orphaned_leaf_pages(
             // Only the pointer's stored length matters; the resolution handle is deliberately dead.
             let v = read_value_lazy(&tyref, &shared, payload, &mut pos, &std::sync::Weak::new())?;
             let stored = match v {
-                Value::Unfetched(Unfetched::External { len, .. }) => len as usize,
-                Value::Unfetched(Unfetched::ExternalComp { stored_len, .. }) => stored_len as usize,
+                Value::Unfetched(Unfetched::External {
+                    first_page, len, ..
+                }) if !kept_chains.contains(&first_page) => len as usize,
+                Value::Unfetched(Unfetched::ExternalComp {
+                    first_page,
+                    stored_len,
+                    ..
+                }) if !kept_chains.contains(&first_page) => stored_len as usize,
                 _ => continue,
             };
             count += stored.div_ceil(cap) as u64;
@@ -1959,6 +2094,7 @@ impl Snapshot {
 
         let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut kept: HashSet<u32> = HashSet::new();
+        let mut shared: HashSet<u32> = HashSet::new();
         let mut gist_pages = 0u32;
         let mut root_data_page = vec![0u32; tables.len()];
         let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
@@ -1972,6 +2108,7 @@ impl Snapshot {
                     &mut alloc,
                     &mut pages,
                     &mut kept,
+                    &mut shared,
                     paging,
                 )?;
             }
@@ -2011,6 +2148,7 @@ impl Snapshot {
                             &mut alloc,
                             &mut pages,
                             &mut kept,
+                            &mut shared,
                             paging,
                         )?,
                         None => 0,
@@ -2097,6 +2235,7 @@ impl Snapshot {
             page_count: alloc.next,
             free_remaining: alloc.free[alloc.cursor..].to_vec(),
             kept,
+            shared_chains: shared,
             catalog_pages: cat_pages.len() as u32,
             gist_pages,
         })
@@ -2239,6 +2378,7 @@ fn serialize_dirty(
     alloc: &mut PageAlloc,
     pages: &mut Vec<(u32, Vec<u8>)>,
     kept: &mut HashSet<u32>,
+    shared: &mut HashSet<u32>,
     paging: Option<&SharedPaging>,
 ) -> Result<u32> {
     let existing = node.page.load(Ordering::Acquire);
@@ -2252,7 +2392,7 @@ fn serialize_dirty(
         // leaf already durable at its page — keep it, write nothing (the incremental-commit win).
         let cp = match child {
             Child::Resident(n) => {
-                serialize_dirty(n, col_types, cap, ps, alloc, pages, kept, paging)?
+                serialize_dirty(n, col_types, cap, ps, alloc, pages, kept, shared, paging)?
             }
             Child::OnDisk(p) => {
                 kept.insert(*p);
@@ -2264,27 +2404,27 @@ fn serialize_dirty(
     let n = node.keys.len() as u32;
     // Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
     // allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
-    // rows the lazy load left unfetched (a sibling row's mutation dirtied them): resolve those
-    // through the pager first — unmetered commit work, large-values.md §14 — so the re-encode
-    // re-plans the resident row exactly as an eager writer would. An INTERIOR node is the
-    // record-free keys+children skeleton (v24) — no values, no chains. Scoped so the `&mut alloc`
-    // borrow ends before this node's own page is allocated.
+    // rows the lazy load left deferred (a sibling row's mutation dirtied them), and an UPDATE's new
+    // row carries its unassigned large values deferred: each is written from its stored bytes, and
+    // a deferred external value keeps its existing chain (large-values.md §15) — no chain read, no
+    // decompression, no chain write. An INTERIOR node is the record-free keys+children skeleton
+    // (v24) — no values, no chains. Scoped so the `&mut alloc` borrow ends before this node's own
+    // page is allocated.
     let mut ovf = Vec::new();
     let (page_type, payload) = {
         let mut take = || alloc.take();
         if node.children.is_empty() {
-            // Resolve rows, then assemble column-major. `resolved[i]` owns a materialized row (only
-            // when it was unfetched); otherwise the reference borrows `node.vals[i]` — no clone.
-            let resolved: Vec<Option<Vec<Value>>> = (0..node.keys.len())
-                .map(|i| resolve_for_encode(&node.vals[i], col_types, paging))
-                .collect::<Result<_>>()?;
-            let rows: Vec<&[Value]> = (0..node.keys.len())
-                .map(|i| resolved[i].as_deref().unwrap_or(&node.vals[i]))
-                .collect();
-            (
-                PAGE_LEAF,
-                encode_leaf_pax(col_types, &node.keys, &rows, cap, &mut take, &mut ovf),
-            )
+            let rows: Vec<&[Value]> = node.vals.iter().map(Vec::as_slice).collect();
+            let mut src = ChainSource {
+                paging,
+                share: true,
+                shared: Vec::new(),
+            };
+            let payload = encode_leaf_pax(
+                col_types, &node.keys, &rows, cap, &mut take, &mut ovf, &mut src,
+            )?;
+            shared.extend(src.shared);
+            (PAGE_LEAF, payload)
         } else {
             (PAGE_INTERIOR, encode_interior(&node.keys, &child_pages))
         }
@@ -3237,46 +3377,171 @@ fn encode_interior(seps: &[Vec<u8>], child_pages: &[u32]) -> Vec<u8> {
     out
 }
 
-/// Encode one value's on-disk body given its resolved disposition — the value codec, unchanged
+/// Where the leaf encoder finds a deferred value's stored bytes, and what it does with a deferred
+/// external value's existing overflow chain (spec/design/large-values.md §15). An **incremental**
+/// commit (`share`) keeps the chain: the rewritten record stores the same pointer and no chain page
+/// is written, because a chain page is immutable and the chain stays reachable from exactly one
+/// record of the new snapshot. A **from-scratch** image renumbers every page, so it copies the
+/// chain's stored bytes — the raw payload or the compressed block, never decompressed — into a fresh
+/// chain. `paging` is the database the pointers name.
+pub(crate) struct ChainSource<'a> {
+    pub(crate) paging: Option<&'a SharedPaging>,
+    pub(crate) share: bool,
+    /// The first page of every chain the encoder kept (`share`), so the live-page count does not
+    /// count the chain as orphaned with the old leaf (memory.md §8.7).
+    pub(crate) shared: Vec<u32>,
+}
+
+impl ChainSource<'_> {
+    /// A source that never shares and has no database to read (resident rows only — tests).
+    pub(crate) fn resident() -> ChainSource<'static> {
+        ChainSource {
+            paging: None,
+            share: false,
+            shared: Vec::new(),
+        }
+    }
+
+    fn read_chain(&self, first: u32, len: usize) -> Result<Vec<u8>> {
+        let paging = self
+            .paging
+            .ok_or_else(|| corrupt("deferred large value with no pager at encode"))?;
+        let fetch = |p: u32| paging.pager().read_block(p);
+        read_overflow_chain(first, len, &fetch, &mut Vec::new())
+    }
+
+    /// `v` materialized: a deferred value resolved through the database's pager (unmetered, like
+    /// all commit work), a resident value borrowed.
+    fn resident_value<'v>(&self, ty: &ColType, v: &'v Value) -> Result<Cow<'v, Value>> {
+        match v {
+            Value::Unfetched(u) => {
+                let paging = self.paging;
+                let fetch = |p: u32| match paging {
+                    Some(paging) => paging.pager().read_block(p),
+                    None => Err(corrupt("deferred large value with no pager at encode")),
+                };
+                Ok(Cow::Owned(resolve_unfetched(ty, u, &fetch)?))
+            }
+            v => Ok(Cow::Borrowed(v)),
+        }
+    }
+
+    /// The LZ4 block a compressed disposition stores: the plan's own block, or the one already on
+    /// the deferred value's chain.
+    fn comp_bytes(&self, c: &CompBlock, v: &Value) -> Result<Vec<u8>> {
+        match (c, v) {
+            (CompBlock::Owned(b), _) => Ok(b.clone()),
+            (
+                CompBlock::OnChain(_),
+                Value::Unfetched(Unfetched::ExternalComp {
+                    first_page,
+                    stored_len,
+                    ..
+                }),
+            ) => self.read_chain(*first_page, *stored_len as usize),
+            (CompBlock::OnChain(_), _) => Err(corrupt("a chained LZ4 block with no chain")),
+        }
+    }
+
+    /// The first page of the chain carrying a deferred value's `stored` bytes in the image being
+    /// written: the existing chain itself (shared), or a fresh copy.
+    fn keep_chain(
+        &mut self,
+        first: u32,
+        stored: usize,
+        cap: usize,
+        take: &mut dyn FnMut() -> u32,
+        ovf: &mut Vec<OverflowPageOut>,
+    ) -> Result<u32> {
+        if self.share {
+            self.shared.push(first);
+            return Ok(first);
+        }
+        let bytes = self.read_chain(first, stored)?;
+        Ok(write_overflow_chain(&bytes, cap, take, ovf))
+    }
+}
+
+/// Encode one value's on-disk body given its planned disposition — the value codec, unchanged
 /// across the row-major and PAX leaf layouts (large-values.md §12/§13). An inline-plain value is
 /// `encode_value`; the large-value forms carry a pointer / inline block and allocate overflow chains
-/// via `take`.
+/// via `take`. A deferred value planned in its own stored form is written from its stored bytes —
+/// an inline body or block verbatim, an external pointer to its kept chain (§15) — so a rewritten
+/// record never re-reads, decompresses, or recompresses an unchanged value.
+#[allow(clippy::too_many_arguments)]
 fn encode_disposed_value(
     ty: &ColType,
     val: &Value,
     disp: &Disp,
+    raw_len: usize,
     cap: usize,
     take: &mut dyn FnMut() -> u32,
     ovf: &mut Vec<OverflowPageOut>,
-) -> Vec<u8> {
+    src: &mut ChainSource<'_>,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    match disp {
-        Disp::Inline => out.extend_from_slice(&encode_value(ty, val)),
-        Disp::External => {
-            let payload = value_payload(ty, val);
+    match (disp, val) {
+        (
+            Disp::Inline,
+            Value::Unfetched(Unfetched::Inline {
+                block, off, len, ..
+            }),
+        ) => {
+            out.push(0x00);
+            out.extend_from_slice(&block[*off as usize..*off as usize + *len as usize]);
+        }
+        (Disp::Inline, v) => out.extend_from_slice(&encode_value(ty, &*src.resident_value(ty, v)?)),
+        (
+            Disp::External,
+            Value::Unfetched(Unfetched::External {
+                first_page, len, ..
+            }),
+        ) => {
+            let first = src.keep_chain(*first_page, *len as usize, cap, take, ovf)?;
+            out.push(TAG_EXTERNAL);
+            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&len.to_be_bytes());
+        }
+        (Disp::External, v) => {
+            let payload = value_payload(ty, &*src.resident_value(ty, v)?);
             let first = write_overflow_chain(&payload, cap, take, ovf);
             out.push(TAG_EXTERNAL);
             out.extend_from_slice(&first.to_be_bytes());
             out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         }
-        Disp::InlineComp(comp) => {
-            let raw_len = value_payload(ty, val).len();
+        (Disp::InlineComp(c), v) => {
+            let comp = src.comp_bytes(c, v)?;
             out.push(TAG_INLINE_COMP);
             out.extend_from_slice(&(raw_len as u32).to_be_bytes());
             out.extend_from_slice(&(comp.len() as u16).to_be_bytes());
-            out.extend_from_slice(comp);
+            out.extend_from_slice(&comp);
         }
-        Disp::ExternalComp(comp) => {
+        (
+            Disp::ExternalComp(_),
+            Value::Unfetched(Unfetched::ExternalComp {
+                first_page,
+                stored_len,
+                raw_len,
+                ..
+            }),
+        ) => {
+            let first = src.keep_chain(*first_page, *stored_len as usize, cap, take, ovf)?;
+            out.push(TAG_EXTERNAL_COMP);
+            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&stored_len.to_be_bytes());
+            out.extend_from_slice(&raw_len.to_be_bytes());
+        }
+        (Disp::ExternalComp(c), v) => {
             // The chain carries the COMPRESSED block (its page count follows comp size).
-            let raw_len = value_payload(ty, val).len();
-            let first = write_overflow_chain(comp, cap, take, ovf);
+            let comp = src.comp_bytes(c, v)?;
+            let first = write_overflow_chain(&comp, cap, take, ovf);
             out.push(TAG_EXTERNAL_COMP);
             out.extend_from_slice(&first.to_be_bytes());
             out.extend_from_slice(&(comp.len() as u32).to_be_bytes());
             out.extend_from_slice(&(raw_len as u32).to_be_bytes());
         }
     }
-    out
+    Ok(out)
 }
 
 /// Build a v24 PAX (column-major) leaf payload from records in ascending key order (format.md
@@ -3286,7 +3551,8 @@ fn encode_disposed_value(
 /// column directory (`K+1` u32 absolute offsets, `col_start[K]` = payload end) ‖ per column a
 /// region: a flags byte (0), then — fixed-width — the null bitmap + `N × width` dense untagged
 /// slots (a NULL slot zero-filled), or — variable-width — an `N`-entry end-offset value directory
-/// + the tagged value bodies (NULL = a zero-length span).
+/// + the tagged value bodies (NULL = a zero-length span). A kept chain (`src`, large-values.md §15)
+/// allocates nothing.
 fn encode_leaf_pax<K: AsRef<[u8]>>(
     col_types: &[ColType],
     keys: &[K],
@@ -3294,7 +3560,8 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
     cap: usize,
     take: &mut dyn FnMut() -> u32,
     ovf: &mut Vec<OverflowPageOut>,
-) -> Vec<u8> {
+    src: &mut ChainSource<'_>,
+) -> Result<Vec<u8>> {
     let n = keys.len();
     let k = col_types.len();
     // Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
@@ -3311,7 +3578,16 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
                 (Some(w), true) => vec![0u8; w],
                 (Some(_), false) => encode_value(ty, val)[1..].to_vec(),
                 (None, true) => Vec::new(),
-                (None, false) => encode_disposed_value(ty, val, &plan.disp[c], cap, take, ovf),
+                (None, false) => encode_disposed_value(
+                    ty,
+                    val,
+                    &plan.disp[c],
+                    plan.payload_len[c],
+                    cap,
+                    take,
+                    ovf,
+                    src,
+                )?,
             };
             val_bytes[c].push(bytes);
         }
@@ -3365,7 +3641,7 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
             out.extend_from_slice(vb);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Write `payload` across a chain of overflow pages (`cap`-byte slabs, in order), allocating each
@@ -6264,8 +6540,8 @@ fn read_overflow_chain(
 /// Read one value **lazily** (spec/design/large-values.md §14): inline-plain and NULL decode as
 /// today, but an external/compressed form becomes an [`Unfetched`] reference holding exactly the
 /// record's pointer fields — no chain read, no decompression. The scan layer resolves the
-/// references for the columns a query touches ([`resolve_unfetched`]); the commit path resolves
-/// the rest when a dirty leaf re-encodes (`resolve_for_encode`).
+/// references for the columns a query touches ([`resolve_unfetched`]); a commit writes the rest from
+/// their stored bytes, keeping their chains (large-values.md §15).
 fn read_value_lazy(
     tyref: &crate::value::TypeRef,
     block: &Arc<Vec<u8>>,
@@ -7336,7 +7612,16 @@ mod tests {
             .map(|i| (i as u32).to_be_bytes().to_vec())
             .collect();
         let row_refs: Vec<&[Value]> = rows.iter().map(Vec::as_slice).collect();
-        let payload = encode_leaf_pax(&col_types, &keys, &row_refs, cap, &mut take, &mut ovf);
+        let payload = encode_leaf_pax(
+            &col_types,
+            &keys,
+            &row_refs,
+            cap,
+            &mut take,
+            &mut ovf,
+            &mut ChainSource::resident(),
+        )
+        .unwrap();
         assert!(
             ovf.is_empty(),
             "values must stay inline (no overflow) for the form-(a) case"
@@ -7460,7 +7745,9 @@ mod tests {
             8192 - PAGE_HEADER,
             &mut take,
             &mut overflow,
-        );
+            &mut ChainSource::resident(),
+        )
+        .unwrap();
         assert!(overflow.is_empty());
 
         let assert_fault_corrupt = |payload: Vec<u8>| {
@@ -7526,7 +7813,16 @@ mod tests {
             .map(|i| (i as u32).to_be_bytes().to_vec())
             .collect();
         let row_refs: Vec<&[Value]> = rows.iter().map(Vec::as_slice).collect();
-        let payload = encode_leaf_pax(&col_types, &keys, &row_refs, cap, &mut take, &mut ovf);
+        let payload = encode_leaf_pax(
+            &col_types,
+            &keys,
+            &row_refs,
+            cap,
+            &mut take,
+            &mut ovf,
+            &mut ChainSource::resident(),
+        )
+        .unwrap();
         assert!(ovf.is_empty());
         let block = make_page(ps, PAGE_LEAF, rows.len() as u32, 0, &payload);
         let node = decode_leaf_node(

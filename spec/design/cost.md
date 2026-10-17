@@ -280,9 +280,10 @@ never-taken `CASE` branch is still touched. Consequences worth naming:
   charge the structural node block and row reads only.
 - **`DELETE`** touches only its filter's columns — dropping a row never reads its chains.
 - **`UPDATE`** touches its filter's columns plus every assignment **source**'s columns. The
-  rewrite itself does not *read* an untouched stored value (under the §14 model an unchanged
-  spilled value's bytes move without decompression); the write side stays metered by
-  `value_compress` per stored row version, unchanged.
+  rewrite itself does not *read* an untouched stored value: an unassigned large value keeps its
+  stored form and its overflow chain ([large-values.md](large-values.md) §15). The write side stays
+  metered by `value_compress` per stored row version, unchanged — every attempt of the record's
+  plan, including one whose outcome a kept value's stored form already records.
 
 ### `value_compress` / `value_decompress` — the compression units
 
@@ -301,7 +302,10 @@ computable from the stored lengths alone, so the charge never requires re-runnin
 - **`value_compress`** is the write side: an `INSERT`/`UPDATE` or table rewrite (for example `ALTER
   TABLE … ADD/DROP COLUMN`) whose replacement record exceeds `RECORD_MAX` runs the disposition
   decision's compress pass, and **every attempt** (adopted or rejected by
-  *store-smaller* — the encoder ran either way) charges `ceil(raw_len / C)`. Charged once per
+  *store-smaller* — the encoder ran either way) charges `ceil(raw_len / C)`. The unit counts the
+  plan's logical attempts: an attempt on a value whose stored form records the outcome (large-values.md
+  §15) charges the same although the encoder is skipped, so cost never depends on whether a row was
+  read from disk or is still resident. Charged once per
   stored row version at the statement's write site, never for the B-tree's internal re-encodes.
   A record that fits inline-plain attempts nothing, so existing costs do not move.
 

@@ -253,7 +253,8 @@ sits so the options stay open (CLAUDE.md §9).
   ([memory.md](memory.md) §8.7) never walks the file at open. Each commit derives the new count from
   the previous one: it adds every page it writes, and subtracts the previous catalog chain and GiST
   forest (both rewritten whole) and the previous B-tree pages outside the subtrees the two snapshots
-  share, with each orphaned leaf's overflow pages counted from its external pointers' lengths.
+  share, with each orphaned leaf's overflow pages counted from its external pointers' lengths —
+  except the chains a rewritten record kept ([large-values.md](large-values.md) §15).
 - **Multi-process file locking** — ✅ **landed ([locking.md](locking.md),
   [page-service.md](page-service.md)).** A stable `<path>.lock/` bundle (`protocol-v2`, carrying the
   `presence` and `arrival` OS locks) elects one owner, the `presence EX` holder, which alone reads and

@@ -10,7 +10,8 @@
 //     generation's manifest dependencies;
 //   - each table's storage keys ascend strictly and equal the primary-key encoding of their rows;
 //   - each table's persisted row count equals its leaf total;
-//   - each column index holds exactly the entries derived from its table's rows.
+//   - each column index holds exactly the entries derived from its table's rows;
+//   - no overflow page is named by two stored values (large-values.md §15).
 //
 // The live checker checks the running process instead (see checkLive).
 
@@ -23,6 +24,7 @@ import { MemoryBlockStore } from "../memoryblockstore.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import type { Database } from "../shared.ts";
+import type { Value } from "../value.ts";
 import { bytesEqual, compareBytes, compareUtf8 } from "./util.ts";
 
 const ROOT_PAGE = 2;
@@ -97,9 +99,10 @@ export function checkImage(image: Uint8Array, want: bigint): [number, number, nu
     }
     seen.add(pg);
   }
+  const claimed = new Set<number>();
   for (const name of [...snap.tables.keys()].sort(compareUtf8)) {
     try {
-      checkTable(snap, name);
+      checkTable(snap, name, paging, claimed);
     } catch (err) {
       throw new CheckError(`table ${name}: ${message(err)}`);
     }
@@ -107,7 +110,16 @@ export function checkImage(image: Uint8Array, want: bigint): [number, number, nu
   return [mt.livePages, mt.pageCount, e.freePages.length];
 }
 
-function checkTable(snap: Snapshot, name: string): void {
+// checkTable also checks chain exclusivity (large-values.md §15): every overflow page the snapshot
+// reaches is named by exactly one stored value, across all tables (claimed). A rewritten record may
+// keep an unchanged value's chain, but two records of one snapshot never share one.
+function checkTable(
+  snap: Snapshot,
+  name: string,
+  paging: SharedPaging,
+  claimed: Set<number>,
+): void {
+  const fetch = (p: number): Uint8Array => paging.readBlock(p);
   const table = snap.tables.get(name)!;
   const store = snap.stores.get(name);
   if (store === undefined) throw new CheckError("no row store");
@@ -117,6 +129,20 @@ function checkTable(snap: Snapshot, name: string): void {
     c.collation !== null ? (snap.resolveCollation(c.collation) ?? null) : null,
   );
   for (let i = 0; i < entries.length; i++) {
+    for (const v of entries[i]!.row) {
+      const ext = externalRef(v);
+      if (ext === null) continue;
+      let pages: number[];
+      try {
+        pages = chainPages(ext[0], ext[1], fetch);
+      } catch (err) {
+        throw new CheckError(`row ${i}: an overflow chain: ${message(err)}`);
+      }
+      for (const pg of pages) {
+        if (claimed.has(pg)) throw new CheckError(`overflow page ${pg} is referenced twice`);
+        claimed.add(pg);
+      }
+    }
     let row: (typeof entries)[number]["row"];
     try {
       row = store.resolveAll(entries[i]!.row);
@@ -187,6 +213,7 @@ export function checkLive(db: Database): void {
     if (free.has(pg))
       throw new CheckError(`${what} references page ${pg}, which is on the free list`);
   };
+  const claimed = new Set<number>();
   for (const name of [...snap.stores.keys()].sort(compareUtf8)) {
     const store = snap.stores.get(name)!;
     const nodes = new Set<number>();
@@ -200,15 +227,23 @@ export function checkLive(db: Database): void {
     }
     for (const en of entries) {
       for (const v of en.row) {
-        if (v.kind !== "unfetched") continue;
-        if (v.ref.form !== TAG_EXTERNAL && v.ref.form !== TAG_EXTERNAL_COMP) continue;
+        const ext = externalRef(v);
+        if (ext === null) continue;
         let pages: number[];
         try {
-          pages = chainPages(v.ref.firstPage, v.ref.storedLen, fetch);
+          pages = chainPages(ext[0], ext[1], fetch);
         } catch (err) {
           throw new CheckError(`table ${name}: an overflow chain: ${message(err)}`);
         }
-        for (const pg of pages) check(`table ${name}'s overflow chain`, pg);
+        for (const pg of pages) {
+          check(`table ${name}'s overflow chain`, pg);
+          // Chain exclusivity (large-values.md §15): a kept chain moves to the rewritten record; two
+          // committed records never share one.
+          if (claimed.has(pg)) {
+            throw new CheckError(`table ${name}: overflow page ${pg} is referenced twice`);
+          }
+          claimed.add(pg);
+        }
       }
     }
   }
@@ -217,4 +252,12 @@ export function checkLive(db: Database): void {
     collectTreePages(ist.treeRoot(), nodes);
     for (const pg of nodes) check(`index ${name}'s tree`, pg);
   }
+}
+
+// externalRef returns the overflow chain a stored value names — its first page and the bytes the
+// chain carries — or null for an inline or resident value.
+function externalRef(v: Value): [number, number] | null {
+  if (v.kind !== "unfetched") return null;
+  if (v.ref.form !== TAG_EXTERNAL && v.ref.form !== TAG_EXTERNAL_COMP) return null;
+  return [v.ref.firstPage, v.ref.storedLen];
 }

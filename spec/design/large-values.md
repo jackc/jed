@@ -20,7 +20,9 @@ hand-rolled deterministic LZ4-block codec ([../fileformat/lz4.md](../fileformat/
 externalize disposition pass, the `compressed_table.jed` golden, and the
 `value_compress`/`value_decompress` cost units; the resolved decisions are in §13 below. The
 **lazy follow-on is also built, in both phases** (§14): the touched-column cost contract, then the
-physical read-on-touch storage behind it. Per CLAUDE.md §14 a third-party dependency is **never**
+physical read-on-touch storage behind it. **Chain sharing on rewrite is built too** (§15): a
+rewritten record keeps an unchanged value's stored form and overflow chain, with no format, plan,
+or cost change. Per CLAUDE.md §14 a third-party dependency is **never**
 added on an agent's initiative — and as §6 below shows this feature needs **none**: every slice
 shipped dependency-free.
 
@@ -528,16 +530,10 @@ tests, the goldens, and the incremental tests are all unchanged):
   reference.
 - An unfetched value that *escapes* (a bug) **fails loudly** — the variant is poisoned: render,
   comparison, and encode panic/throw rather than read it as NULL.
-- A **mutated row is re-stored fully resident**: UPDATE resolves the rewritten row's remaining
-  references as part of the rewrite (unmetered write work), so its weight and disposition re-plan
-  exactly as an eager writer's would. A **dirty leaf's other rows** resolve through the pager at
-  commit (unmetered, like all commit work), re-encoding byte-identically to the eager
-  implementation — chains are rewritten fresh. Whether an **unchanged** spilled value's chain can
-  instead be *shared* by the rewritten record (pointer copy, no chain rewrite — safe under
-  reconstruct-on-open reachability, which unions over live records) remains the **one deferred
-  byte-layout follow-on**: it changes incremental allocation order, so it must land in all cores
-  + the per-core incremental tests together, and it is what would also drop the commit-time
-  re-read.
+- A **mutated row was re-stored fully resident**: UPDATE resolved the rewritten row's remaining
+  references as part of the rewrite, and a **dirty leaf's other rows** resolved through the pager at
+  commit, so every rewrite re-read, re-compressed, and re-wrote every chain. **Superseded by §15**:
+  a rewritten record now keeps an unchanged value's stored form and chain.
 - The open-time reachability walk follows chains via **headers only** (`next_page` hops — no
   payload assembly, no decompression, no UTF-8 validation), so `open` never materializes a large
   value. The per-core tests pin this physically: with every chain *payload* corrupted on disk,
@@ -547,3 +543,112 @@ tests, the goldens, and the incremental tests are all unchanged):
 - Wins, now real: a `SELECT small_col` over a table of huge values reads no chains and decompresses
   nothing; `open` is cheaper on spillable tables; the resident set of a file-backed store stops
   scaling with unreferenced large values (a faulted leaf holds pointers, not megabytes).
+
+---
+
+## 15. Chain sharing on rewrite — BUILT
+
+Before this slice, every rewrite of a record re-materialized its large values: an UPDATE resolved
+the new row's unassigned values, and a commit resolved the other rows of every leaf it rewrote, so a
+one-integer UPDATE on a row with a 1 MB value read the chain, decompressed it, recompressed it, and
+wrote a fresh chain. A rewritten record now **keeps an unchanged value's stored form**: its inline
+body or inline LZ4 block verbatim, and an external value's **existing chain**, by copying the
+pointer. This is PostgreSQL's TOAST behavior: an UPDATE reuses an unchanged value's toast pointer.
+It lands in all three cores; there is **no `format_version` bump** and no change to any golden.
+
+### 15.1 The plan is unchanged: plan from stored facts
+
+The disposition plan (§3/§12/§13) stays a function of the row's logical values, so a rewritten
+record's dispositions and bytes are the ones a fresh plan of its values would produce. Only page
+numbers differ: a kept chain keeps its pages. The plan never needs a deferred value's bytes, because
+its stored fields already supply every input:
+
+- its **inline-plain size** and **payload length** follow from the stored length: `|P(v)| + 3` for
+  `text`/`bytea`/`json` (tag + `u16` length), `|P(v)| + 1` for every other spillable type, where
+  `|P(v)|` is `payload_len` (`0x02`), `raw_len` (`0x03`/`0x04`), or the inline span less its header;
+- the **outcome of a compression attempt** is recorded by its form. An external-plain value was
+  attempted and rejected: pass 2 ran, so pass 1 had visited every candidate. An inline- or
+  external-compressed value was adopted, with the block it stores (`comp_len` / `stored_len`). LZ4
+  output is a function of the payload (lz4.md), so the same attempt in any record has the same
+  outcome. Only an inline-plain value records no outcome; its payload is resident in the record, so
+  an attempt that reaches it compresses those bytes.
+
+Because the plan is a function of logical values, a record's plan, size (its B-tree weight), and
+`value_compress` charge are the same whether its values are deferred references read from disk or
+resident values written in this session. Residency therefore never changes the bytes of a record,
+a node boundary, or a cost.
+
+### 15.2 Which values keep their stored form
+
+- **The other rows of a rewritten leaf.** Every deferred value of an unchanged row is written from
+  its stored bytes: the inline span or block verbatim, the external pointer unchanged. The plan of an
+  unchanged row is its stored plan, so the encoding is the stored record byte for byte. This is the
+  common case: inserting one row into a leaf of large-value rows writes one leaf page and no chain
+  page.
+- **An UPDATE's new row.** Each unassigned, non-primary-key column whose stored value is a large form
+  (`0x02`, `0x03`, `0x04`) carries the stored reference over, captured before the touched set (cost.md
+  §3) resolves it, so the statement reading the column (in its `WHERE`, an assignment source, or
+  `RETURNING`) does not stop the value keeping its chain. After the new storage key is known, the new
+  row is **settled**: its plan is computed, and any carried reference whose planned form is not its
+  stored form (another value grew, so a compressed value must move out of line, or a re-key changed
+  the key length) is resolved, unmetered, as before. A stored row's deferred values therefore always
+  equal its own plan's output — the invariant the scan cost walk and the commit encoder rely on.
+  CHECK constraints, index maintenance, and `RETURNING` read a carried value through the evaluator's
+  demand fault (bplus-reshape.md §5), unmetered like the resolution it replaces. Re-keying and the
+  foreign-key `ON UPDATE` actions run through the same path.
+- **Not kept**: an assigned column (its value is new), a primary-key column (resolved for the new
+  key), a value written in this session and still resident (it has no chain yet, or has one the
+  resident value does not name), and rows rewritten by `INSERT … ON CONFLICT DO UPDATE` or by a table
+  rewrite (`ALTER TABLE`), which resolve the whole row as before. A table whose rows all fit one leaf
+  keeps that root leaf resident after a commit (bplus-reshape.md B4), so its in-session rows rewrite
+  their chains until they are next read from disk. These are physical follow-ons only: the bytes
+  other than page numbers, the plan, and the cost are the same either way.
+
+### 15.3 Ownership and lifetime
+
+A chain page is immutable once written, so sharing one between the previous snapshot and the new one
+needs no reference count. Within one snapshot a chain still belongs to **exactly one record**: a
+carried reference replaces the row it came from (an UPDATE removes the old version, a re-key moves
+it), and every row-copying path that could duplicate a value (`INSERT … SELECT`, `CREATE TABLE AS`,
+projections) materializes it. Every consumer relies on this:
+
+- **Reclamation and the watermark** are unchanged. A kept chain is reachable from both snapshots, so
+  it is never on a free list; the reachability walk (format.md *Reclamation*) unions over live
+  records. A chain dropped by a later UPDATE or DELETE becomes dead when the last snapshot naming it
+  is past the reader watermark (transactions.md §8), like any page.
+- **Live page count (v34, memory.md §8.7)**: a commit records the first page of every chain it kept,
+  and the orphaned-leaf term skips those chains. A kept chain's previous referrer is in a leaf the
+  commit rewrote, so the count stays exact; the per-core live-page self-check and the simulation's
+  image checker verify it.
+- **Validated-COW manifests** (validated-cow.md) list only written pages. A kept chain is inherited,
+  durable before the commit began, and reachable from the fallback snapshot, so the allocator cannot
+  reuse it and recovery need not re-hash it.
+- **Compaction and `to_image`** write a from-scratch image with renumbered pages, so they cannot keep
+  a chain. They copy its stored bytes (the raw payload, or the compressed block) into a fresh chain,
+  without decompressing or recompressing; the record keeps its form. The image is the one the
+  previous implementation produced.
+- **Rollback and savepoints** need nothing: a working snapshot's references name pages of the
+  committed snapshot it started from, which no commit frees while that snapshot is current.
+- **The page service** needs nothing: a page client builds its commit delta with the same encoder,
+  and the owner's reclamation is the same reachability walk.
+
+### 15.4 Cost
+
+Cost does not change. `page_read` and `value_decompress` follow the stored forms, which are those of
+a fresh plan. `value_compress` still charges every pass-1 attempt of the plan, including an attempt
+whose outcome a deferred value's stored form records and whose encoder therefore never runs: the unit
+counts the plan's logical attempts, as `page_read` counts logical page accesses (cost.md §3). Charging
+only the physical work would make the cost of the same statement depend on whether its rows had been
+read from disk or were still resident. The pending-write measure (memory.md §7) likewise still counts
+a kept chain's payload, so `54P05` trip points are unchanged. No `# cost:` entry moved.
+
+### 15.5 Tests
+
+All three cores pin the physical behavior in mirrored `chain_sharing` tests: with every chain
+payload corrupt on disk, an UPDATE of another column, a re-key, and a neighboring INSERT succeed and
+leave the corruption in place (no chain was read or rewritten); an UPDATE that reads the column but
+does not assign it writes no overflow page; compaction afterwards preserves rows and costs; and the
+same statements cost the same on resident and on disk-read rows. The simulation generator's
+`update_narrow` step (the `large-values` profile) assigns only a fixed-width column, sometimes with a
+`WHERE` that reads a variable-width one, and the image checkers (each core and `verify.rb
+--check-image`) check chain exclusivity: no overflow page is named by two stored values.

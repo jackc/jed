@@ -4017,11 +4017,21 @@ impl Engine {
         scan_actual += block_cost;
         let mut filter_actual = scan_actual;
         let store = self.store_scoped(upd.db.as_deref(), &upd.table);
+        let assigned: Vec<bool> = (0..ncols)
+            .map(|i| plans.iter().any(|p| p.idx == i))
+            .collect();
         for (key, mut row) in batch.entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             scan_actual += COSTS.storage_row_read;
             filter_actual += COSTS.storage_row_read;
+            // The stored large values the new row may carry over (large-values.md §15), captured
+            // before the touched set resolves them: an unassigned column keeps its stored form and
+            // its chain even when the statement reads it.
+            let stored = row
+                .iter()
+                .any(|v| matches!(v, Value::Unfetched(u) if u.is_large_form()))
+                .then(|| row.clone());
             // Materialize the filter's + assignment sources' columns if the lazy load left them
             // unfetched — exactly the touched set the block above charged (large-values.md §14).
             store.resolve_columns(&mut row, &mask)?;
@@ -4080,13 +4090,29 @@ impl Engine {
             if let Some(col) = null_col {
                 return Err(self.not_null_row_violation(&relation, col, &new_row));
             }
-            // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
-            // columns so its weight/disposition re-plan exactly as an eager writer's would —
-            // unmetered, part of the rewrite like commit work (large-values.md §14).
-            store.resolve_all(&mut new_row)?;
+            // An unassigned non-key column carries its stored large value over deferred, so the
+            // rewrite neither re-reads nor recompresses it and the commit keeps its chain
+            // (large-values.md §15); every other deferred value is resolved — unmetered, part of
+            // the rewrite like commit work (§14). CHECK and RETURNING read a carried value through
+            // the evaluator's demand fault, also unmetered.
+            for (i, v) in new_row.iter_mut().enumerate() {
+                let carried = !assigned[i] && !pk_members.contains(&i);
+                match stored.as_ref().map(|s| &s[i]) {
+                    Some(Value::Unfetched(u)) if carried && u.is_large_form() => {
+                        *v = Value::Unfetched(u.clone());
+                    }
+                    _ => {
+                        if let Value::Unfetched(u) = v
+                            && !(carried && u.is_large_form())
+                        {
+                            *v = store.resolve_value(i, u)?;
+                        }
+                    }
+                }
+            }
             // CHECK constraints, in name order, on the post-assignment row — after the
             // assignments coerced (22003 in `plan.check`, then 23502 over the whole row, above),
-            // on the fully-resident row (constraints.md §4.4). Every check evaluates (not only those mentioning
+            // with carried large values faulted on demand (constraints.md §4.4). Every check evaluates (not only those mentioning
             // assigned columns); TRUE and NULL pass, the first FALSE aborts the statement
             // (phase 1 — nothing has been written).
             for (name, rexpr) in &checks {
@@ -4102,6 +4128,10 @@ impl Engine {
             } else {
                 key.clone()
             };
+            // A carried value stays deferred only where the new row's plan stores it in its
+            // stored form; the rest are resolved, so the stored row plans exactly as a resident
+            // one would (large-values.md §15).
+            store.settle_carried(&new_key, &mut new_row)?;
             updates.push((key, new_key, new_row, row));
         }
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {

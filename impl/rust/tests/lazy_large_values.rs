@@ -275,9 +275,8 @@ fn lazy_values_round_trip_exactly() {
 }
 
 /// An UPDATE that never touches the spilled column re-stores it without losing it: the
-/// rewritten row resolves its unfetched values as part of the rewrite, the dirty leaf's
-/// other rows resolve at commit, and a reopen reads everything back exactly
-/// (large-values.md §14 — resolve-at-commit; chain sharing stays the deferred follow-on).
+/// rewritten row and the dirty leaf's other rows keep the value's stored form and chain, and a
+/// reopen reads everything back exactly (large-values.md §15; chain_sharing.rs pins the sharing).
 #[test]
 fn update_of_other_columns_preserves_spilled_values() {
     let path = tmp("jed_lazy_update.jed");
@@ -311,11 +310,11 @@ fn update_of_other_columns_preserves_spilled_values() {
         )
         .unwrap()
         .session(SessionOptions::default());
-        // Dirties the leaf carrying row 1's unfetched body without touching it: row 2's
-        // rewrite resolves nothing, row 1 resolves at commit.
+        // Dirties the leaf carrying row 1's unfetched body without touching it: row 1 keeps its
+        // stored form and chain at commit.
         db.query_outcome("UPDATE t SET n = 99 WHERE id = 2", &[])
             .unwrap();
-        // Rewrites row 1 itself: the rewrite materializes its body (part of the write work).
+        // Rewrites row 1 itself: the unassigned body is carried over with its chain.
         db.query_outcome("UPDATE t SET n = 11 WHERE id = 1", &[])
             .unwrap();
         drop(db);

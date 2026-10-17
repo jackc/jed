@@ -13718,6 +13718,7 @@ export class Engine {
     meter.charge(blockCost);
     scanActual += blockCost;
     let filterActual = scanActual;
+    const assignedCol: boolean[] = table.columns.map((_, i) => plans.some((p) => p.idx === i));
     for (const e of scan.entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
@@ -13762,20 +13763,30 @@ export class Engine {
         }
       }
       if (nullCol !== null) throw this.notNullRowViolation(table.name, nullCol, newRow);
-      // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
-      // columns so its weight/disposition re-plan exactly as an eager writer's would —
-      // unmetered, part of the rewrite like commit work (large-values.md §14).
-      const resident = store.resolveAll(newRow);
+      // An unassigned non-key column carries its stored large value over deferred — taken from the
+      // stored row, so the statement reading it does not matter — and the rewrite neither re-reads
+      // nor recompresses it while the commit keeps its chain (large-values.md §15); every other
+      // deferred value is resolved — unmetered, part of the rewrite like commit work (§14). CHECK and
+      // RETURNING read a carried value through the evaluator's demand fault, also unmetered.
+      for (let i = 0; i < newRow.length; i++) {
+        const carried = !assignedCol[i] && !pkMembers.includes(i);
+        const sv = e.row[i]!;
+        const nv = newRow[i]!;
+        if (carried && sv.kind === "unfetched" && sv.ref.form !== 0x00) newRow[i] = sv;
+        else if (nv.kind === "unfetched") newRow[i] = store.resolveValue(i, nv.ref);
+      }
       // CHECK constraints, in name order, on the post-assignment row — after the
-      // assignments coerced (22003/23502 in checkAssign above), on the fully-resident row
-      // (constraints.md §4.4). Every check evaluates (not only those mentioning assigned
-      // columns); TRUE and NULL pass, the first FALSE aborts the statement (phase 1 —
-      // nothing has been written).
-      evalChecks(checks, table.name, resident, env, meter);
+      // assignments coerced (22003/23502 in checkAssign above) (constraints.md §4.4). Every check
+      // evaluates (not only those mentioning assigned columns); TRUE and NULL pass, the first FALSE
+      // aborts the statement (phase 1 — nothing has been written).
+      evalChecks(checks, table.name, newRow, env, meter);
       // The row's NEW storage key: recomputed from the post-assignment row when a key member
       // was assigned (re-keying), else the unchanged old key.
-      const newKey = pkChanged ? encodePkKey(store.columnTypes(), pkMembers, colls, resident) : e.key;
-      updates.push({ key: e.key, newKey, row: resident, oldRow: row });
+      const newKey = pkChanged ? encodePkKey(store.columnTypes(), pkMembers, colls, newRow) : e.key;
+      // A carried value stays deferred only where the new row's plan stores it in its stored form;
+      // the rest are resolved, so the stored row plans exactly as a resident one would
+      // (large-values.md §15).
+      updates.push({ key: e.key, newKey, row: store.settleCarried(newKey, newRow), oldRow: row });
     }
     this.recordExplainActual("Scan " + upd.table, scanActual);
     if (filter !== null) this.recordExplainActual("Filter", filterActual);

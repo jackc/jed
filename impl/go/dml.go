@@ -4255,6 +4255,10 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 	meter.Charge(blockCost)
 	scanActual += blockCost
 	filterActual := scanActual
+	assignedCol := make([]bool, len(store.colTypes))
+	for _, p := range plans {
+		assignedCol[p.idx] = true
+	}
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return outcome{}, err
@@ -4329,14 +4333,23 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 		if nullCol != "" {
 			return outcome{}, db.notNullRowViolation(table.Name, nullCol, newRow)
 		}
-		// The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
-		// columns so its weight/disposition re-plan exactly as an eager writer's would —
-		// unmetered, part of the rewrite like commit work (large-values.md §14).
-		if newRow, err = store.resolveAll(newRow); err != nil {
-			return outcome{}, err
+		// An unassigned non-key column carries its stored large value over deferred — taken from the
+		// stored row, so the statement reading it does not matter — and the rewrite neither re-reads
+		// nor recompresses it while the commit keeps its chain (large-values.md §15); every other
+		// deferred value is resolved — unmetered, part of the rewrite like commit work (§14). CHECK and
+		// RETURNING read a carried value through the evaluator's demand fault, also unmetered.
+		for i := range newRow {
+			carried := !assignedCol[i] && !slices.Contains(pkMembers, i)
+			if sv := e.Row[i]; carried && sv.Kind == ValUnfetched && sv.unfetched().Form != 0x00 {
+				newRow[i] = sv
+			} else if newRow[i].Kind == ValUnfetched {
+				if newRow[i], err = store.resolveValue(i, newRow[i].unfetched()); err != nil {
+					return outcome{}, err
+				}
+			}
 		}
 		// CHECK constraints, in name order, on the post-assignment row — after the
-		// assignments coerced (22003/23502 in p.check above), on the fully-resident row
+		// assignments coerced (22003/23502 in p.check above), on the new row
 		// (constraints.md §4.4). Every check evaluates (not only those mentioning assigned
 		// columns); TRUE and NULL pass, the first FALSE aborts the statement (phase 1 —
 		// nothing has been written).
@@ -4350,6 +4363,12 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			if newKey, err = encodePkKey(store.colTypes, pkMembers, colls, newRow); err != nil {
 				return outcome{}, err
 			}
+		}
+		// A carried value stays deferred only where the new row's plan stores it in its stored form;
+		// the rest are resolved, so the stored row plans exactly as a resident one would
+		// (large-values.md §15).
+		if newRow, err = store.settleCarried(newKey, newRow); err != nil {
+			return outcome{}, err
 		}
 		updates = append(updates, pending{key: e.Key, newKey: newKey, row: newRow, oldRow: row})
 	}
