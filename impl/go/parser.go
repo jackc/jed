@@ -2290,107 +2290,14 @@ loop:
 				r = &seqRestart{Value: v}
 			}
 			restart = r
-		case "as":
-			// `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw
-			// type name is stored; it is resolved (and a non-integer type rejected 22023) at
-			// execution. Inside an IDENTITY column's `( … )` a set DataType is 42601.
-			if err := p.dupCheck(seq.DataType != "", "AS"); err != nil {
-				return seqOptions{}, nil, err
-			}
-			p.advance()
-			name, err := p.expectTypeName()
-			if err != nil {
-				return seqOptions{}, nil, err
-			}
-			seq.DataType = name
-		case "increment":
-			if err := p.dupCheck(seq.Increment != nil, "INCREMENT"); err != nil {
-				return seqOptions{}, nil, err
-			}
-			p.advance()
-			p.consumeKeyword("by")
-			v, err := p.parseSignedIntLiteral()
-			if err != nil {
-				return seqOptions{}, nil, err
-			}
-			seq.Increment = &v
-		case "minvalue":
-			if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
-				return seqOptions{}, nil, err
-			}
-			p.advance()
-			v, err := p.parseSignedIntLiteral()
-			if err != nil {
-				return seqOptions{}, nil, err
-			}
-			seq.MinValue = &seqBound{Value: v}
-		case "maxvalue":
-			if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
-				return seqOptions{}, nil, err
-			}
-			p.advance()
-			v, err := p.parseSignedIntLiteral()
-			if err != nil {
-				return seqOptions{}, nil, err
-			}
-			seq.MaxValue = &seqBound{Value: v}
-		case "start":
-			if err := p.dupCheck(seq.Start != nil, "START"); err != nil {
-				return seqOptions{}, nil, err
-			}
-			p.advance()
-			p.consumeKeyword("with")
-			v, err := p.parseSignedIntLiteral()
-			if err != nil {
-				return seqOptions{}, nil, err
-			}
-			seq.Start = &v
-		case "cache":
-			if err := p.dupCheck(seq.Cache != nil, "CACHE"); err != nil {
-				return seqOptions{}, nil, err
-			}
-			p.advance()
-			v, err := p.parseSignedIntLiteral()
-			if err != nil {
-				return seqOptions{}, nil, err
-			}
-			seq.Cache = &v
-		case "cycle":
-			if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
-				return seqOptions{}, nil, err
-			}
-			p.advance()
-			t := true
-			seq.Cycle = &t
-		case "no":
-			// `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
-			p.advance()
-			switch p.peekKeyword() {
-			case "minvalue":
-				if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
-					return seqOptions{}, nil, err
-				}
-				p.advance()
-				seq.MinValue = &seqBound{NoValue: true}
-			case "maxvalue":
-				if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
-					return seqOptions{}, nil, err
-				}
-				p.advance()
-				seq.MaxValue = &seqBound{NoValue: true}
-			case "cycle":
-				if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
-					return seqOptions{}, nil, err
-				}
-				p.advance()
-				f := false
-				seq.Cycle = &f
-			default:
-				return seqOptions{}, nil, newError(SyntaxError,
-					fmt.Sprintf("expected MINVALUE, MAXVALUE, or CYCLE after NO, found %q", p.peekKeyword()))
-			}
 		default:
-			break loop
+			ok, err := p.parseOneSeqOption(&seq)
+			if err != nil {
+				return seqOptions{}, nil, err
+			}
+			if !ok {
+				break loop
+			}
 		}
 	}
 	if parenthesized {
@@ -2399,6 +2306,133 @@ loop:
 		}
 	}
 	return seq, restart, nil
+}
+
+// parseOneSeqOption parses one order-free sequence option (`sequence_option` in grammar.ebnf) into
+// seq, reporting false when the next token starts none. Shared by the CREATE/ALTER SEQUENCE and
+// identity `( … )` option loops and by `ALTER TABLE … ALTER COLUMN … SET <sequence_option>`
+// (alter.md §2.8).
+func (p *parser) parseOneSeqOption(seq *seqOptions) (bool, error) {
+	switch p.peekKeyword() {
+	case "as":
+		// `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw
+		// type name is stored; it is resolved (and a non-integer type rejected 22023) at
+		// execution. Inside an IDENTITY column's `( … )` a set DataType is 42601.
+		if err := p.dupCheck(seq.DataType != "", "AS"); err != nil {
+			return false, err
+		}
+		p.advance()
+		name, err := p.expectTypeName()
+		if err != nil {
+			return false, err
+		}
+		seq.DataType = name
+	case "increment":
+		if err := p.dupCheck(seq.Increment != nil, "INCREMENT"); err != nil {
+			return false, err
+		}
+		p.advance()
+		p.consumeKeyword("by")
+		v, err := p.parseSignedIntLiteral()
+		if err != nil {
+			return false, err
+		}
+		seq.Increment = &v
+	case "minvalue":
+		if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
+			return false, err
+		}
+		p.advance()
+		v, err := p.parseSignedIntLiteral()
+		if err != nil {
+			return false, err
+		}
+		seq.MinValue = &seqBound{Value: v}
+	case "maxvalue":
+		if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
+			return false, err
+		}
+		p.advance()
+		v, err := p.parseSignedIntLiteral()
+		if err != nil {
+			return false, err
+		}
+		seq.MaxValue = &seqBound{Value: v}
+	case "start":
+		if err := p.dupCheck(seq.Start != nil, "START"); err != nil {
+			return false, err
+		}
+		p.advance()
+		p.consumeKeyword("with")
+		v, err := p.parseSignedIntLiteral()
+		if err != nil {
+			return false, err
+		}
+		seq.Start = &v
+	case "cache":
+		if err := p.dupCheck(seq.Cache != nil, "CACHE"); err != nil {
+			return false, err
+		}
+		p.advance()
+		v, err := p.parseSignedIntLiteral()
+		if err != nil {
+			return false, err
+		}
+		seq.Cache = &v
+	case "cycle":
+		if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
+			return false, err
+		}
+		p.advance()
+		t := true
+		seq.Cycle = &t
+	case "no":
+		// `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
+		p.advance()
+		switch p.peekKeyword() {
+		case "minvalue":
+			if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
+				return false, err
+			}
+			p.advance()
+			seq.MinValue = &seqBound{NoValue: true}
+		case "maxvalue":
+			if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
+				return false, err
+			}
+			p.advance()
+			seq.MaxValue = &seqBound{NoValue: true}
+		case "cycle":
+			if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
+				return false, err
+			}
+			p.advance()
+			f := false
+			seq.Cycle = &f
+		default:
+			return false, newError(SyntaxError,
+				fmt.Sprintf("expected MINVALUE, MAXVALUE, or CYCLE after NO, found %q", p.peekKeyword()))
+		}
+	case "sequence":
+		// `SEQUENCE NAME name` — identity options only; the executor rejects it elsewhere (42601,
+		// sequences.md §13.1).
+		if p.peekKeywordAt(1) != "name" {
+			return false, nil
+		}
+		if err := p.dupCheck(seq.SequenceName != "", "SEQUENCE NAME"); err != nil {
+			return false, err
+		}
+		p.advance()
+		p.advance()
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return false, err
+		}
+		seq.SequenceName = name
+	default:
+		return false, nil
+	}
+	return true, nil
 }
 
 // parseDropSequence parses `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT | CASCADE]`
@@ -2650,8 +2684,40 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 				return nil, err
 			}
 			a := alterColumnAction{Column: column}
-			switch p.peekKeyword() {
-			case "set":
+			setTarget := p.peekKeywordAt(1)
+			isIdentitySet := p.peekKeyword() == "set" && setTarget != "default" && setTarget != "data" && setTarget != "not"
+			switch {
+			case p.peekKeyword() == "restart" || isIdentitySet:
+				// The identity option list (alter.md §2.8): `SET GENERATED …`,
+				// `SET <sequence_option>`, `RESTART …`, in any order.
+				if err := p.parseAlterIdentityOptions(&a); err != nil {
+					return nil, err
+				}
+			case p.peekKeyword() == "add":
+				p.advance()
+				if err := p.expectKeyword("generated"); err != nil {
+					return nil, err
+				}
+				always, err := p.parseGeneratedWhen()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("as"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("identity"); err != nil {
+					return nil, err
+				}
+				var options seqOptions
+				if p.peek().Kind == tokLParen {
+					options, err = p.parseSequenceOptions(true)
+					if err != nil {
+						return nil, err
+					}
+				}
+				a.Kind = alterAddIdentity
+				a.Identity = &identitySpec{Always: always, Options: options}
+			case p.peekKeyword() == "set":
 				p.advance()
 				if p.peekKeyword() == "default" {
 					p.advance()
@@ -2679,11 +2745,21 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 					}
 					a.Kind = alterSetNotNull
 				}
-			case "drop":
+			case p.peekKeyword() == "drop":
 				p.advance()
 				if p.peekKeyword() == "default" {
 					p.advance()
 					a.Kind = alterDropDefault
+				} else if p.peekKeyword() == "identity" {
+					p.advance()
+					a.Kind = alterDropIdentity
+					if p.peekKeyword() == "if" {
+						p.advance()
+						if err := p.expectKeyword("exists"); err != nil {
+							return nil, err
+						}
+						a.IfExists = true
+					}
 				} else {
 					if err := p.expectKeyword("not"); err != nil {
 						return nil, err
@@ -2693,7 +2769,7 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 					}
 					a.Kind = alterDropNotNull
 				}
-			case "type":
+			case p.peekKeyword() == "type":
 				p.advance()
 				if err := p.parseAlterColumnType(&a); err != nil {
 					return nil, err
@@ -2709,6 +2785,81 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 		p.advance()
 	}
 	return at, nil
+}
+
+// parseGeneratedWhen parses `ALWAYS` (true) or `BY DEFAULT` (false) after `GENERATED`.
+func (p *parser) parseGeneratedWhen() (bool, error) {
+	switch p.peekKeyword() {
+	case "always":
+		p.advance()
+		return true, nil
+	case "by":
+		p.advance()
+		if err := p.expectKeyword("default"); err != nil {
+			return false, err
+		}
+		return false, nil
+	default:
+		return false, newError(SyntaxError,
+			fmt.Sprintf("expected ALWAYS or BY DEFAULT after GENERATED, found %q", p.peekKeyword()))
+	}
+}
+
+// parseAlterIdentityOptions parses the identity alteration list of `ALTER [COLUMN] c` (alter.md
+// §2.8, PostgreSQL's alter_identity_column_option_list) into a: one or more of
+// `SET GENERATED { ALWAYS | BY DEFAULT }`, `SET <sequence_option>`, and `RESTART [[WITH] n]`,
+// order-free, each at most once (42601). `SET AS`, `SET RESTART`, and `SET SEQUENCE NAME` are 42601.
+func (p *parser) parseAlterIdentityOptions(a *alterColumnAction) error {
+	a.Kind = alterSetIdentity
+	for {
+		kw := p.peekKeyword()
+		next := p.peekKeywordAt(1)
+		if kw == "restart" {
+			if err := p.dupCheck(a.Restart != nil, "RESTART"); err != nil {
+				return err
+			}
+			p.advance()
+			r := &seqRestart{ToStart: true}
+			if p.peek().Kind == tokInt || p.peek().Kind == tokMinus || p.peekKeyword() == "with" {
+				p.consumeKeyword("with")
+				v, err := p.parseSignedIntLiteral()
+				if err != nil {
+					return err
+				}
+				r = &seqRestart{Value: v}
+			}
+			a.Restart = r
+			continue
+		}
+		if kw != "set" || next == "default" || next == "data" || next == "not" {
+			return nil
+		}
+		p.advance()
+		switch next {
+		case "generated":
+			if err := p.dupCheck(a.Generated != nil, "SET GENERATED"); err != nil {
+				return err
+			}
+			p.advance()
+			always, err := p.parseGeneratedWhen()
+			if err != nil {
+				return err
+			}
+			a.Generated = &always
+		case "as", "restart":
+			return newError(SyntaxError, fmt.Sprintf("sequence option \"%s\" not supported here", next))
+		case "sequence":
+			return newError(SyntaxError, "invalid sequence option SEQUENCE NAME")
+		default:
+			ok, err := p.parseOneSeqOption(&a.SeqOptions)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return newError(SyntaxError, fmt.Sprintf("expected an identity option after SET, found %q", next))
+			}
+		}
+	}
 }
 
 func (p *parser) parseAlterColumnType(a *alterColumnAction) error {
