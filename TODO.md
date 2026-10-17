@@ -596,7 +596,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   WAL: COW + the root swap already give atomicity *and* lock-free concurrency. Trade:
   write-amplification. A **logical** changeset stream is a separate higher-layer door, not
   foreclosed, not scheduled.
-- **Page service (ratified 2026-10-16; phases 1–4 landed).** One owner process alone touches the
+- **Page service (ratified 2026-10-16; phases 1–4 and 6 landed).** One owner process alone touches the
   database file and serves pages and whole-commit deltas to client processes, each running its own
   engine, over a local socket or SSH. It replaced shared multi-process mode at phase 4 (`locking =
   auto`) and carries remote access, backup, and replication. → [page-service.md](spec/design/page-service.md) §16
@@ -653,8 +653,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `client-reclaims` plant.
   - [ ] **Phase 5 — SSH.** `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead
     and subtree fetch.
-  - [ ] **Phase 6 — backup.** Page-identical and compacted forms. This is also jed's answer to SQLite's
-    `sqlite3_backup` / `VACUUM INTO`, locally as well as over SSH.
+  - [x] **Phase 6 — backup.** ✅ **landed** (Rust, Go, TS). Page-identical and compacted forms — jed's
+    answer to SQLite's `sqlite3_backup` / `VACUUM INTO`, locally as well as over SSH. A backup pins one
+    committed snapshot like a reader (never the writer gate) and walks it with its own engine in every
+    role: the page-identical copy keeps every reachable page and the free-list chain at its own index,
+    zeroes the rest, and writes bootstrap meta; the compacted copy is the from-scratch image at
+    `txid + 1`, byte-for-byte what compaction leaves. A page client reads the pages with batched
+    `read_pages`, so the owner needs no new message (`snapshot_stream` stays reserved; page-service.md
+    §9 records why the client walks). Proven by `backup*.process.toml` in every pairing (byte-identical
+    backups across cores, the independent `verify.rb --check-image` decode, a compacted backup equal
+    to the compacted file) and the simulation's `backup` step (service and compaction profiles).
+    - [ ] _follow-on:_ **name the host API and the CLI command.** Today each core has only a test-only
+      entry point (`BackupForTesting` / `backup_for_testing` / `backupForTesting`); the public shape (a
+      destination path and a form, attachments, progress) is a product decision, and cli.md has no
+      backup command yet.
+    - [ ] _follow-on:_ back up a file attachment, and to an OPFS destination (main only today).
   - [ ] **Phase 7 — replication.** The tee, retained log, `subscribe`, lineage and timelines (a format
     change), replicas and read replicas; amend replication.md.
 

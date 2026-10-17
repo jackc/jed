@@ -1,0 +1,314 @@
+# Backups by an owner and its page clients (page-service.md §9; simulation-testing.md §8.3): both forms
+# while other sessions hold pins and the writer gate, backups whose page reads lose the connection
+# (08006), a backup cut by an injected I/O fault, and backups right after recoveries. Generated from
+# the service profile, seed 68.
+# format: simulation
+# profile: service
+# seed: 68
+# page_size: 256
+# cache_bytes: 2048
+# processes: service
+# clock: 1700000000000000
+open w1 write p0
+on w1 CREATE TABLE t1 (id i64 PRIMARY KEY, c1 text, c2 text, c3 i64, c4 bytea)
+on w1 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), md5(g::text || '709.1') || md5(g::text || '709.2') || md5(g::text || '709.3') || md5(g::text || '709.4') || md5(g::text || '709.5') || md5(g::text || '709.6') || md5(g::text || '709.7'), g * 7, NULL FROM generate_series(1, 22) g
+commit w1
+open r1 read p0
+fault disconnect nth=8
+backup compacted
+open r2 read p0
+on r1 SELECT * FROM t1 WHERE id BETWEEN 194 AND 214 ORDER BY id
+on r2 SELECT id % 5 AS k, count(*), max(id) FROM t1 GROUP BY 1
+open r3 read p0
+check
+open w2 write p0
+on w2 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, uuidv4()::text, md5(g::text || '463.1') || md5(g::text || '463.2') || md5(g::text || '463.3') || md5(g::text || '463.4') || md5(g::text || '463.5') || md5(g::text || '463.6') || md5(g::text || '463.7') || md5(g::text || '463.8') || md5(g::text || '463.9') || md5(g::text || '463.10') || md5(g::text || '463.11') || md5(g::text || '463.12') || md5(g::text || '463.13') || md5(g::text || '463.14') || md5(g::text || '463.15') || md5(g::text || '463.16') || md5(g::text || '463.17') || md5(g::text || '463.18') || md5(g::text || '463.19') || md5(g::text || '463.20'), g * 7, decode(repeat(md5(g::text), 35), 'hex') FROM generate_series(23, 37) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c4 = excluded.c4
+close r1
+spawn p2
+backup page_identical p2
+on w2 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, NULL, md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(38, 59) g
+on w2 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), repeat(md5(g::text), 50), g * 7, decode(md5(g::text), 'hex') FROM generate_series(60, 79) g
+on w2 SELECT * FROM t1 WHERE id BETWEEN 45 AND 65 ORDER BY id
+open r4 read p2
+commit w2
+spawn p1
+on r2 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 36
+kill p0
+close r4
+open r5 read p2
+crash power survive=255 tear=112
+open w3 write p0
+spawn p2
+on w3 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), repeat(md5(g::text), 37), g * 7, decode(md5(g::text), 'hex') FROM generate_series(80, 115) g
+on w3 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, repeat(md5(g::text), 24), md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(116, 151) g
+commit w3
+open w4 write p2
+on w4 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, NULL, md5(g::text || '55.1') || md5(g::text || '55.2') || md5(g::text || '55.3') || md5(g::text || '55.4') || md5(g::text || '55.5') || md5(g::text || '55.6') || md5(g::text || '55.7') || md5(g::text || '55.8') || md5(g::text || '55.9') || md5(g::text || '55.10') || md5(g::text || '55.11') || md5(g::text || '55.12') || md5(g::text || '55.13') || md5(g::text || '55.14') || md5(g::text || '55.15') || md5(g::text || '55.16') || md5(g::text || '55.17') || md5(g::text || '55.18') || md5(g::text || '55.19') || md5(g::text || '55.20') || md5(g::text || '55.21') || md5(g::text || '55.22'), g * 7, decode(md5(g::text), 'hex') FROM generate_series(29, 35) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c4 = excluded.c4
+on w4 DELETE FROM t1 WHERE id BETWEEN 108 AND 130
+on w4 SELECT count(*), sum(id) FROM t1
+on w4 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 10
+on w4 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(4, 14) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c4 = excluded.c4
+commit w4
+backup page_identical p0
+spawn p1
+kill p2
+disconnect p1
+open w5 write p1
+on w5 UPDATE t1 SET c1 = c1 || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', c4 = decode(md5(id::text), 'hex') WHERE id BETWEEN 78 AND 94
+on w5 SELECT count(*), sum(id) FROM t1
+on w5 SELECT id % 7 AS k, count(*), max(id) FROM t1 GROUP BY 1
+spawn p2
+on w5 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, uuidv4()::text, uuidv4()::text, g * 7, NULL FROM generate_series(52, 82) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c4 = excluded.c4
+on w5 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(152, 179) g
+on w5 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, NULL, repeat(md5(g::text), 20), g * 7, NULL FROM generate_series(180, 188) g
+open r6 read p2
+disconnect p2
+exit p2
+on w5 ANALYZE t1
+disconnect p1
+disconnect p0
+on w5 UPDATE t1 SET c2 = c2 || 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', c4 = decode(md5(id::text), 'hex') WHERE id BETWEEN 71 AND 93
+spawn p2
+on w5 UPDATE t1 SET c4 = decode(md5(id::text), 'hex') WHERE id BETWEEN 179 AND 207
+on w5 CREATE TABLE t2 (id i64 PRIMARY KEY, c1 i64)
+commit w5
+open w6 write p1
+open r7 read p0
+on w6 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, uuidv4()::text, md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(189, 202) g
+on w6 SELECT 1 / 0
+crash power survive=899 tear=0
+crash power survive=1000 tear=342
+open r8 read p0
+open w7 write p0
+commit w7
+open r9 read p0
+backup page_identical p0
+on r9 SELECT id % 4 AS k, count(*), max(id) FROM t2 GROUP BY 1
+open w8 write p0
+spawn p2
+backup page_identical p0
+rollback w8
+spawn p1
+close r9
+crash process
+open r10 read p0
+open w9 write p0
+spawn p2
+on w9 CREATE INDEX ix1 ON t1 (c3)
+on w9 CREATE TABLE t3 (id i64 PRIMARY KEY, c1 text, c2 i32, c3 i64, c4 bytea)
+on r10 SELECT count(*), sum(id) FROM t1
+on w9 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), md5(g::text || '40.1') || md5(g::text || '40.2') || md5(g::text || '40.3') || md5(g::text || '40.4') || md5(g::text || '40.5') || md5(g::text || '40.6') || md5(g::text || '40.7') || md5(g::text || '40.8') || md5(g::text || '40.9') || md5(g::text || '40.10') || md5(g::text || '40.11') || md5(g::text || '40.12') || md5(g::text || '40.13') || md5(g::text || '40.14') || md5(g::text || '40.15') || md5(g::text || '40.16') || md5(g::text || '40.17') || md5(g::text || '40.18') || md5(g::text || '40.19') || md5(g::text || '40.20') || md5(g::text || '40.21') || md5(g::text || '40.22') || md5(g::text || '40.23') || md5(g::text || '40.24'), g * 7, decode(md5(g::text), 'hex') FROM generate_series(189, 214) g
+exit p0
+open w10 write p2
+on w10 SELECT * FROM t1 WHERE id BETWEEN 225 AND 245 ORDER BY id
+commit w10
+open w11 write p2
+clock +496463
+on w11 DELETE FROM t1 WHERE id % 5 = 2
+backup compacted p2
+open r11 read p2
+on w11 INSERT INTO t2 (id, c1) SELECT g, g * 7 FROM generate_series(1, 12) g ON CONFLICT (id) DO NOTHING
+on w11 DELETE FROM t2 WHERE id % 6 = 0
+on w11 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), NULL, g * 7, decode(md5(g::text), 'hex') FROM generate_series(189, 198) g
+open r12 read p2
+spawn p0
+on w11 INSERT INTO t2 (id, c1) SELECT g, g * 7 FROM generate_series(13, 26) g
+open r13 read p2
+on w11 ALTER TABLE t2 ADD COLUMN c2x1 i32
+on w11 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 67 + 10) % 1000 FROM generate_series(13, 50) g ON CONFLICT (id) DO UPDATE SET c2x1 = excluded.c2x1
+on r13 SELECT * FROM t2 WHERE id BETWEEN 96 AND 116 ORDER BY id
+on w11 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, repeat(md5(g::text), 23), md5(g::text || '379.1') || md5(g::text || '379.2') || md5(g::text || '379.3') || md5(g::text || '379.4') || md5(g::text || '379.5') || md5(g::text || '379.6') || md5(g::text || '379.7'), g * 7, decode(repeat(md5(g::text), 22), 'hex') FROM generate_series(199, 221) g
+on w11 DELETE FROM t1 WHERE id % 5 = 3
+on w11 UPDATE t1 SET c1 = uuidv4()::text, c2 = md5(id::text), c4 = decode(md5(id::text), 'hex') WHERE id % 6 = 1
+on r12 SELECT * FROM t2 ORDER BY md5(id::text) LIMIT 29
+open r14 read p2
+on w11 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, NULL, md5(g::text), g * 7, NULL FROM generate_series(222, 259) g
+on w11 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(131, 146) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c4 = excluded.c4
+spawn p1
+fault disconnect nth=6
+backup compacted
+on w11 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 90 + 15) % 1000 FROM generate_series(41, 66) g ON CONFLICT (id) DO UPDATE SET c2x1 = excluded.c2x1
+on w11 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 77 + 18) % 1000 FROM generate_series(67, 74) g
+fault process_crash issue=937 nth=1
+commit w11
+exit p1
+spawn p1
+open w12 write p2
+crash process
+open r15 read p0
+open w13 write p0
+on w13 CREATE TABLE IF NOT EXISTS t2 (id i64 PRIMARY KEY, c1 i64)
+on w13 ALTER TABLE t2 ADD COLUMN IF NOT EXISTS c2x1 i32
+on w13 UPDATE t2 SET c2x1 = (c2x1 + 1) % 1000 WHERE id BETWEEN 53 AND 59
+spawn p2
+on w13 CREATE TABLE IF NOT EXISTS t1 (id i64 PRIMARY KEY, c1 text, c2 text, c3 i64, c4 bytea)
+on w13 DELETE FROM t1 WHERE id BETWEEN 162 AND 177
+on w13 DELETE FROM t1 WHERE id % 6 = 0
+commit w13
+disconnect p2
+clock +1629129
+on r15 SELECT id % 3 AS k, count(*), max(id) FROM t1 GROUP BY 1
+reopen
+clock +807186
+open w14 write p0
+open r16 read p0
+backup compacted p0
+on w14 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, repeat(md5(g::text), 56), md5(g::text), g * 7, decode(repeat(md5(g::text), 10), 'hex') FROM generate_series(260, 277) g
+on w14 UPDATE t2 SET c2x1 = (c2x1 + 1) % 1000 WHERE id % 4 = 0
+on w14 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), md5(g::text), g * 7, decode(repeat(md5(g::text), 34), 'hex') FROM generate_series(278, 284) g
+spawn p2
+on w14 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), uuidv4()::text, g * 7, decode(repeat(md5(g::text), 9), 'hex') FROM generate_series(120, 136) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c4 = excluded.c4
+on r16 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 33
+on w14 DELETE FROM t2 WHERE id BETWEEN 31 AND 43
+close r16
+spawn p1
+reopen
+reopen
+open r17 read p0
+open w15 write p0
+fault power_loss survive=538 tear=195 nth=2
+commit w15
+spawn p2
+crash process
+spawn p1
+open w16 write p1
+on w16 DELETE FROM t1 WHERE id % 7 = 3
+exit p0
+on w16 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text || '764.1') || md5(g::text || '764.2') || md5(g::text || '764.3') || md5(g::text || '764.4') || md5(g::text || '764.5') || md5(g::text || '764.6') || md5(g::text || '764.7') || md5(g::text || '764.8') || md5(g::text || '764.9'), md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(260, 262) g
+commit w16
+open r18 read p1
+close r18
+spawn p0
+open w17 write p0
+spawn p2
+on w17 UPDATE t1 SET c1 = md5(id::text), c4 = NULL WHERE id BETWEEN 58 AND 72
+open r19 read p0
+on w17 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(263, 278) g
+on w17 DELETE FROM t1 WHERE id % 4 = 1
+on w17 CREATE INDEX ix2 ON t1 (c3)
+on w17 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 13 + 41) % 1000 FROM generate_series(75, 79) g
+on w17 UPDATE t2 SET c2x1 = (c2x1 + 1) % 1000 WHERE id BETWEEN 77 AND 87
+commit w17
+open r20 read p0
+check
+on r20 SELECT * FROM t1 WHERE id BETWEEN 260 AND 280 ORDER BY id
+open r21 read p2
+open r22 read p2
+open w18 write p1
+on w18 DELETE FROM t1 WHERE id % 2 = 0
+commit w18
+close r19
+open r23 read p2
+disconnect p2
+open w19 write p0
+on w19 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), md5(g::text), g * 7, decode(md5(g::text), 'hex') FROM generate_series(279, 309) g
+fault power_loss survive=736 tear=196 nth=1
+backup page_identical
+reopen
+open r24 read p0
+crash process
+reopen
+open w20 write p0
+on w20 DROP TABLE IF EXISTS t2
+spawn p1
+on w20 UPDATE t1 SET c1 = repeat(md5(id::text), 60), c4 = decode(md5(id::text), 'hex') WHERE id % 3 = 2
+on w20 ANALYZE t1
+fault disconnect nth=1
+commit w20
+open r25 read p1
+exit p0
+open w21 write p1
+open r26 read p1
+on w21 UPDATE t1 SET c2 = md5(id::text), c4 = decode(md5(id::text), 'hex') WHERE id BETWEEN 143 AND 154
+check
+spawn p0
+on w21 INSERT INTO t1 (id, c1, c2, c3, c4) SELECT g, md5(g::text), uuidv4()::text, g * 7, decode(md5(g::text), 'hex') FROM generate_series(279, 317) g
+on w21 SELECT * FROM t1 ORDER BY md5(id::text) LIMIT 6
+fault io_error op=sync nth=2
+commit w21
+spawn p2
+open r27 read p2
+open r28 read p2
+on r26 SELECT * FROM t2 ORDER BY id LIMIT 10
+disconnect p2
+check
+check
+on r25 SELECT count(*), sum(id) FROM t1
+reopen
+check
+open r29 read p0
+spawn p1
+on r29 SELECT * FROM t2 ORDER BY md5(id::text) LIMIT 21
+on r29 SELECT id % 5 AS k, count(*), max(id) FROM t1 GROUP BY 1
+on r29 SELECT count(*), sum(id) FROM t2
+on r29 SELECT count(*), sum(id) FROM t2
+disconnect p0
+spawn p2
+open r30 read p0
+close r29
+open r31 read p1
+kill p0
+close r31
+disconnect p1
+open w22 write p2
+on w22 CREATE TABLE IF NOT EXISTS t2 (id i64 PRIMARY KEY, c1 i64)
+on w22 ALTER TABLE t2 ADD COLUMN IF NOT EXISTS c2x1 i32
+on w22 CREATE UNIQUE INDEX ix3 ON t2 (c1)
+on w22 CREATE TABLE IF NOT EXISTS t1 (id i64 PRIMARY KEY, c1 text, c2 text, c3 i64, c4 bytea)
+on w22 CREATE INDEX IF NOT EXISTS ix2 ON t1 (c3)
+on w22 SELECT * FROM t1 WHERE id = 63
+on w22 UPDATE t2 SET c2x1 = (c2x1 + 1) % 1000 WHERE id % 4 = 2
+on w22 UPDATE t2 SET c2x1 = (id * 28) % 1000 WHERE id BETWEEN 25 AND 29
+commit w22
+disconnect p1
+open w23 write p2
+on w23 SELECT count(*), sum(id) FROM t2
+on w23 UPDATE t1 SET c1 = c1 || 'xxxxxxxxxxxxxxxxxx', c2 = md5(id::text), c4 = decode(md5(id::text), 'hex') WHERE id BETWEEN 273 AND 293
+on w23 CREATE INDEX ix4 ON t2 (c2x1)
+on w23 CREATE SEQUENCE IF NOT EXISTS s1
+on w23 SELECT nextval('s1')
+commit w23
+spawn p0
+check
+fault disconnect nth=8
+backup page_identical
+open w24 write p0
+backup page_identical p2
+open r32 read p0
+open r33 read p0
+open r34 read p1
+on r34 SELECT * FROM t1 WHERE id BETWEEN 25 AND 45 ORDER BY id
+disconnect p0
+open r35 read p2
+disconnect p0
+on w24 DELETE FROM t1 WHERE id BETWEEN 2 AND 25
+clock +3162997
+on w24 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 4 + 10) % 1000 FROM generate_series(80, 101) g
+on w24 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 92 + 18) % 1000 FROM generate_series(102, 120) g
+check
+on w24 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 28 + 43) % 1000 FROM generate_series(121, 152) g
+on w24 UPDATE t1 SET c2 = md5(id::text || '758.1') || md5(id::text || '758.2') || md5(id::text || '758.3') || md5(id::text || '758.4') || md5(id::text || '758.5') || md5(id::text || '758.6') || md5(id::text || '758.7') || md5(id::text || '758.8') || md5(id::text || '758.9') || md5(id::text || '758.10') || md5(id::text || '758.11') || md5(id::text || '758.12') || md5(id::text || '758.13') || md5(id::text || '758.14'), c4 = decode(md5(id::text), 'hex') WHERE id % 7 = 0
+on w24 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 49 + 29) % 1000 FROM generate_series(19, 26) g ON CONFLICT (id) DO UPDATE SET c2x1 = excluded.c2x1
+backup compacted p0
+on w24 INSERT INTO t2 (id, c1, c2x1) SELECT g, g * 7, (g * 72 + 29) % 1000 FROM generate_series(153, 192) g
+disconnect p0
+on w24 DELETE FROM t1 WHERE id BETWEEN 50 AND 56
+exit p2
+check
+on r32 SELECT * FROM t1 ORDER BY id LIMIT 9
+on w24 DROP TABLE IF EXISTS t1
+on w24 ALTER TABLE t2 ADD COLUMN c3x2 i32
+spawn p2
+rollback w24
+on r34 SELECT * FROM t1 WHERE id BETWEEN 213 AND 233 ORDER BY id
+close r32
+disconnect p0
+disconnect p2
+crash process
+open w25 write p0
+spawn p1
+spawn p2
+on w25 DELETE FROM t1 WHERE id BETWEEN 17 AND 46
+commit w25
+reopen
+check
