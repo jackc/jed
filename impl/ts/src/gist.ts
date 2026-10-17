@@ -399,14 +399,26 @@ export function serializeGistTree(
   alloc: () => number,
 ): { pages: GistPage[]; root: number } {
   const pages: GistPage[] = [];
-  const root = serializeNode(tree.root, ops, pages, alloc);
+  const root = serializeGistTreeTo(tree, ops, alloc, (p) => pages.push(p));
   return { pages, root };
+}
+
+// serializeGistTreeTo is serializeGistTree handing each page to emit as soon as it is encoded (the same
+// pages, in the same order), so a caller that writes pages out — host compaction's image stream — never
+// holds the index's pages at once. Returns the root page.
+export function serializeGistTreeTo(
+  tree: GistTree,
+  ops: GistOpclass[],
+  alloc: () => number,
+  emit: (page: GistPage) => void,
+): number {
+  return serializeNode(tree.root, ops, emit, alloc);
 }
 
 function serializeNode(
   node: GistNode,
   ops: GistOpclass[],
-  pages: GistPage[],
+  emit: (page: GistPage) => void,
   alloc: () => number,
 ): number {
   if (node.leaf) {
@@ -416,7 +428,7 @@ function serializeNode(
       parts.push(be16(b.length), b, be16(e.skey.length), e.skey);
     }
     const pageNo = alloc();
-    pages.push({
+    emit({
       pageNo,
       pageType: PAGE_GIST_LEAF,
       itemCount: node.entries.length,
@@ -425,14 +437,14 @@ function serializeNode(
     return pageNo;
   }
   // Children first (post-order), in the node's canonical entry order.
-  const childPages = node.children.map((c) => serializeNode(c.node, ops, pages, alloc));
+  const childPages = node.children.map((c) => serializeNode(c.node, ops, emit, alloc));
   const parts: Uint8Array[] = [];
   for (let i = 0; i < node.children.length; i++) {
     const b = encodeBoundTuple(ops, node.children[i]!.bound);
     parts.push(be16(b.length), b, be32(childPages[i]!));
   }
   const pageNo = alloc();
-  pages.push({
+  emit({
     pageNo,
     pageType: PAGE_GIST_INTERIOR,
     itemCount: node.children.length,

@@ -927,7 +927,9 @@ class SharedCore {
   // maintenanceCommit is the owner-only free-list rebuild after client commits (page-service.md §6): a
   // client commit never walks the database, so when the pages off the free list pass the reclamation threshold
   // and no pin holds back reclamation, the owner commits the unchanged snapshot at the next txid with
-  // in-commit reclamation. Called holding the gate, after adoption.
+  // in-commit reclamation. A client commit never lowers the high-water either, so the owner also commits
+  // when the free list ends at the high-water, and that commit truncates it (format.md *Trailing
+  // truncation*). Called holding the gate, after adoption.
   private maintenanceCommit(): void {
     const st = this.storage;
     const prev = this.committed;
@@ -936,7 +938,8 @@ class SharedCore {
     if (
       !(
         st.liveAtCompaction === 0 ||
-        reclaimDue(st.pageCount, st.freePages.length, st.liveAtCompaction)
+        reclaimDue(st.pageCount, st.freePages.length, st.liveAtCompaction) ||
+        st.freePages[st.freePages.length - 1] === st.pageCount - 1
       )
     ) {
       return;
@@ -1046,7 +1049,7 @@ class SharedCore {
     const client = this.client!;
     const budget: BudgetCtx = { name: "main", prev: this.committed, canCompact: false, stagesRows };
     try {
-      persistImpl(this.storage, snap, false, client.reuseGrant, budget);
+      persistImpl(this.storage, snap, false, client.reuseGrant, budget, false);
     } catch (error) {
       // A lost acknowledgement: the outcome is resolved by re-election (README §6.5).
       const lost = client.lostCommit(error);

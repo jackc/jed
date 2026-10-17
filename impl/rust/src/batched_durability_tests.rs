@@ -433,3 +433,106 @@ fn synchronous_on_keeps_txid_parity_slots() {
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Trailing truncation under synchronous = off (validated-cow.md §4, format.md *Trailing
+/// truncation*): only a commit that begins with nothing pending lowers the high-water, and the file
+/// is shortened only at the barrier that makes the lowering generation durable — the batch's cap
+/// flush or close — never while the batch is pending. A table dropped at the top of the file leaves a
+/// long free run there once a flush lets reclamation list its pages; until then the relaxed churn
+/// grows the file past it. Mirrors the Go TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff.
+#[test]
+fn relaxed_trailing_truncation_waits_for_the_flush() {
+    const PAGE: u32 = 4096;
+    let dir = scratch("truncate");
+    let path = dir.join("truncate.jed");
+    let mut db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        page_size: PAGE,
+        skip_fsync: true,
+        ..CreateOptions::default()
+    })
+    .unwrap();
+    exec(
+        &mut db,
+        "CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)",
+    );
+    exec(
+        &mut db,
+        "INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 100) g",
+    );
+    exec(&mut db, "CREATE TABLE big (id i64 PRIMARY KEY, pad text)");
+    exec(
+        &mut db,
+        "INSERT INTO big SELECT g, repeat('z', 300) FROM generate_series(1, 20000) g",
+    );
+    db.close().unwrap();
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            synchronous: Synchronous::Off,
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
+    db.0.storage.lock().unwrap().inline_flush = true;
+    let len = || std::fs::metadata(&path).unwrap().len();
+    let state = |db: &Database| {
+        let st = db.0.storage.lock().unwrap();
+        let pending = st.paging.pager().has_pending();
+        (st.page_count, pending)
+    };
+    let mut peak = state(&db).0;
+    exec(&mut db, "DROP TABLE big");
+    let mut deferred = false;
+    for k in 0..1500u32 {
+        let (before, (high, pending_before)) = (len(), state(&db));
+        exec(
+            &mut db,
+            &format!(
+                "UPDATE t SET pad = 'r{k}' || repeat('y', 200), n = n + 7 WHERE id = {}",
+                1 + k % 100
+            ),
+        );
+        let (length, (pc, pending)) = (len(), state(&db));
+        peak = peak.max(pc);
+        assert!(
+            !(pending_before && pc < high),
+            "commit {k} lowered the high-water from {high} to {pc} inside a pending batch"
+        );
+        assert!(
+            !(pending && length < before),
+            "commit {k} shortened the file from {before} to {length} bytes while its batch is pending"
+        );
+        let limit = (pc as u64 + crate::pager::growth_step(pc, PAGE) as u64) * PAGE as u64;
+        if pending && pc < high && length > limit {
+            deferred = true; // lowered now, shortened at the batch's flush
+        }
+    }
+    let pc = state(&db).0;
+    assert!(
+        pc * 3 <= peak,
+        "trailing truncation should return the dropped table's pages: {peak} pages at the peak, {pc} after churn"
+    );
+    assert!(
+        deferred,
+        "no relaxed commit lowered the high-water with its shrink left to the flush"
+    );
+    db.close().unwrap();
+    let limit = (pc as u64 + crate::pager::growth_step(pc, PAGE) as u64) * PAGE as u64;
+    assert!(
+        len() <= limit,
+        "close flushed the batch but left the file {} bytes (at most {limit})",
+        len()
+    );
+    let mut re = Database::open(&path).unwrap();
+    assert_eq!(state(&re).0, pc, "reopened page count");
+    let mut s = re.session(SessionOptions::default());
+    let mut rows = s.query("SELECT count(*) FROM t", &[]).unwrap();
+    let row = rows.next().expect("a count row");
+    assert!(matches!(row[0], Value::Int(100)), "reopened count");
+    drop(rows);
+    drop(s);
+    re.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

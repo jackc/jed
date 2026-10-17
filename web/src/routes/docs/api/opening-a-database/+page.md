@@ -94,8 +94,10 @@ leases.
 
 ## Reclaiming space (compaction)
 
-jed reuses the pages that deletes and updates free, but a file never shrinks by itself: after a big
-delete it keeps its peak size. To give that space back, compact the database:
+jed reuses the pages that deletes and updates free. When the free pages are at the end of a file, a
+later commit cuts them off and the file gets shorter by itself, but free pages in the middle of the
+file stay there, so after a big delete the file can stay close to its peak size. To give all of that
+space back, compact the database:
 `db.compact("main")` (Rust), `db.Compact("main")` (Go), or `db.compact("main")` (TypeScript). Pass
 an attachment's name to compact that database instead. The name is matched exactly, as given when
 the database was attached.

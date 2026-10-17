@@ -151,7 +151,12 @@ never refresh meta: every commit to the file passes through it.
   (never waited for) and a drained watermark (no local reader and no client pin), and fails `55006`
   otherwise; a client's compaction fails `55006`. The stable lock bundle stays locked while the new
   image is renamed into place; connected clients see a reset invalidation window and reload.
-- **Trailing truncation** has the same rules.
+- **Trailing truncation** (format.md *Trailing truncation*) is part of the owner's own commits and
+  maintenance commits, never a client's: it truncates only free-list pages the reuse gate (the same
+  watermark, counting client pins) lets the commit reuse. It never waits and never fails; when the
+  gate is closed the commit simply keeps its high-water. Under `synchronous = off` the shrink waits
+  for the owner's flush; the flush before granting a client's `begin_write` shrinks nothing
+  (validated-cow.md §4).
 
 ## 7. Host/API surface
 

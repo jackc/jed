@@ -1,8 +1,8 @@
 # Deterministic simulation testing — design
 
-> **Status: S1–S9 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
+> **Status: S1–S10 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
 > retired with shared mode and succeeded by S8, an owner and its page clients), including spill faults, temp-table spill, file
-> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, and batched durability (S9). A seeded simulator that runs long, randomized
+> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, batched durability (S9), and trailing truncation (S10). A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
 > becomes a regression test. It targets the **storage, commit, and recovery state machine**
@@ -189,7 +189,9 @@ Each file implements `BlockStore` over three pieces of state:
 
 `write_at` appends a pending version and updates the cache. A successful `sync` makes every pending
 write durable. A growing `set_size` does too: it is a full `fsync` by contract (hosts.md §2.1).
-`read_at` serves the cache.
+A shrinking `set_size` (trailing truncation, format.md) cuts the cache, the durable bytes, and the
+pending writes past the new length at once: the most destructive outcome, as if the truncation
+reached the disk before anything still pending. `read_at` serves the cache.
 
 ### 6.2 Content-keyed fault decisions
 
@@ -420,6 +422,24 @@ wrote; `free` is the in-memory free list the next commit allocates from. A commi
 relaxed batch is exempt from both assertions: it reuses only pages free at the floor and keeps the
 batch's pages off the free list by design (validated-cow.md §4). Only its bounds carry forward.
 
+**Trailing truncation** (format.md *Trailing truncation*) is checked exactly after every quiet
+commit, since a quiet commit always passes the reuse gate. Let `P₀` be the high-water before the
+commit, `k` the start of the free list's trailing run below it (`k = P₀` when page `P₀ − 1` is not
+free), and `w` one more than the highest page index the step wrote. The commit's high-water must be
+exactly `max(k, w)`: the tree pages take the lowest free pages, so whatever of the run they leave is
+truncated, and every page drawn after that comes from the high-water at `k`. This one equation
+also pins ordinary growth (with no trailing run it reads `max(P₀, w)`). After a commit that lowered
+the high-water to `P`, the file must be at most `P + clamp(P, floor, cap)` pages long (pager.md
+§7), so the shrink happened and kept no more than one growth step.
+
+Under `synchronous = off` (validated-cow.md §4) the same equation holds for a commit that begins
+with nothing pending. A commit that begins with a non-empty pending set never lowers the high-water,
+so its high-water must be exactly `max(P₀, w)`. Its shrink is deferred, so the length bound is checked
+instead when the engine next holds nothing pending (after the batch cap's flush or a clean close),
+against the newest generation's high-water. And after every step the file must be at least as long
+as the durable floor's `page_count`: while a batch is pending the floor is the one generation recovery
+is sure to find, and a shrink that cut its pages would leave it unusable.
+
 **Two more violations** need no checker: any statement or commit that reports `XX001` (corruption
 must never surface outside corruption mode), and **snapshot isolation** — when a reader closes, its
 digest must be one recorded for the version it pinned, however many commits, reclamations, and page
@@ -520,6 +540,7 @@ defaults, which `mixed.toml` restates):
 | `corruption` | `corrupt` steps, with and without `reseal` |
 | `service` | An owner and page clients: spawns, exits, kills, lost connections, client commits, promotion (S8); half the traces relaxed |
 | `relaxed` | `synchronous = off`: batched commits, cap flushes, crashes and faulted commits mid-batch and at the flush (S9) |
+| `truncation` | Bulk inserts, heavy deletes and drops, then long quiet runs, so commits lower the high-water and shorten the file (S10); half the traces relaxed |
 
 A profile changes what is emitted, never what is checked: every oracle runs on every trace.
 
@@ -720,6 +741,31 @@ primitive) gets a simulated implementation.
    the file grows and each growth's full fsync makes the batch durable early. Only one or two in a hundred `relaxed` traces catch
    a plant that drops it, so each core carries a deterministic unit test instead — a crash that lands
    only a batch's second commit, whose meta must be rejected.
+
+10. **S10 — Trailing truncation. Landed.** The exact high-water check after every quiet commit and the
+    file-length bound after a commit that lowered it (§8.3), the shrinking `set_size` of the simulated
+    disk (§6.1), and the `truncation` profile, whose deletes, drops, and long quiet runs make
+    reclamation list the dead top of a file and the next commit cut it off. The service model's
+    maintenance commit now also follows a client commit that leaves the free list ending at the
+    high-water. Each protection is held to a plant (60 seeds of its profile):
+
+    | Planted bug | Profile | Traces that caught it |
+    |---|---|---|
+    | a commit never truncates | `truncation` | 58 / 60 |
+    | truncation also takes the commit's own orphans, still the fallback's pages | `truncation` | 58 / 60 |
+
+    A plant that truncated pages despite the reuse gate was dropped: in one process every reader pins a
+    version at or after the free list's generation (a rebuild waits for older readers), so it changed
+    nothing a trace could observe. No engine bug surfaced.
+
+    Rebased onto batched durability (S9), half the `truncation` traces run relaxed, and the oracles add
+    the relaxed rules of §8.3: no lowering inside a pending batch, the deferred shrink checked at the
+    flush, and the file never shorter than the durable floor's high-water. Two more plants:
+
+    | Planted bug | Profile | Traces that caught it |
+    |---|---|---|
+    | a relaxed commit shrinks the file before its batch's flush | `truncation` | 8 / 60 |
+    | the flush that ends a batch never shrinks a file the batch lowered | `truncation` | 25 / 60 |
 
 ## 15. Open questions
 

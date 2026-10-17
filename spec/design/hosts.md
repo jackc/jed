@@ -133,16 +133,16 @@ which it already does.
   the allocation is durable. A host that can only resize logically (a sparse truncate, no
   allocating write/`fsync`) stays **correct** but pays the file-growth metadata journal on the
   *next* `sync()` (the ~4.3 ms growing-file cost) — it forfeits the optimization, not
-  correctness. (Truncation/shrink needs no barrier, and the engine is **grow-only today** —
-  free-list reuse recycles space but never returns it to the OS, so `set_size` is effectively
-  durable-grow. **File shrinking is a deferred feature** whose decided approach is `to_image`-based
-  whole-image compaction — re-serialize the committed snapshot into a fresh, smaller file — which
-  reaches the seam as a normal smaller write, not an in-place truncate; the lighter trailing-free
-  truncation variant is the only path that would call `set_size` *down*. storage.md §6.)
+  correctness. (Truncation/shrink needs no barrier. Whole-file compaction reaches the seam as a
+  fresh, smaller file written and renamed into place; the in-place trailing-free truncation is the
+  one path that calls `set_size` *down*, after a commit's final barrier (under `synchronous = off`,
+  the batch's flush), and treats a failed shrink
+  as harmless — storage.md §6, format.md *Trailing truncation*.)
 - **The physical file length is `≥` the logical `page_count`.** The pager tracks
   `allocated_pages` (= `size() / page_size`, the physical high-water that preallocation runs
   ahead) distinct from the committed logical `page_count` the meta records (storage.md §9). The
-  slack pages in `[page_count, allocated_pages)` are **unreferenced trailing zeros** — no
+  slack pages in `[page_count, allocated_pages)` are **unreferenced** (zeros, or stale pages a
+  trailing truncation kept as slack) — no
   byte-contract impact (they are past the high-water; the goldens and `create`'s from-scratch
   image are not preallocated, so they stay byte-exact). A host never needs to know about the
   distinction; it only sees `size()`/`set_size`.

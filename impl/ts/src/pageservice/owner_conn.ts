@@ -795,25 +795,25 @@ export class Connection {
       return;
     }
     let due: boolean;
+    let quiet = false;
     let live = 0;
     state.lock();
     try {
       state.unpinLocked(w.base, 1);
       state.publishLocked(d.txid, d.meta, d.written);
       state.bumpEpoch();
-      // A maintenance commit is due when the pages off the free list passed the reclamation
-      // threshold (format.md *Reclamation*) and no pin — every pin is older than the next txid —
-      // holds back reclamation (README §6.4). The high-water bounds that count from above, so the
-      // committed free list is read below only when the high-water alone passes.
+      // A maintenance commit is due when no pin — every pin is older than the next txid — holds back
+      // reclamation (README §6.4) and either the pages off the free list passed the reclamation
+      // threshold (format.md *Reclamation*) or the free list ends at the high-water, which the
+      // maintenance commit then truncates (format.md *Trailing truncation*). The committed free list
+      // is read below to decide.
       live = state.liveAtCompactionLocked();
-      due =
-        state.oldestPinnedLocked() === null &&
-        state.engineOldestLocked() === null &&
-        (live === 0 || reclaimDue(d.parsed.pageCount, 0, live));
+      quiet = state.oldestPinnedLocked() === null && state.engineOldestLocked() === null;
+      due = quiet && live === 0;
     } finally {
       state.unlock();
     }
-    if (due && live !== 0) {
+    if (quiet && live !== 0) {
       let free: number[] | null;
       try {
         free = readFreeListChain(
@@ -826,7 +826,10 @@ export class Connection {
       }
       // An unreadable chain hands the gate over anyway: the engine's maintenance commit decides
       // again from the free list it adopts.
-      due = free === null || reclaimDue(d.parsed.pageCount, free.length, live);
+      due =
+        free === null ||
+        reclaimDue(d.parsed.pageCount, free.length, live) ||
+        free[free.length - 1] === d.parsed.pageCount - 1;
     }
     const maintenance = this.db.maintenanceDue(due);
     const n = this.pins.get(w.base) ?? 0;

@@ -125,8 +125,10 @@ func (p *pager) pendingEntries() []manifestEntry {
 
 // flushPending is a flush (validated-cow.md §4): one durable barrier makes every pending commit
 // durable, so the newest meta — in the non-floor slot — becomes the floor. A failed barrier poisons the
-// pager (sync), so the next commit and close report it.
-func (p *pager) flushPending() error {
+// pager (sync), so the next commit and close report it. shrink lets a flush that follows a lowering
+// commit shorten the file (settleTruncation); a page client's begin_write flush passes false and leaves
+// the shrink to the owner's next barrier (format.md *Trailing truncation*).
+func (p *pager) flushPending(shrink bool) error {
 	if len(p.pending) == 0 {
 		return nil
 	}
@@ -135,6 +137,9 @@ func (p *pager) flushPending() error {
 	}
 	p.floorSlot ^= 1
 	p.pending = nil
+	if shrink {
+		p.shrinkAfterBarrier()
+	}
 	return nil
 }
 
@@ -332,6 +337,19 @@ func commitManifest(ps uint32, txid uint64, root, pageCount, head, livePages uin
 	return meta, pages
 }
 
+// trailingRun splits the sorted safe free pages at the start k of their trailing run below the
+// high-water: every page in [k, high) is in safe (format.md *Trailing truncation*). It returns the
+// pages below k and k itself; k == high when page high−1 is not safe.
+func trailingRun(safe []uint32, high uint32) ([]uint32, uint32) {
+	k := high
+	n := len(safe)
+	for n > 0 && safe[n-1] == k-1 {
+		n--
+		k--
+	}
+	return safe[:n], k
+}
+
 type validatedCommitPlan struct {
 	pages           []dirtyPage // free-list pages, then manifest overflow
 	meta            []byte
@@ -343,9 +361,12 @@ type validatedCommitPlan struct {
 	dirty []manifestEntry
 }
 
-// planValidatedCommit plans the free list and manifest. pending is the batch's pending set (nil under
-// synchronous = on): its pages join the manifest and stay off the free list (validated-cow.md §4).
-func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool) (validatedCommitPlan, error) {
+// planValidatedCommit plans a file commit's free-list and manifest pages and its meta. pending is the
+// batch's pending set (nil under synchronous = on): its pages join the manifest and stay off the free
+// list (validated-cow.md §4). truncate lets the plan lower the high-water past the trailing run of safe
+// free pages (format.md *Trailing truncation*): only an owner's (or an alone process's) own commit that
+// plans against a durable floor — nothing pending — sets it, never a page client's planned delta.
+func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse, truncate bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool) (validatedCommitPlan, error) {
 	candidates, live, gen, err := freeListCandidates(snap, paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending)
 	if err != nil {
 		return validatedCommitPlan{}, err
@@ -363,13 +384,26 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		}
 		safe = filtered
 	}
+	base := write.pageCount
+	if truncate {
+		var k uint32
+		safe, k = trailingRun(safe, base)
+		if k < base {
+			base = k
+			cut := len(candidates)
+			for cut > 0 && candidates[cut-1] >= k {
+				cut--
+			}
+			candidates = candidates[:cut]
+		}
+	}
 	ps := int(pageSize)
 	reserved := 0
 	for {
 		ids := make([]uint32, reserved)
 		drawn := min(len(safe), reserved)
 		copy(ids, safe[:drawn])
-		next := write.pageCount
+		next := base
 		for i := drawn; i < reserved; i++ {
 			if next == ^uint32(0) {
 				return validatedCommitPlan{}, newError(ProgramLimitExceeded, "database page limit exceeded")

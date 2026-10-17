@@ -558,6 +558,8 @@ struct SimDb {
     high: u32,
     /// The free list the next commit allocates from.
     free: u32,
+    /// Where that free list's trailing run below `high` starts (`high`: none).
+    trail: u32,
     /// ≥ the engine's live-at-last-reclamation.
     lac_bound: u32,
     /// The previous commit in this lifetime.
@@ -566,6 +568,14 @@ struct SimDb {
     /// commit allocates from the high-water and keeps the batch's pages off the free list
     /// (validated-cow.md §4), so the bounded-growth assertions do not apply to it.
     batch_open: bool,
+    /// Whether the step began with a non-empty pending set: a commit then plans inside a batch and
+    /// may not lower the high-water (validated-cow.md §4). Unlike `batch_open` it is false after a
+    /// recovery whose adopted generation awaits stabilization, which the commit's own first barrier
+    /// makes the floor.
+    batch_pending: bool,
+    /// Set when a relaxed commit lowered the high-water: the next flush (the batch cap, close) must
+    /// shorten the file (format.md *Trailing truncation*).
+    shrink_due: bool,
     /// Set when an owner died under synchronous = off: until a process observes main again, it may
     /// have recovered any version from the floor up.
     owner_lost: bool,
@@ -593,9 +603,12 @@ impl SimDb {
             max_attempted: 0,
             high: 0,
             free: 0,
+            trail: 0,
             lac_bound: 0,
             last: Growth::default(),
             batch_open: false,
+            batch_pending: false,
+            shrink_due: false,
             owner_lost: false,
         }
     }
@@ -1518,7 +1531,10 @@ impl<'a> Runner<'a> {
             .collect();
         for name in self.order() {
             let open = self.relaxed && !self.engine_flushed(&name);
-            self.sdb(&name).batch_open = open;
+            let pending = self.relaxed && self.engine_pending(&name);
+            let d = self.sdb(&name);
+            d.batch_open = open;
+            d.batch_pending = pending;
         }
         if let Some(pid) = self.step_pid(st)
             && st.kind != "spawn"
@@ -1622,6 +1638,12 @@ impl<'a> Runner<'a> {
             drop(disk);
             if let Some(msg) = violation {
                 self.fail(i, msg);
+                return false;
+            }
+        }
+        // Checked against the floor this step leaves (a flush in the step moved it).
+        for name in self.order() {
+            if !self.check_truncated(i, &name) {
                 return false;
             }
         }
@@ -2025,12 +2047,84 @@ impl<'a> Runner<'a> {
         db.sim_engine_flushed(name)
     }
 
+    /// Whether the process writing database `name` holds a non-empty pending set — a relaxed batch
+    /// not yet flushed (validated-cow.md §4). Not run under the page service.
+    fn engine_pending(&self, name: &str) -> bool {
+        if self.service {
+            return false;
+        }
+        self.db
+            .as_ref()
+            .is_some_and(|db| db.sim_engine_pending(name))
+    }
+
+    /// Check trailing truncation against batched durability (§8.3, validated-cow.md §4). The file
+    /// never shrinks below the durable floor's high-water: while a relaxed batch is pending the floor
+    /// is the only generation recovery is sure to find, so a shrink before the flush must not cut its
+    /// pages. And once the engine holds nothing pending again, a shrink that a relaxed commit deferred
+    /// has happened: the file is at most one growth step past the published high-water.
+    fn check_truncated(&mut self, i: usize, name: &str) -> bool {
+        let (floor, version, shrink_due) = {
+            let d = &self.dbs[name];
+            (d.floor, d.version, d.shrink_due)
+        };
+        let (image, stopped) = {
+            let file = self.dbs[name].file.clone();
+            let disk = self.disk();
+            (
+                disk.image(&file),
+                disk.dead() || !disk.fired.is_empty() || disk.armed(),
+            )
+        };
+        let Some(image) = image else {
+            return true;
+        };
+        let length = image.len() as u64;
+        let ps = self.page_size as u64;
+        if let Some((pc, _)) = sim_meta_of(&image, self.page_size, floor)
+            && pc as u64 * ps > length
+        {
+            self.fail(
+                i,
+                format!(
+                    "trailing truncation: {name}'s file is {length} bytes, shorter than its durable version {floor}'s {pc} pages"
+                ),
+            );
+            return false;
+        }
+        if !shrink_due {
+            return true;
+        }
+        if stopped {
+            self.sdb(name).shrink_due = false; // a crash or fault may have cut the flush short
+            return true;
+        }
+        if !self.engine_flushed(name) {
+            return true;
+        }
+        self.sdb(name).shrink_due = false;
+        let Some((pc, _)) = sim_meta_of(&image, self.page_size, version) else {
+            return true;
+        };
+        let limit = (pc as u64 + crate::pager::growth_step(pc, self.page_size) as u64) * ps;
+        if length > limit {
+            self.fail(
+                i,
+                format!(
+                    "trailing truncation: {name} flushed a batch that lowered its high-water to {pc} pages but its file is {length} bytes (at most {limit})"
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
     // --- bounded growth (simulation-testing.md §8.3) ---
 
     /// Database `name`'s page high-water and free-list length in the running process — the allocator
-    /// state the next commit draws from.
-    fn allocator(&self, name: &str) -> (u32, u32) {
-        self.db().sim_allocator(name).unwrap_or((0, 0))
+    /// state the next commit draws from — and where the free list's trailing run starts.
+    fn allocator(&self, name: &str) -> (u32, u32, u32) {
+        self.db().sim_allocator(name).unwrap_or((0, 0, 0))
     }
 
     /// Start a new bounded-growth lifetime for database `name` (an open, a recovery, a compaction, an
@@ -2038,10 +2132,11 @@ impl<'a> Runner<'a> {
     /// (format.md *Reclamation*), so a file whose dead pages are not all listed is reclaimed only
     /// after it doubles.
     fn observe_growth(&mut self, name: &str) {
-        let (pc, free) = self.allocator(name);
+        let (pc, free, trail) = self.allocator(name);
         let d = self.sdb(name);
         d.high = pc;
         d.free = free;
+        d.trail = trail;
         d.lac_bound = pc.wrapping_sub(free);
         d.last = Growth::default();
     }
@@ -2069,14 +2164,58 @@ impl<'a> Runner<'a> {
         else {
             return;
         };
-        let (_, free) = self.allocator(name);
-        let written = {
+        let (_, free, trail) = self.allocator(name);
+        let (written, top, length) = {
             let file = self.dbs[name].file.clone();
             let disk = self.disk();
-            disk.file(&file).map_or(0, |id| {
-                disk.written_pages(id).iter().filter(|pg| **pg >= 2).count() as u32
+            disk.file(&file).map_or((0, 0, 0), |id| {
+                let pages = disk.written_pages(id).iter().filter(|pg| **pg >= 2);
+                let top = pages.clone().max().map_or(0, |pg| *pg as u32 + 1);
+                (pages.count() as u32, top, disk.file_len(id))
             })
         };
+        // Trailing truncation (§8.3): a quiet commit passes the reuse gate, so its tree pages take the
+        // lowest free pages, whatever of the old trailing run they leave is truncated, and every later
+        // page comes from the high-water at the run's start.
+        // A commit inside a relaxed batch never lowers the high-water (validated-cow.md §4), so it
+        // only grows it to what it wrote.
+        let (prev_high, prev_trail) = (self.dbs[name].high, self.dbs[name].trail);
+        let in_batch = self.dbs[name].batch_pending;
+        if quiet && in_batch && pc != prev_high.max(top) {
+            self.fail(
+                i,
+                format!(
+                    "trailing truncation: {name} has {pc} pages after a commit inside a relaxed batch that wrote up to page {top}, from {prev_high} pages"
+                ),
+            );
+            return;
+        }
+        if quiet && !in_batch && pc != prev_trail.max(top) {
+            self.fail(
+                i,
+                format!(
+                    "trailing truncation: {name} has {pc} pages after a quiet commit that wrote up to page {top}, from {prev_high} pages whose free list's trailing run began at {prev_trail}"
+                ),
+            );
+            return;
+        }
+        if quiet && pc < prev_high && self.relaxed {
+            // The shrink waits for the batch's flush (validated-cow.md §4): checked when the engine
+            // next holds nothing pending (check_truncated).
+            self.sdb(name).shrink_due = true;
+        } else if quiet && pc < prev_high {
+            let limit = (pc as u64 + crate::pager::growth_step(pc, self.page_size) as u64)
+                * self.page_size as u64;
+            if length > limit {
+                self.fail(
+                    i,
+                    format!(
+                        "trailing truncation: {name} lowered its high-water to {pc} pages but its file is {length} bytes (at most {limit})"
+                    ),
+                );
+                return;
+            }
+        }
         let (before, unlisted, lac_bound) = {
             let d = &self.dbs[name];
             (d.last, d.high.wrapping_sub(d.free), d.lac_bound)
@@ -2087,6 +2226,7 @@ impl<'a> Runner<'a> {
             let d = self.sdb(name);
             d.high = pc;
             d.free = free;
+            d.trail = trail;
             d.lac_bound = d.lac_bound.max(live.wrapping_add(written));
             d.last = Growth::default();
             return;
@@ -2124,6 +2264,7 @@ impl<'a> Runner<'a> {
         let d = self.sdb(name);
         d.high = pc;
         d.free = free;
+        d.trail = trail;
         d.lac_bound = d.lac_bound.max(live.wrapping_add(written));
         d.last = Growth {
             reclaimed,
@@ -2408,6 +2549,12 @@ impl<'a> Runner<'a> {
         for pid in self.live_pids() {
             if let Err(e) = self.close_proc(pid) {
                 self.fail(i, format!("close: {e}"));
+                return false;
+            }
+        }
+        // Close flushed every batch, so a shrink a relaxed commit deferred has happened.
+        for name in self.order() {
+            if !self.check_truncated(i, &name) {
                 return false;
             }
         }

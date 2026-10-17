@@ -908,7 +908,7 @@ func (sc *psServerConn) waitForGate(requestID uint32, m psBeginWrite) {
 		// poisons the owner, which stops serving.
 		st := c.storage
 		st.mu.Lock()
-		ferr := st.flush()
+		ferr := st.flush(false)
 		st.mu.Unlock()
 		if ferr != nil {
 			o.releaseGate()
@@ -1318,7 +1318,9 @@ func (c *sharedCore) adoptForeign(o *pageServiceOwner) error {
 // maintenanceCommit is the owner-only free-list rebuild after a client commit (page-service.md §6):
 // a client commit never walks the database, so when the pages off the free list pass the reclamation threshold
 // and no pin holds back reclamation, the owner commits the unchanged snapshot at the next txid with
-// in-commit reclamation. Called holding the gate, after the catalog adoption.
+// in-commit reclamation. A client commit never lowers the high-water either, so the owner also commits
+// when the free list ends at the high-water, and that commit truncates it (format.md *Trailing
+// truncation*). Called holding the gate, after the catalog adoption.
 func (c *sharedCore) maintenanceCommit(o *pageServiceOwner) {
 	r := c.role.Load()
 	if r.owner != o {
@@ -1330,7 +1332,7 @@ func (c *sharedCore) maintenanceCommit(o *pageServiceOwner) {
 	if c.oldestLiveVersion(newTxid) != newTxid {
 		return
 	}
-	if !(st.liveAtCompaction == 0 || reclaimDue(st.pageCount, len(st.freePages), st.liveAtCompaction)) {
+	if !(st.liveAtCompaction == 0 || reclaimDue(st.pageCount, len(st.freePages), st.liveAtCompaction) || st.endsFree()) {
 		return
 	}
 	snap := rt.committed.clone()

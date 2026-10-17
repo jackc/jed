@@ -309,10 +309,21 @@ Before v33, steady state was **two metadata-free `fdatasync`s ≈ 2.8 ms** per c
 result (all three cores):** the `insert_commit_durable` benchmark fell from **~9.0 ms → ~2.5–3.1 ms**
 p50 (~2.7–2.9×), at PostgreSQL's order of magnitude (jed pays two syncs to PG's one).
 
+**Shrinking ([../fileformat/format.md](../fileformat/format.md) *Trailing truncation*).** A file
+commit that lowers the high-water to `P` shortens the file after its final barrier, but keeps one
+growth step of slack: a file longer than `P + clamp(P, floor, cap)` pages is cut to exactly that
+length, so the next growth after a shrink is already allocated and a truncate→regrow cycle does
+not pay an allocating `fsync` per commit. `set_size` downward needs no barrier (hosts.md §2.1). A
+failed shrink is ignored (the file stays longer; the commit is durable). Shrinking never runs on
+an in-memory store, a temp domain, or a page client. Under `synchronous = off` the shrink waits for
+the flush that makes the lowering generation durable (validated-cow.md §4); the pager records it
+and shortens the file right after that barrier, to one step past the newest high-water.
+
 **What this does *not* touch:**
 
 - **The byte contract (§8 / CLAUDE.md §8).** The committed image — pages `[0, page_count)` — is
-  byte-identical; the preallocated tail is **unreferenced trailing zeros past the high-water**.
+  byte-identical; the preallocated tail is **unreferenced bytes past the high-water** (zeros, or
+  stale pages a shrink kept as slack).
   `create`'s from-scratch `to_image` write and the golden fixtures are **not** preallocated, so the
   goldens stay byte-exact and the cross-core round-trip is unchanged. The loader reads `page_count`
   and reconstructs the free-list from the **meta**, never the physical file length, so slack pages

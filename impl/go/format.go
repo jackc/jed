@@ -860,14 +860,12 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 			if idx.Kind == indexGist {
 				// GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store (gist.md
 				// §4.1). Serialize the canonical tree, allocating from the same counter.
-				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, int(pageSize)-pageHeader, func() uint32 { p := nextIndex; nextIndex++; return p })
+				// Each node page streams to the sink as it is encoded, so the image never holds an
+				// index's pages at once (host compaction's bounded memory, api.md §2.6).
+				root, err := serializeGistIndex(s, s.tables[k], idx, int(pageSize)-pageHeader, func() uint32 { p := nextIndex; nextIndex++; return p },
+					func(p gistPage) error { return body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload) })
 				if err != nil {
 					return 0, err
-				}
-				for _, p := range gpages {
-					if err := body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload); err != nil {
-						return 0, err
-					}
 				}
 				r = root
 			} else if istore := s.indexStores[idx.Name]; istore.treeRoot() != nil {
@@ -965,8 +963,9 @@ func (b *pageSink) page(index uint32, pageType byte, itemCount, nextPage uint32,
 // never serialized for a GiST index; this is. The tree is rebuilt CANONICALLY from the leaf set, so
 // its bytes are a pure function of the set — content-deterministic and cross-core identical (§3).
 // alloc hands out page numbers (a counter for the whole image, the free-list allocator for an
-// incremental commit). Returns the node pages + the root; an empty index returns no pages and root 0.
-func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int, alloc func() uint32) ([]gistPage, uint32, error) {
+// incremental commit); emit receives each node page, in post-order, once its bytes are final.
+// Returns the root; an empty index emits no page and returns root 0.
+func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int, alloc func() uint32, emit func(gistPage) error) (uint32, error) {
 	// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per WITH column
 	// for an EXCLUDE backing index. A GiST index is always plain-column (columnOrdinals non-nil).
 	ops := gistOpclassesFor(idx.columnOrdinals(), table.Columns)
@@ -974,7 +973,7 @@ func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int
 	if istore := s.indexStores[idx.Name]; istore != nil {
 		entries, err := istore.EntriesInKeyOrder()
 		if err != nil {
-			return nil, 0, err
+			return 0, err
 		}
 		keys = make([][]byte, len(entries))
 		for i, e := range entries {
@@ -982,21 +981,20 @@ func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int
 		}
 	}
 	if len(keys) == 0 {
-		return nil, 0, nil
+		return 0, nil
 	}
 	tree, err := buildGistFromLeafKeys(ops, keys)
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
-	pages, root := serializeGistTree(tree, ops, alloc)
 	// Leaf keys are rebuilt from the stored index, so a corrupt key length can grow a node past its
-	// page, which makePage would otherwise truncate.
-	for _, p := range pages {
+	// page, which makePage would otherwise truncate: checked before each page is emitted.
+	return serializeGistTree(tree, ops, alloc, func(p gistPage) error {
 		if len(p.payload) > capacity {
-			return nil, 0, newError(DataCorrupted, "GiST node overflows its page")
+			return newError(DataCorrupted, "GiST node overflows its page")
 		}
-	}
-	return pages, root, nil
+		return emit(p)
+	})
 }
 
 // serializeNode serializes one node and its subtree post-order, emitting each page to body, and returns
@@ -1196,13 +1194,13 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 			if idx.Kind == indexGist {
 				// GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from the
 				// allocator (free-list first), the old tree's pages reclaimed on the next open.
-				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, capacity, alloc.take)
+				root, err := serializeGistIndex(s, s.tables[k], idx, capacity, alloc.take, func(p gistPage) error {
+					gistPages++
+					pages = append(pages, dirtyPage{index: p.pageNo, bytes: makePage(ps, p.pageType, p.itemCount, 0, p.payload)})
+					return nil
+				})
 				if err != nil {
 					return incrementalWrite{}, err
-				}
-				gistPages += uint32(len(gpages))
-				for _, p := range gpages {
-					pages = append(pages, dirtyPage{index: p.pageNo, bytes: makePage(ps, p.pageType, p.itemCount, 0, p.payload)})
 				}
 				r = root
 			} else if root := s.indexStores[idx.Name].treeRoot(); root != nil {

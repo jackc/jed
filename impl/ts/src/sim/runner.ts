@@ -14,8 +14,8 @@ import type { Engine } from "../executor.ts";
 // The Node file host registers the file compactor, the attach opener, and the directory barrier the
 // engine reaches through Engine.fileHost (here the simulated filesystem).
 import { close as closeEngine, createVia, openServiceWith } from "../file.ts";
-import { loadEnginePaged } from "../format.ts";
-import { Pager } from "../pager.ts";
+import { loadEnginePaged, trailingRun } from "../format.ts";
+import { growthStep, Pager } from "../pager.ts";
 import type { PageClient } from "../pageservice/client.ts";
 import { readFreeListChain } from "../pageservice/delta.ts";
 import { ServiceHandoff } from "../pageservice/handoff.ts";
@@ -347,12 +347,21 @@ class SimDB {
   // engine's reclamation trigger compares against, and what the previous commit left.
   high = 0; // the page high-water now
   free = 0; // the free list the next commit allocates from
+  trail = 0; // where that free list's trailing run below high starts (high: none)
   lacBound = 0; // ≥ the engine's live-at-last-reclamation
   last: SimGrowth = { reclaimed: false, high: 0, free: 0 }; // the previous commit in this lifetime
   // batchOpen is whether the current step began with a relaxed batch pending on this database's file:
   // its commit keeps the batch's pages off the free list and reuses only the floor's free pages
   // (validated-cow.md §4), so the bounded-growth assertions do not apply to it.
   batchOpen = false;
+  // batchPending is whether the step began with a non-empty pending set: a commit then plans inside a
+  // batch and may not lower the high-water (validated-cow.md §4). Unlike batchOpen it is false after a
+  // recovery whose adopted generation awaits stabilization, which the commit's own first barrier makes
+  // the floor.
+  batchPending = false;
+  // shrinkDue is set when a relaxed commit lowered the high-water: the next flush (the batch cap, close)
+  // must shorten the file (format.md *Trailing truncation*).
+  shrinkDue = false;
   // ownerLost is set when an owner died under synchronous = off: until a process observes main again,
   // it may have recovered any version from the floor up.
   ownerLost = false;
@@ -816,6 +825,7 @@ export class SimRunner {
     for (const [name, d] of this.dbs) {
       start.set(name, d.version);
       d.batchOpen = this.relaxed && !this.engineFlushed(d);
+      d.batchPending = this.relaxed && this.enginePending(d);
     }
     const pid = this.stepPid(st);
     if (pid !== null && st.kind !== "spawn" && !this.selectProc(pid)) {
@@ -895,6 +905,8 @@ export class SimRunner {
       }
       d.floor = d.version;
     }
+    // Checked against the floor this step leaves (a flush in the step moved it).
+    for (const d of this.order()) if (!this.checkTruncated(i, d)) return false;
     if (armed === null) return true;
     if (armed.kind === "disconnect") {
       // A lost connection ends no process: its client re-elects at its next begin.
@@ -1316,15 +1328,67 @@ export class SimRunner {
     return st.paging.batchFlushed();
   }
 
+  // enginePending reports whether the process writing database d holds a non-empty pending set — a
+  // relaxed batch not yet flushed (validated-cow.md §4). Not run under the page service.
+  private enginePending(d: SimDB): boolean {
+    if (this.service || this.db === null) return false;
+    const core = coreOf(this.db);
+    const st = d.name === "main" ? core.storage : core.attachments.get(d.name)?.storage;
+    if (st === undefined || st.paging === null) return false;
+    return st.paging.hasPending();
+  }
+
+  // checkTruncated checks trailing truncation against batched durability (§8.3, validated-cow.md §4).
+  // The file never shrinks below the durable floor's high-water: while a relaxed batch is pending the
+  // floor is the only generation recovery is sure to find, so a shrink before the flush must not cut
+  // its pages. And once the engine holds nothing pending again, a shrink that a relaxed commit deferred
+  // has happened: the file is at most one growth step past the published high-water.
+  private checkTruncated(i: number, d: SimDB): boolean {
+    const f = this.fs.files.get(d.file);
+    if (f === undefined) return true;
+    const length = f.cache.length;
+    const floor = metaOf(f.cache, this.pageSize, d.floor);
+    if (floor !== null && floor.pageCount * this.pageSize > length) {
+      this.fail(
+        i,
+        `trailing truncation: ${d.name}'s file is ${length} bytes, shorter than its durable version ` +
+          `${d.floor}'s ${floor.pageCount} pages`,
+      );
+      return false;
+    }
+    if (!d.shrinkDue) return true;
+    if (this.fs.dead || this.fs.fired !== "" || this.fs.fault !== null) {
+      d.shrinkDue = false; // a crash or fault may have cut the flush short
+      return true;
+    }
+    if (!this.engineFlushed(d)) return true;
+    d.shrinkDue = false;
+    const meta = metaOf(f.cache, this.pageSize, d.version);
+    if (meta === null) return true;
+    const pc = meta.pageCount;
+    const limit = (pc + growthStep(pc, this.pageSize)) * this.pageSize;
+    if (length > limit) {
+      this.fail(
+        i,
+        `trailing truncation: ${d.name} flushed a batch that lowered its high-water to ${pc} pages but ` +
+          `its file is ${length} bytes (at most ${limit})`,
+      );
+      return false;
+    }
+    return true;
+  }
+
   // --- bounded growth (simulation-testing.md §8.3) ----------------------------------------------
 
   // allocator is database d's page high-water and free-list length in the running process — the
-  // allocator state the next commit draws from.
-  private allocator(d: SimDB): { pageCount: number; free: number } {
+  // allocator state the next commit draws from — and where the free list's trailing run below the
+  // high-water starts (the high-water when its top page is not free; format.md *Trailing truncation*).
+  private allocator(d: SimDB): { pageCount: number; free: number; trail: number } {
     const core = coreOf(this.database);
     const st = d.name === "main" ? core.storage : core.attachments.get(d.name)?.storage;
-    if (st === undefined) return { pageCount: 0, free: 0 };
-    return { pageCount: st.pageCount, free: st.freePages.length };
+    if (st === undefined) return { pageCount: 0, free: 0, trail: 0 };
+    const trail = trailingRun(st.freePages, st.pageCount).start;
+    return { pageCount: st.pageCount, free: st.freePages.length, trail };
   }
 
   // observeGrowth starts a new bounded-growth lifetime for d (an open, a recovery, a compaction, an
@@ -1332,9 +1396,10 @@ export class SimRunner {
   // (format.md *Reclamation*), so a file whose dead pages are not all listed is reclaimed only after
   // it doubles.
   private observeGrowth(d: SimDB): void {
-    const { pageCount, free } = this.allocator(d);
+    const { pageCount, free, trail } = this.allocator(d);
     d.high = pageCount;
     d.free = free;
+    d.trail = trail;
     d.lacBound = (pageCount - free) >>> 0;
     d.last = { reclaimed: false, high: 0, free: 0 };
   }
@@ -1356,15 +1421,58 @@ export class SimRunner {
     if (meta === null) return;
     const pc = meta.pageCount;
     const live = meta.live;
-    const { free } = this.allocator(d);
+    const { free, trail } = this.allocator(d);
+    const file = this.fs.files.get(d.file)!;
     let written = 0;
-    for (const pg of this.fs.files.get(d.file)!.pages) if (pg >= 2) written++;
+    let top = 0;
+    for (const pg of file.pages) {
+      if (pg >= 2) {
+        written++;
+        top = Math.max(top, pg + 1);
+      }
+    }
+    // Trailing truncation (§8.3): a quiet commit passes the reuse gate, so its tree pages take the
+    // lowest free pages, whatever of the old trailing run they leave is truncated, and every later page
+    // comes from the high-water at the run's start. A commit inside a relaxed batch never lowers the
+    // high-water (validated-cow.md §4), so it only grows it to what it wrote.
+    if (quiet && d.batchPending && pc !== Math.max(d.high, top)) {
+      this.fail(
+        i,
+        `trailing truncation: ${d.name} has ${pc} pages after a commit inside a relaxed batch that ` +
+          `wrote up to page ${top}, from ${d.high} pages`,
+      );
+      return;
+    }
+    if (quiet && !d.batchPending && pc !== Math.max(d.trail, top)) {
+      this.fail(
+        i,
+        `trailing truncation: ${d.name} has ${pc} pages after a quiet commit that wrote up to page ` +
+          `${top}, from ${d.high} pages whose free list's trailing run began at ${d.trail}`,
+      );
+      return;
+    }
+    if (quiet && pc < d.high && this.relaxed) {
+      // The shrink waits for the batch's flush (validated-cow.md §4): checked when the engine next holds
+      // nothing pending (checkTruncated).
+      d.shrinkDue = true;
+    } else if (quiet && pc < d.high) {
+      const limit = (pc + growthStep(pc, this.pageSize)) * this.pageSize;
+      if (file.cache.length > limit) {
+        this.fail(
+          i,
+          `trailing truncation: ${d.name} lowered its high-water to ${pc} pages but its file is ` +
+            `${file.cache.length} bytes (at most ${limit})`,
+        );
+        return;
+      }
+    }
     const before = d.last;
     if (d.batchOpen) {
       // A commit inside a relaxed batch neither reuses nor frees the batch's pages (validated-cow.md
       // §4); only the bounds carry forward.
       d.high = pc;
       d.free = free;
+      d.trail = trail;
       d.lacBound = Math.max(d.lacBound, live + written);
       d.last = { reclaimed: false, high: 0, free: 0 };
       return;
@@ -1396,6 +1504,7 @@ export class SimRunner {
     }
     d.high = pc;
     d.free = free;
+    d.trail = trail;
     d.lacBound = Math.max(d.lacBound, live + written);
     d.last = { reclaimed, high: pc, free };
   }
@@ -1604,6 +1713,8 @@ export class SimRunner {
         return false;
       }
     }
+    // Close flushed every batch, so a shrink a relaxed commit deferred has happened.
+    for (const d of this.order()) if (!this.checkTruncated(i, d)) return false;
     this.fs.processDeath();
     try {
       this.open();

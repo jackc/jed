@@ -468,15 +468,14 @@ type gistPage struct {
 }
 
 // serializeGistTree serializes the whole tree to its node pages in canonical post-order (children
-// before parent, the root last). alloc hands out the next page number. Returns the pages (each with
-// its allocated number) and the root page.
-func serializeGistTree(t *gistTree, ops []gistOpclass, alloc func() uint32) ([]gistPage, uint32) {
-	var pages []gistPage
-	root := gistSerializeNode(t.root, ops, &pages, alloc)
-	return pages, root
+// before parent, the root last), handing each page to emit as soon as it is encoded, so a caller that
+// writes pages out (host compaction's image stream) never holds the index's pages at once. alloc
+// hands out the next page number. Returns the root page, or emit's first error.
+func serializeGistTree(t *gistTree, ops []gistOpclass, alloc func() uint32, emit func(gistPage) error) (uint32, error) {
+	return gistSerializeNode(t.root, ops, alloc, emit)
 }
 
-func gistSerializeNode(node *gistNode, ops []gistOpclass, pages *[]gistPage, alloc func() uint32) uint32 {
+func gistSerializeNode(node *gistNode, ops []gistOpclass, alloc func() uint32, emit func(gistPage) error) (uint32, error) {
 	if node.leaf {
 		var payload []byte
 		for i := range node.entries {
@@ -487,13 +486,16 @@ func gistSerializeNode(node *gistNode, ops []gistOpclass, pages *[]gistPage, all
 			payload = append(payload, node.entries[i].skey...)
 		}
 		pageNo := alloc()
-		*pages = append(*pages, gistPage{pageNo: pageNo, pageType: pageGistLeaf, itemCount: uint32(len(node.entries)), payload: payload})
-		return pageNo
+		return pageNo, emit(gistPage{pageNo: pageNo, pageType: pageGistLeaf, itemCount: uint32(len(node.entries)), payload: payload})
 	}
 	// Children first (post-order), in the node's canonical entry order.
 	childPages := make([]uint32, len(node.children))
 	for i := range node.children {
-		childPages[i] = gistSerializeNode(node.children[i].node, ops, pages, alloc)
+		pg, err := gistSerializeNode(node.children[i].node, ops, alloc, emit)
+		if err != nil {
+			return 0, err
+		}
+		childPages[i] = pg
 	}
 	var payload []byte
 	for i := range node.children {
@@ -503,8 +505,7 @@ func gistSerializeNode(node *gistNode, ops []gistOpclass, pages *[]gistPage, all
 		payload = appendU32(payload, childPages[i])
 	}
 	pageNo := alloc()
-	*pages = append(*pages, gistPage{pageNo: pageNo, pageType: pageGistInterior, itemCount: uint32(len(node.children)), payload: payload})
-	return pageNo
+	return pageNo, emit(gistPage{pageNo: pageNo, pageType: pageGistInterior, itemCount: uint32(len(node.children)), payload: payload})
 }
 
 // ---- the leaf-key codec + canonical-order build (the executor/serializer API) -----------------

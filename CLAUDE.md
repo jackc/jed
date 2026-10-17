@@ -630,7 +630,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   `txid + 1`) into `<path>.jedtmp` in bounded memory and atomically renames it into place (in memory: a
   fresh `MemoryBlockStore`). It never waits — a held writer gate, a pinned reader, or another process
   holding the file is `55006` (locking.md §6) — and is results- and cost-neutral (pages are renumbered,
-  tree nodes kept). OPFS compaction and in-place trailing truncation remain follow-ons.
+  tree nodes kept). Ordinary owner commits also cut off free pages at the top of a file and shorten it
+  after their barrier (in-place trailing truncation, format.md *Trailing truncation*; never on a page
+  client). OPFS compaction remains a follow-on.
 - **Validated COW durable commits (format v33).** Dirty body pages are written once, with
   CRC-64/ECMA-182 identities recorded inline in the alternate meta page and, for large
   transactions, in reusable manifest overflow pages. A single final durable barrier replaces
@@ -651,8 +653,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   The batch ends at the inline-manifest cap (flushed on a background goroutine/thread in Go/Rust,
   inline in TS — the next commit waits, so bytes never depend on timing), at close, before a page
   client's `begin_write`, and at compaction. Under `synchronous = on` the slot rule is `txid & 1` and
-  nothing changes. No time-based flush yet (its interval is undecided). Trailing truncation, when it
-  lands, must run only with nothing pending. [spec/design/validated-cow.md](spec/design/validated-cow.md) §4.
+  nothing changes. No time-based flush yet (its interval is undecided). Trailing truncation runs only
+  with nothing pending: only a batch's first commit lowers the high-water, and the file is shortened
+  at the flush, never while the batch is pending. [spec/design/validated-cow.md](spec/design/validated-cow.md) §4.
 - **Live page count (format v34).** Meta offset 56 records the exact number of pages reachable
   from the catalog root (catalog chain, tree and GiST nodes, live overflow chains — never meta,
   free-list, or manifest pages). Every commit advances it by an exact delta — its written pages

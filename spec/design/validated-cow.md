@@ -78,6 +78,17 @@ recovery dependencies. It may put old dependencies into its *new* free list; the
 reusable only by a subsequent commit, when the meta slot that required them is replaced.
 No metadata checkpoint is required to permit normal reuse.
 
+**Trailing truncation** ([fileformat/format.md](../fileformat/format.md) *Trailing truncation*)
+follows the same proof. It removes only pages of the safe remaining free list, which are dead at
+the fallback and listed in no manifest, so a page the commit draws from the lowered high-water
+overwrites nothing either candidate needs. The file is shortened only **after** the final barrier,
+and that order is load-bearing: a candidate whose `page_count` exceeds the file's length is not
+usable (open skips it), so a shrink that reached the disk before the new generation was durable
+could leave neither candidate valid. After the barrier the new generation is durable and references
+no page at or above its own `page_count`; the shortened file may retire the fallback candidate
+early, exactly as the next commit's meta write would. Under `synchronous = off` both the lowering and
+the shrink follow the batch rules of §4.
+
 Manifest pages use safe free pages before extending the file. Always appending them would
 grow even a repeatedly updated tiny database. Free-list serialization and manifest size
 depend on one another, so all cores use this monotone planning algorithm:
@@ -211,9 +222,19 @@ generation (in the slot it was written to) and the pending set empties. The flus
 - **Compaction** writes a new, already durable image and empties the pending set.
 - **Stabilization** of an adopted generation (§3) is a flush.
 
-Trailing truncation of the file (not yet built) must run only when nothing is pending, right after a
-flush: pages above the floor's high-water may hold the batch's pending pages, and the floor's own
-dependencies must stay in the file until a newer generation is durable.
+**Trailing truncation** ([fileformat/format.md](../fileformat/format.md) *Trailing truncation*) runs
+only at a durable barrier, with nothing pending. Two rules keep it inside the batch protocol:
+
+- Only a commit that begins with nothing pending lowers the high-water. That commit plans exactly as
+  under `synchronous = on`, against the floor's own free list, so every page it cuts is free at the
+  floor and on no pending set. A commit inside a batch never lowers it; the batch's later commits
+  draw from the lowered high-water, which hands out only those floor-free pages, so rule 3 holds.
+- The file is shortened only right after a barrier that covers the newest generation: at once for a
+  `synchronous = on` commit, otherwise at the batch's flush — the cap, close, detach, or an ownership
+  release — to one growth step past the newest generation's high-water. Until then the floor's pages
+  above the new `page_count` stay in the file, so the floor's meta stays usable (open skips a slot
+  whose `page_count` exceeds the file). The owner's flush before a client's `begin_write` shrinks
+  nothing; the shrink waits for the owner's next barrier over a commit of its own.
 
 The cap flush may run **in the background** (a goroutine in Go, a thread in Rust): the commit that
 reached the cap returns at once, and the domain's next commit, compaction, flush, or close first waits

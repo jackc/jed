@@ -476,6 +476,7 @@ impl Engine {
             ps,
             can_reclaim,
             true,
+            true,
             live.live,
             &[],
             None,
@@ -493,6 +494,8 @@ impl Engine {
             pager.write_block(slot, &plan.meta)?;
             pager.sync()?;
             pager.finish_commit(&plan.meta, slot, true, &[]);
+            // Trailing truncation (format.md): shorten the file after the barrier.
+            pager.settle_truncation(plan.page_count, plan.page_count < self.page_count, true);
         }
         // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
         // evicts a stale pool decode of any free page this commit reused for new content.
