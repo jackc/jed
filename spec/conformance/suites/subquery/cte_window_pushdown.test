@@ -465,7 +465,7 @@ WITH c AS (SELECT id, k FROM t) SELECT t.id FROM t WHERE EXISTS (SELECT 1 FROM c
 9
 
 # A single reference inside an IN subquery.
-# cost: 110
+# cost: 65
 query I rowsort
 WITH c AS (SELECT id, k FROM t) SELECT t.id FROM t WHERE t.id IN (SELECT c.id FROM c WHERE c.k = 2)
 ----

@@ -616,18 +616,18 @@ EXPLAIN DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = $1)
 0
 Delete items
 -
-334
-2013
+10
+33
 1
 Filter
 conjuncts=1
-334
-2013
+10
+33
 2
 Scan items
-Full scan; touched=1
-1000
-1006
+PK interval set: id; intervals=1; arrays=1; touched=1
+10
+16
 
 query ITTII nosort
 EXPLAIN DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = 70)
@@ -635,18 +635,18 @@ EXPLAIN DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = 70)
 0
 Delete items
 -
-334
-2013
+10
+33
 1
 Filter
 conjuncts=1
-334
-2013
+10
+33
 2
 Scan items
-Full scan; touched=1
-1000
-1006
+PK interval set: id; intervals=1; arrays=1; touched=1
+10
+16
 
 # EXPLAIN ANALYZE executes, so each run is followed by restoring row 70.
 # params: 70

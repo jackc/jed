@@ -833,8 +833,19 @@ func orSelectivities(parts []selectivityExpr) selectivityExpr {
 // whose value is unavailable, a correlated outer column — default_array_elements stand-ins of
 // unknown value (the operand itself).
 func estimatorArrayElements(array *rExpr) []*rExpr {
-	if array.kind == reArray && !array.nested {
+	switch {
+	case array.kind == reArray && !array.nested:
 		return array.sargs
+	case array.kind == reQuantified:
+		// A folded `= ANY(SELECT …)` point source: its constant array.
+		return estimatorArrayElements(array.rhs)
+	case array.kind == reInValues:
+		// A folded `IN (SELECT …)` point source: its value list.
+		elems := make([]*rExpr, len(array.list))
+		for i, v := range array.list {
+			elems[i] = valueToRExpr(v)
+		}
+		return elems
 	}
 	if c := estimatorValue(array); c != nil {
 		switch c.kind {

@@ -1170,6 +1170,19 @@ fn estimator_array_point_sources(array: &ArrayPointSource, key_type: ScalarType)
             level: *level,
             index: *index,
         },
+        ArrayPointSource::List(values) => {
+            return estimator_array_value_sources(
+                &ArrayVal {
+                    dims: vec![values.len()],
+                    lbounds: vec![1],
+                    elements: values.clone(),
+                },
+                key_type,
+            );
+        }
+        // A membership subquery's list is known only after its fold: stand-ins of unknown value (a
+        // sibling slot no relation has, which the estimator never reads).
+        ArrayPointSource::Folded(_) => BoundSrc::Sibling(usize::MAX),
     };
     vec![stand_in; DEFAULT_ARRAY_ELEMENTS]
 }
@@ -2396,9 +2409,12 @@ fn build_index_interval_set_plan(
             .is_some_and(|s| crate::encoding::key_slot_skippable(s))
             && col.collation.is_none()
     };
+    // A leading range, or a leading membership subquery (which widens to the whole index if it is
+    // read before its fold), leaves the leading slot to be stepped over.
     let lead = &tuple[0];
+    let lead_specs = lead.specs.as_deref().unwrap_or_default();
     if !skippable(cols[0])
-        && interval_plan_has_range(lead.specs.as_deref().unwrap_or_default(), &lead.clip)
+        && (interval_plan_has_range(lead_specs, &lead.clip) || specs_have_subquery(lead_specs))
     {
         return None;
     }
@@ -2488,7 +2504,13 @@ pub(crate) fn detect_interval_set(
     flatten(filter, &mut conjuncts);
     let mut found = None;
     for (i, e) in conjuncts.iter().enumerate() {
-        if !matches!(e, RExpr::Or(_, _) | RExpr::Quantified { .. }) {
+        if !matches!(
+            e,
+            RExpr::Or(_, _)
+                | RExpr::Quantified { .. }
+                | RExpr::Subquery { .. }
+                | RExpr::InValues { .. }
+        ) {
             continue;
         }
         if let Some(specs) = reduce_interval_union(e, key_idx, key_type, col_coll) {
@@ -2580,7 +2602,13 @@ fn walk_tuple_members(
         let key_idx = rel.offset + *ci;
         let mut found = None;
         for (i, e) in conjuncts.iter().enumerate() {
-            if !matches!(e, RExpr::Or(_, _) | RExpr::Quantified { .. }) {
+            if !matches!(
+                e,
+                RExpr::Or(_, _)
+                    | RExpr::Quantified { .. }
+                    | RExpr::Subquery { .. }
+                    | RExpr::InValues { .. }
+            ) {
                 continue;
             }
             if let Some(specs) = reduce_interval_union(e, key_idx, ty, col_coll) {
@@ -2690,12 +2718,69 @@ pub(crate) fn reduce_interval_union(
 /// exactly the key's type, or a promoted type whose values convert exactly to the key
 /// (`elem_promoted`); a promoted array must be readable as a value, since its elements convert
 /// through [`point_value`]. Returns that array as one array spec.
+/// A membership-subquery point source among an interval set's disjuncts.
+fn specs_have_subquery(specs: &[IntervalSpec]) -> bool {
+    specs.iter().any(|spec| {
+        matches!(
+            spec.array,
+            Some(ArrayPointSource::Folded(_) | ArrayPointSource::List(_))
+        )
+    })
+}
+
+/// An uncorrelated membership subquery whose value list is a key's point source once folded (cost.md
+/// §3 "OR / IN-list"): `key IN (SELECT …)` or `key = ANY(SELECT …)` with a single column of the key's
+/// type (or a promoted integer/decimal one), on the bare key column, or the folded `IN` list a
+/// mutation plans over. An IN compares by byte identity, so a collated key is left alone.
+fn subquery_point_source(
+    e: &RExpr,
+    key_idx: usize,
+    col_coll: Option<&str>,
+) -> Option<ArrayPointSource> {
+    match e {
+        RExpr::InValues {
+            lhs,
+            list,
+            negated: false,
+            points: Some(_),
+        } if is_column(lhs, key_idx) && col_coll.is_none() => {
+            Some(ArrayPointSource::List(list.clone()))
+        }
+        RExpr::Subquery {
+            plan,
+            kind,
+            lhs: Some(lhs),
+            negated: false,
+            row_valued: false,
+            points: Some(points),
+        } if is_column(lhs, key_idx) && !query_plan_references_outer(plan, 0) => {
+            let ok = match kind {
+                SubqueryKind::In => col_coll.is_none(),
+                SubqueryKind::Quantified {
+                    op: CmpOp::Eq,
+                    all: false,
+                    collation,
+                } => collation.as_ref().map(|c| c.name.as_str()) == col_coll,
+                _ => false,
+            };
+            ok.then(|| ArrayPointSource::Folded(points.clone()))
+        }
+        _ => None,
+    }
+}
+
 fn as_array_point_spec(
     e: &RExpr,
     key_idx: usize,
     key_type: ScalarType,
     col_coll: Option<&str>,
 ) -> Option<IntervalSpec> {
+    if let Some(array) = subquery_point_source(e, key_idx, col_coll) {
+        return Some(IntervalSpec {
+            terms: Vec::new(),
+            array: Some(array),
+        });
+    }
     let RExpr::Quantified {
         op: CmpOp::Eq,
         all: false,
@@ -2787,30 +2872,40 @@ fn array_point_keys(
     params: &[Value],
     outer: &[&[Value]],
     coll: Option<&Collation>,
-) -> Vec<Vec<u8>> {
+) -> Option<Vec<Vec<u8>>> {
     let value = match src {
         ArrayPointSource::Elements(elems) => {
-            return elems
-                .iter()
-                .filter_map(|elem| {
-                    match encode_bound_key(key_type, elem, params, outer, coll, &[]) {
-                        BoundKey::Key(k) => Some(k),
-                        BoundKey::Null | BoundKey::OutOfRange => None,
-                    }
-                })
-                .collect();
+            return Some(
+                elems
+                    .iter()
+                    .filter_map(|elem| {
+                        match encode_bound_key(key_type, elem, params, outer, coll, &[]) {
+                            BoundKey::Key(k) => Some(k),
+                            BoundKey::Null | BoundKey::OutOfRange => None,
+                        }
+                    })
+                    .collect(),
+            );
         }
-        ArrayPointSource::Null => return Vec::new(),
+        ArrayPointSource::Null => return Some(Vec::new()),
+        // A membership subquery not yet folded has no value list: the caller widens to every key.
+        ArrayPointSource::Folded(points) => {
+            return points
+                .values
+                .get()
+                .map(|values| value_point_keys(key_type, values, coll));
+        }
+        ArrayPointSource::List(values) => return Some(value_point_keys(key_type, values, coll)),
         ArrayPointSource::Param(i) => &params[*i],
         ArrayPointSource::Outer { level, index } => &outer[outer.len() - level][*index],
         ArrayPointSource::Const(a) => {
-            return array_value_point_keys(key_type, a, coll);
+            return Some(array_value_point_keys(key_type, a, coll));
         }
     };
-    match value {
+    Some(match value {
         Value::Array(a) => array_value_point_keys(key_type, a, coll),
         _ => Vec::new(),
-    }
+    })
 }
 
 fn array_value_point_keys(
@@ -2818,7 +2913,16 @@ fn array_value_point_keys(
     arr: &ArrayVal,
     coll: Option<&Collation>,
 ) -> Vec<Vec<u8>> {
-    arr.elements
+    value_point_keys(key_type, &arr.elements, coll)
+}
+
+/// Element values as key points, in order: a NULL element and one no key can equal contribute none.
+fn value_point_keys(
+    key_type: ScalarType,
+    elems: &[Value],
+    coll: Option<&Collation>,
+) -> Vec<Vec<u8>> {
+    elems
         .iter()
         .filter_map(
             |elem| match encode_value_key(key_type, &*point_value(key_type, elem)?, coll) {
@@ -5269,7 +5373,13 @@ pub(crate) fn canonical_interval_set(
             } else {
                 continue;
             };
-            for key in array_point_keys(key_type, array, params, outer, coll) {
+            let Some(keys) = array_point_keys(key_type, array, params, outer, coll) else {
+                if !bound_empty(&point_clip) {
+                    intervals.push(point_clip);
+                }
+                continue;
+            };
+            for key in keys {
                 let mut point = KeyBound::unbounded();
                 intersect_lo(&mut point, &key, true);
                 intersect_hi(&mut point, &key, true);
@@ -5367,18 +5477,19 @@ impl PkKeySet {
 
 /// A point member's sorted, de-duplicated encoded points (never merged), each inside the member's
 /// clip. A member with no set has the single point its equalities agree on.
+/// `None` when a membership subquery among its sources is not yet folded, so it has no points.
 fn member_points(
     m: &TupleMember,
     params: &[Value],
     outer: &[&[Value]],
     left: &[Value],
-) -> Vec<Vec<u8>> {
+) -> Option<Vec<Vec<u8>>> {
     let coll = m.coll.as_deref();
     let Some(clip) = build_logical_interval(m.col_type, &m.clip, params, outer, coll, left) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let Some(specs) = &m.specs else {
-        return clip.lo.into_iter().collect();
+        return Some(clip.lo.into_iter().collect());
     };
     let inside = |key: &[u8], within: &KeyBound| {
         let mut point = KeyBound::unbounded();
@@ -5399,11 +5510,8 @@ fn member_points(
             } else {
                 continue;
             };
-            keys.extend(
-                array_point_keys(m.col_type, array, params, outer, coll)
-                    .into_iter()
-                    .filter(|key| inside(key, &within)),
-            );
+            let points = array_point_keys(m.col_type, array, params, outer, coll)?;
+            keys.extend(points.into_iter().filter(|key| inside(key, &within)));
             continue;
         }
         if let Some(b) = build_logical_interval(m.col_type, &spec.terms, params, outer, coll, left)
@@ -5415,7 +5523,7 @@ fn member_points(
     }
     keys.sort();
     keys.dedup();
-    keys
+    Some(keys)
 }
 
 /// The final member's canonical logical intervals: its set clipped by its clip, or with no set the
@@ -5462,7 +5570,12 @@ fn expand_tuple_prefixes(
     let mut consumed = 0usize;
     for (i, m) in tuple.iter().enumerate() {
         let (points, intervals) = if m.point {
-            (member_points(m, params, outer, left), Vec::new())
+            // A membership subquery not yet folded has no points: the set widens to the prefixes
+            // so far, as at the probe cap.
+            let Some(points) = member_points(m, params, outer, left) else {
+                break;
+            };
+            (points, Vec::new())
         } else {
             (Vec::new(), final_member_intervals(m, params, outer, left))
         };

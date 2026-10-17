@@ -4236,6 +4236,9 @@ pub(crate) enum RExpr {
         /// row constructor, so each body row packages its N columns as one anonymous composite
         /// value (`Value::Composite`) instead of yielding its single column. Never set for Exists.
         row_valued: bool,
+        /// For a point-capable `In` / `= ANY` membership subquery: the cell the fold fills with its
+        /// value list, shared with any interval-set bound planned over it (cost.md §3 "OR / IN-list").
+        points: Option<std::sync::Arc<FoldedPoints>>,
     },
     /// A folded **uncorrelated** `IN (subquery)` (spec/design/grammar.md §26): the subquery ran
     /// once (at the fold pass) yielding the constant `list`; per row it tests `lhs` for 3-valued
@@ -4245,6 +4248,8 @@ pub(crate) enum RExpr {
         lhs: Box<RExpr>,
         list: Vec<Value>,
         negated: bool,
+        /// The folded subquery's point flags, when its values are points of `lhs`'s type.
+        points: Option<std::sync::Arc<FoldedPoints>>,
     },
     /// A quantified array comparison `lhs op ANY/ALL(array)` (spec/design/array-functions.md §11):
     /// the array spelling of `IN`. At eval `lhs` is evaluated ONCE, `array` once; then a 3-valued
@@ -7054,6 +7059,16 @@ pub(crate) struct IntervalSpec {
     array: Option<ArrayPointSource>,
 }
 
+/// A membership subquery's value list as a key's point source (cost.md §3 "OR / IN-list"): its single
+/// column's values are points of the scalar left operand's type exactly (`elem_exact`) or after an
+/// integer/decimal conversion (`elem_promoted`). The uncorrelated fold fills `values`; an
+/// interval-set bound planned before the fold reads them through this shared cell.
+pub(crate) struct FoldedPoints {
+    pub(crate) values: std::sync::OnceLock<Vec<Value>>,
+    pub(crate) elem_exact: bool,
+    pub(crate) elem_promoted: bool,
+}
+
 /// The array operand of a `key = ANY(array)` interval-set disjunct (cost.md §3 "OR / IN-list") —
 /// constant for the whole scan and readable without evaluation — in the owned form the plan keeps
 /// (the `BoundSrc` precedent).
@@ -7068,6 +7083,10 @@ pub(crate) enum ArrayPointSource {
     Const(Box<ArrayVal>),
     /// A NULL array: no points.
     Null,
+    /// An uncorrelated `IN (SELECT …)` / `= ANY(SELECT …)`: its value list once folded.
+    Folded(std::sync::Arc<FoldedPoints>),
+    /// A folded `IN` list a mutation plans over.
+    List(Vec<Value>),
 }
 
 /// Canonical interval-set plan over a single-column PK. Specs are OR disjuncts; `clip` is the

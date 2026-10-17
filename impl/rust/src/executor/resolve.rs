@@ -300,6 +300,7 @@ fn resolve_comparison(
                 lhs: None,
                 negated: false,
                 row_valued: true,
+                points: None,
             };
             Ok((rl, lt, rr, rt))
         })?,

@@ -3350,6 +3350,7 @@ impl RExpr {
                 lhs,
                 negated,
                 row_valued,
+                ..
             } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut child: Vec<&[Value]> = env.outer.to_vec();
@@ -3427,7 +3428,9 @@ impl RExpr {
                 out
             }),
             // A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
-            RExpr::InValues { lhs, list, negated } => outline(|| {
+            RExpr::InValues {
+                lhs, list, negated, ..
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
                 in_membership(&lv, list, *negated, m)

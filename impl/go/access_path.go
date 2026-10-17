@@ -747,7 +747,9 @@ func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx ind
 		s, ok := rel.table.Columns[c].Type.AsScalar()
 		return ok && keySlotSkippable(s) && rel.table.Columns[c].Collation == ""
 	}
-	if lead := members[0]; !skippable(cols[0]) && intervalPlanHasRange(lead.specs, lead.clip) {
+	// A leading range, or a leading membership subquery (which widens to the whole index if it is
+	// read before its fold), leaves the leading slot to be stepped over.
+	if lead := members[0]; !skippable(cols[0]) && (intervalPlanHasRange(lead.specs, lead.clip) || specsHaveSubquery(lead.specs)) {
 		return nil
 	}
 	// Suffix eligibility (cost.md §3 "Multi-column secondary indexes"): every key column from the
@@ -814,7 +816,7 @@ func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Coll
 	flatten(filter)
 	found := -1
 	for i, e := range conjuncts {
-		if e.kind != reOr && e.kind != reQuantified {
+		if e.kind != reOr && e.kind != reQuantified && e.kind != reSubquery && e.kind != reInValues {
 			continue
 		}
 		if reduced, ok := reduceIntervalUnion(e, keyIdx, keyType, colColl); ok {
@@ -895,7 +897,7 @@ func (db *engine) walkTupleMembers(conjuncts []*rExpr, rel scopeRel, cols []int)
 		var specs []intervalSpec
 		found := -1
 		for i, e := range conjuncts {
-			if e.kind != reOr && e.kind != reQuantified {
+			if e.kind != reOr && e.kind != reQuantified && e.kind != reSubquery && e.kind != reInValues {
 				continue
 			}
 			if reduced, ok := reduceIntervalUnion(e, keyIdx, ty, colColl); ok {
@@ -1000,6 +1002,9 @@ func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl strin
 // exactly the key's type, or a promoted type whose values convert exactly to the key (elemPromoted);
 // a promoted array must be readable as a value, since its elements convert through pointValue.
 func asArrayPointSpec(e *rExpr, keyIdx int, keyType scalarType, colColl string) (intervalSpec, bool) {
+	if (e.kind == reSubquery || e.kind == reInValues) && isSubqueryPointSource(e, keyIdx, colColl) {
+		return intervalSpec{array: e}, true
+	}
 	if e.kind != reQuantified || e.op != opEq || e.quantAll || e.rowWise || !(e.elemExact || e.elemPromoted) || !isColumn(e.lhs, keyIdx) {
 		return intervalSpec{}, false
 	}
@@ -1011,6 +1016,44 @@ func asArrayPointSpec(e *rExpr, keyIdx int, keyType scalarType, colColl string) 
 		return intervalSpec{}, false
 	}
 	return intervalSpec{array: e.rhs}, true
+}
+
+// specsHaveSubquery reports a membership-subquery point source among an interval set's disjuncts.
+func specsHaveSubquery(specs []intervalSpec) bool {
+	for _, spec := range specs {
+		if spec.array != nil && (spec.array.kind == reSubquery || spec.array.kind == reInValues) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSubqueryPointSource reports whether e is an uncorrelated membership subquery whose value list is
+// a key's point source once folded (cost.md §3 "OR / IN-list"): `key IN (SELECT …)` or `key =
+// ANY(SELECT …)` with a single column of the key's type (or a promoted integer/decimal one), on the
+// bare key column, or the folded `IN` list a mutation plans over. Its values are read after the fold
+// replaces the node in place; an IN compares by byte identity, so a collated key is left alone.
+func isSubqueryPointSource(e *rExpr, keyIdx int, colColl string) bool {
+	if !(e.elemExact || e.elemPromoted) || e.rowValued || !isColumn(e.lhs, keyIdx) {
+		return false
+	}
+	if e.kind == reInValues {
+		return !e.negated && colColl == ""
+	}
+	if queryPlanReferencesOuter(e.subPlan, 0) {
+		return false
+	}
+	switch e.subKind {
+	case sqIn:
+		return !e.negated && colColl == ""
+	case sqQuantified:
+		cmpColl := ""
+		if e.collation != nil {
+			cmpColl = e.collation.Name
+		}
+		return e.op == opEq && !e.quantAll && cmpColl == colColl
+	}
+	return false
 }
 
 // isArrayPointSource reports whether an `= ANY` array operand is constant for the whole scan and
@@ -1071,15 +1114,25 @@ func pointValue(keyType scalarType, v Value) (Value, bool) {
 // a NULL element, and an element no key can equal (an out-of-range integer, a non-integral decimal
 // against an integer key, an unmapped collated text) contribute no point, exactly as the equivalent
 // IN-list's disjuncts would.
-func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation) [][]byte {
+func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation) ([][]byte, bool) {
 	var keys [][]byte
+	switch src.kind {
+	case reSubquery:
+		// A membership subquery not yet folded has no value list: the caller widens to every key.
+		return nil, false
+	case reQuantified:
+		// A folded `= ANY(SELECT …)`: the constant array the fold produced.
+		return arrayPointKeys(keyType, src.rhs, params, outer, coll)
+	case reInValues:
+		return valuePointKeys(keyType, src.list, coll), true
+	}
 	if src.kind == reArray {
 		for _, elem := range src.sargs {
 			if key, isNull, ok := encodeBoundKey(keyType, elem, params, outer, coll, nil); ok && !isNull {
 				keys = append(keys, key)
 			}
 		}
-		return keys
+		return keys, true
 	}
 	var v Value
 	switch src.kind {
@@ -1091,9 +1144,16 @@ func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []stor
 		v = arrayValueOf(src.cArray)
 	}
 	if v.Kind != ValArray {
-		return nil
+		return nil, true
 	}
-	for _, elem := range v.arrayVal().Elements {
+	return valuePointKeys(keyType, v.arrayVal().Elements, coll), true
+}
+
+// valuePointKeys encodes element values as key points, in order: a NULL element and one no key can
+// equal contribute none.
+func valuePointKeys(keyType scalarType, elems []Value, coll *Collation) [][]byte {
+	var keys [][]byte
+	for _, elem := range elems {
 		point, ok := pointValue(keyType, elem)
 		if !ok {
 			continue
@@ -1873,7 +1933,14 @@ func canonicalIntervalSet(keyType scalarType, specs []intervalSpec, clipTerms []
 				}
 				pointClip = intersectBounds(b, clip)
 			}
-			for _, key := range arrayPointKeys(keyType, spec.array, params, outer, coll) {
+			keys, known := arrayPointKeys(keyType, spec.array, params, outer, coll)
+			if !known {
+				if !boundEmpty(pointClip) {
+					intervals = append(intervals, pointClip)
+				}
+				continue
+			}
+			for _, key := range keys {
 				b := intersectBounds(intersectHi(intersectLo(unboundedBound(), key, true), key, true), pointClip)
 				if !boundEmpty(b) {
 					intervals = append(intervals, b)
@@ -1941,13 +2008,13 @@ func mergeKeyIntervals(intervals []keyBound, fixedWidth bool) []keyBound {
 
 // memberPoints is a point member's sorted, de-duplicated encoded points (never merged), each inside
 // the member's clip. A member with no set has the single point its equalities agree on.
-func memberPoints(m tupleMember, params []Value, outer []storedRow, left storedRow) [][]byte {
+func memberPoints(m tupleMember, params []Value, outer []storedRow, left storedRow) ([][]byte, bool) {
 	clip, empty := buildLogicalInterval(m.colType, m.clip, params, outer, m.coll, left)
 	if empty {
-		return nil
+		return nil, true
 	}
 	if m.specs == nil {
-		return [][]byte{clip.lo}
+		return [][]byte{clip.lo}, true
 	}
 	var keys [][]byte
 	keep := func(key []byte, within keyBound) {
@@ -1966,7 +2033,11 @@ func memberPoints(m tupleMember, params []Value, outer []storedRow, left storedR
 				}
 				within = intersectBounds(b, clip)
 			}
-			for _, key := range arrayPointKeys(m.colType, spec.array, params, outer, m.coll) {
+			keys, known := arrayPointKeys(m.colType, spec.array, params, outer, m.coll)
+			if !known {
+				return nil, false
+			}
+			for _, key := range keys {
 				keep(key, within)
 			}
 			continue
@@ -1982,7 +2053,7 @@ func memberPoints(m tupleMember, params []Value, outer []storedRow, left storedR
 			out = append(out, key)
 		}
 	}
-	return out
+	return out, true
 }
 
 // finalMemberIntervals is the final member's canonical logical intervals: its set clipped by its
@@ -2014,7 +2085,13 @@ func expandTuplePrefixes(tuple []tupleMember, tag []byte, params []Value, outer 
 		var count int
 		var points [][]byte
 		if m.point {
-			points = memberPoints(m, params, outer, left)
+			var known bool
+			if points, known = memberPoints(m, params, outer, left); !known {
+				// A membership subquery not yet folded has no points: the set widens to the prefixes
+				// so far, as at the probe cap.
+				final = nil
+				break
+			}
 			count = len(points)
 		} else {
 			final = finalMemberIntervals(m, params, outer, left)

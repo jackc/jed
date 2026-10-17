@@ -524,8 +524,14 @@ point-set/range intersection).
   (a cast literal such as `'{1,2}'::i32[]`), a correlated outer column, or — for an exact element type
   only — a one-dimensional `ARRAY[…]` whose every element is itself a constant key source (a literal,
   `$N`, or outer column). A promoted `ARRAY[…]` (`ARRAY[1::i32, 3::i32]` against an `i64` key) and a
-  promoted float pair (`f32[]` against an `f64` key) fall back to the scan they had. At execution, the
-  disjunct contributes **one point per element**, over all of a multidimensional array's elements in
+  promoted float pair (`f32[]` against an `f64` key) fall back to the scan they had. An uncorrelated
+  membership subquery is a source too — `key IN (SELECT …)` or `key = ANY(SELECT …)` whose single
+  column is of the key's type or a promoted integer/decimal one (an `IN`, which compares by byte
+  identity, only on a key with no collation): the fold runs it once before the scan opens, and its
+  value list is the array. A subquery the scan reads before its fold (one inside a derived-table
+  body, which runs with that body) has no values yet, so its disjunct widens to every key; NOT IN and
+  a correlated subquery do not bound. A mutation plans over its already-folded `IN` list. At
+  execution, the disjunct contributes **one point per element**, over all of a multidimensional array's elements in
   storage order; a NULL element, an element no key can equal, and a NULL or empty array contribute
   none. A promoted element is first converted to the key's type: an integer of another width is the
   same integer when the key's width holds it; an integer against a decimal key is the equal decimal
