@@ -499,6 +499,8 @@ pub(crate) struct PageServiceOwner {
     /// The handoff state; `admission` wakes the owner's own begins when a drain ends.
     handoff: Mutex<HandoffState>,
     admission: Condvar,
+    /// Mirrors `draining` so every owner transaction begin checks it without a lock.
+    draining_now: AtomicBool,
     /// The handle's lock host (the owner record, the endpoint, the drain's clock) and file host (the
     /// read handle): the OS, or the simulator's.
     host: Arc<dyn LockHost>,
@@ -559,6 +561,7 @@ impl PageServiceOwner {
                 draining: false,
             }),
             admission: Condvar::new(),
+            draining_now: AtomicBool::new(false),
             host,
             files,
             file: RwLock::new(file),
@@ -718,12 +721,17 @@ impl PageServiceOwner {
         }
     }
 
-    /// Block an owner session's transaction begin while a yield drains (README.md §6.5).
-    pub(crate) fn wait_admission(&self) {
+    /// Block an owner session's transaction begin while a yield drains (README.md §6.5). Returns
+    /// whether it waited; the common case is one atomic load.
+    pub(crate) fn wait_admission(&self) -> bool {
+        if !self.draining_now.load(Ordering::Acquire) {
+            return false;
+        }
         let mut handoff = self.handoff.lock().expect("handoff lock poisoned");
         while handoff.draining {
             handoff = self.admission.wait(handoff).expect("handoff lock poisoned");
         }
+        true
     }
 
     /// Whether client begins are answered rather than parked.
@@ -733,7 +741,10 @@ impl PageServiceOwner {
 
     /// Release the owner's own waiting begins.
     pub(crate) fn end_drain(&self) {
-        self.handoff.lock().expect("handoff lock poisoned").draining = false;
+        let mut handoff = self.handoff.lock().expect("handoff lock poisoned");
+        handoff.draining = false;
+        self.draining_now.store(false, Ordering::Release);
+        drop(handoff);
         self.admission.notify_all();
     }
 
@@ -793,6 +804,7 @@ impl PageServiceOwner {
         handoff.state = OwnerState::Yielding;
         handoff.requester = Some(conn.id);
         handoff.draining = true;
+        self.draining_now.store(true, Ordering::Release);
         drop(handoff);
         let owner = Arc::clone(self);
         let requester = conn.id;

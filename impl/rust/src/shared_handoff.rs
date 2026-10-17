@@ -491,8 +491,7 @@ impl Shared {
                 .current_role()
                 .expect("a page-service handle always has a role");
             if let Some(owner) = &role.owner {
-                owner.wait_admission();
-                if !self.role_is(&role) {
+                if owner.wait_admission() && !self.role_is(&role) {
                     continue;
                 }
                 if let Err(e) = self.adopt_foreign(owner) {
@@ -502,7 +501,8 @@ impl Shared {
                     return Err(e);
                 }
                 let mut live = self.live.lock().expect("live lock not poisoned");
-                if !self.role_is(&role) {
+                // A role change swaps the role and the registry's generation under this lock.
+                if live.generation != role.generation {
                     continue;
                 }
                 let r = self.roots.read().expect("roots lock not poisoned");

@@ -99,12 +99,13 @@ type pageServiceOwner struct {
 	// nextAck is the commit-resolution test hook (psAck*).
 	nextAck atomic.Int32
 
-	// stateMu guards state, requester, and drainDone. drainDone is closed when a yield's drain ends, which
+	// stateMu guards state and requester. drainDone (set under stateMu, read lock-free by every owner
+	// transaction begin) is closed when a yield's drain ends, which
 	// releases the owner's own waiting begins (waitAdmission).
 	stateMu   sync.Mutex
 	state     ownerState
 	requester *psServerConn
-	drainDone chan struct{}
+	drainDone atomic.Pointer[chan struct{}]
 
 	// fileMu guards file, the owner's own read handle on the database: page reads use positioned reads
 	// on it, independent of the pager's lock, so a client never waits on the owner's commit. Compaction
@@ -457,11 +458,8 @@ func (o *pageServiceOwner) broadcast(n psNotice) {
 
 // waitAdmission blocks an owner session's transaction begin while a yield drains (README.md §6.5).
 func (o *pageServiceOwner) waitAdmission() {
-	o.stateMu.Lock()
-	done := o.drainDone
-	o.stateMu.Unlock()
-	if done != nil {
-		<-done
+	if done := o.drainDone.Load(); done != nil {
+		<-*done
 	}
 }
 
@@ -530,7 +528,9 @@ func (sc *psServerConn) requestOwnership() psMessage {
 	case o.state != ownerServing, o.preference != OwnershipYield && !o.readOnly:
 		return psOwnershipReply{status: psOwnershipRefused}
 	}
-	o.state, o.requester, o.drainDone = ownerYielding, sc, make(chan struct{})
+	done := make(chan struct{})
+	o.state, o.requester = ownerYielding, sc
+	o.drainDone.Store(&done)
 	go o.yield(sc)
 	return psOwnershipReply{status: psOwnershipYielding}
 }
@@ -586,11 +586,10 @@ func (o *pageServiceOwner) cancelYield() {
 // endDrain releases the owner's own waiting begins.
 func (o *pageServiceOwner) endDrain() {
 	o.stateMu.Lock()
-	done := o.drainDone
-	o.drainDone = nil
+	done := o.drainDone.Swap(nil)
 	o.stateMu.Unlock()
 	if done != nil {
-		close(done)
+		close(*done)
 	}
 }
 

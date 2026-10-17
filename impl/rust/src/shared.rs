@@ -1307,8 +1307,8 @@ impl Shared {
         &self,
         owner: &crate::pageservice::owner::PageServiceOwner,
     ) -> Result<()> {
-        if !self.is_owner(owner)
-            || owner.foreign.load(Ordering::Acquire) <= self.committed_version()
+        if owner.foreign.load(Ordering::Acquire) <= self.committed_version()
+            || !self.is_owner(owner)
         {
             return Ok(());
         }
