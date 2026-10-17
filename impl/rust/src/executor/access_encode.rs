@@ -1183,6 +1183,7 @@ fn estimator_array_point_sources(array: &ArrayPointSource, key_type: ScalarType)
         // A membership subquery's list is known only after its fold: stand-ins of unknown value (a
         // sibling slot no relation has, which the estimator never reads).
         ArrayPointSource::Folded(_) => BoundSrc::Sibling(usize::MAX),
+        ArrayPointSource::Sibling(i) => BoundSrc::Sibling(*i),
     };
     vec![stand_in; DEFAULT_ARRAY_ELEMENTS]
 }
@@ -2392,11 +2393,23 @@ fn build_index_interval_set_plan(
     idx: &IndexDef,
     catalog: &Engine,
 ) -> Option<IndexKeySet> {
+    build_index_interval_set_plan_conjuncts(&flatten_conjuncts(filter), rel, idx, catalog, None)
+}
+
+/// [`build_index_interval_set_plan`] over an AND-chain's conjuncts; `siblings` admits a sibling
+/// column as a member's source (an index-nested-loop inner).
+fn build_index_interval_set_plan_conjuncts(
+    conjuncts: &[&RExpr],
+    rel: &ScopeRel,
+    idx: &IndexDef,
+    catalog: &Engine,
+    siblings: Option<&[(usize, usize)]>,
+) -> Option<IndexKeySet> {
     if idx.kind != IndexKind::Btree || idx.predicate.is_some() {
         return None;
     }
     let cols = idx.column_ordinals()?;
-    let (tuple, has_set) = walk_tuple_members(&flatten_conjuncts(filter), rel, &cols, catalog);
+    let (tuple, has_set) = walk_tuple_members(conjuncts, rel, &cols, catalog, siblings);
     if !has_set {
         return None;
     }
@@ -2491,17 +2504,19 @@ pub(crate) fn detect_interval_set(
     key_type: ScalarType,
     coll: Option<&Collation>,
 ) -> Option<(Vec<IntervalSpec>, Vec<BoundTerm>)> {
+    detect_interval_set_conjuncts(&flatten_conjuncts(filter), key_idx, key_type, coll, None)
+}
+
+/// [`detect_interval_set`] over an AND-chain's conjuncts; `siblings` admits a sibling column as a
+/// source (an index-nested-loop inner, cost.md §3 "JOIN").
+fn detect_interval_set_conjuncts(
+    conjuncts: &[&RExpr],
+    key_idx: usize,
+    key_type: ScalarType,
+    coll: Option<&Collation>,
+    siblings: Option<&[(usize, usize)]>,
+) -> Option<(Vec<IntervalSpec>, Vec<BoundTerm>)> {
     let col_coll = coll.map(|c| c.name.as_str());
-    fn flatten<'a>(e: &'a RExpr, out: &mut Vec<&'a RExpr>) {
-        if let RExpr::And(l, r) = e {
-            flatten(l, out);
-            flatten(r, out);
-        } else {
-            out.push(e);
-        }
-    }
-    let mut conjuncts = Vec::new();
-    flatten(filter, &mut conjuncts);
     let mut found = None;
     for (i, e) in conjuncts.iter().enumerate() {
         if !matches!(
@@ -2513,21 +2528,21 @@ pub(crate) fn detect_interval_set(
         ) {
             continue;
         }
-        if let Some(specs) = reduce_interval_union(e, key_idx, key_type, col_coll) {
+        if let Some(specs) = reduce_interval_union(e, key_idx, key_type, col_coll, siblings) {
             found = Some((i, specs));
             break;
         }
     }
     let (found_idx, specs) = found?;
     let mut clip = Vec::new();
-    for (i, e) in conjuncts.into_iter().enumerate() {
+    for (i, e) in conjuncts.iter().enumerate() {
         if i != found_idx {
             collect_bound_terms(
                 e,
                 &KeyMatch::Column(key_idx),
                 key_type,
                 col_coll,
-                None,
+                siblings,
                 &mut clip,
             );
         }
@@ -2542,6 +2557,17 @@ pub(crate) fn detect_tuple_interval_set(
     rel: &ScopeRel,
     catalog: &Engine,
 ) -> Option<PkKeySet> {
+    detect_tuple_interval_set_conjuncts(&flatten_conjuncts(filter), rel, catalog, None)
+}
+
+/// [`detect_tuple_interval_set`] over an AND-chain's conjuncts; `siblings` admits a sibling column as
+/// a member's source (an index-nested-loop inner).
+fn detect_tuple_interval_set_conjuncts(
+    conjuncts: &[&RExpr],
+    rel: &ScopeRel,
+    catalog: &Engine,
+    siblings: Option<&[(usize, usize)]>,
+) -> Option<PkKeySet> {
     let pk = rel.table.pk_indices();
     if pk.len() < 2 {
         return None;
@@ -2552,7 +2578,7 @@ pub(crate) fn detect_tuple_interval_set(
             .as_scalar()
             .is_some_and(|ty| ty.is_fixed_width())
     });
-    let (tuple, has_set) = walk_tuple_members(&flatten_conjuncts(filter), rel, &pk, catalog);
+    let (tuple, has_set) = walk_tuple_members(conjuncts, rel, &pk, catalog, siblings);
     has_set.then(|| PkKeySet {
         pk_type: tuple[0].col_type,
         coll: None,
@@ -2588,6 +2614,7 @@ fn walk_tuple_members(
     rel: &ScopeRel,
     cols: &[usize],
     catalog: &Engine,
+    siblings: Option<&[(usize, usize)]>,
 ) -> (Vec<TupleMember>, bool) {
     let mut tuple = Vec::new();
     let mut has_set = false;
@@ -2611,7 +2638,7 @@ fn walk_tuple_members(
             ) {
                 continue;
             }
-            if let Some(specs) = reduce_interval_union(e, key_idx, ty, col_coll) {
+            if let Some(specs) = reduce_interval_union(e, key_idx, ty, col_coll, siblings) {
                 found = Some((i, specs));
                 break;
             }
@@ -2621,7 +2648,14 @@ fn walk_tuple_members(
         let mut clip = Vec::new();
         for (i, e) in conjuncts.iter().enumerate() {
             if Some(i) != found_idx {
-                collect_bound_terms(e, &KeyMatch::Column(key_idx), ty, col_coll, None, &mut clip);
+                collect_bound_terms(
+                    e,
+                    &KeyMatch::Column(key_idx),
+                    ty,
+                    col_coll,
+                    siblings,
+                    &mut clip,
+                );
             }
         }
         let has_eq = clip.iter().any(|t| t.op == CmpOp::Eq);
@@ -2661,14 +2695,15 @@ pub(crate) fn reduce_interval_union(
     key_idx: usize,
     key_type: ScalarType,
     col_coll: Option<&str>,
+    siblings: Option<&[(usize, usize)]>,
 ) -> Option<Vec<IntervalSpec>> {
     if let RExpr::Or(l, r) = e {
-        let mut left = reduce_interval_union(l, key_idx, key_type, col_coll)?;
-        let right = reduce_interval_union(r, key_idx, key_type, col_coll)?;
+        let mut left = reduce_interval_union(l, key_idx, key_type, col_coll, siblings)?;
+        let right = reduce_interval_union(r, key_idx, key_type, col_coll, siblings)?;
         left.extend(right);
         return Some(left);
     }
-    if let Some(spec) = as_array_point_spec(e, key_idx, key_type, col_coll) {
+    if let Some(spec) = as_array_point_spec(e, key_idx, key_type, col_coll, siblings) {
         return Some(vec![spec]);
     }
     // A leaf is an AND of same-key comparisons (BETWEEN's resolved shape) and at most one `= ANY`
@@ -2678,11 +2713,12 @@ pub(crate) fn reduce_interval_union(
         key_idx: usize,
         key_type: ScalarType,
         col_coll: Option<&str>,
+        siblings: Option<&[(usize, usize)]>,
         out: &mut IntervalSpec,
     ) -> bool {
         if let RExpr::And(l, r) = e {
-            return leaf_terms(l, key_idx, key_type, col_coll, out)
-                && leaf_terms(r, key_idx, key_type, col_coll, out);
+            return leaf_terms(l, key_idx, key_type, col_coll, siblings, out)
+                && leaf_terms(r, key_idx, key_type, col_coll, siblings, out);
         }
         let before = out.terms.len();
         collect_bound_terms(
@@ -2690,7 +2726,7 @@ pub(crate) fn reduce_interval_union(
             &KeyMatch::Column(key_idx),
             key_type,
             col_coll,
-            None,
+            siblings,
             &mut out.terms,
         );
         if out.terms.len() == before + 1 {
@@ -2698,7 +2734,7 @@ pub(crate) fn reduce_interval_union(
         }
         out.terms.truncate(before);
         if out.array.is_none()
-            && let Some(spec) = as_array_point_spec(e, key_idx, key_type, col_coll)
+            && let Some(spec) = as_array_point_spec(e, key_idx, key_type, col_coll, siblings)
         {
             out.array = spec.array;
             return true;
@@ -2709,7 +2745,7 @@ pub(crate) fn reduce_interval_union(
         terms: Vec::new(),
         array: None,
     };
-    leaf_terms(e, key_idx, key_type, col_coll, &mut spec).then(|| vec![spec])
+    leaf_terms(e, key_idx, key_type, col_coll, siblings, &mut spec).then(|| vec![spec])
 }
 
 /// Whether `e` is `key = ANY(array)` whose array elements are points of the key (cost.md §3
@@ -2718,6 +2754,30 @@ pub(crate) fn reduce_interval_union(
 /// exactly the key's type, or a promoted type whose values convert exactly to the key
 /// (`elem_promoted`); a promoted array must be readable as a value, since its elements convert
 /// through [`point_value`]. Returns that array as one array spec.
+/// An interval or tuple set with a sibling column among its sources (a comparison source, an array
+/// operand, or an `ARRAY[...]` element): an index-nested-loop set.
+fn key_set_uses_sibling(specs: &[IntervalSpec], clip: &[BoundTerm], tuple: &[TupleMember]) -> bool {
+    let terms_use =
+        |terms: &[BoundTerm]| terms.iter().any(|t| matches!(t.src, BoundSrc::Sibling(_)));
+    let specs_use = |specs: &[IntervalSpec]| {
+        specs.iter().any(|spec| {
+            terms_use(&spec.terms)
+                || match &spec.array {
+                    Some(ArrayPointSource::Sibling(_)) => true,
+                    Some(ArrayPointSource::Elements(elems)) => {
+                        elems.iter().any(|e| matches!(e, BoundSrc::Sibling(_)))
+                    }
+                    _ => false,
+                }
+        })
+    };
+    specs_use(specs)
+        || terms_use(clip)
+        || tuple
+            .iter()
+            .any(|m| specs_use(m.specs.as_deref().unwrap_or_default()) || terms_use(&m.clip))
+}
+
 /// A membership-subquery point source among an interval set's disjuncts.
 fn specs_have_subquery(specs: &[IntervalSpec]) -> bool {
     specs.iter().any(|spec| {
@@ -2774,6 +2834,7 @@ fn as_array_point_spec(
     key_idx: usize,
     key_type: ScalarType,
     col_coll: Option<&str>,
+    siblings: Option<&[(usize, usize)]>,
 ) -> Option<IntervalSpec> {
     if let Some(array) = subquery_point_source(e, key_idx, col_coll) {
         return Some(IntervalSpec {
@@ -2800,7 +2861,7 @@ fn as_array_point_spec(
     {
         return None;
     }
-    let array = array_point_source(array, key_type, *elem_exact)?;
+    let array = array_point_source(array, key_type, *elem_exact, siblings)?;
     Some(IntervalSpec {
         terms: Vec::new(),
         array: Some(array),
@@ -2811,8 +2872,20 @@ fn as_array_point_spec(
 /// readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
 /// outer column, or — for an exact element type only — a one-dimensional `ARRAY[...]` whose every
 /// element is a constant key source.
-fn array_point_source(e: &RExpr, key_type: ScalarType, exact: bool) -> Option<ArrayPointSource> {
+fn array_point_source(
+    e: &RExpr,
+    key_type: ScalarType,
+    exact: bool,
+    siblings: Option<&[(usize, usize)]>,
+) -> Option<ArrayPointSource> {
     match e {
+        // Index-nested-loop: a sibling array column of the selected physical-left relation.
+        RExpr::Column(i)
+            if siblings
+                .is_some_and(|ranges| ranges.iter().any(|&(lo, hi)| *i >= lo && *i < hi)) =>
+        {
+            Some(ArrayPointSource::Sibling(*i))
+        }
         RExpr::Param(i) => Some(ArrayPointSource::Param(*i)),
         RExpr::ConstArray(a) => Some(ArrayPointSource::Const(a.clone())),
         RExpr::ConstNull => Some(ArrayPointSource::Null),
@@ -2825,7 +2898,7 @@ fn array_point_source(e: &RExpr, key_type: ScalarType, exact: bool) -> Option<Ar
             nested: false,
         } if exact => elems
             .iter()
-            .map(|elem| const_source(elem, key_type, None))
+            .map(|elem| const_source(elem, key_type, siblings))
             .collect::<Option<Vec<_>>>()
             .map(ArrayPointSource::Elements),
         _ => None,
@@ -2872,6 +2945,7 @@ fn array_point_keys(
     params: &[Value],
     outer: &[&[Value]],
     coll: Option<&Collation>,
+    left: &[Value],
 ) -> Option<Vec<Vec<u8>>> {
     let value = match src {
         ArrayPointSource::Elements(elems) => {
@@ -2879,7 +2953,7 @@ fn array_point_keys(
                 elems
                     .iter()
                     .filter_map(|elem| {
-                        match encode_bound_key(key_type, elem, params, outer, coll, &[]) {
+                        match encode_bound_key(key_type, elem, params, outer, coll, left) {
                             BoundKey::Key(k) => Some(k),
                             BoundKey::Null | BoundKey::OutOfRange => None,
                         }
@@ -2898,6 +2972,11 @@ fn array_point_keys(
         ArrayPointSource::List(values) => return Some(value_point_keys(key_type, values, coll)),
         ArrayPointSource::Param(i) => &params[*i],
         ArrayPointSource::Outer { level, index } => &outer[outer.len() - level][*index],
+        // Index-nested-loop: the sibling column of the current combined left-hand row.
+        ArrayPointSource::Sibling(i) => match left.get(*i) {
+            Some(v) => v,
+            None => return Some(Vec::new()),
+        },
         ArrayPointSource::Const(a) => {
             return Some(array_value_point_keys(key_type, a, coll));
         }
@@ -3073,6 +3152,56 @@ pub(crate) fn inventory_inl_candidates<'a>(
                         .map(|&c| rel.table.columns[c].ty.scalar())
                         .collect(),
                 }),
+                where_filter,
+            ));
+        }
+    }
+    // Interval and tuple sets bound to a sibling (cost.md §3 "JOIN"): a PK or index set one of whose
+    // sources is a sibling column — `id = ANY(s.ids)`, `tenant = s.tenant AND id IN (1, 2)` — is
+    // evaluated per outer row. A set with constant sources only is the ordinary relation bound.
+    let conjuncts: Vec<&RExpr> = filters.iter().flat_map(|f| flatten_conjuncts(f)).collect();
+    let pk_set = detect_tuple_interval_set_conjuncts(&conjuncts, rel, catalog, sibling_range)
+        .or_else(|| {
+            let pk_local = rel.table.primary_key_index()?;
+            let sty = rel.table.columns[pk_local].ty.as_scalar()?;
+            let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
+            let (specs, clip) = detect_interval_set_conjuncts(
+                &conjuncts,
+                rel.offset + pk_local,
+                sty,
+                coll.as_deref(),
+                sibling_range,
+            )?;
+            Some(PkKeySet {
+                pk_type: sty,
+                coll,
+                specs,
+                clip,
+                tuple: Vec::new(),
+                member_count: 1,
+                all_fixed: sty.is_fixed_width(),
+            })
+        });
+    if let Some(bound) = pk_set
+        && key_set_uses_sibling(&bound.specs, &bound.clip, &bound.tuple)
+    {
+        candidates.push(storage_order_candidate(
+            ScanCandidateKind::PkInterval,
+            String::new(),
+            Some(ScanBound::PkSet(bound)),
+            where_filter,
+        ));
+    }
+    for idx in &rel.table.indexes {
+        if let Some(bound) =
+            build_index_interval_set_plan_conjuncts(&conjuncts, rel, idx, catalog, sibling_range)
+            && key_set_uses_sibling(&[], &[], &bound.tuple)
+        {
+            let name = bound.name_key.clone();
+            candidates.push(index_order_candidate(
+                ScanCandidateKind::IndexInterval,
+                name,
+                ScanBound::IndexSet(bound),
                 where_filter,
             ));
         }
@@ -5373,7 +5502,7 @@ pub(crate) fn canonical_interval_set(
             } else {
                 continue;
             };
-            let Some(keys) = array_point_keys(key_type, array, params, outer, coll) else {
+            let Some(keys) = array_point_keys(key_type, array, params, outer, coll, left) else {
                 if !bound_empty(&point_clip) {
                     intervals.push(point_clip);
                 }
@@ -5510,7 +5639,7 @@ fn member_points(
             } else {
                 continue;
             };
-            let points = array_point_keys(m.col_type, array, params, outer, coll)?;
+            let points = array_point_keys(m.col_type, array, params, outer, coll, left)?;
             keys.extend(points.into_iter().filter(|key| inside(key, &within)));
             continue;
         }

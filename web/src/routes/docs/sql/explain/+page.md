@@ -202,7 +202,9 @@ another width or a `decimal` key, and a `decimal` array against an integer key: 
 converted to the key's type, and one no key can equal (out of range, or with a fractional part) is
 skipped. EXPLAIN counts it as one of the set's intervals and marks it `arrays=1`,
 since its point count is known only when the query runs. The estimate reads the array's elements,
-so a bound list is planned with the values each execution binds.
+so a bound list is planned with the values each execution binds. An uncorrelated `id IN (SELECT …)`
+or `id = ANY(SELECT …)` works the same way: the subquery runs once before the scan, and its rows are
+the list.
 
 <LiveSql demo="anyPointSet" seed={seed} query={anyPointSet} rows={8} />
 
@@ -233,7 +235,10 @@ outer relation (`c.id = t.city_id`), jed opens that bound **per outer row** inst
 whole inner table — an `Index-nested-loop … bound` on the inner `Scan`. Alongside primary-key and
 ordered B-tree comparisons, GIN array predicates (`@>`, `&&`, array `=`, scalar `= ANY`) and GiST
 range/scalar predicates (`&&`, `@>`, `=`) can use a bare earlier-sibling column. EXPLAIN names these
-`Index-nested-loop GIN bound` and `Index-nested-loop GiST bound`. The plan stays a `Nested Loop`; the
+`Index-nested-loop GIN bound` and `Index-nested-loop GiST bound`. A key list can come from the outer
+row too: `o.id = ANY(l.ids)` looks up each element of the outer row's array, and `b.store =
+s.store AND b.sku IN (7, 9)` looks up each `(store, sku)` pair for the outer row's store — an
+`Index-nested-loop PK interval set` or `Index interval set`. The plan stays a `Nested Loop`; the
 inner child makes the per-outer access method visible.
 
 The indexed relation need not appear second in SQL. This example deliberately writes `city` first;

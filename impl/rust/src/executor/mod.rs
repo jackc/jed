@@ -7087,6 +7087,9 @@ pub(crate) enum ArrayPointSource {
     Folded(std::sync::Arc<FoldedPoints>),
     /// A folded `IN` list a mutation plans over.
     List(Vec<Value>),
+    /// Index-nested-loop: a sibling array column, read from the current combined left-hand row by
+    /// its GLOBAL column index (the `BoundSrc::Sibling` precedent).
+    Sibling(usize),
 }
 
 /// Canonical interval-set plan over a single-column PK. Specs are OR disjuncts; `clip` is the

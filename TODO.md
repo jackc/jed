@@ -262,10 +262,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     - [x] _follow-on:_ an uncorrelated `IN (SELECT …)` / `= ANY(SELECT …)` (its folded value list),
       an ANY under an AND leaf of an OR, the `<> ALL` complement estimate, and the residual's
       per-element `operator_eval` for an array of known length.
+    - [x] _follow-on:_ an index-nested-loop sibling array column (`o.id = ANY(l.ids)`) — an inner
+      PK / index interval set or tuple set with a sibling source. → [cost.md §3](spec/design/cost.md)
+      "index-nested-loop"
     - [ ] _follow-on:_ the shapes that still full-scan — a promoted `ARRAY[...]` constructor
       (`ARRAY[1::i32, 3::i32]` against an `i64` key) and promoted floats (`f32[]` against an `f64`
-      key), and an index-nested-loop sibling array column. A bench param generator that binds a
-      real array (`any_array_pk` and `composite_pk_any` build one from eight scalars). _(size: S)_
+      key). A bench param generator that binds a real array (`any_array_pk` and `composite_pk_any`
+      build one from eight scalars). _(size: S)_
     - [ ] _follow-on:_ an uncorrelated subquery inside a derived-table body is evaluated with the
       body (per row) instead of folded before its scan opens, so its `IN` point set widens to every
       key there. _(size: S)_
@@ -278,8 +281,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `(a, b)` probes `(a, b)` prefixes for `a = 1 AND b = ANY($1)`; key columns from the first later
       set or range onward stay fixed-width for row-key suffix recovery). → [cost.md §3](spec/design/cost.md)
       "Multi-column secondary indexes"
-    - [ ] _follow-on:_ an index-nested-loop sibling column as a tuple-set member's point source
-      (PK and index). _(size: S)_
+    - [x] _follow-on:_ an index-nested-loop sibling column as a tuple-set member's point source
+      (PK and index): `b.tenant = a.tenant AND b.id IN (1, 2)` probes the outer row's tuples.
     - [x] _follow-on:_ a variable-width index column at or after the first later set or range — an
       admitted entry steps over a C-collated `text`/`bytea`, `decimal`, or `interval` slot by
       decoding its delimiter, so such a column no longer leaves only the plain index bound (a

@@ -903,6 +903,18 @@ pinned cross-core in `spec/conformance/suites/joins/index_nested_loop.test` (and
 `joins/pushdown.test` / `self_join.test` / `comma.test` / `qualified*.test` cross-relation cases).
 EXPLAIN surfaces the access path as `Index-nested-loop PK bound` / `Index-nested-loop Index bound`.
 
+The same rule admits **interval and tuple sets with a sibling source** (`query.any_array_point_lookup`,
+`query.composite_key_set`): the PK / index interval sets and tuple sets of "OR / IN-list",
+"Composite primary keys", and "Multi-column secondary indexes" above, detected over the `ON` and WHERE
+conjuncts together, where a source may also be a bare earlier-sibling column — an `= ANY` array
+operand (`b.id = ANY(a.ids)`, one point per element of the current outer row's array, a promoted
+element type converted as above), an `ARRAY[…]` element, or a member's equality or range source
+(`b.tenant = a.tenant AND b.id IN (1, 2)` probes `(a.tenant, 1)` and `(a.tenant, 2)`). Such a set is
+an index-nested-loop candidate only when some source is a sibling column; one with constant sources
+only is the relation's ordinary once-materialized bound. Its intervals are built per outer row and
+charged as the same sum of bounded scans; EXPLAIN shows `Index-nested-loop PK interval set` /
+`Index-nested-loop Index interval set`. Pinned in `query/inl_key_set.test`.
+
 The same rule admits **opclass sibling bounds** after the cheaper PK and ordered-B-tree checks:
 
 - GIN `@>` / `&&` / array `=` and scalar `= ANY(array)` evaluate a bare earlier-sibling query
@@ -919,7 +931,8 @@ residual-rechecked; therefore lossy candidates, misses, and LEFT NULL extension 
 to nested loop. An unsupported runtime value yields the specified empty/fallback behavior, never an
 unsound prune. The operand must be the bare earlier column — the inner's own column and a later
 sibling are rejected. A usable sibling bound takes precedence over the relation's once-materialized
-constant bound; within INL the fixed order is PK → ordered B-tree → GiST → GIN. Gated by
+constant bound; within INL the fixed order is PK → ordered B-tree → GiST → GIN → PK interval set →
+index interval set. Gated by
 `query.gin_index_nested_loop` / `query.gist_index_nested_loop`, with cross-core costs pinned in the
 three `joins/*index_nested_loop.test` opclass suites. EXPLAIN uses `Index-nested-loop GIN bound` /
 `Index-nested-loop GiST bound`.

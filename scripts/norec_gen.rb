@@ -304,7 +304,10 @@ CORRELATED_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi
 INL_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.order_by_keys
              query.qualified_column query.join_inner query.join_left query.index_nested_loop
-             query.point_lookup expr.arithmetic types.i32 null.three_valued].freeze
+             query.point_lookup expr.arithmetic types.i32 null.three_valued
+             query.any_array_point_lookup query.interval_set query.composite_key_set
+             query.or_in_point_lookup query.logical_connectives ddl.composite_primary_key
+             func.array_quantified types.array cast.array expr.in_list].freeze
 INDEX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert dml.insert_multi_row
                dml.update dml.delete query.select query.where_eq query.comparison_order
                query.order_by expr.arithmetic expr.comparison_value types.i32
@@ -896,6 +899,35 @@ def gen_index_nested_loop(seed)
   ipair.call("INNER, bound inr by the WHERE (ON true)",
              "SELECT o.id, inr.v FROM o JOIN inr ON true WHERE inr.id = o.k ORDER BY o.id",
              "SELECT o.id, inr.v FROM o JOIN inr ON true WHERE inr.id + 0 = o.k ORDER BY o.id", inner)
+
+  # A sibling array column is an inner interval set's point source, and a sibling column a tuple-set
+  # member's point (cost.md §3 "JOIN"); `+ 0` on the inner key full-scans per outer row.
+  lists = o_ids.map do |oid|
+    arr = Array.new(rng.rand(0..3)) { rng.rand < 0.2 ? nil : (inr.map(&:first) + absent_pool).sample(random: rng) }
+    [oid, oid == o_ids.last ? nil : arr]
+  end
+  lit = ->(arr) { arr.nil? ? 'NULL' : "'{#{arr.map { |x| x.nil? ? 'NULL' : x }.join(',')}}'" }
+  stmt(out, "CREATE TABLE ol (id i32 PRIMARY KEY, ks i32[])")
+  stmt(out, "INSERT INTO ol VALUES #{lists.map { |oid, arr| "(#{oid}, #{lit.call(arr)})" }.join(', ')}")
+  arr_rows = lists.flat_map do |oid, arr|
+    (arr || []).compact.uniq.sort.select { |k| inr_by_id.key?(k) }.map { |k| [oid, k, inr_by_id[k]] }
+  end
+  aflat = arr_rows.flat_map { |oid, k, v| [oid.to_s, k.to_s, v.to_s] }
+  out << "# INNER, bound inr by a sibling array `inr.id = ANY(ol.ks)`"
+  q(out, "III", "SELECT ol.id, inr.id, inr.v FROM ol JOIN inr ON inr.id = ANY(ol.ks) ORDER BY ol.id, inr.id", aflat)
+  q(out, "III", "SELECT ol.id, inr.id, inr.v FROM ol JOIN inr ON inr.id + 0 = ANY(ol.ks) ORDER BY ol.id, inr.id", aflat)
+
+  stmt(out, "CREATE TABLE ct (t i32, id i32, v i32, PRIMARY KEY (t, id))")
+  ct = (1..15).to_a.sample(6, random: rng).flat_map { |t| (1..6).map { |id| [t, id, rng.rand(-20..20)] } }
+  stmt(out, "INSERT INTO ct VALUES #{ct.map { |t, id, v| "(#{t}, #{id}, #{v})" }.join(', ')}")
+  picks = (1..6).to_a.sample(2, random: rng).sort
+  ct_rows = o.sort_by(&:first).flat_map do |oid, ok|
+    ct.select { |t, id, _v| ok && t == ok && picks.include?(id) }.sort_by { |_t, id, _v| id }.map { |_t, id, v| [oid, id, v] }
+  end
+  cflat = ct_rows.flat_map { |oid, id, v| [oid.to_s, id.to_s, v.to_s] }
+  out << "# INNER, a tuple set whose leading member is the sibling `ct.t = o.k`"
+  q(out, "III", "SELECT o.id, ct.id, ct.v FROM o JOIN ct ON ct.t = o.k AND ct.id IN (#{picks.join(', ')}) ORDER BY o.id, ct.id", cflat)
+  q(out, "III", "SELECT o.id, ct.id, ct.v FROM o JOIN ct ON ct.t + 0 = o.k AND ct.id + 0 IN (#{picks.join(', ')}) ORDER BY o.id, ct.id", cflat)
 
   out.join("\n") + "\n"
 end

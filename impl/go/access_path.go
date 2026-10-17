@@ -730,14 +730,23 @@ func scanBoundHasStorageOrder(bound *scanBound) bool {
 }
 
 func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx indexDef) *indexKeySetPlan {
-	if idx.Kind != indexBtree || idx.Predicate != nil || filter == nil {
+	if filter == nil {
+		return nil
+	}
+	return db.buildIndexIntervalSetPlanConjuncts(flattenConjuncts(filter), rel, idx, nil)
+}
+
+// buildIndexIntervalSetPlanConjuncts is buildIndexIntervalSetPlan over an AND-chain's conjuncts;
+// siblings admits a sibling column as a member's source (an index-nested-loop inner).
+func (db *engine) buildIndexIntervalSetPlanConjuncts(conjuncts []*rExpr, rel scopeRel, idx indexDef, siblings columnRanges) *indexKeySetPlan {
+	if idx.Kind != indexBtree || idx.Predicate != nil {
 		return nil
 	}
 	cols := idx.columnOrdinals()
 	if cols == nil {
 		return nil
 	}
-	members, hasSet := db.walkTupleMembers(flattenConjuncts(filter), rel, cols)
+	members, hasSet := db.walkTupleMembers(conjuncts, rel, cols, siblings)
 	if !hasSet {
 		return nil
 	}
@@ -799,27 +808,22 @@ func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Coll
 	if filter == nil {
 		return nil, nil
 	}
+	return detectIntervalSetConjuncts(flattenConjuncts(filter), keyIdx, keyType, coll, nil)
+}
+
+// detectIntervalSetConjuncts is detectIntervalSet over an AND-chain's conjuncts; siblings admits a
+// sibling column as a source (an index-nested-loop inner, cost.md §3 "JOIN").
+func detectIntervalSetConjuncts(conjuncts []*rExpr, keyIdx int, keyType scalarType, coll *Collation, siblings columnRanges) (specs []intervalSpec, clip []boundTerm) {
 	colColl := ""
 	if coll != nil {
 		colColl = coll.Name
 	}
-	var conjuncts []*rExpr
-	var flatten func(*rExpr)
-	flatten = func(e *rExpr) {
-		if e.kind == reAnd {
-			flatten(e.lhs)
-			flatten(e.rhs)
-			return
-		}
-		conjuncts = append(conjuncts, e)
-	}
-	flatten(filter)
 	found := -1
 	for i, e := range conjuncts {
 		if e.kind != reOr && e.kind != reQuantified && e.kind != reSubquery && e.kind != reInValues {
 			continue
 		}
-		if reduced, ok := reduceIntervalUnion(e, keyIdx, keyType, colColl); ok {
+		if reduced, ok := reduceIntervalUnion(e, keyIdx, keyType, colColl, siblings); ok {
 			specs, found = reduced, i
 			break
 		}
@@ -831,7 +835,7 @@ func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Coll
 		if i == found {
 			continue
 		}
-		if t, ok := asBoundTerm(e, columnMatch(keyIdx), keyType, colColl, nil); ok {
+		if t, ok := asBoundTerm(e, columnMatch(keyIdx), keyType, colColl, siblings); ok {
 			clip = append(clip, t)
 		}
 	}
@@ -841,8 +845,17 @@ func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Coll
 // detectTupleIntervalSet builds a composite-PK tuple interval set (cost.md §3 "Composite primary
 // keys") over the PK members. nil unless some consumed member has a set.
 func (db *engine) detectTupleIntervalSet(filter *rExpr, rel scopeRel) *pkKeySetPlan {
+	if filter == nil {
+		return nil
+	}
+	return db.detectTupleIntervalSetConjuncts(flattenConjuncts(filter), rel, nil)
+}
+
+// detectTupleIntervalSetConjuncts is detectTupleIntervalSet over an AND-chain's conjuncts; siblings
+// admits a sibling column as a member's source (an index-nested-loop inner).
+func (db *engine) detectTupleIntervalSetConjuncts(conjuncts []*rExpr, rel scopeRel, siblings columnRanges) *pkKeySetPlan {
 	pk := rel.table.PKIndices()
-	if len(pk) < 2 || filter == nil {
+	if len(pk) < 2 {
 		return nil
 	}
 	plan := &pkKeySetPlan{memberCount: len(pk), allFixed: true}
@@ -851,7 +864,7 @@ func (db *engine) detectTupleIntervalSet(filter *rExpr, rel scopeRel) *pkKeySetP
 			plan.allFixed = false
 		}
 	}
-	members, hasSet := db.walkTupleMembers(flattenConjuncts(filter), rel, pk)
+	members, hasSet := db.walkTupleMembers(conjuncts, rel, pk, siblings)
 	if !hasSet {
 		return nil
 	}
@@ -861,6 +874,9 @@ func (db *engine) detectTupleIntervalSet(filter *rExpr, rel scopeRel) *pkKeySetP
 
 // flattenConjuncts lists the top-level AND-chain's conjuncts in order.
 func flattenConjuncts(filter *rExpr) []*rExpr {
+	if filter == nil {
+		return nil
+	}
 	var conjuncts []*rExpr
 	var flatten func(*rExpr)
 	flatten = func(e *rExpr) {
@@ -879,7 +895,7 @@ func flattenConjuncts(filter *rExpr) []*rExpr {
 // primary keys"), each with its own set (the first reducing OR/IN/ANY conjunct) and clip (every
 // direct comparison). A point member continues the walk; the first other member with a set or clip
 // is the final member and ends it. hasSet reports that some consumed member has a set.
-func (db *engine) walkTupleMembers(conjuncts []*rExpr, rel scopeRel, cols []int) (members []tupleMember, hasSet bool) {
+func (db *engine) walkTupleMembers(conjuncts []*rExpr, rel scopeRel, cols []int, siblings columnRanges) (members []tupleMember, hasSet bool) {
 	for _, ci := range cols {
 		ty, ok := rel.table.Columns[ci].Type.AsScalar()
 		if !ok {
@@ -900,7 +916,7 @@ func (db *engine) walkTupleMembers(conjuncts []*rExpr, rel scopeRel, cols []int)
 			if e.kind != reOr && e.kind != reQuantified && e.kind != reSubquery && e.kind != reInValues {
 				continue
 			}
-			if reduced, ok := reduceIntervalUnion(e, keyIdx, ty, colColl); ok {
+			if reduced, ok := reduceIntervalUnion(e, keyIdx, ty, colColl, siblings); ok {
 				specs, found = reduced, i
 				break
 			}
@@ -911,7 +927,7 @@ func (db *engine) walkTupleMembers(conjuncts []*rExpr, rel scopeRel, cols []int)
 			if i == found {
 				continue
 			}
-			if t, ok := asBoundTerm(e, columnMatch(keyIdx), ty, colColl, nil); ok {
+			if t, ok := asBoundTerm(e, columnMatch(keyIdx), ty, colColl, siblings); ok {
 				clip = append(clip, t)
 				hasEq = hasEq || t.op == opEq
 			}
@@ -951,22 +967,22 @@ func pointSpecs(specs []intervalSpec) bool {
 	return true
 }
 
-func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl string) ([]intervalSpec, bool) {
+func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl string, siblings columnRanges) ([]intervalSpec, bool) {
 	if e == nil {
 		return nil, false
 	}
 	if e.kind == reOr {
-		l, lok := reduceIntervalUnion(e.lhs, keyIdx, keyType, colColl)
+		l, lok := reduceIntervalUnion(e.lhs, keyIdx, keyType, colColl, siblings)
 		if !lok {
 			return nil, false
 		}
-		r, rok := reduceIntervalUnion(e.rhs, keyIdx, keyType, colColl)
+		r, rok := reduceIntervalUnion(e.rhs, keyIdx, keyType, colColl, siblings)
 		if !rok {
 			return nil, false
 		}
 		return append(l, r...), true
 	}
-	if spec, ok := asArrayPointSpec(e, keyIdx, keyType, colColl); ok {
+	if spec, ok := asArrayPointSpec(e, keyIdx, keyType, colColl, siblings); ok {
 		return []intervalSpec{spec}, true
 	}
 	// A leaf is an AND of same-key comparisons (BETWEEN's resolved shape) and at most one `= ANY`
@@ -978,12 +994,12 @@ func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl strin
 		if x.kind == reAnd {
 			return walk(x.lhs) && walk(x.rhs)
 		}
-		if t, ok := asBoundTerm(x, columnMatch(keyIdx), keyType, colColl, nil); ok {
+		if t, ok := asBoundTerm(x, columnMatch(keyIdx), keyType, colColl, siblings); ok {
 			terms = append(terms, t)
 			return true
 		}
 		if array == nil {
-			if spec, ok := asArrayPointSpec(x, keyIdx, keyType, colColl); ok {
+			if spec, ok := asArrayPointSpec(x, keyIdx, keyType, colColl, siblings); ok {
 				array = spec.array
 				return true
 			}
@@ -1001,7 +1017,7 @@ func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl strin
 // collation (as asBoundTerm), and an array that is constant for the whole scan. The element type is
 // exactly the key's type, or a promoted type whose values convert exactly to the key (elemPromoted);
 // a promoted array must be readable as a value, since its elements convert through pointValue.
-func asArrayPointSpec(e *rExpr, keyIdx int, keyType scalarType, colColl string) (intervalSpec, bool) {
+func asArrayPointSpec(e *rExpr, keyIdx int, keyType scalarType, colColl string, siblings columnRanges) (intervalSpec, bool) {
 	if (e.kind == reSubquery || e.kind == reInValues) && isSubqueryPointSource(e, keyIdx, colColl) {
 		return intervalSpec{array: e}, true
 	}
@@ -1012,7 +1028,7 @@ func asArrayPointSpec(e *rExpr, keyIdx int, keyType scalarType, colColl string) 
 	if e.collation != nil {
 		cmpColl = e.collation.Name
 	}
-	if cmpColl != colColl || !isArrayPointSource(e.rhs, keyType, e.elemExact) {
+	if cmpColl != colColl || !isArrayPointSource(e.rhs, keyType, e.elemExact, siblings) {
 		return intervalSpec{}, false
 	}
 	return intervalSpec{array: e.rhs}, true
@@ -1060,16 +1076,19 @@ func isSubqueryPointSource(e *rExpr, keyIdx int, colColl string) bool {
 // readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
 // outer column, or — for an exact element type only — a one-dimensional ARRAY[...] whose every
 // element is a constant key source.
-func isArrayPointSource(e *rExpr, keyType scalarType, exact bool) bool {
+func isArrayPointSource(e *rExpr, keyType scalarType, exact bool, siblings columnRanges) bool {
 	switch e.kind {
 	case reParam, reConstArray, reConstNull, reOuterColumn:
 		return true
+	case reColumn:
+		// Index-nested-loop: a sibling array column of the selected physical-left relation.
+		return siblings.contains(e.index)
 	case reArray:
 		if e.nested || !exact {
 			return false
 		}
 		for _, elem := range e.sargs {
-			if !isConstSource(elem, keyType, nil) {
+			if !isConstSource(elem, keyType, siblings) {
 				return false
 			}
 		}
@@ -1114,7 +1133,7 @@ func pointValue(keyType scalarType, v Value) (Value, bool) {
 // a NULL element, and an element no key can equal (an out-of-range integer, a non-integral decimal
 // against an integer key, an unmapped collated text) contribute no point, exactly as the equivalent
 // IN-list's disjuncts would.
-func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation) ([][]byte, bool) {
+func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation, left storedRow) ([][]byte, bool) {
 	var keys [][]byte
 	switch src.kind {
 	case reSubquery:
@@ -1122,13 +1141,13 @@ func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []stor
 		return nil, false
 	case reQuantified:
 		// A folded `= ANY(SELECT …)`: the constant array the fold produced.
-		return arrayPointKeys(keyType, src.rhs, params, outer, coll)
+		return arrayPointKeys(keyType, src.rhs, params, outer, coll, left)
 	case reInValues:
 		return valuePointKeys(keyType, src.list, coll), true
 	}
 	if src.kind == reArray {
 		for _, elem := range src.sargs {
-			if key, isNull, ok := encodeBoundKey(keyType, elem, params, outer, coll, nil); ok && !isNull {
+			if key, isNull, ok := encodeBoundKey(keyType, elem, params, outer, coll, left); ok && !isNull {
 				keys = append(keys, key)
 			}
 		}
@@ -1142,6 +1161,11 @@ func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []stor
 		v = outer[len(outer)-src.level][src.index]
 	case reConstArray:
 		v = arrayValueOf(src.cArray)
+	case reColumn:
+		// Index-nested-loop: the sibling column of the current combined left-hand row.
+		if src.index < len(left) {
+			v = left[src.index]
+		}
 	}
 	if v.Kind != ValArray {
 		return nil, true
@@ -1314,6 +1338,28 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 			candidates = append(candidates, indexOrderCandidate(scanCandidateBtree, bound.index.nameKey, bound, whereFilter))
 		}
 	}
+	// Interval and tuple sets bound to a sibling (cost.md §3 "JOIN"): a PK or index set one of whose
+	// sources is a sibling column — `id = ANY(s.ids)`, `tenant = s.tenant AND id IN (1, 2)` — is
+	// evaluated per outer row. A set with constant sources only is the ordinary relation bound.
+	conjuncts := append(flattenConjuncts(on), flattenConjuncts(whereFilter)...)
+	pkSet := db.detectTupleIntervalSetConjuncts(conjuncts, rel, siblingColumns)
+	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
+		if sty, ok := rel.table.Columns[pkLocal].Type.AsScalar(); ok {
+			if coll, push := db.keyCollationCtx(rel.table.Columns[pkLocal]); push {
+				if specs, clip := detectIntervalSetConjuncts(conjuncts, rel.offset+pkLocal, sty, coll, siblingColumns); specs != nil {
+					pkSet = &pkKeySetPlan{pkType: sty, coll: coll, specs: specs, clip: clip}
+				}
+			}
+		}
+	}
+	if pkSet != nil && keySetUsesSibling(pkSet.specs, pkSet.clip, pkSet.tuple) {
+		candidates = append(candidates, storageOrderCandidate(scanCandidatePKInterval, "", &scanBound{pkSet: pkSet}, whereFilter))
+	}
+	for _, idx := range rel.table.Indexes {
+		if is := db.buildIndexIntervalSetPlanConjuncts(conjuncts, rel, idx, siblingColumns); is != nil && keySetUsesSibling(nil, nil, is.tuple) {
+			candidates = append(candidates, indexOrderCandidate(scanCandidateIndexInterval, is.nameKey, &scanBound{indexSet: is}, whereFilter))
+		}
+	}
 	// Opclass sibling bounds follow the cheaper primary-key and ordered-B-tree paths. GiST precedes
 	// GIN, matching the ordinary SELECT access-path precedence; each detector admits only a bare
 	// column from an earlier sibling, never the indexed relation itself or a later relation.
@@ -1368,6 +1414,48 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		return bytes.Compare([]byte(a.indexName), []byte(b.indexName)) < 0
 	})
 	return candidates
+}
+
+// keySetUsesSibling reports an interval or tuple set with a sibling column among its sources (a
+// comparison source, an array operand, or an ARRAY[...] element): an index-nested-loop set.
+func keySetUsesSibling(specs []intervalSpec, clip []boundTerm, tuple []tupleMember) bool {
+	termsUse := func(terms []boundTerm) bool {
+		for _, t := range terms {
+			if t.src.kind == reColumn {
+				return true
+			}
+		}
+		return false
+	}
+	specsUse := func(specs []intervalSpec) bool {
+		for _, spec := range specs {
+			if termsUse(spec.terms) {
+				return true
+			}
+			if a := spec.array; a != nil {
+				if a.kind == reColumn {
+					return true
+				}
+				if a.kind == reArray {
+					for _, elem := range a.sargs {
+						if elem.kind == reColumn {
+							return true
+						}
+					}
+				}
+			}
+		}
+		return false
+	}
+	if specsUse(specs) || termsUse(clip) {
+		return true
+	}
+	for _, m := range tuple {
+		if specsUse(m.specs) || termsUse(m.clip) {
+			return true
+		}
+	}
+	return false
 }
 
 // keyCollationCtx reports the collation a key over col is STORED under, deciding whether — and how —
@@ -1933,7 +2021,7 @@ func canonicalIntervalSet(keyType scalarType, specs []intervalSpec, clipTerms []
 				}
 				pointClip = intersectBounds(b, clip)
 			}
-			keys, known := arrayPointKeys(keyType, spec.array, params, outer, coll)
+			keys, known := arrayPointKeys(keyType, spec.array, params, outer, coll, left)
 			if !known {
 				if !boundEmpty(pointClip) {
 					intervals = append(intervals, pointClip)
@@ -2033,7 +2121,7 @@ func memberPoints(m tupleMember, params []Value, outer []storedRow, left storedR
 				}
 				within = intersectBounds(b, clip)
 			}
-			keys, known := arrayPointKeys(m.colType, spec.array, params, outer, m.coll)
+			keys, known := arrayPointKeys(m.colType, spec.array, params, outer, m.coll, left)
 			if !known {
 				return nil, false
 			}
