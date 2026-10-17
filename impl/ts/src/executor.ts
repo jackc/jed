@@ -32732,6 +32732,7 @@ export function finalizeArrayAgg(plan: AggPlan, elems: Value[]): Value {
 const MOMENT_SURFACES: Record<string, [AggPlan, AggPlan]> = {
   var_pop: ["varPop", "varPopFloat"],
   stddev_samp: ["stddevSamp", "stddevSampFloat"],
+  stddev: ["stddevSamp", "stddevSampFloat"],
   stddev_pop: ["stddevPop", "stddevPopFloat"],
   var_samp: ["varSamp", "varSampFloat"],
   variance: ["varSamp", "varSampFloat"],

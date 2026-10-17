@@ -12,6 +12,7 @@ import "math"
 // momentSurfaces maps each one-argument statistical aggregate to its exact and float plans.
 var momentSurfaces = map[string][2]aggPlan{
 	"stddev_samp": {planStddevSamp, planStddevSampFloat},
+	"stddev":      {planStddevSamp, planStddevSampFloat},
 	"stddev_pop":  {planStddevPop, planStddevPopFloat},
 	"var_pop":     {planVarPop, planVarPopFloat},
 	"var_samp":    {planVarSamp, planVarSampFloat},
