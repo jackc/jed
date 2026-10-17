@@ -769,6 +769,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `regr_avgy(y, x)` | two exact / two float | `decimal` / `f64` | the mean of `y` |
 | `regr_sxx(y, x)` | two exact / two float | `decimal` / `f64` | the sum of squared deviations of `x` |
 | `regr_syy(y, x)` | two exact / two float | `decimal` / `f64` | the sum of squared deviations of `y` |
+| `regr_sxy(y, x)` | two exact / two float | `decimal` / `f64` | the sum of products of the deviations |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -894,3 +895,4 @@ with the one-argument float forms (`float-moment-order`).
 | `regr_avgy(y, x)` | `Σy / N` | `Σy / N` | no pair |
 | `regr_sxx(y, x)` | `numX / N` | `Sxx` | no pair |
 | `regr_syy(y, x)` | `numY / N` | `Syy` | no pair |
+| `regr_sxy(y, x)` | `numXY / N` | `Sxy` | no pair |
