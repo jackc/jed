@@ -46,6 +46,7 @@ enum Bound {
     I32(i32),
     I64(i64),
     Text(String),
+    I64Array(Vec<i64>),
 }
 
 fn coerce_args(args: &[Arg], stmt: &Statement) -> BoxResult<Vec<Bound>> {
@@ -57,6 +58,7 @@ fn coerce_args(args: &[Arg], stmt: &Statement) -> BoxResult<Vec<Bound>> {
             (Arg::Int(n), &Type::INT4) => Bound::I32(i32::try_from(*n)?),
             (Arg::Int(n), _) => Bound::I64(*n),
             (Arg::Text(s), _) => Bound::Text(s.clone()),
+            (Arg::IntArray(arr), _) => Bound::I64Array(arr.clone()),
         });
     }
     Ok(out)
@@ -70,11 +72,16 @@ fn bound_refs(bound: &[Bound]) -> Vec<&(dyn ToSql + Sync)> {
             Bound::I32(v) => v as &(dyn ToSql + Sync),
             Bound::I64(v) => v as &(dyn ToSql + Sync),
             Bound::Text(v) => v as &(dyn ToSql + Sync),
+            Bound::I64Array(v) => v as &(dyn ToSql + Sync),
         })
         .collect()
 }
 
 impl Engine for PgEngine {
+    fn array_params(&self) -> bool {
+        true
+    }
+
     fn exec(&mut self, sql: &str) -> BoxResult<()> {
         self.client.batch_execute(sql)?;
         Ok(())

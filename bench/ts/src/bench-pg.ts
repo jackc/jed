@@ -15,6 +15,7 @@ const TEXT_OIDS = new Set([25, 1043]); // text, varchar
 type Sql = ReturnType<typeof postgres>;
 
 class PgEngine implements Engine {
+  readonly arrayParams = true; // an int_array parameter binds as a bigint[] (benchmarks.md §3)
   private readonly sql: Sql;
   private query = "";
 

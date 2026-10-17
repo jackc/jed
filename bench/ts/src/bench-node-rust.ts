@@ -20,6 +20,7 @@ import {
   type Engine,
   mainWith,
   readSidecar,
+  scalarArgs,
 } from "./lib.ts";
 
 class NodeRustEngine implements Engine {
@@ -96,7 +97,7 @@ class NodeRustEngine implements Engine {
 }
 
 function bindArgs(args: Arg[]): BindValue[] {
-  return args;
+  return scalarArgs(args);
 }
 
 await mainWith({

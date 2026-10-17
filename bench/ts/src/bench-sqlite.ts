@@ -13,6 +13,7 @@ import {
   mainWith,
   readSidecar,
   rewritePlaceholders,
+  scalarArgs,
   staleErr,
 } from "./lib.ts";
 
@@ -42,7 +43,7 @@ class SqliteEngine implements Engine {
   }
 
   async queryPrepared(args: Arg[], sum: Checksum | null): Promise<number> {
-    const rows = this.stmt!.all(...args) as Record<string, unknown>[];
+    const rows = this.stmt!.all(...scalarArgs(args)) as Record<string, unknown>[];
     if (sum !== null) {
       for (const row of rows) {
         for (const name of this.cols) {
@@ -59,7 +60,7 @@ class SqliteEngine implements Engine {
   }
 
   async execPrepared(args: Arg[]): Promise<void> {
-    this.stmt!.run(...args);
+    this.stmt!.run(...scalarArgs(args));
   }
 
   async queryInt(sql: string): Promise<bigint> {

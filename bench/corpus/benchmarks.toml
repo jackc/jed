@@ -366,6 +366,226 @@ gen = "int_uniform"
 min = 1
 max = 1000
 
+# `key = ANY($1)` with a real bound array (query.any_array_point_lookup): the int_array generator binds
+# one bigint[] of eight uniformly drawn keys, the way a host passes a list, where any_array_pk spells
+# the array as eight scalar parameters. Drivers that bind no arrays skip it.
+[[bench]]
+name = "any_array_pk_param"
+description = "PK = ANY($1) with a bound bigint[] of eight keys on 100k rows; one point probe per element"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, v FROM any_param_orders WHERE id = ANY($1) ORDER BY id"
+warmup = 500
+iterations = 15000
+seed = 4321
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS any_param_orders",
+  "CREATE TABLE any_param_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO any_param_orders SELECT g, g * 3 FROM generate_series(1, 100000) AS g"
+]
+
+[[bench.param]]
+gen = "int_array"
+min_len = 8
+max_len = 8
+elem_min = 1
+elem_max = 100000
+
+# The composite-PK tuple set with a real bound array: tenant = $1 AND id = ANY($2), $2 one bigint[] of
+# eight ids (composite_pk_any spells it as eight scalars).
+[[bench]]
+name = "composite_pk_any_param"
+description = "Composite PK tenant = $1 AND id = ANY($2) with a bound bigint[] of eight ids on 100k rows"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, v FROM tenant_param_orders WHERE tenant = $1 AND id = ANY($2) ORDER BY id"
+warmup = 500
+iterations = 15000
+seed = 4322
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS tenant_param_orders",
+  "CREATE TABLE tenant_param_orders (tenant bigint, id bigint, v bigint, PRIMARY KEY (tenant, id))",
+  "INSERT INTO tenant_param_orders SELECT t, i, t * 1000 + i FROM generate_series(1, 100) AS t, generate_series(1, 1000) AS i"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100
+
+[[bench.param]]
+gen = "int_array"
+min_len = 8
+max_len = 8
+elem_min = 1
+elem_max = 1000
+
+# An index tuple set over a text column (query.composite_key_set): an index on (tenant, region, k) with
+# a set on the text region column. Before the variable-width slot skip the set could not be consumed
+# past the leading column, so jed fetched the tenant's whole 1,000-row index prefix; it now probes the
+# two (tenant, region, k) prefixes.
+[[bench]]
+name = "index_tuple_text"
+description = "Index on (tenant, region text, k): tenant = $1 AND region IN ('east', 'west') AND k = $2 on 100k rows"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, v FROM region_items WHERE tenant = $1 AND region IN ('east', 'west') AND k = $2 ORDER BY id"
+warmup = 300
+iterations = 5000
+seed = 4323
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS region_items",
+  "CREATE TABLE region_items (id bigint PRIMARY KEY, tenant bigint, region text, k bigint, v bigint)",
+  "INSERT INTO region_items SELECT (t - 1) * 1000 + i, t, CASE i % 4 WHEN 0 THEN 'east' WHEN 1 THEN 'north' WHEN 2 THEN 'south' ELSE 'west' END, i % 250, t * 1000 + i FROM generate_series(1, 100) AS t, generate_series(1, 1000) AS i",
+  "CREATE INDEX region_items_trk ON region_items (tenant, region, k)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 249
+
+# `key IN (SELECT …)` (query.any_array_point_lookup): an uncorrelated subquery picks eight keys of a
+# 100k-row table. Before the slice jed scanned every row and tested it against the folded list; the
+# folded list is now the PK's point set.
+[[bench]]
+name = "subquery_in_pk"
+description = "PK IN (SELECT k FROM picks WHERE g = $1) on 100k rows; eight point probes vs. a full scan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, v FROM sub_orders WHERE id IN (SELECT k FROM sub_picks WHERE g = $1) ORDER BY id"
+warmup = 100
+iterations = 2000
+seed = 4324
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS sub_orders",
+  "DROP TABLE IF EXISTS sub_picks",
+  "CREATE TABLE sub_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO sub_orders SELECT g, g * 3 FROM generate_series(1, 100000) AS g",
+  "CREATE TABLE sub_picks (g bigint, k bigint, PRIMARY KEY (g, k))",
+  "INSERT INTO sub_picks SELECT g, (g * 7919 + j * 104729) % 100000 + 1 FROM generate_series(1, 1000) AS g, generate_series(1, 8) AS j"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000
+
+# An ANY under an AND leaf of a same-key OR (query.any_array_point_lookup): before the slice the OR did
+# not reduce and jed full-scanned; the leaf's range now clips the array's points.
+[[bench]]
+name = "any_or_leaf_pk"
+description = "PK (= ANY(ARRAY[$1..$4]) AND id > $5) OR id = $6 on 100k rows; clipped point probes vs. a full scan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, v FROM any_orders_leaf WHERE (id = ANY(ARRAY[$1, $2, $3, $4]) AND id > $5) OR id = $6 ORDER BY id"
+warmup = 100
+iterations = 2000
+seed = 4325
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS any_orders_leaf",
+  "CREATE TABLE any_orders_leaf (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO any_orders_leaf SELECT g, g * 3 FROM generate_series(1, 100000) AS g"
+]
+
+# PostgreSQL types an ARRAY[...] of untyped parameters as text[]; jed types it from the key.
+[bench.sql_override]
+postgres = "SELECT id, v FROM any_orders_leaf WHERE (id = ANY(ARRAY[$1::bigint, $2::bigint, $3::bigint, $4::bigint]) AND id > $5) OR id = $6 ORDER BY id"
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 50000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+# An index-nested-loop sibling array (query.any_array_point_lookup, query.index_nested_loop): one outer
+# list row's bigint[] of eight keys bounds the inner 100k-row PK per outer row. Before the slice the
+# inner had no sibling bound for an ANY and was scanned in full.
+[[bench]]
+name = "inl_any_array"
+description = "lists JOIN orders ON o.id = ANY(l.ids) WHERE l.k = $1; eight inner point probes vs. a full inner scan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT o.id, o.v FROM inl_lists l JOIN inl_orders o ON o.id = ANY(l.ids) WHERE l.k = $1 ORDER BY o.id"
+warmup = 100
+iterations = 2000
+seed = 4326
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS inl_lists",
+  "DROP TABLE IF EXISTS inl_orders",
+  "CREATE TABLE inl_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO inl_orders SELECT g, g * 3 FROM generate_series(1, 100000) AS g",
+  "CREATE TABLE inl_lists (k bigint PRIMARY KEY, ids bigint[])",
+  "INSERT INTO inl_lists SELECT g, ARRAY[CAST(g AS bigint) * 7919 % 100000 + 1, CAST(g AS bigint) * 104729 % 100000 + 1, CAST(g AS bigint) * 1299709 % 100000 + 1, CAST(g AS bigint) * 15485863 % 100000 + 1, CAST(g AS bigint) * 49979687 % 100000 + 1, CAST(g AS bigint) * 86028121 % 100000 + 1, CAST(g AS bigint) * 122949823 % 100000 + 1, CAST(g AS bigint) * 179424673 % 100000 + 1] FROM generate_series(1, 1000) AS g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000
+
+# An index-nested-loop sibling tuple member (query.composite_key_set, query.index_nested_loop): the
+# outer tenant row's key is the inner composite PK's leading point, then three listed ids. Before the
+# slice the inner bound was the tenant's whole 1,000-row prefix.
+[[bench]]
+name = "inl_tuple_set"
+description = "tenants JOIN tp ON tp.tenant = t.tenant AND tp.id IN (3 ids) WHERE t.name = $1; three inner probes vs. a prefix"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT tp.id, tp.w FROM inl_tenants t JOIN inl_tp tp ON tp.tenant = t.tenant AND tp.id IN (17, 401, 977) WHERE t.name = $1 ORDER BY tp.id"
+warmup = 300
+iterations = 5000
+seed = 4327
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS inl_tenants",
+  "DROP TABLE IF EXISTS inl_tp",
+  "CREATE TABLE inl_tenants (tenant bigint PRIMARY KEY, name bigint)",
+  "INSERT INTO inl_tenants SELECT g, g + 5000 FROM generate_series(1, 100) AS g",
+  "CREATE TABLE inl_tp (tenant bigint, id bigint, w bigint, PRIMARY KEY (tenant, id))",
+  "INSERT INTO inl_tp SELECT t, i, t * 10000 + i FROM generate_series(1, 100) AS t, generate_series(1, 1000) AS i"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 5001
+max = 5100
+
 # Bounded LIMIT streaming over an ordered secondary-index range
 # (query.bounded_limit_streaming). The range admits 65–129 rows, but ORDER BY the same index lets
 # each core stop its index walk and table point-lookups after five rows. Before this slice the bound

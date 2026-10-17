@@ -36,7 +36,7 @@ type Bench struct {
 
 // Param is one $N parameter generator.
 type Param struct {
-	Gen    string `toml:"gen"` // int_uniform | serial | text | int_window
+	Gen    string `toml:"gen"` // int_uniform | serial | text | int_window | int_array
 	Min    int64  `toml:"min"`
 	Max    int64  `toml:"max"`
 	Start  int64  `toml:"start"`
@@ -48,6 +48,21 @@ type Param struct {
 	Base   int64 `toml:"base"`
 	OffMin int64 `toml:"off_min"`
 	OffMax int64 `toml:"off_max"`
+	// int_array: a one-dimensional bigint array bound as one parameter — its length drawn from
+	// int_uniform(min_len, max_len), then each element from int_uniform(elem_min, elem_max).
+	ElemMin int64 `toml:"elem_min"`
+	ElemMax int64 `toml:"elem_max"`
+}
+
+// HasArrayParam reports a bench that binds an int_array parameter, which a driver without
+// ArrayParamEngine skips.
+func (b *Bench) HasArrayParam() bool {
+	for _, p := range b.Param {
+		if p.Gen == "int_array" {
+			return true
+		}
+	}
+	return false
 }
 
 // SQLFor returns the bench's SQL for an engine, honoring sql_override.
@@ -142,6 +157,12 @@ func (s *ParamStream) Next() []any {
 			args[i] = args[p.Base].(int64) + s.prng.IntUniform(p.OffMin, p.OffMax)
 		case "text":
 			args[i] = s.prng.Text(p.MinLen, p.MaxLen)
+		case "int_array":
+			arr := make([]int64, s.prng.IntUniform(p.MinLen, p.MaxLen))
+			for j := range arr {
+				arr[j] = s.prng.IntUniform(p.ElemMin, p.ElemMax)
+			}
+			args[i] = arr
 		default:
 			panic("unknown param gen " + p.Gen)
 		}

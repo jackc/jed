@@ -7,6 +7,8 @@ over a dedicated `gin` dataset (§4), the regex + window benchmarks, and the **c
 throughput** benchmarks (the `concurrent_read` kind, §8.1). Rule-based access-path work is pinned by
 scratch workloads including `composite_pk_lookup`, `interval_set_pk`, `any_array_pk` (`key =
 ANY(array)` point sets) with `any_array_pk_promoted` (a correlated `integer[]` against a `bigint` key),
+`any_array_pk_param` / `composite_pk_any_param` (a bound `bigint[]` parameter), `any_or_leaf_pk`,
+`subquery_in_pk`, `inl_any_array`, `inl_tuple_set`, `index_tuple_text`,
 `composite_pk_any` (composite-PK tuple sets), `index_tuple_any` (multi-column index tuple sets), and `bounded_index_limit`; P6b adds `order_only_index_limit` and `gist_range_select` while reusing
 `gin_contains` and `interval_set_pk` for its cross-method matrix. `join_inl_topn` covers the
 combined join rule, while P7 adds the reversed-source-order
@@ -925,7 +927,7 @@ iterations  = 50000                 # timed iterations
 seed        = 4201                  # splitmix64 seed for this bench's param stream (§4)
 
 [[bench.param]]                     # one entry per $N, ascending
-gen = "int_uniform"                 # "int_uniform" | "serial" | "text" | "int_window"
+gen = "int_uniform"                 # "int_uniform" | "serial" | "text" | "int_window" | "int_array"
 min = 1                             # int_uniform: inclusive bounds
 max = 1000000
 ```
@@ -952,7 +954,11 @@ ids), `text` (`min_len`/`max_len`; a length draw then per-char draws — §4), a
 (`base`/`off_min`/`off_max`; the value of an **earlier** param at index `base` plus
 `int_uniform(off_min, off_max)` — a selective fixed-width range around a base param, e.g.
 `col BETWEEN $1 AND $2` with `$2 = $1 + [off_min, off_max]`, both endpoints const-sources so
-the range pushes down to an index bound).
+the range pushes down to an index bound), and `int_array` (`min_len`/`max_len`/`elem_min`/
+`elem_max`; a length draw, then one draw per element — a one-dimensional `bigint[]` bound as **one**
+parameter, the way a host passes a list to `id = ANY($1)`). A driver that cannot bind an array
+parameter (SQLite, and the wrapped Node/Ruby/WASM harnesses) skips a bench with one, as a driver
+without the bench host functions skips a `host_functions` bench.
 
 **Placeholder policy.** SQL uses `$N` with first occurrences in ascending order. jed and
 PostgreSQL bind `$N` natively; SQLite harnesses mechanically rewrite `$N` → `?N` at

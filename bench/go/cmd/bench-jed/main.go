@@ -86,6 +86,24 @@ func benchEnvironment() (*jed.Environment, error) {
 // HostFunctions reports that every handle carries the bench host functions (benchmarks.md §8.2).
 func (e *engine) HostFunctions() bool { return true }
 
+// ArrayParams reports that an int_array parameter binds as a bigint array (benchmarks.md §3).
+func (e *engine) ArrayParams() bool { return true }
+
+// jedArgs converts an int_array parameter ([]int64) to a one-dimensional jed array value; every other
+// argument binds as itself.
+func jedArgs(args []any) []any {
+	for i, a := range args {
+		if arr, ok := a.([]int64); ok {
+			elems := make([]jed.Value, len(arr))
+			for j, n := range arr {
+				elems[j] = jed.IntValue(n)
+			}
+			args[i] = jed.ArrayValue(elems)
+		}
+	}
+	return args
+}
+
 // drainExec runs a statement through the ergonomic Query seam to completion, discarding any rows — the
 // bench equivalent of Exec (a write materializes at the call; Close releases the cursor).
 func drainExec(rows *jed.Rows, err error) error {
@@ -147,14 +165,14 @@ type jedStmt struct {
 }
 
 func (s *jedStmt) Exec(args []any) error {
-	return drainExec(s.sess.QueryPrepared(context.Background(), s.stmt, args...))
+	return drainExec(s.sess.QueryPrepared(context.Background(), s.stmt, jedArgs(args)...))
 }
 
 func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
 	// The ergonomic QueryPrepared(ctx, stmt, args...) is the sole prepared query surface
 	// (impl/go/ergonomic.go): it converts the native args to []Value and, with a background context,
 	// arms no cancellation — the same work the old raw QueryValues path did, since args is already []any.
-	rows, err := s.sess.QueryPrepared(context.Background(), s.stmt, args...)
+	rows, err := s.sess.QueryPrepared(context.Background(), s.stmt, jedArgs(args)...)
 	if err != nil {
 		return 0, err
 	}

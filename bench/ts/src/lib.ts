@@ -111,6 +111,10 @@ export interface Param {
   base: bigint;
   offMin: bigint;
   offMax: bigint;
+  // int_array: a one-dimensional bigint array bound as one parameter — its length drawn from
+  // intUniform(minLen, maxLen), then each element from intUniform(elemMin, elemMax).
+  elemMin: bigint;
+  elemMax: bigint;
 }
 
 export interface Bench {
@@ -187,6 +191,8 @@ export function loadCorpus(corpusDir: string): Bench[] {
         base: big(p.base),
         offMin: big(p.off_min),
         offMax: big(p.off_max),
+        elemMin: big(p.elem_min),
+        elemMax: big(p.elem_max),
       });
     }
     benches.push({
@@ -249,7 +255,16 @@ export function staleErr(dataset: string, engine: string): Error {
 
 // --- param stream (benchmarks.md §3: one stream across warmup + measured) ---
 
-export type Arg = bigint | string;
+export type Arg = bigint | string | bigint[];
+
+// scalarArgs is the args of a driver without arrayParams, whose runner skips every bench with an
+// int_array parameter: an array here is a harness bug.
+export function scalarArgs(args: Arg[]): (bigint | string)[] {
+  return args.map((a) => {
+    if (Array.isArray(a)) throw new Error("this driver binds no array parameters");
+    return a;
+  });
+}
 
 export class ParamStream {
   private readonly params: Param[];
@@ -282,6 +297,13 @@ export class ParamStream {
         case "text":
           args.push(this.prng.text(p.minLen, p.maxLen));
           break;
+        case "int_array": {
+          const n = this.prng.intUniform(p.minLen, p.maxLen);
+          const arr: bigint[] = [];
+          for (let j = 0n; j < n; j++) arr.push(this.prng.intUniform(p.elemMin, p.elemMax));
+          args.push(arr);
+          break;
+        }
         default:
           throw new Error(`unknown param gen ${p.gen}`);
       }
@@ -316,6 +338,9 @@ export interface Engine {
   // OPTIONAL: true when the driver registered the bench host functions (bench_mix_row /
   // bench_mix_batch, benchmarks.md §8.2). A driver without it skips a host_functions bench.
   hostFunctions?: boolean;
+  // OPTIONAL: true when the driver binds an int_array parameter as an array (benchmarks.md §3). A
+  // driver without it skips a bench with one.
+  arrayParams?: boolean;
 }
 
 // ConcurrentOutcome is what a driver's concurrentRead returns (benchmarks.md §8.1):
@@ -489,6 +514,12 @@ async function runOne(
     if (b.hostFunctions && eng.hostFunctions !== true) {
       process.stderr.write(
         `  skip: ${cfg.engine}/${cfg.lang}/${cfg.variant} has no bench host functions\n`,
+      );
+      return null;
+    }
+    if (b.params.some((p) => p.gen === "int_array") && eng.arrayParams !== true) {
+      process.stderr.write(
+        `  skip: ${cfg.engine}/${cfg.lang}/${cfg.variant} binds no array parameters\n`,
       );
       return null;
     }

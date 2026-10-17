@@ -144,12 +144,19 @@ fn bind_args(args: &[Arg]) -> Vec<Value> {
         .map(|a| match a {
             Arg::Int(n) => Value::Int(*n),
             Arg::Text(s) => Value::Text(s.clone()),
+            Arg::IntArray(arr) => Value::Array(jed::ArrayVal::one_dim(
+                arr.iter().map(|n| Value::Int(*n)).collect(),
+            )),
         })
         .collect()
 }
 
 impl Engine for JedEngine {
     fn host_functions(&self) -> bool {
+        true
+    }
+
+    fn array_params(&self) -> bool {
         true
     }
 

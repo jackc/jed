@@ -18,7 +18,7 @@ import {
   openDatabase,
 } from "../../../impl/ts/src/lib.ts";
 import { Environment } from "../../../impl/ts/src/environment.ts";
-import { intValue, textValue, type Value } from "../../../impl/ts/src/value.ts";
+import { arrayValue, intValue, textValue, type Value } from "../../../impl/ts/src/value.ts";
 
 import {
   type Arg,
@@ -31,6 +31,7 @@ import {
 
 class JedEngine implements Engine {
   readonly hostFunctions = true; // every handle carries benchExtensions() (benchmarks.md §8.2)
+  readonly arrayParams = true; // an int_array parameter binds as a bigint array (benchmarks.md §3)
   private readonly db: Database;
   // The persistent connection the bench drives (BEGIN/COMMIT/ROLLBACK span calls).
   private readonly sess: Session;
@@ -164,7 +165,13 @@ function benchEnvironment(): Environment {
 }
 
 function bindArgs(args: Arg[]): Value[] {
-  return args.map((a) => (typeof a === "bigint" ? intValue(a) : textValue(a)));
+  return args.map((a) =>
+    typeof a === "bigint"
+      ? intValue(a)
+      : typeof a === "string"
+        ? textValue(a)
+        : arrayValue(a.map((n) => intValue(n))),
+  );
 }
 
 // drainRows pulls a cursor to exhaustion, folding each row into sum (when non-null), and returns the

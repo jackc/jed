@@ -66,6 +66,12 @@ type HostFunctionEngine interface {
 	HostFunctions() bool
 }
 
+// ArrayParamEngine is the OPTIONAL capability of a driver that binds an int_array parameter (a
+// []int64) as an array (spec/design/benchmarks.md §3). A driver without it SKIPS such a bench.
+type ArrayParamEngine interface {
+	ArrayParams() bool
+}
+
 // errSkip is the sentinel runOne returns when a bench does not apply to this driver (a
 // concurrent_read on a driver without ConcurrentEngine). Run drops it and continues.
 var errSkip = errors.New("bench skipped for this driver")
@@ -201,6 +207,12 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 	if b.HostFunctions {
 		if he, ok := eng.(HostFunctionEngine); !ok || !he.HostFunctions() {
 			fmt.Fprintf(os.Stderr, "  skip: %s/%s/%s has no bench host functions\n", cfg.Engine, cfg.Lang, cfg.Variant)
+			return res, errSkip
+		}
+	}
+	if b.HasArrayParam() {
+		if ae, ok := eng.(ArrayParamEngine); !ok || !ae.ArrayParams() {
+			fmt.Fprintf(os.Stderr, "  skip: %s/%s/%s binds no array parameters\n", cfg.Engine, cfg.Lang, cfg.Variant)
 			return res, errSkip
 		}
 	}
