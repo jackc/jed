@@ -6057,6 +6057,22 @@ pub(crate) enum WindowPlan {
     NthValue,
 }
 
+/// Which statistic a one-argument statistical aggregate finalizes (aggregates.md §23).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MomentStat {
+    VarPop,
+}
+
+impl MomentStat {
+    /// Whether the statistic is a sample (N − 1) rather than a population (N) one, and whether it
+    /// is a standard deviation rather than a variance.
+    pub(crate) fn sample_stddev(self) -> (bool, bool) {
+        match self {
+            MomentStat::VarPop => (false, false),
+        }
+    }
+}
+
 /// The bitwise operation a bit aggregate folds with (aggregates.md §23).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BitOp {
@@ -6101,6 +6117,12 @@ pub(crate) enum AggPlan {
     /// string_agg(value, delimiter) — the non-NULL values joined in fold order, each after the first
     /// preceded by its own row's delimiter (aggregates.md §23). The operand is a 2-field Row.
     StringAgg,
+    /// The one-argument statistical aggregates (aggregates.md §23): exact over integer/decimal input
+    /// (decimal result), PostgreSQL's float8 algorithm over float input (`float`, f64 result).
+    Moment {
+        stat: MomentStat,
+        float: bool,
+    },
     /// json_agg / jsonb_agg (and the `_strict` variants) — aggregate the inputs' JSON images into a
     /// JSON array (json-sql-functions.md §4). `compact` selects the `json` (compact) vs `jsonb`
     /// (canonical) result render; `strict` skips a NULL input (else a NULL → JSON null).
@@ -6295,6 +6317,22 @@ pub(crate) enum Acc {
     StringAgg {
         rows: Vec<Vec<Value>>,
         seen: bool,
+    },
+    /// The exact one-argument moments (aggregates.md §23): the count of non-NULL inputs and the
+    /// decimal sums of x and x².
+    MomentsExact {
+        stat: MomentStat,
+        n: i64,
+        sx: Decimal,
+        sxx: Decimal,
+    },
+    /// PostgreSQL's float8_accum transition state: N, Σx, and Sxx (the sum of squared deviations
+    /// from the running mean), all f64.
+    MomentsFloat {
+        stat: MomentStat,
+        n: f64,
+        sx: f64,
+        sxx: f64,
     },
     MinMax {
         cur: Option<Value>,

@@ -263,7 +263,7 @@ import {
   stageTemp,
   type StorageBudget,
 } from "./persist.ts";
-import { Decimal, workLinear } from "./decimal.ts";
+import { Decimal, momentVariance, workLinear, workMul } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated, GIN_MAX_TERM_BYTES } from "./encoding.ts";
 import {
   checkViolation,
@@ -401,6 +401,7 @@ import {
   byteaValue,
   boolValue,
   canonFloat,
+  compositeValue,
   compareTextC,
   dateValue,
   decimalValue,
@@ -32245,6 +32246,10 @@ export type AggPlan =
   // string_agg(value, delimiter) — the non-NULL values joined, each after the first preceded by its
   // own row's delimiter (aggregates.md §23). The operand is a 2-field Row(value, delimiter).
   | "stringAgg"
+  // The statistical aggregates (aggregates.md §23): exact over integer/decimal input (decimal
+  // result), PostgreSQL's float8 algorithms over float input (the *Float plans, f64 result).
+  | "varPop"
+  | "varPopFloat"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32522,6 +32527,14 @@ export type Acc = {
   // For the string_agg plan (aggregates.md §23): the [value, delimiter] of every row with a non-NULL
   // value, in fold order (`seen` marks that one was folded).
   strRows: Value[][];
+  // The statistical aggregates' running moments (aggregates.md §23): the exact count and decimal sums
+  // over integer/decimal input, PostgreSQL's float8 transition values over float input.
+  momN: bigint;
+  momSx: Decimal;
+  momSxx: Decimal;
+  momFN: number;
+  momFSx: number;
+  momFSxx: number;
   jsonAsJson: boolean;
   jsonStrict: boolean;
   // For the "jsonObjectAgg" plan (B4): the (key text, value image) pairs in row order (the image as
@@ -32585,6 +32598,12 @@ export function newAcc(
     jsonElems: [],
     arrElems: [],
     strRows: [],
+    momN: 0n,
+    momSx: Decimal.fromBigInt(0n),
+    momSxx: Decimal.fromBigInt(0n),
+    momFN: 0,
+    momFSx: 0,
+    momFSxx: 0,
     jsonAsJson,
     jsonStrict,
     jsonPairs: [],
@@ -32699,6 +32718,59 @@ export function finalizeArrayAgg(plan: AggPlan, elems: Value[]): Value {
     lbounds: [1, ...first.lbounds],
     elements,
   };
+}
+
+// foldExactMoment adds one input to the exact one-argument moments (aggregates.md §23), skipping
+// NULL. Each fold charges decimal_work for the square and the two additions, by the `*` and `+`
+// formulas (spec/design/cost.md §3).
+function foldExactMoment(a: Acc, v: Value, m: Meter): void {
+  if (v.kind === "null") return;
+  const x = toDecimal(v);
+  const x2 = x.mulExact(x);
+  m.charge(
+    COSTS.decimalWork *
+      BigInt(workMul(x, x) - 1 + workLinear(a.momSx, x) - 1 + workLinear(a.momSxx, x2) - 1),
+  );
+  m.guard();
+  a.momSx = a.momSx.addUncapped(x);
+  a.momSxx = a.momSxx.addUncapped(x2);
+  a.momN += 1n;
+}
+
+// foldFloatMoment is PostgreSQL's float8_accum (and float4_accum, which widens to f64 first): the
+// Youngs-Cramer update of the one-argument float moments (aggregates.md §23). A finite input whose
+// update overflows to ±Inf traps 22003; an infinite or NaN input makes Sxx NaN.
+function foldFloatMoment(a: Acc, v: Value): void {
+  if (v.kind === "null") return;
+  const x = (v as { value: number }).value;
+  const n = a.momFN + 1;
+  const sx = a.momFSx + x;
+  let sxx = a.momFSxx;
+  if (a.momFN > 0) {
+    const tmp = x * n - sx;
+    sxx += (tmp * tmp) / (n * a.momFN);
+    if (isInf(sx) || isInf(sxx)) {
+      if (!isInf(a.momFSx) && !isInf(x)) throw overflow("f64");
+      sxx = Number.NaN;
+    }
+  } else if (!Number.isFinite(x)) sxx = Number.NaN;
+  a.momFN = n;
+  a.momFSx = sx;
+  a.momFSxx = sxx;
+}
+
+// isInf reports whether x is +Infinity or -Infinity (C's isinf).
+function isInf(x: number): boolean {
+  return x === Number.POSITIVE_INFINITY || x === Number.NEGATIVE_INFINITY;
+}
+
+// floatMomentVariance is float8_var_pop / float8_var_samp / float8_stddev_pop / float8_stddev_samp:
+// NULL over no input (or one, for a sample); else Sxx / N or Sxx / (N − 1), square-rooted for a
+// standard deviation.
+function floatMomentVariance(a: Acc, sample: boolean, stddev: boolean): Value {
+  if (a.momFN === 0 || (sample && a.momFN <= 1)) return nullValue();
+  const r = a.momFSxx / (sample ? a.momFN - 1 : a.momFN);
+  return float64Value(stddev ? Math.sqrt(r) : r);
 }
 
 // finalizeStringAgg joins string_agg's non-NULL values in fold order (aggregates.md §23): the first
@@ -32839,6 +32911,12 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
           a.cur = intValue(a.plan === "bitAnd" ? c & v.int : a.plan === "bitOr" ? c | v.int : c ^ v.int);
         }
       }
+      break;
+    case "varPop":
+      foldExactMoment(a, v, m);
+      break;
+    case "varPopFloat":
+      foldFloatMoment(a, v);
       break;
     case "stringAgg": {
       // A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
@@ -33017,6 +33095,12 @@ export function finalizeAcc(a: Acc): Value {
       return a.seen ? finalizeArrayAgg(a.plan, a.arrElems) : nullValue();
     case "stringAgg":
       return a.seen ? finalizeStringAgg(a.strRows) : nullValue();
+    case "varPop": {
+      const r = momentVariance(a.momN, a.momSx, a.momSxx, false, false);
+      return r === null ? nullValue() : decimalValue(r);
+    }
+    case "varPopFloat":
+      return floatMomentVariance(a, false, false);
     case "jsonAgg": {
       // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array (json:
       // PG's ", "-joined element texts; jsonb: the canonical array).
@@ -35832,6 +35916,9 @@ export function aggregatePlan(
   if (surface === "bit_or" && code === "same_as_input") return ["bitOr", t, undefined];
   if (surface === "bit_xor" && code === "same_as_input") return ["bitXor", t, undefined];
   // An array input stacks into one more dimension of the same (dimension-agnostic) array type.
+  if (surface === "var_pop" && code === "decimal") return ["varPop", { kind: "decimal" }, undefined];
+  if (surface === "var_pop" && code === "f64")
+    return ["varPopFloat", { kind: "float", ty: "f64" }, undefined];
   if (surface === "string_agg" && code === "text") return ["stringAgg", { kind: "text" }, undefined];
   if (surface === "string_agg" && code === "bytea")
     return ["stringAgg", { kind: "bytea" }, undefined];
@@ -37417,6 +37504,14 @@ function encodeBlockingAccs(keys: Value[], accs: Acc[]): Row {
       boolValue(a.floatNaN),
       boolValue(a.floatPosInf),
       boolValue(a.floatNegInf),
+      compositeValue([
+        intValue(a.momN),
+        decimalValue(a.momSx),
+        decimalValue(a.momSxx),
+        float64Value(a.momFN),
+        float64Value(a.momFSx),
+        float64Value(a.momFSxx),
+      ]),
     );
   return row;
 }
@@ -37428,7 +37523,7 @@ function decodeBlockingAccs(
   const n = Number((row[0]! as { int: bigint }).int);
   const keys = row.slice(1, n + 1);
   const accs = specs.map((s, i) => {
-    const at = n + 1 + i * 9;
+    const at = n + 1 + i * 10;
     const a = newAccFromSpec(s, zone);
     a.count = (row[at]! as { int: bigint }).int;
     a.sumInt = (row[at + 1]! as { int: bigint }).int;
@@ -37439,6 +37534,13 @@ function decodeBlockingAccs(
     a.floatNaN = (row[at + 6]! as { value: boolean }).value;
     a.floatPosInf = (row[at + 7]! as { value: boolean }).value;
     a.floatNegInf = (row[at + 8]! as { value: boolean }).value;
+    const mom = (row[at + 9]! as { fields: Value[] }).fields;
+    a.momN = (mom[0]! as { int: bigint }).int;
+    a.momSx = (mom[1]! as { dec: Decimal }).dec;
+    a.momSxx = (mom[2]! as { dec: Decimal }).dec;
+    a.momFN = (mom[3]! as { value: number }).value;
+    a.momFSx = (mom[4]! as { value: number }).value;
+    a.momFSxx = (mom[5]! as { value: number }).value;
     return a;
   });
   return { keys, accs };
@@ -37485,6 +37587,14 @@ function packedStateBytes(accs: Acc[]): number {
       case "arrayAgg":
       case "stringAgg":
         n += MEMORY_VALUE;
+        break;
+      case "varPop":
+        // [int n, decimal Σx, decimal Σx²].
+        n += MEMORY_VALUE + valueBytes(decimalValue(a.momSx)) + valueBytes(decimalValue(a.momSxx));
+        break;
+      case "varPopFloat":
+        // [f64 N, f64 Σx, f64 Sxx].
+        n += 3 * MEMORY_VALUE;
         break;
       case "arrayAggArray":
         // [bool seen, int ndim, (int length, int lower bound) per dimension of the first input].

@@ -107,6 +107,16 @@ reason       = "Non-determinism is infectious through boolean/control-flow bound
 
 # --- float SUM/AVG fold order --------------------------------------------
 [[exception]]
+id           = "float-moment-order"
+surface      = "The float statistical aggregates over f32/f64 input — var_pop and the rest of ../design/aggregates.md §23 — the fold ORDER of PostgreSQL's Youngs-Cramer transition. Their exact integer/decimal forms are order-independent and NOT covered."
+class        = "A"
+drops        = ["G2", "G3"]
+blast_radius = "the aggregate's f64 result column (its low bits), exactly as float-sum-order: it promotes to the row multiset / other columns / cost only through float-gated control flow or a key, which float-control-flow bounds. The NULL rules, the NaN result for an infinite or NaN input, and the 22003 finite-overflow trap do not depend on fold order. Every core folds the identical PK-scan order with the identical separately rounded IEEE operations (no fused multiply-add), so the value is cross-core byte-identical today; the entry withholds the promise against a future parallel plan."
+test         = "the `R` render tag's tolerant compare, PG-oracle-checked (PostgreSQL's float8_accum is the same order-dependent fold). # cost:/# names:/# types: stay exact."
+status       = "ratified"
+reason       = "The Youngs-Cramer update is a sequence of non-associative IEEE operations, so its low bits depend on fold order, like a float sum. An order-independent form would need the exact accumulator float-sum-order declines; PostgreSQL's own result is order-dependent too."
+
+[[exception]]
 id           = "float-sum-order"
 surface      = "SUM(f32/f64) and AVG(f32/f64) — the fold ORDER of the running total (../design/float.md §7). MIN/MAX/COUNT and int/decimal SUM/AVG are order-independent and NOT covered."
 class        = "A"

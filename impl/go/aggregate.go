@@ -195,6 +195,10 @@ const (
 	// string_agg(value, delimiter) — the non-NULL values joined, each after the first preceded by its
 	// own row's delimiter (aggregates.md §23). The operand is a 2-field Row(value, delimiter).
 	planStringAgg
+	// The statistical aggregates (aggregates.md §23): exact over integer/decimal input (decimal
+	// result), PostgreSQL's float8 algorithms over float input (f64 result). See aggregate_stats.go.
+	planVarPop         // var_pop(x) over integer/decimal
+	planVarPopFloat    // var_pop(x) over f32/f64
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -347,6 +351,10 @@ type acc struct {
 	// string_agg accumulator (aggregates.md §23): the Row(value, delimiter) of every row with a
 	// non-NULL value, in fold order; `seen` marks that one was folded.
 	strRows []Value
+	// The statistical aggregates' running moments (aggregate_stats.go): the exact count and sums
+	// over integer/decimal input, PostgreSQL's float8 transition values over float input.
+	exact momentsExact
+	float momentsFloat
 	// Ordered-set aggregate state (spec/design/aggregates.md §13): the WITHIN GROUP direction +
 	// the **evaluated** percentile fraction for this group, plus the collected non-NULL values
 	// (percentile_cont widens to f64 into osaFloats; mode/percentile_disc keep the Value in
@@ -592,6 +600,10 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				a.cur = IntValue(bitFold(a.plan, a.cur.Int, v.Int))
 			}
 		}
+	case planVarPop:
+		return a.exact.fold(v, m)
+	case planVarPopFloat:
+		return a.float.fold(v)
 	case planStringAgg:
 		// A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
 		if !(*v.composite())[0].IsNull() {
@@ -921,6 +933,10 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), nil
 		}
 		return finalizeStringAgg(a.strRows), nil
+	case planVarPop:
+		return a.exact.variance(false, false)
+	case planVarPopFloat:
+		return a.float.variance(false, false), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
 	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:

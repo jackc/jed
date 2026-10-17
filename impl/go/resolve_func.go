@@ -3064,6 +3064,10 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 		return planStringAgg, resolvedType{kind: rtText}
 	case surface == "string_agg" && result == "bytea":
 		return planStringAgg, resolvedType{kind: rtBytea}
+	case surface == "var_pop" && result == "decimal":
+		return planVarPop, resolvedType{kind: rtDecimal}
+	case surface == "var_pop" && result == "f64":
+		return planVarPopFloat, resolvedType{kind: rtFloat64}
 	case surface == "array_agg" && result == "array_of_input":
 		// An array input stacks into one more dimension of the same (dimension-agnostic) array type.
 		if t.kind == rtArray {

@@ -330,6 +330,8 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
     // string_agg (aggregates.md §23).
     "text",
     "bytea",
+    // The float statistical aggregates (aggregates.md §23).
+    "f64",
   ]);
   for (const a of AGGREGATES) {
     assert.ok(
