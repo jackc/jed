@@ -20,26 +20,14 @@ impl Engine {
         mut ct: CreateTable,
         params: &[Value],
     ) -> Result<Outcome> {
+        let Some(plan) = self.ctas_prepare(&ct, params)? else {
+            return Ok(Outcome::Statement {
+                cost: 0,
+                rows_affected: None,
+            });
+        };
         let cta = *ct.as_query.take().expect("a CREATE TABLE … AS statement");
         let (target_temp, attach_name) = self.create_table_target(&ct)?;
-        check_reserved_name("table", &ct.name)?;
-        // Plan the query once, for its output columns. Its `$N` parameters are typed and bound as a
-        // query's are, so a wrong parameter count or an untyped parameter fails here.
-        let mut ptypes = ParamTypes::default();
-        let plan = self.plan_query(&cta.query, None, &[], &mut ptypes)?;
-        bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
-        if self.create_table_name_taken(&ct.name, attach_name.as_deref()) {
-            if ct.if_not_exists {
-                return Ok(Outcome::Statement {
-                    cost: 0,
-                    rows_affected: None,
-                });
-            }
-            return Err(EngineError::new(
-                SqlState::DuplicateTable,
-                format!("relation already exists: {}", ct.name),
-            ));
-        }
         let columns = self.ctas_columns(&ct, &cta, &plan, target_temp)?;
         let (table, with_data, query) = (ct.name.clone(), cta.with_data, cta.query);
         self.create_table_with_columns(ct, Some(columns))?;
@@ -56,7 +44,7 @@ impl Engine {
             (None, true) => "temp".to_string(),
             (None, false) => "main".to_string(),
         };
-        let ins = Insert {
+        let insert = |source: QueryExpr| Insert {
             table,
             table_pos: SrcPos::NONE,
             db: Some(db),
@@ -64,11 +52,76 @@ impl Engine {
             columns: None,
             column_pos: Vec::new(),
             overriding: None,
-            source: InsertSource::Query(Box::new(query)),
+            source: InsertSource::Query(Box::new(source)),
             on_conflict: None,
             returning: None,
         };
-        self.execute_insert_cached(ins, params, CteCtx::empty(), None, false)
+        // A data-modifying WITH is the statement's own (create-table-as.md §1): the fill is
+        // `WITH … INSERT INTO t <body>`, run by the writable-CTE orchestrator, so every part reads
+        // the pre-statement snapshot (with the new, empty table) and runs exactly once.
+        match query {
+            QueryExpr::With(w) if with_is_data_modifying(&w) => {
+                let w = *w;
+                let wq = WithQuery {
+                    ctes: w.ctes,
+                    body: CteBody::Insert(Box::new(insert(*w.body))),
+                    recursive: w.recursive,
+                };
+                self.execute_with_dml(wq, params)
+            }
+            query => {
+                self.execute_insert_cached(insert(query), params, CteCtx::empty(), None, false)
+            }
+        }
+    }
+
+    /// The checks of a `CREATE TABLE … AS` before anything is created (create-table-as.md §3 steps
+    /// 2–4), shared with `EXPLAIN CREATE TABLE … AS` (§7): the target database and the `jed_`
+    /// reservation, the query planned with its parameters typed and bound, and the name check. The
+    /// planned query, or `None` when `IF NOT EXISTS` skips a taken name.
+    pub(crate) fn ctas_prepare(
+        &self,
+        ct: &CreateTable,
+        params: &[Value],
+    ) -> Result<Option<QueryPlan>> {
+        let cta = ct
+            .as_query
+            .as_deref()
+            .expect("a CREATE TABLE … AS statement");
+        let (_, attach_name) = self.create_table_target(ct)?;
+        check_reserved_name("table", &ct.name)?;
+        // Plan the query once, for its output columns. Its `$N` parameters are typed and bound as a
+        // query's are, so a wrong parameter count or an untyped parameter fails here.
+        let mut ptypes = ParamTypes::default();
+        let plan = match &cta.query {
+            // A data-modifying WITH plans as the statement's own WITH (writable-cte.md): its CTEs
+            // first, then the body that reads them.
+            QueryExpr::With(w) if with_is_data_modifying(w) => {
+                let body = CteBody::Query((*w.body).clone());
+                let bindings = self.plan_cte_bindings(
+                    &w.ctes,
+                    w.recursive,
+                    &[],
+                    None,
+                    &mut ptypes,
+                    CtePrimary::Body(&body),
+                )?;
+                let visible: Vec<&CteBinding> = bindings.iter().collect();
+                self.plan_query(&w.body, None, &visible, &mut ptypes)?
+            }
+            query => self.plan_query(query, None, &[], &mut ptypes)?,
+        };
+        bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        if self.create_table_name_taken(&ct.name, attach_name.as_deref()) {
+            if ct.if_not_exists {
+                return Ok(None);
+            }
+            return Err(EngineError::new(
+                SqlState::DuplicateTable,
+                format!("relation already exists: {}", ct.name),
+            ));
+        }
+        Ok(Some(plan))
     }
 
     /// The new table's columns, derived from the planned query (create-table-as.md §2): the column
@@ -201,4 +254,24 @@ fn ctas_column_type(name: &str, rt: &ResolvedType) -> Result<Type> {
         ));
     }
     Ok(ty)
+}
+
+/// Whether a `CREATE TABLE … AS` query's own `WITH` holds a data-modifying CTE
+/// (create-table-as.md §1), which makes it the statement's writable `WITH`.
+pub(crate) fn with_is_data_modifying(w: &WithExpr) -> bool {
+    w.ctes.iter().any(|c| c.body.is_data_modifying())
+}
+
+/// The query statement a `CREATE TABLE … AS` runs (create-table-as.md §7): its query as a top-level
+/// `SELECT`, set operation, or `WITH` — what `EXPLAIN CREATE TABLE … AS` renders.
+pub(crate) fn ctas_query_statement(query: &QueryExpr) -> Statement {
+    match query {
+        QueryExpr::Select(sel) => Statement::Select((**sel).clone()),
+        QueryExpr::SetOp(so) => Statement::SetOp((**so).clone()),
+        QueryExpr::With(w) => Statement::With(WithQuery {
+            ctes: w.ctes.clone(),
+            body: CteBody::Query((*w.body).clone()),
+            recursive: w.recursive,
+        }),
+    }
 }

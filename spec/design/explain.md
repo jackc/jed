@@ -26,7 +26,9 @@ is `42601`. The legacy positional `EXPLAIN ANALYZE` remains equivalent to
 
 The option words are recognized positionally and remain non-reserved. The inner statement is a
 query (`SELECT`, `VALUES`, a set operation, or `WITH`, including a data-modifying `WITH`) or DML
-(`INSERT`, `UPDATE`, `DELETE`). DDL, transaction control, and nested `EXPLAIN` are rejected `42601`.
+(`INSERT`, `UPDATE`, `DELETE`), or a `CREATE TABLE … AS` / `SELECT … INTO`, which renders the plan of
+the query it runs ([create-table-as.md](create-table-as.md) §7). Other DDL (the column-definition
+`CREATE TABLE` included), transaction control, and nested `EXPLAIN` are rejected `42601`.
 
 - Plain `EXPLAIN` plans and renders without executing. It is a read even when its inner statement
   is DML, but checks the inner statement's privileges.
@@ -202,6 +204,8 @@ estimates, actual costs, or lane tags.
 - jed supports only boolean ANALYZE/VERBOSE/COSTS/LANE options. PostgreSQL FORMAT, BUFFERS, TIMING,
   SUMMARY, WAL, SETTINGS, GENERIC_PLAN, MEMORY, and SERIALIZE are not accepted.
 - ANALYZE reports deterministic logical work instead of timing.
+- `EXPLAIN ANALYZE CREATE TABLE … AS` in a read-only transaction is `25006`, and under `WITH NO
+  DATA` it runs nothing of the query ([create-table-as.md](create-table-as.md) §5).
 
 Collation-name rendering in keys and additional physical operators remain follow-ons; none changes
 the contracts above.

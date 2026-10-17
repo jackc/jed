@@ -487,7 +487,7 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 }
 
 // planWriteTarget plans the target view as a read of it at the statement's top level would (views.md
-// §4/§4.1), returning the output names, types, and collation derivations of every view in its
+// §4/§4.1), returning the output names, types, collation derivations, and typmods of every view in its
 // expansion.
 func (db *engine) planWriteTarget(view *viewDef) (map[string]*valuesPlan, error) {
 	metas := map[string]*valuesPlan{}
@@ -501,6 +501,7 @@ func (db *engine) planWriteTarget(view *viewDef) (map[string]*valuesPlan, error)
 		}
 		metas[view.Name] = &valuesPlan{
 			columnTypes: plan.columnTypes(), columnNames: plan.columnNames(), columnDerivs: plan.columnDerivs(),
+			columnTypmods: plan.columnTypmods(),
 		}
 		return nil
 	})

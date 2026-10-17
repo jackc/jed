@@ -63,7 +63,9 @@ query_statement ::= with_clause? ( query_expr | insert | update | delete )
   only in the `WITH` list directly prefixing the statement, never inside a subquery or another CTE
   body (the nested-`WITH` narrowing, [cte.md](cte.md) §1, is unchanged). PostgreSQL imposes the
   same restriction — data-modifying statements are allowed only in a `WITH` attached to the
-  top-level statement.
+  top-level statement. The query of a `CREATE TABLE … AS` (or a `SELECT … INTO`) is such a statement:
+  its own `WITH` may hold a data-modifying CTE, and the fill runs it as `WITH … INSERT INTO t …`
+  ([create-table-as.md](create-table-as.md) §1/§3).
 
 ## 2. The shared snapshot — the central semantic
 

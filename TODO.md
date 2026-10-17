@@ -180,9 +180,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`CREATE TABLE … AS`** — `CREATE [TEMP] TABLE [IF NOT EXISTS] name [(cols)] [ON COMMIT …] AS
   query [WITH [NO] DATA]`, PostgreSQL's: columns typed from the query with the typmods its outputs
   keep (`exprTypmod`, now tracked through every query output), filled as `INSERT … SELECT` (which now
-  accepts a same-typed array/range/composite source). → [create-table-as.md](spec/design/create-table-as.md)
-  - [ ] _follow-on:_ a data-modifying `WITH` in the query (`0A000`); `SELECT … INTO`; `EXPLAIN CREATE
-    TABLE … AS`; view columns reporting their bodies' typmods. → [create-table-as.md §5](spec/design/create-table-as.md)
+  accepts a same-typed array/range/composite source). **Follow-ons landed:** a data-modifying `WITH`
+  in the query (run as the statement's writable `WITH`), `SELECT … INTO [TEMP] [TABLE] name` with
+  PostgreSQL's placement rules, `EXPLAIN [ANALYZE] CREATE TABLE … AS`, and view columns reporting
+  their bodies' typmods (`jed_columns`, `CREATE OR REPLACE VIEW`'s type comparison).
+  → [create-table-as.md](spec/design/create-table-as.md)
+  - [ ] _follow-on:_ array element typmods (with array columns that declare them).
+    → [create-table-as.md §5](spec/design/create-table-as.md)
 - [x] **Views** (`CREATE [OR REPLACE] VIEW` / `ALTER VIEW … RENAME` / `DROP VIEW`, writes through
   updatable views) — a named persisted query read as the equivalent derived table (identical rows,
   cost, plan);

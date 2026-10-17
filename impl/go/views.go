@@ -349,10 +349,9 @@ func (db *engine) planViewReference(viewName string, body *queryExpr, written *t
 			db.viewColumns = make(map[string]*valuesPlan)
 		}
 		if _, ok := db.viewColumns[viewName]; !ok {
-			// The stand-in records no typmods (a shape reads only its outputs' types and pushability).
 			db.viewColumns[viewName] = &valuesPlan{
 				columnTypes: plan.columnTypes(), columnNames: plan.columnNames(), columnDerivs: plan.columnDerivs(),
-				columnTypmods: make([]typmod, len(plan.columnTypes())),
+				columnTypmods: plan.columnTypmods(),
 			}
 		}
 		return nil
@@ -362,8 +361,9 @@ func (db *engine) planViewReference(viewName string, body *queryExpr, written *t
 
 // viewColumnTypes returns the canonical type text of each output column of view (introspection.md
 // §5): the body is planned exactly as a reference to the view would plan it, so a body that cannot be
-// planned raises the error reading the view would. An untyped NULL column reads as text, the type a
-// derived-table column of unknown type takes.
+// planned raises the error reading the view would. The text carries the typmod the column keeps
+// (create-table-as.md §2), and an untyped NULL column reads as text, the type a derived-table column
+// of unknown type takes.
 func (db *engine) viewColumnTypes(view *viewDef) ([]string, error) {
 	if view.Unparsed {
 		return nil, unparsableViewError(view.Name)
@@ -377,14 +377,10 @@ func (db *engine) viewColumnTypes(view *viewDef) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	types := plan.columnTypes()
+	types, typmods := plan.columnTypes(), plan.columnTypmods()
 	out := make([]string, len(types))
 	for i, t := range types {
-		if t.kind == rtNull {
-			out[i] = "text"
-		} else {
-			out[i] = rtName(t)
-		}
+		out[i] = viewColumnTypeText(t, typmods[i])
 	}
 	return out, nil
 }
@@ -507,6 +503,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 	bodyNames := append([]string(nil), plan.columnNames()...)
 	bodyTypes := append([]resolvedType(nil), plan.columnTypes()...)
 	bodyDerivs := append([]deriv(nil), plan.columnDerivs()...)
+	bodyTypmods := append([]typmod(nil), plan.columnTypmods()...)
 	columns, err := viewOutputNames(bodyNames, cv.Columns)
 	if err != nil {
 		return outcome{}, err
@@ -581,7 +578,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 			return outcome{}, notAView(cv.Name)
 		}
 		// 9. Column compatibility (42P16), 10. no cycle (42P17).
-		if err := db.checkViewReplacement(replaced, columns, bodyTypes, bodyDerivs); err != nil {
+		if err := db.checkViewReplacement(replaced, columns, bodyTypes, bodyDerivs, bodyTypmods); err != nil {
 			return outcome{}, err
 		}
 		if db.viewReads(deps, cv.Name) {
@@ -605,10 +602,10 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 }
 
 // checkViewReplacement is the CREATE OR REPLACE VIEW column compatibility check (views.md §1.2 step 9,
-// PostgreSQL's checkViewColumns): no fewer columns, then each existing column keeps its name, type, and
-// collation, all 42P16. The existing types and collations come from planning the view's current body;
-// a body that no longer plans compares only the names and the count.
-func (db *engine) checkViewReplacement(old *viewDef, names []string, types []resolvedType, derivs []deriv) error {
+// PostgreSQL's checkViewColumns): no fewer columns, then each existing column keeps its name, type
+// (typmod included), and collation, all 42P16. The existing types and collations come from planning
+// the view's current body; a body that no longer plans compares only the names and the count.
+func (db *engine) checkViewReplacement(old *viewDef, names []string, types []resolvedType, derivs []deriv, typmods []typmod) error {
 	invalid := func(msg string) error { return newError(InvalidTableDefinition, msg) }
 	if len(names) < len(old.Columns) {
 		return invalid("cannot drop columns from view")
@@ -630,9 +627,11 @@ func (db *engine) checkViewReplacement(old *viewDef, names []string, types []res
 			continue
 		}
 		oldType := current.columnTypes()[i]
-		if !resolvedTypeEqual(oldType, types[i]) {
+		wasType := viewColumnTypeText(oldType, current.columnTypmods()[i])
+		isType := viewColumnTypeText(types[i], typmods[i])
+		if !resolvedTypeEqual(oldType, types[i]) || wasType != isType {
 			return invalid(fmt.Sprintf("cannot change data type of view column \"%s\" from %s to %s",
-				oldName, rtName(oldType), rtName(types[i])))
+				oldName, wasType, isType))
 		}
 		was, wasOK := db.viewCollation(current.columnDerivs()[i])
 		is, isOK := db.viewCollation(derivs[i])
@@ -868,6 +867,22 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 		db.working().removeView(name)
 	}
 	return outcome{Kind: outcomeStatement}, nil
+}
+
+// viewColumnTypeText is the type text of a view output column (introspection.md §5, views.md §1.2):
+// the result type with the typmod the column keeps applied at a scalar leaf (`varchar(3)`,
+// `decimal(5,2)`), and an untyped NULL as text. An array keeps no element typmod
+// (create-table-as.md §5).
+func viewColumnTypeText(t resolvedType, tm typmod) string {
+	switch {
+	case t.kind == rtNull:
+		return "text"
+	case t.kind == rtText && tm.VarcharLen != nil:
+		return fmt.Sprintf("varchar(%d)", *tm.VarcharLen)
+	case t.kind == rtDecimal && tm.Decimal != nil:
+		return fmt.Sprintf("decimal(%d,%d)", tm.Decimal.Precision, tm.Decimal.Scale)
+	}
+	return rtName(t)
 }
 
 // viewOutputNames is the view's output column names (views.md §1): the column list applied over the

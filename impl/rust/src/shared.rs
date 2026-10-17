@@ -4621,6 +4621,27 @@ mod temp_reclaim_internal_tests {
             other => panic!("expected a statement, got {other:?}"),
         }
         assert!(rows(&mut sess, "SELECT a FROM v").is_empty());
+        // SELECT … INTO and EXPLAIN [ANALYZE] CREATE TABLE … AS bind the query's parameters too (§6/§7).
+        match sess
+            .query_outcome("SELECT id INTO x FROM src WHERE id <= $1", &[Value::Int(2)])
+            .unwrap()
+        {
+            Outcome::Statement { rows_affected, .. } => assert_eq!(rows_affected, Some(2)),
+            other => panic!("expected a statement, got {other:?}"),
+        }
+        let explain = "EXPLAIN CREATE TABLE y AS SELECT id FROM src WHERE id = $1";
+        match sess.query_outcome(explain, &[Value::Int(1)]).unwrap() {
+            Outcome::Query { rows, .. } => assert!(!rows.is_empty()),
+            other => panic!("expected a query, got {other:?}"),
+        }
+        let err = sess.query_outcome("SELECT id FROM y", &[]).unwrap_err();
+        assert_eq!(err.code(), "42P01");
+        let analyze = "EXPLAIN ANALYZE CREATE TABLE y AS SELECT id FROM src WHERE id = $1";
+        sess.query_outcome(analyze, &[Value::Int(1)]).unwrap();
+        assert_eq!(
+            rows(&mut sess, "SELECT id FROM y"),
+            vec![vec![Value::Int(1)]]
+        );
         // The column-definition form is plain DDL: it takes no parameters.
         let err = sess
             .query_outcome("CREATE TABLE w (a i32)", &[Value::Int(1)])

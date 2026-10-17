@@ -337,9 +337,9 @@ e
 not false
 
 # --- views: one row per output column, after the tables ------------------------------------------
-# A view column's `type` is the type its planned body produces: the result-column type, which
-# carries no typmod (a varchar(10) column reads as text, decimal(8,2) as decimal), and an untyped
-# NULL reads as text. A view column is nullable, keyless, and has no default. Names are the view's
+# A view column's `type` is the type its planned body produces: the result-column type with the
+# typmod the body keeps (create-table-as.md §2 — a varchar(10) column reads as varchar(10), an
+# expression over it as text), and an untyped NULL reads as text. A view column is nullable, keyless, and has no default. Names are the view's
 # stored output names, so a column list renames them.
 statement ok
 CREATE TABLE vbase (id i32 PRIMARY KEY, label varchar(10) NOT NULL DEFAULT 'x', amount decimal(8,2), tags text[], at addr)
@@ -358,13 +358,13 @@ NULL
 NULL
 2
 label
-text
+varchar(10)
 false
 NULL
 NULL
 3
 total
-decimal
+decimal(8,2)
 false
 NULL
 NULL

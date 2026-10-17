@@ -1262,6 +1262,18 @@ impl Engine {
                 self.collect_cte_catalog_privs(&wq.body, req);
             }
             Statement::Explain { inner, .. } => self.collect_catalog_expr_privs(inner, req),
+            // A `CREATE TABLE … AS` whose own WITH writes (create-table-as.md §1) runs those writes,
+            // unless WITH NO DATA never runs the query.
+            Statement::CreateTable(ct) => {
+                if let Some(cta) = &ct.as_query
+                    && cta.with_data
+                    && let QueryExpr::With(w) = &cta.query
+                {
+                    for cte in &w.ctes {
+                        self.collect_cte_catalog_privs(&cte.body, req);
+                    }
+                }
+            }
             _ => {}
         }
     }

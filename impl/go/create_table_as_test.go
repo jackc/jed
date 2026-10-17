@@ -45,6 +45,33 @@ func TestCreateTableAsBindsParameters(t *testing.T) {
 	if rows := queryRows(t, sess, "SELECT a FROM v"); len(rows) != 0 {
 		t.Fatalf("v rows = %v, want none", rows)
 	}
+	// SELECT … INTO and EXPLAIN [ANALYZE] CREATE TABLE … AS bind the query's parameters too (§6/§7).
+	sql = "SELECT id INTO x FROM src WHERE id <= $1"
+	out, err = queryOutcome(sess, sql, []Value{IntValue(2)})
+	if err != nil {
+		t.Fatalf("%q: %v", sql, err)
+	}
+	if out.Kind != outcomeStatement || !out.HasRowsAffected || out.RowsAffected != 2 {
+		t.Fatalf("%q: got kind %v rows affected (%d, %v), want a statement affecting 2", sql, out.Kind, out.RowsAffected, out.HasRowsAffected)
+	}
+	sql = "EXPLAIN CREATE TABLE y AS SELECT id FROM src WHERE id = $1"
+	out, err = queryOutcome(sess, sql, []Value{IntValue(1)})
+	if err != nil {
+		t.Fatalf("%q: %v", sql, err)
+	}
+	if out.Kind != outcomeQuery || len(out.Rows) == 0 {
+		t.Fatalf("%q: got kind %v with %d rows, want a plan", sql, out.Kind, len(out.Rows))
+	}
+	if code := errCode(t, sess, "SELECT id FROM y"); code != "42P01" {
+		t.Fatalf("y after EXPLAIN: got %s, want 42P01", code)
+	}
+	sql = "EXPLAIN ANALYZE CREATE TABLE y AS SELECT id FROM src WHERE id = $1"
+	if _, err := queryOutcome(sess, sql, []Value{IntValue(1)}); err != nil {
+		t.Fatalf("%q: %v", sql, err)
+	}
+	if rows := queryRows(t, sess, "SELECT id FROM y"); len(rows) != 1 || rows[0][0].Int != 1 {
+		t.Fatalf("y rows = %v, want (1)", rows)
+	}
 	// The column-definition form is plain DDL: it takes no parameters.
 	if code := paramErrCode(t, sess, "CREATE TABLE w (a i32)", IntValue(1)); code != "42601" {
 		t.Fatalf("column-definition form with a parameter: got %s, want 42601", code)

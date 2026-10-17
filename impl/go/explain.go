@@ -65,13 +65,29 @@ func (r *explainRender) actualCost(i int) int64 {
 // EXPLAIN never executes the inner statement — planExplainInner produces the plan structs, which
 // renderQueryPlan walks. The EXPLAIN statement's own cost is one row_produced per emitted plan row.
 func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
+	// `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7) renders the plan of the query the statement
+	// runs. Its checks before anything is created run first — the target, the query's analysis, the
+	// name — and an IF NOT EXISTS that skips a taken name renders no plan. Only ANALYZE runs the
+	// statement itself; the lane is the statement's (explainOutcome reads ex.Inner).
+	inner, run := ex.Inner, (*statement)(nil)
+	if ct := ex.Inner.CreateTable; ct != nil && ct.AsQuery != nil {
+		_, ok, err := db.ctasPrepare(ct, params)
+		if err != nil {
+			return outcome{}, err
+		}
+		if !ok {
+			return db.explainOutcome(nil, ex)
+		}
+		query := ctasQueryStatement(ct.AsQuery.Query)
+		inner, run = &query, ex.Inner
+	}
 	// Bound values make EXPLAIN show the custom plan (estimator.md §6.1): a probe pass types each $N,
 	// then every planning pass below — and an ANALYZE's execution — sees the values. A $N still
 	// renders symbolically. Without values a $N is planned unbound.
 	planning := db.beginPlanning()
 	defer planning.end()
 	if len(params) > 0 {
-		if _, err := db.estimateExplain(ex.Inner); err != nil {
+		if _, err := db.estimateExplain(inner); err != nil {
 			return outcome{}, err
 		}
 		ptys, err := (&paramTypes{types: planning.frame.types}).finalize()
@@ -85,14 +101,14 @@ func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 		planning.bind(bound)
 	}
 	if ex.Analyze {
-		return db.executeExplainAnalyze(ex, params)
+		return db.executeExplainAnalyze(ex, inner, run, params)
 	}
-	estimates, err := db.estimateExplain(ex.Inner)
+	estimates, err := db.estimateExplain(inner)
 	if err != nil {
 		return outcome{}, err
 	}
 	r := explainRender{estimates: estimates, verbose: ex.Verbose}
-	if err := db.renderExplain(&r, ex.Inner, 0); err != nil {
+	if err := db.renderExplain(&r, inner, 0); err != nil {
 		return outcome{}, err
 	}
 	return db.explainOutcome(r.rows, ex)
@@ -105,8 +121,12 @@ func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 // statement executes for real (a DML inner mutates, and the outer autocommit commits it — EXPLAIN
 // ANALYZE of a write IS a write, classified by stmtIsWrite). The EXPLAIN statement's OWN cost is one
 // row_produced per emitted plan row (independent of the inner cost, which appears only in the root).
-func (db *engine) executeExplainAnalyze(ex *explain, params []Value) (outcome, error) {
-	inner := ex.Inner
+// run, when non-nil, is the statement executed in place of the rendered inner — a CREATE TABLE … AS,
+// whose rendered plan is its query's (create-table-as.md §7).
+func (db *engine) executeExplainAnalyze(ex *explain, inner, run *statement, params []Value) (outcome, error) {
+	if run == nil {
+		run = inner
+	}
 	// Render the plan tree first (plan-only, no execution — pre-mutation).
 	estimates, err := db.estimateExplain(inner)
 	if err != nil {
@@ -122,7 +142,7 @@ func (db *engine) executeExplainAnalyze(ex *explain, params []Value) (outcome, e
 	profile := &actualCostProfile{byNode: make(map[actualCostKey][]int64)}
 	previousProfile := db.explainActual
 	db.explainActual = profile
-	innerOut, err := db.dispatchStmtBody(*inner, params)
+	innerOut, err := db.dispatchStmtBody(*run, params)
 	db.explainActual = previousProfile
 	if err != nil {
 		return outcome{}, err

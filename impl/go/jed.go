@@ -48,8 +48,12 @@ var SupportedCapabilities = []string{
 	// session.allow_temp_ddl; storage budget resource.temp_budget.
 	"ddl.temp_table",
 	"ddl.temp_on_commit",
-	// CREATE TABLE … AS query [WITH [NO] DATA] (spec/design/create-table-as.md).
+	// CREATE TABLE … AS query [WITH [NO] DATA] (spec/design/create-table-as.md), with a
+	// data-modifying WITH in its query, its SELECT … INTO spelling, and EXPLAIN of it.
 	"ddl.create_table_as",
+	"ddl.create_table_as_writable_with",
+	"ddl.select_into",
+	"ddl.explain_create_table_as",
 	// CREATE INDEX / DROP INDEX — non-unique secondary indexes, maintained on every write
 	// and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
 	"ddl.secondary_index",

@@ -495,7 +495,7 @@ impl Engine {
             check: None,
         };
         for level in levels.into_iter().rev() {
-            let (_, types, derivs) = metas
+            let (_, types, derivs, _) = metas
                 .get(&level.view.name)
                 .cloned()
                 .expect("planning the target plans every view in its chain");
@@ -551,6 +551,7 @@ impl Engine {
                     plan.column_names().to_vec(),
                     plan.column_types().to_vec(),
                     plan.column_derivs().to_vec(),
+                    plan.column_typmods().to_vec(),
                 ),
             );
             Ok(metas)
@@ -635,8 +636,9 @@ impl Engine {
     }
 }
 
-/// A view's output names, types, and collation derivations (the `Engine::view_columns` value).
-pub(crate) type ViewColumnsMeta = (Vec<String>, Vec<ResolvedType>, Vec<Deriv>);
+/// A view's output names, types, collation derivations, and typmods (the `Engine::view_columns`
+/// value).
+pub(crate) type ViewColumnsMeta = (Vec<String>, Vec<ResolvedType>, Vec<Deriv>, Vec<Typmod>);
 
 /// Resolve a reference to column `col` of the layered relation `rel` found `level` scopes out
 /// (views.md §15.2): an updatable column is the base column itself; a read-only one is its select

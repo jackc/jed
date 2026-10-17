@@ -234,12 +234,12 @@ order. It may add new columns at the end:
 <LiveSql demo="replace" {seed} query={replace} rows={2} />
 
 A change to an existing column is `42P16`: fewer columns, a different name, a different type, or a
-different collation. To rename a column, use `ALTER VIEW … RENAME COLUMN` (below). Two details
-differ from PostgreSQL:
+different collation. A type includes its length or precision, so `varchar(3)` cannot become
+`varchar(4)` or `text`, and `numeric(5,2)` cannot become `numeric(6,2)`. To rename a column, use
+`ALTER VIEW … RENAME COLUMN` (below). Two details differ from PostgreSQL:
 
-- Types are compared without their length or precision, so `varchar(3)` can become `varchar(4)` or
-  `text`. A bare integer such as `0` is an `i64` in jed, so `0 AS n` cannot replace an `i32` column;
-  write `0::i32 AS n`.
+- A bare integer such as `0` is an `i64` in jed, so `0 AS n` cannot replace an `i32` column; write
+  `0::i32 AS n`. A `varchar` with no length is the same type as `text`, so one can replace the other.
 - A replacement whose query would read the view itself, directly or through other views, is `42P17`.
   PostgreSQL accepts it and fails every later read.
 

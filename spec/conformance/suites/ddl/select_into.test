@@ -1,0 +1,180 @@
+# SELECT … INTO [TEMP | TEMPORARY] [TABLE] [db.]name (spec/design/create-table-as.md §6): PostgreSQL's
+# older spelling of CREATE TABLE name AS <the query without INTO> — the same columns (names, types,
+# typmods), rows, cost, and errors. The clause follows the select list of the statement's leftmost
+# SELECT, which may be a set operation's first arm, parenthesized, or the primary of a WITH (a
+# data-modifying one included). Anywhere else it is 42601, and in a CREATE VIEW body 0A000.
+# Oracle-checked against PostgreSQL 18. Format: ../../../design/conformance.md.
+# requires: ddl.select_into, ddl.create_table_as, ddl.create_table_as_writable_with, ddl.create_table, ddl.primary_key, ddl.view, dml.insert, dml.insert_multi_row, dml.insert_select, dml.delete, dml.returning, query.select, query.select_star, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.limit, query.distinct, query.union, query.cte, query.cte_data_modifying, query.subquery_scalar, query.subquery_in, query.derived_table, query.aggregates, query.group_by, expr.arithmetic, types.i32, types.i64, types.decimal, types.text, types.varchar_length, resource.cost_metering
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, price decimal(10,2), name varchar(5))
+
+statement ok
+INSERT INTO src VALUES (1, 1.5, 'ab'), (2, 2.25, 'cd'), (3, 10, NULL)
+
+# --- the forms --------------------------------------------------------------------------------------
+
+# cost: 7
+statement ok
+SELECT id, price, name INTO s1 FROM src
+
+query IDT rowsort
+SELECT * FROM s1
+----
+1
+1.50
+ab
+2
+2.25
+cd
+3
+10.00
+NULL
+
+# the columns keep the typmods: price is decimal(10,2), name varchar(5)
+statement ok
+INSERT INTO s1 VALUES (4, 1.234, 'abcde')
+
+statement error 22001
+INSERT INTO s1 VALUES (5, 1, 'abcdef')
+
+query D nosort
+SELECT price FROM s1 WHERE id = 4
+----
+1.23
+
+# the optional TABLE word, WHERE, ORDER BY, and LIMIT
+statement ok
+SELECT id INTO TABLE s2 FROM src WHERE id > 1 ORDER BY id DESC LIMIT 1
+
+query I nosort
+SELECT * FROM s2
+----
+3
+
+# DISTINCT, GROUP BY, and output names: an alias, a function's name, and ?column?
+statement ok
+SELECT DISTINCT price > 2 AS big, count(*), id + 0 INTO s3 FROM src GROUP BY price > 2, id
+
+query BII rowsort
+SELECT big, count, "?column?" FROM s3
+----
+false
+1
+1
+true
+1
+2
+true
+1
+3
+
+# a FROM-less SELECT
+statement ok
+SELECT 1 AS one, 'x' AS t INTO s4
+
+query IT nosort
+SELECT * FROM s4
+----
+1
+x
+
+# the first arm of a set operation, and a parenthesized query
+statement ok
+SELECT id INTO s5 FROM src WHERE id = 1 UNION SELECT id FROM src WHERE id = 3
+
+query I rowsort
+SELECT * FROM s5
+----
+1
+3
+
+statement ok
+(SELECT id INTO s6 FROM src WHERE id = 2)
+
+query I nosort
+SELECT * FROM s6
+----
+2
+
+# the primary of a WITH, read-only and data-modifying
+statement ok
+WITH w AS (SELECT id FROM src WHERE id < 3) SELECT id INTO s7 FROM w
+
+query I rowsort
+SELECT * FROM s7
+----
+1
+2
+
+statement ok
+WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id, name) SELECT * INTO s8 FROM d
+
+query IT nosort
+SELECT * FROM s8
+----
+3
+NULL
+
+query I nosort
+SELECT count(*) FROM src
+----
+2
+
+# a taken name is 42P07 (there is no IF NOT EXISTS spelling)
+statement error 42P07
+SELECT id INTO s1 FROM src
+
+statement error 42601
+SELECT id INTO IF NOT EXISTS s1 FROM src
+
+# the select list's own errors come first, as for CREATE TABLE … AS
+statement error 42703
+SELECT nosuch INTO s9 FROM src
+
+statement error 42701
+SELECT id, id INTO s9 FROM src
+
+# --- INTO only follows the leftmost SELECT's select list ---------------------------------------------
+
+statement error 42601
+SELECT id FROM src INTO s9
+
+statement error 42601
+SELECT id FROM src UNION SELECT id INTO s9 FROM src
+
+statement error 42601
+SELECT id INTO s9 FROM src UNION ALL (SELECT id INTO s10 FROM src)
+
+statement error 42601
+SELECT * INTO s9 FROM (SELECT id INTO s10 FROM src) x
+
+statement error 42601
+SELECT (SELECT id INTO s9 FROM src LIMIT 1)
+
+statement error 42601
+SELECT id FROM src WHERE id IN (SELECT id INTO s9 FROM src)
+
+statement error 42601
+WITH w AS (SELECT id INTO s9 FROM src) SELECT * FROM w
+
+statement error 42601
+INSERT INTO src SELECT id + 10 INTO s9 FROM src
+
+statement error 42601
+CREATE TABLE s9 AS SELECT id INTO s10 FROM src
+
+statement error 42601
+VALUES (1) INTO s9
+
+statement error 0A000
+CREATE VIEW v AS SELECT id INTO s9 FROM src
+
+statement error 42601
+CREATE VIEW v AS SELECT * FROM (SELECT id INTO s9 FROM src) x
+
+statement error 42601
+CREATE VIEW v AS SELECT id FROM src UNION SELECT id INTO s9 FROM src
+
+statement error 42P01
+SELECT * FROM s9

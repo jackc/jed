@@ -57,6 +57,23 @@ test("CREATE TABLE … AS binds parameters", () => {
   assert.equal(nodata.kind, "statement");
   if (nodata.kind === "statement") assert.equal(nodata.rowsAffected, null);
   assert.deepEqual(rows(sess, "SELECT a FROM v"), []);
+  // SELECT … INTO and EXPLAIN [ANALYZE] CREATE TABLE … AS bind the query's parameters too (§6/§7).
+  const into = queryOutcome(sess, "SELECT id INTO x FROM src WHERE id <= $1", [intValue(2n)]);
+  assert.equal(into.kind, "statement");
+  if (into.kind === "statement") assert.equal(into.rowsAffected, 2);
+  const explain = queryOutcome(sess, "EXPLAIN CREATE TABLE y AS SELECT id FROM src WHERE id = $1", [
+    intValue(1n),
+  ]);
+  assert.equal(explain.kind, "query");
+  if (explain.kind === "query") assert.ok(explain.rows.length > 0);
+  assert.equal(
+    codeOf(() => queryOutcome(sess, "SELECT id FROM y")),
+    "42P01",
+  );
+  queryOutcome(sess, "EXPLAIN ANALYZE CREATE TABLE y AS SELECT id FROM src WHERE id = $1", [
+    intValue(1n),
+  ]);
+  assert.deepEqual(rows(sess, "SELECT id FROM y"), [["1"]]);
   // The column-definition form is plain DDL: it takes no parameters.
   assert.equal(
     codeOf(() => queryOutcome(sess, "CREATE TABLE w (a i32)", [intValue(1n)])),
