@@ -1,0 +1,217 @@
+schema_version = 1
+name = "backup-forms-through-the-page-service"
+description = "A page client and the owner back up the database in both forms (spec/design/page-service.md §9, spec/pageservice/README.md §6.6): neither waits for an open write transaction or sees its writes, both forms decode independently and reopen, the page-identical copy keeps the page numbering and txid, a compacted backup is byte-identical to the file compaction then leaves, and every backup is byte-identical across core pairings."
+requires = ["file.page_service"]
+byte_identical = true
+byte_identical_files = ["client_pi", "client_c", "owner_pi", "owner_c", "before_compact"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, pad text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE u (id i64 PRIMARY KEY, body text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 300) FROM generate_series(1, 2000) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "DELETE FROM t WHERE id > 100"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('z', 300) FROM generate_series(2001, 4000) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "DELETE FROM t WHERE id > 100"
+
+# Incompressible values long enough for overflow chains.
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO u SELECT g, (SELECT string_agg(md5((g * 1000 + k)::text), '') FROM generate_series(1, 200) k) FROM generate_series(1, 10) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "DELETE FROM u WHERE id > 5"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET pad = 'y' WHERE id = 1"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+# The owner holds the writer gate with an uncommitted insert: a backup neither waits for it nor sees it.
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (5000, 'pending')"
+
+[[step]]
+actor = "b"
+command = "backup"
+form = "page_identical"
+path = "client_pi"
+
+[[step]]
+actor = "b"
+command = "backup"
+form = "compacted"
+path = "client_c"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+# The owner backs up its own file the same way.
+[[step]]
+actor = "a"
+command = "backup"
+form = "page_identical"
+path = "owner_pi"
+
+[[step]]
+actor = "a"
+command = "backup"
+form = "compacted"
+path = "owner_c"
+
+# A backup never replaces an existing file.
+[[step]]
+actor = "b"
+command = "backup"
+form = "page_identical"
+path = "owner_c"
+expect_error = "58P02"
+
+# Each decodes under the independent Ruby reader: "txid:live:pages:free". The page-identical copies
+# keep the source's txid and page count; the compacted ones are at txid + 1 with no free list.
+[[step]]
+actor = "-"
+command = "check_image"
+path = "client_pi"
+expect = "10:13:180:58"
+
+[[step]]
+actor = "-"
+command = "check_image"
+path = "client_c"
+expect = "11:13:15:0"
+
+[[step]]
+actor = "-"
+command = "check_image"
+path = "owner_pi"
+expect = "11:13:180:54"
+
+[[step]]
+actor = "-"
+command = "check_image"
+path = "owner_c"
+expect = "12:13:15:0"
+
+# A backup opens as an ordinary database: the client's copy predates the pending insert.
+[[step]]
+actor = "c"
+command = "start"
+argument = "open"
+path = "client_pi"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*), max(id) FROM t"
+expect = "100:100"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*), sum(length(body)) FROM u"
+expect = "5:32000"
+
+[[step]]
+actor = "c"
+command = "exec"
+sql = "INSERT INTO t VALUES (6000, 'copy')"
+
+[[step]]
+actor = "c"
+command = "close"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open"
+path = "owner_c"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*), max(id) FROM t"
+expect = "101:5000"
+
+[[step]]
+actor = "c"
+command = "close"
+
+# A compacted backup is the file compaction leaves for the same snapshot. The client pins nothing, so
+# compaction runs once its asynchronous end_reads reach the owner.
+[[step]]
+actor = "b"
+command = "backup"
+form = "compacted"
+path = "before_compact"
+
+[[step]]
+actor = "a"
+command = "compact"
+retry_ms = 2000
+
+[[step]]
+actor = "-"
+command = "same_bytes"
+paths = ["shared", "before_compact"]
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "101"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

@@ -43,7 +43,7 @@ const (
 	psCodeAbort             byte = 0x09
 	psCodeCommitStatus      byte = 0x0A
 	psCodeRequestOwnership  byte = 0x0B
-	psCodeSnapshotStream    byte = 0x0C // reserved (phase 6): decoded as an unknown code
+	psCodeSnapshotStream    byte = 0x0C // reserved (README.md §3.6): decoded as an unknown code
 	psCodeSubscribe         byte = 0x0D // reserved (phase 7): decoded as an unknown code
 	psCodeHelloOK           byte = 0x41
 	psCodeReadBegun         byte = 0x42

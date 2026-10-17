@@ -1428,15 +1428,35 @@ func loadEnginePaged(pgr *pager, capacity int, env *Environment) (*engine, error
 // shared-file participant holds commit SH. Co-resident body pages are append-only, so cached leaves
 // remain valid and only the catalog/interior skeleton is rebuilt.
 func loadEngineSharedPaging(paging *sharedPaging, env *Environment) (*engine, error) {
+	return loadEngineSharedPagingAt(paging, env, loadAt{})
+}
+
+// loadAt adjusts loadEngineSharedPagingAt for a backup's walk (spec/design/page-service.md §9): meta
+// names the version to load instead of the one recovery selects, and gist sees every GiST R-tree page
+// the load reads. A load at a given meta leaves the engine's free list empty: an older version's free
+// list may name pages a newer commit reused, which the pager's current recovery dependencies would
+// misreport as corrupt.
+type loadAt struct {
+	meta *meta
+	gist func(page uint32)
+}
+
+func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt) (*engine, error) {
 	pgr := paging.pgr
 	pageSize := int(pgr.pageSize)
 	if !pageSizeValid(pageSize) {
 		return nil, newError(DataCorrupted, "invalid page size")
 	}
 
-	mt, err := pgr.selectValidatedMeta()
-	if err != nil {
-		return nil, err
+	var mt meta
+	if at.meta != nil {
+		mt = *at.meta
+	} else {
+		selected, err := pgr.selectValidatedMeta()
+		if err != nil {
+			return nil, err
+		}
+		mt = selected
 	}
 
 	snap := newSnapshot(env)
@@ -1643,6 +1663,9 @@ func loadEngineSharedPaging(paging *sharedPaging, env *Environment) (*engine, er
 					var keys [][]byte
 					read := func(p uint32) (byte, uint32, []byte, error) {
 						live.gist++
+						if at.gist != nil {
+							at.gist(p)
+						}
 						block, err := paging.readBlock(p)
 						if err != nil {
 							return 0, 0, nil, err
@@ -1717,11 +1740,13 @@ func loadEngineSharedPaging(paging *sharedPaging, env *Environment) (*engine, er
 	db.pageCount = mt.pageCount
 	// v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability
 	// walk (spec/fileformat/format.md *Reclamation*).
-	free, err := readFreeList(paging, mt.freeListHead, mt.pageCount)
-	if err != nil {
-		return nil, err
+	if at.meta == nil {
+		free, err := readFreeList(paging, mt.freeListHead, mt.pageCount)
+		if err != nil {
+			return nil, err
+		}
+		db.freePages = free
 	}
-	db.freePages = free
 	// Every persisted free page is dead at the committed version (the free-list is "as of" mt.txid), so
 	// its reuse generation is mt.txid: at open oldest_live == committed and any later reader pins ≥ the
 	// committed version, so reuse is safe (transactions.md §8, the free-list generation gate).
@@ -1770,6 +1795,12 @@ func anySpillable(colTypes []colType) bool {
 // (chainPages — large-values.md §14), so opening a file never materializes or decompresses a large
 // value.
 func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
+	return collectLeafOverflowWith(paging.pgr.readBlock, pageIdx, colTypes, reached, seen, depth)
+}
+
+// collectLeafOverflowWith is collectLeafOverflow over a page reader: the commit path's reads go
+// straight to the pager it already holds, a backup's take the pager lock per page.
+func collectLeafOverflowWith(read func(uint32) ([]byte, error), pageIdx uint32, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
 	if depth > maxTreeDepth {
 		return newError(DataCorrupted, "B-tree deeper than any valid tree")
 	}
@@ -1777,7 +1808,7 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 		return newError(DataCorrupted, "B-tree page reached twice")
 	}
 	seen[pageIdx] = true
-	block, err := paging.pgr.readBlock(pageIdx)
+	block, err := read(pageIdx)
 	if err != nil {
 		return err
 	}
@@ -1787,7 +1818,7 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 	}
 	switch pg.pageType {
 	case pageLeaf:
-		fetch := func(p uint32) ([]byte, error) { return paging.pgr.readBlock(p) }
+		fetch := read
 		n := int(pg.itemCount)
 		leaf, err := parsePaxLeaf(pg.payload, n, colTypes)
 		if err != nil {
@@ -1835,7 +1866,7 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 			cps = append(cps, cp)
 		}
 		for _, cp := range cps {
-			if err := collectLeafOverflow(paging, cp, colTypes, reached, seen, depth+1); err != nil {
+			if err := collectLeafOverflowWith(read, cp, colTypes, reached, seen, depth+1); err != nil {
 				return err
 			}
 		}

@@ -51,7 +51,7 @@ pub const CODE_COMMIT_END: u8 = 0x08;
 pub const CODE_ABORT: u8 = 0x09;
 pub const CODE_COMMIT_STATUS: u8 = 0x0A;
 pub const CODE_REQUEST_OWNERSHIP: u8 = 0x0B;
-/// Reserved for phase 6 (backup); a decoder rejects it in protocol 1.
+/// Reserved (README.md §3.6: backup reads pages with read_pages); a decoder rejects it in protocol 1.
 pub const CODE_SNAPSHOT_STREAM: u8 = 0x0C;
 /// Reserved for phase 7 (replication); a decoder rejects it in protocol 1.
 pub const CODE_SUBSCRIBE: u8 = 0x0D;

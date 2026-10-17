@@ -1,6 +1,6 @@
 # Page service — one owner process, page-level clients — design
 
-> **Status: RATIFIED DESIGN (2026-10-16); phases 1–4 landed, 5–7 to come (§16).** This document
+> **Status: RATIFIED DESIGN (2026-10-16); phases 1–4 and 6 landed, 5 and 7 to come (§16).** This document
 > replaced the earlier shared multi-process protocol with a single **owner** process that alone
 > touches the database file and serves **pages** to every other process over a local endpoint, and
 > extends the same service over SSH for remote access, backup, and replication. The message catalog,
@@ -160,7 +160,7 @@ readers.
 | `commit(CommitDelta)` | Owner validates and persists (§5.6). Reply: the new `txid` once durable. |
 | `abort()` | Release the writer gate; discard any received delta pages. |
 | `commit_status(txid, manifest_digest)` | Resolve an unacknowledged commit after a lost connection (§8.4). |
-| `snapshot_stream(txid, form)` | Stream a pinned snapshot for backup (§9). |
+| `snapshot_stream(txid, form)` | Reserved. The ratified design streamed a pinned snapshot for backup from the owner; backup instead reads pages with `read_pages` (§9). |
 | `subscribe(from_txid)` | Stream retained commit deltas, then the live tail (§10). |
 | `request_ownership()` | Ask a yielding owner to step aside (§8.2). |
 
@@ -453,19 +453,53 @@ return (§5.5) to finish, then answers:
 
 ## 9. Backup
 
-Both backup forms are page-service clients, so they work locally and over SSH alike.
+Both backup forms are page-service clients, so they work locally and over SSH alike. Each pins one
+committed snapshot the way a reader does (`begin_read`) and copies it into a new file; neither takes
+the writer gate, so a backup never waits for a writer and never sees an uncommitted write.
 
-- **Page-identical** (the `pg_basebackup` analogue). `snapshot_stream(txid, page_identical)` sends
-  every page reachable from the pinned snapshot, plus its free-list chain, at its own index, and a meta
-  for that root. The writer zero-fills unreachable indices and writes **bootstrap meta** (zero manifest
-  fields, both slots on the same root — validated-cow.md) so the copy opens without the original's
-  last manifest. The result has the original's page numbering, so it can seed a replica (§10).
+- **Page-identical** (the `pg_basebackup` analogue). The backup walks the pinned snapshot with its own
+  engine and copies every page reachable from it — the catalog chain, every table and index B+tree,
+  every GiST R-tree, every live overflow chain — plus its free-list chain, each at its own index,
+  reading them with batched `read_pages`. The writer zero-fills every other index below the
+  snapshot's page count (its dead pages and its last commit's manifest pages) and writes **bootstrap
+  meta** (zero manifest fields, both slots on the same root — validated-cow.md) for that root, with
+  the snapshot's `txid`, page count, free-list head, and live count, so the copy opens without the
+  original's last manifest. The result has the original's page numbering, so it can seed a replica
+  (§10).
 - **Compacted** (the SQLite `VACUUM INTO` analogue). A client pins a snapshot and runs the existing
-  streaming `compact` image writer locally against it, writing a fresh, renumbered file. Smallest
-  output; cannot seed a replica.
+  streaming `compact` image writer locally against it, writing a fresh, renumbered file at the
+  snapshot's `txid + 1`: byte-for-byte the file host compaction ([api.md](api.md) §2.6) would leave
+  for that snapshot. Smallest output; cannot seed a replica. It is also the one form an in-memory
+  database has (a page-identical backup of one is `0A000`).
 - **Logical dump** (the `pg_dump` analogue) — SQL text or similar, the only form that survives a
   `format_version` change or is readable without jed. It is a CLI feature on top of an ordinary
   client and is out of scope here.
+
+**The client walks** (decided when phase 6 landed). The ratified text had the owner walk the pinned
+snapshot and send its pages with `snapshot_stream(txid, page_identical)`. Finding the reachable pages
+means decoding the catalog — column types for the overflow chains, index kinds for the GiST
+R-trees — which takes an engine and an environment that can decode it. The backup process has both,
+for the same reasons every client runs its own engine (§3); the owner would decode an older pinned
+version it never otherwise interprets, with its own environment, and a TS owner's service worker has
+no engine at all (§14). Every copied page crosses the connection once either way. The cost of the
+client walk is extra round trips for the walk's own reads (each catalog page, overflow-chain hop, and
+GiST level); over SSH, phase 5's read-ahead and subtree fetch are what shorten them, so
+`snapshot_stream` stays a reserved code.
+
+The same walk serves every role: an owner, or a handle outside the page service, reads its own file
+through its pager. Common rules ([spec/pageservice/README.md](../pageservice/README.md) §6.6):
+
+- The destination must not exist (`58P02`, as `create`). The backup writes `<dest>.jedtmp`, syncs it
+  (unless the handle skips fsync), renames it into place, and syncs the directory; a failure removes
+  the temp file and leaves no destination.
+- The backup's pin is an ordinary reader's: it holds back the reuse of pages freed after it and makes
+  compaction fail `55006` while it runs. A role change during a client's backup fails it `08006`.
+- Every copied page's CRC-32 is checked (`XX001`), and the reachable count must equal the snapshot
+  meta's live count (`XX001`).
+- A backup copies the main database only. It is a host act: not metered, not reachable from SQL.
+- **The host API is not yet named.** Each core exposes a test-only entry point (`BackupForTesting`,
+  `backup_for_testing`, `backupForTesting`); the public name and shape (a destination path and a
+  form; attachments; progress) are a product decision, as is the CLI command.
 
 ## 10. Replication (amends replication.md)
 
@@ -685,7 +719,9 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
    S8); retiring shared mode and the `shared` option; the new bundle marker.
 5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree
    fetch.
-6. **Backup**: page-identical and compacted forms.
+6. ✅ **Backup** (landed): page-identical and compacted forms, the client walking its own pinned
+   snapshot (§9, [spec/pageservice/README.md](../pageservice/README.md) §6.6); the host API's public
+   name is open.
 7. **Replication**: the tee, retained log, `subscribe`, lineage and timelines (format change),
    replicas and read replicas; amend replication.md.
 

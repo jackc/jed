@@ -134,6 +134,12 @@ module Sim
       text = transcript(out, name, core) or next
       text.each_line do |line|
         j = JSON.parse(line)
+        if j["op"] == "backup" && j["version"]
+          # A backup's file (page-service.md §9), decoded like a recovery's image.
+          img = File.join(out, "#{name}.#{core}.step#{j['i']}.backup.img")
+          expected[img] = j.merge("recovered" => j["version"]) if File.exist?(img)
+          next
+        end
         next unless j["op"] == "crash"
 
         img = File.join(out, "#{name}.#{core}.step#{j['i']}.img")
@@ -166,7 +172,7 @@ module Sim
                     "#{core} recovered #{have.join('/')}"
       end
     end
-    puts "sim: the independent checker decoded #{expected.size} crash image(s)"
+    puts "sim: the independent checker decoded #{expected.size} crash and backup image(s)"
     failures
   end
 

@@ -113,13 +113,15 @@ reply = "ownership_reply"
 phase = 4
 fields = []
 
-# Reserved: bodies are defined by phases 6 (backup) and 7 (replication).
+# Reserved. snapshot_stream: phase 6 (backup) needs no message of its own — the backup reads pages
+# with read_pages (README.md §6.6); the code is kept for an owner-side page stream, should SSH
+# (phase 5) want one. subscribe: its body is defined by phase 7 (replication).
 [[message]]
 name = "snapshot_stream"
 code = 0x0C
 direction = "request"
 reply = "reserved"
-phase = 6
+phase = 5
 fields = []
 
 [[message]]

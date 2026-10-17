@@ -62,7 +62,8 @@ A client may pipeline: it may send further requests before earlier replies arriv
 
 [messages.toml](messages.toml) is the catalog. Request codes are `0x01`–`0x3F`, reply codes
 `0x40`–`0x7D`, and `0x7E`/`0x7F` are `notice` and `error`. A message's `phase` is the
-page-service.md §16 phase that first uses it. Phases 2, 3, and 4 have landed. **Messages of phases not
+page-service.md §16 phase that first uses it. Phases 2, 3, 4, and 6 have landed (phase 6, backup, needs no
+message of its own: §6.6). **Messages of phases not
 yet landed are provisional: the phase that lands them may revise their bodies.** The protocol version stays **1** until the first
 release that ships the page service; after that, any change to a landed message needs a new version.
 
@@ -203,12 +204,12 @@ resolution window (§4): 0 when the window holds `txid` with this digest, 1 when
 another digest or `txid` is above the committed `txid`, 2 otherwise. A commit's `digest` is CRC-64/ECMA-182
 (the validated-COW manifest CRC, initial value 0) of the complete meta page the commit published.
 
-### 3.6 Ownership (phase 4); backup and replication (phases 6–7, provisional)
+### 3.6 Ownership (phase 4); reserved codes
 
 | Message | Body | Reply |
 |---|---|---|
 | `request_ownership` | empty | `ownership_reply`: `status u8` (0 the owner is yielding to this connection, 1 refused) |
-| `snapshot_stream` | reserved (phase 6) | — |
+| `snapshot_stream` | reserved: backup reads pages with `read_pages` (§6.6); the code is kept for an owner-side page stream, should SSH (phase 5) want one | — |
 | `subscribe` | reserved (phase 7) | — |
 
 `request_ownership` asks the owner to yield (page-service.md §8.2; the rules are §6.5). It is
@@ -573,6 +574,42 @@ ordinary connection to the attached file's owner.
 - **Detach and close** end the attachment's role: an owner drains its clients for its shutdown grace and
   releases ownership, and a client closes its connection (§6.5). Detaching a pinned attachment is still
   `55006`.
+
+### 6.6 Backup (phase 6)
+
+A backup (page-service.md §9) copies the main database's committed snapshot into a new file. It is a
+reader: every role runs the same steps, reading pages through its own pager (an owner, or a handle not
+under the page service, from its file; a client through the owner).
+
+1. **Pin.** Begin a read as a local reader does (§6.3: a client sends `begin_read` and keeps the pin
+   for the backup), and take the meta that published the pinned version `v`: the slot `v & 1` (or the
+   other) whose `txid` is `v`. A client's slots are its adopted meta. When neither slot carries `v` —
+   two commits overwrote it after the pin — release the pin and pin again.
+2. **Write** `<dest>.jedtmp` (the destination must not exist: `58P02`), then sync it unless the handle
+   skips fsync, rename it to `<dest>`, and sync the directory. Any failure removes the temp file and
+   releases the pin.
+   - **Compacted:** the from-scratch image (format.md) of the pinned snapshot at `txid = v + 1`.
+   - **Page-identical** (a file database only; an in-memory one is `0A000`): load the catalog and the
+     interior skeleton at the pinned meta, as an adoption does, noting every GiST R-tree page the load
+     reads. The **backup set** is the catalog chain from the meta's root, every node of every table and
+     B-tree/GIN index tree, every overflow page a leaf of a table with spillable columns references,
+     and those GiST pages; its size must equal the meta's live count (`XX001`). Add the free-list chain
+     from the meta's head (`page_type 7` pages; `XX001` otherwise). Copy each page of the set, in
+     ascending index order, to `index × page_size`, checking its CRC-32 (`XX001`); a client reads them
+     with `read_pages` batches of up to `max_read_pages` indices, naming its newest pinned version as
+     always. Every other index below the meta's page count stays zero; when the last index is not in
+     the set, a zero page is written there so the file spans the page count. Both meta slots get the
+     **bootstrap meta** of the pinned meta: the same magic, version, page size, `txid`, root, page
+     count, free-list head, and live count, every manifest field and every byte from 64 on zero, and a
+     fresh CRC (validated-cow.md §1).
+3. **Release** the pin.
+
+The page-identical copy opens as the source did at `v`: the same page numbering, catalog, free list,
+and live count. Its zero pages are unreachable, and none is on the free list except as the target of
+a later reuse, which overwrites it. A compacted backup and a page-identical one taken by different
+cores of the same history are byte-identical (the from-scratch image is a format.md contract, and the
+copied pages are the owner's file bytes). A backup changes nothing in the source: it writes no page
+of the database, takes no writer gate, and its pin is an ordinary reader's.
 
 ## 7. The corpus through a client
 

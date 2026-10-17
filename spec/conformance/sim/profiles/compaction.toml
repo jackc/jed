@@ -10,11 +10,13 @@ page_sizes = [256, 512]
 max_readers = 1
 
 [weights]
+backup = 3
 compact = 6
 open_read = 2
 close_read = 6
 read_query = 3
 
 [faults]
+backup_fault = 300
 compact_fault = 450
 nth_max = 2
