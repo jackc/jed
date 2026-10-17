@@ -2344,9 +2344,20 @@ Two new top-level statements ([indexes.md](indexes.md)):
 create_index  ::= "CREATE" "UNIQUE"? "INDEX" ( "IF" "NOT" "EXISTS" identifier | identifier? )
                   "ON" identifier using_clause?
                   "(" index_element ("," index_element)* ")" ( "WHERE" expr )?
-index_element ::= column_ref | function_call | "(" expr ")"
+index_element ::= ( column_ref | function_call | "(" expr ")" )
+                  ( "ASC" | "DESC" )? ( "NULLS" ( "FIRST" | "LAST" ) )?
 drop_index    ::= "DROP" "INDEX" identifier
 ```
+
+**Per-key ordering options** (`a DESC`, `b NULLS FIRST`, `(a + 1) DESC NULLS LAST`) are
+PostgreSQL's `opt_asc_desc opt_nulls_order` ([indexes.md §11](indexes.md)): the words are
+recognized positionally after a key element (non-reserved), the direction defaults to `ASC`, and
+the NULL placement defaults by direction (`DESC` ⇒ `NULLS FIRST`, as the query `ORDER BY` §10). A
+bare `NULLS` not followed by `FIRST`/`LAST`, or a second direction, is `42601`. The parser keeps
+what was *written*, because an unordered access method rejects any written option — explicit
+`ASC` included — with `0A000` (`access method "gin" does not support ASC/DESC options`, then
+`… NULLS FIRST/LAST options`). A `UNIQUE` / `PRIMARY KEY` constraint's column list has no ordering
+(`42601`, as in PostgreSQL — only `CREATE UNIQUE INDEX` takes one).
 
 **The optional trailing `WHERE predicate`** makes the index **partial** — only rows whose
 predicate is TRUE are indexed ([indexes.md §9](indexes.md)). `WHERE` is recognized

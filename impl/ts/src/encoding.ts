@@ -107,3 +107,77 @@ export function encodeNullable(t: ScalarType, value: bigint | null): Uint8Array 
   out.set(v, 1);
   return out;
 }
+
+// KeyOrder is one ordered-index key element's sort order (spec/design/encoding.md §2.16, indexes.md
+// §10): desc for a `DESC` key, nullsFirst for `NULLS FIRST`. The default (`ASC NULLS LAST`) is the
+// plain §2.2 slot; the PostgreSQL defaults follow direction (`DESC` ⇒ `NULLS FIRST`).
+export type KeyOrder = { readonly desc: boolean; readonly nullsFirst: boolean };
+
+// KEY_ORDER_ASC is `ASC NULLS LAST` — the plain §2.2 slot (0x00 present, 0x01 NULL).
+export const KEY_ORDER_ASC: KeyOrder = Object.freeze({ desc: false, nullsFirst: false });
+
+// keyOrderIsDefault reports whether o is the default `ASC NULLS LAST` order (no persisted option byte).
+export function keyOrderIsDefault(o: KeyOrder): boolean {
+  return !o.desc && !o.nullsFirst;
+}
+
+// keyOrderToByte is the persisted option byte (format.md, v46): bit0 desc, bit1 nulls_first.
+export function keyOrderToByte(o: KeyOrder): number {
+  return (o.desc ? 1 : 0) | (o.nullsFirst ? 2 : 0);
+}
+
+// keyOrderFromByte decodes a persisted option byte; null when a reserved bit is set.
+export function keyOrderFromByte(b: number): KeyOrder | null {
+  if ((b & ~0b11) !== 0) return null;
+  return { desc: (b & 1) !== 0, nullsFirst: (b & 2) !== 0 };
+}
+
+// keyOrderPresentTag is the slot's presence tag for a present value (§2.16): 0x00 ASC NULLS LAST,
+// 0x01 ASC NULLS FIRST, 0xFF DESC NULLS FIRST, 0xFE DESC NULLS LAST.
+export function keyOrderPresentTag(o: KeyOrder): number {
+  if (o.desc) return o.nullsFirst ? 0xff : 0xfe;
+  return o.nullsFirst ? 0x01 : 0x00;
+}
+
+// keyOrderNullTag is the slot's lone NULL byte (§2.16): 0x01 ASC NULLS LAST, 0x00 ASC NULLS FIRST,
+// 0xFE DESC NULLS FIRST, 0xFF DESC NULLS LAST.
+export function keyOrderNullTag(o: KeyOrder): number {
+  if (o.desc) return o.nullsFirst ? 0xfe : 0xff;
+  return o.nullsFirst ? 0x00 : 0x01;
+}
+
+// keyOrderIsNullTag reports whether tag (a slot's first byte) is o's NULL byte.
+export function keyOrderIsNullTag(o: KeyOrder, tag: number): boolean {
+  return tag === keyOrderNullTag(o);
+}
+
+// The one-byte tag arrays, shared: callers only concatenate slot parts, never mutate them.
+const TAG_BYTES: Uint8Array[] = Array.from({ length: 256 }, (_, i) => Uint8Array.of(i));
+
+// keyOrderPushPresent appends a present slot to parts: the presence tag, then the bare
+// order-preserving key body — bitwise inverted (one's complement) for a DESC key.
+export function keyOrderPushPresent(parts: Uint8Array[], o: KeyOrder, body: Uint8Array): void {
+  parts.push(TAG_BYTES[keyOrderPresentTag(o)]!);
+  if (o.desc) {
+    const inv = new Uint8Array(body.length);
+    for (let i = 0; i < body.length; i++) inv[i] = body[i]! ^ 0xff;
+    parts.push(inv);
+  } else {
+    parts.push(body);
+  }
+}
+
+// keyOrderPushSlot appends the slot for an optional value: keyOrderPushPresent or the NULL byte.
+export function keyOrderPushSlot(parts: Uint8Array[], o: KeyOrder, body: Uint8Array | null): void {
+  if (body === null) parts.push(TAG_BYTES[keyOrderNullTag(o)]!);
+  else keyOrderPushPresent(parts, o, body);
+}
+
+// keyOrderPresentSlot is the present slot for body as a fresh array.
+export function keyOrderPresentSlot(o: KeyOrder, body: Uint8Array): Uint8Array {
+  const out = new Uint8Array(body.length + 1);
+  out[0] = keyOrderPresentTag(o);
+  if (o.desc) for (let i = 0; i < body.length; i++) out[i + 1] = body[i]! ^ 0xff;
+  else out.set(body, 1);
+  return out;
+}

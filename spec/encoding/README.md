@@ -23,6 +23,7 @@ nullable presence tag, composition, and the NULLs-last decision — is in
 
 | File | Contents |
 |---|---|
+| [ordered.toml](ordered.toml) | The four **ordered index slots** (ASC/DESC × NULLS FIRST/LAST, [../design/encoding.md §2.16](../design/encoding.md)) for every keyable type — byte-exact, order-checked in each order, and prefix-free. |
 | [integers.toml](integers.toml) | Byte-exact `(value → bytes)` **key-encoding** vectors: `i16`/`i32`/`i64` bare values, the nullable presence-tag slot, and the descending (inverted) encoding. |
 | [timestamps.toml](timestamps.toml) | `timestamp`/`timestamptz` parse / render vectors — `(input → micros)`, `(input → error)`, `(micros → text)` ([../design/timestamp.md](../design/timestamp.md)). |
 | [intervals.toml](intervals.toml) | `interval` parse / render vectors — `(input → months/days/micros)` and `(fields → text)` ([../design/interval.md](../design/interval.md)). |

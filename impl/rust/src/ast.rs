@@ -395,6 +395,32 @@ pub struct CreateIndex {
     /// predicate carries its canonical text (persisted, format_version 27) and the parsed AST the
     /// executor re-resolves against the table's columns, as a `CHECK` / expression key does.
     pub predicate: Option<IndexPredicate>,
+    /// Each key element's written `ASC`/`DESC` + `NULLS FIRST|LAST` options (spec/design/indexes.md
+    /// §10), parallel to `keys`. GIN/GiST reject any written option (`0A000`), so the parser keeps
+    /// what was *written*, not just the effective order.
+    pub key_orders: Vec<IndexKeyOrderSpec>,
+}
+
+/// The ordering options written after one `CREATE INDEX` key element (indexes.md §11): `desc` is
+/// `Some(false)` for `ASC`, `Some(true)` for `DESC`, `None` when omitted; `nulls_first` likewise for
+/// `NULLS FIRST` / `NULLS LAST`. The effective order defaults by direction (PostgreSQL: `DESC` ⇒
+/// `NULLS FIRST`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct IndexKeyOrderSpec {
+    pub desc: Option<bool>,
+    pub nulls_first: Option<bool>,
+}
+
+impl IndexKeyOrderSpec {
+    /// The effective key order: direction as written (default `ASC`), NULL placement as written or
+    /// the direction's default.
+    pub fn effective(self) -> crate::encoding::KeyOrder {
+        let desc = self.desc.unwrap_or(false);
+        crate::encoding::KeyOrder {
+            desc,
+            nulls_first: self.nulls_first.unwrap_or(desc),
+        }
+    }
 }
 
 /// A partial-index predicate (spec/design/indexes.md §9): its persisted canonical text + parsed

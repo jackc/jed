@@ -321,6 +321,35 @@ fn partial_index_table_db() -> Session {
     db
 }
 
+/// The v46 ordered-index-keys fixture (spec/design/indexes.md §11, encoding.md §2.16): DESC / NULLS
+/// FIRST / DESC NULLS LAST elements (index_flags bit4 + the option bytes, the ordered entry slots)
+/// beside a plain index. Must match verify.rb's ORDERED_INDEX_TABLE.
+fn ordered_index_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, v text, n i32, d decimal)",
+    );
+    run(&mut db, "CREATE INDEX t_v_desc ON t (v DESC)");
+    run(&mut db, "CREATE INDEX t_n_nf ON t (n NULLS FIRST)");
+    run(
+        &mut db,
+        "CREATE UNIQUE INDEX t_mix ON t (d DESC NULLS LAST, n)",
+    );
+    run(&mut db, "CREATE INDEX t_plain ON t (n)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, 'b', 10, 1.5), (2, NULL, NULL, NULL), (3, 'a', 20, -2), (4, 'ab', NULL, 100)",
+    );
+    db
+}
+
 fn timezone_index_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
         environment: golden_env(),
@@ -2069,6 +2098,7 @@ fn write_matches_goldens() {
         ("unique_table.jed", unique_table_db),
         ("expr_index_table.jed", expr_index_table_db),
         ("partial_index_table.jed", partial_index_table_db),
+        ("ordered_index_table.jed", ordered_index_table_db),
         ("timezone_index_table.jed", timezone_index_table_db),
         ("hostfunc_index_table.jed", hostfunc_index_table_db),
         ("hostfunc_check_table.jed", hostfunc_check_table_db),

@@ -140,13 +140,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ defer a writable `WITH`'s foreign-key checks to the end of the whole statement (PostgreSQL's RI-trigger timing), so a reference made valid only by a LATER sub-statement no longer fails `23503`. → [writable-cte.md §7](spec/design/writable-cte.md)
 - [x] **`FOREIGN KEY` constraints** — column-/table-level `REFERENCES`, composite + self-reference, same-type pairing (`42804`), MATCH SIMPLE and MATCH FULL (a partly-NULL tuple is `23503`; `format_version` 40's match bit, `jed_constraints.match_type`), enforced at four write sites (`23503`), plus recursive `ON DELETE`/`ON UPDATE` `CASCADE | SET NULL | SET DEFAULT` action closures (`format_version` 30's three-bit action fields). → [constraints.md §6](spec/design/constraints.md)
   - [ ] _follow-on:_ FK type pairing relaxed to PG's comparable-types.
-- [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — on-disk B-trees with equality/range and multi-column-prefix bounds, expression and partial keys, bounded mutation scans, and LIMIT streaming; `format_version` 5/26/27. → [indexes.md](spec/design/indexes.md)
+- [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — on-disk B-trees with equality/range and multi-column-prefix bounds, expression and partial keys, bounded mutation scans, and LIMIT streaming; per-key `ASC`/`DESC` + `NULLS FIRST|LAST` (the ordered slot — encoding.md §2.16; forward walks serve matching `ORDER BY`s); `format_version` 5/26/27/46. → [indexes.md](spec/design/indexes.md)
   Variable-width (text/decimal/bytea/interval, C or collated) range and trailing key elements are
   skipped by their self-delimiting encodings (indexes.md §5.1). Partial indexes are used whenever the
   WHERE implies their predicate under a bounded `predtest.c`-subset prover (§9.1), including a full
   partial-index scan with no access predicate and its ORDER BY walk (§9.2), OR/IN sets, and the
   index-nested-loop inner (§9.3); `ON CONFLICT (cols) WHERE pred` infers a partial unique arbiter.
-  - [ ] _follow-on (each its own slice + NoREC obligation):_ ordered (`ASC`/`DESC`/`NULLS`) keys; a
+  - [ ] _follow-on (each its own slice + NoREC obligation):_ a **backward** index walk serving a
+    `DESC` order from an `ASC` index (needs a unique NULL-free key, or a reversed tie-break); a
     container (range/array/composite) element after the equality prefix (needs a container slot
     skip); a full partial-index scan inside a join (sound for a NULL-rejecting predicate,
     indexes.md §9.2); prover extensions — refutation, cross-family constants, `NOT`, and a bound

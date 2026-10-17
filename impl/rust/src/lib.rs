@@ -161,6 +161,8 @@ pub mod tooling {
     };
     /// Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
     pub use crate::cost::{QUERY_MEMORY_PEAK, QUERY_MEMORY_UNDERFLOWS};
+    /// An index key element's sort order (spec/design/indexes.md §11) — the dump renders it.
+    pub use crate::encoding::KeyOrder;
     /// Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
     pub use crate::format::VERIFY_LIVE_PAGES;
     /// Session-local temp domains spilled to a scratch file (spec/design/temp-tables.md §6).
@@ -1251,6 +1253,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // the jed_indexes catalog relation (I2, introspection.md §5.1): one row per secondary index —
     // name, table_name, columns (text[]), is_unique, method (btree/gin/gist).
     "introspect.indexes",
+    // Ordered index keys: per-element ASC/DESC + NULLS FIRST|LAST (spec/design/indexes.md §11).
+    "ddl.index_key_order",
     // the jed_constraints catalog relation (I2): one row per CHECK / UNIQUE / FK / EXCLUDE
     // constraint — name, table_name, type, columns (text[]), expression, ref_table, ref_columns
     // (text[]) (introspection.md §5.1).

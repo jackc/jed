@@ -53,7 +53,9 @@ Nine relations ship today:
   is never `not_null`, keyed, defaulted, or an identity. Views
   in attached databases are not listed.
 - **`jed_indexes`** — one row per secondary index: `name`, `table_name`, `columns` (a `text[]` of
-  the indexed column names in key order), `is_unique`, and `method` (`btree` / `gin` / `gist`).
+  the indexed column names in key order), `is_unique`, `method` (`btree` / `gin` / `gist`),
+  `predicate` (a partial index's `WHERE` text, else `NULL`), and `descending` / `nulls_first`
+  (`boolean[]`s parallel to `columns`: each key's `DESC` and `NULLS FIRST` flags).
   The primary key owns no index object, so it is not listed here — see `jed_columns.pk_ordinal`.
 - **`jed_constraints`** — one row per `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` constraint:
   `name`, `table_name`, `type`, `columns` (a `text[]` of the member/local columns; `NULL` for a

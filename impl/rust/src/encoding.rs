@@ -81,3 +81,91 @@ pub fn encode_nullable(ty: ScalarType, value: Option<i64>) -> Vec<u8> {
         }
     }
 }
+
+/// One ordered-index key element's sort order (spec/design/encoding.md §2.16, indexes.md §11):
+/// `desc` for a `DESC` key, `nulls_first` for `NULLS FIRST`. The default (`ASC NULLS LAST`) is the
+/// plain §2.2 slot; the PostgreSQL defaults follow direction (`DESC` ⇒ `NULLS FIRST`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Hash)]
+pub struct KeyOrder {
+    pub desc: bool,
+    pub nulls_first: bool,
+}
+
+impl KeyOrder {
+    /// `ASC NULLS LAST` — the plain §2.2 slot (`0x00` present, `0x01` NULL).
+    pub const ASC: KeyOrder = KeyOrder {
+        desc: false,
+        nulls_first: false,
+    };
+
+    /// Whether this is the default `ASC NULLS LAST` order (no persisted option byte).
+    pub fn is_default(self) -> bool {
+        !self.desc && !self.nulls_first
+    }
+
+    /// The persisted option byte (format.md, v46): bit0 `desc`, bit1 `nulls_first`.
+    pub fn to_byte(self) -> u8 {
+        u8::from(self.desc) | (u8::from(self.nulls_first) << 1)
+    }
+
+    /// Decode a persisted option byte; `None` when a reserved bit is set.
+    pub fn from_byte(b: u8) -> Option<KeyOrder> {
+        (b & !0b11 == 0).then_some(KeyOrder {
+            desc: b & 1 != 0,
+            nulls_first: b & 2 != 0,
+        })
+    }
+
+    /// The slot's presence tag for a present value (§2.16): `0x00` ASC NULLS LAST, `0x01` ASC NULLS
+    /// FIRST, `0xFF` DESC NULLS FIRST, `0xFE` DESC NULLS LAST.
+    pub fn present_tag(self) -> u8 {
+        match (self.desc, self.nulls_first) {
+            (false, false) => 0x00,
+            (false, true) => 0x01,
+            (true, true) => 0xFF,
+            (true, false) => 0xFE,
+        }
+    }
+
+    /// The slot's lone NULL byte (§2.16): `0x01` ASC NULLS LAST, `0x00` ASC NULLS FIRST, `0xFE` DESC
+    /// NULLS FIRST, `0xFF` DESC NULLS LAST.
+    pub fn null_tag(self) -> u8 {
+        match (self.desc, self.nulls_first) {
+            (false, false) => 0x01,
+            (false, true) => 0x00,
+            (true, true) => 0xFE,
+            (true, false) => 0xFF,
+        }
+    }
+
+    /// Append a present slot: the presence tag, then the bare order-preserving key `body` — bitwise
+    /// inverted (one's complement) for a `DESC` key.
+    pub fn push_present(self, out: &mut Vec<u8>, body: &[u8]) {
+        out.push(self.present_tag());
+        if self.desc {
+            out.extend(body.iter().map(|b| !b));
+        } else {
+            out.extend_from_slice(body);
+        }
+    }
+
+    /// Append the slot for an optional value: [`push_present`](Self::push_present) or the NULL byte.
+    pub fn push_slot(self, out: &mut Vec<u8>, body: Option<&[u8]>) {
+        match body {
+            Some(b) => self.push_present(out, b),
+            None => out.push(self.null_tag()),
+        }
+    }
+
+    /// The present slot for `body` as a fresh vector.
+    pub fn present_slot(self, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(body.len() + 1);
+        self.push_present(&mut out, body);
+        out
+    }
+
+    /// Whether `tag` (a slot's first byte) is this order's NULL byte.
+    pub fn is_null_tag(self, tag: u8) -> bool {
+        tag == self.null_tag()
+    }
+}

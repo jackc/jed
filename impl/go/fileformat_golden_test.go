@@ -179,6 +179,20 @@ func partialIndexTableDB(t *testing.T) *Session {
 	return db
 }
 
+// orderedIndexTableDB is the v46 ordered-index-keys fixture (spec/design/indexes.md §11,
+// encoding.md §2.16): DESC / NULLS FIRST / DESC NULLS LAST elements (index_flags bit4 + the option
+// bytes, the ordered entry slots) beside a plain index. Must match verify.rb's ORDERED_INDEX_TABLE.
+func orderedIndexTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v text, n i32, d decimal)")
+	run(t, db, "CREATE INDEX t_v_desc ON t (v DESC)")
+	run(t, db, "CREATE INDEX t_n_nf ON t (n NULLS FIRST)")
+	run(t, db, "CREATE UNIQUE INDEX t_mix ON t (d DESC NULLS LAST, n)")
+	run(t, db, "CREATE INDEX t_plain ON t (n)")
+	run(t, db, "INSERT INTO t VALUES (1, 'b', 10, 1.5), (2, NULL, NULL, NULL), (3, 'a', 20, -2), (4, 'ab', NULL, 100)")
+	return db
+}
+
 // hostfuncIndexTableDB has a HOST-FUNCTION index dependency (v31 — the index_flags bit2 + the
 // persisted dependency list after index_root_page, extensibility.md §8.1): the index t_geo_idx is on
 // geo_hash(a), a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
@@ -1184,6 +1198,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"unique_table.jed", uniqueTableDB},
 		{"expr_index_table.jed", exprIndexTableDB},
 		{"partial_index_table.jed", partialIndexTableDB},
+		{"ordered_index_table.jed", orderedIndexTableDB},
 		{"timezone_index_table.jed", timezoneIndexTableDB},
 		{"hostfunc_index_table.jed", hostfuncIndexTableDB},
 		{"hostfunc_check_table.jed", hostfuncCheckTableDB},
@@ -1274,6 +1289,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"unique_table.jed", uniqueTableDB, "t"},
 		{"expr_index_table.jed", exprIndexTableDB, "t"},
 		{"partial_index_table.jed", partialIndexTableDB, "t"},
+		{"ordered_index_table.jed", orderedIndexTableDB, "t"},
 		{"timezone_index_table.jed", timezoneIndexTableDB, "t"},
 		{"gin_array_table.jed", ginArrayTableDB, "t"},
 		{"gin_uuid_table.jed", ginUuidTableDB, "t"},

@@ -23,10 +23,21 @@ const (
 	keySlotCollated
 )
 
-// keySlot is one index key component's slot form (indexes.md §5.1).
+// keySlot is one index key component's slot form (indexes.md §5.1) under its sort order
+// (indexes.md §11, encoding.md §2.16): the order picks the slot's NULL tag, and a DESC slot's body
+// is the one's complement of the ASC body, which the skip reads through an XOR mask (inversion
+// keeps every body self-delimiting — the no-prefix property, spec/encoding/ordered.toml). The zero
+// order is the plain §2.2 ASC NULLS LAST slot.
 type keySlot struct {
 	kind  keySlotKind
 	width int // keySlotFixed only
+	order keyOrder
+}
+
+// withOrder is k under the key element's sort order o.
+func (k keySlot) withOrder(o keyOrder) keySlot {
+	k.order = o
+	return k
 }
 
 // keySlotForScalar is the slot form of a scalar key component of type ty; collated selects the
@@ -52,15 +63,21 @@ func keySlotForScalar(ty scalarType, collated bool) (keySlot, bool) {
 }
 
 // slotLen is the byte length of the nullable slot starting at key[at] (its tag included): 1 for the
-// 0x01 NULL tag, else 1 + the self-delimited body. ok=false for a malformed (truncated) slot.
+// order's NULL tag, else 1 + the self-delimited body (inverted under DESC). ok=false for a malformed
+// (truncated) slot.
 func (k keySlot) slotLen(key []byte, at int) (int, bool) {
 	if at >= len(key) {
 		return 0, false
 	}
-	if key[at] == 0x01 {
+	if key[at] == k.order.nullTag() {
 		return 1, true
 	}
 	body := key[at+1:]
+	// m un-inverts a DESC body byte (b^m is the ASC byte).
+	var m byte
+	if k.order.Desc {
+		m = 0xFF
+	}
 	var n int
 	switch k.kind {
 	case keySlotFixed:
@@ -69,7 +86,7 @@ func (k keySlot) slotLen(key []byte, at int) (int, bool) {
 		}
 		n = k.width
 	case keySlotTerminated:
-		l, ok := terminatedLen(body)
+		l, ok := terminatedLen(body, m)
 		if !ok {
 			return 0, false
 		}
@@ -78,7 +95,7 @@ func (k keySlot) slotLen(key []byte, at int) (int, bool) {
 		if len(body) == 0 {
 			return 0, false
 		}
-		switch class := body[0]; class {
+		switch class := body[0] ^ m; class {
 		case 0x04:
 			n = 1
 		case 0x03, 0x05:
@@ -90,7 +107,7 @@ func (k keySlot) slotLen(key []byte, at int) (int, bool) {
 			if len(body) < 5 {
 				return 0, false
 			}
-			pos := bytes.IndexByte(body[5:], term)
+			pos := bytes.IndexByte(body[5:], term^m)
 			if pos < 0 {
 				return 0, false
 			}
@@ -106,13 +123,13 @@ func (k keySlot) slotLen(key []byte, at int) (int, bool) {
 			if i+2 > len(body) {
 				return 0, false
 			}
-			zero := body[i] == 0 && body[i+1] == 0
+			zero := body[i]^m == 0 && body[i+1]^m == 0
 			i += 2
 			if zero {
 				seps++
 			}
 		}
-		l, ok := terminatedLen(body[i:])
+		l, ok := terminatedLen(body[i:], m)
 		if !ok {
 			return 0, false
 		}
@@ -122,21 +139,21 @@ func (k keySlot) slotLen(key []byte, at int) (int, bool) {
 }
 
 // terminatedLen is the length of a *-terminated-escape body (0x00 0xFF an escaped NUL, 0x00 0x01
-// the end).
-func terminatedLen(body []byte) (int, bool) {
+// the end), each byte read as b^m (m = 0xFF for a DESC slot's inverted body).
+func terminatedLen(body []byte, m byte) (int, bool) {
 	i := 0
 	for {
 		if i >= len(body) {
 			return 0, false
 		}
-		if body[i] != 0x00 {
+		if body[i]^m != 0x00 {
 			i++
 			continue
 		}
 		if i+1 >= len(body) {
 			return 0, false
 		}
-		if body[i+1] == 0x01 {
+		if body[i+1]^m == 0x01 {
 			return i + 2, true
 		}
 		i += 2

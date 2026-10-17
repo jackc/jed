@@ -1218,6 +1218,17 @@ impl Engine {
                         Some(p) => Value::Text(p.expr_text.clone()),
                         None => Value::Null,
                     },
+                    // Each key element's order flags (indexes.md §11), parallel to `columns`.
+                    Value::Array(ArrayVal::one_dim(
+                        (0..idx.keys.len())
+                            .map(|i| Value::Bool(idx.key_order(i).desc))
+                            .collect(),
+                    )),
+                    Value::Array(ArrayVal::one_dim(
+                        (0..idx.keys.len())
+                            .map(|i| Value::Bool(idx.key_order(i).nulls_first))
+                            .collect(),
+                    )),
                 ]);
             }
         }

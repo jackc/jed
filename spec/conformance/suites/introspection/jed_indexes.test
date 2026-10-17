@@ -9,7 +9,7 @@
 # jed_columns.pk_ordinal. Resolution / qualifier scoping / read-only rejection / privileges / cost
 # are the same model as jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT
 # PostgreSQL-oracle-checked.
-# requires: introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, ddl.exclusion_constraint, ddl.exclusion_btree, ddl.exclusion_partial, types.boolean, types.boolean_storable, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
+# requires: ddl.index_key_order, introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, ddl.exclusion_constraint, ddl.exclusion_btree, ddl.exclusion_partial, types.boolean, types.boolean_storable, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
 
 # --- an empty database lists no indexes (catalog relations are not themselves indexes) ------------
 
@@ -168,6 +168,32 @@ NULL
 
 statement ok
 DROP TABLE p
+
+# --- descending / nulls_first: each key element's order flags, parallel to columns (indexes.md §11) --
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+CREATE INDEX o_ord ON o (a DESC, b NULLS FIRST, id DESC NULLS LAST, (a + b))
+
+query TTTT nosort
+SELECT name, columns, descending, nulls_first FROM jed_indexes WHERE table_name = 'o'
+----
+o_ord
+{a,b,id,"a + b"}
+{true,false,true,false}
+{true,true,false,false}
+
+# a plain index reports all-false flags
+query TT nosort
+SELECT descending, nulls_first FROM jed_indexes WHERE name = 'ix_bc'
+----
+{false,false}
+{false,false}
+
+statement ok
+DROP TABLE o
 
 # --- read-only: every mutation / DDL target naming the relation is 42809 ------------------------
 

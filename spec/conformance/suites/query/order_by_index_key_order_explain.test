@@ -1,0 +1,206 @@
+# EXPLAIN of plans over ordered index keys (spec/design/indexes.md §11, explain.md §5): which access
+# path / index order serves each query of query/order_by_index_key_order.test (rows and costs are
+# pinned there). The plans are jed-owned, so this file is cross-core checked, not oracle-checked.
+# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.index_range, query.index_prefix, query.or_in_point_lookup, query.interval_set, query.composite_key_set, query.order_by, query.order_by_keys, query.order_by_index_scan, query.order_by_topk, query.limit, query.join_inner, query.index_nested_loop, query.explain, query.set_returning, expr.in_list, types.i32, types.text
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, a i32, b i32, pad text)
+
+statement ok
+INSERT INTO o SELECT i, CASE WHEN i % 97 = 0 THEN NULL ELSE i % 50 END, CASE WHEN i % 31 = 0 THEN NULL ELSE i % 13 END, 'p' FROM generate_series(1, 600) AS i
+
+statement ok
+CREATE INDEX o_a_desc ON o (a DESC)
+
+statement ok
+CREATE INDEX o_ab ON o (a NULLS FIRST, b DESC)
+
+statement ok
+CREATE TABLE s (x i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO s VALUES (5), (44)
+
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO w SELECT i, (i * 37) % 1000 FROM generate_series(1, 400) AS i
+
+statement ok
+CREATE INDEX w_k ON w (k DESC)
+
+# The forward walk of o_a_desc serves ORDER BY a DESC (NULLS FIRST by default).
+query ITTII nosort
+EXPLAIN SELECT id, a FROM o ORDER BY a DESC LIMIT 8
+----
+0
+Limit
+limit=8
+8
+33
+1
+Scan o
+Full scan; touched=2; ordered: index order: o_a_desc
+8
+25
+
+# A mismatched NULL placement is not the index order: the blocking top-k sort.
+query ITTII nosort
+EXPLAIN SELECT id, a FROM o ORDER BY a DESC NULLS LAST, id LIMIT 3
+----
+0
+Limit
+limit=3
+3
+607
+1
+Sort
+keys=2, top-k=3
+600
+604
+2
+Scan o
+Full scan; touched=2
+600
+604
+
+# A backward walk is not used: ORDER BY a over the DESC index keeps the top-k sort.
+query ITTII nosort
+EXPLAIN SELECT id, a FROM o ORDER BY a LIMIT 3
+----
+0
+Limit
+limit=3
+3
+607
+1
+Sort
+keys=1, top-k=3
+600
+604
+2
+Scan o
+Full scan; touched=2
+600
+604
+
+# Two ordered keys (a NULLS FIRST, b DESC) match o_ab.
+query ITTII nosort
+EXPLAIN SELECT id, a, b FROM o ORDER BY a NULLS FIRST, b DESC LIMIT 9
+----
+0
+Limit
+limit=9
+9
+39
+1
+Scan o
+Full scan; touched=3; ordered: index order: o_ab
+9
+30
+
+# Flipping b's NULL placement no longer matches o_ab.
+query ITTII nosort
+EXPLAIN SELECT id, a, b FROM o ORDER BY a NULLS FIRST, b DESC NULLS LAST LIMIT 9
+----
+0
+Limit
+limit=9
+9
+613
+1
+Sort
+keys=2, top-k=9
+600
+604
+2
+Scan o
+Full scan; touched=3
+600
+604
+
+# A range over the DESC column seeks o_a_desc.
+query ITTII nosort
+EXPLAIN SELECT id FROM o WHERE a >= 48
+----
+0
+Filter
+conjuncts=1
+200
+1001
+1
+Scan o
+Index bound: using o_a_desc; touched=2
+200
+601
+
+# An equality prefix then a range on the DESC second key seeks o_ab.
+query ITTII nosort
+EXPLAIN SELECT id, b FROM o WHERE a = 7 AND b > 8
+----
+0
+Filter
+conjuncts=2
+1
+9
+1
+Scan o
+Index bound: using o_ab; touched=3
+1
+5
+
+# An IN list over the DESC column is an index interval set.
+query ITTII nosort
+EXPLAIN SELECT id FROM o WHERE a IN (3, 47) AND id < 200
+----
+0
+Filter
+conjuncts=2
+2
+51
+1
+Scan o
+Index interval set: using o_a_desc; intervals=2; touched=2
+6
+19
+
+# The set composes with the walk of the same DESC index.
+query ITTII nosort
+EXPLAIN SELECT id, k FROM w WHERE k IN (37, 74, 999, 111, 500) ORDER BY k DESC LIMIT 10
+----
+0
+Limit
+limit=10
+10
+121
+1
+Filter
+conjuncts=1
+10
+111
+2
+Scan w
+Index interval set: using w_k; intervals=5; touched=2; ordered: index order: w_k
+10
+21
+
+# An index-nested-loop seek into the DESC index.
+query ITTII nosort
+EXPLAIN SELECT s.x, o.id FROM s JOIN o ON o.a = s.x WHERE o.id < 150
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+2
+33
+1
+Scan s
+Full scan; touched=1
+2
+3
+1
+Scan o
+Index-nested-loop Index bound: using o_a_desc; touched=2; filter:conjuncts=1
+2
+26

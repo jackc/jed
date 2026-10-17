@@ -352,8 +352,11 @@ jed_indexes(
   columns     text[] NOT NULL,   -- the indexed column names in index-key order (duplicates included)
   is_unique   boolean NOT NULL,  -- whether the index enforces uniqueness (indexes.md §8)
   method      text NOT NULL,     -- the access method: 'btree' | 'gin' | 'gist'
-  predicate   text               -- a partial index's predicate text (canonical, indexes.md §9);
+  predicate   text,              -- a partial index's predicate text (canonical, indexes.md §9);
                                  --   NULL for a non-partial index (PG's pg_index.indpred analog)
+  descending  boolean[] NOT NULL, -- per key element, parallel to columns: declared DESC (indexes.md §11)
+  nulls_first boolean[] NOT NULL  -- per key element: NULLs sort first (DESC's default) — together
+                                 --   PG's pg_index.indoption bits; all false for GIN/GiST
 )
 
 jed_constraints(

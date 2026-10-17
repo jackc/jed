@@ -1119,13 +1119,13 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 		panic("referenced columns matched a unique key at CREATE TABLE §6.2")
 	}
 	var prefix []byte
-	for _, pcol := range idxCols {
+	for i, pcol := range idxCols {
 		b, err := encodeTypedKey(parent.Columns[pcol].Type, valueFor(pcol), parentColls[pcol])
 		if err != nil {
 			return fkProbe{}, false, err
 		}
-		prefix = append(prefix, 0x00)
-		prefix = append(prefix, b...)
+		// The parent index's §2.16 ordered present slot (a DESC key inverts its body).
+		prefix = idx.keyOrder(i).pushPresent(prefix, b)
 	}
 	return fkProbe{kind: fkProbeUnique, bytes: prefix, index: idx.Name}, true, nil
 }
@@ -1185,6 +1185,8 @@ func (db *engine) fkProbeHits(probe fkProbe, parentTable string, temp bool) (boo
 type fkReversePath struct {
 	index string
 	cols  []int
+	// orders is the index's sort order of each leading column (indexes.md §11; nil for the PK path).
+	orders []keyOrder
 }
 
 // fkReverseKeyUsable reports whether leading — the first len(fk.Columns) key columns of a child
@@ -1230,15 +1232,17 @@ func fkReverseTailFixed(child *catTable, tail []indexKey) bool {
 func (db *engine) fkReversePrefix(path fkReversePath, fk *foreignKey, child *catTable, values []Value) ([]byte, error) {
 	childColls := db.columnCollations(child.Columns)
 	var prefix []byte
-	for _, c := range path.cols {
+	for i, c := range path.cols {
 		b, err := encodeTypedKey(child.Columns[c].Type, values[slices.Index(fk.Columns, c)], childColls[c])
 		if err != nil {
 			return nil, err
 		}
 		if path.index != "" {
-			prefix = append(prefix, 0x00)
+			// the index column's §2.16 present slot (a DESC key inverts its body)
+			prefix = path.orders[i].pushPresent(prefix, b)
+		} else {
+			prefix = append(prefix, b...)
 		}
-		prefix = append(prefix, b...)
 	}
 	return prefix, nil
 }
@@ -1253,6 +1257,7 @@ func fkChooseReversePath(snap *snapshot, fk *foreignKey, child, parent *catTable
 	}
 	best := ""
 	var bestCols []int
+	var bestOrders []keyOrder
 	for i := range child.Indexes {
 		ix := &child.Indexes[i]
 		if ix.Kind != indexBtree || ix.Predicate != nil || len(ix.Keys) < k {
@@ -1272,10 +1277,14 @@ func fkChooseReversePath(snap *snapshot, fk *foreignKey, child, parent *catTable
 		name := ix.Name
 		if bestCols == nil || name < best {
 			best, bestCols = name, leading
+			bestOrders = make([]keyOrder, k)
+			for j := range bestOrders {
+				bestOrders[j] = ix.keyOrder(j)
+			}
 		}
 	}
 	if bestCols != nil {
-		return fkReversePath{index: best, cols: bestCols}
+		return fkReversePath{index: best, cols: bestCols, orders: bestOrders}
 	}
 	return fkReversePath{}
 }
@@ -1440,10 +1449,10 @@ func (db *engine) fkKeyedScan(t *fkKeyedTarget, childTable string, mask []bool) 
 	if path.index != "" {
 		for i := range child.Indexes {
 			if child.Indexes[i].Name == path.index {
-				for _, key := range child.Indexes[i].Keys[len(path.cols):] {
-					c, _ := key.asColumn()
+				for j := len(path.cols); j < len(child.Indexes[i].Keys); j++ {
+					c, _ := child.Indexes[i].Keys[j].asColumn()
 					slot, _ := keySlotForScalar(child.Columns[c].Type.ScalarTy(), child.Columns[c].Collation != "")
-					suffix = append(suffix, slot)
+					suffix = append(suffix, slot.withOrder(child.Indexes[i].keyOrder(j)))
 				}
 				break
 			}

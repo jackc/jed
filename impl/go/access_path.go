@@ -304,9 +304,12 @@ func (ks *pkKeySetPlan) intervals(params []Value, outer []storedRow, left stored
 // interval set. allFixed reports that every key column is fixed-width, so the probes merge as the
 // PK's do.
 type indexKeySetPlan struct {
-	nameKey  string
-	tuple    []tupleMember
-	slots    []keySlot
+	nameKey string
+	tuple   []tupleMember
+	slots   []keySlot
+	// orders is every key column's sort order (indexes.md §11), parallel to slots: a member's
+	// points are its §2.16 present slots.
+	orders   []keyOrder
 	allFixed bool
 }
 
@@ -320,7 +323,7 @@ type indexProbe struct {
 
 // probes resolves the set's canonical index-key intervals for one execution, in index-key order.
 func (ks *indexKeySetPlan) probes(params []Value, outer []storedRow, left storedRow) []indexProbe {
-	prefixes, final, consumed, hasFinal := expandTuplePrefixes(ks.tuple, []byte{0x00}, params, outer, left)
+	prefixes, final, consumed, hasFinal := expandTuplePrefixes(ks.tuple, ks.orders, params, outer, left)
 	var out []indexProbe
 	for _, p := range prefixes {
 		if !hasFinal {
@@ -328,13 +331,16 @@ func (ks *indexKeySetPlan) probes(params []Value, outer []storedRow, left stored
 			continue
 		}
 		for _, iv := range final {
-			phys := indexLogicalInterval(iv)
-			b := keyBound{lo: concatKey(p, phys.lo), loInc: phys.loInc, hi: concatKey(p, phys.hi), hiInc: phys.hiInc}
+			phys := indexLogicalInterval(iv, ks.orders[consumed-1])
+			b := prefixedInterval(p, phys)
 			if !boundEmpty(b) {
 				out = append(out, indexProbe{bound: b, prefixLen: len(p), suffix: ks.slots[consumed-1:]})
 			}
 		}
 	}
+	// The probes are disjoint; a DESC final member emits its intervals in reverse physical order, so
+	// order them by their lower endpoint — the index-key order the walk must follow.
+	sort.SliceStable(out, func(i, j int) bool { return bytes.Compare(out[i].bound.lo, out[j].bound.lo) < 0 })
 	if !ks.allFixed || len(out) < 2 {
 		return out
 	}
@@ -435,6 +441,9 @@ type indexEqCol struct {
 	colType scalarType
 	coll    *Collation
 	srcs    []*rExpr
+	// order is the key element's sort order (indexes.md §11): the probe slot is its §2.16 present
+	// slot.
+	order keyOrder
 }
 
 // indexBoundPlan is the plan-time result for one eligible ordered index (indexes.md §5.1): a maximal
@@ -454,6 +463,9 @@ type indexBoundPlan struct {
 	// as the column collation's UCA sort key, the stored key form (encoding.md §2.12).
 	rangeColl  *Collation
 	rangeTerms []boundTerm // range conjuncts on the column after the equality prefix (nil ⇒ none)
+	// rangeOrder is the range element's sort order (indexes.md §11): a DESC element swaps the byte
+	// endpoints.
+	rangeOrder keyOrder
 	suffix     []keySlot
 }
 
@@ -491,6 +503,7 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	var rangeType scalarType
 	var rangeColl *Collation
 	var rangeTerms []boundTerm
+	var rangeOrder keyOrder
 	for i := range rindex.Keys {
 		key := rindex.Keys[i]
 		// Each key element yields (its scalar key type, its key collation, the matcher against a
@@ -550,13 +563,14 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 		}
 		walk(filter)
 		if len(eqs) > 0 {
-			eqCols = append(eqCols, indexEqCol{colType: ty, coll: coll, srcs: eqs})
+			eqCols = append(eqCols, indexEqCol{colType: ty, coll: coll, srcs: eqs, order: rindex.keyOrder(i)})
 			continue // extend the equality prefix
 		}
 		if len(ranges) > 0 {
 			rangeType = ty
 			rangeColl = coll
 			rangeTerms = ranges
+			rangeOrder = rindex.keyOrder(i)
 		}
 		break // first non-equality element ends the prefix (with or without a trailing range)
 	}
@@ -569,7 +583,7 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	}
 	return &indexBoundPlan{
 		nameKey: idx.Name, eqCols: eqCols,
-		rangeType: rangeType, rangeColl: rangeColl, rangeTerms: rangeTerms, suffix: suffix,
+		rangeType: rangeType, rangeColl: rangeColl, rangeTerms: rangeTerms, rangeOrder: rangeOrder, suffix: suffix,
 	}
 }
 
@@ -579,7 +593,7 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 // type). ok=false when one is a container (range/array/composite) element.
 func indexSuffixSlots(rel scopeRel, rindex resolvedIndex, from int) ([]keySlot, bool) {
 	suffix := make([]keySlot, 0, max(len(rindex.Keys)-from, 0))
-	for _, key := range rindex.Keys[from:] {
+	for j, key := range rindex.Keys[from:] {
 		var slot keySlot
 		if key.Expr == nil {
 			col := rel.table.Columns[key.Col]
@@ -599,7 +613,8 @@ func indexSuffixSlots(rel scopeRel, rindex resolvedIndex, from int) ([]keySlot, 
 				return nil, false
 			}
 		}
-		suffix = append(suffix, slot)
+		// The slot reads the element's own NULL tag and (DESC) inverted body (indexes.md §11).
+		suffix = append(suffix, slot.withOrder(rindex.keyOrder(from+j)))
 	}
 	return suffix, true
 }
@@ -875,6 +890,7 @@ func (db *engine) buildIndexIntervalSetPlanConjuncts(conjuncts []*rExpr, rel sco
 		}
 	}
 	slots := make([]keySlot, len(cols))
+	orders := make([]keyOrder, len(cols))
 	allFixed := true
 	for i, c := range cols {
 		slot, skip := slotOf(c)
@@ -883,9 +899,10 @@ func (db *engine) buildIndexIntervalSetPlanConjuncts(conjuncts []*rExpr, rel sco
 		}
 		s, ok := rel.table.Columns[c].Type.AsScalar()
 		allFixed = allFixed && ok && s.IsFixedWidth()
-		slots[i] = slot
+		slots[i] = slot.withOrder(idx.keyOrder(i))
+		orders[i] = idx.keyOrder(i)
 	}
-	return &indexKeySetPlan{nameKey: idx.Name, tuple: members, slots: slots, allFixed: allFixed}
+	return &indexKeySetPlan{nameKey: idx.Name, tuple: members, slots: slots, orders: orders, allFixed: allFixed}
 }
 
 // planMutationScan selects an UPDATE/DELETE target access path by cost (estimator.md §9.3): every
@@ -1437,7 +1454,7 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		// Every trailing column is skipped by its self-delimiting slot (indexes.md §5.1).
 		suffix := make([]keySlot, 0, len(cols)-1)
 		unskippableTail := false
-		for _, c := range cols[1:] {
+		for j, c := range cols[1:] {
 			col := rel.table.Columns[c]
 			s, ok := col.Type.AsScalar()
 			if !ok {
@@ -1449,7 +1466,7 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 				unskippableTail = true
 				break
 			}
-			suffix = append(suffix, slot)
+			suffix = append(suffix, slot.withOrder(idx.keyOrder(j+1)))
 		}
 		if unskippableTail {
 			continue
@@ -1476,7 +1493,7 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 			// skipped past the single equality slot.
 			bound := &scanBound{index: &indexBoundPlan{
 				nameKey: idx.Name,
-				eqCols:  []indexEqCol{{colType: ty, coll: coll, srcs: eqs}},
+				eqCols:  []indexEqCol{{colType: ty, coll: coll, srcs: eqs, order: idx.keyOrder(0)}},
 				suffix:  suffix,
 			}}
 			candidates = append(candidates, indexOrderCandidate(scanCandidateBtree, bound.index.nameKey, bound, whereFilter))
@@ -1981,16 +1998,18 @@ func (db *engine) buildIndexBound(ib *indexBoundPlan, params []Value, outer []st
 				return keyBound{}, 0, true
 			}
 		}
-		p = append(p, 0x00)
-		p = append(p, agreed...)
+		// The column's §2.16 present slot (a DESC key inverts its body).
+		p = ec.order.pushPresent(p, agreed)
 	}
 	if ib.rangeTerms == nil {
 		b = keyBound{lo: p, loInc: true, hi: prefixSuccessor(p), hiInc: false}
 		return b, len(p), boundEmpty(b)
 	}
-	// Equality prefix P + a range on the next column. Base: [P, P‖0x01) — present values only
-	// (the 0x01 NULL tag sorts after every 0x00 present slot at this position).
-	b = keyBound{lo: append([]byte(nil), p...), loInc: true, hi: append(append([]byte(nil), p...), 0x01), hiInc: false}
+	// Equality prefix P + a range on the next column: the present region of that column's slot
+	// [P‖tag, P‖tag+1) (the order's NULL byte sits outside it — a range is never true for NULL),
+	// tightened by each term's logical interval mapped through the column's order (§2.16; a DESC
+	// column swaps the byte endpoints).
+	logical := unboundedBound()
 	for _, t := range ib.rangeTerms {
 		// A collated range column's probe is the collation's sort key (the stored key form).
 		key, isNull, ok := encodeBoundKey(ib.rangeType, t.src, params, outer, ib.rangeColl, left)
@@ -2000,22 +2019,24 @@ func (db *engine) buildIndexBound(ib *indexBoundPlan, params []Value, outer []st
 		if !ok {
 			continue // out-of-range endpoint: drop this half-bound (a wider, still-sound scan)
 		}
-		ps := append(append([]byte(nil), p...), 0x00) // P ‖ 0x00 (present tag)
-		ps = append(ps, key...)                       // P ‖ 0x00 ‖ encode(v)
 		switch t.op {
 		case opGe:
-			b = intersectLo(b, ps, true)
+			logical = intersectLo(logical, key, true)
 		case opGt:
-			b = intersectLo(b, prefixSuccessor(ps), true) // skip the whole c = v subtree
+			logical = intersectLo(logical, key, false)
 		case opLt:
-			b = intersectHi(b, ps, false)
+			logical = intersectHi(logical, key, false)
 		case opLe:
-			b = intersectHi(b, prefixSuccessor(ps), false)
+			logical = intersectHi(logical, key, true)
 		case opEq: // defensive — an equality never reaches rangeTerms, but treat it as [v, v]
-			b = intersectLo(b, ps, true)
-			b = intersectHi(b, prefixSuccessor(ps), false)
+			logical = intersectLo(logical, key, true)
+			logical = intersectHi(logical, key, true)
 		}
 	}
+	if boundEmpty(logical) {
+		return keyBound{}, 0, true
+	}
+	b = prefixedInterval(p, indexLogicalInterval(logical, ib.rangeOrder))
 	return b, len(p), boundEmpty(b)
 }
 
@@ -2024,7 +2045,7 @@ func (db *engine) buildIndexBound(ib *indexBoundPlan, params []Value, outer []st
 // slabs) block — the index-tree nodes overlapping the range plus, per entry, the row's point
 // lookup. prefixByteLen is the equality-prefix byte length skipped before the fixed-width
 // suffix-skip that recovers each entry's row storage key (indexes.md §5.1). Shared by the
-// access-predicate bound (indexBoundRows) and the OR / IN-list point-set (indexPointRows) so both
+// access-predicate bound (indexBoundRows) and the OR / IN-list key-set probes so both
 // drive the identical per-entry fetch — same cost by construction.
 func (db *engine) indexScanBound(tableName, nameKey string, suffix []keySlot, b keyBound, prefixByteLen int, mask []bool) (rows []storedRow, pages, slabs int, err error) {
 	entries, pages, slabs, err := db.indexScanBoundEntries(tableName, nameKey, suffix, b, prefixByteLen, mask)
@@ -2071,29 +2092,6 @@ func indexStoreBoundEntries(istore, store *tableStore, suffix []keySlot, b keyBo
 		out = append(out, entry{Key: append([]byte(nil), rowKey...), Row: row})
 	}
 	return out, pages, slabs, nil
-}
-
-// indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
-// equality prefix scan [0x00‖value, byte-successor) over the index B-tree plus, per admitted entry,
-// the row's point lookup. Used by the OR / IN-list secondary-index point-set (indexKeySetRows),
-// where each distinct list value is one such point probe. suffix holds the trailing key
-// components' slots (columns[1:]), skipped past the single leading slot.
-func (db *engine) indexPointRows(tableName, nameKey string, suffix []keySlot, valueKey []byte, mask []bool) (rows []storedRow, pages, slabs int, err error) {
-	entries, pages, slabs, err := db.indexPointEntries(tableName, nameKey, suffix, valueKey, mask)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	rows = make([]storedRow, len(entries))
-	for i := range entries {
-		rows[i] = entries[i].Row
-	}
-	return rows, pages, slabs, nil
-}
-
-func (db *engine) indexPointEntries(tableName, nameKey string, suffix []keySlot, valueKey []byte, mask []bool) (entries []entry, pages, slabs int, err error) {
-	prefix := append([]byte{0x00}, valueKey...)
-	b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
-	return db.indexScanBoundEntries(tableName, nameKey, suffix, b, len(prefix), mask)
 }
 
 func buildLogicalInterval(keyType scalarType, terms []boundTerm, params []Value, outer []storedRow, coll *Collation, left storedRow) (keyBound, bool) {
@@ -2300,11 +2298,12 @@ func concatKey(p, k []byte) []byte {
 }
 
 // expandTuplePrefixes evaluates a tuple set's members in key order (cost.md §3): the cartesian
-// product of the point members' keys, each preceded by tag, as prefixes in byte order, and the
-// final member's canonical logical intervals when it is consumed. A later member with more than one
-// point that would take the running product over maxKeySetProbes ends the walk unconsumed. An empty
-// member empties the set: no prefixes.
-func expandTuplePrefixes(tuple []tupleMember, tag []byte, params []Value, outer []storedRow, left storedRow) (prefixes [][]byte, final []keyBound, consumed int, hasFinal bool) {
+// product of the point members' keys — bare for a PK (orders == nil), each member's §2.16 present
+// slot under its orders[i] for an index — as prefixes in byte order, and the final member's
+// canonical logical intervals when it is consumed. A later member with more than one point that
+// would take the running product over maxKeySetProbes ends the walk unconsumed. An empty member
+// empties the set: no prefixes.
+func expandTuplePrefixes(tuple []tupleMember, orders []keyOrder, params []Value, outer []storedRow, left storedRow) (prefixes [][]byte, final []keyBound, consumed int, hasFinal bool) {
 	prefixes = [][]byte{nil}
 	for i, m := range tuple {
 		var count int
@@ -2334,11 +2333,20 @@ func expandTuplePrefixes(tuple []tupleMember, tag []byte, params []Value, outer 
 			hasFinal = true
 			break
 		}
+		// An index member's points become its ordered slots, re-sorted into physical byte order (a
+		// DESC member's inverted bodies reverse the logical order).
+		if orders != nil {
+			slots := make([][]byte, len(points))
+			for j, k := range points {
+				slots[j] = orders[i].presentSlot(k)
+			}
+			sort.Slice(slots, func(a, b int) bool { return bytes.Compare(slots[a], slots[b]) < 0 })
+			points = slots
+		}
 		next := make([][]byte, 0, len(prefixes)*count)
 		for _, p := range prefixes {
 			for _, k := range points {
-				key := make([]byte, 0, len(p)+len(tag)+len(k))
-				next = append(next, append(append(append(key, p...), tag...), k...))
+				next = append(next, concatKey(p, k))
 			}
 		}
 		prefixes = next
@@ -2437,25 +2445,63 @@ func (db *engine) indexKeySetEntries(tableName string, ks *indexKeySetPlan, para
 	return entries, pages, slabs, nil
 }
 
-func indexLogicalInterval(logical keyBound) keyBound {
-	b := keyBound{lo: []byte{0x00}, loInc: true, hi: []byte{0x01}, hiInc: false}
-	if logical.lo != nil {
-		p := append([]byte{0x00}, logical.lo...)
-		if logical.loInc {
-			b = intersectLo(b, p, true)
-		} else if next := prefixSuccessor(p); next != nil {
-			b = intersectLo(b, next, true)
-		}
-	}
-	if logical.hi != nil {
-		p := append([]byte{0x00}, logical.hi...)
-		if logical.hiInc {
-			if next := prefixSuccessor(p); next != nil {
+// indexLogicalInterval maps one key element's LOGICAL interval (bare order-preserving key bytes,
+// ascending) to its physical slot interval under order (encoding.md §2.16): the present region
+// [tag, tag+1) of the slot, tightened by the logical bounds. An ascending order keeps the endpoints
+// (v ↦ tag‖v); a DESC order inverts each body, which reverses memcmp order over the prefix-free key
+// bodies, so the logical lower bound becomes the physical upper bound and vice versa — `≥ v` ↦
+// `< succ(tag‖~v)`, `> v` ↦ `< tag‖~v`, `< v` ↦ `≥ succ(tag‖~v)`, `≤ v` ↦ `≥ tag‖~v`. The result is
+// half-open (lo inclusive, hi exclusive) whenever both ends are bounded; a nil hi (the DESC NULLS
+// FIRST present region tops the slot at 0xFF) is unbounded.
+func indexLogicalInterval(logical keyBound, order keyOrder) keyBound {
+	tag := order.presentTag()
+	b := keyBound{lo: []byte{tag}, loInc: true, hi: prefixSuccessor([]byte{tag}), hiInc: false}
+	tighten := func(key []byte, logicalLo, inc bool) {
+		slot := order.presentSlot(key)
+		// An ascending order keeps the side; DESC flips it.
+		physLo := logicalLo != order.Desc
+		switch {
+		case physLo && inc:
+			b = intersectLo(b, slot, true)
+		case physLo && !inc:
+			if next := prefixSuccessor(slot); next != nil {
+				b = intersectLo(b, next, true)
+			} else {
+				b.lo = slot
+				b.hi = append([]byte(nil), slot...)
+				b.hiInc = false
+			}
+		case !physLo && inc:
+			if next := prefixSuccessor(slot); next != nil {
 				b = intersectHi(b, next, false)
 			}
-		} else {
-			b = intersectHi(b, p, false)
+		default:
+			b = intersectHi(b, slot, false)
 		}
+	}
+	if logical.lo != nil {
+		tighten(logical.lo, true, logical.loInc)
+	}
+	if logical.hi != nil {
+		tighten(logical.hi, false, logical.hiInc)
+	}
+	return b
+}
+
+// prefixedInterval places a one-slot physical interval (indexLogicalInterval) under the encoded
+// prefix p; an unbounded upper end (the DESC NULLS FIRST present region tops the slot) becomes
+// succ(p).
+func prefixedInterval(p []byte, phys keyBound) keyBound {
+	var b keyBound
+	if phys.lo != nil {
+		b.lo, b.loInc = concatKey(p, phys.lo), phys.loInc
+	} else {
+		b.lo, b.loInc = append([]byte(nil), p...), true
+	}
+	if phys.hi != nil {
+		b.hi, b.hiInc = concatKey(p, phys.hi), phys.hiInc
+	} else {
+		b.hi, b.hiInc = prefixSuccessor(p), false
 	}
 	return b
 }
@@ -3775,9 +3821,8 @@ type indexOrderPlan struct {
 // The index store holds its entries in (indexed columns, storage key) order, so a forward walk
 // delivers rows in ORDER BY <indexed columns> ASC NULLS LAST order, ties broken by the PK — exactly
 // the eager stable sort's tie-break. Returns non-nil iff the ORDER BY keys are EXACTLY a B-tree
-// index's columns (same count, same columns in key order), each ASC with default NULLS LAST (the
-// index stores NULL as 0x01 after a present 0x00 → NULLS LAST; an explicit NULLS FIRST does not
-// match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
+// index's columns (same count, same columns in key order), each with the index element's declared
+// direction and NULL placement (indexes.md §11 — the §2.16 ordered slot realizes it) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
 // the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
 // multi-column index would tie-break by the remaining index columns, not the PK.
 func (db *engine) orderSatisfiedByIndexes(table *catTable, offset int, order []orderSlot, filter *rExpr) []indexOrderPlan {
@@ -3809,8 +3854,10 @@ func (db *engine) orderSatisfiedByIndexes(table *catTable, offset int, order []o
 		}
 		matchesOrder := true
 		for i, o := range order {
-			if o.descending || o.nullsFirst {
-				matchesOrder = false // ASC + NULLS LAST only — the order a forward index walk realizes
+			// A forward walk realizes each key element's declared order (indexes.md §11): the ORDER BY
+			// key's direction and effective NULL placement must both match.
+			if ko := idx.keyOrder(i); o.descending != ko.Desc || o.nullsFirst != ko.NullsFirst {
+				matchesOrder = false
 				break
 			}
 			if o.idx != offset+cols[i] {

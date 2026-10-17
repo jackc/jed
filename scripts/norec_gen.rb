@@ -94,6 +94,10 @@
 #              (a top-N, cost.md §3 "secondary-index order"); `ORDER BY v` with no LIMIT keeps the
 #              eager sort. Over a total order (distinct `v`, NULLS LAST) the index top-N windows and
 #              the eager full sort must reconstruct the SAME by-construction sorted whole.
+#   index_key_order — one column indexed under a random ASC/DESC × NULLS FIRST/LAST order (indexes.md
+#              §10): ORDER BY windows in that order walk the index; the eager sort, the opposite
+#              direction, and range / IN probes through the ordered slots (vs. the bound defeated by
+#              `+ 0`) must all match their by-construction answers.
 #   distinct_order — `SELECT DISTINCT a ... ORDER BY a` over a composite PK (a, b) dedups STREAMING in
 #              PK scan order (the sort elided, cost.md §3 "DISTINCT"); with a LIMIT it short-circuits a
 #              top-N. The distinct-`a` windows must reconstruct the by-construction sorted distinct set.
@@ -380,6 +384,12 @@ INDEX_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.in
                      dml.insert_multi_row query.select query.order_by query.order_by_keys
                      query.limit query.offset query.order_by_index_scan types.i32
                      null.three_valued].freeze
+INDEX_KEY_ORDER_REQ = %w[ddl.index_key_order ddl.create_table ddl.primary_key ddl.secondary_index
+                         dml.insert dml.insert_multi_row query.select query.comparison_order
+                         query.order_by query.order_by_keys query.limit query.offset
+                         query.order_by_index_scan query.order_by_topk query.index_range
+                         query.or_in_point_lookup expr.in_list expr.arithmetic types.i32
+                         null.three_valued].freeze
 OR_IN_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert dml.insert_multi_row
                dml.update dml.delete query.select query.where_eq query.order_by
                query.logical_connectives query.point_lookup query.or_in_point_lookup expr.in_list
@@ -2460,6 +2470,61 @@ def gen_index_order(seed)
     q(out, "II", "SELECT id, v FROM t ORDER BY v #{clause}".strip, flat.call(exp))
   end
 
+  out.join("\n") + "\n"
+end
+
+# --- scenario: ordered index keys (the walk of a DESC / NULLS FIRST index reconstructs the sorted whole)
+# One column is indexed under a random ASC/DESC × NULLS FIRST/LAST order (indexes.md §11). Every
+# ORDER BY window in that order walks the index (a top-N); the no-LIMIT forms are the eager-sort
+# reference; the opposite order and a range / IN probe through the inverted slots are checked against
+# their by-construction answers. NULL ties are broken by the PK, so every window is a total order.
+def gen_index_key_order(seed)
+  rng = Random.new(seed)
+  ids = (1..60).to_a.sample(12, random: rng).sort
+  vals = (-40..40).to_a.sample(9, random: rng)
+  null_ids = ids.sample(3, random: rng)
+  vi = -1
+  rows = ids.map { |id| null_ids.include?(id) ? [id, nil] : [id, vals[vi += 1]] }
+  desc = rng.rand(2).zero?
+  nulls_first = rng.rand(2).zero?
+  spell = ->(d, nf) { "#{d ? 'DESC' : 'ASC'} NULLS #{nf ? 'FIRST' : 'LAST'}" }
+  order = spell.call(desc, nulls_first)
+  sort = lambda do |d, nf|
+    present = rows.reject { |_, v| v.nil? }.sort_by { |id, v| [d ? -v : v, id] }
+    nulls = rows.select { |_, v| v.nil? }.sort_by(&:first)
+    nf ? nulls + present : present + nulls
+  end
+  flat = ->(rs) { rs.flat_map { |id, v| [id.to_s, v.nil? ? "NULL" : v.to_s] } }
+  sorted = sort.call(desc, nulls_first)
+  n = rows.size
+  a = rng.rand(2..n - 2)
+
+  out = header(seed, INDEX_KEY_ORDER_REQ, "ordered index keys (#{order} walk reconstructs the sorted whole)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v.nil? ? 'NULL' : v})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_v ON t (v #{order})")
+  [["LIMIT #{a}", sorted[0, a]], ["LIMIT #{a} OFFSET #{a}", sorted[a, a] || []],
+   ["LIMIT #{n}", sorted], ["", sorted]].each do |clause, exp|
+    out << "# ORDER BY v #{order} #{clause.empty? ? '(full eager-sort reference)' : clause}"
+    q(out, "II", "SELECT id, v FROM t ORDER BY v #{order} #{clause}".strip, flat.call(exp))
+  end
+  # The opposite direction is not the index order: the eager / top-k sort must agree with it too.
+  other = sort.call(!desc, nulls_first)
+  out << "# the opposite direction (not served by the forward walk)"
+  q(out, "II", "SELECT id, v FROM t ORDER BY v #{spell.call(!desc, nulls_first)} LIMIT #{a}", flat.call(other[0, a]))
+  # A range and an IN probe through the ordered slots vs. the same predicate defeated by `+ 0`.
+  c = vals.sample(random: rng)
+  pick = vals.sample(3, random: rng)
+  [["v > #{c}", ->(v) { v > c }], ["v <= #{c}", ->(v) { v <= c }],
+   ["v IN (#{pick.join(', ')})", ->(v) { pick.include?(v) }]].each do |pred, f|
+    exp = rows.select { |_, v| !v.nil? && f.call(v) }.map { |id, _| id.to_s }.sort
+    out << "# #{pred} through the index, and with the bound defeated"
+    [pred, pred.sub("v", "v + 0")].each do |w|
+      out << "query I rowsort" << "SELECT id FROM t WHERE #{w}" << "----"
+      out.concat(exp)
+      out << ""
+    end
+  end
   out.join("\n") + "\n"
 end
 
@@ -5187,6 +5252,7 @@ SCENARIOS = {
   "topk" => method(:gen_topk),
   "hash_join" => method(:gen_hash_join),
   "index_order" => method(:gen_index_order),
+  "index_key_order" => method(:gen_index_key_order),
   "distinct_order" => method(:gen_distinct_order),
   "agg_order" => method(:gen_agg_order),
   "join_order" => method(:gen_join_order),

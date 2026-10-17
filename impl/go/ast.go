@@ -421,6 +421,30 @@ type createIndex struct {
 	// carries the predicate's canonical text + parsed AST the executor re-resolves against the
 	// table's columns, as a CHECK / expression key does.
 	Predicate *indexPredicate
+	// KeyOrders is each key element's written ASC/DESC + NULLS FIRST|LAST options
+	// (spec/design/indexes.md §11), parallel to Keys. GIN/GiST reject any written option (0A000), so
+	// the parser keeps what was WRITTEN, not just the effective order.
+	KeyOrders []indexKeyOrderSpec
+}
+
+// indexKeyOrderSpec is the ordering options written after one CREATE INDEX key element
+// (indexes.md §11): Desc is nil when omitted, else &false (ASC) / &true (DESC); NullsFirst likewise
+// for NULLS FIRST / NULLS LAST. The effective order defaults by direction (PostgreSQL: DESC ⇒ NULLS
+// FIRST).
+type indexKeyOrderSpec struct {
+	Desc       *bool
+	NullsFirst *bool
+}
+
+// effective is the effective key order: direction as written (default ASC), NULL placement as
+// written or the direction's default.
+func (s indexKeyOrderSpec) effective() keyOrder {
+	desc := s.Desc != nil && *s.Desc
+	nf := desc
+	if s.NullsFirst != nil {
+		nf = *s.NullsFirst
+	}
+	return keyOrder{Desc: desc, NullsFirst: nf}
 }
 
 // indexPredicate is a partial-index predicate (spec/design/indexes.md §9): its persisted canonical

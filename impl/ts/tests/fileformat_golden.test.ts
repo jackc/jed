@@ -221,6 +221,23 @@ function partialIndexTableDB(): Engine {
   return db;
 }
 
+// orderedIndexTableDB is the v46 ordered-index-keys fixture (spec/design/indexes.md §11, encoding.md
+// §2.16): DESC / NULLS FIRST / DESC NULLS LAST elements (index_flags bit4 + the option bytes, the
+// ordered entry slots) beside a plain index. Must match verify.rb's ORDERED_INDEX_TABLE.
+function orderedIndexTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v text, n i32, d decimal)");
+  run(db, "CREATE INDEX t_v_desc ON t (v DESC)");
+  run(db, "CREATE INDEX t_n_nf ON t (n NULLS FIRST)");
+  run(db, "CREATE UNIQUE INDEX t_mix ON t (d DESC NULLS LAST, n)");
+  run(db, "CREATE INDEX t_plain ON t (n)");
+  run(
+    db,
+    "INSERT INTO t VALUES (1, 'b', 10, 1.5), (2, NULL, NULL, NULL), (3, 'a', 20, -2), (4, 'ab', NULL, 100)",
+  );
+  return db;
+}
+
 // hostfuncIndexTableDB has a HOST-FUNCTION index dependency (v31 — the index_flags bit2 + the
 // persisted dependency list after index_root_page, extensibility.md §8.1): the index t_geo_idx is on
 // geo_hash(a), a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
@@ -1237,6 +1254,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "unique_table.jed", build: uniqueTableDB },
     { name: "expr_index_table.jed", build: exprIndexTableDB },
     { name: "partial_index_table.jed", build: partialIndexTableDB },
+    { name: "ordered_index_table.jed", build: orderedIndexTableDB },
     { name: "timezone_index_table.jed", build: timezoneIndexTableDB },
     { name: "hostfunc_index_table.jed", build: hostfuncIndexTableDB },
     { name: "hostfunc_check_table.jed", build: hostfuncCheckTableDB },
@@ -1322,6 +1340,7 @@ test("read goldens reproduces rows", () => {
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
     { name: "expr_index_table.jed", build: exprIndexTableDB, table: "t" },
     { name: "partial_index_table.jed", build: partialIndexTableDB, table: "t" },
+    { name: "ordered_index_table.jed", build: orderedIndexTableDB, table: "t" },
     { name: "timezone_index_table.jed", build: timezoneIndexTableDB, table: "t" },
     { name: "hostfunc_index_table.jed", build: hostfuncIndexTableDB, table: "t" },
     { name: "hostfunc_check_table.jed", build: hostfuncCheckTableDB, table: "t" },

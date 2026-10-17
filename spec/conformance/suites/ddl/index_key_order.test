@@ -1,0 +1,557 @@
+# Ordered index keys — per-element ASC / DESC and NULLS FIRST | LAST on CREATE INDEX
+# (spec/design/indexes.md §11, encoding.md §2.16). PostgreSQL semantics: the direction defaults to
+# ASC, the NULL placement to the direction's default (ASC -> NULLS LAST, DESC -> NULLS FIRST); an
+# unordered access method (GIN / GiST) rejects any WRITTEN option, explicit ASC included (0A000,
+# direction first); a UNIQUE / PRIMARY KEY constraint takes no ordering (a syntax error, 42601 —
+# only CREATE UNIQUE INDEX does). The order changes only the entry bytes, never which rows an index
+# holds or constrains: maintenance on every write path, uniqueness (NULLS DISTINCT), ON CONFLICT
+# inference (which ignores the order), and foreign keys referencing or served by a DESC index all
+# behave exactly as over an ASC index. Every keyable type is exercised under DESC, including the
+# variable-width / container keys whose inverted bodies must still be self-delimiting.
+# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.gin_index, ddl.gist_index, ddl.foreign_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.limit, query.is_null, types.i32, types.text, types.decimal, types.bytea, types.uuid, types.interval, types.f64, types.timestamp, types.date, types.boolean, types.array, types.range, types.composite
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text, arr i32[], r int4range)
+
+# --- surface: every option combination parses; the auto-name ignores the order -------------------
+
+statement ok
+CREATE INDEX t_a_desc ON t (a DESC)
+
+statement ok
+CREATE INDEX t_a_asc_nf ON t (a ASC NULLS FIRST)
+
+statement ok
+CREATE INDEX t_a_desc_nl ON t (a DESC NULLS LAST)
+
+statement ok
+CREATE INDEX t_ab ON t (a NULLS FIRST, b DESC)
+
+statement ok
+CREATE INDEX ON t (b DESC NULLS LAST, a ASC NULLS LAST)
+
+# the auto-name is t_b_a_idx, exactly as an unordered (b, a) index would derive
+statement error 42P07
+CREATE INDEX t_b_a_idx ON t (a)
+
+# an expression key takes an order too
+statement ok
+CREATE INDEX t_expr ON t ((a + 1) DESC)
+
+# a second direction is a syntax error
+statement error 42601
+CREATE INDEX t_bad ON t (a DESC ASC)
+
+# --- GIN / GiST reject any written option, explicit ASC included (0A000, direction checked first) -
+
+statement error 0A000
+CREATE INDEX t_gin ON t USING gin (arr DESC)
+
+statement error 0A000
+CREATE INDEX t_gin ON t USING gin (arr ASC)
+
+statement error 0A000
+CREATE INDEX t_gin ON t USING gin (arr NULLS FIRST)
+
+statement error 0A000
+CREATE INDEX t_gist ON t USING gist (r DESC)
+
+statement error 0A000
+CREATE INDEX t_gist ON t USING gist (r NULLS LAST)
+
+# the column checks still come first: a missing column is 42703 before the option check
+statement error 42703
+CREATE INDEX t_gin ON t USING gin (nosuch DESC)
+
+# --- a UNIQUE / PRIMARY KEY constraint takes no ordering (PostgreSQL: a syntax error) -------------
+
+statement error 42601
+CREATE TABLE u (a i32, UNIQUE (a DESC))
+
+statement error 42601
+CREATE TABLE u (a i32 PRIMARY KEY DESC)
+
+statement error 42601
+CREATE TABLE u (a i32, PRIMARY KEY (a DESC))
+
+# --- maintenance: INSERT / UPDATE / DELETE through every order, NULLs included --------------------
+
+statement ok
+INSERT INTO t VALUES (1, 30, 'c', NULL, NULL), (2, NULL, 'a', NULL, NULL), (3, 10, NULL, NULL, NULL), (4, 20, 'b', NULL, NULL), (5, NULL, NULL, NULL, NULL)
+
+statement ok
+UPDATE t SET a = 40 WHERE id = 3
+
+statement ok
+UPDATE t SET b = 'z' WHERE id = 5
+
+statement ok
+DELETE FROM t WHERE id = 4
+
+query IIT rowsort
+SELECT id, a, b FROM t
+----
+1
+30
+c
+2
+NULL
+a
+3
+40
+NULL
+5
+NULL
+z
+
+query I rowsort
+SELECT id FROM t WHERE a IS NULL
+----
+2
+5
+
+query I rowsort
+SELECT id FROM t WHERE a > 35
+----
+3
+
+# --- uniqueness over a DESC unique index (NULLS DISTINCT) ------------------------------------------
+
+statement ok
+CREATE TABLE ut (id i32 PRIMARY KEY, a i32, b text)
+
+statement ok
+CREATE UNIQUE INDEX ut_ab ON ut (a DESC, b NULLS FIRST)
+
+statement ok
+INSERT INTO ut VALUES (1, 1, 'x'), (2, 1, 'y'), (3, 2, 'x'), (4, 1, NULL), (5, 1, NULL)
+
+statement error 23505
+INSERT INTO ut VALUES (6, 1, 'x')
+
+statement error 23505
+UPDATE ut SET b = 'y' WHERE id = 1
+
+# an end-state-valid swap succeeds (jed validates UPDATE uniqueness against the statement's end state)
+statement ok
+UPDATE ut SET a = a + 10 WHERE a = 1
+
+query IIT rowsort
+SELECT id, a, b FROM ut
+----
+1
+11
+x
+2
+11
+y
+3
+2
+x
+4
+11
+NULL
+5
+11
+NULL
+
+# a build over existing duplicates traps 23505 and creates nothing
+statement ok
+INSERT INTO ut VALUES (6, 2, 'q'), (7, 3, 'q')
+
+statement error 23505
+CREATE UNIQUE INDEX ut_b ON ut (b DESC)
+
+statement ok
+CREATE UNIQUE INDEX ut_b ON ut (b DESC NULLS LAST, id ASC NULLS FIRST)
+
+# --- ON CONFLICT infers a DESC unique index (inference ignores the order) --------------------------
+
+statement ok
+CREATE TABLE oc (id i32 PRIMARY KEY, a i32, n i32)
+
+statement ok
+CREATE UNIQUE INDEX oc_a ON oc (a DESC NULLS LAST)
+
+statement ok
+INSERT INTO oc VALUES (1, 5, 0)
+
+statement ok
+INSERT INTO oc VALUES (2, 5, 0) ON CONFLICT (a) DO NOTHING
+
+statement ok
+INSERT INTO oc VALUES (3, 5, 0) ON CONFLICT (a) DO UPDATE SET n = oc.n + 1
+
+statement ok
+INSERT INTO oc VALUES (4, 6, 0) ON CONFLICT (a) DO UPDATE SET n = oc.n + 1
+
+query III rowsort
+SELECT id, a, n FROM oc
+----
+1
+5
+1
+4
+6
+0
+
+# --- foreign keys: a FK may reference the columns of a DESC unique index, and a DESC child index ----
+# serves the parent-side reverse match (DELETE / UPDATE of a referenced key).
+
+statement ok
+CREATE TABLE fp (id i32 PRIMARY KEY, code i32)
+
+statement ok
+CREATE UNIQUE INDEX fp_code ON fp (code DESC)
+
+statement ok
+CREATE TABLE fc (id i32 PRIMARY KEY, code i32 REFERENCES fp (code), tag i32)
+
+statement ok
+CREATE INDEX fc_code ON fc (code DESC NULLS LAST, tag ASC NULLS FIRST)
+
+statement ok
+INSERT INTO fp VALUES (1, 100), (2, 200), (3, 300)
+
+statement ok
+INSERT INTO fc VALUES (10, 100, 1), (11, 300, NULL), (12, NULL, 2)
+
+statement error 23503
+INSERT INTO fc VALUES (13, 400, 1)
+
+statement error 23503
+DELETE FROM fp WHERE code = 300
+
+statement error 23503
+UPDATE fp SET code = 101 WHERE code = 100
+
+statement ok
+DELETE FROM fp WHERE code = 200
+
+query II rowsort
+SELECT id, code FROM fp
+----
+1
+100
+3
+300
+
+# --- every keyable type under DESC (and NULLS LAST): the walk order is the type's descending order -
+# Each table indexes one column DESC; ORDER BY v DESC [NULLS LAST] LIMIT reads the index in key order.
+
+statement ok
+CREATE TABLE kd (id i32 PRIMARY KEY, v decimal)
+
+statement ok
+CREATE INDEX kd_v ON kd (v DESC)
+
+statement ok
+INSERT INTO kd VALUES (1, 1.5), (2, -2.25), (3, 100), (4, NULL), (5, 0), (6, 1.50), (7, -0.001)
+
+query ID nosort
+SELECT id, v FROM kd ORDER BY v DESC LIMIT 7
+----
+4
+NULL
+3
+100
+1
+1.5
+6
+1.50
+5
+0
+7
+-0.001
+2
+-2.25
+
+statement ok
+CREATE TABLE kt (id i32 PRIMARY KEY, v text)
+
+statement ok
+CREATE INDEX kt_v ON kt (v DESC NULLS LAST)
+
+statement ok
+INSERT INTO kt VALUES (1, 'a'), (2, 'aa'), (3, '0'), (4, NULL), (5, 'b'), (6, 'ab'), (7, 'a')
+
+query IT nosort
+SELECT id, v FROM kt ORDER BY v DESC NULLS LAST LIMIT 7
+----
+5
+b
+6
+ab
+2
+aa
+1
+a
+7
+a
+3
+0
+4
+NULL
+
+statement ok
+CREATE TABLE kb (id i32 PRIMARY KEY, v bytea)
+
+statement ok
+CREATE INDEX kb_v ON kb (v DESC)
+
+statement ok
+INSERT INTO kb VALUES (1, '\x61'), (2, '\x6100'), (3, '\x'), (4, '\x00'), (5, '\x6101'), (6, NULL)
+
+query IT nosort
+SELECT id, v FROM kb ORDER BY v DESC LIMIT 6
+----
+6
+NULL
+5
+\x6101
+2
+\x6100
+1
+\x61
+4
+\x00
+3
+\x
+
+statement ok
+CREATE TABLE ki (id i32 PRIMARY KEY, v interval)
+
+statement ok
+CREATE INDEX ki_v ON ki (v DESC)
+
+statement ok
+INSERT INTO ki VALUES (1, '1 day'), (2, '-1 hour'), (3, '1 mon'), (4, '29 days'), (5, '0'), (6, NULL)
+
+query IT nosort
+SELECT id, v FROM ki ORDER BY v DESC LIMIT 6
+----
+6
+NULL
+3
+1 mon
+4
+29 days
+1
+1 day
+5
+00:00:00
+2
+-01:00:00
+
+statement ok
+CREATE TABLE kf (id i32 PRIMARY KEY, v f64)
+
+statement ok
+CREATE INDEX kf_v ON kf (v DESC NULLS LAST)
+
+statement ok
+INSERT INTO kf VALUES (1, 1.5), (2, 'NaN'), (3, '-Infinity'), (4, 0), (5, 'Infinity'), (6, -2.5), (7, NULL)
+
+query IR nosort
+SELECT id, v FROM kf ORDER BY v DESC NULLS LAST LIMIT 7
+----
+2
+NaN
+5
+Infinity
+1
+1.5
+4
+0
+6
+-2.5
+3
+-Infinity
+7
+NULL
+
+statement ok
+CREATE TABLE ku (id i32 PRIMARY KEY, v uuid, ts timestamp, d date, ok boolean)
+
+statement ok
+CREATE INDEX ku_v ON ku (v DESC)
+
+statement ok
+CREATE INDEX ku_ts ON ku (ts DESC NULLS LAST)
+
+statement ok
+CREATE INDEX ku_d ON ku (d ASC NULLS FIRST)
+
+statement ok
+CREATE INDEX ku_ok ON ku (ok DESC)
+
+statement ok
+INSERT INTO ku VALUES (1, '00000000-0000-0000-0000-000000000001', '2020-01-01 00:00:00', '2020-01-01', true), (2, 'ffffffff-ffff-ffff-ffff-ffffffffffff', NULL, NULL, false), (3, NULL, '1999-12-31 23:59:59', '1999-12-31', NULL), (4, '80000000-0000-0000-0000-000000000000', '2021-06-01 12:00:00', '2021-06-01', true)
+
+query IT nosort
+SELECT id, v FROM ku ORDER BY v DESC LIMIT 4
+----
+3
+NULL
+2
+ffffffff-ffff-ffff-ffff-ffffffffffff
+4
+80000000-0000-0000-0000-000000000000
+1
+00000000-0000-0000-0000-000000000001
+
+query IT nosort
+SELECT id, ts FROM ku ORDER BY ts DESC NULLS LAST LIMIT 4
+----
+4
+2021-06-01 12:00:00
+1
+2020-01-01 00:00:00
+3
+1999-12-31 23:59:59
+2
+NULL
+
+query IT nosort
+SELECT id, d FROM ku ORDER BY d NULLS FIRST LIMIT 4
+----
+2
+NULL
+3
+1999-12-31
+1
+2020-01-01
+4
+2021-06-01
+
+query IB nosort
+SELECT id, ok FROM ku ORDER BY ok DESC LIMIT 4
+----
+3
+NULL
+1
+true
+4
+true
+2
+false
+
+statement ok
+CREATE TABLE kr (id i32 PRIMARY KEY, v int4range, w numrange)
+
+statement ok
+CREATE INDEX kr_v ON kr (v DESC)
+
+statement ok
+CREATE INDEX kr_w ON kr (w DESC NULLS LAST)
+
+statement ok
+INSERT INTO kr VALUES (1, '[1,5)', '[1.5,2]'), (2, 'empty', 'empty'), (3, '[1,)', '(1.5,2]'), (4, '(,3)', '(,1.5)'), (5, NULL, NULL), (6, '[1,4)', '[1.50,3)')
+
+query IT nosort
+SELECT id, v FROM kr ORDER BY v DESC LIMIT 6
+----
+5
+NULL
+3
+[1,)
+1
+[1,5)
+6
+[1,4)
+4
+(,3)
+2
+empty
+
+query IT nosort
+SELECT id, w FROM kr ORDER BY w DESC NULLS LAST LIMIT 6
+----
+3
+(1.5,2]
+6
+[1.50,3)
+1
+[1.5,2]
+4
+(,1.5)
+2
+empty
+5
+NULL
+
+statement ok
+CREATE TABLE ka (id i32 PRIMARY KEY, v i32[], s text[])
+
+statement ok
+CREATE INDEX ka_v ON ka (v DESC)
+
+statement ok
+CREATE INDEX ka_s ON ka (s DESC NULLS LAST)
+
+statement ok
+INSERT INTO ka VALUES (1, '{1,2}', '{a,b}'), (2, '{1}', '{a}'), (3, '{}', '{}'), (4, '{1,NULL}', '{a,NULL}'), (5, '{2}', '{b}'), (6, NULL, NULL), (7, '{1,2,3}', '{ab}')
+
+query IT nosort
+SELECT id, v FROM ka ORDER BY v DESC LIMIT 7
+----
+6
+NULL
+5
+{2}
+4
+{1,NULL}
+7
+{1,2,3}
+1
+{1,2}
+2
+{1}
+3
+{}
+
+query IT nosort
+SELECT id, s FROM ka ORDER BY s DESC NULLS LAST LIMIT 7
+----
+5
+{b}
+7
+{ab}
+4
+{a,NULL}
+1
+{a,b}
+2
+{a}
+3
+{}
+6
+NULL
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE TABLE kc (id i32 PRIMARY KEY, v addr)
+
+statement ok
+CREATE INDEX kc_v ON kc (v DESC)
+
+statement ok
+INSERT INTO kc VALUES (1, ROW('Main', 90210)), (2, ROW('Main', NULL)), (3, ROW('', 1)), (4, NULL), (5, ROW('Mai', 5)), (6, ROW(NULL, 1))
+
+query IT nosort
+SELECT id, v FROM kc ORDER BY v DESC LIMIT 6
+----
+4
+NULL
+6
+(,1)
+2
+(Main,)
+1
+(Main,90210)
+5
+(Mai,5)
+3
+("",1)

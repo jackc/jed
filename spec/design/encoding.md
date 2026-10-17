@@ -83,6 +83,8 @@ authored but appeared only behind the value codec (§3), where its order is irre
   component sorts as the mirror of its ascending form. Under inversion the nullable tag
   flips `0x00 ↔ 0xFF` and `0x01 ↔ 0xFE`, so **NULL (`0xFE`) sorts before every present
   value (`0xFF…`)** — i.e. descending lifts NULL to **first**, the exact mirror of §2.2.
+  **Status — EXERCISED** as the `DESC NULLS FIRST` member of the four ordered-index slots (§2.16),
+  which also decouple NULL placement from direction (`ASC NULLS FIRST`, `DESC NULLS LAST`).
 
 ### 2.4 Text — `text-terminated-escape` (authored; unexercised this slice)
 
@@ -750,6 +752,62 @@ unindexed), a composite is **not** a GIN element, and **array-of-composite** as 
 `composite_key_table.jed` golden (`rust == go == ts == ruby`, via `spec/fileformat/verify.rb`'s
 independent `encode_composite_key`). This is jed's **last** `0A000` scalar/container key — with it
 landed, every built-in type is keyable except an array whose element is itself a composite.
+
+### 2.16 Ordered index slots — `ASC`/`DESC` × `NULLS FIRST`/`LAST` (indexes.md §11)
+
+A secondary-index key element may declare a sort order ([indexes.md §11](indexes.md)). Its entry
+slot is then one of **four ordered slots**: the **presence tag is chosen by the NULL placement**
+and the **body (the type's bare order-preserving key, §2.1–§2.15) is bitwise-inverted for `DESC`**.
+
+| order | present slot | NULL slot |
+|---|---|---|
+| `ASC NULLS LAST` (the default — §2.2) | `0x00` ‖ body | `0x01` |
+| `ASC NULLS FIRST` | `0x01` ‖ body | `0x00` |
+| `DESC NULLS FIRST` (the `DESC` default — §2.3) | `0xFF` ‖ ~body | `0xFE` |
+| `DESC NULLS LAST` | `0xFE` ‖ ~body | `0xFF` |
+
+Equivalently: `DESC NULLS FIRST` is the whole-component inversion of `ASC NULLS LAST` (§2.3), and
+`DESC NULLS LAST` the whole-component inversion of `ASC NULLS FIRST`. The default slot is unchanged,
+so an index whose keys are all `ASC NULLS LAST` keeps its pre-v46 bytes exactly.
+
+**Why the inversion preserves order for every keyable type — prefix-freeness.** Bitwise inversion
+reverses `memcmp` order **between two byte strings neither of which is a prefix of the other**: the
+first differing byte decides, and `~x < ~y ⇔ x > y` for single bytes. (For a proper prefix it does
+*not* reverse — `x < x‖y` and `~x < ~x‖~y`.) Every body in §2 is **prefix-free** — no value's body is
+a proper prefix of another value's body — because each is self-delimiting, which is exactly the
+property composition (§2.3) already relies on:
+
+- fixed-width bodies (integers §2.1, `uuid` §2.7, `float` §2.8, `boolean` §2.9, `interval` §2.10,
+  the timestamp/date rules) are prefix-free by width;
+- `text` / `bytea` (§2.4/§2.6) end in the `00 01` terminator, and the escape means `00` is followed
+  only by `FF` or `01` inside a body — so a body ends exactly at its first `00 01`;
+- `decimal` (§2.5) is a class byte, then (non-zero) a fixed 4-byte exponent and `0x00`-terminated
+  mantissa pairs in `[01, 64]` (complemented under the negative class — terminator `FF`, pairs in
+  `[9B, FE]`), so the class byte fixes where the body ends;
+- the collated sort key (§2.12) ends in the `C`-key trailer (§2.4), whose terminator is
+  unambiguous after the `0x0000`-separated 16-bit weight levels;
+- the containers (§2.11 range, §2.14 array, §2.15 composite) are framed by their markers / element
+  count / fixed arity with prefix-free components inside.
+
+So for two distinct values `x ≠ y` of one type, `body(x)` and `body(y)` first differ at a byte
+inside both, and `~body` reverses their order; equal values have equal bodies (`1.5 = 1.50`,
+`-0 = +0`, `NaN = NaN`, span-equal intervals, collation-equal-and-identical strings) and stay equal.
+The inverted bodies are themselves prefix-free, so a `DESC` slot still **composes** with the
+following slots and the storage-key suffix: comparing two entries is decided inside the first
+differing slot, never by what follows it. The tag byte then places NULL: under `NULLS FIRST` the NULL
+tag is below every present tag (`0x00 < 0x01`, `0xFE < 0xFF`), under `NULLS LAST` above it.
+
+**Reading an ordered slot.** A slot is NULL iff its first byte is the order's NULL tag; otherwise
+the body follows the order's present tag (inverted for `DESC`, so a reader that skips a fixed-width
+body skips the same width, and a reader that needs the bare body inverts it back). A range bound over
+a `DESC` element swaps endpoints: logical `≥ v` becomes physical `< succ(tag ‖ ~v)`, `> v` becomes
+`< tag ‖ ~v`, `< v` becomes `≥ succ(tag ‖ ~v)`, `≤ v` becomes `≥ tag ‖ ~v`, all within the element's
+present region `[tag, tag + 1)` (which excludes the NULL slot — a range is never true for NULL).
+
+**Status — EXERCISED** (`format_version` 46). The `(value → bytes)` vectors for every keyable type
+in all four orders — each list walked in that order's logical sequence and checked prefix-free — are
+in [../encoding/ordered.toml](../encoding/ordered.toml); the on-disk image is pinned by the
+`ordered_index_table.jed` golden ([../fileformat/format.md](../fileformat/format.md)).
 
 ## 3. Where this is used today
 

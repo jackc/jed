@@ -137,6 +137,8 @@ pub(crate) struct IndexEqCol {
     pub(crate) col_type: ScalarType,
     pub(crate) coll: Option<std::sync::Arc<Collation>>,
     pub(crate) srcs: Vec<BoundSrc>,
+    /// The key element's sort order (indexes.md §11): the probe slot is its §2.16 present slot.
+    pub(crate) order: KeyOrder,
 }
 
 /// The optional trailing range of an index access predicate (indexes.md §5.1): a range on the key
@@ -146,13 +148,15 @@ pub(crate) struct IndexRange {
     pub(crate) col_type: ScalarType,
     pub(crate) coll: Option<std::sync::Arc<Collation>>,
     pub(crate) terms: Vec<BoundTerm>,
+    /// The range element's sort order (indexes.md §11): a DESC element swaps the byte endpoints.
+    pub(crate) order: KeyOrder,
 }
 
 /// How one index key component's nullable slot is skipped to recover an entry's storage-key suffix
 /// (indexes.md §5.1, encoding.md §2.2): every scalar key encoding is self-delimiting, either by a
 /// fixed width or by its own terminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KeySlot {
+pub(crate) enum KeySlotKind {
     /// A fixed-width body (the integers, bool, uuid, date, timestamps, floats, interval's 16 bytes).
     Fixed(usize),
     /// `text-terminated-escape` / `bytea-terminated-escape` (encoding.md §2.4/§2.6).
@@ -163,46 +167,73 @@ pub(crate) enum KeySlot {
     Collated,
 }
 
+/// One index key component's slot form (indexes.md §5.1) under its sort order (indexes.md §11,
+/// encoding.md §2.16): the order picks the slot's NULL tag, and a `DESC` slot's body is the one's
+/// complement of the ASC body, which the skip reads through an XOR mask (inversion keeps every body
+/// self-delimiting — the no-prefix property, spec/encoding/ordered.toml). The default order is the
+/// plain §2.2 `ASC NULLS LAST` slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeySlot {
+    pub(crate) kind: KeySlotKind,
+    pub(crate) order: KeyOrder,
+}
+
 impl KeySlot {
+    /// The `ASC NULLS LAST` slot of kind `kind`.
+    pub(crate) fn asc(kind: KeySlotKind) -> KeySlot {
+        KeySlot {
+            kind,
+            order: KeyOrder::ASC,
+        }
+    }
+
     /// The slot form of a scalar key component of type `ty`; `collated` selects the sort-key form
     /// of a non-`C` text key. `None` for a type with no key encoding.
     pub(crate) fn for_scalar(ty: ScalarType, collated: bool) -> Option<KeySlot> {
-        Some(match ty {
-            ScalarType::Text if collated => KeySlot::Collated,
-            ScalarType::Text | ScalarType::Bytea => KeySlot::Terminated,
-            ScalarType::Decimal => KeySlot::Decimal,
-            ScalarType::Interval => KeySlot::Fixed(16),
+        Some(KeySlot::asc(match ty {
+            ScalarType::Text if collated => KeySlotKind::Collated,
+            ScalarType::Text | ScalarType::Bytea => KeySlotKind::Terminated,
+            ScalarType::Decimal => KeySlotKind::Decimal,
+            ScalarType::Interval => KeySlotKind::Fixed(16),
             ScalarType::Json | ScalarType::Jsonb | ScalarType::JsonPath => return None,
-            _ => KeySlot::Fixed(ty.width_bytes()),
-        })
+            _ => KeySlotKind::Fixed(ty.width_bytes()),
+        }))
+    }
+
+    /// This slot under the key element's sort order `order`.
+    pub(crate) fn with_order(self, order: KeyOrder) -> KeySlot {
+        KeySlot { order, ..self }
     }
 
     /// The byte length of the nullable slot starting at `key[at]` (its tag included): `1` for the
-    /// `0x01` NULL tag, else `1` + the self-delimited body. `None` for a malformed (truncated) slot.
+    /// order's NULL tag, else `1` + the self-delimited body (inverted under `DESC`). `None` for a
+    /// malformed (truncated) slot.
     pub(crate) fn slot_len(self, key: &[u8], at: usize) -> Option<usize> {
-        if *key.get(at)? == 0x01 {
+        if *key.get(at)? == self.order.null_tag() {
             return Some(1);
         }
         let body = key.get(at + 1..)?;
-        let n = match self {
-            KeySlot::Fixed(w) => {
+        // `m` un-inverts a DESC body byte (`b ^ m` is the ASC byte).
+        let m: u8 = if self.order.desc { 0xFF } else { 0x00 };
+        let n = match self.kind {
+            KeySlotKind::Fixed(w) => {
                 if body.len() < w {
                     return None;
                 }
                 w
             }
-            KeySlot::Terminated => terminated_len(body)?,
-            KeySlot::Decimal => match *body.first()? {
+            KeySlotKind::Terminated => terminated_len(body, m)?,
+            KeySlotKind::Decimal => match *body.first()? ^ m {
                 0x04 => 1,
                 // class ‖ 4-byte exponent ‖ pair bytes ‖ terminator (0x00; complemented 0xFF).
                 class @ (0x03 | 0x05) => {
                     let term = if class == 0x05 { 0x00 } else { 0xFF };
                     let rest = body.get(5..)?;
-                    5 + rest.iter().position(|&b| b == term)? + 1
+                    5 + rest.iter().position(|&b| b ^ m == term)? + 1
                 }
                 _ => return None,
             },
-            KeySlot::Collated => {
+            KeySlotKind::Collated => {
                 // Three levels of 2-byte weights, each ended by a 0x0000 separator, then the
                 // identical level: the original string's terminated `C` key.
                 let mut i = 0;
@@ -210,23 +241,24 @@ impl KeySlot {
                 while seps < 3 {
                     let w = body.get(i..i + 2)?;
                     i += 2;
-                    if w == [0, 0] {
+                    if w[0] ^ m == 0 && w[1] ^ m == 0 {
                         seps += 1;
                     }
                 }
-                i + terminated_len(body.get(i..)?)?
+                i + terminated_len(body.get(i..)?, m)?
             }
         };
         Some(1 + n)
     }
 }
 
-/// The length of a `*-terminated-escape` body (`0x00 0xFF` an escaped NUL, `0x00 0x01` the end).
-fn terminated_len(body: &[u8]) -> Option<usize> {
+/// The length of a `*-terminated-escape` body (`0x00 0xFF` an escaped NUL, `0x00 0x01` the end),
+/// each byte read as `b ^ m` (`m = 0xFF` for a DESC slot's inverted body).
+fn terminated_len(body: &[u8], m: u8) -> Option<usize> {
     let mut i = 0;
     loop {
-        if *body.get(i)? == 0x00 {
-            match *body.get(i + 1)? {
+        if *body.get(i)? ^ m == 0x00 {
+            match *body.get(i + 1)? ^ m {
                 0x01 => return Some(i + 2),
                 _ => i += 2,
             }
@@ -317,7 +349,7 @@ pub(crate) fn build_index_access_predicate(
     // comparison on this relation's key, so its WHERE conjunct rejects a NULL-extended row.)
     let mut eq_cols: Vec<IndexEqCol> = Vec::new();
     let mut range: Option<IndexRange> = None;
-    for key in &rindex.keys {
+    for (key, &order) in rindex.keys.iter().zip(&rindex.orders) {
         // Each key element yields (its scalar key type, its key collation, the matcher against a
         // WHERE conjunct operand). A non-scalar / skewed element stops the prefix.
         let (ty, coll, matcher): (ScalarType, Option<std::sync::Arc<Collation>>, KeyMatch) =
@@ -360,6 +392,7 @@ pub(crate) fn build_index_access_predicate(
                 col_type: ty,
                 coll,
                 srcs: eqs.into_iter().map(|t| t.src).collect(),
+                order,
             });
             continue; // extend the equality prefix
         }
@@ -368,6 +401,7 @@ pub(crate) fn build_index_access_predicate(
                 col_type: ty,
                 coll,
                 terms: ranges,
+                order,
             });
         }
         break; // first non-equality element ends the prefix (with or without a trailing range)
@@ -394,7 +428,7 @@ pub(crate) fn index_suffix_slots(
     from: usize,
 ) -> Option<Vec<KeySlot>> {
     let mut suffix = Vec::with_capacity(rindex.keys.len().saturating_sub(from));
-    for key in &rindex.keys[from..] {
+    for (j, key) in rindex.keys[from..].iter().enumerate() {
         let slot = match key {
             ResolvedKey::Column(ci) => {
                 let col = &rel.table.columns[*ci];
@@ -404,7 +438,8 @@ pub(crate) fn index_suffix_slots(
                 KeySlot::for_scalar(ety.as_scalar()?, ecoll.is_some())?
             }
         };
-        suffix.push(slot);
+        // The slot reads the element's own NULL tag and (DESC) inverted body (indexes.md §11).
+        suffix.push(slot.with_order(rindex.orders.get(from + j).copied().unwrap_or_default()));
     }
     Some(suffix)
 }
@@ -2718,6 +2753,7 @@ fn build_index_interval_set_plan_conjuncts(
         .find(|&i| tuple[i].specs.is_some() || !tuple[i].point)
         .unwrap_or(tuple.len());
     let mut slots = Vec::with_capacity(cols.len());
+    let orders: Vec<KeyOrder> = (0..cols.len()).map(|i| idx.key_order(i)).collect();
     let mut all_fixed = true;
     for (i, &c) in cols.iter().enumerate() {
         let slot = slot_of(c);
@@ -2726,12 +2762,16 @@ fn build_index_interval_set_plan_conjuncts(
         }
         let s = rel.table.columns[c].ty.as_scalar();
         all_fixed = all_fixed && s.is_some_and(|s| s.is_fixed_width());
-        slots.push(slot.unwrap_or(KeySlot::Fixed(0)));
+        slots.push(
+            slot.unwrap_or(KeySlot::asc(KeySlotKind::Fixed(0)))
+                .with_order(orders[i]),
+        );
     }
     Some(IndexKeySet {
         name_key: idx.name.to_string(),
         tuple,
         slots,
+        orders,
         all_fixed,
     })
 }
@@ -3440,9 +3480,13 @@ pub(crate) fn inventory_inl_candidates<'a>(
         // Every trailing column is skipped by its self-delimiting slot (indexes.md §5.1).
         let Some(suffix) = cols[1..]
             .iter()
-            .map(|&c| {
+            .enumerate()
+            .map(|(j, &c)| {
                 let col = &rel.table.columns[c];
-                KeySlot::for_scalar(col.ty.as_scalar()?, col.collation.is_some())
+                Some(
+                    KeySlot::for_scalar(col.ty.as_scalar()?, col.collation.is_some())?
+                        .with_order(idx.key_order(j + 1)),
+                )
             })
             .collect::<Option<Vec<KeySlot>>>()
         else {
@@ -3472,6 +3516,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
                         col_type: ty,
                         coll,
                         srcs: eqs,
+                        order: idx.key_order(0),
                     }],
                     range: None,
                     suffix,
@@ -3778,13 +3823,14 @@ pub(crate) struct IndexOrder {
 /// stable sort's tie-break.
 ///
 /// Returns `Some` iff the `ORDER BY` keys are **exactly** a B-tree index's columns (same count, same
-/// columns in key order), each `ASC` with **default `NULLS LAST`** (the index stores `NULL` as `0x01`
-/// after a present `0x00`, so it realizes NULLS-LAST; an explicit `NULLS FIRST` does not match) and
+/// columns in key order), each with the index element's declared direction and NULL placement
+/// (indexes.md §11 — a forward walk realizes exactly the declared order) and
 /// sorting by the column's stored key collation (`Skewed`/unresolvable → refuse, the §12 read-safety
 /// rule), **and** the table's PK is fixed-width ([`pk_storage_width`]). The exact-match requirement is
 /// load-bearing: a strict prefix of a *multi*-column index would tie-break by the remaining index
 /// columns rather than the PK, diverging from the eager sort (the same tie-break trap the
-/// composite-PK reverse case carries). `DESC` (a reverse index walk) is a follow-on.
+/// composite-PK reverse case carries). A backward walk (an ASC index for a DESC order) is a
+/// follow-on: it would reverse the storage-key tie-break.
 pub(crate) fn order_satisfied_by_indexes(
     table: &Table,
     offset: usize,
@@ -3823,8 +3869,11 @@ pub(crate) fn order_satisfied_by_indexes(
                 .iter()
                 .enumerate()
                 .all(|(i, (slot, descending, nulls_first, coll))| {
-                    if *descending || *nulls_first {
-                        return false; // ASC + NULLS LAST only — the order a forward index walk realizes
+                    // A forward walk realizes each key element's declared order (indexes.md §11):
+                    // the ORDER BY key's direction and effective NULL placement must both match.
+                    let order = idx.key_order(i);
+                    if *descending != order.desc || *nulls_first != order.nulls_first {
+                        return false;
                     }
                     if *slot != offset + cols[i] {
                         return false; // the i-th index column, in key order
@@ -4325,6 +4374,9 @@ pub(crate) struct ResolvedIndex {
     pub unique: bool,
     pub kind: IndexKind,
     pub keys: Vec<ResolvedKey>,
+    /// Each key element's sort order (indexes.md §11), parallel to `keys` (always full length here):
+    /// the entry slot of element `i` is the encoding.md §2.16 ordered slot under `orders[i]`.
+    pub orders: Vec<KeyOrder>,
     /// A **partial** index's resolved `WHERE predicate` (spec/design/indexes.md §9): evaluated
     /// against each row (unmetered, like a key expression), a row is indexed / constrained **only**
     /// when it is TRUE. `None` for an ordinary (full) index — every row is indexed.
@@ -4428,16 +4480,12 @@ pub(crate) fn index_entry_key(
     env: &EvalEnv,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    for key in &rindex.keys {
-        match index_slot_key(key, col_types, colls, row, env)? {
-            None => out.push(0x01),
-            Some(bytes) => {
-                // present tag, then the slot's order-preserving key (range-aware §2.11, composite
-                // §2.15, collated-text-aware §2.12)
-                out.push(0x00);
-                out.extend_from_slice(&bytes);
-            }
-        }
+    for (key, &order) in rindex.keys.iter().zip(&rindex.orders) {
+        // The §2.16 ordered slot: the order's presence tag + the slot's order-preserving key
+        // (range-aware §2.11, composite §2.15, collated-text-aware §2.12), inverted for DESC — or
+        // the order's NULL byte.
+        let bytes = index_slot_key(key, col_types, colls, row, env)?;
+        order.push_slot(&mut out, bytes.as_deref());
     }
     out.extend_from_slice(storage_key);
     Ok(out)
@@ -4515,16 +4563,13 @@ pub(crate) fn index_entry_keys_columns(
     Ok(match def.kind {
         IndexKind::Btree => {
             let mut out = Vec::new();
-            for &ci in &cols {
+            for (i, &ci) in cols.iter().enumerate() {
+                let order = def.key_order(i);
                 match &row[ci] {
-                    Value::Null => out.push(0x01),
+                    Value::Null => out.push(order.null_tag()),
                     v => {
-                        out.push(0x00);
-                        out.extend_from_slice(&encode_key_ct(
-                            &col_types[ci],
-                            v,
-                            colls[ci].as_deref(),
-                        )?);
+                        let body = encode_key_ct(&col_types[ci], v, colls[ci].as_deref())?;
+                        order.push_present(&mut out, &body);
                     }
                 }
             }
@@ -4874,15 +4919,11 @@ pub(crate) fn index_prefix_key(
         return Ok(None);
     }
     let mut out = Vec::new();
-    for key in &rindex.keys {
+    for (key, &order) in rindex.keys.iter().zip(&rindex.orders) {
         match index_slot_key(key, col_types, colls, row, env)? {
             None => return Ok(None),
-            Some(bytes) => {
-                // present tag, then the slot's order-preserving key (range-aware §2.11, composite
-                // §2.15, collated-text-aware §2.12)
-                out.push(0x00);
-                out.extend_from_slice(&bytes);
-            }
+            // the order's present slot (§2.16) — the same bytes the entry key carries
+            Some(bytes) => order.push_present(&mut out, &bytes),
         }
     }
     Ok(Some(out))
@@ -5236,13 +5277,14 @@ pub(crate) fn fk_probe(
             .column_ordinals()
             .expect("FK target is a plain-column unique index");
         let mut prefix = Vec::new();
-        for &pcol in &idx_cols {
-            prefix.push(0x00);
-            prefix.extend_from_slice(&encode_typed_key(
+        for (i, &pcol) in idx_cols.iter().enumerate() {
+            // The parent index's §2.16 ordered present slot (a DESC key inverts its body).
+            let body = encode_typed_key(
                 &parent.columns[pcol].ty,
                 value_for(pcol),
                 parent_colls[pcol].as_deref(),
-            )?);
+            )?;
+            idx.key_order(i).push_present(&mut prefix, &body);
         }
         Ok(Some(FkProbe::Unique {
             index: idx.name.to_string(),
@@ -5268,6 +5310,8 @@ pub(crate) fn fk_match_full_violated(fk: &ForeignKeyConstraint, row: &Row) -> bo
 pub(crate) struct FkReversePath {
     pub(crate) index: Option<String>,
     pub(crate) cols: Vec<usize>,
+    /// The index's sort order of each leading column (indexes.md §11; empty for the PK path).
+    pub(crate) orders: Vec<KeyOrder>,
 }
 
 /// Whether `leading` — the first `fk.columns.len()` key columns of a child tree — can serve `fk`'s
@@ -5322,7 +5366,7 @@ pub(crate) fn fk_reverse_prefix(
     values: &[Value],
 ) -> Result<Vec<u8>> {
     let mut prefix = Vec::new();
-    for &c in &path.cols {
+    for (i, &c) in path.cols.iter().enumerate() {
         let slot = fk
             .columns
             .iter()
@@ -5334,9 +5378,11 @@ pub(crate) fn fk_reverse_prefix(
             child_colls[c].as_deref(),
         )?;
         if path.index.is_some() {
-            prefix.push(0x00);
+            // the index column's §2.16 present slot (a DESC key inverts its body)
+            path.orders[i].push_present(&mut prefix, &b);
+        } else {
+            prefix.extend_from_slice(&b);
         }
-        prefix.extend_from_slice(&b);
     }
     Ok(prefix)
 }
@@ -5355,6 +5401,7 @@ pub(crate) fn fk_choose_reverse_path(
         return Some(FkReversePath {
             index: None,
             cols: child.pk[..k].to_vec(),
+            orders: Vec::new(),
         });
     }
     let mut best: Option<FkReversePath> = None;
@@ -5382,6 +5429,7 @@ pub(crate) fn fk_choose_reverse_path(
             best = Some(FkReversePath {
                 index: Some(name),
                 cols: leading,
+                orders: (0..k).map(|i| ix.key_order(i)).collect(),
             });
         }
     }
@@ -6032,13 +6080,14 @@ fn concat_key(p: &[u8], k: &[u8]) -> Vec<u8> {
 }
 
 /// Evaluate a tuple set's members in key order (cost.md §3): the cartesian product of the point
-/// members' keys, each preceded by `tag`, as prefixes in byte order, and the final member's
+/// members' keys — bare for a PK (`orders = None`), each member's §2.16 present slot under its
+/// `orders[i]` for an index — as prefixes in byte order, and the final member's
 /// canonical logical intervals when it is consumed, with the consumed count and whether the final
 /// member was consumed. A later member with more than one point that would take the running product
 /// over [`MAX_KEY_SET_PROBES`] ends the walk unconsumed. An empty member empties the set: `None`.
 fn expand_tuple_prefixes(
     tuple: &[TupleMember],
-    tag: &[u8],
+    orders: Option<&[KeyOrder]>,
     params: &[Value],
     outer: &[&[Value]],
     left: &[Value],
@@ -6075,14 +6124,21 @@ fn expand_tuple_prefixes(
             has_final = true;
             break;
         }
+        // An index member's points become its ordered slots, re-sorted into physical byte order (a
+        // DESC member's inverted bodies reverse the logical order).
+        let points = match orders {
+            None => points,
+            Some(orders) => {
+                let mut slots: Vec<Vec<u8>> =
+                    points.iter().map(|k| orders[i].present_slot(k)).collect();
+                slots.sort();
+                slots
+            }
+        };
         let mut next = Vec::with_capacity(prefixes.len() * count);
         for p in &prefixes {
             for k in &points {
-                let mut key = Vec::with_capacity(p.len() + tag.len() + k.len());
-                key.extend_from_slice(p);
-                key.extend_from_slice(tag);
-                key.extend_from_slice(k);
-                next.push(key);
+                next.push(concat_key(p, k));
             }
         }
         prefixes = next;
@@ -6099,7 +6155,7 @@ fn tuple_interval_set(
     left: &[Value],
 ) -> Vec<KeyBound> {
     let Some((prefixes, final_intervals, consumed, has_final)) =
-        expand_tuple_prefixes(&ks.tuple, &[], params, outer, left)
+        expand_tuple_prefixes(&ks.tuple, None, params, outer, left)
     else {
         return Vec::new();
     };
@@ -6162,7 +6218,7 @@ impl IndexKeySet {
         left: &[Value],
     ) -> Vec<IndexProbe> {
         let Some((prefixes, final_intervals, consumed, has_final)) =
-            expand_tuple_prefixes(&self.tuple, &[0x00], params, outer, left)
+            expand_tuple_prefixes(&self.tuple, Some(&self.orders), params, outer, left)
         else {
             return Vec::new();
         };
@@ -6182,13 +6238,8 @@ impl IndexKeySet {
                 continue;
             }
             for iv in &final_intervals {
-                let phys = index_logical_interval(iv);
-                let b = KeyBound {
-                    lo: phys.lo.map(|lo| concat_key(p, &lo)),
-                    lo_inc: phys.lo_inc,
-                    hi: phys.hi.map(|hi| concat_key(p, &hi)),
-                    hi_inc: phys.hi_inc,
-                };
+                let phys = index_logical_interval(iv, self.orders[consumed - 1]);
+                let b = prefixed_interval(p, phys);
                 if !bound_empty(&b) {
                     out.push(IndexProbe {
                         bound: b,
@@ -6198,6 +6249,9 @@ impl IndexKeySet {
                 }
             }
         }
+        // The probes are disjoint; a DESC final member emits its intervals in reverse physical order,
+        // so order them by their lower endpoint — the index-key order the walk must follow.
+        out.sort_by(|a, b| a.bound.lo.cmp(&b.bound.lo));
         if !self.all_fixed || out.len() < 2 {
             return out;
         }
@@ -6214,32 +6268,67 @@ impl IndexKeySet {
     }
 }
 
-pub(crate) fn index_logical_interval(logical: &KeyBound) -> KeyBound {
+/// Place a one-slot physical interval ([`index_logical_interval`]) under the encoded prefix `p`; an
+/// unbounded upper end (the DESC NULLS FIRST present region tops the slot) becomes `succ(p)`.
+pub(crate) fn prefixed_interval(p: &[u8], phys: KeyBound) -> KeyBound {
+    KeyBound {
+        lo: Some(match &phys.lo {
+            Some(lo) => concat_key(p, lo),
+            None => p.to_vec(),
+        }),
+        lo_inc: phys.lo.is_none() || phys.lo_inc,
+        hi: match &phys.hi {
+            Some(hi) => Some(concat_key(p, hi)),
+            None => prefix_successor(p),
+        },
+        hi_inc: phys.hi.is_some() && phys.hi_inc,
+    }
+}
+
+/// Map one key element's LOGICAL interval (bare order-preserving key bytes, ascending) to its
+/// physical slot interval under `order` (encoding.md §2.16): the present region `[tag, tag+1)` of the
+/// slot, tightened by the logical bounds. An ascending order keeps the endpoints (`v` ↦ `tag‖v`); a
+/// DESC order inverts each body, which reverses memcmp order over the prefix-free key bodies, so the
+/// logical lower bound becomes the physical upper bound and vice versa — `≥ v` ↦ `< succ(tag‖~v)`,
+/// `> v` ↦ `< tag‖~v`, `< v` ↦ `≥ succ(tag‖~v)`, `≤ v` ↦ `≥ tag‖~v`. The result is half-open
+/// (`lo` inclusive, `hi` exclusive) whenever both ends are bounded.
+pub(crate) fn index_logical_interval(logical: &KeyBound, order: KeyOrder) -> KeyBound {
+    let tag = order.present_tag();
     let mut b = KeyBound {
-        lo: Some(vec![0x00]),
+        lo: Some(vec![tag]),
         lo_inc: true,
-        hi: Some(vec![0x01]),
+        hi: prefix_successor(&[tag]),
         hi_inc: false,
     };
-    if let Some(lo) = &logical.lo {
-        let mut p = vec![0x00];
-        p.extend_from_slice(lo);
-        if logical.lo_inc {
-            intersect_lo(&mut b, &p, true);
-        } else if let Some(next) = prefix_successor(&p) {
-            intersect_lo(&mut b, &next, true);
+    // (physical endpoint, which side, inclusive-as-written) for one logical endpoint.
+    let mut tighten = |key: &[u8], logical_lo: bool, inc: bool| {
+        let slot = order.present_slot(key);
+        // An ascending order keeps the side; DESC flips it.
+        let phys_lo = logical_lo != order.desc;
+        // Inclusive lower bound `slot`, exclusive upper bound `slot` or `succ(slot)`.
+        match (phys_lo, inc) {
+            (true, true) => intersect_lo(&mut b, &slot, true),
+            (true, false) => match prefix_successor(&slot) {
+                Some(next) => intersect_lo(&mut b, &next, true),
+                None => {
+                    b.lo = Some(slot.clone());
+                    b.hi = Some(slot);
+                    b.hi_inc = false;
+                }
+            },
+            (false, true) => {
+                if let Some(next) = prefix_successor(&slot) {
+                    intersect_hi(&mut b, &next, false);
+                }
+            }
+            (false, false) => intersect_hi(&mut b, &slot, false),
         }
+    };
+    if let Some(lo) = &logical.lo {
+        tighten(lo, true, logical.lo_inc);
     }
     if let Some(hi) = &logical.hi {
-        let mut p = vec![0x00];
-        p.extend_from_slice(hi);
-        if logical.hi_inc {
-            if let Some(next) = prefix_successor(&p) {
-                intersect_hi(&mut b, &next, false);
-            }
-        } else {
-            intersect_hi(&mut b, &p, false);
-        }
+        tighten(hi, false, logical.hi_inc);
     }
     b
 }
@@ -6441,8 +6530,11 @@ pub(crate) fn build_index_bound(
                 Some(_) => return None,
             }
         }
-        p.push(0x00);
-        p.extend_from_slice(&agreed.expect("an equality column has at least one source"));
+        // The column's §2.16 present slot (a DESC key inverts its body).
+        ec.order.push_present(
+            &mut p,
+            &agreed.expect("an equality column has at least one source"),
+        );
     }
     let Some(rng) = &ib.range else {
         // Pure equality prefix: [P, byte-successor(P)).
@@ -6458,16 +6550,11 @@ pub(crate) fn build_index_bound(
             Some((b, p.len()))
         };
     };
-    // Equality prefix P + a range on the next column. Base: [P, P‖0x01) — present values only (the
-    // 0x01 NULL tag sorts after every 0x00 present slot at this position).
-    let mut hi_null = p.clone();
-    hi_null.push(0x01);
-    let mut b = KeyBound {
-        lo: Some(p.clone()),
-        lo_inc: true,
-        hi: Some(hi_null),
-        hi_inc: false,
-    };
+    // Equality prefix P + a range on the next column: the present region of that column's slot
+    // `[P‖tag, P‖tag+1)` (the order's NULL byte sits outside it — a range is never true for NULL),
+    // tightened by each term's logical interval mapped through the column's order (§2.16; a DESC
+    // column swaps the byte endpoints).
+    let mut logical = KeyBound::unbounded();
     for t in &rng.terms {
         // A collated range column's probe is the collation's sort key (the stored key form).
         let key = match encode_bound_key(
@@ -6482,27 +6569,20 @@ pub(crate) fn build_index_bound(
             BoundKey::OutOfRange => continue, // drop this half-bound (a wider, still-sound scan)
             BoundKey::Key(k) => k,
         };
-        // P ‖ 0x00 ‖ encode(v) — the range column's present slot appended to the prefix.
-        let mut ps = p.clone();
-        ps.push(0x00);
-        ps.extend_from_slice(&key);
         match t.op {
-            CmpOp::Ge => intersect_lo(&mut b, &ps, true),
-            // `>` skips the whole `c = v` subtree: the smallest key after every `P‖0x00‖v‖*` entry.
-            CmpOp::Gt => match prefix_successor(&ps) {
-                Some(s) => intersect_lo(&mut b, &s, true),
-                None => return None, // no key exceeds the max — empty (unreachable: ps starts 0x00)
-            },
-            CmpOp::Lt => intersect_hi(&mut b, &ps, false),
-            CmpOp::Le => match prefix_successor(&ps) {
-                Some(s) => intersect_hi(&mut b, &s, false),
-                None => {} // everything ≤ max — keep the base hi (P‖0x01)
-            },
+            CmpOp::Ge => intersect_lo(&mut logical, &key, true),
+            CmpOp::Gt => intersect_lo(&mut logical, &key, false),
+            CmpOp::Lt => intersect_hi(&mut logical, &key, false),
+            CmpOp::Le => intersect_hi(&mut logical, &key, true),
             // `=` never reaches range terms (filtered into the equality prefix); `<>` never becomes a
             // bound term at all. Both contribute no half-bound.
             CmpOp::Eq | CmpOp::Ne => {}
         }
     }
+    if bound_empty(&logical) {
+        return None;
+    }
+    let b = prefixed_interval(&p, index_logical_interval(&logical, rng.order));
     if bound_empty(&b) {
         None
     } else {
@@ -9126,5 +9206,78 @@ mod candidate_inventory_tests {
             .filter
             .into_where()
             .expect("inventory query filter")
+    }
+}
+
+#[cfg(test)]
+mod key_slot_ordered_vector_tests {
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The unified key-slot skipper over every ordered slot in spec/encoding/ordered.toml
+    /// (indexes.md §5.1/§11, encoding.md §2.16): for each scalar group's four orders, the skip
+    /// recognizes the order's NULL tag and steps over the (DESC: inverted) body exactly, with
+    /// trailing bytes after the slot — the storage-key suffix a real entry carries. Byte-level
+    /// skipping is out of the corpus's reach (CLAUDE.md §10).
+    #[test]
+    fn slot_len_skips_every_ordered_vector() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/encoding/ordered.toml");
+        let v: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let orders = [
+            ("asc_nulls_last", KeyOrder::ASC),
+            (
+                "asc_nulls_first",
+                KeyOrder {
+                    desc: false,
+                    nulls_first: true,
+                },
+            ),
+            (
+                "desc_nulls_first",
+                KeyOrder {
+                    desc: true,
+                    nulls_first: true,
+                },
+            ),
+            (
+                "desc_nulls_last",
+                KeyOrder {
+                    desc: true,
+                    nulls_first: false,
+                },
+            ),
+        ];
+        let mut checked = 0;
+        for group in v["group"].as_array().unwrap() {
+            let name = group["type"].as_str().unwrap();
+            let slot = if name.starts_with("collated text") {
+                KeySlot::asc(KeySlotKind::Collated)
+            } else if name.contains("range") || name.contains("[]") || name.contains('(') {
+                continue; // a container group: its slot is not skippable by KeySlot (§5.1)
+            } else {
+                KeySlot::for_scalar(ScalarType::from_name(name).unwrap(), false).unwrap()
+            };
+            for case in group["cases"].as_array().unwrap() {
+                for (field, order) in orders {
+                    let mut bytes = unhex(case[field].as_str().unwrap());
+                    let n = bytes.len();
+                    bytes.extend_from_slice(&[0x00, 0x01, 0xFE, 0xFF]);
+                    assert_eq!(
+                        slot.with_order(order).slot_len(&bytes, 0),
+                        Some(n),
+                        "{name} {field} {case:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 200, "only {checked} slots checked");
     }
 }

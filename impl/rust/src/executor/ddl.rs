@@ -1605,6 +1605,7 @@ impl Engine {
                     // A PK / UNIQUE constraint index is always plain-column — no host dependency.
                     host_deps: Vec::new(),
                     timezone_deps: TimeZoneDeps::default(),
+                    orders: Vec::new(),
                 },
             );
         }
@@ -1868,6 +1869,8 @@ impl Engine {
                     // Plain-column keys; only a partial predicate can carry a dependency.
                     host_deps,
                     timezone_deps,
+                    // An EXCLUDE element takes no ordering option: the backing index is ASC.
+                    orders: Vec::new(),
                 },
             );
             table.exclusions.push(ExclusionConstraint {
@@ -2861,6 +2864,7 @@ impl Engine {
                                     predicate: None,
                                     host_deps: Vec::new(),
                                     timezone_deps: TimeZoneDeps::default(),
+                                    orders: Vec::new(),
                                 });
                                 table.indexes.sort_by_key(|x| x.name.to_string());
                                 added_constraints.insert(name.to_string());
@@ -3066,6 +3070,8 @@ impl Engine {
                                     predicate,
                                     host_deps,
                                     timezone_deps,
+                                    // An EXCLUDE element takes no ordering option: the backing index is ASC.
+                                    orders: Vec::new(),
                                 });
                                 table.exclusions.push(ExclusionConstraint {
                                     name: name.clone(),
@@ -4704,6 +4710,7 @@ impl Engine {
             name: def.name.clone(),
             unique: def.unique,
             kind: def.kind,
+            orders: (0..keys.len()).map(|i| def.key_order(i)).collect(),
             keys,
             predicate,
         })
@@ -5113,7 +5120,7 @@ impl Engine {
         // function (byte-identical to v30 then).
         let mut host_deps: Vec<HostFuncDep> = Vec::new();
         let mut timezone_deps = TimeZoneDeps::default();
-        for elem in &ci.keys {
+        for (elem_i, elem) in ci.keys.iter().enumerate() {
             // An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the
             // table's columns, validate it is immutable + indexable-typed, and store its canonical
             // text (persisted, format_version 26). Expression keys are B-tree only this slice —
@@ -5146,6 +5153,31 @@ impl Engine {
                 )
             })?;
             self.check_index_column_type(kind, &columns[idx].ty)?;
+            // Ordering options (indexes.md §11): only an ordered B-tree takes them. PostgreSQL rejects
+            // any WRITTEN option on an unordered access method, explicit `ASC` included — the
+            // direction first, then the NULLS placement (0A000).
+            if kind != IndexKind::Btree {
+                let spec = ci.key_orders.get(elem_i).copied().unwrap_or_default();
+                let method = if kind == IndexKind::Gin {
+                    "gin"
+                } else {
+                    "gist"
+                };
+                if spec.desc.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!("access method \"{method}\" does not support ASC/DESC options"),
+                    ));
+                }
+                if spec.nulls_first.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "access method \"{method}\" does not support NULLS FIRST/LAST options"
+                        ),
+                    ));
+                }
+            }
             // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
             ci_keys.push(IndexKey::Column(idx));
         }
@@ -5285,6 +5317,9 @@ impl Engine {
             predicate,
             host_deps,
             timezone_deps,
+            orders: IndexDef::canonical_orders(
+                ci.key_orders.iter().map(|o| o.effective()).collect(),
+            ),
         };
         // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
         // row. The touched set is the columns the key elements read — an index column for a

@@ -333,8 +333,13 @@ identity_alter_option ::= "SET" "GENERATED" ("ALWAYS" | "BY" "DEFAULT")
  * gin/gist index is 0A000. The predicate is a boolean expression over the table's own columns,
  * immutable and self-contained: a subquery is 0A000, a bind parameter 42P02, an aggregate 42803, a
  * window 42P20, a non-boolean result 42804, a non-immutable / timestamptz-dependent expression 42P17.
- * Narrowings this slice (each 0A000-free — simply not in the grammar): no per-key ASC/DESC/NULLS or
- * COLLATE, no NULLS NOT DISTINCT.
+ *   Each key element may carry PostgreSQL's ordering options — "ASC" | "DESC", then "NULLS FIRST" |
+ * "NULLS LAST" (indexes.md §11). The direction defaults to ASC and the NULL placement to the
+ * direction's default (DESC => NULLS FIRST). B-tree only: any WRITTEN option on a gin / gist index —
+ * explicit ASC included — is 0A000 (the direction checked first). A UNIQUE / PRIMARY KEY constraint's
+ * column list takes no ordering (42601, as in PostgreSQL).
+ * Narrowings this slice (each 0A000-free — simply not in the grammar): no per-key COLLATE or
+ * operator class, no NULLS NOT DISTINCT.
  *   "IF NOT EXISTS" (which REQUIRES a name, as in PG — "IF NOT EXISTS ON t (a)" is 42601) makes a name
  * already taken in the target database's relation namespace a no-op success instead of 42P07. Unlike
  * CREATE TABLE IF NOT EXISTS, the skip is decided where PostgreSQL's index_create decides it: AFTER
@@ -352,9 +357,12 @@ identity_alter_option ::= "SET" "GENERATED" ("ALWAYS" | "BY" "DEFAULT")
 create_index   ::= "CREATE" "UNIQUE"? "INDEX" ( "IF" "NOT" "EXISTS" identifier | identifier? ) "ON" qualified_table
                    using_clause? "(" index_element ("," index_element)* ")"
                    ( "WHERE" expr )?               /* an optional partial-index predicate (indexes.md §9) */
-index_element  ::= column_ref                    /* a bare column name */
+index_element  ::= index_key index_order?
+index_key      ::= column_ref                    /* a bare column name */
                  | function_call                 /* a bare function call, e.g. lower(email) */
                  | "(" expr ")"                  /* any parenthesized expression; "(col)" normalizes to a column key */
+index_order    ::= ( "ASC" | "DESC" ) ( "NULLS" ( "FIRST" | "LAST" ) )?
+                 | "NULLS" ( "FIRST" | "LAST" )  /* the key's sort order (indexes.md §11) */
 using_clause   ::= "USING" identifier
 drop_index     ::= "DROP" "INDEX" identifier
 

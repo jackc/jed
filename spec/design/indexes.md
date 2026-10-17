@@ -16,7 +16,7 @@
 ## 1. Surface
 
 ```sql
-CREATE [UNIQUE] INDEX [IF NOT EXISTS name | name] ON table (key [, key ...]) [WHERE predicate]
+CREATE [UNIQUE] INDEX [IF NOT EXISTS name | name] ON table (key [ASC | DESC] [NULLS FIRST | LAST] [, ...]) [WHERE predicate]
 DROP INDEX name
 REINDEX [ ( option [, ...] ) ] { INDEX | TABLE } [ CONCURRENTLY ] [db.]name     -- §10
 REINDEX [ ( option [, ...] ) ] { DATABASE | SYSTEM } [ CONCURRENTLY ] [ name ]
@@ -78,8 +78,9 @@ three forms in one key list (`CREATE INDEX ON t (lower(email), a, (b + 1))`).
   (`0A000`), or a **bind parameter** `$N` (`42P02`). An immutable expression is a
   deterministic function of the row, so the index stays consistent with the table under the
   §8/§10 contract.
-- **Still deferred** (each a relaxable narrowing, PostgreSQL features): per-key
-  `ASC`/`DESC`/`NULLS`, `CONCURRENTLY`, and an explicit operator class /
+- **Per-key ordering** — `a DESC`, `b NULLS FIRST` — has landed (§11, `format_version` 46).
+- **Still deferred** (each a relaxable narrowing, PostgreSQL features): `CONCURRENTLY`, and an
+  explicit operator class /
   `COLLATE` on a key element. An expression key's text result uses the expression's own
   effective collation (jed's ordinary text-collation resolution), not a per-key `COLLATE`.
   (Partial (`WHERE`) indexes have **landed** for B-tree — §9.)
@@ -179,7 +180,8 @@ entry_key = nullable-slot(key_1) ‖ nullable-slot(key_2) ‖ … ‖ row_storag
   tag (`0x00` present ‖ the type's order-preserving key bytes, `0x01` NULL) — **always**,
   even for a NOT NULL column or a NOT-NULL-typed expression (one uniform rule; nullability
   never changes the byte layout). This is the first place §2.2 is exercised in stored
-  bytes: NULL sorts **after** every present value (ascending), the PostgreSQL model. An
+  bytes: NULL sorts **after** every present value (ascending), the PostgreSQL model. (A key
+  element declared `DESC` / `NULLS FIRST` uses the corresponding §2.16 ordered slot instead — §11.) An
   expression key encodes under the **expression's resolved result type and collation**
   (e.g. `lower(email)` → the `text` order-preserving key under the expression's effective
   collation).
@@ -692,7 +694,7 @@ table refuse writes (`XX002`) until it is rebuilt with the current environment.
 ### 10.1 What a rebuild is
 
 Rebuilding an index is **exactly** dropping it and creating it again with the same definition — the
-same name, key elements, uniqueness, method, and predicate — in one all-or-nothing statement, with
+same name, key elements and their ordering options (§11), uniqueness, method, and predicate — in one all-or-nothing statement, with
 three properties a DROP/CREATE pair does not give for free:
 
 - **Position and links are kept.** The index keeps its place in the table's catalog order (ascending
@@ -794,3 +796,72 @@ databases); a built-in catalog relation is `42809` where PostgreSQL rebuilds a s
 indexes. None is PG-comparable through the oracle (which probes inside a transaction block), so
 `suites/ddl/reindex_jed.test` pins them cross-core, beside the oracle-clean `suites/ddl/reindex.test`.
 
+
+## 11. Ordered keys (`ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`)
+
+```sql
+CREATE INDEX t_ab ON t (a DESC, b NULLS FIRST, (c + 1) DESC NULLS LAST)
+```
+
+Each key element may carry PostgreSQL's ordering options ([grammar.md §30](grammar.md)). Semantics
+are PostgreSQL's (oracle-probed):
+
+- **Defaults.** The direction defaults to `ASC`; the NULL placement defaults **by direction** —
+  `ASC` ⇒ `NULLS LAST`, `DESC` ⇒ `NULLS FIRST` (NULL is the largest value, [encoding.md §4](encoding.md)).
+  `ASC NULLS LAST` is the plain index of §1–§9, byte-identical to an index without options.
+- **B-tree only.** A GIN or GiST index rejects any *written* option — an explicit `ASC` included —
+  with `0A000` (`access method "gin" does not support ASC/DESC options`; then, for a NULL placement,
+  `… does not support NULLS FIRST/LAST options`), checked per element right after the element's own
+  column checks (so a missing column is still `42703`). An `EXCLUDE` element takes none (its
+  grammar has no option).
+- **Constraints take none.** `UNIQUE (a DESC)` and `PRIMARY KEY (a DESC)` are syntax errors (`42601`),
+  as in PostgreSQL: only `CREATE UNIQUE INDEX` takes an ordering. (PostgreSQL's `ADD CONSTRAINT …
+  USING INDEX`, which refuses an index without default ordering, has no jed analogue.)
+- **The auto-name ignores the order** (`CREATE INDEX ON t (b DESC, a)` is `t_b_a_idx`).
+
+**Entries.** Element `i`'s slot is the [encoding.md §2.16](encoding.md) **ordered slot** under its
+order: the presence tag chosen by the NULL placement, the type's order-preserving body bitwise
+inverted for `DESC`. Every keyable type qualifies — the inversion reverses the order of the
+prefix-free bodies, variable-width and container bodies included — so an index iterates in its
+declared order. The order changes only the entry bytes, never *which* rows an index holds or
+constrains: maintenance (§4), uniqueness (§8, NULLS DISTINCT, the probe prefix built from the same
+ordered slots), partial predicates (§9), the `ON CONFLICT` arbiter (inference ignores the order, as
+in PostgreSQL — [upsert.md](upsert.md)), a foreign key referencing a unique index's columns, and a
+child index serving the parent-side reverse match ([constraints.md §6.5](constraints.md)) all encode
+their probes through the index's ordered slots.
+
+**Planner.** Every §5 path treats an ordered index as an ASC one, through its slots:
+
+- the **access predicate** (§5.1) encodes equality-prefix slots as ordered present slots; a trailing
+  range maps its logical interval into the element's present region `[tag, tag + 1)` — under `DESC`
+  the byte endpoints swap (`a > v` becomes `< tag ‖ ~v`) — so the NULL slot stays outside the range
+  whether it sorts first or last;
+- the unified **key-slot skipper** (§5.1) steps over each skipped element's ordered slot: its NULL tag, or its present tag and the body — under `DESC` the inverted body, whose end the skipper finds by inverting the terminator / length bytes (the no-prefix property holds under inversion, [encoding.md §2.16](encoding.md));
+- **key-set probes** (OR / `IN` / `= ANY`, [cost.md §3](cost.md) "Multi-column secondary indexes")
+  encode each member's points as ordered slots and emit the probes in physical byte order, so a set
+  over an ordered index still streams that index's order;
+- **index-nested-loop** seeks, `UPDATE`/`DELETE` targets, and the FK reverse match seek ordered slots;
+- an **`ORDER BY` served by an index walk** ([cost.md §3](cost.md) "secondary-index order") requires
+  every `ORDER BY` key to match its index element's **direction and effective NULL placement**
+  (`ORDER BY a DESC` matches `a DESC` = `DESC NULLS FIRST`, not `a DESC NULLS LAST`). The walk is
+  forward, so ties are broken by the ascending storage-key suffix — exactly the eager stable sort.
+
+Estimates and costs are those of the equivalent ASC index (the trees have identical shapes); an
+ordered index adds candidates, never a new cost unit.
+
+**Not this slice.** A **backward** walk — serving `ORDER BY a DESC` from an `ASC` index, as
+PostgreSQL's *Index Scan Backward* does — stays a follow-on: reversing the walk also reverses the
+storage-key tie-break, which then disagrees with jed's PK-ascending tie order unless the index key is
+unique and NULL-free (the reverse-PK trap, cost.md §3). Declaring the index in the wanted order is the
+supported path.
+
+**Persistence** (`format_version` 46, [format.md](../fileformat/format.md)): `index_flags` bit4
+`has_key_options`; when set, one option byte per key element (bit0 `desc`, bit1 `nulls_first`)
+follows the index's other optional sections. The writer omits the list when every element is
+`ASC NULLS LAST` (so such an index is byte-identical to v45); a reader rejects a reserved option bit,
+the bit on a non-B-tree index, or an all-default list (`XX001`).
+
+**Introspection.** `jed_indexes` gains `descending boolean[]` and `nulls_first boolean[]`, parallel
+to `columns` — PostgreSQL's `pg_index.indoption` bits ([introspection.md §5.1](introspection.md)).
+The CLI dump re-emits the options as `pg_get_indexdef` prints them (`a DESC`, `b NULLS FIRST`,
+`c DESC NULLS LAST`).

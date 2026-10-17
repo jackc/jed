@@ -1804,7 +1804,7 @@ func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *
 			}
 		}
 	}
-	return resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys, Predicate: predicate}, nil
+	return resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys, Orders: def.keyOrders(), Predicate: predicate}, nil
 }
 
 // resolveTableIndexes resolves every index of a table once per statement (the maintenance driver —
@@ -3839,7 +3839,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	// (byte-identical to v30 then).
 	var hostDeps []hostFuncDep
 	var timezoneDeps timeZoneDeps
-	for _, elem := range ci.Keys {
+	for elemI, elem := range ci.Keys {
 		// An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the table's
 		// columns, validate it is immutable + indexable-typed, and store its canonical text
 		// (persisted, format_version 26). Expression keys are B-tree only this slice — GIN/GiST take
@@ -3862,6 +3862,27 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 		if err := db.indexColumnTypeGate(kind, columns[idx].Type); err != nil {
 			return outcome{}, err
+		}
+		// Ordering options (indexes.md §11): only an ordered B-tree takes them. PostgreSQL rejects any
+		// WRITTEN option on an unordered access method, explicit ASC included — the direction first,
+		// then the NULLS placement (0A000).
+		if kind != indexBtree {
+			var spec indexKeyOrderSpec
+			if elemI < len(ci.KeyOrders) {
+				spec = ci.KeyOrders[elemI]
+			}
+			method := "gist"
+			if kind == indexGin {
+				method = "gin"
+			}
+			if spec.Desc != nil {
+				return outcome{}, newError(FeatureNotSupported,
+					"access method \""+method+"\" does not support ASC/DESC options")
+			}
+			if spec.NullsFirst != nil {
+				return outcome{}, newError(FeatureNotSupported,
+					"access method \""+method+"\" does not support NULLS FIRST/LAST options")
+			}
 		}
 		// A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
 		ciKeys = append(ciKeys, indexKey{Col: idx})
@@ -3956,7 +3977,13 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	if err := timezoneDeps.validate(); err != nil {
 		return outcome{}, err
 	}
-	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind, Predicate: predicate, HostDeps: hostDeps, TimezoneDeps: timezoneDeps}
+	effOrders := make([]keyOrder, len(ciKeys))
+	for i := range effOrders {
+		if i < len(ci.KeyOrders) {
+			effOrders[i] = ci.KeyOrders[i].effective()
+		}
+	}
+	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind, Predicate: predicate, HostDeps: hostDeps, TimezoneDeps: timezoneDeps, Orders: canonicalKeyOrders(effOrders)}
 	// The build scan (cost.md §3): page_read per table-tree node + storage_row_read per row. The
 	// touched set is the columns the key elements read — an index column for a column key, or every
 	// column an expression key references (which may be variable-width, so a spilled value adds its
@@ -4112,7 +4139,8 @@ func (db *engine) executeReindex(rx *reindexStmt) (outcome, error) {
 // unparsed key or predicate is XX003 (unparsable-definitions.md §3.4); every expression is resolved
 // again and its host-function and timezone dependencies re-collected from the current environment
 // exactly as CREATE INDEX collects them (a missing function 42883, a no-longer-admissible one 42P17, an
-// unloaded named zone 22023). Column keys, uniqueness, method, and predicate text carry over.
+// unloaded named zone 22023). Column keys, their ordering options (§11), uniqueness, method, and
+// predicate text carry over.
 func (db *engine) readmitIndexDef(table *catTable, old *indexDef) (indexDef, error) {
 	if old.unparsed() {
 		return indexDef{}, unparsableIndexError(table.Name, old.Name)

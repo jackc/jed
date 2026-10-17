@@ -10,12 +10,13 @@ use crate::ast::{
     BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictColumn, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef,
     Delete, DropIndex, DropSequence, DropTable, DropType, DropView, ExcludeDef, Expr,
-    ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource,
-    InsertValue, JoinClause, JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing,
-    JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding,
-    QueryExpr, RefAction, Reindex, ReindexKind, ReturningClause, SavepointOp, Select, SelectItem,
-    SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement, SubscriptSpec, TableRef,
-    TableRefPos, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem, IndexKeyOrderSpec, IndexPredicate,
+    Insert, InsertSource, InsertValue, JoinClause, JoinKind, JsonBehavior, JsonOnBehavior,
+    JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
+    OrderKey, Overriding, QueryExpr, RefAction, Reindex, ReindexKind, ReturningClause, SavepointOp,
+    Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement,
+    SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update,
+    WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::ast::{CycleClause, SearchClause};
@@ -1831,9 +1832,8 @@ impl Parser {
     /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS name | name] ON <table> ( col [, col]* )`
     /// (spec/design/grammar.md §30). The optional name needs one disambiguation because no word is reserved: the
     /// word after INDEX is the index name UNLESS it is `ON` followed by a word and then `(`
-    /// — that exact three-token shape can only be the unnamed form's `ON table (`. Key
-    /// columns are bare identifiers (no expression / ordered / partial keys this slice — a
-    /// `(`/`ASC`/`DESC` after a key is the natural 42601).
+    /// — that exact three-token shape can only be the unnamed form's `ON table (`. Each key
+    /// element may be followed by `ASC`/`DESC` and `NULLS FIRST|LAST` (indexes.md §11).
     fn parse_create_index(&mut self) -> Result<CreateIndex> {
         self.expect_keyword("create")?;
         let unique = self.peek_keyword().as_deref() == Some("unique");
@@ -1881,8 +1881,10 @@ impl Parser {
         };
         self.expect(&Token::LParen)?;
         let mut keys = Vec::new();
+        let mut key_orders = Vec::new();
         loop {
             keys.push(self.parse_index_element()?);
+            key_orders.push(self.parse_index_key_order()?);
             match self.advance() {
                 Token::Comma => continue,
                 Token::RParen => break,
@@ -1910,7 +1912,46 @@ impl Parser {
             using,
             db,
             predicate,
+            key_orders,
         })
+    }
+
+    /// The optional `ASC | DESC` then `NULLS FIRST | LAST` after an index key element (indexes.md
+    /// §10, PostgreSQL's `opt_asc_desc opt_nulls_order`). A bare `NULLS` not followed by `FIRST` /
+    /// `LAST` is 42601, as in the query `ORDER BY`.
+    fn parse_index_key_order(&mut self) -> Result<IndexKeyOrderSpec> {
+        let desc = match self.peek_keyword().as_deref() {
+            Some("asc") => {
+                self.advance();
+                Some(false)
+            }
+            Some("desc") => {
+                self.advance();
+                Some(true)
+            }
+            _ => None,
+        };
+        let nulls_first = if self.peek_keyword().as_deref() == Some("nulls") {
+            self.advance();
+            match self.peek_keyword().as_deref() {
+                Some("first") => {
+                    self.advance();
+                    Some(true)
+                }
+                Some("last") => {
+                    self.advance();
+                    Some(false)
+                }
+                other => {
+                    return Err(syntax(format!(
+                        "NULLS must be followed by FIRST or LAST, found {other:?}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(IndexKeyOrderSpec { desc, nulls_first })
     }
 
     /// One `index_element` (grammar.md §30, indexes.md §1): a bare column, a bare function

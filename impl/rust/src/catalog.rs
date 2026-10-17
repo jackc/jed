@@ -303,9 +303,31 @@ pub struct IndexDef {
     /// `(name, arg_types)`.
     pub host_deps: Vec<HostFuncDep>,
     pub timezone_deps: TimeZoneDeps,
+    /// Per-key-element sort order (spec/design/indexes.md §11, `format_version` 46), parallel to
+    /// `keys`. **Empty** when every element is the default `ASC NULLS LAST` — the overwhelmingly
+    /// common index, written with no option bytes (byte-identical to v45); otherwise exactly
+    /// `keys.len()` entries. B-tree only (GIN/GiST reject `ASC`/`DESC`/`NULLS`). Read through
+    /// [`IndexDef::key_order`].
+    pub orders: Vec<crate::encoding::KeyOrder>,
 }
 
 impl IndexDef {
+    /// Key element `i`'s sort order (`ASC NULLS LAST` when the index carries no options).
+    pub fn key_order(&self, i: usize) -> crate::encoding::KeyOrder {
+        self.orders.get(i).copied().unwrap_or_default()
+    }
+
+    /// Normalize a per-element order list to the canonical form: empty when all are default.
+    pub fn canonical_orders(
+        orders: Vec<crate::encoding::KeyOrder>,
+    ) -> Vec<crate::encoding::KeyOrder> {
+        if orders.iter().all(|o| o.is_default()) {
+            Vec::new()
+        } else {
+            orders
+        }
+    }
+
     /// Whether every key element is a plain column (no expression key) — the common case, and
     /// the GIN/GiST invariant. Lets column-only code paths fast-check.
     pub fn all_columns(&self) -> bool {

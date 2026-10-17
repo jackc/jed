@@ -304,6 +304,39 @@ type indexDef struct {
 	// registry; a mismatch makes the index unusable. Sorted by (Name, ArgTypes).
 	HostDeps     []hostFuncDep
 	TimezoneDeps timeZoneDeps
+	// Orders is the per-key-element sort order (spec/design/indexes.md §11, format_version 46),
+	// parallel to Keys. EMPTY when every element is the default ASC NULLS LAST — the common index,
+	// written with no option bytes (byte-identical to v45); otherwise exactly len(Keys) entries.
+	// B-tree only (GIN/GiST reject ASC/DESC/NULLS). Read through keyOrder.
+	Orders []keyOrder
+}
+
+// keyOrder is key element i's sort order (ASC NULLS LAST when the index carries no options).
+func (d *indexDef) keyOrder(i int) keyOrder {
+	if i < len(d.Orders) {
+		return d.Orders[i]
+	}
+	return keyOrder{}
+}
+
+// keyOrders is every key element's sort order, full length (len(Keys)).
+func (d *indexDef) keyOrders() []keyOrder {
+	out := make([]keyOrder, len(d.Keys))
+	for i := range out {
+		out[i] = d.keyOrder(i)
+	}
+	return out
+}
+
+// canonicalKeyOrders normalizes a per-element order list to the canonical form: nil when all are
+// default.
+func canonicalKeyOrders(orders []keyOrder) []keyOrder {
+	for _, o := range orders {
+		if !o.isDefault() {
+			return orders
+		}
+	}
+	return nil
 }
 
 // allColumns reports whether every key element is a plain column (no expression key) — the common
