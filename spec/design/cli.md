@@ -49,8 +49,11 @@ binary).
 
 ```
 jed [OPTIONS] [DBFILE]
+jed pages [--read-only] DBFILE
 
   (no DBFILE)             transient in-memory database
+  ssh://[user@]host[:port]/path
+                          a database on another host, over ssh (below)
   --create                create DBFILE instead of opening it (58P02 if it exists)
   --readonly              open DBFILE read-only (api.md §2.1): writes fail with 25006,
                           the file is never touched
@@ -86,11 +89,38 @@ path.
 **Exit codes.** `0` success · `1` startup/usage error (bad flags; `58P01`/`58P02`/
 `XX001`/`58030` on open/create) · `2` a SQL statement failed in script mode.
 
-### 3.1 The `migrate` subcommand (the one reserved first-token verb)
+**Remote databases: `ssh://` (page-service.md §2, §13; spec/pageservice/README.md §5.3).** A DBFILE
+of the form `ssh://[user@]host[:port]/path` opens the database at `path` on `host` as a **page
+client**: the CLI runs the system `ssh` from `PATH` as `ssh [-p port] -- [user@]host 'jed pages
+<path>'` (the path single-quoted for the remote shell; `ssh://host/~/app.jed` is relative to the
+remote user's home), and that process's stdin/stdout carry the page-service connection. Everything
+else is unchanged: the CLI's own engine runs the SQL, fetching pages over SSH (with read-ahead) and
+committing through the remote owner; `--readonly` asks for a read-only connection; `--dump` works.
+The remote `jed` must be on the remote user's `PATH`. When the connection ends (the remote owner
+handed ownership on, the network dropped), the next statement runs `ssh` again. `--create` is
+refused over `ssh://` (create the file on the remote host). Authentication, host keys, and
+encryption are SSH's, from the user's ssh configuration; the CLI adds **no options** of its own for
+them. **Open question for the maintainer:** how a deployment names a remote binary that is not
+`jed` on `PATH`, or an ssh other than `ssh` (an environment variable, a flag, a URL query) — not
+decided, so nothing is configurable yet.
+
+**`jed pages [--read-only] DBFILE`** is the remote end, a second reserved first-token word (like
+`migrate`, §3.1; a file named `pages` is reached as `jed ./pages`). It serves one page-service
+connection on stdin/stdout and writes nothing else to stdout. If the database has a live owner (an
+application, another `jed`), it relays the stream to that owner's endpoint; otherwise it opens the
+database itself as an `ownership = yield` owner — serving its local endpoint too — and hands
+ownership to an application that opens with `prefer`, which ends the stream; the client's
+re-election then reaches the application through a fresh `jed pages`. `--read-only` makes the
+connection read-only whatever the client asks (and opens the file read-only when it owns), so an
+`authorized_keys` entry `command="jed pages --read-only /srv/app.jed"` restricts a key to reads of
+one database. A failure to open (`58P01`, …) is reported to the client on the stream and to stderr;
+exit status `0` when the connection ended, `1` otherwise.
+
+### 3.1 The `migrate` subcommand (a reserved first-token verb)
 
 The CLI bundles the **`jed-migrate` Rust crate** (`/migrate`, spec `/migrate/design.md`) so schema
 migrations ship in the CLI with no separate binary — "the command line tool will bundle it in as
-well." This introduces the CLI's **first and only reserved first-token word**: if the first token is
+well." This introduced the CLI's **first reserved first-token word** (`pages`, §3, is the second): if the first token is
 the literal **`migrate`**, everything after it is the migration subcommand; **any other first token
 is the DBFILE, exactly as above** (the `jed [OPTIONS] [DBFILE]` grammar is untouched for every
 non-`migrate` invocation). The only collision — a database file literally named `migrate` (no

@@ -1,6 +1,6 @@
 # Page service — one owner process, page-level clients — design
 
-> **Status: RATIFIED DESIGN (2026-10-16); phases 1–4 and 6 landed, 5 and 7 to come (§16).** This document
+> **Status: RATIFIED DESIGN (2026-10-16); phases 1–6 landed, 7 to come (§16).** This document
 > replaced the earlier shared multi-process protocol with a single **owner** process that alone
 > touches the database file and serves **pages** to every other process over a local endpoint, and
 > extends the same service over SSH for remote access, backup, and replication. The message catalog,
@@ -193,6 +193,23 @@ Fetches are batched. The client pager requests read-ahead on leaf chains (the ne
 an interior already in hand) and, for scans, can request every page under a subtree root in one
 message. Read-ahead is a pager policy, invisible to cost: page reads remain logical units
 ([cost.md](cost.md)), so a query's cost is identical through the service and on a local file.
+
+**As built (phase 5).** Read-ahead is entirely client-side and uses the ordinary `read_pages`, so the
+protocol is unchanged. When a scan descends into a demand-paged leaf of an interior node it holds
+(every interior is resident, so the leaves an interior names are known without a fetch), it hints
+that leaf together with the following leaves of the same interior that the scan will visit, in visit
+order and inside the scan's key bounds. The hint window starts at **one** leaf, so a scan that stops
+after its first leaf (a `LIMIT`) fetches nothing extra, and doubles with each hint up to **64**, so a
+long scan fetches leaves 64 to a request: every leaf under an interior with at most 64 children (the
+subtree fetch) in one message. The pool takes the fetched pages through the same decode a fault
+uses, skipping pages already resident or loading, at most a quarter of the pool at a time; its
+invalidation is therefore the pool's (§5.4), and a failed read-ahead is ignored (the fault that
+follows reads the page and reports any error). A request names at most the `hello_ok`
+`max_read_pages`. Read-ahead is on for clients over the stream transport (the SSH case,
+[spec/pageservice/README.md](../pageservice/README.md) §5.3), whose round trips cross a network; a
+local-socket client still fetches one leaf per fault, which keeps the deterministic simulator's frame
+counts and the cross-core local behavior unchanged. Rust implements it; Go and TS have no stream
+transport yet. Point lookups fetch only their path (one leaf), as before.
 
 ### 5.4 Client cache coherence
 
@@ -675,6 +692,14 @@ native code (the OS locks still use `impl/ts/native-lock`):
 
 Not every core needs to serve: the browser has one process, and WASI has no OS file locks.
 
+**The stream transport (SSH, phase 5)** is Rust-only for now: `Database::open_remote` (the client)
+and `Database::serve_page_stream` (`jed pages`, the serving end) — so the CLI, and Rust programs,
+reach remote databases. The owner a `jed pages` relays to may be any core, and a `jed pages` that
+owns serves local clients of every core (the `service_stream` process scenario). Go and TS clients
+over a stream are not required by any use case yet (§1 use cases 1–4 are the CLI's); their local
+clients already speak the identical protocol, so adding one is a transport, not a protocol, change.
+Unix only, like serving.
+
 **Endpoint mechanics (decided at ratification; exact layout in
 [spec/pageservice/README.md](../pageservice/README.md) §5):**
 
@@ -731,8 +756,15 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
    ([spec/pageservice/README.md](../pageservice/README.md) §6.5); the process-corpus rewrite;
    simulation testing of an owner and its clients ([simulation-testing.md](simulation-testing.md) §14
    S8); retiring shared mode and the `shared` option; the new bundle marker.
-5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree
-   fetch.
+5. ✅ **SSH** (landed, Rust and the CLI): the stream transport and `jed pages`
+   ([spec/pageservice/README.md](../pageservice/README.md) §5.3, [cli.md](cli.md) §3), the CLI
+   opening `ssh://[user@]host[:port]/path` through the system `ssh`, client-side read-ahead and
+   subtree fetch over the existing `read_pages` (§5.3; no wire change). Proven by the
+   `service_stream` process scenario (a Rust stream client against owners of every core), Rust
+   host-API tests, and the CLI's e2e tests with a fake `ssh`; `bench:page_service` adds the
+   `stream_cold_scan` lanes. **Open question:** how a deployment configures the remote binary
+   (anything but `jed` on the remote `PATH`) and the ssh command — not decided, so nothing is
+   configurable yet. Go and TS gain a stream transport when a program needs remote access from them.
 6. ✅ **Backup** (landed): page-identical and compacted forms, the client walking its own pinned
    snapshot (§9, [spec/pageservice/README.md](../pageservice/README.md) §6.6); the host API's public
    name is open.

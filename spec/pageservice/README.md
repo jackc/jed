@@ -294,6 +294,37 @@ checks it on `connect`, so only processes of the owner's user can connect (page-
 Windows serving is not yet specified (page-service.md §14): there `auto` is a non-serving owner
 (`exclusive`, locking.md §1).
 
+### 5.3 The stream transport (phase 5)
+
+The same protocol, byte for byte, runs over any pair of byte pipes: a remote client reaches the owner
+of a database on another machine through a child process's stdin and stdout — `ssh host jed pages
+/path` (cli.md §3) — with no listening port. Framing, messages, and every rule above are unchanged;
+the transport only replaces how a connection is made.
+
+- **The client** runs the transport command once per connection. It never owns: there is no bundle
+  on its side, so its election (§6.1) always finds a serving owner and "dials" it by running the
+  command, and its re-election after a lost connection (§6.5) runs it again; `commit_status` (§6.4)
+  resolves a lost acknowledgement through the new connection as through a local one. Its ownership
+  preference is `never` whatever was asked. An open that cannot complete a `hello` before
+  `file_lock_timeout_ms` fails `08006` with the transport's standard error; a fatal `error` answering
+  the `hello` (`58P01` for a missing file, `0A000`, `53300`) is the open's error.
+- **The serving end** (`jed pages [--read-only] DBFILE`) reads the first frame, which must be
+  `hello` (anything else is answered with a fatal `08P01`), and sets its read-only flag when started
+  with `--read-only`. Then:
+  1. if the owner record (§5.1) names a serving owner of this user whose endpoint accepts a
+     connection, it writes the (possibly rewritten) `hello` to that endpoint and relays bytes in both
+     directions until either side ends;
+  2. otherwise it opens the database under `locking = auto` as an `ownership = yield` owner (read-only
+     with `--read-only`) and serves the stream as one more connection of that owner, alongside its
+     own endpoint. It exits when the stream ends. A `prefer` opener that asks for ownership gets it
+     (§6.5), which ends the stream; the client's re-election reaches the new owner through a fresh
+     `jed pages` (step 1). If the open makes it a client instead (another process won the election),
+     it closes that handle and retries step 1;
+  3. a failure to open is answered with a fatal `error` frame for the `hello`.
+- Only the Rust core (and so the CLI) has a stream transport so far; the owners it relays to may be
+  any core. Go and TypeScript clients reach a remote database the same way once they gain one; the
+  wire contract needs nothing more.
+
 ## 6. Roles under `locking = auto` (phases 2–4)
 
 The behavior every core implements for the read path, the write path, and handoff. It is host state, so the real-process corpus

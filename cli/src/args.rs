@@ -36,8 +36,11 @@ pub struct Args {
 
 pub const USAGE: &str = "\
 usage: jed [OPTIONS] [DBFILE]
+       jed pages [--read-only] DBFILE   (the remote end of ssh://; jed pages --help)
 
   (no DBFILE)             transient in-memory database
+  ssh://[user@]host[:port]/path
+                          open a database on another host: runs `ssh host jed pages path`
   --create                create DBFILE instead of opening it
   --readonly              open DBFILE read-only: writes fail with 25006, the file is never touched
   --page-size N           with --create: the page size locked into the file

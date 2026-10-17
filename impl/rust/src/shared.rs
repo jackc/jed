@@ -2750,7 +2750,7 @@ impl Database {
 
     /// Open a database that another machine (or process) serves over a stream: a page client whose
     /// connection is the standard input and output of `command`, run once per connection
-    /// (spec/pageservice/README.md §5.4). The CLI opens `ssh://host/path` as
+    /// (spec/pageservice/README.md §5.3). The CLI opens `ssh://host/path` as
     /// `["ssh", "host", "jed", "pages", "/path"]`. `name` identifies the database in this process
     /// (one handle per name, like a path) and is what [`path`](Self::path) reports.
     ///
@@ -2790,7 +2790,7 @@ impl Database {
 
     /// Serve one page-service connection on `input`/`output` for the database at `path` until it
     /// ends: the serving side of [`open_remote`](Self::open_remote), run by `jed pages`
-    /// (spec/pageservice/README.md §5.4). The stream is relayed to the database's live owner when it
+    /// (spec/pageservice/README.md §5.3). The stream is relayed to the database's live owner when it
     /// has one; otherwise this process opens the database as a `yield` owner (read-only when
     /// `read_only`), which keeps serving its local endpoint too. `read_only` also makes the
     /// connection read-only whatever the client asks. Unix only.

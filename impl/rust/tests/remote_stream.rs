@@ -1,4 +1,4 @@
-//! The page service's stream transport (spec/pageservice/README.md §5.4): `Database::open_remote`
+//! The page service's stream transport (spec/pageservice/README.md §5.3): `Database::open_remote`
 //! over a transport command and `Database::serve_page_stream` (`jed pages`) on the other end. These
 //! are host-API tests (CLAUDE.md §10). The transport here is an in-process `serve_page_stream` over
 //! OS pipes, which is what `ssh host jed pages /path` runs on the far side; the real-process corpus
@@ -6,7 +6,7 @@
 //! reaches a remote host.
 #![cfg(unix)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use jed::value::Value;
 use jed::{CreateOptions, Database, OpenOptions};
@@ -20,9 +20,9 @@ fn tmp(name: &str) -> PathBuf {
     path
 }
 
-fn create(path: &PathBuf) {
+fn create(path: &Path) {
     let mut db = Database::create(CreateOptions {
-        path: Some(path.clone()),
+        path: Some(path.to_path_buf()),
         ..CreateOptions::default()
     })
     .unwrap();
@@ -36,7 +36,7 @@ fn create(path: &PathBuf) {
     db.close().unwrap();
 }
 
-fn open_remote(serve: &str, path: &PathBuf) -> jed::Result<Database> {
+fn open_remote(serve: &str, path: &Path) -> jed::Result<Database> {
     Database::open_remote_in_process(
         path,
         serve == "pages-read-only",
@@ -47,7 +47,7 @@ fn open_remote(serve: &str, path: &PathBuf) -> jed::Result<Database> {
 
 /// Open `path` locally once the in-process server of a closed remote handle has closed its own
 /// handle (the far side of a real transport is another process, which exits instead).
-fn open_after_server_exits(path: &PathBuf) -> Database {
+fn open_after_server_exits(path: &Path) -> Database {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match Database::open(path) {

@@ -675,7 +675,7 @@ impl PageServiceOwner {
     }
 
     /// Serve one more connection, accepted on the endpoint or handed over by the host (the stdio
-    /// transport of `jed pages`, spec/pageservice/README.md §5.4). A connection added after the
+    /// transport of `jed pages`, spec/pageservice/README.md §5.3). A connection added after the
     /// owner stopped serving is closed at once.
     pub(crate) fn add_connection(self: &Arc<Self>, stream: Box<dyn PsStream>) -> Added {
         {

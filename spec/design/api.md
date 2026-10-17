@@ -174,6 +174,19 @@ unmetered. File attachments carry these fields in `AttachSource::file(path, opti
 their idiomatic options structs (`locking`, `file_lock_timeout_ms` / `Locking`, `FileLockTimeoutMs` /
 `locking`, `fileLockTimeoutMs`). In-memory databases have no bundle and ignore file-lock options.
 
+**Remote databases — the stream transport (Rust, Unix; [spec/pageservice/README.md](../pageservice/README.md)
+§5.3).** `Database::open_remote(command, name, opts)` opens a database another machine serves: a page
+client whose connection is the stdin/stdout of `command` (`["ssh", "--", "host", "jed pages
+'/srv/app.jed'"]` for the CLI's `ssh://host/srv/app.jed`), run once per connection. `name` stands for
+the path: it is the handle's process-local identity and what `path()` reports. The handle is an
+ordinary page client — its own engine, environment, and session envelope — that never owns
+(`opts.ownership` is ignored) and re-runs the command when the connection ends; `opts.read_only`
+asks for a read-only connection, `opts.file_lock_timeout_ms` bounds each election, and an open that
+reaches nothing fails `08006` with the command's stderr. `Database::serve_page_stream(path, opts,
+read_only, input, output)` is the far side (`jed pages`): it relays the stream to the database's live
+owner, or owns the database as a `yield` owner and serves the stream, returning when the stream ends.
+Go and TS have no stream transport yet (page-service.md §14).
+
 **Work-memory budget — a handle setting ([spill.md](spill.md) §3).** `open`'s `opts.work_mem`
 (Rust `OpenOptions { work_mem }` / Go `OpenOptions { WorkMem }` / TS `{ workMem }`; default
 **`DEFAULT_WORK_MEM = 256 MiB`**) bounds resident row/state buffers before **spilling to disk**:
