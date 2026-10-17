@@ -1,0 +1,121 @@
+schema_version = 1
+name = "service-stream-transport"
+description = "Page service phase 5: a page client over the stream transport (what `jed ssh://host/path` runs, with the actor serving `pages` in place of `ssh host jed pages`). The transport relays to the live owner; when the owner leaves, the client's re-election runs the transport again, which owns the file itself as a yield owner; an application that then opens with prefer takes ownership from it, and the stream client reconnects to the application. The stream client and its transport are the Rust core (the only core with a stream transport); the owners are every core."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, v text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 100) FROM generate_series(1, 500) g"
+
+# The stream client: its transport finds a's owner record and relays to a's endpoint.
+[[step]]
+actor = "b"
+core = "rust"
+command = "start"
+argument = "open-remote"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64 FROM t"
+expect = "500:125250"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1000, 'through the relay')"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "501"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "DELETE FROM t WHERE id <= 100"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "401"
+
+# The owner leaves. The stream client re-elects by running the transport again; with no owner left,
+# the transport opens the file as a yield owner and serves the stream itself.
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "401"
+retry_ms = 5000
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1001, 'transport owns')"
+
+# An application opens with prefer: it takes ownership from the yielding transport, whose stream then
+# ends; the stream client's next transport relays to the application.
+[[step]]
+actor = "c"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "c"
+command = "role"
+expect = "owner"
+retry_ms = 8000
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "402"
+retry_ms = 8000
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1002, 'after the yield')"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT id FROM t WHERE id >= 1000 ORDER BY id"
+expect = "1000,1001,1002"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "c"
+command = "close"
