@@ -10047,8 +10047,9 @@ export class Engine {
       // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
       ciKeys.push({ kind: "column", column: idx });
     }
-    // GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an inverted
-    // index) and a single column only — both deferred 0A000.
+    // GIN has no uniqueness (undefined for an inverted index — spec/design/gin.md §3, 0A000). A
+    // multi-column GIN takes up to 32 key columns (PostgreSQL's INDEX_MAX_KEYS, 54011), each with
+    // its own operator class (§4.4).
     if (kind === "gin") {
       if (ci.unique) {
         throw engineError(
@@ -10056,8 +10057,11 @@ export class Engine {
           "access method gin does not support unique indexes",
         );
       }
-      if (ciKeys.length !== 1) {
-        throw engineError("feature_not_supported", "a multi-column gin index is not supported yet");
+      if (ciKeys.length > GIN_MAX_KEY_COLUMNS) {
+        throw engineError(
+          "too_many_columns",
+          `cannot use more than ${GIN_MAX_KEY_COLUMNS} columns in an index`,
+        );
       }
     }
     // GiST narrowings (gist.md §1/§5/§11): no uniqueness (express it as EXCLUDE … WITH =, GX3) and a
@@ -10973,7 +10977,10 @@ export class Engine {
         const u = store.scanWithUnits(mask);
         return { entries: u.entries, pages: u.pages, slabs: u.slabs };
       }
-      queries.push({ strategy: arm.strategy, terms: extracted.terms });
+      queries.push({
+        strategy: arm.strategy,
+        terms: extracted.terms.map((t) => ginTaggedTerm(gb.tag, t)),
+      });
     }
 
     // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
@@ -24024,6 +24031,9 @@ export type GinBound = {
   // desugars to one) whose every disjunct holds an accelerable conjunct on this column, in source
   // order. Empty for the ordinary single-conjunct bound; non-empty, strategy is the first arm's.
   orArms: GinStrategy[];
+  // A multi-column GIN index's column tag for the bound's column (gin.md §4.4), prefixed to every
+  // query term; null for a single-column index.
+  tag: number | null;
 };
 
 // ginStructuralSelectivity is a GIN bound's structural access selectivity (estimator.md §7): its
@@ -25032,6 +25042,16 @@ function statisticsGinEstimate(
   return { rows, entries, totalEntries };
 }
 
+// statisticsGinTotalEntries is a term-eligible column's estimated total GIN term occurrences at its
+// current row count (statistics.md §6.1), or null without term facts.
+function statisticsGinTotalEntries(rel: ScopeRel, column: number, engine: Engine): bigint | null {
+  const fact = engine.estimatorColumnStatistics(rel.db, rel.table.name, column);
+  if (fact === undefined || fact.terms === null) return null;
+  const current = currentColumnStatistics(engine, rel, column);
+  if (current === null) return null;
+  return statisticsScale(current.rows, fact.terms.occurrences, fact.analyzedRows);
+}
+
 // statisticsGinOperandValue is a GIN query operand's plan-time value (statistics.md §6.1): a literal,
 // a folded array literal, or a one-dimensional ARRAY[...] of literals.
 function statisticsGinOperandValue(operand: RExpr): Value | null {
@@ -25130,10 +25150,21 @@ function ginCandidateTermEstimate(
     if (estimate.rows > current.nonnullRows) estimate.rows = current.nonnullRows;
   }
   if (estimate === null) return null;
+  // A multi-column index's entries span every key column (gin.md §4.4): its total is the sum of each
+  // column's term occurrences (a column without term facts contributes none).
+  let total = estimate.totalEntries;
+  if (gb.tag !== null) {
+    const idx = rel.table.indexes.find((i) => i.name === gb.nameKey);
+    if (idx !== undefined) {
+      total = 0n;
+      for (const c of indexColumnOrdinals(idx) ?? [])
+        total = saturatingEstimateAdd(total, statisticsGinTotalEntries(rel, c, engine) ?? 0n);
+    }
+  }
   const index = engine.estimatorIndexStore(rel.db, gb.nameKey);
   const nodes = BigInt(index.nodeCount());
   const height = BigInt(index.height());
-  const totalEntries = estimate.totalEntries < 1n ? 1n : estimate.totalEntries;
+  const totalEntries = total < 1n ? 1n : total;
   const pages = estimatorClampPages(
     statisticsScale(nodes, estimate.entries, totalEntries),
     nodes,
@@ -27560,23 +27591,25 @@ export function inventoryINLCandidates(
   }
   for (const idx of rel.table.indexes) {
     if (idx.kind !== "gin") continue;
-    const ci = indexFirstColumn(idx);
-    const colGlobal = rel.offset + ci;
-    const colType = rel.table.columns[ci]!.type;
-    const opclass = ginOpclassOf(colType);
-    if (opclass === null) continue;
-    for (const filter of filters) {
-      const m = ginSiblingMatch(filter, colGlobal, opclass, siblingRange);
-      if (m !== null)
-        candidates.push(
-          storageOrderCandidate(
-            "gin",
-            idx.name,
-            { kind: "gin", gin: ginBoundOf(idx.name, colType, m.strategy, colGlobal) },
-            whereFilter,
-          ),
-        );
-      if (candidates.at(-1)?.identity.indexName === idx.name) break;
+    const cols = indexColumnOrdinals(idx) ?? [];
+    // Each key column in key order; the first with a sibling-operand conjunct is the bound.
+    columns: for (let pos = 0; pos < cols.length; pos++) {
+      const ci = cols[pos]!;
+      const colGlobal = rel.offset + ci;
+      const colType = rel.table.columns[ci]!.type;
+      const opclass = ginOpclassOf(colType);
+      if (opclass === null) continue;
+      for (const filter of filters) {
+        const m = ginSiblingMatch(filter, colGlobal, opclass, siblingRange);
+        if (m !== null) {
+          const gin = {
+            ...ginBoundOf(idx.name, colType, m.strategy, colGlobal),
+            tag: ginColumnTag(cols.length, pos),
+          };
+          candidates.push(storageOrderCandidate("gin", idx.name, { kind: "gin", gin }, whereFilter));
+          break columns;
+        }
+      }
     }
   }
   candidates.sort((a, b) => {
@@ -27760,19 +27793,40 @@ export function buildGinBoundForIndex(
   offset: number,
 ): GinBound | null {
   if (idx.kind !== "gin") return null;
-  const ci = indexFirstColumn(idx);
-  const colGlobal = offset + ci;
-  const colType = columns[ci]!.type;
-  const opclass = ginOpclassOf(colType);
-  if (opclass === null) return null; // defensive: CREATE INDEX enforces an operator class
-  const m = ginMatch(filter, colGlobal, opclass);
-  if (m !== null) return ginBoundOf(idx.name, colType, m.strategy, colGlobal);
+  const cols = indexColumnOrdinals(idx) ?? [];
+  // A multi-column index serves a query on any of its columns (gin.md §4.4): the first key column, in
+  // key order, with a single accelerable conjunct is the bound; failing that, the first with a
+  // disjunctive one (§6.3).
+  for (let pos = 0; pos < cols.length; pos++) {
+    const ci = cols[pos]!;
+    const colType = columns[ci]!.type;
+    const opclass = ginOpclassOf(colType);
+    if (opclass === null) continue; // defensive: CREATE INDEX enforces an operator class
+    const m = ginMatch(filter, offset + ci, opclass);
+    if (m !== null)
+      return {
+        ...ginBoundOf(idx.name, colType, m.strategy, offset + ci),
+        tag: ginColumnTag(cols.length, pos),
+      };
+  }
   // No single accelerable conjunct: an OR conjunct whose every arm is one (an IN list over the
   // column) bounds the scan by the union of the arms' gathers (gin.md §6.3).
-  const or = ginOrMatch(filter, colGlobal, opclass);
-  if (or === null) return null;
-  const arms = ginOrArms(or).map((arm) => ginMatch(arm, colGlobal, opclass)!.strategy);
-  return { ...ginBoundOf(idx.name, colType, arms[0]!, colGlobal), orArms: arms };
+  for (let pos = 0; pos < cols.length; pos++) {
+    const ci = cols[pos]!;
+    const colType = columns[ci]!.type;
+    const opclass = ginOpclassOf(colType);
+    if (opclass === null) continue;
+    const colGlobal = offset + ci;
+    const or = ginOrMatch(filter, colGlobal, opclass);
+    if (or === null) continue;
+    const arms = ginOrArms(or).map((arm) => ginMatch(arm, colGlobal, opclass)!.strategy);
+    return {
+      ...ginBoundOf(idx.name, colType, arms[0]!, colGlobal),
+      orArms: arms,
+      tag: ginColumnTag(cols.length, pos),
+    };
+  }
+  return null;
 }
 
 // ginOrMatch finds the disjunctive GIN conjunct (gin.md §6.3): the first conjunct of the WHERE
@@ -27808,6 +27862,7 @@ export function ginBoundOf(
     strategy,
     colGlobal,
     orArms: [],
+    tag: null,
   };
 }
 
@@ -28768,25 +28823,52 @@ export function isGistDeferredScalarType(ty: Type): boolean {
 // they appear in no posting list). Returned sorted by term (= encoded-byte order, order-preserving
 // for every admitted element type); terms dedup by their canonical encoded bytes (so a float -0/+0,
 // two NaNs, or span-equal intervals like 1 mon/30 days are one term).
+//
+// A multi-column index (gin.md §4.4) prefixes each column's terms with its column tag — the 0-based
+// key position as one byte — so the entries are tag ‖ term ‖ storage key.
 export function ginEntries(
   columns: Column[],
   cols: number[],
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
-  const ci = cols[0]!;
-  const colType = columns[ci]!.type;
-  if (!typeIsJsonb(colType) && colType.kind !== "array")
-    throw new Error("a GIN index column is an array or jsonb (CREATE INDEX gate)");
-  // A large array or document spills like any variable-width value, so a stored row's value may be
-  // deferred; it must be resolved — skipping it would silently drop (or fail to remove) its posting
-  // entries.
-  return ginValueTerms(colType, residentValue(row[ci]!)).map((term) => {
-    const out = new Uint8Array(term.length + storageKey.length);
-    out.set(term, 0);
-    out.set(storageKey, term.length);
-    return out;
+  const out: Uint8Array[] = [];
+  cols.forEach((ci, pos) => {
+    const colType = columns[ci]!.type;
+    if (!typeIsJsonb(colType) && colType.kind !== "array")
+      throw new Error("a GIN index column is an array or jsonb (CREATE INDEX gate)");
+    const tag = ginColumnTag(cols.length, pos);
+    // A large array or document spills like any variable-width value, so a stored row's value may
+    // be deferred; it must be resolved — skipping it would silently drop (or fail to remove) its
+    // posting entries.
+    for (const term of ginValueTerms(colType, residentValue(row[ci]!))) {
+      const tagged = ginTaggedTerm(tag, term);
+      const entry = new Uint8Array(tagged.length + storageKey.length);
+      entry.set(tagged, 0);
+      entry.set(storageKey, tagged.length);
+      out.push(entry);
+    }
   });
+  return out;
+}
+
+// GIN_MAX_KEY_COLUMNS is the most key columns a GIN index takes (gin.md §4.4) — PostgreSQL's
+// INDEX_MAX_KEYS; each entry's column tag is one byte.
+export const GIN_MAX_KEY_COLUMNS = 32;
+
+// ginColumnTag is the column tag a GIN index over keyCount columns prefixes to the terms of its key
+// position pos (gin.md §4.4): null for a single-column index, else the 0-based position (one byte).
+export function ginColumnTag(keyCount: number, pos: number): number | null {
+  return keyCount > 1 ? pos : null;
+}
+
+// ginTaggedTerm is tag ‖ term, or the bare term when untagged.
+export function ginTaggedTerm(tag: number | null, term: Uint8Array): Uint8Array {
+  if (tag === null) return term;
+  const out = new Uint8Array(term.length + 1);
+  out[0] = tag;
+  out.set(term, 1);
+  return out;
 }
 
 // ginValueTerms is one value's GIN term set (gin.md §4): its distinct terms in ascending byte order —

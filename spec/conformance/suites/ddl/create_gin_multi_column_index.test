@@ -1,0 +1,54 @@
+# Multi-column GIN indexes — CREATE INDEX … USING gin (a, b, …) (spec/design/gin.md §3/§4.4). Each
+# key column takes its own operator class (array_ops over an admitted array, jsonb_ops over jsonb),
+# so a multi-column GIN may mix array and jsonb columns, and may repeat a column (PostgreSQL allows
+# both). The auto-name joins the column names like any index; a column with no GIN operator class
+# fails the whole index (42704), and more than 32 key columns is 54011 (PostgreSQL's
+# INDEX_MAX_KEYS). The build scan charges like any GIN build — one table scan, whatever the column
+# count. Rows and errors match PostgreSQL. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gin_multi_column, dml.insert, dml.insert_multi_row, types.i32, types.text, types.array, types.jsonb, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], doc jsonb, words text[], n i32)
+
+statement ok
+INSERT INTO t VALUES
+  (1, ARRAY[1,2], '{"a": 1}', ARRAY['x'], 1),
+  (2, NULL, '["b"]', NULL, 2),
+  (3, '{}', NULL, ARRAY['y', 'z'], 3)
+
+# one table scan builds every column's entries: page_read(1) + 3 storage_row_read
+# cost: 4
+statement ok
+CREATE INDEX t_multi ON t USING gin (tags, doc, words)
+
+# the auto-name joins the key column names
+statement ok
+CREATE INDEX ON t USING gin (doc, tags)
+
+statement ok
+DROP INDEX t_doc_tags_idx
+
+# a repeated column is allowed
+statement ok
+CREATE INDEX t_twice ON t USING gin (tags, tags)
+
+# a column with no GIN operator class fails the whole index
+statement error 42704
+CREATE INDEX t_bad ON t USING gin (tags, n)
+
+statement error 0A000
+CREATE UNIQUE INDEX t_bad ON t USING gin (tags, doc)
+
+statement error 54011
+CREATE INDEX t_wide ON t USING gin (tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags)
+
+# 32 columns is the limit
+statement ok
+CREATE INDEX t_wide ON t USING gin (tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, tags, doc)
+
+statement ok
+DROP INDEX t_wide
+
+# cost: 0
+statement ok
+DROP INDEX t_multi

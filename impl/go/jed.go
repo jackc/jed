@@ -69,6 +69,7 @@ var SupportedCapabilities = []string{
 	// built + maintained on every write, persisted (format_version 13). The query-side planner
 	// bound is query.gin_scan. spec/design/gin.md
 	"ddl.gin_index",
+	"ddl.gin_multi_column",
 	// GiST indexes — CREATE INDEX ... USING gist over a range column (range_ops); the on-disk
 	// R-tree (pages 5/6, format_version 20). Query-side bound is query.gist_scan. spec/design/gist.md GX1
 	"ddl.gist_index",

@@ -19,7 +19,7 @@
 ## 1. Surface
 
 ```sql
-CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
+CREATE [UNIQUE] INDEX [name] ON table USING gin (col [, col …])
 ```
 
 - **A GIN index is a new index *kind*.** Everything an ordinary index has — the relation
@@ -28,16 +28,17 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   ([indexes.md §2/§6](indexes.md)); only **how entries are derived from a row** and **how a
   query uses it** differ. The default kind (no `USING`, or `USING btree`) is the ordered
   B-tree; `USING gin` selects this one.
-- **One column: a `jsonb` column (`jsonb_ops`, §2.1) or an array (`array_ops`).** The operator
+- **Each key column a `jsonb` column (`jsonb_ops`, §2.1) or an array (`array_ops`).** The operator
   class is implied by the column type — there is no explicit opclass syntax and none is persisted.
+  A GIN index may list up to 32 key columns, each with its own operator class (§4.4).
   For an array, a single column whose element type is one of the integers (`i16[]` / `i32[]` /
   `i64[]`), `boolean[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, the binary floats
   `f32[]` / `f64[]`, `interval[]`, `text[]`, `bytea[]`, or `decimal[]` — every scalar element type
   whose order-preserving key encoding has landed ([encoding.md §2.1](encoding.md), [§2.4](encoding.md)
   for text, [§2.5](encoding.md) for decimal, [§2.6](encoding.md) for bytea, [§2.8](encoding.md) for
   floats, [§2.10](encoding.md) for interval), the keys an ordered-index / `PRIMARY KEY` column
-  accepts. A multi-column GIN, and arrays of composite, `jsonb`, or other non-scalar elements, are
-  `0A000` this slice (§3, §10). A `json` column has no GIN operator class (`42704`, as in
+  accepts. Arrays of composite, `jsonb`, or other non-scalar elements are `0A000` this slice (§3,
+  §10). A `json` column has no GIN operator class (`42704`, as in
   PostgreSQL).
 - **Accelerates `@>`, `&&`, `const = ANY(col)` membership, and array `=`.** A `WHERE`
   conjunct `col @> const` (contains), `col && const` (overlaps), `const = ANY(col)` (the
@@ -227,8 +228,9 @@ like a type name.
      depend on the collation (§4.2).
 4. **`UNIQUE` with `USING gin`** is **0A000** (uniqueness is undefined for an inverted
    index — §1; PG raises `0A000` too: "access method gin does not support unique indexes").
-5. **More than one key column** with `USING gin` is **0A000** this slice (PG *would* build a
-   multicolumn GIN — divergence, override).
+5. **More than 32 key columns** is **54011** ("cannot use more than 32 columns in an index",
+   PostgreSQL's `INDEX_MAX_KEYS`). Each key column passes step 3 in key order; a column may repeat
+   (PostgreSQL allows it). An expression key is `0A000` for GIN, as before.
 6. The explicit name, if any, is checked against the relation namespace — **42P07** (§
    [indexes.md §2](indexes.md), unchanged).
 
@@ -365,6 +367,37 @@ decimal term = decimal-order-preserving(element)[0 .. min(k, 128)]
   decimal (a whole key of exactly 128 bytes ends in its terminator), and for bytea the recheck
   separates the 128-byte value from its longer extensions. PostgreSQL's `array_ops` stores whole
   elements and has no cut.
+
+### 4.4 Multi-column indexes: the column tag
+
+A GIN index over several key columns holds every column's entries in one entry tree, each prefixed
+by its **column tag** — the column's 0-based key position as one byte, PostgreSQL's per-entry
+attribute number (`gin_index_getattr`):
+
+```
+entry_key = column_tag (u8) ‖ term ‖ row_storage_key      (a multi-column index)
+entry_key = term ‖ row_storage_key                          (a single-column index — unchanged)
+```
+
+The term is the column's own opclass term (§4, §4.1–§4.3), so a multi-column index may mix an
+array and a `jsonb` column. The tag keeps the columns' posting lists apart — `tag ‖ term` is the
+posting prefix, self-delimiting because the tag is one byte and the term self-delimits — and a
+repeated column (`USING gin (a, a)`) stores the same terms under two tags. Entries ascend by tag,
+then term, then storage key, so the build's sort (§5) and the from-scratch tree shape stay a function
+of the entry set. A single-column index has no tag, as in PostgreSQL, so its bytes are unchanged.
+
+**Queries.** A query on any key column can use the index (PostgreSQL's multicolumn GIN). The bound
+takes the first key column, in key order, with an accelerable conjunct, then — failing any — the
+first with an accelerable disjunction (§6.3); its query terms are prefixed with that column's tag
+and gathered exactly as for a single-column index (the skip-scan's spans and leaf groups read the
+tagged ranges). The sibling index-nested-loop bound (§6.1) tries each key column likewise. Conjuncts
+on two columns of one index are not combined into one gather — one column bounds, the residual
+filter applies the rest — and an `OR` across two columns is not a GIN bound (narrowings, §10).
+
+**Estimates.** Term statistics are per column ([statistics.md §4.5](statistics.md)), so a multi-column
+bound's rows and `gin_entry` come from its column's facts unchanged; only its page estimate scales
+against the index's total entries, the sum of every key column's estimated term occurrences (a column
+without term facts contributes none).
 
 **Term extraction is a SET (dedup is mandatory, not an optimization).** A row
 `{1, 1, 2}` yields the terms `{1, 2}` — one entry each. Two `1` entries for one row would
@@ -613,6 +646,13 @@ exactly as a table tree — is unchanged ([indexes.md §6](indexes.md)); a GIN e
 bytes* differ (term ‖ storage-key, §4), but the page/record framing does not. Each version
 is a clean break (CLAUDE.md §1); a reader accepts only version 13.
 
+**Multi-column GIN (`format_version` 43).** The catalog entry is unchanged — its key ordinal list
+already holds several columns — but a reader now admits a GIN index with 1–32 key columns (each with
+a GIN operator class; anything else is `XX001`), and a multi-column index's entries carry the column
+tag of §4.4. Older readers would misread such an index, hence the version bump; every single-column
+GIN is byte-identical to v42. `fixtures/gin_multi_table.jed` pins the tagged entries of a GIN over an
+`i32[]` and a `jsonb` column.
+
 `jsonb_ops` needs no format change: the operator class follows from the indexed column's catalog
 type (`jsonb` → `jsonb_ops`, an array → `array_ops`), so a reader recovers it without a new byte.
 `fixtures/gin_jsonb_table.jed` pins its entry bytes: a GIN index over a `jsonb` column whose rows
@@ -674,7 +714,9 @@ rows, `gin_entry` reads, and index pages, and the predicate's logical selectivit
   oracle-override-ledgered.
 - **`text[]`, `bytea[]`, and `decimal[]` terms are cut at 128 bytes** (§4.2, §4.3) — PG keeps the
   whole element. Lossy and rechecked; unobservable in results.
-- **Single-column only** — PG supports multicolumn GIN; jed is `0A000` this slice (§3).
+- **Multi-column GIN** matches PostgreSQL's surface (§4.4), with two plan narrowings: conjuncts on
+  two columns of one index are not combined into one scan (PG combines them in one index scan), and
+  an `OR` across two columns is not a bound. Same rows either way.
 - **`<@` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a broad scan +
   recheck); jed runs `<@` by full scan this slice (a cost/plan difference, never a result
   difference — §10). `IN` lists and `OR`s of GIN arms on one index are accelerated as PG's
@@ -734,7 +776,9 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
 - **More operators** — `<@` (contained-by, a broad scan + recheck). (`const = ANY(col)`
   membership, array `=`, and `IN` lists / `OR`s of GIN arms have landed — §1/§6/§6.3.) An `OR`
   whose arms use different indexes (PostgreSQL's general `BitmapOr`) is not combined.
-- **Multi-column GIN** and general correlated / expression / same-or-later-relation query operands.
+- **Multi-column combined scans** — one gather over conjuncts on several columns of one multi-column
+  index (§4.4), and an `OR` across its columns. (Multi-column GIN itself has landed.)
+- General correlated / expression / same-or-later-relation query operands.
   (Bare earlier-sibling operands, GIN and ordered-index bounds for `UPDATE`/`DELETE` scans, and
   bounded LIMIT streaming have landed — §6/§6.1 and
   [indexes.md §5.1](indexes.md).)

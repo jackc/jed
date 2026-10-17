@@ -548,6 +548,19 @@ function ginDecimalByteaTableDB(): Engine {
 // gin.md §2.1/§4.1): keys at two levels, an array string element (a KEY term) beside a member string
 // value (a STRING term), 1.5/1.50 as ONE number term, a top-level string, `{}` and a SQL NULL (no
 // entries), and a negative number. An ordered index i_n sits beside it.
+// ginMultiTableDB is the v43 multi-column GIN golden (gin.md §4.4): every entry is column_tag ‖ term ‖
+// storage key over an i32[] and a jsonb column; NULL and empty values contribute nothing.
+function ginMultiTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], doc jsonb)");
+  run(
+    db,
+    `INSERT INTO t VALUES (1, '{1,2}', '{"a": 1}'), (2, '{2,2}', NULL), (3, NULL, '["x"]'), (4, '{}', '{}')`,
+  );
+  run(db, "CREATE INDEX i_multi_gin ON t USING gin (nums, doc)");
+  return db;
+}
+
 function ginJsonbTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb, n i32)");
@@ -1263,6 +1276,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "gin_float_table.jed", build: ginFloatTableDB },
     { name: "gin_interval_table.jed", build: ginIntervalTableDB },
     { name: "gin_jsonb_table.jed", build: ginJsonbTableDB },
+    { name: "gin_multi_table.jed", build: ginMultiTableDB },
     { name: "gin_text_table.jed", build: ginTextTableDB },
     { name: "gin_decimal_bytea_table.jed", build: ginDecimalByteaTableDB },
     { name: "fk_table.jed", build: fkTableDB },
@@ -1349,6 +1363,7 @@ test("read goldens reproduces rows", () => {
     { name: "gin_float_table.jed", build: ginFloatTableDB, table: "t" },
     { name: "gin_interval_table.jed", build: ginIntervalTableDB, table: "t" },
     { name: "gin_jsonb_table.jed", build: ginJsonbTableDB, table: "t" },
+    { name: "gin_multi_table.jed", build: ginMultiTableDB, table: "t" },
     { name: "gin_text_table.jed", build: ginTextTableDB, table: "t" },
     { name: "gin_decimal_bytea_table.jed", build: ginDecimalByteaTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },

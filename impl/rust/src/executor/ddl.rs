@@ -5181,8 +5181,9 @@ impl Engine {
             // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
             ci_keys.push(IndexKey::Column(idx));
         }
-        // GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an
-        // inverted index) and a single column only — both deferred 0A000.
+        // GIN has no uniqueness (undefined for an inverted index — spec/design/gin.md §3, 0A000).
+        // A multi-column GIN takes up to 32 key columns (PostgreSQL's INDEX_MAX_KEYS, 54011), each
+        // with its own operator class (§4.4).
         if kind == IndexKind::Gin {
             if ci.unique {
                 return Err(EngineError::new(
@@ -5190,10 +5191,10 @@ impl Engine {
                     "access method gin does not support unique indexes".to_string(),
                 ));
             }
-            if ci_keys.len() != 1 {
+            if ci_keys.len() > GIN_MAX_KEY_COLUMNS {
                 return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "a multi-column gin index is not supported yet".to_string(),
+                    SqlState::TooManyColumns,
+                    format!("cannot use more than {GIN_MAX_KEY_COLUMNS} columns in an index"),
                 ));
             }
         }

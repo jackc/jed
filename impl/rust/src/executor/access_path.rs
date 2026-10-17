@@ -272,7 +272,13 @@ impl Engine {
                     let (entries, pages, slabs) = store.scan_with_units(mask)?;
                     return Ok((entries, (pages, slabs)));
                 }
-                GinQuery::Terms(terms) => queries.push((strategy, terms)),
+                GinQuery::Terms(terms) => queries.push((
+                    strategy,
+                    terms
+                        .into_iter()
+                        .map(|term| gin_tagged_term(gb.tag, term))
+                        .collect(),
+                )),
             }
         }
 

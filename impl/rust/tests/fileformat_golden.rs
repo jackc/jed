@@ -875,6 +875,31 @@ fn gin_decimal_bytea_table_db() -> Session {
     db
 }
 
+/// A multi-column GIN index over an i32[] and a jsonb column (the v43 golden, spec/design/gin.md
+/// §4.4): every entry is column_tag ‖ term ‖ storage key; NULL and empty values contribute nothing.
+fn gin_multi_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], doc jsonb)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '{1,2}', '{\"a\": 1}'), (2, '{2,2}', NULL), (3, NULL, '[\"x\"]'), (4, '{}', '{}')",
+    );
+    run(
+        &mut db,
+        "CREATE INDEX i_multi_gin ON t USING gin (nums, doc)",
+    );
+    db
+}
+
 /// A GIN index over a jsonb column (the jsonb_ops golden, spec/design/gin.md §2.1/§4.1): keys at two
 /// levels, an array string element (KEY term) beside a member string value (STRING term), a boolean
 /// and a JSON null; a top-level array whose 1.5 and 1.50 are ONE number term; a top-level string; `{}`
@@ -2107,6 +2132,7 @@ fn write_matches_goldens() {
         ("gin_float_table.jed", gin_float_table_db),
         ("gin_interval_table.jed", gin_interval_table_db),
         ("gin_jsonb_table.jed", gin_jsonb_table_db),
+        ("gin_multi_table.jed", gin_multi_table_db),
         ("gin_text_table.jed", gin_text_table_db),
         ("gin_decimal_bytea_table.jed", gin_decimal_bytea_table_db),
         ("fk_table.jed", fk_table_db),
@@ -2215,6 +2241,7 @@ fn read_goldens_reproduces_rows() {
         ("gin_float_table.jed", gin_float_table_db, "t"),
         ("gin_interval_table.jed", gin_interval_table_db, "t"),
         ("gin_jsonb_table.jed", gin_jsonb_table_db, "t"),
+        ("gin_multi_table.jed", gin_multi_table_db, "t"),
         ("gin_text_table.jed", gin_text_table_db, "t"),
         (
             "gin_decimal_bytea_table.jed",

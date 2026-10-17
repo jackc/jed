@@ -83,10 +83,6 @@ DROP INDEX t_tags_gin
 # exactly like create_index.test's reserved-word `on` block (conformance.md §5). TODO(G1/G2):
 # add the matching spec/conformance/oracle_overrides.toml entries when this file is oracle-checked.
 
-# a multi-column GIN is deferred (PG builds a multicolumn GIN over two array columns)
-statement error 0A000
-CREATE INDEX i ON t USING gin (tags, tags2)
-
 # a jsonb[] element type is deferred (PG builds a jsonb[] GIN; jed 0A000 — gin.md §10)
 statement error 0A000
 CREATE INDEX i ON t USING gin (notes)

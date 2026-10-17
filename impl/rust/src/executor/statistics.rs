@@ -470,6 +470,23 @@ pub(crate) fn statistics_gin_estimate(
     })
 }
 
+/// A term-eligible column's estimated total GIN term occurrences at its current row count
+/// (statistics.md §6.1), or `None` without term facts.
+pub(crate) fn statistics_gin_total_entries(
+    rel: &ScopeRel<'_>,
+    column: usize,
+    catalog: &Engine,
+) -> Option<i64> {
+    let fact = catalog.column_statistics_scoped(rel.db.as_deref(), &rel.table.name, column)?;
+    let term_facts = fact.terms.as_ref()?;
+    let current = current_column_statistics(rel, column, catalog)?;
+    Some(statistics_scale(
+        current.rows,
+        term_facts.occurrences,
+        fact.analyzed_rows,
+    ))
+}
+
 /// A GIN query operand's plan-time value (statistics.md §6.1): a literal, a folded array literal, or
 /// a one-dimensional `ARRAY[...]` of literals.
 fn statistics_gin_operand_value(operand: &RExpr) -> Option<Value> {

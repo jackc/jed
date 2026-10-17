@@ -809,6 +809,16 @@ name = "statement_too_complex"
 class = "program limit exceeded"
 template = "statement too complex: nesting depth exceeds the maximum of {max}"
 
+# 54011 too_many_columns — a multi-column GIN index lists more than 32 key columns
+# (spec/design/gin.md §4.4). PostgreSQL's code and message (INDEX_MAX_KEYS, raised by DefineIndex for
+# any index); jed applies the limit to GIN only, whose per-entry column tag is one byte. Asserted by
+# the conformance corpus (ddl.gin_multi_column).
+[[error]]
+code = "54011"
+name = "too_many_columns"
+class = "program limit exceeded"
+template = "cannot use more than {max} columns in an index"
+
 # 54P01 cost_limit_exceeded — a caller-imposed cost ceiling was exceeded during execution.
 # jed-specific: PostgreSQL has no execution-cost ceiling, so this code (a `P` subclass, like
 # 22P02/42P18/25P02) is a documented divergence (CLAUDE.md §1/§13; spec/design/cost.md §6). The

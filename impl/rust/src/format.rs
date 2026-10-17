@@ -146,7 +146,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // timezone dependencies; a DESC / NULLS FIRST key's entry slots use the encoding.md §2.16 ordered
 // slot. An index with only default (ASC NULLS LAST) keys is byte-identical to v45
 // (spec/design/indexes.md §11).
-pub(crate) const FORMAT_VERSION: u16 = 46;
+pub(crate) const FORMAT_VERSION: u16 = 47;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -5594,20 +5594,24 @@ fn validate_loaded_references(snap: &Snapshot) -> Result<()> {
                     }
                 }
                 IndexKind::Gin => {
-                    if idx.keys.len() != 1 {
+                    if idx.keys.is_empty() || idx.keys.len() > crate::executor::GIN_MAX_KEY_COLUMNS
+                    {
                         return Err(corrupt(&format!(
-                            "GIN index {} does not have exactly one column",
-                            idx.name
+                            "GIN index {} has {} key columns",
+                            idx.name,
+                            idx.keys.len()
                         )));
                     }
-                    let IndexKey::Column(c) = idx.keys[0] else {
-                        return Err(corrupt("a non-btree index cannot have an expression key"));
-                    };
-                    if !crate::executor::term_eligible(&t.columns[c].ty) {
-                        return Err(corrupt(&format!(
-                            "GIN index {} column has no operator class",
-                            idx.name
-                        )));
+                    for key in &idx.keys {
+                        let IndexKey::Column(c) = *key else {
+                            return Err(corrupt("a non-btree index cannot have an expression key"));
+                        };
+                        if !crate::executor::term_eligible(&t.columns[c].ty) {
+                            return Err(corrupt(&format!(
+                                "GIN index {} column has no operator class",
+                                idx.name
+                            )));
+                        }
                     }
                 }
                 IndexKind::Gist => {

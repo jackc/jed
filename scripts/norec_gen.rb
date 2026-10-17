@@ -183,6 +183,8 @@
 #              (gin.md §6.3); the same predicates with one arm spelled `NOT (tags <> Q)` / `Q <@ tags`
 #              hold an arm no GIN strategy matches, so they full scan. Both must return the
 #              by-construction rows.
+#   gin_multi — a multi-column GIN over (a, b) serves `b @> Q` / `k = ANY(b)` / `a && Q` through
+#              each column's tagged terms (gin.md §4.4); `Q <@ b` / `COALESCE(a, a) && Q` full scan.
 #   gin_eq   — `tags = Q` over a GIN-indexed array column gathers candidates via the @>-superset
 #              bound + residual = (gin.md §6); the equivalent `NOT (tags <> Q)` is NOT GIN-accelerated
 #              (full scan). Both must return identical rows (exact-equality gather oracle).
@@ -488,6 +490,10 @@ GIN_OR_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan qu
                 query.gin_array_eq query.gin_disjunction dml.insert dml.insert_multi_row query.select
                 query.order_by query.where_eq query.logical_connectives expr.in_list types.i32
                 types.array func.array_containment func.array_quantified cast.operator].freeze
+GIN_MULTI_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index ddl.gin_multi_column query.gin_scan
+                   query.gin_any_eq dml.insert dml.insert_multi_row query.select query.order_by
+                   query.logical_connectives types.i32 types.array func.array_containment
+                   func.array_quantified expr.coalesce cast.operator].freeze
 GIN_EQ_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_array_eq dml.insert
                 dml.insert_multi_row query.select query.order_by query.where_eq types.i32
                 types.array].freeze
@@ -3279,6 +3285,48 @@ def gen_gin_or(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: multi-column GIN (a query on any key column via the index vs a defeating spelling) --
+# A multi-column GIN index over (a, b) tags every entry with its key position (spec/design/gin.md
+# §4.4), so `b @> Q`, `k = ANY(b)`, and `a && Q` all gather through it; the equivalent `Q <@ b` /
+# `'{k}' <@ b` match no GIN strategy, and `&&` (symmetric) is defeated by wrapping the column in
+# COALESCE, so those full scan. Both must return the by-construction rows. The two columns share
+# their element domain, so a tag mix-up would show.
+def gen_gin_multi(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(14, random: rng).sort
+  val = -> { rng.rand(0..5).zero? ? nil : Array.new(rng.rand(0..3)) { rng.rand(0..4) } }
+  rows = ids.map { |id| [id, val.call, val.call] }
+  arr = ->(t) { t.nil? ? "NULL" : "'{#{t.join(',')}}'::i32[]" }
+  ids_where = ->(pred) { rows.select { |r| pred.call(r) }.map { |id, _, _| id.to_s } }
+  q1 = [rng.rand(0..4)]
+  q2 = [rng.rand(0..4), rng.rand(0..4)].uniq
+  k = rng.rand(0..5)
+
+  out = header(seed, GIN_MULTI_REQ, "multi-column GIN (a query on either key column via the index vs a defeating spelling)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32[], b i32[])")
+  stmt(out, "CREATE INDEX t_ab_gin ON t USING gin (a, b)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, a, b| "(#{id}, #{arr.call(a)}, #{arr.call(b)})" }.join(', ')}")
+
+  pair = lambda do |title, fast, slow, exp|
+    out << "# #{title}"
+    out << "# GIN bound (the column's tagged terms)"
+    q(out, "I", "SELECT id FROM t WHERE #{fast} ORDER BY id", exp)
+    out << "# full scan (a spelling no GIN strategy matches) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE #{slow} ORDER BY id", exp)
+  end
+  pair.call("b @> #{q2.inspect}", "b @> #{arr.call(q2)}", "#{arr.call(q2)} <@ b",
+            ids_where.call(->(r) { !r[2].nil? && q2.all? { |e| r[2].include?(e) } }))
+  pair.call("#{k} = ANY(b)", "#{k} = ANY(b)", "#{arr.call([k])} <@ b",
+            ids_where.call(->(r) { !r[2].nil? && r[2].include?(k) }))
+  pair.call("a && #{q2.inspect}", "a && #{arr.call(q2)}", "COALESCE(a, a) && #{arr.call(q2)}",
+            ids_where.call(->(r) { !r[1].nil? && q2.any? { |e| r[1].include?(e) } }))
+  pair.call("a @> #{q1.inspect} AND b && #{q2.inspect}", "a @> #{arr.call(q1)} AND b && #{arr.call(q2)}",
+            "#{arr.call(q1)} <@ a AND COALESCE(b, b) && #{arr.call(q2)}",
+            ids_where.call(->(r) { !r[1].nil? && !r[2].nil? && q1.all? { |e| r[1].include?(e) } && q2.any? { |e| r[2].include?(e) } }))
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: GIN-bounded array equality (= via the GIN index vs NOT(<>) full scan) -----------
 # `col = Q` over a GIN-indexed array column gathers candidates via the @>-superset bound (Q's
 # distinct non-NULL elements, since col = Q ⟹ col @> Q) + the residual = (spec/design/gin.md §6;
@@ -5327,6 +5375,7 @@ SCENARIOS = {
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),
   "gin_or" => method(:gen_gin_or),
+  "gin_multi" => method(:gen_gin_multi),
   "gin_float" => method(:gen_gin_float),
   "gin_interval" => method(:gen_gin_interval),
   "gin_mut" => method(:gen_gin_mutation),

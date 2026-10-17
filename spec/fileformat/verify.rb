@@ -27,7 +27,10 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 46 # v46: ordered index keys — index_flags bit4 has_key_options; when set, one option byte
+VERSION = 47 # v47: multi-column GIN indexes — a GIN index may list several key columns, and each
+# entry of a multi-column GIN index is column_tag (u8, the 0-based key position) ‖ term ‖ storage key
+# (gin.md §4.4); a single-column GIN's entries are byte-identical to v46. No catalog byte layout change.
+# v46: ordered index keys — index_flags bit4 has_key_options; when set, one option byte
 # per key element (bit0 desc, bit1 nulls_first) follows the optional timezone dependencies, and the
 # element's entry slots use the encoding.md §2.16 ordered slot (indexes.md §11). No other change.
 # v45: exclusion-constraint follow-ons (gist.md §7.1/§7.2) — no byte layout change; the
@@ -1316,6 +1319,26 @@ GIN_DECIMAL_BYTEA_TABLE = {
 #   INSERT (1, '{"a": 1, "b": [true, null, "x"], "c": {"d": "e"}}', 1),
 #          (2, '["x", 1.5, 1.50, false, {"a": 2}]', 2), (3, '"x"', 3), (4, '{}', 4), (5, NULL, 5),
 #          (6, '-0.001', 6)
+# A MULTI-column GIN index (v43, the gin_multi golden, spec/design/gin.md §4.4) over an i32[] and a
+# jsonb column: every entry is column_tag ‖ term ‖ storage key, tag 0 for `nums`, 1 for `doc`, so all
+# `nums` entries sort before all `doc` entries and the two columns' posting lists never mix. Row 2's
+# duplicate element is one entry; a NULL or empty value contributes no entry for its column only. The
+# cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], doc jsonb)
+#   INSERT (1, '{1,2}', '{"a": 1}'), (2, '{2,2}', NULL), (3, NULL, '["x"]'), (4, '{}', '{}')
+#   CREATE INDEX i_multi_gin ON t USING gin (nums, doc)
+GIN_MULTI_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("nums", "i32[]"), col("doc", "jsonb")],
+  indexes: [
+    { name: "i_multi_gin", cols: [1, 2], kind: "gin" }
+  ],
+  rows: [[1, [1, 2], [:obj, [["a", [:num, "1"]]]]],
+         [2, [2, 2], nil],
+         [3, nil, [:arr, [[:str, "x"]]]],
+         [4, [], [:obj, []]]]
+}.freeze
+
 GIN_JSONB_TABLE = {
   name: "t",
   columns: [col("id", "i32", pk: true), col("doc", "jsonb"), col("n", "i32")],
@@ -1803,6 +1826,7 @@ FIXTURES = ([
   { file: "gin_float_table.jed", page_size: 256, tables: [GIN_FLOAT_TABLE] },
   { file: "gin_interval_table.jed", page_size: 256, tables: [GIN_INTERVAL_TABLE] },
   { file: "gin_jsonb_table.jed", page_size: 256, tables: [GIN_JSONB_TABLE] },
+  { file: "gin_multi_table.jed", page_size: 256, tables: [GIN_MULTI_TABLE] },
   { file: "gin_text_table.jed", page_size: 256, tables: [GIN_TEXT_TABLE] },
   { file: "gin_decimal_bytea_table.jed", page_size: 256, tables: [GIN_DECIMAL_BYTEA_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
@@ -2925,23 +2949,29 @@ end
 # entries (they appear in no posting list). Terms dedup by their ENCODED bytes, not Ruby value
 # equality: a float term's key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so {-0,0} and
 # {NaN,NaN} are one term each (Ruby's uniq would keep two distinct NaN objects).
+#
+# A MULTI-column GIN index (v43, gin.md §4.4) prefixes each column's terms with its 0-based key position
+# as one byte: column_tag ‖ term ‖ storage_key. A single-column index has no tag.
 def gin_index_entries(table, ix)
-  col_type = table[:columns][ix[:cols][0]][:type]
-  elem_type = array_elem(col_type)
-  raise "a GIN index column must be an array or jsonb" unless elem_type || col_type == "jsonb"
   pairs = []
-  table_entries(table).each do |storage_key, row|
-    av = row[ix[:cols][0]]
-    next if av.nil? # a NULL array / document yields no terms
-    terms = if col_type == "jsonb"
-              gin_jsonb_terms(av)
-            else
-              elems = av.is_a?(Hash) ? av[:elements] : av
-              elems.compact.map { |e| gin_element_term(elem_type, e) }
-            end
-    terms.uniq.each do |term|
-      key = (term + storage_key).b
-      pairs << [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
+  ix[:cols].each_with_index do |ci, pos|
+    col_type = table[:columns][ci][:type]
+    elem_type = array_elem(col_type)
+    raise "a GIN index column must be an array or jsonb" unless elem_type || col_type == "jsonb"
+    tag = ix[:cols].size > 1 ? [pos].pack("C") : "".b
+    table_entries(table).each do |storage_key, row|
+      av = row[ci]
+      next if av.nil? # a NULL array / document yields no terms
+      terms = if col_type == "jsonb"
+                gin_jsonb_terms(av)
+              else
+                elems = av.is_a?(Hash) ? av[:elements] : av
+                elems.compact.map { |e| gin_element_term(elem_type, e) }
+              end
+      terms.uniq.each do |term|
+        key = (tag + term + storage_key).b
+        pairs << [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
+      end
     end
   end
   pairs.sort_by { |key, _| key }

@@ -1600,8 +1600,25 @@ func (db *engine) ginCandidateTermEstimate(bound *scanBound, residual *rExpr, re
 	if index == nil {
 		return ginCandidateTermOverride{}, false
 	}
+	// A multi-column index's entries span every key column (gin.md §4.4): its total is the sum of
+	// each column's term occurrences (a column without term facts contributes none).
+	totalEntries := estimate.totalEntries
+	if gb.tagged {
+		for _, idx := range rel.table.Indexes {
+			if idx.Name != gb.nameKey {
+				continue
+			}
+			totalEntries = 0
+			for _, c := range idx.columnOrdinals() {
+				if total, ok := db.statisticsGinTotalEntries(rel, c); ok {
+					totalEntries = satEstimateAdd(totalEntries, total)
+				}
+			}
+			break
+		}
+	}
 	nodes, height := int64(index.NodeCount()), int64(index.Height())
-	pages := clampEstimatedPages(statisticsScale(nodes, estimate.entries, max64(1, estimate.totalEntries)), nodes, height)
+	pages := clampEstimatedPages(statisticsScale(nodes, estimate.entries, max64(1, totalEntries)), nodes, height)
 	return ginCandidateTermOverride{rows: estimate.rows, entries: estimate.entries, pages: pages}, true
 }
 

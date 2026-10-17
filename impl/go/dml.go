@@ -499,20 +499,54 @@ func isGistDeferredScalarType(ty dataType) bool {
 //
 // A jsonb column (jsonb_ops, gin.md §2.1/§4.1) contributes one entry per DISTINCT term of its
 // document (ginJsonbIndexTerms) instead; a NULL document yields none.
+//
+// A multi-column index (gin.md §4.4) prefixes each column's terms with its column tag — the 0-based
+// key position as one byte — so the entries are tag ‖ term ‖ storage key.
 func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRow) ([][]byte, error) {
-	ci := cols[0]
-	// A large array / document spills like any variable-width value, so a stored row's value may be
-	// deferred; it must be resolved — skipping it would silently drop (or fail to remove) its posting
-	// entries.
-	v, err := residentValue(row[ci])
-	if err != nil {
-		return nil, err
+	var out [][]byte
+	for pos, ci := range cols {
+		// A large array / document spills like any variable-width value, so a stored row's value may
+		// be deferred; it must be resolved — skipping it would silently drop (or fail to remove) its
+		// posting entries.
+		v, err := residentValue(row[ci])
+		if err != nil {
+			return nil, err
+		}
+		opclass, ok := ginOpclassFor(columns[ci].Type)
+		if !ok {
+			panic("a GIN index column has an operator class (CREATE INDEX / ALTER gate)")
+		}
+		tag, tagged := ginColumnTag(len(cols), pos)
+		terms := ginValueTerms(opclass, v)
+		if tagged {
+			for i, t := range terms {
+				terms[i] = ginTaggedTerm(tag, t)
+			}
+		}
+		out = append(out, ginEntriesFromTerms(terms, storageKey)...)
 	}
-	opclass, ok := ginOpclassFor(columns[ci].Type)
-	if !ok {
-		panic("a GIN index column has an operator class (CREATE INDEX / ALTER gate)")
+	return out, nil
+}
+
+// ginMaxKeyColumns is the most key columns a GIN index takes (gin.md §4.4) — PostgreSQL's
+// INDEX_MAX_KEYS; each entry's column tag is one byte.
+const ginMaxKeyColumns = 32
+
+// ginColumnTag is the column tag a GIN index over keyCount columns prefixes to the terms of its key
+// position pos (gin.md §4.4): none (ok=false) for a single-column index, else the position as one
+// byte — PostgreSQL's per-entry attribute number, 0-based.
+func ginColumnTag(keyCount, pos int) (byte, bool) {
+	if keyCount <= 1 {
+		return 0, false
 	}
-	return ginEntriesFromTerms(ginValueTerms(opclass, v), storageKey), nil
+	return byte(pos), true
+}
+
+// ginTaggedTerm is tag ‖ term (a fresh slice).
+func ginTaggedTerm(tag byte, term []byte) []byte {
+	out := make([]byte, 0, len(term)+1)
+	out = append(out, tag)
+	return append(out, term...)
 }
 
 // ginOpclass is a GIN column's operator class (gin.md §2/§2.1): jsonb_ops for a jsonb column, else

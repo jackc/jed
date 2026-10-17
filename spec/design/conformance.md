@@ -640,6 +640,8 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   **gin_or** — a GIN disjunction (`tags IN (Q1, Q2)`, an `OR` of `@>`/`&&`/`= ANY` arms) is compared
   with the same predicate with one arm spelled `NOT (tags <> Q)` / `Q <@ tags`, which no GIN
   strategy matches, so the `OR` full scans (gin.md §6.3);
+  **gin_multi** — a multi-column GIN over `(a, b)` serves `b @> Q`, `k = ANY(b)`, and `a && Q` through
+  each column's tagged terms (gin.md §4.4), compared with `Q <@ b` / `COALESCE(a, a) && Q` full scans;
   **gist_inl** — GiST range `@>` and scalar `=` sibling bounds are compared with equivalent `<@`
   and paired-inequality full-scan spellings, including NULL/empty range queries;
   **topk** — a blocking ORDER BY LIMIT/OFFSET heap is compared with a DISTINCT-gated full sort over
