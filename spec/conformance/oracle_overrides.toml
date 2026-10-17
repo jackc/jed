@@ -1895,3 +1895,33 @@ reason = "jed: regr_avgy over integer/decimal arguments is exact (aggregates.md 
 file = "aggregates/regr_avgy.test"
 sql = "SELECT regr_avgy(fy, x) FROM t"
 reason = "jed: float is a strict island — no implicit integer↔float conversion — so regr_avgy(f64, i32) matches neither the float nor the exact overload: 42883. PostgreSQL casts both arguments to float8."
+
+[[override]]
+file = "aggregates/regr_sxx.test"
+sql = "SELECT regr_sxx(y, x) FROM t"
+reason = "jed: regr_sxx over integer/decimal arguments is exact (aggregates.md §23), equal to PostgreSQL's numeric evaluation of its formula; PostgreSQL defines regr_sxx only over float8."
+
+[[override]]
+file = "aggregates/regr_sxx.test"
+sql = "SELECT regr_sxx(dy, dx), regr_sxx(y, dx) FROM t"
+reason = "jed: regr_sxx over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/regr_sxx.test"
+sql = "SELECT g, regr_sxx(dy, x) FROM t GROUP BY g"
+reason = "jed: regr_sxx over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/regr_sxx.test"
+sql = "SELECT regr_sxx(DISTINCT y, y) FROM t"
+reason = "jed: regr_sxx over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/regr_sxx.test"
+sql = "SELECT regr_sxx(y, x) FROM big"
+reason = "jed: regr_sxx over integer/decimal arguments is exact (aggregates.md §23); PostgreSQL defines it only over float8."
+
+[[override]]
+file = "aggregates/regr_sxx.test"
+sql = "SELECT regr_sxx(fy, x) FROM t"
+reason = "jed: float is a strict island — no implicit integer↔float conversion — so regr_sxx(f64, i32) matches neither the float nor the exact overload: 42883. PostgreSQL casts both arguments to float8."
