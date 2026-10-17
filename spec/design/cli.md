@@ -15,7 +15,8 @@ surface, versioned with the CLI, never with the spec. There is **one** CLI; it i
 reimplemented per language.
 
 Non-goals: no server / wire protocol (jed is embedded, §1); no query cancellation (the
-engine has none — the deterministic **cost ceiling** is the runaway-query defense, §13);
+engine supports cooperative cancellation, [api.md](api.md) §11.4, but the CLI does not wire it to a
+key — the deterministic **cost ceiling** is its runaway-query defense, §13);
 no SQL dialect of its own (statements pass through the statement splitter **verbatim** —
 the engine's grammar, including `--` / `/* */` comments since grammar.md §33, is the only
 dialect).
