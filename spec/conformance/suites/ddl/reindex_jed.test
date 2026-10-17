@@ -1,0 +1,323 @@
+# skip: disk — explicit transactions, temp tables, and an in-memory attachment spanning records cannot
+# survive the disk-mode per-record reopen (spec/design/conformance.md §3); reindex.test runs both modes.
+# REINDEX — the jed-specific behavior of spec/design/indexes.md §10 that PostgreSQL cannot oracle-check:
+# the DATABASE / SYSTEM / CONCURRENTLY forms (the oracle probes every record inside a transaction block,
+# where PostgreSQL refuses them 25001), the transaction-block refusals themselves, REINDEX joining and
+# rolling back with an explicit block, read-only refusal, the session privilege envelope, temporary
+# tables, database qualifiers and a host attachment, and the forms jed has no counterpart for.
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# attach: rep
+# requires: ddl.reindex, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.temp_table, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.qualified_table, types.i32, types.text, txn.explicit, txn.read_only, session.privileges, session.allow_ddl, session.allow_temp_ddl, attach.in_memory, harness.attach, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')
+
+statement ok
+CREATE INDEX t_a ON t (a)
+
+statement ok
+CREATE UNIQUE INDEX t_b ON t (b)
+
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, c i32)
+
+statement ok
+INSERT INTO w VALUES (1, 5)
+
+statement ok
+CREATE INDEX w_c ON w (c)
+
+# --- DATABASE and SYSTEM ------------------------------------------------------------------------
+
+# every table of main in name byte order: t (t_a, t_b: 2 * (1 + 2)) then w (w_c: 1 + 1) = 8
+# cost: 8
+statement ok
+REINDEX DATABASE
+
+# `main` names the current database
+# cost: 8
+statement ok
+REINDEX DATABASE main
+
+# any other name is not the currently open database (PostgreSQL's 0A000)
+statement error 0A000
+REINDEX DATABASE other
+
+statement error 0A000
+REINDEX DATABASE temp
+
+# jed has no system catalogs, so SYSTEM rebuilds nothing
+# cost: 0
+statement ok
+REINDEX SYSTEM
+
+statement ok
+REINDEX SYSTEM main
+
+statement error 0A000
+REINDEX SYSTEM other
+
+statement error 0A000
+REINDEX SYSTEM CONCURRENTLY
+
+statement error 0A000
+REINDEX (CONCURRENTLY) SYSTEM
+
+# --- CONCURRENTLY: the same rebuild (jed's readers never wait on the writer) ----------------------
+
+# cost: 6
+statement ok
+REINDEX TABLE CONCURRENTLY t
+
+# cost: 3
+statement ok
+REINDEX INDEX CONCURRENTLY t_a
+
+# cost: 3
+statement ok
+REINDEX (CONCURRENTLY, VERBOSE) INDEX t_a
+
+# cost: 8
+statement ok
+REINDEX DATABASE CONCURRENTLY
+
+# an explicit FALSE is the ordinary form, which a transaction block admits
+# cost: 6
+statement ok
+REINDEX (CONCURRENTLY off) TABLE t
+
+# a relation named like the keyword stays nameable
+statement ok
+CREATE TABLE concurrently (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE INDEX concurrently_v ON concurrently (v)
+
+statement ok
+REINDEX TABLE concurrently
+
+statement ok
+REINDEX TABLE CONCURRENTLY concurrently
+
+statement ok
+DROP TABLE concurrently
+
+# --- no counterpart in jed ------------------------------------------------------------------------
+
+statement error 0A000
+REINDEX SCHEMA public
+
+statement error 0A000
+REINDEX (TABLESPACE pg_default) TABLE t
+
+# a built-in catalog relation is not rebuildable (the ANALYZE / CREATE INDEX precedent)
+statement error 42809
+REINDEX TABLE jed_tables
+
+statement error 42809
+REINDEX INDEX jed_tables
+
+# --- transaction blocks ---------------------------------------------------------------------------
+
+statement ok
+BEGIN
+
+# INDEX / TABLE join the block
+statement ok
+REINDEX TABLE t
+
+statement ok
+REINDEX INDEX t_b
+
+query IT nosort
+SELECT a, b FROM t WHERE b = 'y'
+----
+20
+y
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT id FROM t WHERE a = 10
+----
+1
+
+# CONCURRENTLY, DATABASE, and SYSTEM cannot run inside a block (PostgreSQL's PreventInTransactionBlock)
+statement ok
+BEGIN
+
+statement error 25001
+REINDEX INDEX CONCURRENTLY t_a
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement error 25001
+REINDEX DATABASE
+
+# the refusal aborts the block, like any statement error
+statement error 25P02
+REINDEX TABLE t
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement error 25001
+REINDEX SYSTEM
+
+statement ok
+ROLLBACK
+
+# a failed REINDEX aborts the block and changes nothing
+statement ok
+BEGIN
+
+statement error 42P01
+REINDEX TABLE nosuch
+
+statement error 25P02
+SELECT 1
+
+statement ok
+ROLLBACK
+
+# a rebuild is a write: refused in a READ ONLY block
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+REINDEX TABLE t
+
+statement ok
+ROLLBACK
+
+# --- the session privilege envelope ---------------------------------------------------------------
+
+# allow_ddl gates every form, a temporary target included
+# allow_ddl: off
+statement error 42501
+REINDEX TABLE t
+
+# allow_ddl: off
+statement error 42501
+REINDEX INDEX t_a
+
+# allow_ddl: off
+statement error 42501
+REINDEX DATABASE
+
+# INDEX and TABLE also read the target table: SELECT on it
+# default_privileges: NONE
+statement error 42501
+REINDEX TABLE t
+
+# default_privileges: NONE
+statement error 42501
+REINDEX INDEX t_a
+
+# default_privileges: SELECT
+statement ok
+REINDEX INDEX t_a
+
+# DATABASE needs only allow_ddl (PostgreSQL's database-owner check)
+# default_privileges: NONE
+statement ok
+REINDEX DATABASE
+
+# --- temporary tables -----------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE tt (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO tt VALUES (1, 7), (2, 8), (3, 9)
+
+statement ok
+CREATE INDEX tt_v ON tt (v)
+
+# cost: 4
+statement ok
+REINDEX TABLE tt
+
+# cost: 4
+statement ok
+REINDEX INDEX tt_v
+
+# cost: 4
+statement ok
+REINDEX TABLE temp.tt
+
+# cost: 4
+statement ok
+REINDEX INDEX temp.tt_v
+
+statement error 42P01
+REINDEX TABLE main.tt
+
+statement error 42P01
+REINDEX INDEX main.tt_v
+
+# DATABASE covers main followed by the session's temporary tables: 8 + 4
+# cost: 12
+statement ok
+REINDEX DATABASE
+
+# allow_temp_ddl does not substitute for allow_ddl: REINDEX is maintenance, not schema creation
+# allow_ddl: off
+statement error 42501
+REINDEX TABLE tt
+
+query I nosort
+SELECT id FROM tt WHERE v = 8
+----
+2
+
+# --- a host attachment ----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE rep.r (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO rep.r VALUES (1, 100), (2, 200)
+
+statement ok
+CREATE UNIQUE INDEX r_k ON rep.r (k)
+
+# cost: 3
+statement ok
+REINDEX TABLE rep.r
+
+# cost: 3
+statement ok
+REINDEX INDEX rep.r_k
+
+# a bare name does not reach into an attachment
+statement error 42P01
+REINDEX INDEX r_k
+
+# DATABASE <attachment> rebuilds that attachment's tables only
+# cost: 3
+statement ok
+REINDEX DATABASE rep
+
+statement error 42P01
+REINDEX TABLE nodb.r
+
+statement error 23505
+INSERT INTO rep.r VALUES (3, 100)
+
+query II nosort
+SELECT id, k FROM rep.r WHERE k = 200
+----
+2
+200

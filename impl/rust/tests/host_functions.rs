@@ -588,6 +588,136 @@ fn hostfunc_index_reopen_missing_function() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `geo_hash(i64) -> i64` at `version` with a COARSER kernel (`a / 10`), so rows that were distinct
+/// under v1's `a * 10` can collide — the UNIQUE re-check REINDEX performs.
+fn geo_hash_coarse(component: &str, version: u32) -> HostFunction {
+    HostFunction::new(
+        "geo_hash",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(|args: &[Value]| -> jed::Result<Value> {
+            let Value::Int(a) = &args[0] else {
+                unreachable!("strict + resolved i64 arg")
+            };
+            Ok(Value::Int(a / 10))
+        }),
+    )
+    .volatility(Volatility::Immutable)
+    .cross_core(true)
+    .component_id(component.to_string())
+    .semantic_version(version)
+}
+
+#[test]
+fn hostfunc_index_reindex_repairs_version_bump() {
+    // REINDEX (spec/design/indexes.md §10) rebuilds a stale host-dependency index against the CURRENT
+    // registry and re-records its component/version, so the table is writable again — and stays so
+    // across a reopen in the same environment (the new dependency is what was persisted).
+    let path = tmp("hostfunc_index_reindex.jed");
+    create_file(
+        &path,
+        registry(vec![geo_hash("com.example/geo_hash", 1)]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+            "INSERT INTO t VALUES (1, 3), (2, 7)",
+            "CREATE INDEX ix ON t (geo_hash(a))",
+        ],
+    );
+    {
+        let mut db = open_file(&path, registry(vec![geo_hash("com.example/geo_hash", 2)]));
+        assert_eq!(
+            err_code(db.query_outcome("INSERT INTO t VALUES (3, 3)", &[])),
+            "XX002"
+        );
+        // A rolled-back REINDEX leaves the stale pin in place.
+        {
+            let mut s = db.session(SessionOptions::default());
+            s.query_outcome("BEGIN", &[]).unwrap();
+            s.query_outcome("REINDEX INDEX ix", &[]).unwrap();
+            s.query_outcome("ROLLBACK", &[]).unwrap();
+            assert_eq!(
+                err_code(s.query_outcome("INSERT INTO t VALUES (3, 3)", &[])),
+                "XX002"
+            );
+        }
+        // The committed rebuild repairs it: cost = the CREATE INDEX build scan (page_read 1 + 2 rows
+        // + 2 host calls at the default declared cost).
+        let Outcome::Statement { cost, .. } = db.query_outcome("REINDEX TABLE t", &[]).unwrap()
+        else {
+            panic!("REINDEX is a statement")
+        };
+        assert!(cost > 0, "REINDEX charges its build scan");
+        db.query_outcome("INSERT INTO t VALUES (3, 3)", &[])
+            .expect("a rebuilt index is maintained again");
+        assert_eq!(
+            ids(
+                &mut db,
+                "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"
+            ),
+            vec![Value::Int(1), Value::Int(3)]
+        );
+    }
+    let mut db = open_file(&path, registry(vec![geo_hash("com.example/geo_hash", 2)]));
+    db.query_outcome("INSERT INTO t VALUES (4, 7)", &[])
+        .expect("the re-recorded v2 dependency persisted");
+    remove_db(&path);
+}
+
+#[test]
+fn hostfunc_index_reindex_refusals() {
+    let path = tmp("hostfunc_index_reindex_refusals.jed");
+    create_file(
+        &path,
+        registry(vec![geo_hash("com.example/geo_hash", 1)]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+            "INSERT INTO t VALUES (1, 3), (2, 7)",
+            "CREATE UNIQUE INDEX ix ON t (geo_hash(a))",
+        ],
+    );
+    // The function is gone: the expression cannot be re-admitted (42883), and nothing changes.
+    {
+        let mut db = open_file(&path, Environment::default());
+        assert_eq!(err_code(db.query_outcome("REINDEX INDEX ix", &[])), "42883");
+        assert_eq!(err_code(db.query_outcome("REINDEX TABLE t", &[])), "42883");
+        assert_eq!(err_code(db.query_outcome("REINDEX DATABASE", &[])), "42883");
+    }
+    // The new implementation is no longer IMMUTABLE: 42P17, as CREATE INDEX would say.
+    {
+        let volatile = HostFunction::new(
+            "geo_hash",
+            vec![ScalarType::Int64],
+            ScalarType::Int64,
+            Box::new(|args: &[Value]| {
+                let Value::Int(a) = &args[0] else {
+                    unreachable!()
+                };
+                Ok(Value::Int(a * 10))
+            }),
+        )
+        .component_id("com.example/geo_hash")
+        .semantic_version(2);
+        let mut db = open_file(&path, registry(vec![volatile]));
+        assert_eq!(err_code(db.query_outcome("REINDEX INDEX ix", &[])), "42P17");
+    }
+    // The new implementation maps both rows to one key: the UNIQUE rebuild re-checks (23505) and the
+    // stale index stays in place (writes still refused XX002).
+    {
+        let mut db = open_file(
+            &path,
+            registry(vec![geo_hash_coarse("com.example/geo_hash", 2)]),
+        );
+        db.query_outcome("INSERT INTO t VALUES (3, 4)", &[])
+            .expect_err("stale index refuses the write");
+        assert_eq!(err_code(db.query_outcome("REINDEX INDEX ix", &[])), "23505");
+        assert_eq!(
+            err_code(db.query_outcome("INSERT INTO t VALUES (3, 30)", &[])),
+            "XX002"
+        );
+    }
+    remove_db(&path);
+}
+
 // ── The batched kernel ABI (extensibility.md §4.2.1) ────────────────────────────────────────────
 // Batching is host-observable only (how often, and over how many rows, a kernel runs); rows, cost,
 // and errors must be identical to batch-of-one. These mirror the Go/TS batch tests one-for-one.

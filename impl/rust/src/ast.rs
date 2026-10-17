@@ -12,6 +12,8 @@ pub enum Statement {
     AlterTable(AlterTable),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
+    /// `REINDEX` (spec/design/indexes.md §10).
+    Reindex(Reindex),
     CreateType(CreateType),
     DropType(DropType),
     CreateSequence(CreateSequence),
@@ -404,6 +406,31 @@ pub struct IndexPredicate {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DropIndex {
     pub name: String,
+}
+
+/// The object kind a `REINDEX` names (spec/design/indexes.md §10). `SCHEMA` is refused 0A000 by
+/// the parser (jed has no schemas), so it has no variant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReindexKind {
+    Index,
+    Table,
+    Database,
+    System,
+}
+
+/// `REINDEX [(option, …)] {INDEX | TABLE} [CONCURRENTLY] [db.]name` or
+/// `REINDEX [(option, …)] {DATABASE | SYSTEM} [CONCURRENTLY] [name]` — rebuild secondary indexes
+/// in place from their stored definitions (spec/design/indexes.md §10). `db` is the optional
+/// qualifier of an INDEX/TABLE target; `name` is `None` only for a DATABASE/SYSTEM without a
+/// name. `concurrently` merges the positional keyword and the option; `verbose` is accepted and
+/// has no observable effect (jed has no notice channel).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Reindex {
+    pub kind: ReindexKind,
+    pub db: Option<String>,
+    pub name: Option<String>,
+    pub concurrently: bool,
+    pub verbose: bool,
 }
 
 /// `CREATE TYPE <name> AS ( field type [NOT NULL] [, …] )` — a user-defined composite (row)

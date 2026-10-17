@@ -13,9 +13,9 @@ use crate::ast::{
     GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
     JoinClause, JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable,
     JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction,
-    ReturningClause, SavepointOp, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind,
-    SrcPos, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod,
-    UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    Reindex, ReindexKind, ReturningClause, SavepointOp, Select, SelectItem, SelectItems,
+    SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos,
+    TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::ast::{CycleClause, SearchClause};
@@ -223,6 +223,7 @@ impl Parser {
         // Dispatch on the leading keyword. Remaining productions land in Phases D–E.
         match self.peek_keyword().as_deref() {
             Some("analyze") => Ok(Statement::Analyze(self.parse_analyze()?)),
+            Some("reindex") => Ok(Statement::Reindex(self.parse_reindex()?)),
             // CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX —
             // grammar.md §30; UNIQUE needs no lookahead of its own — after CREATE the next
             // word being UNIQUE can only be CREATE UNIQUE INDEX).
@@ -632,6 +633,111 @@ impl Parser {
             self.expect(&Token::RParen)?;
         }
         Ok(Analyze { name, db, columns })
+    }
+
+    /// `REINDEX [(option, …)] {INDEX | TABLE} [CONCURRENTLY] [db.]name` or `REINDEX [(option, …)]
+    /// {DATABASE | SYSTEM} [CONCURRENTLY] [name]` (spec/design/indexes.md §10, grammar.md §61).
+    /// Options are `VERBOSE [boolean]` and `CONCURRENTLY [boolean]`, repeatable (the last value
+    /// wins, as PostgreSQL); an unknown option is 42601, `TABLESPACE` and `REINDEX SCHEMA` are
+    /// 0A000 (jed has neither tablespaces nor schemas). The positional `CONCURRENTLY` is recognized
+    /// only before a name for INDEX/TABLE, so a relation named `concurrently` stays nameable.
+    fn parse_reindex(&mut self) -> Result<Reindex> {
+        self.expect_keyword("reindex")?;
+        let (mut concurrently, mut verbose) = (false, false);
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                let name = self
+                    .peek_keyword()
+                    .ok_or_else(|| syntax("expected a REINDEX option"))?;
+                self.advance();
+                match name.as_str() {
+                    "verbose" => verbose = self.parse_reindex_boolean(&name)?,
+                    "concurrently" => concurrently = self.parse_reindex_boolean(&name)?,
+                    "tablespace" => {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "REINDEX TABLESPACE is not supported: jed has no tablespaces",
+                        ));
+                    }
+                    _ => return Err(syntax(format!("unrecognized REINDEX option \"{name}\""))),
+                }
+                if matches!(self.peek(), Token::RParen) {
+                    self.advance();
+                    break;
+                }
+                if !matches!(self.peek(), Token::Comma) {
+                    return Err(syntax("expected ',' or ')' in REINDEX option list"));
+                }
+                self.advance();
+            }
+        }
+        let kind = match self.peek_keyword().as_deref() {
+            Some("index") => ReindexKind::Index,
+            Some("table") => ReindexKind::Table,
+            Some("database") => ReindexKind::Database,
+            Some("system") => ReindexKind::System,
+            Some("schema") => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "REINDEX SCHEMA is not supported: jed has no schemas",
+                ));
+            }
+            _ => {
+                return Err(syntax(
+                    "expected INDEX, TABLE, SCHEMA, DATABASE, or SYSTEM after REINDEX",
+                ));
+            }
+        };
+        self.advance();
+        let relation = matches!(kind, ReindexKind::Index | ReindexKind::Table);
+        if self.peek_keyword().as_deref() == Some("concurrently")
+            && (!relation || is_ident(self.peek_at(1)))
+        {
+            self.advance();
+            concurrently = true;
+        }
+        let (db, name) = if relation {
+            let (db, name) = self.parse_qualified_table_name()?;
+            (db, Some(name))
+        } else if is_ident(self.peek()) {
+            (None, Some(self.expect_identifier()?))
+        } else {
+            (None, None)
+        };
+        Ok(Reindex {
+            kind,
+            db,
+            name,
+            concurrently,
+            verbose,
+        })
+    }
+
+    /// A REINDEX option's optional boolean value (PostgreSQL's `defGetBoolean`): omitted means
+    /// TRUE; `TRUE`/`FALSE`/`ON`/`OFF` (bare or quoted) and the integers `1`/`0` are accepted;
+    /// anything else is 42601.
+    fn parse_reindex_boolean(&mut self, option: &str) -> Result<bool> {
+        if matches!(self.peek(), Token::Comma | Token::RParen) {
+            return Ok(true);
+        }
+        let value = match self.peek().clone() {
+            Token::Word(w) | Token::Str(w) => match w.to_ascii_lowercase().as_str() {
+                "true" | "on" => Some(true),
+                "false" | "off" => Some(false),
+                _ => None,
+            },
+            Token::Int(1) => Some(true),
+            Token::Int(0) => Some(false),
+            _ => None,
+        };
+        match value {
+            Some(v) => {
+                self.advance();
+                Ok(v)
+            }
+            None => Err(syntax(format!("{option} requires a Boolean value"))),
+        }
     }
 
     /// `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION [READ ONLY|READ

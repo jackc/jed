@@ -709,7 +709,14 @@ impl Engine {
                 ));
             }
             // Run the statement; ANY error aborts the block (it enters the failed state — §6).
-            let result = if self.stmt_is_write_with_views(&stmt) && !writable {
+            let result = if let Some(kind) = reindex_outside_block(&stmt) {
+                // REINDEX CONCURRENTLY / DATABASE / SYSTEM cannot run inside a transaction block
+                // (PostgreSQL's PreventInTransactionBlock — spec/design/indexes.md §10).
+                Err(EngineError::new(
+                    SqlState::ActiveSqlTransaction,
+                    format!("{kind} cannot run inside a transaction block"),
+                ))
+            } else if self.stmt_is_write_with_views(&stmt) && !writable {
                 Err(EngineError::new(
                     SqlState::ReadOnlySqlTransaction,
                     format!(
@@ -1182,6 +1189,23 @@ impl Engine {
         // before execution resolves/evaluates them, so a revoked function cannot be invoked through
         // them (session.md §5.3).
         self.collect_catalog_expr_privs(stmt, &mut req);
+        // REINDEX INDEX reads its owning table's rows: SELECT on that table (indexes.md §10).
+        if let Statement::Reindex(rx) = stmt
+            && rx.kind == ReindexKind::Index
+            && let Some(name) = &rx.name
+        {
+            let owner = match rx.db.as_deref() {
+                Some(q) => self.snap_for_scope(q).and_then(|s| s.find_index(name)),
+                None => self
+                    .temp_read_snap()
+                    .find_index(name)
+                    .or_else(|| self.find_index(name)),
+            };
+            if let Some((table_key, _)) = owner {
+                let table_key = table_key.to_string();
+                req.need_table(&table_key, Privilege::Select);
+            }
+        }
         if req.is_ddl {
             // DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
             // table by `allow_temp_ddl`, everything else (persistent) by `allow_ddl`. The split lets a
@@ -1440,5 +1464,22 @@ fn collect_check_privs(table: &Table, req: &mut PrivReq) {
     // An unparsed check calls nothing this binary can name; the write itself fails XX003.
     for check in table.checks.iter().filter(|c| !c.unparsed) {
         collect_expr_privs(&check.expr, req, &locals);
+    }
+}
+
+/// The PostgreSQL statement name when `stmt` is a REINDEX form that cannot run inside a transaction
+/// block (`PreventInTransactionBlock`, spec/design/indexes.md §10): `CONCURRENTLY` first, then
+/// `DATABASE` / `SYSTEM` — PostgreSQL's check order. `None` for every other statement.
+fn reindex_outside_block(stmt: &Statement) -> Option<&'static str> {
+    let Statement::Reindex(rx) = stmt else {
+        return None;
+    };
+    if rx.concurrently {
+        return Some("REINDEX CONCURRENTLY");
+    }
+    match rx.kind {
+        ReindexKind::Database => Some("REINDEX DATABASE"),
+        ReindexKind::System => Some("REINDEX SYSTEM"),
+        _ => None,
     }
 }

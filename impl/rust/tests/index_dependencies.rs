@@ -133,6 +133,38 @@ fn timezone_lifetime() {
         );
     }
 }
+/// REINDEX (spec/design/indexes.md §10) is the one-statement form of the transactional DROP/CREATE
+/// rebuild: it re-pins the named zone to the loaded data, a rolled-back REINDEX leaves the stale pin,
+/// and the rebuilt UNIQUE partial index enforces again.
+#[test]
+fn timezone_reindex_repins() {
+    let image = build().to_image(4096, 1).unwrap();
+    let env = tz_env();
+    for mode in ["version", "checksum", "missing"] {
+        let mut db = Engine::from_image_in(&skew_pin(&image, mode), &env).unwrap();
+        code(&mut db, "DELETE FROM t WHERE id = 2", "XX002");
+        run(&mut db, "BEGIN");
+        run(&mut db, "REINDEX INDEX zone_idx");
+        run(&mut db, "ROLLBACK");
+        code(&mut db, "DELETE FROM t WHERE id = 2", "XX002");
+        run(&mut db, "REINDEX TABLE t");
+        run(
+            &mut db,
+            "INSERT INTO t VALUES (3,8,'2024-06-01 00:00:00+00')",
+        );
+        code(
+            &mut db,
+            "INSERT INTO t VALUES (4,7,'2024-06-01 00:00:00+00')",
+            "23505",
+        );
+        // The re-pinned index survives a round trip in the same environment.
+        let mut again = Engine::from_image_in(&db.to_image(4096, 1).unwrap(), &env).unwrap();
+        run(&mut again, "DELETE FROM t WHERE id = 2");
+    }
+    // Without the zone loaded, the rebuild cannot re-admit the explicit zone (22023).
+    let mut bare = Engine::from_image_in(&image, &Environment::default()).unwrap();
+    code(&mut bare, "REINDEX INDEX zone_idx", "22023");
+}
 #[test]
 fn timezone_session_independence() {
     let mut db = build();

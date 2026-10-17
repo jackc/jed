@@ -610,6 +610,10 @@ impl Engine {
                 reject_params_for_ddl(params)?;
                 self.execute_drop_index(di)
             }
+            Statement::Reindex(rx) => {
+                reject_params_for_ddl(params)?;
+                self.execute_reindex(rx)
+            }
             Statement::CreateType(ct) => {
                 reject_params_for_ddl(params)?;
                 self.execute_create_type(ct)
@@ -4836,9 +4840,6 @@ impl Engine {
         // Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12,
         // XX002): the new B-tree would be pinned inconsistently with the file's other structures.
         self.ensure_collations_writable(&columns)?;
-        // Per-column frozen collations for the collated text key form (§2.12); `None` everywhere
-        // for a C-only / non-text table (the fast path).
-        let colls = self.column_collations(&columns);
         // Resolve the access method (spec/design/gin.md §3): the default / `btree` is the ordered
         // B-tree, `gin` a GIN inverted index; an unknown method is 42704. Resolved here (not in the
         // parser) so the error is the resolve-time undefined_object, after the table-exists check
@@ -4877,36 +4878,7 @@ impl Engine {
                             ),
                         ));
                     }
-                    // A subquery is not a deterministic function of the row — 0A000 (the resolver
-                    // admits an uncorrelated one, so it is rejected here, before resolution).
-                    reject_index_predicate_structure(expr)?;
-                    // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter
-                    // 42P02 fall out of the resolver, as for a CHECK).
-                    let scope = Scope::index(self, table);
-                    let mut pt = ParamTypes::for_index();
-                    let (node, rtype) =
-                        resolve(&scope, expr, None, &mut AggCtx::Forbidden, &mut pt)?;
-                    // Dependencies accumulate at each resolved operation, through every child.
-                    if pt.nonimmutable {
-                        return Err(EngineError::new(
-                            SqlState::InvalidObjectDefinition,
-                            "functions in index expression must be marked IMMUTABLE".to_string(),
-                        ));
-                    }
-                    // The result type must be key-encodable (a composite result is 0A000).
-                    if resolved_to_key_type(&rtype).is_none() {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "an index on an expression of this result type is not supported yet"
-                                .to_string(),
-                        ));
-                    }
-                    // Collect + admit any host functions the key expression calls (§8.1, step 4):
-                    // each must be IMMUTABLE + carry a component identity, else 42P17 (this also
-                    // closes the latent leak where a volatile host function passed the syntactic
-                    // immutability walk above).
-                    collect_index_host_deps(&node, self.session.env.functions(), &mut host_deps)?;
-                    timezone_deps.merge(&pt.timezone_deps);
+                    self.admit_index_expr(table, expr, false, &mut host_deps, &mut timezone_deps)?;
                     ci_keys.push(IndexKey::Expr(IndexKeyExpr {
                         expr_text: text.clone(),
                         expr: expr.clone(),
@@ -4996,24 +4968,7 @@ impl Engine {
                         ),
                     ));
                 }
-                // Structural pre-walk: a subquery is 0A000 and a bind parameter 42P02 (both admitted
-                // by the resolver, so caught here). The aggregate 42803 / window 42P20 / non-boolean
-                // 42804 rejections then fall out of the Forbidden-context boolean resolve below.
-                reject_index_predicate_structure(&pred.expr)?;
-                let scope = Scope::index(self, table);
-                let mut pt = ParamTypes::for_index();
-                let node = resolve_boolean_filter(&scope, &pred.expr, &mut pt)?;
-                // Dependencies accumulate at each resolved operation, through every child.
-                if pt.nonimmutable {
-                    return Err(EngineError::new(
-                        SqlState::InvalidObjectDefinition,
-                        "functions in index predicate must be marked IMMUTABLE".to_string(),
-                    ));
-                }
-                // Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as
-                // a key expression (IMMUTABLE + component identity, else 42P17).
-                collect_index_host_deps(&node, self.session.env.functions(), &mut host_deps)?;
-                timezone_deps.merge(&pt.timezone_deps);
+                self.admit_index_expr(table, &pred.expr, true, &mut host_deps, &mut timezone_deps)?;
                 Some(IndexKeyExpr {
                     expr_text: pred.text.clone(),
                     expr: pred.expr.clone(),
@@ -5088,79 +5043,7 @@ impl Engine {
         // unmetered. An expression key evaluating with an error aborts the build (nothing is
         // registered — indexes.md §4), preserving all-or-nothing.
         let mut meter = self.session.new_meter();
-        let mut mask = vec![false; columns.len()];
-        for k in &def.keys {
-            match k {
-                IndexKey::Column(c) => mask[*c] = true,
-                IndexKey::Expr(e) => {
-                    for c in check_referenced_columns(&e.expr, &columns) {
-                        mask[c] = true;
-                    }
-                }
-            }
-        }
-        // A partial index's predicate is evaluated per row during the build (indexes.md §9), so the
-        // columns it references join the touched set — the scan reads (and, if spilled, decompresses)
-        // them, keeping the build cost deterministic and cross-core identical.
-        if let Some(pred) = &def.predicate {
-            for c in check_referenced_columns(&pred.expr, &columns) {
-                mask[c] = true;
-            }
-        }
-        // Resolve the index once (column ordinals + resolved expression keys); the eval env for any
-        // expression key (a fresh statement rng — index expressions are immutable, so it is never
-        // read). Built before the `&mut self` writes below, so the `&self` borrow is released first.
-        let rindex = self.resolve_index(table, &def)?;
-        let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
-        let mut entries: Vec<Vec<u8>> = Vec::new();
-        // A UNIQUE build verifies the existing rows before the index is registered
-        // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
-        // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
-        let mut seen_prefixes: HashSet<Vec<u8>> = HashSet::new();
-        {
-            let env = EvalEnv {
-                exec: self,
-                params: &[],
-                outer: &[],
-                rng: &rng,
-                ctes: CteCtx::empty(),
-                host_batch: None,
-            };
-            let store = self.store_scoped(ci.db.as_deref(), &ci.table);
-            // Resolved column types (composite index key vehicle, §2.15).
-            let col_types: Vec<ColType> = store.col_types().to_vec();
-            let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
-            meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
-            entries.reserve(table_entries.len());
-            for (key, mut row) in table_entries {
-                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-                meter.charge(COSTS.storage_row_read);
-                // Resolve a faulted row's touched columns before encoding (an expression key may
-                // read a spilled value; the evaluator's `Unfetched` backstop also handles it).
-                store.resolve_inline_columns(&mut row)?;
-                if def.unique
-                    && let Some(prefix) = index_prefix_key(&col_types, &colls, &rindex, &row, &env)?
-                    && !seen_prefixes.insert(prefix)
-                {
-                    return Err(
-                        EngineError::unique_violation(&ci.table, &def.name).with_detail(
-                            self.index_detail(
-                                &table.name,
-                                &columns,
-                                &def,
-                                &rindex,
-                                &row,
-                                &env,
-                                DUPLICATED,
-                            ),
-                        ),
-                    );
-                }
-                entries.extend(index_entry_keys(
-                    &columns, &col_types, &colls, &rindex, &key, &row, &env,
-                )?);
-            }
-        }
+        let entries = self.build_index_entries(ci.db.as_deref(), table, &def, &mut meter)?;
         meter.guard()?;
 
         let name_key = def.name.to_string();
@@ -5184,11 +5067,6 @@ impl Engine {
             self.working_mut().put_index(&table_key, def, ps);
         }
         let istore = self.index_store_mut_scoped(ci.db.as_deref(), &name_key);
-        // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
-        // so the built tree packs ~full instead of splintering under the storage-key order the
-        // scan produced (random in entry-key space). Part of the byte contract — the sort fixes
-        // the built tree's shape across cores.
-        entries.sort_unstable();
         for ek in entries {
             if !istore.insert(ek, Vec::new())? {
                 return Err(crate::error::EngineError::data_corrupted(
@@ -5200,6 +5078,367 @@ impl Engine {
             cost: meter.accrued,
             rows_affected: None,
         })
+    }
+
+    /// Run a REINDEX (spec/design/indexes.md §10): rebuild each target index in place from its stored
+    /// definition, as if it were dropped and created again with the same name, keys, uniqueness,
+    /// method, and predicate — but in one all-or-nothing statement that keeps the index's catalog
+    /// position and constraint links. Every key expression and predicate is re-admitted against the
+    /// handle's current environment, so the rebuilt index records the current host-function
+    /// identities and timezone data (extensibility.md §8.1, index-dependencies.md). Every new tree is
+    /// built before any is installed, so a failure (23505, a resolution error, the cost ceiling)
+    /// changes nothing. Cost: each index charges exactly its CREATE INDEX build scan.
+    pub(crate) fn execute_reindex(&mut self, rx: Reindex) -> Result<Outcome> {
+        let targets = self.reindex_targets(&rx)?;
+        let mut meter = self.session.new_meter();
+        let mut rebuilt: Vec<(String, String, IndexDef, Vec<Vec<u8>>)> = Vec::new();
+        for (scope, table_key, names) in &targets {
+            if names.is_empty() {
+                continue;
+            }
+            self.check_attachment_writable(Some(scope))?;
+            let table = self
+                .snap_for_scope(scope)
+                .and_then(|s| s.table(table_key))
+                .expect("a REINDEX target table resolved above");
+            self.ensure_collations_writable(&table.columns)?;
+            for name in names {
+                let old = table
+                    .indexes
+                    .iter()
+                    .find(|i| &i.name == name)
+                    .expect("a REINDEX target index belongs to its table");
+                let def = self.readmit_index_def(table, old)?;
+                let entries = self.build_index_entries(Some(scope), table, &def, &mut meter)?;
+                rebuilt.push((scope.clone(), table_key.clone(), def, entries));
+            }
+        }
+        meter.guard()?;
+        for (scope, table_key, def, entries) in rebuilt {
+            let name_key = def.name.to_string();
+            let ps = match scope.as_str() {
+                "main" | "temp" => self.page_size,
+                other => self.attach_page_size(other),
+            };
+            let snap = match scope.as_str() {
+                "temp" => self.temp_working_mut(),
+                "main" => self.working_mut(),
+                other => {
+                    let other = other.to_string();
+                    self.attach_write_snap(&other)
+                }
+            };
+            snap.remove_index(&table_key, &name_key);
+            snap.put_index(&table_key, def, ps);
+            let istore = self.index_store_mut_scoped(Some(&scope), &name_key);
+            for ek in entries {
+                if !istore.insert(ek, Vec::new())? {
+                    return Err(crate::error::EngineError::data_corrupted(
+                        "index entry keys are unique (storage-key suffix)",
+                    ));
+                }
+            }
+        }
+        Ok(Outcome::Statement {
+            cost: meter.accrued,
+            rows_affected: None,
+        })
+    }
+
+    /// Re-admit a stored index definition for REINDEX (spec/design/indexes.md §10): an unparsed key
+    /// or predicate is XX003 (unparsable-definitions.md §3.4); every expression is resolved again and
+    /// its host-function and timezone dependencies re-collected from the current environment exactly
+    /// as CREATE INDEX collects them (a missing function 42883, a no-longer-admissible one 42P17, an
+    /// unloaded named zone 22023). Column keys, uniqueness, method, and predicate text carry over.
+    fn readmit_index_def(&self, table: &Table, old: &IndexDef) -> Result<IndexDef> {
+        let unparsed = old
+            .keys
+            .iter()
+            .any(|k| matches!(k, IndexKey::Expr(e) if e.unparsed))
+            || old.predicate.as_ref().is_some_and(|p| p.unparsed);
+        if unparsed {
+            return Err(crate::catalog::unparsable_index_error(
+                &table.name,
+                &old.name,
+            ));
+        }
+        let mut host_deps: Vec<HostFuncDep> = Vec::new();
+        let mut timezone_deps = TimeZoneDeps::default();
+        for k in &old.keys {
+            if let IndexKey::Expr(e) = k {
+                self.admit_index_expr(table, &e.expr, false, &mut host_deps, &mut timezone_deps)?;
+            }
+        }
+        if let Some(pred) = &old.predicate {
+            self.admit_index_expr(table, &pred.expr, true, &mut host_deps, &mut timezone_deps)?;
+        }
+        sort_host_deps(&mut host_deps);
+        timezone_deps.validate()?;
+        let mut def = old.clone();
+        def.host_deps = host_deps;
+        def.timezone_deps = timezone_deps;
+        Ok(def)
+    }
+
+    /// Resolve a REINDEX's targets (spec/design/indexes.md §10) as `(scope, table key, index names)`
+    /// triples, each scope explicit (`main` / `temp` / an attachment) and each table's indexes in
+    /// catalog (name byte) order. INDEX names one index (42P01 when no relation has the name, 42809
+    /// when it is not an index); TABLE names one table (42809 for a catalog relation, an index, a view,
+    /// or a sequence; 42P01 when missing); DATABASE takes every table of the named database in name
+    /// byte order — `main` (the default) followed by the session's temporary tables, or one attachment;
+    /// SYSTEM has no system catalogs to rebuild. Any other database name is 0A000, as PostgreSQL.
+    fn reindex_targets(&self, rx: &Reindex) -> Result<Vec<(String, String, Vec<String>)>> {
+        let index_names =
+            |t: &Table| -> Vec<String> { t.indexes.iter().map(|i| i.name.to_string()).collect() };
+        match rx.kind {
+            ReindexKind::Index | ReindexKind::Table => {
+                let name = rx.name.as_deref().expect("INDEX/TABLE carry a name");
+                if rx.kind == ReindexKind::Table {
+                    check_catalog_rel_write(name)?;
+                }
+                let scope = match rx.db.as_deref() {
+                    Some(q) => {
+                        let q = q.to_string();
+                        if q != "main" && q != "temp" && self.attach_read_snap(&q).is_none() {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedTable,
+                                format!("database \"{q}\" is not attached"),
+                            ));
+                        }
+                        q
+                    }
+                    None if self.is_temp_table(name) || self.is_temp_index(name) => {
+                        "temp".to_string()
+                    }
+                    None => "main".to_string(),
+                };
+                let snap = self.snap_for_scope(&scope).expect("scope validated above");
+                let shown = match &rx.db {
+                    Some(q) => format!("{q}.{name}"),
+                    None => name.to_string(),
+                };
+                let found = if rx.kind == ReindexKind::Index {
+                    snap.find_index(name)
+                        .map(|(tk, _)| (tk.to_string(), vec![name.to_string()]))
+                } else {
+                    snap.table(name)
+                        .map(|t| (t.name.to_string(), index_names(t)))
+                };
+                if let Some((table_key, names)) = found {
+                    return Ok(vec![(scope, table_key, names)]);
+                }
+                let other_kind = snap.table(name).is_some()
+                    || snap.find_index(name).is_some()
+                    || snap.view(name).is_some()
+                    || snap.sequence(name).is_some()
+                    || (rx.kind == ReindexKind::Index && is_catalog_rel_name(name));
+                if other_kind {
+                    let what = if rx.kind == ReindexKind::Index {
+                        "an index"
+                    } else {
+                        "a table or materialized view"
+                    };
+                    return Err(EngineError::new(
+                        SqlState::WrongObjectType,
+                        format!("\"{shown}\" is not {what}"),
+                    ));
+                }
+                Err(EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("relation \"{shown}\" does not exist"),
+                ))
+            }
+            ReindexKind::Database | ReindexKind::System => {
+                if rx.kind == ReindexKind::System && rx.concurrently {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "cannot reindex system catalogs concurrently",
+                    ));
+                }
+                let scope = match rx.name.as_deref() {
+                    None => "main".to_string(),
+                    Some(n) => {
+                        let n = n.to_string();
+                        if n != "main" && (n == "temp" || self.attach_read_snap(&n).is_none()) {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "can only reindex the currently open database",
+                            ));
+                        }
+                        n
+                    }
+                };
+                if rx.kind == ReindexKind::System {
+                    return Ok(Vec::new());
+                }
+                let mut scopes = vec![scope.clone()];
+                if scope == "main" {
+                    scopes.push("temp".to_string());
+                }
+                let mut out = Vec::new();
+                for sc in scopes {
+                    let snap = self.snap_for_scope(&sc).expect("scope validated above");
+                    for t in snap.tables_sorted() {
+                        out.push((sc.clone(), t.name.to_string(), index_names(t)));
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Resolve one index key expression (`predicate` false) or partial-index predicate (`predicate`
+    /// true) against `table` and admit it for a persisted index (spec/design/indexes.md §1/§2/§9):
+    /// a subquery is 0A000 and a bind parameter 42P02 (structural pre-walk); an aggregate 42803 /
+    /// window 42P20 / non-boolean predicate 42804 fall out of the resolver; a non-immutable operation
+    /// is 42P17; a key's result type must be key-encodable (0A000). The host-function and timezone
+    /// dependencies it reaches accumulate into `host_deps` / `tz` (extensibility.md §8.1,
+    /// index-dependencies.md). Shared by CREATE INDEX and REINDEX (§10), which re-admits every stored
+    /// expression against the current environment.
+    fn admit_index_expr(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        predicate: bool,
+        host_deps: &mut Vec<HostFuncDep>,
+        tz: &mut TimeZoneDeps,
+    ) -> Result<()> {
+        // A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
+        // uncorrelated one, so it is rejected here, before resolution).
+        reject_index_predicate_structure(expr)?;
+        let scope = Scope::index(self, table);
+        let mut pt = ParamTypes::for_index();
+        let node = if predicate {
+            let node = resolve_boolean_filter(&scope, expr, &mut pt)?;
+            if pt.nonimmutable {
+                return Err(EngineError::new(
+                    SqlState::InvalidObjectDefinition,
+                    "functions in index predicate must be marked IMMUTABLE".to_string(),
+                ));
+            }
+            node
+        } else {
+            let (node, rtype) = resolve(&scope, expr, None, &mut AggCtx::Forbidden, &mut pt)?;
+            // Dependencies accumulate at each resolved operation, through every child.
+            if pt.nonimmutable {
+                return Err(EngineError::new(
+                    SqlState::InvalidObjectDefinition,
+                    "functions in index expression must be marked IMMUTABLE".to_string(),
+                ));
+            }
+            // The result type must be key-encodable (a composite result is 0A000).
+            if resolved_to_key_type(&rtype).is_none() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "an index on an expression of this result type is not supported yet"
+                        .to_string(),
+                ));
+            }
+            node
+        };
+        // Collect + admit any host functions the expression calls (§8.1, step 4): each must be
+        // IMMUTABLE + carry a component identity, else 42P17 (this also closes the latent leak where
+        // a volatile host function passed the syntactic immutability walk).
+        collect_index_host_deps(&node, self.session.env.functions(), host_deps)?;
+        tz.merge(&pt.timezone_deps);
+        Ok(())
+    }
+
+    /// Compute a new index's entry keys from `table`'s current rows (the CREATE INDEX build, shared
+    /// with REINDEX — spec/design/indexes.md §2/§10), sorted by entry key. The build scan is metered
+    /// on `meter` (cost.md §3): page_read per table-tree node + storage_row_read per row, over the
+    /// touched set of columns the keys and predicate read (a spilled value adds its
+    /// `value_decompress` slabs). A UNIQUE definition verifies the rows (23505, indexes.md §8). An
+    /// expression key evaluating with an error aborts the build, so nothing is registered.
+    pub(crate) fn build_index_entries(
+        &self,
+        scope: Option<&str>,
+        table: &Table,
+        def: &IndexDef,
+        meter: &mut Meter,
+    ) -> Result<Vec<Vec<u8>>> {
+        let columns = table.columns.clone();
+        let colls = self.column_collations(&columns);
+        let mut mask = vec![false; columns.len()];
+        for k in &def.keys {
+            match k {
+                IndexKey::Column(c) => mask[*c] = true,
+                IndexKey::Expr(e) => {
+                    for c in check_referenced_columns(&e.expr, &columns) {
+                        mask[c] = true;
+                    }
+                }
+            }
+        }
+        // A partial index's predicate is evaluated per row during the build (indexes.md §9), so the
+        // columns it references join the touched set — the scan reads (and, if spilled, decompresses)
+        // them, keeping the build cost deterministic and cross-core identical.
+        if let Some(pred) = &def.predicate {
+            for c in check_referenced_columns(&pred.expr, &columns) {
+                mask[c] = true;
+            }
+        }
+        // Resolve the index once (column ordinals + resolved expression keys); the eval env for any
+        // expression key (a fresh statement rng — index expressions are immutable, so it is never
+        // read). Built before the `&mut self` writes below, so the `&self` borrow is released first.
+        let rindex = self.resolve_index(table, def)?;
+        let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        // A UNIQUE build verifies the existing rows before the index is registered
+        // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
+        // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
+        let mut seen_prefixes: HashSet<Vec<u8>> = HashSet::new();
+        {
+            let env = EvalEnv {
+                exec: self,
+                params: &[],
+                outer: &[],
+                rng: &rng,
+                ctes: CteCtx::empty(),
+                host_batch: None,
+            };
+            let store = self.store_scoped(scope, &table.name);
+            // Resolved column types (composite index key vehicle, §2.15).
+            let col_types: Vec<ColType> = store.col_types().to_vec();
+            let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
+            meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
+            entries.reserve(table_entries.len());
+            for (key, mut row) in table_entries {
+                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                meter.charge(COSTS.storage_row_read);
+                // Resolve a faulted row's touched columns before encoding (an expression key may
+                // read a spilled value; the evaluator's `Unfetched` backstop also handles it).
+                store.resolve_inline_columns(&mut row)?;
+                if def.unique
+                    && let Some(prefix) = index_prefix_key(&col_types, &colls, &rindex, &row, &env)?
+                    && !seen_prefixes.insert(prefix)
+                {
+                    return Err(
+                        EngineError::unique_violation(&table.name, &def.name).with_detail(
+                            self.index_detail(
+                                &table.name,
+                                &columns,
+                                &def,
+                                &rindex,
+                                &row,
+                                &env,
+                                DUPLICATED,
+                            ),
+                        ),
+                    );
+                }
+                entries.extend(index_entry_keys(
+                    &columns, &col_types, &colls, &rindex, &key, &row, &env,
+                )?);
+            }
+        }
+        meter.guard()?;
+        // Sorted by entry key (indexes.md §1): every insert is then a right-edge append, so the built
+        // tree packs ~full instead of splintering under the storage-key order the scan produced
+        // (random in entry-key space). Part of the byte contract — the sort fixes the built tree's
+        // shape across cores.
+        entries.sort_unstable();
+        Ok(entries)
     }
 
     /// Run a DROP INDEX (spec/design/indexes.md §2): a table's name is 42809, a missing one
