@@ -713,6 +713,25 @@ export type CreateIndex = {
 // (spec/design/indexes.md §2). Missing → 42704; a table's name → 42809.
 export type DropIndex = { kind: "dropIndex"; name: string };
 
+// ReindexKind is the object kind a `REINDEX` names (spec/design/indexes.md §10). `SCHEMA` is refused
+// 0A000 by the parser (jed has no schemas), so it has no member.
+export type ReindexKind = "index" | "table" | "database" | "system";
+
+// Reindex is `REINDEX [(option, …)] {INDEX | TABLE} [CONCURRENTLY] [db.]name` or
+// `REINDEX [(option, …)] {DATABASE | SYSTEM} [CONCURRENTLY] [name]` — rebuild secondary indexes in
+// place from their stored definitions (spec/design/indexes.md §10). db is the optional qualifier of
+// an INDEX/TABLE target; name is undefined only for a DATABASE/SYSTEM without a name. concurrently
+// merges the positional keyword and the option; verbose is accepted and has no observable effect
+// (jed has no notice channel).
+export type Reindex = {
+  kind: "reindex";
+  reindexKind: ReindexKind;
+  db?: string;
+  name?: string;
+  concurrently: boolean;
+  verbose: boolean;
+};
+
 // CreateType is a `CREATE TYPE <name> AS ( field type [NOT NULL] [, …] )` statement — a
 // user-defined composite (row) type (spec/design/composite.md, grammar.md). Execution resolves
 // each field's type (a built-in scalar or a previously-defined composite — 42704 if unknown),
@@ -1488,6 +1507,7 @@ export type Statement =
   | DropTable
   | CreateIndex
   | DropIndex
+  | Reindex
   | CreateType
   | DropType
   | CreateSequence

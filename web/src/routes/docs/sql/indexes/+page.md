@@ -98,6 +98,9 @@ ORDER BY id;`;
 	const jsonbKeyQuery = `SELECT id FROM event
 WHERE body ? 'tags'
 ORDER BY id;`;
+
+	const reindexQuery = `REINDEX TABLE city;
+SELECT name FROM city WHERE region = 2 ORDER BY name;`;
 </script>
 
 <svelte:head>
@@ -229,16 +232,14 @@ timezone) is `42P17`. The same rules compose through CASE, COALESCE, arrays, and
 Named zones must be loaded when the index is created. jed stores their version and checksum with
 the index; a computed zone argument pins the entire loaded zone set. If the loaded data differs,
 reads skip that index and writes to its table fail with `XX002`. After loading the desired timezone
-bundle in a fresh process, rebuild the affected index using a transaction:
+bundle in a fresh process, rebuild the affected index with [`REINDEX`](#rebuilding-indexes-reindex):
 
 ```sql
-BEGIN;
-DROP INDEX local_day;
-CREATE INDEX local_day ON events (((created_at AT TIME ZONE 'America/New_York')::date));
-COMMIT;
+REINDEX INDEX local_day;
 ```
 
-If rebuilding fails, `ROLLBACK` preserves the old committed index. These dependency records use
+The rebuild pins the zone data now loaded. If it fails, nothing changes and the old index keeps its
+pins. These dependency records use
 file format 32; plain timestamp values and column indexes require no timezone data.
 
 ## GIN indexes for arrays (`USING gin`)
@@ -362,3 +363,33 @@ GIN this release covers a focused surface (it grows from here):
   is rejected (`0A000`), matching PostgreSQL.
 
 `DROP INDEX`, auto-naming, and the `DROP TABLE` cascade work the same as for an ordered index.
+
+## Rebuilding indexes (`REINDEX`)
+
+`REINDEX` rebuilds indexes from their stored definitions, as if each were dropped and created again
+with the same name, keys, uniqueness, and predicate — in one all-or-nothing statement that keeps the
+constraints an index backs. It never changes a query's answer:
+
+```sql
+REINDEX INDEX city_region;     -- one index
+REINDEX TABLE city;            -- every index of a table
+REINDEX DATABASE;              -- every index in the database (and your temporary tables)
+```
+
+<LiveSql demo="reindexQuery" seed={orderedSeed} query={reindexQuery} rows={3} />
+
+Its main use is to make an index usable again after something it depends on changed: a
+[host function](../../api/host-functions/) with a new version, or the timezone data an index pinned
+(above). Until then reads skip such an index and writes to its table fail with `XX002`. `REINDEX`
+re-resolves the key and predicate against what is loaded now, records the new dependencies, and
+rebuilds the keys; a `UNIQUE` index re-checks its rows (`23505`). If any index fails, none changes.
+An index whose stored definition this version of jed cannot parse (`XX003`) can only be dropped.
+
+The cost is exactly what `CREATE INDEX` of each rebuilt index would charge. `REINDEX INDEX` and
+`REINDEX TABLE` run inside a transaction and roll back with it; as in PostgreSQL, `REINDEX DATABASE`,
+`REINDEX SYSTEM`, and the `CONCURRENTLY` form cannot run inside a transaction block (`25001`).
+`CONCURRENTLY` otherwise rebuilds the same way — readers never wait for the writer in jed — and the
+`(VERBOSE)` option prints nothing. `REINDEX SYSTEM` has nothing to rebuild (jed has no system-catalog
+indexes), and `REINDEX SCHEMA` and the `TABLESPACE` option are not supported (`0A000`). A session
+needs DDL permission, and `SELECT` on the table for the `INDEX` and `TABLE` forms.
+

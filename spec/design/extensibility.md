@@ -782,8 +782,8 @@ never noticed the swap.
   The `DROP` removes the stale check without resolving it. The `ADD` validates **every existing
   row** against the *current* implementation (`23514` names the first row the new rule rejects, in
   which case nothing changes) and persists the current dependency list. This is the index recipe
-  ([index-dependencies.md](index-dependencies.md) *Rebuilding*), and it needs no `REINDEX`-style
-  convenience. jed has no `NOT VALID` / `VALIDATE CONSTRAINT`; if that surface lands later, its
+  ([index-dependencies.md](index-dependencies.md) *Rebuilding*), which `REINDEX` packages for an
+  index; a check needs no such convenience. jed has no `NOT VALID` / `VALIDATE CONSTRAINT`; if that surface lands later, its
   `VALIDATE` would re-stamp in place.
 - **Re-collection whenever every row is re-validated.** A statement that evaluates a check against
   **every row of the end state** re-collects that check's list from its end-state resolution instead
@@ -866,7 +866,8 @@ first is cheap and high-value; the second is the frontier.
 > re-checks each dependency against the current registry: a **read** whose candidate index no longer
 > matches silently skips it (a correct heap scan); a **write** that would maintain it is refused
 > (`XX002` on a component/version mismatch, `42883` on a missing function) — the table is read-only
-> for that index until a rebuild, never a silent stale-key read. This also **closed a latent bug**: a
+> for that index until a rebuild — `REINDEX`, which re-resolves the expression against the current
+> registry and re-records each dependency ([indexes.md](indexes.md) §10) — never a silent stale-key read. This also **closed a latent bug**: a
 > host function (even a `volatile` one) previously leaked into an index expression, because the
 > immutability gate was a purely syntactic walk that never saw host functions; now a non-immutable or
 > unversioned host function in an index is `42P17`.
@@ -1018,7 +1019,8 @@ Graded, per object (blast radius contained to the dependent object, never the da
 - **A host type in the `PRIMARY KEY`** (its key bytes uninterpretable) may force the whole table into
   **read-only heap-scan** mode.
 - **A re-established *different* semantic version** (§7) requires an explicit **rebuild/migration**,
-  never a silent stale-key read.
+  never a silent stale-key read. For an index that rebuild is `REINDEX` ([indexes.md](indexes.md)
+  §10).
 
 This dependency machinery is **not optional** once host code can appear in persisted types or index
 expressions — and it need not wait for the full compatibility.md manifest: a **small per-object

@@ -5207,7 +5207,12 @@ impl Engine {
                         }
                         q
                     }
-                    None if self.is_temp_table(name) || self.is_temp_index(name) => {
+                    // The resolution walk: a name in the session's temporary domain (a table, an
+                    // index, or an owned sequence — preclude-overlaps keeps it in one scope), else main.
+                    None if self.is_temp_table(name)
+                        || self.is_temp_index(name)
+                        || self.is_temp_sequence(name) =>
+                    {
                         "temp".to_string()
                     }
                     None => "main".to_string(),

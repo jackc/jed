@@ -42,6 +42,7 @@ import type {
   OrderKey,
   Overriding,
   QueryExpr,
+  ReindexKind,
   ReturningClause,
   Select,
   SelectItem,
@@ -498,6 +499,8 @@ class Parser {
     switch (this.peekKeyword()) {
       case "analyze":
         return this.parseAnalyze();
+      case "reindex":
+        return this.parseReindex();
       // CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX — grammar.md
       // §30; UNIQUE needs no lookahead of its own — after CREATE the next word being
       // UNIQUE can only be CREATE UNIQUE INDEX).
@@ -848,6 +851,105 @@ class Parser {
       this.expect("rparen");
     }
     return { kind: "analyze", name, db, columns };
+  }
+
+  // parseReindex parses `REINDEX [(option, …)] {INDEX | TABLE} [CONCURRENTLY] [db.]name` or
+  // `REINDEX [(option, …)] {DATABASE | SYSTEM} [CONCURRENTLY] [name]` (spec/design/indexes.md §10,
+  // grammar.md §61). Options are `VERBOSE [boolean]` and `CONCURRENTLY [boolean]`, repeatable (the
+  // last value wins, as PostgreSQL); an unknown option is 42601, `TABLESPACE` and `REINDEX SCHEMA`
+  // are 0A000 (jed has neither tablespaces nor schemas). The positional `CONCURRENTLY` is recognized
+  // only before a name for INDEX/TABLE, so a relation named `concurrently` stays nameable.
+  private parseReindex(): Statement {
+    this.expectKeyword("reindex");
+    let concurrently = false;
+    let verbose = false;
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      for (;;) {
+        const name = this.peekKeyword();
+        if (name === "") throw engineError("syntax_error", "expected a REINDEX option");
+        this.advance();
+        if (name === "verbose") {
+          verbose = this.parseReindexBoolean(name);
+        } else if (name === "concurrently") {
+          concurrently = this.parseReindexBoolean(name);
+        } else if (name === "tablespace") {
+          throw engineError(
+            "feature_not_supported",
+            "REINDEX TABLESPACE is not supported: jed has no tablespaces",
+          );
+        } else {
+          throw engineError("syntax_error", `unrecognized REINDEX option "${name}"`);
+        }
+        if (this.peek().kind === "rparen") {
+          this.advance();
+          break;
+        }
+        if (this.peek().kind !== "comma") {
+          throw engineError("syntax_error", "expected ',' or ')' in REINDEX option list");
+        }
+        this.advance();
+      }
+    }
+    let reindexKind: ReindexKind;
+    switch (this.peekKeyword()) {
+      case "index":
+        reindexKind = "index";
+        break;
+      case "table":
+        reindexKind = "table";
+        break;
+      case "database":
+        reindexKind = "database";
+        break;
+      case "system":
+        reindexKind = "system";
+        break;
+      case "schema":
+        throw engineError(
+          "feature_not_supported",
+          "REINDEX SCHEMA is not supported: jed has no schemas",
+        );
+      default:
+        throw engineError(
+          "syntax_error",
+          "expected INDEX, TABLE, SCHEMA, DATABASE, or SYSTEM after REINDEX",
+        );
+    }
+    this.advance();
+    const relation = reindexKind === "index" || reindexKind === "table";
+    if (this.peekKeyword() === "concurrently" && (!relation || isIdentKind(this.peekKindAt(1)))) {
+      this.advance();
+      concurrently = true;
+    }
+    let db: string | undefined;
+    let name: string | undefined;
+    if (relation) {
+      [db, name] = this.parseQualifiedTableName();
+    } else if (isIdentKind(this.peek().kind)) {
+      name = this.expectIdentifier();
+    }
+    return { kind: "reindex", reindexKind, db, name, concurrently, verbose };
+  }
+
+  // parseReindexBoolean parses a REINDEX option's optional boolean value (PostgreSQL's
+  // defGetBoolean): omitted means TRUE; TRUE/FALSE/ON/OFF (bare or quoted) and the integers 1/0 are
+  // accepted; anything else is 42601.
+  private parseReindexBoolean(option: string): boolean {
+    const t = this.peek();
+    if (t.kind === "comma" || t.kind === "rparen") return true;
+    let value: boolean | null = null;
+    if (t.kind === "word" || t.kind === "str") {
+      const w = (t.kind === "word" ? t.word! : t.str!).toLowerCase();
+      if (w === "true" || w === "on") value = true;
+      else if (w === "false" || w === "off") value = false;
+    } else if (t.kind === "int") {
+      if (t.int === 1n) value = true;
+      else if (t.int === 0n) value = false;
+    }
+    if (value === null) throw engineError("syntax_error", `${option} requires a Boolean value`);
+    this.advance();
+    return value;
   }
 
   // parseBegin parses `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION

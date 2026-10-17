@@ -95,6 +95,30 @@ test("timezone pins persist; skew excludes reads and blocks writes; transactiona
   }
 });
 
+// REINDEX (spec/design/indexes.md §10) is the one-statement form of the transactional DROP/CREATE
+// rebuild: it re-pins the named zone to the loaded data, a rolled-back REINDEX leaves the stale pin,
+// and the rebuilt UNIQUE partial index enforces again.
+test("timezone REINDEX re-pins", () => {
+  const image = toImage(build(), 4096, 1n);
+  for (const mode of ["version", "checksum", "missing"] as const) {
+    const db = loadEngine(corruptPin(image, mode), TZ_ENV);
+    code(() => run(db, "DELETE FROM t WHERE id = 2"), "XX002");
+    run(db, "BEGIN");
+    run(db, "REINDEX INDEX zone_idx");
+    run(db, "ROLLBACK");
+    code(() => run(db, "DELETE FROM t WHERE id = 2"), "XX002");
+    run(db, "REINDEX TABLE t");
+    run(db, "INSERT INTO t VALUES (3,8,'2024-06-01 00:00:00+00')");
+    code(() => run(db, "INSERT INTO t VALUES (4,7,'2024-06-01 00:00:00+00')"), "23505");
+    // The re-pinned index survives a round trip in the same environment.
+    const again = loadEngine(toImage(db, 4096, 1n), TZ_ENV);
+    run(again, "DELETE FROM t WHERE id = 2");
+  }
+  // Without the zone loaded, the rebuild cannot re-admit the explicit zone (22023).
+  const bare = loadEngine(image, new Environment());
+  code(() => run(bare, "REINDEX INDEX zone_idx"), "22023");
+});
+
 test("safe timestamptz expressions remain indexed across session changes", () => {
   const db = build();
   for (const [i, pred] of [

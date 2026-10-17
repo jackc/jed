@@ -22,7 +22,7 @@ func stmtIsWrite(stmt statement) bool {
 		return stmt.Explain.Analyze && stmtIsWrite(*stmt.Explain.Inner)
 	}
 	if stmt.Analyze != nil || stmt.CreateTable != nil || stmt.DropTable != nil || stmt.AlterTable != nil ||
-		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
+		stmt.CreateIndex != nil || stmt.DropIndex != nil || stmt.Reindex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
 		stmt.CreateSequence != nil || stmt.AlterSequence != nil || stmt.DropSequence != nil ||
 		stmt.CreateView != nil || stmt.DropView != nil || stmt.AlterView != nil ||
@@ -478,6 +478,24 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	// before execution resolves/evaluates them, so a revoked function cannot be invoked through them
 	// (session.md §5.3).
 	db.collectCatalogExprPrivs(stmt, &req)
+	// REINDEX INDEX reads its owning table's rows: SELECT on that table (indexes.md §10).
+	if rx := stmt.Reindex; rx != nil && rx.Kind == reindexIndex && rx.HasName {
+		var tableKey string
+		var found bool
+		if rx.DB != nil {
+			if snap := db.snapForScope(*rx.DB); snap != nil {
+				tableKey, _, found = snap.findIndex(rx.Name)
+			}
+		} else {
+			tableKey, _, found = db.tempSnap().findIndex(rx.Name)
+			if !found {
+				tableKey, _, found = db.findIndex(rx.Name)
+			}
+		}
+		if found {
+			req.needTable(tableKey, PrivSelect)
+		}
+	}
 	if req.isDDL {
 		// DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
 		// table by allowTempDDL, everything else (persistent) by allowDDL. A CREATE TABLE is classified
@@ -733,6 +751,16 @@ func collectStmtPrivs(stmt statement, req *privReq) {
 	case stmt.Analyze != nil:
 		req.isDDL = true
 		req.needTable(stmt.Analyze.Name, PrivSelect)
+	case stmt.Reindex != nil:
+		// REINDEX is maintenance like ANALYZE (session.md §5.3): allowDDL, plus SELECT on the target
+		// table — an INDEX target's owning table is added by checkPrivileges, which can resolve the
+		// index. DATABASE / SYSTEM need only allowDDL (PostgreSQL's database-owner check). The temp
+		// split (allowTempDDL) does not apply: it governs schema creation and removal, not
+		// maintenance (spec/design/indexes.md §10).
+		req.isDDL = true
+		if stmt.Reindex.Kind == reindexTable && stmt.Reindex.HasName {
+			req.needTable(stmt.Reindex.Name, PrivSelect)
+		}
 	case stmt.CreateTable != nil:
 		req.isDDL = true
 		// A temp table's DDL is gated by the temp-scoped split of allowDDL (temp-tables.md §5):

@@ -231,6 +231,12 @@ func (p *parser) parseStatement() (statement, error) {
 			return statement{}, err
 		}
 		return statement{Analyze: analyze}, nil
+	case "reindex":
+		rx, err := p.parseReindex()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Reindex: rx}, nil
 	// CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX — grammar.md
 	// §30; UNIQUE needs no lookahead of its own — after CREATE the next word being UNIQUE
 	// can only be CREATE UNIQUE INDEX).
@@ -728,6 +734,121 @@ func (p *parser) parseAnalyze() (*analyzeStmt, error) {
 		}
 	}
 	return &analyzeStmt{Name: name, DB: db, Columns: columns}, nil
+}
+
+// parseReindex parses `REINDEX [(option, …)] {INDEX | TABLE} [CONCURRENTLY] [db.]name` or
+// `REINDEX [(option, …)] {DATABASE | SYSTEM} [CONCURRENTLY] [name]` (spec/design/indexes.md §10,
+// grammar.md §61). Options are `VERBOSE [boolean]` and `CONCURRENTLY [boolean]`, repeatable (the
+// last value wins, as PostgreSQL); an unknown option is 42601, TABLESPACE and REINDEX SCHEMA are
+// 0A000 (jed has neither tablespaces nor schemas). The positional CONCURRENTLY is recognized only
+// before a name for INDEX/TABLE, so a relation named `concurrently` stays nameable.
+func (p *parser) parseReindex() (*reindexStmt, error) {
+	if err := p.expectKeyword("reindex"); err != nil {
+		return nil, err
+	}
+	rx := &reindexStmt{}
+	if p.peek().Kind == tokLParen {
+		p.advance()
+		for {
+			name := p.peekKeyword()
+			if name == "" {
+				return nil, newError(SyntaxError, "expected a REINDEX option")
+			}
+			p.advance()
+			switch name {
+			case "verbose":
+				v, err := p.parseReindexBoolean(name)
+				if err != nil {
+					return nil, err
+				}
+				rx.Verbose = v
+			case "concurrently":
+				v, err := p.parseReindexBoolean(name)
+				if err != nil {
+					return nil, err
+				}
+				rx.Concurrently = v
+			case "tablespace":
+				return nil, newError(FeatureNotSupported, "REINDEX TABLESPACE is not supported: jed has no tablespaces")
+			default:
+				return nil, newError(SyntaxError, `unrecognized REINDEX option "`+name+`"`)
+			}
+			if p.peek().Kind == tokRParen {
+				p.advance()
+				break
+			}
+			if p.peek().Kind != tokComma {
+				return nil, newError(SyntaxError, "expected ',' or ')' in REINDEX option list")
+			}
+			p.advance()
+		}
+	}
+	switch p.peekKeyword() {
+	case "index":
+		rx.Kind = reindexIndex
+	case "table":
+		rx.Kind = reindexTable
+	case "database":
+		rx.Kind = reindexDatabase
+	case "system":
+		rx.Kind = reindexSystem
+	case "schema":
+		return nil, newError(FeatureNotSupported, "REINDEX SCHEMA is not supported: jed has no schemas")
+	default:
+		return nil, newError(SyntaxError, "expected INDEX, TABLE, SCHEMA, DATABASE, or SYSTEM after REINDEX")
+	}
+	p.advance()
+	relation := rx.Kind == reindexIndex || rx.Kind == reindexTable
+	if p.peekKeyword() == "concurrently" && (!relation || isIdentKind(p.peekKindAt(1))) {
+		p.advance()
+		rx.Concurrently = true
+	}
+	if relation {
+		db, name, err := p.parseQualifiedTableName()
+		if err != nil {
+			return nil, err
+		}
+		rx.DB, rx.Name, rx.HasName = db, name, true
+	} else if isIdentKind(p.peek().Kind) {
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		rx.Name, rx.HasName = name, true
+	}
+	return rx, nil
+}
+
+// parseReindexBoolean parses a REINDEX option's optional boolean value (PostgreSQL's defGetBoolean):
+// omitted means TRUE; TRUE/FALSE/ON/OFF (bare or quoted) and the integers 1/0 are accepted; anything
+// else is 42601.
+func (p *parser) parseReindexBoolean(option string) (bool, error) {
+	t := p.peek()
+	if t.Kind == tokComma || t.Kind == tokRParen {
+		return true, nil
+	}
+	var value, ok bool
+	switch t.Kind {
+	case tokWord, tokStr:
+		switch asciiLower(t.Word) {
+		case "true", "on":
+			value, ok = true, true
+		case "false", "off":
+			value, ok = false, true
+		}
+	case tokInt:
+		switch t.Int {
+		case 1:
+			value, ok = true, true
+		case 0:
+			value, ok = false, true
+		}
+	}
+	if !ok {
+		return false, newError(SyntaxError, option+" requires a Boolean value")
+	}
+	p.advance()
+	return value, nil
 }
 
 // parseBegin parses `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION

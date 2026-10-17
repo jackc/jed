@@ -64,7 +64,17 @@ so a different environment's loaded zone set cannot leave a stale admissibility 
 ## Rebuilding
 
 After reopening the database with an environment that loads the desired bundle (loading is additive,
-first definition wins; [environment.md](environment.md)), rebuild each affected index with transactional SQL:
+first definition wins; [environment.md](environment.md)), rebuild each affected index — this is the
+explicit atomic rebuild the pin waits for:
+
+```sql
+REINDEX INDEX active_accounts;      -- or REINDEX TABLE accounts, or REINDEX DATABASE
+```
+
+`REINDEX` ([indexes.md](indexes.md) §10) re-resolves the key and predicate against the loaded data,
+pins the zones it now reads, and rebuilds the tree, verifying uniqueness, in one all-or-nothing
+statement; a zone the expression names that is still not loaded is `22023`. It is exactly the
+transactional drop-and-recreate:
 
 ```sql
 BEGIN;
@@ -74,10 +84,9 @@ CREATE UNIQUE INDEX active_accounts ON accounts (email)
 COMMIT;
 ```
 
-The existing DDL transaction machinery makes replacement, dependency adoption, and uniqueness
-validation atomic. A failed build leaves the old committed index and its pins intact after
-rollback. DROP INDEX remains possible with missing or mismatched dependencies. A dedicated
-REINDEX/upgrade convenience API is not required for this lifecycle.
+Either way the existing DDL transaction machinery makes replacement, dependency adoption, and
+uniqueness validation atomic. A failed build leaves the old committed index and its pins intact
+after rollback. DROP INDEX remains possible with missing or mismatched dependencies.
 
 ## Verification
 
@@ -86,5 +95,5 @@ uniqueness and membership transitions, and matching indexed/full-scan results. P
 the oracle except for documented stronger argument-sensitive admission (epoch extraction and
 explicit-zone make_timestamptz) and dependency lifecycle. Per-core host tests cover differing
 session zones, missing/skewed bundles, dynamic zone sets, transaction rollback on failed rebuild,
-and prepared-plan invalidation. Byte fixtures and cross-core round trips cover the new flags,
+the `REINDEX` re-pin (including a rolled-back one), and prepared-plan invalidation. Byte fixtures and cross-core round trips cover the new flags,
 dependency ordering and encoding, and corruption checks.

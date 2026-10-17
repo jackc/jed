@@ -457,6 +457,92 @@ func TestHostFuncIndexReopenMissingFunction(t *testing.T) {
 	}
 }
 
+// geoHashCoarse is geo_hash(i64) -> i64 at version with a COARSER kernel (a / 10), so rows that were
+// distinct under v1's a * 10 can collide — the UNIQUE re-check REINDEX performs.
+func geoHashCoarse(component string, version uint32) *HostFunction {
+	return NewHostFunction("geo_hash", []string{"i64"}, "i64",
+		func(args []Value) (Value, error) { return IntValue(args[0].Int / 10), nil }).
+		WithVolatility(VolatilityImmutable).WithCrossCore(true).
+		WithComponentID(component).WithSemanticVersion(version)
+}
+
+func TestHostFuncIndexReindexRepairsVersionBump(t *testing.T) {
+	t.Parallel()
+	// REINDEX (spec/design/indexes.md §10) rebuilds a stale host-dependency index against the CURRENT
+	// registry and re-records its component/version, so the table is writable again — and stays so
+	// across a reopen in the same environment (the new dependency is what was persisted).
+	path := filepath.Join(t.TempDir(), "hostfunc_index_reindex.jed")
+	createGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 1)),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		"INSERT INTO t VALUES (1, 3), (2, 7)",
+		"CREATE INDEX ix ON t (geo_hash(a))")
+	func() {
+		db := openGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 2)))
+		defer db.Close()
+		wantHostCode(t, db, "INSERT INTO t VALUES (3, 3)", "XX002")
+		// A rolled-back REINDEX leaves the stale pin in place.
+		func() {
+			s := db.Session(SessionOptions{})
+			defer s.Close()
+			wantHostOK(t, s, "BEGIN")
+			wantHostOK(t, s, "REINDEX INDEX ix")
+			wantHostOK(t, s, "ROLLBACK")
+			wantHostCode(t, s, "INSERT INTO t VALUES (3, 3)", "XX002")
+		}()
+		// The committed rebuild repairs it, charging the CREATE INDEX build scan.
+		out, err := queryOutcome(db, "REINDEX TABLE t", nil)
+		if err != nil {
+			t.Fatalf("REINDEX TABLE t: %v", err)
+		}
+		if out.Cost <= 0 {
+			t.Fatalf("REINDEX cost = %d, want > 0 (the build scan)", out.Cost)
+		}
+		wantHostOK(t, db, "INSERT INTO t VALUES (3, 3)")
+		if got := geoIDs(t, db, "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"); len(got) != 2 || got[0] != 1 || got[1] != 3 {
+			t.Fatalf("after REINDEX + insert = %v, want [1 3]", got)
+		}
+	}()
+	db := openGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 2)))
+	defer db.Close()
+	// The re-recorded v2 dependency persisted.
+	wantHostOK(t, db, "INSERT INTO t VALUES (4, 7)")
+}
+
+func TestHostFuncIndexReindexRefusals(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_index_reindex_refusals.jed")
+	createGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 1)),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		"INSERT INTO t VALUES (1, 3), (2, 7)",
+		"CREATE UNIQUE INDEX ix ON t (geo_hash(a))")
+	// The function is gone: the expression cannot be re-admitted (42883), and nothing changes.
+	func() {
+		db := openGeoFile(t, path, NewEnvironment())
+		defer db.Close()
+		wantHostCode(t, db, "REINDEX INDEX ix", "42883")
+		wantHostCode(t, db, "REINDEX TABLE t", "42883")
+		wantHostCode(t, db, "REINDEX DATABASE", "42883")
+	}()
+	// The new implementation is no longer IMMUTABLE: 42P17, as CREATE INDEX would say.
+	func() {
+		volatile := NewHostFunction("geo_hash", []string{"i64"}, "i64",
+			func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
+			WithComponentID("com.example/geo_hash").WithSemanticVersion(2)
+		db := openGeoFile(t, path, envWith(t, volatile))
+		defer db.Close()
+		wantHostCode(t, db, "REINDEX INDEX ix", "42P17")
+	}()
+	// The new implementation maps both rows to one key: the UNIQUE rebuild re-checks (23505) and the
+	// stale index stays in place (writes still refused XX002).
+	db := openGeoFile(t, path, envWith(t, geoHashCoarse("com.example/geo_hash", 2)))
+	defer db.Close()
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (3, 4)", nil); err == nil {
+		t.Fatal("stale index should refuse the write")
+	}
+	wantHostCode(t, db, "REINDEX INDEX ix", "23505")
+	wantHostCode(t, db, "INSERT INTO t VALUES (3, 30)", "XX002")
+}
+
 // ── The batched kernel ABI (extensibility.md §4.2.1) ────────────────────────────────────────────
 // Batching is host-observable only (how often, and over how many rows, a kernel runs); rows, cost,
 // and errors must be identical to batch-of-one. These mirror the Rust/TS batch tests one-for-one.
