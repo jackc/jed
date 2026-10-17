@@ -5992,9 +5992,12 @@ fn validate_loaded_references(snap: &Snapshot) -> Result<()> {
                 if o >= parent.columns.len() {
                     return Err(corrupt("invalid foreign-key referenced column ordinal"));
                 }
-                if t.columns[local].ty != parent.columns[o].ty {
+                if !crate::executor::fk_types_comparable(
+                    &t.columns[local].ty,
+                    &parent.columns[o].ty,
+                ) {
                     return Err(corrupt(&format!(
-                        "foreign key {} pairs columns of different types",
+                        "foreign key {} pairs columns of incomparable types",
                         fk.name
                     )));
                 }

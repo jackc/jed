@@ -566,13 +566,35 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
    primary-key constraint on the referenced columns). When several match, the **primary key wins**,
    then unique indexes in ascending name byte order (jed's standing deterministic order) — the
    choice only fixes which physical tree the probe walks; the result is identical.
-5. **Types must match.** Each local column and its paired referenced column must be the **same**
-   scalar type — else **`42804`** (`foreign key constraint <name> cannot be implemented: key columns
-   <local> and <ref> are of incompatible types`). This is **stricter than PostgreSQL** (which allows
-   any pair sharing a btree equality operator, e.g. `i32`↔`i64`); the strict static type system
-   (CLAUDE.md §4) is the overriding reason, recorded in §6.7. Because the referenced columns are a
-   PK/unique key, they are already key-encodable; same-type pairing makes the local columns
-   key-encodable too, so no separate `0A000` type gate is needed.
+5. **Types must be comparable.** Each local column and its paired referenced column must be one of
+   these pairs — else **`42804`** (`foreign key constraint <name> cannot be implemented: key columns
+   <local> and <ref> are of incompatible types`):
+
+   - the **same** type (a typmod is not part of the type: `varchar(3)` pairs with `text`,
+     `decimal(6,2)` with `decimal`; a container pairs only with the identical container);
+   - **two integer types**, in either direction (`i16`, `i32`, `i64`);
+   - an **integer** local column referencing a **`decimal`** column;
+   - **`f32` with `f64`**, in either direction.
+
+   PostgreSQL accepts a pair when the referenced column's btree operator family holds an equality
+   from the referencing type, or the referencing type casts implicitly to the referenced one
+   (`ATAddForeignKeyConstraint`). That is exactly the pairs above within jed's comparison matrix
+   ([../types/compare.toml](../types/compare.toml)): `integer_ops` and `float_ops` hold the
+   cross-width equalities, and integer → `numeric` is an implicit cast. `decimal` → integer is
+   `42804` in both (no cast, no operator). PostgreSQL also accepts integer/`numeric` → float (an
+   implicit cast to `float8`) and the `date`/`timestamp`/`timestamptz` pairs (`datetime_ops`); jed
+   rejects them, since its matrix compares none of them (§6.7). Every admitted local type is
+   key-encodable, like the referenced PK/unique column, so no separate `0A000` type gate is needed.
+
+   The pairing is derived from the two column types, so nothing about it is persisted (§6.9). A
+   local column's value matches a parent key it **equals**: before a probe, each value is taken as its
+   equal of the paired column's type — an integer as itself in another integer type when in range, an
+   integer as the exact `decimal`, an integral in-range `decimal` as the integer, `f32` widened to
+   `f64`, a `f64` as the `f32` holding exactly the same value. A value with no equal there (an
+   integer outside a narrower type's range, `5.5` against an integer, the `f64` `0.1` against an
+   `f32`) **matches no key** — child-side `23503`, and never a referencing row on the parent side.
+   Equality is exact in every admitted pair, so the converted value encodes to exactly the key of every
+   equal stored value, in either direction (§6.4, §6.5 step 3).
 6. **Referential actions.** `NO ACTION` (the default), `RESTRICT`, `CASCADE`, `SET NULL`, and
    `SET DEFAULT` are accepted and stored. The three write actions are executed by the parent-side
    mutation closure described in §6.6.
@@ -700,15 +722,20 @@ the engine picks a **reverse access path** on the child table, deterministically
    or a partial index never qualifies: a partial index can omit a referencing row). Every key
    column after the leading `k` must be a **fixed-width scalar**, so an entry's storage-key suffix
    can be located by skipping fixed-width slots (the [indexes.md §5.1](indexes.md) rule); a child
-   PK always qualifies on this point, since its tail is the rest of the storage key itself.
+   PK always qualifies on this point, since its tail is the rest of the storage key itself. A child
+   key is usable whatever the paired types (§6.2 step 5): every admitted equality is exact, so the
+   child rows equal to a parent tuple hold exactly one encoded key.
 2. **Tie order.** When several qualify, the **primary key** wins, then indexes in ascending
    name byte order — the planner's canonical access-path tie order
    ([estimator.md](estimator.md)). Every qualifying path returns the same answer; the order only
    fixes which tree is probed, and so the cost.
 3. **The probe.** The disappearing parent tuple's values are re-encoded in the **chosen child
-   key's column order**, each with the child column's type and collation (identical to the
-   parent's by §6.2 step 5 and the collation gate above): bare member encodings concatenated for
-   the PK, `0x00`-tagged slots for an index ([indexes.md §3](indexes.md)). The child holds a
+   key's column order**, each first taken as its equal of the child column's type (§6.2 step 5) and
+   then encoded with that type and the child column's collation (the parent's, by the collation gate
+   above): bare member encodings concatenated for the PK, `0x00`-tagged slots for an index
+   ([indexes.md §3](indexes.md)). A parent value the child type cannot hold (an `i64` beyond a child
+   `i16`'s range, a non-integral `decimal` against a child integer) has no referencing row: the
+   check passes with no probe. The child holds a
    referencing row iff the half-open prefix range `[P, prefix-successor(P))` holds **any** entry.
    No row is reconstructed: every member of `P` is non-NULL, so a matching key is a complete,
    non-NULL FK tuple (MATCH SIMPLE is satisfied by construction).
@@ -743,7 +770,12 @@ The grammar and executor support the full `ON DELETE` / `ON UPDATE` action set:
 - **`ON UPDATE CASCADE`** assigns each matching child FK tuple the parent row's new referenced
   values, positionally. Every changed parent row contributes an `old tuple -> new tuple` mapping.
   The mappings are applied as one child-table update, so a multi-row key swap does not visit an
-  already-cascaded child twice.
+  already-cascaded child twice. When the local column's type differs from the referenced one
+  (§6.2 step 5), the new value is assigned with PostgreSQL's assignment cast: an integer is
+  range-checked (`22003`), a `decimal` rounds half away from zero to an integer (`22003` out of
+  range), a `f64` rounds to the nearest `f32` (`22003` on overflow), and an `f32` widens. The
+  rewritten row is then checked like any other (§6.4), so a rounded value that names no parent is
+  `23503`.
 - **`SET NULL`** assigns SQL NULL to **every** local member column of the matching FK. Ordinary
   assignment validation follows: a `NOT NULL` member raises `23502` and the entire originating
   statement is rolled back.
@@ -794,9 +826,19 @@ and compression work **does** accrue to the originating statement's cost and to 
 
 ### 6.7 Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
-- **Stricter type matching.** Corresponding FK columns must be the **same** scalar type (`42804`);
-  PG allows any pair with a shared btree equality operator (e.g. `i32`↔`i64`). The strict static
-  type system (CLAUDE.md §4) is the overriding reason.
+- **Fewer cross-type pairings.** jed admits the cross-type pairs PostgreSQL accepts whose equality
+  its own comparison matrix defines (§6.2 step 5). PostgreSQL also accepts an integer or `numeric`
+  referencing a float (through an implicit cast to `float8` — a lossy comparison under which many
+  `i64` values equal one `f64`) and the `date` / `timestamp` / `timestamptz` pairs (its
+  `datetime_ops` family — the `timestamp`↔`timestamptz` equality depends on the session `TimeZone`,
+  so the same rows would satisfy the constraint under one setting and not another). jed's float,
+  `date`, `timestamp`, and `timestamptz` are strict comparison islands (`i32 = f64` is itself
+  `42804`), so these FKs are `42804`. The strict type system (CLAUDE.md §4) and determinism (§10)
+  are the overriding reasons.
+- **A cascaded row is always re-checked.** PostgreSQL skips the RI check of an updated row whose
+  key value did not change. When an `ON UPDATE CASCADE` from a `decimal` parent rounds the new value
+  back to the integer child's old value (parent `5` → `5.25`, child stays `5`), PostgreSQL commits an
+  orphan; jed re-checks the rewritten row (§6.6) and raises `23503`.
 - **End-state, not per-row, parent-side checks.** A parent UPDATE that swaps referenced unique
   values, or otherwise keeps every referenced tuple present in the end state, succeeds where PG's
   per-row check fails on the transient — the two-phase / all-or-nothing model (CLAUDE.md §11
@@ -848,7 +890,10 @@ held in **ascending name byte order** (the catalog's
 standing deterministic order, like checks and indexes), which is also the §6.4 child-side
 name-evaluation order. An FK creates no B-tree, so — unlike an index — it stores no root page. On
 load the referenced-table/column names and ordinals are read back verbatim; a dangling reference in
-an otherwise-valid file is `XX001` (`data_corrupted`). The cross-core byte fixture is the
+an otherwise-valid file is `XX001` (`data_corrupted`). The column types are not stored with the FK:
+the pairing of §6.2 step 5 is re-derived on load, and an incomparable pair is `XX001`, so cross-type
+pairing changed no bytes and needed no version bump (a binary that predates it reports a file with
+a cross-type FK as `XX001`, failing closed). The cross-core byte fixture is the
 `fk_table.jed` golden (`rust == go == ts == ruby`).
 
 ### 6.10 DROP TABLE and dependencies

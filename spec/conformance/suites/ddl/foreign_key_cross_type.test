@@ -1,0 +1,273 @@
+# FOREIGN KEY column pairs of different but comparable types (spec/design/constraints.md §6.2 step
+# 5): two integer types in either direction, an integer referencing a decimal, and f32 with f64 in
+# either direction — the pairs PostgreSQL accepts whose equality jed defines. A referencing value
+# matches a parent key it EQUALS, so a value the referenced type cannot hold matches nothing; an
+# ON UPDATE CASCADE assigns the parent's new value with PostgreSQL's assignment cast. Rows verified
+# against the live PostgreSQL 18 oracle; the pairs jed still rejects are ledgered divergences.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.foreign_key, ddl.foreign_key_cross_type, ddl.secondary_index, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, types.text, types.varchar_length, types.date, types.timestamp, types.timestamptz, cast.explicit
+
+# --- integer types, either direction ----------------------------------------------
+
+statement ok
+CREATE TABLE p16 (id i16 PRIMARY KEY)
+
+statement ok
+INSERT INTO p16 VALUES (1), (2), (32767)
+
+statement ok
+CREATE TABLE c64 (id i32 PRIMARY KEY, pid i64 REFERENCES p16 ON UPDATE CASCADE ON DELETE SET NULL)
+
+statement ok
+INSERT INTO c64 VALUES (1, 1), (2, 32767)
+
+# A value outside the referenced i16's range equals no parent key.
+statement error 23503
+INSERT INTO c64 VALUES (3, 5000000000)
+
+statement error 23503
+INSERT INTO c64 VALUES (3, 40000)
+
+statement ok
+UPDATE p16 SET id = 3 WHERE id = 1
+
+statement ok
+DELETE FROM p16 WHERE id = 32767
+
+query II nosort
+SELECT id, pid FROM c64 ORDER BY id
+----
+1
+3
+2
+NULL
+
+statement ok
+CREATE TABLE p64 (id i64 PRIMARY KEY)
+
+statement ok
+INSERT INTO p64 VALUES (1), (2), (5000000000)
+
+statement ok
+CREATE TABLE c16 (id i32 PRIMARY KEY, pid i16 REFERENCES p64 ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO c16 VALUES (1, 1), (2, 2)
+
+# The cascaded value does not fit the referencing i16.
+statement error 22003
+UPDATE p64 SET id = 5000000001 WHERE id = 1
+
+statement ok
+UPDATE p64 SET id = 7 WHERE id = 1
+
+# No referencing i16 can equal 5000000000, so the parent row goes.
+statement ok
+DELETE FROM p64 WHERE id = 5000000000
+
+statement error 23503
+DELETE FROM p64 WHERE id = 2
+
+# The same checks through a child index on the referencing column.
+statement ok
+CREATE INDEX c16_pid ON c16 (pid)
+
+statement error 23503
+DELETE FROM p64 WHERE id = 7
+
+statement ok
+INSERT INTO p64 VALUES (5000000000)
+
+statement ok
+DELETE FROM p64 WHERE id = 5000000000
+
+query II nosort
+SELECT id, pid FROM c16 ORDER BY id
+----
+1
+7
+2
+2
+
+# A self-reference whose referencing column is narrower than its key, resolved within the batch.
+statement ok
+CREATE TABLE tree (id i64 PRIMARY KEY, parent i32 REFERENCES tree)
+
+statement ok
+INSERT INTO tree VALUES (2, 1), (1, NULL)
+
+statement error 23503
+INSERT INTO tree VALUES (3, 4)
+
+# A UNIQUE referenced column.
+statement ok
+CREATE TABLE pu (id i32 PRIMARY KEY, code i16 UNIQUE)
+
+statement ok
+INSERT INTO pu VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE TABLE cu (id i32 PRIMARY KEY, code i64 REFERENCES pu (code))
+
+statement ok
+INSERT INTO cu VALUES (1, 10)
+
+statement error 23503
+INSERT INTO cu VALUES (2, 70000)
+
+# ALTER TABLE … ADD FOREIGN KEY validates the existing rows the same way.
+statement ok
+CREATE TABLE late (id i32 PRIMARY KEY, code i64)
+
+statement ok
+INSERT INTO late VALUES (1, 20), (2, 70000)
+
+statement error 23503
+ALTER TABLE late ADD FOREIGN KEY (code) REFERENCES pu (code)
+
+statement ok
+DELETE FROM late WHERE id = 2
+
+statement ok
+ALTER TABLE late ADD FOREIGN KEY (code) REFERENCES pu (code)
+
+statement error 23503
+DELETE FROM pu WHERE code = 20
+
+# --- an integer referencing a decimal --------------------------------------------
+
+statement ok
+CREATE TABLE pn (v decimal(6,2) PRIMARY KEY)
+
+statement ok
+INSERT INTO pn VALUES (5), (5.5), (7)
+
+statement ok
+CREATE TABLE cn (id i32 PRIMARY KEY, v i32 REFERENCES pn ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO cn VALUES (1, 5), (2, 7)
+
+statement error 23503
+INSERT INTO cn VALUES (3, 6)
+
+statement ok
+UPDATE pn SET v = 8 WHERE v = 7
+
+# The cascade rounds 6.5 to the integer 7, which then references no parent.
+statement error 23503
+UPDATE pn SET v = 6.5 WHERE v = 8
+
+# No integer equals 5.5.
+statement ok
+DELETE FROM pn WHERE v = 5.5
+
+statement error 23503
+DELETE FROM pn WHERE v = 5
+
+query II nosort
+SELECT id, v FROM cn ORDER BY id
+----
+1
+5
+2
+8
+
+# A documented divergence (constraints.md §6.7): the cascade rounds 5.25 back to the child's own 5,
+# and jed re-checks the rewritten row (23503 — no parent 5 remains). PostgreSQL skips the check of a
+# row whose key value did not change and commits the orphan.
+statement error 23503
+UPDATE pn SET v = 5.25 WHERE v = 5
+
+# The reverse pairing — a decimal referencing an integer — has no implicit cast, as in PostgreSQL.
+statement error 42804
+CREATE TABLE cd (v decimal REFERENCES p64)
+
+# --- f32 and f64, either direction ------------------------------------------------
+
+statement ok
+CREATE TABLE pf8 (v f64 PRIMARY KEY)
+
+statement ok
+INSERT INTO pf8 VALUES (0.5), (0.1), (1e300)
+
+statement ok
+CREATE TABLE cf4 (id i32 PRIMARY KEY, v f32 REFERENCES pf8 ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO cf4 VALUES (1, 0.5)
+
+# The f32 nearest 0.1 is not the f64 0.1.
+statement error 23503
+INSERT INTO cf4 VALUES (2, 0.1)
+
+# The cascaded f64 overflows the referencing f32.
+statement error 22003
+UPDATE pf8 SET v = 1e301 WHERE v = 0.5
+
+statement ok
+DELETE FROM pf8 WHERE v = 0.1
+
+statement error 23503
+DELETE FROM pf8 WHERE v = 0.5
+
+statement ok
+CREATE TABLE pf4 (v f32 PRIMARY KEY)
+
+statement ok
+INSERT INTO pf4 VALUES (0.1)
+
+statement ok
+CREATE TABLE cf8 (id i32 PRIMARY KEY, v f64 REFERENCES pf4 ON UPDATE CASCADE)
+
+statement error 23503
+INSERT INTO cf8 VALUES (1, 0.1)
+
+statement ok
+INSERT INTO cf8 VALUES (1, CAST(0.1 AS f32))
+
+statement ok
+UPDATE pf4 SET v = 0.3
+
+query R nosort
+SELECT v FROM cf8
+----
+0.30000001192092896
+
+# --- text with varchar ------------------------------------------------------------
+
+statement ok
+CREATE TABLE pv (v varchar(3) PRIMARY KEY)
+
+statement ok
+INSERT INTO pv VALUES ('abc')
+
+statement ok
+CREATE TABLE cv (v text REFERENCES pv)
+
+statement ok
+INSERT INTO cv VALUES ('abc')
+
+statement error 23503
+INSERT INTO cv VALUES ('abcd')
+
+# --- pairs jed rejects (constraints.md §6.7): PostgreSQL accepts each, through an implicit cast to
+# float or its cross-type datetime equality; jed's comparison matrix has no such equality.
+
+statement error 42804
+CREATE TABLE cx1 (v i32 REFERENCES pf8)
+
+statement error 42804
+CREATE TABLE cx2 (v decimal REFERENCES pf8)
+
+statement ok
+CREATE TABLE pts (v timestamp PRIMARY KEY)
+
+statement error 42804
+CREATE TABLE cx3 (v date REFERENCES pts)
+
+statement error 42804
+CREATE TABLE cx4 (v timestamptz REFERENCES pts)
+
+# A float never references an integer, in jed or PostgreSQL.
+statement error 42804
+CREATE TABLE cx5 (v f64 REFERENCES p64)

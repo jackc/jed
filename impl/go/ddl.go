@@ -1427,13 +1427,13 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			return outcome{}, newError(InvalidForeignKey,
 				"there is no unique constraint matching given keys for referenced table "+parent.Name)
 		}
-		// 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they
-		// are key-encodable, so a same-typed local column is key-encodable too — no separate
-		// 0A000 type gate is needed.
+		// 8. Comparable-type pairing (§6.2 step 5). The referenced columns are a PK/UNIQUE key,
+		// so they are key-encodable; every admitted local type (the same type, another integer,
+		// the other float width) is key-encodable too — no separate 0A000 type gate is needed.
 		for i := range local {
 			lt := table.Columns[local[i]].Type
 			rt := parent.Columns[refs[i]].Type
-			if !typesEqual(lt, rt) {
+			if !fkTypesComparable(lt, rt) {
 				return outcome{}, newError(DatatypeMismatch, fmt.Sprintf(
 					"foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s",
 					name,
@@ -2796,7 +2796,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 			for i, local := range fk.Columns {
 				ref := fk.RefColumns[i]
-				if !typesEqual(table.Columns[local].Type, parent.Columns[ref].Type) {
+				if !fkTypesComparable(table.Columns[local].Type, parent.Columns[ref].Type) {
 					return outcome{}, typeError(fmt.Sprintf("foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s", fk.Name, table.Columns[local].Name, parent.Columns[ref].Name, table.Columns[local].Type.CanonicalName(), parent.Columns[ref].Type.CanonicalName()))
 				}
 			}
@@ -2821,7 +2821,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 							break
 						}
 					}
-					if newRef >= 0 && !typesEqual(child.Columns[local].Type, table.Columns[newRef].Type) {
+					if newRef >= 0 && !fkTypesComparable(child.Columns[local].Type, table.Columns[newRef].Type) {
 						return outcome{}, typeError(fmt.Sprintf("foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s", fk.Name, child.Columns[local].Name, table.Columns[newRef].Name, child.Columns[local].Type.CanonicalName(), table.Columns[newRef].Type.CanonicalName()))
 					}
 				}

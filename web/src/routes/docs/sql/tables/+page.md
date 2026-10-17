@@ -64,6 +64,19 @@ Foreign keys accept `ON DELETE` and `ON UPDATE` with `NO ACTION` (the default), 
 uses each referencing column's declared default, or `NULL` when it has none; generated changes run
 the same type, `NOT NULL`, `CHECK`, uniqueness, and foreign-key checks as an ordinary statement.
 
+A foreign-key column need not have exactly the referenced column's type. As in PostgreSQL, any two
+integer types pair in either direction, an integer column may reference a `decimal`, and `f32` and
+`f64` pair either way. A referencing value matches a parent key it equals, so an `i64` value too
+large for a referenced `i16` matches nothing (`23503`), and `ON UPDATE CASCADE` converts the new
+key as an assignment would (an out-of-range value is error `22003`). Other pairs are error `42804`;
+unlike PostgreSQL, that includes an integer referencing a float and the `date`/`timestamp`/`timestamptz`
+pairs, which jed never compares with each other.
+
+```sql
+CREATE TABLE region (id i16 PRIMARY KEY);
+CREATE TABLE store (id i32 PRIMARY KEY, region_id i64 REFERENCES region);
+```
+
 Deleting or re-keying a parent row checks every referencing table for rows that still point at it,
 and an action such as `ON DELETE CASCADE` finds the rows it changes the same way. As in PostgreSQL,
 jed does not index a foreign key's referencing columns for you. Without such an index, each check

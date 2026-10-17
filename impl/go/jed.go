@@ -21,6 +21,7 @@ var SupportedCapabilities = []string{
 	"ddl.foreign_key_child_index",
 	"ddl.foreign_key_match_full",
 	"ddl.constraint_name_schema",
+	"ddl.foreign_key_cross_type",
 	// CREATE TABLE IF NOT EXISTS — the idempotent form (persistent and TEMP): a taken relation name
 	// is a no-op success rather than 42P07, decided before any column work (grammar.md §13).
 	"ddl.create_table_if_not_exists",

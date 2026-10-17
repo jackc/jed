@@ -583,6 +583,7 @@ import {
   evalExpr,
   evalFilter,
   floatToIntHalfAway,
+  makeFloatCast,
   passingBindings,
   subqueryRowValue,
   toDecimal,
@@ -7326,7 +7327,7 @@ export class Engine {
       for (let p = 0; p < local.length; p++) {
         const li = local[p]!;
         const ri = refs[p]!;
-        if (!fkTypesEqual(table.columns[li]!.type, parent.columns[ri]!.type)) {
+        if (!fkTypesComparable(table.columns[li]!.type, parent.columns[ri]!.type)) {
           throw engineError(
             "datatype_mismatch",
             "foreign key constraint " +
@@ -8804,7 +8805,7 @@ export class Engine {
               for (let p = 0; p < local.length; p++) {
                 const li = local[p]!,
                   ri = refs[p]!;
-                if (!fkTypesEqual(table.columns[li]!.type, parent.columns[ri]!.type))
+                if (!fkTypesComparable(table.columns[li]!.type, parent.columns[ri]!.type))
                   throw engineError(
                     "datatype_mismatch",
                     `foreign key constraint ${name} cannot be implemented: key columns ${table.columns[li]!.name} and ${parent.columns[ri]!.name} are of incompatible types: ${typeCanonicalName(table.columns[li]!.type)} and ${typeCanonicalName(parent.columns[ri]!.type)}`,
@@ -9214,7 +9215,7 @@ export class Engine {
           fk.refTable === table.name ? table : snap.table(fk.refTable)!;
         fk.columns.forEach((local, i) => {
           const ref = fk.refColumns[i]!;
-          if (!fkTypesEqual(table.columns[local]!.type, parent.columns[ref]!.type))
+          if (!fkTypesComparable(table.columns[local]!.type, parent.columns[ref]!.type))
             throw typeError(
               `foreign key constraint ${fk.name} cannot be implemented: key columns ${table.columns[local]!.name} and ${parent.columns[ref]!.name} are of incompatible types: ${typeCanonicalName(table.columns[local]!.type)} and ${typeCanonicalName(parent.columns[ref]!.type)}`,
             );
@@ -9234,7 +9235,10 @@ export class Engine {
               newRef = columnSources.findIndex(
                 (source) => source.kind === "original" && source.column === oldRef,
               );
-            if (newRef >= 0 && !fkTypesEqual(child.columns[local]!.type, table.columns[newRef]!.type))
+            if (
+              newRef >= 0 &&
+              !fkTypesComparable(child.columns[local]!.type, table.columns[newRef]!.type)
+            )
               throw typeError(
                 `foreign key constraint ${fk.name} cannot be implemented: key columns ${child.columns[local]!.name} and ${table.columns[newRef]!.name} are of incompatible types: ${typeCanonicalName(child.columns[local]!.type)} and ${typeCanonicalName(table.columns[newRef]!.type)}`,
               );
@@ -9893,6 +9897,7 @@ export class Engine {
   // `parentTable` is the referenced table's name, in the FK's domain (`temp`). Unmetered, like the
   // PK/UNIQUE probes (cost.md §3).
   private fkProbeHits(probe: FkProbe, parentTable: string, temp: boolean): boolean {
+    if (probe.kind === "absent") return false;
     if (probe.kind === "pk") {
       return this.fkSnap(temp).store(parentTable).get(probe.bytes) !== undefined;
     }
@@ -9923,7 +9928,9 @@ export class Engine {
     const store = snap.store(childTable);
     const path = fkChooseReversePath(snap, fk, child, parent);
     if (path !== null) {
-      const bound = uniqueProbeBound(this.fkReversePrefix(path, fk, child, values));
+      const prefix = this.fkReversePrefix(path, fk, child, values);
+      if (prefix === null) return false;
+      const bound = uniqueProbeBound(prefix);
       const tree = path.index === null ? store : snap.indexStore(path.index);
       meter.charge(COSTS.pageRead * BigInt(tree.overlapNodeCount(bound)));
       meter.guard();
@@ -9961,21 +9968,21 @@ export class Engine {
   // fkReversePrefix encodes a parent tuple (FK slot order) as the chosen child key's probe prefix:
   // bare member encodings for the PK, the index columns' §2.16 present slots for an index (a DESC key
   // inverts its body — constraints.md §6.5 step 3).
+  // Each value is first taken as its equal of the child column's type (§6.2 step 5); null when one
+  // has no equal there, so no child row can reference the tuple.
   private fkReversePrefix(
     path: FkReversePath,
     fk: ForeignKey,
     child: Table,
     values: Value[],
-  ): Uint8Array {
+  ): Uint8Array | null {
     const childColls = this.columnCollations(child.columns);
     const parts: Uint8Array[] = [];
     for (let i = 0; i < path.cols.length; i++) {
       const c = path.cols[i]!;
-      const b = encodeTypedKey(
-        child.columns[c]!.type,
-        values[fk.columns.indexOf(c)]!,
-        childColls[c] ?? null,
-      );
+      const value = fkValueAs(child.columns[c]!.type, values[fk.columns.indexOf(c)]!);
+      if (value === null) return null;
+      const b = encodeTypedKey(child.columns[c]!.type, value, childColls[c] ?? null);
       if (path.index !== null) keyOrderPushPresent(parts, path.orders[i]!, b);
       else parts.push(b);
     }
@@ -10045,6 +10052,7 @@ export class Engine {
     const seen = new Set<string>();
     for (const tuple of t.tuples) {
       const prefix = this.fkReversePrefix(path, t.fk, child, tuple);
+      if (prefix === null) continue;
       const bound = uniqueProbeBound(prefix);
       const r =
         path.index === null
@@ -14339,7 +14347,8 @@ export class Engine {
       for (const p of plans) {
         try {
           let raw = evalExpr(p.source, row, env, meter);
-          if (mapped !== null) raw = mapped[upd.fkTarget!.fk.columns.indexOf(p.idx)]!;
+          if (mapped !== null)
+            raw = fkCascadeValue(mapped[upd.fkTarget!.fk.columns.indexOf(p.idx)]!, p.target);
           // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
           if (p.notNull && raw.kind === "null") {
             nullCol ??= p.name;
@@ -30622,15 +30631,75 @@ export function typeIsArrayKeyable(t: Type): boolean {
 // encodings concatenated, in PK key order) or a parent unique index's prefix (§2.16 ordered present
 // slots, in index-key order, plus the exact index name). A discriminated union (the TS idiom), with
 // fkProbeBytes returning the raw bytes for batch-membership comparison.
+// An "absent" probe is a complete tuple with no equal in the parent's key types — an integer
+// outside a narrower referenced integer column's range, a non-integral decimal or an inexact f64
+// against an integer or f32 column (constraints.md §6.2 step 5). It matches no parent key; its bytes
+// are empty, and every PK key and unique-index prefix is non-empty.
 export type FkProbe =
   | { kind: "pk"; bytes: Uint8Array }
-  | { kind: "unique"; index: string; prefix: Uint8Array };
+  | { kind: "unique"; index: string; prefix: Uint8Array }
+  | { kind: "absent" };
 
 // fkProbeBytes returns the raw probe bytes — used to compare against this statement's batch end
 // state (§6.4). Two probes of one FK share the same byte space (a given FK always probes the PK or
 // always a fixed unique index), so byte equality is a valid set membership test.
 export function fkProbeBytes(p: FkProbe): Uint8Array {
+  if (p.kind === "absent") return new Uint8Array(0);
   return p.kind === "pk" ? p.bytes : p.prefix;
+}
+
+// fkTypesComparable reports whether a foreign key may pair a local (referencing) column of type
+// `local` with a referenced column of type `referenced` (constraints.md §6.2 step 5): the same type
+// (typmods are not part of it), two integer types in either direction, an integer referencing a
+// decimal, or f32 with f64 in either direction. These are the pairs PostgreSQL accepts whose
+// equality jed's comparison matrix also defines (spec/types/compare.toml); every other pair is 42804.
+export function fkTypesComparable(local: Type, referenced: Type): boolean {
+  if (fkTypesEqual(local, referenced)) return true;
+  if (local.kind !== "scalar" || referenced.kind !== "scalar") return false;
+  const l = local.scalar;
+  const r = referenced.scalar;
+  return (isInteger(l) && (isInteger(r) || r === "decimal")) || (isFloat(l) && isFloat(r));
+}
+
+// fkValueAs returns `v` — a value of one foreign-key column — as the EQUAL value of its paired
+// column's type `target` (constraints.md §6.2 step 5), or null when that type holds no equal value:
+// an integer outside a narrower integer type's range, a non-integral (or out-of-range) decimal
+// against an integer type, a f64 that no f32 represents exactly. Equality is exact, so a converted
+// value encodes to exactly the key bytes of every equal stored value. Same-type values pass
+// unchanged.
+export function fkValueAs(target: Type, v: Value): Value | null {
+  if (target.kind !== "scalar") return v;
+  const t = target.scalar;
+  v = residentValue(v);
+  if (v.kind === "int" && isInteger(t)) return inRange(t, v.int) ? v : null;
+  if (v.kind === "int" && t === "decimal") return decimalValue(Decimal.fromBigInt(v.int));
+  if (v.kind === "decimal" && isInteger(t)) {
+    const n = v.dec.toBigIntRound();
+    if (n === null || !inRange(t, n) || Decimal.fromBigInt(n).cmpValue(v.dec) !== 0) return null;
+    return intValue(n);
+  }
+  if (v.kind === "f32" && t === "f64") return float64Value(v.value);
+  if (v.kind === "f64" && t === "f32") {
+    const n = Math.fround(v.value);
+    if (!Number.isNaN(v.value) && n !== v.value) return null;
+    return float32Value(n);
+  }
+  return v;
+}
+
+// fkCascadeValue prepares an ON UPDATE CASCADE value — of the referenced column's type — for a
+// referencing column of another comparable type (constraints.md §6.6): PostgreSQL's assignment
+// cast. A decimal rounds half away from zero into an integer column and a f64 rounds to nearest
+// into a f32 column, each 22003 out of range; integers and f32 values pass to the store coercion,
+// which range-checks or widens them. A same-type value passes unchanged.
+export function fkCascadeValue(v: Value, target: ScalarType): Value {
+  if (v.kind === "decimal" && isInteger(target)) {
+    const n = v.dec.toBigIntRound();
+    if (n === null || !inRange(target, n)) throw overflow(target);
+    return intValue(n);
+  }
+  if (v.kind === "f64" && target === "f32") return makeFloatCast("f32", v.value);
+  return v;
 }
 
 // fkMatchFullViolated reports whether `row`'s referencing tuple for `fk` violates MATCH FULL
@@ -30659,11 +30728,17 @@ export function fkProbe(
   for (const o of ordinals) {
     if (row[o]!.kind === "null") return null;
   }
-  // The value supplying parent column `pcol` (the fk pairing: refColumns[i] ⇄ ordinals[i]).
-  const valueFor = (pcol: number): Value => {
-    const i = fk.refColumns.indexOf(pcol);
-    return row[ordinals[i]!]!;
-  };
+  // Each value as its equal of the parent column's type (§6.2 step 5); a value with none matches no
+  // parent key. The value supplying parent column `pcol` (the fk pairing: refColumns[i] ⇄
+  // ordinals[i]).
+  const parentValues: Value[] = new Array(parent.columns.length);
+  for (let i = 0; i < fk.refColumns.length; i++) {
+    const pcol = fk.refColumns[i]!;
+    const v = fkValueAs(parent.columns[pcol]!.type, row[ordinals[i]!]!);
+    if (v === null) return { kind: "absent" };
+    parentValues[pcol] = v;
+  }
+  const valueFor = (pcol: number): Value => parentValues[pcol]!;
   // The probe must match the PARENT's stored key, so a collated parent key column uses the PARENT's
   // collation (encoding.md §2.12), independent of the child column's own collation.
   const refSet = sortedUnique(fk.refColumns);

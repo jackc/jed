@@ -1769,6 +1769,7 @@ impl Engine {
                 .index_store(index)
                 .range_entries(&unique_probe_bound(prefix))?
                 .is_empty()),
+            FkProbe::Absent => Ok(false),
         }
     }
 
@@ -1798,7 +1799,9 @@ impl Engine {
         let store = snap.store(child_table);
         if let Some(path) = fk_choose_reverse_path(snap, fk, child, parent) {
             let child_colls = self.column_collations(&child.columns);
-            let prefix = fk_reverse_prefix(&path, fk, child, &child_colls, values)?;
+            let Some(prefix) = fk_reverse_prefix(&path, fk, child, &child_colls, values)? else {
+                return Ok(false);
+            };
             let bound = unique_probe_bound(&prefix);
             let tree = match &path.index {
                 Some(name) => snap.index_store(name),
@@ -1937,7 +1940,9 @@ impl Engine {
         };
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         for tuple in &t.tuples {
-            let prefix = fk_reverse_prefix(&path, &t.fk, child, &child_colls, tuple)?;
+            let Some(prefix) = fk_reverse_prefix(&path, &t.fk, child, &child_colls, tuple)? else {
+                continue;
+            };
             let bound = unique_probe_bound(&prefix);
             let (entries, pages, slabs) = match &path.index {
                 None => store.range_scan_with_units(&bound, mask)?,

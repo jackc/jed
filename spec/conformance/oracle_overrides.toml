@@ -1894,3 +1894,31 @@ reason = "jed: under MINUTE TO SECOND, `90:30` reads as 90 minutes 30 seconds an
 file = "cte/data_modifying_foreign_key.test"
 sql = "WITH d AS (DELETE FROM ap WHERE id = 1 RETURNING id) INSERT INTO ac SELECT 100, id FROM d"
 reason = "jed: inside a data-modifying WITH the foreign-key CHECKS wait for the end of the statement, but referential ACTIONS run with the sub-statement that fires them (writable-cte.md §7). The DELETE's ON DELETE CASCADE runs before the primary inserts child 100, so child 100 is an orphan at the end of the statement (23503). PostgreSQL fires the cascade as an end-of-statement trigger, after the insert, so it deletes child 100 as well and the statement succeeds. PostgreSQL leaves the sub-statement order unspecified; jed's deterministic order runs actions in place."
+
+# --- FOREIGN KEY cross-type pairing (constraints.md §6.2 step 5, §6.7). PostgreSQL accepts these
+# pairs through an implicit cast to float8 or its cross-type datetime equalities; jed keeps the same
+# type islands its comparison matrix keeps, so each is 42804.
+[[override]]
+file = "ddl/foreign_key_cross_type.test"
+sql = "CREATE TABLE cx1 (v i32 REFERENCES pf8)"
+reason = "jed pairs foreign-key columns only when its comparison matrix defines their equality (constraints.md §6.2 step 5, §6.7; spec/types/compare.toml). PostgreSQL accepts an integer referencing float8 by casting the integer to float8 implicitly, a lossy comparison (many i64 values equal one f64). jed's float is a strict comparison island (float.md §3): i32 = f64 is itself 42804, so the FK pairing is too."
+
+[[override]]
+file = "ddl/foreign_key_cross_type.test"
+sql = "CREATE TABLE cx2 (v decimal REFERENCES pf8)"
+reason = "jed pairs foreign-key columns only when its comparison matrix defines their equality (constraints.md §6.2 step 5, §6.7; spec/types/compare.toml). PostgreSQL accepts a numeric referencing float8 by casting the numeric to float8 implicitly, a rounding comparison. jed's float is a strict comparison island (float.md §3): decimal = f64 is itself 42804, so the FK pairing is too."
+
+[[override]]
+file = "ddl/foreign_key_cross_type.test"
+sql = "CREATE TABLE cx3 (v date REFERENCES pts)"
+reason = "jed pairs foreign-key columns only when its comparison matrix defines their equality (constraints.md §6.2 step 5, §6.7; spec/types/compare.toml). PostgreSQL's datetime_ops family compares date with timestamp. jed's date is a strict comparison island (date.md §4): date = timestamp is itself 42804, so the FK pairing is too."
+
+[[override]]
+file = "ddl/foreign_key_cross_type.test"
+sql = "CREATE TABLE cx4 (v timestamptz REFERENCES pts)"
+reason = "jed pairs foreign-key columns only when its comparison matrix defines their equality (constraints.md §6.2 step 5, §6.7; spec/types/compare.toml). PostgreSQL's datetime_ops family compares timestamp with timestamptz through the session TimeZone, so the same rows would satisfy the constraint or not depending on a session setting. jed never compares the two families (timestamp.md; compare.toml), so the FK pairing is 42804."
+
+[[override]]
+file = "ddl/foreign_key_cross_type.test"
+sql = "UPDATE pn SET v = 5.25 WHERE v = 5"
+reason = "jed re-checks every row an ON UPDATE CASCADE rewrites (constraints.md §6.6, §6.7). The cascade assigns decimal 5.25 to an i32 column, which rounds to the child's own 5; no parent 5 remains, so jed raises 23503. PostgreSQL skips the RI check of an updated row whose key value is unchanged (ri_KeysEqual) and commits an orphan. jed keeps referential integrity."

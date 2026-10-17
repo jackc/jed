@@ -444,7 +444,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			return newError(InvalidForeignKey, "there is no unique constraint matching given keys for referenced table "+parent.Name)
 		}
 		for i := range local {
-			if !typesEqual(t.Columns[local[i]].Type, parent.Columns[refs[i]].Type) {
+			if !fkTypesComparable(t.Columns[local[i]].Type, parent.Columns[refs[i]].Type) {
 				return newError(DatatypeMismatch, fmt.Sprintf("foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s", name, t.Columns[local[i]].Name, parent.Columns[refs[i]].Name, t.Columns[local[i]].Type.CanonicalName(), parent.Columns[refs[i]].Type.CanonicalName()))
 			}
 		}

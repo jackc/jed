@@ -4371,8 +4371,8 @@ func validateLoadedReferences(snap *snapshot) error {
 				if o >= len(parent.Columns) {
 					return newError(DataCorrupted, "invalid foreign-key referenced column ordinal")
 				}
-				if !typesEqual(t.Columns[fk.Columns[i]].Type, parent.Columns[o].Type) {
-					return newError(DataCorrupted, "foreign key "+fk.Name+" pairs columns of different types")
+				if !fkTypesComparable(t.Columns[fk.Columns[i]].Type, parent.Columns[o].Type) {
+					return newError(DataCorrupted, "foreign key "+fk.Name+" pairs columns of incomparable types")
 				}
 			}
 			refSet := sortedUnique(fk.RefColumns)

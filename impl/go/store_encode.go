@@ -3,6 +3,7 @@ package jed
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 )
@@ -850,6 +851,89 @@ func typesEqual(a, b dataType) bool {
 	return a.Scalar == b.Scalar
 }
 
+// fkTypesComparable reports whether a foreign key may pair a local (referencing) column of type
+// local with a referenced column of type referenced (constraints.md §6.2 step 5): the same type
+// (typmods are not part of it), two integer types in either direction, an integer referencing a
+// decimal, or f32 with f64 in either direction. These are the pairs PostgreSQL accepts whose
+// equality jed's comparison matrix also defines (spec/types/compare.toml); every other pair is 42804.
+func fkTypesComparable(local, referenced dataType) bool {
+	if typesEqual(local, referenced) {
+		return true
+	}
+	l, lok := local.AsScalar()
+	r, rok := referenced.AsScalar()
+	if !lok || !rok {
+		return false
+	}
+	return (l.IsInteger() && (r.IsInteger() || r.IsDecimal())) || (l.IsFloat() && r.IsFloat())
+}
+
+// fkCascadeValue prepares an ON UPDATE CASCADE value — of the referenced column's type — for a
+// referencing column of another comparable type (constraints.md §6.6): PostgreSQL's assignment
+// cast. A decimal rounds half away from zero into an integer column and a f64 rounds to nearest
+// into a f32 column, each 22003 out of range; integers and f32 values pass to the store coercion,
+// which range-checks or widens them. A same-type value passes unchanged.
+func fkCascadeValue(v Value, target scalarType) (Value, error) {
+	switch {
+	case v.Kind == ValDecimal && target.IsInteger():
+		n, ok := v.decimal().ToInt64Round()
+		if !ok || !target.InRange(n) {
+			return Value{}, overflowErr(target)
+		}
+		return IntValue(n), nil
+	case v.Kind == ValFloat64 && target.IsFloat32():
+		r, err := float64ToFloat32(v.F64())
+		if err != nil {
+			return Value{}, err
+		}
+		return Float32Value(r), nil
+	}
+	return v, nil
+}
+
+// fkValueAs returns v — a value of one foreign-key column — as the EQUAL value of its paired
+// column's type target (constraints.md §6.2 step 5), or ok=false when that type holds no equal
+// value: an integer outside a narrower integer type's range, a non-integral (or out-of-range)
+// decimal against an integer type, a f64 that no f32 represents exactly. Equality is exact, so a
+// converted value encodes to exactly the key bytes of every equal stored value. Same-type values
+// pass unchanged.
+func fkValueAs(target dataType, v Value) (Value, bool, error) {
+	t, ok := target.AsScalar()
+	if !ok {
+		return v, true, nil
+	}
+	if v.Kind == ValUnfetched {
+		resolved, err := resolveUnfetchedSelf(v.unfetched())
+		if err != nil {
+			return Value{}, false, err
+		}
+		v = resolved
+	}
+	switch {
+	case v.Kind == ValInt && t.IsInteger():
+		return v, t.InRange(v.Int), nil
+	case v.Kind == ValInt && t.IsDecimal():
+		return DecimalValue(decimalFromInt64(v.Int)), true, nil
+	case v.Kind == ValDecimal && t.IsInteger():
+		d := *v.decimal()
+		n, fits := d.ToInt64Round()
+		if !fits || !t.InRange(n) || decimalFromInt64(n).CmpValue(d) != 0 {
+			return Value{}, false, nil
+		}
+		return IntValue(n), true, nil
+	case v.Kind == ValFloat32 && t.IsFloat64():
+		return Float64Value(float64(v.F32())), true, nil
+	case v.Kind == ValFloat64 && t.IsFloat32():
+		f := v.F64()
+		n := float32(f)
+		if !math.IsNaN(f) && float64(n) != f {
+			return Value{}, false, nil
+		}
+		return Float32Value(n), true, nil
+	}
+	return v, true, nil
+}
+
 // encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
 // matching the PK / index encoders. value is non-NULL and of a keyable scalar type — every key
 // site's column/expression type passes a keyability gate (PRIMARY KEY / CREATE INDEX / UNIQUE, and a
@@ -1045,6 +1129,11 @@ const (
 	fkProbePk fkProbeKind = iota
 	// fkProbeUnique is a parent unique index's prefix (0x00-tagged slots, index-key order).
 	fkProbeUnique
+	// fkProbeAbsent is a complete tuple with no equal in the parent's key types — an integer outside
+	// a narrower referenced integer column's range, a non-integral decimal or an inexact f64 against
+	// an integer or f32 column (constraints.md §6.2 step 5). It matches no parent key; its bytes are
+	// empty, and every PK key and unique-index prefix is non-empty.
+	fkProbeAbsent
 )
 
 // fkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
@@ -1087,10 +1176,20 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 	}
 	// valueFor returns the value supplying parent column pcol (the fk pairing: RefColumns[i] ⇄
 	// ordinals[i]).
-	valueFor := func(pcol int) Value {
-		i := slices.Index(fk.RefColumns, pcol)
-		return row[ordinals[i]]
+	// Each value as its equal of the parent column's type (§6.2 step 5); a value with none matches
+	// no parent key.
+	parentValues := make([]Value, len(parent.Columns))
+	for i, pcol := range fk.RefColumns {
+		v, ok, err := fkValueAs(parent.Columns[pcol].Type, row[ordinals[i]])
+		if err != nil {
+			return fkProbe{}, false, err
+		}
+		if !ok {
+			return fkProbe{kind: fkProbeAbsent}, true, nil
+		}
+		parentValues[pcol] = v
 	}
+	valueFor := func(pcol int) Value { return parentValues[pcol] }
 	// The probe must match the PARENT's stored key, so a collated parent key column is encoded with
 	// the PARENT's collation (encoding.md §2.12), independent of the child column's own collation.
 	refSet := sortedUnique(fk.RefColumns)
@@ -1169,6 +1268,8 @@ func (db *engine) fkProbeHits(probe fkProbe, parentTable string, temp bool) (boo
 	case fkProbePk:
 		_, ok, err := db.fkSnap(temp).store(parentTable).Get(probe.bytes)
 		return ok, err
+	case fkProbeAbsent:
+		return false, nil
 	default: // fkProbeUnique
 		entries, err := db.fkSnap(temp).indexStore(probe.index).RangeEntries(uniqueProbeBound(probe.bytes))
 		if err != nil {
@@ -1228,14 +1329,21 @@ func fkReverseTailFixed(child *catTable, tail []indexKey) bool {
 }
 
 // fkReversePrefix encodes a parent tuple (FK slot order) as the chosen child key's probe prefix:
-// bare member encodings for the PK, 0x00-tagged slots for an index (constraints.md §6.5 step 3).
-func (db *engine) fkReversePrefix(path fkReversePath, fk *foreignKey, child *catTable, values []Value) ([]byte, error) {
+// bare member encodings for the PK, the index columns' §2.16 present slots for an index (a DESC key
+// inverts its body — constraints.md §6.5 step 3).
+// Each value is first taken as its equal of the child column's type (§6.2 step 5); ok is false when
+// one has no equal there, so no child row can reference the tuple.
+func (db *engine) fkReversePrefix(path fkReversePath, fk *foreignKey, child *catTable, values []Value) ([]byte, bool, error) {
 	childColls := db.columnCollations(child.Columns)
 	var prefix []byte
 	for i, c := range path.cols {
-		b, err := encodeTypedKey(child.Columns[c].Type, values[slices.Index(fk.Columns, c)], childColls[c])
+		v, ok, err := fkValueAs(child.Columns[c].Type, values[slices.Index(fk.Columns, c)])
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		b, err := encodeTypedKey(child.Columns[c].Type, v, childColls[c])
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if path.index != "" {
 			// the index column's §2.16 present slot (a DESC key inverts its body)
@@ -1244,7 +1352,7 @@ func (db *engine) fkReversePrefix(path fkReversePath, fk *foreignKey, child *cat
 			prefix = append(prefix, b...)
 		}
 	}
-	return prefix, nil
+	return prefix, true, nil
 }
 
 // fkChooseReversePath picks the child reverse-match path deterministically: the child PK, then
@@ -1305,8 +1413,8 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 	}
 	store := snap.store(childTable)
 	if path := fkChooseReversePath(snap, fk, child, parent); path.cols != nil {
-		prefix, err := db.fkReversePrefix(path, fk, child, values)
-		if err != nil {
+		prefix, ok, err := db.fkReversePrefix(path, fk, child, values)
+		if err != nil || !ok {
 			return false, err
 		}
 		bound := uniqueProbeBound(prefix)
@@ -1461,9 +1569,12 @@ func (db *engine) fkKeyedScan(t *fkKeyedTarget, childTable string, mask []bool) 
 	var out mutationScanBatch
 	seen := make(map[string]struct{})
 	for _, tuple := range t.tuples {
-		prefix, err := db.fkReversePrefix(path, t.fk, child, tuple)
+		prefix, ok, err := db.fkReversePrefix(path, t.fk, child, tuple)
 		if err != nil {
 			return mutationScanBatch{}, err
+		}
+		if !ok {
+			continue
 		}
 		bound := uniqueProbeBound(prefix)
 		var entries []entry

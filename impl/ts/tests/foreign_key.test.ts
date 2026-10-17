@@ -1,7 +1,8 @@
 // FOREIGN KEY constraints — `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES …` and the
 // column-level `REFERENCES` (spec/design/constraints.md §6, grammar.md §43). Covers what the
 // shared corpus (ddl/foreign_key*.test) cannot: the jed-specific divergences from PostgreSQL
-// (strict same-type pairing and the end-state parent UPDATE), plus
+// (the end-state parent UPDATE; the type-pairing divergences live in
+// ddl/foreign_key_cross_type.test with ledgered overrides), plus
 // catalog introspection (constraint names). The agreeing behavior — the 23503 enforcement at every
 // write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the corpus's job. Mirrors
 // impl/rust/tests/foreign_key.rs and impl/go/foreign_key_test.go.
@@ -31,21 +32,6 @@ test("FK naming and catalog order", () => {
     "CREATE TABLE r (id i32 PRIMARY KEY, x i32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
   ]);
   assert.deepEqual(fkNames(db2, "r"), ["r_x_fkey", "r_x_fkey1"]);
-});
-
-// jed is STRICTER than PostgreSQL on type pairing: corresponding columns must be the SAME scalar
-// type (42804), where PG allows any comparable pair (e.g. i32 ↔ i64) — constraints.md §6.7.
-test("FK strict same-type pairing (42804)", () => {
-  const db = dbWith(["CREATE TABLE p (id i32 PRIMARY KEY)"]);
-  assert.equal(
-    errCode(() => db.execute("CREATE TABLE c1 (x i64 REFERENCES p)")),
-    "42804",
-  );
-  assert.equal(
-    errCode(() => db.execute("CREATE TABLE c2 (x text REFERENCES p)")),
-    "42804",
-  );
-  db.execute("CREATE TABLE c3 (x i32 REFERENCES p)"); // same type — accepted
 });
 
 // All five actions are stored; their behavior lives in the shared conformance corpus (§6.6).

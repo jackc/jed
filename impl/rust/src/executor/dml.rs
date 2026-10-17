@@ -4302,7 +4302,7 @@ impl Engine {
                         .iter()
                         .position(|&c| c == plan.idx)
                         .expect("a CASCADE assignment is one of the FK's local columns");
-                    raw = mapped[slot].clone();
+                    raw = fk_cascade_value(mapped[slot].clone(), plan.target)?;
                 }
                 // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
                 if plan.not_null && matches!(raw, Value::Null) {
