@@ -2255,7 +2255,9 @@ func reclaimDue(pageCount uint32, free int, liveAtCompaction uint32) bool {
 // freeListCandidates computes reclamation once, before the joint free-list and
 // manifest allocator reserves any pages. Current body writes include transaction
 // orphans and remain protected even when they are unreachable from the new root.
-func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool) ([]uint32, uint32, uint64, error) {
+// pending is a relaxed batch's pending set (validated-cow.md §4): manifest dependencies the rebuilt
+// list must exclude, though they are not live.
+func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool, pending []manifestEntry) ([]uint32, uint32, uint64, error) {
 	// liveAtCompaction==0 is the shared-file handoff sentinel: reconstruct on the first proven-alone
 	// commit even when the file is still below the ordinary amortization threshold.
 	compact := canReclaim && (liveAtCompaction == 0 || reclaimDue(pageCount, len(freeRemaining), liveAtCompaction))
@@ -2270,6 +2272,10 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, wr
 		for _, w := range written {
 			reached[w.index] = true
 		}
+		newLive = uint32(len(reached))
+		for _, e := range pending {
+			reached[e.index] = true
+		}
 		var free []uint32
 		for p := rootPage; p < pageCount; p++ {
 			if !reached[p] {
@@ -2277,7 +2283,6 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, wr
 			}
 		}
 		persistList = free
-		newLive = uint32(len(reached))
 		newGen = snap.txid // the recomputed list is proven dead at snap.txid (the generation gate)
 	}
 	return persistList, newLive, newGen, nil

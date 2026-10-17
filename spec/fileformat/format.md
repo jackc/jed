@@ -17,7 +17,15 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 48)
+## Version scope (`format_version` 49)
+
+`format_version` **49** — **batched durability** ([../design/validated-cow.md §4](../design/validated-cow.md)).
+No byte layout changes. A commit's meta goes to the slot that does not hold the newest durable meta
+(*Slot alternation* below), which is `txid & 1` under `synchronous = on` but, under `synchronous =
+off`, the same slot for every commit pending after a flush; such a commit's manifest also lists every
+body page written since that flush. Readers select slots exactly as before. A file changes only by its
+version byte + meta CRC. Readers accept only the exact current version, so a v48 writer — which always
+writes `txid & 1` — cannot overwrite the only durable fallback of a file written in relaxed mode.
 
 `format_version` **48** — **view column defaults, view options, sequence and type dependencies, and
 catalog entries longer than a page** ([../design/views.md](../design/views.md) §3, §6.2, §16). Every
@@ -689,15 +697,22 @@ chain is rewritten to fresh pages on every commit (it carries each table's B-tre
 moves under copy-on-write — see below), so `root_page` is wherever the latest catalog head
 landed. A reader **must** follow `root_page`; it may not assume `2`.
 
-**Slot alternation (writing).** A commit writes its meta to slot **`txid & 1`** (even `txid`
-→ slot 0, odd → slot 1). Because consecutive `txid`s alternate slots, a commit overwrites
-only the **older** slot, leaving the previously-published meta intact throughout the write —
-so a torn meta write always falls back to a complete prior snapshot whose body pages are still
+**Slot alternation (writing).** A commit writes its meta to the slot that does **not** hold the
+**newest durable meta** (the *floor*, [../design/validated-cow.md](../design/validated-cow.md) §4).
+Under `synchronous = on` every commit is durable before the next begins, so this is slot
+**`txid & 1`** (even `txid` → slot 0, odd → slot 1): consecutive `txid`s alternate slots, and a commit
+overwrites only the **older** slot, leaving the previously-published meta intact throughout the write
+— so a torn meta write always falls back to a complete prior snapshot whose body pages are still
 present (copy-on-write never overwrote them). `create` seeds **both** slots with the initial
-`txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
-then overwrites slot 0).
+`txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit then
+overwrites slot 0). An opener takes the selected candidate's slot as the floor slot, or slot
+`txid & 1` when both slots carry the selected `txid`. **New in v49:** under `synchronous = off`
+every commit pending after the floor writes the same non-floor slot, so a valid meta may sit in either
+slot whatever its `txid` parity, and its manifest also lists every body page written since the floor.
+Slot selection on open is unchanged; the version bump keeps a v48 writer, which always writes
+`txid & 1`, from overwriting the only durable fallback of such a file.
 
-**Opening (slot selection).** Validate each candidate's magic, exact version 34, fixed page size,
+**Opening (slot selection).** Validate each candidate's magic, exact current version, fixed page size,
 reserved fields, full-page CRC, page-count bounds, root, free-list, and live-count bounds, and
 manifest below.
 Choose the fully validated candidate with highest `txid`; ties prefer slot 0. A structurally invalid,
@@ -1683,8 +1698,11 @@ only its **dirty** pages, then publishing the new root. Atomicity uses validated
    - Then the **free-list pages**, allocated from safe remaining free pages before high-water;
      prospective manifest page ids are reserved first by the monotone planner described above.
 3. Write **manifest overflow pages**, if the dirty body/free-list identities exceed inline capacity.
-4. **Write the meta** to slot `txid & 1`, with new root/high-water/free-list and inline manifest.
-5. **`sync()`** — body, manifest, and meta are durable; publish the in-process snapshot.
+4. **Write the meta** to the slot not holding the newest durable meta (`txid & 1` under
+   `synchronous = on`; *Slot alternation* above), with new root/high-water/free-list and inline manifest.
+5. **`sync()`** — body, manifest, and meta are durable; publish the in-process snapshot. Under
+   `synchronous = off` the snapshot is published without this barrier and a later flush executes it
+   for the whole batch ([../design/validated-cow.md](../design/validated-cow.md) §4).
 
 Recovery validates the candidate meta, complete manifest, and expected contents of every
 new body page. Incomplete/torn/stale dependencies select the preceding valid candidate, whose

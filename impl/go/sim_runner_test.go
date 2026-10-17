@@ -380,6 +380,13 @@ type simDB struct {
 	free     uint32    // the free list the next commit allocates from
 	lacBound uint32    // ≥ the engine's live-at-last-reclamation
 	last     simGrowth // the previous commit in this lifetime
+	// batchOpen is whether the current step began with a relaxed batch pending on this database's file:
+	// its commit allocates from the high-water and keeps the batch's pages off the free list
+	// (validated-cow.md §4), so the bounded-growth assertions do not apply to it.
+	batchOpen bool
+	// ownerLost is set when an owner died under synchronous = off: until a process observes main
+	// again, it may have recovered any version from the floor up.
+	ownerLost bool
 }
 
 // simGrowth is what a commit left behind, for the next commit's bounded-growth check.
@@ -408,6 +415,9 @@ type simRunner struct {
 	tempBuffers     int   // a session's temp_buffers: past it, a temp domain spills (temp-tables.md §6)
 	maxQueryMemory  int64 // a trace session's max_query_memory_bytes (the oracles' own reads are unlimited)
 	maxStorageBytes int64 // the database's max_storage_bytes
+	// relaxed is the header's synchronous = off (validated-cow.md §4): every process batches its
+	// barriers, flushing inline so the barrier lands in the step that reached the batch cap.
+	relaxed bool
 
 	fs       *simFS
 	db       *Database // the database of the process running the current step
@@ -473,6 +483,7 @@ func newSimRunner(tr simTrace) *simRunner {
 		tempBuffers:     tempBuffers,
 		maxQueryMemory:  maxQueryMemory,
 		maxStorageBytes: maxStorageBytes,
+		relaxed:         tr.header["synchronous"] == "off",
 		fs:              newSimFS(seed, sector, uint32(ps)),
 		sessions:        map[string]*simSession{},
 		service:         tr.header["processes"] == "service",
@@ -618,6 +629,9 @@ func (r *simRunner) openServiceProc(pid int) (*Database, error) {
 		Environment:                r.env,
 		MaxStorageBytes:            r.maxStorageBytes,
 	}
+	if r.relaxed {
+		opts.Synchronous = SynchronousOff
+	}
 	h := newServiceHandoff(host, simDiskPath, opts)
 	h.files, h.spill, h.background = r.fs, r.fs.spillHost(), false
 	db, err := openServiceWith(h, true)
@@ -627,6 +641,7 @@ func (r *simRunner) openServiceProc(pid int) (*Database, error) {
 		r.net.settle()
 		return nil, err
 	}
+	db.core.storage.inlineFlush = true // every flush lands in the step that caused it
 	r.net.settle()
 	return db, nil
 }
@@ -673,6 +688,8 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 	e.spill = r.fs.spillHost() // spill and temp-table spill scratch files, whose operations can fail
 	db := databaseOver(sharedCoreFromEngineCoordinated(e, coord))
 	db.core.storage.files = r.fs // create, compaction, and attachments go through the simulated filesystem
+	db.core.storage.relaxed = r.relaxed
+	db.core.storage.inlineFlush = true // every flush lands in the step that caused it
 	if r.maxStorageBytes > 0 {
 		if err := db.SetMaxStorageBytes("main", r.maxStorageBytes); err != nil {
 			return nil, err
@@ -820,6 +837,7 @@ func (r *simRunner) step(i int) (cont bool) {
 	start := map[string]uint64{}
 	for name, d := range r.dbs {
 		start[name] = d.version
+		d.batchOpen = r.relaxed && !r.engineFlushed(d)
 	}
 	if pid, ok := r.stepPid(st); ok {
 		if st.kind != "spawn" && !r.selectProc(pid) {
@@ -872,9 +890,26 @@ func (r *simRunner) step(i int) (cont bool) {
 	// A completed barrier made every earlier write durable: the generation a database published when
 	// the step began can no longer be lost (§8.2).
 	for name, d := range r.dbs {
-		if f := r.fs.files[d.file]; f != nil && f.barrierOK && start[name] > d.floor {
+		f := r.fs.files[d.file]
+		if f == nil {
+			continue
+		}
+		// Under synchronous = off a barrier proves the step's starting version durable only when the
+		// engine was not batching then: a pending version may be durable by accident (a file growth is
+		// a full fsync) and still be overwritten by the next commit of its batch (validated-cow.md §4).
+		if f.barrierOK && !d.batchOpen && start[name] > d.floor {
 			d.floor = start[name]
 		}
+		if !r.relaxed || r.fs.dead || r.fs.fired != "" || d.version <= d.floor || !r.engineFlushed(d) {
+			continue
+		}
+		// The engine holds nothing pending: it treats the published version as flushed, and will
+		// overwrite only the other slot. Hold it to that, after checking the claim against the disk.
+		if f.metaPending() {
+			r.fail(i, "durability: the engine treats version %d of %s as flushed, but no barrier covered its meta", d.version, d.name)
+			return false
+		}
+		d.floor = d.version
 	}
 	if armed == nil {
 		return true
@@ -1252,6 +1287,11 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 				return
 			}
 			published, ok := r.committedDigest(d)
+			if !ok && r.relaxed && r.fs.fired != "" {
+				// The batch cap's flush failed in this step and revoked the storage, so nothing can be read
+				// back; the acknowledged commit is checked by the recovery that follows.
+				published, ok = in.digest, true
+			}
 			if !ok && r.service && r.fs.dead {
 				// The owner died later in this step (its maintenance commit hit the fault), so nothing can be
 				// read back through it; the acknowledged commit is checked by the recovery that follows.
@@ -1265,7 +1305,9 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			d.addHistory(now, in.digest)
 			d.version, d.lastDigest = now, in.digest
 			d.maxAttempted = max(d.maxAttempted, now)
-			d.floor = now // acknowledged under synchronous = on (§8.2)
+			if !r.relaxed || r.db.core.pageClient() != nil {
+				d.floor = now // acknowledged under synchronous = on, or a page client's commit (§8.2)
+			}
 			r.checkGrowth(i, d, quiet)
 			if r.violation != "" {
 				return
@@ -1280,6 +1322,9 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			r.fail(i, "commit jumped %s from version %d to %d", d.name, base, now)
 			return
 		}
+	}
+	if r.relaxed && r.fs.fired != "" {
+		return // a failed cap flush revoked the storage; the recovery that follows checks it
 	}
 	if err := r.checkLive(); err != nil {
 		r.fail(i, "after commit: %v", err)
@@ -1328,7 +1373,10 @@ func (r *simRunner) serviceCommitted(i int, d *simDB, base, now uint64, digest s
 	for v := now + 1; v <= ov; v++ {
 		d.addHistory(v, digest)
 	}
-	d.version, d.maxAttempted, d.floor = ov, max(d.maxAttempted, ov), ov
+	d.version, d.maxAttempted = ov, max(d.maxAttempted, ov)
+	if !r.relaxed {
+		d.floor = ov // the maintenance commit is an owner commit: batched under synchronous = off
+	}
 	r.emit(`{"i":%d,"op":"maintenance","version":%d}`, i, ov)
 }
 
@@ -1347,6 +1395,36 @@ func simFreeList(image []byte, ps uint32, v uint64) ([]uint32, bool) {
 		return free, err == nil
 	}
 	return nil, false
+}
+
+// engineFlushed reports whether the process writing database d holds no relaxed commit pending a
+// flush — no pending set, no adopted generation awaiting stabilization, no failed barrier — so its
+// published version is the one it treats as durable (validated-cow.md §4). Under the page service
+// the owner writes the file; with no owner running, nothing is claimed.
+func (r *simRunner) engineFlushed(d *simDB) bool {
+	db := r.db
+	if r.service {
+		owner := r.ownerPid()
+		if owner < 0 {
+			return false
+		}
+		db = r.procs[owner].db
+	}
+	if db == nil {
+		return false
+	}
+	st, err := db.core.withStorage(d.name)
+	if err != nil || st.paging == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	flushed := false
+	_ = st.paging.withPager(func(p *pager) error {
+		flushed = len(p.pending) == 0 && !p.recoverySync && !p.poisoned
+		return nil
+	})
+	return flushed && st.flushing == nil
 }
 
 // --- bounded growth (simulation-testing.md §8.3) ------------------------------------------------
@@ -1410,6 +1488,14 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 		}
 	}
 	before := d.last
+	if d.batchOpen {
+		// A commit inside a relaxed batch neither reuses nor frees the batch's pages (validated-cow.md
+		// §4); only the bounds carry forward.
+		d.high, d.free = pc, free
+		d.lacBound = max(d.lacBound, live+written)
+		d.last = simGrowth{}
+		return
+	}
 	if quiet && before.reclaimed && pc > before.high && pc-before.high > written-min(written, before.free) {
 		r.fail(i, "bounded growth: %s grew from %d to %d pages writing %d, with %d free pages to reuse",
 			d.name, before.high, pc, written, before.free)
@@ -1870,6 +1956,11 @@ func (r *simRunner) closeProc(pid int) error {
 // dropProc abandons process pid as a crash does: its sessions and Database vanish without closing,
 // and the kernel releases its locks.
 func (r *simRunner) dropProc(pid int) {
+	if p := r.procs[pid]; r.relaxed && p != nil && p.db != nil && p.db.core.pageOwner() != nil {
+		// A dead owner's batch may be lost back to the floor (validated-cow.md §4): the simulated
+		// process crash may drop writes of the step that acknowledged a commit.
+		r.main().ownerLost = true
+	}
 	for _, sid := range r.sessionsOf(pid) {
 		delete(r.sessions, sid)
 	}
@@ -1896,7 +1987,7 @@ func (r *simRunner) observe(i int, who string, v uint64, dg string, ok bool) boo
 	switch {
 	case !ok:
 		r.fail(i, "%s: version %d is unreadable", who, v)
-	case v < m.version:
+	case v < m.version && (!m.ownerLost || v < m.floor):
 		r.fail(i, "%s sees version %d after version %d was published", who, v, m.version)
 	case v > m.maxAttempted:
 		r.fail(i, "%s sees version %d, which was never attempted (latest attempted %d)", who, v, m.maxAttempted)
@@ -1907,6 +1998,7 @@ func (r *simRunner) observe(i int, who string, v uint64, dg string, ok bool) boo
 		return false
 	}
 	m.version, m.lastDigest = v, dg
+	m.ownerLost = false
 	return true
 }
 

@@ -10,6 +10,8 @@
 description = "Attached file databases: create under crashes, per-database recovery, one durable writer"
 
 page_sizes = [256, 512]
+# Half the traces batch durability (validated-cow.md §4); each attachment follows the handle.
+synchronous = ["on", "off"]
 steps = 500
 max_tables = 5
 max_readers = 4

@@ -204,10 +204,23 @@ OS page cache survives the process and flushes lazily — but **NOT across an OS
 this is the standard SQLite `PRAGMA synchronous=OFF` trade, meant for throwaway/rebuildable databases
 and bulk loads, never a production store that must not lose a commit. It is a **handle** setting (not
 stored in the file); an **in-memory** database ignores it (it never fsyncs). Distinct from
-`synchronous` (§2.2): `synchronous=off` would *defer/batch* the fsync while keeping the file crash-safe
-(never corrupts — a designed, not-yet-built mode); `skip_fsync` *skips* it outright and forfeits
-OS-crash durability. Same shape across cores. (The positively-oriented name `skip_fsync` reads as the
-action it performs, in the stdlib `SkipVerify` tradition — the safe default is the zero value.)
+`synchronous` (below): `synchronous=off` *defers/batches* the fsync while keeping the file crash-safe
+(never corrupts); `skip_fsync` *skips* it outright and forfeits OS-crash durability. Same shape across
+cores. (The positively-oriented name `skip_fsync` reads as the action it performs, in the stdlib
+`SkipVerify` tradition — the safe default is the zero value.)
+
+**Relaxed durability — `synchronous`.** `create`/`open`'s `synchronous` (Rust
+`CreateOptions.synchronous` + `OpenOptions.synchronous: Synchronous::{On, Off}` / Go `.Synchronous`
+with `SynchronousOn` (the zero value) and `SynchronousOff` / TS `{ synchronous: 'on' | 'off' }`; default
+**`on`**) chooses when a commit's durable barrier runs (transactions.md §9). Under `off` a commit is
+visible and acknowledged once its pages and meta are written, and one later **flush** makes a run of
+commits durable together: when the batch reaches its cap, at `close` (whose return value then reports a
+failed flush), and at the other flush points of [validated-cow.md](validated-cow.md) §4. A power loss
+or OS crash can lose the commits acknowledged since the last flush, never the file's integrity; a
+process crash loses none. The browser OPFS entry points take the same option. It is a **handle**
+setting, not stored in the file; the handle's file attachments follow it; an in-memory database ignores
+it. Results, plans, cost, and file bytes are the same as without the background thread, in every core.
+Combined with `skip_fsync`, the deferred barrier is itself a no-op.
 
 #### 2.1.1 One create, no in-memory constructor
 
@@ -293,14 +306,13 @@ transactions.md §1). The commit boundary and durability are **decoupled** (tran
   success it always was. Rollback discards the working set. **File-backed** → commit publishes +
   makes durable per the **`synchronous`** setting (below).
 - **Durability — `synchronous` (default `on`) vs. `skip_fsync`.** `synchronous=on` makes a commit
-  durable **before it returns** (the §3 crash-safe recipe). `synchronous=off`/relaxed makes the
-  commit visible immediately and **batches/defers** the fsync — faster, may lose the last few
-  commits on a crash, **never corrupts** (the on-disk image is always a valid older snapshot); it is
-  a **designed but not-yet-built** mode (transactions.md §9), because a copy-on-write engine must gate
-  page-reuse on a durable watermark to keep that guarantee. The **implemented** durability knob is
-  **`skip_fsync`** (§2.1) — a create/open handle setting that *skips* the fsync outright: the full
-  speedup, but **DEV/TESTING ONLY** (durable across a process crash, not an OS crash). Production that
-  cannot lose a commit uses the default `synchronous=on`.
+  durable **before it returns** (the §3 crash-safe recipe). `synchronous=off` makes the commit visible
+  immediately and **batches/defers** the fsync — faster, may lose the commits acknowledged since the
+  last flush on a power loss or OS crash, **never corrupts** (the on-disk image is always a valid older
+  snapshot) — by the batched-durability rules of [validated-cow.md](validated-cow.md) §4 (§2.1).
+  **`skip_fsync`** (§2.1) *skips* the fsync outright: the full speedup, but **DEV/TESTING ONLY**
+  (durable across a process crash, not an OS crash). Production that cannot lose a commit uses the
+  default `synchronous=on`.
 
 The `Transaction` surface + SQL `BEGIN`/`COMMIT`/`ROLLBACK` (with `READ ONLY`/`READ WRITE` and
 failed-block poisoning) **landed in Phase 5** ([../../TODO.md](../../TODO.md)); their semantics
@@ -577,7 +589,9 @@ unchanged. Each durable attachment advances its own recorded txid when it change
 The recipe below is the **`synchronous=on`** durable-commit path (§2.2, transactions.md §9): it
 fires at **every** durable commit — each autocommit write statement and each explicit `COMMIT`
 alike. Under `synchronous=off` the commit is visible immediately and the `fsync` is **batched /
-deferred** (still all-or-nothing when it does run). Because a commit writes only dirty pages, an
+deferred** (still all-or-nothing when it does run): step 4's barrier is left to the next flush, and the
+meta goes to the slot that does not hold the newest durable meta ([validated-cow.md](validated-cow.md)
+§4). Because a commit writes only dirty pages, an
 autocommit write touches a handful of pages, not the whole file — explicit `BEGIN…COMMIT` still
 batches many statements into one commit.
 
@@ -585,8 +599,9 @@ batches many statements into one commit.
 
 1. Write dirty tree, catalog, overflow, and free-list pages to their final locations.
 2. Write any manifest overflow pages; small manifests fit inline in the existing meta page.
-3. Write the alternate meta slot (`txid & 1`) containing the new root and the manifest of
-   expected page identities.
+3. Write the alternate meta slot — the one not holding the newest durable meta, which under
+   `synchronous=on` is slot `txid & 1` — containing the new root and the manifest of expected page
+   identities.
 4. Execute one durable `sync`, then publish the committed snapshot and acknowledge success.
 
 On open, validate the newest meta's complete manifest and dirty-page contents before adopting
@@ -924,9 +939,9 @@ input-size cap cross-core.
   surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL
   `BEGIN`/`COMMIT`/`ROLLBACK` are specified in [transactions.md](transactions.md) and **landed in
   Phase 5**; §2.2–§2.3 above are revised accordingly (autocommit replaces the original "no
-  autocommit" rule; `close` no longer drops committed work). What stays deferred is only
-  `SAVEPOINT`/nested transactions, `synchronous=off` batching, and group-commit (transactions.md
-  §11).
+  autocommit" rule; `close` no longer drops committed work). `synchronous=off` batching and
+  its fsync coalescing landed later (transactions.md §9). What stays deferred is
+  `SAVEPOINT`/nested transactions and a time-based flush (transactions.md §11).
 - **Browser/OPFS host — landed (TS only), not a non-goal.** The Node `fs` host built here has a
   sibling OPFS host in the TS core ([hosts.md](hosts.md) §5): `OpfsBlockStore` over
   `FileSystemSyncAccessHandle`, with the engine in a Web Worker driven by an **async** client. Its

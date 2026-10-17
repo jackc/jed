@@ -26,6 +26,20 @@ const (
 	LockingNone
 )
 
+// Synchronous is the durability mode of a file-backed handle (spec/design/transactions.md §9, api.md
+// §2.1): when a commit's durable barrier runs.
+type Synchronous uint8
+
+const (
+	// SynchronousOn (the default) makes every commit durable before it returns.
+	SynchronousOn Synchronous = iota
+	// SynchronousOff acknowledges a commit once its pages and meta are written and batches the barrier:
+	// a later flush (the batch cap, Close, …) makes a run of commits durable together. A power loss or
+	// OS crash can lose the commits acknowledged since the last flush, never the file's integrity
+	// (spec/design/validated-cow.md §4).
+	SynchronousOff
+)
+
 // databaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // PageSize is fixed into the file's meta at creation and cannot change thereafter.
 type databaseOptions struct {
@@ -83,6 +97,8 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 		_ = store.close()
 		return nil, err
 	}
+	// Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
+	p.floorSlot = uint32(db.committed.txid & 1)
 	db.paging = newSharedPaging(p, cacheLeaves(defaultCacheBytes, db.pageSize))
 	db.committed.storePaging = db.paging
 	return db, nil
@@ -114,7 +130,10 @@ type OpenOptions struct {
 	// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
 	// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default false.
 	SkipFsync bool
-	Locking   Locking
+	// Synchronous is the durability mode (SynchronousOn, the default, or SynchronousOff — transactions.md
+	// §9). A handle setting, not stored in the file; the handle's file attachments follow it.
+	Synchronous Synchronous
+	Locking     Locking
 	// nil is the 5s default; a non-nil pointer (including &0) is an explicit deadline.
 	FileLockTimeoutMs *uint64
 	// IdleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write

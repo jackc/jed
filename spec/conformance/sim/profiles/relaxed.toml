@@ -1,0 +1,49 @@
+# Batched durability (validated-cow.md §4; simulation-testing.md §14 S9). Under synchronous = off a
+# run of small commits writes one non-floor meta slot with cumulative manifests, allocates only from
+# the high-water, and ends in one flush at the batch cap (37 manifest entries at 512-byte pages) or at
+# close. Crashes and faulted commits land mid-batch and at the cap flush itself; recovery must land
+# between the last flush and the newest attempted commit. Readers stay pinned across batches so reuse
+# after a flush is still gated by the watermark.
+
+description = "synchronous = off: batched commits, cap flushes, crashes mid-batch and at the flush"
+
+synchronous = ["off"]
+page_sizes = [512, 1024]
+cache_bytes = [0, 2048]
+steps = 400
+max_tables = 2
+max_rows = 300
+max_readers = 2
+batch = [1, 40]
+
+[weights]
+open_write = 14
+open_read = 3
+close_read = 4
+read_query = 2
+insert = 8
+update = 10
+delete = 8
+upsert = 2
+commit = 16
+rollback = 1
+create_table = 1
+drop_table = 2
+create_index = 1
+drop_index = 1
+analyze = 1
+check = 2
+reopen = 2
+crash_power = 5
+crash_process = 3
+
+[faults]
+commit_fault = 250
+chain = 400
+power_loss = 10
+process_crash = 4
+io_error_write = 1
+io_error_sync = 2
+survive = [100, 1000]
+tear = [0, 300]
+issue = [500, 1000]

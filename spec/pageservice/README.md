@@ -146,7 +146,10 @@ on expiry, while it keeps serving the connection's other requests (§2). With th
 committed snapshot for the connection — the **write pin**, counted like a read pin and released when
 the write transaction ends — and replies with the same cache answer as `begin_read`, plus the reuse
 grant: true when every pin on the database, the write pin included, is at or after the free list's
-generation (page-service.md §6). The meta is the pinned snapshot's.
+generation (page-service.md §6). The meta is the pinned snapshot's. An owner whose own commits are
+pending a flush under `synchronous = off` ([validated-cow.md](../design/validated-cow.md) §4) first
+flushes them, with the gate held and before pinning, so the client plans against a durable committed
+meta; a failed flush poisons the owner, which stops serving.
 
 A connection that holds the gate may name the write pin's `txid` in `read_pages`.
 
@@ -177,8 +180,9 @@ committed high-water or granted free pages), and no meta is written. A `commit_b
 `commit_pages`, or `commit_end` from a connection without the gate is a protocol violation (but see
 revocation below).
 
-Check C passing is the **point of no return**: the owner writes the meta slot `txid & 1`, executes the
-single durable barrier, publishes the commit (§4, §6.4), answers `committed`, and only then releases the
+Check C passing is the **point of no return**: the owner writes the meta to the slot that does not hold
+the committed meta (slot `txid & 1` unless a relaxed batch left the committed meta in the other slot),
+executes the single durable barrier — whatever either process's `synchronous` setting — publishes the commit (§4, §6.4), answers `committed`, and only then releases the
 gate, whatever happens to the connection. A write or sync failure poisons the owner: it stops serving
 (every connection closes) and its own handle refuses commits until reopened. A failure after check C
 sends no error frame, since the meta may already be durable: the client sees a lost connection and

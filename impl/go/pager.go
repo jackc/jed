@@ -84,6 +84,12 @@ type pager struct {
 	trustMeta        bool
 	commitInProgress bool
 	poisoned         bool
+	// Batched durability (validated-cow.md §4). floorSlot is the meta slot holding the newest durable
+	// meta; every commit writes the other one. pending is the CRC-64 digest of every body page (never a
+	// meta or manifest page) written by a commit after the floor — what a pending commit's manifest
+	// lists besides its own pages. Empty under synchronous = on.
+	floorSlot uint32
+	pending   map[uint32]uint64
 }
 
 // faultPoint selects a point in the commit write sequence at which the fault-injection seam

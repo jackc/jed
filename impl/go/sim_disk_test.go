@@ -303,6 +303,18 @@ func (d *simDisk) writeAt(off int64, p []byte) error {
 	return nil
 }
 
+// metaPending reports whether a meta-slot write is still pending, not yet covered by a barrier: the
+// disk fact the relaxed-durability oracle checks an engine's flush claim against (§8.2).
+func (d *simDisk) metaPending() bool {
+	if len(d.cache) < 12 {
+		return false
+	}
+	ps := int64(binary.BigEndian.Uint32(d.cache[8:12]))
+	_, a := d.pending[0]
+	_, b := d.pending[ps]
+	return a || b
+}
+
 // sortedPending returns the pending offsets in ascending order: no map order may leak.
 func (d *simDisk) sortedPending() []int64 {
 	offs := make([]int64, 0, len(d.pending))

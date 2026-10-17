@@ -7,6 +7,9 @@
 description = "An owner and page clients: promotion, lost connections, client commits"
 
 processes = "service"
+# Half the traces run the owner under synchronous = off (validated-cow.md §4): it flushes its batch
+# before a client's begin_write, and every client commit keeps its own barrier.
+synchronous = ["on", "off"]
 max_procs = 3
 page_sizes = [256, 512]
 max_readers = 4

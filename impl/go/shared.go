@@ -300,6 +300,78 @@ type storage struct {
 	// serviceClient is set on a page client's storage: its file is the owner's, reached through the
 	// service store (page-service.md §4.2).
 	serviceClient bool
+	// relaxed is the handle's synchronous = off (validated-cow.md §4): a file commit defers its barrier
+	// to a flush. Ignored in memory and on a page client's storage, whose commits the owner syncs.
+	relaxed bool
+	// flushing is the in-flight background cap flush, if any; every later storage operation waits for
+	// it first (awaitFlush), so it changes only when the barrier runs, never what is written.
+	flushing *backgroundFlush
+	// inlineFlush runs the cap flush in the committing goroutine instead (the deterministic simulator).
+	inlineFlush bool
+}
+
+// backgroundFlush is one background cap flush (validated-cow.md §4).
+type backgroundFlush struct {
+	done chan struct{}
+	err  error
+}
+
+// awaitFlush waits for an in-flight background flush. Its error is the barrier's, which also poisoned
+// the pager, so the next commit fails regardless. Caller holds st.mu.
+func (st *storage) awaitFlush() error {
+	f := st.flushing
+	if f == nil {
+		return nil
+	}
+	<-f.done
+	st.flushing = nil
+	return f.err
+}
+
+// flush makes every pending commit durable (validated-cow.md §4): close, detach, ownership release, and
+// a page client's begin_write. Caller holds st.mu.
+func (st *storage) flush() error {
+	if err := st.awaitFlush(); err != nil {
+		return err
+	}
+	if st.paging == nil {
+		return nil
+	}
+	return st.paging.withPager(func(p *pager) error { return p.flushPending() })
+}
+
+// startCapFlush ends a batch that reached the cap: the flush runs on its own goroutine (or inline for
+// the simulator), and the domain's next operation waits for it. Its failure poisons the pager, so the
+// next commit and close report it; the commit that reached the cap is already published. Caller holds
+// st.mu, after a relaxed commit.
+func (st *storage) startCapFlush() {
+	paging := st.paging
+	if st.inlineFlush {
+		_ = capFlush(paging)
+		return
+	}
+	f := &backgroundFlush{done: make(chan struct{})}
+	st.flushing = f
+	go func() {
+		f.err = capFlush(paging)
+		close(f.done)
+	}()
+}
+
+// capFlush runs one cap flush. A failed barrier may have dropped pending pages from the OS cache
+// ("fsyncgate"), so pages the published snapshot needs could now read stale: the storage is revoked,
+// and every later read, commit, and close fails 58030 until the database is reopened through recovery.
+func capFlush(paging *sharedPaging) error {
+	err := paging.withPager(func(p *pager) error { return p.flushPending() })
+	if err != nil {
+		paging.revoke(newError(IoError, "a deferred durability flush failed; reopen the database: "+err.Error()))
+	}
+	return err
+}
+
+// relaxedFile reports whether this domain's commits batch their barrier.
+func (st *storage) relaxedFile() bool {
+	return st.relaxed && st.path != "" && !st.serviceClient
 }
 
 // syncDirectoryOnce makes the database file's directory durable before the first durable commit after
@@ -502,9 +574,19 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		}
 	}
 	if st.path != "" {
-		if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
+		if err := st.awaitFlush(); err != nil {
 			return err
 		}
+		pending := false
+		if err := st.paging.withPager(func(p *pager) error {
+			pending = len(p.pending) > 0
+			return p.checkValidatedCommit()
+		}); err != nil {
+			return err
+		}
+		// While a relaxed batch is pending, nothing is reused: every page comes from the high-water
+		// (validated-cow.md §4 rule 3).
+		canReuse = canReuse && !pending
 		write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, canReuse, st.paging)
 		if err != nil {
 			return err
@@ -546,13 +628,17 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	}); err != nil {
 		return err
 	}
-	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, live.live)
+	relaxed := st.relaxedFile()
+	var pending []manifestEntry
+	_ = st.paging.withPager(func(p *pager) error { pending = p.pendingEntries(); return nil })
+	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, live.live, pending)
 	if err != nil {
 		return err
 	}
 	if err := verifyLiveCount(snap, st.paging, write, live); err != nil {
 		return err
 	}
+	capReached := false
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.reserve(plan.pageCount); err != nil {
 			return err
@@ -563,13 +649,17 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 			}
 			st.paging.pool.invalidate(pg.index)
 		}
-		if err := p.writeBlock(uint32(snap.txid&1), plan.meta); err != nil {
+		slot := p.commitSlot()
+		if err := p.writeBlock(slot, plan.meta); err != nil {
 			return err
 		}
-		if err := p.sync(); err != nil {
-			return err
+		if !relaxed {
+			if err := p.sync(); err != nil {
+				return err
+			}
 		}
-		p.finishValidatedCommit(plan.meta)
+		p.finishValidatedCommit(plan.meta, slot, !relaxed, plan.dirty)
+		capReached = relaxed && p.batchCapReached()
 		return nil
 	}); err != nil {
 		return err
@@ -587,6 +677,9 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	st.pageCount, st.freePages = plan.pageCount, plan.free
 	st.liveAtCompaction, st.freeGenTxid = plan.live, plan.generation
 	st.live = live
+	if capReached {
+		st.startCapFlush()
+	}
 	return nil
 }
 
@@ -734,6 +827,11 @@ func (st *storage) precheckBudget(snap *snapshot, reuse bool, budget *budgetCtx)
 		return nil
 	}
 	if st.path != "" {
+		if err := st.awaitFlush(); err != nil {
+			return err
+		}
+		// Plan exactly as the commit will: nothing is reused while a relaxed batch is pending.
+		_ = st.paging.withPager(func(p *pager) error { reuse = reuse && len(p.pending) == 0; return nil })
 		write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, reuse, st.paging)
 		if err != nil {
 			return err
@@ -771,6 +869,11 @@ func (st *storage) storageBytes() int64 {
 func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	// The compacted image is durable on its own, which empties any pending batch; only an in-flight
+	// background flush of the old file must finish first (validated-cow.md §4).
+	if err := st.awaitFlush(); err != nil {
+		return nil, err
+	}
 	if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
 		return nil, err
 	}
@@ -819,7 +922,15 @@ func (st *storage) close() error {
 	if st.paging == nil {
 		return nil
 	}
-	return st.paging.close()
+	// A relaxed domain's pending commits become durable before the file is released (validated-cow.md
+	// §4); a failed flush is what close reports.
+	st.mu.Lock()
+	ferr := st.flush()
+	st.mu.Unlock()
+	if err := st.paging.close(); err != nil && ferr == nil {
+		ferr = err
+	}
+	return ferr
 }
 
 // hasLiveReaders reports whether any cross-session reader currently pins a committed snapshot (the live
@@ -1265,7 +1376,10 @@ type CreateOptions struct {
 	// durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database
 	// (opts.Path == "") which never fsyncs. Byte/cost/result-neutral; default false.
 	SkipFsync bool
-	Locking   Locking
+	// Synchronous is the durability mode (SynchronousOn, the default, or SynchronousOff — transactions.md
+	// §9). Ignored for an in-memory database. A handle setting, not stored in the file.
+	Synchronous Synchronous
+	Locking     Locking
 	// nil is the 5s default; &0 requests one immediate acquisition attempt.
 	FileLockTimeoutMs *uint64
 	// IdleInTransactionTimeoutMs, IdleSessionTimeoutMs, YieldGraceMs, ShutdownGraceMs, MaxConnections,
@@ -1322,6 +1436,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	if coordinator != nil && coordinator.lease() == leaseServiceOwner {
 		openOpts := OpenOptions{
 			SkipFsync:                  opts.SkipFsync,
+			Synchronous:                opts.Synchronous,
 			Locking:                    LockingAuto,
 			FileLockTimeoutMs:          opts.FileLockTimeoutMs,
 			IdleInTransactionTimeoutMs: opts.IdleInTransactionTimeoutMs,
@@ -1337,6 +1452,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
+	c.storage.relaxed = opts.Synchronous == SynchronousOff
 	return databaseOver(c), nil
 }
 
@@ -1393,6 +1509,7 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
+	c.storage.relaxed = opts.Synchronous == SynchronousOff
 	return databaseOver(c), nil
 }
 
@@ -1516,6 +1633,9 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			freeGenTxid:          e.freeGenTxid,
 			budget:               storageBudget{limit: source.maxStorageBytes},
 			live:                 e.live,
+			// A file attachment follows the handle's synchronous setting (validated-cow.md §4).
+			relaxed:     db.core.storage.relaxed,
+			inlineFlush: db.core.storage.inlineFlush,
 		}
 		root = e.committed // its stores fault through st.paging; loadEnginePaged bound storePaging too
 	}
@@ -1928,8 +2048,9 @@ func (db *Database) Close() error {
 		c.closeService()
 	}
 	c.writeMu.Lock()
+	var closeErr error
 	if st := c.storage; st.paging != nil {
-		_ = st.paging.close()
+		closeErr = st.close()
 		st.paging = nil
 	}
 	// Release any still-attached file databases (an in-memory attachment's close is a no-op), so the
@@ -1937,7 +2058,9 @@ func (db *Database) Close() error {
 	c.attachmentsMu.Lock()
 	coordinators := make([]*fileCoordinator, 0, len(c.attachments))
 	for _, att := range c.attachments {
-		_ = att.storage.close()
+		if err := att.storage.close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
 		if att.coordinator != nil {
 			coordinators = append(coordinators, att.coordinator)
 		}
@@ -1953,7 +2076,7 @@ func (db *Database) Close() error {
 		c.coordinator.close()
 		c.coordinator = nil
 	}
-	return nil
+	return closeErr
 }
 
 // accessMode is the access mode a Session was minted with (spec/design/session.md §2.4/§5.1).
