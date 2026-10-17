@@ -9,13 +9,14 @@
 > reproduce identically (CLAUDE.md §2, §8). When a decision here changes, change the
 > data/grammar and here in the same edit.
 >
-> **Status: Slices 1–5 landed.** The canonical grammar and all three native cores implement the
+> **Status: Slices 1–6 landed.** The canonical grammar and all three native cores implement the
 > catalog-only frame: renames, column defaults/nullability, and `ADD`/`DROP CONSTRAINT` for CHECK,
 > UNIQUE, FOREIGN KEY, and EXCLUDE, including comma-action atomicity and validating scans; `ADD
 > COLUMN` appends the catalog column and atomically rebuilds the table (and re-keys it for an inline
 > PRIMARY KEY), `DROP COLUMN` physically removes non-PK columns while compacting dependent
 > ordinals, `ALTER COLUMN TYPE` converts each row, and standalone `ADD`/`DROP PRIMARY KEY` re-key
-> between declared keys and synthetic rowids.
+> between declared keys and synthetic rowids. Slice 6 adds identity management (§2.8): `ADD
+> GENERATED … AS IDENTITY`, `SET GENERATED`, `SET <sequence_option>` / `RESTART`, and `DROP IDENTITY`.
 
 `ALTER TABLE` mutates a table's definition in place — its columns, its constraints, its
 name. It is the last major DDL gap: `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` /
@@ -60,6 +61,13 @@ alter_column_action ::= "SET" "DEFAULT" expr
                       | "SET" "NOT" "NULL"
                       | "DROP" "NOT" "NULL"
                       | ("SET" "DATA")? "TYPE" type_name ("USING" expr)?
+                      | "ADD" "GENERATED" ("ALWAYS" | "BY" "DEFAULT") "AS" "IDENTITY"
+                            ("(" sequence_option* ")")?
+                      | identity_alter_option+
+                      | "DROP" "IDENTITY" ("IF" "EXISTS")?
+identity_alter_option ::= "SET" "GENERATED" ("ALWAYS" | "BY" "DEFAULT")
+                        | "SET" sequence_option
+                        | "RESTART" ("WITH"? signed_integer)?
 ```
 
 `column_def` and `table_constraint` are the exact `CREATE TABLE` productions
@@ -150,16 +158,16 @@ constant is coerced once and stored as value bytes (flag bit2); a non-constant e
 that does not coerce to the column type is `42804`. Existing rows are **not** rewritten — a
 default only affects future inserts (PG-faithful).
 
-An IDENTITY column rejects both forms with `42601` (PG-faithful): its synthesized default is part
-of identity management, which remains in the deferred identity-specific ALTER surface (§6).
+An IDENTITY column rejects both forms with `42601` (PG-faithful): its synthesized default belongs
+to identity management (§2.8) — `DROP IDENTITY` removes it.
 
 ### 2.5 `ALTER COLUMN … SET NOT NULL` / `DROP NOT NULL`
 
 Flip flag bit1. `DROP NOT NULL` is pure catalog (a PK member cannot drop NOT NULL — `42P16`).
 `SET NOT NULL` needs a **validating full scan**: any existing NULL in the column traps
 `23502` and aborts, leaving the catalog unchanged. The scan is metered like any read.
-An IDENTITY column cannot `DROP NOT NULL` (`42601`, PG-faithful); that invariant belongs to the
-deferred `DROP IDENTITY` form rather than this generic nullability edit.
+An IDENTITY column cannot `DROP NOT NULL` (`42601`, PG-faithful); `DROP IDENTITY` (§2.8) must come
+first, and it keeps the column NOT NULL.
 
 ### 2.6 `ADD table_constraint`
 
@@ -187,6 +195,64 @@ is pure catalog removal. A `UNIQUE` / `EXCLUDE` also drops its backing index (th
 named handle for removing a unique index — the inverse of the [indexes.md §8](indexes.md)
 note that `DROP INDEX` is currently the only way). `RESTRICT` (default) refuses to drop a
 `UNIQUE`/`PRIMARY KEY` a `FOREIGN KEY` references (`2BP01`); `CASCADE` drops those FKs with it.
+
+### 2.8 Identity management — `ADD GENERATED`, `SET GENERATED`, `SET`/`RESTART`, `DROP IDENTITY`
+
+An identity column is a NOT NULL integer column with an **owned** sequence, a synthesized `DEFAULT
+nextval('<seq>')`, and the persisted ALWAYS / BY DEFAULT bit ([sequences.md §13](sequences.md)).
+These forms turn an existing column into one, change it, and turn it back, matching PostgreSQL's
+`ATExecAddIdentity` / `ATExecSetIdentity` / `ATExecDropIdentity`. All are catalog-only: no row is
+read or rewritten, no `format_version` changes (the column flag bits, the owned-sequence link, and
+the expression default already exist — format v8/v14/v15).
+
+**`ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( sequence_options )]`.** PostgreSQL defines
+the sequence before it examines the column, and the checks follow that order:
+
+1. The column type must be `smallint` / `integer` / `bigint` (`22023`, "identity column type must be
+   smallint, integer, or bigint") — a `text NOT NULL` column reports this, not the NOT NULL rule.
+2. The options are `CREATE TABLE`'s identity options: an `AS` clause is `42601`, a bad option
+   `22023`, the bounds are the column type's ([sequences.md §14](sequences.md)). `SEQUENCE NAME n`
+   names the sequence (`42P07` if `n` is taken, `42939` for a `jed_` name); otherwise it is
+   `<table>_<column>_seq` with the usual suffix collision resolution
+   ([sequences.md §12.2](sequences.md)).
+3. Then `55000` (`object_not_in_prerequisite_state`) if the column is nullable ("must be declared
+   NOT NULL before identity can be added"), already an identity column, or has a default (constant
+   or expression — a `serial` column has its `nextval` default). `DROP DEFAULT` earlier in the same
+   statement clears the last.
+
+The new sequence starts from its `START` regardless of the values already in the column, as in
+PostgreSQL: existing rows are untouched, and an explicit `RESTART WITH` is how a migration moves the
+counter past them. On an attached-database table the form is `0A000`, like any serial / IDENTITY
+column there ([attached-databases.md](attached-databases.md)); on a temporary table the sequence is
+a temp sequence ([temp-tables.md §8](temp-tables.md)).
+
+**`SET GENERATED { ALWAYS | BY DEFAULT }`, `SET <sequence_option>`, `RESTART [[WITH] n]`.** One
+action may combine any of these in any order (PostgreSQL's `alter_identity_column_option_list`),
+each at most once (`42601`). A column that is not an identity column is `55000` ("is not an
+identity column"). `SET GENERATED` flips the persisted bit, so the next INSERT / UPDATE gates by the
+new kind (`428C9` for ALWAYS without `OVERRIDING SYSTEM VALUE`, [sequences.md §13.3](sequences.md)).
+The sequence options and `RESTART` edit the owned sequence exactly as `ALTER SEQUENCE` does
+([sequences.md §15.2](sequences.md)) with one difference that makes them PostgreSQL-exact: the
+sequence type is the **column type**, so an explicit `MINVALUE` / `MAXVALUE` outside it is `22023`
+and `NO MINVALUE` / `NO MAXVALUE` restore the column type's bound (an identity sequence's type is
+known from its column even though a sequence's type is not persisted — §14.4's divergence does not
+apply here). `SET AS`, `SET RESTART`, and `SET SEQUENCE NAME` are `42601` (PostgreSQL: "not
+supported here" / "invalid sequence option").
+
+**`DROP IDENTITY [IF EXISTS]`.** Drops the owned sequence and the synthesized default and clears the
+identity bits; the column stays NOT NULL (PostgreSQL keeps `attnotnull`). A column that is not an
+identity column is `55000`, or a no-op with `IF EXISTS` (PostgreSQL also raises a NOTICE; jed has
+no notices). `IF EXISTS` is about the identity only: a missing column is still `42703`. The dropped
+sequence's name is free for later actions of the same statement, so `DROP IDENTITY, ADD GENERATED …`
+recreates `<table>_<column>_seq`.
+
+**In the action list.** Each form takes part in §1's left-to-right frame: a sequence created by an
+`ADD GENERATED` (or `ADD COLUMN … GENERATED`) is pending until the statement publishes, later
+actions edit or drop it there, a later `DROP COLUMN` of an earlier column renumbers its owner, and a
+later `ALTER COLUMN … TYPE` retypes it (§3.3). Any failure discards the whole statement, sequence
+included, and the edit rolls back with its transaction. The identity sequence is located through
+the column's `nextval` default, so a column that also still owns a leftover `serial` sequence (after
+`DROP DEFAULT`) edits the right one.
 
 ## 3. Table-rewrite forms (Tier B — rebuild the B-tree)
 
@@ -339,10 +405,8 @@ Most of PG's `ALTER TABLE` menu is moot here and is **not** planned: `OWNER TO` 
 `{ENABLE|DISABLE} TRIGGER` (no roles/triggers, §3); `ATTACH`/`DETACH PARTITION`, `INHERIT`
 (no partitioning/inheritance); `SET TABLESPACE`, `SET (fillfactor=…)`, `SET STATISTICS`,
 `CLUSTER ON`, `SET {LOGGED|UNLOGGED}` (no storage/planner knobs of that kind); `SET SCHEMA`
-(no schemas). Each is a `0A000` if it ever reaches the parser. The one plausible **later**
-addition is identity management (`ALTER COLUMN … ADD GENERATED …`, `SET GENERATED
-{ALWAYS|BY DEFAULT}`, `RESTART`), since IDENTITY columns and `ALTER SEQUENCE … RESTART`
-already exist — a small follow-on, not scheduled.
+(no schemas). Each is a `0A000` if it ever reaches the parser. Identity management, once listed
+here as the plausible later addition, has landed (§2.8).
 
 ## 7. Divergence ledger
 
@@ -355,6 +419,8 @@ already exist — a small follow-on, not scheduled.
 | Type conversion without `USING` | Uses jed's explicit `CAST` matrix (§3.3) | Requires an implicit/assignment cast | One canonical strict conversion matrix; potentially lossy conversions remain visibly bounded to DDL rather than relaxing assignment |
 | Drop-primary-key spelling | `DROP PRIMARY KEY [CASCADE\|RESTRICT]` (§3.4) | `DROP CONSTRAINT <name>` | jed has no persisted PK constraint object/name to address |
 | ALTER TABLE on a non-table | `42809` for an index or sequence | Lenient for some relation kinds | jed's ALTER TABLE owns only the table surface; object-specific ALTER statements remain separate |
+| Action order | Strictly left to right (§1): `ALTER c ADD GENERATED …, ALTER c DROP IDENTITY` succeeds; `ADD COLUMN n … , ALTER n ADD GENERATED …` works | Fixed passes: every DROP form first, ADD IDENTITY after ADD COLUMN, SET last; ADD IDENTITY resolves its column before any action runs (the two examples are `55000` / `42703`) | One readable rule for every action; each action sees exactly the state the ones before it produced |
+| Repeated identity options | `42601` at parse, even on a non-identity column (§2.8) | `55000` first when the column is not an identity column | The option list is validated with the statement's syntax, before any column is examined |
 
 ## 8. Slicing
 
@@ -369,6 +435,8 @@ Ordered lowest-risk → highest, each a vertical slice (CLAUDE.md §10):
    inline-PK re-keying.
 4. **✅ `DROP COLUMN`** — the ordinal renumber + dependency cascade (non-PK columns).
 5. **✅ `ALTER COLUMN TYPE`** + **`ADD`/`DROP PRIMARY KEY`** — the re-encode/re-key rewrites.
+6. **✅ Identity management** (§2.8) — `ADD GENERATED … AS IDENTITY`, `SET GENERATED`, `SET` /
+   `RESTART`, `DROP IDENTITY`; catalog-only.
 
 ## 9. `format_version` impact
 

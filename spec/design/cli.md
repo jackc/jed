@@ -151,7 +151,12 @@ table-level `PRIMARY KEY` in key order; named `CHECK`s from their persisted text
 `INSERT` per row in primary-key order (a no-PK table dumps in storage order, which replays
 into the same rowids), then `CREATE [UNIQUE] INDEX` statements (after the rows, so a
 replay builds each index once — a UNIQUE *constraint* dumps as its backing unique index,
-which recreates the same state). After every table, each view follows as `CREATE VIEW name
+which recreates the same state). An identity column is written as a plain NOT NULL column; after
+its table's rows it becomes an identity column again through `ALTER TABLE … ALTER COLUMN … ADD
+GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY (SEQUENCE NAME s START WITH … INCREMENT BY … MINVALUE
+… MAXVALUE … CACHE … [NO] CYCLE)` — pg_dump's form ([alter.md](alter.md) §2.8) — followed, unless
+the counter is untouched, by `SELECT setval('s', last_value, is_called)`, so a GENERATED ALWAYS column
+takes its dumped values and the sequence keeps its name and position. After every table, each view follows as `CREATE VIEW name
 (columns) AS definition;` — its stored canonical text, followed by ` WITH LOCAL CHECK OPTION` or ` WITH
 CASCADED CHECK OPTION` when it has a check option, in dependency order (a view after every view it
 reads; ties in name byte order — [views.md](views.md) §11). The script is wrapped in one

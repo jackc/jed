@@ -44,9 +44,10 @@ Nine relations ship today:
   (1-based, declaration order), `type` (the canonical type text — `i32`, `varchar(80)`,
   `decimal(8,2)`, `i32[]`, `i32range`, a composite's name, …), `not_null` (declared `NOT NULL`
   or a `PRIMARY KEY` member), `pk_ordinal` (the column's 1-based position in the primary
-  key, in **key** order; `NULL` for a non-member), and `column_default` (the `DEFAULT` as SQL
+  key, in **key** order; `NULL` for a non-member), `column_default` (the `DEFAULT` as SQL
   text — an expression default in its stored canonical form, such as `uuidv7 ( )`, or a constant
-  as a literal of its stored value, such as `1.50` or `'draft'`; `NULL` for no default). A view
+  as a literal of its stored value, such as `1.50` or `'draft'`; `NULL` for no default), and
+  `identity_generation` (`ALWAYS` or `BY DEFAULT` for an identity column, `NULL` otherwise). A view
   column's `type` is the type a query over the view produces, so it carries no length or precision
   (`text`, not `varchar(80)`); a view column is never `not_null`, keyed, or defaulted. Views
   in attached databases are not listed.

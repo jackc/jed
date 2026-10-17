@@ -580,6 +580,12 @@ INSERT INTO t (id, v) OVERRIDING USER VALUE   VALUES (42, 'x')   -- discard the 
   CYCLE`; a bad option is the same `22023`, and an explicit bound outside the column type's range is
   `22023` "out of range for sequence data type *T*"). An **`AS`** clause inside these options is
   `42601` ("conflicting or redundant options" — the column type already fixes the sequence type).
+  **`SEQUENCE NAME n`** is accepted here only (PostgreSQL's identity-only option): it names the owned
+  sequence `n` instead of the auto-name — `42P07` if a relation (or the table itself, or another
+  identity sequence of the statement) already holds `n`, `42939` for a reserved `jed_` name, `42601`
+  if repeated. In `CREATE SEQUENCE` / `ALTER SEQUENCE` it is `42601` ("invalid sequence option
+  SEQUENCE NAME"), as in PostgreSQL. It is what lets a dump recreate an identity column under its
+  existing sequence name (`ALTER TABLE … ADD GENERATED … (SEQUENCE NAME n …)`, cli.md §3).
 - **`NOT NULL`** is forced (PG: an identity column is `NOT NULL`).
 - **The column `DEFAULT`** becomes the expression default `nextval('<seqname>')` (the v8 mechanism,
   evaluated per row at INSERT through the §4 write path), identical to a `serial` column's.
@@ -641,6 +647,18 @@ sequence):
   first (`0A000`, §11 step 6 of CLAUDE.md — relaxable later; a documented divergence from PG, which
   would re-key). The ALWAYS `428C9` check is ordered **before** the PK narrowing, so an ALWAYS identity
   PK reports `428C9` (PG's code), not `0A000`.
+
+### 13.4a Changing an identity column later
+
+`ALTER TABLE … ALTER COLUMN c` can add, change, and drop the identity of an existing column —
+`ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( options )]`, `SET GENERATED …`, `SET
+<sequence_option>` / `RESTART [[WITH] n]`, `DROP IDENTITY [IF EXISTS]` — with PostgreSQL's
+semantics ([alter.md §2.8](alter.md)). `ADD` builds exactly the sequence `CREATE TABLE` would; `SET`
+edits it like §15's `ALTER SEQUENCE`, but bounded by the column type (so `NO MAXVALUE` restores the
+column type's maximum — PG-exact, unlike a direct `ALTER SEQUENCE` on the same sequence, §14.4);
+`DROP` removes the sequence and the synthesized default and keeps NOT NULL. They write the same
+catalog fields `CREATE TABLE` writes (the two flag bits, the `owned_by` link, the `nextval` default),
+so nothing new is persisted.
 
 ### 13.5 Persistence & determinism
 

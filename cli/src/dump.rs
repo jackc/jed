@@ -8,7 +8,7 @@
 use std::io::{self, Write};
 
 use jed::Value;
-use jed::tooling::{CheckOption, Table};
+use jed::tooling::{CheckOption, IdentityKind, Table};
 
 /// Write the whole database as SQL. Tables come out in the catalog's standing order
 /// (sorted by lowercased name — api.md §6); rows in primary-key order via `ORDER BY`
@@ -37,6 +37,13 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
                 q(name),
                 values.join(", ")
             )?;
+        }
+        let identity: Vec<String> = {
+            let table = db.table(name).expect("listed table exists");
+            identity_sql(db, table)
+        };
+        for stmt in identity {
+            writeln!(out, "{stmt}")?;
         }
         for i in 0..n_indexes {
             let table = db.table(name).expect("listed table exists");
@@ -103,8 +110,12 @@ fn create_table_sql(table: &Table) -> String {
         }
         // The canonical DEFAULT text jed_columns.column_default shows (introspection.md §5): an
         // expression default's persisted expr-text (it re-parses to the same expression on replay),
-        // or a constant's SQL literal. `DEFAULT NULL` is omitted — it is the same as no default.
-        if let Some(default) = col.default_text() {
+        // or a constant's SQL literal. `DEFAULT NULL` is omitted — it is the same as no default. An
+        // identity column's synthesized `nextval` default is not written: `identity_sql` adds the
+        // identity back after the rows.
+        if col.identity.is_none()
+            && let Some(default) = col.default_text()
+        {
             line.push_str(" DEFAULT ");
             line.push_str(&default);
         }
@@ -130,6 +141,72 @@ fn create_table_sql(table: &Table) -> String {
         q(&table.name),
         parts.join(",\n")
     )
+}
+
+/// The statements that make each identity column of `table` an identity column again once its rows
+/// are in (cli.md §3): `ALTER TABLE … ADD GENERATED … AS IDENTITY` naming the existing sequence and
+/// spelling out every option, then — unless the counter is untouched — a `setval` that restores it.
+/// Adding the identity after the INSERTs lets a GENERATED ALWAYS column take its dumped values.
+fn identity_sql(db: &jed::Session, table: &Table) -> Vec<String> {
+    let mut out = Vec::new();
+    for col in &table.columns {
+        let Some(kind) = col.identity else {
+            continue;
+        };
+        let Some(seq) = col
+            .default_expr
+            .as_ref()
+            .and_then(|d| nextval_sequence_name(&d.expr_text))
+            .and_then(|n| db.sequence(&n))
+        else {
+            continue;
+        };
+        let when = match kind {
+            IdentityKind::Always => "ALWAYS",
+            IdentityKind::ByDefault => "BY DEFAULT",
+        };
+        out.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} ADD GENERATED {when} AS IDENTITY (SEQUENCE NAME {} \
+             START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {} CACHE {} {});",
+            q(&table.name),
+            q(&col.name),
+            q(&seq.name),
+            seq.start,
+            seq.increment,
+            seq.min_value,
+            seq.max_value,
+            seq.cache,
+            if seq.cycle { "CYCLE" } else { "NO CYCLE" },
+        ));
+        if seq.is_called || seq.last_value != seq.start {
+            out.push(format!(
+                "SELECT setval('{}', {}, {});",
+                q(&seq.name).replace('\'', "''"),
+                seq.last_value,
+                seq.is_called
+            ));
+        }
+    }
+    out
+}
+
+/// The sequence an identity column's synthesized default names: the name text inside its
+/// `nextval ( '…' )` literal (`''` undoubled), parsed by grammar.md §3's name rule.
+fn nextval_sequence_name(default_text: &str) -> Option<String> {
+    let start = default_text.find("nextval ( '")? + "nextval ( '".len();
+    let mut text = String::new();
+    let mut chars = default_text[start..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+            } else {
+                return jed::tooling::parse_name_text(&text).ok();
+            }
+        }
+        text.push(c);
+    }
+    None
 }
 
 /// `ORDER BY` over the primary-key columns in key order, or empty for a no-PK table.
@@ -270,5 +347,67 @@ mod tests {
             .expect("in-memory create is infallible")
             .session(jed::SessionOptions::default());
         assert_eq!(dump_to_string(&mut db), "BEGIN;\nCOMMIT;\n");
+    }
+
+    // Identity columns dump as plain NOT NULL columns, get their rows, and then become identity
+    // columns again under their own sequence name and state (cli.md §3) — so an ALWAYS column takes
+    // its dumped values, a renamed sequence keeps its name, and the counter carries over.
+    #[test]
+    fn identity_columns_round_trip_with_their_sequences() {
+        let mut db = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
+        for sql in [
+            "CREATE TABLE ids (id i32 GENERATED ALWAYS AS IDENTITY (START 5 INCREMENT 5) PRIMARY KEY, \
+             b i16 NOT NULL, fresh i64 GENERATED BY DEFAULT AS IDENTITY)",
+            "INSERT INTO ids (b) VALUES (1), (2)",
+            "ALTER TABLE ids ALTER b ADD GENERATED BY DEFAULT AS IDENTITY (SEQUENCE NAME \"B's seq\" CYCLE MAXVALUE 9)",
+            "ALTER TABLE ids ALTER b RESTART WITH 7",
+        ] {
+            db.execute(sql, &[]).unwrap();
+        }
+        let first = dump_to_string(&mut db);
+        assert_eq!(
+            first,
+            "BEGIN;\n\
+             CREATE TABLE ids (\n\
+             \x20 id i32,\n\
+             \x20 b i16 NOT NULL,\n\
+             \x20 fresh i64 NOT NULL,\n\
+             \x20 PRIMARY KEY (id)\n\
+             );\n\
+             INSERT INTO ids VALUES (5, 1, 1);\n\
+             INSERT INTO ids VALUES (10, 2, 2);\n\
+             ALTER TABLE ids ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME ids_id_seq \
+             START WITH 5 INCREMENT BY 5 MINVALUE 1 MAXVALUE 2147483647 CACHE 1 NO CYCLE);\n\
+             SELECT setval('ids_id_seq', 10, true);\n\
+             ALTER TABLE ids ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY (SEQUENCE NAME \"B's seq\" \
+             START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 9 CACHE 1 CYCLE);\n\
+             SELECT setval('\"B''s seq\"', 7, false);\n\
+             ALTER TABLE ids ALTER COLUMN fresh ADD GENERATED BY DEFAULT AS IDENTITY (SEQUENCE NAME ids_fresh_seq \
+             START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 CACHE 1 NO CYCLE);\n\
+             SELECT setval('ids_fresh_seq', 2, true);\n\
+             COMMIT;\n"
+        );
+        let mut replayed = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
+        for stmt in crate::splitter::split(&first).unwrap() {
+            replayed.execute(&stmt.sql, &[]).unwrap();
+        }
+        assert_eq!(dump_to_string(&mut replayed), first);
+        // The replayed ALWAYS column still refuses an explicit value and continues its sequence.
+        let err = replayed
+            .execute("INSERT INTO ids (id, b, fresh) VALUES (99, 1, 1)", &[])
+            .unwrap_err();
+        assert_eq!(err.code(), "428C9");
+        replayed
+            .execute("INSERT INTO ids (b, fresh) VALUES (3, 3)", &[])
+            .unwrap();
+        let rows = replayed
+            .query("SELECT id FROM ids WHERE b = 3", &[])
+            .unwrap();
+        let ids: Vec<Vec<jed::Value>> = rows.collect();
+        assert_eq!(ids, vec![vec![jed::Value::Int(15)]]);
     }
 }

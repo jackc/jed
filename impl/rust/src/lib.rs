@@ -156,7 +156,9 @@ pub mod tooling {
     // The CLI renders query results + dumps schema using these internal types (returned by
     // `Database::table` / `Session::table`).
     pub use crate::ast::CheckOption;
-    pub use crate::catalog::{CompositeType, IndexKey, IndexKeyExpr, Table, ViewDef};
+    pub use crate::catalog::{
+        CompositeType, IdentityKind, IndexKey, IndexKeyExpr, SequenceDef, Table, ViewDef,
+    };
     /// Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
     pub use crate::cost::{QUERY_MEMORY_PEAK, QUERY_MEMORY_UNDERFLOWS};
     /// Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).

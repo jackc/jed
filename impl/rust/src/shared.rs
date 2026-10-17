@@ -3628,6 +3628,15 @@ impl Session {
         self.engine.composite_type(name)
     }
 
+    /// The definition of sequence `name` (exact name) as this session sees it — session-local
+    /// temp, then main — or `None`. The doc-hidden `tooling` seam the CLI dump uses to recreate an
+    /// identity column's sequence state (cli.md §3); SQL's `jed_sequences` is the introspection
+    /// surface.
+    #[doc(hidden)]
+    pub fn sequence(&self, name: &str) -> Option<&crate::catalog::SequenceDef> {
+        self.engine.sequence(name)
+    }
+
     /// Every view of the main database this session sees, in dependency order — a view after every
     /// view it reads, ties in name byte order (spec/design/views.md §11, the CLI dump order). The
     /// [`ViewDef`](crate::tooling::ViewDef) return is the doc-hidden `tooling` introspection seam;
