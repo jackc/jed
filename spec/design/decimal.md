@@ -215,7 +215,9 @@ comparison with NULL treated as a comparable value (always definite).
   `max_int_digits` digits, or scale over `max_scale`) traps `22003` at resolve (PG `numeric_in`).
 - **Casts** ([casts.toml](../types/casts.toml)): `int → decimal` **implicit** (lossless, scale
   0); `decimal → int` **explicit** only (round to scale 0 half-away, then range-check, `22003`)
-  — **stricter than PG**, which assignment-casts numeric→int; jed forbids the silent narrowing.
+  — **stricter than PG**, which assignment-casts numeric→int. Unlike the integer narrowings
+  (assignment casts that store the exact value or trap, [types.md](types.md) §5), decimal→int
+  rounds, so jed will not do it silently on storage.
   Re-scaling to a target typmod (`CAST(x AS numeric(p,s))`) is the §2 store coercion.
 - **Rendering** (conformance tag **`D`**, [conformance.md](conformance.md) §1): the canonical
   text is an optional `-`, the integer digits (no leading zeros beyond a single `0`), and —

@@ -70,7 +70,7 @@
 # (../design/grammar.md §36, ../design/types.md §5). This does NOT relax the matrix below: a RUNTIME
 # text->T cast on a non-literal text expression (`CAST(text_col AS int)`) is admitted only by its own
 # (text, T) row, and a BARE string never silently becomes a number/bool (`int_col = '42'` is 42804). For integer/decimal the coercion follows jed's OWN literal
-# grammar (no hex/underscore/scientific/NaN — documented §36 divergences from PG).
+# grammar (no hex/underscore/NaN — documented §36 divergences from PG; decimal e-notation is accepted).
 #
 # ARRAY casts (the array cast follow-ons — ../design/array.md §7) likewise do NOT add (from, to)
 # rows here: an array is a STRUCTURAL container type (i32[] exists for every element with no catalog
@@ -86,7 +86,10 @@
 #
 # mode:
 #   implicit    inserted automatically anywhere a value of `to` is wanted (safe, lossless)
-#   assignment  inserted on INSERT/UPDATE into a column of `to` (safe, lossless)
+#   assignment  also inserted when a value is STORED into a column of `to` — INSERT ... VALUES
+#               (literal or expression slot), INSERT ... SELECT, UPDATE ... SET, ON CONFLICT DO
+#               UPDATE, an expression DEFAULT — but not in a comparison or operator. PostgreSQL's
+#               assignment context. May fail at runtime with the row's on_overflow trap.
 #   explicit    only via an explicit CAST(...) ; may fail at runtime
 # on_overflow:
 #   trap        raise the named error when the value does not fit `to` (CLAUDE.md §8)
@@ -109,25 +112,31 @@ from = "i32"
 to = "i64"
 mode = "implicit"
 
-# --- narrowing: lossy, explicit CAST only, traps on overflow ------------------
+# --- narrowing: lossy, assignment (storage) or explicit CAST, traps on overflow ---
+# PostgreSQL's int8->int4, int8->int2 and int4->int2 casts are assignment casts, and jed matches
+# them: `UPDATE t SET i32_col = i64_col` and `INSERT INTO t (i16_col) SELECT i64_col ...` store the
+# value when it fits and trap 22003 per row when it does not. A comparison or arithmetic never
+# narrows — the narrower operand widens instead (the implicit rows above), so `i32_col = i64_col`
+# compares as i64. The storage gate that applies these rows is the hand-written family-level
+# assignability check (grammar.md §24) plus the per-value store coercion (constraints.md §2).
 [[cast]]
 from = "i32"
 to = "i16"
-mode = "explicit"
+mode = "assignment"
 on_overflow = "trap"
 overflow_error = "22003"
 
 [[cast]]
 from = "i64"
 to = "i16"
-mode = "explicit"
+mode = "assignment"
 on_overflow = "trap"
 overflow_error = "22003"
 
 [[cast]]
 from = "i64"
 to = "i32"
-mode = "explicit"
+mode = "assignment"
 on_overflow = "trap"
 overflow_error = "22003"
 
@@ -154,8 +163,10 @@ mode = "implicit"
 # A decimal is rounded to scale 0 (HALF AWAY FROM ZERO — the one engine rounding mode,
 # ../design/decimal.md §3; so 2.5 -> 3, -2.5 -> -3, matching PG numeric->int), then
 # range-checked against the integer type and trapped (22003) if it does not fit. EXPLICIT
-# only — STRICTER than PostgreSQL, which assignment-casts numeric->int; jed forbids the
-# silent narrowing, consistent with its strict matrix (CLAUDE.md §4, design/types.md).
+# only — STRICTER than PostgreSQL, which assignment-casts numeric->int. The line jed draws against
+# the integer narrowings above (which ARE assignment casts): an integer narrowing either stores the
+# exact value or traps, while decimal->int rounds, so storing a decimal into an integer column would
+# silently change the value (CLAUDE.md §4, design/types.md §5).
 [[cast]]
 from = "decimal"
 to = "i16"

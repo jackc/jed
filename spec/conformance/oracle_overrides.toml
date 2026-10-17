@@ -494,15 +494,15 @@ file = "expr/float_arithmetic.test"
 sql = "SELECT 1.0::f32 % 0.0::f32"
 reason = "jed: `%` over f32 (IEEE fmod) traps 22012 on a finite-numerator zero divisor, like `/` (float.md §4). PostgreSQL has no real `%` operator, so it raises 42883 (operator does not exist) at parse. A surface extension, not a behavior divergence."
 
-# --- float round() ties: jed rounds half-AWAY-from-zero (one deterministic mode engine-wide,
+# --- float round() ties: jed rounds half-AWAY-from-zero (one rounding mode engine-wide,
 # decimal.md §3 / CLAUDE.md §8), so round(2.5) = 3. PostgreSQL's float8 round uses the C library
-# rint() (round-half-to-EVEN, platform-dependent), returning 2. jed deliberately diverges to keep
-# float rounding deterministic and cross-core identical (§8 float-formatting bias, §10), rather than
-# inherit PG's platform-sensitive rounding. round(3.5) agrees (both 4) and needs no override.
+# rint(), which under the default IEEE rounding mode is deterministic round-half-to-EVEN, returning 2.
+# jed diverges so float round() agrees with numeric round() and the float->int cast: one rounding
+# mode for every type, not a per-type choice. round(3.5) agrees (both 4) and needs no override.
 [[override]]
 file = "expr/float_math.test"
 sql = "SELECT round(x) FROM f WHERE id = 10"
-reason = "jed: float round() is half-away-from-zero (the engine-wide deterministic rounding mode, decimal.md §3), so round(2.5::f64) = 3. PostgreSQL's double-precision round is the platform rint() (half-to-even) and returns 2 — nondeterministic across platforms, which jed deliberately avoids for cross-core determinism (CLAUDE.md §8/§10)."
+reason = "jed: float round() is half-away-from-zero (the single engine-wide rounding mode, decimal.md §3), so round(2.5::f64) = 3. PostgreSQL's double-precision round is rint(), which under the default IEEE rounding mode is round-half-to-even, and returns 2. jed keeps one rounding mode for every type (numeric round, float round, and the float->int cast all round half away from zero) rather than PG's per-type split."
 
 # --- round(f64, n): jed defines a 2-argument round over the float family (catalog
 # round/2, result f64). PostgreSQL's 2-arg round is numeric-only — there is no
@@ -989,16 +989,6 @@ file = "expr/type_errors.test"
 sql = "SELECT (a = b) + 1 FROM t WHERE id = 1"
 reason = "jed: arithmetic on a boolean is 42804 (datatype_mismatch — the strict type system, §4: no boolean + integer). PostgreSQL has no boolean/integer `+` operator and raises 42883 (undefined_function). Both reject; the codes differ."
 
-[[override]]
-file = "expr/type_errors.test"
-sql = "SELECT CAST(a AS boolean) FROM t WHERE id = 1"
-reason = "jed: casting TO boolean is deferred this slice (0A000 — types.md §9, the documented narrowing). PostgreSQL supports integer->boolean (0 -> false, nonzero -> true) and returns a value. A documented feature deferral."
-
-[[override]]
-file = "expr/type_errors.test"
-sql = "SELECT CAST(a = b AS i32) FROM t WHERE id = 1"
-reason = "jed: there is no boolean->integer cast (a forbidden pair in the strict type system, §4) — 42804. PostgreSQL supports boolean->integer (true -> 1, false -> 0) and returns a value. A documented strict-typing divergence."
-
 # --- joins/errors.test: jed dropped the comma (implicit) cross join.
 [[override]]
 file = "joins/errors.test"
@@ -1092,11 +1082,6 @@ reason = "jed: a text PRIMARY KEY is rejected this slice (0A000), a documented n
 file = "types/boolean.test"
 sql = "SELECT id FROM t WHERE flag = 1"
 reason = "jed: boolean vs a non-boolean operand is 42804 (datatype_mismatch — strict typing, like bool = int). PostgreSQL finds no boolean/integer `=` operator and raises 42883 (undefined_function). Both reject; the codes differ."
-
-[[override]]
-file = "types/boolean.test"
-sql = "SELECT CAST(id AS boolean) FROM t WHERE id = 1"
-reason = "jed: casting TO boolean is deferred this slice (0A000 — types.md §9, the documented narrowing). PostgreSQL supports integer->boolean and returns a value. A documented feature deferral."
 
 [[override]]
 file = "types/boolean.test"
