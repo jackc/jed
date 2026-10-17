@@ -779,6 +779,9 @@ func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectiv
 	if estimatorAnyArray(expr) && (expr.elemExact || expr.elemPromoted) {
 		return db.statisticsAnyArraySelectivity(expr, rel)
 	}
+	if estimatorNotAllArray(expr) && (expr.elemExact || expr.elemPromoted) {
+		return db.statisticsNotAllArraySelectivity(expr, rel)
+	}
 	column, op, literal, ok := statisticsComparison(expr, rel)
 	if !ok {
 		return selectivityExpr{}, false
@@ -803,21 +806,46 @@ func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectiv
 // unknown value adds the NDV average. A promoted element type converts each known element to the
 // column's type first, so an element no value can equal adds none.
 func (db *engine) statisticsAnyArraySelectivity(expr *rExpr, rel scopeRel) (selectivityExpr, bool) {
-	column, ok := statisticsColumn(expr.lhs, rel)
+	current, rows, _, ok := db.statisticsArrayEqualityRows(expr, rel)
 	if !ok {
 		return selectivityExpr{}, false
 	}
-	current := db.currentColumnStatistics(rel, column)
-	if current == nil {
+	return statisticsSelectivity(rows, current.rows), true
+}
+
+// statisticsNotAllArraySelectivity estimates `column <> ALL(array)` from column statistics
+// (statistics.md §6): the non-NULL rows outside the `= ANY` rows, or none when the array is NULL or
+// holds a known NULL element.
+func (db *engine) statisticsNotAllArraySelectivity(expr *rExpr, rel scopeRel) (selectivityExpr, bool) {
+	current, rows, hasNull, ok := db.statisticsArrayEqualityRows(expr, rel)
+	if !ok {
 		return selectivityExpr{}, false
 	}
-	seen, rows := make(map[string]bool), int64(0)
+	if hasNull || estimatorNullArray(expr.rhs) {
+		return statisticsSelectivity(0, current.rows), true
+	}
+	return statisticsSelectivity(current.nonnullRows-rows, current.rows), true
+}
+
+// statisticsArrayEqualityRows is the `column = ANY(array)` row count from column statistics, and
+// whether the array holds a known NULL element.
+func (db *engine) statisticsArrayEqualityRows(expr *rExpr, rel scopeRel) (current *currentColumnStatistics, rows int64, hasNull bool, ok bool) {
+	column, ok := statisticsColumn(expr.lhs, rel)
+	if !ok {
+		return nil, 0, false, false
+	}
+	current = db.currentColumnStatistics(rel, column)
+	if current == nil {
+		return nil, 0, false, false
+	}
+	seen := make(map[string]bool)
 	keyType := rel.table.Columns[column].Type.Scalar
 	for _, elem := range estimatorArrayElements(expr.rhs) {
 		if expr.elemPromoted {
 			elem = estimatorPointElement(keyType, elem)
 		}
 		if estimatorIsNull(elem) {
+			hasNull = true
 			continue
 		}
 		if key, ok := db.statisticsLiteralKey(elem, rel, column); ok {
@@ -827,7 +855,7 @@ func (db *engine) statisticsAnyArraySelectivity(expr *rExpr, rel scopeRel) (sele
 			}
 		} else {
 			if current.ndv == nil {
-				return selectivityExpr{}, false
+				return nil, 0, false, false
 			}
 			rows = satEstimateAdd(rows, statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv)))
 		}
@@ -835,7 +863,7 @@ func (db *engine) statisticsAnyArraySelectivity(expr *rExpr, rel scopeRel) (sele
 			rows = current.nonnullRows
 		}
 	}
-	return statisticsSelectivity(rows, current.rows), true
+	return current, rows, hasNull, true
 }
 
 func collectStatisticsEqualityDisjunction(expr *rExpr, rel scopeRel, column *int, set *bool, literals *[]*rExpr) bool {

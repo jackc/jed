@@ -20,7 +20,7 @@ EXPLAIN SELECT v FROM cp WHERE tenant = 1 AND id = ANY(ARRAY[2, 4, 900])
 Filter
 conjuncts=2
 3
-20
+29
 1
 Scan cp
 PK interval set: tenant, id; intervals=1; arrays=1; touched=3
@@ -36,7 +36,7 @@ EXPLAIN SELECT v FROM cp WHERE tenant = $1 AND id = ANY($2)
 Filter
 conjuncts=2
 2
-12
+16
 1
 Scan cp
 PK interval set: tenant, id; intervals=1; arrays=1; touched=3
@@ -81,7 +81,7 @@ EXPLAIN SELECT v FROM cp WHERE tenant = ANY(ARRAY[1, 2]) AND id IN (2, 3)
 Filter
 conjuncts=2
 2
-18
+22
 1
 Scan cp
 PK interval set: tenant, id; intervals=3; arrays=1; touched=3
@@ -171,12 +171,12 @@ EXPLAIN SELECT tenant, id FROM cp WHERE tenant IN (1, 2, 3) AND id = ANY(ARRAY[3
 Limit
 limit=2
 2
-22
+26
 1
 Filter
 conjuncts=2
 2
-20
+24
 2
 Scan cp
 PK interval set: tenant, id; intervals=4; arrays=1; touched=2; ordered: pk ordered

@@ -387,7 +387,7 @@ EXPLAIN SELECT cat FROM items WHERE id = ANY($1)
 Filter
 conjuncts=1
 2
-8
+12
 1
 Scan items
 PK interval set: id; intervals=1; arrays=1; touched=2
@@ -401,7 +401,7 @@ EXPLAIN SELECT cat FROM items WHERE id = ANY('{70,80}'::i32[])
 Filter
 conjuncts=1
 2
-8
+12
 1
 Scan items
 PK interval set: id; intervals=1; arrays=1; touched=2
@@ -433,7 +433,7 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY($1)
 Filter
 conjuncts=1
 900
-2906
+3906
 1
 Scan items
 Full scan; touched=2
@@ -447,7 +447,7 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY('{1}'::i32[])
 Filter
 conjuncts=1
 900
-2906
+3906
 1
 Scan items
 Full scan; touched=2
@@ -462,7 +462,7 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY($1)
 Filter
 conjuncts=1
 2
-12
+16
 1
 Scan items
 Index interval set: using items_cat; intervals=1; arrays=1; touched=2
@@ -476,7 +476,7 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY('{10,20}'::i32[])
 Filter
 conjuncts=1
 2
-12
+16
 1
 Scan items
 Index interval set: using items_cat; intervals=1; arrays=1; touched=2

@@ -22,7 +22,7 @@ EXPLAIN SELECT a FROM t WHERE id = ANY(ARRAY[1, 3, 5])
 Filter
 conjuncts=1
 3
-13
+22
 1
 Scan t
 PK interval set: id; intervals=1; arrays=1; touched=2
@@ -37,7 +37,7 @@ EXPLAIN SELECT a FROM t WHERE id = ANY($1)
 Filter
 conjuncts=1
 2
-7
+11
 1
 Scan t
 PK interval set: id; intervals=1; arrays=1; touched=2
@@ -52,14 +52,16 @@ EXPLAIN SELECT a FROM t WHERE id = ANY(ARRAY[1, 2]) OR id = 6
 Filter
 conjuncts=1
 3
-19
+25
 1
 Scan t
 PK interval set: id; intervals=2; arrays=1; touched=2
 3
 4
 
-# ALL does not lower.
+# ALL does not lower. `<> ALL` estimates as the complement of `= ANY` over the same elements: each of
+# the four equalities is one of six rows (rounded up), leaving two. The Filter's cost counts one
+# operator_eval per element the residual compares.
 query ITTII nosort
 EXPLAIN SELECT id FROM t WHERE id <> ALL(ARRAY[1, 2, 3, 4])
 ----
@@ -67,7 +69,7 @@ EXPLAIN SELECT id FROM t WHERE id <> ALL(ARRAY[1, 2, 3, 4])
 Filter
 conjuncts=1
 2
-21
+45
 1
 Scan t
 Full scan; touched=1
@@ -89,7 +91,7 @@ EXPLAIN SELECT a FROM big WHERE id = ANY('{1,3}'::i32[])
 Filter
 conjuncts=1
 2
-7
+11
 1
 Scan big
 PK interval set: id; intervals=1; arrays=1; touched=2
@@ -119,7 +121,7 @@ EXPLAIN SELECT a FROM big WHERE id = ANY(ARRAY[1::i32, 3::i32])
 Filter
 conjuncts=1
 1
-17
+23
 1
 Scan big
 Full scan; touched=2
@@ -140,7 +142,7 @@ EXPLAIN SELECT a FROM fl WHERE id = ANY('{1}'::f32[])
 Filter
 conjuncts=1
 1
-6
+8
 1
 Scan fl
 Full scan; touched=2
@@ -155,7 +157,7 @@ EXPLAIN SELECT a FROM big WHERE id = ANY(ARRAY[1, 3])
 Filter
 conjuncts=1
 2
-9
+13
 1
 Scan big
 PK interval set: id; intervals=1; arrays=1; touched=2
@@ -179,7 +181,7 @@ EXPLAIN SELECT id FROM s WHERE x = ANY(ARRAY[30, 10])
 Filter
 conjuncts=1
 2
-11
+15
 1
 Scan s
 Index interval set: using sx; intervals=1; arrays=1; touched=2
@@ -209,7 +211,7 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY('{1.0}'::decimal[])
 Filter
 conjuncts=1
 900
-2903
+3903
 1
 Scan items
 Full scan; touched=2
@@ -224,9 +226,86 @@ EXPLAIN SELECT id FROM items WHERE cat = ANY('{70.0,1.5}'::decimal[])
 Filter
 conjuncts=1
 1
-7
+9
 1
 Scan items
 Index interval set: using items_cat; intervals=1; arrays=1; touched=2
 1
 5
+
+# --- `<> ALL` (NOT IN) complements ---------------------------------------------------------------
+
+# Statistics count the rows each element matches: `cat <> ALL('{1}')` keeps the hundred rows that are
+# not the most-common value.
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat <> ALL('{1}'::i32[])
+----
+0
+Filter
+conjuncts=1
+100
+3103
+1
+Scan items
+Full scan; touched=2
+1000
+1003
+
+# A NULL element proves no row true: `x <> ALL` is never TRUE once an element is NULL.
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat <> ALL(ARRAY[70, NULL])
+----
+0
+Filter
+conjuncts=1
+0
+5003
+1
+Scan items
+Full scan; touched=2
+1000
+1003
+
+# A NULL array proves no row true; an empty array keeps every row.
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE id <> ALL(NULL::i32[])
+----
+0
+Filter
+conjuncts=1
+0
+13
+1
+Scan t
+Full scan; touched=1
+6
+7
+
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE id <> ALL('{}'::i32[])
+----
+0
+Filter
+conjuncts=1
+6
+19
+1
+Scan t
+Full scan; touched=1
+6
+7
+
+# Without statistics the complement uses the structural equality fraction per element.
+query ITTII nosort
+EXPLAIN SELECT a FROM big WHERE a <> ALL(ARRAY[10, 20])
+----
+0
+Filter
+conjuncts=1
+1
+17
+1
+Scan big
+Full scan; touched=1
+3
+4

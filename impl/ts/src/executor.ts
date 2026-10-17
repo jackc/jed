@@ -24300,7 +24300,21 @@ function statisticsLeafSelectivity(
     return statisticsSelectivity(rows, current.rows);
   }
   if (estimatorAnyArray(expr) && (expr.elemExact === true || expr.elemPromoted === true)) {
-    return statisticsAnyArraySelectivity(expr, rel, engine);
+    const counted = statisticsArrayEqualityRows(expr, rel, engine);
+    return counted === null ? null : statisticsSelectivity(counted.rows, counted.current.rows);
+  }
+  // `column <> ALL(array)`: the non-NULL rows outside the `= ANY` rows, or none when the array is
+  // NULL or holds a known NULL element.
+  if (
+    expr.kind === "quantified" &&
+    estimatorNotAllArray(expr) &&
+    (expr.elemExact === true || expr.elemPromoted === true)
+  ) {
+    const counted = statisticsArrayEqualityRows(expr, rel, engine);
+    if (counted === null) return null;
+    const { current, rows, hasNull } = counted;
+    const out = hasNull || estimatorNullArray(expr.array) ? 0n : current.nonnullRows - rows;
+    return statisticsSelectivity(out, current.rows);
   }
   const comparison = statisticsComparison(expr, rel);
   if (comparison === null) return null;
@@ -24318,28 +24332,33 @@ function statisticsLeafSelectivity(
   return rows === null ? null : statisticsSelectivity(rows, current.rows);
 }
 
-// statisticsAnyArraySelectivity estimates `column = ANY(array)` from column statistics
-// (statistics.md §6): the IN-list rule over the array's estimator elements — each distinct non-NULL
-// element by statistics key adds its equality rows, a NULL element adds none, and an element of
-// unknown value adds the NDV average. A promoted element type converts each known element to the
-// column's type first, so an element no value can equal adds none.
-function statisticsAnyArraySelectivity(
+// statisticsArrayEqualityRows is the `column = ANY(array)` row count from column statistics
+// (statistics.md §6), with the column's statistics and whether the array holds a known NULL element:
+// the IN-list rule over the array's estimator elements — each distinct non-NULL element by statistics
+// key adds its equality rows, a NULL element adds none, and an element of unknown value adds the NDV
+// average. A promoted element type converts each known element to the column's type first, so an
+// element no value can equal adds none.
+function statisticsArrayEqualityRows(
   expr: Extract<RExpr, { kind: "quantified" }>,
   rel: ScopeRel,
   engine: Engine,
-): Selectivity | null {
+): { current: CurrentColumnStatistics; rows: bigint; hasNull: boolean } | null {
   const column = statisticsColumn(expr.lhs, rel);
   if (column === null) return null;
   const current = currentColumnStatistics(engine, rel, column);
   if (current === null) return null;
   const seen = new Set<string>();
   let rows = 0n;
+  let hasNull = false;
   const keyType = rel.table.columns[column]!.type;
   for (let elem of estimatorArrayElements(expr.array)) {
     if (expr.elemPromoted === true && keyType.kind === "scalar") {
       elem = estimatorPointElement(keyType.scalar, elem);
     }
-    if (estimatorIsNull(elem)) continue;
+    if (estimatorIsNull(elem)) {
+      hasNull = true;
+      continue;
+    }
     const key = statisticsLiteralKey(elem, rel, column, engine);
     if (key !== null) {
       const id = encodeBytea(key, "hex");
@@ -24356,7 +24375,7 @@ function statisticsAnyArraySelectivity(
     }
     if (rows > current.nonnullRows) rows = current.nonnullRows;
   }
-  return statisticsSelectivity(rows, current.rows);
+  return { current, rows, hasNull };
 }
 
 function collectStatisticsEqualityDisjunction(
@@ -24677,20 +24696,40 @@ function estimatorPredicateSelectivity(expr: RExpr | null): Selectivity {
     case "column":
       return fractionSelectivity(SELECTIVITY_BOOLEAN);
     case "quantified": {
+      if (estimatorNotAllArray(expr)) {
+        // `x <> ALL(array)` is the complement of `x = ANY(array)` (estimator.md §7), except that a
+        // NULL array or a known NULL element proves no row true.
+        if (estimatorNullArray(expr.array)) return { kind: "zero" };
+        const elems = estimatorArrayElements(expr.array);
+        if (elems.some((elem) => estimatorIsNull(elem))) return { kind: "zero" };
+        return notSelectivity(estimatorEqualityDisjunction(elems));
+      }
       if (!estimatorAnyArray(expr)) return selectivityClass(ACCESS_UNSUPPORTED);
       // `x = ANY(array)` is the OR of `x = element` over its elements (estimator.md §7); a NULL
       // element contributes zero true rows.
-      const parts: Selectivity[] = [];
-      for (const elem of estimatorArrayElements(expr.array)) {
-        parts.push(
-          estimatorIsNull(elem) ? { kind: "zero" } : fractionSelectivity(SELECTIVITY_EQUALITY),
-        );
-      }
-      return orSelectivities(parts);
+      return estimatorEqualityDisjunction(estimatorArrayElements(expr.array));
+    }
+    case "inValues": {
+      // A folded `x [NOT] IN (SELECT ...)` reads its value list as `= ANY` / `<> ALL` over the
+      // same elements (estimator.md §7).
+      const elems = expr.list.map((v) => valueToRExpr(v));
+      if (!expr.negated) return estimatorEqualityDisjunction(elems);
+      if (expr.list.some((v) => v.kind === "null")) return { kind: "zero" };
+      return notSelectivity(estimatorEqualityDisjunction(elems));
     }
     default:
       return selectivityClass(ACCESS_UNSUPPORTED);
   }
+}
+
+// estimatorEqualityDisjunction is §7.1's OR of one equality per estimator element; a NULL element
+// contributes zero true rows.
+function estimatorEqualityDisjunction(elems: RExpr[]): Selectivity {
+  const parts: Selectivity[] = [];
+  for (const elem of elems) {
+    parts.push(estimatorIsNull(elem) ? { kind: "zero" } : fractionSelectivity(SELECTIVITY_EQUALITY));
+  }
+  return orSelectivities(parts);
 }
 
 function estimatorPredicateSelectivityWithStatistics(
@@ -25100,15 +25139,47 @@ function estimatorPointElement(keyType: ScalarType, elem: RExpr): RExpr {
 // equalities: ANY (not ALL) equality over an array operand constant for the whole relation.
 function estimatorAnyArray(e: RExpr): e is Extract<RExpr, { kind: "quantified" }> {
   if (e.kind !== "quantified" || e.op !== "eq" || e.all || e.rowWise) return false;
-  switch (e.array.kind) {
+  return estimatorArrayOperand(e.array);
+}
+
+// estimatorNotAllArray reports whether e is a `x <> ALL(array)` — the complement of `x = ANY(array)`
+// — over an array operand constant for the whole relation.
+function estimatorNotAllArray(e: RExpr): boolean {
+  if (e.kind !== "quantified" || e.op !== "ne" || !e.all || e.rowWise) return false;
+  return estimatorArrayOperand(e.array);
+}
+
+// estimatorNullArray reports an array operand the estimator reads as NULL.
+function estimatorNullArray(array: RExpr): boolean {
+  const c = estimatorValue(array);
+  return c !== null && c.kind === "constNull";
+}
+
+// estimatorKnownArrayLen is the element count of a quantified comparison's array operand when the
+// estimator knows it (estimator.md §8.2): an ARRAY[...] constructor's elements, or a plan-time-
+// readable array's flattened elements (a NULL array has none). null for any other operand.
+function estimatorKnownArrayLen(array: RExpr): bigint | null {
+  if (array.kind === "array" && !array.nested) return BigInt(array.elements.length);
+  const c = estimatorValue(array);
+  if (c === null) return null;
+  if (c.kind === "constNull") return 0n;
+  if (c.kind === "constArray" && c.value.kind === "array") return BigInt(c.value.elements.length);
+  return null;
+}
+
+// estimatorArrayOperand reports an array operand constant for the whole relation: a parameter, an
+// array constant, a NULL, a correlated outer column, or a one-dimensional ARRAY[...] of literals,
+// parameters, and outer columns.
+function estimatorArrayOperand(array: RExpr): boolean {
+  switch (array.kind) {
     case "param":
     case "constArray":
     case "constNull":
     case "outerColumn":
       return true;
     case "array":
-      if (e.array.nested) return false;
-      for (const elem of e.array.elements) {
+      if (array.nested) return false;
+      for (const elem of array.elements) {
         if (!estimatorLiteral(elem) && elem.kind !== "outerColumn") return false;
       }
       return true;
@@ -25493,11 +25564,16 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
     case "subquery":
       children = sum(expr.lhs);
       break;
+    // A folded IN list charges one operator_eval per value, and a quantified comparison one per
+    // element it compares (cost.md §3); the estimator counts them when the elements are known.
     case "inValues":
-      children = sum(expr.lhs);
+      children = saturatingEstimateAdd(sum(expr.lhs), BigInt(expr.list.length));
       break;
     case "quantified":
-      children = sum(expr.lhs, expr.array);
+      children = saturatingEstimateAdd(
+        sum(expr.lhs, expr.array),
+        estimatorKnownArrayLen(expr.array) ?? 0n,
+      );
       break;
     case "widthBucketArray":
       children = sum(expr.operand, expr.thresholds);
