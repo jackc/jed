@@ -1674,7 +1674,7 @@ impl Parser {
         false
     }
 
-    /// Parse an optional `PASSING value [FORMAT JSON] AS name [, …]` clause of a SQL/JSON query
+    /// Parse an optional `PASSING value [FORMAT JSON [ENCODING name]] AS name [, …]` clause of a SQL/JSON query
     /// function or `JSON_TABLE` (json-sql-functions.md §5.4) → its arguments (empty when absent).
     /// The name is any identifier, folded like one (`AS X` binds `$x`; `AS "X"` binds `$X`).
     fn parse_json_passing(&mut self) -> Result<Vec<JsonPassing>> {
@@ -1686,11 +1686,18 @@ impl Parser {
         loop {
             let expr = self.parse_expr()?;
             let format_json = self.skip_format_json();
+            let encoding = if format_json && self.peek_keyword().as_deref() == Some("encoding") {
+                self.advance(); // ENCODING
+                Some(json_encoding_name(&self.expect_identifier()?)?)
+            } else {
+                None
+            };
             self.expect_keyword("as")?;
             let name = self.expect_identifier()?;
             passing.push(JsonPassing {
                 expr,
                 format_json,
+                encoding,
                 name,
             });
             if !matches!(self.peek(), Token::Comma) {
@@ -7232,5 +7239,20 @@ mod tests {
             panic!("expected binary RHS");
         };
         assert!(matches!(lhs.as_ref(), Expr::Column(name, _) if name == "default"));
+    }
+}
+
+/// The canonical name of a SQL/JSON `ENCODING` clause's encoding (json-sql-functions.md §5.4):
+/// `UTF8`, `UTF16`, or `UTF32`, matched case-insensitively as PostgreSQL's `makeJsonEncoding` does.
+/// Any other name is `22023`.
+fn json_encoding_name(name: &str) -> Result<String> {
+    match name.to_ascii_lowercase().as_str() {
+        "utf8" => Ok("UTF8".to_string()),
+        "utf16" => Ok("UTF16".to_string()),
+        "utf32" => Ok("UTF32".to_string()),
+        _ => Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("unrecognized JSON encoding: {name}"),
+        )),
     }
 }

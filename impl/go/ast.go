@@ -1662,13 +1662,16 @@ type jsonExistsExpr struct {
 	OnError *jsonOnBehavior
 }
 
-// JsonPassing is one `PASSING value [FORMAT JSON] AS name` argument of a SQL/JSON query function or
+// JsonPassing is one `PASSING value [FORMAT JSON [ENCODING name]] AS name` argument of a SQL/JSON query function or
 // JSON_TABLE (json-sql-functions.md §5.4): binds the path variable $name to the value. FormatJSON is
 // true when `FORMAT JSON` was written (a character-string value is parsed as JSON text).
 type jsonPassing struct {
 	Expr       exprNode
 	FormatJSON bool
-	Name       string
+	// Encoding is the canonical name (UTF8, UTF16, or UTF32) of a `FORMAT JSON ENCODING name`
+	// clause — the encoding a bytea value is in — or "" when absent.
+	Encoding string
+	Name     string
 }
 
 // passingAny reports whether f holds for any PASSING value expression of ps — the shared walk of the

@@ -477,6 +477,89 @@ SELECT JSON_VALUE('{}', '$x' PASSING 'NaN'::f64 AS x)
 statement error 0A000
 SELECT JSON_VALUE('{}', '$x' PASSING '-Infinity'::f32 AS x)
 
-# FORMAT JSON on a bytea value reads it as encoded JSON text in PostgreSQL; jed defers it.
-statement error 0A000
-SELECT JSON_QUERY('{}', '$x' PASSING '\x7b7d'::bytea FORMAT JSON AS x)
+# FORMAT JSON on a bytea value reads it as UTF-8 encoded JSON text (ENCODING UTF8 says so
+# explicitly). Duplicate keys keep the last, as for text. A NULL bytea is JSON null.
+query TTTTT nosort
+SELECT JSON_QUERY('{}', '$x' PASSING '\x7b7d'::bytea FORMAT JSON AS x), JSON_QUERY('{}', '$x' PASSING '\x5b312c325d'::bytea FORMAT JSON ENCODING UTF8 AS x), JSON_VALUE('{}', '$x' PASSING '\x2261c3a96222'::bytea FORMAT JSON AS x), JSON_VALUE('{}', '$x.x' PASSING '\x7b2278223a312c202278223a327d'::bytea FORMAT JSON encoding "utf8" AS x), JSON_QUERY('{}', '$x' PASSING NULL::bytea FORMAT JSON AS x)
+----
+{}
+[1, 2]
+aéb
+2
+null
+
+query BT nosort
+SELECT JSON_EXISTS('{}', '$x ? (@ == 1)' PASSING '\x31'::bytea FORMAT JSON AS x), JSON_VALUE('{}', '$x' PASSING '\x2278'::bytea AS x)
+----
+true
+\x2278
+
+statement ok
+CREATE TABLE bdocs (id i32 PRIMARY KEY, raw bytea)
+
+statement ok
+INSERT INTO bdocs VALUES (1, '\x7b2261223a5b312c325d7d'), (2, '\x7b2261223a5b335d7d'), (3, NULL)
+
+query IT nosort
+SELECT id, JSON_QUERY('{}', '$d.a' PASSING raw FORMAT JSON AS d) FROM bdocs ORDER BY id
+----
+1
+[1, 2]
+2
+[3]
+3
+NULL
+
+query IT nosort
+SELECT d.id, j.v FROM bdocs d, JSON_TABLE('{}', '$d.a[*]' PASSING d.raw FORMAT JSON AS d COLUMNS (v text PATH '$')) j ORDER BY d.id, j.v
+----
+1
+1
+1
+2
+2
+3
+
+# Bytes that are not UTF-8, or a NUL byte, are 22021; text that is not JSON is 22P02. The PASSING
+# value is evaluated outside ON ERROR, so neither is caught.
+statement error 22021
+SELECT JSON_QUERY('{}', '$x' PASSING '\xff'::bytea FORMAT JSON AS x)
+
+statement error 22021
+SELECT JSON_QUERY('{}', '$x' PASSING '\x22c328'::bytea FORMAT JSON AS x)
+
+statement error 22021
+SELECT JSON_QUERY('{}', '$x' PASSING '\x22e282'::bytea FORMAT JSON AS x)
+
+statement error 22021
+SELECT JSON_QUERY('{}', '$x' PASSING '\x2200'::bytea FORMAT JSON AS x)
+
+statement error 22021
+SELECT JSON_VALUE('{}', '$.a' PASSING '\xff'::bytea FORMAT JSON AS x NULL ON ERROR)
+
+statement error 22P02
+SELECT JSON_QUERY('{}', '$x' PASSING ''::bytea FORMAT JSON AS x)
+
+statement error 22P02
+SELECT JSON_QUERY('{}', '$x' PASSING '\x5b'::bytea FORMAT JSON AS x)
+
+# A leading byte-order mark is not stripped, so it is not JSON.
+statement error 22P02
+SELECT JSON_QUERY('{}', '$x' PASSING '\xefbbbf2231'::bytea FORMAT JSON AS x)
+
+# ENCODING names UTF8, UTF16, or UTF32 (anything else is 22023) and is only allowed on a bytea
+# value (42804). PostgreSQL cannot convert from UTF16 or UTF32 (22023).
+statement error 22023
+SELECT JSON_QUERY('{}', '$x' PASSING '\x7b7d'::bytea FORMAT JSON ENCODING latin1 AS x)
+
+statement error 42804
+SELECT JSON_QUERY('{}', '$x' PASSING '{}'::text FORMAT JSON ENCODING UTF8 AS x)
+
+statement error 42804
+SELECT JSON_QUERY('{}', '$x' PASSING NULL FORMAT JSON ENCODING UTF8 AS x)
+
+statement error 22023
+SELECT JSON_QUERY('{}', '$x' PASSING '\x7b7d'::bytea FORMAT JSON ENCODING UTF16 AS x)
+
+statement error 22023
+SELECT JSON_QUERY('{}', '$x' PASSING '\x7b7d'::bytea FORMAT JSON ENCODING utf32 AS x)

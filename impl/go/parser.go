@@ -1862,7 +1862,22 @@ func (p *parser) skipFormatJSON() bool {
 	return false
 }
 
-// parseJSONPassing parses an optional `PASSING value [FORMAT JSON] AS name [, …]` clause of a SQL/JSON
+// jsonEncodingName is the canonical name of a SQL/JSON ENCODING clause's encoding
+// (json-sql-functions.md §5.4): UTF8, UTF16, or UTF32, matched case-insensitively as PostgreSQL's
+// makeJsonEncoding does. Any other name is 22023.
+func jsonEncodingName(name string) (string, error) {
+	switch strings.ToLower(name) {
+	case "utf8":
+		return "UTF8", nil
+	case "utf16":
+		return "UTF16", nil
+	case "utf32":
+		return "UTF32", nil
+	}
+	return "", newError(InvalidParameterValue, "unrecognized JSON encoding: "+name)
+}
+
+// parseJSONPassing parses an optional `PASSING value [FORMAT JSON [ENCODING name]] AS name [, …]` clause of a SQL/JSON
 // query function or JSON_TABLE (json-sql-functions.md §5.4) → its arguments (nil when absent). The
 // name is any identifier, folded like one (`AS X` binds $x; `AS "X"` binds $X).
 func (p *parser) parseJSONPassing() ([]jsonPassing, error) {
@@ -1877,6 +1892,17 @@ func (p *parser) parseJSONPassing() ([]jsonPassing, error) {
 			return nil, err
 		}
 		formatJSON := p.skipFormatJSON()
+		encoding := ""
+		if formatJSON && p.peekKeyword() == "encoding" {
+			p.advance() // ENCODING
+			enc, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			if encoding, err = jsonEncodingName(enc); err != nil {
+				return nil, err
+			}
+		}
 		if err := p.expectKeyword("as"); err != nil {
 			return nil, err
 		}
@@ -1884,7 +1910,7 @@ func (p *parser) parseJSONPassing() ([]jsonPassing, error) {
 		if err != nil {
 			return nil, err
 		}
-		passing = append(passing, jsonPassing{Expr: expr, FormatJSON: formatJSON, Name: name})
+		passing = append(passing, jsonPassing{Expr: expr, FormatJSON: formatJSON, Encoding: encoding, Name: name})
 		if p.peek().Kind != tokComma {
 			return passing, nil
 		}

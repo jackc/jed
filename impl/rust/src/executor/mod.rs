@@ -5897,11 +5897,12 @@ fn resolve_json_sql_fn(
 /// itself, and every other type is converted to `jsonb` — a `json` value parsed (last duplicate key
 /// wins), anything else by `to_jsonb`; a float is the number `float8_numeric`/`float4_numeric`
 /// makes of it. `FORMAT JSON` parses a text value as JSON instead (`22P02` on malformed text) and
-/// converts every other type by `to_jsonb`. `0A000`: a `date`/`timestamp`/`timestamptz` value,
-/// which PostgreSQL passes as a jsonpath datetime item (jed has none, by decision, jsonpath.md
-/// §3.1); and, deferred, a NaN or ±Infinity float (at evaluation), which PostgreSQL passes as a
-/// numeric NaN/±Infinity that jed's `decimal` cannot hold, and `FORMAT JSON` on a `bytea` value (an
-/// encoded JSON text).
+/// converts every other type by `to_jsonb`, except a `bytea` value: that is UTF-8 encoded JSON
+/// text, left as `bytea` here and decoded by [`passing_bindings`]. `ENCODING` is only allowed on a
+/// `bytea` value (`42804`), and only `UTF8` is supported (`22023`, PostgreSQL's conversion error).
+/// `0A000`: a `date`/`timestamp`/`timestamptz` value, which PostgreSQL passes as a jsonpath datetime
+/// item (jed has none, by decision, jsonpath.md §3.1); and, deferred, a NaN or ±Infinity float (at
+/// evaluation), which PostgreSQL passes as a numeric NaN/±Infinity that jed's `decimal` cannot hold.
 pub(crate) fn resolve_json_passing(
     scope: &Scope,
     passing: &[JsonPassing],
@@ -5937,8 +5938,22 @@ pub(crate) fn resolve_json_passing(
             typmod: None,
             varchar_len: None,
         };
+        if let Some(enc) = &p.encoding {
+            if !matches!(ty, ResolvedType::Bytea) {
+                return Err(EngineError::new(
+                    SqlState::DatatypeMismatch,
+                    "JSON ENCODING clause is only allowed for bytea input type",
+                ));
+            }
+            if enc != "UTF8" {
+                return Err(EngineError::new(
+                    SqlState::InvalidParameterValue,
+                    format!("invalid source encoding name \"{enc}\""),
+                ));
+            }
+        }
         let value = match (&ty, p.format_json) {
-            (ResolvedType::Bytea, true) => return unsupported("FORMAT JSON bytea"),
+            (ResolvedType::Bytea, true) => r,
             (ResolvedType::Null | ResolvedType::Jsonb, _) => r,
             (ResolvedType::Json, _) | (ResolvedType::Text, true) => cast_jsonb(r),
             (_, true) => to_jsonb(r, ty, params),
@@ -5992,11 +6007,53 @@ pub(crate) fn passing_bindings(
             }
             Value::Text(s) => JsonNode::String(s),
             Value::Jsonb(n) => n,
+            // `FORMAT JSON` on a `bytea` value: UTF-8 encoded JSON text, parsed as the text cast does.
+            Value::Bytea(b) => {
+                m.charge(COSTS.operator_eval);
+                json::jsonb_in(&decode_utf8_text(&b)?)?
+            }
             _ => unreachable!("resolve_json_passing converts every other type to jsonb"),
         };
         bindings.push((name.clone(), node));
     }
     Ok(crate::jsonpath::passing_vars(bindings))
+}
+
+/// Decode UTF-8 bytes as text, as PostgreSQL's `convert_from(…, 'UTF8')` verifies them: an invalid
+/// sequence or a NUL byte is `22021`, naming the sequence's bytes (up to its expected length, at most
+/// what remains) as PostgreSQL's `report_invalid_encoding` does.
+fn decode_utf8_text(b: &[u8]) -> Result<String> {
+    let bad = match std::str::from_utf8(b) {
+        Ok(s) => match s.find('\0') {
+            None => return Ok(s.to_string()),
+            Some(i) => i,
+        },
+        Err(e) => {
+            let valid = &b[..e.valid_up_to()];
+            valid
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(e.valid_up_to())
+        }
+    };
+    let lead = b[bad];
+    let want = match lead {
+        0x00..=0x7f => 1,
+        _ if lead & 0xe0 == 0xc0 => 2,
+        _ if lead & 0xf0 == 0xe0 => 3,
+        _ if lead & 0xf8 == 0xf0 => 4,
+        _ => 1,
+    };
+    let seq = &b[bad..(bad + want).min(b.len())];
+    let detail = seq
+        .iter()
+        .map(|c| format!("0x{c:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(EngineError::new(
+        SqlState::CharacterNotInRepertoire,
+        format!("invalid byte sequence for encoding \"UTF8\": {detail}"),
+    ))
 }
 
 /// A SQL/JSON error that the query functions' `ON ERROR` clause catches: a data exception (class

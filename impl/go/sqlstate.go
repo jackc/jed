@@ -57,6 +57,8 @@ const (
 	InvalidRowCountInLimitClause
 	// InvalidRowCountInOffsetClause is 2201X — OFFSET must not be negative.
 	InvalidRowCountInOffsetClause
+	// CharacterNotInRepertoire is 22021 — invalid byte sequence for encoding "UTF8": {detail}.
+	CharacterNotInRepertoire
 	// InvalidParameterValue is 22023 — invalid parameter value: {detail}.
 	InvalidParameterValue
 	// InvalidEscapeSequence is 22025 — {detail}.
@@ -270,6 +272,8 @@ func (s SqlState) Code() string {
 		return "2201W"
 	case InvalidRowCountInOffsetClause:
 		return "2201X"
+	case CharacterNotInRepertoire:
+		return "22021"
 	case InvalidParameterValue:
 		return "22023"
 	case InvalidEscapeSequence:
@@ -473,6 +477,7 @@ var errorDescs = []errorDesc{
 	{Code: "2200H", Name: "sequence_generator_limit_exceeded", Class: "data exception"},
 	{Code: "2201W", Name: "invalid_row_count_in_limit_clause", Class: "data exception"},
 	{Code: "2201X", Name: "invalid_row_count_in_offset_clause", Class: "data exception"},
+	{Code: "22021", Name: "character_not_in_repertoire", Class: "data exception"},
 	{Code: "22023", Name: "invalid_parameter_value", Class: "data exception"},
 	{Code: "22025", Name: "invalid_escape_sequence", Class: "data exception"},
 	{Code: "2201B", Name: "invalid_regular_expression", Class: "data exception"},
