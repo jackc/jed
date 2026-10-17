@@ -121,7 +121,7 @@ reads simply skip it (you still get correct rows from a heap scan) and any write
 it is refused (`XX002` on a mismatch, `42883` when the function is missing) — never a silently stale
 result. A non-`immutable` or unversioned host function used in an index is rejected up front with
 `42P17`. To adopt the new version, rebuild the index with
-[`REINDEX`](../../sql/indexes/#rebuilding-indexes-reindex) — `REINDEX INDEX geo_idx` (or
+[`REINDEX`](../../sql/indexes/#reindex) — `REINDEX INDEX geo_idx` (or
 `REINDEX TABLE`, `REINDEX DATABASE`) re-resolves the expression against your current functions,
 records their new identity, and rebuilds the keys, all or nothing.
 

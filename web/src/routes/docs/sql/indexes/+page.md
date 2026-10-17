@@ -232,7 +232,7 @@ timezone) is `42P17`. The same rules compose through CASE, COALESCE, arrays, and
 Named zones must be loaded when the index is created. jed stores their version and checksum with
 the index; a computed zone argument pins the entire loaded zone set. If the loaded data differs,
 reads skip that index and writes to its table fail with `XX002`. After loading the desired timezone
-bundle in a fresh process, rebuild the affected index with [`REINDEX`](#rebuilding-indexes-reindex):
+bundle in a fresh process, rebuild the affected index with [`REINDEX`](#reindex):
 
 ```sql
 REINDEX INDEX local_day;
@@ -363,6 +363,8 @@ GIN this release covers a focused surface (it grows from here):
   is rejected (`0A000`), matching PostgreSQL.
 
 `DROP INDEX`, auto-naming, and the `DROP TABLE` cascade work the same as for an ordered index.
+
+<a id="reindex"></a>
 
 ## Rebuilding indexes (`REINDEX`)
 
