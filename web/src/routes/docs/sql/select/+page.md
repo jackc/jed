@@ -222,7 +222,7 @@ Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
 (`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).
 Beyond `count`, `sum`, `avg`, `min`, and `max`, the aggregates include `bool_and`, `bool_or`, `every`, `bit_and`, `bit_or`, `bit_xor`,
-`array_agg` (`array_agg(name ORDER BY price)`), `string_agg` (`string_agg(name, ', ' ORDER BY name)`), and the statistical `var_pop`, `var_samp`, `variance`, and `stddev_pop` — exact over
+`array_agg` (`array_agg(name ORDER BY price)`), `string_agg` (`string_agg(name, ', ' ORDER BY name)`), and the statistical `var_pop`, `var_samp`, `variance`, `stddev_pop`, and\n`stddev_samp` — exact over
 integers and `numeric`.
 An aggregate's argument list may end in its own `ORDER BY` — the order it folds its input in — which
 is what fixes the element order of `jsonb_agg` / `json_agg` and the last-wins key of

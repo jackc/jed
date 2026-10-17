@@ -6060,6 +6060,7 @@ pub(crate) enum WindowPlan {
 /// Which statistic a one-argument statistical aggregate finalizes (aggregates.md §23).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MomentStat {
+    StddevSamp,
     StddevPop,
     VarPop,
     VarSamp,
@@ -6070,6 +6071,7 @@ impl MomentStat {
     pub(crate) fn from_surface(surface: &str) -> Option<MomentStat> {
         Some(match surface {
             "var_pop" => MomentStat::VarPop,
+            "stddev_samp" => MomentStat::StddevSamp,
             "stddev_pop" => MomentStat::StddevPop,
             "var_samp" | "variance" => MomentStat::VarSamp,
             _ => return None,
@@ -6081,6 +6083,7 @@ impl MomentStat {
     pub(crate) fn sample_stddev(self) -> (bool, bool) {
         match self {
             MomentStat::VarPop => (false, false),
+            MomentStat::StddevSamp => (true, true),
             MomentStat::StddevPop => (false, true),
             MomentStat::VarSamp => (true, false),
         }
