@@ -107,12 +107,16 @@ const (
 	ActiveSqlTransaction
 	// ReadOnlySqlTransaction is 25006 — cannot execute {statement} in a read-only transaction.
 	ReadOnlySqlTransaction
+	// NoActiveSqlTransaction is 25P01 — {statement} can only be used in transaction blocks.
+	NoActiveSqlTransaction
 	// InFailedSqlTransaction is 25P02 — current transaction is aborted, commands ignored until end of transaction block.
 	InFailedSqlTransaction
 	// IdleInTransactionSessionTimeout is 25P03 — {detail}.
 	IdleInTransactionSessionTimeout
 	// DependentObjectsStillExist is 2BP01 — cannot drop type {name} because other objects depend on it: {detail}.
 	DependentObjectsStillExist
+	// InvalidSavepointSpecification is 3B001 — savepoint does not exist: {name}.
+	InvalidSavepointSpecification
 	// ExternalRoutineException is 38000 — host function {name} raised {detail}.
 	ExternalRoutineException
 	// SyntaxError is 42601 — syntax error: {detail}.
@@ -316,12 +320,16 @@ func (s SqlState) Code() string {
 		return "25001"
 	case ReadOnlySqlTransaction:
 		return "25006"
+	case NoActiveSqlTransaction:
+		return "25P01"
 	case InFailedSqlTransaction:
 		return "25P02"
 	case IdleInTransactionSessionTimeout:
 		return "25P03"
 	case DependentObjectsStillExist:
 		return "2BP01"
+	case InvalidSavepointSpecification:
+		return "3B001"
 	case ExternalRoutineException:
 		return "38000"
 	case SyntaxError:
@@ -490,9 +498,11 @@ var errorDescs = []errorDesc{
 	{Code: "23P01", Name: "exclusion_violation", Class: "integrity constraint violation"},
 	{Code: "25001", Name: "active_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25006", Name: "read_only_sql_transaction", Class: "invalid transaction state"},
+	{Code: "25P01", Name: "no_active_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25P02", Name: "in_failed_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25P03", Name: "idle_in_transaction_session_timeout", Class: "invalid transaction state"},
 	{Code: "2BP01", Name: "dependent_objects_still_exist", Class: "dependent objects still exist"},
+	{Code: "3B001", Name: "invalid_savepoint_specification", Class: "invalid savepoint specification"},
 	{Code: "38000", Name: "external_routine_exception", Class: "external routine exception"},
 	{Code: "42601", Name: "syntax_error", Class: "syntax error or access rule violation"},
 	{Code: "42602", Name: "invalid_name", Class: "syntax error or access rule violation"},

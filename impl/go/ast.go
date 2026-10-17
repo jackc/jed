@@ -43,6 +43,29 @@ type statement struct {
 	Begin    *begin
 	Commit   *commit
 	Rollback *rollback
+	// Savepoint is SAVEPOINT / RELEASE [SAVEPOINT] / ROLLBACK … TO [SAVEPOINT] (transactions.md §11).
+	Savepoint *savepointStmt
+}
+
+// savepointOp says which savepoint statement a savepointStmt is (spec/design/transactions.md §11).
+type savepointOp int
+
+const (
+	// savepointDefine is SAVEPOINT name — mark the block's current state under name.
+	savepointDefine savepointOp = iota
+	// savepointRelease is RELEASE [SAVEPOINT] name — forget the newest savepoint named name and every
+	// later one, keeping their changes.
+	savepointRelease
+	// savepointRollbackTo is ROLLBACK … TO [SAVEPOINT] name — restore the state the newest savepoint
+	// named name marked, destroying every later savepoint but keeping that one; clears a failed block.
+	savepointRollbackTo
+)
+
+// savepointStmt is a savepoint statement inside an explicit block (spec/design/transactions.md §11,
+// grammar.md §27). Name is the identifier (folded unless quoted). Outside a block every form is 25P01.
+type savepointStmt struct {
+	Op   savepointOp
+	Name string
 }
 
 // analyzeStmt is `ANALYZE table [(column, ...)]` (spec/design/statistics.md). An empty Columns

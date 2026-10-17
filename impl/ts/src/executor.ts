@@ -57,6 +57,7 @@ import type {
   SetOp,
   SetOpKind,
   Statement,
+  SavepointOp,
   SubscriptSpec,
   TableRef,
   TypeFieldDef,
@@ -2957,7 +2958,7 @@ export class Engine {
         const ast = this.parse(span.text);
         // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
         // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
-        if (ast.kind === "begin" || ast.kind === "commit" || ast.kind === "rollback") {
+        if (ast.kind === "begin" || ast.kind === "commit" || ast.kind === "rollback" || ast.kind === "savepoint") {
           throw engineError(
             "feature_not_supported",
             "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; " +
@@ -3265,6 +3266,8 @@ export class Engine {
         return this.commitTx();
       case "rollback":
         return this.rollbackTx();
+      case "savepoint":
+        return this.savepointStmt(stmt.op, stmt.name);
     }
     this.estimatorTouched.clear();
     // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
@@ -3593,6 +3596,78 @@ export class Engine {
   rollbackTx(): Outcome {
     if (this.session.tx !== null) this.restoreSessionState(this.session.tx);
     this.session.tx = null;
+    return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // savepointStmt runs SAVEPOINT / RELEASE / ROLLBACK TO (spec/design/transactions.md §11), with
+  // PostgreSQL's semantics:
+  //
+  //   - With no open block every form is 25P01 (no_active_sql_transaction); there is no block to abort.
+  //   - In a failed block SAVEPOINT and RELEASE are 25P02; ROLLBACK TO of an existing savepoint is the
+  //     recovery path (it clears the failed state), and of an unknown one is 3B001, leaving the block
+  //     failed.
+  //   - In a clean block an unknown name is 3B001, which — like any statement error inside a block —
+  //     aborts it.
+  //
+  // Names shadow: RELEASE/ROLLBACK TO act on the newest savepoint of that name. RELEASE destroys it and
+  // every later savepoint, keeping their changes; ROLLBACK TO restores the state it marked and destroys
+  // every later savepoint but keeps it, so it can be rolled back to again.
+  savepointStmt(op: SavepointOp, name: string): Outcome {
+    const tx = this.session.tx;
+    if (tx === null) {
+      const what = op === "define" ? "SAVEPOINT" : op === "release" ? "RELEASE SAVEPOINT" : "ROLLBACK TO SAVEPOINT";
+      throw engineError("no_active_sql_transaction", what + " can only be used in transaction blocks");
+    }
+    if (tx.failed && op !== "rollbackTo") {
+      throw engineError(
+        "in_failed_sql_transaction",
+        "current transaction is aborted, commands ignored until end of transaction block",
+      );
+    }
+    if (tx.savepoints === undefined) tx.savepoints = [];
+    const frames = tx.savepoints;
+    let at = -1;
+    for (let i = frames.length - 1; i >= 0; i--) {
+      if (frames[i].name === name) {
+        at = i;
+        break;
+      }
+    }
+    if (op !== "define" && at < 0) {
+      // A clean block aborts; a failed one stays failed (PostgreSQL).
+      tx.failed = true;
+      throw engineError("invalid_savepoint_specification", "savepoint does not exist: " + name);
+    }
+    const cloneAttached = (m: Map<string, Snapshot> | undefined): Map<string, Snapshot> | undefined =>
+      m === undefined ? undefined : new Map([...m].map(([k, v]) => [k, v.clone()]));
+    if (op === "define") {
+      frames.push({
+        name,
+        working: tx.working.clone(),
+        tempWorking: tx.tempWorking.clone(),
+        attachWorking: cloneAttached(tx.attachWorking),
+        mainDirty: tx.mainDirty,
+        tempDirty: tx.tempDirty,
+        attachDirty: tx.attachDirty === undefined ? undefined : new Set(tx.attachDirty),
+        sessionSeq: new Map(this.session.sessionSeq),
+        sessionLastName: this.session.sessionLastName,
+      });
+    } else if (op === "release") {
+      frames.length = at;
+    } else {
+      frames.length = at + 1;
+      const f = frames[at];
+      // Restore clones, so the frame stays intact for a later ROLLBACK TO the same savepoint.
+      tx.working = f.working.clone();
+      tx.tempWorking = f.tempWorking.clone();
+      tx.attachWorking = cloneAttached(f.attachWorking);
+      tx.mainDirty = f.mainDirty;
+      tx.tempDirty = f.tempDirty;
+      tx.attachDirty = f.attachDirty === undefined ? undefined : new Set(f.attachDirty);
+      this.session.sessionSeq = new Map(f.sessionSeq);
+      this.session.sessionLastName = f.sessionLastName;
+      tx.failed = false; // recovery: the block is usable again
+    }
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 

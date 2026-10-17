@@ -1181,6 +1181,28 @@ export type ActiveTx = {
   // attachDirty records which attachments this transaction mutated (exact names), the
   // per-attachment analogue of mainDirty/tempDirty — the set the commit persists + publishes.
   attachDirty?: Set<string>;
+  // savepoints is the block's savepoint stack, oldest first (spec/design/transactions.md §11). SAVEPOINT
+  // pushes a frame, RELEASE truncates to below the newest frame of that name, ROLLBACK TO restores the
+  // newest frame of that name and truncates to just above it. Absent until the first SAVEPOINT.
+  savepoints?: SavepointFrame[];
+};
+
+// SavepointFrame is one savepoint's marked state (spec/design/transactions.md §11): every piece of the
+// open transaction a statement can change, captured at SAVEPOINT. The snapshots are clones — O(1) per
+// store, sharing every unchanged node with working, and cloning freezes working's mutation generation
+// so later writes path-copy rather than touch the frame. Restoring the snapshots restores the
+// table/index roots, the catalog (DDL), sequences, statistics and estimator revisions, temp tables,
+// attachment writes, and the staged pending-write bytes (memory.md §7) at once.
+export type SavepointFrame = {
+  name: string;
+  working: Snapshot;
+  tempWorking: Snapshot;
+  attachWorking: Map<string, Snapshot> | undefined;
+  mainDirty: boolean;
+  tempDirty: boolean;
+  attachDirty: Set<string> | undefined;
+  sessionSeq: Map<string, bigint>;
+  sessionLastName: string | null;
 };
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A

@@ -1,0 +1,175 @@
+# skip: disk — in-memory host attachments and a transaction spanning records do not survive the
+# disk-mode per-record reopen (spec/design/conformance.md §3).
+# What a ROLLBACK TO restores beyond rows and DDL (spec/design/transactions.md §11): the sequence
+# counters (nextval is transactional in jed — sequences.md §5, a documented PostgreSQL divergence,
+# so a rolled-back nextval is handed out again and currval reverts with it), the P9 statistics
+# (statistics.md), and the writes to an attached database (attached-databases.md §5). jed-specific,
+# so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# attach: mydb
+# requires: txn.savepoint, txn.explicit, attach.in_memory, harness.attach, query.qualified_table, ddl.sequence, func.sequence, maintenance.analyze, introspect.statistics, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.aggregates, types.i32, types.i64, types.text
+
+statement ok
+CREATE SEQUENCE s
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO p VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE TABLE mydb.a (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO mydb.a VALUES (1)
+
+# --- sequences: the advance after the savepoint rolls back, currval with it --
+statement ok
+BEGIN
+
+query I nosort
+SELECT nextval('s')
+----
+1
+
+statement ok
+SAVEPOINT a
+
+query I nosort
+SELECT nextval('s')
+----
+2
+
+query I nosort
+SELECT nextval('s')
+----
+3
+
+statement ok
+ROLLBACK TO a
+
+query I nosort
+SELECT currval('s')
+----
+1
+
+query I nosort
+SELECT nextval('s')
+----
+2
+
+# a released savepoint's advance is kept
+statement ok
+SAVEPOINT b
+
+query I nosort
+SELECT nextval('s')
+----
+3
+
+statement ok
+RELEASE b
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT nextval('s')
+----
+4
+
+# --- statistics gathered after the savepoint roll back --------------------
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+ANALYZE p
+
+query T nosort
+SELECT column_name FROM jed_statistics ORDER BY column_name
+----
+id
+v
+
+statement ok
+ROLLBACK TO a
+
+query I nosort
+SELECT count(*) FROM jed_statistics
+----
+0
+
+statement ok
+COMMIT
+
+# --- an attached database's writes roll back to a savepoint ---------------
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO mydb.a VALUES (2)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO mydb.a VALUES (3)
+
+statement ok
+CREATE TABLE mydb.b (id i32)
+
+statement ok
+ROLLBACK TO a
+
+query I nosort
+SELECT id FROM mydb.a ORDER BY id
+----
+1
+2
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM mydb.a ORDER BY id
+----
+1
+2
+
+statement error 42P01
+SELECT id FROM mydb.b
+
+# a first write to an attachment inside a savepoint rolls back to "never written"
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO mydb.a VALUES (9)
+
+statement ok
+ROLLBACK TO a
+
+statement ok
+INSERT INTO p VALUES (3, 30)
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM mydb.a ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM p ORDER BY id
+----
+1
+2
+3

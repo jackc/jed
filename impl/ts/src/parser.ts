@@ -530,6 +530,12 @@ class Parser {
         return this.parseCommit();
       case "rollback":
         return this.parseRollback();
+      case "savepoint":
+        this.advance(); // SAVEPOINT
+        return { kind: "savepoint", op: "define", name: this.expectIdentifier() };
+      case "release":
+        this.advance(); // RELEASE
+        return { kind: "savepoint", op: "release", name: this.parseSavepointName() };
       case "":
         // A leading `(` can only begin a parenthesized query (grammar.md §25).
         if (this.peek().kind === "lparen") return this.parseQueryExpr();
@@ -792,7 +798,23 @@ class Parser {
   private parseRollback(): Statement {
     this.expectKeyword("rollback");
     this.consumeTransactionOrWork();
+    // ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT] name (transactions.md §11).
+    if (this.peekKeyword() === "to") {
+      this.advance(); // TO
+      return { kind: "savepoint", op: "rollbackTo", name: this.parseSavepointName() };
+    }
     return { kind: "rollback" };
+  }
+
+  // parseSavepointName parses the [SAVEPOINT] name tail of RELEASE / ROLLBACK TO (grammar.md §27). The
+  // noise word SAVEPOINT is consumed only when a name follows it, so `RELEASE savepoint` names a
+  // savepoint called savepoint (PostgreSQL's grammar).
+  private parseSavepointName(): string {
+    const next = this.peekKindAt(1);
+    if (this.peekKeyword() === "savepoint" && (next === "word" || next === "quotedIdent")) {
+      this.advance(); // SAVEPOINT
+    }
+    return this.expectIdentifier();
   }
 
   // consumeTransactionOrWork consumes the optional trailing TRANSACTION / WORK noise word.

@@ -76,10 +76,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   non-goal. _(size: M if implemented)_
 - [ ] **`MERGE`** — the SQL-standard (PostgreSQL 15+) `MERGE INTO … USING … ON … WHEN [NOT] MATCHED
   THEN …`, sharing upsert's two-phase write machinery ([upsert.md](spec/design/upsert.md)). _(size: L)_
-- [ ] **`SAVEPOINT` / nested transactions** — deferred in [transactions.md §11](spec/design/transactions.md)
-  (`working` becomes a stack of snapshots; `ROLLBACK TO` pops to a marked root; a nested `BEGIN` is
-  `25001` today). ORMs (Rails, Django, SQLAlchemy) use savepoints for nested transactions, so this
-  gates good language bindings. _(size: M)_
+- [x] **`SAVEPOINT` / nested transactions** — `SAVEPOINT name`, `RELEASE [SAVEPOINT] name`,
+  `ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT] name` with PostgreSQL semantics (name shadowing,
+  `25P01` outside a block, `3B001` unknown name, `ROLLBACK TO` recovers a failed block). The open
+  transaction carries a stack of snapshot frames, so a rollback-to restores rows, DDL, sequences,
+  statistics, temp tables, attachment writes, and pending-write accounting together; SQL-only (no host
+  API methods), `0A000` inside `execute_script`; no format change. A nested `BEGIN` stays `25001`.
+  → [transactions.md §11](spec/design/transactions.md)
 - [ ] **Decide: SQL-language triggers and functions** — SQLite-style triggers whose bodies are plain
   SQL statements, and `CREATE FUNCTION … LANGUAGE sql`. Both stay pure, so neither conflicts with
   CLAUDE.md §13. Record each as a scheduled item or an explicit non-goal. _(size: decision; L each if built)_

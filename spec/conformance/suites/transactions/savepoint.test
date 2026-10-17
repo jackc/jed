@@ -1,0 +1,536 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# Savepoints (spec/design/transactions.md §11, grammar.md §27): SAVEPOINT name, RELEASE [SAVEPOINT]
+# name, ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT] name, with PostgreSQL's semantics. Outside a
+# block every form is 25P01. Names shadow; RELEASE destroys the newest savepoint of a name and every
+# later one, keeping their changes; ROLLBACK TO restores the state it marked, destroys every later
+# savepoint and keeps itself. An unknown name is 3B001, which aborts a clean block like any error;
+# in a failed block SAVEPOINT/RELEASE are 25P02 and ROLLBACK TO is the way back. The PG behavior of
+# every record here was checked by hand against the oracle (the replaying importer cannot express an
+# error that changes transaction state). Format + the `requires` directive:
+# ../../../design/conformance.md.
+# requires: txn.savepoint, txn.explicit, txn.failed_state, txn.read_only, ddl.create_table, ddl.drop_table, ddl.primary_key, ddl.unique, ddl.temp_table, ddl.temp_on_commit, dml.insert, dml.update, dml.delete, query.select, query.order_by, query.aggregates, expr.arithmetic, error.division_by_zero, types.i32
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)
+
+# --- outside a block every form is 25P01 ------------------------------------
+statement error 25P01
+SAVEPOINT a
+
+statement error 25P01
+RELEASE a
+
+statement error 25P01
+RELEASE SAVEPOINT a
+
+statement error 25P01
+ROLLBACK TO a
+
+statement error 25P01
+ROLLBACK TRANSACTION TO SAVEPOINT a
+
+statement error 25P01
+ROLLBACK WORK TO a
+
+# --- ROLLBACK TO discards the work after the savepoint, keeps the work before
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO t VALUES (2, 20)
+
+statement ok
+UPDATE t SET v = 11 WHERE id = 1
+
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+11
+2
+20
+
+statement ok
+ROLLBACK TO SAVEPOINT a
+
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+
+# the unique index rolled back too: 20 is free again
+statement ok
+INSERT INTO t VALUES (3, 20)
+
+# ROLLBACK TO keeps the savepoint, so it can be rolled back to again
+statement ok
+ROLLBACK TO a
+
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+
+statement ok
+DELETE FROM t WHERE id = 1
+
+statement ok
+ROLLBACK WORK TO a
+
+statement ok
+COMMIT
+
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+
+# --- RELEASE keeps the changes; COMMIT with an open savepoint commits all ---
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO t VALUES (2, 20)
+
+statement ok
+RELEASE SAVEPOINT a
+
+# a released savepoint is gone
+statement error 3B001
+ROLLBACK TO a
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO t VALUES (2, 20)
+
+statement ok
+RELEASE a
+
+statement ok
+SAVEPOINT b
+
+statement ok
+INSERT INTO t VALUES (3, 30)
+
+statement ok
+COMMIT
+
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+2
+20
+3
+30
+
+# --- ROLLBACK with open savepoints discards everything ----------------------
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM t WHERE id > 1
+
+statement ok
+SAVEPOINT a
+
+statement ok
+DELETE FROM t
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT count(*) FROM t
+----
+3
+
+# --- names shadow: RELEASE / ROLLBACK TO act on the newest of a name --------
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO t VALUES (4, 40)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO t VALUES (5, 50)
+
+# rolls back to the inner a: 5 goes, 4 stays
+statement ok
+ROLLBACK TO a
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+4
+
+# releases the inner a, uncovering the outer one
+statement ok
+RELEASE a
+
+statement ok
+ROLLBACK TO a
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+
+statement ok
+ROLLBACK
+
+# --- ROLLBACK TO destroys every later savepoint ------------------------------
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+SAVEPOINT b
+
+statement ok
+ROLLBACK TO a
+
+# b is gone; the unknown name aborts the (clean) block
+statement error 3B001
+RELEASE b
+
+statement error 25P02
+SELECT id FROM t
+
+# ...and ROLLBACK TO the surviving a recovers it
+statement ok
+ROLLBACK TO a
+
+query I nosort
+SELECT count(*) FROM t
+----
+3
+
+statement ok
+ROLLBACK
+
+# --- RELEASE destroys every later savepoint too -----------------------------
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+SAVEPOINT b
+
+statement ok
+RELEASE a
+
+statement error 3B001
+ROLLBACK TO b
+
+statement ok
+ROLLBACK
+
+# --- a failed block: SAVEPOINT/RELEASE are 25P02, ROLLBACK TO recovers ------
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (6, 60)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO t VALUES (7, 70)
+
+statement error 22012
+SELECT 1 / (id - id) FROM t
+
+statement error 25P02
+SELECT id FROM t
+
+statement error 25P02
+SAVEPOINT c
+
+statement error 25P02
+RELEASE a
+
+# an unknown name is 3B001 and the block stays failed
+statement error 3B001
+ROLLBACK TO nosuch
+
+statement error 25P02
+SELECT id FROM t
+
+statement ok
+ROLLBACK TO a
+
+# recovered: the work before the savepoint is kept, the work after it is gone
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+6
+
+# the savepoint survived its ROLLBACK TO, and a statement error can fail the block again
+statement error 23505
+INSERT INTO t VALUES (6, 61)
+
+statement ok
+ROLLBACK TO a
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+6
+
+# --- a failed block with savepoints: COMMIT still acts as ROLLBACK ----------
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+DELETE FROM t WHERE id = 6
+
+statement error 23505
+INSERT INTO t VALUES (1, 99)
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+6
+
+# --- DDL inside a savepoint rolls back --------------------------------------
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO u VALUES (1)
+
+statement ok
+DROP TABLE t
+
+statement ok
+ROLLBACK TO a
+
+statement error 42P01
+SELECT id FROM u
+
+statement ok
+ROLLBACK TO a
+
+query I nosort
+SELECT count(*) FROM t
+----
+4
+
+# DDL before the savepoint survives a ROLLBACK TO it
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY)
+
+statement ok
+SAVEPOINT b
+
+statement ok
+INSERT INTO w VALUES (1)
+
+statement ok
+ROLLBACK TO b
+
+statement ok
+INSERT INTO w VALUES (2)
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM w
+----
+2
+
+# --- temporary tables roll back to a savepoint as well ----------------------
+statement ok
+CREATE TEMP TABLE tt (id i32 PRIMARY KEY)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tt VALUES (1)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO tt VALUES (2)
+
+statement ok
+CREATE TEMP TABLE tu (id i32)
+
+statement ok
+ROLLBACK TO a
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM tt
+----
+1
+
+statement error 42P01
+SELECT id FROM tu
+
+# an ON COMMIT DROP table created under a released savepoint is dropped by the commit
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+CREATE TEMP TABLE td (id i32) ON COMMIT DROP
+
+statement ok
+RELEASE a
+
+statement ok
+INSERT INTO td VALUES (1)
+
+query I nosort
+SELECT id FROM td
+----
+1
+
+statement ok
+COMMIT
+
+statement error 42P01
+SELECT id FROM td
+
+# --- savepoint names are identifiers: unquoted names fold, quoted ones do not
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT "A"
+
+statement error 3B001
+RELEASE a
+
+statement ok
+ROLLBACK TO "A"
+
+statement ok
+SAVEPOINT MixedCase
+
+statement ok
+RELEASE mixedcase
+
+# a savepoint may itself be named savepoint
+statement ok
+SAVEPOINT savepoint
+
+statement ok
+RELEASE savepoint
+
+statement ok
+ROLLBACK
+
+# --- a nested BEGIN is still 25001 and does not disturb the savepoints -------
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement error 25001
+BEGIN
+
+statement ok
+RELEASE a
+
+statement ok
+COMMIT
+
+# --- savepoints work in a READ ONLY block ------------------------------------
+statement ok
+BEGIN READ ONLY
+
+statement ok
+SAVEPOINT r
+
+statement error 25006
+INSERT INTO t VALUES (9, 90)
+
+statement ok
+ROLLBACK TO r
+
+query I nosort
+SELECT count(*) FROM t
+----
+4
+
+statement ok
+RELEASE r
+
+statement ok
+COMMIT
+
+# after the block ends, savepoint statements are 25P01 again
+statement error 25P01
+RELEASE r

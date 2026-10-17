@@ -283,7 +283,10 @@ transactions.md §1). The commit boundary and durability are **decoupled** (tran
   **`db.update(fn)`** (read-write) open the transaction, run `fn(tx)`, and **auto-commit on
   success / auto-rollback on error or panic** — the safe default, recommended over a raw
   `begin`. SQL `BEGIN [READ ONLY|READ WRITE]` / `COMMIT` / `ROLLBACK` drive the handle's implicit
-  current transaction equivalently.
+  current transaction equivalently. **Savepoints are SQL-only:** `tx.execute("SAVEPOINT a")`,
+  `RELEASE a`, and `ROLLBACK TO a` run on the open transaction ([transactions.md](transactions.md)
+  §11), so the host API adds no savepoint methods; a `ROLLBACK TO` that recovers a failed block
+  returns the session's status to `Open`.
 - **`commit` / `rollback` are uniform across modes.** **In-memory** → commit **packs the dirty
   pages into the database's `MemoryBlockStore`** (bplus-reshape.md B3 — structurally the file
   commit minus `fsync`, whose memory-host `sync` is a no-op); the observable result is the same

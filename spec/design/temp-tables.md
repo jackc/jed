@@ -275,8 +275,10 @@ behave like ordinary temp tables until `COMMIT`. A `DROP`-table's action survive
   truncated parent and then its first outside referencing table, each in ascending name byte order;
   PostgreSQL orders by OID (creation order), which jed does not have — a difference only in which pair
   the detail names.
-- **Savepoints** do not exist in jed (transactions.md §11). If they land, an action must belong to
-  the subtransaction that created the table, as in PostgreSQL.
+- **Savepoints** (transactions.md §11) need no special handling. A table and its action are temp
+  snapshot state, so a table created under a savepoint that is rolled back is gone with its action,
+  and one created under a released savepoint is acted on at the top-level commit — PostgreSQL's
+  subtransaction behavior (`transactions/savepoint.test`).
 
 ## 6. Storage model — a per-domain MemoryBlockStore that spills to a scratch file
 

@@ -1252,6 +1252,13 @@ export type ReturningClause = {
 export type Begin = { kind: "begin"; writable: boolean | null };
 export type Commit = { kind: "commit" };
 export type Rollback = { kind: "rollback" };
+// Savepoint is SAVEPOINT name / RELEASE [SAVEPOINT] name / ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT]
+// name (transactions.md §11, grammar.md §27). `name` is the identifier (folded unless quoted). Outside
+// a block every form is 25P01. "define" marks the block's state; "release" forgets the newest
+// savepoint of the name and every later one, keeping their changes; "rollbackTo" restores the state
+// it marked, destroys every later savepoint but keeps it, and clears a failed block.
+export type SavepointOp = "define" | "release" | "rollbackTo";
+export type Savepoint = { kind: "savepoint"; op: SavepointOp; name: string };
 
 // Explain is `EXPLAIN [ANALYZE] <statement>` — render the planner's chosen plan for the inner
 // statement instead of running it (spec/design/explain.md). `analyze` false ⇒ plain EXPLAIN: the plan
@@ -1464,4 +1471,5 @@ export type Statement =
   | Begin
   | Commit
   | Rollback
+  | Savepoint
   | Explain;

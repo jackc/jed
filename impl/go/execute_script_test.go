@@ -108,6 +108,9 @@ func TestInScriptTransactionControlIsFeatureNotSupported(t *testing.T) {
 		"INSERT INTO t VALUES (1); COMMIT; INSERT INTO t VALUES (2)",
 		"INSERT INTO t VALUES (1); BEGIN; INSERT INTO t VALUES (2)",
 		"INSERT INTO t VALUES (1); ROLLBACK",
+		"INSERT INTO t VALUES (1); SAVEPOINT a; INSERT INTO t VALUES (2)",
+		"INSERT INTO t VALUES (1); ROLLBACK TO a",
+		"INSERT INTO t VALUES (1); RELEASE a",
 	} {
 		_, err := db.ExecuteScript(script)
 		if got := sessCode(t, err); got != "0A000" {

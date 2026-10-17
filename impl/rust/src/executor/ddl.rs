@@ -579,7 +579,10 @@ impl Engine {
                 inner,
             } => self.execute_explain(analyze, verbose, costs, lane, *inner, params),
             // Transaction control is handled by `execute_stmt_params` before dispatch.
-            Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {
+            Statement::Begin { .. }
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::Savepoint { .. } => {
                 unreachable!("transaction control is handled before dispatch")
             }
         }

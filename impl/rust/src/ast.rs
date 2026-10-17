@@ -65,6 +65,26 @@ pub enum Statement {
     /// `ROLLBACK [TRANSACTION|WORK]` — discard the open block's working set and return to
     /// autocommit; a `ROLLBACK` with no open block is a no-op success (transactions.md §4.2).
     Rollback,
+    /// `SAVEPOINT name` / `RELEASE [SAVEPOINT] name` / `ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT]
+    /// name` — a savepoint inside an explicit block (spec/design/transactions.md §11, grammar.md
+    /// §27). `name` is the identifier (folded unless quoted). Outside a block every form is 25P01.
+    Savepoint {
+        op: SavepointOp,
+        name: String,
+    },
+}
+
+/// Which savepoint statement a [`Statement::Savepoint`] is (spec/design/transactions.md §11).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SavepointOp {
+    /// `SAVEPOINT name` — mark the block's current state under `name`.
+    Define,
+    /// `RELEASE [SAVEPOINT] name` — forget the newest savepoint named `name` and every later one,
+    /// keeping their changes.
+    Release,
+    /// `ROLLBACK … TO [SAVEPOINT] name` — restore the state the newest savepoint named `name` marked,
+    /// destroying every later savepoint but keeping that one; clears a failed block.
+    RollbackTo,
 }
 
 /// `ANALYZE table [(column, ...)]` (spec/design/statistics.md). An empty `columns` vector means all

@@ -2069,7 +2069,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	// privilege resolution sees the snapshot the read will use. Reads only: transaction control must
 	// still work in a failed block, and a write is gated inside dispatch when it falls through below
 	// (executor.go gateReadLanes — the safe-total-Query contract, CLAUDE.md §13).
-	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !s.engine.stmtIsWriteWithViews(stmt) {
+	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && stmt.Savepoint == nil && !s.engine.stmtIsWriteWithViews(stmt) {
 		if err := s.engine.gateReadLanes(stmt); err != nil {
 			return nil, s.engine.poisonOnLaneErr(err)
 		}

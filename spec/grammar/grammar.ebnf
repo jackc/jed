@@ -67,6 +67,9 @@ sql_statement  ::= create_table
                  | begin
                  | commit
                  | rollback
+                 | savepoint
+                 | release
+                 | rollback_to
 
 /* EXPLAIN renders the planner's chosen plan for the inner statement as a result set instead of
  * running it (../design/explain.md). The legacy positional ANALYZE modifier and the parenthesized
@@ -570,7 +573,7 @@ returning_alias ::= ("OLD" | "NEW") "AS" identifier
 
 /* An explicit transaction block. "BEGIN" (optionally "BEGIN TRANSACTION" / "BEGIN WORK") and
  * "START TRANSACTION" are equivalent openers; the access mode defaults to READ WRITE. A nested
- * BEGIN — one issued while a block is already open — is 25001 (no SAVEPOINT/nesting this slice).
+ * BEGIN — one issued while a block is already open — is 25001 (nesting is SAVEPOINT's job).
  * READ ONLY takes no write lock and pins a snapshot; a write statement inside it is 25006. */
 begin          ::= ("BEGIN" ("TRANSACTION" | "WORK")? | "START" "TRANSACTION") access_mode?
 
@@ -584,6 +587,18 @@ access_mode    ::= "READ" "ONLY" | "READ" "WRITE"
 commit         ::= ("COMMIT" | "END") ("TRANSACTION" | "WORK")?
 
 rollback       ::= "ROLLBACK" ("TRANSACTION" | "WORK")?
+
+/* Savepoints inside an explicit block (../design/transactions.md §11). SAVEPOINT marks the block's
+ * state; RELEASE forgets the newest savepoint of the name and every later one, keeping their
+ * changes; ROLLBACK TO restores the newest savepoint of the name, forgets every later one, and
+ * clears a failed block. Outside a block each is 25P01; an unknown name is 3B001. The noise word
+ * SAVEPOINT after RELEASE / ROLLBACK TO is consumed only when an identifier follows it, so
+ * `RELEASE savepoint` names a savepoint called savepoint. SAVEPOINT/RELEASE/TO are NOT reserved. */
+savepoint      ::= "SAVEPOINT" identifier
+
+release        ::= "RELEASE" "SAVEPOINT"? identifier
+
+rollback_to    ::= "ROLLBACK" ("TRANSACTION" | "WORK")? "TO" "SAVEPOINT"? identifier
 
 /* --- queries ------------------------------------------------------------- */
 

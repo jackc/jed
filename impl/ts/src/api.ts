@@ -263,6 +263,7 @@ function queryStmt(
     stmt.kind !== "begin" &&
     stmt.kind !== "commit" &&
     stmt.kind !== "rollback" &&
+    stmt.kind !== "savepoint" &&
     !db.stmtIsWriteWithViews(stmt);
   try {
     if (isRead) db.gateReadLanes(stmt);

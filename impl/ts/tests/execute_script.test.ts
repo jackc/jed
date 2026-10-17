@@ -83,6 +83,9 @@ test("in-script transaction control is 0A000 and rolls the run back", () => {
     "INSERT INTO t VALUES (1); COMMIT; INSERT INTO t VALUES (2)",
     "INSERT INTO t VALUES (1); BEGIN; INSERT INTO t VALUES (2)",
     "INSERT INTO t VALUES (1); ROLLBACK",
+    "INSERT INTO t VALUES (1); SAVEPOINT a; INSERT INTO t VALUES (2)",
+    "INSERT INTO t VALUES (1); ROLLBACK TO a",
+    "INSERT INTO t VALUES (1); RELEASE a",
   ]) {
     assert.strictEqual(
       code(() => db.executeScript(script)),

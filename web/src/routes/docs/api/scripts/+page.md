@@ -32,6 +32,7 @@ or drop them).
 ## Transaction control inside a script
 
 Because `execute_script` owns the implicit transaction boundary, an explicit `BEGIN`, `COMMIT`, or
-`ROLLBACK` **inside** the script is rejected (`0A000`). Run on a session that already has a
+`ROLLBACK` — or a `SAVEPOINT`, `RELEASE`, or `ROLLBACK TO` — **inside** the script is rejected
+(`0A000`). Run on a session that already has a
 transaction open and the script simply joins it — no wrapper, no auto-commit, so the caller stays in
 control. For a script that manages its own transactions, use the `split_statements` loop instead.

@@ -28,6 +28,31 @@ The read-only `view` helper remains useful for enforcing access restrictions and
 <CodeTabs topic="transactions" />
 
 
+## Savepoints
+
+Inside a transaction, savepoints give you nested rollback with PostgreSQL's semantics. Run them as
+ordinary SQL on the open transaction — there are no extra API methods:
+
+```sql
+BEGIN;
+INSERT INTO accounts VALUES (1, 100);
+SAVEPOINT before_bonus;
+INSERT INTO accounts VALUES (2, 50);
+ROLLBACK TO SAVEPOINT before_bonus;   -- undoes the second insert only
+RELEASE SAVEPOINT before_bonus;       -- forgets the savepoint, keeps the work
+COMMIT;                               -- commits account 1
+```
+
+`ROLLBACK TO` undoes everything since the savepoint — rows, schema changes, sequence advances,
+temporary tables, and writes to attached databases — and keeps the savepoint so you can roll back to
+it again. It is also how a transaction recovers after an error: once a statement fails, every other
+statement is rejected with `25P02` until you `ROLLBACK` or `ROLLBACK TO` a savepoint taken before the
+error. Savepoint names may repeat; `RELEASE` and `ROLLBACK TO` use the most recent one.
+
+A savepoint statement outside a transaction is `25P01`, and a name with no savepoint is `3B001`.
+Because sequences in jed are transactional, a value handed out after a savepoint is handed out again
+after `ROLLBACK TO` (PostgreSQL would skip it).
+
 ## Isolation
 
 Readers see the last committed state and run without blocking against an in-flight writer; the only

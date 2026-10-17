@@ -110,8 +110,9 @@ A session carries an explicit **transaction status**, mirroring PostgreSQL's thr
 
 - **`Idle`** — autocommit; each statement is its own transaction.
 - **`Open{writable}`** — inside an explicit transaction.
-- **`Failed`** — open but poisoned: only `ROLLBACK` / `COMMIT` (the latter acting as rollback) are
-  accepted, every other statement is `25P02` ([transactions.md §6](transactions.md), unchanged).
+- **`Failed`** — open but poisoned: only `ROLLBACK` / `COMMIT` (the latter acting as rollback) and
+  `ROLLBACK TO` a savepoint (which returns the session to `Open`) are accepted, every other statement
+  is `25P02` ([transactions.md §6, §11](transactions.md)).
 
 There is **one** state machine with **three entry points** — this is what removes the
 `BEGIN`-vs-`session.begin` overlap:
@@ -347,8 +348,9 @@ error) — so memory is bounded by construction (one statement's transient resul
 discarded), and `lifetime_max_cost` (when it lands) bounds the total work.
 
 **v1 narrowing — transaction control inside a script is `0A000`.** Because the implicit wrapper owns
-the transaction boundary, an explicit `BEGIN` / `COMMIT` / `ROLLBACK` (or `START TRANSACTION`)
-**statement inside** an `execute_script` run is rejected **`0A000 feature_not_supported`**, aborting
+the transaction boundary, an explicit `BEGIN` / `COMMIT` / `ROLLBACK` (or `START TRANSACTION`) or
+savepoint statement (`SAVEPOINT` / `RELEASE` / `ROLLBACK TO` — PostgreSQL likewise rejects a
+savepoint in its implicit multi-statement block) **inside** an `execute_script` run is rejected **`0A000 feature_not_supported`**, aborting
 the run (and rolling the implicit wrapper back). The PG-simple-query **partitioning** semantics —
 where an in-script `COMMIT` would partition the run into separately-committed segments and an
 in-script `BEGIN` would open a nested explicit block — is a deferred follow-on (§11); the implicit

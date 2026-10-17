@@ -52,6 +52,8 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 		return db.commitTx()
 	case stmt.Rollback != nil:
 		return db.rollbackTx()
+	case stmt.Savepoint != nil:
+		return db.savepointStmt(stmt.Savepoint)
 	}
 	clear(db.estimatorTouched)
 	// Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
@@ -411,6 +413,112 @@ func (db *engine) rollbackTx() (outcome, error) {
 	}
 	db.session.tx = nil
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
+}
+
+// savepointStmt runs SAVEPOINT / RELEASE / ROLLBACK TO (spec/design/transactions.md §11), with
+// PostgreSQL's semantics:
+//
+//   - With no open block every form is 25P01 (no_active_sql_transaction); there is no block to abort.
+//   - In a failed block SAVEPOINT and RELEASE are 25P02; ROLLBACK TO of an existing savepoint is the
+//     recovery path (it clears the failed state), and of an unknown one is 3B001, leaving the block
+//     failed.
+//   - In a clean block an unknown name is 3B001, which — like any statement error inside a block —
+//     aborts it.
+//
+// Names shadow: RELEASE/ROLLBACK TO act on the newest savepoint of that name. RELEASE destroys it and
+// every later savepoint, keeping their changes; ROLLBACK TO restores the state it marked and destroys
+// every later savepoint but keeps it, so it can be rolled back to again.
+func (db *engine) savepointStmt(sp *savepointStmt) (outcome, error) {
+	tx := db.session.tx
+	if tx == nil {
+		what := "SAVEPOINT"
+		switch sp.Op {
+		case savepointRelease:
+			what = "RELEASE SAVEPOINT"
+		case savepointRollbackTo:
+			what = "ROLLBACK TO SAVEPOINT"
+		}
+		return outcome{}, newError(NoActiveSqlTransaction, what+" can only be used in transaction blocks")
+	}
+	if tx.failed && sp.Op != savepointRollbackTo {
+		return outcome{}, newError(InFailedSqlTransaction,
+			"current transaction is aborted, commands ignored until end of transaction block")
+	}
+	at := -1
+	for i := len(tx.savepoints) - 1; i >= 0; i-- {
+		if tx.savepoints[i].name == sp.Name {
+			at = i
+			break
+		}
+	}
+	if sp.Op != savepointDefine && at < 0 {
+		// A clean block aborts; a failed one stays failed (PostgreSQL).
+		tx.failed = true
+		return outcome{}, newError(InvalidSavepointSpecification, "savepoint does not exist: "+sp.Name)
+	}
+	switch sp.Op {
+	case savepointDefine:
+		tx.savepoints = append(tx.savepoints, &savepointFrame{
+			name:            sp.Name,
+			working:         tx.working.clone(),
+			tempWorking:     tx.tempWorking.clone(),
+			attachWorking:   cloneSnapshots(tx.attachWorking),
+			mainDirty:       tx.mainDirty,
+			tempDirty:       tx.tempDirty,
+			attachDirty:     cloneBoolSet(tx.attachDirty),
+			sessionSeq:      cloneSeqState(db.session.sessionSeq),
+			sessionLastName: db.session.sessionLastName,
+		})
+	case savepointRelease:
+		tx.savepoints = tx.savepoints[:at]
+	case savepointRollbackTo:
+		tx.savepoints = tx.savepoints[:at+1]
+		f := tx.savepoints[at]
+		// Restore clones, so the frame stays intact for a later ROLLBACK TO the same savepoint.
+		tx.working = f.working.clone()
+		tx.tempWorking = f.tempWorking.clone()
+		tx.attachWorking = cloneSnapshots(f.attachWorking)
+		tx.mainDirty = f.mainDirty
+		tx.tempDirty = f.tempDirty
+		tx.attachDirty = cloneBoolSet(f.attachDirty)
+		db.session.sessionSeq = cloneSeqState(f.sessionSeq)
+		db.session.sessionLastName = f.sessionLastName
+		tx.failed = false // recovery: the block is usable again
+	}
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
+}
+
+// cloneSnapshots clones each snapshot of a per-attachment working map (nil stays nil).
+func cloneSnapshots(m map[string]*snapshot) map[string]*snapshot {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]*snapshot, len(m))
+	for k, v := range m {
+		out[k] = v.clone()
+	}
+	return out
+}
+
+// cloneBoolSet copies a name set (nil stays nil).
+func cloneBoolSet(m map[string]bool) map[string]bool {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// cloneSeqState copies the currval session map (sequences.md §6).
+func cloneSeqState(m map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // seqNextval implements nextval('name') (spec/design/sequences.md §4): advance the named sequence
