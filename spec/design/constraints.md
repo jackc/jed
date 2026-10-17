@@ -113,6 +113,13 @@ and when it is evaluated:
   re-rendered by the closed token table ([../fileformat/format.md](../fileformat/format.md)
   "Check-expression text"), exactly as a `CHECK` is (§4.5) — and **evaluated per row at INSERT**.
 
+A **composite** column's default is always the second kind, even a bare string literal
+(`DEFAULT '(q,3)'`): it is resolved by the column assignment rule a composite column's `INSERT`
+value takes — a `ROW(…)` coerces field-by-field, a string parses through `record_in`, a bare `NULL`
+field adapts ([composite.md](composite.md) §12) — and evaluated per applied row (`format_version`
+44 persists it on the composite column entry). A bare `DEFAULT NULL` records nothing, as for every
+column. Array and range columns accept only `DEFAULT NULL` (`0A000` otherwise).
+
 **Validated once, at CREATE TABLE.** Either way a bad default fails *at CREATE TABLE*, not at the
 first INSERT. For a literal the value is checked there (out of range **`22003`**, cross-family
 **`42804`**, decimal rounded to the column's typmod — `DEFAULT 1.5` on `numeric(6,2)` stores

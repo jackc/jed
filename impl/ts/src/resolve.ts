@@ -117,7 +117,9 @@ import {
   arrayParamElem,
   resolveOperandPair,
   resolveOperandPairWithLhs,
+  recordCastError,
   resolveParamNode,
+  resolveRowToComposite,
   resolveTextOperandPair,
   temporalArithResult,
   unifyArrayElementTypes,
@@ -1864,9 +1866,8 @@ function resolveCastExpr(
   // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
   // (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
   // `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite operand
-  // is the identity. Every other operand (a runtime text expression, an anonymous `ROW(…)`) is a
-  // documented 0A000 narrowing this slice — relaxable. A type modifier on a composite is
-  // meaningless (0A000).
+  // is the identity; a `ROW(…)` constructor casts field-by-field; a runtime text expression parses
+  // through record_in per row. A type modifier on a composite is meaningless (0A000).
   const ct = scope.catalog.compositeType(e.typeName);
   if (ct !== undefined) {
     if (e.typeMod !== null) {
@@ -1883,32 +1884,42 @@ function resolveCastExpr(
         ),
       );
     }
+    // An anonymous `ROW(…)` (or bare `(a, b, …)`) constructor casts structurally: each field is
+    // explicitly cast to its field type (composite.md §8, PostgreSQL's record → composite coercion
+    // under the explicit context).
+    if (e.inner.kind === "row") {
+      return resolveRowToComposite(scope, e.inner.fields, ct, "explicit", ag, params);
+    }
+    const cty: Type = { kind: "composite", name: ct.name };
+    const targetRt = resolvedTypeOfCol(cty, scope.catalog);
     // A bind parameter cast to a composite type takes that type (api.md §5).
     if (e.inner.kind === "param") {
-      const cty: Type = { kind: "composite", name: ct.name };
-      return resolveParamNode(
-        scope,
-        e.inner,
-        scope.catalog.colTypeOf(cty),
-        resolvedTypeOfCol(cty, scope.catalog),
-        params,
-      );
+      return resolveParamNode(scope, e.inner, scope.catalog.colTypeOf(cty), targetRt, params);
     }
     const inner = resolve(scope, e.inner, null, ag, params);
     if (inner.type.kind === "null") {
-      return {
-        node: inner.node,
-        type: resolvedTypeOfCol({ kind: "composite", name: ct.name }, scope.catalog),
-      };
+      return { node: inner.node, type: targetRt };
     }
     // An identical named composite is the identity cast.
     if (inner.type.kind === "composite" && inner.type.name === ct.name) {
       return inner;
     }
-    throw engineError(
-      "feature_not_supported",
-      "casting to a composite type is only supported from a string literal",
-    );
+    // A runtime text value parses through record_in per row (22P02 malformed, a field's own input
+    // error otherwise). A timestamptz field reads an offset-less string in the session zone, so the
+    // cast is then STABLE (42P17 in an index expression), like the array_in cast.
+    if (inner.type.kind === "text") {
+      params.nonimmutable ||= containsTimestamptz(targetRt);
+      return {
+        node: { kind: "compositeCast", to: scope.catalog.colTypeOf(cty), operand: inner.node },
+        type: targetRt,
+      };
+    }
+    // An anonymous record that is not a ROW constructor (a derived column, a subquery) has no field
+    // expressions to cast — PostgreSQL's "cannot cast type record to addr" (42846).
+    if (inner.type.kind === "composite" && inner.type.name === null) {
+      throw recordCastError(ct.name, "");
+    }
+    throw engineError("cannot_coerce", `cannot cast type ${rtName(inner.type)} to ${ct.name}`);
   }
   const [target, typmod, varcharLen, temporal] = resolveTypeAndTypmod(e.typeName, e.typeMod);
   // A timestamp(p) / timestamptz(p) / qualified-interval target rounds or cuts the converted value
@@ -1945,7 +1956,7 @@ function resolveCastExpr(
   // assignment cast to text (a documented divergence), so INSERT INTO text_col VALUES (1) /
   // text_col = 1 stay 42804. A varchar(n) length truncates the rendered text (types.md §15).
   // `$1::text` declares the parameter as text, like every other cast target (api.md §5).
-  // Composite and range sources stay 0A000.
+  // Range sources stay 0A000.
   if (isText(target)) {
     const inner = resolve(scope, e.inner, e.inner.kind === "param" ? "text" : null, ag, params);
     const ik = inner.type.kind;
@@ -2205,6 +2216,14 @@ function resolveCastExpr(
   // Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
   if (inner.type.kind === "date") {
     throw engineError("feature_not_supported", "casting from a date type is not supported yet");
+  }
+  // A composite casts only to text or a composite (composite.md §8): a numeric target is a
+  // forbidden pair (42846 cannot_coerce, as PostgreSQL).
+  if (inner.type.kind === "composite") {
+    throw engineError(
+      "cannot_coerce",
+      "cannot cast type " + rtName(inner.type) + " to " + canonicalName(target),
+    );
   }
   // Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
   if (inner.type.kind === "array") {
@@ -5157,7 +5176,7 @@ function widenTo(node: RExpr, t: ResolvedType, to: ScalarType): RExpr {
 // castToText converts a resolved operand of type t to text (casts.toml, types.md §5) — the explicit
 // `x::text` cast and the `text || anynonarray` operand rendering (string-functions.md §5) share it.
 // target is the text-family cast target (text, or varchar whose length varcharLen truncates).
-// Composite and range sources stay 0A000.
+// Range sources stay 0A000.
 export function castToText(
   node: RExpr,
   t: ResolvedType,
@@ -5208,6 +5227,15 @@ export function castToText(
     case "array":
       params.nonimmutable ||= containsTimestamptz(t.elem);
       return { kind: "arrayCast", toElem: null, operand: node };
+    // composite → text (spec/design/composite.md §8): record_out renders (…) per row. Explicit
+    // only, like the array cast; a timestamptz anywhere in the type renders in the session zone, so
+    // the cast is then STABLE. An anonymous ROW(…) renders the same way. A varchar(n) length wraps
+    // it in the ordinary text cast (truncation).
+    case "composite": {
+      params.nonimmutable ||= containsTimestamptz(t);
+      const cc: RExpr = { kind: "compositeCast", to: null, operand: node };
+      return varcharLen === null ? cc : { ...cast, operand: cc };
+    }
     default:
       throw engineError("feature_not_supported", "casting to text is not supported yet");
   }

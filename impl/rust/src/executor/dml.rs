@@ -724,20 +724,19 @@ impl Engine {
                             // A container column takes a source column of exactly its own type, or an
                             // untyped NULL — the container assignment rule UPDATE and an INSERT VALUES
                             // expression share (array.md §4, ranges.md §4, composite.md §12). An
-                            // anonymous ROW(…) column has no composite type to match (0A000).
+                            // anonymous record column (a projected ROW(…)) is a source column, not
+                            // a constructor whose fields could coerce — PostgreSQL's "cannot cast
+                            // type record to addr" (42846).
                             Type::Composite(_)
                             | Type::Array(_)
                             | Type::Range(_)
                             | Type::Record(_) => {
                                 let src = &q.column_types[p];
                                 if matches!(src, ResolvedType::Composite(c) if c.name.is_none()) {
-                                    return Err(EngineError::new(
-                                        SqlState::FeatureNotSupported,
-                                        format!(
-                                            "inserting a ROW expression into composite column {} is not supported yet",
-                                            col.name
-                                        ),
-                                    ));
+                                    return Err(record_cast_error(&col.ty.canonical_name(), "")
+                                        .with_position(
+                                            super::plan_query::output_column_location(&source, p).0,
+                                        ));
                                 }
                                 if !matches!(src, ResolvedType::Null)
                                     && *src != resolved_type_of_col(&col.ty, self)
@@ -799,9 +798,9 @@ impl Engine {
     /// position order, against a column-less scope that admits subqueries and sees the statement's
     /// CTE bindings. Each expression takes its target column's type as the literal hint and must
     /// be storable there: a scalar column requires an assignable type (42804, the INSERT … SELECT
-    /// gate); a range/array column shares UPDATE's container rule; a composite column takes a NULL
-    /// or a value of that same composite type (an anonymous `ROW(…)` expression is 0A000, as for
-    /// UPDATE). A slot discarded by `OVERRIDING USER VALUE` is not resolved. Returns an empty vec
+    /// gate); a range/array/composite column shares UPDATE's container rule (a `ROW(…)` coerces
+    /// field-by-field to a composite column's type — composite.md §12). A slot discarded by
+    /// `OVERRIDING USER VALUE` is not resolved. Returns an empty vec
     /// for a row with no expression slot.
     fn resolve_insert_row_exprs(
         &self,
@@ -844,34 +843,8 @@ impl Engine {
                     }
                     node
                 }
-                Type::Range(_) | Type::Array(_) => {
+                Type::Range(_) | Type::Array(_) | Type::Composite(_) | Type::Record(_) => {
                     resolve_container_assign(&scope, col, e, &mut AggCtx::Forbidden, ptypes)?
-                }
-                Type::Composite(_) | Type::Record(_) => {
-                    let (node, ty) = resolve(&scope, e, None, &mut AggCtx::Forbidden, ptypes)?;
-                    match &ty {
-                        ResolvedType::Null => {}
-                        ResolvedType::Composite(c) if c.name.is_none() => {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                format!(
-                                    "inserting a ROW expression into composite column {} is not supported yet",
-                                    col.name
-                                ),
-                            ));
-                        }
-                        _ if ty == resolved_type_of_col(&col.ty, self) => {}
-                        _ => {
-                            return Err(assignment_error(format!(
-                                "column {} is of type {} but expression is of type {}",
-                                col.name,
-                                col.ty.canonical_name(),
-                                ty.type_name(),
-                            ))
-                            .with_position(e.location().0));
-                        }
-                    }
-                    node
                 }
             };
             out[p] = Some(node);

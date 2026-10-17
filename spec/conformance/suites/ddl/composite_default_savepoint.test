@@ -1,0 +1,67 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# ALTER TABLE ADD COLUMN with a composite DEFAULT inside a savepoint (spec/design/composite.md §12,
+# transactions.md §11): ROLLBACK TO undoes the column and its default together with everything else
+# since the savepoint, RELEASE keeps them, and ROLLBACK of the block discards them. Oracle-checked
+# against PostgreSQL 18, the final query after ROLLBACK by hand (the replaying importer ends its own
+# block there). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default_expr, ddl.alter_table, ddl.composite_default, txn.explicit, txn.savepoint, dml.insert, dml.insert_column_list, query.select, query.order_by, types.i32, types.text, types.composite
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT s1
+
+statement ok
+ALTER TABLE t ADD COLUMN h addr DEFAULT ROW('main', 1 + 1)
+
+query IT nosort
+SELECT id, h FROM t
+----
+1
+(main,2)
+
+statement ok
+ROLLBACK TO SAVEPOINT s1
+
+query I nosort
+SELECT * FROM t
+----
+1
+
+statement ok
+SAVEPOINT s2
+
+statement ok
+ALTER TABLE t ADD COLUMN h addr DEFAULT ROW('kept', 3)
+
+statement ok
+RELEASE SAVEPOINT s2
+
+statement ok
+INSERT INTO t (id) VALUES (2)
+
+query IT nosort
+SELECT id, h FROM t ORDER BY id
+----
+1
+(kept,3)
+2
+(kept,3)
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT * FROM t
+----
+1

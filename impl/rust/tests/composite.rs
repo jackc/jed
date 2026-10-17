@@ -67,8 +67,8 @@ fn drop_type_removes_it() {
     assert!(db.composite_type("addr").is_none());
 }
 
-/// A nested composite value round-trips and renders with the inner record quoted. The nested
-/// `ROW(ROW(…),…)` constructor is a jed extension PG rejects, so this lives here, not in the corpus.
+/// A nested composite value round-trips and renders with the inner record quoted (the nested
+/// `ROW(ROW(…),…)` constructor's PostgreSQL-checked surface is dml/composite_row_assign.test).
 #[test]
 fn nested_composite_value_roundtrip() {
     let mut db = Database::create(CreateOptions::default())

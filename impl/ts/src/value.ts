@@ -670,7 +670,7 @@ export function recordOut(fields: Value[]): string {
 
 // recordOutZoned is recordOut with each field rendered by renderZoned — a timestamptz field in zone
 // when one is given (timezones.md §9.5).
-function recordOutZoned(fields: Value[], zone: ZoneRef | null): string {
+export function recordOutZoned(fields: Value[], zone: ZoneRef | null): string {
   let out = "(";
   for (let i = 0; i < fields.length; i++) {
     if (i > 0) out += ",";

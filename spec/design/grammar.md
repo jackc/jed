@@ -1257,9 +1257,9 @@ A `VALUES` slot may hold any expression: `INSERT INTO t VALUES (1 + 1, upper('x'
   `INSERT ... SELECT` and `UPDATE` use (`42804`); a range/array column follows `UPDATE`'s container
   rule (a NULL, or the same container type — array.md §4 / ranges.md §4); a composite column takes
   NULL or a value of its own composite type (e.g. a scalar subquery over a composite column), as
-  `UPDATE` does. An anonymous `ROW(…)` *expression* into a composite column is `0A000`, the same
-  deferred anonymous-record → named-composite assignment `UPDATE` carries (composite.md §12) — a documented
-  narrowing (PostgreSQL accepts it); a literal-field `ROW(…)` is unaffected. A `$N` inside an
+  `UPDATE` does, or a `ROW(…)` constructor whose fields coerce to the composite's field types by the
+  assignment rule (composite.md §12); an anonymous record that is not a constructor (a `CASE` over
+  rows, a scalar subquery returning a row) is `42804` (PostgreSQL `42846`). A `$N` inside an
   expression is typed by its operator context (api.md §5), not by the column. Slots are resolved
   row by row, left to right, before `RETURNING` and `ON CONFLICT` (PostgreSQL's analysis order), so
   every resolution error precedes the `428C9` GENERATED ALWAYS gate — an expression is an explicit
@@ -1812,7 +1812,8 @@ own type** or a NULL-typed one, the container rule `UPDATE` and an `INSERT … V
 already share ([array.md](array.md) §4, [ranges.md](ranges.md) §4): a different element, range, or
 composite type is `42804` (PostgreSQL would assignment-cast — e.g. a bare `ARRAY[1]`, which is `i64[]`
 in a select list, into an `i32[]` column; ledgered), and an anonymous `ROW(…)` projection into a
-composite column is `0A000`. The values are stored through the same container codec as `INSERT …
+composite column is `42804` — a projected record is not a constructor whose fields could coerce
+(PostgreSQL `42846`, composite.md §12). The values are stored through the same container codec as `INSERT …
 VALUES`. (Formerly every container column was `0A000` here; `CREATE TABLE … AS` fills its container
 columns through this path — [create-table-as.md](create-table-as.md) §3.)
 

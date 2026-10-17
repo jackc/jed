@@ -350,7 +350,8 @@ back to the same float, in exponent form when the number is very large or very s
 `1e-07`). So `f::text` is a stable value, and an index on it works.
 
 Unlike PostgreSQL, the cast is **explicit only**: `INSERT INTO t (name) VALUES (42)` and
-`name = 42` stay type errors (`42804`). A composite or range value does not cast to `text` yet.
+`name = 42` stay type errors (`42804`). A composite value casts to its row text (`(Main,90210)`);
+a range value does not cast to `text` yet.
 
 ## Concatenating text
 

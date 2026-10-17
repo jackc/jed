@@ -11,7 +11,7 @@
 # select by name, never `SELECT *` positionally. Scoping / read-only / privileges / cost are the
 # same model as jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT
 # PostgreSQL-oracle-checked.
-# requires: introspect.columns, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, resource.cost_metering, ddl.column_default, ddl.column_default_expr, ddl.serial, ddl.identity, ddl.alter_table, func.uuid_generate, session.timezone, types.i16, types.i32, types.i64, types.text, types.varchar_length, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.f32, types.f64, types.date, types.json, types.jsonb, types.composite, types.array, types.array_composite, types.range, ddl.view, ddl.view_alter, introspect.views, session.privileges
+# requires: introspect.columns, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, resource.cost_metering, ddl.column_default, ddl.column_default_expr, ddl.serial, ddl.identity, ddl.alter_table, func.uuid_generate, session.timezone, types.i16, types.i32, types.i64, types.text, types.varchar_length, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.f32, types.f64, types.date, types.json, types.jsonb, types.composite, ddl.composite_default, ddl.drop_table, types.array, types.array_composite, types.range, ddl.view, ddl.view_alter, introspect.views, session.privileges
 # load-timezone: America/New_York
 
 # --- an empty database yields no column rows ------------------------------------------------------
@@ -161,6 +161,21 @@ k
 addr
 l
 addr[]
+
+# A composite column's DEFAULT is an expression default, shown as its canonical token text.
+statement ok
+CREATE TABLE cdefault (id i32 PRIMARY KEY, h addr DEFAULT ROW('Elm', 1 + 1), k addr DEFAULT '(q,3)')
+
+query TT nosort
+SELECT name, column_default FROM jed_columns WHERE table_name = 'cdefault' AND name <> 'id' ORDER BY ordinal
+----
+h
+row ( 'Elm' , 1 + 1 )
+k
+'(q,3)'
+
+statement ok
+DROP TABLE cdefault
 
 # --- not_null: declared NOT NULL or PRIMARY KEY membership; pk_ordinal is KEY order --------------
 

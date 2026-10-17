@@ -585,11 +585,15 @@ pub(crate) fn materialize_insert_value(
         ColType::Composite { name, fields } => match iv {
             InsertValue::Row(field_ivs) => {
                 if field_ivs.len() != fields.len() {
-                    return Err(type_error(format!(
-                        "ROW has {} fields but composite type {name} has {}",
-                        field_ivs.len(),
-                        fields.len()
-                    ))
+                    // PostgreSQL's 42846 "cannot cast type record to T" (composite.md §12).
+                    return Err(EngineError::new(
+                        SqlState::CannotCoerce,
+                        format!(
+                            "ROW has {} fields but composite type {name} has {}",
+                            field_ivs.len(),
+                            fields.len()
+                        ),
+                    )
                     .no_hint());
                 }
                 let mut vals = Vec::with_capacity(fields.len());

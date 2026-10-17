@@ -22,6 +22,7 @@ import {
 import { toCharDecimal, toCharFloat, toCharInt, toNumberText } from "./formatting_num.ts";
 import {
   arrayOutZoned,
+  recordOutZoned,
   arrayValue,
   boolAnd,
   isTrue,
@@ -69,6 +70,7 @@ import {
   coerceCaseValue,
   coerceDecimal,
   coerceStringToArray,
+  coerceRecordTextToValue,
   collatedArrayCmp,
   collatedCmp,
   countNulls,
@@ -458,6 +460,8 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return evalCastNode(e, row, env, m);
     case "arrayCast":
       return evalArrayCastNode(e, row, env, m);
+    case "compositeCast":
+      return evalCompositeCastNode(e, row, env, m);
     case "neg":
       return evalNegNode(e, row, env, m);
     case "not": {
@@ -693,6 +697,32 @@ function evalArrayCastNode(e: Of<"arrayCast">, row: Row, env: EvalEnv, m: Meter)
     return growthResult(m, [e.operand], out);
   }
   return out;
+}
+
+function evalCompositeCastNode(e: Of<"compositeCast">, row: Row, env: EvalEnv, m: Meter): Value {
+  // The two runtime composite casts (spec/design/composite.md §8): composite → text renders
+  // record_out, and runtime text → composite parses record_in against the target composite's field
+  // types (22P02 malformed / a field's own input error — the same errors the '(…)'::addr literal
+  // path raises). One operator_eval, like arrayCast.
+  m.charge(COSTS.operatorEval);
+  const v = evalExpr(e.operand, row, env, m);
+  if (v.kind === "null") return nullValue();
+  if (v.kind === "composite" && e.to === null) {
+    // A timestamptz at any depth renders in the SESSION zone, one timezone unit per finite
+    // instant, charged before rendering (timezones.md §9.5). A growth kernel: field quoting can
+    // expand strings (cost.md §8.1).
+    const zoned = v.fields.reduce((n, f) => n + zoneRenderCount(f), 0);
+    if (zoned > 0) {
+      m.charge(COSTS.timezone * BigInt(zoned));
+      m.guard();
+    }
+    const out = textValue(recordOutZoned(v.fields, env.exec.session.timeZone));
+    return growthResult(m, [e.operand], out);
+  }
+  if (v.kind === "text" && e.to !== null && e.to.kind === "composite") {
+    return coerceRecordTextToValue(v.text, e.to, env.exec.inputZone());
+  }
+  throw new Error("a compositeCast operand is text or composite (resolver-gated)");
 }
 
 function evalNegNode(e: Of<"neg">, row: Row, env: EvalEnv, m: Meter): Value {

@@ -1492,22 +1492,130 @@ func coerceStringToComposite(text string, ct *compositeType, catalog *engine, iz
 // ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
 // canonicalize (spec/design/ranges.md §4/§5). Folds to a reConstRange. Malformed → 22P02;
 // lower>upper → 22000; a canonicalize overflow → 22003.
-// resolveContainerAssign resolves an UPDATE (or ON CONFLICT DO UPDATE) assignment RHS against a
-// RANGE, ARRAY, or COMPOSITE column. It mirrors INSERT's value adaptation (ranges.md §5 / array.md
-// §7 / composite.md §8): a bare string literal adapts to the container via range_in / array_in /
-// record_in, a bare NULL is the typed NULL, and any other expression must resolve to the SAME
-// container type (matching element / the same named composite) else 42804. An anonymous ROW(…)
-// expression has no composite type to match (0A000, the INSERT … VALUES expression rule —
-// composite.md §12). A top-level $N parameter is deferred (0A000) — INSERT's param-to-container
-// handling is special and not generalized to the assignment RHS yet.
+// resolveContainerAssign resolves an UPDATE (or ON CONFLICT DO UPDATE, or INSERT … VALUES expression
+// slot) assignment RHS against a RANGE, ARRAY, or COMPOSITE column. It mirrors INSERT's value
+// adaptation (ranges.md §5 / array.md §7 / composite.md §8): a bare string literal adapts to the
+// container via range_in / array_in / record_in, a bare NULL is the typed NULL, a ROW(…) constructor
+// assigned to a composite coerces field-by-field to the composite's field types (composite.md §12,
+// PostgreSQL's record → composite assignment coercion), and any other expression must resolve to the
+// SAME container type (matching element / the same named composite) else 42804 — except an anonymous
+// record that is not a ROW(…) constructor (a CASE, a subquery, a derived column), which is
+// PostgreSQL's 42846 "cannot cast type record to addr".
 func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+	return resolveContainerAssignTy(s, col.Type, col.Name, e, ag, params)
+}
+
+// rowCoercion is how a ROW(…) constructor's fields coerce to a named composite's field types
+// (spec/design/composite.md §12): by the ASSIGNMENT rule of a stored column (each field must be
+// assignable to its field type, the value coerced at store), or by an EXPLICIT ::type cast (each field
+// explicitly cast to its field type) — PostgreSQL's coerce_record_to_complex under the assignment and
+// explicit coercion contexts.
+type rowCoercion int
+
+const (
+	rowCoercionAssign rowCoercion = iota
+	rowCoercionExplicit
+)
+
+// recordCastError is the 42846 cannot_coerce "cannot cast type record to T" a record → named-composite
+// coercion raises, as PostgreSQL does (composite.md §8/§12).
+func recordCastError(typeName, detail string) *EngineError {
+	msg := "cannot cast type record to " + typeName
+	if detail != "" {
+		msg += ": " + detail
+	}
+	return newError(CannotCoerce, msg).noHint()
+}
+
+// resolveRowToComposite coerces a ROW(…) (or bare (a, b, …)) constructor's field expressions to the
+// named composite ct (spec/design/composite.md §12), recursing for a nested composite field (a nested
+// ROW(…) coerces one level down). The field count must equal the type's (42846 otherwise). Under
+// rowCoercionAssign each field resolves with its field type as the literal hint and must be assignable
+// to it — a scalar field by the column assignment rule, a container field by resolveContainerAssignTy
+// — and the value is coerced when stored. Under rowCoercionExplicit each field is explicitly cast to
+// its field type (the scalar / container cast surface), so the row's values carry the target types at
+// eval. Returns an reRow typed as the named composite.
+func resolveRowToComposite(s *scope, items []exprNode, ct *compositeType, mode rowCoercion, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if len(items) != len(ct.Fields) {
+		which := "input has too many columns"
+		if len(items) < len(ct.Fields) {
+			which = "input has too few columns"
+		}
+		return nil, resolvedType{}, recordCastError(ct.Name, which)
+	}
+	nodes := make([]*rExpr, len(items))
+	for i, item := range items {
+		f := ct.Fields[i]
+		switch {
+		case mode == rowCoercionExplicit:
+			typeName, tm := fieldCastTarget(f)
+			cast := exprNode{Kind: exprCast, Cast: &castExpr{Inner: item, TypeName: typeName, TypeMod: tm}}
+			node, _, err := resolve(s, cast, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = node
+		case f.Type.isScalar():
+			target := f.Type.Scalar
+			node, ty, err := resolve(s, item, &target, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if !assignableTo(ty, target) {
+				return nil, resolvedType{}, positionError(recordCastError(ct.Name,
+					"field "+f.Name+" is of type "+f.Type.CanonicalName()+" but expression is of type "+rtName(ty)),
+					exprLocation(item))
+			}
+			nodes[i] = node
+		default:
+			node, err := resolveContainerAssignTy(s, f.Type, f.Name, item, ag, params)
+			if err != nil {
+				// A container field that does not coerce fails the whole record → composite coercion:
+				// PostgreSQL's 42846 cannot_coerce, not the column-level 42804.
+				if ee, ok := err.(*EngineError); ok && ee.State == DatatypeMismatch {
+					ee.State = CannotCoerce
+				}
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = node
+		}
+	}
+	return &rExpr{kind: reRow, sargs: nodes}, resolvedTypeOfCol(compositeT(ct.Name), s.catalog.readSnap()), nil
+}
+
+// fieldCastTarget is the cast target (type name + modifier) naming a composite field's declared type —
+// the exprCast an explicit ROW(…)::type cast applies to that field: a scalar's canonical name (with its
+// numeric(p,s), varchar(n), or timestamp/interval modifier), a composite's name, an array's T[], a range's name.
+func fieldCastTarget(f compositeField) (string, *typeMod) {
+	var tm *typeMod
+	switch {
+	case f.Decimal != nil && f.Decimal.Precision > 0:
+		prec, scale := uint64(f.Decimal.Precision), uint64(f.Decimal.Scale)
+		tm = &typeMod{Precision: &prec, Scale: &scale}
+	case f.VarcharLen != nil:
+		n := uint64(*f.VarcharLen)
+		tm = &typeMod{Precision: &n}
+	case f.Temporal != nil:
+		tm = &typeMod{IntervalFields: f.Temporal.Fields}
+		if f.Temporal.Precision != noTemporalPrecision {
+			p := uint64(f.Temporal.Precision)
+			tm.Precision = &p
+		}
+	}
+	return f.Type.CanonicalName(), tm
+}
+
+// resolveContainerAssignTy is resolveContainerAssign over a bare container type and the name its
+// errors cite — shared by a column (UPDATE / DO UPDATE / an INSERT expression slot) and a composite
+// field one ROW(…) level down (resolveRowToComposite).
+func resolveContainerAssignTy(s *scope, colTy dataType, colName string, e exprNode, ag *aggCtx, params *paramTypes) (*rExpr, error) {
 	snap := s.catalog.readSnap()
-	colRT := resolvedTypeOfCol(col.Type, snap)
+	colRT := resolvedTypeOfCol(colTy, snap)
 	// A bare string literal adapts to the container context (the same string-adapts-to-context rule
 	// the cast and INSERT VALUES paths use).
 	if e.Kind == exprLiteral && e.Literal != nil && e.Literal.Kind == literalText {
-		if col.Type.IsRange() {
-			elem, _ := col.Type.RangeElement()
+		if colTy.IsRange() {
+			elem, _ := colTy.RangeElement()
 			desc, ok := rangeForElement(elem.Scalar)
 			if !ok {
 				panic("a range column's element always has a range type")
@@ -1517,8 +1625,8 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 			params.noteInputZone(iz)
 			return node, positionError(err, e.Pos)
 		}
-		if col.Type.IsComposite() {
-			ct := snap.compositeType(col.Type.Comp.Name)
+		if colTy.IsComposite() {
+			ct := snap.compositeType(colTy.Comp.Name)
 			if ct == nil {
 				panic("a composite column's type exists in the catalog")
 			}
@@ -1532,7 +1640,7 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 		}
 		// array
 		iz := s.catalog.inputZone()
-		val, err := coerceStringToArray(e.Literal.Str, resolveColType(*col.Type.Array, snap.types), iz)
+		val, err := coerceStringToArray(e.Literal.Str, resolveColType(*colTy.Array, snap.types), iz)
 		if err != nil {
 			return nil, positionError(err, e.Pos)
 		}
@@ -1544,8 +1652,17 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 	}
 	// A bind parameter assigned to a container column takes the column's type (api.md §5).
 	if e.Kind == exprParam {
-		ct := resolveColType(col.Type, snap.types)
+		ct := resolveColType(colTy, snap.types)
 		node, _, err := resolveParamNode(s, e, &ct, colRT, params)
+		return node, err
+	}
+	// A ROW(…) constructor assigned to a composite coerces field-by-field (composite.md §12).
+	if colTy.IsComposite() && e.Kind == exprRow {
+		ct := snap.compositeType(colTy.Comp.Name)
+		if ct == nil {
+			panic("a composite column's type exists in the catalog")
+		}
+		node, _, err := resolveRowToComposite(s, e.RowItems, ct, rowCoercionAssign, ag, params)
 		return node, err
 	}
 	// For an array column over a SCALAR element, pass the element type as the hint so a bare
@@ -1554,8 +1671,8 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 	// narrower i32[]/i16[] column). A range gets no scalar hint (its bare-literal form was handled
 	// above; other forms self-describe their element).
 	var hint *scalarType
-	if col.Type.IsArray() {
-		if es, ok := col.Type.Array.AsScalar(); ok {
+	if colTy.IsArray() {
+		if es, ok := colTy.Array.AsScalar(); ok {
 			hint = &es
 		}
 	}
@@ -1566,12 +1683,14 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 	if ty.kind == rtNull {
 		return node, nil // a NULL-typed expression (e.g. a CASE that may be NULL)
 	}
-	if ty.kind == rtComposite && !ty.comp.named {
-		return nil, newError(FeatureNotSupported,
-			"assigning a ROW expression to composite column "+col.Name+" is not supported yet")
+	// An anonymous record that is not a ROW(…) constructor (a CASE over rows, a scalar subquery, a
+	// derived column) has no field expressions to coerce — PostgreSQL's "cannot cast type record to
+	// addr" (composite.md §12).
+	if colTy.IsComposite() && ty.kind == rtComposite && !ty.comp.named {
+		return nil, positionError(recordCastError(colTy.Comp.Name, ""), exprLocation(e))
 	}
 	if !containerAssignable(ty, colRT) {
-		return nil, positionError(assignmentError("column "+col.Name+" is of type "+col.Type.CanonicalName()+
+		return nil, positionError(assignmentError("column "+colName+" is of type "+colTy.CanonicalName()+
 			" but expression is of type "+rtName(ty)), exprLocation(e))
 	}
 	return node, nil

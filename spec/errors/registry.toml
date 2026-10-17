@@ -508,7 +508,9 @@ class = "syntax error or access rule violation"
 template = "datatype mismatch: {detail}"
 
 # A SQL/JSON `ON EMPTY` / `ON ERROR` `DEFAULT expr` whose type has no cast to the RETURNING type
-# (../design/json-sql-functions.md §5.3) — PostgreSQL's code and message.
+# (../design/json-sql-functions.md §5.3) — PostgreSQL's code and message. Also a composite cast or
+# record → composite coercion with no conversion, "cannot cast type record to addr"
+# (../design/composite.md §8/§12), as in PostgreSQL.
 [[error]]
 code = "42846"
 name = "cannot_coerce"

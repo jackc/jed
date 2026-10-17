@@ -194,7 +194,7 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
             rebase_placeholder_cols(lhs, from, target);
             rebase_placeholder_cols(array, from, target);
         }
-        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
+        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } | RExpr::CompositeCast { inner, .. } => {
             rebase_placeholder_cols(inner, from, target)
         }
         RExpr::Neg { operand, .. } => rebase_placeholder_cols(operand, from, target),

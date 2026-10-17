@@ -2069,6 +2069,7 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
         ),
         RExpr::Cast { inner, .. }
         | RExpr::ArrayCast { inner, .. }
+        | RExpr::CompositeCast { inner, .. }
         | RExpr::DateConvert { inner, .. } => estimator_operator_nodes(Some(inner)),
         RExpr::Neg { operand, .. }
         | RExpr::IsNull { operand, .. }
@@ -2196,6 +2197,7 @@ pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
         | RExpr::Or(lhs, array) => vec![lhs, array],
         RExpr::Cast { inner, .. }
         | RExpr::ArrayCast { inner, .. }
+        | RExpr::CompositeCast { inner, .. }
         | RExpr::DateConvert { inner, .. } => vec![inner],
         RExpr::Neg { operand, .. }
         | RExpr::IsNull { operand, .. }
@@ -4223,7 +4225,9 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
                     .flat_map(subscript_bounds)
                     .all(rexpr_is_constant)
         }
-        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => rexpr_is_constant(inner),
+        RExpr::Cast { inner, .. }
+        | RExpr::ArrayCast { inner, .. }
+        | RExpr::CompositeCast { inner, .. } => rexpr_is_constant(inner),
         RExpr::Neg { operand, .. } => rexpr_is_constant(operand),
         RExpr::Not(x) => rexpr_is_constant(x),
         RExpr::Casing { arg, .. } => rexpr_is_constant(arg),

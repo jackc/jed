@@ -153,6 +153,20 @@ ORDER BY name;`;
        num_nulls(VARIADIC ARRAY[1, NULL, 3]) AS variadic,
        num_nonnulls(1, NULL, 3)              AS non_nulls;`;
 
+	const compositeBuildSeed = `CREATE TYPE addr AS (street text, zip i32);
+CREATE TABLE person (id i32 PRIMARY KEY, home addr DEFAULT ROW('Unknown', 0));
+INSERT INTO person VALUES (1, ROW(upper('main'), 90000 + 210));
+INSERT INTO person (id) VALUES (2);
+UPDATE person SET home = ROW((home).street || ' St', (home).zip + 1) WHERE id = 1;`;
+
+	const compositeBuildExample = `SELECT id,
+       home,
+       home::text                      AS as_text,
+       ('(Oak,' || id || ')')::addr    AS parsed,
+       ROW(id, 7)::addr                AS cast_row
+FROM person
+ORDER BY id;`;
+
 	const arrayCompositeSeed = `CREATE TYPE addr AS (street text, zip i32);
 CREATE TABLE person (id i32 PRIMARY KEY, places addr[]);
 INSERT INTO person VALUES
@@ -626,6 +640,18 @@ keyword, by passing one array whose elements are the arguments. The two forms ag
 form never returns `NULL` (it counts), while `VARIADIC` over a `NULL` array yields `NULL`:
 
 <LiveSql demo="variadicExample" query={variadicExample} rows={2} />
+
+## Building and casting composite values
+
+A `ROW(…)` constructor — or the bare `(a, b)` form — fills a composite column from any expressions:
+in an `INSERT … VALUES` slot, an `UPDATE … SET`, an `ON CONFLICT DO UPDATE SET`, or a column
+`DEFAULT`. Each field is converted to its field's type as a value stored in a column of that type
+would be, so an integer is range-checked and a decimal rounded to its scale; a nested
+`ROW(ROW(…), …)` fills a nested composite field. The field count must match the type
+(`42804` otherwise). Casts convert in both directions: `home::text` renders the row text,
+`text::addr` parses it at run time, and `ROW(…)::addr` casts each field to its field's type:
+
+<LiveSql demo="compositeBuildExample" seed={compositeBuildSeed} query={compositeBuildExample} rows={2} />
 
 ## Arrays of composite types
 

@@ -1,0 +1,182 @@
+# Runtime composite casts (spec/design/composite.md §8): composite → text renders record_out per row
+# (explicit only, a varchar(n) target truncating the text; an anonymous ROW(...) renders the same
+# way), runtime text → composite parses record_in per row against the target's field types (22P02
+# for a malformed literal or a wrong field count, a field's own input error otherwise), and an
+# anonymous ROW(...)::type cast coerces structurally — each field explicitly cast to its field type,
+# recursing for a nested composite field. A field-count mismatch, an uncastable field, a record that
+# is not a ROW constructor, a different composite, and a composite → scalar cast are 42846
+# cannot_coerce, as in PostgreSQL. Type names avoid PostgreSQL's built-in geometric
+# types. Oracle-checked against PostgreSQL 18. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, query.is_null, expr.text_concat, types.i32, types.text, types.boolean, types.decimal, types.varchar_length, types.composite, types.composite_bare_row, cast.composite, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a addr, s text)
+
+statement ok
+INSERT INTO t VALUES (1, ROW('Main', 90210), '(Oak,5)'), (2, ROW('a b', NULL), '("x,y",)'), (3, NULL, NULL), (4, ROW('q"s', 4), '("p d",7)'), (5, ROW('', 0), '("",0)')
+
+# --- composite → text ------------------------------------------------------------------------------
+
+query ITTB nosort
+SELECT id, a::text, CAST(a AS text) || '!', a::text = s FROM t ORDER BY id
+----
+1
+(Main,90210)
+(Main,90210)!
+false
+2
+("a b",)
+("a b",)!
+false
+3
+NULL
+NULL
+NULL
+4
+("q""s",4)
+("q""s",4)!
+false
+5
+("",0)
+("",0)!
+true
+
+query T nosort
+SELECT a::varchar(4) FROM t WHERE id = 1
+----
+(Mai
+
+# An anonymous ROW(...) renders through record_out too.
+query T nosort
+SELECT ROW(1, 'a b', NULL)::text
+----
+(1,"a b",)
+
+# --- runtime text → composite -----------------------------------------------------------------------
+
+query ITTI nosort
+SELECT id, s::addr, (s::addr).street, (CAST(s AS addr)).zip FROM t WHERE id <> 5 ORDER BY id
+----
+1
+(Oak,5)
+Oak
+5
+2
+("x,y",)
+x,y
+NULL
+3
+NULL
+NULL
+NULL
+4
+("p d",7)
+p d
+7
+
+# A composite round-trips through text.
+query IB nosort
+SELECT id, a::text::addr = a FROM t WHERE id IN (1, 4, 5) ORDER BY id
+----
+1
+true
+4
+true
+5
+true
+
+query T nosort
+SELECT ('(q,' || '5)')::addr
+----
+(q,5)
+
+query I nosort
+SELECT id FROM t WHERE s::addr = ROW('Oak', 5)::addr
+----
+1
+
+statement error 22P02
+SELECT ('(a,' || 'x)')::addr
+
+statement error 22P02
+SELECT ('(a' || ')')::addr
+
+statement error 22P02
+SELECT ('a,' || '1')::addr
+
+# --- ROW(...)::type — the structural cast ------------------------------------------------------------
+
+query TTTTT nosort
+SELECT ROW('a', 1)::addr, ROW(1, 2)::addr, ROW('a', 1.7)::addr, ROW('a', '12')::addr, ROW('a', true)::addr
+----
+(a,1)
+(1,2)
+(a,2)
+(a,12)
+(a,1)
+
+query TIB nosort
+SELECT CAST(ROW(upper('z'), 2 + 3) AS addr), (ROW('a', 3)::addr).zip, ROW('a', NULL)::addr IS NULL
+----
+(Z,5)
+3
+false
+
+query IB nosort
+SELECT id, (ROW((a).street, (a).zip)::addr) = a FROM t WHERE id IN (1, 4) ORDER BY id
+----
+1
+true
+4
+true
+
+# A field's modifier applies as an explicit cast: the decimal rounds, the varchar truncates.
+statement ok
+CREATE TYPE price AS (amt decimal(5,2), code varchar(2))
+
+query T nosort
+SELECT ROW(1.005, 'abc')::price
+----
+(1.01,ab)
+
+# A nested ROW(...) casts one level down.
+statement ok
+CREATE TYPE leg AS (a addr, b addr)
+
+query TTT nosort
+SELECT ROW(ROW('x', 1), ROW('y', 2))::leg, ROW(ROW('x', 1)::addr, '(y,2)')::leg, ROW(ROW('x', 1 + 1), NULL)::leg::text
+----
+("(x,1)","(y,2)")
+("(x,1)","(y,2)")
+("(x,2)",)
+
+query T nosort
+SELECT ((ROW(ROW('x', 1), ROW('y', 2))::leg).b).street
+----
+y
+
+# --- rejections ------------------------------------------------------------------------------------
+
+statement error 42846
+SELECT ROW('a')::addr
+
+statement error 42846
+SELECT ROW('a', 1, 2)::addr
+
+statement error 22P02
+SELECT ROW('a', 'b')::addr
+
+statement error 42846
+SELECT ROW('a', ROW(1))::addr
+
+statement error 42846
+SELECT r::addr FROM (SELECT ROW('a', 1) AS r) s
+
+statement error 42846
+SELECT (ROW('a', 1)::addr)::leg
+
+statement error 42846
+SELECT a::i32 FROM t

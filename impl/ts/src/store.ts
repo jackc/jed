@@ -511,7 +511,9 @@ export function materializeInsertValue(
   switch (iv.kind) {
     case "row": {
       if (iv.fields.length !== ty.fields.length) {
-        throw typeError(
+        // PostgreSQL's 42846 "cannot cast type record to T" (composite.md §12).
+        throw engineError(
+          "cannot_coerce",
           "ROW has " +
             iv.fields.length +
             " fields but composite type " +

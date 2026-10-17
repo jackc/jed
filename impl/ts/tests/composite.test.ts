@@ -37,8 +37,8 @@ test("DROP TYPE removes it", () => {
   assert.equal(db.compositeType("addr"), undefined);
 });
 
-// A nested composite value round-trips and renders with the inner record quoted. The nested
-// ROW(ROW(…),…) constructor is a jed extension PG rejects, so this lives here, not in the corpus.
+// A nested composite value round-trips and renders with the inner record quoted (the nested
+// ROW(ROW(…),…) constructor's PostgreSQL-checked surface is dml/composite_row_assign.test).
 test("nested composite value round-trip", () => {
   const db = memDb().session();
   run(db, "CREATE TYPE point AS (x i32, y i32)");

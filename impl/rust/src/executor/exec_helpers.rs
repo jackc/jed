@@ -1051,7 +1051,7 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         } => {
             rexpr_references_outer(lhs, depth) || rexpr_references_outer(array, depth)
         }
-        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
+        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } | RExpr::CompositeCast { inner, .. } => {
             rexpr_references_outer(inner, depth)
         }
         RExpr::Neg { operand, .. } => rexpr_references_outer(operand, depth),
@@ -1221,7 +1221,7 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched(lhs, depth, touched);
             collect_touched(array, depth, touched);
         }
-        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
+        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } | RExpr::CompositeCast { inner, .. } => {
             collect_touched(inner, depth, touched)
         }
         RExpr::Neg { operand, .. } => collect_touched(operand, depth, touched),

@@ -1473,14 +1473,15 @@ pub(crate) fn coerce_string_to_composite(
 /// `i32range '[1,5)'`). Parses the literal, coerces each bound to the element type via the
 /// string-literal coercion, then canonicalizes (spec/design/ranges.md §4/§5). Folds to a
 /// `ConstRange`. Malformed → `22P02`; `lower>upper` → `22000`; a canonicalize overflow → `22003`.
-/// Resolve an UPDATE (or ON CONFLICT DO UPDATE) assignment RHS against a RANGE, ARRAY, or
-/// COMPOSITE column. Mirrors INSERT's value adaptation (ranges.md §5 / array.md §7 / composite.md
-/// §8): a bare string literal adapts to the container via range_in / array_in / record_in, a bare
-/// NULL is the typed NULL, and any other expression must resolve to the SAME container type
-/// (matching element / the same named composite) else 42804. An anonymous `ROW(…)` expression has
-/// no composite type to match (0A000, the INSERT … VALUES expression rule — composite.md §12). A
-/// top-level `$N` parameter is deferred (0A000) — INSERT's param-to-container handling is special
-/// and not generalized to the assignment RHS yet.
+/// Resolve an UPDATE (or ON CONFLICT DO UPDATE, or INSERT … VALUES expression slot) assignment
+/// RHS against a RANGE, ARRAY, or COMPOSITE column. Mirrors INSERT's value adaptation (ranges.md §5
+/// / array.md §7 / composite.md §8): a bare string literal adapts to the container via range_in /
+/// array_in / record_in, a bare NULL is the typed NULL, a `ROW(…)` constructor assigned to a
+/// composite coerces field-by-field to the composite's field types (composite.md §12, PostgreSQL's
+/// record → composite assignment coercion), and any other expression must resolve to the SAME
+/// container type (matching element / the same named composite) else 42804 — except an anonymous
+/// record that is not a `ROW(…)` constructor (a CASE, a subquery, a derived column), which is
+/// PostgreSQL's 42846 "cannot cast type record to addr".
 pub(crate) fn resolve_container_assign(
     scope: &Scope,
     col: &Column,
@@ -1488,12 +1489,153 @@ pub(crate) fn resolve_container_assign(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<RExpr> {
-    let col_rt = resolved_type_of_col(&col.ty, scope.catalog);
+    resolve_container_assign_ty(scope, &col.ty, &col.name, e, agg, params)
+}
+
+/// How a `ROW(…)` constructor's fields coerce to a named composite's field types
+/// (spec/design/composite.md §12): by the ASSIGNMENT rule of a stored column (each field must be
+/// assignable to its field type, the value coerced at store), or by an EXPLICIT `::type` cast (each
+/// field explicitly cast to its field type) — PostgreSQL's `coerce_record_to_complex` under the
+/// assignment and explicit coercion contexts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowCoercion {
+    Assign,
+    Explicit,
+}
+
+/// The `42846` cannot_coerce "cannot cast type record to T" a record → named-composite coercion
+/// raises, as PostgreSQL does (composite.md §8/§12).
+pub(crate) fn record_cast_error(type_name: &str, detail: &str) -> EngineError {
+    let msg = if detail.is_empty() {
+        format!("cannot cast type record to {type_name}")
+    } else {
+        format!("cannot cast type record to {type_name}: {detail}")
+    };
+    EngineError::new(SqlState::CannotCoerce, msg).no_hint()
+}
+
+/// Coerce a `ROW(…)` (or bare `(a, b, …)`) constructor's field expressions to the named composite
+/// `ct` (spec/design/composite.md §12), recursing for a nested composite field (a nested `ROW(…)`
+/// coerces one level down). The field count must equal the type's (42846 otherwise). Under
+/// [`RowCoercion::Assign`] each field resolves with its field type as the literal hint and must be
+/// assignable to it — a scalar field by the column assignment rule, a container field by
+/// [`resolve_container_assign_ty`] — and the value is coerced when stored (store_composite).
+/// Under [`RowCoercion::Explicit`] each field is explicitly cast to its field type (the scalar /
+/// container cast surface), so the row's values carry the target types at eval. Returns an
+/// `RExpr::Row` typed as the named composite.
+pub(crate) fn resolve_row_to_composite(
+    scope: &Scope,
+    items: &[Expr],
+    ct: &CompositeType,
+    mode: RowCoercion,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if items.len() != ct.fields.len() {
+        let which = if items.len() < ct.fields.len() {
+            "input has too few columns"
+        } else {
+            "input has too many columns"
+        };
+        return Err(record_cast_error(&ct.name, which));
+    }
+    let mut nodes = Vec::with_capacity(items.len());
+    for (item, f) in items.iter().zip(ct.fields.iter()) {
+        let node = match mode {
+            RowCoercion::Explicit => {
+                let (type_name, type_mod) = field_cast_target(f);
+                let cast = Expr::Cast {
+                    inner: Box::new(item.clone()),
+                    type_name,
+                    type_mod,
+                    pos: SrcPos::NONE,
+                    cast_pos: SrcPos::NONE,
+                    type_pos: SrcPos::NONE,
+                };
+                resolve(scope, &cast, None, agg, params)?.0
+            }
+            RowCoercion::Assign => match &f.ty {
+                Type::Scalar(target) => {
+                    let (node, ty) = resolve(scope, item, Some(*target), agg, params)?;
+                    if !ty.assignable_to(*target) {
+                        return Err(record_cast_error(
+                            &ct.name,
+                            &format!(
+                                "field {} is of type {} but expression is of type {}",
+                                f.name,
+                                f.ty.canonical_name(),
+                                ty.type_name()
+                            ),
+                        )
+                        .with_position(item.location().0));
+                    }
+                    node
+                }
+                // A container field that does not coerce fails the whole record → composite
+                // coercion: PostgreSQL's 42846 cannot_coerce, not the column-level 42804.
+                _ => resolve_container_assign_ty(scope, &f.ty, &f.name, item, agg, params)
+                    .map_err(|mut e| {
+                        if e.state == SqlState::DatatypeMismatch {
+                            e.state = SqlState::CannotCoerce;
+                        }
+                        e
+                    })?,
+            },
+        };
+        nodes.push(node);
+    }
+    let rt = resolved_type_of_col(
+        &Type::Composite(crate::types::CompositeRef {
+            name: ct.name.clone(),
+        }),
+        scope.catalog,
+    );
+    Ok((RExpr::Row(nodes), rt))
+}
+
+/// The cast target (type name + modifier) naming a composite field's declared type — the
+/// `Expr::Cast` an explicit `ROW(…)::type` cast applies to that field: a scalar's canonical name
+/// (with its `numeric(p,s)`, `varchar(n)`, or timestamp/interval modifier), a composite's name, an array's `T[]`, a
+/// range's name.
+fn field_cast_target(f: &CompositeField) -> (String, Option<TypeMod>) {
+    let type_mod = match (f.decimal, f.varchar_len, f.temporal) {
+        (Some(t), _, _) if t.precision > 0 => Some(TypeMod {
+            precision: Some(u64::from(t.precision)),
+            scale: Some(u64::from(t.scale)),
+            interval_fields: 0,
+        }),
+        (_, Some(n), _) => Some(TypeMod {
+            precision: Some(u64::from(n)),
+            scale: None,
+            interval_fields: 0,
+        }),
+        (_, _, Some(t)) => Some(TypeMod {
+            precision: t.precision.map(u64::from),
+            scale: None,
+            interval_fields: t.fields,
+        }),
+        _ => None,
+    };
+    (f.ty.canonical_name(), type_mod)
+}
+
+/// [`resolve_container_assign`] over a bare container type and the name its errors cite — shared by
+/// a column (UPDATE / DO UPDATE / an INSERT expression slot) and a composite field one `ROW(…)` level
+/// down ([`resolve_row_to_composite`]).
+pub(crate) fn resolve_container_assign_ty(
+    scope: &Scope,
+    col_ty: &Type,
+    col_name: &str,
+    e: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<RExpr> {
+    let col_rt = resolved_type_of_col(col_ty, scope.catalog);
     // A bare string literal adapts to the container context (the same string-adapts-to-context
     // rule the cast and INSERT VALUES paths use).
     if let Expr::Literal(Literal::Text(s), pos) = e {
         let iz = scope.catalog.input_zone();
-        match &col.ty {
+        match col_ty {
             Type::Range(elem) => {
                 let desc = crate::range::range_for_element(elem.scalar())
                     .expect("a range column's element always has a range type");
@@ -1537,35 +1679,42 @@ pub(crate) fn resolve_container_assign(
     }
     // A bind parameter assigned to a container column takes the column's type (api.md §5).
     if let Expr::Param(n1, _) = e {
-        let ct = resolve_col_type(&col.ty, &scope.catalog.read_snap().types);
+        let ct = resolve_col_type(col_ty, &scope.catalog.read_snap().types);
         return Ok(resolve_param_node(scope, *n1, Some(ct), col_rt, params)?.0);
+    }
+    // A `ROW(…)` constructor assigned to a composite coerces field-by-field (composite.md §12).
+    if let (Type::Composite(r), Expr::Row(items, _)) = (col_ty, e) {
+        let ct = scope
+            .catalog
+            .composite_type(&r.name)
+            .expect("a composite column's type exists in the catalog");
+        return Ok(resolve_row_to_composite(scope, items, ct, RowCoercion::Assign, agg, params)?.0);
     }
     // For an array column over a SCALAR element, pass the element type as the hint so a bare
     // `ARRAY[1,2]` constructor adapts its literal elements to the column's element type (the same
     // adaptation `col = ARRAY[…]` uses — without it, bare int literals would type as i64 and miss a
     // narrower i32[]/i16[] column). A range gets no scalar hint (its bare-literal form was handled
     // above; other forms self-describe their element).
-    let hint = col.ty.array_element().and_then(|t| t.as_scalar());
+    let hint = col_ty.array_element().and_then(|t| t.as_scalar());
     let (node, ty) = resolve(scope, e, hint, agg, params)?;
     if matches!(ty, ResolvedType::Null) {
         return Ok(node); // a NULL-typed expression (e.g. a CASE that may be NULL)
     }
-    if matches!(&ty, ResolvedType::Composite(c) if c.name.is_none()) {
-        return Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            format!(
-                "assigning a ROW expression to composite column {} is not supported yet",
-                col.name
-            ),
-        ));
+    // An anonymous record that is not a `ROW(…)` constructor (a CASE over rows, a scalar subquery,
+    // a derived column) has no field expressions to coerce — PostgreSQL's "cannot cast type record
+    // to addr" (composite.md §12).
+    if let (Type::Composite(r), ResolvedType::Composite(c)) = (col_ty, &ty)
+        && c.name.is_none()
+    {
+        return Err(record_cast_error(&r.name, "").with_position(e.location().0));
     }
     // Ranges/arrays compare equal only over equal element types (ResolvedType's derived Eq compares
     // the boxed element), matching the comparison rule (ranges.md §6 / array.md §5).
     if ty != col_rt {
         return Err(assignment_error(format!(
             "column {} is of type {} but expression is of type {}",
-            col.name,
-            col.ty.canonical_name(),
+            col_name,
+            col_ty.canonical_name(),
             ty.type_name()
         ))
         .with_position(e.location().0));
@@ -2296,7 +2445,7 @@ pub(crate) struct AssignPlan {
     pub(crate) source: RExpr,
     /// The resolved `ColType` for a NON-scalar column — `Some` ⇒ `check` stores through
     /// `coerce_for_store`; `None` for a scalar column, which stays on the `store_value` fast path.
-    /// Composite columns reach this only through `SET col = DEFAULT`; ordinary composite
-    /// assignment remains deferred (0A000).
+    /// A composite column's value (a same-typed expression, a `ROW(…)` coerced field-by-field, or
+    /// its `DEFAULT`) is re-coerced field-by-field here (composite.md §12).
     pub(crate) col_type: Option<ColType>,
 }

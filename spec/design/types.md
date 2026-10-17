@@ -268,7 +268,8 @@ listed).
   PostgreSQL's `float8out` / `float4out` text, the same in every core ([float.md](float.md) §9),
   so `f::text` is an indexable key. Rendering `bytea` and `jsonb` can expand the value, so
   those two casts are growth kernels charged for their output ([cost.md](cost.md) §8.1).
-  Composite and range sources stay `0A000`.
+  A composite source renders `record_out` (the same explicit-only rule — [composite.md](composite.md)
+  §8); a range source stays `0A000`.
 - **Strictness is preserved.** The string→number/bool coercion fires only when the type is
   **named** (a literal or CAST). A **bare** string in a numeric context does **not** silently
   become a number: `WHERE int_col = '42'` is `42804` (§4), and a bare string adapts *only* to the

@@ -27,7 +27,9 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 43 # v43: timestamp(p) / interval qualifier typmods — a timestamp/timestamptz column or
+VERSION = 44 # v44: a composite column may carry an expression DEFAULT — column flags bit3 + the
+             # expr-text (u16 length + UTF-8) after the type name (composite.md §12). No other byte
+             # layout change. v43: timestamp(p) / interval qualifier typmods — a timestamp/timestamptz column or
              # composite field appends u8 precision (0xFF = none), an interval one u8 fields ‖ u8
              # precision (spec/design/timestamp.md §8, interval.md §6.1). v42: GIN term statistics — a statistics summary's flags gain bit2 term_eligible, a
 # term-eligible summary appends term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16, and
@@ -288,13 +290,15 @@ end
 # A composite type defined, persisted, AND used by a stored column (S3 — composite.md §4). The
 # value codec is pinned: row 1 has both fields present; row 2's `zip` is NULL (the bitmap's bit 1
 # is set and the field contributes ZERO body bytes). A composite value is the field-value array;
-# `nil` is a NULL field. The cores build this via
+# `nil` is a NULL field. The composite column's expression DEFAULT (v44) pins its flags bit3 + the
+# expr-text after the type name. The cores build this via
 #   CREATE TYPE addr AS (street text NOT NULL, zip i32)
-#   CREATE TABLE t (id i32 PRIMARY KEY, home addr)
+#   CREATE TABLE t (id i32 PRIMARY KEY, home addr DEFAULT ROW('Elm', 1))
 #   INSERT (1, ROW('Main', 90210)); INSERT (2, ROW('Oak', NULL))
 COMPOSITE_TYPE_TABLE = {
   types: [ctype("addr", [field("street", "text", not_null: true), field("zip", "i32")])],
-  tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("home", "addr")],
+  tables: [{ name: "t", columns: [col("id", "i32", pk: true),
+                                  col("home", "addr", default_expr: "row ( 'Elm' , 1 )")],
              rows: [[1, ["Main", 90210]], [2, ["Oak", nil]]] }]
 }.freeze
 
@@ -2332,11 +2336,15 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
   table[:columns].each do |c|
     out << u16(c[:name].bytesize) << c[:name].b
     # A composite column (v9): type_code 14, flags, then the type NAME in the typmod slot
-    # (spec/design/composite.md §3). Composite columns carry no default this slice (bits 2/3 = 0).
+    # (spec/design/composite.md §3). A composite DEFAULT is always an expression default (v44, flags
+    # bit3): its expr-text follows the type name. Bit2 (a constant default) is never set.
     if composite_fields(c[:type])
       out << [14].pack("C")
-      out << [c[:not_null] ? 0b10 : 0].pack("C")
+      cflags = c[:not_null] ? 0b10 : 0
+      cflags |= 0b1000 if c[:default_expr]
+      out << [cflags].pack("C")
       out << u16(c[:type].bytesize) << c[:type].b
+      out << u16(c[:default_expr].bytesize) << c[:default_expr].b if c[:default_expr]
       next
     end
     # An array column (v10): type_code 15, flags, then the element-type descriptor
@@ -4095,17 +4103,25 @@ def decode_table_entry(buf, pos)
     cname, pos = take(buf, pos, cnl.unpack1("n"))
     tc, pos = take(buf, pos, 1)
     # A composite column (v9, type_code 14): flags, then the type NAME in the typmod slot
-    # (spec/design/composite.md §3). No default this slice.
+    # (spec/design/composite.md §3), then (v44, flags bit3) the expression DEFAULT's text. Only
+    # bit1 (not_null) and bit3 (default_is_expr) may be set.
     if tc.getbyte(0) == 14
       cflags, pos = take(buf, pos, 1)
       cf = cflags.getbyte(0)
       raise "reserved flag bit0 set (retired primary_key bit — v5)" if (cf & 0b01) != 0
+      raise "invalid composite column flags (v44)" if (cf & ~0b1010 & 0xff) != 0
 
       tnl, pos = take(buf, pos, 2)
       tname, pos = take(buf, pos, tnl.unpack1("n"))
+      cdefault_expr = nil
+      if (cf & 0b1000) != 0
+        del, pos = take(buf, pos, 2)
+        de, pos = take(buf, pos, del.unpack1("n"))
+        cdefault_expr = de.force_encoding("UTF-8")
+      end
       columns << { name: cname, type: tname, pk: false, not_null: (cf & 0b10) != 0,
                    precision: nil, scale: nil, varchar_len: nil, default: :none,
-                   default_expr: nil, identity: nil, collation: nil, temporal: nil }
+                   default_expr: cdefault_expr, identity: nil, collation: nil, temporal: nil }
       next
     end
     # An array column (v10, type_code 15): flags, then the element-type descriptor

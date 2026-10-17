@@ -936,7 +936,7 @@ function dateTableDB(): Engine {
 function compositeTypeTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)");
-  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr DEFAULT ROW('Elm', 1))");
   run(db, "INSERT INTO t VALUES (1, ROW('Main', 90210))");
   run(db, "INSERT INTO t VALUES (2, ROW('Oak', NULL))");
   return db;

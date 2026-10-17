@@ -978,7 +978,7 @@ pub fn record_out(fields: &[Value]) -> String {
 
 /// [`record_out`] with each field rendered by [`Value::render_zoned`] — a `timestamptz` field in
 /// `zone` when one is given (timezones.md §9.5).
-fn record_out_zoned(
+pub(crate) fn record_out_zoned(
     fields: &[Value],
     zone: Option<&crate::timezone::ZoneRef>,
 ) -> EngineResult<String> {

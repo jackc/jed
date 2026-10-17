@@ -41,8 +41,9 @@ SELECT * FROM person WHERE home = ROW('Main', 90210)
   `f1…fN` over the field types, §5). It is a value and may be a column of a query's own output (a
   derived table, CTE, recursive CTE, or `VALUES` list), alone or as the element of a `record[]`
   (§13). It is **never stored**: no table, view, composite field, or file carries a `record` type,
-  so a `CREATE TABLE … AS` or view column of that type is `42P16`, and it is assigned to a stored
-  composite column only as a named composite.
+  so a `CREATE TABLE … AS` or view column of that type is `42P16`. A `ROW(…)` constructor assigned
+  to a stored composite column (or cast to a named composite) coerces field-by-field to the named
+  type (§8, §12); any other anonymous record is not assignable.
 - **Field types** are any *existing* type — a built-in scalar or a previously-defined composite.
   **Nested composites are supported** (`CREATE TYPE line AS (a addr, b addr)`): every derived
   method recurses. An unknown field type is `42704`. Nesting is bounded to `MAX_COMPOSITE_DEPTH`
@@ -270,10 +271,27 @@ writer's pending catalog under the single-writer staging model (CLAUDE.md §3) �
   cast / typed-literal machinery routes the **string-literal → composite** coercion through
   `record_in`, the same out-of-matrix path as a string-literal → scalar coercion (so
   [../types/casts.toml](../types/casts.toml), which is scalar-only, is unchanged). A bare `NULL`
-  casts to the composite, and a same-named composite operand is the identity cast. Every other
-  text↔composite cast — a **runtime** (non-literal) text expression, a `composite::text`
-  record_out cast, and an anonymous `ROW(…)::type` structural cast — is a documented `0A000`
-  narrowing this slice (relaxable), mirroring the deferred runtime text→scalar casts.
+  casts to the composite, and a same-named composite operand is the identity cast.
+- **Runtime composite casts** (✅, capability `cast.composite`, corpus
+  `suites/cast/composite_casts.test`):
+  - **runtime text → composite** — a non-literal text expression parses through `record_in` per
+    row against the target's field types (`22P02` for a malformed literal or a wrong field count,
+    a field's own input error otherwise);
+  - **composite → text** — `record_out` per row, the text a result cell shows (a `timestamptz`
+    field in the session zone). **Explicit only**, like every cast to text (types.md §5); a
+    `varchar(n)` target truncates the text. An anonymous `ROW(…)` renders the same way;
+  - **`ROW(…)::type`** — an anonymous `ROW(…)` or bare `(a, b, …)` *constructor* cast to a named
+    composite casts each field **explicitly** to its field type (its `numeric(p,s)` / `varchar(n)`
+    modifier applied; a nested `ROW(…)` cast one level down) — PostgreSQL's
+    `coerce_record_to_complex` under the explicit context. The field count must match.
+
+  Both runtime casts are STABLE when the composite type holds a `timestamptz` (it reads the session
+  zone) and immutable otherwise, the array cast's rule. A field-count mismatch, an uncastable field,
+  an anonymous record that is not a constructor (a derived column, a subquery), a different named
+  composite, and a composite → scalar cast are **`42846`** cannot_coerce, as in PostgreSQL (jed's
+  `42804` convention for an unconvertible scalar pair, types.md §9, does not extend to composite
+  casts). Each cast node is one `operator_eval`; `composite → text` is a growth kernel charged
+  for its output and one `timezone` unit per rendered instant, like `array → text` (cost.md §8.1).
 
 ## 9. Cost
 
@@ -313,7 +331,7 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
 | Unknown field type in `CREATE TYPE` | `42704` undefined_object |
 | Field access on a non-composite base | `42809` wrong_object_type |
 | Unknown field name (`(addr).nope`) | `42703` undefined_column |
-| Wrong field count / type in `ROW(…)` vs a composite target | `42804` datatype_mismatch |
+| Wrong field count / type in `ROW(…)` vs a composite target; a non-constructor anonymous record assigned or cast to a composite; a composite cast to a different composite or a scalar | `42846` cannot_coerce |
 | Malformed composite text literal | `22P02` invalid_text_representation |
 | `DROP TYPE … RESTRICT` with dependents | `2BP01` dependent_objects_still_exist |
 | `DROP TYPE` of a missing type (no `IF EXISTS`) | `42704` undefined_object |
@@ -386,9 +404,10 @@ Still deferred `0A000` on the key axis: an **array-of-composite** field as a key
 **FK** pairing (which needs composite same-type FK resolution).
 
 **`INSERT … SELECT` into a composite column** takes a source column of the same composite type or an
-untyped `NULL` (an anonymous `ROW(…)` column is `0A000`, any other type `42804` — the rule an `INSERT …
-VALUES` expression already follows, [grammar.md](grammar.md) §24; `CREATE TABLE … AS` fills its
-composite columns through it, [create-table-as.md](create-table-as.md) §3).
+untyped `NULL`; any other type is `42804`, except an anonymous `ROW(…)` column, which is `42846`
+as in PostgreSQL — a projected record is a source column, not a constructor whose fields could
+coerce — [grammar.md](grammar.md) §24; `CREATE TABLE … AS` fills its composite columns through
+it, [create-table-as.md](create-table-as.md) §3.
 
 **Assigning a composite column.** A bare `NULL` adapts to a composite column as its whole-value
 NULL, and a bare string literal adapts through `record_in` (§8) — the unknown-literal-adapts-to-context
@@ -402,15 +421,34 @@ type is `42804`. A bare **`DEFAULT NULL`** on a composite (or array/range) colum
 same as no default — PostgreSQL stores no default for a NULL constant — so it records nothing (no
 catalog bytes) and `jed_columns.column_default` is NULL.
 
-**Still narrowed (relaxed in a later slice):** an anonymous `ROW(…)` *expression* assigned by
-`UPDATE`/`DO UPDATE` (or as a non-literal-field `INSERT … VALUES` slot) is `0A000` — the
-anonymous-record → named-composite assignment coercion; a non-NULL `DEFAULT` on a composite column is
-`0A000`;
-the runtime (non-literal) text→composite
-cast, the `composite::text` cast, the anonymous `ROW(…)::type` structural cast, and the nested
-`ROW(ROW(…),…)`-into-column constructor (a jed extension PG rejects — covered by unit tests, not the
-PG-oracle corpus) are each `0A000` / jed-only. Composite **value** comparison (`WHERE c = ROW(…)`),
-ORDER BY, DISTINCT, and GROUP BY all landed in S5.
+**Assigning a `ROW(…)` expression** (✅, capability `types.composite_row_assign`, corpus
+`suites/dml/composite_row_assign.test`). A `ROW(…)` or bare `(a, b, …)` constructor whose fields are
+general expressions — an `INSERT … VALUES` slot, an `UPDATE SET` or `DO UPDATE SET` right-hand side,
+a `DEFAULT` — coerces **field-by-field** to the column's named composite by the **assignment** rule
+(PostgreSQL's record → composite coercion): each field resolves with its field type as the literal
+hint and must be assignable to it, by the scalar column rule for a scalar field and by this
+container rule for a container field — so a **nested `ROW(ROW(…), …)`** coerces one level down into
+a nested composite field, beside a bare `NULL` or a `record_in` string for that field. The values are
+coerced when stored (an integer range-checked `22003`, a decimal rounded to its field's scale,
+`store_composite`). The field count must match the type's. A field-count mismatch, an unassignable
+field, and an anonymous record that is **not** a constructor (a `CASE` over rows, a scalar subquery
+returning a row) are `42846` cannot_coerce "cannot cast type record to addr", as in PostgreSQL.
+The constructor is an ordinary `Row` node of the named type, so the cost is the
+unchanged per-node `operator_eval`.
+
+**A non-NULL `DEFAULT` on a composite column** (✅, capability `ddl.composite_default`, corpus
+`suites/ddl/composite_default.test`, `format_version` 44). A composite column's default is always an
+**expression default** ([constraints.md](constraints.md) §2), even a bare string literal: a
+`ROW(…)` (the assignment coercion above), a `record_in` string, or any same-typed expression without
+a column reference, validated at `CREATE TABLE` / `ALTER TABLE ADD COLUMN` / `ALTER COLUMN SET
+DEFAULT` (a malformed literal `22P02`, a field-count mismatch `42846`, a non-composite expression `42804`,
+a column reference `0A000`) and evaluated per applied row — an omitted column, a `DEFAULT` slot,
+`UPDATE SET col = DEFAULT`, and the existing rows an `ADD COLUMN` fills. The catalog persists its
+token text on the composite column entry (flags bit3 + the text after the type name,
+[../fileformat/format.md](../fileformat/format.md)); `jed_columns.column_default` shows that text.
+
+Composite **value** comparison (`WHERE c = ROW(…)`), ORDER BY, DISTINCT, and GROUP BY all landed in
+S5.
 
 ## 13. Anonymous record columns (✅ landed)
 

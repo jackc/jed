@@ -1,0 +1,221 @@
+# Assigning a ROW(...) expression to a composite column (spec/design/composite.md §12): a ROW(...)
+# (or bare (a, b, ...)) constructor whose fields are general expressions coerces field-by-field to
+# the column's composite type by the assignment rule — in an INSERT ... VALUES slot (one-row and
+# multi-row), an UPDATE SET, an ON CONFLICT DO UPDATE SET, and RETURNING sees the stored values. A
+# nested ROW(ROW(...), ...) coerces one level down into a nested composite field, beside a bare NULL
+# or a record_in string literal for that field. The field count must match, and each field must be
+# assignable to its field type (the scalar column rule); an anonymous record that is not a ROW
+# constructor (a CASE over rows, a scalar subquery, an INSERT ... SELECT column) does not coerce.
+# Those rejections are 42846 cannot_coerce, as in PostgreSQL. Type names
+# avoid PostgreSQL's built-in geometric types. Oracle-checked against PostgreSQL 18. Format:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_values_expr, dml.insert_select, dml.insert_on_conflict, dml.update, dml.returning, query.select, query.order_by, query.subquery_scalar, types.i32, types.text, types.decimal, types.composite, types.composite_bare_row, types.composite_row_assign, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a addr)
+
+# --- INSERT ... VALUES: expression fields -----------------------------------------------------------
+
+statement ok
+INSERT INTO t VALUES (1, ROW('Main', 90000 + 210))
+
+statement ok
+INSERT INTO t VALUES (2, ROW('M' || 'x', 5))
+
+statement ok
+INSERT INTO t VALUES (3, ROW(NULL, NULL))
+
+# The bare row constructor is the same ROW(...).
+statement ok
+INSERT INTO t VALUES (4, (upper('elm'), 4 * 2))
+
+# A scalar subquery as a field.
+statement ok
+INSERT INTO t VALUES (5, ROW('max', (SELECT max(id) FROM t)))
+
+# A multi-row VALUES mixing expression rows with a literal-field ROW and a NULL.
+statement ok
+INSERT INTO t VALUES (6, ROW('six', 6)), (7, ROW('se' || 'ven', 6 + 1)), (8, NULL)
+
+query TT nosort
+INSERT INTO t VALUES (9, ROW(lower('NINE'), 3 * 3)) RETURNING a, (a).street
+----
+(nine,9)
+nine
+
+query ITTI nosort
+SELECT id, a, (a).street, (a).zip FROM t ORDER BY id
+----
+1
+(Main,90210)
+Main
+90210
+2
+(Mx,5)
+Mx
+5
+3
+(,)
+NULL
+NULL
+4
+(ELM,8)
+ELM
+8
+5
+(max,4)
+max
+4
+6
+(six,6)
+six
+6
+7
+(seven,7)
+seven
+7
+8
+NULL
+NULL
+NULL
+9
+(nine,9)
+nine
+9
+
+# --- UPDATE SET and ON CONFLICT DO UPDATE SET ------------------------------------------------------
+
+statement ok
+UPDATE t SET a = ROW('U', id * 10) WHERE id = 1
+
+statement ok
+UPDATE t SET a = ROW((a).street || '!', (a).zip + 1) WHERE id = 2
+
+statement ok
+INSERT INTO t VALUES (3, ROW('c', 7)) ON CONFLICT (id) DO UPDATE SET a = ROW((excluded.a).street, (excluded.a).zip * 2)
+
+query TT nosort
+UPDATE t SET a = (initcap((a).street), (a).zip - 1) WHERE id = 4 RETURNING a, (a).street
+----
+(Elm,7)
+Elm
+
+query IT nosort
+SELECT id, a FROM t WHERE id <= 4 ORDER BY id
+----
+1
+(U,10)
+2
+(Mx!,6)
+3
+(c,14)
+4
+(Elm,7)
+
+# --- assignment coercion of each field --------------------------------------------------------------
+
+# An integer field is range-checked when the row is stored.
+statement error 22003
+INSERT INTO t VALUES (20, ROW('big', 3000000000 + 0))
+
+statement error 22003
+UPDATE t SET a = ROW('big', 3000000000 + 0) WHERE id = 1
+
+# A decimal field rounds to its scale; an integer widens to it.
+statement ok
+CREATE TYPE price AS (amt decimal(6,2), cur text)
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, v price)
+
+statement ok
+INSERT INTO p VALUES (1, ROW(1 + 0.005, 'usd')), (2, ROW(1 + 1, upper('eur')))
+
+query IT nosort
+SELECT id, v FROM p ORDER BY id
+----
+1
+(1.01,usd)
+2
+(2.00,EUR)
+
+# --- rejections ------------------------------------------------------------------------------------
+
+# Too many and too few fields.
+statement error 42846
+INSERT INTO t VALUES (20, ROW('a', 1 + 1, 3))
+
+statement error 42846
+INSERT INTO t VALUES (20, ROW('a' || 'b'))
+
+statement error 42846
+UPDATE t SET a = ROW('a', 1, 2 + 0) WHERE id = 1
+
+# A field of a type not assignable to its field type.
+statement error 42846
+INSERT INTO t VALUES (20, ROW('a', 'x' || 'y'))
+
+statement error 42846
+UPDATE t SET a = ROW('a', 'x'::text) WHERE id = 1
+
+# An anonymous record that is not a ROW constructor.
+statement error 42846
+INSERT INTO t VALUES (20, CASE WHEN true THEN ROW('c', 20) ELSE ROW('d', 21) END)
+
+statement error 42846
+INSERT INTO t VALUES (20, (SELECT ROW('a', 1)))
+
+statement error 42846
+UPDATE t SET a = (SELECT ROW('a', 1)) WHERE id = 1
+
+statement error 42846
+INSERT INTO t SELECT 20, ROW('sel', 20)
+
+# --- a nested ROW(ROW(...), ...) into a nested composite field --------------------------------------
+
+statement ok
+CREATE TYPE leg AS (a addr, b addr)
+
+statement ok
+CREATE TABLE l (id i32 PRIMARY KEY, v leg)
+
+statement ok
+INSERT INTO l VALUES (1, ROW(ROW('x', 1), ROW('y', 2)))
+
+statement ok
+INSERT INTO l VALUES (2, ROW(ROW('x', 1 + 1), NULL))
+
+statement ok
+INSERT INTO l VALUES (3, ROW('(x,1)', '(y,2)'))
+
+statement ok
+INSERT INTO l VALUES (4, ROW(ROW(upper('q'), 4), '(r,5)'))
+
+statement ok
+UPDATE l SET v = ROW(ROW('z', id), (v).a) WHERE id = 1
+
+query IT nosort
+SELECT id, v FROM l ORDER BY id
+----
+1
+("(z,1)","(x,1)")
+2
+("(x,2)",)
+3
+("(x,1)","(y,2)")
+4
+("(Q,4)","(r,5)")
+
+query T nosort
+SELECT ((v).b).street FROM l WHERE id = 4
+----
+r
+
+statement error 42846
+INSERT INTO l VALUES (5, ROW(ROW('x', 1, 3), NULL))
+
+statement error 42846
+INSERT INTO l VALUES (5, ROW(1 + 0, NULL))
