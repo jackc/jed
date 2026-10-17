@@ -1533,6 +1533,8 @@ mod registry_tests {
                         | "json"
                         | "boolean"
                         | "array_of_input"
+                        | "text"
+                        | "bytea"
                 ),
                 "aggregate {} has unhandled result code {}",
                 a.name,
@@ -1544,15 +1546,25 @@ mod registry_tests {
             if a.arg == "star" {
                 assert!(aggregate_has_star(&lname), "{} star overload", a.surface);
             } else {
-                let probe = match a.arg_families.first().copied() {
-                    Some("integer") => ResolvedType::Int(ScalarType::Int32),
-                    Some("decimal") => ResolvedType::Decimal,
-                    Some("float") => ResolvedType::Float(ScalarType::Float64),
-                    Some("boolean") => ResolvedType::Bool,
+                let probe_of = |fam: &str| match fam {
+                    "integer" => ResolvedType::Int(ScalarType::Int32),
+                    "decimal" => ResolvedType::Decimal,
+                    "float" => ResolvedType::Float(ScalarType::Float64),
+                    "boolean" => ResolvedType::Bool,
+                    "text" => ResolvedType::Text,
+                    "bytea" => ResolvedType::Bytea,
                     _ => ResolvedType::Int(ScalarType::Int32), // "any"
                 };
-                let found = lookup_aggregate_overload(&lname, &probe)
-                    .expect("expr overload resolves for its declared family");
+                let probe = probe_of(a.arg_families[0]);
+                let found = if a.arg_families.len() > 1 {
+                    // A multi-argument aggregate (aggregates.md §23) resolves through the selector.
+                    let tys: Vec<ResolvedType> =
+                        a.arg_families.iter().map(|f| probe_of(f)).collect();
+                    select_aggregate_overload(&lname, &tys, None).ok().flatten()
+                } else {
+                    lookup_aggregate_overload(&lname, &probe)
+                }
+                .expect("expr overload resolves for its declared family");
                 // And its plan/result selection is total (panics via unreachable! otherwise).
                 let _ = aggregate_plan(&lname, found.result, &probe);
             }

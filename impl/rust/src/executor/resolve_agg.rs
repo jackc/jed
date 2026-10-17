@@ -532,7 +532,7 @@ pub(crate) fn select_scalar_overload(
 /// Whether a bare string literal can be read as a value of a slot's family: the families whose input
 /// the literal resolver converts (`resolve_node`'s `Literal::Text` arm), plus `text` itself and the
 /// unconstrained `any`. The numeric and boolean families are not among them.
-fn literal_adapts(slot: &str) -> bool {
+pub(crate) fn literal_adapts(slot: &str) -> bool {
     matches!(
         slot,
         "any"
@@ -1433,6 +1433,102 @@ pub(crate) fn lookup_aggregate_overload(
     })
 }
 
+/// Resolve the arguments of a multi-argument aggregate call in `sub` (aggregates are forbidden in
+/// them) and select its catalog overload (aggregates.md §23). The overload must match every
+/// argument's family; failing that, an untyped NULL or a bare string literal is unknown-typed and
+/// adopts its slot's family (the scalar functions' rule, functions.md §9.1): `string_agg(b, ',')`
+/// reads `','` as bytea when `b` is. An unknown argument is then re-resolved with that family's type.
+pub(crate) fn resolve_agg_args(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    sub: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(Vec<RExpr>, Vec<ResolvedType>, &'static AggregateDesc)> {
+    let mut rargs = Vec::with_capacity(args.len());
+    let mut tys = Vec::with_capacity(args.len());
+    for a in args {
+        if expr_has_window(a) {
+            return Err(EngineError::new(
+                SqlState::GroupingError,
+                "aggregate function calls cannot contain window function calls",
+            ));
+        }
+        let (r, t) = resolve(scope, a, None, sub, params)?;
+        rargs.push(r);
+        tys.push(t);
+    }
+    let literals = bare_string_literals(args);
+    let mut desc = select_aggregate_overload(name, &tys, None)?;
+    if desc.is_none() && literals.is_some() {
+        desc = select_aggregate_overload(name, &tys, literals.as_deref())?;
+    }
+    let desc = desc.ok_or_else(|| no_agg_overload(name))?;
+    for (i, t) in tys.iter_mut().enumerate() {
+        let literal = literals.as_ref().is_some_and(|l| l[i]);
+        if !matches!(t, ResolvedType::Null) && !literal {
+            continue;
+        }
+        let Some(st) = family_param_type(desc.arg_families[i]) else {
+            continue;
+        };
+        if literal || matches!(args[i], Expr::Param(_)) {
+            let (r, rt) = resolve(scope, &args[i], Some(st), sub, params)?;
+            rargs[i] = r;
+            *t = rt;
+        } else {
+            *t = resolved_type_of(st);
+        }
+    }
+    Ok((rargs, tys, desc))
+}
+
+/// Pick a multi-argument aggregate's overload. With `literals` `None` only an untyped NULL is
+/// unknown (it matches any slot); otherwise a marked bare string literal is unknown too, matching
+/// the slots [`literal_adapts`] admits. Several candidates are narrowed as for a scalar function: at
+/// each unknown position text wins, else the family every candidate shares; any other disagreement
+/// is 42725.
+pub(crate) fn select_aggregate_overload(
+    name: &str,
+    tys: &[ResolvedType],
+    literals: Option<&[bool]>,
+) -> Result<Option<&'static AggregateDesc>> {
+    let unknown = |i: usize| matches!(tys[i], ResolvedType::Null) || literals.is_some_and(|l| l[i]);
+    let candidates: Vec<&'static AggregateDesc> = AGGREGATES
+        .iter()
+        .filter(|a| {
+            surface_matches(a.surface, name)
+                && a.arg == "expr"
+                && a.arg_families.len() == tys.len()
+                && a.arg_families.iter().enumerate().all(|(j, slot)| {
+                    if literals.is_some_and(|l| l[j]) {
+                        literal_adapts(slot)
+                    } else {
+                        matches!(tys[j], ResolvedType::Null) || family_matches(slot, &tys[j])
+                    }
+                })
+        })
+        .collect();
+    if candidates.len() <= 1 {
+        return Ok(candidates.first().copied());
+    }
+    let mut kept = candidates;
+    for i in (0..tys.len()).filter(|&i| unknown(i)) {
+        if kept.iter().any(|a| a.arg_families[i] == "text") {
+            kept.retain(|a| a.arg_families[i] == "text");
+        } else if kept
+            .iter()
+            .any(|a| a.arg_families[i] != kept[0].arg_families[i])
+        {
+            return Err(ambiguous_func_overload(name));
+        }
+    }
+    if kept.len() != 1 {
+        return Err(ambiguous_func_overload(name));
+    }
+    Ok(Some(kept[0]))
+}
+
 /// Reject an untyped NULL operand of an aggregate whose result type is derived from it (array_agg —
 /// aggregates.md §23). PostgreSQL's 42725: array_agg has an element and an array overload, and an
 /// unknown argument matches both.
@@ -1482,6 +1578,8 @@ pub(crate) fn aggregate_plan(
         ("bit_and", "same_as_input") => (AggPlan::Bit(BitOp::And), t.clone()),
         ("bit_or", "same_as_input") => (AggPlan::Bit(BitOp::Or), t.clone()),
         ("bit_xor", "same_as_input") => (AggPlan::Bit(BitOp::Xor), t.clone()),
+        ("string_agg", "text") => (AggPlan::StringAgg, ResolvedType::Text),
+        ("string_agg", "bytea") => (AggPlan::StringAgg, ResolvedType::Bytea),
         // An array input stacks into one more dimension of the same (dimension-agnostic) array type.
         ("array_agg", "array_of_input") => match t {
             ResolvedType::Array(_) => (AggPlan::ArrayAgg { nested: true }, t.clone()),
@@ -1638,6 +1736,17 @@ pub(crate) fn resolve_aggregate(
             ResolvedType::Int(ScalarType::Int64),
             Vec::new(),
         )
+    } else if args.len() >= 2 {
+        // A multi-argument aggregate (string_agg — aggregates.md §23): its arguments travel as one
+        // Row operand, which the fold splits back out.
+        let (rargs, tys, desc) = resolve_agg_args(scope, name, args, &mut sub, params)?;
+        let (plan, result) = aggregate_plan(name, desc.result, &tys[0]);
+        if distinct {
+            for t in &tys {
+                reject_json_distinct(t)?;
+            }
+        }
+        (plan, Some(RExpr::Row(rargs)), result, Vec::new())
     } else {
         // One operand, resolved in a fresh Forbidden sub-context. The registry validates the
         // (surface, operand-family) overload exists (else 42883) and yields its result code; the
@@ -1669,7 +1778,11 @@ pub(crate) fn resolve_aggregate(
     // The in-aggregate ORDER BY (aggregates.md §22) — resolved after the overload, like PG.
     let order = match agg_order {
         Some(keys) => {
-            let arg_nodes: Vec<&RExpr> = operand.iter().collect();
+            // A multi-argument aggregate's argument nodes are its Row operand's fields.
+            let arg_nodes: Vec<&RExpr> = match &operand {
+                Some(RExpr::Row(fields)) if args.len() >= 2 => fields.iter().collect(),
+                _ => operand.iter().collect(),
+            };
             Some(resolve_agg_order(
                 scope, keys, distinct, args, &arg_nodes, params,
             )?)
@@ -2592,6 +2705,12 @@ pub(crate) fn resolve_window_call(
                 ));
             }
             (AggPlan::CountStar, ResolvedType::Int(ScalarType::Int64))
+        } else if args.len() >= 2 {
+            // A multi-argument aggregate's arguments travel as one Row operand (aggregates.md §23).
+            let (rargs, tys, desc) = resolve_agg_args(scope, &lname, args, &mut sub, params)?;
+            let (plan, result) = aggregate_plan(&lname, desc.result, &tys[0]);
+            wargs.push(RExpr::Row(rargs));
+            (plan, result)
         } else {
             let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
             let desc =

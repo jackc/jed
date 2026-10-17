@@ -1039,6 +1039,16 @@ impl Engine {
                     _ => unreachable!(),
                 })
             }
+            Acc::StringAgg { seen, .. } => {
+                if !seen {
+                    return Ok(Value::Null);
+                }
+                let mut rows = Vec::new();
+                while let Some(row) = values.next()? {
+                    rows.push(row);
+                }
+                Ok(super::aggregate::finalize_string_agg(rows))
+            }
             Acc::ArrayAgg { seen, nested, .. } => {
                 if !seen {
                     return Ok(Value::Null);
@@ -1186,6 +1196,11 @@ fn fold_spilled_value(
                 collections.push(owner, vec![elem])?;
             }
         }
+        Acc::StringAgg { rows, .. } => {
+            for row in rows.drain(..) {
+                collections.push(owner, row)?;
+            }
+        }
         Acc::OrderedSet { vals, floats, .. } => {
             for value in vals.drain(..) {
                 collections.push(owner, vec![value])?;
@@ -1241,7 +1256,9 @@ fn pack_acc(acc: Acc) -> Row {
             }
             row
         }
-        Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => vec![Value::Bool(seen)],
+        Acc::JsonAgg { seen, .. }
+        | Acc::JsonObjectAgg { seen, .. }
+        | Acc::StringAgg { seen, .. } => vec![Value::Bool(seen)],
         Acc::OrderedSet { .. } | Acc::Hypothetical { .. } | Acc::Ordered { .. } => Vec::new(),
     }
 }
@@ -1320,7 +1337,9 @@ fn unpack_acc(spec: &AggSpec, state: Row, zone: &crate::timezone::ZoneRef) -> Ac
                 *shape = Some((dims, lbounds));
             }
         }
-        Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => *seen = flag(0),
+        Acc::JsonAgg { seen, .. }
+        | Acc::JsonObjectAgg { seen, .. }
+        | Acc::StringAgg { seen, .. } => *seen = flag(0),
         Acc::OrderedSet { .. } | Acc::Hypothetical { .. } | Acc::Ordered { .. } => {}
     }
     acc

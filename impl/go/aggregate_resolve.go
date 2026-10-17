@@ -71,12 +71,29 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		ag.specs = append(ag.specs, aggSpec{plan: objPlan, operand: operand, distinct: fc.Distinct, filter: filter, order: order, jsonTypes: []resolvedType{kt, vt}})
 		return &rExpr{kind: reColumn, index: slot}, result, nil
 	}
+	var argNodes []*rExpr
 	if fc.Star {
 		// Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
 		if !aggregateHasStar(name) {
 			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		plan, operand, result = planCountStar, nil, resolvedType{kind: rtInt, intTy: scalarInt64}
+	} else if len(fc.Args) >= 2 {
+		// A multi-argument aggregate (string_agg — aggregates.md §23): its arguments travel as one Row
+		// operand, which the fold splits back out.
+		args, tys, desc, err := resolveAggArgs(s, fc, sub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		plan, result = aggregatePlan(name, desc.Result, tys[0])
+		operand, argNodes = &rExpr{kind: reRow, sargs: args}, args
+		if fc.Distinct {
+			for _, t := range tys {
+				if err := rejectJSONDistinct(t); err != nil {
+					return nil, resolvedType{}, err
+				}
+			}
+		}
 	} else {
 		// One operand, resolved in a fresh Forbidden sub-context. The registry validates the
 		// (surface, operand-family) overload exists (else 42883) and yields its result code; the
@@ -116,8 +133,7 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	// The in-aggregate ORDER BY (aggregates.md §22) — resolved after the overload, like PG.
 	var order *aggOrder
 	if fc.AggOrder != nil {
-		var argNodes []*rExpr
-		if operand != nil {
+		if argNodes == nil && operand != nil {
 			argNodes = []*rExpr{operand}
 		}
 		var err error
@@ -752,6 +768,14 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 			}
 			wagg = planCountStar
 			result = resolvedType{kind: rtInt, intTy: scalarInt64}
+		} else if len(fc.Args) >= 2 {
+			// A multi-argument aggregate's arguments travel as one Row operand (aggregates.md §23).
+			args, tys, desc, err := resolveAggArgs(s, fc, sub, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			wagg, result = aggregatePlan(name, desc.Result, tys[0])
+			wargs = append(wargs, &rExpr{kind: reRow, sargs: args})
 		} else {
 			// One operand, resolved in a fresh Forbidden sub-context (no aggregate/window nesting
 			// in a window aggregate's argument). The registry validates the (surface, operand-family)
@@ -1158,6 +1182,127 @@ func aggArg(fc *funcCallExpr) (exprNode, error) {
 			hinted(hintFunctionNoMatch)
 	}
 	return *fc.Args[0], nil
+}
+
+// resolveAggArgs resolves the arguments of a multi-argument aggregate call in sub (aggregates are
+// forbidden in them) and selects its catalog overload (aggregates.md §23). The overload must match
+// every argument's family; failing that, an untyped NULL or a bare string literal is unknown-typed and
+// adopts its slot's family (the scalar functions' rule, functions.md §9.1): string_agg(b, ',') reads
+// ',' as bytea when b is. An unknown argument is then re-resolved with that family's type.
+func resolveAggArgs(s *scope, fc *funcCallExpr, sub *aggCtx, params *paramTypes) ([]*rExpr, []resolvedType, *aggregateDesc, error) {
+	name := fc.Name
+	args := make([]*rExpr, len(fc.Args))
+	tys := make([]resolvedType, len(fc.Args))
+	for i, a := range fc.Args {
+		if exprHasWindow(*a) {
+			return nil, nil, nil, newError(GroupingError, "aggregate function calls cannot contain window function calls")
+		}
+		r, t, err := resolve(s, *a, nil, sub, params)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		args[i], tys[i] = r, t
+	}
+	literals := bareStringLiterals(fc.Args)
+	desc, err := selectAggregateOverload(name, tys, nil)
+	if err == nil && desc == nil && literals != nil {
+		desc, err = selectAggregateOverload(name, tys, literals)
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if desc == nil {
+		return nil, nil, nil, noAggOverload(name)
+	}
+	for i := range tys {
+		literal := literals != nil && literals[i]
+		if tys[i].kind != rtNull && !literal {
+			continue
+		}
+		st, ok := familyParamType(desc.ArgFamilies[i])
+		if !ok {
+			continue
+		}
+		if fc.Args[i].Kind == exprParam || literal {
+			r, t, err := resolve(s, *fc.Args[i], &st, sub, params)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			args[i], tys[i] = r, t
+		} else {
+			tys[i] = resolvedTypeOf(st)
+		}
+	}
+	return args, tys, desc, nil
+}
+
+// selectAggregateOverload picks a multi-argument aggregate's overload. With literals nil only an
+// untyped NULL is unknown (it matches any slot); otherwise a marked bare string literal is unknown
+// too, matching the slots literalAdapts admits. Several candidates are narrowed as for a scalar
+// function: at each unknown position text wins, else the family every candidate shares; any other
+// disagreement is 42725.
+func selectAggregateOverload(name string, tys []resolvedType, literals []bool) (*aggregateDesc, error) {
+	var candidates []*aggregateDesc
+	for i := range aggregates {
+		a := &aggregates[i]
+		if !surfaceMatches(a.Surface, name) || a.Arg != "expr" || len(a.ArgFamilies) != len(tys) {
+			continue
+		}
+		match := true
+		for j, slot := range a.ArgFamilies {
+			switch {
+			case literals != nil && literals[j]:
+				match = literalAdapts(slot)
+			case tys[j].kind == rtNull:
+			default:
+				match = familyMatches(slot, tys[j])
+			}
+			if !match {
+				break
+			}
+		}
+		if match {
+			candidates = append(candidates, a)
+		}
+	}
+	if len(candidates) <= 1 {
+		if len(candidates) == 0 {
+			return nil, nil
+		}
+		return candidates[0], nil
+	}
+	kept := candidates
+	for i := range tys {
+		if tys[i].kind != rtNull && !(literals != nil && literals[i]) {
+			continue
+		}
+		pick, agree := "", true
+		for _, a := range kept {
+			if a.ArgFamilies[i] == "text" {
+				pick = "text"
+			}
+			if a.ArgFamilies[i] != kept[0].ArgFamilies[i] {
+				agree = false
+			}
+		}
+		if pick == "" {
+			if !agree {
+				return nil, ambiguousFuncOverload(name)
+			}
+			continue
+		}
+		var next []*aggregateDesc
+		for _, a := range kept {
+			if a.ArgFamilies[i] == pick {
+				next = append(next, a)
+			}
+		}
+		kept = next
+	}
+	if len(kept) != 1 {
+		return nil, ambiguousFuncOverload(name)
+	}
+	return kept[0], nil
 }
 
 // checkPolymorphicAggOperand rejects an untyped NULL operand of an aggregate whose result type is

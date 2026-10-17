@@ -736,6 +736,15 @@ count is `42883`. Unless noted, NULL inputs are skipped and an empty or all-NULL
 `aggregate_accumulate` per passing row — plus any per-aggregate charge stated below. Finalization is
 unmetered.
 
+**Multi-argument aggregates.** A catalog row with several `arg_families` slots takes that many
+arguments. Its overload must match every argument's family; failing that, an untyped `NULL` or a bare
+string literal is unknown-typed and adopts its slot's family — the scalar functions' rule
+([functions.md](functions.md) §9.1), so `string_agg(b, ',')` reads `','` as `bytea` when `b` is, and
+where several overloads remain, `text` wins at an unknown position (any other tie is `42725`). The
+arguments travel to the fold as one row, built like `ROW(…)`: one `operator_eval` per input row, as
+for `json_object_agg`. `DISTINCT` de-duplicates the whole argument tuple, and under `DISTINCT` each
+in-aggregate `ORDER BY` key must be one of the arguments (§22).
+
 | Aggregate | Argument | Result | Value |
 |---|---|---|---|
 | `bool_and(x)` | `boolean` | `boolean` | TRUE iff every non-NULL input is TRUE |
@@ -745,6 +754,7 @@ unmetered.
 | `bit_or(x)` | `i16`/`i32`/`i64` | the input type | the bitwise OR of the non-NULL inputs |
 | `bit_xor(x)` | `i16`/`i32`/`i64` | the input type | the bitwise XOR of the non-NULL inputs |
 | `array_agg(x)` | any | `T[]`, or the input array type | the inputs, NULLs included, as an array |
+| `string_agg(x, d)` | `text, text` / `bytea, bytea` | `text` / `bytea` | the non-NULL values joined by the delimiters |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -776,3 +786,14 @@ deterministic in jed, unspecified in PostgreSQL — and `DISTINCT` keeps each va
 operator state (`value_bytes(argument)` each, [memory.md](memory.md) §6.3); on the bounded-spill lane
 its inputs are retained aggregate rows `[value]` and its packed state is `[bool seen]`, or over array
 inputs `[bool seen, int ndim, (int length, int lower bound) per dimension of the first input]`.
+
+**`string_agg`.** `string_agg(value, delimiter)` joins its non-NULL values in fold order: the first
+value alone, then each later value preceded by **its own row's** delimiter (PostgreSQL
+`string_agg_transfn`) — so a row's delimiter is used only when its value is non-NULL and some earlier
+value was, and a NULL delimiter adds nothing. The result is NULL when no value is non-NULL (an empty
+string value still counts). The two arguments share a family — `(text, text) → text` or
+`(bytea, bytea) → bytea`; a mixed or other pair is `42883`. Like `array_agg` it is
+**order-sensitive**: the in-aggregate `ORDER BY` fixes its result. It retains the
+`[value, delimiter]` of every row with a non-NULL value as query-memory operator state
+(`value_bytes(value) + value_bytes(delimiter)`); on the bounded-spill lane those are its retained
+aggregate rows and its packed state is `[bool seen]`.

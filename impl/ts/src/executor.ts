@@ -32242,6 +32242,9 @@ export type AggPlan =
   | "bitXor" // bit_xor(x) — the bitwise XOR of the non-NULL integer inputs
   | "arrayAgg" // array_agg(x) — the inputs, NULLs included, as a 1-D array (aggregates.md §23)
   | "arrayAggArray" // array_agg(x) over an array input — stacked into one more dimension
+  // string_agg(value, delimiter) — the non-NULL values joined, each after the first preceded by its
+  // own row's delimiter (aggregates.md §23). The operand is a 2-field Row(value, delimiter).
+  | "stringAgg"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32516,6 +32519,9 @@ export type Acc = {
   // marks the group non-empty). Over array inputs, `cur` holds the first input, whose shape every
   // later input must match.
   arrElems: Value[];
+  // For the string_agg plan (aggregates.md §23): the [value, delimiter] of every row with a non-NULL
+  // value, in fold order (`seen` marks that one was folded).
+  strRows: Value[][];
   jsonAsJson: boolean;
   jsonStrict: boolean;
   // For the "jsonObjectAgg" plan (B4): the (key text, value image) pairs in row order (the image as
@@ -32578,6 +32584,7 @@ export function newAcc(
     floatWidth,
     jsonElems: [],
     arrElems: [],
+    strRows: [],
     jsonAsJson,
     jsonStrict,
     jsonPairs: [],
@@ -32694,6 +32701,32 @@ export function finalizeArrayAgg(plan: AggPlan, elems: Value[]): Value {
   };
 }
 
+// finalizeStringAgg joins string_agg's non-NULL values in fold order (aggregates.md §23): the first
+// value alone, each later one preceded by its own row's delimiter (none when the delimiter is NULL).
+// The result is bytea over bytea values, else text.
+export function finalizeStringAgg(rows: Value[][]): Value {
+  if (rows[0]![0]!.kind === "bytea") {
+    const parts: Uint8Array[] = [];
+    rows.forEach((r, i) => {
+      if (i > 0 && r[1]!.kind === "bytea") parts.push(r[1]!.bytes);
+      parts.push((r[0]! as { bytes: Uint8Array }).bytes);
+    });
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) {
+      out.set(p, at);
+      at += p.length;
+    }
+    return byteaValue(out);
+  }
+  let s = "";
+  rows.forEach((r, i) => {
+    if (i > 0 && r[1]!.kind === "text") s += r[1]!.text;
+    s += (r[0]! as { text: string }).text;
+  });
+  return textValue(s);
+}
+
 // cloneAcc deep-copies a running accumulator so the window stage can SNAPSHOT it at each peer-group
 // boundary and finalize the snapshot without consuming the running fold (spec/design/window.md §6;
 // the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values) and the float fold
@@ -32706,6 +32739,7 @@ export function cloneAcc(a: Acc): Acc {
     ...a,
     jsonElems: a.jsonElems.slice(),
     arrElems: a.arrElems.slice(),
+    strRows: a.strRows.slice(),
     jsonPairs: a.jsonPairs.slice(),
     osaVals: a.osaVals ? a.osaVals.slice() : undefined,
     osaFloats: a.osaFloats ? a.osaFloats.slice() : undefined,
@@ -32806,6 +32840,15 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
         }
       }
       break;
+    case "stringAgg": {
+      // A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
+      const fields = (v as { fields: Value[] }).fields;
+      if (fields[0]!.kind !== "null") {
+        a.seen = true;
+        a.strRows.push(fields);
+      }
+      break;
+    }
     case "arrayAgg":
     case "arrayAggArray":
       if (a.plan === "arrayAggArray") checkArrayAggInput(a, v);
@@ -32893,6 +32936,10 @@ export function accRetainedBytes(a: Acc, v: Value): number {
     case "arrayAgg":
     case "arrayAggArray":
       return valueBytes(v);
+    case "stringAgg": {
+      const fields = (v as { fields: Value[] }).fields;
+      return fields[0]!.kind === "null" ? 0 : keyBytes(fields);
+    }
     default:
       return 0;
   }
@@ -32968,6 +33015,8 @@ export function finalizeAcc(a: Acc): Value {
     case "arrayAgg":
     case "arrayAggArray":
       return a.seen ? finalizeArrayAgg(a.plan, a.arrElems) : nullValue();
+    case "stringAgg":
+      return a.seen ? finalizeStringAgg(a.strRows) : nullValue();
     case "jsonAgg": {
       // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array (json:
       // PG's ", "-joined element texts; jsonb: the canonical array).
@@ -34360,6 +34409,8 @@ export function resolveAggregate(
   // The B4 json[b]_agg flags (asJson / strict) and operand type, set for the "jsonAgg" plan only.
   let jsonFlags: JsonAggFlags | undefined;
   let jsonTypes: ResolvedType[] | undefined;
+  // A multi-argument aggregate's argument nodes (its Row operand's fields), for the ORDER BY check.
+  let argNodes: RExpr[] | null = null;
   if (e.star) {
     // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
     if (!aggregateHasStar(name))
@@ -34367,6 +34418,14 @@ export function resolveAggregate(
     plan = "countStar";
     operand = null;
     result = { kind: "int", ty: "i64" };
+  } else if (e.args.length >= 2) {
+    // A multi-argument aggregate (string_agg — aggregates.md §23): its arguments travel as one Row
+    // operand, which the fold splits back out.
+    const r = resolveAggArgs(scope, name, e.args, sub, params);
+    [plan, result, floatWidth, jsonFlags] = aggregatePlan(name, r.desc.result, r.tys[0]!);
+    operand = { kind: "row", fields: r.nodes };
+    argNodes = r.nodes;
+    if (e.distinct) for (const ty of r.tys) rejectJsonDistinct(ty);
   } else {
     // One operand, resolved in a fresh Forbidden sub-context. The registry validates the (surface,
     // operand-family) overload exists (else 42883) and yields its result code; the plan + result
@@ -34403,7 +34462,7 @@ export function resolveAggregate(
           e.aggOrder,
           e.distinct,
           e.args,
-          operand !== null ? [operand] : [],
+          argNodes ?? (operand !== null ? [operand] : []),
           params,
         )
       : null;
@@ -35075,6 +35134,11 @@ export function resolveWindowCall(
         throw engineError("syntax_error", "* is only valid as the argument of COUNT");
       aggPlan = "countStar";
       result = { kind: "int", ty: "i64" };
+    } else if (e.args.length >= 2) {
+      // A multi-argument aggregate's arguments travel as one Row operand (aggregates.md §23).
+      const r = resolveAggArgs(scope, lname, e.args, sub, params);
+      [aggPlan, result, aggFloatWidth, aggJsonFlags] = aggregatePlan(lname, r.desc.result, r.tys[0]!);
+      wargs.push({ kind: "row", fields: r.nodes });
     } else {
       // One operand, resolved in a fresh Forbidden sub-context (no aggregate/window nesting in a
       // window argument). The registry validates the (surface, operand-family) overload (else 42883).
@@ -35653,6 +35717,83 @@ export function lookupAggregateOverload(
 // widening — aggregates.md §3). The plan is the aggregate's kernel id (fold/finalize switch on it);
 // selecting it from the registered result code keeps the name gate + overload validation
 // data-driven while the kernel stays hand-written (§5). surface is the (folded) call name.
+// resolveAggArgs resolves the arguments of a multi-argument aggregate call in sub (aggregates are
+// forbidden in them) and selects its catalog overload (aggregates.md §23). The overload must match
+// every argument's family; failing that, an untyped NULL or a bare string literal is unknown-typed and
+// adopts its slot's family (the scalar functions' rule, functions.md §9.1): string_agg(b, ',') reads
+// ',' as bytea when b is. An unknown argument is then re-resolved with that family's type.
+function resolveAggArgs(
+  scope: Scope,
+  name: string,
+  args: Expr[],
+  sub: AggCtx,
+  params: ParamTypes,
+): { nodes: RExpr[]; tys: ResolvedType[]; desc: AggregateDesc } {
+  const nodes: RExpr[] = [];
+  const tys: ResolvedType[] = [];
+  for (const a of args) {
+    if (exprHasWindow(a))
+      throw engineError(
+        "grouping_error",
+        "aggregate function calls cannot contain window function calls",
+      );
+    const r = resolve(scope, a, null, sub, params);
+    nodes.push(r.node);
+    tys.push(r.type);
+  }
+  const literals = bareStringLiterals(args);
+  let desc = selectAggregateOverload(name, tys, null);
+  if (desc === undefined && literals !== null) desc = selectAggregateOverload(name, tys, literals);
+  if (desc === undefined) throw noAggOverload(name);
+  for (let i = 0; i < tys.length; i++) {
+    const literal = literals !== null && literals[i]!;
+    if (tys[i]!.kind !== "null" && !literal) continue;
+    const st = familyParamType(desc.argFamilies[i]!);
+    if (st === null) continue;
+    if (literal || args[i]!.kind === "param") {
+      const r = resolve(scope, args[i]!, st, sub, params);
+      nodes[i] = r.node;
+      tys[i] = r.type;
+    } else tys[i] = resolvedTypeOf(st);
+  }
+  return { nodes, tys, desc };
+}
+
+// selectAggregateOverload picks a multi-argument aggregate's overload. With literals null only an
+// untyped NULL is unknown (it matches any slot); otherwise a marked bare string literal is unknown
+// too, matching the LITERAL_FAMILIES slots. Several candidates are narrowed as for a scalar function:
+// at each unknown position text wins, else the family every candidate shares; any other disagreement
+// is 42725.
+export function selectAggregateOverload(
+  name: string,
+  tys: ResolvedType[],
+  literals: boolean[] | null,
+): AggregateDesc | undefined {
+  const literal = (i: number): boolean => literals !== null && literals[i]!;
+  const unknown = (i: number): boolean => tys[i]!.kind === "null" || literal(i);
+  let kept = AGGREGATES.filter(
+    (a) =>
+      a.surface.toLowerCase() === name &&
+      a.arg === "expr" &&
+      a.argFamilies.length === tys.length &&
+      a.argFamilies.every((slot, i) =>
+        literal(i)
+          ? LITERAL_FAMILIES.has(slot)
+          : tys[i]!.kind === "null" || familyMatches(slot, tys[i]!),
+      ),
+  );
+  if (kept.length <= 1) return kept[0];
+  for (let i = 0; i < tys.length; i++) {
+    if (!unknown(i)) continue;
+    if (kept.some((a) => a.argFamilies[i] === "text"))
+      kept = kept.filter((a) => a.argFamilies[i] === "text");
+    else if (kept.some((a) => a.argFamilies[i] !== kept[0]!.argFamilies[i]))
+      throw ambiguousFuncOverload(name);
+  }
+  if (kept.length !== 1) throw ambiguousFuncOverload(name);
+  return kept[0];
+}
+
 // checkPolymorphicAggOperand rejects an untyped NULL operand of an aggregate whose result type is
 // derived from it (array_agg — aggregates.md §23). PostgreSQL's 42725: array_agg has an element and
 // an array overload, and an unknown argument matches both.
@@ -35691,6 +35832,9 @@ export function aggregatePlan(
   if (surface === "bit_or" && code === "same_as_input") return ["bitOr", t, undefined];
   if (surface === "bit_xor" && code === "same_as_input") return ["bitXor", t, undefined];
   // An array input stacks into one more dimension of the same (dimension-agnostic) array type.
+  if (surface === "string_agg" && code === "text") return ["stringAgg", { kind: "text" }, undefined];
+  if (surface === "string_agg" && code === "bytea")
+    return ["stringAgg", { kind: "bytea" }, undefined];
   if (surface === "array_agg" && code === "array_of_input")
     return t.kind === "array"
       ? ["arrayAggArray", t, undefined]
@@ -37339,6 +37483,7 @@ function packedStateBytes(accs: Acc[]): number {
         n += valueBytes(a.cur ?? nullValue());
         break;
       case "arrayAgg":
+      case "stringAgg":
         n += MEMORY_VALUE;
         break;
       case "arrayAggArray":
@@ -37380,6 +37525,14 @@ function foldBlockingCollection(
     if (a.plan === "arrayAggArray") checkArrayAggInput(a, value);
     a.seen = true;
     collections.append(key, [value]);
+    return true;
+  }
+  if (a.plan === "stringAgg") {
+    const fields = (value as { fields: Value[] }).fields;
+    if (fields[0]!.kind !== "null") {
+      a.seen = true;
+      collections.append(key, fields);
+    }
     return true;
   }
   if (a.plan === "jsonAgg" || a.plan === "jsonObjectAgg") {
@@ -37505,6 +37658,12 @@ function finalizeBlockingCollection(
       default:
         throw new Error("hypothetical aggregate plan required");
     }
+  }
+  if (a.plan === "stringAgg") {
+    if (!a.seen) return nullValue();
+    const rows: Value[][] = [];
+    for (const row of collections.get(key)) rows.push(row);
+    return finalizeStringAgg(rows);
   }
   if (a.plan === "arrayAgg" || a.plan === "arrayAggArray") {
     if (!a.seen) return nullValue();

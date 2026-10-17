@@ -2323,14 +2323,14 @@ Rules for both classes:
   covered renderer. `regexp_split_to_array` and `regexp_split_to_table` are the same
   case: their pieces partition the subject, so their text never exceeds it, and the
   array adds at most one element header per character.
-- Aggregates (`json_agg`, `jsonb_object_agg`, …): each input came from a charged
-  row, and the retained inputs are Q2 operator state ([memory.md](memory.md) §6).
+- Aggregates (`json_agg`, `jsonb_object_agg`, `array_agg`, `string_agg`, …): each input came from a
+  charged row, and the retained inputs are Q2 operator state ([memory.md](memory.md) §6).
 - Set-returning functions: each row they produce charges `generated_row`. The
   exception is `regexp_matches`, whose rows are capture arrays (above).
 - Host functions: outside the engine's guarantees (CLAUDE.md §13).
 
-**Follow-ons.** New constructing kernels (`concat`, `format`,
-`string_agg`, `array_fill`) join this table when they land. Path evaluation
+**Follow-ons.** New constructing kernels (`concat`, `format`, `array_fill`) join this table when
+they land. Path evaluation
 inside jsonpath (`jsonb_path_query`, `@?`, `JSON_QUERY`) is metered separately by the
 `jsonpath_compile` and `jsonpath_step` units ([jsonpath.md](jsonpath.md) §7). The S2
 charge on `jsonb_path_query_array` covers only the collected result.

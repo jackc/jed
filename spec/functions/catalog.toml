@@ -5598,9 +5598,9 @@ errors         = ["22023", "22004", "0A000"]
 # surface       SQL spelling, uppercase canonical (COUNT/SUM/MIN/MAX/AVG); a bare spelling folds
 #               to the lowercase name, a quoted one must be exactly lowercase — aggregate names
 #               are not reserved (grammar.md §3).
-# arg           "star" = the COUNT(*) no-expression row counter; "expr" = one general
-#               expression argument. (DISTINCT inside an aggregate is deferred — 42601.)
-# arg_families  required family of the expression argument ("any" = unconstrained).
+# arg           "star" = the COUNT(*) no-expression row counter; "expr" = general expression
+#               arguments, one per arg_families slot (string_agg takes two).
+# arg_families  required family of each expression argument ("any" = unconstrained).
 #               Omitted for arg = "star". SUM/AVG take a numeric family (integer/decimal —
 #               one row per family); COUNT(expr)/MIN/MAX take "any".
 # result        a scalar id (i64, decimal) OR a reserved widening id — "sum_widen"
@@ -5787,6 +5787,31 @@ surface      = "bit_xor"
 arg          = "expr"
 arg_families = ["integer"]
 result       = "same_as_input"
+null         = "aggregate"
+errors       = []
+
+# string_agg(value, delimiter) -> text / bytea (aggregates.md §23): the non-NULL values joined in fold
+# order, each after the first preceded by its own row's delimiter (a NULL delimiter adds nothing); NULL
+# when no value is non-NULL. The two arguments share a family: (text, text) or (bytea, bytea). A bare
+# string-literal delimiter adapts to the value's family. Order-sensitive (the in-aggregate ORDER BY
+# fixes it).
+[[aggregate]]
+name         = "string_agg"
+kind         = "aggregate"
+surface      = "string_agg"
+arg          = "expr"
+arg_families = ["text", "text"]
+result       = "text"
+null         = "aggregate"
+errors       = []
+
+[[aggregate]]
+name         = "string_agg"
+kind         = "aggregate"
+surface      = "string_agg"
+arg          = "expr"
+arg_families = ["bytea", "bytea"]
+result       = "bytea"
 null         = "aggregate"
 errors       = []
 

@@ -1,0 +1,129 @@
+# Aggregate string_agg(value, delimiter) -> text | bytea (spec/design/aggregates.md §23): the non-NULL
+# values joined in fold order, each after the first preceded by its own row's delimiter (a NULL
+# delimiter adds nothing). NULL when no value is non-NULL. The fold order is the input order, so these
+# records fix it with the in-aggregate ORDER BY or a source ordered by its primary key. Output name
+# `string_agg`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.aggregate_order_by, query.window_aggregate, types.i32, types.text, types.bytea, resource.cost_metering, func.string_agg
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, s text, d text, b bytea)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 'pear', '-', '\x01'), (2, 1, NULL, '+', NULL), (3, 1, 'fig', NULL, '\x0203'), (4, 2, 'kiwi', '*', '\x'), (5, 2, 'fig', '/', '\xff')
+
+# The arguments travel as one row: 5 rows read + 1 leaf page read + 5 row packs + 5 accumulated
+# + 1 produced.
+# names: string_agg
+# cost: 17
+query T nosort
+SELECT string_agg(s, ', ' ORDER BY id) FROM t
+----
+pear, fig, kiwi, fig
+
+# Each value after the first is preceded by its own row's delimiter; NULL values are skipped, and a
+# NULL delimiter adds nothing.
+# names: string_agg
+query T nosort
+SELECT string_agg(s, d ORDER BY id) FROM t
+----
+pearfig*kiwi/fig
+
+# names: string_agg
+query T nosort
+SELECT string_agg(s, NULL ORDER BY id) FROM t
+----
+pearfigkiwifig
+
+# names: g, string_agg
+query IT rowsort
+SELECT g, string_agg(s, ',' ORDER BY s) FROM t GROUP BY g
+----
+1
+fig,pear
+2
+fig,kiwi
+
+# No non-NULL value: NULL. An empty group: NULL.
+# names: string_agg
+query T nosort
+SELECT string_agg(s, ',') FROM t WHERE s IS NULL
+----
+NULL
+
+# names: string_agg
+query T nosort
+SELECT string_agg(s, ',') FROM t WHERE g = 9
+----
+NULL
+
+# An empty string value still counts.
+# names: string_agg
+query T nosort
+SELECT string_agg('', ',') FROM t
+----
+,,,,
+
+# names: string_agg
+query T nosort
+SELECT string_agg(DISTINCT s, ',' ORDER BY s) FROM t
+----
+fig,kiwi,pear
+
+# names: string_agg
+query T nosort
+SELECT string_agg(s, ',' ORDER BY id) FILTER (WHERE g = 2) FROM t
+----
+kiwi,fig
+
+# Unordered, over a primary-key-ordered source.
+# names: string_agg
+query T nosort
+SELECT string_agg(upper(s), '|') FROM t
+----
+PEAR|FIG|KIWI|FIG
+
+# bytea values with a bytea delimiter; a string-literal delimiter is read as bytea.
+# names: string_agg
+query T nosort
+SELECT string_agg(b, '\x00' ORDER BY id) FROM t
+----
+\x010002030000ff
+
+# names: string_agg
+query T nosort
+SELECT string_agg(b, NULL ORDER BY id) FROM t
+----
+\x010203ff
+
+# As a window function: a running join over id order.
+# names: id, string_agg
+query IT nosort
+SELECT id, string_agg(s, ',') OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+pear
+2
+pear
+3
+pear,fig
+4
+pear,fig,kiwi
+5
+pear,fig,kiwi,fig
+
+# An untyped NULL value and delimiter resolve to text.
+# names: string_agg
+query T nosort
+SELECT string_agg(NULL, NULL) FROM t
+----
+NULL
+
+# The two arguments must share a family.
+statement error 42883
+SELECT string_agg(s, b) FROM t
+
+statement error 42883
+SELECT string_agg(id, ',') FROM t
+
+statement error 42883
+SELECT string_agg(s) FROM t
