@@ -52,6 +52,7 @@ sql_statement  ::= create_table
                  | alter_table
                  | create_index
                  | drop_index
+                 | reindex
                  | create_sequence
                  | alter_sequence
                  | drop_sequence
@@ -356,6 +357,20 @@ index_element  ::= column_ref                    /* a bare column name */
                  | "(" expr ")"                  /* any parenthesized expression; "(col)" normalizes to a column key */
 using_clause   ::= "USING" identifier
 drop_index     ::= "DROP" "INDEX" identifier
+
+/* REINDEX rebuilds secondary indexes in place from their stored definitions (../design/indexes.md
+ * §10, ../design/grammar.md §59). REINDEX and every word after it are recognized POSITIONALLY and are
+ * not reserved. The positional CONCURRENTLY is taken for INDEX/TABLE only when a name follows it, so a
+ * relation named "concurrently" stays nameable. reindex_option is an option name (VERBOSE,
+ * CONCURRENTLY, or TABLESPACE — the last is 0A000) with an optional boolean value; an unknown name or
+ * a non-boolean value is 42601, and a repeated option is accepted (the last wins). "SCHEMA" in the
+ * kind position is 0A000 (jed has no schemas). */
+reindex        ::= "REINDEX" reindex_options? ( ( "INDEX" | "TABLE" ) "CONCURRENTLY"? qualified_table
+                                              | ( "DATABASE" | "SYSTEM" ) "CONCURRENTLY"? identifier? )
+reindex_options ::= "(" reindex_option ( "," reindex_option )* ")"
+reindex_option ::= ( "VERBOSE" | "CONCURRENTLY" ) reindex_boolean?
+                 | "TABLESPACE" identifier
+reindex_boolean ::= "TRUE" | "FALSE" | "ON" | "OFF" | string | integer   /* a string must spell a boolean word; an integer must be 0 or 1 */
 
 /* CREATE SEQUENCE declares a named, persisted i64 generator (../design/sequences.md). The
  * options may appear in any order, each at most once (a repeat is 42601). "INCREMENT" and

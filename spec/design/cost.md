@@ -660,7 +660,9 @@ the **table's** full node count + `storage_row_read` per row (the build's touche
 indexed columns — is fixed-width, so its chain/decompress terms are structurally zero); an
 empty table charges 0. `CREATE UNIQUE INDEX` charges **exactly the same** — its duplicate
 verification (indexes.md §8) is unmetered validation, like the uniqueness probes below.
-`DROP INDEX` charges 0 (a pure catalog edit, like DROP TABLE). Index **maintenance** at
+`DROP INDEX` charges 0 (a pure catalog edit, like DROP TABLE). `REINDEX` charges, for each index it
+rebuilds, exactly that index's `CREATE INDEX` build scan, summed in target order; a target with no
+index charges 0 (indexes.md §10). Index **maintenance** at
 INSERT/UPDATE/DELETE is unmetered ("What is NOT metered" below).
 `CREATE TABLE … AS` charges exactly what `INSERT INTO t <query>` charges for its fill — the query's
 accrued cost, storing unmetered (grammar.md §24) — and `WITH NO DATA` charges 0
@@ -1682,8 +1684,8 @@ evaluation. It deliberately does **not** meter:
 - **Secondary-index maintenance** — computing and writing/removing index entries at
   INSERT/UPDATE/DELETE is phase-2 write work (it evaluates nothing and cannot fail), so it
   is unmetered like the row writes themselves. The *build* scan of `CREATE INDEX` over
-  existing rows **is** metered (the index-bounded-scan subsection above); `DROP INDEX`
-  charges 0.
+  existing rows **is** metered (the index-bounded-scan subsection above), and so is the same build
+  scan when `REINDEX` rebuilds an index; `DROP INDEX` charges 0.
 - **Uniqueness validation** — the primary-key duplicate check and the unique-index probes
   (indexes.md §8) at INSERT/UPDATE, and `CREATE UNIQUE INDEX`'s build verification, are
   constraint validation like NOT NULL (a branch, not expression evaluation): unmetered. An

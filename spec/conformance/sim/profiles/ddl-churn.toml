@@ -1,7 +1,7 @@
 # Schema churn: tables, indexes, columns, and sequences created and dropped, so the catalog chain
 # grows and is rewritten under faults (simulation-testing.md §9).
 
-description = "CREATE/DROP/ALTER of tables, indexes, columns, and sequences"
+description = "CREATE/DROP/ALTER of tables, indexes, columns, and sequences; REINDEX"
 
 max_tables = 5
 
@@ -13,3 +13,4 @@ drop_index = 4
 add_column = 4
 sequence = 3
 analyze = 2
+reindex = 3

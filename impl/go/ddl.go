@@ -206,6 +206,8 @@ func stmtKind(stmt statement) string {
 		return "CREATE INDEX"
 	case stmt.DropIndex != nil:
 		return "DROP INDEX"
+	case stmt.Reindex != nil:
+		return "REINDEX"
 	case stmt.CreateType != nil:
 		return "CREATE TYPE"
 	case stmt.DropType != nil:
@@ -324,6 +326,11 @@ func (db *engine) dispatchStmtBodyCached(stmt statement, params []Value, ic *ins
 			return outcome{}, err
 		}
 		return db.executeDropIndex(stmt.DropIndex)
+	case stmt.Reindex != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return outcome{}, err
+		}
+		return db.executeReindex(stmt.Reindex)
 	case stmt.CreateType != nil:
 		if err := rejectParamsForDDL(params); err != nil {
 			return outcome{}, err
@@ -3645,9 +3652,6 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	if err := db.ensureCollationsWritable(columns); err != nil {
 		return outcome{}, err
 	}
-	// Per-column frozen collations for the collated text key form (§2.12); nil everywhere for a
-	// C-only / non-text table (the fast path).
-	colls := db.columnCollations(columns)
 	// Resolve the access method (spec/design/gin.md §3): the default / "btree" is the ordered
 	// B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
 	// parser) so the error is the resolve-time undefined_object, after the table-exists check.
@@ -3679,36 +3683,9 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 				return outcome{}, newError(FeatureNotSupported,
 					"an expression key on a "+ci.Using+" index is not supported yet")
 			}
-			// A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
-			// uncorrelated one, so it is rejected here, before resolution).
-			if err := rejectIndexPredicateStructure(*elem.Expr); err != nil {
+			if err := db.admitIndexExpr(table, *elem.Expr, false, &hostDeps, &timezoneDeps); err != nil {
 				return outcome{}, err
 			}
-			// Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02
-			// fall out of the resolver, as for a CHECK).
-			s := indexScope(db, table)
-			pt := &paramTypes{indexContext: true}
-			node, rtype, rerr := resolve(s, *elem.Expr, nil, &aggCtx{collecting: false}, pt)
-			if rerr != nil {
-				return outcome{}, rerr
-			}
-			// Dependencies accumulate at each resolved operation, through every child.
-			if pt.nonimmutable {
-				return outcome{}, newError(InvalidObjectDefinition,
-					"functions in index expression must be marked IMMUTABLE")
-			}
-			// Collect + admit any host functions the key expression calls (§8.1, step 4): each must be
-			// IMMUTABLE + carry a component identity, else 42P17 (this also closes the latent leak where a
-			// volatile host function passed the syntactic immutability walk above).
-			if err := collectIndexHostDeps(node, db.session.env.hosts, &hostDeps); err != nil {
-				return outcome{}, err
-			}
-			// The result type must be key-encodable (a composite result is 0A000).
-			if _, ok := resolvedToKeyType(rtype); !ok {
-				return outcome{}, newError(FeatureNotSupported,
-					"an index on an expression of this result type is not supported yet")
-			}
-			timezoneDeps.merge(pt.timezoneDeps)
 			ciKeys = append(ciKeys, indexKey{Expr: &indexKeyExpr{ExprText: elem.Text, Expr: *elem.Expr}})
 			continue
 		}
@@ -3762,29 +3739,9 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, newError(FeatureNotSupported,
 				"a partial (WHERE) "+ci.Using+" index is not supported yet")
 		}
-		// Structural pre-walk: a subquery is 0A000 and a bind parameter 42P02 (both admitted by the
-		// resolver). The aggregate 42803 / window 42P20 / non-boolean 42804 rejections then fall out of
-		// the Forbidden-context boolean resolve below.
-		if err := rejectIndexPredicateStructure(ci.Predicate.Expr); err != nil {
+		if err := db.admitIndexExpr(table, ci.Predicate.Expr, true, &hostDeps, &timezoneDeps); err != nil {
 			return outcome{}, err
 		}
-		s := indexScope(db, table)
-		pt := &paramTypes{indexContext: true}
-		pnode, err := resolveBooleanFilter(s, &ci.Predicate.Expr, pt)
-		if err != nil {
-			return outcome{}, err
-		}
-		// Dependencies accumulate at each resolved operation, through every child.
-		if pt.nonimmutable {
-			return outcome{}, newError(InvalidObjectDefinition,
-				"functions in index predicate must be marked IMMUTABLE")
-		}
-		// Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as a key
-		// expression (IMMUTABLE + component identity, else 42P17).
-		if err := collectIndexHostDeps(pnode, db.session.env.hosts, &hostDeps); err != nil {
-			return outcome{}, err
-		}
-		timezoneDeps.merge(pt.timezoneDeps)
 		predicate = &indexKeyExpr{ExprText: ci.Predicate.Text, Expr: ci.Predicate.Expr}
 	}
 	// relationExistsScoped checks the namespace of the target scope: an attachment's OWN snapshot for an
@@ -3840,71 +3797,9 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	// against the pre-index store; the writes below are unmetered. An expression key evaluating with
 	// an error aborts the build (nothing is registered — indexes.md §4), preserving all-or-nothing.
 	meter := db.session.newMeter()
-	mask := make([]bool, len(columns))
-	for _, k := range def.Keys {
-		if k.Expr == nil {
-			mask[k.Col] = true
-			continue
-		}
-		for _, c := range checkReferencedColumns(k.Expr.Expr, columns) {
-			mask[c] = true
-		}
-	}
-	// A partial index's predicate is evaluated per row during the build (indexes.md §9), so the
-	// columns it references join the touched set — keeping the build cost deterministic + cross-core.
-	if def.Predicate != nil {
-		for _, c := range checkReferencedColumns(def.Predicate.Expr, columns) {
-			mask[c] = true
-		}
-	}
-	// Resolve the index once (column ordinals + resolved expression keys); the maintenance helpers
-	// build the unmetered eval env for any expression key (index expressions are immutable, so the
-	// rng is never read).
-	rindex, err := db.resolveIndex(table, def)
+	entries, err := db.buildIndexEntries(ci.DB, table, &def, meter)
 	if err != nil {
 		return outcome{}, err
-	}
-	store := db.lkpStoreScoped(ci.DB, ci.Table)
-	stored, nodes, slabs, err := store.ScanWithUnits(mask)
-	if err != nil {
-		return outcome{}, err
-	}
-	meter.Charge(costs.PageRead*int64(nodes) + costs.ValueDecompress*int64(slabs))
-	entries := make([][]byte, 0, len(stored))
-	// A UNIQUE build verifies the existing rows before the index is registered
-	// (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
-	// prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
-	seenPrefixes := make(map[string]bool)
-	for _, e := range stored {
-		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row
-			return outcome{}, err
-		}
-		meter.Charge(costs.StorageRowRead)
-		// The build reads the referenced columns; resolve a faulted row's touched columns before
-		// encoding (an expression key may read a spilled value; the evaluator's Unfetched backstop
-		// also handles it).
-		row, err := store.resolveInlineColumns(e.Row)
-		if err != nil {
-			return outcome{}, err
-		}
-		if def.Unique {
-			prefix, ok, err := db.indexPrefix(store.colTypes, colls, &rindex, row)
-			if err != nil {
-				return outcome{}, err
-			}
-			if ok {
-				if seenPrefixes[string(prefix)] {
-					return outcome{}, newUniqueViolation(ci.Table, def.Name).
-						withDetail(db.indexDetail(table.Name, columns, &def, &rindex, row, detailDuplicated))
-				}
-				seenPrefixes[string(prefix)] = true
-			}
-		}
-		eks, err := db.indexEntries(columns, store.colTypes, colls, &rindex, e.Key, row)
-		if err != nil {
-			return outcome{}, err
-		}
-		entries = append(entries, eks...)
 	}
 	if err := meter.Guard(); err != nil {
 		return outcome{}, err
@@ -3930,11 +3825,6 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		db.working().putIndex(tableKey, def, db.pageSize)
 	}
 	istore := db.writeIndexStoreScoped(ci.DB, nameKey)
-	// Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
-	// so the built tree packs ~full instead of splintering under the storage-key order the
-	// scan produced (random in entry-key space). Part of the byte contract — the sort fixes
-	// the built tree's shape across cores.
-	slices.SortFunc(entries, bytes.Compare)
 	for _, ek := range entries {
 		inserted, err := istore.Insert(ek, nil)
 		if err != nil {
@@ -3945,6 +3835,373 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
+}
+
+// reindexTarget is one table a REINDEX rebuilds indexes of (spec/design/indexes.md §10): its explicit
+// scope ("main" / "temp" / an attachment), its catalog key, and the index names in catalog order.
+type reindexTarget struct {
+	scope    string
+	tableKey string
+	names    []string
+}
+
+// reindexRebuilt is one fully built replacement index, staged until every target is built.
+type reindexRebuilt struct {
+	scope    string
+	tableKey string
+	def      indexDef
+	entries  [][]byte
+}
+
+// executeReindex runs a REINDEX (spec/design/indexes.md §10): rebuild each target index in place from
+// its stored definition, as if it were dropped and created again with the same name, keys, uniqueness,
+// method, and predicate — but in one all-or-nothing statement that keeps the index's catalog position
+// and constraint links. Every key expression and predicate is re-admitted against the handle's current
+// environment, so the rebuilt index records the current host-function identities and timezone data
+// (extensibility.md §8.1, index-dependencies.md). Every new tree is built before any is installed, so a
+// failure (23505, a resolution error, the cost ceiling) changes nothing. Cost: each index charges
+// exactly its CREATE INDEX build scan.
+func (db *engine) executeReindex(rx *reindexStmt) (outcome, error) {
+	targets, err := db.reindexTargets(rx)
+	if err != nil {
+		return outcome{}, err
+	}
+	meter := db.session.newMeter()
+	var rebuilt []reindexRebuilt
+	for _, tg := range targets {
+		if len(tg.names) == 0 {
+			continue
+		}
+		scope := tg.scope
+		if err := db.checkAttachmentWritable(&scope); err != nil {
+			return outcome{}, err
+		}
+		table, ok := db.snapForScope(scope).table(tg.tableKey)
+		if !ok {
+			panic("a REINDEX target table resolved above")
+		}
+		if err := db.ensureCollationsWritable(table.Columns); err != nil {
+			return outcome{}, err
+		}
+		for _, name := range tg.names {
+			var old *indexDef
+			for i := range table.Indexes {
+				if table.Indexes[i].Name == name {
+					old = &table.Indexes[i]
+					break
+				}
+			}
+			if old == nil {
+				panic("a REINDEX target index belongs to its table")
+			}
+			def, err := db.readmitIndexDef(table, old)
+			if err != nil {
+				return outcome{}, err
+			}
+			entries, err := db.buildIndexEntries(&scope, table, &def, meter)
+			if err != nil {
+				return outcome{}, err
+			}
+			rebuilt = append(rebuilt, reindexRebuilt{scope: scope, tableKey: tg.tableKey, def: def, entries: entries})
+		}
+	}
+	if err := meter.Guard(); err != nil {
+		return outcome{}, err
+	}
+	for _, rb := range rebuilt {
+		nameKey := rb.def.Name
+		var snap *snapshot
+		var pageSize uint32
+		switch rb.scope {
+		case "temp":
+			db.session.tx.tempDirty = true
+			snap, pageSize = db.session.tx.tempWorking, db.pageSize
+		case "main":
+			snap, pageSize = db.working(), db.pageSize
+		default:
+			snap = db.attachWriteSnap(rb.scope)
+			snap.storePaging = db.core.attachment(rb.scope).storage.paging
+			pageSize = db.attachPageSize(rb.scope) // the attachment's own page space (§2)
+		}
+		// putIndex inserts by name order, so the rebuilt definition keeps its catalog position.
+		snap.removeIndex(rb.tableKey, nameKey)
+		snap.putIndex(rb.tableKey, rb.def, pageSize)
+		scope := rb.scope
+		istore := db.writeIndexStoreScoped(&scope, nameKey)
+		for _, ek := range rb.entries {
+			inserted, err := istore.Insert(ek, nil)
+			if err != nil {
+				return outcome{}, err
+			}
+			if !inserted {
+				return outcome{}, newError(DataCorrupted, "index entry keys are unique (storage-key suffix)")
+			}
+		}
+	}
+	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
+}
+
+// readmitIndexDef re-admits a stored index definition for REINDEX (spec/design/indexes.md §10): an
+// unparsed key or predicate is XX003 (unparsable-definitions.md §3.4); every expression is resolved
+// again and its host-function and timezone dependencies re-collected from the current environment
+// exactly as CREATE INDEX collects them (a missing function 42883, a no-longer-admissible one 42P17, an
+// unloaded named zone 22023). Column keys, uniqueness, method, and predicate text carry over.
+func (db *engine) readmitIndexDef(table *catTable, old *indexDef) (indexDef, error) {
+	if old.unparsed() {
+		return indexDef{}, unparsableIndexError(table.Name, old.Name)
+	}
+	var hostDeps []hostFuncDep
+	var timezoneDeps timeZoneDeps
+	for _, k := range old.Keys {
+		if k.Expr != nil {
+			if err := db.admitIndexExpr(table, k.Expr.Expr, false, &hostDeps, &timezoneDeps); err != nil {
+				return indexDef{}, err
+			}
+		}
+	}
+	if old.Predicate != nil {
+		if err := db.admitIndexExpr(table, old.Predicate.Expr, true, &hostDeps, &timezoneDeps); err != nil {
+			return indexDef{}, err
+		}
+	}
+	sortHostDeps(hostDeps)
+	if err := timezoneDeps.validate(); err != nil {
+		return indexDef{}, err
+	}
+	def := *old
+	def.HostDeps = hostDeps
+	def.TimezoneDeps = timezoneDeps
+	return def, nil
+}
+
+// reindexTargets resolves a REINDEX's targets (spec/design/indexes.md §10), each scope explicit (main /
+// temp / an attachment) and each table's indexes in catalog (name byte) order. INDEX names one index
+// (42P01 when no relation has the name, 42809 when it is not an index); TABLE names one table (42809
+// for a catalog relation, an index, a view, or a sequence; 42P01 when missing); DATABASE takes every
+// table of the named database in name byte order — main (the default) followed by the session's
+// temporary tables, or one attachment; SYSTEM has no system catalogs to rebuild. Any other database
+// name is 0A000, as PostgreSQL.
+func (db *engine) reindexTargets(rx *reindexStmt) ([]reindexTarget, error) {
+	indexNames := func(t *catTable) []string {
+		names := make([]string, len(t.Indexes))
+		for i, ix := range t.Indexes {
+			names[i] = ix.Name
+		}
+		return names
+	}
+	switch rx.Kind {
+	case reindexIndex, reindexTable:
+		name := rx.Name
+		if rx.Kind == reindexTable {
+			if err := checkCatalogRelWrite(name); err != nil {
+				return nil, err
+			}
+		}
+		var scope string
+		switch {
+		case rx.DB != nil:
+			scope = *rx.DB
+			if scope != "main" && scope != "temp" && db.attachReadSnap(scope) == nil {
+				return nil, newError(UndefinedTable, `database "`+scope+`" is not attached`)
+			}
+		// The resolution walk: a name in the session's temporary domain (a table, an index, or an owned
+		// sequence — preclude-overlaps keeps it in one scope), else main.
+		case db.isTempTable(name) || db.isTempIndex(name) || db.isTempSequence(name):
+			scope = "temp"
+		default:
+			scope = "main"
+		}
+		snap := db.snapForScope(scope)
+		shown := name
+		if rx.DB != nil {
+			shown = *rx.DB + "." + name
+		}
+		if rx.Kind == reindexIndex {
+			if tableKey, _, ok := snap.findIndex(name); ok {
+				return []reindexTarget{{scope: scope, tableKey: tableKey, names: []string{name}}}, nil
+			}
+		} else if t, ok := snap.table(name); ok {
+			return []reindexTarget{{scope: scope, tableKey: t.Name, names: indexNames(t)}}, nil
+		}
+		_, isTable := snap.table(name)
+		_, _, isIndex := snap.findIndex(name)
+		otherKind := isTable || isIndex || snap.view(name) != nil || snap.sequence(name) != nil ||
+			(rx.Kind == reindexIndex && isCatalogRelName(name))
+		if otherKind {
+			what := "a table or materialized view"
+			if rx.Kind == reindexIndex {
+				what = "an index"
+			}
+			return nil, newError(WrongObjectType, `"`+shown+`" is not `+what)
+		}
+		return nil, newError(UndefinedTable, `relation "`+shown+`" does not exist`)
+	default: // DATABASE / SYSTEM
+		if rx.Kind == reindexSystem && rx.Concurrently {
+			return nil, newError(FeatureNotSupported, "cannot reindex system catalogs concurrently")
+		}
+		scope := "main"
+		if rx.HasName {
+			scope = rx.Name
+			if scope != "main" && (scope == "temp" || db.attachReadSnap(scope) == nil) {
+				return nil, newError(FeatureNotSupported, "can only reindex the currently open database")
+			}
+		}
+		if rx.Kind == reindexSystem {
+			return nil, nil
+		}
+		scopes := []string{scope}
+		if scope == "main" {
+			scopes = append(scopes, "temp")
+		}
+		var out []reindexTarget
+		for _, sc := range scopes {
+			for _, t := range db.snapForScope(sc).tablesSorted() {
+				out = append(out, reindexTarget{scope: sc, tableKey: t.Name, names: indexNames(t)})
+			}
+		}
+		return out, nil
+	}
+}
+
+// admitIndexExpr resolves one index key expression (predicate false) or partial-index predicate
+// (predicate true) against table and admits it for a persisted index (spec/design/indexes.md
+// §1/§2/§9): a subquery is 0A000 and a bind parameter 42P02 (structural pre-walk); an aggregate 42803 /
+// window 42P20 / non-boolean predicate 42804 fall out of the resolver; a non-immutable operation is
+// 42P17; a key's result type must be key-encodable (0A000). The host-function and timezone
+// dependencies it reaches accumulate into hostDeps / tz (extensibility.md §8.1, index-dependencies.md).
+// Shared by CREATE INDEX and REINDEX (§10), which re-admits every stored expression against the
+// current environment.
+func (db *engine) admitIndexExpr(table *catTable, expr exprNode, predicate bool, hostDeps *[]hostFuncDep, tz *timeZoneDeps) error {
+	// A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
+	// uncorrelated one, so it is rejected here, before resolution).
+	if err := rejectIndexPredicateStructure(expr); err != nil {
+		return err
+	}
+	s := indexScope(db, table)
+	pt := &paramTypes{indexContext: true}
+	var node *rExpr
+	if predicate {
+		pnode, err := resolveBooleanFilter(s, &expr, pt)
+		if err != nil {
+			return err
+		}
+		// Dependencies accumulate at each resolved operation, through every child.
+		if pt.nonimmutable {
+			return newError(InvalidObjectDefinition, "functions in index predicate must be marked IMMUTABLE")
+		}
+		node = pnode
+	} else {
+		// Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02 fall
+		// out of the resolver, as for a CHECK).
+		knode, rtype, err := resolve(s, expr, nil, &aggCtx{collecting: false}, pt)
+		if err != nil {
+			return err
+		}
+		if pt.nonimmutable {
+			return newError(InvalidObjectDefinition, "functions in index expression must be marked IMMUTABLE")
+		}
+		// The result type must be key-encodable (a composite result is 0A000).
+		if _, ok := resolvedToKeyType(rtype); !ok {
+			return newError(FeatureNotSupported, "an index on an expression of this result type is not supported yet")
+		}
+		node = knode
+	}
+	// Collect + admit any host functions the expression calls (§8.1, step 4): each must be IMMUTABLE +
+	// carry a component identity, else 42P17 (this also closes the latent leak where a volatile host
+	// function passed the syntactic immutability walk).
+	if err := collectIndexHostDeps(node, db.session.env.hosts, hostDeps); err != nil {
+		return err
+	}
+	tz.merge(pt.timezoneDeps)
+	return nil
+}
+
+// buildIndexEntries computes a new index's entry keys from table's current rows (the CREATE INDEX
+// build, shared with REINDEX — spec/design/indexes.md §2/§10), sorted by entry key. The build scan is
+// metered on meter (cost.md §3): page_read per table-tree node + storage_row_read per row, over the
+// touched set of columns the keys and predicate read (a spilled value adds its value_decompress
+// slabs). A UNIQUE definition verifies the rows (23505, indexes.md §8). An expression key evaluating
+// with an error aborts the build, so nothing is registered. A nil scope keeps the bare temp-first
+// funnel.
+func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDef, meter *costMeter) ([][]byte, error) {
+	columns := table.Columns
+	// Per-column frozen collations for the collated text key form (§2.12); nil everywhere for a
+	// C-only / non-text table (the fast path).
+	colls := db.columnCollations(columns)
+	mask := make([]bool, len(columns))
+	for _, k := range def.Keys {
+		if k.Expr == nil {
+			mask[k.Col] = true
+			continue
+		}
+		for _, c := range checkReferencedColumns(k.Expr.Expr, columns) {
+			mask[c] = true
+		}
+	}
+	// A partial index's predicate is evaluated per row during the build (indexes.md §9), so the
+	// columns it references join the touched set — keeping the build cost deterministic + cross-core.
+	if def.Predicate != nil {
+		for _, c := range checkReferencedColumns(def.Predicate.Expr, columns) {
+			mask[c] = true
+		}
+	}
+	// Resolve the index once (column ordinals + resolved expression keys); the maintenance helpers
+	// build the unmetered eval env for any expression key (index expressions are immutable, so the
+	// rng is never read).
+	rindex, err := db.resolveIndex(table, *def)
+	if err != nil {
+		return nil, err
+	}
+	store := db.lkpStoreScoped(scope, table.Name)
+	stored, nodes, slabs, err := store.ScanWithUnits(mask)
+	if err != nil {
+		return nil, err
+	}
+	meter.Charge(costs.PageRead*int64(nodes) + costs.ValueDecompress*int64(slabs))
+	entries := make([][]byte, 0, len(stored))
+	// A UNIQUE build verifies the existing rows before the index is registered
+	// (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
+	// prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
+	seenPrefixes := make(map[string]bool)
+	for _, e := range stored {
+		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row
+			return nil, err
+		}
+		meter.Charge(costs.StorageRowRead)
+		// The build reads the referenced columns; resolve a faulted row's touched columns before
+		// encoding (an expression key may read a spilled value; the evaluator's Unfetched backstop
+		// also handles it).
+		row, err := store.resolveInlineColumns(e.Row)
+		if err != nil {
+			return nil, err
+		}
+		if def.Unique {
+			prefix, ok, err := db.indexPrefix(store.colTypes, colls, &rindex, row)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				if seenPrefixes[string(prefix)] {
+					return nil, newUniqueViolation(table.Name, def.Name).
+						withDetail(db.indexDetail(table.Name, columns, def, &rindex, row, detailDuplicated))
+				}
+				seenPrefixes[string(prefix)] = true
+			}
+		}
+		eks, err := db.indexEntries(columns, store.colTypes, colls, &rindex, e.Key, row)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, eks...)
+	}
+	if err := meter.Guard(); err != nil {
+		return nil, err
+	}
+	// Sorted by entry key (indexes.md §1): every insert is then a right-edge append, so the built tree
+	// packs ~full instead of splintering under the storage-key order the scan produced (random in
+	// entry-key space). Part of the byte contract — the sort fixes the built tree's shape across cores.
+	slices.SortFunc(entries, bytes.Compare)
+	return entries, nil
 }
 
 // executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is

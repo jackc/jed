@@ -115,6 +115,56 @@ func TestIndexTimezoneLifetime(t *testing.T) {
 	}
 }
 
+// REINDEX (spec/design/indexes.md §10) is the one-statement form of the transactional DROP/CREATE
+// rebuild: it re-pins the named zone to the loaded data, a rolled-back REINDEX leaves the stale pin, and
+// the rebuilt UNIQUE partial index enforces again.
+func TestIndexTimezoneReindexRepins(t *testing.T) {
+	image, err := buildZoneIndex(t).ToImage(4096, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"version", "checksum", "missing"} {
+		t.Run(mode, func(t *testing.T) {
+			db, err := loadEngine(skewZonePin(t, image, mode), testEnv("tz"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c := errCode(t, db, "DELETE FROM t WHERE id = 2"); c != "XX002" {
+				t.Fatal(c)
+			}
+			mustExec(t, db, "BEGIN")
+			mustExec(t, db, "REINDEX INDEX zone_idx")
+			mustExec(t, db, "ROLLBACK")
+			if c := errCode(t, db, "DELETE FROM t WHERE id = 2"); c != "XX002" {
+				t.Fatal(c)
+			}
+			mustExec(t, db, "REINDEX TABLE t")
+			mustExec(t, db, "INSERT INTO t VALUES (3,8,'2024-06-01 00:00:00+00')")
+			if c := errCode(t, db, "INSERT INTO t VALUES (4,7,'2024-06-01 00:00:00+00')"); c != "23505" {
+				t.Fatal(c)
+			}
+			// The re-pinned index survives a round trip in the same environment.
+			again, err := db.ToImage(4096, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reloaded, err := loadEngine(again, testEnv("tz"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustExec(t, reloaded, "DELETE FROM t WHERE id = 2")
+		})
+	}
+	// Without the zone loaded, the rebuild cannot re-admit the explicit zone (22023).
+	bare, err := loadEngine(image, NewEnvironment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := errCode(t, bare, "REINDEX INDEX zone_idx"); c != "22023" {
+		t.Fatal(c)
+	}
+}
+
 func TestIndexTimezoneSessionIndependence(t *testing.T) {
 	db := buildZoneIndex(t)
 	for _, pred := range []string{"ts IS NULL", "EXTRACT(epoch FROM ts)>0", "date_part('epoch',ts)>0", "make_timestamptz(2024,1,1,0,0,0,'UTC') < ts", "ts + INTERVAL '1 hour' > ts", "uuid_extract_timestamp(uuid '01941f29-7c00-7000-8000-000000000000') IS NOT NULL"} {

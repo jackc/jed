@@ -2063,6 +2063,7 @@ export function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "alterTable" ||
     stmt.kind === "createIndex" ||
     stmt.kind === "dropIndex" ||
+    stmt.kind === "reindex" ||
     stmt.kind === "createType" ||
     stmt.kind === "dropType" ||
     stmt.kind === "createSequence" ||
@@ -2306,6 +2307,17 @@ export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
     case "analyze":
       req.isDdl = true;
       req.tables.push({ name: stmt.name, priv: "select" });
+      break;
+    // REINDEX is maintenance like ANALYZE (session.md §5.3): allowDdl, plus SELECT on the target
+    // table — an INDEX target's owning table is added by the executor's privilege check, which can
+    // resolve the index. DATABASE / SYSTEM need only allowDdl (PostgreSQL's database-owner check).
+    // The temp split (allowTempDdl) does not apply: it governs schema creation and removal, not
+    // maintenance (spec/design/indexes.md §10).
+    case "reindex":
+      req.isDdl = true;
+      if (stmt.reindexKind === "table" && stmt.name !== undefined) {
+        req.tables.push({ name: stmt.name, priv: "select" });
+      }
       break;
     case "createTable":
       req.isDdl = true;
@@ -2739,6 +2751,8 @@ export function stmtKind(stmt: Statement): string {
       return "CREATE INDEX";
     case "dropIndex":
       return "DROP INDEX";
+    case "reindex":
+      return "REINDEX";
     case "createType":
       return "CREATE TYPE";
     case "dropType":

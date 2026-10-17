@@ -11,8 +11,10 @@ type statement struct {
 	AlterTable  *alterTable
 	CreateIndex *createIndex
 	DropIndex   *dropIndex
-	CreateType  *createType
-	DropType    *dropType
+	// Reindex is `REINDEX` (spec/design/indexes.md §10). Non-nil only for that statement.
+	Reindex    *reindexStmt
+	CreateType *createType
+	DropType   *dropType
 	// CreateSequence/AlterSequence/DropSequence are the sequence DDL statements
 	// (spec/design/sequences.md): a named, persisted i64 generator. Non-nil only for that statement.
 	CreateSequence *createSequence
@@ -427,6 +429,32 @@ type indexPredicate struct {
 // (spec/design/indexes.md §2). Missing → 42704; a table's name → 42809.
 type dropIndex struct {
 	Name string
+}
+
+// reindexKind is the object kind a REINDEX names (spec/design/indexes.md §10). SCHEMA is refused
+// 0A000 by the parser (jed has no schemas), so it has no value.
+type reindexKind int
+
+const (
+	reindexIndex reindexKind = iota
+	reindexTable
+	reindexDatabase
+	reindexSystem
+)
+
+// reindexStmt is `REINDEX [(option, …)] {INDEX | TABLE} [CONCURRENTLY] [db.]name` or
+// `REINDEX [(option, …)] {DATABASE | SYSTEM} [CONCURRENTLY] [name]` — rebuild secondary indexes in
+// place from their stored definitions (spec/design/indexes.md §10). DB is the optional qualifier of
+// an INDEX/TABLE target; Name is "" (HasName false) only for a DATABASE/SYSTEM without a name.
+// Concurrently merges the positional keyword and the option; Verbose is accepted and has no
+// observable effect (jed has no notice channel).
+type reindexStmt struct {
+	Kind         reindexKind
+	DB           *string
+	Name         string
+	HasName      bool
+	Concurrently bool
+	Verbose      bool
 }
 
 // CreateType is a CREATE TYPE <name> AS ( field type [NOT NULL] [, …] ) statement — a

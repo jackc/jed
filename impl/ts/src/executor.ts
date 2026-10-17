@@ -29,6 +29,7 @@ import type {
   Delete,
   DefaultDef,
   DropIndex,
+  Reindex,
   DropSequence,
   DropTable,
   DropType,
@@ -3295,6 +3296,15 @@ export class Engine {
       }
       // Run the statement; ANY error aborts the block (it enters the failed state — §6).
       try {
+        // REINDEX CONCURRENTLY / DATABASE / SYSTEM cannot run inside a transaction block
+        // (PostgreSQL's PreventInTransactionBlock — spec/design/indexes.md §10).
+        const reindexKind = reindexOutsideBlock(stmt);
+        if (reindexKind !== null) {
+          throw engineError(
+            "active_sql_transaction",
+            reindexKind + " cannot run inside a transaction block",
+          );
+        }
         if (this.stmtIsWriteWithViews(stmt) && !tx.writable) {
           throw engineError(
             "read_only_sql_transaction",
@@ -3782,6 +3792,16 @@ export class Engine {
     // before execution resolves/evaluates them, so a revoked function cannot be invoked through them
     // (session.md §5.3).
     this.collectCatalogExprPrivs(stmt, req);
+    // REINDEX INDEX reads its owning table's rows: SELECT on that table (indexes.md §10).
+    if (stmt.kind === "reindex" && stmt.reindexKind === "index" && stmt.name !== undefined) {
+      let owner: [string, IndexDef] | null;
+      if (stmt.db !== undefined) {
+        owner = this.snapForScope(stmt.db)?.findIndex(stmt.name) ?? null;
+      } else {
+        owner = this.tempSnap().findIndex(stmt.name) ?? this.findIndex(stmt.name);
+      }
+      if (owner !== null) req.tables.push({ name: owner[0], priv: "select" });
+    }
     if (req.isDdl) {
       // DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
       // table by allowTempDdl, everything else (persistent) by allowDdl. A CREATE TABLE is classified
@@ -4010,6 +4030,9 @@ export class Engine {
       case "dropIndex":
         rejectParamsForDDL(params);
         return this.executeDropIndex(stmt);
+      case "reindex":
+        rejectParamsForDDL(params);
+        return this.executeReindex(stmt);
       case "createType":
         rejectParamsForDDL(params);
         return this.executeCreateType(stmt);
@@ -9559,9 +9582,6 @@ export class Engine {
     // Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12, XX002):
     // the new B-tree would be pinned inconsistently with the file's other structures.
     this.ensureCollationsWritable(columns);
-    // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
-    // C-only / non-text table (the fast path).
-    const colls = this.columnCollations(columns);
     // Resolve the access method (spec/design/gin.md §3): undefined / "btree" is the ordered
     // B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
     // parser) so the error is the resolve-time undefined_object, after the table-exists check.
@@ -9590,41 +9610,7 @@ export class Engine {
             `an expression key on a ${ci.using ?? ""} index is not supported yet`,
           );
         }
-        // A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
-        // uncorrelated one, so it is rejected here, before resolution).
-        rejectIndexPredicateStructure(elem.expr);
-        // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02 fall
-        // out of the resolver, as for a CHECK).
-        const scope = Scope.index(this, table);
-        const pt = new ParamTypes();
-        pt.indexContext = true;
-        const { node, type: rtype } = resolve(
-          scope,
-          elem.expr,
-          null,
-          { collecting: false, groupKeys: [], specs: [] },
-          pt,
-        );
-        // Dependencies accumulate at each resolved operation, through every child.
-        if (pt.nonimmutable) {
-          throw engineError(
-            "invalid_object_definition",
-            "functions in index expression must be marked IMMUTABLE",
-          );
-        }
-        // The result type must be key-encodable (a composite result is 0A000).
-        if (resolvedToKeyType(rtype) === null) {
-          throw engineError(
-            "feature_not_supported",
-            "an index on an expression of this result type is not supported yet",
-          );
-        }
-        // Collect + admit any host functions the key expression calls (§8.1, step 4): each must be
-        // IMMUTABLE + carry a component identity, else 42P17 (this also closes the latent leak where a
-        // volatile host function passed the syntactic immutability walk above).
-        const hostFns = this.session.environment.hostFunctions();
-        if (hostFns) collectIndexHostDeps(node, hostFns, hostDeps);
-        mergeTimezoneDeps(timezoneDeps, pt.timezoneDeps);
+        this.admitIndexExpr(table, elem.expr, false, hostDeps, timezoneDeps);
         ciKeys.push({ kind: "expr", exprText: elem.text, expr: elem.expr });
         continue;
       }
@@ -9692,25 +9678,7 @@ export class Engine {
           `a partial (WHERE) ${ci.using} index is not supported yet`,
         );
       }
-      // Structural pre-walk: a subquery is 0A000 and a bind parameter 42P02 (both admitted by the
-      // resolver). The aggregate 42803 / window 42P20 / non-boolean 42804 rejections then fall out of
-      // the Forbidden-context boolean resolve below.
-      rejectIndexPredicateStructure(ci.predicate.expr);
-      const predPt = new ParamTypes();
-      predPt.indexContext = true;
-      const predNode = resolveBooleanFilter(Scope.index(this, table), ci.predicate.expr, predPt);
-      // Dependencies accumulate at each resolved operation, through every child.
-      if (predPt.nonimmutable) {
-        throw engineError(
-          "invalid_object_definition",
-          "functions in index predicate must be marked IMMUTABLE",
-        );
-      }
-      // Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as a key
-      // expression (IMMUTABLE + component identity, else 42P17).
-      const hostFns = this.session.environment.hostFunctions();
-      if (hostFns) collectIndexHostDeps(predNode, hostFns, hostDeps);
-      mergeTimezoneDeps(timezoneDeps, predPt.timezoneDeps);
+      this.admitIndexExpr(table, ci.predicate.expr, true, hostDeps, timezoneDeps);
       predicate = { exprText: ci.predicate.text, expr: ci.predicate.expr };
     }
     // relationTaken checks the namespace of the target scope: an attachment's OWN snapshot for an
@@ -9750,15 +9718,6 @@ export class Engine {
     // value_decompress slabs — indexes.md §5). An empty table charges 0. Entries are computed here
     // against the pre-index store; the writes below are unmetered. An expression key evaluating with
     // an error aborts the build (nothing is registered — indexes.md §4), preserving all-or-nothing.
-    const meter = this.session.newMeter();
-    const mask = columns.map(() => false);
-    for (const k of ciKeys) {
-      if (k.kind === "column") mask[k.column] = true;
-      else for (const c of checkReferencedColumns(k.expr, columns)) mask[c] = true;
-    }
-    // A partial index's predicate is evaluated per row during the build (indexes.md §9), so the columns
-    // it references join the touched set — keeping the build cost deterministic + cross-core identical.
-    if (predicate) for (const c of checkReferencedColumns(predicate.expr, columns)) mask[c] = true;
     // A stable on-disk / cross-core order (CLAUDE.md §8): sort the collected dependencies by (name,
     // on-disk arg-type codes) so registration order never leaks into the file bytes. undefined when
     // the index calls no host function, keeping the catalog entry byte-identical to v30.
@@ -9773,38 +9732,8 @@ export class Engine {
       hostDeps: hostDeps.length > 0 ? hostDeps : undefined,
       timezoneDeps,
     };
-    // Resolve the index once (column ordinals + resolved expression keys); an env for any expression
-    // key (a fresh statement rng — index expressions are immutable, so it is never read).
-    const rindex = this.resolveIndex(table, def);
-    const env = this.maintenanceEnv(new StmtRng());
-    const store = this.lkpStoreScoped(ci.db, ci.table);
-    const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
-    meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
-    const entries: Uint8Array[] = [];
-    // A UNIQUE build verifies the existing rows before the index is registered
-    // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
-    // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
-    const seenPrefixes = new Set<string>();
-    for (const e of stored) {
-      meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-      meter.charge(COSTS.storageRowRead);
-      // Resolve a faulted row's touched columns before encoding (an expression key may read a spilled
-      // value; the evaluator's Unfetched backstop also handles it).
-      const row = store.resolveInlineColumns(e.row);
-      if (def.unique) {
-        const prefix = indexPrefixKey(store.columnTypes(), colls, rindex, row, env);
-        if (prefix !== null) {
-          const k = prefix.join(",");
-          if (seenPrefixes.has(k)) {
-            throw uniqueViolation(ci.table, def.name).withDetail(
-              indexDetail(this.session, table.name, columns, def, rindex, row, env, DETAIL_DUPLICATED),
-            );
-          }
-          seenPrefixes.add(k);
-        }
-      }
-      entries.push(...indexEntryKeys(columns, store.columnTypes(), colls, rindex, e.key, row, env));
-    }
+    const meter = this.session.newMeter();
+    const entries = this.buildIndexEntries(ci.db, table, def, meter);
     meter.guard();
 
     const nameKey = def.name;
@@ -9826,17 +9755,276 @@ export class Engine {
       this.working().putIndex(tableKey, def, this.pageSize);
     }
     const istore = this.writeIndexStoreScoped(ci.db, nameKey);
-    // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
-    // so the built tree packs ~full instead of splintering under the storage-key order the
-    // scan produced (random in entry-key space). Part of the byte contract — the sort fixes
-    // the built tree's shape across cores.
-    entries.sort(compareBytes);
     for (const ek of entries) {
       if (!istore.insert(ek, [])) {
         throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
       }
     }
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
+  }
+
+  // executeReindex runs a REINDEX (spec/design/indexes.md §10): rebuild each target index in place
+  // from its stored definition, as if it were dropped and created again with the same name, keys,
+  // uniqueness, method, and predicate — but in one all-or-nothing statement that keeps the index's
+  // catalog position and constraint links. Every key expression and predicate is re-admitted against
+  // the handle's current environment, so the rebuilt index records the current host-function
+  // identities and timezone data (extensibility.md §8.1, index-dependencies.md). Every new tree is
+  // built before any is installed, so a failure (23505, a resolution error, the cost ceiling) changes
+  // nothing. Cost: each index charges exactly its CREATE INDEX build scan.
+  private executeReindex(rx: Reindex): Outcome {
+    const targets = this.reindexTargets(rx);
+    const meter = this.session.newMeter();
+    const rebuilt: { scope: string; tableKey: string; def: IndexDef; entries: Uint8Array[] }[] = [];
+    for (const target of targets) {
+      if (target.names.length === 0) continue;
+      this.checkAttachmentWritable(target.scope);
+      const table = this.snapForScope(target.scope)!.table(target.tableKey)!;
+      this.ensureCollationsWritable(table.columns);
+      for (const name of target.names) {
+        const old = table.indexes.find((i) => i.name === name)!;
+        const def = this.readmitIndexDef(table, old);
+        const entries = this.buildIndexEntries(target.scope, table, def, meter);
+        rebuilt.push({ scope: target.scope, tableKey: target.tableKey, def, entries });
+      }
+    }
+    meter.guard();
+    for (const r of rebuilt) {
+      const nameKey = r.def.name;
+      let snap: Snapshot;
+      let pageSize: number;
+      if (r.scope === "temp") {
+        this.session.tx!.tempDirty = true;
+        snap = this.session.tx!.tempWorking;
+        pageSize = this.pageSize;
+      } else if (r.scope === "main") {
+        snap = this.working();
+        pageSize = this.pageSize;
+      } else {
+        snap = this.attachWriteSnap(r.scope)!;
+        snap.storePaging = this.core!.attachments.get(r.scope)!.storage.paging;
+        pageSize = this.attachPageSize(r.scope);
+      }
+      snap.removeIndex(r.tableKey, nameKey);
+      snap.putIndex(r.tableKey, r.def, pageSize);
+      const istore = this.writeIndexStoreScoped(r.scope, nameKey);
+      for (const ek of r.entries) {
+        if (!istore.insert(ek, [])) {
+          throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
+        }
+      }
+    }
+    return { kind: "statement", cost: meter.accrued, rowsAffected: null };
+  }
+
+  // readmitIndexDef re-admits a stored index definition for REINDEX (spec/design/indexes.md §10): an
+  // unparsed key or predicate is XX003 (unparsable-definitions.md §3.4); every expression is resolved
+  // again and its host-function and timezone dependencies re-collected from the current environment
+  // exactly as CREATE INDEX collects them (a missing function 42883, a no-longer-admissible one 42P17,
+  // an unloaded named zone 22023). Column keys, uniqueness, method, and predicate text carry over.
+  private readmitIndexDef(table: Table, old: IndexDef): IndexDef {
+    if (indexUnparsed(old)) throw unparsableIndexError(table.name, old.name);
+    const hostDeps: HostFuncDep[] = [];
+    const timezoneDeps: TimeZoneDeps = { dynamic: false, zones: [] };
+    for (const k of old.keys) {
+      if (k.kind === "expr") this.admitIndexExpr(table, k.expr, false, hostDeps, timezoneDeps);
+    }
+    if (old.predicate) this.admitIndexExpr(table, old.predicate.expr, true, hostDeps, timezoneDeps);
+    sortHostDeps(hostDeps);
+    validateTimezoneDeps(timezoneDeps);
+    return { ...old, hostDeps: hostDeps.length > 0 ? hostDeps : undefined, timezoneDeps };
+  }
+
+  // reindexTargets resolves a REINDEX's targets (spec/design/indexes.md §10) as (scope, table key,
+  // index names) triples, each scope explicit ("main" / "temp" / an attachment) and each table's
+  // indexes in catalog (name byte) order. INDEX names one index (42P01 when no relation has the name,
+  // 42809 when it is not an index); TABLE names one table (42809 for a catalog relation, an index, a
+  // view, or a sequence; 42P01 when missing); DATABASE takes every table of the named database in name
+  // byte order — main (the default) followed by the session's temporary tables, or one attachment;
+  // SYSTEM has no system catalogs to rebuild. Any other database name is 0A000, as PostgreSQL.
+  private reindexTargets(rx: Reindex): { scope: string; tableKey: string; names: string[] }[] {
+    const indexNames = (t: Table): string[] => t.indexes.map((i) => i.name);
+    if (rx.reindexKind === "index" || rx.reindexKind === "table") {
+      const name = rx.name!;
+      if (rx.reindexKind === "table") checkCatalogRelWrite(name);
+      let scope: string;
+      if (rx.db !== undefined) {
+        const q = rx.db;
+        if (q !== "main" && q !== "temp" && this.attachReadSnap(q) === undefined) {
+          throw engineError("undefined_table", `database "${q}" is not attached`);
+        }
+        scope = q;
+      } else if (this.isTempTable(name) || this.isTempIndex(name) || this.isTempSequence(name)) {
+        // The resolution walk: a name in the session's temporary domain (a table, an index, or an
+        // owned sequence — preclude-overlaps keeps it in one scope), else main.
+        scope = "temp";
+      } else {
+        scope = "main";
+      }
+      const snap = this.snapForScope(scope)!;
+      const shown = rx.db !== undefined ? `${rx.db}.${name}` : name;
+      if (rx.reindexKind === "index") {
+        const found = snap.findIndex(name);
+        if (found !== null) return [{ scope, tableKey: found[0], names: [name] }];
+      } else {
+        const t = snap.table(name);
+        if (t !== undefined) return [{ scope, tableKey: t.name, names: indexNames(t) }];
+      }
+      const otherKind =
+        snap.table(name) !== undefined ||
+        snap.findIndex(name) !== null ||
+        snap.view(name) !== undefined ||
+        snap.sequence(name) !== undefined ||
+        (rx.reindexKind === "index" && isCatalogRelName(name));
+      if (otherKind) {
+        const what = rx.reindexKind === "index" ? "an index" : "a table or materialized view";
+        throw engineError("wrong_object_type", `"${shown}" is not ${what}`);
+      }
+      throw engineError("undefined_table", `relation "${shown}" does not exist`);
+    }
+    if (rx.reindexKind === "system" && rx.concurrently) {
+      throw engineError("feature_not_supported", "cannot reindex system catalogs concurrently");
+    }
+    let scope = "main";
+    if (rx.name !== undefined) {
+      const n = rx.name;
+      if (n !== "main" && (n === "temp" || this.attachReadSnap(n) === undefined)) {
+        throw engineError("feature_not_supported", "can only reindex the currently open database");
+      }
+      scope = n;
+    }
+    if (rx.reindexKind === "system") return [];
+    const scopes = [scope];
+    if (scope === "main") scopes.push("temp");
+    const out: { scope: string; tableKey: string; names: string[] }[] = [];
+    for (const sc of scopes) {
+      const snap = this.snapForScope(sc)!;
+      for (const t of snap.tablesSorted()) {
+        out.push({ scope: sc, tableKey: t.name, names: indexNames(t) });
+      }
+    }
+    return out;
+  }
+
+  // admitIndexExpr resolves one index key expression (predicate false) or partial-index predicate
+  // (predicate true) against table and admits it for a persisted index (spec/design/indexes.md
+  // §1/§2/§9): a subquery is 0A000 and a bind parameter 42P02 (structural pre-walk); an aggregate
+  // 42803 / window 42P20 / non-boolean predicate 42804 fall out of the resolver; a non-immutable
+  // operation is 42P17; a key's result type must be key-encodable (0A000). The host-function and
+  // timezone dependencies it reaches accumulate into hostDeps / tz (extensibility.md §8.1,
+  // index-dependencies.md). Shared by CREATE INDEX and REINDEX (§10), which re-admits every stored
+  // expression against the current environment.
+  private admitIndexExpr(
+    table: Table,
+    expr: Expr,
+    predicate: boolean,
+    hostDeps: HostFuncDep[],
+    tz: TimeZoneDeps,
+  ): void {
+    // A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
+    // uncorrelated one, so it is rejected here, before resolution).
+    rejectIndexPredicateStructure(expr);
+    const scope = Scope.index(this, table);
+    const pt = new ParamTypes();
+    pt.indexContext = true;
+    let node: RExpr;
+    if (predicate) {
+      node = resolveBooleanFilter(scope, expr, pt);
+      if (pt.nonimmutable) {
+        throw engineError(
+          "invalid_object_definition",
+          "functions in index predicate must be marked IMMUTABLE",
+        );
+      }
+    } else {
+      const r = resolve(scope, expr, null, { collecting: false, groupKeys: [], specs: [] }, pt);
+      // Dependencies accumulate at each resolved operation, through every child.
+      if (pt.nonimmutable) {
+        throw engineError(
+          "invalid_object_definition",
+          "functions in index expression must be marked IMMUTABLE",
+        );
+      }
+      // The result type must be key-encodable (a composite result is 0A000).
+      if (resolvedToKeyType(r.type) === null) {
+        throw engineError(
+          "feature_not_supported",
+          "an index on an expression of this result type is not supported yet",
+        );
+      }
+      node = r.node;
+    }
+    // Collect + admit any host functions the expression calls (§8.1, step 4): each must be IMMUTABLE
+    // + carry a component identity, else 42P17 (this also closes the latent leak where a volatile host
+    // function passed the syntactic immutability walk).
+    const hostFns = this.session.environment.hostFunctions();
+    if (hostFns) collectIndexHostDeps(node, hostFns, hostDeps);
+    mergeTimezoneDeps(tz, pt.timezoneDeps);
+  }
+
+  // buildIndexEntries computes a new index's entry keys from table's current rows (the CREATE INDEX
+  // build, shared with REINDEX — spec/design/indexes.md §2/§10), sorted by entry key. The build scan is
+  // metered on meter (cost.md §3): page_read per table-tree node + storage_row_read per row, over the
+  // touched set of columns the keys and predicate read (a spilled value adds its value_decompress
+  // slabs). A UNIQUE definition verifies the rows (23505, indexes.md §8). An expression key evaluating
+  // with an error aborts the build, so nothing is registered.
+  private buildIndexEntries(
+    scope: string | undefined,
+    table: Table,
+    def: IndexDef,
+    meter: Meter,
+  ): Uint8Array[] {
+    const columns = table.columns;
+    // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
+    // C-only / non-text table (the fast path).
+    const colls = this.columnCollations(columns);
+    const mask = columns.map(() => false);
+    for (const k of def.keys) {
+      if (k.kind === "column") mask[k.column] = true;
+      else for (const c of checkReferencedColumns(k.expr, columns)) mask[c] = true;
+    }
+    // A partial index's predicate is evaluated per row during the build (indexes.md §9), so the columns
+    // it references join the touched set — keeping the build cost deterministic + cross-core identical.
+    if (def.predicate) {
+      for (const c of checkReferencedColumns(def.predicate.expr, columns)) mask[c] = true;
+    }
+    // Resolve the index once (column ordinals + resolved expression keys); an env for any expression
+    // key (a fresh statement rng — index expressions are immutable, so it is never read).
+    const rindex = this.resolveIndex(table, def);
+    const env = this.maintenanceEnv(new StmtRng());
+    const store = this.lkpStoreScoped(scope, table.name);
+    const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
+    meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
+    const entries: Uint8Array[] = [];
+    // A UNIQUE build verifies the existing rows before the index is registered
+    // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
+    // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
+    const seenPrefixes = new Set<string>();
+    for (const e of stored) {
+      meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+      meter.charge(COSTS.storageRowRead);
+      // Resolve a faulted row's touched columns before encoding (an expression key may read a spilled
+      // value; the evaluator's Unfetched backstop also handles it).
+      const row = store.resolveInlineColumns(e.row);
+      if (def.unique) {
+        const prefix = indexPrefixKey(store.columnTypes(), colls, rindex, row, env);
+        if (prefix !== null) {
+          const k = prefix.join(",");
+          if (seenPrefixes.has(k)) {
+            throw uniqueViolation(table.name, def.name).withDetail(
+              indexDetail(this.session, table.name, columns, def, rindex, row, env, DETAIL_DUPLICATED),
+            );
+          }
+          seenPrefixes.add(k);
+        }
+      }
+      entries.push(...indexEntryKeys(columns, store.columnTypes(), colls, rindex, e.key, row, env));
+    }
+    meter.guard();
+    // Sorted by entry key (indexes.md §1): every insert is then a right-edge append, so the built tree
+    // packs ~full instead of splintering under the storage-key order the scan produced (random in
+    // entry-key space). Part of the byte contract — the sort fixes the built tree's shape across cores.
+    entries.sort(compareBytes);
+    return entries;
   }
 
   // executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is
@@ -31533,6 +31721,17 @@ export function catalogRelKind(name: string): CatalogRelKind | undefined {
 // scope.
 export function isCatalogSrfKind(kind: SrfKind): boolean {
   return catalogRelKind(kind) !== undefined;
+}
+
+// reindexOutsideBlock is the PostgreSQL statement name when stmt is a REINDEX form that cannot run
+// inside a transaction block (PreventInTransactionBlock, spec/design/indexes.md §10): CONCURRENTLY
+// first, then DATABASE / SYSTEM — PostgreSQL's check order. null for every other statement.
+function reindexOutsideBlock(stmt: Statement): string | null {
+  if (stmt.kind !== "reindex") return null;
+  if (stmt.concurrently) return "REINDEX CONCURRENTLY";
+  if (stmt.reindexKind === "database") return "REINDEX DATABASE";
+  if (stmt.reindexKind === "system") return "REINDEX SYSTEM";
+  return null;
 }
 
 // isCatalogRelName reports whether name is a built-in catalog relation (introspection.md §5).

@@ -71,7 +71,11 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 		// Run the statement; ANY error aborts the block (it enters the failed state — §6).
 		var out outcome
 		var err error
-		if db.stmtIsWriteWithViews(stmt) && !db.session.tx.writable {
+		if kind := reindexOutsideBlock(stmt); kind != "" {
+			// REINDEX CONCURRENTLY / DATABASE / SYSTEM cannot run inside a transaction block
+			// (PostgreSQL's PreventInTransactionBlock — spec/design/indexes.md §10).
+			err = newError(ActiveSqlTransaction, kind+" cannot run inside a transaction block")
+		} else if db.stmtIsWriteWithViews(stmt) && !db.session.tx.writable {
 			err = newError(ReadOnlySqlTransaction,
 				"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 		} else {
@@ -703,4 +707,24 @@ func checkedAddInt64(a, b int64) (sum int64, overflow bool) {
 		return 0, true
 	}
 	return sum, false
+}
+
+// reindexOutsideBlock is the PostgreSQL statement name when stmt is a REINDEX form that cannot run
+// inside a transaction block (PreventInTransactionBlock, spec/design/indexes.md §10): CONCURRENTLY
+// first, then DATABASE / SYSTEM — PostgreSQL's check order. "" for every other statement.
+func reindexOutsideBlock(stmt statement) string {
+	rx := stmt.Reindex
+	if rx == nil {
+		return ""
+	}
+	if rx.Concurrently {
+		return "REINDEX CONCURRENTLY"
+	}
+	switch rx.Kind {
+	case reindexDatabase:
+		return "REINDEX DATABASE"
+	case reindexSystem:
+		return "REINDEX SYSTEM"
+	}
+	return ""
 }

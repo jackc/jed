@@ -460,6 +460,119 @@ test("host-dep index reopen with the function missing", () => {
   db.close();
 });
 
+// geo_hash(i64) -> i64 at version with a COARSER kernel (a / 10), so rows that were distinct under
+// v1's a * 10 can collide — the UNIQUE re-check REINDEX performs.
+function geoHashCoarse(component: string, version: number): HostFunctionSpec {
+  return {
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => intValue(asInt(args[0]!) / 10n),
+    volatility: "immutable",
+    crossCore: true,
+    componentId: component,
+    semanticVersion: version,
+  };
+}
+
+test("host-dep index REINDEX repairs a version bump", () => {
+  // REINDEX (spec/design/indexes.md §10) rebuilds a stale host-dependency index against the CURRENT
+  // registry and re-records its component/version, so the table is writable again — and stays so
+  // across a reopen in the same environment (the new dependency is what was persisted).
+  const path = tmpFile("hostfunc_index_reindex.jed");
+  createFile(path, regWith(geoHash("com.example/geo_hash", 1)), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+    "INSERT INTO t VALUES (1, 3), (2, 7)",
+    "CREATE INDEX ix ON t (geo_hash(a))",
+  ]);
+  {
+    const db = openFile(path, regWith(geoHash("com.example/geo_hash", 2)));
+    assert.equal(
+      errCodeOf(() => queryOutcome(db, "INSERT INTO t VALUES (3, 3)")),
+      "XX002",
+    );
+    // A rolled-back REINDEX leaves the stale pin in place.
+    const s = db.session({});
+    queryOutcome(s, "BEGIN");
+    queryOutcome(s, "REINDEX INDEX ix");
+    queryOutcome(s, "ROLLBACK");
+    assert.equal(
+      errCodeOf(() => queryOutcome(s, "INSERT INTO t VALUES (3, 3)")),
+      "XX002",
+    );
+    s.close();
+    // The committed rebuild repairs it, charging the CREATE INDEX build scan.
+    const o = queryOutcome(db, "REINDEX TABLE t");
+    assert.equal(o.kind, "statement");
+    assert.ok(o.kind === "statement" && o.cost > 0n, "REINDEX charges its build scan");
+    queryOutcome(db, "INSERT INTO t VALUES (3, 3)");
+    assert.deepEqual(idsFile(db, "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"), [1n, 3n]);
+    db.close();
+  }
+  const db = openFile(path, regWith(geoHash("com.example/geo_hash", 2)));
+  // The re-recorded v2 dependency persisted.
+  queryOutcome(db, "INSERT INTO t VALUES (4, 7)");
+  db.close();
+});
+
+test("host-dep index REINDEX refusals", () => {
+  const path = tmpFile("hostfunc_index_reindex_refusals.jed");
+  createFile(path, regWith(geoHash("com.example/geo_hash", 1)), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+    "INSERT INTO t VALUES (1, 3), (2, 7)",
+    "CREATE UNIQUE INDEX ix ON t (geo_hash(a))",
+  ]);
+  // The function is gone: the expression cannot be re-admitted (42883), and nothing changes.
+  {
+    const db = openFile(path, new Environment());
+    assert.equal(
+      errCodeOf(() => queryOutcome(db, "REINDEX INDEX ix")),
+      "42883",
+    );
+    assert.equal(
+      errCodeOf(() => queryOutcome(db, "REINDEX TABLE t")),
+      "42883",
+    );
+    assert.equal(
+      errCodeOf(() => queryOutcome(db, "REINDEX DATABASE")),
+      "42883",
+    );
+    db.close();
+  }
+  // The new implementation is no longer IMMUTABLE: 42P17, as CREATE INDEX would say.
+  {
+    const volatileGeo: HostFunctionSpec = {
+      name: "geo_hash",
+      argTypes: ["i64"],
+      result: "i64",
+      kernel: (args) => intValue(asInt(args[0]!) * 10n),
+      componentId: "com.example/geo_hash",
+      semanticVersion: 2,
+    };
+    const db = openFile(path, regWith(volatileGeo));
+    assert.equal(
+      errCodeOf(() => queryOutcome(db, "REINDEX INDEX ix")),
+      "42P17",
+    );
+    db.close();
+  }
+  // The new implementation maps both rows to one key: the UNIQUE rebuild re-checks (23505) and the
+  // stale index stays in place (writes still refused XX002).
+  {
+    const db = openFile(path, regWith(geoHashCoarse("com.example/geo_hash", 2)));
+    assert.throws(() => queryOutcome(db, "INSERT INTO t VALUES (3, 4)"));
+    assert.equal(
+      errCodeOf(() => queryOutcome(db, "REINDEX INDEX ix")),
+      "23505",
+    );
+    assert.equal(
+      errCodeOf(() => queryOutcome(db, "INSERT INTO t VALUES (3, 30)")),
+      "XX002",
+    );
+    db.close();
+  }
+});
+
 // ---------------------------------------------------------------------------------------------
 // The batched kernel ABI (extensibility.md §4.2.1). Batching is host-observable only (how often, and
 // over how many rows, a kernel runs); rows, cost, and errors must be identical to batch-of-one. These

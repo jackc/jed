@@ -971,7 +971,8 @@ template = "on-disk database file is malformed: {detail}"
 # collation by name + (unicode, cldr) version; if no loaded bundle provides that name the open is
 # refused, and a WRITE that would maintain a collated structure whose pinned version differs from the
 # loaded bundle's is refused (mixing two orderings in one B-tree would corrupt it) — the object stays
-# read-only until a migration (REINDEX, deferred) rebuilds + re-pins it. DELIBERATELY DIVERGES from
+# read-only until a migration (the host op `upgrade_collations`; SQL REINDEX refuses a skewed table
+# with this same code) rebuilds + re-pins it. DELIBERATELY DIVERGES from
 # PostgreSQL, whose XX002 is `index_corrupted` — jed has no such concept and reserved XX002 for this
 # verdict (CLAUDE.md §1, "we own our surface"). Collation-specific for now; a read-required built-in /
 # host gap may get a sibling code later (compatibility.md §12, open decision #4).

@@ -49,7 +49,7 @@ module SimGen
       "open_write" => 10, "open_read" => 6, "close_read" => 5, "read_query" => 8,
       "insert" => 14, "update" => 9, "delete" => 5, "upsert" => 4,
       "create_table" => 2, "drop_table" => 1, "create_index" => 2, "drop_index" => 1,
-      "add_column" => 1, "analyze" => 1, "sequence" => 1, "invalid" => 1,
+      "add_column" => 1, "analyze" => 1, "reindex" => 1, "sequence" => 1, "invalid" => 1,
       "commit" => 9, "rollback" => 2, "check" => 2, "reopen" => 1, "clock" => 1,
       "crash_power" => 1, "crash_process" => 1, "compact" => 0,
       "spawn" => 0, "exit" => 0, "kill" => 0, "disconnect" => 0,
@@ -574,6 +574,7 @@ module SimGen
       when "drop_index" then drop_index
       when "add_column" then add_column
       when "analyze" then analyze
+      when "reindex" then reindex
       when "sequence" then sequence
       when "invalid" then invalid
       end
@@ -685,6 +686,13 @@ module SimGen
     def analyze
       t = pick_table or return
       on("ANALYZE #{t.name}")
+    end
+
+    # REINDEX TABLE rebuilds every index of the table in place (indexes.md §10): fresh index trees,
+    # the old ones left as orphans for the commit's free-list reclamation.
+    def reindex
+      t = pick_table or return
+      on("REINDEX TABLE #{t.name}")
     end
 
     # A sequence may have been lost with a rolled-back or faulted transaction, so every use

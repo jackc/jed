@@ -18,6 +18,8 @@
 ```sql
 CREATE [UNIQUE] INDEX [IF NOT EXISTS name | name] ON table (key [, key ...]) [WHERE predicate]
 DROP INDEX name
+REINDEX [ ( option [, ...] ) ] { INDEX | TABLE } [ CONCURRENTLY ] [db.]name     -- §10
+REINDEX [ ( option [, ...] ) ] { DATABASE | SYSTEM } [ CONCURRENTLY ] [ name ]
 ```
 
 **`IF NOT EXISTS`** (a name is required, as in PostgreSQL) turns a relation-namespace collision
@@ -87,7 +89,7 @@ lifetime contract for both keys and predicates. A type does not make an expressi
 `timestamptz IS NULL`, comparisons of instants, and explicit-zone conversions are allowed. Session
 casts, clocks, and other mutable state are rejected even when nested in a null test, CASE, or array.
 Named-zone data is pinned per index; a mismatch excludes the index from read planning and refuses
-writes (`XX002`) until a transactional DROP/CREATE rebuild. Epoch extraction and explicit-zone
+writes (`XX002`) until a rebuild — `REINDEX` (§10), or the equivalent transactional DROP/CREATE. Epoch extraction and explicit-zone
 `make_timestamptz` receive stronger argument-sensitive admission than PostgreSQL's blanket STABLE
 classification. UTC interval arithmetic retains jed's existing [interval.md](interval.md) contract.
 
@@ -574,3 +576,126 @@ access predicate (a follow-on). Each is a relaxable narrowing, recorded here.
 **Introspection.** `jed_indexes` gains a `predicate text` column carrying the canonical predicate
 text (NULL for a non-partial index) — the analog of PostgreSQL's `pg_index.indpred`
 ([introspection.md §5.1](introspection.md)).
+
+## 10. `REINDEX` — rebuild in place
+
+```sql
+REINDEX [ ( option [, ...] ) ] { INDEX | TABLE } [ CONCURRENTLY ] [db.]name
+REINDEX [ ( option [, ...] ) ] { DATABASE | SYSTEM } [ CONCURRENTLY ] [ name ]
+
+option ::= VERBOSE [ boolean ] | CONCURRENTLY [ boolean ] | TABLESPACE name
+boolean ::= TRUE | FALSE | ON | OFF | 1 | 0          -- bare or quoted; omitted means TRUE
+```
+
+PostgreSQL's `REINDEX` (oracle-probed), for the forms that have a meaning in jed. Its job in jed is
+mostly not corruption repair: it is the **one-statement rebuild of an index whose persisted
+dependencies no longer match the environment** — a host function whose component or version changed
+([extensibility.md](extensibility.md) §8.1/§11), or named-zone data the index pinned
+([index-dependencies.md](index-dependencies.md)). Such an index is skipped by reads and makes its
+table refuse writes (`XX002`) until it is rebuilt with the current environment.
+
+### 10.1 What a rebuild is
+
+Rebuilding an index is **exactly** dropping it and creating it again with the same definition — the
+same name, key elements, uniqueness, method, and predicate — in one all-or-nothing statement, with
+three properties a DROP/CREATE pair does not give for free:
+
+- **Position and links are kept.** The index keeps its place in the table's catalog order (ascending
+  name, §6, so a re-created index lands there too) and every link that names it: the `UNIQUE`
+  constraint it *is* (constraints.md §5), the `EXCLUDE` constraint it backs (gist.md §7), and any
+  foreign key whose referenced columns it covers. `DROP INDEX` of an `EXCLUDE`-backing index is
+  `2BP01`; `REINDEX` of it is legal.
+- **Dependencies are re-admitted against the current environment.** Every key expression and the
+  predicate are resolved again and admitted exactly as `CREATE INDEX` admits them (§2), and the
+  host-function and timezone dependency lists are **collected afresh** rather than verified: the
+  rebuilt index records the current component identity and semantic version of each host function
+  and pins the currently loaded zone data. So the codes are `CREATE INDEX`'s: a host function no
+  longer registered is `42883`, one no longer `IMMUTABLE` or without a component identity `42P17`, an
+  explicitly named zone that is not loaded `22023`. An index whose stored key or predicate text this
+  binary cannot parse is **`XX003`** ([unparsable-definitions.md](unparsable-definitions.md) §3.4):
+  rebuilding needs the parsed definition, so such an index can still only be dropped.
+- **The new tree is built from the current rows** by the `CREATE INDEX` build (§2): a `UNIQUE` index
+  re-verifies uniqueness (`23505`, with the duplicate's detail) — a changed host function can map two
+  rows that were distinct to one key. A plain-column `EXCLUDE`-backing index is not re-checked: its
+  keys are columns compared by built-in operators, which the rebuild cannot change. A version-skewed
+  collated table is `XX002`, as for `CREATE INDEX` ([collation.md](collation.md) §12): the collation
+  migration stays the host operation `upgrade_collations`, never SQL.
+
+Every target index is re-admitted and built **before any is installed**, so a failure in any of
+them — including the cost ceiling — leaves every index, and its stale pins, as they were. Planner
+statistics are unchanged (the rows are unchanged). The catalog generation advances, so cached plans
+are re-planned and see the usable index.
+
+### 10.2 Targets
+
+- **`INDEX name`** rebuilds one secondary index. An unqualified name resolves like `DROP INDEX`'s —
+  the session's temporary domain, then `main`; a qualifier (`main.`, `temp.`, an attachment) names the
+  database, as for a table (attached-databases.md §3). No relation of that name is **`42P01`**
+  (`relation "x" does not exist`, as PostgreSQL); a table, view, sequence, or built-in catalog
+  relation is **`42809`** (`"x" is not an index`).
+- **`TABLE name`** rebuilds every secondary index of the table in catalog order; a table with none is
+  a zero-cost success (PostgreSQL's notice has no jed channel). Missing is `42P01`; an index, view, or
+  sequence is `42809` (`"x" is not a table or materialized view`); a built-in catalog relation is
+  `42809` (`cannot modify system relation`, the CREATE INDEX / ANALYZE precedent).
+- **`DATABASE [name]`** rebuilds every index of every table of the database, tables in name byte
+  order. Unnamed or `main`, the database is `main` **followed by the session's temporary tables**
+  (PostgreSQL's database-wide form covers the session's own temp tables); an attachment's name
+  rebuilds that attachment's tables. Any other name, `temp` included, is **`0A000`** *can only reindex
+  the currently open database* (PostgreSQL's check of a name other than the current database's).
+- **`SYSTEM [name]`** rebuilds system-catalog indexes. jed's catalog relations are computed, with no
+  indexes, so it is a zero-cost success after the same name check. `SYSTEM CONCURRENTLY` is `0A000`
+  *cannot reindex system catalogs concurrently*, checked first, as PostgreSQL.
+- **`SCHEMA name`** is **`0A000`**: jed has no schemas (grammar.md §3); the qualifier names a database,
+  which `DATABASE` covers.
+
+The primary key owns no index object ([constraints.md](constraints.md) §5.4; it is the table's own tree), so
+`REINDEX INDEX t_pkey` is `42P01` and `REINDEX TABLE` does not rewrite the table. PostgreSQL rebuilds
+the primary-key index there; a jed table tree has nothing equivalent to rebuild.
+
+### 10.3 Options and `CONCURRENTLY`
+
+- **`VERBOSE`** is accepted and emits nothing: PostgreSQL's per-index `INFO` lines carry CPU timings,
+  and jed has no notice channel.
+- **`CONCURRENTLY`**, as the positional keyword or the option, performs the ordinary rebuild. Its
+  PostgreSQL purpose — not blocking reads and writes during the build — is already jed's model:
+  readers never wait on the single writer (CLAUDE.md §3). In the positional spelling the keyword is
+  recognized only before a name for `INDEX`/`TABLE`, so a relation named `concurrently` stays
+  nameable without quotes.
+- **`TABLESPACE`** is `0A000`: jed has no tablespaces.
+- Option names and values follow PostgreSQL: an unknown option is `42601` (*unrecognized REINDEX
+  option*), a value that is not a boolean is `42601` (*… requires a Boolean value*), and a repeated
+  option is accepted, the last value winning.
+
+### 10.4 Transactions, privileges, cost
+
+- **Transactional.** `REINDEX INDEX` and `REINDEX TABLE` join an open transaction block and roll back
+  with it (a rolled-back rebuild restores the stale index and its pins). As in PostgreSQL,
+  `CONCURRENTLY`, `DATABASE`, and `SYSTEM` cannot run inside a transaction block: **`25001`** *REINDEX
+  CONCURRENTLY | DATABASE | SYSTEM cannot run inside a transaction block* (CONCURRENTLY checked first),
+  which aborts the block like any error. Outside a block every form is one atomic implicit
+  transaction; PostgreSQL commits the database-wide form per table, a difference visible only in which
+  indexes a failure leaves rebuilt — none, in jed.
+- **A write.** It is `25006` in a read-only transaction or on a read-only handle, and against a
+  read-only attachment. The rebuilt trees replace the old ones; the old pages become orphans that the
+  commit's free-list reclamation returns, exactly as for `DROP INDEX` + `CREATE INDEX`. No new page
+  type, commit path, or format change.
+- **Privileges** ([session.md](session.md) §5.3). Like `ANALYZE`, `REINDEX` is maintenance that reads
+  every row: `INDEX` and `TABLE` need **`allow_ddl`** and **`SELECT`** on the table (for `INDEX`, the
+  owning table); `DATABASE` and `SYSTEM` need only `allow_ddl` (PostgreSQL's database-owner check). The
+  `allow_temp_ddl` split does not apply — it governs creating and removing temporary schema, not
+  maintenance — so a temporary target still needs `allow_ddl`.
+- **Cost** ([cost.md](cost.md) §3). Each rebuilt index charges **exactly its `CREATE INDEX` build
+  scan** (page_read per table-tree node + storage_row_read per row, over the columns its keys and
+  predicate read, plus their `value_decompress` slabs and any host-function calls), summed over the
+  targets in order and guarded per row against the ceiling. Nothing else is charged; a target with no
+  index costs zero.
+
+### 10.5 Divergences from PostgreSQL
+
+The primary key is not an index object (`REINDEX INDEX t_pkey` is `42P01`); `SCHEMA` and
+`TABLESPACE` are `0A000`; `VERBOSE` prints nothing; a database-wide rebuild is atomic rather than
+committed per table; `DATABASE <attachment>` is a jed extension (PostgreSQL has no attached
+databases); a built-in catalog relation is `42809` where PostgreSQL rebuilds a system table's
+indexes. None is PG-comparable through the oracle (which probes inside a transaction block), so
+`suites/ddl/reindex_jed.test` pins them cross-core, beside the oracle-clean `suites/ddl/reindex.test`.
+

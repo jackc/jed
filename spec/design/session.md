@@ -479,7 +479,10 @@ write for transaction/read-only classification, and adds no separate PostgreSQL-
 privilege in this slice ([statistics.md](statistics.md) §1). The same `allow_ddl` gate applies to a
 temporary target; `allow_temp_ddl` controls temporary schema creation/removal, not durable planner-
 metadata authority. A host that wants ANALYZE without general DDL can run it through a separately
-trusted session; splitting a maintenance capability is deferred.
+trusted session; splitting a maintenance capability is deferred. **`REINDEX`** follows the same rule
+([indexes.md](indexes.md) §10): `INDEX`/`TABLE` need `allow_ddl` and `SELECT` on the target table (an
+index's owning table), `DATABASE`/`SYSTEM` need only `allow_ddl`, and a temporary target is not moved
+to `allow_temp_ddl`.
 
 The capability envelope governs the **SQL surface** only. Privileged **host-API** maintenance ops —
 building the environment (loading Unicode data, [environment.md](environment.md)), `db.set_default_collation`, and `db.upgrade_collations()` (the COLLATION

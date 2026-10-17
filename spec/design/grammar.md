@@ -3789,3 +3789,18 @@ SELECT NULLIF(trim(name), '') FROM u              -- an empty string becomes NUL
   for `text`/`bytea`, exactly what an explicit `=` charges. Output name for a bare
   `SELECT NULLIF(…)` is **`nullif`** (PostgreSQL) — the fixed keyword lowercased, the same
   no-expression-printer rationale as the §8 rule-4 function names.
+
+## 59. `REINDEX` ([indexes.md §10](indexes.md))
+
+`REINDEX [(option, …)] {INDEX | TABLE} [CONCURRENTLY] [db.]name` and `REINDEX [(option, …)]
+{DATABASE | SYSTEM} [CONCURRENTLY] [name]` (`reindex` in the grammar) is PostgreSQL's `REINDEX`.
+`REINDEX` is recognized as the leading word; none of the words that follow it is reserved. The
+option list holds `VERBOSE` and `CONCURRENTLY`, each with an optional boolean — `TRUE`/`FALSE`/`ON`/
+`OFF`, bare or quoted, or the integers `1`/`0`, PostgreSQL's `defGetBoolean` — and `TABLESPACE name`,
+which is `0A000`. An unknown option name, or a value that is not a boolean, is `42601`; a repeated
+option is accepted and the last value wins (PostgreSQL does not reject repeats here, unlike jed's
+`EXPLAIN` option list, §53). The kind word `SCHEMA` is `0A000` (no schemas, §3). The positional
+`CONCURRENTLY` is read as the keyword after `INDEX`/`TABLE` only when an identifier follows it —
+`REINDEX TABLE concurrently` rebuilds a table named `concurrently` — and always after
+`DATABASE`/`SYSTEM`, whose name is optional. A missing target name after `INDEX`/`TABLE` is `42601`.
+

@@ -125,7 +125,9 @@ neither maintained nor trusted for an access path. This is the index rule of
   the foreign-key actions that write the table. A `UNIQUE` index is therefore never bypassed: the
   table is read-only while the index is unparsed.
 - **Fails `XX003`:** `ALTER TABLE` actions that rebuild or rewrite the index: `ALTER COLUMN … TYPE`,
-  `DROP COLUMN`, and the `RENAME` forms.
+  `DROP COLUMN`, and the `RENAME` forms; and `REINDEX` of it, directly or through `REINDEX TABLE` /
+  `REINDEX DATABASE` ([indexes.md](indexes.md) §10), which must re-resolve the definition. The
+  table's other indexes rebuild normally with `REINDEX INDEX`.
 - **Proceeds:** `DROP INDEX` of it, `DROP TABLE`, `ALTER TABLE … ADD COLUMN` (with or without a
   default; it leaves every index entry valid), and every read.
 

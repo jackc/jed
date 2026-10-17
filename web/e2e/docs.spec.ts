@@ -666,6 +666,17 @@ test('the indexes page runs the jsonb GIN @> and ? scans live', async ({ page })
   await expect(key.getByTestId('result-rows')).not.toContainText('2');
 });
 
+test('the indexes page runs REINDEX live without changing the answer', async ({ page }) => {
+  await page.goto('/docs/sql/indexes/');
+  // REINDEX TABLE city rebuilds city_region in place; the lookup after it still answers
+  // Lyon, Paris (region 2) and excludes the region-1 cities (indexes.md §10).
+  const panel = livePanel(page, 'reindexQuery');
+  const rows = panel.getByTestId('result-rows').last();
+  await expect(rows).toContainText('Lyon');
+  await expect(rows).toContainText('Paris');
+  await expect(rows).not.toContainText('Tokyo');
+});
+
 test('the views page reads views live and rejects bad writes and breaking drops', async ({
   page
 }) => {

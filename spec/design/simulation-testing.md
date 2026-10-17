@@ -489,7 +489,7 @@ defaults, which `mixed.toml` restates):
 | `reuse-under-pins` | Readers held across many small commits, so reclamation and reuse run around pinned snapshots |
 | `large-values` | Overflow chains, LZ4-compressed records, `UPDATE`s that grow and shrink values |
 | `big-commits` | Transactions dirtying hundreds of pages: manifest overflow, free-list/manifest planning retries |
-| `ddl-churn` | `CREATE`/`DROP`/`ALTER` of tables and indexes, sequences, catalog-chain growth |
+| `ddl-churn` | `CREATE`/`DROP`/`ALTER` of tables and indexes, `REINDEX`, sequences, catalog-chain growth |
 | `crash-storm` | Repeated process and power crashes |
 | `stabilization` | Process crashes that leave complete unsynced generations, then a faulted next commit |
 | `resource` | Tiny caches, spill, storage and query-memory limits, `read_error`, `enospc` |
