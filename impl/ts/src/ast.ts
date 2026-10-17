@@ -142,17 +142,30 @@ export type Expr =
   // (resolved by scalarFromName; unknown → 42704) and text is the literal's string; the string is
   // coerced to the type at resolve. The keyword names the type, so the literal carries it in any
   // expression position (`INTERVAL '1 day'`, `INTEGER '42'`).
-  // `loc` is the string token's source character position.
-  | { kind: "typedLiteral"; typeName: string; text: string; loc?: SrcLoc }
+  // `loc` is the string token's source character position; `typeLoc` the type name's — an unknown
+  // type's 42704 (spec/design/error-fields.md §10.2).
+  | { kind: "typedLiteral"; typeName: string; text: string; loc?: SrcLoc; typeLoc?: SrcLoc }
   // A bind parameter $N (1-based index). Like an adaptable literal it takes its type from
-  // context at resolve; the host binds a value at execute (spec/design/api.md §5).
-  | { kind: "param"; index: number }
+  // context at resolve; the host binds a value at execute (spec/design/api.md §5). `loc` is the $N
+  // token's source character position.
+  | { kind: "param"; index: number; loc?: SrcLoc }
   // `loc` is the CAST keyword's source character position; absent for the postfix `::` form, whose
-  // location is its operand's (spec/design/error-fields.md §10.2).
-  | { kind: "cast"; inner: Expr; typeName: string; typeMod: TypeMod | null; loc?: SrcLoc }
+  // location is its operand's (spec/design/error-fields.md §10.2). `castLoc` is the cast's own token
+  // (the `::` or the CAST keyword), where a cast with no conversion is reported; `typeLoc` the target
+  // type name's, where an unknown type's 42704 is reported.
+  | {
+      kind: "cast";
+      inner: Expr;
+      typeName: string;
+      typeMod: TypeMod | null;
+      loc?: SrcLoc;
+      castLoc?: SrcLoc;
+      typeLoc?: SrcLoc;
+    }
   // EXTRACT(field FROM source) — the datetime field special form (timezones.md §9.2, grammar.md §50).
   // The field is syntactic (identifier or string literal, lowercased at parse); resolves to numeric.
-  | { kind: "extract"; field: string; source: Expr }
+  // `loc` is the EXTRACT keyword's source character position.
+  | { kind: "extract"; field: string; source: Expr; loc?: SrcLoc }
   // expr COLLATE "name" — the postfix collation operator (spec/design/collation.md §1). Sets an
   // EXPLICIT collation on a text expression for the surrounding comparison / ORDER BY; binds at the
   // postfix/typecast level (tighter than || and the comparisons — PG precedence). `collation` is a
@@ -179,7 +192,7 @@ export type Expr =
   // `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON `JSON()` constructor
   // (spec/design/json-sql-functions.md §5): parse a character string to a `json` value (verbatim).
   // Malformed → 22P02; `WITH UNIQUE KEYS` on a duplicate object key → 22030. STRICT.
-  | { kind: "jsonCtor"; operand: Expr; uniqueKeys: boolean }
+  | { kind: "jsonCtor"; operand: Expr; uniqueKeys: boolean; loc?: SrcLoc }
   // `JSON_EXISTS(ctx, path [behavior ON ERROR])` — the SQL/JSON existence predicate
   // (json-sql-functions.md §5, S2). The path is evaluated over the context item; a non-empty
   // sequence → true. The default `ON ERROR` behavior is `FALSE`. `passing` binds the path's `$name`
@@ -190,6 +203,8 @@ export type Expr =
       path: Expr;
       passing: JsonPassing[];
       onError: JsonOnBehavior | null;
+      // The keyword's source character position.
+      loc?: SrcLoc;
     }
   // `JSON_VALUE(ctx, path [RETURNING type] [ON EMPTY] [ON ERROR])` — extract a single SCALAR item,
   // coerced to the RETURNING type (default `text`). Empty → ON EMPTY (default NULL); a non-scalar /
@@ -202,6 +217,8 @@ export type Expr =
       returning: string | null;
       onEmpty: JsonBehavior | null;
       onError: JsonBehavior | null;
+      // The keyword's source character position.
+      loc?: SrcLoc;
     }
   // `JSON_QUERY(ctx, path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])` — extract a
   // JSON value (default `jsonb`). `wrapper` controls array-wrapping; `keepQuotes` controls scalar-
@@ -216,6 +233,8 @@ export type Expr =
       keepQuotes: boolean;
       onEmpty: JsonBehavior | null;
       onError: JsonBehavior | null;
+      // The keyword's source character position.
+      loc?: SrcLoc;
     }
   // `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
   // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
@@ -251,7 +270,9 @@ export type Expr =
   | {
       kind: "case";
       operand: Expr | null;
-      whens: { cond: Expr; result: Expr }[];
+      // Each WHEN's `loc` is its WHEN keyword's source character position — a simple CASE's
+      // comparison is reported there (spec/design/error-fields.md §10.2).
+      whens: { cond: Expr; result: Expr; loc?: SrcLoc }[];
       els: Expr | null;
       // The CASE keyword's source character position.
       loc?: SrcLoc;
@@ -259,12 +280,12 @@ export type Expr =
   // COALESCE(a, b, …) — the first non-NULL argument, lazily evaluated left to right like CASE
   // (spec/design/grammar.md §51). `args` has ≥1 entries (an empty list is 42601 at parse);
   // argument types unify exactly like CASE result arms.
-  | { kind: "coalesce"; args: Expr[] }
+  | { kind: "coalesce"; args: Expr[]; loc?: SrcLoc }
   // GREATEST(a, b, …) / LEAST(a, b, …) — the variadic max/min (spec/design/grammar.md §52). NULL
   // arguments are ignored; the result is NULL only when every argument is NULL. Unlike COALESCE it
   // is EAGER — every argument is evaluated. `greatest` selects max (true) vs min (false). `args`
   // has ≥1 entries (empty is 42601 at parse); argument types unify exactly like CASE result arms.
-  | { kind: "greatestLeast"; args: Expr[]; greatest: boolean }
+  | { kind: "greatestLeast"; args: Expr[]; greatest: boolean; loc?: SrcLoc }
   // NULLIF(a, b) — NULL when a = b, else a (spec/design/grammar.md §58). `args` is exactly [a, b]
   // (any other count is 42601 at parse). EAGER — both arguments are evaluated.
   | { kind: "nullIf"; args: Expr[]; loc?: SrcLoc }
@@ -328,10 +349,12 @@ export type Expr =
     }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a
-  // correlated one is re-executed per outer row. A `$N` inside is a 0A000.
-  | { kind: "scalarSubquery"; query: QueryExpr }
-  // `EXISTS ( query_expr )` (a leading NOT is the ordinary unary connective). grammar.md §26.
-  | { kind: "exists"; query: QueryExpr }
+  // correlated one is re-executed per outer row. A `$N` inside is a 0A000. `loc` is the opening
+  // `(`'s source character position.
+  | { kind: "scalarSubquery"; query: QueryExpr; loc?: SrcLoc }
+  // `EXISTS ( query_expr )` (a leading NOT is the ordinary unary connective). grammar.md §26. `loc` is
+  // the EXISTS keyword's source character position.
+  | { kind: "exists"; query: QueryExpr; loc?: SrcLoc }
   // `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26) — membership of lhs in the
   // subquery's single output column (three-valued, like a literal IN).
   | { kind: "inSubquery"; lhs: Expr; query: QueryExpr; negated: boolean; loc?: SrcLoc }
@@ -355,12 +378,14 @@ export type Expr =
     }
   // A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value from
   // the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The bare
-  // `(a, b)` form is deferred (0A000); only the keyword form parses.
-  | { kind: "row"; fields: Expr[] }
+  // `(a, b)` form is the same row. `loc` is the ROW keyword's source character position (the `(` of
+  // the bare form — spec/design/error-fields.md §10.2).
+  | { kind: "row"; fields: Expr[]; loc?: SrcLoc }
   // An `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Builds a 1-D array value from
   // the element expressions, unified to a common element type at resolve; `ARRAY[]` is the empty
-  // array (its element type comes from an enclosing cast/column context).
-  | { kind: "array"; elements: Expr[] }
+  // array (its element type comes from an enclosing cast/column context). `loc` is the ARRAY
+  // keyword's source character position.
+  | { kind: "array"; elements: Expr[]; loc?: SrcLoc }
   // Field selection `(expr).field` (spec/design/composite.md §S4) — the value of one named field of
   // a composite `base`. The parser produces this for a `.name` postfix on a parenthesized / ROW(…) /
   // cast / qualified-column base; a bare `a.b` stays qualifiedColumn and only falls back to field
@@ -429,7 +454,7 @@ export type OrderKey = {
   // column-reference key (ordinal and expr both null).
   qualifier: string | null;
   column: string;
-  // The column-reference key's source character position (SrcLoc).
+  // The column-reference or ordinal key's source character position (SrcLoc).
   loc?: SrcLoc;
   // An optional explicit `COLLATE "name"` on this sort key (spec/design/collation.md §1); null means
   // the column's collation (the database default, C, until slice 1d). A non-C name orders this key by
@@ -504,6 +529,9 @@ export type FrameBound =
 export type ColumnDef = {
   name: string;
   typeName: string;
+  // The type name's source character position — an unknown type's 42704 (spec/design/error-fields.md
+  // §10.2).
+  typeLoc?: SrcLoc;
   typeMod: TypeMod | null;
   primaryKey: boolean;
   notNull: boolean;
@@ -1002,7 +1030,8 @@ export type Overriding = "system" | "user";
 // which substitutes the target column's declared default (or NULL if it has none). The DEFAULT
 // keyword is not reserved (spec/design/grammar.md §3). See spec/design/constraints.md §2.
 export type InsertValue =
-  | { kind: "lit"; lit: Literal }
+  // A literal and its source character position (spec/design/error-fields.md §10.2).
+  | { kind: "lit"; lit: Literal; loc?: SrcLoc }
   // A bind parameter $N (1-based), bound at execute — spec/design/api.md §5.
   | { kind: "param"; index: number }
   // A ROW(…) constructor in a VALUES slot (spec/design/composite.md §1) — a composite value for a

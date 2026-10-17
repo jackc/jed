@@ -291,7 +291,7 @@ fn resolve_comparison(
     // row, and its single row compares as an anonymous composite. Only this direction — a
     // subquery on the left stays a scalar subquery (42601 for >1 column), like PostgreSQL.
     let (rl, lt, rr, rt) = match (lhs, rhs) {
-        (Expr::Row(items), Expr::ScalarSubquery(q)) => outline(|| {
+        (Expr::Row(items, _), Expr::ScalarSubquery(q, _)) => outline(|| {
             let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
             let (plan, rt) = plan_row_subquery(scope, q, items.len(), params)?;
             let rr = RExpr::Subquery {
@@ -1459,7 +1459,7 @@ pub(crate) fn resolve_scalar_array_operands(
     let fa = resolve_first(scope, array, agg, params)?;
     // A bare parameter array operand takes the array of `x`'s type (api.md §5): `id = ANY($1)`
     // binds a list of ids.
-    if let Expr::Param(n1) = array {
+    if let Expr::Param(n1, _) = array {
         if let Some(elem) = array_param_elem(scope, &lt) {
             let arr_rt = ResolvedType::Array(Box::new(lt.clone()));
             let (ra, at) = resolve_param_node(
@@ -2073,8 +2073,8 @@ pub(crate) fn resolve_text_operand_pair(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
-    let lhs_param = matches!(lhs, Expr::Param(_));
-    let rhs_param = matches!(rhs, Expr::Param(_));
+    let lhs_param = matches!(lhs, Expr::Param(_, _));
+    let rhs_param = matches!(rhs, Expr::Param(_, _));
     if !lhs_param && !rhs_param {
         return resolve_operand_pair(scope, lhs, rhs, agg, params);
     }
@@ -2093,7 +2093,7 @@ pub(crate) fn is_adaptable_operand(e: &Expr) -> bool {
         Expr::Literal(Literal::Int(_), _)
             | Expr::Literal(Literal::Decimal(_), _)
             | Expr::Literal(Literal::Text(_), _)
-            | Expr::Param(_)
+            | Expr::Param(_, _)
     )
 }
 

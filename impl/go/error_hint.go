@@ -44,7 +44,45 @@ const (
 	hintQualifyColumn = "To reference that column, you must use a table-qualified name."
 	// hintTryQualified — 42703, several unreachable relations have the column (errorMissingColumn).
 	hintTryQualified = "Try using a table-qualified name."
+	// hintCollationImplicitMismatch — 42P21, two different implicit collations meet where a collation
+	// is required at plan time (select_common_collation, assign_collations_walker, parse_collate.c).
+	hintCollationImplicitMismatch = "You can choose the collation by applying the COLLATE clause to one or both expressions."
+	// hintRecursiveTermCollation — 42P21, a recursive CTE's recursive term changes a column's
+	// collation (parse_cte.c).
+	hintRecursiveTermCollation = "Use the COLLATE clause to set the collation of the non-recursive term."
+	// hintIndeterminateCollation — 42P22, no collation could be determined for a value that needs one
+	// (varstr_cmp, intorel_startup, …).
+	hintIndeterminateCollation = "Use the COLLATE clause to set the collation explicitly."
+	// hintDropCascade — 2BP01, a DROP (or ALTER TABLE … DROP) that other objects depend on, where the
+	// statement accepts CASCADE (reportDependentObjects, dependency.c).
+	hintDropCascade = "Use DROP ... CASCADE to drop the dependent objects too."
 )
+
+// dropOwnerInsteadHint — 2BP01, dropping an index a constraint owns (findDependentObjects,
+// dependency.c).
+func dropOwnerInsteadHint(constraint, table string) string {
+	return "You can drop constraint " + constraint + " on table " + table + " instead."
+}
+
+// unreachableColumnDetail — 42703 Detail: one relation the reference cannot see has the column
+// (errorMissingColumn, spec/design/error-fields.md §11.8).
+func unreachableColumnDetail(column, label string) string {
+	return "There is a column named \"" + column + "\" in table \"" + label +
+		"\", but it cannot be referenced from this part of the query."
+}
+
+// unreachableColumnsDetail — 42703 Detail: several relations the reference cannot see have the
+// column (errorMissingColumn).
+func unreachableColumnsDetail(column string) string {
+	return "There are columns named \"" + column +
+		"\", but they are in tables that cannot be referenced from this part of the query."
+}
+
+// unreachableTableDetail — 42P01 Detail: the qualifier names a relation the reference cannot see
+// (errorMissingRTE).
+func unreachableTableDetail(label string) string {
+	return "There is an entry for table \"" + label + "\", but it cannot be referenced from this part of the query."
+}
 
 // maxFuzzyDistance is PostgreSQL's MAX_FUZZY_DISTANCE; the search starts one above it.
 const maxFuzzyDistance = 3
@@ -185,16 +223,22 @@ func (s *scope) locateColumnError(err error, qualifier string, hasQualifier bool
 	if !errors.As(err, &e) || e.Position != 0 {
 		return err
 	}
+	var hint, detail string
 	switch e.State {
 	case UndefinedColumn:
-		e.withPosition(int32(pos)).withHint(s.columnHint(qualifier, hasQualifier, name))
+		hint, detail = s.columnHint(qualifier, hasQualifier, name)
+		e.withPosition(int32(pos)).withHint(hint)
 	case UndefinedTable:
 		e.withPosition(int32(pos))
 		if hasQualifier {
-			e.withHint(s.tableHint(qualifier))
+			hint, detail = s.tableHint(qualifier)
+			e.withHint(hint)
 		}
 	case AmbiguousColumn, AmbiguousAlias, InvalidColumnReference:
 		e.withPosition(int32(pos))
+	}
+	if e.Detail == "" {
+		e.withDetail(detail)
 	}
 	return err
 }
@@ -343,10 +387,11 @@ func (s *scope) hintWalk() []hintEntry {
 	return out
 }
 
-// columnHint is PostgreSQL's errorMissingColumn hint (spec/design/error-fields.md §11.1, §11.8), or "":
-// a relation that has the column but cannot be seen from here yields the LATERAL or qualified-name
-// hint; otherwise the misspelled-column suggestion.
-func (s *scope) columnHint(qualifier string, hasQualifier bool, name string) string {
+// columnHint is PostgreSQL's errorMissingColumn hint and detail (spec/design/error-fields.md §11.1,
+// §11.8), each "" when absent: a relation that has the column but cannot be seen from here yields the
+// "cannot be referenced" detail and the LATERAL or qualified-name hint; otherwise the misspelled-column
+// suggestion.
+func (s *scope) columnHint(qualifier string, hasQualifier bool, name string) (string, string) {
 	entries := s.hintWalk()
 	m := newFuzzyColumnMatch(qualifier, hasQualifier, name)
 	var exact []hintEntry
@@ -361,38 +406,39 @@ func (s *scope) columnHint(qualifier string, hasQualifier bool, name string) str
 	}
 	switch {
 	case len(exact) == 0:
-		return m.hint()
-	case len(exact) == 1 && exact[0].lateralOK:
-		return hintLateralColumn
-	case len(exact) == 1 && !hasQualifier && exact[0].qualifiedOnly:
-		return hintQualifyColumn
+		return m.hint(), ""
 	case len(exact) == 1:
-		return ""
+		hint := ""
+		if exact[0].lateralOK {
+			hint = hintLateralColumn
+		} else if !hasQualifier && exact[0].qualifiedOnly {
+			hint = hintQualifyColumn
+		}
+		return hint, unreachableColumnDetail(name, exact[0].label)
 	case !hasQualifier:
-		return hintTryQualified
+		return hintTryQualified, unreachableColumnsDetail(name)
 	}
-	return ""
+	return "", unreachableColumnsDetail(name)
 }
 
-// tableHint is PostgreSQL's errorMissingRTE hint (spec/design/error-fields.md §11.2, §11.8), or "": the
-// first relation in the walk labeled qualifier, or naming that base table or view. A visible one under
-// a different label is the table-alias hint; one hidden from a non-LATERAL subquery is the LATERAL
-// hint.
-func (s *scope) tableHint(qualifier string) string {
+// tableHint is PostgreSQL's errorMissingRTE hint and detail (spec/design/error-fields.md §11.2,
+// §11.8), each "" when absent: the first relation in the walk labeled qualifier, or naming that base
+// table or view. A visible one under a different label is the table-alias hint; any other found
+// relation gets the "cannot be referenced" detail, plus the LATERAL hint when it is hidden from a
+// non-LATERAL subquery.
+func (s *scope) tableHint(qualifier string) (string, string) {
 	for _, e := range s.hintWalk() {
 		if e.label != qualifier && (e.catalog == "" || e.catalog != qualifier) {
 			continue
 		}
-		if e.visible {
-			if e.label != qualifier {
-				return aliasHint(e.label)
-			}
-			return ""
+		if e.visible && e.label != qualifier {
+			return aliasHint(e.label), ""
 		}
-		if e.lateralOK {
-			return hintLateralTable
+		hint := ""
+		if !e.visible && e.lateralOK {
+			hint = hintLateralTable
 		}
-		return ""
+		return hint, unreachableTableDetail(e.label)
 	}
-	return ""
+	return "", ""
 }

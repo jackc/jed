@@ -605,6 +605,9 @@ pub struct ColumnDef {
     pub name: String,
     /// The type name as written (canonical or alias); resolved during analysis.
     pub type_name: String,
+    /// The type name's character position — an unknown type's `42704` (spec/design/error-fields.md
+    /// §10.2); invisible to equality.
+    pub type_pos: SrcPos,
     /// An optional parenthesized type modifier, `numeric(p[,s])` — the first parameterized
     /// type. Meaningful only for decimal; validated at resolve (spec/design/grammar.md §14).
     pub type_mod: Option<TypeMod>,
@@ -757,7 +760,8 @@ pub enum InsertSource {
 /// reserved (spec/design/grammar.md §3). See spec/design/constraints.md §2.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InsertValue {
-    Lit(Literal),
+    /// A literal and its character position (spec/design/error-fields.md §10.2).
+    Lit(Literal, SrcPos),
     /// A bind parameter `$N` (1-based); typed against the target column at resolve.
     Param(u32),
     Default,
@@ -1365,12 +1369,14 @@ pub enum Expr {
     Literal(Literal, SrcPos),
     /// A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value
     /// from the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The
-    /// bare parenthesized `(a, b)` form is deferred (`0A000`) — only the keyword form is parsed.
-    Row(Vec<Expr>),
+    /// bare parenthesized `(a, b)` form is the same row. The position is the `ROW` keyword's (the
+    /// `(` of the bare form — spec/design/error-fields.md §10.2).
+    Row(Vec<Expr>, SrcPos),
     /// An `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Builds a 1-D array value
     /// from the element expressions, unified to a common element type at resolve; `ARRAY[]` is the
-    /// empty array (its element type comes from an enclosing cast/column context).
-    Array(Vec<Expr>),
+    /// empty array (its element type comes from an enclosing cast/column context). The position is
+    /// the `ARRAY` keyword's (spec/design/error-fields.md §10.2).
+    Array(Vec<Expr>, SrcPos),
     /// Field selection `(expr).field` (spec/design/composite.md §S4) — the value of one named field
     /// of a composite `base`. The parser produces this for a `.name` postfix on a parenthesized /
     /// `ROW(…)` / cast / qualified-column base; a bare `a.b` stays `QualifiedColumn` and only falls
@@ -1421,12 +1427,14 @@ pub enum Expr {
         text: String,
         /// The string token's character position (spec/design/error-fields.md §10.2).
         pos: SrcPos,
+        /// The type name's character position — an unknown type's `42704` (§10.2).
+        type_pos: SrcPos,
     },
-    /// A bind parameter `$N` (1-based index). Like an integer/string literal it is an
-    /// *adaptable* operand: its type is inferred from context at resolve (sibling operand,
-    /// target column, or CAST target), and the host binds a value at execute time
-    /// (spec/design/api.md §5). An indeterminate type is 42P18.
-    Param(u32),
+    /// A bind parameter `$N` (1-based index) and its token's character position. Like an
+    /// integer/string literal it is an *adaptable* operand: its type is inferred from context at
+    /// resolve (sibling operand, target column, or CAST target), and the host binds a value at
+    /// execute time (spec/design/api.md §5). An indeterminate type is 42P18.
+    Param(u32, SrcPos),
     Cast {
         inner: Box<Expr>,
         type_name: String,
@@ -1435,6 +1443,11 @@ pub enum Expr {
         /// The `CAST` keyword's character position; `SrcPos::NONE` for the postfix `::` form, whose
         /// location is its operand's (spec/design/error-fields.md §10.2).
         pos: SrcPos,
+        /// The cast's own token — the `::` or the `CAST` keyword — where a cast that has no
+        /// conversion is reported (spec/design/error-fields.md §10.2).
+        cast_pos: SrcPos,
+        /// The target type name's character position — an unknown type's `42704` (§10.2).
+        type_pos: SrcPos,
     },
     /// `EXTRACT(field FROM source)` (spec/design/timezones.md §9.2, grammar.md §50) — the datetime
     /// field special form. `field` is the syntactic field name (an identifier or a string literal,
@@ -1443,6 +1456,8 @@ pub enum Expr {
     Extract {
         field: String,
         source: Box<Expr>,
+        /// The `EXTRACT` keyword's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// `expr COLLATE "name"` — the postfix collation operator (spec/design/collation.md §1). Sets
     /// an EXPLICIT collation on a text expression for the surrounding comparison / `ORDER BY`. Binds
@@ -1490,6 +1505,8 @@ pub enum Expr {
     JsonCtor {
         operand: Box<Expr>,
         unique_keys: bool,
+        /// The `JSON` keyword's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// `JSON_EXISTS(ctx, path [behavior ON ERROR])` — the SQL/JSON existence predicate
     /// (json-sql-functions.md §5, S2). The path is evaluated over the context item; a non-empty
@@ -1500,6 +1517,8 @@ pub enum Expr {
         path: Box<Expr>,
         passing: Vec<JsonPassing>,
         on_error: Option<JsonOnBehavior>,
+        /// The keyword's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// `JSON_VALUE(ctx, path [RETURNING type] [ON EMPTY] [ON ERROR])` — extract a single SCALAR
     /// item, coerced to the RETURNING type (default `text`). Empty → ON EMPTY (default NULL); a
@@ -1511,6 +1530,8 @@ pub enum Expr {
         returning: Option<String>,
         on_empty: Option<JsonBehavior>,
         on_error: Option<JsonBehavior>,
+        /// The keyword's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// `JSON_QUERY(ctx, path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])` — extract a
     /// JSON value (default `jsonb`). `wrapper` controls array-wrapping; `quotes` controls scalar-string
@@ -1525,6 +1546,8 @@ pub enum Expr {
         keep_quotes: bool,
         on_empty: Option<JsonBehavior>,
         on_error: Option<JsonBehavior>,
+        /// The keyword's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
     /// keyword: `negated = true` is `IS NOT DISTINCT FROM` (NULL-safe `=`); `false` is
@@ -1598,11 +1621,15 @@ pub enum Expr {
         els: Option<Box<Expr>>,
         /// The `CASE` keyword's character position (spec/design/error-fields.md §10.2).
         pos: SrcPos,
+        /// Each `WHEN` keyword's character position, index-aligned with `whens` — a simple CASE's
+        /// comparison is reported there (spec/design/error-fields.md §10.2). Always as long as
+        /// `whens` (`SrcPos::NONE` entries when no positions were recorded), so equality is unaffected.
+        when_pos: Vec<SrcPos>,
     },
     /// `COALESCE(a, b, …)` — the first non-NULL argument, lazily evaluated left to right like
     /// CASE (grammar.md §51). The argument list has ≥1 entries (an empty list is 42601 at
-    /// parse); argument types unify exactly like CASE result arms.
-    Coalesce(Vec<Expr>),
+    /// parse); argument types unify exactly like CASE result arms. The position is the keyword's.
+    Coalesce(Vec<Expr>, SrcPos),
     /// `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52). NULL
     /// arguments are ignored; the result is NULL only when every argument is NULL. Unlike
     /// COALESCE this is EAGER — every argument is evaluated. `greatest` selects max (true) vs
@@ -1611,6 +1638,8 @@ pub enum Expr {
     GreatestLeast {
         args: Vec<Expr>,
         greatest: bool,
+        /// The keyword's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// `NULLIF(a, b)` — NULL when `a = b`, else `a` (grammar.md §58). Exactly two arguments
     /// (`[a, b]`; any other count is 42601 at parse). EAGER like GREATEST/LEAST — both arguments
@@ -1687,11 +1716,12 @@ pub enum Expr {
     },
     /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). `resolve`
     /// plans it once against the scope chain; an uncorrelated one is then folded to a constant,
-    /// a correlated one is re-executed per outer row. A `$N` inside is a `0A000`.
-    ScalarSubquery(Box<QueryExpr>),
+    /// a correlated one is re-executed per outer row. A `$N` inside is a `0A000`. The position is
+    /// the opening `(`'s (spec/design/error-fields.md §10.2).
+    ScalarSubquery(Box<QueryExpr>, SrcPos),
     /// `EXISTS ( query_expr )` (grammar.md §26) — the bare existence predicate (a leading `NOT`
-    /// is the ordinary unary connective wrapping this).
-    Exists(Box<QueryExpr>),
+    /// is the ordinary unary connective wrapping this). The position is the `EXISTS` keyword's.
+    Exists(Box<QueryExpr>, SrcPos),
     /// `lhs [NOT] IN ( query_expr )` (grammar.md §26) — membership of `lhs` in the subquery's
     /// single output column (three-valued, like a literal `IN`).
     InSubquery {
@@ -1734,8 +1764,8 @@ impl Expr {
     /// The expression's location for an error that names the whole expression — PostgreSQL's
     /// `exprLocation`, the leftmost character the expression was written at, its folded grouping
     /// parentheses excluded (spec/design/error-fields.md §10.2). `SrcPos::NONE` when jed did not
-    /// record it (a bind parameter, a subquery, a constructor keyword, stored text): the error then
-    /// carries no position rather than a wrong one.
+    /// record it (stored text, or a `CAST(x AS t)` whose location depends on the conversion): the
+    /// error then carries no position rather than a wrong one.
     pub fn location(&self) -> SrcPos {
         match self {
             Expr::Column(_, pos)
@@ -1744,7 +1774,19 @@ impl Expr {
             | Expr::TypedLiteral { pos, .. }
             | Expr::Unary { pos, .. }
             | Expr::Case { pos, .. }
-            | Expr::FuncCall { pos, .. } => *pos,
+            | Expr::FuncCall { pos, .. }
+            | Expr::Param(_, pos)
+            | Expr::Row(_, pos)
+            | Expr::Array(_, pos)
+            | Expr::Coalesce(_, pos)
+            | Expr::GreatestLeast { pos, .. }
+            | Expr::Extract { pos, .. }
+            | Expr::ScalarSubquery(_, pos)
+            | Expr::Exists(_, pos)
+            | Expr::JsonCtor { pos, .. }
+            | Expr::JsonExists { pos, .. }
+            | Expr::JsonValue { pos, .. }
+            | Expr::JsonQuery { pos, .. } => *pos,
             // A `::` cast is located at its operand (the leftmost token). `CAST(x AS t)` is located
             // at a string or NULL literal operand (PostgreSQL coerces it in place); any other
             // operand's location depends on whether the coercion is a no-op, so it is unknown.
@@ -1919,7 +1961,7 @@ pub struct OrderKey {
     /// column-reference key (`ordinal` and `expr` both `None`).
     pub qualifier: Option<String>,
     pub column: String,
-    /// The column-reference key's character position (spec/design/error-fields.md §10.2).
+    /// The column-reference or ordinal key's character position (spec/design/error-fields.md §10.2).
     pub pos: SrcPos,
     /// An optional explicit `COLLATE "name"` on this sort key (`ORDER BY name COLLATE "en-US"`,
     /// spec/design/collation.md §1). `None` ⇒ the column's collation (the database default, `C`,
@@ -1928,6 +1970,17 @@ pub struct OrderKey {
     pub collation: Option<String>,
     pub descending: bool,
     pub nulls_first: bool,
+}
+
+impl OrderKey {
+    /// Where the key was written (spec/design/error-fields.md §10.2): an expression key's location,
+    /// else the column reference or ordinal.
+    pub fn location(&self) -> SrcPos {
+        match &self.expr {
+            Some(e) => e.location(),
+            None => self.pos,
+        }
+    }
 }
 
 /// One window `ORDER BY` sort key (spec/design/window.md §3/§5.1). Unlike the query `OrderKey`

@@ -1070,6 +1070,18 @@ export function exprLocation(e: Expr): number | undefined {
     case "unary":
     case "case":
     case "funcCall":
+    case "param":
+    case "row":
+    case "array":
+    case "coalesce":
+    case "greatestLeast":
+    case "extract":
+    case "scalarSubquery":
+    case "exists":
+    case "jsonCtor":
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
       return e.loc;
     case "cast": {
       // A `::` cast is located at its operand (the leftmost token). CAST(x AS t) is located at a
@@ -1146,11 +1158,20 @@ export function outputColumnIsStringLiteral(q: QueryExpr, i: number): boolean {
   return !grouped;
 }
 
+// orderKeyLocation is where an ORDER BY key was written (spec/design/error-fields.md §10.2): an
+// expression key's location, else the column reference or ordinal.
+export function orderKeyLocation(key: OrderKey): number | undefined {
+  return key.expr !== null ? exprLocation(key.expr) : key.loc;
+}
+
 export function outputColumnLocation(q: QueryExpr, i: number): number | undefined {
   if (q.kind !== "select" || q.items.kind !== "list") return undefined;
   const item = q.items.items[i];
   return item === undefined ? undefined : exprLocation(item.expr);
 }
+
+// POSITION_KEYS are the AST keys that record source positions, all invisible to structural equality.
+const POSITION_KEYS = new Set(["pos", "loc", "castLoc", "typeLoc"]);
 
 export function astDeepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true; // identical primitives (incl. equal bigints) and the same reference
@@ -1170,8 +1191,8 @@ export function astDeepEqual(a: unknown, b: unknown): boolean {
   // spec/design/views.md §5/§7), and a `loc` key a source character position (ast.ts SrcLoc,
   // spec/design/error-fields.md §10.4); both are invisible to structural equality, like Rust's
   // always-equal TableRefPos / StarPos / SrcPos.
-  const ak = Object.keys(ao).filter((k) => k !== "pos" && k !== "loc");
-  if (ak.length !== Object.keys(bo).filter((k) => k !== "pos" && k !== "loc").length) return false;
+  const ak = Object.keys(ao).filter((k) => !POSITION_KEYS.has(k));
+  if (ak.length !== Object.keys(bo).filter((k) => !POSITION_KEYS.has(k)).length) return false;
   for (const k of ak) {
     if (!Object.hasOwn(bo, k)) return false;
     if (!astDeepEqual(ao[k], bo[k])) return false;

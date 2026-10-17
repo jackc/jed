@@ -924,7 +924,10 @@ function setMode(t: TmFromChar, mode: number): void {
   if (mode !== MODE_NONE) {
     if (t.mode === MODE_NONE) t.mode = mode;
     else if (t.mode !== mode) {
-      throw engineError("invalid_datetime_format", "invalid combination of date conventions");
+      throw engineError(
+        "invalid_datetime_format",
+        "invalid combination of date conventions",
+      ).hinted("Do not mix Gregorian and ISO week date conventions in a formatting template.");
     }
   }
 }
@@ -935,7 +938,7 @@ function fromCharSetInt(out: TmFromChar, dest: TmField, value: number, n: FmtNod
     throw engineError(
       "invalid_datetime_format",
       `conflicting values for "${n.key!.name}" field in formatting string`,
-    );
+    ).withDetail("This value contradicts a previous setting for the same field type.");
   }
   out[dest] = value;
 }
@@ -965,12 +968,15 @@ function cStrtol(s: string, start: number): [bigint, number, boolean] {
   return [neg ? -acc : acc, i, false];
 }
 
-function invalidValue(cp: string, n: FmtNode): EngineError {
+function invalidValue(cp: string, n: FmtNode, detail: string): EngineError {
   return engineError(
     "invalid_datetime_format",
     `invalid value "${fromBytes(cp)}" for "${n.key!.name}"`,
-  );
+  ).withDetail(detail);
 }
+
+// FM_HINT is formatting.c's hint on a fixed-width field the source string cannot fill.
+const FM_HINT = 'If your source string is not fixed-width, try using the "FM" modifier.';
 
 // DchReader is DCH_from_char's state: the input (a byte string), the position, and the node list.
 class DchReader {
@@ -1019,19 +1025,27 @@ class DchReader {
         throw engineError(
           "invalid_datetime_format",
           `source string too short for "${n.key!.name}" formatting field`,
-        );
+        )
+          .withDetail(`Field requires ${ln} characters, but only ${used} remain.`)
+          .hinted(FM_HINT);
       }
       let last: number;
       [result, last, erange] = cStrtol(cp, 0);
-      if (last > 0 && last < ln) throw invalidValue(cp, n);
+      if (last > 0 && last < ln) {
+        throw invalidValue(
+          cp,
+          n,
+          `Field requires ${ln} characters, but only ${last} could be parsed.`,
+        ).hinted(FM_HINT);
+      }
       this.pos += last;
     }
-    if (this.pos === init) throw invalidValue(cp, n);
+    if (this.pos === init) throw invalidValue(cp, n, "Value must be an integer.");
     if (erange || result < BigInt(INT32_MIN) || result > BigInt(INT32_MAX)) {
       throw engineError(
         "datetime_field_overflow",
         `value for "${n.key!.name}" in source string is out of range`,
-      );
+      ).withDetail(`Value must be in the range ${INT32_MIN} to ${INT32_MAX}.`);
     }
     if (dest !== null) fromCharSetInt(this.out, dest, Number(result), n);
     return this.pos - init;
@@ -1054,7 +1068,11 @@ class DchReader {
           break;
         }
       }
-      throw invalidValue(cp, this.nodes[i]!);
+      throw invalidValue(
+        cp,
+        this.nodes[i]!,
+        "The given value did not match any of the allowed values for this field.",
+      );
     }
     this.pos += ln;
     return idx;
@@ -1464,7 +1482,7 @@ function toTimestampParts(input: string, tmpl: string): TimestampParts {
       throw engineError(
         "invalid_datetime_format",
         `hour "${tm.hour}" is invalid for the 12-hour clock`,
-      );
+      ).hinted("Use the 24-hour clock, or give an hour between 1 and 12.");
     }
     if (tmfc.pm !== 0 && tm.hour < 12) tm.hour += 12;
     else if (tmfc.pm === 0 && tm.hour === 12) tm.hour = 0;

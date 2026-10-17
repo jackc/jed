@@ -212,6 +212,7 @@ impl Engine {
                         unreachable!("the anchor binding was just pushed as a query source")
                     };
                     check_recursive_column_types(
+                        anchor,
                         anchor_ref,
                         &rhs_plan,
                         &bindings[i].name,
@@ -1111,8 +1112,10 @@ impl Engine {
         // Every form but UNION ALL matches rows, so each column needs an equality operator (42883
         // for json / jsonpath, as PostgreSQL).
         if !(so.op == SetOpKind::Union && so.all) {
-            for t in &column_types {
-                require_setop_equality(t)?;
+            // PostgreSQL reports a missing equality operator at the left operand's column.
+            for (i, t) in column_types.iter().enumerate() {
+                require_setop_equality(t)
+                    .map_err(|e| e.with_position(output_column_location(&so.lhs, i).0))?;
             }
         }
         let column_names = lhs.column_names().to_vec();

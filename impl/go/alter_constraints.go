@@ -79,7 +79,8 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 		}
 	}
 	if !d.Cascade && (selfRefFkDep || incomingDep) {
-		return newError(DependentObjectsStillExist, "cannot drop column "+d.Name+" because other objects depend on it")
+		return newError(DependentObjectsStillExist, "cannot drop column "+d.Name+" because other objects depend on it").
+			hinted(hintDropCascade)
 	}
 	if d.Cascade && (*sources)[ci].original >= 0 {
 		oldColumn := (*sources)[ci].original
@@ -565,7 +566,8 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 				}
 			}
 			if len(deps) > 0 && !d.Cascade {
-				return newError(DependentObjectsStillExist, "cannot drop constraint "+d.Name+" because other objects depend on it")
+				return newError(DependentObjectsStillExist, "cannot drop constraint "+d.Name+" because other objects depend on it").
+					hinted(hintDropCascade)
 			}
 			if d.Cascade {
 				for _, dep := range deps {

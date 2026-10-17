@@ -11,6 +11,7 @@ import type { CreateTable, CreateTableAs, QueryExpr, Statement, WithExpr } from 
 import { cteBodyIsDataModifying } from "./ast.ts";
 import type { Column } from "./catalog.ts";
 import { engineError } from "./errors.ts";
+import { INDETERMINATE_COLLATION } from "./error_hint.ts";
 import {
   type QueryPlan,
   type ResolvedType,
@@ -49,7 +50,7 @@ export function ctasColumns(
       throw engineError(
         "indeterminate_collation",
         `no collation was derived for column "${names[i]!}" with collatable type ${rtName(t)}`,
-      );
+      ).hinted(INDETERMINATE_COLLATION);
     }
   });
   if (renames.length > types.length) {

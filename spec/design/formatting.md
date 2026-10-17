@@ -81,6 +81,13 @@ with one U+FFFD — Unicode's "substitution of maximal subparts" (§3.9), the ru
 `utf8` decoder replaces byte by byte. So `to_timestamp('20€401', 'YYYYMM')` reports `invalid value
 "20�" for "YYYY"` in every core, byte for byte; `spec/errors/detail_cases.txt` pins it.
 
+These input errors carry `formatting.c`'s Detail and Hint as PostgreSQL does (error-fields.md §9,
+§11): a fixed-width field the input cannot fill gives `Field requires 4 characters, but only 2 could
+be parsed.` (counted in bytes) with the hint to use `FM`; a non-integer field, an out-of-range field,
+an unmatched word, and a conflicting repeated field each have their Detail; mixed Gregorian and ISO
+conventions and an out-of-range 12-hour clock hour each have their Hint.
+`spec/errors/position_cases.txt` pins each.
+
 ## 3. `to_char` over datetimes and intervals
 
 The value is broken into PostgreSQL's `fmt_tm` (year, month, day, hour, minute, second, microsecond,

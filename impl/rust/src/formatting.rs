@@ -993,6 +993,9 @@ struct TmFromChar {
     ff: i32,
 }
 
+/// formatting.c's hint on a fixed-width field the source string cannot fill.
+const FM_HINT: &str = "If your source string is not fixed-width, try using the \"FM\" modifier.";
+
 impl TmFromChar {
     fn set_mode(&mut self, mode: u8) -> Result<()> {
         if mode != MODE_NONE {
@@ -1002,6 +1005,9 @@ impl TmFromChar {
                 return Err(EngineError::new(
                     SqlState::InvalidDatetimeFormat,
                     "invalid combination of date conventions",
+                )
+                .hinted(
+                    "Do not mix Gregorian and ISO week date conventions in a formatting template.",
                 ));
             }
         }
@@ -1018,7 +1024,10 @@ fn from_char_set_int(dest: &mut i32, value: i32, n: &FmtNode) -> Result<()> {
                 "conflicting values for \"{}\" field in formatting string",
                 n.key().name
             ),
-        ));
+        )
+        .with_detail(Some(
+            "This value contradicts a previous setting for the same field type.".to_string(),
+        )));
     }
     *dest = value;
     Ok(())
@@ -1122,14 +1131,22 @@ impl DchReader<'_, '_> {
                 return Err(EngineError::new(
                     SqlState::InvalidDatetimeFormat,
                     format!("source string too short for \"{name}\" formatting field"),
-                ));
+                )
+                .with_detail(Some(format!(
+                    "Field requires {ln} characters, but only {used} remain."
+                )))
+                .hinted(FM_HINT));
             }
             let (result, last, erange) = c_strtol(cp, 0);
             if last > 0 && last < ln {
                 return Err(EngineError::new(
                     SqlState::InvalidDatetimeFormat,
                     format!("invalid value \"{}\" for \"{name}\"", lossy(cp)),
-                ));
+                )
+                .with_detail(Some(format!(
+                    "Field requires {ln} characters, but only {last} could be parsed."
+                )))
+                .hinted(FM_HINT));
             }
             self.pos += last;
             (result, erange)
@@ -1138,13 +1155,19 @@ impl DchReader<'_, '_> {
             return Err(EngineError::new(
                 SqlState::InvalidDatetimeFormat,
                 format!("invalid value \"{}\" for \"{name}\"", lossy(cp)),
-            ));
+            )
+            .with_detail(Some("Value must be an integer.".to_string())));
         }
         if erange || result < i32::MIN as i64 || result > i32::MAX as i64 {
             return Err(EngineError::new(
                 SqlState::DatetimeFieldOverflow,
                 format!("value for \"{name}\" in source string is out of range"),
-            ));
+            )
+            .with_detail(Some(format!(
+                "Value must be in the range {} to {}.",
+                i32::MIN,
+                i32::MAX
+            ))));
         }
         if let Some(dest) = dest {
             from_char_set_int(dest, result as i32, &n)?;
@@ -1174,7 +1197,11 @@ impl DchReader<'_, '_> {
                     lossy(cp),
                     self.nodes[i].key().name
                 ),
-            ));
+            )
+            .with_detail(Some(
+                "The given value did not match any of the allowed values for this field."
+                    .to_string(),
+            )));
         };
         self.pos += ln;
         Ok(idx)
@@ -1583,7 +1610,8 @@ fn to_timestamp_parts(input: &str, tmpl: &str) -> Result<TimestampParts> {
             return Err(EngineError::new(
                 SqlState::InvalidDatetimeFormat,
                 format!("hour \"{}\" is invalid for the 12-hour clock", tm.hour),
-            ));
+            )
+            .hinted("Use the 24-hour clock, or give an hour between 1 and 12."));
         }
         if tmfc.pm != 0 && tm.hour < 12 {
             tm.hour += 12;

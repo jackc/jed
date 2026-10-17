@@ -541,7 +541,7 @@ pub(crate) fn materialize_insert_value(
 ) -> Result<Value> {
     match ty {
         ColType::Scalar(s) => match iv {
-            InsertValue::Lit(lit) => literal_to_value_for(lit, *s),
+            InsertValue::Lit(lit, _) => literal_to_value_for(lit, *s),
             InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
             InsertValue::Row(_) => Err(type_error(format!(
                 "cannot assign a record value to a {} field",
@@ -580,9 +580,9 @@ pub(crate) fn materialize_insert_value(
             // A bare NULL adapts to the composite as its whole-value NULL, and a bare string
             // literal adapts via record_in — the same unknown-literal-adapts-to-context rule the
             // array/range arms and the scalar slots follow (spec/design/composite.md §8).
-            InsertValue::Lit(Literal::Null) => Ok(Value::Null),
-            InsertValue::Lit(Literal::Text(s)) => coerce_record_text(s, name, fields, iz),
-            InsertValue::Lit(_) => Err(type_error(format!(
+            InsertValue::Lit(Literal::Null, _) => Ok(Value::Null),
+            InsertValue::Lit(Literal::Text(s), _) => coerce_record_text(s, name, fields, iz),
+            InsertValue::Lit(_, _) => Err(type_error(format!(
                 "cannot assign a scalar value to composite column (type {name})"
             ))),
             InsertValue::Array(_) => Err(type_error(format!(
@@ -620,10 +620,10 @@ pub(crate) fn materialize_insert_value(
             }
             // A bare string literal adapts to the array context via `array_in` (the same
             // string-adapts-to-context rule bytea/uuid use — types.md §6; spec/design/array.md §7).
-            InsertValue::Lit(Literal::Text(s)) => coerce_string_to_array(s, elem, iz),
-            InsertValue::Lit(Literal::Null) => Ok(Value::Null),
+            InsertValue::Lit(Literal::Text(s), _) => coerce_string_to_array(s, elem, iz),
+            InsertValue::Lit(Literal::Null, _) => Ok(Value::Null),
             InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
-            InsertValue::Lit(_) => Err(type_error(
+            InsertValue::Lit(_, _) => Err(type_error(
                 "cannot assign a scalar value to an array column".to_string(),
             )),
             InsertValue::Row(_) => Err(type_error(
@@ -649,12 +649,12 @@ pub(crate) fn materialize_insert_value(
             match iv {
                 // A bare string literal adapts to the range context via `range_in` (the same
                 // string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
-                InsertValue::Lit(Literal::Text(s)) => {
+                InsertValue::Lit(Literal::Text(s), _) => {
                     Ok(Value::Range(coerce_string_to_range(s, desc, iz)?))
                 }
-                InsertValue::Lit(Literal::Null) => Ok(Value::Null),
+                InsertValue::Lit(Literal::Null, _) => Ok(Value::Null),
                 InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
-                InsertValue::Lit(_) => Err(type_error(
+                InsertValue::Lit(_, _) => Err(type_error(
                     "cannot assign a scalar value to a range column".to_string(),
                 )),
                 InsertValue::Array(_) => Err(type_error(

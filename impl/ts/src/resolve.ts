@@ -76,7 +76,9 @@ import type {
 import type { Meter } from "./cost.ts";
 import { EngineError, atPosition, engineError, positionedAt } from "./errors.ts";
 import {
+  COLLATION_IMPLICIT_MISMATCH,
   FUNCTION_NO_MATCH,
+  INDETERMINATE_COLLATION,
   OPERATOR_AMBIGUOUS,
   OPERATOR_NO_MATCH,
   OPERATOR_NO_MATCH_PREFIX,
@@ -909,6 +911,19 @@ function locateNodeError(err: EngineError, e: Expr): EngineError {
       // A string literal adapting to its context (a uuid / bytea / date / json … sibling) is
       // input-converted here, like PostgreSQL's parse-time coercion of an unknown literal.
       if (e.literal.kind === "text") pos = e.loc;
+      break;
+    // A cast's unknown target type points at the type name; a cast with no conversion for its
+    // operand type at the `::` / CAST token (PostgreSQL's 42846, jed's 42804).
+    case "cast":
+      if (err.state === "undefined_object") pos = e.typeLoc;
+      else if (err.state === "datatype_mismatch") pos = e.castLoc;
+      break;
+    case "typedLiteral":
+      if (err.state === "undefined_object") pos = e.typeLoc;
+      break;
+    // EXTRACT is PostgreSQL's extract(…) function: a source type with none is its lookup failure.
+    case "extract":
+      if (err.state === "undefined_function") pos = e.loc;
       break;
   }
   // The operator's own type error — not one an operand decided, nor one positioned inside a
@@ -2470,6 +2485,8 @@ function resolveCaseExpr(
         op: "eq",
         lhs: e.operand,
         rhs: w.cond,
+        // The comparison is reported at its WHEN keyword (error-fields.md §10.2).
+        loc: w.loc,
       };
       cond = resolve(scope, eq, null, ag, params).node;
     } else {
@@ -2965,7 +2982,10 @@ export function sortTargetCollation(catalog: Engine, d: Deriv): Collation | null
 // sortTargetCollation).
 export function rejectIndeterminateTarget(d: Deriv): void {
   if (d.kind === "indeterminate") {
-    throw engineError("collation_mismatch", "collation mismatch between implicit collations");
+    throw engineError(
+      "collation_mismatch",
+      "collation mismatch between implicit collations",
+    ).hinted(COLLATION_IMPLICIT_MISMATCH);
   }
 }
 
@@ -3019,7 +3039,7 @@ export function commonCollation(inputs: Deriv[], noneOk: boolean): Deriv {
       names.length >= 2 && names[0] !== names[1]
         ? `collation mismatch between implicit collations "${names[0]}" and "${names[1]}"`
         : "collation mismatch between implicit collations";
-    throw engineError("collation_mismatch", msg);
+    throw engineError("collation_mismatch", msg).hinted(COLLATION_IMPLICIT_MISMATCH);
   }
   return d;
 }
@@ -3066,7 +3086,7 @@ export function combineDeriv(a: Deriv, b: Deriv): Deriv {
       throw engineError(
         "collation_mismatch",
         `collation mismatch between explicit collations "${a.name}" and "${b.name}"`,
-      );
+      ).noHint();
     }
     return a;
   }
@@ -3090,7 +3110,7 @@ export function resolveDeriv(catalog: Engine, d: Deriv): Collation | null {
     throw engineError(
       "indeterminate_collation",
       "could not determine which collation to use for string comparison",
-    );
+    ).hinted(INDETERMINATE_COLLATION);
   }
   if (d.kind === "implicit" || d.kind === "explicit") {
     return resolveCollationName(catalog, d.name);

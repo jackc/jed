@@ -7775,7 +7775,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
-        | Expr::Param(_) => false,
+        | Expr::Param(_, _) => false,
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_aggregate(inner),
         Expr::Collate { inner, .. } => expr_has_aggregate(inner),
         Expr::Unary { operand, .. } => expr_has_aggregate(operand),
@@ -7808,7 +7808,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::Like { lhs, rhs, .. } | Expr::Regex { lhs, rhs, .. } => {
             expr_has_aggregate(lhs) || expr_has_aggregate(rhs)
         }
-        Expr::Row(items) | Expr::Array(items) => items.iter().any(expr_has_aggregate),
+        Expr::Row(items, _) | Expr::Array(items, _) => items.iter().any(expr_has_aggregate),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_aggregate(base),
         Expr::QualifiedStar { .. } => false,
         Expr::Subscript { base, subscripts } => {
@@ -7830,14 +7830,14 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
                     .any(|(c, r)| expr_has_aggregate(c) || expr_has_aggregate(r))
                 || els.as_deref().is_some_and(expr_has_aggregate)
         }
-        Expr::Coalesce(args) => args.iter().any(expr_has_aggregate),
+        Expr::Coalesce(args, _) => args.iter().any(expr_has_aggregate),
         Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(expr_has_aggregate)
         }
         // A subquery is an independent query: an aggregate INSIDE it does not make the OUTER query
         // an aggregate query (the outer reference, if any, is just a constant to the subquery).
-        Expr::ScalarSubquery(_)
-        | Expr::Exists(_)
+        Expr::ScalarSubquery(_, _)
+        | Expr::Exists(_, _)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => false,
     }
@@ -7876,7 +7876,7 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
-        | Expr::Param(_) => false,
+        | Expr::Param(_, _) => false,
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_window(inner),
         Expr::Collate { inner, .. } => expr_has_window(inner),
         Expr::Unary { operand, .. } => expr_has_window(operand),
@@ -7907,7 +7907,7 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
         Expr::Like { lhs, rhs, .. } | Expr::Regex { lhs, rhs, .. } => {
             expr_has_window(lhs) || expr_has_window(rhs)
         }
-        Expr::Row(items) | Expr::Array(items) => items.iter().any(expr_has_window),
+        Expr::Row(items, _) | Expr::Array(items, _) => items.iter().any(expr_has_window),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_window(base),
         Expr::QualifiedStar { .. } => false,
         Expr::Subscript { base, subscripts } => {
@@ -7929,13 +7929,13 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
                     .any(|(c, r)| expr_has_window(c) || expr_has_window(r))
                 || els.as_deref().is_some_and(expr_has_window)
         }
-        Expr::Coalesce(args) => args.iter().any(expr_has_window),
+        Expr::Coalesce(args, _) => args.iter().any(expr_has_window),
         Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(expr_has_window)
         }
         // A subquery is an independent query: a window function inside it is the subquery's own.
-        Expr::ScalarSubquery(_)
-        | Expr::Exists(_)
+        Expr::ScalarSubquery(_, _)
+        | Expr::Exists(_, _)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => false,
     }
@@ -8116,7 +8116,7 @@ pub(crate) fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)
             desugar_named_windows(lhs, windows)?;
             desugar_named_windows(rhs, windows)?;
         }
-        Expr::Row(items) | Expr::Array(items) => {
+        Expr::Row(items, _) | Expr::Array(items, _) => {
             for x in items.iter_mut() {
                 desugar_named_windows(x, windows)?;
             }
@@ -8141,7 +8141,7 @@ pub(crate) fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)
                 desugar_named_windows(x, windows)?;
             }
         }
-        Expr::Coalesce(args) => {
+        Expr::Coalesce(args, _) => {
             for a in args.iter_mut() {
                 desugar_named_windows(a, windows)?;
             }
@@ -8163,14 +8163,14 @@ pub(crate) fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)
 /// interleaves these with resolution in parse order, a documented micro-order divergence).
 pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
     match e {
-        Expr::ScalarSubquery(_)
-        | Expr::Exists(_)
+        Expr::ScalarSubquery(_, _)
+        | Expr::Exists(_, _)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "cannot use subquery in check constraint",
         )),
-        Expr::Param(n) => Err(EngineError::new(
+        Expr::Param(n, _) => Err(EngineError::new(
             SqlState::UndefinedParameter,
             format!("there is no parameter ${n}"),
         )),
@@ -8226,7 +8226,9 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
             reject_check_structure(lhs)?;
             reject_check_structure(array)
         }
-        Expr::Row(items) | Expr::Array(items) => items.iter().try_for_each(reject_check_structure),
+        Expr::Row(items, _) | Expr::Array(items, _) => {
+            items.iter().try_for_each(reject_check_structure)
+        }
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_check_structure(base),
         // `t.*` cannot syntactically reach a CHECK expression (it is a select-item-only shape —
         // `CHECK (t.*)` is a 42601 in the parser); accept it structurally for exhaustiveness.
@@ -8261,7 +8263,7 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
                 None => Ok(()),
             }
         }
-        Expr::Coalesce(args) => {
+        Expr::Coalesce(args, _) => {
             for a in args {
                 reject_check_structure(a)?;
             }
@@ -8288,14 +8290,14 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
             SqlState::FeatureNotSupported,
             "cannot use column reference in DEFAULT expression",
         )),
-        Expr::ScalarSubquery(_)
-        | Expr::Exists(_)
+        Expr::ScalarSubquery(_, _)
+        | Expr::Exists(_, _)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "cannot use subquery in DEFAULT expression",
         )),
-        Expr::Param(n) => Err(EngineError::new(
+        Expr::Param(n, _) => Err(EngineError::new(
             SqlState::UndefinedParameter,
             format!("there is no parameter ${n}"),
         )),
@@ -8348,7 +8350,7 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
             reject_default_structure(lhs)?;
             reject_default_structure(array)
         }
-        Expr::Row(items) | Expr::Array(items) => {
+        Expr::Row(items, _) | Expr::Array(items, _) => {
             items.iter().try_for_each(reject_default_structure)
         }
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_default_structure(base),
@@ -8385,7 +8387,7 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
                 None => Ok(()),
             }
         }
-        Expr::Coalesce(args) => {
+        Expr::Coalesce(args, _) => {
             for a in args {
                 reject_default_structure(a)?;
             }
@@ -8415,7 +8417,7 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
         };
         match e {
             Expr::Column(name, _) | Expr::QualifiedColumn { name, .. } => note(name),
-            Expr::Literal(_, _) | Expr::TypedLiteral { .. } | Expr::Param(_) => {}
+            Expr::Literal(_, _) | Expr::TypedLiteral { .. } | Expr::Param(_, _) => {}
             Expr::Cast { inner, .. }
             | Expr::Collate { inner, .. }
             | Expr::Extract { source: inner, .. } => walk(inner, columns, out),
@@ -8477,7 +8479,7 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
                     walk(e, columns, out);
                 }
             }
-            Expr::Coalesce(args) => {
+            Expr::Coalesce(args, _) => {
                 for a in args {
                     walk(a, columns, out);
                 }
@@ -8492,7 +8494,7 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
                     walk(a, columns, out);
                 }
             }
-            Expr::Row(items) | Expr::Array(items) => {
+            Expr::Row(items, _) | Expr::Array(items, _) => {
                 for it in items {
                     walk(it, columns, out);
                 }
@@ -8507,8 +8509,8 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
                 }
             }
             // Unreachable in a validated check (rejected by `reject_check_structure`).
-            Expr::ScalarSubquery(_)
-            | Expr::Exists(_)
+            Expr::ScalarSubquery(_, _)
+            | Expr::Exists(_, _)
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. } => {}
         }
@@ -8545,14 +8547,14 @@ pub(crate) fn reject_index_predicate_structure(e: &Expr) -> Result<()> {
 /// [`index_expr_has_subquery`]'s traversal.
 pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
     match e {
-        Expr::Param(n) => Some(*n),
+        Expr::Param(n, _) => Some(*n),
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::QualifiedStar { .. } => None,
-        Expr::ScalarSubquery(_)
-        | Expr::Exists(_)
+        Expr::ScalarSubquery(_, _)
+        | Expr::Exists(_, _)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => None,
         Expr::Cast { inner, .. }
@@ -8604,12 +8606,14 @@ pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
                 })
             })
             .or_else(|| els.as_deref().and_then(index_expr_first_param)),
-        Expr::Coalesce(args) => args.iter().find_map(index_expr_first_param),
+        Expr::Coalesce(args, _) => args.iter().find_map(index_expr_first_param),
         Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().find_map(index_expr_first_param)
         }
         Expr::FuncCall { args, .. } => args.iter().find_map(index_expr_first_param),
-        Expr::Row(items) | Expr::Array(items) => items.iter().find_map(index_expr_first_param),
+        Expr::Row(items, _) | Expr::Array(items, _) => {
+            items.iter().find_map(index_expr_first_param)
+        }
         Expr::Subscript { base, subscripts } => index_expr_first_param(base).or_else(|| {
             subscripts
                 .iter()
@@ -8626,15 +8630,15 @@ pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
 /// resolver admits an uncorrelated subquery, so it is caught here.
 pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
     match e {
-        Expr::ScalarSubquery(_)
-        | Expr::Exists(_)
+        Expr::ScalarSubquery(_, _)
+        | Expr::Exists(_, _)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => true,
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
-        | Expr::Param(_)
+        | Expr::Param(_, _)
         | Expr::QualifiedStar { .. } => false,
         Expr::Cast { inner, .. }
         | Expr::Collate { inner, .. }
@@ -8687,12 +8691,12 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
                     .any(|(c, r)| index_expr_has_subquery(c) || index_expr_has_subquery(r))
                 || els.as_deref().is_some_and(index_expr_has_subquery)
         }
-        Expr::Coalesce(args) => args.iter().any(index_expr_has_subquery),
+        Expr::Coalesce(args, _) => args.iter().any(index_expr_has_subquery),
         Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(index_expr_has_subquery)
         }
         Expr::FuncCall { args, .. } => args.iter().any(index_expr_has_subquery),
-        Expr::Row(items) | Expr::Array(items) => items.iter().any(index_expr_has_subquery),
+        Expr::Row(items, _) | Expr::Array(items, _) => items.iter().any(index_expr_has_subquery),
         Expr::Subscript { base, subscripts } => {
             index_expr_has_subquery(base)
                 || subscripts

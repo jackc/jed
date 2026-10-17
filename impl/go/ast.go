@@ -649,6 +649,9 @@ type columnDef struct {
 	Name string
 	// TypeName as written (canonical or alias); resolved during analysis.
 	TypeName string
+	// TypePos is the type name's character position — an unknown type's 42704
+	// (spec/design/error-fields.md §10.2); invisible to equality.
+	TypePos srcPos
 	// TypeMod is an optional parenthesized type modifier, numeric(p[,s]) — the first
 	// parameterized type. Meaningful only for decimal; validated at resolve (grammar.md §14).
 	TypeMod    *typeMod
@@ -783,6 +786,9 @@ type insertValue struct {
 	IsParam   bool    // a $N bind parameter; Param holds the 1-based index
 	Param     uint64  // valid when IsParam
 	Lit       literal // valid when !IsDefault && !IsParam && !IsRow
+	// LitPos is the literal's character position (spec/design/error-fields.md §10.2); invisible to
+	// equality.
+	LitPos srcPos
 	// IsRow marks a ROW(...) composite constructor (spec/design/composite.md §1); Row holds the
 	// field slots, in order (each itself a literal, a $N, or a nested ROW). A composite-typed column
 	// takes a ROW(...) value in INSERT VALUES.
@@ -1575,11 +1581,16 @@ type exprNode struct {
 	// StarPos is an ExprQualifiedStar's qualifier-token position (views.md §5: `rel . *` is a
 	// three-token span); invisible to equality.
 	StarPos tokPos
+	// TypeLitPos is an ExprTypedLiteral's type-name position — an unknown type's 42704
+	// (spec/design/error-fields.md §10.2); invisible to equality.
+	TypeLitPos srcPos
 	// Pos is the node's character position (spec/design/error-fields.md §10.2); invisible to
 	// equality. A column reference's (the qualifier's for an ExprQualifiedColumn), a literal's (the
 	// minus sign of a folded negative number), a typed literal's string token, a function call's name
 	// (a special form's keyword), an operator's token (the NOT of NOT IN / NOT BETWEEN / NOT LIKE, the
-	// IS of IS DISTINCT FROM), a CASE's keyword, a CAST's keyword (0 for a `::` cast). 0 = none.
+	// IS of IS DISTINCT FROM), a CASE's keyword, a CAST's keyword (0 for a `::` cast), a bind
+	// parameter's `$N`, a ROW / ARRAY / COALESCE / GREATEST / LEAST / EXTRACT / EXISTS / JSON /
+	// JSON_EXISTS / JSON_VALUE / JSON_QUERY keyword, a scalar subquery's or bare row's `(`. 0 = none.
 	Pos srcPos
 }
 
@@ -1618,6 +1629,11 @@ type castExpr struct {
 	Inner    exprNode
 	TypeName string
 	TypeMod  *typeMod
+	// CastPos is the cast's own token — the `::` or the CAST keyword — where a cast that has no
+	// conversion is reported (spec/design/error-fields.md §10.2); invisible to equality.
+	CastPos srcPos
+	// TypePos is the target type name's character position — an unknown type's 42704 (§10.2).
+	TypePos srcPos
 }
 
 // ExtractExpr is EXTRACT(Field FROM Source) (spec/design/timezones.md §9.2, grammar.md §50) — the
@@ -1940,6 +1956,9 @@ type caseExpr struct {
 type caseWhen struct {
 	Cond   exprNode
 	Result exprNode
+	// Pos is the WHEN keyword's character position — a simple CASE's comparison is reported there
+	// (spec/design/error-fields.md §10.2); invisible to equality.
+	Pos srcPos
 }
 
 // OrderKey is one ORDER BY sort key, in one of three modes resolved at parse time
@@ -1965,7 +1984,8 @@ type orderKey struct {
 	// a column-reference key (Ordinal and Expr both unset).
 	Qualifier string
 	Column    string
-	// Pos is the column-reference key's character position (spec/design/error-fields.md §10.2).
+	// Pos is the column-reference or ordinal key's character position (spec/design/error-fields.md
+	// §10.2).
 	Pos srcPos
 	// Collation is an optional explicit `COLLATE "name"` on this sort key (spec/design/collation.md
 	// §1); "" means the column's collation (the database default, C, until slice 1d). A non-C name
@@ -1974,6 +1994,15 @@ type orderKey struct {
 	Collation  string
 	Descending bool
 	NullsFirst bool
+}
+
+// location is where an ORDER BY key was written (spec/design/error-fields.md §10.2): an expression
+// key's location, else the column reference or ordinal.
+func (k orderKey) location() srcPos {
+	if k.Expr != nil {
+		return exprLocation(*k.Expr)
+	}
+	return k.Pos
 }
 
 // WindowOrderKey is one window ORDER BY sort key (spec/design/window.md §3/§5.1). Unlike the query

@@ -103,6 +103,11 @@ pub fn run(
                     if let Some(hint) = &e.hint {
                         let _ = writeln!(err, "HINT:  {hint}");
                     }
+                    // The database holding the error's table, when it is not `main` — a host
+                    // attachment or `temp` (error-fields.md §12).
+                    if let Some(db) = e.database_name.as_deref().filter(|d| *d != "main") {
+                        let _ = writeln!(err, "DATABASE:  {db}");
+                    }
                     if let Some(hint) = hint_for(e.code()) {
                         let _ = writeln!(err, "hint: {hint}");
                     }

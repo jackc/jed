@@ -313,9 +313,13 @@ impl App {
                         Some(h) => format!("  HINT: {h}"),
                         None => String::new(),
                     };
+                    let database = match e.database_name.as_deref() {
+                        Some(db) if db != "main" => format!("  DATABASE: {db}"),
+                        _ => String::new(),
+                    };
                     self.set_message(
                         format!(
-                            "ERROR {}: {}{detail}{engine_hint}{hint}",
+                            "ERROR {}: {}{detail}{engine_hint}{database}{hint}",
                             e.code(),
                             e.message
                         ),

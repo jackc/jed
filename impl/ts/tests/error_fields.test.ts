@@ -7,7 +7,15 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { EngineError, PrivilegeSet, privilegeFromName } from "../src/tooling.ts";
+import {
+  attachMemory,
+  createDatabase,
+  EngineError,
+  Environment,
+  PrivilegeSet,
+  privilegeFromName,
+} from "../src/tooling.ts";
+import { specPath } from "./tomlmini.ts";
 import { type Handle, dbWith } from "./util.ts";
 
 // efErr runs sql on db and returns the EngineError it throws (failing if none / a non-EngineError).
@@ -237,12 +245,16 @@ test("error fields: detail shared cases", () => {
 // PositionCase is one case of the shared Position/Hint fixture (spec/errors/position_cases.txt).
 type PositionCase = {
   name: string;
+  unicode: boolean;
+  attach: string[];
   setup: string[];
   run: string;
   script: boolean;
   code: string;
   position: number | undefined;
   hint: string | undefined;
+  detail: string | undefined;
+  database: string | undefined;
 };
 
 function parsePositionCases(text: string): PositionCase[] {
@@ -252,12 +264,16 @@ function parsePositionCases(text: string): PositionCase[] {
     if (line.startsWith("case: ")) {
       cases.push({
         name: line.slice("case: ".length),
+        unicode: false,
+        attach: [],
         setup: [],
         run: "",
         script: false,
         code: "",
         position: undefined,
         hint: undefined,
+        detail: undefined,
+        database: undefined,
       });
       continue;
     }
@@ -267,6 +283,7 @@ function parsePositionCases(text: string): PositionCase[] {
     const key = sep < 0 ? line : line.slice(0, sep);
     const v = sep < 0 ? "" : line.slice(sep + 2);
     if (key === "setup") c.setup.push(v);
+    else if (key === "attach") c.attach.push(v);
     else if (key === "run") c.run = v;
     else if (key === "script") {
       c.run = v;
@@ -274,30 +291,55 @@ function parsePositionCases(text: string): PositionCase[] {
     } else if (key === "code") c.code = v;
     else if (key === "position") c.position = Number(v);
     else if (key === "hint") c.hint = v;
+    else if (key === "detail") c.detail = v;
+    else if (key === "database") c.database = v;
+    else if (line === "load-unicode") c.unicode = true;
     else if (line !== "no-position") throw new Error(`unknown position_cases directive: ${line}`);
   }
   return cases;
 }
 
-// The Position and Hint fields (spec/design/error-fields.md §10, §11): every case of the shared,
-// language-neutral fixture — the same file the Rust and Go cores run.
+// The Position, Hint, Detail, and DatabaseName fields (spec/design/error-fields.md §10–§12): every
+// case of the shared, language-neutral fixture — the same file the Rust and Go cores run.
 test("error fields: position and hint shared cases", () => {
   const path = new URL("../../../spec/errors/position_cases.txt", import.meta.url);
   const cases = parsePositionCases(readFileSync(path, "utf8"));
   assert.ok(cases.length > 0);
+  // An environment that loaded jed's pinned production Unicode bundle, for a `load-unicode` case.
+  const unicode = Environment.builder()
+    .loadUnicodeData(readFileSync(specPath("collation/fixtures/unicode.jucd")))
+    .build();
   const failures: string[] = [];
   for (const c of cases) {
-    const db = dbWith(c.setup);
+    const handle = createDatabase(c.unicode ? { environment: unicode } : {});
+    for (const name of c.attach) handle.attach(name, attachMemory(), false);
+    const db = handle.session();
+    for (const s of c.setup) {
+      try {
+        db.execute(s);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(`${c.name}: setup ${JSON.stringify(s)}: ${msg}`);
+      }
+    }
     try {
       if (c.script) db.executeScript(c.run);
       else db.execute(c.run);
       failures.push(`${c.name}: expected ${c.code} but succeeded`);
     } catch (e) {
       if (!(e instanceof EngineError)) throw e;
-      if (e.code() !== c.code || e.position !== c.position || e.hint !== c.hint) {
+      if (
+        e.code() !== c.code ||
+        e.position !== c.position ||
+        e.hint !== c.hint ||
+        e.detail !== c.detail ||
+        e.databaseName !== c.database
+      ) {
         failures.push(
-          `${c.name}: got ${e.code()} ${e.position} ${JSON.stringify(e.hint)} (${e.message}), ` +
-            `want ${c.code} ${c.position} ${JSON.stringify(c.hint)}`,
+          `${c.name}: got ${e.code()} ${e.position} ${JSON.stringify(e.hint)} ` +
+            `${JSON.stringify(e.detail)} ${JSON.stringify(e.databaseName)} (${e.message}), ` +
+            `want ${c.code} ${c.position} ${JSON.stringify(c.hint)} ` +
+            `${JSON.stringify(c.detail)} ${JSON.stringify(c.database)}`,
         );
       }
     }

@@ -992,8 +992,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 		// ordinary assignment is 428C9; the DEFAULT form advances the owned sequence through its
 		// expression default.
 		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways && !a.IsDefault {
-			return nil, newError(GeneratedAlways,
-				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
+			return nil, newGeneratedAlwaysUpdate(a.Column)
 		}
 		// Assigning a PRIMARY KEY member re-keys the existing row (upsert.md §5), the standalone
 		// UPDATE rule carried onto the conflict path.
@@ -1126,7 +1125,13 @@ func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk [
 }
 
 func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcome, error) {
-	return db.executeInsertCached(ins, params, ctx, nil, false)
+	// A writable-CTE child names its own target database (spec/design/error-fields.md §12).
+	target := ins.DB
+	out, err := db.executeInsertCached(ins, params, ctx, nil, false)
+	if err != nil {
+		return out, db.stampDatabase(target, err)
+	}
+	return out, nil
 }
 
 func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, ic *insertStmtCache, allowCacheFill bool) (outcome, error) {
@@ -1270,9 +1275,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		// explicit value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is
 		// 428C9 — raised up front (PG raises it at rewrite), firing even over a zero-row source.
 		if len(alwaysTargeted) > 0 {
-			return outcome{}, newError(GeneratedAlways, fmt.Sprintf(
-				"cannot insert a non-DEFAULT value into column %s", table.Columns[alwaysTargeted[0].col].Name,
-			))
+			return outcome{}, newGeneratedAlwaysInsert(table.Columns[alwaysTargeted[0].col].Name)
 		}
 		// SELECT source (§24). Plan the source query, then resolve the RETURNING projection
 		// (PostgreSQL's analysis order — both precede any execution), threading ONE paramTypes
@@ -1444,9 +1447,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 			}
 		}
 		if nonDefault {
-			return outcome{}, newError(GeneratedAlways, fmt.Sprintf(
-				"cannot insert a non-DEFAULT value into column %s", table.Columns[at.col].Name,
-			))
+			return outcome{}, newGeneratedAlwaysInsert(table.Columns[at.col].Name)
 		}
 	}
 	// Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
@@ -1549,7 +1550,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 					// (composite-aware — spec/design/composite.md §1/§4).
 					mv, err := materializeInsertValue(iv, store.colTypes[i], bound, db.inputZone())
 					if err != nil {
-						return outcome{}, assignmentHint(err)
+						return outcome{}, locateLit(iv, assignmentHint(err))
 					}
 					rv[p] = mv
 				}
@@ -1583,7 +1584,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		affected, returned, err = db.runInsertRows(table, store, ins.DB, pk, checks, viewChecks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
 	}
 	if err != nil {
-		return outcome{}, err
+		return outcome{}, locateValueSlot(ins.Rows, err)
 	}
 	if affected > 0 {
 		db.markEstimatorMutation(ins.DB, ins.Table)
@@ -1839,9 +1840,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 	for _, at := range alwaysTargeted {
 		for _, values := range ins.Rows {
 			if !values[at.pos].IsDefault {
-				return nil, newError(GeneratedAlways, fmt.Sprintf(
-					"cannot insert a non-DEFAULT value into column %s", table.Columns[at.col].Name,
-				))
+				return nil, newGeneratedAlwaysInsert(table.Columns[at.col].Name)
 			}
 		}
 	}
@@ -1935,7 +1934,7 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 				} else {
 					mv, err := materializeInsertValue(iv, plan.colTypes[i], bound, db.inputZone())
 					if err != nil {
-						return outcome{}, assignmentHint(err)
+						return outcome{}, locateLit(iv, assignmentHint(err))
 					}
 					rv[p] = mv
 				}
@@ -1972,7 +1971,7 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 		affected = int64(len(rows))
 	}
 	if err != nil {
-		return outcome{}, err
+		return outcome{}, locateValueSlot(ins.Rows, err)
 	}
 	if affected > 0 {
 		db.markEstimatorMutation(ins.DB, ins.Table)
@@ -2023,10 +2022,10 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		seenPrefixes[i] = make(map[string]struct{})
 	}
 	var cunits int64
-	for _, values := range rows {
+	for r, values := range rows {
 		row, err := db.buildInsertRow(table, store.colTypes, provided, values, defaultExprs, rng, meter)
 		if err != nil {
-			return nil, err
+			return nil, atRow(err, r)
 		}
 
 		// CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
@@ -2487,7 +2486,11 @@ func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided [
 		}
 		v, err := coerceForStore(candidate, colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
 		if err != nil {
-			return nil, assignmentHint(stampTable(err, table.Name))
+			err = assignmentHint(stampTable(err, table.Name))
+			if p := provided[i]; p >= 0 {
+				err = atSlot(err, p)
+			}
+			return nil, err
 		}
 		row[i] = v
 	}
@@ -2647,12 +2650,12 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		return evalViewChecks(viewChecks, row, &evalEnv{exec: db, rng: rng}, meter)
 	}
 
-	for _, values := range rows {
+	for r, values := range rows {
 		// Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL
 		// before CHECK before conflict; constraints.md §4.4).
 		row, err := db.buildInsertRow(table, store.colTypes, provided, values, defaultExprs, rng, meter)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, atRow(err, r)
 		}
 		if len(checks) > 0 {
 			if err := meter.Guard(); err != nil {
@@ -3668,6 +3671,16 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
 func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (outcome, error) {
+	// The error names the target's database (spec/design/error-fields.md §12).
+	target := del.DB
+	out, err := db.executeDeleteTarget(del, params, ctx)
+	if err != nil {
+		return out, db.stampDatabase(target, err)
+	}
+	return out, nil
+}
+
+func (db *engine) executeDeleteTarget(del *deleteStmt, params []Value, ctx cteCtx) (outcome, error) {
 	// The statement resolves before its values are bound; a subquery plan that read one restarts the
 	// statement with the values visible (estimator.md §6.1).
 	planning := db.beginPlanning()
@@ -3942,6 +3955,16 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
 func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcome, error) {
+	// The error names the target's database (spec/design/error-fields.md §12).
+	target := upd.DB
+	out, err := db.executeUpdateTarget(upd, params, ctx)
+	if err != nil {
+		return out, db.stampDatabase(target, err)
+	}
+	return out, nil
+}
+
+func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (outcome, error) {
 	// As DELETE: resolve probing, then plan the target scan with the bound values.
 	planning := db.beginPlanning()
 	defer planning.end()
@@ -4023,8 +4046,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		// A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
 		// An ordinary assignment is 428C9; DEFAULT is allowed and advances the owned sequence.
 		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways && !a.IsDefault {
-			return outcome{}, newError(GeneratedAlways,
-				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
+			return outcome{}, newGeneratedAlwaysUpdate(a.Column)
 		}
 		for _, p := range plans {
 			if p.idx == idx {

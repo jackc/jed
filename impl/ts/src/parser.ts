@@ -284,6 +284,7 @@ function classifyOrderKey(
       expr: null,
       qualifier: null,
       column: "",
+      loc: expr.loc,
       collation,
       descending,
       nullsFirst,
@@ -1575,6 +1576,7 @@ class Parser {
     fks: ForeignKeyDef[],
   ): ColumnDef {
     const name = this.expectIdentifier();
+    const typeLoc = this.here();
     const baseType = this.expectTypeName();
     const typeMod = this.parseTypeMod();
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
@@ -1682,6 +1684,7 @@ class Parser {
     return {
       name,
       typeName,
+      typeLoc,
       typeMod,
       primaryKey,
       notNull,
@@ -2851,7 +2854,8 @@ class Parser {
     if (this.peek().kind === "param") {
       return { kind: "param", index: this.advance().paramIndex! };
     }
-    return { kind: "lit", lit: this.parseLiteral() };
+    const loc = this.here();
+    return { kind: "lit", lit: this.parseLiteral(), loc };
   }
 
   // parseLiteral parses a literal value for INSERT: an integer (with an optional leading
@@ -5069,11 +5073,13 @@ class Parser {
 
   // parseCastSuffix parses the `:: type` postfix cast on expr (a parsePostfix arm).
   private parseCastSuffix(expr: Expr): Expr {
+    const castLoc = this.here();
     this.advance();
+    const typeLoc = this.here();
     const baseType = this.expectTypeName();
     const typeMod = this.parseTypeMod();
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
-    return { kind: "cast", inner: expr, typeName, typeMod };
+    return { kind: "cast", inner: expr, typeName, typeMod, castLoc, typeLoc };
   }
 
   // parseSubscriptSuffix parses `base[..][..]` — array subscript (spec/design/array.md §6), a
@@ -5237,13 +5243,14 @@ class Parser {
 
   // parseParenPrimary parses a parenthesized expression, scalar subquery, or bare row constructor (a parsePrimary arm).
   private parseParenPrimary(): Expr {
+    const parenLoc = this.here();
     this.advance();
     // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading `SELECT`
     // (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expression.
     if (this.atSubqueryStart()) {
       const query = this.parseSubquery();
       this.expect("rparen");
-      return { kind: "scalarSubquery", query };
+      return { kind: "scalarSubquery", query, loc: parenLoc };
     }
     const e = this.parseExpr();
     // `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
@@ -5257,7 +5264,7 @@ class Parser {
       }
       this.expect("rparen");
       this.bareRowEnd = this.pos;
-      return { kind: "row", fields };
+      return { kind: "row", fields, loc: parenLoc };
     }
     this.expect("rparen");
     return e;
@@ -5265,15 +5272,17 @@ class Parser {
 
   // parseExistsPrimary parses `EXISTS ( query )` (a parsePrimary arm).
   private parseExistsPrimary(): Expr {
+    const loc = this.here();
     this.advance(); // EXISTS
     this.expect("lparen");
     const query = this.parseSubquery();
     this.expect("rparen");
-    return { kind: "exists", query };
+    return { kind: "exists", query, loc };
   }
 
   // parseRowConstructor parses `ROW(e1, e2, …)` (a parsePrimary arm).
   private parseRowConstructor(): Expr {
+    const loc = this.here();
     this.advance(); // ROW
     this.expect("lparen");
     const fields: Expr[] = [];
@@ -5288,11 +5297,12 @@ class Parser {
     } else {
       this.advance(); // the empty ROW() — consume ')'
     }
-    return { kind: "row", fields };
+    return { kind: "row", fields, loc };
   }
 
   // parseArrayConstructor parses `ARRAY[e1, e2, …]` (a parsePrimary arm).
   private parseArrayConstructor(): Expr {
+    const loc = this.here();
     this.advance(); // ARRAY
     this.expect("lbracket");
     const elements: Expr[] = [];
@@ -5307,27 +5317,30 @@ class Parser {
     } else {
       this.advance(); // the empty ARRAY[] — consume ']'
     }
-    return { kind: "array", elements };
+    return { kind: "array", elements, loc };
   }
 
   // parseTypedLiteral parses a typed string literal `type '...'` (a parsePrimary arm).
   private parseTypedLiteral(): Expr {
+    const typeLoc = this.here();
     const typeName = this.expectIdentifier(); // the named type (folded or quoted — exact)
     const loc = this.here();
     const t = this.advance();
-    return { kind: "typedLiteral", typeName, text: t.str!, loc };
+    return { kind: "typedLiteral", typeName, text: t.str!, loc, typeLoc };
   }
 
   // parseCharacterVaryingLiteral parses the `character varying '...'` typed literal (a parsePrimary arm).
   private parseCharacterVaryingLiteral(): Expr {
+    const typeLoc = this.here();
     const typeName = this.expectTypeName();
     const loc = this.here();
     const t = this.advance();
-    return { kind: "typedLiteral", typeName, text: t.str!, loc };
+    return { kind: "typedLiteral", typeName, text: t.str!, loc, typeLoc };
   }
 
   // parseJsonQueryFunction parses `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (a parsePrimary arm).
   private parseJsonQueryFunction(kw: string): Expr {
+    const loc = this.here();
     this.advance(); // the function keyword
     this.advance(); // (
     const ctx = this.parseExpr();
@@ -5340,11 +5353,11 @@ class Parser {
     let expr: Expr;
     if (kw === "json_exists") {
       const onError = this.parseJsonOnErrorOnly();
-      expr = { kind: "jsonExists", ctx, path, passing, onError };
+      expr = { kind: "jsonExists", ctx, path, passing, onError, loc };
     } else if (kw === "json_value") {
       const returning = this.parseJsonReturning();
       const [onEmpty, onError] = this.parseJsonOnClauses();
-      expr = { kind: "jsonValue", ctx, path, passing, returning, onEmpty, onError };
+      expr = { kind: "jsonValue", ctx, path, passing, returning, onEmpty, onError, loc };
     } else {
       const returning = this.parseJsonReturning();
       const [wrapper, keepQuotes] = this.parseJsonWrapperQuotes();
@@ -5359,6 +5372,7 @@ class Parser {
         keepQuotes,
         onEmpty,
         onError,
+        loc,
       };
     }
     this.expect("rparen");
@@ -5367,6 +5381,7 @@ class Parser {
 
   // parseJsonConstructor parses the `JSON(expr …)` constructor (a parsePrimary arm).
   private parseJsonConstructor(): Expr {
+    const loc = this.here();
     this.advance(); // JSON
     this.advance(); // (
     const operand = this.parseExpr();
@@ -5381,7 +5396,7 @@ class Parser {
       uniqueKeys = w === "with";
     }
     this.expect("rparen");
-    return { kind: "jsonCtor", operand, uniqueKeys };
+    return { kind: "jsonCtor", operand, uniqueKeys, loc };
   }
 
   // parseCastPrimary parses `CAST(expr AS type)` (a parsePrimary arm).
@@ -5391,15 +5406,17 @@ class Parser {
     this.expect("lparen");
     const inner = this.parseExpr();
     this.expectKeyword("as");
+    const typeLoc = this.here();
     const baseType = this.expectTypeName();
     const typeMod = this.parseTypeMod();
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     this.expect("rparen");
-    return { kind: "cast", inner, typeName, typeMod, loc };
+    return { kind: "cast", inner, typeName, typeMod, loc, castLoc: loc, typeLoc };
   }
 
   // parseExtractPrimary parses `EXTRACT(field FROM source)` (a parsePrimary arm).
   private parseExtractPrimary(): Expr {
+    const loc = this.here();
     this.advance(); // EXTRACT
     this.expect("lparen");
     let field: string;
@@ -5413,11 +5430,17 @@ class Parser {
     this.expectKeyword("from");
     const source = this.parseExpr();
     this.expect("rparen");
-    return { kind: "extract", field: field.replace(/[A-Z]/g, (c) => c.toLowerCase()), source };
+    return {
+      kind: "extract",
+      field: field.replace(/[A-Z]/g, (c) => c.toLowerCase()),
+      source,
+      loc,
+    };
   }
 
   // parseCoalescePrimary parses `COALESCE(a, b, …)` (a parsePrimary arm).
   private parseCoalescePrimary(): Expr {
+    const loc = this.here();
     this.advance(); // COALESCE
     this.advance(); // (
     if (this.peekKindAt(0) === "rparen") {
@@ -5430,12 +5453,13 @@ class Parser {
       this.advance(); // ,
     }
     this.expect("rparen");
-    return { kind: "coalesce", args };
+    return { kind: "coalesce", args, loc };
   }
 
   // parseGreatestLeast parses `GREATEST(…)` / `LEAST(…)` (a parsePrimary arm).
   private parseGreatestLeast(kw: string): Expr {
     const greatest = kw === "greatest";
+    const loc = this.here();
     this.advance(); // GREATEST / LEAST
     this.advance(); // (
     if (this.peekKindAt(0) === "rparen") {
@@ -5451,7 +5475,7 @@ class Parser {
       this.advance(); // ,
     }
     this.expect("rparen");
-    return { kind: "greatestLeast", args, greatest };
+    return { kind: "greatestLeast", args, greatest, loc };
   }
 
   // parseCasePrimary parses a `CASE` expression (a parsePrimary arm).
@@ -5461,13 +5485,15 @@ class Parser {
     // Simple form has an operand between CASE and the first WHEN; the searched form starts
     // directly with WHEN (grammar.md §23).
     const operand = this.peekKeyword() === "when" ? null : this.parseExpr();
-    const whens: { cond: Expr; result: Expr }[] = [];
+    const whens: { cond: Expr; result: Expr; loc?: SrcLoc }[] = [];
     while (this.peekKeyword() === "when") {
+      // The WHEN keyword's position — a simple CASE's comparison is reported there (§10.2).
+      const whenLoc = this.here();
       this.advance();
       const cond = this.parseExpr();
       this.expectKeyword("then");
       const result = this.parseExpr();
-      whens.push({ cond, result });
+      whens.push({ cond, result, loc: whenLoc });
     }
     if (whens.length === 0) {
       throw engineError("syntax_error", "CASE requires at least one WHEN clause");
@@ -5487,7 +5513,7 @@ class Parser {
     // The primary token's source character position (spec/design/error-fields.md §10.2).
     const primLoc = this.here();
     if (t.kind === "param") {
-      return { kind: "param", index: this.advance().paramIndex! };
+      return { kind: "param", index: this.advance().paramIndex!, loc: primLoc };
     }
     if (t.kind === "int") {
       // The only magnitude > i64 max the lexer admits is 2^63, which fits no signed

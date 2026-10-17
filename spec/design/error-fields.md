@@ -15,7 +15,8 @@
 > **`Detail`** (the offending values — `Key (id)=(1) already exists.`), is specified in §9; the sixth
 > and seventh, **`Position`** (a 1-based character offset into the query) and **`Hint`**
 > (PostgreSQL's suggestion — "Perhaps you meant …", "You might need to add explicit type casts.",
-> the LATERAL hints), in §10 and §11.
+> the LATERAL hints), in §10 and §11; the eighth, **`DatabaseName`** (the database holding the error's
+> table, jed's analog of PostgreSQL's `SchemaName`), in §12.
 > [api.md](api.md) §7 owns the host-facing error surface; [../errors/registry.toml](../errors/registry.toml)
 > owns the code/template registry.
 
@@ -59,7 +60,7 @@ each mapped to a jed disposition:
 | `Detail` | `D` | **added** (§9) | the offending *values*, PostgreSQL's sentences; a structured field only — the rendered message stays one line |
 | `Position` | `P` | **added** (§10) | 1-based character offset of the offending token; set for parse errors and name-resolution errors |
 | `Hint` | `H` | **added** (§11) | PostgreSQL's misspelled-column and misused-alias suggestions; a structured field only |
-| `SchemaName` | `s` | **omit** (map later) | jed has **no schemas** — the qualifier is a *database* ([attached-databases.md](attached-databases.md), [introspection.md](introspection.md) §3). A `DatabaseName` analog is the natural mapping if/when attachment-qualified errors need it. |
+| `SchemaName` | `s` | **added as `DatabaseName`** (§12) | jed has **no schemas** — the qualifier is a *database* ([attached-databases.md](attached-databases.md), [introspection.md](introspection.md) §3), so the analog names the database holding the table |
 | `Severity` | `S` | **exclude** | jed has one severity (error); no notice/warning channel |
 | `SeverityUnlocalized` | `V` | **exclude** | no localization (single language, determinism) |
 | `InternalPosition` | `p` | **exclude** | no internally-generated queries |
@@ -80,6 +81,7 @@ the core's idiom:
 | existing | `message: String` | `Message string` | `message` (via `Error`) |
 | constraint | `constraint_name: Option<String>` | `ConstraintName string` | `constraintName?: string` |
 | table | `table_name: Option<String>` | `TableName string` | `tableName?: string` |
+| database (§12) | `database_name: Option<String>` | `DatabaseName string` | `databaseName?: string` |
 | column | `column_name: Option<String>` | `ColumnName string` | `columnName?: string` |
 | data type | `data_type_name: Option<String>` | `DataTypeName string` | `dataTypeName?: string` |
 | detail (§9) | `detail: Option<String>` | `Detail string` | `detail?: string` |
@@ -115,7 +117,7 @@ Which errors set which fields (matching how PostgreSQL populates the same protoc
 | 22001 | string_data_right_truncation | | | ✓ | ✓ (`varchar(n)`) |
 
 Each of these class-23 rows also sets `Detail` (§9), subject to the §9.2 exceptions and the §9.4
-privilege gate.
+privilege gate. Every error that sets `TableName` also sets `DatabaseName` (§12).
 
 The `<table>_pkey` value for a primary-key `23505` stays the derived name jed already prints
 ([constraints.md](constraints.md) §5.4) — jed persists no such relation, but the *reported*
@@ -175,13 +177,14 @@ error surface.
 - **`Detail`** — no longer deferred; specified in §9.
 - **`Position`** — no longer deferred; specified in §10.
 - **`Hint`** — no longer deferred; specified in §11: the two suggestion families, the LATERAL hints
-  (§11.8), and PostgreSQL's fixed sentences for the conditions jed shares (§11.4–§11.7). PostgreSQL's
-  remaining hints on surfaces jed implements remain open: the collation hints (`42P21` / `42P22`
-  "…applying the COLLATE clause…"), and the DETAIL sentences that accompany the §11.8 hints ("There is
-  a column named …, but it cannot be referenced from this part of the query.").
-- **`DatabaseName` (the `SchemaName` analog).** jed qualifies by database, not schema. If
-  attachment-qualified errors ever need to name the database, this is the additive field to add;
-  not motivated yet.
+  (§11.8, with their Details), PostgreSQL's fixed sentences for the conditions jed shares
+  (§11.4–§11.7), and the collation, identity-column, and dependent-object hints (§11.9).
+- **`DatabaseName`** — no longer deferred; specified in §12.
+- **Still open:** PostgreSQL's input-syntax Details for malformed `json` / array / range literals
+  ("The input string ended unexpectedly.", "Unexpected end of input."), the `numeric field overflow`
+  Detail, the `2BP01` Detail listing the dependent objects (jed names the first dependent in its
+  message), and positions for collation conflicts, a `CREATE TYPE` field's type, and a `CAST(x AS t)`
+  of a non-literal (§10.2).
 
 Each deferred field is purely additive to the struct, so shipping v1 forecloses none of them.
 
@@ -397,24 +400,33 @@ query surfaces (CLAUDE.md §13). jed adds it as a sixth structured field.
 | a set of expressions with no common type: `CASE` results, `COALESCE`, `GREATEST` / `LEAST`, `ARRAY[…]` elements, a `VALUES` column, a set-operation column | `42804` | the location of the first expression that does not unify with those before it, in PostgreSQL's order: a `CASE`'s `ELSE` result first, then its `THEN` results; a set operation's right operand's column |
 | a value of the wrong type for its column: an `INSERT … VALUES` expression, an `INSERT … SELECT` column, an `UPDATE … SET` / `DO UPDATE SET` value | `42804` | the value's location |
 | a string literal converted at resolve time: cast (`'abc'::int`, `CAST('abc' AS int)`), typed (`int 'abc'`), or adapting to its context (`uuid_col = 'x'`, `UPDATE … SET range_col = '[1,'`) | any input error (`22P02`, `22003`, `22007`, …) | the literal |
+| an `INSERT … VALUES` literal slot, converted when the row is stored | `42804`; a string literal's input error (class 22 except `22001`) | the literal |
+| an unknown type name: a cast target, a typed literal, a `CREATE TABLE` / `ADD COLUMN` column type | `42704` | the type name |
+| a cast between types with no conversion | jed's `42804` (PostgreSQL's `42846`) | the `::`, or the `CAST` keyword |
+| a simple `CASE`'s comparison of its operand with a `WHEN` value | `42804` / `42883` | the `WHEN` keyword |
+| a sort key with no ordering operator; a grouping key, `DISTINCT` output column, or set-operation column with no equality operator | `42883` | the key as written (an ordinal's number); the select item; the left operand's column |
+| a recursive CTE whose recursive term changes a column's type, typmod, or collation | `42804`, `42P21` | the non-recursive term's column |
 
 An expression's **location** is PostgreSQL's `exprLocation`: the leftmost character the expression was
 written at, grouping parentheses excluded — a function call's name, an operator expression's left
 operand's location, a prefix operator, a `CASE` keyword, a literal (a folded negative number's minus
-sign), a `::` cast's operand. jed records it only where it is exact; for an expression whose leftmost
-token it does not record (a bind parameter, a scalar subquery, `EXISTS`, `ROW(…)`, `ARRAY[…]`,
-`COALESCE`, `GREATEST`, `EXTRACT`, the SQL/JSON constructors, `CAST(x AS t)` of a non-literal whose
-PostgreSQL location depends on whether the cast is a no-op) the location is unknown and the error
+sign), a `::` cast's operand, a bind parameter's `$N`, a scalar subquery's `(`, the keyword of
+`EXISTS`, `ROW(…)` (the `(` of a bare `(a, b)` row), `ARRAY[…]`, `COALESCE`, `GREATEST` / `LEAST`,
+`EXTRACT`, `JSON(…)`, and `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`. The one expression whose
+location jed leaves unknown is a `CAST(x AS t)` of a non-literal: PostgreSQL locates it at `x` when
+the cast is a no-op and at `CAST` otherwise, a decision jed does not make syntactically. Its error
 carries no position, rather than a wrong one.
 
 The class-54 program limits (`54000` statement too long, `54001` nesting too deep) are resource
 limits, not mistakes at a place, and carry no position (PostgreSQL's stack-depth error has none).
 An error raised while the statement runs carries none either, as in PostgreSQL: a cast of a value at
-run time (`'abc'::text::int`, `text_col::int`), a store-time conversion of an `INSERT … VALUES` literal
-slot (jed converts a bare literal slot when it stores the row, where PostgreSQL coerces it at parse
-time — the slot's input error is therefore unpositioned). Every other error leaves the field absent.
-PostgreSQL positions still more resolver errors (`42704` unknown type, `42846` cannot cast, a simple
-`CASE`'s `WHEN` comparison); each is purely additive here, needing only the node's recorded position.
+run time (`'abc'::text::int`, `text_col::int`), a length check (`22001`) or a number's range check
+(`22003`) when an `INSERT … VALUES` literal is stored. jed converts a bare literal slot when it stores
+the row, where PostgreSQL coerces it at parse time; the row builder records which slot an error came
+from, so the statement points it at that literal exactly when PostgreSQL would. Every other error
+leaves the field absent, among them collation conflicts other than a recursive term's (PostgreSQL
+positions them at the second collation's expression; jed does not track that) and an unknown type of a
+`CREATE TYPE` field.
 
 jed reports most operator type mismatches as `42804` (its strict type check) where PostgreSQL's
 operator lookup reports `42883` (`1 + 'a'::text`); the position is the same operator token. The
@@ -452,8 +464,11 @@ Each core records, per token, its 1-based character position, beside the token s
 copies a position into the AST nodes that name things: a column reference (bare and qualified), an
 `ORDER BY` column key, an `INSERT` column-list name, an `UPDATE` / `DO UPDATE` `SET` target, a FROM
 table reference, an `INSERT` / `UPDATE` / `DELETE` target, a literal, a typed literal (its string),
-a function call (its name, or a special form's keyword), an operator (its token, §10.2), a `CASE`,
-and a `CAST(… AS …)` (its keyword; a `::` cast records none). The `IN` / `BETWEEN` desugaring gives
+a function call (its name, or a special form's keyword), an operator (its token, §10.2), a `CASE`
+(and each of its `WHEN` keywords), a `CAST(… AS …)` (its keyword; a `::` cast records none as its
+location) with its cast token and target type name, a typed literal's type name, a column definition's
+type name, an `ORDER BY` ordinal, an `INSERT … VALUES` literal slot, a bind parameter, a scalar
+subquery, and the constructor keywords of §10.2. The `IN` / `BETWEEN` desugaring gives
 its comparisons the construct's operator position. These positions are **invisible to AST equality**, like the existing view-rewrite
 token positions (`TableRefPos`, `StarPos`, views.md §5): `a + b` written twice still matches as a GROUP
 BY expression. A parse of stored text records no positions (§10.1).
@@ -467,7 +482,10 @@ bookkeeping on the error, never a field.
 
 The corpus cannot assert a structured field (§8). A shared fixture,
 [../errors/position_cases.txt](../errors/position_cases.txt), lists cases in the `detail_cases.txt`
-format with `position:` and `hint:` directives. Each core's `error_fields` test runs every case. The
+format with `position:`, `hint:`, `detail:`, and `database:` directives (each absent field must be
+absent), plus `attach: <name>` (attach an in-memory database before the setup) and `load-unicode`
+(run the case in an environment that loaded jed's pinned Unicode bundle, for collation cases). Each
+core's `error_fields` test runs every case. The
 expected positions are PostgreSQL 18's for the same statement wherever jed rejects the statement at
 the same token; a case where jed's token surface differs is marked `# jed:`.
 
@@ -540,7 +558,7 @@ Recorded divergences from PostgreSQL:
 - An aliased parenthesized join hides its inner relations, and jed does not record them among the
   relations a reference cannot see (§11.8). PostgreSQL still offers them as misspelled-column
   candidates; jed does not.
-- Every other PostgreSQL hint is absent (§7), except those of §11.4–§11.8.
+- Every other PostgreSQL hint is absent (§7), except those of §11.4–§11.9.
 
 ### 11.4 `jsonb_set_lax`'s `raise_exception` (`22004`)
 
@@ -659,10 +677,69 @@ hint.
 
 PostgreSQL also gives these errors a DETAIL (`There is a column named "a" in table "t", but it cannot
 be referenced from this part of the query.`) and rewords the `42P01` message; jed keeps its message
-and adds no Detail yet (§7). PostgreSQL's other LATERAL condition, a reference from a `LATERAL` item
+and adds the Detail, PostgreSQL's sentence byte-for-byte:
+
+| condition | `Detail` |
+|---|---|
+| `42703`, one exact match | `There is a column named "{column}" in table "{label}", but it cannot be referenced from this part of the query.` |
+| `42703`, two or more exact matches | `There are columns named "{column}", but they are in tables that cannot be referenced from this part of the query.` |
+| `42P01`, a found relation other than the visible table-alias case (§11.2) | `There is an entry for table "{label}", but it cannot be referenced from this part of the query.` |
+
+The Detail accompanies the error whatever the hint, including when the table above gives none.
+PostgreSQL's other LATERAL condition, a reference from a `LATERAL` item
 across a `RIGHT` or `FULL` join (`42P10`), carries a DETAIL and no hint, as in jed (§9.2), except for an
 `UPDATE … FROM` / `DELETE … USING` target, which jed does not support.
 
 The walk is built only on the error path from names already resolved, so it is unmetered and
 deterministic. The shared fixture ([../errors/position_cases.txt](../errors/position_cases.txt))
 pins every form against PostgreSQL 18.
+
+### 11.9 Collation, identity-column, and dependent-object hints
+
+PostgreSQL's fixed sentences for three more conditions jed shares, byte-for-byte (constant text, so
+cross-core identical, unmetered, and changing no code, cost, or abort point):
+
+| condition | SQLSTATE | `Hint` | `Detail` |
+|---|---|---|---|
+| two different implicit collations where a sort, grouping, `DISTINCT`, or set-operation column must choose one ([collation.md](collation.md) §1) | `42P21` | `You can choose the collation by applying the COLLATE clause to one or both expressions.` | |
+| a recursive CTE's recursive term changes a column's collation | `42P21` | `Use the COLLATE clause to set the collation of the non-recursive term.` | |
+| a value whose collation cannot be determined: a comparison or sort of two implicit collations, a `CREATE TABLE … AS` column with no collation | `42P22` | `Use the COLLATE clause to set the collation explicitly.` | |
+| an INSERT of a non-DEFAULT value into a `GENERATED ALWAYS` identity column ([sequences.md](sequences.md) §13) | `428C9` | `Use OVERRIDING SYSTEM VALUE to override.` | `Column "{column}" is an identity column defined as GENERATED ALWAYS.` |
+| an UPDATE (or `DO UPDATE`) of such a column to anything but `DEFAULT` | `428C9` | | `Column "{column}" is an identity column defined as GENERATED ALWAYS.` |
+| a `DROP TABLE`, `DROP VIEW`, `ALTER TABLE … DROP COLUMN`, `DROP CONSTRAINT`, or `DROP PRIMARY KEY` that other objects depend on, without `CASCADE` | `2BP01` | `Use DROP ... CASCADE to drop the dependent objects too.` | |
+| a `DROP INDEX` of the index an `EXCLUDE` constraint owns | `2BP01` | `You can drop constraint {name} on table {table} instead.` | |
+
+Two different **explicit** collations (`42P21`) carry no hint, as in PostgreSQL.
+
+**Recorded divergences.**
+
+- jed's `DROP TYPE` and `DROP SEQUENCE` take no `CASCADE`, so their `2BP01` carries no hint:
+  PostgreSQL's sentence would suggest a form jed rejects.
+- PostgreSQL's `2BP01` Detail lists every dependent object; jed names the first dependent in its
+  message and gives no Detail (§7).
+
+## 12. `DatabaseName` — PostgreSQL's `SchemaName`
+
+PostgreSQL sets `SchemaName` whenever it sets `TableName` (`errtable`): the schema of the table the
+error concerns. jed has no schemas; its qualifier is a **database** — `main`, the session's `temp`, or a
+host attachment ([attached-databases.md](attached-databases.md) §3). `DatabaseName` (Rust
+`database_name: Option<String>`, Go `DatabaseName string`, TS `databaseName?: string`) is the analog,
+with PostgreSQL's population rule: **set whenever `TableName` is set**, to the database holding that
+table, and absent otherwise.
+
+- **Which database.** The statement's target qualifier when it wrote one (`INSERT INTO reports.t`,
+  `CREATE UNIQUE INDEX … ON reports.t`); otherwise the implicit scope: `temp` for a session-local
+  temporary table, else `main` (a bare name reaches only those two). A `CREATE TEMP TABLE`'s errors
+  name `temp`.
+- **Where it is stamped.** At the statement boundary that knows the target (each `INSERT` / `UPDATE` /
+  `DELETE`, including a writable-CTE child, and the `CREATE TABLE` / `ALTER TABLE` / `CREATE INDEX`
+  dispatch), after the error is decided — the same one-source rule as `TableName` (§5). Every table a
+  statement writes is in its target's database (a foreign key never crosses databases), so the stamp is
+  always correct.
+- **Deterministic and additive.** The value is a catalog name, cross-core identical; no format, cost, or
+  message change.
+- **Divergence.** PostgreSQL's values are schema names (`public`, `pg_temp_3`); jed's are database names.
+
+The CLI prints a non-`main` database as a `DATABASE:` line ([cli.md](cli.md) §5). The shared fixture
+([../errors/position_cases.txt](../errors/position_cases.txt)) pins it with its `database:` and
+`attach:` directives.

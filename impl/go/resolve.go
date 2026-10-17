@@ -1813,6 +1813,24 @@ func locateNodeError(err error, e exprNode) error {
 		if e.Literal.Kind == literalText {
 			pos = e.Pos
 		}
+	case exprCast:
+		// A cast's unknown target type points at the type name; a cast with no conversion for its
+		// operand type at the `::` / CAST token (PostgreSQL's 42846, jed's 42804).
+		switch ee.State {
+		case UndefinedObject:
+			pos = e.Cast.TypePos
+		case DatatypeMismatch:
+			pos = e.Cast.CastPos
+		}
+	case exprTypedLiteral:
+		if ee.State == UndefinedObject {
+			pos = e.TypeLitPos
+		}
+	case exprExtract:
+		// EXTRACT is PostgreSQL's extract(…) function: a source type with none is its lookup failure.
+		if ee.State == UndefinedFunction {
+			pos = e.Pos
+		}
 	}
 	// The operator's own type error — not one an operand decided, nor one positioned inside a
 	// subquery — is PostgreSQL's "operator does not exist" (§11.7).
@@ -1831,12 +1849,14 @@ func isUnknownLiteral(e exprNode) bool {
 
 // exprLocation is an expression's location for an error that names the whole expression —
 // PostgreSQL's exprLocation, the leftmost character the expression was written at, its folded
-// grouping parentheses excluded (spec/design/error-fields.md §10.2). 0 when jed did not record it (a
-// bind parameter, a subquery, a constructor keyword, stored text): the error then carries no position
-// rather than a wrong one.
+// grouping parentheses excluded (spec/design/error-fields.md §10.2). 0 when jed did not record it
+// (stored text, or a CAST(x AS t) whose location depends on the conversion): the error then carries no
+// position rather than a wrong one.
 func exprLocation(e exprNode) srcPos {
 	switch e.Kind {
-	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprUnary, exprCase, exprFuncCall:
+	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprUnary, exprCase, exprFuncCall,
+		exprParam, exprRow, exprArray, exprCoalesce, exprGreatestLeast, exprExtract, exprScalarSubquery,
+		exprExists, exprJsonCtor, exprJsonExists, exprJsonValue, exprJsonQuery:
 		return e.Pos
 	case exprCast:
 		// A `::` cast is located at its operand (the leftmost token). CAST(x AS t) is located at a
@@ -3047,7 +3067,8 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		for _, w := range e.Case.Whens {
 			var rcond *rExpr
 			if e.Case.Operand != nil {
-				eq := newBinaryExpr(opEq, *e.Case.Operand, w.Cond, 0)
+				// The comparison is reported at its WHEN keyword (spec/design/error-fields.md §10.2).
+				eq := newBinaryExpr(opEq, *e.Case.Operand, w.Cond, w.Pos)
 				rc, _, err := resolve(s, eq, nil, ag, params)
 				if err != nil {
 					return nil, resolvedType{}, err
@@ -3677,7 +3698,8 @@ func sortTargetCollation(catalog *engine, d deriv) (*Collation, error) {
 // sortTargetCollation).
 func rejectIndeterminateTarget(d deriv) error {
 	if d.kind == derivIndeterminate {
-		return newError(CollationMismatch, "collation mismatch between implicit collations")
+		return newError(CollationMismatch, "collation mismatch between implicit collations").
+			hinted(hintCollationImplicitMismatch)
 	}
 	return nil
 }
@@ -3738,7 +3760,7 @@ func commonCollation(inputs []deriv, noneOK bool) (deriv, error) {
 		if len(names) >= 2 && names[0] != names[1] {
 			msg = fmt.Sprintf("collation mismatch between implicit collations \"%s\" and \"%s\"", names[0], names[1])
 		}
-		return deriv{}, newError(CollationMismatch, msg)
+		return deriv{}, newError(CollationMismatch, msg).hinted(hintCollationImplicitMismatch)
 	default:
 		return d, nil
 	}
@@ -3795,7 +3817,7 @@ func combineDeriv(a, b deriv) (deriv, error) {
 	if a.kind == derivExplicit && b.kind == derivExplicit {
 		if a.name != b.name {
 			return deriv{}, newError(CollationMismatch,
-				fmt.Sprintf("collation mismatch between explicit collations %q and %q", a.name, b.name))
+				fmt.Sprintf("collation mismatch between explicit collations %q and %q", a.name, b.name)).noHint()
 		}
 		return a, nil
 	}
@@ -3827,7 +3849,7 @@ func resolveDeriv(catalog *engine, d deriv) (*Collation, error) {
 	switch d.kind {
 	case derivIndeterminate, derivConflicted:
 		return nil, newError(IndeterminateCollation,
-			"could not determine which collation to use for string comparison")
+			"could not determine which collation to use for string comparison").hinted(hintIndeterminateCollation)
 	case derivImplicit, derivExplicit:
 		return resolveCollationName(catalog, d.name)
 	default:

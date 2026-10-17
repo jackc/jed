@@ -157,7 +157,8 @@ impl Engine {
                         names[i],
                         t.type_name()
                     ),
-                ));
+                )
+                .hinted(error_hint::INDETERMINATE_COLLATION));
             }
         }
         if renames.len() > types.len() {

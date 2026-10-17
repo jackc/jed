@@ -1529,7 +1529,7 @@ pub(crate) fn resolve_agg_args(
         let Some(st) = family_param_type(desc.arg_families[i]) else {
             continue;
         };
-        if literal || matches!(args[i], Expr::Param(_)) {
+        if literal || matches!(args[i], Expr::Param(_, _)) {
             let (r, rt) = resolve(scope, &args[i], Some(st), sub, params)?;
             rargs[i] = r;
             *t = rt;

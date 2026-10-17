@@ -925,7 +925,8 @@ impl Engine {
                     "cannot drop view {} because view {} depends on it",
                     dep.name, dependent.name
                 ),
-            ));
+            )
+            .hinted(error_hint::DROP_CASCADE));
         }
         // Phase 3: remove.
         for name in &targets {
@@ -1142,7 +1143,8 @@ impl Engine {
                         "cannot drop table {} because view {} depends on it",
                         dep.name, view.name
                     ),
-                ));
+                )
+                .hinted(error_hint::DROP_CASCADE));
             }
             seeds.push(view.name.clone());
         }

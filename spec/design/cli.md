@@ -237,8 +237,11 @@ already exists.` (two spaces after the colon, as psql prints it). When the error
 `Position` ([error-fields.md](error-fields.md) §10), psql's error cursor comes first: `LINE n: <the
 statement line holding it>` (`n` counts lines within the statement) and a `^` under the character. An
 engine `Hint` (§11) follows any DETAIL as `HINT:  Perhaps you meant to reference the column "t.name".`.
-The TUI's one-line message log appends Detail and Hint inline (`…  DETAIL: Key (id)=(1) already
-exists.`, `…  HINT: …`). CLI-generated hints (a second `hint: ...` line):
+When the error's table is in a database other than `main` (`DatabaseName`, [error-fields.md](error-fields.md)
+§12 — a host attachment or `temp`), a `DATABASE:  reports` line follows; `main`, the common case, is
+not printed (psql likewise prints `SCHEMA NAME` only in verbose mode). The TUI's one-line message log
+appends Detail, Hint, and a non-`main` database inline (`…  DETAIL: Key (id)=(1) already exists.`,
+`…  HINT: …`, `…  DATABASE: reports`). CLI-generated hints (a second `hint: ...` line):
 missing file → `pass --create`; `54P01` → `raise the ceiling with --max-cost`.
 
 ## 6. TUI mode
