@@ -180,10 +180,9 @@ func TestLazyValuesRoundTripExactly(t *testing.T) {
 	}
 }
 
-// An UPDATE that never touches the spilled column re-stores it without losing it: the
-// rewritten row resolves its unfetched values as part of the rewrite, the dirty leaf's other
-// rows resolve at commit, and a reopen reads everything back exactly (large-values.md §14 —
-// resolve-at-commit; chain sharing stays the deferred follow-on).
+// An UPDATE that never touches the spilled column re-stores it without losing it: the rewritten
+// row and the dirty leaf's other rows keep the value's stored form and chain, and a reopen reads
+// everything back exactly (large-values.md §15; chain_sharing_test.go pins the sharing).
 func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "lazy_update.jed")
@@ -201,10 +200,10 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Dirties the leaf carrying row 1's unfetched body without touching it: row 2's rewrite
-	// resolves nothing, row 1 resolves at commit.
+	// Dirties the leaf carrying row 1's unfetched body without touching it: row 1 keeps its stored
+	// form and chain at commit.
 	mustExec(t, db, "UPDATE t SET n = 99 WHERE id = 2")
-	// Rewrites row 1 itself: the rewrite materializes its body (part of the write work).
+	// Rewrites row 1 itself: the unassigned body is carried over with its chain.
 	mustExec(t, db, "UPDATE t SET n = 11 WHERE id = 1")
 	if err := db.Close(); err != nil {
 		t.Fatal(err)

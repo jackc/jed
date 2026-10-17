@@ -2088,6 +2088,60 @@ gen = "int_uniform"
 min = 0
 max = 99999
 
+# Chain sharing on rewrite (large-values.md §15): UPDATEs that assign only an integer column of rows
+# whose ~9,600-character body is stored out of line — incompressible (an md5 concatenation, a 2-page
+# overflow chain at 8 KiB) on even ids, compressible (a repeated md5, stored inline-compressed) on odd
+# ids. The rewrite keeps each body's stored form and chain: no chain read, no decompression, no
+# recompression, and the commit writes no chain page. The rollback lane measures the statement; the
+# durable lane adds the commit. SQLite has no md5/repeat, so it sits these out.
+[[bench]]
+name = "update_untouched_large_rollback"
+description = "UPDATE of an integer column on 2k rows with ~9.6k-character out-of-line bodies (bodies untouched), rolled back each iteration"
+dataset = "scratch"
+kind = "write_rollback"
+sql = "UPDATE wide SET n = n + 1 WHERE id = $1"
+batch = 1
+warmup = 200
+iterations = 2000
+seed = 4292
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS wide",
+  "CREATE TABLE wide (id bigint PRIMARY KEY, n integer, body text)",
+  "INSERT INTO wide SELECT g, 0, CASE WHEN g % 2 = 0 THEN (SELECT string_agg(md5(CAST(g * 1000 + i AS text)), '' ORDER BY i) FROM generate_series(1, 300) i) ELSE repeat(md5(CAST(g AS text)), 300) END FROM generate_series(1, 2000) g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 2000
+
+[[bench]]
+name = "update_untouched_large_durable"
+description = "Durable single-row UPDATE commits of an integer column on 2k rows with ~9.6k-character out-of-line bodies (bodies untouched)"
+dataset = "scratch"
+kind = "write_durable"
+sql = "UPDATE wide SET n = $2 WHERE id = $1"
+warmup = 100
+iterations = 400
+seed = 4293
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS wide",
+  "CREATE TABLE wide (id bigint PRIMARY KEY, n integer, body text)",
+  "INSERT INTO wide SELECT g, 0, CASE WHEN g % 2 = 0 THEN (SELECT string_agg(md5(CAST(g * 1000 + i AS text)), '' ORDER BY i) FROM generate_series(1, 300) i) ELSE repeat(md5(CAST(g AS text)), 300) END FROM generate_series(1, 2000) g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 2000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 99999
+
 # Text-heavy rows (benchmarks.md §11) over the `text` dataset: 5,000 bodies of 1,000–16,000
 # compressible characters, so most rows store their body LZ4-compressed and the longest ones in an
 # overflow chain (datasets.toml). The scan reads and decompresses every body; the point read returns

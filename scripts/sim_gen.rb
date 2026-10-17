@@ -47,7 +47,7 @@ module SimGen
     "attached_writes" => 0,
     "weights" => {
       "open_write" => 10, "open_read" => 6, "close_read" => 5, "read_query" => 8,
-      "insert" => 14, "update" => 9, "delete" => 5, "upsert" => 4,
+      "insert" => 14, "update" => 9, "delete" => 5, "upsert" => 4, "update_narrow" => 0,
       "create_table" => 2, "drop_table" => 1, "create_index" => 2, "drop_index" => 1,
       "add_column" => 1, "analyze" => 1, "reindex" => 1, "sequence" => 1, "invalid" => 1,
       "commit" => 9, "rollback" => 2, "check" => 2, "reopen" => 1, "clock" => 1,
@@ -566,6 +566,7 @@ module SimGen
       case action
       when "insert" then insert
       when "update" then update
+      when "update_narrow" then update_narrow
       when "delete" then delete
       when "upsert" then upsert
       when "create_table" then create_table
@@ -749,6 +750,24 @@ module SimGen
       chosen = [@rng.pick(targets)] if chosen.empty?
       sets = chosen.map { |name, type, role| "#{name} = #{update_expr(name, type, role)}" }.join(", ")
       on("UPDATE #{t.name} SET #{sets} WHERE #{range_predicate(t)}")
+    end
+
+    # An UPDATE that assigns only a fixed-width column of a table that also has variable-width ones:
+    # the rewrite carries each large value over in its stored form and keeps its overflow chain
+    # (large-values.md §15). Half the time the WHERE also reads a variable-width column, which must
+    # not stop the chain from being kept.
+    def update_narrow
+      t = pick_table or return
+      return if t.next_id <= 1
+
+      wide = t.cols.select { |_, type, _| %w[text bytea].include?(type) }
+      narrow = t.cols.drop(1).select { |_, type, role| type == "i32" && role != :key }
+      return if wide.empty? || narrow.empty?
+
+      name = @rng.pick(narrow)[0]
+      where = range_predicate(t)
+      where = "(#{where}) AND #{@rng.pick(wide)[0]} IS NOT NULL" if @rng.chance(500)
+      on("UPDATE #{t.name} SET #{name} = (#{name} + 1) % 1000 WHERE #{where}")
     end
 
     def delete

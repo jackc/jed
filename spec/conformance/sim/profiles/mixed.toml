@@ -25,6 +25,7 @@ insert = 14
 update = 9
 delete = 5
 upsert = 4
+update_narrow = 0               # assigns only a fixed-width column (large-values.md §15)
 create_table = 2
 drop_table = 1
 create_index = 2

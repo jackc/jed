@@ -163,6 +163,15 @@ pub enum Unfetched {
     },
 }
 
+impl Unfetched {
+    /// Whether this reference is one of the stored large-value forms (inline-compressed or
+    /// external) rather than an inline-plain body whose decode was merely deferred — the forms an
+    /// UPDATE's new row carries over unread (spec/design/large-values.md §15).
+    pub(crate) fn is_large_form(&self) -> bool {
+        !matches!(self, Unfetched::Inline { .. })
+    }
+}
+
 /// An opaque, weakly-held handle to the database's pager, carried by a deferred external value so
 /// it can self-resolve at the evaluator's column access (the B4 demand-fault backstop). Public in
 /// type position only (it rides the public [`Value`] enum); its innards are crate-private. Weak —

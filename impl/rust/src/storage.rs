@@ -215,6 +215,11 @@ impl TableStore {
         self.paging = Some(paging);
     }
 
+    /// This database's shared paging context, when the store is paged.
+    pub(crate) fn paging(&self) -> Option<&SharedPaging> {
+        self.paging.as_deref()
+    }
+
     /// This row's on-disk record size — the weight the page-backed B-tree splits on. Accounts for
     /// out-of-line spill at `cap` (an externalized value weighs its pointer, not its full body —
     /// spec/design/large-values.md §12), so split points match the serialized pages.
@@ -594,6 +599,38 @@ impl TableStore {
                     .expect("an unfetched value implies a paged store");
                 let fetch = |p: u32| paging.pager().read_block(p);
                 *v = crate::format::resolve_unfetched(&self.col_types[i], u, &fetch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialize one deferred value of column `col` through this store's pager.
+    pub(crate) fn resolve_value(&self, col: usize, u: &Unfetched) -> Result<Value> {
+        let paging = self
+            .paging
+            .as_ref()
+            .expect("an unfetched value implies a paged store");
+        let fetch = |p: u32| paging.pager().read_block(p);
+        crate::format::resolve_unfetched(&self.col_types[col], u, &fetch)
+    }
+
+    /// Settle the deferred values an UPDATE's new row carries over (spec/design/large-values.md
+    /// §15): one stays deferred only where the row's disposition plan, under its storage `key`,
+    /// stores it in its stored form — so the commit writes it from its stored bytes and keeps its
+    /// chain. Any other is resolved (unmetered, part of the rewrite), so a stored row's deferred
+    /// values always equal its own plan's output — the invariant the scan cost walk and the
+    /// commit encoder rely on.
+    pub(crate) fn settle_carried(&self, key: &[u8], row: &mut Row) -> Result<()> {
+        if !row.iter().any(|v| matches!(v, Value::Unfetched(_))) {
+            return Ok(());
+        }
+        let kept = crate::format::deferred_in_stored_form(&self.col_types, key, row, self.cap);
+        for (i, v) in row.iter_mut().enumerate() {
+            if let Value::Unfetched(u) = v
+                && !kept[i]
+            {
+                let resolved = self.resolve_value(i, u)?;
+                *v = resolved;
             }
         }
         Ok(())

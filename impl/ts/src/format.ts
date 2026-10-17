@@ -699,7 +699,7 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
   if (v.kind === "null") return encodeNullable(ty, null);
   if (v.kind === "unfetched") {
     // An unfetched reference is resolved before any encode/plan (the scan layer for reads,
-    // the mutation path for stores, resolveForEncode at commit — large-values.md §14).
+    // the commit encoder writes a deferred value from its stored bytes — large-values.md §15).
     throw new Error("BUG: encoding an unfetched large value");
   }
   if (v.kind === "text") {
@@ -951,13 +951,60 @@ type ValueDisp = "inline" | "inlineComp" | "external" | "externalComp";
 // weight), and the value_compress slabs the plan's pass-1 attempts cost (cost.md §3).
 type RecordPlan = {
   disp: ValueDisp[];
+  // comp is the LZ4 block of a compressed form, or null when the block is the one already on a
+  // deferred external-compressed value's chain (large-values.md §15) — compLen is its length either
+  // way.
   comp: (Uint8Array | null)[];
+  compLen: number[];
   size: number;
   compressUnits: number;
   // external is the bytes externalized values occupy on their overflow chains — the raw payload of an
   // external-plain value, the compressed block of an external-compressed one.
   external: number;
+  // payloadLen is each spillable, non-NULL value's content-payload length |P(v)| (0 otherwise) — the
+  // raw length a compressed form records.
+  payloadLen: number[];
 };
+
+// inlineHeaderLen is the inline-plain value-codec header ahead of a content payload P(v) (format.md
+// "Value codec"): the present tag plus, for the length-prefixed text / bytea / json bodies, the u16
+// length; just the tag for every other spillable body (whose payload is the body itself).
+function inlineHeaderLen(ty: ColType): number {
+  if (ty.kind === "scalar" && (isText(ty.scalar) || isBytea(ty.scalar) || isJson(ty.scalar))) {
+    return 3;
+  }
+  return 1;
+}
+
+// valueFacts returns one variable-width value's planning facts: its inline-plain encoded size and its
+// content-payload length. A deferred value supplies both from its stored fields, without reading its
+// chain or decompressing its block (large-values.md §15).
+function valueFacts(ty: ColType, v: Value): [number, number] {
+  if (v.kind === "null") return [0, 0];
+  if (v.kind === "unfetched") {
+    const u = v.ref;
+    let payload: number;
+    if (u.form === 0x00) payload = 1 + u.comp!.length - inlineHeaderLen(ty);
+    else if (u.form === TAG_EXTERNAL) payload = u.storedLen;
+    else payload = u.rawLen;
+    return [payload + inlineHeaderLen(ty), payload];
+  }
+  return [encodeValue(ty, v).length, isSpillable(ty) ? valuePayload(ty, v).length : 0];
+}
+
+// planningPayload is the content payload P(v) of a value the planner compresses: a resident value's,
+// or an inline-deferred value's, read straight from the inline body it holds — the body after a
+// text/bytea/json value's u16 length, every other spillable body whole (format.md "Value codec"). No
+// decode, so a corrupt span cannot fail planning; resolving it later reports it.
+function planningPayload(ty: ColType, v: Value): Uint8Array {
+  if (v.kind === "unfetched") {
+    if (v.ref.form !== 0x00)
+      throw new Error("BUG: a stored large form's compression outcome is known");
+    const body = v.ref.comp!;
+    return body.subarray(Math.min(inlineHeaderLen(ty) - 1, body.length));
+  }
+  return valuePayload(ty, v);
+}
 
 // planDispositions decides each column's on-disk disposition (large-values.md §3/§12/§13;
 // format.md "Large values"). Spill only when forced: if the all-inline-plain record already fits
@@ -968,27 +1015,38 @@ type RecordPlan = {
 // beats their pointer, moving the bytes pass 1 chose (compressed → a 0x04 chain of the
 // compressed block) until the record fits. Shared by the serializer and recordSize (the B-tree
 // split weight): in-memory node boundaries must match the serialized pages.
+//
+// The plan is a function of the row's logical values alone. A deferred value (large-values.md §15)
+// contributes its sizes from its stored fields, and the outcome of a compression attempt on it is
+// already known from its stored form: an external-plain value was attempted and rejected (pass 2
+// ran, so pass 1 visited every candidate first), and an inline- or external-compressed one was
+// adopted with the block it stores. Only an inline-deferred value, whose stored form records no
+// outcome, is compressed when an attempt reaches it — from the bytes it holds.
 function planDispositions(
   colTypes: ColType[],
   key: Uint8Array,
   row: Row,
   capacity: number,
 ): RecordPlan {
+  const plan: RecordPlan = {
+    disp: new Array<ValueDisp>(colTypes.length).fill("inline"),
+    comp: new Array<Uint8Array | null>(colTypes.length).fill(null),
+    compLen: new Array<number>(colTypes.length).fill(0),
+    size: 0,
+    compressUnits: 0,
+    external: 0,
+    payloadLen: new Array<number>(colTypes.length).fill(0),
+  };
   // Each column's inline-plain contribution to recordSize (the v24 basis — format.md "Record"): a
   // fixed-width column always its width (a NULL occupies a zero-filled slot); a variable-width
   // column 0 when NULL (a zero-length span) else its tagged inline encoding.
   const inline = colTypes.map((ty, i) => {
     const w = fixedValueWidth(ty);
     if (w !== null) return w;
-    return row[i]!.kind === "null" ? 0 : encodeValue(ty, row[i]!).length;
+    const [size, payload] = valueFacts(ty, row[i]!);
+    if (isSpillable(ty)) plan.payloadLen[i] = payload;
+    return size;
   });
-  const plan: RecordPlan = {
-    disp: new Array<ValueDisp>(colTypes.length).fill("inline"),
-    comp: new Array<Uint8Array | null>(colTypes.length).fill(null),
-    size: 0,
-    compressUnits: 0,
-    external: 0,
-  };
   const cur = inline.slice();
   let size = key.length + inline.reduce((a, b) => a + b, 0);
   const max = recordMaxFor(capacity, colTypes.length);
@@ -999,27 +1057,36 @@ function planDispositions(
   // Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ S_COMPRESS; largest inline-plain
   // encoded size first, ties by ascending index (Array.prototype.sort is stable, ES2019+).
   // Every attempt is metered (ceil(raw/capacity) value_compress slabs) whether or not
-  // store-smaller adopts it.
-  // Each spillable, non-NULL value's raw payload length (0 otherwise) — the compress threshold's
-  // input, and an external-plain value's chain payload in pass 2.
-  const payloadLen = colTypes.map((ty, i) =>
-    isSpillable(ty) && row[i]!.kind !== "null" ? valuePayload(ty, row[i]!).length : 0,
-  );
+  // store-smaller adopts it — including an attempt whose outcome a deferred value's stored form
+  // already records (cost.md §3: the unit counts the logical attempt).
   let cand: number[] = [];
   for (let i = 0; i < colTypes.length; i++) {
-    if (payloadLen[i]! >= S_COMPRESS) cand.push(i);
+    if (plan.payloadLen[i]! >= S_COMPRESS) cand.push(i);
   }
   cand.sort((a, b) => inline[b]! - inline[a]!);
   for (const i of cand) {
     if (size <= max) break;
-    const payload = valuePayload(colTypes[i]!, row[i]!);
-    plan.compressUnits += Math.ceil(payload.length / capacity);
-    const comp = lz4Compress(payload);
-    if (INLINE_COMP_OVERHEAD + comp.length < inline[i]!) {
-      size = size - cur[i]! + INLINE_COMP_OVERHEAD + comp.length;
-      cur[i] = INLINE_COMP_OVERHEAD + comp.length;
+    plan.compressUnits += Math.ceil(plan.payloadLen[i]! / capacity);
+    const v = row[i]!;
+    let comp: Uint8Array | null = null;
+    let compLen = -1; // -1: the attempt is known to be rejected
+    if (v.kind === "unfetched" && v.ref.form !== 0x00) {
+      if (v.ref.form === TAG_INLINE_COMP) {
+        comp = v.ref.comp!;
+        compLen = comp.length;
+      } else if (v.ref.form === TAG_EXTERNAL_COMP) {
+        compLen = v.ref.storedLen; // the block stays on the value's chain
+      }
+    } else {
+      comp = lz4Compress(planningPayload(colTypes[i]!, v));
+      compLen = comp.length;
+    }
+    if (compLen >= 0 && INLINE_COMP_OVERHEAD + compLen < inline[i]!) {
+      size = size - cur[i]! + INLINE_COMP_OVERHEAD + compLen;
+      cur[i] = INLINE_COMP_OVERHEAD + compLen;
       plan.disp[i] = "inlineComp";
       plan.comp[i] = comp;
+      plan.compLen[i] = compLen;
     }
   }
   if (size <= max) {
@@ -1038,13 +1105,38 @@ function planDispositions(
     if (size <= max) break;
     const compressed = plan.disp[i] === "inlineComp";
     const ptr = compressed ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN;
-    plan.external += compressed ? plan.comp[i]!.length : payloadLen[i]!;
+    plan.external += compressed ? plan.compLen[i]! : plan.payloadLen[i]!;
     plan.disp[i] = compressed ? "externalComp" : "external";
     size = size - cur[i]! + ptr;
     cur[i] = ptr;
   }
   plan.size = size;
   return plan;
+}
+
+// deferredInStoredForm reports, per column, whether the value is deferred AND the record's plan
+// stores it in exactly its stored form (large-values.md §15) — the deferred values a rewritten
+// record may keep, written from their stored bytes with their chains kept.
+export function deferredInStoredForm(
+  colTypes: ColType[],
+  key: Uint8Array,
+  row: Row,
+  capacity: number,
+): boolean[] {
+  const plan = planDispositions(colTypes, key, row, capacity);
+  return row.map((v, i) => {
+    if (v.kind !== "unfetched") return false;
+    switch (v.ref.form) {
+      case 0x00:
+        return plan.disp[i] === "inline";
+      case TAG_INLINE_COMP:
+        return plan.disp[i] === "inlineComp";
+      case TAG_EXTERNAL:
+        return plan.disp[i] === "external";
+      default:
+        return plan.disp[i] === "externalComp";
+    }
+  });
 }
 
 // recordSize is the on-disk size of a record — the weight the page-backed B-tree splits on
@@ -1129,11 +1221,15 @@ export function recordScanUnits(
   let pages = 0;
   let decompress = 0;
   // A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
-  // §14): read the units straight off them — no disposition re-plan, which would need the
-  // unfetched bytes. The numbers equal the resident plan below by construction (the
-  // references ARE that plan's stored output), so a paged and an in-memory database charge
-  // identically (cost.md §3, logical cost).
-  if (row.some((v) => v.kind === "unfetched")) {
+  // §14): read the units straight off them — no disposition re-plan. The numbers equal the plan
+  // below by construction (the references ARE that plan's stored output, and a rewritten row keeps
+  // a deferred value only where its plan stores it in its stored form — §15), so a paged and an
+  // in-memory database charge identically (cost.md §3, logical cost). A row that also holds a
+  // resident variable-width value (an UPDATE's new row) takes the plan.
+  const residentVar = row.some(
+    (v, i) => fixedValueWidth(colTypes[i]!) === null && v.kind !== "null" && v.kind !== "unfetched",
+  );
+  if (!residentVar && row.some((v) => v.kind === "unfetched")) {
     for (let i = 0; i < row.length; i++) {
       const v = row[i]!;
       if (!mask[i] || v.kind !== "unfetched") continue;
@@ -1156,14 +1252,14 @@ export function recordScanUnits(
     if (!mask[i]) continue; // an untouched column's chain/slabs are never read (cost.md §3)
     switch (plan.disp[i]) {
       case "external":
-        pages += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
+        pages += Math.ceil(plan.payloadLen[i]! / capacity);
         break;
       case "inlineComp":
-        decompress += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
+        decompress += Math.ceil(plan.payloadLen[i]! / capacity);
         break;
       case "externalComp":
-        pages += Math.ceil(plan.comp[i]!.length / capacity);
-        decompress += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
+        pages += Math.ceil(plan.compLen[i]! / capacity);
+        decompress += Math.ceil(plan.payloadLen[i]! / capacity);
         break;
     }
   }
@@ -1267,23 +1363,99 @@ function encodeInterior(seps: Uint8Array[], childPages: number[]): Uint8Array {
   return w.toBytes();
 }
 
-// encodeDisposedValue encodes one value's on-disk body given its resolved disposition — the value
+// ChainSource says where the leaf encoder finds a deferred value's stored bytes, and what it does
+// with a deferred external value's existing overflow chain (large-values.md §15). An INCREMENTAL
+// commit (share) keeps the chain: the rewritten record stores the same pointer and no chain page is
+// written, because a chain page is immutable and the chain stays reachable from exactly one record of
+// the new snapshot. A FROM-SCRATCH image renumbers every page, so it copies the chain's stored bytes —
+// the raw payload or the compressed block, never decompressed — into a fresh chain. paging is the
+// database the pointers name; shared collects the first page of every chain the encoder kept, so the
+// live-page count does not count the chain as orphaned with the old leaf (memory.md §8.7).
+export class ChainSource {
+  readonly shared: number[] = [];
+  private readonly paging: SharedPaging | null;
+  private readonly share: boolean;
+
+  constructor(paging: SharedPaging | null, share: boolean) {
+    this.paging = paging;
+    this.share = share;
+  }
+
+  private fetch(p: number): Uint8Array {
+    if (this.paging === null) {
+      throw engineError("data_corrupted", "deferred large value with no pager at encode");
+    }
+    return this.paging.readBlock(p);
+  }
+
+  readChain(first: number, length: number): Uint8Array {
+    return readOverflowChain(first, length, (p) => this.fetch(p), []);
+  }
+
+  // resident returns v materialized: a deferred value resolved through the database's pager
+  // (unmetered, like all commit work), a resident value as is.
+  resident(ty: ColType, v: Value): Value {
+    if (v.kind !== "unfetched") return v;
+    return resolveUnfetched(ty, v.ref, (p) => this.fetch(p));
+  }
+
+  // keepChain returns the first page of the chain carrying a deferred value's stored bytes in the
+  // image being written: the existing chain itself (shared), or a fresh copy.
+  keepChain(
+    first: number,
+    stored: number,
+    capacity: number,
+    take: () => number,
+    ovf: OverflowPageOut[],
+  ): number {
+    if (this.share) {
+      this.shared.push(first);
+      return first;
+    }
+    return writeOverflowChain(this.readChain(first, stored), capacity, take, ovf);
+  }
+}
+
+// planBlock is the LZ4 block a compressed disposition stores: the plan's own block, or the one
+// already on the deferred value's chain.
+function planBlock(plan: RecordPlan, c: number, v: Value, src: ChainSource): Uint8Array {
+  const own = plan.comp[c];
+  if (own !== null && own !== undefined) return own;
+  if (v.kind !== "unfetched" || v.ref.form !== TAG_EXTERNAL_COMP) {
+    throw engineError("data_corrupted", "a chained LZ4 block with no chain");
+  }
+  return src.readChain(v.ref.firstPage, v.ref.storedLen);
+}
+
+// encodeDisposedValue encodes one value's on-disk body given its planned disposition — the value
 // codec, unchanged across the row-major and PAX leaf layouts (large-values.md §12/§13). An
 // inline-plain value is encodeValue; the large-value forms carry a pointer / inline block and
-// allocate overflow chains via `take`. `comp` is the LZ4 block a compressed form carries.
+// allocate overflow chains via `take`. The plan's LZ4 block is reused, so the serializer never
+// re-compresses. A deferred value planned in its own stored form is written from its stored bytes —
+// an inline body or block verbatim, an external pointer to its kept chain (§15) — so a rewritten
+// record never re-reads, decompresses, or recompresses an unchanged value.
 function encodeDisposedValue(
   ty: ColType,
   v: Value,
-  disp: ValueDisp,
-  comp: Uint8Array | null,
+  plan: RecordPlan,
+  c: number,
   capacity: number,
   take: () => number,
   ovf: OverflowPageOut[],
+  src: ChainSource,
 ): Uint8Array {
+  const u = v.kind === "unfetched" ? v.ref : null;
+  const rawLen = plan.payloadLen[c]!;
   const w = new ByteWriter();
-  switch (disp) {
+  switch (plan.disp[c]) {
     case "external": {
-      const payload = valuePayload(ty, v);
+      if (u !== null && u.form === TAG_EXTERNAL) {
+        w.u8(TAG_EXTERNAL);
+        w.u32(src.keepChain(u.firstPage, u.storedLen, capacity, take, ovf));
+        w.u32(u.storedLen);
+        break;
+      }
+      const payload = valuePayload(ty, src.resident(ty, v));
       const first = writeOverflowChain(payload, capacity, take, ovf);
       w.u8(TAG_EXTERNAL);
       w.u32(first);
@@ -1291,25 +1463,37 @@ function encodeDisposedValue(
       break;
     }
     case "inlineComp": {
-      const rawLen = valuePayload(ty, v).length;
+      const comp = planBlock(plan, c, v, src);
       w.u8(TAG_INLINE_COMP);
       w.u32(rawLen);
-      w.u16(comp!.length);
-      w.bytes(comp!);
+      w.u16(comp.length);
+      w.bytes(comp);
       break;
     }
     case "externalComp": {
+      if (u !== null && u.form === TAG_EXTERNAL_COMP) {
+        w.u8(TAG_EXTERNAL_COMP);
+        w.u32(src.keepChain(u.firstPage, u.storedLen, capacity, take, ovf));
+        w.u32(u.storedLen);
+        w.u32(u.rawLen);
+        break;
+      }
       // The chain carries the COMPRESSED block (its page count follows comp size).
-      const rawLen = valuePayload(ty, v).length;
-      const first = writeOverflowChain(comp!, capacity, take, ovf);
+      const comp = planBlock(plan, c, v, src);
+      const first = writeOverflowChain(comp, capacity, take, ovf);
       w.u8(TAG_EXTERNAL_COMP);
       w.u32(first);
-      w.u32(comp!.length);
+      w.u32(comp.length);
       w.u32(rawLen);
       break;
     }
     default:
-      w.bytes(encodeValue(ty, v));
+      if (u !== null && u.form === 0x00) {
+        w.u8(0x00);
+        w.bytes(u.comp!);
+      } else {
+        w.bytes(encodeValue(ty, src.resident(ty, v)));
+      }
   }
   return w.toBytes();
 }
@@ -1321,8 +1505,8 @@ function encodeDisposedValue(
 // (K+1 u32 absolute offsets, colStart[K] = payload end) ‖ per column a region: a flags byte (0),
 // then — fixed-width — the null bitmap + N×width dense untagged slots (a NULL slot zero-filled),
 // or — variable-width — an N-entry end-offset value directory + the tagged value bodies (NULL = a
-// zero-length span). Exported for the lazy-record white-box test (lazy_inline_values.test.ts); the
-// barrel (tooling.ts) is unaffected.
+// zero-length span). A kept chain (src, large-values.md §15) allocates nothing. Exported for the
+// lazy-record white-box test (lazy_inline_values.test.ts); the barrel (tooling.ts) is unaffected.
 export function encodeLeafPax(
   colTypes: ColType[],
   keys: Uint8Array[],
@@ -1330,6 +1514,7 @@ export function encodeLeafPax(
   capacity: number,
   take: () => number,
   ovf: OverflowPageOut[],
+  src: ChainSource = new ChainSource(null, false),
 ): Uint8Array {
   const n = keys.length;
   const k = colTypes.length;
@@ -1350,15 +1535,7 @@ export function encodeLeafPax(
       } else if (isNull) {
         valBytes[c]![i] = new Uint8Array(0);
       } else {
-        valBytes[c]![i] = encodeDisposedValue(
-          colTypes[c]!,
-          v,
-          plan.disp[c]!,
-          plan.comp[c] ?? null,
-          capacity,
-          take,
-          ovf,
-        );
+        valBytes[c]![i] = encodeDisposedValue(colTypes[c]!, v, plan, c, capacity, take, ovf, src);
       }
     }
   }
@@ -2658,12 +2835,12 @@ function serializeNode(
   } else {
     // A leaf may be Packed here: a demand-paged load keeps leaves as page blocks and toImage
     // re-serializes them. Materialize through the seam (decodedRows reconstructs a Packed leaf,
-    // clones a Decoded one), then resolve any lazily-deferred large values through the store's
-    // pager (large-values.md §14) so encode sees resident bytes. Whole-image serialize is not a
-    // hot path (create's empty image / golden generator / toImage canonical), so the clones are
-    // acceptable (packed-leaf.md §7).
-    const rows = decodedRows(n).map((row) => store.resolveAll(row));
-    payload = encodeLeafPax(colTypes, keyViews(n), rows, capacity, take, ovf);
+    // clones a Decoded one). A deferred large value is written from its stored bytes, its chain
+    // copied into the renumbered image (large-values.md §15). Whole-image serialize is not a hot
+    // path (create's empty image / golden generator / toImage canonical / compaction), so the
+    // clones are acceptable (packed-leaf.md §7).
+    const src = new ChainSource(store.pagingContext(), false);
+    payload = encodeLeafPax(colTypes, keyViews(n), decodedRows(n), capacity, take, ovf, src);
   }
   if (payload.length > capacity) {
     throw engineError(
@@ -2693,6 +2870,10 @@ export type IncrementalWrite = {
   // subtrees are shared with the previous snapshot, so the live-page delta skips them (liveAfter,
   // spec/design/memory.md §8.7).
   kept: Set<number>;
+  // sharedChains is the first page of every overflow chain a rewritten record kept (large-values.md
+  // §15): the chain is shared with the previous snapshot, so the live-page delta does not count it as
+  // orphaned with the leaf that held it before.
+  sharedChains: Set<number>;
   // catalogPages and gistPages are how many of pages are catalog pages and GiST R-tree pages. Both are
   // rewritten whole every commit.
   catalogPages: number;
@@ -2718,7 +2899,13 @@ export function liveAfter(
   paging: SharedPaging,
   pageSize: number,
 ): LiveCount {
-  const orphaned = orphanedTreePages(prev, write.kept, paging, pagePayload(pageSize));
+  const orphaned = orphanedTreePages(
+    prev,
+    write.kept,
+    write.sharedChains,
+    paging,
+    pagePayload(pageSize),
+  );
   const live = count.live + write.pages.length - count.catalog - count.gist - orphaned;
   if (live < 0 || live > 0xffff_ffff) {
     throw engineError("data_corrupted", "live page count out of range");
@@ -2729,13 +2916,15 @@ export function liveAfter(
 // orphanedTreePages counts the B-tree pages of prev (table data trees and B-tree/GIN index trees) that
 // the new snapshot no longer references, plus the overflow pages their leaves own (spec/design/
 // memory.md §8.7). A subtree whose root page is in kept is shared and skipped whole: a persisted node
-// is immutable, so everything under it is shared too. Overflow chains are never shared between leaf
-// versions — a dirty leaf re-encodes every value into fresh chains — so an orphaned leaf orphans every
-// chain it points at, and its chain page count follows from each external pointer's stored length.
-// The walk reads only orphaned leaves of tables with spillable columns.
+// is immutable, so everything under it is shared too. An orphaned leaf orphans every chain it points
+// at except the ones a rewritten record kept (shared, large-values.md §15) — a chain is referenced by
+// exactly one record of a snapshot, so a kept chain's only old referrer is in an orphaned leaf — and
+// each chain's page count follows from its external pointer's stored length. The walk reads only
+// orphaned leaves of tables with spillable columns.
 function orphanedTreePages(
   prev: Snapshot,
   kept: Set<number>,
+  shared: Set<number>,
   paging: SharedPaging,
   cap: number,
 ): number {
@@ -2743,12 +2932,12 @@ function orphanedTreePages(
   for (const st of prev.stores.values()) {
     const colTypes = st.columnTypes();
     const spill = anySpillable(colTypes) ? colTypes : null;
-    count += orphanedNodePages(st.treeRoot(), kept, paging, spill, cap);
+    count += orphanedNodePages(st.treeRoot(), kept, shared, paging, spill, cap);
   }
   // A GiST leaf-key store is never serialized (its nodes keep page 0); its R-tree pages are counted
   // wholesale through LiveCount.gist.
   for (const ist of prev.indexStores.values()) {
-    count += orphanedNodePages(ist.treeRoot(), kept, paging, null, cap);
+    count += orphanedNodePages(ist.treeRoot(), kept, shared, paging, null, cap);
   }
   return count;
 }
@@ -2756,16 +2945,17 @@ function orphanedTreePages(
 function orphanedNodePages(
   n: PNode | null,
   kept: Set<number>,
+  shared: Set<number>,
   paging: SharedPaging,
   colTypes: ColType[] | null,
   cap: number,
 ): number {
   if (n === null || n.page === 0 || kept.has(n.page)) return 0;
-  if (n.children.length === 0) return orphanedLeafPages(n.page, paging, colTypes, cap);
+  if (n.children.length === 0) return orphanedLeafPages(n.page, shared, paging, colTypes, cap);
   let count = 1;
   for (const c of n.children) {
-    if (c.node !== null) count += orphanedNodePages(c.node, kept, paging, colTypes, cap);
-    else if (!kept.has(c.page)) count += orphanedLeafPages(c.page, paging, colTypes, cap);
+    if (c.node !== null) count += orphanedNodePages(c.node, kept, shared, paging, colTypes, cap);
+    else if (!kept.has(c.page)) count += orphanedLeafPages(c.page, shared, paging, colTypes, cap);
   }
   return count;
 }
@@ -2773,6 +2963,7 @@ function orphanedNodePages(
 // orphanedLeafPages is one orphaned leaf page plus the overflow pages its external values own.
 function orphanedLeafPages(
   pageIdx: number,
+  shared: Set<number>,
   paging: SharedPaging,
   colTypes: ColType[] | null,
   cap: number,
@@ -2797,6 +2988,7 @@ function orphanedLeafPages(
       );
       if (v.kind !== "unfetched") continue;
       if (v.ref.form !== TAG_EXTERNAL && v.ref.form !== TAG_EXTERNAL_COMP) continue;
+      if (shared.has(v.ref.firstPage)) continue; // kept by a rewritten record (large-values.md §15)
       count += Math.ceil(v.ref.storedLen / cap);
     }
   }
@@ -2889,6 +3081,7 @@ export function incrementalImage(
 
   const pages: { index: number; bytes: Uint8Array }[] = [];
   const kept = new Set<number>();
+  const shared = new Set<number>();
   let gistPages = 0;
   const rootDataPage: number[] = new Array(keys.length).fill(0);
   const indexRoots: number[][] = keys.map(() => []);
@@ -2905,6 +3098,7 @@ export function incrementalImage(
         alloc,
         pages,
         kept,
+        shared,
         paging,
       );
     }
@@ -2935,7 +3129,17 @@ export function incrementalImage(
       } else {
         const iroot = snap.indexStore(idx.name).treeRoot();
         if (iroot !== null) {
-          ir = serializeDirty(iroot, indexColTypes, capacity, ps, alloc, pages, kept, paging);
+          ir = serializeDirty(
+            iroot,
+            indexColTypes,
+            capacity,
+            ps,
+            alloc,
+            pages,
+            kept,
+            shared,
+            paging,
+          );
         }
       }
       indexRoots[ti]!.push(ir);
@@ -2994,24 +3198,10 @@ export function incrementalImage(
     pageCount: alloc.next,
     freeRemaining: alloc.remaining(),
     kept,
+    sharedChains: shared,
     catalogPages: catPages.length,
     gistPages,
   };
-}
-
-// resolveForEncode materializes any unfetched values in `row` for re-encoding at commit
-// (spec/design/large-values.md §14): a dirty leaf may carry rows the lazy load left as
-// references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
-// like all commit work. Returns the row unchanged when nothing is unfetched (the common case);
-// resolution builds a fresh copy, never mutating the shared tree's row.
-function resolveForEncode(row: Row, colTypes: ColType[], paging: SharedPaging | null): Row {
-  if (!row.some((v) => v.kind === "unfetched")) return row;
-  if (paging === null)
-    throw engineError("data_corrupted", "unfetched large value with no pager at commit");
-  const fetch = (p: number): Uint8Array => paging.readBlock(p);
-  return row.map((v, i) =>
-    v.kind === "unfetched" ? resolveUnfetched(colTypes[i]!, v.ref, fetch) : v,
-  );
 }
 
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
@@ -3029,6 +3219,7 @@ function serializeDirty(
   alloc: PageAlloc,
   pages: { index: number; bytes: Uint8Array }[],
   kept: Set<number>,
+  shared: Set<number>,
   paging: SharedPaging | null,
 ): number {
   if (n.page !== 0) {
@@ -3043,15 +3234,18 @@ function serializeDirty(
       kept.add(c.page);
       childPages.push(c.page);
     } else {
-      childPages.push(serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, kept, paging));
+      childPages.push(
+        serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, kept, shared, paging),
+      );
     }
   }
   // Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
   // allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
-  // rows the lazy load left unfetched (a sibling row's mutation dirtied them): resolve those
-  // through the pager first — unmetered commit work, large-values.md §14 — so the re-encode
-  // re-plans the resident row exactly as an eager writer would. An INTERIOR node is the
-  // record-free keys+children skeleton (v24) — no values, no chains.
+  // rows the lazy load left deferred (a sibling row's mutation dirtied them), and an UPDATE's new
+  // row carries its unassigned large values deferred: each is written from its stored bytes, and a
+  // deferred external value keeps its existing chain (large-values.md §15) — no chain read, no
+  // decompression, no chain write. An INTERIOR node is the record-free keys+children skeleton (v24)
+  // — no values, no chains.
   const ovf: OverflowPageOut[] = [];
   const take = (): number => alloc.take();
   let pageType = PAGE_LEAF;
@@ -3060,8 +3254,9 @@ function serializeDirty(
     pageType = PAGE_INTERIOR;
     payload = encodeInterior(n.keys, childPages);
   } else {
-    const rows = n.vals.map((v) => resolveForEncode(v, colTypes, paging));
-    payload = encodeLeafPax(colTypes, n.keys, rows, capacity, take, ovf);
+    const src = new ChainSource(paging, true);
+    payload = encodeLeafPax(colTypes, n.keys, n.vals, capacity, take, ovf, src);
+    for (const p of src.shared) shared.add(p);
   }
   if (payload.length > capacity) {
     throw engineError(
@@ -4590,8 +4785,8 @@ function decodeTableEntry(
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL
 // decode as today, but an external/compressed form becomes an unfetched reference holding exactly
 // the record's pointer fields — no chain read, no decompression. The scan layer resolves the
-// references for the columns a query touches (resolveUnfetched); the commit path resolves the
-// rest when a dirty leaf re-encodes (resolveForEncode); a value the static touched set missed
+// references for the columns a query touches (resolveUnfetched); a commit writes the rest from
+// their stored bytes, keeping their chains (large-values.md §15); a value the static touched set missed
 // self-resolves from the tyref + paging handles stamped here (resolveUnfetchedSelf — the B4
 // demand-fault backstop, bplus-reshape.md §5). paging may be null for a DEAD handle (the open-time
 // reachability walk discards the value right after chain-marking).

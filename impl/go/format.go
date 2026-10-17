@@ -653,7 +653,7 @@ func encodeScalar(ty scalarType, v Value) []byte {
 		return encodeNullable(ty, nil)
 	case ValUnfetched:
 		// An unfetched reference is resolved before any encode/plan (the scan layer for reads,
-		// the mutation path for stores, resolveForEncode at commit — large-values.md §14).
+		// the commit encoder writes a deferred value from its stored bytes — large-values.md §15).
 		panic("BUG: encoding an unfetched large value")
 	case ValComposite:
 		// A composite value is encoded by encodeValue's composite arm, never here.
@@ -1051,22 +1051,18 @@ func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, 
 	} else {
 		// A leaf may be Packed here: a demand-paged load keeps leaves as page blocks and toImage
 		// re-serializes them. Materialize through the seam (decodedRows reconstructs a Packed leaf,
-		// clones a Decoded one), then resolve any lazily-deferred large values through the store's
-		// pager (large-values.md §14) so encode sees resident bytes. Whole-image serialize is not a
-		// hot path (create's empty image / golden generator / toImage canonical), so the clones are
-		// acceptable (packed-leaf.md §7).
+		// clones a Decoded one). A deferred large value is written from its stored bytes, its chain
+		// copied into the renumbered image (large-values.md §15). Whole-image serialize is not a hot
+		// path (create's empty image / golden generator / toImage canonical / compaction), so the
+		// clones are acceptable (packed-leaf.md §7).
 		rows, err := n.decodedRows()
 		if err != nil {
 			return 0, 0, err
 		}
-		for ri := range rows {
-			resolved, err := store.resolveAll(rows[ri])
-			if err != nil {
-				return 0, 0, err
-			}
-			rows[ri] = resolved
+		payload, err = encodeLeafPAX(colTypes, n.keyViews(), rows, capacity, take, &ovf, &chainSource{paging: store.paging})
+		if err != nil {
+			return 0, 0, err
 		}
-		payload = encodeLeafPAX(colTypes, n.keyViews(), rows, capacity, take, &ovf)
 	}
 	if len(payload) > capacity {
 		return 0, 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
@@ -1105,6 +1101,10 @@ type incrementalWrite struct {
 	// subtrees are shared with the previous snapshot, so the live-page delta skips them
 	// (liveCount.after, spec/design/memory.md §8.7).
 	kept map[uint32]bool
+	// sharedChains is the first page of every overflow chain a rewritten record kept (large-values.md
+	// §15): the chain is shared with the previous snapshot, so the live-page delta does not count it as
+	// orphaned with the leaf that held it before.
+	sharedChains map[uint32]bool
 	// catalogPages and gistPages are how many of pages are catalog pages and GiST R-tree pages. Both
 	// are rewritten whole every commit.
 	catalogPages uint32
@@ -1170,13 +1170,14 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 
 	var pages []dirtyPage
 	kept := make(map[uint32]bool)
+	shared := make(map[uint32]bool)
 	var gistPages uint32
 	rootDataPage := make([]uint32, len(keys))
 	indexRoots := make([][]uint32, len(keys))
 	var indexColTypes []colType
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, err := serializeDirty(root, s.stores[k].colTypes, capacity, ps, alloc, &pages, kept, paging)
+			rp, err := serializeDirty(root, s.stores[k].colTypes, capacity, ps, alloc, &pages, kept, shared, paging)
 			if err != nil {
 				return incrementalWrite{}, err
 			}
@@ -1200,7 +1201,7 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 				}
 				r = root
 			} else if root := s.indexStores[idx.Name].treeRoot(); root != nil {
-				rp, err := serializeDirty(root, indexColTypes, capacity, ps, alloc, &pages, kept, paging)
+				rp, err := serializeDirty(root, indexColTypes, capacity, ps, alloc, &pages, kept, shared, paging)
 				if err != nil {
 					return incrementalWrite{}, err
 				}
@@ -1279,43 +1280,10 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 		pageCount:     alloc.next,
 		freeRemaining: alloc.free[alloc.cursor:],
 		kept:          kept,
+		sharedChains:  shared,
 		catalogPages:  uint32(len(catPages)),
 		gistPages:     gistPages,
 	}, nil
-}
-
-// resolveForEncode materializes any unfetched values in row for re-encoding at commit
-// (spec/design/large-values.md §14): a dirty leaf may carry rows the lazy load left as
-// references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
-// like all commit work. Returns the row unchanged when nothing is unfetched (the common case);
-// resolution builds a fresh copy, never mutating the shared tree's row.
-func resolveForEncode(row storedRow, colTypes []colType, paging *sharedPaging) (storedRow, error) {
-	needs := false
-	for _, v := range row {
-		if v.Kind == ValUnfetched {
-			needs = true
-			break
-		}
-	}
-	if !needs {
-		return row, nil
-	}
-	if paging == nil {
-		return nil, newError(DataCorrupted, "unfetched large value with no pager at commit")
-	}
-	fetch := func(p uint32) ([]byte, error) { return paging.readBlock(p) }
-	out := make(storedRow, len(row))
-	copy(out, row)
-	for i := range out {
-		if out[i].Kind == ValUnfetched {
-			v, err := resolveUnfetched(colTypes[i], out[i].unfetched(), fetch)
-			if err != nil {
-				return nil, err
-			}
-			out[i] = v
-		}
-	}
-	return out, nil
 }
 
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
@@ -1326,7 +1294,7 @@ func resolveForEncode(row storedRow, colTypes []colType, paging *sharedPaging) (
 // Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
 // for the byte layout. Every clean node and OnDisk child it reaches is recorded in kept — the shared
 // boundary the live-page delta skips (spec/design/memory.md §8.7).
-func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage, kept map[uint32]bool, paging *sharedPaging) (uint32, error) {
+func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging) (uint32, error) {
 	if n.page != 0 {
 		kept[n.page] = true
 		return n.page, nil
@@ -1340,7 +1308,7 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 			childPages[i] = c.page
 			continue
 		}
-		cp, err := serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, kept, paging)
+		cp, err := serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, kept, shared, paging)
 		if err != nil {
 			return 0, err
 		}
@@ -1348,11 +1316,11 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 	}
 	// Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
 	// allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
-	// rows the lazy load left unfetched (a sibling row's mutation dirtied them): resolve those
-	// through the pager first — unmetered commit work, large-values.md §14 — so the re-encode
-	// re-plans the resident row exactly as an eager writer would (chains are rewritten fresh;
-	// sharing an unchanged chain is the deferred byte-layout follow-on). An INTERIOR node is the
-	// record-free keys+children skeleton (v24) — no values, no chains.
+	// rows the lazy load left deferred (a sibling row's mutation dirtied them), and an UPDATE's new
+	// row carries its unassigned large values deferred: each is written from its stored bytes, and a
+	// deferred external value keeps its existing chain (large-values.md §15) — no chain read, no
+	// decompression, no chain write. An INTERIOR node is the record-free keys+children skeleton (v24)
+	// — no values, no chains.
 	var ovf []overflowPageOut
 	var payload []byte
 	pageType := pageLeaf
@@ -1360,15 +1328,15 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 		pageType = pageInterior
 		payload = encodeInterior(n.keys, childPages)
 	} else {
-		rows := make([]storedRow, len(n.keys))
-		for i := range n.keys {
-			row, err := resolveForEncode(n.vals[i], colTypes, paging)
-			if err != nil {
-				return 0, err
-			}
-			rows[i] = row
+		src := &chainSource{paging: paging, share: true}
+		var err error
+		payload, err = encodeLeafPAX(colTypes, n.keys, n.vals, capacity, alloc.take, &ovf, src)
+		if err != nil {
+			return 0, err
 		}
-		payload = encodeLeafPAX(colTypes, n.keys, rows, capacity, alloc.take, &ovf)
+		for _, p := range src.shared {
+			shared[p] = true
+		}
 	}
 	if len(payload) > capacity {
 		return 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
@@ -1909,7 +1877,7 @@ type liveCount struct {
 // its whole GiST forest, and each B-tree node outside the shared subtrees together with its leaf's
 // overflow pages. A count that would go negative means the persisted count was wrong: XX001.
 func (lc liveCount) after(write incrementalWrite, prev *snapshot, paging *sharedPaging, pageSize uint32) (liveCount, error) {
-	orphaned, err := orphanedTreePages(prev, write.kept, paging, int(pageSize)-pageHeader)
+	orphaned, err := orphanedTreePages(prev, write.kept, write.sharedChains, paging, int(pageSize)-pageHeader)
 	if err != nil {
 		return liveCount{}, err
 	}
@@ -1923,18 +1891,19 @@ func (lc liveCount) after(write incrementalWrite, prev *snapshot, paging *shared
 // orphanedTreePages counts the B-tree pages of prev (table data trees and B-tree/GIN index trees) that
 // the new snapshot no longer references, plus the overflow pages their leaves own (spec/design/memory.md
 // §8.7). A subtree whose root page is in kept is shared and skipped whole: a persisted node is
-// immutable, so everything under it is shared too. Overflow chains are never shared between leaf
-// versions — a dirty leaf re-encodes every value into fresh chains — so an orphaned leaf orphans every
-// chain it points at, and its chain page count follows from each external pointer's stored length. The
-// walk reads only orphaned leaves of tables with spillable columns.
-func orphanedTreePages(prev *snapshot, kept map[uint32]bool, paging *sharedPaging, capacity int) (uint64, error) {
+// immutable, so everything under it is shared too. An orphaned leaf orphans every chain it points at
+// except the ones a rewritten record kept (shared, large-values.md §15) — a chain is referenced by
+// exactly one record of a snapshot, so a kept chain's only old referrer is in an orphaned leaf — and
+// each chain's page count follows from its external pointer's stored length. The walk reads only
+// orphaned leaves of tables with spillable columns.
+func orphanedTreePages(prev *snapshot, kept, shared map[uint32]bool, paging *sharedPaging, capacity int) (uint64, error) {
 	var count uint64
 	for _, st := range prev.stores {
 		var colTypes []colType
 		if anySpillable(st.colTypes) {
 			colTypes = st.colTypes
 		}
-		n, err := orphanedNodePages(st.treeRoot(), kept, paging, colTypes, capacity)
+		n, err := orphanedNodePages(st.treeRoot(), kept, shared, paging, colTypes, capacity)
 		if err != nil {
 			return 0, err
 		}
@@ -1943,7 +1912,7 @@ func orphanedTreePages(prev *snapshot, kept map[uint32]bool, paging *sharedPagin
 	// A GiST leaf-key store is never serialized (its nodes keep page 0); its R-tree pages are counted
 	// wholesale through liveCount.gist.
 	for _, ist := range prev.indexStores {
-		n, err := orphanedNodePages(ist.treeRoot(), kept, paging, nil, capacity)
+		n, err := orphanedNodePages(ist.treeRoot(), kept, shared, paging, nil, capacity)
 		if err != nil {
 			return 0, err
 		}
@@ -1954,12 +1923,12 @@ func orphanedTreePages(prev *snapshot, kept map[uint32]bool, paging *sharedPagin
 
 // orphanedNodePages counts one subtree's orphaned pages (orphanedTreePages). colTypes is nil for a tree
 // whose leaves own no overflow chains.
-func orphanedNodePages(n *pnode, kept map[uint32]bool, paging *sharedPaging, colTypes []colType, capacity int) (uint64, error) {
+func orphanedNodePages(n *pnode, kept, shared map[uint32]bool, paging *sharedPaging, colTypes []colType, capacity int) (uint64, error) {
 	if n == nil || n.page == 0 || kept[n.page] {
 		return 0, nil
 	}
 	if len(n.children) == 0 {
-		return orphanedLeafPages(n.page, paging, colTypes, capacity)
+		return orphanedLeafPages(n.page, shared, paging, colTypes, capacity)
 	}
 	count := uint64(1)
 	for _, c := range n.children {
@@ -1967,10 +1936,10 @@ func orphanedNodePages(n *pnode, kept map[uint32]bool, paging *sharedPaging, col
 		var err error
 		switch {
 		case c.node != nil:
-			sub, err = orphanedNodePages(c.node, kept, paging, colTypes, capacity)
+			sub, err = orphanedNodePages(c.node, kept, shared, paging, colTypes, capacity)
 		case kept[c.page]:
 		default:
-			sub, err = orphanedLeafPages(c.page, paging, colTypes, capacity)
+			sub, err = orphanedLeafPages(c.page, shared, paging, colTypes, capacity)
 		}
 		if err != nil {
 			return 0, err
@@ -1981,7 +1950,7 @@ func orphanedNodePages(n *pnode, kept map[uint32]bool, paging *sharedPaging, col
 }
 
 // orphanedLeafPages is one orphaned leaf page plus the overflow pages its external values own.
-func orphanedLeafPages(pageIdx uint32, paging *sharedPaging, colTypes []colType, capacity int) (uint64, error) {
+func orphanedLeafPages(pageIdx uint32, shared map[uint32]bool, paging *sharedPaging, colTypes []colType, capacity int) (uint64, error) {
 	if colTypes == nil {
 		return 1, nil
 	}
@@ -2025,6 +1994,9 @@ func orphanedLeafPages(pageIdx uint32, paging *sharedPaging, colTypes []colType,
 			}
 			switch u := v.unfetched(); u.Form {
 			case tagExternal, tagExternalComp:
+				if shared[u.FirstPage] {
+					continue // kept by a rewritten record (large-values.md §15)
+				}
 				count += (uint64(u.StoredLen) + uint64(capacity) - 1) / uint64(capacity)
 			}
 		}
@@ -2551,13 +2523,73 @@ const (
 // compressed form carries (so the serializer never re-compresses), the on-disk record size
 // (the B-tree split weight), and the value_compress slabs the plan's pass-1 attempts cost.
 type recordPlan struct {
-	disp          []valueDisp
+	disp []valueDisp
+	// comp is the LZ4 block of a compressed form, or nil when the block is the one already on a
+	// deferred external-compressed value's chain (large-values.md §15) — compLen is its length
+	// either way.
 	comp          [][]byte
+	compLen       []int
 	size          int
 	compressUnits int
 	// external is the bytes externalized values occupy on their overflow chains — the raw payload of
 	// an external-plain value, the compressed block of an external-compressed one.
 	external int
+	// payloadLen is each spillable, non-NULL value's content-payload length |P(v)| (0 otherwise) —
+	// the raw length a compressed form records.
+	payloadLen []int
+}
+
+// inlineHeaderLen is the inline-plain value-codec header ahead of a content payload P(v) (format.md
+// "Value codec"): the present tag plus, for the length-prefixed text / bytea / json bodies, the u16
+// length; just the tag for every other spillable body (whose payload is the body itself).
+func inlineHeaderLen(ty colType) int {
+	if !ty.Composite && ty.Elem == nil && ty.RangeElem == nil &&
+		(ty.Scalar.IsText() || ty.Scalar.IsBytea() || ty.Scalar.IsJson()) {
+		return 3
+	}
+	return 1
+}
+
+// valueFacts returns one variable-width value's planning facts: its inline-plain encoded size and
+// its content-payload length. A deferred value supplies both from its stored fields, without
+// reading its chain or decompressing its block (large-values.md §15).
+func valueFacts(ty colType, v Value) (inline, payload int) {
+	if v.IsNull() {
+		return 0, 0
+	}
+	if v.Kind == ValUnfetched {
+		u := v.unfetched()
+		switch u.Form {
+		case 0x00:
+			payload = 1 + len(u.Comp) - inlineHeaderLen(ty)
+		case tagExternal:
+			payload = int(u.StoredLen)
+		default:
+			payload = int(u.RawLen)
+		}
+		return payload + inlineHeaderLen(ty), payload
+	}
+	inline = len(encodeValue(ty, v))
+	if isSpillable(ty) {
+		payload = len(valuePayload(ty, v))
+	}
+	return inline, payload
+}
+
+// planningPayload is the content payload P(v) of a value the planner compresses: a resident value's,
+// or an inline-deferred value's, read straight from the inline body it holds — the body after a
+// text/bytea/json value's u16 length, every other spillable body whole (format.md "Value codec"). No
+// decode, so a corrupt span cannot fail planning; resolving it later reports it.
+func planningPayload(ty colType, v Value) []byte {
+	if v.Kind == ValUnfetched {
+		u := v.unfetched()
+		if u.Form != 0x00 {
+			panic("BUG: a stored large form's compression outcome is known")
+		}
+		skip := min(inlineHeaderLen(ty)-1, len(u.Comp))
+		return u.Comp[skip:]
+	}
+	return valuePayload(ty, v)
 }
 
 // planDispositions decides each column's on-disk disposition (large-values.md §3/§12/§13;
@@ -2569,25 +2601,36 @@ type recordPlan struct {
 // their pointer, moving the bytes pass 1 chose (compressed → a 0x04 chain of the compressed
 // block) until the record fits. Shared by the serializer and recordSize (the B-tree split
 // weight): in-memory node boundaries must match the serialized pages.
+//
+// The plan is a function of the row's logical values alone. A deferred value (large-values.md §15)
+// contributes its sizes from its stored fields, and the outcome of a compression attempt on it is
+// already known from its stored form: an external-plain value was attempted and rejected (pass 2
+// ran, so pass 1 visited every candidate first), and an inline- or external-compressed one was
+// adopted with the block it stores. Only an inline-deferred value, whose stored form records no
+// outcome, is compressed when an attempt reaches it — from the bytes it holds.
 func planDispositions(colTypes []colType, key []byte, row storedRow, capacity int) recordPlan {
 	// Each column's inline-plain contribution to recordSize (the v24 basis — format.md "Record"):
 	// a fixed-width column always its width (a NULL occupies a zero-filled slot); a variable-width
 	// column 0 when NULL (a zero-length span) else its tagged inline encoding.
 	inline := make([]int, len(colTypes))
+	plan := recordPlan{
+		disp:       make([]valueDisp, len(colTypes)),
+		comp:       make([][]byte, len(colTypes)),
+		compLen:    make([]int, len(colTypes)),
+		payloadLen: make([]int, len(colTypes)),
+	}
 	size := len(key)
 	for i, ty := range colTypes {
 		if w, ok := fixedValueWidth(ty); ok {
 			inline[i] = w
-		} else if row[i].IsNull() {
-			inline[i] = 0
 		} else {
-			inline[i] = len(encodeValue(ty, row[i]))
+			var payload int
+			inline[i], payload = valueFacts(ty, row[i])
+			if isSpillable(ty) {
+				plan.payloadLen[i] = payload
+			}
 		}
 		size += inline[i]
-	}
-	plan := recordPlan{
-		disp: make([]valueDisp, len(colTypes)),
-		comp: make([][]byte, len(colTypes)),
 	}
 	cur := append([]int(nil), inline...)
 	max := recordMaxFor(capacity, len(colTypes))
@@ -2597,17 +2640,13 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 	}
 	// Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ sCompress; largest inline-plain
 	// encoded size first, ties by ascending index. Every attempt is metered (ceil(raw/capacity)
-	// value_compress slabs) whether or not store-smaller adopts it.
-	// Each spillable, non-NULL value's raw payload length (0 otherwise) — the compress threshold's
-	// input, and an external-plain value's chain payload in pass 2.
-	payloadLen := make([]int, len(colTypes))
+	// value_compress slabs) whether or not store-smaller adopts it — including an attempt whose
+	// outcome a deferred value's stored form already records (cost.md §3: the unit counts the
+	// logical attempt).
 	cand := make([]int, 0, len(colTypes))
-	for i, ty := range colTypes {
-		if isSpillable(ty) && !row[i].IsNull() {
-			payloadLen[i] = len(valuePayload(ty, row[i]))
-			if payloadLen[i] >= sCompress {
-				cand = append(cand, i)
-			}
+	for i := range colTypes {
+		if plan.payloadLen[i] >= sCompress {
+			cand = append(cand, i)
 		}
 	}
 	sort.SliceStable(cand, func(a, b int) bool { return inline[cand[a]] > inline[cand[b]] })
@@ -2615,14 +2654,27 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 		if size <= max {
 			break
 		}
-		payload := valuePayload(colTypes[i], row[i])
-		plan.compressUnits += (len(payload) + capacity - 1) / capacity
-		comp := lz4Compress(payload)
-		if inlineCompOverhead+len(comp) < inline[i] {
-			size = size - cur[i] + inlineCompOverhead + len(comp)
-			cur[i] = inlineCompOverhead + len(comp)
+		plan.compressUnits += (plan.payloadLen[i] + capacity - 1) / capacity
+		var comp []byte
+		compLen := -1 // -1: the attempt is known to be rejected
+		if v := row[i]; v.Kind == ValUnfetched && v.unfetched().Form != 0x00 {
+			u := v.unfetched()
+			switch u.Form {
+			case tagInlineComp:
+				comp, compLen = u.Comp, len(u.Comp)
+			case tagExternalComp:
+				compLen = int(u.StoredLen) // the block stays on the value's chain
+			}
+		} else {
+			comp = lz4Compress(planningPayload(colTypes[i], v))
+			compLen = len(comp)
+		}
+		if compLen >= 0 && inlineCompOverhead+compLen < inline[i] {
+			size = size - cur[i] + inlineCompOverhead + compLen
+			cur[i] = inlineCompOverhead + compLen
 			plan.disp[i] = dispInlineComp
 			plan.comp[i] = comp
+			plan.compLen[i] = compLen
 		}
 	}
 	if size <= max {
@@ -2651,9 +2703,9 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 		if plan.disp[i] == dispInlineComp {
 			ptr = externalCompPtrLen
 			next = dispExternalComp
-			plan.external += len(plan.comp[i])
+			plan.external += plan.compLen[i]
 		} else {
-			plan.external += payloadLen[i]
+			plan.external += plan.payloadLen[i]
 		}
 		plan.disp[i] = next
 		size = size - cur[i] + ptr
@@ -2661,6 +2713,30 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 	}
 	plan.size = size
 	return plan
+}
+
+// deferredInStoredForm reports, per column, whether the value is deferred AND the record's plan
+// stores it in exactly its stored form (large-values.md §15) — the deferred values a rewritten
+// record may keep, written from their stored bytes with their chains kept.
+func deferredInStoredForm(colTypes []colType, key []byte, row storedRow, capacity int) []bool {
+	plan := planDispositions(colTypes, key, row, capacity)
+	out := make([]bool, len(row))
+	for i, v := range row {
+		if v.Kind != ValUnfetched {
+			continue
+		}
+		switch v.unfetched().Form {
+		case 0x00:
+			out[i] = plan.disp[i] == dispInline
+		case tagInlineComp:
+			out[i] = plan.disp[i] == dispInlineComp
+		case tagExternal:
+			out[i] = plan.disp[i] == dispExternal
+		case tagExternalComp:
+			out[i] = plan.disp[i] == dispExternalComp
+		}
+	}
+	return out
 }
 
 // recordSize is the on-disk size of a record — the weight the page-backed B+tree splits on
@@ -2734,18 +2810,20 @@ func inlinePlainBody(span []byte) ([]byte, bool) {
 
 func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int, mask []bool) (pages, decompress int) {
 	// A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
-	// §14): read the units straight off them — no disposition re-plan, which would need the
-	// unfetched bytes. The numbers equal the resident plan below by construction (the
-	// references ARE that plan's stored output), so a paged and an in-memory database charge
-	// identically (cost.md §3, logical cost).
-	lazy := false
-	for _, v := range row {
+	// §14): read the units straight off them — no disposition re-plan. The numbers equal the plan
+	// below by construction (the references ARE that plan's stored output, and a rewritten row keeps
+	// a deferred value only where its plan stores it in its stored form — §15), so a paged and an
+	// in-memory database charge identically (cost.md §3, logical cost). A row that also holds a
+	// resident variable-width value (an UPDATE's new row) takes the plan.
+	lazy, residentVar := false, false
+	for i, v := range row {
 		if v.Kind == ValUnfetched {
 			lazy = true
-			break
+		} else if _, fixed := fixedValueWidth(colTypes[i]); !fixed && !v.IsNull() {
+			residentVar = true
 		}
 	}
-	if lazy {
+	if lazy && !residentVar {
 		for i, v := range row {
 			if !mask[i] || v.Kind != ValUnfetched {
 				continue
@@ -2772,15 +2850,12 @@ func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int
 		}
 		switch d {
 		case dispExternal:
-			n := len(valuePayload(colTypes[i], row[i]))
-			pages += (n + capacity - 1) / capacity
+			pages += (plan.payloadLen[i] + capacity - 1) / capacity
 		case dispInlineComp:
-			n := len(valuePayload(colTypes[i], row[i]))
-			decompress += (n + capacity - 1) / capacity
+			decompress += (plan.payloadLen[i] + capacity - 1) / capacity
 		case dispExternalComp:
-			pages += (len(plan.comp[i]) + capacity - 1) / capacity
-			n := len(valuePayload(colTypes[i], row[i]))
-			decompress += (n + capacity - 1) / capacity
+			pages += (plan.compLen[i] + capacity - 1) / capacity
+			decompress += (plan.payloadLen[i] + capacity - 1) / capacity
 		case dispInline:
 		}
 	}
@@ -2895,46 +2970,149 @@ func encodeInterior(seps [][]byte, childPages []uint32) []byte {
 	return out
 }
 
-// encodeDisposedValue encodes one value's on-disk body given its resolved disposition (the value
+// chainSource says where the leaf encoder finds a deferred value's stored bytes, and what it does
+// with a deferred external value's existing overflow chain (large-values.md §15). An INCREMENTAL
+// commit (share) keeps the chain: the rewritten record stores the same pointer and no chain page is
+// written, because a chain page is immutable and the chain stays reachable from exactly one record
+// of the new snapshot. A FROM-SCRATCH image renumbers every page, so it copies the chain's stored
+// bytes — the raw payload or the compressed block, never decompressed — into a fresh chain. paging
+// is the database the pointers name.
+type chainSource struct {
+	paging *sharedPaging
+	share  bool
+	// shared collects the first page of every chain the encoder kept, so the live-page count does
+	// not count the chain as orphaned with the old leaf (memory.md §8.7).
+	shared []uint32
+}
+
+func (s *chainSource) fetch(p uint32) ([]byte, error) {
+	if s.paging == nil {
+		return nil, newError(DataCorrupted, "deferred large value with no pager at encode")
+	}
+	return s.paging.readBlock(p)
+}
+
+func (s *chainSource) readChain(first uint32, length int) ([]byte, error) {
+	var sink []uint32
+	return readOverflowChain(first, length, s.fetch, &sink)
+}
+
+// resident returns v materialized: a deferred value resolved through the database's pager
+// (unmetered, like all commit work), a resident value as is.
+func (s *chainSource) resident(ty colType, v Value) (Value, error) {
+	if v.Kind != ValUnfetched {
+		return v, nil
+	}
+	return resolveUnfetched(ty, v.unfetched(), s.fetch)
+}
+
+// keepChain returns the first page of the chain carrying a deferred value's stored bytes in the
+// image being written: the existing chain itself (shared), or a fresh copy.
+func (s *chainSource) keepChain(first uint32, stored, capacity int, take func() uint32, ovf *[]overflowPageOut) (uint32, error) {
+	if s.share {
+		s.shared = append(s.shared, first)
+		return first, nil
+	}
+	bytes, err := s.readChain(first, stored)
+	if err != nil {
+		return 0, err
+	}
+	return writeOverflowChain(bytes, capacity, take, ovf), nil
+}
+
+// encodeDisposedValue encodes one value's on-disk body given its planned disposition (the value
 // codec, unchanged across the row-major and PAX leaf layouts): an inline-plain value is encodeValue;
 // the large-value forms carry a pointer / inline-compressed block and allocate overflow chains via
-// take (large-values.md §12/§13). comp is the LZ4 block planDispositions already produced for a
-// compressed form (nil otherwise), so the serializer never re-compresses.
-func encodeDisposedValue(ty colType, v Value, disp valueDisp, comp []byte, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
-	switch disp {
+// take (large-values.md §12/§13). The plan's LZ4 block is reused, so the serializer never
+// re-compresses. A deferred value planned in its own stored form is written from its stored bytes —
+// an inline body or block verbatim, an external pointer to its kept chain (§15) — so a rewritten
+// record never re-reads, decompresses, or recompresses an unchanged value.
+func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c, capacity int, take func() uint32, ovf *[]overflowPageOut, src *chainSource) ([]byte, error) {
+	var u *Unfetched
+	if v.Kind == ValUnfetched {
+		u = v.unfetched()
+	}
+	rawLen := plan.payloadLen[c]
+	switch plan.disp[c] {
 	case dispExternal:
-		payload := valuePayload(ty, v)
+		if u != nil && u.Form == tagExternal {
+			first, err := src.keepChain(u.FirstPage, int(u.StoredLen), capacity, take, ovf)
+			if err != nil {
+				return nil, err
+			}
+			out := []byte{tagExternal}
+			out = appendU32(out, first)
+			return appendU32(out, u.StoredLen), nil
+		}
+		r, err := src.resident(ty, v)
+		if err != nil {
+			return nil, err
+		}
+		payload := valuePayload(ty, r)
 		first := writeOverflowChain(payload, capacity, take, ovf)
 		out := []byte{tagExternal}
 		out = appendU32(out, first)
-		out = appendU32(out, uint32(len(payload)))
-		return out
+		return appendU32(out, uint32(len(payload))), nil
 	case dispInlineComp:
-		rawLen := len(valuePayload(ty, v))
+		comp, err := planBlock(plan, c, u, src)
+		if err != nil {
+			return nil, err
+		}
 		out := []byte{tagInlineComp}
 		out = appendU32(out, uint32(rawLen))
 		out = appendU16(out, uint16(len(comp)))
-		out = append(out, comp...)
-		return out
+		return append(out, comp...), nil
 	case dispExternalComp:
+		if u != nil && u.Form == tagExternalComp {
+			first, err := src.keepChain(u.FirstPage, int(u.StoredLen), capacity, take, ovf)
+			if err != nil {
+				return nil, err
+			}
+			out := []byte{tagExternalComp}
+			out = appendU32(out, first)
+			out = appendU32(out, u.StoredLen)
+			return appendU32(out, u.RawLen), nil
+		}
 		// The chain carries the COMPRESSED block (its page count follows comp size).
-		rawLen := len(valuePayload(ty, v))
+		comp, err := planBlock(plan, c, u, src)
+		if err != nil {
+			return nil, err
+		}
 		first := writeOverflowChain(comp, capacity, take, ovf)
 		out := []byte{tagExternalComp}
 		out = appendU32(out, first)
 		out = appendU32(out, uint32(len(comp)))
-		out = appendU32(out, uint32(rawLen))
-		return out
+		return appendU32(out, uint32(rawLen)), nil
 	default:
-		return encodeValue(ty, v)
+		if u != nil && u.Form == 0x00 {
+			return append([]byte{0x00}, u.Comp...), nil
+		}
+		r, err := src.resident(ty, v)
+		if err != nil {
+			return nil, err
+		}
+		return encodeValue(ty, r), nil
 	}
+}
+
+// planBlock is the LZ4 block a compressed disposition stores: the plan's own block, or the one
+// already on the deferred value's chain.
+func planBlock(plan *recordPlan, c int, u *Unfetched, src *chainSource) ([]byte, error) {
+	if plan.comp[c] != nil {
+		return plan.comp[c], nil
+	}
+	if u == nil || u.Form != tagExternalComp {
+		return nil, newError(DataCorrupted, "a chained LZ4 block with no chain")
+	}
+	return src.readChain(u.FirstPage, int(u.StoredLen))
 }
 
 // encodeLeafPAX builds a v24 PAX (column-major) leaf payload from records in ascending key order
 // (format.md "Leaf node"). Values are encoded in (record, column) order — so each external value's
 // overflow chain is allocated via take in exactly that order (a node's own page is allocated by
 // the caller first; then chains in record-then-column order), keeping the overflow page indices
-// golden-pinned. The bytes are then assembled column-major:
+// golden-pinned. A kept chain (src, large-values.md §15) allocates nothing. The bytes are then
+// assembled column-major:
 //
 //	key dir : keyEnd[0..N)   N u32 END offsets into the key blob (leading 0 implicit)
 //	key blob: N keys concatenated (ascending)
@@ -2943,7 +3121,7 @@ func encodeDisposedValue(ty colType, v Value, disp valueDisp, comp []byte, capac
 //	          NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled), or — variable-width —
 //	          an N-entry u32 end-offset value directory + the tagged value bodies (NULL = a
 //	          zero-length span)
-func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
+func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity int, take func() uint32, ovf *[]overflowPageOut, src *chainSource) ([]byte, error) {
 	n := len(keys)
 	k := len(colTypes)
 	// Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
@@ -2969,7 +3147,11 @@ func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity
 			case isNull:
 				valBytes[c][i] = nil // a zero-length span
 			default:
-				valBytes[c][i] = encodeDisposedValue(ty, rows[i][c], plan.disp[c], plan.comp[c], capacity, take, ovf)
+				b, err := encodeDisposedValue(ty, rows[i][c], &plan, c, capacity, take, ovf, src)
+				if err != nil {
+					return nil, err
+				}
+				valBytes[c][i] = b
 			}
 		}
 	}
@@ -3026,7 +3208,7 @@ func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity
 			out = append(out, valBytes[c][i]...)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // overflowPageOut is one overflow page produced while serializing a record's external value.
@@ -5392,8 +5574,8 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 // fields — no chain read, no decompression. Every deferred reference is stamped with its
 // resolution handles (types+c always, paging on the external forms — bplus-reshape.md §5, B4) so
 // it can self-resolve at the evaluator's column access. The scan layer resolves the references
-// for the columns a query touches (resolveUnfetched); the commit path resolves the rest when a
-// dirty leaf re-encodes (resolveForEncode); a touched-set miss resolves on demand
+// for the columns a query touches (resolveUnfetched); a commit writes the rest from their stored
+// bytes, keeping their chains (large-values.md §15); a touched-set miss resolves on demand
 // (resolveUnfetchedSelf).
 func readValueLazy(types []colType, c int, buf []byte, pos *int, paging *sharedPaging) (Value, error) {
 	ty := types[c]

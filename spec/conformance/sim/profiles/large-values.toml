@@ -1,13 +1,15 @@
-# Overflow chains and LZ4-compressed records: UPDATEs that grow and shrink values
-# (simulation-testing.md §9).
+# Overflow chains and LZ4-compressed records: UPDATEs that grow and shrink values, and UPDATEs that
+# assign only a fixed-width column, so the rewrite keeps every large value's chain
+# (simulation-testing.md §9; large-values.md §15).
 
-description = "Overflow chains, LZ4-compressed records, values that grow and shrink"
+description = "Overflow chains, LZ4-compressed records, values that grow and shrink, kept chains"
 
 page_sizes = [256, 512]
 batch = [1, 12]
 
 [weights]
 update = 14
+update_narrow = 10
 insert = 10
 
 [values]

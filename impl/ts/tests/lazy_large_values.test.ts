@@ -191,11 +191,10 @@ test("lazy: UPDATE of other columns preserves spilled values", () => {
     db.close();
 
     db = openDatabase(path, { skipFsync: true });
-    // Dirties the leaf carrying row 1's unfetched body without touching it: row 2's rewrite
-    // resolves nothing, row 1 resolves at commit (large-values.md §14 — resolve-at-commit;
-    // chain sharing stays the deferred follow-on).
+    // Dirties the leaf carrying row 1's unfetched body without touching it: row 1 keeps its stored
+    // form and chain at commit (large-values.md §15; chain_sharing.test.ts pins the sharing).
     db.execute("UPDATE t SET n = 99 WHERE id = 2");
-    // Rewrites row 1 itself: the rewrite materializes its body (part of the write work).
+    // Rewrites row 1 itself: the unassigned body is carried over with its chain.
     db.execute("UPDATE t SET n = 11 WHERE id = 1");
     db.close();
 

@@ -10,13 +10,14 @@
 // cap (= page_size − 16) and the column types to weigh each record (recordSize) for the
 // size-driven split (spec/fileformat/format.md).
 
-import type { Value } from "./value.ts";
+import type { Unfetched, Value } from "./value.ts";
 import type { ColType } from "./catalog.ts";
 import { PMap, pmapFromSkeleton, unboundedBound } from "./pmap.ts";
 import type { KeyBound, LeafShape, LeafSource, PNode, Span } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
   resolveUnfetched,
+  deferredInStoredForm,
   anySpillable,
   anySpillableMasked,
   fixedValueWidth,
@@ -528,6 +529,34 @@ export class TableStore {
         ? resolveUnfetched(this.colTypes[i]!, v.ref, fetch)
         : v,
     );
+  }
+
+  // pagingContext returns this database's shared paging context (null for an unpaged store).
+  pagingContext(): SharedPaging | null {
+    return this.paging;
+  }
+
+  // resolveValue materializes one deferred value of column col through this store's pager.
+  resolveValue(col: number, u: Unfetched): Value {
+    const paging = this.paging;
+    if (paging === null) throw new Error("an unfetched value implies a paged store");
+    return resolveUnfetched(this.colTypes[col]!, u, (p) => paging.readBlock(p));
+  }
+
+  // settleCarried settles the deferred values an UPDATE's new row carries over (large-values.md
+  // §15): one stays deferred only where the row's disposition plan, under its storage key, stores it
+  // in its stored form — so the commit writes it from its stored bytes and keeps its chain. Any other
+  // is resolved (unmetered, part of the rewrite), so a stored row's deferred values always equal its
+  // own plan's output — the invariant the scan cost walk and the commit encoder rely on. `row` is the
+  // caller's own copy and is updated in place.
+  settleCarried(key: Uint8Array, row: Row): Row {
+    if (!row.some((v) => v.kind === "unfetched")) return row;
+    const kept = deferredInStoredForm(this.colTypes, key, row, this.cap);
+    for (let i = 0; i < row.length; i++) {
+      const v = row[i]!;
+      if (v.kind === "unfetched" && !kept[i]) row[i] = this.resolveValue(i, v.ref);
+    }
+    return row;
   }
 
   // resolveAll materializes EVERY unfetched value in `row` (all columns). The mutation path uses

@@ -4295,6 +4295,9 @@ def read_overflow_chain(first, len, fetch)
   while out.bytesize < len
     raise "overflow chain ended before the value length" if p.zero?
     raise "overflow chain revisits a page" unless seen.add?(p)
+    # Chain exclusivity (large-values.md §15): a rewritten record may keep an unchanged value's chain,
+    # but no two records of one generation share a chain page.
+    raise "overflow page #{p} is referenced twice" if $claimed && !$claimed.add?(p)
 
     pg = fetch.call(p)
     raise "expected an overflow page" unless pg[:type] == PAGE_OVERFLOW
@@ -4783,6 +4786,7 @@ def decode_image(image)
   # Every page the decode reads from the catalog root is live (v34): the catalog chain, each tree
   # and GiST node, and each overflow page. The meta's count must equal that reachable set.
   $reached = Set.new
+  $claimed = Set.new
   types = []
   sequences = []
   collations = []
@@ -4853,6 +4857,7 @@ def decode_image(image)
   end
   reached = $reached
   $reached = nil
+  $claimed = nil
   raise "live page count #{meta[:live]} does not match #{reached.size} reachable pages" unless meta[:live] == reached.size
   raise "a free-list page is reachable" unless (free_pages & reached.to_a).empty?
   { types: types, sequences: sequences, collations: collations, tables: tables,
@@ -4862,9 +4867,10 @@ end
 # --check-image FILE… (spec/design/simulation-testing.md §12, slice S6): decode arbitrary database
 # images — the crash images the simulation runners dump — as an independent fourth voice. Selects
 # the generation recovery must select (meta validation + the full commit manifest), validates the
-# free list, decodes every table, index, and overflow chain, and checks the live page count against
-# the reachable set and the free list against both. Prints one JSON line per image, the fields the
-# runners' transcripts also report, or the error that made the image undecodable.
+# free list, decodes every table, index, and overflow chain (no overflow page named by two values —
+# large-values.md §15), and checks the live page count against the reachable set and the free list
+# against both. Prints one JSON line per image, the fields the runners' transcripts also report, or
+# the error that made the image undecodable.
 def check_images(paths)
   require "json"
   failed = false

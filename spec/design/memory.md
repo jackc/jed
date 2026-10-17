@@ -879,7 +879,7 @@ live(after) = live(before) + written − catalog(before) − gist(before) − or
 Each term is exact:
 
 - **`written`**: every page the incremental image writes — dirty tree nodes, the
-  fresh overflow chains of each dirty leaf, the whole GiST forest, the catalog
+  overflow chains each dirty leaf writes fresh, the whole GiST forest, the catalog
   chain — is reachable from the new root. Free-list and manifest pages are planned
   separately and are not counted.
 - **`catalog`, `gist`**: the catalog chain and every GiST R-tree are rewritten whole
@@ -893,10 +893,11 @@ Each term is exact:
   roots a subtree the two snapshots share whole. The commit then walks the previous
   snapshot's trees, skipping shared subtrees and counting every other node. An
   orphaned leaf of a table with variable-width columns also contributes its overflow
-  pages. Chains are never shared between leaf versions, because a dirty leaf
-  re-encodes every value into fresh chains, and each external pointer's stored
-  length gives its chain's page count, `⌈len / C⌉`. So the leaf page alone is
-  enough, with no chain walk.
+  pages, except the chains a rewritten record kept ([large-values.md](large-values.md)
+  §15): the commit records each kept chain's first page, and a chain belongs to one
+  record per snapshot, so a kept chain's previous referrer is always in an orphaned
+  leaf. Each external pointer's stored length gives its chain's page count,
+  `⌈len / C⌉`. So the leaf page alone is enough, with no chain walk.
 
 The walk's cost is proportional to the dirty region. It reads only orphaned leaves
 of tables with variable-width columns, which the writer usually just faulted; a

@@ -366,10 +366,13 @@ manifest validation (validated-cow.md §1) run first, and then walks the selecte
 - each table's storage keys ascend strictly and equal the primary-key encoding of their rows;
 - each table's persisted row count equals its leaf total;
 - each column B-tree index holds exactly the entries derived from its table's rows.
+- no overflow page is named by two stored values: a rewritten record may keep an unchanged value's
+  chain ([large-values.md](large-values.md) §15), but a chain belongs to one record per snapshot.
 
 The **live checker** checks the running process instead: every page its committed in-memory trees
 reference (tree nodes, and the overflow chains reached through resident rows as well as faulted
-leaves) lies below the high-water and off the in-memory free list the next commit allocates from.
+leaves) lies below the high-water and off the in-memory free list the next commit allocates from,
+and no overflow page is reached through two committed rows.
 It exists because the image checker asks the engine's own reachability walk what is live and
 re-derives everything from disk, so it cannot see a resident node whose references went stale. The
 stale-root bug in §14 passed the image checker and was caught only when its corruption surfaced; the
@@ -487,7 +490,7 @@ defaults, which `mixed.toml` restates):
 |---|---|
 | `mixed` | The baseline: every action, value shape, and fault kind |
 | `reuse-under-pins` | Readers held across many small commits, so reclamation and reuse run around pinned snapshots |
-| `large-values` | Overflow chains, LZ4-compressed records, `UPDATE`s that grow and shrink values |
+| `large-values` | Overflow chains, LZ4-compressed records, `UPDATE`s that grow and shrink values, and `update_narrow` `UPDATE`s that assign only a fixed-width column, so the rewrite keeps every chain (large-values.md §15) |
 | `big-commits` | Transactions dirtying hundreds of pages: manifest overflow, free-list/manifest planning retries |
 | `ddl-churn` | `CREATE`/`DROP`/`ALTER` of tables and indexes, `REINDEX`, sequences, catalog-chain growth |
 | `crash-storm` | Repeated process and power crashes |

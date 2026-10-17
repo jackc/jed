@@ -45,6 +45,8 @@ mod cast_text_runtime;
 mod cast_text_string_native;
 #[path = "../tests/cast_uuid.rs"]
 mod cast_uuid;
+#[path = "../tests/chain_sharing.rs"]
+mod chain_sharing;
 #[path = "../tests/check_constraint.rs"]
 mod check_constraint;
 #[path = "../tests/checksum.rs"]

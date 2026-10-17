@@ -404,7 +404,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     mutation-generation tokens. Measure first: their delete path's allocation and GC profile differs
     from Rust's. _(size: M)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** — large `text`/`bytea`/`decimal`/`json` pushed out-of-line onto overflow-page chains (`format_version` 3), optionally LZ4-compressed first via a deterministic hand-rolled block codec (no third-party dep — a library fails §8 byte-identity). → [large-values.md](spec/design/large-values.md), [lz4.md](spec/fileformat/lz4.md)
-  - [ ] _follow-on:_ chain sharing on rewrite (let a rewritten record keep an unchanged value's existing chain — a byte-layout change, lands in all cores + incremental tests together).
+  - [x] _follow-on:_ **chain sharing on rewrite** — ✅ **landed**: an UPDATE that does not assign a large column and a commit that rewrites the leaf around it keep the value's stored form and overflow chain (no read, decompress, recompress, or chain write). The plan is computed from stored facts, so dispositions, bytes other than page numbers, and cost are unchanged; no `format_version` bump. The live-page count skips kept chains; image checkers enforce one record per chain. → [large-values.md §15](spec/design/large-values.md)
+    - [ ] _follow-on:_ keep chains on the remaining rewrite paths — `INSERT … ON CONFLICT DO UPDATE`, table rewrites (`ALTER TABLE`), and in-session rows of a table whose single root leaf stays resident after commit. Physical only (no byte or cost change). _(size: S–M)_
 - [ ] **Upgrade path for older files + an on-disk stability commitment (a 1.0 blocker)** — a reader
   accepts only the current `format_version` ([format.md](spec/fileformat/format.md)), so every bump
   strands existing files, and the CLI's `--dump` needs the old binary to cross. Decide the 1.0 policy:

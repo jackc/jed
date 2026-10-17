@@ -621,7 +621,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   *encoders* are not standardized, so a per-core library would break the §8 byte-identity
   the goldens and the deterministic cost depend on (the §14 analysis, recorded in
   large-values.md §6); the work is metered by the `value_compress`/`value_decompress` cost
-  units (§13).
+  units (§13). A rewritten record keeps an unchanged value's stored form and overflow chain
+  (large-values.md §15): the plan is computed from stored facts, so bytes other than page numbers
+  and cost are unchanged, and a chain belongs to one record per snapshot.
 - **Compaction — ✅ built ([api.md](spec/design/api.md) §2.6).** The host-invoked `compact(name)`
   returns a database's dead pages: it streams the from-scratch image of the committed snapshot (at
   `txid + 1`) into `<path>.jedtmp` in bounded memory and atomically renames it into place (in memory: a

@@ -1682,6 +1682,9 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 - ✅ **text-heavy / large-value rows** — `text_scan` (`sum(length(body))` reads every body) and
   `text_point_read` (one whole body per probe) over the `text` dataset (§4), whose bodies land
   inline plain, inline LZ4-compressed, and in compressed overflow chains, on every engine;
+  `update_untouched_large_rollback` / `_durable` UPDATE an integer column of rows whose bodies are
+  stored out of line or compressed, so the rewrite keeps each body's chain (large-values.md §15) —
+  jed and PostgreSQL (SQLite has no `md5`/`repeat` for the setup);
 - ✅ **`Database` concurrent-reader throughput** — landed as the `concurrent_read` kind
   (§8.1): `concurrent_read_pk_r{1,4}` over the resident `small` dataset plus
   `concurrent_read_pk_cold_r{1,4}` over cold population of the cache-fitting `large` dataset,

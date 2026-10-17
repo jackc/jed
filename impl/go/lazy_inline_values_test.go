@@ -355,7 +355,10 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 		binary.BigEndian.PutUint32(key, uint32(i))
 		keys[i] = key
 	}
-	payload := encodeLeafPAX(colTypes, keys, rows, capacity, take, &ovf)
+	payload, err := encodeLeafPAX(colTypes, keys, rows, capacity, take, &ovf, &chainSource{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(ovf) != 0 {
 		t.Fatalf("values must stay inline (no overflow) for the form-(a) case, got %d overflow pages", len(ovf))
 	}
@@ -453,7 +456,10 @@ func TestPackedLeafValidatesPageBackedDirectoriesAtFault(t *testing.T) {
 	takeSeq := uint32(100)
 	take := func() uint32 { takeSeq++; return takeSeq }
 	var overflow []overflowPageOut
-	payload := encodeLeafPAX(colTypes, keys, rows, 8192-pageHeader, take, &overflow)
+	payload, err := encodeLeafPAX(colTypes, keys, rows, 8192-pageHeader, take, &overflow, &chainSource{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(overflow) != 0 {
 		t.Fatalf("test values unexpectedly spilled")
 	}
@@ -511,7 +517,10 @@ func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 		binary.BigEndian.PutUint32(key, uint32(i))
 		keys[i] = key
 	}
-	payload := encodeLeafPAX(colTypes, keys, rows, capacity, take, &ovf)
+	payload, err := encodeLeafPAX(colTypes, keys, rows, capacity, take, &ovf, &chainSource{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(ovf) != 0 {
 		t.Fatalf("values must stay inline, got %d overflow pages", len(ovf))
 	}
