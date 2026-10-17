@@ -1399,7 +1399,7 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
             if *greatest { "greatest" } else { "least" }.to_string()
         }
         // The fixed keyword lowercased (PG; grammar.md §58).
-        Expr::NullIf(_) => "nullif".to_string(),
+        Expr::NullIf { .. } => "nullif".to_string(),
         Expr::FieldAccess { field, .. } => field.to_string(),
         // A subscript takes the base array's name (PG names `a[1]` after `a`); a chained subscript
         // `a[1][2]` recurses to the same base name. A non-column base falls through to `?column?`.
@@ -3086,7 +3086,7 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
                 || els.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
         }
         Expr::Coalesce(args) => args.iter().any(expr_calls_seq_mutator),
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(expr_calls_seq_mutator)
         }
         Expr::ScalarSubquery(q) | Expr::Exists(q) => query_calls_seq_mutator(q),
@@ -3555,7 +3555,7 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
                 collect_expr_privs(a, req, locals);
             }
         }
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             for a in args {
                 collect_expr_privs(a, req, locals);
             }
@@ -3639,7 +3639,7 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
                 || els.as_ref().is_some_and(|x| expr_reads_columns(x))
         }
         Expr::Coalesce(args) => args.iter().any(expr_reads_columns),
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(expr_reads_columns)
         }
         Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => true,
@@ -4277,6 +4277,7 @@ fn locate_node_error(err: EngineError, e: &Expr) -> EngineError {
             *pos
         }
         Expr::IsDistinctFrom { pos, .. }
+        | Expr::NullIf { pos, .. }
         | Expr::Like { pos, .. }
         | Expr::Regex { pos, .. }
         | Expr::InSubquery { pos, .. }
@@ -6018,7 +6019,7 @@ fn resolve_node(
                 unified,
             ))
         }),
-        Expr::NullIf(args) => outline(|| {
+        Expr::NullIf { args, .. } => outline(|| {
             // NULLIF(a, b) (grammar.md §58) is PostgreSQL's `CASE WHEN a = b THEN NULL ELSE a END`
             // with `a` evaluated once. The operands resolve exactly as an `=` pair: an adaptable
             // literal or parameter takes its type from its sibling.
@@ -6165,7 +6166,7 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
         Expr::Array(items) => combine_derivs(scope, items)?,
         // A subscript or slice carries its array's collation (the subscripts are integers).
         Expr::Subscript { base, .. } => combine_deriv(Deriv::None, derive_collation(scope, base)?)?,
-        Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             combine_derivs(scope, args)?
         }
         // An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
@@ -6306,7 +6307,7 @@ pub(crate) fn derive_typmod(scope: &Scope, e: &Expr) -> Typmod {
         }
         // NULLIF returns its first argument, so it keeps that argument's typmod (PostgreSQL's
         // exprTypmod); an integer `a` widened to decimal has none, as integers carry none.
-        Expr::NullIf(args) => derive_typmod(scope, &args[0]),
+        Expr::NullIf { args, .. } => derive_typmod(scope, &args[0]),
         // A scalar subquery: its output column's typmod, recorded when `resolve` planned it.
         Expr::ScalarSubquery(q) => {
             let key: *const QueryExpr = q.as_ref();

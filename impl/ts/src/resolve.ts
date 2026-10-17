@@ -882,6 +882,7 @@ function locateNodeError(err: EngineError, e: Expr): EngineError {
       }
       break;
     case "isDistinct":
+    case "nullIf":
     case "like":
     case "regex":
     case "inSubquery":

@@ -389,7 +389,7 @@ query surfaces (CLAUDE.md §13). jed adds it as a sixth structured field.
 | a FROM-clause table or view name | `42P01` | the name — the database qualifier of `db.t` |
 | an `INSERT` / `UPDATE` / `DELETE` target, also in a writable CTE or under `EXPLAIN` | `42P01` | the name — the database qualifier of `db.t` |
 | a function call, aggregate, window function, or FROM-clause table function with no implementation for its arguments, or with several and none best | `42883`, `42725` | the function name; for a special form the keyword PostgreSQL rewrites from (`SUBSTRING`, `POSITION`, `OVERLAY`, the `AT` of `AT TIME ZONE`, the `LIKE` of `LIKE … ESCAPE`) |
-| an operator with no implementation for its operand types | `42883`, `42804` | the operator token; the `NOT` of `NOT IN` / `NOT BETWEEN` / `NOT LIKE`, else the `IN` / `BETWEEN` / `LIKE` / `ILIKE` keyword; the `IS` of `IS [NOT] DISTINCT FROM`; the comparison of `op ANY` / `op ALL` |
+| an operator with no implementation for its operand types | `42883`, `42804` | the operator token; the `NOT` of `NOT IN` / `NOT BETWEEN` / `NOT LIKE`, else the `IN` / `BETWEEN` / `LIKE` / `ILIKE` keyword; the `IS` of `IS [NOT] DISTINCT FROM`; the `NULLIF` keyword; the comparison of `op ANY` / `op ALL` |
 | a non-boolean argument of `WHERE`, `JOIN … ON`, `HAVING`, `AND`, `OR`, `NOT`, a searched `CASE WHEN`, `FILTER`, or `CHECK` | `42804` | the argument's location (below) |
 | a set of expressions with no common type: `CASE` results, `COALESCE`, `GREATEST` / `LEAST`, `ARRAY[…]` elements, a `VALUES` column, a set-operation column | `42804` | the location of the first expression that does not unify with those before it, in PostgreSQL's order: a `CASE`'s `ELSE` result first, then its `THEN` results; a set operation's right operand's column |
 | a value of the wrong type for its column: an `INSERT … VALUES` expression, an `INSERT … SELECT` column, an `UPDATE … SET` / `DO UPDATE SET` value | `42804` | the value's location |
@@ -400,7 +400,7 @@ written at, grouping parentheses excluded — a function call's name, an operato
 operand's location, a prefix operator, a `CASE` keyword, a literal (a folded negative number's minus
 sign), a `::` cast's operand. jed records it only where it is exact; for an expression whose leftmost
 token it does not record (a bind parameter, a scalar subquery, `EXISTS`, `ROW(…)`, `ARRAY[…]`,
-`COALESCE`, `GREATEST`, `NULLIF`, `EXTRACT`, the SQL/JSON constructors, `CAST(x AS t)` of a non-literal whose
+`COALESCE`, `GREATEST`, `EXTRACT`, the SQL/JSON constructors, `CAST(x AS t)` of a non-literal whose
 PostgreSQL location depends on whether the cast is a no-op) the location is unknown and the error
 carries no position, rather than a wrong one.
 
@@ -578,7 +578,7 @@ text, so it is cross-core identical, unmetered, and changes no code, cost, or ab
 |---|---|---|
 | a function call, aggregate, window function, or FROM-clause table function with no implementation for its name and arguments (unknown name, wrong argument count or types, an unknown named parameter, a special form's rewritten function) | `42883`; a window function's argument-type check: `42804` | `No function matches the given name and argument types. You might need to add explicit type casts.` (`parse_func.c`) |
 | several functions match an unknown-typed argument and none is best | `42725` | `Could not choose a best candidate function. You might need to add explicit type casts.` |
-| an infix operator with no implementation for its operand types (`+`, `=`, `\|\|`, `->`, `@>`, `LIKE`, `IN`, `BETWEEN`, `IS DISTINCT FROM`, `op ANY` / `ALL`, …) | `42883`, `42804` | `No operator matches the given name and argument types. You might need to add explicit type casts.` (`parse_oper.c`) |
+| an infix operator with no implementation for its operand types (`+`, `=`, `\|\|`, `->`, `@>`, `LIKE`, `IN`, `BETWEEN`, `IS DISTINCT FROM`, `NULLIF`, `op ANY` / `ALL`, …) | `42883`, `42804` | `No operator matches the given name and argument types. You might need to add explicit type casts.` (`parse_oper.c`) |
 | prefix `-` with no implementation for its operand type | `42804` | `No operator matches the given name and argument type. You might need to add an explicit type cast.` |
 | an operator whose every operand is an untyped string literal or `NULL` (`'1' + '2'`) | `42804` | `Could not choose a best candidate operator. You might need to add explicit type casts.` (PostgreSQL reports these as `42725`: several operators match `unknown` operands) |
 | a sort key whose type has no ordering operator (`ORDER BY` a `json` column) | `42883` | `Use an explicit ordering operator or modify the query.` (`get_sort_group_operators`) |
@@ -606,8 +606,8 @@ then. These conditions carry **no** hint, as in PostgreSQL:
   reports, including those PostgreSQL accepts through an implicit cast that jed's strict type system
   omits (`1::float8 = 1::int`, `INSERT INTO t (int_col) VALUES (1.5)`). The sentence's advice holds in
   jed.
-- jed has no `NULLIF`, so `NULLIF(1, 'a'::text)` is jed's unknown-function error with the function
-  sentence; PostgreSQL rewrites it to `=` and gives the operator sentence.
+- `NULLIF(1, 'a'::text)` is jed's cross-family `42804` where PostgreSQL, which rewrites `NULLIF` to
+  `=`, reports `42883`; both point at the `NULLIF` token with the operator sentence.
 - PostgreSQL's `ALTER TABLE … ALTER COLUMN … TYPE` hints (`You might need to specify "USING x::t".`,
   `You might need to add an explicit cast.`) are not attached: jed converts a column with an explicit
   cast ([alter.md](alter.md) §3.3), so the condition PostgreSQL hints about — a type with no

@@ -7028,7 +7028,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
                 || els.as_deref().is_some_and(expr_has_aggregate)
         }
         Expr::Coalesce(args) => args.iter().any(expr_has_aggregate),
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(expr_has_aggregate)
         }
         // A subquery is an independent query: an aggregate INSIDE it does not make the OUTER query
@@ -7127,7 +7127,9 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
                 || els.as_deref().is_some_and(expr_has_window)
         }
         Expr::Coalesce(args) => args.iter().any(expr_has_window),
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => args.iter().any(expr_has_window),
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
+            args.iter().any(expr_has_window)
+        }
         // A subquery is an independent query: a window function inside it is the subquery's own.
         Expr::ScalarSubquery(_)
         | Expr::Exists(_)
@@ -7333,7 +7335,7 @@ pub(crate) fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)
                 desugar_named_windows(a, windows)?;
             }
         }
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             for a in args.iter_mut() {
                 desugar_named_windows(a, windows)?;
             }
@@ -7454,7 +7456,7 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
             }
             Ok(())
         }
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             for a in args {
                 reject_check_structure(a)?;
             }
@@ -7578,7 +7580,7 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
             }
             Ok(())
         }
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             for a in args {
                 reject_default_structure(a)?;
             }
@@ -7669,7 +7671,7 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
                     walk(a, columns, out);
                 }
             }
-            Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+            Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
                 for a in args {
                     walk(a, columns, out);
                 }
@@ -7792,7 +7794,7 @@ pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
             })
             .or_else(|| els.as_deref().and_then(index_expr_first_param)),
         Expr::Coalesce(args) => args.iter().find_map(index_expr_first_param),
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().find_map(index_expr_first_param)
         }
         Expr::FuncCall { args, .. } => args.iter().find_map(index_expr_first_param),
@@ -7875,7 +7877,7 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
                 || els.as_deref().is_some_and(index_expr_has_subquery)
         }
         Expr::Coalesce(args) => args.iter().any(index_expr_has_subquery),
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(index_expr_has_subquery)
         }
         Expr::FuncCall { args, .. } => args.iter().any(index_expr_has_subquery),

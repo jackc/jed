@@ -4775,13 +4775,14 @@ class Parser {
     // immediately followed by `(` (the same one-token lookahead), so the word stays usable as a
     // column name. Exactly two arguments: any other count is 42601, as in PostgreSQL's grammar.
     if (this.peekKeyword() === "nullif" && this.peekKindAt(1) === "lparen") {
+      const loc = this.here();
       this.advance(); // NULLIF
       this.advance(); // (
       const a = this.parseExpr();
       this.expect("comma");
       const b = this.parseExpr();
       this.expect("rparen");
-      return { kind: "nullIf", args: [a, b] };
+      return { kind: "nullIf", args: [a, b], loc };
     }
     if (this.peekKeyword() === "case") return this.parseCasePrimary();
     if (this.atFunctionCall()) return this.parseFunctionCall();
