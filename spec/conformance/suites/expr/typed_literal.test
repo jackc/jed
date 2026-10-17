@@ -4,10 +4,10 @@
 # timestamp/interval), `text` is identity, and integer/decimal/boolean are the text→T cast admitted
 # only for a literal operand. Unknown type name → 42704, malformed → 22P02, out of range → 22003.
 # A runtime text→T cast on a non-literal text expression stays deferred (0A000); a bare string still
-# does not silently coerce to a number/bool. For integer/decimal jed uses its OWN literal grammar:
-# scientific `e`-notation IS accepted (`numeric '1.5e3'` → 1500, §14), but hex/underscore/NaN still
-# trap 22P02 where PG accepts them (documented §36 divergences).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.boolean, types.text, types.bytea, types.uuid, expr.arithmetic, cast.explicit, cast.string_literal
+# does not silently coerce to a number/bool. For integer/decimal jed uses PostgreSQL's input
+# grammar: scientific `e`-notation (`numeric '1.5e3'` → 1500, §14) and the 0x/0o/0b and `_` forms
+# are accepted, but NaN still traps 22P02 where PG accepts it (decimal is always finite, §36).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.boolean, types.text, types.bytea, types.uuid, expr.arithmetic, cast.explicit, cast.string_literal, cast.numeric_input_forms
 
 # --- integer typed literals ------------------------------------------------------------
 # context-free: `integer '42'` carries i32 with no column to adapt from
@@ -194,15 +194,18 @@ SELECT nosuchtype '42'
 statement error 22P02
 SELECT CAST('abc' AS integer)
 
-# --- documented divergences from PostgreSQL (jed uses its own literal grammar) ---------
-# hex integer input: PG accepts `integer '0x10'` → 16; jed traps 22P02 (decimal digits only)
-statement error 22P02
+# --- PostgreSQL 16+ input forms: hex/octal/binary and digit underscores (cast.numeric_input_forms) ---
+query I nosort
 SELECT integer '0x10'
+----
+16
 
-# digit underscores: PG accepts `integer '1_000'` → 1000; jed traps 22P02
-statement error 22P02
+query I nosort
 SELECT integer '1_000'
+----
+1000
 
+# --- documented divergence from PostgreSQL --------------------------------------------
 # NaN: PG accepts `numeric 'NaN'`; jed's decimal is always finite, so 22P02
 statement error 22P02
 SELECT numeric 'NaN'

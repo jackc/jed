@@ -521,6 +521,10 @@ var SupportedCapabilities = []string{
 	// Typed string literals — `type 'string'` and CAST(<string literal> AS type) coerce the
 	// literal to the named type at resolve (spec/design/grammar.md §36, types.md §5).
 	"cast.string_literal",
+	// PostgreSQL 16+ number input forms in text input (0x/0o/0b, `_` separators) and in SQL
+	// numeric literals (grammar.md §4/§36).
+	"cast.numeric_input_forms",
+	"expr.numeric_literal_forms",
 	// The postfix `::` cast operator — `expr :: type` desugars to CAST(expr AS type), sharing
 	// its whole machinery; binds tighter than unary minus (spec/design/grammar.md §37).
 	"cast.operator",
@@ -535,7 +539,7 @@ var SupportedCapabilities = []string{
 	// §36, types.md §5, casts.toml): CAST(text_expr AS T) / text_expr :: T on a NON-LITERAL text
 	// expression for i16/i32/i64, decimal (typmod re-scale), f32/f64, boolean — the same per-type
 	// coercion the LITERAL form folds at resolve, but per row in evalCast. Malformed → 22P02,
-	// out of range → 22003. jed's own grammar (hex/underscore/NaN trap 22P02 — per-core tested);
+	// out of range → 22003. PostgreSQL's input forms (NaN numeric traps 22P02 — per-core tested);
 	// the accepted-grammar cases agree with PG and are oracle-checked. text → uuid is cast.uuid;
 	// text → date is cast.text_date; text → timestamp/timestamptz/interval/bytea is
 	// cast.text_string_native.

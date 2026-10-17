@@ -1,0 +1,190 @@
+# PostgreSQL 16+ numeric literal forms in SQL text (spec/design/grammar.md §4, grammar.ebnf
+# `number`): hexadecimal / octal / binary integer literals (any case) and single `_` digit
+# separators, scanned with PostgreSQL's scan.l rules. A radix literal is typed like the equal
+# decimal literal. An identifier character glued to a number, or an exponent sign with no digit, is
+# 42601 trailing junk; a bare radix prefix is 42601 invalid hexadecimal / octal / binary integer.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, query.order_by, query.limit, types.i32, types.i64, types.decimal, expr.arithmetic, cast.explicit, cast.operator, expr.numeric_literal_forms
+
+query IIIII nosort
+SELECT 0x10, 0o17, 0b101, 1_000, 0X1F
+----
+16
+15
+5
+1000
+31
+
+query III nosort
+SELECT 0O7, 0B1, 0xAbC
+----
+7
+1
+2748
+
+# a `_` may follow the radix prefix and sit between any two digits; a decimal may start with 0
+query IIIII nosort
+SELECT 0x_1, 0b_1, 0o_7, 0_1, 1_000_000
+----
+1
+1
+7
+1
+1000000
+
+# separators in a fraction and an exponent
+query DDD nosort
+SELECT 1_000.5, 1_000e1_0, .5_5
+----
+1000.5
+10000000000000
+0.55
+
+query DD nosort
+SELECT 1_0.0_1, 1_0e1_0
+----
+10.01
+100000000000
+
+# a radix literal is an untyped integer constant, exactly like the equal decimal literal
+query IIII nosort
+SELECT 0x7fffffff, 0x80000000, 0x7fffffffffffffff, -0x8000000000000000
+----
+2147483647
+2147483648
+9223372036854775807
+-9223372036854775808
+
+query III nosort
+SELECT 0x10::i32, 0x10 + 1, -0b11
+----
+16
+17
+-3
+
+# hex digits include e/E: 0x1e is 30, not an exponent
+query I nosort
+SELECT 0x1e
+----
+30
+
+# hex digits run into letters a-f; the token ends at the last hex digit
+query I nosort
+SELECT 0x10abc
+----
+68284
+
+query I nosort
+SELECT 10 LIMIT 0x1
+----
+10
+
+query I nosort
+SELECT x FROM (SELECT 1_0 AS x) t ORDER BY 0x1
+----
+10
+
+# ---- bare radix prefixes ---------------------------------------------------------------------------
+
+statement error 42601
+SELECT 0x
+
+statement error 42601
+SELECT 0x_
+
+statement error 42601
+SELECT 0o
+
+statement error 42601
+SELECT 0b
+
+statement error 42601
+SELECT 0b_
+
+# ---- trailing junk ---------------------------------------------------------------------------------
+
+statement error 42601
+SELECT 1__0
+
+statement error 42601
+SELECT 1_
+
+statement error 42601
+SELECT 0x1_
+
+statement error 42601
+SELECT 0x__1
+
+statement error 42601
+SELECT 0b2
+
+statement error 42601
+SELECT 0o8
+
+statement error 42601
+SELECT 0x1g
+
+statement error 42601
+SELECT 0x10aZ
+
+statement error 42601
+SELECT 0xg
+
+statement error 42601
+SELECT 0xx
+
+statement error 42601
+SELECT 0bz
+
+statement error 42601
+SELECT 00x10
+
+statement error 42601
+SELECT 0_x10
+
+statement error 42601
+SELECT 1_a
+
+statement error 42601
+SELECT 123abc
+
+statement error 42601
+SELECT 1._5
+
+statement error 42601
+SELECT 1.5_
+
+statement error 42601
+SELECT 1.5x
+
+statement error 42601
+SELECT .5x
+
+statement error 42601
+SELECT 1e
+
+statement error 42601
+SELECT 1ea
+
+statement error 42601
+SELECT 1e+
+
+statement error 42601
+SELECT 1.5e_1
+
+statement error 42601
+SELECT 1.5e1_
+
+statement error 42601
+SELECT 1e5_
+
+# ---- a radix literal stops at a `.` -----------------------------------------------------------------
+
+statement error 42601
+SELECT 0x1.5
+
+statement error 42601
+SELECT 0b101.5
+
+statement error 42601
+SELECT 1..2

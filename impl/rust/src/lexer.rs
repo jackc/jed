@@ -5,37 +5,168 @@ use crate::decimal::{EXP_LIMIT, decimal_from_parts};
 use crate::error::{EngineError, Result, SqlState};
 use crate::token::Token;
 
-/// If `bytes[*i..]` begins a well-formed exponent `[eE][+-]?digit+`, consume it (advancing
-/// `*i`) and return `Some(exponent)` with the magnitude clamped to `±EXP_LIMIT`. Otherwise
-/// leave `*i` unchanged and return `None` — a bare `e` / `ex` is NOT part of the number (it
-/// lexes as the following token, exactly as before e-notation existed; PostgreSQL likewise
-/// rejects `1e` as trailing junk rather than reading it as the number `1`).
-fn scan_exponent(bytes: &[u8], i: &mut usize) -> Option<i64> {
-    let start = *i;
-    if start >= bytes.len() || (bytes[start] != b'e' && bytes[start] != b'E') {
-        return None;
+/// Is `c` a PostgreSQL identifier-start byte (scan.l `ident_start`: `[A-Za-z\x80-\xff_]`)? Used
+/// only to detect an identifier glued to a numeric literal (trailing junk, grammar.md §4).
+fn ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_' || c >= 0x80
+}
+
+/// The length of the PostgreSQL identifier (`ident_start ident_cont*`, where `ident_cont` adds
+/// digits and `$`) starting at `bytes[p]`; 0 when none starts there.
+fn ident_len(bytes: &[u8], p: usize) -> usize {
+    if p >= bytes.len() || !ident_start(bytes[p]) {
+        return 0;
     }
-    let mut j = start + 1;
-    let mut neg = false;
-    if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
-        neg = bytes[j] == b'-';
-        j += 1;
+    let mut q = p + 1;
+    while q < bytes.len()
+        && (ident_start(bytes[q]) || bytes[q].is_ascii_digit() || bytes[q] == b'$')
+    {
+        q += 1;
     }
-    if j >= bytes.len() || !bytes[j].is_ascii_digit() {
-        return None; // not a valid exponent — leave `e` for the next token
-    }
-    let mut exp: i64 = 0;
-    while j < bytes.len() && bytes[j].is_ascii_digit() {
-        if exp < EXP_LIMIT {
-            exp = exp * 10 + (bytes[j] - b'0') as i64;
-            if exp > EXP_LIMIT {
-                exp = EXP_LIMIT;
-            }
+    q - p
+}
+
+/// The end of the radix-`base` digit run `(_? digit)*` starting at `bytes[p]` — a `_` counts only
+/// when a digit follows it (PostgreSQL's `hexinteger` tail; a `decinteger` caller first checks its
+/// leading digit).
+fn digit_run_end(bytes: &[u8], mut p: usize, base: u32) -> usize {
+    let is_digit = |q: usize| q < bytes.len() && char::from(bytes[q]).is_digit(base);
+    loop {
+        if is_digit(p) {
+            p += 1;
+        } else if p < bytes.len() && bytes[p] == b'_' && is_digit(p + 1) {
+            p += 2;
+        } else {
+            return p;
         }
-        j += 1;
     }
-    *i = j;
-    Some(if neg { -exp } else { exp })
+}
+
+/// `text` without its `_` digit separators.
+fn strip_underscores(text: &str) -> String {
+    text.chars().filter(|&c| c != '_').collect()
+}
+
+/// An integer literal's unsigned magnitude from its radix-`base` digits (`_` separators allowed).
+/// It must be `<= 2^63` so that `-(2^63)` = `i64::MIN` is reachable; anything larger cannot be
+/// represented (42601). `i64` cannot hold `2^63`, so it is carried unsigned for the parser.
+fn integer_magnitude(written: &str, digits: &str, base: u32) -> Result<u64> {
+    let out_of_range = || syntax(format!("integer literal out of range: {written}"));
+    let mut n: u64 = 0;
+    for c in digits.chars().filter(|&c| c != '_') {
+        let d = u64::from(c.to_digit(base).expect("a scanned digit"));
+        n = n
+            .checked_mul(u64::from(base))
+            .and_then(|n| n.checked_add(d))
+            .filter(|&n| n <= 1u64 << 63)
+            .ok_or_else(out_of_range)?;
+    }
+    Ok(n)
+}
+
+/// Scan the numeric literal starting at `sql[start]` (a digit, or a `.` followed by a digit) with
+/// PostgreSQL's scan.l rules (grammar.md §4): a decimal integer `digit (_? digit)*`; a radix
+/// integer `0x`/`0o`/`0b` `(_? digit)+` (a bare `0x` / `0x_` is "invalid hexadecimal integer"); a
+/// decimal with a `.` and/or an exponent `[eE][+-]?decinteger`. Any identifier character glued to
+/// the end (`123abc`, `1_`, `0x1g`, `1e`), or an exponent sign with no digit (`1e+`), is
+/// "trailing junk after numeric literal". `1..` is the integer `1` followed by the `..` (rescanned).
+/// Returns the token and the byte offset just past it. All errors are 42601.
+fn scan_number(sql: &str, start: usize) -> Result<(Token, usize)> {
+    let bytes = sql.as_bytes();
+    let at = |k: usize| bytes.get(k).copied().unwrap_or(0);
+    let junk = |end: usize| {
+        syntax(format!(
+            "trailing junk after numeric literal at or near \"{}\"",
+            &sql[start..end]
+        ))
+    };
+    // A radix integer: `0x…` / `0o…` / `0b…`.
+    if at(start) == b'0' {
+        let (base, name) = match at(start + 1) {
+            b'x' | b'X' => (16, "hexadecimal"),
+            b'o' | b'O' => (8, "octal"),
+            b'b' | b'B' => (2, "binary"),
+            _ => (0, ""),
+        };
+        if base != 0 {
+            let end = digit_run_end(bytes, start + 2, base);
+            // `0` followed by an identifier is the longest junk reading (scan.l `integer_junk`).
+            let junk_end = start + 1 + ident_len(bytes, start + 1);
+            if end > start + 2 {
+                if junk_end > end {
+                    return Err(junk(junk_end));
+                }
+                let n = integer_magnitude(&sql[start..end], &sql[start + 2..end], base)?;
+                return Ok((Token::Int(n), end));
+            }
+            let fail_end = start + 2 + usize::from(at(start + 2) == b'_');
+            if junk_end > fail_end {
+                return Err(junk(junk_end));
+            }
+            return Err(syntax(format!(
+                "invalid {name} integer at or near \"{}\"",
+                &sql[start..fail_end]
+            )));
+        }
+    }
+    // A decimal integer part (empty for a leading-dot decimal `.5`).
+    let int_end = if at(start).is_ascii_digit() {
+        digit_run_end(bytes, start, 10)
+    } else {
+        start
+    };
+    let mut end = int_end;
+    let mut frac = None;
+    if at(int_end) == b'.' {
+        if at(int_end + 1) == b'.' {
+            // scan.l `numericfail`: `1..` is the integer, and the `..` is rescanned.
+            let n = integer_magnitude(&sql[start..int_end], &sql[start..int_end], 10)?;
+            return Ok((Token::Int(n), int_end));
+        }
+        let frac_start = int_end + 1;
+        // A fraction is a decinteger: it starts with a digit (a `_` right after the `.` is junk).
+        end = if at(frac_start).is_ascii_digit() {
+            digit_run_end(bytes, frac_start, 10)
+        } else {
+            frac_start
+        };
+        frac = Some(&sql[frac_start..end]);
+    }
+    // An optional exponent `[eE][+-]?decinteger`; a bare `e` is junk below, `e+` with no digit is
+    // junk here (scan.l `realfail`).
+    let mut exp = None;
+    if matches!(at(end), b'e' | b'E') {
+        let neg = at(end + 1) == b'-';
+        let signed = neg || at(end + 1) == b'+';
+        let digits_start = end + 1 + usize::from(signed);
+        if at(digits_start).is_ascii_digit() {
+            let exp_end = digit_run_end(bytes, digits_start, 10);
+            // Clamp the magnitude to `EXP_LIMIT` while accumulating (keeps it in `i64` and bounds
+            // the coefficient the shared builder may materialize).
+            let mut v: i64 = 0;
+            for b in bytes[digits_start..exp_end].iter().filter(|&&b| b != b'_') {
+                if v < EXP_LIMIT {
+                    v = (v * 10 + i64::from(b - b'0')).min(EXP_LIMIT);
+                }
+            }
+            exp = Some(if neg { -v } else { v });
+            end = exp_end;
+        } else if signed {
+            return Err(junk(digits_start));
+        }
+    }
+    let glued = ident_len(bytes, end);
+    if glued > 0 {
+        return Err(junk(end + glued));
+    }
+    let int_part = strip_underscores(&sql[start..int_end]);
+    if frac.is_none() && exp.is_none() {
+        let n = integer_magnitude(&sql[start..end], &int_part, 10)?;
+        return Ok((Token::Int(n), end));
+    }
+    let frac = strip_underscores(frac.unwrap_or(""));
+    let (digits, scale) = decimal_from_parts(&int_part, &frac, exp);
+    Ok((Token::Decimal(digits, scale), end))
 }
 
 /// Tokenize `sql` into tokens terminated by `Token::Eof`. Whitespace separates
@@ -423,46 +554,12 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
                 });
             }
             b'0'..=b'9' => {
-                // A numeric literal. Scan the integer digits; a following `.` and/or scientific
-                // `e`-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise
-                // it is an INTEGER literal.
-                let start = i;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-                let int_part = &sql[start..i];
-                // Optional fractional part: `123.`, `123.45`. The fractional part may be empty.
-                let mut frac = "";
-                let mut has_frac = false;
-                if i < bytes.len() && bytes[i] == b'.' {
-                    has_frac = true;
-                    i += 1; // consume '.'
-                    let frac_start = i;
-                    while i < bytes.len() && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    frac = &sql[frac_start..i];
-                }
-                // Optional exponent (`e3`, `E+2`, `e-10`). Only a well-formed exponent is
-                // consumed; an exponent (even with no `.`) makes the literal a decimal.
-                let exp = scan_exponent(bytes, &mut i);
-                if has_frac || exp.is_some() {
-                    let (digits, scale) = decimal_from_parts(int_part, frac, exp);
-                    tokens.push(Token::Decimal(digits, scale));
-                } else {
-                    // Integer literal: an unsigned magnitude. The sign is the `Minus`
-                    // operator. The magnitude must be <= 2^63 so that -(2^63) = i64::MIN
-                    // is reachable; anything larger cannot be represented (42601). i64
-                    // cannot hold 2^63, so carry it unsigned and let the parser convert.
-                    let text = int_part;
-                    let n: u64 = text
-                        .parse()
-                        .map_err(|_| syntax(format!("integer literal out of range: {text}")))?;
-                    if n > (1u64 << 63) {
-                        return Err(syntax(format!("integer literal out of range: {text}")));
-                    }
-                    tokens.push(Token::Int(n));
-                }
+                // A numeric literal: an integer (decimal, or `0x`/`0o`/`0b` radix), or a decimal
+                // (a `.` and/or an `e`-exponent), with `_` digit separators — PostgreSQL's scan.l
+                // number rules (grammar.md §4).
+                let (tok, end) = scan_number(sql, i)?;
+                tokens.push(tok);
+                i = end;
             }
             b'.' => {
                 // A `.` has two roles, disambiguated on the FOLLOWING byte alone (no
@@ -473,16 +570,9 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
                 // (`t.5`) — is invalid either way (a column name is never numeric) and lexes
                 // here as a decimal, rejected at parse.
                 if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-                    i += 1; // consume '.'
-                    let frac_start = i;
-                    while i < bytes.len() && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    let frac = &sql[frac_start..i];
-                    // A leading-dot decimal may also carry an exponent (`.5e2`).
-                    let exp = scan_exponent(bytes, &mut i);
-                    let (digits, scale) = decimal_from_parts("", frac, exp);
-                    tokens.push(Token::Decimal(digits, scale));
+                    let (tok, end) = scan_number(sql, i)?;
+                    tokens.push(tok);
+                    i = end;
                 } else {
                     tokens.push(Token::Dot);
                     i += 1;

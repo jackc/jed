@@ -1737,13 +1737,39 @@ pub(crate) fn parse_float_special_f32(t: &str) -> Option<f32> {
     }
 }
 
-/// Parse a string literal's content as a signed integer of type `ty` — the text→integer coercion
-/// for `INTEGER '42'` / `CAST('42' AS int)` (grammar.md §36). Matches jed's OWN integer-literal
-/// grammar: surrounding ASCII whitespace trimmed, an optional leading `+`/`-`, then one or more
-/// ASCII decimal digits. NO hex/octal/binary or digit underscores (those trap `22P02`, a documented
-/// PG divergence). A value outside `ty`'s range traps `22003`; anything else `22P02`.
+/// PostgreSQL's `isspace` in the C locale — space, tab, LF, VT, FF, CR — the whitespace
+/// `pg_strtoint*` and `numeric_in` skip around a number.
+fn is_pg_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// The radix a `0x`/`0o`/`0b` prefix at `bytes[p..]` names (16 / 8 / 2), or 10 when none does.
+fn radix_prefix(bytes: &[u8], p: usize) -> u32 {
+    if bytes.get(p) != Some(&b'0') {
+        return 10;
+    }
+    match bytes.get(p + 1) {
+        Some(b'x' | b'X') => 16,
+        Some(b'o' | b'O') => 8,
+        Some(b'b' | b'B') => 2,
+        _ => 10,
+    }
+}
+
+/// Is `bytes[p]` a digit of radix `base`?
+fn is_radix_digit(bytes: &[u8], p: usize, base: u32) -> bool {
+    bytes.get(p).is_some_and(|&c| char::from(c).is_digit(base))
+}
+
+/// Parse a string's content as a signed integer of type `ty` — the text→integer coercion for
+/// `INTEGER '42'` / `CAST('42' AS int)` and every other integer input (grammar.md §36). Exactly
+/// PostgreSQL's `pg_strtoint16/32/64`: surrounding whitespace skipped, an optional `+`/`-`, then
+/// decimal digits or a `0x`/`0o`/`0b` radix prefix and its digits, with single `_` separators
+/// between digits (`1_000`, `0x_ff`; never leading in decimal, trailing, or doubled). A
+/// magnitude that overflows while the digits are read traps `22003` at once (so `'99999999999x'`
+/// is out of range, as in PostgreSQL); a malformed string is `22P02`; a value read in full that
+/// is outside `ty`'s range is `22003`.
 pub(crate) fn parse_int_literal(s: &str, ty: ScalarType) -> Result<i64> {
-    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
     let invalid = || {
         EngineError::new(
             SqlState::InvalidTextRepresentation,
@@ -1753,83 +1779,197 @@ pub(crate) fn parse_int_literal(s: &str, ty: ScalarType) -> Result<i64> {
             ),
         )
     };
-    let (neg, digits) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let bytes = s.as_bytes();
+    let mut p = 0;
+    while p < bytes.len() && is_pg_space(bytes[p]) {
+        p += 1;
+    }
+    let neg = bytes.get(p) == Some(&b'-');
+    if neg || bytes.get(p) == Some(&b'+') {
+        p += 1;
+    }
+    let base = radix_prefix(bytes, p);
+    if base != 10 {
+        p += 2;
+    }
+    // The unsigned magnitude of `ty`'s minimum, 2^(bits-1): the largest magnitude any sign admits.
+    let limit = ty.min().unsigned_abs();
+    let first = p;
+    let mut mag: u64 = 0;
+    loop {
+        if is_radix_digit(bytes, p, base) {
+            if mag > limit / u64::from(base) {
+                return Err(overflow(ty));
+            }
+            let d = char::from(bytes[p]).to_digit(base).expect("a radix digit");
+            mag = mag * u64::from(base) + u64::from(d);
+            p += 1;
+        } else if bytes.get(p) == Some(&b'_') {
+            // A decimal number may not start with `_`; every `_` must be followed by a digit.
+            if base == 10 && p == first {
+                return Err(invalid());
+            }
+            p += 1;
+            if !is_radix_digit(bytes, p, base) {
+                return Err(invalid());
+            }
+        } else {
+            break;
+        }
+    }
+    if p == first {
         return Err(invalid());
     }
-    // All-digit but too large for i128 is an out-of-range value (22003), not malformed (22P02).
-    let mag: i128 = digits.parse().map_err(|_| overflow(ty))?;
-    let val = if neg { -mag } else { mag };
-    if val < ty.min() as i128 || val > ty.max() as i128 {
-        return Err(overflow(ty));
+    while p < bytes.len() && is_pg_space(bytes[p]) {
+        p += 1;
     }
-    Ok(val as i64)
+    if p != bytes.len() {
+        return Err(invalid());
+    }
+    if neg {
+        if mag > limit {
+            return Err(overflow(ty));
+        }
+        Ok((-i128::from(mag)) as i64)
+    } else {
+        if mag > limit - 1 {
+            return Err(overflow(ty));
+        }
+        Ok(mag as i64)
+    }
 }
 
-/// Parse a string literal's content as a decimal — the text→decimal coercion for `NUMERIC '1.5'`
-/// / `CAST('1.5' AS numeric)` (grammar.md §36). Matches jed's OWN decimal-literal grammar: trimmed
-/// ASCII whitespace, optional sign, ASCII digits with at most one `.` and a digit on at least one
-/// side, plus optional scientific `e`-notation (`numeric '1.5e3'` → `1500`) — built into the SAME
-/// `(digits, scale)` the lexer feeds `from_digits_scale` (via the shared `decimal_from_parts`), so a
-/// `NUMERIC 'x'` is byte-identical to writing `x`. NO `NaN` / `Infinity` and no hex/underscore
-/// (those trap `22P02` — jed's decimal is always finite; documented PG divergences). The caller
+/// Parse a string's content as a decimal — the text→decimal coercion for `NUMERIC '1.5'` /
+/// `CAST('1.5' AS numeric)` and every other decimal input (grammar.md §36). PostgreSQL's
+/// `numeric_in`: surrounding whitespace skipped, an optional sign, then either a `0x`/`0o`/`0b`
+/// radix integer (`numeric '0x10'` is `16`) or ASCII digits with at most one `.` (a digit after a
+/// leading `.`), optional scientific `e`-notation (`numeric '1.5e3'` → `1500`), and single `_`
+/// separators between digits (`1_000.000_1`; not next to the `.`, leading, trailing, or doubled).
+/// The decimal form builds the SAME `(digits, scale)` the lexer feeds `from_digits_scale` (via the
+/// shared `decimal_from_parts`), so a `NUMERIC 'x'` is byte-identical to writing `x`. NO `NaN` /
+/// `Infinity` (`22P02` — jed's decimal is always finite, a documented PG divergence). The caller
 /// applies the typmod / cap-check.
 pub(crate) fn parse_decimal_literal(s: &str) -> Result<Decimal> {
-    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
     let invalid = || {
         EngineError::new(
             SqlState::InvalidTextRepresentation,
             format!("invalid input syntax for type numeric: \"{s}\""),
         )
     };
-    let (neg, rest) = match t.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    // Split off an optional exponent. Unlike the lexer (which leaves a bare `e` for the next
-    // token), an isolated string must be a COMPLETE numeric, so an `e` with no `[+-]?digit+`
-    // after it is malformed (`22P02`), matching PG's `numeric_in`.
-    let (mantissa, exp) = match rest.find(|c: char| c == 'e' || c == 'E') {
-        Some(pos) => {
-            let (m, e) = (&rest[..pos], &rest[pos + 1..]);
-            let (eneg, edigits) = match e.strip_prefix('-') {
-                Some(r) => (true, r),
-                None => (false, e.strip_prefix('+').unwrap_or(e)),
-            };
-            if edigits.is_empty() || !edigits.bytes().all(|b| b.is_ascii_digit()) {
+    let bytes = s.as_bytes();
+    let at = |k: usize| bytes.get(k).copied().unwrap_or(0);
+    let mut p = 0;
+    while p < bytes.len() && is_pg_space(bytes[p]) {
+        p += 1;
+    }
+    let neg = at(p) == b'-';
+    if neg || at(p) == b'+' {
+        p += 1;
+    }
+    // Every finite numeric starts with a digit or a `.` (anything else is PostgreSQL's NaN /
+    // Infinity, which jed's decimal does not have).
+    if !(at(p).is_ascii_digit() || at(p) == b'.') {
+        return Err(invalid());
+    }
+    let base = radix_prefix(bytes, p);
+    let value = if base != 10 {
+        p += 2;
+        let first = p;
+        let mut digits = String::new();
+        loop {
+            if is_radix_digit(bytes, p, base) {
+                digits.push(char::from(bytes[p]));
+                p += 1;
+            } else if at(p) == b'_' {
+                p += 1;
+                if !is_radix_digit(bytes, p, base) {
+                    return Err(invalid());
+                }
+            } else {
+                break;
+            }
+        }
+        if p == first {
+            return Err(invalid());
+        }
+        Decimal::from_radix_digits(neg, &digits, base)?
+    } else {
+        let mut int_part = String::new();
+        let mut frac = String::new();
+        let mut have_dp = false;
+        if at(p) == b'.' {
+            have_dp = true;
+            p += 1;
+        }
+        if !at(p).is_ascii_digit() {
+            return Err(invalid());
+        }
+        loop {
+            let c = at(p);
+            if c.is_ascii_digit() {
+                if have_dp {
+                    frac.push(char::from(c));
+                } else {
+                    int_part.push(char::from(c));
+                }
+                p += 1;
+            } else if c == b'.' {
+                // A second `.`, or a `_` right after the `.`, is malformed.
+                if have_dp || at(p + 1) == b'_' {
+                    return Err(invalid());
+                }
+                have_dp = true;
+                p += 1;
+            } else if c == b'_' {
+                p += 1;
+                if !at(p).is_ascii_digit() {
+                    return Err(invalid());
+                }
+            } else {
+                break;
+            }
+        }
+        let mut exp = None;
+        if at(p) == b'e' || at(p) == b'E' {
+            p += 1;
+            let eneg = at(p) == b'-';
+            if eneg || at(p) == b'+' {
+                p += 1;
+            }
+            if !at(p).is_ascii_digit() {
                 return Err(invalid());
             }
             // Clamp the magnitude to `EXP_LIMIT` while accumulating (keeps it in `i64` and
             // bounds the coefficient the shared builder may materialize).
             let mut v: i64 = 0;
-            for b in edigits.bytes() {
-                if v < decimal::EXP_LIMIT {
-                    v = v * 10 + (b - b'0') as i64;
-                    if v > decimal::EXP_LIMIT {
-                        v = decimal::EXP_LIMIT;
+            loop {
+                let c = at(p);
+                if c.is_ascii_digit() {
+                    if v < decimal::EXP_LIMIT {
+                        v = (v * 10 + i64::from(c - b'0')).min(decimal::EXP_LIMIT);
                     }
+                    p += 1;
+                } else if c == b'_' {
+                    p += 1;
+                    if !at(p).is_ascii_digit() {
+                        return Err(invalid());
+                    }
+                } else {
+                    break;
                 }
             }
-            (m, Some(if eneg { -v } else { v }))
+            exp = Some(if eneg { -v } else { v });
         }
-        None => (rest, None),
+        let (digits, scale) = decimal::decimal_from_parts(&int_part, &frac, exp);
+        Decimal::from_digits_scale(neg, &digits, scale)
     };
-    let mut parts = mantissa.splitn(2, '.');
-    let int_part = parts.next().unwrap_or("");
-    let frac = parts.next().unwrap_or("");
-    // A second `.` lands in `frac` (splitn(2) does not split it); reject it.
-    if frac.contains('.')
-        || !int_part.bytes().all(|b| b.is_ascii_digit())
-        || !frac.bytes().all(|b| b.is_ascii_digit())
-        || (int_part.is_empty() && frac.is_empty())
-    {
+    while p < bytes.len() && is_pg_space(bytes[p]) {
+        p += 1;
+    }
+    if p != bytes.len() {
         return Err(invalid());
     }
-    let (digits, scale) = decimal::decimal_from_parts(int_part, frac, exp);
-    Ok(Decimal::from_digits_scale(neg, &digits, scale))
+    Ok(value)
 }
 
 /// Parse a string literal's content as a boolean — the text→boolean coercion for `BOOLEAN 'true'`

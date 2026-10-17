@@ -1233,8 +1233,8 @@ primary        ::= number
  * remain usable as column / function names otherwise. The type name is a bare identifier (NO
  * typmod here: a "(" after the name breaks the lookahead, so `NUMERIC(10,2) '…'` is not a typed
  * literal — typmod rides only on CAST). For the native-syntax types (integer/decimal/boolean) the
- * coercion matches jed's OWN literal grammar, not PG's extras (no hex/underscore/scientific/NaN —
- * documented §36 divergences). */
+ * coercion is PostgreSQL's input function (pg_strtoint* / numeric_in / boolin, including the 0x/0o/0b
+ * and `_` forms), except that a decimal takes no NaN/Infinity (a documented §36 divergence). */
 typed_literal  ::= type_word string
 
 /* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). A parameter
@@ -1470,18 +1470,33 @@ literal        ::= "-"? number
 /* A `number` is an UNSIGNED numeric literal: either an integer or a decimal. The
  * sign, if any, is the unary-minus operator (so "- 5" with a space is legal, and
  * "-5" is the operator applied to "5", folded at parse time). The lexer scans one
- * run of digits with an optional fractional point and an optional scientific exponent,
- * emitting an INTEGER token only when there is NEITHER a "." NOR an exponent and a DECIMAL
- * token otherwise — so the integer paths (LIMIT/OFFSET `count`, the typmod, array arity)
- * are unaffected (a bare digit run is still an integer). */
+ * number with PostgreSQL's scan.l rules (../design/grammar.md §4), emitting an INTEGER
+ * token only when there is NEITHER a "." NOR an exponent and a DECIMAL token otherwise —
+ * so the integer paths (LIMIT/OFFSET `count`, the typmod, array arity) are unaffected (a
+ * bare digit run, or a radix integer, is still an integer). A number immediately followed
+ * by an identifier character (a letter, "_", a digit or "$" continuing it, or any non-ASCII
+ * character — `123abc`, `1_`, `0x1g`, `1e`, `1.5x`), or by an exponent sign with no digit
+ * (`1e+`), is 42601 "trailing junk after numeric literal"; a radix prefix with no digit
+ * (`0x`, `0x_`, `0o`, `0b`) is 42601 "invalid hexadecimal / octal / binary integer". The
+ * one throwback: `1..` is the integer 1 followed by the "..", which is rescanned. */
 number         ::= decimal | integer
 
-/* An integer is an UNSIGNED magnitude of digits; its magnitude must be <= 2^63
- * (9223372036854775808); a larger magnitude is a syntax error (42601, cannot be
- * represented). The single value 2^63 is in range only as the operand of unary
- * minus, where it folds to i64's minimum (-9223372036854775808); a bare 2^63
- * fits no signed integer type and traps 22003 at resolve time. */
-integer        ::= digit+
+/* An integer is an UNSIGNED magnitude, written in decimal or with a 0x / 0o / 0b radix
+ * prefix (either case; PostgreSQL 16+), with single "_" separators between digits (and after
+ * a radix prefix): `1_000`, `0x_ff`, `0b1010_1010`. The separators carry no value. Its
+ * magnitude must be <= 2^63 (9223372036854775808); a larger magnitude is a syntax error
+ * (42601, cannot be represented). The single value 2^63 is in range only as the operand
+ * of unary minus, where it folds to i64's minimum (-9223372036854775808); a bare 2^63
+ * fits no signed integer type and traps 22003 at resolve time. A radix literal is the same
+ * untyped integer constant as the equal decimal literal. */
+integer        ::= decinteger
+                 | "0" ( "x" | "X" ) ( "_"? hexdigit )+
+                 | "0" ( "o" | "O" ) ( "_"? octdigit )+
+                 | "0" ( "b" | "B" ) ( "_"? bindigit )+
+decinteger     ::= digit ( "_"? digit )*
+hexdigit       ::= [0-9A-Fa-f]
+octdigit       ::= [0-7]
+bindigit       ::= [0-1]
 
 /* A decimal literal is either a "."-bearing significand (digits on at least one side —
  * `1.5`, `1.`, `.5`, `0.00`) or ANY significand followed by a scientific `e`-notation
@@ -1496,12 +1511,12 @@ integer        ::= digit+
  * untyped decimal constant that adapts to its context (../design/types.md §6, extended to
  * decimal). */
 decimal        ::= significand exponent
-                 | digit+ "." digit*
-                 | "." digit+
-significand    ::= digit+ "." digit*
-                 | "." digit+
-                 | digit+
-exponent       ::= ( "e" | "E" ) ( "+" | "-" )? digit+
+                 | decinteger "." decinteger?
+                 | "." decinteger
+significand    ::= decinteger "." decinteger?
+                 | "." decinteger
+                 | decinteger
+exponent       ::= ( "e" | "E" ) ( "+" | "-" )? decinteger
 
 /* The "." token has two roles, resolved by the lexer on the FOLLOWING byte alone (no
  * preceding-token context, so the rule is trivially identical across cores — §4):

@@ -36,19 +36,8 @@ file = "expr/make_interval.test"
 sql = "SELECT make_interval(secs := 1)"
 reason = "jed: named notation uses only `=>` (grammar.md §17). jed has no `:` token, and `=>` alone is the modern, unambiguous PostgreSQL spelling, so `:=` is a 42601 syntax error. PostgreSQL accepts the legacy `:=` alias and returns 00:00:01. A deliberate, documented surface narrowing (a spelling, not a behavior — functions.md §11)."
 
-# --- typed string literals: jed coerces integer/decimal by its OWN literal grammar (grammar.md
-# §36), not PG's permissive input functions, so a `type 'string'` is byte-identical to writing the
-# value as a native jed literal. The four forms PG accepts and jed rejects (22P02):
-[[override]]
-file = "expr/typed_literal.test"
-sql = "SELECT integer '0x10'"
-reason = "jed: a `type 'string'` integer is coerced by jed's own integer-literal grammar — decimal digits only (22P02). PostgreSQL (16+) accepts hex/octal/binary input and returns 16. jed has no hex integer literal anywhere, so admitting it only in the string form would diverge from its native literals (grammar.md §36)."
-
-[[override]]
-file = "expr/typed_literal.test"
-sql = "SELECT integer '1_000'"
-reason = "jed: a `type 'string'` integer is coerced by jed's own integer-literal grammar — no digit underscores (22P02). PostgreSQL (16+) accepts `1_000` and returns 1000. jed has no underscore-grouped integer literal anywhere (grammar.md §36)."
-
+# --- typed string literals: jed's decimal is always finite, so the NaN form PG accepts traps 22P02
+# (grammar.md §36). The hex/octal/binary and `_` forms now match PostgreSQL (cast.numeric_input_forms).
 [[override]]
 file = "expr/typed_literal.test"
 sql = "SELECT numeric 'NaN'"

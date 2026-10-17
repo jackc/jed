@@ -260,8 +260,8 @@ is trimmed, a leading sign is accepted, and a `boolean` follows PostgreSQL's spe
 <LiveSql demo="textNumCastDemo" query={textNumCastDemo} rows={1} />
 
 The type must be **named** — a bare string never silently becomes a number, so `int_col = '42'` stays
-a type error (`42804`). jed uses its own literal grammar, so hex, digit underscores, and `NaN` are
-rejected (`22P02`) where PostgreSQL accepts them. 
+a type error (`42804`). Integer and `numeric` input reads PostgreSQL 16+'s forms — `'0x1F'::int` is
+`31`, `'1_000'::int` is `1000` — but `numeric` rejects `NaN` (`22P02`), since it is always finite.
 
 One exception, as in PostgreSQL: a bare string **literal** stored into an `f32` / `f64` column — an
 `INSERT … VALUES` cell or an `UPDATE … SET` value — is read with the float's input rules, so

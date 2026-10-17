@@ -31,7 +31,8 @@ import { atPosition, engineError, positionedAt } from "./errors.ts";
 import { exprLocation } from "./eval_ops.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import { emptyRangeValue, parseByteaHex, parseRecordTokens, parseUuid } from "./value.ts";
-import { canonicalName, inRange, rank, roundToWidth, typeCanonicalName } from "./types.ts";
+import { canonicalName, minOf, rank, roundToWidth, typeCanonicalName } from "./types.ts";
+import { radixDigitValue } from "./lexer.ts";
 import type { ColType, Column, CompositeType } from "./catalog.ts";
 import { resolvedRangeElementScalar } from "./scope.ts";
 import { elementScalar, finalizeRange, parseRangeText, rangeForElement } from "./range.ts";
@@ -752,93 +753,168 @@ export function coerceStringToComposite(
   };
 }
 
-// parseIntLiteral parses a string literal's content as a signed integer of type ty — the
-// text→integer coercion for INTEGER '42' / CAST('42' AS int) (grammar.md §36). jed's OWN
-// integer-literal grammar: trimmed ASCII whitespace, optional +/-, then ASCII decimal digits
-// (NO hex/octal/binary or underscores — 22P02, a documented PG divergence). Out of range → 22003.
+// isPgSpace reports whether c is PostgreSQL's isspace in the C locale — space, tab, LF, VT, FF, CR —
+// the whitespace pg_strtoint* and numeric_in skip around a number.
+function isPgSpace(c: string | undefined): boolean {
+  return c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
+}
+
+// radixPrefix is the radix a 0x/0o/0b prefix at s[p..] names (16 / 8 / 2), or 10 when none does.
+function radixPrefix(s: string, p: number): number {
+  if (s[p] !== "0") return 10;
+  const c = s[p + 1];
+  if (c === "x" || c === "X") return 16;
+  if (c === "o" || c === "O") return 8;
+  if (c === "b" || c === "B") return 2;
+  return 10;
+}
+
+// parseIntLiteral parses a string's content as a signed integer of type ty — the text→integer
+// coercion for INTEGER '42' / CAST('42' AS int) and every other integer input (grammar.md §36).
+// Exactly PostgreSQL's pg_strtoint16/32/64: surrounding whitespace skipped, an optional +/-, then
+// decimal digits or a 0x/0o/0b radix prefix and its digits, with single "_" separators between
+// digits (1_000, 0x_ff; never leading in decimal, trailing, or doubled). A magnitude that
+// overflows while the digits are read traps 22003 at once (so '99999999999x' is out of range, as
+// in PostgreSQL); a malformed string is 22P02; a value read in full outside ty's range is 22003.
 export function parseIntLiteral(s: string, ty: ScalarType): bigint {
   const invalid = (): Error =>
     engineError(
       "invalid_text_representation",
       `invalid input syntax for type ${canonicalName(ty)}: "${s}"`,
     );
-  let t = trimLit(s);
-  let neg = false;
-  if (t.startsWith("-")) {
-    neg = true;
-    t = t.slice(1);
-  } else if (t.startsWith("+")) {
-    t = t.slice(1);
+  let p = 0;
+  while (p < s.length && isPgSpace(s[p])) p++;
+  const neg = s[p] === "-";
+  if (neg || s[p] === "+") p++;
+  const base = radixPrefix(s, p);
+  if (base !== 10) p += 2;
+  // The unsigned magnitude of ty's minimum, 2^(bits-1): the largest magnitude any sign admits.
+  const limit = -minOf(ty);
+  const b = BigInt(base);
+  const first = p;
+  let mag = 0n;
+  for (;;) {
+    const d = radixDigitValue(s[p], base);
+    if (d >= 0) {
+      if (mag > limit / b) throw overflow(ty);
+      mag = mag * b + BigInt(d);
+      p++;
+    } else if (s[p] === "_") {
+      // A decimal number may not start with "_"; every "_" must be followed by a digit.
+      if (base === 10 && p === first) throw invalid();
+      p++;
+      if (radixDigitValue(s[p], base) < 0) throw invalid();
+    } else {
+      break;
+    }
   }
-  if (t === "" || !allAsciiDigits(t)) throw invalid();
-  // BigInt holds an arbitrary-length digit run; range is checked below (out of range → 22003).
-  const v = neg ? -BigInt(t) : BigInt(t);
-  if (!inRange(ty, v)) throw overflow(ty);
-  return v;
+  if (p === first) throw invalid();
+  while (p < s.length && isPgSpace(s[p])) p++;
+  if (p !== s.length) throw invalid();
+  if (neg) {
+    if (mag > limit) throw overflow(ty);
+    return -mag;
+  }
+  if (mag > limit - 1n) throw overflow(ty);
+  return mag;
 }
 
-// parseDecimalLiteral parses a string literal's content as a decimal — the text→decimal coercion
-// for NUMERIC '1.5' / CAST('1.5' AS numeric) (grammar.md §36). jed's OWN decimal-literal grammar:
-// trimmed ASCII whitespace, optional sign, ASCII digits with at most one '.' and a digit on at
-// least one side, plus optional scientific e-notation (numeric '1.5e3' → 1500) — built into the SAME
-// (digits, scale) the lexer feeds Decimal.fromDigitsScale (via the shared decimalFromParts), so
-// NUMERIC 'x' is byte-identical to writing x. NO NaN / Infinity and no hex/underscore (22P02).
-// Caller applies typmod / cap-check.
+// parseDecimalLiteral parses a string's content as a decimal — the text→decimal coercion for
+// NUMERIC '1.5' / CAST('1.5' AS numeric) and every other decimal input (grammar.md §36).
+// PostgreSQL's numeric_in: surrounding whitespace skipped, an optional sign, then either a
+// 0x/0o/0b radix integer (numeric '0x10' is 16) or ASCII digits with at most one "." (a digit
+// after a leading "."), optional scientific e-notation (numeric '1.5e3' → 1500), and single "_"
+// separators between digits (1_000.000_1; not next to the ".", leading, trailing, or doubled). The
+// decimal form builds the SAME (digits, scale) the lexer feeds Decimal.fromDigitsScale (via the
+// shared decimalFromParts), so NUMERIC 'x' is byte-identical to writing x. NO NaN / Infinity
+// (22P02 — jed's decimal is always finite, a documented PG divergence). Caller applies typmod /
+// cap-check.
 export function parseDecimalLiteral(s: string): Decimal {
   const invalid = (): Error =>
     engineError("invalid_text_representation", `invalid input syntax for type numeric: "${s}"`);
-  let t = trimLit(s);
-  let neg = false;
-  if (t.startsWith("-")) {
-    neg = true;
-    t = t.slice(1);
-  } else if (t.startsWith("+")) {
-    t = t.slice(1);
-  }
-  // Split off an optional exponent. Unlike the lexer (which leaves a bare e for the next token), an
-  // isolated string must be a COMPLETE numeric, so an e with no [+-]?digit+ after it is malformed
-  // (22P02), matching PG's numeric_in.
-  let mantissa = t;
-  let exp: number | null = null;
-  const ei = t.search(/[eE]/);
-  if (ei >= 0) {
-    mantissa = t.slice(0, ei);
-    let e = t.slice(ei + 1);
-    let eneg = false;
-    if (e.startsWith("-")) {
-      eneg = true;
-      e = e.slice(1);
-    } else if (e.startsWith("+")) {
-      e = e.slice(1);
-    }
-    if (e === "" || !allAsciiDigits(e)) {
-      throw invalid();
-    }
-    // Clamp the magnitude to EXP_LIMIT while accumulating (bounds the coefficient the shared
-    // builder may materialize).
-    let v = 0;
-    for (let k = 0; k < e.length; k++) {
-      if (v < EXP_LIMIT) {
-        v = v * 10 + (e.charCodeAt(k) - 48);
-        if (v > EXP_LIMIT) v = EXP_LIMIT;
+  const isDig = (c: string | undefined): boolean => c !== undefined && c >= "0" && c <= "9";
+  let p = 0;
+  while (p < s.length && isPgSpace(s[p])) p++;
+  const neg = s[p] === "-";
+  if (neg || s[p] === "+") p++;
+  // Every finite numeric starts with a digit or a "." (anything else is PostgreSQL's NaN /
+  // Infinity, which jed's decimal does not have).
+  if (!isDig(s[p]) && s[p] !== ".") throw invalid();
+  let value: Decimal;
+  const base = radixPrefix(s, p);
+  if (base !== 10) {
+    p += 2;
+    const first = p;
+    let digits = "";
+    for (;;) {
+      if (radixDigitValue(s[p], base) >= 0) {
+        digits += s[p];
+        p++;
+      } else if (s[p] === "_") {
+        p++;
+        if (radixDigitValue(s[p], base) < 0) throw invalid();
+      } else {
+        break;
       }
     }
-    exp = eneg ? -v : v;
+    if (p === first) throw invalid();
+    value = Decimal.fromRadixDigits(neg, digits, base);
+  } else {
+    let intPart = "";
+    let frac = "";
+    let haveDp = false;
+    if (s[p] === ".") {
+      haveDp = true;
+      p++;
+    }
+    if (!isDig(s[p])) throw invalid();
+    for (;;) {
+      const c = s[p];
+      if (isDig(c)) {
+        if (haveDp) frac += c;
+        else intPart += c;
+        p++;
+      } else if (c === ".") {
+        // A second ".", or a "_" right after the ".", is malformed.
+        if (haveDp || s[p + 1] === "_") throw invalid();
+        haveDp = true;
+        p++;
+      } else if (c === "_") {
+        p++;
+        if (!isDig(s[p])) throw invalid();
+      } else {
+        break;
+      }
+    }
+    let exp: number | null = null;
+    if (s[p] === "e" || s[p] === "E") {
+      p++;
+      const eneg = s[p] === "-";
+      if (eneg || s[p] === "+") p++;
+      if (!isDig(s[p])) throw invalid();
+      // Clamp the magnitude to EXP_LIMIT while accumulating (bounds the coefficient the shared
+      // builder may materialize).
+      let v = 0;
+      for (;;) {
+        const c = s[p];
+        if (isDig(c)) {
+          if (v < EXP_LIMIT) v = Math.min(v * 10 + (s.charCodeAt(p) - 48), EXP_LIMIT);
+          p++;
+        } else if (c === "_") {
+          p++;
+          if (!isDig(s[p])) throw invalid();
+        } else {
+          break;
+        }
+      }
+      exp = eneg ? -v : v;
+    }
+    const [digits, scale] = decimalFromParts(intPart, frac, exp);
+    value = Decimal.fromDigitsScale(neg, digits, scale);
   }
-  const dot = mantissa.indexOf(".");
-  const intPart = dot < 0 ? mantissa : mantissa.slice(0, dot);
-  const frac = dot < 0 ? "" : mantissa.slice(dot + 1);
-  // A second '.' lands in frac (indexOf found the first); reject it.
-  if (
-    frac.includes(".") ||
-    !(intPart === "" || allAsciiDigits(intPart)) ||
-    !(frac === "" || allAsciiDigits(frac)) ||
-    (intPart === "" && frac === "")
-  ) {
-    throw invalid();
-  }
-  const [digits, scale] = decimalFromParts(intPart, frac, exp);
-  return Decimal.fromDigitsScale(neg, digits, scale);
+  while (p < s.length && isPgSpace(s[p])) p++;
+  if (p !== s.length) throw invalid();
+  return value;
 }
 
 // parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for

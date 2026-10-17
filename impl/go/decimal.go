@@ -116,6 +116,41 @@ func decimalFromParts(intPart, frac string, hasExp bool, exp int64) (string, uin
 	return string(digits), 0
 }
 
+// decimalFromRadixDigits is the integer whose radix-base (2, 8, or 16) digits are digits (ASCII,
+// no separators), at scale 0 — PostgreSQL numeric_in's non-decimal integer input (numeric '0xff',
+// decimal.md §2). A value certainly above the MaxIntDigits cap traps 22003 before any conversion
+// work (a resource guard: base^(n-1) >= 2^435412 > 10^131072); the caller's cap check decides the
+// rest.
+func decimalFromRadixDigits(neg bool, digits string, base int) (Decimal, error) {
+	sig := strings.TrimLeft(digits, "0")
+	bits := map[int]int{2: 1, 8: 3, 16: 4}[base]
+	if len(sig) > 0 && (len(sig)-1)*bits >= 435412 {
+		return Decimal{}, decimalOverflow()
+	}
+	// Fold the digits in groups worth at most 2^28 (< decBase), so each step is one
+	// multiply-by-small and add over the LSB-first base-10^9 limbs.
+	group := 28 / bits
+	var limbs []uint32
+	for start := 0; start < len(sig); start += group {
+		end := min(start+group, len(sig))
+		carry, mul := uint64(0), uint64(1)
+		for k := start; k < end; k++ {
+			carry = carry*uint64(base) + uint64(radixDigitValue(sig[k], base))
+			mul *= uint64(base)
+		}
+		for k := range limbs {
+			cur := uint64(limbs[k])*mul + carry
+			limbs[k] = uint32(cur % decBase)
+			carry = cur / decBase
+		}
+		for carry != 0 {
+			limbs = append(limbs, uint32(carry%decBase))
+			carry /= decBase
+		}
+	}
+	return newDecimal(neg, 0, limbs), nil
+}
+
 // IsZero reports whether the value is zero.
 func (d Decimal) IsZero() bool { return len(d.Limbs) == 0 }
 

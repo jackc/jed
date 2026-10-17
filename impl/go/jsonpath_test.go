@@ -116,18 +116,13 @@ func TestMalformedJsonpathIs42601(t *testing.T) {
 	}
 }
 
-// An item method reads a string with jed's OWN number grammars (grammar.md §36): decimal digits only,
-// no hex/octal/binary prefixes and no digit underscores, so those strings are 22036 where PostgreSQL
-// 16+ (int8in / numeric_in, and glibc strtod behind float8in) accepts them.
+// .double() reads a string with jed's float grammar (float.md §4): no hex floats and no digit
+// underscores, so "0x10" is 22036 where PostgreSQL's float8in (glibc strtod) accepts it. The integer
+// and decimal methods read PostgreSQL's input forms (the corpus).
 func TestJsonpathMethodNumberGrammarDivergence(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, c := range []struct{ doc, path string }{
-		{`"0x10"`, "$.bigint()"},
-		{`"1_000"`, "$.bigint()"},
-		{`"0o17"`, "$.integer()"},
-		{`"0x1A"`, "$.number()"},
-		{`"1_0"`, "$.decimal()"},
 		{`"0x10"`, "$.double()"},
 	} {
 		sql := "SELECT jsonb_path_query_first('" + c.doc + "', '" + c.path + "')"

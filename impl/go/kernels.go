@@ -1755,41 +1755,97 @@ func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, var
 	}
 }
 
-// parseIntLiteral parses a string literal's content as a signed integer of type ty — the
-// text→integer coercion for INTEGER '42' / CAST('42' AS int) (grammar.md §36). jed's OWN
-// integer-literal grammar: trimmed ASCII whitespace, optional +/-, then ASCII decimal digits
-// (NO hex/octal/binary or underscores — 22P02, a documented PG divergence). Out of range → 22003.
+// radixPrefix is the radix a 0x/0o/0b prefix at s[p:] names (16 / 8 / 2), or 10 when none does.
+func radixPrefix(s string, p int) int {
+	if p+1 >= len(s) || s[p] != '0' {
+		return 10
+	}
+	switch s[p+1] {
+	case 'x', 'X':
+		return 16
+	case 'o', 'O':
+		return 8
+	case 'b', 'B':
+		return 2
+	}
+	return 10
+}
+
+// radixDigitIn is the value of s[p] as a digit of radix base, or -1 (also past the end).
+func radixDigitIn(s string, p, base int) int {
+	if p >= len(s) {
+		return -1
+	}
+	return radixDigitValue(s[p], base)
+}
+
+// parseIntLiteral parses a string's content as a signed integer of type ty — the text→integer
+// coercion for INTEGER '42' / CAST('42' AS int) and every other integer input (grammar.md §36).
+// Exactly PostgreSQL's pg_strtoint16/32/64: surrounding whitespace skipped, an optional +/-, then
+// decimal digits or a 0x/0o/0b radix prefix and its digits, with single '_' separators between
+// digits (1_000, 0x_ff; never leading in decimal, trailing, or doubled). A magnitude that
+// overflows while the digits are read traps 22003 at once (so '99999999999x' is out of range, as
+// in PostgreSQL); a malformed string is 22P02; a value read in full outside ty's range is 22003.
 func parseIntLiteral(s string, ty scalarType) (int64, error) {
-	t := strings.Trim(s, litWhitespace)
 	invalid := func() error {
 		return newError(InvalidTextRepresentation,
 			"invalid input syntax for type "+ty.CanonicalName()+": \""+s+"\"")
 	}
-	neg := false
-	if rest, ok := strings.CutPrefix(t, "-"); ok {
-		neg, t = true, rest
-	} else if rest, ok := strings.CutPrefix(t, "+"); ok {
-		t = rest
+	p := 0
+	for p < len(s) && isPGSpace(s[p]) {
+		p++
 	}
-	if t == "" || !allASCIIDigits(t) {
+	neg := p < len(s) && s[p] == '-'
+	if neg || (p < len(s) && s[p] == '+') {
+		p++
+	}
+	base := radixPrefix(s, p)
+	if base != 10 {
+		p += 2
+	}
+	// The unsigned magnitude of ty's minimum, 2^(bits-1): the largest magnitude any sign admits.
+	limit := uint64(-(ty.Min() + 1)) + 1
+	first := p
+	var mag uint64
+	for {
+		if d := radixDigitIn(s, p, base); d >= 0 {
+			if mag > limit/uint64(base) {
+				return 0, overflowErr(ty)
+			}
+			mag = mag*uint64(base) + uint64(d)
+			p++
+		} else if p < len(s) && s[p] == '_' {
+			// A decimal number may not start with '_'; every '_' must be followed by a digit.
+			if base == 10 && p == first {
+				return 0, invalid()
+			}
+			p++
+			if radixDigitIn(s, p, base) < 0 {
+				return 0, invalid()
+			}
+		} else {
+			break
+		}
+	}
+	if p == first {
 		return 0, invalid()
 	}
-	// big.Int parses an arbitrary-length digit run; an out-of-range value is 22003, not 22P02.
-	mag, ok := new(big.Int).SetString(t, 10)
-	if !ok {
+	for p < len(s) && isPGSpace(s[p]) {
+		p++
+	}
+	if p != len(s) {
 		return 0, invalid()
 	}
 	if neg {
-		mag.Neg(mag)
+		if mag > limit {
+			return 0, overflowErr(ty)
+		}
+		return -int64(mag-1) - 1, nil
 	}
-	if !mag.IsInt64() {
+	if mag > limit-1 {
 		return 0, overflowErr(ty)
 	}
-	v := mag.Int64()
-	if !ty.InRange(v) {
-		return 0, overflowErr(ty)
-	}
-	return v, nil
+	return int64(mag), nil
 }
 
 // parseFloatLiteral parses a string literal's content as a float of width ty — the text→float
@@ -1887,67 +1943,145 @@ func validFloatNumeric(t string) bool {
 	return true
 }
 
-// parseDecimalLiteral parses a string literal's content as a decimal — the text→decimal coercion
-// for NUMERIC '1.5' / CAST('1.5' AS numeric) (grammar.md §36). jed's OWN decimal-literal grammar:
-// trimmed ASCII whitespace, optional sign, ASCII digits with at most one '.' and a digit on at
-// least one side, plus optional scientific e-notation (numeric '1.5e3' → 1500) — built into the
-// SAME (digits, scale) the lexer feeds DecimalFromDigitsScale (via the shared decimalFromParts), so
-// NUMERIC 'x' is byte-identical to writing x. NO NaN / Infinity and no hex/underscore (22P02).
-// Caller applies typmod / cap-check.
+// parseDecimalLiteral parses a string's content as a decimal — the text→decimal coercion for
+// NUMERIC '1.5' / CAST('1.5' AS numeric) and every other decimal input (grammar.md §36).
+// PostgreSQL's numeric_in: surrounding whitespace skipped, an optional sign, then either a
+// 0x/0o/0b radix integer (numeric '0x10' is 16) or ASCII digits with at most one '.' (a digit
+// after a leading '.'), optional scientific e-notation (numeric '1.5e3' → 1500), and single '_'
+// separators between digits (1_000.000_1; not next to the '.', leading, trailing, or doubled). The
+// decimal form builds the SAME (digits, scale) the lexer feeds DecimalFromDigitsScale (via the
+// shared decimalFromParts), so NUMERIC 'x' is byte-identical to writing x. NO NaN / Infinity
+// (22P02 — jed's decimal is always finite, a documented PG divergence). Caller applies typmod /
+// cap-check.
 func parseDecimalLiteral(s string) (Decimal, error) {
-	t := strings.Trim(s, litWhitespace)
 	invalid := func() (Decimal, error) {
 		return Decimal{}, newError(InvalidTextRepresentation,
 			"invalid input syntax for type numeric: \""+s+"\"")
 	}
-	neg := false
-	if rest, ok := strings.CutPrefix(t, "-"); ok {
-		neg, t = true, rest
-	} else if rest, ok := strings.CutPrefix(t, "+"); ok {
-		t = rest
+	at := func(k int) byte {
+		if k < len(s) {
+			return s[k]
+		}
+		return 0
 	}
-	// Split off an optional exponent. Unlike the lexer (which leaves a bare e for the next token),
-	// an isolated string must be a COMPLETE numeric, so an e with no [+-]?digit+ after it is
-	// malformed (22P02), matching PG's numeric_in.
-	mantissa := t
-	hasExp := false
-	var exp int64
-	if ei := strings.IndexAny(t, "eE"); ei >= 0 {
-		mantissa = t[:ei]
-		e := t[ei+1:]
-		eneg := false
-		if rest, ok := strings.CutPrefix(e, "-"); ok {
-			eneg, e = true, rest
-		} else if rest, ok := strings.CutPrefix(e, "+"); ok {
-			e = rest
-		}
-		if e == "" || !allASCIIDigits(e) {
-			return invalid()
-		}
-		// Clamp the magnitude to expLimit while accumulating (keeps it in i64 and bounds the
-		// coefficient the shared builder may materialize).
-		for m := 0; m < len(e); m++ {
-			if exp < expLimit {
-				exp = exp*10 + int64(e[m]-'0')
-				if exp > expLimit {
-					exp = expLimit
-				}
-			}
-		}
-		if eneg {
-			exp = -exp
-		}
-		hasExp = true
+	p := 0
+	for p < len(s) && isPGSpace(s[p]) {
+		p++
 	}
-	intPart, frac, hasDot := strings.Cut(mantissa, ".")
-	// A second '.' lands in frac (Cut splits on the first); reject it.
-	if (hasDot && strings.Contains(frac, ".")) ||
-		!allASCIIDigits(intPart) || !allASCIIDigits(frac) ||
-		(intPart == "" && frac == "") {
+	neg := at(p) == '-'
+	if neg || at(p) == '+' {
+		p++
+	}
+	// Every finite numeric starts with a digit or a '.' (anything else is PostgreSQL's NaN /
+	// Infinity, which jed's decimal does not have).
+	if !isDigitByte(at(p)) && at(p) != '.' {
 		return invalid()
 	}
-	digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
-	return decimalFromDigitsScale(neg, digits, scale), nil
+	var value Decimal
+	if base := radixPrefix(s, p); base != 10 {
+		p += 2
+		first := p
+		var digits []byte
+		for {
+			if radixDigitIn(s, p, base) >= 0 {
+				digits = append(digits, s[p])
+				p++
+			} else if at(p) == '_' {
+				p++
+				if radixDigitIn(s, p, base) < 0 {
+					return invalid()
+				}
+			} else {
+				break
+			}
+		}
+		if p == first {
+			return invalid()
+		}
+		d, err := decimalFromRadixDigits(neg, string(digits), base)
+		if err != nil {
+			return Decimal{}, err
+		}
+		value = d
+	} else {
+		var intPart, frac []byte
+		haveDP := false
+		if at(p) == '.' {
+			haveDP = true
+			p++
+		}
+		if !isDigitByte(at(p)) {
+			return invalid()
+		}
+		for {
+			c := at(p)
+			if isDigitByte(c) {
+				if haveDP {
+					frac = append(frac, c)
+				} else {
+					intPart = append(intPart, c)
+				}
+				p++
+			} else if c == '.' {
+				// A second '.', or a '_' right after the '.', is malformed.
+				if haveDP || at(p+1) == '_' {
+					return invalid()
+				}
+				haveDP = true
+				p++
+			} else if c == '_' {
+				p++
+				if !isDigitByte(at(p)) {
+					return invalid()
+				}
+			} else {
+				break
+			}
+		}
+		hasExp := false
+		var exp int64
+		if at(p) == 'e' || at(p) == 'E' {
+			p++
+			eneg := at(p) == '-'
+			if eneg || at(p) == '+' {
+				p++
+			}
+			if !isDigitByte(at(p)) {
+				return invalid()
+			}
+			// Clamp the magnitude to expLimit while accumulating (keeps it in i64 and bounds the
+			// coefficient the shared builder may materialize).
+			for {
+				c := at(p)
+				if isDigitByte(c) {
+					if exp < expLimit {
+						exp = min(exp*10+int64(c-'0'), expLimit)
+					}
+					p++
+				} else if c == '_' {
+					p++
+					if !isDigitByte(at(p)) {
+						return invalid()
+					}
+				} else {
+					break
+				}
+			}
+			if eneg {
+				exp = -exp
+			}
+			hasExp = true
+		}
+		digits, scale := decimalFromParts(string(intPart), string(frac), hasExp, exp)
+		value = decimalFromDigitsScale(neg, digits, scale)
+	}
+	for p < len(s) && isPGSpace(s[p]) {
+		p++
+	}
+	if p != len(s) {
+		return invalid()
+	}
+	return value, nil
 }
 
 // parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for

@@ -32,29 +32,147 @@ function isAlpha(c: string): boolean {
   return c === "_" || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
 }
 
-// scanExponent: if sql[i..] begins a well-formed exponent [eE][+-]?digit+, return [exp, nextIndex]
-// with the magnitude clamped to ±EXP_LIMIT. Otherwise [null, i] — a bare e / ex is NOT part of the
-// number (it lexes as the following token, exactly as before e-notation existed; PostgreSQL
-// likewise rejects `1e` as trailing junk rather than reading it as the number `1`).
-function scanExponent(sql: string, i: number): [number | null, number] {
-  const n = sql.length;
-  if (i >= n || (sql[i] !== "e" && sql[i] !== "E")) return [null, i];
-  let j = i + 1;
-  let neg = false;
-  if (j < n && (sql[j] === "+" || sql[j] === "-")) {
-    neg = sql[j] === "-";
-    j++;
+// numIdentStart reports whether c is a PostgreSQL identifier-start character (scan.l ident_start:
+// [A-Za-z\x80-\xff_] — every non-ASCII character). Used only to detect an identifier glued to a
+// numeric literal (trailing junk, grammar.md §4).
+function numIdentStart(c: string | undefined): boolean {
+  return c !== undefined && (isAlpha(c) || c.charCodeAt(0) >= 0x80);
+}
+
+// numIdentLen is the length of the PostgreSQL identifier (ident_start ident_cont*, where ident_cont
+// adds digits and "$") starting at sql[p]; 0 when none starts there.
+function numIdentLen(sql: string, p: number): number {
+  if (!numIdentStart(sql[p])) return 0;
+  let q = p + 1;
+  while (q < sql.length && (numIdentStart(sql[q]) || isDigit(sql[q]!) || sql[q] === "$")) q++;
+  return q - p;
+}
+
+// radixDigitValue is c's value as a digit of radix base (2, 8, 10, or 16), or -1.
+export function radixDigitValue(c: string | undefined, base: number): number {
+  if (c === undefined) return -1;
+  const code = c.charCodeAt(0);
+  let v = -1;
+  if (code >= 48 && code <= 57) v = code - 48;
+  else if (code >= 97 && code <= 102) v = code - 87;
+  else if (code >= 65 && code <= 70) v = code - 55;
+  return v < base ? v : -1;
+}
+
+// digitRunEnd is the end of the radix-base digit run (_? digit)* starting at sql[p] — a "_" counts
+// only when a digit follows it (PostgreSQL's hexinteger tail; a decinteger caller first checks its
+// leading digit).
+function digitRunEnd(sql: string, p: number, base: number): number {
+  for (;;) {
+    if (radixDigitValue(sql[p], base) >= 0) p++;
+    else if (sql[p] === "_" && radixDigitValue(sql[p + 1], base) >= 0) p += 2;
+    else return p;
   }
-  if (j >= n || !isDigit(sql[j]!)) return [null, i];
-  let exp = 0;
-  while (j < n && isDigit(sql[j]!)) {
-    if (exp < EXP_LIMIT) {
-      exp = exp * 10 + (sql.charCodeAt(j) - 48);
-      if (exp > EXP_LIMIT) exp = EXP_LIMIT;
+}
+
+// integerMagnitude is an integer literal's unsigned magnitude from its radix-base digits ("_"
+// separators allowed). It must be <= 2^63 so that -(2^63) = i64's minimum is reachable; anything
+// larger cannot be represented (42601).
+function integerMagnitude(written: string, digits: string, base: number): bigint {
+  let v = 0n;
+  const b = BigInt(base);
+  for (const c of digits) {
+    if (c === "_") continue;
+    v = v * b + BigInt(radixDigitValue(c, base));
+    if (v > MAX_MAGNITUDE) {
+      throw engineError("syntax_error", `integer literal out of range: ${written}`);
     }
-    j++;
   }
-  return [neg ? -exp : exp, j];
+  return v;
+}
+
+// scanNumber scans the numeric literal starting at sql[start] (a digit, or a "." followed by a
+// digit) with PostgreSQL's scan.l rules (grammar.md §4): a decimal integer digit (_? digit)*; a
+// radix integer 0x/0o/0b (_? digit)+ (a bare 0x / 0x_ is "invalid hexadecimal integer"); a decimal
+// with a "." and/or an exponent [eE][+-]?decinteger. Any identifier character glued to the end
+// (123abc, 1_, 0x1g, 1e), or an exponent sign with no digit (1e+), is "trailing junk after numeric
+// literal". 1.. is the integer 1 followed by the .. (rescanned). Returns the token and the index
+// just past it. All errors are 42601.
+function scanNumber(sql: string, start: number): [Token, number] {
+  const junk = (end: number): EngineError =>
+    engineError(
+      "syntax_error",
+      `trailing junk after numeric literal at or near "${sql.slice(start, end)}"`,
+    );
+  // A radix integer: 0x… / 0o… / 0b….
+  if (sql[start] === "0") {
+    const next = sql[start + 1];
+    const [base, name] =
+      next === "x" || next === "X"
+        ? [16, "hexadecimal"]
+        : next === "o" || next === "O"
+          ? [8, "octal"]
+          : next === "b" || next === "B"
+            ? [2, "binary"]
+            : [0, ""];
+    if (base !== 0) {
+      const end = digitRunEnd(sql, start + 2, base);
+      // 0 followed by an identifier is the longest junk reading (scan.l integer_junk).
+      const junkEnd = start + 1 + numIdentLen(sql, start + 1);
+      if (end > start + 2) {
+        if (junkEnd > end) throw junk(junkEnd);
+        const v = integerMagnitude(sql.slice(start, end), sql.slice(start + 2, end), base);
+        return [{ kind: "int", int: v }, end];
+      }
+      const failEnd = start + 2 + (sql[start + 2] === "_" ? 1 : 0);
+      if (junkEnd > failEnd) throw junk(junkEnd);
+      throw engineError(
+        "syntax_error",
+        `invalid ${name} integer at or near "${sql.slice(start, failEnd)}"`,
+      );
+    }
+  }
+  // A decimal integer part (empty for a leading-dot decimal .5).
+  const intEnd = isDigit(sql[start] ?? "") ? digitRunEnd(sql, start, 10) : start;
+  let end = intEnd;
+  let frac: string | null = null;
+  if (sql[intEnd] === ".") {
+    if (sql[intEnd + 1] === ".") {
+      // scan.l numericfail: 1.. is the integer, and the .. is rescanned.
+      const v = integerMagnitude(sql.slice(start, intEnd), sql.slice(start, intEnd), 10);
+      return [{ kind: "int", int: v }, intEnd];
+    }
+    const fracStart = intEnd + 1;
+    // A fraction is a decinteger: it starts with a digit (a `_` right after the `.` is junk).
+    end = isDigit(sql[fracStart] ?? "") ? digitRunEnd(sql, fracStart, 10) : fracStart;
+    frac = sql.slice(fracStart, end);
+  }
+  // An optional exponent [eE][+-]?decinteger; a bare e is junk below, e+ with no digit is junk
+  // here (scan.l realfail).
+  let exp: number | null = null;
+  if (sql[end] === "e" || sql[end] === "E") {
+    const neg = sql[end + 1] === "-";
+    const signed = neg || sql[end + 1] === "+";
+    const digitsStart = end + 1 + (signed ? 1 : 0);
+    if (isDigit(sql[digitsStart] ?? "")) {
+      const expEnd = digitRunEnd(sql, digitsStart, 10);
+      // Clamp the magnitude to EXP_LIMIT while accumulating (keeps it exact and bounds the
+      // coefficient the shared builder may materialize).
+      let v = 0;
+      for (let k = digitsStart; k < expEnd; k++) {
+        if (sql[k] !== "_" && v < EXP_LIMIT)
+          v = Math.min(v * 10 + (sql.charCodeAt(k) - 48), EXP_LIMIT);
+      }
+      exp = neg ? -v : v;
+      end = expEnd;
+    } else if (signed) {
+      throw junk(digitsStart);
+    }
+  }
+  const glued = numIdentLen(sql, end);
+  if (glued > 0) throw junk(end + glued);
+  const intPart = sql.slice(start, intEnd).replaceAll("_", "");
+  if (frac === null && exp === null) {
+    const v = integerMagnitude(sql.slice(start, end), intPart, 10);
+    return [{ kind: "int", int: v }, end];
+  }
+  const [digits, scale] = decimalFromParts(intPart, (frac ?? "").replaceAll("_", ""), exp);
+  return [{ kind: "decimal", decDigits: digits, decScale: scale }, end];
 }
 
 // lex tokenizes sql into tokens terminated by an "eof" token.
@@ -423,44 +541,11 @@ function lexRaw(sql: string, st: LexState): Token[] {
       unicodeEscapes.push(tokens.length);
       tokens.push(quote === "'" ? { kind: "str", str: s } : { kind: "quotedIdent", str: s });
     } else if (isDigit(c)) {
-      // A numeric literal. Scan the integer digits; a following "." and/or scientific
-      // e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an
-      // INTEGER literal.
-      const start = i;
-      while (i < n && isDigit(sql[i]!)) {
-        i++;
-      }
-      const intPart = sql.slice(start, i);
-      // Optional fractional part: `123.`, `123.45`. The fractional part may be empty.
-      let frac = "";
-      let hasFrac = false;
-      if (i < n && sql[i] === ".") {
-        hasFrac = true;
-        i++; // consume "."
-        const fracStart = i;
-        while (i < n && isDigit(sql[i]!)) {
-          i++;
-        }
-        frac = sql.slice(fracStart, i);
-      }
-      // Optional exponent (`e3`, `E+2`, `e-10`); a well-formed exponent (even with no ".")
-      // makes the literal a decimal.
-      const [exp, next] = scanExponent(sql, i);
-      i = next;
-      if (hasFrac || exp !== null) {
-        const [digits, scale] = decimalFromParts(intPart, frac, exp);
-        tokens.push({ kind: "decimal", decDigits: digits, decScale: scale });
-      } else {
-        // Integer literal: an unsigned magnitude (the sign is the "minus" operator). The
-        // magnitude must be <= 2^63 so that -(2^63) = i64's minimum is reachable; anything
-        // larger cannot be represented (42601).
-        const text = intPart;
-        const v = BigInt(text);
-        if (v > MAX_MAGNITUDE) {
-          throw engineError("syntax_error", `integer literal out of range: ${text}`);
-        }
-        tokens.push({ kind: "int", int: v });
-      }
+      // A numeric literal: an integer (decimal, or 0x/0o/0b radix), or a decimal (a "." and/or an
+      // e-exponent), with "_" digit separators — PostgreSQL's scan.l number rules (grammar.md §4).
+      const [tok, end] = scanNumber(sql, i);
+      tokens.push(tok);
+      i = end;
     } else if (c === ".") {
       // A "." has two roles, disambiguated on the FOLLOWING char alone (no preceding-token
       // context, so the rule is trivially identical across cores — grammar.md §4): a digit
@@ -469,17 +554,9 @@ function lexRaw(sql: string, st: LexState): Token[] {
       // identifier then `.<digit>` (`t.5`) — is invalid either way and lexes as a decimal,
       // rejected at parse.
       if (i + 1 < n && isDigit(sql[i + 1]!)) {
-        i++; // consume "."
-        const fracStart = i;
-        while (i < n && isDigit(sql[i]!)) {
-          i++;
-        }
-        const frac = sql.slice(fracStart, i);
-        // A leading-dot decimal may also carry an exponent (`.5e2`).
-        const [exp, next] = scanExponent(sql, i);
-        i = next;
-        const [digits, scale] = decimalFromParts("", frac, exp);
-        tokens.push({ kind: "decimal", decDigits: digits, decScale: scale });
+        const [tok, end] = scanNumber(sql, i);
+        tokens.push(tok);
+        i = end;
       } else {
         tokens.push({ kind: "dot" });
         i++;

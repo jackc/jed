@@ -46,21 +46,14 @@ fn err_at(db: &mut Session, expr: &str, id: usize) -> String {
 
 // --- (a) jed-stricter grammar divergences on the RUNTIME path -------------------------------------
 // These trap 22P02 in jed but PostgreSQL ACCEPTS them, so they cannot be oracle-checked. The point
-// is to prove the runtime `evalCast` coercion uses jed's OWN literal grammar (identical to the
-// resolve-time literal form), not PG's input-function extras.
+// is to prove the runtime `evalCast` coercion uses the same grammar as the resolve-time literal
+// form (the hex / `_` integer forms match PostgreSQL and live in the corpus).
 
 #[test]
-fn hex_integer_string_traps_22p02_at_runtime() {
-    // PG: '0x10'::int4 → 16. jed: decimal digits only → 22P02.
+fn hex_float_string_traps_22p02_at_runtime() {
+    // PG: '0x10'::float8 → 16 (glibc strtod's hex float). jed's float grammar → 22P02.
     let mut db = seeded(&["0x10"]);
-    assert_eq!(err_at(&mut db, "s :: int", 1), "22P02");
-}
-
-#[test]
-fn digit_underscore_integer_string_traps_22p02_at_runtime() {
-    // PG: '1_000'::int4 → 1000. jed: no underscores → 22P02.
-    let mut db = seeded(&["1_000"]);
-    assert_eq!(err_at(&mut db, "s :: int", 1), "22P02");
+    assert_eq!(err_at(&mut db, "s :: float8", 1), "22P02");
 }
 
 #[test]
