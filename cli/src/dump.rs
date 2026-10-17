@@ -52,12 +52,25 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
             // A column key dumps its column name; an EXPRESSION key its canonical text, wrapped in
             // parentheses so the emitted CREATE INDEX re-parses (a bare operator expression is a
             // syntax error — indexes.md §1).
+            // Each key's non-default sort order follows it as PostgreSQL's pg_get_indexdef prints it
+            // (indexes.md §11): ` DESC`, plus ` NULLS LAST` on a DESC key or ` NULLS FIRST` on an
+            // ASC key when the placement is not the direction's default.
             let cols: Vec<String> = idx
                 .keys
                 .iter()
-                .map(|k| match k {
-                    jed::tooling::IndexKey::Column(c) => q(&table.columns[*c].name),
-                    jed::tooling::IndexKey::Expr(e) => format!("({})", e.expr_text),
+                .enumerate()
+                .map(|(i, k)| {
+                    let key = match k {
+                        jed::tooling::IndexKey::Column(c) => q(&table.columns[*c].name),
+                        jed::tooling::IndexKey::Expr(e) => format!("({})", e.expr_text),
+                    };
+                    let order = idx.key_order(i);
+                    match (order.desc, order.nulls_first) {
+                        (false, false) => key,
+                        (false, true) => format!("{key} NULLS FIRST"),
+                        (true, true) => format!("{key} DESC"),
+                        (true, false) => format!("{key} DESC NULLS LAST"),
+                    }
                 })
                 .collect();
             // A PARTIAL index appends its WHERE predicate (canonical text, indexes.md §9) so a
@@ -256,6 +269,7 @@ mod tests {
              )",
             "CREATE INDEX users_age_idx ON users (age)",
             "CREATE INDEX users_ok_idx ON users (age) WHERE ok",
+            "CREATE INDEX users_ord_idx ON users (age DESC, name NULLS FIRST, id DESC NULLS LAST)",
             "INSERT INTO users (id, age, name, blob) VALUES (2, 30, 'it''s bob', '\\x6869')",
             "INSERT INTO users (id, age, name, score) VALUES (1, 40, 'alice', 9.50)",
             "CREATE TABLE nopk (v i64)",
@@ -313,6 +327,7 @@ mod tests {
              CREATE INDEX users_age_idx ON users (age);\n\
              CREATE UNIQUE INDEX users_age_key ON users (age);\n\
              CREATE INDEX users_ok_idx ON users (age) WHERE ok;\n\
+             CREATE INDEX users_ord_idx ON users (age DESC, name NULLS FIRST, id DESC NULLS LAST);\n\
              CREATE VIEW \"Mixed\" (v) AS select \"nopk\" . \"v\" from nopk;\n\
              CREATE VIEW z_base (id, name) AS select id , name from users where age > 18 WITH LOCAL CHECK OPTION;\n\
              CREATE VIEW a_top (n) AS select name from z_base;\n\

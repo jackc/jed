@@ -657,6 +657,11 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   authorized like a write to a table, by the writer's privilege on the view alone; `WITH [CASCADED |
   LOCAL] CHECK OPTION` refuses (`44000`) a written row the checked views would not show
   ([spec/design/views.md](spec/design/views.md) §15).
+- **Ordered index keys (format v46).** A B-tree key element may be `ASC`/`DESC` with `NULLS FIRST|LAST`
+  (PostgreSQL defaults); `index_flags` bit4 carries one option byte per element, and the element's
+  entries use the ordered slot (tag by NULL placement, body inverted for `DESC` — encoding.md §2.16),
+  valid for every keyable type because every key body is prefix-free
+  ([spec/design/indexes.md](spec/design/indexes.md) §11).
 - **Stored SQL this binary cannot parse.** A view body, expression DEFAULT, CHECK, or expression /
   partial-index text that the parser rejects (a newer jed's syntax, which needs no format bump) is not
   corruption: the load keeps the object unparsed and byte-for-byte, and only statements that need it

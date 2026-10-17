@@ -16,6 +16,23 @@ INSERT INTO city VALUES
 
 	const orderedQuery = `SELECT name FROM city WHERE region = 1 ORDER BY name;`;
 
+	const sortSeed = `CREATE TABLE score (
+  id     i32 PRIMARY KEY,
+  player text NOT NULL,
+  points i32
+);
+CREATE INDEX score_points ON score (points DESC);
+INSERT INTO score VALUES
+  (1, 'ada',   90),
+  (2, 'grace', NULL),
+  (3, 'linus', 75),
+  (4, 'barb',  98),
+  (5, 'ken',   61);`;
+
+	const sortQuery = `SELECT player, points FROM score
+ORDER BY points DESC
+LIMIT 3;`;
+
 	const exprSeed = `CREATE TABLE account (
   id    i32 PRIMARY KEY,
   email text NOT NULL
@@ -124,7 +141,7 @@ SELECT name FROM city WHERE region = 2 ORDER BY name;`;
 
 <svelte:head>
 	<title>Indexes — jed</title>
-	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, expression and partial (WHERE) indexes, and GIN inverted indexes that accelerate array containment, overlap, membership, and exact equality, and jsonb containment and key existence, run live." />
+	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes (with ASC/DESC and NULLS FIRST/LAST keys), expression and partial (WHERE) indexes, and GIN inverted indexes that accelerate array containment, overlap, membership, and exact equality, and jsonb containment and key existence, run live." />
 </svelte:head>
 
 # Indexes
@@ -186,6 +203,33 @@ child index once per parent row instead of rescanning all children. With `ORDER 
 ...`, jed preserves that nested-loop order and stops opening later child bounds as soon as the result
 window is full. Each bound it does start is gathered completely, so duplicate child keys retain their
 primary-key tie-break and the result is identical to the blocking plan.
+
+## Sort order (`ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST`)
+
+Each key of an ordered index can declare its sort order, as in PostgreSQL:
+
+```sql
+CREATE INDEX score_points ON score (points DESC);
+CREATE INDEX feed ON post (author, created_at DESC NULLS LAST);
+```
+
+The direction defaults to `ASC`, and NULLs default to the largest value — last for `ASC`, **first
+for `DESC`** — unless you write `NULLS FIRST` or `NULLS LAST`. The index stores its entries in that
+order, so an `ORDER BY` whose every key matches the index (direction *and* NULL placement) walks the
+index instead of sorting, and with a `LIMIT` it stops after the first few entries. Below, the
+leaderboard reads only the top of `score_points`: the `NULL` score comes first, exactly as
+`ORDER BY points DESC` places it. Edit the query to `ORDER BY points DESC NULLS LAST` and the plan
+falls back to a sort — a different order, with the same rows a sort always gives.
+
+<LiveSql demo="sortQuery" seed={sortSeed} query={sortQuery} rows={4} />
+
+Equality and range lookups (`points >= 80`), `IN` lists, joins, and `UPDATE`/`DELETE` targets use a
+`DESC` index exactly like an `ASC` one, and a `UNIQUE` index enforces the same rule whatever its order.
+Two narrowings: jed does not walk an `ASC` index backward to serve a `DESC` order (declare the index
+in the order you query), and only ordered B-trees take an order — `USING gin` or `gist` rejects
+`ASC`/`DESC`/`NULLS` with `0A000`. As in PostgreSQL, a `UNIQUE (...)` or `PRIMARY KEY (...)`
+constraint takes no order; use `CREATE UNIQUE INDEX ... (col DESC)`. [`jed_indexes`](../introspection/)
+reports each key's `descending` and `nulls_first` flags.
 
 ## Expression indexes
 

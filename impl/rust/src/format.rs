@@ -128,6 +128,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v41: a composite-type entry admits a range-typed field — `field_type_code 17` followed by the
 // one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3);
 // no other byte layout change.
+// v42: GIN term statistics (spec/design/statistics.md §4.5).
 // v43: timestamp(p) / interval qualifier typmods — a timestamp / timestamptz column or composite
 // field appends `u8 precision` (0xFF = none, else 0..6), an interval one `u8 interval_fields ‖ u8
 // precision` (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod
@@ -140,7 +141,12 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // partial `EXCLUDE … WHERE (predicate)`), and an exclusion constraint may name an ordered (btree,
 // `index_kind 0`, non-unique) backing index whose every element operator is `=` (`EXCLUDE USING
 // btree`). A v44 reader rejected both shapes as corrupt, hence the version break.
-pub(crate) const FORMAT_VERSION: u16 = 45;
+// v46: ordered index keys — the per-index `index_flags` byte gains bit4 `has_key_options`, and — only
+// when set — one option byte per key element (bit0 `desc`, bit1 `nulls_first`) after the optional
+// timezone dependencies; a DESC / NULLS FIRST key's entry slots use the encoding.md §2.16 ordered
+// slot. An index with only default (ASC NULLS LAST) keys is byte-identical to v45
+// (spec/design/indexes.md §11).
+pub(crate) const FORMAT_VERSION: u16 = 46;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -4221,7 +4227,8 @@ fn table_entry_bytes(
             (if idx.unique { 1 } else { 0 })
                 | (if idx.predicate.is_some() { 2 } else { 0 })
                 | (if idx.host_deps.is_empty() { 0 } else { 4 })
-                | (if idx.timezone_deps.is_empty() { 0 } else { 8 }),
+                | (if idx.timezone_deps.is_empty() { 0 } else { 8 })
+                | (if idx.orders.is_empty() { 0 } else { 16 }),
         );
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
         out.push(idx.kind as u8);
@@ -4249,6 +4256,12 @@ fn table_entry_bytes(
                 }
                 out.extend_from_slice(&dep.checksum.to_be_bytes());
             }
+        }
+        // v46: the per-element key options (bit0 desc, bit1 nulls_first — indexes.md §11), one byte
+        // per key element after every other optional section — only when bit4 is set (some element
+        // is not the default ASC NULLS LAST).
+        for o in &idx.orders {
+            out.push(o.to_byte());
         }
     }
     // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
@@ -5969,7 +5982,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         let iflags = read_u8(buf, pos)?;
         // bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9), bit2
         // has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1); the rest reserved.
-        if iflags & !0b1111 != 0 {
+        if iflags & !0b1_1111 != 0 {
             return Err(corrupt("reserved index flag set"));
         }
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7);
@@ -6053,6 +6066,26 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 });
             }
         }
+        // v46: bit4 has_key_options — one option byte per key element (bit0 desc, bit1 nulls_first;
+        // the rest reserved), B-tree only, and never all-default (the writer omits that list).
+        let orders = if iflags & 0b1_0000 != 0 {
+            if kind != IndexKind::Btree {
+                return Err(corrupt("a non-btree index cannot have key options"));
+            }
+            let mut orders = Vec::with_capacity(keys.len());
+            for _ in 0..keys.len() {
+                orders.push(
+                    crate::encoding::KeyOrder::from_byte(read_u8(buf, pos)?)
+                        .ok_or_else(|| corrupt("reserved index key option bit set"))?,
+                );
+            }
+            if orders.iter().all(|o| o.is_default()) {
+                return Err(corrupt("index key options are all default"));
+            }
+            orders
+        } else {
+            Vec::new()
+        };
         indexes.push(IndexDef {
             name: iname,
             keys,
@@ -6061,6 +6094,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             predicate,
             host_deps,
             timezone_deps,
+            orders,
         });
     }
     // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the

@@ -2052,12 +2052,18 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 		return nil, err
 	}
 	var keys []indexKeyElem
+	var keyOrders []indexKeyOrderSpec
 	for {
 		key, err := p.parseIndexElement()
 		if err != nil {
 			return nil, err
 		}
 		keys = append(keys, key)
+		order, err := p.parseIndexKeyOrder()
+		if err != nil {
+			return nil, err
+		}
+		keyOrders = append(keyOrders, order)
 		tok := p.advance()
 		if tok.Kind == tokComma {
 			continue
@@ -2080,7 +2086,40 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 		}
 		predicate = &indexPredicate{Text: renderTokens(p.tokens[start:p.pos]), Expr: expr}
 	}
-	return &createIndex{Name: name, IfNotExists: ifNotExists, Table: table, DB: dbQualifier, Keys: keys, Unique: unique, Using: using, Predicate: predicate}, nil
+	return &createIndex{Name: name, IfNotExists: ifNotExists, Table: table, DB: dbQualifier, Keys: keys, Unique: unique, Using: using, Predicate: predicate, KeyOrders: keyOrders}, nil
+}
+
+// parseIndexKeyOrder parses the optional `ASC | DESC` then `NULLS FIRST | LAST` after an index key
+// element (indexes.md §11, PostgreSQL's opt_asc_desc opt_nulls_order). A bare `NULLS` not followed
+// by FIRST / LAST is 42601, as in the query ORDER BY.
+func (p *parser) parseIndexKeyOrder() (indexKeyOrderSpec, error) {
+	var spec indexKeyOrderSpec
+	switch p.peekKeyword() {
+	case "asc":
+		p.advance()
+		f := false
+		spec.Desc = &f
+	case "desc":
+		p.advance()
+		t := true
+		spec.Desc = &t
+	}
+	if p.peekKeyword() == "nulls" {
+		p.advance()
+		switch p.peekKeyword() {
+		case "first":
+			p.advance()
+			t := true
+			spec.NullsFirst = &t
+		case "last":
+			p.advance()
+			f := false
+			spec.NullsFirst = &f
+		default:
+			return spec, newError(SyntaxError, "NULLS must be followed by FIRST or LAST")
+		}
+	}
+	return spec, nil
 }
 
 // parseIndexElement parses one index_element (grammar.md §30, indexes.md §1): a bare column, a

@@ -1912,7 +1912,7 @@ impl Engine {
                 .iter()
                 .find(|ix| ix.name.to_string() == *name)
                 .expect("the reverse-path index exists");
-            for key in &ix.keys[path.cols.len()..] {
+            for (i, key) in ix.keys.iter().enumerate().skip(path.cols.len()) {
                 let c = key
                     .as_column()
                     .expect("a reverse-path tail key is a plain column");
@@ -1924,7 +1924,8 @@ impl Engine {
                             .expect("a reverse-path tail column is a fixed-width scalar"),
                         col.collation.is_some(),
                     )
-                    .expect("a reverse-path tail column has a key slot"),
+                    .expect("a reverse-path tail column has a key slot")
+                    .with_order(ix.key_order(i)),
                 );
             }
         }

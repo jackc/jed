@@ -871,6 +871,10 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "method", Type: scalarT(scalarText), NotNull: true},
 			// A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
 			{Name: "predicate", Type: scalarT(scalarText)},
+			// Per key element, parallel to columns: whether it is DESC, and whether its NULLs sort first
+			// (indexes.md §11 — PostgreSQL's pg_index.indoption bits).
+			{Name: "descending", Type: arrayT(scalarT(scalarBool)), NotNull: true},
+			{Name: "nulls_first", Type: arrayT(scalarT(scalarBool)), NotNull: true},
 		}}
 	case srfJedConstraints:
 		return &catTable{Name: "jed_constraints", Columns: []catColumn{
@@ -1125,6 +1129,14 @@ func (db *engine) jedIndexesRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 			if idx.Predicate != nil {
 				predicate = TextValue(idx.Predicate.ExprText)
 			}
+			// Each key element's order flags (indexes.md §11), parallel to columns.
+			desc := make([]Value, len(idx.Keys))
+			nullsFirst := make([]Value, len(idx.Keys))
+			for j := range idx.Keys {
+				o := idx.keyOrder(j)
+				desc[j] = BoolValue(o.Desc)
+				nullsFirst[j] = BoolValue(o.NullsFirst)
+			}
 			out = append(out, storedRow{
 				TextValue(idx.Name),
 				TextValue(t.Name),
@@ -1132,6 +1144,8 @@ func (db *engine) jedIndexesRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				BoolValue(idx.Unique),
 				TextValue(indexMethodName(idx.Kind)),
 				predicate,
+				ArrayValue(desc),
+				ArrayValue(nullsFirst),
 			})
 		}
 	}

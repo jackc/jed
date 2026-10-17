@@ -1106,8 +1106,10 @@ The index store holds its entries as `(indexed columns, storage key)`, so a forw
 *after* a present `0x00` — exactly NULLS-LAST), ties broken by the PK suffix — precisely the eager
 stable sort's tie-break. It engages when:
 
-- the `ORDER BY` keys are **exactly** the index's columns (same count, same order), each **`ASC` with
-  default `NULLS LAST`** and sorting by the column's stored key collation (a `Skewed` collated index
+- the `ORDER BY` keys are **exactly** the index's columns (same count, same order), each matching
+  its index element's declared order — **direction and effective NULL placement** (`ASC NULLS LAST`
+  for a plain index; `DESC` ⇒ `NULLS FIRST` unless written; [indexes.md §11](indexes.md)) — and
+  sorting by the column's stored key collation (a `Skewed` collated index
   is never walked — the §12 read-safety rule). *Exactly*, because a strict prefix of a *multi*-column
   index would tie-break by the remaining index columns rather than the PK, diverging from the eager
   sort (the composite-PK reverse trap again);
@@ -1125,8 +1127,10 @@ stable sort's tie-break. It engages when:
   The rows match the eager sort exactly. `query/order_by_index_scan.test` pins the top-N, the residual
   filter, the OFFSET, and the no-`LIMIT` / non-indexed-column contrasts that keep the eager sort.
 
-Narrowings (each a follow-on): `DESC` (a reverse index walk — restricted to a unique index, the same
-tie-break trap) and a strict-prefix-of-a-multi-column-index `ORDER BY` keep the eager path. A WHERE
+Narrowings (each a follow-on): a **backward** walk serving a `DESC` order from an `ASC` index (a
+reverse walk reverses the storage-key tie-break — the same trap; declaring the index `DESC`,
+[indexes.md §11](indexes.md), is the supported path, walked forward) and a
+strict-prefix-of-a-multi-column-index `ORDER BY` keep the eager path. A WHERE
 pushdown bound over this exact index now composes with the walk (the bounded LIMIT rule above).
 
 ### Windowed top-N — a backward window served from the LIMIT prefix

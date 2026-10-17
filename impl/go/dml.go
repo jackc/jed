@@ -37,10 +37,22 @@ type resolvedIndex struct {
 	Unique bool
 	Kind   indexKind
 	Keys   []resolvedKey
+	// Orders is each key element's sort order (indexes.md §11), parallel to Keys (always full length
+	// here): the entry slot of element i is the encoding.md §2.16 ordered slot under Orders[i].
+	Orders []keyOrder
 	// Predicate is a PARTIAL index's resolved WHERE predicate (spec/design/indexes.md §9): evaluated
 	// against each row (unmetered, like a key expression), a row is indexed / constrained ONLY when it
 	// is TRUE. nil for an ordinary (full) index — every row is indexed.
 	Predicate *rExpr
+}
+
+// keyOrder is key element i's sort order (ASC NULLS LAST when Orders is short — a resolvedIndex
+// built without orders).
+func (ri *resolvedIndex) keyOrder(i int) keyOrder {
+	if i < len(ri.Orders) {
+		return ri.Orders[i]
+	}
+	return keyOrder{}
 }
 
 type insertAlwaysTarget struct{ col, pos int }
@@ -254,19 +266,20 @@ func indexSlotKey(key resolvedKey, colTypes []colType, colls []*Collation, row s
 // Unfetched backstop.
 func indexEntryKey(colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([]byte, error) {
 	var out []byte
-	for _, key := range rindex.Keys {
+	for i, key := range rindex.Keys {
 		present, b, err := indexSlotKey(key, colTypes, colls, row, env)
 		if err != nil {
 			return nil, err
 		}
+		// The §2.16 ordered slot: the order's presence tag + the slot's order-preserving key
+		// (range-aware §2.11, composite §2.15, collated-text-aware §2.12), inverted for DESC — or the
+		// order's NULL byte.
+		order := rindex.keyOrder(i)
 		if !present {
-			out = append(out, 0x01)
+			out = append(out, order.nullTag())
 			continue
 		}
-		// present tag, then the slot's order-preserving key (range-aware §2.11, composite §2.15,
-		// collated-text-aware §2.12)
-		out = append(out, 0x00)
-		out = append(out, b...)
+		out = order.pushPresent(out, b)
 	}
 	out = append(out, storageKey...)
 	return out, nil
@@ -328,7 +341,7 @@ func indexEntryKeysColumns(columns []catColumn, colTypes []colType, colls []*Col
 	for i, c := range cols {
 		keys[i] = resolvedKey{Col: c}
 	}
-	ri := &resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys}
+	ri := &resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys, Orders: def.keyOrders()}
 	return indexEntryKeys(columns, colTypes, colls, ri, storageKey, row, nil)
 }
 
@@ -629,7 +642,7 @@ func indexPrefixKey(colTypes []colType, colls []*Collation, rindex *resolvedInde
 		return nil, false, nil
 	}
 	var out []byte
-	for _, key := range rindex.Keys {
+	for i, key := range rindex.Keys {
 		present, b, err := indexSlotKey(key, colTypes, colls, row, env)
 		if err != nil {
 			return nil, false, err
@@ -637,10 +650,8 @@ func indexPrefixKey(colTypes []colType, colls []*Collation, rindex *resolvedInde
 		if !present {
 			return nil, false, nil // NULLS DISTINCT: a NULL slot never conflicts
 		}
-		// present tag, then the slot's order-preserving key (range-aware §2.11, composite §2.15,
-		// collated-text-aware §2.12)
-		out = append(out, 0x00)
-		out = append(out, b...)
+		// the order's present slot (§2.16) — the same bytes the entry key carries
+		out = rindex.keyOrder(i).pushPresent(out, b)
 	}
 	return out, true, nil
 }

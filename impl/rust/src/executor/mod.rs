@@ -30,7 +30,7 @@ pub(crate) use crate::cost::{Lifetime, Meter};
 pub(crate) use crate::costs::COSTS;
 pub(crate) use crate::date::parse_date;
 pub(crate) use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
-pub(crate) use crate::encoding::{encode_bool, encode_int, encode_terminated};
+pub(crate) use crate::encoding::{KeyOrder, encode_bool, encode_int, encode_terminated};
 pub(crate) use crate::error::{EngineError, Result, SqlState};
 pub(crate) use crate::interval::{self, Interval, parse_interval};
 pub(crate) use crate::json::{self, JsonNode};
@@ -5655,6 +5655,14 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
             not_null,
         )
     };
+    // A `boolean[]` per-key-element flag column (jed_indexes.descending / nulls_first, §5.1).
+    let bool_arr = |name: &str, not_null: bool| {
+        mk_col(
+            name,
+            Type::Array(Box::new(Type::Scalar(ScalarType::Bool))),
+            not_null,
+        )
+    };
     let table = |name: &str, columns: Vec<Column>| {
         Box::new(Table {
             name: name.to_string(),
@@ -5696,6 +5704,10 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 // A partial index's predicate canonical text; NULL for a non-partial index
                 // (indexes.md §9, introspection.md §5.1).
                 col("predicate", ScalarType::Text, false),
+                // Per key element, parallel to `columns`: whether it is DESC, and whether its NULLs
+                // sort first (indexes.md §11 — PostgreSQL's pg_index.indoption bits).
+                bool_arr("descending", true),
+                bool_arr("nulls_first", true),
             ],
         ),
         SrfKind::JedConstraints => table(
@@ -7187,6 +7199,9 @@ pub(crate) struct IndexKeySet {
     name_key: String,
     tuple: Vec<TupleMember>,
     slots: Vec<KeySlot>,
+    /// Every key column's sort order (indexes.md §11), parallel to `slots`: a member's points
+    /// are its §2.16 present slots.
+    orders: Vec<KeyOrder>,
     all_fixed: bool,
 }
 

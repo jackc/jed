@@ -1,0 +1,330 @@
+# Planning over ordered index keys (spec/design/indexes.md §11, cost.md §3 "ORDER BY satisfied by
+# secondary-index order", encoding.md §2.16). A DESC / NULLS FIRST key stores its entries in the
+# declared order, so:
+#   - an ORDER BY whose every key matches the index element's direction AND effective NULL placement
+#     (ASC -> NULLS LAST, DESC -> NULLS FIRST unless written) is served by the FORWARD index walk,
+#     with the LIMIT early-out; ties are broken by the PK suffix, exactly as the eager stable sort.
+#     A mismatched NULL placement or direction keeps the blocking sort (a backward walk of an ASC
+#     index for a DESC order stays a follow-on: it would break ties PK-descending);
+#   - equality prefixes, trailing ranges (endpoints swapped under DESC, NULL slot excluded), key-set
+#     probes (IN / = ANY, emitted in physical order), UPDATE / DELETE targets, and index-nested-loop
+#     seeks all bound an ordered index exactly as an ASC one.
+# Rows agree with the PostgreSQL oracle; the plans (EXPLAIN) and costs are jed-owned and cross-core
+# checked.
+# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.index_prefix, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.order_by, query.order_by_keys, query.order_by_index_scan, query.bounded_limit_streaming, query.order_by_topk, query.limit, query.offset, query.join_inner, query.index_nested_loop, query.explain, query.set_returning, query.is_null, expr.between, expr.in_list, func.array_quantified, types.array, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, a i32, b i32, pad text)
+
+# 600 rows: a in 0..49 (NULL every 97th row), b in 0..12 (NULL every 31st row).
+statement ok
+INSERT INTO o SELECT i, CASE WHEN i % 97 = 0 THEN NULL ELSE i % 50 END, CASE WHEN i % 31 = 0 THEN NULL ELSE i % 13 END, 'p' FROM generate_series(1, 600) AS i
+
+statement ok
+CREATE INDEX o_a_desc ON o (a DESC)
+
+statement ok
+CREATE INDEX o_ab ON o (a NULLS FIRST, b DESC)
+
+# --- ORDER BY served by the forward walk of a matching ordered index -----------------------------
+
+# DESC defaults to NULLS FIRST: the index's first entries are the NULL a's (ids 97, 194, ... in PK
+# order), then a = 49 ascending by id.
+# cost: 33
+query II nosort
+SELECT id, a FROM o ORDER BY a DESC LIMIT 8
+----
+97
+NULL
+194
+NULL
+291
+NULL
+388
+NULL
+485
+NULL
+582
+NULL
+49
+49
+99
+49
+
+# OFFSET composes with the walk.
+# cost: 31
+query II nosort
+SELECT id, a FROM o ORDER BY a DESC LIMIT 3 OFFSET 6
+----
+49
+49
+99
+49
+149
+49
+
+# A mismatched NULL placement is a different order: the blocking top-k sort serves it (made total by
+# the id key, since a top-k sort's ties are not the oracle's).
+# cost: 607
+query II nosort
+SELECT id, a FROM o ORDER BY a DESC NULLS LAST, id LIMIT 3
+----
+49
+49
+99
+49
+149
+49
+
+# Two ordered keys: a ASC NULLS FIRST, b DESC (NULLS FIRST by default) — the o_ab walk.
+# cost: 39
+query III nosort
+SELECT id, a, b FROM o ORDER BY a NULLS FIRST, b DESC LIMIT 9
+----
+194
+NULL
+12
+388
+NULL
+11
+582
+NULL
+10
+97
+NULL
+6
+291
+NULL
+5
+485
+NULL
+4
+350
+0
+12
+50
+0
+11
+400
+0
+10
+
+# --- access bounds over a DESC column -------------------------------------------------------------
+
+# Equality on the DESC column seeks one prefix.
+# cost: 61
+query I rowsort
+SELECT id FROM o WHERE a = 7
+----
+107
+157
+207
+257
+307
+357
+407
+457
+507
+557
+57
+7
+
+# A range over the DESC column: the byte endpoints swap, and the NULL slot (which sorts FIRST under
+# DESC) stays outside the range.
+# cost: 121
+query I rowsort
+SELECT id FROM o WHERE a >= 48
+----
+148
+149
+198
+199
+248
+249
+298
+299
+348
+349
+398
+399
+448
+449
+48
+49
+498
+499
+548
+549
+598
+599
+98
+99
+
+# cost: 61
+query I rowsort
+SELECT id FROM o WHERE a < 1
+----
+100
+150
+200
+250
+300
+350
+400
+450
+50
+500
+550
+600
+
+# cost: 169
+query I rowsort
+SELECT id FROM o WHERE a BETWEEN 20 AND 21
+----
+120
+121
+170
+171
+20
+21
+220
+221
+270
+271
+320
+321
+370
+371
+420
+421
+470
+471
+520
+521
+570
+571
+70
+71
+
+# Equality prefix then a range on the DESC second key (o_ab: a NULLS FIRST, b DESC): the NULL b's
+# sort first in the b slot and are excluded.
+# cost: 23
+query II rowsort
+SELECT id, b FROM o WHERE a = 7 AND b > 8
+----
+207
+12
+257
+10
+557
+11
+
+# The bound composes with the walk of the same index: a = 7 ORDER BY a NULLS FIRST, b DESC.
+# cost: 53
+query II nosort
+SELECT id, b FROM o WHERE a = 7 ORDER BY a NULLS FIRST, b DESC LIMIT 4
+----
+207
+12
+557
+11
+257
+10
+307
+8
+
+# A NULL-equality is never true: provably empty, nothing read.
+# cost: 0
+query I rowsort
+SELECT id FROM o WHERE a = NULL
+----
+
+# --- key-set probes over a DESC column ------------------------------------------------------------
+
+# cost: 181
+query I rowsort
+SELECT id FROM o WHERE a IN (3, 47) AND id < 200
+----
+103
+147
+153
+197
+3
+47
+53
+
+# A set on the leading column, then an equality on the DESC b.
+# cost: 14
+query III rowsort
+SELECT id, a, b FROM o WHERE a = ANY(ARRAY[7, 9]) AND b = 9
+----
+9
+9
+9
+
+# The probes come out in physical (DESC) order, so a set over a DESC index still streams its ORDER BY
+# (k is unique, so the order is total).
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO w SELECT i, (i * 37) % 1000 FROM generate_series(1, 400) AS i
+
+statement ok
+CREATE INDEX w_k ON w (k DESC)
+
+# cost: 43
+query II nosort
+SELECT id, k FROM w WHERE k IN (37, 74, 999, 111, 500) ORDER BY k DESC LIMIT 10
+----
+27
+999
+3
+111
+2
+74
+1
+37
+
+# --- UPDATE / DELETE targets through a DESC bound -------------------------------------------------
+
+statement ok
+UPDATE o SET pad = 'q' WHERE a >= 49
+
+query I nosort
+SELECT count(*) FROM o WHERE pad = 'q'
+----
+12
+
+statement ok
+DELETE FROM o WHERE a = 0 AND b > 10
+
+query I nosort
+SELECT count(*) FROM o
+----
+598
+
+# --- index-nested-loop seek into a DESC index -----------------------------------------------------
+
+statement ok
+CREATE TABLE s (x i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO s VALUES (5), (44)
+
+# cost: 109
+query II rowsort
+SELECT s.x, o.id FROM s JOIN o ON o.a = s.x WHERE o.id < 150
+----
+44
+144
+44
+44
+44
+94
+5
+105
+5
+5
+5
+55

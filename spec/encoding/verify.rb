@@ -648,6 +648,88 @@ def check_gin_jsonb_file(filename)
   checked
 end
 
+# --- ordered index slots (encoding.md §2.16) ----------------------------------------------------
+# One value's bare order-preserving key body, from a tagged inline table: an integer width
+# (`i16`/`i32`/`i64`, `timestamp` = the i64 rule, `date` = the i32 rule), `boolean`, `uuid`, `f32`/`f64`
+# (string), `decimal` (string), `text`, `bytea` (hex), `interval` ([months, days, micros]), `range`
+# ({ elem, lower?, upper?, lower_inc?, upper_inc?, empty? }), `array` ({ elem, elements = [...] } —
+# 1-D, lower bound 1; a NULL element is { null = true }), `composite` (the field list, §2.15 rules),
+# or `collated` (a given UCA sort-key body in hex, pinned in spec/collation/vectors/sortkey.toml).
+ORDERED_INT_WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "timestamp" => 8, "date" => 4 }.freeze
+
+def enc_ordered_body(v)
+  k, x = v.first
+  case k
+  when *ORDERED_INT_WIDTH.keys then enc_bare(x, ORDERED_INT_WIDTH[k])
+  when "boolean" then enc_bare(x, 1)
+  when "uuid" then uuid_to_bytes(x)
+  when "f32", "f64" then enc_float(k, x)
+  when "decimal" then enc_decimal(x)
+  when "text" then enc_terminated(x.b)
+  when "bytea" then enc_terminated([x].pack("H*"))
+  when "interval" then enc_interval({ "months" => x[0], "days" => x[1], "micros" => x[2] })
+  when "range" then enc_range(x["elem"], x)
+  when "array" then enc_ordered_array(x)
+  when "composite" then enc_composite(x)
+  when "collated" then [x].pack("H*")
+  else raise "unknown ordered value #{v.inspect}"
+  end
+end
+
+# array-elements-terminated (§2.14) for a 1-D array with lower bound 1 (the empty array has ndim 0).
+def enc_ordered_array(x)
+  out = +"".b
+  x["elements"].each do |e|
+    out << (e.is_a?(Hash) && e["null"] ? "\x02".b : "\x01".b + enc_ordered_body({ x["elem"] => e }))
+  end
+  out << "\x00".b
+  out << (x["elements"].empty? ? "\x00".b : "\x01".b + [x["elements"].size].pack("N") + enc_bare(1, 4))
+end
+
+# The four ordered slots: [present tag, NULL tag, invert body?] per order (encoding.md §2.16).
+ORDERED_SLOTS = {
+  "asc_nulls_last" => [0x00, 0x01, false], "asc_nulls_first" => [0x01, 0x00, false],
+  "desc_nulls_first" => [0xFF, 0xFE, true], "desc_nulls_last" => [0xFE, 0xFF, true]
+}.freeze
+
+def enc_ordered_slot(order, c)
+  present, null, inv = ORDERED_SLOTS.fetch(order)
+  return [null].pack("C") if c["null"]
+
+  body = enc_ordered_body(c["value"])
+  [present].pack("C") + (inv ? invert(body) : body)
+end
+
+# Verify spec/encoding/ordered.toml: every case's bytes in every order are byte-exact against this
+# reference; within a group the cases are listed in ASCENDING logical order (the NULL case last), and
+# each order's encodings must sort strictly in that order's logical sequence (ASC / DESC values, NULLs
+# placed first or last) — and be PREFIX-FREE, so a slot composes with any following bytes.
+def check_ordered_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  checked = 0
+  (data["group"] || []).each do |group|
+    values = group["cases"].reject { |c| c["null"] }
+    nulls = group["cases"].select { |c| c["null"] }
+    fail!("ordered #{group['type']}: exactly one trailing NULL case") unless nulls.size == 1 && group["cases"].last["null"]
+    ORDERED_SLOTS.each do |order, (_, _, desc)|
+      seq = desc ? values.reverse : values
+      seq = order.end_with?("nulls_first") ? nulls + seq : seq + nulls
+      rows = seq.map do |c|
+        got = hex(enc_ordered_slot(order, c))
+        want = c[order]
+        fail!("ordered #{group['type']} #{c['label']} #{order}: encode=#{got} want=#{want}") unless got == want
+        checked += 1
+        [c["label"] || "NULL", [want].pack("H*").b]
+      end
+      check_order("ordered #{group['type']} #{order}", rows)
+      rows.combination(2) do |(la, a), (lb, b)|
+        fail!("ordered #{group['type']} #{order}: #{la} / #{lb} not prefix-free") if a.start_with?(b) || b.start_with?(a)
+      end
+    end
+  end
+  checked
+end
+
 def label_of(c) = c["null"] ? "NULL" : c["value"]
 
 def main
@@ -730,7 +812,10 @@ def main
   # bytes, built from the text/decimal key rules above — a flag byte + a cut, terminated body.
   checked += check_gin_jsonb_file("gin_jsonb_terms.toml")
 
+  # Ordered index slots (§2.16): every keyable type's body in all four ASC/DESC x NULLS orders.
+  checked += check_ordered_file("ordered.toml")
+
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end
 
-main
+main if $PROGRAM_NAME == __FILE__

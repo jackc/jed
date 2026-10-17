@@ -116,7 +116,10 @@ import {
   type ViewDepKind,
   columnDefaultText,
   columnIndex,
+  canonicalKeyOrders,
   indexColumnOrdinals,
+  indexKeyOrder,
+  indexKeyOrderEffective,
   indexFirstColumn,
   pkIndices,
   seqDataTypeDefaultBounds,
@@ -283,6 +286,15 @@ import {
   encodeInt,
   encodeTerminated,
   GIN_MAX_TERM_BYTES,
+  KEY_ORDER_ASC,
+  type KeyOrder,
+  keyOrderIsDefault,
+  keyOrderIsNullTag,
+  keyOrderNullTag,
+  keyOrderPresentSlot,
+  keyOrderPresentTag,
+  keyOrderPushPresent,
+  keyOrderPushSlot,
 } from "./encoding.ts";
 import {
   checkViolation,
@@ -7554,7 +7566,9 @@ export class Engine {
       }
       if (predicate) verifyIndexHostDeps(predicate, reg, def.hostDeps);
     }
-    return { name: def.name, unique: def.unique, kind: def.kind, keys, predicate };
+    // Each key element's sort order (indexes.md §11), always full length here.
+    const orders = keys.map((_, i) => indexKeyOrder(def, i));
+    return { name: def.name, unique: def.unique, kind: def.kind, keys, orders, predicate };
   }
 
   // resolveTableIndexes resolves every index of a table once per statement (the maintenance driver —
@@ -9800,7 +9814,8 @@ export class Engine {
   }
 
   // fkReversePrefix encodes a parent tuple (FK slot order) as the chosen child key's probe prefix:
-  // bare member encodings for the PK, 0x00-tagged slots for an index (constraints.md §6.5 step 3).
+  // bare member encodings for the PK, the index columns' §2.16 present slots for an index (a DESC key
+  // inverts its body — constraints.md §6.5 step 3).
   private fkReversePrefix(
     path: FkReversePath,
     fk: ForeignKey,
@@ -9809,14 +9824,15 @@ export class Engine {
   ): Uint8Array {
     const childColls = this.columnCollations(child.columns);
     const parts: Uint8Array[] = [];
-    for (const c of path.cols) {
+    for (let i = 0; i < path.cols.length; i++) {
+      const c = path.cols[i]!;
       const b = encodeTypedKey(
         child.columns[c]!.type,
         values[fk.columns.indexOf(c)]!,
         childColls[c] ?? null,
       );
-      if (path.index !== null) parts.push(new Uint8Array([0x00]));
-      parts.push(b);
+      if (path.index !== null) keyOrderPushPresent(parts, path.orders[i]!, b);
+      else parts.push(b);
     }
     return concatBytes(parts);
   }
@@ -9871,10 +9887,12 @@ export class Engine {
     if (path.index !== null) {
       const ix = child.indexes.find((i) => i.name === path.index);
       if (ix !== undefined) {
-        for (const key of ix.keys.slice(path.cols.length)) {
+        for (let i = path.cols.length; i < ix.keys.length; i++) {
+          const key = ix.keys[i]!;
           if (key.kind !== "column") continue;
           const col = child.columns[key.column]!;
-          suffix.push(keySlotForScalar(typeAsScalar(col.type)!, col.collation !== null)!);
+          const slot = keySlotForScalar(typeAsScalar(col.type)!, col.collation !== null)!;
+          suffix.push(keySlotWithOrder(slot, indexKeyOrder(ix, i)));
         }
       }
     }
@@ -9985,7 +10003,8 @@ export class Engine {
     // function (byte-identical to v30 then).
     const hostDeps: HostFuncDep[] = [];
     const timezoneDeps: TimeZoneDeps = { dynamic: false, zones: [] };
-    for (const elem of ci.keys) {
+    for (let elemI = 0; elemI < ci.keys.length; elemI++) {
+      const elem = ci.keys[elemI]!;
       // An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the table's
       // columns, validate it is immutable + indexable-typed, and store its canonical text (persisted,
       // format_version 26). Expression keys are B-tree only this slice — GIN/GiST take a single plain
@@ -10007,6 +10026,24 @@ export class Engine {
         throw engineError("undefined_column", "column does not exist: " + name);
       }
       this.checkIndexColumnType(kind, columns[idx]!.type);
+      // Ordering options (indexes.md §11): only an ordered B-tree takes them. PostgreSQL rejects any
+      // WRITTEN option on an unordered access method, explicit ASC included — the direction first,
+      // then the NULLS placement (0A000).
+      if (kind !== "btree") {
+        const spec = ci.keyOrders[elemI] ?? {};
+        if (spec.desc !== undefined) {
+          throw engineError(
+            "feature_not_supported",
+            `access method "${kind}" does not support ASC/DESC options`,
+          );
+        }
+        if (spec.nullsFirst !== undefined) {
+          throw engineError(
+            "feature_not_supported",
+            `access method "${kind}" does not support NULLS FIRST/LAST options`,
+          );
+        }
+      }
       // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
       ciKeys.push({ kind: "column", column: idx });
     }
@@ -10117,6 +10154,7 @@ export class Engine {
       predicate,
       hostDeps: hostDeps.length > 0 ? hostDeps : undefined,
       timezoneDeps,
+      orders: canonicalKeyOrders(ci.keyOrders.map(indexKeyOrderEffective)),
     };
     const meter = this.session.newMeter();
     const entries = this.buildIndexEntries(ci.db, table, def, meter);
@@ -10734,7 +10772,7 @@ export class Engine {
   // block — the index-tree nodes overlapping the range plus, per entry, the row's point lookup.
   // prefixByteLen is the equality-prefix byte length skipped before the fixed-width suffix-skip that
   // recovers each entry's row storage key (indexes.md §5.1). Shared by the access-predicate bound
-  // (indexBoundRows) and the OR / IN-list point-set (indexPointRows) so both drive the identical
+  // (indexBoundRows) and the OR / IN-list key-set probes so both drive the identical
   // per-entry fetch — same cost by construction (cost.md §3 "index-bounded scan" / "OR / IN-list").
   indexScanBound(
     tableName: string,
@@ -10767,36 +10805,6 @@ export class Engine {
     );
   }
 
-  // indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
-  // equality prefix scan [0x00‖value, byte-successor) over the index B-tree plus, per admitted entry,
-  // the row's point lookup. Used by the OR / IN-list secondary-index point-set (indexKeySetRows), where
-  // each distinct list value is one such point probe. suffix holds the trailing key components' slots
-  // (columns[1..]), skipped past the single leading slot.
-  indexPointRows(
-    tableName: string,
-    nameKey: string,
-    suffix: KeySlot[],
-    valueKey: Uint8Array,
-    mask: boolean[],
-  ): { rows: Row[]; pages: number; slabs: number } {
-    const r = this.indexPointEntries(tableName, nameKey, suffix, valueKey, mask);
-    return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
-  }
-
-  indexPointEntries(
-    tableName: string,
-    nameKey: string,
-    suffix: KeySlot[],
-    valueKey: Uint8Array,
-    mask: boolean[],
-  ): { entries: Entry[]; pages: number; slabs: number } {
-    // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
-    // is every entry extending the prefix: [prefix, byte-successor(prefix)).
-    const prefix = new Uint8Array(1 + valueKey.length);
-    prefix.set(valueKey, 1);
-    const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
-    return this.indexScanBoundEntries(tableName, nameKey, suffix, b, prefix.length, mask);
-  }
 
   // Execute canonical logical intervals over the row's own B-tree. Storage keys are retained for
   // mutation consumers, and each disjoint interval's page/slab block is summed.
@@ -19071,6 +19079,9 @@ export class Engine {
           textValue(idx.kind),
           // A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
           idx.predicate ? textValue(idx.predicate.exprText) : nullValue(),
+          // Each key element's order flags (indexes.md §11), parallel to columns.
+          arrayValue(idx.keys.map((_, i) => boolValue(indexKeyOrder(idx, i).desc))),
+          arrayValue(idx.keys.map((_, i) => boolValue(indexKeyOrder(idx, i).nullsFirst))),
         ]);
       }
     }
@@ -23899,6 +23910,9 @@ export type IndexKeySet = {
   nameKey: string;
   tuple: TupleMember[];
   slots: KeySlot[];
+  // orders is every key column's sort order (indexes.md §11), parallel to slots: a member's points
+  // are its §2.16 present slots.
+  orders: KeyOrder[];
   allFixed: boolean;
 };
 
@@ -24005,13 +24019,25 @@ export type GinBound = {
 // equality const-source bound to it. At exec time the sources must agree on one value (else the bound
 // is provably empty). A collated column encodes its probe via the UCA sort key (encoding.md §2.12) to
 // match the index's stored key form (collation.md §8).
-export type IndexEqCol = { colType: ScalarType; coll: Collation | null; srcs: RExpr[] };
+// order is the key element's sort order (indexes.md §11): the probe slot is its §2.16 present slot.
+export type IndexEqCol = {
+  colType: ScalarType;
+  coll: Collation | null;
+  srcs: RExpr[];
+  order: KeyOrder;
+};
 
 // IndexRange is the optional trailing range of an index access predicate (indexes.md §5.1): a range
 // on the key column immediately after the equality prefix. A collated text column (coll non-null)
 // encodes its endpoints as the column collation's UCA sort key, the stored key form (encoding.md
 // §2.12).
-export type IndexRange = { colType: ScalarType; coll: Collation | null; terms: BoundTerm[] };
+// order is the range element's sort order (indexes.md §11): a DESC element swaps the byte endpoints.
+export type IndexRange = {
+  colType: ScalarType;
+  coll: Collation | null;
+  terms: BoundTerm[];
+  order: KeyOrder;
+};
 
 // KeySlot is how one index key component's nullable slot is skipped to recover an entry's
 // storage-key suffix (indexes.md §5.1, encoding.md §2.2): every scalar key encoding is
@@ -24019,11 +24045,22 @@ export type IndexRange = { colType: ScalarType; coll: Collation | null; terms: B
 // (the integers, bool, uuid, date, timestamps, floats, interval's 16 bytes); "terminated" is
 // text-/bytea-terminated-escape (encoding.md §2.4/§2.6); "decimal" is decimal-order-preserving
 // (§2.5); "collated" is text-collated-sortkey (§2.12).
-export type KeySlot =
+//
+// order is the key element's sort order (indexes.md §11, encoding.md §2.16; absent = ASC NULLS LAST):
+// it picks the slot's NULL tag, and a DESC slot's body is the one's complement of the ASC body,
+// which the skip reads through an XOR mask (inversion keeps every body self-delimiting — the
+// no-prefix property, spec/encoding/ordered.toml).
+export type KeySlot = (
   | { kind: "fixed"; width: number }
   | { kind: "terminated" }
   | { kind: "decimal" }
-  | { kind: "collated" };
+  | { kind: "collated" }
+) & { readonly order?: KeyOrder };
+
+// keySlotWithOrder is slot under the key element's sort order.
+export function keySlotWithOrder(slot: KeySlot, order: KeyOrder): KeySlot {
+  return keyOrderIsDefault(order) ? slot : { ...slot, order };
+}
 
 const KEY_SLOT_TERMINATED: KeySlot = { kind: "terminated" };
 const KEY_SLOT_DECIMAL: KeySlot = { kind: "decimal" };
@@ -24051,14 +24088,15 @@ export function keySlotForScalar(ty: ScalarType, collated: boolean): KeySlot | n
 }
 
 // terminatedLen is the length of a `*-terminated-escape` body starting at key[from] (`0x00 0xFF` an
-// escaped NUL, `0x00 0x01` the end); null when truncated.
-function terminatedLen(key: Uint8Array, from: number): number | null {
+// escaped NUL, `0x00 0x01` the end), each byte read as b ^ m (m = 0xFF for a DESC slot's inverted
+// body); null when truncated.
+function terminatedLen(key: Uint8Array, from: number, m: number): number | null {
   let i = from;
   for (;;) {
     if (i >= key.length) return null;
-    if (key[i] === 0x00) {
+    if ((key[i]! ^ m) === 0x00) {
       if (i + 1 >= key.length) return null;
-      if (key[i + 1] === 0x01) return i + 2 - from;
+      if ((key[i + 1]! ^ m) === 0x01) return i + 2 - from;
       i += 2;
     } else {
       i++;
@@ -24067,11 +24105,15 @@ function terminatedLen(key: Uint8Array, from: number): number | null {
 }
 
 // keySlotLen is the byte length of the nullable slot starting at key[at] (its tag included): 1 for
-// the 0x01 NULL tag, else 1 + the self-delimited body. null for a malformed (truncated) slot.
+// the order's NULL tag, else 1 + the self-delimited body (inverted under DESC). null for a malformed
+// (truncated) slot.
 export function keySlotLen(slot: KeySlot, key: Uint8Array, at: number): number | null {
   if (at >= key.length) return null;
-  if (key[at] === 0x01) return 1;
+  const order = slot.order ?? KEY_ORDER_ASC;
+  if (key[at] === keyOrderNullTag(order)) return 1;
   const body = at + 1;
+  // m un-inverts a DESC body byte (b ^ m is the ASC byte).
+  const m = order.desc ? 0xff : 0x00;
   let n: number;
   switch (slot.kind) {
     case "fixed":
@@ -24079,14 +24121,14 @@ export function keySlotLen(slot: KeySlot, key: Uint8Array, at: number): number |
       n = slot.width;
       break;
     case "terminated": {
-      const t = terminatedLen(key, body);
+      const t = terminatedLen(key, body, m);
       if (t === null) return null;
       n = t;
       break;
     }
     case "decimal": {
       if (body >= key.length) return null;
-      const cls = key[body]!;
+      const cls = key[body]! ^ m;
       if (cls === 0x04) {
         n = 1;
       } else if (cls === 0x03 || cls === 0x05) {
@@ -24096,7 +24138,7 @@ export function keySlotLen(slot: KeySlot, key: Uint8Array, at: number): number |
         if (rest > key.length) return null;
         let pos = -1;
         for (let i = rest; i < key.length; i++) {
-          if (key[i] === term) {
+          if ((key[i]! ^ m) === term) {
             pos = i - rest;
             break;
           }
@@ -24115,11 +24157,11 @@ export function keySlotLen(slot: KeySlot, key: Uint8Array, at: number): number |
       let seps = 0;
       while (seps < 3) {
         if (body + i + 2 > key.length) return null;
-        const zero = key[body + i] === 0 && key[body + i + 1] === 0;
+        const zero = (key[body + i]! ^ m) === 0 && (key[body + i + 1]! ^ m) === 0;
         i += 2;
         if (zero) seps++;
       }
-      const t = terminatedLen(key, body + i);
+      const t = terminatedLen(key, body + i, m);
       if (t === null) return null;
       n = i + t;
       break;
@@ -24203,7 +24245,9 @@ export function buildIndexAccessPredicate(
   // comparison on this relation's key, so its WHERE conjunct rejects a NULL-extended row.)
   const eqCols: IndexEqCol[] = [];
   let range: IndexRange | null = null;
-  for (const key of rindex.keys) {
+  for (let ki = 0; ki < rindex.keys.length; ki++) {
+    const key = rindex.keys[ki]!;
+    const order = rindex.orders[ki]!;
     // Each key element yields (its scalar key type, its key collation, the matcher against a WHERE
     // conjunct operand). A non-scalar / skewed element stops the prefix.
     let ty: ScalarType;
@@ -24248,10 +24292,10 @@ export function buildIndexAccessPredicate(
     };
     walk(filter);
     if (eqs.length > 0) {
-      eqCols.push({ colType: ty, coll, srcs: eqs });
+      eqCols.push({ colType: ty, coll, srcs: eqs, order });
       continue; // extend the equality prefix
     }
-    if (ranges.length > 0) range = { colType: ty, coll, terms: ranges };
+    if (ranges.length > 0) range = { colType: ty, coll, terms: ranges, order };
     break; // first non-equality element ends the prefix (with or without a trailing range)
   }
   if (eqCols.length === 0 && range === null) return null; // nothing bound
@@ -24270,7 +24314,8 @@ export function indexSuffixSlots(
   from: number,
 ): KeySlot[] | null {
   const suffix: KeySlot[] = [];
-  for (const key of rindex.keys.slice(from)) {
+  for (let ki = from; ki < rindex.keys.length; ki++) {
+    const key = rindex.keys[ki]!;
     let slot: KeySlot | null;
     if (key.kind === "column") {
       const col = rel.table.columns[key.column]!;
@@ -24283,7 +24328,8 @@ export function indexSuffixSlots(
       slot = keySlotForScalar(s, key.coll !== null);
     }
     if (slot === null) return null;
-    suffix.push(slot);
+    // The slot reads the element's own NULL tag and (DESC) inverted body (indexes.md §11).
+    suffix.push(keySlotWithOrder(slot, rindex.orders[ki] ?? KEY_ORDER_ASC));
   }
   return suffix;
 }
@@ -26751,9 +26797,10 @@ function buildIndexIntervalSetPlanConjuncts(
     if (i >= t && slot === null) return null;
     const ty = typeAsScalar(rel.table.columns[cols[i]!]!.type);
     allFixed = allFixed && ty !== undefined && isFixedWidth(ty);
-    slots.push(slot ?? { kind: "fixed", width: 0 });
+    slots.push(keySlotWithOrder(slot ?? { kind: "fixed", width: 0 }, indexKeyOrder(idx, i)));
   }
-  return { nameKey: idx.name, tuple, slots, allFixed };
+  const orders = cols.map((_, i) => indexKeyOrder(idx, i));
+  return { nameKey: idx.name, tuple, slots, orders, allFixed };
 }
 
 // Find the first top-level conjunct that is a pure OR of same-key intervals. Other direct same-key
@@ -27336,15 +27383,15 @@ export function inventoryINLCandidates(
     // Every trailing column is skipped by its self-delimiting slot (indexes.md §5.1).
     const suffix: KeySlot[] = [];
     let skippable = true;
-    for (const c of cols.slice(1)) {
-      const col = rel.table.columns[c]!;
+    for (let j = 1; j < cols.length; j++) {
+      const col = rel.table.columns[cols[j]!]!;
       const ts = typeAsScalar(col.type);
       const slot = ts === undefined ? null : keySlotForScalar(ts, col.collation !== null);
       if (slot === null) {
         skippable = false;
         break;
       }
-      suffix.push(slot);
+      suffix.push(keySlotWithOrder(slot, indexKeyOrder(idx, j)));
     }
     if (!skippable) continue;
     const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
@@ -27367,7 +27414,7 @@ export function inventoryINLCandidates(
         kind: "index",
         index: {
           nameKey: idx.name,
-          eqCols: [{ colType: ty, coll: ctx.coll, srcs: eqs }],
+          eqCols: [{ colType: ty, coll: ctx.coll, srcs: eqs, order: indexKeyOrder(idx, 0) }],
           range: null,
           suffix,
         },
@@ -27584,9 +27631,8 @@ export type IndexOrder = { nameKey: string; pkWidth: number };
 // The index store holds its entries in (indexed columns, storage key) order, so a forward walk
 // delivers rows in ORDER BY <indexed columns> ASC NULLS LAST order, ties broken by the PK — exactly
 // the eager stable sort's tie-break. Returns non-null iff the ORDER BY keys are EXACTLY a B-tree
-// index's columns (same count, same columns in key order), each ASC with default NULLS LAST (the
-// index stores NULL as 0x01 after a present 0x00 → NULLS LAST; an explicit NULLS FIRST does not
-// match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
+// index's columns (same count, same columns in key order), each with the direction and NULL
+// placement the index element declares (indexes.md §11, encoding.md §2.16) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
 // the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
 // multi-column index would tie-break by the remaining index columns, not the PK.
 export function orderSatisfiedByIndexes(
@@ -27618,8 +27664,11 @@ export function orderSatisfiedByIndexes(
     let matches = true;
     for (let i = 0; i < order.length; i++) {
       const o = order[i]!;
-      if (o.descending || o.nullsFirst) {
-        matches = false; // ASC + NULLS LAST only — the order a forward index walk realizes
+      // A forward walk realizes each key element's declared order (indexes.md §11): the ORDER BY
+      // key's direction and effective NULL placement must both match.
+      const ko = indexKeyOrder(idx, i);
+      if (o.descending !== ko.desc || o.nullsFirst !== ko.nullsFirst) {
+        matches = false;
         break;
       }
       if (o.idx !== offset + cols[i]!) {
@@ -28053,6 +28102,9 @@ export type ResolvedIndex = {
   unique: boolean;
   kind: "btree" | "gin" | "gist";
   keys: ResolvedKey[];
+  // orders is each key element's sort order (indexes.md §11), parallel to keys (always full length
+  // here): the entry slot of element i is the encoding.md §2.16 ordered slot under orders[i].
+  orders: KeyOrder[];
   // predicate is a PARTIAL index's resolved WHERE predicate (spec/design/indexes.md §9): evaluated
   // against each row (unmetered, like a key expression), a row is indexed / constrained ONLY when it
   // is TRUE. undefined for an ordinary (full) index — every row is indexed.
@@ -28154,15 +28206,12 @@ export function indexEntryKey(
   env: EvalEnv,
 ): Uint8Array {
   const parts: Uint8Array[] = [];
-  for (const key of rindex.keys) {
-    const b = indexSlotKey(key, colTypes, colls, row, env);
-    if (b === null) {
-      parts.push(Uint8Array.of(0x01));
-    } else {
-      // present tag, then the slot's order-preserving key (range-aware §2.11, composite §2.15,
-      // collated-text-aware §2.12)
-      parts.push(Uint8Array.of(0x00), b);
-    }
+  for (let i = 0; i < rindex.keys.length; i++) {
+    // The §2.16 ordered slot: the order's presence tag + the slot's order-preserving key
+    // (range-aware §2.11, composite §2.15, collated-text-aware §2.12), inverted for DESC — or the
+    // order's NULL byte.
+    const b = indexSlotKey(rindex.keys[i]!, colTypes, colls, row, env);
+    keyOrderPushSlot(parts, rindex.orders[i]!, b);
   }
   parts.push(storageKey);
   return concatBytes(parts);
@@ -28220,10 +28269,14 @@ export function indexEntryKeysColumns(
   if (def.kind === "gin") return ginEntries(columns, cols, storageKey, row);
   if (def.kind === "gist") return gistEntries(columns, cols, storageKey, row);
   const parts: Uint8Array[] = [];
-  for (const ci of cols) {
+  for (let i = 0; i < cols.length; i++) {
+    const ci = cols[i]!;
     const v = row[ci]!;
-    if (v.kind === "null") parts.push(Uint8Array.of(0x01));
-    else parts.push(Uint8Array.of(0x00), encodeColTypeKey(colTypes[ci]!, v, colls[ci]!));
+    keyOrderPushSlot(
+      parts,
+      indexKeyOrder(def, i),
+      v.kind === "null" ? null : encodeColTypeKey(colTypes[ci]!, v, colls[ci]!),
+    );
   }
   parts.push(storageKey);
   return [concatBytes(parts)];
@@ -29059,12 +29112,11 @@ export function indexPrefixKey(
   // exempt from uniqueness, exactly like a NULL-bearing prefix (returns null).
   if (!indexRowQualifies(rindex, row, env)) return null;
   const parts: Uint8Array[] = [];
-  for (const key of rindex.keys) {
-    const b = indexSlotKey(key, colTypes, colls, row, env);
+  for (let i = 0; i < rindex.keys.length; i++) {
+    const b = indexSlotKey(rindex.keys[i]!, colTypes, colls, row, env);
     if (b === null) return null; // NULLS DISTINCT: a NULL slot never conflicts
-    // present tag, then the slot's order-preserving key (range-aware §2.11, composite §2.15,
-    // collated-text-aware §2.12)
-    parts.push(Uint8Array.of(0x00), b);
+    // the order's present slot (§2.16) — the same bytes the entry key carries
+    keyOrderPushPresent(parts, rindex.orders[i]!, b);
   }
   return concatBytes(parts);
 }
@@ -29073,8 +29125,9 @@ export function indexPrefixKey(
 // (spec/design/constraints.md §6.5): the child's PK (index === null) or a plain-column ordered
 // B-tree secondary index (index = its exact name); null from fkChooseReversePath is the
 // full-scan fallback. cols are the leading child key columns, in key order, whose set is exactly
-// the FK's local columns.
-type FkReversePath = { index: string | null; cols: number[] };
+// the FK's local columns. orders is the index's sort order of each leading column (indexes.md §11;
+// empty for the PK path).
+type FkReversePath = { index: string | null; cols: number[]; orders: KeyOrder[] };
 
 // fkReverseKeyUsable reports whether `leading` — the first fk.columns.length key columns of a child
 // tree — can serve fk's reverse match: the same column set as the FK's local columns, and every
@@ -29124,7 +29177,7 @@ function fkChooseReversePath(
 ): FkReversePath | null {
   const k = fk.columns.length;
   if (child.pk.length >= k && fkReverseKeyUsable(snap, fk, child, parent, child.pk.slice(0, k))) {
-    return { index: null, cols: child.pk.slice(0, k) };
+    return { index: null, cols: child.pk.slice(0, k), orders: [] };
   }
   let best: FkReversePath | null = null;
   for (const ix of child.indexes) {
@@ -29142,7 +29195,11 @@ function fkChooseReversePath(
       continue;
     }
     const name = ix.name;
-    if (best === null || compareTextC(name, best.index!) < 0) best = { index: name, cols: leading };
+    if (best === null || compareTextC(name, best.index!) < 0) {
+      const orders: KeyOrder[] = [];
+      for (let i = 0; i < k; i++) orders.push(indexKeyOrder(ix, i));
+      best = { index: name, cols: leading, orders };
+    }
   }
   return best;
 }
@@ -29505,8 +29562,8 @@ export function typeIsArrayKeyable(t: Type): boolean {
 
 // FkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
 // up in the parent, tagged with which physical tree to probe — the parent's PK store (bare member
-// encodings concatenated, in PK key order) or a parent unique index's prefix (0x00-tagged slots,
-// in index-key order, plus the exact index name). A discriminated union (the TS idiom), with
+// encodings concatenated, in PK key order) or a parent unique index's prefix (§2.16 ordered present
+// slots, in index-key order, plus the exact index name). A discriminated union (the TS idiom), with
 // fkProbeBytes returning the raw bytes for batch-membership comparison.
 export type FkProbe =
   | { kind: "pk"; bytes: Uint8Array }
@@ -29567,9 +29624,11 @@ export function fkProbe(
   })!;
   const idxCols = indexColumnOrdinals(idx)!; // an FK target is a plain-column unique index
   const parts: Uint8Array[] = [];
-  for (const pcol of idxCols) {
-    parts.push(Uint8Array.of(0x00));
-    parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!));
+  for (let i = 0; i < idxCols.length; i++) {
+    const pcol = idxCols[i]!;
+    // The parent index's §2.16 ordered present slot (a DESC key inverts its body).
+    const body = encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!);
+    keyOrderPushPresent(parts, indexKeyOrder(idx, i), body);
   }
   return {
     kind: "unique",
@@ -30106,9 +30165,10 @@ export function buildCompletePkPoint(
 }
 
 // buildIndexBound turns an index access predicate into a concrete index-key range at exec time
-// (indexes.md §5.1). It encodes the equality prefix into p (the concatenated present slots), then — if
-// there is a range column — starts from [P, P‖0x01) (the upper endpoint stops before the range
-// column's NULL slot, since a range is never true for NULL) and intersects each range term; otherwise
+// (indexes.md §5.1). It encodes the equality prefix into p (the concatenated §2.16 present slots),
+// then — if there is a range column — intersects each range term into a logical interval mapped into
+// the range column's present region under its order (indexes.md §11; the order's NULL byte sits
+// outside it, since a range is never true for NULL); otherwise
 // the range is [P, byte-successor(P)) (every entry extending P). null ⇒ the bound admits no key (a
 // NULL / disagreeing prefix equality, a NULL range endpoint, or a contradictory range). prefixLen =
 // p.length, the byte count the row-key suffix skip advances past the equality-prefix slots before
@@ -30131,8 +30191,8 @@ export function buildIndexBound(
       if (agreed === null) agreed = bk.key;
       else if (!bytesEq(agreed, bk.key)) return null;
     }
-    parts.push(new Uint8Array([0x00]));
-    parts.push(agreed!);
+    // The column's §2.16 present slot (a DESC key inverts its body).
+    keyOrderPushPresent(parts, ec.order, agreed!);
   }
   const p = concatBytes(parts);
   if (ib.range === null) {
@@ -30140,42 +30200,34 @@ export function buildIndexBound(
     const b: KeyBound = { lo: p, loInc: true, hi: prefixSuccessor(p), hiInc: false };
     return boundEmpty(b) ? null : { bound: b, prefixLen: p.length };
   }
-  // Equality prefix P + a range on the next column. Base: [P, P‖0x01) — present values only (the 0x01
-  // NULL tag sorts after every 0x00 present slot at this position).
-  const b: KeyBound = {
-    lo: p,
-    loInc: true,
-    hi: concatBytes([p, new Uint8Array([0x01])]),
-    hiInc: false,
-  };
+  // Equality prefix P + a range on the next column: the present region of that column's slot
+  // [P‖tag, P‖tag+1) (the order's NULL byte sits outside it — a range is never true for NULL),
+  // tightened by each term's logical interval mapped through the column's order (§2.16; a DESC
+  // column swaps the byte endpoints).
+  const logical = unboundedBound();
   for (const t of ib.range.terms) {
     // A collated range column's probe is the collation's sort key (the stored key form).
     const bk = encodeBoundKey(ib.range.colType, t.src, params, outer, ib.range.coll, left);
     if (bk.kind === "null") return null;
     if (bk.kind === "outOfRange") continue; // drop this half-bound (a wider, still-sound scan)
-    const ps = concatBytes([p, new Uint8Array([0x00]), bk.key]); // P ‖ 0x00 ‖ encode(v)
     switch (t.op) {
       case "ge":
-        intersectLo(b, ps, true);
+        intersectLo(logical, bk.key, true);
         break;
-      case "gt": {
-        // `>` skips the whole `c = v` subtree: the smallest key after every P‖0x00‖v‖* entry.
-        const s = prefixSuccessor(ps);
-        if (s === null) return null; // no key exceeds max — empty (unreachable: ps starts 0x00)
-        intersectLo(b, s, true);
+      case "gt":
+        intersectLo(logical, bk.key, false);
         break;
-      }
       case "lt":
-        intersectHi(b, ps, false);
+        intersectHi(logical, bk.key, false);
         break;
-      case "le": {
-        const s = prefixSuccessor(ps);
-        if (s !== null) intersectHi(b, s, false); // null ⇒ everything ≤ max, keep the base hi (P‖0x01)
+      case "le":
+        intersectHi(logical, bk.key, true);
         break;
-      }
       // "eq" never reaches range terms (folded into the equality prefix); "ne" never a bound term.
     }
   }
+  if (boundEmpty(logical)) return null;
+  const b = prefixedInterval(p, indexLogicalInterval(logical, ib.range.order));
   return boundEmpty(b) ? null : { bound: b, prefixLen: p.length };
 }
 
@@ -30479,13 +30531,14 @@ function finalMemberIntervals(m: TupleMember, params: Value[], outer: Row[], lef
 }
 
 // expandTuplePrefixes evaluates a tuple set's members in key order (cost.md §3): the cartesian
-// product of the point members' keys, each preceded by tag, as prefixes in byte order, and the final
+// product of the point members' keys — bare for a PK (orders = null), each member's §2.16 present slot
+// under its orders[i] for an index — as prefixes in byte order, and the final
 // member's canonical logical intervals when it is consumed. A later member with more than one point
 // that would take the running product over MAX_KEY_SET_PROBES ends the walk unconsumed. An empty
 // member empties the set: null.
 function expandTuplePrefixes(
   tuple: TupleMember[],
-  tag: Uint8Array,
+  orders: KeyOrder[] | null,
   params: Value[],
   outer: Row[],
   left: Row,
@@ -30511,9 +30564,17 @@ function expandTuplePrefixes(
       hasFinal = true;
       break;
     }
+    // An index member's points become its ordered slots, re-sorted into physical byte order (a DESC
+    // member's inverted bodies reverse the logical order).
+    let slots = points;
+    if (orders !== null) {
+      const o = orders[i]!;
+      slots = points.map((k) => keyOrderPresentSlot(o, k));
+      slots.sort(compareBytes);
+    }
     const next: Uint8Array[] = [];
     for (const p of prefixes) {
-      for (const k of points) next.push(concatBytes([p, tag, k]));
+      for (const k of slots) next.push(concatBytes([p, k]));
     }
     prefixes = next;
   }
@@ -30523,7 +30584,7 @@ function expandTuplePrefixes(
 // tupleIntervalSet resolves a composite-PK tuple set (cost.md §3): each prefix a tuple point, a
 // prefix range, or the final member's intervals under it, then canonicalized.
 function tupleIntervalSet(ks: PkKeySet, params: Value[], outer: Row[], left: Row): KeyBound[] {
-  const expanded = expandTuplePrefixes(ks.tuple!, new Uint8Array(0), params, outer, left);
+  const expanded = expandTuplePrefixes(ks.tuple!, null, params, outer, left);
   if (expanded === null) return [];
   const { prefixes, finalIntervals, consumed, hasFinal } = expanded;
   const complete = consumed === ks.memberCount && !hasFinal;
@@ -30564,7 +30625,7 @@ function indexKeySetProbes(
   outer: Row[],
   left: Row,
 ): IndexProbe[] {
-  const expanded = expandTuplePrefixes(ks.tuple, new Uint8Array([0x00]), params, outer, left);
+  const expanded = expandTuplePrefixes(ks.tuple, ks.orders, params, outer, left);
   if (expanded === null) return [];
   const { prefixes, finalIntervals, consumed, hasFinal } = expanded;
   const out: IndexProbe[] = [];
@@ -30578,17 +30639,15 @@ function indexKeySetProbes(
       continue;
     }
     for (const iv of finalIntervals) {
-      const phys = indexLogicalInterval(iv);
-      const b: KeyBound = {
-        lo: phys.lo === null ? null : concatBytes([p, phys.lo]),
-        loInc: phys.loInc,
-        hi: phys.hi === null ? null : concatBytes([p, phys.hi]),
-        hiInc: phys.hiInc,
-      };
+      const phys = indexLogicalInterval(iv, ks.orders[consumed - 1]!);
+      const b = prefixedInterval(p, phys);
       if (!boundEmpty(b))
         out.push({ bound: b, prefixLen: p.length, suffix: ks.slots.slice(consumed - 1) });
     }
   }
+  // The probes are disjoint; a DESC final member emits its intervals in reverse physical order, so
+  // order them by their lower endpoint — the index-key order the walk must follow.
+  out.sort((a, b) => compareLoEndpoint(a.bound.lo, b.bound.lo));
   if (!ks.allFixed || out.length < 2) return out;
   // Every slot is fixed-width, so the merged intervals recover their suffix by width from the key's
   // start.
@@ -30598,28 +30657,63 @@ function indexKeySetProbes(
   ).map((bound) => ({ bound, prefixLen: 0, suffix: ks.slots }));
 }
 
-export function indexLogicalInterval(logical: KeyBound): KeyBound {
+
+// compareLoEndpoint orders two lower endpoints, an unbounded (null) one first — Option<Vec<u8>>
+// ordering (None < Some).
+function compareLoEndpoint(a: Uint8Array | null, b: Uint8Array | null): number {
+  if (a === null) return b === null ? 0 : -1;
+  if (b === null) return 1;
+  return compareBytes(a, b);
+}
+
+// prefixedInterval places a one-slot physical interval (indexLogicalInterval) under the encoded
+// prefix p; an unbounded upper end (the DESC NULLS FIRST present region tops the slot) becomes
+// succ(p).
+export function prefixedInterval(p: Uint8Array, phys: KeyBound): KeyBound {
+  return {
+    lo: phys.lo !== null ? concatBytes([p, phys.lo]) : p.slice(),
+    loInc: phys.lo === null || phys.loInc,
+    hi: phys.hi !== null ? concatBytes([p, phys.hi]) : prefixSuccessor(p),
+    hiInc: phys.hi !== null && phys.hiInc,
+  };
+}
+
+// indexLogicalInterval maps one key element's LOGICAL interval (bare order-preserving key bytes,
+// ascending) to its physical slot interval under order (encoding.md §2.16): the present region
+// [tag, tag+1) of the slot, tightened by the logical bounds. An ascending order keeps the endpoints
+// (v ↦ tag‖v); a DESC order inverts each body, which reverses memcmp order over the prefix-free key
+// bodies, so the logical lower bound becomes the physical upper bound and vice versa — `≥ v` ↦
+// `< succ(tag‖~v)`, `> v` ↦ `< tag‖~v`, `< v` ↦ `≥ succ(tag‖~v)`, `≤ v` ↦ `≥ tag‖~v`. The result is
+// half-open (lo inclusive, hi exclusive) whenever both ends are bounded.
+export function indexLogicalInterval(logical: KeyBound, order: KeyOrder): KeyBound {
+  const tag = keyOrderPresentTag(order);
   const b: KeyBound = {
-    lo: new Uint8Array([0x00]),
+    lo: Uint8Array.of(tag),
     loInc: true,
-    hi: new Uint8Array([0x01]),
+    hi: prefixSuccessor(Uint8Array.of(tag)),
     hiInc: false,
   };
-  if (logical.lo !== null) {
-    const p = concatBytes([new Uint8Array([0x00]), logical.lo]);
-    if (logical.loInc) intersectLo(b, p, true);
-    else {
-      const next = prefixSuccessor(p);
+  const tighten = (key: Uint8Array, logicalLo: boolean, inc: boolean): void => {
+    const slot = keyOrderPresentSlot(order, key);
+    // An ascending order keeps the side; DESC flips it.
+    const physLo = logicalLo !== order.desc;
+    // Inclusive lower bound slot, exclusive upper bound slot or succ(slot).
+    if (physLo && inc) intersectLo(b, slot, true);
+    else if (physLo) {
+      const next = prefixSuccessor(slot);
       if (next !== null) intersectLo(b, next, true);
-    }
-  }
-  if (logical.hi !== null) {
-    const p = concatBytes([new Uint8Array([0x00]), logical.hi]);
-    if (logical.hiInc) {
-      const next = prefixSuccessor(p);
+      else {
+        b.lo = slot;
+        b.hi = slot.slice();
+        b.hiInc = false;
+      }
+    } else if (inc) {
+      const next = prefixSuccessor(slot);
       if (next !== null) intersectHi(b, next, false);
-    } else intersectHi(b, p, false);
-  }
+    } else intersectHi(b, slot, false);
+  };
+  if (logical.lo !== null) tighten(logical.lo, true, logical.loInc);
+  if (logical.hi !== null) tighten(logical.hi, false, logical.hiInc);
   return b;
 }
 
@@ -33342,6 +33436,10 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("method", "text", true),
         // A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
         col("predicate", "text", false),
+        // Per key element, parallel to columns: whether it is DESC, and whether its NULLs sort first
+        // (indexes.md §11 — PostgreSQL's pg_index.indoption bits).
+        mkCol("descending", arrayT(scalarT("boolean")), true),
+        mkCol("nulls_first", arrayT(scalarT("boolean")), true),
       ]);
     case "jed_constraints":
       return table("jed_constraints", [

@@ -639,6 +639,16 @@ test('the indexes page runs the full partial-index walk live', async ({ page }) 
   await expect(panel.getByTestId('result-rows')).not.toContainText('triage');
 });
 
+test('the indexes page runs the DESC index leaderboard live', async ({ page }) => {
+  await page.goto('/docs/sql/indexes/');
+  // ORDER BY points DESC walks score_points (points DESC): the NULL score sorts first, then 98, 90.
+  const panel = livePanel(page, 'sortQuery');
+  await expect(panel.getByTestId('result-rows')).toContainText('grace');
+  await expect(panel.getByTestId('result-rows')).toContainText('barb');
+  await expect(panel.getByTestId('result-rows')).toContainText('ada');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('linus');
+});
+
 test('the indexes page runs the GIN @> contains scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
   // The GIN containment scan: tags @> ARRAY[10,20] → intro and gin (both hold

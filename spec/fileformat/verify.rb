@@ -27,7 +27,10 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 45 # v45: exclusion-constraint follow-ons (gist.md §7.1/§7.2) — no byte layout change; the
+VERSION = 46 # v46: ordered index keys — index_flags bit4 has_key_options; when set, one option byte
+# per key element (bit0 desc, bit1 nulls_first) follows the optional timezone dependencies, and the
+# element's entry slots use the encoding.md §2.16 ordered slot (indexes.md §11). No other change.
+# v45: exclusion-constraint follow-ons (gist.md §7.1/§7.2) — no byte layout change; the
 # v27 has_predicate bit is legal on a GiST index backing an exclusion (EXCLUDE … WHERE (predicate)),
 # and an exclusion may name a non-unique ordered (btree) backing index whose operators are all `=`
 # (EXCLUDE USING btree). A fixture index's `where:` lambda mirrors its predicate (this reference does
@@ -907,6 +910,29 @@ EXPR_INDEX_TABLE = {
 #   CREATE INDEX ON t (amt) WHERE status = 'active';
 #   CREATE UNIQUE INDEX t_uact ON t (amt) WHERE status = 'active';
 #   CREATE INDEX ON t (status);
+# A table with ORDERED index keys (v46 — indexes.md §11, encoding.md §2.16): pins index_flags bit4 +
+# the per-element option bytes and the ordered entry slots. `t_v_desc` is DESC (NULLS FIRST by
+# default: present tag 0xFF + the inverted body, NULL 0xFE) over a variable-width text column — the
+# inversion of a terminated body; `t_n_nf` is ASC NULLS FIRST (NULL 0x00, present 0x01 + the body);
+# `t_mix` mixes DESC NULLS LAST (present 0xFE + inverted body, NULL 0xFF) on a decimal with a
+# default ASC element (the option list still names it); `t_plain` is an ordinary index beside them
+# (no option bytes). The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, v text, n i32, d decimal)
+#   CREATE INDEX t_v_desc ON t (v DESC);  CREATE INDEX t_n_nf ON t (n NULLS FIRST)
+#   CREATE UNIQUE INDEX t_mix ON t (d DESC NULLS LAST, n);  CREATE INDEX t_plain ON t (n)
+#   INSERT (1, 'b', 10, 1.5); (2, NULL, NULL, NULL); (3, 'a', 20, -2); (4, 'ab', NULL, 100)
+ORDERED_INDEX_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("v", "text"), col("n", "i32"), col("d", "decimal")],
+  indexes: [
+    { name: "t_mix", cols: [3, 2], unique: true, orders: %i[desc_nulls_last asc] },
+    { name: "t_n_nf", cols: [2], orders: [:asc_nulls_first] },
+    { name: "t_plain", cols: [2] },
+    { name: "t_v_desc", cols: [1], orders: [:desc] }
+  ],
+  rows: [[1, "b", 10, "1.5"], [2, nil, nil, nil], [3, "a", 20, "-2"], [4, "ab", nil, "100"]]
+}.freeze
+
 PARTIAL_INDEX_TABLE = {
   name: "t",
   columns: [col("id", "i32", pk: true), col("status", "text"), col("amt", "i32")],
@@ -1768,6 +1794,7 @@ FIXTURES = ([
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
   { file: "expr_index_table.jed", page_size: 256, tables: [EXPR_INDEX_TABLE] },
   { file: "partial_index_table.jed", page_size: 256, tables: [PARTIAL_INDEX_TABLE] },
+  { file: "ordered_index_table.jed", page_size: 256, tables: [ORDERED_INDEX_TABLE] },
   { file: "timezone_index_table.jed", page_size: 256, tables: [TIMEZONE_INDEX_TABLE] },
   { file: "hostfunc_index_table.jed", page_size: 256, tables: [HOSTFUNC_INDEX_TABLE] },
   { file: "hostfunc_check_table.jed", page_size: 256, tables: [HOSTFUNC_CHECK_TABLE] },
@@ -2483,7 +2510,10 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
     host_deps = ix[:host_deps] || []
     timezone_deps = ix[:timezone_deps]
     has_timezone_deps = timezone_deps && (timezone_deps[:dynamic] || !timezone_deps[:zones].empty?)
-    out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0) | (host_deps.empty? ? 0 : 4) | (has_timezone_deps ? 8 : 0)].pack("C")
+    orders = index_orders(ix)
+    has_key_options = orders.any? { |o| o != [false, false] }
+    out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0) | (host_deps.empty? ? 0 : 4) | (has_timezone_deps ? 8 : 0) |
+            (has_key_options ? 16 : 0)].pack("C")
 
     # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
     out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
@@ -2501,6 +2531,8 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
         out << u32(dep[:checksum])
       end
     end
+    # v46: one key-option byte per element (bit0 desc, bit1 nulls_first) — only when bit4 is set.
+    orders.each { |desc, nf| out << [(desc ? 1 : 0) | (nf ? 2 : 0)].pack("C") } if has_key_options
   end
   # Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS table,
   # list order), the referenced table name, the referenced-column ordinals (into the PARENT
@@ -2825,14 +2857,32 @@ end
 # A secondary-index entry key (indexes.md §3): each indexed column as the encoding.md §2.2
 # NULLABLE SLOT (0x00 + bare order-preserving bytes when present, the lone 0x01 for NULL —
 # always tagged, even for a NOT NULL column), then the row's storage key as the suffix.
+# An index's per-element [desc, nulls_first] orders (indexes.md §11): a fixture's `orders:` list of
+# :asc / :desc / :asc_nulls_first / :desc_nulls_last symbols, default ASC NULLS LAST everywhere.
+ORDER_SYMBOLS = { asc: [false, false], asc_nulls_first: [false, true],
+                  desc: [true, true], desc_nulls_last: [true, false] }.freeze
+
+def index_orders(ix)
+  ix[:cols].each_index.map { |i| ORDER_SYMBOLS.fetch((ix[:orders] || [])[i] || :asc) }
+end
+
+# The encoding.md §2.16 ordered slot tags: [present, null] per [desc, nulls_first].
+def ordered_slot_tags(desc, nulls_first)
+  { [false, false] => [0x00, 0x01], [false, true] => [0x01, 0x00],
+    [true, true] => [0xFF, 0xFE], [true, false] => [0xFE, 0xFF] }.fetch([desc, nulls_first])
+end
+
 def index_entry_key(table, ix, storage_key, row)
   out = +"".b
-  ix[:cols].each do |ci|
+  orders = index_orders(ix)
+  ix[:cols].each_with_index do |ci, i|
+    desc, nulls_first = orders[i]
+    present, null = ordered_slot_tags(desc, nulls_first)
     v = row[ci]
     if v.nil?
-      out << "\x01".b
+      out << [null].pack("C")
     else
-      out << "\x00".b
+      out << [present].pack("C")
       # A fixture may force a non-collation ("C" / byte-order) key encoding for an index over a
       # COLLATE-annotated column via `key_collation: "C"`, to author a version-SKEWED index whose
       # stored order is deliberately WRONG for the loaded collation (the skew read-safety regression
@@ -2840,7 +2890,10 @@ def index_entry_key(table, ix, storage_key, row)
       # column's frozen collation, as every other fixture does.
       coll = ix.key?(:key_collation) ? ix[:key_collation] : table[:columns][ci][:collation]
       coll = nil if coll == "C"
-      out << key_body(table[:columns][ci][:type], v, coll)
+      body = key_body(table[:columns][ci][:type], v, coll)
+      # A DESC element's body is bitwise inverted (§2.16).
+      body = body.bytes.map { |b| b ^ 0xFF }.pack("C*") if desc
+      out << body
     end
   end
   out << storage_key
@@ -4305,7 +4358,7 @@ def decode_table_entry(buf, pos)
     end
     fb, pos = take(buf, pos, 1)
     # bit0 unique (v6), bit1 has_predicate (v27), bit2 has_host_deps (v31 — extensibility.md §8.1).
-    raise "reserved index flag set" if (fb.getbyte(0) & ~0b1111) != 0
+    raise "reserved index flag set" if (fb.getbyte(0) & ~0b1_1111) != 0
     kb, pos = take(buf, pos, 1) # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
     raise "reserved index kind (only 0=btree, 1=gin, 2=gist defined — v20)" if kb.getbyte(0) > 2
     has_predicate = (fb.getbyte(0) & 0b10) != 0
@@ -4342,7 +4395,19 @@ def decode_table_entry(buf, pos)
         timezone_deps[:zones] << { name: dep_name.force_encoding("UTF-8"), version: version.force_encoding("UTF-8"), checksum: cb.unpack1("N") }
       end
     end
-    indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0,
+    # v46: bit4 has_key_options — one option byte per key element after the timezone dependencies.
+    orders = nil
+    if (fb.getbyte(0) & 16) != 0
+      raise "a non-btree index cannot have key options" if kb.getbyte(0) != 0
+      orders = cols.map do
+        ob, pos = take(buf, pos, 1)
+        o = ob.getbyte(0)
+        raise "reserved index key option bit set" if (o & ~0b11) != 0
+        ORDER_SYMBOLS.key([(o & 1) != 0, (o & 2) != 0])
+      end
+      raise "index key options are all default" if orders.all? { |o| o == :asc }
+    end
+    indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, orders: orders,
                  kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
                  root_page: rb.unpack1("N"), predicate: predicate, host_deps: host_deps, timezone_deps: timezone_deps }
   end
@@ -4989,7 +5054,8 @@ def decode_image(image)
               else
                 read_tree_keys(image, ps, ix[:root_page])
               end
-        { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps], entries: raw.map { |k| k.unpack1("H*") } }
+        { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps], orders: ix[:orders],
+          entries: raw.map { |k| k.unpack1("H*") } }
       end
       tables << { name: entry[:name], columns: entry[:columns], pk: entry[:pk],
                   checks: entry[:checks], indexes: indexes, rows: rows }
@@ -5106,11 +5172,13 @@ def expected_tables(fx)
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr], host_deps: ck[:host_deps] || [] } },
       indexes: (t[:indexes] || []).map do |ix|
         if ix[:kind] == "gist"
-          { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps],
+          { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps], orders: nil,
             entries: gist_leaf_keys_sorted(t, ix).map { |k| k.unpack1("H*") } }
         else
           ent = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
-          { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps],
+          # The decoded key options (nil when the index writes none — every element ASC NULLS LAST).
+          orders = index_orders(ix).any? { |o| o != [false, false] } ? index_orders(ix).map { |o| ORDER_SYMBOLS.key(o) } : nil
+          { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps], orders: orders,
             entries: ent.map { |key, _| key.unpack1("H*") } }
         end
       end,

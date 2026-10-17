@@ -757,7 +757,17 @@ export type CreateIndex = {
   // whose predicate is TRUE are indexed. undefined for an ordinary (full) index. It carries the
   // predicate's canonical text + parsed AST the executor re-resolves against the table's columns.
   predicate?: { text: string; expr: Expr };
+  // Each key element's WRITTEN `ASC`/`DESC` + `NULLS FIRST|LAST` options (spec/design/indexes.md
+  // §10), parallel to keys. GIN/GiST reject any written option (0A000), so the parser keeps what was
+  // written, not just the effective order.
+  keyOrders: IndexKeyOrderSpec[];
 };
+
+// IndexKeyOrderSpec is the ordering options written after one CREATE INDEX key element (indexes.md
+// §10): desc is false for `ASC`, true for `DESC`, undefined when omitted; nullsFirst likewise for
+// `NULLS FIRST` / `NULLS LAST`. The effective order defaults by direction (PostgreSQL: DESC ⇒ NULLS
+// FIRST) — indexKeyOrderEffective.
+export type IndexKeyOrderSpec = { desc?: boolean; nullsFirst?: boolean };
 
 // DropIndex is a DROP INDEX <name> statement — remove one secondary index
 // (spec/design/indexes.md §2). Missing → 42704; a table's name → 42809.

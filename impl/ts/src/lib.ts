@@ -1055,6 +1055,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The jed_indexes catalog relation (I2, introspection.md §5.1): one row per secondary index —
   // name, table_name, columns (text[]), is_unique, method (btree/gin/gist).
   "introspect.indexes",
+  // Ordered index keys: per-element ASC/DESC + NULLS FIRST|LAST (spec/design/indexes.md §11).
+  "ddl.index_key_order",
   // The jed_constraints catalog relation (I2): one row per CHECK / UNIQUE / FK / EXCLUDE
   // constraint — name, table_name, type, columns (text[]), expression, ref_table, ref_columns
   // (text[]) (introspection.md §5.1).

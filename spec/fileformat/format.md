@@ -17,7 +17,16 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 45)
+## Version scope (`format_version` 46)
+
+`format_version` **46** — **ordered index keys** ([../design/indexes.md §11](../design/indexes.md)).
+A table entry's per-index `index_flags` byte gains **bit4 `has_key_options`**; when set, one
+`key_option` byte per key element follows the index's optional timezone dependencies — bit0 `desc`,
+bit1 `nulls_first`, bits 2–7 reserved (written 0, `XX001` when set). The bit is B-tree only and the list
+is never all-default (both `XX001`). Element `i`'s entry slots then use the
+[../design/encoding.md §2.16](../design/encoding.md) ordered slot. A file with no ordered index changes
+only by its version byte + meta CRC; the new `ordered_index_table` golden pins the option bytes and the
+ordered entry slots. Readers accept only the exact current version.
 
 `format_version` **45** — **exclusion-constraint follow-ons** ([../design/gist.md §7.1/§7.2/§8](../design/gist.md)).
 No byte layout change. The `index_flags` bit1 `has_predicate` (and the v31/v32 dependency lists after
@@ -833,13 +842,14 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`index_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key **element** (a column or, **v26**, an expression): |
 | &nbsp;&nbsp;`key_element` ×`key_col_count` | per element a `u16` in **index-key order**: a **column ordinal** (`< col_count`; duplicates allowed — indexes.md §1; an out-of-range non-sentinel ordinal is `XX001`), **or** the sentinel **`0xFFFF`** (**new in v26**) marking an **expression key**, immediately followed by a `u16 expr_len` + `expr_len` UTF-8 bytes of the expression's canonical text (*Check-expression text* below). An expression element re-parses at load (kept unparsed on failure — [unparsable-definitions.md](../design/unparsable-definitions.md)) and re-resolves against this table's columns to recover its result type; a plain column index writes no `0xFFFF` and is byte-identical to v6 |
-| &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); **bit1 `has_predicate`** (**new in v27** — a partial index, indexes.md §9; the predicate text follows `index_root_page`); bit2 `has_host_deps` (v31), bit3 `has_timezone_deps` (v32); bits 4–7 reserved, written 0 (a set reserved bit is `XX001`) |
+| &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); **bit1 `has_predicate`** (**new in v27** — a partial index, indexes.md §9; the predicate text follows `index_root_page`); bit2 `has_host_deps` (v31), bit3 `has_timezone_deps` (v32), **bit4 `has_key_options`** (**new in v46** — indexes.md §11; B-tree only); bits 5–7 reserved, written 0 (a set reserved bit is `XX001`) |
 | &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**new in v20** — a persisted R-tree, `index_root_page` points at its root, pages 5/6 above, [../design/gist.md](../design/gist.md)); `3…` reserved. At v20 a value `> 2` is `XX001`. A GIN/GiST index always has `index_flags` bit0 (`unique`) clear. A partial index (`index_flags` bit1) is B-tree, or (**v45**) the GiST index backing a partial exclusion constraint — `has_predicate` set on a GIN index, or on a GiST index no exclusion names, is `XX001` |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
 | &nbsp;&nbsp;`index_pred_len` | u16 — **only present when `index_flags` bit1 (`has_predicate`)** (**new in v27**); written *after* `index_root_page` |
 | &nbsp;&nbsp;`index_pred` | UTF-8 — the partial index's predicate text (*Check-expression text* below), `index_pred_len` bytes; re-parses at load (kept unparsed on failure) and re-resolves against this table's columns (indexes.md §9) |
 | &nbsp;&nbsp;`host_deps` | only when bit2 is set: the v31 dependency list described in Version scope above; follows the optional predicate |
 | &nbsp;&nbsp;`timezone_deps` | only when bit3 is set: `u8 dynamic`, `u16 count`, then `(name, version, checksum)` entries as specified for v32 above; follows the optional host list |
+| &nbsp;&nbsp;`key_option` ×`key_col_count` | only when bit4 is set (**new in v46**): per key element in index-key order, bit0 `desc`, bit1 `nulls_first`, bits 2–7 reserved; follows the optional timezone dependencies. Never all zero (a writer omits the list then) |
 | `fk_count` | u16 — the table's `FOREIGN KEY` constraints (**new in v11**; `0` for a table with none) |
 | per foreign key (×`fk_count`): | |
 | &nbsp;&nbsp;`fk_name_len` | u16 |
@@ -1762,6 +1772,7 @@ the interior-node format and the split contract.
 | `unique_table.jed` | **unique indexes** (v6) — the per-index `index_flags` byte: a `UNIQUE` constraint's auto-named `t_v_key` (over a nullable column holding two NULLs — *NULLS DISTINCT* stored side by side), a named two-column constraint, a `CREATE UNIQUE INDEX`, and one plain index (`index_flags` 0) in the same catalog |
 | `timezone_index_table.jed` | v32 timezone dependency pins: two named-zone expression keys (including an alias), a partial predicate, and the exact UTF-8 sorted dependency list |
 | `partial_index_table.jed` | **partial-index predicates** (v27) — the `index_flags` bit1 + the predicate canonical text after `index_root_page`: a plain partial index `t_amt_idx` (`WHERE status = 'active'`) beside a `UNIQUE` partial index `t_uact` (`WHERE status = 'active'`) and a non-partial index `t_status_idx` (bit1 clear, byte-identical to v26) in one catalog; the table is empty, so all three trees are empty (root 0) and the fixture isolates the v27 catalog change ([../design/indexes.md §9](../design/indexes.md)) |
+| `ordered_index_table.jed` | **Ordered index keys** (v46, [../design/indexes.md §11](../design/indexes.md)) — `index_flags` bit4 + the per-element option bytes: a `DESC` text index (present `FF` ‖ the inverted terminated body, NULL `FE`), an `ASC NULLS FIRST` i32 index (NULL `00`, present `01`), a unique `(d DESC NULLS LAST, n)` mixing an ordered decimal element with a default one, and a plain index without options ([../design/encoding.md §2.16](../design/encoding.md)) |
 | `gin_array_table.jed` | **GIN inverted index** (v13) — the per-index `index_kind` byte: a `USING gin` index over an `i32[]` column (rows with multi-element, duplicate-element, empty, and NULL arrays — exercising term dedup and the zero-entry cases; entries are `encode(elem) ‖ storage-key`, empty payload — [../design/gin.md §4](../design/gin.md)) beside one ordinary ordered index (`index_kind = 0`) in the same catalog |
 | `gin_uuid_table.jed` | **GIN over a non-integer element type** (no version bump — `uuid` is a fixed-width key encoding already on disk) — a `USING gin` index over a `uuid[]` column: each GIN term is the element's 16-byte `uuid-raw16` key encoding, so entries are `encode_uuid(elem) ‖ storage-key` (empty payload — [../design/gin.md §3/§4](../design/gin.md)). Same row shape as `gin_array_table` (term dedup, empty/NULL arrays, a NULL element), pinning that a uuid-element GIN serializes byte-identically across cores |
 | `gin_float_table.jed` | **GIN over float elements** (no version bump — the `float-order-preserving` key is already on disk) — `USING gin` indexes over an `f64[]` and an `f32[]` column: each term is the element's canonicalized 8-/4-byte float key ([../design/encoding.md §2.8](../design/encoding.md)), so `-0`/`+0` share one entry and every NaN is one entry (dedup over canonical bytes — [../design/gin.md §2/§4](../design/gin.md)), while the stored array values keep `-0`'s sign bit. Empty/NULL arrays and NULL/duplicate elements as in `gin_array_table` |

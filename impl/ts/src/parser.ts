@@ -26,6 +26,7 @@ import type {
   IdentitySpec,
   IndexKeyElem,
   ConflictColumn,
+  IndexKeyOrderSpec,
   ConflictTarget,
   Insert,
   InsertValue,
@@ -1861,8 +1862,10 @@ class Parser {
     }
     this.expect("lparen");
     const keys: IndexKeyElem[] = [];
+    const keyOrders: IndexKeyOrderSpec[] = [];
     for (;;) {
       keys.push(this.parseIndexElement());
+      keyOrders.push(this.parseIndexKeyOrder());
       const tok = this.advance();
       if (tok.kind === "comma") continue;
       if (tok.kind === "rparen") break;
@@ -1878,7 +1881,45 @@ class Parser {
       const expr = this.parseExpr();
       predicate = { text: renderTokens(this.tokens.slice(start, this.pos)), expr };
     }
-    return { kind: "createIndex", name, ifNotExists, table, db, keys, unique, using, predicate };
+    return {
+      kind: "createIndex",
+      name,
+      ifNotExists,
+      table,
+      db,
+      keys,
+      unique,
+      using,
+      predicate,
+      keyOrders,
+    };
+  }
+
+  // parseIndexKeyOrder parses the optional `ASC | DESC` then `NULLS FIRST | LAST` after an index key
+  // element (indexes.md §11, PostgreSQL's `opt_asc_desc opt_nulls_order`). A bare `NULLS` not
+  // followed by FIRST / LAST is 42601, as in the query ORDER BY.
+  private parseIndexKeyOrder(): IndexKeyOrderSpec {
+    const spec: IndexKeyOrderSpec = {};
+    if (this.peekKeyword() === "asc") {
+      this.advance();
+      spec.desc = false;
+    } else if (this.peekKeyword() === "desc") {
+      this.advance();
+      spec.desc = true;
+    }
+    if (this.peekKeyword() === "nulls") {
+      this.advance();
+      if (this.peekKeyword() === "first") {
+        this.advance();
+        spec.nullsFirst = true;
+      } else if (this.peekKeyword() === "last") {
+        this.advance();
+        spec.nullsFirst = false;
+      } else {
+        throw engineError("syntax_error", "NULLS must be followed by FIRST or LAST");
+      }
+    }
+    return spec;
   }
 
   // parseIndexElement parses one `index_element` (grammar.md §30, indexes.md §1): a bare column,

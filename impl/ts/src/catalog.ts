@@ -1,7 +1,8 @@
 // Table metadata: column definitions and lookups. Data-shaped (a type + free
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
-import type { CheckOption, Expr, QueryExpr } from "./ast.ts";
+import type { CheckOption, Expr, IndexKeyOrderSpec, QueryExpr } from "./ast.ts";
+import { KEY_ORDER_ASC, type KeyOrder, keyOrderIsDefault } from "./encoding.ts";
 import {
   type DecimalTypmod,
   type ScalarType,
@@ -233,7 +234,31 @@ export type IndexDef = {
   // (name, arg-type codes). B-tree only (a GIN/GiST index's keys are plain columns).
   hostDeps?: HostFuncDep[];
   timezoneDeps?: TimeZoneDeps;
+  // orders is the per-key-element sort order (spec/design/indexes.md §11, format_version 46),
+  // parallel to keys. undefined / EMPTY when every element is the default ASC NULLS LAST — the
+  // overwhelmingly common index, written with no option bytes (byte-identical to v45); otherwise
+  // exactly keys.length entries. B-tree only (GIN/GiST reject ASC/DESC/NULLS). Read through
+  // indexKeyOrder.
+  orders?: KeyOrder[];
 };
+
+// indexKeyOrder is key element i's sort order (ASC NULLS LAST when the index carries no options).
+export function indexKeyOrder(def: IndexDef, i: number): KeyOrder {
+  return def.orders?.[i] ?? KEY_ORDER_ASC;
+}
+
+// indexKeyOrderEffective is a written key element's effective order (indexes.md §11): direction as
+// written (default ASC), NULL placement as written or the direction's default (DESC ⇒ NULLS FIRST).
+export function indexKeyOrderEffective(spec: IndexKeyOrderSpec): KeyOrder {
+  const desc = spec.desc ?? false;
+  return { desc, nullsFirst: spec.nullsFirst ?? desc };
+}
+
+// canonicalKeyOrders normalizes a per-element order list to the canonical form: empty when all are
+// default.
+export function canonicalKeyOrders(orders: KeyOrder[]): KeyOrder[] {
+  return orders.every(keyOrderIsDefault) ? [] : orders;
+}
 
 // indexKeyColumn is the column ordinal of a plain column key element, else null (an expression key).
 // columnDefaultText is the column's DEFAULT as canonical SQL text (introspection.md §5
