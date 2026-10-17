@@ -424,10 +424,33 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   WAL: COW + the root swap already give atomicity *and* lock-free concurrency. Trade:
   write-amplification. A **logical** changeset stream is a separate higher-layer door, not
   foreclosed, not scheduled.
-- **Page service (proposal, unratified).** One owner process alone touches the database file and
-  serves pages and whole-commit deltas to client processes, each running its own engine, over a
-  local socket or SSH. It would replace shared multi-process mode and carry remote access, backup,
-  and replication. → [page-service.md](spec/design/page-service.md)
+- **Page service (ratified 2026-10-16, being built).** One owner process alone touches the database
+  file and serves pages and whole-commit deltas to client processes, each running its own engine,
+  over a local socket or SSH. It replaces shared multi-process mode at phase 4 and carries remote
+  access, backup, and replication. [locking.md](spec/design/locking.md) stays the binding protocol
+  until phase 4 lands; until then the service is reachable only through the test-only
+  `locking = service` value. → [page-service.md](spec/design/page-service.md) §16
+  - [x] **Phase 1 — spec.** ✅ **landed**: `spec/pageservice/` holds the message catalog and framing
+    as shared data, field encodings, and byte fixtures checked by a Ruby verifier under `mise run
+    verify`; `08006`, `08007`, `08P01`, `25P03` registered; a hand-written codec per core (Rust, Go,
+    TS) tested against the fixtures.
+  - [ ] **Phase 2 — read path.** Rust, Go, TS: election by `presence EX`, the owner record, the
+    same-user endpoint, `hello`/`begin_read`/`read_pages`/`end_read`, incarnation ids and client
+    cache invalidation, read-only connections, the TS worker-thread client and service. Proven by
+    process-corpus election/read cases in every pairing and by the SQL corpus run read-only through a
+    client of another core's owner; benchmarks for the alone-owner fast path and warm/cold client reads.
+  - [ ] **Phase 3 — write path.** The writer gate across processes, the reuse grant, `commit`
+    (`CommitDelta`) with owner validation (`08P01`), owner adoption, owner-only free-list rebuilds by
+    maintenance commits (a transactions.md §2.1 carve-out), `commit_status`, the idle-in-transaction
+    timeout (`25P03`), cross-owner attachment gate ordering.
+  - [ ] **Phase 4 — handoff.** Promotion, ownership preference and yield, graceful close, the grace
+    periods; the process-corpus rewrite; simulation testing of owner + clients; retire shared mode,
+    the `shared` and test-only `service` values, and locking.md §4–§5; a new bundle marker.
+  - [ ] **Phase 5 — SSH.** `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead
+    and subtree fetch.
+  - [ ] **Phase 6 — backup.** Page-identical and compacted forms.
+  - [ ] **Phase 7 — replication.** The tee, retained log, `subscribe`, lineage and timelines (a format
+    change), replicas and read replicas; amend replication.md.
 
 ## Resource admission follow-through
 

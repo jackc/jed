@@ -58,10 +58,11 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [locking.md](locking.md) — shared multi-process file coordination: the stable five-lock bundle,
   global writer + short commit gate, append-only co-resident commits, and the OS-backed presence-EX
   lease that preserves the one-process foreground fast path (CLAUDE.md §9).
-- [page-service.md](page-service.md) — the page service (**UNRATIFIED PROPOSAL**): one owner
-  process touches the file and serves pages and whole-commit deltas to client processes, each running
-  its own engine, over a local socket or SSH — replacing shared mode and carrying remote access,
-  backup, and replication (CLAUDE.md §9).
+- [page-service.md](page-service.md) — the page service (**RATIFIED, being built in phases**): one
+  owner process touches the file and serves pages and whole-commit deltas to client processes, each
+  running its own engine, over a local socket or SSH — replacing shared mode at its phase 4 and
+  carrying remote access, backup, and replication (CLAUDE.md §9). Until phase 4, locking.md binds.
+  The wire contract (message catalog, framing, byte fixtures) is [../pageservice/](../pageservice/README.md).
 - [replication.md](replication.md) — replication by block-shipping the per-commit page-delta
   (no WAL — copy-on-write already gives atomicity + concurrency): the change record, the
   replica apply recipe, keyless replicas, PITR at commit granularity, and the write-amplification

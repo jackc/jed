@@ -1,0 +1,363 @@
+# Page-service byte fixtures — CANONICAL DATA (CLAUDE.md §8).
+#
+# Every core's hand-written codec must, for each [[frame]]:
+#   1. encode   the message from its fields and produce exactly `hex`;
+#   2. decode   `hex` (with the given page_size) back to the same message and fields;
+# for each [[owner_record]], encode and decode the same way; and for each [[malformed]], reject
+# `hex` as a protocol violation (08P01) when decoding it as one complete frame. `kind` is the fault
+# the Ruby reference detects; a core need only reject.
+#
+# Field values are strings in a canonical text form, keyed `f_<field name>` (README.md §1 types):
+#   u8/u16/u32/u64   decimal
+#   bool             "true" / "false"
+#   id16             32 lowercase hex digits
+#   sqlstate/string  the text itself
+#   page             "<prefix hex>/<fill hex>": the prefix bytes, then the fill byte up to page_size
+#   u32_list         comma-separated decimals; "" is the empty list
+#   page_list        pages separated by ";"; "" is the empty list
+#   indexed_page_list  "<index>=<page>" items separated by ";"; "" is the empty list
+# page_size is "0" when the message has no page field. Bytes are lowercase hex, no separators.
+# Regenerate the hex with `ruby spec/pageservice/verify.rb --generate` only when the contract changes.
+
+schema_version = 1
+
+# --- phase 2: the read path -----------------------------------------------------------------------
+
+[[frame]]
+name = "hello"
+message = "hello"
+request_id = "1"
+page_size = "0"
+f_protocol_min = "1"
+f_protocol_max = "1"
+f_format_version = "42"
+f_flags = "1"
+f_client_name = "jed-go"
+hex = "00000016010000000100010001002a01000000066a65642d676f"
+
+[[frame]]
+name = "hello_unicode_name"
+message = "hello"
+request_id = "1"
+page_size = "0"
+f_protocol_min = "1"
+f_protocol_max = "3"
+f_format_version = "42"
+f_flags = "0"
+f_client_name = "jéd"
+hex = "00000014010000000100010003002a00000000046ac3a964"
+
+[[frame]]
+name = "hello_ok"
+message = "hello_ok"
+request_id = "1"
+page_size = "0"
+f_protocol = "1"
+f_format_version = "42"
+f_page_size = "4096"
+f_connection_id = "7"
+f_flags = "1"
+f_max_read_pages = "1024"
+hex = "0000001a41000000010001002a0000100000000000000000070100000400"
+
+[[frame]]
+name = "begin_read_cold"
+message = "begin_read"
+request_id = "2"
+page_size = "0"
+f_incarnation = "00000000000000000000000000000000"
+f_last_txid = "0"
+hex = "0000001d0200000002000000000000000000000000000000000000000000000000"
+
+[[frame]]
+name = "begin_read_warm"
+message = "begin_read"
+request_id = "4294967295"
+page_size = "0"
+f_incarnation = "0123456789abcdeffedcba9876543210"
+f_last_txid = "18446744073709551615"
+hex = "0000001d02ffffffff0123456789abcdeffedcba9876543210ffffffffffffffff"
+
+[[frame]]
+name = "read_begun_list"
+message = "read_begun"
+request_id = "2"
+page_size = "256"
+f_incarnation = "0123456789abcdeffedcba9876543210"
+f_txid = "12"
+f_invalidate = "0"
+f_indices = "2,5,9"
+f_meta = "4a454442002a0000/00"
+hex = "0000012e42000000020123456789abcdeffedcba9876543210000000000000000c00000000030000000200000005000000094a454442002a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+[[frame]]
+name = "read_begun_all"
+message = "read_begun"
+request_id = "3"
+page_size = "256"
+f_incarnation = "ffffffffffffffffffffffffffffffff"
+f_txid = "1"
+f_invalidate = "1"
+f_indices = ""
+f_meta = "/5a"
+hex = "000001224200000003ffffffffffffffffffffffffffffffff000000000000000101000000005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+
+[[frame]]
+name = "read_pages"
+message = "read_pages"
+request_id = "5"
+page_size = "0"
+f_txid = "12"
+f_indices = "2,3,4096"
+hex = "0000001d0300000005000000000000000c00000003000000020000000300001000"
+
+[[frame]]
+name = "pages"
+message = "pages"
+request_id = "5"
+page_size = "256"
+f_pages = "0201/00;/ff"
+hex = "0000020943000000050000000202010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+[[frame]]
+name = "pages_empty"
+message = "pages"
+request_id = "6"
+page_size = "256"
+f_pages = ""
+hex = "00000009430000000600000000"
+
+[[frame]]
+name = "end_read"
+message = "end_read"
+request_id = "6"
+page_size = "0"
+f_txid = "12"
+hex = "0000000d0400000006000000000000000c"
+
+[[frame]]
+name = "error_fatal"
+message = "error"
+request_id = "9"
+page_size = "0"
+f_sqlstate = "08P01"
+f_message = "protocol violation"
+f_detail = "read_pages names txid 3, which this connection has not pinned"
+f_flags = "1"
+hex = "000000627f0000000930385030310000001270726f746f636f6c2076696f6c6174696f6e0000003d726561645f7061676573206e616d6573207478696420332c207768696368207468697320636f6e6e656374696f6e20686173206e6f742070696e6e656401"
+
+[[frame]]
+name = "error_empty_text"
+message = "error"
+request_id = "0"
+page_size = "0"
+f_sqlstate = "0A000"
+f_message = ""
+f_detail = ""
+f_flags = "0"
+hex = "000000137f000000003041303030000000000000000000"
+
+# --- phases 3–4 (provisional) ---------------------------------------------------------------------
+
+[[frame]]
+name = "begin_write"
+message = "begin_write"
+request_id = "10"
+page_size = "0"
+f_incarnation = "0123456789abcdeffedcba9876543210"
+f_last_txid = "12"
+f_lock_timeout_ms = "5000"
+hex = "00000025050000000a0123456789abcdeffedcba9876543210000000000000000c0000000000001388"
+
+[[frame]]
+name = "write_begun"
+message = "write_begun"
+request_id = "10"
+page_size = "256"
+f_incarnation = "0123456789abcdeffedcba9876543210"
+f_txid = "13"
+f_invalidate = "0"
+f_indices = "7"
+f_reuse_grant = "true"
+f_meta = "4a454442/00"
+hex = "00000127450000000a0123456789abcdeffedcba9876543210000000000000000d000000000100000007014a454442000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+[[frame]]
+name = "commit_begin"
+message = "commit_begin"
+request_id = "11"
+page_size = "256"
+f_txid = "14"
+f_meta = "4a454442/00"
+f_manifest_pages = "20=08/00"
+hex = "00000215060000000b000000000000000e4a454442000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000001408000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+[[frame]]
+name = "commit_pages"
+message = "commit_pages"
+request_id = "12"
+page_size = "256"
+f_pages = "18=02/00;19=03/11"
+hex = "00000211070000000c0000000200000012020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001303111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+
+[[frame]]
+name = "commit_end"
+message = "commit_end"
+request_id = "13"
+page_size = "0"
+hex = "00000005080000000d"
+
+[[frame]]
+name = "committed"
+message = "committed"
+request_id = "13"
+page_size = "0"
+f_txid = "14"
+hex = "0000000d480000000d000000000000000e"
+
+[[frame]]
+name = "abort"
+message = "abort"
+request_id = "14"
+page_size = "0"
+hex = "00000005090000000e"
+
+[[frame]]
+name = "commit_status"
+message = "commit_status"
+request_id = "1"
+page_size = "0"
+f_txid = "14"
+f_digest = "9223372036854775808"
+hex = "000000150a00000001000000000000000e8000000000000000"
+
+[[frame]]
+name = "commit_status_reply"
+message = "commit_status_reply"
+request_id = "1"
+page_size = "0"
+f_status = "2"
+hex = "000000064a0000000102"
+
+[[frame]]
+name = "request_ownership"
+message = "request_ownership"
+request_id = "3"
+page_size = "0"
+hex = "000000050b00000003"
+
+[[frame]]
+name = "ownership_reply"
+message = "ownership_reply"
+request_id = "3"
+page_size = "0"
+f_status = "0"
+hex = "000000064b0000000300"
+
+[[frame]]
+name = "notice_yield"
+message = "notice"
+request_id = "0"
+page_size = "0"
+f_kind = "1"
+f_connection_id = "42"
+hex = "0000000e7e0000000001000000000000002a"
+
+# --- the owner record (README.md §5.1) ------------------------------------------------------------
+
+[[owner_record]]
+name = "serving"
+f_flags = "1"
+f_uid = "1000"
+f_incarnation = "0123456789abcdeffedcba9876543210"
+f_pid = "4242"
+f_endpoint = "/srv/app.jed.lock/uid-1000/endpoint"
+hex = "4a45444f574e4552000101000003e80123456789abcdeffedcba987654321000001092000000232f7372762f6170702e6a65642e6c6f636b2f7569642d313030302f656e64706f696e74e73404bb"
+
+[[owner_record]]
+name = "not_serving"
+f_flags = "0"
+f_uid = "0"
+f_incarnation = "ffffffffffffffffffffffffffffffff"
+f_pid = "1"
+f_endpoint = ""
+hex = "4a45444f574e455200010000000000ffffffffffffffffffffffffffffffff0000000100000000c94dd496"
+
+# --- malformed frames: every decoder rejects these with 08P01 -------------------------------------
+
+[[malformed]]
+name = "length_below_header"
+page_size = "0"
+kind = "length"
+reason = "length 4 is below the 5-byte code + request_id minimum"
+hex = "0000000401000000"
+
+[[malformed]]
+name = "length_above_max"
+page_size = "0"
+kind = "length"
+reason = "length 16777217 exceeds max_frame_length; rejected before the body is read"
+hex = "010000010400000006"
+
+[[malformed]]
+name = "unknown_code"
+page_size = "0"
+kind = "code"
+reason = "0x3e names no message"
+hex = "000000053e00000001"
+
+[[malformed]]
+name = "reserved_code"
+page_size = "0"
+kind = "code"
+reason = "snapshot_stream is reserved in protocol 1"
+hex = "000000050c00000001"
+
+[[malformed]]
+name = "truncated_field"
+page_size = "0"
+kind = "truncated"
+reason = "end_read's txid u64 is one byte short"
+hex = "0000000c04000000060000000000000c"
+
+[[malformed]]
+name = "trailing_bytes"
+page_size = "0"
+kind = "trailing"
+reason = "end_read has a byte after its last field"
+hex = "0000000e0400000006000000000000000c00"
+
+[[malformed]]
+name = "bad_bool"
+page_size = "256"
+kind = "bool"
+reason = "write_begun's reuse_grant bool is 2"
+hex = "00000123450000000a01010101010101010101010101010101000000000000000d00000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+[[malformed]]
+name = "bad_utf8"
+page_size = "0"
+kind = "utf8"
+reason = "client_name is not valid UTF-8"
+hex = "00000012010000000100010001002a0100000002c328"
+
+[[malformed]]
+name = "list_count_exceeds_body"
+page_size = "0"
+kind = "count"
+reason = "a u32_list count of 0xffffffff with no entries; the count is checked before allocating"
+hex = "000000110300000005000000000000000cffffffff"
+
+[[malformed]]
+name = "page_list_short_page"
+page_size = "256"
+kind = "count"
+reason = "a page_list page shorter than page_size"
+hex = "0000000d430000000500000001aabbccdd"
+
+[[malformed]]
+name = "bad_sqlstate"
+page_size = "0"
+kind = "sqlstate"
+reason = "sqlstate characters must be ASCII digits or upper-case letters"
+hex = "000000137f000000093038703031000000000000000001"

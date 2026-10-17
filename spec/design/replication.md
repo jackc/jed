@@ -8,7 +8,7 @@
 > object it ships is the one [storage.md](storage.md) §4 already produces. When a decision here
 > changes, update [CLAUDE.md](../../CLAUDE.md) §9 and [storage.md](storage.md) §6 in the same edit.
 >
-> **Proposed amendments (unratified):** [page-service.md](page-service.md) §9–§10 would move the tee to
+> **Ratified amendments, not yet built:** [page-service.md](page-service.md) §9–§10 move the tee to
 > a single owner's commit point, produce page-identical base images (§4) through the page service,
 > and add lineage/timelines, a durability floor, log-durability ordering, retention, and a
 > stream-break policy.

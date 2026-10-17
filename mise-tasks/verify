@@ -13,6 +13,7 @@ CHECKS = [
   ["key encoding", "spec/encoding/verify.rb"],
   ["prng + uuid fixtures", "spec/encoding/prng_verify.rb"],
   ["conformance taxonomy", "spec/conformance/verify.rb"],
+  ["page-service wire contract", "spec/pageservice/verify.rb"],
   ["file format", "spec/fileformat/verify.rb"],
   ["function catalog", "spec/functions/verify.rb"],
   ["cost schedule", "spec/cost/verify.rb"],

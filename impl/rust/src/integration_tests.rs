@@ -147,6 +147,8 @@ mod nosync;
 mod on_conflict;
 #[path = "../tests/overflow_cost.rs"]
 mod overflow_cost;
+#[path = "../tests/pageservice_codec.rs"]
+mod pageservice_codec;
 #[path = "../tests/params.rs"]
 mod params;
 #[path = "../tests/plan_cache.rs"]

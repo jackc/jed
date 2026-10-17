@@ -10,9 +10,13 @@
 > update those docs, [CLAUDE.md](../../CLAUDE.md) §9, [AGENTS.md](../../AGENTS.md), and
 > [TODO.md](../../TODO.md) together.
 >
-> **Proposed successor (unratified):** [page-service.md](page-service.md) would replace shared mode
-> with one owner process that alone touches the file and serves pages to client processes. Until it
-> is ratified and its handoff phase lands, this document is the binding protocol.
+>
+> **Ratified successor, being built:** [page-service.md](page-service.md) (ratified 2026-10-16)
+> replaces shared mode with one owner process that alone touches the file and serves pages to client
+> processes. **This document remains the binding multi-process protocol until the page service's
+> phase 4 (handoff, page-service.md §16) lands**: `auto` selects shared mode, and the page service is
+> reachable only through the test-only `locking = service` value, which never shares a database with
+> a shared-mode process. Phase 4 retires shared mode and this document's §4–§5 in one step.
 
 ## 1. Decision and status
 

@@ -15,8 +15,14 @@ package jed
 type SqlState int
 
 const (
+	// ConnectionFailure is 08006 — {detail}.
+	ConnectionFailure SqlState = iota
+	// TransactionResolutionUnknown is 08007 — {detail}.
+	TransactionResolutionUnknown
+	// ProtocolViolation is 08P01 — {detail}.
+	ProtocolViolation
 	// CardinalityViolation is 21000 — more than one row returned by a subquery used as an expression.
-	CardinalityViolation SqlState = iota
+	CardinalityViolation
 	// DataException is 22000 — {detail}.
 	DataException
 	// StringDataRightTruncation is 22001 — {detail}.
@@ -103,6 +109,8 @@ const (
 	ReadOnlySqlTransaction
 	// InFailedSqlTransaction is 25P02 — current transaction is aborted, commands ignored until end of transaction block.
 	InFailedSqlTransaction
+	// IdleInTransactionSessionTimeout is 25P03 — {detail}.
+	IdleInTransactionSessionTimeout
 	// DependentObjectsStillExist is 2BP01 — cannot drop type {name} because other objects depend on it: {detail}.
 	DependentObjectsStillExist
 	// ExternalRoutineException is 38000 — host function {name} raised {detail}.
@@ -214,6 +222,12 @@ const (
 // Code returns the canonical SQLSTATE string.
 func (s SqlState) Code() string {
 	switch s {
+	case ConnectionFailure:
+		return "08006"
+	case TransactionResolutionUnknown:
+		return "08007"
+	case ProtocolViolation:
+		return "08P01"
 	case CardinalityViolation:
 		return "21000"
 	case DataException:
@@ -302,6 +316,8 @@ func (s SqlState) Code() string {
 		return "25006"
 	case InFailedSqlTransaction:
 		return "25P02"
+	case IdleInTransactionSessionTimeout:
+		return "25P03"
 	case DependentObjectsStillExist:
 		return "2BP01"
 	case ExternalRoutineException:
@@ -424,6 +440,9 @@ type errorDesc struct {
 
 // Errors lists every error, in registry order.
 var errorDescs = []errorDesc{
+	{Code: "08006", Name: "connection_failure", Class: "connection exception"},
+	{Code: "08007", Name: "transaction_resolution_unknown", Class: "connection exception"},
+	{Code: "08P01", Name: "protocol_violation", Class: "connection exception"},
 	{Code: "21000", Name: "cardinality_violation", Class: "cardinality violation"},
 	{Code: "22000", Name: "data_exception", Class: "data exception"},
 	{Code: "22001", Name: "string_data_right_truncation", Class: "data exception"},
@@ -468,6 +487,7 @@ var errorDescs = []errorDesc{
 	{Code: "25001", Name: "active_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25006", Name: "read_only_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25P02", Name: "in_failed_sql_transaction", Class: "invalid transaction state"},
+	{Code: "25P03", Name: "idle_in_transaction_session_timeout", Class: "invalid transaction state"},
 	{Code: "2BP01", Name: "dependent_objects_still_exist", Class: "dependent objects still exist"},
 	{Code: "38000", Name: "external_routine_exception", Class: "external routine exception"},
 	{Code: "42601", Name: "syntax_error", Class: "syntax error or access rule violation"},

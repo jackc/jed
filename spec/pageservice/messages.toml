@@ -1,0 +1,196 @@
+# Page-service message catalog — CANONICAL DATA (CLAUDE.md §5).
+#
+# The wire contract of spec/design/page-service.md: framing constants and every message's code,
+# direction, reply, phase, and body fields. Prose rules (validation, meaning) are in README.md.
+# Each core hand-writes its codec from this table; verify.rb checks the table's shape and every
+# fixture in fixtures.toml against an independent Ruby codec. Test-time data: no core parses it at
+# runtime.
+#
+# fields  ordered "name:type" pairs; the types are README.md §1's.
+# reply   the reply message's name, or "none" (no reply on success).
+# phase   the page-service.md §16 phase that first uses the message. Phases not yet landed are
+#         provisional (README.md §3).
+
+schema_version = 1
+protocol_version = 1
+max_frame_length = 16777216
+# length u32 + code u8 + request_id u32
+header_length = 9
+max_read_pages_cap = 1024
+max_invalidation_entries = 65536
+invalidation_window_commits = 256
+endpoint_max_path_bytes = 100
+owner_record_magic = "JEDOWNER"
+owner_record_version = 1
+
+# --- requests (client → owner) -----------------------------------------------
+
+[[message]]
+name = "hello"
+code = 0x01
+direction = "request"
+reply = "hello_ok"
+phase = 2
+fields = ["protocol_min:u16", "protocol_max:u16", "format_version:u16", "flags:u8", "client_name:string"]
+
+[[message]]
+name = "begin_read"
+code = 0x02
+direction = "request"
+reply = "read_begun"
+phase = 2
+fields = ["incarnation:id16", "last_txid:u64"]
+
+[[message]]
+name = "read_pages"
+code = 0x03
+direction = "request"
+reply = "pages"
+phase = 2
+fields = ["txid:u64", "indices:u32_list"]
+
+[[message]]
+name = "end_read"
+code = 0x04
+direction = "request"
+reply = "none"
+phase = 2
+fields = ["txid:u64"]
+
+[[message]]
+name = "begin_write"
+code = 0x05
+direction = "request"
+reply = "write_begun"
+phase = 3
+fields = ["incarnation:id16", "last_txid:u64", "lock_timeout_ms:u64"]
+
+[[message]]
+name = "commit_begin"
+code = 0x06
+direction = "request"
+reply = "none"
+phase = 3
+fields = ["txid:u64", "meta:page", "manifest_pages:indexed_page_list"]
+
+[[message]]
+name = "commit_pages"
+code = 0x07
+direction = "request"
+reply = "none"
+phase = 3
+fields = ["pages:indexed_page_list"]
+
+[[message]]
+name = "commit_end"
+code = 0x08
+direction = "request"
+reply = "committed"
+phase = 3
+fields = []
+
+[[message]]
+name = "abort"
+code = 0x09
+direction = "request"
+reply = "none"
+phase = 3
+fields = []
+
+[[message]]
+name = "commit_status"
+code = 0x0A
+direction = "request"
+reply = "commit_status_reply"
+phase = 3
+fields = ["txid:u64", "digest:u64"]
+
+[[message]]
+name = "request_ownership"
+code = 0x0B
+direction = "request"
+reply = "ownership_reply"
+phase = 4
+fields = []
+
+# Reserved: bodies are defined by phases 6 (backup) and 7 (replication).
+[[message]]
+name = "snapshot_stream"
+code = 0x0C
+direction = "request"
+reply = "reserved"
+phase = 6
+fields = []
+
+[[message]]
+name = "subscribe"
+code = 0x0D
+direction = "request"
+reply = "reserved"
+phase = 7
+fields = []
+
+# --- replies and owner-initiated frames (owner → client) ------------------------
+
+[[message]]
+name = "hello_ok"
+code = 0x41
+direction = "reply"
+phase = 2
+fields = ["protocol:u16", "format_version:u16", "page_size:u32", "connection_id:u64", "flags:u8", "max_read_pages:u32"]
+
+[[message]]
+name = "read_begun"
+code = 0x42
+direction = "reply"
+phase = 2
+fields = ["incarnation:id16", "txid:u64", "invalidate:u8", "indices:u32_list", "meta:page"]
+
+[[message]]
+name = "pages"
+code = 0x43
+direction = "reply"
+phase = 2
+fields = ["pages:page_list"]
+
+[[message]]
+name = "write_begun"
+code = 0x45
+direction = "reply"
+phase = 3
+fields = ["incarnation:id16", "txid:u64", "invalidate:u8", "indices:u32_list", "reuse_grant:bool", "meta:page"]
+
+[[message]]
+name = "committed"
+code = 0x48
+direction = "reply"
+phase = 3
+fields = ["txid:u64"]
+
+[[message]]
+name = "commit_status_reply"
+code = 0x4A
+direction = "reply"
+phase = 3
+fields = ["status:u8"]
+
+[[message]]
+name = "ownership_reply"
+code = 0x4B
+direction = "reply"
+phase = 4
+fields = ["status:u8"]
+
+[[message]]
+name = "notice"
+code = 0x7E
+direction = "notice"
+phase = 4
+fields = ["kind:u8", "connection_id:u64"]
+
+[[message]]
+name = "error"
+code = 0x7F
+direction = "reply"
+phase = 2
+fields = ["sqlstate:sqlstate", "message:string", "detail:string", "flags:u8"]

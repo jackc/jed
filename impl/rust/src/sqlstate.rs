@@ -12,6 +12,12 @@
 /// and carries no meaning — the discriminant is never serialized.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SqlState {
+    /// 08006 — {detail}
+    ConnectionFailure,
+    /// 08007 — {detail}
+    TransactionResolutionUnknown,
+    /// 08P01 — {detail}
+    ProtocolViolation,
     /// 21000 — more than one row returned by a subquery used as an expression
     CardinalityViolation,
     /// 22000 — {detail}
@@ -100,6 +106,8 @@ pub enum SqlState {
     ReadOnlySqlTransaction,
     /// 25P02 — current transaction is aborted, commands ignored until end of transaction block
     InFailedSqlTransaction,
+    /// 25P03 — {detail}
+    IdleInTransactionSessionTimeout,
     /// 2BP01 — cannot drop type {name} because other objects depend on it: {detail}
     DependentObjectsStillExist,
     /// 38000 — host function {name} raised {detail}
@@ -212,6 +220,9 @@ impl SqlState {
     /// The canonical 5-char SQLSTATE string (spec/errors/registry.toml).
     pub fn code(self) -> &'static str {
         match self {
+            SqlState::ConnectionFailure => "08006",
+            SqlState::TransactionResolutionUnknown => "08007",
+            SqlState::ProtocolViolation => "08P01",
             SqlState::CardinalityViolation => "21000",
             SqlState::DataException => "22000",
             SqlState::StringDataRightTruncation => "22001",
@@ -256,6 +267,7 @@ impl SqlState {
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::ReadOnlySqlTransaction => "25006",
             SqlState::InFailedSqlTransaction => "25P02",
+            SqlState::IdleInTransactionSessionTimeout => "25P03",
             SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::ExternalRoutineException => "38000",
             SqlState::SyntaxError => "42601",
@@ -317,6 +329,9 @@ impl SqlState {
     /// host-function kernel, spec/design/ruby.md §5b).
     pub fn from_code(code: &str) -> Option<SqlState> {
         match code {
+            "08006" => Some(SqlState::ConnectionFailure),
+            "08007" => Some(SqlState::TransactionResolutionUnknown),
+            "08P01" => Some(SqlState::ProtocolViolation),
             "21000" => Some(SqlState::CardinalityViolation),
             "22000" => Some(SqlState::DataException),
             "22001" => Some(SqlState::StringDataRightTruncation),
@@ -361,6 +376,7 @@ impl SqlState {
             "25001" => Some(SqlState::ActiveSqlTransaction),
             "25006" => Some(SqlState::ReadOnlySqlTransaction),
             "25P02" => Some(SqlState::InFailedSqlTransaction),
+            "25P03" => Some(SqlState::IdleInTransactionSessionTimeout),
             "2BP01" => Some(SqlState::DependentObjectsStillExist),
             "38000" => Some(SqlState::ExternalRoutineException),
             "42601" => Some(SqlState::SyntaxError),
@@ -431,6 +447,9 @@ pub struct ErrorDesc {
 /// Every error, in registry order.
 #[rustfmt::skip]
 pub const ERRORS: &[ErrorDesc] = &[
+    ErrorDesc { code: "08006", name: "connection_failure", class: "connection exception" },
+    ErrorDesc { code: "08007", name: "transaction_resolution_unknown", class: "connection exception" },
+    ErrorDesc { code: "08P01", name: "protocol_violation", class: "connection exception" },
     ErrorDesc { code: "21000", name: "cardinality_violation", class: "cardinality violation" },
     ErrorDesc { code: "22000", name: "data_exception", class: "data exception" },
     ErrorDesc { code: "22001", name: "string_data_right_truncation", class: "data exception" },
@@ -475,6 +494,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "25001", name: "active_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25006", name: "read_only_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25P02", name: "in_failed_sql_transaction", class: "invalid transaction state" },
+    ErrorDesc { code: "25P03", name: "idle_in_transaction_session_timeout", class: "invalid transaction state" },
     ErrorDesc { code: "2BP01", name: "dependent_objects_still_exist", class: "dependent objects still exist" },
     ErrorDesc { code: "38000", name: "external_routine_exception", class: "external routine exception" },
     ErrorDesc { code: "42601", name: "syntax_error", class: "syntax error or access rule violation" },

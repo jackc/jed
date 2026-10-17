@@ -18,6 +18,36 @@
 
 schema_version = 1
 
+# --- connection exception (class 08) ---------------------------------------
+# Raised by the page service (../design/page-service.md, ../pageservice/README.md): a page client's
+# connection to the owner process. PostgreSQL's codes for the same failures. Host-observed, never
+# reachable from SQL alone, so the shared corpus does not assert them; the real-process corpus does.
+#
+# The owner's connection is gone (the owner exited or closed it) while a transaction was open or a
+# request was in flight; the application retries, as after a PostgreSQL failover (page-service.md §8.1).
+[[error]]
+code = "08006"
+name = "connection_failure"
+class = "connection exception"
+template = "{detail}"
+
+# The connection was lost after a commit was sent and its outcome could not be resolved
+# (page-service.md §8.4).
+[[error]]
+code = "08007"
+name = "transaction_resolution_unknown"
+class = "connection exception"
+template = "{detail}"
+
+# A peer sent a frame that violates the wire contract: malformed framing or fields, an unknown
+# message, or a request the protocol forbids in the connection's state (an unpinned txid, a
+# CommitDelta that fails validation — page-service.md §5.6). The owner closes the connection.
+[[error]]
+code = "08P01"
+name = "protocol_violation"
+class = "connection exception"
+template = "{detail}"
+
 # --- cardinality violation (class 21) ---------------------------------------
 [[error]]
 code = "21000"
@@ -344,6 +374,15 @@ code = "25P02"
 name = "in_failed_sql_transaction"
 class = "invalid transaction state"
 template = "current transaction is aborted, commands ignored until end of transaction block"
+
+# A page client held the global writer gate idle past the owner's idle-in-transaction timeout
+# (page-service.md §5.5, §11.1); its transaction was revoked and fails at its next request.
+# PostgreSQL's code for idle_in_transaction_session_timeout.
+[[error]]
+code = "25P03"
+name = "idle_in_transaction_session_timeout"
+class = "invalid transaction state"
+template = "{detail}"
 
 # --- dependent objects still exist (class 2B) -------------------------------
 # Raised by `DROP TYPE ... RESTRICT` (the default) when a table column or another

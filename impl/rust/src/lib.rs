@@ -53,6 +53,7 @@ mod lz4;
 mod memsize;
 mod operators;
 mod pager;
+mod pageservice;
 mod paging;
 mod parser;
 mod pmap;

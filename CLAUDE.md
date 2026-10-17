@@ -749,6 +749,17 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   PID/mtime stale-lock heuristics are forbidden; an unsupported host fails closed. OPFS remains
   inherently exclusive. The first rollout must drain every pre-protocol binary because an advisory
   protocol cannot coordinate with a process that does not participate.
+- **Page service: the ratified successor to shared mode (`spec/design/page-service.md`), being built
+  in phases.** One **owner** process (the `presence EX` holder) alone touches the file; every other
+  process is a **page client** running its own engine, whose pager reads pages from, and (phase 3)
+  commits whole `CommitDelta`s through, the owner over a same-user local socket (later SSH). Pages are
+  logical cost units, so a query's rows, plan, and cost are identical through the service. The wire
+  contract is shared data with byte fixtures (`spec/pageservice/`). **locking.md stays the binding
+  protocol until phase 4 (handoff) lands**: until then `auto` means shared mode and the service is
+  reachable only through the test-only `locking = service` value; phase 4 removes shared mode in one
+  step. Decided at ratification: the endpoint lives in the bundle (runtime-directory fallback);
+  `begin_read` is always a round trip; free-list rebuilds are owner-only maintenance commits; no
+  client request timeout; Rust on Windows is a non-serving owner only for now.
 
 ---
 

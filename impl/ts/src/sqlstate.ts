@@ -10,6 +10,9 @@
 // the union member IS the canonical snake_case name from the registry.
 
 export type SqlState =
+  | "connection_failure" // 08006 — {detail}
+  | "transaction_resolution_unknown" // 08007 — {detail}
+  | "protocol_violation" // 08P01 — {detail}
   | "cardinality_violation" // 21000 — more than one row returned by a subquery used as an expression
   | "data_exception" // 22000 — {detail}
   | "string_data_right_truncation" // 22001 — {detail}
@@ -54,6 +57,7 @@ export type SqlState =
   | "active_sql_transaction" // 25001 — there is already a transaction in progress
   | "read_only_sql_transaction" // 25006 — cannot execute {statement} in a read-only transaction
   | "in_failed_sql_transaction" // 25P02 — current transaction is aborted, commands ignored until end of transaction block
+  | "idle_in_transaction_session_timeout" // 25P03 — {detail}
   | "dependent_objects_still_exist" // 2BP01 — cannot drop type {name} because other objects depend on it: {detail}
   | "external_routine_exception" // 38000 — host function {name} raised {detail}
   | "syntax_error" // 42601 — syntax error: {detail}
@@ -109,6 +113,9 @@ export type SqlState =
   | "unparsable_stored_definition"; // XX003 — stored definition does not parse in this version of jed: {detail}
 
 const CODES: Record<SqlState, string> = {
+  connection_failure: "08006",
+  transaction_resolution_unknown: "08007",
+  protocol_violation: "08P01",
   cardinality_violation: "21000",
   data_exception: "22000",
   string_data_right_truncation: "22001",
@@ -153,6 +160,7 @@ const CODES: Record<SqlState, string> = {
   active_sql_transaction: "25001",
   read_only_sql_transaction: "25006",
   in_failed_sql_transaction: "25P02",
+  idle_in_transaction_session_timeout: "25P03",
   dependent_objects_still_exist: "2BP01",
   external_routine_exception: "38000",
   syntax_error: "42601",
@@ -224,6 +232,9 @@ export interface ErrorDesc {
 
 // Every error, in registry order.
 export const ERRORS: readonly ErrorDesc[] = [
+  { code: "08006", name: "connection_failure", class: "connection exception" },
+  { code: "08007", name: "transaction_resolution_unknown", class: "connection exception" },
+  { code: "08P01", name: "protocol_violation", class: "connection exception" },
   { code: "21000", name: "cardinality_violation", class: "cardinality violation" },
   { code: "22000", name: "data_exception", class: "data exception" },
   { code: "22001", name: "string_data_right_truncation", class: "data exception" },
@@ -268,6 +279,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "25001", name: "active_sql_transaction", class: "invalid transaction state" },
   { code: "25006", name: "read_only_sql_transaction", class: "invalid transaction state" },
   { code: "25P02", name: "in_failed_sql_transaction", class: "invalid transaction state" },
+  { code: "25P03", name: "idle_in_transaction_session_timeout", class: "invalid transaction state" },
   { code: "2BP01", name: "dependent_objects_still_exist", class: "dependent objects still exist" },
   { code: "38000", name: "external_routine_exception", class: "external routine exception" },
   { code: "42601", name: "syntax_error", class: "syntax error or access rule violation" },

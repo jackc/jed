@@ -1,10 +1,14 @@
 # Page service — one owner process, page-level clients — design
 
-> **Status: DESIGN PROPOSAL — not ratified, not built.** This document proposes replacing the
+> **Status: RATIFIED DESIGN (2026-10-16); being built in phases (§16).** This document replaces the
 > shared multi-process protocol ([locking.md](locking.md)) with a single **owner** process that alone
 > touches the database file and serves **pages** to every other process over a local endpoint, and
-> extending the same service over SSH for remote access, backup, and replication. Nothing here binds
-> an implementation until it is ratified. When it is, update [locking.md](locking.md),
+> extends the same service over SSH for remote access, backup, and replication. The message catalog,
+> framing, and byte fixtures are [spec/pageservice/](../pageservice/README.md).
+>
+> **[locking.md](locking.md) stays the binding multi-process protocol until phase 4 (§16) lands.**
+> Until then the page service is reachable only through the test-only `locking = service` value, and
+> `auto` keeps meaning shared mode. When phase 4 lands, update [locking.md](locking.md),
 > [replication.md](replication.md), [hosts.md](hosts.md) §6, [api.md](api.md) §2.1,
 > [CLAUDE.md](../../CLAUDE.md) §9, and [TODO.md](../../TODO.md) together.
 
@@ -81,7 +85,10 @@ from a page service), though both are servers.
   that is stopped (`SIGSTOP`), paused (a long GC), or blocked in a durability barrier delays every
   client's `begin_read`, `read_pages`, and `commit` until it resumes. Shared mode's already-joined
   peers keep reading the file directly in that case. This design accepts the cost in exchange for
-  one process touching the file; a client-side request timeout is open (§17.9).
+  one process touching the file. **There is no client-side request timeout** (decided at
+  ratification): a client waits for a live owner as a reader of a local file waits for a slow disk.
+  Only the owner's death (EOF) or the client's own cancellation ends the wait; the open-time
+  `file_lock_timeout_ms` and the writer-gate `lock_timeout_ms` keep their meanings.
 
 ### 4.2 Client
 
@@ -164,6 +171,17 @@ on a cache miss. `end_read` needs no reply. This keeps today's guarantee that a 
 after another process's commit returned sees that commit (locking.md §5.1), the same freshness the
 shared protocol gets from its meta re-read.
 
+**`begin_read` is always a round trip** (decided at ratification). There is no relaxed mode in
+which owner-pushed commit notices let a client begin locally: that would make a client's freshness
+depend on notice delivery timing, a second consistency mode for every test to cover, for a saving of
+one local round trip.
+
+The `begin_read` reply carries the **committed meta page itself** — the exact bytes of the meta slot
+that published the pinned snapshot. The client's pager decodes it with the ordinary meta parser, so
+the root, `txid`, `page_count`, free-list head, and live count reach it with no second encoding. A
+client does not re-validate the manifest the meta names: the owner validated it at recovery or
+wrote it itself, and each page's own CRC-32 still catches transfer corruption on decode (`XX001`).
+
 When the returned `txid` advanced, or the reply is "invalidate all", the client reloads its
 catalog/interior skeleton and invalidates persistent plan caches for that database, as shared mode
 does today on a foreign `txid`.
@@ -210,6 +228,18 @@ the owner has received the complete `CommitDelta` and it passed validation (§5.
 the owner finishes the commit whether or not the connection survives, then releases the gate; the
 client resolves the outcome with `commit_status` (§8.4).
 
+**Attachments: one global acquisition order across owners** (decided at ratification). Each
+attached file has its own owner, so one process may own `main` and be a client of an attachment, or
+the reverse. The one-durable-writer-per-transaction rule ([attached-databases.md](attached-databases.md))
+is unchanged, and so is locking.md §6's conservative rule: a writable transaction acquires the writer
+gate of `main` and of every read-write file attachment, **in normalized (real-path) UTF-8 byte
+order**, whether a given gate is local (this process owns that file: its in-process gate) or remote
+(another process owns it: `begin_write` to that owner). Every process uses the same total order over
+the same real paths, so no wait cycle can form across owners. Each wait is also bounded by the session
+`lock_timeout_ms` (`55P03`) as a backstop, and an acquisition failure releases the gates already held
+in reverse order. A future target-declaring transaction API may narrow the set, as locking.md §6
+already allows.
+
 ### 5.6 Commit
 
 The client builds the `CommitDelta` with the ordinary v33 recipe ([validated-cow.md](validated-cow.md)):
@@ -253,7 +283,7 @@ carry everything required.
   persisted free list exactly as an alone process would; without it, the client allocates from the
   high-water, as a deferred in-process commit does today. Pins taken after `begin_write` are on the
   writer's base snapshot or later, so they cannot invalidate the grant.
-- **Free-list rebuilds are owner-only (proposed).** The periodic in-commit reclamation (the
+- **Free-list rebuilds are owner-only.** The periodic in-commit reclamation (the
   reachability walk once the high-water passes about twice the live count, storage.md §6) is O(live
   pages). Run by a remote client it would fetch the whole database. Instead a client commit never
   rebuilds; when a client commit crosses the rebuild threshold the owner runs a storage-maintenance
@@ -261,7 +291,8 @@ carry everything required.
   adds no latency to it, but the owner does not release the writer gate between the two, so no other
   writer starts in between. This makes a file's page layout depend on which
   process committed, which is fine for the cross-core contract (each role's rule is specified and
-  identical in every core) but must be modeled by simulation testing (§15). Open question §17.3.
+  identical in every core) but must be modeled by simulation testing (§15). Letting clients rebuild
+  too was rejected at ratification: a remote client would fetch the whole database to walk it.
 - **The maintenance commit is a new commit kind.** It changes only the free list, yet it writes
   pages, issues a barrier, and advances `txid`. [transactions.md](transactions.md) §2.1 (no mutation,
   no barrier, no `txid` advance) needs an explicit carve-out for it, and it is a distinct delta kind
@@ -448,7 +479,8 @@ these consequences of the owner model:
   or a push by a local sidecar subscriber to object storage (the Litestream model).
 - **Log-append failure** (disk full, I/O error) happens after the commit is durable. The owner records
   an explicit stream break (a new timeline) and keeps accepting writes; a broken stream is surfaced to
-  the host, never silent. Refusing writes until the log is healthy is an alternative policy (§17).
+  the host, never silent. Refusing writes until the log is healthy was rejected at ratification: it
+  would turn a backup-side fault into an application outage.
 
 ## 11. Serving
 
@@ -457,8 +489,17 @@ these consequences of the owner model:
 - `serve`: `true` (default where supported, §14 below) | `false`. A non-serving owner is today's
   `exclusive` mode.
 - `ownership`: `prefer` | `yield` | `never` (§8.2).
-- Owner-side limits: maximum concurrent connections, idle-session timeout, idle-in-transaction
-  timeout, yield and shutdown grace periods.
+- Owner-side limits, with these defaults (decided at ratification):
+
+  | Limit | Default | Meaning |
+  |---|---|---|
+  | yield grace period | 5 s | how long a yielding owner (§8.2) lets running transactions finish before aborting them with `08006` |
+  | shutdown grace period | 30 s | the same, for a graceful close (§8.3 step 3) |
+  | idle-session timeout | off (`0`) | a connection with no open transaction is never closed for idleness, as PostgreSQL's `idle_session_timeout` default |
+  | idle-in-transaction timeout | 60 s, **client write transactions only** | a client holding the global writer gate (§5.5) with no request in flight for this long is revoked: `25P03` at its next request. Read pins have no idle timeout: a pin stalls only reuse, never another writer |
+  | maximum concurrent connections | unlimited (`0`) | when set, a further connection is refused at `hello` with PostgreSQL's `53300 too_many_connections` (registered with the phase that implements the limit) |
+
+  `0` disables a timeout. These are owner settings; a client cannot change them.
 
 ### 11.2 Connection capabilities
 
@@ -471,7 +512,7 @@ corrupt the database regardless (§13).
 
 ## 12. Changes to the lock bundle and the shared protocol
 
-Superseded when ratified:
+Superseded when phase 4 (§16) lands — until then [locking.md](locking.md) binds unchanged:
 
 - shared mode: the join window and its `arrival` doorbell, alone↔shared transitions and the
   `transition` lock (locking.md §4.2–§4.3), meta refresh at transaction begin (§5.1), the
@@ -561,17 +602,24 @@ native code (the OS locks still use `impl/ts/native-lock`):
 
 Not every core needs to serve: the browser has one process, and WASI has no OS file locks.
 
-**Endpoint mechanics (open):**
+**Endpoint mechanics (decided at ratification; exact layout in
+[spec/pageservice/README.md](../pageservice/README.md) §5):**
 
-- **Path length.** Unix socket paths are limited to about 104–108 bytes, so a socket inside a deep
-  bundle path can fail to bind. Proposed: bind inside a `0700` per-user directory in the bundle
-  (`<path>.lock/<user>/endpoint`) when it fits, otherwise a short path in the user's private runtime
-  directory (`$XDG_RUNTIME_DIR` on Linux, the per-user `$TMPDIR` on macOS), recorded in the owner
-  record (§4.3). Linux's abstract namespace is rejected (no file permissions).
-- **Windows.** Go supports `AF_UNIX` on Windows. Rust's standard library does not, so the Rust core
-  needs named pipes or `AF_UNIX` through either a crate (a CLAUDE.md §14 dependency decision) or
-  `unsafe` FFI (a CLAUDE.md §13 decision). Until decided, Rust on Windows offers non-serving ownership
-  only.
+- **Location.** Unix socket paths are limited to about 104–108 bytes, so a socket inside a deep
+  bundle path can fail to bind. The endpoint is a stream socket inside a `0700` per-user directory in
+  the bundle (`<path>.lock/uid-<uid>/endpoint`) when that path fits in 100 bytes, otherwise a short
+  path in the user's private runtime directory (`$XDG_RUNTIME_DIR` on Linux, the per-user `$TMPDIR`
+  on macOS, else a `0700` `/tmp/jed-<uid>` directory the owner creates and verifies), named from the
+  owner's incarnation id. Either way the path is recorded in the owner record (§4.3), which is how
+  clients find it. Linux's abstract namespace is rejected (no file permissions). Always using a
+  runtime directory was rejected: the bundle keeps the endpoint beside the database it serves, and
+  the runtime directory exists only to work around the path-length limit.
+- **Windows.** Go supports `AF_UNIX` on Windows. Rust's standard library does not, and the choice
+  between a named-pipe crate (a CLAUDE.md §14 dependency) and `unsafe` FFI (a CLAUDE.md §13 decision)
+  is deferred until Windows serving is needed. **Until then the Rust core on Windows is a
+  non-serving owner only** (`serve = false`): it can own a database, but it neither serves clients
+  nor connects to another owner, so a second process opening the same database waits and fails
+  `55006` exactly as `exclusive` does today. The table above reads "yes" for Rust only on Unix.
 
 ## 15. Verification
 
@@ -620,22 +668,22 @@ process corpus and benchmarks use; `auto` keeps meaning shared mode. A service o
 shared-mode join windows, so tests never mix the two on one database. The test-only value is removed
 with shared mode (§12).
 
-## 17. Open questions
+## 17. Decisions at ratification
 
-1. **Endpoint location**: bundle with runtime-directory fallback (proposed), or always a runtime
-   directory?
-2. **Rust on Windows**: a named-pipe crate (needs CLAUDE.md §14 approval) or non-serving only at
-   first?
-3. **Reclamation**: owner-only rebuilds with maintenance commits (proposed), or clients rebuild too?
-4. **Grace periods and defaults** for yield, shutdown, idle sessions, and idle-in-transaction.
-5. **Freshness**: keep `begin_read` a round trip always (proposed), or allow an opt-in relaxed mode
-   in which owner-pushed commit notices let a client begin locally?
-6. **Log-append failure policy**: break the stream and keep writing (proposed), or refuse writes?
-7. **Query-level protocol over SSH**: deferred. It would only win for very large scans or
-   extractions where shipping rows beats shipping pages; the RAM-sized design target suggests batched
-   page fetches cover most remote use.
-8. **Attachments**: each attached file has its own owner, so one process may own `main` and be a
-   client of an attachment. The one-durable-writer-per-transaction rule is unchanged; confirm the
-   writer-gate acquisition order across owners avoids deadlock (locking.md §6 orders by path today).
-9. **Client request timeout** for a live but stuck owner (§4.1): none (proposed: the accepted
-   cost), or a client-side timeout, and with which SQLSTATE?
+The proposal's open questions were settled when this design was ratified (2026-10-16). Each decision
+now lives in the body; this table is the index.
+
+| Question | Decision | Where |
+|---|---|---|
+| Endpoint location | a `0700` per-user directory in the bundle, falling back to the user's runtime directory when the path is too long | §14, [spec/pageservice/](../pageservice/README.md) §5 |
+| Rust on Windows | non-serving owner only until Windows serving is needed; no dependency now | §14 |
+| Reclamation | owner-only free-list rebuilds, by maintenance commits | §6 |
+| Grace periods and defaults | yield 5 s, shutdown 30 s, idle session off, idle in transaction 60 s (client write transactions only) | §11.1 |
+| Freshness | `begin_read` is always a round trip | §5.3 |
+| Log-append failure | break the stream and keep accepting writes | §10 |
+| Attachments | every writer gate, local or remote, in real-path byte order; `lock_timeout_ms` as a backstop | §5.5 |
+| Client request timeout | none | §4.1 |
+
+**Deferred, not decided:** a query-level protocol over SSH. It would only win for very large scans or
+extractions where shipping rows beats shipping pages; the RAM-sized design target suggests batched
+page fetches cover most remote use.
