@@ -34,8 +34,17 @@ func blockingAccRow(a *acc) storedRow {
 		}
 		return storedRow{a.cur}
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict,
-		planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
+		planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique,
+		planArrayAgg:
 		return storedRow{BoolValue(a.seen)}
+	case planArrayAggArray:
+		// The seen flag, then the first input's shape: its dimension count and each (length, lower
+		// bound) pair, so a later input is checked against it.
+		row := storedRow{BoolValue(a.seen), IntValue(int64(len(a.arrDims)))}
+		for i := range a.arrDims {
+			row = append(row, IntValue(int64(a.arrDims[i])), IntValue(int64(a.arrLbounds[i])))
+		}
+		return row
 	default: // ordered-set and hypothetical-set: everything lives in the collection rows
 		return storedRow{}
 	}
@@ -67,8 +76,17 @@ func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
 			a.cur, a.hasCur = r[0], true
 		}
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict,
-		planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
+		planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique,
+		planArrayAgg:
 		a.seen = r[0].boolVal()
+	case planArrayAggArray:
+		a.seen = r[0].boolVal()
+		if n := int(r[1].Int); n > 0 {
+			a.arrDims, a.arrLbounds = make([]int, n), make([]int32, n)
+			for i := 0; i < n; i++ {
+				a.arrDims[i], a.arrLbounds[i] = int(r[2+2*i].Int), int32(r[3+2*i].Int)
+			}
+		}
 	}
 	return a
 }
@@ -283,7 +301,7 @@ func blockingFold(a *acc, v Value, m *costMeter, unique *stateMap, prefix []Valu
 	}
 	// The retained input now lives in the collection rows; drop it from the accumulator so a
 	// long-lived one (an ordered aggregate's finalize fold) never re-retains it.
-	a.jsonElems, a.objPairs, a.osaVals, a.osaFloats = nil, nil, nil, nil
+	a.jsonElems, a.objPairs, a.osaVals, a.osaFloats, a.arrElems = nil, nil, nil, nil, nil
 	return nil
 }
 
@@ -297,6 +315,11 @@ func blockingRetain(a *acc, owner uint64, collections *hashRows) error {
 	}
 	for _, pair := range a.objPairs {
 		if err := collections.push(owner, storedRow{TextValue(pair.key), pair.val}); err != nil {
+			return err
+		}
+	}
+	for _, v := range a.arrElems {
+		if err := collections.push(owner, storedRow{v}); err != nil {
 			return err
 		}
 	}
@@ -423,6 +446,15 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			fraction = &v
 		}
 		return db.blockingOrderedSet(a, fraction, collections, owner)
+	case planArrayAgg, planArrayAggArray:
+		if !a.seen {
+			return NullValue(), nil
+		}
+		var elems []Value
+		if err := collections.each(owner, func(row storedRow) error { elems = append(elems, row[0]); return nil }); err != nil {
+			return NullValue(), err
+		}
+		return finalizeArrayAgg(a.plan, elems)
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
 		if !a.seen {
 			return NullValue(), nil

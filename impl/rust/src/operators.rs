@@ -6763,6 +6763,15 @@ pub const AGGREGATES: &[AggregateDesc] = &[
         errors: &[],
     },
     AggregateDesc {
+        name: "array_agg",
+        surface: "array_agg",
+        arg: "expr",
+        arg_families: &["any"],
+        result: "array_of_input",
+        null: "aggregate",
+        errors: &["22004", "2202E", "54000", "42725"],
+    },
+    AggregateDesc {
         name: "jsonb_agg",
         surface: "jsonb_agg",
         arg: "expr",

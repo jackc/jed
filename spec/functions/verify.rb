@@ -93,7 +93,7 @@ REQUIRED_FIELDS  = %w[name kind arity arg_families arg_resolution result null er
 # Aggregate functions (kind = "aggregate") use a distinct field set and validation
 # branch — they are not operators (functions.md). `result` accepts a scalar id or one of
 # these reserved widening ids; `null` is the single "aggregate" skip-NULL discipline.
-RESERVED_AGG_RESULTS = %w[sum_widen same_as_input].to_set
+RESERVED_AGG_RESULTS = %w[sum_widen same_as_input array_of_input].to_set
 AGG_ARGS             = %w[star expr].to_set
 AGG_NULL_BEHAVIORS   = %w[aggregate].to_set
 AGG_REQUIRED_FIELDS  = %w[name kind surface arg result null errors].freeze

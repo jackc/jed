@@ -184,11 +184,14 @@ const (
 	planAvgFloat64                // AVG(f64) — fold sum / count, result f64
 	planMin
 	planMax
-	planBoolAnd        // bool_and(x) — TRUE iff every non-NULL input is TRUE (aggregates.md §23)
-	planBoolOr         // bool_or(x) — TRUE iff some non-NULL input is TRUE (aggregates.md §23)
-	planBitAnd         // bit_and(x) — the bitwise AND of the non-NULL integer inputs (aggregates.md §23)
-	planBitOr          // bit_or(x) — the bitwise OR of the non-NULL integer inputs
-	planBitXor         // bit_xor(x) — the bitwise XOR of the non-NULL integer inputs
+	planBoolAnd  // bool_and(x) — TRUE iff every non-NULL input is TRUE (aggregates.md §23)
+	planBoolOr   // bool_or(x) — TRUE iff some non-NULL input is TRUE (aggregates.md §23)
+	planBitAnd   // bit_and(x) — the bitwise AND of the non-NULL integer inputs (aggregates.md §23)
+	planBitOr    // bit_or(x) — the bitwise OR of the non-NULL integer inputs
+	planBitXor   // bit_xor(x) — the bitwise XOR of the non-NULL integer inputs
+	planArrayAgg // array_agg(x) — the inputs, NULLs included, as a 1-D array (aggregates.md §23)
+	// array_agg(x) over an array input — the inputs stacked into an array of one more dimension.
+	planArrayAggArray
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -284,7 +287,7 @@ type aggOrder struct {
 // the group non-empty — [], not NULL, as in PostgreSQL). Every other aggregate ignores NULLs.
 func (p aggPlan) distinctKeepsNull() bool {
 	switch p {
-	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
+	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict, planArrayAgg, planArrayAggArray:
 		return true
 	}
 	return false
@@ -332,6 +335,12 @@ type acc struct {
 	objPairs  []objAggPair
 	objAgg    bool
 	objUnique bool
+	// array_agg accumulator (aggregates.md §23): the inputs in fold order, NULLs included; `seen`
+	// marks the group non-empty. For an array input, arrDims/arrLbounds are the first input's shape,
+	// which every later input must match (nil before the first).
+	arrElems   []Value
+	arrDims    []int
+	arrLbounds []int32
 	// Ordered-set aggregate state (spec/design/aggregates.md §13): the WITHIN GROUP direction +
 	// the **evaluated** percentile fraction for this group, plus the collected non-NULL values
 	// (percentile_cont widens to f64 into osaFloats; mode/percentile_disc keep the Value in
@@ -459,6 +468,9 @@ func (a *acc) clone() *acc {
 		// acc's images (mirrors the floatSum slice clone above).
 		c.jsonElems = append([]Value(nil), a.jsonElems...)
 	}
+	if a.arrElems != nil {
+		c.arrElems = append([]Value(nil), a.arrElems...)
+	}
 	if a.objPairs != nil {
 		// Deep-copy the (key, value) pairs slice (as jsonElems above) so a cloned-finalize over a
 		// window peer-group doesn't alias the still-running acc.
@@ -571,6 +583,15 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				a.cur = IntValue(bitFold(a.plan, a.cur.Int, v.Int))
 			}
 		}
+	case planArrayAgg:
+		a.seen = true
+		a.arrElems = append(a.arrElems, v)
+	case planArrayAggArray:
+		if err := a.checkArrayAggInput(v); err != nil {
+			return err
+		}
+		a.seen = true
+		a.arrElems = append(a.arrElems, v)
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
 		// Mark the group non-empty even when the strict filter drops this row (an all-skipped group
 		// still finalizes to `[]`, not NULL — only a zero-row group is NULL).
@@ -652,6 +673,31 @@ func (a *acc) fold(v Value, m *costMeter) error {
 	return nil
 }
 
+// checkArrayAggInput validates one input of array_agg over arrays (PostgreSQL accumArrayResultArr,
+// aggregates.md §23): a NULL is 22004, an empty first input 2202E, a result past MAXDIM 54000, and
+// an input whose shape differs from the first's 2202E. The first input records the shape.
+func (a *acc) checkArrayAggInput(v Value) error {
+	if v.IsNull() {
+		return newError(NullValueNotAllowed, "cannot accumulate null arrays")
+	}
+	arr := v.arrayVal()
+	if a.arrDims == nil {
+		if arr.Ndim() == 0 {
+			return newError(ArraySubscriptError, "cannot accumulate empty arrays")
+		}
+		if arr.Ndim()+1 > arrayMaxDim {
+			return newError(ProgramLimitExceeded, fmt.Sprintf(
+				"number of array dimensions (%d) exceeds the maximum allowed (%d)", arr.Ndim()+1, arrayMaxDim))
+		}
+		a.arrDims, a.arrLbounds = arr.Dims, arr.Lbounds
+		return nil
+	}
+	if !intSliceEqual(arr.Dims, a.arrDims) || !int32SliceEqual(arr.Lbounds, a.arrLbounds) {
+		return newError(ArraySubscriptError, "cannot accumulate arrays of different dimensionality")
+	}
+	return nil
+}
+
 // bitFold applies a bit aggregate's bitwise operator (aggregates.md §23).
 func bitFold(plan aggPlan, cur, v int64) int64 {
 	switch plan {
@@ -683,6 +729,8 @@ func (a *acc) retainedBytes(v Value) int64 {
 		if v.IsNull() {
 			return 0
 		}
+		return memValueBytes(v)
+	case planArrayAgg, planArrayAggArray:
 		return memValueBytes(v)
 	}
 	return 0
@@ -844,6 +892,11 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), err
 		}
 		return JsonbValue(out), nil
+	case planArrayAgg, planArrayAggArray:
+		if !a.seen {
+			return NullValue(), nil
+		}
+		return finalizeArrayAgg(a.plan, a.arrElems)
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
 	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:
@@ -856,6 +909,16 @@ func (a *acc) finalize() (Value, error) {
 		}
 		return NullValue(), nil
 	}
+}
+
+// finalizeArrayAgg builds array_agg's result from a non-empty group's inputs (aggregates.md §23): a
+// 1-D array of the inputs, or — over array inputs, whose shapes the fold has already matched — the
+// inputs stacked into one more dimension (lower bound 1).
+func finalizeArrayAgg(plan aggPlan, elems []Value) (Value, error) {
+	if plan == planArrayAgg {
+		return ArrayValue(append([]Value(nil), elems...)), nil
+	}
+	return buildNestedArray(elems)
 }
 
 // finalizeOrderedSet computes an ordered-set aggregate's value over its collected group

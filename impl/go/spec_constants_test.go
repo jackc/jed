@@ -601,7 +601,7 @@ func TestRegistryCoversCatalog(t *testing.T) {
 	for i := range aggregates {
 		a := &aggregates[i]
 		switch a.Result {
-		case "i64", "decimal", "sum_widen", "same_as_input", "json", "jsonb", "boolean":
+		case "i64", "decimal", "sum_widen", "same_as_input", "json", "jsonb", "boolean", "array_of_input":
 		default:
 			t.Fatalf("aggregate %s has unhandled result code %s", a.Name, a.Result)
 		}

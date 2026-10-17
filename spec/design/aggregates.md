@@ -124,9 +124,9 @@ extremes, but the form is accepted for symmetry with PostgreSQL). De-duplication
 fold, **value-canonically** — the same `Eq`/`Hash` the group-key bucketing uses, so `1.5` and `1.50`
 are one value and `-0.0` and `+0.0` are one value — keeping the **first occurrence in scan order**.
 NULL arguments are skipped exactly as without `DISTINCT` (so an all-NULL / empty distinct group is
-`COUNT` `0` and `SUM`/`AVG` `NULL`) — except by the JSON array aggregates `json[b]_agg[_strict]`,
-whose transition function is not strict in PostgreSQL: there one NULL is kept as a distinct value
-(`jsonb_agg(DISTINCT x)` folds it as JSON `null`; the `_strict` variant then drops it in the fold but
+`COUNT` `0` and `SUM`/`AVG` `NULL`) — except by `array_agg` (§23) and the JSON array aggregates
+`json[b]_agg[_strict]`, whose transition functions are not strict in PostgreSQL: there one NULL is kept
+as a distinct value (`jsonb_agg(DISTINCT x)` folds it as JSON `null`; the `_strict` variant then drops it in the fold but
 the group is still non-empty, `[]` not NULL). The object aggregates de-duplicate the `(key, value)`
 pair. It composes with `GROUP BY` (de-duplication is per group). De-duplication needs an equality,
 so `DISTINCT` over a `json` argument is **`42883`** (*"could not identify an equality operator for
@@ -744,6 +744,7 @@ unmetered.
 | `bit_and(x)` | `i16`/`i32`/`i64` | the input type | the bitwise AND of the non-NULL inputs |
 | `bit_or(x)` | `i16`/`i32`/`i64` | the input type | the bitwise OR of the non-NULL inputs |
 | `bit_xor(x)` | `i16`/`i32`/`i64` | the input type | the bitwise XOR of the non-NULL inputs |
+| `array_agg(x)` | any | `T[]`, or the input array type | the inputs, NULLs included, as an array |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -754,3 +755,24 @@ the two's-complement bitwise operator and return the input's own type, so they n
 are order-insensitive; `bit_xor` is not idempotent, so `DISTINCT` changes its result. Their packed
 state on the bounded-spill lane is `[int or NULL]`. (PostgreSQL also defines them over `bit` strings,
 which jed does not have.)
+
+**`array_agg`.** `array_agg(x)` collects its inputs **including NULLs** in fold order: over a non-array
+`T` the result is the 1-D `T[]` with lower bound 1; it is NULL only over an empty group (a group of
+NULLs is `{NULL,…}`). `DISTINCT` keeps one NULL as a distinct value, as PostgreSQL's non-strict
+transition does. Over an **array** input the result is the same array type with one more dimension,
+the inputs stacked in fold order (PostgreSQL `accumArrayResultArr`): the outer dimension has lower
+bound 1 and the inner dimensions keep the inputs' lengths and lower bounds. Each input is checked as
+it is folded — a NULL input is `22004` (*"cannot accumulate null arrays"*); an empty first input is
+`2202E` (*"cannot accumulate empty arrays"*); a first input of 6 dimensions is `54000` (the result
+would pass `MAXDIM`); a later input whose dimension count, lengths, or lower bounds differ from the
+first's is `2202E` (*"cannot accumulate arrays of different dimensionality"*). An untyped `NULL`
+argument matches both forms and is `42725`, as in PostgreSQL. The catalog's reserved result id
+`array_of_input` names this typing.
+
+`array_agg` is **order-sensitive** ([determinism.md](determinism.md) §7): its result order is the fold
+order, which the in-aggregate `ORDER BY` (§22) fixes. Without it the fold follows the input order —
+deterministic in jed, unspecified in PostgreSQL — and `DISTINCT` keeps each value's first occurrence
+(§5), where PostgreSQL's sort-based dedup yields sorted order. It retains every input as query-memory
+operator state (`value_bytes(argument)` each, [memory.md](memory.md) §6.3); on the bounded-spill lane
+its inputs are retained aggregate rows `[value]` and its packed state is `[bool seen]`, or over array
+inputs `[bool seen, int ndim, (int length, int lower bound) per dimension of the first input]`.

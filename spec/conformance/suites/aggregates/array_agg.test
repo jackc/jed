@@ -1,0 +1,147 @@
+# Aggregate array_agg(x) (spec/design/aggregates.md §23): the inputs, NULLs included, in fold order,
+# as a 1-D array of the input type; over an array input, the inputs stacked into one more dimension.
+# NULL over an empty group. The fold order is the input order, so these records fix it with the
+# in-aggregate ORDER BY or a source ordered by its primary key. Output name `array_agg`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.aggregate_order_by, query.window_aggregate, types.i32, types.text, types.array, resource.cost_metering, func.array_agg
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, a i32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 30, 'pear'), (2, 1, NULL, 'fig'), (3, 1, 10, NULL), (4, 2, 20, 'a b'), (5, 2, 10, 'fig')
+
+# 5 rows read + 1 leaf page read + 5 accumulated + 1 produced.
+# names: array_agg
+# cost: 12
+query T nosort
+SELECT array_agg(a ORDER BY id) FROM t
+----
+{30,NULL,10,20,10}
+
+# names: array_agg
+query T nosort
+SELECT array_agg(s ORDER BY s DESC) FROM t
+----
+{NULL,pear,fig,fig,"a b"}
+
+# names: g, array_agg
+query IT rowsort
+SELECT g, array_agg(a ORDER BY a) FROM t GROUP BY g
+----
+1
+{10,30,NULL}
+2
+{10,20}
+
+# An empty group is NULL; a group of NULLs is an array of NULLs.
+# names: array_agg
+query T nosort
+SELECT array_agg(a) FROM t WHERE g = 9
+----
+NULL
+
+# names: array_agg
+query T nosort
+SELECT array_agg(a) FROM t WHERE a IS NULL
+----
+{NULL}
+
+# DISTINCT keeps one NULL, as a distinct value.
+# names: array_agg
+query T nosort
+SELECT array_agg(DISTINCT a ORDER BY a) FROM t
+----
+{10,20,30,NULL}
+
+# names: array_agg
+query T nosort
+SELECT array_agg(a ORDER BY id) FILTER (WHERE g = 2) FROM t
+----
+{20,10}
+
+# An expression argument.
+# names: array_agg
+query T nosort
+SELECT array_agg(a * 2 ORDER BY id) FROM t WHERE a IS NOT NULL
+----
+{60,20,40,20}
+
+# Unordered, over a primary-key-ordered source.
+# names: array_agg
+query T nosort
+SELECT array_agg(id) FROM t
+----
+{1,2,3,4,5}
+
+# The result is an ordinary array value.
+# names: array_length, array_agg
+query IT nosort
+SELECT array_length(array_agg(a), 1), (array_agg(s ORDER BY id))[2] FROM t
+----
+5
+fig
+
+# As a window function: a running collection over id order.
+# names: id, array_agg
+query IT nosort
+SELECT id, array_agg(a) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+{30}
+2
+{30,NULL}
+3
+{30,NULL,10}
+4
+{30,NULL,10,20}
+5
+{30,NULL,10,20,10}
+
+# Over array inputs: the inputs stacked into one more dimension.
+statement ok
+CREATE TABLE m (id i32 PRIMARY KEY, v i32[])
+
+statement ok
+INSERT INTO m VALUES (1, ARRAY[1, 2]), (2, ARRAY[3, 4]), (3, ARRAY[5, NULL])
+
+# names: array_agg
+query T nosort
+SELECT array_agg(v ORDER BY id) FROM m
+----
+{{1,2},{3,4},{5,NULL}}
+
+# names: array_agg
+query T nosort
+SELECT array_agg(ARRAY[v, v] ORDER BY id) FROM m WHERE id < 3
+----
+{{{1,2},{1,2}},{{3,4},{3,4}}}
+
+# The stacked value keeps the inputs' lower bounds in its inner dimensions.
+# names: array_agg
+query T nosort
+SELECT array_agg('[0:1]={7,8}'::i32[]) FROM m
+----
+[1:3][0:1]={{7,8},{7,8},{7,8}}
+
+# names: array_ndims
+query I nosort
+SELECT array_ndims(array_agg(v)) FROM m
+----
+2
+
+# An array input may not be NULL, empty (first), or of a different shape.
+statement ok
+INSERT INTO m VALUES (4, NULL)
+
+statement error 22004
+SELECT array_agg(v ORDER BY id) FROM m
+
+statement error 2202E
+SELECT array_agg('{}'::i32[]) FROM m
+
+statement error 2202E
+SELECT array_agg(CASE WHEN id = 2 THEN ARRAY[1] ELSE ARRAY[1, 2] END ORDER BY id) FROM m
+
+# An untyped NULL argument matches both the element and the array form.
+statement error 42725
+SELECT array_agg(NULL) FROM t

@@ -6093,6 +6093,11 @@ pub(crate) enum AggPlan {
     /// bit_and / bit_or / bit_xor(x) — the bitwise fold of the non-NULL integer inputs, result the
     /// input type (aggregates.md §23).
     Bit(BitOp),
+    /// array_agg(x) — the inputs, NULLs included, in fold order (aggregates.md §23): a 1-D array, or
+    /// over an array input (`nested`) the inputs stacked into one more dimension.
+    ArrayAgg {
+        nested: bool,
+    },
     /// json_agg / jsonb_agg (and the `_strict` variants) — aggregate the inputs' JSON images into a
     /// JSON array (json-sql-functions.md §4). `compact` selects the `json` (compact) vs `jsonb`
     /// (canonical) result render; `strict` skips a NULL input (else a NULL → JSON null).
@@ -6140,7 +6145,7 @@ impl AggPlan {
     /// folds a NULL (even the `_strict` variants, which then drop it in the fold but still mark the
     /// group non-empty — `[]`, not NULL, as in PostgreSQL). Every other aggregate ignores NULLs.
     pub(crate) fn distinct_keeps_null(self) -> bool {
-        matches!(self, AggPlan::JsonAgg { .. })
+        matches!(self, AggPlan::JsonAgg { .. } | AggPlan::ArrayAgg { .. })
     }
 }
 
@@ -6272,6 +6277,15 @@ pub(crate) enum Acc {
     Bit {
         cur: Option<i64>,
         op: BitOp,
+    },
+    /// array_agg: the inputs in fold order, NULLs included; `seen` marks the group non-empty. For an
+    /// array input (`nested`), `shape` is the first input's `(dims, lbounds)`, which every later
+    /// input must match (`None` before the first).
+    ArrayAgg {
+        elems: Vec<Value>,
+        seen: bool,
+        nested: bool,
+        shape: Option<(Vec<usize>, Vec<i32>)>,
     },
     MinMax {
         cur: Option<Value>,

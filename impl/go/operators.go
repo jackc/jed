@@ -6763,6 +6763,15 @@ var aggregates = []aggregateDesc{
 		Errors:      []string{},
 	},
 	{
+		Name:        "array_agg",
+		Surface:     "array_agg",
+		Arg:         "expr",
+		ArgFamilies: []string{"any"},
+		Result:      "array_of_input",
+		Null:        "aggregate",
+		Errors:      []string{"22004", "2202E", "54000", "42725"},
+	},
+	{
 		Name:        "jsonb_agg",
 		Surface:     "jsonb_agg",
 		Arg:         "expr",

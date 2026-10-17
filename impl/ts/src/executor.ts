@@ -32240,6 +32240,8 @@ export type AggPlan =
   | "bitAnd" // bit_and(x) — the bitwise AND of the non-NULL integer inputs (aggregates.md §23)
   | "bitOr" // bit_or(x) — the bitwise OR of the non-NULL integer inputs
   | "bitXor" // bit_xor(x) — the bitwise XOR of the non-NULL integer inputs
+  | "arrayAgg" // array_agg(x) — the inputs, NULLs included, as a 1-D array (aggregates.md §23)
+  | "arrayAggArray" // array_agg(x) over an array input — stacked into one more dimension
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32341,7 +32343,7 @@ export type AggOrder = {
 // still mark the group non-empty — [], not NULL, as in PostgreSQL). Every other aggregate ignores
 // NULLs.
 export function aggDistinctKeepsNull(plan: AggPlan): boolean {
-  return plan === "jsonAgg";
+  return plan === "jsonAgg" || plan === "arrayAgg" || plan === "arrayAggArray";
 }
 
 // KeySort is a single WITHIN GROUP ordering-key sort spec (aggregates.md §13/§19): direction, NULL
@@ -32510,6 +32512,10 @@ export type Acc = {
   // input nullValue()) for json_agg, a jsonb value for jsonb_agg — and the two flags fixed at
   // resolve (asJson → json result; strict → skip a NULL-valued row).
   jsonElems: Value[];
+  // For the array_agg plans (aggregates.md §23): the inputs in fold order, NULLs included (`seen`
+  // marks the group non-empty). Over array inputs, `cur` holds the first input, whose shape every
+  // later input must match.
+  arrElems: Value[];
   jsonAsJson: boolean;
   jsonStrict: boolean;
   // For the "jsonObjectAgg" plan (B4): the (key text, value image) pairs in row order (the image as
@@ -32571,6 +32577,7 @@ export function newAcc(
     floatNegInf: false,
     floatWidth,
     jsonElems: [],
+    arrElems: [],
     jsonAsJson,
     jsonStrict,
     jsonPairs: [],
@@ -32642,6 +32649,51 @@ export function newAccFromSpecUnordered(s: AggSpec, zone: ZoneRef): Acc {
   return a;
 }
 
+// checkArrayAggInput validates one input of array_agg over arrays (PostgreSQL accumArrayResultArr,
+// aggregates.md §23): a NULL is 22004, an empty first input 2202E, a result past MAXDIM 54000, and an
+// input whose shape differs from the first's 2202E. The first input is kept in a.cur as the shape.
+function checkArrayAggInput(a: Acc, v: Value): void {
+  if (v.kind === "null") throw engineError("null_value_not_allowed", "cannot accumulate null arrays");
+  if (v.kind !== "array") throw new Error("a nested array_agg holds only arrays");
+  const first = a.cur;
+  if (first === null) {
+    if (v.dims.length === 0)
+      throw engineError("array_subscript_error", "cannot accumulate empty arrays");
+    if (v.dims.length + 1 > 6)
+      throw engineError(
+        "program_limit_exceeded",
+        `number of array dimensions (${v.dims.length + 1}) exceeds the maximum allowed (6)`,
+      );
+    a.cur = v;
+    return;
+  }
+  const f = first as { dims: number[]; lbounds: number[] };
+  const same =
+    f.dims.length === v.dims.length &&
+    f.dims.every((d, i) => d === v.dims[i] && f.lbounds[i] === v.lbounds[i]);
+  if (!same)
+    throw engineError(
+      "array_subscript_error",
+      "cannot accumulate arrays of different dimensionality",
+    );
+}
+
+// finalizeArrayAgg builds array_agg's result over a non-empty group's inputs (aggregates.md §23): a
+// 1-D array of the inputs, or — over array inputs, whose shapes the fold has already matched — the
+// inputs stacked into one more dimension (lower bound 1).
+export function finalizeArrayAgg(plan: AggPlan, elems: Value[]): Value {
+  if (plan === "arrayAgg") return arrayValue(elems.slice());
+  const first = elems[0] as { dims: number[]; lbounds: number[] };
+  const elements: Value[] = [];
+  for (const e of elems) elements.push(...(e as { elements: Value[] }).elements);
+  return {
+    kind: "array",
+    dims: [elems.length, ...first.dims],
+    lbounds: [1, ...first.lbounds],
+    elements,
+  };
+}
+
 // cloneAcc deep-copies a running accumulator so the window stage can SNAPSHOT it at each peer-group
 // boundary and finalize the snapshot without consuming the running fold (spec/design/window.md §6;
 // the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values) and the float fold
@@ -32653,6 +32705,7 @@ export function cloneAcc(a: Acc): Acc {
   return {
     ...a,
     jsonElems: a.jsonElems.slice(),
+    arrElems: a.arrElems.slice(),
     jsonPairs: a.jsonPairs.slice(),
     osaVals: a.osaVals ? a.osaVals.slice() : undefined,
     osaFloats: a.osaFloats ? a.osaFloats.slice() : undefined,
@@ -32753,6 +32806,12 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
         }
       }
       break;
+    case "arrayAgg":
+    case "arrayAggArray":
+      if (a.plan === "arrayAggArray") checkArrayAggInput(a, v);
+      a.seen = true;
+      a.arrElems.push(v);
+      break;
     case "jsonAgg":
       // Called once per group row, NULL-valued rows INCLUDED. `seen` marks the group non-empty even
       // when the strict filter drops this row (so a one-NULL-row strict group finalizes to [] not
@@ -32831,6 +32890,9 @@ export function accRetainedBytes(a: Acc, v: Value): number {
     case "percentileCont":
     case "orderedSetContInterval":
       return v.kind === "null" ? 0 : valueBytes(v);
+    case "arrayAgg":
+    case "arrayAggArray":
+      return valueBytes(v);
     default:
       return 0;
   }
@@ -32903,6 +32965,9 @@ export function finalizeAcc(a: Acc): Value {
     case "bitOr":
     case "bitXor":
       return a.cur ?? nullValue();
+    case "arrayAgg":
+    case "arrayAggArray":
+      return a.seen ? finalizeArrayAgg(a.plan, a.arrElems) : nullValue();
     case "jsonAgg": {
       // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array (json:
       // PG's ", "-joined element texts; jsonb: the canonical array).
@@ -34324,6 +34389,7 @@ export function resolveAggregate(
     operand = r.node;
     const desc = lookupAggregateOverload(name, r.type);
     if (!desc) throw noAggOverload(name);
+    checkPolymorphicAggOperand(desc, r.type);
     [plan, result, floatWidth, jsonFlags] = aggregatePlan(name, desc.result, r.type);
     // A JSON aggregate converts each input by its static type (json-sql-functions.md §4).
     if (plan === "jsonAgg") jsonTypes = [r.type];
@@ -35021,6 +35087,7 @@ export function resolveWindowCall(
       const r = resolve(scope, e.args[0]!, null, sub, params);
       const desc = lookupAggregateOverload(lname, r.type);
       if (!desc) throw noAggOverload(lname);
+      checkPolymorphicAggOperand(desc, r.type);
       [aggPlan, result, aggFloatWidth, aggJsonFlags] = aggregatePlan(lname, desc.result, r.type);
       wargs.push(r.node); // the aggregate operand → args[0]
       if (aggPlan === "jsonAgg") aggJsonTypes = [r.type];
@@ -35586,6 +35653,14 @@ export function lookupAggregateOverload(
 // widening — aggregates.md §3). The plan is the aggregate's kernel id (fold/finalize switch on it);
 // selecting it from the registered result code keeps the name gate + overload validation
 // data-driven while the kernel stays hand-written (§5). surface is the (folded) call name.
+// checkPolymorphicAggOperand rejects an untyped NULL operand of an aggregate whose result type is
+// derived from it (array_agg — aggregates.md §23). PostgreSQL's 42725: array_agg has an element and
+// an array overload, and an unknown argument matches both.
+function checkPolymorphicAggOperand(desc: AggregateDesc, t: ResolvedType): void {
+  if (desc.result === "array_of_input" && t.kind === "null")
+    throw ambiguousFuncOverload(desc.surface.toLowerCase());
+}
+
 export function aggregatePlan(
   surface: string,
   code: string,
@@ -35615,6 +35690,11 @@ export function aggregatePlan(
   if (surface === "bit_and" && code === "same_as_input") return ["bitAnd", t, undefined];
   if (surface === "bit_or" && code === "same_as_input") return ["bitOr", t, undefined];
   if (surface === "bit_xor" && code === "same_as_input") return ["bitXor", t, undefined];
+  // An array input stacks into one more dimension of the same (dimension-agnostic) array type.
+  if (surface === "array_agg" && code === "array_of_input")
+    return t.kind === "array"
+      ? ["arrayAggArray", t, undefined]
+      : ["arrayAgg", { kind: "array", elem: t }, undefined];
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (B4). The (surface, result-code) pair
   // selects the result type + the two flags; the result code is "jsonb" or "json". asJson = the json
   // result type; strict = the _strict variant (skip a NULL-valued row).
@@ -37258,6 +37338,13 @@ function packedStateBytes(accs: Acc[]): number {
       case "bitXor":
         n += valueBytes(a.cur ?? nullValue());
         break;
+      case "arrayAgg":
+        n += MEMORY_VALUE;
+        break;
+      case "arrayAggArray":
+        // [bool seen, int ndim, (int length, int lower bound) per dimension of the first input].
+        n += (2 + 2 * (a.cur === null ? 0 : (a.cur as { dims: number[] }).dims.length)) * MEMORY_VALUE;
+        break;
       default:
         break;
     }
@@ -37287,6 +37374,12 @@ function foldBlockingCollection(
       collections.append(key, [
         a.plan === "percentileCont" ? float64Value(percentileInputF64(value)) : value,
       ]);
+    return true;
+  }
+  if (a.plan === "arrayAgg" || a.plan === "arrayAggArray") {
+    if (a.plan === "arrayAggArray") checkArrayAggInput(a, value);
+    a.seen = true;
+    collections.append(key, [value]);
     return true;
   }
   if (a.plan === "jsonAgg" || a.plan === "jsonObjectAgg") {
@@ -37412,6 +37505,12 @@ function finalizeBlockingCollection(
       default:
         throw new Error("hypothetical aggregate plan required");
     }
+  }
+  if (a.plan === "arrayAgg" || a.plan === "arrayAggArray") {
+    if (!a.seen) return nullValue();
+    const elems: Value[] = [];
+    for (const row of collections.get(key)) elems.push(row[0]!);
+    return finalizeArrayAgg(a.plan, elems);
   }
   if (a.plan === "jsonAgg") {
     if (!a.seen) return nullValue();

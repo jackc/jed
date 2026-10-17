@@ -1532,6 +1532,7 @@ mod registry_tests {
                         | "jsonb"
                         | "json"
                         | "boolean"
+                        | "array_of_input"
                 ),
                 "aggregate {} has unhandled result code {}",
                 a.name,
