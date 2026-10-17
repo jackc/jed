@@ -393,6 +393,20 @@ func gistExcludeTableDB(t *testing.T) *Session {
 	return db
 }
 
+// excludeFollowonTableDB is the v45 exclusion follow-ons golden (spec/design/gist.md §7.1/§7.2): an
+// EXCLUDE USING btree whose backing index is an ordered, non-unique two-column B-tree, beside a
+// partial EXCLUDE USING gist … WHERE (b > 0) whose GiST index carries the predicate and holds only
+// rows 1 and 4. Mirrors the Ruby reference's EXCLUDE_FOLLOWON_TABLE.
+func excludeFollowonTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, c text, span i32range, b i32, "+
+		"EXCLUDE USING btree (a WITH =, c WITH =), "+
+		"EXCLUDE USING gist (span WITH &&) WHERE (b > 0))")
+	run(t, db, "INSERT INTO t VALUES (1, 1, 'x', '[1,5)', 1), (2, 1, 'y', '[1,5)', 0), "+
+		"(3, 2, 'x', '[3,8)', NULL), (4, NULL, 'x', '[10,20)', 2), (5, 1, NULL, '[2,4)', -1)")
+	return db
+}
+
 // ginUuidTableDB has a GIN index over a uuid[] column (kind 1) — the non-integer GIN element-type
 // golden (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte uuid-raw16 key encoding,
 // so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
@@ -1192,6 +1206,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"gist_range_table.jed", gistRangeTableDB},
 		{"gist_scalar_table.jed", gistScalarTableDB},
 		{"gist_exclude_table.jed", gistExcludeTableDB},
+		{"exclude_followon_table.jed", excludeFollowonTableDB},
 		{"array_composite_table.jed", arrayCompositeTableDB},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB},
 		{"composite_range_field_table.jed", compositeRangeFieldTableDB},
@@ -1281,6 +1296,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"gist_range_table.jed", gistRangeTableDB, "t"},
 		{"gist_scalar_table.jed", gistScalarTableDB, "t"},
 		{"gist_exclude_table.jed", gistExcludeTableDB, "booking"},
+		{"exclude_followon_table.jed", excludeFollowonTableDB, "t"},
 		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB, "t"},
 		{"composite_range_field_table.jed", compositeRangeFieldTableDB, "t"},

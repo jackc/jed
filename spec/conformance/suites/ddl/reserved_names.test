@@ -86,7 +86,7 @@ CREATE TABLE u1 (a i32, CONSTRAINT jed_u UNIQUE (a))
 
 # same for a named EXCLUDE constraint's backing GiST index (gist.md §7)
 statement error 42939
-CREATE TABLE e1 (id i32 PRIMARY KEY, r i32range, CONSTRAINT jed_e EXCLUDE (r WITH &&))
+CREATE TABLE e1 (id i32 PRIMARY KEY, r i32range, CONSTRAINT jed_e EXCLUDE USING gist (r WITH &&))
 
 # --- the type namespace: composite types -----------------------------------------------------------
 

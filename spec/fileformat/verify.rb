@@ -27,7 +27,12 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 44 # v44: a composite column may carry an expression DEFAULT — column flags bit3 + the
+VERSION = 45 # v45: exclusion-constraint follow-ons (gist.md §7.1/§7.2) — no byte layout change; the
+# v27 has_predicate bit is legal on a GiST index backing an exclusion (EXCLUDE … WHERE (predicate)),
+# and an exclusion may name a non-unique ordered (btree) backing index whose operators are all `=`
+# (EXCLUDE USING btree). A fixture index's `where:` lambda mirrors its predicate (this reference does
+# not evaluate SQL): only rows it admits are indexed.
+             # v44: a composite column may carry an expression DEFAULT — column flags bit3 + the
              # expr-text (u16 length + UTF-8) after the type name (composite.md §12). No other byte
              # layout change. v43: timestamp(p) / interval qualifier typmods — a timestamp/timestamptz column or
              # composite field appends u8 precision (0xFF = none), an interval one u8 fields ‖ u8
@@ -1177,6 +1182,28 @@ GIST_EXCLUDE_TABLE = {
          [7, 105, rng(1, 5)], [8, nil, rng(10, 20)]]
 }.freeze
 
+# The v45 exclusion follow-ons (spec/design/gist.md §7.1/§7.2): an `EXCLUDE USING btree (a WITH =,
+# c WITH =)` whose backing index `t_a_c_excl` is an ORDERED, NON-unique two-column B-tree (index_kind
+# 0, index_flags 0 — every row has an entry, NULL slots included) beside a partial `EXCLUDE USING gist
+# (span WITH &&) WHERE (b > 0)` whose backing GiST index `t_span_excl` carries the v27 predicate bit +
+# text and holds only the rows with b > 0 (rows 1 and 4). The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, a i32, c text, span i32range, b i32,
+#     EXCLUDE USING btree (a WITH =, c WITH =), EXCLUDE USING gist (span WITH &&) WHERE (b > 0))
+#   INSERT INTO t VALUES (1, 1, 'x', '[1,5)', 1), (2, 1, 'y', '[1,5)', 0), (3, 2, 'x', '[3,8)', NULL),
+#     (4, NULL, 'x', '[10,20)', 2), (5, 1, NULL, '[2,4)', -1)
+EXCLUDE_FOLLOWON_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("a", "i32"), col("c", "text"), col("span", "i32range"),
+            col("b", "i32")],
+  indexes: [{ name: "t_a_c_excl", cols: [1, 2] },
+            { name: "t_span_excl", cols: [3], kind: "gist", predicate: "b > 0",
+              where: ->(row) { !row[4].nil? && row[4] > 0 } }],
+  exclusions: [{ name: "t_a_c_excl", index: "t_a_c_excl", elements: [[1, "="], [2, "="]] },
+               { name: "t_span_excl", index: "t_span_excl", elements: [[3, "&&"]] }],
+  rows: [[1, 1, "x", rng(1, 5), 1], [2, 1, "y", rng(1, 5), 0], [3, 2, "x", rng(3, 8), nil],
+         [4, nil, "x", rng(10, 20), 2], [5, 1, nil, rng(2, 4), -1]]
+}.freeze
+
 # GIN indexes over f64[] and f32[] columns (the float GIN element golden, spec/design/gin.md §2/§4):
 # each GIN term is the element's canonicalizing float-order-preserving key (encoding.md §2.8), so
 # -0 and +0 share a term (row 1's tags), every NaN is ONE term (row 2's two NaNs; row 2's r), and
@@ -1589,7 +1616,9 @@ COLLATION_SKEW_TWIN_TABLE = {
 #   c — a parsable CHECK c_ok (v > 0) and an unparsed c_v_check;
 #   d — an unparsed expression DEFAULT on v and a parsable one (1 + 1) on k;
 #   x — an unparsed expression index x_future_idx beside a plain index x_v_idx on v;
-#   p — a UNIQUE partial index p_future_idx on v whose predicate is unparsed.
+#   p — a UNIQUE partial index p_future_idx on v whose predicate is unparsed;
+#   e — a partial exclusion e_r_excl (EXCLUDE USING gist (r WITH &&) WHERE (…), v45) whose predicate
+#       is unparsed, its GiST index forged empty over two overlapping rows.
 UNPARSABLE_DEFINITIONS = {
   tables: [
     { name: "t", columns: [col("id", "i32", pk: true), col("v", "i32")],
@@ -1607,7 +1636,12 @@ UNPARSABLE_DEFINITIONS = {
     { name: "p", columns: [col("id", "i32", pk: true), col("v", "i32")],
       indexes: [{ name: "p_future_idx", cols: [1], unique: true, predicate: "v is future syntax",
                   forged_empty: true }],
-      rows: [[1, 1], [2, 2]] }
+      rows: [[1, 1], [2, 2]] },
+    { name: "e", columns: [col("id", "i32", pk: true), col("r", "i32range")],
+      indexes: [{ name: "e_r_excl", cols: [1], kind: "gist", predicate: "r is future syntax",
+                  forged_empty: true }],
+      exclusions: [{ name: "e_r_excl", index: "e_r_excl", elements: [[1, "&&"]] }],
+      rows: [[1, rng(1, 5)], [2, rng(3, 8)]] }
   ],
   views: [
     { name: "ok", columns: %w[id v], definition: "select id , v from t where v > 0",
@@ -1752,6 +1786,7 @@ FIXTURES = ([
   { file: "gist_range_table.jed", page_size: 256, tables: [GIST_RANGE_TABLE] },
   { file: "gist_scalar_table.jed", page_size: 256, tables: [GIST_SCALAR_TABLE] },
   { file: "gist_exclude_table.jed", page_size: 256, tables: [GIST_EXCLUDE_TABLE] },
+  { file: "exclude_followon_table.jed", page_size: 256, tables: [EXCLUDE_FOLLOWON_TABLE] },
   { file: "json_table.jed", page_size: 256, tables: [JSON_TABLE] },
   { file: "jsonb_table.jed", page_size: 256, tables: [JSONB_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
@@ -2812,6 +2847,12 @@ def index_entry_key(table, ix, storage_key, row)
   out
 end
 
+# Whether a (partial) index holds `row`: a fixture's `where:` lambda mirrors the index's SQL predicate
+# (indexes.md §9, gist.md §7.1); an index without one holds every row.
+def index_admits?(ix, row)
+  ix[:where].nil? || ix[:where].call(row)
+end
+
 # An index's (entry_key, record-plan) pairs in entry-key order. An index record has an EMPTY
 # payload (key only — format.md "Index trees"), so its plan is trivially inline. `forged_empty: true`
 # authors an index whose tree is empty although the table has rows: the stand-in for an index a newer
@@ -2819,7 +2860,7 @@ end
 # wrongly trusts it loses rows.
 def index_entries(table, ix)
   return [] if ix[:forged_empty]
-  table_entries(table).map do |storage_key, row|
+  table_entries(table).select { |_k, row| index_admits?(ix, row) }.map do |storage_key, row|
     key = index_entry_key(table, ix, storage_key, row)
     [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
   end.sort_by { |key, _| key }
@@ -3134,10 +3175,12 @@ end
 # One leaf entry per row with NO NULL indexed column (any NULL → the row is not indexed, gist.md
 # §4.1/§7). An empty index serializes nothing and returns root 0 (the empty-index convention).
 def serialize_gist_index(table, ix, next_index, pages)
+  return [0, next_index] if ix[:forged_empty]
+
   ops = gist_opclasses_for(table, ix)
   entries = []
   table_entries(table).each do |storage_key, row|
-    next if ix[:cols].any? { |ci| row[ci].nil? }
+    next if ix[:cols].any? { |ci| row[ci].nil? } || !index_admits?(ix, row)
 
     entries << [gist_leaf_bound(ops, row, ix[:cols]), storage_key]
   end
@@ -3149,10 +3192,12 @@ end
 # A GiST index's leaf keys (bound ‖ skey), one per fully-non-NULL indexed row, sorted bytewise — the
 # SET a round-trip read must reproduce (order-independent: the comparison sorts).
 def gist_leaf_keys_sorted(table, ix)
+  return [] if ix[:forged_empty]
+
   ops = gist_opclasses_for(table, ix)
   keys = []
   table_entries(table).each do |storage_key, row|
-    next if ix[:cols].any? { |ci| row[ci].nil? }
+    next if ix[:cols].any? { |ci| row[ci].nil? } || !index_admits?(ix, row)
 
     keys << (gist_encode_bound(ops, gist_leaf_bound(ops, row, ix[:cols])) + storage_key).b
   end
@@ -4264,9 +4309,10 @@ def decode_table_entry(buf, pos)
     kb, pos = take(buf, pos, 1) # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
     raise "reserved index kind (only 0=btree, 1=gin, 2=gist defined — v20)" if kb.getbyte(0) > 2
     has_predicate = (fb.getbyte(0) & 0b10) != 0
-    raise "a non-btree index cannot be partial (v27)" if has_predicate && kb.getbyte(0) != 0
+    # v45: a GiST index may be partial (the backing index of EXCLUDE … WHERE, gist.md §7.1).
+    raise "a gin index cannot be partial (v27)" if has_predicate && kb.getbyte(0) == 1
     has_host_deps = (fb.getbyte(0) & 0b100) != 0
-    raise "a non-btree index cannot have host-function dependencies (v31)" if has_host_deps && kb.getbyte(0) != 0
+    raise "a non-btree index cannot have host-function dependencies (v31)" if has_host_deps && kb.getbyte(0) != 0 && !(kb.getbyte(0) == 2 && has_predicate)
     rb, pos = take(buf, pos, 4)
     # v27: the partial-index predicate canonical text follows index_root_page when bit1 is set.
     predicate = nil
@@ -4279,7 +4325,7 @@ def decode_table_entry(buf, pos)
     host_deps, pos = read_host_deps(buf, pos) if has_host_deps
     timezone_deps = nil
     if (fb.getbyte(0) & 8) != 0
-      raise "a non-btree index cannot have timezone dependencies" if kb.getbyte(0) != 0
+      raise "a non-btree index cannot have timezone dependencies" if kb.getbyte(0) != 0 && !(kb.getbyte(0) == 2 && has_predicate)
       db, pos = take(buf, pos, 1)
       dc, pos = take(buf, pos, 2)
       dynamic, count = db.getbyte(0), dc.unpack1("n")

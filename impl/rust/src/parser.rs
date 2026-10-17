@@ -1244,8 +1244,9 @@ impl Parser {
     /// Parse one `[CONSTRAINT name] EXCLUDE [USING method] ( col WITH op [, col2 WITH op2 ...] )`
     /// (the cursor is verified by `at_exclusion_table_constraint`). Each operand is a bare column
     /// name; the `WITH` operator is captured as its source text (`=` / `&&`) and mapped to a
-    /// strategy at execution (spec/design/gist.md §7). The `USING` method (only `gist`) is captured
-    /// verbatim and validated at execution.
+    /// strategy at execution (spec/design/gist.md §7). The `USING` method (`btree` / `gist`) is
+    /// captured verbatim and validated at execution; an optional `WHERE ( predicate )` follows
+    /// (the partial form, §7.1).
     fn parse_exclusion_table_constraint(&mut self) -> Result<ExcludeDef> {
         let name = if self.peek_keyword().as_deref() == Some("constraint") {
             self.advance();
@@ -1276,10 +1277,25 @@ impl Parser {
                 other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
             }
         }
+        // The partial form `WHERE ( predicate )` (gist.md §7.1) — PostgreSQL's ExclusionWhereClause
+        // requires the parentheses. The text captured is the inner expression's (the partial-index
+        // predicate's canonical form, indexes.md §9).
+        let predicate = if self.peek_keyword().as_deref() == Some("where") {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            let start = self.pos;
+            let expr = self.parse_expr()?;
+            let text = render_tokens(&self.tokens[start..self.pos]);
+            self.expect(&Token::RParen)?;
+            Some(IndexPredicate { text, expr })
+        } else {
+            None
+        };
         Ok(ExcludeDef {
             name,
             using,
             elements,
+            predicate,
         })
     }
 

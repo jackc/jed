@@ -135,7 +135,12 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v44: a composite column may carry an expression DEFAULT — column flags bit3 (default_is_expr),
 // with the expr-text (u16 length + UTF-8) after the type name (spec/design/composite.md §12); any
 // other composite column flag but not_null is corrupt. No other byte layout change.
-pub(crate) const FORMAT_VERSION: u16 = 44;
+// v45: exclusion-constraint follow-ons (spec/design/gist.md §7.1/§7.2) — no byte layout change; the
+// v27 `has_predicate` bit is now legal on a GiST index that backs an exclusion constraint (the
+// partial `EXCLUDE … WHERE (predicate)`), and an exclusion constraint may name an ordered (btree,
+// `index_kind 0`, non-unique) backing index whose every element operator is `=` (`EXCLUDE USING
+// btree`). A v44 reader rejected both shapes as corrupt, hence the version break.
+pub(crate) const FORMAT_VERSION: u16 = 45;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -5640,23 +5645,40 @@ fn validate_loaded_references(snap: &Snapshot) -> Result<()> {
                 )));
             }
         }
-        for ex in &t.exclusions {
-            let Some(index) = t
-                .indexes
-                .iter()
-                .find(|i| i.name == ex.index && i.kind == IndexKind::Gist)
-            else {
+        // A partial GiST index exists only as a partial exclusion's backing index (v45, gist.md
+        // §7.1).
+        for i in &t.indexes {
+            if i.kind == IndexKind::Gist
+                && i.predicate.is_some()
+                && !t.exclusions.iter().any(|e| e.index == i.name)
+            {
                 return Err(corrupt(&format!(
-                    "exclusion constraint {} has no backing GiST index",
+                    "partial gist index {} backs no exclusion constraint",
+                    i.name
+                )));
+            }
+        }
+        for ex in &t.exclusions {
+            // The backing index is a GiST index (gist.md §7) or, for `EXCLUDE USING btree`
+            // (v45, §7.2), a NON-unique ordered index whose every operator is `=`.
+            let Some(index) = t.indexes.iter().find(|i| {
+                i.name == ex.index
+                    && (i.kind == IndexKind::Gist || (i.kind == IndexKind::Btree && !i.unique))
+            }) else {
+                return Err(corrupt(&format!(
+                    "exclusion constraint {} has no backing GiST or btree index",
                     ex.name
                 )));
             };
             // The probe pairs element i with index column i and builds its query from the
             // operator, so the two lists must agree and each operator must fit its column.
             let element_columns: Vec<usize> = ex.elements.iter().map(|e| e.column).collect();
+            let btree = index.kind == IndexKind::Btree;
             let fits = |e: &ExclusionElement| match e.op {
-                ExclusionOp::Overlaps => t.columns[e.column].ty.is_range(),
-                ExclusionOp::Equal => crate::executor::is_gist_scalar_type(&t.columns[e.column].ty),
+                ExclusionOp::Overlaps => !btree && t.columns[e.column].ty.is_range(),
+                ExclusionOp::Equal => {
+                    btree || crate::executor::is_gist_scalar_type(&t.columns[e.column].ty)
+                }
             };
             if index.column_ordinals() != Some(element_columns) || !ex.elements.iter().all(fits) {
                 return Err(corrupt(&format!(
@@ -5964,9 +5986,11 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             return Err(corrupt("a non-btree index cannot have an expression key"));
         }
         let has_predicate = iflags & 0b10 != 0;
-        // A partial index is B-tree only (indexes.md §9): bit1 with a GIN/GiST kind is corrupt.
-        if has_predicate && kind != IndexKind::Btree {
-            return Err(corrupt("a non-btree index cannot be partial"));
+        // A partial index is B-tree (indexes.md §9) or the GiST index of a partial exclusion
+        // constraint (v45, gist.md §7.1 — checked against the exclusion list once the table is
+        // decoded): bit1 with a GIN kind is corrupt.
+        if has_predicate && kind == IndexKind::Gin {
+            return Err(corrupt("a gin index cannot be partial"));
         }
         index_roots.push(read_u32(buf, pos)?);
         // v27: the partial-index predicate canonical text follows index_root_page (bit1 set) — re-parse
@@ -5983,9 +6007,10 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             None
         };
         // v31: the host-function dependency list follows the predicate (bit2 set) —
-        // extensibility.md §8.1. A non-btree index never carries one.
+        // extensibility.md §8.1. Only a btree index or a partial GiST index (a partial exclusion, v45) carries one.
         let has_host_deps = iflags & 0b100 != 0;
-        if has_host_deps && kind != IndexKind::Btree {
+        if has_host_deps && kind != IndexKind::Btree && !(kind == IndexKind::Gist && has_predicate)
+        {
             return Err(corrupt(
                 "a non-btree index cannot have host-function dependencies",
             ));
@@ -5997,7 +6022,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         };
         let mut timezone_deps = TimeZoneDeps::default();
         if iflags & 8 != 0 {
-            if kind != IndexKind::Btree {
+            if kind != IndexKind::Btree && !(kind == IndexKind::Gist && has_predicate) {
                 return Err(corrupt(
                     "a non-btree index cannot have timezone dependencies",
                 ));

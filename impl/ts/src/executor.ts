@@ -3188,6 +3188,86 @@ export class Engine {
     }
   }
 
+  // resolveExclusionDefinition resolves the parts of an EXCLUDE definition that are independent of
+  // naming: the access method, the element columns, and their operators. CREATE TABLE and ALTER
+  // TABLE share this path so their operator/opclass and duplicate-column gates cannot drift
+  // (spec/design/gist.md §7). Under btree (§7.2) every column needs a key-encodable type (the CREATE
+  // INDEX gate) and every operator must be = — the only commutative btree operator (42809
+  // otherwise, as in PostgreSQL). Under gist the operators are && (range) and = (fixed-width scalar).
+  resolveExclusionDefinition(
+    table: Table,
+    def: ExcludeDef,
+  ): { method: "btree" | "gist"; columns: number[]; elements: ExclusionElement[] } {
+    const method = exclusionMethod(def.using);
+    const columns: number[] = [];
+    const elements: ExclusionElement[] = [];
+    for (const el of def.elements) {
+      const column = columnIndex(table, el.column);
+      if (column < 0)
+        throw engineError("undefined_column", `column ${el.column} named in key does not exist`);
+      // A repeated column is harmless to a btree exclusion (its backing ordered index admits a
+      // repeated key column, as CREATE INDEX does — PostgreSQL accepts it); the GiST tuple bound
+      // keeps the GX3 narrowing (42701).
+      if (method === "gist" && columns.includes(column))
+        throw engineError(
+          "duplicate_column",
+          `column ${el.column} appears twice in exclusion constraint`,
+        );
+      const ty = table.columns[column]!.type;
+      let op: ExclusionOp;
+      if (method === "btree") {
+        // The opclass first (PostgreSQL's ComputeIndexAttrs order), then the operator.
+        this.checkIndexColumnType("btree", ty);
+        if (el.op !== "=")
+          throw engineError(
+            "wrong_object_type",
+            `operator ${el.op} is not a commutative member of the btree operator family of ${typeCanonicalName(ty)}`,
+          );
+        op = "equal";
+      } else {
+        op = gistExclusionOp(ty, el.op);
+      }
+      columns.push(column);
+      elements.push({ column, op });
+    }
+    return { method, columns, elements };
+  }
+
+  // resolveIndexPredicate validates a partial index's WHERE predicate (spec/design/indexes.md §9) —
+  // shared by CREATE INDEX … WHERE and the partial EXCLUDE … WHERE (predicate) (gist.md §7.1) so the
+  // two cannot drift: a subquery is 0A000 and a bind parameter 42P02 (structural pre-walk); an
+  // aggregate 42803, a window 42P20, a non-boolean 42804 (the Forbidden-context boolean resolve); a
+  // non-immutable dependency 42P17 (index-dependencies.md). Host-function and time-zone dependencies
+  // accumulate into hostDeps / timezoneDeps. Returns the stored form (the canonical text + the
+  // unresolved AST, re-resolved per statement).
+  resolveIndexPredicate(
+    table: Table,
+    pred: { text: string; expr: Expr },
+    hostDeps: HostFuncDep[],
+    timezoneDeps: TimeZoneDeps,
+  ): { exprText: string; expr: Expr } {
+    // Structural pre-walk: a subquery is 0A000 and a bind parameter 42P02 (both admitted by the
+    // resolver). The aggregate 42803 / window 42P20 / non-boolean 42804 rejections then fall out of
+    // the Forbidden-context boolean resolve below.
+    rejectIndexPredicateStructure(pred.expr);
+    const predPt = new ParamTypes();
+    predPt.indexContext = true;
+    const predNode = resolveBooleanFilter(Scope.index(this, table), pred.expr, predPt);
+    // Dependencies accumulate at each resolved operation, through every child.
+    if (predPt.nonimmutable) {
+      throw engineError(
+        "invalid_object_definition",
+        "functions in index predicate must be marked IMMUTABLE",
+      );
+    }
+    // Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as a key
+    // expression (IMMUTABLE + component identity, else 42P17).
+    const hostFns = this.session.environment.hostFunctions();
+    if (hostFns) collectIndexHostDeps(predNode, hostFns, hostDeps);
+    mergeTimezoneDeps(timezoneDeps, predPt.timezoneDeps);
+    return { exprText: pred.text, expr: pred.expr };
+  }
+
   // tableNames is the canonical name of every table in the visible snapshot, sorted ascending
   // by exact-name UTF-8 byte order (the catalog's standing order — no map-iteration order may leak,
   // CLAUDE.md §8). Secondary indexes are not
@@ -7169,7 +7249,16 @@ export class Engine {
     // 42P07/42710 across the relation + constraint namespaces), and build the MULTI-COLUMN GiST index
     // that enforces it. The probe + 23P01 live in INSERT/UPDATE.
     for (const exc of ct.excludes) {
-      const { columns: indices, elements } = resolveExclusionDefinition(table, exc);
+      const { method, columns: indices, elements } = this.resolveExclusionDefinition(table, exc);
+      // The partial form's predicate (gist.md §7.1), validated as a partial index's.
+      const hostDeps: HostFuncDep[] = [];
+      const timezoneDeps: TimeZoneDeps = { dynamic: false, zones: [] };
+      const predicate =
+        exc.predicate !== undefined
+          ? this.resolveIndexPredicate(table, exc.predicate, hostDeps, timezoneDeps)
+          : undefined;
+      sortHostDeps(hostDeps);
+      validateTimezoneDeps(timezoneDeps);
       // Name the constraint (= its backing index name). An explicit name checks the relation
       // namespace (42P07) then the table's constraint names (42710); a derived `<table>_<cols>_excl`
       // suffix-walks both.
@@ -7211,8 +7300,15 @@ export class Engine {
       table.indexes.splice(pos, 0, {
         name,
         keys: indices.map((c) => ({ kind: "column", column: c })),
+        // A btree exclusion's index is NOT unique (PostgreSQL's indisunique = false): the
+        // constraint, not the index, enforces it (23P01, gist.md §7.2), so it is no FOREIGN KEY
+        // target and no ON CONFLICT column-list arbiter.
         unique: false,
-        kind: "gist",
+        kind: method,
+        predicate,
+        // Plain-column keys; only a partial predicate can carry a dependency.
+        hostDeps: hostDeps.length > 0 ? hostDeps : undefined,
+        timezoneDeps,
       });
       table.exclusions.push({ name, index: name, elements });
     }
@@ -8200,7 +8296,20 @@ export class Engine {
                       !cascadeUniqueCols.some((cols) => sameSet(sortedUnique(fk.refColumns), cols)),
                   ),
               );
-            if (!action.cascade && (selfRefFkDep || incomingDep))
+            // A partial exclusion whose predicate (but no element) reads the column depends on it
+            // NORMALLY, as in PostgreSQL: RESTRICT refuses, CASCADE drops the constraint
+            // (gist.md §7.1). An element column is an internal one.
+            const exclusionPredicateDep = table.exclusions.some(
+              (ex) =>
+                !ex.elements.some((el) => el.column === ci) &&
+                table.indexes.some(
+                  (index) =>
+                    index.name === ex.index &&
+                    index.predicate !== undefined &&
+                    usesExpr(index.predicate.expr),
+                ),
+            );
+            if (!action.cascade && (selfRefFkDep || incomingDep || exclusionPredicateDep))
               throw engineError(
                 "dependent_objects_still_exist",
                 `cannot drop column ${action.name} because other objects depend on it`,
@@ -8232,7 +8341,11 @@ export class Engine {
               return keep;
             });
             table.exclusions = table.exclusions.filter((ex) => {
-              const keep = !ex.elements.some((el) => el.column === ci);
+              // An element column, or a column of a partial exclusion's predicate (whose backing
+              // index the predicate check above just removed).
+              const keep =
+                !ex.elements.some((el) => el.column === ci) &&
+                table.indexes.some((index) => index.name === ex.index);
               if (!keep) added.delete(ex.name);
               return keep;
             });
@@ -8557,7 +8670,17 @@ export class Engine {
               added.add(name);
             } else {
               const d = c.def;
-              const { columns: cols, elements } = resolveExclusionDefinition(table, d);
+              const { method, columns: cols, elements } = this.resolveExclusionDefinition(table, d);
+              // The partial form's predicate (gist.md §7.1), validated as a partial index's,
+              // against the working table.
+              const hostDeps: HostFuncDep[] = [];
+              const timezoneDeps: TimeZoneDeps = { dynamic: false, zones: [] };
+              const predicate =
+                d.predicate !== undefined
+                  ? this.resolveIndexPredicate(table, d.predicate, hostDeps, timezoneDeps)
+                  : undefined;
+              sortHostDeps(hostDeps);
+              validateTimezoneDeps(timezoneDeps);
               let name: string;
               if (d.name !== null) {
                 name = d.name;
@@ -8582,7 +8705,10 @@ export class Engine {
                 name,
                 keys: cols.map((column) => ({ kind: "column", column })),
                 unique: false,
-                kind: "gist",
+                kind: method,
+                predicate,
+                hostDeps: hostDeps.length > 0 ? hostDeps : undefined,
+                timezoneDeps,
               });
               table.exclusions.push({ name, index: name, elements });
               table.indexes.sort(compareName);
@@ -9198,19 +9324,41 @@ export class Engine {
             }
           }
         }
-      for (const ex of table.exclusions)
-        if (addedConstraints.has(ex.name))
-          for (let i = 0; i < all.entries.length; i++)
+      // EXCLUDE validation over the existing rows (gist.md §7, alter.md §5): every unordered pair
+      // of PARTICIPATING rows — those a partial constraint's predicate admits (§7.1) — charges one
+      // constraint_check; a pair conflicts when both carry a probe key and the keys conflict (equal
+      // ordered prefixes for a btree exclusion, §7.2, the conjunction for a GiST one).
+      const validated = table.exclusions.filter((e) => addedConstraints.has(e.name));
+      if (validated.length > 0) {
+        for (const ex of validated) {
+          const def = table.indexes.find((ix) => ix.name === ex.index)!;
+          const chk: ExclusionCheck = { exc: ex, rindex: this.resolveIndex(table, def) };
+          const members: { row: Row; key: ExclusionKey | null }[] = [];
+          for (const entry of all.entries) {
+            const a = store.resolveInlineColumns(entry.row);
+            if (!this.exclusionParticipates(chk, a)) continue;
+            members.push({
+              row: a,
+              key: this.exclusionKey(chk, table.columns, alterColTypes, colls, a),
+            });
+          }
+          for (let i = 0; i < members.length; i++)
             for (let j = 0; j < i; j++) {
               meter.charge(COSTS.constraintCheck);
               meter.guard();
-              const a = store.resolveInlineColumns(all.entries[i]!.row);
-              const b = store.resolveInlineColumns(all.entries[j]!.row);
-              if (exclusionPairConflicts(table.columns, ex, a, b))
+              const a = members[i]!;
+              const b = members[j]!;
+              if (
+                a.key !== null &&
+                b.key !== null &&
+                exclusionKeysConflict(table.columns, ex, a.key, a.row, b.key, b.row)
+              )
                 throw exclusionViolation(table.name, ex.name).withDetail(
-                  exclusionDetail(this.session, table.name, table.columns, ex, a, b, false),
+                  exclusionDetail(this.session, table.name, table.columns, ex, a.row, b.row, false),
                 );
             }
+        }
+      }
       for (const es of constraintEntries.values()) es.sort(compareBytes);
     }
     const rekeyed = rewriteRows !== null && pkRekeyed;
@@ -9252,7 +9400,8 @@ export class Engine {
     if (clearStatistics) ws.clearStatistics(table.name);
     if (rekeyed)
       ws.rebuildAlterIndexes(original, table, constraintEntries, alterPageSize);
-    else ws.syncAlterConstraintIndexes(original, table, constraintEntries, alterPageSize);
+    else
+      ws.syncAlterConstraintIndexes(original, table, constraintEntries, alterPageSize, indexRename);
     for (const cols of cascadeUniqueCols) {
       for (const [key, child] of [...ws.tables]) {
         if (child.name === table.name) continue;
@@ -9916,8 +10065,7 @@ export class Engine {
           `a partial (WHERE) ${ci.using} index is not supported yet`,
         );
       }
-      this.admitIndexExpr(table, ci.predicate.expr, true, hostDeps, timezoneDeps);
-      predicate = { exprText: ci.predicate.text, expr: ci.predicate.expr };
+      predicate = this.resolveIndexPredicate(table, ci.predicate, hostDeps, timezoneDeps);
     }
     // relationTaken checks the namespace of the target scope: an attachment's OWN snapshot for an
     // attached table (each attached database is an independent namespace, §3), else the temp-aware
@@ -11970,35 +12118,17 @@ export class Engine {
     }
 
     // EXCLUDE constraints (spec/design/gist.md §7), after FK existence — a batch pass over the
-    // statement's END STATE: each new row must conflict with no STORED row (probe the backing GiST
-    // tree, whose leaf recheck is the full (expr_i op_i) conjunction) and no OTHER new row of this
-    // batch (pairwise — the resident tree holds only stored rows). The NULL rule / empty-range exempt
-    // a row. Unmetered validation, before any write.
-    const exclusions = this.table(table.name)?.exclusions ?? [];
-    if (exclusions.length > 0) {
-      const tcols = table.columns;
-      for (const exc of exclusions) {
-        for (const pr of prepared) {
-          const other = this.insertExclusionConflictsStored(dbScope, table, tcols, exc, pr.row);
-          if (other !== null) {
-            throw exclusionViolation(table.name, exc.name).withDetail(
-              exclusionDetail(this.session, table.name, tcols, exc, pr.row, other, true),
-            );
-          }
-        }
-        for (let i = 0; i < prepared.length; i++) {
-          for (let j = 0; j < i; j++) {
-            const fresh = prepared[i]!.row;
-            const other = prepared[j]!.row;
-            if (exclusionPairConflicts(tcols, exc, fresh, other)) {
-              throw exclusionViolation(table.name, exc.name).withDetail(
-                exclusionDetail(this.session, table.name, tcols, exc, fresh, other, true),
-              );
-            }
-          }
-        }
-      }
-    }
+    // statement's END STATE: each new row must conflict with no STORED row (probe the backing index —
+    // a GiST tree whose leaf recheck is the full (expr_i op_i) conjunction, or for a btree exclusion,
+    // §7.2, the ordered index for an equal key) and no OTHER new row of this batch (pairwise — the
+    // index holds only stored rows). The NULL rule / empty-range exempt a row, as does a partial
+    // constraint's not-TRUE predicate (§7.1). Unmetered validation, before any write.
+    this.validateExclusions(
+      dbScope,
+      this.table(table.name) ?? table,
+      prepared.map((pr) => pr.row),
+      new Set<string>(),
+    );
 
     // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
     meter.charge(COSTS.valueCompress * cunits);
@@ -12166,14 +12296,7 @@ export class Engine {
       this.validateInsertFkStored(relation, table.columns, fk, probe, row, fkTemp);
     }
 
-    for (const exc of this.table(table.name)?.exclusions ?? []) {
-      const other = this.insertExclusionConflictsStored(dbScope, table, table.columns, exc, row);
-      if (other !== null) {
-        throw exclusionViolation(table.name, exc.name).withDetail(
-          exclusionDetail(this.session, table.name, table.columns, exc, row, other, true),
-        );
-      }
-    }
+    this.validateExclusions(dbScope, this.table(table.name) ?? table, [row], new Set<string>());
 
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
@@ -12223,29 +12346,154 @@ export class Engine {
       );
   }
 
-  // Probe resident GiST rows for one exclusion candidate. The batch caller separately retains its
-  // pairwise end-state pass; the stored-row semantics are shared. Returns the conflicting stored row
-  // (the least storage key among the matches, for a deterministic Detail — error-fields.md §9.2), or
-  // null when nothing conflicts.
-  private insertExclusionConflictsStored(
+  // exclusionChecks resolves a table's EXCLUDE constraints for one statement (spec/design/gist.md
+  // §7): each constraint with its backing index resolved — the partial predicate (§7.1) and, for a
+  // btree exclusion (§7.2), the ordered key. A backing index whose stored predicate did not parse is
+  // XX003 (unparsable-definitions.md §3.4): such a constraint cannot be enforced.
+  exclusionChecks(table: Table): ExclusionCheck[] {
+    const out: ExclusionCheck[] = [];
+    for (const exc of table.exclusions) {
+      const def = table.indexes.find((ix) => ix.name === exc.index);
+      if (def === undefined)
+        throw engineError("data_corrupted", "an exclusion constraint has its backing index");
+      out.push({ exc, rindex: this.resolveIndex(table, def) });
+    }
+    return out;
+  }
+
+  // exclusionParticipates reports whether row participates in an exclusion constraint at all: always,
+  // unless the constraint is partial and its predicate is not TRUE for the row (gist.md §7.1 —
+  // PostgreSQL's partial exclusion; the predicate eval is unmetered, like a partial index's).
+  exclusionParticipates(chk: ExclusionCheck, row: Row): boolean {
+    return indexRowQualifies(chk.rindex, row, this.maintenanceEnv(new StmtRng()));
+  }
+
+  // exclusionKey is a row's exclusion probe key (gist.md §7), or null when the row can never
+  // conflict: its predicate is not TRUE (§7.1), an excluded column is NULL (the NULL rule), or a &&
+  // column holds the empty range. A btree exclusion's key (§7.2) is the backing ordered index's slot
+  // prefix — two participating rows conflict iff their prefixes are equal, exactly UNIQUE's rule —
+  // and a GiST exclusion's the conjunction query.
+  exclusionKey(
+    chk: ExclusionCheck,
+    columns: Column[],
+    colTypes: ColType[],
+    colls: (Collation | null)[],
+    row: Row,
+  ): ExclusionKey | null {
+    if (chk.rindex.kind === "btree") {
+      // indexPrefix applies the predicate and the NULL rule.
+      const prefix = this.indexPrefix(colTypes, colls, chk.rindex, row);
+      return prefix === null ? null : { kind: "btree", prefix };
+    }
+    if (!this.exclusionParticipates(chk, row)) return null;
+    const probe = exclusionProbeQuery(columns, chk.exc, row);
+    return probe === null ? null : { kind: "gist", query: probe.query, strats: probe.strats };
+  }
+
+  // exclusionStoredConflict is the stored row a participating new row conflicts with under one
+  // exclusion constraint (gist.md §7), skipping the rows this statement rewrites (rewritten storage
+  // keys, joined — an UPDATE's vacated old rows; empty for INSERT). Returns the conflicting stored row
+  // with the least storage key (a deterministic Detail — error-fields.md §9.2), or null. The backing
+  // index holds only participating rows (a partial index), so every hit participates.
+  private exclusionStoredConflict(
     dbScope: string | undefined,
     table: Table,
-    columns: Column[],
-    exc: ExclusionConstraint,
-    row: Row,
+    chk: ExclusionCheck,
+    key: ExclusionKey,
+    rewritten: Set<string>,
   ): Row | null {
-    const probe = exclusionProbeQuery(columns, exc, row);
-    if (probe === null) return null;
-    const tree = this.readSnap().gistTreeFor(exc.index);
-    if (tree === undefined) return null;
-    const first = leastKey(gistSearch(tree, probe.query, probe.strats).keys);
-    if (first === null) return null;
-    // The engine keeps the tree and the rows in step, so an entry naming no stored row is a corrupt
-    // index (storage.md §7).
-    const other = this.lkpStoreScoped(dbScope, table.name).get(first);
+    let hit: Uint8Array | null = null;
+    if (key.kind === "btree") {
+      // Entries sharing the prefix sit adjacent in storage-key order (indexes.md §8).
+      const entries = this.lkpIndexStoreScoped(dbScope, chk.rindex.name).rangeEntries(
+        uniqueProbeBound(key.prefix),
+      );
+      for (const e of entries) {
+        const suffix = e.key.slice(key.prefix.length);
+        if (!rewritten.has(suffix.join(","))) {
+          hit = suffix;
+          break;
+        }
+      }
+    } else {
+      const tree = this.readSnap().gistTreeFor(chk.rindex.name);
+      if (tree !== undefined)
+        hit = leastKey(
+          gistSearch(tree, key.query, key.strats).keys.filter((h) => !rewritten.has(h.join(","))),
+        );
+    }
+    if (hit === null) return null;
+    // A matched entry always names a stored row; one that does not is a corrupt index.
+    const other = this.lkpStoreScoped(dbScope, table.name).get(hit);
     if (other === undefined)
-      throw engineError("data_corrupted", "a GiST entry references a stored row");
+      throw engineError("data_corrupted", "an exclusion index entry references a stored row");
     return other;
+  }
+
+  // exclusionConflictsPlanned reports whether a proposed ON CONFLICT DO NOTHING row conflicts under
+  // one exclusion constraint with a stored row or with an insert this statement already planned
+  // (planned) — the row-at-a-time visibility upsert.md §3 reproduces (gist.md §7).
+  private exclusionConflictsPlanned(
+    dbScope: string | undefined,
+    table: Table,
+    chk: ExclusionCheck,
+    colTypes: ColType[],
+    colls: (Collation | null)[],
+    row: Row,
+    planned: Row[],
+  ): boolean {
+    const columns = table.columns;
+    const key = this.exclusionKey(chk, columns, colTypes, colls, row);
+    if (key === null) return false;
+    if (this.exclusionStoredConflict(dbScope, table, chk, key, new Set<string>()) !== null)
+      return true;
+    for (const p of planned) {
+      const pk = this.exclusionKey(chk, columns, colTypes, colls, p);
+      if (pk !== null && exclusionKeysConflict(columns, chk.exc, key, row, pk, p)) return true;
+    }
+    return false;
+  }
+
+  // validateExclusions validates the participating rows of one statement against a table's
+  // exclusion constraints (gist.md §7), in constraint (name) order: each must conflict with no stored
+  // row outside rewritten (joined storage keys) and with no earlier row of rows (pairwise — the
+  // backing index holds only stored rows). The first conflict traps 23P01 with PostgreSQL's
+  // "conflicts with existing key" Detail. Unmetered validation, before any write.
+  private validateExclusions(
+    dbScope: string | undefined,
+    table: Table,
+    rows: Row[],
+    rewritten: Set<string>,
+  ): void {
+    if (table.exclusions.length === 0 || rows.length === 0) return;
+    const tcols = table.columns;
+    const checks = this.exclusionChecks(table);
+    const colTypes = this.lkpStoreScoped(dbScope, table.name).columnTypes();
+    const colls = this.columnCollations(tcols);
+    for (const chk of checks) {
+      const keys = rows.map((row) => this.exclusionKey(chk, tcols, colTypes, colls, row));
+      for (let i = 0; i < rows.length; i++) {
+        const key = keys[i]!;
+        if (key === null) continue;
+        const other = this.exclusionStoredConflict(dbScope, table, chk, key, rewritten);
+        if (other !== null)
+          throw exclusionViolation(table.name, chk.exc.name).withDetail(
+            exclusionDetail(this.session, table.name, tcols, chk.exc, rows[i]!, other, true),
+          );
+      }
+      for (let i = 0; i < rows.length; i++) {
+        const ki = keys[i]!;
+        if (ki === null) continue;
+        for (let j = 0; j < i; j++) {
+          const kj = keys[j]!;
+          if (kj === null) continue;
+          if (exclusionKeysConflict(tcols, chk.exc, ki, rows[i]!, kj, rows[j]!))
+            throw exclusionViolation(table.name, chk.exc.name).withDetail(
+              exclusionDetail(this.session, table.name, tcols, chk.exc, rows[i]!, rows[j]!, true),
+            );
+        }
+      }
+    }
   }
 
   // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
@@ -12305,6 +12553,13 @@ export class Engine {
       throw engineError(
         "syntax_error",
         "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+      );
+    }
+    // An exclusion constraint arbitrates DO NOTHING only (PostgreSQL's infer_arbiter_indexes).
+    if (arb.kind === "exclusion") {
+      throw engineError(
+        "wrong_object_type",
+        "ON CONFLICT DO UPDATE not supported with exclusion constraints",
       );
     }
     const scope = Scope.onConflictExcluded(this, table, vw, alias);
@@ -12400,11 +12655,12 @@ export class Engine {
     table: Table,
     ak: Uint8Array,
   ): { key: Uint8Array; row: Row } | null {
-    if (arb.isPK) {
+    if (arb.kind === "pk") {
       const row = store.get(ak);
       if (row === undefined) return null;
       return { key: ak, row: store.resolveAll(row) };
     }
+    if (arb.kind === "exclusion") throw new Error("an exclusion arbiter has no existing-row probe");
     const def = table.indexes[arb.indexPos]!;
     const entries = this.readSnap()
       .indexStore(def.name)
@@ -12568,6 +12824,10 @@ export class Engine {
     // The unique-index positions in table.indexes (no-target skip test + end-state pass).
     const uniqIdx: number[] = [];
     for (let i = 0; i < table.indexes.length; i++) if (table.indexes[i]!.unique) uniqIdx.push(i);
+    // The exclusion constraints (gist.md §7), parallel to table.exclusions — the no-target DO
+    // NOTHING arbiter skips on any of them, an ON CONSTRAINT exclusion arbiter on its own
+    // (upsert.md §2).
+    const excChecks = this.exclusionChecks(table);
 
     const inserts: Row[] = [];
     // A planned update: the existing row's old storage key, its new one (they differ when the DO
@@ -12627,11 +12887,33 @@ export class Engine {
           }
         }
         if (conflictHit) continue; // skip
+        // An exclusion conflict is a conflict too (PostgreSQL arbitrates every exclusion
+        // constraint for a no-target DO NOTHING).
+        let excluded = false;
+        for (const chk of excChecks) {
+          if (this.exclusionConflictsPlanned(dbScope, table, chk, colTypes, colls, row, inserts)) {
+            excluded = true;
+            break;
+          }
+        }
+        if (excluded) continue; // skip
         if (pkk !== null) insPk.add(pkk.join(","));
         for (let u = 0; u < uniqIdx.length; u++) {
           const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[uniqIdx[u]!]!, row);
           if (prefix !== null) insPrefixes[u]!.add(prefix.join(","));
         }
+        viewCheck(row);
+        inserts.push(row);
+        continue;
+      }
+
+      // An ON CONSTRAINT exclusion arbiter (DO NOTHING only — resolveOnConflict rejects DO UPDATE
+      // with 42809): skip a row this constraint excludes against a stored row or an earlier planned
+      // insert; any other conflict is caught by the end-state validation.
+      if (plan.arb.kind === "exclusion") {
+        const chk = excChecks[plan.arb.exclusionPos]!;
+        if (this.exclusionConflictsPlanned(dbScope, table, chk, colTypes, colls, row, inserts))
+          continue; // skip
         viewCheck(row);
         inserts.push(row);
         continue;
@@ -12812,6 +13094,17 @@ export class Engine {
         }
       }
     }
+
+    // EXCLUDE (gist.md §7) over the END STATE, as INSERT and UPDATE: each inserted row and each
+    // updated NEW row must conflict with no stored row the statement keeps (an updated row's old
+    // version is vacated) and with no other new row. A conflict a DO NOTHING arbiter covers was
+    // skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
+    this.validateExclusions(
+      dbScope,
+      table,
+      updates.map((u) => u.newRow).concat(inserts),
+      new Set<string>(updates.map((u) => u.key.join(","))),
+    );
 
     // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE — a
     // re-keyed row's references follow its key change as a re-keying UPDATE's do (constraints.md
@@ -13914,44 +14207,14 @@ export class Engine {
     // — that row is vacated) nor another updated NEW row (pairwise). The NULL rule / empty-range
     // exempt a row. An end-state-valid swap thus succeeds where PG fails the per-row transient (the
     // documented UNIQUE end-state divergence). Unmetered, phase 1, before any write.
-    if (table.exclusions.length > 0 && updates.length > 0) {
+    if (updates.length > 0) {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
-      for (const exc of table.exclusions) {
-        const ikey = exc.index;
-        for (const u of updates) {
-          const probe = exclusionProbeQuery(table.columns, exc, u.row);
-          if (probe === null) continue;
-          const tree = this.readSnap().gistTreeFor(ikey);
-          // The least non-vacated stored match (a deterministic Detail — error-fields.md §9.2).
-          const hit =
-            tree === undefined
-              ? null
-              : leastKey(
-                  gistSearch(tree, probe.query, probe.strats).keys.filter(
-                    (h) => !rewritten.has(h.join(",")),
-                  ),
-                );
-          if (hit !== null) {
-            const other = store.get(hit);
-            if (other === undefined)
-              throw engineError("data_corrupted", "a GiST entry references a stored row");
-            throw exclusionViolation(table.name, exc.name).withDetail(
-              exclusionDetail(this.session, table.name, table.columns, exc, u.row, other, true),
-            );
-          }
-        }
-        for (let i = 0; i < updates.length; i++) {
-          for (let j = 0; j < i; j++) {
-            const fresh = updates[i]!.row;
-            const other = updates[j]!.row;
-            if (exclusionPairConflicts(table.columns, exc, fresh, other)) {
-              throw exclusionViolation(table.name, exc.name).withDetail(
-                exclusionDetail(this.session, table.name, table.columns, exc, fresh, other, true),
-              );
-            }
-          }
-        }
-      }
+      this.validateExclusions(
+        upd.db,
+        table,
+        updates.map((u) => u.row),
+        rewritten,
+      );
     }
 
     // FOREIGN KEY child-side (constraints.md §6.4): re-validate an FK only when the statement
@@ -19049,7 +19312,8 @@ export class Engine {
           textValue(t.name),
           textValue("exclude"),
           textArr(exc.elements.map((el) => t.columns[el.column]!.name)),
-          nullValue(),
+          // A partial exclusion's WHERE predicate text (gist.md §7.1); NULL otherwise.
+          excPredicateText(t, exc),
           nullValue(),
           nullValue(),
           textArr(exc.elements.map((el) => exclusionOpSymbol(el.op))),
@@ -27160,7 +27424,9 @@ export function inventoryINLCandidates(
   // matching ordinary SELECT planning; only a bare earlier-sibling column is admissible.
   const filters = [on, whereFilter].filter((f): f is RExpr => f !== null);
   for (const idx of rel.table.indexes) {
-    if (idx.kind !== "gist" || idx.keys.length !== 1) continue;
+    // A partial GiST index (a partial EXCLUDE's backing index — gist.md §7.1) holds only the
+    // predicate's rows, so it is constraint-only, never a candidate.
+    if (idx.kind !== "gist" || idx.keys.length !== 1 || idx.predicate !== undefined) continue;
     const ci = indexFirstColumn(idx);
     const colGlobal = rel.offset + ci;
     const colType = rel.table.columns[ci]!.type;
@@ -27545,7 +27811,7 @@ export function buildGistBoundForIndex(
   columns: Column[],
   offset: number,
 ): GistBound | null {
-  if (idx.kind !== "gist" || idx.keys.length !== 1) return null;
+  if (idx.kind !== "gist" || idx.keys.length !== 1 || idx.predicate !== undefined) return null;
   const ci = indexFirstColumn(idx);
   const colGlobal = offset + ci;
   const colType = columns[ci]!.type;
@@ -28033,6 +28299,33 @@ export function exclusionProbeQuery(
   return { query, strats };
 }
 
+// ExclusionCheck is one EXCLUDE constraint resolved for a statement (spec/design/gist.md §7): the
+// constraint and its backing index resolved — the partial predicate (§7.1) and, for USING btree
+// (§7.2), the ordered key the equality probe builds.
+export type ExclusionCheck = { exc: ExclusionConstraint; rindex: ResolvedIndex };
+
+// ExclusionKey is a participating row's exclusion probe key (gist.md §7): the backing ordered
+// index's slot prefix for a btree exclusion (§7.2 — two rows conflict iff the prefixes are equal), or
+// the GiST conjunction query.
+export type ExclusionKey =
+  | { kind: "btree"; prefix: Uint8Array }
+  | { kind: "gist"; query: GistQuery[]; strats: GistStrategy[] };
+
+// exclusionKeysConflict reports whether two participating rows conflict under one exclusion
+// constraint, given their probe keys (gist.md §7): equal prefixes for a btree exclusion, the full
+// (expr_i op_i) conjunction for a GiST one.
+export function exclusionKeysConflict(
+  columns: Column[],
+  exc: ExclusionConstraint,
+  ka: ExclusionKey,
+  a: Row,
+  kb: ExclusionKey,
+  b: Row,
+): boolean {
+  if (ka.kind === "btree" && kb.kind === "btree") return bytesEq(ka.prefix, kb.prefix);
+  return exclusionPairConflicts(columns, exc, a, b);
+}
+
 // exclusionPairConflicts reports whether the (expr_i op_i) conjunction holds between two rows
 // (spec/design/gist.md §7). Used for the in-batch new-row-vs-new-row check (the resident GiST tree
 // holds only stored rows). A NULL in any excluded column of either row, or an empty range under &&
@@ -28252,8 +28545,6 @@ export function ginElementTerm(elem: ScalarType, v: Value): Uint8Array {
   return encodeKeyValue(elem, v, null);
 }
 
-// Resolve the EXCLUDE access method, element columns, duplicate-column rule, and operator/opclass
-// pairing once for both CREATE TABLE and ALTER TABLE (spec/design/gist.md §7).
 // tableConstraintNameTaken reports whether table t holds a constraint named name — a CHECK, a
 // UNIQUE constraint (its backing index), a FOREIGN KEY, or an EXCLUDE constraint.
 function tableConstraintNameTaken(t: Table, name: string): boolean {
@@ -28277,56 +28568,49 @@ function schemaConstraintNameTaken(snap: Snapshot, skip: string, name: string): 
   return false;
 }
 
-function resolveExclusionDefinition(
-  table: Table,
-  def: ExcludeDef,
-): { columns: number[]; elements: ExclusionElement[] } {
-  if (def.using !== null && def.using !== "gist")
+// exclusionMethod resolves the access method of an EXCLUDE definition (spec/design/gist.md §7/§7.2):
+// no USING or `USING btree` is the ordered B-tree (PostgreSQL's default access method), `USING gist`
+// the GiST index. `gin` exists but cannot enforce an exclusion (0A000, PostgreSQL's "does not support
+// exclusion constraints"); any other method name does not exist (42704, as for CREATE INDEX).
+function exclusionMethod(using: string | null): "btree" | "gist" {
+  if (using === null || using === "btree") return "btree";
+  if (using === "gist") return "gist";
+  if (using === "gin")
     throw engineError(
-      "undefined_object",
-      `access method ${def.using} does not support exclusion constraints`,
+      "feature_not_supported",
+      "access method gin does not support exclusion constraints",
     );
-  const columns: number[] = [];
-  const elements: ExclusionElement[] = [];
-  for (const el of def.elements) {
-    const column = columnIndex(table, el.column);
-    if (column < 0)
-      throw engineError("undefined_column", `column ${el.column} named in key does not exist`);
-    if (columns.includes(column))
+  throw engineError("undefined_object", `access method does not exist: ${using}`);
+}
+
+// gistExclusionOp is the GiST WITH operator of one EXCLUDE element over a column of type ty
+// (gist.md §7): && needs a range column (range_ops), = a fixed-width keyable scalar (the in-core
+// btree_gist).
+function gistExclusionOp(ty: Type, operator: string): ExclusionOp {
+  if (operator === "&&") {
+    if (ty.kind !== "range")
       throw engineError(
-        "duplicate_column",
-        `column ${el.column} appears twice in exclusion constraint`,
+        "undefined_object",
+        `data type ${typeCanonicalName(ty)} has no default operator class for access method gist that accepts operator &&`,
       );
-    const ty = table.columns[column]!.type;
-    let op: ExclusionOp;
-    if (el.op === "&&") {
-      if (ty.kind !== "range")
-        throw engineError(
-          "undefined_object",
-          `data type ${typeCanonicalName(ty)} has no default operator class for access method gist that accepts operator &&`,
-        );
-      op = "overlaps";
-    } else if (el.op === "=") {
-      if (isGistScalarType(ty)) op = "equal";
-      else if (isGistDeferredScalarType(ty))
-        throw engineError(
-          "feature_not_supported",
-          `an exclusion constraint with = over ${typeCanonicalName(ty)} is not supported yet`,
-        );
-      else
-        throw engineError(
-          "undefined_object",
-          `data type ${typeCanonicalName(ty)} has no default operator class for access method gist`,
-        );
-    } else
+    return "overlaps";
+  }
+  if (operator === "=") {
+    if (isGistScalarType(ty)) return "equal";
+    if (isGistDeferredScalarType(ty))
       throw engineError(
         "feature_not_supported",
-        `exclusion constraint operator ${el.op} is not supported yet`,
+        `an exclusion constraint with = over ${typeCanonicalName(ty)} is not supported yet`,
       );
-    columns.push(column);
-    elements.push({ column, op });
+    throw engineError(
+      "undefined_object",
+      `data type ${typeCanonicalName(ty)} has no default operator class for access method gist`,
+    );
   }
-  return { columns, elements };
+  throw engineError(
+    "feature_not_supported",
+    `exclusion constraint operator ${operator} is not supported yet`,
+  );
 }
 
 // isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
@@ -28568,8 +28852,13 @@ export function encodePkKey(
 }
 
 // Arbiter is which uniqueness constraint an ON CONFLICT arbitrates (spec/design/upsert.md §2):
-// the primary key (isPK), or a unique index by position in table.indexes (indexPos).
-export type Arbiter = { isPK: true } | { isPK: false; indexPos: number };
+// the primary key, a unique index by position in table.indexes (indexPos), or an EXCLUDE constraint
+// by position in table.exclusions (exclusionPos) — named by ON CONSTRAINT, and legal only with DO
+// NOTHING (spec/design/upsert.md §2, PostgreSQL's 42809 for DO UPDATE).
+export type Arbiter =
+  | { kind: "pk" }
+  | { kind: "index"; indexPos: number }
+  | { kind: "exclusion"; exclusionPos: number };
 
 // ConflictPlan is a resolved ON CONFLICT clause (spec/design/upsert.md), built by resolveOnConflict.
 export type ConflictPlan = {
@@ -28676,7 +28965,7 @@ export function resolveArbiter(
         "there is no unique or exclusion constraint matching the ON CONFLICT specification",
       );
     }
-    if (pk.length > 0 && sameIntSet(pk, want)) return { isPK: true };
+    if (pk.length > 0 && sameIntSet(pk, want)) return { kind: "pk" };
     for (let i = 0; i < table.indexes.length; i++) {
       const def = table.indexes[i]!;
       // A conflict-target COLUMN list matches only a plain-column unique index (an expression unique
@@ -28684,7 +28973,7 @@ export function resolveArbiter(
       // matched only through an implying `WHERE index_predicate` (below), as in PostgreSQL.
       const cols = indexColumnOrdinals(def);
       if (def.unique && def.predicate === undefined && cols !== null && sameIntSet(cols, want))
-        return { isPK: false, indexPos: i };
+        return { kind: "index", indexPos: i };
     }
     if (indexPredicate !== null) {
       for (let i = 0; i < table.indexes.length; i++) {
@@ -28697,7 +28986,7 @@ export function resolveArbiter(
           sameIntSet(cols, want) &&
           partialIndexImplied(indexPredicate, table, 0, def, catalog)
         )
-          return { isPK: false, indexPos: i };
+          return { kind: "index", indexPos: i };
       }
     }
     throw engineError(
@@ -28706,12 +28995,14 @@ export function resolveArbiter(
     );
   }
   const pkey = pkeyName(table.name);
-  if (pk.length > 0 && target.name === pkey) return { isPK: true };
+  if (pk.length > 0 && target.name === pkey) return { kind: "pk" };
   for (let i = 0; i < table.indexes.length; i++) {
     const def = table.indexes[i]!;
     if (def.unique && def.name === target.name)
-      return { isPK: false, indexPos: i };
+      return { kind: "index", indexPos: i };
   }
+  const ex = table.exclusions.findIndex((e) => e.name === target.name);
+  if (ex >= 0) return { kind: "exclusion", exclusionPos: ex };
   throw engineError(
     "undefined_object",
     `constraint ${target.name} for table ${table.name} does not exist`,
@@ -28739,7 +29030,8 @@ export function arbiterKey(
   row: Row,
   env: EvalEnv,
 ): Uint8Array | null {
-  if (arb.isPK) return encodePkKey(colTypes, pk, colls, row);
+  if (arb.kind === "pk") return encodePkKey(colTypes, pk, colls, row);
+  if (arb.kind === "exclusion") throw new Error("an exclusion arbiter has no arbiter key");
   return indexPrefixKey(colTypes, colls, rindexes[arb.indexPos]!, row, env);
 }
 
@@ -32978,6 +33270,13 @@ export function checkCatalogRelWrite(name: string): void {
   if (isCatalogRelName(name)) {
     throw engineError("wrong_object_type", `cannot modify system relation "${name}"`);
   }
+}
+
+// excPredicateText is the jed_constraints.expression of an exclude row: the backing index's partial
+// predicate text (gist.md §7.1), or NULL for a non-partial exclusion.
+function excPredicateText(t: Table, exc: ExclusionConstraint): Value {
+  const pred = t.indexes.find((ix) => ix.name === exc.index)?.predicate;
+  return pred === undefined ? nullValue() : textValue(pred.exprText);
 }
 
 // exclusionOpSymbol is the operator symbol rendered by jed_constraints.operators (introspection.md

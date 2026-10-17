@@ -1,0 +1,97 @@
+# INSERT … ON CONFLICT and EXCLUDE constraints (spec/design/upsert.md §2, gist.md §7).
+#
+# A no-target DO NOTHING arbitrates every exclusion constraint too: a row an exclusion excludes —
+# against a stored row or an earlier row of the same statement — is skipped. ON CONSTRAINT names an
+# exclusion constraint for DO NOTHING; DO UPDATE cannot arbitrate one (42809). An exclusion conflict
+# outside the arbiter is still 23P01. Both access methods (gist over a range, btree `=`). Oracle-checked.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.exclusion_constraint, ddl.exclusion_btree, ddl.exclusion_partial, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.insert_on_conflict_exclusion, dml.returning, query.select, query.order_by, types.i32, types.text, types.range, types.boolean, types.boolean_storable
+
+statement ok
+CREATE TABLE r (id i32 PRIMARY KEY, span int4range, EXCLUDE USING gist (span WITH &&))
+
+statement ok
+INSERT INTO r VALUES (1, '[1,5)')
+
+# --- no target: an excluded row is skipped -------------------------------------------------------------
+query I nosort
+INSERT INTO r VALUES (2, '[2,3)'), (3, '[10,20)'), (4, '[15,25)'), (5, '[30,40)') ON CONFLICT DO NOTHING RETURNING id
+----
+3
+5
+
+query IT nosort
+SELECT id, span FROM r ORDER BY id
+----
+1
+[1,5)
+3
+[10,20)
+5
+[30,40)
+
+# --- ON CONSTRAINT names the exclusion for DO NOTHING ----------------------------------------------------
+statement ok
+INSERT INTO r VALUES (6, '[3,4)') ON CONFLICT ON CONSTRAINT r_span_excl DO NOTHING
+
+# an arbiter covers only its own constraint: a primary-key conflict is still 23505
+statement error 23505
+INSERT INTO r VALUES (1, '[50,60)') ON CONFLICT ON CONSTRAINT r_span_excl DO NOTHING
+
+statement error 42809
+INSERT INTO r VALUES (6, '[3,4)') ON CONFLICT ON CONSTRAINT r_span_excl DO UPDATE SET id = 7
+
+# --- an exclusion conflict outside the arbiter is an error ---------------------------------------------
+statement error 23P01
+INSERT INTO r VALUES (7, '[4,6)') ON CONFLICT (id) DO NOTHING
+
+statement error 23P01
+INSERT INTO r VALUES (1, '[1,5)') ON CONFLICT (id) DO UPDATE SET span = '[12,13)'
+
+statement ok
+INSERT INTO r VALUES (1, '[1,5)') ON CONFLICT (id) DO UPDATE SET span = '[5,6)'
+
+query IT nosort
+SELECT id, span FROM r ORDER BY id
+----
+1
+[5,6)
+3
+[10,20)
+5
+[30,40)
+
+# --- a btree exclusion, and a partial one -------------------------------------------------------------
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, code text, live boolean, EXCLUDE (code WITH =) WHERE (live))
+
+statement ok
+INSERT INTO c VALUES (1, 'a', true), (2, 'b', false)
+
+query I nosort
+INSERT INTO c VALUES (3, 'a', true), (4, 'a', false), (5, 'b', true), (6, 'b', true) ON CONFLICT DO NOTHING RETURNING id
+----
+4
+5
+
+statement ok
+INSERT INTO c VALUES (7, 'a', true) ON CONFLICT ON CONSTRAINT c_code_excl DO NOTHING
+
+statement error 23P01
+INSERT INTO c VALUES (7, 'a', true) ON CONFLICT (id) DO NOTHING
+
+query ITB nosort
+SELECT id, code, live FROM c ORDER BY id
+----
+1
+a
+true
+2
+b
+false
+4
+a
+false
+5
+b
+true

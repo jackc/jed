@@ -505,9 +505,10 @@ A **partial index** indexes only the rows for which its `WHERE predicate` is **T
 (the ordinary 3VL WHERE rule — a row whose predicate is FALSE *or* NULL is left out).
 `CREATE INDEX pt_amt_active ON pt (amt) WHERE status = 'active'` builds a B-tree over
 `amt` holding an entry only for the `status = 'active'` rows — the canonical shape (a
-narrow index over a hot subset). B-tree only this slice (a `WHERE` on a GIN / GiST index
-is `0A000`); the `EXCLUDE … WHERE (predicate)` partial form is a separate GiST follow-on
-([gist.md §7](gist.md)).
+narrow index over a hot subset). `CREATE INDEX … WHERE` is B-tree only (a `WHERE` on a GIN /
+GiST index is `0A000`); the one partial GiST index is the backing index of a partial exclusion
+constraint, `EXCLUDE … WHERE (predicate)` ([gist.md §7.1](gist.md)), whose predicate obeys every
+rule below and which is constraint-only (never a read access path).
 
 **The predicate.** A boolean expression over the table's own columns, immutable and
 self-contained — the same purity an expression *key* guarantees (§1). At `CREATE INDEX`

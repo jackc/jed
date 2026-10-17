@@ -1035,14 +1035,21 @@ export class Snapshot {
     next: Table,
     entries: Map<string, Uint8Array[]>,
     pageSize: number,
+    indexRename?: { oldName: string; newName: string },
   ): void {
     const live = new Set(next.indexes.map((i) => i.name));
     for (const i of old.indexes)
-      if (!live.has(i.name)) {
+      if (!live.has(i.name) && indexRename?.oldName !== i.name) {
         this.indexStores.delete(i.name);
         this.gistTrees.delete(i.name);
       }
-    const prior = new Set(old.indexes.map((i) => i.name));
+    // A RENAME CONSTRAINT of a UNIQUE / EXCLUDE moved its backing index's store to the new name
+    // (alterTableCatalog), so the renamed index is a prior one: keep its entries.
+    const prior = new Set(
+      old.indexes.map((i) =>
+        indexRename !== undefined && i.name === indexRename.oldName ? indexRename.newName : i.name,
+      ),
+    );
     for (const i of next.indexes) {
       const k = i.name;
       const rebuild = entries.has(k);

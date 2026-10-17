@@ -1517,40 +1517,12 @@ impl Engine {
         // statement's END STATE: each new row must conflict with no STORED row (probe the backing
         // GiST tree, whose leaf recheck is the full `(expr_i op_i)` conjunction) and no OTHER new
         // row of this batch (pairwise — the resident tree holds only stored rows). The NULL rule /
-        // empty-range exempt a row (`exclusion_probe_query`). Unmetered validation, before any write.
-        let exclusions: Vec<ExclusionConstraint> = self
-            .table(table)
-            .map(|t| t.exclusions.clone())
-            .unwrap_or_default();
-        if !exclusions.is_empty() {
-            let tcols: Vec<Column> = self
-                .table(table)
-                .map(|t| t.columns.clone())
-                .unwrap_or_default();
-            for exc in &exclusions {
-                let ikey = exc.index.to_string();
-                for (_, row) in &prepared {
-                    if let Some(other) =
-                        self.insert_exclusion_conflicts_stored(table, &tcols, exc, row, &ikey)?
-                    {
-                        return Err(EngineError::exclusion_violation(&relation, &exc.name)
-                            .with_detail(
-                                self.exclusion_detail(&relation, &tcols, exc, row, &other, true),
-                            ));
-                    }
-                }
-                for i in 0..prepared.len() {
-                    for j in 0..i {
-                        let (new, other) = (&prepared[i].1, &prepared[j].1);
-                        if exclusion_pair_conflicts(&tcols, exc, new, other)? {
-                            return Err(EngineError::exclusion_violation(&relation, &exc.name)
-                                .with_detail(
-                                    self.exclusion_detail(&relation, &tcols, exc, new, other, true),
-                                ));
-                        }
-                    }
-                }
-            }
+        // empty-range exempt a row, as does a partial constraint's not-TRUE predicate (§7.1); a
+        // btree exclusion probes its ordered index for an equal key (§7.2). Unmetered validation,
+        // before any write.
+        {
+            let rows: Vec<&Row> = prepared.iter().map(|(_, r)| r).collect();
+            self.validate_exclusions(table, &relation, &rows, &HashSet::new())?;
         }
 
         // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
@@ -1741,27 +1713,7 @@ impl Engine {
             self.validate_insert_fk_stored(&relation, columns, &fk, &probe, &row, fk_temp)?;
         }
 
-        let exclusions: Vec<ExclusionConstraint> = self
-            .table(table)
-            .map(|t| t.exclusions.clone())
-            .unwrap_or_default();
-        if !exclusions.is_empty() {
-            let tcols: Vec<Column> = self
-                .table(table)
-                .map(|t| t.columns.clone())
-                .unwrap_or_default();
-            for exc in &exclusions {
-                let ikey = exc.index.to_string();
-                if let Some(other) =
-                    self.insert_exclusion_conflicts_stored(table, &tcols, exc, &row, &ikey)?
-                {
-                    return Err(EngineError::exclusion_violation(&relation, &exc.name)
-                        .with_detail(
-                            self.exclusion_detail(&relation, &tcols, exc, &row, &other, true),
-                        ));
-                }
-            }
-        }
+        self.validate_exclusions(table, &relation, &[&row], &HashSet::new())?;
 
         meter.charge(COSTS.value_compress * cunits);
         meter.guard()?;
@@ -1872,6 +1824,14 @@ impl Engine {
                         "ON CONFLICT DO UPDATE requires inference specification or constraint name",
                     ));
                 }
+                // An exclusion constraint arbitrates DO NOTHING only (PostgreSQL's
+                // infer_arbiter_indexes).
+                if matches!(arbiter, Some(Arbiter::Exclusion(_))) {
+                    return Err(EngineError::new(
+                        SqlState::WrongObjectType,
+                        "ON CONFLICT DO UPDATE not supported with exclusion constraints",
+                    ));
+                }
                 let scope = Scope::on_conflict_excluded(self, tdef, vw, alias);
                 // SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once,
                 // exactly as standalone UPDATE does (constraints.md §2): a constant/no default
@@ -1972,6 +1932,7 @@ impl Engine {
             Arbiter::PrimaryKey => self.store(table).get(ak)?.map(|row| (ak.to_vec(), row)),
             // Unique-index arbiter: probe the index for the prefix → its entry's storage-key
             // suffix → fetch the row (indexes.md §8).
+            Arbiter::Exclusion(_) => unreachable!("an exclusion arbiter has no existing-row probe"),
             Arbiter::Index(i) => {
                 let def = &indexes[*i];
                 let istore = self.index_store(&def.name.to_string());
@@ -2049,6 +2010,13 @@ impl Engine {
             .filter(|(_, d)| d.unique)
             .map(|(i, _)| i)
             .collect();
+        // The exclusion constraints (gist.md §7), parallel to the table's `exclusions` list — the
+        // no-target DO NOTHING arbiter skips on any of them, an `ON CONSTRAINT` exclusion arbiter on
+        // its own (upsert.md §2).
+        let exc_checks: Vec<ExclusionCheck> = match self.table(table) {
+            Some(t) => self.exclusion_checks(t)?,
+            None => Vec::new(),
+        };
 
         // Phase 1 — sequential classification.
         let mut inserts: Vec<Row> = Vec::new();
@@ -2124,6 +2092,20 @@ impl Engine {
                     if committed || in_batch {
                         continue; // skip
                     }
+                    // An exclusion conflict is a conflict too (PostgreSQL arbitrates every
+                    // exclusion constraint for a no-target DO NOTHING).
+                    let mut excluded = false;
+                    for chk in &exc_checks {
+                        if self.exclusion_conflicts_planned(
+                            table, chk, columns, &col_types, &colls, &row, &inserts,
+                        )? {
+                            excluded = true;
+                            break;
+                        }
+                    }
+                    if excluded {
+                        continue; // skip
+                    }
                     if let Some(k) = pkk {
                         ins_pk.insert(k);
                     }
@@ -2133,6 +2115,24 @@ impl Engine {
                         {
                             ins_prefixes[u].insert(p);
                         }
+                    }
+                    view_check(&row, meter)?;
+                    inserts.push(row);
+                }
+                // An `ON CONSTRAINT` exclusion arbiter (DO NOTHING only — resolve rejects DO UPDATE
+                // with 42809): skip a row this constraint excludes against a stored row or an
+                // earlier planned insert; any other conflict is caught by the end-state validation.
+                Some(Arbiter::Exclusion(e)) => {
+                    if self.exclusion_conflicts_planned(
+                        table,
+                        &exc_checks[*e],
+                        columns,
+                        &col_types,
+                        &colls,
+                        &row,
+                        &inserts,
+                    )? {
+                        continue; // skip
                     }
                     view_check(&row, meter)?;
                     inserts.push(row);
@@ -2368,6 +2368,21 @@ impl Engine {
             }
         }
 
+        // EXCLUDE (gist.md §7) over the END STATE, as INSERT and UPDATE: each inserted row and each
+        // updated NEW row must conflict with no stored row the statement keeps (an updated row's old
+        // version is vacated) and with no other new row. A conflict a DO NOTHING arbiter covers was
+        // skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
+        {
+            let rewritten: HashSet<&[u8]> =
+                updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
+            let rows: Vec<&Row> = updates
+                .iter()
+                .map(|(_, _, nr, _)| nr)
+                .chain(inserts.iter())
+                .collect();
+            self.validate_exclusions(table, &relation, &rows, &rewritten)?;
+        }
+
         // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE.
         let fk_parent = self
             .table_scoped(db_scope, table)
@@ -2575,33 +2590,194 @@ impl Engine {
         Ok(())
     }
 
-    /// Test one candidate against the resident rows for an exclusion constraint. Batch-only
-    /// pairwise end-state checks remain in the batch caller; this stored probe is common to both
-    /// INSERT paths (gist.md §7, constraints.md §7).
-    /// Returns the conflicting stored row (the least storage key among the matches, for a
-    /// deterministic `Detail` — error-fields.md §9.2), or `None` when nothing conflicts.
-    fn insert_exclusion_conflicts_stored(
+    /// Resolve a table's `EXCLUDE` constraints for one statement (spec/design/gist.md §7): each
+    /// constraint with its backing index resolved — the partial predicate (§7.1) and, for a btree
+    /// exclusion (§7.2), the ordered key. A backing index whose stored predicate did not parse is
+    /// `XX003` (unparsable-definitions.md §3.4): such a constraint cannot be enforced.
+    pub(crate) fn exclusion_checks(&self, table: &Table) -> Result<Vec<ExclusionCheck>> {
+        let mut out = Vec::with_capacity(table.exclusions.len());
+        for exc in &table.exclusions {
+            let def = table
+                .indexes
+                .iter()
+                .find(|i| i.name == exc.index)
+                .ok_or_else(|| {
+                    EngineError::data_corrupted("an exclusion constraint has its backing index")
+                })?;
+            out.push(ExclusionCheck {
+                exc: exc.clone(),
+                rindex: self.resolve_index(table, def)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Whether `row` participates in an exclusion constraint at all: always, unless the constraint
+    /// is partial and its predicate is not TRUE for the row (gist.md §7.1 — PostgreSQL's partial
+    /// exclusion; the predicate eval is unmetered, like a partial index's).
+    pub(crate) fn exclusion_participates(&self, chk: &ExclusionCheck, row: &Row) -> Result<bool> {
+        let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let env = EvalEnv {
+            exec: self,
+            params: &[],
+            outer: &[],
+            rng: &rng,
+            ctes: CteCtx::empty(),
+            host_batch: None,
+        };
+        index_row_qualifies(&chk.rindex, row, &env)
+    }
+
+    /// A row's exclusion probe key (gist.md §7), or `None` when the row can never conflict: its
+    /// predicate is not TRUE (§7.1), an excluded column is NULL (the NULL rule), or a `&&` column
+    /// holds the empty range. A btree exclusion's key (§7.2) is the backing ordered index's slot
+    /// prefix — two participating rows conflict iff their prefixes are equal, exactly UNIQUE's
+    /// rule — and a GiST exclusion's the conjunction query.
+    pub(crate) fn exclusion_key(
+        &self,
+        chk: &ExclusionCheck,
+        columns: &[Column],
+        col_types: &[ColType],
+        colls: &[Option<std::sync::Arc<Collation>>],
+        row: &Row,
+    ) -> Result<Option<ExclusionKey>> {
+        if chk.rindex.kind == IndexKind::Btree {
+            // `index_prefix` applies the predicate and the NULL rule.
+            return Ok(self
+                .index_prefix(col_types, colls, &chk.rindex, row)?
+                .map(ExclusionKey::Btree));
+        }
+        if !self.exclusion_participates(chk, row)? {
+            return Ok(None);
+        }
+        Ok(exclusion_probe_query(columns, &chk.exc, row)?.map(|(q, s)| ExclusionKey::Gist(q, s)))
+    }
+
+    /// The stored row a participating new row conflicts with under one exclusion constraint
+    /// (gist.md §7), skipping the rows this statement rewrites (`rewritten` storage keys — an
+    /// UPDATE's vacated old rows; empty for INSERT). Returns the conflicting stored row with the
+    /// least storage key (a deterministic `Detail` — error-fields.md §9.2), or `None`. The backing
+    /// index holds only participating rows (a partial index), so every hit participates.
+    pub(crate) fn exclusion_stored_conflict(
         &self,
         table: &str,
-        columns: &[Column],
-        exc: &ExclusionConstraint,
-        row: &Row,
-        index_key: &str,
+        chk: &ExclusionCheck,
+        key: &ExclusionKey,
+        rewritten: &HashSet<&[u8]>,
     ) -> Result<Option<Row>> {
-        let Some((query, strats)) = exclusion_probe_query(columns, exc, row)? else {
-            return Ok(None);
+        let hit: Option<Vec<u8>> = match key {
+            ExclusionKey::Btree(prefix) => {
+                // Entries sharing the prefix sit adjacent in storage-key order (indexes.md §8).
+                let istore = self.index_store(&chk.rindex.name.to_string());
+                istore
+                    .range_entries(&unique_probe_bound(prefix))?
+                    .into_iter()
+                    .map(|(ekey, _)| ekey[prefix.len()..].to_vec())
+                    .find(|suffix| !rewritten.contains(suffix.as_slice()))
+            }
+            ExclusionKey::Gist(query, strats) => self
+                .gist_tree(&chk.rindex.name.to_string())
+                .and_then(|tree| {
+                    tree.search(query, strats)
+                        .0
+                        .into_iter()
+                        .filter(|h| !rewritten.contains(h.as_slice()))
+                        .min()
+                }),
         };
-        let Some(first) = self
-            .gist_tree(index_key)
-            .and_then(|tree| tree.search(&query, &strats).0.into_iter().min())
-        else {
+        let Some(hit) = hit else {
             return Ok(None);
         };
         // A matched entry always names a stored row; one that does not is a corrupt index.
-        let row = self.store(table).get(&first)?.ok_or_else(|| {
-            crate::error::EngineError::data_corrupted("a GiST entry references a stored row")
+        let row = self.store(table).get(&hit)?.ok_or_else(|| {
+            EngineError::data_corrupted("an exclusion index entry references a stored row")
         })?;
         Ok(Some(row))
+    }
+
+    /// Whether a proposed `ON CONFLICT DO NOTHING` row conflicts under one exclusion constraint with
+    /// a stored row or with an insert this statement already planned (`planned`) — the row-at-a-time
+    /// visibility upsert.md §3 reproduces (gist.md §7).
+    #[allow(clippy::too_many_arguments)]
+    fn exclusion_conflicts_planned(
+        &self,
+        table: &str,
+        chk: &ExclusionCheck,
+        columns: &[Column],
+        col_types: &[ColType],
+        colls: &[Option<std::sync::Arc<Collation>>],
+        row: &Row,
+        planned: &[Row],
+    ) -> Result<bool> {
+        let Some(key) = self.exclusion_key(chk, columns, col_types, colls, row)? else {
+            return Ok(false);
+        };
+        if self
+            .exclusion_stored_conflict(table, chk, &key, &HashSet::new())?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        for p in planned {
+            if let Some(pk) = self.exclusion_key(chk, columns, col_types, colls, p)? {
+                if exclusion_keys_conflict(columns, &chk.exc, &key, row, &pk, p)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Validate the participating rows `rows` of one statement against a table's exclusion
+    /// constraints (gist.md §7), in constraint (name) order: each must conflict with no stored row
+    /// outside `rewritten` and with no earlier row of `rows` (pairwise — the backing index holds only
+    /// stored rows). The first conflict traps `23P01` with PostgreSQL's "conflicts with existing key"
+    /// `Detail`. Unmetered validation, before any write.
+    pub(crate) fn validate_exclusions(
+        &self,
+        table: &str,
+        relation: &str,
+        rows: &[&Row],
+        rewritten: &HashSet<&[u8]>,
+    ) -> Result<()> {
+        let Some(tdef) = self.table(table) else {
+            return Ok(());
+        };
+        if tdef.exclusions.is_empty() || rows.is_empty() {
+            return Ok(());
+        }
+        let tcols = tdef.columns.clone();
+        let checks = self.exclusion_checks(tdef)?;
+        let col_types: Vec<ColType> = self.store(table).col_types().to_vec();
+        let colls = self.column_collations(&tcols);
+        for chk in &checks {
+            let mut keys: Vec<Option<ExclusionKey>> = Vec::with_capacity(rows.len());
+            for row in rows {
+                keys.push(self.exclusion_key(chk, &tcols, &col_types, &colls, row)?);
+            }
+            for (i, row) in rows.iter().enumerate() {
+                let Some(key) = &keys[i] else { continue };
+                if let Some(other) = self.exclusion_stored_conflict(table, chk, key, rewritten)? {
+                    return Err(EngineError::exclusion_violation(relation, &chk.exc.name)
+                        .with_detail(
+                            self.exclusion_detail(relation, &tcols, &chk.exc, row, &other, true),
+                        ));
+                }
+            }
+            for i in 0..rows.len() {
+                let Some(ki) = &keys[i] else { continue };
+                for j in 0..i {
+                    let Some(kj) = &keys[j] else { continue };
+                    if exclusion_keys_conflict(&tcols, &chk.exc, ki, rows[i], kj, rows[j])? {
+                        return Err(EngineError::exclusion_violation(relation, &chk.exc.name)
+                            .with_detail(self.exclusion_detail(
+                                relation, &tcols, &chk.exc, rows[i], rows[j], true,
+                            )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Evaluate the table's CHECK constraints on one candidate row (constraints.md §4.4): TRUE
@@ -4185,51 +4361,13 @@ impl Engine {
         // is a rewritten OLD key — that row is vacated by this statement) nor another updated NEW
         // row (pairwise). The NULL rule / empty-range exempt a row. An end-state-valid swap thus
         // succeeds where PG fails the per-row transient (the documented UNIQUE end-state divergence,
-        // constraints.md §6.5). Unmetered, phase 1, before any write.
-        let exclusions: Vec<ExclusionConstraint> = self
-            .table(&upd.table)
-            .map(|t| t.exclusions.clone())
-            .unwrap_or_default();
-        if !exclusions.is_empty() && !updates.is_empty() {
+        // constraints.md §6.5). A partial constraint's not-TRUE predicate exempts a row (§7.1); a
+        // btree exclusion probes its ordered index (§7.2). Unmetered, phase 1, before any write.
+        if !updates.is_empty() {
             let rewritten: HashSet<&[u8]> =
                 updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
-            for exc in &exclusions {
-                let ikey = exc.index.to_string();
-                for (_, _, new_row, _) in &updates {
-                    if let Some((q, strats)) = exclusion_probe_query(&tcolumns, exc, new_row)? {
-                        // The least non-vacated stored match (a deterministic Detail, §9.2).
-                        let hit = match self.gist_tree(&ikey) {
-                            Some(tree) => tree
-                                .search(&q, &strats)
-                                .0
-                                .into_iter()
-                                .filter(|h| !rewritten.contains(h.as_slice()))
-                                .min(),
-                            None => None,
-                        };
-                        if let Some(hit) = hit {
-                            let other = self.store(&upd.table).get(&hit)?.ok_or_else(|| {
-                                EngineError::data_corrupted("a GiST entry references a stored row")
-                            })?;
-                            return Err(EngineError::exclusion_violation(&relation, &exc.name)
-                                .with_detail(self.exclusion_detail(
-                                    &relation, &tcolumns, exc, new_row, &other, true,
-                                )));
-                        }
-                    }
-                }
-                for i in 0..updates.len() {
-                    for j in 0..i {
-                        let (new, other) = (&updates[i].2, &updates[j].2);
-                        if exclusion_pair_conflicts(&tcolumns, exc, new, other)? {
-                            return Err(EngineError::exclusion_violation(&relation, &exc.name)
-                                .with_detail(self.exclusion_detail(
-                                    &relation, &tcolumns, exc, new, other, true,
-                                )));
-                        }
-                    }
-                }
-            }
+            let rows: Vec<&Row> = updates.iter().map(|(_, _, r, _)| r).collect();
+            self.validate_exclusions(&upd.table, &relation, &rows, &rewritten)?;
         }
 
         // FOREIGN KEY child-side (constraints.md §6.4): re-validate an FK only when the statement

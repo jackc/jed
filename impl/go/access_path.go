@@ -1509,7 +1509,7 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 	// column from an earlier sibling, never the indexed relation itself or a later relation.
 	filters := []*rExpr{on, whereFilter}
 	for _, idx := range rel.table.Indexes {
-		if idx.Kind != indexGist || len(idx.Keys) != 1 {
+		if idx.Kind != indexGist || len(idx.Keys) != 1 || idx.Predicate != nil {
 			continue
 		}
 		ci := idx.firstColumn()
@@ -1750,9 +1750,11 @@ func ginMatchOperand(filter *rExpr, colGlobal int, jsonb bool, queryOK func(*rEx
 }
 
 // buildGistBoundForIndex inventories one single-column GiST index. Multi-column GiST indexes are
-// EXCLUDE backing structures and remain constraint-only, never planner candidates.
+// EXCLUDE backing structures and remain constraint-only, never planner candidates; so is the
+// partial GiST index a partial EXCLUDE … WHERE builds (gist.md §7.1 — it holds only the
+// predicate's rows).
 func buildGistBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, offset int) *gistBoundPlan {
-	if filter == nil || idx.Kind != indexGist || len(idx.Keys) != 1 {
+	if filter == nil || idx.Kind != indexGist || len(idx.Keys) != 1 || idx.Predicate != nil {
 		return nil
 	}
 	ci := idx.firstColumn()

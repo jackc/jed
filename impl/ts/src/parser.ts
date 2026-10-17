@@ -1346,7 +1346,8 @@ class Parser {
   // parseExclusionTableConstraint parses one `[CONSTRAINT name] EXCLUDE [USING method] ( col WITH op
   // [, col2 WITH op2 ...] )` (the cursor is verified by atExclusionTableConstraint). Each operand is
   // a bare column name; the WITH operator is captured as its source text (= / &&) and mapped to a
-  // strategy at execution (spec/design/gist.md §7). The USING method (only gist) is captured verbatim.
+  // strategy at execution (spec/design/gist.md §7). The USING method (btree / gist) is captured
+  // verbatim and validated at execution; an optional `WHERE ( predicate )` follows (§7.1).
   private parseExclusionTableConstraint(): ExcludeDef {
     let name: string | null = null;
     if (this.peekKeyword() === "constraint") {
@@ -1373,6 +1374,18 @@ class Parser {
       if (k === "comma") continue;
       if (k === "rparen") break;
       throw engineError("syntax_error", "expected ',' or ')'");
+    }
+    // The partial form `WHERE ( predicate )` (gist.md §7.1) — PostgreSQL's ExclusionWhereClause
+    // requires the parentheses. The text captured is the inner expression's (the partial-index
+    // predicate's canonical form, indexes.md §9).
+    if (this.peekKeyword() === "where") {
+      this.advance();
+      this.expect("lparen");
+      const start = this.pos;
+      const expr = this.parseExpr();
+      const text = renderTokens(this.tokens.slice(start, this.pos));
+      this.expect("rparen");
+      return { name, using, elements, predicate: { text, expr } };
     }
     return { name, using, elements };
   }

@@ -1,0 +1,70 @@
+# jed-specific EXCLUDE behavior for the btree and partial forms (spec/design/gist.md §7.1/§7.2).
+#
+# Deliberate divergences from PostgreSQL, so cross-core-checked rather than oracle-checked:
+#   - UPDATE validates exclusions against the statement's END STATE (the documented UNIQUE end-state
+#     divergence, constraints.md §6.5): a value shift or swap that PostgreSQL's per-row check rejects
+#     succeeds here when the end state is valid.
+#   - EXCLUDE on a temporary table is 0A000 for either method (gist.md §11).
+#   - USING gin is 0A000 and an unknown access method 42704, worded as jed's CREATE INDEX does.
+#   - A GiST exclusion keeps its repeated-column narrowing (42701); a btree one accepts it, as PG does.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.exclusion_constraint, ddl.exclusion_btree, ddl.exclusion_partial, ddl.temp_table, dml.insert, dml.insert_multi_row, dml.update, query.select, query.order_by, types.i32, types.range, types.array, expr.case, types.boolean, types.boolean_storable
+
+# --- end-state UPDATE over a btree exclusion -------------------------------------------------------------
+statement ok
+CREATE TABLE seq (id i32 PRIMARY KEY, pos i32, EXCLUDE (pos WITH =))
+
+statement ok
+INSERT INTO seq VALUES (1, 1), (2, 2), (3, 3)
+
+# PostgreSQL fails the transient collision (row 1 → 2 while row 2 still holds 2); the end state is valid
+statement ok
+UPDATE seq SET pos = pos + 1
+
+statement ok
+UPDATE seq SET pos = CASE WHEN id = 1 THEN 4 WHEN id = 3 THEN 2 ELSE pos END
+
+query II nosort
+SELECT id, pos FROM seq ORDER BY id
+----
+1
+4
+2
+3
+3
+2
+
+statement error 23P01
+UPDATE seq SET pos = 3 WHERE id = 1
+
+# --- end-state UPDATE over a partial exclusion ----------------------------------------------------------
+statement ok
+CREATE TABLE slot (id i32 PRIMARY KEY, span int4range, on_air boolean, EXCLUDE USING gist (span WITH &&) WHERE (on_air))
+
+statement ok
+INSERT INTO slot VALUES (1, '[1,5)', true), (2, '[1,5)', false)
+
+# swapping which of the two overlapping rows is on air leaves one participating row
+statement ok
+UPDATE slot SET on_air = NOT on_air
+
+query IB nosort
+SELECT id, on_air FROM slot ORDER BY id
+----
+1
+false
+2
+true
+
+# --- narrowings ------------------------------------------------------------------------------------------
+statement error 0A000
+CREATE TEMP TABLE tmp (id i32 PRIMARY KEY, a i32, EXCLUDE (a WITH =))
+
+statement error 0A000
+CREATE TABLE g (id i32 PRIMARY KEY, a i32[], EXCLUDE USING gin (a WITH =))
+
+statement error 42704
+CREATE TABLE h (id i32 PRIMARY KEY, a i32, EXCLUDE USING hash (a WITH =))
+
+statement error 42701
+CREATE TABLE d (id i32 PRIMARY KEY, a int4range, EXCLUDE USING gist (a WITH &&, a WITH &&))

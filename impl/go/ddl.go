@@ -424,6 +424,134 @@ func rejectParamsForDDL(params []Value) error {
 	return nil
 }
 
+// resolveIndexPredicate validates a partial index's `WHERE predicate` (spec/design/indexes.md §9) —
+// shared by `CREATE INDEX … WHERE` and the partial `EXCLUDE … WHERE (predicate)` (gist.md §7.1) so
+// the two cannot drift: a subquery is 0A000 and a bind parameter 42P02 (structural pre-walk); an
+// aggregate 42803, a window 42P20, a non-boolean 42804 (the Forbidden-context boolean resolve); a
+// non-immutable dependency 42P17 (index-dependencies.md). Host-function and time-zone dependencies
+// accumulate into hostDeps / timezoneDeps. Returns the stored form (the canonical text + the
+// unresolved AST, re-resolved per statement).
+func (db *engine) resolveIndexPredicate(table *catTable, pred *indexPredicate, hostDeps *[]hostFuncDep, timezoneDeps *timeZoneDeps) (*indexKeyExpr, error) {
+	if err := db.admitIndexExpr(table, pred.Expr, true, hostDeps, timezoneDeps); err != nil {
+		return nil, err
+	}
+	return &indexKeyExpr{ExprText: pred.Text, Expr: pred.Expr}, nil
+}
+
+// resolveExclusionPredicate resolves an EXCLUDE definition's optional partial predicate (gist.md
+// §7.1), validated as a partial index's, into the backing index's predicate + dependency lists.
+func (db *engine) resolveExclusionPredicate(table *catTable, pred *indexPredicate) (*indexKeyExpr, []hostFuncDep, timeZoneDeps, error) {
+	var hostDeps []hostFuncDep
+	var timezoneDeps timeZoneDeps
+	var predicate *indexKeyExpr
+	if pred != nil {
+		p, err := db.resolveIndexPredicate(table, pred, &hostDeps, &timezoneDeps)
+		if err != nil {
+			return nil, nil, timeZoneDeps{}, err
+		}
+		predicate = p
+	}
+	sortHostDeps(hostDeps)
+	if err := timezoneDeps.validate(); err != nil {
+		return nil, nil, timeZoneDeps{}, err
+	}
+	return predicate, hostDeps, timezoneDeps, nil
+}
+
+// exclusionMethod resolves the access method of an EXCLUDE definition (spec/design/gist.md
+// §7/§7.2): no USING or USING btree is the ordered B-tree (PostgreSQL's default access method),
+// USING gist the GiST index. gin exists but cannot enforce an exclusion (0A000, PostgreSQL's "does
+// not support exclusion constraints"); any other method name does not exist (42704, as for CREATE
+// INDEX).
+func exclusionMethod(using string) (indexKind, error) {
+	switch using {
+	case "", "btree":
+		return indexBtree, nil
+	case "gist":
+		return indexGist, nil
+	case "gin":
+		return 0, newError(FeatureNotSupported, "access method gin does not support exclusion constraints")
+	default:
+		return 0, newError(UndefinedObject, "access method does not exist: "+using)
+	}
+}
+
+// resolveExclusionDefinition resolves the parts of an EXCLUDE definition that are independent of
+// naming: the access method, the element columns, and their operators. CREATE TABLE and ALTER
+// TABLE share this path so their operator/opclass and duplicate-column gates cannot drift
+// (spec/design/gist.md §7). Under btree (§7.2) every column needs a key-encodable type (the CREATE
+// INDEX gate) and every operator must be = — the only commutative btree operator (42809 otherwise,
+// as in PostgreSQL). Under gist the operators are && (range) and = (fixed-width scalar).
+func (db *engine) resolveExclusionDefinition(table *catTable, using string, elements []excludeElementDef) (indexKind, []int, []exclusionElement, error) {
+	method, err := exclusionMethod(using)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	cols := make([]int, 0, len(elements))
+	resolved := make([]exclusionElement, 0, len(elements))
+	for _, el := range elements {
+		ci := table.ColumnIndex(el.Column)
+		if ci < 0 {
+			return 0, nil, nil, newError(UndefinedColumn, "column "+el.Column+" named in key does not exist")
+		}
+		// A repeated column is harmless to a btree exclusion (its backing ordered index admits a
+		// repeated key column, as CREATE INDEX does — PostgreSQL accepts it); the GiST tuple bound
+		// keeps the GX3 narrowing (42701).
+		if method == indexGist && slices.Contains(cols, ci) {
+			return 0, nil, nil, newError(DuplicateColumn, "column "+el.Column+" appears twice in exclusion constraint")
+		}
+		ty := table.Columns[ci].Type
+		var op exclusionOp
+		if method == indexBtree {
+			// The opclass first (PostgreSQL's ComputeIndexAttrs order), then the operator.
+			if err := db.indexColumnTypeGate(indexBtree, ty); err != nil {
+				return 0, nil, nil, err
+			}
+			if el.Op != "=" {
+				return 0, nil, nil, newError(WrongObjectType,
+					"operator "+el.Op+" is not a commutative member of the btree operator family of "+ty.CanonicalName())
+			}
+			op = exclEqual
+		} else {
+			o, err := gistExclusionOp(ty, el.Op)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			op = o
+		}
+		cols = append(cols, ci)
+		resolved = append(resolved, exclusionElement{Column: ci, Op: op})
+	}
+	return method, cols, resolved, nil
+}
+
+// gistExclusionOp is the GiST WITH operator of one EXCLUDE element over a column of type ty
+// (gist.md §7): && needs a range column (range_ops), = a fixed-width keyable scalar (the in-core
+// btree_gist).
+func gistExclusionOp(ty dataType, operator string) (exclusionOp, error) {
+	switch operator {
+	case "&&":
+		if !ty.IsRange() {
+			return 0, newError(UndefinedObject,
+				"data type "+ty.CanonicalName()+" has no default operator class for access method gist that accepts operator &&")
+		}
+		return exclOverlaps, nil
+	case "=":
+		switch {
+		case isGistScalarType(ty):
+			return exclEqual, nil
+		case isGistDeferredScalarType(ty):
+			return 0, newError(FeatureNotSupported,
+				"an exclusion constraint with = over "+ty.CanonicalName()+" is not supported yet")
+		default:
+			return 0, newError(UndefinedObject,
+				"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
+		}
+	default:
+		return 0, newError(FeatureNotSupported, "exclusion constraint operator "+operator+" is not supported yet")
+	}
+}
+
 // executeCreateTable analyzes and runs a CREATE TABLE: resolve each column's type
 // name, enforce a single primary key across both forms (column-level and the
 // table-level PRIMARY KEY (a, b, ...) constraint — which is implicitly NOT NULL per
@@ -1339,52 +1467,14 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 	// 42P07/42710 across the relation + constraint namespaces), and build the MULTI-COLUMN GiST index
 	// that enforces it. The probe + 23P01 live in INSERT/UPDATE.
 	for _, exc := range ct.Excludes {
-		if exc.Using != "" && exc.Using != "gist" {
-			return outcome{}, newError(UndefinedObject, "access method "+exc.Using+" does not support exclusion constraints")
+		method, indices, elements, err := db.resolveExclusionDefinition(table, exc.Using, exc.Elements)
+		if err != nil {
+			return outcome{}, err
 		}
-		indices := make([]int, 0, len(exc.Elements))
-		elements := make([]exclusionElement, 0, len(exc.Elements))
-		for _, el := range exc.Elements {
-			ci := -1
-			for i := range table.Columns {
-				if table.Columns[i].Name == el.Column {
-					ci = i
-					break
-				}
-			}
-			if ci < 0 {
-				return outcome{}, newError(UndefinedColumn, "column "+el.Column+" named in key does not exist")
-			}
-			if slices.Contains(indices, ci) {
-				return outcome{}, newError(DuplicateColumn, "column "+el.Column+" appears twice in exclusion constraint")
-			}
-			ty := table.Columns[ci].Type
-			// The WITH operator must pair with the column's GiST opclass (gist.md §7): && over a
-			// range column (range_ops), = over a fixed-width keyable scalar (the in-core btree_gist).
-			var op exclusionOp
-			switch el.Op {
-			case "&&":
-				if !ty.IsRange() {
-					return outcome{}, newError(UndefinedObject,
-						"data type "+ty.CanonicalName()+" has no default operator class for access method gist that accepts operator &&")
-				}
-				op = exclOverlaps
-			case "=":
-				switch {
-				case isGistScalarType(ty):
-					op = exclEqual
-				case isGistDeferredScalarType(ty):
-					return outcome{}, newError(FeatureNotSupported,
-						"an exclusion constraint with = over "+ty.CanonicalName()+" is not supported yet")
-				default:
-					return outcome{}, newError(UndefinedObject,
-						"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
-				}
-			default:
-				return outcome{}, newError(FeatureNotSupported, "exclusion constraint operator "+el.Op+" is not supported yet")
-			}
-			indices = append(indices, ci)
-			elements = append(elements, exclusionElement{Column: ci, Op: op})
+		// The partial form's predicate (gist.md §7.1), validated as a partial index's.
+		predicate, hostDeps, timezoneDeps, err := db.resolveExclusionPredicate(table, exc.Predicate)
+		if err != nil {
+			return outcome{}, err
 		}
 		// Name the constraint (= its backing index name). An explicit name checks the relation
 		// namespace (42P07) then the table's constraint names (42710); a derived `<table>_<cols>_excl`
@@ -1438,8 +1528,11 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 				return relTaken(n) || conTaken(n) || schemaTaken(n)
 			})
 		}
-		// Insert the backing GiST index in catalog (ascending name byte) order.
-		def := indexDef{Name: name, Keys: columnKeys(indices), Unique: false, Kind: indexGist}
+		// Insert the backing index in catalog (ascending name byte) order. A btree exclusion's index
+		// is NOT unique (PostgreSQL's indisunique = false): the constraint, not the index, enforces it
+		// (23P01, gist.md §7.2), so it is no FOREIGN KEY target and no ON CONFLICT column-list
+		// arbiter. Plain-column keys; only a partial predicate can carry a dependency.
+		def := indexDef{Name: name, Keys: columnKeys(indices), Unique: false, Kind: method, Predicate: predicate, HostDeps: hostDeps, TimezoneDeps: timezoneDeps}
 		nameKey := name
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
@@ -2930,7 +3023,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if rekeyed {
 		err = ws.rebuildAlterIndexes(original, &table, constraintEntries, alterPageSize)
 	} else {
-		err = ws.syncAlterConstraintIndexes(original, &table, constraintEntries, alterPageSize)
+		err = ws.syncAlterConstraintIndexes(original, &table, constraintEntries, alterPageSize, indexOld, indexNew)
 	}
 	if err != nil {
 		return outcome{}, err
@@ -3812,10 +3905,11 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, newError(FeatureNotSupported,
 				"a partial (WHERE) "+ci.Using+" index is not supported yet")
 		}
-		if err := db.admitIndexExpr(table, ci.Predicate.Expr, true, &hostDeps, &timezoneDeps); err != nil {
+		p, err := db.resolveIndexPredicate(table, ci.Predicate, &hostDeps, &timezoneDeps)
+		if err != nil {
 			return outcome{}, err
 		}
-		predicate = &indexKeyExpr{ExprText: ci.Predicate.Text, Expr: ci.Predicate.Expr}
+		predicate = p
 	}
 	// relationExistsScoped checks the namespace of the target scope: an attachment's OWN snapshot for an
 	// attached table (each attached database is an independent namespace, §3), else the temp-aware

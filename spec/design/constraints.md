@@ -417,6 +417,11 @@ live with the index ([indexes.md §8](indexes.md) — *NULLS DISTINCT*, the writ
 `CREATE UNIQUE INDEX`). This section is the CREATE TABLE surface. Everything here is
 oracle-probed against PostgreSQL 18 except the documented divergences.
 
+`EXCLUDE (a WITH =, b WITH =)` — the all-`=` exclusion, btree by default
+([gist.md §7.2](gist.md)) — enforces the same rule but is **not** a UNIQUE constraint: its backing
+ordered index is not unique, a conflict is `23P01` with the exclusion `Detail`, and it is neither a
+FOREIGN KEY target nor an `ON CONFLICT` column-list arbiter, as in PostgreSQL.
+
 ### 5.1 Surface and resolution
 
 Both positions, same constraint: a **column-level** `[CONSTRAINT name] UNIQUE` is the

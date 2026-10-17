@@ -108,6 +108,8 @@
 #              the equivalent sibling <@ indexed-column spelling defeats the bound.
 #   gist_inl — GiST range @> and fixed-width scalar = sibling operands bound the inner; equivalent
 #              <@ and paired-inequality spellings defeat the bounds.
+#   exclude_btree — an EXCLUDE USING btree constraint's ordered backing index (and a partial one's,
+#              under its predicate conjunct) bounds `code = c`; `code + 0 = c` full-scans. Same rows.
 #   where_pushdown — single-relation WHERE conjuncts over a join run as their (preserved) base
 #              relation is read (planner.md §3.2); writing each column as `col + 0` makes the conjunct
 #              arithmetic, which never moves, so it is applied to the joined rows instead. INNER, LEFT,
@@ -509,6 +511,10 @@ GIN_STATS_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.gin_
 GIST_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index query.gist_scan dml.insert
               dml.insert_multi_row query.select query.order_by types.i32 types.range
               func.range_constructors func.range_operators].freeze
+EXCLUDE_BTREE_REQ = %w[ddl.create_table ddl.primary_key ddl.exclusion_constraint ddl.exclusion_btree
+                       ddl.exclusion_partial dml.insert dml.insert_multi_row query.select
+                       query.order_by query.where_eq query.logical_connectives expr.arithmetic
+                       types.i32 types.text types.boolean types.boolean_storable].freeze
 GIST_SCALAR_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_scalar_index query.gist_scalar_scan
                      dml.insert dml.insert_multi_row query.select query.order_by
                      query.comparison_order query.logical_connectives types.i32 query.where_eq].freeze
@@ -3043,6 +3049,60 @@ def gen_gist_scalar(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: an EXCLUDE USING btree backing index as an access path (gist.md §7.2) --------------
+# `EXCLUDE (code WITH =, tag WITH =)` — btree, PostgreSQL's default method — backs itself with an
+# ordinary non-unique ordered index on (code, tag), which bounds `code = c` like any index; a partial
+# `EXCLUDE (code WITH =) WHERE (live)` backs itself with a partial ordered index, which bounds
+# `live AND code = c` (the predicate conjunct present, indexes.md §9). Writing the column as `code + 0`
+# leaves no bare-column bound, so the same predicate full-scans. Each pair must return identical
+# by-construction rows (a row matches iff its code equals c, and — for the partial pair — it is live):
+# this catches an exclusion-backing-index maintenance or bound bug ALL cores might share.
+def gen_exclude_btree(seed)
+  rng = Random.new(seed)
+  ids = (1..60).to_a.sample(16, random: rng).sort
+  # (id, code, tag, live): (code, tag) pairs are distinct (the btree exclusion), live codes are
+  # distinct (the partial one); one row has a NULL code (never conflicts).
+  used_pairs = {}
+  live_codes = {}
+  null_id = ids.sample(random: rng)
+  rows = ids.map do |id|
+    next [id, nil, "n", true] if id == null_id
+
+    code = tag = nil
+    loop do
+      code = rng.rand(0..5)
+      tag = %w[a b c].sample(random: rng)
+      break unless used_pairs[[code, tag]]
+    end
+    used_pairs[[code, tag]] = true
+    live = !live_codes[code] && rng.rand(0..1).zero?
+    live_codes[code] = true if live
+    [id, code, tag, live]
+  end
+  matches = lambda do |c, live_only|
+    rows.select { |_id, code, _tag, live| code == c && (!live_only || live) }.map { |id, *| id.to_s }
+  end
+  lit = ->(v) { v.nil? ? "NULL" : v.is_a?(String) ? "'#{v}'" : v.to_s }
+
+  out = header(seed, EXCLUDE_BTREE_REQ, "EXCLUDE USING btree backing index (code = c bounded vs code + 0 = c full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, code i32, tag text, live boolean, " \
+            "EXCLUDE (code WITH =, tag WITH =), EXCLUDE (code WITH =) WHERE (live))")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |r| "(#{r.map { |v| lit.call(v) }.join(', ')})" }.join(', ')}")
+
+  [0, 3, 9].each do |c|
+    out << "# code = #{c}: the exclusion's ordered index bounds the scan"
+    q(out, "I", "SELECT id FROM t WHERE code = #{c} ORDER BY id", matches.call(c, false))
+    out << "# code + 0 = #{c}: the same predicate, no bound — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE code + 0 = #{c} ORDER BY id", matches.call(c, false))
+    out << "# live AND code = #{c}: the partial exclusion's index bounds the scan"
+    q(out, "I", "SELECT id FROM t WHERE live AND code = #{c} ORDER BY id", matches.call(c, true))
+    out << "# live AND code + 0 = #{c}: no bound — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE live AND code + 0 = #{c} ORDER BY id", matches.call(c, true))
+  end
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: GIN-bounded `= ANY` membership (k = ANY via the GIN index vs '{k}' <@ full scan) ---
 # `c = ANY(col)` over a GIN-indexed array column gathers the single term c's posting list
 # (spec/design/gin.md §6; query.gin_any_eq); the SEMANTICALLY IDENTICAL `'{c}' <@ col` (contained-by)
@@ -5148,6 +5208,7 @@ SCENARIOS = {
   "varwidth_span" => method(:gen_varwidth_span),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),
+  "exclude_btree" => method(:gen_exclude_btree),
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
   "window" => method(:gen_window_frame),

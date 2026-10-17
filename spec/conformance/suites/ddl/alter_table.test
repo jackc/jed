@@ -245,3 +245,31 @@ DROP TABLE renamed_owned
 
 statement error 42P01
 SELECT nextval('owned_id_seq')
+
+# A constraint rename keeps the backing index's entries: the renamed UNIQUE / EXCLUDE still sees the
+# rows stored before the rename, and the renamed unique index still serves reads.
+statement ok
+CREATE TABLE kept (id i32 PRIMARY KEY, code text, span int4range, CONSTRAINT kept_code_key UNIQUE (code), CONSTRAINT kept_span EXCLUDE USING gist (span WITH &&))
+
+statement ok
+INSERT INTO kept VALUES (1, 'a', '[1,5)')
+
+statement ok
+ALTER TABLE kept RENAME CONSTRAINT kept_code_key TO kept_code_uq
+
+statement ok
+ALTER TABLE kept RENAME CONSTRAINT kept_span TO kept_span_x
+
+statement error 23505
+INSERT INTO kept VALUES (2, 'a', '[10,20)')
+
+statement error 23P01
+INSERT INTO kept VALUES (3, 'b', '[2,3)')
+
+query I nosort
+SELECT id FROM kept WHERE code = 'a'
+----
+1
+
+statement ok
+DROP TABLE kept

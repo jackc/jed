@@ -8,9 +8,11 @@
 #   d (id, v, k) row (1,1,1); v's expression DEFAULT does not parse, k's is 1 + 1
 #   x (id, v) rows (1,1) (2,2); expression index x_future_idx does not parse; x_v_idx on v
 #   p (id, v) rows (1,1) (2,2); UNIQUE partial index p_future_idx on v whose predicate does not parse
+#   e (id, r) rows (1,[1,5)) (2,[3,8)); partial EXCLUDE e_r_excl (gist, r WITH &&) whose predicate does
+#     not parse, its index forged empty
 # The two unparsed indexes are forged EMPTY although their tables have rows, so a planner that used
 # either would lose rows. jed-specific, so cross-core-checked, not PostgreSQL-oracle-checked.
-# requires: harness.fixture_open, storage.unparsable_definitions, introspect.tables, introspect.views, introspect.columns, introspect.indexes, introspect.constraints, ddl.view, ddl.view_alter, ddl.view_cascade, dml.view_write, ddl.check, ddl.column_default_expr, ddl.index_expr, ddl.index_partial, ddl.reindex, ddl.alter_table, ddl.drop_table, dml.insert, dml.insert_column_list, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text
+# requires: harness.fixture_open, storage.unparsable_definitions, introspect.tables, introspect.views, introspect.columns, introspect.indexes, introspect.constraints, ddl.view, ddl.view_alter, ddl.view_cascade, dml.view_write, ddl.check, ddl.column_default_expr, ddl.index_expr, ddl.index_partial, ddl.reindex, ddl.exclusion_constraint, ddl.exclusion_partial, types.range, ddl.alter_table, ddl.drop_table, dml.insert, dml.insert_column_list, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text
 # fixture: fileformat/fixtures/unparsable_definitions.jed
 
 # --- views (§3.1) ----------------------------------------------------------------------------------
@@ -306,6 +308,51 @@ SELECT id, v, z FROM x
 3
 3
 5
+
+# --- partial exclusion constraint (§3.4, gist.md §7.1) ---------------------------------------------
+
+# The constraint is listed with its stored predicate text; its forged-empty GiST index serves no read.
+query TTT nosort
+SELECT name, type, expression FROM jed_constraints WHERE table_name = 'e'
+----
+e_r_excl
+exclude
+r is future syntax
+
+query I rowsort
+SELECT id FROM e WHERE r && '[3,4)'::i32range
+----
+1
+2
+
+# Every write that maintains the backing index, or checks the constraint, needs the predicate.
+statement error XX003
+INSERT INTO e VALUES (3, '[20,30)')
+
+statement error XX003
+UPDATE e SET r = '[40,50)' WHERE id = 1
+
+statement error XX003
+DELETE FROM e WHERE id = 1
+
+statement error 2BP01
+DROP INDEX e_r_excl
+
+statement ok
+ALTER TABLE e DROP CONSTRAINT e_r_excl
+
+statement ok
+INSERT INTO e VALUES (3, '[2,4)')
+
+query I rowsort
+SELECT id FROM e WHERE r && '[3,4)'::i32range
+----
+1
+2
+3
+
+statement ok
+DROP TABLE e
 
 # --- partial index (§3.4) --------------------------------------------------------------------------
 

@@ -297,17 +297,22 @@ pub struct UniqueDef {
 }
 
 /// One parsed `EXCLUDE` constraint (spec/design/gist.md §7, grammar.md): the optional explicit
-/// `CONSTRAINT` name (it names the backing GiST index), an optional `USING <method>` (only `gist` —
-/// the default — is supported; anything else is 42704 at execution), and the `(column, operator)`
-/// element list in declaration order. Each operand is a bare column name; the operator is the
-/// `WITH` operator's source text (`=` or `&&`). Execution resolves the columns + operators
-/// (42703/42701/42704/0A000), creates the multi-column GiST index, and names the unnamed ones.
+/// `CONSTRAINT` name (it names the backing index), an optional `USING <method>` (`btree` — the
+/// PostgreSQL default — or `gist`; anything else is 42704 at execution), the `(column, operator)`
+/// element list in declaration order, and the optional `WHERE (predicate)` of the partial form
+/// (gist.md §7.1). Each operand is a bare column name; the operator is the `WITH` operator's source
+/// text. Execution resolves the columns + operators (42703/42701/42704/42809/0A000), creates the
+/// backing index (a multi-column GiST index, or an ordered B-tree for `USING btree` — §7.2), and
+/// names the unnamed ones.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ExcludeDef {
     pub name: Option<String>,
     pub using: Option<String>,
     /// `(column name, operator source text)` per element, in declaration order.
     pub elements: Vec<(String, String)>,
+    /// The partial form's `WHERE (predicate)` (gist.md §7.1): the inner expression and its
+    /// canonical text, stored like a partial index's predicate (indexes.md §9).
+    pub predicate: Option<IndexPredicate>,
 }
 
 /// One parsed `CHECK` constraint (spec/design/grammar.md §29): the optional explicit

@@ -57,7 +57,8 @@ Nine relations ship today:
   The primary key owns no index object, so it is not listed here — see `jed_columns.pk_ordinal`.
 - **`jed_constraints`** — one row per `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` constraint:
   `name`, `table_name`, `type`, `columns` (a `text[]` of the member/local columns; `NULL` for a
-  `CHECK`), `expression` (the `CHECK` text; `NULL` otherwise), and `ref_table` / `ref_columns`
+  `CHECK`), `expression` (the `CHECK` text, or a partial `EXCLUDE` constraint's `WHERE` predicate;
+  `NULL` otherwise), and `ref_table` / `ref_columns`
   (the foreign-key parent; `NULL` otherwise), `operators` (an `EXCLUDE` constraint's `WITH`
   operators, `&&` or `=`, in the same order as `columns`; `NULL` otherwise), and `match_type` (a
   foreign key's `simple` or `full`; `NULL` otherwise). A `UNIQUE` constraint

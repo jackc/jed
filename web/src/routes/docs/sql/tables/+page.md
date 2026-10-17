@@ -283,7 +283,7 @@ The second insert is rejected with `23P01` — room `101` is already booked for 
 range. A different room, or a non-overlapping range, is fine. The supported operators are `=` (over a
 fixed-width scalar) and `&&` (range overlap); `UNIQUE` is the special all-`=` case. A row with `NULL`
 in an excluded column — or an empty range under `&&` — never conflicts (it is exempt). The constraint
-is backed by a GiST index and enforced on every write, all-or-nothing like the others. (PostgreSQL
+is backed by a GiST index (`USING gist`) and enforced on every write, all-or-nothing like the others. (PostgreSQL
 needs `CREATE EXTENSION btree_gist` for the scalar `=` member; jed ships it in-core.)
 
 Rescheduling is just an `UPDATE` — assigning a range (or array) column re-checks every constraint
@@ -298,6 +298,44 @@ UPDATE booking SET during = '[35,45)' WHERE id = 1;  -- error 23P01: now overlap
 
 The range literal on the right adapts to the column's type; an `i32range(20,28)` constructor, a cast,
 or a `during + '[5,8)'::i32range` expression work too.
+
+**Only some rows — `WHERE (predicate)`.** A partial exclusion constraint applies to the rows its
+predicate admits; a row whose predicate is false or `NULL` neither conflicts nor is conflicted with.
+Here only active bookings may overlap nothing:
+
+```sql
+CREATE TABLE slot (
+  id i32 PRIMARY KEY,
+  during i32range,
+  active boolean,
+  EXCLUDE USING gist (during WITH &&) WHERE (active)
+);
+INSERT INTO slot VALUES (1, '[1,5)', true), (2, '[1,5)', false);  -- ok: row 2 is inactive
+INSERT INTO slot VALUES (3, '[3,8)', true);                        -- error 23P01: overlaps row 1
+```
+
+The predicate follows the rules of a partial index's (it must be immutable and read only the
+table's own columns; the parentheses are required).
+
+**`EXCLUDE USING btree` — the all-`=` form.** With only `=` operators the constraint can use an
+ordinary ordered index, and btree is the default access method, as in PostgreSQL: `EXCLUDE (code
+WITH =)` means `EXCLUDE USING btree (code WITH =)`. It forbids the same rows a `UNIQUE (code)` would
+— and works over any type an index can key, `text` included — but it stays an exclusion constraint:
+a conflict is `23P01` rather than `23505`, and it is not a foreign-key target or an `ON CONFLICT
+(code)` arbiter. Combined with `WHERE`, it expresses "at most one primary contact per customer":
+
+```sql
+CREATE TABLE contact (
+  id i32 PRIMARY KEY,
+  customer i32,
+  is_primary boolean,
+  EXCLUDE (customer WITH =) WHERE (is_primary)
+);
+```
+
+`INSERT … ON CONFLICT DO NOTHING` skips a row any exclusion constraint rejects, and `ON CONFLICT ON
+CONSTRAINT contact_customer_excl DO NOTHING` names one; `DO UPDATE` cannot arbitrate an exclusion
+constraint (`42809`).
 
 ## Auto-numbering with `serial`
 

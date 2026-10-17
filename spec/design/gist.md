@@ -24,7 +24,7 @@ CREATE INDEX [name] ON table USING gist (col)
 -- GX3: the exclusion constraint, backed by a GiST index
 CREATE TABLE t (
   ...,
-  EXCLUDE USING gist (col WITH operator [, col2 WITH operator2 ...])
+  EXCLUDE USING gist (col WITH operator [, col2 WITH operator2 ...]) [WHERE (predicate)]
 )
 ```
 
@@ -300,8 +300,11 @@ cost, residuals, LEFT behavior, precedence, and EXPLAIN.
 ## 7. `EXCLUDE` constraints (GX3) ✅ LANDED
 
 ```sql
-[CONSTRAINT name] EXCLUDE [USING gist] (expr WITH operator [, expr2 WITH operator2 ...])
+[CONSTRAINT name] EXCLUDE [USING { gist | btree }] (expr WITH operator [, expr2 WITH operator2 ...])
+    [WHERE (predicate)]
 ```
+
+(No `USING` is `btree`, PostgreSQL's default — §7.2; the `WHERE` form is §7.1.)
 
 The constraint guarantees: **no two distinct rows `R1`, `R2` make every element comparison
 `R1.expr_i  operator_i  R2.expr_i` simultaneously TRUE.** `UNIQUE` is the degenerate all-`=`
@@ -336,7 +339,7 @@ exclusion (`EXCLUDE USING gist (during WITH &&)`) needs only GX1.
   [constraints.md §6.5](constraints.md)).
 - **Columns-only WITH exprs first** (a bare column reference); a general expression
   (`EXCLUDE USING gist ((lower(name)) WITH =)`) is a deferred follow-on (§11).
-- **Supported WITH operators: `&&` (a range column) and `=` (a fixed-width keyable scalar)** — the
+- **Supported GiST WITH operators: `&&` (a range column) and `=` (a fixed-width keyable scalar)** — the
   symmetric operators the §5/§6 opclasses serve. A `&&` over a non-range column or a `=` over a
   no-opclass type is `42704`; a `=` over a deferred keyable (`text`/`bytea`/`decimal`/`interval`) is
   `0A000`; any other operator is `0A000` (the broader operator set is a §11 follow-on). The backing
@@ -355,6 +358,89 @@ exclusion (`EXCLUDE USING gist (during WITH &&)`) needs only GX1.
   (the resident tree holds only stored rows). Both the empty-range exemption and the NULL rule
   short-circuit the probe (return "exempt"), which also sidesteps the empty-range overlap-descend
   trap (§5).
+- **`INSERT … ON CONFLICT`** treats exclusion constraints as PostgreSQL does
+  ([upsert.md §2](upsert.md)): a no-target `DO NOTHING` skips a row any exclusion constraint
+  excludes (against stored rows and the statement's earlier inserts — upsert's row-at-a-time
+  visibility); `ON CONSTRAINT <exclusion>` arbitrates that constraint for `DO NOTHING`;
+  `ON CONSTRAINT <exclusion> DO UPDATE` is `42809` (*ON CONFLICT DO UPDATE not supported with
+  exclusion constraints*); an exclusion never matches a column-list target (`42P10`); any other
+  exclusion conflict among the inserted and updated rows is `23P01`, validated against the
+  statement's end state like UNIQUE's.
+
+### 7.1 The partial form — `EXCLUDE … WHERE (predicate)` ✅ LANDED
+
+```sql
+EXCLUDE USING gist (during WITH &&) WHERE (active)     -- only active reservations may not overlap
+```
+
+PostgreSQL's `ExclusionWhereClause`: the parentheses are required (`WHERE active` is `42601`). Only
+rows whose predicate is **TRUE** participate — a row whose predicate is FALSE or NULL is exempt in
+both directions (it never conflicts and is never conflicted with), exactly as a partial index leaves
+it out. Mechanically the constraint's **backing index is a partial index**: the predicate is the
+backing index's `predicate` (the [indexes.md §9](indexes.md) machinery, unchanged), so maintenance
+already indexes only qualifying rows and every stored probe hit participates; the probe exempts a new
+row whose predicate is not TRUE before building its key, and the pairwise in-statement check compares
+participating rows only. Everything a partial index's predicate obeys, this one obeys:
+
+- **Validation** is the partial-index predicate's, in the same order and with the same codes (one
+  shared resolver in each core): a subquery `0A000`, a parameter `42P02`, an unknown column `42703`,
+  an aggregate `42803`, a window `42P20`, a non-boolean `42804`, and a non-immutable or
+  session-dependent operation `42P17` ([index-dependencies.md](index-dependencies.md)) — the
+  element columns and operators are resolved first (PostgreSQL's order). Host-function and named-zone
+  dependencies persist on the backing index (extensibility.md §8.1).
+- **Stored text binding.** The predicate is stored as canonical text on the backing index
+  (`format_version` 45 admits the predicate bit on a GiST index that backs an exclusion — §8),
+  re-parsed and re-resolved per statement; `ALTER TABLE … RENAME COLUMN` / `RENAME TO` rewrite it;
+  `ALTER COLUMN … TYPE` and `ADD CONSTRAINT` re-validate it. A column that only the predicate reads is
+  a **normal** dependency (PostgreSQL's): `DROP COLUMN` is `2BP01` without `CASCADE` and drops the
+  constraint with it; an element column stays an internal one (the constraint drops silently).
+- **Unparsable text** ([unparsable-definitions.md](unparsable-definitions.md) §3.4): a predicate this
+  binary cannot parse is kept unparsed; every write that maintains the backing index or checks the
+  constraint is `XX003`; reads are unaffected; `ALTER TABLE … DROP CONSTRAINT` and `DROP TABLE` work.
+- **Reads.** A partial GiST backing index is constraint-only, never a read access path (the
+  multi-column backing-index precedent above; GiST has no predicate-implication gate yet). A partial
+  **btree** exclusion's backing index (§7.2) is an ordinary partial ordered index and is used under
+  the indexes.md §9 syntactic-implication rule.
+- **`ALTER TABLE … ADD … WHERE`** validates only the participating existing rows: each unordered pair
+  of rows whose predicate is TRUE charges one `constraint_check` (alter.md §5).
+- **Introspection.** `jed_indexes.predicate` shows the backing index's predicate and
+  `jed_constraints.expression` the same text for the `exclude` row (NULL for a non-partial one).
+
+### 7.2 `EXCLUDE USING btree` — the all-`=` exclusion ✅ LANDED
+
+```sql
+EXCLUDE (customer WITH =) WHERE (is_primary)            -- btree is the default access method
+EXCLUDE USING btree (a WITH =, b WITH =)
+```
+
+PostgreSQL's default access method for `EXCLUDE` is **btree**, so an `EXCLUDE` with no `USING` is
+this form (a GiST exclusion spells `USING gist`; `EXCLUDE (span WITH &&)` is therefore `42809`, as
+in PostgreSQL). Its only commutative operator is `=`, so every element is `col WITH =` and the
+constraint forbids two participating rows whose excluded columns are all equal — UNIQUE's rule, NULLs
+never conflicting (*NULLS DISTINCT* is the exclusion NULL rule). It is **lowered onto an ordered
+index**: the backing index is an ordinary B-tree over the element columns (repeats allowed, as
+CREATE INDEX allows them), and the probe is the UNIQUE probe — the row's slot prefix
+([indexes.md §8](indexes.md)) ranged over that index, skipping a row this statement rewrites — while
+the pairwise in-statement check compares prefixes. What is observably *PostgreSQL's exclusion*, not
+a unique constraint, and what jed matches:
+
+- **The error is `23P01`**, `conflicting key value violates exclusion constraint "<name>"`, with the
+  exclusion `Detail` — `Key (a, c)=(1, x) conflicts with existing key (a, c)=(1, x).` (`… conflicts
+  with key …` for `ADD` over existing rows) — never `23505` / `… already exists.`.
+- **The backing index is not unique** (PostgreSQL's `indisunique = false`; `jed_indexes.is_unique` is
+  false): it is no `FOREIGN KEY` target (`42830`), never a column-list `ON CONFLICT` arbiter
+  (`42P10`), and not a `jed_constraints` `unique` row (only the `exclude` one). It serves reads like
+  any ordered index.
+- **Types.** Any column type an ordered index keys is admitted — text (under its collation), bytea,
+  decimal, ranges, arrays, composites — the CREATE INDEX gate (`0A000` for an unkeyable type),
+  checked before the operator (PostgreSQL's `ComputeIndexAttrs` order). A non-`=` operator is `42809`
+  (PostgreSQL: *not commutative* / *not a member of operator family*).
+- **Method gates.** `USING gin` is `0A000` (*does not support exclusion constraints*); an unknown
+  method (`hash` included — jed has no hash access method) is `42704`.
+- **Everything else is shared with §7**: the two-phase enforcement position, end-state UPDATE
+  semantics (the documented divergence), the partial form (§7.1), `DROP INDEX` of the backing index
+  `2BP01`, `ALTER TABLE … DROP CONSTRAINT`, `ON CONFLICT` arbitration, and the temp-table narrowing
+  (`0A000` for either method — §11).
 
 ## 8. Persistence
 
@@ -374,6 +460,15 @@ column's catalog type** (range → range bounds, scalar → scalar bounds). So a
 either flavor with no version change, and the page walk that repopulates the leaf store on load is
 opclass-agnostic (it copies bound bytes verbatim). Golden: `gist_scalar_table.jed`
 (`rust == go == ts == ruby`).
+
+**The §7.1/§7.2 follow-ons (`format_version` 45) — no byte layout change.** The v27 `has_predicate`
+index-flags bit (and the v31/v32 dependency lists after it) is now legal on a **GiST** index that
+backs an exclusion constraint — the partial form's predicate is its backing index's — and an
+exclusion entry may name an **ordered** (`index_kind 0`, `unique` clear) backing index whose every
+element operator is `=` (`EXCLUDE USING btree`). A reader rejects a partial GiST index that backs no
+exclusion, a partial GIN index, a btree backing index that is unique or carries `&&`, as corrupt
+(`XX001`). A v44 reader rejected both new shapes as corrupt, hence the version break. Golden:
+`exclude_followon_table.jed` (`rust == go == ts == ruby`).
 
 **GX3 — the exclusion-constraint catalog entry (`format_version` 21).** ✅ Unlike UNIQUE, an
 exclusion constraint must persist the **operator per column** (UNIQUE is always `=` and records
@@ -418,9 +513,10 @@ Each is its own vertical slice with a NoREC/oracle obligation ([conformance.md �
   §6). `text` additionally needs the column collation threaded into the key encoding (the ordered
   index's `key_collation_ctx` precedent), so its sort-key bound matches the collated probe. Each is
   its own small slice; the codec already length-prefixes the bound, so no node-format change.
-- **The `EXCLUDE … WHERE (predicate)` partial form**; **general-expression** WITH operands;
-  `EXCLUDE USING btree (a WITH =)` lowering an all-`=` exclude onto an ordered unique index (a
-  `UNIQUE` alias); `ALTER TABLE … ADD CONSTRAINT … EXCLUDE`.
+- **General-expression** WITH operands. (The `WHERE (predicate)` partial form, §7.1, `EXCLUDE USING
+  btree`, §7.2, and `ALTER TABLE … ADD CONSTRAINT … EXCLUDE` have landed.) A GiST predicate-implication
+  gate, so a partial GiST index could serve reads (indexes.md §9's syntactic rule) — and with it
+  `CREATE INDEX … USING gist … WHERE`, still `0A000`.
 - **`DEFERRABLE` / `INITIALLY DEFERRED`** — jed has no deferred-constraint machinery yet; its own
   axis (a constraint queue checked at commit), not GiST-specific.
 - **Future opclasses, behind the §2 seam unchanged** — `multirange_ops` (once a multirange type
@@ -476,3 +572,4 @@ The whole feature has landed.
 | **GX1** ✅ | the GiST index *kind* + `range_ops` (§5) + the consistent-descent planner gather (SELECT + UPDATE/DELETE) + the `gist_descent` cost unit + `format_version` 20 (`index_kind = 2`, pages 5/6) + the `gist_range_table.jed` golden + `CREATE UNIQUE … USING gist` → `0A000` (+ multi-column / temp → `0A000`); capabilities `ddl.gist_index` / `query.gist_scan`; the `query/gist_scan.test` corpus (oracle-clean) + the `gist` NoREC relation |
 | **GX2** ✅ | the scalar `=` opclass (§6) — the in-core `btree_gist` equivalent over the **fixed-width** keyables (integers / boolean / uuid / date / timestamp / timestamptz); the opclass seam (the tree core generalized to `range_ops` + scalar `=`); bounds are `[min,max]` over the order-preserving key encoding (raw-byte compare); the planner `=` gather (the cost-inferior fallback bound — ordered-index pushdown skips a GiST index); persisted within v20's pages 5/6 (no bump — bound flavor keyed off the column type) + the `gist_scalar_table.jed` golden; deferred keyable (text/bytea/decimal/interval) → `0A000`, no-opclass type → `42704`; capabilities `ddl.gist_scalar_index` / `query.gist_scalar_scan`; the `query/gist_scalar_scan.test` corpus + the `gist_scalar` NoREC relation |
 | **GX3** ✅ | `EXCLUDE [USING gist] (col WITH op, …)` (§7) — the backing-index constraint, the conjunction probe (INSERT + UPDATE), `23P01`, the NULL rule + empty-range exemption, end-state semantics; the tree core generalized to **multi-column** (a tuple bound); the per-table exclusion-constraint catalog entry (`format_version` 21) + the `gist_exclude_table.jed` golden; `&&`/`=` operators (others `0A000`), backing-index `DROP INDEX` → `2BP01`, exclude-on-temp `0A000`; capability `ddl.exclusion_constraint`; the `ddl/exclusion_constraint.test` corpus (the multi-column form is a jed in-core divergence — PG needs `btree_gist`) |
+| **GX4** ✅ | the §7.1 partial `EXCLUDE … WHERE (predicate)` form (the backing index's partial predicate; validation, rename rewrite, the predicate-column `DROP COLUMN` dependency, unparsable handling, introspection) + the §7.2 `EXCLUDE USING btree` all-`=` form on a non-unique ordered index (btree the default method; `23P01` + the exclusion Detail; `42809` for a non-`=` operator) + `ON CONFLICT` arbitration of exclusion constraints; `format_version` 45 + the `exclude_followon_table.jed` golden; capabilities `ddl.exclusion_partial` / `ddl.exclusion_btree` / `dml.insert_on_conflict_exclusion`; corpus `ddl/exclusion_partial.test`, `ddl/exclusion_btree.test`, `dml/insert_on_conflict_exclusion.test` (oracle-clean) and `ddl/exclusion_jed.test` |

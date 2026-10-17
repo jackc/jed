@@ -289,6 +289,12 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // backed by a multi-column GiST index; the conjunction probe traps 23P01 at INSERT/UPDATE,
     // with the NULL rule + end-state semantics. format_version 21.
     "ddl.exclusion_constraint",
+    // The partial EXCLUDE … WHERE (predicate) form (gist.md §7.1) and EXCLUDE USING btree — the
+    // all-= exclusion on an ordered, non-unique index (§7.2); ON CONFLICT arbitrating exclusion
+    // constraints (upsert.md §2). format_version 45.
+    "ddl.exclusion_partial",
+    "ddl.exclusion_btree",
+    "dml.insert_on_conflict_exclusion",
     // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9). S2: the type
     // is created/dropped/persisted; composite columns/values land later (spec/design/composite.md).
     "types.composite",
