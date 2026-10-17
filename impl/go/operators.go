@@ -6709,6 +6709,15 @@ var aggregates = []aggregateDesc{
 		Errors:      []string{},
 	},
 	{
+		Name:        "bool_and",
+		Surface:     "bool_and",
+		Arg:         "expr",
+		ArgFamilies: []string{"boolean"},
+		Result:      "boolean",
+		Null:        "aggregate",
+		Errors:      []string{},
+	},
+	{
 		Name:        "jsonb_agg",
 		Surface:     "jsonb_agg",
 		Arg:         "expr",

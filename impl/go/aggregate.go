@@ -184,6 +184,7 @@ const (
 	planAvgFloat64                // AVG(f64) — fold sum / count, result f64
 	planMin
 	planMax
+	planBoolAnd        // bool_and(x) — TRUE iff every non-NULL input is TRUE (aggregates.md §23)
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -548,6 +549,15 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				}
 			}
 		}
+	case planBoolAnd:
+		// The running conjunction of the non-NULL inputs (aggregates.md §23); NULLs are skipped.
+		if !v.IsNull() {
+			if !a.hasCur {
+				a.cur, a.hasCur = v, true
+			} else if !v.boolVal() {
+				a.cur = v
+			}
+		}
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
 		// Mark the group non-empty even when the strict filter drops this row (an all-skipped group
 		// still finalizes to `[]`, not NULL — only a zero-row group is NULL).
@@ -815,7 +825,7 @@ func (a *acc) finalize() (Value, error) {
 		// A hypothetical-set aggregate is finalized in the group-emission loop (it needs the spec's
 		// per-key sort specs), never through acc.finalize (aggregates.md §19).
 		panic("a hypothetical-set accumulator is finalized in the group-emission loop")
-	default: // planMin, planMax
+	default: // planMin, planMax, planBoolAnd
 		if a.hasCur {
 			return a.cur, nil
 		}

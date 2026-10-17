@@ -6446,6 +6446,15 @@ export const AGGREGATES: readonly AggregateDesc[] = [
     errors: [],
   },
   {
+    name: "bool_and",
+    surface: "bool_and",
+    arg: "expr",
+    argFamilies: ["boolean"],
+    result: "boolean",
+    null: "aggregate",
+    errors: [],
+  },
+  {
     name: "jsonb_agg",
     surface: "jsonb_agg",
     arg: "expr",

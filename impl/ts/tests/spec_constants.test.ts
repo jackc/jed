@@ -323,6 +323,8 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
     // json[b]_agg / json[b]_agg_strict (B4) — aggregatePlan maps (surface, "jsonb"|"json") → jsonAgg.
     "jsonb",
     "json",
+    // bool_and (aggregates.md §23).
+    "boolean",
   ]);
   for (const a of AGGREGATES) {
     assert.ok(
