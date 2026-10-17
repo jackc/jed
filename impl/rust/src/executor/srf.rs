@@ -399,12 +399,13 @@ impl Engine {
                     "a composite/array column in a record column-definition list is not supported yet",
                 ));
             }
-            let (st, decimal, varchar_len) = resolve_type_and_typmod(&d.type_name, &d.type_mod)?;
+            let (st, tm) = resolve_type_and_typmod(&d.type_name, &d.type_mod)?;
             columns.push(Column {
                 name: d.name.clone(),
                 ty: Type::Scalar(st),
-                decimal,
-                varchar_len,
+                decimal: tm.decimal,
+                varchar_len: tm.varchar_len,
+                temporal: tm.temporal,
                 primary_key: false,
                 not_null: false,
                 default: None,
@@ -477,6 +478,7 @@ impl Engine {
                 ty: f.ty.clone(),
                 decimal: f.decimal,
                 varchar_len: f.varchar_len,
+                temporal: f.temporal,
                 primary_key: false,
                 not_null: false,
                 default: None,
@@ -948,6 +950,7 @@ impl Engine {
                 ty: self.resolve_coldef_type(d)?,
                 decimal: None,
                 varchar_len: None,
+                temporal: None,
                 primary_key: false,
                 not_null: false,
                 default: None,
@@ -1008,7 +1011,7 @@ impl Engine {
         };
         let named = |n: &str| -> Result<Type> {
             if ScalarType::from_name(n).is_some() {
-                let (s, _, _) = resolve_type_and_typmod(n, &None)?;
+                let (s, _) = resolve_type_and_typmod(n, &None)?;
                 return Ok(Type::Scalar(s));
             }
             if let Some(rdesc) = crate::range::range_by_name(n) {
@@ -1134,7 +1137,12 @@ impl Engine {
                     Value::Text(t.name.clone()),
                     Value::Text(c.name.clone()),
                     Value::Int(i as i64 + 1),
-                    Value::Text(catalog_type_text(&c.ty, c.decimal.as_ref(), c.varchar_len)),
+                    Value::Text(catalog_type_text(
+                        &c.ty,
+                        c.decimal.as_ref(),
+                        c.varchar_len,
+                        c.temporal,
+                    )),
                     Value::Bool(c.not_null || c.primary_key),
                     pk_ordinal,
                     c.default_text().map_or(Value::Null, Value::Text),
@@ -1345,7 +1353,12 @@ impl Engine {
                     Value::Text(ty.name.clone()),
                     Value::Text(f.name.clone()),
                     Value::Int(i as i64 + 1),
-                    Value::Text(catalog_type_text(&f.ty, f.decimal.as_ref(), f.varchar_len)),
+                    Value::Text(catalog_type_text(
+                        &f.ty,
+                        f.decimal.as_ref(),
+                        f.varchar_len,
+                        f.temporal,
+                    )),
                     Value::Bool(f.not_null),
                 ]);
             }

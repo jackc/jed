@@ -1470,7 +1470,7 @@ func coerceStringToComposite(text string, ct *compositeType, catalog *engine, iz
 			nodes[i] = node
 			fields[i] = compositeRField{name: f.Name, ty: ty}
 		default:
-			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Decimal, f.VarcharLen, iz)
+			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, fieldTypmod(&f), iz)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1639,7 +1639,9 @@ func coerceStringToRange(text string, desc rangeDesc, iz *inputZone) (*RangeVal,
 	return finalizeRange(desc, lower, upper, parsed.lowerInc, parsed.upperInc)
 }
 
-func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, varcharLen *uint32, iz *inputZone) (*rExpr, resolvedType, error) {
+func coerceStringLiteral(s string, target scalarType, tm typmod, iz *inputZone) (*rExpr, resolvedType, error) {
+	decTypmod := tm.Decimal
+	varcharLen := tm.VarcharLen
 	switch target {
 	case scalarBytea:
 		b, err := decodeByteaLiteral(s)
@@ -1653,8 +1655,13 @@ func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, var
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstUuid, cBytea: b}, resolvedType{kind: rtUuid}, nil
+	// A timestamp(p) target rounds the parsed value (timestamp.md §8); a qualified interval target
+	// reads the text under its qualifier and cuts it (interval.md §6.1).
 	case scalarTimestamp:
 		m, err := parseTimestamp(s)
+		if err == nil {
+			m, err = adjustTimestampTypmod(m, tm.Temporal)
+		}
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1662,12 +1669,15 @@ func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, var
 	case scalarTimestamptz:
 		// An offset-less string reads in the session zone (timezones.md §9.3).
 		m, err := iz.parseTimestamptz(s)
+		if err == nil {
+			m, err = adjustTimestampTypmod(m, tm.Temporal)
+		}
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
 	case scalarInterval:
-		iv, err := parseInterval(s)
+		iv, err := parseIntervalTypmod(s, tm.Temporal)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1725,8 +1735,8 @@ func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, var
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		if typmod != nil {
-			d, err = d.CoerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
+		if decTypmod != nil {
+			d, err = d.CoerceToTypmod(uint32(decTypmod.Precision), uint32(decTypmod.Scale))
 		} else {
 			d, err = d.CheckCap()
 		}

@@ -199,11 +199,11 @@ func (db *engine) resolveJSONRecord(name string, jsonb, set bool, args []*exprNo
 			return nil, nil, newError(FeatureNotSupported,
 				"a composite/array column in a record column-definition list is not supported yet")
 		}
-		st, decimal, varcharLen, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod)
+		st, tm, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod)
 		if err != nil {
 			return nil, nil, err
 		}
-		columns = append(columns, catColumn{Name: d.Name, Type: scalarT(st), Decimal: decimal, VarcharLen: varcharLen})
+		columns = append(columns, catColumn{Name: d.Name, Type: scalarT(st), Decimal: tm.Decimal, VarcharLen: tm.VarcharLen, Temporal: tm.Temporal})
 	}
 	tname := name
 	if alias != nil {
@@ -246,7 +246,7 @@ func (db *engine) resolveJSONPopulate(name string, jsonb, set bool, args []*expr
 	}
 	columns := make([]catColumn, 0, len(ctype.Fields))
 	for _, f := range ctype.Fields {
-		columns = append(columns, catColumn{Name: f.Name, Type: f.Type, Decimal: f.Decimal, VarcharLen: f.VarcharLen})
+		columns = append(columns, catColumn{Name: f.Name, Type: f.Type, Decimal: f.Decimal, VarcharLen: f.VarcharLen, Temporal: f.Temporal})
 	}
 	// The SECOND argument is the json/jsonb document.
 	want := scalarJson
@@ -576,7 +576,7 @@ func (db *engine) resolveUnnestRecord(rec *compositeRType, defs []typeFieldDef, 
 func (db *engine) resolveColdefType(d typeFieldDef) (dataType, error) {
 	named := func(n string) (dataType, error) {
 		if _, ok := scalarTypeFromName(n); ok {
-			s, _, _, err := resolveTypeAndTypmod(n, nil)
+			s, _, err := resolveTypeAndTypmod(n, nil)
 			if err != nil {
 				return dataType{}, err
 			}
@@ -599,7 +599,7 @@ func (db *engine) resolveColdefType(d typeFieldDef) (dataType, error) {
 	}
 	if _, ok := scalarTypeFromName(d.TypeName); ok {
 		// Validate the modifier as a column's would be, then drop it.
-		if _, _, _, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod); err != nil {
+		if _, _, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod); err != nil {
 			return dataType{}, err
 		}
 	}
@@ -963,9 +963,9 @@ func (db *engine) resolveCatalogScope(qualifier *string) (string, error) {
 // (varchar(10), decimal(8,2)), a composite's name as created, a range's canonical id (i32range,
 // numrange, …), and `[]` appended for an array (the typmod applies to the element: varchar(5)[]).
 // This text is a compatibility surface the moment it ships — pinned by the corpus.
-func catalogTypeText(ty dataType, dec *decimalTypmod, vlen *uint32) string {
+func catalogTypeText(ty dataType, dec *decimalTypmod, vlen *uint32, temporal *temporalTypmod) string {
 	if ty.Array != nil {
-		return catalogTypeText(*ty.Array, dec, vlen) + "[]"
+		return catalogTypeText(*ty.Array, dec, vlen, temporal) + "[]"
 	}
 	if ty.Range != nil {
 		desc, _ := rangeForElement(ty.Range.ScalarTy())
@@ -973,6 +973,11 @@ func catalogTypeText(ty dataType, dec *decimalTypmod, vlen *uint32) string {
 	}
 	if ty.Comp != nil {
 		return ty.Comp.Name
+	}
+	// timestamp(3), timestamptz(0), interval day to second(3), interval(2) — the canonical name with
+	// PostgreSQL's format_type modifier spelling.
+	if temporal != nil {
+		return ty.Scalar.CanonicalName() + temporalTypmodText(*temporal)
 	}
 	if ty.Scalar == scalarText && vlen != nil {
 		return fmt.Sprintf("varchar(%d)", *vlen)
@@ -1051,7 +1056,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				TextValue(t.Name),
 				TextValue(c.Name),
 				IntValue(int64(i + 1)),
-				TextValue(catalogTypeText(c.Type, c.Decimal, c.VarcharLen)),
+				TextValue(catalogTypeText(c.Type, c.Decimal, c.VarcharLen, c.Temporal)),
 				BoolValue(c.NotNull || c.PrimaryKey),
 				pkOrdinal,
 				columnDefault,
@@ -1394,7 +1399,7 @@ func (db *engine) jedTypeFieldsRows(sp *srfPlan, m *costMeter) ([]storedRow, err
 				TextValue(ct.Name),
 				TextValue(f.Name),
 				IntValue(int64(i + 1)),
-				TextValue(catalogTypeText(f.Type, f.Decimal, f.VarcharLen)),
+				TextValue(catalogTypeText(f.Type, f.Decimal, f.VarcharLen, f.Temporal)),
 				BoolValue(f.NotNull),
 			})
 		}
@@ -1715,7 +1720,7 @@ func jsonRecordRow(node *JsonNode, cols []catColumn, env *evalEnv, m *costMeter)
 			row = append(row, NullValue())
 			continue
 		}
-		v, err := coerceJSONMember(member, col.Type, col.Decimal, env, m)
+		v, err := coerceJSONMember(member, col.Type, columnTypmod(col), env, m)
 		if err != nil {
 			return nil, err
 		}
@@ -1728,7 +1733,7 @@ func jsonRecordRow(node *JsonNode, cols []catColumn, env *evalEnv, m *costMeter)
 // path): a `jsonb` column embeds the node, a `json` column its canonical text, every other scalar
 // coerces the node's `->>`-style text through the cast machinery (so `"42"` / `42` → an `int`
 // column, etc.). A composite/array column type is a deferred 0A000.
-func coerceJSONMember(node *JsonNode, colTy dataType, decimal *decimalTypmod, env *evalEnv, m *costMeter) (Value, error) {
+func coerceJSONMember(node *JsonNode, colTy dataType, tm typmod, env *evalEnv, m *costMeter) (Value, error) {
 	// A composite / array / range field type is a deferred 0A000 (only scalar / json / jsonb coerce
 	// this slice). R1's col-def list rejects these at resolve; R2's composite fields can carry one.
 	if _, ok := colTy.AsScalar(); !ok {
@@ -1745,7 +1750,7 @@ func coerceJSONMember(node *JsonNode, colTy dataType, decimal *decimalTypmod, en
 		if !ok {
 			return NullValue(), nil
 		}
-		rexpr, _, err := coerceStringLiteral(text, st, decimal, nil, env.exec.inputZone())
+		rexpr, _, err := coerceStringLiteral(text, st, tm, env.exec.inputZone())
 		if err != nil {
 			return Value{}, err
 		}
@@ -1799,7 +1804,7 @@ func applyJSONBehavior(behavior jsonOnBehavior, clause jsonClause, defaults json
 		if v.Kind != ValJsonb || returning == scalarJsonb {
 			return v, nil
 		}
-		out, err := coerceJSONMember(v.jsonb(), scalarT(returning), nil, env, m)
+		out, err := coerceJSONMember(v.jsonb(), scalarT(returning), typmod{}, env, m)
 		if err != nil {
 			var ee *EngineError
 			if !isSQLJSONError(err) || !errors.As(err, &ee) {
@@ -1828,7 +1833,7 @@ func applyJSONBehavior(behavior jsonOnBehavior, clause jsonClause, defaults json
 // jsonNodeAsReturning renders a json result node as the RETURNING type: `jsonb` embeds, `json` its
 // canonical text, any other scalar coerces the node's `->>`-style text through the cast machinery.
 func jsonNodeAsReturning(node JsonNode, returning scalarType, env *evalEnv, m *costMeter) (Value, error) {
-	return coerceJSONMember(&node, scalarT(returning), nil, env, m)
+	return coerceJSONMember(&node, scalarT(returning), typmod{}, env, m)
 }
 
 // evalJSONSqlResult applies the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an
@@ -1857,7 +1862,7 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, w
 		}
 		// Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is a
 		// SQL/JSON error honored by ON ERROR.
-		v, err := coerceJSONMember(&item, scalarT(returning), nil, env, m)
+		v, err := coerceJSONMember(&item, scalarT(returning), typmod{}, env, m)
 		if err != nil {
 			if isSQLJSONError(err) {
 				return applyJSONBehavior(onError, jsonClauseError, defaults, err, returning, env, m)

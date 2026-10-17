@@ -155,7 +155,7 @@ pub(crate) fn coerce_range_bound(
     elem: ScalarType,
     iz: &InputZone,
 ) -> Result<Option<Value>> {
-    match store_value(v, elem, None, None, false, "range bound", iz)? {
+    match store_value(v, elem, Typmod::NONE, false, "range bound", iz)? {
         Value::Null => Ok(None),
         other => Ok(Some(other)),
     }
@@ -179,12 +179,12 @@ pub(crate) fn eval_range_op(
     let result = match op {
         // `range @> element`: l is the range, r the element (coerced to the range's element type).
         RangeOp::ContainsElem => {
-            let e = store_value(r.clone(), elem, None, None, false, "range element", iz)?;
+            let e = store_value(r.clone(), elem, Typmod::NONE, false, "range element", iz)?;
             crate::range::range_contains_elem(expect_range(l), &e)
         }
         // `element <@ range`: l is the element, r the range.
         RangeOp::ElemContainedBy => {
-            let e = store_value(l.clone(), elem, None, None, false, "range element", iz)?;
+            let e = store_value(l.clone(), elem, Typmod::NONE, false, "range element", iz)?;
             crate::range::range_contains_elem(expect_range(r), &e)
         }
         _ => {
@@ -1152,7 +1152,7 @@ pub(crate) fn resolve_scalar_assign(
 ) -> Result<RExpr> {
     if let (true, Expr::Literal(Literal::Text(s), pos)) = (target.is_float(), e) {
         let iz = scope.catalog.input_zone();
-        let (node, _) = coerce_string_literal(s, target, None, None, &iz)
+        let (node, _) = coerce_string_literal(s, target, Typmod::NONE, &iz)
             .map_err(|err| err.with_position(pos.0))?;
         return Ok(node);
     }
@@ -1202,14 +1202,15 @@ pub(crate) fn missing_from_entry(qualifier: &str) -> EngineError {
 /// Stored on disk as a `u32`, so it fits comfortably.
 pub(crate) const MAX_VARCHAR_LEN: u32 = 10485760;
 
-/// Resolve a scalar type name + optional type modifier, returning the type, the decimal typmod
-/// (when the type is `decimal`), and the `varchar(n)` max length (when the type is `text` —
-/// spec/design/types.md §15). At most one of the two typmods is ever `Some` (they belong to
-/// different types). A typmod on any other type is `0A000`.
+/// Resolve a scalar type name + optional type modifier, returning the type and its typmod: the
+/// decimal `numeric(p,s)` (when the type is `decimal`), the `varchar(n)` max length (when the type
+/// is `text` — spec/design/types.md §15), or the timestamp precision / interval qualifier and
+/// precision (spec/design/timestamp.md §8, interval.md §6.1). At most one part is ever `Some` (each
+/// belongs to its own types). A typmod on any other type is `0A000`.
 pub(crate) fn resolve_type_and_typmod(
     name: &str,
     type_mod: &Option<TypeMod>,
-) -> Result<(ScalarType, Option<DecimalTypmod>, Option<u32>)> {
+) -> Result<(ScalarType, Typmod)> {
     let ty = if let Some(ty) = ScalarType::from_name(name) {
         ty
     } else {
@@ -1219,12 +1220,32 @@ pub(crate) fn resolve_type_and_typmod(
         ));
     };
     match type_mod {
-        None => Ok((ty, None, None)),
+        None => Ok((ty, Typmod::NONE)),
         Some(tm) => {
             if ty.is_decimal() {
-                Ok((ty, Some(validate_decimal_typmod(tm)?), None))
+                Ok((
+                    ty,
+                    Typmod {
+                        decimal: Some(validate_decimal_typmod(tm)?),
+                        ..Typmod::NONE
+                    },
+                ))
             } else if ty.is_text() {
-                Ok((ty, None, Some(validate_varchar_typmod(tm)?)))
+                Ok((
+                    ty,
+                    Typmod {
+                        varchar_len: Some(validate_varchar_typmod(tm)?),
+                        ..Typmod::NONE
+                    },
+                ))
+            } else if ty.is_timestamp() || ty.is_timestamptz() || ty.is_interval() {
+                Ok((
+                    ty,
+                    Typmod {
+                        temporal: Some(validate_temporal_typmod(tm)?),
+                        ..Typmod::NONE
+                    },
+                ))
             } else {
                 Err(EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -1248,7 +1269,7 @@ pub(crate) fn validate_varchar_typmod(tm: &TypeMod) -> Result<u32> {
             "varchar takes exactly one type modifier (a length)".to_string(),
         ));
     }
-    let n = tm.precision;
+    let n = tm.precision.unwrap_or(0);
     if n < 1 {
         return Err(EngineError::new(
             SqlState::InvalidParameterValue,
@@ -1264,10 +1285,29 @@ pub(crate) fn validate_varchar_typmod(tm: &TypeMod) -> Result<u32> {
     Ok(n as u32)
 }
 
+/// Validate a `timestamp(p)` / `timestamptz(p)` / interval type modifier (spec/design/timestamp.md
+/// §8, interval.md §6.1). A precision above 6 is reduced to 6, as PostgreSQL does (it also warns;
+/// jed has no warning channel). A second modifier (`timestamp(3, 1)`) is 42601. The parser attaches
+/// a field qualifier only to `interval`, and never a negative precision (42601 there).
+pub(crate) fn validate_temporal_typmod(tm: &TypeMod) -> Result<TemporalTypmod> {
+    if tm.scale.is_some() {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "a timestamp or interval takes at most one precision".to_string(),
+        ));
+    }
+    Ok(TemporalTypmod {
+        fields: tm.interval_fields,
+        precision: tm
+            .precision
+            .map(|p| p.min(u64::from(crate::timestamp::MAX_TIMESTAMP_PRECISION)) as u8),
+    })
+}
+
 /// Validate a decimal `numeric(p[,s])` type modifier: `1 <= p <= 1000`, `0 <= s <= p`; else
 /// trap 22023 (spec/design/decimal.md §2). `numeric(p)` means scale 0.
 pub(crate) fn validate_decimal_typmod(tm: &TypeMod) -> Result<DecimalTypmod> {
-    let p = tm.precision;
+    let p = tm.precision.unwrap_or(0);
     if p < 1 || p > MAX_PRECISION as u64 {
         return Err(EngineError::new(
             SqlState::InvalidParameterValue,
@@ -1392,7 +1432,7 @@ pub(crate) fn coerce_string_to_composite(
                         coerce_string_to_composite(&s, nested, catalog, iz)?
                     }
                     Type::Scalar(scalar) => {
-                        coerce_string_literal(&s, *scalar, f.decimal, f.varchar_len, iz)?
+                        coerce_string_literal(&s, *scalar, Typmod::of_field(f), iz)?
                     }
                     // An array-typed field (spec/design/array.md §12): the token is an array text
                     // literal, coerced through `array_in` against the element type — the same path a
@@ -1562,7 +1602,7 @@ pub(crate) fn coerce_string_to_range(
         match b {
             None => Ok(None),
             Some(s) => {
-                let (node, _) = coerce_string_literal(s, elem, None, None, iz)?;
+                let (node, _) = coerce_string_literal(s, elem, Typmod::NONE, iz)?;
                 Ok(Some(rexpr_const_to_value(&node)?))
             }
         }
@@ -1575,10 +1615,11 @@ pub(crate) fn coerce_string_to_range(
 pub(crate) fn coerce_string_literal(
     s: &str,
     target: ScalarType,
-    typmod: Option<DecimalTypmod>,
-    varchar_len: Option<u32>,
+    tm: Typmod,
     iz: &InputZone,
 ) -> Result<(RExpr, ResolvedType)> {
+    let typmod = tm.decimal;
+    let varchar_len = tm.varchar_len;
     Ok(match target {
         ScalarType::Bytea => (
             RExpr::ConstBytea(decode_bytea_literal(s)?),
@@ -1588,16 +1629,21 @@ pub(crate) fn coerce_string_literal(
             RExpr::ConstUuid(decode_uuid_literal(s)?),
             ResolvedType::Uuid,
         ),
+        // A `timestamp(p)` target rounds the parsed value (timestamp.md §8); a qualified interval
+        // target reads the text under its qualifier and cuts it (interval.md §6.1).
         ScalarType::Timestamp => (
-            RExpr::ConstTimestamp(parse_timestamp(s)?),
+            RExpr::ConstTimestamp(adjust_timestamp_typmod(parse_timestamp(s)?, tm.temporal)?),
             ResolvedType::Timestamp,
         ),
         ScalarType::Timestamptz => (
-            RExpr::ConstTimestamptz(iz.parse_timestamptz(s)?),
+            RExpr::ConstTimestamptz(adjust_timestamp_typmod(
+                iz.parse_timestamptz(s)?,
+                tm.temporal,
+            )?),
             ResolvedType::Timestamptz,
         ),
         ScalarType::Interval => (
-            RExpr::ConstInterval(parse_interval(s)?),
+            RExpr::ConstInterval(interval::parse_interval_typmod(s, tm.temporal)?),
             ResolvedType::Interval,
         ),
         ScalarType::Date => (RExpr::ConstDate(parse_date(s)?), ResolvedType::Date),
@@ -2242,10 +2288,10 @@ pub(crate) struct AssignPlan {
     pub(crate) idx: usize,
     pub(crate) name: String,
     pub(crate) target: ScalarType,
-    pub(crate) decimal: Option<DecimalTypmod>,
-    /// The `varchar(n)` length for a text column (spec/design/types.md §15) — UPDATE re-checks
-    /// the new value's length exactly like INSERT (over-length 22001, trailing-space truncate).
-    pub(crate) varchar_len: Option<u32>,
+    /// The column's typmod — UPDATE re-coerces the new value exactly like INSERT (a `varchar(n)`
+    /// over-length 22001 / trailing-space truncate, a `numeric(p,s)` rescale, a `timestamp(p)`
+    /// rounding, an interval qualifier cut).
+    pub(crate) typmod: Typmod,
     pub(crate) not_null: bool,
     pub(crate) source: RExpr,
     /// The resolved `ColType` for a NON-scalar column — `Some` ⇒ `check` stores through

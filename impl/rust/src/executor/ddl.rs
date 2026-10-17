@@ -886,6 +886,7 @@ impl Engine {
             // carries no typmod (the composite's fields carry their own); a type modifier written on
             // a composite column is rejected (0A000). A composite column is storable but never
             // keyable — the PK gate below rejects it 0A000 (§6).
+            let mut temporal: Option<TemporalTypmod> = None;
             let (ty, decimal, varchar_len): (Type, Option<DecimalTypmod>, Option<u32>) =
                 if let Some(sk) = serial_kind {
                     // A serial column takes no typmod (`serial(5)` is 42601) and no `[]` (handled by
@@ -943,7 +944,7 @@ impl Engine {
                     let elem = crate::range::element_scalar(rdesc);
                     (Type::Range(Box::new(Type::Scalar(elem))), None, None)
                 } else if ScalarType::from_name(&def.type_name).is_some() {
-                    let (s, d, vlen) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+                    let (s, tm) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
                     // `jsonpath` is literal-only this slice (P1a) — a jsonpath COLUMN is `0A000`, like a
                     // J0-stage json column (a storable jsonpath is a follow-on).
                     if s == ScalarType::JsonPath {
@@ -952,7 +953,8 @@ impl Engine {
                             "a jsonpath column is not supported yet".to_string(),
                         ));
                     }
-                    (Type::Scalar(s), d, vlen)
+                    temporal = tm.temporal;
+                    (Type::Scalar(s), tm.decimal, tm.varchar_len)
                 } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
                     if def.type_mod.is_some() {
                         return Err(EngineError::new(
@@ -1167,8 +1169,11 @@ impl Engine {
                                 store_value(
                                     literal_to_value_for(lit, sty)?,
                                     sty,
-                                    decimal,
-                                    varchar_len,
+                                    Typmod {
+                                        decimal,
+                                        varchar_len,
+                                        temporal,
+                                    },
                                     false,
                                     &def.name,
                                     &self.input_zone(),
@@ -1236,6 +1241,7 @@ impl Engine {
                 ty,
                 decimal,
                 varchar_len,
+                temporal,
                 primary_key: def.primary_key,
                 // PRIMARY KEY ⇒ NOT NULL; a `serial` or IDENTITY column is NOT NULL too
                 // (sequences.md §12/§13).
@@ -3407,10 +3413,14 @@ impl Engine {
                                     &mut ParamTypes::default(),
                                 )?;
                                 let type_sql = match type_mod {
-                                    Some(m) => match m.scale {
-                                        Some(s) => format!("{type_name} ({}, {})", m.precision, s),
-                                        None => format!("{type_name} ({})", m.precision),
-                                    },
+                                    Some(m) => {
+                                        let r = m.render();
+                                        if r.starts_with(' ') {
+                                            format!("{type_name}{r}")
+                                        } else {
+                                            format!("{type_name} {r}")
+                                        }
+                                    }
                                     None => type_name.clone(),
                                 };
                                 target.default_expr = Some(DefaultExpr {
@@ -3652,8 +3662,7 @@ impl Engine {
                             row.push(coerce_for_store(
                                 value,
                                 col_type,
-                                column.decimal,
-                                column.varchar_len,
+                                Typmod::of_column(column),
                                 column.not_null,
                                 &column.name,
                                 &self.input_zone(),
@@ -4091,8 +4100,7 @@ impl Engine {
                     store_value(
                         literal_to_value_for(lit, sty)?,
                         sty,
-                        col.decimal,
-                        col.varchar_len,
+                        Typmod::of_column(col),
                         false,
                         &col.name,
                         &self.input_zone(),
@@ -4142,6 +4150,7 @@ impl Engine {
         attachment_scope: bool,
     ) -> Result<Column> {
         let serial_kind = serial_pseudo_type(&def.type_name);
+        let mut temporal: Option<TemporalTypmod> = None;
         let (ty, decimal, varchar_len): (Type, Option<DecimalTypmod>, Option<u32>) =
             if let Some(sk) = serial_kind {
                 if def.type_mod.is_some() {
@@ -4190,14 +4199,15 @@ impl Engine {
                     None,
                 )
             } else if ScalarType::from_name(&def.type_name).is_some() {
-                let (s, d, v) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+                let (s, tm) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
                 if s == ScalarType::JsonPath {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         "a jsonpath column is not supported yet",
                     ));
                 }
-                (Type::Scalar(s), d, v)
+                temporal = tm.temporal;
+                (Type::Scalar(s), tm.decimal, tm.varchar_len)
             } else if let Some(c) = self.read_snap().composite_type(&def.type_name) {
                 if def.type_mod.is_some() {
                     return Err(EngineError::new(
@@ -4259,6 +4269,7 @@ impl Engine {
             ty,
             decimal,
             varchar_len,
+            temporal,
             primary_key: def.primary_key,
             not_null: def.primary_key
                 || def.not_null
@@ -5558,6 +5569,7 @@ impl Engine {
                     format!("attribute {} specified more than once", f.name),
                 ));
             }
+            let mut ftemporal: Option<TemporalTypmod> = None;
             let (fty, fdecimal, fvarchar): (Type, Option<DecimalTypmod>, Option<u32>) =
                 if let Some(base) = f.type_name.strip_suffix("[]") {
                     // An array-typed field (spec/design/array.md §12 — the mirror of an
@@ -5585,8 +5597,9 @@ impl Engine {
                     };
                     (Type::Array(Box::new(elem)), None, None)
                 } else if ScalarType::from_name(&f.type_name).is_some() {
-                    let (s, d, vlen) = resolve_type_and_typmod(&f.type_name, &f.type_mod)?;
-                    (Type::Scalar(s), d, vlen)
+                    let (s, tm) = resolve_type_and_typmod(&f.type_name, &f.type_mod)?;
+                    ftemporal = tm.temporal;
+                    (Type::Scalar(s), tm.decimal, tm.varchar_len)
                 } else if let Some(rdesc) = crate::range::range_by_name(&f.type_name) {
                     // A range-typed field (spec/design/composite.md §3, format_version 41): the
                     // element is carried inline like a range column's, and a range takes no typmod.
@@ -5626,6 +5639,7 @@ impl Engine {
                 ty: fty,
                 decimal: fdecimal,
                 varchar_len: fvarchar,
+                temporal: ftemporal,
                 not_null: f.not_null,
             });
         }

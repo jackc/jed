@@ -1006,7 +1006,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 		// (resolveContainerAssign) and is stored through coerceForStore (carried as colType); a
 		// scalar column takes the scalar assignability gate.
 		plan := assignPlan{
-			idx: idx, name: col.Name, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull,
+			idx: idx, name: col.Name, typmod: columnTypmod(&col), notNull: col.NotNull,
 		}
 		colScalar, isScalar := col.Type.AsScalar()
 		if isScalar {
@@ -2484,7 +2484,7 @@ func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided [
 			row[i] = NullValue()
 			continue
 		}
-		v, err := coerceForStore(candidate, colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
+		v, err := coerceForStore(candidate, colTypes[i], columnTypmod(&col), col.NotNull, col.Name, db.inputZone())
 		if err != nil {
 			err = assignmentHint(stampTable(err, table.Name))
 			if p := provided[i]; p >= 0 {
@@ -4061,7 +4061,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 				src = valueToRExpr(defaultOrNull(col))
 			}
 			plan := assignPlan{
-				idx: idx, name: col.Name, decimal: col.Decimal, varcharLen: col.VarcharLen,
+				idx: idx, name: col.Name, typmod: columnTypmod(&col),
 				notNull: col.NotNull, source: src,
 			}
 			if scalar, ok := col.Type.AsScalar(); ok {
@@ -4083,7 +4083,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 				return outcome{}, err
 			}
 			plans = append(plans, assignPlan{
-				idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,
+				idx: idx, name: col.Name, target: colScalar, typmod: columnTypmod(&col), notNull: col.NotNull, source: src,
 			})
 		} else {
 			// A composite, range, or array column: the RHS adapts (a bare string literal via

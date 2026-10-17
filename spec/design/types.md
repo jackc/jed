@@ -840,7 +840,9 @@ varying(n)` is measured in characters.
 
 **Typmod validation (`22023`).** At resolve, `1 ≤ n ≤ 10485760` (PostgreSQL's `varchar` ceiling);
 `varchar(0)` and `varchar(10485761)` each trap `22023` (`invalid_parameter_value`), matching PG. A
-length modifier on a non-`text`, non-`decimal` type stays `0A000` (`i32(5)` etc. — §5, unchanged).
+length modifier on a type that takes none stays `0A000` (`i32(5)` etc. — §5, unchanged); the third
+and fourth parameterized types are `timestamp(p)` / `timestamptz(p)` and the interval qualifier /
+precision (§16).
 
 **Two over-length behaviors, split exactly as PostgreSQL does (the §1 default):**
 
@@ -868,3 +870,19 @@ value is already truncated/checked before it reaches the codec).
 - **`varchar(n)[]`** — an array of length-limited text. A type modifier on an array type stays
   `0A000` ("a type modifier on an array type is not supported yet"), the **same** narrowing
   `numeric(p,s)[]` already carries (§12); plain `text[]` is unaffected.
+
+## 16. The temporal typmods — `timestamp(p)` and interval qualifiers
+
+The **third and fourth parameterized types**: a `timestamp` / `timestamptz` column, field, or cast
+target may carry a fractional-second **precision** `p` (`timestamp(3)`), and an `interval` one a
+**field qualifier** and/or a precision (`interval DAY TO SECOND(3)`, `interval(2)`). As with §12/§15
+the type is unchanged — a modifier, not a type: the value codec, comparison, and key encoding are
+the plain type's. The semantics are PostgreSQL's and are specified with the types:
+[timestamp.md](timestamp.md) §8 (rounding half away from zero, measured from 2000-01-01) and
+[interval.md](interval.md) §6.1 (qualifier-steered input, cutting below the least field, precision
+rounding). `0 ≤ p ≤ 6`, a larger `p` reduced to 6 (PostgreSQL warns; jed has no warning channel). The
+thirteen qualifiers are shared data ([datetime_units.toml](../types/datetime_units.toml)
+`interval_qualifier`, generated into each core). On disk (`format_version` 43) the column/field entry
+carries the modifier in its typmod slot ([format.md](../fileformat/format.md)); the typmod is
+tracked through query outputs like the others ([create-table-as.md](create-table-as.md) §2). A typmod
+on an array type stays `0A000` (§15's narrowing).

@@ -17,7 +17,20 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 42)
+## Version scope (`format_version` 43)
+
+`format_version` **43** — **timestamp precision and interval qualifier typmods**
+([../design/timestamp.md §8](../design/timestamp.md), [../design/interval.md §6.1](../design/interval.md)).
+A `timestamp` / `timestamptz` column entry (`type_code` 9 / 10) now appends, in its typmod slot, one
+**`u8 ts_precision`** — `0xFF` = none (a plain `timestamp`), `0 … 6` = the declared `timestamp(p)`. An
+`interval` column entry (`type_code` 11) appends **`u8 interval_fields`** — `0` = no qualifier,
+`1 … 13` = the qualifier code of [../types/datetime_units.toml](../types/datetime_units.toml)
+`interval_qualifier` — then **`u8 interval_precision`** (`0xFF` = none, `0 … 6`). A composite type's
+timestamp / timestamptz / interval **field** carries the same bytes in the same place. A precision
+above 6 (other than `0xFF`), a qualifier code above 13, or a precision on a qualifier whose least
+field is not `second` is `XX001`. The value codec is unchanged (a value is rounded / cut before it
+is encoded). A file with no timestamp/interval column changes only by its version byte + meta CRC;
+the new `temporal_typmod_table` golden pins the slot.
 
 `format_version` **42** — **GIN term statistics** ([../design/statistics.md §4.5/§7](../design/statistics.md)).
 A column-statistics summary gains flag bit2 `term_eligible`; a term-eligible summary appends
@@ -590,7 +603,7 @@ Two slots for torn-write-safe publication, with dirty-page validation since v33
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`42`** |
+| 4  | 2 | `format_version` (u16) — current = **`43`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -776,6 +789,9 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`precision` | u16 — **only present when `type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only present when `type_code == 6` (decimal)** |
 | &nbsp;&nbsp;`varchar_max_len` | u32 — **only present when `type_code == 4` (text)** (**new in v22**); `0` = unbounded (`text`/`varchar`/`string`), `1 … 10485760` = the `varchar(n)` length limit ([../design/types.md §15](../design/types.md)) |
+| &nbsp;&nbsp;`ts_precision` | u8 — **only present when `type_code` is 9 or 10 (timestamp / timestamptz)** (**new in v43**); `0xFF` = none, `0 … 6` = `timestamp(p)` ([../design/timestamp.md §8](../design/timestamp.md)) |
+| &nbsp;&nbsp;`interval_fields` | u8 — **only present when `type_code == 11` (interval)** (**new in v43**); `0` = no qualifier, `1 … 13` = the [datetime_units.toml](../types/datetime_units.toml) qualifier code ([../design/interval.md §6.1](../design/interval.md)) |
+| &nbsp;&nbsp;`interval_precision` | u8 — **only present when `type_code == 11`** (**new in v43**), after `interval_fields`; `0xFF` = none, `0 … 6`; set only with no qualifier or one whose least field is `second` (else `XX001`) |
 | &nbsp;&nbsp;`default` | value-codec bytes — **only present when `flags` bit2 (`has_default`)**; written *after* the typmod |
 | &nbsp;&nbsp;`default_expr_len` | u16 — **only present when `flags` bit3 (`default_is_expr`)**; written *after* the typmod (in place of `default`) |
 | &nbsp;&nbsp;`default_expr` | UTF-8 — the default's expression text (*Check-expression text* below), `default_expr_len` bytes |
@@ -994,6 +1010,8 @@ A composite-type entry records a `CREATE TYPE name AS (field type, …)` definit
 | &nbsp;&nbsp;`precision` | u16 — **only when `field_type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only when `field_type_code == 6` (decimal)** |
 | &nbsp;&nbsp;`varchar_max_len` | u32 — **only when `field_type_code == 4` (text)** (**new in v22**); `0` = unbounded, `1 … 10485760` = the `varchar(n)` length limit |
+| &nbsp;&nbsp;`ts_precision` | u8 — **only when `field_type_code` is 9 or 10** (**new in v43**); as the column entry's |
+| &nbsp;&nbsp;`interval_fields`, `interval_precision` | u8, u8 — **only when `field_type_code == 11`** (**new in v43**); as the column entry's |
 
 Fields are emitted in **declaration order** (the order they appear in `CREATE TYPE`). A field
 type code of `14` references another composite **by name** (nested composites); a field type code
@@ -1706,6 +1724,7 @@ the interior-node format and the split contract.
 | `pk_table.jed` | an int PK table whose rows force a **3-node tree** (record-free interior root + two leaves holding **all** the records — the v24 B+tree shape) at page 256 — the load-bearing interior-node + copy-up split proof; includes a NULL value in a row (exercising the fixed-width region's null bitmap + zero-filled slot) |
 | `max_sep_table.jed` | **degenerate interior fan-out** ([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)) — a secondary index over near-`RECORD_MAX(0)` text keys, sized so two separators + pointers overflow `C` and the pinned `N = 2 → m = 1` interior split produces a legal **`N = 0` interior node**; pins the minimum-fanout invariant and the degenerate split shape |
 | `text_table.jed` | a text column — the value codec's text branch; empty string, embedded quote, multi-byte + astral chars, a NULL (single leaf) |
+| `temporal_typmod_table.jed` | the v43 temporal typmod slot: `timestamp(3)` / `timestamptz(0)` / `interval day to second(2)` columns (table `t`), `interval year` / `interval(4)` columns (table `u`), and a composite type with `timestamp(1)` / `interval minute` fields used by a column (table `v`); stored values already rounded/cut, beside an all-NULL row |
 | `varchar_table.jed` | a `varchar(n)` column — the v22 text-column `u32 varchar_max_len` typmod slot (a bounded `varchar(5)` beside an unbounded `text` column, in one catalog); stored values are within-limit text |
 | `bool_table.jed` | a boolean column — the `bool-byte` value branch (single leaf) |
 | `bool_pk_table.jed` | a **boolean PRIMARY KEY** (the second non-integer stored key — the `bool-byte` key, `00`/`01`, no presence tag) + a nullable boolean column; rows in key order (false then true) |

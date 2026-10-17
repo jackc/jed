@@ -210,10 +210,17 @@ class PgOracle
   def terminate(sql) = rewrite(sql).strip.chomp(";") + ";"
 
   # `\gdesc` describes a query's result columns WITHOUT executing. Returns [[name, base_type], ...]
-  # with the typmod stripped (`numeric(10,2)` -> `numeric`); empty means PG could not plan it.
+  # with the typmod stripped (`numeric(10,2)` -> `numeric`, `timestamp(3) without time zone` ->
+  # `timestamp without time zone`, `interval day to second(3)` -> `interval`); empty means PG could
+  # not plan it.
   def describe(pg_sql)
     desc, = run("#{pg_sql} \\gdesc")
-    desc.map { |l| n, t = l.chomp.split("|", 2); [n, t.sub(/\(.*\)\z/, "")] }
+    desc.map do |l|
+      n, t = l.chomp.split("|", 2)
+      t = t.gsub(/\(\d+(,\d+)?\)/, "")
+      t = "interval" if t.start_with?("interval ")
+      [n, t]
+    end
   end
 
   # PG base type -> coltype tag. Arrays (`<elem>[]`) and composites render as a printable string

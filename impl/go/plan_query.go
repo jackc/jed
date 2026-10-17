@@ -1509,6 +1509,7 @@ func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolved
 		if bodyTypmods != nil {
 			columns[i].Decimal = bodyTypmods[i].Decimal
 			columns[i].VarcharLen = bodyTypmods[i].VarcharLen
+			columns[i].Temporal = bodyTypmods[i].Temporal
 		}
 	}
 	return &catTable{Name: name, Columns: columns}, nil

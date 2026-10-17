@@ -27,7 +27,9 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 42 # v42: GIN term statistics — a statistics summary's flags gain bit2 term_eligible, a
+VERSION = 43 # v43: timestamp(p) / interval qualifier typmods — a timestamp/timestamptz column or
+             # composite field appends u8 precision (0xFF = none), an interval one u8 fields ‖ u8
+             # precision (spec/design/timestamp.md §8, interval.md §6.1). v42: GIN term statistics — a statistics summary's flags gain bit2 term_eligible, a
 # term-eligible summary appends term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16, and
 # stats_kind 3 term items follow (statistics.md §4.5/§7). No other byte layout change.
 # v41: a composite-type entry admits a range-typed field — field_type_code 17 + the
@@ -215,17 +217,57 @@ end
 # BY DEFAULT) — the v15 column flag bits 4 (is_identity) + 5 (identity_always); an identity column
 # also carries not_null + an expression default (the nextval, spec/design/sequences.md §13).
 def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, varchar_len: nil,
-        default: :none, default_expr: nil, identity: nil, collation: nil)
+        default: :none, default_expr: nil, identity: nil, collation: nil, temporal: nil)
   { name: name, type: type, pk: pk, not_null: not_null.nil? ? pk : not_null,
     precision: precision, scale: scale, varchar_len: varchar_len, default: default,
-    default_expr: default_expr, identity: identity, collation: collation }
+    default_expr: default_expr, identity: identity, collation: collation, temporal: temporal }
+end
+
+# A timestamp / interval typmod (v43, spec/design/timestamp.md §8, interval.md §6.1): `fields` is the
+# interval qualifier code (spec/types/datetime_units.toml, 0 = none — always 0 for a timestamp) and
+# `precision` 0..6 or nil.
+def temporal(fields: 0, precision: nil) = { fields: fields, precision: precision }
+
+TEMPORAL_TYPES = %w[timestamp timestamptz interval].freeze
+NO_TEMPORAL_PRECISION = 0xFF
+
+# The v43 temporal typmod slot of a timestamp/timestamptz (u8 precision) or interval (u8 fields ‖ u8
+# precision) column or field; empty for every other type.
+def temporal_typmod_bytes(type, tm)
+  prec = tm&.dig(:precision) || NO_TEMPORAL_PRECISION
+  case type
+  when "timestamp", "timestamptz" then [prec].pack("C")
+  when "interval" then [tm&.dig(:fields) || 0, prec].pack("CC")
+  else "".b
+  end
+end
+
+# Decode the slot temporal_typmod_bytes writes (nil = no typmod); an out-of-range precision or an
+# unknown qualifier code is corrupt.
+def decode_temporal_typmod(type, buf, pos)
+  return [nil, pos] unless TEMPORAL_TYPES.include?(type)
+
+  fields = 0
+  if type == "interval"
+    fb, pos = take(buf, pos, 1)
+    fields = fb.getbyte(0)
+    raise "unknown interval qualifier #{fields}" if fields > 13
+  end
+  pb, pos = take(buf, pos, 1)
+  prec = pb.getbyte(0)
+  raise "invalid temporal precision #{prec}" unless prec == NO_TEMPORAL_PRECISION || prec <= 6
+
+  precision = prec == NO_TEMPORAL_PRECISION ? nil : prec
+  return [nil, pos] if fields.zero? && precision.nil?
+
+  [temporal(fields: fields, precision: precision), pos]
 end
 
 # A composite-type field (format.md *Composite-type entry*, v9): a name + type (a scalar string,
 # or a composite type NAME for a nested composite) + NOT NULL flag + decimal typmod / varchar(n) len.
-def field(name, type, not_null: false, precision: nil, scale: nil, varchar_len: nil)
+def field(name, type, not_null: false, precision: nil, scale: nil, varchar_len: nil, temporal: nil)
   { name: name, type: type, not_null: not_null, precision: precision, scale: scale,
-    varchar_len: varchar_len }
+    varchar_len: varchar_len, temporal: temporal }
 end
 
 # A composite (row) type definition (`CREATE TYPE name AS (...)`): a name + ordered field list.
@@ -610,6 +652,39 @@ INTERVAL_PK_TABLE = {
   columns: [col("k", "interval", pk: true), col("v", "i32")],
   rows: [[[-1, 0, 0], 6], [[0, -1, 0], 5], [[0, 0, 0], 4], [[0, 0, 1_000_000], 1],
          [[0, 1, 0], 2], [[1, 0, 0], 3], [[1200, 0, 0], 7]]
+}.freeze
+
+# Timestamp precision and interval qualifier typmods (v43, spec/design/timestamp.md §8, interval.md
+# §6.1): the temporal typmod slot on timestamp(3) / timestamptz(0) / interval day to second(2) /
+# interval year / interval(4) columns and on a composite type's timestamp(1) / interval minute fields,
+# each table beside an all-NULL row (three tables so each record fits a 256-byte page). Stored values
+# are already rounded/cut. The cores build this via
+#   CREATE TYPE stamp AS (at timestamp(1), d interval minute)
+#   CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp(3), tz timestamptz(0), iv interval day to second(2))
+#   CREATE TABLE u (id i32 PRIMARY KEY, iy interval year, ip interval(4))
+#   CREATE TABLE v (id i32 PRIMARY KEY, s stamp)
+#   INSERT INTO t (1, '2024-01-01 12:00:00.1234', '2024-01-01 12:00:00.4+00', '1 day 02:03:04.567'),
+#                 (2, NULL, NULL, NULL)
+#   INSERT INTO u (1, '2 years 5 months', '1.23449'), (2, NULL, NULL)
+#   INSERT INTO v (1, ROW('2024-01-01 12:00:00.05', '3 minutes 20 seconds')), (2, NULL)
+TEMPORAL_TYPMOD_TABLE = {
+  types: [ctype("stamp", [field("at", "timestamp", temporal: temporal(precision: 1)),
+                          field("d", "interval", temporal: temporal(fields: 5))])],
+  tables: [{ name: "t",
+             columns: [col("id", "i32", pk: true),
+                       col("ts", "timestamp", temporal: temporal(precision: 3)),
+                       col("tz", "timestamptz", temporal: temporal(precision: 0)),
+                       col("iv", "interval", temporal: temporal(fields: 10, precision: 2))],
+             rows: [[1, 1_704_110_400_123_000, 1_704_110_400_000_000, [0, 1, 7_384_570_000]],
+                    [2, nil, nil, nil]] },
+           { name: "u",
+             columns: [col("id", "i32", pk: true),
+                       col("iy", "interval", temporal: temporal(fields: 1)),
+                       col("ip", "interval", temporal: temporal(precision: 4))],
+             rows: [[1, [24, 0, 0], [0, 0, 1_234_500]], [2, nil, nil]] },
+           { name: "v",
+             columns: [col("id", "i32", pk: true), col("s", "stamp")],
+             rows: [[1, [1_704_110_400_100_000, [0, 0, 180_000_000]]], [2, nil]] }]
 }.freeze
 
 # A table with a date column (type code 16): exercises the value codec's date branch (the i32
@@ -1677,6 +1752,8 @@ FIXTURES = ([
   { file: "jsonb_table.jed", page_size: 256, tables: [JSONB_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
     types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
+  { file: "temporal_typmod_table.jed", page_size: 256,
+    types: TEMPORAL_TYPMOD_TABLE[:types], tables: TEMPORAL_TYPMOD_TABLE[:tables] },
   { file: "composite_key_table.jed", page_size: 256,
     types: COMPOSITE_KEY_TABLE[:types], tables: COMPOSITE_KEY_TABLE[:tables] },
   { file: "array_composite_table.jed", page_size: 256,
@@ -2309,6 +2386,8 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
     # A text column appends its varchar(n) max length (u32) — only for type_code 4 (v22). 0 =
     # unbounded (spec/design/types.md §15).
     out << u32(c[:varchar_len] || 0) if c[:type] == "text"
+    # A timestamp/timestamptz/interval column appends its precision / qualifier typmod (v43).
+    out << temporal_typmod_bytes(c[:type], c[:temporal])
     # A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default value via
     # the same value codec rows use — AFTER the typmod, presence-gated. A DEFAULT NULL is one
     # 0x01. An EXPRESSION default (flags bit3, v8) instead appends its expr-text (u16 length +
@@ -2555,6 +2634,8 @@ def composite_type_entry_bytes(ct)
     out << u16(f[:precision] || 0) << u16(f[:scale] || 0) if f[:type] == "decimal"
     # A text field appends its varchar(n) max length (u32, v22); 0 = unbounded (types.md §15).
     out << u32(f[:varchar_len] || 0) if f[:type] == "text"
+    # A timestamp/timestamptz/interval field appends its typmod (v43).
+    out << temporal_typmod_bytes(f[:type], f[:temporal])
   end
   out
 end
@@ -3997,8 +4078,9 @@ def decode_composite_type_entry(buf, pos)
       n = vb.unpack1("N")
       varchar_len = n.zero? ? nil : n
     end
+    tm, pos = decode_temporal_typmod(type, buf, pos)
     fields << { name: fname, type: type, not_null: not_null, precision: precision, scale: scale,
-                varchar_len: varchar_len }
+                varchar_len: varchar_len, temporal: tm }
   end
   [{ name: name, fields: fields }, pos]
 end
@@ -4023,7 +4105,7 @@ def decode_table_entry(buf, pos)
       tname, pos = take(buf, pos, tnl.unpack1("n"))
       columns << { name: cname, type: tname, pk: false, not_null: (cf & 0b10) != 0,
                    precision: nil, scale: nil, varchar_len: nil, default: :none,
-                   default_expr: nil, identity: nil, collation: nil }
+                   default_expr: nil, identity: nil, collation: nil, temporal: nil }
       next
     end
     # An array column (v10, type_code 15): flags, then the element-type descriptor
@@ -4045,7 +4127,7 @@ def decode_table_entry(buf, pos)
       end
       columns << { name: cname, type: "#{elem_type}[]", pk: false, not_null: (af & 0b10) != 0,
                    precision: nil, scale: nil, varchar_len: nil, default: :none,
-                   default_expr: nil, identity: nil, collation: collation }
+                   default_expr: nil, identity: nil, collation: collation, temporal: nil }
       next
     end
     # A range column (v15, type_code 17): flags, then the element-type descriptor — one scalar code
@@ -4060,7 +4142,7 @@ def decode_table_entry(buf, pos)
       rname = RANGE_ELEM.key(elem_type) or raise "type code is not a valid range element subtype"
       columns << { name: cname, type: rname, pk: false, not_null: (rf & 0b10) != 0,
                    precision: nil, scale: nil, varchar_len: nil, default: :none,
-                   default_expr: nil, identity: nil, collation: nil }
+                   default_expr: nil, identity: nil, collation: nil, temporal: nil }
       next
     end
     flags, pos = take(buf, pos, 1)
@@ -4090,6 +4172,8 @@ def decode_table_entry(buf, pos)
       n = vb.unpack1("N")
       varchar_len = n.zero? ? nil : n
     end
+    # A timestamp/timestamptz/interval column carries its precision / qualifier typmod (v43).
+    tm, pos = decode_temporal_typmod(type, buf, pos)
     # The default follows the typmod: a CONSTANT default (bit2) is a value via the value codec; an
     # EXPRESSION default (bit3, v8) is the expr-text (u16 length + UTF-8). Mutually exclusive.
     raise "column has both a constant and an expression default" if (f & 0b1100) == 0b1100
@@ -4111,7 +4195,8 @@ def decode_table_entry(buf, pos)
     end
     columns << { name: cname, type: type, pk: false, not_null: (f & 0b10) != 0,
                  precision: precision, scale: scale, varchar_len: varchar_len, default: default,
-                 default_expr: default_expr, identity: identity, collation: collation }
+                 default_expr: default_expr, identity: identity, collation: collation,
+                 temporal: tm }
   end
   # The primary key (v5): member ordinals in KEY order; pk membership marks the columns.
   pk = []
@@ -4938,7 +5023,8 @@ def expected_types(fx)
     { name: t[:name],
       fields: t[:fields].map do |f|
         { name: f[:name], type: f[:type], not_null: f[:not_null] || false,
-          precision: f[:precision], scale: f[:scale], varchar_len: f[:varchar_len] }
+          precision: f[:precision], scale: f[:scale], varchar_len: f[:varchar_len],
+          temporal: f[:temporal] }
       end }
   end
 end
@@ -4952,7 +5038,7 @@ def expected_tables(fx)
         { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],
           precision: c[:precision], scale: c[:scale], varchar_len: c[:varchar_len],
           default: c[:default], default_expr: c[:default_expr], identity: c[:identity],
-          collation: c[:collation] }
+          collation: c[:collation], temporal: c[:temporal] }
       end,
       pk: pk_order(t),
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr], host_deps: ck[:host_deps] || [] } },

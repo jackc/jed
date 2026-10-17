@@ -60,6 +60,14 @@
   'ok'::varchar(8)              AS within_limit,
   'jedi'::character varying(3)  AS two_word;`;
 
+	const precisionDemo = `SELECT
+  '2024-01-15 10:30:45.678'::timestamp(1)   AS rounded,
+  '2024-01-15 10:30:45.5'::timestamp(0)     AS half_rounds_up,
+  interval '1 day 02:03:04.5' hour          AS cut_to_hours,
+  interval '2:03' minute to second          AS min_sec,
+  interval '5' day                          AS unitless_days,
+  '1.23456'::interval(2)                    AS interval_precision;`;
+
 	const uuidCastDemo = `SELECT
   ('550E8400-E29B-41D4-A716-446655440000'::text)::uuid  AS text_to_uuid,
   '550e8400-e29b-41d4-a716-446655440000'::uuid::text    AS uuid_to_text,
@@ -380,6 +388,25 @@ Storing into a `varchar(n)` **column** is stricter: an over-length value raises 
 truncated to `n` (the SQL-standard trailing-space rule). `UPDATE` re-checks the length the same way.
 The limit lives on the value, not the type: a `varchar(4)` and an unbounded `text` are the same type
 underneath, with the same collation, comparison, and key encoding.
+
+## Timestamp precision and interval fields
+
+A `timestamp` or `timestamptz` may declare a **precision**, the number of fractional-second digits
+it keeps: `timestamp(3)`, `timestamptz(0)` (0 through 6; a larger precision means 6). A value stored
+in such a column or cast to such a type is **rounded**, not truncated, exactly as in PostgreSQL —
+including PostgreSQL's quirk that a half second rounds *up* after 2000-01-01 and *down* before it.
+
+An `interval` may declare **fields** — `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, or a range
+such as `YEAR TO MONTH`, `DAY TO SECOND`, `MINUTE TO SECOND` — and a precision, `interval(3)` or
+`interval DAY TO SECOND(3)`. The fields steer how text is read (a bare `'5'` under `DAY` is five
+days; `'2:03'` under `MINUTE TO SECOND` is two minutes three seconds) and cut everything below the
+last field (`HOUR` drops minutes and seconds but keeps days and months). They also work on a literal:
+`INTERVAL '1' DAY`.
+
+<LiveSql demo="precisionDemo" query={precisionDemo} rows={1} />
+
+The modifier is part of the column's type in `jed_columns` (`timestamp(3)`,
+`interval day to second(3)`), and `CREATE TABLE … AS` keeps it from a column or a cast.
 
 ## UUID ⇄ text and bytea casts
 

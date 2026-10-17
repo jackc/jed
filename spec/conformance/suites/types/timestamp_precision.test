@@ -1,0 +1,182 @@
+# timestamp(p) / timestamptz(p) precision typmods (spec/design/timestamp.md §8). A column, composite
+# field, or cast target may declare 0 <= p <= 6 fractional-second digits; a value stored or cast
+# there is ROUNDED (not truncated) to p digits, half away from zero measured from PostgreSQL's
+# 2000-01-01 epoch — so .5 rounds up after 2000 and down before it (PostgreSQL's
+# AdjustTimestampForTypmod). ±infinity passes through. A literal rounds at resolve; a runtime value
+# rounds through the cast's typmod, on INSERT/UPDATE assignment, and through a composite field.
+# p > 6 is reduced to 6 (PostgreSQL also warns; jed has no warning channel — that one record lives in
+# introspection/temporal_typmod.test). All rows oracle-checked against PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.select_no_from, query.where_eq, query.order_by, query.values_query, cast.explicit, cast.string_literal, types.i32, types.text, types.date, types.timestamp, types.timestamptz, types.interval, types.composite, types.timestamp_precision, harness.params
+
+# --- casts of a literal: rounded at resolve ------------------------------------------------------
+query TTTT nosort
+SELECT '2020-01-01 12:34:56.789567'::timestamp(3), '2020-01-01 12:34:56.5'::timestamp(0), '2020-01-01 12:34:56.789567'::timestamp(6), CAST('2020-01-01 12:34:56.04' AS timestamp(1))
+----
+2020-01-01 12:34:56.79
+2020-01-01 12:34:57
+2020-01-01 12:34:56.789567
+2020-01-01 12:34:56
+
+# rounding carries into every field
+query T nosort
+SELECT '2009-12-31 23:59:59.95'::timestamp(1)
+----
+2010-01-01 00:00:00
+
+# the half-way tie rounds AWAY from 2000-01-01: up after it, down before it (PostgreSQL's epoch)
+query TTT nosort
+SELECT '2005-06-01 12:00:00.5'::timestamp(0), '1985-06-01 12:00:00.5'::timestamp(0), '1969-12-31 23:59:59.5'::timestamp(0)
+----
+2005-06-01 12:00:01
+1985-06-01 12:00:00
+1969-12-31 23:59:59
+
+query TT nosort
+SELECT '1985-06-01 12:00:00.55'::timestamp(1), '1985-06-01 12:00:00.56'::timestamp(1)
+----
+1985-06-01 12:00:00.5
+1985-06-01 12:00:00.6
+
+# timestamptz rounds the instant
+query TT nosort
+SELECT '2020-01-01 00:00:00.5+00'::timestamptz(0), '2020-01-01 00:00:00.123456+02'::timestamptz(2)
+----
+2020-01-01 00:00:01+00
+2019-12-31 22:00:00.12+00
+
+# ±infinity is untouched
+query TT nosort
+SELECT 'infinity'::timestamp(0), '-infinity'::timestamptz(3)
+----
+infinity
+-infinity
+
+# a NULL stays NULL
+query T nosort
+SELECT NULL::timestamp(2)
+----
+NULL
+
+# --- casts of a runtime value: the typmod scales it ----------------------------------------------
+query TTTT nosort
+SELECT (timestamp '2020-01-01 00:00:00.5')::timestamp(0), (timestamp '2020-01-01 00:00:00.5' + interval '0.25 seconds')::timestamp(1), ('2020-06-01 00:00:00.5+00'::timestamptz)::timestamp(0), ('2020-06-01'::date)::timestamp(2)
+----
+2020-01-01 00:00:01
+2020-01-01 00:00:00.8
+2020-06-01 00:00:01
+2020-06-01 00:00:00
+
+query TT nosort
+SELECT (timestamp '2020-01-01 00:00:00.5')::timestamptz(0), x::timestamp(2) FROM (VALUES ('2021-02-03 04:05:06.789'::text)) v(x)
+----
+2020-01-01 00:00:01+00
+2021-02-03 04:05:06.79
+
+# --- assignment: a timestamp(p) column rounds every stored value --------------------------------
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp(2), tz timestamptz(0), plain timestamp)
+
+statement ok
+INSERT INTO t VALUES (1, '2020-01-01 00:00:00.125', '2020-01-01 00:00:00.5+00', '2020-01-01 00:00:00.125'), (2, '1985-01-01 00:00:00.125', '1985-01-01 00:00:00.5+00', '1985-01-01 00:00:00.125')
+
+# a runtime value (an expression) rounds too
+statement ok
+INSERT INTO t VALUES (3, timestamp '2020-01-01 00:00:00.004' + interval '0.001 seconds', timestamptz '2020-01-01 00:00:00.4+00' + interval '0.1 seconds', NULL)
+
+statement ok
+INSERT INTO t VALUES (4, 'infinity', '-infinity', NULL), (5, NULL, NULL, NULL)
+
+query ITTT nosort
+SELECT id, ts, tz, plain FROM t ORDER BY id
+----
+1
+2020-01-01 00:00:00.13
+2020-01-01 00:00:01+00
+2020-01-01 00:00:00.125
+2
+1985-01-01 00:00:00.12
+1985-01-01 00:00:00+00
+1985-01-01 00:00:00.125
+3
+2020-01-01 00:00:00.01
+2020-01-01 00:00:01+00
+NULL
+4
+infinity
+-infinity
+NULL
+5
+NULL
+NULL
+NULL
+
+# INSERT … SELECT from an unconstrained column rounds on the way in
+statement ok
+INSERT INTO t (id, ts, tz) SELECT 6, plain, NULL FROM t WHERE id = 1
+
+query T nosort
+SELECT ts FROM t WHERE id = 6
+----
+2020-01-01 00:00:00.13
+
+# UPDATE re-rounds the new value
+statement ok
+UPDATE t SET ts = ts + interval '0.006 seconds', tz = tz + interval '0.4 seconds' WHERE id = 1
+
+query TT nosort
+SELECT ts, tz FROM t WHERE id = 1
+----
+2020-01-01 00:00:00.14
+2020-01-01 00:00:01+00
+
+# an equality against the stored (rounded) value
+query I nosort
+SELECT id FROM t WHERE ts = '2020-01-01 00:00:00.13'
+----
+6
+
+# a bound parameter rounds on assignment and through a typmod cast
+# params: '2020-01-01 00:00:00.125'
+statement ok
+INSERT INTO t (id, ts) VALUES (7, $1)
+
+query T nosort
+SELECT ts FROM t WHERE id = 7
+----
+2020-01-01 00:00:00.13
+
+# params: '2020-01-01 00:00:00.5'
+query T nosort
+SELECT $1::timestamp(0)
+----
+2020-01-01 00:00:01
+
+# --- a composite field rounds its values ---------------------------------------------------------
+statement ok
+CREATE TYPE stamp AS (at timestamp(0), note text)
+
+query T nosort
+SELECT '("2020-01-01 00:00:00.5",x)'::stamp
+----
+("2020-01-01 00:00:01",x)
+
+statement ok
+CREATE TABLE ev (id i32 PRIMARY KEY, s stamp)
+
+statement ok
+INSERT INTO ev VALUES (1, ROW('2020-01-01 00:00:00.7', 'a'))
+
+query T nosort
+SELECT (s).at FROM ev
+----
+2020-01-01 00:00:01
+
+# --- typmod errors -------------------------------------------------------------------------------
+# a second modifier is a syntax error
+statement error 42601
+SELECT '2020-01-01'::timestamp(1, 2)
+
+# a negative precision is a syntax error (the modifier is an unsigned integer)
+statement error 42601
+SELECT '2020-01-01'::timestamp(-1)
+

@@ -158,3 +158,29 @@ export const DATE_TOKENS: readonly DtToken[] = [
   { token: "y", kind: "units", value: "year" },
   { token: "yesterday", kind: "reserv", value: "yesterday" },
 ];
+
+// One SQL interval field qualifier (interval.md §6.1): its persisted `code`, its `name` as
+// written and displayed, its least-significant kept field, and whether `a:b` reads as mm:ss.
+export interface IntervalQualifier {
+  code: number;
+  name: string;
+  least: string;
+  mmSS: boolean;
+}
+
+// The thirteen interval qualifiers, by ascending code (`INTERVAL_QUALIFIERS[code - 1]`).
+export const INTERVAL_QUALIFIERS: readonly IntervalQualifier[] = [
+  { code: 1, name: "year", least: "year", mmSS: false },
+  { code: 2, name: "month", least: "month", mmSS: false },
+  { code: 3, name: "day", least: "day", mmSS: false },
+  { code: 4, name: "hour", least: "hour", mmSS: false },
+  { code: 5, name: "minute", least: "minute", mmSS: false },
+  { code: 6, name: "second", least: "second", mmSS: false },
+  { code: 7, name: "year to month", least: "month", mmSS: false },
+  { code: 8, name: "day to hour", least: "hour", mmSS: false },
+  { code: 9, name: "day to minute", least: "minute", mmSS: false },
+  { code: 10, name: "day to second", least: "second", mmSS: false },
+  { code: 11, name: "hour to minute", least: "minute", mmSS: false },
+  { code: 12, name: "hour to second", least: "second", mmSS: false },
+  { code: 13, name: "minute to second", least: "second", mmSS: true },
+];

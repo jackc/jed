@@ -637,6 +637,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		var colType dataType
 		var decimal *decimalTypmod
 		var varcharLen *uint32
+		var temporal *temporalTypmod
 		isComposite := false
 		isArray := false
 		isRange := false
@@ -674,7 +675,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			colType = rangeT(scalarT(elementScalar(rdesc)))
 			isRange = true
 		} else if _, ok := scalarTypeFromName(def.TypeName); ok {
-			ty, d, vl, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
+			ty, tm, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 			if err != nil {
 				return outcome{}, err
 			}
@@ -684,8 +685,9 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 				return outcome{}, newError(FeatureNotSupported, "a jsonpath column is not supported yet")
 			}
 			colType = scalarT(ty)
-			decimal = d
-			varcharLen = vl
+			decimal = tm.Decimal
+			varcharLen = tm.VarcharLen
+			temporal = tm.Temporal
 		} else if ctype := db.readSnap().compositeType(def.TypeName); ctype != nil {
 			if def.TypeMod != nil {
 				return outcome{}, newError(FeatureNotSupported,
@@ -834,7 +836,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 				def.Default.Expr.Literal.Kind == literalText &&
 				dateClockIsRelative(def.Default.Expr.Literal.Str)
 			if def.Default.Expr.Kind == exprLiteral && !clockDefault {
-				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, varcharLen, false, def.Name, db.inputZone())
+				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, typmod{Decimal: decimal, VarcharLen: varcharLen, Temporal: temporal}, false, def.Name, db.inputZone())
 				if err != nil {
 					return outcome{}, assignmentHint(err)
 				}
@@ -881,6 +883,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			Type:       colType,
 			Decimal:    decimal,
 			VarcharLen: varcharLen,
+			Temporal:   temporal,
 			PrimaryKey: def.PrimaryKey,
 			// PRIMARY KEY ⇒ NOT NULL; a serial or IDENTITY column is NOT NULL too (sequences.md §12/§13).
 			NotNull:     def.PrimaryKey || def.NotNull || isSerial || def.Identity != nil,
@@ -2570,10 +2573,10 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					}
 					typeSQL := edit.TypeName
 					if edit.TypeMod != nil {
-						if edit.TypeMod.Scale != nil {
-							typeSQL += fmt.Sprintf(" (%d, %d)", edit.TypeMod.Precision, *edit.TypeMod.Scale)
+						if r := edit.TypeMod.render(); strings.HasPrefix(r, " ") {
+							typeSQL += r
 						} else {
-							typeSQL += fmt.Sprintf(" (%d)", edit.TypeMod.Precision)
+							typeSQL += " " + r
 						}
 					}
 					target.DefaultExpr = &defaultExprDef{ExprText: "CAST ( " + oldColumn.DefaultExpr.ExprText + " AS " + typeSQL + " )", Expr: defaultCast}
@@ -2770,7 +2773,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					if err != nil {
 						return outcome{}, err
 					}
-					v, err = coerceForStore(v, step.addedType, step.added.Decimal, step.added.VarcharLen, step.added.NotNull, step.added.Name, db.inputZone())
+					v, err = coerceForStore(v, step.addedType, columnTypmod(&step.added), step.added.NotNull, step.added.Name, db.inputZone())
 					if err != nil {
 						return outcome{}, err
 					}
@@ -3082,7 +3085,7 @@ func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *de
 	ty := col.Type.Scalar
 	clockDefault := ty == scalarDate && def.Expr.Kind == exprLiteral && def.Expr.Literal.Kind == literalText && dateClockIsRelative(def.Expr.Literal.Str)
 	if def.Expr.Kind == exprLiteral && !clockDefault {
-		v, err := storeValue(literalToValue(*def.Expr.Literal), ty, col.Decimal, col.VarcharLen, false, col.Name, db.inputZone())
+		v, err := storeValue(literalToValue(*def.Expr.Literal), ty, columnTypmod(&col), false, col.Name, db.inputZone())
 		if err != nil {
 			return nil, nil, assignmentHint(err)
 		}
@@ -3106,6 +3109,7 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 	var ty dataType
 	var decimal *decimalTypmod
 	var varcharLen *uint32
+	var temporal *temporalTypmod
 	if isSerial {
 		if def.TypeMod != nil {
 			return catColumn{}, newError(SyntaxError, "type modifier is not allowed for type "+def.TypeName)
@@ -3128,14 +3132,14 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 		}
 		ty = rangeT(scalarT(elementScalar(r)))
 	} else if _, ok := scalarTypeFromName(def.TypeName); ok {
-		s, d, v, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
+		s, tm, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 		if err != nil {
 			return catColumn{}, err
 		}
 		if s == scalarJsonPath {
 			return catColumn{}, newError(FeatureNotSupported, "a jsonpath column is not supported yet")
 		}
-		ty, decimal, varcharLen = scalarT(s), d, v
+		ty, decimal, varcharLen, temporal = scalarT(s), tm.Decimal, tm.VarcharLen, tm.Temporal
 	} else if c := db.readSnap().compositeType(def.TypeName); c != nil {
 		if def.TypeMod != nil {
 			return catColumn{}, newError(FeatureNotSupported, "a type modifier is not supported for composite type "+def.TypeName)
@@ -3166,7 +3170,7 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 		return catColumn{}, newError(FeatureNotSupported, "this column type or collation is not supported on an attached-database table")
 	}
 
-	col := catColumn{Name: def.Name, Type: ty, Decimal: decimal, VarcharLen: varcharLen, PrimaryKey: def.PrimaryKey, NotNull: def.PrimaryKey || def.NotNull || isSerial || def.Identity != nil, Collation: collation}
+	col := catColumn{Name: def.Name, Type: ty, Decimal: decimal, VarcharLen: varcharLen, Temporal: temporal, PrimaryKey: def.PrimaryKey, NotNull: def.PrimaryKey || def.NotNull || isSerial || def.Identity != nil, Collation: collation}
 	if def.PrimaryKey {
 		if len(table.PK) > 0 {
 			return catColumn{}, newError(InvalidTableDefinition, "multiple primary keys for table "+table.Name+" are not allowed")
@@ -4288,6 +4292,7 @@ func (db *engine) executeCreateType(ct *createType) (outcome, error) {
 		var fty dataType
 		var fdecimal *decimalTypmod
 		var fvarchar *uint32
+		var ftemporal *temporalTypmod
 		if base, ok := strings.CutSuffix(f.TypeName, "[]"); ok {
 			// An array-typed field (spec/design/array.md §12 — the mirror of an array-of-composite
 			// element). The element is a scalar or a previously-defined composite (element_type_code
@@ -4305,11 +4310,11 @@ func (db *engine) executeCreateType(ct *createType) (outcome, error) {
 				return outcome{}, newError(UndefinedObject, "type does not exist: "+base)
 			}
 		} else if _, ok := scalarTypeFromName(f.TypeName); ok {
-			s, d, vl, err := resolveTypeAndTypmod(f.TypeName, f.TypeMod)
+			s, tm, err := resolveTypeAndTypmod(f.TypeName, f.TypeMod)
 			if err != nil {
 				return outcome{}, err
 			}
-			fty, fdecimal, fvarchar = scalarT(s), d, vl
+			fty, fdecimal, fvarchar, ftemporal = scalarT(s), tm.Decimal, tm.VarcharLen, tm.Temporal
 		} else if rdesc, ok := rangeByName(f.TypeName); ok {
 			// A range-typed field (spec/design/composite.md §3, format_version 41): the element is
 			// carried inline like a range column's, and a range takes no typmod.
@@ -4327,7 +4332,7 @@ func (db *engine) executeCreateType(ct *createType) (outcome, error) {
 		} else {
 			return outcome{}, newError(UndefinedObject, "type does not exist: "+f.TypeName)
 		}
-		fields = append(fields, compositeField{Name: f.Name, Type: fty, Decimal: fdecimal, VarcharLen: fvarchar, NotNull: f.NotNull})
+		fields = append(fields, compositeField{Name: f.Name, Type: fty, Decimal: fdecimal, VarcharLen: fvarchar, Temporal: ftemporal, NotNull: f.NotNull})
 	}
 	// Bound composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A chain of CREATE TYPEs each
 	// nesting the previous (`a`, `b AS (x a)`, …) builds unbounded depth across many cheap statements —

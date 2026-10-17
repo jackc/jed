@@ -1515,6 +1515,48 @@ fn composite_type_table_db() -> Session {
     db
 }
 
+/// Timestamp precision and interval qualifier typmods (v43 — spec/design/timestamp.md §8,
+/// interval.md §6.1): the temporal typmod slot on columns and composite fields; stored values are
+/// rounded/cut on INSERT. Must match `spec/fileformat/verify.rb`'s `TEMPORAL_TYPMOD_TABLE`.
+fn temporal_typmod_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TYPE stamp AS (at timestamp(1), d interval minute)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp(3), tz timestamptz(0), \
+         iv interval day to second(2))",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE u (id i32 PRIMARY KEY, iy interval year, ip interval(4))",
+    );
+    run(&mut db, "CREATE TABLE v (id i32 PRIMARY KEY, s stamp)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '2024-01-01 12:00:00.1234', '2024-01-01 12:00:00.4+00', \
+         '1 day 02:03:04.567'), (2, NULL, NULL, NULL)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO u VALUES (1, '2 years 5 months', '1.23449'), (2, NULL, NULL)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO v VALUES (1, ROW('2024-01-01 12:00:00.05', '3 minutes 20 seconds')), \
+         (2, NULL)",
+    );
+    db
+}
+
 /// A composite-TYPED column used as the PRIMARY KEY (the third container key,
 /// `composite-field-slots`, encoding.md §2.15 / composite.md §6) — distinct from the multi-column
 /// `composite_pk_table` (a flat tuple of scalars). The stored key is the per-field §2.2 nullable
@@ -2010,6 +2052,7 @@ fn write_matches_goldens() {
         ("gin_decimal_bytea_table.jed", gin_decimal_bytea_table_db),
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
+        ("temporal_typmod_table.jed", temporal_typmod_table_db),
         ("composite_key_table.jed", composite_key_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
         ("sequence_table.jed", sequence_table_db),
@@ -2120,6 +2163,9 @@ fn read_goldens_reproduces_rows() {
         ),
         ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
+        ("temporal_typmod_table.jed", temporal_typmod_table_db, "t"),
+        ("temporal_typmod_table.jed", temporal_typmod_table_db, "u"),
+        ("temporal_typmod_table.jed", temporal_typmod_table_db, "v"),
         ("composite_key_table.jed", composite_key_table_db, "t"),
         ("nested_composite_table.jed", nested_composite_table_db, "t"),
         ("array_table.jed", array_table_db, "t"),

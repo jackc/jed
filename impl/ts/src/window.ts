@@ -41,7 +41,7 @@ import { engineError } from "./errors.ts";
 import { intervalCmp } from "./interval.ts";
 import { rangeTotalCmp } from "./range.ts";
 import { jsonNodeCmp } from "./json.ts";
-import type { DecimalTypmod, ScalarType } from "./types.ts";
+import type { DecimalTypmod, ScalarType, TemporalTypmod } from "./types.ts";
 import type { ColType } from "./catalog.ts";
 import type { InputZone, ZoneRef } from "./timezone.ts";
 export function or3(
@@ -1332,6 +1332,9 @@ export type AssignPlan = {
   // The varchar(n) length for a text column (spec/design/types.md §15) — UPDATE re-checks the new
   // value's length exactly like INSERT (over-length 22001, trailing-space truncate).
   varcharLen: number | null;
+  // The timestamp precision / interval qualifier typmod — UPDATE rounds / cuts the new value exactly
+  // like INSERT (spec/design/timestamp.md §8, interval.md §6.1).
+  temporal: TemporalTypmod | null;
   notNull: boolean;
   source: RExpr;
   // The resolved ColType for a NON-scalar column — when set, checkAssign stores through
@@ -1346,6 +1349,6 @@ export type AssignPlan = {
 // elements). The resolver proved the value's family is assignable.
 export function checkAssign(p: AssignPlan, v: Value, iz: InputZone): Value {
   if (p.colType !== undefined)
-    return coerceForStore(v, p.colType, p.decimal, p.varcharLen, p.notNull, p.name, iz);
-  return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name, iz);
+    return coerceForStore(v, p.colType, p.decimal, p.varcharLen, p.temporal, p.notNull, p.name, iz);
+  return storeValue(v, p.target, p.decimal, p.varcharLen, p.temporal, p.notNull, p.name, iz);
 }

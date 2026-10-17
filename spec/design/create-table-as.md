@@ -77,12 +77,13 @@ A column is created for each output column of the query, in order, with:
   storable type: **`42P16`** *column "r" has pseudo-type record* (`record[]` for an array of one).
   A type no declared column may have in jed is the same `0A000` as for `CREATE TABLE`: a `jsonpath`
   column, and an array whose element is an array or a range.
-- **its typmod** — the `numeric(p,s)` precision and scale or the `varchar(n)` length the output
-  keeps, PostgreSQL's `exprTypmod`:
+- **its typmod** — the `numeric(p,s)` precision and scale, the `varchar(n)` length, or the
+  `timestamp(p)` precision / interval qualifier and precision (timestamp.md §8, interval.md §6.1)
+  the output keeps, PostgreSQL's `exprTypmod`:
   - a column reference keeps its column's (a base table's, or a derived table's, CTE's, view's,
     `USING` join's, or set-returning function's output column, each of which records its body's);
-  - a cast to `numeric(p,s)` / `varchar(n)` has the cast's; a cast without a typmod (`::decimal`,
-    `::varchar`, `::text`) has none;
+  - a cast to `numeric(p,s)` / `varchar(n)` / `timestamp(p)` / a qualified interval has the cast's;
+    a cast without a typmod (`::decimal`, `::varchar`, `::text`, `::interval`) has none;
   - `COLLATE` keeps its operand's;
   - `CASE` (with an `ELSE`; without one it can yield a typmod-less `NULL`), `COALESCE`, `GREATEST`,
     and `LEAST` keep the typmod every result input has, else none;

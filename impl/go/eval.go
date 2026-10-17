@@ -261,7 +261,7 @@ func evalRangeCtor(elem scalarType, vals []Value, iz *inputZone) (Value, error) 
 // integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses, and a
 // non-assignable value is 42804 (the resolver already screened the common 42883 cases).
 func coerceRangeBound(v Value, elem scalarType, iz *inputZone) (*Value, error) {
-	out, err := storeValue(v, elem, nil, nil, false, "range bound", iz)
+	out, err := storeValue(v, elem, typmod{}, false, "range bound", iz)
 	if err != nil {
 		return nil, err
 	}
@@ -284,14 +284,14 @@ func evalRangeOp(op rangeOp, l, r Value, elem scalarType, iz *inputZone) (Value,
 	switch op {
 	// `range @> element`: l is the range, r the element (coerced to the range's element type).
 	case roContainsElem:
-		e, err := storeValue(r, elem, nil, nil, false, "range element", iz)
+		e, err := storeValue(r, elem, typmod{}, false, "range element", iz)
 		if err != nil {
 			return Value{}, err
 		}
 		result = rangeContainsElem(expectRange(l), e)
 	// `element <@ range`: l is the element, r the range.
 	case roElemContainedBy:
-		e, err := storeValue(l, elem, nil, nil, false, "range element", iz)
+		e, err := storeValue(l, elem, typmod{}, false, "range element", iz)
 		if err != nil {
 			return Value{}, err
 		}
@@ -991,7 +991,7 @@ func requireAssignable(t resolvedType, colTy scalarType, col string) error {
 // the gate (42804).
 func resolveScalarAssign(s *scope, e exprNode, colTy scalarType, col string, params *paramTypes) (*rExpr, error) {
 	if colTy.IsFloat() && e.Kind == exprLiteral && e.Literal.Kind == literalText {
-		node, _, err := coerceStringLiteral(e.Literal.Str, colTy, nil, nil, s.catalog.inputZone())
+		node, _, err := coerceStringLiteral(e.Literal.Str, colTy, typmod{}, s.catalog.inputZone())
 		if err != nil {
 			return nil, positionError(err, exprLocation(e))
 		}
@@ -1017,34 +1017,70 @@ func resolveScalarAssign(s *scope, e exprNode, colTy scalarType, col string, par
 // as a u32.
 const maxVarcharLen uint64 = 10485760
 
-// resolveTypeAndTypmod resolves a scalar type name + optional type modifier, returning the type,
-// the decimal typmod (decimal), and the varchar(n) max length (text — spec/design/types.md §15).
-// At most one typmod is ever non-nil (they belong to different types); a typmod on any other type
-// is 0A000.
-func resolveTypeAndTypmod(name string, tm *typeMod) (scalarType, *decimalTypmod, *uint32, error) {
+// resolveTypeAndTypmod resolves a scalar type name + optional type modifier, returning the type and
+// its typmod: the decimal numeric(p,s) (decimal), the varchar(n) max length (text —
+// spec/design/types.md §15), or the timestamp precision / interval qualifier and precision
+// (spec/design/timestamp.md §8, interval.md §6.1). At most one part is ever set (each belongs to its
+// own types); a typmod on any other type is 0A000.
+func resolveTypeAndTypmod(name string, tm *typeMod) (scalarType, typmod, error) {
 	ty, ok := scalarTypeFromName(name)
 	if !ok {
-		return 0, nil, nil, newError(UndefinedObject, "type does not exist: "+name)
+		return 0, typmod{}, newError(UndefinedObject, "type does not exist: "+name)
 	}
 	if tm == nil {
-		return ty, nil, nil, nil
+		return ty, typmod{}, nil
 	}
 	if ty.IsDecimal() {
-		typmod, err := validateDecimalTypmod(tm)
+		d, err := validateDecimalTypmod(tm)
 		if err != nil {
-			return 0, nil, nil, err
+			return 0, typmod{}, err
 		}
-		return ty, typmod, nil, nil
+		return ty, typmod{Decimal: d}, nil
 	}
 	if ty.IsText() {
 		vl, err := validateVarcharTypmod(tm)
 		if err != nil {
-			return 0, nil, nil, err
+			return 0, typmod{}, err
 		}
-		return ty, nil, vl, nil
+		return ty, typmod{VarcharLen: vl}, nil
 	}
-	return 0, nil, nil, newError(FeatureNotSupported,
+	if ty.IsTimestamp() || ty.IsTimestamptz() || ty.IsInterval() {
+		t, err := validateTemporalTypmod(tm)
+		if err != nil {
+			return 0, typmod{}, err
+		}
+		return ty, typmod{Temporal: t}, nil
+	}
+	return 0, typmod{}, newError(FeatureNotSupported,
 		"a type modifier is not supported for type "+ty.CanonicalName())
+}
+
+// typeModPrecision is a type modifier's precision, 0 when it has none (an interval qualifier).
+func typeModPrecision(tm *typeMod) uint64 {
+	if tm.Precision == nil {
+		return 0
+	}
+	return *tm.Precision
+}
+
+// validateTemporalTypmod validates a timestamp(p) / timestamptz(p) / interval type modifier
+// (spec/design/timestamp.md §8, interval.md §6.1). A precision above 6 is reduced to 6, as
+// PostgreSQL does (it also warns; jed has no warning channel). A second modifier
+// (`timestamp(3, 1)`) is 42601. The parser attaches a field qualifier only to interval, and never a
+// negative precision (42601 there).
+func validateTemporalTypmod(tm *typeMod) (*temporalTypmod, error) {
+	if tm.Scale != nil {
+		return nil, newError(SyntaxError, "a timestamp or interval takes at most one precision")
+	}
+	out := temporalTypmod{Fields: tm.IntervalFields, Precision: noTemporalPrecision}
+	if tm.Precision != nil {
+		p := *tm.Precision
+		if p > maxTimestampPrecision {
+			p = maxTimestampPrecision
+		}
+		out.Precision = uint8(p)
+	}
+	return &out, nil
 }
 
 // validateVarcharTypmod validates a varchar(n) type modifier: 1 <= n <= 10485760 (PostgreSQL's
@@ -1054,7 +1090,7 @@ func validateVarcharTypmod(tm *typeMod) (*uint32, error) {
 	if tm.Scale != nil {
 		return nil, newError(SyntaxError, "varchar takes exactly one type modifier (a length)")
 	}
-	n := tm.Precision
+	n := typeModPrecision(tm)
 	if n < 1 {
 		return nil, newError(InvalidParameterValue, "length for type varchar must be at least 1")
 	}
@@ -1069,7 +1105,7 @@ func validateVarcharTypmod(tm *typeMod) (*uint32, error) {
 // validateDecimalTypmod validates a decimal numeric(p[,s]) type modifier: 1 <= p <= 1000,
 // 0 <= s <= p; else trap 22023 (spec/design/decimal.md §2). numeric(p) means scale 0.
 func validateDecimalTypmod(tm *typeMod) (*decimalTypmod, error) {
-	p := tm.Precision
+	p := typeModPrecision(tm)
 	if p < 1 || p > maxPrecision {
 		return nil, newError(InvalidParameterValue,
 			fmt.Sprintf("NUMERIC precision %d must be between 1 and %d", p, maxPrecision))
@@ -1448,7 +1484,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			out = TextValue(s)
 		} else {
-			out, err = evalCast(v, e.result, e.typmod)
+			out, err = evalCast(v, e.result, e.typmod, e.temporal)
 			if err != nil {
 				return Value{}, err
 			}
@@ -1533,7 +1569,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				newElems[i] = TextValue(s)
 				continue
 			}
-			ce, err := evalCast(el, scalar, nil)
+			ce, err := evalCast(el, scalar, nil, nil)
 			if err != nil {
 				return Value{}, err
 			}
@@ -4672,7 +4708,7 @@ func scalarToText(v Value, env *evalEnv, m *costMeter) (string, error) {
 // evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
-func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) {
+func evalCast(v Value, target scalarType, typmod *decimalTypmod, temporal *temporalTypmod) (Value, error) {
 	// The JSON cast matrix (spec/design/json.md §6.1): text → json validates + stores verbatim
 	// (22P02 on malformed); text → jsonb parses + canonicalizes.
 	if v.Kind == ValText {
@@ -4699,9 +4735,15 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 			return UuidValue(b), nil
 		}
 		// text → interval / bytea (types.md §5): the literal's own input per row — parseInterval
-		// (22007/22008) and the bytea input — `\x` hex or escape format (22P02).
+		// (22007/22008) and the bytea input — `\x` hex or escape format (22P02). A runtime text is
+		// read WITHOUT the qualifier and then cut to it, as PostgreSQL's CoerceViaIO + interval_scale
+		// does (interval.md §6.1) — only a literal or an assigned/record string is read under the
+		// qualifier.
 		if target.IsInterval() {
 			iv, err := parseInterval(v.str())
+			if err == nil {
+				iv, err = adjustIntervalTypmod(iv, temporal)
+			}
 			if err != nil {
 				return Value{}, err
 			}
@@ -4756,6 +4798,29 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 			return Value{}, err
 		}
 		return IntValue(n), nil
+	}
+	// timestamp(p) / timestamptz(p) / a qualified interval over a value already of the type (the
+	// typmod scaling cast — timestamp.md §8, interval.md §6.1).
+	if v.Kind == ValTimestamp && target.IsTimestamp() {
+		m, err := adjustTimestampTypmod(v.Int, temporal)
+		if err != nil {
+			return Value{}, err
+		}
+		return TimestampValue(m), nil
+	}
+	if v.Kind == ValTimestamptz && target.IsTimestamptz() {
+		m, err := adjustTimestampTypmod(v.Int, temporal)
+		if err != nil {
+			return Value{}, err
+		}
+		return TimestamptzValue(m), nil
+	}
+	if v.Kind == ValInterval && target.IsInterval() {
+		iv, err := adjustIntervalTypmod(v.interval(), temporal)
+		if err != nil {
+			return Value{}, err
+		}
+		return IntervalValue(iv), nil
 	}
 	// uuid → bytea (the 16 raw bytes) — the uuid cast slice (casts.toml/types.md §14). uuid → text
 	// is scalarToText.

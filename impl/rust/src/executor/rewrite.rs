@@ -530,6 +530,7 @@ pub(crate) fn substitute_body_columns(
                 typmod: None,
                 varchar_len: None,
                 trap: TrapClass::None,
+                temporal: None,
             },
         })
     })
@@ -746,12 +747,14 @@ fn map_pushdown_safe(e: &RExpr, column: &dyn Fn(usize) -> Option<RExpr>) -> Opti
             typmod,
             varchar_len,
             trap,
+            temporal,
         } => RExpr::Cast {
             inner: boxed(inner)?,
             target: *target,
             typmod: typmod.clone(),
             varchar_len: *varchar_len,
             trap: *trap,
+            temporal: *temporal,
         },
         RExpr::ScalarFunc { func, args, result } => RExpr::ScalarFunc {
             func: *func,

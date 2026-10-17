@@ -44,6 +44,7 @@ const field = (name: string, type: ColType): ColField => ({
   type,
   typmod: null,
   varcharLen: null,
+  temporal: null,
   notNull: false,
 });
 

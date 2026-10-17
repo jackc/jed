@@ -247,7 +247,10 @@ jed_columns(
 **The canonical `type` text** (a compatibility surface from the moment it ships; every
 renderable type is pinned in `suites/introspection/jed_columns.test`): the scalar's canonical
 name (`i32`, `text`, `boolean`, `decimal`, `f64`, `jsonb`, …) with the **typmod applied at the
-leaf** — `varchar(10)`, `decimal(8,2)`; a composite renders **its name as created**; a range its
+leaf** — `varchar(10)`, `decimal(8,2)`, and PostgreSQL's `format_type` modifier spelling for the
+temporal typmods: `timestamp(3)`, `timestamptz(0)`, `interval day to second(3)`, `interval(2)`,
+`interval year` (timestamp.md §8, interval.md §6.1; pinned in
+`suites/introspection/temporal_typmod.test`); a composite renders **its name as created**; a range its
 canonical id from ranges.toml (`i32range`, `numrange`, …); an array appends `[]` to its element's
 rendering (`i32[]`, `addr[]` — and when the element-typmod narrowing lifts, `varchar(5)[]`).
 

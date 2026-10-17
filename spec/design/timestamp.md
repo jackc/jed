@@ -274,3 +274,52 @@ comparable value (always definite).
    `timestamp × timestamptz` is `42804`.
 10. **Resolve-time parse** — a bad literal in `WHERE` traps before any scan, deterministically,
     like `bytea`.
+11. **Typmod rounding epoch** — `timestamp(p)` rounds half away from zero measured from
+    PostgreSQL's 2000-01-01 epoch, not jed's 1970 one (§8): shift by `946684800 × 10⁶` µs, round,
+    shift back. Rounding from 1970 would round `1985-06-01 12:00:00.5` the wrong way.
+
+## 8. Precision typmods — `timestamp(p)` / `timestamptz(p)`
+
+A `timestamp` / `timestamptz` column, composite field, or cast target may declare a **precision**
+`p`, the number of fractional-second digits kept (`timestamp(3)`, `timestamptz(0)`). It is a type
+**modifier**, not a new type — the type, comparison, key encoding, and value codec are unchanged —
+carried beside the column like `numeric(p,s)` and `varchar(n)`
+([types.md](types.md) §12/§15). PostgreSQL's semantics throughout (CLAUDE.md §1):
+
+- **Range.** `0 ≤ p ≤ 6`. A larger `p` is reduced to 6, as PostgreSQL does (`timestamp(9)` is
+  `timestamp(6)`); PostgreSQL also emits a *warning*, which jed, having no warning channel, does not
+  (the same silent-where-PG-notices rule as grammar.md §13). The modifier is an unsigned integer
+  literal, so `timestamp(-1)` is `42601` (PostgreSQL agrees for `timestamp`; for the generic
+  `timestamptz(-1)` spelling it reports `22023` — jed reports `42601` for both). A second modifier
+  (`timestamp(3, 1)`) is `42601`. `timestamp(6)` is kept as written (`jed_columns` shows
+  `timestamp(6)`), though it never changes a value.
+- **Rounding, not truncation** — PostgreSQL's `AdjustTimestampForTypmod`: the microsecond count is
+  rounded **half away from zero** to `10^(6−p)` µs, the sign taken relative to **2000-01-01**
+  (PostgreSQL's epoch): after it a half rounds up (`2005-06-01 12:00:00.5` → `12:00:01`), before
+  it down (`1985-06-01 12:00:00.5` → `12:00:00`). Rounding carries into every field
+  (`2009-12-31 23:59:59.95`::`timestamp(1)` is `2010-01-01 00:00:00`). `±infinity` passes through. A
+  rounding that leaves jed's range (§1) or lands on an infinity sentinel is `22008`.
+- **Where it applies** — everywhere PostgreSQL applies a typmod: a string literal adapting to a
+  `timestamp(p)` column, a `'…'::timestamp(p)` / `CAST('…' AS timestamp(p))` literal (folded at
+  resolve), a runtime value cast to `timestamp(p)` (from `timestamp`, `timestamptz`, `date`, or
+  `text` — a scaling `Cast` over the conversion, one extra `operator_eval`), every value stored by
+  `INSERT` / `UPDATE` / `INSERT … SELECT` (the assignment re-rounds, so `ts + interval '0.006
+  seconds'` stays at `p` digits), a constant `DEFAULT` (stored rounded), a composite field
+  (`ROW(…)` and the `'(…)'` record text), and `ALTER COLUMN … TYPE timestamp(p)` (existing values are
+  re-cast). Arithmetic and function results carry no typmod, exactly as in PostgreSQL.
+- **Typmod tracking** — a query output keeps the typmod a column reference, a `::timestamp(p)` cast,
+  a `CASE`/`COALESCE`/`GREATEST`/`LEAST` or set operation whose inputs all agree, a scalar subquery,
+  or a composite field carries ([create-table-as.md](create-table-as.md) §2), so `CREATE TABLE … AS`
+  keeps it. `jed_columns.type` shows PostgreSQL's `format_type` modifier on jed's canonical name
+  (`timestamp(3)`, `timestamptz(0)` — [introspection.md](introspection.md) §5).
+- **Not supported** — the multi-word `timestamp(p) with time zone` spelling (jed has no multi-word
+  `timestamp … time zone` name at all, grammar.md §36), the `TIMESTAMP(p) '…'` typed literal (the
+  `(` breaks the typed-literal lookahead; write `'…'::timestamp(p)`), `current_timestamp(p)` /
+  `localtimestamp(p)` (deferred, [grammar.ebnf](../grammar/grammar.ebnf)), and `timestamp(p)[]` (a
+  typmod on an array type stays `0A000`, the `varchar(n)[]` narrowing — [array.md](array.md) §12).
+- **On disk** (`format_version` 43, [format.md](../fileformat/format.md)): a `timestamp` /
+  `timestamptz` column entry or composite field appends one `u8` precision in its typmod slot,
+  `0xFF` for none. The value codec is unchanged — a value is rounded before it is encoded.
+
+Pinned by suites/types/timestamp_precision.test (oracle-checked) and
+suites/introspection/temporal_typmod.test (catalog text, CTAS, ALTER, DEFAULT).

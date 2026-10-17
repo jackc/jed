@@ -4,7 +4,7 @@
 // a decimal column coerces to the typmod (rounds, precision-checks → 22003); a boolean into a
 // boolean column is accepted as-is; a cross-family value (decimal→int, text→int, etc.) is 42804.
 import type { ArrayInResult, Value } from "./value.ts";
-import type { DecimalTypmod, ScalarType } from "./types.ts";
+import type { DecimalTypmod, ScalarType, TemporalTypmod } from "./types.ts";
 import { EngineError, engineError, notNullViolation } from "./errors.ts";
 import { ASSIGNMENT_MISMATCH } from "./error_hint.ts";
 import {
@@ -60,9 +60,15 @@ import {
   decodeByteaLiteral,
   decodeUuidLiteral,
 } from "./executor.ts";
-import { NEG_INFINITY, POS_INFINITY, parseTimestamp, parseTimestamptzInput } from "./timestamp.ts";
+import {
+  NEG_INFINITY,
+  POS_INFINITY,
+  adjustTimestampForTypmod,
+  parseTimestamp,
+  parseTimestamptzInput,
+} from "./timestamp.ts";
 import { DATE_NEG_INFINITY, DATE_POS_INFINITY, dateClockSpecial, parseDate } from "./date.ts";
-import { parseInterval, tsShift } from "./interval.ts";
+import { adjustIntervalForTypmod, parseIntervalTypmod, tsShift } from "./interval.ts";
 import { jsonbIn, jsonbOut, validateJson } from "./json.ts";
 import type { BinaryOp, InsertValue, Literal } from "./ast.ts";
 import type { ColField, ColType } from "./catalog.ts";
@@ -80,6 +86,7 @@ export function storeValue(
   colTy: ScalarType,
   typmod: DecimalTypmod | null,
   varcharLen: number | null,
+  temporal: TemporalTypmod | null,
   notNull: boolean,
   colName: string,
   iz: InputZone,
@@ -137,13 +144,19 @@ export function storeValue(
       if (isBytea(colTy)) return byteaValue(decodeByteaLiteral(v.text));
       // ... and to a uuid column via the PG-flexible uuid input (types.md §6/§14); 22P02 on bad input.
       if (isUuid(colTy)) return uuidValue(decodeUuidLiteral(v.text));
-      // ... or to a timestamp column (spec/design/timestamp.md); bad input traps 22007/22008.
-      if (isTimestamp(colTy)) return timestampValue(parseTimestamp(v.text));
+      // ... or to a timestamp column (spec/design/timestamp.md); bad input traps 22007/22008. A
+      // timestamp(p) column rounds it (§8).
+      if (isTimestamp(colTy)) {
+        return timestampValue(adjustTimestampTypmod(parseTimestamp(v.text), temporal));
+      }
       // An offset-less string reads in the session zone (timezones.md §9.3).
-      if (isTimestamptz(colTy)) return timestamptzValue(iz.parseTimestamptz(v.text));
+      if (isTimestamptz(colTy)) {
+        return timestamptzValue(adjustTimestampTypmod(iz.parseTimestamptz(v.text), temporal));
+      }
       if (isDate(colTy)) return dateValue(parseDate(v.text));
-      // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008.
-      if (isInterval(colTy)) return intervalValue(parseInterval(v.text));
+      // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008. A
+      // qualified column reads it under its qualifier and cuts it (§6.1).
+      if (isInterval(colTy)) return intervalValue(parseIntervalTypmod(v.text, temporal));
       // ... or to a float column via float's input parse (the float8in spellings — sign/digits/
       // e-notation/Infinity/NaN; spec/design/float.md §4); malformed → 22P02, out of range → 22003.
       // So `INSERT ... VALUES ('NaN')` works (a bare decimal literal cannot spell NaN/Infinity).
@@ -172,12 +185,12 @@ export function storeValue(
         "cannot store a uuid value in " + canonicalName(colTy) + " column " + colName,
       );
     case "timestamp":
-      if (isTimestamp(colTy)) return v;
+      if (isTimestamp(colTy)) return timestampValue(adjustTimestampTypmod(v.micros, temporal));
       throw typeError(
         "cannot store a timestamp value in " + canonicalName(colTy) + " column " + colName,
       );
     case "timestamptz":
-      if (isTimestamptz(colTy)) return v;
+      if (isTimestamptz(colTy)) return timestamptzValue(adjustTimestampTypmod(v.micros, temporal));
       throw typeError(
         "cannot store a timestamptz value in " + canonicalName(colTy) + " column " + colName,
       );
@@ -187,7 +200,7 @@ export function storeValue(
         "cannot store a date value in " + canonicalName(colTy) + " column " + colName,
       );
     case "interval":
-      if (isInterval(colTy)) return v;
+      if (isInterval(colTy)) return intervalValue(adjustIntervalTypmod(v.iv, temporal));
       throw typeError(
         "cannot store an interval value in " + canonicalName(colTy) + " column " + colName,
       );
@@ -215,6 +228,19 @@ export function storeValue(
         "cannot store a boolean value in " + canonicalName(colTy) + " column " + colName,
       );
   }
+}
+
+// adjustTimestampTypmod rounds a timestamp / timestamptz to a timestamp(p) typmod (timestamp.md
+// §8); no typmod (or no precision) passes it through.
+export function adjustTimestampTypmod(m: bigint, tm: TemporalTypmod | null): bigint {
+  if (tm === null || tm.precision === null) return m;
+  return adjustTimestampForTypmod(m, tm.precision);
+}
+
+// adjustIntervalTypmod cuts an interval to its qualifier and precision typmod (interval.md §6.1);
+// no typmod passes it through.
+export function adjustIntervalTypmod(iv: Interval, tm: TemporalTypmod | null): Interval {
+  return tm === null ? iv : adjustIntervalForTypmod(iv, tm);
 }
 
 // coerceDecimal coerces a decimal into a column's typmod: round to the declared scale and
@@ -277,12 +303,13 @@ export function coerceForStore(
   ty: ColType,
   typmod: DecimalTypmod | null,
   varcharLen: number | null,
+  temporal: TemporalTypmod | null,
   notNull: boolean,
   colName: string,
   iz: InputZone,
 ): Value {
   if (ty.kind === "scalar")
-    return storeValue(v, ty.scalar, typmod, varcharLen, notNull, colName, iz);
+    return storeValue(v, ty.scalar, typmod, varcharLen, temporal, notNull, colName, iz);
   if (ty.kind === "array") return storeArray(v, ty.elem, notNull, colName, iz);
   if (ty.kind === "range") return storeRange(v, ty.elem, notNull, colName, iz);
   return storeComposite(v, ty.name, ty.fields, notNull, colName, iz);
@@ -313,7 +340,7 @@ export function storeRange(
   }
   if (v.empty) return v;
   const coerce = (b: Value | null): Value | null =>
-    b === null ? null : coerceForStore(b, elem, null, null, false, colName, iz);
+    b === null ? null : coerceForStore(b, elem, null, null, null, false, colName, iz);
   return rangeValue(coerce(v.lower), coerce(v.upper), v.lowerInc, v.upperInc);
 }
 
@@ -338,7 +365,9 @@ export function storeArray(
   }
   // Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[] deferred).
   // The shape (dims/lbounds) is preserved.
-  const out = v.elements.map((el) => coerceForStore(el, elem, null, null, false, colName, iz));
+  const out = v.elements.map((el) =>
+    coerceForStore(el, elem, null, null, null, false, colName, iz),
+  );
   return { kind: "array", dims: v.dims, lbounds: v.lbounds, elements: out };
 }
 
@@ -378,7 +407,16 @@ export function storeComposite(
   const out: Value[] = new Array(fields.length);
   for (let i = 0; i < fields.length; i++) {
     const f = fields[i]!;
-    out[i] = coerceForStore(v.fields[i]!, f.type, f.typmod, f.varcharLen, f.notNull, f.name, iz);
+    out[i] = coerceForStore(
+      v.fields[i]!,
+      f.type,
+      f.typmod,
+      f.varcharLen,
+      f.temporal,
+      f.notNull,
+      f.name,
+      iz,
+    );
   }
   return compositeValue(out);
 }
@@ -542,7 +580,7 @@ export function coerceArrayElementText(tok: string, elem: ColType, iz: InputZone
   // element ColType is never a range.
   if (elem.kind === "range")
     throw new Error("array-of-range is not a storable type (ranges.md §2)");
-  const { node } = coerceStringLiteral(tok, elem.scalar, null, null, iz);
+  const { node } = coerceStringLiteral(tok, elem.scalar, null, null, null, iz);
   return rexprConstToValue(node);
 }
 
@@ -575,7 +613,14 @@ export function coerceRecordTextToValue(
       if (desc === undefined) throw new Error("a range field's element always has a range type");
       return coerceStringToRange(tok, desc, iz);
     }
-    const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod, f.varcharLen, iz);
+    const { node } = coerceStringLiteral(
+      tok,
+      f.type.scalar,
+      f.typmod,
+      f.varcharLen,
+      f.temporal,
+      iz,
+    );
     return rexprConstToValue(node);
   });
   return compositeValue(vals);

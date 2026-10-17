@@ -186,3 +186,37 @@ date = [
   { token = "y", type = "units", value = "year" },
   { token = "yesterday", type = "reserv", value = "yesterday" },
 ]
+
+# The SQL interval field qualifiers (`interval YEAR TO MONTH`, `interval '1' DAY`, `SECOND(p)` —
+# ../design/interval.md §6.1): PostgreSQL's thirteen `opt_interval` forms (gram.y) and what
+# `DecodeInterval` / `AdjustIntervalForTypmod` (timestamp.c) do with each. A qualifier is part of an
+# interval column's or cast target's type modifier, so `code` is persisted (the column entry's
+# `interval_fields` byte, ../fileformat/format.md) and must never be renumbered; 0 means "no
+# qualifier" and is not listed.
+#
+# code   the stable on-disk code, 1..13, listed in ascending order.
+# name   the qualifier as written and as displayed (lowercase, single spaces): `year`,
+#        `day to second`, … — the `jed_columns` type text is `interval <name>` (PostgreSQL's
+#        format_type spelling), with `(p)` after it when a precision is declared.
+# least  the least-significant field the qualifier keeps. It decides both behaviors: a unitless
+#        number in the input takes this unit (`interval '5' DAY` is 5 days), and the value is cut
+#        below it (YEAR keeps whole years and zeroes days and time; MONTH zeroes days and time; DAY
+#        zeroes the time; HOUR and MINUTE truncate the time toward zero). A `second` qualifier cuts
+#        nothing, and only a qualifier whose least field is `second` may carry a precision.
+# mm_ss  true only for `minute to second`: a two-field time `a:b` reads as minutes:seconds rather
+#        than hours:minutes.
+interval_qualifier = [
+  { code = 1, name = "year", least = "year" },
+  { code = 2, name = "month", least = "month" },
+  { code = 3, name = "day", least = "day" },
+  { code = 4, name = "hour", least = "hour" },
+  { code = 5, name = "minute", least = "minute" },
+  { code = 6, name = "second", least = "second" },
+  { code = 7, name = "year to month", least = "month" },
+  { code = 8, name = "day to hour", least = "hour" },
+  { code = 9, name = "day to minute", least = "minute" },
+  { code = 10, name = "day to second", least = "second" },
+  { code = 11, name = "hour to minute", least = "minute" },
+  { code = 12, name = "hour to second", least = "second" },
+  { code = 13, name = "minute to second", least = "second", mm_ss = true },
+]

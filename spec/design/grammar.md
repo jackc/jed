@@ -324,9 +324,16 @@ With `decimal` the rule gains an **optional parenthesized type modifier** —
 `type_name ::= identifier ("(" integer ("," integer)? ")")?` — the engine's **first
 parameterized type**. The grammar accepts the typmod *shape* for any type name (it is one
 production), but the **semantics** are owned by resolution: a typmod is meaningful only for
-`decimal`/`numeric` (precision, optional scale; §14), and a typmod on a type that takes
-none — `i32(5)` — is rejected at resolve. Empty parens (`numeric()`) and a non-integer
-inside are `42601`. This mirrors §6's standing split: the grammar stays small and
+`decimal`/`numeric` (precision, optional scale; §14), `varchar(n)` ([types.md](types.md) §15),
+and `timestamp(p)` / `timestamptz(p)` ([timestamp.md](timestamp.md) §8), and a typmod on a type
+that takes none — `i32(5)` — is rejected at resolve. Empty parens (`numeric()`) and a non-integer
+inside are `42601`. The one type whose modifier is not parenthesized is `interval`: after it the
+parser reads PostgreSQL's `opt_interval` — one of the thirteen field qualifiers (`YEAR`,
+`DAY TO SECOND`, …, shared data in [datetime_units.toml](../types/datetime_units.toml)), with an
+optional `(p)` after a trailing `SECOND` — or a bare `(p)`, never both; an invalid `TO` pairing is
+`42601` ([interval.md](interval.md) §6.1). The field words are read as a qualifier only right
+after the type word (so `SELECT interval '1' day` is a qualified literal, not an alias `day`, as in
+PostgreSQL) and stay non-reserved everywhere else. This mirrors §6's standing split: the grammar stays small and
 permissive about *shape*, the type system enforces *meaning*.
 
 ## 7. Growth rule
@@ -2789,8 +2796,10 @@ value literals, so `true 'x'` is not `CAST('x' AS true)`.)
   **`NaN` / `±Infinity`** (`numeric 'NaN'` — jed's decimal is always finite,
   [decimal.md](decimal.md) §2), which traps `22P02` where PG accepts it.
 - jed uses the **canonical single-word** type names: PG's multi-word `TIMESTAMP WITH TIME ZONE
-  '…'` and the **precision typmod** form `TIMESTAMP(p) '…'` / `NUMERIC(p,s) '…'` are not typed
-  literals here (a `(` after the name breaks the lookahead; typmod rides only on `CAST`).
+  '…'` and the **precision typmod** form `TIMESTAMP(p) '…'` / `INTERVAL(p) '…'` / `NUMERIC(p,s) '…'`
+  are not typed literals here (a `(` after the name breaks the lookahead; typmod rides only on
+  `CAST` / `::`). The **trailing interval qualifier** form `INTERVAL '1' DAY TO SECOND` *is*
+  accepted — it is `CAST('1' AS interval DAY TO SECOND)` ([interval.md](interval.md) §6.1).
 - **ISO-8601 / SQL-standard combined interval forms** inside `INTERVAL '…'` remain deferred
   ([interval.md](interval.md) §3) — a parse-subset gap, not a literal-syntax one.
 

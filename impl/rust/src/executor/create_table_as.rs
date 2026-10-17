@@ -203,6 +203,7 @@ impl Engine {
                 ty,
                 decimal: typmod.decimal,
                 varchar_len: typmod.varchar_len,
+                temporal: typmod.temporal,
                 primary_key: false,
                 not_null: false,
                 default: None,

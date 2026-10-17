@@ -3105,7 +3105,7 @@ func rexprEqShifted(a, b *rExpr, offset int) bool {
 			rexprEqShifted(a.rhs, b.rhs, offset)
 	case reCast:
 		// A scalar cast, no typmod / varchar(n) (those would change the value's byte form).
-		return a.typmod == nil && b.typmod == nil && a.varchar == nil && b.varchar == nil &&
+		return a.typmod == nil && b.typmod == nil && a.varchar == nil && b.varchar == nil && a.temporal == nil && b.temporal == nil &&
 			a.result == b.result && rexprEqShifted(a.operand, b.operand, offset)
 	case reNeg:
 		return rexprEqShifted(a.operand, b.operand, offset)

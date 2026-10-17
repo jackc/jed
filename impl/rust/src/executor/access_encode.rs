@@ -5552,6 +5552,7 @@ pub(crate) fn rexpr_eq_shifted(a: &RExpr, b: &RExpr, offset: usize) -> bool {
                 target: ta,
                 typmod: None,
                 varchar_len: None,
+                temporal: None,
                 ..
             },
             Cast {
@@ -5559,6 +5560,7 @@ pub(crate) fn rexpr_eq_shifted(a: &RExpr, b: &RExpr, offset: usize) -> bool {
                 target: tb,
                 typmod: None,
                 varchar_len: None,
+                temporal: None,
                 ..
             },
         ) => ta == tb && rexpr_eq_shifted(ia, ib, offset),

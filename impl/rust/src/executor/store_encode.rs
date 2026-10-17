@@ -13,24 +13,8 @@ impl AssignPlan {
     /// decimal→int implicitly).
     pub(crate) fn check(&self, v: Value, iz: &InputZone) -> Result<Value> {
         match &self.col_type {
-            Some(ct) => coerce_for_store(
-                v,
-                ct,
-                self.decimal,
-                self.varchar_len,
-                self.not_null,
-                &self.name,
-                iz,
-            ),
-            None => store_value(
-                v,
-                self.target,
-                self.decimal,
-                self.varchar_len,
-                self.not_null,
-                &self.name,
-                iz,
-            ),
+            Some(ct) => coerce_for_store(v, ct, self.typmod, self.not_null, &self.name, iz),
+            None => store_value(v, self.target, self.typmod, self.not_null, &self.name, iz),
         }
     }
 }
@@ -43,12 +27,13 @@ impl AssignPlan {
 pub(crate) fn store_value(
     v: Value,
     col_ty: ScalarType,
-    typmod: Option<DecimalTypmod>,
-    varchar_len: Option<u32>,
+    tm: Typmod,
     not_null: bool,
     col_name: &str,
     iz: &InputZone,
 ) -> Result<Value> {
+    let typmod = tm.decimal;
+    let varchar_len = tm.varchar_len;
     match v {
         Value::Null => {
             if not_null {
@@ -109,15 +94,26 @@ pub(crate) fn store_value(
                 Ok(Value::Uuid(decode_uuid_literal(&s)?))
             } else if col_ty.is_timestamp() {
                 // A string literal adapts to a timestamp column (spec/design/timestamp.md);
-                // malformed input traps 22007, an out-of-range field 22008.
-                Ok(Value::Timestamp(parse_timestamp(&s)?))
+                // malformed input traps 22007, an out-of-range field 22008. A `timestamp(p)`
+                // column rounds it (§8).
+                Ok(Value::Timestamp(adjust_timestamp_typmod(
+                    parse_timestamp(&s)?,
+                    tm.temporal,
+                )?))
             } else if col_ty.is_timestamptz() {
                 // An offset-less string reads in the session zone (timezones.md §9.3).
-                Ok(Value::Timestamptz(iz.parse_timestamptz(&s)?))
+                Ok(Value::Timestamptz(adjust_timestamp_typmod(
+                    iz.parse_timestamptz(&s)?,
+                    tm.temporal,
+                )?))
             } else if col_ty.is_interval() {
                 // A string literal adapts to an interval column (spec/design/interval.md);
-                // malformed input traps 22007, an out-of-range field 22008.
-                Ok(Value::Interval(parse_interval(&s)?))
+                // malformed input traps 22007, an out-of-range field 22008. A qualified column
+                // reads it under its qualifier and cuts it (§6.1).
+                Ok(Value::Interval(interval::parse_interval_typmod(
+                    &s,
+                    tm.temporal,
+                )?))
             } else if col_ty.is_date() {
                 // A string literal adapts to a date column (spec/design/date.md); malformed
                 // input traps 22007, an out-of-range field 22008.
@@ -167,7 +163,7 @@ pub(crate) fn store_value(
         }
         Value::Timestamp(m) => {
             if col_ty.is_timestamp() {
-                Ok(Value::Timestamp(m))
+                Ok(Value::Timestamp(adjust_timestamp_typmod(m, tm.temporal)?))
             } else {
                 Err(type_error(format!(
                     "cannot store a timestamp value in {} column {col_name}",
@@ -177,7 +173,7 @@ pub(crate) fn store_value(
         }
         Value::Timestamptz(m) => {
             if col_ty.is_timestamptz() {
-                Ok(Value::Timestamptz(m))
+                Ok(Value::Timestamptz(adjust_timestamp_typmod(m, tm.temporal)?))
             } else {
                 Err(type_error(format!(
                     "cannot store a timestamptz value in {} column {col_name}",
@@ -197,7 +193,7 @@ pub(crate) fn store_value(
         }
         Value::Interval(iv) => {
             if col_ty.is_interval() {
-                Ok(Value::Interval(iv))
+                Ok(Value::Interval(adjust_interval_typmod(iv, tm.temporal)?))
             } else {
                 Err(type_error(format!(
                     "cannot store an interval value in {} column {col_name}",
@@ -299,14 +295,13 @@ pub(crate) fn store_value(
 pub(crate) fn coerce_for_store(
     v: Value,
     ty: &ColType,
-    typmod: Option<DecimalTypmod>,
-    varchar_len: Option<u32>,
+    tm: Typmod,
     not_null: bool,
     col_name: &str,
     iz: &InputZone,
 ) -> Result<Value> {
     match ty {
-        ColType::Scalar(s) => store_value(v, *s, typmod, varchar_len, not_null, col_name, iz),
+        ColType::Scalar(s) => store_value(v, *s, tm, not_null, col_name, iz),
         ColType::Composite { name, fields } => {
             store_composite(v, name, fields, not_null, col_name, iz)
         }
@@ -345,7 +340,12 @@ pub(crate) fn store_range(
                 match b {
                     None => Ok(None),
                     Some(val) => Ok(Some(Box::new(coerce_for_store(
-                        *val, elem, None, None, false, col_name, iz,
+                        *val,
+                        elem,
+                        Typmod::NONE,
+                        false,
+                        col_name,
+                        iz,
                     )?))),
                 }
             };
@@ -387,7 +387,12 @@ pub(crate) fn store_array(
                 // Elements are nullable (not_null = false); the element typmod is unconstrained
                 // this slice (numeric(p,s)[] and varchar(n)[] are deferred — §12, types.md §15).
                 out.push(coerce_for_store(
-                    val, elem, None, None, false, col_name, iz,
+                    val,
+                    elem,
+                    Typmod::NONE,
+                    false,
+                    col_name,
+                    iz,
                 )?);
             }
             Ok(Value::Array(ArrayVal {
@@ -435,8 +440,7 @@ pub(crate) fn store_composite(
                 out.push(coerce_for_store(
                     val,
                     &f.ty,
-                    f.typmod,
-                    f.varchar_len,
+                    Typmod::of_col_field(f),
                     f.not_null,
                     &f.name,
                     iz,
@@ -447,6 +451,24 @@ pub(crate) fn store_composite(
         _ => Err(type_error(format!(
             "cannot store a non-record value in composite column {col_name} (type {type_name})"
         ))),
+    }
+}
+
+/// Round a timestamp / timestamptz to a `timestamp(p)` typmod (timestamp.md §8); no typmod (or no
+/// precision) passes it through.
+pub(crate) fn adjust_timestamp_typmod(m: i64, tm: Option<TemporalTypmod>) -> Result<i64> {
+    match tm.and_then(|t| t.precision) {
+        Some(p) => crate::timestamp::adjust_timestamp_for_typmod(m, p),
+        None => Ok(m),
+    }
+}
+
+/// Cut an interval to its qualifier and precision typmod (interval.md §6.1); no typmod passes it
+/// through.
+pub(crate) fn adjust_interval_typmod(iv: Interval, tm: Option<TemporalTypmod>) -> Result<Interval> {
+    match tm {
+        Some(t) => interval::adjust_interval_for_typmod(iv, t),
+        None => Ok(iv),
     }
 }
 
@@ -846,7 +868,7 @@ pub(crate) fn coerce_array_element_text(
 ) -> Result<Value> {
     match elem {
         ColType::Scalar(s) => {
-            let (node, _) = coerce_string_literal(tok, *s, None, None, iz)?;
+            let (node, _) = coerce_string_literal(tok, *s, Typmod::NONE, iz)?;
             rexpr_const_to_value(&node)
         }
         ColType::Composite { name, fields } => coerce_record_text(tok, name, fields, iz),
@@ -885,7 +907,7 @@ pub(crate) fn coerce_record_text(
             None => vals.push(Value::Null),
             Some(s) => vals.push(match &f.ty {
                 ColType::Scalar(sc) => {
-                    let (node, _) = coerce_string_literal(&s, *sc, f.typmod, f.varchar_len, iz)?;
+                    let (node, _) = coerce_string_literal(&s, *sc, Typmod::of_col_field(f), iz)?;
                     rexpr_const_to_value(&node)?
                 }
                 ColType::Composite {

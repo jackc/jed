@@ -3,7 +3,7 @@
 
 # Codegen "middle path" (CLAUDE.md §5): generate the per-language datetime unit-name tables
 # (PostgreSQL's `deltatktbl` and `datetktbl`) from the canonical spec/types/datetime_units.toml.
-# This emits the token DATA only — the lookup (ASCII case-fold, TOKMAXLEN truncation, binary
+# It also emits the SQL interval field-qualifier table (interval.md §6.1). This emits the DATA only — the lookup (ASCII case-fold, TOKMAXLEN truncation, binary
 # search) and what EXTRACT / date_part / date_trunc do with the result stay hand-written in each
 # core's datetime_fn. Build-time only; no shipped core runs Ruby or parses TOML.
 #
@@ -44,6 +44,8 @@ def load_tables
   max = data["token_max_len"]
   fail!("#{SRC}: token_max_len must be 10 (PostgreSQL's TOKMAXLEN)") unless max == 10
   tables = { "delta" => data["delta"], "date" => data["date"] }
+  quals = data["interval_qualifier"]
+  validate_qualifiers(quals)
   tables.each do |name, entries|
     fail!("#{SRC}: no #{name} entries") if entries.nil? || entries.empty?
     entries.each { |e| validate_entry(name, e, max) }
@@ -53,8 +55,27 @@ def load_tables
       fail!("#{name}: #{a.inspect} must sort before #{b.inspect}") unless a.b < b.b
     end
   end
-  [max, tables]
+  [max, tables.merge("qualifier" => quals)]
 end
+
+LEAST_FIELDS = %w[year month day hour minute second].freeze
+
+# The thirteen interval qualifiers: codes 1..13 in order (persisted, never renumbered), each name
+# a leading field or `<leading> to <trailing>` (single spaces), each least field one of the six.
+def validate_qualifiers(quals)
+  fail!("#{SRC}: expected 13 interval_qualifier entries") unless quals.is_a?(Array) && quals.length == 13
+  quals.each_with_index do |q, i|
+    fail!("interval_qualifier #{i}: code must be #{i + 1}") unless q["code"] == i + 1
+    unless q["name"].is_a?(String) && q["name"].match?(/\A[a-z]+( to [a-z]+)?\z/)
+      fail!("interval_qualifier #{q['code']}: bad name #{q['name'].inspect}")
+    end
+    fail!("interval_qualifier #{q['name']}: bad least #{q['least'].inspect}") unless LEAST_FIELDS.include?(q["least"])
+    fail!("interval_qualifier #{q['name']}: least must end the name") unless q["name"].end_with?(q["least"])
+    fail!("interval_qualifier #{q['name']}: mm_ss is a boolean") unless [nil, true, false].include?(q["mm_ss"])
+  end
+end
+
+def mm_ss(q) = q["mm_ss"] ? "true" : "false"
 
 def validate_entry(table, e, max)
   tok = e["token"]
@@ -114,6 +135,21 @@ def rust_file(max, tables)
     pub const DATE_TOKENS: &[DtToken] = &[
     #{tables['date'].map { |e| rust_entry(e) }.join("\n")}
     ];
+
+    /// One SQL interval field qualifier (interval.md §6.1): its persisted `code`, its `name` as
+    /// written and displayed, its least-significant kept field, and whether `a:b` reads as mm:ss.
+    pub struct IntervalQualifier {
+        pub code: u8,
+        pub name: &'static str,
+        pub least: &'static str,
+        pub mm_ss: bool,
+    }
+
+    /// The thirteen interval qualifiers, by ascending code (`INTERVAL_QUALIFIERS[code - 1]`).
+    #[rustfmt::skip]
+    pub const INTERVAL_QUALIFIERS: &[IntervalQualifier] = &[
+    #{tables['qualifier'].map { |q| %(    IntervalQualifier { code: #{q['code']}, name: "#{q['name']}", least: "#{q['least']}", mm_ss: #{mm_ss(q)} },) }.join("\n")}
+    ];
   RS
 end
 
@@ -156,6 +192,22 @@ def go_file(max, tables)
     var dtDateTokens = []dtToken{
     #{tables['date'].map { |e| go_entry(e) }.join("\n")}
     }
+
+    // intervalQualifier is one SQL interval field qualifier (interval.md §6.1): its persisted code,
+    // its name as written and displayed, its least-significant kept field, and whether a:b reads
+    // as mm:ss.
+    type intervalQualifier struct {
+    \tcode  uint8
+    \tname  string
+    \tleast string
+    \tmmSS  bool
+    }
+
+    // intervalQualifiers are the thirteen interval qualifiers, by ascending code
+    // (intervalQualifiers[code-1]).
+    var intervalQualifiers = []intervalQualifier{
+    #{tables['qualifier'].map { |q| %(\t{code: #{q['code']}, name: "#{q['name']}", least: "#{q['least']}", mmSS: #{mm_ss(q)}},) }.join("\n")}
+    }
   GO
 end
 
@@ -196,6 +248,20 @@ def ts_file(max, tables)
     export const DATE_TOKENS: readonly DtToken[] = [
     #{tables['date'].map { |e| ts_entry(e) }.join("\n")}
     ];
+
+    // One SQL interval field qualifier (interval.md §6.1): its persisted `code`, its `name` as
+    // written and displayed, its least-significant kept field, and whether `a:b` reads as mm:ss.
+    export interface IntervalQualifier {
+      code: number;
+      name: string;
+      least: string;
+      mmSS: boolean;
+    }
+
+    // The thirteen interval qualifiers, by ascending code (`INTERVAL_QUALIFIERS[code - 1]`).
+    export const INTERVAL_QUALIFIERS: readonly IntervalQualifier[] = [
+    #{tables['qualifier'].map { |q| %(  { code: #{q['code']}, name: "#{q['name']}", least: "#{q['least']}", mmSS: #{mm_ss(q)} },) }.join("\n")}
+    ];
   TS
 end
 
@@ -223,7 +289,8 @@ def main
     exit 1
   end
   puts "OK: #{TARGETS.length} generated files current " \
-       "(#{tables['delta'].length} delta tokens, #{tables['date'].length} date tokens)"
+       "(#{tables['delta'].length} delta tokens, #{tables['date'].length} date tokens, " \
+       "#{tables['qualifier'].length} interval qualifiers)"
 end
 
 main

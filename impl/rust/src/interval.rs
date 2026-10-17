@@ -10,6 +10,7 @@
 //! from zero — the engine's one mode), and the render format must be byte-identical across the
 //! Rust/Go/TS cores. All cascade arithmetic is exact integer math (no float in the value path).
 
+use crate::datetime_units_gen::{INTERVAL_QUALIFIERS, IntervalQualifier};
 use crate::error::{EngineError, Result, SqlState};
 use crate::timestamp;
 
@@ -1081,7 +1082,7 @@ fn adjust_years(val: i64, scale: i32, itm: &mut ItmIn) -> Dt<()> {
 /// PG's `DecodeTimeForInterval` (`DecodeTimeCommon`): a time field `H:M`, `H:M:S[.f]`, or
 /// `M:S.f` (two parts with a fraction are minutes and seconds). The time REPLACES `itm.usec`, as
 /// in PG — so a fractional unit to the time's left (read earlier) loses its µs part.
-fn decode_time_for_interval(s: &[u8], itm: &mut ItmIn) -> Dt<()> {
+fn decode_time_for_interval(s: &[u8], mm_ss: bool, itm: &mut ItmIn) -> Dt<()> {
     let (mut hour, n) = strtoi64(s)?;
     let mut cp = &s[n..];
     if cp.first() != Some(&b':') {
@@ -1092,6 +1093,15 @@ fn decode_time_for_interval(s: &[u8], itm: &mut ItmIn) -> Dt<()> {
     let mut sec: i32 = 0;
     let mut fsec: i64 = 0;
     match cp.first() {
+        // `a:b` under `MINUTE TO SECOND` is minutes:seconds (PG `DecodeTimeCommon`).
+        None if mm_ss => {
+            if i32::try_from(hour).is_err() {
+                return Err(DtErr::FieldOverflow);
+            }
+            sec = min;
+            min = hour as i32;
+            hour = 0;
+        }
         None => {}
         Some(b'.') => {
             // mm:ss.fff
@@ -1131,8 +1141,13 @@ fn decode_time_for_interval(s: &[u8], itm: &mut ItmIn) -> Dt<()> {
 /// left, so a unit word is met before the number it applies to. A number with no unit takes the
 /// last unit read: seconds at the right end, then whatever unit was read last — except that after an
 /// `hour` or a time field the next unitless number is days (`'1 1:00'`, `'5 1 hour'`). `N-M` is
-/// years-months. Returns whether the input was `infinity` / `-infinity`.
-fn decode_interval(fields: &[Field], itm: &mut ItmIn) -> Dt<bool> {
+/// years-months. A field qualifier (`range`, its datetime_units.toml code, 0 for none) gives the
+/// rightmost unitless number its least field's unit (`'5' DAY` is 5 days) and makes `a:b` read as
+/// mm:ss under `MINUTE TO SECOND` (interval.md §6.1). Returns whether the input was `infinity` /
+/// `-infinity`.
+fn decode_interval(fields: &[Field], range: u8, itm: &mut ItmIn) -> Dt<bool> {
+    let qual = qualifier(range);
+    let mm_ss = qual.is_some_and(|q| q.mm_ss);
     let mut is_before = false;
     let mut parsing_unit_val = false;
     let mut infinite = false;
@@ -1144,13 +1159,15 @@ fn decode_interval(fields: &[Field], itm: &mut ItmIn) -> Dt<bool> {
         let mut tmask: u32 = 0;
         let mut ftype = f.ftype;
         if ftype == FieldType::Time {
-            decode_time_for_interval(&f.text, itm)?;
+            decode_time_for_interval(&f.text, mm_ss, itm)?;
             tmask = FIELD_TIME;
             ty = DTK_DAY;
             parsing_unit_val = false;
         } else if ftype == FieldType::Tz {
             // A signed time (`-1:00`, `+02:03`) — else a signed number, read below.
-            if f.text[1..].contains(&b':') && decode_time_for_interval(&f.text[1..], itm).is_ok() {
+            if f.text[1..].contains(&b':')
+                && decode_time_for_interval(&f.text[1..], mm_ss, itm).is_ok()
+            {
                 if f.text[0] == b'-' {
                     itm.usec = itm.usec.checked_neg().ok_or(DtErr::FieldOverflow)?;
                 }
@@ -1165,7 +1182,15 @@ fn decode_interval(fields: &[Field], itm: &mut ItmIn) -> Dt<bool> {
             FieldType::Time | FieldType::Tz => {}
             FieldType::Number | FieldType::Date => {
                 if ty == IGNORE_DTF {
-                    ty = DTK_SECOND;
+                    // the qualifier's least field decides what the rightmost number is
+                    ty = match qual.map(|q| q.least) {
+                        Some("year") => DTK_YEAR,
+                        Some("month") => DTK_MONTH,
+                        Some("day") => DTK_DAY,
+                        Some("hour") => DTK_HOUR,
+                        Some("minute") => DTK_MINUTE,
+                        _ => DTK_SECOND,
+                    };
                 }
                 let s = &f.text[..];
                 let (mut val, n) = strtoi64(s)?;
@@ -1690,9 +1715,26 @@ fn decode_iso8601_interval(s: &[u8], itm: &mut ItmIn) -> Dt<()> {
 /// (spec/design/interval.md §3): the PostgreSQL / SQL-standard field syntax, else ISO 8601.
 /// Malformed input is 22007; a field beyond its range is 22008 (PG's 22015).
 pub fn parse_interval(input: &str) -> Result<Interval> {
+    parse_interval_ranged(input, 0)
+}
+
+/// Parse interval text for a target carrying a type modifier — PostgreSQL's `interval_in` with a
+/// typmod (interval.md §6.1): the qualifier steers the parse, then the value is cut to it and
+/// rounded to its precision ([`adjust_interval_for_typmod`]). `None` is plain [`parse_interval`].
+pub fn parse_interval_typmod(
+    input: &str,
+    typmod: Option<crate::types::TemporalTypmod>,
+) -> Result<Interval> {
+    match typmod {
+        None => parse_interval(input),
+        Some(tm) => adjust_interval_for_typmod(parse_interval_ranged(input, tm.fields)?, tm),
+    }
+}
+
+fn parse_interval_ranged(input: &str, range: u8) -> Result<Interval> {
     let b = input.as_bytes();
     let mut itm = ItmIn::default();
-    let mut res = parse_date_time(b).and_then(|fields| decode_interval(&fields, &mut itm));
+    let mut res = parse_date_time(b).and_then(|fields| decode_interval(&fields, range, &mut itm));
     if res == Err(DtErr::BadFormat) {
         res = decode_iso8601_interval(b, &mut itm).map(|()| false);
     }
@@ -1716,6 +1758,64 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
             })
         }
     }
+}
+
+// --- type modifiers (interval.md §6.1) ----------------------------------------
+
+/// The largest interval precision (PostgreSQL's `MAX_INTERVAL_PRECISION`); a larger declared
+/// precision is reduced to it.
+pub const MAX_INTERVAL_PRECISION: u8 = 6;
+
+/// The interval field qualifier with stable `code` (spec/types/datetime_units.toml), or `None` for
+/// code 0 (no qualifier) or an unknown code.
+pub fn qualifier(code: u8) -> Option<&'static IntervalQualifier> {
+    INTERVAL_QUALIFIERS.iter().find(|q| q.code == code)
+}
+
+/// The qualifier written as `name` (`"day to second"`), if it is one of the thirteen.
+pub fn qualifier_by_name(name: &str) -> Option<&'static IntervalQualifier> {
+    INTERVAL_QUALIFIERS.iter().find(|q| q.name == name)
+}
+
+/// Cut an interval to a type modifier — PostgreSQL's `AdjustIntervalForTypmod`: the fields below
+/// the qualifier's least field go (YEAR keeps whole years of the months and zeroes days and time;
+/// MONTH zeroes days and time; DAY zeroes the time; HOUR and MINUTE truncate the time toward zero —
+/// higher fields are kept), then the time rounds half away from zero to the precision. A rounding
+/// that overflows is 22008.
+pub fn adjust_interval_for_typmod(
+    iv: Interval,
+    typmod: crate::types::TemporalTypmod,
+) -> Result<Interval> {
+    let mut out = iv;
+    match qualifier(typmod.fields).map(|q| q.least) {
+        Some("year") => {
+            out.months = out.months / MONTHS_PER_YEAR as i32 * MONTHS_PER_YEAR as i32;
+            out.days = 0;
+            out.micros = 0;
+        }
+        Some("month") => {
+            out.days = 0;
+            out.micros = 0;
+        }
+        Some("day") => out.micros = 0,
+        Some("hour") => out.micros = out.micros / USECS_PER_HOUR * USECS_PER_HOUR,
+        Some("minute") => out.micros = out.micros / USECS_PER_MINUTE * USECS_PER_MINUTE,
+        _ => {}
+    }
+    if let Some(p) = typmod.precision
+        && p < MAX_INTERVAL_PRECISION
+    {
+        let scale = 10i64.pow(u32::from(MAX_INTERVAL_PRECISION - p));
+        let offset = scale / 2;
+        let shifted = if out.micros >= 0 {
+            out.micros.checked_add(offset)
+        } else {
+            out.micros.checked_sub(offset)
+        }
+        .ok_or_else(|| field_overflow("interval out of range"))?;
+        out.micros = shifted - shifted % scale;
+    }
+    Ok(out)
 }
 
 // --- rendering ---------------------------------------------------------------

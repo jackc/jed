@@ -160,3 +160,30 @@ pub const DATE_TOKENS: &[DtToken] = &[
     DtToken { token: "y", kind: "units", value: "year" },
     DtToken { token: "yesterday", kind: "reserv", value: "yesterday" },
 ];
+
+/// One SQL interval field qualifier (interval.md §6.1): its persisted `code`, its `name` as
+/// written and displayed, its least-significant kept field, and whether `a:b` reads as mm:ss.
+pub struct IntervalQualifier {
+    pub code: u8,
+    pub name: &'static str,
+    pub least: &'static str,
+    pub mm_ss: bool,
+}
+
+/// The thirteen interval qualifiers, by ascending code (`INTERVAL_QUALIFIERS[code - 1]`).
+#[rustfmt::skip]
+pub const INTERVAL_QUALIFIERS: &[IntervalQualifier] = &[
+    IntervalQualifier { code: 1, name: "year", least: "year", mm_ss: false },
+    IntervalQualifier { code: 2, name: "month", least: "month", mm_ss: false },
+    IntervalQualifier { code: 3, name: "day", least: "day", mm_ss: false },
+    IntervalQualifier { code: 4, name: "hour", least: "hour", mm_ss: false },
+    IntervalQualifier { code: 5, name: "minute", least: "minute", mm_ss: false },
+    IntervalQualifier { code: 6, name: "second", least: "second", mm_ss: false },
+    IntervalQualifier { code: 7, name: "year to month", least: "month", mm_ss: false },
+    IntervalQualifier { code: 8, name: "day to hour", least: "hour", mm_ss: false },
+    IntervalQualifier { code: 9, name: "day to minute", least: "minute", mm_ss: false },
+    IntervalQualifier { code: 10, name: "day to second", least: "second", mm_ss: false },
+    IntervalQualifier { code: 11, name: "hour to minute", least: "minute", mm_ss: false },
+    IntervalQualifier { code: 12, name: "hour to second", least: "second", mm_ss: false },
+    IntervalQualifier { code: 13, name: "minute to second", least: "second", mm_ss: true },
+];
