@@ -285,6 +285,17 @@ impl SimFs {
         self.arena[id].barrier_ok
     }
 
+    /// Whether a meta-slot write of file `id` is still pending, not yet covered by a barrier: the
+    /// disk fact the relaxed-durability oracle checks an engine's flush claim against (§8.2).
+    pub(crate) fn meta_pending(&self, id: usize) -> bool {
+        let file = &self.arena[id];
+        if file.cache.len() < 12 {
+            return false;
+        }
+        let ps = u32::from_be_bytes(file.cache[8..12].try_into().unwrap()) as u64;
+        file.pending.contains_key(&0) || file.pending.contains_key(&ps)
+    }
+
     /// How many writes reached file `id` this step.
     pub(crate) fn file_writes(&self, id: usize) -> usize {
         self.arena[id].writes

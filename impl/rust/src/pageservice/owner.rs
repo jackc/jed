@@ -122,8 +122,9 @@ pub(crate) fn new_incarnation() -> Result<Id16> {
     Ok(id)
 }
 
-/// Read the meta slot that published `txid` through `paging`. Every commit writes slot `txid & 1`,
-/// so it is read first; the parse check guards a slot a later commit already overwrote.
+/// Read the meta slot that published `txid` through `paging`. A commit writes slot `txid & 1`
+/// unless a relaxed batch put it in the other slot (format.md, *Slot alternation*), so both are
+/// tried; the parse check guards a slot a later commit already overwrote.
 pub(crate) fn committed_meta(paging: &crate::paging::SharedPaging, txid: u64) -> Result<Vec<u8>> {
     let mut pager = paging.pager();
     for slot in [(txid & 1) as u32, ((txid & 1) ^ 1) as u32] {
@@ -144,10 +145,18 @@ pub(crate) fn previous_meta(paging: &crate::paging::SharedPaging, txid: u64) -> 
     if txid == 0 {
         return None;
     }
-    let block = paging.pager().read_block(((txid & 1) ^ 1) as u32).ok()?;
-    crate::format::meta_txid_and_page_count(&block)
-        .is_some_and(|(t, _)| t == txid - 1)
-        .then_some(block)
+    // A commit writes slot txid & 1 unless a relaxed batch put it in the other slot (format.md,
+    // *Slot alternation*), so both are tried.
+    let mut pager = paging.pager();
+    for slot in 0..2 {
+        let Ok(block) = pager.read_block(slot) else {
+            continue;
+        };
+        if crate::format::meta_txid_and_page_count(&block).is_some_and(|(t, _)| t == txid - 1) {
+            return Some(block);
+        }
+    }
+    None
 }
 
 /// The owner's published meta, invalidation window, and resolution window (README.md §4). Lives in
@@ -1238,6 +1247,21 @@ impl PageServiceOwner {
             .acquire(m.lock_timeout_ms, &|| conn.closed.load(Ordering::Acquire));
         // Declared before the state guard, so a final drop of the core never runs under it.
         let shared = self.shared.upgrade();
+        // The owner's own relaxed commits are flushed before a client plans against the committed
+        // meta: a client cannot name the owner's pending set in its manifest (README.md §3.5). A
+        // failed flush poisons the owner, which stops serving.
+        let mut flush_failed = false;
+        let result = match (result, &shared) {
+            (Ok(()), Some(core)) => match core.page_service_flush() {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.gate.release();
+                    flush_failed = true;
+                    Err(e)
+                }
+            },
+            (result, _) => result,
+        };
         let mut state = conn.state.lock().expect("connection state lock poisoned");
         state.waiting = false;
         let shared = match (&shared, state.closed) {
@@ -1251,6 +1275,10 @@ impl PageServiceOwner {
         };
         if let Err(e) = result {
             conn.send(request_id, &error_reply(&e, 0));
+            if flush_failed {
+                drop(state);
+                self.stop_serving();
+            }
             return;
         }
         let Some((begun, check)) =

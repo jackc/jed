@@ -30,6 +30,20 @@ pub enum Locking {
     None,
 }
 
+/// The durability mode of a file-backed handle (spec/design/transactions.md §9, api.md §2.1): when
+/// a commit's durable barrier runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Synchronous {
+    /// Every commit is durable before it returns (the default).
+    #[default]
+    On,
+    /// A commit is acknowledged once its pages and meta are written, and the barrier is batched: a
+    /// later flush (the batch cap, close, …) makes a run of commits durable together. A power loss
+    /// or OS crash can lose the commits acknowledged since the last flush, never the file's
+    /// integrity (spec/design/validated-cow.md §4).
+    Off,
+}
+
 pub const DEFAULT_FILE_LOCK_TIMEOUT_MS: u64 = 5_000;
 
 /// A page-service owner's default idle-in-transaction timeout (spec/design/page-service.md §11.1).
@@ -93,6 +107,10 @@ pub struct CreateOptions {
     /// ONLY — durable across a process crash, not an OS crash / power loss. Ignored for an in-memory
     /// database (`path: None`) which never fsyncs. Byte/cost/result-neutral; default `false`.
     pub skip_fsync: bool,
+    /// The durability mode ([`Synchronous::On`], the default, or [`Synchronous::Off`] —
+    /// transactions.md §9). Ignored for an in-memory database. A handle setting, not stored in the
+    /// file.
+    pub synchronous: Synchronous,
     pub locking: Locking,
     pub file_lock_timeout_ms: u64,
     /// The environment this database runs in (spec/design/environment.md): the loaded Unicode and
@@ -133,6 +151,7 @@ impl Default for CreateOptions {
             path: None,
             page_size: 0,
             skip_fsync: false,
+            synchronous: Synchronous::On,
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
             environment: Environment::default(),
@@ -180,6 +199,10 @@ pub struct OpenOptions {
     /// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
     /// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default `false`.
     pub skip_fsync: bool,
+    /// The durability mode ([`Synchronous::On`], the default, or [`Synchronous::Off`] —
+    /// transactions.md §9). A handle setting, not stored in the file; the handle's file attachments
+    /// follow it.
+    pub synchronous: Synchronous,
     pub locking: Locking,
     pub file_lock_timeout_ms: u64,
     /// The environment this handle runs in (spec/design/environment.md): the loaded Unicode and
@@ -220,6 +243,7 @@ impl Default for OpenOptions {
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             skip_fsync: false,
+            synchronous: Synchronous::On,
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
             environment: Environment::default(),
@@ -283,10 +307,11 @@ impl Engine {
         // pager at creation (`Snapshot::store_paging`), so their committed leaves demote at each
         // commit and fault back through the pool — same residency shape as after a reopen.
         let store = files.open_store(path, opts.no_sync, false)?;
-        let paging = SharedPaging::new(
-            Pager::from_store(store)?,
-            cache_leaves(DEFAULT_CACHE_BYTES, db.page_size),
-        );
+        let mut pager = Pager::from_store(store)?;
+        // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot
+        // alternation*).
+        pager.set_floor_slot((db.committed.txid & 1) as u32);
+        let paging = SharedPaging::new(pager, cache_leaves(DEFAULT_CACHE_BYTES, db.page_size));
         db.committed.set_store_paging(paging.clone());
         db.paging = Some(paging);
         Ok(db)
@@ -452,6 +477,8 @@ impl Engine {
             can_reclaim,
             true,
             live.live,
+            &[],
+            None,
         )?;
         crate::format::verify_live_count(snap, &paging, &write, live)?;
         {
@@ -460,9 +487,12 @@ impl Engine {
             for (index, bytes) in &plan.auxiliary {
                 pager.write_block(*index, bytes)?;
             }
-            pager.write_block((snap.txid & 1) as u32, &plan.meta)?;
+            // The bare single-handle engine is always synchronous = on: the slot not holding the
+            // floor is txid & 1 (format.md, *Slot alternation*).
+            let slot = pager.commit_slot();
+            pager.write_block(slot, &plan.meta)?;
             pager.sync()?;
-            pager.finish_commit(&plan.meta);
+            pager.finish_commit(&plan.meta, slot, true, &[]);
         }
         // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
         // evicts a stale pool decode of any free page this commit reused for new content.

@@ -408,14 +408,16 @@ impl Shared {
         let owner = role.owner.as_ref().expect("an owner role");
         owner.shutdown();
         self.install_role(next, None, None);
-        self.storage
-            .lock()
-            .expect("storage lock not poisoned")
-            .paging
-            .revoke(EngineError::new(
+        {
+            let mut st = self.storage.lock().expect("storage lock not poisoned");
+            // Pending relaxed commits become durable before ownership moves (page-service.md §6). A
+            // failed flush poisons the pager; the next owner stabilizes whatever it adopts.
+            let _ = st.flush();
+            st.paging.revoke(EngineError::new(
                 SqlState::ConnectionFailure,
                 "this process no longer owns the database",
             ));
+        }
         owner.remove_serving();
         owner.release_presence();
     }
@@ -903,6 +905,7 @@ pub(super) fn start_service_owner(
     let (paging, page_size) = {
         let mut storage = shared.storage.lock().expect("storage lock not poisoned");
         storage.record_commits = true;
+        storage.relaxed = handoff.opts.synchronous == crate::file::Synchronous::Off;
         (storage.paging.clone(), storage.page_size)
     };
     let txid = shared.committed_version();
@@ -1006,6 +1009,7 @@ pub(crate) fn open_service_with(
                 // The owner publishes this process's commits; the client adopts its own from the meta.
                 storage.record_commits = true;
                 storage.budget.limit = opts.max_storage_bytes;
+                storage.relaxed = opts.synchronous == crate::file::Synchronous::Off;
             }
             db.0.attach_handoff(hosts, &real, opts);
             let role = Arc::new(ServiceRole {
