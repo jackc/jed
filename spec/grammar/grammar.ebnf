@@ -893,7 +893,15 @@ derived_alias  ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
  * argument to any other is 42883. */
 table_function ::= identifier "(" function_arg ("," function_arg)* ")"
 
-table_function_alias ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
+/* A table function's alias may carry a rename-only list or a typed column-definition list (a type
+ * after the first name decides). The typed list declares a record-returning function's columns —
+ * json[b]_to_record(set) (../design/json-table.md §1) and unnest over an anonymous-record array
+ * (../design/composite.md §13) — and may also follow "AS" with no relation alias, the relation then
+ * keeping the function's name (PostgreSQL's func_alias_clause). A duplicate column name is 42701. */
+table_function_alias ::= "AS"? identifier ("(" identifier ("," identifier)* ")" | "(" column_def_list ")")?
+                       | "AS" "(" column_def_list ")"
+
+column_def_list ::= identifier type_name ("[" "]")? ("," identifier type_name ("[" "]")?)*
 
 /* A join_clause is INNER/OUTER JOIN ... (ON <expr> | USING (cols)) (the "INNER" keyword is
  * optional — a bare "JOIN" is INNER), a NATURAL join (a derived condition, no ON/USING), or

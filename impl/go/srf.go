@@ -51,6 +51,11 @@ func (db *engine) resolveSRF(name string, args []*exprNode, argNames []*string, 
 		set := strings.HasSuffix(lname, "set")
 		return db.resolveJSONPopulate(lname, jsonb, set, args, alias, argScope, ptypes)
 	}
+	// unnest takes a column-definition list exactly when its array's element is an anonymous record
+	// (composite.md §13), so it resolves its argument before applying the guard below.
+	if name == "unnest" {
+		return db.resolveUnnest(args, alias, columnDefs, argScope, ptypes)
+	}
 	// A column-definition list is valid ONLY on a record-returning function (PG).
 	if columnDefs != nil {
 		return nil, nil, newError(SyntaxError,
@@ -59,8 +64,6 @@ func (db *engine) resolveSRF(name string, args []*exprNode, argNames []*string, 
 	switch {
 	case name == "generate_series":
 		return db.resolveGenerateSeries(args, alias, argScope, ptypes)
-	case name == "unnest":
-		return db.resolveUnnest(args, alias, argScope, ptypes)
 	case name == "regexp_matches", name == "regexp_split_to_table":
 		return db.resolveRegexSRF(name, args, alias, argScope, ptypes)
 	}
@@ -184,6 +187,9 @@ func (db *engine) resolveJSONRecord(name string, jsonb, set bool, args []*exprNo
 	if columnDefs == nil {
 		return nil, nil, newError(SyntaxError,
 			"a column definition list is required for function "+name)
+	}
+	if err := checkColdefNames(columnDefs); err != nil {
+		return nil, nil, err
 	}
 	columns := make([]catColumn, 0, len(columnDefs))
 	for _, d := range columnDefs {
@@ -444,9 +450,14 @@ func (db *engine) resolveGenerateSeries(args []*exprNode, alias *string, argScop
 // unnest(composite[])): the synthetic column is typed at the bound element type directly
 // (typeFromResolved), so a composite array produces composite rows. An anonymous-record element
 // (unnest(ARRAY[ROW(…)])) makes unnest a function returning record, which in FROM needs a
-// column-definition list — 42601, as in PostgreSQL (composite.md §1; the list itself is not supported
-// for unnest yet).
-func (db *engine) resolveUnnest(args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
+// column-definition list (AS u(a i32, b text)) — without one 42601, as in PostgreSQL (composite.md
+// §13); with one the relation has the declared columns (resolveUnnestRecord). A list on any other
+// unnest is 42601.
+func (db *engine) resolveUnnest(args []*exprNode, alias *string, columnDefs []typeFieldDef, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
+	if columnDefs != nil && len(args) > 1 {
+		return nil, nil, newError(SyntaxError,
+			"UNNEST() with multiple arguments cannot have a column definition list")
+	}
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload("unnest")
 	}
@@ -458,8 +469,23 @@ func (db *engine) resolveUnnest(args []*exprNode, alias *string, argScope *scope
 	switch t.kind {
 	case rtArray:
 		if t.elem.kind == rtComposite && !t.elem.comp.named {
+			if columnDefs == nil {
+				return nil, nil, newError(SyntaxError,
+					`a column definition list is required for functions returning "record"`)
+			}
+			table, err := db.resolveUnnestRecord(t.elem.comp, columnDefs, alias)
+			if err != nil {
+				return nil, nil, err
+			}
+			return table, &srfPlan{kind: srfUnnestRecord, args: []*rExpr{r}, recordCols: table.Columns}, nil
+		}
+		if columnDefs != nil {
+			if t.elem.kind == rtComposite {
+				return nil, nil, newError(SyntaxError,
+					"a column definition list is redundant for a function returning a named composite type")
+			}
 			return nil, nil, newError(SyntaxError,
-				`a column definition list is required for functions returning "record"`)
+				`a column definition list is only allowed for functions returning "record"`)
 		}
 		elemTy, err := typeFromResolved(*t.elem)
 		if err != nil {
@@ -481,6 +507,137 @@ func (db *engine) resolveUnnest(args []*exprNode, alias *string, argScope *scope
 	default:
 		return nil, nil, noFuncOverload("unnest")
 	}
+}
+
+// resolveUnnestRecord builds the relation of unnest(record[]) AS u(c type, …) (composite.md §13): one
+// column per declared entry, typed as declared. The anonymous record's field list is static, so the
+// declared shape is checked against it here, at plan time: a different field count, or a field whose
+// type differs from its column's, is 42804 (PostgreSQL's "function return row and query-specified
+// return row do not match", which it raises at the first non-NULL element). Integer widths are
+// interchangeable — jed's unconstrained integer literal is i64 where PostgreSQL's is int4 — and a value
+// outside a narrower declared integer type is 22003 at execution. A duplicate column name is 42701; a
+// type modifier is accepted and not enforced (PostgreSQL's binary-coercible match neither checks nor
+// applies it).
+func (db *engine) resolveUnnestRecord(rec *compositeRType, defs []typeFieldDef, alias *string) (*catTable, error) {
+	if err := checkColdefNames(defs); err != nil {
+		return nil, err
+	}
+	columns := make([]catColumn, 0, len(defs))
+	for _, d := range defs {
+		ty, err := db.resolveColdefType(d)
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, catColumn{Name: d.Name, Type: ty})
+	}
+	const mismatch = "function return row and query-specified return row do not match"
+	if len(rec.fields) != len(columns) {
+		plural := "s"
+		if len(rec.fields) == 1 {
+			plural = ""
+		}
+		return nil, newError(DatatypeMismatch, fmt.Sprintf("%s: returned row contains %d attribute%s, but query expects %d",
+			mismatch, len(rec.fields), plural, len(columns)))
+	}
+	for i, f := range rec.fields {
+		fty, err := typeFromResolved(f.ty)
+		if err != nil {
+			return nil, err
+		}
+		if !recordFieldFits(fty, columns[i].Type) {
+			return nil, newError(DatatypeMismatch, fmt.Sprintf("%s: returned type %s at ordinal position %d, but query expects %s",
+				mismatch, rtName(f.ty), i+1, rtName(resolvedTypeOfCol(columns[i].Type, db.readSnap()))))
+		}
+	}
+	tname := "unnest"
+	if alias != nil {
+		tname = *alias
+	}
+	return &catTable{Name: tname, Columns: columns}, nil
+}
+
+// resolveColdefType is the type of one column-definition-list entry of unnest(record[]): a scalar
+// (its type modifier dropped), a range, a named composite, or an array of a scalar or composite. An
+// unknown name is 42704.
+func (db *engine) resolveColdefType(d typeFieldDef) (dataType, error) {
+	named := func(n string) (dataType, error) {
+		if _, ok := scalarTypeFromName(n); ok {
+			s, _, _, err := resolveTypeAndTypmod(n, nil)
+			if err != nil {
+				return dataType{}, err
+			}
+			return scalarT(s), nil
+		}
+		if rdesc, ok := rangeByName(n); ok {
+			return rangeT(scalarT(elementScalar(rdesc))), nil
+		}
+		if ctype := db.readSnap().compositeType(n); ctype != nil {
+			return compositeT(ctype.Name), nil
+		}
+		return dataType{}, newError(UndefinedObject, "type does not exist: "+n)
+	}
+	if base, ok := strings.CutSuffix(d.TypeName, "[]"); ok {
+		elem, err := named(base)
+		if err != nil {
+			return dataType{}, err
+		}
+		return arrayT(elem), nil
+	}
+	if _, ok := scalarTypeFromName(d.TypeName); ok {
+		// Validate the modifier as a column's would be, then drop it.
+		if _, _, _, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod); err != nil {
+			return dataType{}, err
+		}
+	}
+	return named(d.TypeName)
+}
+
+// checkColdefNames rejects a duplicate name in a FROM-clause column-definition list — 42701,
+// PostgreSQL's "column name … specified more than once" (json-table.md §1, composite.md §13).
+func checkColdefNames(defs []typeFieldDef) error {
+	for i, d := range defs {
+		for _, p := range defs[:i] {
+			if p.Name == d.Name {
+				return newError(DuplicateColumn, fmt.Sprintf("column name %q specified more than once", d.Name))
+			}
+		}
+	}
+	return nil
+}
+
+// recordFieldFits reports whether an anonymous record's field of type field may fill a declared column
+// of type decl (composite.md §13): the same type, or integers of any widths — also as array elements.
+func recordFieldFits(field, decl dataType) bool {
+	switch {
+	case field.Array != nil || decl.Array != nil:
+		return field.Array != nil && decl.Array != nil && recordFieldFits(*field.Array, *decl.Array)
+	case field.Range != nil || decl.Range != nil:
+		return field.Range != nil && decl.Range != nil && field.Range.Scalar == decl.Range.Scalar
+	case field.Comp != nil || decl.Comp != nil:
+		return field.Comp != nil && decl.Comp != nil && field.Comp.Name == decl.Comp.Name
+	case field.Record != nil || decl.Record != nil:
+		return false
+	}
+	return field.Scalar == decl.Scalar || (field.Scalar.IsInteger() && decl.Scalar.IsInteger())
+}
+
+// checkRecordFieldValue range-checks one record field value against its declared column type: an
+// integer (also an integer array's elements) outside a narrower declared width is 22003
+// (composite.md §13).
+func checkRecordFieldValue(v Value, decl dataType) error {
+	switch {
+	case v.Kind == ValInt && decl.IsInteger():
+		if !decl.Scalar.InRange(v.Int) {
+			return overflowErr(decl.Scalar)
+		}
+	case v.Kind == ValArray && decl.Array != nil:
+		for _, e := range v.arrayVal().Elements {
+			if err := checkRecordFieldValue(e, *decl.Array); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // resolveRegexSRF resolves regexp_matches / regexp_split_to_table (regex.md §8c). The call resolves
@@ -1991,6 +2148,51 @@ func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []boo
 	default:
 		panic("the resolver restricts unnest's argument to an array")
 	}
+}
+
+// unnestRecordRows generates the rows of unnest(record[]) AS u(c type, …) (composite.md §13): one row
+// per array element, its fields spread over the declared columns; a NULL element is a row of NULLs
+// (as in PostgreSQL); a NULL array yields no rows. A field value outside a narrower declared integer
+// type is 22003. Each row charges one generated_row, like unnest.
+func (db *engine) unnestRecordRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []bool) ([]storedRow, error) {
+	v, err := sp.args[0].eval(nil, env, m)
+	if err != nil {
+		return nil, err
+	}
+	if v.Kind == ValNull {
+		return nil, nil
+	}
+	if v.Kind != ValArray {
+		panic("the resolver restricts unnest's argument to an array")
+	}
+	width := len(sp.recordCols)
+	out := make([]storedRow, 0, len(v.arrayVal().Elements))
+	for _, e := range v.arrayVal().Elements {
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(costs.GeneratedRow)
+		var row storedRow
+		if e.Kind == ValComposite {
+			fields := *e.composite()
+			for i, f := range fields {
+				if err := checkRecordFieldValue(f, sp.recordCols[i].Type); err != nil {
+					return nil, err
+				}
+			}
+			row = append(storedRow(nil), fields...)
+		} else {
+			row = make(storedRow, width)
+			for i := range row {
+				row[i] = NullValue()
+			}
+		}
+		if err := m.admitRowMasked(row, mask); err != nil { // a materialized relation row (memory.md §5.1)
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
 }
 
 // jsonRecordsetRowsVerbatim is json_to_recordset / json_populate_recordset over a json ARRAY,

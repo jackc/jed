@@ -4173,7 +4173,18 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	}
 	var alias *string
 	var aliasPos tokPos
-	if p.peekKeyword() == "as" {
+	// `AS (c type, …)` — a table function's column-definition list without a relation alias
+	// (PostgreSQL's func_alias_clause); the relation keeps the function's name.
+	var bareDefs []typeFieldDef
+	if p.peekKeyword() == "as" && isFunc && p.peekKindAt(1) == tokLParen {
+		p.advance() // AS
+		p.advance() // (
+		defs, err := p.parseFieldDefList()
+		if err != nil {
+			return tableRef{}, err
+		}
+		bareDefs = defs
+	} else if p.peekKeyword() == "as" {
 		p.advance()
 		aliasPos = tokPos(p.pos)
 		a, err := p.expectIdentifier()
@@ -4192,7 +4203,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	// `AS g(c1, …)` (§35) or the typed column-definition list `AS g(c type, …)` used by
 	// record-returning functions (C0, json-table.md §1).
 	var columnAliases []string
-	var columnDefs []typeFieldDef
+	columnDefs := bareDefs
 	var listOpen, listClose tokPos
 	if alias != nil && p.peek().Kind == tokLParen && !isFunc {
 		listOpen = tokPos(p.pos)

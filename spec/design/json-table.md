@@ -49,6 +49,13 @@ C0 is small, well-precedented (the composite-field parser + the synthetic-table 
 already exist), and is the prerequisite that de-risks the record functions and `JSON_TABLE`.
 Capability `func.coldeflist`.
 
+As in PostgreSQL, the list may also follow `AS` with **no relation alias** (`json_to_record(doc) AS
+(a i32)`), the relation then keeping the function's name, and a **duplicate column name** in it is
+`42701`. `unnest` over an anonymous-record array is the other record-returning function that takes a
+list ([composite.md](composite.md) §13). Still deferred: a composite or array column type in a json
+record function's list (`0A000`), and `json[b]_populate_record(set)` over an anonymous-record base
+(`NULL::record` — jed has no `record` cast target; `0A000` for a `ROW(…)` base).
+
 ---
 
 ## 2. Record-returning functions (R-series)

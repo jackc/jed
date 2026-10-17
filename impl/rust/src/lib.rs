@@ -1081,6 +1081,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // the C0 FROM-clause column-definition-list facility (json-table.md §1) + the json/jsonb
     // record-returning functions (R1) — json[b]_to_record / _recordset (json-table.md §2).
     "func.coldeflist",
+    "func.unnest_record",
     "func.json_record",
     // json/jsonb populate-record functions (R2) — shape from the base arg's composite type (json-table.md §2).
     "func.json_populate",

@@ -998,7 +998,11 @@ description = "jsonb_set_lax(jsonb_in jsonb, path text[], replacement jsonb [, c
 
 [[capability]]
 id = "func.coldeflist"
-description = "the FROM-clause column-definition-list facility (C0, spec/design/json-table.md §1): a record-returning table function followed by AS t(col type, …) declaring its output columns' names and types (reusing the composite-field parser). Carried on the synthetic SRF table; the typed columns fix the result types statically. A col-def list is valid ONLY on a record-returning function (else 42601); a record-returning function REQUIRES one (else 42601). The rename-only form AS g(col) (no types) on a table function stays a deferred 0A000. The keystone for the record functions (and, later, JSON_TABLE)"
+description = "the FROM-clause column-definition-list facility (C0, spec/design/json-table.md §1): a record-returning table function followed by AS t(col type, …) declaring its output columns' names and types (reusing the composite-field parser). Carried on the synthetic SRF table; the typed columns fix the result types statically. A col-def list is valid ONLY on a record-returning function (else 42601); a record-returning function REQUIRES one (else 42601). The list may also follow AS with no relation alias (AS (col type, …)), the relation keeping the function's name; a duplicate column name is 42701 (PostgreSQL). The keystone for the record functions (and, later, JSON_TABLE)"
+
+[[capability]]
+id = "func.unnest_record"
+description = "a column-definition list on unnest(record[]) (spec/design/composite.md §13): unnest over an array of anonymous records returns record, so in FROM it takes PostgreSQL's column-definition list — unnest(arr) AS u(a i32, b text), also the alias-less AS (a i32, …) — naming and typing the relation's columns; each element's fields spread over them and a NULL element is a row of NULLs (a NULL array: zero rows). Without the list 42601; a list on any other unnest 42601 (a named-composite array: redundant). The declared shape is checked against the record's static field list at plan time: a different field count or field type is 42804 (PostgreSQL checks at the first non-NULL element — ledgered), integer widths are interchangeable (jed's integer literal is i64, PostgreSQL's int4 — ledgered) with a narrower declared integer range-checked per value (22003). A duplicate column name in any column-definition list is 42701. Each produced row charges one generated_row. Builds on func.unnest, func.coldeflist, types.record_column"
 
 [[capability]]
 id = "func.json_record"

@@ -321,6 +321,7 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
 | Corrupt type catalog (dangling/cyclic/over-deep field ref) | `XX001` data_corrupted |
 | A `CREATE TABLE … AS` or view column of type `record` / `record[]` (§13) | `42P16` invalid_table_definition |
 | `unnest(record[])` in `FROM` without a column-definition list (§13) | `42601` syntax_error |
+| A column-definition list whose shape does not match the record's fields (§13) | `42804` datatype_mismatch |
 | A composite `PRIMARY KEY`/index/`UNIQUE` whose type transitively contains an **array-of-composite** field; a composite **FK** pairing; bare `(a,b)`; `ALTER TYPE`; `DROP TYPE … CASCADE` | `0A000` feature_not_supported |
 
 ## 12. Delivery (sub-slices)
@@ -442,11 +443,32 @@ cycle detection ([recursive-cte.md](recursive-cte.md) §9). Corpus: `suites/type
   view column ([views.md](views.md) §1.1) of type `record` / `record[]` is **`42P16`** *column "r"
   has pseudo-type record* (`record[]`), as in PostgreSQL — a view column is a catalog column, even
   though jed persists only its name. The catalog encoders treat a `Record` type as unreachable.
-- **`unnest(record[])`.** `unnest` over a `record[]` is a function returning `record`, which in
-  `FROM` needs a column-definition list: **`42601`** *a column definition list is required for
-  functions returning "record"*, as in PostgreSQL. Supplying the list (`unnest(…) AS u(a i32, b
-  text)`) is a deferred follow-on (`42601` today — the list is accepted only on the json record
-  functions, [json-table.md](json-table.md) §2).
+- **`unnest(record[])`** (✅ landed, capability `func.unnest_record`, corpus
+  `suites/types/record_unnest_coldef.test`). `unnest` over a `record[]` is a function returning
+  `record`, which in `FROM` takes PostgreSQL's **column-definition list**: `unnest(arr) AS u(a i32,
+  b text)` (also `u(a i32, …)` without `AS`, and the alias-less `AS (a i32, …)`, whose relation keeps
+  the name `unnest`). The relation has the declared columns, typed as declared; each element's
+  fields spread over them in order, a NULL element is a row of NULLs, and a NULL or empty array
+  yields no rows; each row charges one `generated_row`, like `unnest`. The rules, PostgreSQL's:
+  - Without the list it is **`42601`** *a column definition list is required for functions
+    returning "record"*. A list on any other `unnest` is `42601` (*only allowed for functions
+    returning "record"*; for a named-composite array, *redundant for a function returning a named
+    composite type*), and on a multi-argument `unnest` it is `42601` too.
+  - A duplicate column name is **`42701`** — in every column-definition list, the json record
+    functions' too ([json-table.md](json-table.md) §1). An unknown type is `42704`.
+  - The declared shape must match the record's: a different field count, or a field whose type
+    is not its column's, is **`42804`** *function return row and query-specified return row do not
+    match*. A declared column may be any scalar, range, named composite, or array of a scalar or
+    composite; a type modifier (`decimal(6,2)`, `varchar(3)`) is accepted and **not** enforced —
+    PostgreSQL's match is binary-coercibility, which neither checks nor applies it.
+  - **Deliberate divergences** (ledgered). (1) jed checks the shape **at plan time**, against the
+    record's static field list (CLAUDE.md §4); PostgreSQL checks the row it gets back, so an
+    empty or all-NULL array never errors there. (2) **Integer widths are interchangeable** — also as
+    integer-array elements — because jed's unconstrained integer literal is `i64` where PostgreSQL's
+    is `int4`: without this, the PostgreSQL-idiomatic `ROW(1, …)` could not fill an `i32` column. A
+    value outside a narrower declared integer type is `22003` at execution; PostgreSQL rejects the
+    field type itself (`42804`). (3) A bare string literal inside `ROW(…)` is `text` in jed, so it
+    fills a `text` column; PostgreSQL's is `unknown` and matches nothing.
 - **Deliberate divergence — jed keeps the field list.** PostgreSQL's `record` is *dynamic*: it keeps
   a derived record's fields only where the planner still sees the `ROW(…)` expression (a plain
   derived table or CTE — jed agrees there). Through a `VALUES` list, a `record[]` element, or a

@@ -3404,7 +3404,14 @@ class Parser {
     }
     let alias: string | null = null;
     let aliasPos: number | null = null;
-    if (this.peekKeyword() === "as") {
+    // `AS (c type, …)` — a table function's column-definition list without a relation alias
+    // (PostgreSQL's func_alias_clause); the relation keeps the function's name.
+    let bareDefs: TypeFieldDef[] | undefined;
+    if (this.peekKeyword() === "as" && args !== null && this.peekKindAt(1) === "lparen") {
+      this.advance(); // AS
+      this.advance(); // (
+      bareDefs = this.parseFieldDefList();
+    } else if (this.peekKeyword() === "as") {
       this.advance();
       aliasPos = this.pos;
       alias = this.expectIdentifier();
@@ -3425,7 +3432,7 @@ class Parser {
     // `AS g(c1, …)` (§35) or the typed column-definition list `AS g(c type, …)` used by
     // record-returning functions (C0, json-table.md §1).
     let columnAliases: string[] | undefined;
-    let columnDefs: TypeFieldDef[] | undefined;
+    let columnDefs: TypeFieldDef[] | undefined = bareDefs;
     let listPos: [number, number] | null = null;
     if (alias !== null && this.peek().kind === "lparen" && args === null) {
       const open = this.pos;

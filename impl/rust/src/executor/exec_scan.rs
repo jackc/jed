@@ -2180,6 +2180,9 @@ impl Engine {
                         return self.generate_series_rows(srf, &env, meter, mask);
                     }
                     SrfKind::Unnest => return self.unnest_rows(srf, &env, meter, mask),
+                    SrfKind::UnnestRecord => {
+                        return self.unnest_record_rows(srf, &env, meter, mask);
+                    }
                     SrfKind::JsonbArrayElements
                     | SrfKind::JsonbArrayElementsText
                     | SrfKind::JsonbObjectKeys

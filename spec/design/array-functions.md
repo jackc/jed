@@ -887,8 +887,9 @@ Two pieces, one per core (Rust/Go/TS), each tiny:
    row-major. The composite output column is **first-class downstream, exactly like any composite
    column** — `SELECT u FROM unnest('{…}'::addr[]) AS u` renders each value via `record_out`,
    `(u).zip` reads a field, and `ORDER BY`/`DISTINCT`/aggregation use the composite total order. (An
-   *anonymous* composite element — a `record[]` with no catalog name — stays `0A000`, the
-   `type_from_resolved` precedent; it is not reachable from a stored/typed array.) **This is a
+   *anonymous* composite element — a `record[]` with no catalog name — makes `unnest` a function
+   returning `record`, which takes PostgreSQL's column-definition list `AS u(a i32, …)` and expands
+   into those columns; without one it is `42601` — [composite.md §13](composite.md).) **This is a
    single-composite-column model, a documented divergence from PostgreSQL** (decisions 23/24): jed
    treats the SRF output like a composite column rather than reproducing PG's "a composite-returning
    function in FROM expands into a relation of its fields" rule.

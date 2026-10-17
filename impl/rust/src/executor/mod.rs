@@ -5301,6 +5301,9 @@ pub(crate) enum SrfKind {
     GenerateSeries,
     /// `unnest(anyarray)` — one row per array element, flattened row-major (array-functions.md §9).
     Unnest,
+    /// `unnest(record[]) AS u(c type, …)` — one row per anonymous-record element, its fields spread
+    /// over the column-definition list's columns (the SrfPlan's `record_cols`; composite.md §13).
+    UnnestRecord,
     /// `jsonb_array_elements(jsonb)` — one `jsonb` row per array element (json-sql-functions.md §3).
     JsonbArrayElements,
     /// `jsonb_array_elements_text(jsonb)` — one `text` row per array element (the `->>`-style render).
