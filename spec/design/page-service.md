@@ -287,7 +287,8 @@ carry everything required.
   high-water, as a deferred in-process commit does today. Pins taken after `begin_write` are on the
   writer's base snapshot or later, so they cannot invalidate the grant.
 - **Free-list rebuilds are owner-only.** The periodic in-commit reclamation (the
-  reachability walk once the high-water passes about twice the live count, storage.md §6) is O(live
+  reachability walk once the pages off the free list pass about twice the live count, format.md
+  *Reclamation*) is O(live
   pages). Run by a remote client it would fetch the whole database. Instead a client commit never
   rebuilds; when a client commit crosses the rebuild threshold the owner runs a storage-maintenance
   commit immediately after it. The client's commit is acknowledged first, so the maintenance commit

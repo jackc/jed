@@ -222,8 +222,10 @@ sits so the options stay open (CLAUDE.md §9).
   so **open reads it directly** rather than reconstructing it by walking every leaf (the second
   full leaf pass for spillable overflow chains is gone). Persistence is paired with **continuous within-session
   reclamation** for the file/in-memory main domain: a file commit reclaims **this commit's fresh
-  orphans in-commit** — periodically, once the high-water passes ~2× the live count, so the file
-  oscillates in `[live, 2×live]` and the O(live) reachability walk is amortized O(height)/commit
+  orphans in-commit** — periodically, once the pages off the free list (`page_count − |free|`)
+  pass ~2× the live count at the last rebuild, so the file stays within ~2× live and the O(live)
+  reachability walk is amortized O(height)/commit (the trigger is format.md *Reclamation*; measuring
+  the never-shrinking high-water instead would walk on every commit once a file had doubled)
   — because with open no longer reconstructing, orphans left unpersisted would leak permanently
   (a short open→commit→close session especially). This is what makes the **oldest-live-snapshot
   watermark** (transactions.md §8 — a page freed at `txid T` is reusable only once

@@ -382,14 +382,16 @@ checked structurally.
 of a database. The engine reclaims only when no reader is pinned behind the new version
 (transactions.md §8), so a workload that holds a reader legitimately grows until the readers close;
 only a **quiet** commit — no other session open, a single process, no armed fault — is held to a
-bound. A file commit reclaims in-commit once its high-water passes `max(compact_min_pages,
-compact_growth × L)`, where `L` is the live count at its last reclamation (memory.md §8.4). The
+bound. A file commit reclaims in-commit once its pages off the free list (`page_count − free`) pass
+`max(compact_min_pages, compact_growth × L)`, where `L` is the live count at its last reclamation
+(memory.md §8.4, format.md *Reclamation*). A commit only adds pages off the list, so the count it
+began with is a lower bound on the one the engine tests. The
 runner cannot see `L`, so it tracks an upper bound per process lifetime: at an open (or recovery,
 compaction, attach), the page count minus the free list, which is what the engine seeds `L` with
 (format.md *Reclamation*); after each commit, the maximum of that and its live pages plus the pages
 it wrote. Then:
 
-- a quiet commit that **began** past that threshold must have reclaimed: every page below its
+- a quiet commit that **began** with more pages off the list than that threshold must have reclaimed: every page below its
   high-water is a meta page, live, on the free list, or written by the commit itself (its manifest
   and free-list pages) — `page_count − 2 − live − free ≤ written`;
 - the next commit, if quiet too, reuses that free list before it grows the file: its high-water grows

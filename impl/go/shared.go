@@ -263,7 +263,7 @@ type storage struct {
 	// within-session reclamation): its within-session reuse is watermark-gated by freeGenTxid (§8).
 	reclaimWithinSession bool
 	// liveAtCompaction is the reachable page count recorded at the last compaction — the cheap trigger basis:
-	// compaction re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).
+	// compaction re-runs only once the pages off the free list pass ~2× it (periodic ~2× bound, no per-commit walk).
 	liveAtCompaction uint32
 	// freeGenTxid is the version the current freePages list is "as of" — the last compaction's txid, or the
 	// committed version at open. It gates within-session reuse under the reader-liveness watermark
@@ -904,8 +904,8 @@ func (c *sharedCore) deregisterPin(gen, v uint64) {
 //   - a no-op for a non-reclaim domain (reclaimWithinSession false);
 //   - deferred while any older version is pinned (canReclaim false): compaction frees pages unreachable
 //     from the committed root, which an older reader may still observe, so it waits for the pins to drain;
-//   - periodic: it walks (O(pages)) only once the high-water passes ~2× the live count at the last
-//     compaction, so page_count oscillates in [live, 2×live] and the walk is amortized O(height)/commit.
+//   - periodic: it walks (O(pages)) only once the pages off the free list pass ~2× the live count at the
+//     last compaction (reclaimDue), so the walk is amortized O(height)/commit.
 //
 // Runs under the writer gate (caller holds st.mu). written is the pages THIS commit wrote — unioned into
 // the live set so a live GiST R-tree (rewritten wholesale each commit, invisible to reachablePages) is
@@ -915,8 +915,7 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []uint32
 	if !st.reclaimWithinSession || !canReclaim {
 		return nil
 	}
-	// The trigger constants are shared data (memory.md §8.4).
-	if st.pageCount <= compactMinPages || uint64(st.pageCount) <= compactGrowth*uint64(st.liveAtCompaction) {
+	if !reclaimDue(st.pageCount, len(st.freePages), st.liveAtCompaction) {
 		return nil
 	}
 	reached, err := snap.reachablePages(st.paging, catRoot)

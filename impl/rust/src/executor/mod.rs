@@ -515,7 +515,7 @@ pub struct Engine {
     pub(crate) free_pages: Vec<u32>,
     /// The live (reachable) page count recorded at this handle's last within-session compaction — the
     /// cheap periodic trigger basis (v25): a bare-`Engine` file commit re-runs the reclamation walk
-    /// only once the high-water passes ~2× it, mirroring [`crate::shared::Storage`]. `0` for an
+    /// only once the pages off the free list pass ~2× it, mirroring [`crate::shared::Storage`]. `0` for an
     /// in-memory database (no persistence).
     pub(crate) live_at_compaction: u32,
     /// The live-page accounting of the committed file state (spec/design/memory.md §8.7): read from

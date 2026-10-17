@@ -303,9 +303,10 @@ compaction it would leak a page per commit, breaking the storage ceiling the §1
 guarantee rests on. A reclaim domain (`reclaim_within_session`, set only by temp domains) instead
 rebuilds its free-list from the **live reachable set** at commit (`maybe_compact`, reusing the same
 reachability walk the open-time free-list reconstruction runs — the catalog chain + the in-memory tree
-node pages + spillable-leaf overflow). It is **periodic** (walks only once the high-water passes ~2×
-the live count at the last compaction, so `page_count` oscillates in `[live, 2×live]` and the walk is
-amortized O(height)/commit) and **watermark-gated** (deferred while any older version is pinned — a
+node pages + spillable-leaf overflow). It is **periodic** (walks only once the pages off the free list
+pass ~2× the live count at the last compaction, so `page_count` stays within ~2× live and the walk is
+amortized O(height)/commit — the trigger of [../fileformat/format.md](../fileformat/format.md)
+*Reclamation*) and **watermark-gated** (deferred while any older version is pinned — a
 read session or an open streaming cursor over the domain — so a page a live reader may still fault is
 never freed). This reclamation carries **no cross-core byte contract**: a temp store is never
 serialized (D1), so its physical page layout and reclamation are per-core (only the *logical*

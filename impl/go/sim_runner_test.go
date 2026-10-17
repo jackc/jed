@@ -377,6 +377,7 @@ type simDB struct {
 	// Bounded growth (§8.3), tracked over one process lifetime: an upper bound on the live count the
 	// engine's reclamation trigger compares against, and what the previous commit left.
 	high     uint32    // the page high-water now
+	free     uint32    // the free list the next commit allocates from
 	lacBound uint32    // ≥ the engine's live-at-last-reclamation
 	last     simGrowth // the previous commit in this lifetime
 }
@@ -1378,18 +1379,20 @@ func (r *simRunner) simAllocator(d *simDB) (pageCount, free uint32) {
 // doubles.
 func (r *simRunner) observeGrowth(d *simDB) {
 	pc, free := r.simAllocator(d)
-	d.high, d.lacBound = pc, pc-free
+	d.high, d.free, d.lacBound = pc, free, pc-free
 	d.last = simGrowth{}
 }
 
 // checkGrowth checks the reader-aware bounded-growth invariant after a commit published a new
 // version of d (simulation-testing.md §8.3). With no reader pinned, no other process, and no fault,
-// the engine reclaims in the commit once the high-water passes compact_growth × the live count at
-// its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so a commit
-// with one open is not checked. Two checks follow:
-//   - a quiet commit that began past max(compact_min_pages, compact_growth × an upper bound on that
-//     live count) must have reclaimed: every page below the high-water is meta, live, free, or
-//     written by the commit itself (its manifest and free-list pages);
+// the engine reclaims in the commit once the pages off its free list pass compact_growth × the live
+// count at its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so a
+// commit with one open is not checked. A commit only adds pages off the list (each page it allocates
+// leaves the list or grows the file), so the count it began with is a lower bound. Two checks follow:
+//   - a quiet commit that began with more pages off the list than max(compact_min_pages,
+//     compact_growth × an upper bound on that live count) must have reclaimed: every page below the
+//     high-water is meta, live, free, or written by the commit itself (its manifest and free-list
+//     pages);
 //   - the next quiet commit reuses that free list before it grows the file.
 func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 	if r.service {
@@ -1413,7 +1416,7 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 		return
 	}
 	reclaimed := false
-	if quiet && d.high > max(compactMinPages, uint32(compactGrowth)*d.lacBound) {
+	if quiet && d.high-d.free > max(compactMinPages, uint32(compactGrowth)*d.lacBound) {
 		reclaimed = true
 		if leaked := pc - 2 - live - free; pc < 2+live+free || leaked > written {
 			r.fail(i, "bounded growth: %s has %d pages, %d live and %d free, after a commit that wrote %d "+
@@ -1421,7 +1424,7 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 			return
 		}
 	}
-	d.high = pc
+	d.high, d.free = pc, free
 	d.lacBound = max(d.lacBound, live+written)
 	d.last = simGrowth{reclaimed: reclaimed, high: pc, free: free}
 }

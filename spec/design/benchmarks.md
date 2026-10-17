@@ -1322,7 +1322,9 @@ Two write kinds:
 - **`write_durable`** — per iteration: one statement as its own durable commit — the full
   fsync path. jed: autocommit (`synchronous=on` is the only mode today); PostgreSQL:
   default `synchronous_commit=on`; SQLite: `PRAGMA journal_mode=DELETE; PRAGMA
-  synchronous=FULL`. The final `count(*)` must equal `warmup + iterations`.
+  synchronous=FULL`. The final `count(*)` must equal the count right after `setup_sql`, plus
+  `warmup + iterations` when the statement is an `INSERT` (an `UPDATE` lane such as
+  `update_commit_durable` changes rows in place).
 
 A `write_rollback` bench may also use `dataset = "scratch"` when its `setup_sql` builds the
 written table; its expected post-run `count(*)` is then the count observed right after

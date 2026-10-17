@@ -709,7 +709,7 @@ point is a pure function of the sequence of operations, because each input is:
   so is the order it reuses free-list pages in. In-memory stores already share the
   file serializer.
 - **The compaction schedule.** The `16`-page floor and the `2 × live` trigger
-  are shared data: `[reclamation]` in `spec/cost/schedule.toml`
+  (measured on the pages off the free list, format.md *Reclamation*) are shared data: `[reclamation]` in `spec/cost/schedule.toml`
   (`compact_min_pages`, `compact_growth`), codegen'd into every core like the cost
   schedule. They were hand-mirrored constants before Q4a, though `54P03` already
   depended on them.

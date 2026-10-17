@@ -139,6 +139,12 @@ module Bench
     File.exist?(path) ? File.read(path).strip : ""
   end
 
+  # Whether a write bench's statement adds one row per iteration (an INSERT) rather than changing
+  # rows in place (an UPDATE).
+  def insert?(sql)
+    sql.split.first.to_s.casecmp?("INSERT")
+  end
+
   # The target table of a write statement — the word after INTO (INSERT), UPDATE, or FROM (DELETE) —
   # for the post-run count.
   def write_table(sql)
@@ -226,7 +232,7 @@ module Bench
     w.setup_sql_for(cfg[:engine]).each { |sql| eng.exec(sql) }
     # A scratch write_rollback table is built by setup_sql, so its expected post-run count is the
     # count observed now rather than a dataset spec row count (benchmarks.md §8).
-    scratch_rows = (eng.query_int("SELECT count(*) FROM #{write_table(w.sql)}") if w.kind == "write_rollback" && w.dataset == "scratch")
+    scratch_rows = (eng.query_int("SELECT count(*) FROM #{write_table(w.sql)}") if w.kind != "query" && w.dataset == "scratch")
     eng.prepare(w.sql_for(cfg[:engine]))
 
     started_at = Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -274,7 +280,7 @@ module Bench
     if w.kind != "query"
       table = write_table(w.sql)
       n = eng.query_int("SELECT count(*) FROM #{table}")
-      expect = if w.kind != "write_rollback" then w.warmup + w.iterations
+      expect = if w.kind != "write_rollback" then scratch_rows.to_i + (insert?(w.sql) ? w.warmup + w.iterations : 0)
                elsif w.dataset == "scratch" then scratch_rows
                else dataset_table_rows(corpus_dir, w.dataset, table)
                end

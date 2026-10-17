@@ -2249,14 +2249,23 @@ func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirt
 	return pages, flIDs[0], persisted, hw, nil
 }
 
+// reclaimDue is the periodic reclamation trigger (format.md *Reclamation*; the constants are shared
+// data, memory.md §8.4): the pages below the high-water that are not on the free list — live pages
+// plus dead ones no list holds yet — exceed compact_min_pages and compact_growth × the live count at
+// the last reclamation. The high-water alone never shrinks, so it cannot be the measure: once a file
+// crossed 2× live it would stay there and every later commit would walk.
+func reclaimDue(pageCount uint32, free int, liveAtCompaction uint32) bool {
+	unlisted := uint64(pageCount) - uint64(free)
+	return unlisted > uint64(compactMinPages) && unlisted > compactGrowth*uint64(liveAtCompaction)
+}
+
 // freeListCandidates computes reclamation once, before the joint free-list and
 // manifest allocator reserves any pages. Current body writes include transaction
 // orphans and remain protected even when they are unreachable from the new root.
 func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool) ([]uint32, uint32, uint64, error) {
 	// liveAtCompaction==0 is the shared-file handoff sentinel: reconstruct on the first proven-alone
-	// commit even when the file is still below the ordinary amortization threshold. The trigger
-	// constants are shared data (memory.md §8.4).
-	compact := canReclaim && (liveAtCompaction == 0 || (pageCount > compactMinPages && uint64(pageCount) > compactGrowth*uint64(liveAtCompaction)))
+	// commit even when the file is still below the ordinary amortization threshold.
+	compact := canReclaim && (liveAtCompaction == 0 || reclaimDue(pageCount, len(freeRemaining), liveAtCompaction))
 	persistList := freeRemaining
 	newLive := liveAtCompaction
 	newGen := genTxid

@@ -180,10 +180,10 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 			return res, fmt.Errorf("setup_sql %q: %w", sql, err)
 		}
 	}
-	// A scratch write_rollback table is built by setup_sql, so its expected post-run count is the
+	// A scratch write table is built by setup_sql, so its expected post-run count starts from the
 	// count observed now rather than a dataset spec row count (benchmarks.md §8).
 	var scratchRows int64
-	if b.Kind == "write_rollback" && b.Dataset == "scratch" {
+	if b.Kind != "query" && b.Dataset == "scratch" {
 		if scratchRows, err = eng.QueryInt("SELECT count(*) FROM " + writeTable(b.SQL)); err != nil {
 			return res, err
 		}
@@ -299,7 +299,10 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 				}
 			}
 		case "write_durable":
-			expect = int64(b.Warmup + b.Iterations)
+			expect = scratchRows
+			if isInsert(b.SQL) {
+				expect += int64(b.Warmup + b.Iterations)
+			}
 		}
 		if n != expect {
 			return res, fmt.Errorf("post-run count(*) of %s: got %d, want %d", table, n, expect)
@@ -519,6 +522,13 @@ func partition[T any](items []T, n int) [][]T {
 		idx += size
 	}
 	return blocks
+}
+
+// isInsert reports whether a write bench's statement adds one row per iteration (an INSERT) rather
+// than changing rows in place (an UPDATE).
+func isInsert(sql string) bool {
+	fields := strings.Fields(sql)
+	return len(fields) > 0 && strings.EqualFold(fields[0], "INSERT")
 }
 
 // writeTable extracts the target table of a write statement — the word after INTO

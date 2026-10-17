@@ -3375,6 +3375,16 @@ function serializeFreeList(
   return { pages, head: flIds[0]!, persisted, newNext: hw };
 }
 
+// The periodic reclamation trigger (format.md *Reclamation*; the constants are shared data,
+// memory.md §8.4): the pages below the high-water that are not on the free list — live pages plus
+// dead ones no list holds yet — exceed compact_min_pages and compact_growth × the live count at the
+// last reclamation. The high-water alone never shrinks, so it cannot be the measure: once a file
+// crossed 2× live it would stay there and every later commit would walk.
+export function reclaimDue(pageCount: number, free: number, liveAtCompaction: number): boolean {
+  const unlisted = pageCount - free;
+  return unlisted > COMPACT_MIN_PAGES && unlisted > COMPACT_GROWTH * liveAtCompaction;
+}
+
 // planFreeList is the v25 durable-commit free-list plan, shared by the file commit paths (persist.ts
 // persistImpl / commitDurableAttachment and the bare-engine file.ts persist). It runs IN-COMMIT (after
 // the tree + catalog are written to the pager, before the meta), so the list it persists includes THIS
@@ -3407,11 +3417,10 @@ export function planFreeList(
 } {
   // liveAtCompaction=0 is the shared-mode orphan sentinel: a co-resident commit deliberately
   // persisted no reusable free list, so the first proven-alone commit must reconstruct regardless
-  // of the ordinary periodic threshold. The trigger constants are shared data (memory.md §8.4).
+  // of the ordinary periodic threshold.
   const compact =
     canReclaim &&
-    (liveAtCompaction === 0 ||
-      (pageCount > COMPACT_MIN_PAGES && pageCount > COMPACT_GROWTH * liveAtCompaction));
+    (liveAtCompaction === 0 || reclaimDue(pageCount, freeRemaining.length, liveAtCompaction));
   let persistList = freeRemaining;
   let newLive = liveAtCompaction;
   let newGen = genTxid;

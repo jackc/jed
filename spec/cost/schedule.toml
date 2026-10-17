@@ -34,8 +34,10 @@ entry = 32
 # attachments, session temp domains) and the in-commit file reclamation (format.md *Reclamation*;
 # temp-tables.md §6). A store's page_count is observable through the deterministic storage budgets
 # (max_temp_storage_bytes 54P03, max_storage_bytes 54P06 — memory.md §8.4), so the schedule is shared data:
-# compaction runs once page_count > compact_min_pages and page_count > compact_growth × the live
-# page count at the last compaction.
+# compaction runs once the pages off the free list (page_count − |free list|, the live pages plus the
+# dead ones no list holds yet) exceed compact_min_pages and compact_growth × the live page count at
+# the last compaction. Not page_count alone: the high-water never shrinks, so once past the threshold
+# it would trigger the reachability walk on every commit.
 [reclamation]
 compact_min_pages = 16
 compact_growth = 2

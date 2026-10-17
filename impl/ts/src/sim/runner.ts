@@ -346,6 +346,7 @@ class SimDB {
   // Bounded growth (§8.3), tracked over one process lifetime: an upper bound on the live count the
   // engine's reclamation trigger compares against, and what the previous commit left.
   high = 0; // the page high-water now
+  free = 0; // the free list the next commit allocates from
   lacBound = 0; // ≥ the engine's live-at-last-reclamation
   last: SimGrowth = { reclaimed: false, high: 0, free: 0 }; // the previous commit in this lifetime
 
@@ -1266,18 +1267,21 @@ export class SimRunner {
   private observeGrowth(d: SimDB): void {
     const { pageCount, free } = this.allocator(d);
     d.high = pageCount;
+    d.free = free;
     d.lacBound = (pageCount - free) >>> 0;
     d.last = { reclaimed: false, high: 0, free: 0 };
   }
 
   // checkGrowth checks the reader-aware bounded-growth invariant after a commit published a new
   // version of d (simulation-testing.md §8.3). With no reader pinned, no other process, and no fault,
-  // the engine reclaims in the commit once the high-water passes compact_growth × the live count at
-  // its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so a commit
-  // with one open is not checked. Two checks follow:
-  //   - a quiet commit that began past max(compact_min_pages, compact_growth × an upper bound on that
-  //     live count) must have reclaimed: every page below the high-water is meta, live, free, or
-  //     written by the commit itself (its manifest and free-list pages);
+  // the engine reclaims in the commit once the pages off its free list pass compact_growth × the live
+  // count at its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so a
+  // commit with one open is not checked. A commit only adds pages off the list (each page it allocates
+  // leaves the list or grows the file), so the count it began with is a lower bound. Two checks follow:
+  //   - a quiet commit that began with more pages off the list than max(compact_min_pages,
+  //     compact_growth × an upper bound on that live count) must have reclaimed: every page below the
+  //     high-water is meta, live, free, or written by the commit itself (its manifest and free-list
+  //     pages);
   //   - the next quiet commit reuses that free list before it grows the file.
   private checkGrowth(i: number, d: SimDB, quiet: boolean): void {
     if (this.service) return;
@@ -1303,7 +1307,7 @@ export class SimRunner {
       return;
     }
     let reclaimed = false;
-    if (quiet && d.high > Math.max(COMPACT_MIN_PAGES, COMPACT_GROWTH * d.lacBound)) {
+    if (quiet && d.high - d.free > Math.max(COMPACT_MIN_PAGES, COMPACT_GROWTH * d.lacBound)) {
       reclaimed = true;
       if (pc < 2 + live + free || pc - 2 - live - free > written) {
         this.fail(
@@ -1315,6 +1319,7 @@ export class SimRunner {
       }
     }
     d.high = pc;
+    d.free = free;
     d.lacBound = Math.max(d.lacBound, live + written);
     d.last = { reclaimed, high: pc, free };
   }
