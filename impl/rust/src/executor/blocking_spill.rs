@@ -1205,6 +1205,7 @@ fn pack_acc(acc: Acc) -> Row {
             Value::Bool(neg_inf),
         ],
         Acc::MinMax { cur, .. } => vec![cur.unwrap_or(Value::Null)],
+        Acc::Bool { cur, .. } => vec![cur.map_or(Value::Null, Value::Bool)],
         Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => vec![Value::Bool(seen)],
         Acc::OrderedSet { .. } | Acc::Hypothetical { .. } | Acc::Ordered { .. } => Vec::new(),
     }
@@ -1256,6 +1257,12 @@ fn unpack_acc(spec: &AggSpec, state: Row, zone: &crate::timezone::ZoneRef) -> Ac
                 None
             } else {
                 Some(state[0].clone())
+            }
+        }
+        Acc::Bool { cur, .. } => {
+            *cur = match state[0] {
+                Value::Bool(b) => Some(b),
+                _ => None,
             }
         }
         Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => *seen = flag(0),

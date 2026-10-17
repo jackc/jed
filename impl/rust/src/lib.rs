@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // bool_and(boolean) — TRUE iff every non-NULL input is TRUE (aggregates.md §23).
+    "func.bool_and",
     // the jed_tables catalog relation (I1, spec/design/introspection.md §5): a read-only computed
     // relation — one row per user table of the qualified database, derived at execution from its
     // pinned catalog snapshot; SELECT-gated like a user table; write/DDL targets are 42809.

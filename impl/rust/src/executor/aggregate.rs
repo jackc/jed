@@ -120,6 +120,10 @@ impl Acc {
                 is_min: false,
                 collation: None,
             },
+            AggPlan::BoolAnd => Acc::Bool {
+                cur: None,
+                is_and: true,
+            },
             AggPlan::JsonAgg { compact, strict } => Acc::JsonAgg {
                 elems: Vec::new(),
                 compact,
@@ -252,6 +256,16 @@ impl Acc {
                         }
                     };
                     *cur = Some(next);
+                }
+            }
+            Acc::Bool { cur, is_and } => {
+                // NULLs are skipped (aggregates.md §23).
+                if let Value::Bool(b) = value {
+                    *cur = Some(match *cur {
+                        None => b,
+                        Some(c) if *is_and => c && b,
+                        Some(c) => c || b,
+                    });
                 }
             }
             Acc::JsonAgg {
@@ -447,6 +461,7 @@ impl Acc {
                 neg_inf,
             } => finalize_float_fold(width, is_avg, total, count, any_nan, pos_inf, neg_inf)?,
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
+            Acc::Bool { cur, .. } => cur.map_or(Value::Null, Value::Bool),
             // json_agg/jsonb_agg: NULL over an empty group; else the JSON array (json: PG's
             // `", "`-joined element texts; jsonb: the canonical array).
             Acc::JsonAgg {

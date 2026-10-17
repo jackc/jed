@@ -3050,6 +3050,8 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 		return planMin, t
 	case surface == "max" && result == "same_as_input":
 		return planMax, t
+	case surface == "bool_and" && result == "boolean":
+		return planBoolAnd, resolvedType{kind: rtBool}
 	case surface == "jsonb_agg" && result == "jsonb":
 		return planJsonbAgg, resolvedType{kind: rtJsonb}
 	case surface == "json_agg" && result == "json":

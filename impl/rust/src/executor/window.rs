@@ -1525,7 +1525,13 @@ mod registry_tests {
             assert!(
                 matches!(
                     a.result,
-                    "i64" | "decimal" | "sum_widen" | "same_as_input" | "jsonb" | "json"
+                    "i64"
+                        | "decimal"
+                        | "sum_widen"
+                        | "same_as_input"
+                        | "jsonb"
+                        | "json"
+                        | "boolean"
                 ),
                 "aggregate {} has unhandled result code {}",
                 a.name,
@@ -1541,6 +1547,7 @@ mod registry_tests {
                     Some("integer") => ResolvedType::Int(ScalarType::Int32),
                     Some("decimal") => ResolvedType::Decimal,
                     Some("float") => ResolvedType::Float(ScalarType::Float64),
+                    Some("boolean") => ResolvedType::Bool,
                     _ => ResolvedType::Int(ScalarType::Int32), // "any"
                 };
                 let found = lookup_aggregate_overload(&lname, &probe)

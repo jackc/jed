@@ -254,6 +254,8 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   unioned grouping-set rows; `GROUPING()` and window functions coexist in one query (§21).
 - **The in-aggregate `ORDER BY`** (landed) — `json_agg(x ORDER BY y DESC)` folds the input rows in
   key order (§22).
+- **General-purpose aggregates** (landing) — PostgreSQL's boolean, bitwise, collecting, and
+  statistical aggregates (§23).
 
 ## 11. `FILTER (WHERE cond)` — restricting an aggregate's input rows
 
@@ -721,3 +723,23 @@ argument and each key's `operator_eval`s per passing row, `aggregate_accumulate`
 `generated_row`) when the sorted arguments are folded at finalize. The buffering and the sort are
 **unmetered**, like the query `ORDER BY` sort. Deterministic and cross-core identical. New capability
 `query.aggregate_order_by`.
+
+## 23. General-purpose aggregates
+
+PostgreSQL's everyday aggregates beyond the five of §1, each an ordinary aggregate: it folds the
+passing input rows of its group, composes with `GROUP BY`/`HAVING`, `DISTINCT` (§5), `FILTER` (§11),
+the in-aggregate `ORDER BY` (§22), and `OVER` (a window aggregate, [window.md](window.md) §6), and its
+catalog row ([catalog.toml](../functions/catalog.toml)) names its overloads. A wrong argument type or
+count is `42883`. Unless noted, NULL inputs are skipped and an empty or all-NULL group yields NULL.
+
+**Cost** is the ordinary aggregate cost of §8 — the argument's `operator_eval`s and one
+`aggregate_accumulate` per passing row — plus any per-aggregate charge stated below. Finalization is
+unmetered.
+
+| Aggregate | Argument | Result | Value |
+|---|---|---|---|
+| `bool_and(x)` | `boolean` | `boolean` | TRUE iff every non-NULL input is TRUE |
+
+**Boolean aggregates.** `bool_and` is the running conjunction of its non-NULL inputs. It is
+order-insensitive ([determinism.md](determinism.md) §7). Its packed state on the bounded-spill lane is
+`[bool or NULL]` ([memory.md](memory.md) §6.6).

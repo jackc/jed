@@ -58,9 +58,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ PG surface still narrower around names — a derived CHECK/FK name's collision walk avoids only its own table's constraint names, where PostgreSQL avoids every constraint name in the schema ([constraints.md §6.7](spec/design/constraints.md)).
 - [x] **Named + optional (DEFAULT) function arguments** — PG named notation `f(name => value)` + DEFAULT params; `make_interval`, then `make_timestamp`/`make_timestamptz`; `VARIADIC` (landed as **AF6** with the array type). → [functions.md §11](spec/design/functions.md)
   - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
-- [ ] **Common aggregates** — PostgreSQL's everyday aggregates that jed lacks: `string_agg` and
+- [ ] **Common aggregates** — PARTIAL ([aggregates.md §23](spec/design/aggregates.md)). Landed:
+  `bool_and`. Still missing: `string_agg` and
   `array_agg` (order-sensitive; [determinism.md](spec/design/determinism.md) already classifies them),
-  `bool_and`/`bool_or`/`every`, `bit_and`/`bit_or`/`bit_xor`, and the statistical set —
+  `bool_or`/`every`, `bit_and`/`bit_or`/`bit_xor`, and the statistical set —
   `stddev`/`stddev_pop`/`stddev_samp`, `variance`/`var_pop`/`var_samp`, `covar_pop`/`covar_samp`,
   `corr`, `regr_*` (exact over `decimal`, PostgreSQL's `float8` results over floats). Each needs its
   spill/query-memory accounting (memory.md §6). _(size: M)_

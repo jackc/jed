@@ -5723,6 +5723,18 @@ result       = "same_as_input"
 null         = "aggregate"
 errors       = []
 
+# bool_and(boolean) -> boolean (aggregates.md §23): TRUE iff every non-NULL input is TRUE; NULL over
+# an empty/all-NULL group. Order-insensitive (commutative, associative, idempotent).
+[[aggregate]]
+name         = "bool_and"
+kind         = "aggregate"
+surface      = "bool_and"
+arg          = "expr"
+arg_families = ["boolean"]
+result       = "boolean"
+null         = "aggregate"
+errors       = []
+
 # json/jsonb array aggregates (B4, json-sql-functions.md §4): aggregate the input values into a JSON
 # array, in the group's row order (or the in-aggregate ORDER BY). json_agg/jsonb_agg INCLUDE a NULL
 # input (as JSON null); the _strict variants SKIP a NULL input. Result NULL over an empty group. Each

@@ -6709,6 +6709,15 @@ pub const AGGREGATES: &[AggregateDesc] = &[
         errors: &[],
     },
     AggregateDesc {
+        name: "bool_and",
+        surface: "bool_and",
+        arg: "expr",
+        arg_families: &["boolean"],
+        result: "boolean",
+        null: "aggregate",
+        errors: &[],
+    },
+    AggregateDesc {
         name: "jsonb_agg",
         surface: "jsonb_agg",
         arg: "expr",

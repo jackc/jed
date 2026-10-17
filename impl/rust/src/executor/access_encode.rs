@@ -6078,6 +6078,8 @@ pub(crate) enum AggPlan {
     AvgFloat(ScalarType),
     Min,
     Max,
+    /// bool_and(x) — TRUE iff every non-NULL input is TRUE (aggregates.md §23).
+    BoolAnd,
     /// json_agg / jsonb_agg (and the `_strict` variants) — aggregate the inputs' JSON images into a
     /// JSON array (json-sql-functions.md §4). `compact` selects the `json` (compact) vs `jsonb`
     /// (canonical) result render; `strict` skips a NULL input (else a NULL → JSON null).
@@ -6245,6 +6247,12 @@ pub(crate) enum Acc {
         any_nan: bool,
         pos_inf: bool,
         neg_inf: bool,
+    },
+    /// bool_and: the running conjunction of the non-NULL inputs, `None` until one is folded
+    /// (aggregates.md §23).
+    Bool {
+        cur: Option<bool>,
+        is_and: bool,
     },
     MinMax {
         cur: Option<Value>,

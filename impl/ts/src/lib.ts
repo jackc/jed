@@ -199,6 +199,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json[b]_object_agg[_unique] (B4) — the JSON-object aggregate builders (json-sql-functions.md §4).
   // Aggregate a group's (key, value) pairs into one JSON object; _unique errors 22030 on a dup key.
   "func.json_object_agg",
+  // bool_and(boolean) — TRUE iff every non-NULL input is TRUE (aggregates.md §23).
+  "func.bool_and",
   // The IS JSON predicate (S1) — expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT)
   // UNIQUE [KEYS]], the SQL/JSON well-formedness test (json-sql-functions.md §5).
   "expr.is_json",
