@@ -760,6 +760,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `variance(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | PostgreSQL's alias of `var_samp` |
 | `stddev_pop(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the population standard deviation |
 | `stddev_samp(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the sample standard deviation |
+| `stddev(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | PostgreSQL's alias of `stddev_samp` |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -840,3 +841,4 @@ bounded-spill lane: exact `[int N, decimal Σx, decimal Σx²]`, float `[f64 N, 
 - `variance` is PostgreSQL's historical alias of `var_samp`.
 - `stddev_pop` is the population standard deviation, the square root of `var_pop`.
 - `stddev_samp` is the sample standard deviation, the square root of `var_samp`.
+- `stddev` is PostgreSQL's historical alias of `stddev_samp`.
