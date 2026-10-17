@@ -948,6 +948,13 @@ func (db *engine) lkpStoreScoped(scope *string, name string) *tableStore {
 // writeStoreScoped resolves a table's WRITE store honoring an explicit database qualifier, marking the
 // right domain dirty (main / temp / the attachment); nil scope keeps the bare temp-first funnel.
 func (db *engine) writeStoreScoped(scope *string, name string) *tableStore {
+	net := db.session.netStaging()
+	store := db.writeStoreScopedRaw(scope, name)
+	store.setNetStaging(net)
+	return store
+}
+
+func (db *engine) writeStoreScopedRaw(scope *string, name string) *tableStore {
 	if scope == nil {
 		return db.writeStore(name)
 	}
@@ -1020,6 +1027,13 @@ func (db *engine) lkpIndexStoreScoped(scope *string, nameKey string) *tableStore
 }
 
 func (db *engine) writeIndexStoreScoped(scope *string, nameKey string) *tableStore {
+	net := db.session.netStaging()
+	store := db.writeIndexStoreScopedRaw(scope, nameKey)
+	store.setNetStaging(net)
+	return store
+}
+
+func (db *engine) writeIndexStoreScopedRaw(scope *string, nameKey string) *tableStore {
 	if scope == nil {
 		return db.writeIndexStore(nameKey)
 	}
@@ -1162,11 +1176,16 @@ func (db *engine) lkpStore(name string) *tableStore {
 // (flagging tempDirty) and a persistent write to working (which flags mainDirty) — so a pure-temp
 // transaction leaves the main image untouched (temp-tables.md §2).
 func (db *engine) writeStore(name string) *tableStore {
+	net := db.session.netStaging()
+	var store *tableStore
 	if db.isTempTable(name) {
 		db.session.tx.tempDirty = true
-		return db.session.tx.tempWorking.store(name)
+		store = db.session.tx.tempWorking.store(name)
+	} else {
+		store = db.working().store(name)
 	}
-	return db.working().store(name)
+	store.setNetStaging(net)
+	return store
 }
 
 // lkpIndexStore returns a secondary index's store for READS, walking session-local → main
@@ -1181,11 +1200,16 @@ func (db *engine) lkpIndexStore(nameKey string) *tableStore {
 // writeIndexStore returns a secondary index's store for MUTATION, walking session-local → main
 // (flagging the matching dirty bit).
 func (db *engine) writeIndexStore(nameKey string) *tableStore {
+	net := db.session.netStaging()
+	var store *tableStore
 	if db.tempSnap().hasIndexStore(nameKey) {
 		db.session.tx.tempDirty = true
-		return db.session.tx.tempWorking.indexStore(nameKey)
+		store = db.session.tx.tempWorking.indexStore(nameKey)
+	} else {
+		store = db.working().indexStore(nameKey)
 	}
-	return db.working().indexStore(nameKey)
+	store.setNetStaging(net)
+	return store
 }
 
 // InTransaction reports whether an explicit transaction block is currently open
@@ -1713,6 +1737,10 @@ func (s *sessionState) resetStatementMemory() {
 		*s.queryBytes = *s.queryFloor
 	}
 }
+
+// netStaging reports whether the session's writes keep the per-key record that makes pending writes
+// net (memory.md §7.1): only under a finite query-memory budget, so the default path pays nothing.
+func (s *sessionState) netStaging() bool { return s.maxQueryMemoryBytes > 0 }
 
 // pendingWriteBytes is the stored bytes the open transaction's working snapshots (main and attached
 // databases) have staged — its pending writes (memory.md §7). Session-local temp tables are bounded by

@@ -2502,15 +2502,21 @@ export class Engine {
   // right domain dirty (main / temp / the attachment); an undefined scope keeps the bare temp-first funnel.
   private writeStoreScoped(scope: string | undefined, name: string): TableStore {
     if (scope === undefined) return this.writeStore(name);
+    const net = this.session.netStaging();
+    let store: TableStore;
     switch (scope) {
       case "temp":
         this.session.tx!.tempDirty = true;
-        return this.session.tx!.tempWorking.store(name);
+        store = this.session.tx!.tempWorking.store(name);
+        break;
       case "main":
-        return this.working().store(name);
+        store = this.working().store(name);
+        break;
       default:
-        return this.attachWriteSnap(scope)!.store(name);
+        store = this.attachWriteSnap(scope)!.store(name);
     }
+    store.setNetStaging(net);
+    return store;
   }
 
   // lkpIndexStoreScoped / writeIndexStoreScoped are the index-store analogues of lkpStoreScoped /
@@ -2527,15 +2533,21 @@ export class Engine {
 
   private writeIndexStoreScoped(scope: string | undefined, nameKey: string): TableStore {
     if (scope === undefined) return this.writeIndexStore(nameKey);
+    const net = this.session.netStaging();
+    let store: TableStore;
     switch (scope) {
       case "temp":
         this.session.tx!.tempDirty = true;
-        return this.session.tx!.tempWorking.indexStore(nameKey);
+        store = this.session.tx!.tempWorking.indexStore(nameKey);
+        break;
       case "main":
-        return this.working().indexStore(nameKey);
+        store = this.working().indexStore(nameKey);
+        break;
       default:
-        return this.attachWriteSnap(scope)!.indexStore(nameKey);
+        store = this.attachWriteSnap(scope)!.indexStore(nameKey);
     }
+    store.setNetStaging(net);
+    return store;
   }
 
   // compositeDependentAny is the DROP TYPE … RESTRICT dependency check across every visible scope
@@ -2627,11 +2639,16 @@ export class Engine {
   // (flagging tempDirty) and a persistent write to working (which flags mainDirty) — so a pure-temp
   // transaction leaves the main image untouched (temp-tables.md §2).
   private writeStore(name: string): TableStore {
+    const net = this.session.netStaging();
+    let store: TableStore;
     if (this.isTempTable(name)) {
       this.session.tx!.tempDirty = true;
-      return this.session.tx!.tempWorking.store(name);
+      store = this.session.tx!.tempWorking.store(name);
+    } else {
+      store = this.working().store(name);
     }
-    return this.working().store(name);
+    store.setNetStaging(net);
+    return store;
   }
 
   // lkpIndexStore returns a secondary index's store for READS, walking session-local → main
@@ -2646,11 +2663,16 @@ export class Engine {
   // writeIndexStore returns a secondary index's store for MUTATION, walking session-local → main
   // (flagging the matching dirty bit).
   private writeIndexStore(nameKey: string): TableStore {
+    const net = this.session.netStaging();
+    let store: TableStore;
     if (this.tempSnap().hasIndexStore(nameKey)) {
       this.session.tx!.tempDirty = true;
-      return this.session.tx!.tempWorking.indexStore(nameKey);
+      store = this.session.tx!.tempWorking.indexStore(nameKey);
+    } else {
+      store = this.working().indexStore(nameKey);
     }
-    return this.working().indexStore(nameKey);
+    store.setNetStaging(net);
+    return store;
   }
 
   // columnCollations resolves each column's frozen collation (Column.collation, the name) to its

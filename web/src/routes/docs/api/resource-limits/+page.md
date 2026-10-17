@@ -103,9 +103,10 @@ transaction commits or rolls back. Each statement starts with those bytes alread
 adds its own as soon as it has written its rows (beside whatever the statement still holds, such as
 an `INSERT … SELECT`'s source rows or a `RETURNING` result), and after every statement they must
 still fit, so a long transaction of many small `INSERT`s fails with `54P05` instead of growing
-without bound. The count is what the transaction ends up holding: rewriting a row it already wrote
-replaces that row's bytes rather than adding to them, and deleting a row it inserted gives them
-back. Temporary tables are bounded by `max_temp_storage_bytes` instead.
+without bound. While a budget is set, the count is what the transaction ends up holding: rewriting a
+row it already wrote replaces that row's bytes rather than adding to them, and deleting a row it
+inserted gives them back. Writes made with no budget set still count, but are not tracked row by
+row, so rewriting them later counts again. Temporary tables are bounded by `max_temp_storage_bytes` instead.
 
 ## Storage limit
 

@@ -592,7 +592,8 @@ impl Engine {
     /// A table's WRITE store honoring an explicit database qualifier, marking the right domain dirty
     /// (main / temp / the attachment); a `None` scope keeps the bare temp-first funnel.
     pub(crate) fn store_mut_scoped(&mut self, scope: Option<&str>, name: &str) -> &mut TableStore {
-        match scope {
+        let net = self.session.net_staging();
+        let store = match scope {
             None => self.store_mut(name),
             Some(q) => match q.to_string().as_str() {
                 "temp" => self.temp_working_mut().store_mut(name),
@@ -602,7 +603,9 @@ impl Engine {
                     self.attach_write_snap(&other).store_mut(name)
                 }
             },
-        }
+        };
+        store.set_net_staging(net);
+        store
     }
 
     /// A secondary index's READ store honoring an explicit database qualifier (an index belongs to the
@@ -628,7 +631,8 @@ impl Engine {
         scope: Option<&str>,
         name_key: &str,
     ) -> &mut TableStore {
-        match scope {
+        let net = self.session.net_staging();
+        let store = match scope {
             None => self.index_store_mut(name_key),
             Some(q) => match q.to_string().as_str() {
                 "temp" => self.temp_working_mut().index_store_mut(name_key),
@@ -638,7 +642,9 @@ impl Engine {
                     self.attach_write_snap(&other).index_store_mut(name_key)
                 }
             },
-        }
+        };
+        store.set_net_staging(net);
+        store
     }
 
     /// The `DROP TYPE … RESTRICT` dependency check across every visible scope (spec/design/temp-tables.md
