@@ -186,6 +186,7 @@ const (
 	planMax
 	planBoolAnd        // bool_and(x) — TRUE iff every non-NULL input is TRUE (aggregates.md §23)
 	planBoolOr         // bool_or(x) — TRUE iff some non-NULL input is TRUE (aggregates.md §23)
+	planBitAnd         // bit_and(x) — the bitwise AND of the non-NULL integer inputs (aggregates.md §23)
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -558,6 +559,16 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				a.cur, a.hasCur = v, true
 			}
 		}
+	case planBitAnd:
+		// The running bitwise fold of the non-NULL inputs (aggregates.md §23); NULLs are skipped. The
+		// result stays within the input width, so it never overflows.
+		if !v.IsNull() {
+			if !a.hasCur {
+				a.cur, a.hasCur = v, true
+			} else {
+				a.cur = IntValue(a.cur.Int & v.Int)
+			}
+		}
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
 		// Mark the group non-empty even when the strict filter drops this row (an all-skipped group
 		// still finalizes to `[]`, not NULL — only a zero-row group is NULL).
@@ -825,7 +836,7 @@ func (a *acc) finalize() (Value, error) {
 		// A hypothetical-set aggregate is finalized in the group-emission loop (it needs the spec's
 		// per-key sort specs), never through acc.finalize (aggregates.md §19).
 		panic("a hypothetical-set accumulator is finalized in the group-emission loop")
-	default: // planMin, planMax, planBoolAnd, planBoolOr
+	default: // planMin, planMax, planBoolAnd, planBoolOr, planBitAnd
 		if a.hasCur {
 			return a.cur, nil
 		}
