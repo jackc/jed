@@ -201,6 +201,8 @@ const (
 	planVarPopFloat // var_pop(x) over f32/f64
 	planVarSamp
 	planVarSampFloat
+	planStddevPop
+	planStddevPopFloat
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -602,9 +604,9 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				a.cur = IntValue(bitFold(a.plan, a.cur.Int, v.Int))
 			}
 		}
-	case planVarPop, planVarSamp:
+	case planVarPop, planVarSamp, planStddevPop:
 		return a.exact.fold(v, m)
-	case planVarPopFloat, planVarSampFloat:
+	case planVarPopFloat, planVarSampFloat, planStddevPopFloat:
 		return a.float.fold(v)
 	case planStringAgg:
 		// A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
@@ -935,10 +937,10 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), nil
 		}
 		return finalizeStringAgg(a.strRows), nil
-	case planVarPop, planVarSamp:
+	case planVarPop, planVarSamp, planStddevPop:
 		st := momentStats[a.plan]
 		return a.exact.variance(st.sample, st.stddev)
-	case planVarPopFloat, planVarSampFloat:
+	case planVarPopFloat, planVarSampFloat, planStddevPopFloat:
 		st := momentStats[a.plan]
 		return a.float.variance(st.sample, st.stddev), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:

@@ -11,9 +11,10 @@ import "math"
 
 // momentSurfaces maps each one-argument statistical aggregate to its exact and float plans.
 var momentSurfaces = map[string][2]aggPlan{
-	"var_pop":  {planVarPop, planVarPopFloat},
-	"var_samp": {planVarSamp, planVarSampFloat},
-	"variance": {planVarSamp, planVarSampFloat},
+	"stddev_pop": {planStddevPop, planStddevPopFloat},
+	"var_pop":    {planVarPop, planVarPopFloat},
+	"var_samp":   {planVarSamp, planVarSampFloat},
+	"variance":   {planVarSamp, planVarSampFloat},
 }
 
 // momentStat is what a statistical plan finalizes: a sample (N − 1) or population (N) statistic, and
@@ -22,6 +23,7 @@ type momentStat struct{ sample, stddev bool }
 
 // momentStats gives each statistical plan's statistic.
 var momentStats = map[aggPlan]momentStat{
+	planStddevPop: {stddev: true}, planStddevPopFloat: {stddev: true},
 	planVarPop: {}, planVarPopFloat: {},
 	planVarSamp: {sample: true}, planVarSampFloat: {sample: true},
 }

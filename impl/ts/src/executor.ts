@@ -32252,6 +32252,8 @@ export type AggPlan =
   | "varPopFloat"
   | "varSamp"
   | "varSampFloat"
+  | "stddevPop"
+  | "stddevPopFloat"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32727,6 +32729,7 @@ export function finalizeArrayAgg(plan: AggPlan, elems: Value[]): Value {
 // or population (N) statistic, a standard deviation or a variance — and whether it is the float form.
 const MOMENT_SURFACES: Record<string, [AggPlan, AggPlan]> = {
   var_pop: ["varPop", "varPopFloat"],
+  stddev_pop: ["stddevPop", "stddevPopFloat"],
   var_samp: ["varSamp", "varSampFloat"],
   variance: ["varSamp", "varSampFloat"],
 };
@@ -32734,6 +32737,8 @@ const MOMENT_STATS: Partial<
   Record<AggPlan, { sample: boolean; stddev: boolean; float: boolean }>
 > = {
   varPop: { sample: false, stddev: false, float: false },
+  stddevPop: { sample: false, stddev: true, float: false },
+  stddevPopFloat: { sample: false, stddev: true, float: true },
   varPopFloat: { sample: false, stddev: false, float: true },
   varSamp: { sample: true, stddev: false, float: false },
   varSampFloat: { sample: true, stddev: false, float: true },
@@ -32859,6 +32864,8 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
     case "varPopFloat":
     case "varSamp":
     case "varSampFloat":
+    case "stddevPop":
+    case "stddevPopFloat":
       if (MOMENT_STATS[a.plan]!.float) foldFloatMoment(a, v);
       else foldExactMoment(a, v, m);
       break;
@@ -33088,6 +33095,8 @@ export function finalizeAcc(a: Acc): Value {
     case "varPopFloat":
     case "varSamp":
     case "varSampFloat":
+    case "stddevPop":
+    case "stddevPopFloat":
       return finalizeMoment(a);
     case "countStar":
     case "count":
