@@ -1093,6 +1093,10 @@ id = "func.variance"
 description = "variance(x) (aggregates.md §23): PostgreSQL's historical alias for var_samp, with the same results. Builds on func.var_samp"
 
 [[capability]]
+id = "func.stddev_pop"
+description = "stddev_pop(x) (aggregates.md §23): the population standard deviation — the square root of var_pop, taken over exact input by PostgreSQL's sqrt_var at the variance's own select_div_scale (a decimal result) and over float input by IEEE sqrt (an f64 result). Builds on func.var_pop"
+
+[[capability]]
 id = "func.json_object_agg"
 description = "json/jsonb object aggregates (B4, spec/design/json-sql-functions.md §4): jsonb_object_agg(key, value) / json_object_agg(key, value) aggregate the group's (key, value) pairs into a single JSON object; jsonb_object_agg_unique / json_object_agg_unique additionally error 22030 ('duplicate JSON object key value') on a duplicate key. The key is always a JSON string (§2.2: a number/boolean its text, a datetime its ISO 8601 form, any other scalar its text output; an array/composite/json/jsonb key → 22023); a NULL key → 22004 (json_object_agg) / 22023 'field name must not be null' (jsonb_object_agg). The value is its JSON image (§2.2); a float key or value is a ledgered deferred 0A000. An empty group → SQL NULL. jsonb_object_agg canonicalizes (last-wins dedup, canonical key order, spaced); json_object_agg keeps the group's row order + duplicate keys and uses PG's idiosyncratic '{ … }' brace-padded ', ' / ' : ' spacing. These are 2-argument aggregates, hand-resolved (the single-operand aggregate catalog can't express a key/value pair) — the key/value pair is carried as a Row operand. Deterministic under an ORDER BY of the source. Oracle-pinned (postgres:18). Builds on func.json_agg"
 
