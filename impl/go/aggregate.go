@@ -188,6 +188,7 @@ const (
 	planBoolOr         // bool_or(x) — TRUE iff some non-NULL input is TRUE (aggregates.md §23)
 	planBitAnd         // bit_and(x) — the bitwise AND of the non-NULL integer inputs (aggregates.md §23)
 	planBitOr          // bit_or(x) — the bitwise OR of the non-NULL integer inputs
+	planBitXor         // bit_xor(x) — the bitwise XOR of the non-NULL integer inputs
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -560,7 +561,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				a.cur, a.hasCur = v, true
 			}
 		}
-	case planBitAnd, planBitOr:
+	case planBitAnd, planBitOr, planBitXor:
 		// The running bitwise fold of the non-NULL inputs (aggregates.md §23); NULLs are skipped. The
 		// result stays within the input width, so it never overflows.
 		if !v.IsNull() {
@@ -656,8 +657,10 @@ func bitFold(plan aggPlan, cur, v int64) int64 {
 	switch plan {
 	case planBitAnd:
 		return cur & v
-	default: // planBitOr
+	case planBitOr:
 		return cur | v
+	default: // planBitXor
+		return cur ^ v
 	}
 }
 

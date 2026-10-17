@@ -6491,6 +6491,15 @@ export const AGGREGATES: readonly AggregateDesc[] = [
     errors: [],
   },
   {
+    name: "bit_xor",
+    surface: "bit_xor",
+    arg: "expr",
+    argFamilies: ["integer"],
+    result: "same_as_input",
+    null: "aggregate",
+    errors: [],
+  },
+  {
     name: "jsonb_agg",
     surface: "jsonb_agg",
     arg: "expr",

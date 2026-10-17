@@ -28,7 +28,7 @@ func blockingAccRow(a *acc) storedRow {
 	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
 		f := a.floatSum
 		return storedRow{Float64Value(f.total), IntValue(f.count), BoolValue(f.sawNaN), BoolValue(f.sawPosInf), BoolValue(f.sawNegInf)}
-	case planMin, planMax, planBoolAnd, planBoolOr, planBitAnd, planBitOr:
+	case planMin, planMax, planBoolAnd, planBoolOr, planBitAnd, planBitOr, planBitXor:
 		if !a.hasCur {
 			return storedRow{NullValue()}
 		}
@@ -62,7 +62,7 @@ func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
 		f := a.floatSum
 		f.total, f.count = r[0].F64(), r[1].Int
 		f.sawNaN, f.sawPosInf, f.sawNegInf = r[2].boolVal(), r[3].boolVal(), r[4].boolVal()
-	case planMin, planMax, planBoolAnd, planBoolOr, planBitAnd, planBitOr:
+	case planMin, planMax, planBoolAnd, planBoolOr, planBitAnd, planBitOr, planBitXor:
 		if !r[0].IsNull() {
 			a.cur, a.hasCur = r[0], true
 		}

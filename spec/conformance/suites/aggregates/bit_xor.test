@@ -1,0 +1,101 @@
+# Aggregate bit_xor(integer) -> the input type (spec/design/aggregates.md §23): the bitwise XOR of
+# the non-NULL inputs. NULL inputs are skipped; an empty or all-NULL group -> NULL. Output name
+# `bit_xor`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i16, types.i32, types.i64, resource.cost_metering, func.bit_xor, func.bit_and
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, a i32, s i16, l i64)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 7, 12, -1), (2, 1, NULL, NULL, NULL), (3, 1, 13, 10, 9223372036854775807), (4, 2, -1, -6, -9223372036854775808), (5, 2, -8, 3, 5), (6, 3, NULL, NULL, NULL)
+
+# 6 rows read + 1 leaf page read + 6 accumulated + 1 produced.
+# names: bit_xor
+# cost: 14
+query I nosort
+SELECT bit_xor(a) FROM t
+----
+13
+
+# names: bit_xor, bit_xor, bit_xor
+query III nosort
+SELECT bit_xor(a), bit_xor(s), bit_xor(l) FROM t WHERE g = 1
+----
+10
+6
+-9223372036854775808
+
+# names: bit_xor, bit_xor, bit_xor
+query III nosort
+SELECT bit_xor(a), bit_xor(s), bit_xor(l) FROM t WHERE g = 2
+----
+7
+-7
+-9223372036854775803
+
+# All-NULL and empty groups are NULL.
+# names: g, bit_xor
+query II rowsort
+SELECT g, bit_xor(a) FROM t GROUP BY g
+----
+1
+10
+2
+7
+3
+NULL
+
+# names: bit_xor
+query I nosort
+SELECT bit_xor(a) FROM t WHERE g = 9
+----
+NULL
+
+# names: bit_xor
+query I nosort
+SELECT bit_xor(a + 1) FROM t WHERE g = 1
+----
+6
+
+# names: bit_xor
+query I nosort
+SELECT bit_xor(DISTINCT a) FILTER (WHERE id < 4) FROM t
+----
+10
+
+# names: id, bit_xor
+query II nosort
+SELECT id, bit_xor(a) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+7
+2
+7
+3
+10
+4
+-11
+5
+13
+6
+13
+
+statement error 42883
+SELECT bit_xor(a::numeric) FROM t
+
+statement error 42883
+SELECT bit_xor(a > 0) FROM t
+
+# XOR is not idempotent: a repeated value cancels, unless DISTINCT drops it first.
+statement ok
+CREATE TABLE r (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO r VALUES (1, 6), (2, 6), (3, 3)
+
+# names: bit_xor, bit_xor
+query II nosort
+SELECT bit_xor(a), bit_xor(DISTINCT a) FROM r
+----
+3
+5

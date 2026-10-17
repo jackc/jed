@@ -6062,6 +6062,7 @@ pub(crate) enum WindowPlan {
 pub(crate) enum BitOp {
     And,
     Or,
+    Xor,
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
