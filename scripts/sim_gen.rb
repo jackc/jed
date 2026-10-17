@@ -404,7 +404,10 @@ module SimGen
       if faulted
         kind = if @service && @rng.chance(400)
                  "disconnect nth=#{@rng.range(1, @p.dig("faults", "frames_max") || 8)}"
-               elsif @rng.chance(500)
+               elsif @rng.chance(500) || (@service && @procs.length > 1)
+                 # With several processes a process crash kills only the owner, which the model
+                 # cannot name, so it would lose track of the running processes; a power loss kills
+                 # them all.
                  "power_loss survive=#{draw('survive')} tear=#{draw('tear')} nth=#{@rng.range(1, 2)}"
                else
                  "process_crash issue=#{draw('issue')} nth=#{@rng.range(1, 2)}"
