@@ -199,6 +199,17 @@ fn fk_parent_missing(snap: &Snapshot, name: &str) -> EngineError {
     )
 }
 
+/// PostgreSQL's `ConstraintNameExists` for a derived name's collision walk (constraints.md §6.7):
+/// whether a table of the database domain `snap` — the main database, the session's temp domain, or
+/// one attachment, each its own schema — holds a constraint named `name`. `skip` is the table being
+/// created or altered, whose in-progress definition the caller checks itself; every other table is
+/// read as the statement found it.
+fn schema_constraint_name_taken(snap: &Snapshot, skip: &str, name: &str) -> bool {
+    snap.tables
+        .iter()
+        .any(|(key, t)| key != skip && constraint_name_taken(t, name))
+}
+
 fn constraint_name_taken(t: &Table, name: &str) -> bool {
     t.checks.iter().any(|c| c.name == name)
         || t.indexes.iter().any(|i| i.unique && i.name == name)
@@ -593,6 +604,20 @@ impl Engine {
     /// "relation" word. For a bare/main/temp target `relation_exists` is temp-aware
     /// (preclude-overlaps — temp-tables.md §3); an attachment target checks its OWN snapshot's
     /// namespace (each attached database is independent, attached-databases.md §3).
+    /// The database domain (schema) a CREATE TABLE's new table joins, for the derived constraint
+    /// name walk (constraints.md §6.7): the session's temp domain, an attachment, or main.
+    fn create_table_domain(&self, target_temp: bool, attach_name: Option<&str>) -> &Snapshot {
+        if target_temp {
+            return self.temp_read_snap();
+        }
+        match attach_name {
+            Some(attach) => self
+                .attach_read_snap(attach)
+                .expect("attachment resolved by the caller"),
+            None => self.read_snap(),
+        }
+    }
+
     pub(crate) fn create_table_name_taken(&self, name: &str, attach_name: Option<&str>) -> bool {
         match attach_name {
             Some(attach) => {
@@ -1281,8 +1306,12 @@ impl Engine {
                         [i] => Some(table.columns[*i].name.to_string()),
                         _ => None,
                     };
+                    // A derived name also walks past every constraint name of the table's
+                    // database domain — its schema (constraints.md §6.7).
+                    let domain = self.create_table_domain(target_temp, attach_name.as_deref());
                     choose_object_name(&table.name, column.as_deref(), "check", |n| {
                         checks.iter().any(|c| c.name == n)
+                            || schema_constraint_name_taken(domain, "", n)
                     })
                 }
             };
@@ -1347,8 +1376,11 @@ impl Engine {
                 None => {
                     let names: Vec<&str> = cols.iter().map(|&i| &*table.columns[i].name).collect();
                     let addition = name_addition(&names);
+                    let domain = self.create_table_domain(target_temp, attach_name.as_deref());
                     choose_object_name(&table.name, Some(&addition), "key", |n| {
-                        taken(self, &table, n) || table.checks.iter().any(|c| c.name == n)
+                        taken(self, &table, n)
+                            || table.checks.iter().any(|c| c.name == n)
+                            || schema_constraint_name_taken(domain, "", n)
                     })
                 }
             };
@@ -1469,12 +1501,17 @@ impl Engine {
                         .to_string(),
                 ));
             }
-            // 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
+            // 5. Name — the per-table constraint namespace: the CHECK and UNIQUE constraints
+            // already defined (PostgreSQL creates the indexes before the FKs) and the earlier FKs
+            // (§6.2/§6.7). A derived name also walks past the domain's other tables' names.
+            let local_taken = |n: &str| {
+                table.checks.iter().any(|c| c.name == n)
+                    || table.indexes.iter().any(|i| i.unique && i.name == n)
+                    || resolved_fks.iter().any(|f| f.name == n)
+            };
             let name = match &fk.name {
                 Some(n) => {
-                    if table.checks.iter().any(|c| c.name == *n)
-                        || resolved_fks.iter().any(|f| f.name == *n)
-                    {
+                    if local_taken(n) {
                         return Err(EngineError::new(
                             SqlState::DuplicateObject,
                             format!("constraint {n} for relation {} already exists", table.name),
@@ -1485,9 +1522,9 @@ impl Engine {
                 None => {
                     let names: Vec<&str> = local.iter().map(|&i| &*table.columns[i].name).collect();
                     let addition = name_addition(&names);
+                    let domain = self.create_table_domain(target_temp, attach_name.as_deref());
                     choose_object_name(&table.name, Some(&addition), "fkey", |n| {
-                        table.checks.iter().any(|c| c.name == n)
-                            || resolved_fks.iter().any(|f| f.name == n)
+                        local_taken(n) || schema_constraint_name_taken(domain, "", n)
                     })
                 }
             };
@@ -1585,8 +1622,11 @@ impl Engine {
                     let names: Vec<&str> =
                         indices.iter().map(|&i| &*table.columns[i].name).collect();
                     let addition = name_addition(&names);
+                    let domain = self.create_table_domain(target_temp, attach_name.as_deref());
                     choose_object_name(&table.name, Some(&addition), "excl", |n| {
-                        taken(self, &table, n) || constraint_taken(&table, n)
+                        taken(self, &table, n)
+                            || constraint_taken(&table, n)
+                            || schema_constraint_name_taken(domain, "", n)
                     })
                 }
             };
@@ -2478,7 +2518,10 @@ impl Engine {
                                         &table.name,
                                         column.as_deref(),
                                         "check",
-                                        |n| constraint_name_taken(&table, n),
+                                        |n| {
+                                            constraint_name_taken(&table, n)
+                                                || schema_constraint_name_taken(&snap, &old_key, n)
+                                        },
                                     )
                                 };
                                 if d.name.is_some() && constraint_name_taken(&table, &name) {
@@ -2566,6 +2609,7 @@ impl Engine {
                                             &dropped_owned_sequences,
                                             n,
                                         ) || constraint_name_taken(&table, n)
+                                            || schema_constraint_name_taken(&snap, &old_key, n)
                                     })
                                 };
                                 table.indexes.push(IndexDef {
@@ -2686,6 +2730,7 @@ impl Engine {
                                     let addition = name_addition(&names);
                                     choose_object_name(&table.name, Some(&addition), "fkey", |n| {
                                         constraint_name_taken(&table, n)
+                                            || schema_constraint_name_taken(&snap, &old_key, n)
                                     })
                                 };
                                 for (&li, &ri) in local.iter().zip(&refs) {
@@ -2754,6 +2799,7 @@ impl Engine {
                                             &dropped_owned_sequences,
                                             n,
                                         ) || constraint_name_taken(&table, n)
+                                            || schema_constraint_name_taken(&snap, &old_key, n)
                                     })
                                 };
                                 table.indexes.push(IndexDef {

@@ -6073,6 +6073,15 @@ export class Engine {
   // relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
   // §3); an attachment target checks its OWN snapshot's namespace (each attached database is
   // independent, attached-databases.md §3).
+  // createTableDomain is the database domain (schema) a CREATE TABLE's new table joins, for the
+  // derived constraint-name walk (constraints.md §6.7): the session's temp domain, an attachment, or
+  // main.
+  private createTableDomain(targetTemp: boolean, attachName: string): Snapshot {
+    if (targetTemp) return this.tempSnap();
+    if (attachName !== "") return this.attachReadSnap(attachName)!;
+    return this.readSnap();
+  }
+
   createTableNameTaken(name: string, attachName: string): boolean {
     if (attachName === "") return this.relationExists(name);
     const as = this.attachReadSnap(attachName)!;
@@ -6644,6 +6653,11 @@ export class Engine {
     const checks: CheckConstraint[] = [];
     const nameTaken = (name: string): boolean =>
       checks.some((c) => c.name === name);
+    // A derived name also walks past every constraint name of the table's database domain — its
+    // schema (constraints.md §6.7, PostgreSQL's ChooseConstraintName); an explicit one is checked
+    // against this table alone.
+    const domain = this.createTableDomain(targetTemp, attachName);
+    const schemaTaken = (n: string): boolean => schemaConstraintNameTaken(domain, "", n);
     for (let ci = 0; ci < ct.checks.length; ci++) {
       const def = ct.checks[ci]!;
       let name: string;
@@ -6658,7 +6672,12 @@ export class Engine {
       } else {
         const cols = checkReferencedColumns(def.expr, columns);
         const column = cols.length === 1 ? columns[cols[0]!]!.name : null;
-        name = chooseObjectName(table.name, column, "check", nameTaken);
+        name = chooseObjectName(
+          table.name,
+          column,
+          "check",
+          (n) => nameTaken(n) || schemaTaken(n),
+        );
       }
       checks.push({ name, exprText: def.text, expr: def.expr, hostDeps: checkDeps[ci] });
     }
@@ -6716,7 +6735,7 @@ export class Engine {
           table.name,
           addition,
           "key",
-          (n) => relationTaken(n) || checkNameTaken(n),
+          (n) => relationTaken(n) || checkNameTaken(n) || schemaTaken(n),
         );
       }
       // Insert in catalog (ascending name byte) order — indexes.md §6.
@@ -6809,9 +6828,12 @@ export class Engine {
           "number of referencing and referenced columns for foreign key disagree",
         );
       }
-      // 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
+      // 5. Name — the per-table constraint namespace: the CHECK and UNIQUE constraints already
+      // defined (PostgreSQL creates the indexes before the FKs) and the earlier FKs (§6.2/§6.7). A
+      // derived name also walks past the domain's other tables' constraint names.
       const nameTakenFk = (n: string): boolean =>
         table.checks.some((c) => c.name === n) ||
+        table.indexes.some((i) => i.unique && i.name === n) ||
         resolvedFks.some((f) => f.name === n);
       let fkName: string;
       if (fk.name !== null) {
@@ -6824,7 +6846,12 @@ export class Engine {
         fkName = fk.name;
       } else {
         const addition = nameAddition(local.map((i) => table.columns[i]!.name));
-        fkName = chooseObjectName(table.name, addition, "fkey", nameTakenFk);
+        fkName = chooseObjectName(
+          table.name,
+          addition,
+          "fkey",
+          (n) => nameTakenFk(n) || schemaTaken(n),
+        );
       }
       // 6. Resolve and store the selected referential actions (§6.6).
       const onDelete = fkAction(fk.onDelete, "DELETE");
@@ -6915,7 +6942,12 @@ export class Engine {
         name = exc.name;
       } else {
         const addition = nameAddition(indices.map((i) => table.columns[i]!.name));
-        name = chooseObjectName(table.name, addition, "excl", (n) => relTaken(n) || conTaken(n));
+        name = chooseObjectName(
+          table.name,
+          addition,
+          "excl",
+          (n) => relTaken(n) || conTaken(n) || schemaTaken(n),
+        );
       }
       // Insert the backing GiST index in catalog (ascending name byte) order.
       let pos = table.indexes.findIndex((ix) => compareName(ix, { name }) > 0);
@@ -7679,11 +7711,11 @@ export class Engine {
       }
       case "actions": {
         const added = addedConstraints;
-        const taken = (n: string) =>
-          table.checks.some((c) => c.name === n) ||
-          table.indexes.some((i) => i.unique && i.name === n) ||
-          table.fks.some((f) => f.name === n) ||
-          table.exclusions.some((e) => e.name === n);
+        const taken = (n: string) => tableConstraintNameTaken(table, n);
+        // A derived name also walks past the domain's other tables' constraint names (§6.7).
+        const schemaSnap = snap;
+        const derivedTaken = (n: string) =>
+          taken(n) || schemaConstraintNameTaken(schemaSnap, oldKey, n);
         const actions = [...at.action.actions];
         while (actions.length > 0) {
           const action = actions.shift()!;
@@ -8014,7 +8046,7 @@ export class Engine {
               if (d.name === null) {
                 const rs = checkReferencedColumns(d.expr, table.columns);
                 const column = rs.length === 1 ? table.columns[rs[0]!]!.name : null;
-                name = chooseObjectName(table.name, column, "check", taken);
+                name = chooseObjectName(table.name, column, "check", derivedTaken);
               } else if (taken(d.name)) {
                 throw engineError(
                   "duplicate_object",
@@ -8065,7 +8097,7 @@ export class Engine {
                   table.name,
                   addition,
                   "key",
-                  (n) => workingRelationTaken(n) || taken(n),
+                  (n) => workingRelationTaken(n) || derivedTaken(n),
                 );
               }
               table.indexes.push({
@@ -8152,7 +8184,7 @@ export class Engine {
                   );
               } else {
                 const addition = nameAddition(local.map((i) => table.columns[i]!.name));
-                name = chooseObjectName(table.name, addition, "fkey", taken);
+                name = chooseObjectName(table.name, addition, "fkey", derivedTaken);
               }
               for (let p = 0; p < local.length; p++) {
                 const li = local[p]!,
@@ -8194,7 +8226,7 @@ export class Engine {
                   table.name,
                   addition,
                   "excl",
-                  (n) => workingRelationTaken(n) || taken(n),
+                  (n) => workingRelationTaken(n) || derivedTaken(n),
                 );
               }
               table.indexes.push({
@@ -26569,6 +26601,29 @@ export function ginElementTerm(elem: ScalarType, v: Value): Uint8Array {
 
 // Resolve the EXCLUDE access method, element columns, duplicate-column rule, and operator/opclass
 // pairing once for both CREATE TABLE and ALTER TABLE (spec/design/gist.md §7).
+// tableConstraintNameTaken reports whether table t holds a constraint named name — a CHECK, a
+// UNIQUE constraint (its backing index), a FOREIGN KEY, or an EXCLUDE constraint.
+function tableConstraintNameTaken(t: Table, name: string): boolean {
+  return (
+    t.checks.some((c) => c.name === name) ||
+    t.indexes.some((i) => i.unique && i.name === name) ||
+    t.fks.some((f) => f.name === name) ||
+    t.exclusions.some((e) => e.name === name)
+  );
+}
+
+// schemaConstraintNameTaken is PostgreSQL's ConstraintNameExists for a derived name's collision walk
+// (constraints.md §6.7): whether a table of the database domain snap — the main database, the
+// session's temp domain, or one attachment, each its own schema — holds a constraint named name.
+// skip is the table being created or altered, whose in-progress definition the caller checks itself;
+// every other table is read as the statement found it.
+function schemaConstraintNameTaken(snap: Snapshot, skip: string, name: string): boolean {
+  for (const [key, t] of snap.tables) {
+    if (key !== skip && tableConstraintNameTaken(t, name)) return true;
+  }
+  return false;
+}
+
 function resolveExclusionDefinition(
   table: Table,
   def: ExcludeDef,

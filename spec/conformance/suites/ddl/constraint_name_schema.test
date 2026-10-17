@@ -1,0 +1,101 @@
+# A derived constraint name avoids every constraint name in its schema (spec/design/constraints.md
+# §6.7, grammar.md §3.1) — PostgreSQL's ChooseConstraintName / ChooseRelationName(isconstraint)
+# check pg_constraint across the whole namespace, not only the table being defined. jed's main
+# database is one schema, so a derived CHECK, FOREIGN KEY, UNIQUE, or EXCLUDE name suffix-walks past
+# the constraint names of EVERY table in the database (a CHECK/FK name walks the constraint names; a
+# UNIQUE/EXCLUDE name, which is also its backing index's, walks the relation names too). An EXPLICIT
+# name still collides only within its own table (42710). Each derived name is proven by dropping it
+# (DROP CONSTRAINT fails 42704 on any other name). Oracle-checked against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.alter_table, ddl.constraint_name_schema, types.i32, types.range
+
+# --- CHECK: table t_a's multi-column check and table t's check on a both derive t_a_check ---------
+
+statement ok
+CREATE TABLE t_a (x i32, y i32, CHECK (x > y))
+
+statement ok
+CREATE TABLE t (a i32 CHECK (a > 0))
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT t_a_check1
+
+statement ok
+ALTER TABLE t_a DROP CONSTRAINT t_a_check
+
+# --- an explicit name on another table occupies a derived FK / UNIQUE / EXCLUDE / CHECK name -----
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE holder (z i32, r int4range, CONSTRAINT q_z_fkey CHECK (z > 0), CONSTRAINT w_z_key CHECK (z > 0), CONSTRAINT x_r_excl CHECK (z > 0), CONSTRAINT s_z_check CHECK (z > 0))
+
+statement ok
+CREATE TABLE q (z i32 REFERENCES p)
+
+statement ok
+ALTER TABLE q DROP CONSTRAINT q_z_fkey1
+
+statement ok
+CREATE TABLE w (z i32 UNIQUE)
+
+statement ok
+ALTER TABLE w DROP CONSTRAINT w_z_key1
+
+statement ok
+CREATE TABLE x (r int4range, EXCLUDE USING gist (r WITH &&))
+
+statement ok
+ALTER TABLE x DROP CONSTRAINT x_r_excl1
+
+statement ok
+CREATE TABLE s (z i32 CHECK (z > 0))
+
+statement ok
+ALTER TABLE s DROP CONSTRAINT s_z_check1
+
+# --- ALTER TABLE ... ADD walks the schema too -----------------------------------------------------
+
+statement ok
+CREATE TABLE s2 (z i32, r int4range)
+
+statement ok
+CREATE TABLE holder2 (z i32, CONSTRAINT s2_z_check CHECK (z > 0), CONSTRAINT s2_z_fkey CHECK (z > 0), CONSTRAINT s2_z_key CHECK (z > 0), CONSTRAINT s2_r_excl CHECK (z > 0))
+
+statement ok
+ALTER TABLE s2 ADD CHECK (z > 0), ADD FOREIGN KEY (z) REFERENCES p, ADD UNIQUE (z), ADD EXCLUDE USING gist (r WITH &&)
+
+statement ok
+ALTER TABLE s2 DROP CONSTRAINT s2_z_check1, DROP CONSTRAINT s2_z_fkey1, DROP CONSTRAINT s2_z_key1, DROP CONSTRAINT s2_r_excl1
+
+# a constraint dropped earlier in the same ALTER frees its name
+statement ok
+ALTER TABLE holder2 DROP CONSTRAINT s2_z_check, ADD CONSTRAINT keep CHECK (z > 0)
+
+statement ok
+ALTER TABLE s2 ADD CHECK (z > 0)
+
+statement ok
+ALTER TABLE s2 DROP CONSTRAINT s2_z_check
+
+# --- an explicit name collides only within its own table ------------------------------------------
+
+statement ok
+CREATE TABLE e (z i32 CONSTRAINT q_z_fkey1 CHECK (z > 0))
+
+statement ok
+ALTER TABLE e DROP CONSTRAINT q_z_fkey1
+
+# --- within one CREATE TABLE, an FK name avoids the table's UNIQUE constraint names ---------------
+
+statement ok
+CREATE TABLE r (a i32, CONSTRAINT r_a_fkey UNIQUE (a), FOREIGN KEY (a) REFERENCES p)
+
+statement ok
+ALTER TABLE r DROP CONSTRAINT r_a_fkey1
+
+statement ok
+ALTER TABLE r DROP CONSTRAINT r_a_fkey
+
+statement error 42710
+CREATE TABLE r3 (a i32, CONSTRAINT zz UNIQUE (a), CONSTRAINT zz FOREIGN KEY (a) REFERENCES p)

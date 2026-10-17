@@ -134,7 +134,9 @@ name passed to `nextval('…')` is read the same way: `nextval('MySeq')` means `
 `nextval('"MySeq"')` means `MySeq`. A name may be at most 63 bytes (error `42622`). Names jed
 makes up for unnamed constraints, indexes, and serial sequences (`orders_pkey`, `orders_email_key`,
 `orders_id_seq`) are shortened to fit the same 63 bytes, exactly as PostgreSQL shortens them, so you
-can always refer to them. Names that start with `jed_` are reserved for jed's own catalog relations
+can always refer to them. If another constraint in the same database already has the name jed
+would make up, a number is added (`orders_email_key1`), as in PostgreSQL. Temporary tables and each
+attached database count as separate databases for this. Names that start with `jed_` are reserved for jed's own catalog relations
 (error `42939`).
 
 A quoted name or a string literal can also spell characters by code point, as in PostgreSQL. Put

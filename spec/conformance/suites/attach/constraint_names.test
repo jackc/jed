@@ -1,0 +1,54 @@
+# skip: disk — in-memory host attachments do not survive the disk-mode per-record reopen (a fresh
+# Database handle is opened from the file, and an in-memory attachment lives only on the old handle;
+# spec/design/conformance.md §3, attached-databases.md §5).
+# A derived constraint name's schema walk (spec/design/constraints.md §6.7) with attached databases:
+# each attachment is a separate database, so a derived name on an attachment table walks past that
+# attachment's constraint names only, and a main-database table's past main's only. jed-specific
+# (PostgreSQL has no embedded multi-database model), so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# attach: mydb
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.check, ddl.unique, ddl.alter_table, ddl.constraint_name_schema, types.i32
+
+# an attachment's explicit names do not occupy main's derived names
+statement ok
+CREATE TABLE mydb.holder (a i32, CONSTRAINT t_a_check CHECK (a > 0), CONSTRAINT u_a_key CHECK (a > 0))
+
+statement ok
+CREATE TABLE t (a i32 CHECK (a > 0))
+
+statement ok
+ALTER TABLE t DROP CONSTRAINT t_a_check
+
+statement ok
+CREATE TABLE u (a i32 UNIQUE)
+
+statement ok
+ALTER TABLE u DROP CONSTRAINT u_a_key
+
+# but within the attachment they do
+statement ok
+CREATE TABLE mydb.t (a i32 CHECK (a > 0))
+
+statement ok
+ALTER TABLE mydb.t DROP CONSTRAINT t_a_check1
+
+statement ok
+CREATE TABLE mydb.u (a i32)
+
+statement ok
+ALTER TABLE mydb.u ADD UNIQUE (a)
+
+statement ok
+ALTER TABLE mydb.u DROP CONSTRAINT u_a_key1
+
+# main's names do not occupy the attachment's
+statement ok
+CREATE TABLE holder_main (a i32 CONSTRAINT v_a_check CHECK (a > 0))
+
+statement ok
+CREATE TABLE mydb.v (a i32)
+
+statement ok
+ALTER TABLE mydb.v ADD CHECK (a > 0)
+
+statement ok
+ALTER TABLE mydb.v DROP CONSTRAINT v_a_check

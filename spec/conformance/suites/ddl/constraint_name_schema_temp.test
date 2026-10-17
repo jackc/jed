@@ -1,0 +1,42 @@
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# A derived constraint name's schema walk (spec/design/constraints.md §6.7) with temporary tables: the
+# session's temp tables are their own schema, as PostgreSQL's pg_temp is, so a derived name on a temp
+# table walks past the other temp tables' constraint names only, and one on a persistent table past
+# the persistent tables' only. Oracle-checked against PostgreSQL 18.
+# requires: ddl.create_table, ddl.check, ddl.temp_table, ddl.alter_table, ddl.constraint_name_schema, types.i32
+
+# a temp table's explicit name does not occupy a persistent table's derived name
+statement ok
+CREATE TEMP TABLE holder_t (a i32 CONSTRAINT tm_a_check CHECK (a > 0))
+
+statement ok
+CREATE TABLE tm (a i32 CHECK (a > 0))
+
+statement ok
+ALTER TABLE tm DROP CONSTRAINT tm_a_check
+
+# nor the other way round
+statement ok
+CREATE TABLE holder_p (a i32 CONSTRAINT tt_a_check CHECK (a > 0))
+
+statement ok
+CREATE TEMP TABLE tt (a i32 CHECK (a > 0))
+
+statement ok
+ALTER TABLE tt DROP CONSTRAINT tt_a_check
+
+# but another temp table's name does
+statement ok
+CREATE TEMP TABLE holder_t2 (a i32 CONSTRAINT tt2_a_check CHECK (a > 0))
+
+statement ok
+CREATE TEMP TABLE tt2 (a i32 CHECK (a > 0))
+
+statement ok
+ALTER TABLE tt2 DROP CONSTRAINT tt2_a_check1
+
+statement ok
+ALTER TABLE tt2 ADD CHECK (a < 10), ADD CHECK (a < 9)
+
+statement ok
+ALTER TABLE tt2 DROP CONSTRAINT tt2_a_check1, DROP CONSTRAINT tt2_a_check2

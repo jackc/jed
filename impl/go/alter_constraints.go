@@ -218,6 +218,23 @@ func newAlterConstraintState() *alterConstraintState {
 	return &alterConstraintState{added: map[string]bool{}, other: map[string]*catTable{}}
 }
 
+// schemaConstraintNameTaken is PostgreSQL's ConstraintNameExists for a derived name's collision
+// walk (constraints.md §6.7): whether a table of the database domain snap — the main database, the
+// session's temp domain, or one attachment, each its own schema — holds a constraint named name.
+// skip is the table being created or altered, whose in-progress definition the caller checks
+// itself; every other table is read as the statement found it.
+func schemaConstraintNameTaken(snap *snapshot, skip string, name string) bool {
+	for key, t := range snap.tables {
+		if key == skip {
+			continue
+		}
+		if constraintNameTaken(t, name) {
+			return true
+		}
+	}
+	return false
+}
+
 func constraintNameTaken(t *catTable, name string) bool {
 	for _, c := range t.Checks {
 		if c.Name == name {
@@ -266,7 +283,9 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			}
 		} else {
 			refs := checkReferencedColumns(d.Expr, t.Columns)
-			taken := func(n string) bool { return constraintNameTaken(t, n) }
+			taken := func(n string) bool {
+				return constraintNameTaken(t, n) || schemaConstraintNameTaken(snap, t.Name, n)
+			}
 			if len(refs) == 1 {
 				name = chooseObjectName(t.Name, t.Columns[refs[0]].Name, true, "check", taken)
 			} else {
@@ -308,7 +327,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			}
 		} else {
 			name = chooseObjectName(t.Name, nameAddition(columnNames(t.Columns, cols)), true, "key", func(n string) bool {
-				return relationTaken(n) || constraintNameTaken(t, n)
+				return relationTaken(n) || constraintNameTaken(t, n) || schemaConstraintNameTaken(snap, t.Name, n)
 			})
 		}
 		t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Unique: true, Kind: indexBtree})
@@ -375,7 +394,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			}
 		} else {
 			name = chooseObjectName(t.Name, nameAddition(columnNames(t.Columns, local)), true, "fkey", func(n string) bool {
-				return constraintNameTaken(t, n)
+				return constraintNameTaken(t, n) || schemaConstraintNameTaken(snap, t.Name, n)
 			})
 		}
 		onDelete, err := newFkAction(d.OnDelete, "DELETE")
@@ -460,7 +479,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 		}
 	} else {
 		name = chooseObjectName(t.Name, nameAddition(columnNames(t.Columns, cols)), true, "excl", func(n string) bool {
-			return relationTaken(n) || constraintNameTaken(t, n)
+			return relationTaken(n) || constraintNameTaken(t, n) || schemaConstraintNameTaken(snap, t.Name, n)
 		})
 	}
 	t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Kind: indexGist})
