@@ -992,6 +992,18 @@ fn finalize_exact_pair(stat: PairStat, n: i64, sums: &[Decimal; 5]) -> Result<Va
     let num_xy = count.mul_exact(sxy).add_uncapped(&sx.mul_exact(sy).neg());
     let r = match stat {
         PairStat::CovarPop => num_xy.div(&count.mul_exact(&count))?,
+        PairStat::RegrIntercept => {
+            let num_x = count
+                .mul_exact(&sums[1])
+                .add_uncapped(&sums[0].mul_exact(&sums[0]).neg());
+            if num_x.is_zero() {
+                return Ok(Value::Null);
+            }
+            sums[2]
+                .mul_exact(&sums[1])
+                .add_uncapped(&sums[0].mul_exact(&sums[4]).neg())
+                .div(&num_x)?
+        }
         PairStat::RegrSlope => {
             let num_x = count
                 .mul_exact(&sums[1])
@@ -1113,6 +1125,12 @@ fn finalize_float_pair(stat: PairStat, t: &[f64; 6]) -> Value {
     }
     Value::Float64(match stat {
         PairStat::CovarPop => sxy / n,
+        PairStat::RegrIntercept => {
+            if t[2] == 0.0 {
+                return Value::Null;
+            }
+            (t[3] - t[1] * sxy / t[2]) / n
+        }
         PairStat::RegrSlope => {
             if t[2] == 0.0 {
                 return Value::Null;
