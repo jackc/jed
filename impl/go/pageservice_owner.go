@@ -1294,7 +1294,7 @@ func (c *sharedCore) adoptForeign(o *pageServiceOwner) error {
 }
 
 // maintenanceCommit is the owner-only free-list rebuild after a client commit (page-service.md §6):
-// a client commit never walks the database, so when the high-water passes the reclamation threshold
+// a client commit never walks the database, so when the pages off the free list pass the reclamation threshold
 // and no pin holds back reclamation, the owner commits the unchanged snapshot at the next txid with
 // in-commit reclamation. Called holding the gate, after the catalog adoption.
 func (c *sharedCore) maintenanceCommit(o *pageServiceOwner) {
@@ -1308,7 +1308,7 @@ func (c *sharedCore) maintenanceCommit(o *pageServiceOwner) {
 	if c.oldestLiveVersion(newTxid) != newTxid {
 		return
 	}
-	if !(st.liveAtCompaction == 0 || (st.pageCount > compactMinPages && uint64(st.pageCount) > compactGrowth*uint64(st.liveAtCompaction))) {
+	if !(st.liveAtCompaction == 0 || reclaimDue(st.pageCount, len(st.freePages), st.liveAtCompaction)) {
 		return
 	}
 	snap := rt.committed.clone()

@@ -1337,12 +1337,11 @@ impl Shared {
     }
 
     /// The owner-only free-list rebuild after a client commit (page-service.md §6): a client commit
-    /// never walks the database, so when the high-water passes the reclamation threshold and no pin
+    /// never walks the database, so when the pages off the free list pass the reclamation threshold and no pin
     /// holds back reclamation, the owner commits the unchanged snapshot at the next txid with
     /// in-commit reclamation. Called holding the gate, after the catalog adoption.
     #[cfg(unix)]
     pub(crate) fn maintenance_commit(&self, owner: &crate::pageservice::owner::PageServiceOwner) {
-        use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES};
         let Some(role) = self.current_role() else {
             return;
         };
@@ -1364,8 +1363,11 @@ impl Shared {
             return;
         }
         if !(st.live_at_compaction == 0
-            || (st.page_count > COMPACT_MIN_PAGES
-                && u64::from(st.page_count) > COMPACT_GROWTH * u64::from(st.live_at_compaction)))
+            || crate::format::reclaim_due(
+                st.page_count,
+                st.free_pages.len(),
+                st.live_at_compaction,
+            ))
         {
             return;
         }

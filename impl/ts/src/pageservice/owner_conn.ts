@@ -146,6 +146,14 @@ function metaPageCount(meta: Uint8Array): number {
   return ((meta[24]! << 24) | (meta[25]! << 16) | (meta[26]! << 8) | meta[27]!) >>> 0;
 }
 
+// reclaimDue mirrors format.ts reclaimDue (format.md *Reclamation*), kept here so the service does not
+// import the engine: the pages off the free list exceed compact_min_pages and compact_growth × the
+// live count at the last reclamation.
+function reclaimDue(pageCount: number, free: number, live: number): boolean {
+  const unlisted = pageCount - free;
+  return unlisted > COMPACT_MIN_PAGES && unlisted > COMPACT_GROWTH * live;
+}
+
 function freeListHead(meta: Uint8Array): number {
   return ((meta[28]! << 24) | (meta[29]! << 16) | (meta[30]! << 8) | meta[31]!) >>> 0;
 }
@@ -766,24 +774,41 @@ export class Connection {
       this.db.stopServing();
       return;
     }
-    let maintenance: boolean;
+    let due: boolean;
+    let live = 0;
     state.lock();
     try {
       state.unpinLocked(w.base, 1);
       state.publishLocked(d.txid, d.meta, d.written);
       state.bumpEpoch();
-      // A maintenance commit is due when the high-water passed the reclamation threshold and no pin —
-      // every pin is older than the next txid — holds back reclamation (README §6.4).
-      const pageCount = d.parsed.pageCount;
-      const live = state.liveAtCompactionLocked();
-      maintenance = this.db.maintenanceDue(
+      // A maintenance commit is due when the pages off the free list passed the reclamation
+      // threshold (format.md *Reclamation*) and no pin — every pin is older than the next txid —
+      // holds back reclamation (README §6.4). The high-water bounds that count from above, so the
+      // committed free list is read below only when the high-water alone passes.
+      live = state.liveAtCompactionLocked();
+      due =
         state.oldestPinnedLocked() === null &&
-          state.engineOldestLocked() === null &&
-          (live === 0 || (pageCount > COMPACT_MIN_PAGES && pageCount > COMPACT_GROWTH * live)),
-      );
+        state.engineOldestLocked() === null &&
+        (live === 0 || reclaimDue(d.parsed.pageCount, 0, live));
     } finally {
       state.unlock();
     }
+    if (due && live !== 0) {
+      let free: number[] | null;
+      try {
+        free = readFreeListChain(
+          (p) => this.db.readPage(p),
+          freeListHead(d.meta),
+          d.parsed.pageCount,
+        );
+      } catch {
+        free = null;
+      }
+      // An unreadable chain hands the gate over anyway: the engine's maintenance commit decides
+      // again from the free list it adopts.
+      due = free === null || reclaimDue(d.parsed.pageCount, free.length, live);
+    }
+    const maintenance = this.db.maintenanceDue(due);
     const n = this.pins.get(w.base) ?? 0;
     if (n <= 1) this.pins.delete(w.base);
     else this.pins.set(w.base, n - 1);

@@ -68,6 +68,7 @@ import {
   loadEngine,
   loadEnginePaged,
   newAttachedStorage,
+  reclaimDue,
   toImage as toImageBytes,
 } from "./format.ts";
 import type { CompositeType, Table, ViewDef } from "./catalog.ts";
@@ -83,7 +84,6 @@ import {
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
 import { metaChecksum } from "./commit_manifest.ts";
-import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import type { BlockStore } from "./blockstore.ts";
 import { EngineError, engineError } from "./errors.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
@@ -918,7 +918,7 @@ class SharedCore {
   }
 
   // maintenanceCommit is the owner-only free-list rebuild after client commits (page-service.md §6): a
-  // client commit never walks the database, so when the high-water passes the reclamation threshold
+  // client commit never walks the database, so when the pages off the free list pass the reclamation threshold
   // and no pin holds back reclamation, the owner commits the unchanged snapshot at the next txid with
   // in-commit reclamation. Called holding the gate, after adoption.
   private maintenanceCommit(): void {
@@ -929,7 +929,7 @@ class SharedCore {
     if (
       !(
         st.liveAtCompaction === 0 ||
-        (st.pageCount > COMPACT_MIN_PAGES && st.pageCount > COMPACT_GROWTH * st.liveAtCompaction)
+        reclaimDue(st.pageCount, st.freePages.length, st.liveAtCompaction)
       )
     ) {
       return;
