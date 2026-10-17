@@ -1948,13 +1948,15 @@ export function seqBoundCheckLast(lastValue: bigint, minValue: bigint, maxValue:
 
 // applySeqAlter re-edits an existing SequenceDef per ALTER SEQUENCE s <options>
 // (spec/design/sequences.md §15.2) — PG init_params with isInit=false. Only the WRITTEN options
-// change; lastValue/isCalled are preserved unless restart is given. The value type is not persisted
-// (§14.4), so NO MINVALUE/NO MAXVALUE reset the open direction to the bigint bound and an explicit
-// bound is i64-checked only. options.dataType must be null (the caller rejects AS as 0A000 first).
+// change; lastValue/isCalled are preserved unless restart is given. `dtype` is the sequence data
+// type the bounds are checked against: bigint for ALTER SEQUENCE (the value type is not persisted,
+// §14.4), the column type for an identity column's `ALTER TABLE … ALTER COLUMN … SET`
+// (spec/design/alter.md §2.8). options.dataType must be null (the caller rejects AS as 0A000 first).
 export function applySeqAlter(
   existing: SequenceDef,
   options: SeqOptions,
   restart: SeqRestart | null,
+  dtype: SeqDataType,
 ): SequenceDef {
   const def = { ...existing };
   if (options.increment !== null) {
@@ -1972,10 +1974,31 @@ export function applySeqAlter(
     }
     def.cache = options.cache;
   }
-  // NO MINVALUE/NO MAXVALUE recompute the default for the (possibly new) INCREMENT sign — against the
-  // bigint range (the value type is not persisted, §14.4). An explicit bound is taken as written; an
+  // NO MINVALUE/NO MAXVALUE recompute the default for the (possibly new) INCREMENT sign against
+  // `dtype`. An explicit bound must lie in `dtype`'s range (MAX checked first, PG order); an
   // unwritten bound is preserved (PG keeps it even when the sign flips).
-  const [defMin, defMax] = seqDataTypeDefaultBounds("bigint", def.increment);
+  const [defMin, defMax] = seqDataTypeDefaultBounds(dtype, def.increment);
+  const [typeMin, typeMax] = seqDataTypeRange(dtype);
+  if (
+    options.maxValue !== null &&
+    options.maxValue.value !== null &&
+    options.maxValue.value > typeMax
+  ) {
+    throw engineError(
+      "invalid_parameter_value",
+      `MAXVALUE (${options.maxValue.value}) is out of range for sequence data type ${seqDataTypePgName(dtype)}`,
+    );
+  }
+  if (
+    options.minValue !== null &&
+    options.minValue.value !== null &&
+    options.minValue.value < typeMin
+  ) {
+    throw engineError(
+      "invalid_parameter_value",
+      `MINVALUE (${options.minValue.value}) is out of range for sequence data type ${seqDataTypePgName(dtype)}`,
+    );
+  }
   if (options.minValue !== null) {
     def.minValue = options.minValue.value === null ? defMin : options.minValue.value;
   }

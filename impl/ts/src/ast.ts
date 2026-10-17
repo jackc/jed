@@ -758,6 +758,11 @@ export type SeqOptions = {
   start: bigint | null;
   cache: bigint | null;
   cycle: boolean | null;
+  // sequenceName is `SEQUENCE NAME name` — valid only inside an identity column's `( … )` options,
+  // where it names the owned sequence instead of the auto-chosen `<table>_<column>_seq`
+  // (spec/design/sequences.md §13.1). Anywhere else (CREATE / ALTER SEQUENCE) it is 42601, as in
+  // PostgreSQL.
+  sequenceName: string | null;
 };
 
 // emptySeqOptions builds a fresh SeqOptions with every override unset (the all-default sequence).
@@ -770,6 +775,7 @@ export function emptySeqOptions(): SeqOptions {
     start: null,
     cache: null,
     cycle: null,
+    sequenceName: null,
   };
 }
 
@@ -783,7 +789,8 @@ export function seqOptionsHasAny(o: SeqOptions): boolean {
     o.maxValue !== null ||
     o.start !== null ||
     o.cache !== null ||
-    o.cycle !== null
+    o.cycle !== null ||
+    o.sequenceName !== null
   );
 }
 
@@ -872,7 +879,23 @@ export type AlterColumnAction = {
     | { kind: "dropDefault" }
     | { kind: "setNotNull" }
     | { kind: "dropNotNull" }
-    | { kind: "setType"; typeName: string; typeMod: TypeMod | null; using: Expr | null };
+    | { kind: "setType"; typeName: string; typeMod: TypeMod | null; using: Expr | null }
+    // `ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]` (alter.md §2.8): make
+    // an existing NOT NULL, default-less integer column an identity column with a new owned sequence.
+    | { kind: "addIdentity"; identity: IdentitySpec }
+    // One or more of `SET GENERATED { ALWAYS | BY DEFAULT }`, `SET <sequence_option>`, and
+    // `RESTART [[WITH] n]` on an identity column (alter.md §2.8). `generated` is true for ALWAYS,
+    // false for BY DEFAULT, null when unset; `options`/`restart` edit the owned sequence exactly as
+    // `ALTER SEQUENCE` does, with the column type as the sequence type.
+    | {
+        kind: "setIdentity";
+        generated: boolean | null;
+        options: SeqOptions;
+        restart: SeqRestart | null;
+      }
+    // `DROP IDENTITY [IF EXISTS]` (alter.md §2.8): drop the owned sequence and the synthesized
+    // default; the column stays NOT NULL.
+    | { kind: "dropIdentity"; ifExists: boolean };
 };
 
 // Insert is an INSERT ... [(col, ..)] whose rows come from DEFAULT VALUES, a VALUES list (each

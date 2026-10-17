@@ -1778,85 +1778,109 @@ class Parser {
           }
           break;
         }
-        // `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw type
-        // name is stored; it is resolved (and a non-integer type rejected 22023) at execution.
-        // Inside an IDENTITY column's `( … )` a set dataType is 42601.
-        case "as": {
-          this.dupCheck(seq.dataType !== null, "AS");
-          this.advance();
-          seq.dataType = this.expectTypeName();
-          break;
-        }
-        case "increment": {
-          this.dupCheck(seq.increment !== null, "INCREMENT");
-          this.advance();
-          this.consumeKeyword("by");
-          seq.increment = this.parseSignedIntLiteral();
-          break;
-        }
-        case "minvalue": {
-          this.dupCheck(seq.minValue !== null, "MINVALUE");
-          this.advance();
-          seq.minValue = { value: this.parseSignedIntLiteral() };
-          break;
-        }
-        case "maxvalue": {
-          this.dupCheck(seq.maxValue !== null, "MAXVALUE");
-          this.advance();
-          seq.maxValue = { value: this.parseSignedIntLiteral() };
-          break;
-        }
-        case "start": {
-          this.dupCheck(seq.start !== null, "START");
-          this.advance();
-          this.consumeKeyword("with");
-          seq.start = this.parseSignedIntLiteral();
-          break;
-        }
-        case "cache": {
-          this.dupCheck(seq.cache !== null, "CACHE");
-          this.advance();
-          seq.cache = this.parseSignedIntLiteral();
-          break;
-        }
-        case "cycle": {
-          this.dupCheck(seq.cycle !== null, "CYCLE");
-          this.advance();
-          seq.cycle = true;
-          break;
-        }
-        // `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
-        case "no": {
-          this.advance();
-          switch (this.peekKeyword()) {
-            case "minvalue":
-              this.dupCheck(seq.minValue !== null, "MINVALUE");
-              this.advance();
-              seq.minValue = { value: null };
-              break;
-            case "maxvalue":
-              this.dupCheck(seq.maxValue !== null, "MAXVALUE");
-              this.advance();
-              seq.maxValue = { value: null };
-              break;
-            case "cycle":
-              this.dupCheck(seq.cycle !== null, "CYCLE");
-              this.advance();
-              seq.cycle = false;
-              break;
-            default:
-              throw engineError(
-                "syntax_error",
-                `expected MINVALUE, MAXVALUE, or CYCLE after NO, found '${this.peekKeyword()}'`,
-              );
-          }
-          break;
-        }
         default:
-          if (parenthesized) this.expect("rparen");
-          return { options: seq, restart };
+          if (!this.parseOneSeqOption(seq)) {
+            if (parenthesized) this.expect("rparen");
+            return { options: seq, restart };
+          }
       }
     }
+  }
+
+  // parseOneSeqOption parses one order-free sequence option (`sequence_option` in grammar.ebnf) into
+  // `seq`, or returns false when the next token starts none. Shared by the CREATE/ALTER SEQUENCE and
+  // identity `( … )` option loops and by `ALTER TABLE … ALTER COLUMN … SET <sequence_option>`
+  // (spec/design/alter.md §2.8).
+  private parseOneSeqOption(seq: SeqOptions): boolean {
+    switch (this.peekKeyword()) {
+      // `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw type
+      // name is stored; it is resolved (and a non-integer type rejected 22023) at execution.
+      // Inside an IDENTITY column's `( … )` a set dataType is 42601.
+      case "as": {
+        this.dupCheck(seq.dataType !== null, "AS");
+        this.advance();
+        seq.dataType = this.expectTypeName();
+        break;
+      }
+      case "increment": {
+        this.dupCheck(seq.increment !== null, "INCREMENT");
+        this.advance();
+        this.consumeKeyword("by");
+        seq.increment = this.parseSignedIntLiteral();
+        break;
+      }
+      case "minvalue": {
+        this.dupCheck(seq.minValue !== null, "MINVALUE");
+        this.advance();
+        seq.minValue = { value: this.parseSignedIntLiteral() };
+        break;
+      }
+      case "maxvalue": {
+        this.dupCheck(seq.maxValue !== null, "MAXVALUE");
+        this.advance();
+        seq.maxValue = { value: this.parseSignedIntLiteral() };
+        break;
+      }
+      case "start": {
+        this.dupCheck(seq.start !== null, "START");
+        this.advance();
+        this.consumeKeyword("with");
+        seq.start = this.parseSignedIntLiteral();
+        break;
+      }
+      case "cache": {
+        this.dupCheck(seq.cache !== null, "CACHE");
+        this.advance();
+        seq.cache = this.parseSignedIntLiteral();
+        break;
+      }
+      case "cycle": {
+        this.dupCheck(seq.cycle !== null, "CYCLE");
+        this.advance();
+        seq.cycle = true;
+        break;
+      }
+      // `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
+      case "no": {
+        this.advance();
+        switch (this.peekKeyword()) {
+          case "minvalue":
+            this.dupCheck(seq.minValue !== null, "MINVALUE");
+            this.advance();
+            seq.minValue = { value: null };
+            break;
+          case "maxvalue":
+            this.dupCheck(seq.maxValue !== null, "MAXVALUE");
+            this.advance();
+            seq.maxValue = { value: null };
+            break;
+          case "cycle":
+            this.dupCheck(seq.cycle !== null, "CYCLE");
+            this.advance();
+            seq.cycle = false;
+            break;
+          default:
+            throw engineError(
+              "syntax_error",
+              `expected MINVALUE, MAXVALUE, or CYCLE after NO, found '${this.peekKeyword()}'`,
+            );
+        }
+        break;
+      }
+      // `SEQUENCE NAME name` — identity options only; the executor rejects it elsewhere (42601,
+      // sequences.md §13.1).
+      case "sequence": {
+        if (this.peekKeywordAt(1) !== "name") return false;
+        this.dupCheck(seq.sequenceName !== null, "SEQUENCE NAME");
+        this.advance();
+        this.advance();
+        seq.sequenceName = this.expectIdentifier();
+        break;
+      }
+      default:
+        return false;
+    }
+    return true;
   }
 
   // parseDropSequence parses `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT | CASCADE]`
@@ -2038,7 +2062,27 @@ class Parser {
         if (this.peekKeyword() === "column") this.advance();
         const column = this.expectIdentifier();
         let edit: AlterColumnAction;
-        if (this.peekKeyword() === "set") {
+        const setTarget = this.peekKeywordAt(1);
+        if (
+          this.peekKeyword() === "restart" ||
+          (this.peekKeyword() === "set" &&
+            setTarget !== "default" &&
+            setTarget !== "data" &&
+            setTarget !== "not")
+        ) {
+          // The identity option list (alter.md §2.8): `SET GENERATED …`, `SET <sequence_option>`,
+          // `RESTART …`, in any order.
+          edit = { column, action: this.parseAlterIdentityOptions() };
+        } else if (this.peekKeyword() === "add") {
+          this.advance();
+          this.expectKeyword("generated");
+          const always = this.parseGeneratedWhen();
+          this.expectKeyword("as");
+          this.expectKeyword("identity");
+          const options =
+            this.peek().kind === "lparen" ? this.parseSequenceOptions(true) : emptySeqOptions();
+          edit = { column, action: { kind: "addIdentity", identity: { always, options } } };
+        } else if (this.peekKeyword() === "set") {
           this.advance();
           if (this.peekKeyword() === "default") {
             this.advance();
@@ -2065,6 +2109,15 @@ class Parser {
           if (this.peekKeyword() === "default") {
             this.advance();
             edit = { column, action: { kind: "dropDefault" } };
+          } else if (this.peekKeyword() === "identity") {
+            this.advance();
+            let ifExists = false;
+            if (this.peekKeyword() === "if") {
+              this.advance();
+              this.expectKeyword("exists");
+              ifExists = true;
+            }
+            edit = { column, action: { kind: "dropIdentity", ifExists } };
           } else {
             this.expectKeyword("not");
             this.expectKeyword("null");
@@ -2080,6 +2133,72 @@ class Parser {
       this.advance();
     }
     return { kind: "alterTable", name, db, ifExists, action: { kind: "actions", actions } };
+  }
+
+  // parseGeneratedWhen parses `ALWAYS` (true) or `BY DEFAULT` (false) after `GENERATED`.
+  private parseGeneratedWhen(): boolean {
+    const kw = this.peekKeyword();
+    if (kw === "always") {
+      this.advance();
+      return true;
+    }
+    if (kw === "by") {
+      this.advance();
+      this.expectKeyword("default");
+      return false;
+    }
+    throw engineError(
+      "syntax_error",
+      `expected ALWAYS or BY DEFAULT after GENERATED, found '${kw}'`,
+    );
+  }
+
+  // parseAlterIdentityOptions parses the identity alteration list of `ALTER [COLUMN] c`
+  // (spec/design/alter.md §2.8, PostgreSQL's `alter_identity_column_option_list`): one or more of
+  // `SET GENERATED { ALWAYS | BY DEFAULT }`, `SET <sequence_option>`, and `RESTART [[WITH] n]`,
+  // order-free, each at most once (42601). `SET AS`, `SET RESTART`, and `SET SEQUENCE NAME` are
+  // 42601 ("not supported here").
+  private parseAlterIdentityOptions(): Extract<
+    AlterColumnAction["action"],
+    { kind: "setIdentity" }
+  > {
+    let generated: boolean | null = null;
+    const options = emptySeqOptions();
+    let restart: SeqRestart | null = null;
+    for (;;) {
+      const kw = this.peekKeyword();
+      if (kw === "restart") {
+        this.dupCheck(restart !== null, "RESTART");
+        this.advance();
+        if (
+          this.peek().kind === "int" ||
+          this.peek().kind === "minus" ||
+          this.peekKeyword() === "with"
+        ) {
+          this.consumeKeyword("with");
+          restart = { toStart: false, value: this.parseSignedIntLiteral() };
+        } else {
+          restart = { toStart: true };
+        }
+        continue;
+      }
+      const next = this.peekKeywordAt(1);
+      if (kw !== "set" || next === "default" || next === "data" || next === "not") break;
+      this.advance();
+      const opt = this.peekKeyword();
+      if (opt === "generated") {
+        this.dupCheck(generated !== null, "SET GENERATED");
+        this.advance();
+        generated = this.parseGeneratedWhen();
+      } else if (opt === "as" || opt === "restart") {
+        throw engineError("syntax_error", `sequence option "${opt}" not supported here`);
+      } else if (opt === "sequence") {
+        throw engineError("syntax_error", "invalid sequence option SEQUENCE NAME");
+      } else if (!this.parseOneSeqOption(options)) {
+        throw engineError("syntax_error", `expected an identity option after SET, found '${opt}'`);
+      }
+    }
+    return { kind: "setIdentity", generated, options, restart };
   }
 
   private parseAlterColumnType(): Extract<AlterColumnAction["action"], { kind: "setType" }> {

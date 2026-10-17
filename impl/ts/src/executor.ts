@@ -79,7 +79,7 @@ import {
   restartPlanning,
   withPlanValues,
 } from "./plan_params.ts";
-import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions } from "./ast.ts";
+import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { chooseObjectName, indexColumnNames, nameAddition } from "./autoname.ts";
 import {
   type CheckConstraint,
@@ -6413,14 +6413,19 @@ export class Engine {
         // Create the OWNED sequence — a default ascending i64 for serial, or the IDENTITY column's
         // `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
         // expression default (format_version 8 mechanism).
-        const seqName = this.chooseSerialSeqName(
-          ct.name,
-          def.name,
-          pendingSerials,
-          [],
-        );
+        // `SEQUENCE NAME` in the identity options names the sequence (sequences.md §13.1);
+        // otherwise PostgreSQL's ChooseRelationName auto-name.
+        const explicitName = def.identity?.options.sequenceName ?? null;
+        let seqName: string;
+        if (explicitName !== null) {
+          this.checkIdentitySequenceName(ct.name, explicitName, pendingSerials, []);
+          seqName = explicitName;
+        } else seqName = this.chooseSerialSeqName(ct.name, def.name, pendingSerials, []);
         const owner: SeqOwner = { table: ct.name, column: columns.length }; // this column's ordinal
-        const opts = def.identity !== null ? def.identity.options : emptySeqOptions();
+        const opts = {
+          ...(def.identity !== null ? def.identity.options : emptySeqOptions()),
+          sequenceName: null,
+        };
         // The owned sequence's data type follows the column (§14): serial → the pseudo-type,
         // identity → the column type. An explicit `AS` inside the identity `( … )` options conflicts
         // with that — 42601 (PG: "conflicting or redundant options"). serial carries no parsed
@@ -7067,6 +7072,25 @@ export class Engine {
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
+  // checkIdentitySequenceName validates an explicit identity `SEQUENCE NAME` (sequences.md §13.1): the
+  // `jed_` reservation (42939), then the relation namespace as chooseSerialSeqName sees it — an
+  // existing relation, the owning table, a pending owned sequence, or a caller-reserved name is 42P07.
+  private checkIdentitySequenceName(
+    table: string,
+    name: string,
+    pending: SequenceDef[],
+    reserved: string[],
+  ): void {
+    checkReservedName("sequence", name);
+    if (
+      this.relationExists(name) ||
+      name === table ||
+      pending.some((s) => s.name === name) ||
+      reserved.some((r) => r === name)
+    )
+      throw engineError("duplicate_table", `relation already exists: ${name}`);
+  }
+
   // chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
   // (spec/design/sequences.md §12), matching PostgreSQL's ChooseRelationName(table, column, "seq"):
   // <table>_<column>_seq, truncated to fit 63 bytes (grammar.md §3.1), with the smallest integer
@@ -7588,6 +7612,48 @@ export class Engine {
       kind: "original",
       column,
     }));
+    // scopeWriteSnap is the write snapshot of the table's scope (main, temp, or an attachment) — where
+    // the statement's new owned sequences are published and an identity column's sequence is edited.
+    const scopeWriteSnap = (): Snapshot => {
+      if (at.db === undefined ? tempScope : at.db === "temp") {
+        this.session.tx!.tempDirty = true;
+        return this.session.tx!.tempWorking;
+      }
+      if (at.db === undefined || at.db === "main") return this.working();
+      return this.attachWriteSnap(at.db)!;
+    };
+    // identitySequenceSlot locates identity column `ci`'s owned sequence (alter.md §2.8): pending
+    // (created by an earlier ADD COLUMN / ADD IDENTITY action of this statement) or in the catalog.
+    // The column's synthesized `nextval('<seq>')` default names it — possibly wrapped in the CAST an
+    // earlier ALTER COLUMN … TYPE added — which tells the identity sequence apart from a leftover
+    // serial sequence the same column may still own after DROP DEFAULT.
+    const identitySequenceSlot = (
+      ci: number,
+    ): { kind: "pending"; index: number } | { kind: "existing"; key: string } => {
+      const defaultText = table.columns[ci]!.defaultExpr?.exprText ?? "";
+      const namesIt = (name: string) => defaultText.includes(nextvalDefaultText(name));
+      const pendingOwned = (seq: SequenceDef) =>
+        seq.ownedBy !== undefined && seq.ownedBy.table === table.name && seq.ownedBy.column === ci;
+      let pi = pendingSerials.findIndex((seq) => pendingOwned(seq) && namesIt(seq.name));
+      if (pi < 0) pi = pendingSerials.findIndex(pendingOwned);
+      if (pi >= 0) return { kind: "pending", index: pi };
+      const source = columnSources[ci];
+      if (source?.kind !== "original")
+        throw new Error("an added identity column has a pending sequence");
+      const owned = snap
+        .sequencesOwnedBy(original.name)
+        .filter((key) => snap.sequence(key)?.ownedBy?.column === source.column);
+      const key = owned.find(namesIt) ?? owned[0];
+      if (key === undefined) throw new Error("identity column has an owned sequence");
+      return { kind: "existing", key };
+    };
+    // notIdentityColumn is the 55000 for an identity alteration of a column that is not an identity
+    // column (PostgreSQL's ATExecSetIdentity / ATExecDropIdentity).
+    const notIdentityColumn = (ci: number) =>
+      engineError(
+        "object_not_in_prerequisite_state",
+        `column "${table.columns[ci]!.name}" of relation "${table.name}" is not an identity column`,
+      );
     const typeChangedColumns = original.columns.map(() => false);
     type RowStep =
       | { kind: "add"; column: Column; colType: ColType; defaultExpr: RExpr | null }
@@ -8325,6 +8391,95 @@ export class Engine {
                 throw engineError("syntax_error", "identity column cannot drop its default");
               table.columns[ci] = { ...col, default: null, defaultExpr: null };
               break;
+            case "addIdentity": {
+              // alter.md §2.8, PostgreSQL's order: the owned sequence is defined first (type gate
+              // 22023, option errors, the name), then the column's prerequisites (55000).
+              if (attachmentScope)
+                throw engineError(
+                  "feature_not_supported",
+                  "a serial / IDENTITY column on an attached-database table is not supported yet",
+                );
+              const scalar = typeAsScalar(col.type);
+              const dtype =
+                scalar === undefined || !typeIsInteger(col.type)
+                  ? undefined
+                  : seqDataTypeForScalar(scalar);
+              if (dtype === undefined)
+                throw engineError(
+                  "invalid_parameter_value",
+                  "identity column type must be smallint, integer, or bigint",
+                );
+              const spec = edit.action.identity;
+              if (spec.options.dataType !== null)
+                throw engineError("syntax_error", "conflicting or redundant options");
+              const explicitName = spec.options.sequenceName;
+              const opts = { ...spec.options, dataType: dtype, sequenceName: null };
+              const reserved = table.indexes.map((i) => i.name);
+              const seqName =
+                explicitName ??
+                this.chooseSerialSeqName(table.name, col.name, pendingSerials, reserved);
+              const seq = buildSequenceDef(seqName, opts, { table: table.name, column: ci });
+              if (explicitName !== null)
+                this.checkIdentitySequenceName(table.name, seqName, pendingSerials, reserved);
+              if (!col.notNull)
+                throw engineError(
+                  "object_not_in_prerequisite_state",
+                  `column "${col.name}" of relation "${table.name}" must be declared NOT NULL before identity can be added`,
+                );
+              if (col.identity !== null)
+                throw engineError(
+                  "object_not_in_prerequisite_state",
+                  `column "${col.name}" of relation "${table.name}" is already an identity column`,
+                );
+              if (col.default !== null || col.defaultExpr !== null)
+                throw engineError(
+                  "object_not_in_prerequisite_state",
+                  `column "${col.name}" of relation "${table.name}" already has a default value`,
+                );
+              pendingSerials.push(seq);
+              const exprText = nextvalDefaultText(seqName);
+              table.columns[ci] = {
+                ...col,
+                defaultExpr: { exprText, expr: parseExpression(exprText) },
+                identity: spec.always ? "always" : "byDefault",
+              };
+              break;
+            }
+            case "setIdentity": {
+              if (col.identity === null) throw notIdentityColumn(ci);
+              const { generated, options, restart } = edit.action;
+              if (seqOptionsHasAny(options) || restart !== null) {
+                const scalar = typeAsScalar(col.type);
+                const dtype = scalar === undefined ? undefined : seqDataTypeForScalar(scalar);
+                if (dtype === undefined) throw new Error("identity column is integer");
+                const slot = identitySequenceSlot(ci);
+                if (slot.kind === "pending")
+                  pendingSerials[slot.index] = applySeqAlter(
+                    pendingSerials[slot.index]!,
+                    options,
+                    restart,
+                    dtype,
+                  );
+                else
+                  scopeWriteSnap().putSequence(
+                    applySeqAlter(snap.sequence(slot.key)!, options, restart, dtype),
+                  );
+              }
+              if (generated !== null)
+                table.columns[ci] = { ...col, identity: generated ? "always" : "byDefault" };
+              break;
+            }
+            case "dropIdentity": {
+              if (col.identity === null) {
+                if (edit.action.ifExists) break;
+                throw notIdentityColumn(ci);
+              }
+              const slot = identitySequenceSlot(ci);
+              if (slot.kind === "pending") pendingSerials.splice(slot.index, 1);
+              else scopeWriteSnap().removeSequence(slot.key);
+              table.columns[ci] = { ...col, identity: null, default: null, defaultExpr: null };
+              break;
+            }
             case "setNotNull":
               table.columns[ci] = { ...col, notNull: true };
               break;
@@ -8443,30 +8598,17 @@ export class Engine {
                     newScalar === undefined ? undefined : seqDataTypeForScalar(newScalar);
                 if (oldDtype === undefined || newDtype === undefined)
                   throw new Error("identity column is integer");
-                const pi = pendingSerials.findIndex(
-                  (seq) =>
-                    seq.ownedBy !== undefined &&
-                    seq.ownedBy.table === table.name &&
-                    seq.ownedBy.column === ci,
-                );
-                if (pi >= 0)
-                  pendingSerials[pi] = retypeIdentitySequence(
-                    pendingSerials[pi]!,
+                const slot = identitySequenceSlot(ci);
+                if (slot.kind === "pending")
+                  pendingSerials[slot.index] = retypeIdentitySequence(
+                    pendingSerials[slot.index]!,
                     oldDtype,
                     newDtype,
                   );
-                else {
-                  const source = columnSources[ci];
-                  if (source?.kind !== "original")
-                    throw new Error("added identity column has pending sequence");
-                  const key = snap
-                    .sequencesOwnedBy(original.name)
-                    .find((name) => snap.sequence(name)?.ownedBy?.column === source.column);
-                  if (key === undefined) throw new Error("identity column has owned sequence");
+                else
                   this.putSequenceRouted(
-                    retypeIdentitySequence(snap.sequence(key)!, oldDtype, newDtype),
+                    retypeIdentitySequence(snap.sequence(slot.key)!, oldDtype, newDtype),
                   );
-                }
               }
               table.columns[ci] = target;
               typeChangedColumns[ci] = true;
@@ -8559,21 +8701,11 @@ export class Engine {
     meter.guard();
     let rewriteRows: Entry[] | null = null;
     let rewriteNextRowid = 0n;
+    // Make owned sequences (ADD COLUMN serial/identity, ADD IDENTITY) visible to their synthesized
+    // nextval defaults — also on the catalog-only path (an ADD IDENTITY rewrites no rows).
+    // Statement-level rollback restores the prior working root if any later validation fails.
+    for (const seq of pendingSerials) scopeWriteSnap().putSequence(seq);
     if (tableRewriteNeeded) {
-      for (const seq of pendingSerials) {
-        let sw: Snapshot;
-        if (at.db === undefined) {
-          if (tempScope) {
-            this.session.tx!.tempDirty = true;
-            sw = this.session.tx!.tempWorking;
-          } else sw = this.working();
-        } else if (at.db === "temp") {
-          this.session.tx!.tempDirty = true;
-          sw = this.session.tx!.tempWorking;
-        } else if (at.db === "main") sw = this.working();
-        else sw = this.attachWriteSnap(at.db)!;
-        sw.putSequence(seq);
-      }
       const store = this.lkpStoreScoped(at.db, original.name);
       const scan = store.scanWithUnits(original.columns.map(() => true));
       rewriteNextRowid = store.nextSyntheticRowid();
@@ -9045,13 +9177,14 @@ export class Engine {
           "syntax_error",
           `multiple default values specified for column ${def.name} of table ${table.name}`,
         );
-      const seqName = this.chooseSerialSeqName(
-        table.name,
-        def.name,
-        pending,
-        reservedRelationNames,
-      );
-      const opts = { ...(def.identity?.options ?? emptySeqOptions()) };
+      const explicitName = def.identity?.options.sequenceName ?? null;
+      let seqName: string;
+      if (explicitName !== null) {
+        this.checkIdentitySequenceName(table.name, explicitName, pending, reservedRelationNames);
+        seqName = explicitName;
+      } else
+        seqName = this.chooseSerialSeqName(table.name, def.name, pending, reservedRelationNames);
+      const opts = { ...(def.identity?.options ?? emptySeqOptions()), sequenceName: null };
       if (opts.dataType !== null)
         throw engineError("syntax_error", "conflicting or redundant options");
       const scalar = serialKind ?? (type.kind === "scalar" ? type.scalar : undefined);
@@ -9814,6 +9947,8 @@ export class Engine {
       if (cs.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
       throw engineError("duplicate_table", `relation already exists: ${cs.name}`);
     }
+    if (cs.options.sequenceName !== null)
+      throw engineError("syntax_error", "invalid sequence option SEQUENCE NAME");
     this.working().putSequence(buildSequenceDef(cs.name, cs.options, undefined));
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
@@ -9870,7 +10005,9 @@ export class Engine {
       if (as.action.options.dataType !== null) {
         throw engineError("feature_not_supported", "ALTER SEQUENCE ... AS type is not supported");
       }
-      const newDef = applySeqAlter(committed, as.action.options, as.action.restart);
+      if (as.action.options.sequenceName !== null)
+        throw engineError("syntax_error", "invalid sequence option SEQUENCE NAME");
+      const newDef = applySeqAlter(committed, as.action.options, as.action.restart, "bigint");
       this.putSequenceRouted(newDef);
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
@@ -17946,7 +18083,8 @@ export class Engine {
   // (catalogTypeText); not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal
   // is the 1-based position in the PRIMARY KEY in KEY order (which may differ from declaration
   // order — constraints.md §3), NULL for a non-member; column_default is the canonical DEFAULT
-  // text (columnDefaultText). The main database's views follow, in (view name, ordinal) order
+  // text (columnDefaultText); identity_generation is ALWAYS / BY DEFAULT for an identity column, else
+  // NULL. The main database's views follow, in (view name, ordinal) order
   // (introspection.md §5): a view column's type is the type its planned body produces, and it is
   // nullable, keyless, and has no default. Cost mirrors jedTablesRows.
   private jedColumnsRows(srf: SrfPlan, meter: Meter): Row[] {
@@ -17970,6 +18108,11 @@ export class Engine {
           boolValue(c.notNull || c.primaryKey),
           k >= 0 ? intValue(BigInt(k + 1)) : nullValue(),
           columnDefault === null ? nullValue() : textValue(columnDefault),
+          c.identity === "always"
+            ? textValue("ALWAYS")
+            : c.identity === "byDefault"
+              ? textValue("BY DEFAULT")
+              : nullValue(),
         ]);
       }
     }
@@ -17987,6 +18130,7 @@ export class Engine {
             intValue(BigInt(i + 1)),
             textValue(types[i]!),
             boolValue(false),
+            nullValue(),
             nullValue(),
             nullValue(),
           ]);
@@ -31386,6 +31530,8 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("pk_ordinal", "i32", false),
         // The DEFAULT as canonical SQL text; NULL for none (introspection.md §5).
         col("column_default", "text", false),
+        // 'ALWAYS' / 'BY DEFAULT' for an identity column, else NULL (introspection.md §5).
+        col("identity_generation", "text", false),
       ]);
     case "jed_indexes":
       return table("jed_indexes", [
