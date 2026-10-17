@@ -29,6 +29,7 @@ import {
   estimateScanCandidates,
   fkTypesEqual,
   inventoryScanCandidates,
+  inventorySingleRelationCandidates,
   inventoryINLCandidates,
   needsEagerScan,
   orderSatisfiedByIndex,
@@ -59,10 +60,10 @@ export function optimizeSelect(
   eng: Engine,
 ): void {
   ruleScanBounds(plan, rels, snap, eng);
-  ruleIndexNestedLoop(plan, rels, snap);
+  ruleIndexNestedLoop(plan, rels, snap, eng);
   ruleHashJoin(plan, rels);
   ruleOrderByPkScan(plan, rels, snap);
-  ruleOrderByIndexScan(plan, rels, snap);
+  ruleOrderByIndexScan(plan, rels, snap, eng);
   ruleCostedSingleRelationPipeline(plan, rels, snap, eng);
   ruleCostedTwoRelationJoin(plan, rels, snap, eng);
   ruleCostedNWayJoin(plan, rels, snap, eng);
@@ -216,7 +217,10 @@ function ruleScanBounds(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng:
     ) {
       return null;
     }
-    const candidates = inventoryScanCandidates(accessPredicate(plan), rel, snap, eng);
+    const candidates =
+      rels.length === 1
+        ? inventorySingleRelationCandidates(accessPredicate(plan), rel, snap, eng)
+        : inventoryScanCandidates(accessPredicate(plan), rel, snap, eng);
     const estimates = estimateScanCandidates(
       candidates,
       rel,
@@ -262,7 +266,7 @@ function ruleCostedSingleRelationPipeline(
     return;
   }
   const rel = rels[0]!;
-  const access = inventoryScanCandidates(accessPredicate(plan), rel, snap, eng);
+  const access = inventorySingleRelationCandidates(accessPredicate(plan), rel, snap, eng);
   if (access.length === 0) return;
 
   const pkDir =
@@ -277,7 +281,14 @@ function ruleCostedSingleRelationPipeline(
     plan.order.length > 0 &&
     plan.orderExprs.length === 0 &&
     pkDir === null
-      ? orderSatisfiedByIndexes(snap, rel.table, plan.rels[0]!.offset, plan.order)
+      ? orderSatisfiedByIndexes(
+          snap,
+          rel.table,
+          plan.rels[0]!.offset,
+          plan.order,
+          accessPredicate(plan),
+          eng,
+        )
       : [];
 
   const orderByName = new Map(indexOrders.map((order) => [order.nameKey, order]));
@@ -427,6 +438,7 @@ function ruleCostedTwoRelationJoin(
         rels[inner]!,
         relationColumnRange(plan, outer),
         snap,
+        eng,
       )) {
         candidates.push({
           order,
@@ -704,6 +716,7 @@ function expandJoinSearchState(
         rels[inner]!,
         siblingColumns,
         snap,
+        eng,
       )) {
         inl.push({ candidate, onIndex });
       }
@@ -714,6 +727,7 @@ function expandJoinSearchState(
       rels[inner]!,
       siblingColumns,
       snap,
+      eng,
     )) {
       inl.push({ candidate, onIndex: -1 });
     }
@@ -1046,7 +1060,12 @@ function ruleCostedNWayJoin(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, 
 // INNER/CROSS/LEFT join (a RIGHT/FULL preserved side cannot be bounded per outer row). rels[0] has
 // no earlier relation; relation i's join is plan.joins[i-1]. A non-null entry takes precedence
 // over the once-materialized relBounds.
-function ruleIndexNestedLoop(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): void {
+function ruleIndexNestedLoop(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  snap: Snapshot,
+  eng: Engine,
+): void {
   plan.phys.relINLBounds = rels.map((rel, i) => {
     if (
       i === 0 ||
@@ -1059,7 +1078,7 @@ function ruleIndexNestedLoop(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot)
     }
     const k = plan.joins[i - 1]!.kind;
     if (k !== "inner" && k !== "cross" && k !== "left") return null;
-    return detectINLBound(plan.joins[i - 1]!.on, plan.filter, rel, snap);
+    return detectINLBound(plan.joins[i - 1]!.on, plan.filter, rel, snap, eng);
   });
 }
 
@@ -1091,7 +1110,12 @@ function ruleOrderByPkScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): 
 // that index and point-look-up each row — a top-N that avoids the blocking sort. Gated to a LIMIT
 // and, when a WHERE bound exists, only when that bound walks the same index in the same order;
 // mutually exclusive with pkOrdered.
-function ruleOrderByIndexScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): void {
+function ruleOrderByIndexScan(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  snap: Snapshot,
+  eng: Engine,
+): void {
   const candidate =
     !plan.isAgg &&
     !plan.hasWindow &&
@@ -1104,7 +1128,14 @@ function ruleOrderByIndexScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot
     plan.rels[0]!.srf === undefined &&
     plan.rels[0]!.cte === undefined &&
     plan.rels[0]!.derived === undefined
-      ? orderSatisfiedByIndex(snap, rels[0]!.table, plan.rels[0]!.offset, plan.order)
+      ? orderSatisfiedByIndex(
+          snap,
+          rels[0]!.table,
+          plan.rels[0]!.offset,
+          plan.order,
+          accessPredicate(plan),
+          eng,
+        )
       : null;
   const bound = plan.phys.relBounds[0]!;
   plan.phys.indexOrder =

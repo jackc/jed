@@ -728,6 +728,10 @@ type onConflict struct {
 	// Target is the optional conflict target (the arbiter). Nil is legal only with DoNothing
 	// (any uniqueness conflict is then skipped); DoUpdate with a nil target is 42601.
 	Target *conflictTarget
+	// IndexPredicate is the optional `WHERE index_predicate` after a `( col, … )` target
+	// (upsert.md §2): it lets a PARTIAL unique index whose predicate it implies be inferred as the
+	// arbiter.
+	IndexPredicate *exprNode
 	// DoUpdate true = DO UPDATE (Assignments + Filter apply); false = DO NOTHING.
 	DoUpdate    bool
 	Assignments []assignment // DO UPDATE SET … (empty for DO NOTHING)

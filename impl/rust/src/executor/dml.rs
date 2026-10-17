@@ -1856,11 +1856,39 @@ impl Engine {
                 format!("table does not exist: {table}"),
             )
         })?;
-        let arbiter = match vw {
-            Some(vw) => {
-                resolve_arbiter(tdef, vw.conflict_target(tdef, oc.target.as_ref())?.as_ref())?
+        // `ON CONFLICT (cols) WHERE index_predicate` (upsert.md §2): the target's columns are checked
+        // first (42703), then the predicate resolves against the table like a partial-index
+        // predicate (subquery 0A000, `$N` 42P02, aggregate 42803, window 42P20; no type or
+        // mutability check — PostgreSQL's), and only then is the arbiter inferred (42P10).
+        let index_predicate = match &oc.index_predicate {
+            None => None,
+            Some(pred) => {
+                if vw.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "ON CONFLICT ... WHERE through a view is not supported",
+                    ));
+                }
+                if let Some(ConflictTarget::Columns(cols)) = &oc.target {
+                    for c in cols {
+                        col_idx(tdef, c)?;
+                    }
+                }
+                reject_index_predicate_structure(pred)?;
+                let scope = Scope::index(self, tdef);
+                let mut pt = ParamTypes::for_index();
+                let mut agg = AggCtx::Forbidden;
+                Some(resolve(&scope, pred, None, &mut agg, &mut pt)?.0)
             }
-            None => resolve_arbiter(tdef, oc.target.as_ref())?,
+        };
+        let arbiter = match vw {
+            Some(vw) => resolve_arbiter(
+                tdef,
+                vw.conflict_target(tdef, oc.target.as_ref())?.as_ref(),
+                None,
+                self,
+            )?,
+            None => resolve_arbiter(tdef, oc.target.as_ref(), index_predicate.as_ref(), self)?,
         };
         let action = match &oc.action {
             ConflictAction::DoNothing => ConflictActionPlan::DoNothing,

@@ -2668,8 +2668,10 @@ class Parser {
     this.advance(); // ON
     this.advance(); // CONFLICT
 
-    // Optional conflict target: a `( col, … )` column list or `ON CONSTRAINT name`.
+    // Optional conflict target: a `( col, … )` column list (with an optional `WHERE
+    // index_predicate`) or `ON CONSTRAINT name`.
     let target: ConflictTarget | null = null;
+    let indexPredicate: Expr | null = null;
     if (this.peek().kind === "lparen") {
       this.advance(); // '('
       const cols: string[] = [];
@@ -2680,6 +2682,7 @@ class Parser {
         if (k === "rparen") break;
         throw engineError("syntax_error", "expected ',' or ')'");
       }
+      indexPredicate = this.parseOptionalWhere();
       target = { kind: "columns", columns: cols };
     } else if (this.peekKeyword() === "on") {
       this.advance(); // ON
@@ -2692,7 +2695,7 @@ class Parser {
     const action = this.peekKeyword();
     if (action === "nothing") {
       this.advance();
-      return { target, doUpdate: false, assignments: [], filter: null };
+      return { target, indexPredicate, doUpdate: false, assignments: [], filter: null };
     }
     if (action === "update") {
       this.advance();
@@ -2711,7 +2714,7 @@ class Parser {
         break;
       }
       const filter = this.parseOptionalWhere();
-      return { target, doUpdate: true, assignments, filter };
+      return { target, indexPredicate, doUpdate: true, assignments, filter };
     }
     throw engineError(
       "syntax_error",

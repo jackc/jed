@@ -1,0 +1,196 @@
+# The partial-index predicate-implication prover (spec/design/indexes.md §9.1). A partial index holds
+# only its qualifying rows, so the planner may use it only when the WHERE implies the index
+# predicate. Beyond a conjunct structurally equal to the predicate, the prover decomposes AND/OR on
+# both sides (IN is an OR), expands `x = ANY(constant array)`, applies the btree comparison
+# implication table over same-family constants (`amt > 50` implies `amt > 0`), and derives
+# `x IS NOT NULL` from a comparison of x with a constant. Rows never change with or without the
+# index (the WHERE stays the residual filter); the `# cost:` lines pin which queries use it — each
+# implied query reads only the index range, each non-implied one costs the full scan.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.logical_connectives, expr.in_list, query.set_returning, query.index_range, query.index_partial, query.index_partial_implication, types.i32, types.text, types.decimal, types.date, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE pi (id i32 PRIMARY KEY, status text, amt i32, price decimal, d date)
+
+statement ok
+INSERT INTO pi SELECT g, CASE g % 4 WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' ELSE NULL END, g % 50 - 10, (g % 7) * 0.5, date '2024-01-01' + g FROM generate_series(1, 200) AS g
+
+# --- comparison implication: index predicate `amt > 0` ---------------------------------------------
+
+statement ok
+CREATE INDEX pi_amt_pos ON pi (amt) WHERE amt > 0
+
+# `amt > 30` implies `amt > 0`: a range seek of the partial index
+# cost: 146
+query I rowsort
+SELECT count(*) FROM pi WHERE amt > 30
+----
+36
+
+# `amt = 7` implies `amt > 0`
+# cost: 17
+query I rowsort
+SELECT id FROM pi WHERE amt = 7
+----
+117
+167
+17
+67
+
+# BETWEEN desugars to two comparisons; `amt >= 3` implies `amt > 0`
+# cost: 74
+query I rowsort
+SELECT count(*) FROM pi WHERE amt BETWEEN 3 AND 5
+----
+12
+
+# IN is an OR: each `amt = k` (k > 0) implies the predicate
+# cost: 46
+query I rowsort
+SELECT id FROM pi WHERE amt IN (4, 33)
+----
+114
+14
+143
+164
+193
+43
+64
+93
+
+# `amt = ANY(array)` premises likewise
+# cost: 54
+query I rowsort
+SELECT id FROM pi WHERE amt = ANY(ARRAY[4, 33])
+----
+114
+14
+143
+164
+193
+43
+64
+93
+
+# NOT implied — `amt >= 0` admits 0, `amt > -1` admits 0, and an IN with a non-positive element:
+# the full scan (the same rows a seek could not have returned)
+# cost: 562
+query I rowsort
+SELECT count(*) FROM pi WHERE amt >= 0
+----
+160
+
+# cost: 805
+query I rowsort
+SELECT id FROM pi WHERE amt IN (4, -3)
+----
+107
+114
+14
+157
+164
+57
+64
+7
+
+statement ok
+DROP INDEX pi_amt_pos
+
+# --- an OR predicate, implied by any one disjunct --------------------------------------------------
+
+statement ok
+CREATE INDEX pi_amt_ab ON pi (amt) WHERE status = 'a' OR status = 'b'
+
+# cost: 13
+query I rowsort
+SELECT id FROM pi WHERE status = 'b' AND amt = 3
+----
+113
+13
+
+# an IN subset of the predicate's disjuncts implies it
+# cost: 15
+query I rowsort
+SELECT id FROM pi WHERE status IN ('a', 'b') AND amt = 4
+----
+164
+64
+
+# a superset does not
+# cost: 1055
+query I rowsort
+SELECT id FROM pi WHERE status IN ('a', 'c') AND amt = 4
+----
+114
+14
+164
+64
+
+statement ok
+DROP INDEX pi_amt_ab
+
+# --- IS NOT NULL implied by a comparison with a constant -------------------------------------------
+
+statement ok
+CREATE INDEX pi_status_nn ON pi (amt) WHERE status IS NOT NULL
+
+# cost: 21
+query I rowsort
+SELECT id FROM pi WHERE status > 'b' AND amt = 12
+----
+122
+22
+
+statement ok
+DROP INDEX pi_status_nn
+
+# --- decimal and date constants --------------------------------------------------------------------
+
+statement ok
+CREATE INDEX pi_price ON pi (amt) WHERE price >= 2.0
+
+# cost: 5
+query I rowsort
+SELECT id FROM pi WHERE price = 2.50 AND amt = 5
+----
+
+statement ok
+DROP INDEX pi_price
+
+statement ok
+CREATE INDEX pi_recent ON pi (amt) WHERE d > '2024-06-01'
+
+# cost: 7
+query I rowsort
+SELECT id FROM pi WHERE d >= '2024-07-01' AND amt = 30
+----
+190
+
+# an earlier date does not imply it
+# cost: 683
+query I rowsort
+SELECT id FROM pi WHERE d >= '2024-05-01' AND amt = 30
+----
+140
+190
+
+statement ok
+DROP INDEX pi_recent
+
+# --- a conjunctive predicate: every conjunct must be implied ---------------------------------------
+
+statement ok
+CREATE INDEX pi_both ON pi (amt) WHERE status = 'c' AND amt < 20
+
+# cost: 13
+query I rowsort
+SELECT id FROM pi WHERE status = 'c' AND amt = 12
+----
+122
+22
+
+# `amt = 25` does not imply `amt < 20` — the full scan finds the same rows
+# cost: 651
+query I rowsort
+SELECT id FROM pi WHERE status = 'c' AND amt = 25
+----

@@ -1167,6 +1167,9 @@ func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
 		return "Full scan"
 	case b.pk != nil:
 		return prefix + "PK bound: " + renderPKBound(b.pk)
+	case b.index != nil && len(b.index.eqCols) == 0 && b.index.rangeTerms == nil:
+		// A full partial-index scan has no access predicate (indexes.md §9.2).
+		return prefix + "Index scan: using " + b.index.nameKey
 	case b.index != nil:
 		return prefix + "Index bound: using " + b.index.nameKey
 	case b.gin != nil:

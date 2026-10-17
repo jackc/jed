@@ -364,6 +364,15 @@ candidate's rows, `gin_entry`, and pages. Ordered/PK bounds derive their
 program from their equality prefix, optional trailing range, and interval disjunction. Unsupported
 access predicates use `opaque`.
 
+A **partial** B-tree index holds only its qualifying rows ([indexes.md](indexes.md) §9), so a bound
+or interval set over one (and the full partial-index scan, indexes.md §9.2) further ANDs into its
+scan-row program, after the access predicate's own (statistics-refined) program, each top-level
+conjunct of the index predicate — in predicate order, with the structural (statistics-free) rules
+above — that reads no column of the key elements the access predicate constrains (the equality
+prefix and range element; for an interval set, its consumed members). A skipped conjunct usually
+restates the access predicate's own range (an index `ON t (amt) WHERE amt > 0` bounded by
+`amt > 50`). A `zero` or unique access program is unchanged. Output rows are unaffected.
+
 ### 7.1 Boolean composition
 
 Top-level AND/OR nodes flatten in source order. Before ordinary AND folding, the estimator performs
@@ -642,8 +651,11 @@ feeds the same candidate inventories into §9.2/§10 so access paths are priced 
 orientation and algorithm; independently replacing one join input from a base-only estimate would
 not minimize the whole join plan.
 
-The candidate set contains every legal access path: PK, every ordered B-tree bound, every GiST
-bound, every GIN bound, PK interval set, every ordered-index interval set, and full scan.
+The candidate set contains every legal access path: PK, every ordered B-tree bound (and every full
+partial-index scan, [indexes.md](indexes.md) §9.2 — a B-tree candidate under its index's name, for a
+partial index with no ordinary bound), every GiST bound, every GIN bound, PK interval set, every
+ordered-index interval set, and full scan. A multi-relation inventory never holds a full
+partial-index scan.
 
 The selector compares **complete single-relation physical pipelines**, not isolated base scans.
 Each access candidate is composed with the ordering property it naturally provides:
@@ -657,8 +669,11 @@ adds one **order-only B-tree** candidate. It walks that index and point-fetches 
 retaining the complete WHERE residual. When the same index already supplies a legal bound, its one
 candidate composes the bound and order rather than duplicating the identity. Multiple matching
 ordering indexes are all inventoried and sorted by name byte order; catalog order never chooses one.
-The existing exact-order, forward `ASC NULLS LAST`, fixed-width-PK, non-partial-index gates remain
-unchanged.
+The existing exact-order, forward `ASC NULLS LAST`, and fixed-width-PK gates remain unchanged; a
+partial index is an ordering index only when the WHERE implies its predicate (indexes.md §9.3). The
+single-relation inventory also holds a full partial-index scan for every partial index whose
+predicate the WHERE implies but whose keys it does not bound (indexes.md §9.2); it composes with
+that index's order like any bound.
 
 For every pipeline, the estimator applies the selected access work, residual, projection and other
 nodes at their real stages, then applies any ordering/streaming `OFFSET + LIMIT` prefix. This makes a
@@ -727,8 +742,9 @@ An `UPDATE` or `DELETE` target is one base relation with no join, ordering, or L
 is the single-relation rule without composition:
 
 1. inventory every legal access path for the target over the complete resolved WHERE: PK, every
-   ordered B-tree, every GiST, every GIN, PK interval set, every ordered-index interval set, and
-   full scan (a host-attached target has only full scan);
+   ordered B-tree (including a full partial-index scan, [indexes.md](indexes.md) §9.2), every GiST,
+   every GIN, PK interval set, every ordered-index interval set, and full scan (a host-attached
+   target has only full scan);
 2. estimate each with §8.1's base-candidate rule and no `row_produced` — the selected Scan's access
    work plus the complete WHERE evaluated once per scan row — against the visible snapshot the
    mutation scan reads (under a writable-CTE read pin, the pre-statement state); and

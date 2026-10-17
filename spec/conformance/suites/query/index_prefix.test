@@ -147,10 +147,9 @@ SELECT id FROM u WHERE name = 'alice' AND v >= 20 AND v <= 40 ORDER BY id
 2
 4
 
-# a bare RANGE on the variable-width LEADING column is NOT eligible (the range column would be
-# width-skipped, but text has no fixed width) — so this takes the full scan + residual filter;
-# the rows are still correct
-# cost: 36
+# a bare RANGE on the variable-width LEADING column is eligible: the range column's text slot is
+# skipped by its terminator (indexes.md §5.1), so this range-scans the index
+# cost: 21
 query I nosort
 SELECT id FROM u WHERE name > 'alice' ORDER BY id
 ----

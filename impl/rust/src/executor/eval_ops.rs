@@ -2019,9 +2019,16 @@ pub(crate) enum ConflictActionPlan {
 /// matched as an order-independent SET against a unique index / the primary key (no match →
 /// 42P10); `ON CONSTRAINT name` names a unique index or the synthesized `<table>_pkey` (miss →
 /// 42704). `None` target → `None` arbiter (legal only with `DO NOTHING`).
+///
+/// `index_predicate` is the resolved `WHERE index_predicate` of a column target (table-local
+/// columns): with it, a PARTIAL unique index whose predicate it implies (indexes.md §9.1) is also
+/// inferable, after the PK and every non-partial unique index (each in name byte order). Without it
+/// no partial index is inferred, as in PostgreSQL.
 pub(crate) fn resolve_arbiter(
     tdef: &Table,
     target: Option<&ConflictTarget>,
+    index_predicate: Option<&RExpr>,
+    catalog: &Engine,
 ) -> Result<Option<Arbiter>> {
     let target = match target {
         None => return Ok(None),
@@ -2046,10 +2053,8 @@ pub(crate) fn resolve_arbiter(
             for (i, def) in tdef.indexes.iter().enumerate() {
                 // A conflict-target COLUMN list matches only a plain-column unique index (an
                 // expression unique index is arbitrated by `ON CONSTRAINT <name>` — upsert.md §3).
-                // A PARTIAL unique index is NOT matched by a bare column list (PostgreSQL requires
-                // the predicate to be restated — `ON CONFLICT (amt) WHERE …`, a deferred upsert
-                // follow-on, indexes.md §9): so a column target that only a partial index covers
-                // reports "no matching arbiter", agreeing with PG.
+                // A PARTIAL unique index is matched only through an implying `WHERE
+                // index_predicate` (below), as in PostgreSQL.
                 if def.unique
                     && def.predicate.is_none()
                     && def.column_ordinals().is_some_and(|c| {
@@ -2057,6 +2062,19 @@ pub(crate) fn resolve_arbiter(
                     })
                 {
                     return Ok(Some(Arbiter::Index(i)));
+                }
+            }
+            if let Some(filter) = index_predicate {
+                for (i, def) in tdef.indexes.iter().enumerate() {
+                    if def.unique
+                        && def.predicate.is_some()
+                        && def.column_ordinals().is_some_and(|c| {
+                            c.into_iter().collect::<std::collections::BTreeSet<_>>() == want
+                        })
+                        && partial_index_implied(filter, tdef, 0, def, catalog)
+                    {
+                        return Ok(Some(Arbiter::Index(i)));
+                    }
                 }
             }
             Err(EngineError::new(

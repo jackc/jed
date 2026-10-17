@@ -49,6 +49,13 @@
 #              IN-list; the equivalent `v + 0` predicates defeat the mutation bound. Applied to
 #              identically-seeded tables, both paths must reach the same by-construction end state,
 #              including an indexed-column update and a PK-rekeying update.
+#   index_vartail — a text / decimal range or trailing element of an ordered-index bound skips its
+#              slot by its own terminator (indexes.md §5.1); `a + 0` / `s || ''` / `d + 0` defeat the
+#              bounds. NULLs, prefix strings, '' and negative / zero decimals must match.
+#   partial_index — partial indexes serve a WHERE that implies their predicate (indexes.md §9.1-§9.3):
+#              comparison implication, the full partial-index scan and its ORDER BY walk, OR/IN sets,
+#              and INL inners (ON-implied; a LEFT JOIN whose WHERE alone implies a predicate a
+#              NULL-extended row satisfies must not use the index). Wrapped spellings defeat them all.
 #   or_in    — `pk IN (a,b,c)` / `pk = a OR pk = b` (and the secondary-index equivalent) lower to a
 #              UNION of point probes (cost.md §3 "OR / IN-list"); `pk + 0 IN (...)` wraps each
 #              disjunct's key in a `BinaryOp`, so no disjunct is a bare column and it full-scans. Both
@@ -353,6 +360,20 @@ INDEX_PREFIX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.i
                       dml.insert_multi_row query.select query.where_eq query.comparison_order
                       query.order_by query.index_prefix query.index_range expr.arithmetic
                       expr.comparison_value types.i32 null.three_valued].freeze
+INDEX_VARTAIL_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
+                       dml.insert_multi_row query.select query.where_eq query.comparison_order
+                       query.order_by query.index_prefix query.index_range
+                       query.index_variable_width_tail expr.arithmetic expr.comparison_value
+                       expr.text_concat types.i32 types.text types.decimal null.three_valued].freeze
+PARTIAL_INDEX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.index_partial
+                       dml.insert dml.insert_multi_row dml.delete query.select query.where_eq
+                       query.comparison_order query.logical_connectives query.order_by
+                       query.order_by_keys query.limit query.qualified_column query.join_inner
+                       query.join_left query.index_nested_loop query.order_by_index_scan
+                       query.or_in_point_lookup query.index_partial query.index_partial_implication
+                       query.index_partial_full_scan query.index_partial_access_paths expr.in_list
+                       expr.arithmetic expr.comparison_value expr.text_concat types.i32 types.text
+                       null.three_valued].freeze
 INDEX_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
                      dml.insert_multi_row query.select query.order_by query.order_by_keys
                      query.limit query.offset query.order_by_index_scan types.i32
@@ -1466,6 +1487,151 @@ def gen_index_prefix(seed)
              "a + 0 = #{ka} AND b + 0 > #{kb}", ->(r) { r[1] == ka && r[2] && r[2] > kb })
   ppair.call("a = #{ka} (leading equality only, b unbounded)", "a = #{ka}",
              "a + 0 = #{ka}", ->(r) { r[1] == ka })
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: VARIABLE-WIDTH range / trailing index elements (slot skip vs full scan) ------------
+# A text / decimal element as the range element or a trailing element of an ordered-index bound
+# (spec/design/indexes.md §5.1, query.index_variable_width_tail): each admitted entry's storage key is
+# recovered by skipping the variable-width slot by its own terminator. Spelling the key columns as
+# `a + 0` / `s || ''` / `d + 0` defeats every bound (full scan). NULLs, a string that prefixes
+# another, '', and negative / zero decimals exercise each skip rule. Both must return identical rows.
+def gen_index_vartail(seed)
+  rng = Random.new(seed)
+  ids = (1..60).to_a.sample(30, random: rng).sort
+  words = ["", "p", "pa", "pab", "pb", "q", "qq", "z"]
+  decs = ["-2.5", "-0.01", "0", "0.5", "1", "1.25", "10", "-10.75"]
+  rows = ids.map do |id|
+    [id, rng.rand(0..2), rng.rand(8).zero? ? nil : words.sample(random: rng),
+     rng.rand(8).zero? ? nil : decs.sample(random: rng), rng.rand(-50..50)]
+  end
+  lit = ->(x) { x.nil? ? "NULL" : "'#{x}'" }
+  flat = ->(rs) { rs.flat_map { |r| [r[0].to_s, r[4].to_s] } }
+
+  out = header(seed, INDEX_VARTAIL_REQ, "variable-width range / trailing index elements (slot skip vs full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, s text, d decimal, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, a, s1, d, w| "(#{id}, #{a}, #{lit.call(s1)}, #{d.nil? ? 'NULL' : d}, #{w})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_as_idx ON t (a, s)")
+  stmt(out, "CREATE INDEX t_s_idx ON t (s)")
+  stmt(out, "CREATE INDEX t_ad_idx ON t (a, d)")
+
+  pair = lambda do |title, opt, plus, sel|
+    exp = flat.call(rows.select { |r| sel.call(r) })
+    out << "# #{title}"
+    q(out, "II", "SELECT id, w FROM t WHERE #{opt} ORDER BY id", exp)
+    out << "# full scan (wrapped keys defeat the bound) — MUST match"
+    q(out, "II", "SELECT id, w FROM t WHERE #{plus} ORDER BY id", exp)
+  end
+
+  ka = rng.rand(0..2)
+  w1 = words.sample(random: rng)
+  w2 = words.sample(random: rng)
+  lo, hi = [w1, w2].sort
+  d1 = decs.sample(random: rng)
+  dv = ->(x) { Rational(x) }
+  pair.call("a = #{ka} (text trailing slot)", "a = #{ka}", "a + 0 = #{ka}", ->(r) { r[1] == ka })
+  pair.call("a = #{ka} AND s > '#{w1}' (text range element)", "a = #{ka} AND s > '#{w1}'",
+            "a + 0 = #{ka} AND s || '' > '#{w1}'", ->(r) { r[1] == ka && r[2] && r[2].b > w1.b })
+  pair.call("s >= '#{lo}' AND s <= '#{hi}' (leading text range)", "s >= '#{lo}' AND s <= '#{hi}'",
+            "s || '' >= '#{lo}' AND s || '' <= '#{hi}'",
+            ->(r) { r[2] && r[2].b >= lo.b && r[2].b <= hi.b })
+  pair.call("a = #{ka} AND d <= #{d1} (decimal range element)", "a = #{ka} AND d <= #{d1}",
+            "a + 0 = #{ka} AND d + 0 <= #{d1}", ->(r) { r[1] == ka && r[3] && dv.call(r[3]) <= dv.call(d1) })
+  pair.call("a = #{ka} AND d > #{d1} (decimal range element)", "a = #{ka} AND d > #{d1}",
+            "a + 0 = #{ka} AND d + 0 > #{d1}", ->(r) { r[1] == ka && r[3] && dv.call(r[3]) > dv.call(d1) })
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: PARTIAL-index relaxations (implied index paths vs full scan) ----------------------
+# Partial indexes serve a query whose WHERE implies their predicate (spec/design/indexes.md §9.1-§9.3):
+# a comparison-implied bound, a full partial-index scan (alone and as an ORDER BY ... LIMIT walk), an
+# OR/IN set, and an index-nested-loop inner (ON-implied; WHERE-implied with a NULL-rejecting
+# predicate; and a LEFT JOIN whose WHERE implies a predicate a NULL-extended row satisfies, which must
+# NOT use the index). Spelling the predicate columns as `x + 0` / `x || ''` defeats every implication
+# (full scans / nested loops). Both must return identical rows.
+def gen_partial_index(seed)
+  rng = Random.new(seed)
+  ids = (1..80).to_a.sample(40, random: rng).sort
+  stats = ["a", "b", "c", nil]
+  rows = ids.map do |id|
+    [id, stats.sample(random: rng), rng.rand(6).zero? ? nil : rng.rand(-5..20), rng.rand(-50..50)]
+  end
+  us = (1..8).map { |k| [k, rng.rand(-5..24)] }
+  lit = ->(x) { x.nil? ? "NULL" : "'#{x}'" }
+  num = ->(x) { x.nil? ? "NULL" : x.to_s }
+
+  out = header(seed, PARTIAL_INDEX_REQ, "partial-index relaxations (implied index paths vs full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, st text, amt i32, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, st, amt, w| "(#{id}, #{lit.call(st)}, #{num.call(amt)}, #{w})" }.join(', ')}")
+  stmt(out, "CREATE TABLE u (k i32 PRIMARY KEY, x i32)")
+  stmt(out, "INSERT INTO u VALUES #{us.map { |k, x| "(#{k}, #{x})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_amt_pos ON t (amt) WHERE amt > 0")
+  stmt(out, "CREATE INDEX t_w_nost ON t (w) WHERE st IS NULL")
+  stmt(out, "CREATE INDEX t_amt_ab ON t (amt) WHERE st = 'a' OR st = 'b'")
+
+  two = lambda do |title, coltypes, opt, plus, exp|
+    out << "# #{title}"
+    q(out, coltypes, opt, exp)
+    out << "# without the implication — MUST match"
+    q(out, coltypes, plus, exp)
+  end
+  sel = ->(f) { rows.select { |r| f.call(r) }.flat_map { |r| [r[0].to_s, r[3].to_s] } }
+
+  k1 = rng.rand(1..15)
+  two.call("amt > #{k1} implies amt > 0", "II",
+           "SELECT id, w FROM t WHERE amt > #{k1} ORDER BY id",
+           "SELECT id, w FROM t WHERE amt + 0 > #{k1} ORDER BY id",
+           sel.call(->(r) { r[2] && r[2] > k1 }))
+  pts = [rng.rand(1..20), rng.rand(1..20)].uniq
+  two.call("amt IN (#{pts.join(', ')}) implies amt > 0", "II",
+           "SELECT id, w FROM t WHERE amt IN (#{pts.join(', ')}) ORDER BY id",
+           "SELECT id, w FROM t WHERE amt + 0 IN (#{pts.join(', ')}) ORDER BY id",
+           sel.call(->(r) { r[2] && pts.include?(r[2]) }))
+  two.call("st IS NULL (full partial-index scan)", "II",
+           "SELECT id, w FROM t WHERE st IS NULL ORDER BY id",
+           "SELECT id, w FROM t WHERE st || '' IS NULL ORDER BY id",
+           sel.call(->(r) { r[1].nil? }))
+  lim = rng.rand(1..4)
+  nost = rows.select { |r| r[1].nil? }.sort_by { |r| [r[3], r[0]] }.first(lim)
+  two.call("st IS NULL ORDER BY w LIMIT #{lim} (partial index walk)", "II",
+           "SELECT w, id FROM t WHERE st IS NULL ORDER BY w LIMIT #{lim}",
+           "SELECT w, id FROM t WHERE st || '' IS NULL ORDER BY w + 0 LIMIT #{lim}",
+           nost.flat_map { |r| [r[3].to_s, r[0].to_s] })
+  which = %w[a b].sample(random: rng)
+  two.call("st = '#{which}' AND amt IN (...) (partial OR/IN set)", "II",
+           "SELECT id, w FROM t WHERE st = '#{which}' AND amt IN (#{pts.join(', ')}) ORDER BY id",
+           "SELECT id, w FROM t WHERE st || '' = '#{which}' AND amt + 0 IN (#{pts.join(', ')}) ORDER BY id",
+           sel.call(->(r) { r[1] == which && r[2] && pts.include?(r[2]) }))
+
+  join = lambda do |left, f|
+    res = []
+    us.each do |k, x|
+      m = rows.select { |r| f.call(x, r) }
+      if m.empty?
+        res << [k, nil] if left
+      else
+        m.each { |r| res << [k, r[0]] }
+      end
+    end
+    res.sort_by { |k, id| [k, id || 0] }
+  end
+  jflat = ->(rs) { rs.flat_map { |k, id| [k.to_s, id.nil? ? "NULL" : id.to_s] } }
+  two.call("INNER JOIN, ON implies st = 'a' OR st = 'b' (partial INL inner)", "II",
+           "SELECT u.k, t.id FROM u JOIN t ON t.amt = u.x AND t.st = '#{which}' ORDER BY u.k, t.id",
+           "SELECT u.k, t.id FROM u JOIN t ON t.amt + 0 = u.x AND t.st || '' = '#{which}' ORDER BY u.k, t.id",
+           jflat.call(join.call(false, ->(x, r) { r[2] == x && r[1] == which })))
+  two.call("LEFT JOIN, ON implies amt > 0", "II",
+           "SELECT u.k, t.id FROM u LEFT JOIN t ON t.amt = u.x AND t.amt > 0 ORDER BY u.k, t.id",
+           "SELECT u.k, t.id FROM u LEFT JOIN t ON t.amt + 0 = u.x AND t.amt + 0 > 0 ORDER BY u.k, t.id",
+           jflat.call(join.call(true, ->(x, r) { r[2] == x && r[2] > 0 })))
+  # WHERE st IS NULL over a LEFT JOIN: a NULL-extended row satisfies it, so the partial index on
+  # `st IS NULL` must not serve as the inner.
+  two.call("LEFT JOIN WHERE st IS NULL (a NULL-extended row satisfies the predicate)", "II",
+           "SELECT u.k, t.id FROM u LEFT JOIN t ON t.w = u.x WHERE t.st IS NULL ORDER BY u.k, t.id",
+           "SELECT u.k, t.id FROM u LEFT JOIN t ON t.w + 0 = u.x WHERE t.st || '' IS NULL ORDER BY u.k, t.id",
+           jflat.call(join.call(true, ->(x, r) { r[3] == x }).select { |_k, id| id.nil? || rows.find { |r| r[0] == id }[1].nil? }))
 
   out.join("\n") + "\n"
 end
@@ -4950,6 +5116,8 @@ SCENARIOS = {
   "index_expr" => method(:gen_index_expr),
   "index_range" => method(:gen_index_range),
   "index_prefix" => method(:gen_index_prefix),
+  "index_vartail" => method(:gen_index_vartail),
+  "partial_index" => method(:gen_partial_index),
   "or_in" => method(:gen_or_in),
   "interval_set" => method(:gen_interval_set),
   "any_array" => method(:gen_any_array),

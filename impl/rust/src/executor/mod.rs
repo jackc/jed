@@ -124,6 +124,10 @@ mod view_write;
 pub(crate) use view_write::*;
 mod row_json;
 pub(crate) use row_json::*;
+mod implication;
+pub(crate) use implication::{
+    filter_implies_predicate, filters_imply_predicate, predicate_rejects_null,
+};
 mod span_filter;
 pub(crate) use span_filter::{LaneFilter, ScratchRow};
 // __SUBMODULES__
@@ -7130,16 +7134,16 @@ pub(crate) struct TupleMember {
 pub(crate) struct IndexKeySet {
     name_key: String,
     tuple: Vec<TupleMember>,
-    col_types: Vec<ScalarType>,
+    slots: Vec<KeySlot>,
     all_fixed: bool,
 }
 
 /// One canonical index interval with its row-key suffix recovery: the known prefix byte length
-/// skipped first, then the width-skipped member slots after it.
+/// skipped first, then the self-delimiting member slots after it (indexes.md §5.1).
 pub(crate) struct IndexProbe {
     bound: KeyBound,
     prefix_len: usize,
-    suffix: Vec<ScalarType>,
+    suffix: Vec<KeySlot>,
 }
 
 /// A per-relation scan bound (cost.md §3): a primary-key range, a secondary-index

@@ -1905,7 +1905,7 @@ impl Engine {
                 slabs,
             });
         };
-        let mut suffix: Vec<ScalarType> = Vec::new();
+        let mut suffix: Vec<KeySlot> = Vec::new();
         if let Some(name) = &path.index {
             let ix = child
                 .indexes
@@ -1916,11 +1916,15 @@ impl Engine {
                 let c = key
                     .as_column()
                     .expect("a reverse-path tail key is a plain column");
+                let col = &child.columns[c];
                 suffix.push(
-                    child.columns[c]
-                        .ty
-                        .as_scalar()
-                        .expect("a reverse-path tail column is a fixed-width scalar"),
+                    KeySlot::for_scalar(
+                        col.ty
+                            .as_scalar()
+                            .expect("a reverse-path tail column is a fixed-width scalar"),
+                        col.collation.is_some(),
+                    )
+                    .expect("a reverse-path tail column has a key slot"),
                 );
             }
         }

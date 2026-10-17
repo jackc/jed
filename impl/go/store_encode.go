@@ -1404,13 +1404,14 @@ func (db *engine) fkKeyedScan(t *fkKeyedTarget, childTable string, mask []bool) 
 		entries, pages, slabs, err := store.ScanWithUnits(mask)
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
-	var suffix []scalarType
+	var suffix []keySlot
 	if path.index != "" {
 		for i := range child.Indexes {
 			if child.Indexes[i].Name == path.index {
 				for _, key := range child.Indexes[i].Keys[len(path.cols):] {
 					c, _ := key.asColumn()
-					suffix = append(suffix, child.Columns[c].Type.ScalarTy())
+					slot, _ := keySlotForScalar(child.Columns[c].Type.ScalarTy(), child.Columns[c].Collation != "")
+					suffix = append(suffix, slot)
 				}
 				break
 			}

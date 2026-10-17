@@ -187,9 +187,8 @@ entry_key = nullable-slot(key_1) ‖ nullable-slot(key_2) ‖ … ‖ row_storag
   table) is appended as the **suffix**. It makes every entry key unique (a non-unique
   index needs no duplicate handling in the tree), defines a deterministic order among
   equal indexed values (storage-key order), and *is* the row pointer: every prefix
-  component is self-delimiting (fixed-width behind the tag today; terminated/escaped for
-  the future variable-width types), so the suffix is recovered by walking the prefix —
-  no payload needed.
+  component is self-delimiting (a fixed width or its own terminator behind the tag — the
+  §5.1 slot rule), so the suffix is recovered by walking the prefix — no payload needed.
 
 Composition and `memcmp` order follow [encoding.md §2.3](encoding.md) unchanged.
 
@@ -329,15 +328,26 @@ index tree is **range-scanned**:
   still-sound scan); a contradictory pair (`c_p > 5 AND c_p < 5`) is empty.
 
 In each admitted entry the row's storage key is recovered by skipping the **equality
-prefix by its known byte length** `len(P)` and then every remaining key component —
-the range column (if any) and all trailing columns — by width (each self-delimiting: a
-`0x01` NULL tag alone, or `0x00` + the component type's fixed width); the suffix after
-them names the row's storage key, which is fetched from the table tree by **point
-lookup**, in index-entry order (= key order, then storage-key order, so downstream
-order-determinism — ORDER BY tie-breaking, DISTINCT first-occurrence — is unchanged). The
-WHERE stays the **residual filter**, re-applied to every fetched row: the bound only
-narrows which rows are scanned, so the result is always correct even where the bound is a
-superset.
+prefix by its known byte length** `len(P)` and then every remaining key component — the range
+element (if any) and all trailing elements — by its **self-delimiting slot**
+([encoding.md §2.2](encoding.md)): a `0x01` NULL tag alone, or `0x00` + the component's key body,
+whose length its own encoding fixes:
+
+| key form | body length |
+|---|---|
+| integers, `bool`, `uuid`, `date`, `timestamp[tz]`, `f32`/`f64` | the type's fixed width |
+| `interval` (`interval-span-i128`, §2.10) | 16 |
+| `C` `text` / `bytea` (`*-terminated-escape`, §2.4/§2.6) | through the first `0x00 0x01` (a `0x00 0xFF` pair is an escaped NUL) |
+| `decimal` (`decimal-order-preserving`, §2.5) | `1` for zero (`0x04`); else the class byte, the 4-byte exponent, and the pair bytes through the terminator — `0x00` for a positive (`0x05`), `0xFF` for a negative (`0x03`) |
+| collated `text` (`text-collated-sortkey`, §2.12) | 2-byte weight units through the third `0x0000` separator, then a terminated `C` text body |
+
+A container (range/array/composite) element after the equality prefix has no slot rule here, so
+such an index is not used for the bound (the full scan + residual filter; rows identical). The
+suffix after the skipped slots names the row's storage key, which is fetched from the table tree by
+**point lookup**, in index-entry order (= key order, then storage-key order, so downstream
+order-determinism — ORDER BY tie-breaking, DISTINCT first-occurrence — is unchanged). The WHERE
+stays the **residual filter**, re-applied to every fetched row: the bound only narrows which rows
+are scanned, so the result is always correct even where the bound is a superset.
 
 An `UPDATE` / `DELETE` target scan uses the same eligible access predicate as SELECT. It gathers
 every admitted `(storage key, old row)` from the pre-mutation index state, rechecks the complete
@@ -347,22 +357,12 @@ candidate walk in progress. With a non-blocking `LIMIT`, the same bound is pulle
 order and table point-lookups stop at `OFFSET+LIMIT` residual survivors. If `ORDER BY` is exactly the
 same index order, its sort is also elided; an incompatible order retains eager gather + sort.
 
-An index is **eligible for the bound only when every key element from the range element
-onward** — i.e. all elements **after the equality prefix** — has a **fixed-width scalar**
-type (a column key's column type, or an expression key's *result* type). The suffix-skip
-above recovers the row's storage key by advancing over each such component by its type's
-*fixed* width, which a **non-scalar** (range/array/composite) or a **variable-width scalar**
-(`text` / `decimal` / `bytea` / `interval`) does not have. The **equality-prefix elements
-may be any width** (including collated `text`, and an expression producing `text` such as
-`lower(email)`) — their slots are matched as the known encoded prefix `P`, skipped by
-`len(P)`, never by width; so an index whose leading elements are variable-width is usable
-**when the WHERE pins them by equality** (`lower(email) = 'x' AND b > 3` over
-`(lower(email), b i32)` seeks; a bare `b > 3` there does not, because the leading slot is
-then unknown and variable-width). An index whose range element or a trailing unbounded
-element is variable-width is **not used for the bound**: the query takes the full scan +
-residual filter (rows identical, only the cost differs). Lifting the fixed-width tail
-requirement is a follow-on: skip a variable-width component by its self-delimiting length,
-not a fixed width.
+Any scalar key element may be the **range element** or a **trailing element**: a range on a
+variable-width element encodes its endpoints exactly as an equality does (a collated text element's
+endpoints as the column collation's sort key, so it range-scans in collation order —
+[collation.md §8](collation.md)), and every element after the equality prefix is skipped by the slot
+rule above. So `WHERE name > 'm'` over an index on `name text` and `WHERE a = 1` over `(a i32, b
+text)` both seek. (Before the slot rule, only fixed-width elements could follow the prefix.)
 
 ### Cost (the cross-core contract — cost.md §3)
 
@@ -429,11 +429,10 @@ The catalog reshape (v5) + the unique flag (v6)
 - **Expression-index matching is syntactic** (as in PG): the planner uses an expression
   index only when a WHERE operand is structurally equal to the key expression, not
   whenever they are semantically equivalent (`b + a` does not match an index on `a + b`).
-- **Partial-index implication is syntactic** (§9): jed uses a partial index only when the
-  WHERE AND-chain **contains a conjunct structurally equal to the index predicate**, where
-  PG's planner also matches a query predicate that *implies* the index predicate
-  (`amt > 50 ⟹ amt > 0`). A jed miss is a correct full scan. A partial index is used only via the access-predicate bound (no full
-  partial-index scan, and no partial OR/IN / ORDER-BY-skip / INL path this slice).
+- **Partial-index implication is a bounded subset of PostgreSQL's** (§9.1): jed proves
+  implication with a deterministic, step-bounded subset of `predtest.c` (no refutation, no
+  cross-family constants, no `NOT` reasoning, a `$N` never a known value). A jed miss is a correct
+  scan without the index.
 - PG's index machinery (btree opclasses, `USING`, collations, opfamilies) is owned
   surface jed does not implement — we own our surface (CLAUDE.md §1).
 - Error **messages** differ in jed's house style (no identifier quoting); codes match.
@@ -554,24 +553,119 @@ conflicts). So `CREATE UNIQUE INDEX ON pt (amt) WHERE status = 'active'` allows 
 row to duplicate an `active` row's `amt`, but forbids two `active` rows from sharing it.
 
 **Planner (§5) — sound-if-conservative implication.** The partial index holds *only* the
-qualifying rows, so a bounded scan of it plus the residual WHERE returns the query's rows **iff
-every row the query wants is a qualifying row** — i.e. the query's WHERE implies the index
-predicate. jed uses a **syntactic** test (PG's, not a semantic prover): a partial B-tree index is
-eligible for an access-predicate bound (§5.1) **only when the WHERE AND-chain contains a conjunct
-structurally equal to the index's predicate** (the §5.1 `rexpr_eq_shifted` structural match). So
-`SELECT … WHERE status = 'active' AND amt = 100` seeks `pt_amt_active` (the `amt = 100`
-access predicate, gated by the present `status = 'active'` conjunct); `SELECT … WHERE amt = 100`
-(no predicate conjunct) takes the full scan. The full WHERE — including the predicate conjunct —
-stays the residual filter (harmless: it is TRUE for every indexed row). Partial indexes are used
-**only** through the ordinary access-predicate bound, including UPDATE/DELETE when the mutation
-WHERE contains the predicate conjunct. The OR/IN merged-point-lookup, ORDER-BY-skip-sort walk, and
-index-nested-loop paths keep non-partial indexes only this slice (each a documented follow-on).
+qualifying rows, so a scan of it plus the residual WHERE returns the query's rows **iff every row
+the query wants is a qualifying row** — i.e. the query's WHERE implies the index predicate. jed
+decides that with the prover of §9.1. The full WHERE — including any conjunct that implies the
+predicate — stays the residual filter (harmless: it is TRUE for every indexed row). A partial
+B-tree index then serves the ordinary access-predicate bound (§5.1, SELECT and UPDATE/DELETE), the
+**full partial-index scan** (§9.2), and the remaining ordered-index paths (§9.3). Its scan rows
+are estimated with the predicate's selectivity ([estimator.md §7](estimator.md)).
 
-**Divergences from PostgreSQL** (§7): (a) the implication test is **syntactic** — jed uses a
-partial index only when the WHERE literally contains the predicate conjunct, where PG's prover
-also matches an implying predicate (`amt > 50` query ⟹ `amt > 0` index); a jed miss is a correct
-full scan. (b) There is no full partial-index scan without a leading equality/range
-access predicate (a follow-on). Each is a relaxable narrowing, recorded here.
+### 9.1 The implication prover
+
+`implies(W, P)` decides whether a WHERE implies a partial index's resolved predicate `P`. `W` is the
+list of the filter's top-level `AND` conjuncts (the conjuncts of every filter the caller supplies,
+in order); `P`'s columns are table-local and match a filter column shifted by the relation's
+offset. Three procedures, each consuming **one step** of a budget of **10,000** per call of the
+prover (a procedure entered with the budget exhausted answers `false`). Every procedure
+short-circuits left to right in the order written:
+
+1. **`conj(W, P)`** — if `P` is `A AND B`: `conj(W, A) && conj(W, B)`. Otherwise `true` if some
+   `w ∈ W` (in order) has `clause(w, P)`; else, if `P` is `A OR B`: `conj(W, A) || conj(W, B)`;
+   else `false`.
+2. **`clause(w, p)`** — `true` if `w` is structurally equal to `p` (the §5.1 expression match;
+   comparisons agree on operator and, for an ordering operator, collation). Else: if `p` is
+   `A AND B`, `clause(w, A) && clause(w, B)`; if `w` is `A OR B`, `clause(A, p) && clause(B, p)`;
+   if `w` is `A AND B` (nested under an OR), `clause(A, p) || clause(B, p)`; if `w` is an
+   **`x = ANY(array)` premise** — a non-row-wise, non-`ALL` `=` quantified comparison whose array is
+   a constant array or a one-dimensional `ARRAY[…]`, at most **100** elements, every element NULL or
+   a prover constant — then every non-NULL element `e` (in order) must satisfy `atom(x = e, p)`, and
+   at least one element must be non-NULL (a NULL element never makes `ANY` TRUE); the premise's
+   ordering-collation flag is the quantifier's. Else, if `p` is `A OR B` and
+   `clause(w, A) || clause(w, B)`, `true`. Else, if `w` is a **comparison atom**, `atom(w, p)`;
+   else `false`.
+3. **`atom(x op₁ c₁, p)`** — if `p` is `A AND B`: `atom(…, A) && atom(…, B)`; if `A OR B`:
+   `atom(…, A) || atom(…, B)`. If `p` is `y IS NOT NULL` with `y` structurally equal to `x`: `true`
+   (a TRUE comparison with a constant has a non-NULL operand). If `p` is a comparison atom
+   `y op₂ c₂` with `y` structurally equal to `x` and `c₁`, `c₂` of the same constant family: the
+   implication table below on the order of `c₁` vs `c₂`, where an ordering operator (`< <= > >=`)
+   on either side requires both comparisons to carry no collation (`C` text or a non-text family).
+   Otherwise `false`.
+
+A **comparison atom** is a comparison (`= <> < <= > >=`) with a **prover constant** on one side
+(normalized to the right, the operator flipped when the constant is on the left; the right side is
+tried first). The prover constant families, each ordered within itself only: integer literals (by
+value), `text` (byte order — `C`), `decimal` (by value), `date`, `timestamp`, `timestamptz`,
+`boolean` (`false < true`), `uuid` (byte order). A NULL literal, a parameter `$N`, a float, an
+interval, a cast, or any other expression is not a prover constant. `IN (…)` is its desugared OR of
+equalities, and `BETWEEN` its AND of two comparisons.
+
+The comparison implication table (PostgreSQL's btree `BT_implic_table`): `x op₁ c₁` implies
+`x op₂ c₂` when
+
+| `op₁` | `op₂` and the condition on `c₁` vs `c₂` |
+|---|---|
+| `=` | `c₁ op₂ c₂` holds |
+| `<` | `op₂ ∈ {<, <=, <>}` and `c₁ <= c₂` |
+| `<=` | `op₂ ∈ {<, <>}` and `c₁ < c₂`; or `op₂` is `<=` and `c₁ <= c₂` |
+| `>` | `op₂ ∈ {>, >=, <>}` and `c₁ >= c₂` |
+| `>=` | `op₂ ∈ {>, <>}` and `c₁ > c₂`; or `op₂` is `>=` and `c₁ >= c₂` |
+| `<>` | `op₂` is `<>` and `c₁ = c₂` |
+
+So `amt > 50` implies `amt > 0`, `amt = 5` implies `amt <> 3`, `status IN ('a','b')` implies
+`status IN ('a','b','c')`, `status > 'b'` implies `status IS NOT NULL`, and `amt = ANY(ARRAY[4,
+33])` implies `amt > 0`; `amt >= 0` does not imply `amt > 0`. Every rule is sound for any row,
+including one whose columns are all NULL (a NULL-extended outer-join row): a TRUE premise never
+holds of a NULL operand.
+
+**NULL-rejecting predicates.** A predicate is *NULL-rejecting* when it cannot be TRUE for a row whose
+columns are all NULL. The syntactic test: a comparison with a bare column on either side; a `LIKE`
+or regex match, or a non-`ALL` quantified comparison, with a bare column operand; `col IS NOT
+NULL`; a bare column or its `NOT`; an `AND` with either side NULL-rejecting; an `OR` with both sides
+NULL-rejecting. Anything else is not. Used by §9.3.
+
+### 9.2 The full partial-index scan
+
+When a **single-relation** SELECT, UPDATE, or DELETE's WHERE implies a partial B-tree index's
+predicate but supplies **no** equality/range access predicate on its keys, the whole index is still a
+complete source of every row the statement can return. The planner then inventories one more
+candidate for that index: a **full partial-index scan** — the §5.1 bound with an empty equality
+prefix and no range (the range `[ε, ∞)` over the index tree), recovering each entry's storage key by
+the slot rule and point-looking-up its row. It is a B-tree candidate under the index's name, so it
+takes part in cost selection like any bound ([estimator.md §9](estimator.md)), composes with an
+exact same-index `ORDER BY` (the sort is elided) and with LIMIT streaming exactly as a bound over
+that index does, and appears in EXPLAIN as `Index scan: using <index>`. It is offered only when every
+key element is a scalar with a slot rule (§5.1) and no key column is a version-skewed collated
+column ([collation.md §12](collation.md)), and never in a multi-relation scope: there a relation may
+be NULL-extended, and an implied predicate such as `deleted_at IS NULL` is TRUE for a NULL-extended
+row the index does not hold. The structural selector used by fixed-policy (multi-relation)
+boundaries therefore never sees it. The canonical use is a soft-delete index over the few live
+rows: `CREATE INDEX t_live ON t (k) WHERE deleted_at IS NULL` serves `WHERE deleted_at IS NULL` and
+`WHERE deleted_at IS NULL ORDER BY k LIMIT n`.
+
+### 9.3 The other ordered-index paths
+
+- **OR / IN interval sets** ([cost.md §3](cost.md)) use a partial index when the WHERE implies its
+  predicate; the set's disjunction is a WHERE conjunct of strict comparisons on the relation's own
+  key, so it rejects a NULL-extended row.
+- The **exact-order index walk** of `ORDER BY … LIMIT` ([planner.md §5](planner.md), single
+  relations only) walks a partial index when the WHERE implies its predicate.
+- **Index-nested-loop inner.** A partial index serves as the inner of an index-nested-loop join
+  when the join's own `ON` implies its predicate — a row the index lacks fails the `ON` and never
+  joins, outer join or not — or when the `ON` together with the WHERE implies a **NULL-rejecting**
+  predicate. A WHERE conjunct holds only of the final rows, and an outer join may NULL-extend this
+  relation in a row that the index's missing rows produced; a NULL-rejecting predicate makes every
+  such row fail the implied WHERE, so the result is unchanged. (`a LEFT JOIN b ON b.k = a.x WHERE
+  b.tag IS NULL` must not probe an index `WHERE tag IS NULL`: an `a` row whose only matches are
+  tagged would become a NULL-extended row that passes the WHERE.)
+- The **referencing-side lookup** of a foreign-key action ([constraints.md §6](constraints.md))
+  still uses only non-partial indexes (it has no query predicate to imply the index predicate).
+
+**Divergences from PostgreSQL** (§7): the prover is a bounded subset of PostgreSQL's
+(`predtest.c`): no refutation, no cross-family constants, no `NOT` reasoning, and a parameter
+`$N` is never a known constant (PostgreSQL's custom plans see the value), so a jed miss is a
+correct scan without the index. A partial unique index arbitrates `ON CONFLICT` only through an
+implying `WHERE index_predicate` ([upsert.md §2](upsert.md)), as in PostgreSQL.
 
 **Introspection.** `jed_indexes` gains a `predicate text` column carrying the canonical predicate
 text (NULL for a non-partial index) — the analog of PostgreSQL's `pg_index.indpred`

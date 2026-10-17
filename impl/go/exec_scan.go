@@ -1207,17 +1207,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		return keepGoing, err
 	}
 
-	rowKeyFromIndex := func(ekey []byte, prefixLen int, suffix []scalarType) []byte {
-		at := prefixLen
-		for _, ty := range suffix {
-			at = keySlotEnd(ekey, at, ty)
-		}
-		if at > len(ekey) {
-			return nil // a short entry names no row
-		}
-		return ekey[at:]
-	}
-	scanIndexInterval := func(nameKey string, b keyBound, prefixLen int, suffix []scalarType, charge bool) (bool, error) {
+	scanIndexInterval := func(nameKey string, b keyBound, prefixLen int, suffix []keySlot, charge bool) (bool, error) {
 		istore := db.lkpIndexStore(nameKey)
 		if charge {
 			overlap, slabs, err := istore.OverlapScanUnits(b, nil)
@@ -1234,7 +1224,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 			if err := meter.Guard(); err != nil {
 				return false, err
 			}
-			rowKey := rowKeyFromIndex(ekey, prefixLen, suffix)
+			rowKey := indexEntryRowKey(ekey, prefixLen, suffix)
 			row, ok, pages, slabs, err := store.GetWithUnits(rowKey, plan.relMasks[0])
 			if err != nil {
 				return false, err
@@ -1281,7 +1271,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	case sb.index != nil:
 		b, prefixLen, empty := db.buildIndexBound(sb.index, params, env.outer, nil)
 		if !empty {
-			if _, err := scanIndexInterval(sb.index.nameKey, b, prefixLen, sb.index.suffixTypes, true); err != nil {
+			if _, err := scanIndexInterval(sb.index.nameKey, b, prefixLen, sb.index.suffix, true); err != nil {
 				return selectResult{}, err
 			}
 		}

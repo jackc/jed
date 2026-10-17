@@ -1126,6 +1126,10 @@ impl Engine {
         match b {
             None => "Full scan".to_string(),
             Some(ScanBound::Pk(pb)) => format!("{prefix}PK bound: {}", render_pk_bound(pb)),
+            // A full partial-index scan has no access predicate (indexes.md §9.2).
+            Some(ScanBound::Index(ib)) if ib.eq_cols.is_empty() && ib.range.is_none() => {
+                format!("{prefix}Index scan: using {}", ib.name_key)
+            }
             Some(ScanBound::Index(ib)) => format!("{prefix}Index bound: using {}", ib.name_key),
             Some(ScanBound::Gin(gb)) => format!("{prefix}GIN bound: using {}", gb.name_key),
             Some(ScanBound::Gist(gp)) => format!("{prefix}GiST bound: using {}", gp.name_key),

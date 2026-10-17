@@ -140,7 +140,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`FOREIGN KEY` constraints** — column-/table-level `REFERENCES`, composite + self-reference, same-type pairing (`42804`), MATCH SIMPLE and MATCH FULL (a partly-NULL tuple is `23503`; `format_version` 40's match bit, `jed_constraints.match_type`), enforced at four write sites (`23503`), plus recursive `ON DELETE`/`ON UPDATE` `CASCADE | SET NULL | SET DEFAULT` action closures (`format_version` 30's three-bit action fields). → [constraints.md §6](spec/design/constraints.md)
   - [ ] _follow-on:_ FK type pairing relaxed to PG's comparable-types.
 - [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — on-disk B-trees with equality/range and multi-column-prefix bounds, expression and partial keys, bounded mutation scans, and LIMIT streaming; `format_version` 5/26/27. → [indexes.md](spec/design/indexes.md)
-  - [ ] _follow-on (each its own slice + NoREC obligation):_ a variable-width range/tail column (self-delimiting skip, not fixed width); ordered (`ASC`/`DESC`/`NULLS`) keys; **partial-index relaxations** — a full partial-index scan without a leading access predicate, partial OR/IN / ORDER-BY-skip / INL bounds, an ON CONFLICT partial arbiter, a general predicate-implication prover (beyond the syntactic match). (`jsonb` and composite keys are tracked separately above.)
+  Variable-width (text/decimal/bytea/interval, C or collated) range and trailing key elements are
+  skipped by their self-delimiting encodings (indexes.md §5.1). Partial indexes are used whenever the
+  WHERE implies their predicate under a bounded `predtest.c`-subset prover (§9.1), including a full
+  partial-index scan with no access predicate and its ORDER BY walk (§9.2), OR/IN sets, and the
+  index-nested-loop inner (§9.3); `ON CONFLICT (cols) WHERE pred` infers a partial unique arbiter.
+  - [ ] _follow-on (each its own slice + NoREC obligation):_ ordered (`ASC`/`DESC`/`NULLS`) keys; a
+    container (range/array/composite) element after the equality prefix (needs a container slot
+    skip); a full partial-index scan inside a join (sound for a NULL-rejecting predicate,
+    indexes.md §9.2); prover extensions — refutation, cross-family constants, `NOT`, and a bound
+    `$N`'s value (would make implication parameter-sensitive, estimator.md §6.1). (`jsonb` and
+    composite keys are tracked separately above.)
 - [x] **GIN inverted indexes** (`CREATE INDEX … USING gin`) — a second index *kind* via a type-generic operator-class seam: the **`array_ops`** opclass (one entry per distinct non-NULL element, `format_version` 12's `index_kind` byte, a `gin_entry` cost unit) accelerating `@>`/`&&`/`= ANY(col)`/array `=` for SELECT + GIN-bounded UPDATE/DELETE, over every scalar key element type (incl. `text[]`, each element's `C` key cut at 128 bytes, `bytea[]` and `decimal[]`, each key cut at 128 bytes — a decimal's key is value-based, so `1.5 = 1.50` is term-exact and an integer `= ANY(decimal[])` converts, `f32[]`/`f64[]`, whose canonicalizing float key makes `-0 = +0` and `NaN = NaN` term-exact, and `interval[]`, whose span key makes `1 mon = 30 days` term-exact) — plus the **`jsonb_ops`** opclass over a `jsonb` column (PostgreSQL's key/value terms, flag byte + terminated body cut at 128 bytes) accelerating `@>`/`?`/`?|`/`?&`, lossy and always rechecked; an ALL-mode **skip-scan** intersection reads only the shortest posting list whole and probes the others leaf by leaf at the surviving candidates (gin.md §6.2). → [gin.md](spec/design/gin.md)
   Bounded LIMIT streaming completes the posting gather, then stops candidate table lookups/filtering at the window.
   - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the index recording empty/NULL-array rows) / `IN` over a scalar list; the **remaining** element types — composite- and `jsonb`-element arrays (each needs a non-scalar term rule); multi-column GIN; correlated / array-column query operands; posting-list run compression; the `jsonb_ops` jsonpath strategies `@?`/`@@`; a future object/document opclass.
@@ -148,7 +158,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on (each its own slice + NoREC/oracle obligation):_ the `EXCLUDE … WHERE (predicate)` partial form; `DEFERRABLE` / `INITIALLY DEFERRED` (jed has no deferred-constraint machinery — its own axis); `EXCLUDE USING btree (a WITH =)` lowering an all-`=` exclude onto an ordered unique index; **SP-GiST** (`index_kind = 3`) and GiST KNN `ORDER BY col <-> const` (needs a distance scalar — far off); general-expression WITH operands; multi-column GiST beyond the exclusion shape.
   - [ ] _follow-on — future GiST opclasses (each gated on its type/operator surface landing first):_ **`multirange_ops`** once a multirange type lands ([ranges.md §10](spec/design/ranges.md)); an **`hstore`/dictionary-type opclass** (`@>`/`?`/`?&`/`?|`) for a future map type (a new type axis, or riding the [json.md §3](spec/design/json.md) dictionary door — which brings a **GIN** opclass too); a **`pg_trgm`-style trigram `text` opclass** accelerating similarity (`%`) / `LIKE` / `ILIKE`; an **`intarray`-style signature GiST opclass** over array columns. Each is "build it when its type / operator surface exists"; none is foreclosed by the GiST seam.
 - [x] **`UPSERT` / `ON CONFLICT`** — `INSERT … ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] }`; the `excluded` pseudo-relation; column-SET or `ON CONSTRAINT name` arbiter; two-phase / all-or-nothing. → [upsert.md](spec/design/upsert.md), [grammar.md §46](spec/design/grammar.md)
-  - [ ] _follow-on:_ the partial-index `WHERE index_predicate` / `COLLATE`/opclass inference decorations; relaxing the DO UPDATE PK-column assignment (`0A000`) — the standalone UPDATE re-keying has landed, but the conflict-path re-key is still deferred. → [upsert.md §10](spec/design/upsert.md)
+  - [x] `ON CONFLICT (cols) WHERE index_predicate` partial unique-index arbiter inference.
+  - [ ] _follow-on:_ the `WHERE index_predicate` through an updatable view (`0A000`); several partial
+    arbiters at once (PostgreSQL arbitrates every inferable index); `COLLATE`/opclass inference decorations; relaxing the DO UPDATE PK-column assignment (`0A000`) — the standalone UPDATE re-keying has landed, but the conflict-path re-key is still deferred. → [upsert.md §10](spec/design/upsert.md)
 - [x] **`ALTER TABLE`** — catalog-only rename/default/nullability/constraint edits plus the
   `ADD`/`DROP COLUMN`, `ALTER COLUMN … TYPE … [USING]`, and `ADD`/`DROP PRIMARY KEY` rewrite slices
   have landed, as has identity management (`ALTER COLUMN … ADD GENERATED … AS IDENTITY`, `SET GENERATED`,
@@ -285,10 +297,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     - [x] _follow-on:_ an index-nested-loop sibling column as a tuple-set member's point source
       (PK and index): `b.tenant = a.tenant AND b.id IN (1, 2)` probes the outer row's tuples.
     - [x] _follow-on:_ a variable-width index column at or after the first later set or range — an
-      admitted entry steps over a C-collated `text`/`bytea`, `decimal`, or `interval` slot by
-      decoding its delimiter, so such a column no longer leaves only the plain index bound (a
-      collated `text` slot still does). The plain index bound and the index-nested-loop bound keep
-      their fixed-width suffix rule.
+      admitted entry steps over any scalar slot (a `text` of any collation, `bytea`, `decimal`, or
+      `interval`) by its self-delimiting slot rule (indexes.md §5.1), so such a column no longer
+      leaves only the plain index bound. The plain index bound and the index-nested-loop bound use
+      the same rule.
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
     composite/array/json/jsonb, GIN term statistics for `<@`, and an element-count

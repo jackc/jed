@@ -639,6 +639,75 @@ setup_sql = [
   "CREATE INDEX p6b_ordered_x_idx ON p6b_ordered (x)"
 ]
 
+# Variable-width trailing index element (query.index_variable_width_tail, indexes.md §5.1). The index
+# is (a, s text); `a = $1` admits ~100 of 100k rows. Before the slot rule the text slot after the
+# equality prefix could not be skipped, so the index was ineligible and every core full-scanned.
+[[bench]]
+name = "index_vartail_prefix"
+description = "Index on (a, s text): a = $1 on 100k rows; ~100 index-bounded lookups past a text slot vs a full scan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, s FROM vartail_orders WHERE a = $1 ORDER BY id"
+warmup = 20
+iterations = 300
+seed = 4291
+expect_rows_per_iter = 100
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS vartail_orders",
+  "CREATE TABLE vartail_orders (id bigint PRIMARY KEY, a bigint, s text)",
+  "INSERT INTO vartail_orders SELECT g, g % 1000, 'k' || CAST(g % 997 AS text) FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX vartail_orders_a_s_idx ON vartail_orders (a, s)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 999
+
+# Implied partial-index range (query.index_partial_implication, indexes.md §9.1). The index holds
+# only `amt > 0` rows; the query's literal `amt BETWEEN 50000 AND 50300` implies it. With the old
+# syntactic match the WHERE did not restate the predicate, so jed full-scanned 100k rows. (The prover
+# reads only literals: a `$N` endpoint is never a known value, indexes.md §9.1.)
+[[bench]]
+name = "partial_index_implied_range"
+description = "Partial index WHERE amt > 0, queried by an implying literal amt BETWEEN 50000 AND 50300 on 100k rows"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, amt FROM partial_orders WHERE amt BETWEEN 50000 AND 50300 ORDER BY id"
+warmup = 20
+iterations = 300
+seed = 4292
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS partial_orders",
+  "CREATE TABLE partial_orders (id bigint PRIMARY KEY, amt bigint)",
+  "INSERT INTO partial_orders SELECT g, (g * 7919) % 200001 - 100000 FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX partial_orders_pos_idx ON partial_orders (amt) WHERE amt > 0"
+]
+
+# Full partial-index scan (query.index_partial_full_scan, indexes.md §9.2): a soft-delete index over
+# the 100 live rows of 100k serves `WHERE deleted IS NULL ORDER BY k LIMIT 10` by walking the narrow
+# index in k order. Before, a partial index needed an access predicate on its key, so jed full-scanned
+# and sorted.
+[[bench]]
+name = "partial_index_live_topn"
+description = "Soft-delete partial index (100 live of 100k rows): WHERE deleted IS NULL ORDER BY k LIMIT 10"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, k FROM softdel_orders WHERE deleted IS NULL ORDER BY k LIMIT 10"
+warmup = 20
+iterations = 300
+seed = 4293
+expect_rows_per_iter = 10
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS softdel_orders",
+  "CREATE TABLE softdel_orders (id bigint PRIMARY KEY, k bigint, deleted bigint)",
+  "INSERT INTO softdel_orders SELECT g, (g * 31) % 1009, CASE WHEN g % 1000 = 0 THEN NULL ELSE g END FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX softdel_orders_live_idx ON softdel_orders (k) WHERE deleted IS NULL"
+]
+
 # P6b makes GiST a cost-selected single-relation candidate. Ten ranges contain the fixed one-point
 # query range; the complete path competes with the 50k-row full scan.
 [[bench]]

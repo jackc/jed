@@ -412,6 +412,11 @@ arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_p
 - **Array, range, and composite columns** — `DO UPDATE` assigns them as `UPDATE` does: `NULL`, a
   text literal (`'{1,2}'`, `'[1,5)'`, `'(Main,1)'`), or a value of the column's own type such as
   `excluded.col`.
+- **A partial unique index** — a column target never picks a partial unique index unless you add its
+  predicate after the target, as in PostgreSQL. With `CREATE UNIQUE INDEX account_open ON account
+  (owner) WHERE balance > 0`, write `INSERT … ON CONFLICT (owner) WHERE balance > 0 DO NOTHING`. The
+  `WHERE` only has to imply the index predicate (`WHERE balance > 10` works too). A row whose own
+  predicate is false is not in that index, so it never conflicts there and is inserted.
 - **A target alias** — `INSERT INTO account AS a VALUES (1, 'Ada', 5.00) ON CONFLICT (id) DO UPDATE
   SET balance = a.balance + excluded.balance RETURNING a.balance;` names the existing row `a`. Once
   aliased, the table is referred to only by its alias (`account.balance` would be `42P01`), in the

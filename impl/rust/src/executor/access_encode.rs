@@ -140,10 +140,118 @@ pub(crate) struct IndexEqCol {
 }
 
 /// The optional trailing range of an index access predicate (indexes.md §5.1): a range on the key
-/// column immediately after the equality prefix. Its column is fixed-width (never collated).
+/// column immediately after the equality prefix. A collated text column (`coll = Some`) encodes its
+/// endpoints as the column collation's UCA sort key, the stored key form (encoding.md §2.12).
 pub(crate) struct IndexRange {
     pub(crate) col_type: ScalarType,
+    pub(crate) coll: Option<std::sync::Arc<Collation>>,
     pub(crate) terms: Vec<BoundTerm>,
+}
+
+/// How one index key component's nullable slot is skipped to recover an entry's storage-key suffix
+/// (indexes.md §5.1, encoding.md §2.2): every scalar key encoding is self-delimiting, either by a
+/// fixed width or by its own terminator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeySlot {
+    /// A fixed-width body (the integers, bool, uuid, date, timestamps, floats, interval's 16 bytes).
+    Fixed(usize),
+    /// `text-terminated-escape` / `bytea-terminated-escape` (encoding.md §2.4/§2.6).
+    Terminated,
+    /// `decimal-order-preserving` (encoding.md §2.5).
+    Decimal,
+    /// `text-collated-sortkey` (encoding.md §2.12).
+    Collated,
+}
+
+impl KeySlot {
+    /// The slot form of a scalar key component of type `ty`; `collated` selects the sort-key form
+    /// of a non-`C` text key. `None` for a type with no key encoding.
+    pub(crate) fn for_scalar(ty: ScalarType, collated: bool) -> Option<KeySlot> {
+        Some(match ty {
+            ScalarType::Text if collated => KeySlot::Collated,
+            ScalarType::Text | ScalarType::Bytea => KeySlot::Terminated,
+            ScalarType::Decimal => KeySlot::Decimal,
+            ScalarType::Interval => KeySlot::Fixed(16),
+            ScalarType::Json | ScalarType::Jsonb | ScalarType::JsonPath => return None,
+            _ => KeySlot::Fixed(ty.width_bytes()),
+        })
+    }
+
+    /// The byte length of the nullable slot starting at `key[at]` (its tag included): `1` for the
+    /// `0x01` NULL tag, else `1` + the self-delimited body. `None` for a malformed (truncated) slot.
+    pub(crate) fn slot_len(self, key: &[u8], at: usize) -> Option<usize> {
+        if *key.get(at)? == 0x01 {
+            return Some(1);
+        }
+        let body = key.get(at + 1..)?;
+        let n = match self {
+            KeySlot::Fixed(w) => {
+                if body.len() < w {
+                    return None;
+                }
+                w
+            }
+            KeySlot::Terminated => terminated_len(body)?,
+            KeySlot::Decimal => match *body.first()? {
+                0x04 => 1,
+                // class ‖ 4-byte exponent ‖ pair bytes ‖ terminator (0x00; complemented 0xFF).
+                class @ (0x03 | 0x05) => {
+                    let term = if class == 0x05 { 0x00 } else { 0xFF };
+                    let rest = body.get(5..)?;
+                    5 + rest.iter().position(|&b| b == term)? + 1
+                }
+                _ => return None,
+            },
+            KeySlot::Collated => {
+                // Three levels of 2-byte weights, each ended by a 0x0000 separator, then the
+                // identical level: the original string's terminated `C` key.
+                let mut i = 0;
+                let mut seps = 0;
+                while seps < 3 {
+                    let w = body.get(i..i + 2)?;
+                    i += 2;
+                    if w == [0, 0] {
+                        seps += 1;
+                    }
+                }
+                i + terminated_len(body.get(i..)?)?
+            }
+        };
+        Some(1 + n)
+    }
+}
+
+/// The length of a `*-terminated-escape` body (`0x00 0xFF` an escaped NUL, `0x00 0x01` the end).
+fn terminated_len(body: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    loop {
+        if *body.get(i)? == 0x00 {
+            match *body.get(i + 1)? {
+                0x01 => return Some(i + 2),
+                _ => i += 2,
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Skip `slots` past `prefix_len` in an index entry key and return the storage-key suffix after
+/// them (indexes.md §3). A corrupt entry shorter than its components yields an empty storage key,
+/// which names no row.
+pub(crate) fn index_entry_row_key<'a>(
+    key: &'a [u8],
+    prefix_len: usize,
+    slots: &[KeySlot],
+) -> &'a [u8] {
+    let mut at = prefix_len;
+    for slot in slots {
+        match slot.slot_len(key, at) {
+            Some(n) => at += n,
+            None => return &[],
+        }
+    }
+    key.get(at..).unwrap_or(&[])
 }
 
 /// The plan-time result for one eligible ordered index (indexes.md §5.1): a maximal EQUALITY PREFIX
@@ -151,15 +259,16 @@ pub(crate) struct IndexRange {
 /// inventory owns one plan per eligible index; the selector chooses among them. At exec time
 /// `build_index_bound` turns these into a concrete index-key range: the equality prefix bytes
 /// P = concatenated present slots, then the range (if any) intersected relative to P.
-/// `suffix_types` are the types of the index columns AFTER the equality prefix (`columns[eq..]`) —
-/// the range column (if any) plus every trailing column — each FIXED-WIDTH so an admitted entry's
-/// row-key suffix is recovered by width-skipping them past P.
+/// `suffix` holds the slot forms of the index key elements AFTER the equality prefix
+/// (`keys[eq..]`) — the range element (if any) plus every trailing element — each skipped by its
+/// self-delimiting encoding so an admitted entry's row-key suffix is recovered past P. An empty
+/// `eq_cols` with no `range` is a FULL partial-index scan (indexes.md §9.2).
 pub(crate) struct IndexBound {
     /// The index store's key — the exact index name.
     pub(crate) name_key: String,
     pub(crate) eq_cols: Vec<IndexEqCol>,
     pub(crate) range: Option<IndexRange>,
-    pub(crate) suffix_types: Vec<ScalarType>,
+    pub(crate) suffix: Vec<KeySlot>,
 }
 
 /// The outcome of encoding a const-source into the PK key space.
@@ -204,6 +313,8 @@ pub(crate) fn build_index_access_predicate(
             return None;
         }
     }
+    // (A partial index's predicate needs no NULL-rejection here: every bound term below is a strict
+    // comparison on this relation's key, so its WHERE conjunct rejects a NULL-extended row.)
     let mut eq_cols: Vec<IndexEqCol> = Vec::new();
     let mut range: Option<IndexRange> = None;
     for key in &rindex.keys {
@@ -255,6 +366,7 @@ pub(crate) fn build_index_access_predicate(
         if !ranges.is_empty() {
             range = Some(IndexRange {
                 col_type: ty,
+                coll,
                 terms: ranges,
             });
         }
@@ -263,27 +375,124 @@ pub(crate) fn build_index_access_predicate(
     if eq_cols.is_empty() && range.is_none() {
         return None; // nothing bound
     }
-    // Eligibility: every key element from the range element onward (`keys[eq_cols.len()..]`) is
-    // width-skipped past the known equality prefix to recover the storage key, so each must be a
-    // fixed-width scalar (a column's type, or an expression's result type). The equality-prefix
-    // elements may be any width — their slots are matched as the known prefix bytes.
-    let mut suffix_types = Vec::with_capacity(rindex.keys.len() - eq_cols.len());
-    for key in &rindex.keys[eq_cols.len()..] {
-        let s = match key {
-            ResolvedKey::Column(ci) => rel.table.columns[*ci].ty.as_scalar()?,
-            ResolvedKey::Expr(_, ety, _) => ety.as_scalar()?,
-        };
-        if !s.is_fixed_width() {
-            return None;
-        }
-        suffix_types.push(s);
-    }
+    let suffix = index_suffix_slots(rel, &rindex, eq_cols.len())?;
     Some(IndexBound {
         name_key: idx.name.to_string(),
         eq_cols,
         range,
-        suffix_types,
+        suffix,
     })
+}
+
+/// The slot forms of the resolved index's key elements from `from` onward (indexes.md §5.1): each is
+/// skipped past the known equality prefix to recover an entry's storage key, so each must be a
+/// scalar with a key encoding (a column's type, or an expression's result type). `None` when one is
+/// a container (range/array/composite) element.
+pub(crate) fn index_suffix_slots(
+    rel: &ScopeRel,
+    rindex: &ResolvedIndex,
+    from: usize,
+) -> Option<Vec<KeySlot>> {
+    let mut suffix = Vec::with_capacity(rindex.keys.len().saturating_sub(from));
+    for key in &rindex.keys[from..] {
+        let slot = match key {
+            ResolvedKey::Column(ci) => {
+                let col = &rel.table.columns[*ci];
+                KeySlot::for_scalar(col.ty.as_scalar()?, col.collation.is_some())?
+            }
+            ResolvedKey::Expr(_, ety, ecoll) => {
+                KeySlot::for_scalar(ety.as_scalar()?, ecoll.is_some())?
+            }
+        };
+        suffix.push(slot);
+    }
+    Some(suffix)
+}
+
+/// A FULL partial-index scan (indexes.md §9.2): a B-tree PARTIAL index whose predicate the WHERE
+/// implies (§9.1) is a complete source of the query's rows even without an equality/range access
+/// predicate, so it is a candidate that walks the whole (narrow) index. Offered only for a
+/// single-relation scan (a join's relation never NULL-extends here) and only when no ordinary access
+/// predicate already bounds this index. Every key element must be skippable (§5.1).
+pub(crate) fn build_partial_index_full_scan(
+    filter: &RExpr,
+    rel: &ScopeRel,
+    idx: &IndexDef,
+    catalog: &Engine,
+) -> Option<IndexBound> {
+    if idx.kind != IndexKind::Btree || idx.predicate.is_none() {
+        return None;
+    }
+    let rindex = catalog.resolve_index(rel.table, idx).ok()?;
+    let pred = rindex.predicate.as_ref()?;
+    if !filter_implies_predicate(filter, pred, rel.offset) {
+        return None;
+    }
+    // A skewed collated key element's stored order is not the loaded collation's; never walk it
+    // (the read-safety rule, collation.md §12).
+    for key in &rindex.keys {
+        if let ResolvedKey::Column(ci) = key {
+            key_collation_ctx(catalog, &rel.table.columns[*ci])?;
+        }
+    }
+    let suffix = index_suffix_slots(rel, &rindex, 0)?;
+    Some(IndexBound {
+        name_key: idx.name.to_string(),
+        eq_cols: Vec::new(),
+        range: None,
+        suffix,
+    })
+}
+
+/// The single-relation access inventory (estimator.md §9.1, §9.3): [`inventory_scan_candidates`]
+/// plus a FULL partial-index scan for every partial index whose predicate the WHERE implies and that
+/// has no ordinary access-predicate candidate (indexes.md §9.2), in canonical kind/name order.
+pub(crate) fn inventory_single_relation_candidates<'a>(
+    filter: Option<&'a RExpr>,
+    rel: &ScopeRel,
+    catalog: &Engine,
+) -> Vec<ScanCandidate<'a>> {
+    let mut candidates = inventory_scan_candidates(filter, rel, catalog);
+    let Some(filter_expr) = filter else {
+        return candidates;
+    };
+    if rel.is_attachment() {
+        return candidates;
+    }
+    let mut added = false;
+    for idx in &rel.table.indexes {
+        let has_bound = candidates.iter().any(|c| {
+            c.identity.kind == ScanCandidateKind::Btree && c.identity.index_name == idx.name
+        });
+        if has_bound {
+            continue;
+        }
+        if let Some(bound) = build_partial_index_full_scan(filter_expr, rel, idx, catalog) {
+            let name = bound.name_key.clone();
+            candidates.push(index_order_candidate(
+                ScanCandidateKind::Btree,
+                name,
+                ScanBound::Index(bound),
+                filter,
+            ));
+            added = true;
+        }
+    }
+    if added {
+        sort_scan_candidates(&mut candidates);
+    }
+    candidates
+}
+
+fn sort_scan_candidates(candidates: &mut [ScanCandidate<'_>]) {
+    candidates.sort_by(|a, b| {
+        a.identity.kind.cmp(&b.identity.kind).then_with(|| {
+            a.identity
+                .index_name
+                .as_bytes()
+                .cmp(b.identity.index_name.as_bytes())
+        })
+    });
 }
 
 /// Canonical access-path rank from estimator.toml. Keep declaration order byte-identical to the
@@ -490,14 +699,7 @@ pub(crate) fn inventory_scan_candidates<'a>(
         }
     }
     candidates.push(full());
-    candidates.sort_by(|a, b| {
-        a.identity.kind.cmp(&b.identity.kind).then_with(|| {
-            a.identity
-                .index_name
-                .as_bytes()
-                .cmp(b.identity.index_name.as_bytes())
-        })
-    });
+    sort_scan_candidates(&mut candidates);
     candidates
 }
 
@@ -1419,7 +1621,7 @@ fn index_set_structural_selectivity(
     if bound.tuple.len() > 1 {
         return tuple_set_selectivity(
             &bound.tuple,
-            bound.col_types.len(),
+            bound.slots.len(),
             unique,
             structural_tuple_member_selectivity,
         );
@@ -1428,7 +1630,7 @@ fn index_set_structural_selectivity(
     estimator_interval_selectivity(
         lead.specs.as_deref().unwrap_or_default(),
         &lead.clip,
-        unique && bound.col_types.len() == 1,
+        unique && bound.slots.len() == 1,
         lead.col_type,
     )
 }
@@ -1603,6 +1805,75 @@ fn estimator_candidate_selectivity_with_statistics(
     rel: &ScopeRel<'_>,
     catalog: &Engine,
 ) -> crate::estimator::Selectivity {
+    let access = estimator_access_selectivity_with_statistics(bound, identity, rel, catalog);
+    partial_index_scan_selectivity(access, bound, identity, rel, catalog)
+}
+
+/// A PARTIAL index holds only its qualifying rows (indexes.md §9), so its scan rows are the access
+/// predicate's rows further narrowed by the index predicate (estimator.md §7): each top-level
+/// predicate conjunct that reads no column of a key element the access predicate constrains applies
+/// its structural (statistics-free) selectivity, in predicate order. A conjunct over a constrained
+/// column is skipped, since it usually restates the access predicate's own range.
+fn partial_index_scan_selectivity(
+    access: crate::estimator::Selectivity,
+    bound: Option<&ScanBound>,
+    identity: &ScanCandidateIdentity,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    if matches!(access, Selectivity::Zero | Selectivity::Unique) {
+        return access;
+    }
+    let constrained = match bound {
+        Some(ScanBound::Index(b)) => b.eq_cols.len() + usize::from(b.range.is_some()),
+        Some(ScanBound::IndexSet(b)) => b.tuple.len(),
+        _ => return access,
+    };
+    let Some(idx) = rel
+        .table
+        .indexes
+        .iter()
+        .find(|index| index.name == identity.index_name)
+    else {
+        return access;
+    };
+    if idx.predicate.is_none() {
+        return access;
+    }
+    let Ok(rindex) = catalog.resolve_index(rel.table, idx) else {
+        return access;
+    };
+    let Some(pred) = &rindex.predicate else {
+        return access;
+    };
+    let mut read = vec![false; rel.table.columns.len()];
+    for key in rindex.keys.iter().take(constrained) {
+        match key {
+            ResolvedKey::Column(ci) => read[*ci] = true,
+            ResolvedKey::Expr(e, ..) => collect_touched(e, 0, &mut read),
+        }
+    }
+    let mut conjuncts = Vec::new();
+    estimator_flatten_boolean(pred, true, &mut conjuncts);
+    let mut result = access;
+    for conjunct in conjuncts {
+        let mut touched = vec![false; rel.table.columns.len()];
+        collect_touched(conjunct, 0, &mut touched);
+        if touched.iter().zip(&read).any(|(t, r)| *t && *r) {
+            continue;
+        }
+        result = result.and(estimator_predicate_selectivity(Some(conjunct)));
+    }
+    result
+}
+
+fn estimator_access_selectivity_with_statistics(
+    bound: Option<&ScanBound>,
+    identity: &ScanCandidateIdentity,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> crate::estimator::Selectivity {
     use crate::estimator::Selectivity;
     use crate::estimator_constants::SELECTIVITY_EQUALITY;
     let structural = estimator_candidate_selectivity(bound, identity, rel);
@@ -1711,12 +1982,9 @@ fn estimator_candidate_selectivity_with_statistics(
                 return structural;
             };
             if bound.tuple.len() > 1 {
-                return tuple_set_selectivity(
-                    &bound.tuple,
-                    bound.col_types.len(),
-                    index.unique,
-                    |m| statistics_tuple_member_selectivity(m, rel, catalog),
-                );
+                return tuple_set_selectivity(&bound.tuple, bound.slots.len(), index.unique, |m| {
+                    statistics_tuple_member_selectivity(m, rel, catalog)
+                });
             }
             let lead = &bound.tuple[0];
             estimator_interval_selectivity_with_statistics(
@@ -2393,19 +2661,32 @@ fn build_index_interval_set_plan(
     idx: &IndexDef,
     catalog: &Engine,
 ) -> Option<IndexKeySet> {
-    build_index_interval_set_plan_conjuncts(&flatten_conjuncts(filter), rel, idx, catalog, None)
+    // A PARTIAL index serves the set only when the WHERE implies its predicate (indexes.md §9.1);
+    // the set's own disjunction is a NULL-rejecting conjunct on this relation's key.
+    let partial_ok = idx.predicate.is_none()
+        || partial_index_implied(filter, rel.table, rel.offset, idx, catalog);
+    build_index_interval_set_plan_conjuncts(
+        &flatten_conjuncts(filter),
+        rel,
+        idx,
+        catalog,
+        None,
+        partial_ok,
+    )
 }
 
 /// [`build_index_interval_set_plan`] over an AND-chain's conjuncts; `siblings` admits a sibling
-/// column as a member's source (an index-nested-loop inner).
+/// column as a member's source (an index-nested-loop inner). `partial_ok` is the caller's proof that
+/// a PARTIAL index's predicate is implied (indexes.md §9.1, §9.3).
 fn build_index_interval_set_plan_conjuncts(
     conjuncts: &[&RExpr],
     rel: &ScopeRel,
     idx: &IndexDef,
     catalog: &Engine,
     siblings: Option<&[(usize, usize)]>,
+    partial_ok: bool,
 ) -> Option<IndexKeySet> {
-    if idx.kind != IndexKind::Btree || idx.predicate.is_some() {
+    if idx.kind != IndexKind::Btree || (idx.predicate.is_some() && !partial_ok) {
         return None;
     }
     let cols = idx.column_ordinals()?;
@@ -2413,15 +2694,13 @@ fn build_index_interval_set_plan_conjuncts(
     if !has_set {
         return None;
     }
-    // A key column whose slot an admitted entry can step over without knowing its value: a
-    // fixed-width or self-delimiting C-collated slot (key_slot_skippable).
-    let skippable = |c: usize| {
+    // A key column's self-delimiting slot form (indexes.md §5.1): every scalar key type, collated
+    // text included, can be stepped over without knowing its value.
+    let slot_of = |c: usize| {
         let col = &rel.table.columns[c];
-        col.ty
-            .as_scalar()
-            .is_some_and(|s| crate::encoding::key_slot_skippable(s))
-            && col.collation.is_none()
+        KeySlot::for_scalar(col.ty.as_scalar()?, col.collation.is_some())
     };
+    let skippable = |c: usize| slot_of(c).is_some();
     // A leading range, or a leading membership subquery (which widens to the whole index if it is
     // read before its fold), leaves the leading slot to be stepped over.
     let lead = &tuple[0];
@@ -2436,20 +2715,21 @@ fn build_index_interval_set_plan_conjuncts(
     let t = (1..tuple.len())
         .find(|&i| tuple[i].specs.is_some() || !tuple[i].point)
         .unwrap_or(tuple.len());
-    let mut col_types = Vec::with_capacity(cols.len());
+    let mut slots = Vec::with_capacity(cols.len());
     let mut all_fixed = true;
     for (i, &c) in cols.iter().enumerate() {
-        if i >= t && !skippable(c) {
+        let slot = slot_of(c);
+        if i >= t && slot.is_none() {
             return None;
         }
         let s = rel.table.columns[c].ty.as_scalar();
         all_fixed = all_fixed && s.is_some_and(|s| s.is_fixed_width());
-        col_types.push(rel.table.columns[c].ty.scalar());
+        slots.push(slot.unwrap_or(KeySlot::Fixed(0)));
     }
     Some(IndexKeySet {
         name_key: idx.name.to_string(),
         tuple,
-        col_types,
+        slots,
         all_fixed,
     })
 }
@@ -2480,7 +2760,7 @@ impl Engine {
                 db: db.map(str::to_owned),
                 layer: None,
             };
-            let candidates = inventory_scan_candidates(Some(f), &rel, self);
+            let candidates = inventory_single_relation_candidates(Some(f), &rel, self);
             let estimates = estimate_scan_candidates(&candidates, &rel, self, false);
             select_costed_scan_candidate(candidates, &estimates)
         });
@@ -3041,6 +3321,48 @@ pub(crate) fn detect_inl_bound(
         .and_then(|candidate| candidate.bound)
 }
 
+/// Whether the WHERE `filter` implies a partial index's resolved predicate (indexes.md §9.1). An
+/// index whose predicate does not resolve (an unparsable one) is never implied.
+pub(crate) fn partial_index_implied(
+    filter: &RExpr,
+    table: &Table,
+    offset: usize,
+    idx: &IndexDef,
+    catalog: &Engine,
+) -> bool {
+    match catalog.resolve_index(table, idx) {
+        Ok(rindex) => rindex
+            .predicate
+            .as_ref()
+            .is_some_and(|pred| filter_implies_predicate(filter, pred, offset)),
+        Err(_) => false,
+    }
+}
+
+/// Whether a PARTIAL index may serve as an index-nested-loop inner (indexes.md §9.3): the join's own
+/// `on` must imply its predicate, or `on` together with the `where` must imply a NULL-rejecting
+/// predicate. A WHERE conjunct holds only for the final rows, and a later outer join may NULL-extend
+/// this relation; a NULL-rejecting predicate makes every such row fail the implied WHERE anyway.
+fn inl_partial_admissible(
+    on: Option<&RExpr>,
+    where_filter: Option<&RExpr>,
+    rel: &ScopeRel,
+    idx: &IndexDef,
+    catalog: &Engine,
+) -> bool {
+    let Ok(rindex) = catalog.resolve_index(rel.table, idx) else {
+        return false;
+    };
+    let Some(pred) = &rindex.predicate else {
+        return false;
+    };
+    if on.is_some_and(|f| filter_implies_predicate(f, pred, rel.offset)) {
+        return true;
+    }
+    let filters: Vec<&RExpr> = on.into_iter().chain(where_filter).collect();
+    predicate_rejects_null(pred) && filters_imply_predicate(&filters, pred, rel.offset)
+}
+
 pub(crate) fn inventory_inl_candidates<'a>(
     on: Option<&'a RExpr>,
     where_filter: Option<&'a RExpr>,
@@ -3098,10 +3420,10 @@ pub(crate) fn inventory_inl_candidates<'a>(
         if idx.kind != IndexKind::Btree {
             continue;
         }
-        // A PARTIAL index holds only its qualifying rows (indexes.md §9), and this bound never checks
-        // that the query implies the predicate, so a partial index is not an INL inner (as for
-        // ORDER-BY skip-sort and interval sets). That also keeps out one whose predicate did not parse.
-        if idx.predicate.is_some() {
+        // A PARTIAL index holds only its qualifying rows (indexes.md §9), so it is an INL inner only
+        // when the join's conditions imply its predicate (§9.3). One whose predicate did not parse
+        // never resolves, so it stays out.
+        if idx.predicate.is_some() && !inl_partial_admissible(on, where_filter, rel, idx, catalog) {
             continue;
         }
         // The index-nested-loop sibling bound is column-only this slice (an expression index takes
@@ -3113,14 +3435,17 @@ pub(crate) fn inventory_inl_candidates<'a>(
         let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
             continue;
         };
-        if cols[1..].iter().any(|&c| {
-            rel.table.columns[c]
-                .ty
-                .as_scalar()
-                .is_none_or(|s| !s.is_fixed_width())
-        }) {
+        // Every trailing column is skipped by its self-delimiting slot (indexes.md §5.1).
+        let Some(suffix) = cols[1..]
+            .iter()
+            .map(|&c| {
+                let col = &rel.table.columns[c];
+                KeySlot::for_scalar(col.ty.as_scalar()?, col.collation.is_some())
+            })
+            .collect::<Option<Vec<KeySlot>>>()
+        else {
             continue;
-        }
+        };
         let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[ci]) else {
             continue;
         };
@@ -3133,8 +3458,8 @@ pub(crate) fn inventory_inl_candidates<'a>(
         if eqs.iter().any(|s| matches!(s, BoundSrc::Sibling(_))) {
             // This slice keeps the index-nested-loop bound single-column-equality (a leading key
             // column bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md
-            // §3 "index-nested-loop"). `suffix_types` are the trailing columns (columns[1..],
-            // fixed-width by the check above), width-skipped past the single equality slot.
+            // §3 "index-nested-loop"). `suffix` holds the trailing columns' slots (columns[1..]),
+            // skipped past the single equality slot.
             let name_key = idx.name.to_string();
             candidates.push(index_order_candidate(
                 ScanCandidateKind::Btree,
@@ -3147,10 +3472,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
                         srcs: eqs,
                     }],
                     range: None,
-                    suffix_types: cols[1..]
-                        .iter()
-                        .map(|&c| rel.table.columns[c].ty.scalar())
-                        .collect(),
+                    suffix,
                 }),
                 where_filter,
             ));
@@ -3193,9 +3515,14 @@ pub(crate) fn inventory_inl_candidates<'a>(
         ));
     }
     for idx in &rel.table.indexes {
-        if let Some(bound) =
-            build_index_interval_set_plan_conjuncts(&conjuncts, rel, idx, catalog, sibling_range)
-            && key_set_uses_sibling(&[], &[], &bound.tuple)
+        if let Some(bound) = build_index_interval_set_plan_conjuncts(
+            &conjuncts,
+            rel,
+            idx,
+            catalog,
+            sibling_range,
+            idx.predicate.is_none() || inl_partial_admissible(on, where_filter, rel, idx, catalog),
+        ) && key_set_uses_sibling(&[], &[], &bound.tuple)
         {
             let name = bound.name_key.clone();
             candidates.push(index_order_candidate(
@@ -3460,6 +3787,7 @@ pub(crate) fn order_satisfied_by_indexes(
     table: &Table,
     offset: usize,
     order: &[crate::spill::SortKey],
+    filter: Option<&RExpr>,
     catalog: &Engine,
 ) -> Vec<IndexOrder> {
     let Some(pk_width) = pk_storage_width(table) else {
@@ -3470,12 +3798,15 @@ pub(crate) fn order_satisfied_by_indexes(
         if idx.kind != IndexKind::Btree {
             continue; // only an ordered B-tree realizes the column order (GIN/GiST do not)
         }
-        // A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds
-        // only its qualifying rows, so walking it would drop rows unless the query implies the
-        // predicate — the predicate-implication gate lives only on the access-predicate bound. Stays
-        // non-partial (a follow-on); falling through leaves a correct full-scan + sort.
+        // A PARTIAL index holds only its qualifying rows (indexes.md §9), so walking it for order
+        // is sound only when the WHERE implies its predicate (§9.1). The caller is a single-relation
+        // scan, so no row is NULL-extended.
         if idx.predicate.is_some() {
-            continue;
+            let implied =
+                filter.is_some_and(|f| partial_index_implied(f, table, offset, idx, catalog));
+            if !implied {
+                continue;
+            }
         }
         // ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression
         // index key is a follow-on — indexes.md §5).
@@ -3517,9 +3848,10 @@ pub(crate) fn order_satisfied_by_index(
     table: &Table,
     offset: usize,
     order: &[crate::spill::SortKey],
+    filter: Option<&RExpr>,
     catalog: &Engine,
 ) -> Option<IndexOrder> {
-    order_satisfied_by_indexes(table, offset, order, catalog)
+    order_satisfied_by_indexes(table, offset, order, filter, catalog)
         .into_iter()
         .next()
 }
@@ -5104,32 +5436,6 @@ impl KeyMatch<'_> {
     }
 }
 
-/// Does the WHERE `filter` imply a PARTIAL index's predicate (spec/design/indexes.md §9)? jed's
-/// syntactic test (PG's, not a prover): the filter's top-level AND-chain must contain a conjunct
-/// STRUCTURALLY EQUAL to the resolved predicate. `pred` is in table-local column coords; a `filter`
-/// conjunct is global, so it is matched shifted by `offset` (the relation's global column base).
-/// Sound-if-conservative: a miss means the index is not used (a correct full scan + residual filter).
-pub(crate) fn filter_implies_predicate(filter: &RExpr, pred: &RExpr, offset: usize) -> bool {
-    // The filter contains a top-level conjunct structurally equal to `target`.
-    fn contains_conjunct(filter: &RExpr, target: &RExpr, offset: usize) -> bool {
-        match filter {
-            RExpr::And(l, r) => {
-                contains_conjunct(l, target, offset) || contains_conjunct(r, target, offset)
-            }
-            conjunct => rexpr_eq_shifted(conjunct, target, offset),
-        }
-    }
-    // Every top-level conjunct of `pred` must be present as a conjunct of `filter` (so a conjunctive
-    // predicate `a AND b` is implied by a WHERE that lists both `a` and `b`, not only the whole `a AND b`).
-    match pred {
-        RExpr::And(l, r) => {
-            filter_implies_predicate(filter, l, offset)
-                && filter_implies_predicate(filter, r, offset)
-        }
-        single => contains_conjunct(filter, single, offset),
-    }
-}
-
 /// A SOUND-if-incomplete structural equality for index-expression matching (spec/design/indexes.md
 /// §5): does the WHERE conjunct operand `a` (GLOBAL column indices) equal the resolved index key
 /// expression `b` (table-local `Column(i)`, matched as `Column(i + offset)`)? Covers the common
@@ -5827,7 +6133,7 @@ impl IndexKeySet {
                         hi_inc: false,
                     },
                     prefix_len: p.len(),
-                    suffix: self.col_types[consumed..].to_vec(),
+                    suffix: self.slots[consumed..].to_vec(),
                 });
                 continue;
             }
@@ -5843,7 +6149,7 @@ impl IndexKeySet {
                     out.push(IndexProbe {
                         bound: b,
                         prefix_len: p.len(),
-                        suffix: self.col_types[consumed - 1..].to_vec(),
+                        suffix: self.slots[consumed - 1..].to_vec(),
                     });
                 }
             }
@@ -5858,7 +6164,7 @@ impl IndexKeySet {
             .map(|bound| IndexProbe {
                 bound,
                 prefix_len: 0,
-                suffix: self.col_types.clone(),
+                suffix: self.slots.clone(),
             })
             .collect()
     }
@@ -6119,9 +6425,15 @@ pub(crate) fn build_index_bound(
         hi_inc: false,
     };
     for t in &rng.terms {
-        // The range column is fixed-width (indexes.md §5.1 eligibility), so it is never collated: the
-        // probe encodes with a `None` collation.
-        let key = match encode_bound_key(rng.col_type, &t.src, params, outer, None, left) {
+        // A collated range column's probe is the collation's sort key (the stored key form).
+        let key = match encode_bound_key(
+            rng.col_type,
+            &t.src,
+            params,
+            outer,
+            rng.coll.as_deref(),
+            left,
+        ) {
             BoundKey::Null => return None,
             BoundKey::OutOfRange => continue, // drop this half-bound (a wider, still-sound scan)
             BoundKey::Key(k) => k,

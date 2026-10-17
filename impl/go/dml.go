@@ -706,7 +706,12 @@ type conflictPlan struct {
 // column list is matched as an order-independent SET against a unique index / the primary key (no
 // match → 42P10); ON CONSTRAINT name names a unique index or the synthesized <table>_pkey (miss →
 // 42704). A nil target → nil arbiter (legal only with DO NOTHING).
-func resolveArbiter(table *catTable, target *conflictTarget) (*arbiter, error) {
+//
+// indexPredicate is the resolved `WHERE index_predicate` of a column target (table-local columns):
+// with it, a PARTIAL unique index whose predicate it implies (indexes.md §9.1) is also inferable,
+// after the PK and every non-partial unique index (each in name byte order). Without it no partial
+// index is inferred, as in PostgreSQL.
+func (db *engine) resolveArbiter(table *catTable, target *conflictTarget, indexPredicate *rExpr) (*arbiter, error) {
 	if target == nil {
 		return nil, nil
 	}
@@ -726,12 +731,21 @@ func resolveArbiter(table *catTable, target *conflictTarget) (*arbiter, error) {
 		for i, def := range table.Indexes {
 			// A conflict-target COLUMN list matches only a plain-column unique index (an expression
 			// unique index is arbitrated by ON CONSTRAINT <name> — upsert.md §3). A PARTIAL unique
-			// index is NOT matched by a bare column list (PostgreSQL requires the predicate to be
-			// restated — a deferred upsert follow-on, indexes.md §9): so a column target that only a
-			// partial index covers reports "no matching arbiter", agreeing with PG.
+			// index is matched only through an implying WHERE index_predicate (below), as in
+			// PostgreSQL.
 			if def.Unique && def.Predicate == nil {
 				if cols := def.columnOrdinals(); cols != nil && sameIntSet(cols, want) {
 					return &arbiter{indexPos: i}, nil
+				}
+			}
+		}
+		if indexPredicate != nil {
+			for i, def := range table.Indexes {
+				if def.Unique && def.Predicate != nil {
+					if cols := def.columnOrdinals(); cols != nil && sameIntSet(cols, want) &&
+						db.partialIndexImplied(indexPredicate, table, 0, def) {
+						return &arbiter{indexPos: i}, nil
+					}
 				}
 			}
 		}
@@ -792,6 +806,33 @@ func arbiterKey(arb *arbiter, colTypes []colType, pk []int, colls []*Collation, 
 // exposes the view's columns, on the existing row and on `excluded`; the SET columns were already
 // retargeted at the base table.
 func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *string, vw *viewWrite, ptypes *paramTypes) (*conflictPlan, error) {
+	// `ON CONFLICT (cols) WHERE index_predicate` (upsert.md §2): the target's columns are checked
+	// first (42703), then the predicate resolves against the table like a partial-index predicate
+	// (subquery 0A000, $N 42P02, aggregate 42803, window 42P20; no type or mutability check —
+	// PostgreSQL's), and only then is the arbiter inferred (42P10).
+	var indexPredicate *rExpr
+	if oc.IndexPredicate != nil {
+		if vw != nil {
+			return nil, newError(FeatureNotSupported, "ON CONFLICT ... WHERE through a view is not supported")
+		}
+		if oc.Target != nil && !oc.Target.IsConstraint {
+			for _, c := range oc.Target.Columns {
+				if table.ColumnIndex(c) < 0 {
+					return nil, newError(UndefinedColumn, "column does not exist: "+c)
+				}
+			}
+		}
+		if err := rejectIndexPredicateStructure(*oc.IndexPredicate); err != nil {
+			return nil, err
+		}
+		s := indexScope(db, table)
+		pt := &paramTypes{indexContext: true}
+		node, _, err := resolve(s, *oc.IndexPredicate, nil, &aggCtx{collecting: false}, pt)
+		if err != nil {
+			return nil, err
+		}
+		indexPredicate = node
+	}
 	target := oc.Target
 	if vw != nil {
 		var err error
@@ -799,7 +840,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 			return nil, err
 		}
 	}
-	arb, err := resolveArbiter(table, target)
+	arb, err := db.resolveArbiter(table, target, indexPredicate)
 	if err != nil {
 		return nil, err
 	}

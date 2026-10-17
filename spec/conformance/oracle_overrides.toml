@@ -1856,3 +1856,10 @@ reason = "jed: Julian day -5 is 4714-11-19 BC, inside jed's int64-microsecond ti
 file = "expr/to_timestamp.test"
 sql = "SELECT to_timestamp('294276-12-31', 'YYYY-MM-DD')"
 reason = "jed: year 294276 is past the end of jed's finite int64-microsecond timestamp range (about 294247 AD, timestamp.md §1), so 22008 timestamp out of range. PostgreSQL's 2000-epoch range reaches 294276-12-31 and returns it."
+
+# --- ON CONFLICT (cols) WHERE index_predicate through an updatable view: PostgreSQL rewrites the
+# inference predicate onto the base table; jed refuses it (upsert.md §9, a narrowing).
+[[override]]
+file = "dml/insert_on_conflict_partial.test"
+sql = "INSERT INTO puv VALUES (20, 'active', 7) ON CONFLICT (amt) WHERE status = 'active' DO NOTHING"
+reason = "jed does not map an ON CONFLICT inference WHERE through an updatable view onto the base table (0A000, upsert.md §9/§10); PostgreSQL rewrites it and infers the base table's partial unique index. A documented narrowing; the base-table form is fully supported."

@@ -9,7 +9,7 @@
 // itself runs width-specialized in the number domain where exact (≤ 32-bit halves), since
 // per-byte bigint arithmetic allocates and these codecs sit on the hot path.
 
-import { isFixedWidth, type ScalarType, widthBytes } from "./types.ts";
+import { type ScalarType, widthBytes } from "./types.ts";
 
 // encodeInt encodes a non-null integer value of the given type to its order-preserving
 // key bytes — value + 2^(bits-1), emitted as `width` unsigned big-endian bytes. value is
@@ -106,50 +106,4 @@ export function encodeNullable(t: ScalarType, value: bigint | null): Uint8Array 
   out[0] = 0x00;
   out.set(v, 1);
   return out;
-}
-
-// keySlotSkippable reports whether a C-collated key slot of type t can be stepped over in an index
-// entry without knowing its value (cost.md §3 "Multi-column secondary indexes"): a fixed-width type
-// by its width, and the self-delimiting variable-width text, bytea, decimal, and interval bodies by
-// decoding their delimiters (encoding.md §2.4–§2.6, §2.10). A collated text key (the UCA sort key,
-// §2.12) is not stepped over.
-export function keySlotSkippable(t: ScalarType): boolean {
-  return t === "text" || t === "bytea" || t === "decimal" || t === "interval" || isFixedWidth(t);
-}
-
-// keySlotEnd returns the offset just past the nullable key slot of type t starting at at (the §2.2
-// presence tag, then the body): a lone 0x01 NULL tag, or 0x00 followed by the body, stepped over by
-// its width or, for a variable-width body, by decoding its delimiter. A truncated slot returns an
-// offset past key.length, which names no row.
-export function keySlotEnd(key: Uint8Array, at: number, t: ScalarType): number {
-  const short = key.length + 1;
-  if (at >= key.length) return short;
-  if (key[at] === 0x01) return at + 1;
-  at++;
-  switch (t) {
-    case "text":
-    case "bytea":
-      // text-terminated-escape: 0x00 0xFF is an escaped content NUL, 0x00 0x01 the terminator.
-      for (let i = at; i + 1 < key.length; i++) {
-        if (key[i] === 0x00) {
-          if (key[i + 1] === 0x01) return i + 2;
-          i++;
-        }
-      }
-      return short;
-    case "decimal": {
-      // decimal-order-preserving: the class byte; zero is that byte alone, otherwise a 4-byte
-      // exponent and mantissa pairs ending at the terminator (0x00, or 0xFF complemented for a
-      // negative value).
-      if (at >= key.length) return short;
-      const cls = key[at]!;
-      if (cls === 0x04) return at + 1;
-      const term = cls === 0x03 ? 0xff : 0x00;
-      for (let i = at + 5; i < key.length; i++) if (key[i] === term) return i + 1;
-      return short;
-    }
-    case "interval":
-      return at + 16;
-  }
-  return at + widthBytes(t);
 }

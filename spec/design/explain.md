@@ -123,7 +123,8 @@ precedence: a SELECT containing `nextval`/`setval`, or a top-level WITH containi
 
 Attributes are separated by `; `. A node with no attributes is `-`.
 
-- Scans render `Full scan`, `PK bound: ...`, `Index bound: using <index>`, `GIN bound: ...`,
+- Scans render `Full scan`, `PK bound: ...`, `Index bound: using <index>`, `Index scan: using
+  <index>` (a full partial-index scan with no access predicate, [indexes.md](indexes.md) §9.2), `GIN bound: ...`,
   `GiST bound: ...`, or an interval-set form: `PK interval set: <key>; intervals=N` or
   `Index interval set: using <index>; intervals=N`, where `N` counts the set's structural disjuncts
   and a following `arrays=K` (only when `K > 0`) counts those that are `key = ANY(array)` arrays or

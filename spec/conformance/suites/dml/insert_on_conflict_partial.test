@@ -1,0 +1,164 @@
+# INSERT ... ON CONFLICT (cols) WHERE index_predicate — partial unique-index arbiter inference
+# (spec/design/upsert.md §2, PostgreSQL semantics). A PARTIAL unique index is inferred as the arbiter
+# only when the target restates a WHERE that implies its predicate (the indexes.md §9.1 prover); a
+# non-partial unique index / the PK is inferred whether or not a WHERE is given. The WHERE resolves
+# against the target table like a partial-index predicate. A proposed row whose predicate is not
+# TRUE never conflicts on a partial arbiter (it would not enter that index), so it is inserted.
+# Rows and error codes are probed against PostgreSQL. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.index_partial, ddl.view, dml.view_write, dml.view_on_conflict, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.upsert_partial_arbiter, dml.returning, query.select, query.order_by, types.i32, types.text, expr.arithmetic
+
+statement ok
+CREATE TABLE pu (id i32 PRIMARY KEY, status text, amt i32)
+
+statement ok
+CREATE UNIQUE INDEX pu_act ON pu (amt) WHERE status = 'active'
+
+statement ok
+INSERT INTO pu VALUES (1, 'active', 10), (2, 'inactive', 20)
+
+# no WHERE: a partial unique index is never inferred
+statement error 42P10
+INSERT INTO pu VALUES (3, 'active', 10) ON CONFLICT (amt) DO NOTHING
+
+# the restated predicate infers it
+statement ok
+INSERT INTO pu VALUES (3, 'active', 10) ON CONFLICT (amt) WHERE status = 'active' DO NOTHING
+
+# an implying conjunction infers it too
+query ITI rowsort
+INSERT INTO pu VALUES (4, 'active', 10) ON CONFLICT (amt) WHERE status = 'active' AND amt > 0 DO UPDATE SET amt = pu.amt + 1 RETURNING *
+----
+1
+active
+11
+
+# a WHERE that does not imply the predicate infers nothing
+statement error 42P10
+INSERT INTO pu VALUES (5, 'active', 30) ON CONFLICT (amt) WHERE status = 'inactive' DO NOTHING
+
+statement error 42P10
+INSERT INTO pu VALUES (5, 'active', 30) ON CONFLICT (amt) WHERE status = 'active' OR amt > 0 DO NOTHING
+
+# a non-boolean WHERE is not an error; it simply implies nothing
+statement error 42P10
+INSERT INTO pu VALUES (5, 'active', 30) ON CONFLICT (amt) WHERE amt DO NOTHING
+
+# a proposed row outside the predicate never conflicts on the partial arbiter: it is inserted
+query ITI rowsort
+INSERT INTO pu VALUES (5, 'inactive', 11) ON CONFLICT (amt) WHERE status = 'active' DO UPDATE SET amt = 99 RETURNING *
+----
+5
+inactive
+11
+
+# a proposed qualifying row conflicts with the qualifying row only
+query ITI rowsort
+INSERT INTO pu VALUES (6, 'active', 11) ON CONFLICT (amt) WHERE status = 'active' DO UPDATE SET status = 'hit' RETURNING *
+----
+1
+hit
+11
+
+# two proposed rows with one arbiter key: the second is skipped under DO NOTHING
+statement ok
+INSERT INTO pu VALUES (7, 'active', 40), (8, 'active', 40) ON CONFLICT (amt) WHERE status = 'active' DO NOTHING
+
+# … and is 21000 under DO UPDATE
+statement error 21000
+INSERT INTO pu VALUES (9, 'active', 50), (10, 'active', 50) ON CONFLICT (amt) WHERE status = 'active' DO UPDATE SET amt = 0
+
+# a non-qualifying pair never shares an arbiter key
+statement ok
+INSERT INTO pu VALUES (9, 'x', 50), (10, 'x', 50) ON CONFLICT (amt) WHERE status = 'active' DO UPDATE SET amt = 0
+
+# a WHERE on a PK / non-partial target is accepted and still infers it
+query ITI rowsort
+INSERT INTO pu VALUES (2, 'zzz', 0) ON CONFLICT (id) WHERE amt > 0 DO UPDATE SET status = excluded.status RETURNING *
+----
+2
+zzz
+20
+
+query ITI rowsort
+SELECT * FROM pu
+----
+1
+hit
+11
+10
+x
+50
+2
+zzz
+20
+5
+inactive
+11
+7
+active
+40
+9
+x
+50
+
+# a comparison-implied predicate: the index predicate is `n > 0`
+statement ok
+CREATE TABLE pn (id i32 PRIMARY KEY, n i32)
+
+statement ok
+CREATE UNIQUE INDEX pn_pos ON pn (n) WHERE n > 0
+
+statement ok
+INSERT INTO pn VALUES (1, 5), (2, -5)
+
+query II rowsort
+INSERT INTO pn VALUES (3, 5) ON CONFLICT (n) WHERE n > 3 DO UPDATE SET n = pn.n + 100 RETURNING *
+----
+1
+105
+
+statement error 42P10
+INSERT INTO pn VALUES (3, 5) ON CONFLICT (n) WHERE n > -1 DO NOTHING
+
+# the predicate column need not be a target column; qualified references resolve to the table
+statement ok
+CREATE TABLE pq (id i32 PRIMARY KEY, k i32, live i32)
+
+statement ok
+CREATE UNIQUE INDEX pq_k_live ON pq (k) WHERE live = 1
+
+statement ok
+INSERT INTO pq VALUES (1, 7, 1)
+
+query III rowsort
+INSERT INTO pq VALUES (2, 7, 1) ON CONFLICT (k) WHERE pq.live = 1 DO UPDATE SET live = 2 RETURNING *
+----
+1
+7
+2
+
+# --- resolution errors (the target's columns first, then the predicate) ----------------------------
+
+statement error 42703
+INSERT INTO pq VALUES (3, 8, 1) ON CONFLICT (nosuch) WHERE live = 1 DO NOTHING
+
+statement error 42703
+INSERT INTO pq VALUES (3, 8, 1) ON CONFLICT (k) WHERE nosuch = 1 DO NOTHING
+
+statement error 0A000
+INSERT INTO pq VALUES (3, 8, 1) ON CONFLICT (k) WHERE (SELECT true) DO NOTHING
+
+statement error 42P01
+INSERT INTO pq VALUES (3, 8, 1) ON CONFLICT (k) WHERE excluded.live = 1 DO NOTHING
+
+statement error 42803
+INSERT INTO pq VALUES (3, 8, 1) ON CONFLICT (k) WHERE count(*) > 0 DO NOTHING
+
+# --- a jed narrowing: the WHERE through an updatable view (PostgreSQL rewrites it onto the base
+# table; jed refuses it — upsert.md §9). Kept last: it succeeds on PostgreSQL.
+
+statement ok
+CREATE VIEW puv AS SELECT id, status, amt FROM pu
+
+statement error 0A000
+INSERT INTO puv VALUES (20, 'active', 7) ON CONFLICT (amt) WHERE status = 'active' DO NOTHING

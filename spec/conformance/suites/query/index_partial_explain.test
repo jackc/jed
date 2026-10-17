@@ -1,0 +1,84 @@
+# EXPLAIN of the partial-index access paths (spec/design/explain.md §5, indexes.md §9.2/§9.3): a
+# full partial-index scan renders `Index scan: using <index>`; a bound over a partial index whose
+# predicate the WHERE implies (but does not restate) renders the ordinary `Index bound`. The
+# estimates apply the predicate's structural selectivity to the partial index's scan rows
+# (estimator.md §7). jed-only output. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, dml.insert, dml.insert_select, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, query.limit, query.set_returning, query.explain, dml.explain, query.order_by_index_scan, query.index_partial, query.index_partial_implication, query.index_partial_full_scan, types.i32, types.text, null.three_valued
+
+statement ok
+CREATE TABLE ex (id i32 PRIMARY KEY, k i32, gone i32)
+
+statement ok
+INSERT INTO ex SELECT g, g % 50, CASE WHEN g % 20 = 0 THEN NULL ELSE 1 END FROM generate_series(1, 200) AS g
+
+statement ok
+CREATE INDEX ex_live ON ex (k) WHERE gone IS NULL
+
+query ITTII nosort
+EXPLAIN SELECT id FROM ex WHERE gone IS NULL
+----
+0
+Filter
+conjuncts=1
+1
+5
+1
+Scan ex
+Index scan: using ex_live; touched=2
+1
+3
+
+query ITTII nosort
+EXPLAIN SELECT id FROM ex WHERE gone IS NULL ORDER BY k LIMIT 2
+----
+0
+Limit
+limit=2
+1
+5
+1
+Filter
+conjuncts=1
+1
+4
+2
+Scan ex
+Index scan: using ex_live; touched=3; ordered: index order: ex_live
+1
+3
+
+query ITTII nosort
+EXPLAIN DELETE FROM ex WHERE gone IS NULL
+----
+0
+Delete ex
+-
+1
+4
+1
+Filter
+conjuncts=1
+1
+4
+2
+Scan ex
+Index scan: using ex_live; touched=1
+1
+3
+
+statement ok
+CREATE INDEX ex_pos ON ex (k) WHERE k > 10
+
+query ITTII nosort
+EXPLAIN SELECT id FROM ex WHERE k > 40
+----
+0
+Filter
+conjuncts=1
+67
+269
+1
+Scan ex
+Index bound: using ex_pos; touched=2
+67
+135

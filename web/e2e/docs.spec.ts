@@ -615,6 +615,17 @@ test('the indexes page runs the partial-index lookup live', async ({ page }) => 
   await expect(panel.getByTestId('result-rows')).not.toContainText('2');
 });
 
+test('the indexes page runs the full partial-index walk live', async ({ page }) => {
+  await page.goto('/docs/sql/indexes/');
+  // The soft-delete task_live index walked in priority order: the two live tasks with the lowest
+  // priority are plan (1) and ship (2); review (3) is past the LIMIT and triage is deleted.
+  const panel = livePanel(page, 'softQuery');
+  await expect(panel.getByTestId('result-rows')).toContainText('plan');
+  await expect(panel.getByTestId('result-rows')).toContainText('ship');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('review');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('triage');
+});
+
 test('the indexes page runs the GIN @> contains scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
   // The GIN containment scan: tags @> ARRAY[10,20] → intro and gin (both hold

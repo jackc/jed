@@ -276,8 +276,6 @@ import {
   encodeInt,
   encodeTerminated,
   GIN_MAX_TERM_BYTES,
-  keySlotEnd,
-  keySlotSkippable,
 } from "./encoding.ts";
 import {
   checkViolation,
@@ -353,6 +351,11 @@ import {
   readLeafColumn,
   ScratchRow,
 } from "./span_filter.ts";
+import {
+  filterImpliesPredicate,
+  filtersImplyPredicate,
+  predicateRejectsNull,
+} from "./implication.ts";
 import { type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
 import {
   RowSpool,
@@ -5806,7 +5809,7 @@ export class Engine {
       offset: 0,
       ...(db !== undefined ? { db } : {}),
     };
-    const candidates = inventoryScanCandidates(filter, rel, this.readSnap(), this);
+    const candidates = inventorySingleRelationCandidates(filter, rel, this.readSnap(), this);
     const estimates = estimateScanCandidates(candidates, rel, this, false);
     return { bound: selectCostedScanCandidate(candidates, estimates), db, contradiction };
   }
@@ -6129,6 +6132,10 @@ export class Engine {
       case "pk":
         return prefix + "PK bound: " + renderPkBound(b.pk);
       case "index":
+        // A full partial-index scan has no access predicate (indexes.md §9.2).
+        if (b.index.eqCols.length === 0 && b.index.range === null) {
+          return prefix + "Index scan: using " + b.index.nameKey;
+        }
         return prefix + "Index bound: using " + b.index.nameKey;
       case "gin":
         return prefix + "GIN bound: using " + b.gin.nameKey;
@@ -9542,12 +9549,14 @@ export class Engine {
       const r = store.scanWithUnits(mask);
       return { entries: r.entries, pages: r.pages, slabs: r.slabs, empty: false };
     }
-    const suffix: ScalarType[] = [];
+    const suffix: KeySlot[] = [];
     if (path.index !== null) {
       const ix = child.indexes.find((i) => i.name === path.index);
       if (ix !== undefined) {
         for (const key of ix.keys.slice(path.cols.length)) {
-          if (key.kind === "column") suffix.push(typeAsScalar(child.columns[key.column]!.type)!);
+          if (key.kind !== "column") continue;
+          const col = child.columns[key.column]!;
+          suffix.push(keySlotForScalar(typeAsScalar(col.type)!, col.collation !== null)!);
         }
       }
     }
@@ -10393,7 +10402,7 @@ export class Engine {
     return this.indexScanBoundEntries(
       tableName,
       ib.nameKey,
-      ib.suffixTypes,
+      ib.suffix,
       built.bound,
       built.prefixLen,
       mask,
@@ -10410,12 +10419,12 @@ export class Engine {
   indexScanBound(
     tableName: string,
     nameKey: string,
-    suffixTypes: ScalarType[],
+    suffix: KeySlot[],
     b: KeyBound,
     prefixByteLen: number,
     mask: boolean[],
   ): { rows: Row[]; pages: number; slabs: number } {
-    const r = this.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, prefixByteLen, mask);
+    const r = this.indexScanBoundEntries(tableName, nameKey, suffix, b, prefixByteLen, mask);
     return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
   }
 
@@ -10423,7 +10432,7 @@ export class Engine {
   indexScanBoundEntries(
     tableName: string,
     nameKey: string,
-    suffixTypes: ScalarType[],
+    suffix: KeySlot[],
     b: KeyBound,
     prefixByteLen: number,
     mask: boolean[],
@@ -10431,7 +10440,7 @@ export class Engine {
     return indexStoreBoundEntries(
       this.lkpIndexStore(nameKey),
       this.lkpStore(tableName),
-      suffixTypes,
+      suffix,
       b,
       prefixByteLen,
       mask,
@@ -10441,23 +10450,23 @@ export class Engine {
   // indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
   // equality prefix scan [0x00‖value, byte-successor) over the index B-tree plus, per admitted entry,
   // the row's point lookup. Used by the OR / IN-list secondary-index point-set (indexKeySetRows), where
-  // each distinct list value is one such point probe. suffixTypes are the trailing key components
-  // (columns[1..], fixed-width), width-skipped past the single leading slot.
+  // each distinct list value is one such point probe. suffix holds the trailing key components' slots
+  // (columns[1..]), skipped past the single leading slot.
   indexPointRows(
     tableName: string,
     nameKey: string,
-    suffixTypes: ScalarType[],
+    suffix: KeySlot[],
     valueKey: Uint8Array,
     mask: boolean[],
   ): { rows: Row[]; pages: number; slabs: number } {
-    const r = this.indexPointEntries(tableName, nameKey, suffixTypes, valueKey, mask);
+    const r = this.indexPointEntries(tableName, nameKey, suffix, valueKey, mask);
     return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
   }
 
   indexPointEntries(
     tableName: string,
     nameKey: string,
-    suffixTypes: ScalarType[],
+    suffix: KeySlot[],
     valueKey: Uint8Array,
     mask: boolean[],
   ): { entries: Entry[]; pages: number; slabs: number } {
@@ -10466,7 +10475,7 @@ export class Engine {
     const prefix = new Uint8Array(1 + valueKey.length);
     prefix.set(valueKey, 1);
     const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
-    return this.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, prefix.length, mask);
+    return this.indexScanBoundEntries(tableName, nameKey, suffix, b, prefix.length, mask);
   }
 
   // Execute canonical logical intervals over the row's own B-tree. Storage keys are retained for
@@ -12083,7 +12092,39 @@ export class Engine {
     vw: ViewWrite | null,
     ptypes: ParamTypes,
   ): ConflictPlan {
-    const arb = resolveArbiter(table, vw === null ? oc.target : viewConflictTarget(vw, table, oc.target));
+    // `ON CONFLICT (cols) WHERE index_predicate` (upsert.md §2): the target's columns are checked
+    // first (42703), then the predicate resolves against the table like a partial-index predicate
+    // (subquery 0A000, `$N` 42P02, aggregate 42803, window 42P20; no type or mutability check —
+    // PostgreSQL's), and only then is the arbiter inferred (42P10).
+    let indexPredicate: RExpr | null = null;
+    if (oc.indexPredicate !== null) {
+      if (vw !== null) {
+        throw engineError(
+          "feature_not_supported",
+          "ON CONFLICT ... WHERE through a view is not supported",
+        );
+      }
+      if (oc.target !== null && oc.target.kind === "columns") {
+        for (const c of oc.target.columns) {
+          if (columnIndex(table, c) < 0)
+            throw engineError("undefined_column", "column does not exist: " + c);
+        }
+      }
+      rejectIndexPredicateStructure(oc.indexPredicate);
+      const predPt = new ParamTypes();
+      predPt.indexContext = true;
+      indexPredicate = resolve(
+        Scope.index(this, table),
+        oc.indexPredicate,
+        null,
+        { collecting: false, groupKeys: [], specs: [] },
+        predPt,
+      ).node;
+    }
+    const arb =
+      vw === null
+        ? resolveArbiter(table, oc.target, indexPredicate, this)
+        : resolveArbiter(table, viewConflictTarget(vw, table, oc.target), null, this);
     if (!oc.doUpdate) {
       return { arb, doUpdate: false, assignments: [], filter: null };
     }
@@ -19589,20 +19630,11 @@ export class Engine {
       else store.scanRange(bound, visit);
       return more;
     };
-    const rowKeyFromIndex = (
-      entryKey: Uint8Array,
-      prefixLen: number,
-      suffix: ScalarType[],
-    ): Uint8Array => {
-      let at = prefixLen;
-      for (const ty of suffix) at = keySlotEnd(entryKey, at, ty);
-      return entryKey.slice(at);
-    };
     const scanIndex = (
       nameKey: string,
       bound: KeyBound,
       prefixLen: number,
-      suffix: ScalarType[],
+      suffix: KeySlot[],
     ): boolean => {
       const istore = this.lkpIndexStore(nameKey);
       const su = istore.overlapScanUnits(bound, []);
@@ -19611,7 +19643,8 @@ export class Engine {
       let more = true;
       istore.scanRange(bound, (entryKey) => {
         meter.guard();
-        const rowKey = rowKeyFromIndex(entryKey, prefixLen, suffix);
+        // A corrupt entry shorter than its components yields an empty storage key (no row).
+        const rowKey = indexEntryRowKey(entryKey, prefixLen, suffix) ?? new Uint8Array(0);
         const u = store.getWithUnits(rowKey, plan.relMasks[0]!);
         if (u.row === undefined)
           throw engineError("data_corrupted", "an index entry references a stored row");
@@ -19639,12 +19672,13 @@ export class Engine {
     } else if (sb.kind === "index") {
       const built = buildIndexBound(sb.index, params, env.outer, []);
       if (built !== null)
-        scanIndex(sb.index.nameKey, built.bound, built.prefixLen, sb.index.suffixTypes);
+        scanIndex(sb.index.nameKey, built.bound, built.prefixLen, sb.index.suffix);
     } else if (sb.kind === "indexSet") {
       if (canPull) {
         const ks = sb.indexSet;
         for (const probe of indexKeySetProbes(ks, params, env.outer, [])) {
-          if (!scanIndex(ks.nameKey, probe.bound, probe.prefixLen, probe.suffix)) break;
+          if (!scanIndex(ks.nameKey, probe.bound, probe.prefixLen, probe.suffix))
+            break;
         }
       }
     } else if (sb.kind === "gin" || sb.kind === "gist") {
@@ -23319,19 +23353,19 @@ export const MAX_KEY_SET_PROBES = 65536;
 
 // IndexKeySet is the PkKeySet analog over a B-tree secondary index whose keys are plain columns
 // (indexes.md §5; cost.md §3 "Multi-column secondary indexes"): tuple is the consumed key columns in
-// key order, walked as a composite-PK tuple set's members, and colTypes is every key column's type —
-// the per-entry key-suffix skip. A tuple of one member is the leading-column interval set. allFixed
+// key order, walked as a composite-PK tuple set's members, and slots is every key column's
+// self-delimiting slot form (indexes.md §5.1) — the per-entry key-suffix skip. A tuple of one member is the leading-column interval set. allFixed
 // reports that every key column is fixed-width, so the probes merge as the PK's do.
 export type IndexKeySet = {
   nameKey: string;
   tuple: TupleMember[];
-  colTypes: ScalarType[];
+  slots: KeySlot[];
   allFixed: boolean;
 };
 
 // IndexProbe is one canonical index interval with its row-key suffix recovery: the known prefix byte
-// length skipped first, then the width-skipped member slots after it.
-export type IndexProbe = { bound: KeyBound; prefixLen: number; suffix: ScalarType[] };
+// length skipped first, then the self-delimiting member slots after it (indexes.md §5.1).
+export type IndexProbe = { bound: KeyBound; prefixLen: number; suffix: KeySlot[] };
 
 // GistBound is the plan-time result for one eligible GiST index (spec/design/gist.md §5): its descent
 // strategy and the column's global scope index. The inventory owns one plan per eligible index; the
@@ -23435,22 +23469,158 @@ export type GinBound = {
 export type IndexEqCol = { colType: ScalarType; coll: Collation | null; srcs: RExpr[] };
 
 // IndexRange is the optional trailing range of an index access predicate (indexes.md §5.1): a range
-// on the key column immediately after the equality prefix. Its column is fixed-width (never collated).
-export type IndexRange = { colType: ScalarType; terms: BoundTerm[] };
+// on the key column immediately after the equality prefix. A collated text column (coll non-null)
+// encodes its endpoints as the column collation's UCA sort key, the stored key form (encoding.md
+// §2.12).
+export type IndexRange = { colType: ScalarType; coll: Collation | null; terms: BoundTerm[] };
+
+// KeySlot is how one index key component's nullable slot is skipped to recover an entry's
+// storage-key suffix (indexes.md §5.1, encoding.md §2.2): every scalar key encoding is
+// self-delimiting, either by a fixed width or by its own terminator. "fixed" is a fixed-width body
+// (the integers, bool, uuid, date, timestamps, floats, interval's 16 bytes); "terminated" is
+// text-/bytea-terminated-escape (encoding.md §2.4/§2.6); "decimal" is decimal-order-preserving
+// (§2.5); "collated" is text-collated-sortkey (§2.12).
+export type KeySlot =
+  | { kind: "fixed"; width: number }
+  | { kind: "terminated" }
+  | { kind: "decimal" }
+  | { kind: "collated" };
+
+const KEY_SLOT_TERMINATED: KeySlot = { kind: "terminated" };
+const KEY_SLOT_DECIMAL: KeySlot = { kind: "decimal" };
+const KEY_SLOT_COLLATED: KeySlot = { kind: "collated" };
+
+// keySlotForScalar is the slot form of a scalar key component of type ty; collated selects the
+// sort-key form of a non-C text key. null for a type with no key encoding.
+export function keySlotForScalar(ty: ScalarType, collated: boolean): KeySlot | null {
+  switch (ty) {
+    case "text":
+      return collated ? KEY_SLOT_COLLATED : KEY_SLOT_TERMINATED;
+    case "bytea":
+      return KEY_SLOT_TERMINATED;
+    case "decimal":
+      return KEY_SLOT_DECIMAL;
+    case "interval":
+      return { kind: "fixed", width: 16 };
+    case "json":
+    case "jsonb":
+    case "jsonpath":
+      return null;
+    default:
+      return { kind: "fixed", width: widthBytes(ty) };
+  }
+}
+
+// terminatedLen is the length of a `*-terminated-escape` body starting at key[from] (`0x00 0xFF` an
+// escaped NUL, `0x00 0x01` the end); null when truncated.
+function terminatedLen(key: Uint8Array, from: number): number | null {
+  let i = from;
+  for (;;) {
+    if (i >= key.length) return null;
+    if (key[i] === 0x00) {
+      if (i + 1 >= key.length) return null;
+      if (key[i + 1] === 0x01) return i + 2 - from;
+      i += 2;
+    } else {
+      i++;
+    }
+  }
+}
+
+// keySlotLen is the byte length of the nullable slot starting at key[at] (its tag included): 1 for
+// the 0x01 NULL tag, else 1 + the self-delimited body. null for a malformed (truncated) slot.
+export function keySlotLen(slot: KeySlot, key: Uint8Array, at: number): number | null {
+  if (at >= key.length) return null;
+  if (key[at] === 0x01) return 1;
+  const body = at + 1;
+  let n: number;
+  switch (slot.kind) {
+    case "fixed":
+      if (key.length - body < slot.width) return null;
+      n = slot.width;
+      break;
+    case "terminated": {
+      const t = terminatedLen(key, body);
+      if (t === null) return null;
+      n = t;
+      break;
+    }
+    case "decimal": {
+      if (body >= key.length) return null;
+      const cls = key[body]!;
+      if (cls === 0x04) {
+        n = 1;
+      } else if (cls === 0x03 || cls === 0x05) {
+        // class ‖ 4-byte exponent ‖ pair bytes ‖ terminator (0x00; complemented 0xFF).
+        const term = cls === 0x05 ? 0x00 : 0xff;
+        const rest = body + 5;
+        if (rest > key.length) return null;
+        let pos = -1;
+        for (let i = rest; i < key.length; i++) {
+          if (key[i] === term) {
+            pos = i - rest;
+            break;
+          }
+        }
+        if (pos < 0) return null;
+        n = 5 + pos + 1;
+      } else {
+        return null;
+      }
+      break;
+    }
+    case "collated": {
+      // Three levels of 2-byte weights, each ended by a 0x0000 separator, then the identical level:
+      // the original string's terminated C key.
+      let i = 0;
+      let seps = 0;
+      while (seps < 3) {
+        if (body + i + 2 > key.length) return null;
+        const zero = key[body + i] === 0 && key[body + i + 1] === 0;
+        i += 2;
+        if (zero) seps++;
+      }
+      const t = terminatedLen(key, body + i);
+      if (t === null) return null;
+      n = i + t;
+      break;
+    }
+  }
+  return 1 + n;
+}
+
+// indexEntryRowKey skips slots past prefixLen in an index entry key and returns the storage-key
+// suffix after them (indexes.md §3); null for a corrupt entry shorter than its components, which
+// names no row.
+export function indexEntryRowKey(
+  key: Uint8Array,
+  prefixLen: number,
+  slots: KeySlot[],
+): Uint8Array | null {
+  let at = prefixLen;
+  for (const slot of slots) {
+    const n = keySlotLen(slot, key, at);
+    if (n === null) return null;
+    at += n;
+  }
+  if (at > key.length) return null;
+  return key.slice(at);
+}
 
 // IndexBound is the plan-time result for one eligible ordered index (indexes.md §5.1): a maximal
 // EQUALITY PREFIX on the leading key columns (eqCols) plus an OPTIONAL RANGE on the next column
 // (range). The inventory owns one plan per eligible index; the selector chooses among them. At exec
 // time buildIndexBound turns these into a concrete index-key range: the equality prefix bytes P =
-// concatenated present slots, then the range (if any) intersected relative to P. suffixTypes are the
-// types of the index columns AFTER the equality prefix (columns[eqCols.length..]) — the range column
-// (if any) plus every trailing column — each FIXED-WIDTH so an admitted entry's row-key suffix is
-// recovered by width-skipping them past P.
+// concatenated present slots, then the range (if any) intersected relative to P. suffix holds the
+// slot forms of the index key elements AFTER the equality prefix (keys[eqCols.length..]) — the range
+// element (if any) plus every trailing element — each skipped by its self-delimiting encoding so an
+// admitted entry's row-key suffix is recovered past P. An empty eqCols with no range is a FULL
+// partial-index scan (indexes.md §9.2).
 export type IndexBound = {
   nameKey: string;
   eqCols: IndexEqCol[];
   range: IndexRange | null;
-  suffixTypes: ScalarType[];
+  suffix: KeySlot[];
 };
 
 // buildIndexAccessPredicate constructs an index access predicate for idx over rel (indexes.md §5.1): a
@@ -23459,8 +23629,8 @@ export type IndexBound = {
 // agreed equality conjunct into the prefix and stopping at the first column that has no equality
 // (taking its range conjuncts, if any, as the trailing range). null for a non-B-tree index, a Skewed
 // collated bound column (whose stored keys are at the file's pinned version — collation.md §12), no
-// bound at all, or an ineligible suffix (a column after the equality prefix that is not a fixed-width
-// scalar — the width-based key-suffix skip needs it). siblingRange opens the index-nested-loop door:
+// bound at all, or an ineligible suffix (an element after the equality prefix that is not a scalar
+// with a self-delimiting key encoding — the key-suffix skip needs it). siblingRange opens the index-nested-loop door:
 // a bare sibling "column" node inside that global slot interval is resolved per outer row. null is
 // the ordinary once-materialized bound.
 export function buildIndexAccessPredicate(
@@ -23481,9 +23651,8 @@ export function buildIndexAccessPredicate(
     return null;
   }
   // A PARTIAL index holds only its qualifying rows (indexes.md §9), so it is usable ONLY when the
-  // query's WHERE implies the index predicate. jed's test is syntactic (PG's, not a prover): the WHERE
-  // AND-chain must contain a conjunct STRUCTURALLY EQUAL to the resolved predicate. A miss yields no
-  // bound — a correct full scan. (The resolved predicate is in table-local column coords; a WHERE
+  // query's WHERE implies the index predicate (the bounded prover, §9.1). A miss yields no bound — a
+  // correct full scan. (The resolved predicate is in table-local column coords; a WHERE
   // conjunct is global, so it is matched shifted by rel.offset.)
   if (
     rindex.predicate !== undefined &&
@@ -23491,6 +23660,8 @@ export function buildIndexAccessPredicate(
   ) {
     return null;
   }
+  // (A partial index's predicate needs no NULL-rejection here: every bound term below is a strict
+  // comparison on this relation's key, so its WHERE conjunct rejects a NULL-extended row.)
   const eqCols: IndexEqCol[] = [];
   let range: IndexRange | null = null;
   for (const key of rindex.keys) {
@@ -23541,24 +23712,115 @@ export function buildIndexAccessPredicate(
       eqCols.push({ colType: ty, coll, srcs: eqs });
       continue; // extend the equality prefix
     }
-    if (ranges.length > 0) range = { colType: ty, terms: ranges };
+    if (ranges.length > 0) range = { colType: ty, coll, terms: ranges };
     break; // first non-equality element ends the prefix (with or without a trailing range)
   }
   if (eqCols.length === 0 && range === null) return null; // nothing bound
-  // Eligibility: every key element from the range element onward (keys[eqCols.length..]) is
-  // width-skipped past the known equality prefix to recover the storage key, so each must be a
-  // fixed-width scalar (a column's type, or an expression's result type). The equality-prefix
-  // elements may be any width — their slots are matched as the known prefix bytes.
-  const suffixTypes: ScalarType[] = [];
-  for (const key of rindex.keys.slice(eqCols.length)) {
-    const s =
-      key.kind === "column"
-        ? typeAsScalar(rel.table.columns[key.column]!.type)
-        : typeAsScalar(key.type);
-    if (s === undefined || !isFixedWidth(s)) return null;
-    suffixTypes.push(s);
+  const suffix = indexSuffixSlots(rel, rindex, eqCols.length);
+  if (suffix === null) return null;
+  return { nameKey: idx.name, eqCols, range, suffix };
+}
+
+// indexSuffixSlots are the slot forms of the resolved index's key elements from `from` onward
+// (indexes.md §5.1): each is skipped past the known equality prefix to recover an entry's storage
+// key, so each must be a scalar with a key encoding (a column's type, or an expression's result
+// type). null when one is a container (range/array/composite) element.
+export function indexSuffixSlots(
+  rel: ScopeRel,
+  rindex: ResolvedIndex,
+  from: number,
+): KeySlot[] | null {
+  const suffix: KeySlot[] = [];
+  for (const key of rindex.keys.slice(from)) {
+    let slot: KeySlot | null;
+    if (key.kind === "column") {
+      const col = rel.table.columns[key.column]!;
+      const s = typeAsScalar(col.type);
+      if (s === undefined) return null;
+      slot = keySlotForScalar(s, col.collation !== null);
+    } else {
+      const s = typeAsScalar(key.type);
+      if (s === undefined) return null;
+      slot = keySlotForScalar(s, key.coll !== null);
+    }
+    if (slot === null) return null;
+    suffix.push(slot);
   }
-  return { nameKey: idx.name, eqCols, range, suffixTypes };
+  return suffix;
+}
+
+// buildPartialIndexFullScan is a FULL partial-index scan (indexes.md §9.2): a B-tree PARTIAL index
+// whose predicate the WHERE implies (§9.1) is a complete source of the query's rows even without an
+// equality/range access predicate, so it is a candidate that walks the whole (narrow) index. Offered
+// only for a single-relation scan (a join's relation never NULL-extends here) and only when no
+// ordinary access predicate already bounds this index. Every key element must be skippable (§5.1).
+export function buildPartialIndexFullScan(
+  filter: RExpr,
+  rel: ScopeRel,
+  idx: IndexDef,
+  snap: Snapshot,
+  engine: Engine,
+): IndexBound | null {
+  if (idx.kind !== "btree" || idx.predicate === undefined) return null;
+  let rindex: ResolvedIndex;
+  try {
+    rindex = engine.resolveIndex(rel.table, idx);
+  } catch {
+    return null;
+  }
+  const pred = rindex.predicate;
+  if (pred === undefined) return null;
+  if (!filterImpliesPredicate(filter, pred, rel.offset)) return null;
+  // A skewed collated key element's stored order is not the loaded collation's; never walk it (the
+  // read-safety rule, collation.md §12).
+  for (const key of rindex.keys) {
+    if (key.kind === "column" && keyCollationCtx(snap, rel.table.columns[key.column]!) === null) {
+      return null;
+    }
+  }
+  const suffix = indexSuffixSlots(rel, rindex, 0);
+  if (suffix === null) return null;
+  return { nameKey: idx.name, eqCols: [], range: null, suffix };
+}
+
+// inventorySingleRelationCandidates is the single-relation access inventory (estimator.md §9.1,
+// §9.3): inventoryScanCandidates plus a FULL partial-index scan for every partial index whose
+// predicate the WHERE implies and that has no ordinary access-predicate candidate (indexes.md §9.2),
+// in canonical kind/name order.
+export function inventorySingleRelationCandidates(
+  filter: RExpr | null,
+  rel: ScopeRel,
+  snap: Snapshot,
+  engine: Engine,
+): ScanCandidate[] {
+  const candidates = inventoryScanCandidates(filter, rel, snap, engine);
+  if (filter === null || isAttachmentScope(rel.db)) return candidates;
+  let added = false;
+  for (const idx of rel.table.indexes) {
+    const hasBound = candidates.some(
+      (c) => c.identity.kind === "btree" && c.identity.indexName === idx.name,
+    );
+    if (hasBound) continue;
+    const bound = buildPartialIndexFullScan(filter, rel, idx, snap, engine);
+    if (bound !== null) {
+      candidates.push(
+        indexOrderCandidate("btree", bound.nameKey, { kind: "index", index: bound }, filter),
+      );
+      added = true;
+    }
+  }
+  if (added) sortScanCandidates(candidates);
+  return candidates;
+}
+
+function sortScanCandidates(candidates: ScanCandidate[]): void {
+  candidates.sort((a, b) => {
+    const rank =
+      SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) -
+      SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
+    if (rank !== 0) return rank;
+    return compareName({ name: a.identity.indexName }, { name: b.identity.indexName });
+  });
 }
 
 // detectScanBound picks one SELECT relation's scan bound. It is the fixed-policy wrapper over the
@@ -23636,7 +23898,7 @@ export function inventoryScanCandidates(
     );
   }
   for (const idx of rel.table.indexes) {
-    const bound = buildIndexIntervalSetPlan(filter, rel, idx, snap);
+    const bound = buildIndexIntervalSetPlan(filter, rel, idx, snap, engine);
     if (bound !== null) {
       candidates.push(
         indexOrderCandidate(
@@ -23649,13 +23911,7 @@ export function inventoryScanCandidates(
     }
   }
   candidates.push(full);
-  candidates.sort((a, b) => {
-    const rank =
-      SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) -
-      SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
-    if (rank !== 0) return rank;
-    return compareName({ name: a.identity.indexName }, { name: b.identity.indexName });
-  });
+  sortScanCandidates(candidates);
   return candidates;
 }
 
@@ -25296,7 +25552,7 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       if (ks.tuple.length > 1) {
         return tupleSetSelectivity(
           ks.tuple,
-          ks.colTypes.length,
+          ks.slots.length,
           unique,
           structuralTupleMemberSelectivity,
         );
@@ -25305,7 +25561,7 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       return estimatorIntervalSelectivity(
         lead.specs ?? [],
         lead.clip,
-        unique && ks.colTypes.length === 1,
+        unique && ks.slots.length === 1,
         lead.colType,
       );
     }
@@ -25443,6 +25699,64 @@ function estimatorCandidateSelectivityWithStatistics(
   rel: ScopeRel,
   engine: Engine,
 ): Selectivity {
+  const access = estimatorAccessSelectivityWithStatistics(candidate, rel, engine);
+  return partialIndexScanSelectivity(access, candidate, rel, engine);
+}
+
+// partialIndexScanSelectivity: a PARTIAL index holds only its qualifying rows (indexes.md §9), so its
+// scan rows are the access predicate's rows further narrowed by the index predicate (estimator.md
+// §7): each top-level predicate conjunct that reads no column of a key element the access predicate
+// constrains applies its structural (statistics-free) selectivity, in predicate order. A conjunct
+// over a constrained column is skipped, since it usually restates the access predicate's own range.
+function partialIndexScanSelectivity(
+  access: Selectivity,
+  candidate: ScanCandidate,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity {
+  if (access.kind === "zero" || access.kind === "unique") return access;
+  const bound = candidate.bound;
+  let constrained: number;
+  if (bound !== null && bound.kind === "index") {
+    constrained = bound.index.eqCols.length + (bound.index.range !== null ? 1 : 0);
+  } else if (bound !== null && bound.kind === "indexSet") {
+    constrained = bound.indexSet.tuple.length;
+  } else {
+    return access;
+  }
+  const idx = rel.table.indexes.find((index) => index.name === candidate.identity.indexName);
+  if (idx === undefined || idx.predicate === undefined) return access;
+  let rindex: ResolvedIndex;
+  try {
+    rindex = engine.resolveIndex(rel.table, idx);
+  } catch {
+    return access;
+  }
+  const pred = rindex.predicate;
+  if (pred === undefined) return access;
+  const width = rel.table.columns.length;
+  const read = new Array<boolean>(width).fill(false);
+  for (const key of rindex.keys.slice(0, constrained)) {
+    if (key.kind === "column") read[key.column] = true;
+    else collectTouched(key.expr, 0, read);
+  }
+  const conjuncts: RExpr[] = [];
+  estimatorFlattenBoolean(pred, "and", conjuncts);
+  let result = access;
+  for (const conjunct of conjuncts) {
+    const touched = new Array<boolean>(width).fill(false);
+    collectTouched(conjunct, 0, touched);
+    if (touched.some((t, i) => t && read[i] === true)) continue;
+    result = andSelectivity(result, estimatorPredicateSelectivity(conjunct));
+  }
+  return result;
+}
+
+function estimatorAccessSelectivityWithStatistics(
+  candidate: ScanCandidate,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity {
   const structural = estimatorCandidateSelectivity(candidate, rel);
   if (structural.kind === "zero" || structural.kind === "unique") return structural;
   const bound = candidate.bound;
@@ -25521,7 +25835,7 @@ function estimatorCandidateSelectivityWithStatistics(
       if (index === undefined || key?.kind !== "column") return structural;
       const ks = bound.indexSet;
       if (ks.tuple.length > 1) {
-        return tupleSetSelectivity(ks.tuple, ks.colTypes.length, index.unique, (m) =>
+        return tupleSetSelectivity(ks.tuple, ks.slots.length, index.unique, (m) =>
           statisticsTupleMemberSelectivity(m, rel, engine),
         );
       }
@@ -25840,31 +26154,39 @@ function buildIndexIntervalSetPlan(
   rel: ScopeRel,
   idx: IndexDef,
   snap: Snapshot,
+  engine: Engine,
 ): IndexKeySet | null {
-  return buildIndexIntervalSetPlanConjuncts(flattenConjuncts(filter), rel, idx, snap, null);
+  // A PARTIAL index serves the set only when the WHERE implies its predicate (indexes.md §9.1); the
+  // set's own disjunction is a NULL-rejecting conjunct on this relation's key.
+  const partialOk =
+    idx.predicate === undefined || partialIndexImplied(filter, rel.table, rel.offset, idx, engine);
+  return buildIndexIntervalSetPlanConjuncts(flattenConjuncts(filter), rel, idx, snap, null, partialOk);
 }
 
 // buildIndexIntervalSetPlanConjuncts is buildIndexIntervalSetPlan over an AND-chain's conjuncts;
-// siblingRange admits a sibling column as a member's source (an index-nested-loop inner).
+// siblingRange admits a sibling column as a member's source (an index-nested-loop inner). partialOk
+// is the caller's proof that a PARTIAL index's predicate is implied (indexes.md §9.1, §9.3).
 function buildIndexIntervalSetPlanConjuncts(
   conjuncts: RExpr[],
   rel: ScopeRel,
   idx: IndexDef,
   snap: Snapshot,
   siblingRange: ColumnRange,
+  partialOk: boolean,
 ): IndexKeySet | null {
-  if (idx.kind !== "btree" || idx.predicate !== undefined) return null;
+  if (idx.kind !== "btree" || (idx.predicate !== undefined && !partialOk)) return null;
   const cols = indexColumnOrdinals(idx);
   if (cols === null) return null;
   const { tuple, hasSet } = walkTupleMembers(conjuncts, rel, cols, snap, siblingRange);
   if (!hasSet) return null;
-  // A key column whose slot an admitted entry can step over without knowing its value: a fixed-width
-  // or self-delimiting C-collated slot (keySlotSkippable).
-  const skippable = (c: number): boolean => {
+  // A key column's self-delimiting slot form (indexes.md §5.1): every scalar key type, collated text
+  // included, can be stepped over without knowing its value.
+  const slotOf = (c: number): KeySlot | null => {
     const col = rel.table.columns[c]!;
     const ty = typeAsScalar(col.type);
-    return ty !== undefined && keySlotSkippable(ty) && col.collation === null;
+    return ty === undefined ? null : keySlotForScalar(ty, col.collation !== null);
   };
+  const skippable = (c: number): boolean => slotOf(c) !== null;
   // A leading range, or a leading membership subquery (which widens to the whole index if it is
   // read before its fold), leaves the leading slot to be stepped over.
   const lead = tuple[0]!;
@@ -25882,15 +26204,16 @@ function buildIndexIntervalSetPlanConjuncts(
       break;
     }
   }
-  const colTypes: ScalarType[] = [];
+  const slots: KeySlot[] = [];
   let allFixed = true;
   for (let i = 0; i < cols.length; i++) {
-    if (i >= t && !skippable(cols[i]!)) return null;
+    const slot = slotOf(cols[i]!);
+    if (i >= t && slot === null) return null;
     const ty = typeAsScalar(rel.table.columns[cols[i]!]!.type);
     allFixed = allFixed && ty !== undefined && isFixedWidth(ty);
-    colTypes.push(typeScalar(rel.table.columns[cols[i]!]!.type));
+    slots.push(slot ?? { kind: "fixed", width: 0 });
   }
-  return { nameKey: idx.name, tuple, colTypes, allFixed };
+  return { nameKey: idx.name, tuple, slots, allFixed };
 }
 
 // Find the first top-level conjunct that is a pure OR of same-key intervals. Other direct same-key
@@ -26350,6 +26673,7 @@ export function detectINLBound(
   whereFilter: RExpr | null,
   rel: ScopeRel,
   snap: Snapshot,
+  engine: Engine,
 ): ScanBound | null {
   return inventoryINLCandidates(
     on,
@@ -26357,7 +26681,53 @@ export function detectINLBound(
     rel,
     [{ start: 0, end: rel.offset }],
     snap,
+    engine,
   )[0]?.bound ?? null;
+}
+
+// partialIndexImplied reports whether the WHERE filter implies a partial index's resolved predicate
+// (indexes.md §9.1). An index whose predicate does not resolve (an unparsable one) is never implied.
+export function partialIndexImplied(
+  filter: RExpr,
+  table: Table,
+  offset: number,
+  idx: IndexDef,
+  engine: Engine,
+): boolean {
+  let rindex: ResolvedIndex;
+  try {
+    rindex = engine.resolveIndex(table, idx);
+  } catch {
+    return false;
+  }
+  return rindex.predicate !== undefined && filterImpliesPredicate(filter, rindex.predicate, offset);
+}
+
+// inlPartialAdmissible reports whether a PARTIAL index may serve as an index-nested-loop inner
+// (indexes.md §9.3): the join's own `on` must imply its predicate, or `on` together with the `where`
+// must imply a NULL-rejecting predicate. A WHERE conjunct holds only for the final rows, and a later
+// outer join may NULL-extend this relation; a NULL-rejecting predicate makes every such row fail the
+// implied WHERE anyway.
+function inlPartialAdmissible(
+  on: RExpr | null,
+  whereFilter: RExpr | null,
+  rel: ScopeRel,
+  idx: IndexDef,
+  engine: Engine,
+): boolean {
+  let rindex: ResolvedIndex;
+  try {
+    rindex = engine.resolveIndex(rel.table, idx);
+  } catch {
+    return false;
+  }
+  const pred = rindex.predicate;
+  if (pred === undefined) return false;
+  if (on !== null && filterImpliesPredicate(on, pred, rel.offset)) return true;
+  const filters: RExpr[] = [];
+  if (on !== null) filters.push(on);
+  if (whereFilter !== null) filters.push(whereFilter);
+  return predicateRejectsNull(pred) && filtersImplyPredicate(filters, pred, rel.offset);
 }
 
 // inventoryINLCandidates enumerates every legal sibling-dependent inner access path in canonical
@@ -26369,6 +26739,7 @@ export function inventoryINLCandidates(
   rel: ScopeRel,
   siblingRange: ColumnRange,
   snap: Snapshot,
+  engine: Engine,
 ): ScanCandidate[] {
   // A host-attached inner relation full-scans per outer row this slice (attached-databases.md §8): the
   // seek would resolve its index store unscoped. Index-nested-loop over an attachment is a perf follow-on.
@@ -26406,10 +26777,15 @@ export function inventoryINLCandidates(
   // order — the deterministic tie-break, matching detectScanBound).
   for (const idx of rel.table.indexes) {
     if (idx.kind !== "btree") continue;
-    // A PARTIAL index holds only its qualifying rows (indexes.md §9), and this bound never checks
-    // that the query implies the predicate, so a partial index is not an INL inner (as for ORDER-BY
-    // skip-sort and interval sets). That also keeps out one whose predicate did not parse.
-    if (idx.predicate !== undefined) continue;
+    // A PARTIAL index holds only its qualifying rows (indexes.md §9), so it is an INL inner only when
+    // the join's conditions imply its predicate (§9.3). One whose predicate did not parse never
+    // resolves, so it stays out.
+    if (
+      idx.predicate !== undefined &&
+      !inlPartialAdmissible(on, whereFilter, rel, idx, engine)
+    ) {
+      continue;
+    }
     // The index-nested-loop sibling bound is column-only this slice (an expression index takes the
     // access-predicate path — indexes.md §5; an INL bound over an expression key is a follow-on).
     const cols = indexColumnOrdinals(idx);
@@ -26417,14 +26793,20 @@ export function inventoryINLCandidates(
     const ci = cols[0]!;
     const ty = typeAsScalar(rel.table.columns[ci]!.type);
     if (ty === undefined) continue;
-    if (
-      cols.slice(1).some((c) => {
-        const ts = typeAsScalar(rel.table.columns[c]!.type);
-        return ts === undefined || !isFixedWidth(ts);
-      })
-    ) {
-      continue;
+    // Every trailing column is skipped by its self-delimiting slot (indexes.md §5.1).
+    const suffix: KeySlot[] = [];
+    let skippable = true;
+    for (const c of cols.slice(1)) {
+      const col = rel.table.columns[c]!;
+      const ts = typeAsScalar(col.type);
+      const slot = ts === undefined ? null : keySlotForScalar(ts, col.collation !== null);
+      if (slot === null) {
+        skippable = false;
+        break;
+      }
+      suffix.push(slot);
     }
+    if (!skippable) continue;
     const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
     if (ctx === null) continue;
     const terms = collect(rel.offset + ci, ty, ctx.coll);
@@ -26439,16 +26821,15 @@ export function inventoryINLCandidates(
     if (siblingEq) {
       // This slice keeps the index-nested-loop bound single-column-equality (a leading key column
       // bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md §3
-      // "index-nested-loop"). suffixTypes are the trailing columns (columns[1..], fixed-width by the
-      // check above), width-skipped past the single equality slot.
-      const suffixTypes = cols.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
+      // "index-nested-loop"). suffix holds the trailing columns' slots (columns[1..]), skipped past
+      // the single equality slot.
       const bound: ScanBound = {
         kind: "index",
         index: {
           nameKey: idx.name,
           eqCols: [{ colType: ty, coll: ctx.coll, srcs: eqs }],
           range: null,
-          suffixTypes,
+          suffix,
         },
       };
       candidates.push(indexOrderCandidate("btree", idx.name, bound, whereFilter));
@@ -26480,7 +26861,14 @@ export function inventoryINLCandidates(
     );
   }
   for (const idx of rel.table.indexes) {
-    const set = buildIndexIntervalSetPlanConjuncts(conjuncts, rel, idx, snap, siblingRange);
+    const set = buildIndexIntervalSetPlanConjuncts(
+      conjuncts,
+      rel,
+      idx,
+      snap,
+      siblingRange,
+      idx.predicate === undefined || inlPartialAdmissible(on, whereFilter, rel, idx, engine),
+    );
     if (set !== null && keySetUsesSibling([], [], set.tuple)) {
       candidates.push(
         indexOrderCandidate(
@@ -26664,16 +27052,22 @@ export function orderSatisfiedByIndexes(
   table: Table,
   offset: number,
   order: OrderSlot[],
+  filter: RExpr | null,
+  engine: Engine,
 ): IndexOrder[] {
   const pkWidth = pkStorageWidth(table);
   if (pkWidth === null) return [];
   const matchingIndexes: IndexOrder[] = [];
   for (const idx of table.indexes) {
     if (idx.kind !== "btree") continue; // only an ordered B-tree realizes the column order
-    // A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds only its
-    // qualifying rows, so walking it would drop rows unless the query implies the predicate — that gate
-    // lives only on the access-predicate bound. Stays non-partial (a follow-on); full-scan + sort.
-    if (idx.predicate !== undefined) continue;
+    // A PARTIAL index holds only its qualifying rows (indexes.md §9), so walking it for order is sound
+    // only when the WHERE implies its predicate (§9.1). The caller is a single-relation scan, so no
+    // row is NULL-extended.
+    if (idx.predicate !== undefined) {
+      const implied =
+        filter !== null && partialIndexImplied(filter, table, offset, idx, engine);
+      if (!implied) continue;
+    }
     // ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression index key
     // is a follow-on — indexes.md §5).
     const cols = indexColumnOrdinals(idx);
@@ -26716,8 +27110,10 @@ export function orderSatisfiedByIndex(
   table: Table,
   offset: number,
   order: OrderSlot[],
+  filter: RExpr | null,
+  engine: Engine,
 ): IndexOrder | null {
-  return orderSatisfiedByIndexes(snap, table, offset, order)[0] ?? null;
+  return orderSatisfiedByIndexes(snap, table, offset, order, filter, engine)[0] ?? null;
 }
 
 // buildGinBoundForIndex inventories one GIN index when its array column has an accelerable conjunct
@@ -27912,7 +28308,17 @@ export type ConflictPlan = {
 // column list is matched as an order-independent SET against a unique index / the primary key (no
 // match → 42P10); ON CONSTRAINT name names a unique index or the synthesized <table>_pkey (miss →
 // 42704). A null target → null arbiter (legal only with DO NOTHING).
-export function resolveArbiter(table: Table, target: ConflictTarget | null): Arbiter | null {
+//
+// indexPredicate is the resolved `WHERE index_predicate` of a column target (table-local columns):
+// with it, a PARTIAL unique index whose predicate it implies (indexes.md §9.1) is also inferable,
+// after the PK and every non-partial unique index (each in name byte order). Without it no partial
+// index is inferred, as in PostgreSQL.
+export function resolveArbiter(
+  table: Table,
+  target: ConflictTarget | null,
+  indexPredicate: RExpr | null,
+  engine: Engine,
+): Arbiter | null {
   if (target === null) return null;
   const pk = pkIndices(table);
   if (target.kind === "columns") {
@@ -27926,13 +28332,25 @@ export function resolveArbiter(table: Table, target: ConflictTarget | null): Arb
     for (let i = 0; i < table.indexes.length; i++) {
       const def = table.indexes[i]!;
       // A conflict-target COLUMN list matches only a plain-column unique index (an expression unique
-      // index is arbitrated by ON CONSTRAINT <name> — upsert.md §3). A PARTIAL unique index is NOT
-      // matched by a bare column list (PostgreSQL requires the predicate to be restated — a deferred
-      // upsert follow-on, indexes.md §9): a column target that only a partial index covers reports
-      // "no matching arbiter", agreeing with PG.
+      // index is arbitrated by ON CONSTRAINT <name> — upsert.md §3). A PARTIAL unique index is
+      // matched only through an implying `WHERE index_predicate` (below), as in PostgreSQL.
       const cols = indexColumnOrdinals(def);
       if (def.unique && def.predicate === undefined && cols !== null && sameIntSet(cols, want))
         return { isPK: false, indexPos: i };
+    }
+    if (indexPredicate !== null) {
+      for (let i = 0; i < table.indexes.length; i++) {
+        const def = table.indexes[i]!;
+        const cols = indexColumnOrdinals(def);
+        if (
+          def.unique &&
+          def.predicate !== undefined &&
+          cols !== null &&
+          sameIntSet(cols, want) &&
+          partialIndexImplied(indexPredicate, table, 0, def, engine)
+        )
+          return { isPK: false, indexPos: i };
+      }
     }
     throw engineError(
       "invalid_column_reference",
@@ -28127,7 +28545,7 @@ function fkKeyedMatch(t: FkKeyedTarget, row: Row): number | null {
 function indexStoreBoundEntries(
   istore: TableStore,
   store: TableStore,
-  suffixTypes: ScalarType[],
+  suffix: KeySlot[],
   b: KeyBound,
   prefixByteLen: number,
   mask: boolean[],
@@ -28139,15 +28557,12 @@ function indexStoreBoundEntries(
   let slabs = 0;
   const rows: Entry[] = [];
   for (const e of iscan.entries) {
-    // Skip the equality prefix by its known byte length, then each remaining key component
-    // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the body stepped over by width or
-    // delimiter, indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
-    let at = prefixByteLen;
-    for (const ty of suffixTypes) at = keySlotEnd(e.key, at, ty);
-    // An entry too short for its slots is corrupt: it names no row.
-    if (at > e.key.length)
+    // Skip the equality prefix by its known byte length, then each remaining key component by its
+    // self-delimiting slot (indexes.md §5.1); the suffix after them is the row's storage key
+    // (indexes.md §3). An entry too short for its slots is corrupt: it names no row.
+    const rowKey = indexEntryRowKey(e.key, prefixByteLen, suffix);
+    if (rowKey === null)
       throw engineError("data_corrupted", "an index entry references a stored row");
-    const rowKey = e.key.slice(at);
     const u = store.getWithUnits(rowKey, mask);
     pages += u.pages;
     slabs += u.slabs;
@@ -28810,24 +29225,6 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
   }
 }
 
-// filterImpliesPredicate reports whether the WHERE filter implies a PARTIAL index's predicate
-// (spec/design/indexes.md §9). jed's syntactic test (PG's, not a prover): every top-level conjunct of
-// pred must be present as a top-level conjunct of filter (so a conjunctive predicate a AND b is
-// implied by a WHERE that lists both a and b). pred is in table-local column coords; a filter conjunct
-// is global, so it is matched shifted by offset. Sound-if-conservative: a miss means the index is not
-// used (a correct full scan + residual filter).
-export function filterImpliesPredicate(filter: RExpr, pred: RExpr, offset: number): boolean {
-  if (pred.kind === "and") {
-    return (
-      filterImpliesPredicate(filter, pred.lhs, offset) &&
-      filterImpliesPredicate(filter, pred.rhs, offset)
-    );
-  }
-  const contains = (f: RExpr): boolean =>
-    f.kind === "and" ? contains(f.lhs) || contains(f.rhs) : rexprEqShifted(f, pred, offset);
-  return contains(filter);
-}
-
 // asBoundTerm recognizes a single comparison conjunct: a comparison (=,<,<=,>,>=) with the bound's
 // key operand (a bare LOCAL column, or an index EXPRESSION matched structurally — a correlated
 // "outerColumn" is a different kind, so it never matches) on one side and a const-source of the key's
@@ -29110,9 +29507,8 @@ export function buildIndexBound(
     hiInc: false,
   };
   for (const t of ib.range.terms) {
-    // The range column is fixed-width (indexes.md §5.1 eligibility), so it is never collated: the
-    // probe encodes with a null collation.
-    const bk = encodeBoundKey(ib.range.colType, t.src, params, outer, null, left);
+    // A collated range column's probe is the collation's sort key (the stored key form).
+    const bk = encodeBoundKey(ib.range.colType, t.src, params, outer, ib.range.coll, left);
     if (bk.kind === "null") return null;
     if (bk.kind === "outOfRange") continue; // drop this half-bound (a wider, still-sound scan)
     const ps = concatBytes([p, new Uint8Array([0x00]), bk.key]); // P ‖ 0x00 ‖ encode(v)
@@ -29535,7 +29931,7 @@ function indexKeySetProbes(
       out.push({
         bound: { lo: p, loInc: true, hi: prefixSuccessor(p), hiInc: false },
         prefixLen: p.length,
-        suffix: ks.colTypes.slice(consumed),
+        suffix: ks.slots.slice(consumed),
       });
       continue;
     }
@@ -29548,7 +29944,7 @@ function indexKeySetProbes(
         hiInc: phys.hiInc,
       };
       if (!boundEmpty(b))
-        out.push({ bound: b, prefixLen: p.length, suffix: ks.colTypes.slice(consumed - 1) });
+        out.push({ bound: b, prefixLen: p.length, suffix: ks.slots.slice(consumed - 1) });
     }
   }
   if (!ks.allFixed || out.length < 2) return out;
@@ -29557,7 +29953,7 @@ function indexKeySetProbes(
   return mergeKeyIntervals(
     out.map((probe) => probe.bound),
     true,
-  ).map((bound) => ({ bound, prefixLen: 0, suffix: ks.colTypes }));
+  ).map((bound) => ({ bound, prefixLen: 0, suffix: ks.slots }));
 }
 
 export function indexLogicalInterval(logical: KeyBound): KeyBound {
