@@ -203,6 +203,8 @@ mod timestamptz_session_render;
 mod timezone;
 #[path = "../tests/transactions.rs"]
 mod transactions;
+#[path = "../tests/truncate.rs"]
+mod truncate;
 #[path = "../tests/unique.rs"]
 mod unique;
 #[path = "../tests/unnest.rs"]

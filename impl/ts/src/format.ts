@@ -84,6 +84,7 @@ import {
   gistRangeOpclass,
   readGistLeafKeys,
   serializeGistTree,
+  serializeGistTreeTo,
 } from "./gist.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
@@ -2896,9 +2897,17 @@ function serializeGistIndex(
   if (keys.length === 0) return { index: 0, next: nextIndex };
   const tree = buildGistFromLeafKeys(ops, keys);
   let n = nextIndex;
-  const { pages, root } = serializeGistTree(tree, ops, () => n++);
-  checkGistPages(pages, ps);
-  for (const p of pages) body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload);
+  // Each node page streams to the sink as it is encoded, so the image never holds an index's pages at
+  // once (host compaction's bounded memory, api.md §2.6).
+  const root = serializeGistTreeTo(
+    tree,
+    ops,
+    () => n++,
+    (p) => {
+      checkGistPages([p], ps);
+      body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload);
+    },
+  );
   return { index: root, next: n };
 }
 
@@ -3695,6 +3704,19 @@ export function reclaimDue(pageCount: number, free: number, liveAtCompaction: nu
   return unlisted > COMPACT_MIN_PAGES && unlisted > COMPACT_GROWTH * liveAtCompaction;
 }
 
+// trailingRun splits the sorted safe free pages at the start of their trailing run below the high-water:
+// every page in [start, high) is in safe (format.md *Trailing truncation*). start === high when page
+// high − 1 is not safe.
+export function trailingRun(safe: number[], high: number): { below: number[]; start: number } {
+  let start = high;
+  let n = safe.length;
+  while (n > 0 && safe[n - 1] === start - 1) {
+    n--;
+    start--;
+  }
+  return { below: safe.slice(0, n), start };
+}
+
 // planFreeList is the v25 durable-commit free-list plan, shared by the file commit paths (persist.ts
 // persistImpl / commitDurableAttachment and the bare-engine file.ts persist). It runs IN-COMMIT (after
 // the tree + catalog are written to the pager, before the meta), so the list it persists includes THIS
@@ -3718,6 +3740,7 @@ export function planFreeList(
   canReuse: boolean,
   pending: { index: number }[] = [],
   allowed: Set<number> | null = null,
+  truncate = false,
 ): {
   pages: { index: number; bytes: Uint8Array }[];
   head: number;
@@ -3754,11 +3777,25 @@ export function planFreeList(
   // hazard as data-page reuse. When the watermark defers reuse the chain must grow the high-water instead
   // (empty `safe`), exactly as the data allocator does.
   // A pending batch reuses only pages free at its floor (validated-cow.md §4 rule 3).
-  const safe = !canReuse
+  let safe = !canReuse
     ? []
     : allowed === null
       ? freeRemaining
       : freeRemaining.filter((p) => allowed.has(p));
+  // Trailing truncation (format.md *Trailing truncation*): the safe pages that run up to the high-water
+  // leave both lists, and the high-water starts below them. Only the file's owner (or an alone process)
+  // truncates, and only against a durable floor (nothing pending, validated-cow.md §4); a page client's
+  // delta never shrinks the high-water.
+  let base = pageCount;
+  if (truncate) {
+    const run = trailingRun(safe, pageCount);
+    if (run.start < pageCount) {
+      safe = run.below;
+      base = run.start;
+      const k = run.start;
+      persistList = persistList.filter((p) => p < k);
+    }
+  }
   // Joint allocation is monotone: reserve descriptor overflow pages first, then encode the free
   // list with those reservations removed. Growing the reservation can shrink the free-list chain,
   // so a final descriptor may have empty tail pages; never release/reallocate them in this trial.
@@ -3766,7 +3803,7 @@ export function planFreeList(
   for (;;) {
     const reused = Math.min(manifestCount, safe.length);
     const manifestIds = safe.slice(0, reused);
-    let next = pageCount;
+    let next = base;
     for (let i = reused; i < manifestCount; i++) {
       if (next >= 0xffff_ffff)
         throw engineError("program_limit_exceeded", "database page limit exceeded");

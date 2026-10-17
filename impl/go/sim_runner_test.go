@@ -378,12 +378,21 @@ type simDB struct {
 	// engine's reclamation trigger compares against, and what the previous commit left.
 	high     uint32    // the page high-water now
 	free     uint32    // the free list the next commit allocates from
+	trail    uint32    // where that free list's trailing run below high starts (high: none)
 	lacBound uint32    // ≥ the engine's live-at-last-reclamation
 	last     simGrowth // the previous commit in this lifetime
 	// batchOpen is whether the current step began with a relaxed batch pending on this database's file:
 	// its commit allocates from the high-water and keeps the batch's pages off the free list
 	// (validated-cow.md §4), so the bounded-growth assertions do not apply to it.
 	batchOpen bool
+	// batchPending is whether the step began with a non-empty pending set: a commit then plans inside a
+	// batch and may not lower the high-water (validated-cow.md §4). Unlike batchOpen it is false after a
+	// recovery whose adopted generation awaits stabilization, which the commit's own first barrier makes
+	// the floor.
+	batchPending bool
+	// shrinkDue is set when a relaxed commit lowered the high-water: the next flush (the batch cap, close)
+	// must shorten the file (format.md *Trailing truncation*, validated-cow.md §4).
+	shrinkDue bool
 	// ownerLost is set when an owner died under synchronous = off: until a process observes main
 	// again, it may have recovered any version from the floor up.
 	ownerLost bool
@@ -838,6 +847,7 @@ func (r *simRunner) step(i int) (cont bool) {
 	for name, d := range r.dbs {
 		start[name] = d.version
 		d.batchOpen = r.relaxed && !r.engineFlushed(d)
+		d.batchPending = r.relaxed && r.enginePending(d)
 	}
 	if pid, ok := r.stepPid(st); ok {
 		if st.kind != "spawn" && !r.selectProc(pid) {
@@ -910,6 +920,12 @@ func (r *simRunner) step(i int) (cont bool) {
 			return false
 		}
 		d.floor = d.version
+	}
+	// Checked against the floor this step leaves (a flush in the step moved it).
+	for _, d := range r.order() {
+		if !r.checkTruncated(i, d) {
+			return false
+		}
 	}
 	if armed == nil {
 		return true
@@ -1427,6 +1443,26 @@ func (r *simRunner) engineFlushed(d *simDB) bool {
 	return flushed && st.flushing == nil
 }
 
+// enginePending reports whether the process writing database d holds a non-empty pending set — a
+// relaxed batch not yet flushed (validated-cow.md §4). Not run under the page service.
+func (r *simRunner) enginePending(d *simDB) bool {
+	if r.service || r.db == nil {
+		return false
+	}
+	st, err := r.db.core.withStorage(d.name)
+	if err != nil || st.paging == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	pending := false
+	_ = st.paging.withPager(func(p *pager) error {
+		pending = len(p.pending) > 0
+		return nil
+	})
+	return pending
+}
+
 // --- bounded growth (simulation-testing.md §8.3) ------------------------------------------------
 
 // simMetaOf reads the page high-water and live page count of the meta slot holding version v.
@@ -1440,15 +1476,21 @@ func simMetaOf(image []byte, ps uint32, v uint64) (pageCount, live uint32, ok bo
 }
 
 // simAllocator is database d's page high-water and free-list length in the running process — the
-// allocator state the next commit draws from.
-func (r *simRunner) simAllocator(d *simDB) (pageCount, free uint32) {
+// allocator state the next commit draws from — and where the free list's trailing run below the
+// high-water starts (the high-water itself when its top page is not free; format.md *Trailing
+// truncation*).
+func (r *simRunner) simAllocator(d *simDB) (pageCount, free, trail uint32) {
 	st, err := r.db.core.withStorage(d.name)
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.pageCount, uint32(len(st.freePages))
+	trail = st.pageCount
+	for n := len(st.freePages); n > 0 && st.freePages[n-1] == trail-1; n-- {
+		trail--
+	}
+	return st.pageCount, uint32(len(st.freePages)), trail
 }
 
 // observeGrowth starts a new bounded-growth lifetime for d (an open, a recovery, a compaction, an
@@ -1456,8 +1498,8 @@ func (r *simRunner) simAllocator(d *simDB) (pageCount, free uint32) {
 // (format.md *Reclamation*), so a file whose dead pages are not all listed is reclaimed only after it
 // doubles.
 func (r *simRunner) observeGrowth(d *simDB) {
-	pc, free := r.simAllocator(d)
-	d.high, d.free, d.lacBound = pc, free, pc-free
+	pc, free, trail := r.simAllocator(d)
+	d.high, d.free, d.trail, d.lacBound = pc, free, trail, pc-free
 	d.last = simGrowth{}
 }
 
@@ -1480,18 +1522,45 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 	if !ok {
 		return
 	}
-	_, free := r.simAllocator(d)
-	var written uint32
+	_, free, trail := r.simAllocator(d)
+	var written, top uint32
 	for pg := range r.fs.files[d.file].pages {
 		if pg >= 2 {
 			written++
+			top = max(top, uint32(pg)+1)
+		}
+	}
+	// Trailing truncation (§8.3): a quiet commit passes the reuse gate, so its tree pages take the
+	// lowest free pages, whatever of the old trailing run they leave is truncated, and every later page
+	// comes from the high-water at the run's start. A commit inside a relaxed batch never lowers the
+	// high-water (validated-cow.md §4), so it only grows it to what it wrote.
+	if quiet && d.batchPending && pc != max(d.high, top) {
+		r.fail(i, "trailing truncation: %s has %d pages after a commit inside a relaxed batch that wrote up to page %d, "+
+			"from %d pages", d.name, pc, top, d.high)
+		return
+	}
+	if quiet && !d.batchPending && pc != max(d.trail, top) {
+		r.fail(i, "trailing truncation: %s has %d pages after a quiet commit that wrote up to page %d, "+
+			"from %d pages whose free list's trailing run began at %d", d.name, pc, top, d.high, d.trail)
+		return
+	}
+	if quiet && pc < d.high && r.relaxed {
+		// The shrink waits for the batch's flush (validated-cow.md §4): checked when the engine next
+		// holds nothing pending (checkShrunk).
+		d.shrinkDue = true
+	} else if quiet && pc < d.high {
+		limit := (int64(pc) + int64(growthStep(pc, r.pageSize))) * int64(r.pageSize)
+		if length := int64(len(r.fs.files[d.file].cache)); length > limit {
+			r.fail(i, "trailing truncation: %s lowered its high-water to %d pages but its file is %d bytes (at most %d)",
+				d.name, pc, length, limit)
+			return
 		}
 	}
 	before := d.last
 	if d.batchOpen {
 		// A commit inside a relaxed batch neither reuses nor frees the batch's pages (validated-cow.md
 		// §4); only the bounds carry forward.
-		d.high, d.free = pc, free
+		d.high, d.free, d.trail = pc, free, trail
 		d.lacBound = max(d.lacBound, live+written)
 		d.last = simGrowth{}
 		return
@@ -1510,9 +1579,47 @@ func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
 			return
 		}
 	}
-	d.high, d.free = pc, free
+	d.high, d.free, d.trail = pc, free, trail
 	d.lacBound = max(d.lacBound, live+written)
 	d.last = simGrowth{reclaimed: reclaimed, high: pc, free: free}
+}
+
+// checkTruncated checks trailing truncation against batched durability (§8.3, validated-cow.md §4).
+// The file never shrinks below the durable floor's high-water: while a relaxed batch is pending the
+// floor is the only generation recovery is sure to find, so a shrink before the flush must not cut its
+// pages. And once the engine holds nothing pending again, a shrink that a relaxed commit deferred has
+// happened: the file is at most one growth step past the published high-water.
+func (r *simRunner) checkTruncated(i int, d *simDB) bool {
+	f := r.fs.files[d.file]
+	if f == nil {
+		return true
+	}
+	length := int64(len(f.cache))
+	if pc, _, ok := simMetaOf(f.cache, r.pageSize, d.floor); ok && int64(pc)*int64(r.pageSize) > length {
+		r.fail(i, "trailing truncation: %s's file is %d bytes, shorter than its durable version %d's %d pages", d.name, length, d.floor, pc)
+		return false
+	}
+	if !d.shrinkDue {
+		return true
+	}
+	if r.fs.dead || r.fs.fired != "" || r.fs.fault != nil {
+		d.shrinkDue = false // a crash or fault may have cut the flush short
+		return true
+	}
+	if !r.engineFlushed(d) {
+		return true
+	}
+	d.shrinkDue = false
+	pc, _, ok := simMetaOf(f.cache, r.pageSize, d.version)
+	if !ok {
+		return true
+	}
+	if limit := (int64(pc) + int64(growthStep(pc, r.pageSize))) * int64(r.pageSize); length > limit {
+		r.fail(i, "trailing truncation: %s flushed a batch that lowered its high-water to %d pages but its file is %d bytes (at most %d)",
+			d.name, pc, length, limit)
+		return false
+	}
+	return true
 }
 
 func (r *simRunner) stepEnd(i int, st simStep) {
@@ -1714,6 +1821,12 @@ func (r *simRunner) stepReopen(i int) bool {
 	for _, pid := range r.livePids() {
 		if err := r.closeProc(pid); err != nil {
 			r.fail(i, "close: %v", err)
+			return false
+		}
+	}
+	// Close flushed every batch, so a shrink a relaxed commit deferred has happened.
+	for _, d := range r.order() {
+		if !r.checkTruncated(i, d) {
 			return false
 		}
 	}

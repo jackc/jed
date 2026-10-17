@@ -266,8 +266,9 @@ sits so the options stay open (CLAUDE.md §9).
   compaction (locking.md §3–§6).
 - **File compaction / shrink (returning space to the OS)** — ✅ **landed (all three cores;
   host API [api.md](api.md) §2.6).** The free-list (above) recycles dead space for *jed*, but it
-  never gives it back: `page_count` is a monotonic high-water (plus the pager.md §7 preallocation
-  slack), so the file is **grow-only** — insert-a-lot-then-delete leaves it at its peak size. (This
+  gives back only free space at the *top* of the file (trailing truncation, below): `page_count`
+  is otherwise a high-water (plus the pager.md §7 preallocation slack), so insert-a-lot-then-delete
+  leaves the file near its peak size. (This
   is the SQLite/PostgreSQL default too — both reuse freed space and shrink only under an explicit
   `VACUUM`.) The host-invoked **`compact(name)`** re-serializes the committed snapshot at `txid + 1`
   through the from-scratch serializer — the **garbage-free packed image** `create` writes
@@ -284,11 +285,21 @@ sits so the options stay open (CLAUDE.md §9).
   keeps every tree node, so later results **and costs** are unchanged. It **needs nothing new at
   the seam** (§2, [hosts.md](hosts.md)) beyond the host's atomic rename — which is why the OPFS host
   is `0A000` for now. An in-memory database compacts by replacing its `MemoryBlockStore` with the
-  image. A lighter **in-place trailing-free truncation** — lower `page_count` and `set_size` down
-  when the top pages `[k, page_count)` are all free (the PG-plain-`VACUUM` /
-  SQLite-`incremental_vacuum` flavor) — stays open as a cheaper *partial* complement: no rewrite,
-  but it reclaims only *trailing* free space and must be sequenced against the two-meta-slot
-  fallback (§4/§7) and the watermark. Tracked in [../../TODO.md](../../TODO.md).
+  image.
+- **In-place trailing-free truncation** — ✅ **landed (all three cores; no format bump).** The
+  lighter, automatic complement to compaction (the PG-plain-`VACUUM` / SQLite-`incremental_vacuum`
+  flavor): a file commit whose top pages `[k, page_count)` are all on the persisted free list
+  lowers `page_count` to `k` and, after its final barrier, shortens the file to `k` plus one
+  preallocation step (pager.md §7). No rewrite and no host call; it reclaims only *trailing* space
+  the free list already holds, so interior dead pages still need `compact`. It is sequenced against
+  the two-meta-slot fallback (only pages dead at the fallback are truncated, the shrink follows the
+  barrier), the watermark (it uses the free-list reuse gate), validated-COW recovery (a truncated
+  page is in no manifest), the live page count (unchanged: the pages were dead), and the page
+  service (owner only; a client's delta never shrinks the high-water), and batched durability
+  (under `synchronous = off` only a batch's first commit lowers the high-water and the file is
+  shortened at the flush, validated-cow.md §4). Bytes:
+  [../fileformat/format.md](../fileformat/format.md) *Trailing truncation*. A per-commit
+  truncation does not fight preallocation because the shrink keeps one growth step of slack.
 - **Buffer pool / demand paging** — ✅ **landed (P6.4)** ([pager.md](pager.md)). The resident
   set is a **bounded cache of pages** with eviction instead of the whole file (CLAUDE.md §9), so
   a database far larger than RAM is served by paging the working set in on demand through the

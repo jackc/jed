@@ -6,7 +6,7 @@
 // and Rust cores becomes a run-to-run byte-identity check here.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -278,5 +278,68 @@ test("the engine adopts a service flush through the shared batch state", () => {
     assert.ok(paging.pendingEntries().length <= manifestInlineCapacity(4096));
   } finally {
     db.close();
+  }
+});
+
+// Trailing truncation under synchronous = off (validated-cow.md §4, format.md *Trailing truncation*):
+// only a commit that begins with nothing pending lowers the high-water, and the file is shortened only
+// at the barrier that makes the lowering generation durable — the batch's cap flush or close — never
+// while the batch is pending. A table dropped at the top of the file leaves a long free run there once
+// a flush lets reclamation list its pages; until then the relaxed churn grows the file past it.
+// Mirrors the Go TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff.
+test("relaxed trailing truncation waits for the flush", () => {
+  const PAGE = 4096;
+  const growthStep = (pages: number) =>
+    Math.min((1024 * 1024) / PAGE, Math.max((16 * 1024) / PAGE, pages));
+  const path = join(dir, "truncate.jed");
+  const seed = createDatabase({ path, pageSize: PAGE, skipFsync: true, locking: "none" });
+  seed.execute("CREATE TABLE t (id i64 PRIMARY KEY, pad text, n i64)");
+  seed.execute("INSERT INTO t SELECT g, repeat('x', 300), g % 7 FROM generate_series(1, 100) g");
+  seed.execute("CREATE TABLE big (id i64 PRIMARY KEY, pad text)");
+  seed.execute("INSERT INTO big SELECT g, repeat('z', 300) FROM generate_series(1, 20000) g");
+  seed.close();
+  const db = openDatabase(path, { synchronous: "off", skipFsync: true, locking: "none" });
+  const length = () => statSync(path).size;
+  const state = () => {
+    const st = storage(db);
+    return { pc: st.pageCount, pending: st.paging!.hasPending() };
+  };
+  let peak = state().pc;
+  db.execute("DROP TABLE big");
+  let deferred = false;
+  for (let k = 0; k < 1500; k++) {
+    const before = length();
+    const { pc: high, pending: pendingBefore } = state();
+    db.execute(
+      `UPDATE t SET pad = 'r${k}' || repeat('y', 200), n = n + 7 WHERE id = ${1 + (k % 100)}`,
+    );
+    const now = length();
+    const { pc, pending } = state();
+    peak = Math.max(peak, pc);
+    assert.ok(
+      !(pendingBefore && pc < high),
+      `commit ${k} lowered the high-water from ${high} to ${pc} inside a pending batch`,
+    );
+    assert.ok(
+      !(pending && now < before),
+      `commit ${k} shortened the file from ${before} to ${now} bytes while its batch is pending`,
+    );
+    if (pending && pc < high && now > (pc + growthStep(pc)) * PAGE) deferred = true;
+  }
+  const pc = state().pc;
+  assert.ok(
+    pc * 3 <= peak,
+    `the dropped table's pages are returned: ${peak} pages at the peak, ${pc} after churn`,
+  );
+  assert.ok(deferred, "no relaxed commit lowered the high-water with its shrink left to the flush");
+  db.close();
+  const limit = (pc + growthStep(pc)) * PAGE;
+  assert.ok(length() <= limit, `close left the file ${length()} bytes (at most ${limit})`);
+  const re = openDatabase(path, { locking: "none" });
+  try {
+    assert.equal(re.pageCount, pc);
+    assert.equal(re.get("SELECT count(*) AS n FROM t")?.n, 100n);
+  } finally {
+    re.close();
   }
 });

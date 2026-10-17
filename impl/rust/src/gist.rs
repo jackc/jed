@@ -552,18 +552,39 @@ where
     A: FnMut() -> u32,
 {
     let mut pages = Vec::new();
-    let root = serialize_node(&tree.root, ops, &mut pages, alloc);
+    let root = serialize_tree_to(tree, ops, alloc, &mut |p| {
+        pages.push(p);
+        Ok(())
+    })
+    .expect("collecting pages cannot fail");
     (pages, root)
 }
 
-fn serialize_node<A>(
-    node: &GistNode,
+/// [`serialize_tree`], handing each page to `emit` as soon as it is encoded (the same pages, in the
+/// same order), so a caller that writes pages out — host compaction's image stream — never holds the
+/// index's pages at once. Returns the root page, or `emit`'s first error.
+pub fn serialize_tree_to<A, E>(
+    tree: &GistTree,
     ops: &[GistOpclass],
-    pages: &mut Vec<GistPage>,
     alloc: &mut A,
-) -> u32
+    emit: &mut E,
+) -> Result<u32>
 where
     A: FnMut() -> u32,
+    E: FnMut(GistPage) -> Result<()>,
+{
+    serialize_node(&tree.root, ops, alloc, emit)
+}
+
+fn serialize_node<A, E>(
+    node: &GistNode,
+    ops: &[GistOpclass],
+    alloc: &mut A,
+    emit: &mut E,
+) -> Result<u32>
+where
+    A: FnMut() -> u32,
+    E: FnMut(GistPage) -> Result<()>,
 {
     match node {
         GistNode::Leaf(entries) => {
@@ -576,20 +597,20 @@ where
                 payload.extend_from_slice(&e.skey);
             }
             let page_no = alloc();
-            pages.push(GistPage {
+            emit(GistPage {
                 page_no,
                 page_type: PAGE_GIST_LEAF,
                 item_count: entries.len() as u32,
                 payload,
-            });
-            page_no
+            })?;
+            Ok(page_no)
         }
         GistNode::Interior(children) => {
             // Children first (post-order), in the node's canonical entry order.
-            let child_pages: Vec<u32> = children
-                .iter()
-                .map(|c| serialize_node(&c.node, ops, pages, alloc))
-                .collect();
+            let mut child_pages = Vec::with_capacity(children.len());
+            for c in children {
+                child_pages.push(serialize_node(&c.node, ops, alloc, emit)?);
+            }
             let mut payload = Vec::new();
             for (c, cp) in children.iter().zip(child_pages.iter()) {
                 let b = encode_bound(ops, &c.bound);
@@ -598,13 +619,13 @@ where
                 payload.extend_from_slice(&cp.to_be_bytes());
             }
             let page_no = alloc();
-            pages.push(GistPage {
+            emit(GistPage {
                 page_no,
                 page_type: PAGE_GIST_INTERIOR,
                 item_count: children.len() as u32,
                 payload,
-            });
-            page_no
+            })?;
+            Ok(page_no)
         }
     }
 }

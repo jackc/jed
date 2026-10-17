@@ -332,15 +332,18 @@ func (st *storage) awaitFlush() error {
 }
 
 // flush makes every pending commit durable (validated-cow.md §4): close, detach, ownership release, and
-// a page client's begin_write. Caller holds st.mu.
-func (st *storage) flush() error {
+// a page client's begin_write. shrink is false only for the begin_write flush, which leaves a
+// pending trailing-truncation shrink to the owner's next barrier: the Node core runs that flush on its
+// service worker, outside the engine's pager, so every core does the same and file lengths agree
+// (format.md *Trailing truncation*). Caller holds st.mu.
+func (st *storage) flush(shrink bool) error {
 	if err := st.awaitFlush(); err != nil {
 		return err
 	}
 	if st.paging == nil {
 		return nil
 	}
-	return st.paging.withPager(func(p *pager) error { return p.flushPending() })
+	return st.paging.withPager(func(p *pager) error { return p.flushPending(shrink) })
 }
 
 // startCapFlush ends a batch that reached the cap: the flush runs on its own goroutine (or inline for
@@ -365,7 +368,7 @@ func (st *storage) startCapFlush() {
 // ("fsyncgate"), so pages the published snapshot needs could now read stale: the storage is revoked,
 // and every later read, commit, and close fails 58030 until the database is reopened through recovery.
 func capFlush(paging *sharedPaging) error {
-	err := paging.withPager(func(p *pager) error { return p.flushPending() })
+	err := paging.withPager(func(p *pager) error { return p.flushPending(true) })
 	if err != nil {
 		paging.revoke(newError(IoError, "a deferred durability flush failed; reopen the database: "+err.Error()))
 	}
@@ -662,7 +665,11 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	relaxed := st.relaxedFile()
 	var pending []manifestEntry
 	_ = st.paging.withPager(func(p *pager) error { pending = p.pendingEntries(); return nil })
-	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, live.live, pending, allowed)
+	// Only the file's owner lowers the high-water, and only against a durable floor: a page client's
+	// delta never shrinks it, and a commit inside a relaxed batch may not cut pages the floor's batch
+	// has yet to make durable (format.md *Trailing truncation*, validated-cow.md §4).
+	truncate := !st.serviceClient && len(pending) == 0
+	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed)
 	if err != nil {
 		return err
 	}
@@ -690,6 +697,10 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 			}
 		}
 		p.finishValidatedCommit(plan.meta, slot, !relaxed, plan.dirty)
+		// Trailing truncation lowered the high-water: shorten the file once the new meta is durable —
+		// now under synchronous = on, at the batch's flush under synchronous = off — keeping one growth
+		// step of slack (pager.md §7).
+		p.settleTruncation(plan.pageCount, plan.pageCount < st.pageCount, !relaxed)
 		capReached = relaxed && p.batchCapReached()
 		return nil
 	}); err != nil {
@@ -880,6 +891,13 @@ func (st *storage) precheckBudget(snap *snapshot, reuse bool, budget *budgetCtx)
 	return nil
 }
 
+// endsFree reports whether the free list holds the page just below the high-water, so a commit that
+// may reuse it truncates the file (format.md *Trailing truncation*). Caller holds the writer gate.
+func (st *storage) endsFree() bool {
+	n := len(st.freePages)
+	return n > 0 && st.freePages[n-1] == st.pageCount-1
+}
+
 // storageBytes is the committed-storage measure: an in-memory domain's logical high-water times the
 // page size (memory.md §8.2), a file-backed domain's live pages times the page size (§8.7).
 func (st *storage) storageBytes() int64 {
@@ -957,7 +975,7 @@ func (st *storage) close() error {
 	// A relaxed domain's pending commits become durable before the file is released (validated-cow.md
 	// §4); a failed flush is what close reports.
 	st.mu.Lock()
-	ferr := st.flush()
+	ferr := st.flush(true)
 	st.mu.Unlock()
 	if err := st.paging.close(); err != nil && ferr == nil {
 		ferr = err

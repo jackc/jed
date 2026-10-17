@@ -38,6 +38,15 @@ fn prealloc_chunk_pages(page_size: u32) -> u32 {
     (PREALLOC_CHUNK_BYTES / page_size.max(1)).max(1)
 }
 
+/// The pages [`Pager::reserve`] adds in one step growing from `pages`: the current size, clamped to
+/// the preallocation floor and cap (pager.md §7).
+pub(crate) fn growth_step(pages: u32, page_size: u32) -> u32 {
+    pages.clamp(
+        prealloc_floor_pages(page_size),
+        prealloc_chunk_pages(page_size),
+    )
+}
+
 /// The preallocation **floor** in **pages** for a file of `page_size` bytes: `max(1, 16 KiB /
 /// page_size)`. Always `≤ prealloc_chunk_pages` (16 KiB ≤ 1 MiB), so the clamp in [`Pager::reserve`]
 /// is well-formed.
@@ -74,6 +83,11 @@ pub(crate) struct Pager {
     /// after the floor, by page id — what a pending commit's manifest lists besides its own pages.
     /// Empty under synchronous = on.
     pending: BTreeMap<u32, u64>,
+    /// Set when a commit of the current batch lowered the high-water (format.md *Trailing
+    /// truncation*) and the file has not been shortened yet: the shrink waits for the barrier that
+    /// makes the newest generation durable. `shrink_pages` is that newest generation's high-water.
+    shrink_pending: bool,
+    shrink_pages: u32,
     /// The armed one-shot commit fault — the **fault-injection seam** (spec/design/storage.md §7),
     /// `#[cfg(test)]` so it is **entirely absent from a production build** (zero footprint). `None`
     /// unless a test armed one with [`arm_fault`](Pager::arm_fault).
@@ -154,6 +168,8 @@ impl Pager {
             trust_meta: false,
             floor_slot: 0,
             pending: BTreeMap::new(),
+            shrink_pending: false,
+            shrink_pages: 0,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
@@ -361,8 +377,11 @@ impl Pager {
 
     /// A flush (validated-cow.md §4): one durable barrier makes every pending commit durable, so
     /// the newest meta — in the non-floor slot — becomes the floor. A failed barrier poisons the
-    /// pager ([`sync`](Pager::sync)), so the next commit reports it.
-    pub(crate) fn flush_pending(&mut self) -> Result<()> {
+    /// pager ([`sync`](Pager::sync)), so the next commit reports it. `shrink` lets a flush that
+    /// follows a lowering commit shorten the file ([`settle_truncation`](Pager::settle_truncation)); a
+    /// page client's `begin_write` flush passes `false` and leaves the shrink to the owner's next
+    /// barrier (format.md *Trailing truncation*).
+    pub(crate) fn flush_pending(&mut self, shrink: bool) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -375,6 +394,9 @@ impl Pager {
         self.sync()?;
         self.floor_slot ^= 1;
         self.pending.clear();
+        if shrink {
+            self.shrink_after_barrier();
+        }
         Ok(())
     }
 
@@ -504,6 +526,48 @@ impl Pager {
         }
         self.allocated_pages = target;
         Ok(())
+    }
+
+    /// Shorten the file after a commit lowered the committed high-water to `page_count` (format.md
+    /// *Trailing truncation*): a file longer than `page_count` plus one growth step — the step
+    /// [`reserve`](Pager::reserve) would add growing from `page_count` — is cut to exactly that, so the
+    /// next growth after a shrink is already allocated (pager.md §7). Best effort: the commit is
+    /// already durable, so a failed shrink leaves the file longer and the allocation high-water
+    /// unchanged, which is harmless. Shrinking needs no barrier (hosts.md §2.1).
+    pub(crate) fn trim_slack(&mut self, page_count: u32) {
+        let target = page_count.saturating_add(growth_step(page_count, self.page_size));
+        if self.allocated_pages <= target {
+            return;
+        }
+        if self
+            .store
+            .set_size(target as u64 * self.page_size as u64)
+            .is_ok()
+        {
+            self.allocated_pages = target;
+        }
+    }
+
+    /// Record the high-water `page_count` a commit published. `lowered` is whether the commit
+    /// lowered it (trailing truncation); `durable` is whether the commit's barrier ran. The file is
+    /// shortened only after a barrier that covers the newest generation: at once for a durable
+    /// commit, at the next flush for a relaxed one (validated-cow.md §4), so a shrink never reaches
+    /// the disk while a batch is pending and the floor still needs the pages above the new high-water.
+    pub(crate) fn settle_truncation(&mut self, page_count: u32, lowered: bool, durable: bool) {
+        self.shrink_pending |= lowered;
+        self.shrink_pages = page_count;
+        if durable {
+            self.shrink_after_barrier();
+        }
+    }
+
+    /// Shorten the file to the newest generation's high-water plus one growth step when a commit
+    /// since the last barrier lowered it. Called right after a successful barrier.
+    fn shrink_after_barrier(&mut self) {
+        if self.shrink_pending {
+            self.shrink_pending = false;
+            self.trim_slack(self.shrink_pages);
+        }
     }
 
     /// The host durability barrier. A validated COW commit calls this once after writing its

@@ -253,6 +253,7 @@ export function persistImpl(
   canReclaim?: boolean,
   canReuse = true,
   budget: BudgetCtx | null = null,
+  truncate = true,
 ): IncrementalWrite {
   let allowed: Set<number> | null = null;
   if (db.paging !== null && db.persistHook !== null) {
@@ -279,7 +280,7 @@ export function persistImpl(
   // store (persistHook null) keeps its free-list in RAM.
   if (db.persistHook !== null) {
     const live = admitFile(db, write, budget?.prev ?? db.committed, budget);
-    commitFile(db, snap, write, live, reclaim, canReuse, allowed);
+    commitFile(db, snap, write, live, reclaim, canReuse, allowed, truncate);
   } else commitInMemory(db, snap, write, reclaim);
   return write;
 }
@@ -367,6 +368,7 @@ function commitFile(
   canReclaim: boolean,
   canReuse: boolean,
   allowed: Set<number> | null,
+  truncate: boolean,
 ): void {
   syncDirectoryOnce(db);
   const paging = db.paging!;
@@ -394,6 +396,9 @@ function commitFile(
     canReuse,
     pending,
     allowed,
+    // Only the file's owner lowers the high-water, and only against a durable floor: a commit inside a
+    // relaxed batch may not cut pages the batch has yet to make durable (validated-cow.md §4).
+    truncate && pending.length === 0,
   );
   verifyLiveCount(snap, paging, write, live);
   paging.reserve(plan.newPageCount);
@@ -429,6 +434,10 @@ function commitFile(
   if (!relaxed) paging.sync();
   paging.finishDurableCommit(snap.txid, metaChecksum(meta));
   paging.recordCommit(snap.txid, metaChecksum(meta), slot, !relaxed, dirty);
+  // Trailing truncation lowered the high-water: shorten the file once the new meta is durable — now
+  // under synchronous = on, at the batch's flush under synchronous = off — keeping one growth step of
+  // slack (pager.md §7).
+  paging.settleTruncation(plan.newPageCount, plan.newPageCount < db.pageCount, !relaxed);
   const capReached = relaxed && paging.batchCapReached();
   db.lastCommitMeta = meta;
   db.lastCommitWritten = [...write.pages, ...plan.pages, ...manifest.pages].map((pg) => pg.index);

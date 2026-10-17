@@ -348,7 +348,7 @@ pub(crate) struct Storage {
 /// revoked, and every later read, commit, and close fails `58030` until the database is reopened
 /// through recovery.
 fn cap_flush(paging: &crate::paging::SharedPaging) -> Result<()> {
-    let result = paging.pager().flush_pending();
+    let result = paging.pager().flush_pending(true);
     if let Err(e) = &result {
         paging.revoke(EngineError::new(
             SqlState::IoError,
@@ -724,6 +724,13 @@ impl Storage {
         Ok(())
     }
 
+    /// Whether the free list holds the page just below the high-water, so a commit that may reuse it
+    /// truncates the file (format.md *Trailing truncation*).
+    #[cfg(unix)]
+    pub(crate) fn ends_free(&self) -> bool {
+        self.free_pages.last() == Some(&self.page_count.wrapping_sub(1))
+    }
+
     /// The committed-storage measure: an in-memory domain's logical high-water times the page size
     /// (memory.md §8.2), a file-backed domain's live pages times the page size (§8.7).
     pub(crate) fn storage_bytes(&self) -> i64 {
@@ -753,7 +760,17 @@ impl Storage {
     /// and a page client's `begin_write`.
     pub(crate) fn flush(&mut self) -> Result<()> {
         self.await_flush()?;
-        self.paging.pager().flush_pending()
+        self.paging.pager().flush_pending(true)
+    }
+
+    /// The owner's flush before granting a page client's `begin_write`: like [`flush`](Storage::flush),
+    /// but a pending trailing-truncation shrink waits for the owner's next barrier. The Node core runs this
+    /// flush on its service worker, outside the engine's pager, so every core leaves the shrink to the
+    /// owner and file lengths agree (format.md *Trailing truncation*).
+    #[cfg(unix)]
+    pub(crate) fn flush_for_client(&mut self) -> Result<()> {
+        self.await_flush()?;
+        self.paging.pager().flush_pending(false)
     }
 
     /// End a batch that reached the cap: the flush runs on its own thread (or inline for the
@@ -814,6 +831,13 @@ impl Storage {
     /// Whether this domain holds no relaxed commit pending a flush — no pending set, no adopted
     /// generation awaiting stabilization, no failed barrier, no flush in flight — so its published
     /// version is the one it treats as durable (the simulator's floor rule).
+    /// Whether this storage holds a non-empty pending set — a relaxed batch not yet flushed
+    /// (validated-cow.md §4), inside which a commit may not lower the high-water.
+    #[cfg(feature = "sim")]
+    pub(crate) fn engine_pending(&self) -> bool {
+        self.paging.pager().has_pending()
+    }
+
     #[cfg(feature = "sim")]
     pub(crate) fn engine_flushed(&self) -> bool {
         let pager = self.paging.pager();
@@ -938,6 +962,10 @@ impl Storage {
             ps,
             can_reclaim,
             can_reuse,
+            // Only the file's owner lowers the high-water, and only against a durable floor: a page
+            // client's delta never shrinks it, and a commit inside a relaxed batch may not cut pages the
+            // batch has yet to make durable (format.md *Trailing truncation*, validated-cow.md §4).
+            !self.service_client && pending.is_empty(),
             live.live,
             &pending,
             allowed,
@@ -957,6 +985,10 @@ impl Storage {
                 pager.sync()?;
             }
             pager.finish_commit(&plan.meta, slot, !relaxed, &plan.dirty);
+            // Trailing truncation lowered the high-water: shorten the file once the new meta is
+            // durable — now under synchronous = on, at the batch's flush under synchronous = off —
+            // keeping one growth step of slack (pager.md §7).
+            pager.settle_truncation(plan.page_count, plan.page_count < self.page_count, !relaxed);
             relaxed && pager.batch_cap_reached()
         };
         // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
@@ -1390,7 +1422,7 @@ impl Shared {
         self.storage
             .lock()
             .expect("storage lock not poisoned")
-            .flush()
+            .flush_for_client()
     }
 
     /// End an owner-pager commit a client delta began but will never finish (an abort, a rejected
@@ -1510,7 +1542,9 @@ impl Shared {
     /// The owner-only free-list rebuild after a client commit (page-service.md §6): a client commit
     /// never walks the database, so when the pages off the free list pass the reclamation threshold and no pin
     /// holds back reclamation, the owner commits the unchanged snapshot at the next txid with
-    /// in-commit reclamation. Called holding the gate, after the catalog adoption.
+    /// in-commit reclamation. A client commit never lowers the high-water either, so the owner also
+    /// commits when the free list ends at the high-water, and that commit truncates it (format.md
+    /// *Trailing truncation*). Called holding the gate, after the catalog adoption.
     #[cfg(unix)]
     pub(crate) fn maintenance_commit(&self, owner: &crate::pageservice::owner::PageServiceOwner) {
         let Some(role) = self.current_role() else {
@@ -1538,7 +1572,8 @@ impl Shared {
                 st.page_count,
                 st.free_pages.len(),
                 st.live_at_compaction,
-            ))
+            )
+            || st.ends_free())
         {
             return;
         }
@@ -4262,6 +4297,26 @@ impl Database {
             .inline_flush = true;
     }
 
+    /// Whether the process holds a relaxed batch pending on database `name` (the simulator's
+    /// trailing-truncation check, validated-cow.md §4).
+    #[cfg(feature = "sim")]
+    pub(crate) fn sim_engine_pending(&self, name: &str) -> bool {
+        if name == "main" {
+            return self
+                .0
+                .storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .engine_pending();
+        }
+        self.0
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned")
+            .get(name)
+            .is_some_and(|a| a.storage.engine_pending())
+    }
+
     /// Whether database `name` (`main` or an attachment) holds no relaxed commit pending a flush
     /// ([`Storage::engine_flushed`]); `false` if there is no such database.
     pub(crate) fn sim_engine_flushed(&self, name: &str) -> bool {
@@ -4293,19 +4348,24 @@ impl Database {
     }
 
     /// Database `name`'s page high-water and in-memory free-list length — the allocator state its
-    /// next commit draws from (`main` or an attachment); `None` if there is no such database.
-    pub(crate) fn sim_allocator(&self, name: &str) -> Option<(u32, u32)> {
+    /// next commit draws from (`main` or an attachment) — and where the free list's trailing run below
+    /// the high-water starts (the high-water when its top page is not free; format.md *Trailing
+    /// truncation*); `None` if there is no such database.
+    pub(crate) fn sim_allocator(&self, name: &str) -> Option<(u32, u32, u32)> {
+        let of = |st: &Storage| {
+            let (_, trail) = crate::format::trailing_run(&st.free_pages, st.page_count);
+            (st.page_count, st.free_pages.len() as u32, trail)
+        };
         if name == "main" {
             let st = self.0.storage.lock().expect("storage lock not poisoned");
-            return Some((st.page_count, st.free_pages.len() as u32));
+            return Some(of(&st));
         }
         let atts = self
             .0
             .attachments
             .lock()
             .expect("attachments lock not poisoned");
-        atts.get(name)
-            .map(|a| (a.storage.page_count, a.storage.free_pages.len() as u32))
+        atts.get(name).map(|a| of(&a.storage))
     }
 }
 

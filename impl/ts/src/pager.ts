@@ -43,6 +43,12 @@ function preallocFloorPages(pageSize: number): number {
   return Math.max(1, Math.floor(PREALLOC_FLOOR_BYTES / Math.max(1, pageSize)));
 }
 
+// growthStep is the pages reserve adds in one step growing from pages: the current size, floored at
+// preallocFloorPages and capped at preallocChunkPages (pager.md §7).
+export function growthStep(pages: number, pageSize: number): number {
+  return Math.min(preallocChunkPages(pageSize), Math.max(preallocFloorPages(pageSize), pages));
+}
+
 // FaultPoint selects a point in the commit write sequence at which the fault-injection seam
 // (spec/design/storage.md §7) simulates a crash. Pages 0/1 are always the meta slots and every
 // body/catalog page is ≥ 2 (format.md), so "meta_write" is identified by the page index, never by
@@ -118,6 +124,11 @@ export class Pager {
   private pending = new Map<number, bigint>();
   private publishedMeta = "";
   private batchMirror: BatchMirror | null = null;
+  // shrinkPending is set when a commit of the current batch lowered the high-water (format.md *Trailing
+  // truncation*) and the file has not been shortened yet: the shrink waits for the barrier that makes
+  // the newest generation durable. shrinkPages is that newest generation's high-water.
+  private shrinkPending = false;
+  private shrinkPages = 0;
 
   private constructor(store: BlockStore, pageSize: number, allocatedPages: number) {
     this.store = store;
@@ -219,6 +230,23 @@ export class Pager {
     }
     this.store.setSize(target * this.pageSize);
     this.allocatedPages = target;
+  }
+
+  // trimSlack shortens the file after a commit lowered the committed high-water to pageCount (format.md
+  // *Trailing truncation*): a file longer than pageCount plus one growth step — the step reserve would
+  // add growing from pageCount — is cut to exactly that, so the next growth after a shrink is already
+  // allocated (pager.md §7). Best effort: the commit is already durable, so a failed shrink leaves the
+  // file longer and the allocation high-water unchanged, which is harmless. Shrinking needs no barrier
+  // (hosts.md §2.1).
+  trimSlack(pageCount: number): void {
+    const target = Math.min(0xffff_ffff, pageCount + growthStep(pageCount, this.pageSize));
+    if (this.allocatedPages <= target) return;
+    try {
+      this.store.setSize(target * this.pageSize);
+      this.allocatedPages = target;
+    } catch {
+      // A failed shrink leaves the file longer; nothing depends on it.
+    }
   }
 
   // Refresh the physical high-water after another process's commit grew the file (a page-service
@@ -359,6 +387,28 @@ export class Pager {
     this.floorSlot ^= 1;
     this.pending.clear();
     this.publishBatch();
+    this.shrinkAfterBarrier();
+  }
+
+  // settleTruncation records the high-water pageCount a commit published. lowered is whether the commit
+  // lowered it (trailing truncation); durable is whether the commit's barrier ran. The file is shortened
+  // only after a barrier that covers the newest generation: at once for a durable commit, at the next
+  // flush for a relaxed one (validated-cow.md §4), so a shrink never reaches the disk while a batch is
+  // pending and the floor still needs the pages above the new high-water. A page service's begin_write
+  // flush (the worker's, outside this pager) shrinks nothing: the shrink waits for the owner's next
+  // barrier, as in every core.
+  settleTruncation(pageCount: number, lowered: boolean, durable: boolean): void {
+    this.shrinkPending ||= lowered;
+    this.shrinkPages = pageCount;
+    if (durable) this.shrinkAfterBarrier();
+  }
+
+  // shrinkAfterBarrier shortens the file to the newest generation's high-water plus one growth step when
+  // a commit since the last barrier lowered it. Called right after a successful barrier.
+  private shrinkAfterBarrier(): void {
+    if (!this.shrinkPending) return;
+    this.shrinkPending = false;
+    this.trimSlack(this.shrinkPages);
   }
 
   // batchFlushed reports whether nothing awaits a barrier: no pending set, no adopted generation awaiting

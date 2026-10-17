@@ -1,0 +1,47 @@
+# Trailing truncation (spec/fileformat/format.md *Trailing truncation*; simulation-testing.md §8.3):
+# bulk inserts grow the file, heavy deletes and drops empty it, and runs of mostly quiet commits let
+# reclamation list the dead top of the file and the following commit cut it off. Readers are rare and
+# short, since a pinned reader holds truncation back. Crashes and reopens are rare too: each starts a
+# process whose reclamation trigger is seeded with every unlisted page (format.md *Reclamation*), so
+# it waits for the file to double; the armed commit faults still land around commits that lower the
+# high-water and shorten the file. Half the traces run under synchronous = off, where only a commit
+# that begins with nothing pending lowers the high-water and the shrink waits for the batch's flush
+# (validated-cow.md §4).
+
+description = "Grow, empty, and churn a file so commits lower its high-water and shorten it"
+
+synchronous = ["on", "off"]
+page_sizes = [256, 512]
+cache_bytes = [0, 2048]
+steps = 500
+max_tables = 3
+max_rows = 600
+max_readers = 1
+batch = [20, 120]
+
+[weights]
+open_write = 14
+open_read = 1
+close_read = 8
+read_query = 2
+insert = 8
+update = 10
+delete = 12
+upsert = 1
+create_table = 2
+drop_table = 2
+create_index = 1
+drop_index = 1
+add_column = 0
+analyze = 1
+sequence = 0
+invalid = 0
+commit = 16
+rollback = 1
+check = 2
+reopen = 0
+crash_power = 0
+crash_process = 0
+
+[faults]
+commit_fault = 15

@@ -1622,21 +1622,19 @@ impl Snapshot {
                 let r = if idx.kind == IndexKind::Gist {
                     // GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store
                     // (gist.md §4.1). Serialize the canonical tree, allocating from the same counter.
-                    let (gpages, root) = {
-                        let mut alloc = || {
-                            let p = next_index;
-                            next_index += 1;
-                            p
-                        };
-                        serialize_gist_index(self, table, idx, &mut alloc)?
+                    // Each node page streams to the sink as it is encoded, so the image never holds
+                    // an index's pages at once (host compaction's bounded memory, api.md §2.6).
+                    let mut alloc = || {
+                        let p = next_index;
+                        next_index += 1;
+                        p
                     };
-                    for p in gpages {
+                    serialize_gist_index(self, table, idx, &mut alloc, &mut |p| {
                         if p.payload.len() > cap {
                             return Err(corrupt("GiST node overflows its page"));
                         }
-                        body.page(p.page_no, p.page_type, p.item_count, 0, &p.payload)?;
-                    }
-                    root
+                        body.page(p.page_no, p.page_type, p.item_count, 0, &p.payload)
+                    })?
                 } else {
                     let istore = self.index_store(&idx.name.to_string());
                     match istore.tree_root() {
@@ -2165,23 +2163,20 @@ impl Snapshot {
                 let r = if idx.kind == IndexKind::Gist {
                     // GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from
                     // the allocator (free-list first), the old tree's pages reclaimed on the next open.
-                    let (gpages, root) = {
-                        let mut a = || alloc.take();
-                        serialize_gist_index(self, table, idx, &mut a)?
-                    };
-                    gist_pages += gpages.len() as u32;
-                    for p in gpages {
+                    let mut a = || alloc.take();
+                    serialize_gist_index(self, table, idx, &mut a, &mut |p| {
                         // A tree rebuilt from valid leaf keys always fits; an oversized node means
                         // the loaded keys were corrupt.
                         if p.payload.len() > cap {
                             return Err(corrupt("GiST node overflows its page"));
                         }
+                        gist_pages += 1;
                         pages.push((
                             p.page_no,
                             make_page(ps, p.page_type, p.item_count, 0, &p.payload),
                         ));
-                    }
-                    root
+                        Ok(())
+                    })?
                 } else {
                     let istore = self.index_store(&idx.name.to_string());
                     match istore.tree_root() {
@@ -3058,6 +3053,7 @@ pub(crate) fn plan_free_list(
     ps: usize,
     can_reclaim: bool,
     can_reuse: bool,
+    truncate: bool,
     live_pages: u32,
     pending: &[(u32, u64)],
     allowed: Option<&HashSet<u32>>,
@@ -3068,7 +3064,7 @@ pub(crate) fn plan_free_list(
     let compact = can_reclaim
         && (live_at_compaction == 0
             || reclaim_due(page_count, free_remaining.len(), live_at_compaction));
-    let (persist_list, new_live, new_gen) = if compact {
+    let (mut persist_list, new_live, new_gen) = if compact {
         let mut reached = reachable_pages(snap, paging, cat_root)?;
         for (index, _) in written {
             reached.insert(*index);
@@ -3093,7 +3089,7 @@ pub(crate) fn plan_free_list(
     // the same hazard as data-page reuse. When the watermark defers reuse the chain must grow the
     // high-water instead (empty `safe`), exactly as the data allocator does.
     let filtered: Vec<u32>;
-    let safe: &[u32] = match (can_reuse, allowed) {
+    let mut safe: &[u32] = match (can_reuse, allowed) {
         (false, _) => &[],
         (true, None) => free_remaining,
         // A pending batch reuses only pages free at its floor (validated-cow.md §4 rule 3).
@@ -3106,9 +3102,22 @@ pub(crate) fn plan_free_list(
             &filtered
         }
     };
+    // Trailing truncation (format.md *Trailing truncation*): the safe pages that run up to the
+    // high-water leave both lists, and the high-water starts below them. Only the file's owner (or an
+    // alone process) truncates, and only against a durable floor (nothing pending, validated-cow.md
+    // §4); a page client's delta never shrinks the high-water.
+    let mut base = page_count;
+    if truncate {
+        let (below, k) = trailing_run(safe, page_count);
+        if k < page_count {
+            safe = below;
+            base = k;
+            persist_list.retain(|&p| p < k);
+        }
+    }
     let mut n = 0;
     loop {
-        let mut next = page_count;
+        let mut next = base;
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
             ids.push(if let Some(id) = safe.get(i) {
@@ -3162,6 +3171,19 @@ pub(crate) fn plan_free_list(
             dirty,
         });
     }
+}
+
+/// Split the sorted safe free pages at the start `k` of their trailing run below the high-water: every
+/// page in `[k, high)` is in `safe` (format.md *Trailing truncation*). Returns the pages below `k` and
+/// `k`; `k == high` when page `high − 1` is not safe.
+pub(crate) fn trailing_run(safe: &[u32], high: u32) -> (&[u32], u32) {
+    let mut k = high;
+    let mut n = safe.len();
+    while n > 0 && safe[n - 1] == k - 1 {
+        n -= 1;
+        k -= 1;
+    }
+    (&safe[..n], k)
 }
 
 pub(crate) struct CommitPlan {
@@ -3360,12 +3382,17 @@ fn read_separators(payload: &[u8], pos: &mut usize, n: usize) -> Result<Vec<Vec<
 /// page numbers (a counter for the whole image, the free-list allocator for an incremental commit).
 /// Returns the node pages + the root page; an empty index returns no pages and root `0` (the
 /// empty-index convention shared with ordinary indexes).
-fn serialize_gist_index<A: FnMut() -> u32>(
+fn serialize_gist_index<A, E>(
     snap: &Snapshot,
     table: &Table,
     idx: &IndexDef,
     alloc: &mut A,
-) -> Result<(Vec<crate::gist::GistPage>, u32)> {
+    emit: &mut E,
+) -> Result<u32>
+where
+    A: FnMut() -> u32,
+    E: FnMut(crate::gist::GistPage) -> Result<()>,
+{
     // One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per `WITH`
     // column for an EXCLUDE backing index.
     let ops: Vec<crate::gist::GistOpclass> = idx
@@ -3377,10 +3404,11 @@ fn serialize_gist_index<A: FnMut() -> u32>(
     let istore = snap.index_store(&idx.name.to_string());
     let keys: Vec<Vec<u8>> = istore.iter_entries()?.into_iter().map(|(k, _)| k).collect();
     if keys.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok(0);
     }
     let tree = crate::gist::build_from_leaf_keys(&ops, keys.iter().map(|k| k.as_slice()))?;
-    Ok(crate::gist::serialize_tree(&tree, &ops, alloc))
+    drop(keys); // the tree holds every entry now; free the key copies before encoding pages
+    crate::gist::serialize_tree_to(&tree, &ops, alloc, emit)
 }
 
 /// Walk a persisted GiST R-tree (rooted at `root`, page types 5/6 — spec/design/gist.md §4.1),

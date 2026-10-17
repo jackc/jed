@@ -1750,9 +1750,10 @@ the new one no longer does. Two mechanisms recover them; through v24 only the fi
   high-water: a commit rebuilds when that count, taken after its own tree and catalog pages are
   allocated, exceeds both `compact_min_pages` and `compact_growth × L`, where `L` is the live count
   the last rebuild found (seeded at open with `page_count − |free-list|`; the constants are
-  `[reclamation]` in `spec/cost/schedule.toml`). The high-water never shrinks (nothing truncates
-  the file), so a trigger on `page_count` alone would, once a file first passed `2 × L`, stay true
-  and walk the whole database on every later commit. Measured off the list, a rebuild returns the
+  `[reclamation]` in `spec/cost/schedule.toml`). The high-water shrinks only by *Trailing
+  truncation* below, which takes pages off the list and the high-water together, so a trigger on
+  `page_count` alone would, once a file first passed `2 × L`, stay true and walk the whole
+  database on every later commit. Measured off the list, a rebuild returns the
   count to `L`, the next one waits until about `L` more dead pages have accumulated, and the
   rebuild is amortized O(height)/commit. The file grows only when the free-list is empty, when
   every page below the high-water is off the list, so `page_count` stays within about `2 ×` the
@@ -1776,6 +1777,64 @@ This is what makes the watermark load-bearing (through v24 the reconstruct-on-op
 already dead at open, so the gate held trivially). Paired with **atomic pin registration** (a reader
 loads the committed root and registers its pin under one lock, and publish takes the same lock) so the
 watermark can never miss a reader mid-registration.
+
+### Trailing truncation
+
+A file commit also lowers the high-water when the top of the file is free (the SQLite
+`incremental_vacuum` / PostgreSQL plain-`VACUUM` flavor, without a rewrite). After step 1 has
+allocated the commit's tree, GiST, and catalog pages, let `H` be the high-water and `S` the
+**safe** free pages that remain: the persisted free-list entries the commit did not consume, all
+dead at the fallback snapshot. The **trailing run** is the largest `[k, H)` with every page in `S`.
+When it is non-empty, the commit plans its free-list and manifest pages (validated-cow.md §2) with
+`[k, H)` removed from both the candidate list and `S`, and with the high-water starting at `k`; a
+page it then draws from the high-water lands back in `[k, H)`, which is safe, or beyond `H`. The
+meta records the resulting high-water, at most `H`, and those pages are no longer free, live, or
+written: they are past `page_count`. The run is empty, and the commit unchanged, when:
+
+- reuse is gated off (`oldest_live_txid < free_gen_txid`, *The watermark* above): `S` is then empty,
+  because a page dead at the free-list's generation may still be reachable from a live reader's
+  version;
+- the commit is a page client's planned `CommitDelta`: only the owner lowers the high-water
+  ([../design/page-service.md](../design/page-service.md) §6), and an owner rejects a delta whose
+  page count shrinks;
+- the store is in memory or a session-local temp domain (no file to shorten; `storage_bytes` of an
+  in-memory database is its high-water and stays as it was).
+- the commit begins inside a relaxed batch: under `synchronous = off` a commit whose pending set is
+  non-empty ([../design/validated-cow.md](../design/validated-cow.md) §4) never lowers the
+  high-water. Only a commit that begins with nothing pending — the first of a batch, which plans
+  against a durable floor exactly as a `synchronous = on` commit does — truncates, and its `S` is the
+  floor's own free list, so a truncated page is free at the floor and on no pending page. Later
+  commits of the batch draw from the lowered high-water, which hands out only those pages.
+
+Only pages of `S` are truncated, never this commit's own orphans (still reachable from the
+fallback), so a reclamation rebuild's newly freed top pages are truncated by the **next** commit,
+once they are on the persisted list. Every truncated page is dead at the new and the fallback
+snapshot and listed in no manifest, so recovery (either slot) never reads it, and a later commit
+that grows the file again writes each page before anything references it. The rule is a pure
+function of the committed state, identical in every core.
+
+After the commit's final `sync()`, the file is shortened. The host keeps one growth step of
+preallocation ([../design/pager.md](../design/pager.md) §7): with `P` the new high-water and
+`step(P) = clamp(P, floor, cap)` the step `reserve` would add growing from `P`, a file longer than
+`P + step(P)` pages is cut to exactly that by `set_size`, only on a commit that lowered the
+high-water. The shrink must follow the barrier: open skips a meta slot whose `page_count` exceeds
+the file's length, so the shortened file can retire the fallback slot, and only a durable new
+generation may replace it. A crash before the shrink leaves only unreferenced slack.
+A failed shrink leaves the file longer and is not an error: the commit is already durable. A file's
+bytes past `page_count` (zeros, or stale pages the shrink kept) are never read.
+
+Under `synchronous = off` the shrink waits for the barrier that makes the lowering generation
+durable ([../design/validated-cow.md](../design/validated-cow.md) §4). A relaxed commit that lowers
+the high-water records it and returns without a barrier, so the file keeps its length while the
+batch is pending: the floor, the one generation a crash is sure to recover, may still need pages at
+or above the new `page_count`, and cutting them would leave no usable meta slot. The next flush that
+covers the newest generation — the batch cap's flush, `close`, detaching the attachment, an
+ownership release — shortens the file to `P + step(P)`, with `P` the newest generation's high-water
+(the batch's later commits may have grown it again). The page service's flush before granting a
+client's `begin_write` shrinks nothing, in every core: in the Node core it runs on the service
+worker, outside the engine's pager. The shrink then waits for the owner's next barrier that covers a
+commit of its own; a client's commit never shrinks the file. A crash, a failed flush, or compaction
+drops a shrink still waiting, leaving only unreferenced slack.
 
 **From-scratch image (`to_image`).** A clean, garbage-free image of a snapshot — used by
 `create`'s initial write, by host compaction (written at the compacted snapshot's `txid + 1`,

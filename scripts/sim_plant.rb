@@ -129,6 +129,39 @@ module SimPlant
       profile: "relaxed",
       edits: [["impl/go/shared.go", "\t\treturn nil\n\t}\n\treturn st.floorFreeFor(true)\n", "\t\treturn nil\n\t}\n\treturn nil\n"]]
     ),
+    # Trailing truncation (format.md *Trailing truncation*): a commit cuts off the free list's top run,
+    # and only the pages the reader watermark lets it reuse.
+    Plant.new(
+      name: "never-truncate",
+      protection: "a commit lowers the high-water past the free list's trailing run (storage.md §6)",
+      profile: "truncation",
+      edits: [["impl/go/validated_commit.go", "\tif truncate {\n", "\tif false && truncate {\n"]]
+    ),
+    # Only pages already on the persisted free list are dead at the fallback; the commit's own orphans
+    # are still the fallback's, so a page drawn from the lowered high-water could overwrite one.
+    Plant.new(
+      name: "truncate-own-orphans",
+      protection: "trailing truncation removes only free pages the fallback snapshot no longer needs (validated-cow.md §2)",
+      profile: "truncation",
+      edits: [["impl/go/validated_commit.go",
+               "safe, k = trailingRun(safe, base)",
+               "_, k = trailingRun(candidates, base)\n\t\tsafe, _ = trailingRun(safe, k)"]]
+    ),
+    # Under synchronous = off the shrink waits for the flush (validated-cow.md §4): a pending batch's
+    # floor still needs the pages above the lowered high-water, and the batch's flush must still shorten
+    # the file. Half the `truncation` traces run relaxed.
+    Plant.new(
+      name: "truncate-in-batch",
+      protection: "a relaxed commit that lowers the high-water shortens the file only after the flush (validated-cow.md §4)",
+      profile: "truncation",
+      edits: [["impl/go/pager.go", "\tif durable {\n\t\tp.shrinkAfterBarrier()\n", "\tif true {\n\t\tp.shrinkAfterBarrier()\n"]]
+    ),
+    Plant.new(
+      name: "flush-never-shrinks",
+      protection: "the flush that ends a relaxed batch shortens a file one of its commits truncated (format.md *Trailing truncation*)",
+      profile: "truncation",
+      edits: [["impl/go/validated_commit.go", "\tif shrink {\n\t\tp.shrinkAfterBarrier()\n", "\tif false && shrink {\n\t\tp.shrinkAfterBarrier()\n"]]
+    ),
   ].freeze
 
   module_function

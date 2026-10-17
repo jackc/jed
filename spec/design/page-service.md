@@ -309,6 +309,16 @@ carry everything required.
   a client's `synchronous` setting does not reach the owner, so the owner treats it as `on`. Close,
   yield, and shutdown flush before ownership moves; a successor after an owner crash stabilizes the
   adopted generation as always (validated-cow.md §3).
+- **Trailing truncation is owner-only too** ([../fileformat/format.md](../fileformat/format.md)
+  *Trailing truncation*). A client's delta never lowers the page count (the owner rejects one that
+  does), so a client plans exactly as before. The owner's own commits truncate as an alone process
+  does, and the post-client-commit maintenance commit also runs when the persisted free list ends at
+  the high-water (its top page is `page_count − 1`) and no pin holds the watermark back, so the space
+  a client's commits leave at the top is returned without waiting for the next rebuild. At most one
+  maintenance commit follows a client commit. Under `synchronous = off` the owner's flush before granting a
+  `begin_write` shrinks nothing, in every core (the Node core runs it on the service worker, outside
+  the engine's pager): a truncation an owner commit deferred waits for the owner's next barrier over a
+  commit of its own ([validated-cow.md](validated-cow.md) §4).
 - **Compaction** is an ordinary owner operation: it requires the owner's watermark drained (now
   including client pins) and the writer gate, and fails `55006` rather than waiting, as today. After
   the rename, clients' next `begin_read` receives "invalidate all"; a pinned client blocks compaction.

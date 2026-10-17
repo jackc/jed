@@ -308,7 +308,7 @@ func (c *sharedCore) releaseOwnership(r *serviceRole, next *serviceRole) {
 	st.mu.Lock()
 	// Pending relaxed commits become durable before ownership moves (page-service.md §6). A failed flush
 	// poisons the pager; the next owner stabilizes whatever it adopts.
-	_ = st.flush()
+	_ = st.flush(true)
 	if st.paging != nil {
 		st.paging.revoke(newError(ConnectionFailure, "this process no longer owns the database"))
 	}

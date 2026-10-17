@@ -301,6 +301,11 @@ impl SimFs {
         self.arena[id].writes
     }
 
+    /// File `id`'s length in bytes, as its process sees it.
+    pub(crate) fn file_len(&self, id: usize) -> u64 {
+        self.arena[id].cache.len() as u64
+    }
+
     /// The distinct pages of file `id` this step wrote.
     pub(crate) fn written_pages(&self, id: usize) -> &BTreeSet<u64> {
         &self.arena[id].pages

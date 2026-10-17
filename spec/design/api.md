@@ -494,8 +494,10 @@ thread-safe pager + watermark-gated reclamation, session.md §2.4); the single-h
 
 ### 2.6 Compaction (`compact`)
 
-The free list ([storage.md](storage.md) §6) lets jed reuse dead pages, but the page high-water never
-goes down, so a file that grew and then shrank logically keeps its peak size. **`compact(name)`**
+The free list ([storage.md](storage.md) §6) lets jed reuse dead pages, and an ordinary commit
+shortens a file whose top pages are free (trailing truncation, format.md *Trailing truncation*), but
+dead pages below the top stay in the file, so a file that grew and then shrank logically stays near
+its peak size. **`compact(name)`**
 gives that space back: it rewrites one database as the garbage-free **from-scratch image** of its
 committed snapshot ([../fileformat/format.md](../fileformat/format.md) *From-scratch image*) and
 replaces the old storage with it. This is the SQLite `VACUUM` / PostgreSQL `VACUUM FULL` flavor:

@@ -82,6 +82,12 @@ export class SharedPaging {
     this.pager.reserve(minPages);
   }
 
+  // settleTruncation records a commit's high-water and shortens the file after the barrier that covers
+  // it (pager.ts settleTruncation).
+  settleTruncation(pageCount: number, lowered: boolean, durable: boolean): void {
+    this.pager.settleTruncation(pageCount, lowered, durable);
+  }
+
   writeBlock(index: number, bytes: Uint8Array): void {
     this.pager.writeBlock(index, bytes);
   }

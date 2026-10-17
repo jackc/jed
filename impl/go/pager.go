@@ -90,6 +90,11 @@ type pager struct {
 	// lists besides its own pages. Empty under synchronous = on.
 	floorSlot uint32
 	pending   map[uint32]uint64
+	// shrinkPending is set when a commit of the current batch lowered the high-water (format.md *Trailing
+	// truncation*) and the file has not been shortened yet: the shrink waits for the barrier that makes
+	// the newest generation durable. shrinkPages is that newest generation's high-water.
+	shrinkPending bool
+	shrinkPages   uint32
 }
 
 // faultPoint selects a point in the commit write sequence at which the fault-injection seam
@@ -270,6 +275,53 @@ func (p *pager) reserve(minPages uint32) (err error) {
 	}
 	p.allocatedPages = target
 	return nil
+}
+
+// trimSlack shortens the file after a commit lowered the committed high-water to pageCount (format.md
+// *Trailing truncation*): a file longer than pageCount plus one growth step — the step reserve would
+// add growing from pageCount — is cut to exactly that, so the next growth after a shrink is already
+// allocated (pager.md §7). Best effort: the commit is already durable, so a failed shrink leaves the
+// file longer and the allocation high-water unchanged, which is harmless. Shrinking needs no barrier
+// (hosts.md §2.1).
+func (p *pager) trimSlack(pageCount uint32) {
+	target := pageCount + growthStep(pageCount, p.pageSize)
+	if target < pageCount { // saturate at the u32 page ceiling
+		target = ^uint32(0)
+	}
+	if p.allocatedPages <= target {
+		return
+	}
+	if err := p.store.setSize(int64(target) * int64(p.pageSize)); err == nil {
+		p.allocatedPages = target
+	}
+}
+
+// settleTruncation records the high-water pageCount a commit published. lowered is whether the commit
+// lowered it (trailing truncation); durable is whether the commit's barrier ran. The file is shortened
+// only after a barrier that covers the newest generation: at once for a durable commit, at the next
+// flush for a relaxed one (validated-cow.md §4), so a shrink never reaches the disk while a batch is
+// pending and the floor still needs the pages above the new high-water.
+func (p *pager) settleTruncation(pageCount uint32, lowered, durable bool) {
+	p.shrinkPending = p.shrinkPending || lowered
+	p.shrinkPages = pageCount
+	if durable {
+		p.shrinkAfterBarrier()
+	}
+}
+
+// shrinkAfterBarrier shortens the file to the newest generation's high-water plus one growth step
+// when a commit since the last barrier lowered it. Called right after a successful barrier.
+func (p *pager) shrinkAfterBarrier() {
+	if p.shrinkPending {
+		p.shrinkPending = false
+		p.trimSlack(p.shrinkPages)
+	}
+}
+
+// growthStep is the pages reserve adds in one step growing from pages: the current size, floored at
+// preallocFloorPages and capped at preallocChunkPages (pager.md §7).
+func growthStep(pages, pageSize uint32) uint32 {
+	return min(max(pages, preallocFloorPages(pageSize)), preallocChunkPages(pageSize))
 }
 
 // sync requests durable completion of all prior writes. A validated-COW commit
