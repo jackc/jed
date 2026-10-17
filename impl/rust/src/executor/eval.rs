@@ -1801,6 +1801,36 @@ impl RExpr {
                 }
                 Ok(best.unwrap_or(Value::Null))
             }),
+            RExpr::NullIf {
+                args,
+                coerce_decimal,
+                widen_float,
+            } => outline(|| {
+                // NULLIF is EAGER (grammar.md §58): charge the node, evaluate `a` then `b` (both,
+                // always — NULLIF(1, 1/0) traps), then compare them as `=` does, charging the same
+                // size-scaled work (decimal_work / varlen_compare). Equal → NULL; otherwise —
+                // including when either side is NULL — the result is `a`.
+                m.charge(COSTS.operator_eval);
+                let a = args[0].eval(row, env, m)?;
+                let b = args[1].eval(row, env, m)?;
+                m.charge(COSTS.decimal_work * ((decimal_cmp_work(&a, &b) - 1) as i64));
+                m.charge(COSTS.varlen_compare * (varlen_compare_work(&a, &b) - 1));
+                m.guard()?;
+                let equal = if *widen_float {
+                    // A mixed-width float pair compares at f64 (the implicit f32 → f64 cast).
+                    let widen = |v: &Value| match v {
+                        Value::Float32(x) => Value::Float64(f64::from(*x)),
+                        other => other.clone(),
+                    };
+                    widen(&a).eq3(&widen(&b))
+                } else {
+                    a.eq3(&b)
+                };
+                if from3(equal).is_true() {
+                    return Ok(Value::Null);
+                }
+                Ok(coerce_case(a, *coerce_decimal))
+            }),
             RExpr::HostFunc {
                 id, args, result, ..
             } => outline(|| {

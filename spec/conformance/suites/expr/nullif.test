@@ -1,0 +1,235 @@
+# NULLIF(a, b) — NULL when a = b, else a (spec/design/grammar.md §58). EAGER — both arguments are
+# evaluated, a first (NULLIF(1, 1/0) traps 22012), so it is NOT a short-circuit exception (cost.md
+# §3). A NULL on either side never matches: NULLIF(NULL, b) is NULL and NULLIF(a, NULL) is a. The
+# pair must be comparable by `=` (json is 42883; a cross-family pair is jed's comparison 42804), and
+# the result takes a's type after PostgreSQL's `=` resolution: an unknown a takes b's type (text when
+# both are NULL), an integer a facing a decimal b is decimal (there is no integer = numeric
+# operator), and every other pair keeps a's type (the integer widths and f32/f64 have cross-type
+# operators). Exactly two arguments (any other count is 42601); a distinct grammar node — not a
+# catalog function — so `nullif` stays usable as a column name. Output name `nullif`.
+# Oracle-checked against PostgreSQL 18. Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.nullif, expr.comparison_value, expr.arithmetic, cast.explicit, error.division_by_zero, types.i16, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, types.date, types.array, types.json, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 10, 'x'), (2, 10, 5, 'y'), (3, NULL, 5, NULL), (4, 7, NULL, 'z'), (5, NULL, NULL, '')
+
+# Equal pair → NULL (row 1); unequal → a (row 2); a NULL on either side never matches, so the result
+# is a (rows 3–5). Leaf arguments charge nothing and an integer equality has no size-scaled work, so
+# NULLIF costs 1 per row (the node) + 5 scan + 5 produced + 1 page = 16.
+# names: nullif
+# types: i32
+# cost: 16
+query I nosort
+SELECT NULLIF(a, b) FROM t ORDER BY id
+----
+NULL
+10
+NULL
+7
+NULL
+
+# The divide-by-zero guard idiom: a zero divisor becomes NULL, so the quotient is NULL, not 22012.
+query I nosort
+SELECT 100 / NULLIF(b - 5, 0) FROM t ORDER BY id
+----
+20
+NULL
+NULL
+NULL
+NULL
+
+# Text: the empty string becomes NULL (row 5); a NULL `s` stays NULL.
+query T nosort
+SELECT NULLIF(s, '') FROM t ORDER BY id
+----
+x
+y
+NULL
+z
+NULL
+
+# NULLIF in WHERE: rows where a and b differ or either is NULL.
+query I rowsort
+SELECT id FROM t WHERE NULLIF(a, b) IS NOT NULL
+----
+2
+4
+
+# --- eager evaluation: both arguments always run ------------------------------------------------
+
+statement error 22012
+SELECT NULLIF(1, 1 / 0)
+
+statement error 22012
+SELECT NULLIF(1 / 0, 1)
+
+# Even when a is NULL, b is still evaluated (NULLIF is not COALESCE).
+statement error 22012
+SELECT NULLIF(a, 1 / 0) FROM t WHERE id = 3
+
+# --- result type: a's type after the = resolution ----------------------------------------------
+
+# Integer widths keep a's width (int2 = int4 and int8 = int4 are cross-type operators).
+# types: i16, i64, i32
+query III nosort
+SELECT NULLIF(1::i16, 2::i32), NULLIF(1::i64, 2::i32), NULLIF(1::i32, 2::i64)
+----
+1
+1
+1
+
+# An integer facing a decimal resolves both to decimal; equality is numeric (1 = 1.0).
+# types: decimal, decimal, decimal
+query DDD nosort
+SELECT NULLIF(1, 1.5), NULLIF(1.5, 1), NULLIF(2, 1)::decimal
+----
+1
+1.5
+2
+
+query D nosort
+SELECT NULLIF(1, 1.0)
+----
+NULL
+
+# A mixed-width float pair compares at f64 but keeps a's width: real 0.1 prints as 0.1.
+# types: f32, f64
+query RR nosort
+SELECT NULLIF(0.1::f32, 0::f64), NULLIF(0.5::f64, 0.25::f32)
+----
+0.1
+0.5
+
+query R nosort
+SELECT NULLIF(0.5::f32, 0.5::f64)
+----
+NULL
+
+# An unknown (NULL) a takes b's type; a NULL b leaves a's type; two NULLs are text.
+# types: i32, i16, text
+query IIT nosort
+SELECT NULLIF(NULL, 1::i32), NULLIF(1::i16, NULL), NULLIF(NULL, NULL)
+----
+NULL
+1
+NULL
+
+# A string literal adapts to its sibling's type, on either side.
+# types: date, date
+query TT nosort
+SELECT NULLIF('2024-01-01', '2024-01-01'::date), NULLIF('2024-01-02'::date, '2024-01-01')
+----
+NULL
+2024-01-02
+
+# types: text
+query T nosort
+SELECT NULLIF('a', 'b')
+----
+a
+
+# Arrays compare element-wise.
+query TT nosort
+SELECT NULLIF(ARRAY[1, 2], ARRAY[1, 2]), NULLIF(ARRAY[1, 2], ARRAY[1, 3])
+----
+NULL
+{1,2}
+
+# --- errors --------------------------------------------------------------------------------------
+
+# Exactly two arguments.
+statement error 42601
+SELECT NULLIF(1)
+
+statement error 42601
+SELECT NULLIF(1, 2, 3)
+
+statement error 42601
+SELECT NULLIF()
+
+# The pair must be comparable by `=`: an integer and a text value are a cross-family pair (42804,
+# the error jed's `1 = 'a'::text` raises; PostgreSQL reports 42883 — oracle_overrides.toml).
+statement error 42804
+SELECT NULLIF(1, 'a'::text)
+
+# json has no equality operator.
+statement error 42883
+SELECT NULLIF('{"a": 1}'::json, '{"a": 1}'::json)
+
+# --- aggregates and grouping -----------------------------------------------------------------------
+
+query I nosort
+SELECT NULLIF(count(a), 3) FROM t
+----
+NULL
+
+query II nosort
+SELECT b, NULLIF(sum(a), 10) FROM t GROUP BY b ORDER BY b
+----
+5
+NULL
+10
+NULL
+NULL
+7
+
+# --- `nullif` stays usable as a column name ----------------------------------------------------
+
+statement ok
+CREATE TABLE kw (id i32 PRIMARY KEY, nullif i32)
+
+statement ok
+INSERT INTO kw VALUES (1, 4), (2, 0)
+
+query II nosort
+SELECT nullif, NULLIF(nullif, 0) FROM kw ORDER BY id
+----
+4
+4
+0
+NULL
+
+# --- NULLIF in a CHECK constraint and an expression DEFAULT ------------------------------------
+
+statement ok
+CREATE TABLE ck (id i32 PRIMARY KEY, a i32, b i32 DEFAULT NULLIF(5, 6), CHECK (NULLIF(a, 0) <> 13))
+
+statement ok
+INSERT INTO ck (id, a) VALUES (1, 0)
+
+query II nosort
+SELECT a, b FROM ck
+----
+0
+5
+
+statement error 23514
+INSERT INTO ck (id, a) VALUES (2, 13)
+
+# --- an expression index on NULLIF matches the same expression in a WHERE ------------------------
+
+statement ok
+CREATE TABLE ei (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO ei VALUES (1, 1), (2, 0), (3, 3), (4, 0), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
+
+# Full scan: every row evaluates the WHERE (1 NULLIF node + 1 compare = 2 per row).
+# cost: 32
+query I rowsort
+SELECT id FROM ei WHERE NULLIF(a, 0) = 7
+----
+7
+
+statement ok
+CREATE INDEX ei_nullif_idx ON ei ((NULLIF(a, 0)))
+
+# The same query now seeks the index: the pinned cost must be lower than the full scan's.
+# cost: 6
+query I rowsort
+SELECT id FROM ei WHERE NULLIF(a, 0) = 7
+----
+7

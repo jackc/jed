@@ -239,9 +239,11 @@ SELECT 'ä' < 'z' COLLATE "de"                      -- per-expression collation 
     coercion — a node of its own in PostgreSQL) combines its operand like a function, so it turns a
     conflicted column (below) into no collation, where a plain `::text` leaves it conflicted. A cast
     to any non-text type derives none.
-  - **`CASE`, `COALESCE`, `GREATEST`/`LEAST`** combine their **result** inputs: every
+  - **`CASE`, `COALESCE`, `GREATEST`/`LEAST`, `NULLIF`** combine their **result** inputs: every
     `THEN` and the `ELSE` of a `CASE` (never the simple-`CASE` operand or a `WHEN` condition —
-    PostgreSQL's `CaseExpr` rule), and every argument of the others.
+    PostgreSQL's `CaseExpr` rule), and every argument of the others (both operands of `NULLIF`,
+    which also derives its `=` comparison's collation from them, so a conflicted text pair is
+    `42P21`/`42P22` as for `=`).
   - **Aggregates and window functions** whose result is the input type — `min`/`max` (plain or
     `OVER`), `lag`/`lead`/`first_value`/`last_value`/`nth_value`, and the ordered-set `mode` /
     `percentile_disc` (their single `WITHIN GROUP` key) — carry their value arguments' collation;

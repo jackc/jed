@@ -1398,6 +1398,8 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
         Expr::GreatestLeast { greatest, .. } => {
             if *greatest { "greatest" } else { "least" }.to_string()
         }
+        // The fixed keyword lowercased (PG; grammar.md §58).
+        Expr::NullIf(_) => "nullif".to_string(),
         Expr::FieldAccess { field, .. } => field.to_string(),
         // A subscript takes the base array's name (PG names `a[1]` after `a`); a chained subscript
         // `a[1][2]` recurses to the same base name. A non-column base falls through to `?column?`.
@@ -2522,6 +2524,7 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
         RExpr::GreatestLeast { args, greatest, .. } => {
             explain_call(if *greatest { "greatest" } else { "least" }, args)
         }
+        RExpr::NullIf { args, .. } => explain_call("nullif", args),
         RExpr::ScalarFunc {
             func: ScalarFunc::ByteaConcat | ScalarFunc::TextConcat,
             args,
@@ -3083,7 +3086,9 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
                 || els.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
         }
         Expr::Coalesce(args) => args.iter().any(expr_calls_seq_mutator),
-        Expr::GreatestLeast { args, .. } => args.iter().any(expr_calls_seq_mutator),
+        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+            args.iter().any(expr_calls_seq_mutator)
+        }
         Expr::ScalarSubquery(q) | Expr::Exists(q) => query_calls_seq_mutator(q),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             expr_calls_seq_mutator(lhs) || query_calls_seq_mutator(query)
@@ -3550,7 +3555,7 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
                 collect_expr_privs(a, req, locals);
             }
         }
-        Expr::GreatestLeast { args, .. } => {
+        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
             for a in args {
                 collect_expr_privs(a, req, locals);
             }
@@ -3634,7 +3639,9 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
                 || els.as_ref().is_some_and(|x| expr_reads_columns(x))
         }
         Expr::Coalesce(args) => args.iter().any(expr_reads_columns),
-        Expr::GreatestLeast { args, .. } => args.iter().any(expr_reads_columns),
+        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+            args.iter().any(expr_reads_columns)
+        }
         Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => true,
         Expr::Quantified { lhs, array, .. } => expr_reads_columns(lhs) || expr_reads_columns(array),
     }
@@ -6011,6 +6018,46 @@ fn resolve_node(
                 unified,
             ))
         }),
+        Expr::NullIf(args) => outline(|| {
+            // NULLIF(a, b) (grammar.md §58) is PostgreSQL's `CASE WHEN a = b THEN NULL ELSE a END`
+            // with `a` evaluated once. The operands resolve exactly as an `=` pair: an adaptable
+            // literal or parameter takes its type from its sibling.
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, &args[0], &args[1], agg, params)?;
+            // The `=` comparability gate, exactly as for `a = b` (42883 json/jsonpath, 42804 for a
+            // cross-family or structurally mismatched pair).
+            classify_comparable(&lt, &rt)?;
+            // A text pair derives the comparison collation like `=` does, so a conflict is 42P21
+            // and an indeterminate implicit pair 42P22. Equality ignores the collation itself.
+            if lt.collatable() && rt.collatable() {
+                let d = combine_deriv(
+                    derive_collation(scope, &args[0])?,
+                    derive_collation(scope, &args[1])?,
+                )?;
+                resolve_deriv(scope.catalog, d)?;
+            }
+            // The result is `a`'s type after PostgreSQL's `=` resolution: an unknown (NULL) `a`
+            // takes `b`'s type (text when both are NULL), and an integer `a` facing a decimal `b`
+            // becomes decimal (there is no `int = numeric` operator). Every other comparable pair
+            // keeps `a`'s type: the integer widths and `f32`/`f64` have cross-type operators.
+            let (result, coerce_decimal) = match (&lt, &rt) {
+                (ResolvedType::Null, ResolvedType::Null) => (ResolvedType::Text, false),
+                (ResolvedType::Null, _) => (rt.clone(), false),
+                (ResolvedType::Int(_), ResolvedType::Decimal) => (ResolvedType::Decimal, true),
+                _ => (lt.clone(), false),
+            };
+            let widen_float = matches!(
+                (&lt, &rt),
+                (ResolvedType::Float(a), ResolvedType::Float(b)) if a != b
+            );
+            Ok((
+                RExpr::NullIf {
+                    args: vec![rl, rr],
+                    coerce_decimal,
+                    widen_float,
+                },
+                result,
+            ))
+        }),
     }
 }
 
@@ -6118,7 +6165,9 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
         Expr::Array(items) => combine_derivs(scope, items)?,
         // A subscript or slice carries its array's collation (the subscripts are integers).
         Expr::Subscript { base, .. } => combine_deriv(Deriv::None, derive_collation(scope, base)?)?,
-        Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } => combine_derivs(scope, args)?,
+        Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => {
+            combine_derivs(scope, args)?
+        }
         // An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
         // arguments. FILTER and an in-aggregate ORDER BY contribute nothing.
         Expr::FuncCall {
@@ -6255,6 +6304,9 @@ pub(crate) fn derive_typmod(scope: &Scope, e: &Expr) -> Typmod {
         Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } => {
             common_typmod(args.iter().map(|a| derive_typmod(scope, a)))
         }
+        // NULLIF returns its first argument, so it keeps that argument's typmod (PostgreSQL's
+        // exprTypmod); an integer `a` widened to decimal has none, as integers carry none.
+        Expr::NullIf(args) => derive_typmod(scope, &args[0]),
         // A scalar subquery: its output column's typmod, recorded when `resolve` planned it.
         Expr::ScalarSubquery(q) => {
             let key: *const QueryExpr = q.as_ref();

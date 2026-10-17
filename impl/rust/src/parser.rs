@@ -5810,6 +5810,23 @@ impl Parser {
                 return Ok(Expr::GreatestLeast { args, greatest });
             });
         }
+        // `NULLIF(a, b)` — NULL when `a = b`, else `a` (grammar.md §58). Recognized only when
+        // NULLIF is immediately followed by `(` (the same one-token lookahead), so the word stays
+        // usable as a column name. Exactly two arguments: any other count is 42601, as in
+        // PostgreSQL's grammar.
+        if self.peek_keyword().as_deref() == Some("nullif")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            return outline(|| {
+                self.advance(); // NULLIF
+                self.advance(); // (
+                let a = self.parse_expr()?;
+                self.expect(&Token::Comma)?;
+                let b = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::NullIf(vec![a, b]))
+            });
+        }
         if self.peek_keyword().as_deref() == Some("case") {
             return outline(|| {
                 let case_pos = self.here();

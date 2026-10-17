@@ -1338,6 +1338,9 @@ func outputName(s *scope, e exprNode) string {
 			return "greatest"
 		}
 		return "least"
+	case exprNullIf:
+		// The fixed keyword lowercased (PG; grammar.md §58).
+		return "nullif"
 	case exprFieldAccess:
 		// A field selection takes the FIELD name (PG names the output column after the selected
 		// field, exact — spec/design/composite.md §S4).
@@ -3201,6 +3204,8 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		}
 		return &rExpr{kind: reGreatestLeast, sargs: args, caseDecimal: unified.kind == rtDecimal, greatest: e.Greatest, collation: coll},
 			unified, nil
+	case exprNullIf:
+		return resolveNullIf(s, e, ag, params)
 	case exprQuantified:
 		return resolveQuantified(s, e.Quantified, ag, params)
 	case exprQuantifiedSubquery:
@@ -3353,6 +3358,8 @@ func deriveCollation(s *scope, e exprNode) (deriv, error) {
 		return combineDerivList(s, e.Coalesce)
 	case exprGreatestLeast:
 		return combineDerivList(s, e.GreatestLeast)
+	case exprNullIf:
+		return combineDerivList(s, e.NullIf)
 	case exprScalarSubquery:
 		// A scalar subquery: its output column's collation, recorded when resolve planned it.
 		if o, ok := s.subqueryDerivs[e.Subquery]; ok {
@@ -3483,6 +3490,10 @@ func deriveTypmod(s *scope, e exprNode) typmod {
 		return commonTypmodList(s, e.Coalesce)
 	case exprGreatestLeast:
 		return commonTypmodList(s, e.GreatestLeast)
+	case exprNullIf:
+		// NULLIF returns its first argument, so it keeps that argument's typmod (PostgreSQL's
+		// exprTypmod); an integer `a` widened to decimal has none, as integers carry none.
+		return deriveTypmod(s, e.NullIf[0])
 	case exprScalarSubquery:
 		// A scalar subquery: its output column's typmod, recorded when resolve planned it.
 		if o, ok := s.subqueryDerivs[e.Subquery]; ok {
@@ -4403,4 +4414,53 @@ func castToText(rinner *rExpr, ity resolvedType, target scalarType, varcharLen *
 	default:
 		return nil, newError(FeatureNotSupported, "casting to text is not supported yet")
 	}
+}
+
+// resolveNullIf resolves NULLIF(a, b) (grammar.md §58) — PostgreSQL's
+// `CASE WHEN a = b THEN NULL ELSE a END` with `a` evaluated once. The operands resolve exactly as an
+// `=` pair (an adaptable literal or parameter takes its type from its sibling) and pass the `=`
+// comparability gate; a text pair derives the comparison collation like `=` does (42P21/42P22),
+// though equality ignores it.
+func resolveNullIf(s *scope, e exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	rl, lt, rr, rt, err := resolveOperandPair(s, e.NullIf[0], e.NullIf[1], ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if err := classifyComparable(lt, rt); err != nil {
+		return nil, resolvedType{}, err
+	}
+	if lt.collatable() && rt.collatable() {
+		ld, err := deriveCollation(s, e.NullIf[0])
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		rd, err := deriveCollation(s, e.NullIf[1])
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		d, err := combineDeriv(ld, rd)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if _, err := resolveDeriv(s.catalog, d); err != nil {
+			return nil, resolvedType{}, err
+		}
+	}
+	// The result is `a`'s type after PostgreSQL's `=` resolution: an unknown (NULL) `a` takes `b`'s
+	// type (text when both are NULL), and an integer `a` facing a decimal `b` becomes decimal (there
+	// is no `int = numeric` operator). Every other comparable pair keeps `a`'s type: the integer
+	// widths and f32/f64 have cross-type operators.
+	result, coerceDecimal := lt, false
+	switch {
+	case lt.kind == rtNull && rt.kind == rtNull:
+		result = resolvedType{kind: rtText}
+	case lt.kind == rtNull:
+		result = rt
+	case lt.kind == rtInt && rt.kind == rtDecimal:
+		result, coerceDecimal = resolvedType{kind: rtDecimal}, true
+	}
+	// A mixed-width float pair compares at f64; the result keeps a's width.
+	widen := (lt.kind == rtFloat32 && rt.kind == rtFloat64) || (lt.kind == rtFloat64 && rt.kind == rtFloat32)
+	return &rExpr{kind: reNullIf, sargs: []*rExpr{rl, rr}, caseDecimal: coerceDecimal, nullifWidenFloat: widen},
+		result, nil
 }

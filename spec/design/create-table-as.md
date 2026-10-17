@@ -76,6 +76,7 @@ A column is created for each output column of the query, in order, with:
   - `COLLATE` keeps its operand's;
   - `CASE` (with an `ELSE`; without one it can yield a typmod-less `NULL`), `COALESCE`, `GREATEST`,
     and `LEAST` keep the typmod every result input has, else none;
+  - `NULLIF(a, b)` keeps `a`'s (an integer `a` widened to decimal has none);
   - a set operation's or a `VALUES` list's column keeps the typmod every operand or row has, else
     none (PostgreSQL's `select_common_typmod`);
   - a scalar subquery keeps its column's;

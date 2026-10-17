@@ -110,6 +110,11 @@ sql = "SELECT 1 / INTERVAL '1 day'"
 reason = "jed: dividing a number by an interval is a 42804 datatype mismatch (interval.md §5); PG reports 42883 (no `integer / interval` operator). Both reject; a documented error-class divergence."
 
 [[override]]
+file = "expr/nullif.test"
+sql = "SELECT NULLIF(1, 'a'::text)"
+reason = "jed: NULLIF's operands must be comparable by `=`, and an integer × text pair is jed's cross-family comparison 42804 (types.md, the comparison matrix — exactly what `1 = 'a'::text` raises). PG reports 42883 (no `integer = text` operator). Both reject; a documented error-class divergence (grammar.md §58)."
+
+[[override]]
 file = "expr/interval_scale.test"
 sql = "SELECT INTERVAL '1 day' * INTERVAL '2 days'"
 reason = "jed: multiplying two intervals is a 42804 datatype mismatch (interval.md §5); PG reports 42883 (no `interval * interval` operator). Both reject; a documented error-class divergence."

@@ -4074,7 +4074,7 @@ export class Engine {
         add(expr.els);
         for (const arm of expr.arms) { add(arm.cond); add(arm.result); }
         return;
-      case "greatestLeast": case "coalesce": case "scalarFunc": case "hostFunc": case "arrayFunc":
+      case "greatestLeast": case "nullIf": case "coalesce": case "scalarFunc": case "hostFunc": case "arrayFunc":
       case "regexFunc": case "rangeFunc": case "rangeCtor": case "rangeOp":
       case "rangeSetOp": case "variadic": case "jsonBuild": case "jsonSetInsert":
       case "jsonObjectFromArrays": case "jsonImage": case "jsonPathFn": case "jsonSqlFn":
@@ -22297,6 +22297,7 @@ export class Engine {
         e.els = this.foldUncorrelatedInRExpr(e.els, bound, ctes, cost);
         return e;
       case "greatestLeast":
+      case "nullIf":
       case "coalesce":
       case "scalarFunc":
       case "hostFunc":
@@ -24765,6 +24766,7 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
       for (const arm of expr.arms) children = saturatingEstimateAdd(children, sum(arm.cond, arm.result));
       break;
     case "greatestLeast":
+    case "nullIf":
     case "coalesce":
     case "scalarFunc":
     case "hostFunc":
@@ -25963,6 +25965,7 @@ export function rexprIsConstant(e: RExpr): boolean {
         rexprIsConstant(e.els)
       );
     case "greatestLeast":
+    case "nullIf":
     case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
@@ -27601,6 +27604,15 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
     // GREATEST/LEAST(a, b, …) is likewise a legal index expression (grammar.md §52); a GREATEST
     // index must not match a LEAST query (the `greatest` discriminant is compared), nor an index
     // built under a different text collation (compared by name).
+    // NULLIF(a, b) is likewise a legal index expression (grammar.md §58).
+    case "nullIf":
+      return (
+        b.kind === "nullIf" &&
+        a.coerceDecimal === b.coerceDecimal &&
+        a.widenFloat === b.widenFloat &&
+        a.args.length === b.args.length &&
+        a.args.every((x, i) => rexprEqShifted(x, b.args[i]!, offset))
+      );
     case "greatestLeast":
       return (
         b.kind === "greatestLeast" &&
@@ -28604,6 +28616,7 @@ export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
         ) || rexprReferencesOuter(e.els, depth)
       );
     case "greatestLeast":
+    case "nullIf":
     case "coalesce":
     case "scalarFunc":
     case "hostFunc":
@@ -29062,6 +29075,7 @@ function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
       collectHostFuncNodes(e.els, out);
       return;
     case "greatestLeast":
+    case "nullIf":
     case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
@@ -29343,6 +29357,7 @@ export function collectTouched(e: RExpr, depth: number, touched: boolean[]): voi
       collectTouched(e.els, depth, touched);
       return;
     case "greatestLeast":
+    case "nullIf":
     case "coalesce":
     case "scalarFunc":
     case "hostFunc":
@@ -29752,6 +29767,7 @@ export function rebasePlaceholderCols(e: RExpr, from: number, target: number): v
       rebasePlaceholderCols(e.els, from, target);
       return;
     case "greatestLeast":
+    case "nullIf":
     case "coalesce":
     case "scalarFunc":
     case "hostFunc":
@@ -30204,6 +30220,13 @@ export type RExpr =
       greatest: boolean;
       collation: Collation | null;
     }
+  // A resolved NULLIF(a, b) (grammar.md §58) — `args` is exactly [a, b]. EAGER: both arguments
+  // are evaluated, a first. When both are non-NULL and a = b the result is NULL; otherwise it is a.
+  // The result type is a's, except that an integer a facing a decimal b becomes decimal
+  // (`coerceDecimal`, PostgreSQL's int = numeric resolution). `widenFloat` widens an f32 operand to
+  // f64 for the comparison only (a mixed-width float pair; the result keeps a's width). Equality is
+  // byte equality under every deterministic collation, so no collation is carried.
+  | { kind: "nullIf"; args: RExpr[]; coerceDecimal: boolean; widenFloat: boolean }
   // A scalar-function call (spec/design/functions.md §9, float.md §8), evaluated per row in any
   // context. `result` is the static result type — for abs over an integer/float it is the
   // operand's own type (range-checked / fround'd at that width), for round over int/decimal it is
@@ -33855,6 +33878,7 @@ export function exprHasAggregate(e: Expr): boolean {
       );
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       return e.args.some(exprHasAggregate);
     case "row":
       return e.fields.some(exprHasAggregate);
@@ -33935,6 +33959,7 @@ export function exprHasWindow(e: Expr): boolean {
       );
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       return e.args.some(exprHasWindow);
     case "row":
       return e.fields.some(exprHasWindow);
@@ -34126,6 +34151,7 @@ export function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): vo
       return;
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       for (const a of e.args) desugarNamedWindows(a, windows);
       return;
     // Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
@@ -34234,6 +34260,7 @@ export function rejectCheckStructure(e: Expr): void {
       return;
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       for (const a of e.args) rejectCheckStructure(a);
       return;
     case "row":
@@ -34331,6 +34358,7 @@ export function rejectDefaultStructure(e: Expr): void {
       return;
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       for (const a of e.args) rejectDefaultStructure(a);
       return;
     case "row":
@@ -34425,6 +34453,7 @@ export function indexExprHasSubquery(e: Expr): boolean {
       );
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       return e.args.some(indexExprHasSubquery);
     case "funcCall":
       return e.args.some(indexExprHasSubquery);
@@ -34515,6 +34544,7 @@ export function indexExprFirstParam(e: Expr): number | null {
       return e.els !== null ? indexExprFirstParam(e.els) : null;
     }
     case "coalesce":
+    case "nullIf":
     case "greatestLeast": {
       for (const a of e.args) {
         const p = indexExprFirstParam(a);
@@ -34618,6 +34648,7 @@ export function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
         return;
       case "coalesce":
       case "greatestLeast":
+      case "nullIf":
         for (const a of e.args) walk(a);
         return;
       case "funcCall":

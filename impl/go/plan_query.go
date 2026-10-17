@@ -1104,6 +1104,12 @@ func countSelfRefsExpr(e exprNode, name string) int {
 			n += countSelfRefsExpr(a, name)
 		}
 		return n
+	case exprNullIf:
+		n := 0
+		for _, a := range e.NullIf {
+			n += countSelfRefsExpr(a, name)
+		}
+		return n
 	case exprFuncCall:
 		n := 0
 		for _, a := range e.FuncCall.Args {

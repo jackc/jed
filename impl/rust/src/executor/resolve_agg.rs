@@ -213,6 +213,7 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
         }
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
+        | RExpr::NullIf { args, .. }
         | RExpr::ScalarFunc { args, .. }
         | RExpr::HostFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }

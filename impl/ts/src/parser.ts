@@ -4771,6 +4771,18 @@ class Parser {
       if ((kw === "greatest" || kw === "least") && this.peekKindAt(1) === "lparen")
         return this.parseGreatestLeast(kw);
     }
+    // `NULLIF(a, b)` — NULL when a = b, else a (grammar.md §58). Recognized only when NULLIF is
+    // immediately followed by `(` (the same one-token lookahead), so the word stays usable as a
+    // column name. Exactly two arguments: any other count is 42601, as in PostgreSQL's grammar.
+    if (this.peekKeyword() === "nullif" && this.peekKindAt(1) === "lparen") {
+      this.advance(); // NULLIF
+      this.advance(); // (
+      const a = this.parseExpr();
+      this.expect("comma");
+      const b = this.parseExpr();
+      this.expect("rparen");
+      return { kind: "nullIf", args: [a, b] };
+    }
     if (this.peekKeyword() === "case") return this.parseCasePrimary();
     if (this.atFunctionCall()) return this.parseFunctionCall();
     return this.parseLiteralOrName();

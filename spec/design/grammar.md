@@ -3675,3 +3675,55 @@ unreserved `with` after a `FROM` item would otherwise read as its alias — `AS 
 "with" WITH NO DATA` still parses. Any other trailing word is `42601`. The query's `$N` placeholders
 bind as a query's do (create-table-as.md §1); PostgreSQL's `AS TABLE name` / `AS EXECUTE name` forms
 are absent.
+
+## 58. `NULLIF`
+
+`NULLIF(a, b)` returns **NULL when `a = b`**, and `a` otherwise (`nullif_expr ::= "NULLIF" "(" expr
+"," expr ")"`). It is PostgreSQL's `CASE WHEN a = b THEN NULL ELSE a END` with `a` evaluated once —
+a single-node grammar form beside `COALESCE` (§51) and `GREATEST`/`LEAST` (§52), sharing their
+non-reserved lookahead, because the CASE rewrite would evaluate `a` twice (a second error, a second
+`nextval`, a doubled cost).
+
+```sql
+SELECT total / NULLIF(count, 0) FROM stats       -- a zero divisor becomes NULL instead of 22012
+SELECT NULLIF(trim(name), '') FROM u              -- an empty string becomes NULL
+```
+
+- **Grammar.** Exactly two arguments; any other count (`NULLIF(a)`, `NULLIF(a, b, c)`, `NULLIF()`)
+  is `42601`, PostgreSQL's shape. `NULLIF` stays **non-reserved**: the form is recognized only when
+  the keyword is immediately followed by `(` (the `EXTRACT`/`JSON(` one-token lookahead, §8), so
+  `nullif` remains usable as a column name — observably PostgreSQL's `col_name_keyword`
+  classification. Being a distinct grammar node (not a catalog function), it has no modifier forms
+  and carries **no** `EXECUTE` privilege, like `GREATEST`/`LEAST`.
+- **Eager — NOT a short-circuit** ([cost.md](cost.md) §3). Both operands are evaluated, `a` first,
+  whatever their values: `NULLIF(1, 1/0)` and `NULLIF(NULL, 1/0)` trap `22012` (PostgreSQL
+  evaluates both arguments before comparing).
+- **NULLs never match.** The comparison is `=`'s three-valued equality, and only TRUE yields NULL:
+  `NULLIF(NULL, b)` is NULL (it is `a`), and `NULLIF(a, NULL)` is `a`.
+- **Typing — the `=` operand pair.** The operands resolve exactly as the operands of `a = b`: an
+  adaptable literal or bind parameter takes its type from its sibling (`NULLIF(d, '2024-01-01')`
+  compares dates; `NULLIF($1, col)` types `$1` as `col`'s type), and the pair must pass `=`'s
+  comparability gate — a non-comparable `json`/`jsonpath` is `42883`, a cross-family pair is jed's
+  comparison `42804` (PostgreSQL reports `42883` for, e.g., `integer = text`; the error-class
+  divergence every jed comparison carries). A text pair derives the comparison collation as `=`
+  does, so conflicting explicit collations are `42P21` and an indeterminate implicit pair `42P22`;
+  equality itself is byte equality under every deterministic collation
+  ([collation.md](collation.md) §7).
+- **Result type — `a`'s, after PostgreSQL's `=` resolution.** PostgreSQL's result is the left input
+  type of the `=` operator it resolves, so: an unknown (NULL) `a` takes `b`'s type, and an all-NULL
+  `NULLIF(NULL, NULL)` is `text`; an integer `a` facing a `decimal` `b` is `decimal` (there is no
+  `integer = numeric` operator, so both become numeric — `NULLIF(1, 1.0)` is NULL, `NULLIF(1, 1.5)`
+  is the decimal `1`); every other comparable pair keeps `a`'s type, because the integer widths and
+  `f32`/`f64` have cross-type `=` operators (`NULLIF(1::i16, 2::i32)` is `i16`; `NULLIF(0.1::f32,
+  0::f64)` is the `f32` `0.1`, the pair compared at `f64`). The result keeps `a`'s typmod (an
+  integer widened to decimal has none — PostgreSQL's `exprTypmod`) and carries the collation the
+  two operands combine to ([collation.md](collation.md) §1).
+- **Where it is legal**: anywhere an expression is — projections, `WHERE`, `GROUP BY`/`HAVING`,
+  `ORDER BY`, `CHECK` constraints, expression `DEFAULT`s, and **index expressions**
+  ([indexes.md](indexes.md) §9 — immutable iff its arguments are; an index on `NULLIF(a, 0)` matches
+  the same expression in a query and pushes down). Aggregates nest as in any expression.
+- **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the node, plus both operands' own costs,
+  plus the size-scaled work of the equality — `decimal_work` for wide decimals and `varlen_compare`
+  for `text`/`bytea`, exactly what an explicit `=` charges. Output name for a bare
+  `SELECT NULLIF(…)` is **`nullif`** (PostgreSQL) — the fixed keyword lowercased, the same
+  no-expression-printer rationale as the §8 rule-4 function names.
