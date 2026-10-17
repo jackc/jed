@@ -598,7 +598,7 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 
 // validateAlterConstraints scans once, checks every newly-added surviving constraint against the
 // final table definition, and returns sorted backing-index entries for publication.
-func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *string, snap *snapshot, st *alterConstraintState, meter *costMeter, rewritten []entry) (map[string][][]byte, error) {
+func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *string, snap *snapshot, st *alterConstraintState, meter *costMeter, rewritten []entry) (map[string][]indexEntry, error) {
 	if len(st.added) == 0 {
 		return nil, nil
 	}
@@ -652,7 +652,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 	}
 	colls := db.columnCollations(t.Columns)
 	seen := map[string]map[string]bool{}
-	entries := map[string][][]byte{}
+	entries := map[string][]indexEntry{}
 	// Presence in entries, including an empty slice for an empty table, is the publication-time
 	// identity marker for a newly-added backing index. This distinguishes DROP+ADD reuse of an old
 	// name from an unchanged old index whose store may be retained.
@@ -712,7 +712,9 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 			if err != nil {
 				return nil, err
 			}
-			entries[nk] = append(entries[nk], eks...)
+			for _, ek := range eks {
+				entries[nk] = append(entries[nk], indexEntry{ek, len(e.Key)})
+			}
 		}
 	}
 	// FK validation uses byte-identical parent probes. A self-reference checks the scanned end state;
@@ -838,7 +840,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		}
 	}
 	for k := range entries {
-		slices.SortFunc(entries[k], bytes.Compare)
+		sortIndexEntries(entries[k])
 	}
 	return entries, nil
 }

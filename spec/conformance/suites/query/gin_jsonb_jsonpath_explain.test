@@ -101,12 +101,12 @@ EXPLAIN SELECT id FROM d WHERE doc @@ '$.k == 3 && $.s == "v1"'
 Filter
 conjuncts=1
 2
-14
+13
 1
 Scan d
 GIN bound: using d_doc_gin; touched=2
 2
-10
+9
 
 statement ok
 ANALYZE d
@@ -118,12 +118,12 @@ EXPLAIN SELECT id FROM d WHERE doc @@ '$.k == 3 && $.s == "v1"'
 Filter
 conjuncts=1
 6
-148
+147
 1
 Scan d
 GIN bound: using d_doc_gin; touched=2
 6
-136
+135
 
 query ITTII nosort
 EXPLAIN SELECT id FROM d WHERE doc @@ '$.k == 3 || $.k == 4'
@@ -132,9 +132,9 @@ EXPLAIN SELECT id FROM d WHERE doc @@ '$.k == 3 || $.k == 4'
 Filter
 conjuncts=1
 44
-310
+309
 1
 Scan d
 GIN bound: using d_doc_gin; touched=2
 44
-222
+221

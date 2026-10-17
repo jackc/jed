@@ -23,8 +23,13 @@ A fourth independent encoder/decoder (the Ruby reference in
 A GIN index may list 1–32 key columns, each of which must have a GIN operator class (else `XX001`).
 Every entry of a multi-column GIN index is `column_tag (u8, the 0-based key position) ‖ term ‖
 storage_key`; a single-column GIN's entries carry no tag and are byte-identical to v46. No catalog
-byte layout changes, so a file with no multi-column GIN changes only by its version byte + meta CRC;
-the new `gin_multi_table` golden pins the tagged entries. Readers accept only the exact current
+byte layout changes. The same version stores every GIN tree's records as **posting runs**
+([../design/gin.md §4.5](../design/gin.md)): a record key is `term ‖ last ‖ body ‖ u16 BE
+len(body)`, the body front-coding the run's earlier storage keys as `varint(shared) ‖ varint(suffix
+length) ‖ suffix`, a run growing to at most 64 bytes, and a from-scratch image packing each term's
+storage keys greedily ([../encoding/gin_posting_runs.toml](../encoding/gin_posting_runs.toml)). A file
+with no GIN index changes only by its version byte + meta CRC; every GIN golden's index tree changes,
+and the new `gin_multi_table` golden pins the tagged runs. Readers accept only the exact current
 version.
 
 `format_version` **46** — **ordered index keys** ([../design/indexes.md §11](../design/indexes.md)).

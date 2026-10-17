@@ -33,7 +33,7 @@ INSERT INTO d VALUES
 # ---- @@: equality predicates --------------------------------------------------------------------
 
 # key a + number 1 (lax unwraps row 3's array; row 4's 1.0 is the same number)
-# cost: 96
+# cost: 98
 query I nosort
 SELECT id FROM d WHERE doc @@ '$.a == 1' ORDER BY id
 ----
@@ -51,34 +51,34 @@ SELECT id FROM d WHERE doc @@ '$.b == "x"' ORDER BY id
 7
 
 # strict mode: a member's string is a value term only; row 7's array is not unwrapped
-# cost: 39
+# cost: 38
 query I nosort
 SELECT id FROM d WHERE doc @@ 'strict $.b == "x"' ORDER BY id
 ----
 1
 
 # strict [*]: an array element string is a key term
-# cost: 54
+# cost: 55
 query I nosort
 SELECT id FROM d WHERE doc @@ 'strict $.tags[*] == "blue"' ORDER BY id
 ----
 1
 
 # nested keys
-# cost: 44
+# cost: 45
 query I nosort
 SELECT id FROM d WHERE doc @@ '$.c.d == "x"' ORDER BY id
 ----
 3
 
 # && and ||
-# cost: 63
+# cost: 65
 query I nosort
 SELECT id FROM d WHERE doc @@ '$.a == 1 && $.b == "x"' ORDER BY id
 ----
 1
 
-# cost: 160
+# cost: 165
 query I nosort
 SELECT id FROM d WHERE doc @@ '$.a == 2 || $.c.d == "y"' ORDER BY id
 ----
@@ -128,7 +128,7 @@ SELECT id FROM d WHERE doc @@ 'exists ($.n)' ORDER BY id
 ----
 7
 
-# cost: 63
+# cost: 65
 query I nosort
 SELECT id FROM d WHERE doc @@ 'exists ($.c.e[*] ? (@.f == 3))' ORDER BY id
 ----
@@ -136,7 +136,7 @@ SELECT id FROM d WHERE doc @@ 'exists ($.c.e[*] ? (@.f == 3))' ORDER BY id
 
 # ---- @?: a path's filters ------------------------------------------------------------------------
 
-# cost: 113
+# cost: 115
 query I nosort
 SELECT id FROM d WHERE doc @? '$ ? (@.a == 1)' ORDER BY id
 ----
@@ -146,7 +146,7 @@ SELECT id FROM d WHERE doc @? '$ ? (@.a == 1)' ORDER BY id
 5
 
 # a filter on a later accessor keeps the earlier keys
-# cost: 44
+# cost: 45
 query I nosort
 SELECT id FROM d WHERE doc @? '$.c ? (@.d == "y")' ORDER BY id
 ----
@@ -192,11 +192,11 @@ query I nosort
 SELECT id FROM d WHERE doc @? NULL ORDER BY id
 ----
 
-# cost: 43
+# cost: 44
 statement ok
 UPDATE d SET doc = '{"a": 5}' WHERE doc @@ '$.c.d == "x"'
 
-# cost: 32
+# cost: 29
 statement ok
 DELETE FROM d WHERE doc @? '$ ? (@.a == 5)'
 

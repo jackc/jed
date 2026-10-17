@@ -1722,6 +1722,34 @@ two rounds each, jed harnesses only, p50; the machine was shared with another be
 
 Every core and both variants returned the same checksums.
 
+### GIN follow-ons (format_version 47)
+
+The GIN disjunction, multi-column, jsonpath, and posting-run slices (gin.md §2.2/§4.4/§4.5/§6.3) add
+`gin_in` (an `IN` list of three array constants) and `gin_jsonb_path_match` (`doc @@ '$.n == 7 &&
+$.kind == "k7"'`), and treat every `gin_*` / `custom_plan_gin_*` lane as affected. Measured with the
+three jed harnesses, alternating base (`172e3b0a`) and branch builds — base, after, base, after —
+against one corpus, each variant on its own `bench/data`. **The machine was loaded** (other agents'
+builds and test runs shared it), so differences under about ±15% are noise. p50 per query:
+
+| lane | Go base → after | Rust base → after | TS base → after |
+|---|---|---|---|
+| `gin_in` | 128 ms → 1.7 ms | 121 ms → 1.8 ms | 320 ms → 5.4 ms |
+| `gin_jsonb_path_match` | 224 ms → 1.3 ms | 146 ms → 1.0 ms | 440 ms → 4.5 ms |
+| `gin_delete` | 822 µs → 666 µs | 1668 µs → 979 µs | 1771 µs → 2160 µs |
+| `gin_contains` | 177 µs → 233 µs | 296 µs → 302 µs | 384 µs → 824 µs |
+| `gin_jsonb_contains` | 176 µs → 514 µs | 149 µs → 355 µs | 427 µs → 1550 µs |
+| `gin_text_contains` | 144 µs → 496 µs | 139 µs → 356 µs | 509 µs → 1926 µs |
+| `gin_overlaps`, `gin_member`, `gin_jsonb_exists`, `gin_stats_*`, `gin_inl` | within ±10% | within ±5% | +1% to +10% |
+
+That run predates a fix to the skip-scan probe: it decoded every run between a leaf group's first
+and last candidates, which made a rare-plus-common intersection (`gin_*_contains`) 2–3× slower. The
+probe now looks up each candidate's own run (gin.md §6.2). A partial rerun (one base/after pair)
+after the fix measured `gin_jsonb_contains` at 177 → 221 µs (Go), 151 → 203 µs (Rust), and 430 → 783
+µs (TS), and `gin_text_contains` at 153 → 211, 137 → 183, and 526 → 846 µs. Index size is not
+noisy: on 100,000 rows the posting runs shrink a three-element `i64[]` GIN from 1,280 to 256 pages and
+a four-key `jsonb` GIN from 2,560 to 512 (4 KiB pages). Every answer checksum agreed across cores and
+builds.
+
 ### Unchanged writable commit regression
 
 `go test -C impl/go -run '^$' -bench BenchmarkWritableNoopCommit -benchtime=300x -count=3`

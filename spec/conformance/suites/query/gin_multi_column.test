@@ -51,7 +51,7 @@ SELECT id FROM t WHERE doc ? 'k' ORDER BY id
 3
 5
 
-# cost: 10
+# cost: 13
 query I nosort
 SELECT id FROM t WHERE doc @> '{"a": 1}' ORDER BY id
 ----
@@ -76,7 +76,7 @@ SELECT id FROM t WHERE doc ? 'a' AND tags @> ARRAY[2] ORDER BY id
 
 # ---- an OR on one column ---------------------------------------------------------------------
 
-# cost: 31
+# cost: 34
 query I nosort
 SELECT id FROM t WHERE doc ? 'k' OR doc @> '{"a": 2}' ORDER BY id
 ----
@@ -118,7 +118,7 @@ SELECT id FROM t WHERE words @> ARRAY['green'] ORDER BY id
 ----
 3
 
-# cost: 8
+# cost: 10
 statement ok
 DELETE FROM t WHERE doc @> '{"a": 2}'
 

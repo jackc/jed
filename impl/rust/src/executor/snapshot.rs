@@ -501,22 +501,17 @@ impl Snapshot {
                             .to_string(),
                     ));
                 }
-                let mut ekeys: Vec<Vec<u8>> = Vec::new();
+                let mut ekeys: Vec<(Vec<u8>, usize)> = Vec::new();
                 for (k, row) in &entries {
-                    ekeys.extend(index_entry_keys_columns(
-                        &table.columns,
-                        &col_types,
-                        &colls,
-                        def,
-                        k,
-                        row,
-                    )?);
+                    ekeys.extend(
+                        index_entry_keys_columns(&table.columns, &col_types, &colls, def, k, row)?
+                            .into_iter()
+                            .map(|ek| (ek, k.len())),
+                    );
                 }
                 ekeys.sort_unstable();
                 let mut fresh = TableStore::new(cap, Vec::new());
-                for ek in ekeys {
-                    fresh.insert(ek, Vec::new())?;
-                }
+                index_build_insert(&mut fresh, def.kind, ekeys)?;
                 self.put_index_store(def.name.to_string(), fresh);
             }
         }
@@ -1126,7 +1121,7 @@ impl Snapshot {
         &mut self,
         old: &Table,
         next: &Table,
-        entries: &std::collections::HashMap<String, Vec<Vec<u8>>>,
+        entries: &std::collections::HashMap<String, Vec<(Vec<u8>, usize)>>,
         page_size: u32,
         index_rename: Option<(&str, &str)>,
     ) -> Result<()> {
@@ -1163,9 +1158,11 @@ impl Snapshot {
             if let Some(p) = &self.store_paging {
                 s.attach_paging(p.clone());
             }
-            for e in entries.get(&k).into_iter().flatten() {
-                s.insert(e.clone(), Vec::new())?;
-            }
+            crate::executor::index_build_insert(
+                &mut s,
+                i.kind,
+                entries.get(&k).cloned().unwrap_or_default(),
+            )?;
             std::sync::Arc::make_mut(&mut self.index_stores).insert(k, s);
         }
         Ok(())
@@ -1175,7 +1172,7 @@ impl Snapshot {
         &mut self,
         old: &Table,
         next: &Table,
-        entries: &std::collections::HashMap<String, Vec<Vec<u8>>>,
+        entries: &std::collections::HashMap<String, Vec<(Vec<u8>, usize)>>,
         page_size: u32,
     ) -> Result<()> {
         for ix in &old.indexes {
@@ -1190,9 +1187,11 @@ impl Snapshot {
             if let Some(paging) = &self.store_paging {
                 store.attach_paging(paging.clone());
             }
-            for entry in entries.get(&key).into_iter().flatten() {
-                store.insert(entry.clone(), Vec::new())?;
-            }
+            crate::executor::index_build_insert(
+                &mut store,
+                ix.kind,
+                entries.get(&key).cloned().unwrap_or_default(),
+            )?;
             std::sync::Arc::make_mut(&mut self.index_stores).insert(key, store);
         }
         Ok(())

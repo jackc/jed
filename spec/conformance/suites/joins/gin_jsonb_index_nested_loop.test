@@ -31,7 +31,7 @@ INSERT INTO doc VALUES
   (14, '{}'),
   (15, NULL)
 
-# cost: 56
+# cost: 58
 query II nosort
 SELECT p.id, d.id FROM probe p JOIN doc d ON d.body @> p.q ORDER BY p.id, d.id
 ----
@@ -48,7 +48,7 @@ SELECT p.id, d.id FROM probe p JOIN doc d ON d.body @> p.q ORDER BY p.id, d.id
 5
 10
 
-# cost: 57
+# cost: 59
 query II nosort
 SELECT p.id, d.id FROM probe p LEFT JOIN doc d ON d.body @> p.q ORDER BY p.id, d.id
 ----
@@ -95,7 +95,7 @@ SELECT p.id, d.id FROM probe p JOIN doc d ON d.body ?| p.ks ORDER BY p.id, d.id
 1
 12
 
-# cost: 55
+# cost: 54
 query II nosort
 SELECT p.id, d.id FROM probe p LEFT JOIN doc d ON d.body ?& p.ks ORDER BY p.id, d.id
 ----

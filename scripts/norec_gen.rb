@@ -209,6 +209,9 @@
 #              mixing a term in every row, frequent, rare, and absent terms reads only the shortest
 #              posting list whole and probes the rest leaf by leaf; the equivalent `Q <@ tags` is NOT
 #              GIN-accelerated (full scan). Both must return the by-construction count and id sum.
+#   gin_runs — GIN posting runs under churn (gin.md §4.5): a scattered load then DELETE/UPDATE/INSERT
+#              batches; `@>` / `&&` / `= ANY` through the maintained runs vs `<@` full scans, against
+#              by-construction counts and sums.
 #   gin_text — GIN over text[] (gin.md §4.2): `tags @> Q` / `k = ANY(tags)` gather through each element's
 #              C text key cut at 128 bytes (long elements sharing a prefix share a term); the
 #              equivalent `Q <@ tags` / `ARRAY[k] <@ tags` are NOT GIN-accelerated (full scan). Both
@@ -501,6 +504,10 @@ GIN_JSONPATH_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_s
                       query.gin_jsonb_jsonpath dml.insert dml.insert_multi_row query.select query.order_by
                       types.i32 types.text types.jsonb types.jsonpath types.json_casts expr.jsonpath_filter
                       expr.jsonpath_match cast.operator].freeze
+GIN_RUNS_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_any_eq
+                  query.gin_mutation dml.insert dml.insert_multi_row dml.update dml.delete query.select
+                  query.aggregates query.logical_connectives types.i32 types.text types.array
+                  func.array_containment func.array_quantified expr.arithmetic cast.operator].freeze
 GIN_EQ_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_array_eq dml.insert
                 dml.insert_multi_row query.select query.order_by query.where_eq types.i32
                 types.array].freeze
@@ -2923,6 +2930,61 @@ def gen_gin_skip(seed)
     out << "# full scan (Q <@ col is the same predicate, not GIN-accelerated) — MUST match"
     q(out, "II", "SELECT count(*), sum(id) FROM t WHERE #{arr} <@ tags", exp)
   end
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GIN posting runs under churn (maintained runs vs <@ full scan) --------------------
+# A GIN entry tree stores each term's postings as front-coded runs (spec/design/gin.md §4.5) that
+# maintenance edits one run at a time: inserts split a full run, deletes shrink or empty one, and an
+# UPDATE moves a row's postings between terms. The table is loaded in a scattered key order (so most
+# inserts land inside existing runs, not at a term's end), then churned by DELETE / UPDATE / INSERT
+# batches; afterwards the GIN-bounded `@>` / `&&` / `= ANY` and the equivalent `<@`-spelled full scans
+# must agree with the by-construction rows. Storage keys mix widths (a text primary key), so the
+# front coding sees varying shared prefixes.
+def gen_gin_runs(seed)
+  rng = Random.new(seed)
+  n = rng.rand(300..700)
+  m = rng.rand(3..6)
+  ids = (1..n).to_a.shuffle(random: rng)
+  key = ->(i) { "k#{i * 37 % 1009}-#{i}" }
+  tags = {}
+  ids.each { |i| tags[i] = [i % m, (i * 7) % (m + 3) + 10] }
+  out = header(seed, GIN_RUNS_REQ, "GIN posting runs under churn (maintained runs vs <@ full scan)")
+  stmt(out, "CREATE TABLE t (id text PRIMARY KEY, n i32, tags i32[])")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+  ids.each_slice(97) do |slice|
+    stmt(out, "INSERT INTO t VALUES #{slice.map { |i| "('#{key.call(i)}', #{i}, '{#{tags[i].join(',')}}')" }.join(', ')}")
+  end
+  # churn: delete a residue class, retag another, re-insert some deleted rows
+  d = rng.rand(2..5)
+  r = rng.rand(0...d)
+  stmt(out, "DELETE FROM t WHERE n % #{d} = #{r}")
+  deleted = ids.select { |i| i % d == r }
+  deleted.each { |i| tags.delete(i) }
+  u = rng.rand(3..7)
+  stmt(out, "UPDATE t SET tags = ARRAY[n % #{u} + 20, n % #{m}] WHERE n % #{u} = 1")
+  tags.each_key { |i| tags[i] = [i % u + 20, i % m] if i % u == 1 }
+  back = deleted.sample([deleted.size, 40].min, random: rng)
+  stmt(out, "INSERT INTO t VALUES #{back.map { |i| "('#{key.call(i)}', #{i}, '{#{i % m}}')" }.join(', ')}") unless back.empty?
+  back.each { |i| tags[i] = [i % m] }
+
+  agg = ->(sel) { hits = tags.keys.select { |i| sel.call(tags[i]) }; [hits.size.to_s, hits.empty? ? "NULL" : hits.sum.to_s] }
+  pair = lambda do |title, fast, slow, exp|
+    out << "# #{title}"
+    out << "# GIN bound (the maintained posting runs)"
+    q(out, "II", "SELECT count(*), sum(n) FROM t WHERE #{fast}", exp)
+    out << "# full scan (an equivalent spelling no GIN strategy matches) — MUST match"
+    q(out, "II", "SELECT count(*), sum(n) FROM t WHERE #{slow}", exp)
+  end
+  t1 = rng.rand(0...m)
+  t2 = rng.rand(10...(m + 13))
+  t3 = rng.rand(20...(u + 20))
+  pair.call("@> {#{t1}}", "tags @> '{#{t1}}'::i32[]", "'{#{t1}}'::i32[] <@ tags", agg.call(->(t) { t.include?(t1) }))
+  pair.call("@> {#{t1},#{t2}}", "tags @> '{#{t1},#{t2}}'::i32[]", "'{#{t1},#{t2}}'::i32[] <@ tags",
+            agg.call(->(t) { t.include?(t1) && t.include?(t2) }))
+  pair.call("&& {#{t2},#{t3}}", "tags && '{#{t2},#{t3}}'::i32[]", "'{#{t2}}'::i32[] <@ tags OR '{#{t3}}'::i32[] <@ tags",
+            agg.call(->(t) { t.include?(t2) || t.include?(t3) }))
+  pair.call("#{t3} = ANY", "#{t3} = ANY(tags)", "'{#{t3}}'::i32[] <@ tags", agg.call(->(t) { t.include?(t3) }))
   out.join("\n") + "\n"
 end
 
@@ -5441,6 +5503,7 @@ SCENARIOS = {
   "gin_jsonb" => method(:gen_gin_jsonb),
   "gin_jsonpath" => method(:gen_gin_jsonpath),
   "gin_skip" => method(:gen_gin_skip),
+  "gin_runs" => method(:gen_gin_runs),
   "gin_text" => method(:gen_gin_text),
   "gin_stats" => method(:gen_gin_stats),
   "gin_dec" => method(:gen_gin_decimal),

@@ -81,12 +81,12 @@ EXPLAIN SELECT id FROM t WHERE doc ? 'g2'
 Filter
 conjuncts=1
 2
-14
+13
 1
 Scan t
 GIN bound: using t_multi; touched=2
 2
-10
+9
 
 statement ok
 ANALYZE t
@@ -98,12 +98,12 @@ EXPLAIN SELECT id FROM t WHERE doc ? 'g2'
 Filter
 conjuncts=1
 40
-242
+241
 1
 Scan t
 GIN bound: using t_multi; touched=2
 40
-162
+161
 
 query ITTII nosort
 EXPLAIN SELECT id FROM t WHERE 3 = ANY(tags)
@@ -112,9 +112,9 @@ EXPLAIN SELECT id FROM t WHERE 3 = ANY(tags)
 Filter
 conjuncts=1
 46
-278
+277
 1
 Scan t
 GIN bound: using t_multi; touched=2
 46
-186
+185

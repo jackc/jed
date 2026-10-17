@@ -54,7 +54,7 @@ INSERT INTO d VALUES
 # ---- @> -------------------------------------------------------------------------------------
 
 # a top-level member value: only row 1 has a = 1 (row 3's 1.50 is a different number)
-# cost: 21
+# cost: 25
 query I nosort
 SELECT id FROM d WHERE doc @> '{"a": 1}' ORDER BY id
 ----
@@ -77,7 +77,7 @@ SELECT id FROM d WHERE doc @> '{"tags": ["red"]}' ORDER BY id
 # below the top level a value matches only a value of the same kind: rows 1 and 2 hold an ARRAY
 # under "tags", so only row 12's string matches (an array's "red" is a KEY term, a member value's
 # "red" a STRING term, so the gather already separates them)
-# cost: 10
+# cost: 9
 query I nosort
 SELECT id FROM d WHERE doc @> '{"tags": "red"}' ORDER BY id
 ----
@@ -258,7 +258,7 @@ query I nosort
 SELECT id FROM d WHERE doc ?| '{NULL}' ORDER BY id
 ----
 
-# cost: 23
+# cost: 21
 query I nosort
 SELECT id FROM d WHERE doc ?& '{a,b}' ORDER BY id
 ----

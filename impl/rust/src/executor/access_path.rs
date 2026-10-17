@@ -489,11 +489,12 @@ impl GinGather {
     fn read(&mut self, istore: &TableStore, bound: &KeyBound, term: &[u8]) -> Result<Vec<Vec<u8>>> {
         let (es, p, _) = istore.range_scan_with_units(bound, &[])?;
         self.pages += p;
-        self.entries += es.len();
-        Ok(es
-            .into_iter()
-            .map(|(ekey, _)| ekey[term.len()..].to_vec())
-            .collect())
+        let mut keys = Vec::new();
+        for (run, _) in es {
+            keys.extend(crate::gin_runs::decode_run(term.len(), &run)?);
+        }
+        self.entries += keys.len();
+        Ok(keys)
     }
 
     /// The candidates of a query tree (gin.md §2.2/§6), ascending. A term is its whole posting list.
@@ -550,17 +551,46 @@ impl GinGather {
     /// step of the cheaper leaf-local match (gin.md §6.2). Stops once no candidate survives. The spans and the grouping read only the
     /// resident skeleton and are unmetered.
     fn intersect(&mut self, istore: &TableStore, terms: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
-        let mut ordered: Vec<(usize, Vec<u8>)> = terms
-            .into_iter()
-            .map(|t| (istore.overlap_node_count(&Self::posting_bound(&t)), t))
-            .collect();
-        ordered.sort();
-        let mut ordered = ordered.into_iter().map(|(_, t)| t);
-        let Some(driver) = ordered.next() else {
-            return Ok(Vec::new());
-        };
-        let mut candidates = self.posting_list(istore, &driver)?;
         let height = istore.height();
+        if terms.len() < 2 {
+            return match terms.first() {
+                Some(term) => self.posting_list(istore, term),
+                None => Ok(Vec::new()),
+            };
+        }
+        // Order the terms by span; a term whose posting range lies in one leaf is peeked — its
+        // leaf's run records read (charging the path) — and ordered by its run count and bytes, so
+        // a short list in a shared leaf still drives (gin.md §6.2).
+        let mut ordered = Vec::with_capacity(terms.len());
+        for term in terms {
+            let bound = Self::posting_bound(&term);
+            let span = istore.overlap_node_count(&bound);
+            let (runs, bytes, peeked) = if span <= height {
+                let (es, p, _) = istore.range_scan_with_units(&bound, &[])?;
+                self.pages += p;
+                let bytes: usize = es.iter().map(|(k, _)| k.len()).sum();
+                let runs: Vec<Vec<u8>> = es.into_iter().map(|(k, _)| k).collect();
+                (runs.len(), bytes, Some(runs))
+            } else {
+                (usize::MAX, usize::MAX, None)
+            };
+            ordered.push((span, runs, bytes, term, peeked));
+        }
+        ordered.sort_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)));
+        let mut ordered = ordered.into_iter();
+        let (_, _, _, driver, peeked) = ordered.next().expect("two or more terms");
+        let mut candidates = match peeked {
+            Some(runs) => {
+                let mut keys = Vec::new();
+                for run in &runs {
+                    keys.extend(crate::gin_runs::decode_run(driver.len(), run)?);
+                }
+                self.entries += keys.len();
+                keys
+            }
+            None => self.posting_list(istore, &driver)?,
+        };
+        let mut ordered = ordered.map(|(_, _, _, t, _)| t);
         let probe = |term: &[u8], key: &[u8]| [term, key].concat();
         let span = |lo: Vec<u8>, hi: Vec<u8>| KeyBound {
             lo: Some(lo),
@@ -568,7 +598,7 @@ impl GinGather {
             hi: Some(hi),
             hi_inc: true,
         };
-        for term in ordered {
+        for term in ordered.by_ref() {
             if candidates.is_empty() {
                 break;
             }
@@ -584,27 +614,102 @@ impl GinGather {
                 {
                     j += 1;
                 }
-                // One leaf: its root-to-leaf path once, then the cheaper leaf-local match — a probe
-                // per candidate, or a merge with the term's entries between the first and last
-                // candidate — one `gin_entry` per step.
-                let (found, path, _) = istore
-                    .range_scan_with_units(&span(first, probe(&term, &candidates[j])), &[])?;
-                self.pages += path;
-                self.entries += (j + 1 - i).min(found.len());
-                // Both lists ascend, so a merge keeps the candidates whose entry was found.
-                let mut f = found.iter().map(|(k, _)| &k[term.len()..]).peekable();
-                for c in &candidates[i..=j] {
-                    while f.next_if(|k| *k < c.as_slice()).is_some() {}
-                    if f.next_if(|k| *k == c.as_slice()).is_some() {
-                        survivors.push(c.clone());
-                    }
-                }
+                // One leaf: the runs from `term ‖ c_i` through the run holding (or following) `c_j`
+                // — the first run past `term ‖ c_j` (gin.md §4.5/§6.2). The group charges the nodes
+                // that range overlaps (its root-to-leaf path when the run is in the same leaf), then
+                // the cheaper leaf-local match — a probe per candidate, or a merge with the runs'
+                // storage keys — one `gin_entry` per step.
+                let last = probe(&term, &candidates[j]);
+                let group = &candidates[i..=j];
+                // The run past `term ‖ c_j` ends the charged range; membership is found by a lookup
+                // per candidate when the group is small, else by one scan of the group's runs — the
+                // same answer and charges either way.
+                let (end, found) = if group.len() <= GIN_GROUP_LOOKUPS {
+                    probe_group_lookups(istore, &term, group)?
+                } else {
+                    probe_group_scan(istore, &term, group, &first, &last)?
+                };
+                self.pages += istore.overlap_node_count(&span(first, end.unwrap_or(last)));
+                self.entries += group.len();
+                survivors.extend(found);
                 i = j + 1;
             }
             candidates = survivors;
         }
         Ok(candidates)
     }
+}
+
+/// A skip-scan leaf group of at most this many candidates finds each candidate's run by its own lookup;
+/// a larger one scans the group's runs once (gin.md §6.2). An implementation choice: both find the
+/// same postings and the group's charges do not depend on it.
+const GIN_GROUP_LOOKUPS: usize = 4;
+
+/// One leaf group's surviving candidates by a lookup per candidate — the first run at or after
+/// `term ‖ c` holds `c` if any run does — and the key of the run at or after the last candidate.
+fn probe_group_lookups(
+    istore: &TableStore,
+    term: &[u8],
+    group: &[Vec<u8>],
+) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
+    let mut found = Vec::new();
+    let mut decoded: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
+    let mut end = None;
+    for c in group {
+        let Some(run) = crate::gin_runs::run_at_or_after(istore, term, c)? else {
+            break;
+        };
+        if decoded.as_ref().is_none_or(|(r, _)| *r != run) {
+            let keys = crate::gin_runs::decode_run(term.len(), &run)?;
+            decoded = Some((run.clone(), keys));
+        }
+        let (_, keys) = decoded.as_ref().expect("decoded above");
+        if keys.binary_search(c).is_ok() {
+            found.push(c.clone());
+        }
+        // A candidate with no run at or after it ends the loop, so after the last candidate this is
+        // the run at or after it.
+        end = Some(run);
+    }
+    Ok((end, found))
+}
+
+/// One leaf group's surviving candidates by one scan of its runs, from `term ‖ c_first` through the
+/// first run past `last` (= `term ‖ c_last`), and that run's key.
+fn probe_group_scan(
+    istore: &TableStore,
+    term: &[u8],
+    group: &[Vec<u8>],
+    first: &[u8],
+    last: &[u8],
+) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
+    let mut runs: Vec<Vec<u8>> = Vec::new();
+    let mut past = false;
+    let mut bound = GinGather::posting_bound(term);
+    bound.lo = Some(first.to_vec());
+    istore.scan_range(&bound, &mut |key, _| {
+        runs.push(key.to_vec());
+        past = key > last;
+        Ok(!past)
+    })?;
+    let mut found = Vec::new();
+    let mut decoded: Option<(usize, Vec<Vec<u8>>)> = None;
+    for c in group {
+        let key = [term, c].concat();
+        let at = runs.partition_point(|r| r.as_slice() < key.as_slice());
+        if at == runs.len() {
+            break;
+        }
+        if decoded.as_ref().is_none_or(|(d, _)| *d != at) {
+            decoded = Some((at, crate::gin_runs::decode_run(term.len(), &runs[at])?));
+        }
+        let (_, keys) = decoded.as_ref().expect("decoded above");
+        if keys.binary_search(c).is_ok() {
+            found.push(c.clone());
+        }
+    }
+    let end = if past { runs.pop() } else { None };
+    Ok((end, found))
 }
 
 /// The outcome of a GIN opclass's `extract_query_terms` (gin.md §2/§6): the distinct query terms to

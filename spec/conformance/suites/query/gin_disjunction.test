@@ -51,7 +51,7 @@ SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[3]) ORDER BY id
 3
 
 # overlapping arms: a row in both arms' gathers is fetched once
-# cost: 57
+# cost: 55
 query I nosort
 SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[2,1], ARRAY[1,2,3]) ORDER BY id
 ----
@@ -77,7 +77,7 @@ SELECT id FROM t WHERE tags IN ('{}'::i32[], ARRAY[3]) ORDER BY id
 
 # an arm holding a NULL element still gathers its non-NULL terms (array `=` treats NULL elements as
 # equal, so row 9 matches)
-# cost: 44
+# cost: 45
 query I nosort
 SELECT id FROM t WHERE tags IN (ARRAY[1,NULL], ARRAY[6,7]) ORDER BY id
 ----
@@ -160,7 +160,7 @@ INSERT INTO d VALUES
   (5, '{}'),
   (6, NULL)
 
-# cost: 25
+# cost: 27
 query I nosort
 SELECT id FROM d WHERE doc @> '{"a": 2}' OR doc ? 'c' ORDER BY id
 ----
@@ -168,7 +168,7 @@ SELECT id FROM d WHERE doc @> '{"a": 2}' OR doc ? 'c' ORDER BY id
 3
 4
 
-# cost: 25
+# cost: 27
 query I nosort
 SELECT id FROM d WHERE doc ?| '{b,zz}' OR doc @> '{"c": [2]}' ORDER BY id
 ----

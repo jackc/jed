@@ -1,7 +1,6 @@
 package jed
 
 import (
-	"bytes"
 	"fmt"
 	"sort"
 )
@@ -555,20 +554,20 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 				return 0, newError(FeatureNotSupported,
 					"collation upgrade of a table with a partial index is not supported yet")
 			}
-			var ekeys [][]byte
+			var ekeys []indexEntry
 			for _, e := range entries {
 				eks, err := indexEntryKeysColumns(table.Columns, colTypes, colls, def, e.Key, e.Row)
 				if err != nil {
 					return 0, err
 				}
-				ekeys = append(ekeys, eks...)
-			}
-			sort.Slice(ekeys, func(a, b int) bool { return bytes.Compare(ekeys[a], ekeys[b]) < 0 })
-			fresh := newTableStore(c, nil)
-			for _, ek := range ekeys {
-				if _, err := fresh.Insert(ek, storedRow{}); err != nil {
-					return 0, err
+				for _, ek := range eks {
+					ekeys = append(ekeys, indexEntry{ek, len(e.Key)})
 				}
+			}
+			sortIndexEntries(ekeys)
+			fresh := newTableStore(c, nil)
+			if err := indexBuildInsert(fresh, def.Kind, ekeys); err != nil {
+				return 0, err
 			}
 			s.putIndexStore(def.Name, fresh)
 		}
@@ -1314,7 +1313,7 @@ func (s *snapshot) alterTableRewrite(t *catTable, colTypes []colType, entries []
 // syncAlterConstraintIndexes applies the backing-store delta for ALTER TABLE slice 2 after the
 // final catalog and row validation have succeeded. Entries are already sorted by raw key bytes.
 // indexOld/indexNew name a RENAME CONSTRAINT's backing-index rename ("" when none).
-func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32, indexOld, indexNew string) error {
+func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[string][]indexEntry, pageSize uint32, indexOld, indexNew string) error {
 	live := make(map[string]bool, len(next.Indexes))
 	for _, ix := range next.Indexes {
 		live[ix.Name] = true
@@ -1350,21 +1349,15 @@ func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[s
 		if s.storePaging != nil {
 			fresh.attachPaging(s.storePaging)
 		}
-		for _, entry := range entries[key] {
-			inserted, err := fresh.Insert(entry, nil)
-			if err != nil {
-				return err
-			}
-			if !inserted {
-				panic("constraint index entries include the storage-key suffix")
-			}
+		if err := indexBuildInsert(fresh, ix.Kind, entries[key]); err != nil {
+			return err
 		}
 		s.indexStores[key] = fresh
 	}
 	return nil
 }
 
-func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32) error {
+func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][]indexEntry, pageSize uint32) error {
 	for _, ix := range old.Indexes {
 		key := ix.Name
 		delete(s.indexStores, key)
@@ -1376,10 +1369,8 @@ func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][
 		if s.storePaging != nil {
 			fresh.attachPaging(s.storePaging)
 		}
-		for _, e := range entries[key] {
-			if _, err := fresh.Insert(e, nil); err != nil {
-				return err
-			}
+		if err := indexBuildInsert(fresh, ix.Kind, entries[key]); err != nil {
+			return err
 		}
 		s.indexStores[key] = fresh
 	}

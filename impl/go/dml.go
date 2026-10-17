@@ -2264,7 +2264,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 	// each phase-1 entry prefix (byte-identical to building the entry with the key directly —
 	// indexes.md §3/§4), then write the entries after the rows (an index write cannot fail, so
 	// all-or-nothing is unchanged).
-	indexInserts := make([][][]byte, len(table.Indexes))
+	indexInserts := make([][]indexEntry, len(table.Indexes))
 	for _, pr := range prepared {
 		key := pr.key
 		if key == nil {
@@ -2273,7 +2273,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		for k := range table.Indexes {
 			for _, p := range pr.prefixes[k] {
 				ek := append(append([]byte{}, p...), key...)
-				indexInserts[k] = append(indexInserts[k], ek)
+				indexInserts[k] = append(indexInserts[k], indexEntry{ek, len(key)})
 			}
 		}
 		ok, err := store.Insert(key, pr.row)
@@ -2292,7 +2292,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 	for k, def := range table.Indexes {
 		istore := db.writeIndexStoreScoped(dbScope, def.Name)
 		for _, ek := range indexInserts[k] {
-			inserted, err := istore.Insert(ek, nil)
+			inserted, err := indexEntryInsert(istore, def.Kind, ek.key, ek.skeyLen)
 			if err != nil {
 				return nil, err
 			}
@@ -2456,7 +2456,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 	for i, def := range table.Indexes {
 		istore := db.writeIndexStoreScoped(dbScope, def.Name)
 		for _, entry := range indexEntries[i] {
-			inserted, err := istore.Insert(entry, nil)
+			inserted, err := indexEntryInsert(istore, def.Kind, entry, len(key))
 			if err != nil {
 				return nil, err
 			}
@@ -3353,7 +3353,10 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		}
 		insertPrefixes[i] = rp
 	}
-	type indexMove struct{ removals, insertions [][]byte }
+	type indexMove struct {
+		removals, insertions [][]byte
+		oldLen, newLen       int
+	}
 	indexMoves := make([][]indexMove, len(table.Indexes))
 	for _, u := range updates {
 		for k := range rindexes {
@@ -3370,7 +3373,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			removals := bytesDiff(oldEks, newEks)
 			insertions := bytesDiff(newEks, oldEks)
 			if len(removals) > 0 || len(insertions) > 0 {
-				indexMoves[k] = append(indexMoves[k], indexMove{removals: removals, insertions: insertions})
+				indexMoves[k] = append(indexMoves[k], indexMove{removals: removals, insertions: insertions, oldLen: len(u.key), newLen: len(u.newKey)})
 			}
 		}
 	}
@@ -3388,7 +3391,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			}
 		}
 	}
-	indexAdds := make([][][]byte, len(table.Indexes))
+	indexAdds := make([][]indexEntry, len(table.Indexes))
 	for i, row := range inserts {
 		var key []byte
 		if len(pk) > 0 {
@@ -3403,7 +3406,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		for k := range table.Indexes {
 			for _, p := range insertPrefixes[i][k] {
 				ek := append(append([]byte{}, p...), key...)
-				indexAdds[k] = append(indexAdds[k], ek)
+				indexAdds[k] = append(indexAdds[k], indexEntry{ek, len(key)})
 			}
 		}
 		ok, err := store.Insert(key, row)
@@ -3447,14 +3450,14 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		if rekeyed {
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
-					if _, err := istore.Remove(oldEk); err != nil {
+					if _, err := indexEntryRemove(istore, def.Kind, oldEk, mv.oldLen); err != nil {
 						return 0, nil, err
 					}
 				}
 			}
 		}
 		for _, ek := range indexAdds[k] {
-			inserted, err := istore.Insert(ek, nil)
+			inserted, err := indexEntryInsert(istore, def.Kind, ek.key, ek.skeyLen)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -3465,13 +3468,13 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		for _, mv := range indexMoves[k] {
 			if !rekeyed {
 				for _, oldEk := range mv.removals {
-					if _, err := istore.Remove(oldEk); err != nil {
+					if _, err := indexEntryRemove(istore, def.Kind, oldEk, mv.oldLen); err != nil {
 						return 0, nil, err
 					}
 				}
 			}
 			for _, newEk := range mv.insertions {
-				inserted, err := istore.Insert(newEk, nil)
+				inserted, err := indexEntryInsert(istore, def.Kind, newEk, mv.newLen)
 				if err != nil {
 					return 0, nil, err
 				}
@@ -4165,14 +4168,16 @@ func (db *engine) executeDeleteTarget(del *deleteStmt, params []Value, ctx cteCt
 	if err != nil {
 		return outcome{}, err
 	}
-	toRemove := make([][][]byte, len(rindexes))
+	toRemove := make([][]indexEntry, len(rindexes))
 	for k := range rindexes {
 		for _, m := range matched {
 			eks, err := db.indexEntries(table.Columns, store.colTypes, colls, &rindexes[k], m.key, m.row)
 			if err != nil {
 				return outcome{}, err
 			}
-			toRemove[k] = append(toRemove[k], eks...)
+			for _, ek := range eks {
+				toRemove[k] = append(toRemove[k], indexEntry{ek, len(m.key)})
+			}
 		}
 	}
 	// Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
@@ -4186,7 +4191,7 @@ func (db *engine) executeDeleteTarget(del *deleteStmt, params []Value, ctx cteCt
 	for k, def := range table.Indexes {
 		istore := db.writeIndexStoreScoped(del.DB, def.Name)
 		for _, ek := range toRemove[k] {
-			if _, err := istore.Remove(ek); err != nil {
+			if _, err := indexEntryRemove(istore, def.Kind, ek.key, ek.skeyLen); err != nil {
 				return outcome{}, err
 			}
 		}
@@ -4851,7 +4856,10 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 	// cores). An entry key is `indexed-cols || storage-key`, so a re-keyed row moves EVERY
 	// one of its entries (the suffix changed); a non-PK UPDATE keeps the suffix and moves
 	// only entries whose indexed columns changed.
-	type indexMove struct{ removals, insertions [][]byte }
+	type indexMove struct {
+		removals, insertions [][]byte
+		oldLen, newLen       int
+	}
 	indexMoves := make([][]indexMove, len(table.Indexes))
 	for _, u := range updates {
 		for k := range table.Indexes {
@@ -4870,7 +4878,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			removals := bytesDiff(oldEks, newEks)
 			insertions := bytesDiff(newEks, oldEks)
 			if len(removals) > 0 || len(insertions) > 0 {
-				indexMoves[k] = append(indexMoves[k], indexMove{removals: removals, insertions: insertions})
+				indexMoves[k] = append(indexMoves[k], indexMove{removals: removals, insertions: insertions, oldLen: len(u.key), newLen: len(u.newKey)})
 			}
 		}
 	}
@@ -4904,14 +4912,14 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			istore := db.writeIndexStoreScoped(upd.DB, def.Name)
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
-					if _, err := istore.Remove(oldEk); err != nil {
+					if _, err := indexEntryRemove(istore, def.Kind, oldEk, mv.oldLen); err != nil {
 						return outcome{}, err
 					}
 				}
 			}
 			for _, mv := range indexMoves[k] {
 				for _, newEk := range mv.insertions {
-					inserted, err := istore.Insert(newEk, nil)
+					inserted, err := indexEntryInsert(istore, def.Kind, newEk, mv.newLen)
 					if err != nil {
 						return outcome{}, err
 					}
@@ -4932,12 +4940,12 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			istore := db.writeIndexStoreScoped(upd.DB, def.Name)
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
-					if _, err := istore.Remove(oldEk); err != nil {
+					if _, err := indexEntryRemove(istore, def.Kind, oldEk, mv.oldLen); err != nil {
 						return outcome{}, err
 					}
 				}
 				for _, newEk := range mv.insertions {
-					inserted, err := istore.Insert(newEk, nil)
+					inserted, err := indexEntryInsert(istore, def.Kind, newEk, mv.newLen)
 					if err != nil {
 						return outcome{}, err
 					}

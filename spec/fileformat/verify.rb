@@ -28,8 +28,9 @@ require "zlib"
 
 MAGIC = "JEDB".b
 VERSION = 47 # v47: multi-column GIN indexes — a GIN index may list several key columns, and each
-# entry of a multi-column GIN index is column_tag (u8, the 0-based key position) ‖ term ‖ storage key
-# (gin.md §4.4); a single-column GIN's entries are byte-identical to v46. No catalog byte layout change.
+# term of a multi-column GIN index is prefixed by its column_tag (u8, the 0-based key position,
+# gin.md §4.4) — and GIN posting runs: every GIN tree record is a run of one term's storage keys,
+# term ‖ last ‖ front-coded body ‖ u16 body length (gin.md §4.5). No catalog byte layout change.
 # v46: ordered index keys — index_flags bit4 has_key_options; when set, one option byte
 # per key element (bit0 desc, bit1 nulls_first) follows the optional timezone dependencies, and the
 # element's entry slots use the encoding.md §2.16 ordered slot (indexes.md §11). No other change.
@@ -2952,8 +2953,57 @@ end
 #
 # A MULTI-column GIN index (v43, gin.md §4.4) prefixes each column's terms with its 0-based key position
 # as one byte: column_tag ‖ term ‖ storage_key. A single-column index has no tag.
+#
+# Since v43 the tree's records are POSTING RUNS (gin.md §4.5): each term's storage keys, ascending,
+# packed greedily into run keys of at most GIN_RUN_MAX_BYTES (a run of one key may be longer). A run
+# key is term ‖ last ‖ body ‖ u16 BE len(body), the body front-coding every key but the last, in
+# ascending order, as varint(shared) ‖ varint(suffix length) ‖ suffix against the previous key (the
+# first against the last). A from-scratch image is this greedy packing.
+GIN_RUN_MAX_BYTES = 64
+
+def gin_varint(v)
+  out = "".b
+  loop do
+    byte = v & 0x7F
+    v >>= 7
+    return out << (v.zero? ? byte : byte | 0x80).chr if v.zero?
+
+    out << (byte | 0x80).chr
+  end
+end
+
+def gin_shared_prefix(a, b)
+  n = 0
+  n += 1 while n < a.bytesize && n < b.bytesize && a.getbyte(n) == b.getbyte(n)
+  n
+end
+
+def gin_encode_run(term, keys)
+  last = keys.last
+  body = "".b
+  prev = last
+  keys[0...-1].each do |k|
+    shared = gin_shared_prefix(prev, k)
+    body << gin_varint(shared) << gin_varint(k.bytesize - shared) << k.byteslice(shared..)
+    prev = k
+  end
+  (term + last + body + [body.bytesize].pack("n")).b
+end
+
+def gin_pack_runs(term, keys)
+  runs = []
+  start = 0
+  while start < keys.size
+    stop = start + 1
+    stop += 1 while stop < keys.size && gin_encode_run(term, keys[start..stop]).bytesize <= GIN_RUN_MAX_BYTES
+    runs << gin_encode_run(term, keys[start...stop])
+    start = stop
+  end
+  runs
+end
+
 def gin_index_entries(table, ix)
-  pairs = []
+  postings = Hash.new { |h, k| h[k] = [] }
   ix[:cols].each_with_index do |ci, pos|
     col_type = table[:columns][ci][:type]
     elem_type = array_elem(col_type)
@@ -2968,13 +3018,14 @@ def gin_index_entries(table, ix)
                 elems = av.is_a?(Hash) ? av[:elements] : av
                 elems.compact.map { |e| gin_element_term(elem_type, e) }
               end
-      terms.uniq.each do |term|
-        key = (tag + term + storage_key).b
-        pairs << [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
-      end
+      terms.uniq.each { |term| postings[(tag + term).b] << storage_key.b }
     end
   end
-  pairs.sort_by { |key, _| key }
+  postings.keys.sort.flat_map do |term|
+    gin_pack_runs(term, postings[term].sort).map do |key|
+      [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
+    end
+  end.sort_by { |key, _| key }
 end
 
 # An array_ops term (spec/design/gin.md §4/§4.2/§4.3): the element's key body, a text or bytea

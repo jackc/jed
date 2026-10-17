@@ -446,6 +446,15 @@ import {
 import { StmtRng } from "./seam.ts";
 import { ginJsonbIndexTerms, ginJsonbKeyTerm } from "./gin_jsonb.ts";
 import {
+  ginDecodeRun,
+  ginRunAtOrAfter,
+  type IndexEntry,
+  indexBuildInsert,
+  indexEntryInsert,
+  indexEntryRemove,
+  sortIndexEntries,
+} from "./gin_runs.ts";
+import {
   type GinTree,
   ginTreeFromTerms,
   ginTreeMapTerms,
@@ -9221,7 +9230,7 @@ export class Engine {
           if (mask[i] && row[i]!.kind === "null") throw notNullViolation(notNullNames[i]!);
       }
     }
-    const constraintEntries = new Map<string, Uint8Array[]>();
+    const constraintEntries = new Map<string, IndexEntry[]>();
     if (addedConstraints.size > 0) {
       // Presence in this map is also the publication-time identity marker for a newly-added backing
       // index. Seed empty indexes so DROP+ADD name reuse cannot retain the old store.
@@ -9308,7 +9317,8 @@ export class Engine {
             }
           }
           const es = constraintEntries.get(k) ?? [];
-          es.push(...this.indexEntries(table.columns, alterColTypes, colls, ri, entry.key, row));
+          for (const ek of this.indexEntries(table.columns, alterColTypes, colls, ri, entry.key, row))
+            es.push({ key: ek, skeyLen: entry.key.length });
           constraintEntries.set(k, es);
         }
       }
@@ -9381,7 +9391,7 @@ export class Engine {
             }
         }
       }
-      for (const es of constraintEntries.values()) es.sort(compareBytes);
+      for (const es of constraintEntries.values()) sortIndexEntries(es);
     }
     const rekeyed = rewriteRows !== null && pkRekeyed;
     if (rekeyed) {
@@ -9389,12 +9399,11 @@ export class Engine {
       const colls = this.columnCollations(table.columns);
       for (const index of table.indexes) {
         const resolved = this.resolveIndex(table, index);
-        const entries: Uint8Array[] = [];
+        const entries: IndexEntry[] = [];
         for (const row of rewriteRows!)
-          entries.push(
-            ...this.indexEntries(table.columns, rewriteColTypes!, colls, resolved, row.key, row.row),
-          );
-        entries.sort(compareBytes);
+          for (const ek of this.indexEntries(table.columns, rewriteColTypes!, colls, resolved, row.key, row.row))
+            entries.push({ key: ek, skeyLen: row.key.length });
+        sortIndexEntries(entries);
         constraintEntries.set(index.name, entries);
       }
     }
@@ -10191,11 +10200,7 @@ export class Engine {
       this.working().putIndex(tableKey, def, this.pageSize);
     }
     const istore = this.writeIndexStoreScoped(ci.db, nameKey);
-    for (const ek of entries) {
-      if (!istore.insert(ek, [])) {
-        throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
-      }
-    }
+    indexBuildInsert(istore, def.kind, entries);
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
   }
 
@@ -10210,7 +10215,7 @@ export class Engine {
   private executeReindex(rx: Reindex): Outcome {
     const targets = this.reindexTargets(rx);
     const meter = this.session.newMeter();
-    const rebuilt: { scope: string; tableKey: string; def: IndexDef; entries: Uint8Array[] }[] = [];
+    const rebuilt: { scope: string; tableKey: string; def: IndexDef; entries: IndexEntry[] }[] = [];
     for (const target of targets) {
       if (target.names.length === 0) continue;
       this.checkAttachmentWritable(target.scope);
@@ -10243,11 +10248,8 @@ export class Engine {
       snap.removeIndex(r.tableKey, nameKey);
       snap.putIndex(r.tableKey, r.def, pageSize);
       const istore = this.writeIndexStoreScoped(r.scope, nameKey);
-      for (const ek of r.entries) {
-        if (!istore.insert(ek, [])) {
-          throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
-        }
-      }
+      // The same build insert as CREATE INDEX, so a GIN index's posting runs come out identical.
+      indexBuildInsert(istore, r.def.kind, r.entries);
     }
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
   }
@@ -10408,7 +10410,7 @@ export class Engine {
     table: Table,
     def: IndexDef,
     meter: Meter,
-  ): Uint8Array[] {
+  ): IndexEntry[] {
     const columns = table.columns;
     // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
     // C-only / non-text table (the fast path).
@@ -10430,7 +10432,7 @@ export class Engine {
     const store = this.lkpStoreScoped(scope, table.name);
     const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
     meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
-    const entries: Uint8Array[] = [];
+    const entries: IndexEntry[] = [];
     // A UNIQUE build verifies the existing rows before the index is registered
     // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
     // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
@@ -10453,13 +10455,14 @@ export class Engine {
           seenPrefixes.add(k);
         }
       }
-      entries.push(...indexEntryKeys(columns, store.columnTypes(), colls, rindex, e.key, row, env));
+      for (const ek of indexEntryKeys(columns, store.columnTypes(), colls, rindex, e.key, row, env))
+        entries.push({ key: ek, skeyLen: e.key.length });
     }
     meter.guard();
     // Sorted by entry key (indexes.md §1): every insert is then a right-edge append, so the built tree
     // packs ~full instead of splintering under the storage-key order the scan produced (random in
     // entry-key space). Part of the byte contract — the sort fixes the built tree's shape across cores.
-    entries.sort(compareBytes);
+    sortIndexEntries(entries);
     return entries;
   }
 
@@ -12187,7 +12190,7 @@ export class Engine {
     // entries are computed against its final key (the rowid included) and written after
     // the rows (indexes.md §4 — an index write cannot fail, so all-or-nothing is
     // unchanged).
-    const indexInserts: Uint8Array[][] = table.indexes.map(() => []);
+    const indexInserts: IndexEntry[][] = table.indexes.map(() => []);
     for (let ri = 0; ri < prepared.length; ri++) {
       const pr = prepared[ri]!;
       const key = pr.key ?? encodeInt("i64", store.allocRowid());
@@ -12195,7 +12198,7 @@ export class Engine {
       // entry with the key directly — indexes.md §3/§4).
       for (let k = 0; k < table.indexes.length; k++) {
         for (const p of entryPrefixes[ri]![k]!) {
-          indexInserts[k]!.push(concatBytes([p, key]));
+          indexInserts[k]!.push({ key: concatBytes([p, key]), skeyLen: key.length });
         }
       }
       if (!store.insert(key, pr.row)) {
@@ -12211,7 +12214,7 @@ export class Engine {
       const def = table.indexes[k]!;
       const istore = this.writeIndexStoreScoped(dbScope, def.name);
       for (const ek of indexInserts[k]!) {
-        if (!istore.insert(ek, [])) {
+        if (!indexEntryInsert(istore, def.kind, ek.key, ek.skeyLen)) {
           // A cross-sub-statement unique-index collision under the read pin (as above).
           throw uniqueViolation(table.name, def.name);
         }
@@ -12355,7 +12358,8 @@ export class Engine {
       const def = table.indexes[i]!;
       const istore = this.writeIndexStoreScoped(dbScope, def.name);
       for (const entry of indexEntries[i]!) {
-        if (!istore.insert(entry, [])) throw uniqueViolation(table.name, def.name);
+        if (!indexEntryInsert(istore, def.kind, entry, key.length))
+          throw uniqueViolation(table.name, def.name);
       }
     }
     this.syncPendingWrites(meter);
@@ -13184,9 +13188,7 @@ export class Engine {
         this.indexEntries(table.columns, store.columnTypes(), colls, rindex, new Uint8Array(0), row),
       ),
     );
-    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
-      () => [],
-    );
+    const indexMoves: IndexMove[][] = table.indexes.map(() => []);
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
         // A re-keyed row moves EVERY entry (the storage-key suffix changed); otherwise only the
@@ -13196,7 +13198,7 @@ export class Engine {
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0)
-          indexMoves[k]!.push({ removals, insertions });
+          indexMoves[k]!.push({ removals, insertions, oldLen: u.key.length, newLen: u.newKey.length });
       }
     }
     // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table; append each
@@ -13206,13 +13208,14 @@ export class Engine {
     // since an insert or a moved row may land on a key another moved row vacates; each index
     // likewise removes every moved entry before adding any.
     if (rekeyed) for (const u of updates) store.remove(u.key);
-    const indexAdds: Uint8Array[][] = table.indexes.map(() => []);
+    const indexAdds: IndexEntry[][] = table.indexes.map(() => []);
     for (let ri = 0; ri < inserts.length; ri++) {
       const row = inserts[ri]!;
       const key =
         pk.length > 0 ? encodePkKey(colTypes, pk, colls, row) : encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
-        for (const p of insertPrefixes[ri]![k]!) indexAdds[k]!.push(concatBytes([p, key]));
+        for (const p of insertPrefixes[ri]![k]!)
+          indexAdds[k]!.push({ key: concatBytes([p, key]), skeyLen: key.length });
       }
       if (!store.insert(key, row)) {
         // Reachable only under the writable-CTE read pin (writable-cte.md §7), as for INSERT:
@@ -13229,6 +13232,7 @@ export class Engine {
       for (const u of updates) store.replace(u.key, u.newRow);
     }
     for (let k = 0; k < table.indexes.length; k++) {
+      const kind = table.indexes[k]!.kind;
       const name = table.indexes[k]!.name;
       const istore = this.writeIndexStore(name);
       // An index-entry insert that found its key taken: under a re-key a cross-sub-statement
@@ -13237,14 +13241,14 @@ export class Engine {
         rekeyed
           ? uniqueViolation(table.name, name)
           : engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
-      if (rekeyed) for (const mv of indexMoves[k]!) for (const oldEk of mv.removals) istore.remove(oldEk);
+      if (rekeyed) for (const mv of indexMoves[k]!) for (const oldEk of mv.removals) indexEntryRemove(istore, kind, oldEk, mv.oldLen);
       for (const ek of indexAdds[k]!) {
-        if (!istore.insert(ek, [])) throw collision();
+        if (!indexEntryInsert(istore, kind, ek.key, ek.skeyLen)) throw collision();
       }
       for (const mv of indexMoves[k]!) {
-        if (!rekeyed) for (const oldEk of mv.removals) istore.remove(oldEk);
+        if (!rekeyed) for (const oldEk of mv.removals) indexEntryRemove(istore, kind, oldEk, mv.oldLen);
         for (const newEk of mv.insertions) {
-          if (!istore.insert(newEk, [])) throw collision();
+          if (!indexEntryInsert(istore, kind, newEk, mv.newLen)) throw collision();
         }
       }
     }
@@ -13792,10 +13796,11 @@ export class Engine {
     // against the stored row) BEFORE the removals below. Resolve the table's indexes once;
     // toRemove[kx] is index kx's entries (rindexes order = indexes order).
     const rindexes = this.resolveTableIndexes(table);
-    const toRemove: Uint8Array[][] = rindexes.map((rindex) => {
-      const acc: Uint8Array[] = [];
+    const toRemove: IndexEntry[][] = rindexes.map((rindex) => {
+      const acc: IndexEntry[] = [];
       for (const m of matched)
-        acc.push(...this.indexEntries(table.columns, store.columnTypes(), colls, rindex, m.key, m.row));
+        for (const ek of this.indexEntries(table.columns, store.columnTypes(), colls, rindex, m.key, m.row))
+          acc.push({ key: ek, skeyLen: m.key.length });
       return acc;
     });
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
@@ -13805,7 +13810,7 @@ export class Engine {
     for (let kx = 0; kx < table.indexes.length; kx++) {
       const def = table.indexes[kx]!;
       const istore = this.writeIndexStoreScoped(del.db, def.name);
-      for (const ek of toRemove[kx]!) istore.remove(ek);
+      for (const ek of toRemove[kx]!) indexEntryRemove(istore, def.kind, ek.key, ek.skeyLen);
     }
     this.syncPendingWrites(meter);
     if (matched.length > 0) this.markEstimatorMutation(del.db, del.table);
@@ -14320,9 +14325,7 @@ export class Engine {
     // cores). An entry key is `indexed-cols || storage-key`, so a re-keyed row moves EVERY
     // one of its entries (the suffix changed); a non-PK UPDATE keeps the suffix and moves
     // only entries whose indexed columns changed.
-    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
-      () => [],
-    );
+    const indexMoves: IndexMove[][] = table.indexes.map(() => []);
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
         // The row's old and new entry SETS (one entry for an ordered index, one per term for GIN —
@@ -14334,7 +14337,7 @@ export class Engine {
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0) {
-          indexMoves[k]!.push({ removals, insertions });
+          indexMoves[k]!.push({ removals, insertions, oldLen: u.key.length, newLen: u.newKey.length });
         }
       }
     }
@@ -14358,11 +14361,13 @@ export class Engine {
         }
       }
       for (let k = 0; k < table.indexes.length; k++) {
+        const kind = table.indexes[k]!.kind;
         const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name);
-        for (const mv of indexMoves[k]!) for (const oldEk of mv.removals) istore.remove(oldEk);
+        for (const mv of indexMoves[k]!)
+          for (const oldEk of mv.removals) indexEntryRemove(istore, kind, oldEk, mv.oldLen);
         for (const mv of indexMoves[k]!)
           for (const newEk of mv.insertions) {
-            if (!istore.insert(newEk, [])) {
+            if (!indexEntryInsert(istore, kind, newEk, mv.newLen)) {
               // A cross-sub-statement collision under the read pin (as above).
               throw uniqueViolation(table.name, table.indexes[k]!.name);
             }
@@ -14371,11 +14376,12 @@ export class Engine {
     } else {
       for (const u of updates) writeStore.replace(u.key, u.row);
       for (let k = 0; k < table.indexes.length; k++) {
+        const kind = table.indexes[k]!.kind;
         const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name);
         for (const mv of indexMoves[k]!) {
-          for (const oldEk of mv.removals) istore.remove(oldEk);
+          for (const oldEk of mv.removals) indexEntryRemove(istore, kind, oldEk, mv.oldLen);
           for (const newEk of mv.insertions) {
-            if (!istore.insert(newEk, [])) {
+            if (!indexEntryInsert(istore, kind, newEk, mv.newLen)) {
               throw engineError(
                 "data_corrupted",
                 "index entry keys are unique (storage-key suffix)",
@@ -28947,6 +28953,10 @@ export function ginEntries(
   return out;
 }
 
+// IndexMove is one index's phase-2 entry moves for one row: the entries to remove (each ending in an
+// oldLen-byte storage key) and to insert (each ending in a newLen-byte storage key).
+type IndexMove = { removals: Uint8Array[]; insertions: Uint8Array[]; oldLen: number; newLen: number };
+
 // GIN_MAX_KEY_COLUMNS is the most key columns a GIN index takes (gin.md §4.4) — PostgreSQL's
 // INDEX_MAX_KEYS; each entry's column tag is one byte.
 export const GIN_MAX_KEY_COLUMNS = 32;
@@ -29026,16 +29036,22 @@ class GinGather {
     return { lo: term, loInc: true, hi: prefixSuccessor(term), hiInc: false };
   }
 
-  // read scans b of the entry tree, charging its overlap nodes and entries, and returns the storage
-  // keys of its entries (the suffix after the term) in ascending order.
+  // read scans b of the entry tree, charging its overlap nodes and one gin_entry per posting, and
+  // returns the storage keys of its posting runs (gin.md §4.5) in ascending order.
   private read(b: KeyBound, term: Uint8Array): Uint8Array[] {
     const scan = this.istore.rangeScanWithUnits(b, []);
     this.pages += scan.pages;
-    this.entries += scan.entries.length;
-    return scan.entries.map((e) => e.key.slice(term.length));
+    return this.decodeRuns(term, scan.entries.map((e) => e.key));
   }
 
-  // postingList is a term's whole posting list (a prefix range scan).
+  // decodeRuns is the storage keys of a term's run records, charging one gin_entry each.
+  private decodeRuns(term: Uint8Array, runs: Uint8Array[]): Uint8Array[] {
+    const keys: Uint8Array[] = [];
+    for (const run of runs) keys.push(...ginDecodeRun(term.length, run));
+    this.entries += keys.length;
+    return keys;
+  }
+
   // eval is the candidates of a query tree (gin.md §2.2/§6), ascending. A term is its whole posting
   // list. An or unions its leaves' lists (in byte order), then its children's candidates (in order).
   // An and intersects its leaves by the skip-scan (§6.2) — or, with no leaf, starts from its first
@@ -29065,25 +29081,45 @@ class GinGather {
     return cand;
   }
 
+  // postingList is a term's whole posting list (a prefix range scan).
   postingList(term: Uint8Array): Uint8Array[] {
     return this.read(GinGather.postingBound(term), term);
   }
 
   // intersect is the ALL-mode intersection (gin.md §6.2). The terms are ordered by their posting
-  // range's skeleton overlap count (ties by bytes); the first list is read whole, and each following
-  // term is probed at the surviving candidates in leaf groups — runs of consecutive candidates whose
-  // probe keys fall in one leaf — each charging its root-to-leaf path once and one gin_entry per step
-  // of the cheaper leaf-local match. Stops once no candidate survives. The spans and the grouping
-  // read only the resident skeleton and are unmetered.
+  // range's skeleton overlap count; a term whose range lies in one leaf is peeked — its run records
+  // read, charging the path — and ordered by its run count and bytes, ties by term bytes. The first
+  // list is read whole, and each following term is probed at the surviving candidates in leaf groups
+  // — runs of consecutive candidates whose probe keys fall in one leaf — each reading the runs from
+  // its first probe key through the run past its last, charging the nodes that range overlaps and one
+  // gin_entry per step of the cheaper leaf-local match. Stops once no candidate survives.
   intersect(terms: Uint8Array[]): Uint8Array[] {
     const istore = this.istore;
-    const ordered = terms
-      .map((t) => ({ span: istore.overlapNodeCount(GinGather.postingBound(t)), t }))
-      .sort((a, b) => a.span - b.span || cmpBytes(a.t, b.t))
-      .map((o) => o.t);
-    if (ordered.length === 0) return [];
-    let candidates = this.postingList(ordered[0]!);
+    if (terms.length === 0) return [];
+    if (terms.length === 1) return this.postingList(terms[0]!);
     const height = istore.height();
+    const ordered = terms
+      .map((t) => {
+        const bound = GinGather.postingBound(t);
+        const span = istore.overlapNodeCount(bound);
+        if (span > height)
+          return { span, runs: Infinity, bytes: Infinity, t, peeked: null as Uint8Array[] | null };
+        const scan = istore.rangeScanWithUnits(bound, []);
+        this.pages += scan.pages;
+        const keys = scan.entries.map((e) => e.key);
+        const bytes = keys.reduce((acc, k) => acc + k.length, 0);
+        return { span, runs: keys.length, bytes, t, peeked: keys as Uint8Array[] | null };
+      })
+      .sort(
+        (a, b) =>
+          a.span - b.span ||
+          (a.runs === b.runs ? 0 : a.runs < b.runs ? -1 : 1) ||
+          (a.bytes === b.bytes ? 0 : a.bytes < b.bytes ? -1 : 1) ||
+          cmpBytes(a.t, b.t),
+      );
+    const driver = ordered[0]!;
+    let candidates =
+      driver.peeked !== null ? this.decodeRuns(driver.t, driver.peeked) : this.postingList(driver.t);
     const probe = (term: Uint8Array, key: Uint8Array): Uint8Array => {
       const out = new Uint8Array(term.length + key.length);
       out.set(term, 0);
@@ -29097,7 +29133,7 @@ class GinGather {
       hiInc: true,
     });
     for (let ti = 1; ti < ordered.length && candidates.length > 0; ti++) {
-      const term = ordered[ti]!;
+      const term = ordered[ti]!.t;
       const survivors: Uint8Array[] = [];
       let i = 0;
       while (i < candidates.length) {
@@ -29109,29 +29145,107 @@ class GinGather {
         ) {
           j++;
         }
-        // One leaf: its root-to-leaf path once, then the cheaper leaf-local match — a probe per
-        // candidate, or a merge with the term's entries between the first and last candidate — one
-        // gin_entry per step.
-        const scan = istore.rangeScanWithUnits(span(first, probe(term, candidates[j]!)), []);
-        this.pages += scan.pages;
-        this.entries += Math.min(j + 1 - i, scan.entries.length);
-        // Both lists ascend, so a merge keeps the candidates whose entry was found.
-        const found = scan.entries.map((e) => e.key.subarray(term.length));
-        let f = 0;
-        for (let c = i; c <= j; c++) {
-          const ck = candidates[c]!;
-          while (f < found.length && cmpBytes(found[f]!, ck) < 0) f++;
-          if (f < found.length && cmpBytes(found[f]!, ck) === 0) {
-            survivors.push(ck);
-            f++;
-          }
-        }
+        // One leaf: the runs from term ‖ c_i through the run holding (or following) c_j — the first
+        // run past term ‖ c_j (gin.md §4.5/§6.2). The group charges the nodes that range overlaps (its
+        // root-to-leaf path when the run is in the same leaf), then the cheaper leaf-local match — a
+        // probe per candidate, or a merge with the runs' storage keys — one gin_entry per step.
+        const last = probe(term, candidates[j]!);
+        const group = candidates.slice(i, j + 1);
+        // The run past term ‖ c_j ends the charged range; membership is found by a lookup per
+        // candidate when the group is small, else by one scan of the group's runs — the same answer
+        // and charges either way.
+        const probed =
+          group.length <= GIN_GROUP_LOOKUPS
+            ? ginProbeGroupLookups(istore, term, group)
+            : ginProbeGroupScan(istore, term, group, first, last);
+        this.pages += istore.overlapNodeCount(span(first, probed.end ?? last));
+        this.entries += group.length;
+        survivors.push(...probed.found);
         i = j + 1;
       }
       candidates = survivors;
     }
     return candidates;
   }
+}
+
+// GIN_GROUP_LOOKUPS: a skip-scan leaf group of at most this many candidates finds each candidate's run
+// by its own lookup; a larger one scans the group's runs once (gin.md §6.2). An implementation choice:
+// both find the same postings and the group's charges do not depend on it.
+const GIN_GROUP_LOOKUPS = 4;
+
+function ginContainsKey(keys: Uint8Array[], key: Uint8Array): boolean {
+  let lo = 0;
+  let hi = keys.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (cmpBytes(keys[mid]!, key) < 0) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < keys.length && cmpBytes(keys[lo]!, key) === 0;
+}
+
+// ginProbeGroupLookups is one leaf group's surviving candidates by a lookup per candidate — the first
+// run at or after term ‖ c holds c if any run does — and the key of the run at or after the last
+// candidate (null when none).
+function ginProbeGroupLookups(
+  istore: TableStore,
+  term: Uint8Array,
+  group: Uint8Array[],
+): { end: Uint8Array | null; found: Uint8Array[] } {
+  const found: Uint8Array[] = [];
+  let end: Uint8Array | null = null;
+  let decodedRun: Uint8Array | null = null;
+  let keys: Uint8Array[] = [];
+  for (const c of group) {
+    const run = ginRunAtOrAfter(istore, term, c);
+    if (run === null) break; // no later candidate has a run either
+    if (decodedRun === null || cmpBytes(decodedRun, run) !== 0) {
+      keys = ginDecodeRun(term.length, run);
+      decodedRun = run;
+    }
+    if (ginContainsKey(keys, c)) found.push(c);
+    end = run;
+  }
+  return { end, found };
+}
+
+// ginProbeGroupScan is one leaf group's surviving candidates by one scan of its runs, from
+// term ‖ c_first through the first run past last (= term ‖ c_last), and that run's key.
+function ginProbeGroupScan(
+  istore: TableStore,
+  term: Uint8Array,
+  group: Uint8Array[],
+  first: Uint8Array,
+  last: Uint8Array,
+): { end: Uint8Array | null; found: Uint8Array[] } {
+  const runs: Uint8Array[] = [];
+  let past = false;
+  istore.scanRange({ ...GinGather.postingBound(term), lo: first }, (k) => {
+    runs.push(k.slice());
+    past = cmpBytes(k, last) > 0;
+    return !past;
+  });
+  const found: Uint8Array[] = [];
+  let decodedAt = -1;
+  let keys: Uint8Array[] = [];
+  for (const c of group) {
+    const key = concatBytes([term, c]);
+    let lo = 0;
+    let hi = runs.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (cmpBytes(runs[mid]!, key) < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo === runs.length) break;
+    if (lo !== decodedAt) {
+      keys = ginDecodeRun(term.length, runs[lo]!);
+      decodedAt = lo;
+    }
+    if (ginContainsKey(keys, c)) found.push(c);
+  }
+  return { end: past ? runs[runs.length - 1]! : null, found };
 }
 
 // unionPostings returns the storage keys present in ANY posting list (the && mode-ANY combine),

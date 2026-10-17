@@ -466,6 +466,8 @@ GIN this release covers a focused surface (it grows from here):
   stored values keep their own spelling.
 - **For arrays, `@>`, `&&`, `= ANY`, and array `=`**, and `IN` lists or `OR`s of them — `<@`
   (contained-by) still runs by full scan; it is not GIN-accelerated yet.
+- **Compact postings** — the rows that share a term are stored together, their keys front-coded, so a
+  GIN index takes roughly a fifth of the pages one entry per row would.
 - **No `UNIQUE`** — an inverted index has many entries per row, so `CREATE UNIQUE INDEX … USING gin`
   is rejected (`0A000`), matching PostgreSQL.
 

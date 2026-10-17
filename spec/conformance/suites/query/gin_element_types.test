@@ -40,7 +40,7 @@ INSERT INTO u VALUES
   (7, '{00000000-0000-0000-0000-0000000000aa}')
 
 # @> (contains): rows whose tags contain BOTH aa and bb → ids 1, 4 (the two-posting-list intersection)
-# cost: 16
+# cost: 17
 query I nosort
 SELECT id FROM u WHERE tags @> '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb}'::uuid[] ORDER BY id
 ----
@@ -66,7 +66,7 @@ SELECT id FROM u WHERE '00000000-0000-0000-0000-0000000000aa'::uuid = ANY(tags) 
 
 # = (exact array equality): tags exactly {aa,bb} → id 4 (the @>-superset gather + residual = — only
 # id 4, not id 1 which merely CONTAINS {aa,bb})
-# cost: 15
+# cost: 16
 query I nosort
 SELECT id FROM u WHERE tags = '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb}'::uuid[] ORDER BY id
 ----
