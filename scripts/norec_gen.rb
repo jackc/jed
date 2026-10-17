@@ -59,7 +59,8 @@
 #   any_array — `key = ANY(array)` over a PK or leading index column lowers to one point per element
 #              (cost.md §3 "OR / IN-list"); `key + 0 = ANY(array)` full-scans. Constructor, cast, and
 #              multidimensional arrays, NULL/duplicate/absent elements, an empty array, an OR
-#              disjunct, a range clip, an ANY under an AND leaf of an OR, promoted element types (an out-of-range i64, a fractional
+#              disjunct, a range clip, an ANY under an AND leaf of an OR, an uncorrelated IN / = ANY
+#              subquery, promoted element types (an out-of-range i64, a fractional
 #              decimal, integers against a decimal key), and a mutation end state must all agree.
 #   composite_key_set — IN / OR / `= ANY` sets on a composite PK's members lower to a tuple
 #              interval set (cost.md §3 "Composite primary keys"): the cartesian product of the
@@ -366,7 +367,7 @@ ANY_ARRAY_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.inse
                    query.logical_connectives query.point_lookup query.or_in_point_lookup
                    query.interval_set query.any_array_point_lookup func.array_quantified types.array
                    types.array_multidim cast.array expr.arithmetic types.i32 types.i64 types.decimal
-                   null.three_valued].freeze
+                   null.three_valued query.subquery_in query.subquery_quantified].freeze
 COMPOSITE_KEY_SET_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
                            dml.insert_multi_row dml.update query.select query.where_eq
                            query.comparison_order query.order_by query.logical_connectives
@@ -1579,6 +1580,15 @@ def gen_any_array(seed)
             by_id.call(pick.first(2)))
   pair.call("promoted decimal elements, one fractional", "id",
             "'{#{pick[0]}.0,#{pick[1]}.5,#{pick[2]}}'::decimal[]", by_id.call([pick[0], pick[2]]))
+
+  # An uncorrelated membership subquery is a point source once folded; `id + 0` full-scans.
+  stmt(out, "CREATE TABLE src (k i32, kw i64)")
+  stmt(out, "INSERT INTO src VALUES #{(pick.first(3) + [absent, nil]).map { |k| k.nil? ? '(NULL, NULL)' : "(#{k}, #{k})" }.join(', ')}")
+  out << "# IN (SELECT ...) and a promoted = ANY (SELECT ...)"
+  q(out, "II", "SELECT id, w FROM t WHERE id IN (SELECT k FROM src) ORDER BY id", by_id.call(pick.first(3)))
+  q(out, "II", "SELECT id, w FROM t WHERE id + 0 IN (SELECT k FROM src) ORDER BY id", by_id.call(pick.first(3)))
+  q(out, "II", "SELECT id, w FROM t WHERE id = ANY(SELECT kw FROM src) ORDER BY id", by_id.call(pick.first(3)))
+  q(out, "II", "SELECT id, w FROM t WHERE id + 0 = ANY(SELECT kw FROM src) ORDER BY id", by_id.call(pick.first(3)))
 
   other = (ids - pick).sample(random: rng)
   out << "# an ANY disjunct beside a same-key equality"

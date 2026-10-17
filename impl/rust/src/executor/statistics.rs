@@ -885,7 +885,10 @@ pub(crate) fn statistics_leaf_selectivity(
             current.rows,
         ));
     }
-    if let RExpr::InValues { lhs, list, negated } = expr {
+    if let RExpr::InValues {
+        lhs, list, negated, ..
+    } = expr
+    {
         let column = statistics_column(lhs, rel)?;
         let current = current_column_statistics(rel, column, catalog)?;
         let mut seen = HashSet::new();

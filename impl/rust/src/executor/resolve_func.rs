@@ -2785,7 +2785,9 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             ),
             args,
         ),
-        RExpr::InValues { lhs, list, negated } => format!(
+        RExpr::InValues {
+            lhs, list, negated, ..
+        } => format!(
             "{} {}in ({})",
             render_rexpr(lhs),
             if *negated { "not " } else { "" },
@@ -5079,6 +5081,7 @@ fn resolve_node(
                     lhs: None,
                     negated: false,
                     row_valued: false,
+                    points: None,
                 },
                 out_type,
             ))
@@ -5094,6 +5097,7 @@ fn resolve_node(
                     lhs: None,
                     negated: false,
                     row_valued: false,
+                    points: None,
                 },
                 ResolvedType::Bool,
             ))
@@ -5115,6 +5119,7 @@ fn resolve_node(
             // between the operand and the body column is still 42P22 (PostgreSQL's texteq demands
             // one).
             membership_collation(scope, lhs, &lt, &elem, row_valued, &plan)?;
+            let points = subquery_points(&lt, &elem, row_valued);
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
@@ -5122,6 +5127,7 @@ fn resolve_node(
                     lhs: Some(Box::new(rlhs)),
                     negated: *negated,
                     row_valued,
+                    points,
                 },
                 ResolvedType::Bool,
             ))
@@ -5991,6 +5997,7 @@ fn resolve_node(
                 ),
             };
             let collation = membership_collation(scope, lhs, &lt, &elem, row_valued, &plan)?;
+            let points = subquery_points(&lt, &elem, row_valued);
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
@@ -6002,6 +6009,7 @@ fn resolve_node(
                     lhs: Some(Box::new(rlhs)),
                     negated: false,
                     row_valued,
+                    points,
                 },
                 ResolvedType::Bool,
             ))
@@ -7008,4 +7016,29 @@ pub(crate) fn cast_to_text(
             "casting to text is not supported yet",
         )),
     }
+}
+
+/// A membership subquery's point cell (cost.md §3 "OR / IN-list"): present when its single column's
+/// values are points of the scalar left operand's type, exactly or after an integer/decimal
+/// conversion, as for the array form. A row-valued subquery has none.
+fn subquery_points(
+    lt: &ResolvedType,
+    elem: &ResolvedType,
+    row_valued: bool,
+) -> Option<std::sync::Arc<super::FoldedPoints>> {
+    if row_valued {
+        return None;
+    }
+    let (Some(l), Some(e)) = (ctx_of(lt), ctx_of(elem)) else {
+        return None;
+    };
+    let elem_exact = l == e;
+    let elem_promoted = !elem_exact && super::access_encode::point_promotable(l, e);
+    (elem_exact || elem_promoted).then(|| {
+        std::sync::Arc::new(super::FoldedPoints {
+            values: std::sync::OnceLock::new(),
+            elem_exact,
+            elem_promoted,
+        })
+    })
 }

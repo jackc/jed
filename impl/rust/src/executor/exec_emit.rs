@@ -1425,6 +1425,7 @@ impl Engine {
                 lhs,
                 negated,
                 row_valued,
+                points,
             } = taken
             else {
                 unreachable!("guarded by matches! above")
@@ -1454,10 +1455,15 @@ impl Engine {
                         .into_iter()
                         .map(|row| subquery_row_value(row, row_valued))
                         .collect();
+                    // A bound planned over this subquery reads its points from the shared cell.
+                    if let Some(p) = &points {
+                        let _ = p.values.set(list.clone());
+                    }
                     RExpr::InValues {
                         lhs: lhs.expect("an IN subquery carries its resolved lhs"),
                         list,
                         negated,
+                        points,
                     }
                 }
                 // An uncorrelated quantified subquery folds to a constant-array `Quantified`
@@ -1469,6 +1475,9 @@ impl Engine {
                         .into_iter()
                         .map(|row| subquery_row_value(row, row_valued))
                         .collect();
+                    if let Some(p) = &points {
+                        let _ = p.values.set(elements.clone());
+                    }
                     let arr = if elements.is_empty() {
                         ArrayVal::empty()
                     } else {
@@ -1484,8 +1493,8 @@ impl Engine {
                         lhs: lhs.expect("a quantified subquery carries its resolved lhs"),
                         array: Box::new(RExpr::ConstArray(Box::new(arr))),
                         row_wise: row_valued,
-                        elem_exact: false,
-                        elem_promoted: false,
+                        elem_exact: points.as_ref().is_some_and(|p| p.elem_exact),
+                        elem_promoted: points.as_ref().is_some_and(|p| p.elem_promoted),
                         collation,
                     }
                 }

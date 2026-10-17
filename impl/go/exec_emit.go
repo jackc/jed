@@ -1600,13 +1600,13 @@ func (db *engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, 
 				elems[i] = subqueryRowValue(row, e.rowValued)
 			}
 			arr := &rExpr{kind: reConstArray, cArray: oneDimArray(elems)}
-			*e = rExpr{kind: reQuantified, op: e.op, quantAll: e.quantAll, lhs: e.lhs, rhs: arr, rowWise: e.rowValued, collation: e.collation}
+			*e = rExpr{kind: reQuantified, op: e.op, quantAll: e.quantAll, lhs: e.lhs, rhs: arr, rowWise: e.rowValued, collation: e.collation, elemExact: e.elemExact, elemPromoted: e.elemPromoted}
 		default: // sqIn
 			list := make([]Value, len(r.rows))
 			for i, row := range r.rows {
 				list[i] = subqueryRowValue(row, e.rowValued)
 			}
-			*e = rExpr{kind: reInValues, lhs: e.lhs, list: list, negated: e.negated}
+			*e = rExpr{kind: reInValues, lhs: e.lhs, list: list, negated: e.negated, elemExact: e.elemExact, elemPromoted: e.elemPromoted}
 		}
 		return nil
 	}

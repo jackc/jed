@@ -1,0 +1,140 @@
+# EXPLAIN of membership-subquery point sets (spec/design/cost.md §3 "OR / IN-list", explain.md §5):
+# an uncorrelated `key IN (SELECT …)` / `key = ANY(SELECT …)` is one disjunct of the key's interval
+# set, counted among its `arrays=` since its values are known only after the fold; the estimator reads
+# default_array_elements values of unknown value (estimator.md §7). Rows and costs are pinned in
+# subquery_point_set.test. The plans are jed-owned, so this file is cross-core checked, not
+# oracle-checked.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, dml.delete, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.subquery_in, query.subquery_quantified, query.subquery_correlated, query.explain, query.set_returning, func.array_quantified, types.i32, types.i64, types.decimal
+
+statement ok
+CREATE TABLE big (id i64 PRIMARY KEY, v i64)
+
+statement ok
+INSERT INTO big SELECT g, g * 10 FROM generate_series(1, 2000) AS g
+
+statement ok
+CREATE TABLE pick (k i64, ki i32, kd decimal)
+
+statement ok
+INSERT INTO pick VALUES (7, 7, 7.0), (1500, 1500, 1500.5), (42, 42, 42), (NULL, NULL, NULL), (7, 7, 7)
+
+query ITTII nosort
+EXPLAIN SELECT id, v FROM big WHERE id IN (SELECT k FROM pick)
+----
+0
+Filter
+conjuncts=1
+10
+49
+1
+Scan big
+PK interval set: id; intervals=1; arrays=1; touched=2
+10
+18
+
+query ITTII nosort
+EXPLAIN SELECT id, v FROM big WHERE id = ANY(SELECT ki FROM pick)
+----
+0
+Filter
+conjuncts=1
+10
+49
+1
+Scan big
+PK interval set: id; intervals=1; arrays=1; touched=2
+10
+18
+
+# NOT IN and a correlated subquery do not bound.
+query ITTII nosort
+EXPLAIN SELECT count(*) FROM big WHERE id NOT IN (SELECT k FROM pick WHERE k IS NOT NULL)
+----
+0
+Aggregate
+groups=0 aggs=1
+1
+4691
+1
+Filter
+conjuncts=1
+667
+4023
+2
+Scan big
+Full scan; touched=1
+2000
+2008
+
+query ITTII nosort
+EXPLAIN SELECT id, v FROM big WHERE id IN (SELECT k FROM pick WHERE pick.k = big.id)
+----
+0
+Filter
+conjuncts=1
+667
+28675
+1
+Scan big
+Full scan; touched=2
+2000
+2008
+
+query ITTII nosort
+EXPLAIN SELECT d.v FROM (SELECT v FROM big WHERE id IN (SELECT k FROM pick)) AS d
+----
+0
+Subquery d
+-
+10
+59
+1
+Filter
+conjuncts=1
+10
+49
+2
+Scan big
+PK interval set: id; intervals=1; arrays=1; touched=2
+10
+18
+
+statement ok
+CREATE TABLE tp (tenant i64, id i64, w i64, PRIMARY KEY (tenant, id))
+
+statement ok
+INSERT INTO tp SELECT t, i, t * 10000 + i FROM generate_series(1, 4) AS t, generate_series(1, 2000) AS i
+
+query ITTII nosort
+EXPLAIN SELECT w FROM tp WHERE tenant = 2 AND id IN (SELECT k FROM pick)
+----
+0
+Filter
+conjuncts=2
+10
+63
+1
+Scan tp
+PK interval set: tenant, id; intervals=1; arrays=1; touched=3
+10
+12
+
+query ITTII nosort
+EXPLAIN DELETE FROM big WHERE id = ANY(SELECT k FROM pick WHERE k < 100)
+----
+0
+Delete big
+-
+10
+41
+1
+Filter
+conjuncts=1
+10
+41
+2
+Scan big
+PK interval set: id; intervals=1; arrays=1; touched=1
+10
+18

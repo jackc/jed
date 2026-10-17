@@ -138,7 +138,7 @@ SELECT t.id, t.n FROM t JOIN (VALUES (1), (3)) AS v (id) ON t.id = v.id ORDER BY
 
 # A VALUES body inside an IN-subquery (reachable wherever a subquery is).
 # names: id
-# cost: 19
+# cost: 16
 query I nosort
 SELECT id FROM t WHERE id IN (SELECT column1 FROM (VALUES (1), (3)) AS v) ORDER BY id
 ----

@@ -2126,7 +2126,21 @@ func resolveQuantifiedSubquery(s *scope, q *quantifiedSubqueryExpr, ag *aggCtx, 
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs, rowValued: rowValued, collation: coll}, resolvedType{kind: rtBool}, nil
+	exact, promoted := subqueryElemPoints(lt, elem, rowValued)
+	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs, rowValued: rowValued, collation: coll, elemExact: exact, elemPromoted: promoted}, resolvedType{kind: rtBool}, nil
+}
+
+// subqueryElemPoints is a membership subquery's elemExact/elemPromoted flags (cost.md §3 "OR /
+// IN-list"): whether its single column's values are points of the scalar left operand's type, as
+// for the array form. A row-valued subquery has neither.
+func subqueryElemPoints(lt, elem resolvedType, rowValued bool) (exact, promoted bool) {
+	if rowValued {
+		return false, false
+	}
+	lc, ec := ctxOf(lt), ctxOf(elem)
+	exact = lc != nil && ec != nil && *lc == *ec
+	promoted = !exact && lc != nil && ec != nil && pointPromotable(*lc, *ec)
+	return exact, promoted
 }
 
 // resolveJSONAccess resolves a json/jsonb accessor operator (`-> ->> #> #>>`,

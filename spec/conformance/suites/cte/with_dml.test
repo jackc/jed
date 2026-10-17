@@ -19,7 +19,7 @@ INSERT INTO inbox VALUES (1, 100), (2, 200), (3, 300)
 # A WITH clause feeding a DELETE primary: the CTE selects the ids to remove, the DELETE primary
 # removes them and RETURNINGs the deleted rows.
 # names: id, payload
-# cost: 26
+# cost: 22
 query II rowsort
 WITH old AS (SELECT id FROM inbox WHERE payload >= 200)
 DELETE FROM inbox WHERE id IN (SELECT id FROM old) RETURNING id, payload
@@ -77,7 +77,7 @@ statement ok
 INSERT INTO acct VALUES (1, 50), (2, 80)
 
 # names: id, bal
-# cost: 16
+# cost: 13
 query II nosort
 WITH bump AS (SELECT id FROM acct WHERE bal < 60)
 UPDATE acct SET bal = bal + 1000 WHERE id IN (SELECT id FROM bump) RETURNING id, bal

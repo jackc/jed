@@ -59,6 +59,7 @@ import type {
   AggCtx,
   ArrayFuncName,
   DeleteKind,
+  FoldedPoints,
   HasKeyKind,
   JsonGetOp,
   JsonImageFunc,
@@ -1566,6 +1567,7 @@ function resolveInSubqueryExpr(
   // = ignores the collation at eval (byte identity, collation.md §7), but a conflict between
   // the operand and the body column is still 42P22 (PostgreSQL's texteq demands one).
   membershipCollation(scope, e.lhs, lt, elem, rowValued, plan);
+  const points = subqueryPoints(lt, elem, rowValued);
   return {
     node: {
       kind: "subquery",
@@ -1574,6 +1576,7 @@ function resolveInSubqueryExpr(
       lhs,
       negated: e.negated,
       rowValued,
+      ...(points !== null ? { points } : {}),
     },
     type: { kind: "bool" },
   };
@@ -1600,6 +1603,7 @@ function resolveQuantifiedSubqueryExpr(
     );
   }
   const collation = membershipCollation(scope, e.lhs, lt, elem, rowValued, plan);
+  const points = subqueryPoints(lt, elem, rowValued);
   return {
     node: {
       kind: "subquery",
@@ -1611,9 +1615,27 @@ function resolveQuantifiedSubqueryExpr(
       op: e.op,
       all: e.all,
       collation,
+      ...(points !== null ? { points } : {}),
     },
     type: { kind: "bool" },
   };
+}
+
+// subqueryPoints is a membership subquery's point cell (cost.md §3 "OR / IN-list"): present when
+// its single column's values are points of the scalar left operand's type, exactly or after an
+// integer/decimal conversion, as for the array form. A row-valued subquery has none.
+function subqueryPoints(
+  lt: ResolvedType,
+  elem: ResolvedType,
+  rowValued: boolean,
+): FoldedPoints | null {
+  if (rowValued) return null;
+  const lc = ctxOf(lt);
+  const ec = ctxOf(elem);
+  if (lc === null || ec === null) return null;
+  const elemExact = lc === ec;
+  const elemPromoted = !elemExact && pointPromotable(lc, ec);
+  return elemExact || elemPromoted ? { values: null, elemExact, elemPromoted } : null;
 }
 
 function resolveCollateExpr(

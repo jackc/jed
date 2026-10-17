@@ -2371,7 +2371,8 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if _, err := membershipCollation(s, is.Lhs, lt, elem, rowValued, &plan); err != nil {
 			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated, rowValued: rowValued}, resolvedType{kind: rtBool}, nil
+		exact, promoted := subqueryElemPoints(lt, elem, rowValued)
+		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated, rowValued: rowValued, elemExact: exact, elemPromoted: promoted}, resolvedType{kind: rtBool}, nil
 	case exprCollate:
 		// `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
 		// the inner expression, require a collatable (text / text[]) type (42804, PG-matching), and validate

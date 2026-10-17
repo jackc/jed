@@ -22987,6 +22987,8 @@ export class Engine {
           // (array-functions.md §11.6): its single column becomes a 1-D array and the node reuses
           // the array form's 3VL fold — no per-row re-execution.
           const elements = r.rows.map((row) => subqueryRowValue(row, e.rowValued));
+          // A bound planned over this subquery reads its points from the shared cell.
+          if (e.points !== undefined) e.points.values = elements;
           return {
             kind: "quantified",
             op: e.op!,
@@ -22995,11 +22997,16 @@ export class Engine {
             array: valueToRExpr(arrayValue(elements)),
             rowWise: e.rowValued,
             collation: e.collation ?? null,
+            elemExact: e.points?.elemExact === true,
+            elemPromoted: e.points?.elemPromoted === true,
           };
         }
         // in
         const list = r.rows.map((row) => subqueryRowValue(row, e.rowValued));
-        return { kind: "inValues", lhs: e.lhs!, list, negated: e.negated };
+        if (e.points !== undefined) e.points.values = list;
+        return e.points !== undefined
+          ? { kind: "inValues", lhs: e.lhs!, list, negated: e.negated, points: e.points }
+          : { kind: "inValues", lhs: e.lhs!, list, negated: e.negated };
       }
       case "cast":
       case "arrayCast":
@@ -25089,6 +25096,8 @@ function orSelectivitiesRange(parts: Selectivity[], start: number, end: number):
 // unknown value (the operand itself).
 function estimatorArrayElements(array: RExpr): RExpr[] {
   if (array.kind === "array" && !array.nested) return array.elements;
+  // A folded IN list point source: its values.
+  if (array.kind === "inValues") return array.list.map((v) => valueToRExpr(v));
   const c = estimatorValue(array);
   if (c !== null) {
     if (c.kind === "constNull") return [];
@@ -25844,8 +25853,14 @@ function buildIndexIntervalSetPlan(
     const ty = typeAsScalar(col.type);
     return ty !== undefined && keySlotSkippable(ty) && col.collation === null;
   };
+  // A leading range, or a leading membership subquery (which widens to the whole index if it is
+  // read before its fold), leaves the leading slot to be stepped over.
   const lead = tuple[0]!;
-  if (!skippable(cols[0]!) && intervalPlanHasRange(lead.specs ?? [], lead.clip)) return null;
+  if (
+    !skippable(cols[0]!) &&
+    (intervalPlanHasRange(lead.specs ?? [], lead.clip) || specsHaveSubquery(lead.specs ?? []))
+  )
+    return null;
   // Suffix eligibility (cost.md §3 "Multi-column secondary indexes"): every key column from the
   // first member after the leading one that may go unconsumed or be a range onward is skipped.
   let t = tuple.length;
@@ -25889,7 +25904,7 @@ export function detectIntervalSet(
   let found = -1;
   let specs: IntervalSpec[] | null = null;
   for (let i = 0; i < conjuncts.length; i++) {
-    if (conjuncts[i]!.kind !== "or" && conjuncts[i]!.kind !== "quantified") continue;
+    if (!intervalSetConjunctKind(conjuncts[i]!)) continue;
     const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, keyType, colColl);
     if (reduced !== null) {
       found = i;
@@ -25977,7 +25992,7 @@ function walkTupleMembers(
     let found = -1;
     let specs: IntervalSpec[] | null = null;
     for (let i = 0; i < conjuncts.length; i++) {
-      if (conjuncts[i]!.kind !== "or" && conjuncts[i]!.kind !== "quantified") continue;
+      if (!intervalSetConjunctKind(conjuncts[i]!)) continue;
       const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, ty, colColl);
       if (reduced !== null) {
         found = i;
@@ -26058,12 +26073,61 @@ export function reduceIntervalUnion(
 // is exactly the key's type, or a promoted type whose values convert exactly to the key
 // (elemPromoted); a promoted array must be readable as a value, since its elements convert through
 // pointValue.
+// intervalSetConjunctKind reports a conjunct kind that may reduce to an interval set: an OR, an
+// `= ANY` array, or a membership subquery (or its folded IN list).
+function intervalSetConjunctKind(e: RExpr): boolean {
+  return e.kind === "or" || e.kind === "quantified" || e.kind === "subquery" || e.kind === "inValues";
+}
+
+// specsHaveSubquery reports a membership-subquery point source among an interval set's disjuncts.
+function specsHaveSubquery(specs: IntervalSpec[]): boolean {
+  return specs.some(
+    (spec) =>
+      spec.array !== undefined && (spec.array.kind === "subquery" || spec.array.kind === "inValues"),
+  );
+}
+
+// isSubqueryPointSource reports whether e is an uncorrelated membership subquery whose value list is
+// a key's point source once folded (cost.md §3 "OR / IN-list"): `key IN (SELECT …)` or `key =
+// ANY(SELECT …)` with a single column of the key's type (or a promoted integer/decimal one), on the
+// bare key column, or the folded IN list a mutation plans over. An IN compares by byte identity, so
+// a collated key is left alone.
+function isSubqueryPointSource(e: RExpr, keyIdx: number, colColl: string | null): boolean {
+  if (e.kind === "inValues") {
+    return (
+      e.points !== undefined &&
+      !e.negated &&
+      e.lhs.kind === "column" &&
+      e.lhs.index === keyIdx &&
+      colColl === null
+    );
+  }
+  if (
+    e.kind !== "subquery" ||
+    e.points === undefined ||
+    e.rowValued ||
+    e.negated ||
+    e.lhs === null ||
+    e.lhs.kind !== "column" ||
+    e.lhs.index !== keyIdx ||
+    queryPlanReferencesOuter(e.plan, 0)
+  )
+    return false;
+  if (e.subKind === "in") return colColl === null;
+  if (e.subKind === "quantified") {
+    const cmpColl = e.collation != null ? e.collation.name : null;
+    return e.op === "eq" && e.all === false && cmpColl === colColl;
+  }
+  return false;
+}
+
 function asArrayPointSpec(
   e: RExpr,
   keyIdx: number,
   keyType: ScalarType,
   colColl: string | null,
 ): IntervalSpec | null {
+  if (isSubqueryPointSource(e, keyIdx, colColl)) return { terms: [], array: e };
   if (
     e.kind !== "quantified" ||
     e.op !== "eq" ||
@@ -26142,8 +26206,15 @@ function arrayPointKeys(
   params: Value[],
   outer: Row[],
   coll: Collation | null,
-): Uint8Array[] {
+): Uint8Array[] | null {
   const keys: Uint8Array[] = [];
+  // A membership subquery's points come from its fold; not yet folded, it has none: the caller
+  // widens to every key.
+  if (src.kind === "subquery") {
+    const values = src.points?.values ?? null;
+    return values === null ? null : valuePointKeys(keyType, values, coll);
+  }
+  if (src.kind === "inValues") return valuePointKeys(keyType, src.list, coll);
   if (src.kind === "array") {
     for (const elem of src.elements) {
       const encoded = encodeBoundKey(keyType, elem, params, outer, coll, []);
@@ -26164,7 +26235,14 @@ function arrayPointKeys(
       break;
   }
   if (v === null || v.kind !== "array") return keys;
-  for (const elem of v.elements) {
+  return valuePointKeys(keyType, v.elements, coll);
+}
+
+// valuePointKeys encodes element values as key points, in order: a NULL element and one no key can
+// equal contribute none.
+function valuePointKeys(keyType: ScalarType, elems: Value[], coll: Collation | null): Uint8Array[] {
+  const keys: Uint8Array[] = [];
+  for (const elem of elems) {
     const point = pointValue(keyType, elem);
     if (point === null) continue;
     const encoded = encodeValueKey(keyType, point, coll);
@@ -29130,7 +29208,12 @@ export function canonicalIntervalSet(
         if (b === null) continue;
         pointClip = intersectBounds(b, clip);
       }
-      for (const key of arrayPointKeys(keyType, spec.array, params, outer, coll)) {
+      const keys = arrayPointKeys(keyType, spec.array, params, outer, coll);
+      if (keys === null) {
+        if (!boundEmpty(pointClip)) intervals.push(pointClip);
+        continue;
+      }
+      for (const key of keys) {
         const point = unboundedBound();
         intersectLo(point, key, true);
         intersectHi(point, key, true);
@@ -29204,7 +29287,8 @@ export function pkKeySetIntervals(
 
 // memberPoints is a point member's sorted, de-duplicated encoded points (never merged), each inside
 // the member's clip. A member with no set has the single point its equalities agree on.
-function memberPoints(m: TupleMember, params: Value[], outer: Row[], left: Row): Uint8Array[] {
+// null when a membership subquery among its sources is not yet folded, so it has no points.
+function memberPoints(m: TupleMember, params: Value[], outer: Row[], left: Row): Uint8Array[] | null {
   const clip = buildLogicalInterval(m.colType, m.clip, params, outer, m.coll, left);
   if (clip === null) return [];
   if (m.specs === null) return clip.lo !== null ? [clip.lo] : [];
@@ -29224,9 +29308,9 @@ function memberPoints(m: TupleMember, params: Value[], outer: Row[], left: Row):
         if (b === null) continue;
         within = intersectBounds(b, clip);
       }
-      for (const key of arrayPointKeys(m.colType, spec.array, params, outer, m.coll)) {
-        keep(key, within);
-      }
+      const points = arrayPointKeys(m.colType, spec.array, params, outer, m.coll);
+      if (points === null) return null;
+      for (const key of points) keep(key, within);
       continue;
     }
     const b = buildLogicalInterval(m.colType, spec.terms, params, outer, m.coll, left);
@@ -29268,7 +29352,11 @@ function expandTuplePrefixes(
   let consumed = 0;
   for (let i = 0; i < tuple.length; i++) {
     const m = tuple[i]!;
-    const points = m.point ? memberPoints(m, params, outer, left) : [];
+    const memberKeys = m.point ? memberPoints(m, params, outer, left) : [];
+    // A membership subquery not yet folded has no points: the set widens to the prefixes so far,
+    // as at the probe cap.
+    if (memberKeys === null) break;
+    const points = memberKeys;
     const intervals = m.point ? [] : finalMemberIntervals(m, params, outer, left);
     const count = m.point ? points.length : intervals.length;
     if (count === 0) return null;
@@ -31007,6 +31095,12 @@ export type RSubscript =
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
 // their (promotion-tower) result type so the computed value can be range-checked.
+// FoldedPoints is a membership subquery's value list as a key's point source (cost.md §3 "OR /
+// IN-list"): its single column's values are points of the scalar left operand's type exactly
+// (elemExact) or after an integer/decimal conversion (elemPromoted). The uncorrelated fold fills
+// values; an interval-set bound planned before the fold reads them through this shared cell.
+export type FoldedPoints = { values: Value[] | null; elemExact: boolean; elemPromoted: boolean };
+
 export type RExpr =
   | { kind: "column"; index: number }
   // A bind parameter, by 0-based index into the bound-values array passed to evalExpr. Its
@@ -31379,10 +31473,13 @@ export type RExpr =
       // For subKind "quantified": the comparison collation (spec/design/collation.md §1) — the left
       // operand combined with the body column's implicit collation; null for C / a non-text pair.
       collation?: Collation | null;
+      // For a point-capable "in" / `= ANY` membership subquery: the cell the fold fills with its
+      // value list, shared with any interval-set bound planned over it (cost.md §3 "OR / IN-list").
+      points?: FoldedPoints;
     }
   // A folded uncorrelated `IN (subquery)`: the subquery ran once yielding `list`; per row it tests
   // `lhs` for three-valued membership (empty → negated; a NULL with no positive match → NULL).
-  | { kind: "inValues"; lhs: RExpr; list: Value[]; negated: boolean }
+  | { kind: "inValues"; lhs: RExpr; list: Value[]; negated: boolean; points?: FoldedPoints }
   // A quantified array comparison `lhs op ANY/ALL(array)` (spec/design/array-functions.md §11) — the
   // array spelling of IN. At eval `lhs` is evaluated once, `array` once; then a 3-valued fold over the
   // array's flattened elements (ANY = OR-fold, ALL = AND-fold), charging per element like "inValues".

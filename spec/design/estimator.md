@@ -314,7 +314,8 @@ Let `N` be a base relation's exact row count.
   `A`, in order. A one-dimensional `ARRAY[...]`'s elements are its element expressions; an array
   readable at plan time (a literal, or a bound parameter in its custom plan, §6.1) has its elements,
   flattened in storage order, as literals; a NULL array has none; any other array — an unbound
-  parameter, an outer column — has `default_array_elements` entries of unknown value
+  parameter, an outer column, an uncorrelated membership subquery acting as a point source (its
+  values are known only after the fold) — has `default_array_elements` entries of unknown value
   (`estimator.toml`; PostgreSQL's assumed length for a non-constant array). A NULL element contributes
   zero true rows, and an empty array gives zero. Over an interval set, and in column statistics, a
   known element of a promoted element type ([cost.md §3](cost.md)) is first converted to the key's
