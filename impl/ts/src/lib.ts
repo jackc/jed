@@ -522,6 +522,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.gin_bytea_elements",
   "query.gin_jsonb_ops",
   "query.gin_disjunction",
+  "query.gin_jsonb_jsonpath",
   "query.is_null",
   "query.order_by",
   // Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

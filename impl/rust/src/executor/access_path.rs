@@ -3,6 +3,7 @@
 //! (mirrors part of impl/go access_path.go). The filter-analysis that DETECTS a bound is in mod.rs.
 
 use super::*;
+use crate::gin_jsonpath::GinTree;
 
 impl Engine {
     /// Execute an index equality bound (cost.md §3 "index-bounded scan"): fetch the rows the
@@ -260,7 +261,7 @@ impl Engine {
                 })
                 .collect()
         };
-        let mut queries = Vec::with_capacity(arms.len());
+        let mut queries: Vec<GinTree> = Vec::with_capacity(arms.len());
         for (strategy, operand) in arms {
             let qv = operand.eval(query_row, env, &mut env.exec.session.scratch_meter())?;
             match gin_query_terms(gb.opclass, strategy, &qv) {
@@ -272,13 +273,13 @@ impl Engine {
                     let (entries, pages, slabs) = store.scan_with_units(mask)?;
                     return Ok((entries, (pages, slabs)));
                 }
-                GinQuery::Terms(terms) => queries.push((
-                    strategy,
-                    terms
-                        .into_iter()
-                        .map(|term| gin_tagged_term(gb.tag, term))
-                        .collect(),
-                )),
+                GinQuery::Terms(terms) => queries.push(
+                    GinTree::from_terms(strategy.is_any(), terms)
+                        .map_terms(&|term| gin_tagged_term(gb.tag, term)),
+                ),
+                GinQuery::Tree(tree) => {
+                    queries.push(tree.map_terms(&|term| gin_tagged_term(gb.tag, term)))
+                }
             }
         }
 
@@ -292,13 +293,12 @@ impl Engine {
         // The candidate storage keys, in ascending byte (= storage-key) order, so the point lookups
         // and the emitted rows follow storage order exactly as a full scan would (gin.md §6/§8).
         let candidates: Vec<Vec<u8>> = if queries.len() == 1 {
-            let (strategy, terms) = queries.pop().expect("one arm");
-            gather.arm(istore, strategy, terms)?
+            gather.eval(istore, &queries[0])?
         } else {
             // A disjunction: each arm's candidates in source order, unioned (gin.md §6.3).
             let mut union = BTreeSet::new();
-            for (strategy, terms) in queries {
-                union.extend(gather.arm(istore, strategy, terms)?);
+            for tree in &queries {
+                union.extend(gather.eval(istore, tree)?);
             }
             union.into_iter().collect()
         };
@@ -496,25 +496,45 @@ impl GinGather {
             .collect())
     }
 
-    /// One strategy's candidates over its distinct query terms: mode ANY (`&&`, `?|`) → the union
-    /// of every whole posting list; mode ALL → the intersection. `= ANY` (Member) and `?` are a single
-    /// term, so the intersection is that lone posting list; array `=` (Equal) gathers the same
-    /// superset as `@>` over `Q`'s distinct non-NULL terms (the residual `=` makes it exact
-    /// downstream) — gin.md §6; the `jsonb_ops` gathers are supersets the residual rechecks (§2.1).
-    fn arm(
-        &mut self,
-        istore: &TableStore,
-        strategy: GinStrategy,
-        terms: Vec<Vec<u8>>,
-    ) -> Result<Vec<Vec<u8>>> {
-        if strategy.is_any() {
-            let mut union = BTreeSet::new();
-            for term in &terms {
-                union.extend(self.posting_list(istore, term)?);
+    /// The candidates of a query tree (gin.md §2.2/§6), ascending. A term is its whole posting list.
+    /// An `Or` unions its leaves' lists (in byte order), then its children's candidates (in order). An
+    /// `And` intersects its leaves by the skip-scan (§6.2) — or, with no leaf, starts from its first
+    /// child — then intersects each following child's candidates in order, stopping once none
+    /// survives. Mode ALL is an `And` of terms and mode ANY an `Or`, so `= ANY` and `?` (one term) read
+    /// that lone list, array `=` gathers the same superset as `@>` (the residual `=` makes it exact),
+    /// and the `jsonb_ops` gathers are supersets the residual rechecks (§2.1).
+    fn eval(&mut self, istore: &TableStore, tree: &GinTree) -> Result<Vec<Vec<u8>>> {
+        match tree {
+            GinTree::Term(term) => self.posting_list(istore, term),
+            GinTree::Or(leaves, rest) => {
+                let mut union = BTreeSet::new();
+                for term in leaves {
+                    union.extend(self.posting_list(istore, term)?);
+                }
+                for child in rest {
+                    union.extend(self.eval(istore, child)?);
+                }
+                Ok(union.into_iter().collect())
             }
-            Ok(union.into_iter().collect())
-        } else {
-            self.intersect(istore, terms)
+            GinTree::And(leaves, rest) => {
+                let mut rest = rest.iter();
+                let mut candidates = if leaves.is_empty() {
+                    match rest.next() {
+                        Some(first) => self.eval(istore, first)?,
+                        None => return Ok(Vec::new()),
+                    }
+                } else {
+                    self.intersect(istore, leaves.clone())?
+                };
+                for child in rest {
+                    if candidates.is_empty() {
+                        break;
+                    }
+                    let found: BTreeSet<Vec<u8>> = self.eval(istore, child)?.into_iter().collect();
+                    candidates.retain(|key| found.contains(key));
+                }
+                Ok(candidates)
+            }
         }
     }
 
@@ -592,6 +612,8 @@ impl GinGather {
 /// index cannot enumerate.
 pub(crate) enum GinQuery {
     Terms(Vec<Vec<u8>>),
+    /// A jsonpath strategy's AND/OR term tree (gin.md §2.2).
+    Tree(GinTree),
     Empty,
     FullScan,
 }
@@ -676,6 +698,21 @@ fn array_query_terms(strategy: GinStrategy, elem: ScalarType, qv: &Value) -> Gin
 fn jsonb_query_terms(strategy: GinStrategy, qv: &Value) -> GinQuery {
     let terms = match (strategy, qv) {
         (_, Value::Null) => return GinQuery::Empty,
+        // `@?` / `@@` (gin.md §2.2): the tree PostgreSQL extracts from the path, or the full scan
+        // when nothing is extractable. The path text is a jsonpath value's canonical text, already
+        // compiled at resolve; a term never depends on the environment's casing table.
+        (GinStrategy::JsonPathExists | GinStrategy::JsonPathMatch, Value::JsonPath(text)) => {
+            let Ok(path) = crate::jsonpath::JsonPath::compile(text, None) else {
+                return GinQuery::FullScan;
+            };
+            return match crate::gin_jsonpath::jsonpath_gin_tree(
+                &path,
+                strategy == GinStrategy::JsonPathExists,
+            ) {
+                Some(tree) => GinQuery::Tree(tree),
+                None => GinQuery::FullScan,
+            };
+        }
         (GinStrategy::JsonContains, Value::Jsonb(doc)) => {
             let terms = crate::json::gin_jsonb_index_terms(doc);
             if terms.is_empty() {

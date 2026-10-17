@@ -424,14 +424,19 @@ Key existence (`1` and `4` have a top-level `tags` key):
 <LiveSql demo="jsonbKeyQuery" seed={jsonbSeed} query={jsonbKeyQuery} rows={6} />
 
 A key or string longer than 128 bytes is indexed by its first 128 bytes, so very long values that
-share a prefix also share an index entry; the recheck tells them apart. The jsonpath operators
-`@?` and `@@` are not accelerated yet, and run by full scan.
+share a prefix also share an index entry; the recheck tells them apart.
+
+The jsonpath operators use the index too, as in PostgreSQL. **`body @@ '$.kind == "login"'`** and
+**`body @? '$.tags[*] ? (@ == "beta")'`** require every key on the path and the compared value, and
+`&&` / `||` combine such comparisons. A path with nothing to look up — no `==` against a literal, or
+an item method like `.size()` in the way — reads every row, as does a negated comparison.
 
 ### Current scope
 
 GIN this release covers a focused surface (it grows from here):
 
-- **A `jsonb` column** — the `jsonb_ops` operator class above, for `@>`, `<@`, `?`, `?|`, and `?&`.
+- **A `jsonb` column** — the `jsonb_ops` operator class above, for `@>`, `<@`, `?`, `?|`, `?&`,
+  `@?`, and `@@`.
 
 - **An array** of the integers (`i16[]`, `i32[]`, `i64[]`), `text[]`, `bytea[]`,
   `numeric[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`, `interval[]`, or

@@ -202,6 +202,9 @@
 #              and `doc ?& K` gather candidates from key/value terms; the same predicates over
 #              `doc::text::jsonb` (an identity round trip, not the bare column) are NOT GIN-accelerated.
 #              Both must return the by-construction rows of PostgreSQL's containment rule.
+#   gin_jsonpath — GIN jsonb_ops `@?` / `@@` (gin.md §2.2): lax/strict equality, `&&`/`||`, and
+#              filter paths gather through the extracted term tree; the same predicates over
+#              `doc::text::jsonb` full scan. Both must return the by-construction rows.
 #   gin_skip — the GIN ALL-mode skip-scan (gin.md §6.2) over a multi-leaf entry tree: `tags @> Q`
 #              mixing a term in every row, frequent, rare, and absent terms reads only the shortest
 #              posting list whole and probes the rest leaf by leaf; the equivalent `Q <@ tags` is NOT
@@ -494,6 +497,10 @@ GIN_MULTI_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index ddl.gin_multi_
                    query.gin_any_eq dml.insert dml.insert_multi_row query.select query.order_by
                    query.logical_connectives types.i32 types.array func.array_containment
                    func.array_quantified expr.coalesce cast.operator].freeze
+GIN_JSONPATH_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_jsonb_ops
+                      query.gin_jsonb_jsonpath dml.insert dml.insert_multi_row query.select query.order_by
+                      types.i32 types.text types.jsonb types.jsonpath types.json_casts expr.jsonpath_filter
+                      expr.jsonpath_match cast.operator].freeze
 GIN_EQ_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_array_eq dml.insert
                 dml.insert_multi_row query.select query.order_by query.where_eq types.i32
                 types.array].freeze
@@ -3327,6 +3334,58 @@ def gen_gin_multi(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: GIN jsonb_ops jsonpath (@? / @@ via the GIN index vs doc::text::jsonb full scan) --
+# `doc @@ '$.k == v'`, `doc @? '$ ? (@.k == v)'`, strict and lax, `&&` / `||`, and `[*]` filters
+# gather through the term tree jsonb_ops extracts from the path (spec/design/gin.md §2.2;
+# query.gin_jsonb_jsonpath); the same predicates over `doc::text::jsonb` (not the bare column) full
+# scan. Documents are objects whose members are scalars or arrays of scalars (plus a SQL NULL), so the
+# by-construction answer is simple: lax `$.k == v` holds when member k equals v or is an array with an
+# element equal to v; strict holds only for an equal scalar member. Both spellings must match it.
+def gen_gin_jsonpath(seed)
+  rng = Random.new(seed)
+  scalar = -> { [rng.rand(0..2), "x", "y", true, nil].sample(random: rng) }
+  docs = (1..16).map do |id|
+    doc = JSONB_KEYS.sample(rng.rand(0..3), random: rng).to_h do |k|
+      [k, rng.rand(0..3).zero? ? Array.new(rng.rand(0..2)) { scalar.call } : scalar.call]
+    end
+    [id, doc]
+  end
+  docs[rng.rand(0...docs.size)][1] = nil
+  lit = ->(d) { d.nil? ? "NULL" : "'#{JSON.generate(d)}'" }
+  jp = ->(v) { v.nil? ? "null" : JSON.generate(v) }
+  # JSON equality as jsonpath compares: same kind, equal value (true never equals 1).
+  eq = ->(a, b) { a.class == b.class && a == b || (a.is_a?(Integer) && b.is_a?(Integer) && a == b) }
+  lax = ->(d, k, v) { d.key?(k) && (d[k].is_a?(Array) ? d[k].any? { |e| eq.call(e, v) } : eq.call(d[k], v)) }
+  strict = ->(d, k, v) { d.key?(k) && !d[k].is_a?(Array) && eq.call(d[k], v) }
+  ids_where = ->(pred) { docs.select { |_id, d| !d.nil? && pred.call(d) }.map { |id, _| id.to_s } }
+
+  out = header(seed, GIN_JSONPATH_REQ, "GIN jsonb_ops jsonpath (@? / @@ via the GIN index vs doc::text::jsonb full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb)")
+  stmt(out, "CREATE INDEX t_doc_gin ON t USING gin (doc)")
+  stmt(out, "INSERT INTO t VALUES #{docs.map { |id, d| "(#{id}, #{lit.call(d)})" }.join(', ')}")
+
+  pair = lambda do |title, op_path, exp|
+    out << "# #{title}"
+    out << "# GIN bound (the jsonpath term tree + residual recheck)"
+    q(out, "I", "SELECT id FROM t WHERE doc #{op_path} ORDER BY id", exp)
+    out << "# full scan (doc::text::jsonb is not the bare column) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE doc::text::jsonb #{op_path} ORDER BY id", exp)
+  end
+  k1, k2 = JSONB_KEYS.sample(2, random: rng)
+  v1 = scalar.call
+  v2 = scalar.call
+  pair.call("@@ $.#{k1} == #{jp.call(v1)}", "@@ '$.#{k1} == #{jp.call(v1)}'", ids_where.call(->(d) { lax.call(d, k1, v1) }))
+  pair.call("@@ strict $.#{k1} == #{jp.call(v1)}", "@@ 'strict $.#{k1} == #{jp.call(v1)}'", ids_where.call(->(d) { strict.call(d, k1, v1) }))
+  pair.call("@? $ ? (@.#{k2} == #{jp.call(v2)})", "@? '$ ? (@.#{k2} == #{jp.call(v2)})'", ids_where.call(->(d) { lax.call(d, k2, v2) }))
+  pair.call("@@ && ", "@@ '$.#{k1} == #{jp.call(v1)} && $.#{k2} == #{jp.call(v2)}'",
+            ids_where.call(->(d) { lax.call(d, k1, v1) && lax.call(d, k2, v2) }))
+  pair.call("@@ || ", "@@ '$.#{k1} == #{jp.call(v1)} || $.#{k2} == #{jp.call(v2)}'",
+            ids_where.call(->(d) { lax.call(d, k1, v1) || lax.call(d, k2, v2) }))
+  pair.call("@? [*] filter", "@? '$.#{k2}[*] ? (@ == #{jp.call(v2)})'", ids_where.call(->(d) { lax.call(d, k2, v2) }))
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: GIN-bounded array equality (= via the GIN index vs NOT(<>) full scan) -----------
 # `col = Q` over a GIN-indexed array column gathers candidates via the @>-superset bound (Q's
 # distinct non-NULL elements, since col = Q ⟹ col @> Q) + the residual = (spec/design/gin.md §6;
@@ -5380,6 +5439,7 @@ SCENARIOS = {
   "gin_interval" => method(:gen_gin_interval),
   "gin_mut" => method(:gen_gin_mutation),
   "gin_jsonb" => method(:gen_gin_jsonb),
+  "gin_jsonpath" => method(:gen_gin_jsonpath),
   "gin_skip" => method(:gen_gin_skip),
   "gin_text" => method(:gen_gin_text),
   "gin_stats" => method(:gen_gin_stats),

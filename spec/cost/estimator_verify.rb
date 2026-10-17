@@ -37,6 +37,8 @@ EXPECTED_ACCESS_METHOD = {
   "gin_jsonb_exists" => "matching",
   "gin_jsonb_exists_any" => "matching",
   "gin_jsonb_exists_all" => "matching",
+  "gin_jsonb_path_exists" => "matching",
+  "gin_jsonb_path_match" => "matching",
   "unsupported" => "opaque",
 }.freeze
 

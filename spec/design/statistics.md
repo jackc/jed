@@ -336,7 +336,8 @@ correlation or OR-overlap models.
 
 A GIN-served predicate over a bare term-eligible column with facts — the conjunct shapes a GIN
 index accelerates ([gin.md §1/§2.1](gin.md): `col @> Q`, `col && Q`, `c = ANY(col)`, `col ? k`,
-`col ?| K`, `col ?& K`, and `jsonb` `col @> Q` / `Q <@ col`) — whose query operand is a plan-time
+`col ?| K`, `col ?& K`, `jsonb` `col @> Q` / `Q <@ col`, and the jsonpath `col @? P` / `col @@ P`
+of [gin.md §2.2](gin.md)) — whose query operand is a plan-time
 literal extracts the query's terms exactly as the gather would ([gin.md §6](gin.md)), including the
 element-type conversion of `c`. Array `=` keeps the structural equality estimate as a logical leaf;
 only its GIN candidate uses the terms (below). Then:
@@ -356,6 +357,11 @@ only its GIN candidate uses the terms (below). Then:
   and each later term is probed at no more than the surviving candidates.
 - **ANY** (`&&`, `?|`): `rows = min(current_nonnull, Σ term_rows)` and `entries = Σ term_rows`, both
   saturating — the disjoint-union upper bound of §7.1 of [estimator.md](estimator.md).
+- **A term tree** (`@?` / `@@`, [gin.md §2.2](gin.md)): ALL is an AND node of terms and ANY an OR
+  node, and a tree estimates recursively by the same rules. An OR sums its leaves' and children's
+  rows and entries (rows capped at `current_nonnull`). An AND folds its leaves as ALL above (with no
+  leaf it starts from its first child's estimate), then each further child in order adds its
+  `entries` and scales `rows` by its `rows / N`.
 
 The predicate's logical selectivity is `rows / N`. A GIN candidate over the same column uses `rows`
 as its scan rows, `entries` as its `gin_entry` estimate, and

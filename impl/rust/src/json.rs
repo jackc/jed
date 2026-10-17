@@ -1294,7 +1294,7 @@ pub fn gin_jsonb_key_term(key: &str) -> Vec<u8> {
 
 /// A scalar's term. `as_key` marks a string that is an array element (or the top-level scalar,
 /// PG's one-element raw-scalar array): it indexes as a KEY, which is what `?` finds.
-fn gin_jsonb_scalar_term(node: &JsonNode, as_key: bool) -> Vec<u8> {
+pub(crate) fn gin_jsonb_scalar_term(node: &JsonNode, as_key: bool) -> Vec<u8> {
     match node {
         JsonNode::Null => vec![GIN_JSONB_NULL],
         JsonNode::Bool(b) => vec![GIN_JSONB_BOOL, u8::from(*b)],

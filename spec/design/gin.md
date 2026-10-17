@@ -48,7 +48,8 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col [, col …])
   (`col IN (Q1, Q2)`, which is `col = Q1 OR col = Q2`) and any `OR` of accelerable conjuncts on the
   column bound it by the union of the arms' gathers (§6.3). `<@` (contained-by) is **not**
   GIN-accelerated this slice (it still runs, by full scan — §10). On a `jsonb` column the accelerated conjuncts are `col @> const`
-  (equivalently `const <@ col`), `col ? const`, `col ?| const`, and `col ?& const` (§2.1).
+  (equivalently `const <@ col`), `col ? const`, `col ?| const`, and `col ?& const` (§2.1), and the
+  jsonpath operators `col @? path` and `col @@ path` (§2.2).
 - **`UNIQUE` is meaningless for GIN and rejected.** An inverted index has many entries per
   row, so uniqueness is undefined; `CREATE UNIQUE INDEX … USING gin` is `0A000` (§3). A GIN
   index never backs a `UNIQUE` constraint.
@@ -195,9 +196,63 @@ PostgreSQL's default `jsonb` GIN operator class, term-for-term (`gin_extract_jso
   value under a different key) and string terms may be truncated (§4.1), so candidates include false
   positives; the residual operator removes them. PostgreSQL marks every `jsonb_ops` strategy
   `recheck = true` as well.
-- **Not accelerated:** the jsonpath operators `@?` / `@@` (PostgreSQL's `jsonb_ops` serves them
-  through a path-to-terms extraction — a follow-on, §10), `=`, and every other `jsonb` operator.
-  `jsonb_path_ops` (hashed paths, `@>` only) is not offered.
+- **Also accelerated:** the jsonpath operators `col @? P` / `col @@ P`, through the term tree of §2.2.
+- **Not accelerated:** `=`, the jsonpath *functions* (`jsonb_path_exists`, `jsonb_path_match`, …,
+  which PostgreSQL does not index either), and every other `jsonb` operator. `jsonb_path_ops` (hashed
+  paths, `@>` only) is not offered.
+
+### 2.2 `jsonb_ops` jsonpath strategies (`@?`, `@@`)
+
+PostgreSQL's `jsonb_ops` serves `col @? P` (strategy 15) and `col @@ P` (strategy 16) by extracting
+from the jsonpath an AND/OR **tree** of terms (`extract_jsp_query` in `jsonb_gin.c`); jed extracts the
+same tree, term for term, with the same §4.1 term bytes. A row is a candidate when the tree is TRUE
+with each leaf read as "the row carries this term" (PostgreSQL's `execute_jsp_gin_node`); the
+operator always rechecks (PostgreSQL marks both strategies `recheck`).
+
+**What is extracted.** PostgreSQL extracts *statements* of one kind, `accessors == scalar`: a
+comparison `==` with a step-less `null` / boolean / number / string literal on either side (the left
+side wins when both are literals) and, on the other, a path starting at `$` or `@` whose accessors
+are `.key`, `.*`, `.**`, `[*]`, and `[…]` subscripts, possibly with filters. Walking the accessors:
+
+- `$` restarts the path at the root; `@` continues the path of the enclosing filter.
+- a filter `? (pred)` extracts `pred` against the path so far and keeps its node, if any;
+- any other accessor — an item method, a variable, a literal, `last`, arithmetic, a parenthesized
+  predicate — ends the walk, keeping only the filter nodes found so far (no keys, no scalar).
+
+A completed walk with a scalar contributes a **KEY** term per `.key` accessor (in PostgreSQL's
+order, last accessor first) and the **scalar's** term: a `null`, boolean, or number value term; a
+string is a key term **or** a string value term (an `OR` node), because `jsonb_ops` indexes a string
+array element as a key. In `strict` mode the last accessor pins the string: none (the root), `.key`,
+or `.*` → the value term; `[*]` or `[…]` → the key term; `.**` → either. The statement's nodes are
+AND-ed. `exists (path)` contributes only that path's filter nodes (an `EXISTS` with a scalar-less walk
+adds no terms — PostgreSQL deliberately skips them as non-selective).
+
+**Combining.** `p && q` → AND, `p || q` → OR, `!p` flips the operator by De Morgan: under an odd
+number of `!`, `&&` is an OR and `||` an AND, and `==` / `exists` extract nothing (`!(a == 1)` holds on
+rows without the term). An OR with an unextractable side is unextractable. An AND with an
+unextractable side keeps the other side. `!=`, `<`, `<=`, `>`, `>=`, `starts with`, `like_regex`, and
+`is unknown` extract nothing.
+
+**The two operators.** `@?` is `EXISTS(P)`: a path body extracts its filters; a predicate body
+(`$.a == 1`) extracts nothing. `@@` reads a predicate body; a path body extracts nothing. Nothing
+extracted at the top is the **full-scan fallback** (PostgreSQL's `GIN_SEARCH_MODE_ALL`); a NULL `P` is
+provably empty. Lax/strict follows the path's mode word.
+
+**Normal form.** The tree is normalized before the gather and the estimate: nested nodes of one kind
+are spliced into their parent, each node keeps its leaf terms as a distinct, byte-ordered set and
+its non-leaf children in extraction order, and a node with one child is that child. A
+multi-column index prefixes each leaf with the column tag (§4.4).
+
+**Evaluation (the gather).** A term reads its whole posting list. An OR unions its leaves' lists (byte
+order) and then its children's candidates (in order). An AND runs the ALL-mode skip-scan (§6.2) over
+its leaves — or, with no leaf, starts from its first child — and then intersects each following
+child's candidates in order, stopping as soon as no candidate survives (the remaining children are not
+read and charge nothing). Every other strategy is the one-level special case: mode ALL is an AND of
+terms and mode ANY an OR, so their reads and charges are unchanged. Costs are §6's.
+
+**Example.** `doc @@ '$.a.b == "x" && $.n == 1'` in lax mode is
+`AND({key a, key b, key n, num 1}, [OR({key x, str x})])`: the skip-scan intersects the four leaves,
+then the survivors are intersected with the union of the `x` key and value lists.
 
 ## 3. DDL semantics (PG-matched where the surface overlaps; oracle-probed)
 
@@ -441,7 +496,8 @@ The per-relation pushdown seam ([indexes.md §5](indexes.md), [cost.md §3](cost
 relation scanned by a **`SELECT`, `UPDATE`, or `DELETE`**, if the `WHERE` AND-chain has a conjunct
 `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)` (membership), or `col = Q`
 (exact array equality) where `col` is a GIN-indexed array column — or `col @> Q` / `Q <@ col` /
-`col ? k` / `col ?| K` / `col ?& K` where `col` is a GIN-indexed `jsonb` column (§2.1) — and **the
+`col ? k` / `col ?| K` / `col ?& K` / `col @? P` / `col @@ P` where `col` is a GIN-indexed `jsonb`
+column (§2.1, §2.2) — and **the
 query operand is a constant** — row-independent, built only from literals and `$N` parameters
 (`Q` an array literal, an `ARRAY[…]` constructor such as `ARRAY['a', $1]`, or a literal/`$N`-param
 `jsonb`; `c`/`k` a literal/`$N`-param scalar or key; `K` a literal or `ARRAY[…]`-constructed
@@ -752,7 +808,13 @@ rows, `gin_entry` reads, and index pages, and the predicate's logical selectivit
   operator class, 0A000 for the deferred element types), house-style messages.
 - **`jsonb_ops` over-long terms** — PostgreSQL hashes a key/string longer than 125 bytes into its
   term; jed keeps the first 128 bytes (§4.1). Both are lossy and rechecked; unobservable in results.
-- **`jsonb_ops` does not accelerate `@?` / `@@`** (PostgreSQL does — §10). Same rows, by full scan.
+- **`jsonb_ops` jsonpath extraction** matches PostgreSQL's (§2.2) with two deliberate departures,
+  both plan-only: (a) under `!`, an `&&` whose one side is unextractable is unextractable when De
+  Morgan makes it an OR — PostgreSQL keeps the other side whenever the operator is written `&&`, so
+  its index scan of `doc @@ '!(!($.a == 1) && $.b == 2)'` drops rows its sequential scan returns
+  (oracle-verified); jed returns the sequential-scan rows; (b) a scalar side must be a step-less
+  literal — PostgreSQL's `jspIsScalar` ignores accessors after a literal (`"x".type()`), extracting a
+  term the comparison does not need; jed extracts nothing there.
 
 ## 10. Narrowings this slice (deferred follow-ons)
 
@@ -761,8 +823,6 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
 
 - **More opclasses** — `jsonb_ops` has **landed** (§2.1); a future object/document type would be a
   new opclass behind the §2 seam; `jsonb_path_ops` (path hashes) later still.
-- **`jsonb_ops` jsonpath strategies** — `col @? path` / `col @@ path`, extracting the key/value
-  terms a path's equality chain requires (PostgreSQL's `jsonb_ops` strategies 15/16).
 - **More array element types** — the **fixed-width key-encodable** elements (`uuid`, `date`,
   `timestamp`, `timestamptz`, `boolean`, alongside the integers) have **landed** (§3): the GIN
   term is their existing key encoding, so the inverted core was unchanged — only the DDL gate

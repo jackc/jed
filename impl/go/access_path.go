@@ -415,6 +415,11 @@ const (
 	ginJsonbExists
 	ginJsonbExistsAny
 	ginJsonbExistsAll
+	// ginJsonPathExists / ginJsonPathMatch are jsonb_ops `col @? P` / `col @@ P` (gin.md §2.2): the
+	// AND/OR term tree PostgreSQL extracts from the jsonpath; nothing extractable falls back to the
+	// full scan. The recovered query operand is the jsonpath P.
+	ginJsonPathExists
+	ginJsonPathMatch
 )
 
 // ginBoundPlan is the plan-time result for one eligible GIN index (spec/design/gin.md §6): its array
@@ -1813,6 +1818,15 @@ func ginMatchOperand(filter *rExpr, colGlobal int, jsonb bool, queryOK func(*rEx
 			default:
 				return ginJsonbExistsAll, filter.rhs, true
 			}
+		// `col @? P` / `col @@ P` (gin.md §2.2): only the operators — the jsonpath functions take vars
+		// and a silent flag, and PostgreSQL indexes neither.
+		case filter.kind == reJsonPathFn && !filter.jpTz && len(filter.sargs) == 2 &&
+			(filter.jpFnKind == jpfExistsSilent || filter.jpFnKind == jpfMatchSilent) &&
+			isColumn(filter.sargs[0], colGlobal) && queryOK(filter.sargs[1]):
+			if filter.jpFnKind == jpfExistsSilent {
+				return ginJsonPathExists, filter.sargs[1], true
+			}
+			return ginJsonPathMatch, filter.sargs[1], true
 		}
 		return 0, nil, false
 	}
@@ -2698,7 +2712,7 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 			arms = append(arms, ginArm{s, q})
 		}
 	}
-	var queries []ginArmTerms
+	var queries []*ginTree
 	for _, arm := range arms {
 		qv, err := arm.operand.eval(queryRow, env, env.exec.session.scratchMeter())
 		if err != nil {
@@ -2719,20 +2733,16 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 			// whole disjunction fall back.
 			return store.ScanWithUnits(mask)
 		}
-		if gb.tagged {
-			for i, t := range q.terms {
-				q.terms[i] = ginTaggedTerm(gb.tag, t)
-			}
+		tree := q.tree
+		if tree == nil {
+			tree = ginTreeFromTerms(arm.strategy.isAny(), q.terms)
 		}
-		queries = append(queries, ginArmTerms{strategy: arm.strategy, terms: q.terms})
+		if gb.tagged {
+			tree = tree.mapTerms(func(t []byte) []byte { return ginTaggedTerm(gb.tag, t) })
+		}
+		queries = append(queries, tree)
 	}
 	return db.ginGather(store, gb, queries, meter, mask, keysOnly)
-}
-
-// ginArmTerms is one gathered arm of a GIN bound: its strategy and distinct query terms.
-type ginArmTerms struct {
-	strategy ginStrategy
-	terms    [][]byte
 }
 
 // isAny reports whether the strategy's posting lists combine by union (mode ANY: `&&`, `?|`) rather
@@ -2760,6 +2770,8 @@ const (
 type ginQuery struct {
 	kind  ginQueryKind
 	terms [][]byte
+	// tree is a jsonpath strategy's AND/OR term tree (gin.md §2.2), set instead of terms.
+	tree *ginTree
 }
 
 // ginQueryTerms is a resident GIN query value's terms under its operator class and strategy — what
@@ -2858,19 +2870,19 @@ func arrayQueryTerms(strategy ginStrategy, elem scalarType, qv Value) ginQuery {
 // candidate storage keys, ascending byte (= storage-key) order, each point-looked-up so lookups and
 // emitted rows follow storage order exactly as a full scan (gin.md §6/§8). gin_entry (per posting
 // entry visited) is charged on meter; the (pages, slabs) block is returned for the caller.
-func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, arms []ginArmTerms, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
+func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, arms []*ginTree, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
 	istore := db.lkpIndexStore(gb.nameKey)
 	g := ginGatherer{istore: istore}
 	var cand [][]byte
 	if len(arms) == 1 {
-		if cand, err = g.arm(arms[0].strategy, arms[0].terms); err != nil {
+		if cand, err = g.eval(arms[0]); err != nil {
 			return nil, 0, 0, err
 		}
 	} else {
 		// A disjunction: each arm's candidates in source order, unioned (gin.md §6.3).
 		postings := make([][][]byte, 0, len(arms))
 		for _, arm := range arms {
-			keys, e := g.arm(arm.strategy, arm.terms)
+			keys, e := g.eval(arm)
 			if e != nil {
 				return nil, 0, 0, e
 			}
@@ -2912,6 +2924,22 @@ func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
 	}
 	var terms [][]byte
 	switch strategy {
+	case ginJsonPathExists, ginJsonPathMatch:
+		// `@?` / `@@` (gin.md §2.2): the tree PostgreSQL extracts from the path, or the full scan when
+		// nothing is extractable. The path text is a jsonpath value's canonical text, already compiled
+		// at resolve; a term never depends on the environment's casing table.
+		if qv.Kind != ValJsonPath {
+			return ginQuery{kind: ginQueryEmpty}
+		}
+		path, err := compile(qv.str(), nil)
+		if err != nil {
+			return ginQuery{kind: ginQueryFullScan}
+		}
+		tree := jsonPathGinTree(&path, strategy == ginJsonPathExists)
+		if tree == nil {
+			return ginQuery{kind: ginQueryFullScan}
+		}
+		return ginQuery{kind: ginQueryGather, tree: tree}
 	case ginJsonbContains:
 		if qv.Kind != ValJsonb {
 			return ginQuery{kind: ginQueryEmpty}
@@ -4021,28 +4049,72 @@ func ginPostingBound(term []byte) keyBound {
 	return keyBound{lo: term, loInc: true, hi: prefixSuccessor(term), hiInc: false}
 }
 
-// postingList reads term's whole posting list (a prefix range scan), charging its overlap nodes and
-// entries, and returns the storage keys (the suffix after the term) in ascending order.
-// arm is one strategy's candidates over its distinct query terms: mode ANY (`&&`, `?|`) → the
-// union of every whole posting list; mode ALL → the skip-scan intersection (gin.md §6.2). `= ANY` and
-// `?` are a single term, so the intersection is that lone posting list; array `=` gathers the same
-// superset as `@>` (the residual makes it exact); the jsonb_ops gathers are supersets the residual
-// rechecks.
-func (g *ginGatherer) arm(strategy ginStrategy, terms [][]byte) ([][]byte, error) {
-	if !strategy.isAny() {
-		return g.intersect(terms)
+// eval is the candidates of a query tree (gin.md §2.2/§6), ascending. A term is its whole posting
+// list. An Or unions its leaves' lists (in byte order), then its children's candidates (in order). An
+// And intersects its leaves by the skip-scan (§6.2) — or, with no leaf, starts from its first child —
+// then intersects each following child's candidates in order, stopping once none survives. Mode ALL
+// is an And of terms and mode ANY an Or, so `= ANY` and `?` (one term) read that lone list, array `=`
+// gathers the same superset as `@>` (the residual makes it exact), and the jsonb_ops gathers are
+// supersets the residual rechecks.
+func (g *ginGatherer) eval(t *ginTree) ([][]byte, error) {
+	switch t.kind {
+	case ginTreeTerm:
+		return g.postingList(t.term)
+	case ginTreeOr:
+		postings := make([][][]byte, 0, len(t.leaves)+len(t.rest))
+		for _, term := range t.leaves {
+			keys, e := g.postingList(term)
+			if e != nil {
+				return nil, e
+			}
+			postings = append(postings, keys)
+		}
+		for _, child := range t.rest {
+			keys, e := g.eval(child)
+			if e != nil {
+				return nil, e
+			}
+			postings = append(postings, keys)
+		}
+		return unionPostings(postings), nil
 	}
-	postings := make([][][]byte, 0, len(terms))
-	for _, t := range terms {
-		keys, e := g.postingList(t)
+	rest := t.rest
+	var cand [][]byte
+	var err error
+	if len(t.leaves) > 0 {
+		cand, err = g.intersect(t.leaves)
+	} else if len(rest) > 0 {
+		cand, err = g.eval(rest[0])
+		rest = rest[1:]
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, child := range rest {
+		if len(cand) == 0 {
+			break
+		}
+		found, e := g.eval(child)
 		if e != nil {
 			return nil, e
 		}
-		postings = append(postings, keys)
+		in := make(map[string]bool, len(found))
+		for _, k := range found {
+			in[string(k)] = true
+		}
+		kept := cand[:0:0]
+		for _, k := range cand {
+			if in[string(k)] {
+				kept = append(kept, k)
+			}
+		}
+		cand = kept
 	}
-	return unionPostings(postings), nil
+	return cand, nil
 }
 
+// postingList reads term's whole posting list (a prefix range scan), charging its overlap nodes and
+// entries, and returns the storage keys (the suffix after the term) in ascending order.
 func (g *ginGatherer) postingList(term []byte) ([][]byte, error) {
 	es, p, _, err := g.istore.RangeScanWithUnits(ginPostingBound(term), nil)
 	if err != nil {

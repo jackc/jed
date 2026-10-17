@@ -39,6 +39,8 @@ export const ACCESS_GIN_JSONB_CONTAINS = "matching";
 export const ACCESS_GIN_JSONB_EXISTS = "matching";
 export const ACCESS_GIN_JSONB_EXISTS_ANY = "matching";
 export const ACCESS_GIN_JSONB_EXISTS_ALL = "matching";
+export const ACCESS_GIN_JSONB_PATH_EXISTS = "matching";
+export const ACCESS_GIN_JSONB_PATH_MATCH = "matching";
 export const ACCESS_UNSUPPORTED = "opaque";
 
 export const ESTIMATOR_ACCESS_PATH_ORDER = [
