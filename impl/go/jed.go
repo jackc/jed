@@ -591,6 +591,11 @@ var SupportedCapabilities = []string{
 	// over a date is 0A000); julian is PG's float8 formula. The timestamptz overload decomposes
 	// in the session zone (stable; EXTRACT's selective timezone charge); the others are immutable.
 	"func.date_part",
+	// PostgreSQL's data-type formatting functions (spec/design/formatting.md): to_char over
+	// datetimes, intervals, and numbers; to_timestamp / to_date; to_number.
+	"func.to_char",
+	"func.to_timestamp",
+	"func.to_number",
 	// The COLLATE expression operator + ORDER BY … COLLATE over a VENDORED collation (collation slice
 	// 1c, spec/design/collation.md §14): a vendored collation orders text by its UCA sort key in
 	// the ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704,

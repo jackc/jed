@@ -12,7 +12,7 @@
 #   impl/ts, impl/node, bench/ts, migrate/ts — biome (mise-pinned; biome.json at repo root).
 #                       2-space, lineWidth 100. The @generated TS files
 #                       (operators/costs/ranges_gen/sqlstate/
-#                       datetime_units_gen/pg_keywords_gen) are EXCLUDED there, so the codegen
+#                       datetime_units_gen/pg_keywords_gen/formatting_gen) are EXCLUDED there, so the codegen
 #                       drift check (`mise run verify`) stays their single source of truth. Biome's
 #                       LINTER is on with a tailored ruleset, but FORMAT and LINT are separate gates:
 #                       `mise run fmt` runs `biome format` (format only), `mise run lint` runs

@@ -1918,6 +1918,11 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         | ScalarFunc::MakeDate
         | ScalarFunc::CurrentDate
         | ScalarFunc::DatePart
+        | ScalarFunc::ToChar
+        | ScalarFunc::ToCharInt8
+        | ScalarFunc::ToTimestamp
+        | ScalarFunc::ToDate
+        | ScalarFunc::ToNumber
         | ScalarFunc::JustifyHours
         | ScalarFunc::JustifyDays
         | ScalarFunc::JustifyInterval

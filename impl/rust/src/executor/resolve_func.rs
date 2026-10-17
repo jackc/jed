@@ -1110,7 +1110,12 @@ fn adopt_scalar_overload(
         && matches!(rargs.first(), Some(RExpr::ConstText(f)) if f.eq_ignore_ascii_case("epoch"));
     params.nonimmutable |= desc.volatility != "immutable" && !epoch;
     let result = scalar_result_type(desc.result, &tys);
-    let func = scalar_func_id(name);
+    let mut func = scalar_func_id(name);
+    // PostgreSQL's to_char has int4 and int8 overloads (a smallint widens to int4); they differ
+    // in EEEE, so the i64 overload is its own kernel.
+    if func == ScalarFunc::ToChar && matches!(tys[0], ResolvedType::Int(ScalarType::Int64)) {
+        func = ScalarFunc::ToCharInt8;
+    }
     // Promote float arguments to f64 when the function computes at f64 (every float
     // overload except `abs(f32)`, which keeps its width). The eval then sees one width.
     let widen_args = !matches!(func, ScalarFunc::Abs);
@@ -2264,6 +2269,9 @@ fn debug_snake(value: impl std::fmt::Debug) -> String {
 }
 
 fn explain_scalar_func(func: ScalarFunc) -> String {
+    if func == ScalarFunc::ToCharInt8 {
+        return "to_char".to_string();
+    }
     debug_snake(func)
 }
 

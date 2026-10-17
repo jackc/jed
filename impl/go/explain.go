@@ -1773,6 +1773,15 @@ func explainScalarFunc(f scalarFunc) string {
 		return "get_bit"
 	case sfSetBit:
 		return "set_bit"
+	case sfToCharTimestamp, sfToCharTimestamptz, sfToCharInterval, sfToCharInt4, sfToCharInt8,
+		sfToCharDecimal, sfToCharFloat4, sfToCharFloat8:
+		return "to_char"
+	case sfToTimestamp, sfToTimestampEpoch:
+		return "to_timestamp"
+	case sfToDate:
+		return "to_date"
+	case sfToNumber:
+		return "to_number"
 	case sfMd5:
 		return "md5"
 	case sfSha224:

@@ -210,6 +210,21 @@ FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
   'epoch'::date                 AS epoch,
   make_date(2024, 2, 29)        AS built,
   'tomorrow'::date - 'today'    AS one_day;`;
+
+	const toCharDemo = `SELECT
+  to_char(timestamp '2024-03-05 13:04:05', 'FMDay, FMDDth FMMonth YYYY HH12:MI AM') AS long_date,
+  to_char(timestamp '2024-03-05 13:04:05', 'IYYY-"W"IW-ID')                          AS iso_week,
+  to_char(interval '26 hours 5 minutes', 'HH24:MI')                                 AS hours,
+  to_char(1234567.891, 'FM9,999,999.99')                                            AS grouped,
+  to_char(-42.5, '999.9PR')                                                         AS bracketed,
+  to_char(1987::i32, 'RN')                                                          AS roman;`;
+
+	const parseDemo = `SELECT
+  to_timestamp('05 Mar 2024 13:04', 'DD Mon YYYY HH24:MI')      AS ts,
+  to_timestamp('2024-03-05 13:04 +05:30', 'YYYY-MM-DD HH24:MI OF') AS with_offset,
+  to_date('2024 065', 'YYYY DDD')                               AS day_of_year,
+  to_number('$1,234.56-', 'L9,999.99S')                         AS amount,
+  to_timestamp(1700000000::f64)                                 AS from_epoch;`;
 </script>
 
 <svelte:head>
@@ -728,6 +743,32 @@ prepared statement tracks the clock, and an index expression containing one is r
 than silently frozen. `make_date(year, month, day)` builds a date from parts:
 
 <LiveSql demo="dateClockDemo" query={dateClockDemo} rows={1} />
+
+### Formatting and parsing with templates
+
+PostgreSQL's template functions work as in PostgreSQL. `to_char(value, template)` renders a
+`timestamp`, `timestamptz`, `interval`, integer, `decimal`, or float through a template:
+`YYYY`, `MM`, `DD`, `HH24`, `MI`, `SS`, `Month`, `Day`, ISO `IYYY`/`IW`/`ID`, `J`, `TZ`/`OF` for
+datetimes; `9`, `0`, `.`, `,`, `S`, `MI`, `PR`, `RN`, `V`, and `EEEE` for numbers. `FM` drops the
+padding, `TH` adds an ordinal suffix, and double-quoted text is copied through. A `timestamptz` is
+shown in the session time zone, with its abbreviation under `TZ`:
+
+<LiveSql demo="toCharDemo" query={toCharDemo} rows={1} />
+
+`to_timestamp(text, template)` and `to_date(text, template)` read text back with the same
+patterns; a reading without a `TZH`/`TZM`/`OF` offset is a wall clock in the session time zone.
+`to_number(text, template)` reads a `decimal`, and `to_timestamp(seconds)` converts Unix-epoch
+seconds:
+
+<LiveSql demo="parseDemo" query={parseDemo} rows={1} />
+
+jed has no locale, so it behaves as PostgreSQL does under the `C` locale: the `TM` prefix gives
+the English month and day names (without padding), and `D`, `G`, `L` are `.`, `,`, and a space.
+A few things differ from PostgreSQL. A `date` is not implicitly cast, so write
+`to_char(d::timestamp, …)`. A bare integer literal is `i64` in jed, so `to_char(125, '9.9EEEE')`
+takes PostgreSQL's `bigint` rounding (`1.3e+02`); write `125::i32` for the `integer` one
+(`1.2e+02`). A time zone abbreviation in `to_timestamp`'s input (`'… EST'` under `TZ`) is not
+supported yet (`0A000`); give the offset instead.
 
 
 See the full [type reference](../../reference/types/) for every scalar type and its range.

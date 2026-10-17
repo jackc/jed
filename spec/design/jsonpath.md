@@ -379,8 +379,9 @@ language for `.datetime(template)`. The conformance suite `json/json_datetime_ex
 both the `0A000` and the extract-and-cast form.
 
 **Revisitable.** This is a scope decision, not a technical barrier. If a real need appears, the
-strict-subset option is the likely path, and it gets cheaper if SQL `to_timestamp` is built for its
-own sake. Reopening it also reopens the date/time `PASSING` value (json-sql-functions.md §5.4) and
+strict-subset option is the likely path; SQL `to_timestamp` has since landed
+([formatting.md](formatting.md)), so its field readers exist in every core, though not PostgreSQL's
+standard parsing mode or the abbreviation table. Reopening it also reopens the date/time `PASSING` value (json-sql-functions.md §5.4) and
 the `_tz` functions' session-zone comparisons (§5.1).
 
 ### 3.2 Arithmetic

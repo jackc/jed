@@ -920,6 +920,23 @@ const (
 	// md5(text | bytea) → text — the MD5 digest as 32 lowercase hex digits; text hashes its UTF-8
 	// bytes (§4).
 	sfMd5
+	// to_char(x, template) → text — the data-type formatting renderers (formatting.md §3, §6): a
+	// timestamp, a timestamptz (decomposed in the session zone), an interval, an int4-path integer
+	// (i16/i32), an int8-path i64, a decimal, an f32, an f64.
+	sfToCharTimestamp
+	sfToCharTimestamptz
+	sfToCharInterval
+	sfToCharInt4
+	sfToCharInt8
+	sfToCharDecimal
+	sfToCharFloat4
+	sfToCharFloat8
+	// to_timestamp(text, template) → timestamptz; to_date(text, template) → date; to_number(text,
+	// template) → decimal (formatting.md §5, §7); to_timestamp(f64) → timestamptz (Unix seconds).
+	sfToTimestamp
+	sfToDate
+	sfToNumber
+	sfToTimestampEpoch
 	// sha224(bytea) → bytea — the 28-byte SHA-224 digest (§4).
 	sfSha224
 	// sha256(bytea) → bytea — the 32-byte SHA-256 digest (§4).

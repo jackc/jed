@@ -1,0 +1,17 @@
+# EXPLAIN (VERBOSE) prints the data-type formatting functions under their SQL names, whichever
+# overload (spec/design/formatting.md, explain.md). jed-SPECIFIC plan text.
+# requires: query.select, query.select_no_from, query.explain, types.timestamp, types.timestamptz, types.interval, types.decimal, types.f64, types.i64, func.to_char, func.to_timestamp, func.to_number
+
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT to_char(timestamp '2024-01-01', 'YYYY'), to_char(timestamptz '2024-01-01 00:00:00+00', 'TZ'), to_char(interval '1 day', 'DD'), to_char(5::i64, '9'), to_char(1.5, '9.9'), to_char(1.5::f64, '9.9')
+----
+0
+Result
+output=[to_char('2024-01-01 00:00:00', 'YYYY'), to_char('2024-01-01 00:00:00+00', 'TZ'), to_char('1 day', 'DD'), to_char(cast(5 as i64), '9'), to_char(1.5, '9.9'), to_char(cast(1.5 as f64), '9.9')]
+
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT to_timestamp('2024', 'YYYY'), to_timestamp(0::f64), to_date('2024', 'YYYY'), to_number('12', '99')
+----
+0
+Result
+output=[to_timestamp('2024', 'YYYY'), to_timestamp(cast(0 as f64)), to_date('2024', 'YYYY'), to_number('12', '99')]

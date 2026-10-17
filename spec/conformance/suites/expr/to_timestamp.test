@@ -1,0 +1,1264 @@
+# to_timestamp(text, template) → timestamptz and to_date(text, template) → date
+# (spec/design/formatting.md §5; PostgreSQL's "Data Type Formatting Functions", manual §9.8): the
+# field readers, fixed-width vs FM fields, separator / space skipping, FX, the word readers, BC
+# years, ISO week dates, day of year, fractional seconds (FFn rounds), the TZH / TZM / OF offsets,
+# and PostgreSQL's errors. Most shapes come from PostgreSQL's horology regression test. The session
+# zone is UTC unless a record says otherwise. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.order_by, query.select, query.select_no_from, types.i32, types.text, types.timestamptz, types.date, types.f64, session.timezone, query.set_returning, func.to_timestamp
+
+# load-timezone: America/New_York
+
+query T nosort
+SELECT to_timestamp('0097/Feb/16 --> 08:14:30', 'YYYY/Mon/DD --> HH:MI:SS')
+----
+0097-02-16 08:14:30+00
+
+query T nosort
+SELECT to_timestamp('97/2/16 8:14:30', 'FMYYYY/FMMM/FMDD FMHH:FMMI:FMSS')
+----
+0097-02-16 08:14:30+00
+
+query T nosort
+SELECT to_timestamp('2011$03!18 23_38_15', 'YYYY-MM-DD HH24:MI:SS')
+----
+2011-03-18 23:38:15+00
+
+query T nosort
+SELECT to_timestamp('1985 January 12', 'YYYY FMMonth DD')
+----
+1985-01-12 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('1985 FMMonth 12', 'YYYY "FMMonth" DD')
+----
+1985-01-12 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('1985 \ 12', 'YYYY \\ DD')
+----
+1985-01-12 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('My birthday-> Year: 1976, Month: May, Day: 16', '"My birthday-> Year:" YYYY, "Month:" FMMonth, "Day:" DD')
+----
+1976-05-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('1,582nd VIII 21', 'Y,YYYth FMRM DD')
+----
+1582-08-21 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('15 "text between quote marks" 98 54 45', 'HH24 "\"text between quote marks\"" YY MI SS')
+----
+1998-01-01 15:54:45+00
+
+query T nosort
+SELECT to_timestamp('05121445482000', 'MMDDHH24MISSYYYY')
+----
+2000-05-12 14:45:48+00
+
+query T nosort
+SELECT to_timestamp('2000January09Sunday', 'YYYYFMMonthDDFMDay')
+----
+2000-01-09 00:00:00+00
+
+statement error 22007
+SELECT to_timestamp('97/Feb/16', 'YYMonDD')
+
+query T nosort
+SELECT to_timestamp('97/Feb/16', 'YY:Mon:DD')
+----
+1997-02-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('97/Feb/16', 'FXYY:Mon:DD')
+----
+1997-02-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('97/Feb/16', 'FXYY/Mon/DD')
+----
+1997-02-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('19971116', 'YYYYMMDD')
+----
+1997-11-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('20000-1116', 'YYYY-MMDD')
+----
+20000-11-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('1997 AD 11 16', 'YYYY BC MM DD')
+----
+1997-11-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('1997 BC 11 16', 'YYYY BC MM DD')
+----
+1997-11-16 00:00:00+00 BC
+
+query T nosort
+SELECT to_timestamp('1997 A.D. 11 16', 'YYYY B.C. MM DD')
+----
+1997-11-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('1997 B.C. 11 16', 'YYYY B.C. MM DD')
+----
+1997-11-16 00:00:00+00 BC
+
+query T nosort
+SELECT to_timestamp('9-1116', 'Y-MMDD')
+----
+2009-11-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('95-1116', 'YY-MMDD')
+----
+1995-11-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('995-1116', 'YYY-MMDD')
+----
+1995-11-16 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2005426', 'YYYYWWD')
+----
+2005-10-15 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2005300', 'YYYYDDD')
+----
+2005-10-27 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2005527', 'IYYYIWID')
+----
+2006-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('005527', 'IYYIWID')
+----
+2006-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('05527', 'IYIWID')
+----
+2006-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('5527', 'IIWID')
+----
+2006-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2005364', 'IYYYIDDD')
+----
+2006-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('20050302', 'YYYYMMDD')
+----
+2005-03-02 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2005 03 02', 'YYYYMMDD')
+----
+2005-03-02 00:00:00+00
+
+query T nosort
+SELECT to_timestamp(' 2005 03 02', 'YYYYMMDD')
+----
+2005-03-02 00:00:00+00
+
+query T nosort
+SELECT to_timestamp(' 20050302', 'YYYYMMDD')
+----
+2005-03-02 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 AM', 'YYYY-MM-DD HH12:MI PM')
+----
+2011-12-18 11:38:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 PM', 'YYYY-MM-DD HH12:MI PM')
+----
+2011-12-18 23:38:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 A.M.', 'YYYY-MM-DD HH12:MI P.M.')
+----
+2011-12-18 11:38:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 P.M.', 'YYYY-MM-DD HH12:MI P.M.')
+----
+2011-12-18 23:38:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 +05', 'YYYY-MM-DD HH12:MI TZH')
+----
+2011-12-18 06:38:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 -05', 'YYYY-MM-DD HH12:MI TZH')
+----
+2011-12-18 16:38:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 +05:20', 'YYYY-MM-DD HH12:MI TZH:TZM')
+----
+2011-12-18 06:18:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 -05:20', 'YYYY-MM-DD HH12:MI TZH:TZM')
+----
+2011-12-18 16:58:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 20', 'YYYY-MM-DD HH12:MI TZM')
+----
+2011-12-18 11:18:00+00
+
+statement error 0A000
+SELECT to_timestamp('2011-12-18 11:38 EST', 'YYYY-MM-DD HH12:MI TZ')
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 -05', 'YYYY-MM-DD HH12:MI TZ')
+----
+2011-12-18 16:38:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 +01:30', 'YYYY-MM-DD HH12:MI TZ')
+----
+2011-12-18 10:08:00+00
+
+statement error 0A000
+SELECT to_timestamp('2011-12-18 11:38 MSK', 'YYYY-MM-DD HH12:MI TZ')
+
+statement error 0A000
+SELECT to_timestamp('2011-12-18 00:00 LMT', 'YYYY-MM-DD HH24:MI TZ')
+
+statement error 0A000
+SELECT to_timestamp('2011-12-18 11:38ESTFOO24', 'YYYY-MM-DD HH12:MITZFOOSS')
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38-05FOO24', 'YYYY-MM-DD HH12:MITZFOOSS')
+----
+2011-12-18 16:38:24+00
+
+statement error 0A000
+SELECT to_timestamp('2011-12-18 11:38 JUNK', 'YYYY-MM-DD HH12:MI TZ')
+
+statement error 22007
+SELECT to_timestamp('2011-12-18 11:38 ...', 'YYYY-MM-DD HH12:MI TZ')
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 -05', 'YYYY-MM-DD HH12:MI OF')
+----
+2011-12-18 16:38:00+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 11:38 +01:30', 'YYYY-MM-DD HH12:MI OF')
+----
+2011-12-18 10:08:00+00
+
+statement error 22007
+SELECT to_timestamp('2011-12-18 11:38 +xyz', 'YYYY-MM-DD HH12:MI OF')
+
+statement error 22007
+SELECT to_timestamp('2011-12-18 11:38 +01:xyz', 'YYYY-MM-DD HH12:MI OF')
+
+query T nosort
+SELECT to_timestamp('2018-11-02 12:34:56.025', 'YYYY-MM-DD HH24:MI:SS.MS')
+----
+2018-11-02 12:34:56.025+00
+
+query IT rowsort
+SELECT i, to_timestamp('2018-11-02 12:34:56', 'YYYY-MM-DD HH24:MI:SS.FF' || i::text) FROM generate_series(1, 6) AS g(i)
+----
+1
+2018-11-02 12:34:56+00
+2
+2018-11-02 12:34:56+00
+3
+2018-11-02 12:34:56+00
+4
+2018-11-02 12:34:56+00
+5
+2018-11-02 12:34:56+00
+6
+2018-11-02 12:34:56+00
+
+query IT rowsort
+SELECT i, to_timestamp('2018-11-02 12:34:56.1', 'YYYY-MM-DD HH24:MI:SS.FF' || i::text) FROM generate_series(1, 6) AS g(i)
+----
+1
+2018-11-02 12:34:56.1+00
+2
+2018-11-02 12:34:56.1+00
+3
+2018-11-02 12:34:56.1+00
+4
+2018-11-02 12:34:56.1+00
+5
+2018-11-02 12:34:56.1+00
+6
+2018-11-02 12:34:56.1+00
+
+query IT rowsort
+SELECT i, to_timestamp('2018-11-02 12:34:56.12', 'YYYY-MM-DD HH24:MI:SS.FF' || i::text) FROM generate_series(1, 6) AS g(i)
+----
+1
+2018-11-02 12:34:56.1+00
+2
+2018-11-02 12:34:56.12+00
+3
+2018-11-02 12:34:56.12+00
+4
+2018-11-02 12:34:56.12+00
+5
+2018-11-02 12:34:56.12+00
+6
+2018-11-02 12:34:56.12+00
+
+query IT rowsort
+SELECT i, to_timestamp('2018-11-02 12:34:56.123', 'YYYY-MM-DD HH24:MI:SS.FF' || i::text) FROM generate_series(1, 6) AS g(i)
+----
+1
+2018-11-02 12:34:56.1+00
+2
+2018-11-02 12:34:56.12+00
+3
+2018-11-02 12:34:56.123+00
+4
+2018-11-02 12:34:56.123+00
+5
+2018-11-02 12:34:56.123+00
+6
+2018-11-02 12:34:56.123+00
+
+query IT rowsort
+SELECT i, to_timestamp('2018-11-02 12:34:56.1234', 'YYYY-MM-DD HH24:MI:SS.FF' || i::text) FROM generate_series(1, 6) AS g(i)
+----
+1
+2018-11-02 12:34:56.1+00
+2
+2018-11-02 12:34:56.12+00
+3
+2018-11-02 12:34:56.123+00
+4
+2018-11-02 12:34:56.1234+00
+5
+2018-11-02 12:34:56.1234+00
+6
+2018-11-02 12:34:56.1234+00
+
+query IT rowsort
+SELECT i, to_timestamp('2018-11-02 12:34:56.12345', 'YYYY-MM-DD HH24:MI:SS.FF' || i::text) FROM generate_series(1, 6) AS g(i)
+----
+1
+2018-11-02 12:34:56.1+00
+2
+2018-11-02 12:34:56.12+00
+3
+2018-11-02 12:34:56.123+00
+4
+2018-11-02 12:34:56.1235+00
+5
+2018-11-02 12:34:56.12345+00
+6
+2018-11-02 12:34:56.12345+00
+
+query IT rowsort
+SELECT i, to_timestamp('2018-11-02 12:34:56.123456', 'YYYY-MM-DD HH24:MI:SS.FF' || i::text) FROM generate_series(1, 6) AS g(i)
+----
+1
+2018-11-02 12:34:56.1+00
+2
+2018-11-02 12:34:56.12+00
+3
+2018-11-02 12:34:56.123+00
+4
+2018-11-02 12:34:56.1235+00
+5
+2018-11-02 12:34:56.12346+00
+6
+2018-11-02 12:34:56.123456+00
+
+statement error 22008
+SELECT i, to_timestamp('2018-11-02 12:34:56.123456789', 'YYYY-MM-DD HH24:MI:SS.FF' || i::text) FROM generate_series(1, 6) AS g(i)
+
+query IT rowsort
+SELECT i, to_timestamp('20181102123456123456', 'YYYYMMDDHH24MISSFF' || i::text) FROM generate_series(1, 6) AS g(i)
+----
+1
+2018-11-02 12:34:56.1+00
+2
+2018-11-02 12:34:56.12+00
+3
+2018-11-02 12:34:56.123+00
+4
+2018-11-02 12:34:56.1235+00
+5
+2018-11-02 12:34:56.12346+00
+6
+2018-11-02 12:34:56.123456+00
+
+query T nosort
+SELECT to_date('1 4 1902', 'Q MM YYYY')
+----
+1902-04-01
+
+query T nosort
+SELECT to_date('3 4 21 01', 'W MM CC YY')
+----
+2001-04-15
+
+query T nosort
+SELECT to_date('2458872', 'J')
+----
+2020-01-23
+
+query T nosort
+SELECT to_date('44-02-01 BC','YYYY-MM-DD BC')
+----
+0044-02-01 BC
+
+query T nosort
+SELECT to_date('-44-02-01','YYYY-MM-DD')
+----
+0044-02-01 BC
+
+query T nosort
+SELECT to_date('-44-02-01 BC','YYYY-MM-DD BC')
+----
+0044-02-01
+
+query T nosort
+SELECT to_timestamp('44-02-01 11:12:13 BC','YYYY-MM-DD HH24:MI:SS BC')
+----
+0044-02-01 11:12:13+00 BC
+
+query T nosort
+SELECT to_timestamp('-44-02-01 11:12:13','YYYY-MM-DD HH24:MI:SS')
+----
+0044-02-01 11:12:13+00 BC
+
+query T nosort
+SELECT to_timestamp('-44-02-01 11:12:13 BC','YYYY-MM-DD HH24:MI:SS BC')
+----
+0044-02-01 11:12:13+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 23:38:15', 'YYYY-MM-DD HH24:MI:SS')
+----
+2011-12-18 23:38:15+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 23:38:15', 'YYYY-MM-DD HH24:MI:SS')
+----
+2011-12-18 23:38:15+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 23:38:15', 'YYYY-MM-DD HH24:MI:SS')
+----
+2011-12-18 23:38:15+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 23:38:15', 'YYYY-MM-DD HH24:MI:SS')
+----
+2011-12-18 23:38:15+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 23:38:15', 'YYYY-MM-DD HH24:MI:SS')
+----
+2011-12-18 23:38:15+00
+
+query T nosort
+SELECT to_timestamp('2011-12-18 23:38:15', 'YYYY-MM-DD HH24:MI:SS')
+----
+2011-12-18 23:38:15+00
+
+query T nosort
+SELECT to_timestamp('2000+ JUN', 'YYYY/MON')
+----
+2000-06-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp(' 2000 +JUN', 'YYYY/MON')
+----
+2000-06-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp(' 2000 +JUN', 'YYYY//MON')
+----
+2000-06-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2000 +JUN', 'YYYY//MON')
+----
+2000-06-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2000 + JUN', 'YYYY MON')
+----
+2000-06-01 00:00:00+00
+
+statement error 22007
+SELECT to_timestamp('2000 ++ JUN', 'YYYY MON')
+
+statement error 22007
+SELECT to_timestamp('2000 + + JUN', 'YYYY MON')
+
+statement error 22007
+SELECT to_timestamp('2000 + + JUN', 'YYYY MON')
+
+query T nosort
+SELECT to_timestamp('2000 -10', 'YYYY TZH')
+----
+2000-01-01 10:00:00+00
+
+query T nosort
+SELECT to_timestamp('2000 -10', 'YYYY TZH')
+----
+2000-01-01 10:00:00+00
+
+query T nosort
+SELECT to_date('2011 12 18', 'YYYY MM DD')
+----
+2011-12-18
+
+query T nosort
+SELECT to_date('2011 12 18', 'YYYY MM DD')
+----
+2011-12-18
+
+query T nosort
+SELECT to_date('2011 12 18', 'YYYY MM DD')
+----
+2011-12-18
+
+query T nosort
+SELECT to_date('2011 12 18', 'YYYY MM DD')
+----
+2011-12-18
+
+query T nosort
+SELECT to_date('2011 12 18', 'YYYY MM DD')
+----
+2011-12-18
+
+query T nosort
+SELECT to_date('2011 12 18', 'YYYY MM DD')
+----
+2011-12-18
+
+query T nosort
+SELECT to_date('2011 12 18', 'YYYYxMMxDD')
+----
+2011-12-18
+
+query T nosort
+SELECT to_date('2011x 12x 18', 'YYYYxMMxDD')
+----
+2011-12-18
+
+statement error 22007
+SELECT to_date('2011 x12 x18', 'YYYYxMMxDD')
+
+statement error 22007
+SELECT to_timestamp('2005527', 'YYYYIWID')
+
+statement error 22007
+SELECT to_timestamp('19971', 'YYYYMMDD')
+
+statement error 22007
+SELECT to_timestamp('19971)24', 'YYYYMMDD')
+
+statement error 22007
+SELECT to_timestamp('Friday 1-January-1999', 'DY DD MON YYYY')
+
+statement error 22007
+SELECT to_timestamp('Fri 1-January-1999', 'DY DD MON YYYY')
+
+query T nosort
+SELECT to_timestamp('Fri 1-Jan-1999', 'DY DD MON YYYY')
+----
+1999-01-01 00:00:00+00
+
+statement error 22007
+SELECT to_timestamp('1997-11-Jan-16', 'YYYY-MM-Mon-DD')
+
+statement error 22007
+SELECT to_timestamp('199711xy', 'YYYYMMDD')
+
+statement error 22008
+SELECT to_timestamp('10000000000', 'FMYYYY')
+
+statement error 22008
+SELECT to_timestamp('2016-06-13 25:00:00', 'YYYY-MM-DD HH24:MI:SS')
+
+statement error 22008
+SELECT to_timestamp('2016-06-13 15:60:00', 'YYYY-MM-DD HH24:MI:SS')
+
+statement error 22008
+SELECT to_timestamp('2016-06-13 15:50:60', 'YYYY-MM-DD HH24:MI:SS')
+
+query T nosort
+SELECT to_timestamp('2016-06-13 15:50:55', 'YYYY-MM-DD HH24:MI:SS')
+----
+2016-06-13 15:50:55+00
+
+statement error 22007
+SELECT to_timestamp('2016-06-13 15:50:55', 'YYYY-MM-DD HH:MI:SS')
+
+statement error 22008
+SELECT to_timestamp('2016-13-01 15:50:55', 'YYYY-MM-DD HH24:MI:SS')
+
+statement error 22008
+SELECT to_timestamp('2016-02-30 15:50:55', 'YYYY-MM-DD HH24:MI:SS')
+
+query T nosort
+SELECT to_timestamp('2016-02-29 15:50:55', 'YYYY-MM-DD HH24:MI:SS')
+----
+2016-02-29 15:50:55+00
+
+statement error 22008
+SELECT to_timestamp('2015-02-29 15:50:55', 'YYYY-MM-DD HH24:MI:SS')
+
+query T nosort
+SELECT to_timestamp('2015-02-11 86000', 'YYYY-MM-DD SSSS')
+----
+2015-02-11 23:53:20+00
+
+statement error 22008
+SELECT to_timestamp('2015-02-11 86400', 'YYYY-MM-DD SSSS')
+
+query T nosort
+SELECT to_timestamp('2015-02-11 86000', 'YYYY-MM-DD SSSSS')
+----
+2015-02-11 23:53:20+00
+
+statement error 22008
+SELECT to_timestamp('2015-02-11 86400', 'YYYY-MM-DD SSSSS')
+
+statement error 22008
+SELECT to_timestamp('1000000000,999', 'Y,YYY')
+
+statement error 22008
+SELECT to_timestamp('0.-2147483648', 'SS.MS')
+
+statement error 22008
+SELECT to_timestamp('613566758', 'W')
+
+statement error 22008
+SELECT to_timestamp('2024 613566758 1', 'YYYY WW D')
+
+statement error 22008
+SELECT to_date('2016-13-10', 'YYYY-MM-DD')
+
+statement error 22008
+SELECT to_date('2016-02-30', 'YYYY-MM-DD')
+
+query T nosort
+SELECT to_date('2016-02-29', 'YYYY-MM-DD')
+----
+2016-02-29
+
+statement error 22008
+SELECT to_date('2015-02-29', 'YYYY-MM-DD')
+
+query T nosort
+SELECT to_date('2015 365', 'YYYY DDD')
+----
+2015-12-31
+
+statement error 22008
+SELECT to_date('2015 366', 'YYYY DDD')
+
+query T nosort
+SELECT to_date('2016 365', 'YYYY DDD')
+----
+2016-12-30
+
+query T nosort
+SELECT to_date('2016 366', 'YYYY DDD')
+----
+2016-12-31
+
+statement error 22008
+SELECT to_date('2016 367', 'YYYY DDD')
+
+query T nosort
+SELECT to_date('0000-02-01','YYYY-MM-DD')
+----
+0001-02-01 BC
+
+statement error 22008
+SELECT to_date('100000000', 'CC')
+
+statement error 22008
+SELECT to_date('-100000000', 'CC')
+
+statement error 22008
+SELECT to_date('-2147483648 01', 'CC YY')
+
+statement error 22008
+SELECT to_date('2147483647 01', 'CC YY')
+
+query T nosort
+SELECT to_timestamp('2024-03-05', '')
+----
+0001-01-01 00:00:00+00 BC
+
+query T nosort
+SELECT to_date('2024-03-05', '')
+----
+0001-01-01 BC
+
+query T nosort
+SELECT to_timestamp('', 'YYYY')
+----
+0001-01-01 00:00:00+00 BC
+
+query T nosort
+SELECT to_timestamp(NULL, 'YYYY')
+----
+NULL
+
+query T nosort
+SELECT to_timestamp('2024', NULL)
+----
+NULL
+
+query T nosort
+SELECT to_timestamp('12:34', 'HH24:MI')
+----
+0001-01-01 12:34:00+00 BC
+
+query T nosort
+SELECT to_date('12', 'MM')
+----
+0001-12-01 BC
+
+query T nosort
+SELECT to_date('2024 31', 'YYYY DD')
+----
+2024-01-31
+
+query T nosort
+SELECT to_date('02-31', 'MM-DD')
+----
+0001-03-02 BC
+
+query T nosort
+SELECT to_timestamp('2024-03-05 13:04:05.987654', 'YYYY-MM-DD HH24:MI:SS.US')
+----
+2024-03-05 13:04:05.987654+00
+
+query T nosort
+SELECT to_timestamp('2024-03-05 13:04:05.9876', 'YYYY-MM-DD HH24:MI:SS.FF2')
+----
+2024-03-05 13:04:05.99+00
+
+query T nosort
+SELECT to_timestamp('1985-03-05 13:04:05.125', 'YYYY-MM-DD HH24:MI:SS.FF2')
+----
+1985-03-05 13:04:05.12+00
+
+query T nosort
+SELECT to_timestamp('1985-03-05 13:04:05.135', 'YYYY-MM-DD HH24:MI:SS.FF2')
+----
+1985-03-05 13:04:05.13+00
+
+query T nosort
+SELECT to_timestamp('2024-03-05 13:04:05.125', 'YYYY-MM-DD HH24:MI:SS.FF2')
+----
+2024-03-05 13:04:05.13+00
+
+query T nosort
+SELECT to_timestamp('1960-03-05 13:04:05.125', 'YYYY-MM-DD HH24:MI:SS.FF2')
+----
+1960-03-05 13:04:05.12+00
+
+query T nosort
+SELECT to_timestamp('1985-03-05 13:04:05.5', 'YYYY-MM-DD HH24:MI:SS.FF1')
+----
+1985-03-05 13:04:05.5+00
+
+query T nosort
+SELECT to_timestamp('5th March 2024', 'DDth Month YYYY')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('5TH march 2024', 'FMDDTH FMMonth YYYY')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('MARCH 05 2024', 'MONTH DD YYYY')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('mar 05 2024', 'MON DD YYYY')
+----
+2024-03-05 00:00:00+00
+
+statement error 22007
+SELECT to_timestamp('Tuesday 2024 10 1', 'Day IYYY IW ID')
+
+query T nosort
+SELECT to_timestamp('2024 10 2', 'IYYY IW ID')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024 10', 'IYYY IW')
+----
+2024-03-04 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024 065', 'IYYY IDDD')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024 3', 'YYYY D')
+----
+2024-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024 Tue', 'YYYY Dy')
+----
+2024-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('xii 2024', 'rm YYYY')
+----
+2024-12-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('IV 2024', 'RM YYYY')
+----
+2024-04-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('21 05', 'CC YY')
+----
+2005-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('21', 'CC')
+----
+2001-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('20 00', 'CC YY')
+----
+2000-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('21 05 BC', 'CC YY BC')
+----
+2005-01-01 00:00:00+00 BC
+
+query T nosort
+SELECT to_timestamp('21 BC', 'CC BC')
+----
+2100-01-01 00:00:00+00 BC
+
+query T nosort
+SELECT to_timestamp('2460375', 'J')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2460375 13', 'J HH24')
+----
+2024-03-05 13:00:00+00
+
+query T nosort
+SELECT to_timestamp('0', 'J')
+----
+0001-01-01 00:00:00+00 BC
+
+query T nosort
+SELECT to_timestamp('-5', 'J')
+----
+4714-11-19 00:00:00+00 BC
+
+query T nosort
+SELECT to_timestamp('1 2024', 'Q YYYY')
+----
+2024-01-01 00:00:00+00
+
+statement error 22007
+SELECT to_timestamp('2024 13', 'YYYY HH12')
+
+statement error 22007
+SELECT to_timestamp('2024 0', 'YYYY HH12')
+
+query T nosort
+SELECT to_timestamp('2024 12 AM', 'YYYY HH12 AM')
+----
+2024-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024 12 PM', 'YYYY HH12 PM')
+----
+2024-01-01 12:00:00+00
+
+statement error 22007
+SELECT to_timestamp('2024 PM AM', 'YYYY PM AM')
+
+statement error 22007
+SELECT to_timestamp('2024 xx', 'YYYY AM')
+
+statement error 22009
+SELECT to_timestamp('2024 +16', 'YYYY TZH')
+
+query T nosort
+SELECT to_timestamp('2024 +15:59', 'YYYY TZH:TZM')
+----
+2023-12-31 08:01:00+00
+
+statement error 22009
+SELECT to_timestamp('2024 +05:60', 'YYYY TZH:TZM')
+
+query T nosort
+SELECT to_timestamp('2024 +5:30', 'YYYY OF')
+----
+2023-12-31 18:30:00+00
+
+query T nosort
+SELECT to_timestamp('2024 30', 'YYYY TZM')
+----
+2023-12-31 23:30:00+00
+
+statement error 0A000
+SELECT to_timestamp('2024 EST', 'YYYY TZ')
+
+statement error 0A000
+SELECT to_timestamp('2024 UTC', 'YYYY TZ')
+
+query T nosort
+SELECT to_timestamp('2024-03-05 01:02:03', 'FXYYYY-MM-DD HH24:MI:SS')
+----
+2024-03-05 01:02:03+00
+
+query T nosort
+SELECT to_timestamp('2024-03-05  01:02:03', 'FXYYYY-MM-DD HH24:MI:SS')
+----
+2024-03-05 01:02:03+00
+
+query T nosort
+SELECT to_timestamp('2024x03x05', 'FXYYYY-MM-DD')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('20240305', 'FXYYYYMMDD')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp(' 2024', 'FXYYYY')
+----
+2024-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024-3-5', 'YYYY-MM-DD')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024-03-05 1:2:3', 'YYYY-MM-DD HH24:MI:SS')
+----
+2024-03-05 01:02:03+00
+
+query T nosort
+SELECT to_timestamp('24-03-05', 'YY-MM-DD')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('69-03-05', 'YY-MM-DD')
+----
+2069-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('70-03-05', 'YY-MM-DD')
+----
+1970-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('519-03-05', 'YYY-MM-DD')
+----
+2519-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('520-03-05', 'YYY-MM-DD')
+----
+1520-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024-03-05', 'YYYY-MM-DD"T"')
+----
+2024-03-05 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024T03', 'YYYY"T"MM')
+----
+2024-03-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024 060', 'YYYY DDD')
+----
+2024-02-29 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2023 060', 'YYYY DDD')
+----
+2023-03-01 00:00:00+00
+
+statement error 22007
+SELECT to_timestamp('060', 'DDD')
+
+statement error 22008
+SELECT to_timestamp('2024 400', 'YYYY DDD')
+
+query T nosort
+SELECT to_timestamp('2024 12', 'YYYY SS')
+----
+2024-01-01 00:00:12+00
+
+statement error 22008
+SELECT to_timestamp('2024 99', 'YYYY MI')
+
+query T nosort
+SELECT to_timestamp('2024 5 5', 'YYYY W D')
+----
+2024-01-29 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024 5', 'YYYY WW')
+----
+2024-01-29 00:00:00+00
+
+statement error 22008
+SELECT to_timestamp('300000', 'YYYY')
+
+statement error 22008
+SELECT to_timestamp('294276-12-31', 'YYYY-MM-DD')
+
+query T nosort
+SELECT to_date('5874897-12-31', 'YYYY-MM-DD')
+----
+5874897-12-31
+
+query T nosort
+SELECT to_date('4713-11-24 BC', 'YYYY-MM-DD BC')
+----
+4713-11-24 BC
+
+statement error 22008
+SELECT to_date('2147483647', 'YYYY')
+
+query T nosort
+SELECT to_timestamp('1,234 5', 'Y,YYY MM')
+----
+1234-05-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('12,34', 'Y,YYY')
+----
+12034-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('2024 1st', 'YYYY DDth')
+----
+2024-01-01 00:00:00+00
+
+statement error 22007
+SELECT to_timestamp('2024 ab', 'YYYY MM')
+
+query T nosort
+SELECT to_timestamp('2024 001', 'YYYY MS')
+----
+2024-01-01 00:00:00.001+00
+
+query T nosort
+SELECT to_timestamp('2024 1', 'YYYY MS')
+----
+2024-01-01 00:00:00.1+00
+
+query T nosort
+SELECT to_timestamp('2024 12', 'YYYY MS')
+----
+2024-01-01 00:00:00.12+00
+
+statement error 22008
+SELECT to_timestamp('2024 1234567', 'YYYY US')
+
+query T nosort
+SELECT to_timestamp('2024 1', 'YYYY FF6')
+----
+2024-01-01 00:00:00.1+00
+
+query T nosort
+SELECT to_timestamp('2024 123456', 'YYYY FF3')
+----
+2024-01-01 00:00:00.123+00
+
+query T nosort
+SELECT to_timestamp('2024 999999', 'YYYY FF3')
+----
+2024-01-01 00:00:01+00
+
+query T nosort
+SELECT to_timestamp('2024 3 01', 'YYYY MM DD MM')
+----
+2024-03-01 00:00:00+00
+
+statement error 22007
+SELECT to_timestamp('2024 03 01 04', 'YYYY MM DD MM')
+
+query T nosort
+SELECT to_timestamp('2024 03 01 03', 'YYYY MM DD MM')
+----
+2024-03-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp(0::f64)
+----
+1970-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp(1700000000.5::f64)
+----
+2023-11-14 22:13:20.5+00
+
+query T nosort
+SELECT to_timestamp(-1.5::f64)
+----
+1969-12-31 23:59:58.5+00
+
+query T nosort
+SELECT to_timestamp(0.0000005::f64)
+----
+1970-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp(946684800.0000005::f64)
+----
+2000-01-01 00:00:00+00
+
+query T nosort
+SELECT to_timestamp('Infinity'::f64)
+----
+infinity
+
+query T nosort
+SELECT to_timestamp('-Infinity'::f64)
+----
+-infinity
+
+statement error 22008
+SELECT to_timestamp('NaN'::f64)
+
+statement error 22008
+SELECT to_timestamp(1e15::f64)
+
+query T nosort
+SELECT to_timestamp(1234567890::f32)
+----
+2009-02-13 23:32:16+00
+
+query T nosort
+SELECT to_timestamp(NULL::f64)
+----
+NULL
+
+# === the session zone ========================================================================
+
+# an offset-less reading is a wall clock in the session zone (DST included); an offset fixes it
+# timezone: America/New_York
+query T nosort
+SELECT to_timestamp('2024-01-15 12:00', 'YYYY-MM-DD HH24:MI')
+----
+2024-01-15 12:00:00-05
+
+# timezone: America/New_York
+query T nosort
+SELECT to_timestamp('2024-07-15 12:00', 'YYYY-MM-DD HH24:MI')
+----
+2024-07-15 12:00:00-04
+
+# timezone: America/New_York
+query T nosort
+SELECT to_timestamp('2024-07-15 12:00 +02', 'YYYY-MM-DD HH24:MI TZH')
+----
+2024-07-15 06:00:00-04
+
+# the spring-forward gap and the fall-back overlap resolve as PostgreSQL does
+# timezone: America/New_York
+query T nosort
+SELECT to_timestamp('2024-03-10 02:30', 'YYYY-MM-DD HH24:MI')
+----
+2024-03-10 03:30:00-04
+
+# timezone: America/New_York
+query T nosort
+SELECT to_timestamp('2024-11-03 01:30', 'YYYY-MM-DD HH24:MI')
+----
+2024-11-03 01:30:00-05
+
+# to_date reads no zone
+# timezone: America/New_York
+query T nosort
+SELECT to_date('2024-07-15 23:30', 'YYYY-MM-DD HH24:MI')
+----
+2024-07-15
+
+# to_timestamp(seconds) is an instant, rendered in the session zone
+# timezone: America/New_York
+query T nosort
+SELECT to_timestamp(1700000000::f64)
+----
+2023-11-14 17:13:20-05
+
+# === a column template and input ===============================================================
+
+statement ok
+CREATE TABLE tt (id i32 PRIMARY KEY, s text, f text)
+
+statement ok
+INSERT INTO tt VALUES (1, '2024-03-05', 'YYYY-MM-DD'), (2, '05/03/2024', 'DD/MM/YYYY'), (3, 'March 5, 2024', 'Month DD, YYYY'), (4, NULL, 'YYYY'), (5, '2024', NULL)
+
+query ITT nosort
+SELECT id, to_timestamp(s, f), to_date(s, f) FROM tt ORDER BY id
+----
+1
+2024-03-05 00:00:00+00
+2024-03-05
+2
+2024-03-05 00:00:00+00
+2024-03-05
+3
+2024-03-05 00:00:00+00
+2024-03-05
+4
+NULL
+NULL
+5
+NULL
+NULL

@@ -2226,6 +2226,7 @@ count (up to about 16k groups under `MAX_REGEX_PROGRAM`, [regex.md](regex.md) §
 | `jsonb_pretty` | amplifier | S2 | `payload(jsonb)` | UTF-8 bytes of the result |
 | `encode`, `quote_literal`, `quote_ident`, `quote_nullable`, `like_escape`; casts from an array, `bytea`, or `jsonb` to `text`, and from `jsonb` to `json` | growth | S3 | — | UTF-8 bytes of the result |
 | element-wise `bytea[]` → `text[]` cast | growth | S3 | — | `payload(array)` |
+| `to_char` (every overload) | growth | — | — | UTF-8 bytes of the result |
 
 The amplifiers' exact sizes:
 
@@ -2337,6 +2338,8 @@ Rules for both classes:
   and renders that jed does not implement yet (casts to `text` from composites and
   ranges). The missing renders join the table when they land: each escapes its
   input, so each can grow it.
+- `to_timestamp`, `to_date`, `to_number`: they build a fixed-size value (a decimal bounded by the
+  template's digit count) from one scan of their input ([formatting.md](formatting.md) §9).
 - Parsing text into an array, `json`, `jsonb`, composite, or range: the result is
   bounded by the input text, and getting back to text for another round needs a
   covered renderer. `string_to_array`, `regexp_split_to_array`, and `regexp_split_to_table` are the same

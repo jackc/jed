@@ -109,6 +109,13 @@ eval *logic* they dispatch to stays hand-written (§2).
   `pg_keywords_gen.{rs,go,ts}` (`QUOTED_KEYWORDS`). The generator checks strict byte order and the
   category names. `quote_ident` and `format`'s `%I` consult the table by hand
   ([string-functions.md](string-functions.md) §3); jed's parser does not.
+- **Formatting templates — done** ([../../scripts/gen_formatting.rb](../../scripts/gen_formatting.rb)).
+  PostgreSQL's `DCH_keywords` / `DCH_suff` / `NUM_keywords` and the fixed word lists `to_char` and
+  `to_timestamp` read, copied into [../types/formatting.toml](../types/formatting.toml), are generated
+  per core as `formatting_gen.{rs,go,ts}` (the keyword arrays, their first-byte index, the action ids,
+  the suffix bits). The generator checks that keywords sharing a first byte are contiguous, which the
+  sequential search relies on. The template parser and the processors stay hand-written
+  ([formatting.md](formatting.md) §2).
 - **Scalar types — remaining.** Extend the generator to the scalar set, replacing its hand-mirror
   (§1 option 2). Harder than errors: `scalars.toml` is ragged (integer-only / decimal-only /
   text-only fields) and `ScalarType`'s variant identity is threaded through the codec/comparator,

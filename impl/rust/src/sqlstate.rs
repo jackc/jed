@@ -32,6 +32,8 @@ pub enum SqlState {
     InvalidDatetimeFormat,
     /// 22008 — date/time field value out of range: {detail}
     DatetimeFieldOverflow,
+    /// 22009 — time zone displacement out of range: {detail}
+    InvalidTimeZoneDisplacementValue,
     /// 22012 — division by zero
     DivisionByZero,
     /// 22014 — argument of ntile must be greater than zero
@@ -240,6 +242,7 @@ impl SqlState {
             SqlState::NullValueNotAllowed => "22004",
             SqlState::InvalidDatetimeFormat => "22007",
             SqlState::DatetimeFieldOverflow => "22008",
+            SqlState::InvalidTimeZoneDisplacementValue => "22009",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidArgumentForNtile => "22014",
             SqlState::InvalidArgumentForNthValue => "22016",
@@ -354,6 +357,7 @@ impl SqlState {
             "22004" => Some(SqlState::NullValueNotAllowed),
             "22007" => Some(SqlState::InvalidDatetimeFormat),
             "22008" => Some(SqlState::DatetimeFieldOverflow),
+            "22009" => Some(SqlState::InvalidTimeZoneDisplacementValue),
             "22012" => Some(SqlState::DivisionByZero),
             "22014" => Some(SqlState::InvalidArgumentForNtile),
             "22016" => Some(SqlState::InvalidArgumentForNthValue),
@@ -477,6 +481,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "22004", name: "null_value_not_allowed", class: "data exception" },
     ErrorDesc { code: "22007", name: "invalid_datetime_format", class: "data exception" },
     ErrorDesc { code: "22008", name: "datetime_field_overflow", class: "data exception" },
+    ErrorDesc { code: "22009", name: "invalid_time_zone_displacement_value", class: "data exception" },
     ErrorDesc { code: "22012", name: "division_by_zero", class: "data exception" },
     ErrorDesc { code: "22014", name: "invalid_argument_for_ntile", class: "data exception" },
     ErrorDesc { code: "22016", name: "invalid_argument_for_nth_value", class: "data exception" },
