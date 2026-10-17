@@ -940,6 +940,7 @@ var SupportedCapabilities = []string{
 	// AS t(col type, …) declaring its typed output columns (json-table.md §1). Valid only on a
 	// record-returning function (else 42601); the rename-only AS g(col) form stays 0A000.
 	"func.coldeflist",
+	"func.unnest_record",
 	// json/jsonb record-returning functions (R1) — json[b]_to_record → one record row,
 	// json[b]_to_recordset → setof record, over the C0 col-def list (json-table.md §2).
 	"func.json_record",

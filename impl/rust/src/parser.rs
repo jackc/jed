@@ -3768,10 +3768,19 @@ impl Parser {
             None
         };
         let mut alias_pos = None;
+        // `AS (c type, …)` — a table function's column-definition list without a relation alias
+        // (PostgreSQL's `func_alias_clause`); the relation keeps the function's name.
+        let mut bare_defs = None;
         let alias = if self.peek_keyword().as_deref() == Some("as") {
             self.advance();
-            alias_pos = Some(self.pos);
-            Some(self.expect_identifier()?)
+            if args.is_some() && matches!(self.peek(), Token::LParen) {
+                self.advance(); // (
+                bare_defs = Some(self.parse_field_def_list()?);
+                None
+            } else {
+                alias_pos = Some(self.pos);
+                Some(self.expect_identifier()?)
+            }
         } else {
             match self.peek() {
                 Token::QuotedIdent(w) => {
@@ -3824,7 +3833,7 @@ impl Parser {
                     (Some(aliases), None)
                 }
             } else {
-                (None, None)
+                (None, bare_defs)
             };
         Ok(TableRef {
             name,

@@ -639,7 +639,10 @@ a bare row comparison:
 <LiveSql demo="arrayCompositeExample" seed={arrayCompositeSeed} query={arrayCompositeExample} rows={2} />
 
 `unnest` expands a composite array into one **composite row** per element — read the whole row
-(`u`) or reach into a field (`(u).zip`):
+(`u`) or reach into a field (`(u).zip`). An array of *anonymous* rows (`ARRAY[ROW(1, 'a'::text)]`, or
+`array_agg(ROW(id, name))`) has no field names to expose, so, as in PostgreSQL, `unnest` over it needs
+a column-definition list that names and types its columns:
+`SELECT * FROM unnest(ARRAY[ROW(1, 'a'::text), ROW(2, 'b'::text)]) AS u(id i32, name text)`.
 
 <LiveSql demo="unnestCompositeExample" seed={arrayCompositeSeed} query={unnestCompositeExample} rows={2} />
 

@@ -172,6 +172,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The FROM-clause column-definition list `AS t(col type, …)` (C0, json-table.md §1) — the typed
   // output columns a record-returning function declares; the shared parseFieldDefList body.
   "func.coldeflist",
+  "func.unnest_record",
   // json[b]_to_record / json[b]_to_recordset (R1, json-table.md §2) — the record-returning functions
   // that map a JSON object's members to the C0 col-def-list columns by name + coerce.
   "func.json_record",

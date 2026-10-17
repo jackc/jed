@@ -1732,3 +1732,37 @@ file = "params/containers.test"
 sql = "SELECT id FROM c WHERE p = $1"
 params = "'(3,4)'"
 reason = "jed types a parameter compared with a named composite as that composite (api.md §5), so a text value is read by its record input. PostgreSQL types the parameter as the anonymous record (record_eq's argument type) and cannot read text into it (0A000, input of anonymous composite types is not implemented)."
+
+# --- unnest(record[]) AS u(c type, …) (spec/design/composite.md §13): jed's anonymous record has a
+# static field list, so the column-definition list is checked against it at plan time and matched
+# with integer widths interchangeable; PostgreSQL's `record` is dynamic, checked at the first
+# non-NULL element by exact (binary-coercible) type.
+[[override]]
+file = "types/record_unnest_coldef.test"
+sql = "SELECT * FROM unnest((SELECT array_agg(ROW(id, name)) FROM t WHERE id > 5)) AS u(id i32)"
+reason = "jed: the anonymous record's field list is static (CLAUDE.md §4), so a column-definition list that does not match it is a plan-time 42804 even when the array is NULL or empty. PostgreSQL checks the returned row descriptor only once the function produces a non-NULL row, so an empty/NULL array returns zero rows. A stricter divergence (composite.md §13)."
+
+[[override]]
+file = "types/record_unnest_coldef.test"
+sql = "SELECT * FROM unnest(ARRAY[ROW(1, 'a'::text)]) AS u(a i64, b text)"
+reason = "jed: integer widths are interchangeable between a record field and its declared column, because jed's unconstrained integer literal is i64 where PostgreSQL's is int4 — without this, the PostgreSQL-idiomatic `ROW(1, …)` would not fill an `i32` column. PostgreSQL requires a binary-coercible type and raises 42804 (int4 vs int8). A lenient divergence (composite.md §13)."
+
+[[override]]
+file = "types/record_unnest_coldef.test"
+sql = "SELECT * FROM unnest(ARRAY[ROW(1::i16, 'a'::text)]) AS u(a i32, b text)"
+reason = "jed: integer widths are interchangeable between a record field and its declared column (composite.md §13); PostgreSQL raises 42804 (smallint vs integer). A lenient divergence."
+
+[[override]]
+file = "types/record_unnest_coldef.test"
+sql = "SELECT * FROM unnest(ARRAY[ROW(3000000000, 'a'::text)]) AS u(a i32, b text)"
+reason = "jed: an integer field may fill a narrower declared integer column, range-checked per value — 3000000000 does not fit i32, so 22003 (composite.md §13). PostgreSQL rejects the bigint field type itself (42804). Both reject; the codes differ because jed's check is the value's, not the type's."
+
+[[override]]
+file = "types/record_unnest_coldef.test"
+sql = "SELECT * FROM unnest(ARRAY[ROW(ARRAY[1, 70000], 'a'::text)]) AS u(a i16[], b text)"
+reason = "jed: an integer-array field may fill a narrower declared integer-array column, each element range-checked — 70000 does not fit i16, so 22003 (composite.md §13). PostgreSQL rejects the int4[] field type itself (42804)."
+
+[[override]]
+file = "types/record_unnest_coldef.test"
+sql = "SELECT * FROM unnest(ARRAY[ROW(1, 'a')]) AS u(a i32, b text)"
+reason = "jed: a bare string literal inside ROW(…) is typed text (composite.md §13), so it fills a text column. PostgreSQL leaves it the pseudo-type unknown, which matches no declared column type (42804, \"Returned type unknown at ordinal position 2\"). A lenient divergence."

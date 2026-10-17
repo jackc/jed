@@ -17177,6 +17177,9 @@ export class Engine {
       const set = lname.endsWith("set");
       return this.resolveJsonPopulate(lname, jsonb, set, args, alias, argScope, ptypes);
     }
+    // unnest takes a column-definition list exactly when its array's element is an anonymous record
+    // (composite.md §13), so it resolves its argument before applying the guard below.
+    if (lname === "unnest") return this.resolveUnnest(args, alias, columnDefs, argScope, ptypes);
     // A column-definition list is valid ONLY on a record-returning function (PG).
     if (columnDefs !== null) {
       throw engineError(
@@ -17186,7 +17189,6 @@ export class Engine {
     }
     if (lname === "generate_series")
       return this.resolveGenerateSeries(args, alias, argScope, ptypes);
-    if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
     if (lname === "regexp_matches" || lname === "regexp_split_to_table")
       return this.resolveRegexSrf(lname, args, alias, argScope, ptypes);
     // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): json[b]_each → (key text, value
@@ -17401,6 +17403,7 @@ export class Engine {
         "a column definition list is required for function " + name,
       );
     }
+    checkColdefNames(columnDefs);
     const columns: Column[] = [];
     for (const d of columnDefs) {
       // A composite/array column type in the col-def list is a deferred 0A000 follow-on.
@@ -17732,22 +17735,45 @@ export class Engine {
   // unnest(composite[])): the synthetic column is typed at the bound element type directly
   // (typeFromResolved), so a composite array produces composite rows. An anonymous-record element
   // (unnest(ARRAY[ROW(…)])) makes unnest a function returning record, which in FROM needs a
-  // column-definition list — 42601, as in PostgreSQL (composite.md §1; the list itself is not
-  // supported for unnest yet).
+  // column-definition list (AS u(a i32, b text)) — without one 42601, as in PostgreSQL (composite.md
+  // §13); with one the relation has the declared columns (resolveUnnestRecord). A list on any other
+  // unnest is 42601.
   private resolveUnnest(
     args: Expr[],
     alias: string | null,
+    columnDefs: TypeFieldDef[] | null,
     argScope: Scope,
     ptypes: ParamTypes,
   ): { table: Table; srf: SrfPlan } {
+    if (columnDefs !== null && args.length > 1) {
+      throw engineError(
+        "syntax_error",
+        "UNNEST() with multiple arguments cannot have a column definition list",
+      );
+    }
     if (args.length !== 1) throw noFuncOverload("unnest");
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const { node, type } = resolve(argScope, args[0]!, null, forbidden, ptypes);
     if (type.kind === "array") {
       if (type.elem.kind === "composite" && type.elem.name === null) {
+        if (columnDefs === null) {
+          throw engineError(
+            "syntax_error",
+            'a column definition list is required for functions returning "record"',
+          );
+        }
+        const table = this.resolveUnnestRecord(type.elem.fields, columnDefs, alias);
+        return {
+          table,
+          srf: { kind: "unnest_record", args: [node], recordCols: table.columns },
+        };
+      }
+      if (columnDefs !== null) {
         throw engineError(
           "syntax_error",
-          'a column definition list is required for functions returning "record"',
+          type.elem.kind === "composite"
+            ? "a column definition list is redundant for a function returning a named composite type"
+            : 'a column definition list is only allowed for functions returning "record"',
         );
       }
       const elemTy = typeFromResolved(type.elem);
@@ -17761,6 +17787,82 @@ export class Engine {
     }
     if (type.kind === "null") throw indeterminatePoly();
     throw noFuncOverload("unnest");
+  }
+
+  // resolveUnnestRecord builds the relation of unnest(record[]) AS u(c type, …) (composite.md §13):
+  // one column per declared entry, typed as declared. The anonymous record's field list is static, so
+  // the declared shape is checked against it here, at plan time: a different field count, or a field
+  // whose type differs from its column's, is 42804 (PostgreSQL's "function return row and
+  // query-specified return row do not match", which it raises at the first non-NULL element). Integer
+  // widths are interchangeable — jed's unconstrained integer literal is i64 where PostgreSQL's is int4
+  // — and a value outside a narrower declared integer type is 22003 at execution. A duplicate column
+  // name is 42701; a type modifier is accepted and not enforced (PostgreSQL's binary-coercible match
+  // neither checks nor applies it).
+  private resolveUnnestRecord(
+    fields: { name: string; type: ResolvedType }[],
+    defs: TypeFieldDef[],
+    alias: string | null,
+  ): Table {
+    checkColdefNames(defs);
+    const columns: Column[] = defs.map((d) => ({
+      name: d.name,
+      type: this.resolveColdefType(d),
+      decimal: null,
+      varcharLen: null,
+      primaryKey: false,
+      notNull: false,
+      default: null,
+      defaultExpr: null,
+      identity: null,
+      collation: null,
+    }));
+    const mismatch = "function return row and query-specified return row do not match";
+    if (fields.length !== columns.length) {
+      throw engineError(
+        "datatype_mismatch",
+        `${mismatch}: returned row contains ${fields.length} attribute${fields.length === 1 ? "" : "s"}, but query expects ${columns.length}`,
+      );
+    }
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i]!;
+      const col = columns[i]!;
+      if (!recordFieldFits(typeFromResolved(f.type), col.type)) {
+        throw engineError(
+          "datatype_mismatch",
+          `${mismatch}: returned type ${rtName(f.type)} at ordinal position ${i + 1}, but query expects ${rtName(resolvedTypeOfCol(col.type, this))}`,
+        );
+      }
+    }
+    return {
+      name: alias ?? "unnest",
+      columns,
+      pk: [],
+      checks: [],
+      indexes: [],
+      fks: [],
+      exclusions: [],
+    };
+  }
+
+  // resolveColdefType is the type of one column-definition-list entry of unnest(record[]): a scalar
+  // (its type modifier dropped), a range, a named composite, or an array of a scalar or composite. An
+  // unknown name is 42704.
+  private resolveColdefType(d: TypeFieldDef): Type {
+    const named = (n: string): Type => {
+      if (scalarTypeFromName(n) !== undefined) {
+        const [s] = resolveTypeAndTypmod(n, null);
+        return scalarT(s);
+      }
+      const rdesc = rangeByName(n);
+      if (rdesc !== undefined) return { kind: "range", elem: scalarT(elementScalar(rdesc)) };
+      const ctype = this.compositeType(n);
+      if (ctype !== undefined) return { kind: "composite", name: ctype.name };
+      throw engineError("undefined_object", "type does not exist: " + n);
+    };
+    if (d.typeName.endsWith("[]")) return { kind: "array", elem: named(d.typeName.slice(0, -2)) };
+    // Validate a scalar's modifier as a column's would be, then drop it.
+    if (scalarTypeFromName(d.typeName) !== undefined) resolveTypeAndTypmod(d.typeName, d.typeMod);
+    return named(d.typeName);
   }
 
   // resolveRegexSrf resolves regexp_matches / regexp_split_to_table (regex.md §8c). The call resolves
@@ -18209,6 +18311,32 @@ export class Engine {
       meter.guard();
       meter.charge(COSTS.generatedRow);
       const row = [e];
+      meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
+      out.push(row);
+    }
+    return out;
+  }
+
+  // unnestRecordRows generates the rows of unnest(record[]) AS u(c type, …) (composite.md §13): one
+  // row per array element, its fields spread over the declared columns; a NULL element is a row of
+  // NULLs (as in PostgreSQL); a NULL array yields no rows. A field value outside a narrower declared
+  // integer type is 22003. Each row charges one generatedRow, like unnest.
+  private unnestRecordRows(srf: SrfPlan, env: EvalEnv, meter: Meter, mask: boolean[]): Row[] {
+    const v = evalExpr(srf.args[0]!, [], env, meter);
+    if (v.kind === "null") return [];
+    if (v.kind !== "array") throw new Error("the resolver restricts unnest's argument to an array");
+    const cols = srf.recordCols!;
+    const out: Row[] = [];
+    for (const e of v.elements) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      let row: Row;
+      if (e.kind === "composite") {
+        for (let i = 0; i < e.fields.length; i++) checkRecordFieldValue(e.fields[i]!, cols[i]!.type);
+        row = [...e.fields];
+      } else {
+        row = cols.map((): Value => ({ kind: "null" }));
+      }
       meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
       out.push(row);
     }
@@ -19870,6 +19998,8 @@ export class Engine {
     switch (srf.kind) {
       case "unnest":
         return this.unnestRows(srf, env, meter, mask);
+      case "unnest_record":
+        return this.unnestRecordRows(srf, env, meter, mask);
       case "generate_series":
         return this.generateSeriesRows(srf, env, meter, mask);
       case "jsonb_array_elements":
@@ -31048,6 +31178,9 @@ export type PlanRel = {
 export type SrfKind =
   | "generate_series"
   | "unnest"
+  // unnest(record[]) AS u(c type, …) — one row per anonymous-record element, its fields spread over
+  // the column-definition list's columns (recordCols; composite.md §13).
+  | "unnest_record"
   | "jsonb_array_elements"
   | "jsonb_array_elements_text"
   | "jsonb_object_keys"
@@ -38723,4 +38856,55 @@ function pushJsonObjectAggPair(out: string[], i: number, key: string, v: Value):
 // (composite.md §12).
 function isBareNullDefault(def: DefaultDef): boolean {
   return def.expr.kind === "literal" && def.expr.literal.kind === "null";
+}
+
+// checkColdefNames rejects a duplicate name in a FROM-clause column-definition list — 42701,
+// PostgreSQL's "column name … specified more than once" (json-table.md §1, composite.md §13).
+function checkColdefNames(defs: TypeFieldDef[]): void {
+  for (let i = 0; i < defs.length; i++) {
+    for (let j = 0; j < i; j++) {
+      if (defs[j]!.name === defs[i]!.name) {
+        throw engineError(
+          "duplicate_column",
+          `column name "${defs[i]!.name}" specified more than once`,
+        );
+      }
+    }
+  }
+}
+
+// recordFieldFits reports whether an anonymous record's field of type `field` may fill a declared
+// column of type `decl` (composite.md §13): the same type, or integers of any widths — also as array
+// elements.
+function recordFieldFits(field: Type, decl: Type): boolean {
+  if (field.kind === "array" || decl.kind === "array") {
+    return field.kind === "array" && decl.kind === "array" && recordFieldFits(field.elem, decl.elem);
+  }
+  if (field.kind === "range" || decl.kind === "range") {
+    return (
+      field.kind === "range" &&
+      decl.kind === "range" &&
+      field.elem.kind === "scalar" &&
+      decl.elem.kind === "scalar" &&
+      field.elem.scalar === decl.elem.scalar
+    );
+  }
+  if (field.kind === "composite" || decl.kind === "composite") {
+    return field.kind === "composite" && decl.kind === "composite" && field.name === decl.name;
+  }
+  if (field.kind !== "scalar" || decl.kind !== "scalar") return false;
+  return (
+    field.scalar === decl.scalar || (isInteger(field.scalar) && isInteger(decl.scalar))
+  );
+}
+
+// checkRecordFieldValue range-checks one record field value against its declared column type: an
+// integer (also an integer array's elements) outside a narrower declared width is 22003
+// (composite.md §13).
+function checkRecordFieldValue(v: Value, decl: Type): void {
+  if (v.kind === "int" && decl.kind === "scalar" && isInteger(decl.scalar)) {
+    if (!inRange(decl.scalar, v.int)) throw overflow(decl.scalar);
+  } else if (v.kind === "array" && decl.kind === "array") {
+    for (const e of v.elements) checkRecordFieldValue(e, decl.elem);
+  }
 }

@@ -2687,8 +2687,9 @@ fixed-shape table function, including multi-column SRFs. Fewer aliases than outp
 partial rename and leaves the remaining catalog names intact; more aliases than available columns
 is `42P10` (*invalid column reference*). The list changes names only — never column order, types,
 cardinality, evaluation, or cost. A typed column-definition list (`AS r(c type, …)`) remains the
-separate record-returning-function form ([json-table.md](json-table.md) §1); the parser distinguishes
-it structurally by the type word after the first column name. Oracle-verified against PostgreSQL.
+separate record-returning-function form ([json-table.md](json-table.md) §1, [composite.md](composite.md)
+§13 for `unnest(record[])`); the parser distinguishes it structurally by the type word after the first
+column name, and `AS (c type, …)` with no alias name is always that form. Oracle-verified against PostgreSQL.
 
 **Composition.** An SRF relation is a first-class FROM item: it joins/cross-joins other
 relations (`t CROSS JOIN generate_series(1, 3)` is the product), and `WHERE` / `ORDER BY` /

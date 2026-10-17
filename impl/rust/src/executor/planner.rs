@@ -1877,11 +1877,12 @@ impl Engine {
                     m.map(|(si, args, kind, json_table, introspect_scope)| {
                         // A record-returning SRF carries its declared columns (the C0 col-def list, held
                         // on the synthetic table) so the row generator can map members → columns.
-                        let record_cols = if matches!(kind, SrfKind::JsonRecord { .. }) {
-                            synthetic[si].columns.clone()
-                        } else {
-                            Vec::new()
-                        };
+                        let record_cols =
+                            if matches!(kind, SrfKind::JsonRecord { .. } | SrfKind::UnnestRecord) {
+                                synthetic[si].columns.clone()
+                            } else {
+                                Vec::new()
+                            };
                         SrfPlan {
                             kind,
                             args,

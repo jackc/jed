@@ -78,6 +78,11 @@ impl Engine {
                 ptypes,
             );
         }
+        // `unnest` takes a column-definition list exactly when its array's element is an anonymous
+        // record (composite.md §13), so it resolves its argument before applying the guard below.
+        if name == "unnest" {
+            return self.resolve_unnest(args, alias, column_defs, &arg_scope, ptypes);
+        }
         // A column-definition list is valid ONLY on a record-returning function (PG).
         if column_defs.is_some() {
             return Err(EngineError::new(
@@ -89,9 +94,6 @@ impl Engine {
         }
         if name == "generate_series" {
             return self.resolve_generate_series(args, alias, &arg_scope, ptypes);
-        }
-        if name == "unnest" {
-            return self.resolve_unnest(args, alias, &arg_scope, ptypes);
         }
         if name == "regexp_matches" || name == "regexp_split_to_table" {
             return self.resolve_regex_srf(name, args, alias, &arg_scope, ptypes);
@@ -387,6 +389,7 @@ impl Engine {
                 format!("a column definition list is required for function {name}"),
             )
         })?;
+        check_coldef_names(defs)?;
         let mut columns = Vec::with_capacity(defs.len());
         for d in defs {
             // A composite/array column type in the col-def list is a deferred 0A000 follow-on.
@@ -821,15 +824,23 @@ impl Engine {
     /// or a composite** (AF7 — `unnest(composite[])`): the synthetic column is typed at the bound
     /// element type directly (`type_from_resolved`), so a composite array produces composite rows.
     /// An anonymous-record element (`unnest(ARRAY[ROW(…)])`) makes `unnest` a function returning
-    /// `record`, which in `FROM` needs a column-definition list — `42601`, as in PostgreSQL
-    /// (composite.md §1; the list itself is not supported for `unnest` yet).
+    /// `record`, which in `FROM` needs a column-definition list (`AS u(a i32, b text)`) — without one
+    /// `42601`, as in PostgreSQL (composite.md §13); with one the relation has the declared columns
+    /// (`resolve_unnest_record`). A list on any other `unnest` is `42601`.
     pub(crate) fn resolve_unnest(
         &self,
         args: &[Expr],
         alias: Option<&str>,
+        column_defs: Option<&[TypeFieldDef]>,
         arg_scope: &Scope,
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
+        if column_defs.is_some() && args.len() > 1 {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "UNNEST() with multiple arguments cannot have a column definition list",
+            ));
+        }
         if args.len() != 1 {
             return Err(no_func_overload("unnest"));
         }
@@ -837,9 +848,26 @@ impl Engine {
         let elem_ty = match &t {
             ResolvedType::Array(elem) if matches!(&**elem, ResolvedType::Composite(c) if c.name.is_none()) =>
             {
+                let ResolvedType::Composite(rec) = &**elem else {
+                    unreachable!("matched an anonymous composite element above")
+                };
+                let Some(defs) = column_defs else {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "a column definition list is required for functions returning \"record\"",
+                    ));
+                };
+                let table = self.resolve_unnest_record(rec, defs, alias)?;
+                return Ok((table, vec![rarg], SrfKind::UnnestRecord));
+            }
+            ResolvedType::Array(elem) if column_defs.is_some() => {
                 return Err(EngineError::new(
                     SqlState::SyntaxError,
-                    "a column definition list is required for functions returning \"record\"",
+                    if matches!(&**elem, ResolvedType::Composite(_)) {
+                        "a column definition list is redundant for a function returning a named composite type"
+                    } else {
+                        "a column definition list is only allowed for functions returning \"record\""
+                    },
                 ));
             }
             ResolvedType::Array(elem) => type_from_resolved(elem)?,
@@ -854,6 +882,152 @@ impl Engine {
             set_synthetic_collation(&mut table.columns[0], &d);
         }
         Ok((table, vec![rarg], SrfKind::Unnest))
+    }
+
+    /// The relation of `unnest(record[]) AS u(c type, …)` (composite.md §13): one column per declared
+    /// entry, typed as declared. The anonymous record's field list is static, so the declared shape is
+    /// checked against it here, at plan time: a different field count, or a field whose type differs
+    /// from its column's, is `42804` (PostgreSQL's "function return row and query-specified return row
+    /// do not match", which it raises at the first non-NULL element). Integer widths are
+    /// interchangeable — jed's unconstrained integer literal is `i64` where PostgreSQL's is `int4` — and
+    /// a value outside a narrower declared integer type is `22003` at execution. A duplicate column
+    /// name is `42701`; a type modifier is accepted and not enforced (PostgreSQL's binary-coercible
+    /// match neither checks nor applies it).
+    pub(crate) fn resolve_unnest_record(
+        &self,
+        rec: &CompositeRType,
+        defs: &[TypeFieldDef],
+        alias: Option<&str>,
+    ) -> Result<Box<Table>> {
+        check_coldef_names(defs)?;
+        let mut columns = Vec::with_capacity(defs.len());
+        for d in defs {
+            columns.push(Column {
+                name: d.name.clone(),
+                ty: self.resolve_coldef_type(d)?,
+                decimal: None,
+                varchar_len: None,
+                primary_key: false,
+                not_null: false,
+                default: None,
+                default_expr: None,
+                identity: None,
+                collation: None,
+                no_collation: false,
+                collation_conflict: false,
+            });
+        }
+        let mismatch = "function return row and query-specified return row do not match";
+        if rec.fields.len() != columns.len() {
+            return Err(EngineError::new(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "{mismatch}: returned row contains {} attribute{}, but query expects {}",
+                    rec.fields.len(),
+                    if rec.fields.len() == 1 { "" } else { "s" },
+                    columns.len()
+                ),
+            ));
+        }
+        for (i, ((_, fty), col)) in rec.fields.iter().zip(&columns).enumerate() {
+            if !record_field_fits(&type_from_resolved(fty)?, &col.ty) {
+                return Err(EngineError::new(
+                    SqlState::DatatypeMismatch,
+                    format!(
+                        "{mismatch}: returned type {} at ordinal position {}, but query expects {}",
+                        fty.type_name(),
+                        i + 1,
+                        resolved_type_of_col(&col.ty, self).type_name()
+                    ),
+                ));
+            }
+        }
+        Ok(Box::new(Table {
+            name: alias.unwrap_or("unnest").to_string(),
+            columns,
+            pk: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            exclusions: Vec::new(),
+            on_commit: crate::catalog::OnCommit::PreserveRows,
+            scalar_func: false,
+        }))
+    }
+
+    /// The type of one column-definition-list entry of `unnest(record[])`: a scalar (its type
+    /// modifier dropped), a range, a named composite, or an array of a scalar or composite. An unknown
+    /// name is `42704`.
+    fn resolve_coldef_type(&self, d: &TypeFieldDef) -> Result<Type> {
+        let undefined = |n: &str| {
+            EngineError::new(
+                SqlState::UndefinedObject,
+                format!("type does not exist: {n}"),
+            )
+        };
+        let named = |n: &str| -> Result<Type> {
+            if ScalarType::from_name(n).is_some() {
+                let (s, _, _) = resolve_type_and_typmod(n, &None)?;
+                return Ok(Type::Scalar(s));
+            }
+            if let Some(rdesc) = crate::range::range_by_name(n) {
+                return Ok(Type::Range(Box::new(Type::Scalar(
+                    crate::range::element_scalar(rdesc),
+                ))));
+            }
+            match self.composite_type(n) {
+                Some(ctype) => Ok(Type::Composite(crate::types::CompositeRef {
+                    name: ctype.name.clone(),
+                })),
+                None => Err(undefined(n)),
+            }
+        };
+        match d.type_name.strip_suffix("[]") {
+            Some(base) => Ok(Type::Array(Box::new(named(base)?))),
+            None => {
+                if ScalarType::from_name(&d.type_name).is_some() {
+                    // Validate the modifier as a column's would be, then drop it.
+                    resolve_type_and_typmod(&d.type_name, &d.type_mod)?;
+                }
+                named(&d.type_name)
+            }
+        }
+    }
+
+    /// Generate the rows of `unnest(record[]) AS u(c type, …)` (composite.md §13): one row per array
+    /// element, its fields spread over the declared columns; a NULL element is a row of NULLs (as in
+    /// PostgreSQL); a NULL array yields no rows. A field value outside a narrower declared integer
+    /// type is `22003`. Each row charges one `generated_row`, like `unnest`.
+    pub(crate) fn unnest_record_rows(
+        &self,
+        srf: &SrfPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+        mask: &[bool],
+    ) -> Result<Vec<Row>> {
+        let arr = match srf.args[0].eval(&[], env, meter)? {
+            Value::Null => return Ok(Vec::new()),
+            Value::Array(a) => a,
+            _ => unreachable!("the resolver restricts unnest's argument to an array"),
+        };
+        let width = srf.record_cols.len();
+        let mut out: Vec<Row> = Vec::with_capacity(arr.elements.len());
+        for e in arr.elements {
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            let row = match e {
+                Value::Composite(fields) => {
+                    for (v, col) in fields.iter().zip(&srf.record_cols) {
+                        check_record_field_value(v, &col.ty)?;
+                    }
+                    fields
+                }
+                _ => vec![Value::Null; width],
+            };
+            meter.admit_row_masked(&row, mask)?;
+            out.push(row);
+        }
+        Ok(out)
     }
 
     /// Generate the rows of a `generate_series(start, stop[, step])` FROM-clause source
@@ -1647,4 +1821,45 @@ fn json_verbatim_srf_rows(kind: SrfKind, text: &str, meter: &mut Meter) -> Resul
         _ => unreachable!("json_verbatim_srf_rows only handles the json verbatim SRF kinds"),
     }
     Ok(out)
+}
+
+/// Reject a duplicate name in a FROM-clause column-definition list — `42701`, PostgreSQL's
+/// "column name … specified more than once" (json-table.md §1, composite.md §13).
+fn check_coldef_names(defs: &[TypeFieldDef]) -> Result<()> {
+    for (i, d) in defs.iter().enumerate() {
+        if defs[..i].iter().any(|p| p.name == d.name) {
+            return Err(EngineError::new(
+                SqlState::DuplicateColumn,
+                format!("column name \"{}\" specified more than once", d.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether an anonymous record's field of type `field` may fill a declared column of type `decl`
+/// (composite.md §13): the same type, or integers of any widths — also as array elements.
+fn record_field_fits(field: &Type, decl: &Type) -> bool {
+    match (field, decl) {
+        (Type::Scalar(a), Type::Scalar(b)) => a == b || (a.is_integer() && b.is_integer()),
+        (Type::Array(a), Type::Array(b)) => record_field_fits(a, b),
+        _ => field == decl,
+    }
+}
+
+/// Range-check one record field value against its declared column type: an integer (also an
+/// integer array's elements) outside a narrower declared width is `22003` (composite.md §13).
+fn check_record_field_value(v: &Value, decl: &Type) -> Result<()> {
+    match (v, decl) {
+        (Value::Int(i), Type::Scalar(st)) if st.is_integer() && !st.in_range(*i) => {
+            Err(overflow(*st))
+        }
+        (Value::Array(a), Type::Array(elem)) => {
+            for e in &a.elements {
+                check_record_field_value(e, elem)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }

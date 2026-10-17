@@ -1604,6 +1604,9 @@ const (
 	srfGenerateSeries srfKind = iota
 	// srfUnnest is unnest(anyarray) — one row per array element, flattened row-major (array-functions.md §9).
 	srfUnnest
+	// srfUnnestRecord is unnest(record[]) AS u(c type, …) — one row per anonymous-record element, its
+	// fields spread over the column-definition list's columns (recordCols; composite.md §13).
+	srfUnnestRecord
 	// srfJsonbArrayElements is jsonb_array_elements(jsonb) — one `jsonb` row per array element
 	// (json-sql-functions.md §3).
 	srfJsonbArrayElements
