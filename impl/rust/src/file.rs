@@ -15,19 +15,19 @@ use crate::filehost::FileHost;
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, SharedPaging, cache_leaves};
 
-/// Cross-process coordination mode for a file database (spec/design/locking.md §7.1).
+/// How a file database coordinates with other processes (spec/design/locking.md,
+/// spec/design/page-service.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Locking {
+    /// The page service (the default): the opener that takes presence EX owns the file and serves
+    /// it, every other opener is its page client. Where the host cannot serve (Windows), a
+    /// non-serving owner, like [`Locking::Exclusive`].
     #[default]
     Auto,
-    Shared,
+    /// A non-serving owner: a second opener waits, then fails `55006`.
     Exclusive,
+    /// No coordination: an unsafe escape hatch for externally coordinated access.
     None,
-    /// The TEST-ONLY page-service mode (spec/design/page-service.md §16): the opener becomes the
-    /// owner when it can take presence EX, otherwise a page client of the owner. It exists
-    /// until the page service's handoff phase replaces shared mode; never mix it with shared or
-    /// exclusive openers of one database. Unix only (`0A000` elsewhere).
-    Service,
 }
 
 pub const DEFAULT_FILE_LOCK_TIMEOUT_MS: u64 = 5_000;
@@ -110,20 +110,20 @@ pub struct CreateOptions {
     /// A page-service owner's idle-in-transaction timeout for client write transactions
     /// (spec/design/page-service.md §11.1): a client holding the writer gate that sends nothing for
     /// this long is revoked (`25P03` at its next request). `0` disables it. Only
-    /// [`Locking::Service`] reads it. Default
+    /// the page service ([`Locking::Auto`]) reads it. Default
     /// [`DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS`] (60 s).
     pub idle_in_transaction_timeout_ms: u64,
     /// The page-service handoff options (spec/pageservice/README.md §6.5): an owner's yield and
     /// shutdown graces (`None`: [`DEFAULT_YIELD_GRACE_MS`], [`DEFAULT_SHUTDOWN_GRACE_MS`]), its
     /// idle-session timeout (`None` or `Some(0)`: never), and its connection limit (`0`: unlimited;
-    /// `53300` beyond it). Only [`Locking::Service`] reads them, as an owner's limits; a client keeps
+    /// `53300` beyond it). Only the page service ([`Locking::Auto`]) reads them, as an owner's limits; a client keeps
     /// them for the day it becomes owner.
     pub yield_grace_ms: Option<u64>,
     pub shutdown_grace_ms: Option<u64>,
     pub idle_session_timeout_ms: Option<u64>,
     pub max_connections: usize,
     /// The ownership preference under the page service (spec/design/page-service.md §8.2). Only
-    /// [`Locking::Service`] reads it.
+    /// the page service ([`Locking::Auto`]) reads it.
     pub ownership: Ownership,
 }
 
@@ -196,20 +196,20 @@ pub struct OpenOptions {
     /// A page-service owner's idle-in-transaction timeout for client write transactions
     /// (spec/design/page-service.md §11.1): a client holding the writer gate that sends nothing for
     /// this long is revoked (`25P03` at its next request). `0` disables it. Only
-    /// [`Locking::Service`] reads it. Default
+    /// the page service ([`Locking::Auto`]) reads it. Default
     /// [`DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS`] (60 s).
     pub idle_in_transaction_timeout_ms: u64,
     /// The page-service handoff options (spec/pageservice/README.md §6.5): an owner's yield and
     /// shutdown graces (`None`: [`DEFAULT_YIELD_GRACE_MS`], [`DEFAULT_SHUTDOWN_GRACE_MS`]), its
     /// idle-session timeout (`None` or `Some(0)`: never), and its connection limit (`0`: unlimited;
-    /// `53300` beyond it). Only [`Locking::Service`] reads them, as an owner's limits; a client keeps
+    /// `53300` beyond it). Only the page service ([`Locking::Auto`]) reads them, as an owner's limits; a client keeps
     /// them for the day it becomes owner.
     pub yield_grace_ms: Option<u64>,
     pub shutdown_grace_ms: Option<u64>,
     pub idle_session_timeout_ms: Option<u64>,
     pub max_connections: usize,
     /// The ownership preference under the page service (spec/design/page-service.md §8.2). Only
-    /// [`Locking::Service`] reads it.
+    /// the page service ([`Locking::Auto`]) reads it.
     pub ownership: Ownership,
 }
 

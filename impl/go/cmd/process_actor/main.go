@@ -72,16 +72,13 @@ func run() error {
 		// as their page-service owner on command.
 		return ownerIdle(os.Args[2])
 	}
-	locking := jed.LockingShared
-	switch os.Args[1] {
-	case "open-exclusive":
+	// create/open use the default locking (the page service); open-exclusive is a non-serving owner.
+	locking := jed.LockingAuto
+	if os.Args[1] == "open-exclusive" {
 		locking = jed.LockingExclusive
-	case "create-service", "open-service", "open-service-read-only":
-		// The test-only page-service mode (spec/design/page-service.md §16).
-		locking = jed.LockingService
 	}
-	readOnly := os.Args[1] == "open-service-read-only"
-	if os.Args[1] == "create" || os.Args[1] == "create-service" {
+	readOnly := os.Args[1] == "open-read-only"
+	if os.Args[1] == "create" {
 		db, err = jed.CreateDatabase(jed.CreateOptions{
 			Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle,
 			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
@@ -233,7 +230,7 @@ func replyError(err error) {
 }
 
 // ownerIdle serves OWNER_OPEN <hex path> / OWNER_CLOSE / CLOSE: it owns one database at a time under
-// the test-only page-service mode, so another core's conformance harness can run queries as its client.
+// the page service, so another core's conformance harness can run queries as its client.
 // root is the repository root, whose spec bundles the owner loads.
 func ownerIdle(root string) error {
 	env, err := ownerEnvironment(root)
@@ -249,7 +246,7 @@ func ownerIdle(root string) error {
 		switch command {
 		case "OWNER_OPEN":
 			timeout := uint64(5000)
-			db, err = jed.OpenDatabaseWithOptions(sql(argument), jed.OpenOptions{Locking: jed.LockingService, SkipFsync: true, FileLockTimeoutMs: &timeout, Environment: env})
+			db, err = jed.OpenDatabaseWithOptions(sql(argument), jed.OpenOptions{Locking: jed.LockingAuto, SkipFsync: true, FileLockTimeoutMs: &timeout, Environment: env})
 		case "OWNER_CLOSE":
 			if db != nil {
 				err = db.Close()

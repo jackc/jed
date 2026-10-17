@@ -201,9 +201,9 @@ export class Pager {
     this.allocatedPages = target;
   }
 
-  // Refresh the physical high-water after a foreign process appended pages. Shared-mode writers
-  // reserve from the committed page_count, but the pager's allocation cache must also learn the
-  // file's current length so it never tries to regrow from a stale value.
+  // Refresh the physical high-water after another process's commit grew the file (a page-service
+  // owner adopting a client commit, or a client adopting the owner's meta): the pager's allocation
+  // cache must learn the file's current length so it never tries to regrow from a stale value.
   refreshAllocatedPages(): void {
     this.allocatedPages = Math.floor(this.store.size() / this.pageSize);
   }

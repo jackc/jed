@@ -29,7 +29,7 @@ class Actor
               when "node" then ["node", File.join(ROOT, "impl/ts/src/bin/process_actor.ts")]
               else raise "unknown actor core #{core}"
               end
-    # `action` may carry extra actor arguments after the action word ("create-service 5000 300": the
+    # `action` may carry extra actor arguments after the action word ("create 5000 300": the
     # open timeout, then the owner's idle-in-transaction timeout), passed after the path.
     action, *extra = action.split
     @stdin, @stdout, @stderr, @wait = Open3.popen3(*command, action, path, *extra)

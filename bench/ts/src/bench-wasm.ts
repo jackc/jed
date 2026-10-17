@@ -37,7 +37,7 @@ const TAG_HANDLE = 3;
 // The ABI this harness speaks (impl/wasm/src/lib.rs ABI_VERSION).
 const ABI_VERSION = 2;
 
-// jed_create/jed_open `locking` byte (spec/design/locking.md §7.1): 0 auto, 1 shared, 2 exclusive,
+// jed_create/jed_open `locking` byte (spec/design/locking.md §7.1): 0 auto, 2 exclusive,
 // 3 none. wasm32-wasip1 has no file locking (locking.md §7.3), so only `none` opens a file there.
 // The harness supplies the external coordination `none` requires: each benchmark process owns its
 // dataset files and the runner never points two processes at the same file concurrently.

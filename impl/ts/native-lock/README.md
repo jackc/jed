@@ -12,5 +12,5 @@ mise run ts:lock_build
 
 The exact-pinned Node-API dependencies and bounded host-only native exception are recorded in
 `CLAUDE.md` §14 and `spec/design/locking.md` §8. Browser/OPFS bundles never import this crate. A
-production package must provide a matching prebuilt artifact and fails shared locking closed when it
+production package must provide a matching prebuilt artifact and fails file locking closed when it
 does not; it must not download or compile code during installation.

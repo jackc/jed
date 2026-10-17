@@ -1,68 +1,43 @@
-//! Stable cross-process file coordination (spec/design/locking.md).
+//! Cross-process file coordination (spec/design/locking.md).
 //!
-//! The database file is never itself the lock identity. Five empty files in the persistent
+//! The database file is never itself the lock identity. Empty files in the persistent
 //! `<database>.lock/` bundle carry whole-file OS locks; the database remains one copyable data file.
+//! presence EX is ownership: a page-service owner (page-service.md §4.1), an exclusive opener, or a
+//! file attachment holds it for its whole tenure; arrival SH guards the protocol-marker check.
 //!
 //! Every lock operation goes through a [`LockHost`]: the lock bundle, whole-file locks on it, the
-//! clock deadlines read, the pause between polls of a contended lock, the background presence probe,
-//! and the process-local duplicate-open registry. Production uses the OS ([`OsLockHost`]). The
-//! deterministic simulator (spec/design/simulation-testing.md §14 S5) substitutes simulated
-//! processes sharing one lock table, so the protocol runs, crashes, and interleaves deterministically.
+//! clock deadlines read, the pause between polls of a contended lock, and the process-local
+//! duplicate-open registry. Production uses the OS ([`OsLockHost`]). The deterministic simulator
+//! (spec/design/simulation-testing.md §14 S5) substitutes simulated processes sharing one lock
+//! table, so the protocol runs, crashes, and interleaves deterministically.
 
 use std::collections::HashSet;
 use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{EngineError, Result, SqlState};
 use crate::file::Locking;
 
-const PROTOCOL_MARKER: &str = "protocol-v1";
-const LOCK_NAMES: [&str; 5] = ["presence", "arrival", "transition", "writer", "commit"];
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// The bundle's protocol: v2 is presence ownership under the page service. The legacy shared-mode
+/// marker may remain in an existing bundle; a v1 binary rejects the v2 marker, so the two never run
+/// on one file (page-service.md §12).
+const PROTOCOL_MARKER: &str = "protocol-v2";
+const LEGACY_PROTOCOL_MARKER: &str = "protocol-v1";
+const LOCK_NAMES: [&str; 2] = ["presence", "arrival"];
 const RETRY_INTERVAL: Duration = Duration::from_millis(2);
 
 static OPEN_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LeaseState {
-    Alone = 1,
-    Shared = 2,
-    Exclusive = 3,
-    Poisoned = 4,
-}
-
-impl LeaseState {
-    fn from_u8(value: u8) -> LeaseState {
-        match value {
-            1 => LeaseState::Alone,
-            2 => LeaseState::Shared,
-            3 => LeaseState::Exclusive,
-            _ => LeaseState::Poisoned,
-        }
-    }
-}
-
 /// One bundle file's lock, opaque to the coordinator: a [`File`] for the OS host.
 pub(crate) type LockHandle = Box<dyn std::any::Any + Send + Sync>;
 
-/// The five bundle locks of one participant.
+/// The bundle locks of one participant.
 pub(crate) struct LockFiles {
     pub(crate) presence: LockHandle,
     pub(crate) arrival: LockHandle,
-    pub(crate) transition: LockHandle,
-    pub(crate) writer: LockHandle,
-    pub(crate) commit: LockHandle,
-}
-
-/// The stop signal of an OS presence-probe thread.
-pub(crate) struct ProbeSignal {
-    stop: AtomicBool,
-    wake_mu: Mutex<()>,
-    wake: Condvar,
 }
 
 /// Everything the coordinator needs from its environment (see the module docs).
@@ -70,7 +45,7 @@ pub(crate) trait LockHost: Send + Sync {
     /// Register `path` as open in this process; false if it already is.
     fn claim_path(&self, path: &Path) -> bool;
     fn release_path(&self, path: &Path);
-    /// Create or open the lock bundle beside `path` and open its five lock handles.
+    /// Create or open the lock bundle beside `path` and open its lock handles.
     fn open_bundle(&self, path: &Path) -> Result<LockFiles>;
     /// Re-validate the protocol marker (held under arrival SH, the migration barrier).
     fn validate_marker(&self, path: &Path) -> Result<()>;
@@ -78,19 +53,11 @@ pub(crate) trait LockHost: Send + Sync {
     fn close_files(&self, files: &LockFiles);
     /// Take or convert the lock without waiting: `Ok(false)` when another holder conflicts.
     fn try_lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<bool>;
-    /// Take or convert the lock, waiting as long as it takes.
-    fn lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<()>;
     fn unlock(&self, handle: &LockHandle) -> std::io::Result<()>;
     /// The clock lock deadlines read.
     fn now(&self) -> Instant;
     /// Wait between polls of a contended lock.
     fn pause(&self);
-    /// Run `callback` periodically until `signal` stops; the OS returns the probe thread to join.
-    fn start_probe(
-        &self,
-        signal: Arc<ProbeSignal>,
-        callback: Arc<dyn Fn() + Send + Sync>,
-    ) -> Option<JoinHandle<()>>;
     /// The process id the fork check compares.
     fn pid(&self) -> u32;
 }
@@ -143,15 +110,6 @@ impl LockHost for OsLockHost {
         }
     }
 
-    fn lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<()> {
-        let file = os_file(handle);
-        if exclusive {
-            file.lock()
-        } else {
-            file.lock_shared()
-        }
-    }
-
     fn unlock(&self, handle: &LockHandle) -> std::io::Result<()> {
         os_file(handle).unlock()
     }
@@ -164,82 +122,46 @@ impl LockHost for OsLockHost {
         thread::sleep(RETRY_INTERVAL);
     }
 
-    fn start_probe(
-        &self,
-        signal: Arc<ProbeSignal>,
-        callback: Arc<dyn Fn() + Send + Sync>,
-    ) -> Option<JoinHandle<()>> {
-        Some(thread::spawn(move || {
-            loop {
-                // Release the wait mutex before the callback: Drop takes it to publish `stop`, and
-                // may run on this thread when the callback releases the last handle.
-                let timed_out = {
-                    let guard = signal.wake_mu.lock().expect("probe wake lock poisoned");
-                    let (_guard, wait) = signal
-                        .wake
-                        .wait_timeout_while(guard, POLL_INTERVAL, |_| {
-                            !signal.stop.load(Ordering::Acquire)
-                        })
-                        .expect("probe wake lock poisoned");
-                    wait.timed_out()
-                };
-                if signal.stop.load(Ordering::Acquire) {
-                    break;
-                }
-                if timed_out {
-                    callback();
-                }
-            }
-        }))
-    }
-
     fn pid(&self) -> u32 {
         std::process::id()
     }
 }
 
-/// One registered participant in a file's stable lock domain.
+/// One owner of a file: the holder of presence EX for its whole tenure.
 pub(crate) struct FileCoordinator {
     host: Arc<dyn LockHost>,
     path: PathBuf,
     files: LockFiles,
-    state: AtomicU8,
-    signal: Arc<ProbeSignal>,
-    probe: Mutex<Option<JoinHandle<()>>>,
-    probe_started: AtomicBool,
     opener_pid: u32,
+    /// A page-service owner (it serves an endpoint); otherwise a non-serving owner — an exclusive
+    /// opener or a file attachment.
+    serving: bool,
     /// Leave the process-local path claim at drop: a page-service owner's claim belongs to its
     /// handle, which keeps the path through role changes (page-service.md §8).
     keep_path: bool,
-}
-
-/// An RAII whole-file lock used for the short commit/meta adoption gates.
-pub(crate) struct FileLockGuard<'a> {
-    host: &'a dyn LockHost,
-    handle: &'a LockHandle,
-}
-
-impl Drop for FileLockGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.host.unlock(self.handle);
-    }
+    /// This coordinator wrote a non-serving owner record, removed at drop
+    /// (spec/pageservice/README.md §5.1).
+    record: bool,
 }
 
 impl FileCoordinator {
-    /// Prepare coordination for an existing database before any database byte is read.
+    /// Take ownership of an existing database before any database byte is read: `None` under
+    /// `Locking::None`, otherwise a non-serving owner (the page-service open is the election,
+    /// [`crate::pageservice::election`]). A caller resolves `Locking::Auto` first.
     pub(crate) fn open(path: &Path, mode: Locking, timeout_ms: u64) -> Result<Option<Self>> {
         let mode = resolve_mode(mode)?;
         if mode == Locking::None {
             return Ok(None);
         }
         let path = resolve_open_path(path)?;
-        Self::acquire(Arc::new(OsLockHost), path, mode, timeout_ms).map(Some)
+        let mut coordinator = Self::acquire(Arc::new(OsLockHost), path, false, timeout_ms)?;
+        coordinator.write_non_serving_record();
+        Ok(Some(coordinator))
     }
 
     /// The registered participant of a page-service owner elected at open
-    /// (spec/pageservice/README.md §6.1): presence EX held for its whole tenure and no join-window
-    /// probe, exactly like an exclusive opener. `files` are the bundle locks the election opened;
-    /// the path is already claimed.
+    /// (spec/pageservice/README.md §6.1): presence EX held for its whole tenure. `files` are the
+    /// bundle locks the election opened; the path is already claimed.
     pub(crate) fn elected_owner(
         host: Arc<dyn LockHost>,
         path: PathBuf,
@@ -250,20 +172,16 @@ impl FileCoordinator {
             host,
             path,
             files,
-            state: AtomicU8::new(LeaseState::Exclusive as u8),
-            signal: Arc::new(ProbeSignal {
-                stop: AtomicBool::new(false),
-                wake_mu: Mutex::new(()),
-                wake: Condvar::new(),
-            }),
-            probe: Mutex::new(None),
-            probe_started: AtomicBool::new(false),
             opener_pid,
+            serving: true,
             keep_path: true,
+            record: false,
         }
     }
 
-    /// Prepare coordination for an absent database path before the initial image is published.
+    /// Take ownership of an absent database path before the initial image is published. Under
+    /// `Locking::Auto` (where the host serves) the creator becomes the serving owner — its record is
+    /// written when it serves — and under `Locking::Exclusive` a non-serving owner.
     pub(crate) fn create(path: &Path, mode: Locking, timeout_ms: u64) -> Result<Option<Self>> {
         let mode = resolve_mode(mode)?;
         if mode == Locking::None {
@@ -275,15 +193,22 @@ impl FileCoordinator {
         let name = path.file_name().ok_or_else(|| {
             EngineError::new(SqlState::IoError, "database path has no final component")
         })?;
-        Self::acquire(Arc::new(OsLockHost), parent.join(name), mode, timeout_ms).map(Some)
+        let serving = mode == Locking::Auto;
+        let mut coordinator =
+            Self::acquire(Arc::new(OsLockHost), parent.join(name), serving, timeout_ms)?;
+        if !serving {
+            coordinator.write_non_serving_record();
+        }
+        Ok(Some(coordinator))
     }
 
-    /// Register as a participant in `path`'s lock domain through `host` (`mode` is Shared or
-    /// Exclusive; the caller has resolved Auto and handled None).
+    /// Take presence EX for `path` through `host` with the exclusive acquisition loop, until the
+    /// open timeout (`55006`, worded from the owner record when there is one). `serving` marks a
+    /// page-service owner, which keeps the process-local path claim at drop.
     pub(crate) fn acquire(
         host: Arc<dyn LockHost>,
         path: PathBuf,
-        mode: Locking,
+        serving: bool,
         timeout_ms: u64,
     ) -> Result<Self> {
         if !host.claim_path(&path) {
@@ -306,60 +231,31 @@ impl FileCoordinator {
         let result = (|| {
             let deadline = deadline(h, timeout_ms);
             lock_until(h, &files.arrival, false, deadline, &path, false)?;
-            h.validate_marker(&path)?;
-
-            let state = if mode == Locking::Exclusive {
-                loop {
-                    lock_until(h, &files.transition, true, deadline, &path, false)?;
-                    match try_lock(h, &files.presence, true)? {
-                        true => {
-                            h.unlock(&files.transition)
-                                .map_err(|e| lock_error(e, &path))?;
-                            break LeaseState::Exclusive;
-                        }
-                        false => {
-                            h.unlock(&files.transition)
-                                .map_err(|e| lock_error(e, &path))?;
-                            check_deadline(h, deadline, &path, false)?;
-                            h.pause();
-                        }
+            let owned = h.validate_marker(&path).and_then(|()| {
+                lock_until(h, &files.presence, true, deadline, &path, false).map_err(|e| {
+                    match owner_reason(&path) {
+                        Some(reason) => EngineError::new(
+                            SqlState::ObjectInUse,
+                            format!("database file is in use: {} ({reason})", path.display()),
+                        ),
+                        None => e,
                     }
-                }
-            } else {
-                // A first opener takes presence EX and immediately gets the fast path. A participant
-                // already present makes the EX attempt fail; its arrival lock then drives the holder's
-                // downgrade and this opener joins with presence SH.
-                lock_until(h, &files.transition, true, deadline, &path, false)?;
-                let alone = try_lock(h, &files.presence, true)?;
-                h.unlock(&files.transition)
-                    .map_err(|e| lock_error(e, &path))?;
-                if alone {
-                    LeaseState::Alone
-                } else {
-                    lock_until(h, &files.presence, false, deadline, &path, false)?;
-                    LeaseState::Shared
-                }
-            };
-            h.unlock(&files.arrival).map_err(|e| lock_error(e, &path))?;
-            Ok(state)
+                })
+            });
+            let unlocked = h.unlock(&files.arrival).map_err(|e| lock_error(e, &path));
+            owned.and(unlocked)
         })();
         match result {
-            Ok(state) => {
+            Ok(()) => {
                 let opener_pid = host.pid();
                 Ok(FileCoordinator {
                     host,
                     path,
                     files,
-                    state: AtomicU8::new(state as u8),
-                    signal: Arc::new(ProbeSignal {
-                        stop: AtomicBool::new(false),
-                        wake_mu: Mutex::new(()),
-                        wake: Condvar::new(),
-                    }),
-                    probe: Mutex::new(None),
-                    probe_started: AtomicBool::new(false),
                     opener_pid,
-                    keep_path: false,
+                    serving,
+                    keep_path: serving,
+                    record: false,
                 })
             }
             Err(e) => {
@@ -371,22 +267,34 @@ impl FileCoordinator {
         }
     }
 
+    /// Publish a non-serving owner record (flags 0, empty endpoint — README.md §5.1), so a
+    /// page-service opener words its timeout as "owned by a non-serving process". Best effort: a
+    /// missing record only loses that wording.
+    fn write_non_serving_record(&mut self) {
+        #[cfg(unix)]
+        {
+            use crate::pageservice::{codec::OwnerRecord, endpoint, owner::new_incarnation};
+            let written = (|| {
+                let record = OwnerRecord {
+                    serving: false,
+                    uid: endpoint::current_uid(&endpoint::bundle_dir(&self.path))?,
+                    incarnation: new_incarnation()?,
+                    pid: std::process::id(),
+                    endpoint: String::new(),
+                };
+                endpoint::write_owner_record(&self.path, &record)
+            })();
+            self.record = written.is_ok();
+        }
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Leave the process-local path claim at drop: the claim belongs to the page-service handle
-    /// this coordinator's presence EX made the owner (page-service.md §8).
-    pub(crate) fn keep_path_claim(&mut self) {
-        self.keep_path = true;
-    }
-
-    pub(crate) fn state(&self) -> LeaseState {
-        LeaseState::from_u8(self.state.load(Ordering::Acquire))
-    }
-
-    pub(crate) fn set_state(&self, state: LeaseState) {
-        self.state.store(state as u8, Ordering::Release);
+    /// Whether this is a page-service owner (it serves an endpoint).
+    pub(crate) fn serving(&self) -> bool {
+        self.serving
     }
 
     pub(crate) fn check_pid(&self) -> Result<()> {
@@ -399,127 +307,39 @@ impl FileCoordinator {
             ))
         }
     }
-
-    fn guard<'a>(&'a self, handle: &'a LockHandle) -> FileLockGuard<'a> {
-        FileLockGuard {
-            host: self.host.as_ref(),
-            handle,
-        }
-    }
-
-    pub(crate) fn lock_commit_shared(&self) -> Result<FileLockGuard<'_>> {
-        self.host
-            .lock(&self.files.commit, false)
-            .map_err(|e| lock_error(e, &self.path))?;
-        Ok(self.guard(&self.files.commit))
-    }
-
-    pub(crate) fn lock_commit_exclusive(&self) -> Result<FileLockGuard<'_>> {
-        self.host
-            .lock(&self.files.commit, true)
-            .map_err(|e| lock_error(e, &self.path))?;
-        Ok(self.guard(&self.files.commit))
-    }
-
-    pub(crate) fn lock_writer(&self, timeout_ms: u64) -> Result<()> {
-        let h = self.host.as_ref();
-        lock_until(
-            h,
-            &self.files.writer,
-            true,
-            if timeout_ms == 0 {
-                None
-            } else {
-                deadline(h, timeout_ms)
-            },
-            &self.path,
-            true,
-        )
-    }
-
-    pub(crate) fn unlock_writer(&self) {
-        let _ = self.host.unlock(&self.files.writer);
-    }
-
-    pub(crate) fn lock_transition(&self) -> Result<FileLockGuard<'_>> {
-        self.host
-            .lock(&self.files.transition, true)
-            .map_err(|e| lock_error(e, &self.path))?;
-        Ok(self.guard(&self.files.transition))
-    }
-
-    pub(crate) fn try_arrival_exclusive(&self) -> Result<Option<FileLockGuard<'_>>> {
-        if try_lock(self.host.as_ref(), &self.files.arrival, true)? {
-            Ok(Some(self.guard(&self.files.arrival)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Convert the held presence EX lease to SH. The caller holds transition EX and the local barrier.
-    pub(crate) fn downgrade_presence(&self) -> Result<()> {
-        self.set_state(LeaseState::Shared);
-        self.host
-            .unlock(&self.files.presence)
-            .map_err(|e| lock_error(e, &self.path))?;
-        self.host
-            .lock(&self.files.presence, false)
-            .map_err(|e| lock_error(e, &self.path))
-    }
-
-    /// Try SH→EX while arrival EX and transition EX make the temporary unlock invisible.
-    pub(crate) fn try_upgrade_presence(&self) -> Result<bool> {
-        self.host
-            .unlock(&self.files.presence)
-            .map_err(|e| lock_error(e, &self.path))?;
-        if try_lock(self.host.as_ref(), &self.files.presence, true)? {
-            Ok(true)
-        } else {
-            self.host
-                .lock(&self.files.presence, false)
-                .map_err(|e| lock_error(e, &self.path))?;
-            Ok(false)
-        }
-    }
-
-    /// Start the unreferenced-equivalent background lease probe. The callback performs one complete
-    /// transition attempt under the core's local writer/reader barrier.
-    pub(crate) fn start_probe(&self, callback: Arc<dyn Fn() + Send + Sync>) {
-        if self.state() == LeaseState::Exclusive {
-            return;
-        }
-        let mut slot = self.probe.lock().expect("probe lock poisoned");
-        if self.probe_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        *slot = self.host.start_probe(Arc::clone(&self.signal), callback);
-    }
 }
 
 impl Drop for FileCoordinator {
     fn drop(&mut self) {
-        // Publish `stop` under the probe's wait mutex: set without it, the store + notify could land
-        // between the probe's predicate check and its park, losing the wakeup and stalling this
-        // join for a full POLL_INTERVAL.
-        {
-            let _guard = self
-                .signal
-                .wake_mu
-                .lock()
-                .expect("probe wake lock poisoned");
-            self.signal.stop.store(true, Ordering::Release);
-        }
-        self.signal.wake.notify_all();
-        if let Some(handle) = self.probe.lock().expect("probe lock poisoned").take() {
-            if handle.thread().id() != thread::current().id() {
-                let _ = handle.join();
-            }
+        #[cfg(unix)]
+        if self.record {
+            let _ = fs::remove_file(crate::pageservice::endpoint::owner_record_path(&self.path));
         }
         self.host.close_files(&self.files);
         if !self.keep_path {
             self.host.release_path(&self.path);
         }
     }
+}
+
+/// The owner record's wording for a presence EX this opener could not take (README.md §6.1).
+#[cfg(unix)]
+fn owner_reason(path: &Path) -> Option<&'static str> {
+    use crate::pageservice::endpoint;
+    let record = endpoint::read_owner_record(path)?;
+    let uid = endpoint::current_uid(&endpoint::bundle_dir(path)).ok()?;
+    if record.uid != uid {
+        Some("owned by another user's process")
+    } else if !record.serving {
+        Some("owned by a non-serving process")
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn owner_reason(_path: &Path) -> Option<&'static str> {
+    None
 }
 
 /// Resolve an existing database path as a coordinated open does (locking.md §3.1): symlinks
@@ -589,44 +409,23 @@ pub(crate) fn check_deadline(
     }
 }
 
-fn resolve_mode(mode: Locking) -> Result<Locking> {
-    if mode == Locking::Service {
-        // Creating under the test-only page-service mode takes presence EX like an exclusive opener:
-        // the creator is the owner (spec/pageservice/README.md §6.1). Windows serving is not yet
-        // specified (page-service.md §14).
-        return if cfg!(unix) {
-            Ok(Locking::Exclusive)
-        } else {
-            Err(service_unsupported())
-        };
+/// Resolve a locking mode: `Auto` is the page service where the host serves (Unix —
+/// page-service.md §14), otherwise a non-serving owner (`Exclusive`). Without OS file locks every
+/// mode but `None` is `0A000`.
+pub(crate) fn resolve_mode(mode: Locking) -> Result<Locking> {
+    if mode == Locking::None {
+        return Ok(mode);
     }
-    #[cfg(any(unix, windows))]
-    {
-        Ok(if mode == Locking::Auto {
-            Locking::Shared
-        } else {
-            mode
-        })
+    if !cfg!(any(unix, windows)) {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "file locking is unavailable on this host; use locking=none only with external coordination",
+        ));
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        if mode == Locking::None {
-            Ok(mode)
-        } else {
-            Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "file locking is unavailable on this host; use locking=none only with external coordination",
-            ))
-        }
+    if mode == Locking::Auto && !cfg!(unix) {
+        return Ok(Locking::Exclusive);
     }
-}
-
-/// `locking = service` off Unix (page-service.md §14).
-pub(crate) fn service_unsupported() -> EngineError {
-    EngineError::new(
-        SqlState::FeatureNotSupported,
-        "the page service is unavailable on this platform",
-    )
+    Ok(mode)
 }
 
 fn open_bundle(path: &Path) -> Result<LockFiles> {
@@ -646,19 +445,12 @@ fn open_bundle(path: &Path) -> Result<LockFiles> {
     }
 
     validate_protocol_marker(path)?;
-    ensure_regular_file(&bundle.join(PROTOCOL_MARKER))?;
     for name in LOCK_NAMES {
         ensure_regular_file(&bundle.join(name))?;
     }
-    // Revalidate after creation/open. The arrival lock acquired by the caller protects the final
-    // protocol-marker check against a cooperating future migration.
-    ensure_regular_file(&bundle.join(PROTOCOL_MARKER))?;
     Ok(LockFiles {
         presence: Box::new(open_regular(&bundle.join("presence"))?),
         arrival: Box::new(open_regular(&bundle.join("arrival"))?),
-        transition: Box::new(open_regular(&bundle.join("transition"))?),
-        writer: Box::new(open_regular(&bundle.join("writer"))?),
-        commit: Box::new(open_regular(&bundle.join("commit"))?),
     })
 }
 
@@ -671,7 +463,11 @@ fn validate_protocol_marker(path: &Path) -> Result<()> {
         let entry = entry.map_err(|e| io_error("read coordination entry", e))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("protocol-v") && name != PROTOCOL_MARKER {
+        // A legacy shared-mode marker (with its stale lock files) is tolerated.
+        if name.starts_with("protocol-v")
+            && name != PROTOCOL_MARKER
+            && name != LEGACY_PROTOCOL_MARKER
+        {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 format!(
@@ -786,16 +582,41 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("db.jed");
         fs::write(&path, b"not read by coordinator").unwrap();
-        let first = FileCoordinator::open(&path, Locking::Shared, 0)
+        let first = FileCoordinator::open(&path, Locking::Exclusive, 0)
             .unwrap()
             .unwrap();
-        let err = match FileCoordinator::open(&path, Locking::Shared, 0) {
+        let err = match FileCoordinator::open(&path, Locking::Exclusive, 0) {
             Ok(_) => panic!("duplicate coordinated open unexpectedly succeeded"),
             Err(error) => error,
         };
         assert_eq!(err.state, SqlState::ObjectInUse);
         drop(first);
-        assert!(root.join("db.jed.lock/protocol-v1").is_file());
+        assert!(root.join("db.jed.lock/protocol-v2").is_file());
+        assert!(!root.join("db.jed.lock/transition").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_marker_is_tolerated_and_unknown_markers_fail() {
+        let root = std::env::temp_dir().join(format!("jed-lock-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("db.jed.lock")).unwrap();
+        let path = root.join("db.jed");
+        fs::write(&path, b"x").unwrap();
+        for stale in ["protocol-v1", "transition", "writer", "commit"] {
+            fs::write(root.join("db.jed.lock").join(stale), b"").unwrap();
+        }
+        drop(
+            FileCoordinator::open(&path, Locking::Exclusive, 0)
+                .unwrap()
+                .unwrap(),
+        );
+        fs::write(root.join("db.jed.lock/protocol-v3"), b"").unwrap();
+        let err = match FileCoordinator::open(&path, Locking::Exclusive, 0) {
+            Ok(_) => panic!("an unknown protocol marker unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(err.state, SqlState::FeatureNotSupported);
         fs::remove_dir_all(root).unwrap();
     }
 }

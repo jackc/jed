@@ -126,21 +126,23 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
 - Key encoding must preserve logical order in raw byte order.
 - Do not assume on-disk page bytes are plaintext-comparable; leave room for the
   encryption-at-rest design.
-- Shared multi-process file access is landed across Rust, Go, and
-  Node/TypeScript. Coordinate through the stable `<path>.lock/` OS-lock bundle
-  in `spec/design/locking.md`: one global writer, meta freshness at
-  transaction begin, append-only commits while co-resident, and reuse/compaction
-  only when presence-exclusive proves aloneness. The one-process foreground path
-  must retain zero coordination syscalls and zero per-transaction meta reads.
+- Multi-process file access is the page service (`spec/design/page-service.md`,
+  `spec/design/locking.md`), landed across Rust, Go, and Node/TypeScript: the
+  process holding `presence EX` on the stable `<path>.lock/` bundle owns the file
+  and alone reads and writes it; every other process is a page client running its
+  own engine, and every commit to the file passes through the owner. Reuse and
+  reclamation run only on the owner, gated by its reader watermark (which counts
+  client pins). The owner's foreground path must retain zero coordination
+  syscalls and zero per-transaction meta reads.
 - Never use PID files, mtime leases, or automatic stale-lock stealing for database
   safety. A host without the required crash-clean OS lock fails closed.
-- Node shared locking uses the approved minimal Node-API lock helper while
-  keeping the independent TypeScript engine; its alone lease makes no foreground
+- Node file locking uses the approved minimal Node-API lock helper while
+  keeping the independent TypeScript engine; an owner's foreground path makes no
   addon calls. A full Rust-core Node wrapper
   exists only as a reach experiment: it wins heavy/parallel reads but not cheap
   queries or writes uniformly, and it is not a TypeScript conformance voice.
-- Treat the lock-bundle protocol version as a compatibility boundary. Pre-protocol
-  binaries cannot overlap safely and must be drained once during first rollout.
+- Treat the lock-bundle protocol version (`protocol-v2`) as a compatibility
+  boundary: a binary that does not take the bundle's locks cannot overlap safely.
 - Replication, where relevant, is block-delta shipping at the block seam, not a
   WAL.
 - Blocking hash JOIN, aggregation, and DISTINCT use bounded row spools and disk
@@ -175,7 +177,7 @@ every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by defa
 bounds an in-memory database's or attachment's committed pages, checked at commit before any write
 (slice Q4a), and a file-backed database's or attachment's **live** pages — reachable from the catalog
 root, an exact count persisted in the meta page, so the trip point is independent of the free list
-and of co-resident append-only allocation (slice Q4c, memory.md §8.7); file-backed page caches stay
+(slice Q4c, memory.md §8.7); file-backed page caches stay
 evict-only under `cache_bytes` and never fail a query. A file's dead pages are bounded by the work
 that wrote them (`max_cost`/`lifetime_max_cost`), not by this limit. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a

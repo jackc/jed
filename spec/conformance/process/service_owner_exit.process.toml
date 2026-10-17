@@ -6,7 +6,7 @@ requires = ["file.page_service"]
 [[step]]
 actor = "a"
 command = "start"
-argument = "create-service"
+argument = "create"
 
 [[step]]
 actor = "a"
@@ -21,7 +21,7 @@ sql = "INSERT INTO t VALUES (1), (2), (3)"
 [[step]]
 actor = "b"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 [[step]]
 actor = "b"
@@ -89,7 +89,7 @@ command = "read_close"
 [[step]]
 actor = "a"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 [[step]]
 actor = "a"

@@ -53,10 +53,10 @@ evolves exactly as in a normal walk.
 
 Two sibling formats cover concurrency that a one-handle SQL transcript cannot express:
 `# format: concurrency` files model named in-process sessions, while
-`process/*.process.toml` drives real Rust/Go/Node processes over one file. The latter is the planned
-Layer 4 shared-lock contract from [concurrency-testing.md](concurrency-testing.md) §10 and
-[locking.md](locking.md) §9; it becomes an in-CI capability gate with the locking slice rather than
-being mirrored separately in each core.
+`process/*.process.toml` drives real Rust/Go/Node processes over one file. The latter is the
+Layer 4 multi-process contract from [concurrency-testing.md](concurrency-testing.md) §10 and
+[locking.md](locking.md) §9, an in-CI capability gate (`file.page_service`) rather than tests
+mirrored separately in each core.
 
 ## 1. Format: sqllogictest-style
 
@@ -356,7 +356,8 @@ with **`# skip: memory[ — reason]`**. `mise run conformance` runs both modes o
 ci` gates on both.
 
 A third mode, **`service`** (harness arg `service`, owner core in `JED_SERVICE_OWNER`), is the disk
-mode with the owner moved to another core's process: every record, writes included, runs on a
+mode with the owner moved to another core's process: the harness opens the file with the default
+`locking = auto` while the owner holds it, so every record, writes included, runs on a
 **page client** of that owner, so every query reads pages through the service and every write commits
 a `CommitDelta` the owner validates and publishes ([../pageservice/README.md](../pageservice/README.md)
 §7). Page reads are logical cost units, so rows, errors, plans, and costs must be unchanged across the

@@ -197,11 +197,13 @@ that the layer maps. The class is a stable category (api.md §7).
 
 **File locking is a host-layer duty, not a `BlockStore` method ([locking.md](locking.md)).**
 The host program layer joins the stable `<path>.lock/` coordination bundle **before the first content
-read**; the five-method byte seam remains lock-unaware. Each host declares a tier: `os-shared`
-(Rust/Go local files — whole-file `flock` on Unix, `LockFileEx` on Windows), `native-adapter-shared`
-(Node, only with the explicitly approved adapter), `inherent-exclusive` (OPFS sync access handle), or
-`unavailable` (wasm32-wasip1). Unsupported requested coordination fails closed `0A000`; there is no
-cooperative PID/mtime fallback. See locking.md §3/§7 for the normative five-lock protocol.
+read**; the five-method byte seam remains lock-unaware. What `locking = auto` selects is per host
+(locking.md §7.3): the **page service** on Unix local files (Rust/Go `flock`, and Node only with the
+explicitly approved adapter) — the `presence EX` holder owns the file and serves it to page clients;
+**exclusive** on Windows (`LockFileEx`, serving deferred) and on OPFS (the sync access handle is
+inherently exclusive); and **unavailable** on wasm32-wasip1 (only `none`). Unsupported requested
+coordination fails closed `0A000`; there is no cooperative PID/mtime fallback. See locking.md §3/§7
+for the normative bundle and ownership rules.
 
 ## 5. The OPFS host (the build target)
 
@@ -327,9 +329,10 @@ as it crosses. See the two docs for the full designs.
     (not portable yet); and **compaction** ([api.md](api.md) §2.6), which is `0A000` on OPFS until a
     crash-safe whole-file replace is designed for it (a sibling OPFS file plus a swap the engine can
     recover from — OPFS offers no atomic rename-over-existing contract the file host's recipe relies on).
-- **Shared multi-process file coordination** — ✅ **landed
-  ([locking.md](locking.md))**: the five-file OS-lock bundle, append-only contended commit,
-  and presence-EX uncontended lease run in Rust, Go, and Node. Rust/Go need no dependency; Node uses
+- **Multi-process file access** — ✅ **landed
+  ([locking.md](locking.md), [page-service.md](page-service.md))**: the `protocol-v2` lock bundle,
+  one `presence EX` owner, and the page service with handoff run in Rust, Go, and Node (it replaced
+  the earlier shared mode). Rust/Go need no dependency; Node uses
   the approved narrow `impl/ts/native-lock` adapter. Prebuilt-package matrix work remains.
 - **Encryption codec** — ⏳ design door ([encryption.md](encryption.md)); not built. Crypto is a
   §14 vetted-library decision requiring explicit confirmation before any dependency lands.

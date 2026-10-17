@@ -511,7 +511,7 @@ shape. Each cell below is the median of that statistic across the five retained 
 Every retained run produced checksum `ac02f0205c4f05c5`. Rust shared was **26.7% slower** than
 exclusive by the median mean (26.8% by p50), establishing the glibc/background-thread attribution
 before any INSERT optimization. The TypeScript tail is visibly GC-sensitive; timings remain
-observational. The Rust harness accepts benchmark-only `JED_BENCH_LOCKING=auto|shared|exclusive|none`
+observational. The Rust harness accepts benchmark-only `JED_BENCH_LOCKING=auto|exclusive|none`
 so later paired runs do not require source patches; absence keeps the normal `auto` default.
 
 A separate temporary Rust counting-allocator probe (removed after collection) bounded the same
@@ -780,7 +780,9 @@ gap is materially smaller, but the final 5% target is **not met**. The alone lea
 foreground coordination syscalls and zero per-transaction meta reads; the remaining difference is the
 Linux/glibc allocator-mode effect of having started the background join-probe thread. `locking=auto`
 therefore remains the safe shared default, while `locking=exclusive` remains the explicit
-single-process maximum-performance choice.
+single-process maximum-performance choice. (Historical: shared mode, its alone lease, and its join
+probe were later retired for the page service, where `locking=auto` makes a lone opener a
+page-service owner — [locking.md](locking.md) §1.)
 
 The final allocation/GC decision uses the isolated retained probes from Slices 3–4 rather than adding
 instrumentation to this timing run. Rust unique-dirty mutation removes 89.0% of allocator calls and
@@ -1124,7 +1126,7 @@ bench-<engine> <corpus_dir> <data_dir> <out_path> [name_filter_substring]
 bench-setup    <corpus_dir> <data_dir> [--engine jed|sqlite|pg|all] [--force]
 ```
 
-The Rust jed harness additionally accepts `JED_BENCH_LOCKING=auto|shared|exclusive|none` for paired
+The Rust jed harness additionally accepts `JED_BENCH_LOCKING=auto|exclusive|none` for paired
 coordination attribution. It is benchmark-only and absent by default, so normal runs exercise the
 public API's `auto` default.
 
@@ -1653,7 +1655,7 @@ timed loop returns a checksum; the run fails if any engine or pairing disagrees.
 
 | Lane | What it measures |
 |---|---|
-| `alone_*` | the shared-mode alone fast path (`locking = auto`), the baseline |
+| `alone_*` | a non-serving owner (`locking = exclusive`), the baseline (shared mode's alone fast path until its retirement) |
 | `owner_*` | a page-service owner with no client: the alone-owner fast path, which must match `alone_*` |
 | `client_cold_scan` / `client_cold_lookup` | a freshly opened page client's first reads: every leaf it touches is fetched with `read_pages` |
 | `client_warm_scan` / `client_warm_lookup` | the same reads with the client's buffer pool warm: one `begin_read` round trip per query |

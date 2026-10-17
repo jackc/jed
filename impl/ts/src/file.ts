@@ -50,22 +50,23 @@ import { type Ownership, ServiceHandoff } from "./pageservice/handoff.ts";
 // handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one (§7).
 export type DatabaseOptions = { pageSize?: number; noSync?: boolean; environment?: Environment };
 
-// CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1/§2.1.1). path
-// selects the backing: absent → an in-memory database (never touches the filesystem); present → a
-// single file at that path (58P02 if it already exists). It is a genuine optional, not an overloaded
-// empty-string sentinel (api.md §2.1). pageSize (absent/0 → DEFAULT_PAGE_SIZE) is locked into a file's
-// meta at creation and fixes an in-memory database's tree fan-out (the page-backed B-tree's fan-out
-// tracks the page size), so it is meaningful for both backings.
-// skipFsync turns off the per-commit fsync for this handle (the fsync=off host setting, api.md §2.1):
-// commits write identical bytes in the same order but skip the fdatasync barrier. DEV/TESTING ONLY —
-// durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database (no
-// path) which never fsyncs. Byte/cost/result-neutral; default false.
-// "service" is the TEST-ONLY page-service mode (spec/design/page-service.md §16): the opener becomes the
-// owner when it can take presence EX, otherwise a page client of the owner (read-only exactly when the
-// handle is opened read-only). It exists until
-// the page service's handoff phase replaces shared mode; never mix it with shared or exclusive openers
-// of one database. Unix only (0A000 elsewhere).
-export type Locking = "auto" | "shared" | "exclusive" | "none" | "service";
+// CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1/§2.1.1).
+// path selects the backing: absent → an in-memory database (never touches the filesystem); present
+// → a single file at that path (58P02 if it already exists). It is a genuine optional, not an
+// overloaded empty-string sentinel (api.md §2.1). pageSize (absent/0 → DEFAULT_PAGE_SIZE) is locked
+// into a file's meta at creation and fixes an in-memory database's tree fan-out (the page-backed
+// B-tree's fan-out tracks the page size), so it is meaningful for both backings.
+// skipFsync turns off the per-commit fsync for this handle (the fsync=off host setting, api.md
+// §2.1): commits write identical bytes in the same order but skip the fdatasync barrier.
+// DEV/TESTING ONLY — durable across a process crash, not an OS crash / power loss. Ignored for an
+// in-memory database (no path) which never fsyncs. Byte/cost/result-neutral; default false.
+// Locking selects how a file database coordinates with other processes (spec/design/locking.md,
+// page-service.md): "auto" (the default) is the page service — the opener that takes presence EX
+// owns the file and serves it, every other opener is its page client (read-only exactly when the
+// handle is opened read-only) — where the host can serve (Unix), and a non-serving owner elsewhere;
+// "exclusive" is a non-serving owner (a second opener waits, then fails 55006); "none" skips
+// coordination (an unsafe escape hatch).
+export type Locking = "auto" | "exclusive" | "none";
 
 export type CreateOptions = {
   path?: string;
@@ -180,13 +181,14 @@ export type OpenOptions = {
   // idleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write
   // transactions (spec/design/page-service.md §11.1): a client holding the writer gate that sends
   // nothing for this long is revoked (25P03 at its next request). Absent is the 60 s default; 0
-  // disables it. Only `locking = "service"` reads it.
+  // disables it. Only the page service (`locking = "auto"`) reads it.
   idleInTransactionTimeoutMs?: number;
   // idleSessionTimeoutMs closes a page-service connection idle between transactions for this long
-  // (page-service.md §11.1); absent or 0 never does. yieldGraceMs and shutdownGraceMs are how long a
-  // yielding or closing owner lets running transactions finish (absent: 5 s and 30 s). maxConnections
-  // bounds an owner's connections (53300 beyond it); absent or 0 is unlimited. Only `locking =
-  // "service"` reads them, as an owner's limits; a client keeps them for the day it becomes owner.
+  // (page-service.md §11.1); absent or 0 never does. yieldGraceMs and shutdownGraceMs are how long
+  // a yielding or closing owner lets running transactions finish (absent: 5 s and 30 s).
+  // maxConnections bounds an owner's connections (53300 beyond it); absent or 0 is unlimited. Only
+  // the page service (`locking = "auto"`) reads them, as an owner's limits; a client keeps them for
+  // the day it becomes owner.
   idleSessionTimeoutMs?: number;
   yieldGraceMs?: number;
   shutdownGraceMs?: number;
@@ -194,7 +196,8 @@ export type OpenOptions = {
   // ownership is the opener's ownership preference under the page service (page-service.md §8.2):
   // "prefer" (the default) becomes owner when the database is free and asks a yielding owner to
   // yield; "yield" hands ownership to a prefer requester (for tools); "never" never owns (an open with
-  // no owner fails 55006, and a client never promotes). Only `locking = "service"` reads it.
+  // no owner fails 55006, and a client never promotes). Only the page service (`locking = "auto"`)
+  // reads it.
   ownership?: Ownership;
   // The handle's Environment (spec/design/environment.md): the file's referenced collations, zones,
   // and host functions resolve against it at open, and it supplies the random + clock sources. A
@@ -257,28 +260,19 @@ export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): 
 // module (it stays browser-clean). The OPFS host registers its own. Read-only opens the file O_RDONLY.
 // The file opens through main's file host (null is the OS), so the simulated filesystem serves
 // attachments too.
+//
+// A file attachment is a non-serving owner of its file until attachments join the page service
+// (page-service.md §5.5): another process holding the file makes the attach wait, then fail 55006.
 registerFileAttachOpener((source, readOnly, files, environment) => {
   const path = source.path!;
-  if (source.locking === "service") {
-    // Attachments join the page service with its write path (page-service.md §16 phase 3).
-    throw engineError(
-      "feature_not_supported",
-      "file attachments do not support the page service yet",
-    );
-  }
-  const coordinator = FileCoordinator.open(path, source.locking, source.fileLockTimeoutMs);
+  const locking = resolvedLocking(source.locking) === "none" ? "none" : "exclusive";
+  const coordinator = FileCoordinator.open(path, locking, source.fileLockTimeoutMs);
   try {
-    coordinator?.lockCommitShared();
-    let engine: Engine;
-    try {
-      engine = openVia(files ?? osFiles, coordinator?.path ?? path, {
-        readOnly,
-        locking: "none",
-        environment,
-      });
-    } finally {
-      coordinator?.unlockCommit();
-    }
+    const engine = openVia(files ?? osFiles, coordinator?.path ?? path, {
+      readOnly,
+      locking: "none",
+      environment,
+    });
     return { engine, coordinator };
   } catch (error) {
     coordinator?.close();
@@ -472,10 +466,9 @@ export function createDatabase(opts: CreateOptions = {}): Database {
         environment: opts.environment,
       });
       engine.storageBudget.limit = maxStorageBytes;
-      if (opts.locking === "service") {
+      if (coordinator?.serving === true) {
         // The creator is the owner (README §6.1); its handle keeps the path claim across roles.
-        coordinator!.keepPathClaim();
-        const path = coordinator!.path;
+        const path = coordinator.path;
         const environment = engine.environment;
         const handoff = new ServiceHandoff(
           path,
@@ -486,7 +479,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
           environment,
           () => open(path, { skipFsync: opts.skipFsync, environment, locking: "none" }),
         );
-        return startServiceOwner(engine, coordinator!, handoff);
+        return startServiceOwner(engine, coordinator, handoff);
       }
       return Database.fromEngine(engine, coordinator);
     } catch (error) {
@@ -501,16 +494,11 @@ export function createDatabase(opts: CreateOptions = {}): Database {
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
 // the host Database handle with its default session (the back-compat bridge, spec/design/session.md §2.4).
 export function openDatabase(path: string, opts: OpenOptions = {}): Database {
-  if (opts.locking === "service") return openServiceDatabase(path, opts);
-  const coordinator = FileCoordinator.open(path, opts.locking, opts.fileLockTimeoutMs);
+  const locking = resolvedLocking(opts.locking);
+  if (locking === "auto") return openServiceDatabase(path, opts);
+  const coordinator = FileCoordinator.open(path, locking, opts.fileLockTimeoutMs);
   try {
-    coordinator?.lockCommitShared();
-    let engine: Engine;
-    try {
-      engine = open(coordinator?.path ?? path, { ...opts, locking: "none" });
-    } finally {
-      coordinator?.unlockCommit();
-    }
+    const engine = open(coordinator?.path ?? path, { ...opts, locking: "none" });
     return Database.fromEngine(engine, coordinator);
   } catch (error) {
     coordinator?.close();
@@ -518,10 +506,10 @@ export function openDatabase(path: string, opts: OpenOptions = {}): Database {
   }
 }
 
-// openServiceDatabase opens path under the test-only `locking = service` (spec/pageservice/README.md
-// §6.1): as the serving owner when the election takes presence EX, otherwise as a page client.
+// openServiceDatabase opens path under the page service (`locking = "auto"`,
+// spec/pageservice/README.md §6.1): as the serving owner when the election takes presence EX,
+// otherwise as a page client.
 function openServiceDatabase(path: string, opts: OpenOptions): Database {
-  resolvedLocking("service");
   const real = canonicalOpenPath(path);
   const environment = opts.environment ?? new Environment();
   const handoff = new ServiceHandoff(

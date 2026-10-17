@@ -334,15 +334,14 @@ pub extern "C" fn jed_open_memory() -> *mut u8 {
 }
 
 /// Decode the host's `locking` byte into the cross-process coordination mode (spec/design/locking.md
-/// §7.1): `0` auto, `1` shared, `2` exclusive, `3` none; anything else is `22023`. The wrap applies
-/// no default of its own — the caller states the mode. On `wasm32-wasip1` file locking is
-/// unavailable (locking.md §7.3), so `auto`/`shared`/`exclusive` fail `0A000` at open/create and only
+/// §7.1): `0` auto, `2` exclusive, `3` none; anything else (including `1`, the retired shared mode) is
+/// `22023`. The wrap applies no default of its own — the caller states the mode. On `wasm32-wasip1`
+/// file locking is unavailable (locking.md §7.3), so `auto`/`exclusive` fail `0A000` at open/create and only
 /// `none` proceeds; a host may pass `3` only when it coordinates access to the file itself (e.g. a
 /// single-process benchmark that owns its data files).
 fn locking_mode(b: u8) -> Result<Locking, *mut u8> {
     match b {
         0 => Ok(Locking::Auto),
-        1 => Ok(Locking::Shared),
         2 => Ok(Locking::Exclusive),
         3 => Ok(Locking::None),
         _ => Err(err_buf("22023", &format!("invalid locking mode {b}"))),

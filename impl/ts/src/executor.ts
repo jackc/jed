@@ -258,7 +258,6 @@ import {
 import {
   commitDurableAttachment,
   adoptStaged,
-  persistSharedBody,
   type StagedCommit,
   stageInMemory,
   stageTemp,
@@ -3541,28 +3540,9 @@ export class Engine {
           ws.txid = (this.attachedCommitted.get(name)?.txid ?? 0n) + 1n; // alternating meta slot + reopen
           if (prev === undefined) throw new Error("an attached file has a committed root");
           const budget = { name, prev, canCompact, stagesRows };
-          if (att.coordinator?.state === "shared") {
-            let bodyWritten = false;
-            try {
-              const pending = persistSharedBody(att.storage, ws, budget);
-              bodyWritten = true;
-              att.coordinator.lockCommitExclusive();
-              try {
-                pending.publishMeta();
-              } finally {
-                att.coordinator.unlockCommit();
-              }
-              ws.demoteCleanLeaves();
-            } catch (error) {
-              if (bodyWritten || att.storage.paging?.commitRequiresReopen())
-                att.coordinator.state = "poisoned";
-              throw error;
-            }
-          } else {
-            // A local reader pins every attached root, so reuse is safe only after that common
-            // watermark drains.
-            commitDurableAttachment(att.storage, ws, canReclaim, canReclaim, budget);
-          }
+          // A local reader pins every attached root, so reuse is safe only after that common
+          // watermark drains.
+          commitDurableAttachment(att.storage, ws, canReclaim, canReclaim, budget);
         } else {
           // The budget's forced compaction rebuilds the free list from the attachment's committed
           // root (memory.md §8.3).

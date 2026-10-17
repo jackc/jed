@@ -20,9 +20,8 @@ import { persistImpl } from "../persist.ts";
 import { Environment } from "../environment.ts";
 import { type ClockSource, osRandomSource, type RandomSource, SeededRandom } from "../seam.ts";
 import { attachFile, Database, type Session } from "../shared.ts";
-import { FileCoordinator } from "../coordinator.ts";
 import { CheckError, checkImage, checkLive as checkLiveDatabase } from "./check.ts";
-import { SimDeadlock, SimLockHost, SimLockTable } from "./locks.ts";
+import { SimDeadlock, type SimLockHost, type SimLockTable } from "./locks.ts";
 import { LANE_SESSION, MAIN_FILE, SimFS, type SimFault } from "./disk.ts";
 import {
   atoi,
@@ -452,7 +451,7 @@ export class SimRunner {
   private sessions = new Map<string, SimSession>();
 
   // Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
-  // coordination; a `# processes: shared` trace opens every process with shared locking.
+  // coordination. Multi-process traces are unsupported until they return with the page service.
   private shared: boolean;
   private procs = new Map<number, SimProc>();
   private cur = 0; // the process running the current step
@@ -492,7 +491,9 @@ export class SimRunner {
     let sector = atoi(tr.header.get("sector"));
     if (sector <= 0) sector = SECTOR_DEFAULT;
     this.fs = new SimFS(this.seed, sector, ps);
-    this.shared = tr.header.get("processes") === "shared";
+    // Multi-process traces return with the page service (simulation-testing.md); run() rejects
+    // them.
+    this.shared = false;
   }
 
   private fail(step: number, msg: string): void {
@@ -548,63 +549,15 @@ export class SimRunner {
     this.database.attach(name, attachFile(this.dbs.get(name)!.file, { locking: "none" }), false);
   }
 
-  // openProc starts process pid. A shared trace acquires the file coordinator through the simulated
-  // lock host first, exactly as openDatabase does through the OS host.
+  // openProc starts process pid.
   private openProc(pid: number): void {
-    let coord: FileCoordinator | null = null;
-    let host: SimLockHost | null = null;
-    if (this.shared) {
-      if (this.locks === null) {
-        this.locks = new SimLockTable(
-          {
-            get: () => this.clock,
-            advance: (micros) => {
-              this.clock += micros;
-            },
-          },
-          (p) => this.procBusy(p),
-        );
-      }
-      const locks = this.locks;
-      host = new SimLockHost(locks, pid);
-      try {
-        coord = FileCoordinator.acquire(host, MAIN_FILE, "shared");
-      } catch (e) {
-        locks.release(pid);
-        throw e;
-      }
-      try {
-        coord.lockCommitShared();
-      } catch (e) {
-        coord.close();
-        locks.release(pid);
-        throw e;
-      }
-    }
-    let db: Database;
-    try {
-      db = this.openDatabase(coord);
-    } catch (e) {
-      if (coord !== null) {
-        coord.unlockCommit();
-        coord.close();
-        this.locks!.release(pid);
-      }
-      throw e;
-    }
-    this.procs.set(pid, { pid, db, host });
+    const db = this.openDatabase();
+    this.procs.set(pid, { pid, db, host: null });
     this.cur = pid;
     this.db = db;
   }
 
-  // procBusy reports whether pid's presence probe would block: it takes the process's own writer
-  // gate, which an open write session holds.
-  private procBusy(pid: number): boolean {
-    for (const ss of this.sessions.values()) if (ss.pid === pid && ss.write) return true;
-    return false;
-  }
-
-  private openDatabase(coord: FileCoordinator | null): Database {
+  private openDatabase(): Database {
     const main = this.fs.main();
     if (main === undefined) throw engineError("io_error", "the database file is gone");
     const pager = Pager.fromStore(main);
@@ -619,13 +572,17 @@ export class SimRunner {
     e.persistHook = persistImpl;
     // Spill and temp-table spill scratch files, whose operations can fail.
     e.spillSink = this.fs.spillSink();
-    coord?.unlockCommit();
-    const db = Database.fromEngine(e, coord);
+    const db = Database.fromEngine(e, null);
     if (this.maxStorageBytes > 0n) db.setMaxStorageBytes("main", this.maxStorageBytes);
     return db;
   }
 
   run(): void {
+    const processes = this.tr.header.get("processes");
+    if (processes !== undefined && processes !== "") {
+      this.violation = `unsupported processes mode ${processes}`;
+      return;
+    }
     // Create the database through the simulated filesystem, as the host's create does: a temp file,
     // its sync, the rename, and the directory barrier (S4).
     try {
@@ -700,7 +657,6 @@ export class SimRunner {
         this.emit(`{"i":${i},"op":"clock"}`);
         return true;
       case "tick":
-        this.locks?.runProbes(-1);
         this.emit(`{"i":${i},"op":"tick"}`);
         return true;
       case "exit": {
@@ -1001,8 +957,7 @@ export class SimRunner {
   }
 
   // quiet reports whether the commit being checked ran with nothing that may hold reclamation back: no
-  // other session (a reader pins its snapshot), no other process (co-resident commits are
-  // append-only), and no fault.
+  // other session (a reader pins its snapshot), no other process, and no fault.
   private quiet(): boolean {
     return !this.shared && this.sessions.size === 0 && this.fs.fault === null;
   }

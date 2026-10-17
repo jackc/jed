@@ -6,7 +6,7 @@ requires = ["file.page_service"]
 [[step]]
 actor = "a"
 command = "start"
-argument = "create-service"
+argument = "create"
 
 [[step]]
 actor = "a"
@@ -16,7 +16,7 @@ sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
 [[step]]
 actor = "b"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 [[step]]
 actor = "b"
@@ -55,7 +55,7 @@ command = "close"
 [[step]]
 actor = "b"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 [[step]]
 actor = "b"

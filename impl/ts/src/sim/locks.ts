@@ -1,9 +1,10 @@
 // The deterministic-simulation lock host (spec/design/simulation-testing.md §14 S5), a port of the
-// Go runner's sim_locks_test.go: simulated processes sharing one table of whole-file locks, standing
-// in for the OS host (coordinator.ts osLocks). A process that dies loses its locks at once, as the
-// kernel releases a dead process's locks. A contended acquisition never blocks the single simulation
-// thread: each poll runs the other processes' presence probes and advances the simulated clock, so
-// the holder can react and deadlines expire in simulated time.
+// Go runner's sim_locks_test.go: simulated processes sharing one table of whole-file locks,
+// standing in for the OS host (coordinator.ts osLocks). A process that dies loses its locks at
+// once, as the kernel releases a dead process's locks. A contended acquisition never blocks the
+// single simulation thread: each poll advances the simulated clock, so deadlines expire in
+// simulated time. No trace uses it while multi-process traces are unsupported (they return with the
+// page service, simulation-testing.md).
 
 import type { LockFiles, LockHandle, LockHost } from "../lockhost.ts";
 
@@ -16,32 +17,16 @@ export class SimDeadlock extends Error {}
 // SimLockTable is the kernel's view of every bundle lock: lock name → holding process → exclusive.
 export class SimLockTable {
   holders = new Map<string, Map<number, boolean>>();
-  probes = new Map<number, () => void>(); // each live process's presence probe
   polls = 0;
   private clock: { get(): bigint; advance(micros: bigint): void };
-  private busy: (pid: number) => boolean; // whether a process's probe would block (writer gate held)
 
-  constructor(
-    clock: { get(): bigint; advance(micros: bigint): void },
-    busy: (pid: number) => boolean,
-  ) {
+  constructor(clock: { get(): bigint; advance(micros: bigint): void }) {
     this.clock = clock;
-    this.busy = busy;
   }
 
-  // release drops every lock pid holds and forgets its probe: the process is gone.
+  // release drops every lock pid holds: the process is gone.
   release(pid: number): void {
     for (const h of this.holders.values()) h.delete(pid);
-    this.probes.delete(pid);
-  }
-
-  // runProbes runs every live process's probe except skip's, in process order.
-  runProbes(skip: number): void {
-    const pids = [...this.probes.keys()].sort((a, b) => a - b);
-    for (const pid of pids) {
-      const probe = this.probes.get(pid);
-      if (pid !== skip && probe !== undefined && !this.busy(pid)) probe();
-    }
   }
 
   nowMicros(): number {
@@ -75,13 +60,7 @@ export class SimLockHost implements LockHost {
   }
 
   openBundle(_path: string): LockFiles {
-    return {
-      presence: "presence",
-      arrival: "arrival",
-      transition: "transition",
-      writer: "writer",
-      commit: "commit",
-    };
+    return { presence: "presence", arrival: "arrival" };
   }
 
   validateMarker(_path: string): void {}
@@ -123,14 +102,7 @@ export class SimLockHost implements LockHost {
         `simulated deadlock: process p${this.pidNum} waited ${t.polls} polls for a lock`,
       );
     }
-    t.runProbes(this.pidNum);
     t.advance();
-  }
-
-  startProbe(tick: () => void): () => void {
-    this.table.probes.set(this.pidNum, tick);
-    // The runner forgets the probe when the process ends (SimLockTable.release), as Go's does.
-    return () => {};
   }
 
   pid(): number {

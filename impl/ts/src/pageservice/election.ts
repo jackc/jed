@@ -1,4 +1,4 @@
-// Election under the test-only `locking = service` (spec/design/page-service.md §4.3,
+// Election under the page service, `locking = "auto"` (spec/design/page-service.md §4.3,
 // spec/pageservice/README.md §6.1, §6.5): the opener that takes presence EX owns the database and
 // serves it; every other opener connects to the owner's endpoint as a page client (read-only exactly
 // when the opener asked for a read-only handle). A client whose connection ends runs the same election

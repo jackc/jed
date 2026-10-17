@@ -1,7 +1,7 @@
 schema_version = 1
 name = "validated-cow-serialization-error"
-description = "Serialization errors leave exclusive/shared writers and file attachments usable; failed explicit commits discard already encoded dirty rows."
-requires = ["file.shared_process"]
+description = "Serialization errors leave exclusive writers, page-service owners and clients, and file attachments usable; failed explicit commits discard already encoded dirty rows."
+requires = ["file.page_service"]
 fixture = "fileformat/fixtures/cow_inline.jed"
 byte_identical = true
 
@@ -124,6 +124,11 @@ expect = "1:24"
 actor = "a"
 command = "close"
 
+# A file attachment owns its file: no other process may hold it.
+[[step]]
+actor = "b"
+command = "close"
+
 [[step]]
 actor = "a"
 command = "start"
@@ -148,17 +153,7 @@ command = "exec"
 sql = "UPDATE aux.t SET v = 25 WHERE id = 1"
 
 [[step]]
-actor = "b"
-command = "query_i64"
-sql = "SELECT id, v FROM t ORDER BY id"
-expect = "1:25"
-
-[[step]]
 actor = "a"
-command = "close"
-
-[[step]]
-actor = "b"
 command = "close"
 
 [[step]]

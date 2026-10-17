@@ -1,4 +1,4 @@
-//! Election under the test-only `Locking::Service` (spec/pageservice/README.md §6.1, §6.5): the
+//! Election under the page service (`Locking::Auto`; spec/pageservice/README.md §6.1, §6.5): the
 //! opener that takes presence EX owns the database and serves it; every other opener connects to
 //! the owner's endpoint as a page client. A client whose connection ends runs the same election
 //! again (re-election). The OS lock is the only authority — the owner record only tells a client

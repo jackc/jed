@@ -1,5 +1,8 @@
-// Stable Node file coordination (spec/design/locking.md). Database bytes are never the lock
-// identity: five persistent empty files beside the database carry crash-clean whole-file OS locks.
+// Node file coordination (spec/design/locking.md). Database bytes are never the lock identity:
+// persistent empty files in a bundle beside the database carry crash-clean whole-file OS locks.
+// presence EX is ownership: a page-service owner (spec/design/page-service.md §4.1), an exclusive
+// opener, or a file attachment holds it for its whole tenure; arrival SH guards the protocol-marker
+// check.
 
 import {
   lstatSync,
@@ -17,10 +20,23 @@ import process from "node:process";
 import { engineError } from "./errors.ts";
 import type { Locking } from "./file.ts";
 import type { LockFiles, LockHandle, LockHost } from "./lockhost.ts";
-import type { FileCoordinatorHost, LeaseState } from "./session.ts";
+import {
+  currentUid,
+  newIncarnation,
+  ownerRecordPath,
+  pageServiceSupported,
+  readOwnerRecord,
+  removeQuietly,
+  writeOwnerRecord,
+} from "./pageservice/endpoint.ts";
+import type { FileCoordinatorHost } from "./session.ts";
 
-const PROTOCOL_MARKER = "protocol-v1";
-const LOCK_NAMES = ["presence", "arrival", "transition", "writer", "commit"] as const;
+// PROTOCOL_MARKER names the bundle's protocol: v2 is presence ownership under the page service.
+// LEGACY_PROTOCOL_MARKER (shared mode) may remain in an existing bundle, with its unused lock
+// files; a v1 binary rejects the v2 marker, so the two never run on one file (page-service.md §12).
+const PROTOCOL_MARKER = "protocol-v2";
+const LEGACY_PROTOCOL_MARKER = "protocol-v1";
+const LOCK_NAMES = ["presence", "arrival"] as const;
 const DEFAULT_FILE_LOCK_TIMEOUT_MS = 5000;
 const RETRY_MS = 2;
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
@@ -52,7 +68,7 @@ function native(): NativeBinding {
   if (nativeBinding === null) {
     throw engineError(
       "feature_not_supported",
-      "Node shared file locking needs the matching first-party jed_lock native artifact",
+      "Node file locking needs the matching first-party jed_lock native artifact",
     );
   }
   return nativeBinding;
@@ -104,7 +120,11 @@ function validateProtocol(path: string): void {
     ioError("read coordination directory", error);
   }
   for (const entry of entries) {
-    if (entry.startsWith("protocol-v") && entry !== PROTOCOL_MARKER) {
+    if (
+      entry.startsWith("protocol-v") &&
+      entry !== PROTOCOL_MARKER &&
+      entry !== LEGACY_PROTOCOL_MARKER
+    ) {
       throw engineError(
         "feature_not_supported",
         `unsupported coordination protocol marker ${entry}; supported: ${PROTOCOL_MARKER}`,
@@ -145,20 +165,13 @@ function openBundle(path: string): LockFiles {
   return opened as LockFiles;
 }
 
+// resolvedLocking resolves a locking mode: "auto" is the page service where the host can serve
+// (page-service.md §14), otherwise a non-serving owner ("exclusive"). Unsupported OS locks fail
+// 0A000 when the bundle's native locks are first loaded.
 export function resolvedLocking(mode: Locking | undefined): Locking {
   const value = mode ?? "auto";
-  if (value === "auto") return "shared";
-  if (value === "shared" || value === "exclusive" || value === "none") return value;
-  if (value === "service") {
-    // The test-only page-service mode (spec/design/page-service.md §16): Unix only (README §5.2).
-    if (process.platform === "win32" || typeof process.geteuid !== "function") {
-      throw engineError(
-        "feature_not_supported",
-        `the page service is unavailable on ${process.platform}`,
-      );
-    }
-    return value;
-  }
+  if (value === "auto") return pageServiceSupported() ? "auto" : "exclusive";
+  if (value === "exclusive" || value === "none") return value;
   throw engineError("feature_not_supported", `unknown file locking mode: ${String(value)}`);
 }
 
@@ -173,8 +186,8 @@ export function timeoutValue(value: number | undefined): number {
   return timeout;
 }
 
-// osLocks is the production coordination host: the native whole-file locks, the monotonic clock, a
-// RETRY_MS sleep between polls, and a one-second unref'd probe timer.
+// osLocks is the production coordination host: the native whole-file locks, the monotonic clock,
+// and a RETRY_MS sleep between polls.
 export const osLocks: LockHost = {
   claimPath(path: string): boolean {
     if (openPaths.has(path)) return false;
@@ -209,11 +222,6 @@ export const osLocks: LockHost = {
   },
   pause(): void {
     sleep(RETRY_MS);
-  },
-  startProbe(tick: () => void): () => void {
-    const probe = setInterval(tick, 1000);
-    probe.unref();
-    return () => clearInterval(probe);
   },
   pid(): number {
     return process.pid;
@@ -276,38 +284,49 @@ function canonicalCreatePath(path: string): string {
 
 export class FileCoordinator implements FileCoordinatorHost {
   readonly path: string;
-  state: LeaseState;
+  // serving is true for a page-service owner's coordinator, false for a non-serving owner (an
+  // exclusive opener or a file attachment).
+  readonly serving: boolean;
   private readonly host: LockHost;
   private readonly files: LockFiles;
   private readonly openerPid: number;
-  private stopProbe: (() => void) | null = null;
   private closed = false;
   // keepPath leaves the process-local path claim at close: a page-service owner's claim belongs to its
   // handle, which keeps the path through role changes (spec/pageservice/README.md §6.5).
   private keepPath = false;
+  // record is set when this coordinator wrote a non-serving owner record, removed at close
+  // (spec/pageservice/README.md §5.1).
+  private record = false;
 
-  private constructor(host: LockHost, path: string, files: LockFiles, state: LeaseState) {
+  private constructor(host: LockHost, path: string, files: LockFiles, serving: boolean) {
     this.host = host;
     this.path = path;
     this.files = files;
-    this.state = state;
+    this.serving = serving;
     this.openerPid = host.pid();
   }
 
+  // open takes ownership of the existing database at path as a non-serving owner ("exclusive");
+  // "auto" opens go through the page-service election instead (file.ts).
   static open(path: string, mode?: Locking, fileLockTimeoutMs?: number): FileCoordinator | null {
     const locking = resolvedLocking(mode);
     if (locking === "none") return null;
     return FileCoordinator.acquire(osLocks, canonicalOpenPath(path), locking, fileLockTimeoutMs);
   }
 
+  // create takes ownership of the database about to be created at path: a serving owner under
+  // "auto", a non-serving owner under "exclusive".
   static create(path: string, mode?: Locking, fileLockTimeoutMs?: number): FileCoordinator | null {
     const locking = resolvedLocking(mode);
     if (locking === "none") return null;
     return FileCoordinator.acquire(osLocks, canonicalCreatePath(path), locking, fileLockTimeoutMs);
   }
 
-  // acquire joins the coordination protocol for the (already canonical) path through host: arrival
-  // SH, then presence EX (alone or exclusive) or SH (shared) under transition EX (locking.md §4).
+  // acquire takes presence EX for the (already canonical) path through host with the exclusive
+  // acquisition loop — arrival SH while the marker is checked, then presence EX until the open
+  // timeout (55006). Mode "exclusive" (an exclusive opener or a file attachment) writes a
+  // non-serving owner record, so a page-service opener words its timeout as "owned by a non-serving
+  // process"; mode "auto" is a page-service creator, which writes its own record when it serves.
   static acquire(
     host: LockHost,
     path: string,
@@ -325,35 +344,23 @@ export class FileCoordinator implements FileCoordinatorHost {
       files = host.openBundle(path);
       const deadline = host.nowMicros() + timeoutValue(timeoutOption) * 1000;
       lockUntil(host, files.arrival, false, deadline, path, false);
-      host.validateMarker(path);
-      let state: LeaseState;
-      // Creating under the page service takes presence EX like exclusive: the creator is the owner.
-      if (mode === "exclusive" || mode === "service") {
-        for (;;) {
-          lockUntil(host, files.transition, true, deadline, path, false);
-          const alone = host.tryLock(files.presence, true);
-          host.unlock(files.transition);
-          if (alone) {
-            state = "exclusive";
-            break;
-          }
-          if (host.nowMicros() >= deadline) {
-            throw engineError("object_in_use", `database file is in use: ${path}`);
-          }
-          host.pause();
+      try {
+        host.validateMarker(path);
+        try {
+          lockUntil(host, files.presence, true, deadline, path, false);
+        } catch (error) {
+          const reason = host === osLocks ? ownerReason(path) : "";
+          if (reason === "") throw error;
+          throw engineError("object_in_use", `database file is in use: ${path} (${reason})`);
         }
-      } else {
-        lockUntil(host, files.transition, true, deadline, path, false);
-        const alone = host.tryLock(files.presence, true);
-        host.unlock(files.transition);
-        if (alone) state = "alone";
-        else {
-          lockUntil(host, files.presence, false, deadline, path, false);
-          state = "shared";
-        }
+      } finally {
+        host.unlock(files.arrival);
       }
-      host.unlock(files.arrival);
-      return new FileCoordinator(host, path, files, state);
+      const coordinator = new FileCoordinator(host, path, files, mode !== "exclusive");
+      if (mode === "exclusive") {
+        if (host === osLocks) coordinator.writeRecord();
+      } else coordinator.keepPath = true;
+      return coordinator;
     } catch (error) {
       if (files !== null) host.closeFiles(files);
       host.releasePath(path);
@@ -361,18 +368,29 @@ export class FileCoordinator implements FileCoordinatorHost {
     }
   }
 
-  // fromElection wraps the bundle an elected page-service owner holds (presence EX, arrival released):
-  // it behaves as an exclusive lease — no join-window probe (spec/pageservice/README.md §6.1).
+  // fromElection wraps the bundle an elected page-service owner holds (presence EX, arrival
+  // released) (spec/pageservice/README.md §6.1).
   static fromElection(host: LockHost, path: string, files: LockFiles): FileCoordinator {
-    const coordinator = new FileCoordinator(host, path, files, "exclusive");
+    const coordinator = new FileCoordinator(host, path, files, true);
     coordinator.keepPath = true;
     return coordinator;
   }
 
-  // keepPathClaim makes close leave the process-local path claim (a page-service creator's handle
-  // releases it itself).
-  keepPathClaim(): void {
-    this.keepPath = true;
+  // writeRecord publishes a non-serving owner record (flags 0, empty endpoint; README §5.1). It is
+  // advisory — only the words of another opener's timeout depend on it — so a failure is ignored.
+  private writeRecord(): void {
+    try {
+      writeOwnerRecord(this.path, {
+        serving: false,
+        uid: currentUid(),
+        incarnation: newIncarnation(),
+        pid: process.pid,
+        endpoint: "",
+      });
+      this.record = true;
+    } catch {
+      // Advisory only.
+    }
   }
 
   checkPid(): void {
@@ -384,67 +402,22 @@ export class FileCoordinator implements FileCoordinatorHost {
     }
   }
 
-  startProbe(tick: () => void): void {
-    if (this.state === "exclusive" || this.stopProbe !== null) return;
-    this.stopProbe = this.host.startProbe(tick);
-  }
-
-  lockCommitShared(): void {
-    lockUntil(this.host, this.files.commit, false, null, this.path, false);
-  }
-
-  lockCommitExclusive(): void {
-    lockUntil(this.host, this.files.commit, true, null, this.path, false);
-  }
-
-  unlockCommit(): void {
-    this.host.unlock(this.files.commit);
-  }
-
-  lockWriter(timeoutMs: number): void {
-    const deadline = timeoutMs === 0 ? null : this.host.nowMicros() + timeoutMs * 1000;
-    lockUntil(this.host, this.files.writer, true, deadline, this.path, true);
-  }
-
-  unlockWriter(): void {
-    this.host.unlock(this.files.writer);
-  }
-
-  tryArrivalExclusive(): boolean {
-    return this.host.tryLock(this.files.arrival, true);
-  }
-
-  unlockArrival(): void {
-    this.host.unlock(this.files.arrival);
-  }
-
-  lockTransition(): void {
-    lockUntil(this.host, this.files.transition, true, null, this.path, false);
-  }
-
-  unlockTransition(): void {
-    this.host.unlock(this.files.transition);
-  }
-
-  downgradePresence(): void {
-    this.state = "shared";
-    this.host.unlock(this.files.presence);
-    lockUntil(this.host, this.files.presence, false, null, this.path, false);
-  }
-
-  tryUpgradePresence(): boolean {
-    this.host.unlock(this.files.presence);
-    if (this.host.tryLock(this.files.presence, true)) return true;
-    lockUntil(this.host, this.files.presence, false, null, this.path, false);
-    return false;
-  }
-
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    if (this.stopProbe !== null) this.stopProbe();
-    this.stopProbe = null;
+    if (this.record) removeQuietly(ownerRecordPath(this.path));
     this.host.closeFiles(this.files);
     if (!this.keepPath) this.host.releasePath(this.path);
   }
+}
+
+// ownerReason words why presence EX is held elsewhere, from the owner record: another user's
+// process or a non-serving one ("" when the record is absent or names a serving owner of this
+// user).
+function ownerReason(path: string): string {
+  const record = readOwnerRecord(path);
+  if (record === null) return "";
+  if (record.uid !== currentUid()) return "owned by another user's process";
+  if (!record.serving) return "owned by a non-serving process";
+  return "";
 }

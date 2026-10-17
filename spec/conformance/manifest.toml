@@ -1604,12 +1604,8 @@ description = "The jed_type_fields catalog relation (spec/design/introspection.m
 # of the profile's (transitive) capabilities.
 
 [[capability]]
-id = "file.shared_process"
-description = "Crash-clean shared multi-process access to one file (and independently coordinated file attachments): stable protocol-v1 lock bundle, one global writer with 55P03 timeout, immutable pinned snapshots, commit-gated meta refresh, append-only co-resident commits, and a zero-foreground-lock alone lease (spec/design/locking.md). Host/process conformance, not SQL corpus records."
-
-[[capability]]
 id = "file.page_service"
-description = "The page service's read and write paths under the test-only `locking = service` value (spec/design/page-service.md phases 2-3, spec/pageservice/README.md §6): election by presence EX, the owner record and same-user endpoint, hello/begin_read/read_pages/end_read, incarnation-scoped client cache invalidation, client pins in the owner's watermark, read-only connections on request (25006), the shared writer gate (55P03), the reuse grant, validated CommitDelta commits (08P01), owner maintenance commits, the idle-in-transaction timeout (25P03), commit_status resolution, and 08006 after the owner dies. Host/process conformance, not SQL corpus records."
+description = "Multi-process access through the page service (spec/design/page-service.md, spec/pageservice/README.md §6): the presence-only protocol-v2 lock bundle, election by presence EX, the owner record and same-user endpoint, hello/begin_read/read_pages/end_read, incarnation-scoped client cache invalidation, client pins in the owner's watermark, read-only connections on request (25006), the shared writer gate (55P03), the reuse grant, validated CommitDelta commits (08P01), owner maintenance commits, the idle-in-transaction timeout (25P03), commit_status resolution, and handoff — re-election with promotion, ownership preferences and yield, graceful close, the owner limits (53300) — plus exclusive (non-serving) owners and owner-only file attachments. Host/process conformance, not SQL corpus records."
 
 [[capability]]
 id = "storage.unparsable_definitions"

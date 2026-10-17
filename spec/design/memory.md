@@ -763,21 +763,21 @@ The handle gains one read-only **deterministic gauge**, `storage_bytes(name)`
 (Rust/Go/TS idiomatic spellings, like `resident_leaves`). It reports the measure
 the limit checks: §8.2's high-water for in-memory domains and §8.7's live pages for
 file-backed ones. It is neither RSS nor the file's length, so a host can watch
-growth against its limit before it is hit. A process sharing a file sees a peer's
-commits in the gauge once it begins its next transaction, which reloads the meta.
+growth against its limit before it is hit. Every process using a file sees one
+count: the owner's committed meta, which a page client's next transaction reads
+through the page service.
 
 ### 8.7 The file form
 
 > **Status: implemented (Q4c)** in all three cores, `format_version` 34.
 
 **Why not the high-water.** For a file-backed database, `page_count × page_size` is
-not deterministic under shared multi-process access. While another process is
-co-resident, commits are append-only (`free_list_head = 0`,
-[locking.md](locking.md)). Co-residence is detected by a background probe, so how
-much the file grows depends on timing that no single handle's operation sequence
-fixes. Within one process the high-water also depends on the reader watermark,
-which can defer free-list reuse. The file form therefore limits a different
-measure.
+not deterministic: it depends on the reader watermark, which can defer free-list
+reuse, and under the page service that watermark counts page clients' pins, whose
+releases reach the owner asynchronously. (When this measure was chosen, the larger
+source was the since-retired shared mode, whose co-resident processes committed
+append-only on probe timing; [locking.md](locking.md) §1.) The file form therefore
+limits a different measure.
 
 **Measure.**
 
@@ -790,23 +790,22 @@ catalog chain, every node of every table B+tree and B-tree/GIN index tree, every
 GiST R-tree page, and every overflow page of a live externalized value. It never
 counts the meta slots, free-list pages, commit-manifest pages, or dead pages. It is
 a function of the committed trees alone, so it does not depend on free-list reuse,
-the reader watermark, co-residence, or host compaction (which rewrites the file but
+the reader watermark, other processes, or host compaction (which rewrites the file but
 keeps every live page). It answers disk use, the need SQLite's `max_page_count` and
 PostgreSQL's `53100 disk_full` answer, but as a deterministic logical count.
 
 The file's length may exceed the measure by dead pages: up to roughly the live size
 again under periodic reclamation (§8.2's `2 × live` trigger), and more while a pinned
-reader defers reuse or while processes are co-resident and commits only append.
-Those dead pages are bounded by the work that wrote them, which `max_cost` and
-`lifetime_max_cost` meter, not by this limit. Reclamation resumes once the reader
-closes or one process is alone, and host compaction returns them
+reader (local, or a page client's) defers reuse. Those dead pages are bounded by
+the work that wrote them, which `max_cost` and `lifetime_max_cost` meter, not by
+this limit. Reclamation resumes once the reader closes, and host compaction returns
+them
 ([api.md](api.md) §2.6).
 
 **Persistence.** The exact count is stored at meta offset 56
-([format.md](../fileformat/format.md), `format_version` 34). Every commit by every
-process advances it, with or without a limit. Open reads it without walking the
-file, and a co-resident process reads its peer's count when it reloads the meta at
-transaction begin. A from-scratch image (create, host compaction) records all of
+([format.md](../fileformat/format.md), `format_version` 34). Every commit advances
+it, with or without a limit, including a page client's commit, which the owner
+writes. Open reads it without walking the file. A from-scratch image (create, host compaction) records all of
 its body pages. Old binaries cannot overlap the rollout: readers accept only the
 exact current version.
 
@@ -862,11 +861,11 @@ domains too, so a `54P06` in main or in a file attachment discards the whole
 transaction before any domain packs a page.
 
 **Determinism.** The trip point is a pure function of the sequence of operations:
-the count depends only on the committed trees, and the commit order of a shared
-file is serialized by its global writer lock. The real-process corpus pins this
-independence: one process alone and two co-resident processes with append-only
-commits trip at the same batch and report the same gauge, though the co-resident
-file grows to nearly twice the length (`process/storage_limit.process.toml`).
+the count depends only on the committed trees, and every commit to a file is
+serialized by its owner's writer gate. The real-process corpus pins this
+independence: one process alone and an owner and a page client alternating commits
+trip at the same batch and report the same gauge
+(`process/storage_limit.process.toml`).
 
 **Verification.** The Ruby reference ([verify.rb](../fileformat/verify.rb)) checks
 that every golden's stored count equals the pages its independent decoder reaches.
@@ -913,7 +912,7 @@ bounded overshoot of at most one extra page per resident leaf.
   non-growing commits under a lowered limit, a delete's immediate effect, an index
   build, and GiST pages; the harnesses re-apply main's limit after each disk-mode
   reopen. `process/storage_limit.process.toml` pins the same trip point alone and
-  co-resident. Per-core tests cover the open option, the persisted count across a
+  through an owner and a page client. Per-core tests cover the open option, the persisted count across a
   reopen, file attachments and their multi-root rejection, and a reachability
   recount across B-tree, GIN, GiST, overflow, drop, and compaction.
 - **Follow-ons:** bounding the interior skeleton and GiST tree under `cache_bytes`

@@ -28,10 +28,11 @@ Style (CLAUDE.md §10): **boring, explicit code over clever abstraction.**
   iteration; encoded keys are held as a binary string (byte == code unit) so the default
   string sort is exactly unsigned byte order (CLAUDE.md §8).
 - **Independent engine, narrow native Node lock host.** SQL, storage, types, execution, and file
-  bytes are TypeScript. Node's shared-file host loads the `jed_lock.node` artifact built from
+  bytes are TypeScript. Node's file host loads the `jed_lock.node` artifact built from
   `native-lock/` solely for
-  crash-clean whole-file OS locks because Node exposes no standard `flock`/`LockFileEx`; the alone
-  lease makes no foreground addon call. Browser/OPFS and in-memory paths do not import it.
+  crash-clean whole-file OS locks (presence ownership and arrival) because Node exposes no standard
+  `flock`/`LockFileEx`; queries make no foreground addon call. Browser/OPFS and in-memory paths do
+  not import it.
 
 ## Toolchain (no build step)
 

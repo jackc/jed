@@ -56,13 +56,12 @@ fn run() -> Result<(), EngineError> {
         .get("max_connections")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // create/open use the default locking (the page service); open-exclusive is a non-serving owner.
     let locking = match action.as_str() {
         "open-exclusive" => Locking::Exclusive,
-        // The test-only page-service mode (spec/design/page-service.md §16).
-        "create-service" | "open-service" | "open-service-read-only" => Locking::Service,
-        _ => Locking::Shared,
+        _ => Locking::Auto,
     };
-    let mut database = if action == "create" || action == "create-service" {
+    let mut database = if action == "create" {
         Database::create(CreateOptions {
             path: Some(path),
             locking,
@@ -82,7 +81,7 @@ fn run() -> Result<(), EngineError> {
                 locking,
                 file_lock_timeout_ms: timeout,
                 idle_in_transaction_timeout_ms: idle,
-                read_only: action == "open-service-read-only",
+                read_only: action == "open-read-only",
                 idle_session_timeout_ms: millis("idle_session"),
                 yield_grace_ms: millis("yield_grace"),
                 shutdown_grace_ms: millis("shutdown_grace"),
@@ -209,7 +208,7 @@ fn run() -> Result<(), EngineError> {
 }
 
 /// Serve `OWNER_OPEN <hex path>` / `OWNER_CLOSE` / `CLOSE`: own one database at a time under the
-/// test-only page-service mode, so another core's conformance harness can run queries as its client.
+/// page service, so another core's conformance harness can run queries as its client.
 fn owner_idle(root: &std::path::Path) -> Result<(), EngineError> {
     let environment = owner_environment(root)?;
     println!("READY");
@@ -223,7 +222,7 @@ fn owner_idle(root: &std::path::Path) -> Result<(), EngineError> {
                 Database::open_with_options(
                     path,
                     OpenOptions {
-                        locking: Locking::Service,
+                        locking: Locking::Auto,
                         skip_fsync: true,
                         file_lock_timeout_ms: 5000,
                         environment: environment.clone(),

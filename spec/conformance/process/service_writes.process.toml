@@ -6,7 +6,7 @@ requires = ["file.page_service"]
 [[step]]
 actor = "a"
 command = "start"
-argument = "create-service"
+argument = "create"
 
 [[step]]
 actor = "a"
@@ -16,7 +16,7 @@ sql = "CREATE TABLE t (id i64 PRIMARY KEY, v text)"
 [[step]]
 actor = "b"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 # A client's autocommit write is a CommitDelta the owner validates, writes, and publishes.
 [[step]]
@@ -98,7 +98,7 @@ expect = "900"
 [[step]]
 actor = "c"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 [[step]]
 actor = "c"

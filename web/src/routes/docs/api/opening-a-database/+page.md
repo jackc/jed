@@ -53,17 +53,23 @@ The stored text is never changed, so the newer jed reads the original definition
 
 ## Sharing a file between processes
 
-Local file databases use crash-clean **shared multi-process coordination by default**. Several Rust,
-Go, or Node processes may open the same file at once; readers keep stable snapshots, while one writer
-at a time commits globally. The usual one-process case holds an exclusive fast-path lease, so queries
-and commits add no foreground lock calls or extra metadata reads. Contended processes take the slower,
-append-only commit path.
+Several Rust, Go, or Node processes may open the same local file at once. The first to open it
+becomes its **owner**: only the owner reads and writes the file, and it serves the database to every
+later opener over a local socket. Each of those processes is a **page client** that runs its own
+engine, reading pages from the owner and sending its commits to the owner. Results, plans, and query
+costs are the same either way, readers keep stable snapshots, and one writer at a time commits. The
+owner's own queries and commits add no lock calls or extra metadata reads. When the owner closes or
+exits, a client takes over as owner and the others carry on.
 
-Set the open/create `locking` option to `shared` to require this behavior, `exclusive` to reject other
-processes, or `none` only when an external coordinator provides the same safety. `auto` (the default)
-selects shared on supported local hosts. `file_lock_timeout_ms` / `FileLockTimeoutMs` /
-`fileLockTimeoutMs` bounds open/join waiting (default 5 seconds); the separate session
+The open/create `locking` option chooses this. `auto` (the default) uses the page service on hosts
+that support it (Unix local files) and behaves like `exclusive` elsewhere (Windows, for now).
+`exclusive` owns the file without serving it, so another process's open waits and then fails with
+`55006`. `none` skips coordination and is only for when an external coordinator provides the same
+safety. `file_lock_timeout_ms` / `FileLockTimeoutMs` / `fileLockTimeoutMs` bounds how long an open
+waits to own the file or reach its owner (default 5 seconds); the separate session
 `lock_timeout_ms` / `LockTimeoutMs` / `lockTimeoutMs` bounds writer waiting and reports `55P03`.
+An attached file is always owned exclusively by the handle that attaches it, for now: attaching a
+file another process has open waits, then fails with `55006`.
 
 Node uses a small first-party native helper solely for OS file locks because Node has no standard
 `flock`/`LockFileEx` API. SQL and storage still run in the independent TypeScript engine; browser/OPFS
@@ -86,7 +92,8 @@ statements are unchanged. An in-memory database compacts too, which lowers its `
 
 Compaction is an explicit maintenance step and never waits. It fails with `55006` while anything
 else is using the database — an open write transaction, a read session or open cursor on the
-handle, or another process with the file open — so close those and retry. A read-only database is
+handle, or a read in progress on a page client — so close those and retry. Only the owner can
+compact; a page client's `compact` also fails with `55006`. A read-only database is
 `25006`, and the browser (OPFS) host does not support compaction yet (`0A000`). The rewrite needs
 free disk space for a second copy of the live data, and keeps the file's permission bits but not
 its owner.

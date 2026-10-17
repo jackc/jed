@@ -1,7 +1,7 @@
 schema_version = 1
-name = "shared-handoff-and-crash-release"
-description = "Two independent cores share snapshots, serialize writers, and recover a killed writer gate."
-requires = ["file.shared_process"]
+name = "multi-process-handoff-and-crash-release"
+description = "An owner and a page client of two independent cores share snapshots, serialize writers through the owner's gate, and recover the gate a killed client held."
+requires = ["file.page_service"]
 
 [[step]]
 actor = "a"

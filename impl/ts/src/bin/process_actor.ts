@@ -60,22 +60,15 @@ if (action === "owner-idle") {
 const fileLockTimeoutMs = timeoutText === undefined ? 5000 : Number(timeoutText);
 // The page-service owner's idle-in-transaction timeout (spec/design/page-service.md §11.1).
 const idleInTransactionTimeoutMs = idleText === undefined ? undefined : Number(idleText);
-// create-service / open-service / open-service-read-only use the test-only page-service mode
-// (spec/design/page-service.md §16).
-const locking =
-  action === "open-exclusive"
-    ? "exclusive"
-    : action === "create-service" ||
-        action === "open-service" ||
-        action === "open-service-read-only"
-      ? "service"
-      : "shared";
-const readOnly = action === "open-service-read-only";
+// create / open / open-read-only use the default locking (the page service); open-exclusive is a
+// non-serving owner.
+const locking = action === "open-exclusive" ? "exclusive" : "auto";
+const readOnly = action === "open-read-only";
 
 let database: Database;
 try {
   database =
-    action === "create" || action === "create-service"
+    action === "create"
       ? createDatabase({
           path,
           locking,
@@ -269,7 +262,7 @@ function replyError(error: unknown): void {
 }
 
 // ownerIdle serves OWNER_OPEN <hex path> / OWNER_CLOSE / CLOSE: it owns one database at a time under the
-// test-only page-service mode, so another core's conformance harness can run queries as its client.
+// page service, so another core's conformance harness can run queries as its client.
 // root is the repository root, whose spec bundles the owner loads.
 async function ownerIdle(root: string): Promise<void> {
   const environment = ownerEnvironment(root);
@@ -283,7 +276,7 @@ async function ownerIdle(root: string): Promise<void> {
       switch (command) {
         case "OWNER_OPEN":
           owned = openDatabase(sql(argument), {
-            locking: "service",
+            locking: "auto",
             skipFsync: true,
             fileLockTimeoutMs: 5000,
             environment,

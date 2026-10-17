@@ -8,12 +8,7 @@
 // Browser-clean: imports only host-agnostic core, no `node:*`, so it lands in a browser bundle.
 
 import type { Engine, Snapshot } from "./executor.ts";
-import {
-  buildCommitManifest,
-  manifestInlineCapacity,
-  manifestOverflowCapacity,
-  metaChecksum,
-} from "./commit_manifest.ts";
+import { buildCommitManifest, metaChecksum } from "./commit_manifest.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import { engineError } from "./errors.ts";
 import type { FileHost } from "./filehost.ts";
@@ -71,13 +66,13 @@ export function storageBytes(db: Engine): bigint {
 }
 
 // admitFile is the live-page count a DURABLE commit of write would publish, admitted under the file
-// form of max_storage_bytes (memory.md §8.7) before any page is written. The measure is the live pages
-// — reachable from the new catalog root — times the page size, so neither free pages nor the
-// co-resident append-only allocation counts. A commit is admitted when the domain is unlimited, when it
-// does not grow the live count, when it fits, or under the repair exemption (it stages no record
-// version and rewrites no more catalog pages than the last commit). There is no forced compaction:
-// reclaiming dead pages cannot lower the measure. prev is the committed snapshot the domain's live
-// count describes; a null budget (a bare engine's commit) only computes the count.
+// form of max_storage_bytes (memory.md §8.7) before any page is written. The measure is the live
+// pages — reachable from the new catalog root — times the page size, so free pages never count. A
+// commit is admitted when the domain is unlimited, when it does not grow the live count, when it
+// fits, or under the repair exemption (it stages no record version and rewrites no more catalog
+// pages than the last commit). There is no forced compaction: reclaiming dead pages cannot lower
+// the measure. prev is the committed snapshot the domain's live count describes; a null budget (a
+// bare engine's commit) only computes the count.
 function admitFile(
   db: Engine,
   write: IncrementalWrite,
@@ -265,66 +260,6 @@ export function persistImpl(
     commitFile(db, snap, write, live, reclaim, canReuse);
   } else commitInMemory(db, snap, write, reclaim);
   return write;
-}
-
-// Shared-process commit is deliberately append-only (locking.md §5.3): it never consumes the
-// persisted free list, rewrites its chain, truncates, or replaces the file. Body and overflow
-// descriptor writes happen before commit EX; meta publication and the single durability barrier
-// stay inside commit EX so another process cannot adopt an unacknowledged live writer's generation.
-// budget is the domain's committed-storage context: the commit is admitted under the file form of
-// max_storage_bytes (memory.md §8.7) before any page is written.
-export function persistSharedBody(
-  db: Engine,
-  snap: Snapshot,
-  budget: BudgetCtx,
-): {
-  write: IncrementalWrite;
-  publishMeta: () => void;
-} {
-  const paging = db.paging;
-  paging?.checkDurableCommit();
-  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, false);
-  if (paging === null) return { write, publishMeta: () => {} };
-  const live = admitFile(db, write, budget.prev, budget);
-  const overflowCount = Math.ceil(
-    Math.max(0, write.pages.length - manifestInlineCapacity(db.pageSize)) /
-      manifestOverflowCapacity(db.pageSize),
-  );
-  const pageCount = write.pageCount + overflowCount;
-  if (pageCount > 0xffff_ffff)
-    throw engineError("program_limit_exceeded", "database page limit exceeded");
-  const ids = Array.from({ length: overflowCount }, (_, i) => write.pageCount + i);
-  const manifest = buildCommitManifest(db.pageSize, snap.txid, write.pages, ids);
-  syncDirectoryOnce(db);
-  paging.beginDurableCommit();
-  paging.refreshAllocatedPages();
-  paging.reserve(pageCount);
-  for (const pg of [...write.pages, ...manifest.pages]) paging.writeBlock(pg.index, pg.bytes);
-  verifyLiveCount(snap, paging, write, live);
-  return {
-    write,
-    publishMeta: () => {
-      const meta = metaPage(
-        db.pageSize,
-        snap.txid,
-        write.rootPage,
-        pageCount,
-        0,
-        live.live,
-        manifest,
-      );
-      paging.writeBlock(Number(snap.txid & 1n), meta);
-      paging.sync();
-      paging.finishDurableCommit(snap.txid, metaChecksum(meta));
-      db.pageCount = pageCount;
-      db.freePages = [];
-      // Zero is the orphan sentinel: the first later alone commit rebuilds the free list instead of
-      // trusting reachability facts from before a co-resident interval.
-      db.liveAtCompaction = 0;
-      db.freeGenTxid = snap.txid;
-      db.live = live;
-    },
-  };
 }
 
 // DirectorySync makes the directory holding the database file at path durable, through files (null is

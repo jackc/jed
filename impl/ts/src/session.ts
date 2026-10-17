@@ -818,6 +818,15 @@ export function* bufferedRows(
   }
 }
 
+// Host-owned OS coordination surface: the presence-EX ownership a file database or attachment holds
+// (a page-service owner or a non-serving owner, spec/design/page-service.md §4.1). It lives beside
+// Attachment so the executor never imports the Node host.
+export interface FileCoordinatorHost {
+  readonly path: string;
+  checkPid(): void;
+  close(): void;
+}
+
 // Attachment is one host-attached DATABASE-scoped database in a handle's namespace
 // (spec/design/attached-databases.md §2): a named (storage, mode) pair reachable by a database
 // qualifier. Its MUTABLE storage identity (page accounting, block store + pager) lives here — an
@@ -827,29 +836,6 @@ export function* bufferedRows(
 // non-null, a FileBlockStore behind the pager, committed durably via commitDurableAttachment) or
 // in-memory (storage.path is null, a MemoryBlockStore, committed via stageInMemory). The storage Engine's
 // path is the sole source of the file/memory distinction.
-export type LeaseState = "alone" | "shared" | "exclusive" | "poisoned";
-
-// Host-owned OS coordination surface. It lives beside Attachment so the executor can select the
-// shared append-only commit without importing the Node host.
-export interface FileCoordinatorHost {
-  readonly path: string;
-  state: LeaseState;
-  checkPid(): void;
-  startProbe(tick: () => void): void;
-  lockCommitShared(): void;
-  lockCommitExclusive(): void;
-  unlockCommit(): void;
-  lockWriter(timeoutMs: number): void;
-  unlockWriter(): void;
-  tryArrivalExclusive(): boolean;
-  unlockArrival(): void;
-  lockTransition(): void;
-  unlockTransition(): void;
-  downgradePresence(): void;
-  tryUpgradePresence(): boolean;
-  close(): void;
-}
-
 export type Attachment = {
   name: string; // exact qualifier name (the registry key)
   readOnly: boolean; // a read-only attachment rejects every write (DML + DDL) with 25006 (§4)

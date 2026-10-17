@@ -828,10 +828,9 @@ function createsTempTable(text: string): boolean {
 let serviceOwner: OwnerActor | null = null;
 let clientRecords = 0;
 
-// serviceLocking is the file locking mode the harness opens with: the test-only page-service mode in
-// service mode, the default otherwise.
-function serviceLocking(): "service" | undefined {
-  return serviceOwner !== null ? "service" : undefined;
+// serviceLocking is the file locking mode the harness opens with: the default, the page service.
+function serviceLocking(): "auto" {
+  return "auto";
 }
 
 function runFile(text: string, disk: boolean): void {

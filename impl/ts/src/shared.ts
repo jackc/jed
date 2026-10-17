@@ -93,7 +93,6 @@ import {
   adoptStaged,
   type BudgetCtx,
   persistImpl,
-  persistSharedBody,
   precheckBudget,
   type StagedCommit,
   storageBytes,
@@ -384,7 +383,6 @@ class SharedCore {
   live = new Map<bigint, number>();
   // writerActive is true while a write transaction is open (at most one — CLAUDE.md §3).
   writerActive = false;
-  private heldWriterCoordinators: FileCoordinatorHost[] = [];
   // storage is the Engine that owns the storage identity (the pager + buffer pool + the mutable page
   // accounting: paging/pageSize/pageCount/freePages) — since B3 (bplus-reshape.md) EVERY core has
   // one: a file-backed core over a FileBlockStore, an in-memory core over a MemoryBlockStore (with a
@@ -398,13 +396,13 @@ class SharedCore {
   // write is 25006. Always false for an in-memory core.
   readOnly = false;
   coordinator: FileCoordinatorHost | null;
-  // service is set on a page-service owner, client on a page client (spec/design/page-service.md §4);
-  // at most one is set, and only under the test-only `locking = service`. They are the current role's
-  // (spec/pageservice/README.md §6.5): handoff is set under the page service, and roleKind/roleGen
-  // name the current role — owner, client, or none between roles. A role change installs fresh main
-  // storage and committed snapshot together with the role and starts an empty live registry; a pin of
-  // an older role deregisters as a no-op, and a commit whose writer began under an older role fails
-  // 08006 without writing.
+  // service is set on a page-service owner, client on a page client (spec/design/page-service.md
+  // §4); at most one is set, and only under the page service (`locking = "auto"`). They are the
+  // current role's (spec/pageservice/README.md §6.5): handoff is set under the page service, and
+  // roleKind/roleGen name the current role — owner, client, or none between roles. A role change
+  // installs fresh main storage and committed snapshot together with the role and starts an empty
+  // live registry; a pin of an older role deregisters as a no-op, and a commit whose writer began
+  // under an older role fails 08006 without writing.
   service: ServiceOwnerHandle | null = null;
   client: PageClientHandle | null = null;
   handoff: ServiceHandoffHost | null = null;
@@ -455,47 +453,11 @@ class SharedCore {
         this.writerActive = false;
         throw error;
       }
-      if (this.service === null) return;
     }
     try {
-      this.acquireCoordinators(timeoutMs);
+      this.checkPid();
     } catch (error) {
       this.releaseServiceGate();
-      throw error;
-    }
-  }
-
-  private acquireCoordinators(timeoutMs: number): void {
-    if (this.attachments.size === 0) {
-      const coordinator = this.coordinator;
-      if (coordinator === null) return;
-      try {
-        coordinator.checkPid();
-        if (coordinator.state === "alone" || coordinator.state === "exclusive") return;
-        if (coordinator.state === "poisoned") {
-          throw engineError("io_error", "shared-file coordinator is poisoned");
-        }
-      } catch (error) {
-        this.writerActive = false;
-        throw error;
-      }
-    }
-    const held: FileCoordinatorHost[] = [];
-    try {
-      for (const coordinator of this.writableCoordinators()) {
-        coordinator.checkPid();
-        if (coordinator.state === "poisoned") {
-          throw engineError("io_error", "shared-file coordinator is poisoned");
-        }
-        if (coordinator.state === "shared") {
-          coordinator.lockWriter(timeoutMs);
-          held.push(coordinator);
-        }
-      }
-      this.refreshShared();
-      this.heldWriterCoordinators = held;
-    } catch (error) {
-      for (const coordinator of held.reverse()) coordinator.unlockWriter();
       this.writerActive = false;
       throw error;
     }
@@ -512,10 +474,6 @@ class SharedCore {
 
   releaseWriter(): void {
     if (!this.writerActive) return;
-    if (this.heldWriterCoordinators.length !== 0) {
-      for (const coordinator of this.heldWriterCoordinators.reverse()) coordinator.unlockWriter();
-      this.heldWriterCoordinators.length = 0;
-    }
     this.writerClient?.endWrite();
     this.writerClient = null;
     this.releaseServiceGate();
@@ -994,63 +952,17 @@ class SharedCore {
     });
   }
 
-  private writableCoordinators(): FileCoordinatorHost[] {
-    const coordinators: FileCoordinatorHost[] = [];
-    if (this.coordinator !== null) coordinators.push(this.coordinator);
-    for (const attachment of this.attachments.values()) {
-      if (!attachment.readOnly && attachment.coordinator !== null) {
-        coordinators.push(attachment.coordinator);
-      }
-    }
-    coordinators.sort((a, b) => compareFilePaths(a.path, b.path));
-    return coordinators;
-  }
-
-  hasSharedCoordinator(): boolean {
-    if (this.coordinator?.state === "shared") return true;
-    for (const attachment of this.attachments.values()) {
-      if (attachment.coordinator?.state === "shared") return true;
-    }
-    return false;
-  }
-
   checkPid(): void {
     this.coordinator?.checkPid();
     for (const attachment of this.attachments.values()) attachment.coordinator?.checkPid();
   }
 
-  // A page client sends nothing here: only a read begin that pins a local reader talks to the owner
-  // (refreshAndPin), since a pin taken where no reader follows would leak (README §6.3).
+  // refreshShared brings a transaction begin up to date with other processes: a page-service owner
+  // adopts its clients' commits (page-service.md §7). A page client sends nothing here: only a read
+  // begin that pins a local reader talks to the owner (refreshAndPin), since a pin taken where no
+  // reader follows would leak (README §6.3).
   refreshShared(): void {
-    if (this.client !== null) return;
     if (this.service !== null) this.serviceRefresh();
-    if (!this.hasSharedCoordinator()) return;
-    const coordinator = this.coordinator;
-    if (coordinator?.state === "shared") {
-      coordinator.checkPid();
-      coordinator.lockCommitShared();
-      try {
-        this.reloadFromPager();
-      } finally {
-        coordinator.unlockCommit();
-      }
-    }
-    const attachments = [...this.attachments.entries()]
-      .filter((entry): entry is [string, Attachment & { coordinator: FileCoordinatorHost }] =>
-        Boolean(entry[1].coordinator),
-      )
-      .sort((a, b) => compareFilePaths(a[1].coordinator.path, b[1].coordinator.path));
-    for (const [name, attachment] of attachments) {
-      const attachedCoordinator = attachment.coordinator;
-      if (attachedCoordinator.state !== "shared") continue;
-      attachedCoordinator.checkPid();
-      attachedCoordinator.lockCommitShared();
-      try {
-        this.reloadAttachmentFromPager(name, attachment);
-      } finally {
-        attachedCoordinator.unlockCommit();
-      }
-    }
   }
 
   // clientRefresh is a page client's read begin (spec/pageservice/README.md §6.3): one begin_read, the
@@ -1162,102 +1074,6 @@ class SharedCore {
     }
   }
 
-  private reloadFromPager(): void {
-    const paging = this.storage.paging;
-    if (paging === null) return;
-    paging.refreshAllocatedPages();
-    const loaded = loadEnginePaged(paging, this.environment);
-    if (loaded.committed.txid <= this.committed.txid) return;
-    this.storage.pageCount = loaded.pageCount;
-    this.storage.freePages = loaded.freePages;
-    this.storage.liveAtCompaction = loaded.liveAtCompaction;
-    this.storage.freeGenTxid = loaded.freeGenTxid;
-    this.storage.live = loaded.live;
-    this.committed = loaded.committed;
-    this.planEpoch++;
-  }
-
-  private reloadAttachmentFromPager(name: string, attachment: Attachment): void {
-    const paging = attachment.storage.paging;
-    if (paging === null) return;
-    paging.refreshAllocatedPages();
-    const loaded = loadEnginePaged(paging, this.environment);
-    const current = this.attached.get(name);
-    if (current !== undefined && loaded.committed.txid <= current.txid) return;
-    attachment.storage.pageCount = loaded.pageCount;
-    attachment.storage.freePages = loaded.freePages;
-    attachment.storage.liveAtCompaction = loaded.liveAtCompaction;
-    attachment.storage.freeGenTxid = loaded.freeGenTxid;
-    attachment.storage.live = loaded.live;
-    const attached = new Map(this.attached);
-    attached.set(name, loaded.committed);
-    this.attached = attached;
-    this.planEpoch++;
-  }
-
-  coordinationTick(): void {
-    const coordinator = this.coordinator;
-    if (coordinator === null || this.writerActive) return;
-    try {
-      if (coordinator.state === "alone") this.tryDowngrade(coordinator);
-      else if (coordinator.state === "shared") this.tryUpgrade(coordinator, null);
-    } catch {
-      coordinator.state = "poisoned";
-    }
-  }
-
-  coordinationTickAttachment(name: string, coordinator: FileCoordinatorHost): void {
-    if (this.writerActive) return;
-    try {
-      if (coordinator.state === "alone") this.tryDowngrade(coordinator);
-      else if (coordinator.state === "shared") this.tryUpgrade(coordinator, name);
-    } catch {
-      coordinator.state = "poisoned";
-    }
-  }
-
-  private tryDowngrade(coordinator: FileCoordinatorHost): void {
-    if (coordinator.tryArrivalExclusive()) {
-      coordinator.unlockArrival();
-      return;
-    }
-    coordinator.lockTransition();
-    try {
-      if (coordinator.tryArrivalExclusive()) {
-        coordinator.unlockArrival();
-        return;
-      }
-      coordinator.downgradePresence();
-    } finally {
-      coordinator.unlockTransition();
-    }
-  }
-
-  private tryUpgrade(coordinator: FileCoordinatorHost, attachment: string | null): void {
-    coordinator.lockTransition();
-    try {
-      if (!coordinator.tryArrivalExclusive()) return;
-      try {
-        if (!coordinator.tryUpgradePresence()) return;
-        coordinator.lockCommitShared();
-        try {
-          if (attachment === null) this.reloadFromPager();
-          else {
-            const attached = this.attachments.get(attachment);
-            if (attached !== undefined) this.reloadAttachmentFromPager(attachment, attached);
-          }
-        } finally {
-          coordinator.unlockCommit();
-        }
-        coordinator.state = "alone";
-      } finally {
-        coordinator.unlockArrival();
-      }
-    } finally {
-      coordinator.unlockTransition();
-    }
-  }
-
   // compactLocked compacts database lname (`main` or an attachment) under the local writer flag the
   // caller holds (spec/design/api.md §2.6): require presence-exclusive coordination and a drained reader
   // watermark, then rewrite the storage at the next version and publish the reloaded root. JS is
@@ -1267,20 +1083,7 @@ class SharedCore {
     const coordinator = main
       ? this.coordinator
       : (this.attachments.get(lname)?.coordinator ?? null);
-    if (coordinator !== null) {
-      coordinator.checkPid();
-      // A peer may have closed since the probe last looked: retry the upgrade now.
-      if (coordinator.state === "shared") this.tryUpgrade(coordinator, main ? null : lname);
-      if (coordinator.state === "shared") {
-        throw engineError(
-          "object_in_use",
-          `cannot compact database "${name}" while another process has it open`,
-        );
-      }
-      if (coordinator.state === "poisoned") {
-        throw engineError("io_error", "shared-file coordinator is poisoned");
-      }
-    }
+    coordinator?.checkPid();
     if (this.live.size > 0) {
       throw engineError(
         "object_in_use",
@@ -1348,31 +1151,12 @@ class SharedCore {
     // Both consult the SAME registry; single-handle / all-readers-current keeps oldest_live == committed,
     // so both hold and behavior (and on-disk bytes) are identical to an ungated commit.
     const oldest = this.oldestLiveVersion(snap.txid);
-    const coordinator = this.coordinator;
     const budget: BudgetCtx = {
       name: "main",
       prev: this.committed,
       canCompact: this.canCompactCommitted(),
       stagesRows,
     };
-    if (coordinator !== null && coordinator.state === "shared" && this.storage.path !== null) {
-      let bodyWritten = false;
-      try {
-        const pending = persistSharedBody(this.storage, snap, budget);
-        bodyWritten = true;
-        coordinator.lockCommitExclusive();
-        try {
-          pending.publishMeta();
-        } finally {
-          coordinator.unlockCommit();
-        }
-      } catch (error) {
-        if (bodyWritten || this.storage.paging?.commitRequiresReopen())
-          coordinator.state = "poisoned";
-        throw error;
-      }
-      return;
-    }
     persistImpl(
       this.storage,
       snap,
@@ -1595,7 +1379,7 @@ export function registerFileCompactor(fn: FileCompactor): void {
 export type AttachSource = {
   file: boolean;
   path?: string;
-  locking?: "auto" | "shared" | "exclusive" | "none" | "service";
+  locking?: "auto" | "exclusive" | "none";
   fileLockTimeoutMs?: number;
   maxStorageBytes?: bigint;
 };
@@ -1669,7 +1453,7 @@ export class Database {
   // carry the shared paging, so every pinned/cloned snapshot faults clean pages through the one pool
   // (spec/design/pager.md).
   // The engine carries the handle's Environment (its session's), which the shared core adopts.
-  // pageService carries a page-service owner or client (test-only `locking = service`, file.ts).
+  // pageService carries a page-service owner or client (`locking = "auto"`, file.ts).
   static fromEngine(
     engine: Engine,
     coordinator: FileCoordinatorHost | null = null,
@@ -1704,7 +1488,6 @@ export class Database {
     core.service?.onHandoff(() => core.serviceHandoff());
     // No local reader follows an open, so a client's open-time pin is released at once.
     core.releaseIdlePins();
-    coordinator?.startProbe(() => core.coordinationTick());
     return Database.over(core);
   }
 
@@ -1793,7 +1576,6 @@ export class Database {
     } finally {
       c.releaseWriter();
     }
-    coordinator?.startProbe(() => c.coordinationTickAttachment(lname, coordinator!));
   }
 
   // detach removes a previously attached database (spec/design/attached-databases.md §4/§8). A host-API

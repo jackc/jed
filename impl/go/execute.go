@@ -341,17 +341,9 @@ func (db *engine) commitTx() (outcome, error) {
 					canCompact: db.core.canCompactCommitted(),
 					stagesRows: stagesRows,
 				}
-				var err error
-				if att.coordinator != nil && att.coordinator.lease() == leaseShared {
-					err = att.storage.commitShared(ws, att.coordinator, budget)
-					if err != nil && att.storage.paging.commitRequiresReopen() {
-						att.coordinator.setLease(leasePoisoned)
-					}
-				} else {
-					// A local reader pins every attached root, so reuse is safe only once that common
-					// watermark has drained.
-					err = att.storage.commitDurable(ws, canReclaim, canReclaim, budget)
-				}
+				// A local reader pins every attached root, so reuse is safe only once that common
+				// watermark has drained.
+				err := att.storage.commitDurable(ws, canReclaim, canReclaim, budget)
 				if err != nil {
 					return outcome{}, err
 				}

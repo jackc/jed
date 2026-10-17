@@ -2,8 +2,7 @@ package jed
 
 // The coordination host: everything the shared-file coordinator (coordinator.go, spec/design/
 // locking.md) needs from its environment — the lock bundle beside the database file, whole-file
-// locks on it, the clock its deadlines read, the pause between polls of a contended lock, the
-// background presence probe, and the process-local duplicate-open registry. Production uses the OS.
+// locks on it, the clock its deadlines read, the pause between polls of a contended lock, and the process-local duplicate-open registry. Production uses the OS.
 // The deterministic simulator (spec/design/simulation-testing.md §14 S5) substitutes simulated
 // processes sharing one lock table, so the protocol runs, crashes, and interleaves deterministically.
 
@@ -28,8 +27,6 @@ type lockHost interface {
 	now() time.Time
 	// pause waits between polls of a contended lock.
 	pause()
-	// startProbe runs tick periodically until c.stop closes, then closes c.done.
-	startProbe(c *fileCoordinator, tick func())
 	pid() int
 }
 
@@ -72,24 +69,8 @@ func (osLockHost) now() time.Time            { return time.Now() }
 func (osLockHost) pause()                    { time.Sleep(2 * time.Millisecond) }
 func (osLockHost) pid() int                  { return os.Getpid() }
 
-func (osLockHost) startProbe(c *fileCoordinator, tick func()) {
-	go func() {
-		defer close(c.done)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				tick()
-			case <-c.stop:
-				return
-			}
-		}
-	}()
-}
-
 func closeOSLockFiles(f lockFiles) {
-	for _, h := range []lockHandle{f.commit, f.writer, f.transition, f.arrival, f.presence} {
+	for _, h := range []lockHandle{f.arrival, f.presence} {
 		if file, ok := h.(*os.File); ok && file != nil {
 			_ = file.Close()
 		}

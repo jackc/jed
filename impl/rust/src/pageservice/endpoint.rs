@@ -1,7 +1,8 @@
 //! The page-service endpoint and owner record on the host filesystem (spec/pageservice/README.md
 //! §5): where an owner binds its socket, how a directory proves it is private to one user, and the
 //! owner record clients read to find the endpoint. Unix only: Windows serving is not yet specified
-//! (page-service.md §14), so `locking = service` fails `0A000` there before any of this is reached.
+//! (page-service.md §14), so `Locking::Auto` resolves to a non-serving owner there and none of this
+//! is reached.
 
 use std::path::{Path, PathBuf};
 

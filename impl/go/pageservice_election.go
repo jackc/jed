@@ -1,6 +1,6 @@
 package jed
 
-// Election under the test-only LockingService (spec/design/page-service.md §4.3; spec/pageservice/
+// Election under the page service (LockingAuto) (spec/design/page-service.md §4.3; spec/pageservice/
 // README.md §6.1, §6.5): the opener that takes presence EX owns the database and serves it; every other
 // opener connects to the owner's endpoint as a page client. A client whose connection ends runs the
 // same election again (re-election). The OS lock is the only authority — the owner record only tells
@@ -71,7 +71,7 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool,
 			}
 			if owned {
 				_ = host.unlock(files.arrival)
-				c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid(), stop: make(chan struct{}), done: make(chan struct{})}
+				c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid()}
 				c.setLease(leaseServiceOwner)
 				c.keepPath = true
 				return serviceElection{owner: c}, nil
@@ -144,11 +144,9 @@ func resolveServicePath(path string) (string, error) {
 	return real, nil
 }
 
-// openServiceDatabase opens path under LockingService: as the serving owner, or as a page client.
+// openServiceDatabase opens path under the page service (LockingAuto): as the serving owner, or as a
+// page client.
 func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
-	if _, err := resolvedLocking(LockingService); err != nil {
-		return nil, err
-	}
 	real, err := resolveServicePath(path)
 	if err != nil {
 		return nil, err

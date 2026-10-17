@@ -257,7 +257,7 @@ because they have different conformance contracts**:
 | `max_sql_length` | A — envelope | 1 MiB | parse-size abort (`54000`) | `# max_sql_length:` (existing) |
 | `lifetime_max_cost` | A — envelope | `0` (unlimited) | per-session cumulative abort (`54P02`) | concurrency-style schedule |
 | `idle_in_transaction_timeout` | A — envelope | `0` (off) | auto-rollback of an idle open txn (`25P03`, §2.2) | ordered schedule *(deferred, §11)* |
-| `lock_timeout_ms` | A — envelope | `0` (no deadline) | shared cross-process writer-gate wait (`55P03`, locking.md §5.2) | real-process coordination suite |
+| `lock_timeout_ms` | A — envelope | `0` (no deadline) | writer-gate wait, local or the page-service owner's (`55P03`, locking.md §7.1) | real-process coordination suite |
 | `work_mem` | A — envelope | 256 MiB | *when* an operator spills (never results) | invariant (spill.md §6) |
 | `max_scalar_bytes` | A — envelope | 64 MiB | cumulative scalar allocation per statement (`54P04`) | `# max_scalar_bytes:` |
 | `max_query_memory_bytes` | A — envelope | `0` (unlimited) | live row-buffer and operator-state memory per statement (`54P05`, memory.md) | `# max_query_memory_bytes:` |
@@ -653,9 +653,9 @@ random/clock sources ([api.md §6/§8/§10](api.md)) — relocate onto `Session`
 (the bare `Database` proxies them to its default session for back-compat). `read_only` is the one
 exception: its *physical* form stays a `Database` open option ([api.md §2.1](api.md), `25006`),
 and its session-level *authorization* role is superseded by the privilege model (§5.3, `42501`).
-`lock_timeout_ms` is an additive host-only Bucket-A setting from [locking.md](locking.md): it controls
-only how long a shared file writer waits for the cross-process gate, uses monotonic host time, and has
-no effect for in-memory or presence-EX fast-path writes.
+`lock_timeout_ms` is an additive host-only Bucket-A setting from [locking.md](locking.md) §7.1: it
+controls only how long a writer waits for the writer gate (the local one, or the page-service owner's
+for a page client) and uses monotonic host time.
 
 ## 9. Determinism & the conformance contract
 

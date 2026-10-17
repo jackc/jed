@@ -982,11 +982,8 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     }
     let _service_release = ServiceRelease;
     let service_mode = service::active();
-    let locking = if service_mode {
-        jed::Locking::Service
-    } else {
-        jed::Locking::Auto
-    };
+    // The default locking: the page service (in service mode, a page client of the owner actor).
+    let locking = jed::Locking::Auto;
     // The file's environment: the harness's switchable sources plus the bundles it asks for. Every
     // database the file runs against (the fresh one, a disk-mode reopen, a fixture) uses it.
     let sources = HarnessSources::new();

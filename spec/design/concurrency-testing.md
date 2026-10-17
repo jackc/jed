@@ -52,15 +52,15 @@ than exact transcripts.
 | **1. Schedule** | snapshot isolation, cross-handle visibility, the watermark | yes — explicit total order | yes (conformance) | runs identically (sequential) |
 | **2. Await** | write-gate blocking | yes — equivalent serial order | yes | modeled (no real block) |
 | **3. Stress** | races, commit atomicity, reclamation-under-load | no — random schedule | no (bench-family) | seeded sequential interleave, or skip |
-| **4. Process** | shared-file OS protocol, cross-core interoperability, crash release | barrier-directed; timing outcomes bounded | yes once `file.shared_process` lands | Node participates through the native adapter |
+| **4. Process** | multi-process access (OS locks, the page service, handoff), cross-core interoperability, crash release | barrier-directed; timing outcomes bounded | yes (`file.page_service`) | Node participates through the native adapter |
 
 Layers 1–2 join the differential contract. Layer 3 belongs to the benchmarks family
 ([benchmarks.md](benchmarks.md)): nondeterministic schedule, deterministic *checked answer*.
 **The first three layers have landed.** Layers 1–2 run on all three cores (stepped-sequential everywhere;
 the stepped-threaded mode on Go and Rust). **Layer 3** (§6) lands as `stress/*.stress.toml` + `mise run
 stress`, **outside `mise run ci`** (bench-family), with real-threads workers on Go (under the race
-detector) and Rust and a seeded-sequential interleaver on TS. **Layer 4** (§10) is the required,
-not-yet-built real-process contract for [locking.md](locking.md).
+detector) and Rust and a seeded-sequential interleaver on TS. **Layer 4** (§10) is the landed,
+release-blocking real-process contract for [locking.md](locking.md) and [page-service.md](page-service.md).
 
 ## 4. Layer 1 — the deterministic schedule format
 
@@ -352,8 +352,8 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
 - `stress/*.stress.toml` + a `mise run stress` task — Layer 3; **outside `mise run ci`**, registered
   alongside the determinism ledger as timing-nondeterministic (like `bench/`).
 - `spec/conformance/process/*.process.toml` + `mise run concurrency:process` — Layer 4; one shared
-  language-neutral scenario is driven against same-core and Rust↔Go↔Node actor combinations. It enters
-  `mise run ci` when `file.shared_process` lands; Windows/macOS run the same corpus in their platform lanes.
+  language-neutral scenario is driven against same-core and Rust↔Go↔Node actor combinations. It runs in
+  `mise run ci` for cores declaring `file.page_service`; Windows/macOS run the same corpus in their platform lanes.
 
 ### Capabilities (Layers 1–2)
 
@@ -393,17 +393,19 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
   `stress/balance_transfer.stress.toml` (the balance-transfer sum invariant + confluent final
   state). Most valuable once file-backed sharing is wired (§6), but already exercises commit
   atomicity, snapshot isolation under contention, and the watermark over the real concurrent paths.
-- **Layer 4 — landed.** It is release-blocking for shared file access and
-  owns the `file.shared_process` capability. The feature is not represented by three mirrored unit
+- **Layer 4 — landed.** It is release-blocking for multi-process file access and
+  owns the `file.page_service` capability (shared mode's `file.shared_process` was retired with it). The feature is not represented by three mirrored unit
   suites: the one process corpus below drives every supported core pairing over the same file.
 
-## 10. Layer 4 — real-process shared-file protocol
+## 10. Layer 4 — real-process multi-process access
 
 Layer 4 exists because Layers 1–3 cannot exercise kernel lock lifetime, process death, or two native
 cores interpreting one bundle. A `.process.toml` scenario declares named actors (`rust`, `go`, or
 `node`), one temporary database path, and an explicit sequence of commands and barriers. Each core
-supplies a small test-only actor binary that accepts create/open/begin/query/commit/rollback/close and
-named fault-hook commands over stdin and returns framed results over stdout. The shared Ruby driver
+supplies a small test-only actor binary that is started with an action (`create`, `open`,
+`open-read-only`, or `open-exclusive` — the last a non-serving `locking = exclusive` owner; the others
+use the default `locking = auto`, so the first opener owns the file and later openers are its page
+clients), accepts begin/query/commit/rollback/close and named fault-hook commands over stdin and returns framed results over stdout. The shared Ruby driver
 owns scheduling, deadlines, process kill, and transcript comparison. Each (scenario, pairing) run
 uses its own temporary directory, so the driver runs pairings concurrently (`JED_PROCESS_JOBS`,
 default 8) and reports them in corpus order; ordering *within* a scenario is unchanged.
@@ -411,23 +413,25 @@ default 8) and reports them in corpus order; ordering *within* a scenario is unc
 A scenario may specify `fixture = "fileformat/fixtures/<name>.jed"` to seed the shared
 file from an independently authored recovery image before actors open it. With
 `byte_identical = true`, the driver compares the final incremental image across all nine
-Rust/Go/Node pairings, excluding unreferenced physical preallocation. Scenarios that request
-byte equality explicitly fix the allocation mode: keep two processes present through every
-write for append-only allocation, or use actor action `open-exclusive` for deterministic reuse.
+Rust/Go/Node pairings, excluding unreferenced physical preallocation. Every commit is allocated by
+the owner, whose page reuse is gated by its reader watermark (counting client pins), so a scenario
+that requests byte equality fixes reuse through the pins it holds, or uses `open-exclusive`.
 `max_page_count` additionally bounds logical file growth. `cow_overflow` and `cow_stale_orphan`
 cover validated-COW manifest recovery, pinned readers, a killed and replaced writer, foreign-root
 adoption, and continued commits. `cow_reuse` updates 400 rows repeatedly across exclusive
 writer handoffs, exercising multi-page manifests, free-list planning, and bounded page reuse.
-`cow_serialization_error` rejects oversized catalogs without poisoning exclusive/shared
-writers or file attachments, including explicit commits that encoded dirty rows before failing.
+`cow_serialization_error` rejects oversized catalogs without poisoning exclusive writers,
+page-service owners and clients, or file attachments, including explicit commits that encoded dirty rows before failing.
 `storage_limit` pins the file form of `max_storage_bytes` (memory.md §8.7): actors set the limit
-(`max_storage_bytes`) and read the gauge (`storage_bytes`), and one process alone and two
-co-resident processes with append-only commits trip at the same batch with the same live count,
-though the co-resident file grows to nearly twice the length. A peer's delete lowers the count the
-other process commits against.
+(`max_storage_bytes`) and read the gauge (`storage_bytes`), and one process alone and an owner
+and a page client alternating commits trip at the same batch with the same live count; the owner's
+maintenance commits keep the shared file as small as the lone one. A client's delete lowers the
+count every process commits against. `file-attachment-ownership` (`attachment_ownership`) checks
+that a file attachment is a non-serving owner: a second handle's attach of the same file fails
+`55006` until the first closes or dies. `compact` refuses compaction while a page client or a local
+reader pins a snapshot and succeeds after; a connected client continues on the compacted image.
 
-The page service's read path (page-service.md phase 2) runs here too, under the test-only
-`locking = service` actions `create-service` and `open-service`: `service_reads` elects the creator
+The page service's read path (page-service.md phase 2): `service_reads` elects the creator
 owner and the second opener a page client, then checks fresh reads after the owner's commits, a pinned
 read session, correct reads after the owner reuses freed pages (the client's invalidation list),
 compaction refused while a client pins and allowed after, and `25006` for a write through a client
@@ -461,12 +465,12 @@ must exit with status 0 after `close`.
 
 The corpus, not per-core copies, covers:
 
-- first-rollout/unknown-marker failure, join, alone→shared→alone transitions, and open/writer timeout;
-- Rust↔Go, Rust↔Node, Go↔Node, and same-core reader/writer handoff;
-- a reader pinned before a foreign commit, append-only page allocation, meta refresh, and plan
-  invalidation after foreign `txid`;
-- kill after every lock acquisition, body sync, and meta-publication hook; the survivor must select a
-  valid old/new meta and the kernel must release every dead actor's locks;
+- election, open/writer timeout, and ownership handoff (promotion, yield, graceful close);
+- Rust↔Go, Rust↔Node, Go↔Node, and same-core owner/client pairings;
+- a client read pinned across the owner's commits, page reuse under client pins, and cache
+  invalidation after another process's commit;
+- owner and client kills, including after commit hooks; the survivor must select a valid old/new
+  meta and the kernel must release every dead actor's locks;
 - compaction lock continuity, symlink identity, hard-link rejection, and bundle-entry replacement
   failure; and
 - a confluent multi-writer checksum plus a file-format verifier pass after every crash scenario.

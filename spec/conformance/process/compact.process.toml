@@ -1,7 +1,7 @@
 schema_version = 1
 name = "compaction-presence-and-continuity"
-description = "Compaction refuses while a peer process or a reader holds the file, then rewrites it so a later process joins the compacted image (api.md §2.6, locking.md §6)."
-requires = ["file.shared_process"]
+description = "Compaction refuses while a page client or a local reader pins a snapshot, then rewrites the file; a connected client continues on the compacted image and a later process opens it (api.md §2.6; spec/pageservice/README.md §6.2)."
+requires = ["file.page_service"]
 byte_identical = true
 
 [[step]]
@@ -31,21 +31,24 @@ argument = "open"
 
 # Another process has the file open: compaction needs presence EX and never waits.
 [[step]]
+actor = "b"
+command = "read_open"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "100"
+
+[[step]]
 actor = "a"
 command = "compact"
 expect_error = "55006"
 
 [[step]]
 actor = "b"
-command = "query_i64"
-sql = "SELECT count(*) FROM t"
-expect = "100"
+command = "read_close"
 
-[[step]]
-actor = "b"
-command = "close"
-
-# A pinned local reader also refuses it.
 [[step]]
 actor = "a"
 command = "read_open"
@@ -59,10 +62,11 @@ expect_error = "55006"
 actor = "a"
 command = "read_close"
 
-# The peer has closed: compaction regains presence EX itself and rewrites the file.
+# The client's end_read reaches the owner asynchronously.
 [[step]]
 actor = "a"
 command = "compact"
+retry_ms = 2000
 
 [[step]]
 actor = "a"
@@ -75,11 +79,6 @@ command = "txid"
 expect = "5"
 
 # A new process joins through the unchanged lock bundle and sees the compacted file.
-[[step]]
-actor = "b"
-command = "start"
-argument = "open"
-
 [[step]]
 actor = "b"
 command = "query_i64"

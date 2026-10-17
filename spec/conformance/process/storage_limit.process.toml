@@ -1,7 +1,7 @@
 schema_version = 1
 name = "storage-limit-live-pages"
-description = "A file's max_storage_bytes trips at the same live-page count whether one process writes it alone or two co-resident processes share it with append-only commits; a peer's delete lowers the count every process sees (memory.md §8.7)."
-requires = ["file.shared_process"]
+description = "A file's max_storage_bytes trips at the same live-page count whether one process writes it alone or an owner and a page client alternate commits; a client's delete lowers the count every process sees (memory.md §8.7)."
+requires = ["file.page_service"]
 
 # One process alone: twenty pages hold fourteen batches.
 
@@ -111,9 +111,9 @@ expect = "33"
 actor = "a"
 command = "close"
 
-# Two co-resident processes alternate the same batches. Their commits only append, so the file
-# grows to 63 pages against 33 alone, yet the limit trips at the same batch and both processes
-# report the same live count.
+# An owner and its page client alternate the same batches. The limit trips at the same batch and both
+# processes report the same live count; the owner's maintenance commits keep the file at 32 pages
+# against 33 alone.
 
 [[step]]
 actor = "a"
@@ -235,9 +235,9 @@ expect = "163840"
 [[step]]
 actor = "a"
 command = "page_count"
-expect = "63"
+expect = "32"
 
-# A peer's delete lowers the live count the other process commits against.
+# A client's delete lowers the live count the owner commits against.
 
 [[step]]
 actor = "b"

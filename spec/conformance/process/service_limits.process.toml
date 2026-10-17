@@ -6,7 +6,7 @@ requires = ["file.page_service"]
 [[step]]
 actor = "a"
 command = "start"
-argument = "create-service 5000 60000 max_connections=1 idle_session=300"
+argument = "create 5000 60000 max_connections=1 idle_session=300"
 
 [[step]]
 actor = "a"
@@ -21,12 +21,12 @@ sql = "INSERT INTO t VALUES (1)"
 [[step]]
 actor = "b"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 [[step]]
 actor = "c"
 command = "start"
-argument = "open-service"
+argument = "open"
 expect_error = "53300"
 
 [[step]]

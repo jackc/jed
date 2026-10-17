@@ -281,7 +281,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     is not adopted; the full durable-completion guarantee is unchanged.
     → [macOS measurements](spec/design/durable-commit-experiments.md#macos-measurements-2026-10-13)
 
-- [x] **Shared multi-process file access** — ✅ **landed** ([locking.md](spec/design/locking.md)). The stable `protocol-v1` bundle, alone fast path, global writer, commit/meta gate, append-only shared commits, foreign-plan invalidation, independently coordinated file attachments, and Rust↔Go↔Node real-process matrix are implemented. The independent TypeScript engine uses the narrow first-party `impl/ts/native-lock` Node-API adapter; the full Rust wrapper remains a workload-dependent reach experiment. `locking = auto` is shared on capable local hosts. Pre-protocol binaries still require a one-time drain. → [locking.md](spec/design/locking.md), [benchmarks.md §7.3](spec/design/benchmarks.md)
+- [x] **Shared multi-process file access** — ✅ **landed, then superseded** by the page service (phase 4 retired it; [locking.md](spec/design/locking.md) now specifies the bundle and ownership). The stable `protocol-v1` bundle, alone fast path, global writer, commit/meta gate, append-only shared commits, foreign-plan invalidation, independently coordinated file attachments, and Rust↔Go↔Node real-process matrix are implemented. The independent TypeScript engine uses the narrow first-party `impl/ts/native-lock` Node-API adapter; the full Rust wrapper remains a workload-dependent reach experiment. `locking = auto` is shared on capable local hosts. Pre-protocol binaries still require a one-time drain. → [locking.md](spec/design/locking.md), [benchmarks.md §7.3](spec/design/benchmarks.md)
   - [ ] **Node prebuilt distribution matrix** — ship no-install-script Node-API-8 artifacts for Linux glibc/musl x64+arm64, macOS x64+arm64, and Windows x64 with SHA-256/provenance and packaging tests. Source/dev builds already use `mise run ts:lock_build`; missing production artifacts fail closed `0A000`.
   - [ ] **Expanded shared-file fault/platform matrix** — extend the landed real-process handoff, timeout, pinned-reader, killed-writer, and attachment scenarios with deterministic body-sync/meta-publish fault hooks, a joiner arriving mid-compaction (the basic presence refusal + later join is `compact.process.toml`), symlink/hard-link process lanes, and every supported Windows/macOS packaging lane.
 - [x] **Survive stored SQL a binary cannot parse** — ✅ **landed** ([unparsable-definitions.md](spec/design/unparsable-definitions.md)). Catalog loading used to fail the whole file with `XX001` when stored SQL text (a view, expression `DEFAULT`, `CHECK`, partial-index predicate, or expression index key) used syntax a newer jed added without a `format_version` bump (`SEARCH`/`CYCLE`, e92a7a3e), locking an older program out of a file a newer one edited: standalone, in shared mode, and under any future page service. The load now keeps the object unparsed with its text unchanged; only statements that need it fail, with the new `XX003`: a reference to the view, a write that evaluates the check or applies the default, a write that maintains the index, and the `ALTER TABLE` actions that analyze or rewrite the text. Reads proceed and skip the index; `DROP` of each object and `DROP TABLE` work. All three cores, against the Ruby-forged `unparsable_definitions.jed` fixture and `suites/storage/unparsable_definitions.test`. Also fixed in passing: the index-nested-loop path no longer uses a partial index as its inner (it never checked the predicate, so it could drop rows; indexes.md §9 already excluded it).
@@ -424,12 +424,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   WAL: COW + the root swap already give atomicity *and* lock-free concurrency. Trade:
   write-amplification. A **logical** changeset stream is a separate higher-layer door, not
   foreclosed, not scheduled.
-- **Page service (ratified 2026-10-16, being built).** One owner process alone touches the database
-  file and serves pages and whole-commit deltas to client processes, each running its own engine,
-  over a local socket or SSH. It replaces shared multi-process mode at phase 4 and carries remote
-  access, backup, and replication. [locking.md](spec/design/locking.md) stays the binding protocol
-  until phase 4 lands; until then the service is reachable only through the test-only
-  `locking = service` value. → [page-service.md](spec/design/page-service.md) §16
+- **Page service (ratified 2026-10-16; phases 1–3 landed, phase 4 landing).** One owner process alone touches the
+  database file and serves pages and whole-commit deltas to client processes, each running its own
+  engine, over a local socket or SSH. It replaced shared multi-process mode at phase 4 (`locking =
+  auto`) and carries remote access, backup, and replication. → [page-service.md](spec/design/page-service.md) §16
   - [x] **Phase 1 — spec.** ✅ **landed**: `spec/pageservice/` holds the message catalog and framing
     as shared data, field encodings, and byte fixtures checked by a Ruby verifier under `mise run
     verify`; `08006`, `08007`, `08P01`, `25P03` registered; a hand-written codec per core (Rust, Go,
@@ -454,8 +452,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     timeout (`25P03`); read-only connections only on request. Proven by the `service_*` scenarios
     in every pairing and by `conformance:service` now running every record, writes included, on a
     page client; `bench:page_service` adds `client_commit`.
-  - [ ] **File attachments under the service.** A file attachment under `locking = service` (owner
-    or client of the attached file; `0A000` today), taking every writer gate, local or remote, in
+  - [ ] **File attachments under the service.** A file attachment as owner or client of the
+    attached file (today an owner-only non-serving owner: another process holding it means `55006`),
+    taking every writer gate, local or remote, in
     real-path order with `lock_timeout_ms` as the backstop (page-service.md §5.5).
   - [ ] **Phase 4 — handoff.** Promotion, ownership preference and yield, graceful close, the grace
     periods; the process-corpus rewrite; simulation testing of owner + clients; retire shared mode,
@@ -466,7 +465,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `ownership = prefer | yield | never`, yield with notices, drain, and the 2 s handoff pause; a
       read-only owner yields to a writer; graceful close; idle-session timeout; `max_connections`
       (`53300`). Proven by the `service_*` process scenarios in every pairing.
-    - [ ] Retire shared mode (attachments owner-only until the attachment item above), new marker.
+    - [x] **Shared mode retired**: `locking = auto | exclusive | none`, `auto` the page service (a
+      non-serving owner where serving is unavailable), `exclusive` a non-serving owner, the
+      `protocol-v2` bundle of `presence` and `arrival`, file attachments owner-only until the item
+      above; the process corpus runs every scenario under it.
     - [ ] Simulation testing of owner + clients over a simulated transport.
   - [ ] **Phase 5 — SSH.** `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead
     and subtree fetch.

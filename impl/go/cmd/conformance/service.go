@@ -100,11 +100,7 @@ var serviceOwner *ownerActor
 // clientRecords counts the records a page client ran.
 var clientRecords int
 
-// serviceLocking is the file locking mode the harness opens with: the test-only page-service mode in
-// service mode, the default otherwise.
+// serviceLocking is the file locking mode the harness opens with: the default, the page service.
 func serviceLocking() jed.Locking {
-	if serviceOwner != nil {
-		return jed.LockingService
-	}
 	return jed.LockingAuto
 }

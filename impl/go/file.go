@@ -13,19 +13,17 @@ import (
 	"path/filepath"
 )
 
-// Locking selects the shared-file coordination mode (spec/design/locking.md §7.1).
+// Locking selects how a file database coordinates with other processes (spec/design/locking.md,
+// page-service.md): LockingAuto (the default) is the page service — the opener that takes presence EX
+// owns the file and serves it, every other opener is its page client — where the host supports it, and
+// a non-serving owner elsewhere; LockingExclusive is a non-serving owner (a second opener waits, then
+// fails 55006); LockingNone skips coordination (an unsafe escape hatch).
 type Locking uint8
 
 const (
 	LockingAuto Locking = iota
-	LockingShared
 	LockingExclusive
 	LockingNone
-	// LockingService is the TEST-ONLY page-service mode (spec/design/page-service.md §16): the opener
-	// becomes the owner when it can take presence EX, otherwise a read-only page client of the owner.
-	// It exists until the page service's handoff phase replaces shared mode; never mix it with shared
-	// or exclusive openers of one database. Unix only (0A000 elsewhere).
-	LockingService
 )
 
 // databaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
@@ -122,19 +120,19 @@ type OpenOptions struct {
 	// IdleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write
 	// transactions (spec/design/page-service.md §11.1): a client holding the writer gate that sends
 	// nothing for this long is revoked (25P03 at its next request). nil is the 60 s default; &0
-	// disables it. Only LockingService reads it.
+	// disables it. Only the page service (LockingAuto) reads it.
 	IdleInTransactionTimeoutMs *uint64
 	// IdleSessionTimeoutMs closes a page-service connection idle between transactions for this long
 	// (page-service.md §11.1); nil or &0 never does. YieldGraceMs and ShutdownGraceMs are how long a
 	// yielding or closing owner lets running transactions finish (nil: 5 s and 30 s). MaxConnections
-	// bounds an owner's connections (53300 beyond it); 0 is unlimited. Only LockingService reads them,
+	// bounds an owner's connections (53300 beyond it); 0 is unlimited. Only the page service (LockingAuto) reads them,
 	// as an owner's limits; a client keeps them for the day it becomes owner.
 	IdleSessionTimeoutMs *uint64
 	YieldGraceMs         *uint64
 	ShutdownGraceMs      *uint64
 	MaxConnections       int
 	// Ownership is the opener's ownership preference under the page service (page-service.md §8.2):
-	// OwnershipPrefer (the default), OwnershipYield, or OwnershipNever. Only LockingService reads it.
+	// OwnershipPrefer (the default), OwnershipYield, or OwnershipNever. Only the page service (LockingAuto) reads it.
 	Ownership Ownership
 	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
 	// time-zone data the file's references resolve against, the host functions, and the random + clock

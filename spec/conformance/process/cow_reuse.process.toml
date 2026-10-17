@@ -1,7 +1,7 @@
 schema_version = 1
 name = "validated-cow-manifest-reuse"
 description = "Repeated large commits allocate reusable manifest/free-list pages, then reopen in another core; the final logical image must be byte-identical and bounded."
-requires = ["file.shared_process"]
+requires = ["file.page_service"]
 fixture = "fileformat/fixtures/cow_inline.jed"
 byte_identical = true
 max_page_count = 512

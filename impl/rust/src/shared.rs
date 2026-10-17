@@ -59,8 +59,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 /// A test-only seam (compiled out of production entirely): fires in [`Session::publish`] AFTER the
 /// durable persist but BEFORE the roots swap — the window in which the just-committed version is durable
@@ -74,7 +76,7 @@ use crate::api::{PreparedStatement, Rows, Transaction};
 use crate::ast::Statement;
 use crate::cancel::CancellationToken;
 use crate::catalog::{CompositeType, Table};
-use crate::coordinator::{FileCoordinator, LeaseState};
+use crate::coordinator::FileCoordinator;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
     CachedInsert, CachedPlan, CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions,
@@ -600,8 +602,8 @@ impl Storage {
 
     /// The live-page count a FILE commit of `write` would publish, admitted under the file form of
     /// `max_storage_bytes` (memory.md §8.7) before any page is written. The measure is the live
-    /// pages — reachable from the new catalog root — times the page size, so neither free pages nor
-    /// the co-resident append-only allocation counts. A commit is admitted when the domain is
+    /// pages — reachable from the new catalog root — times the page size, so free pages do not
+    /// count. A commit is admitted when the domain is
     /// unlimited, when it does not grow the live count, when it fits, or under the repair exemption
     /// (it stages no record version and rewrites no more catalog pages than the last commit). There is
     /// no forced compaction: reclaiming dead pages cannot lower the measure.
@@ -827,45 +829,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Conservative co-resident commit (locking.md §5.3): append every dirty page at/above the
-    /// newest logical high-water, persist no free-list chain, and gate only alternate-meta
-    /// publication. Old body/free-list pages stay immutable until presence EX is recovered.
-    fn commit_file_shared(
-        &mut self,
-        snap: &Snapshot,
-        write: crate::format::IncrementalWrite,
-        live: crate::format::LiveCount,
-        coordinator: &FileCoordinator,
-    ) -> Result<()> {
-        let plan = crate::format::plan_shared_commit(self.page_size, snap.txid, &write, live.live)?;
-        self.sync_directory_once();
-        {
-            let mut pager = self.paging.pager();
-            pager.begin_commit()?;
-            pager.refresh_allocated_pages()?;
-            pager.reserve(plan.page_count)?;
-            for (index, bytes) in write.pages.iter().chain(plan.auxiliary.iter()) {
-                pager.write_block(*index, bytes)?;
-            }
-        }
-        crate::format::verify_live_count(snap, &self.paging, &write, live)?;
-        let commit = coordinator.lock_commit_exclusive()?;
-        {
-            let mut pager = self.paging.pager();
-            pager.write_block((snap.txid & 1) as u32, &plan.meta)?;
-            pager.sync()?;
-            pager.finish_commit(&plan.meta);
-        }
-        drop(commit);
-        self.page_count = plan.page_count;
-        self.free_pages.clear();
-        // Force the first later alone commit to reconstruct the reclaimable set.
-        self.live_at_compaction = 0;
-        self.free_gen_txid = snap.txid;
-        self.live = live;
-        Ok(())
-    }
-
     /// The IN-MEMORY branch of [`commit_durable`]: a `MemoryBlockStore` is never reopened, so it keeps
     /// its free-list in RAM and persists NO `page_type 7` pages (writing them would waste memory pages);
     /// the meta write + `sync` are no-ops on the store. Within-session reclamation is a **post-commit**
@@ -1007,8 +970,6 @@ pub(crate) struct Shared {
     /// on the condvar until the holder commits or rolls back (CLAUDE.md §3 — at most one writer).
     writer_active: Mutex<bool>,
     writer_free: Condvar,
-    held_coordinators: Mutex<Vec<Arc<FileCoordinator>>>,
-    held_coordinator_count: AtomicUsize,
     /// The live-reader registry (transactions.md §8): pinned versions → the reclamation watermark.
     live: Mutex<LiveRegistry>,
     /// The storage identity (§2.4) — since B3 every core has one (file- or memory-backed). Mutated
@@ -1024,7 +985,7 @@ pub(crate) struct Shared {
     /// Native file coordination. `None` for memory or explicit `locking=none`.
     coordinator: Option<Arc<FileCoordinator>>,
     /// The page-service state that outlives roles (spec/design/page-service.md §4, §8); set only
-    /// under the test-only `Locking::Service`.
+    /// under the page service ([`Locking::Auto`] on Unix).
     #[cfg(unix)]
     handoff: std::sync::OnceLock<Arc<handoff::ServiceHandoff>>,
     /// The handle's current page-service role — the owner, a page client, or neither between roles
@@ -1057,9 +1018,7 @@ impl Shared {
         *active = true;
     }
 
-    /// Claim the in-process writer gate, then every potentially-writable shared file gate in canonical
-    /// path order. Locking all writable domains is the conservative attachment rule: the SQL API does
-    /// not declare its durable target at BEGIN, and canonical ordering prevents cross-handle deadlock.
+    /// Claim the in-process writer gate. Under the page service a writer also takes the owner's gate.
     fn acquire_writer(&self, timeout_ms: u64) -> Result<()> {
         self.acquire_local_writer();
         #[cfg(unix)]
@@ -1073,76 +1032,12 @@ impl Shared {
             }
             return Ok(());
         }
-        if self.attachment_count.load(Ordering::Acquire) == 0 {
-            match &self.coordinator {
-                None => return Ok(()),
-                Some(coordinator) => {
-                    if let Err(error) = coordinator.check_pid() {
-                        self.release_local_writer();
-                        return Err(error);
-                    }
-                    match coordinator.state() {
-                        LeaseState::Alone | LeaseState::Exclusive => return Ok(()),
-                        LeaseState::Poisoned => {
-                            self.release_local_writer();
-                            return Err(EngineError::new(
-                                SqlState::IoError,
-                                "shared-file coordinator is poisoned",
-                            ));
-                        }
-                        LeaseState::Shared => {}
-                    }
-                }
-            }
-        }
-        let coordinators = self.writable_coordinators();
-        let mut held: Vec<Arc<FileCoordinator>> = Vec::new();
-        for coordinator in &coordinators {
-            if let Err(error) = coordinator.check_pid() {
-                for prior in held.iter().rev() {
-                    prior.unlock_writer();
-                }
-                self.release_local_writer();
-                return Err(error);
-            }
-            match coordinator.state() {
-                LeaseState::Shared => match coordinator.lock_writer(timeout_ms) {
-                    Ok(()) => held.push(Arc::clone(coordinator)),
-                    Err(error) => {
-                        for prior in held.iter().rev() {
-                            prior.unlock_writer();
-                        }
-                        self.release_local_writer();
-                        return Err(error);
-                    }
-                },
-                LeaseState::Poisoned => {
-                    for prior in held.iter().rev() {
-                        prior.unlock_writer();
-                    }
-                    self.release_local_writer();
-                    return Err(EngineError::new(
-                        SqlState::IoError,
-                        "shared-file coordinator is poisoned",
-                    ));
-                }
-                LeaseState::Alone | LeaseState::Exclusive => {}
-            }
-        }
-        if let Err(error) = self.refresh_shared() {
-            for coordinator in held.iter().rev() {
-                coordinator.unlock_writer();
-            }
+        #[cfg(not(unix))]
+        let _ = timeout_ms;
+        if let Err(error) = self.check_coordinator_pids() {
             self.release_local_writer();
             return Err(error);
         }
-        let held_count = held.len();
-        *self
-            .held_coordinators
-            .lock()
-            .expect("held-coordinators lock not poisoned") = held;
-        self.held_coordinator_count
-            .store(held_count, Ordering::Release);
         Ok(())
     }
 
@@ -1152,73 +1047,19 @@ impl Shared {
         if self.handoff.get().is_some() {
             self.release_service_write();
         }
-        if self.held_coordinator_count.swap(0, Ordering::AcqRel) == 0 {
-            self.release_local_writer();
-            return;
-        }
-        let mut held = self
-            .held_coordinators
-            .lock()
-            .expect("held-coordinators lock not poisoned");
-        for coordinator in held.drain(..).rev() {
-            coordinator.unlock_writer();
-        }
-        drop(held);
         self.release_local_writer();
     }
 
-    fn writable_coordinators(&self) -> Vec<Arc<FileCoordinator>> {
-        let mut coordinators = Vec::new();
-        if let Some(coordinator) = &self.coordinator {
-            coordinators.push(Arc::clone(coordinator));
-        }
-        let attachments = self
-            .attachments
-            .lock()
-            .expect("attachments lock not poisoned");
-        for attachment in attachments.values() {
-            if attachment.mode == AttachMode::ReadWrite
-                && let Some(coordinator) = &attachment.coordinator
-            {
-                coordinators.push(Arc::clone(coordinator));
-            }
-        }
-        coordinators.sort_by(|a, b| {
-            a.path()
-                .to_string_lossy()
-                .as_bytes()
-                .cmp(b.path().to_string_lossy().as_bytes())
-        });
-        coordinators
-    }
-
+    /// Whether other processes may commit to this database, so a read session refreshes at its
+    /// first read: true exactly under the page service. A page client's read begin is its
+    /// begin_read round trip (README.md §6.3); an owner's adopts any client commit published since
+    /// (page-service.md §7).
     fn has_shared_coordinator(&self) -> bool {
-        // A page client's read begin is its begin_read round trip (README.md §6.3); an owner's
-        // adopts any client commit published since (page-service.md §7).
         #[cfg(unix)]
         if self.handoff.get().is_some() {
             return true;
         }
-        if self
-            .coordinator
-            .as_ref()
-            .is_some_and(|coordinator| coordinator.state() == LeaseState::Shared)
-        {
-            return true;
-        }
-        if self.attachment_count.load(Ordering::Acquire) == 0 {
-            return false;
-        }
-        self.attachments
-            .lock()
-            .expect("attachments lock not poisoned")
-            .values()
-            .any(|attachment| {
-                attachment
-                    .coordinator
-                    .as_ref()
-                    .is_some_and(|coordinator| coordinator.state() == LeaseState::Shared)
-            })
+        false
     }
 
     fn check_coordinator_pids(&self) -> Result<()> {
@@ -1247,59 +1088,17 @@ impl Shared {
         self.writer_free.notify_one();
     }
 
-    /// Adopt foreign main and attachment roots while shared. Each file has its own short commit-SH
-    /// gate; the resulting immutable roots are published together after all refreshes complete.
+    /// Bring a transaction begin up to date with other processes: a page-service owner adopts its
+    /// page clients' commits (page-service.md §7). A page client refreshes only where a read pins
+    /// its snapshot ([`refresh_and_pin`](Self::refresh_and_pin)): its begin_read takes an owner pin
+    /// that the reader that follows must register (README.md §6.3).
     fn refresh_shared(&self) -> Result<()> {
-        // A page-service owner's sessions adopt client commits at their next transaction begin. A
-        // page client refreshes only where a read pins its snapshot ([`refresh_and_pin`]): its
-        // begin_read takes an owner pin that the reader that follows must register.
         #[cfg(unix)]
         if self.handoff.get().is_some() {
             return match self.service_owner() {
                 Some(owner) => self.adopt_foreign(&owner),
                 None => Ok(()),
             };
-        }
-        if !self.has_shared_coordinator() {
-            return Ok(());
-        }
-        let _live = self.live.lock().expect("live lock not poisoned");
-        if let Some(coordinator) = &self.coordinator
-            && coordinator.state() == LeaseState::Shared
-        {
-            coordinator.check_pid()?;
-            let _commit = coordinator.lock_commit_shared()?;
-            self.reload_from_pager()?;
-        }
-        let coordinated = {
-            let attachments = self
-                .attachments
-                .lock()
-                .expect("attachments lock not poisoned");
-            let mut coordinated = attachments
-                .iter()
-                .filter_map(|(name, attachment)| {
-                    attachment
-                        .coordinator
-                        .as_ref()
-                        .map(|coordinator| (name.clone(), Arc::clone(coordinator)))
-                })
-                .collect::<Vec<_>>();
-            coordinated.sort_by(|a, b| {
-                a.1.path()
-                    .to_string_lossy()
-                    .as_bytes()
-                    .cmp(b.1.path().to_string_lossy().as_bytes())
-            });
-            coordinated
-        };
-        for (name, coordinator) in coordinated {
-            if coordinator.state() != LeaseState::Shared {
-                continue;
-            }
-            coordinator.check_pid()?;
-            let _commit = coordinator.lock_commit_shared()?;
-            self.reload_attachment_from_pager(&name)?;
         }
         Ok(())
     }
@@ -1628,171 +1427,6 @@ impl Shared {
         }
     }
 
-    /// Reload the newest CRC-valid meta through this handle's existing pager. Caller holds the
-    /// relevant local barrier and (when shared) commit SH.
-    fn reload_from_pager(&self) -> Result<()> {
-        let paging = self
-            .storage
-            .lock()
-            .expect("storage lock not poisoned")
-            .paging
-            .clone();
-        paging.pager().refresh_allocated_pages()?;
-        let engine = Engine::open_shared_paging(paging, &self.env)?;
-        let current = self
-            .roots
-            .read()
-            .expect("roots lock not poisoned")
-            .committed
-            .txid;
-        if engine.committed.txid <= current {
-            return Ok(());
-        }
-        {
-            let mut storage = self.storage.lock().expect("storage lock not poisoned");
-            storage.page_count = engine.page_count;
-            storage.free_pages = engine.free_pages.clone();
-            storage.live_at_compaction = engine.live_at_compaction;
-            storage.free_gen_txid = engine.free_gen_txid;
-            storage.live = engine.live;
-        }
-        let mut roots = self.roots.write().expect("roots lock not poisoned");
-        roots.committed = Arc::new(engine.committed);
-        self.plan_epoch.fetch_add(1, Ordering::Release);
-        Ok(())
-    }
-
-    fn reload_attachment_from_pager(&self, name: &str) -> Result<()> {
-        let paging = {
-            let attachments = self
-                .attachments
-                .lock()
-                .expect("attachments lock not poisoned");
-            let Some(attachment) = attachments.get(name) else {
-                return Ok(());
-            };
-            attachment.storage.paging.clone()
-        };
-        paging.pager().refresh_allocated_pages()?;
-        let engine = Engine::open_shared_paging(paging, &self.env)?;
-        let current = self
-            .roots
-            .read()
-            .expect("roots lock not poisoned")
-            .attached
-            .get(name)
-            .map_or(0, |root| root.txid);
-        if engine.committed.txid <= current {
-            return Ok(());
-        }
-        {
-            let mut attachments = self
-                .attachments
-                .lock()
-                .expect("attachments lock not poisoned");
-            let Some(attachment) = attachments.get_mut(name) else {
-                return Ok(());
-            };
-            attachment.storage.page_count = engine.page_count;
-            attachment.storage.free_pages = engine.free_pages.clone();
-            attachment.storage.live_at_compaction = engine.live_at_compaction;
-            attachment.storage.free_gen_txid = engine.free_gen_txid;
-            attachment.storage.live = engine.live;
-        }
-        self.roots
-            .write()
-            .expect("roots lock not poisoned")
-            .attached
-            .insert(name.to_string(), Arc::new(engine.committed));
-        self.plan_epoch.fetch_add(1, Ordering::Release);
-        Ok(())
-    }
-
-    /// One background alone↔shared lease probe. Foreground work never calls this path.
-    fn coordination_tick(&self) {
-        let Some(coordinator) = &self.coordinator else {
-            return;
-        };
-        let result = match coordinator.state() {
-            LeaseState::Alone => self.try_downgrade(coordinator),
-            LeaseState::Shared => self.try_upgrade(coordinator, None),
-            LeaseState::Exclusive | LeaseState::Poisoned => Ok(()),
-        };
-        if result.is_err() {
-            coordinator.set_state(LeaseState::Poisoned);
-        }
-    }
-
-    fn coordination_tick_attachment(&self, name: &str) {
-        let coordinator = self
-            .attachments
-            .lock()
-            .expect("attachments lock not poisoned")
-            .get(name)
-            .and_then(|attachment| attachment.coordinator.as_ref().map(Arc::clone));
-        let Some(coordinator) = coordinator else {
-            return;
-        };
-        let result = match coordinator.state() {
-            LeaseState::Alone => self.try_downgrade(&coordinator),
-            LeaseState::Shared => self.try_upgrade(&coordinator, Some(name)),
-            LeaseState::Exclusive | LeaseState::Poisoned => Ok(()),
-        };
-        if result.is_err() {
-            coordinator.set_state(LeaseState::Poisoned);
-        }
-    }
-
-    fn try_downgrade(&self, coordinator: &FileCoordinator) -> Result<()> {
-        if let Some(no_arrival) = coordinator.try_arrival_exclusive()? {
-            drop(no_arrival);
-            return Ok(());
-        }
-        self.acquire_local_writer();
-        let result = (|| {
-            let _live = self.live.lock().expect("live lock not poisoned");
-            let _transition = coordinator.lock_transition()?;
-            let retry = coordinator.try_arrival_exclusive()?;
-            if retry.is_none() {
-                coordinator.downgrade_presence()?;
-            }
-            drop(retry);
-            Ok(())
-        })();
-        self.release_local_writer();
-        result
-    }
-
-    fn try_upgrade(&self, coordinator: &FileCoordinator, attachment: Option<&str>) -> Result<()> {
-        self.acquire_local_writer();
-        let result = self.try_upgrade_locked(coordinator, attachment);
-        self.release_local_writer();
-        result
-    }
-
-    /// [`try_upgrade`](Self::try_upgrade) for a caller already holding the local writer barrier.
-    fn try_upgrade_locked(
-        &self,
-        coordinator: &FileCoordinator,
-        attachment: Option<&str>,
-    ) -> Result<()> {
-        let _live = self.live.lock().expect("live lock not poisoned");
-        let _transition = coordinator.lock_transition()?;
-        let Some(_arrival) = coordinator.try_arrival_exclusive()? else {
-            return Ok(());
-        };
-        if coordinator.try_upgrade_presence()? {
-            let _commit = coordinator.lock_commit_shared()?;
-            if let Some(name) = attachment {
-                self.reload_attachment_from_pager(name)?;
-            } else {
-                self.reload_from_pager()?;
-            }
-            coordinator.set_state(LeaseState::Alone);
-        }
-        Ok(())
-    }
-
     /// Claim the in-process writer barrier only if it is free right now (compaction never waits —
     /// spec/design/api.md §2.6).
     fn try_acquire_local_writer(&self) -> bool {
@@ -1805,8 +1439,7 @@ impl Shared {
     }
 
     /// Compact database `lname` (`main` or an attachment) under the local writer barrier the caller
-    /// holds (spec/design/api.md §2.6): require presence-exclusive coordination and a drained reader
-    /// watermark, then rewrite the storage at the next version and publish the reloaded root while
+    /// holds (spec/design/api.md §2.6): require a drained reader watermark, then rewrite the storage at the next version and publish the reloaded root while
     /// still holding the watermark lock, so no reader pins in between.
     fn compact_locked(&self, lname: &str, name: &str) -> Result<()> {
         let main = lname == "main";
@@ -1821,27 +1454,6 @@ impl Shared {
         };
         if let Some(coordinator) = &coordinator {
             coordinator.check_pid()?;
-            if coordinator.state() == LeaseState::Shared {
-                // A peer may have closed since the probe last looked: retry the upgrade now.
-                self.try_upgrade_locked(coordinator, if main { None } else { Some(lname) })?;
-            }
-            match coordinator.state() {
-                LeaseState::Alone | LeaseState::Exclusive => {}
-                LeaseState::Shared => {
-                    return Err(EngineError::new(
-                        SqlState::ObjectInUse,
-                        format!(
-                            "cannot compact database \"{name}\" while another process has it open"
-                        ),
-                    ));
-                }
-                LeaseState::Poisoned => {
-                    return Err(EngineError::new(
-                        SqlState::IoError,
-                        "shared-file coordinator is poisoned",
-                    ));
-                }
-            }
         }
         #[allow(unused_mut)]
         let mut live = self.live.lock().expect("live lock not poisoned");
@@ -1995,41 +1607,10 @@ impl Shared {
                     can_compact,
                     stages_rows,
                 };
-                let shared = att
-                    .coordinator
-                    .as_ref()
-                    .is_some_and(|coordinator| coordinator.state() == LeaseState::Shared);
-                if shared {
-                    att.storage.paging.pager().check_commit()?;
-                    let write = snap.incremental_image(
-                        att.storage.page_size,
-                        att.storage.page_count,
-                        &att.storage.free_pages,
-                        false,
-                        Some(&att.storage.paging),
-                    )?;
-                    let live = att.storage.admit_file(&write, &budget)?;
-                    let result = att.storage.commit_file_shared(
-                        snap,
-                        write,
-                        live,
-                        att.coordinator
-                            .as_ref()
-                            .expect("shared attachment has coordinator"),
-                    );
-                    if result.is_err() && att.storage.paging.pager().commit_requires_reopen() {
-                        att.coordinator
-                            .as_ref()
-                            .expect("shared attachment has coordinator")
-                            .set_state(LeaseState::Poisoned);
-                    }
-                    result?;
-                } else {
-                    // A local reader pins the whole roots map, so reuse is safe only when that common
-                    // watermark says no older attachment root is live.
-                    att.storage
-                        .commit_durable(snap, can_reclaim, can_reclaim, Some(&budget))?;
-                }
+                // A local reader pins the whole roots map, so reuse is safe only when that common
+                // watermark says no older attachment root is live.
+                att.storage
+                    .commit_durable(snap, can_reclaim, can_reclaim, Some(&budget))?;
                 snap.demote_clean_leaves(); // post-commit residency flip (bplus-reshape.md B4)
             } else {
                 let budget = prev.as_deref().map(|prev| BudgetCtx {
@@ -2398,11 +1979,7 @@ impl Shared {
         // so both hold and behavior (and on-disk bytes) are identical to an ungated commit. The watermark is
         // computed BEFORE the storage lock so the `live` lock is never held under it (a clean lock order).
         let oldest = self.oldest_live_version(snap.txid);
-        let shared = self
-            .coordinator
-            .as_ref()
-            .is_some_and(|c| c.state() == LeaseState::Shared);
-        let can_reclaim = !shared && oldest == snap.txid;
+        let can_reclaim = oldest == snap.txid;
         let prev = Arc::clone(
             &self
                 .roots
@@ -2418,41 +1995,14 @@ impl Shared {
         {
             return Err(handoff::stale_role());
         }
-        let can_reuse = !shared && oldest >= st.free_gen_txid;
+        let can_reuse = oldest >= st.free_gen_txid;
         let budget = BudgetCtx {
             name: "main",
             prev: &prev,
             can_compact,
             stages_rows,
         };
-        if shared && st.path.is_some() {
-            st.paging.pager().check_commit()?;
-            let write = snap.incremental_image(
-                st.page_size,
-                st.page_count,
-                &st.free_pages,
-                false,
-                Some(&st.paging),
-            )?;
-            let live = st.admit_file(&write, &budget)?;
-            let result = st.commit_file_shared(
-                snap,
-                write,
-                live,
-                self.coordinator
-                    .as_ref()
-                    .expect("shared state has coordinator"),
-            );
-            if result.is_err() && st.paging.pager().commit_requires_reopen() {
-                self.coordinator
-                    .as_ref()
-                    .expect("shared state has coordinator")
-                    .set_state(LeaseState::Poisoned);
-            }
-            result
-        } else {
-            st.commit_durable(snap, can_reclaim, can_reuse, Some(&budget))
-        }
+        st.commit_durable(snap, can_reclaim, can_reuse, Some(&budget))
     }
 
     /// Whether MAIN is file-backed (durable) rather than in-memory — the input to the one-durable-writer
@@ -2648,8 +2198,6 @@ impl Database {
             }),
             writer_active: Mutex::new(false),
             writer_free: Condvar::new(),
-            held_coordinators: Mutex::new(Vec::new()),
-            held_coordinator_count: AtomicUsize::new(0),
             live: Mutex::new(LiveRegistry::default()),
             storage: Mutex::new(storage),
             attachments: Mutex::new(HashMap::new()),
@@ -2664,14 +2212,6 @@ impl Database {
             plan_epoch: AtomicU64::new(0),
             env,
         });
-        if let Some(coordinator) = &shared.coordinator {
-            let weak: Weak<Shared> = Arc::downgrade(&shared);
-            coordinator.start_probe(Arc::new(move || {
-                if let Some(shared) = weak.upgrade() {
-                    shared.coordination_tick();
-                }
-            }));
-        }
         Database(shared)
     }
 
@@ -2959,12 +2499,11 @@ impl Database {
                 )?;
                 engine.set_environment(env.clone());
                 let canonical = canonical.to_path_buf();
-                if opts.locking == Locking::Service {
+                if coordinator.as_ref().is_some_and(FileCoordinator::serving) {
                     // The creator took presence EX: it is the owner and serves, whatever its
                     // ownership preference (README.md §6.1). The handle keeps the path claim
                     // through its roles.
-                    let mut coordinator = coordinator.take().expect("service creation coordinates");
-                    coordinator.keep_path_claim();
+                    let coordinator = coordinator.take().expect("service creation coordinates");
                     let db = Database::from_engine_coordinated(engine, None);
                     db.0.storage
                         .lock()
@@ -2973,7 +2512,7 @@ impl Database {
                         .limit = opts.max_storage_bytes;
                     let open_opts = OpenOptions {
                         skip_fsync: opts.skip_fsync,
-                        locking: Locking::Service,
+                        locking: Locking::Auto,
                         file_lock_timeout_ms: opts.file_lock_timeout_ms,
                         environment: env,
                         max_storage_bytes: opts.max_storage_bytes,
@@ -3017,19 +2556,15 @@ impl Database {
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
-        if opts.locking == Locking::Service {
+        let locking = crate::coordinator::resolve_mode(opts.locking)?;
+        if locking == Locking::Auto {
             return open_service(path.as_ref(), opts);
         }
         let max_storage_bytes = opts.max_storage_bytes;
-        let coordinator =
-            FileCoordinator::open(path.as_ref(), opts.locking, opts.file_lock_timeout_ms)?;
+        let coordinator = FileCoordinator::open(path.as_ref(), locking, opts.file_lock_timeout_ms)?;
         let canonical = coordinator
             .as_ref()
             .map_or(path.as_ref(), FileCoordinator::path);
-        let commit = match &coordinator {
-            Some(c) => Some(c.lock_commit_shared()?),
-            None => None,
-        };
         let engine = Engine::open_with_options(
             canonical,
             OpenOptions {
@@ -3038,7 +2573,6 @@ impl Database {
                 ..opts
             },
         )?;
-        drop(commit);
         let db = Database::from_engine_coordinated(engine, coordinator);
         db.0.storage
             .lock()
@@ -3095,23 +2629,18 @@ impl Database {
         let file_backing: Option<(Storage, Snapshot, Option<Arc<FileCoordinator>>)> = if source.file
         {
             let path = source.path.as_ref().expect("a file source carries a path");
-            if source.locking == Locking::Service {
-                // Attachments join the page service with its write path (page-service.md §16 phase 3).
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "file attachments do not support the page service yet",
-                ));
-            }
+            // A file attachment is a non-serving owner of its file until attachments join the page
+            // service (page-service.md §5.5): another process holding the file makes the attach
+            // wait, then fail 55006.
+            let locking = match source.locking {
+                Locking::Auto => Locking::Exclusive,
+                other => other,
+            };
             let coordinator =
-                FileCoordinator::open(path, source.locking, source.file_lock_timeout_ms)?
-                    .map(Arc::new);
+                FileCoordinator::open(path, locking, source.file_lock_timeout_ms)?.map(Arc::new);
             let canonical = coordinator
                 .as_ref()
                 .map_or(path.as_path(), |coordinator| coordinator.path());
-            let commit = match &coordinator {
-                Some(coordinator) => Some(coordinator.lock_commit_shared()?),
-                None => None,
-            };
             // Through main's file host (crate::filehost), so the simulated filesystem serves
             // attachments too.
             let files = self
@@ -3137,7 +2666,6 @@ impl Database {
                     ..OpenOptions::default()
                 },
             )?;
-            drop(commit);
             let paging = engine
                 .paging
                 .clone()
@@ -3222,24 +2750,6 @@ impl Database {
             Ok(())
         })();
         self.0.release_writer();
-        if result.is_ok() {
-            let coordinator = self
-                .0
-                .attachments
-                .lock()
-                .expect("attachments lock not poisoned")
-                .get(&lname)
-                .and_then(|attachment| attachment.coordinator.as_ref().map(Arc::clone));
-            if let Some(coordinator) = coordinator {
-                let weak = Arc::downgrade(&self.0);
-                let attachment_name = lname.clone();
-                coordinator.start_probe(Arc::new(move || {
-                    if let Some(shared) = weak.upgrade() {
-                        shared.coordination_tick_attachment(&attachment_name);
-                    }
-                }));
-            }
-        }
         result
     }
 
@@ -3415,6 +2925,8 @@ impl Database {
 #[cfg(unix)]
 use handoff::{open_service, start_service_owner};
 
+/// Off Unix `Locking::Auto` resolves to a non-serving owner (page-service.md §14), so no handle
+/// serves or becomes a page client.
 #[cfg(not(unix))]
 fn start_service_owner(
     _db: Database,
@@ -3422,12 +2934,12 @@ fn start_service_owner(
     _coordinator: FileCoordinator,
     _opts: OpenOptions,
 ) -> Result<Database> {
-    Err(crate::coordinator::service_unsupported())
+    unreachable!("the page service is Unix-only")
 }
 
 #[cfg(not(unix))]
 fn open_service(_path: &Path, _opts: OpenOptions) -> Result<Database> {
-    Err(crate::coordinator::service_unsupported())
+    unreachable!("the page service is Unix-only")
 }
 
 /// The access mode a [`Session`] was minted with (spec/design/session.md §2.4/§5.1). Distinct from
@@ -3549,8 +3061,8 @@ impl Session {
             && !self.engine.in_transaction()
             && !self.engine.stmt_is_write_with_views(ast)
         {
-            // refresh_and_pin: shared mode's meta refresh, an owner's adoption of client commits, or
-            // a page client's begin_read, then the atomic load+register.
+            // refresh_and_pin: an owner's adoption of client commits or a page client's begin_read,
+            // then the atomic load+register.
             let (snap, attached, version, generation) = self.shared.refresh_and_pin()?;
             self.base_version = version;
             self.engine.committed = (*snap).clone();
@@ -4439,15 +3951,6 @@ impl Database {
             free_pages: st.free_pages.clone(),
             paging: st.paging.clone(),
         }
-    }
-
-    /// A shared core over `engine` coordinated by `coordinator` (the simulator's processes, which
-    /// acquire the coordinator through a simulated lock host).
-    pub(crate) fn sim_from_engine_coordinated(
-        engine: Engine,
-        coordinator: FileCoordinator,
-    ) -> Database {
-        Self::from_engine_coordinated(engine, Some(coordinator))
     }
 
     /// Route MAIN's file operations (compaction, the first commit's directory barrier, opening a

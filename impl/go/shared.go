@@ -104,8 +104,7 @@ type sharedCore struct {
 	roots atomic.Pointer[roots]
 	// writeMu is the single-writer gate: a goroutine holds it for its whole write transaction, so a
 	// second Write blocks until the holder commits or rolls back (CLAUDE.md §3 — at most one writer).
-	writeMu          sync.Mutex
-	heldCoordinators []*fileCoordinator // exact shared writer locks acquired with writeMu
+	writeMu sync.Mutex
 	// liveMu guards live, the live-reader registry (transactions.md §8): pinned version → refcount.
 	// Its minimum key is the reclamation watermark (several readers may pin the same version).
 	liveMu sync.Mutex
@@ -125,7 +124,7 @@ type sharedCore struct {
 	attachments     map[string]*attachment
 	attachmentCount atomic.Int64
 	coordinator     *fileCoordinator
-	// handoff and role are set under the test-only LockingService (page-service.md §4, §8): role is the
+	// handoff and role are set under the page service (LockingAuto) (page-service.md §4, §8): role is the
 	// handle's current role — the owner, a page client, or neither between roles — replaced between
 	// transactions by pageservice_handoff.go. liveGen is the role generation the live registry belongs
 	// to (guarded by liveMu): a pin of an older role deregisters as a no-op. writerRole is the role the
@@ -153,55 +152,10 @@ func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
 		}
 		return nil
 	}
-	if c.attachmentCount.Load() == 0 {
-		if c.coordinator == nil {
-			return nil
-		}
-		if err := c.coordinator.checkPID(); err != nil {
-			c.writeMu.Unlock()
-			return err
-		}
-		switch c.coordinator.lease() {
-		case leaseAlone, leaseExclusive, leaseServiceOwner:
-			return nil
-		case leasePoisoned:
-			c.writeMu.Unlock()
-			return newError(IoError, "shared-file coordinator is poisoned")
-		}
-	}
-	coordinators := c.writableCoordinators()
-	held := make([]*fileCoordinator, 0, len(coordinators))
-	unlock := func() {
-		for i := len(held) - 1; i >= 0; i-- {
-			held[i].unlockWriter()
-		}
-	}
-	for _, coordinator := range coordinators {
-		if err := coordinator.checkPID(); err != nil {
-			unlock()
-			c.writeMu.Unlock()
-			return err
-		}
-		switch coordinator.lease() {
-		case leaseShared:
-			if err := coordinator.lockWriter(timeoutMs); err != nil {
-				unlock()
-				c.writeMu.Unlock()
-				return err
-			}
-			held = append(held, coordinator)
-		case leasePoisoned:
-			unlock()
-			c.writeMu.Unlock()
-			return newError(IoError, "shared-file coordinator is poisoned")
-		}
-	}
-	if err := c.refreshShared(); err != nil {
-		unlock()
+	if err := c.checkCoordinatorPIDs(); err != nil {
 		c.writeMu.Unlock()
 		return err
 	}
-	c.heldCoordinators = held
 	return nil
 }
 
@@ -209,47 +163,13 @@ func (c *sharedCore) releaseWriter() {
 	if c.handoff != nil {
 		c.releaseServiceWrite()
 	}
-	for i := len(c.heldCoordinators) - 1; i >= 0; i-- {
-		c.heldCoordinators[i].unlockWriter()
-	}
-	c.heldCoordinators = nil
 	c.writeMu.Unlock()
 }
 
-func (c *sharedCore) writableCoordinators() []*fileCoordinator {
-	c.attachmentsMu.RLock()
-	defer c.attachmentsMu.RUnlock()
-	coordinators := make([]*fileCoordinator, 0, len(c.attachments)+1)
-	if c.coordinator != nil {
-		coordinators = append(coordinators, c.coordinator)
-	}
-	for _, attachment := range c.attachments {
-		if attachment.mode == attachReadWrite && attachment.coordinator != nil {
-			coordinators = append(coordinators, attachment.coordinator)
-		}
-	}
-	sort.Slice(coordinators, func(i, j int) bool { return coordinators[i].path < coordinators[j].path })
-	return coordinators
-}
-
+// hasSharedCoordinator reports whether other processes may commit to this database, so a read session
+// refreshes at its first read: true under the page service.
 func (c *sharedCore) hasSharedCoordinator() bool {
-	if c.handoff != nil {
-		return true
-	}
-	if c.coordinator != nil && c.coordinator.lease() == leaseShared {
-		return true
-	}
-	if c.attachmentCount.Load() == 0 {
-		return false
-	}
-	c.attachmentsMu.RLock()
-	defer c.attachmentsMu.RUnlock()
-	for _, attachment := range c.attachments {
-		if attachment.coordinator != nil && attachment.coordinator.lease() == leaseShared {
-			return true
-		}
-	}
-	return false
+	return c.handoff != nil
 }
 
 func (c *sharedCore) checkCoordinatorPIDs() error {
@@ -279,224 +199,15 @@ func (c *sharedCore) attachment(name string) *attachment {
 	return c.attachments[name]
 }
 
+// refreshShared brings a transaction begin up to date with other processes: an owner adopts its page
+// clients' commits (page-service.md §7). A page client refreshes only at a read begin that pins a local
+// reader (refreshAndPin): a begin_read pin taken here would have no reader to keep it
+// (spec/pageservice/README.md §6.3).
 func (c *sharedCore) refreshShared() error {
 	if c.handoff != nil {
-		// A page client refreshes only at a read begin that pins a local reader (refreshAndPin): a
-		// begin_read pin taken here would have no reader to keep it (spec/pageservice/README.md §6.3).
 		return c.adoptForeign(c.pageOwner())
 	}
-	if !c.hasSharedCoordinator() {
-		return nil
-	}
-	c.liveMu.Lock()
-	defer c.liveMu.Unlock()
-	if coord := c.coordinator; coord != nil && coord.lease() == leaseShared {
-		if err := coord.checkPID(); err != nil {
-			return err
-		}
-		if err := coord.lockCommitShared(); err != nil {
-			return err
-		}
-		err := c.reloadFromPager()
-		coord.unlockCommit()
-		if err != nil {
-			return err
-		}
-	}
-	type coordinatedAttachment struct {
-		name  string
-		coord *fileCoordinator
-	}
-	c.attachmentsMu.RLock()
-	coordinated := make([]coordinatedAttachment, 0, len(c.attachments))
-	for name, attachment := range c.attachments {
-		if attachment.coordinator != nil {
-			coordinated = append(coordinated, coordinatedAttachment{name: name, coord: attachment.coordinator})
-		}
-	}
-	c.attachmentsMu.RUnlock()
-	sort.Slice(coordinated, func(i, j int) bool { return coordinated[i].coord.path < coordinated[j].coord.path })
-	for _, attachment := range coordinated {
-		if attachment.coord.lease() != leaseShared {
-			continue
-		}
-		if err := attachment.coord.checkPID(); err != nil {
-			return err
-		}
-		if err := attachment.coord.lockCommitShared(); err != nil {
-			return err
-		}
-		err := c.reloadAttachmentFromPager(attachment.name)
-		attachment.coord.unlockCommit()
-		if err != nil {
-			return err
-		}
-	}
 	return nil
-}
-
-func (c *sharedCore) reloadFromPager() error {
-	c.storage.mu.Lock()
-	if err := c.storage.paging.withPager(func(p *pager) error { return p.refreshAllocatedPages() }); err != nil {
-		c.storage.mu.Unlock()
-		return err
-	}
-	loaded, err := loadEngineSharedPaging(c.storage.paging, c.env)
-	if err != nil {
-		c.storage.mu.Unlock()
-		return err
-	}
-	current := c.roots.Load().committed.txid
-	if loaded.committed.txid <= current {
-		c.storage.mu.Unlock()
-		return nil
-	}
-	c.storage.pageCount = loaded.pageCount
-	c.storage.freePages = loaded.freePages
-	c.storage.liveAtCompaction = loaded.liveAtCompaction
-	c.storage.freeGenTxid = loaded.freeGenTxid
-	c.storage.live = loaded.live
-	c.storage.mu.Unlock()
-	rt := c.roots.Load()
-	c.roots.Store(&roots{committed: loaded.committed, attached: rt.attached})
-	c.planEpoch.Add(1)
-	return nil
-}
-
-func (c *sharedCore) reloadAttachmentFromPager(name string) error {
-	attachment := c.attachment(name)
-	if attachment == nil {
-		return nil
-	}
-	attachment.storage.mu.Lock()
-	if err := attachment.storage.paging.withPager(func(p *pager) error { return p.refreshAllocatedPages() }); err != nil {
-		attachment.storage.mu.Unlock()
-		return err
-	}
-	loaded, err := loadEngineSharedPaging(attachment.storage.paging, c.env)
-	if err != nil {
-		attachment.storage.mu.Unlock()
-		return err
-	}
-	current := c.roots.Load().attached[name]
-	if current != nil && loaded.committed.txid <= current.txid {
-		attachment.storage.mu.Unlock()
-		return nil
-	}
-	attachment.storage.pageCount = loaded.pageCount
-	attachment.storage.freePages = loaded.freePages
-	attachment.storage.liveAtCompaction = loaded.liveAtCompaction
-	attachment.storage.freeGenTxid = loaded.freeGenTxid
-	attachment.storage.live = loaded.live
-	attachment.storage.mu.Unlock()
-	old := c.roots.Load()
-	attached := make(map[string]*snapshot, len(old.attached))
-	for key, root := range old.attached {
-		attached[key] = root
-	}
-	attached[name] = loaded.committed
-	c.roots.Store(&roots{committed: old.committed, attached: attached})
-	c.planEpoch.Add(1)
-	return nil
-}
-
-func (c *sharedCore) coordinationTick() {
-	coord := c.coordinator
-	if coord == nil {
-		return
-	}
-	var err error
-	switch coord.lease() {
-	case leaseAlone:
-		err = c.tryDowngrade(coord)
-	case leaseShared:
-		err = c.tryUpgrade(coord, "")
-	}
-	if err != nil {
-		coord.setLease(leasePoisoned)
-	}
-}
-
-func (c *sharedCore) coordinationTickAttachment(name string, coord *fileCoordinator) {
-	var err error
-	switch coord.lease() {
-	case leaseAlone:
-		err = c.tryDowngrade(coord)
-	case leaseShared:
-		err = c.tryUpgrade(coord, name)
-	}
-	if err != nil {
-		coord.setLease(leasePoisoned)
-	}
-}
-
-func (c *sharedCore) tryDowngrade(coord *fileCoordinator) error {
-	noArrival, err := coord.tryArrivalExclusive()
-	if err != nil {
-		return classifyLockError(err)
-	}
-	if noArrival {
-		coord.unlockArrival()
-		return nil
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	c.liveMu.Lock()
-	defer c.liveMu.Unlock()
-	if err := coord.lockTransition(); err != nil {
-		return err
-	}
-	defer coord.unlockTransition()
-	retry, err := coord.tryArrivalExclusive()
-	if err != nil {
-		return classifyLockError(err)
-	}
-	if retry {
-		coord.unlockArrival()
-		return nil
-	}
-	return coord.downgradePresence()
-}
-
-func (c *sharedCore) tryUpgrade(coord *fileCoordinator, attachment string) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.tryUpgradeLocked(coord, attachment)
-}
-
-// tryUpgradeLocked is tryUpgrade for a caller already holding the local writer gate (writeMu).
-func (c *sharedCore) tryUpgradeLocked(coord *fileCoordinator, attachment string) error {
-	c.liveMu.Lock()
-	defer c.liveMu.Unlock()
-	if err := coord.lockTransition(); err != nil {
-		return err
-	}
-	defer coord.unlockTransition()
-	arrival, err := coord.tryArrivalExclusive()
-	if err != nil {
-		return classifyLockError(err)
-	}
-	if !arrival {
-		return nil
-	}
-	defer coord.unlockArrival()
-	upgraded, err := coord.tryUpgradePresence()
-	if err != nil || !upgraded {
-		return err
-	}
-	if err := coord.lockCommitShared(); err != nil {
-		return err
-	}
-	if attachment == "" {
-		err = c.reloadFromPager()
-	} else {
-		err = c.reloadAttachmentFromPager(attachment)
-	}
-	coord.unlockCommit()
-	if err == nil {
-		coord.setLease(leaseAlone)
-	}
-	return err
 }
 
 // attachMode is an attachment's write disposition (attached-databases.md §4). A read-only attachment
@@ -732,22 +443,14 @@ func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 		guard = c.roleGuard(r)
 	}
 	oldest := c.oldestLiveVersion(snap.txid)
-	shared := c.coordinator != nil && c.coordinator.lease() == leaseShared
-	canReclaim := !shared && oldest == snap.txid
-	canReuse := !shared && oldest >= c.storage.freeGenTxid
+	canReclaim := oldest == snap.txid
+	canReuse := oldest >= c.storage.freeGenTxid
 	budget := &budgetCtx{
 		name:       "main",
 		prev:       c.roots.Load().committed,
 		canCompact: c.canCompactCommitted(),
 		stagesRows: stagesRows,
 		guard:      guard,
-	}
-	if shared && c.storage.path != "" {
-		err := c.storage.commitShared(snap, c.coordinator, budget)
-		if err != nil && c.storage.paging.commitRequiresReopen() {
-			c.coordinator.setLease(leasePoisoned)
-		}
-		return err
 	}
 	return c.storage.commitDurable(snap, canReclaim, canReuse, budget)
 }
@@ -782,79 +485,6 @@ func (c *sharedCore) persistClient(snap *snapshot, stagesRows bool, r *serviceRo
 	})
 	r.paging.pool.invalidateAll()
 	return err
-}
-
-// commitShared is the co-resident (append-only) file commit: admitted under the file form of
-// max_storage_bytes (memory.md §8.7) before any page is written.
-func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator, budget *budgetCtx) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
-		return err
-	}
-	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, false, st.paging)
-	if err != nil {
-		return err
-	}
-	live, err := st.admitFile(write, budget)
-	if err != nil {
-		return err
-	}
-	plan, err := planSharedValidatedCommit(st.pageSize, snap, write, live.live)
-	if err != nil {
-		return err
-	}
-	st.syncDirectoryOnce()
-	if err := st.paging.withPager(func(p *pager) error {
-		if err := p.beginValidatedCommit(); err != nil {
-			return err
-		}
-		if err := p.refreshAllocatedPages(); err != nil {
-			return err
-		}
-		if err := p.reserve(plan.pageCount); err != nil {
-			return err
-		}
-		for _, pg := range write.pages {
-			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
-				return err
-			}
-		}
-		for _, pg := range plan.pages {
-			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	if err := verifyLiveCount(snap, st.paging, write, live); err != nil {
-		return err
-	}
-	if err := coordinator.lockCommitExclusive(); err != nil {
-		return err
-	}
-	err = st.paging.withPager(func(p *pager) error {
-		if err := p.writeBlock(uint32(snap.txid&1), plan.meta); err != nil {
-			return err
-		}
-		if err := p.sync(); err != nil {
-			return err
-		}
-		p.finishValidatedCommit(plan.meta)
-		return nil
-	})
-	coordinator.unlockCommit()
-	if err != nil {
-		return err
-	}
-	st.pageCount = plan.pageCount
-	st.freePages = nil
-	st.liveAtCompaction = 0
-	st.freeGenTxid = snap.txid
-	st.live = live
-	return nil
 }
 
 // commitDurable serializes the writer and gates allocation through the reader
@@ -1567,9 +1197,6 @@ func sharedCoreFromEngineCoordinated(e *engine, coordinator *fileCoordinator) *s
 		freeGenTxid:          e.freeGenTxid, // the loaded free-list is "as of" the committed version (§8 reuse gate)
 		live:                 e.live,
 	}
-	if coordinator != nil {
-		coordinator.startProbe(c.coordinationTick)
-	}
 	return c
 }
 
@@ -1693,10 +1320,10 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		}
 		return nil, err
 	}
-	if opts.Locking == LockingService {
+	if coordinator != nil && coordinator.lease() == leaseServiceOwner {
 		openOpts := OpenOptions{
 			SkipFsync:                  opts.SkipFsync,
-			Locking:                    LockingService,
+			Locking:                    LockingAuto,
 			FileLockTimeoutMs:          opts.FileLockTimeoutMs,
 			IdleInTransactionTimeoutMs: opts.IdleInTransactionTimeoutMs,
 			IdleSessionTimeoutMs:       opts.IdleSessionTimeoutMs,
@@ -1746,24 +1373,19 @@ func OpenDatabase(path string) (*Database, error) {
 // OpenDatabaseWithOptions opens an existing file-backed database at path with explicit open settings
 // (buffer-pool budget, read-only mode, work-mem) and returns the host handle with its default session.
 func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
-	if opts.Locking == LockingService {
-		return openServiceDatabase(path, opts)
-	}
-	coordinator, real, err := prepareOpenCoordinator(path, opts.Locking, opts.FileLockTimeoutMs)
+	mode, err := resolvedLocking(opts.Locking)
 	if err != nil {
 		return nil, err
 	}
-	if coordinator != nil {
-		if err := coordinator.lockCommitShared(); err != nil {
-			coordinator.close()
-			return nil, err
-		}
+	if mode == LockingAuto {
+		return openServiceDatabase(path, opts)
+	}
+	coordinator, real, err := prepareOpenCoordinator(path, mode, opts.FileLockTimeoutMs)
+	if err != nil {
+		return nil, err
 	}
 	opts.Locking = LockingNone
 	e, err := openWithOptions(real, opts)
-	if coordinator != nil {
-		coordinator.unlockCommit()
-	}
 	if err != nil {
 		if coordinator != nil {
 			coordinator.close()
@@ -1862,25 +1484,18 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	if source.file {
 		var real string
 		var err error
-		if source.locking == LockingService {
-			// Attachments join the page service with its write path (page-service.md §16 phase 3).
-			return newError(FeatureNotSupported, "file attachments do not support the page service yet")
+		// A file attachment is a non-serving owner of its file until attachments join the page service
+		// (page-service.md §5.5): another process holding the file makes the attach wait, then fail 55006.
+		locking := source.locking
+		if locking == LockingAuto {
+			locking = LockingExclusive
 		}
-		coordinator, real, err = prepareOpenCoordinator(source.path, source.locking, source.fileLockTimeoutMs)
+		coordinator, real, err = prepareOpenCoordinator(source.path, locking, source.fileLockTimeoutMs)
 		if err != nil {
 			return err
 		}
-		if coordinator != nil {
-			if err := coordinator.lockCommitShared(); err != nil {
-				coordinator.close()
-				return err
-			}
-		}
 		// Through main's file host (filehost.go), so the simulated filesystem serves attachments too.
 		e, err := openVia(db.core.storage.fileHost(), real, OpenOptions{ReadOnly: readOnly, Locking: LockingNone, Environment: db.core.env})
-		if coordinator != nil {
-			coordinator.unlockCommit()
-		}
 		if err != nil {
 			if coordinator != nil {
 				coordinator.close()
@@ -1955,9 +1570,6 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	c.liveMu.Lock() // publish under the pin lock (§8), like Session.publish
 	c.roots.Store(&roots{committed: old.committed, attached: na})
 	c.liveMu.Unlock()
-	if coordinator != nil {
-		coordinator.startProbe(func() { c.coordinationTickAttachment(lname, coordinator) })
-	}
 	return nil
 }
 
@@ -2068,29 +1680,16 @@ func (c *sharedCore) compactLocked(lname, name string) error {
 	main := lname == "main"
 	st := c.storage
 	coord := c.coordinator
-	attachmentName := ""
 	if !main {
 		att := c.attachment(lname)
 		if att == nil {
 			return newError(UndefinedObject, `database "`+name+`" is not attached`)
 		}
-		st, coord, attachmentName = att.storage, att.coordinator, lname
+		st, coord = att.storage, att.coordinator
 	}
 	if coord != nil {
 		if err := coord.checkPID(); err != nil {
 			return err
-		}
-		if coord.lease() == leaseShared {
-			// A peer may have closed since the probe last looked: retry the upgrade now.
-			if err := c.tryUpgradeLocked(coord, attachmentName); err != nil {
-				return err
-			}
-		}
-		switch coord.lease() {
-		case leaseShared:
-			return newError(ObjectInUse, `cannot compact database "`+name+`" while another process has it open`)
-		case leasePoisoned:
-			return newError(IoError, "shared-file coordinator is poisoned")
 		}
 	}
 	c.liveMu.Lock()

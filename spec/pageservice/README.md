@@ -11,9 +11,8 @@ byte fixtures. Like the file format ([../fileformat/](../fileformat/README.md)),
 | [fixtures.toml](fixtures.toml) | Byte fixtures: declarative field values → the exact frame bytes, plus malformed frames every decoder must reject. |
 | [verify.rb](verify.rb) | Independent Ruby reference codec. It checks the catalog's shape, encodes every fixture from its fields and compares the bytes, decodes the bytes back, and checks that each malformed frame is rejected. `--generate` rewrites the fixture bytes. Run via `mise run verify`. |
 
-[locking.md](../design/locking.md) remains the binding multi-process protocol until page-service.md
-phase 4 lands. Until then a core speaks this protocol only under the test-only `locking = service`
-value.
+A core speaks this protocol under `locking = auto` (page-service.md §12); [locking.md](../design/locking.md)
+owns the coordination bundle and its locks.
 
 ## 1. Conventions
 
@@ -287,9 +286,10 @@ Only a `presence EX` holder may unlink a stale endpoint at its own path before b
 removes its endpoint when it closes. Directory search permission is the access control: the kernel
 checks it on `connect`, so only processes of the owner's user can connect (page-service.md §13).
 
-Windows serving is not yet specified (page-service.md §14): `locking = service` fails `0A000` there.
+Windows serving is not yet specified (page-service.md §14): there `auto` is a non-serving owner
+(`exclusive`, locking.md §1).
 
-## 6. Roles under `locking = service` (phases 2–4)
+## 6. Roles under `locking = auto` (phases 2–4)
 
 The behavior every core implements for the read path, the write path, and handoff. It is host state, so the real-process corpus
 (`spec/conformance/process/`) and the corpus-through-a-client run (§7) check it, not byte fixtures.
@@ -301,7 +301,7 @@ The behavior every core implements for the read path, the write path, and handof
    validate the marker.
 2. Loop until `file_lock_timeout_ms`:
    - Try `presence EX` without waiting. On success the opener is the **owner**: it releases `arrival`
-     and opens the file as an alone process does, without a join-window probe.
+     and opens the file (recovery, and the stabilization a writable handle performs).
    - Otherwise read the owner record. If it parses, names this process's uid, and is serving,
      connect to its endpoint and send `hello`. On `hello_ok` the opener is a **client**: it releases
      `arrival` and closes its bundle handles (a client holds no bundle lock, page-service.md §4.2). A
@@ -314,9 +314,10 @@ An opener whose ownership preference is `never` (§6.5) skips the `presence EX` 
 when no owner answers. A `hello` refused with `53300` (the owner's connection limit, §6.5) fails the
 open at once, like `0A000`.
 
-`create` under `locking = service` takes `presence EX` with the exclusive acquisition loop and is the
-owner, whatever its ownership preference. A client whose owner exits re-elects (§6.5). File attachments do not support `locking = service` yet (`0A000`);
-the cross-owner gate order of page-service.md §5.5 lands with them.
+`create` under `locking = auto` takes `presence EX` with the exclusive acquisition loop and is the
+owner, whatever its ownership preference. A client whose owner exits re-elects (§6.5). File
+attachments are non-serving owners of their files (locking.md §4) until they join the service with the
+cross-owner gate order of page-service.md §5.5.
 
 ### 6.2 The owner
 
@@ -527,7 +528,7 @@ election fails at once; a re-electing client keeps trying until its open timeout
 
 `mise run conformance:service` runs the SQL corpus with each core as a page client of another core's
 owner (Rust→Go, Go→TS, TS→Rust, as client→owner). It is the disk storage mode (conformance.md §3)
-with the owner out of process: the harness creates the database under `locking = service`, hands it to
+with the owner out of process: the harness creates the database under the default `locking = auto`, hands it to
 the other core's owner actor, and runs **every record, writes included,** on a page client, reopening a
 fresh client handle and session before each record as the disk mode reopens its handle. Rows, errors,
 plans, and costs must match the corpus exactly, because page reads are logical cost units. Files

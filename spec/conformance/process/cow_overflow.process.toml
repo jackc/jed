@@ -1,7 +1,7 @@
 schema_version = 1
 name = "validated-cow-overflow-handoff"
 description = "Recover a shared manifest fixture, preserve a pinned reader, replace a killed writer, and compare incremental bytes across cores."
-requires = ["file.shared_process"]
+requires = ["file.page_service"]
 fixture = "fileformat/fixtures/cow_overflow.jed"
 byte_identical = true
 

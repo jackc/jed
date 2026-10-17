@@ -1,7 +1,7 @@
 schema_version = 1
-name = "shared-file-attachment-handoff"
-description = "Two handles with independent main files coordinate one writable file attachment."
-requires = ["file.shared_process"]
+name = "file-attachment-ownership"
+description = "A file attachment owns its file as a non-serving owner until attachments join the page service: a second handle's attach fails 55006 while the first holds it, and succeeds once the first closes or dies."
+requires = ["file.page_service"]
 
 [[step]]
 actor = "b"
@@ -46,72 +46,38 @@ actor = "b"
 command = "attach"
 name = "work"
 path = "attachment"
+expect_error = "55006"
 
 [[step]]
 actor = "a"
-command = "read_open"
-
-[[step]]
-actor = "a"
-command = "read_query_i64"
-sql = "SELECT id FROM work.t ORDER BY id"
-expect = "1"
-
-[[step]]
-actor = "b"
 command = "exec"
 sql = "INSERT INTO work.t VALUES (2)"
 
 [[step]]
 actor = "a"
-command = "read_query_i64"
-sql = "SELECT id FROM work.t ORDER BY id"
-expect = "1"
+command = "close"
 
 [[step]]
-actor = "a"
-command = "read_close"
+actor = "b"
+command = "attach"
+name = "work"
+path = "attachment"
 
 [[step]]
-actor = "a"
+actor = "b"
 command = "query_i64"
 sql = "SELECT id FROM work.t ORDER BY id"
 expect = "1,2"
 
 [[step]]
-actor = "a"
+actor = "b"
 command = "write_open"
 argument = "0"
 
 [[step]]
-actor = "a"
+actor = "b"
 command = "write_exec"
 sql = "INSERT INTO work.t VALUES (3)"
-
-[[step]]
-actor = "b"
-command = "write_open"
-argument = "50"
-expect_error = "55P03"
-
-[[step]]
-actor = "a"
-command = "write_commit"
-
-[[step]]
-actor = "b"
-command = "exec"
-sql = "INSERT INTO work.t VALUES (4)"
-
-[[step]]
-actor = "b"
-command = "write_open"
-argument = "0"
-
-[[step]]
-actor = "b"
-command = "write_exec"
-sql = "INSERT INTO work.t VALUES (5)"
 
 [[step]]
 actor = "b"
@@ -119,14 +85,21 @@ command = "kill"
 
 [[step]]
 actor = "a"
-command = "exec"
-sql = "INSERT INTO work.t VALUES (6)"
+command = "start"
+argument = "open"
+path = "main_a"
+
+[[step]]
+actor = "a"
+command = "attach"
+name = "work"
+path = "attachment"
 
 [[step]]
 actor = "a"
 command = "query_i64"
 sql = "SELECT id FROM work.t ORDER BY id"
-expect = "1,2,3,4,6"
+expect = "1,2"
 
 [[step]]
 actor = "a"

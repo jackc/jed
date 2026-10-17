@@ -1,8 +1,9 @@
 // The page-service endpoint and owner record on the host filesystem (spec/pageservice/README.md §5):
 // where an owner binds its socket, how a directory proves it is private to one user, and the owner
 // record clients read to find the endpoint. Unix only: Windows serving is not yet specified
-// (page-service.md §14), so `locking = service` fails 0A000 there. Node-only.
+// (page-service.md §14), so `locking = "auto"` is a non-serving owner there. Node-only.
 
+import { randomFillSync } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, normalize } from "node:path";
 import process from "node:process";
@@ -19,8 +20,16 @@ export function pageServiceSupported(): boolean {
   return process.platform !== "win32" && typeof process.geteuid === "function";
 }
 
+// currentUid is the effective uid (0 where the platform has none, as on Windows).
 export function currentUid(): number {
-  return process.geteuid!();
+  return process.geteuid?.() ?? 0;
+}
+
+// newIncarnation draws a nonzero random 16-byte owner incarnation (README §5.1).
+export function newIncarnation(): Uint8Array {
+  const id = new Uint8Array(16);
+  while (id.every((b) => b === 0)) randomFillSync(id);
+  return id;
 }
 
 function hex(bytes: Uint8Array): string {

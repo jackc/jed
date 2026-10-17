@@ -879,7 +879,7 @@ pub(super) fn start_service_owner(
     Ok(db)
 }
 
-/// Open `path` under the test-only `Locking::Service` (spec/pageservice/README.md §6.1): as the
+/// Open `path` under the page service (`Locking::Auto`, spec/pageservice/README.md §6.1): as the
 /// serving owner, or as a page client of the owner.
 pub(super) fn open_service(path: &Path, opts: OpenOptions) -> Result<Database> {
     let real = crate::coordinator::resolve_open_path(path)?;

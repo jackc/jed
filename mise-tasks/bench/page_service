@@ -9,8 +9,8 @@
 # disagree. It drives the real-process actors (scripts/process_conformance.rb's Actor) so each core
 # is measured as owner and as client of every core, with the same deterministic workload:
 #
-#   alone        the shared-mode alone fast path (`create`), the baseline every owner must match;
-#   owner        a page-service owner with no client (`create-service`): the alone-owner fast path;
+#   alone        a non-serving owner (`open-exclusive`), the baseline every serving owner must match;
+#   owner        a page-service owner with no client (`create`): the alone-owner fast path;
 #   client cold  a freshly opened page client's first scan / first point lookups (every leaf fetched
 #                through read_pages);
 #   client warm  the same reads once the client's buffer pool holds the pages (one begin_read round
@@ -83,20 +83,22 @@ Dir.mktmpdir("jed-page-service-bench-") do |dir|
     alone_path = File.join(dir, "alone-#{owner_core}.jed")
     alone = Actor.new(owner_core, "create", alone_path)
     load(alone)
+    alone.close
+    alone = Actor.new(owner_core, "open-exclusive", alone_path)
     owner_lanes(alone, owner_core, "alone")
     record("alone_commit", owner_core, nil, COMMITS, *time(alone, "TIME_COMMITS", COMMITS))
     alone.close
 
     path = File.join(dir, "service-#{owner_core}.jed")
-    owner = Actor.new(owner_core, "create-service", path)
+    owner = Actor.new(owner_core, "create", path)
     load(owner)
     owner_lanes(owner, owner_core, "owner")
     BENCH_CORES.each do |client_core|
-      client = Actor.new(client_core, "open-service", path)
+      client = Actor.new(client_core, "open", path)
       record("client_cold_scan", owner_core, client_core, 1, *time(client, "TIME_SCAN", 1))
       record("client_warm_scan", owner_core, client_core, 5, *time(client, "TIME_SCAN", 5))
       client.close
-      client = Actor.new(client_core, "open-service", path)
+      client = Actor.new(client_core, "open", path)
       record("client_cold_lookup", owner_core, client_core, LOOKUPS / 4, *time(client, "TIME_LOOKUPS", LOOKUPS / 4))
       time(client, "TIME_LOOKUPS", LOOKUPS / 4)
       record("client_warm_lookup", owner_core, client_core, LOOKUPS, *time(client, "TIME_LOOKUPS", LOOKUPS))
@@ -104,7 +106,7 @@ Dir.mktmpdir("jed-page-service-bench-") do |dir|
     end
     # Commits change the rows, so they run after every pairing's reads (the read checksums must agree).
     BENCH_CORES.each do |client_core|
-      client = Actor.new(client_core, "open-service", path)
+      client = Actor.new(client_core, "open", path)
       record("client_commit", owner_core, client_core, COMMITS, *time(client, "TIME_COMMITS", COMMITS))
       client.close
     end

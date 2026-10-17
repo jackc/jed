@@ -1,7 +1,7 @@
 schema_version = 1
 name = "unchanged-writable-commits"
-description = "Empty and zero-row shared writers release the global gate without advancing durable metadata; the next writer refreshes and commits normally."
-requires = ["file.shared_process"]
+description = "Empty and zero-row writers of an owner and its page client release the writer gate without advancing durable metadata; the next writer refreshes and commits normally."
+requires = ["file.page_service"]
 
 [[step]]
 actor = "a"

@@ -313,18 +313,3 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		return validatedCommitPlan{pages: append(fl, overflow...), meta: meta, free: free, pageCount: pc, live: live, generation: gen}, nil
 	}
 }
-
-func planSharedValidatedCommit(ps uint32, snap *snapshot, write incrementalWrite, livePages uint32) (validatedCommitPlan, error) {
-	left := max(0, len(write.pages)-manifestInlineCapacity(int(ps)))
-	count := (left + manifestOverflowCapacity(int(ps)) - 1) / manifestOverflowCapacity(int(ps))
-	if uint64(write.pageCount)+uint64(count) > uint64(^uint32(0)) {
-		return validatedCommitPlan{}, newError(ProgramLimitExceeded, "database page limit exceeded")
-	}
-	ids := make([]uint32, count)
-	for i := range ids {
-		ids[i] = write.pageCount + uint32(i)
-	}
-	pc := write.pageCount + uint32(count)
-	meta, pages := commitManifest(ps, snap.txid, write.rootPage, pc, 0, livePages, write.pages, ids)
-	return validatedCommitPlan{pages: pages, meta: meta, pageCount: pc, generation: snap.txid}, nil
-}

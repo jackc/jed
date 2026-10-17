@@ -95,7 +95,8 @@ depend on one another, so all cores use this monotone planning algorithm:
 Reservation may reduce the free-list page count. Consequently a final overflow page may
 have zero entries; the reserved chain still has exactly `M` pages, maximal prefix filling,
 and valid headers/digests. Checked arithmetic must reject page-count/size overflow before
-issuing writes. Shared-process mode supplies no reusable pages and continues append-only.
+issuing writes. A page client plans its commit with this same algorithm, using the persisted
+free list only under the owner's reuse grant ([page-service.md](page-service.md) §6).
 
 The durable algorithm produces the same allocation and bytes with fsync disabled, and
 can be exercised over a MemoryBlockStore in tests. Ephemeral in-memory databases and temporary
@@ -103,7 +104,7 @@ domains may retain their existing bootstrap-meta path; they have no crash-recove
 Durability is intentionally absent when the host disables synchronization; logical SQL results,
 types, and cost remain unchanged. Physical checksums and recovery reads are not SQL cost units.
 
-## 3. Process crashes, failure, and shared access
+## 3. Process crashes, failure, and multiple processes
 
 Validation establishes readable completeness, not durable completeness. After a process
 crash, the kernel cache can contain all of a failed commit even though a machine crash would
@@ -111,9 +112,9 @@ lose some of it. A writable opener therefore stabilizes the adopted generation w
 durable sync **before the first new write**. Otherwise a later transaction could overwrite
 the only actually durable fallback, then a power failure could lose both generations.
 
-This rule also applies to a shared process that adopts a generation written by another
-process. It must stabilize that generation under the global writer gate before writing
-again. A read-only adoption does not require a sync; adopting it cannot silently mark it
+This rule also applies to a process that becomes owner, by election or promotion
+([locking.md](locking.md) §4), and adopts a generation a previous owner wrote. It must
+stabilize that generation before writing again. A read-only adoption does not require a sync; adopting it cannot silently mark it
 safe for a future writer. A locally acknowledged generation is already durable and does
 not need a stabilization flush on every transaction.
 
@@ -124,28 +125,27 @@ the new file readable but its entry not durable: the next opener adopts it, and 
 failure can revert the rename and bring back the older file, losing every commit made since —
 syncing the file itself never makes its directory entry durable. So the first durable commit
 after each open syncs the database's directory, once, before any write (best effort, like
-every directory sync; skipped under `fsync=off`). This applies to the alone, shared, and
-attachment commit paths. The deterministic simulator found this gap
+every directory sync; skipped under `fsync=off`). This applies to every commit path: an
+owner's own, a page client's (which the owner writes), and an attachment's. The deterministic simulator found this gap
 ([simulation-testing.md](simulation-testing.md) §14).
 
 Any write/sync failure poisons the storage handle: no later commit may continue from an
-assumed prior root. Close and reopen through recovery. Shared-file failure retains the
-coordinator gates until close, as [locking.md](locking.md) requires. This applies to the
-alone, uncoordinated, attachment, and shared commit paths, not just co-resident writers.
+assumed prior root. Close and reopen through recovery. An owner whose storage fails stops
+serving and closes before releasing `presence EX` ([locking.md](locking.md) §2). This applies
+to the owner, uncoordinated, and attachment commit paths alike.
 
 Writer admission rejects an already failed handle before serialization can read inherited
-pages. Serialization and shared-manifest planning run before starting the storage commit:
-an encoding/size error discards the working snapshot without poisoning the pager or coordinator.
+pages. Serialization and manifest planning run before starting the storage commit:
+an encoding/size error discards the working snapshot without poisoning the pager.
 Only after preparation succeeds does the writer arm the commit guard and stabilize any adopted
 generation, before its first allocation or write. A failed stabilization or any later failure
 keeps the guard armed until reopen. Ordinary SQL transaction rollback rules still apply.
 
-The lock-bundle protocol does not change: pages 0 and 1 remain the discovery location,
-one global writer remains, and co-resident commits never reuse body pages. A transaction
-begin takes `commit SH`, reads both meta pages directly, and validates a newly observed
-generation before adopting its root. A writer takes `commit EX` for meta publication and
-the final durability barrier. The no-peer fast path retains zero foreground coordination
-syscalls and zero per-transaction meta reads.
+Multiple processes do not change the commit recipe: pages 0 and 1 remain the discovery
+location, and every commit to the file is written by its owner, so no transaction begin
+re-reads meta. A page client's commit is validated by the owner before it is written
+([page-service.md](page-service.md) §5.6). The owner's fast path retains zero foreground
+coordination syscalls and zero per-transaction meta reads.
 
 ## 4. Integration and verification
 

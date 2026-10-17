@@ -1,16 +1,13 @@
 # Page service — one owner process, page-level clients — design
 
-> **Status: RATIFIED DESIGN (2026-10-16); being built in phases (§16).** This document replaces the
-> shared multi-process protocol ([locking.md](locking.md)) with a single **owner** process that alone
+> **Status: RATIFIED DESIGN (2026-10-16); phases 1–3 landed, phase 4 landing, 5–7 to come (§16).** This document
+> replaced the earlier shared multi-process protocol with a single **owner** process that alone
 > touches the database file and serves **pages** to every other process over a local endpoint, and
 > extends the same service over SSH for remote access, backup, and replication. The message catalog,
 > framing, and byte fixtures are [spec/pageservice/](../pageservice/README.md).
 >
-> **[locking.md](locking.md) stays the binding multi-process protocol until phase 4 (§16) lands.**
-> Until then the page service is reachable only through the test-only `locking = service` value, and
-> `auto` keeps meaning shared mode. When phase 4 lands, update [locking.md](locking.md),
-> [replication.md](replication.md), [hosts.md](hosts.md) §6, [api.md](api.md) §2.1,
-> [CLAUDE.md](../../CLAUDE.md) §9, and [TODO.md](../../TODO.md) together.
+> `locking = auto` selects the page service; [locking.md](locking.md) owns the coordination bundle,
+> its locks, and the exclusive (non-serving) owner.
 
 ## 1. What this is for
 
@@ -174,8 +171,8 @@ The message catalog, framing, and field encodings are data-shaped and belong in 
 
 A read transaction is one round trip: `begin_read`, then queries run over the pin, fetching pages only
 on a cache miss. `end_read` needs no reply. This keeps today's guarantee that a transaction begun
-after another process's commit returned sees that commit (locking.md §5.1), the same freshness the
-shared protocol gets from its meta re-read.
+after another process's commit returned sees that commit, the freshness the earlier shared protocol
+got from its meta re-read at transaction begin.
 
 **`begin_read` is always a round trip** (decided at ratification). There is no relaxed mode in
 which owner-pushed commit notices let a client begin locally: that would make a client's freshness
@@ -272,7 +269,7 @@ Then, holding the gate: write the meta, execute the single durable barrier, adop
 snapshot locally (reload the skeleton; drop the owner's buffer-pool entries for written indices),
 append the delta to the replication tee, record `(txid, manifest digest)` in the resolution window
 (§8.4), acknowledge, and release the gate (after a maintenance commit, if one is due, §6). A write
-or sync failure poisons the owner's storage handle exactly as it does today (locking.md §5.3): the
+or sync failure poisons the owner's storage handle exactly as an alone process's does ([validated-cow.md](validated-cow.md)): the
 owner stops serving and closes, and the commit's outcome is resolved by recovery under the next
 owner (§8.4).
 
@@ -335,8 +332,8 @@ code to reopen bind every participant equally.
   defaults, CHECK constraints, partial-index predicates, and expression index keys. A newer release
   can add syntax without changing `format_version` (`SEARCH`/`CYCLE` did). An older binary that meets
   such text keeps the object unparsed and fails only the statements that need it, with `XX003`
-  ([unparsable-definitions.md](unparsable-definitions.md)); this holds standalone, in shared mode, and
-  here alike. The page service adds two rules of its own. The owner's service duties (validation,
+  ([unparsable-definitions.md](unparsable-definitions.md)); this holds standalone and under the page
+  service alike. The page service adds two rules of its own. The owner's service duties (validation,
   adoption, reclamation, backup — §5.6, §6, §9) are structural and never parse stored SQL, so a
   newer client's DDL cannot stop the service. And the owner reloads its own sessions' catalog at
   their next transaction begin, not in the commit path, so nothing a client commits can fail after it
@@ -520,22 +517,21 @@ corrupt the database regardless (§13).
 
 ## 12. Changes to the lock bundle and the shared protocol
 
-Superseded when phase 4 (§16) lands — until then [locking.md](locking.md) binds unchanged:
+Landed with phase 4 ([locking.md](locking.md) is the current bundle and ownership spec):
 
-- shared mode: the join window and its `arrival` doorbell, alone↔shared transitions and the
-  `transition` lock (locking.md §4.2–§4.3), meta refresh at transaction begin (§5.1), the
-  cross-process `writer` and `commit` gates (§5.2–§5.3), and append-only co-resident commits;
-- the `shared` value of `locking`. The option becomes `auto` (owner/client) | `exclusive` (owner,
-  `serve = false`) | `none` (unchanged escape hatch). The test-only `service` value used
-  before phase 4 (§16) is removed with it.
+- Removed: shared mode — the join window and its `arrival` doorbell, alone↔shared transitions and the
+  `transition` lock, meta refresh at transaction begin, the cross-process `writer` and `commit` gates,
+  and append-only co-resident commits — and the `shared` value of `locking`. The option is `auto`
+  (owner/client) | `exclusive` (a non-serving owner) | `none` (unchanged escape hatch). The test-only
+  `service` value used during phases 2–3 is gone with it.
+- Kept: the stable bundle and its identity rules, `presence` as the ownership lock, `arrival` as the
+  marker-validation barrier, the hard-link rejection, the per-path in-process registry, fork
+  invalidation, the open timeout, and fail-closed behavior on unsupported hosts.
 
-Kept: the stable bundle and its identity rules (locking.md §3.1), `presence` as the ownership lock,
-the hard-link rejection, the per-path in-process registry, fork invalidation, the open timeout, and
-fail-closed behavior on unsupported hosts.
-
-**No migration.** Shared mode has no production users, so the page service replaces it as a clean
-break, the way a `format_version` change does. The bundle gets a new protocol marker, which an older
-binary already rejects with `0A000` (locking.md §3.1). No mixed-fleet rollout is designed or tested.
+**No migration.** Shared mode had no production users, so the page service replaced it as a clean
+break, the way a `format_version` change does. The bundle has a new protocol marker, `protocol-v2`,
+which a shared-mode binary rejects with `0A000`; a leftover `protocol-v1` marker is ignored. No
+mixed-fleet rollout is designed or tested.
 
 ## 13. Security and trust
 
@@ -581,8 +577,8 @@ binary already rejects with `0A000` (locking.md §3.1). No mixed-fleet rollout i
 | Native TS in the browser (OPFS) | no | yes (today's exclusive access) | no |
 | wasm32-wasip1 | no | no (explicit `none` only, as today) | no |
 
-Native TS on Node keeps its place in multi-process access, which it has today through shared mode
-([locking.md](locking.md) §8, §9.2), so the Layer 4 corpus keeps all three cores and production Node
+Native TS on Node keeps the place in multi-process access it had through shared mode
+([locking.md](locking.md) §8), so the Layer 4 corpus keeps all three cores and production Node
 does not depend on the Rust bindings.
 
 **Native TS on Node.** Node's embedding API is synchronous (locking.md §8) and the engine runs on
@@ -602,7 +598,7 @@ native code (the OS locks still use `impl/ts/native-lock`):
   `SharedArrayBuffer` that both threads update with `Atomics`. The engine thread waits on the gate
   with `Atomics.wait`, and at each transaction begin it compares the shared committed `txid` with its
   own (an atomic load, no syscall, so the alone fast path is unchanged). It adopts a client's commit
-  through the path today's shared mode uses for a foreign `txid`.
+  by reloading its catalog from the committed meta, as for any foreign `txid`.
 - **Performance caveat.** The service worker reads pages through its own file handle, not the engine
   thread's buffer pool, so clients of a TS owner are served from the OS page cache. Client page
   fetches pay the thread handoff above. Both are slower than the Rust and Go owners and clients,
@@ -661,23 +657,20 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
    gate, reuse grant, `commit` with validation, owner adoption, the reclamation rule, `commit_status`,
    the idle-in-transaction timeout ([spec/pageservice/README.md](../pageservice/README.md) §3.5, §6.4).
    File attachments under the service, with the cross-owner gate order of §5.5, follow separately.
-4. **Handoff**: promotion, yield, graceful close, timeouts; the process-corpus rewrite; simulation
-   testing; retire shared mode and the `shared` option; the new bundle marker.
+4. **Handoff**: promotion, yield, graceful close, timeouts
+   ([spec/pageservice/README.md](../pageservice/README.md) §6.5), the process-corpus rewrite, retiring
+   shared mode and the `shared` option, and the new bundle marker have landed (file attachments are
+   owner-only non-serving owners until they join the service); simulation testing of an owner and its
+   clients is in progress.
 5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree
    fetch.
 6. **Backup**: page-identical and compacted forms.
 7. **Replication**: the tee, retained log, `subscribe`, lineage and timelines (format change),
    replicas and read replicas; amend replication.md.
 
-**The page service replaces shared mode; the two never run as alternatives.** Phases 2–3 are
-internal milestones, not releases of a second mode: blue-green deploys need promotion (phase 4),
-so until it lands shared mode remains what ships. The release that lands phase 4 switches `auto` to
-owner/client and removes shared mode in one step.
-
-Until then the service is reachable only through a test-only `locking = service` value that the
-process corpus and benchmarks use; `auto` keeps meaning shared mode. A service owner does not honor
-shared-mode join windows, so tests never mix the two on one database. The test-only value is removed
-with shared mode (§12).
+**The page service replaced shared mode; the two never ran as alternatives.** During phases 2–3 the
+service was reachable only through a test-only `locking = service` value, and shared mode remained what
+`auto` selected; phase 4 switched `auto` to owner/client and removed shared mode in one step.
 
 ## 17. Decisions at ratification
 

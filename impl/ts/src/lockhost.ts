@@ -1,10 +1,11 @@
-// The coordination host: everything the shared-file coordinator (coordinator.ts, spec/design/
-// locking.md) needs from its environment — the lock bundle beside the database file, whole-file locks
-// on it, the clock its deadlines read, the pause between polls of a contended lock, the background
-// presence probe, the process id the fork check compares, and the process-local duplicate-open
-// registry. Production uses the OS (coordinator.ts osLocks). The deterministic simulator
-// (spec/design/simulation-testing.md §14 S5) substitutes simulated processes sharing one lock table,
-// so the protocol runs, crashes, and interleaves deterministically. Type-only, so it imports nothing.
+// The coordination host: everything the file coordinator (coordinator.ts, spec/design/locking.md)
+// and the page-service election (pageservice/election.ts) need from their environment — the lock
+// bundle beside the database file, whole-file locks on it, the clock deadlines read, the pause
+// between polls of a contended lock, the process id the fork check compares, and the process-local
+// duplicate-open registry. Production uses the OS (coordinator.ts osLocks). The deterministic
+// simulator (spec/design/simulation-testing.md §14 S5) substitutes simulated processes sharing one
+// lock table, so the protocol runs, crashes, and interleaves deterministically. Type-only, so it
+// imports nothing.
 
 // A LockHandle is one bundle file's lock: a native lock file for the OS host.
 export type LockHandle = unknown;
@@ -12,9 +13,6 @@ export type LockHandle = unknown;
 export type LockFiles = {
   presence: LockHandle;
   arrival: LockHandle;
-  transition: LockHandle;
-  writer: LockHandle;
-  commit: LockHandle;
 };
 
 export interface LockHost {
@@ -32,7 +30,5 @@ export interface LockHost {
   nowMicros(): number;
   // pause waits between polls of a contended lock.
   pause(): void;
-  // startProbe runs tick periodically and returns the function that stops it.
-  startProbe(tick: () => void): () => void;
   pid(): number;
 }

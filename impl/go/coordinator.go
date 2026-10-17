@@ -1,7 +1,9 @@
 package jed
 
-// Stable cross-process file coordination (spec/design/locking.md). The database inode is never the
-// lock identity: five persistent empty files beside it carry whole-file kernel locks.
+// Cross-process file coordination (spec/design/locking.md). The database inode is never the lock
+// identity: persistent empty files in a bundle beside it carry whole-file kernel locks. presence EX is
+// ownership: a page-service owner (page-service.md §4.1), an exclusive opener, or a file attachment
+// holds it for its whole tenure; arrival SH guards the protocol-marker check.
 
 import (
 	"errors"
@@ -17,38 +19,39 @@ import (
 
 const (
 	defaultFileLockTimeoutMs = 5000
-	protocolMarker           = "protocol-v1"
+	// protocolMarker names the bundle's protocol: v2 is presence ownership under the page service.
+	// legacyProtocolMarker (shared mode) may remain in an existing bundle; a v1 binary rejects the v2
+	// marker, so the two never run on one file (page-service.md §12).
+	protocolMarker       = "protocol-v2"
+	legacyProtocolMarker = "protocol-v1"
 )
 
 type leaseState uint32
 
 const (
-	leaseAlone leaseState = iota + 1
-	leaseShared
-	leaseExclusive
-	leasePoisoned
-	// leaseServiceOwner is the page-service owner (page-service.md §4.1): presence EX for the whole
-	// tenure and no join window, like exclusive, plus a serving endpoint.
+	// leaseExclusive is a non-serving owner: an exclusive opener or a file attachment.
+	leaseExclusive leaseState = iota + 1
+	// leaseServiceOwner is the page-service owner (page-service.md §4.1), which also serves an endpoint.
 	leaseServiceOwner
 )
 
 type lockFiles struct {
-	presence, arrival, transition, writer, commit lockHandle
+	presence, arrival lockHandle
 }
 
 type fileCoordinator struct {
-	host    lockHost
-	path    string
-	files   lockFiles
-	state   atomic.Uint32
-	pid     int
-	stop    chan struct{}
-	done    chan struct{}
-	started atomic.Bool
-	once    sync.Once
+	host  lockHost
+	path  string
+	files lockFiles
+	state atomic.Uint32
+	pid   int
+	once  sync.Once
 	// keepPath leaves the process-local path claim at close: a page-service owner's claim belongs to its
 	// handle, which keeps the path through role changes (page-service.md §8).
 	keepPath bool
+	// record is set when this coordinator wrote a non-serving owner record, removed at close
+	// (spec/pageservice/README.md §5.1).
+	record bool
 }
 
 func prepareOpenCoordinator(path string, mode Locking, timeout *uint64) (*fileCoordinator, string, error) {
@@ -102,11 +105,14 @@ func prepareCreateCoordinator(path string, mode Locking, timeout *uint64) (*file
 	return c, real, err
 }
 
+// acquireCoordinator takes presence EX for path with the exclusive acquisition loop, until the open
+// timeout (55006). A coordinator in mode LockingExclusive (an exclusive opener or a file attachment)
+// writes a non-serving owner record, so a page-service opener words its timeout as "owned by a
+// non-serving process"; a page-service creator writes its own record when it serves.
 func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *uint64) (*fileCoordinator, error) {
 	if !host.claimPath(path) {
 		return nil, newError(ObjectInUse, "database is already open in this process: "+path+" (share one Database handle)")
 	}
-
 	fail := func(err error) (*fileCoordinator, error) {
 		host.releasePath(path)
 		return nil, err
@@ -115,71 +121,45 @@ func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *ui
 	if err != nil {
 		return fail(err)
 	}
-	closeFiles := true
-	defer func() {
-		if closeFiles {
-			host.closeFiles(files)
-		}
-	}()
+	failClosing := func(err error) (*fileCoordinator, error) {
+		host.closeFiles(files)
+		return fail(err)
+	}
 	deadline := fileLockDeadline(host, timeoutOpt)
 	if err := lockUntil(host, files.arrival, false, deadline, path, false); err != nil {
-		return fail(err)
+		return failClosing(err)
 	}
 	if err := host.validateMarker(path); err != nil {
 		_ = host.unlock(files.arrival)
-		return fail(err)
+		return failClosing(err)
 	}
-
-	state := leaseShared
-	// Creating under LockingService takes presence EX like exclusive: the creator is the owner.
-	if mode == LockingExclusive || mode == LockingService {
-		for {
-			if err := lockUntil(host, files.transition, true, deadline, path, false); err != nil {
-				_ = host.unlock(files.arrival)
-				return fail(err)
+	if err := lockUntil(host, files.presence, true, deadline, path, false); err != nil {
+		_ = host.unlock(files.arrival)
+		reason := ""
+		if record, ok := readOwnerRecord(path); ok {
+			switch {
+			case record.uid != currentUID():
+				reason = "owned by another user's process"
+			case !record.serving:
+				reason = "owned by a non-serving process"
 			}
-			ok, lockErr := host.tryLock(files.presence, true)
-			_ = host.unlock(files.transition)
-			if lockErr != nil {
-				_ = host.unlock(files.arrival)
-				return fail(classifyLockError(lockErr))
-			}
-			if ok {
-				state = leaseExclusive
-				if mode == LockingService {
-					state = leaseServiceOwner
-				}
-				break
-			}
-			if err := checkLockDeadline(host, deadline, path, false); err != nil {
-				_ = host.unlock(files.arrival)
-				return fail(err)
-			}
-			host.pause()
 		}
-	} else {
-		if err := lockUntil(host, files.transition, true, deadline, path, false); err != nil {
-			_ = host.unlock(files.arrival)
-			return fail(err)
+		if reason != "" {
+			err = newError(ObjectInUse, "database file is in use: "+path+" ("+reason+")")
 		}
-		alone, lockErr := host.tryLock(files.presence, true)
-		_ = host.unlock(files.transition)
-		if lockErr != nil {
-			_ = host.unlock(files.arrival)
-			return fail(classifyLockError(lockErr))
-		}
-		if alone {
-			state = leaseAlone
-		} else if err := lockUntil(host, files.presence, false, deadline, path, false); err != nil {
-			_ = host.unlock(files.arrival)
-			return fail(err)
-		}
+		return failClosing(err)
 	}
 	_ = host.unlock(files.arrival)
-	c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid(), stop: make(chan struct{}), done: make(chan struct{})}
-	c.state.Store(uint32(state))
-	c.keepPath = state == leaseServiceOwner
-	closeFiles = false
+	c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid()}
+	if mode == LockingExclusive {
+		c.state.Store(uint32(leaseExclusive))
+		if host == osLocks {
+			c.record = writeOwnerRecord(path, ownerRecord{uid: currentUID(), incarnation: newIncarnation(), pid: uint32(os.Getpid())}) == nil
+		}
+	} else {
+		c.state.Store(uint32(leaseServiceOwner))
+		c.keepPath = true
+	}
 	return c, nil
 }
 
@@ -193,80 +173,16 @@ func (c *fileCoordinator) checkPID() error {
 	return nil
 }
 
-func (c *fileCoordinator) startProbe(tick func()) {
-	c.started.Store(true)
-	if c.lease() == leaseExclusive || c.lease() == leaseServiceOwner {
-		close(c.done)
-		return
-	}
-	c.host.startProbe(c, tick)
-}
-
 func (c *fileCoordinator) close() {
 	c.once.Do(func() {
-		close(c.stop)
-		if c.started.Load() {
-			<-c.done
+		if c.record {
+			_ = os.Remove(ownerRecordPath(c.path))
 		}
 		c.host.closeFiles(c.files)
 		if !c.keepPath {
 			c.host.releasePath(c.path)
 		}
 	})
-}
-
-func (c *fileCoordinator) lockCommitShared() error {
-	return lockBlocking(c.host, c.files.commit, false, c.path)
-}
-
-func (c *fileCoordinator) lockCommitExclusive() error {
-	return lockBlocking(c.host, c.files.commit, true, c.path)
-}
-func (c *fileCoordinator) unlockCommit() { _ = c.host.unlock(c.files.commit) }
-
-func (c *fileCoordinator) lockWriter(timeoutMs uint64) error {
-	var deadline time.Time
-	if timeoutMs != 0 {
-		deadline = c.host.now().Add(time.Duration(timeoutMs) * time.Millisecond)
-	}
-	return lockUntil(c.host, c.files.writer, true, deadline, c.path, true)
-}
-
-func (c *fileCoordinator) unlockWriter() { _ = c.host.unlock(c.files.writer) }
-
-func (c *fileCoordinator) tryArrivalExclusive() (bool, error) {
-	return c.host.tryLock(c.files.arrival, true)
-}
-
-func (c *fileCoordinator) unlockArrival() { _ = c.host.unlock(c.files.arrival) }
-func (c *fileCoordinator) lockTransition() error {
-	return lockBlocking(c.host, c.files.transition, true, c.path)
-}
-func (c *fileCoordinator) unlockTransition() { _ = c.host.unlock(c.files.transition) }
-
-func (c *fileCoordinator) downgradePresence() error {
-	c.setLease(leaseShared)
-	if err := c.host.unlock(c.files.presence); err != nil {
-		return classifyLockError(err)
-	}
-	return lockBlocking(c.host, c.files.presence, false, c.path)
-}
-
-func (c *fileCoordinator) tryUpgradePresence() (bool, error) {
-	if err := c.host.unlock(c.files.presence); err != nil {
-		return false, classifyLockError(err)
-	}
-	ok, err := c.host.tryLock(c.files.presence, true)
-	if err != nil {
-		return false, classifyLockError(err)
-	}
-	if ok {
-		return true, nil
-	}
-	if err := lockBlocking(c.host, c.files.presence, false, c.path); err != nil {
-		return false, err
-	}
-	return false, nil
 }
 
 func openLockBundle(path string) (lockFiles, error) {
@@ -281,7 +197,7 @@ func openLockBundle(path string) (lockFiles, error) {
 	if err := validateProtocolMarker(path); err != nil {
 		return lockFiles{}, err
 	}
-	for _, name := range []string{protocolMarker, "presence", "arrival", "transition", "writer", "commit"} {
+	for _, name := range []string{"presence", "arrival"} {
 		if err := ensureRegularLockFile(filepath.Join(bundle, name)); err != nil {
 			return lockFiles{}, err
 		}
@@ -294,18 +210,6 @@ func openLockBundle(path string) (lockFiles, error) {
 		return lockFiles{}, newError(IoError, err.Error())
 	}
 	if opened.arrival, err = open("arrival"); err != nil {
-		closeOSLockFiles(opened)
-		return lockFiles{}, newError(IoError, err.Error())
-	}
-	if opened.transition, err = open("transition"); err != nil {
-		closeOSLockFiles(opened)
-		return lockFiles{}, newError(IoError, err.Error())
-	}
-	if opened.writer, err = open("writer"); err != nil {
-		closeOSLockFiles(opened)
-		return lockFiles{}, newError(IoError, err.Error())
-	}
-	if opened.commit, err = open("commit"); err != nil {
 		closeOSLockFiles(opened)
 		return lockFiles{}, newError(IoError, err.Error())
 	}
@@ -322,7 +226,7 @@ func validateProtocolMarker(path string) error {
 		return newError(IoError, "read coordination directory: "+err.Error())
 	}
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "protocol-v") && entry.Name() != protocolMarker {
+		if name := entry.Name(); strings.HasPrefix(name, "protocol-v") && name != protocolMarker && name != legacyProtocolMarker {
 			return newError(FeatureNotSupported, "unsupported coordination protocol marker "+entry.Name()+"; supported: "+protocolMarker)
 		}
 	}
@@ -343,18 +247,20 @@ func ensureRegularLockFile(path string) error {
 	return nil
 }
 
+// resolvedLocking resolves a locking mode: auto is the page service where the host supports it
+// (page-service.md §14), otherwise a non-serving owner (exclusive).
 func resolvedLocking(mode Locking) (Locking, error) {
-	if mode == LockingAuto {
-		mode = LockingShared
-	}
-	if mode > LockingService {
+	if mode > LockingNone {
 		return 0, newError(FeatureNotSupported, "unknown file locking mode")
 	}
-	if mode == LockingService && !pageServiceSupported() {
-		return 0, newError(FeatureNotSupported, "the page service is unavailable on "+runtime.GOOS)
+	if mode == LockingNone {
+		return mode, nil
 	}
-	if !osLocksSupported() && mode != LockingNone {
+	if !osLocksSupported() {
 		return 0, newError(FeatureNotSupported, "file locking is unavailable on "+runtime.GOOS)
+	}
+	if mode == LockingAuto && !pageServiceSupported() {
+		return LockingExclusive, nil
 	}
 	return mode, nil
 }

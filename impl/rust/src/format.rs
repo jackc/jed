@@ -2370,9 +2370,10 @@ impl Engine {
         Self::open_shared_paging(paging, env)
     }
 
-    /// Reload the newest committed snapshot through an existing pager/pool. Shared-file participants
-    /// use this after reading the two meta slots under `commit SH`; body pages remain immutable while
-    /// co-resident, so the existing buffer pool is valid and only the catalog/interior skeleton changes.
+    /// Reload the newest committed snapshot through an existing pager/pool: a page-service owner
+    /// adopting its clients' commits, or a client adopting the owner's. The caller invalidates any
+    /// rewritten page first, so the buffer pool stays valid and only the catalog/interior skeleton
+    /// changes.
     /// Collation references resolve against `env`.
     pub(crate) fn open_shared_paging(
         paging: Arc<SharedPaging>,
@@ -2824,9 +2825,9 @@ pub(crate) fn plan_free_list(
     live_pages: u32,
 ) -> Result<CommitPlan> {
     use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES}; // shared data (memory.md §8.4)
-    // `live_at_compaction == 0` is the shared-file handoff sentinel: co-resident commits deliberately
-    // persisted no free list, so the first proven-alone commit reconstructs immediately even for a
-    // small file. Ordinary stores retain the amortized >16-page / >2× trigger.
+    // `live_at_compaction == 0` marks a store whose reclaimable set is unknown, so a commit that may
+    // reclaim reconstructs it immediately even for a small file. Ordinary stores retain the amortized
+    // >16-page / >2× trigger.
     let compact = can_reclaim
         && (live_at_compaction == 0
             || (page_count > COMPACT_MIN_PAGES
@@ -2909,36 +2910,6 @@ pub(crate) struct CommitPlan {
     pub page_count: u32,
     pub live: u32,
     pub generation: u64,
-}
-
-pub(crate) fn plan_shared_commit(
-    page_size: u32,
-    txid: u64,
-    write: &IncrementalWrite,
-    live_pages: u32,
-) -> Result<CommitPlan> {
-    let n = commit_manifest::overflow_needed(page_size as usize, write.pages.len());
-    let end = write.page_count.checked_add(n as u32).ok_or_else(|| {
-        EngineError::new(
-            SqlState::ProgramLimitExceeded,
-            "database page limit exceeded",
-        )
-    })?;
-    let ids: Vec<_> = (write.page_count..end).collect();
-    let (meta, auxiliary) = commit_manifest::encode(
-        meta_page(page_size, txid, write.root_page, end, 0, live_pages),
-        &write.pages,
-        &[],
-        &ids,
-    );
-    Ok(CommitPlan {
-        auxiliary,
-        meta,
-        persisted: Vec::new(),
-        page_count: end,
-        live: 0,
-        generation: txid,
-    })
 }
 
 /// Add every node page of a resident B+tree to `reached`: an interior/leaf node's own set-once page,

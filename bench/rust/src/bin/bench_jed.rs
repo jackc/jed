@@ -113,18 +113,17 @@ fn bench_environment() -> BoxResult<Environment> {
 }
 
 /// Optional benchmark-only coordination override. Ordinary runs keep the public API's `auto`
-/// default; insert-performance attribution can set `JED_BENCH_LOCKING=shared|exclusive|none`
+/// default; insert-performance attribution can set `JED_BENCH_LOCKING=exclusive|none`
 /// without carrying a source patch between paired samples.
 fn bench_locking() -> BoxResult<Locking> {
     match std::env::var("JED_BENCH_LOCKING") {
         Err(std::env::VarError::NotPresent) => Ok(Locking::Auto),
         Ok(value) => match value.as_str() {
             "auto" => Ok(Locking::Auto),
-            "shared" => Ok(Locking::Shared),
             "exclusive" => Ok(Locking::Exclusive),
             "none" => Ok(Locking::None),
             _ => Err(format!(
-                "invalid JED_BENCH_LOCKING {value:?}: expected auto, shared, exclusive, or none"
+                "invalid JED_BENCH_LOCKING {value:?}: expected auto, exclusive, or none"
             )
             .into()),
         },

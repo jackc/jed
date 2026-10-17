@@ -71,7 +71,7 @@ func (h *simLockHost) claimPath(path string) bool {
 func (h *simLockHost) releasePath(path string) { delete(h.claimed, path) }
 
 func (h *simLockHost) openBundle(string) (lockFiles, error) {
-	return lockFiles{presence: "presence", arrival: "arrival", transition: "transition", writer: "writer", commit: "commit"}, nil
+	return lockFiles{presence: "presence", arrival: "arrival"}, nil
 }
 
 func (h *simLockHost) validateMarker(string) error { return nil }
@@ -116,11 +116,6 @@ func (h *simLockHost) pause() {
 	}
 	t.runProbes(h.pidNum)
 	*t.clock += simLockPoll
-}
-
-func (h *simLockHost) startProbe(c *fileCoordinator, tick func()) {
-	h.table.probes[h.pidNum] = tick
-	close(c.done)
 }
 
 func (h *simLockHost) pid() int { return h.pidNum }

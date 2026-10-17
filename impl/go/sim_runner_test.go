@@ -470,7 +470,7 @@ func newSimRunner(tr simTrace) *simRunner {
 		maxStorageBytes: maxStorageBytes,
 		fs:              newSimFS(seed, sector, uint32(ps)),
 		sessions:        map[string]*simSession{},
-		shared:          tr.header["processes"] == "shared",
+		shared:          false, // multi-process traces return with the page service (simulation-testing.md)
 		procs:           map[int]*simProc{},
 		dbs:             map[string]*simDB{},
 		violationStep:   -1,
@@ -571,41 +571,13 @@ func (r *simRunner) attach(name string) error {
 	return r.db.Attach(name, AttachFileWithOptions(r.dbs[name].file, AttachFileOptions{Locking: LockingNone}), false)
 }
 
-// openProc starts process pid. A shared trace acquires the file coordinator through the simulated
-// lock host first, exactly as OpenDatabaseWithOptions does through the OS host.
+// openProc starts process pid.
 func (r *simRunner) openProc(pid int) error {
-	var coord *fileCoordinator
-	var host *simLockHost
-	if r.shared {
-		if r.locks == nil {
-			r.locks = newSimLockTable(&r.clock, r.procBusy)
-		}
-		host = &simLockHost{table: r.locks, pidNum: pid, claimed: map[string]bool{}}
-		c, err := acquireCoordinator(host, simDiskPath, LockingShared, nil)
-		if err != nil {
-			r.locks.release(pid)
-			return err
-		}
-		if err := c.lockCommitShared(); err != nil {
-			c.close()
-			r.locks.release(pid)
-			return err
-		}
-		coord = c
-	}
-	db, err := r.openDatabase(coord)
-	if coord != nil {
-		if err != nil {
-			coord.unlockCommit()
-			coord.close()
-			r.locks.release(pid)
-			return err
-		}
-	}
+	db, err := r.openDatabase(nil)
 	if err != nil {
 		return err
 	}
-	r.procs[pid] = &simProc{pid: pid, db: db, host: host}
+	r.procs[pid] = &simProc{pid: pid, db: db}
 	r.cur, r.db = pid, db
 	return nil
 }
@@ -640,9 +612,6 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 	}
 	e.path = simDiskPath
 	e.spill = r.fs.spillHost() // spill and temp-table spill scratch files, whose operations can fail
-	if coord != nil {
-		coord.unlockCommit()
-	}
 	db := databaseOver(sharedCoreFromEngineCoordinated(e, coord))
 	db.core.storage.files = r.fs // create, compaction, and attachments go through the simulated filesystem
 	if r.maxStorageBytes > 0 {
@@ -654,6 +623,10 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 }
 
 func (r *simRunner) run() {
+	if p := r.tr.header["processes"]; p != "" {
+		r.violation = "unsupported processes mode " + p
+		return
+	}
 	// Create the database through the simulated filesystem, as the host's create does: a temp file,
 	// its sync, the rename, and the directory barrier (S4).
 	e, err := createVia(r.fs, simDiskPath, databaseOptions{PageSize: r.pageSize, env: r.env})

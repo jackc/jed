@@ -252,15 +252,15 @@ sits so the options stay open (CLAUDE.md §9).
   the previous one: it adds every page it writes, and subtracts the previous catalog chain and GiST
   forest (both rewritten whole) and the previous B-tree pages outside the subtrees the two snapshots
   share, with each orphaned leaf's overflow pages counted from its external pointers' lengths.
-- **Multi-process file locking** — ✅ **landed ([locking.md](locking.md)).** Protocol-aware handles and
-  file attachments share the same file safely through a stable `<path>.lock/` bundle carrying
-  presence/arrival/transition/writer/commit OS locks. An
-  uncontended presence-EX lease preserves the current foreground path and v30 allocator. While
-  co-resident, begins refresh the newest meta, one global writer commits append-only with
-  `free_list_head = 0`, and body pages stay immutable. Free-page reuse, free-list persistence/rebuild,
-  truncation, and compaction require presence-EX proof of aloneness plus the existing in-process
-  watermark. The bundle, rather than the replaceable database inode, remains locked across future
-  `to_image` compaction (locking.md §3–§6).
+- **Multi-process file locking** — ✅ **landed ([locking.md](locking.md),
+  [page-service.md](page-service.md)).** A stable `<path>.lock/` bundle (`protocol-v2`, carrying the
+  `presence` and `arrival` OS locks) elects one owner, the `presence EX` holder, which alone reads and
+  writes the file; under `locking = auto` other processes are page clients that read pages from, and
+  commit whole deltas through, the owner. The owner keeps the current foreground path and allocator.
+  Free-page reuse, free-list persistence/rebuild, truncation, and compaction run only on the owner,
+  gated by its reader watermark, which counts client pins. File attachments are non-serving owners of
+  their files. The bundle, rather than the replaceable database inode, remains locked across
+  compaction (locking.md §3–§6).
 - **File compaction / shrink (returning space to the OS)** — ✅ **landed (all three cores;
   host API [api.md](api.md) §2.6).** The free-list (above) recycles dead space for *jed*, but it
   never gives it back: `page_count` is a monotonic high-water (plus the pager.md §7 preallocation
@@ -277,7 +277,7 @@ sits so the options stay open (CLAUDE.md §9).
   leaves the prior file intact. It is **explicit, not automatic-per-commit** — a per-commit
   truncation would fight the §9/pager.md §7 preallocation (truncate → regrow → re-`fsync` churn) —
   and it **never waits**: a held writer gate, any pinned reader (the watermark, transactions.md §8),
-  or another process holding the file (locking.md §6) is `55006`. Compaction renumbers pages but
+  or a page client's pin (locking.md §6) is `55006`, as is compaction requested by a page client. Compaction renumbers pages but
   keeps every tree node, so later results **and costs** are unchanged. It **needs nothing new at
   the seam** (§2, [hosts.md](hosts.md)) beyond the host's atomic rename — which is why the OPFS host
   is `0A000` for now. An in-memory database compacts by replacing its `MemoryBlockStore` with the

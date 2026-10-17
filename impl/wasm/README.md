@@ -47,10 +47,10 @@ Output: `impl/wasm/target/wasm32-wasip1/release/jed_wasm.wasm`.
 ### File locking
 
 `jed_create`/`jed_open` take an explicit `locking` byte, the `locking` handle setting of
-[`spec/design/locking.md`](../../spec/design/locking.md) §7.1: `0` auto, `1` shared, `2` exclusive,
-`3` none (any other value is `22023`). The wrap applies **no default of its own**: the caller
-always states the mode. `wasm32-wasip1` has no whole-file OS locking (locking.md §7.3), so `auto`,
-`shared`, and `exclusive` fail `0A000` at open/create, and only `none` opens a file. Pass `none`
+[`spec/design/locking.md`](../../spec/design/locking.md) §7.1: `0` auto, `2` exclusive, `3` none (any
+other value, including `1` for the retired shared mode, is `22023`). The wrap applies **no default of
+its own**: the caller always states the mode. `wasm32-wasip1` has no whole-file OS locking
+(locking.md §7.3), so `auto` and `exclusive` fail `0A000` at open/create, and only `none` opens a file. Pass `none`
 only when the host itself guarantees that no other process or handle opens the same file while this
 one is open, because nothing in the engine guards against concurrent access in that mode. The
 benchmark harness passes `none` because it is the external coordination: each bench process owns

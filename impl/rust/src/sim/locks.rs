@@ -6,14 +6,17 @@
 //! contended acquisition never blocks the single simulation thread: each poll runs the other
 //! processes' presence probes and advances the simulated clock, so the holder can react and
 //! deadlines expire in simulated time.
+//!
+//! Unused while multi-process traces are unsupported: they return with the page service, whose
+//! owner and clients will run over this host.
+#![allow(dead_code)]
 
-use crate::coordinator::{LockFiles, LockHandle, LockHost, ProbeSignal};
+use crate::coordinator::{LockFiles, LockHandle, LockHost};
 use crate::error::Result;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Microseconds of simulated time per poll of a contended lock.
@@ -152,9 +155,6 @@ impl LockHost for SimLockHost {
         Ok(LockFiles {
             presence: Box::new("presence".to_string()),
             arrival: Box::new("arrival".to_string()),
-            transition: Box::new("transition".to_string()),
-            writer: Box::new("writer".to_string()),
-            commit: Box::new("commit".to_string()),
         })
     }
 
@@ -188,16 +188,6 @@ impl LockHost for SimLockHost {
         Ok(true)
     }
 
-    /// The Go reference's `lockBlocking`: poll, pausing between attempts.
-    fn lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<()> {
-        loop {
-            if self.try_lock(handle, exclusive)? {
-                return Ok(());
-            }
-            self.pause();
-        }
-    }
-
     fn unlock(&self, handle: &LockHandle) -> std::io::Result<()> {
         let mut t = lock(&self.table);
         if let Some(holders) = t.holders.get_mut(lock_name(handle)) {
@@ -228,15 +218,6 @@ impl LockHost for SimLockHost {
         lock(&self.table)
             .clock
             .fetch_add(LOCK_POLL, Ordering::Relaxed);
-    }
-
-    fn start_probe(
-        &self,
-        _signal: Arc<ProbeSignal>,
-        callback: Arc<dyn Fn() + Send + Sync>,
-    ) -> Option<JoinHandle<()>> {
-        lock(&self.table).probes.insert(self.pid, callback);
-        None
     }
 
     fn pid(&self) -> u32 {

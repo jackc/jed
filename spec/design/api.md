@@ -133,41 +133,40 @@ implicit transaction *is* read-only). Because no write transaction can open, no 
 publishes; the file is additionally opened **without write access**, so the OS enforces what
 the guards promise (a read-only handle works on a read-only filesystem). The handle exposes
 `read_only()` / `ReadOnly()` / `.readOnly`. Like the memory budget it is a handle setting, not
-stored in the file. Under shared coordination (next paragraph), read-only processes may coexist
-with writers: the handle still never writes, and its pinned pages stay immutable because co-resident
-commits are append-only.
+stored in the file. Under the page service (next paragraph) a read-only handle may be a page client
+of a writing owner (a read-only connection), or the owner itself, which hands ownership to the first
+client that writes and continues as a client ([spec/pageservice/README.md](../pageservice/README.md)
+§6.5); either way it never writes.
 
-**File coordination — an open-time property ([locking.md](locking.md)).** `create`, `open`, and
-`AttachSource::file` use `locking = auto` (the zero-value/default) | `shared` | `exclusive` | `none`.
-On a capable local file host `auto` selects **shared multi-process access** through the stable
-`<path>.lock/` OS-lock bundle; OPFS selects its inherent exclusive access. A one-process shared handle
-normally holds the presence-EX fast-path lease, so its foreground transaction path is identical to the
-uncoordinated path. Co-resident processes refresh meta at transaction begin, share one global writer,
-and commit append-only. `exclusive` never opens a join window. `none` is the unsafe escape hatch for an
-externally coordinated or static file; network filesystems require that external coordinator. An
-unsupported requested mode fails closed `0A000`.
+**File coordination — an open-time property ([locking.md](locking.md),
+[page-service.md](page-service.md)).** `create`, `open`, and `AttachSource::file` use `locking =
+auto` (the zero-value/default) | `exclusive` | `none`. On a host that can serve (Unix local files)
+`auto` selects the **page service**: the opener that takes `presence EX` in the stable `<path>.lock/`
+bundle owns the file and serves a same-user endpoint; any other opener becomes a page client of it,
+reading pages through it and committing through it, and a client opened `read_only` gets a read-only
+connection. The owner's foreground transaction path is identical to the uncoordinated path.
+`exclusive` is a non-serving owner (a second opener waits, then fails `55006`); `auto` selects it
+where serving is unavailable (Windows for now), and OPFS is inherently exclusive. A file attachment is
+a non-serving owner of its file under `auto` and `exclusive` until attachments join the service.
+`none` is the unsafe escape hatch for an externally coordinated or static file; network filesystems
+require that external coordinator. An unsupported requested mode fails closed `0A000`.
 
-A fifth value, **`service`**, is **test-only** until the page service's handoff phase replaces shared
-mode ([page-service.md](page-service.md) §16): the opener that takes `presence EX` becomes the
-page-service owner and serves a same-user endpoint; any other opener becomes a page client of it,
-reading pages through it and committing through it (phases 2–3); a client opened `read_only` gets a
-read-only connection. Unix only (`0A000` elsewhere); file attachments reject it (`0A000`). Under
-`service` only, `idle_in_transaction_timeout_ms` (Go `IdleInTransactionTimeoutMs`, TS
-`idleInTransactionTimeoutMs`; default **60000**, `0` disables) is the owner's idle-in-transaction
-timeout for client write transactions (page-service.md §11.1). Handoff (phase 4,
-[spec/pageservice/README.md](../pageservice/README.md) §6.5): a client whose owner leaves re-elects —
-it promotes itself or reconnects to the new owner — and continues; `ownership` (Rust `Ownership::{Prefer,
-Yield, Never}`, Go `OwnershipPrefer`/`OwnershipYield`/`OwnershipNever`, TS `"prefer" | "yield" |
-"never"`; default prefer) is the opener's ownership preference; and the owner limits are
-`yield_grace_ms` (default 5000), `shutdown_grace_ms` (30000), `idle_session_timeout_ms` (0, off), and
-`max_connections` (0, unlimited; `53300` beyond it), spelled in each core's case like
-`idle_in_transaction_timeout_ms`. It is spelled `Locking::Service` / `LockingService` / `"service"`, is
-never documented as a production option, and must never share a database with a shared or exclusive
-opener.
+The page-service options are owner settings a client keeps for the day it becomes owner:
+`idle_in_transaction_timeout_ms` (Go `IdleInTransactionTimeoutMs`, TS `idleInTransactionTimeoutMs`;
+default **60000**, `0` disables) is the owner's idle-in-transaction timeout for client write
+transactions (page-service.md §11.1); `yield_grace_ms` (default 5000), `shutdown_grace_ms` (30000),
+`idle_session_timeout_ms` (0, off), and `max_connections` (0, unlimited; `53300` beyond it) are the
+other owner limits, spelled in each core's case like `idle_in_transaction_timeout_ms`. `ownership`
+(Rust `Ownership::{Prefer, Yield, Never}`, Go `OwnershipPrefer`/`OwnershipYield`/`OwnershipNever`, TS
+`"prefer" | "yield" | "never"`; default prefer) is the opener's ownership preference. Handoff
+([spec/pageservice/README.md](../pageservice/README.md) §6.5): a client whose owner leaves re-elects —
+it promotes itself or reconnects to the new owner — and continues; a transaction open across the
+change fails `08006`.
 
-`file_lock_timeout_ms` (default **5000**, `0` = fail immediately) bounds shared join / exclusive open
-and returns `55006` on expiry. It is distinct from the session `lock_timeout_ms` (`0` = no deadline),
-which bounds the cross-process writer gate and returns `55P03`. Both use monotonic host time and are
+`file_lock_timeout_ms` (default **5000**, `0` = one attempt) bounds the election, the exclusive
+acquisition loop, and a page client's re-election, and returns `55006` on expiry. It is distinct from
+the session `lock_timeout_ms` (`0` = no deadline), which bounds the writer gate (local or the owner's)
+and returns `55P03`. Both use monotonic host time and are
 unmetered. File attachments carry these fields in `AttachSource::file(path, options)`; create/open use
 their idiomatic options structs (`locking`, `file_lock_timeout_ms` / `Locking`, `FileLockTimeoutMs` /
 `locking`, `fileLockTimeoutMs`). In-memory databases have no bundle and ignore file-lock options.
@@ -514,11 +513,11 @@ from RAM and lowering `storage_bytes` (memory.md §8). A file's `storage_bytes` 
    - the handle's writer gate must be free (no session holds an open write transaction);
    - no reader may be pinned (the reader watermark is drained — no open read session, read-only
      transaction, or streaming cursor on this handle, transactions.md §8);
-   - under shared file coordination, no other process may have the file open: compaction needs the
-     presence-exclusive lease (locking.md §6). If this handle is in the shared state only because a
-     peer has since closed, compaction first retries the upgrade itself.
-   A host that sees `55006` closes its cursors and sessions (or waits for the peer process) and
-   retries.
+   - under the page service, compaction is the owner's: no client may hold the writer gate or pin a
+     snapshot, and a page client's compaction is `55006` (locking.md §6). Connected clients reload the
+     compacted image at their next transaction begin.
+   A host that sees `55006` closes its cursors and sessions (or waits for its clients' transactions)
+   and retries.
 
 **What it does.** Holding the writer gate and the reader-watermark lock (so no reader can pin while
 the storage is swapped), compaction serializes the committed snapshot at **`txid + 1`** into a fresh
@@ -530,7 +529,7 @@ image and installs it:
   (the `create` recipe, §3). The pager then reopens the new file with a cold buffer pool of the
   same `cache_bytes` budget. `path` is resolved through symlinks first, so a symlinked database
   stays a symlink to the compacted file. The coordination bundle (`<path>.lock/`) is untouched, so
-  no other process can join while the database inode is replaced (locking.md §3.1).
+  ownership (`presence EX`) holds while the database inode is replaced (locking.md §3.1).
 - **In-memory:** the image becomes a new `MemoryBlockStore`; the old store is released.
 
 Afterwards the database's page count is exactly its from-scratch image size, its free list is empty,

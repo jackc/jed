@@ -375,8 +375,10 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   **Layer 4 (`mise run concurrency:process`) is landed and release-blocking:** one shared
   `spec/conformance/process/*.process.toml` corpus drives real Rust/Go/Node actor processes in every
   supported pairing over one file. Explicit barriers, kill hooks, and invariant checks cover the
-  shared OS-lock protocol, crash release, meta recovery, and cross-core interoperability. It joins
-  `mise run ci` with the `file.shared_process` capability and is release-blocking for shared file access;
+  page service (election, reads and writes through the owner, promotion, yield, graceful close, commit
+  resolution), exclusive owners, owner-only file attachments, crash release, and cross-core
+  interoperability. It joins `mise run ci` with the `file.page_service` capability and is
+  release-blocking for multi-process file access;
   this behavior must not live only in three mirrored per-core tests.
 - **Deterministic simulation testing covers the storage state machine** (`spec/design/simulation-testing.md`).
   A seeded generator (`scripts/sim_gen.rb`) writes multi-session histories; each core's runner executes
@@ -727,40 +729,31 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   **explicit** and `close` does **not** auto-flush (uncommitted changes are discarded); an
   in-memory `commit` is a no-op success, so the operation stays uniform and forward-compatible
   with the future §3 staging-buffer transactions. Same shape across all three cores.
-- **Multi-process access: shared-by-default coordination (`spec/design/locking.md`) — landed.**
-  Protocol-aware separate opens and file attachments now share
-  the full shared protocol: a stable, version-marked `<path>.lock/` bundle carries crash-clean
-  whole-file OS locks for presence, arrival, transition, one global writer, and the short
-  commit-publication gate. On capable
-  local hosts `locking = auto` selects shared. One process normally holds a presence-EX fast-path
-  lease, so foreground reads/writes perform **no coordination syscall or meta pread** and use the
-  current v30 allocator unchanged; a background probe notices a crash-clean arrival lock and opens a
-  join window. While co-resident, transaction begin refreshes meta, writers serialize globally, and
-  commits are append-only (`free_list_head = 0`). Reuse/reclamation/truncation/compaction require
-  presence-EX proof of aloneness plus the in-process watermark. No format bump or persisted
-  `catalog_gen` is required for correctness. Rust/Go use `flock`/`LockFileEx` without dependencies;
-  Node needs native OS locking. The chosen implementation is a first-party minimal Rust Node-API lock
-  adapter (host calls only, not a Rust-core wrapper). A full Rust-core
-  Node wrapper was built and benchmarked first: it wins heavy/parallel reads but is not universally
-  faster, losing most cheap-query and write comparisons; ordinary Node calls also retain a material
-  boundary tax (`spec/design/benchmarks.md` §7.3). The exact `napi-rs` pins are approved for both the
-  experiment and the bounded production lock-host exception; completing the no-install-script
-  prebuilt artifact/provenance matrix remains packaging work, not a protocol gap.
-  PID/mtime stale-lock heuristics are forbidden; an unsupported host fails closed. OPFS remains
-  inherently exclusive. The first rollout must drain every pre-protocol binary because an advisory
-  protocol cannot coordinate with a process that does not participate.
-- **Page service: the ratified successor to shared mode (`spec/design/page-service.md`), being built
-  in phases.** One **owner** process (the `presence EX` holder) alone touches the file; every other
-  process is a **page client** running its own engine, whose pager reads pages from, and commits
-  whole `CommitDelta`s through, the owner over a same-user local socket (later SSH). Phases 1–3 (spec,
-  read path, write path) have landed; free-list rebuilds are owner-only maintenance commits. Pages are
-  logical cost units, so a query's rows, plan, and cost are identical through the service. The wire
-  contract is shared data with byte fixtures (`spec/pageservice/`). **locking.md stays the binding
-  protocol until phase 4 (handoff) lands**: until then `auto` means shared mode and the service is
-  reachable only through the test-only `locking = service` value; phase 4 removes shared mode in one
-  step. Decided at ratification: the endpoint lives in the bundle (runtime-directory fallback);
-  `begin_read` is always a round trip; free-list rebuilds are owner-only maintenance commits; no
-  client request timeout; Rust on Windows is a non-serving owner only for now.
+- **Multi-process access: the page service (`spec/design/page-service.md`, `spec/design/locking.md`) —
+  landed.** One **owner** process (the `presence EX` holder in a stable, version-marked
+  `<path>.lock/` bundle of crash-clean whole-file OS locks) alone touches the file; every other process
+  is a **page client** running its own engine, whose pager reads pages from, and commits whole
+  `CommitDelta`s through, the owner over a same-user local socket (later SSH). `locking = auto`
+  selects it on hosts that can serve (Unix local files); `exclusive` is a non-serving owner (a second
+  opener waits, then fails `55006`), as `auto` is where serving is unavailable (Windows for now);
+  `none` is the unsafe escape hatch. The owner's foreground path performs **no coordination syscall
+  or meta re-read**; reuse and reclamation run on the owner, gated by its reader watermark, which counts
+  client pins, and free-list rebuilds after client commits are owner-only maintenance commits. Pages are
+  logical cost units, so a query's rows, plan, and cost are identical through the service. Ownership
+  hands off between transactions: a client whose owner leaves promotes itself or reconnects to the new
+  owner (transactions open across the change fail `08006`; a lost commit acknowledgement is resolved by
+  `commit_status`); `ownership = prefer | yield | never` lets a tool hand ownership to an application;
+  a read-only owner yields to a writer; a closing owner drains its clients. The wire contract is shared
+  data with byte fixtures (`spec/pageservice/`). It replaced the earlier shared-by-default protocol as a
+  clean break (bundle marker `protocol-v2`; shared mode had no production users). File attachments are
+  owner-only non-serving owners until attachments join the service. Decided at ratification: the
+  endpoint lives in the bundle (runtime-directory fallback); `begin_read` is always a round trip; no
+  client request timeout; Rust on Windows is a non-serving owner only for now. Rust/Go use
+  `flock`/`LockFileEx` without dependencies; Node uses the first-party minimal Rust Node-API lock
+  adapter (host calls only, not a Rust-core wrapper; §14), with the service and client socket on worker
+  threads. A full Rust-core Node wrapper was built and benchmarked first: it wins heavy/parallel reads
+  but is not universally faster (`spec/design/benchmarks.md` §7.3). PID/mtime stale-lock heuristics
+  are forbidden; an unsupported host fails closed. OPFS remains inherently exclusive.
 
 ---
 
@@ -1031,7 +1024,7 @@ every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by defa
 bounds an in-memory database's or attachment's committed pages, checked at commit before any write
 (slice Q4a), and a file-backed database's or attachment's **live** pages — reachable from the catalog
 root, an exact count persisted in the meta page, so the trip point is independent of the free list
-and of co-resident append-only allocation (slice Q4c, memory.md §8.7); file-backed page caches stay
+(slice Q4c, memory.md §8.7); file-backed page caches stay
 evict-only under `cache_bytes` and never fail a query. A file's dead pages are bounded by the work
 that wrote them (`max_cost`/`lifetime_max_cost`), not by this limit. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a

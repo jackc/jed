@@ -6,7 +6,7 @@ requires = ["file.page_service"]
 [[step]]
 actor = "a"
 command = "start"
-argument = "create-service"
+argument = "create"
 
 [[step]]
 actor = "a"
@@ -16,7 +16,7 @@ sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
 [[step]]
 actor = "b"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 # The owner holds the gate: a client writer times out, and its reads still work.
 [[step]]
@@ -123,7 +123,7 @@ expect = "1,2,4"
 [[step]]
 actor = "b"
 command = "start"
-argument = "open-service"
+argument = "open"
 
 [[step]]
 actor = "b"

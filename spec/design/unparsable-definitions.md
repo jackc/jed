@@ -22,8 +22,8 @@ A release can add syntax without a `format_version` bump, because the bytes that
 change. `SEARCH`/`CYCLE` did so ([recursive-cte.md](recursive-cte.md)). An older binary that opens a
 file a newer one edited can then meet text its parser rejects. Until now that failed the whole load
 with `XX001`, which reports a healthy file as corrupt and locks the older program out of every table:
-standalone, in shared multi-process mode ([locking.md](locking.md)), where a co-resident older process
-reloads the catalog after a newer one commits, and under any future page service.
+standalone, and under the page service ([page-service.md](page-service.md)), where an older client or
+owner reloads the catalog after a newer process commits.
 
 Text the parser rejects is not evidence of corruption. Page checksums already detect damage at rest,
 and a catalog page that passes its checksum holds the bytes some jed wrote.
@@ -161,7 +161,7 @@ the order planning reaches them.
 ## 6. Scope
 
 The rule covers every database a handle opens: `main`, file and in-memory attachments, and catalog
-reloads after a foreign commit in shared mode. Session-local temporary objects never round-trip
+reloads after another process's commit under the page service. Session-local temporary objects never round-trip
 through another binary, so they are never unparsed. Text that parses but fails resolution (an unknown
 function, a missing sequence) was already handled per use and is unchanged
 ([views.md](views.md) §3, [extensibility.md](extensibility.md) §7.1).

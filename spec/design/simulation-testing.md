@@ -1,6 +1,7 @@
 # Deterministic simulation testing — design
 
-> **Status: S1–S6 landed in all three cores** (§14), including spill faults, temp-table spill, file
+> **Status: S1–S7 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
+> retired with shared mode, and an owner-and-client slice follows), including spill faults, temp-table spill, file
 > attachments, `create`, the bounded-growth invariant, and the `corrupt` mode. A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
@@ -48,8 +49,8 @@ every precondition:
   single-threaded scheduler choosing which session steps next reproduces every observable
   interleaving.
 - **The engine has no background work on the paths simulated.** In production code, the only
-  goroutines and threads are the shared-mode coordinator's probe and Go's context-cancellation
-  watcher. Neither runs unless shared locking or a cancellable context is in use.
+  goroutines and threads are the page service's (the owner's listener and connections, a client's
+  socket) and Go's context-cancellation watcher. Neither runs on a simulated single-process trace.
 - **Allocation is deterministic.** The free-list and manifest planning algorithm is specified
   ([validated-cow.md](validated-cow.md) §2) and produces byte-identical files across cores, so the
   **set** of pages a commit writes, and their bytes, is identical in every core.
@@ -64,8 +65,9 @@ Those stay with the race-detector modes, Layer 4, and the durability benchmarks 
 **In scope:** the validated-COW commit and recovery protocol, free-list reuse and the reader
 watermark, manifest overflow, live-page-count bookkeeping, unchanged-commit elision, poisoned
 handles, recovered-generation stabilization, large-value overflow chains, buffer-pool eviction,
-spill and temp-table spill, `max_storage_bytes`, `create`, compaction, file attachments, the
-shared-process lock protocol, and at-rest corruption.
+spill and temp-table spill, `max_storage_bytes`, `create`, compaction, file attachments, and
+at-rest corruption. Multiple processes (an owner and its page clients) return with a later slice
+(§14, item 5).
 
 **Non-goals:**
 - **SQL semantics.** The PostgreSQL oracle, the cross-core corpus, and NoREC already cover them. The
@@ -391,8 +393,7 @@ it wrote. Then:
   by at most `max(0, written − free)`.
 
 `written` counts the distinct pages of the database's file (other than the two meta pages) the step
-wrote; `free` is the in-memory free list the next commit allocates from. Shared traces are exempt:
-co-resident commits are append-only by design (locking.md §5.3).
+wrote; `free` is the in-memory free list the next commit allocates from.
 
 **Two more violations** need no checker: any statement or commit that reports `XX001` (corruption
 must never surface outside corruption mode), and **snapshot isolation** — when a reader closes, its
@@ -488,7 +489,6 @@ defaults, which `mixed.toml` restates):
 | `stabilization` | Process crashes that leave complete unsynced generations, then a faulted next commit |
 | `resource` | Tiny caches, spill, storage and query-memory limits, `read_error`, `enospc` |
 | `compaction` | Host compaction with crashes at the temp-file and directory barriers (`nth`) |
-| `shared` | Processes joining, leaving, and dying around a shared file (S5) |
 | `spill` | Sort, aggregate, and temp-table spill under small `work_mem` and `temp_buffers`, with `spill_error` |
 | `attachments` | File attachments created under crashes, per-database recovery, writes to one durable database per transaction |
 | `growth` | Short-lived readers between long runs of quiet commits, for the bounded-growth check (§8.3) |
@@ -543,7 +543,7 @@ oracles are what the test means.
 | Per-core exhaustive crash tests | **Keep.** They enumerate every subset of small commits, an exhaustiveness random search cannot promise. The simulator covers the long histories they cannot express. |
 | `spec/fileformat/verify.rb` | **Extended in slice S6** with `--check-image`, an independent fourth voice for §8.3 and for which generation recovery should select. |
 | Concurrency Layers 1–3 | **Keep.** The race-detector modes test real threads. The simulator tests faults over logical interleavings. |
-| Process corpus (Layer 4) | **Keep, release-blocking.** Real kernel lock semantics and real process death cannot be simulated. Slice S5 explores the same protocol state machine randomly. |
+| Process corpus (Layer 4) | **Keep, release-blocking.** Real kernel lock semantics and real process death cannot be simulated. The planned owner-and-client slice (§14, item 5) will explore the page service's state machine randomly. |
 | Durability benchmarks | **Keep.** Only real hardware says whether the barrier contract holds on a real device (§6.4). |
 
 ## 13. The obligation to grow it
@@ -615,40 +615,13 @@ primitive) gets a simulated implementation.
    (validated-cow.md §3). The same sweep also corrected the floor rule (§8.2), which had trusted a
    compaction's temp-file sync.
 
-5. **S5 — Simulated lock host and multiple processes. Landed.** Every core's coordinator goes through a
-   lock-host seam (bundle files, whole-file locks, the deadline clock, the pause between polls of a
-   contended lock, the presence probe, and the in-process open registry); the OS host keeps today's
-   behavior (Rust's host adds a blocking `lock`, keeping its native blocking calls; the simulated host
-   implements it as a polling loop). The simulated host shares one lock table among simulated
-   processes over one simulated filesystem:
-   - A trace with `# processes: shared` opens every process with shared locking. `spawn <p>` starts
-     process `p` (`p0` starts implicitly), `exit <p>` closes it cleanly, and `kill <p>` crashes it
-     alone: its sessions and locks vanish, as the kernel releases a dead process's locks, while the
-     kernel cache and the other processes survive. `open <sid> <mode> <p>` opens a session in `p`
-     (default `p0`). `tick` runs every live process's presence probe, in process order.
-   - A lock acquisition that would block instead runs the other processes' probes and advances the
-     simulated clock by the poll interval (2 ms), so deadlines expire in simulated time. A wait that
-     makes no progress for 100,000 polls is reported as a deadlock. A process holding an open write
-     session is skipped: its probe takes the process's own writer gate and would block until that
-     writer ends, which no single simulated step can wait for. For the same reason the generator
-     spawns a process only while no writer is open; otherwise the join times out with `55006`.
-   - A `process_crash` fault kills only the process executing the step; a power loss kills them all
-     and `p0` reopens. A session's base version is checked against the history when it opens, so a
-     process that adopts a killed writer's unacknowledged generation must adopt one the history
-     allows.
-
-   - `spawn`, `check`, and `reopen` apply the same check in a shared trace: a process killed
-     mid-commit can leave a complete generation in the kernel cache that no survivor has begun on
-     yet, so the version seen may be newer than the last one the runner saw — never older.
-
-   This explores alone↔shared transitions, append-only co-resident commits, meta refresh at begin,
-   and foreign-generation adoption under crashes. In 100 `shared` traces on Go, 392 commits ran with
-   other processes present and 42 processes died mid-commit while others continued. The
-   `ignore-co-residents` plant (every process acts as if alone) is caught as wrong or unreadable data
-   (4 of 60 traces); two of its traces also showed the Go engine panicking, rather than failing
-   closed with `XX001`, on a page whose checksum was valid but whose structure was not — a
-   robustness gap only a logic bug can reach, tracked separately. Layer 4 stays the authority for
-   real kernel behavior.
+5. **S5 — Simulated lock host and multiple processes. Retired with shared mode.** S5 simulated
+   shared mode: processes joining, leaving, and dying around one file under the shared lock protocol
+   (the `shared` profile, `# processes: shared` traces, and the `ignore-co-residents` plant). The page
+   service replaced shared mode ([locking.md](locking.md) §1), so the profile and plant were removed
+   and a trace with a `processes` header is now reported as unsupported. Multi-process traces return
+   in a later slice of the same phase, which simulates an owner and its page clients over a
+   simulated transport. Until then Layer 4 is the only multi-process coverage.
 6. **S6 — Independent checker. Landed.** `verify.rb --check-image` decodes a crash image as a fourth
    voice: it selects the generation recovery must select and checks the live count and free list.
    The driver compares its decision with every recovery a core reports (`sim:regress` always,
@@ -678,9 +651,6 @@ primitive) gets a simulated implementation.
   host-supplied `BlockStore`" become a real host-API capability? hosts.md already treats hosts as
   pluggable. That decision belongs to the API, not this harness.
 - **CI budget.** How many regression traces and how long a sweep slice `mise run ci` can afford.
-- **Re-entrant probes.** A lock wait runs the other processes' probes inside the waiting process's
-  call, skipping busy writers. A future generator shape that reached a process already holding its
-  own writer gate or live mutex would hang in Rust (a std `Mutex`) rather than report a deadlock.
 - **Sector size defaults.** 64-byte tears are the default because they keep tearing possible at
   256-byte pages. Whether to also sweep 512-byte or 4 KiB units, which match real atomic-write
   sizes, is a profile choice.

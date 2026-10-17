@@ -6,9 +6,8 @@
 // read client pins into its reader watermark, to reset the window at compaction, to take the writer
 // gate, and — when a client commit was published or the gate handed over, which one atomic load at each
 // transaction begin notices — to adopt client commits and run maintenance commits. The owner's own
-// sessions otherwise keep the alone fast path. Node-only.
+// sessions otherwise run as on an unshared file. Node-only.
 
-import { randomFillSync } from "node:crypto";
 import process from "node:process";
 import { MessageChannel, type MessagePort } from "node:worker_threads";
 
@@ -21,6 +20,7 @@ import type { ServiceEngineFacts, ServiceOwnerHandle, ServicePending } from "../
 import { type BlockingChannel, ProcessWorker } from "./blocking.ts";
 import {
   currentUid,
+  newIncarnation,
   endpointPath,
   ownerRecordPath,
   removeQuietly,
@@ -58,12 +58,6 @@ export type OwnerLimits = {
   maxConnections: number;
   preferYield: boolean;
 };
-
-function newIncarnation(): Uint8Array {
-  const id = new Uint8Array(16);
-  while (id.every((b) => b === 0)) randomFillSync(id);
-  return id;
-}
 
 // readCommittedMeta reads the meta slot that published txid. Every commit writes slot txid & 1, so it
 // is the one to read; the parse check guards a slot a later commit already overwrote.

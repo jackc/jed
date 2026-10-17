@@ -624,7 +624,7 @@ struct Runner<'a> {
     fs: Arc<Mutex<SimFs>>,
 
     // Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
-    // coordination; a `# processes: shared` trace opens every process with shared locking.
+    // coordination. Multi-process traces are unsupported until they return with the page service.
     shared: bool,
     procs: BTreeMap<u32, Proc>,
     /// The process running the current step.
@@ -845,7 +845,8 @@ impl<'a> Runner<'a> {
             max_storage_bytes,
             sessions: HashMap::new(),
             db: None,
-            shared: tr.header("processes") == "shared",
+            // Multi-process traces return with the page service (simulation-testing.md).
+            shared: false,
             procs: BTreeMap::new(),
             cur: 0,
             locks: None,
@@ -946,47 +947,9 @@ impl<'a> Runner<'a> {
             .attach(name, AttachSource::file(file).locking(Locking::None), false)
     }
 
-    /// Start process `pid`. A shared trace acquires the file coordinator through the simulated lock
-    /// host first, exactly as `Database::open_with_options` does through the OS host.
+    /// Start process `pid`.
     fn open_proc(&mut self, pid: u32) -> Result<(), EngineError> {
-        let db = if self.shared {
-            let table = self
-                .locks
-                .get_or_insert_with(|| locks::new_table(self.clock.clone()))
-                .clone();
-            let host = Arc::new(locks::SimLockHost::new(table.clone(), pid));
-            let coordinator = match FileCoordinator::acquire(
-                host,
-                PathBuf::from(MAIN_FILE),
-                Locking::Shared,
-                crate::file::DEFAULT_FILE_LOCK_TIMEOUT_MS,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    locks::release(&table, pid);
-                    return Err(e);
-                }
-            };
-            let engine = match coordinator.lock_commit_shared() {
-                Ok(commit) => {
-                    let engine = self.open_engine();
-                    drop(commit);
-                    engine
-                }
-                Err(e) => Err(e),
-            };
-            let engine = match engine {
-                Ok(engine) => engine,
-                Err(e) => {
-                    drop(coordinator);
-                    locks::release(&table, pid);
-                    return Err(e);
-                }
-            };
-            Database::sim_from_engine_coordinated(engine, coordinator)
-        } else {
-            Database::from_engine(self.open_engine()?)
-        };
+        let db = Database::from_engine(self.open_engine()?);
         // Create, compaction, and attachments go through the simulated filesystem.
         db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
         if self.max_storage_bytes > 0 {
@@ -1236,6 +1199,11 @@ impl<'a> Runner<'a> {
     }
 
     fn run(&mut self) {
+        let processes = self.tr.header("processes");
+        if !processes.is_empty() {
+            self.violation = format!("unsupported processes mode {processes}");
+            return;
+        }
         // Create the database through the simulated filesystem, as the host's create does: a temp
         // file, its sync, the rename, and the directory barrier (S4).
         let created = Engine::create_via(
