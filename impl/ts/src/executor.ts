@@ -574,6 +574,7 @@ import {
   resolveJsonObject,
   resolveJsonImage,
   resolveJsonbSetInsert,
+  resolveJsonBehavior,
   resolveJsonPassing,
   resolveJsonpathArgs,
   resolveJsonpathFn,
@@ -17557,7 +17558,7 @@ export class Engine {
     // The PASSING values (json-sql-functions.md §5.4) follow the context in the SRF's args.
     const passing = resolveJsonPassing(argScope, jt.passing, forbidden, ptypes);
     const outColumns: Column[] = [];
-    const columns = this.resolveJtColumns(jt.columns, outColumns);
+    const columns = this.resolveJtColumns(jt.columns, outColumns, argScope, ptypes);
     const width = outColumns.length;
     const table: Table = {
       name: alias ?? "json_table",
@@ -17581,7 +17582,12 @@ export class Engine {
   // resolveJtColumns recursively resolves a `JSON_TABLE` COLUMNS tree, flattening the leaf columns
   // into `outColumns` (pre-order, declaration order) and assigning each its flat output index. Port
   // of impl/rust/src/executor.rs `resolve_jt_columns`.
-  private resolveJtColumns(cols: JtColumn[], outColumns: Column[]): JtCol[] {
+  private resolveJtColumns(
+    cols: JtColumn[],
+    outColumns: Column[],
+    argScope: Scope,
+    ptypes: ParamTypes,
+  ): JtCol[] {
     const resolved: JtCol[] = [];
     for (const col of cols) {
       switch (col.kind) {
@@ -17615,6 +17621,8 @@ export class Engine {
           const compiled = jtCompilePath(col.path, col.name);
           const idx = outColumns.length;
           outColumns.push(jtColumn(col.name, st, null));
+          const empty = resolveJsonBehavior(argScope, col.onEmpty, "null", st, ptypes);
+          const error = resolveJsonBehavior(argScope, col.onError, "null", st, ptypes);
           resolved.push({
             kind: "regular",
             idx,
@@ -17623,8 +17631,10 @@ export class Engine {
             path: compiled,
             query,
             wrapper: col.wrapper,
-            onEmpty: col.onEmpty ?? "null",
-            onError: col.onError ?? "null",
+            onEmpty: empty.behavior,
+            onError: error.behavior,
+            onEmptyDefault: empty.default,
+            onErrorDefault: error.default,
           });
           break;
         }
@@ -17645,7 +17655,7 @@ export class Engine {
         case "nested": {
           // Canonical text only — a like_regex fold never changes it, so no casing table is needed.
           const compiled = jsonPathRender(jsonPathCompile(col.path, undefined));
-          const nested = this.resolveJtColumns(col.columns, outColumns);
+          const nested = this.resolveJtColumns(col.columns, outColumns, argScope, ptypes);
           resolved.push({ kind: "nested", path: compiled, columns: nested });
           break;
         }
@@ -30679,6 +30689,10 @@ export type RExpr =
       keepQuotes: boolean;
       onEmpty: JsonOnBehavior;
       onError: JsonOnBehavior;
+      // The `args` index of a `DEFAULT expr` behavior's expression (json-sql-functions.md §5.3),
+      // after the PASSING values; -1 when that behavior is not DEFAULT.
+      onEmptyDefault: number;
+      onErrorDefault: number;
     }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
@@ -31486,6 +31500,10 @@ export type JtCol =
       wrapper: JsonWrapper;
       onEmpty: JsonOnBehavior;
       onError: JsonOnBehavior;
+      // The `DEFAULT expr` expressions of onEmpty / onError (json-sql-functions.md §5.3); null when
+      // that behavior is not DEFAULT.
+      onEmptyDefault: RExpr | null;
+      onErrorDefault: RExpr | null;
     }
   // An `EXISTS` column: JSON_EXISTS of `path`, coerced to `returning` (bool/int).
   | { kind: "exists"; idx: number; returning: ScalarType; path: string; onError: JsonOnBehavior }
@@ -31638,17 +31656,41 @@ export function isSqljsonError(e: unknown): e is EngineError {
   return e instanceof EngineError && e.code().startsWith("22");
 }
 
-// applyJsonBehavior applies a constant `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING
-// type. `underlying` is the SQL/JSON error this behavior replaces (rethrown verbatim by `error`).
-// Port of impl/rust/src/executor.rs `apply_json_behavior`.
+// JsonDefaults: the `DEFAULT expr` expressions of a SQL/JSON query function's ON EMPTY / ON ERROR
+// clauses and the row they are evaluated against (json-sql-functions.md §5.3).
+export type JsonDefaults = { onEmpty: RExpr | null; onError: RExpr | null; row: Row };
+
+// applyJsonBehavior applies an `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING type.
+// `underlying` is the SQL/JSON error this behavior replaces (rethrown verbatim by `error`). A `DEFAULT
+// expr` is evaluated here, outside the clause: its own errors propagate, as in PostgreSQL. Its value
+// is already of the RETURNING type, except a jsonb value, which is coerced as a JSON item
+// (PostgreSQL's runtime json_populate_type coercion); a failure there is 42804. Port of
+// impl/rust/src/executor.rs `apply_json_behavior`.
 export function applyJsonBehavior(
   behavior: JsonOnBehavior,
+  clause: "empty" | "error",
+  defaults: JsonDefaults,
   underlying: EngineError,
   returning: ScalarType,
   env: EvalEnv,
   meter: Meter,
 ): Value {
   switch (behavior) {
+    case "default": {
+      const expr = clause === "empty" ? defaults.onEmpty : defaults.onError;
+      if (expr === null) throw new Error("a DEFAULT behavior carries its expression");
+      const v = evalExpr(expr, defaults.row, env, meter);
+      if (v.kind !== "jsonb" || returning === "jsonb") return v;
+      try {
+        return coerceJsonMember(v.node, scalarT(returning), null, env, meter);
+      } catch (e) {
+        if (!isSqljsonError(e)) throw e;
+        throw engineError(
+          "datatype_mismatch",
+          `could not coerce ON ${clause.toUpperCase()} expression (DEFAULT) to the RETURNING type`,
+        ).withDetail(e.message);
+      }
+    }
     case "error":
       throw underlying;
     case "null":
@@ -31689,6 +31731,7 @@ export function evalJsonSqlResult(
   wrapper: JsonWrapper,
   onEmpty: JsonOnBehavior,
   onError: JsonOnBehavior,
+  defaults: JsonDefaults,
   constant: boolean,
   env: EvalEnv,
   meter: Meter,
@@ -31700,6 +31743,8 @@ export function evalJsonSqlResult(
       if (seq.length === 0) {
         return applyJsonBehavior(
           onEmpty,
+          "empty",
+          defaults,
           engineError("no_sql_json_item", "no SQL/JSON item"),
           returning,
           env,
@@ -31709,6 +31754,8 @@ export function evalJsonSqlResult(
       if (seq.length > 1) {
         return applyJsonBehavior(
           onError,
+          "error",
+          defaults,
           engineError(
             "more_than_one_sql_json_item",
             "JSON path expression in JSON_VALUE should return singleton scalar item",
@@ -31723,6 +31770,8 @@ export function evalJsonSqlResult(
       if (item.kind === "array" || item.kind === "object") {
         return applyJsonBehavior(
           onError,
+          "error",
+          defaults,
           engineError(
             "sql_json_scalar_required",
             "JSON path expression in JSON_VALUE should return singleton scalar item",
@@ -31738,7 +31787,7 @@ export function evalJsonSqlResult(
         return coerceJsonMember(item, scalarT(returning), decimal, env, meter);
       } catch (e) {
         if (isSqljsonError(e)) {
-          return applyJsonBehavior(onError, e, returning, env, meter);
+          return applyJsonBehavior(onError, "error", defaults, e, returning, env, meter);
         }
         throw e;
       }
@@ -31759,6 +31808,8 @@ export function evalJsonSqlResult(
           if (seq.length === 0) {
             return applyJsonBehavior(
               onEmpty,
+              "empty",
+              defaults,
               engineError("no_sql_json_item", "no SQL/JSON item"),
               returning,
               env,
@@ -31768,6 +31819,8 @@ export function evalJsonSqlResult(
           if (seq.length > 1) {
             return applyJsonBehavior(
               onError,
+              "error",
+              defaults,
               engineError(
                 "more_than_one_sql_json_item",
                 "JSON path expression in JSON_QUERY should return singleton item without wrapper",
@@ -31879,6 +31932,7 @@ export function expandJtLevel(
             col.wrapper,
             col.onEmpty,
             col.onError,
+            { onEmpty: col.onEmptyDefault, onError: col.onErrorDefault, row: [] },
             env,
             meter,
           );
@@ -31946,6 +32000,7 @@ export function evalJtRegular(
   wrapper: JsonWrapper,
   onEmpty: JsonOnBehavior,
   onError: JsonOnBehavior,
+  defaults: JsonDefaults,
   env: EvalEnv,
   meter: Meter,
 ): Value {
@@ -31955,13 +32010,25 @@ export function evalJtRegular(
     seq = jsonPathEval(p, item, jtEval(vars), meter);
   } catch (e) {
     if (isSqljsonError(e)) {
-      return applyJsonBehavior(onError, e, returning, env, meter);
+      return applyJsonBehavior(onError, "error", defaults, e, returning, env, meter);
     }
     throw e;
   }
   const kind: JsonSqlKind = query ? "query" : "value";
   // A JSON_TABLE row item is never a constant operand, so a wrapped column charges its array.
-  return evalJsonSqlResult(kind, seq, returning, decimal, wrapper, onEmpty, onError, false, env, meter);
+  return evalJsonSqlResult(
+    kind,
+    seq,
+    returning,
+    decimal,
+    wrapper,
+    onEmpty,
+    onError,
+    defaults,
+    false,
+    env,
+    meter,
+  );
 }
 
 // evalJtExists evaluates an `EXISTS` `JSON_TABLE` column over a row item — JSON_EXISTS, coerced to

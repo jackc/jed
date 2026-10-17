@@ -32,6 +32,7 @@ import {
   resolvedRangeElementScalar,
   resolvedToScalar,
   containsTimestamptz,
+  rejectDefaultStructure,
   resolvedTypeEqual,
   resolvedTypeOf,
   resolvedTypeOfCol,
@@ -44,6 +45,7 @@ import {
 import type {
   BinaryOp,
   Expr,
+  JsonBehavior,
   JsonOnBehavior,
   JsonPassing,
   JsonPredicateKind,
@@ -2229,7 +2231,7 @@ function resolveJsonExistsExpr(
     "without",
     true,
     null,
-    e.onError,
+    e.onError === null ? null : { kind: e.onError, default: null },
     ag,
     params,
   );
@@ -4271,8 +4273,8 @@ export function resolveJsonSqlFn(
   returning: string | null,
   wrapper: JsonWrapper,
   keepQuotes: boolean,
-  onEmpty: JsonOnBehavior | null,
-  onError: JsonOnBehavior | null,
+  onEmpty: JsonBehavior | null,
+  onError: JsonBehavior | null,
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -4325,24 +4327,144 @@ export function resolveJsonSqlFn(
       "JSON_QUERY RETURNING a non-json type is not supported yet",
     );
   }
-  const onEmptyB: JsonOnBehavior = onEmpty ?? "null";
-  const onErrorB: JsonOnBehavior = onError ?? (kind === "exists" ? "false" : "null");
   const rpassing = resolveJsonPassing(scope, passing, ag, params);
+  const empty = resolveJsonBehavior(scope, onEmpty, "null", returningSt, params);
+  const error = resolveJsonBehavior(
+    scope,
+    onError,
+    kind === "exists" ? "false" : "null",
+    returningSt,
+    params,
+  );
+  // The args: the context, the path, the PASSING values, then the DEFAULT expressions.
+  const args: RExpr[] = [rctx.node, rpath.node, ...rpassing.exprs];
+  let onEmptyDefault = -1;
+  let onErrorDefault = -1;
+  if (empty.default !== null) {
+    onEmptyDefault = args.length;
+    args.push(empty.default);
+  }
+  if (error.default !== null) {
+    onErrorDefault = args.length;
+    args.push(error.default);
+  }
   return {
     node: {
       kind: "jsonSqlFn",
       sqlKind: kind,
-      args: [rctx.node, rpath.node, ...rpassing.exprs],
+      args,
       passingNames: rpassing.names,
       returning: returningSt,
       decimal: null,
       wrapper,
       keepQuotes,
-      onEmpty: onEmptyB,
-      onError: onErrorB,
+      onEmpty: empty.behavior,
+      onError: error.behavior,
+      onEmptyDefault,
+      onErrorDefault,
     },
     type: resolvedTypeOf(returningSt),
   };
+}
+
+// resolveJsonBehavior resolves an ON EMPTY / ON ERROR clause → its behavior (fallback when the clause
+// is absent) and, for `DEFAULT expr`, the resolved expression (json-sql-functions.md §5.3). As
+// PostgreSQL's transformJsonBehavior: the expression must be a constant, a non-aggregate function
+// call, or an operator expression, possibly under casts (42804 otherwise), must not reference a
+// column (42804), and takes the RETURNING type as its hint, so a string literal is read as that type
+// at resolve. A NULL, a value already of the RETURNING type, and a jsonb value (coerced as a JSON
+// item when the behavior fires) are kept; a boolean is made a JSON boolean for the same runtime
+// coercion unless the RETURNING type is i32 (the cast); any other type is cast explicitly to the
+// RETURNING type, 42846 when no cast exists. Port of impl/rust `resolve_json_behavior`.
+export function resolveJsonBehavior(
+  scope: Scope,
+  clause: JsonBehavior | null,
+  fallback: JsonOnBehavior,
+  returning: ScalarType,
+  params: ParamTypes,
+): { behavior: JsonOnBehavior; default: RExpr | null } {
+  if (clause === null) return { behavior: fallback, default: null };
+  const expr = clause.default;
+  if (expr === null) return { behavior: clause.kind, default: null };
+  if (!jsonDefaultShapeOk(expr)) {
+    throw engineError(
+      "datatype_mismatch",
+      "can only specify a constant, non-aggregate function, or operator expression for DEFAULT",
+    );
+  }
+  try {
+    rejectDefaultStructure(expr);
+  } catch (e) {
+    if (
+      e instanceof EngineError &&
+      e.code() === "0A000" &&
+      e.message.includes("column reference")
+    ) {
+      throw engineError(
+        "datatype_mismatch",
+        "DEFAULT expression must not contain column references",
+      );
+    }
+    throw e;
+  }
+  const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+  const r = resolve(scope, expr, returning, forbidden, params);
+  const ty = r.type;
+  if (
+    ty.kind === "null" ||
+    ty.kind === "jsonb" ||
+    resolvedTypeEqual(ty, resolvedTypeOf(returning))
+  ) {
+    return { behavior: "default", default: r.node };
+  }
+  if (ty.kind === "bool" && returning !== "i32") {
+    return {
+      behavior: "default",
+      default: { kind: "jsonImage", func: "to_jsonb", args: [r.node], valueType: ty },
+    };
+  }
+  try {
+    const cast = resolve(
+      scope,
+      { kind: "cast", inner: expr, typeName: canonicalName(returning), typeMod: null },
+      null,
+      forbidden,
+      params,
+    );
+    return { behavior: "default", default: cast.node };
+  } catch (e) {
+    if (e instanceof EngineError && (e.code() === "42804" || e.code() === "0A000")) {
+      throw engineError(
+        "cannot_coerce",
+        `cannot cast behavior expression of type ${rtName(ty)} to ${canonicalName(returning)}`,
+      );
+    }
+    throw e;
+  }
+}
+
+// jsonDefaultShapeOk reports whether a `DEFAULT expr` behavior has the shape PostgreSQL's
+// ValidJsonBehaviorDefaultExpr admits: a constant, a function call, or an operator expression (not
+// AND/OR/NOT, which are boolean expressions there), possibly under a cast or COLLATE.
+function jsonDefaultShapeOk(e: Expr): boolean {
+  switch (e.kind) {
+    case "literal":
+    case "typedLiteral":
+    case "like":
+    case "regex":
+      return true;
+    case "funcCall":
+      return (e.over ?? null) === null && (e.overName ?? null) === null;
+    case "binary":
+      return e.op !== "and" && e.op !== "or";
+    case "unary":
+      return e.op !== "not";
+    case "cast":
+    case "collate":
+      return jsonDefaultShapeOk(e.inner);
+    default:
+      return false;
+  }
 }
 
 // resolveJsonPassing resolves a `PASSING value [FORMAT JSON] AS name, …` clause

@@ -962,8 +962,8 @@ pub enum JtColumn {
         path: Option<String>,
         wrapper: JsonWrapper,
         keep_quotes: bool,
-        on_empty: Option<JsonOnBehavior>,
-        on_error: Option<JsonOnBehavior>,
+        on_empty: Option<JsonBehavior>,
+        on_error: Option<JsonBehavior>,
     },
     /// `name type EXISTS [PATH p] [behavior ON ERROR]` — JSON_EXISTS of `p`, coerced to `type`.
     Exists {
@@ -1443,8 +1443,8 @@ pub enum Expr {
         path: Box<Expr>,
         passing: Vec<JsonPassing>,
         returning: Option<String>,
-        on_empty: Option<JsonOnBehavior>,
-        on_error: Option<JsonOnBehavior>,
+        on_empty: Option<JsonBehavior>,
+        on_error: Option<JsonBehavior>,
     },
     /// `JSON_QUERY(ctx, path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])` — extract a
     /// JSON value (default `jsonb`). `wrapper` controls array-wrapping; `quotes` controls scalar-string
@@ -1457,8 +1457,8 @@ pub enum Expr {
         wrapper: JsonWrapper,
         /// `KEEP QUOTES` (true, default) / `OMIT QUOTES` (false).
         keep_quotes: bool,
-        on_empty: Option<JsonOnBehavior>,
-        on_error: Option<JsonOnBehavior>,
+        on_empty: Option<JsonBehavior>,
+        on_error: Option<JsonBehavior>,
     },
     /// `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
     /// keyword: `negated = true` is `IS NOT DISTINCT FROM` (NULL-safe `=`); `false` is
@@ -1711,8 +1711,17 @@ impl Expr {
     }
 }
 
-/// A constant `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions
-/// (json-sql-functions.md §5.2). `DEFAULT expr` is the deferred S3 follow-on (§5.3).
+/// One parsed `ON EMPTY` / `ON ERROR` clause of `JSON_VALUE` / `JSON_QUERY` / a `JSON_TABLE` column:
+/// a constant behavior, or `DEFAULT expr` (`kind` [`JsonOnBehavior::Default`], `default` the
+/// expression — json-sql-functions.md §5.3).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JsonBehavior {
+    pub kind: JsonOnBehavior,
+    pub default: Option<Box<Expr>>,
+}
+
+/// An `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions (json-sql-functions.md
+/// §5.2). `Default` marks `DEFAULT expr`, whose expression is carried beside it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JsonOnBehavior {
     /// `NULL` — substitute SQL NULL.
@@ -1726,6 +1735,8 @@ pub enum JsonOnBehavior {
     /// `EMPTY ARRAY` / `EMPTY OBJECT` — substitute an empty JSON array / object (JSON_QUERY).
     EmptyArray,
     EmptyObject,
+    /// `DEFAULT expr` — evaluate the expression (json-sql-functions.md §5.3).
+    Default,
 }
 
 /// `JSON_QUERY`'s array-wrapper mode (json-sql-functions.md §5.2).

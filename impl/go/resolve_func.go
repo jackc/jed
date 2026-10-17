@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -2514,7 +2515,7 @@ func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, tz bool, fc *
 // resolveJSONSqlFn resolves a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY
 // (json-sql-functions.md §5, S2) → an reJsonSqlFn node + its fixed result type. ctx is json/jsonb/
 // text (coerced to a jsonb document at eval); path is a jsonpath (a bare string literal compiles).
-func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, passing []jsonPassing, returning *string, wrapper jsonWrapper, keepQuotes bool, onEmpty, onError *jsonOnBehavior, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, passing []jsonPassing, returning *string, wrapper jsonWrapper, keepQuotes bool, onEmpty, onError *jsonBehavior, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// The context item — json / jsonb / text, coerced to a jsonb document at eval; a bare string
 	// literal adapts to jsonb.
 	jsonbHint := scalarJsonb
@@ -2563,31 +2564,128 @@ func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, passing []
 	if kind == jsQuery && returningST != scalarJson && returningST != scalarJsonb {
 		return nil, resolvedType{}, newError(FeatureNotSupported, "JSON_QUERY RETURNING a non-json type is not supported yet")
 	}
-	onEmptyB := jOBNull
-	if onEmpty != nil {
-		onEmptyB = *onEmpty
-	}
-	onErrorB := jOBNull
-	if onError != nil {
-		onErrorB = *onError
-	} else if kind == jsExists {
-		onErrorB = jOBFalse
-	}
 	passingExprs, passingNames, err := resolveJSONPassing(s, passing, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
+	onEmptyB, onEmptyDefault, err := resolveJSONBehavior(s, onEmpty, jOBNull, returningST, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	onErrorFallback := jOBNull
+	if kind == jsExists {
+		onErrorFallback = jOBFalse
+	}
+	onErrorB, onErrorDefault, err := resolveJSONBehavior(s, onError, onErrorFallback, returningST, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// The args: the context, the path, the PASSING values, then the DEFAULT expressions.
+	sargs := append([]*rExpr{rctx, rpath}, passingExprs...)
+	onEmptyAt, onErrorAt := -1, -1
+	if onEmptyDefault != nil {
+		onEmptyAt = len(sargs)
+		sargs = append(sargs, onEmptyDefault)
+	}
+	if onErrorDefault != nil {
+		onErrorAt = len(sargs)
+		sargs = append(sargs, onErrorDefault)
+	}
 	return &rExpr{
-		kind:           reJsonSqlFn,
-		jsKind:         kind,
-		sargs:          append([]*rExpr{rctx, rpath}, passingExprs...),
-		jsPassingNames: passingNames,
-		result:         returningST,
-		jsWrapper:      wrapper,
-		jsKeepQuotes:   keepQuotes,
-		jsOnEmpty:      onEmptyB,
-		jsOnError:      onErrorB,
+		kind:             reJsonSqlFn,
+		jsKind:           kind,
+		sargs:            sargs,
+		jsPassingNames:   passingNames,
+		result:           returningST,
+		jsWrapper:        wrapper,
+		jsKeepQuotes:     keepQuotes,
+		jsOnEmpty:        onEmptyB,
+		jsOnError:        onErrorB,
+		jsOnEmptyDefault: onEmptyAt,
+		jsOnErrorDefault: onErrorAt,
 	}, resolvedTypeOf(returningST), nil
+}
+
+// jsonExistsBehavior wraps JSON_EXISTS's constant ON ERROR behavior (nil when absent) as a clause.
+func jsonExistsBehavior(b *jsonOnBehavior) *jsonBehavior {
+	if b == nil {
+		return nil
+	}
+	return &jsonBehavior{Kind: *b}
+}
+
+// resolveJSONBehavior resolves an ON EMPTY / ON ERROR clause → its behavior (fallback when the clause
+// is absent) and, for `DEFAULT expr`, the resolved expression (json-sql-functions.md §5.3). As
+// PostgreSQL's transformJsonBehavior: the expression must be a constant, a non-aggregate function
+// call, or an operator expression, possibly under casts (42804 otherwise), must not reference a
+// column (42804), and takes the RETURNING type as its hint, so a string literal is read as that type
+// at resolve. A NULL, a value already of the RETURNING type, and a jsonb value (coerced as a JSON
+// item when the behavior fires) are kept; a boolean is made a JSON boolean for the same runtime
+// coercion unless the RETURNING type is i32 (the cast); any other type is cast explicitly to the
+// RETURNING type, 42846 when no cast exists. Port of impl/rust `resolve_json_behavior`.
+func resolveJSONBehavior(s *scope, clause *jsonBehavior, fallback jsonOnBehavior, returning scalarType, params *paramTypes) (jsonOnBehavior, *rExpr, error) {
+	if clause == nil {
+		return fallback, nil, nil
+	}
+	if clause.Default == nil {
+		return clause.Kind, nil, nil
+	}
+	expr := *clause.Default
+	if !jsonDefaultShapeOK(expr) {
+		return 0, nil, newError(DatatypeMismatch, "can only specify a constant, non-aggregate function, or operator expression for DEFAULT")
+	}
+	if err := rejectDefaultStructure(expr); err != nil {
+		var ee *EngineError
+		if errors.As(err, &ee) && ee.Code() == "0A000" && strings.Contains(ee.Message, "column reference") {
+			return 0, nil, newError(DatatypeMismatch, "DEFAULT expression must not contain column references")
+		}
+		return 0, nil, err
+	}
+	hint := returning
+	r, ty, err := resolve(s, expr, &hint, &aggCtx{}, params)
+	if err != nil {
+		return 0, nil, err
+	}
+	switch {
+	case ty.kind == rtNull || ty.kind == rtJsonb || resolvedTypeEqual(ty, resolvedTypeOf(returning)):
+		// kept
+	case ty.kind == rtBool && returning != scalarInt32:
+		t := ty
+		r = &rExpr{kind: reJsonImage, jiFunc: jiToJsonb, sargs: []*rExpr{r}, jiType: &t}
+	default:
+		cast := exprNode{Kind: exprCast, Cast: &castExpr{Inner: expr, TypeName: returning.CanonicalName()}}
+		cr, _, err := resolve(s, cast, nil, &aggCtx{}, params)
+		if err != nil {
+			var ee *EngineError
+			if errors.As(err, &ee) && (ee.Code() == "42804" || ee.Code() == "0A000") {
+				return 0, nil, newError(CannotCoerce, fmt.Sprintf("cannot cast behavior expression of type %s to %s", rtName(ty), returning.CanonicalName()))
+			}
+			return 0, nil, err
+		}
+		r = cr
+	}
+	return jOBDefault, r, nil
+}
+
+// jsonDefaultShapeOK reports whether a `DEFAULT expr` behavior has the shape PostgreSQL's
+// ValidJsonBehaviorDefaultExpr admits: a constant, a function call, or an operator expression (not
+// AND/OR/NOT, which are boolean expressions there), possibly under a cast or COLLATE.
+func jsonDefaultShapeOK(e exprNode) bool {
+	switch e.Kind {
+	case exprLiteral, exprTypedLiteral, exprLike, exprRegex:
+		return true
+	case exprFuncCall:
+		return e.FuncCall.Over == nil && e.FuncCall.OverName == ""
+	case exprBinary:
+		return e.Binary.Op != opAnd && e.Binary.Op != opOr
+	case exprUnary:
+		return e.Unary.Op != opNot
+	case exprCast:
+		return jsonDefaultShapeOK(e.Cast.Inner)
+	case exprCollate:
+		return jsonDefaultShapeOK(e.Collate.Inner)
+	}
+	return false
 }
 
 // resolveJSONPassing resolves a `PASSING value [FORMAT JSON] AS name, …` clause (json-sql-functions.md

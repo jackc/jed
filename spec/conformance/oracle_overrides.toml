@@ -1761,3 +1761,14 @@ reason = "jed: an integer-array field may fill a narrower declared integer-array
 file = "types/record_unnest_coldef.test"
 sql = "SELECT * FROM unnest(ARRAY[ROW(1, 'a')]) AS u(a i32, b text)"
 reason = "jed: a bare string literal inside ROW(…) is typed text (composite.md §13), so it fills a text column. PostgreSQL leaves it the pseudo-type unknown, which matches no declared column type (42804, \"Returned type unknown at ordinal position 2\"). A lenient divergence."
+
+# --- SQL/JSON DEFAULT behaviors (json-sql-functions.md §5.3) -------------------------------------
+[[override]]
+file = "json/json_behavior_default.test"
+sql = "SELECT JSON_VALUE(jsonb '{}', '$.a' DEFAULT true ON EMPTY)"
+reason = "jed: a boolean DEFAULT for a RETURNING type other than boolean or i32 is coerced as the JSON boolean it is, so `true` is 'true'. PostgreSQL 18's transformJsonBehavior builds the jsonb constant from the behavior type (DEFAULT is neither TRUE nor FALSE), so every boolean DEFAULT becomes 'false' — a PostgreSQL bug jed does not copy."
+
+[[override]]
+file = "json/json_behavior_default.test"
+sql = "SELECT JSON_VALUE(jsonb '{\"a\": 1}', '$.a' RETURNING i32 DEFAULT 1 / 0 ON EMPTY)"
+reason = "jed: a DEFAULT expression is evaluated only when its clause fires, so an unused `1 / 0` raises nothing and the item is returned. PostgreSQL's planner constant-folds an immutable DEFAULT expression, raising 22012 before execution whether or not the behavior fires. jed does no plan-time folding (a documented divergence, json-sql-functions.md §5.3)."

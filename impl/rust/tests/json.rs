@@ -266,8 +266,8 @@ fn json_record_composite_array_column_is_0a000() {
 
 /// A `jsonb` column round-trips every node kind (object/array/number/string/bool/null) through a
 /// serialize + reload, confirming the tagged-node value codec decodes back to the canonical render.
-/// The deferred S2 sub-clauses of the SQL/JSON query functions are `0A000` — ON ERROR/EMPTY
-/// DEFAULT expr, JSON_QUERY OMIT QUOTES, and JSON_QUERY RETURNING a non-json type.
+/// The deferred S2 sub-clauses of the SQL/JSON query functions are `0A000` —
+/// JSON_QUERY OMIT QUOTES and JSON_QUERY RETURNING a non-json type.
 /// PostgreSQL supports all of these, so each is a documented divergence; the supported subset is
 /// oracle-clean in suites/json/json_query_fns.test.
 #[test]
@@ -276,7 +276,6 @@ fn json_query_fn_deferred_clauses_are_0a000() {
         .unwrap()
         .session(SessionOptions::default());
     for sql in [
-        "SELECT JSON_VALUE('{\"a\":1}', '$.b' DEFAULT 'z' ON EMPTY)",
         "SELECT JSON_QUERY('{\"a\":1}', '$.a' OMIT QUOTES)",
         "SELECT JSON_QUERY('{\"a\":1}', '$.a' RETURNING int)",
     ] {

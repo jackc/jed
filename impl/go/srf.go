@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -314,7 +315,7 @@ func (db *engine) resolveJSONTable(jt *jsonTable, alias *string, parent *scope, 
 		return nil, nil, err
 	}
 	var outColumns []catColumn
-	columns, err := db.resolveJtColumns(jt.Columns, &outColumns)
+	columns, err := db.resolveJtColumns(jt.Columns, &outColumns, argScope, ptypes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -331,8 +332,9 @@ func (db *engine) resolveJSONTable(jt *jsonTable, alias *string, parent *scope, 
 }
 
 // resolveJtColumns recursively resolves a JSON_TABLE COLUMNS tree, flattening the leaf columns into
-// `outColumns` (pre-order, declaration order) and assigning each its flat output index.
-func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn) ([]jtCol, error) {
+// `outColumns` (pre-order, declaration order) and assigning each its flat output index. A column's ON
+// EMPTY / ON ERROR `DEFAULT expr` resolves in argScope (json-sql-functions.md §5.3).
+func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn, argScope *scope, ptypes *paramTypes) ([]jtCol, error) {
 	resolved := make([]jtCol, 0, len(cols))
 	for _, col := range cols {
 		switch c := col.(type) {
@@ -361,15 +363,25 @@ func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn) ([]
 			}
 			idx := len(*outColumns)
 			*outColumns = append(*outColumns, newJtColumn(c.Name, st, decimal))
+			onEmpty, onEmptyDefault, err := resolveJSONBehavior(argScope, c.OnEmpty, jOBNull, st, ptypes)
+			if err != nil {
+				return nil, err
+			}
+			onError, onErrorDefault, err := resolveJSONBehavior(argScope, c.OnError, jOBNull, st, ptypes)
+			if err != nil {
+				return nil, err
+			}
 			resolved = append(resolved, &jtColRegular{
-				idx:       idx,
-				returning: st,
-				decimal:   decimal,
-				path:      compiled,
-				query:     query,
-				wrapper:   c.Wrapper,
-				onEmpty:   jtBehavior(c.OnEmpty, jOBNull),
-				onError:   jtBehavior(c.OnError, jOBNull),
+				idx:            idx,
+				returning:      st,
+				decimal:        decimal,
+				path:           compiled,
+				query:          query,
+				wrapper:        c.Wrapper,
+				onEmpty:        onEmpty,
+				onError:        onError,
+				onEmptyDefault: onEmptyDefault,
+				onErrorDefault: onErrorDefault,
 			})
 		case *jtColumnExists:
 			st, _, err := jtScalarType(db, c.TypeName)
@@ -393,7 +405,7 @@ func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn) ([]
 			if err != nil {
 				return nil, err
 			}
-			nested, err := db.resolveJtColumns(c.Columns, outColumns)
+			nested, err := db.resolveJtColumns(c.Columns, outColumns, argScope, ptypes)
 			if err != nil {
 				return nil, err
 			}
@@ -1726,10 +1738,51 @@ func isSQLJSONError(err error) bool {
 	return false
 }
 
-// applyJSONBehavior applies a constant `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING
-// type. underlying is the SQL/JSON error this behavior replaces (raised verbatim by `ERROR`).
-func applyJSONBehavior(behavior jsonOnBehavior, underlying error, returning scalarType, env *evalEnv, m *costMeter) (Value, error) {
+// jsonDefaults are the `DEFAULT expr` expressions of a SQL/JSON query function's ON EMPTY / ON ERROR
+// clauses and the row they are evaluated against (json-sql-functions.md §5.3).
+type jsonDefaults struct {
+	onEmpty *rExpr
+	onError *rExpr
+	row     storedRow
+}
+
+// jsonClause names which clause a behavior answers: ON EMPTY or ON ERROR (named in a DEFAULT
+// coercion error).
+type jsonClause int
+
+const (
+	jsonClauseEmpty jsonClause = iota
+	jsonClauseError
+)
+
+// applyJSONBehavior applies an `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING type.
+// underlying is the SQL/JSON error this behavior replaces (raised verbatim by `ERROR`). A `DEFAULT
+// expr` is evaluated here, outside the clause: its own errors propagate, as in PostgreSQL. Its value
+// is already of the RETURNING type, except a jsonb value, which is coerced as a JSON item
+// (PostgreSQL's runtime json_populate_type coercion); a failure there is 42804.
+func applyJSONBehavior(behavior jsonOnBehavior, clause jsonClause, defaults jsonDefaults, underlying error, returning scalarType, env *evalEnv, m *costMeter) (Value, error) {
 	switch behavior {
+	case jOBDefault:
+		expr, name := defaults.onEmpty, "EMPTY"
+		if clause == jsonClauseError {
+			expr, name = defaults.onError, "ERROR"
+		}
+		v, err := expr.eval(defaults.row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if v.Kind != ValJsonb || returning == scalarJsonb {
+			return v, nil
+		}
+		out, err := coerceJSONMember(v.jsonb(), scalarT(returning), nil, env, m)
+		if err != nil {
+			var ee *EngineError
+			if !isSQLJSONError(err) || !errors.As(err, &ee) {
+				return Value{}, err
+			}
+			return Value{}, newError(DatatypeMismatch, "could not coerce ON "+name+" expression (DEFAULT) to the RETURNING type").withDetail(ee.Message)
+		}
+		return out, nil
 	case jOBError:
 		return Value{}, underlying
 	case jOBNull:
@@ -1757,23 +1810,23 @@ func jsonNodeAsReturning(node JsonNode, returning scalarType, env *evalEnv, m *c
 // evaluated sequence. (JSON_EXISTS is handled inline — non-empty → true.)
 // constant reports that the context and path are both constant operands, so a wrapped JSON_QUERY
 // result is free like any constant growth kernel (cost.md §8.1).
-func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, wrapper jsonWrapper, onEmpty, onError jsonOnBehavior, constant bool, env *evalEnv, m *costMeter) (Value, error) {
+func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, wrapper jsonWrapper, onEmpty, onError jsonOnBehavior, defaults jsonDefaults, constant bool, env *evalEnv, m *costMeter) (Value, error) {
 	switch kind {
 	case jsExists:
 		return BoolValue(len(seq) > 0), nil
 	case jsValue:
 		if len(seq) == 0 {
-			return applyJSONBehavior(onEmpty, newError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
+			return applyJSONBehavior(onEmpty, jsonClauseEmpty, defaults, newError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
 		}
 		if len(seq) > 1 {
-			return applyJSONBehavior(onError,
+			return applyJSONBehavior(onError, jsonClauseError, defaults,
 				newError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_VALUE should return singleton scalar item"),
 				returning, env, m)
 		}
 		item := seq[0]
 		// JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
 		if item.Kind == JArray || item.Kind == JObject {
-			return applyJSONBehavior(onError,
+			return applyJSONBehavior(onError, jsonClauseError, defaults,
 				newError(SqlJsonScalarRequired, "JSON path expression in JSON_VALUE should return singleton scalar item"),
 				returning, env, m)
 		}
@@ -1782,7 +1835,7 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, w
 		v, err := coerceJSONMember(&item, scalarT(returning), nil, env, m)
 		if err != nil {
 			if isSQLJSONError(err) {
-				return applyJSONBehavior(onError, err, returning, env, m)
+				return applyJSONBehavior(onError, jsonClauseError, defaults, err, returning, env, m)
 			}
 			return Value{}, err
 		}
@@ -1802,10 +1855,10 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, w
 			}
 		default: // JWWithout
 			if len(seq) == 0 {
-				return applyJSONBehavior(onEmpty, newError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
+				return applyJSONBehavior(onEmpty, jsonClauseEmpty, defaults, newError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
 			}
 			if len(seq) > 1 {
-				return applyJSONBehavior(onError,
+				return applyJSONBehavior(onError, jsonClauseError, defaults,
 					newError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_QUERY should return singleton item without wrapper"),
 					returning, env, m)
 			}
@@ -2034,6 +2087,7 @@ func expandJtNested(children []*jtColNested, item *JsonNode, vars jpVars, env *e
 // evalJtRegular evaluates a regular JSON_TABLE column over a row item — JSON_VALUE (scalar) /
 // JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR.
 func evalJtRegular(item *JsonNode, c *jtColRegular, vars jpVars, env *evalEnv, m *costMeter) (Value, error) {
+	defaults := jsonDefaults{onEmpty: c.onEmptyDefault, onError: c.onErrorDefault}
 	p, err := compileMetered(c.path, m, env.exec.session.env.propertyTable())
 	if err != nil {
 		return Value{}, err
@@ -2041,7 +2095,7 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, vars jpVars, env *evalEnv, m
 	seq, err := p.Eval(*item, jtEvalOpts(vars), m)
 	if err != nil {
 		if isSQLJSONError(err) {
-			return applyJSONBehavior(c.onError, err, c.returning, env, m)
+			return applyJSONBehavior(c.onError, jsonClauseError, defaults, err, c.returning, env, m)
 		}
 		return Value{}, err
 	}
@@ -2050,7 +2104,7 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, vars jpVars, env *evalEnv, m
 		kind = jsQuery
 	}
 	// A JSON_TABLE row item is never a constant operand, so a wrapped column charges its array.
-	return evalJSONSqlResult(kind, seq, c.returning, c.wrapper, c.onEmpty, c.onError, false, env, m)
+	return evalJSONSqlResult(kind, seq, c.returning, c.wrapper, c.onEmpty, c.onError, defaults, false, env, m)
 }
 
 // evalJtExists evaluates an EXISTS JSON_TABLE column over a row item — JSON_EXISTS, coerced to the

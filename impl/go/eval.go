@@ -4250,7 +4250,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		// The PASSING values, evaluated after the context and path (as in PostgreSQL) and outside ON
 		// ERROR: each is a base object for .keyvalue() ids (jsonpath.md §3.1).
-		passing := e.sargs[2:]
+		passing := e.sargs[2 : 2+len(e.jsPassingNames)]
+		defaults := jsonDefaults{row: row}
+		if e.jsOnEmptyDefault >= 0 {
+			defaults.onEmpty = e.sargs[e.jsOnEmptyDefault]
+		}
+		if e.jsOnErrorDefault >= 0 {
+			defaults.onError = e.sargs[e.jsOnErrorDefault]
+		}
 		bindings, err := passingBindings(passing, e.jsPassingNames, row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -4261,7 +4268,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
 			// else (a cost abort, a missing variable, etc.) propagates.
 			if isSQLJSONError(err) {
-				return applyJSONBehavior(e.jsOnError, err, e.result, env, m)
+				return applyJSONBehavior(e.jsOnError, jsonClauseError, defaults, err, e.result, env, m)
 			}
 			return Value{}, err
 		}
@@ -4271,10 +4278,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		constant := true
-		for _, a := range e.sargs {
+		for _, a := range e.sargs[:2+len(e.jsPassingNames)] {
 			constant = constant && rexprIsConstant(a)
 		}
-		return evalJSONSqlResult(e.jsKind, seq, e.result, e.jsWrapper, e.jsOnEmpty, e.jsOnError, constant, env, m)
+		return evalJSONSqlResult(e.jsKind, seq, e.result, e.jsWrapper, e.jsOnEmpty, e.jsOnError, defaults, constant, env, m)
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued

@@ -1735,14 +1735,23 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
             sat_add(total, estimator_operator_nodes(Some(arg)))
         }),
         RExpr::JsonSqlFn {
-            ctx, path, passing, ..
-        } => passing.iter().fold(
-            sat_add(
-                estimator_operator_nodes(Some(ctx)),
-                estimator_operator_nodes(Some(path)),
+            ctx,
+            path,
+            passing,
+            on_empty_default,
+            on_error_default,
+            ..
+        } => passing
+            .iter()
+            .chain(on_empty_default.as_deref())
+            .chain(on_error_default.as_deref())
+            .fold(
+                sat_add(
+                    estimator_operator_nodes(Some(ctx)),
+                    estimator_operator_nodes(Some(path)),
+                ),
+                |total, p| sat_add(total, estimator_operator_nodes(Some(p))),
             ),
-            |total, p| sat_add(total, estimator_operator_nodes(Some(p))),
-        ),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().fold(0, |total, field| {
                 sat_add(total, estimator_operator_nodes(Some(field)))
@@ -1837,10 +1846,17 @@ pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
         | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().collect(),
         RExpr::JsonSqlFn {
-            ctx, path, passing, ..
+            ctx,
+            path,
+            passing,
+            on_empty_default,
+            on_error_default,
+            ..
         } => {
             let mut children = vec![ctx.as_ref(), path.as_ref()];
             children.extend(passing);
+            children.extend(on_empty_default.as_deref());
+            children.extend(on_error_default.as_deref());
             children
         }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => fields.iter().collect(),
@@ -3514,11 +3530,20 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::JsonSqlFn {
-            ctx, path, passing, ..
+            ctx,
+            path,
+            passing,
+            on_empty_default,
+            on_error_default,
+            ..
         } => {
             rexpr_is_constant(ctx)
                 && rexpr_is_constant(path)
-                && passing.iter().all(rexpr_is_constant)
+                && passing
+                    .iter()
+                    .chain(on_empty_default.as_deref())
+                    .chain(on_error_default.as_deref())
+                    .all(rexpr_is_constant)
         }
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. }
