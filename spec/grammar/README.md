@@ -22,3 +22,10 @@ rule — lives in [../design/grammar.md](../design/grammar.md).
 > time as features land. Constructs still deferred (added here *first* when they land) —
 > e.g. `COUNT(DISTINCT x)`, LATERAL / select-list set-returning functions, and the further
 > surfaces enumerated in [../design/grammar.md](../design/grammar.md).
+
+## Keyword data
+
+[pg_keywords.toml](pg_keywords.toml) is not part of the grammar: it is PostgreSQL 18's list of
+non-unreserved keywords, kept as data so `quote_ident` and `format`'s `%I` quote exactly the words
+PostgreSQL quotes ([../design/string-functions.md](../design/string-functions.md) §3). jed itself
+reserves no keywords ([../design/grammar.md](../design/grammar.md) §3).

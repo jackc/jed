@@ -4771,10 +4771,10 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
-# quote_ident(text) → text — the string wrapped as a SQL identifier: returned unchanged if it is
-# already a safe unquoted identifier (^[a-z_][a-z0-9_]*$), else double-quoted with each internal "
-# doubled. quote_ident('Foo') = '"Foo"'. STRICT. jed quotes by the LEXICAL pattern only (no
-# reserved-keyword quoting — jed has no enumerated keyword set; string-functions.md §3).
+# quote_ident(text) → text — the string wrapped as a SQL identifier: returned unchanged if it is a
+# safe unquoted identifier (^[a-z_][a-z0-9_]*$) that is not one of PostgreSQL's quoted (non-unreserved)
+# keywords (../grammar/pg_keywords.toml), else double-quoted with each internal " doubled.
+# quote_ident('Foo') = '"Foo"', quote_ident('select') = '"select"'. STRICT. (string-functions.md §3)
 [[operator]]
 volatility     = "immutable"
 name           = "quote_ident"
@@ -4816,6 +4816,60 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = ["22025"]
+
+# --- text-building VARIADIC "any" functions (string-functions.md §6) ---------------------------------
+# PostgreSQL's concat / concat_ws / format. Each takes a spread of heterogeneous arguments (or a single
+# array via the VARIADIC keyword) and renders every argument it uses through its type's OUTPUT text
+# (a boolean is `t`/`f`, as PostgreSQL's boolout — not the `true`/`false` of the `::text` cast; a
+# timestamptz renders in the session zone). NON-STRICT (null = "none"), so the kernel decides NULLs:
+#  - concat(VARIADIC "any") → text: the non-NULL arguments' text, joined; never NULL in the spread form
+#    (concat(NULL) = ''). concat(VARIADIC arr) joins the array's non-NULL elements; a NULL array → NULL.
+#    A growth kernel (cost.md §8.1).
+#  - concat_ws(sep text, VARIADIC "any") → text: the non-NULL arguments joined by `sep`; a NULL `sep` →
+#    NULL. An amplifier (`sep` repeats once per argument).
+#  - format(formatstr text, VARIADIC "any") → text: printf-style %s / %I / %L / %% with positional
+#    `n$`, the `-` flag, a width, and a `*` / `*n$` width argument. A NULL format string → NULL; a NULL
+#    VARIADIC array is no arguments. Malformed specifiers are 22023, an over-long number 22003, %I of a
+#    NULL 22004; a `*` width argument that is not an integer is that text's integer-input error (22P02 /
+#    22003). PostgreSQL's separate one-argument format(text) row is folded in: a zero-argument spread is
+#    allowed (the fixed-param floor, like the json builders). An amplifier (widths, and positional reuse).
+# volatility = "stable", as PostgreSQL declares all three (an argument's output text can depend on a
+# session setting), so none may appear in an index expression (42P17). No parameter names.
+[[operator]]
+volatility     = "stable"
+name           = "concat"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+variadic       = true
+arg_resolution = "none"
+result         = "text"
+null           = "none"
+errors         = ["42804"]
+
+[[operator]]
+volatility     = "stable"
+name           = "concat_ws"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "any"]
+variadic       = true
+arg_resolution = "none"
+result         = "text"
+null           = "none"
+errors         = ["42804", "54000"]
+
+[[operator]]
+volatility     = "stable"
+name           = "format"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "any"]
+variadic       = true
+arg_resolution = "none"
+result         = "text"
+null           = "none"
+errors         = ["42804", "22023", "22003", "22004", "22P02", "54000"]
 
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).

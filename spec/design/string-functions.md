@@ -358,17 +358,22 @@ The PostgreSQL quoting helpers for building SQL text.
 - **`quote_nullable(s)`** is `quote_literal` except it is **non-strict**: `quote_nullable(NULL)`
   returns the four-character text `NULL` (not a SQL NULL). It is the one string function with the
   `none` NULL discipline — the eval does **not** short-circuit a NULL argument, so the kernel sees it.
-- **`quote_ident(s)`** wraps `s` as a SQL **identifier**: returned unchanged if it is already a safe
-  unquoted identifier (`^[a-z_][a-z0-9_]*$`), otherwise double-quoted with each internal `"` doubled.
+- **`quote_ident(s)`** wraps `s` as a SQL **identifier**, exactly as PostgreSQL's `quote_identifier`:
+  returned unchanged if it is a safe unquoted identifier (`^[a-z_][a-z0-9_]*$`) **and** not one of
+  PostgreSQL's quoted keywords, otherwise double-quoted with each internal `"` doubled.
   `quote_ident('foo') = 'foo'`, `quote_ident('Foo') = '"Foo"'`, `quote_ident('foo bar') = '"foo bar"'`,
-  `quote_ident('a"b') = '"a""b"'`. STRICT.
+  `quote_ident('a"b') = '"a""b"'`, `quote_ident('select') = '"select"'`. STRICT. `format`'s `%I`
+  (§6) uses the same rule.
 
-  **Deliberate divergence — no reserved-keyword quoting.** PostgreSQL *also* double-quotes an
-  identifier that is a reserved keyword (`quote_ident('select') = '"select"'`). jed has no
-  enumerated reserved-keyword set (its hand-written parsers match keywords contextually, not from a
-  central list — grammar.md), so jed quotes only by the **lexical** safety pattern: `quote_ident
-  ('select') = 'select'`. The oracle corpus exercises the non-keyword cases (which match
-  PostgreSQL); keyword-aware quoting is a deferred refinement, recorded here.
+  **The keyword list is PostgreSQL's, not jed's.** PostgreSQL quotes every keyword that is not
+  *unreserved*: its reserved, column-name, and type/function-name keywords (`select`, `table`,
+  `integer`, `left`, `xmltable`, …), while an unreserved keyword such as `abort` or `name` stays bare.
+  jed reserves no keywords of its own ([grammar.md](grammar.md) §3), so the list exists only to give
+  `quote_ident` PostgreSQL's output. It is mechanical data copied from PostgreSQL 18's `kwlist.h` into
+  [../grammar/pg_keywords.toml](../grammar/pg_keywords.toml) and generated into each core
+  (`pg_keywords_gen.{rs,go,ts}`, `scripts/gen_keywords.rb`, [codegen.md](codegen.md) §5); the
+  lookup is an exact byte match on the already lowercase-only candidate. Quoting a keyword is never
+  wrong in jed either: a quoted identifier is always an identifier.
 
 ### `like_escape(pattern, escape) → text`
 
@@ -525,6 +530,63 @@ evaluation. Recursion that doubles a value is therefore bounded by a cost ceilin
 it as `(a || b)`, with a non-text operand under its cast (`('a' || cast(1 as text))`). Collation
 derivation is unchanged: `||` combines its operands' derivations (collation.md), so two
 conflicting implicit collations are `42P21` where the result is compared or ordered.
+
+## 6. Text-building VARIADIC functions (`concat`, `concat_ws`, `format`)
+
+PostgreSQL's three `VARIADIC "any"` text builders (manual §9.4, §9.4.1). They are catalog rows with
+`variadic = true` ([array-functions.md](array-functions.md) §12): a call is either a **spread** of
+heterogeneous arguments or a single array passed with the `VARIADIC` keyword. They resolve through the
+variadic resolver and evaluate on its `RExpr::Variadic` / `reVariadic` / `variadic` node.
+
+- **`concat(VARIADIC "any") → text`** joins its non-NULL arguments' text. The spread form never
+  returns NULL (`concat(NULL)` is `''`); the array form joins the non-NULL elements (row-major, any
+  dimensionality), and a NULL array is NULL. `concat()` is `42883`.
+- **`concat_ws(sep text, VARIADIC "any") → text`** joins the non-NULL arguments with `sep`. A NULL
+  `sep` is NULL; a NULL array is NULL. `concat_ws(',')` is `42883`.
+- **`format(formatstr text, VARIADIC "any") → text`** is PostgreSQL's `text_format`. A specifier is
+  `%[n$][-][width]type` with `type` one of `s` (the value's text; NULL is `''`), `I` (`quote_ident`'s
+  rule, §3; NULL is `22004` "null values cannot be formatted as an SQL identifier"), or `L`
+  (`quote_literal`; NULL is the unquoted text `NULL`), and `%%` is one `%`. `width` is a digit run or
+  `*` / `*n$`, which takes the width from an argument (NULL is 0; a negative width left-aligns). The
+  `-` flag left-aligns. Padding counts characters (code points, §2). `n$` selects an argument, and a
+  later unnumbered specifier continues after the last one used. Extra arguments are ignored. A NULL
+  format string is NULL; a NULL `VARIADIC` array is no arguments. PostgreSQL's separate one-argument
+  `format(text)` row is folded into the variadic row: the spread form's floor is the format string
+  alone, as for the json builders.
+
+  Errors, in scan order and with PostgreSQL's text: `22023` "unterminated format() type specifier"
+  and "unrecognized format() type specifier "x"" (both with the hint `For a single "%" use "%%".`),
+  "too few arguments for format()", "format specifies argument 0, but arguments are numbered from 1",
+  and "width argument position must be ended by "$""; `22003` "number is out of range" for a number
+  in the format string above `2147483647` or a width of `-2147483648`.
+
+**Argument text.** Each argument the function uses renders through its type's **output text**,
+the text PostgreSQL's output function produces — the result-cell rendering (a decimal keeps its
+scale, bytea is `\x` hex, jsonb is canonical, a row is `record_out`). The one difference from the
+`::text` cast (§5) is a boolean, which is `t`/`f` (PostgreSQL's `boolout`), not `true`/`false`.
+A boolean nested in an array or row keeps jed's container rendering (`{true,false}`, `(true,1)`),
+where PostgreSQL's `array_out` / `record_out` write `{t,f}` / `(t,1)`; that is a divergence of jed's
+container text output as a whole, not of these functions, and is left to it. A
+finite `timestamptz` at any depth renders in the session zone and charges one `timezone` unit before
+rendering. `format` renders only the arguments its specifiers select. A `*` width argument of an
+integer type is read directly (outside i32 is `22003`); any other type goes through the text → i32
+cast, so a non-integer is that cast's `22P02` / `22003`. That cast reads jed's integer-literal
+grammar, so a text width of `'0x10'` is `22P02` where PostgreSQL reads 16 (the same documented
+narrowing as `'0x10'::int`).
+
+**Volatility.** All three are `stable`, as PostgreSQL declares them, so none may appear in an index
+expression (`42P17`).
+
+**Cost.** One `operator_eval` per call, plus the arguments' own costs and any `timezone` units.
+`concat` is a growth kernel ([cost.md](cost.md) §8.1): its result is at most its rendered
+arguments, so it charges `scalar_byte` per output UTF-8 byte after building and is free over
+constant operands. `concat_ws` and `format` are amplifiers: a separator repeats once per argument,
+and a width or a reused positional argument multiplies its input, under the control of an operand.
+`format` charges its format string's UTF-8 bytes as its input scan and guards; both then compute
+the exact output size, reject one above `0x3fffffff` bytes with `54000` ("requested length too
+large", where PostgreSQL fails its 1 GB allocation), charge it, guard, and reserve it against the
+scalar allowance before building the result. A `format` specifier error found during the scan is
+reported before the output charge.
 
 ## Resource admission for result amplification
 

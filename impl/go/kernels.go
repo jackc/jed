@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -548,10 +549,10 @@ func quoteLiteralText(s string) string {
 	return "'" + inner.String() + "'"
 }
 
-// quoteIdentText is quote_ident(s) (string-functions.md §3): wrap s as a SQL identifier — returned
-// unchanged if it is already a safe unquoted identifier (^[a-z_][a-z0-9_]*$), else double-quoted with
-// each internal " doubled. jed quotes by the LEXICAL pattern only — no reserved-keyword quoting (jed
-// has no enumerated keyword set), a documented divergence from PostgreSQL.
+// quoteIdentText is quote_ident(s) (string-functions.md §3), PostgreSQL's quote_identifier: wrap s
+// as a SQL identifier — returned unchanged if it is a safe unquoted identifier (^[a-z_][a-z0-9_]*$)
+// that is not one of PostgreSQL's quoted (non-unreserved) keywords, else double-quoted with each
+// internal " doubled. Shared by quote_ident and format's %I.
 func quoteIdentText(s string) string {
 	safe := len(s) > 0
 	for i := 0; i < len(s) && safe; i++ {
@@ -562,6 +563,10 @@ func quoteIdentText(s string) string {
 		} else {
 			safe = lower || (b >= '0' && b <= '9')
 		}
+	}
+	if safe {
+		_, found := slices.BinarySearch(pgQuotedKeywords, s)
+		safe = !found
 	}
 	if safe {
 		return s

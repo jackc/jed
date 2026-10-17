@@ -3765,6 +3765,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// differ: the spread form counts the args' null-ness (never NULL); the VARIADIC-array form
 		// returns NULL on a NULL whole-array, else counts the array's flattened elements' null-ness.
 		m.Charge(costs.OperatorEval)
+		if e.vfunc == vfConcat || e.vfunc == vfConcatWs || e.vfunc == vfFormat {
+			return evalTextVariadic(e, row, env, m)
+		}
 		wantNulls := e.vfunc == vfNumNulls
 		if e.variadicArray {
 			v, err := e.sargs[0].eval(row, env, m)

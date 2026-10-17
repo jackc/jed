@@ -103,6 +103,12 @@ eval *logic* they dispatch to stays hand-written (§2).
   tables' invariants (strict byte order for the binary search, tokens at most `TOKMAXLEN` bytes,
   known units). The lookup that reads them — case-fold, truncate, search — and what `EXTRACT` /
   `date_part` / `date_trunc` do with the result stay hand-written ([timezones.md](timezones.md) §9.6).
+- **PostgreSQL's quoted keywords — done** ([../../scripts/gen_keywords.rb](../../scripts/gen_keywords.rb)).
+  The non-unreserved keywords of PostgreSQL 18's `kwlist.h`, copied into
+  [../grammar/pg_keywords.toml](../grammar/pg_keywords.toml), are generated per core as
+  `pg_keywords_gen.{rs,go,ts}` (`QUOTED_KEYWORDS`). The generator checks strict byte order and the
+  category names. `quote_ident` and `format`'s `%I` consult the table by hand
+  ([string-functions.md](string-functions.md) §3); jed's parser does not.
 - **Scalar types — remaining.** Extend the generator to the scalar set, replacing its hand-mirror
   (§1 option 2). Harder than errors: `scalars.toml` is ragged (integer-only / decimal-only /
   text-only fields) and `ScalarType`'s variant identity is threaded through the codec/comparator,

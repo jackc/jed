@@ -238,6 +238,7 @@ import {
 import type { ZoneRef } from "./timezone.ts";
 import type { ExtractSrc } from "./datetime_fn.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
+import { textVariadic } from "./text_build.ts";
 import type { BinaryOp } from "./ast.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
 import { OPERATORS } from "./operators.ts";
@@ -2266,6 +2267,12 @@ function evalVariadicNode(e: Of<"variadic">, row: Row, env: EvalEnv, m: Meter): 
   // spread form counts the args' null-ness (never NULL); the VARIADIC-array form returns NULL on
   // a NULL whole-array, else counts the array's flattened elements' null-ness.
   m.charge(COSTS.operatorEval);
+  if (e.func === "concat" || e.func === "concat_ws" || e.func === "format") {
+    // The text builders (string-functions.md §6): non-strict, so every argument is evaluated first.
+    const vals: Value[] = [];
+    for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+    return textVariadic(e.func, e.args, vals, e.arrayForm, env.exec.session.timeZone, m);
+  }
   const wantNulls = e.func === "num_nulls";
   if (e.arrayForm) {
     const v = evalExpr(e.args[0]!, row, env, m);

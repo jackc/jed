@@ -54,7 +54,9 @@ calls, rows, subqueries and CTEs. A cursor keeps its original budget until it cl
 This budget covers the functions where one call can multiply its input by an amount an argument
 controls: the exact output bytes of **`repeat`, `lpad`, `rpad`, `replace`, `regexp_replace`,
 `jsonb_pretty`** (UTF-8), **`array_replace`**, and the capture arrays of **`regexp_match` and
-`regexp_matches`** (a pattern of nested groups repeats the matched text once per group), and logical
+`regexp_matches`** (a pattern of nested groups repeats the matched text once per group), the text of
+**`concat_ws` and `format`** (a separator repeats per argument; a `format` width or a reused `%1$s`
+multiplies its argument), and logical
 scratch reservations in **decimal `sqrt`, `exp`, `ln`, `log`, `log10`, `power`, `pow`**. These functions also charge their input and output bytes
 as cost before they build anything; decimals charge inside their algorithms. A cost ceiling can
 reject the work before its allocation budget is used.
@@ -63,7 +65,7 @@ Functions whose output is at most a small multiple of their inputs do not use th
 large bulk statements are not capped by it. These are the array builders (`ARRAY[…]`,
 `array_append`, `array_cat`, array `||`), the JSON builders (`jsonb_build_object`, `to_jsonb`,
 `jsonb_set`, jsonb `||`, and the like), and the functions and casts that render text with escapes
-or hex (`encode`, `quote_literal`, `quote_ident`, `quote_nullable`, and casts from an array,
+or hex (`concat`, `encode`, `quote_literal`, `quote_ident`, `quote_nullable`, and casts from an array,
 `bytea`, or `jsonb` to text). Instead they charge one cost unit per byte they build (32 per array element or JSON node
 plus its contents), which lets `max_cost` stop a query that doubles a value over and over. A value
 built only from constants, such as `ARRAY[1, 2, 3]` in a `WHERE` clause, costs nothing extra.

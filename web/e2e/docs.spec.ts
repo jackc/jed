@@ -77,6 +77,16 @@ test('the types page autoruns the text concatenation demo', async ({ page }) => 
   await expect(rows).toContainText('1.50 USD');
 });
 
+test('the types page autoruns the concat / format demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // concat skips the NULL and renders true as t; %L quotes the decimal; %I quotes the identifier.
+  const rows = livePanel(page, 'formatDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('order 42 t');
+  await expect(rows).toContainText('a, b');
+  await expect(rows).toContainText("tea costs '1.50'");
+  await expect(rows).toContainText('SELECT * FROM "Order Lines"');
+});
+
 test('the types page autoruns the bytea input demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // hex input '\xdead beef' (whitespace between pairs) = \xdeadbeef, escape-format 'abc' =

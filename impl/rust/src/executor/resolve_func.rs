@@ -973,6 +973,13 @@ fn resolve_host_scalar(
     Some((id, registry.function(id).result))
 }
 
+/// Whether a VARIADIC function's FIXED parameter (concat_ws's separator, format's format string)
+/// admits an argument of type `t`: its family, or an untyped NULL, which is the NULL of that family
+/// (functions.md §9.1).
+fn fixed_slot_matches(slot: &str, t: &ResolvedType) -> bool {
+    matches!(t, ResolvedType::Null) || family_matches(slot, t)
+}
+
 /// The 42804 raised when a `VARIADIC` operand is not an array (array-functions.md §12 / §7).
 pub(crate) fn variadic_not_array() -> EngineError {
     EngineError::new(
@@ -1015,7 +1022,13 @@ pub(crate) fn resolve_variadic_func(
             return Err(no_func_overload(name));
         }
         for (i, a) in args.iter().enumerate() {
-            let (r, t) = resolve(scope, a, None, agg, params)?;
+            // A fixed parameter offers its family's literal hint (format($1, …) types $1 text).
+            let hint = if i + 1 < k {
+                family_hint(desc.arg_families[i])
+            } else {
+                None
+            };
+            let (r, t) = resolve(scope, a, hint, agg, params)?;
             if i + 1 == k {
                 // the variadic (array) operand
                 match &t {
@@ -1028,7 +1041,7 @@ pub(crate) fn resolve_variadic_func(
                     // A non-array operand (incl. a bare untyped NULL) is 42804 — PG's exact code.
                     _ => return Err(variadic_not_array()),
                 }
-            } else if !family_matches(desc.arg_families[i], &t) {
+            } else if !fixed_slot_matches(desc.arg_families[i], &t) {
                 return Err(no_func_overload(name));
             }
             rargs.push(r);
@@ -1036,11 +1049,12 @@ pub(crate) fn resolve_variadic_func(
         }
     } else {
         // Spread form: at least `k` args (so a variadic function needs ≥1 variadic arg —
-        // num_nulls() is 42883). The json builders are the exception: a ZERO-arg spread is valid
-        // (json_build_array() → [], json_build_object() → {}), so their floor is the fixed-param
-        // count (k-1 = 0). The fixed params match their concrete families; every argument from the
-        // variadic slot onward matches the variadic element family ("any" ⇒ all).
-        let min_args = if json_build_classify(name).is_some() {
+        // num_nulls() is 42883). The json builders and `format` are the exceptions: a ZERO-arg
+        // spread is valid (json_build_array() → [], format('x') — PostgreSQL's one-argument
+        // format(text) row), so their floor is the fixed-param count (k-1). The fixed params match
+        // their concrete families; every argument from the variadic slot onward matches the
+        // variadic element family ("any" ⇒ all).
+        let min_args = if json_build_classify(name).is_some() || name == "format" {
             k - 1
         } else {
             k
@@ -1049,13 +1063,22 @@ pub(crate) fn resolve_variadic_func(
             return Err(no_func_overload(name));
         }
         for (i, a) in args.iter().enumerate() {
-            let (r, t) = resolve(scope, a, None, agg, params)?;
+            let hint = if i + 1 < k {
+                family_hint(desc.arg_families[i])
+            } else {
+                None
+            };
+            let (r, t) = resolve(scope, a, hint, agg, params)?;
             let slot = if i < k - 1 {
                 desc.arg_families[i]
             } else {
                 var_family
             };
-            if !family_matches(slot, &t) {
+            if !(if i < k - 1 {
+                fixed_slot_matches(slot, &t)
+            } else {
+                family_matches(slot, &t)
+            }) {
                 return Err(no_func_overload(name));
             }
             rargs.push(r);
@@ -1064,6 +1087,9 @@ pub(crate) fn resolve_variadic_func(
     }
 
     let result = scalar_result_type(desc.result, &[]);
+    // Catalog volatility is persisted-index admission data (concat / concat_ws / format are STABLE,
+    // as in PostgreSQL — index-dependencies.md).
+    params.nonimmutable |= desc.volatility != "immutable";
     // The json/jsonb builders share the spread/array-form validation above but their own eval node
     // and a json/jsonb result; the count functions (num_nulls/num_nonnulls) keep RExpr::Variadic.
     if let Some((kind, json)) = json_build_classify(name) {
@@ -2123,6 +2149,9 @@ fn explain_variadic_func(func: &VariadicFunc) -> &'static str {
     match func {
         VariadicFunc::NumNulls => "num_nulls",
         VariadicFunc::NumNonnulls => "num_nonnulls",
+        VariadicFunc::Concat => "concat",
+        VariadicFunc::ConcatWs => "concat_ws",
+        VariadicFunc::Format => "format",
     }
 }
 

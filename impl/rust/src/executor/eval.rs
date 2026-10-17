@@ -3104,6 +3104,12 @@ impl RExpr {
                 array_form,
             } => outline(|| {
                 m.charge(COSTS.operator_eval);
+                if matches!(
+                    func,
+                    VariadicFunc::Concat | VariadicFunc::ConcatWs | VariadicFunc::Format
+                ) {
+                    return eval_text_variadic(func, args, *array_form, row, env, m);
+                }
                 let want_nulls = matches!(func, VariadicFunc::NumNulls);
                 let count = if *array_form {
                     match args[0].eval(row, env, m)? {

@@ -486,10 +486,10 @@ pub(crate) fn quote_literal_text(s: &str) -> String {
     }
 }
 
-/// `quote_ident(s)` (string-functions.md §3): wrap `s` as a SQL identifier — returned unchanged if it
-/// is already a safe unquoted identifier (`^[a-z_][a-z0-9_]*$`), else double-quoted with each internal
-/// `"` doubled. jed quotes by the LEXICAL pattern only — no reserved-keyword quoting (jed has no
-/// enumerated keyword set), a documented divergence from PostgreSQL.
+/// `quote_ident(s)` (string-functions.md §3), PostgreSQL's `quote_identifier`: wrap `s` as a SQL
+/// identifier — returned unchanged if it is a safe unquoted identifier (`^[a-z_][a-z0-9_]*$`) that is
+/// not one of PostgreSQL's quoted (non-unreserved) keywords, else double-quoted with each internal `"`
+/// doubled. Shared by `quote_ident` and `format`'s `%I`.
 pub(crate) fn quote_ident_text(s: &str) -> String {
     let safe = !s.is_empty()
         && s.bytes().enumerate().all(|(i, b)| {
@@ -498,7 +498,10 @@ pub(crate) fn quote_ident_text(s: &str) -> String {
             } else {
                 b == b'_' || b.is_ascii_lowercase() || b.is_ascii_digit()
             }
-        });
+        })
+        && crate::pg_keywords_gen::QUOTED_KEYWORDS
+            .binary_search(&s)
+            .is_err();
     if safe {
         return s.to_string();
     }

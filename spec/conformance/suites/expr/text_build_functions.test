@@ -1,0 +1,267 @@
+# The text-building VARIADIC "any" functions concat / concat_ws / format (spec/design/string-functions.md
+# §6; PostgreSQL's "String Functions and Operators", manual §9.4 and §9.4.1). Each takes a spread of
+# heterogeneous arguments or a single array via the VARIADIC keyword, and renders each argument through
+# its type's output text (a boolean is t/f, as PostgreSQL's boolout). NON-STRICT: concat skips NULL
+# arguments and never returns NULL in the spread form; concat_ws returns NULL for a NULL separator;
+# format returns NULL for a NULL format string. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.text, types.boolean, types.decimal, types.date, types.bytea, types.timestamptz, types.f64, types.interval, types.uuid, types.jsonb, types.composite, types.array, types.array_multidim, func.variadic, ddl.index_expr, expr.text_build
+
+statement ok
+CREATE TABLE t (id int PRIMARY KEY, a text, n int, b boolean)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 10, true), (2, NULL, NULL, NULL), (3, 'O''Reilly', -5, false)
+
+# === concat(VARIADIC "any") ==================================================================
+
+query T nosort
+SELECT concat('a', 'b', 'c')
+----
+abc
+
+# each argument is its output text: a boolean is t, a decimal keeps its scale, bytea is hex
+query T nosort
+SELECT concat(true, 1, 1.50, NULL, 'x', ARRAY[1,2], date '2024-01-02', '\x01'::bytea)
+----
+t11.50x{1,2}2024-01-02\x01
+
+# float, interval, uuid, jsonb, timestamptz (in the session zone), and a row value
+query T nosort
+SELECT concat(1.5::float8, '|', interval '1 day 2 hours', '|', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid, '|', '{"b": 1, "a": [1, 2]}'::jsonb, '|', timestamptz '2024-01-02 03:04:05+00', '|', ROW(1, 'a b'))
+----
+1.5|1 day 02:00:00|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|{"a": [1, 2], "b": 1}|2024-01-02 03:04:05+00|(1,"a b")
+
+# NULL arguments are skipped; all-NULL is the empty string, never NULL
+query BB nosort
+SELECT concat(NULL) = '', concat(NULL, NULL) IS NULL
+----
+true
+false
+
+query IT rowsort
+SELECT id, concat(a, '/', n, '/', b) FROM t
+----
+1
+x/10/t
+2
+//
+3
+O'Reilly/-5/f
+
+# the VARIADIC-array form joins the non-NULL elements (row-major); a NULL array is NULL
+query TT nosort
+SELECT concat(VARIADIC ARRAY[1, NULL, 3]), concat(VARIADIC ARRAY[ARRAY[1,2],ARRAY[3,4]])
+----
+13
+1234
+
+query B nosort
+SELECT concat(VARIADIC NULL::int[]) IS NULL
+----
+true
+
+statement error 42883
+SELECT concat()
+
+statement error 42804 VARIADIC argument must be an array
+SELECT concat(VARIADIC 1)
+
+# === concat_ws(sep text, VARIADIC "any") =====================================================
+
+query TT nosort
+SELECT concat_ws(', ', 'a', NULL, 'b', 2), concat_ws('', 'x', 'y')
+----
+a, b, 2
+xy
+
+# a NULL separator is NULL; only NULL arguments is the empty string
+query BB nosort
+SELECT concat_ws(NULL, 1, 2) IS NULL, concat_ws('-', NULL, NULL) = ''
+----
+true
+true
+
+query IT rowsort
+SELECT id, concat_ws('|', a, n, b) || '.' FROM t
+----
+1
+x|10|t.
+2
+.
+3
+O'Reilly|-5|f.
+
+query TT nosort
+SELECT concat_ws('-', VARIADIC ARRAY[1, NULL, 3]), concat_ws('-', VARIADIC ARRAY['a'])
+----
+1-3
+a
+
+query B nosort
+SELECT concat_ws('-', VARIADIC NULL::text[]) IS NULL
+----
+true
+
+statement error 42883
+SELECT concat_ws(',')
+
+# === format(formatstr text, VARIADIC "any") ==================================================
+
+query T nosort
+SELECT format('Hello %s, %s', 'World', 42)
+----
+Hello World, 42
+
+# a format string alone is valid; %% is one percent
+query TT nosort
+SELECT format('abc'), format('100%% of %s', 'it')
+----
+abc
+100% of it
+
+# %I quotes an identifier (keywords too), %L a literal (NULL unquoted)
+query T nosort
+SELECT format('INSERT INTO %I VALUES(%L, %L, %L)', 'Foo bar', 'O''Reilly', NULL, 1.5)
+----
+INSERT INTO "Foo bar" VALUES('O''Reilly', NULL, '1.5')
+
+query T nosort
+SELECT format('%I.%I', 'table', 'abort')
+----
+"table".abort
+
+query T nosort
+SELECT format('%L', 'a\b')
+----
+E'a\\b'
+
+# %s of NULL is the empty string
+query T nosort
+SELECT format('[%s]', NULL)
+----
+[]
+
+# a NULL format string is NULL
+query B nosort
+SELECT format(NULL, 1) IS NULL
+----
+true
+
+# positional arguments; a later unnumbered specifier continues after the last one used
+query T nosort
+SELECT format('%1$s %s %2$s %s', 'a', 'b', 'c')
+----
+a b b c
+
+query T nosort
+SELECT format('%1$s %1$s', 'z')
+----
+z z
+
+# width pads on the left; the - flag pads on the right; width counts characters
+query T nosort
+SELECT format('[%5s][%-5s][%3s][%1s]', 'ab', 'ab', 'é😀', 'long')
+----
+[   ab][ab   ][ é😀][long]
+
+# a * width takes the next argument; a negative width left-aligns; a NULL width is 0
+query T nosort
+SELECT format('[%*s][%*s][%*s]', 4, 'x', -4, 'y', NULL, 'z')
+----
+[   x][y   ][z]
+
+query T nosort
+SELECT format('[%2$*1$s][%-*s]', 4, 'x', 3, 'y')
+----
+[   x][y  ]
+
+# a text width argument converts through its integer input
+query T nosort
+SELECT format('[%*s]', '3', 'a')
+----
+[  a]
+
+# extra arguments are ignored
+query T nosort
+SELECT format('%s', 1, 2)
+----
+1
+
+query IT rowsort
+SELECT id, format('%s=%L', a, n) FROM t
+----
+1
+x='10'
+2
+=NULL
+3
+O'Reilly='-5'
+
+# the VARIADIC-array form spreads the elements; a NULL array is no arguments
+query T nosort
+SELECT format('%s|%s', VARIADIC ARRAY['a', NULL])
+----
+a|
+
+query T nosort
+SELECT format('a%%', VARIADIC NULL::int[])
+----
+a%
+
+statement error 22023 too few arguments for format\(\)
+SELECT format('%s|%s', VARIADIC ARRAY['a'])
+
+# --- malformed format strings ----------------------------------------------------------------
+
+statement error 22023 too few arguments for format\(\)
+SELECT format('%s %s', 'a')
+
+statement error 22023 unterminated format\(\) type specifier
+SELECT format('abc%')
+
+statement error 22023 unterminated format\(\) type specifier
+SELECT format('%1$', 1)
+
+statement error 22023 unterminated format\(\) type specifier
+SELECT format('%-5', 'x')
+
+statement error 22023 unrecognized format\(\) type specifier "x"
+SELECT format('%x', 1)
+
+statement error 22023 unrecognized format\(\) type specifier "é"
+SELECT format('%é', 1)
+
+statement error 22023 format specifies argument 0, but arguments are numbered from 1
+SELECT format('%0$s', 1)
+
+statement error 22023 format specifies argument 0, but arguments are numbered from 1
+SELECT format('%*0$s', 1)
+
+statement error 22023 width argument position must be ended by "\$"
+SELECT format('%*1s', 1, 'x')
+
+statement error 22003 number is out of range
+SELECT format('%2147483648s', 'a')
+
+statement error 22003 number is out of range
+SELECT format('%*s', -2147483648, 'a')
+
+statement error 22004 null values cannot be formatted as an SQL identifier
+SELECT format('%I', NULL)
+
+statement error 22P02
+SELECT format('%*s', 'abc', 'x')
+
+statement error 22003
+SELECT format('%*s', 9999999999, 'x')
+
+statement error 42883
+SELECT format()
+
+# === volatility: STABLE, as in PostgreSQL, so not admissible in an index expression ==========
+
+statement error 42P17
+CREATE INDEX t_concat ON t (concat(a, n))
+
+statement error 42P17
+CREATE INDEX t_format ON t (format('%s', a))

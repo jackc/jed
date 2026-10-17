@@ -47,6 +47,13 @@
   1.50 || ' USD'        AS keeps_scale,
   'x' || NULL           AS null_result;`;
 
+	const formatDemo = `SELECT
+  concat('order ', 42, ' ', NULL, true)        AS concat_skips_null,
+  concat_ws(', ', 'a', NULL, 'b')             AS with_separator,
+  format('%s costs %L', 'tea', 1.50)       AS formatted,
+  format('SELECT * FROM %I', 'Order Lines') AS quoted_ident,
+  format('[%5s][%-5s]', 'ab', 'ab')        AS padded;`;
+
 	const varcharDemo = `SELECT
   'hello world'::varchar(5)     AS truncated,
   'café'::varchar(4)            AS fits_by_codepoint,
@@ -323,6 +330,15 @@ one side is an array, `||` appends to the array instead; beside a `jsonb` or `by
 literal is read as that type (`jsonb` merge, `bytea` concatenation), while a `text`-typed value makes
 it text concatenation. Like the cast, `|| timestamptz` renders in the session time zone, so it cannot
 appear in an index expression.
+
+`concat(…)` and `concat_ws(separator, …)` join any number of values of any type and **skip**
+`NULL`s, so they never turn a whole result `NULL` (unless the separator is). `format(template, …)`
+is PostgreSQL's `printf`: `%s` inserts a value, `%I` quotes it as an identifier, `%L` as a literal
+(`NULL` unquoted), `%%` is a percent sign, `%2$s` picks an argument by position, and a width such as
+`%10s` or `%-10s` pads it. All three render a value with its type's output text (a boolean is `t`/`f`)
+and pass an array's elements with `VARIADIC`, as in `concat(VARIADIC ARRAY[1, 2])`:
+
+<LiveSql demo="formatDemo" query={formatDemo} rows={1} />
 
 ## varchar(n) length limits
 

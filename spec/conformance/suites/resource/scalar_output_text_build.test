@@ -1,0 +1,103 @@
+# Output-constructing kernels (spec/design/cost.md §8.1, memory.md §1): concat, concat_ws, format
+# (spec/design/string-functions.md §6). concat is a growth kernel: it charges scalar_byte × the result's
+# UTF-8 bytes after building it, never reserves the scalar allowance, and is free over constant
+# operands. concat_ws and format are amplifiers (a separator repeats per argument; a width or a reused
+# positional argument multiplies its input): format charges its format string's UTF-8 bytes as the
+# input scan, then each sizes its exact output, caps it at 54000, charges, and reserves it before
+# building, even over constants.
+# jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, types.i32, types.text, types.array, func.variadic, expr.text_build, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text, n i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'abc', 42)
+
+# The baseline scan for the column cases below.
+# cost: 3
+query I nosort
+SELECT id FROM t
+----
+1
+
+# === concat: growth ===
+
+# Constant operands are free: one operator_eval.
+# cost: 2
+query T nosort
+SELECT concat('ab', 1)
+----
+ab1
+
+# Over a column the 5-byte result is charged.
+# cost: 9
+query T nosort
+SELECT concat(s, n) FROM t
+----
+abc42
+
+# A growth kernel never reserves the scalar allowance.
+# max_scalar_bytes: 1
+query T nosort
+SELECT concat(s, n) FROM t
+----
+abc42
+
+# === concat_ws: amplifier ===
+
+# Charged even over constants: 'a--b' is 4 bytes.
+# cost: 6
+query T nosort
+SELECT concat_ws('--', 'a', 'b')
+----
+a--b
+
+# max_scalar_bytes: 3
+statement error 54P04
+SELECT concat_ws('--', 'a', 'b')
+
+# max_scalar_bytes: 4
+query T nosort
+SELECT concat_ws('--', 'a', 'b')
+----
+a--b
+
+# The separator repeats once per element of a VARIADIC array.
+# max_scalar_bytes: 4
+statement error 54P04
+SELECT concat_ws('--', VARIADIC ARRAY['a', 'b', 'c'])
+
+# === format: amplifier ===
+
+# The 5-byte format string is the input scan; the 4-byte result is charged.
+# cost: 11
+query T nosort
+SELECT format('%s-%s', 'ab', 'c')
+----
+ab-c
+
+# A width multiplies its padding: the 12-byte result.
+# cost: 20
+query T nosort
+SELECT format('[%10s]', 'x')
+----
+[         x]
+
+# max_scalar_bytes: 11
+statement error 54P04
+SELECT format('[%10s]', 'x')
+
+# The output cap: 54000 before the output charge.
+statement error 54000
+SELECT format('%2147483647s', 'x')
+
+# A cost ceiling reports before the allowance.
+# max_cost: 100
+statement error 54P01
+SELECT format('%1000000s', 'x')
+
+# A positional argument reused many times multiplies the argument.
+# max_scalar_bytes: 8
+statement error 54P04
+SELECT format('%1$s%1$s%1$s', s) FROM t

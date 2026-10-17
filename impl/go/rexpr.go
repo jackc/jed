@@ -1049,6 +1049,9 @@ type variadicFunc int
 const (
 	vfNumNulls    variadicFunc = iota // num_nulls(VARIADIC "any") → i32 — count of NULL args/elements
 	vfNumNonnulls                     // num_nonnulls(VARIADIC "any") → i32 — count of non-NULL args/elements
+	vfConcat                          // concat(VARIADIC "any") → text (string-functions.md §6)
+	vfConcatWs                        // concat_ws(sep, VARIADIC "any") → text
+	vfFormat                          // format(formatstr, VARIADIC "any") → text
 )
 
 // jsonBuildKind selects which VARIADIC json/jsonb builder an reJsonBuild node is
