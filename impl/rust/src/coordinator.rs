@@ -96,6 +96,13 @@ pub(crate) trait LockHost: Send + Sync {
     fn dial(&self, endpoint: &str) -> std::io::Result<Box<dyn crate::pageservice::net::PsStream>>;
     #[cfg(unix)]
     fn remove_endpoint(&self, endpoint: &Path);
+    /// Whether page clients dialed through this host read ahead (spec/design/page-service.md §5.3):
+    /// the stream transport's, whose round trips cross a network. A local socket's round trip is
+    /// cheap, and its clients fault one leaf at a time.
+    #[cfg(unix)]
+    fn reads_ahead(&self) -> bool {
+        false
+    }
 }
 
 /// The production coordination host: `flock` / `LockFileEx` on the bundle files.

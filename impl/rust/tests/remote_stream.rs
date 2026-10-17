@@ -172,3 +172,51 @@ fn failing_transport_reports_its_stderr() {
         error.message
     );
 }
+
+/// `read_pages` requests this thread has sent.
+fn read_requests() -> u64 {
+    jed::pageservice::client::READ_PAGES_SENT.with(|sent| sent.get())
+}
+
+/// Scans over the stream transport read ahead: a full scan fetches its leaves in batches, a scan
+/// stopped by LIMIT fetches no leaf beyond the first, and the cost is the local run's.
+#[test]
+fn scans_read_ahead_without_changing_cost() {
+    let path = tmp("read_ahead.jed");
+    create(&path);
+    let full = "SELECT sum(length(v))::i64 FROM t";
+    let first = "SELECT id FROM t ORDER BY id LIMIT 1";
+    let (full_cost, first_cost) = {
+        let mut local = Database::open(&path).unwrap();
+        let mut rows = local.query(full, &[]).unwrap();
+        rows.by_ref().for_each(drop);
+        let full_cost = rows.cost();
+        let mut rows = local.query(first, &[]).unwrap();
+        rows.by_ref().for_each(drop);
+        let first_cost = rows.cost();
+        local.close().unwrap();
+        (full_cost, first_cost)
+    };
+
+    let mut remote = open_remote("pages", &path).unwrap();
+    let before = read_requests();
+    let mut rows = remote.query(first, &[]).unwrap();
+    rows.by_ref().for_each(drop);
+    assert_eq!(rows.cost(), first_cost);
+    drop(rows);
+    assert_eq!(read_requests() - before, 1, "LIMIT 1 fetches one leaf");
+
+    let before = read_requests();
+    let mut rows = remote.query(full, &[]).unwrap();
+    let total: Vec<_> = rows.by_ref().collect();
+    assert_eq!(rows.cost(), full_cost);
+    drop(rows);
+    assert_eq!(total[0][0], Value::Int(2000 * 200));
+    let leaves = 2000 * 200 / 4096;
+    let requests = read_requests() - before;
+    assert!(
+        requests * 4 < leaves,
+        "{requests} read_pages requests for about {leaves} leaves"
+    );
+    remote.close().unwrap();
+}

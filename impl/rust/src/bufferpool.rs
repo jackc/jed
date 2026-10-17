@@ -163,6 +163,12 @@ impl<T> BufferPool<T> {
         result
     }
 
+    /// Whether `page_id` is resident or being loaded.
+    pub(crate) fn contains(&self, page_id: u32) -> bool {
+        let state = self.state.lock().expect("buffer pool mutex poisoned");
+        state.index.contains_key(&page_id) || state.loading.contains_key(&page_id)
+    }
+
     /// The most pages the pool holds at once.
     pub(crate) fn capacity(&self) -> usize {
         self.state

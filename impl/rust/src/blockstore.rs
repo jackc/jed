@@ -52,6 +52,19 @@ pub(crate) trait BlockStore: Send {
     /// Drop writes buffered for a commit that failed. Only a page client's store buffers them
     /// (spec/design/page-service.md §5.6); every other host writes through.
     fn discard_pending(&mut self) {}
+    /// Whether [`read_pages`](BlockStore::read_pages) fetches its pages in one request, so scans
+    /// read ahead through it (a page client, spec/design/page-service.md §5.3). Every other host
+    /// reads page by page and scans fault one leaf at a time.
+    fn batches_reads(&self) -> bool {
+        false
+    }
+    /// Read the whole pages at `indices`.
+    fn read_pages(&mut self, indices: &[u32], page_size: u32) -> Result<Vec<Vec<u8>>> {
+        indices
+            .iter()
+            .map(|&index| self.read_at(u64::from(index) * u64::from(page_size), page_size as usize))
+            .collect()
+    }
 }
 
 /// The **file** storage host (spec/design/hosts.md §4): a `std::fs::File`, safe positioned reads on

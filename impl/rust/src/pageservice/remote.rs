@@ -240,6 +240,10 @@ impl LockHost for RemoteLockHost {
     }
 
     fn remove_endpoint(&self, _endpoint: &Path) {}
+
+    fn reads_ahead(&self) -> bool {
+        true
+    }
 }
 
 /// The options a remote open runs with: a remote client never owns, so it never asks for

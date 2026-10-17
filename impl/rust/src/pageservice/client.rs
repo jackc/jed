@@ -41,6 +41,12 @@ use crate::pageservice::net::PsStream;
 /// its connection ends, so the requester takes ownership (README.md §6.5).
 pub(crate) const HANDOFF_PAUSE: Duration = Duration::from_millis(2000);
 
+#[cfg(test)]
+thread_local! {
+    /// `read_pages` requests this thread sent (the read-ahead tests count round trips).
+    pub(crate) static READ_PAGES_SENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// The re-election trigger a handle installs on its connection ([`PsConnection::set_on_break`]).
 pub(crate) type OnBreak = Arc<dyn Fn() + Send + Sync>;
 
@@ -87,6 +93,10 @@ pub(crate) struct PsConnection {
     /// The lock host, whose clock times the handoff pause (the simulator's in a simulation).
     host: Arc<dyn LockHost>,
     page_size: AtomicU32,
+    /// The most pages one `read_pages` may name (`hello_ok`).
+    max_read_pages: AtomicU32,
+    /// Scans over this connection read ahead (the stream transport, [`LockHost::reads_ahead`]).
+    read_ahead: bool,
     /// `hello_ok` said the connection is read-only.
     read_only: AtomicBool,
     /// The owner's `hello_ok` flags (README.md §3.1, §6.5): its own handle is read-only; its
@@ -178,6 +188,8 @@ pub(crate) fn connect(
         control,
         host: Arc::clone(host),
         page_size: AtomicU32::new(0),
+        max_read_pages: AtomicU32::new(1),
+        read_ahead: host.reads_ahead(),
         read_only: AtomicBool::new(false),
         owner_read_only: AtomicBool::new(false),
         owner_yields: AtomicBool::new(false),
@@ -207,6 +219,8 @@ pub(crate) fn connect(
     match conn.round_trip(|| Ok(hello)) {
         Ok(Message::HelloOk(ok)) if crate::format::page_size_valid(ok.page_size as usize) => {
             conn.page_size.store(ok.page_size, Ordering::Release);
+            conn.max_read_pages
+                .store(ok.max_read_pages.max(1), Ordering::Release);
             conn.read_only.store(
                 ok.flags & HELLO_OK_FLAG_CONNECTION_READ_ONLY != 0,
                 Ordering::Release,
@@ -613,53 +627,39 @@ impl PsConnection {
         let _ = self.send_locked(&mut outbox, &Message::EndRead(EndRead { txid }), false);
     }
 
-    /// Fetch one page under the newest pinned version.
-    fn read_page(&self, index: u32) -> Result<Vec<u8>> {
-        let reply = self.round_trip(|| {
-            let txid = self
-                .held_max
-                .load(Ordering::Acquire)
-                .max(self.write_txid.load(Ordering::Acquire));
-            if txid == 0 {
-                return Err(EngineError::new(
-                    SqlState::ObjectNotInPrerequisiteState,
-                    "a page client read a page outside any transaction",
-                ));
-            }
-            Ok(Message::ReadPages(ReadPages {
-                txid,
-                indices: vec![index],
-            }))
-        })?;
-        match reply {
-            Message::Pages(mut pages) if pages.pages.len() == 1 => Ok(pages.pages.remove(0)),
-            _ => Err(violation("unexpected reply to read_pages")),
-        }
-    }
-
-    /// Fetch a batch of pages under the newest pinned version (a backup's copy, README.md §6.6).
-    /// The batch holds at most [`max_read_pages`](Self::max_read_pages) indices.
+    /// Fetch pages under the newest pinned version, in as few `read_pages` requests as the owner's
+    /// `max_read_pages` allows (read-ahead batches them, page-service.md §5.3; a backup's copy,
+    /// README.md §6.6).
     pub(crate) fn read_pages(&self, indices: &[u32]) -> Result<Vec<Vec<u8>>> {
-        let reply = self.round_trip(|| {
-            let txid = self
-                .held_max
-                .load(Ordering::Acquire)
-                .max(self.write_txid.load(Ordering::Acquire));
-            if txid == 0 {
-                return Err(EngineError::new(
-                    SqlState::ObjectNotInPrerequisiteState,
-                    "a page client read a page outside any transaction",
-                ));
+        let limit = self.max_read_pages.load(Ordering::Acquire).max(1) as usize;
+        let mut pages = Vec::with_capacity(indices.len());
+        for chunk in indices.chunks(limit) {
+            #[cfg(test)]
+            READ_PAGES_SENT.with(|sent| sent.set(sent.get() + 1));
+            let reply = self.round_trip(|| {
+                let txid = self
+                    .held_max
+                    .load(Ordering::Acquire)
+                    .max(self.write_txid.load(Ordering::Acquire));
+                if txid == 0 {
+                    return Err(EngineError::new(
+                        SqlState::ObjectNotInPrerequisiteState,
+                        "a page client read a page outside any transaction",
+                    ));
+                }
+                Ok(Message::ReadPages(ReadPages {
+                    txid,
+                    indices: chunk.to_vec(),
+                }))
+            })?;
+            match reply {
+                Message::Pages(reply) if reply.pages.len() == chunk.len() => {
+                    pages.extend(reply.pages)
+                }
+                _ => return Err(violation("unexpected reply to read_pages")),
             }
-            Ok(Message::ReadPages(ReadPages {
-                txid,
-                indices: indices.to_vec(),
-            }))
-        })?;
-        match reply {
-            Message::Pages(pages) if pages.pages.len() == indices.len() => Ok(pages.pages),
-            _ => Err(violation("unexpected reply to read_pages")),
         }
+        Ok(pages)
     }
 
     /// The most indices one `read_pages` may name on this connection (README.md §3.1).
@@ -888,7 +888,7 @@ impl BlockStore for ServiceBlockStore {
         } else if let Some(page) = self.pending.get(&(index as u32)) {
             page.clone()
         } else {
-            self.conn.read_page(index as u32)?
+            self.conn.read_pages(&[index as u32])?.remove(0)
         };
         if page.len() != page_size as usize {
             return Err(EngineError::new(
@@ -947,6 +947,44 @@ impl BlockStore for ServiceBlockStore {
     fn discard_pending(&mut self) {
         self.pending.clear();
         self.pending_meta = None;
+    }
+
+    fn batches_reads(&self) -> bool {
+        self.conn.read_ahead
+    }
+
+    /// The meta slots and a commit's pending pages are local; every other page comes from the owner
+    /// in one batched fetch.
+    fn read_pages(&mut self, indices: &[u32], page_size: u32) -> Result<Vec<Vec<u8>>> {
+        let remote: Vec<u32> = indices
+            .iter()
+            .copied()
+            .filter(|index| *index >= 2 && !self.pending.contains_key(index))
+            .collect();
+        let mut fetched = if remote.is_empty() {
+            Vec::new()
+        } else {
+            self.conn.read_pages(&remote)?
+        }
+        .into_iter();
+        let mut pages = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let page = if index < 2 {
+                self.conn.meta()
+            } else if let Some(page) = self.pending.get(&index) {
+                page.clone()
+            } else {
+                fetched.next().expect("one fetched page per remote index")
+            };
+            if page.len() != page_size as usize {
+                return Err(EngineError::new(
+                    SqlState::ProtocolViolation,
+                    "the owner sent a page of the wrong size",
+                ));
+            }
+            pages.push(page);
+        }
+        Ok(pages)
     }
 }
 

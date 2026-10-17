@@ -43,14 +43,19 @@ pub(crate) fn cache_leaves(cache_bytes: usize, page_size: u32) -> usize {
 pub(crate) struct SharedPaging {
     pager: Mutex<Pager>,
     pool: BufferPool<Node>,
+    /// The store fetches several pages in one request (a page client): scans read ahead
+    /// ([`prefetch_leaves`](Self::prefetch_leaves)).
+    batches: bool,
 }
 
 impl SharedPaging {
     /// Wrap an open `pager` with a CLOCK pool of `capacity` leaves.
     pub(crate) fn new(pager: Pager, capacity: usize) -> Arc<SharedPaging> {
+        let batches = pager.batches_reads();
         Arc::new(SharedPaging {
             pager: Mutex::new(pager),
             pool: BufferPool::new(capacity),
+            batches,
         })
     }
 
@@ -92,6 +97,49 @@ impl SharedPaging {
             ));
         }
         Ok(node)
+    }
+
+    /// Whether scans over this paging read ahead (spec/design/page-service.md §5.3).
+    pub(crate) fn batches_reads(&self) -> bool {
+        self.batches
+    }
+
+    /// Read ahead (spec/design/page-service.md §5.3): bring the leaves at `pages` that are not
+    /// resident into the pool with one batched store read, decoded as a fault would decode them. At
+    /// most a quarter of the pool is read ahead at once, so read-ahead cannot evict the leaf the scan
+    /// is on. A failure is ignored: the fault that follows reads the page again and reports it.
+    pub(crate) fn prefetch_leaves(self: &Arc<Self>, pages: &[u32], col_types: &Arc<Vec<ColType>>) {
+        if !self.batches {
+            return;
+        }
+        let limit = (self.pool.capacity() / 4).max(1);
+        let missing: Vec<u32> = pages
+            .iter()
+            .copied()
+            .filter(|&page| !self.pool.contains(page))
+            .take(limit)
+            .collect();
+        if missing.len() < 2 {
+            return;
+        }
+        let Ok(blocks) = self
+            .pager
+            .lock()
+            .expect("pager mutex poisoned")
+            .read_blocks(&missing)
+        else {
+            return;
+        };
+        for (page, block) in missing.into_iter().zip(blocks) {
+            let _ = self.pool.get_or_load(page, || {
+                crate::format::decode_leaf_node(
+                    block,
+                    page,
+                    Arc::clone(col_types),
+                    Arc::downgrade(self),
+                )
+            });
+        }
     }
 
     /// Lock the pager for the commit write path (file.rs `persist` pwrites dirty pages + meta).

@@ -76,6 +76,64 @@ impl Child {
 /// database passes `None` and never faults.
 pub(crate) trait LeafSource {
     fn load_leaf(&self, page: u32) -> Result<Arc<Node>>;
+    /// Whether [`prefetch`](Self::prefetch) does anything: only a store that fetches several pages
+    /// in one request (a page client, spec/design/page-service.md §5.3) benefits from read-ahead.
+    fn prefetches(&self) -> bool {
+        false
+    }
+    /// A hint that the scan will fault these leaf pages next, in this order: a source that batches
+    /// reads brings the ones not already resident in with one request. Errors are left for the
+    /// fault that follows. Invisible to cost, which counts logical page reads (cost.md).
+    fn prefetch(&self, _pages: &[u32]) {}
+}
+
+/// The most leaves one read-ahead hint names.
+const READ_AHEAD_MAX: usize = 64;
+
+/// A scan's read-ahead (spec/design/page-service.md §5.3): when the traversal descends into a leaf
+/// of an interior node it already holds, it hints that leaf together with the next leaves of that
+/// node it will visit, within the scan's bounds. The window starts at one leaf (no read-ahead, so
+/// a scan stopped by LIMIT after one leaf fetches nothing extra) and doubles with each hint up to
+/// [`READ_AHEAD_MAX`], so a long scan fetches its leaves in batches of 64 — every leaf of a
+/// subtree in one request when it has at most that many.
+pub(crate) struct ReadAhead {
+    window: usize,
+}
+
+impl ReadAhead {
+    pub(crate) fn new() -> ReadAhead {
+        ReadAhead { window: 1 }
+    }
+
+    /// Hint the descent into `positions.next()` of `node` and the descents after it (`positions`
+    /// in visit order). Returns how many of those descents the hint covers, the current one
+    /// included: the caller hints again after that many.
+    fn hint(
+        &mut self,
+        node: &Node,
+        positions: impl Iterator<Item = usize>,
+        src: Option<&dyn LeafSource>,
+    ) -> usize {
+        let Some(src) = src.filter(|s| s.prefetches()) else {
+            return usize::MAX;
+        };
+        let taken: Vec<usize> = positions.take(self.window).collect();
+        let pages: Vec<u32> = taken
+            .iter()
+            .filter_map(|&i| match &node.children[i] {
+                Child::OnDisk(page) => Some(*page),
+                Child::Resident(_) => None,
+            })
+            .collect();
+        if pages.is_empty() {
+            return taken.len().max(1);
+        }
+        self.window = (self.window * 2).min(READ_AHEAD_MAX);
+        if pages.len() > 1 {
+            src.prefetch(&pages);
+        }
+        taken.len().max(1)
+    }
 }
 
 /// Resolve child `i` to a resident node, faulting an `OnDisk` leaf through `src` (the buffer pool).
@@ -1062,7 +1120,7 @@ impl PMap {
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
         if let Some(root) = &self.root {
-            walk_range_visit(root, b, src, visit)?;
+            walk_range_visit(root, b, src, &mut ReadAhead::new(), visit)?;
         }
         Ok(())
     }
@@ -1080,7 +1138,7 @@ impl PMap {
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
         if let Some(root) = &self.root {
-            walk_range_visit_rev(root, b, src, visit)?;
+            walk_range_visit_rev(root, b, src, &mut ReadAhead::new(), visit)?;
         }
         Ok(())
     }
@@ -1103,6 +1161,7 @@ impl PMap {
             stack,
             bound: b,
             reverse,
+            ahead: ReadAhead::new(),
         }
     }
 }
@@ -1118,6 +1177,8 @@ struct ScanFrame {
     is_leaf: bool,
     lo: usize,
     hi: usize,
+    /// Descents into this interior's children still covered by its last read-ahead hint.
+    hinted: usize,
 }
 
 impl ScanFrame {
@@ -1133,6 +1194,7 @@ impl ScanFrame {
             node,
             lo,
             hi,
+            hinted: 0,
         }
     }
 }
@@ -1155,6 +1217,7 @@ pub(crate) struct RangeCursor {
     stack: Vec<ScanFrame>,
     bound: KeyBound,
     reverse: bool,
+    ahead: ReadAhead,
 }
 
 impl RangeCursor {
@@ -1215,6 +1278,14 @@ impl RangeCursor {
             if frame.is_leaf {
                 return emit(&frame.node, p).map(Some);
             }
+            if frame.hinted == 0 {
+                frame.hinted = if reverse {
+                    self.ahead.hint(&frame.node, (frame.lo..=p).rev(), src)
+                } else {
+                    self.ahead.hint(&frame.node, p..frame.hi, src)
+                };
+            }
+            frame.hinted -= 1;
             let ch = child(&frame.node, p, src)?;
             self.stack.push(ScanFrame::new(ch, &self.bound));
         }
@@ -1680,6 +1751,7 @@ fn walk_range_visit(
     node: &Node,
     b: &KeyBound,
     src: Option<&dyn LeafSource>,
+    ahead: &mut ReadAhead,
     visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
 ) -> Result<bool> {
     if node.is_leaf() {
@@ -1692,9 +1764,14 @@ fn walk_range_visit(
         return Ok(true);
     }
     let (cf, cl) = b.child_window(node);
+    let mut hinted = 0;
     for i in cf..=cl {
+        if hinted == 0 {
+            hinted = ahead.hint(node, i..=cl, src);
+        }
+        hinted -= 1;
         let ch = child(node, i, src)?;
-        if !walk_range_visit(&ch, b, src, visit)? {
+        if !walk_range_visit(&ch, b, src, ahead, visit)? {
             return Ok(false);
         }
     }
@@ -1709,6 +1786,7 @@ fn walk_range_visit_rev(
     node: &Node,
     b: &KeyBound,
     src: Option<&dyn LeafSource>,
+    ahead: &mut ReadAhead,
     visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
 ) -> Result<bool> {
     if node.is_leaf() {
@@ -1721,9 +1799,14 @@ fn walk_range_visit_rev(
         return Ok(true);
     }
     let (cf, cl) = b.child_window(node);
+    let mut hinted = 0;
     for i in (cf..=cl).rev() {
+        if hinted == 0 {
+            hinted = ahead.hint(node, (cf..=i).rev(), src);
+        }
+        hinted -= 1;
         let ch = child(node, i, src)?;
-        if !walk_range_visit_rev(&ch, b, src, visit)? {
+        if !walk_range_visit_rev(&ch, b, src, ahead, visit)? {
             return Ok(false);
         }
     }
