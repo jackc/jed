@@ -40,6 +40,90 @@ func (s *productionDurabilityStore) setSize(n int64) error {
 	return s.blockStore.setSize(n)
 }
 
+// BenchmarkProductionRelaxedCommit runs the same update workload through the Database API with
+// synchronous on and off (spec/design/validated-cow.md §4): under off the barrier is batched, so
+// flushes/commit falls to about one per batch. A revision without the setting cannot compile it; run
+// BenchmarkProductionDurableCommit there.
+func BenchmarkProductionRelaxedCommit(b *testing.B) {
+	root := os.Getenv("JED_DURABILITY_BENCH_DIR")
+	if root == "" {
+		b.Skip("set JED_DURABILITY_BENCH_DIR to a persistent filesystem directory")
+	}
+	for _, mode := range []Synchronous{SynchronousOn, SynchronousOff} {
+		name := "sync_on"
+		if mode == SynchronousOff {
+			name = "sync_off"
+		}
+		for _, batch := range []int{1, 64} {
+			b.Run(fmt.Sprintf("%s/rows_%d", name, batch), func(b *testing.B) {
+				const rows = 512
+				dir, err := os.MkdirTemp(root, "production-relaxed-")
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer os.RemoveAll(dir)
+				path := filepath.Join(dir, "db.jed")
+				db, err := CreateDatabase(CreateOptions{Path: path, Synchronous: mode})
+				if err != nil {
+					b.Fatal(err)
+				}
+				exec := func(sql string) {
+					if _, err := db.ExecuteScript(sql); err != nil {
+						b.Fatal(err)
+					}
+				}
+				exec("CREATE TABLE t (id i32 PRIMARY KEY, v i64)")
+				var seed strings.Builder
+				seed.WriteString("INSERT INTO t VALUES ")
+				for i := 0; i < rows; i++ {
+					if i > 0 {
+						seed.WriteString(",")
+					}
+					fmt.Fprintf(&seed, "(%d,0)", i)
+				}
+				exec(seed.String())
+				counts := make([]int64, rows)
+				st := db.core.storage
+				store := &productionDurabilityStore{blockStore: st.paging.pgr.store}
+				st.paging.pgr.store = store
+				b.ResetTimer()
+				for tx := 0; tx < b.N; tx++ {
+					lo := (tx * 137) % (rows - batch + 1)
+					exec(fmt.Sprintf("UPDATE t SET v=v+1 WHERE id >= %d AND id < %d", lo, lo+batch))
+					for i := lo; i < lo+batch; i++ {
+						counts[i]++
+					}
+				}
+				// The close's flush makes the last batch durable; it is part of the cost.
+				if err := db.Close(); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(store.bytes)/float64(b.N), "bytes/commit")
+				b.ReportMetric(float64(store.flushes)/float64(b.N), "flushes/commit")
+				b.ReportMetric(float64(store.growths)/float64(b.N), "growths/commit")
+				reopened, err := open(path)
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer reopened.Close()
+				out, err := execute(reopened, "SELECT id,v FROM t ORDER BY id")
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(out.Rows) != rows {
+					b.Fatalf("reopen rows=%d", len(out.Rows))
+				}
+				for i, row := range out.Rows {
+					if row[0].Int != int64(i) || row[1].Int != counts[i] {
+						b.Fatalf("row%d=%v expectedcount%d", i, row, counts[i])
+					}
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkProductionDurableCommit(b *testing.B) {
 	root := os.Getenv("JED_DURABILITY_BENCH_DIR")
 	if root == "" {

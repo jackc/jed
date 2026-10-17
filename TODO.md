@@ -418,9 +418,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   an in-place upgrade on open, a `jed upgrade` that carries readers for older versions, or a frozen
   format with additive changes only. Ratify or replace the
   [compatibility.md](spec/design/compatibility.md) proposal alongside. _(size: L + decision)_
-- [ ] **Batched durability and group commit** — the `synchronous=off` setting exists, but its
-  background flusher and fsync coalescing across concurrent committers are deferred
-  ([transactions.md §9/§11](spec/design/transactions.md)). _(size: M)_
+- [x] **Batched durability and group commit** — `synchronous = off` (a create/open handle setting,
+  `format_version` 43): a relaxed commit is visible once its pages and meta are written, and one
+  flush makes a run of commits durable — fsync coalescing across every committer of the handle.
+  Pending commits write the slot not holding the newest durable meta, carry cumulative manifests,
+  reuse only pages the floor had free, and keep the batch off the free list, so recovery lands between
+  the last flush and the newest attempted commit and never corrupts. The batch ends at the
+  inline-manifest cap (a background flush in Go/Rust, inline in TS), at close, before a page client's
+  `begin_write`, and at compaction. Simulator S9 (`relaxed` profile, engine-aligned floor oracle).
+  → [validated-cow.md §4](spec/design/validated-cow.md), [transactions.md §9](spec/design/transactions.md)
+  - [ ] _follow-on — needs a decision:_ a **time-based flush** — a background flusher that makes an
+    idle relaxed batch durable after an interval. Its default interval and the knob's name are a
+    product decision (no spec names one); until then an idle relaxed handle stays undurable until its
+    next cap flush or `close`. _(size: S + decision)_
+  - [ ] _follow-on:_ honor a page client's own `synchronous = off`: a client's setting does not reach
+    the owner (no wire field), so every client commit keeps its barrier; batching them needs a commit
+    flag in `spec/pageservice/` and a way to name the owner's pending set. _(size: M)_
 
 ---
 

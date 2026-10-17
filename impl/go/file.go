@@ -265,7 +265,7 @@ func (db *engine) persist(snap *snapshot) error {
 		paging: db.paging, liveAtCompaction: db.liveAtCompaction, freeGenTxid: db.freeGenTxid,
 		path: db.path, dirSynced: db.dirSynced,
 	}
-	err = st.commitFile(snap, write, live, db.openStreams == 0, true)
+	err = st.commitFile(snap, write, live, db.openStreams == 0, true, nil)
 	db.dirSynced = st.dirSynced
 	if err != nil {
 		return err

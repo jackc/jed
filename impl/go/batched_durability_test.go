@@ -108,7 +108,11 @@ func TestRelaxedBatchCapFlushesInBackgroundWithSameBytes(t *testing.T) {
 	}
 }
 
-func TestRelaxedBatchDefersReuseUntilTheFlush(t *testing.T) {
+// TestRelaxedBatchReusesOnlyTheFloorsFreePages churns updates through several batches: a commit inside
+// a batch may reuse only pages free at the floor, never one freed during the batch, and no free list
+// may hold a pending page (validated-cow.md §4 rules 3 and 4). The file must also stop growing: each
+// batch's orphans become reusable once a flush moves the floor past them.
+func TestRelaxedBatchReusesOnlyTheFloorsFreePages(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reuse.jed")
 	db := relaxedDB(t, path, 256, true)
 	defer db.Close()
@@ -117,27 +121,45 @@ func TestRelaxedBatchDefersReuseUntilTheFlush(t *testing.T) {
 		mustExecDB(t, db, "INSERT INTO t VALUES ("+strconv.Itoa(i)+", repeat('v', 30))")
 	}
 	st := db.core.storage
-	check := func(stage string) {
+	state := func() (pending map[uint32]uint64, free []uint32, floorFree map[uint32]bool, pageCount uint32) {
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		_ = st.paging.withPager(func(p *pager) error {
-			for _, free := range st.freePages {
-				if _, ok := p.pending[free]; ok {
-					t.Fatalf("%s: free list holds pending page %d", stage, free)
-				}
+			pending = make(map[uint32]uint64, len(p.pending))
+			for k, v := range p.pending {
+				pending[k] = v
 			}
 			return nil
 		})
+		return pending, append([]uint32(nil), st.freePages...), st.floorFree, st.pageCount
 	}
-	for i := 1; i <= 40; i++ {
-		before := st.pageCount
-		pending := 0
-		_ = st.paging.withPager(func(p *pager) error { pending = len(p.pending); return nil })
-		mustExecDB(t, db, "UPDATE t SET v = repeat('w', 30) WHERE id = "+strconv.Itoa(i))
-		check("update " + strconv.Itoa(i))
-		if pending > 0 && st.pageCount == before {
-			t.Fatalf("update %d committed with a pending batch without allocating from the high-water", i)
+	var midway uint32
+	for i := 0; i < 400; i++ {
+		before, _, floorFree, highWater := state()
+		mustExecDB(t, db, "UPDATE t SET v = repeat('"+string(rune('a'+i%26))+"', 30) WHERE id = "+strconv.Itoa(1+i%40))
+		after, free, _, _ := state()
+		for _, f := range free {
+			if _, ok := after[f]; ok {
+				t.Fatalf("update %d: the free list holds pending page %d", i, f)
+			}
 		}
+		if len(before) == 0 || len(after) == 0 {
+			continue // the batch's first commit plans as under synchronous = on; or a cap flush followed
+		}
+		for pg := range after {
+			if _, old := before[pg]; old || pg >= highWater {
+				continue
+			}
+			if !floorFree[pg] {
+				t.Fatalf("update %d reused page %d, which was not free at the floor", i, pg)
+			}
+		}
+		if i == 200 {
+			midway = st.pageCount
+		}
+	}
+	if st.pageCount > midway+uint32(manifestInlineCapacity(256))*2 {
+		t.Fatalf("the file kept growing under relaxed churn: %d pages at update 200, %d at 400", midway, st.pageCount)
 	}
 }
 

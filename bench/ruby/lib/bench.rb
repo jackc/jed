@@ -92,7 +92,8 @@ module Bench
 
   Workload = Struct.new(
     :name, :dataset, :kind, :sql, :warmup, :iterations, :seed, :expect_rows_per_iter,
-    :engines, :batch, :setup_sql, :sql_override, :setup_sql_override, :params, :host_functions
+    :engines, :batch, :setup_sql, :sql_override, :setup_sql_override, :params, :host_functions,
+    :relaxed
   ) do
     def sql_for(engine) = sql_override[engine] || sql
     def setup_sql_for(engine) = setup_sql_override[engine] || setup_sql
@@ -114,7 +115,8 @@ module Bench
         t["name"] || "", t["dataset"] || "", t["kind"] || "", t["sql"] || "",
         t["warmup"] || 0, t["iterations"] || 0, t["seed"] || 0, t["expect_rows_per_iter"],
         t["engines"] || [], t["batch"] || 0, t["setup_sql"] || [],
-        t["sql_override"] || {}, t["setup_sql_override"] || {}, params, t["host_functions"] == true
+        t["sql_override"] || {}, t["setup_sql_override"] || {}, params, t["host_functions"] == true,
+        t["relaxed"] == true
       )
     end
   end
@@ -216,6 +218,12 @@ module Bench
       # parameter (spec/design/benchmarks.md §3).
       if w.params.any? { |p| p.generator == "int_array" }
         warn "  skip: #{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]} binds no array parameters"
+        next
+      end
+      # A relaxed lane needs synchronous = off at open (benchmarks.md §8), which the gem's open does
+      # not take; the native cores carry it.
+      if w.relaxed
+        warn "  skip: #{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]} has no relaxed durability mode"
         next
       end
       warn "#{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]}: #{w.name} (#{w.dataset}) ..."

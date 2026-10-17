@@ -2,8 +2,9 @@
 # frozen_string_literal: true
 #MISE description="Measure production durable SQL commits, including checksums, growth and all flushes (Go)"
 
-# Tunables: JED_DURABILITY_COMMITS (default 256), JED_DURABILITY_REPEATS (default 6), and
-# JED_DURABILITY_BENCH_DIR (default bench/results/production-durability-<stamp>-<pid>).
+# Tunables: JED_DURABILITY_COMMITS (default 256), JED_DURABILITY_REPEATS (default 6),
+# JED_DURABILITY_BENCH_DIR (default bench/results/production-durability-<stamp>-<pid>), and
+# JED_DURABILITY_BENCH (the -bench pattern; default both the durable and the relaxed benchmark).
 
 require "json"
 require "tmpdir"
@@ -23,7 +24,7 @@ Dir.mktmpdir("jed-production-durability-") do |temp|
     File.join(GO_DIR, "production_durability_bench_test.go") => File.join(ROOT, "bench/durability/production_go_bench_test.go"),
   }))
   env = { "JED_DURABILITY_BENCH_DIR" => dir }
-  cmd = ["go", "test", "-overlay", overlay, "-run", "^$", "-bench", "BenchmarkProductionDurableCommit",
+  cmd = ["go", "test", "-overlay", overlay, "-run", "^$", "-bench", ENV.fetch("JED_DURABILITY_BENCH", "BenchmarkProduction(Durable|Relaxed)Commit"),
          "-benchtime=#{commits}x", "-count=#{repeats}"]
   File.open(File.join(dir, "run.log"), "w") do |log|
     IO.popen(env, cmd, chdir: GO_DIR, err: %i[child out]) do |pipe|

@@ -28,6 +28,7 @@ type Bench struct {
 	Batch             int                 `toml:"batch"`                // write kinds: statements per iteration
 	Readers           int                 `toml:"readers"`              // concurrent_read: reader Sessions
 	HostFunctions     bool                `toml:"host_functions"`       // calls the bench host functions (benchmarks.md §8.2)
+	Relaxed           bool                `toml:"relaxed"`              // write_durable under relaxed durability (benchmarks.md §8)
 	SetupSQL          []string            `toml:"setup_sql"`            // write kinds: run once before warmup
 	SQLOverride       map[string]string   `toml:"sql_override"`
 	SetupSQLOverride  map[string][]string `toml:"setup_sql_override"`

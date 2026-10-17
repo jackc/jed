@@ -1,8 +1,8 @@
 # Deterministic simulation testing — design
 
-> **Status: S1–S8 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
+> **Status: S1–S9 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
 > retired with shared mode and succeeded by S8, an owner and its page clients), including spill faults, temp-table spill, file
-> attachments, `create`, the bounded-growth invariant, and the `corrupt` mode. A seeded simulator that runs long, randomized
+> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, and batched durability (S9). A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
 > becomes a regression test. It targets the **storage, commit, and recovery state machine**
@@ -146,7 +146,9 @@ checks are part of the step. There is no separate `recover` step.
 
 **Header knobs** are `seed`, `page_size`, `cache_bytes` (0 or absent: the engine default), `clock`
 (the simulated clock's start, in microseconds), `sector` (the tear granularity, default 64 bytes),
-and the informational `profile`. Four handle settings are applied at every open: `work_mem` and
+`synchronous` (`on`, the default, or `off`: every process batches its barriers, [validated-cow.md](validated-cow.md)
+§4, and runs the cap flush inline so the barrier lands in the step that reached the cap), and the
+informational `profile`. Four handle settings are applied at every open: `work_mem` and
 `temp_buffers` (a trace session's; spill goes to the simulated spill host, §6.1, whose bytes are not
 durable state), `max_query_memory_bytes` (a trace session's; the oracles' own reads are unlimited),
 and `max_storage_bytes` (the database's file form, memory.md §8.7). Under either limit a commit can
@@ -343,6 +345,19 @@ belongs to the corpus.
 - The **allowed set** after a crash is every version from the floor through the newest version whose
   commit was **attempted**. Under a relaxed `synchronous` mode, the floor is the last explicit
   durability point.
+- **Under `synchronous = off`** a barrier proves less. A file growth is a full fsync (hosts.md §2.1),
+  so a pending version can become durable by accident and still be overwritten by the next commit of
+  its batch, which writes the same slot. So the step-start rule above applies only when the engine
+  held nothing pending as the step began, and the acknowledged-commit rule only to a page client's
+  commit, which keeps its own barrier. The floor otherwise moves when the engine itself holds nothing
+  pending at a step's end (no pending set, no adopted generation awaiting stabilization, no failed
+  barrier): it then treats its published version as flushed, and the runner holds it to that — after
+  checking the claim against the disk. A meta-slot write still pending there is a violation of its own
+  ("the engine treats version V as flushed, but no barrier covered its meta"). Under the page service
+  the owner's state is the one consulted, and after an owner dies a process may recover any version
+  from the floor up, since the simulated process crash may drop writes of the step that acknowledged
+  a commit (§6.3) — a more pessimistic model than the in-order issue that makes a real process crash
+  lose no acknowledged relaxed commit.
 - **Recovering below the floor is a durability violation.** Recovering above the latest attempted
   version, or failing with `XX001` outside corruption mode, is a corruption violation.
 - Each database has its own floor. An attachment's floor is **0** from the moment `attach` starts
@@ -401,7 +416,9 @@ it wrote. Then:
   by at most `max(0, written − free)`.
 
 `written` counts the distinct pages of the database's file (other than the two meta pages) the step
-wrote; `free` is the in-memory free list the next commit allocates from.
+wrote; `free` is the in-memory free list the next commit allocates from. A commit that begins inside a
+relaxed batch is exempt from both assertions: it reuses only pages free at the floor and keeps the
+batch's pages off the free list by design (validated-cow.md §4). Only its bounds carry forward.
 
 **Two more violations** need no checker: any statement or commit that reports `XX001` (corruption
 must never surface outside corruption mode), and **snapshot isolation** — when a reader closes, its
@@ -498,10 +515,11 @@ defaults, which `mixed.toml` restates):
 | `resource` | Tiny caches, spill, storage and query-memory limits, `read_error`, `enospc` |
 | `compaction` | Host compaction with crashes at the temp-file and directory barriers (`nth`) |
 | `spill` | Sort, aggregate, and temp-table spill under small `work_mem` and `temp_buffers`, with `spill_error` |
-| `attachments` | File attachments created under crashes, per-database recovery, writes to one durable database per transaction |
+| `attachments` | File attachments created under crashes, per-database recovery, writes to one durable database per transaction; half the traces relaxed |
 | `growth` | Short-lived readers between long runs of quiet commits, for the bounded-growth check (§8.3) |
 | `corruption` | `corrupt` steps, with and without `reseal` |
-| `service` | An owner and page clients: spawns, exits, kills, lost connections, client commits, promotion (S8) |
+| `service` | An owner and page clients: spawns, exits, kills, lost connections, client commits, promotion (S8); half the traces relaxed |
+| `relaxed` | `synchronous = off`: batched commits, cap flushes, crashes and faulted commits mid-batch and at the flush (S9) |
 
 A profile changes what is emitted, never what is checked: every oracle runs on every trace.
 
@@ -691,6 +709,17 @@ primitive) gets a simulated implementation.
      whose outcome stayed unknown (`08007`), every one cross-checked by the oracles. The
      `client-reclaims` plant (a client's commit reclaims and reuses as if it owned the file) is caught
      in 10 of 40 traces. The regression trace `service-owner-and-clients.sim` keeps one such history.
+
+9. **S9 — Batched durability. Landed.** The `synchronous` header knob, the `relaxed` profile, and
+   relaxed halves of `service` and `attachments`. The runners open every process relaxed with the cap
+   flush inline; the oracles gain the engine-aligned floor rules of §8.2 (including the check that an
+   engine claiming a flushed version really put a barrier behind its meta) and the batch exemption of
+   §8.3. Two plants (`scripts/sim_plant.rb`): a pending commit that writes slot `txid & 1`
+   (`relaxed-parity-slot`) and one that reuses pages freed during its batch (`relaxed-reuse`). The third rule, the
+   cumulative manifest, is hard to reach here: a batch often outgrows the pages its floor had free, so
+   the file grows and each growth's full fsync makes the batch durable early. Only one or two in a hundred `relaxed` traces catch
+   a plant that drops it, so each core carries a deterministic unit test instead — a crash that lands
+   only a batch's second commit, whose meta must be rejected.
 
 ## 15. Open questions
 

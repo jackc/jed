@@ -125,9 +125,9 @@ module SimPlant
     ),
     Plant.new(
       name: "relaxed-reuse",
-      protection: "a commit inside a relaxed batch never reuses the free list (validated-cow.md §4 rule 3)",
+      protection: "a commit inside a relaxed batch reuses only pages free at its floor (validated-cow.md §4 rule 3)",
       profile: "relaxed",
-      edits: [["impl/go/shared.go", "canReuse = canReuse && !pending", "canReuse = canReuse || pending"]]
+      edits: [["impl/go/shared.go", "\t\treturn nil\n\t}\n\treturn st.floorFreeFor(true)\n", "\t\treturn nil\n\t}\n\treturn nil\n"]]
     ),
   ].freeze
 

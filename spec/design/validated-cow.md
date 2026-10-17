@@ -172,11 +172,17 @@ The rules:
 2. **Cumulative manifest.** A commit's manifest lists the pending set plus its own dirty pages, in
    page order. A meta that validates therefore proves every page written since the floor that it
    could depend on, not only its own.
-3. **No reuse while pending.** A commit that begins with a non-empty pending set allocates every
-   page — tree, catalog, free-list chain, and manifest — from the high-water, never from the free
-   list. So no page is written twice between two flushes: each pending digest stays exact, and no
-   dependency of the floor, nor of any pending generation, is ever overwritten. The first commit
-   after a flush plans exactly as under `synchronous = on`.
+3. **Reuse only what the floor had free.** The first commit of a batch — one that begins with
+   nothing pending — plans exactly as under `synchronous = on`, and records the free list it starts
+   from: the floor's own free list, which excludes the floor's dependencies (§2). A commit that begins
+   with a non-empty pending set may reuse a page — for tree, catalog, free-list chain, or manifest —
+   only if that page was on the recorded list; the free list is scanned in ascending order and every
+   other free page is skipped and stays listed, then the high-water serves the rest. A page freed
+   during the batch may still be live in the floor, so it waits for the next batch. Since a page
+   reused in the batch becomes pending, and pending pages never return to a free list (rule 4), no
+   page is written twice between two flushes: each pending digest stays exact, and no dependency of
+   the floor is ever overwritten. A batch's orphans become reusable once a flush moves the floor past
+   them, so relaxed churn does not grow the file without bound.
 4. **Free-list exclusion.** A commit's persisted free list excludes the whole pending set, since
    every pending page is a dependency of its manifest. Reclamation still runs; a page orphaned
    during a batch is listed by the first reclamation after the floor moves past it.
@@ -188,7 +194,7 @@ generation (in the slot it was written to) and the pending set empties. The flus
 - **The batch cap.** When a commit leaves the pending set with at least
   `I = floor((page_size − 64) / 12)` entries — the inline manifest capacity (§2) — the batch ends
   with it and a flush follows. The cap bounds a pending commit's manifest, the pages recovery
-  validates, and the growth that rule 3 defers, to about one page's worth of entries; at 4 KiB pages
+  validates, and the reuse that rule 3 defers, to about one page's worth of entries; at 4 KiB pages
   a one-row commit dirties three or four pages, so one barrier serves about a hundred commits.
 - **Close** (and detaching a file attachment) flushes before releasing the file; a failed flush is
   the error `close` reports.

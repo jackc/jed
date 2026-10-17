@@ -1121,13 +1121,21 @@ type pageAlloc struct {
 	// and the single-handle case leave it true (oldest_live == committed ⇒ no page is still observed),
 	// so the on-disk byte layout is unchanged whenever no reader pins an older version.
 	reuse bool
+	// allowed, when set, restricts reuse to these free pages — while a relaxed batch is pending, only
+	// the pages already free at the floor (spec/design/validated-cow.md §4 rule 3). A free page it
+	// passes over stays on the list (skipped). nil allows every free page.
+	allowed map[uint32]bool
+	skipped []uint32
 }
 
 func (a *pageAlloc) take() uint32 {
-	if a.reuse && a.cursor < len(a.free) {
+	for a.reuse && a.cursor < len(a.free) {
 		p := a.free[a.cursor]
 		a.cursor++
-		return p
+		if a.allowed == nil || a.allowed[p] {
+			return p
+		}
+		a.skipped = append(a.skipped, p)
 	}
 	p := a.next
 	if p == ^uint32(0) {
@@ -1146,6 +1154,11 @@ func (a *pageAlloc) take() uint32 {
 // set-once page ids are assigned here. The page size was validated at file creation, so no size check
 // is repeated.
 func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, reuse bool, paging *sharedPaging) (incrementalWrite, error) {
+	return s.incrementalImageAllowed(pageSize, startPage, free, reuse, nil, paging)
+}
+
+// incrementalImageAllowed is incrementalImage with reuse restricted to allowed (nil: every free page).
+func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []uint32, reuse bool, allowed map[uint32]bool, paging *sharedPaging) (incrementalWrite, error) {
 	ps := int(pageSize)
 	capacity := ps - pageHeader
 
@@ -1158,7 +1171,7 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 	// Allocate from the free-list first (reclaiming dead pages), then extend the file — unless the
 	// watermark defers reuse (reuse false), in which case only the high-water is drawn and the whole
 	// free-list carries through unconsumed for persistence (pageAlloc.reuse, transactions.md §8).
-	alloc := &pageAlloc{free: free, next: startPage, reuse: reuse}
+	alloc := &pageAlloc{free: free, next: startPage, reuse: reuse, allowed: allowed}
 
 	var pages []dirtyPage
 	kept := make(map[uint32]bool)
@@ -1262,7 +1275,7 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 		pages:         pages,
 		rootPage:      catRoot,
 		pageCount:     alloc.next,
-		freeRemaining: alloc.free[alloc.cursor:],
+		freeRemaining: append(alloc.skipped, alloc.free[alloc.cursor:]...), // both ascending, skipped first
 		kept:          kept,
 		sharedChains:  shared,
 		catalogPages:  uint32(len(catPages)),

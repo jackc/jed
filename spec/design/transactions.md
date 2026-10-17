@@ -465,9 +465,10 @@ database-level **`synchronous`** setting governs *when* the fsync fires relative
     gate, and at compaction or the stabilization of an adopted generation; the cap flush runs on a
     background goroutine/thread in Go and Rust and inline in TypeScript, and the next commit waits for
     it, so every core writes the same bytes;
-  - while a batch is pending, commits allocate only from the high-water (a page the durable fallback
-    still needs is never overwritten) and their manifests vouch for every page written since the
-    floor, so recovery lands **between the last flush and the newest attempted commit**.
+  - while a batch is pending, commits reuse only pages already free at the last flush (a page the
+    durable fallback still needs is never overwritten) and their manifests vouch for every page
+    written since the floor, so recovery lands **between the last flush and the newest attempted
+    commit**.
 
   Results, plans, and cost are identical in both modes; only when the barrier runs differs. The
   setting is a **handle** setting (`create`/`open`, [api.md](api.md) §2.1), not stored in the file,

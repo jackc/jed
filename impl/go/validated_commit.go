@@ -345,7 +345,7 @@ type validatedCommitPlan struct {
 
 // planValidatedCommit plans the free list and manifest. pending is the batch's pending set (nil under
 // synchronous = on): its pages join the manifest and stay off the free list (validated-cow.md §4).
-func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse bool, livePages uint32, pending []manifestEntry) (validatedCommitPlan, error) {
+func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool) (validatedCommitPlan, error) {
 	candidates, live, gen, err := freeListCandidates(snap, paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending)
 	if err != nil {
 		return validatedCommitPlan{}, err
@@ -353,6 +353,15 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 	safe := write.freeRemaining
 	if !canReuse {
 		safe = nil
+	} else if allowed != nil {
+		// A pending batch reuses only pages free at its floor (validated-cow.md §4 rule 3).
+		filtered := make([]uint32, 0, len(safe))
+		for _, id := range safe {
+			if allowed[id] {
+				filtered = append(filtered, id)
+			}
+		}
+		safe = filtered
 	}
 	ps := int(pageSize)
 	reserved := 0

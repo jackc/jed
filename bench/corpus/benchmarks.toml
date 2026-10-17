@@ -2142,6 +2142,76 @@ gen = "int_uniform"
 min = 0
 max = 99999
 
+# The two durable lanes above under each engine's relaxed-durability mode (benchmarks.md §8): a
+# commit may be lost to a power failure, but the file is never corrupted. jed opens the scratch file
+# with synchronous = off and batches its barrier (validated-cow.md §4); PostgreSQL turns
+# synchronous_commit off; SQLite runs WAL with synchronous = NORMAL.
+[[bench]]
+name = "insert_commit_relaxed"
+description = "Relaxed single-row commits: one INSERT per commit, barrier batched (jed synchronous=off, PG synchronous_commit=off, SQLite WAL+NORMAL)"
+dataset = "scratch"
+kind = "write_durable"
+relaxed = true
+sql = "INSERT INTO scratch (id, v) VALUES ($1, $2)"
+warmup = 10
+iterations = 1000
+seed = 4291
+setup_sql = ["CREATE TABLE scratch (id bigint PRIMARY KEY, v integer)"]
+
+[bench.setup_sql_override]
+postgres = ["SET synchronous_commit = off", "CREATE TABLE scratch (id bigint PRIMARY KEY, v integer)"]
+sqlite = ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "CREATE TABLE scratch (id INTEGER PRIMARY KEY, v INTEGER)"]
+
+[[bench.param]]
+gen = "serial"
+start = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 99999
+
+[[bench]]
+name = "update_commit_relaxed"
+description = "Relaxed single-row UPDATE commits over a preloaded 100k-row table: one UPDATE per commit, barrier batched"
+dataset = "scratch"
+kind = "write_durable"
+relaxed = true
+sql = "UPDATE churn SET v = $2 WHERE id = $1"
+warmup = 400
+iterations = 1000
+seed = 4292
+setup_sql = [
+  "DROP TABLE IF EXISTS churn",
+  "CREATE TABLE churn (id bigint PRIMARY KEY, v integer)",
+  "INSERT INTO churn WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 100000) SELECT x, 0 FROM g"
+]
+
+[bench.setup_sql_override]
+postgres = [
+  "SET synchronous_commit = off",
+  "DROP TABLE IF EXISTS churn",
+  "CREATE TABLE churn (id bigint PRIMARY KEY, v integer)",
+  "INSERT INTO churn WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 100000) SELECT x, 0 FROM g"
+]
+sqlite = [
+  "PRAGMA journal_mode=WAL",
+  "PRAGMA synchronous=NORMAL",
+  "DROP TABLE IF EXISTS churn",
+  "CREATE TABLE churn (id INTEGER PRIMARY KEY, v INTEGER)",
+  "INSERT INTO churn WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 100000) SELECT x, 0 FROM g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 99999
+
 # Text-heavy rows (benchmarks.md §11) over the `text` dataset: 5,000 bodies of 1,000–16,000
 # compressible characters, so most rows store their body LZ4-compressed and the longest ones in an
 # overflow chain (datasets.toml). The scan reads and decompresses every body; the point read returns
