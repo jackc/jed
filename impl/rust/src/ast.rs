@@ -694,10 +694,25 @@ pub struct OnConflict {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ConflictTarget {
     /// `( col [, ...] )` — index inference: matched as a column SET against a unique index /
-    /// the primary key (order-independent; no match → 42P10).
-    Columns(Vec<String>),
+    /// the primary key (order-independent; no match → 42P10). Each element may carry the
+    /// `COLLATE` / operator-class inference decorations (spec/design/upsert.md §2).
+    Columns(Vec<ConflictColumn>),
     /// `ON CONSTRAINT name` — a unique-index name, or the synthesized `<table>_pkey` (miss → 42704).
     Constraint(String),
+}
+
+/// One element of an `ON CONFLICT ( … )` inference list (spec/design/upsert.md §2): a column and
+/// PostgreSQL's optional decorations. `ordering` / `nulls` record a written `ASC`/`DESC` /
+/// `NULLS FIRST|LAST`, parsed only so resolution can reject them (42P10) in element order.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ConflictColumn {
+    pub name: String,
+    /// `COLLATE "name"` — the collation the column's index key must use.
+    pub collation: Option<String>,
+    /// A bare B-tree operator-class name (`text_ops`) the column's index key must use.
+    pub opclass: Option<String>,
+    pub ordering: bool,
+    pub nulls: bool,
 }
 
 /// The action an `ON CONFLICT` takes on a conflicting row (spec/design/upsert.md §1).

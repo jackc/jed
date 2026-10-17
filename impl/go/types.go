@@ -75,6 +75,46 @@ type decimalTypmod struct {
 	Scale     uint16
 }
 
+// BtreeOpclass is the PostgreSQL name of the type's default B-tree operator class (btree_opclass in
+// spec/types/scalars.toml) — the class every jed B-tree key over the type uses, matched by an ON
+// CONFLICT inference decoration (spec/design/upsert.md §2). "" for a type with no B-tree class
+// (json, jsonpath).
+func (t scalarType) BtreeOpclass() string {
+	switch t {
+	case scalarInt16:
+		return "int2_ops"
+	case scalarInt32:
+		return "int4_ops"
+	case scalarInt64:
+		return "int8_ops"
+	case scalarText:
+		return "text_ops"
+	case scalarBool:
+		return "bool_ops"
+	case scalarDecimal:
+		return "numeric_ops"
+	case scalarBytea:
+		return "bytea_ops"
+	case scalarUuid:
+		return "uuid_ops"
+	case scalarTimestamp:
+		return "timestamp_ops"
+	case scalarTimestamptz:
+		return "timestamptz_ops"
+	case scalarInterval:
+		return "interval_ops"
+	case scalarFloat32:
+		return "float4_ops"
+	case scalarFloat64:
+		return "float8_ops"
+	case scalarDate:
+		return "date_ops"
+	case scalarJsonb:
+		return "jsonb_ops"
+	}
+	return ""
+}
+
 // CanonicalName is the single name used in all output (determinism — CLAUDE.md §10).
 func (t scalarType) CanonicalName() string {
 	switch t {

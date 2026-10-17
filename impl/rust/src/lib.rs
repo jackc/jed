@@ -428,6 +428,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "dml.update_default",
     // ON CONFLICT DO UPDATE SET col = DEFAULT — the conflict-action form (upsert.md §5).
     "dml.insert_on_conflict_default",
+    // ON CONFLICT COLLATE / operator-class inference decorations (upsert.md §2).
+    "dml.insert_on_conflict_decorations",
+    // ON CONFLICT DO UPDATE re-keying a primary-key column + the overlay second-affect rule (upsert.md §3-§5).
+    "dml.insert_on_conflict_rekey",
     // Assigning a range/array (container) column in an UPDATE (ranges.md §4 / array.md §4).
     "dml.update_container",
     "dml.delete",

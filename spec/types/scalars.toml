@@ -85,10 +85,18 @@ schema_version = 1
 #               order over UTF-8 (PostgreSQL's `C`/POSIX collation, = SQLite BINARY),
 #               the deterministic, version-independent, table-free choice (CLAUDE.md
 #               §8; ../design/types.md §11). Locale/ICU collations are a later feature.
+# btree_opclass the PostgreSQL name of the type's DEFAULT B-tree operator class — the class every
+#               jed B-tree key over a column of the type uses (there is no per-key class,
+#               ../design/indexes.md §1). Matched by an ON CONFLICT inference decoration
+#               (`ON CONFLICT (n int4_ops)`, ../design/upsert.md §2). Omitted for a type with no
+#               B-tree class (json, jsonpath — as in PostgreSQL). The containers' polymorphic
+#               classes (array_ops / range_ops / record_ops) and the `varchar_ops` alias of
+#               text_ops are fixed in upsert.md §2, not per scalar.
 # -----------------------------------------------------------------------------
 
 [[type]]
 id = "i16"
+btree_opclass = "int2_ops"
 aliases = ["smallint", "int2"]
 family = "integer"
 storable = true
@@ -103,6 +111,7 @@ rank = 1
 
 [[type]]
 id = "i32"
+btree_opclass = "int4_ops"
 aliases = ["int", "integer", "int4"]
 family = "integer"
 storable = true
@@ -117,6 +126,7 @@ rank = 2
 
 [[type]]
 id = "i64"
+btree_opclass = "int8_ops"
 aliases = ["bigint", "int8"]
 family = "integer"
 storable = true
@@ -147,6 +157,7 @@ rank = 3
 # No bits/min/max/overflow/rank — those are integer-family fields.
 [[type]]
 id = "boolean"
+btree_opclass = "bool_ops"
 aliases = ["bool"]
 family = "boolean"
 storable = true
@@ -166,6 +177,7 @@ encoding = { method = "bool-byte", width_bytes = 1 }
 # rank — those are integer-family fields; no width_bytes — text is variable-width.
 [[type]]
 id = "text"
+btree_opclass = "text_ops"
 aliases = ["varchar", "character varying", "string"]
 family = "text"
 storable = true
@@ -193,6 +205,7 @@ collation = "C"
 # drive (../cost/schedule.toml, ../design/cost.md §3).
 [[type]]
 id = "decimal"
+btree_opclass = "numeric_ops"
 aliases = ["numeric", "dec"]
 family = "decimal"
 storable = true
@@ -220,6 +233,7 @@ max_scale = 16383
 # no width_bytes — bytea is variable-width; no collation.
 [[type]]
 id = "bytea"
+btree_opclass = "bytea_ops"
 aliases = []
 family = "bytea"
 storable = true
@@ -243,6 +257,7 @@ encoding = { method = "bytea-terminated-escape" }
 # present (16). No bits/min/max/overflow/rank (integer-family fields); no collation.
 [[type]]
 id = "uuid"
+btree_opclass = "uuid_ops"
 aliases = []
 family = "uuid"
 storable = true
@@ -275,6 +290,7 @@ encoding = { method = "uuid-raw16", width_bytes = 16 }
 # overflow/rank (not the integer family); no collation.
 [[type]]
 id = "timestamp"
+btree_opclass = "timestamp_ops"
 aliases = ["timestamp without time zone"]
 family = "timestamp"
 storable = true
@@ -282,6 +298,7 @@ encoding = { method = "int-be-signflip", width_bytes = 8 }
 
 [[type]]
 id = "timestamptz"
+btree_opclass = "timestamptz_ops"
 aliases = ["timestamp with time zone"]
 family = "timestamptz"
 storable = true
@@ -312,6 +329,7 @@ encoding = { method = "int-be-signflip", width_bytes = 8 }
 # — CLAUDE.md §8), a documented PG divergence on sub-unit ties (../design/interval.md §5).
 [[type]]
 id = "interval"
+btree_opclass = "interval_ops"
 aliases = []
 family = "interval"
 storable = true
@@ -357,6 +375,7 @@ encoding = { method = "interval-span-i128" }
 # width_bytes present (f64 → 8, f32 → 4).
 [[type]]
 id = "f32"
+btree_opclass = "float4_ops"
 aliases = ["real", "float4"]
 family = "float"
 storable = true
@@ -367,6 +386,7 @@ rank = 1
 
 [[type]]
 id = "f64"
+btree_opclass = "float8_ops"
 aliases = ["double precision", "float", "float8"]
 family = "float"
 storable = true
@@ -401,6 +421,7 @@ rank = 2
 # bits/min/max/overflow/rank (not the integer family); no collation. width_bytes = 4.
 [[type]]
 id = "date"
+btree_opclass = "date_ops"
 aliases = []
 family = "date"
 storable = true
@@ -439,6 +460,7 @@ storable = true
 # COLUMN lands in J1 (the one format_version bump); J0 is the literal-only surface. Malformed → 22P02.
 [[type]]
 id = "jsonb"
+btree_opclass = "jsonb_ops"
 aliases = []
 family = "jsonb"
 storable = true

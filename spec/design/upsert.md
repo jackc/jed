@@ -24,9 +24,11 @@ INSERT INTO t [ AS alias ] [(cols)] { VALUES ... | SELECT ... }
   ON CONFLICT [ conflict_target ] conflict_action
   [ RETURNING ... ]
 
-conflict_target ::= ( col [, ...] ) [ WHERE index_predicate ]
+conflict_target ::= ( element [, ...] ) [ WHERE index_predicate ]
                                                -- index inference (column SET)
                   | ON CONSTRAINT name          -- a named unique index, or <table>_pkey
+
+element         ::= col [ COLLATE "collation" ] [ opclass ]   -- §2 inference decorations
 
 conflict_action ::= DO NOTHING
                   | DO UPDATE SET col = expr [, ...] [ WHERE condition ]
@@ -68,7 +70,7 @@ is never an arbiter.)
   index ([indexes.md §9](indexes.md)) is never inferred from a bare column list (`42P10` when it is
   the only match, as in PostgreSQL); restating its predicate makes it inferable. The
   `index_predicate` resolves against the target table's columns like a partial-index predicate,
-  after the list's columns are checked (`42703` first): a subquery is `0A000`, a parameter `$N`
+  after the list's elements and their decorations are checked (their `42P10`/`42703`/`42704` first): a subquery is `0A000`, a parameter `$N`
   `42P02`, an unknown column `42703`, `excluded.col` `42P01`, an aggregate `42803`, a window
   function `42P20`; its type and mutability are **not** checked (PostgreSQL's — a non-boolean
   predicate is no error, it merely implies nothing). Among the unique indexes / primary key whose
@@ -80,6 +82,41 @@ is never an arbiter.)
   entry in the partial index, so its arbiter key is NULL-like: it never conflicts on that arbiter,
   never counts as a duplicate proposal (§4), and is an ordinary insert (probed). The `WHERE` is not
   allowed through an updatable view (`0A000`, a narrowing).
+- **Inference decorations** (PostgreSQL's `infer_collation_opclass_match`, probed). A target
+  element may carry a **`COLLATE "name"`** and/or an **operator-class name** (`(name COLLATE
+  "unicode")`, `(n int4_ops)`, `(name COLLATE "C" text_ops)`). A decoration does not change
+  which columns are named; it *narrows* which unique indexes match: an index matches only if,
+  besides the column-set rule above, every decorated element's column is keyed under that
+  collation / operator class. Each element is checked in order — `ASC`/`DESC` (*ASC/DESC is not
+  allowed in ON CONFLICT clause*) and `NULLS FIRST`/`LAST` (*NULLS FIRST/LAST is not allowed in
+  ON CONFLICT clause*) are **`42P10`**, then the column (`42703`), then the collation name, which
+  must be `"C"` or a loaded collation (**`42704`**, the `COLLATE` operator's rule —
+  [collation.md](collation.md) §1), then the operator class, which must be one of jed's B-tree
+  operator classes (**`42704`**, *operator class "x" does not exist for access method "btree"*).
+  Only after every element resolves — and then the `WHERE index_predicate` — does the index search
+  run, so a decoration no index satisfies is the ordinary **`42P10`**. The decorations narrow
+  partial and non-partial candidates alike: a partial unique index is inferable iff the column set
+  equals, every decoration holds, and the `WHERE` implies its predicate.
+  - **Collation.** jed keys a column under its frozen collation (a key element takes no
+    `COLLATE` of its own, indexes.md §1), so an element's `COLLATE "x"` is satisfied iff the
+    column is collatable (`text`, `varchar`, `text[]`) and its collation is `x`. `COLLATE` on a
+    non-collatable column (`(n COLLATE "C")` over `i32`) is `42P10`, as in PostgreSQL (an index
+    attribute of a non-collatable type has no collation, so none matches) — not the `42804` the
+    `COLLATE` *operator* raises.
+  - **Operator class.** Every jed B-tree key uses its type's **default** B-tree operator class
+    (there is no per-key opclass, indexes.md §1). The names are PostgreSQL's: each scalar's is
+    data (`btree_opclass` in [../types/scalars.toml](../types/scalars.toml): `int2_ops`,
+    `int4_ops`, `int8_ops`, `bool_ops`, `text_ops`, `numeric_ops`, `bytea_ops`, `uuid_ops`,
+    `timestamp_ops`, `timestamptz_ops`, `interval_ops`, `float4_ops`, `float8_ops`, `date_ops`,
+    `jsonb_ops`; `json` and `jsonpath` have none), and the containers take PostgreSQL's
+    polymorphic classes — an array column `array_ops`, a range `range_ops`, a composite
+    `record_ops`. `varchar_ops` is PostgreSQL's non-default alias of `text_ops` (same family,
+    same input type) and is accepted as one. An element's opclass is satisfied iff it is the
+    column's class (`(n int8_ops)` over an `i32` column is `42P10` — `int4_ops` and `int8_ops`
+    share a family but not an input type, PostgreSQL's test). The decoration names the class
+    *bare*; a schema-qualified name (`pg_catalog.text_ops`) is not in jed's grammar (`42601`).
+  - Two elements may name the same column (`(name, name COLLATE "C")`); the target is still a
+    set, and each decoration must hold.
 - **`ON CONSTRAINT name`.** By exact name ([grammar.md §3](grammar.md)): the synthesized
   **`<table>_pkey`** names the primary key (jed does not persist that name but accepts it as
   an arbiter spelling — symmetric with the `23505` message, constraints.md §5.4); otherwise
@@ -104,59 +141,83 @@ is written. `ON CONFLICT` keeps that contract and adds a **sequential planning**
 later proposed row observes earlier ones' effects — reproducing PostgreSQL's row-at-a-time
 visibility while still writing nothing until all rows are planned and validated.
 
-**Phase 1 walks the candidate rows in source order**, maintaining:
+**Phase 1 walks the candidate rows in source order**, maintaining an overlay on the committed
+snapshot that later rows' conflict probes consult:
 
-- the set of **arbiter keys already proposed** by this statement (for the §4 second-affect
-  rule);
-- the planned **inserts** and **updates** (keyed by storage key), forming an overlay on the
-  committed snapshot that later rows' conflict probes consult.
+- the **affected arbiter keys** — the arbiter key of every row this statement has already
+  inserted or updated (an updated row's key as of its *new* values), the rows a later proposal
+  may not affect again (§4);
+- the **affected stored rows** — the storage keys of committed rows this statement has already
+  updated (their committed arbiter-index entry no longer describes them);
+- the planned **inserts** and **updates** (an update records the existing row's old storage key,
+  its new storage key, and its old and new values).
 
 For each candidate row `R` (built with defaults filled, coerced, `NOT NULL` `23502` and
 `CHECK` `23514` applied first — the existing per-row order, constraints.md §4.4):
 
 1. Compute `R`'s **arbiter key** `ak` (the arbiter index/PK prefix over `R`'s values). A
    **NULL-bearing** `ak` (a nullable arbiter column is NULL) never conflicts (NULLS DISTINCT,
-   indexes.md §8) — `R` is an ordinary insert (step 4), never a duplicate-proposed (step 2).
-2. **`ak` already proposed by this statement?** (a second candidate row with the same arbiter
-   key):
-   - `DO UPDATE` → **`21000`** (*ON CONFLICT DO UPDATE command cannot affect row a second
-     time*). This fires on *duplicate proposed arbiter keys* regardless of whether either row
-     actually conflicts with a committed row, and **regardless of a `WHERE` that would skip
-     the update** (probed). 
-   - `DO NOTHING` → **skip** `R`.
-3. Else record `ak` as proposed, then **look up `ak` in the committed snapshot + the overlay**:
-   - **Conflict with an existing row `E`:**
+   indexes.md §8) — `R` is an ordinary insert, never a conflict.
+2. **Look up `ak` in the committed snapshot**, ignoring a committed row this statement already
+   updated (step 2 finds it, if at all, through its new key in step 3):
+   - **Conflict with an unaffected existing row `E`:**
      - `DO NOTHING` → **skip** `R`.
-     - `DO UPDATE` → evaluate the optional `WHERE` against `[E | excluded=R]`; if **false**,
-       skip the update (`E` unchanged, not returned by `RETURNING`); if true/absent, apply
-       the `SET` to `E` (§5) → `E'`, and plan an **update** of `E`'s storage key.
-   - **No conflict on the arbiter** → `R` is an **insert**. It still passes the ordinary
-     PK + every-unique-index validation (against committed + overlay), so a conflict on a
-     **non-arbiter** constraint traps **`23505`** (§2). Plan an **insert**.
+     - `DO UPDATE` → evaluate the optional `WHERE` against `[E | excluded=R]`; if **not true**,
+       skip the update (`E` unchanged, not returned by `RETURNING`, and still unaffected — a
+       later proposal may conflict with it again); if true/absent, apply the `SET` to `E` (§5)
+       → `E'`, plan an **update** of `E` (re-keyed to `E'`'s storage key when a primary-key
+       column was assigned, §5), and record `E'`'s arbiter key (when not NULL-bearing) and `E`'s
+       storage key as affected.
+3. **Else, is `ak` an affected arbiter key?** (`R` conflicts with a row this statement inserted
+   or updated):
+   - `DO UPDATE` → **`21000`** (§4).
+   - `DO NOTHING` → **skip** `R`.
+4. **Else** → `R` is an **insert**; record `ak` as affected. It still passes the ordinary
+   PK + every-unique-index validation (against the end state), so a conflict on a
+   **non-arbiter** constraint traps **`23505`** (§2). Plan an **insert**.
 
 **Phase 2** applies the planned inserts and updates to the store and maintains every index,
-exactly as `INSERT`/`UPDATE` phase 2 do. A ceiling abort (`54P01`) or any validation error
-in phase 1 leaves the database untouched (all-or-nothing).
+exactly as `INSERT`/`UPDATE` phase 2 do. When an update re-keys its row, phase 2 first vacates
+every re-keyed row's old storage key and index entries, then places the inserts and the
+updated rows (the standalone re-keying `UPDATE`'s two-pass, so a chain or swap of keys never
+collides transiently); without a re-key the order is unchanged (inserts, then in-place
+replacements, then each index's new and moved entries). A ceiling abort (`54P01`) or any
+validation error in phase 1 leaves the database untouched (all-or-nothing).
 
 **End-state uniqueness (the documented divergence shared with `UPDATE`).** Planned updates
 are validated for uniqueness against the **statement end state** — an index entry belonging
 to a row being rewritten does not conflict with that row's new values, and a value *swap*
 across two updated rows succeeds — exactly as `UPDATE` (indexes.md §8, the §9 divergence).
-The no-target `DO NOTHING` skip decision and the arbiter conflict probe likewise consult the
-overlay (committed + planned), not a per-row transient.
+The primary key is validated the same way once a row can be re-keyed: the inserted rows' keys
+and the updated rows' new keys must be distinct from each other and from every stored key that
+is not an updated row's old (vacated) key (`23505` on `<table>_pkey`, inserts checked before
+updates, each in phase-1 order). So `ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100`
+onto a key some other row holds is `23505`, as in PostgreSQL, while a proposal whose key an
+earlier update vacated is inserted (probed: `VALUES (1, …), (1, …) … DO UPDATE SET id = 7`
+moves row 1 to 7 and then inserts a new row 1).
 
 ## 4. The second-affect rule (`21000`)
 
 PostgreSQL forbids a single `INSERT ... ON CONFLICT DO UPDATE` from affecting the same row
-twice. jed detects this as **two proposed rows sharing one arbiter key** (§3 step 2):
+twice: when the conflicting row was **inserted or updated by this statement**, the update is
+`21000` (*ON CONFLICT DO UPDATE command cannot affect row a second time*). jed detects this as a
+proposal whose arbiter key is an **affected** key with no unaffected committed row holding it
+(§3 step 3). Probed against PostgreSQL:
 
-- it fires whether the first proposal was an insert or an update of an existing row (probed:
-  `VALUES (5,…),(5,…)` with neither `5` existing → `21000`; with `5` existing → `21000`);
+- two proposals sharing a key with none existing → `21000` (the first inserted the row the
+  second conflicts with): `VALUES (5,…),(5,…)`;
+- two proposals updating the same existing row → `21000`;
+- a proposal hitting the key an earlier update **moved a row to** → `21000` (`VALUES (1,…),
+  (5,…) … DO UPDATE SET id = 5`, the existing row 1 moved to 5);
 - it fires **before** the `DO UPDATE` `WHERE` is consulted, so a `WHERE false` does not
-  suppress it (probed);
-- it is specific to `DO UPDATE`. Under `DO NOTHING` a duplicate proposed arbiter key is
-  simply **skipped** (probed: `VALUES (6,1),(6,2) ON CONFLICT (id) DO NOTHING` keeps
-  `(6,1)`), which is why `DO NOTHING` needs no target to be well-defined.
+  suppress it when the first proposal inserted the row; but a row whose update a `WHERE`
+  **skipped** was not affected, so a second proposal for it is evaluated again (`VALUES
+  (5,…),(5,…) … WHERE false` over an existing row 5 succeeds, changing nothing);
+- a proposal for a key an earlier update **vacated** conflicts with nothing and is inserted.
+
+Under `DO NOTHING` a conflict with an affected row is simply **skipped** (probed: `VALUES
+(6,1),(6,2) ON CONFLICT (id) DO NOTHING` keeps `(6,1)`), which is why `DO NOTHING` needs no
+target to be well-defined.
 
 A NULL-bearing arbiter key is exempt (two `(NULL)` proposals do not "affect the same row").
 
@@ -215,14 +276,25 @@ Privilege preflight walks the selected default expression's named functions (ses
 As in PostgreSQL, a `DO UPDATE` statement needs `UPDATE` on the target besides `INSERT`, and any
 conflict target (`DO NOTHING` too) or column-reading `RETURNING` needs `SELECT` (session.md §5.3).
 
-**Narrowings on `SET` (each relaxable, §9):** assigning a **primary-key column** is
-**`0A000`** — a deferred follow-on (the standalone `UPDATE` re-keying has landed, CLAUDE.md §11
-step 6, but extending it to the conflict path is separate); assigning a
+**Assigning a primary-key column re-keys the row** (PostgreSQL allows it; the standalone
+re-keying `UPDATE`, CLAUDE.md §11 step 6 and [constraints.md](constraints.md) §6.5/§6.7, carried
+onto the conflict path). `SET id = excluded.id + 100` (or `SET id = DEFAULT`, which draws the
+default per updated row) recomputes the existing row's storage key from `E'`, and the row moves
+in phase 2 with every secondary-index entry following it (an entry's suffix is the storage key,
+so all of them move). The re-key is validated against the statement end state (§3): another row's
+key is `23505` on `<table>_pkey`; a key this statement vacates is free. Foreign keys follow the
+`UPDATE` rules exactly: a child-side FK whose local columns include an assigned key column is
+re-checked (`23503`), and a parent-side reference to the old key takes its `ON UPDATE` action —
+`NO ACTION`/`RESTRICT` is `23503` while a child still references the old key, `CASCADE` /
+`SET NULL` / `SET DEFAULT` rewrite the children after the target rows reach their new state
+(constraints.md §6.5). A row whose assignment leaves the key value unchanged is not re-keyed.
+
+**Narrowings on `SET` (each relaxable, §9):** assigning a
 **`GENERATED ALWAYS AS IDENTITY`** column anything but `DEFAULT` is **`428C9`** (the standing
 `UPDATE` rule, sequences.md §13.4 — `SET id = DEFAULT` is accepted and advances the owned
 sequence). The standalone `UPDATE` container narrowings carry over: a `$N` parameter into a
-container column, and an anonymous `ROW(…)` expression into a composite column, are `0A000`. The
-primary-key narrowing applies to the `DEFAULT` form too. An unknown `col` is `42703`.
+container column, and an anonymous `ROW(…)` expression into a composite column, are `0A000`. An
+unknown `col` is `42703`.
 
 ## 6. `RETURNING`
 
@@ -257,24 +329,34 @@ except `42P09` (`ambiguous_alias`), added with the target alias (§5). The codes
 |---|---|
 | `21000` | `DO UPDATE` would affect a row a second time (§4). Message: *ON CONFLICT DO UPDATE command cannot affect row a second time*. |
 | `42601` | `DO UPDATE` with no conflict target (§2). Message: *ON CONFLICT DO UPDATE requires inference specification or constraint name*. |
-| `42P10` | A column-list target matches no unique index / PK (§2). Message: *there is no unique or exclusion constraint matching the ON CONFLICT specification*. |
-| `42704` | `ON CONSTRAINT name` names no unique constraint (§2). Message: *constraint "name" for table "table" does not exist*. |
+| `42P10` | A column-list target matches no unique index / PK, including one whose `COLLATE` / operator-class decoration no index satisfies (§2). Message: *there is no unique or exclusion constraint matching the ON CONFLICT specification*. Also `ASC`/`DESC` or `NULLS FIRST`/`LAST` on a target element (*ASC/DESC is not allowed in ON CONFLICT clause*, *NULLS FIRST/LAST is not allowed in ON CONFLICT clause*). |
+| `42704` | `ON CONSTRAINT name` names no unique constraint (§2). Message: *constraint "name" for table "table" does not exist*. Also an element's unknown collation (*collation "x" does not exist*) or operator class (*operator class "x" does not exist for access method "btree"*). |
 | `42703` | An unknown column in the target list or `SET` (§2, §5). |
 | `42P01` | A `SET`/`WHERE`/`RETURNING` reference qualified by the table's name under an `AS alias` (§5). |
 | `42P09` | `excluded.col` in `DO UPDATE` when the target is itself labeled `excluded` (§5). |
-| `23505` | A conflict on a **non-arbiter** constraint (§2), or any conflict with no `ON CONFLICT` clause. |
+| `23505` | A conflict on a **non-arbiter** constraint (§2), any conflict with no `ON CONFLICT` clause, or a `DO UPDATE` re-key onto another row's primary key (§3, §5). |
 | `23502` / `23514` / `22003` / `42804` / `23503` / `0A000` / `428C9` | The ordinary `INSERT`/`UPDATE` per-row checks, applied to proposed and updated rows (§3, §5). |
 
 ## 9. Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
-- **`DO UPDATE` cannot assign a primary-key column** (`0A000`); PostgreSQL allows it. The
-  standalone `UPDATE` re-keying has landed (CLAUDE.md §11 step 6), but extending it to the
-  conflict path (the existing row would move, with its own arbiter/secondary-index re-probe)
-  is a separate deferred follow-on (§10).
 - **End-state, not per-row transient, uniqueness** for planned updates and the overlay-based
   conflict probe — the same divergence `UNIQUE`/`UPDATE` carry (indexes.md §7), from the
   two-phase / all-or-nothing model. A value *swap* under `DO UPDATE` succeeds where PG's
-  per-row check could fail on the transient.
+  per-row check could fail on the transient — including a primary-key swap by re-keying
+  (`VALUES (2,…),(101,…) … DO UPDATE SET id = CASE …` exchanging the keys of rows 2 and 101
+  succeeds; PostgreSQL's first update collides with row 101, `23505`), as for the standalone
+  re-keying `UPDATE` (constraints.md §6.5).
+- **No PostgreSQL `"default"` collation in a decoration.** A jed column's collation is the
+  concrete name frozen at `CREATE TABLE` (collation.md §1/§15 — the database default is a
+  recorded name, not a distinct `"default"` collation object), so `ON CONFLICT (name COLLATE
+  "C")` matches an un-annotated column of a `C`-default database, and `COLLATE "default"` is an
+  unknown collation (`42704`). PostgreSQL keys such a column under its `"default"` collation,
+  which only `COLLATE "default"` names, so there `COLLATE "C"` is `42P10`. A column declared with
+  an explicit collation behaves identically in both.
+- **Only jed's operator classes exist** (§2). PostgreSQL's B-tree classes for types jed lacks
+  or orderings jed does not offer (`text_pattern_ops`, `varchar_pattern_ops`, `bpchar_ops`,
+  `name_ops`, …) are `42704` in jed — PostgreSQL resolves them and then finds no matching index
+  (`42P10`). A schema-qualified class name is `42601`.
 - **Which constraint name a `23505` reports** when several are violated follows jed's standing
   deterministic order (PK first, then unique indexes by name byte order), not PG's
   index-creation order (constraints.md §5.4). The code is identical.
@@ -292,8 +374,9 @@ except `42P09` (`ambiguous_alias`), added with the target alias (§5). The codes
 
 ## 10. Deferred (each its own later slice)
 
-Assigning a primary-key column on the conflict-action path (§5);
-the `WHERE index_predicate` through an updatable view; several partial arbiters at once (§9);
-`COLLATE`/opclass inference decorations; multi-column `SET (a,b) = (...)`; and the GIN /
+The `WHERE index_predicate` through an updatable view; several partial arbiters at once (§9);
+**expression** inference elements (`ON CONFLICT (lower(email))`, `((name) COLLATE "C")` — an
+expression unique index is arbitrated by `ON CONSTRAINT` today); multi-column `SET (a,b) =
+(...)`; and the GIN /
 ordered-index acceleration of the arbiter probe (the probe reuses the unique-index point/range
 lookup, which is already a probe, so this is a non-issue for unique arbiters).

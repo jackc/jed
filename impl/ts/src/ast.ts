@@ -974,11 +974,24 @@ export type OnConflict = {
 
 // ConflictTarget is the arbiter constraint named by an ON CONFLICT target (spec/design/upsert.md
 // §2): a `( col [, ...] )` inference list matched as a SET against a unique index / the primary key
-// (no match → 42P10), or `ON CONSTRAINT name` (a unique-index name or the synthesized <table>_pkey;
-// miss → 42704).
+// (no match → 42P10), each element optionally decorated, or `ON CONSTRAINT name` (a unique-index
+// name or the synthesized <table>_pkey; miss → 42704).
 export type ConflictTarget =
-  | { kind: "columns"; columns: string[] }
+  | { kind: "columns"; columns: ConflictColumn[] }
   | { kind: "constraint"; name: string };
+
+// ConflictColumn is one element of an `ON CONFLICT ( … )` inference list (spec/design/upsert.md
+// §2): a column and PostgreSQL's optional decorations — `collation` (COLLATE "name") and `opclass`
+// (a bare B-tree operator-class name), each the collation / class the column's key must use, null
+// when absent. `ordering` / `nulls` record a written ASC/DESC / NULLS FIRST|LAST, parsed only so
+// resolution can reject them (42P10) in element order.
+export type ConflictColumn = {
+  name: string;
+  collation: string | null;
+  opclass: string | null;
+  ordering: boolean;
+  nulls: boolean;
+};
 
 // Overriding is the INSERT `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md
 // §13): "system" lets an explicit value land in a GENERATED ALWAYS identity column; "user" discards

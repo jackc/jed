@@ -1863,3 +1863,32 @@ reason = "jed: year 294276 is past the end of jed's finite int64-microsecond tim
 file = "dml/insert_on_conflict_partial.test"
 sql = "INSERT INTO puv VALUES (20, 'active', 7) ON CONFLICT (amt) WHERE status = 'active' DO NOTHING"
 reason = "jed does not map an ON CONFLICT inference WHERE through an updatable view onto the base table (0A000, upsert.md §9/§10); PostgreSQL rewrites it and infers the base table's partial unique index. A documented narrowing; the base-table form is fully supported."
+
+# --- ON CONFLICT inference decorations (upsert.md §2/§9): jed has no PostgreSQL "default" collation
+# object and only its own B-tree operator classes.
+[[override]]
+file = "dml/insert_on_conflict_decorations.test"
+sql = "INSERT INTO dd VALUES (2, 'a') ON CONFLICT (name COLLATE \"C\") DO NOTHING"
+reason = "jed: a column's collation is the concrete name frozen at CREATE TABLE (the per-database default, here C — collation.md §1/§15), so COLLATE \"C\" names the un-annotated column's key collation and the arbiter matches (the row is skipped). PostgreSQL keys an un-annotated column under its distinct \"default\" collation, which COLLATE \"C\" does not name, so it raises 42P10 (upsert.md §9)."
+
+[[override]]
+file = "dml/insert_on_conflict_decorations.test"
+sql = "INSERT INTO dd VALUES (2, 'a') ON CONFLICT (name COLLATE \"default\") DO NOTHING"
+reason = "jed has no \"default\" collation object — the database default is a recorded collation name (collation.md §1/§15) — so COLLATE \"default\" is an unknown collation, 42704. PostgreSQL resolves it to the un-annotated column's collation and matches (upsert.md §9)."
+
+[[override]]
+file = "dml/insert_on_conflict_decorations.test"
+sql = "INSERT INTO dd VALUES (2, 'a') ON CONFLICT (name text_pattern_ops) DO NOTHING"
+reason = "jed offers only each type's default B-tree operator class (indexes.md §1), so text_pattern_ops names no jed class: 42704. PostgreSQL resolves the class and then finds no index keyed under it: 42P10 (upsert.md §9)."
+
+[[override]]
+file = "dml/insert_on_conflict_decorations.test"
+sql = "INSERT INTO dd VALUES (2, 'a') ON CONFLICT (name pg_catalog.text_ops) DO NOTHING"
+reason = "jed has no schemas; an inference element's operator class is a bare name (grammar.ebnf conflict_element), so a qualified one is a 42601 syntax error. PostgreSQL resolves pg_catalog.text_ops and matches (upsert.md §9)."
+
+# --- ON CONFLICT DO UPDATE re-keying: end-state primary-key validation (upsert.md §3/§9), the
+# standalone re-keying UPDATE's divergence (constraints.md §6.5).
+[[override]]
+file = "dml/insert_on_conflict_rekey.test"
+sql = "INSERT INTO rs VALUES (2, 0), (101, 0) ON CONFLICT (id) DO UPDATE SET id = CASE WHEN rs.id = 2 THEN 101 ELSE 2 END RETURNING *"
+reason = "jed validates a re-keying DO UPDATE against the statement's END STATE (two-phase / all-or-nothing, upsert.md §3), where the two rows have exchanged keys without a collision, so the swap succeeds. PostgreSQL applies each update immediately and its first update collides with row 101 (23505) — the same end-state divergence the standalone re-keying UPDATE and UNIQUE carry (constraints.md §6.5, indexes.md §8)."

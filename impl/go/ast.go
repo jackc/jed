@@ -742,12 +742,26 @@ type onConflict struct {
 // §2). EXACTLY ONE of Columns / Constraint is meaningful (IsConstraint selects which).
 type conflictTarget struct {
 	// Columns is the `( col [, ...] )` inference list — matched as a SET against a unique index /
-	// the primary key (order-independent; no match → 42P10). Valid when !IsConstraint.
-	Columns []string
+	// the primary key (order-independent; no match → 42P10), each element optionally decorated
+	// (upsert.md §2). Valid when !IsConstraint.
+	Columns []conflictColumn
 	// IsConstraint marks `ON CONSTRAINT name`; Constraint is a unique-index name or the
 	// synthesized <table>_pkey (miss → 42704).
 	IsConstraint bool
 	Constraint   string
+}
+
+// conflictColumn is one element of an `ON CONFLICT ( … )` inference list (spec/design/upsert.md
+// §2): a column and PostgreSQL's optional decorations. Ordering / Nulls record a written ASC/DESC /
+// NULLS FIRST|LAST, parsed only so resolution can reject them (42P10) in element order.
+type conflictColumn struct {
+	Name string
+	// Collation is a `COLLATE "name"` (nil = none) — the collation the column's key must use.
+	Collation *string
+	// Opclass is a bare B-tree operator-class name (nil = none) the column's key must use.
+	Opclass  *string
+	Ordering bool
+	Nulls    bool
 }
 
 // Overriding is the INSERT `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md

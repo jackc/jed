@@ -19,15 +19,6 @@ func ocDB(t *testing.T, sql ...string) *Session {
 	return db
 }
 
-func ocErr(t *testing.T, db dbHandle, sql string) string {
-	t.Helper()
-	_, err := queryOutcome(db, sql, nil)
-	if err == nil {
-		t.Fatalf("expected an error from %q", sql)
-	}
-	return err.(*EngineError).Code()
-}
-
 func ocAffected(t *testing.T, db dbHandle, sql string) (int64, bool) {
 	t.Helper()
 	out, err := queryOutcome(db, sql, nil)
@@ -38,17 +29,6 @@ func ocAffected(t *testing.T, db dbHandle, sql string) (int64, bool) {
 		t.Fatalf("expected a statement outcome from %q", sql)
 	}
 	return out.RowsAffected, out.HasRowsAffected
-}
-
-// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is still 0A000 — a
-// deferred follow-on. The standalone UPDATE re-keying has landed (§11 step 6); extending it to
-// the upsert conflict path is separate. PostgreSQL allows it.
-func TestOnConflictDoUpdatePKColumnUnsupported(t *testing.T) {
-	t.Parallel()
-	db := ocDB(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 10)")
-	if got := ocErr(t, db, "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100"); got != "0A000" {
-		t.Fatalf("got %s, want 0A000", got)
-	}
 }
 
 // The affected-row count (api.md §4) the corpus's `statement ok` cannot assert: an ON CONFLICT

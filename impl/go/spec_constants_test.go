@@ -29,6 +29,26 @@ func specPath(t *testing.T, rel string) string {
 	}
 }
 
+// Every scalar's default B-tree operator class (btree_opclass, spec/design/upsert.md §2) matches
+// scalarType.BtreeOpclass; a type without the field has no class.
+func TestBtreeOpclassesMatchSpec(t *testing.T) {
+	t.Parallel()
+	for _, row := range readTomlTables(t, specPath(t, "types/scalars.toml"), "type") {
+		id := row.str("id")
+		st, ok := scalarTypeFromName(id)
+		if !ok {
+			t.Fatalf("unknown type id %s", id)
+		}
+		want := ""
+		if row.has("btree_opclass") {
+			want = row.str("btree_opclass")
+		}
+		if got := st.BtreeOpclass(); got != want {
+			t.Errorf("%s btree_opclass: got %q, want %q", id, got, want)
+		}
+	}
+}
+
 func TestScalarTypesMatchSpec(t *testing.T) {
 	t.Parallel()
 	tables := readTomlTables(t, specPath(t, "types/scalars.toml"), "type")

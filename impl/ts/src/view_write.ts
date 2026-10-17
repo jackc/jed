@@ -13,7 +13,7 @@
 // WHERE clauses resolve the same way and are AND-ed ahead of the statement's own; the checked views'
 // WHERE clauses become the statement's check-option checks (resolveViewChecks, §15.6).
 
-import type { CheckOption, ConflictTarget, Expr } from "./ast.ts";
+import type { CheckOption, ConflictColumn, ConflictTarget, Expr } from "./ast.ts";
 import type { Column, Table } from "./catalog.ts";
 import type { EngineError } from "./errors.ts";
 import { engineError } from "./errors.ts";
@@ -91,6 +91,7 @@ export function viewConflictTarget(
   vw: ViewWrite,
   table: Table,
   target: ConflictTarget | null,
+  checkNames: (c: ConflictColumn) => void,
 ): ConflictTarget | null {
   if (target === null) return null;
   if (target.kind === "constraint") {
@@ -99,12 +100,16 @@ export function viewConflictTarget(
       `constraint ${target.name} for table ${vw.view} does not exist`,
     );
   }
+  // Each element in order: its written ordering, the view column, then its decoration names
+  // (upsert.md §2) — PostgreSQL resolves the target against the view before the rewrite maps it.
   const positions = target.columns.map((c) => {
-    const k = vw.top.columns.findIndex((col) => col.name === c);
-    if (k < 0) throw engineError("undefined_column", "column does not exist: " + c);
+    checkConflictOrdering(c);
+    const k = vw.top.columns.findIndex((col) => col.name === c.name);
+    if (k < 0) throw engineError("undefined_column", "column does not exist: " + c.name);
+    checkNames(c);
     return k;
   });
-  const columns = positions.map((k) => {
+  const columns = positions.map((k, i) => {
     const f = followLayer(vw.top, k);
     if (f.kind === "expr") {
       throw engineError(
@@ -112,9 +117,24 @@ export function viewConflictTarget(
         "there is no unique or exclusion constraint matching the ON CONFLICT specification",
       );
     }
-    return table.columns[f.index]!.name;
+    return { ...target.columns[i]!, name: table.columns[f.index]!.name };
   });
   return { kind: "columns", columns };
+}
+
+// checkConflictOrdering is the written-ordering check on one ON CONFLICT inference element
+// (spec/design/upsert.md §2), raised before the element's column is looked up — PostgreSQL's
+// order: ASC/DESC, then NULLS FIRST|LAST, each 42P10.
+export function checkConflictOrdering(c: ConflictColumn): void {
+  if (c.ordering) {
+    throw engineError("invalid_column_reference", "ASC/DESC is not allowed in ON CONFLICT clause");
+  }
+  if (c.nulls) {
+    throw engineError(
+      "invalid_column_reference",
+      "NULLS FIRST/LAST is not allowed in ON CONFLICT clause",
+    );
+  }
 }
 
 // ViewCheck is one check-option check of a write through a view (views.md §15.6): the checked view's

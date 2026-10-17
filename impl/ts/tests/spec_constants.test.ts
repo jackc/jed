@@ -9,6 +9,7 @@ import { ERRORS } from "../src/sqlstate.ts";
 import {
   ALL_SCALAR_TYPES,
   type ScalarType,
+  btreeOpclass,
   canonicalName,
   isFixedWidth,
   maxOf,
@@ -22,6 +23,18 @@ import { AGGREGATES, OPERATORS, SET_RETURNING } from "../src/operators.ts";
 import { rangeByName } from "../src/range.ts";
 import { COSTS } from "../src/costs.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
+
+// Every scalar's default B-tree operator class (btree_opclass, spec/design/upsert.md §2) matches
+// btreeOpclass; a type without the field has no class.
+test("btree operator classes match spec/types/scalars.toml", () => {
+  for (const row of readTomlTables(specPath("types/scalars.toml"), "type")) {
+    const id = row.str("id");
+    const st = scalarTypeFromName(id);
+    assert.notEqual(st, undefined, `unknown type id ${id}`);
+    const want = row.has("btree_opclass") ? row.str("btree_opclass") : null;
+    assert.equal(btreeOpclass(st as ScalarType), want, `${id}: btree_opclass`);
+  }
+});
 
 test("scalar types match spec/types/scalars.toml", () => {
   const rows = readTomlTables(specPath("types/scalars.toml"), "type");

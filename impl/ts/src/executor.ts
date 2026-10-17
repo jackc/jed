@@ -22,6 +22,7 @@ import type {
   CreateType,
   AlterView,
   CreateView,
+  ConflictColumn,
   ConflictTarget,
   ColumnDef,
   Cte,
@@ -410,6 +411,8 @@ import {
   typeScalar,
   widthBytes,
   isFixedWidth,
+  ALL_SCALAR_TYPES,
+  btreeOpclass,
 } from "./types.ts";
 import { StmtRng } from "./seam.ts";
 import { ginJsonbIndexTerms, ginJsonbKeyTerm } from "./gin_jsonb.ts";
@@ -619,6 +622,7 @@ import {
   checkOptionViolation,
   columnRefPosition,
   renamedNames,
+  checkConflictOrdering,
   viewConflictTarget,
   viewsBottomUp,
   writeVerb,
@@ -12092,10 +12096,11 @@ export class Engine {
     vw: ViewWrite | null,
     ptypes: ParamTypes,
   ): ConflictPlan {
-    // `ON CONFLICT (cols) WHERE index_predicate` (upsert.md §2): the target's columns are checked
-    // first (42703), then the predicate resolves against the table like a partial-index predicate
-    // (subquery 0A000, `$N` 42P02, aggregate 42803, window 42P20; no type or mutability check —
-    // PostgreSQL's), and only then is the arbiter inferred (42P10).
+    // `ON CONFLICT (cols) WHERE index_predicate` (upsert.md §2): the target's elements are checked
+    // first, in order (ASC/DESC 42P10, column 42703, collation / operator class 42704), then the
+    // predicate resolves against the table like a partial-index predicate (subquery 0A000, `$N`
+    // 42P02, aggregate 42803, window 42P20; no type or mutability check — PostgreSQL's), and only
+    // then is the arbiter inferred (42P10).
     let indexPredicate: RExpr | null = null;
     if (oc.indexPredicate !== null) {
       if (vw !== null) {
@@ -12106,8 +12111,10 @@ export class Engine {
       }
       if (oc.target !== null && oc.target.kind === "columns") {
         for (const c of oc.target.columns) {
-          if (columnIndex(table, c) < 0)
-            throw engineError("undefined_column", "column does not exist: " + c);
+          checkConflictOrdering(c);
+          if (columnIndex(table, c.name) < 0)
+            throw engineError("undefined_column", "column does not exist: " + c.name);
+          checkConflictNames(this, c);
         }
       }
       rejectIndexPredicateStructure(oc.indexPredicate);
@@ -12121,10 +12128,9 @@ export class Engine {
         predPt,
       ).node;
     }
-    const arb =
-      vw === null
-        ? resolveArbiter(table, oc.target, indexPredicate, this)
-        : resolveArbiter(table, viewConflictTarget(vw, table, oc.target), null, this);
+    const target =
+      vw === null ? oc.target : viewConflictTarget(vw, table, oc.target, (c) => checkConflictNames(this, c));
+    const arb = resolveArbiter(this, table, target, indexPredicate);
     if (!oc.doUpdate) {
       return { arb, doUpdate: false, assignments: [], filter: null };
     }
@@ -12136,7 +12142,6 @@ export class Engine {
       );
     }
     const scope = Scope.onConflictExcluded(this, table, vw, alias);
-    const pkMembers = pkIndices(table);
     // SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once, exactly as
     // standalone UPDATE does (constraints.md §2): a constant/no default becomes a constant node
     // (free), an expression default is evaluated per updated row through the statement meter and
@@ -12159,20 +12164,13 @@ export class Engine {
         );
       }
       // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4): an
-      // ordinary assignment is 428C9 (before the PK 0A000); the DEFAULT form advances the owned
-      // sequence through its expression default.
+      // ordinary assignment is 428C9; the DEFAULT form advances the owned sequence through its
+      // expression default.
       if (table.columns[idx]!.identity === "always" && !a.isDefault) {
         throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
       }
-      // Assigning a PRIMARY KEY member in DO UPDATE remains deferred (0A000, upsert.md §5/§9):
-      // the standalone UPDATE re-keying has landed (§11 step 6), but extending it to the upsert
-      // conflict path is a separate follow-on.
-      if (pkMembers.includes(idx)) {
-        throw engineError(
-          "feature_not_supported",
-          "updating a primary key column is not supported",
-        );
-      }
+      // Assigning a PRIMARY KEY member re-keys the existing row (upsert.md §5), the standalone
+      // UPDATE rule carried onto the conflict path.
       for (const p of plans) {
         if (p.idx === idx) {
           throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
@@ -12404,11 +12402,17 @@ export class Engine {
     for (let i = 0; i < table.indexes.length; i++) if (table.indexes[i]!.unique) uniqIdx.push(i);
 
     const inserts: Row[] = [];
-    const updates: { key: Uint8Array; newRow: Row; oldRow: Row }[] = [];
-    // Arbiter keys this statement has already proposed (the §4 second-affect rule).
-    const proposedArb = new Set<string>();
+    // A planned update: the existing row's old storage key, its new one (they differ when the DO
+    // UPDATE assigned a primary-key column — a re-key, upsert.md §5), and its new and old values.
+    const updates: { key: Uint8Array; newKey: Uint8Array; newRow: Row; oldRow: Row }[] = [];
+    // The overlay (upsert.md §3): the arbiter keys of rows this statement inserted or updated (an
+    // update's NEW key — the §4 second-affect rule), and the storage keys of the committed rows it
+    // updated (their committed arbiter entry no longer describes them).
+    const affectedArb = new Set<string>();
+    const affectedStored = new Set<string>();
+    const pkAssigned = plan.doUpdate && plan.assignments.some((a) => pk.includes(a.idx));
     // For the no-target DO NOTHING path: the planned inserts' keys/prefixes (the arbiter path uses
-    // proposedArb instead).
+    // the overlay instead).
     const insPk = new Set<string>();
     const insPrefixes = uniqIdx.map(() => new Set<string>());
 
@@ -12473,21 +12477,25 @@ export class Engine {
         continue;
       }
       const akKey = ak.join(",");
-      if (proposedArb.has(akKey)) {
-        // A second proposed row with the same arbiter key (§4).
-        if (plan.doUpdate) {
-          throw engineError(
-            "cardinality_violation",
-            "ON CONFLICT DO UPDATE command cannot affect row a second time",
-          );
-        }
-        continue; // DO NOTHING → skip
-      }
-      proposedArb.add(akKey);
-      const existing = this.arbiterExisting(plan.arb, readStore, table, ak);
+      // §3 step 2: an UNAFFECTED committed row holding the arbiter key. A committed row this
+      // statement already updated is found, if at all, by its new key (step 3).
+      let existing = this.arbiterExisting(plan.arb, readStore, table, ak);
+      if (existing !== null && affectedStored.has(existing.key.join(","))) existing = null;
       if (existing === null) {
-        // No committed conflict on the arbiter → insert (a non-arbiter conflict is caught by the
-        // end-state validation below).
+        // §3 step 3: a row this statement already inserted or updated holds the key — it may not
+        // be affected again (§4).
+        if (affectedArb.has(akKey)) {
+          if (plan.doUpdate) {
+            throw engineError(
+              "cardinality_violation",
+              "ON CONFLICT DO UPDATE command cannot affect row a second time",
+            );
+          }
+          continue; // DO NOTHING → skip
+        }
+        // No conflict on the arbiter → insert (a non-arbiter conflict is caught by the end-state
+        // validation below).
+        affectedArb.add(akKey);
         viewCheck(row);
         inserts.push(row);
         continue;
@@ -12504,8 +12512,8 @@ export class Engine {
         ctes: EMPTY_CTE_CTX,
         exec: this,
       };
-      // An optional WHERE that is not TRUE skips the update (existing row unchanged, not returned)
-      // — but the arbiter key was already proposed, so a second row still trips §4.
+      // An optional WHERE that is not TRUE skips the update (existing row unchanged, not returned,
+      // and still unaffected — a later proposal may conflict with it again, upsert.md §4).
       if (plan.filter !== null && !evalFilter(plan.filter, combined, env, meter)) continue;
       const newRow = existing.row.slice();
       let nullCol: string | null = null;
@@ -12526,18 +12534,31 @@ export class Engine {
       if (nullCol !== null) throw this.notNullRowViolation(relation, nullCol, newRow);
       if (checks.length > 0) evalChecks(checks, relation, newRow, checkEnv(), meter);
       viewCheck(newRow);
-      updates.push({ key: existing.key, newRow, oldRow: existing.row });
+      // Assigning a key member re-keys the row (upsert.md §5).
+      const newKey = pkAssigned ? encodePkKey(colTypes, pk, colls, newRow) : existing.key;
+      const nak = this.arbiterProbeKey(plan.arb, store.columnTypes(), pk, colls, rindexes, newRow);
+      if (nak !== null) affectedArb.add(nak.join(","));
+      affectedStored.add(existing.key.join(","));
+      updates.push({ key: existing.key, newKey, newRow, oldRow: existing.row });
     }
 
-    // End-state validation (upsert.md §3), before any write. PRIMARY KEY: each insert's key must be
-    // free in the committed store and distinct from the other inserts — a collision is 23505 on
-    // <table>_pkey (a non-arbiter PK conflict).
-    if (pk.length > 0 && inserts.length > 0) {
+    // End-state validation (upsert.md §3), before any write. PRIMARY KEY: each insert's key — and,
+    // once an update re-keys its row, each updated row's new key — must be distinct from the others
+    // and free in the committed store, where an updated row's old key counts as vacated. A collision
+    // is 23505 on <table>_pkey (inserts checked first, then updates, each in phase-1 order). Without
+    // a re-key an update keeps its key, so only the inserts are probed.
+    const rekeyed = updates.some((u) => !bytesEq(u.key, u.newKey));
+    if (pk.length > 0 && (inserts.length > 0 || rekeyed)) {
+      const rewritten = new Set<string>(rekeyed ? updates.map((u) => u.key.join(",")) : []);
+      const keyed: { key: Uint8Array; row: Row }[] = inserts.map((row) => ({
+        key: encodePkKey(colTypes, pk, colls, row),
+        row,
+      }));
+      if (rekeyed) for (const u of updates) keyed.push({ key: u.newKey, row: u.newRow });
       const seen = new Set<string>();
-      for (const row of inserts) {
-        const k = encodePkKey(colTypes, pk, colls, row);
-        const ks = k.join(",");
-        if (readStore.get(k) !== undefined || seen.has(ks)) {
+      for (const { key, row } of keyed) {
+        const ks = key.join(",");
+        if ((readStore.get(key) !== undefined && !rewritten.has(ks)) || seen.has(ks)) {
           throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
             pkDetail(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
           );
@@ -12623,7 +12644,9 @@ export class Engine {
       }
     }
 
-    // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE.
+    // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE — a
+    // re-keyed row's references follow its key change as a re-keying UPDATE's do (constraints.md
+    // §6.5).
     const fkUpdates = updates.map((u) => ({ row: u.newRow, oldRow: u.oldRow }));
 
     // Meter the disposition-plan compression attempts (value_compress, cost.md §3) for the inserted
@@ -12634,7 +12657,7 @@ export class Engine {
       const kb = pk.length > 0 ? encodePkKey(colTypes, pk, colls, row) : placeholder;
       cunits += BigInt(store.writeCompressUnits(kb, row));
     }
-    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.key, u.newRow));
+    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.newKey, u.newRow));
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
@@ -12672,8 +12695,10 @@ export class Engine {
     );
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
+        // A re-keyed row moves EVERY entry (the storage-key suffix changed); otherwise only the
+        // entries whose indexed values changed move.
         const oldEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.key, u.oldRow);
-        const newEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.key, u.newRow);
+        const newEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.newKey, u.newRow);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0)
@@ -12681,7 +12706,12 @@ export class Engine {
       }
     }
     // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table; append each
-    // row's storage key to its precomputed entry prefixes), then replace the updated rows (entries moved).
+    // row's storage key to its precomputed entry prefixes), then replace the updated rows (entries
+    // moved). When an update re-keys its row (upsert.md §3/§5), every updated row's OLD key is
+    // vacated first and its new key placed after the inserts — the re-keying UPDATE's two-pass,
+    // since an insert or a moved row may land on a key another moved row vacates; each index
+    // likewise removes every moved entry before adding any.
+    if (rekeyed) for (const u of updates) store.remove(u.key);
     const indexAdds: Uint8Array[][] = table.indexes.map(() => []);
     for (let ri = 0; ri < inserts.length; ri++) {
       const row = inserts[ri]!;
@@ -12690,20 +12720,37 @@ export class Engine {
       for (let k = 0; k < table.indexes.length; k++) {
         for (const p of insertPrefixes[ri]![k]!) indexAdds[k]!.push(concatBytes([p, key]));
       }
-      if (!store.insert(key, row)) throw new Error("pre-validated INSERT key must be unique");
+      if (!store.insert(key, row)) {
+        // Reachable only under the writable-CTE read pin (writable-cte.md §7), as for INSERT:
+        // phase 1's end-state check caught every in-statement duplicate.
+        throw uniqueViolation(table.name, pkeyName(table.name));
+      }
     }
-    for (const u of updates) store.replace(u.key, u.newRow);
+    if (rekeyed) {
+      for (const u of updates) {
+        // A cross-sub-statement collision under the read pin (as above).
+        if (!store.insert(u.newKey, u.newRow)) throw uniqueViolation(table.name, pkeyName(table.name));
+      }
+    } else {
+      for (const u of updates) store.replace(u.key, u.newRow);
+    }
     for (let k = 0; k < table.indexes.length; k++) {
-      const istore = this.writeIndexStore(table.indexes[k]!.name);
+      const name = table.indexes[k]!.name;
+      const istore = this.writeIndexStore(name);
+      // An index-entry insert that found its key taken: under a re-key a cross-sub-statement
+      // collision (the read pin, as above); otherwise impossible.
+      const collision = (): EngineError =>
+        rekeyed
+          ? uniqueViolation(table.name, name)
+          : engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
+      if (rekeyed) for (const mv of indexMoves[k]!) for (const oldEk of mv.removals) istore.remove(oldEk);
       for (const ek of indexAdds[k]!) {
-        if (!istore.insert(ek, []))
-          throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
+        if (!istore.insert(ek, [])) throw collision();
       }
       for (const mv of indexMoves[k]!) {
-        for (const oldEk of mv.removals) istore.remove(oldEk);
+        if (!rekeyed) for (const oldEk of mv.removals) istore.remove(oldEk);
         for (const newEk of mv.insertions) {
-          if (!istore.insert(newEk, []))
-            throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
+          if (!istore.insert(newEk, [])) throw collision();
         }
       }
     }
@@ -28304,29 +28351,100 @@ export type ConflictPlan = {
   filter: RExpr | null;
 };
 
+// checkConflictNames is the decoration-name check on one ON CONFLICT inference element
+// (spec/design/upsert.md §2), after its column is found: the collation must be C or loaded, the
+// operator class one of jed's B-tree classes — each 42704.
+export function checkConflictNames(catalog: Engine, c: ConflictColumn): void {
+  if (c.collation !== null) resolveCollationName(catalog, c.collation);
+  if (c.opclass !== null && canonicalBtreeOpclass(c.opclass) === null) {
+    throw engineError(
+      "undefined_object",
+      `operator class "${c.opclass}" does not exist for access method "btree"`,
+    );
+  }
+}
+
+// canonicalBtreeOpclass resolves a B-tree operator-class name to the class jed keys with
+// (spec/design/upsert.md §2): a scalar's default class, a container's polymorphic class, or
+// varchar_ops — PostgreSQL's alias of text_ops (same family and input type). null names no jed class.
+export function canonicalBtreeOpclass(name: string): string | null {
+  if (name === "varchar_ops") return "text_ops";
+  if (name === "array_ops" || name === "range_ops" || name === "record_ops") return name;
+  for (const s of ALL_SCALAR_TYPES) {
+    if (btreeOpclass(s) === name) return name;
+  }
+  return null;
+}
+
+// columnBtreeOpclass is the B-tree operator class a column's keys use: its type's default class
+// (upsert.md §2).
+function columnBtreeOpclass(t: Type): string | null {
+  switch (t.kind) {
+    case "scalar":
+      return btreeOpclass(t.scalar);
+    case "array":
+      return "array_ops";
+    case "range":
+      return "range_ops";
+    case "composite":
+      return "record_ops";
+    case "record":
+      return null;
+  }
+}
+
+// conflictDecorationsHold reports whether a column's index keys satisfy an inference element's
+// decorations (upsert.md §2): a COLLATE needs a collatable column (text / text[]) frozen under that
+// collation, an operator class needs the column type's default class. Every jed key over a column
+// shares the column's collation and class, so this depends on the column alone.
+function conflictDecorationsHold(col: Column, c: ConflictColumn): boolean {
+  if (c.collation !== null) {
+    const t = col.type.kind === "array" ? col.type.elem : col.type;
+    const collatable = t.kind === "scalar" && t.scalar === "text";
+    if (!collatable || (col.collation ?? "C") !== c.collation) return false;
+  }
+  if (c.opclass !== null && canonicalBtreeOpclass(c.opclass) !== columnBtreeOpclass(col.type)) {
+    return false;
+  }
+  return true;
+}
+
 // resolveArbiter resolves an ON CONFLICT target into an Arbiter (spec/design/upsert.md §2): a
 // column list is matched as an order-independent SET against a unique index / the primary key (no
-// match → 42P10); ON CONSTRAINT name names a unique index or the synthesized <table>_pkey (miss →
-// 42704). A null target → null arbiter (legal only with DO NOTHING).
+// match → 42P10), each element first checked in order (ASC/DESC 42P10, column 42703, collation /
+// operator class 42704) and its decorations then narrowing the match; ON CONSTRAINT name names a
+// unique index or the synthesized <table>_pkey (miss → 42704). A null target → null arbiter
+// (legal only with DO NOTHING).
 //
 // indexPredicate is the resolved `WHERE index_predicate` of a column target (table-local columns):
 // with it, a PARTIAL unique index whose predicate it implies (indexes.md §9.1) is also inferable,
 // after the PK and every non-partial unique index (each in name byte order). Without it no partial
-// index is inferred, as in PostgreSQL.
+// index is inferred, as in PostgreSQL. The decorations narrow partial candidates too.
 export function resolveArbiter(
+  catalog: Engine,
   table: Table,
   target: ConflictTarget | null,
   indexPredicate: RExpr | null,
-  engine: Engine,
 ): Arbiter | null {
   if (target === null) return null;
   const pk = pkIndices(table);
   if (target.kind === "columns") {
     const want = new Set<number>();
+    let decorationsHold = true;
     for (const c of target.columns) {
-      const idx = columnIndex(table, c);
-      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + c);
+      checkConflictOrdering(c);
+      const idx = columnIndex(table, c.name);
+      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + c.name);
+      checkConflictNames(catalog, c);
+      if (!conflictDecorationsHold(table.columns[idx]!, c)) decorationsHold = false;
       want.add(idx);
+    }
+    // A decoration its column's keys do not satisfy rules out every index (upsert.md §2).
+    if (!decorationsHold) {
+      throw engineError(
+        "invalid_column_reference",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+      );
     }
     if (pk.length > 0 && sameIntSet(pk, want)) return { isPK: true };
     for (let i = 0; i < table.indexes.length; i++) {
@@ -28347,7 +28465,7 @@ export function resolveArbiter(
           def.predicate !== undefined &&
           cols !== null &&
           sameIntSet(cols, want) &&
-          partialIndexImplied(indexPredicate, table, 0, def, engine)
+          partialIndexImplied(indexPredicate, table, 0, def, catalog)
         )
           return { isPK: false, indexPos: i };
       }
