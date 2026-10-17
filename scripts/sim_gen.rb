@@ -406,20 +406,23 @@ module SimGen
     def usable?(db) = db == "main" || @attached[db] == :yes
 
     # Attach a file database (creating its file if it does not exist). Attaching takes the writer gate,
-    # so it waits for no writer; a fault may crash create at its temp-file or directory barrier.
+    # so it waits for no writer; a fault may crash create at its temp-file or directory barrier. In a
+    # service trace every running process attaches it, main's owner first (page-service.md §5.5), and a
+    # fault kills that owner like any other.
     def attach
-      return if @service || @writer || @p["attachments"].zero?
+      return if @writer || @p["attachments"].zero?
 
       name = "a#{@rng.range(1, @p['attachments'])}"
       faulted = @attached[name] != :yes && @rng.chance(@p.dig("faults", "attach_fault"))
       if faulted
         kind = @rng.chance(500) ? "power_loss survive=#{draw('survive')} tear=#{draw('tear')}" : "process_crash issue=#{draw('issue')}"
-        emit("fault #{kind} nth=#{@rng.range(1, 3)}")
+        line = "fault #{kind} nth=#{@rng.range(1, 3)}"
+        emit(line)
       end
       emit("attach #{name}")
       was = @attached[name]
       if faulted
-        kill_sessions
+        @service ? fault_kills(line, nil) : kill_sessions
         @attached[name] = :maybe
       else
         @attached[name] = :yes

@@ -624,10 +624,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     timeout (`25P03`); read-only connections only on request. Proven by the `service_*` scenarios
     in every pairing and by `conformance:service` now running every record, writes included, on a
     page client; `bench:page_service` adds `client_commit`.
-  - [ ] **File attachments under the service.** A file attachment as owner or client of the
-    attached file (today an owner-only non-serving owner: another process holding it means `55006`),
-    taking every writer gate, local or remote, in
-    real-path order with `lock_timeout_ms` as the backstop (page-service.md §5.5).
+  - [x] **File attachments under the service.** ✅ **landed** (Rust, Go, TS; spec/pageservice/
+    README.md §6.6): a file attachment under `locking = auto` is elected owner (serving it) or page
+    client of its file, through an inner handle with its own role, handoff, reader registry, and
+    resolution window, taking main's ownership preference and owner limits; read begins pin it through
+    that role; a writable transaction takes every writer gate, local or remote, in real-path byte
+    order with `lock_timeout_ms` as the backstop, releasing in reverse on failure; attach/detach wait
+    for no other process. No wire or format change. Proven by the `attachment_service`,
+    `attachment_gate_order`, and `attachment_read_only` process scenarios in every pairing and by the
+    `service-attachments` simulation profile (simulation-testing.md §14 S11).
   - [x] **Phase 4 — handoff.** ✅ **landed.** Promotion, ownership preference and yield, graceful close, the grace
     periods; the process-corpus rewrite; simulation testing of owner + clients; retire shared mode,
     the `shared` and test-only `service` values, and locking.md §4–§5; a new bundle marker.

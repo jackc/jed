@@ -33,14 +33,17 @@ import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl, registerDirectorySync } from "./persist.ts";
 import {
+  type AttachSource,
   buildInMemory,
   Database,
+  type OpenedAttachment,
   registerFileAttachOpener,
   registerFileCompactor,
+  type ServiceHandoffHost,
 } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
 import { canonicalOpenPath, FileCoordinator, resolvedLocking } from "./coordinator.ts";
-import { type Ownership, ServiceHandoff } from "./pageservice/handoff.ts";
+import { type HandoffHosts, type Ownership, ServiceHandoff } from "./pageservice/handoff.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -275,11 +278,17 @@ export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): 
 // The file opens through main's file host (null is the OS), so the simulated filesystem serves
 // attachments too.
 //
-// A file attachment is a non-serving owner of its file until attachments join the page service
-// (page-service.md §5.5): another process holding the file makes the attach wait, then fail 55006.
-registerFileAttachOpener((source, readOnly, files, environment, relaxed) => {
+// Under `locking = "auto"` a file attachment joins the page service (page-service.md §5.5): it is
+// elected owner or page client of the attached file exactly as an open is, through an inner handle of
+// its own (openServiceAttachment). Under "exclusive" it is a non-serving owner of its file: another
+// process holding the file makes the attach wait, then fail 55006. Either way it follows the handle's
+// synchronous setting (validated-cow.md §4).
+registerFileAttachOpener((source, readOnly, files, environment, relaxed, mainHandoff) => {
   const path = source.path!;
-  const locking = resolvedLocking(source.locking) === "none" ? "none" : "exclusive";
+  const locking = resolvedLocking(source.locking);
+  if (locking === "auto") {
+    return openServiceAttachment(path, source, readOnly, files, environment, relaxed, mainHandoff);
+  }
   const coordinator = FileCoordinator.open(path, locking, source.fileLockTimeoutMs);
   try {
     // A file attachment follows the handle's synchronous setting (validated-cow.md §4).
@@ -289,12 +298,71 @@ registerFileAttachOpener((source, readOnly, files, environment, relaxed) => {
       environment,
       synchronous: relaxed ? "off" : "on",
     });
-    return { engine, coordinator };
+    return { kind: "file", engine, coordinator };
   } catch (error) {
     coordinator?.close();
     throw error;
   }
 });
+
+// openServiceAttachment elects this process owner or page client of the attachment file at path
+// (page-service.md §5.5; spec/pageservice/README.md §6.6), through the handle's own hosts: main's
+// handoff's lock, file, and client hosts and background flag when main is under the page service (the
+// simulator's in a simulation), the OS lock host and main's file host otherwise. The inner handle takes
+// main's ownership preference and owner limits when main is under the page service, the defaults
+// otherwise.
+function openServiceAttachment(
+  path: string,
+  source: AttachSource,
+  readOnly: boolean,
+  files: FileHost | null,
+  environment: Environment,
+  relaxed: boolean,
+  mainHandoff: ServiceHandoffHost | null,
+): OpenedAttachment {
+  const main = mainHandoff instanceof ServiceHandoff ? mainHandoff : null;
+  const hosts: HandoffHosts = main !== null ? main.hosts() : { files };
+  const hostFiles = hosts.files ?? null;
+  const real = hostFiles === null ? canonicalOpenPath(path) : hostFiles.realPath(path);
+  const options: OpenOptions = {
+    readOnly,
+    locking: "auto",
+    fileLockTimeoutMs: source.fileLockTimeoutMs,
+    environment,
+    maxStorageBytes: source.maxStorageBytes,
+    // The attachment follows the handle's synchronous setting (validated-cow.md §4).
+    synchronous: relaxed ? "off" : "on",
+  };
+  if (main !== null) {
+    // A handle under the page service lends its ownership preference and owner limits to its
+    // attachments (README §6.6).
+    options.ownership = main.ownership;
+    options.idleInTransactionTimeoutMs = main.limits.idleInTransactionTimeoutMs;
+    options.idleSessionTimeoutMs = main.limits.idleSessionTimeoutMs;
+    options.yieldGraceMs = main.yieldGraceMs;
+    options.shutdownGraceMs = main.shutdownGraceMs;
+    options.maxConnections = main.limits.maxConnections;
+  }
+  const adoptClient = hosts.adoptClient ?? null;
+  const handoff = new ServiceHandoff(
+    real,
+    options,
+    readOnly,
+    source.fileLockTimeoutMs,
+    {},
+    environment,
+    () => {
+      const engine = openVia(hostFiles ?? osFiles, real, { ...options, locking: "none" });
+      // An owner's storage reaches the same file and spill hosts a client's does.
+      engine.fileHost = hostFiles;
+      adoptClient?.(engine);
+      return engine;
+    },
+    hosts,
+  );
+  const service = openServiceWith(handoff);
+  return { kind: "service", service, realPath: real };
+}
 
 // compactFile rewrites the file database at path as the from-scratch image of snap at txid and reopens
 // it (host compaction, spec/design/api.md §2.6). The caller holds the writer gate with the reader

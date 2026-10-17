@@ -846,7 +846,18 @@ export type Attachment = {
   readOnly: boolean; // a read-only attachment rejects every write (DML + DDL) with 25006 (§4)
   storage: Engine; // the block store (file or in-memory) + pager + page accounting
   coordinator: FileCoordinatorHost | null;
+  // svc is set for a file attachment under the page service (spec/design/page-service.md §5.5): its
+  // own owner or page-client role over the attached file, through an inner handle whose storage is
+  // `storage`. Its commit runs through that role. null for every other attachment.
+  svc: ServiceAttachmentHandle | null;
 };
+
+// ServiceAttachmentHandle is a file attachment under the page service as the executor sees it
+// (shared.ts implements it): commitServiceAttachment commits the attachment's working snapshot through
+// its inner handle, under the gate the writer holds, and returns the attachment's committed snapshot.
+export interface ServiceAttachmentHandle {
+  commitServiceAttachment(snap: Snapshot, stagesRows: boolean): Snapshot;
+}
 
 // AttachmentCore is the minimal view of the shared core the executor needs for attachment routing
 // (spec/design/attached-databases.md §5): the core-owned registry, the reader-liveness watermark, and

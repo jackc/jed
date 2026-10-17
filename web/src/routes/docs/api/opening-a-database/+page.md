@@ -84,8 +84,12 @@ that support it (Unix local files) and behaves like `exclusive` elsewhere (Windo
 safety. `file_lock_timeout_ms` / `FileLockTimeoutMs` / `fileLockTimeoutMs` bounds how long an open
 waits to own the file or reach its owner (default 5 seconds); the separate session
 `lock_timeout_ms` / `LockTimeoutMs` / `lockTimeoutMs` bounds writer waiting and reports `55P03`.
-An attached file is always owned exclusively by the handle that attaches it, for now: attaching a
-file another process has open waits, then fails with `55006`.
+An attached file uses the page service too: the first process to attach (or open) it owns and serves
+it, and any other process that attaches it reads and commits through that owner, taking over when it
+leaves. A write transaction takes the writer lock of the main database and of every read-write
+attached file, in the same order in every process, so writers in processes that share several files
+wait in line rather than deadlock; each wait is bounded by `lock_timeout_ms` (`55P03`). One
+transaction still writes at most one file-backed database.
 
 Node uses a small first-party native helper solely for OS file locks because Node has no standard
 `flock`/`LockFileEx` API. SQL and storage still run in the independent TypeScript engine; browser/OPFS

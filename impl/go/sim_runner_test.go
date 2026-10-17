@@ -580,6 +580,9 @@ func (r *simRunner) open() error {
 	if err := r.openProc(0); err != nil {
 		return err
 	}
+	if r.service {
+		return nil // openProc re-attached them
+	}
 	for _, name := range r.attachedNames() {
 		d := r.dbs[name]
 		if r.fs.files[d.file] == nil {
@@ -592,9 +595,15 @@ func (r *simRunner) open() error {
 	return nil
 }
 
-// attach attaches the existing file of attachment name read-write to the current process.
+// attach attaches the existing file of attachment name read-write to the current process: under the
+// page service in a service trace (owner or page client of the file, README.md §6.6), uncoordinated
+// otherwise.
 func (r *simRunner) attach(name string) error {
-	return r.db.Attach(name, AttachFileWithOptions(r.dbs[name].file, AttachFileOptions{Locking: LockingNone}), false)
+	locking := LockingNone
+	if r.service {
+		locking = LockingAuto
+	}
+	return r.db.Attach(name, AttachFileWithOptions(r.dbs[name].file, AttachFileOptions{Locking: locking}), false)
 }
 
 // openProc starts process pid. A service trace elects it through the simulated lock host and
@@ -612,6 +621,20 @@ func (r *simRunner) openProc(pid int) error {
 	}
 	r.procs[pid] = &simProc{pid: pid, db: db}
 	r.cur, r.db = pid, db
+	if r.service {
+		// Every process attaches every tracked attachment whose file exists: the owner of the file, or
+		// a page client of whichever process owns it.
+		for _, name := range r.attachedNames() {
+			if r.fs.files[r.dbs[name].file] == nil {
+				continue
+			}
+			if err := r.attach(name); err != nil {
+				_ = r.closeProc(pid)
+				return fmt.Errorf("re-attach %s: %w", name, err)
+			}
+		}
+		r.net.settle()
+	}
 	return nil
 }
 
@@ -655,14 +678,30 @@ func (r *simRunner) openServiceProc(pid int) (*Database, error) {
 	return db, nil
 }
 
-// ownerPid is the running process that owns the database under the page service, or -1.
-func (r *simRunner) ownerPid() int {
+// ownerPid is the running process that owns the main database under the page service, or -1.
+func (r *simRunner) ownerPid() int { return r.ownerPidOf(r.main()) }
+
+// ownerPidOf is the running process that owns database d under the page service, or -1.
+func (r *simRunner) ownerPidOf(d *simDB) int {
 	for _, pid := range r.livePids() {
-		if r.procs[pid].db.core.pageOwner() != nil {
+		if c := simServiceCore(r.procs[pid].db, d); c != nil && c.pageOwner() != nil {
 			return pid
 		}
 	}
 	return -1
+}
+
+// simServiceCore is the core whose page-service role serves database d in db: the handle's own for
+// main, an attachment's inner handle's (README.md §6.6), or nil when d is not attached under the
+// service.
+func simServiceCore(db *Database, d *simDB) *sharedCore {
+	if d.name == "main" {
+		return db.core
+	}
+	if att := db.core.attachment(d.name); att != nil && att.svc != nil {
+		return att.svc.core
+	}
+	return nil
 }
 
 // procBusy reports whether pid's presence probe would block: it takes the process's own writer gate,
@@ -951,16 +990,38 @@ func (r *simRunner) step(i int) (cont bool) {
 	// In a service trace any other fault kills the owner, the only process that touches the file,
 	// whichever process's step drove its I/O; the others keep running over the same kernel state.
 	if r.service && len(r.procs) > 1 {
-		pid := r.ownerPid()
-		if pid < 0 {
-			pid = r.cur
+		// Every owner — of main or of an attachment — is a process that may have touched a file after
+		// the fault fired, so each dies; with attachments owned elsewhere that may be more than one.
+		pids := r.ownerPids()
+		if len(pids) == 0 {
+			pids = []int{r.cur}
 		}
-		r.dropProc(pid)
-		r.fs.processDeath()
-		r.emit(`{"i":%d,"op":"killed","pid":%d,"fired":%q}`, i, pid, fired)
-		return true
+		if len(pids) < len(r.procs) {
+			for _, pid := range pids {
+				r.dropProc(pid)
+			}
+			r.fs.processDeath()
+			for _, pid := range pids {
+				r.emit(`{"i":%d,"op":"killed","pid":%d,"fired":%q}`, i, pid, fired)
+			}
+			return true
+		}
 	}
 	return r.recover(i, fired)
+}
+
+// ownerPids lists the running processes that own main or an attachment under the page service.
+func (r *simRunner) ownerPids() []int {
+	var pids []int
+	for _, pid := range r.livePids() {
+		for _, d := range r.order() {
+			if c := simServiceCore(r.procs[pid].db, d); c != nil && c.pageOwner() != nil {
+				pids = append(pids, pid)
+				break
+			}
+		}
+	}
+	return pids
 }
 
 // dbVersion is the version of database d the current process has published.
@@ -968,7 +1029,24 @@ func (r *simRunner) dbVersion(d *simDB) uint64 {
 	if d.name == "main" {
 		return r.db.Version()
 	}
-	if snap := r.db.core.roots.Load().attached[d.name]; snap != nil {
+	return simAttachedVersion(r.db, d)
+}
+
+// simSessionVersion is the version of attachment name a session reads (its pinned or base root), or 0.
+func simSessionVersion(s *Session, name string) uint64 {
+	if snap := s.engine.attachedCommitted[name]; snap != nil {
+		return snap.txid
+	}
+	return 0
+}
+
+// simAttachedVersion is the version of attachment d that db has adopted: an attachment under the page
+// service reports its inner handle's.
+func simAttachedVersion(db *Database, d *simDB) uint64 {
+	if db.core.attachment(d.name) == nil {
+		return 0
+	}
+	if snap := db.core.attachedRoot(d.name); snap != nil {
 		return snap.txid
 	}
 	return 0
@@ -1034,11 +1112,22 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 		if !r.observe(i, "session "+st.sid, s.Version(), d, ok) {
 			return
 		}
+		for _, name := range r.attachedNames() {
+			a := r.dbs[name]
+			v := simSessionVersion(s, name)
+			if v == 0 {
+				continue
+			}
+			dg, ok := r.digest(s, a)
+			if !r.observeDB(i, a, "session "+st.sid, v, dg, ok) {
+				return
+			}
+		}
 	}
 	// A session pins every database's committed root when it opens.
 	pins := map[string]uint64{"main": s.Version()}
 	for _, name := range r.attachedNames() {
-		if v := r.dbVersion(r.dbs[name]); v != 0 {
+		if v := simSessionVersion(s, name); v != 0 {
 			pins[name] = v
 		}
 	}
@@ -1264,6 +1353,9 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			return
 		}
 		for k, d := range dbs {
+			if _, pinned := ss.pins[d.name]; !pinned {
+				continue
+			}
 			if now := r.dbVersion(d); now != d.version {
 				r.fail(i, "a failed commit published version %d of %s (was %d)", now, d.name, d.version)
 				return
@@ -1290,6 +1382,9 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 	r.emit(`{"i":%d,"op":"commit","sid":%q,"version":%d%s%s}`, i, st.sid, versions["main"], r.versionsJSON(versions), role)
 	quiet := r.quiet()
 	for k, d := range dbs {
+		if _, pinned := ss.pins[d.name]; !pinned {
+			continue // not attached in this session's process when it opened: it cannot have written it
+		}
 		base, now, in := d.version, versions[d.name], before[k]
 		switch now {
 		case base:
@@ -1308,6 +1403,11 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 				// back; the acknowledged commit is checked by the recovery that follows.
 				published, ok = in.digest, true
 			}
+			if !ok && r.service && !r.fs.dead && simCode(r.digestErr) == "08006" {
+				// An armed disconnect landed in this read-back's own frames: the read fails 08006, as
+				// any read open across a lost connection does; a fresh read re-elects and reads again.
+				published, ok = r.committedDigest(d)
+			}
 			if !ok && r.service && r.fs.dead {
 				// The owner died later in this step (its maintenance commit hit the fault), so nothing can be
 				// read back through it; the acknowledged commit is checked by the recovery that follows.
@@ -1321,14 +1421,14 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			d.addHistory(now, in.digest)
 			d.version, d.lastDigest = now, in.digest
 			d.maxAttempted = max(d.maxAttempted, now)
-			if !r.relaxed || r.db.core.pageClient() != nil {
+			if c := simServiceCore(r.db, d); !r.relaxed || (c != nil && c.pageClient() != nil) {
 				d.floor = now // acknowledged under synchronous = on, or a page client's commit (§8.2)
 			}
 			r.checkGrowth(i, d, quiet)
 			if r.violation != "" {
 				return
 			}
-			if r.service && d.name == "main" {
+			if r.service {
 				r.serviceCommitted(i, d, base, now, in.digest)
 				if r.violation != "" {
 					return
@@ -1353,7 +1453,7 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 // follow a client's commit with a maintenance commit — the unchanged snapshot at the next versions —
 // which joins the history with the same contents.
 func (r *simRunner) serviceCommitted(i int, d *simDB, base, now uint64, digest string) {
-	if r.db.core.pageClient() == nil {
+	if c := simServiceCore(r.db, d); c == nil || c.pageClient() == nil {
 		return
 	}
 	image := r.image(d)
@@ -1378,11 +1478,14 @@ func (r *simRunner) serviceCommitted(i int, d *simDB, base, now uint64, digest s
 		d.maxAttempted = max(d.maxAttempted, now+1)
 		return
 	}
-	owner := r.ownerPid()
+	owner := r.ownerPidOf(d)
 	if owner < 0 {
 		return
 	}
 	ov := r.procs[owner].db.Version()
+	if d.name != "main" {
+		ov = simAttachedVersion(r.procs[owner].db, d)
+	}
 	if ov <= now {
 		return
 	}
@@ -1393,7 +1496,11 @@ func (r *simRunner) serviceCommitted(i int, d *simDB, base, now uint64, digest s
 	if !r.relaxed {
 		d.floor = ov // the maintenance commit is an owner commit: batched under synchronous = off
 	}
-	r.emit(`{"i":%d,"op":"maintenance","version":%d}`, i, ov)
+	if d.name == "main" {
+		r.emit(`{"i":%d,"op":"maintenance","version":%d}`, i, ov)
+	} else {
+		r.emit(`{"i":%d,"op":"maintenance","db":%q,"version":%d}`, i, d.name, ov)
+	}
 }
 
 // simFreeList reads the free list the meta slot holding version v persists, from a file image.
@@ -1420,7 +1527,7 @@ func simFreeList(image []byte, ps uint32, v uint64) ([]uint32, bool) {
 func (r *simRunner) engineFlushed(d *simDB) bool {
 	db := r.db
 	if r.service {
-		owner := r.ownerPid()
+		owner := r.ownerPidOf(d)
 		if owner < 0 {
 			return false
 		}
@@ -1722,12 +1829,8 @@ func (r *simRunner) stepCompact(i int, name string) {
 // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
 // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
 func (r *simRunner) stepAttach(i int, name string) {
-	if r.service {
-		r.fail(i, "attach is single-process only")
-		return
-	}
 	d := r.dbs[name]
-	if d != nil && r.dbVersion(d) != 0 {
+	if d != nil && r.dbVersion(d) != 0 && (!r.service || r.attachedInAll(name)) {
 		r.emit(`{"i":%d,"op":"attach","db":%q,"version":%d}`, i, name, d.version)
 		return
 	}
@@ -1748,7 +1851,11 @@ func (r *simRunner) stepAttach(i int, name string) {
 		_ = e.Close()
 		d.floor = 1 // create returned: the file and its directory entry are durable
 	}
-	if err := r.attach(name); err != nil {
+	if r.service {
+		if !r.attachEverywhere(i, name) {
+			return
+		}
+	} else if err := r.attach(name); err != nil {
 		r.attachFailed(i, name, err)
 		return
 	}
@@ -1759,6 +1866,55 @@ func (r *simRunner) stepAttach(i int, name string) {
 	}
 	r.observeGrowth(d)
 	r.emit(`{"i":%d,"op":"attach","db":%q,"version":%d}`, i, name, v)
+}
+
+// attachEverywhere attaches file database name in every running process of a service trace (README.md
+// §6.6): main's owner first — so it owns the file too, and one process owns every database — then the
+// others in process order, each a page client of it. With no owner of main, the lowest process's read
+// begin first re-elects it. A process that already has it attached is skipped. It leaves the attaching
+// owner as the step's process.
+func (r *simRunner) attachEverywhere(i int, name string) bool {
+	first := r.ownerPid()
+	if first < 0 {
+		first = r.livePids()[0]
+		r.selectProc(first)
+		dg, ok := r.committedDigest(r.main())
+		if !r.observe(i, fmt.Sprintf("attaching p%d", first), r.db.Version(), dg, ok) {
+			return false
+		}
+		r.net.settle()
+	}
+	order := []int{first}
+	for _, pid := range r.livePids() {
+		if pid != first {
+			order = append(order, pid)
+		}
+	}
+	for _, pid := range order {
+		r.selectProc(pid)
+		if r.db.core.attachment(name) != nil {
+			continue
+		}
+		err := r.attach(name)
+		r.net.settle()
+		if err != nil {
+			r.selectProc(first)
+			r.attachFailed(i, name, err)
+			return false
+		}
+	}
+	r.selectProc(first)
+	return true
+}
+
+// attachedInAll reports whether every running process has attachment name attached.
+func (r *simRunner) attachedInAll(name string) bool {
+	for _, pid := range r.livePids() {
+		if r.procs[pid].db.core.attachment(name) == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *simRunner) attachFailed(i int, name string, err error) {
@@ -1783,11 +1939,16 @@ func (r *simRunner) stepCheck(i int) {
 	var entries []string
 	var mainLine string
 	for _, d := range r.order() {
+		if r.service && d.name != "main" && r.dbVersion(d) == 0 {
+			// This process is not attached to it: a faulted attach killed the process attaching it
+			// before this one did; the next attach step repairs that.
+			continue
+		}
 		v, dg, ok := r.committedView(d)
 		switch {
-		case r.service && d.name == "main":
+		case r.service:
 			// Another process may have died leaving a newer complete generation this one now adopts.
-			if !r.observe(i, "check", v, dg, ok) {
+			if !r.observeDB(i, d, "check", v, dg, ok) {
 				return
 			}
 		case !ok || v != d.version || dg != d.lastDigest:
@@ -1839,15 +2000,21 @@ func (r *simRunner) stepReopen(i int) bool {
 	var mainV uint64
 	var mainD string
 	for _, d := range r.order() {
+		if r.dbVersion(d) == 0 && d.name != "main" && r.service && d.floor == 0 && r.fs.files[d.file] == nil {
+			// A faulted attach killed its owner before create returned (S8 kills only the owner, so no
+			// recovery ran to forget it): the file may legitimately be gone.
+			delete(r.dbs, d.name)
+			continue
+		}
 		if r.dbVersion(d) == 0 {
 			r.fail(i, "a clean reopen lost attachment %s", d.name)
 			return false
 		}
 		v := r.dbVersion(d)
 		dg, ok := r.committedDigest(d)
-		if r.service && d.name == "main" {
+		if r.service {
 			// A process killed mid-commit may have left a complete generation no survivor began on yet.
-			if !r.observe(i, "reopened p0", v, dg, ok) {
+			if !r.observeDB(i, d, "reopened p0", v, dg, ok) {
 				return false
 			}
 		} else if v != d.version || !ok || dg != d.lastDigest {
@@ -2069,10 +2236,15 @@ func (r *simRunner) closeProc(pid int) error {
 // dropProc abandons process pid as a crash does: its sessions and Database vanish without closing,
 // and the kernel releases its locks.
 func (r *simRunner) dropProc(pid int) {
-	if p := r.procs[pid]; r.relaxed && p != nil && p.db != nil && p.db.core.pageOwner() != nil {
+	if p := r.procs[pid]; r.relaxed && p != nil && p.db != nil {
 		// A dead owner's batch may be lost back to the floor (validated-cow.md §4): the simulated
-		// process crash may drop writes of the step that acknowledged a commit.
-		r.main().ownerLost = true
+		// process crash may drop writes of the step that acknowledged a commit. Each database it owned
+		// (main or an attachment under the service) has its own batch.
+		for _, d := range r.dbs {
+			if c := simServiceCore(p.db, d); c != nil && c.pageOwner() != nil {
+				d.ownerLost = true
+			}
+		}
 	}
 	for _, sid := range r.sessionsOf(pid) {
 		delete(r.sessions, sid)
@@ -2096,16 +2268,24 @@ func (r *simRunner) dropProc(pid int) {
 // another process adopts — so the version may be newer than the last this runner saw, but never
 // older, and its contents must be a generation the history records.
 func (r *simRunner) observe(i int, who string, v uint64, dg string, ok bool) bool {
-	m := r.main()
+	return r.observeDB(i, r.main(), who, v, dg, ok)
+}
+
+// observeDB is observe for database d: under the page service every attachment is shared too.
+func (r *simRunner) observeDB(i int, m *simDB, who string, v uint64, dg string, ok bool) bool {
+	what := ""
+	if m.name != "main" {
+		what = " of " + m.name
+	}
 	switch {
 	case !ok:
-		r.fail(i, "%s: version %d is unreadable", who, v)
+		r.fail(i, "%s: version %d%s is unreadable", who, v, what)
 	case v < m.version && (!m.ownerLost || v < m.floor):
-		r.fail(i, "%s sees version %d after version %d was published", who, v, m.version)
+		r.fail(i, "%s sees version %d%s after version %d was published", who, v, what, m.version)
 	case v > m.maxAttempted:
-		r.fail(i, "%s sees version %d, which was never attempted (latest attempted %d)", who, v, m.maxAttempted)
+		r.fail(i, "%s sees version %d%s, which was never attempted (latest attempted %d)", who, v, what, m.maxAttempted)
 	case !m.history[v][dg]:
-		r.fail(i, "%s sees version %d with contents (digest %s) no transaction produced", who, v, dg)
+		r.fail(i, "%s sees version %d%s with contents (digest %s) no transaction produced", who, v, what, dg)
 	}
 	if r.violation != "" {
 		return false
@@ -2145,7 +2325,8 @@ func (r *simRunner) stepPid(st simStep) (int, bool) {
 // stepSpawn starts a process (S5) and checks what it sees.
 func (r *simRunner) stepSpawn(i int, pid int) {
 	if r.procs[pid] != nil {
-		r.fail(i, "spawn p%d: already running", pid)
+		// The generator cannot know a fault killed the owner and that p0 restarted since.
+		r.emit(`{"i":%d,"op":"spawn","pid":%d,"skip":true}`, i, pid)
 		return
 	}
 	if err := r.openProc(pid); err != nil {
@@ -2162,7 +2343,20 @@ func (r *simRunner) stepSpawn(i int, pid int) {
 	if !r.observe(i, fmt.Sprintf("spawned p%d", pid), v, dg, ok) {
 		return
 	}
-	r.emit(`{"i":%d,"op":"spawn","pid":%d,"version":%d}`, i, pid, v)
+	versions := map[string]uint64{}
+	for _, name := range r.attachedNames() {
+		a := r.dbs[name]
+		av := r.dbVersion(a)
+		if av == 0 {
+			continue
+		}
+		adg, aok := r.committedDigest(a)
+		if !r.observeDB(i, a, fmt.Sprintf("spawned p%d", pid), r.dbVersion(a), adg, aok) {
+			return
+		}
+		versions[name] = r.dbVersion(a)
+	}
+	r.emit(`{"i":%d,"op":"spawn","pid":%d,"version":%d%s}`, i, pid, v, r.versionsJSON(versions))
 }
 
 // simImageHash folds the logical image — the pages below the high-water — into FNV-1a 64 (§8.4).

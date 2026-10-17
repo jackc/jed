@@ -212,7 +212,10 @@ The existing model generalizes with one genuinely new constraint.
   reads each attachment's pre-statement state.
 - **Single writer, unchanged.** One write lock per `Database` handle (transactions.md §10) still
   serializes all writers; there are still no write-write conflicts and no retry loop. Cross-attachment
-  writes in one transaction are serialized like any other write.
+  writes in one transaction are serialized like any other write. Across processes, a file attachment
+  under `locking = auto` is owner or page client of its file under the page service, and a writable
+  transaction also takes the writer gate of main and of every read-write such attachment, in
+  real-path order ([page-service.md](page-service.md) §5.5, [spec/pageservice/README.md](../pageservice/README.md) §6.6).
 - **The one new rule — at most one *durable* (file-backed) database written per transaction.** Making
   **N file** databases commit **atomically** across a crash is the genuinely hard problem (a
   super-journal / two-phase protocol with crash-recovery — SQLite's territory), and it is **deferred**

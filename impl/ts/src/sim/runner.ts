@@ -392,8 +392,34 @@ type CoreView = {
   client: PageClient | null;
   attached: Map<string, { txid: bigint }>;
   storage: Engine;
-  attachments: Map<string, { storage: Engine }>;
+  // svc is set on a file attachment under the page service: its inner handle's core (README.md §6.6).
+  attachments: Map<string, { storage: Engine; svc: { core: CoreView } | null }>;
+  attachedRoot(name: string): { txid: bigint } | undefined;
 };
+
+// serviceCoreOf is the core whose page-service role serves database d in db: the handle's own for
+// main, an attachment's inner handle's (README.md §6.6), or null when d is not attached under the
+// service.
+function serviceCoreOf(db: Database, d: SimDB): CoreView | null {
+  const core = coreOf(db);
+  if (d.name === "main") return core;
+  return core.attachments.get(d.name)?.svc?.core ?? null;
+}
+
+// attachedVersionOf is the version of attachment d that db has adopted (0 when not attached): an
+// attachment under the page service reports its inner handle's.
+function attachedVersionOf(db: Database, d: SimDB): bigint {
+  const core = coreOf(db);
+  if (!core.attachments.has(d.name)) return 0n;
+  return core.attachedRoot(d.name)?.txid ?? 0n;
+}
+
+// sessionVersionOf is the version of attachment name a session reads (its pinned or base root), or 0.
+function sessionVersionOf(s: Session, name: string): bigint {
+  const engine = (s as unknown as { engine: { attachedCommitted: Map<string, { txid: bigint }> } })
+    .engine;
+  return engine.attachedCommitted.get(name)?.txid ?? 0n;
+}
 
 function coreOf(db: Database): CoreView {
   return (db as unknown as { core: CoreView }).core;
@@ -570,6 +596,7 @@ export class SimRunner {
   // re-attaches every tracked attachment whose file exists.
   private open(): void {
     this.openProc(0);
+    if (this.service) return; // openProc re-attached them
     for (const name of this.attachedNames()) {
       const d = this.dbs.get(name)!;
       if (!this.fs.files.has(d.file)) continue; // the caller decides whether losing it was allowed
@@ -582,9 +609,12 @@ export class SimRunner {
     }
   }
 
-  // attach attaches the existing file of attachment name read-write to the current process.
+  // attach attaches the existing file of attachment name read-write to the current process: under the
+  // page service in a service trace (owner or page client of the file, README.md §6.6), uncoordinated
+  // otherwise.
   private attach(name: string): void {
-    this.database.attach(name, attachFile(this.dbs.get(name)!.file, { locking: "none" }), false);
+    const locking = this.service ? "auto" : "none";
+    this.database.attach(name, attachFile(this.dbs.get(name)!.file, { locking }), false);
   }
 
   // openProc starts process pid. A service trace elects it through the simulated lock host and
@@ -607,6 +637,25 @@ export class SimRunner {
     this.procs.set(pid, { pid, db, host });
     this.cur = pid;
     this.db = db;
+    if (this.service) {
+      // Every process attaches every tracked attachment whose file exists: the owner of the file, or a
+      // page client of whichever process owns it.
+      for (const name of this.attachedNames()) {
+        if (!this.fs.files.has(this.dbs.get(name)!.file)) continue;
+        try {
+          this.attach(name);
+        } catch (e) {
+          try {
+            this.closeProc(pid);
+          } catch {
+            // The re-attach failure is the one reported.
+          }
+          if (e instanceof EngineError) e.message = `re-attach ${name}: ${e.message}`;
+          throw e;
+        }
+      }
+      this.net.pump();
+    }
   }
 
   // openServiceProc opens process pid under the page service (S8): its own lock host over the shared
@@ -620,6 +669,8 @@ export class SimRunner {
         idleInTransactionTimeoutMs: 0,
         idleSessionTimeoutMs: 0,
         shutdownGraceMs: SIM_SERVICE_GRACE_MS,
+        // The handle's setting, which its file attachments follow whatever role it holds.
+        synchronous: this.relaxed ? "off" : "on",
       },
       false,
       SIM_FILE_LOCK_TIMEOUT_MS,
@@ -648,12 +699,34 @@ export class SimRunner {
     return db;
   }
 
-  // ownerPid is the running process that owns the database under the page service, or -1.
+  // ownerPid is the running process that owns the main database under the page service, or -1.
   private ownerPid(): number {
+    return this.ownerPidOf(this.main());
+  }
+
+  // ownerPidOf is the running process that owns database d under the page service, or -1.
+  private ownerPidOf(d: SimDB): number {
     for (const pid of this.livePids()) {
-      if (coreOf(this.procs.get(pid)!.db).service !== null) return pid;
+      const c = serviceCoreOf(this.procs.get(pid)!.db, d);
+      if (c !== null && c.service !== null) return pid;
     }
     return -1;
+  }
+
+  // ownerPids lists the running processes that own main or an attachment under the page service.
+  private ownerPids(): number[] {
+    const pids: number[] = [];
+    for (const pid of this.livePids()) {
+      const db = this.procs.get(pid)!.db;
+      for (const d of this.order()) {
+        const c = serviceCoreOf(db, d);
+        if (c !== null && c.service !== null) {
+          pids.push(pid);
+          break;
+        }
+      }
+    }
+    return pids;
   }
 
   private openDatabase(): Database {
@@ -923,12 +996,18 @@ export class SimRunner {
     // In a service trace any other fault kills the owner, the only process that touches the file,
     // whichever process's step drove its I/O; the others keep running over the same kernel state.
     if (this.service && this.procs.size > 1) {
-      let dead = this.ownerPid();
-      if (dead < 0) dead = this.cur;
-      this.dropProc(dead);
-      this.fs.processDeath();
-      this.emit(`{"i":${i},"op":"killed","pid":${dead},"fired":${goQuote(fired)}}`);
-      return true;
+      // Every owner — of main or of an attachment — is a process that may have touched a file after
+      // the fault fired, so each dies; with attachments owned elsewhere that may be more than one.
+      let dead = this.ownerPids();
+      if (dead.length === 0) dead = [this.cur];
+      if (dead.length < this.procs.size) {
+        for (const pid of dead) this.dropProc(pid);
+        this.fs.processDeath();
+        for (const pid of dead) {
+          this.emit(`{"i":${i},"op":"killed","pid":${pid},"fired":${goQuote(fired)}}`);
+        }
+        return true;
+      }
     }
     return this.recover(i, fired);
   }
@@ -936,7 +1015,7 @@ export class SimRunner {
   // dbVersion is the version of database d the current process has published.
   private dbVersion(d: SimDB): bigint {
     if (d.name === "main") return versionOf(this.database);
-    return coreOf(this.database).attached.get(d.name)?.txid ?? 0n;
+    return attachedVersionOf(this.database, d);
   }
 
   // versionsJSON renders the attachments' versions as `,"dbs":{"a1":V,...}`, or "" with none, so a
@@ -979,11 +1058,18 @@ export class SimRunner {
     if (this.service) {
       const d = this.digest(s, this.main());
       if (!this.observe(i, "session " + st.sid, s.version, d)) return;
+      for (const name of this.attachedNames()) {
+        const a = this.dbs.get(name)!;
+        const v = sessionVersionOf(s, name);
+        if (v === 0n) continue;
+        const dg = this.digest(s, a);
+        if (!this.observeDB(i, a, "session " + st.sid, v, dg)) return;
+      }
     }
     // A session pins every database's committed root when it opens.
     const pins = new Map<string, bigint>([["main", s.version]]);
     for (const name of this.attachedNames()) {
-      const v = this.dbVersion(this.dbs.get(name)!);
+      const v = sessionVersionOf(s, name);
       if (v !== 0n) pins.set(name, v);
     }
     this.sessions.set(st.sid, { s, random, write: st.mode === "write", pins, pid: this.cur });
@@ -1172,6 +1258,7 @@ export class SimRunner {
       }
       for (let k = 0; k < dbs.length; k++) {
         const d = dbs[k]!;
+        if (!ss.pins.has(d.name)) continue;
         const now = this.dbVersion(d);
         if (now !== d.version) {
           this.fail(i, `a failed commit published version ${now} of ${d.name} (was ${d.version})`);
@@ -1200,6 +1287,8 @@ export class SimRunner {
     const quiet = this.quiet();
     for (let k = 0; k < dbs.length; k++) {
       const d = dbs[k]!;
+      // Not attached in this session's process when it opened: it cannot have written it.
+      if (!ss.pins.has(d.name)) continue;
       const base = d.version;
       const now = versions.get(d.name)!;
       const inflight = before[k]!;
@@ -1225,6 +1314,16 @@ export class SimRunner {
           // back; the acknowledged commit is checked by the recovery that follows.
           published = inflight.digest;
         }
+        if (
+          published === null &&
+          this.service &&
+          !this.fs.dead &&
+          this.digestErr !== null &&
+          errCode(this.digestErr) === "08006"
+        ) {
+          // An armed disconnect landed in the read-back's own frames: read it back again.
+          published = this.committedDigest(d);
+        }
         if (published === null && this.service && this.fs.dead) {
           // The owner died later in this step (its maintenance commit hit the fault), so nothing can be
           // read back through it; the acknowledged commit is checked by the recovery that follows.
@@ -1245,12 +1344,12 @@ export class SimRunner {
         d.version = now;
         d.lastDigest = inflight.digest;
         if (now > d.maxAttempted) d.maxAttempted = now;
-        if (!this.relaxed || coreOf(this.database).client !== null) {
+        if (!this.relaxed || (serviceCoreOf(this.database, d)?.client ?? null) !== null) {
           d.floor = now; // acknowledged under synchronous = on, or a page client's commit (§8.2)
         }
         this.checkGrowth(i, d, quiet);
         if (this.violation !== "") return;
-        if (this.service && d.name === "main") {
+        if (this.service) {
           this.serviceCommitted(i, d, base, now, inflight.digest);
           if (this.violation !== "") return;
         }
@@ -1275,7 +1374,8 @@ export class SimRunner {
   // follow a client's commit with a maintenance commit — the unchanged snapshot at the next versions —
   // which joins the history with the same contents.
   private serviceCommitted(i: number, d: SimDB, base: bigint, now: bigint, digest: string): void {
-    if (coreOf(this.database).client === null) return;
+    const c = serviceCoreOf(this.database, d);
+    if (c === null || c.client === null) return;
     const image = this.image(d);
     const before = freeListOf(image, this.pageSize, base);
     const after = freeListOf(image, this.pageSize, now);
@@ -1299,15 +1399,19 @@ export class SimRunner {
       if (now + 1n > d.maxAttempted) d.maxAttempted = now + 1n;
       return;
     }
-    const owner = this.ownerPid();
+    const owner = this.ownerPidOf(d);
     if (owner < 0) return;
-    const ov = versionOf(this.procs.get(owner)!.db);
+    const ownerDb = this.procs.get(owner)!.db;
+    const ov = d.name === "main" ? versionOf(ownerDb) : attachedVersionOf(ownerDb, d);
     if (ov <= now) return;
     for (let v = now + 1n; v <= ov; v++) d.addHistory(v, digest);
     d.version = ov;
     if (ov > d.maxAttempted) d.maxAttempted = ov;
     if (!this.relaxed) d.floor = ov; // the maintenance commit is an owner commit: batched under off
-    this.emit(`{"i":${i},"op":"maintenance","version":${ov}}`);
+    if (d.name === "main") this.emit(`{"i":${i},"op":"maintenance","version":${ov}}`);
+    else {
+      this.emit(`{"i":${i},"op":"maintenance","db":${goQuote(d.name)},"version":${ov}}`);
+    }
   }
 
   // engineFlushed reports whether the process writing database d holds no relaxed commit pending a
@@ -1317,7 +1421,7 @@ export class SimRunner {
   private engineFlushed(d: SimDB): boolean {
     let db = this.db;
     if (this.service) {
-      const owner = this.ownerPid();
+      const owner = this.ownerPidOf(d);
       if (owner < 0) return false;
       db = this.procs.get(owner)!.db;
     }
@@ -1613,12 +1717,12 @@ export class SimRunner {
   // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
   // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
   private stepAttach(i: number, name: string): void {
-    if (this.service) {
-      this.fail(i, "attach is single-process only");
-      return;
-    }
     let d = this.dbs.get(name);
-    if (d !== undefined && this.dbVersion(d) !== 0n) {
+    if (
+      d !== undefined &&
+      this.dbVersion(d) !== 0n &&
+      (!this.service || this.attachedInAll(name))
+    ) {
       this.emit(`{"i":${i},"op":"attach","db":${goQuote(name)},"version":${d.version}}`);
       return;
     }
@@ -1642,17 +1746,64 @@ export class SimRunner {
       }
       d.floor = 1n; // create returned: the file and its directory entry are durable
     }
-    try {
-      this.attach(name);
-    } catch (e) {
-      this.attachFailed(i, name, e);
-      return;
+    if (this.service) {
+      if (!this.attachEverywhere(i, name)) return;
+    } else {
+      try {
+        this.attach(name);
+      } catch (e) {
+        this.attachFailed(i, name, e);
+        return;
+      }
     }
     const v = this.dbVersion(d);
     const dg = this.committedDigest(d);
     if (!this.checkRecovered(i, d, v, dg, "attached")) return;
     this.observeGrowth(d);
     this.emit(`{"i":${i},"op":"attach","db":${goQuote(name)},"version":${v}}`);
+  }
+
+  // attachEverywhere attaches file database name in every running process of a service trace
+  // (README.md §6.6): main's owner first — so it owns the file too, and one process owns every
+  // database — then the others in process order, each a page client of it. With no owner of main, the
+  // lowest process's read begin first re-elects it. A process that already has it attached is skipped.
+  // It leaves the attaching owner as the step's process.
+  private attachEverywhere(i: number, name: string): boolean {
+    let first = this.ownerPid();
+    if (first < 0) {
+      first = this.livePids()[0]!;
+      this.selectProc(first);
+      const dg = this.committedDigest(this.main());
+      if (!this.observe(i, `attaching p${first}`, versionOf(this.database), dg)) return false;
+      this.net.pump();
+    }
+    const order = [first, ...this.livePids().filter((pid) => pid !== first)];
+    for (const pid of order) {
+      this.selectProc(pid);
+      if (coreOf(this.database).attachments.has(name)) continue;
+      let err: unknown = null;
+      try {
+        this.attach(name);
+      } catch (e) {
+        err = e;
+      }
+      this.net.pump();
+      if (err !== null) {
+        this.selectProc(first);
+        this.attachFailed(i, name, err);
+        return false;
+      }
+    }
+    this.selectProc(first);
+    return true;
+  }
+
+  // attachedInAll reports whether every running process has attachment name attached.
+  private attachedInAll(name: string): boolean {
+    for (const pid of this.livePids()) {
+      if (!coreOf(this.procs.get(pid)!.db).attachments.has(name)) return false;
+    }
+    return true;
   }
 
   private attachFailed(i: number, name: string, e: unknown): void {
@@ -1669,10 +1820,15 @@ export class SimRunner {
     const entries: string[] = [];
     let mainLine = "";
     for (const d of this.order()) {
+      if (this.service && d.name !== "main" && this.dbVersion(d) === 0n) {
+        // This process is not attached to it: a faulted attach killed the process attaching it before
+        // this one did; the next attach step repairs that.
+        continue;
+      }
       const { v, dg } = this.committedView(d);
-      if (this.service && d.name === "main") {
+      if (this.service) {
         // Another process may have died leaving a newer complete generation this one now adopts.
-        if (!this.observe(i, "check", v, dg)) return;
+        if (!this.observeDB(i, d, "check", v, dg)) return;
       } else if (dg === null || v !== d.version || dg !== d.lastDigest) {
         this.fail(i, `a read session does not see the last committed version of ${d.name}`);
         return;
@@ -1726,15 +1882,27 @@ export class SimRunner {
     let mainV = 0n;
     let mainD = "";
     for (const d of this.order()) {
+      if (
+        this.dbVersion(d) === 0n &&
+        d.name !== "main" &&
+        this.service &&
+        d.floor === 0n &&
+        !this.fs.files.has(d.file)
+      ) {
+        // A faulted attach killed its owner before create returned (S8 kills only the owner, so no
+        // recovery ran to forget it): the file may legitimately be gone.
+        this.dbs.delete(d.name);
+        continue;
+      }
       if (this.dbVersion(d) === 0n) {
         this.fail(i, `a clean reopen lost attachment ${d.name}`);
         return false;
       }
       const v = this.dbVersion(d);
       const dg = this.committedDigest(d);
-      if (this.service && d.name === "main") {
+      if (this.service) {
         // A process killed mid-commit may have left a complete generation no survivor began on yet.
-        if (!this.observe(i, "reopened p0", v, dg)) return false;
+        if (!this.observeDB(i, d, "reopened p0", v, dg)) return false;
       } else if (v !== d.version || dg === null || dg !== d.lastDigest) {
         this.fail(
           i,
@@ -1988,11 +2156,14 @@ export class SimRunner {
   // and the kernel releases its locks.
   private dropProc(pid: number): void {
     const p = this.procs.get(pid);
-    const main = this.dbs.get("main");
-    if (this.relaxed && p !== undefined && coreOf(p.db).service !== null && main !== undefined) {
+    if (this.relaxed && p !== undefined) {
       // A dead owner's batch may be lost back to the floor (validated-cow.md §4): the simulated
-      // process crash may drop writes of the step that acknowledged a commit.
-      main.ownerLost = true;
+      // process crash may drop writes of the step that acknowledged a commit. Each database it owned
+      // (main or an attachment under the service) has its own batch.
+      for (const d of this.dbs.values()) {
+        const c = serviceCoreOf(p.db, d);
+        if (c !== null && c.service !== null) d.ownerLost = true;
+      }
     }
     for (const sid of this.sessionsOf(pid)) this.sessions.delete(sid);
     this.locks?.release(pid);
@@ -2007,17 +2178,25 @@ export class SimRunner {
   // another process adopts — so the version may be newer than the last this runner saw, but never
   // older, and its contents must be a generation the history records.
   private observe(i: number, who: string, v: bigint, d: string | null): boolean {
-    const m = this.main();
-    if (d === null) this.fail(i, `${who}: version ${v} is unreadable`);
+    return this.observeDB(i, this.main(), who, v, d);
+  }
+
+  // observeDB is observe for database m: under the page service every attachment is shared too.
+  private observeDB(i: number, m: SimDB, who: string, v: bigint, d: string | null): boolean {
+    const what = m.name === "main" ? "" : " of " + m.name;
+    if (d === null) this.fail(i, `${who}: version ${v}${what} is unreadable`);
     else if (v < m.version && (!m.ownerLost || v < m.floor)) {
-      this.fail(i, `${who} sees version ${v} after version ${m.version} was published`);
+      this.fail(i, `${who} sees version ${v}${what} after version ${m.version} was published`);
     } else if (v > m.maxAttempted) {
       this.fail(
         i,
-        `${who} sees version ${v}, which was never attempted (latest attempted ${m.maxAttempted})`,
+        `${who} sees version ${v}${what}, which was never attempted (latest attempted ${m.maxAttempted})`,
       );
     } else if (!m.inHistory(v, d)) {
-      this.fail(i, `${who} sees version ${v} with contents (digest ${d}) no transaction produced`);
+      this.fail(
+        i,
+        `${who} sees version ${v}${what} with contents (digest ${d}) no transaction produced`,
+      );
     }
     if (this.violation !== "") return false;
     m.version = v;
@@ -2056,7 +2235,8 @@ export class SimRunner {
   // stepSpawn starts a process (S5) and checks what it sees.
   private stepSpawn(i: number, pid: number): void {
     if (this.procs.has(pid)) {
-      this.fail(i, `spawn p${pid}: already running`);
+      // The generator cannot know a fault killed the owner and that p0 restarted since.
+      this.emit(`{"i":${i},"op":"spawn","pid":${pid},"skip":true}`);
       return;
     }
     try {
@@ -2074,7 +2254,15 @@ export class SimRunner {
     const v = versionOf(this.database);
     const d = this.committedDigest(this.main());
     if (!this.observe(i, `spawned p${pid}`, v, d)) return;
-    this.emit(`{"i":${i},"op":"spawn","pid":${pid},"version":${v}}`);
+    const versions = new Map<string, bigint>();
+    for (const name of this.attachedNames()) {
+      const a = this.dbs.get(name)!;
+      if (this.dbVersion(a) === 0n) continue;
+      const adg = this.committedDigest(a);
+      if (!this.observeDB(i, a, `spawned p${pid}`, this.dbVersion(a), adg)) return;
+      versions.set(name, this.dbVersion(a));
+    }
+    this.emit(`{"i":${i},"op":"spawn","pid":${pid},"version":${v}${this.versionsJSON(versions)}}`);
   }
 }
 

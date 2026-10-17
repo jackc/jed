@@ -32,6 +32,7 @@ export type HandoffOptions = {
   idleSessionTimeoutMs?: number;
   idleInTransactionTimeoutMs?: number;
   maxConnections?: number;
+  synchronous?: "on" | "off";
 };
 
 // HandoffHosts are a handle's hosts under the page service: its lock host (the OS by default), its
@@ -52,6 +53,9 @@ export class ServiceHandoff implements ServiceHandoffHost {
   readonly yieldGraceMs: number;
   readonly shutdownGraceMs: number;
   readonly limits: OwnerLimits;
+  // relaxed is the handle's synchronous = off, whatever role it holds: its file attachments follow it
+  // (validated-cow.md §4).
+  readonly relaxed: boolean;
   private readonly readOnly: boolean;
   private readonly timeoutMs: number | undefined;
   private readonly clientOpen: ClientOpenOptions;
@@ -80,6 +84,7 @@ export class ServiceHandoff implements ServiceHandoffHost {
     this.adoptClient = hosts.adoptClient ?? null;
     this.background = hosts.background ?? true;
     this.ownership = options.ownership ?? "prefer";
+    this.relaxed = options.synchronous === "off";
     this.yieldGraceMs = options.yieldGraceMs ?? DEFAULT_YIELD_GRACE_MS;
     this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
     this.limits = {
@@ -162,6 +167,17 @@ export class ServiceHandoff implements ServiceHandoffHost {
     } catch {
       return false;
     }
+  }
+
+  // hosts are the handoff's lock, file, and client hosts and its background flag, which a file
+  // attachment's own handoff copies (page-service.md §5.5): the simulator's in a simulation.
+  hosts(): HandoffHosts {
+    return {
+      lock: this.host,
+      files: this.files,
+      adoptClient: this.adoptClient ?? undefined,
+      background: this.background,
+    };
   }
 
   releasePath(): void {

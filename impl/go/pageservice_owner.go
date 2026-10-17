@@ -1337,7 +1337,7 @@ func (c *sharedCore) maintenanceCommit(o *pageServiceOwner) {
 	}
 	snap := rt.committed.clone()
 	snap.txid = newTxid
-	budget := &budgetCtx{name: "main", prev: rt.committed, guard: c.roleGuard(r)}
+	budget := &budgetCtx{name: c.domainName(), prev: rt.committed, guard: c.roleGuard(r)}
 	if err := st.commitDurable(snap, true, true, budget); err != nil {
 		if r.paging != nil && r.paging.commitRequiresReopen() {
 			o.stopServing()

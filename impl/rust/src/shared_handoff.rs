@@ -123,6 +123,11 @@ fn can_open_read_write(files: &dyn FileHost, path: &Path) -> bool {
 }
 
 impl ServiceHandoff {
+    /// The database's resolved real path (the writer-gate order key, page-service.md §5.5).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The file host promotion and the owner's read handle open the file through.
     fn file_host(&self) -> Arc<dyn FileHost> {
         match &self.files {
@@ -133,6 +138,81 @@ impl ServiceHandoff {
 }
 
 impl Shared {
+    /// Elect this handle owner or page client of the attachment file at `path` (page-service.md
+    /// §5.5; README.md §6.6) through the handle's own lock, file, and spill hosts, returning the inner
+    /// handle and the file's resolved real path. The inner handle takes the handle's ownership
+    /// preference and owner limits when main is under the page service, the defaults otherwise.
+    pub(crate) fn open_service_attachment(
+        &self,
+        name: &str,
+        path: &Path,
+        source: &AttachSource,
+        read_only: bool,
+    ) -> Result<(Arc<Shared>, PathBuf)> {
+        let (main_files, spill, relaxed, inline_flush) = {
+            let storage = self.storage.lock().expect("storage lock not poisoned");
+            (
+                storage.files.clone(),
+                storage.spill.clone(),
+                storage.relaxed,
+                storage.inline_flush,
+            )
+        };
+        let (host, files, background) = match self.handoff.get() {
+            Some(handoff) => (
+                Arc::clone(&handoff.host),
+                handoff.files.clone(),
+                handoff.background,
+            ),
+            None => (Arc::new(OsLockHost) as Arc<dyn LockHost>, main_files, true),
+        };
+        let real = match &files {
+            Some(files) => files.real_path(path)?,
+            None => crate::coordinator::resolve_open_path(path)?,
+        };
+        let mut opts = OpenOptions {
+            read_only,
+            locking: Locking::Auto,
+            file_lock_timeout_ms: source.file_lock_timeout_ms,
+            environment: self.env.clone(),
+            max_storage_bytes: source.max_storage_bytes,
+            // The attachment follows the handle's synchronous setting (validated-cow.md §4).
+            synchronous: if relaxed {
+                crate::file::Synchronous::Off
+            } else {
+                crate::file::Synchronous::On
+            },
+            ..OpenOptions::default()
+        };
+        if let Some(handoff) = self.handoff.get() {
+            // A handle under the page service lends its ownership preference and owner limits to
+            // its attachments (README.md §6.6).
+            opts.ownership = handoff.opts.ownership;
+            opts.idle_in_transaction_timeout_ms = handoff.opts.idle_in_transaction_timeout_ms;
+            opts.idle_session_timeout_ms = handoff.opts.idle_session_timeout_ms;
+            opts.yield_grace_ms = handoff.opts.yield_grace_ms;
+            opts.shutdown_grace_ms = handoff.opts.shutdown_grace_ms;
+            opts.max_connections = handoff.opts.max_connections;
+        }
+        let hosts = ServiceHosts {
+            host,
+            files,
+            spill,
+            background,
+        };
+        let Database(inner) = open_service_with(hosts, &real, opts, true)?;
+        let _ = inner.name.set(name.to_string());
+        if inline_flush {
+            // The simulator's inline cap flush reaches the attachment too.
+            inner
+                .storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .inline_flush = true;
+        }
+        Ok((inner, real))
+    }
+
     /// Attach the page-service state to a freshly built core.
     fn attach_handoff(self: &Arc<Self>, hosts: ServiceHosts, path: &Path, mut opts: OpenOptions) {
         opts.environment = self.env.clone();
@@ -796,7 +876,7 @@ impl Shared {
             return Err(stale_role());
         }
         let budget = BudgetCtx {
-            name: "main",
+            name: self.domain_name(),
             prev: &prev,
             can_compact: false,
             stages_rows,

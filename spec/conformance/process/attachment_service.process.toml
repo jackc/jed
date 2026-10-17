@@ -1,0 +1,291 @@
+schema_version = 1
+name = "attachment-service"
+description = "A file attachment under the page service (page-service.md §5.5): the first process to attach a file owns and serves it, a second process's attach is a page client that reads and commits through it, the attachment's writer gate is shared by both processes' writers (every writable transaction takes it, whatever it writes), and ownership hands off when the owner detaches or dies."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "create"
+path = "attachment"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+path = "main_a"
+
+[[step]]
+actor = "a"
+command = "attach"
+name = "work"
+path = "attachment"
+
+[[step]]
+actor = "a"
+command = "role"
+argument = "work"
+expect = "owner"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "create"
+path = "main_b"
+
+[[step]]
+actor = "b"
+command = "attach"
+name = "work"
+path = "attachment"
+
+[[step]]
+actor = "b"
+command = "role"
+argument = "work"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "owner"
+
+# Reads and commits through the attachment's owner, in both directions.
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM work.t ORDER BY id"
+expect = "1"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO work.t VALUES (2)"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM work.t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO work.t VALUES (3)"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM work.t ORDER BY id"
+expect = "1,2,3"
+
+# The owner's writer holds the attachment's gate: the client's writer times out, and its reads go on.
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO work.t VALUES (4)"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "300"
+expect_error = "55P03"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM work.t"
+expect = "3"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+# The client's writer holds it: the owner's writer times out.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO work.t VALUES (5)"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "300"
+expect_error = "55P03"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM work.t ORDER BY id"
+expect = "1,2,3,4,5"
+
+# A writable transaction takes the gate of every read-write attachment, even one that writes only main.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "CREATE TABLE m (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "300"
+expect_error = "55P03"
+
+[[step]]
+actor = "b"
+command = "write_rollback"
+
+# A writer killed while holding the attachment's gate releases it at end of stream, uncommitted.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO work.t VALUES (99)"
+
+[[step]]
+actor = "b"
+command = "kill"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO work.t VALUES (6)"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM work.t ORDER BY id"
+expect = "1,2,3,4,5,6"
+
+# The owner detaches: the client promotes itself to owner of the attachment.
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+path = "main_b"
+
+[[step]]
+actor = "b"
+command = "attach"
+name = "work"
+path = "attachment"
+
+[[step]]
+actor = "b"
+command = "role"
+argument = "work"
+expect = "client"
+
+[[step]]
+actor = "a"
+command = "detach"
+argument = "work"
+
+[[step]]
+actor = "b"
+command = "role"
+argument = "work"
+expect = "owner"
+retry_ms = 5000
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO work.t VALUES (7)"
+
+[[step]]
+actor = "a"
+command = "attach"
+name = "work"
+path = "attachment"
+
+[[step]]
+actor = "a"
+command = "role"
+argument = "work"
+expect = "client"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM work.t ORDER BY id"
+expect = "1,2,3,4,5,6,7"
+
+# The owner dies: the client promotes at its next transaction begin, with every commit intact.
+[[step]]
+actor = "b"
+command = "kill"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM work.t ORDER BY id"
+expect = "1,2,3,4,5,6,7"
+
+[[step]]
+actor = "a"
+command = "role"
+argument = "work"
+expect = "owner"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO work.t VALUES (8)"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+path = "attachment"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3,4,5,6,7,8"
+
+[[step]]
+actor = "b"
+command = "close"

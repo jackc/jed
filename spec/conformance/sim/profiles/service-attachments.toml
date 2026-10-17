@@ -1,0 +1,41 @@
+# File attachments under the page service (page-service.md §5.5; spec/pageservice/README.md §6.6;
+# simulation-testing.md §14 S11): an owner and its page clients over main and up to two attached file
+# databases. `attach` attaches a file in every running process, main's owner first, so that process owns
+# every database and the others are page clients of each; later processes attach every attachment. A
+# client commits main or one attachment through its owner (one durable database per transaction), which
+# follows with maintenance commits; a lost connection resolves a commit by re-election; a fault kills
+# every owner, and the next begin elsewhere promotes main and every attachment together,
+# each recovering its own generation.
+
+description = "Attachments under the page service: client commits, promotion, per-database recovery"
+
+processes = "service"
+# Half the traces run under synchronous = off (validated-cow.md §4): each database's owner flushes its
+# own batch before granting that database's gate to a client, independently of the others.
+synchronous = ["on", "off"]
+max_procs = 3
+page_sizes = [256, 512]
+max_readers = 4
+attachments = 2
+attached_writes = 500
+
+[weights]
+spawn = 8
+exit = 1
+kill = 1
+disconnect = 2
+attach = 5
+open_read = 7
+close_read = 4
+crash_power = 1
+crash_process = 1
+
+[faults]
+commit_fault = 250
+attach_fault = 200
+nth_max = 2
+power_loss = 2
+process_crash = 7
+disconnect = 4
+frames_max = 8
+issue = [800, 1000]

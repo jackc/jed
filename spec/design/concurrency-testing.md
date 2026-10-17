@@ -426,9 +426,14 @@ page-service owners and clients, or file attachments, including explicit commits
 (`max_storage_bytes`) and read the gauge (`storage_bytes`), and one process alone and an owner
 and a page client alternating commits trip at the same batch with the same live count; the owner's
 maintenance commits keep the shared file as small as the lone one. A client's delete lowers the
-count every process commits against. `file-attachment-ownership` (`attachment_ownership`) checks
-that a file attachment is a non-serving owner: a second handle's attach of the same file fails
-`55006` until the first closes or dies. `compact` refuses compaction while a page client or a local
+count every process commits against. File attachments under the service (spec/pageservice/README.md
+§6.6): `attachment_service` elects the first attacher owner and the second a page client that reads
+and commits through it, checks that every writable transaction of either process takes the
+attachment's writer gate (`55P03`), that a writer killed holding it releases it, and that ownership
+hands off when the owner detaches or dies; `attachment_gate_order` has two processes each own one file
+and attach the other's, so writers crossing owners queue in real-path order instead of deadlocking;
+`attachment_read_only` has a read-only attachment own its file and yield it to another process's
+writer. `compact` refuses compaction while a page client or a local
 reader pins a snapshot and succeeds after; a connected client continues on the compacted image.
 
 The page service's read path (page-service.md phase 2): `service_reads` elects the creator

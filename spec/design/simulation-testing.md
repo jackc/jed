@@ -134,7 +134,7 @@ check
 | `crash process` / `crash power survive=‰ tear=‰` | An immediate crash between steps. |
 | `reopen` | Ends every session (rolling back a writer), closes cleanly, and opens again. |
 | `compact [<db>]` | Host compaction of `main` or a file attachment (api.md §2.6), through the simulated filesystem. |
-| `attach <name>` | Attaches the file database `<name>.jed` read-write (attached-databases.md §4), first creating it through the simulated filesystem if it does not exist. Every later process re-attaches every attachment whose file exists. Single-process traces only. |
+| `attach <name>` | Attaches the file database `<name>.jed` read-write (attached-databases.md §4), first creating it through the simulated filesystem if it does not exist. Every later process re-attaches every attachment whose file exists. In a service trace it attaches the file in every running process under the page service, main's owner first (S11). |
 | `corrupt flips=N [reseal=1]` | Bit rot in the main file (§6.3). Ends every session cleanly, flips bits, opens and reads, then repairs. |
 | `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
@@ -541,6 +541,7 @@ defaults, which `mixed.toml` restates):
 | `service` | An owner and page clients: spawns, exits, kills, lost connections, client commits, promotion (S8); half the traces relaxed |
 | `relaxed` | `synchronous = off`: batched commits, cap flushes, crashes and faulted commits mid-batch and at the flush (S9) |
 | `truncation` | Bulk inserts, heavy deletes and drops, then long quiet runs, so commits lower the high-water and shorten the file (S10); half the traces relaxed |
+| `service-attachments` | Owners and page clients of main and of up to two file attachments: attach in every process, client commits of attachments, per-database promotion and recovery (S11); half the traces relaxed |
 
 A profile changes what is emitted, never what is checked: every oracle runs on every trace.
 
@@ -766,6 +767,38 @@ primitive) gets a simulated implementation.
     |---|---|---|
     | a relaxed commit shrinks the file before its batch's flush | `truncation` | 8 / 60 |
     | the flush that ends a batch never shrinks a file the batch lowered | `truncation` | 25 / 60 |
+
+11. **S11 — File attachments under the page service. Landed.** The `service-attachments` profile puts
+    `attach` in `# processes: service` traces ([spec/pageservice/README.md](../pageservice/README.md)
+    §6.6). An `attach` step attaches the file in every running process: main's owner first, so it owns
+    the file and the others are page clients of it; a spawned process attaches every attachment whose
+    file exists. Each database's bundle locks, owner record, and endpoint are its own in the simulated
+    lock host.
+    - **Faults kill every owner.** The simulated filesystem has one death point per step: once a fault
+      fires, every later I/O of the step fails, whichever process issues it. Only owners touch files, so
+      a faulted step kills every process that owns main or an attachment (all of them, as a single
+      process's crash, when that is every process). Ownership usually coincides — main's owner attaches
+      first, and each begin re-elects main and every attachment together — but a faulted attach or a
+      promotion can split it, and the rule holds either way. Cross-owner gate order is the process
+      corpus's (`attachment_gate_order`).
+    - **Oracles.** Every database is observed like main under S8: what a process sees of an attachment
+      may be newer than the runner last saw, never older, and is a recorded generation. A client's
+      attachment commit obeys the commit-role rule and may be followed by the owner's maintenance
+      commit, which joins that attachment's history. A process that is not attached to a database (a
+      faulted attach killed the attacher first) is skipped by the checks of that database until the
+      next `attach`.
+    - The regression trace `service-attachments-owner-and-clients.sim` keeps one history with client
+      commits of attachments, an attachment maintenance commit, and owner kills.
+    - The sweeps surfaced one S8 oracle gap, independent of attachments: an armed `disconnect` can
+      land in a commit's read-back itself, which then fails `08006` like any read open across a lost
+      connection; the read-back now retries once with a fresh read, which re-elects.
+   - **Batched durability and trailing truncation** (S9, S10). An attachment follows its handle's
+     `synchronous` setting, as a process's main does, and half the traces run relaxed. Each database is
+     its own file domain: its owner flushes its own batch before granting its gate to a client, and
+     only its owner's own commits truncate it. The floor rules apply per database — a page client's
+     commit of an attachment sets that attachment's floor, and a dead process loses the batch of each
+     database it owned — and the durability checks read each database's pending state from its own
+     owner.
 
 ## 15. Open questions
 
