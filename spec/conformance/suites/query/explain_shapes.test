@@ -577,8 +577,8 @@ Full scan; touched=2
 0
 0
 
-# A variable-width leading index key supports point intervals, but not range unions: recovering the
-# row-key suffix from an arbitrary text interval still needs the deferred variable-width skip.
+# A variable-width leading index key supports range unions too: each admitted entry recovers its
+# row-key suffix by stepping over the text slot's terminator.
 statement ok
 CREATE TABLE text_intervals (id i32 PRIMARY KEY, v text)
 
@@ -595,6 +595,6 @@ conjuncts=1
 0
 1
 Scan text_intervals
-Full scan; touched=2
+Index interval set: using text_intervals_v_idx; intervals=2; touched=2
 0
 0

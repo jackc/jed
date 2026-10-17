@@ -592,14 +592,18 @@ point-set/range intersection).
   - **No tuple point.** An index entry's key is the member slots followed by the row's storage key,
     so even with every member consumed as a point the prefix gives `[P, prefix-successor(P))`.
   - **Suffix eligibility.** Each admitted entry's row storage key is recovered by skipping the
-    probe's known prefix and then width-skipping every remaining member slot (a lone `0x01` NULL tag,
-    or `0x00` + the fixed width), so a member that may be skipped must be fixed-width. Let `t` be the
-    position of the first consumed member after the leading one that has a set or is the final member
-    (the number of consumed members if none): every key column at position `t` or later must be a
-    fixed-width scalar, and a leading member whose set or clip holds a non-equality comparison must
-    be fixed-width too. Otherwise the index has no interval-set candidate. A variable-width point
-    member before `t` is fine: its probe bytes are known. With only the leading member consumed this
-    is the earlier leading-column rule.
+    probe's known prefix and then stepping over every remaining key slot: a lone `0x01` NULL tag, or
+    `0x00` and the body — a fixed-width body by its width, and a C-collated `text` or `bytea` body by
+    its `0x00 0x01` terminator (an escaped `0x00 0xFF` is content), a `decimal` body by its class byte
+    (zero alone) or its `0x00` terminator after the exponent (`0xFF` for a negative value), and an
+    `interval` body by its 16 bytes ([encoding.md](encoding.md) §2.4–§2.6, §2.10). A slot that may be
+    stepped over must be one of these; a collated `text` key (the UCA sort key, §2.12) and the
+    unkeyed JSON types are not. Let `t` be the position of the first consumed member after the
+    leading one that has a set or is the final member (the number of consumed members if none):
+    every key column at position `t` or later must be steppable, and a leading member whose set or
+    clip holds a non-equality comparison must be steppable too. Otherwise the index has no
+    interval-set candidate. Any member before `t` is fine: its probe bytes are known. With only the
+    leading member consumed this is the leading-column rule.
   - **Canonicalization.** When every key column is fixed-width the tuple intervals are sorted and
     merged as the PK's are, byte-adjacent closed intervals included. Otherwise they are not merged
     across prefixes: the prefixes are distinct self-delimiting byte strings, so their interval groups
@@ -616,9 +620,9 @@ A canonical interval-set bound takes the **eager materialize path** — the sing
 / vectorized-aggregate fast paths (which each interpret only a single contiguous bound) gate **off**
 it, exactly as they do an index / GIN / GiST bound. `spec/conformance/suites/query/or_in_point_lookup.test`
 pins point costs cross-core; `query/interval_set.test` pins clipping, range union, overlap merging,
-and fallbacks. Secondary-index range intervals retain the ordered-index fixed-width eligibility
-needed to recover row-key suffixes (the suffix rule above); variable-width leading range unions fall
-back. `query/composite_key_set.test` pins the PK and index tuple sets.
+and fallbacks. Secondary-index range intervals recover row-key suffixes by the suffix rule above,
+so a C-collated `text` leading range union steps over its own slot; a collated one falls back.
+`query/composite_key_set.test` pins the PK and index tuple sets.
 
 ### Index-bounded scan — a secondary index narrows a base-relation scan
 

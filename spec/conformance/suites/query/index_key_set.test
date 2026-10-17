@@ -10,7 +10,7 @@
 # the live PostgreSQL 18 oracle; the costs are jed-owned, so the `# cost:` lines are the cross-core
 # pin. The plans are pinned by EXPLAIN in index_key_set_explain.test.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_multi_row, dml.insert_select, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.index_range, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, expr.between, query.aggregates, maintenance.analyze, func.array_quantified, func.array, query.set_returning, types.array, cast.array, types.i32, types.i64, types.text, null.three_valued, resource.cost_metering
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_multi_row, dml.insert_select, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.index_range, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, expr.between, query.aggregates, maintenance.analyze, func.array_quantified, func.array, query.set_returning, types.array, cast.array, types.i32, types.i64, types.text, types.bytea, types.decimal, types.interval, expr.case, cast.string_literal, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE ix (id i64 PRIMARY KEY, a i32, b i64, v i64)
@@ -240,8 +240,9 @@ SELECT v FROM uq WHERE a IN (1, 3) AND b IN (10, 20)
 # --- variable-width columns ------------------------------------------------------------------------
 
 # A text column's slot is self-delimiting, so its points concatenate in byte order. The row-key
-# suffix is recovered past each probe's known prefix and the fixed-width columns after it, so a text
-# column may be a point member only before the first later set.
+# suffix is recovered past each probe's known prefix by stepping over every key slot after it — a
+# fixed-width slot by its width, a text, bytea, decimal, or interval slot by decoding its delimiter —
+# so a variable-width column may sit anywhere in the index.
 statement ok
 CREATE TABLE ev (id i64 PRIMARY KEY, region text, day i32, seq i32)
 
@@ -313,10 +314,9 @@ SELECT a, c, id FROM tm WHERE a = 2 AND s = 'y' AND c IN (7, 70)
 70
 470
 
-# A set on the text column would leave its slot to be width-skipped under a capped walk, so the index
-# has no tuple set, and its plain `a = 2` bound would fetch a third of the table: a full scan is
-# cheaper. The rows are the same.
-# cost: 4608
+# A set on the text column is consumed too: each admitted entry steps over its text slot by decoding
+# the terminator, so `(2, 'x', 7)` and `(2, 'y', 7)` are two probes.
+# cost: 25
 query III rowsort
 SELECT a, c, id FROM tm WHERE a = 2 AND s IN ('x', 'y') AND c = 7
 ----
@@ -326,6 +326,101 @@ SELECT a, c, id FROM tm WHERE a = 2 AND s IN ('x', 'y') AND c = 7
 2
 7
 407
+
+# A final range on the text column under a set: each `a` prefix maps `s > 'x'` to its text slot range.
+# cost: 3808
+query III rowsort
+SELECT a, c, id FROM tm WHERE a IN (1, 3) AND s > 'x' AND c = 4
+----
+1
+4
+104
+1
+4
+204
+3
+4
+704
+3
+4
+804
+
+# Every variable-width key type after a leading set: the probes leave the text, bytea, decimal, and
+# interval slots (NULLs among them, a bytea with embedded zero bytes, negative, zero, and positive
+# decimals) to be stepped over before each entry's row key.
+statement ok
+CREATE TABLE vw (id i64 PRIMARY KEY, a i32, t text, b bytea, d decimal, iv interval, c i32)
+
+statement ok
+INSERT INTO vw SELECT g, g % 4, CASE g % 3 WHEN 0 THEN NULL WHEN 1 THEN 'v1' ELSE 'v2' END, CASE g % 5 WHEN 0 THEN NULL WHEN 1 THEN '\x00ff00'::bytea WHEN 2 THEN '\x00'::bytea ELSE '\x61'::bytea END, CASE g % 7 WHEN 0 THEN NULL WHEN 1 THEN -1.25 WHEN 2 THEN 0 WHEN 3 THEN 0.5 ELSE 12345.678 END, CASE g % 11 WHEN 0 THEN NULL WHEN 1 THEN '1 day'::interval ELSE '-3 hours'::interval END, g % 10 FROM generate_series(1, 400) AS g
+
+statement ok
+CREATE INDEX vw_all ON vw (a, t, b, d, iv, c)
+
+# cost: 1758
+query IITI rowsort
+SELECT id, a, t, c FROM vw WHERE a IN (1, 3) AND c = 7 AND id < 120
+----
+107
+3
+v2
+7
+117
+1
+NULL
+7
+17
+1
+v2
+7
+27
+3
+NULL
+7
+37
+1
+v1
+7
+47
+3
+v2
+7
+57
+1
+NULL
+7
+67
+3
+v1
+7
+7
+3
+v1
+7
+77
+1
+v2
+7
+87
+3
+NULL
+7
+97
+1
+v1
+7
+
+# A leading text range union steps over its own slot the same way.
+# cost: 6849
+query TII rowsort
+SELECT region, day, seq FROM ev WHERE (region < 'f' OR region > 'v') AND day = 3 AND seq = 4
+----
+east
+3
+4
+west
+3
+4
 
 # --- the probe cap ---------------------------------------------------------------------------------
 

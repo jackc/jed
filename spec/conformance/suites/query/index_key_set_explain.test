@@ -4,7 +4,7 @@
 # disjuncts, and `arrays=` counts the `= ANY` arrays among them. Rows and costs are pinned in
 # index_key_set.test. The plans are jed-owned, so this file is cross-core checked, not oracle-checked.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.point_lookup, query.index_range, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.logical_connectives, query.order_by, query.limit, query.explain, query.set_returning, maintenance.analyze, func.array_quantified, types.array, cast.array, types.i32, types.i64, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.point_lookup, query.index_range, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.logical_connectives, query.order_by, query.limit, query.explain, query.set_returning, maintenance.analyze, func.array_quantified, types.array, cast.array, types.i32, types.i64, types.text, types.bytea, types.decimal, types.interval, expr.case, cast.string_literal
 
 statement ok
 CREATE TABLE ix (id i64 PRIMARY KEY, a i32, b i64, v i64)
@@ -216,8 +216,8 @@ Index interval set: using tm_asc (a, s, c); intervals=2; touched=4
 2
 8
 
-# A set on the text column leaves the index no tuple set, and its plain `a = 2` bound would fetch a
-# third of the table: a full scan is cheaper.
+# A set on the text column is consumed too: an admitted entry steps over its text slot by decoding
+# the terminator.
 query ITTII nosort
 EXPLAIN SELECT a, c, id FROM tm WHERE a = 2 AND s IN ('x', 'y') AND c = 7
 ----
@@ -225,9 +225,48 @@ EXPLAIN SELECT a, c, id FROM tm WHERE a = 2 AND s IN ('x', 'y') AND c = 7
 Filter
 conjuncts=3
 2
-7208
+24
 1
 Scan tm
-Full scan; touched=4
-900
-906
+Index interval set: using tm_asc (a, s, c); intervals=2; touched=4
+2
+8
+
+# A final text range under a set.
+query ITTII nosort
+EXPLAIN SELECT a, c, id FROM tm WHERE a IN (1, 3) AND s > 'x' AND c = 4
+----
+0
+Filter
+conjuncts=3
+4
+4007
+1
+Scan tm
+Index interval set: using tm_asc (a, s); intervals=2; touched=4
+400
+1203
+
+# Every variable-width key type after a leading set is stepped over.
+statement ok
+CREATE TABLE vw (id i64 PRIMARY KEY, a i32, t text, b bytea, d decimal, iv interval, c i32)
+
+statement ok
+INSERT INTO vw SELECT g, g % 4, CASE g % 3 WHEN 0 THEN NULL WHEN 1 THEN 'v1' ELSE 'v2' END, CASE g % 5 WHEN 0 THEN NULL WHEN 1 THEN '\x00ff00'::bytea WHEN 2 THEN '\x00'::bytea ELSE '\x61'::bytea END, CASE g % 7 WHEN 0 THEN NULL WHEN 1 THEN -1.25 WHEN 2 THEN 0 WHEN 3 THEN 0.5 ELSE 12345.678 END, CASE g % 11 WHEN 0 THEN NULL WHEN 1 THEN '1 day'::interval ELSE '-3 hours'::interval END, g % 10 FROM generate_series(1, 400) AS g
+
+statement ok
+CREATE INDEX vw_all ON vw (a, t, b, d, iv, c)
+
+query ITTII nosort
+EXPLAIN SELECT id, a, t, c FROM vw WHERE a IN (1, 3) AND c = 7 AND id < 120
+----
+0
+Filter
+conjuncts=3
+1
+43
+1
+Scan vw
+Index interval set: using vw_all; intervals=2; touched=4
+4
+14

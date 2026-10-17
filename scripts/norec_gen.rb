@@ -68,8 +68,9 @@
 #              duplicate, absent, and empty-array shapes and a mutation end state must all agree.
 #   index_key_set — the composite_key_set walk over a multi-column secondary B-tree index
 #              (cost.md §3 "Multi-column secondary indexes"): each prefix an index prefix range whose
-#              entries point-fetch their rows, over a non-unique index with duplicate keys and a text
-#              point column between fixed-width ones. Spelling each key column as `col + 0`
+#              entries point-fetch their rows, over a non-unique index with duplicate keys, a text
+#              column between fixed-width ones (a point, a set, or a final range), and a leading text
+#              range union; each skipped text slot is stepped over by its terminator. Spelling each key column as `col + 0`
 #              full-scans. Point, prefix-range, final-range, NULL, duplicate, absent, and empty-array
 #              shapes and a mutation end state must all agree.
 #   bounded_limit — LIMIT/OFFSET windows over PK interval sets, a compatible ordered secondary-index
@@ -1695,6 +1696,7 @@ def gen_index_key_set(seed)
   stmt(out, "INSERT INTO x VALUES #{values}")
   stmt(out, "CREATE INDEX x_tk ON x (t, k)")
   stmt(out, "CREATE INDEX x_tsk ON x (t, s, k)")
+  stmt(out, "CREATE INDEX x_sk ON x (s, k)")
   stmt(out, "ANALYZE x")
 
   # The bare columns lower to an index tuple set; `{T}`/`{K}`/`{S}` spelled `col + 0` (or `s || ''`)
@@ -1735,6 +1737,10 @@ def gen_index_key_set(seed)
             where.call { |t, k, s| t == t1 && s == s1 && ks.include?(k) })
   pair.call("a set on the text column", "{T} IN (#{ts.join(', ')}) AND {S} IN ('a', '#{s1}') AND {K} = #{k1}",
             where.call { |t, k, s| ts.include?(t) && ['a', s1].include?(s) && k == k1 })
+  pair.call("a final text range after a set", "{T} IN (#{ts.join(', ')}) AND {S} >= '#{s1}'",
+            where.call { |t, _k, s| ts.include?(t) && s >= s1 })
+  pair.call("a leading text range union", "({S} < 'b' OR {S} > 'b') AND {K} = #{k1}",
+            where.call { |_t, k, s| s != 'b' && k == k1 })
   pair.call("an empty array", "{T} IN (#{ts.join(', ')}) AND {K} = ANY('{}'::i32[])", [])
 
   stmt(out, "CREATE TABLE x_scan (id i32 PRIMARY KEY, t i32, k i32, s text, w i32)")

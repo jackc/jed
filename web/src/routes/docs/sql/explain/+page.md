@@ -219,9 +219,10 @@ the work bounded, a list is used only while the number of combinations stays at 
 A multi-column secondary index takes the same lists over its columns in index order. With an index on
 `(store, sku)`, the same `WHERE` looks up each `(store, sku)` pair in the index and fetches only those
 rows. The detail lists the index columns the set covers after the index name. To find each entry's
-row, jed needs every index column from the first non-leading column with a list or range onward to
-have a fixed-width type, so a `text` column there (even one the query does not mention) leaves only
-the plain index bound; a `text` column before it is fine.
+row, jed steps over every index column from the first non-leading column with a list or range onward,
+which works for fixed-width types and for `text`, `bytea`, `decimal`, and `interval`; a `text` column
+with a non-`C` collation there (even one the query does not mention) leaves only the plain index
+bound.
 
 <LiveSql demo="indexTupleSet" seed={saleSeed} query={indexTupleSet} rows={8} />
 
