@@ -163,23 +163,26 @@ const (
 	pairRegrSyy
 	pairRegrSxy
 	pairRegrSlope
+	pairRegrIntercept
 )
 
 // pairSurfaces maps each two-argument statistical aggregate to its exact and float plans.
 var pairSurfaces = map[string][2]aggPlan{
-	"regr_slope": {planRegrSlope, planRegrSlopeFloat},
-	"regr_sxy":   {planRegrSxy, planRegrSxyFloat},
-	"regr_syy":   {planRegrSyy, planRegrSyyFloat},
-	"regr_sxx":   {planRegrSxx, planRegrSxxFloat},
-	"regr_avgy":  {planRegrAvgy, planRegrAvgyFloat},
-	"regr_avgx":  {planRegrAvgx, planRegrAvgxFloat},
-	"corr":       {planCorr, planCorrFloat},
-	"covar_pop":  {planCovarPop, planCovarPopFloat},
-	"covar_samp": {planCovarSamp, planCovarSampFloat},
+	"regr_intercept": {planRegrIntercept, planRegrInterceptFloat},
+	"regr_slope":     {planRegrSlope, planRegrSlopeFloat},
+	"regr_sxy":       {planRegrSxy, planRegrSxyFloat},
+	"regr_syy":       {planRegrSyy, planRegrSyyFloat},
+	"regr_sxx":       {planRegrSxx, planRegrSxxFloat},
+	"regr_avgy":      {planRegrAvgy, planRegrAvgyFloat},
+	"regr_avgx":      {planRegrAvgx, planRegrAvgxFloat},
+	"corr":           {planCorr, planCorrFloat},
+	"covar_pop":      {planCovarPop, planCovarPopFloat},
+	"covar_samp":     {planCovarSamp, planCovarSampFloat},
 }
 
 // pairStats gives each two-argument plan its statistic.
 var pairStats = map[aggPlan]pairStat{
+	planRegrIntercept: pairRegrIntercept, planRegrInterceptFloat: pairRegrIntercept,
 	planRegrSlope: pairRegrSlope, planRegrSlopeFloat: pairRegrSlope,
 	planRegrSxy: pairRegrSxy, planRegrSxyFloat: pairRegrSxy,
 	planRegrSyy: pairRegrSyy, planRegrSyyFloat: pairRegrSyy,
@@ -268,6 +271,12 @@ func (s *pairsExact) finalize(stat pairStat) (Value, error) {
 			return NullValue(), nil
 		}
 		r, err = numXY.Div(numX)
+	case pairRegrIntercept:
+		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
+		if numX.IsZero() {
+			return NullValue(), nil
+		}
+		r, err = s.sy.mulExact(s.sxx).sub(s.sx.mulExact(s.sxy)).Div(numX)
 	default:
 		panic("unhandled pair statistic")
 	}
@@ -366,6 +375,11 @@ func (s *pairsFloat) finalize(stat pairStat) Value {
 			return NullValue()
 		}
 		return Float64Value(s.sxy / s.sxx)
+	case pairRegrIntercept:
+		if s.sxx == 0 {
+			return NullValue()
+		}
+		return Float64Value((s.sy - float64(s.sx*s.sxy)/s.sxx) / s.n)
 	default:
 		panic("unhandled pair statistic")
 	}

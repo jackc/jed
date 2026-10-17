@@ -863,6 +863,8 @@ var SupportedCapabilities = []string{
 	// (key, value) pairs into one JSON object; _unique errors 22030 on a duplicate key
 	// (json-sql-functions.md §4).
 	"func.json_object_agg",
+	// regr_intercept(Y, X) — the least-squares intercept (aggregates.md §23).
+	"func.regr_intercept",
 	// regr_slope(Y, X) — the least-squares slope (aggregates.md §23).
 	"func.regr_slope",
 	// regr_sxy(Y, X) — the sum of products of the deviations (aggregates.md §23).

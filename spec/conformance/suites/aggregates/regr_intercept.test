@@ -1,0 +1,133 @@
+# Aggregate regr_intercept(Y, X) (spec/design/aggregates.md §23): the Y intercept of the least-squares line through the pairs whose arguments are both non-NULL, NULL when X is constant. Over two float arguments it is
+# PostgreSQL's float8 algorithm with an f64 result; over two integer/decimal arguments it is exact, a
+# decimal result — a jed divergence (PostgreSQL defines it only over float8), ledgered in
+# oracle_overrides.toml, whose expected values are PostgreSQL's numeric evaluation of the formula in
+# aggregates.md §23. A pair with a NULL is skipped. Output name `regr_intercept`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.regr_intercept, func.covar_pop
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, y i32, x i32, dy numeric(6,2), dx numeric(6,1), fy f64, fx f64, ry f32, rx f32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1, 2, 1.50, 2.0, 1, 2, 1, 2), (2, 1, 3, 5, 2.25, 5.5, 3, 5, 3, 5), (3, 1, 4, 4, NULL, 4.5, 4, 4, 4, 4), (4, 1, 8, 9, 8.00, 9.0, 8, 9, 8, 9), (5, 2, NULL, 1, 1.00, NULL, NULL, 1, NULL, 1), (6, 2, 2, 3, 2.00, 3.0, 2, 3, 2, 3)
+
+# The arguments travel as one row: 6 rows read + 1 leaf page read + 6 row packs + 6 accumulated + 1
+# produced.
+# names: regr_intercept
+# cost: 20
+query R nosort
+SELECT regr_intercept(fy, fx) FROM t
+----
+-0.8424657534246578
+
+# f32 arguments widen to f64.
+# names: regr_intercept
+query R nosort
+SELECT regr_intercept(ry, rx) FROM t
+----
+-0.8424657534246578
+
+# names: g, regr_intercept
+query IR rowsort
+SELECT g, regr_intercept(fy, fx) FROM t GROUP BY g
+----
+1
+-0.8076923076923075
+2
+NULL
+
+# One pair, and none (a pair with a NULL is skipped).
+# names: regr_intercept
+query R nosort
+SELECT regr_intercept(fy, fx) FROM t WHERE id = 6
+----
+NULL
+
+# names: regr_intercept
+query R nosort
+SELECT regr_intercept(fy, fx) FROM t WHERE id = 5
+----
+NULL
+
+# names: regr_intercept
+query R nosort
+SELECT regr_intercept(fy, fx * 2) FILTER (WHERE id > 1) FROM t
+----
+-0.7469879518072293
+
+# names: id, regr_intercept
+query IR nosort
+SELECT id, regr_intercept(fy, fx) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+NULL
+2
+-0.3333333333333335
+3
+-0.21428571428571352
+4
+-0.8076923076923075
+5
+-0.8076923076923075
+6
+-0.8424657534246578
+
+# names: regr_intercept
+query R nosort
+SELECT regr_intercept(y, x) FROM (VALUES (1.0::f64, 'Infinity'::f64), (2.0::f64, 3.0::f64)) v(y, x)
+----
+NaN
+
+statement error 22003
+SELECT regr_intercept(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
+
+# Over integer and decimal arguments: exact.
+# names: regr_intercept
+# cost: 20
+query D nosort
+SELECT regr_intercept(y, x) FROM t
+----
+-0.84246575342465753425
+
+# names: regr_intercept, regr_intercept
+query DD nosort
+SELECT regr_intercept(dy, dx), regr_intercept(y, dx) FROM t
+----
+-0.96252676659528907923
+-1.0034129692832765
+
+# names: g, regr_intercept
+query ID rowsort
+SELECT g, regr_intercept(dy, x) FROM t GROUP BY g
+----
+1
+-1.1824324324324324
+2
+0.50000000000000000000
+
+# names: regr_intercept
+query D nosort
+SELECT regr_intercept(DISTINCT y, y) FROM t
+----
+0.00000000000000000000
+
+# Wide decimals charge decimal_work for each pair's three products and five sums.
+statement ok
+CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
+
+statement ok
+INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
+
+# names: regr_intercept
+# cost: 180
+query D nosort
+SELECT regr_intercept(y, x) FROM big
+----
+-432098766109.74665851369013708
+
+# A float argument beside an exact one has no overload.
+statement error 42883
+SELECT regr_intercept(fy, x) FROM t
+
+statement error 42883
+SELECT regr_intercept(y) FROM t
