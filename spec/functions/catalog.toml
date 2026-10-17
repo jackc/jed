@@ -2395,11 +2395,14 @@ errors         = ["22003"]
 # with NO libm transcendental on the value path (the result scale is chosen deterministically, never
 # from a platform `log`/`log10`). Result is an unconstrained `numeric`; the result SCALE follows PG's
 # rule (≥ NUMERIC_MIN_SIG_DIGITS = 16 significant digits, never below the input's scale).
-# arg_resolution = "none", like the float roots and `sign`: a bare INTEGER does NOT promote (`sqrt(2)`
-# → 42883, a documented jed strictness vs PG's int→float8), but a decimal literal/value does
-# (`sqrt(4.0)` → numeric 2.0000000000000000, matching PG). Mixed integer/decimal arguments need an
-# explicit cast (a deferred follow-on). Domain errors match PG: sqrt of a negative and the power
-# domain errors trap 2201F; ln/log of a non-positive trap 2201E; exp/power overflow traps 22003.
+# The one-argument rows are arg_resolution = "none", like the float roots and `sign`: a bare INTEGER
+# does NOT promote (`sqrt(2)` → 42883, a documented jed strictness vs PG's int→float8), but a decimal
+# literal/value does (`sqrt(4.0)` → numeric 2.0000000000000000, matching PG). The two-argument
+# log/power/pow rows are arg_resolution = "promote" (functions.md §9.2): a MIXED integer/decimal pair
+# promotes the integer to decimal, as PG's int→numeric implicit cast does (`power(2.0, 3)` →
+# numeric), while two integers still match no row (42883). Domain errors match PG: sqrt of a negative
+# and the power domain errors trap 2201F; ln/log of a non-positive trap 2201E; exp/power overflow
+# traps 22003.
 
 [[operator]]
 volatility     = "immutable"
@@ -2465,7 +2468,7 @@ name           = "log"
 kind           = "function"
 arity          = 2
 arg_families   = ["decimal", "decimal"]
-arg_resolution = "none"
+arg_resolution = "promote"
 result         = "decimal"
 null           = "propagates"
 errors         = ["2201E"]
@@ -2482,7 +2485,7 @@ name           = "power"
 kind           = "function"
 arity          = 2
 arg_families   = ["decimal", "decimal"]
-arg_resolution = "none"
+arg_resolution = "promote"
 result         = "decimal"
 null           = "propagates"
 errors         = ["2201F", "22003"]
@@ -2493,7 +2496,7 @@ name           = "pow"
 kind           = "function"
 arity          = 2
 arg_families   = ["decimal", "decimal"]
-arg_resolution = "none"
+arg_resolution = "promote"
 result         = "decimal"
 null           = "propagates"
 errors         = ["2201F", "22003"]

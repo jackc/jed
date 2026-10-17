@@ -3427,7 +3427,8 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 	}
 	// `width_bucket(op, low, high, count)` — resolver-routed so the three value operands reconcile
 	// across the integer/decimal families PG's implicit casts span (all-integer or mixed
-	// integer/decimal → numeric; all-float → float). count must be integer. result int4.
+	// integer/decimal → numeric; all-float → float, a numeric literal adapting to a float operand).
+	// count must be integer. result int4.
 	if name == "width_bucket" && len(fc.Args) == 4 {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
@@ -3449,6 +3450,18 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, noFuncOverload("width_bucket")
 		}
 		anyFloat := isFloatKind(tys[0].kind) || isFloatKind(tys[1].kind) || isFloatKind(tys[2].kind)
+		if anyFloat {
+			// A numeric literal beside a float operand adapts to f64 (functions.md §9.2).
+			for i := 0; i < 3; i++ {
+				if (tys[i].kind == rtInt || tys[i].kind == rtDecimal) && isNumericLiteral(fc.Args[i]) {
+					r, t, err := floatLiteral(s, fc.Args[i], ag, params)
+					if err != nil {
+						return nil, resolvedType{}, err
+					}
+					rargs[i], tys[i] = r, t
+				}
+			}
+		}
 		ok := func(k rtKind) bool {
 			if anyFloat {
 				return isFloatKind(k) || k == rtNull
@@ -3815,6 +3828,15 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 	if id, result, ok := resolveHostScalar(s, name, tys); ok {
 		return &rExpr{kind: reHostFunc, index: id, cText: name, sargs: rargs, result: result}, resolvedTypeOf(result), nil
 	}
+	// A promoting two-argument function reconciles a mixed numeric pair as the arithmetic operators
+	// do (functions.md §9.2): power(2.0, 3) selects the decimal overload, pow(x_f64, 3) the float one.
+	if ptys, ok, err := promoteScalarPair(s, fc, rargs, tys, ag, params); err != nil {
+		return nil, resolvedType{}, err
+	} else if ok {
+		if desc := lookupScalarOverload(name, ptys); desc != nil {
+			return adoptScalarOverload(s, fc, desc, rargs, ptys, nil, ag, params)
+		}
+	}
 	// No overload takes the bare string literals as text, so retry with them unknown-typed, as
 	// PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
 	if literals := bareStringLiterals(fc.Args); literals != nil {
@@ -3827,6 +3849,66 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 		}
 	}
 	return nil, resolvedType{}, noFuncOverload(name)
+}
+
+// scalarPairPromotes reports whether name has a two-argument catalog row with arg_resolution
+// "promote" — the rows whose mixed numeric pairs reconcile (functions.md §9.2).
+func scalarPairPromotes(name string) bool {
+	for i := range operators {
+		o := &operators[i]
+		if o.Kind == "function" && o.Name == name && len(o.ArgFamilies) == 2 && o.ArgResolution == "promote" {
+			return true
+		}
+	}
+	return false
+}
+
+// isNumericLiteral reports whether e is a bare integer or decimal literal (a negative one included:
+// the parser folds the sign into the literal).
+func isNumericLiteral(e *exprNode) bool {
+	return e.Kind == exprLiteral && (e.Literal.Kind == literalInt || e.Literal.Kind == literalDecimal)
+}
+
+// floatLiteral re-resolves a numeric literal argument that faces a float argument as f64 — the type
+// of every float overload's arguments (functions.md §9.2; PostgreSQL reads the constant as float8).
+func floatLiteral(s *scope, e *exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	f64 := scalarFloat64
+	return resolve(s, *e, &f64, ag, params)
+}
+
+// promoteScalarPair reconciles the two resolved arguments of a promoting function (functions.md
+// §9.2) the way the arithmetic operators reconcile their operands: an integer facing a decimal reads
+// as decimal (compare.toml's promote-to-decimal — the kernel converts the value), and an integer or
+// decimal LITERAL facing a float is re-resolved as f64 (float.md §4/§6; a value never becomes a
+// float). ok is false when the pair needs no reconciliation or has none. A re-resolved literal
+// replaces its entry in rargs; the returned types are the reconciled pair.
+func promoteScalarPair(s *scope, fc *funcCallExpr, rargs []*rExpr, tys []resolvedType, ag *aggCtx, params *paramTypes) ([]resolvedType, bool, error) {
+	if len(tys) != 2 || !scalarPairPromotes(fc.Name) {
+		return nil, false, nil
+	}
+	exact := func(k rtKind) bool { return k == rtInt || k == rtDecimal }
+	l, r := tys[0].kind, tys[1].kind
+	switch {
+	case exact(l) && exact(r) && l != r:
+		dec := resolvedType{kind: rtDecimal}
+		return []resolvedType{dec, dec}, true, nil
+	case isFloatKind(l) != isFloatKind(r):
+		other := 0
+		if isFloatKind(l) {
+			other = 1
+		}
+		if !exact(tys[other].kind) || !isNumericLiteral(fc.Args[other]) {
+			return nil, false, nil
+		}
+		re, t, err := floatLiteral(s, fc.Args[other], ag, params)
+		if err != nil {
+			return nil, false, err
+		}
+		out := []resolvedType{tys[0], tys[1]}
+		rargs[other], out[other] = re, t
+		return out, true, nil
+	}
+	return nil, false, nil
 }
 
 // bareStringLiterals marks the arguments that are bare string literals ('…', not a typed literal or

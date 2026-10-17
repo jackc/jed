@@ -395,6 +395,38 @@ and VARIADIC functions, aggregates) keep their own argument typing. An unknown a
 matches a host-registered function's signature ([extensibility.md](extensibility.md) §4.2), so it
 stays `42883` there.
 
+### 9.2 Mixed numeric pairs — `arg_resolution = "promote"` on a two-argument function
+
+PostgreSQL resolves `power(2.0, 3)` to `power(numeric, numeric)`: the `int4` argument casts
+implicitly to `numeric`, and the overload with an exact match on the other argument wins. jed builds
+no general implicit-coercion pass (§9). Instead, a two-argument function row may say
+`arg_resolution = "promote"`, meaning its arguments reconcile the way the arithmetic operators'
+operands do (§4, [../types/compare.toml](../types/compare.toml)). The rows that do are
+`power`/`pow` and `log(b, x)` over `decimal`, and `power`/`pow` and `atan2` over `float`.
+
+When the call matches no row as written (and no host function, which is tried first), each
+argument keeps its resolved type, and the pair is reconciled once:
+
+- **An integer facing a decimal** reads as `decimal` (compare.toml's `promote-to-decimal`), and the
+  row over `decimal × decimal` is looked up again. The kernel converts the integer value at scale
+  0, as a cast to `numeric` would, but no cast is charged: the call costs one less than the
+  spelling with an explicit `::numeric`. So `power(2.0, 3)`, `power(int_col, 0.5)`, and
+  `log(2, 8.0)` return `numeric`, as in PostgreSQL.
+- **An integer or decimal literal facing a float** is resolved again as `f64` and the float row is
+  looked up again: `pow(f, 3)`, `power(2.5::f32, 2)`, and `atan2(1.0::f64, 1)` return `f64`, as in
+  PostgreSQL, which reads the constant as `float8`. Only a literal adapts (a negative literal
+  too). A float *value* never meets an integer or decimal *value* — float is a strict island
+  ([float.md](float.md) §6) — so `power(f, i)` stays `42883` where PostgreSQL casts `i` to
+  `float8` (an oracle override).
+
+Anything else is unchanged. Two integers still match no row (`power(2, 3)` is `42883`; PostgreSQL
+returns a `float8`, an oracle override, [decimal.md](decimal.md) §8), and a bare `NULL` or `$N`
+follows §9.1 and does not reconcile. The resolver-routed functions with numeric pairs reconcile by
+the same rules in their own resolvers: `mod`/`div`/`gcd`/`lcm` promote an integer beside a decimal,
+and `width_bucket`'s float form adapts its literal operands to `f64`, so `width_bucket(f, 0, 10, 5)`
+resolves as in PostgreSQL. `round`/`trunc(decimal, integer)` need nothing: their rows already take
+the mixed pair.
+
 ## 10. Set-returning functions (`generate_series`) — the fourth function mold
 
 A **set-returning function (SRF)** is the fourth function shape, distinct from the three

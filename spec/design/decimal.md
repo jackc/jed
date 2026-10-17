@@ -329,8 +329,10 @@ or ±Infinity to produce.
 *integer* literal does **not** promote (`sqrt(2)` → `42883`), matching the existing float-root /
 `sign` behavior — PostgreSQL instead casts `int → double precision` and returns a float8 value
 (ledgered in `oracle_overrides.toml`). A *decimal* literal **does** resolve to the numeric kernel
-(`sqrt(4.0)` → `2.0000000000000000`, matching PG). Mixed integer/decimal arguments
-(`power(2.0, 3)`) need an explicit cast — a deferred follow-on.
+(`sqrt(4.0)` → `2.0000000000000000`, matching PG). The two-argument `log`/`power`/`pow` rows are
+`arg_resolution = "promote"` instead: a mixed integer/decimal pair promotes the integer to
+decimal, so `power(2.0, 3)` and `log(2, 8.0)` resolve to the numeric kernel as in PG
+([functions.md](functions.md) §9.2). Two integers still match no row.
 
 **Cost and allocation.** Each SQL call charges one `operator_eval` plus the guarded
 `decimal_transcend` work in cost.md §8. The exact step sites are:

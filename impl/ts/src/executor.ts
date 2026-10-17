@@ -36641,7 +36641,8 @@ export function resolveFuncCall(
   }
   // `width_bucket(op, low, high, count)` — resolver-routed so the three value operands reconcile
   // across the integer/decimal families PG's implicit casts span (all-integer or mixed
-  // integer/decimal → numeric; all-float → float). count must be integer. result int4.
+  // integer/decimal → numeric; all-float → float, a numeric literal adapting to a float operand).
+  // count must be integer. result int4.
   if (lname === "width_bucket" && e.args.length === 4) {
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
@@ -36655,6 +36656,16 @@ export function resolveFuncCall(
     if (tys[3]!.kind !== "int" && tys[3]!.kind !== "null") throw noFuncOverload("width_bucket");
     const anyFloat =
       tys[0]!.kind === "float" || tys[1]!.kind === "float" || tys[2]!.kind === "float";
+    if (anyFloat) {
+      // A numeric literal beside a float operand adapts to f64 (functions.md §9.2).
+      for (let i = 0; i < 3; i++) {
+        if ((tys[i]!.kind === "int" || tys[i]!.kind === "decimal") && isNumericLiteral(e.args[i]!)) {
+          const r = floatLiteral(scope, e.args[i]!, ag, params);
+          rargs[i] = r.node;
+          tys[i] = r.type;
+        }
+      }
+    }
     const ok = (t: ResolvedType) =>
       anyFloat
         ? t.kind === "float" || t.kind === "null"
@@ -37075,10 +37086,20 @@ export function resolveScalarFunc(
     // `id` indexes the frozen registry; the kernel is reached by id at eval.
     const host = resolveHostScalar(scope, e.name, rargs, tys);
     if (host) return host;
-    // No overload takes the bare string literals as text, so retry with them unknown-typed, as
-    // PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
-    literals = bareStringLiterals(e.args);
-    if (literals) desc = selectUnknownOverload(name, tys, literals);
+    // A promoting two-argument function reconciles a mixed numeric pair as the arithmetic
+    // operators do (functions.md §9.2): power(2.0, 3) selects the decimal overload, pow(x_f64, 3)
+    // the float one.
+    const ptys = promoteScalarPair(scope, name, e.args, rargs, tys, ag, params);
+    if (ptys) {
+      desc = lookupScalarOverload(name, ptys);
+      if (desc) tys.splice(0, tys.length, ...ptys);
+    }
+    if (!desc) {
+      // No overload takes the bare string literals as text, so retry with them unknown-typed, as
+      // PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
+      literals = bareStringLiterals(e.args);
+      if (literals) desc = selectUnknownOverload(name, tys, literals);
+    }
     if (!desc) throw noFuncOverload(name);
   }
   // An unknown-typed argument adopts its slot's family (functions.md §9.1): a bare $N, or a bare
@@ -37132,6 +37153,67 @@ export function resolveScalarFunc(
   params.nonimmutable ||= desc.volatility !== "immutable" && !epoch;
   const result = scalarResultType(desc.result, tys);
   return scalarFuncNode(func, rargs, result, argWidth);
+}
+
+// scalarPairPromotes reports whether name has a two-argument catalog row with arg_resolution
+// "promote" — the rows whose mixed numeric pairs reconcile (functions.md §9.2).
+function scalarPairPromotes(name: string): boolean {
+  return OPERATORS.some(
+    (o) =>
+      o.kind === "function" &&
+      o.name === name &&
+      o.argFamilies.length === 2 &&
+      o.argResolution === "promote",
+  );
+}
+
+// isNumericLiteral reports whether e is a bare integer or decimal literal (a negative one included:
+// the parser folds the sign into the literal).
+function isNumericLiteral(e: Expr): boolean {
+  return e.kind === "literal" && (e.literal.kind === "int" || e.literal.kind === "decimal");
+}
+
+// floatLiteral re-resolves a numeric literal argument that faces a float argument as f64 — the type
+// of every float overload's arguments (functions.md §9.2; PostgreSQL reads the constant as float8).
+function floatLiteral(
+  scope: Scope,
+  e: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  return resolve(scope, e, "f64", ag, params);
+}
+
+// promoteScalarPair reconciles the two resolved arguments of a promoting function (functions.md
+// §9.2) the way the arithmetic operators reconcile their operands: an integer facing a decimal reads
+// as decimal (compare.toml's promote-to-decimal — the kernel converts the value), and an integer or
+// decimal LITERAL facing a float is re-resolved as f64 (float.md §4/§6; a value never becomes a
+// float). null when the pair needs no reconciliation or has none. A re-resolved literal replaces its
+// entry in rargs; the result is the reconciled pair of types.
+function promoteScalarPair(
+  scope: Scope,
+  name: string,
+  args: Expr[],
+  rargs: RExpr[],
+  tys: ResolvedType[],
+  ag: AggCtx,
+  params: ParamTypes,
+): ResolvedType[] | null {
+  if (tys.length !== 2 || !scalarPairPromotes(name)) return null;
+  const exact = (t: ResolvedType) => t.kind === "int" || t.kind === "decimal";
+  const l = tys[0]!;
+  const r = tys[1]!;
+  if (exact(l) && exact(r) && l.kind !== r.kind) return [{ kind: "decimal" }, { kind: "decimal" }];
+  if ((l.kind === "float") !== (r.kind === "float")) {
+    const other = l.kind === "float" ? 1 : 0;
+    if (!exact(tys[other]!) || !isNumericLiteral(args[other]!)) return null;
+    const re = floatLiteral(scope, args[other]!, ag, params);
+    rargs[other] = re.node;
+    const out = [l, r];
+    out[other] = re.type;
+    return out;
+  }
+  return null;
 }
 
 // bareStringLiterals marks the arguments that are bare string literals ('…', not a typed literal or
