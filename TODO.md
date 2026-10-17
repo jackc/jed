@@ -277,9 +277,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       "Multi-column secondary indexes"
     - [ ] _follow-on:_ an index-nested-loop sibling column as a tuple-set member's point source
       (PK and index). _(size: S)_
-    - [ ] _follow-on:_ a variable-width (`text`) index column at or after the first later set or
-      range — today it leaves only the plain index bound, since the row-key suffix is recovered by
-      width-skipping those slots; skipping a self-delimiting slot by decoding would lift it. _(size: S)_
+    - [x] _follow-on:_ a variable-width index column at or after the first later set or range — an
+      admitted entry steps over a C-collated `text`/`bytea`, `decimal`, or `interval` slot by
+      decoding its delimiter, so such a column no longer leaves only the plain index bound (a
+      collated `text` slot still does). The plain index bound and the index-nested-loop bound keep
+      their fixed-width suffix rule.
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
     composite/array/json/jsonb, GIN term statistics for `<@`, and an element-count

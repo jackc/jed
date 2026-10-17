@@ -430,15 +430,12 @@ pub(crate) fn index_store_bound_entries(
     let mut slabs = 0usize;
     let mut rows = Vec::with_capacity(entries.len());
     for (ekey, _) in entries {
-        // Skip the equality prefix by its known byte length, then each remaining key component by
-        // width (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width,
-        // indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
+        // Skip the equality prefix by its known byte length, then each remaining key component
+        // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the body stepped over by width or
+        // delimiter, indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
         let mut at = prefix_byte_len;
         for &ty in suffix_types {
-            at += match ekey.get(at) {
-                Some(0x01) => 1,
-                _ => 1 + ty.width_bytes(),
-            };
+            at = crate::encoding::key_slot_end(&ekey, at, ty);
         }
         // A corrupt entry shorter than its components yields an empty storage key (no row).
         let row_key = ekey.get(at..).unwrap_or(&[]);

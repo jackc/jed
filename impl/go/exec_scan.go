@@ -1210,11 +1210,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	rowKeyFromIndex := func(ekey []byte, prefixLen int, suffix []scalarType) []byte {
 		at := prefixLen
 		for _, ty := range suffix {
-			if at < len(ekey) && ekey[at] == 0x01 {
-				at++
-			} else {
-				at += 1 + ty.WidthBytes()
-			}
+			at = keySlotEnd(ekey, at, ty)
 		}
 		if at > len(ekey) {
 			return nil // a short entry names no row

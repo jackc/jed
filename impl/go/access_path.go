@@ -741,11 +741,17 @@ func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx ind
 	if !hasSet {
 		return nil
 	}
-	if lead := members[0]; !lead.colType.IsFixedWidth() && intervalPlanHasRange(lead.specs, lead.clip) {
+	// skippable reports a key column whose slot an admitted entry can step over without knowing its
+	// value: a fixed-width or self-delimiting C-collated slot (keySlotSkippable).
+	skippable := func(c int) bool {
+		s, ok := rel.table.Columns[c].Type.AsScalar()
+		return ok && keySlotSkippable(s) && rel.table.Columns[c].Collation == ""
+	}
+	if lead := members[0]; !skippable(cols[0]) && intervalPlanHasRange(lead.specs, lead.clip) {
 		return nil
 	}
 	// Suffix eligibility (cost.md §3 "Multi-column secondary indexes"): every key column from the
-	// first member after the leading one that may go unconsumed or be a range onward is width-skipped.
+	// first member after the leading one that may go unconsumed or be a range onward is skipped.
 	t := len(members)
 	for i := 1; i < len(members); i++ {
 		if members[i].specs != nil || !members[i].point {
@@ -757,11 +763,10 @@ func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx ind
 	allFixed := true
 	for i, c := range cols {
 		s, ok := rel.table.Columns[c].Type.AsScalar()
-		fixed := ok && s.IsFixedWidth()
-		if !fixed && i >= t {
+		if i >= t && !skippable(c) {
 			return nil
 		}
-		allFixed = allFixed && fixed
+		allFixed = allFixed && ok && s.IsFixedWidth()
 		colTypes[i] = s
 	}
 	return &indexKeySetPlan{nameKey: idx.Name, tuple: members, colTypes: colTypes, allFixed: allFixed}
@@ -1748,16 +1753,12 @@ func indexStoreBoundEntries(istore, store *tableStore, suffixTypes []scalarType,
 		return nil, 0, 0, err
 	}
 	for _, e := range entries {
-		// Skip the equality prefix by its known byte length, then each remaining key component by
-		// width (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width, indexes.md §5.1);
-		// the suffix after them is the row's storage key (indexes.md §3).
+		// Skip the equality prefix by its known byte length, then each remaining key component
+		// (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the body stepped over by width or
+		// delimiter, indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
 		at := prefixByteLen
 		for _, ty := range suffixTypes {
-			if at < len(e.Key) && e.Key[at] == 0x01 {
-				at++
-			} else {
-				at += 1 + ty.WidthBytes()
-			}
+			at = keySlotEnd(e.Key, at, ty)
 		}
 		// A short entry (a page that disagrees with its index) yields an empty key, which names no row.
 		var rowKey []byte

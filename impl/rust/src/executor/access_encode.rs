@@ -2295,26 +2295,34 @@ fn build_index_interval_set_plan(
     if !has_set {
         return None;
     }
+    // A key column whose slot an admitted entry can step over without knowing its value: a
+    // fixed-width or self-delimiting C-collated slot (key_slot_skippable).
+    let skippable = |c: usize| {
+        let col = &rel.table.columns[c];
+        col.ty
+            .as_scalar()
+            .is_some_and(|s| crate::encoding::key_slot_skippable(s))
+            && col.collation.is_none()
+    };
     let lead = &tuple[0];
-    if !lead.col_type.is_fixed_width()
+    if !skippable(cols[0])
         && interval_plan_has_range(lead.specs.as_deref().unwrap_or_default(), &lead.clip)
     {
         return None;
     }
     // Suffix eligibility (cost.md §3 "Multi-column secondary indexes"): every key column from the
-    // first member after the leading one that may go unconsumed or be a range onward is width-skipped.
+    // first member after the leading one that may go unconsumed or be a range onward is skipped.
     let t = (1..tuple.len())
         .find(|&i| tuple[i].specs.is_some() || !tuple[i].point)
         .unwrap_or(tuple.len());
     let mut col_types = Vec::with_capacity(cols.len());
     let mut all_fixed = true;
     for (i, &c) in cols.iter().enumerate() {
-        let s = rel.table.columns[c].ty.as_scalar();
-        let fixed = s.is_some_and(|s| s.is_fixed_width());
-        if !fixed && i >= t {
+        if i >= t && !skippable(c) {
             return None;
         }
-        all_fixed = all_fixed && fixed;
+        let s = rel.table.columns[c].ty.as_scalar();
+        all_fixed = all_fixed && s.is_some_and(|s| s.is_fixed_width());
         col_types.push(rel.table.columns[c].ty.scalar());
     }
     Some(IndexKeySet {

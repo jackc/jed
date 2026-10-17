@@ -81,3 +81,62 @@ pub fn encode_nullable(ty: ScalarType, value: Option<i64>) -> Vec<u8> {
         }
     }
 }
+
+/// Whether a C-collated key slot of type `ty` can be stepped over in an index entry without knowing
+/// its value (cost.md §3 "Multi-column secondary indexes"): a fixed-width type by its width, and the
+/// self-delimiting variable-width text, bytea, decimal, and interval bodies by decoding their
+/// delimiters (encoding.md §2.4–§2.6, §2.10). A collated text key (the UCA sort key, §2.12) is not
+/// stepped over.
+pub fn key_slot_skippable(ty: ScalarType) -> bool {
+    matches!(
+        ty,
+        ScalarType::Text | ScalarType::Bytea | ScalarType::Decimal | ScalarType::Interval
+    ) || ty.is_fixed_width()
+}
+
+/// The offset just past the nullable key slot of type `ty` starting at `at` (the §2.2 presence tag,
+/// then the body): a lone `0x01` NULL tag, or `0x00` followed by the body, stepped over by its width
+/// or, for a variable-width body, by decoding its delimiter. A truncated slot returns an offset past
+/// `key.len()`, which names no row.
+pub fn key_slot_end(key: &[u8], at: usize, ty: ScalarType) -> usize {
+    let short = key.len() + 1;
+    match key.get(at) {
+        None => return short,
+        Some(0x01) => return at + 1,
+        _ => {}
+    }
+    let at = at + 1;
+    match ty {
+        ScalarType::Text | ScalarType::Bytea => {
+            // text-terminated-escape: 0x00 0xFF is an escaped content NUL, 0x00 0x01 the terminator.
+            let mut i = at;
+            while i + 1 < key.len() {
+                if key[i] == 0x00 {
+                    if key[i + 1] == 0x01 {
+                        return i + 2;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            short
+        }
+        ScalarType::Decimal => {
+            // decimal-order-preserving: the class byte; zero is that byte alone, otherwise a 4-byte
+            // exponent and mantissa pairs ending at the terminator (0x00, or 0xFF complemented for a
+            // negative value).
+            let Some(&class) = key.get(at) else {
+                return short;
+            };
+            if class == 0x04 {
+                return at + 1;
+            }
+            let term = if class == 0x03 { 0xFF } else { 0x00 };
+            (at + 5..key.len())
+                .find(|&i| key[i] == term)
+                .map_or(short, |i| i + 1)
+        }
+        ScalarType::Interval => at + 16,
+        _ => at + ty.width_bytes(),
+    }
+}

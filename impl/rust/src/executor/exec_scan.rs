@@ -142,12 +142,8 @@ fn process_streaming_row(
 
 fn index_row_key<'a>(entry_key: &'a [u8], prefix_len: usize, suffix: &[ScalarType]) -> &'a [u8] {
     let mut at = prefix_len;
-    for ty in suffix {
-        at += if entry_key.get(at) == Some(&0x01) {
-            1
-        } else {
-            1 + ty.width_bytes()
-        };
+    for &ty in suffix {
+        at = crate::encoding::key_slot_end(entry_key, at, ty);
     }
     // A corrupt entry shorter than its components yields an empty storage key, which names no row.
     entry_key.get(at..).unwrap_or(&[])

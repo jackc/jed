@@ -271,7 +271,14 @@ import {
   type StorageBudget,
 } from "./persist.ts";
 import { Decimal, momentVariance, workLinear, workMul } from "./decimal.ts";
-import { encodeBool, encodeInt, encodeTerminated, GIN_MAX_TERM_BYTES } from "./encoding.ts";
+import {
+  encodeBool,
+  encodeInt,
+  encodeTerminated,
+  GIN_MAX_TERM_BYTES,
+  keySlotEnd,
+  keySlotSkippable,
+} from "./encoding.ts";
 import {
   checkViolation,
   EngineError,
@@ -19588,7 +19595,7 @@ export class Engine {
       suffix: ScalarType[],
     ): Uint8Array => {
       let at = prefixLen;
-      for (const ty of suffix) at += entryKey[at] === 0x01 ? 1 : 1 + widthBytes(ty);
+      for (const ty of suffix) at = keySlotEnd(entryKey, at, ty);
       return entryKey.slice(at);
     };
     const scanIndex = (
@@ -25752,10 +25759,17 @@ function buildIndexIntervalSetPlan(
   if (cols === null) return null;
   const { tuple, hasSet } = walkTupleMembers(flattenConjuncts(filter), rel, cols, snap);
   if (!hasSet) return null;
+  // A key column whose slot an admitted entry can step over without knowing its value: a fixed-width
+  // or self-delimiting C-collated slot (keySlotSkippable).
+  const skippable = (c: number): boolean => {
+    const col = rel.table.columns[c]!;
+    const ty = typeAsScalar(col.type);
+    return ty !== undefined && keySlotSkippable(ty) && col.collation === null;
+  };
   const lead = tuple[0]!;
-  if (!isFixedWidth(lead.colType) && intervalPlanHasRange(lead.specs ?? [], lead.clip)) return null;
+  if (!skippable(cols[0]!) && intervalPlanHasRange(lead.specs ?? [], lead.clip)) return null;
   // Suffix eligibility (cost.md §3 "Multi-column secondary indexes"): every key column from the
-  // first member after the leading one that may go unconsumed or be a range onward is width-skipped.
+  // first member after the leading one that may go unconsumed or be a range onward is skipped.
   let t = tuple.length;
   for (let i = 1; i < tuple.length; i++) {
     if (tuple[i]!.specs !== null || !tuple[i]!.point) {
@@ -25766,10 +25780,9 @@ function buildIndexIntervalSetPlan(
   const colTypes: ScalarType[] = [];
   let allFixed = true;
   for (let i = 0; i < cols.length; i++) {
+    if (i >= t && !skippable(cols[i]!)) return null;
     const ty = typeAsScalar(rel.table.columns[cols[i]!]!.type);
-    const fixed = ty !== undefined && isFixedWidth(ty);
-    if (!fixed && i >= t) return null;
-    allFixed = allFixed && fixed;
+    allFixed = allFixed && ty !== undefined && isFixedWidth(ty);
     colTypes.push(typeScalar(rel.table.columns[cols[i]!]!.type));
   }
   return { nameKey: idx.name, tuple, colTypes, allFixed };
@@ -27851,13 +27864,11 @@ function indexStoreBoundEntries(
   let slabs = 0;
   const rows: Entry[] = [];
   for (const e of iscan.entries) {
-    // Skip the equality prefix by its known byte length, then each remaining key component by width
-    // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width, indexes.md §5.1); the
-    // suffix after them is the row's storage key (indexes.md §3).
+    // Skip the equality prefix by its known byte length, then each remaining key component
+    // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the body stepped over by width or
+    // delimiter, indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
     let at = prefixByteLen;
-    for (const ty of suffixTypes) {
-      at += e.key[at] === 0x01 ? 1 : 1 + widthBytes(ty);
-    }
+    for (const ty of suffixTypes) at = keySlotEnd(e.key, at, ty);
     // An entry too short for its slots is corrupt: it names no row.
     if (at > e.key.length)
       throw engineError("data_corrupted", "an index entry references a stored row");
