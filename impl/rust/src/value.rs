@@ -687,6 +687,22 @@ impl Value {
         }
     }
 
+    /// Render as an element of a container's text (an array element or a composite field): exactly
+    /// [`Value::render_zoned`], except a boolean is PostgreSQL's `boolout` spelling `t`/`f` — the
+    /// text `array_out` / `record_out` embed (`{t,f}`, `(t,1)`). The top-level result cell keeps the
+    /// canonical `true`/`false` (conformance.md §1), and a `bool → text` cast stays `true`/`false`
+    /// as PostgreSQL's `booltext` (spec/design/array.md §7).
+    fn render_element_zoned(
+        &self,
+        zone: Option<&crate::timezone::ZoneRef>,
+    ) -> EngineResult<String> {
+        match self {
+            Value::Bool(true) => Ok("t".to_string()),
+            Value::Bool(false) => Ok("f".to_string()),
+            _ => self.render_zoned(zone),
+        }
+    }
+
     /// How many finite `timestamptz` values a session-zone render of this value converts — each one
     /// `timezone` cost unit when the engine renders it (the `array → text` cast, timezones.md §9.5).
     /// NULL and ±infinity count nothing; containers are walked at every depth.
@@ -965,7 +981,7 @@ fn record_out_zoned(
         if matches!(f, Value::Null) {
             continue; // a NULL field is the empty string between delimiters (unquoted)
         }
-        let s = f.render_zoned(zone)?;
+        let s = f.render_element_zoned(zone)?;
         if record_field_needs_quote(&s) {
             out.push('"');
             for ch in s.chars() {
@@ -1240,7 +1256,7 @@ fn render_array_elem(
     match e {
         Value::Null => out.push_str("NULL"),
         _ => {
-            let s = e.render_zoned(zone)?;
+            let s = e.render_element_zoned(zone)?;
             if array_elem_needs_quote(&s) {
                 out.push('"');
                 for ch in s.chars() {
