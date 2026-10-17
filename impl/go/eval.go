@@ -1502,6 +1502,42 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(truncateToChars(out.str(), int(*e.varchar))), nil
 		}
 		return out, nil
+	case reCompositeCast:
+		// The two runtime composite casts (spec/design/composite.md §8): composite → text renders
+		// record_out, and runtime text → composite parses record_in against the target composite's
+		// field types (22P02 malformed / a field's own input error — the same errors the '(…)'::addr
+		// literal path raises). One operator_eval, like reArrayCast.
+		m.Charge(costs.OperatorEval)
+		v, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if v.Kind == ValNull {
+			return NullValue(), nil
+		}
+		if e.castElem == nil {
+			// A timestamptz at any depth renders in the SESSION zone, one timezone unit per finite
+			// instant, charged before rendering (timezones.md §9.5). A growth kernel: field quoting
+			// can expand strings (cost.md §8.1).
+			fields := *v.composite()
+			var zoned int64
+			for _, f := range fields {
+				zoned += f.zoneRenderCount()
+			}
+			if zoned > 0 {
+				m.Charge(costs.Timezone * zoned)
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+			}
+			zone := env.exec.session.timeZone
+			text, err := recordOutZoned(fields, &zone)
+			if err != nil {
+				return Value{}, err
+			}
+			return growthResult(m, []*rExpr{e.operand}, TextValue(text))
+		}
+		return coerceRecordTextToValue(v.str(), *e.castElem, env.exec.inputZone())
 	case reArrayCast:
 		// The three array-involving casts (spec/design/array.md §7): array → text (array_out),
 		// runtime text → T[] (array_in per row), and element-wise array → array (each element through

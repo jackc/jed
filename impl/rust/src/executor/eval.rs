@@ -397,6 +397,40 @@ impl RExpr {
                     _ => unreachable!("an ArrayCast operand is text or array (resolver-gated)"),
                 }
             }),
+            // The two runtime composite casts (spec/design/composite.md §8): composite → text
+            // renders `record_out`, and runtime text → composite parses `record_in` against the
+            // target composite's field types (22P02 malformed / a field's own input error — the same
+            // errors the `'(…)'::addr` literal path raises). One `operator_eval`, like ArrayCast.
+            RExpr::CompositeCast { inner, to } => outline(|| {
+                m.charge(COSTS.operator_eval);
+                match (inner.eval(row, env, m)?, to) {
+                    (Value::Null, _) => Ok(Value::Null),
+                    // A `timestamptz` at any depth renders in the SESSION zone, one `timezone` unit
+                    // per finite instant, charged before rendering (timezones.md §9.5).
+                    (Value::Composite(fields), None) => {
+                        let zoned = fields.iter().map(Value::zone_render_count).sum::<u64>();
+                        if zoned > 0 {
+                            m.charge(COSTS.timezone * zoned as i64);
+                            m.guard()?;
+                        }
+                        let out = Value::Text(crate::value::record_out_zoned(
+                            &fields,
+                            Some(&env.exec.session.time_zone),
+                        )?);
+                        // A growth kernel: field quoting can expand strings (cost.md §8.1).
+                        if !rexpr_is_constant(inner) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
+                    (Value::Text(s), Some(ColType::Composite { name, fields })) => {
+                        coerce_record_text(&s, name, fields, &env.exec.input_zone())
+                    }
+                    _ => unreachable!(
+                        "a CompositeCast operand is text or composite (resolver-gated)"
+                    ),
+                }
+            }),
             RExpr::Neg { operand, result } => outline(|| {
                 m.charge(operator_cost("neg"));
                 match operand.eval(row, env, m)? {

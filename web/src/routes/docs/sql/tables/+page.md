@@ -410,8 +410,9 @@ arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_p
 - **Resetting to a default** — `DO UPDATE SET col = DEFAULT` assigns the column's declared default
   (or `NULL`), exactly like `UPDATE … SET col = DEFAULT` (see Applying defaults above).
 - **Array, range, and composite columns** — `DO UPDATE` assigns them as `UPDATE` does: `NULL`, a
-  text literal (`'{1,2}'`, `'[1,5)'`, `'(Main,1)'`), or a value of the column's own type such as
-  `excluded.col`.
+  text literal (`'{1,2}'`, `'[1,5)'`, `'(Main,1)'`), a value of the column's own type such as
+  `excluded.col`, or — for a composite column — a `ROW(…)` of expressions such as
+  `ROW((excluded.home).street, 0)`.
 - **A partial unique index** — a column target never picks a partial unique index unless you add its
   predicate after the target, as in PostgreSQL. With `CREATE UNIQUE INDEX account_open ON account
   (owner) WHERE balance > 0`, write `INSERT … ON CONFLICT (owner) WHERE balance > 0 DO NOTHING`. The

@@ -3148,6 +3148,8 @@ export function renderRExpr(e: RExpr): string {
       return `cast(${renderRExpr(e.operand)} as ${canonicalName(e.target)})`;
     case "arrayCast":
       return `array_cast(${renderRExpr(e.operand)})`;
+    case "compositeCast":
+      return `cast(${renderRExpr(e.operand)} as ${e.to !== null && e.to.kind === "composite" ? e.to.name : "text"})`;
     case "neg":
       return `(-${renderRExpr(e.operand)})`;
     case "not":

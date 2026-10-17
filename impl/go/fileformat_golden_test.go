@@ -916,7 +916,7 @@ func dateTableDB(t *testing.T) *Session {
 func compositeTypeTableDB(t *testing.T) *Session {
 	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
 	run(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)")
-	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr)")
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr DEFAULT ROW('Elm', 1))")
 	run(t, db, "INSERT INTO t VALUES (1, ROW('Main', 90210))")
 	run(t, db, "INSERT INTO t VALUES (2, ROW('Oak', NULL))")
 	return db

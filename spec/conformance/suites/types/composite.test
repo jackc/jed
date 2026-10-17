@@ -4,9 +4,8 @@
 # keys, and the `record_in` round-trip (`'(…)'::type` / `type '(…)'`, §8). The DDL surface
 # (CREATE/DROP TYPE, dependency tracking) is in ../ddl/create_type.test. record_out/record_in match
 # PostgreSQL byte-for-byte. NB: type names here avoid PG's built-in geometric types (`point`/`line`/
-# `box`/…), and the corpus uses the PG-compatible record_in literal for NESTED composites — the bare
-# nested `ROW(ROW(…),…)` constructor is a documented jed extension PG rejects, covered by the unit
-# tests, not this PG-oracle corpus. Format: ../../../design/conformance.md.
+# `box`/…); a nested `ROW(ROW(…),…)` into a nested composite column is ../dml/composite_row_assign.test.
+# Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, expr.not_equal, types.composite, types.i32, types.text, resource.cost_metering
 
 statement ok

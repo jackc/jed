@@ -1133,11 +1133,23 @@ impl Engine {
                     }),
                     identity_kind,
                 )
-            } else if ty.is_composite() || ty.is_array() || ty.is_range() {
-                // A DEFAULT on a composite-, array-, or range-typed column is not supported this
-                // slice (composite.md §12 / array.md §12 / ranges.md §8), except a bare `DEFAULT
-                // NULL`: it is the same as no default (PostgreSQL stores none for it), so it records
-                // nothing.
+            } else if ty.is_composite() {
+                // A composite column's DEFAULT is always an EXPRESSION default (composite.md §12) —
+                // a `ROW(…)`, a record_in string, a same-typed expression — validated against the
+                // column's type now and evaluated per applied row. A bare `DEFAULT NULL` is the same
+                // as no default (PostgreSQL stores none for it), so it records nothing.
+                match &def.default {
+                    Some(d) if !is_bare_null_default(d) => (
+                        None,
+                        Some(self.build_container_default(&ty, &def.name, d)?),
+                        None,
+                    ),
+                    _ => (None, None, None),
+                }
+            } else if ty.is_array() || ty.is_range() {
+                // A DEFAULT on an array- or range-typed column is not supported this slice
+                // (array.md §12 / ranges.md §8), except a bare `DEFAULT NULL`: it is the same as no
+                // default (PostgreSQL stores none for it), so it records nothing.
                 if def
                     .default
                     .as_ref()
@@ -4073,6 +4085,34 @@ impl Engine {
         Ok(())
     }
 
+    /// Validate a composite column's DEFAULT (composite.md §12) and keep it as an EXPRESSION default:
+    /// the structural pre-walk (no column reference, subquery, …), then resolution against an empty
+    /// scope by the column assignment rule — a `ROW(…)` coerces field-by-field, a string literal
+    /// parses through record_in now (22P02 at CREATE, as in PostgreSQL), a bare NULL field adapts —
+    /// so a bad default fails at DDL time. Every application re-evaluates it per row.
+    fn build_container_default(
+        &self,
+        ty: &Type,
+        col_name: &str,
+        def: &DefaultDef,
+    ) -> Result<DefaultExpr> {
+        reject_default_structure(&def.expr)?;
+        let scope = Scope::empty(self);
+        resolve_container_assign_ty(
+            &scope,
+            ty,
+            col_name,
+            &def.expr,
+            &mut AggCtx::Forbidden,
+            &mut ParamTypes::default(),
+        )?;
+        Ok(DefaultExpr {
+            expr_text: def.text.clone(),
+            expr: def.expr.clone(),
+            unparsed: false,
+        })
+    }
+
     fn build_alter_default(
         &self,
         col: &Column,
@@ -4080,9 +4120,16 @@ impl Engine {
     ) -> Result<(Option<Value>, Option<DefaultExpr>)> {
         let Type::Scalar(sty) = &col.ty else {
             // A bare `DEFAULT NULL` on a container column is the same as no default (PostgreSQL
-            // stores none for it); any other container DEFAULT is not supported yet.
+            // stores none for it); a composite column takes an expression default (composite.md
+            // §12); any other container DEFAULT is not supported yet.
             if is_bare_null_default(def) {
                 return Ok((None, None));
+            }
+            if col.ty.is_composite() {
+                return Ok((
+                    None,
+                    Some(self.build_container_default(&col.ty, &col.name, def)?),
+                ));
             }
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
@@ -4389,7 +4436,7 @@ impl Engine {
                     IdentityKind::ByDefault
                 }
             });
-        } else if col.ty.is_composite() || col.ty.is_array() || col.ty.is_range() {
+        } else if col.ty.is_array() || col.ty.is_range() {
             // A bare `DEFAULT NULL` is the same as no default (see `create_table`).
             if def
                 .default
@@ -4398,7 +4445,7 @@ impl Engine {
             {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
-                    "a DEFAULT on a composite-, array-, or range-typed column is not supported yet",
+                    "a DEFAULT on an array- or range-typed column is not supported yet",
                 ));
             }
         } else if let Some(default) = &def.default {
@@ -4645,13 +4692,21 @@ impl Engine {
                 }
                 Some(de) => {
                     let scope = Scope::empty(self);
-                    let (node, _) = resolve(
-                        &scope,
-                        &de.expr,
-                        Some(col.ty.scalar()),
-                        &mut AggCtx::Forbidden,
-                        params,
-                    )?;
+                    let node = match &col.ty {
+                        Type::Scalar(s) => {
+                            resolve(&scope, &de.expr, Some(*s), &mut AggCtx::Forbidden, params)?.0
+                        }
+                        // A composite column's default resolves by the container assignment rule
+                        // it was validated with (a `ROW(…)` coerces field-by-field).
+                        ty => resolve_container_assign_ty(
+                            &scope,
+                            ty,
+                            &col.name,
+                            &de.expr,
+                            &mut AggCtx::Forbidden,
+                            params,
+                        )?,
+                    };
                     out.push(Some(node));
                 }
                 None => out.push(None),

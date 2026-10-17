@@ -1509,7 +1509,10 @@ fn composite_type_table_db() -> Session {
         &mut db,
         "CREATE TYPE addr AS (street text NOT NULL, zip i32)",
     );
-    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr)");
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, home addr DEFAULT ROW('Elm', 1))",
+    );
     run(&mut db, "INSERT INTO t VALUES (1, ROW('Main', 90210))");
     run(&mut db, "INSERT INTO t VALUES (2, ROW('Oak', NULL))");
     db

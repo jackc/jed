@@ -1502,7 +1502,7 @@ impl Engine {
             return Ok(());
         }
         match e {
-            RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
+            RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } | RExpr::CompositeCast { inner, .. } => {
                 self.fold_uncorrelated_in_rexpr(inner, bound, ctes, cost)
             }
             RExpr::Neg { operand, .. } => {

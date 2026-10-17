@@ -132,7 +132,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // field appends `u8 precision` (0xFF = none, else 0..6), an interval one `u8 interval_fields ‖ u8
 // precision` (fields 0 = no qualifier, else the datetime_units.toml qualifier code) in the typmod
 // slot (spec/design/timestamp.md §8, interval.md §6.1); no other byte layout change.
-pub(crate) const FORMAT_VERSION: u16 = 43;
+// v44: a composite column may carry an expression DEFAULT — column flags bit3 (default_is_expr),
+// with the expr-text (u16 length + UTF-8) after the type name (spec/design/composite.md §12); any
+// other composite column flag but not_null is corrupt. No other byte layout change.
+pub(crate) const FORMAT_VERSION: u16 = 44;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -4039,14 +4042,23 @@ fn table_entry_bytes(
         match &col.ty {
             Type::Composite(r) => {
                 // A composite column (v9): type_code 14, then flags, then the type name in the
-                // typmod slot (spec/fileformat/format.md). Composite columns carry no default this
-                // slice, so flags bits 2/3 are 0.
+                // typmod slot (spec/fileformat/format.md). A composite DEFAULT is always an
+                // EXPRESSION default (v44, flags bit3): its expr-text follows the type name. Bit2
+                // (a constant default) is never set.
                 out.push(14);
-                let flags = if col.not_null { 0b10u8 } else { 0 };
+                let mut flags = if col.not_null { 0b10u8 } else { 0 };
+                if col.default_expr.is_some() {
+                    flags |= 0b1000;
+                }
                 out.push(flags);
                 let tn = r.name.as_bytes();
                 out.extend_from_slice(&(tn.len() as u16).to_be_bytes());
                 out.extend_from_slice(tn);
+                if let Some(de) = &col.default_expr {
+                    let et = de.expr_text.as_bytes();
+                    out.extend_from_slice(&(et.len() as u16).to_be_bytes());
+                    out.extend_from_slice(et);
+                }
             }
             Type::Array(elem) => {
                 // An array column (v10): type_code 15, flags, then the element type descriptor
@@ -5665,14 +5677,30 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         let cname = read_string(buf, pos)?;
         let tc = read_u8(buf, pos)?;
         if tc == 14 {
-            // A composite column (v9): flags, then the type name (spec/fileformat/format.md).
-            // Forward-ready — composite columns are not produced this slice (composite.md §12),
-            // but a reader handles the code so a later-slice file loads cleanly.
+            // A composite column (v9): flags, then the type name (spec/fileformat/format.md), then
+            // (v44, flags bit3) the expression DEFAULT's text. Only bit1 (not_null) and bit3
+            // (default_is_expr) may be set — a composite never has a constant default, an
+            // identity, or a collation.
             let flags = read_u8(buf, pos)?;
             if flags & 0b01 != 0 {
                 return Err(corrupt("reserved column flag bit0 set"));
             }
+            if flags & !0b1010 != 0 {
+                return Err(corrupt("invalid composite column flags"));
+            }
             let tname = read_string(buf, pos)?;
+            let default_expr = if flags & 0b1000 != 0 {
+                let expr_text = read_string(buf, pos)?;
+                // Text this binary cannot parse is kept, unparsed (unparsable-definitions.md).
+                let (expr, unparsed) = parse_stored_expression(&expr_text);
+                Some(DefaultExpr {
+                    expr_text,
+                    expr,
+                    unparsed,
+                })
+            } else {
+                None
+            };
             columns.push(Column {
                 name: cname,
                 ty: Type::Composite(crate::types::CompositeRef { name: tname }),
@@ -5682,7 +5710,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 primary_key: false,
                 not_null: flags & 0b10 != 0,
                 default: None,
-                default_expr: None,
+                default_expr,
                 identity: None,
                 collation: None,
                 no_collation: false,

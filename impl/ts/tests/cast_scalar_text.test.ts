@@ -2,7 +2,7 @@
 // PG-clean oracle corpus cannot hold. The rendering of every type, the session-zone timestamptz form,
 // the 42P17 index rejection, and element-wise T[] → text[] agree with PostgreSQL and live in
 // suites/cast/scalar_to_text.test. Here: the casts are EXPLICIT only (an assignment or implicit use
-// is 42804 where PG accepts it), composite/range → text stay 0A000 (PG renders them), and the
+// is 42804 where PG accepts it), range → text stays 0A000 (PG renders it), and the
 // $1::text parameter declaration. Mirrors impl/rust/tests/cast_scalar_text.rs.
 
 import assert from "node:assert/strict";
@@ -33,16 +33,14 @@ test("the text cast is explicit only", () => {
   assert.deepEqual(query(db, "SELECT s FROM t WHERE s = 42::text"), [["42"]]);
 });
 
-// A composite or range value has no text cast yet (0A000), though PostgreSQL renders both.
-test("composite and range → text are 0A000", () => {
-  const db = dbWith(["CREATE TYPE addr AS (street text, zip i32)"]);
-  for (const sql of ["SELECT ('(Main,90210)'::addr)::text", "SELECT ('[1,5)'::i32range)::text"]) {
-    assert.equal(
-      errCode(() => db.execute(sql)),
-      "0A000",
-      sql,
-    );
-  }
+// A range value has no text cast yet (0A000), though PostgreSQL renders it (composite → text
+// landed — cast/composite_casts.test).
+test("range → text is 0A000", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => db.execute("SELECT ('[1,5)'::i32range)::text")),
+    "0A000",
+  );
 });
 
 // $1::text declares the parameter as text (the cast-target parameter typing, api.md §5); a

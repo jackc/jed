@@ -95,32 +95,6 @@ test("range narrowings are 0A000", () => {
   // dml/insert_select_container.test).
 });
 
-// Updating a range or composite COLUMN works — standalone UPDATE and the ON CONFLICT DO UPDATE
-// conflict-action path (ranges.md §4 / composite.md §12, oracle-clean in types/range.test and
-// dml/composite_assign.test) — but an anonymous ROW(…) expression assigned to a composite column
-// stays 0A000 (the anonymous-record → named-composite coercion, composite.md §12). PG supports it, so
-// it is jed-stricter and cannot live in the oracle corpus. (A $N parameter into a container column
-// now binds — params/containers.test.)
-test("container update deferrals are 0A000", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)",
-    "INSERT INTO t VALUES (1, '[1,5)')",
-  ]);
-  db.execute("CREATE TYPE addr AS (street text, zip i32)");
-  db.execute("CREATE TABLE p (id i32 PRIMARY KEY, a addr)");
-  db.execute("INSERT INTO p VALUES (1, ROW('x', 5))");
-  assert.equal(
-    errCode(() => db.execute("UPDATE p SET a = ROW('y', 9) WHERE id = 1")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() =>
-      db.execute("INSERT INTO p VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET a = ROW('y', 9)"),
-    ),
-    "0A000",
-  );
-});
-
 // Range comparison (R3) is restricted to the SAME element type (spec/design/ranges.md §6): a range
 // is comparable only to a range over an equal element, never to a different-element range or to a
 // bare scalar. jed reports its uniform comparison-mismatch code `42804`; PostgreSQL reports `42883`

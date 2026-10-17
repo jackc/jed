@@ -2,7 +2,7 @@
 //! PG-clean oracle corpus cannot hold. The rendering of every type, the session-zone timestamptz
 //! form, the 42P17 index rejection, and element-wise `T[] → text[]` agree with PostgreSQL and live in
 //! `suites/cast/scalar_to_text.test`. Here: the casts are EXPLICIT only (an assignment or implicit
-//! use is 42804 where PG accepts it), composite/range → text stay 0A000 (PG renders them), and the
+//! use is 42804 where PG accepts it), range → text stays 0A000 (PG renders it), and the
 //! `$1::text` parameter declaration. Mirrors impl/go/cast_scalar_text_test.go.
 
 use jed::value::Value;
@@ -61,15 +61,11 @@ fn text_cast_is_explicit_only() {
     );
 }
 
-/// A composite or range value has no text cast yet (0A000), though PostgreSQL renders both.
+/// A range value has no text cast yet (0A000), though PostgreSQL renders it (composite → text
+/// landed — cast/composite_casts.test).
 #[test]
-fn composite_and_range_to_text_are_0a000() {
+fn range_to_text_is_0a000() {
     let mut db = db();
-    exec(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
-    assert_eq!(
-        err_code(&mut db, "SELECT ('(Main,90210)'::addr)::text", &[]),
-        "0A000"
-    );
     assert_eq!(
         err_code(&mut db, "SELECT ('[1,5)'::i32range)::text", &[]),
         "0A000"

@@ -82,7 +82,7 @@ test("INSERT ... SELECT cost is the embedded SELECT's accrued cost", () => {
 
 // --- general expressions in VALUES slots (spec/design/grammar.md §16) ---------------------------
 // The shared corpus (suites/dml/insert_values_expr.test) pins the agreeing behaviour; these cover
-// what it cannot express: bind params inside an expression, and a deliberate PG divergence.
+// what it cannot express: bind params inside an expression.
 
 test("a $N inside a VALUES expression slot is typed by its operator context", () => {
   // A $N inside a VALUES expression slot is typed by the resolver from its operator context
@@ -90,19 +90,4 @@ test("a $N inside a VALUES expression slot is typed by its operator context", ()
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, name text)"]);
   db.execute("INSERT INTO t VALUES ($1 + 1, upper($2))", [intValue(1n), textValue("ab")]);
   assert.deepStrictEqual(query(db, "SELECT id, name FROM t"), [["2", "AB"]]);
-});
-
-test("an anonymous ROW expression into a composite column is 0A000", () => {
-  // A deliberate narrowing (PostgreSQL accepts it): a ROW(…) whose fields are not all literals is a
-  // general expression of an anonymous record type, and anonymous-record → named-composite
-  // assignment is deferred exactly as for UPDATE (composite.md §12). A literal-field ROW(…) and a
-  // value of the column's own composite type are accepted (the shared corpus covers both).
-  const db = dbWith([
-    "CREATE TYPE pt AS (x i32, y i32)",
-    "CREATE TABLE t (id i32 PRIMARY KEY, p pt)",
-  ]);
-  assert.equal(
-    errCode(() => db.execute("INSERT INTO t VALUES (1, ROW(1 + 1, 2))")),
-    "0A000",
-  );
 });

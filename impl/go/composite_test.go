@@ -84,8 +84,8 @@ func queryRendered(t *testing.T, db dbHandle, sql string) [][]string {
 }
 
 // TestNestedCompositeValueRoundtrip: a nested composite value round-trips and renders with the inner
-// record quoted. The nested ROW(ROW(…),…) constructor is a jed extension PG rejects, so this lives
-// here, not in the corpus.
+// record quoted (the nested ROW(ROW(…),…) constructor's PostgreSQL-checked surface is
+// dml/composite_row_assign.test).
 func TestNestedCompositeValueRoundtrip(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})

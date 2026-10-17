@@ -2568,6 +2568,13 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             )
         }
         RExpr::ArrayCast { inner, .. } => format!("array_cast({})", render_rexpr(inner)),
+        RExpr::CompositeCast { inner, to } => {
+            let target = match to {
+                Some(ColType::Composite { name, .. }) => name.as_str(),
+                _ => "text",
+            };
+            format!("cast({} as {target})", render_rexpr(inner))
+        }
         RExpr::Neg { operand, .. } => format!("(-{})", render_rexpr(operand)),
         RExpr::Not(operand) => format!("(not {})", render_rexpr(operand)),
         RExpr::Arith { op, lhs, rhs, .. } => binary(lhs, explain_arith_op(*op), rhs),
@@ -5369,30 +5376,59 @@ fn resolve_node(
                     })
                     .map_err(|e| e.with_position(pos.0));
                 }
+                // An anonymous `ROW(…)` (or bare `(a, b, …)`) constructor casts structurally: each
+                // field is explicitly cast to its field type (composite.md §8, PostgreSQL's
+                // record → composite coercion under the explicit context).
+                if let Expr::Row(items, _) = inner.as_ref() {
+                    return resolve_row_to_composite(
+                        scope,
+                        items,
+                        ct,
+                        RowCoercion::Explicit,
+                        agg,
+                        params,
+                    );
+                }
                 let ct_name = ct.name.clone();
+                let cty = Type::Composite(crate::types::CompositeRef {
+                    name: ct_name.clone(),
+                });
+                let target_rt = resolved_type_of_col(&cty, scope.catalog);
                 // A bind parameter cast to a composite type takes that type (api.md §5).
                 if let Expr::Param(n1, _) = inner.as_ref() {
-                    let cty = Type::Composite(crate::types::CompositeRef { name: ct_name });
                     let col = resolve_col_type(&cty, &scope.catalog.read_snap().types);
-                    let rt = resolved_type_of_col(&cty, scope.catalog);
-                    return resolve_param_node(scope, *n1, Some(col), rt, params);
+                    return resolve_param_node(scope, *n1, Some(col), target_rt, params);
                 }
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
                 return match &ity {
-                    ResolvedType::Null => Ok((
-                        rinner,
-                        resolved_type_of_col(
-                            &Type::Composite(crate::types::CompositeRef { name: ct_name }),
-                            scope.catalog,
-                        ),
-                    )),
+                    ResolvedType::Null => Ok((rinner, target_rt)),
                     // An identical named composite is the identity cast.
                     ResolvedType::Composite(c) if c.name.as_deref() == Some(ct_name.as_str()) => {
                         Ok((rinner, ity))
                     }
+                    // A runtime text value parses through `record_in` per row (22P02 malformed, a
+                    // field's own input error otherwise). A timestamptz field reads an offset-less
+                    // string in the session zone, so the cast is then STABLE (42P17 in an index
+                    // expression), like the array_in cast.
+                    ResolvedType::Text => {
+                        params.nonimmutable |= target_rt.contains_timestamptz();
+                        Ok((
+                            RExpr::CompositeCast {
+                                inner: Box::new(rinner),
+                                to: Some(resolve_col_type(&cty, &scope.catalog.read_snap().types)),
+                            },
+                            target_rt,
+                        ))
+                    }
+                    // An anonymous record that is not a ROW constructor (a derived column, a
+                    // subquery) has no field expressions to cast — PostgreSQL's "cannot cast type
+                    // record to addr" (42846 there).
+                    ResolvedType::Composite(c) if c.name.is_none() => {
+                        Err(record_cast_error(&ct_name, ""))
+                    }
                     _ => Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "casting to a composite type is only supported from a string literal",
+                        SqlState::CannotCoerce,
+                        format!("cannot cast type {} to {ct_name}", ity.type_name()),
                     )),
                 };
             }
@@ -5766,11 +5802,16 @@ fn resolve_node(
                         "casting from a date type is not supported yet",
                     ));
                 }
-                // Casting a composite (text↔composite) lands in a later slice (composite.md §8/§12).
+                // A composite casts only to text or a composite (composite.md §8): a numeric
+                // target is a forbidden pair (42846 cannot_coerce, as PostgreSQL).
                 ResolvedType::Composite(_) => {
                     return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "casting a composite value is not supported yet",
+                        SqlState::CannotCoerce,
+                        format!(
+                            "cannot cast type {} to {}",
+                            ity.type_name(),
+                            target.canonical_name()
+                        ),
                     ));
                 }
                 // Casting FROM an array (array→text, element-wise array→array) is deferred
@@ -7071,7 +7112,24 @@ pub(crate) fn cast_to_text(
                 to_elem: None,
             })
         }
-        ResolvedType::Composite(_) | ResolvedType::Range(_) => Err(EngineError::new(
+        // composite → text (spec/design/composite.md §8): `record_out` renders `(…)` per row.
+        // Explicit only, like the array cast; a `timestamptz` anywhere in the type renders in the
+        // session zone, so the cast is then STABLE. An anonymous `ROW(…)` renders the same way.
+        ResolvedType::Composite(_) if varchar_len.is_none() => {
+            params.nonimmutable |= ity.contains_timestamptz();
+            Ok(RExpr::CompositeCast {
+                inner: Box::new(rinner),
+                to: None,
+            })
+        }
+        ResolvedType::Composite(_) => {
+            params.nonimmutable |= ity.contains_timestamptz();
+            Ok(cast(RExpr::CompositeCast {
+                inner: Box::new(rinner),
+                to: None,
+            }))
+        }
+        ResolvedType::Range(_) => Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "casting to text is not supported yet",
         )),

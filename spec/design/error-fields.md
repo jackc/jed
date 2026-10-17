@@ -402,7 +402,7 @@ query surfaces (CLAUDE.md §13). jed adds it as a sixth structured field.
 | a string literal converted at resolve time: cast (`'abc'::int`, `CAST('abc' AS int)`), typed (`int 'abc'`), or adapting to its context (`uuid_col = 'x'`, `UPDATE … SET range_col = '[1,'`) | any input error (`22P02`, `22003`, `22007`, …) | the literal |
 | an `INSERT … VALUES` literal slot, converted when the row is stored | `42804`; a string literal's input error (class 22 except `22001`) | the literal |
 | an unknown type name: a cast target, a typed literal, a `CREATE TABLE` / `ADD COLUMN` column type | `42704` | the type name |
-| a cast between types with no conversion | jed's `42804` (PostgreSQL's `42846`) | the `::`, or the `CAST` keyword |
+| a cast between types with no conversion | jed's `42804` (PostgreSQL's `42846`); a composite cast `42846` | the `::`, or the `CAST` keyword |
 | a simple `CASE`'s comparison of its operand with a `WHEN` value | `42804` / `42883` | the `WHEN` keyword |
 | a sort key with no ordering operator; a grouping key, `DISTINCT` output column, or set-operation column with no equality operator | `42883` | the key as written (an ordinal's number); the select item; the left operand's column |
 | a recursive CTE whose recursive term changes a column's type, typmod, or collation | `42804`, `42P21` | the non-recursive term's column |

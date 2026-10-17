@@ -14,7 +14,9 @@ schema_version = 1
 #    generated before it fail to open (XX001); invalidate them.
 # 7: the on-disk format bumped 42 → 43 (timestamp / interval typmod slots), so v42 datasets
 #    fail to open; invalidate them.
-generator_version = 7
+# 8: the on-disk format bumped 43 → 44 (composite column DEFAULTs), so v43 datasets fail to
+#    open; invalidate them.
+generator_version = 8
 
 [[dataset]]
 name = "small"

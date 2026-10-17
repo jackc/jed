@@ -590,7 +590,9 @@ import {
 import {
   coerceStringLiteral,
   requireTextOrNull,
+  recordCastError,
   resolveContainerAssign,
+  resolveContainerAssignTy,
   resolveOperandPair,
   widenFloatTo,
 } from "./kernels.ts";
@@ -4321,7 +4323,7 @@ export class Engine {
       case "inValues": add(expr.lhs); return;
       case "quantified": add(expr.lhs); add(expr.array); return;
       case "widthBucketArray": add(expr.operand); add(expr.thresholds); return;
-      case "cast": case "arrayCast": case "neg": case "not": case "isNull":
+      case "cast": case "arrayCast": case "compositeCast": case "neg": case "not": case "isNull":
       case "isJson": case "jsonCtor": add(expr.operand); return;
       case "arith": case "compare": case "and": case "or": case "distinct":
       case "like": case "regex": add(expr.lhs); add(expr.rhs); return;
@@ -6693,18 +6695,22 @@ export class Engine {
         const exprText = nextvalDefaultText(seqName);
         def_defaultExpr = { exprText, expr: parseExpression(exprText) };
         if (def.identity !== null) identityKind = def.identity.always ? "always" : "byDefault";
-      } else if (
-        colType.kind === "composite" ||
-        colType.kind === "array" ||
-        colType.kind === "range"
-      ) {
-        // A DEFAULT on a composite-, array-, or range-typed column is not supported this slice
-        // (composite.md §12 / array.md §12 / ranges.md §8), except a bare DEFAULT NULL: it is the
-        // same as no default (PostgreSQL stores none for it), so it records nothing.
+      } else if (colType.kind === "composite") {
+        // A composite column's DEFAULT is always an EXPRESSION default (composite.md §12) — a
+        // ROW(…), a record_in string, a same-typed expression — validated against the column's
+        // type now and evaluated per applied row. A bare DEFAULT NULL is the same as no default
+        // (PostgreSQL stores none for it), so it records nothing.
+        if (def.default !== null && !isBareNullDefault(def.default)) {
+          def_defaultExpr = this.buildContainerDefault(colType, def.name, def.default);
+        }
+      } else if (colType.kind === "array" || colType.kind === "range") {
+        // A DEFAULT on an array- or range-typed column is not supported this slice (array.md §12 /
+        // ranges.md §8), except a bare DEFAULT NULL: it is the same as no default (PostgreSQL
+        // stores none for it), so it records nothing.
         if (def.default !== null && !isBareNullDefault(def.default)) {
           throw engineError(
             "feature_not_supported",
-            "a DEFAULT on a composite-, array-, or range-typed column is not supported yet",
+            "a DEFAULT on an array- or range-typed column is not supported yet",
           );
         }
       } else if (def.default !== null) {
@@ -7539,13 +7545,21 @@ export class Engine {
     return table.columns.map((col, i) => {
       if (col.defaultExpr === null || (need !== null && !need[i])) return null;
       if (col.defaultExpr.unparsed) throw unparsableDefaultError(table.name, col.name);
-      return resolve(
+      const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+      if (col.type.kind === "scalar") {
+        return resolve(Scope.empty(this), col.defaultExpr.expr, col.type.scalar, forbidden, ptypes)
+          .node;
+      }
+      // A composite column's default resolves by the container assignment rule it was validated
+      // with (a ROW(…) coerces field-by-field).
+      return resolveContainerAssignTy(
         Scope.empty(this),
+        col.type,
+        col.name,
         col.defaultExpr.expr,
-        typeScalar(col.type),
-        { collecting: false, groupKeys: [], specs: [] },
+        forbidden,
         ptypes,
-      ).node;
+      );
     });
   }
 
@@ -9282,12 +9296,39 @@ export class Engine {
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
   }
 
+  // buildContainerDefault validates a composite column's DEFAULT (composite.md §12) and keeps it as
+  // an EXPRESSION default: the structural pre-walk (no column reference, subquery, …), then
+  // resolution against an empty scope by the column assignment rule — a ROW(…) coerces
+  // field-by-field, a string literal parses through record_in now (22P02 at CREATE, as in
+  // PostgreSQL), a bare NULL field adapts — so a bad default fails at DDL time. Every application
+  // re-evaluates it per row.
+  private buildContainerDefault(ty: Type, colName: string, def: DefaultDef): DefaultExpr {
+    rejectDefaultStructure(def.expr);
+    resolveContainerAssignTy(
+      Scope.empty(this),
+      ty,
+      colName,
+      def.expr,
+      { collecting: false, groupKeys: [], specs: [] },
+      new ParamTypes(),
+    );
+    return { exprText: def.text, expr: def.expr };
+  }
+
   private buildAlterDefault(col: Column, def: DefaultDef): Column {
     const sty = typeAsScalar(col.type);
     // A bare DEFAULT NULL on a container column is the same as no default (PostgreSQL stores none
-    // for it); any other container DEFAULT is not supported yet.
+    // for it); a composite column takes an expression default (composite.md §12); any other
+    // container DEFAULT is not supported yet.
     if (sty === undefined && isBareNullDefault(def))
       return { ...col, default: null, defaultExpr: null };
+    if (col.type.kind === "composite") {
+      return {
+        ...col,
+        default: null,
+        defaultExpr: this.buildContainerDefault(col.type, col.name, def),
+      };
+    }
     if (sty === undefined)
       throw engineError(
         "feature_not_supported",
@@ -9481,12 +9522,12 @@ export class Engine {
         identity:
           def.identity === null ? null : def.identity.always ? "always" : "byDefault",
       };
-    } else if (type.kind === "composite" || type.kind === "array" || type.kind === "range") {
+    } else if (type.kind === "array" || type.kind === "range") {
       // A bare DEFAULT NULL is the same as no default (see executeCreateTable).
       if (def.default !== null && !isBareNullDefault(def.default))
         throw engineError(
           "feature_not_supported",
-          "a DEFAULT on a composite-, array-, or range-typed column is not supported yet",
+          "a DEFAULT on an array- or range-typed column is not supported yet",
         );
     } else if (def.default !== null) col = this.buildAlterDefault(col, def.default);
     return col;
@@ -11016,25 +11057,10 @@ export class Engine {
           );
         }
         out[p] = node;
-      } else if (col.type.kind === "range" || col.type.kind === "array") {
-        out[p] = resolveContainerAssign(scope, col, value.expr, forbidden, ptypes);
       } else {
-        const { node, type } = resolve(scope, value.expr, null, forbidden, ptypes);
-        if (type.kind === "composite" && type.name === null) {
-          throw engineError(
-            "feature_not_supported",
-            `inserting a ROW expression into composite column ${col.name} is not supported yet`,
-          );
-        }
-        if (type.kind !== "null" && !resolvedTypeEqual(type, resolvedTypeOfCol(col.type, this))) {
-          throw positionedAt(
-            assignmentError(
-              `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
-            ),
-            exprLocation(value.expr),
-          );
-        }
-        out[p] = node;
+        // A range/array/composite column shares UPDATE's container rule (a ROW(…) coerces
+        // field-by-field to a composite column's type — composite.md §12).
+        out[p] = resolveContainerAssign(scope, col, value.expr, forbidden, ptypes);
       }
     }
     return out;
@@ -11536,14 +11562,15 @@ export class Engine {
         const col = table.columns[i]!;
         // A container column takes a source column of exactly its own type, or an untyped NULL —
         // the container assignment rule UPDATE and an INSERT VALUES expression share (array.md §6,
-        // ranges.md §1, composite.md §12). An anonymous ROW(…) column has no composite type to
-        // match (0A000).
+        // ranges.md §1, composite.md §12). An anonymous record column (a projected ROW(…)) is a
+        // source column, not a constructor whose fields could coerce — PostgreSQL's "cannot cast
+        // type record to addr" (42846).
         if (col.type.kind !== "scalar") {
           const src = q.columnTypes[p]!;
           if (src.kind === "composite" && src.name === null) {
-            throw engineError(
-              "feature_not_supported",
-              `inserting a ROW expression into composite column ${col.name} is not supported yet`,
+            throw positionedAt(
+              recordCastError(typeCanonicalName(col.type), ""),
+              outputColumnLocation(ins.source.query, p),
             );
           }
           if (src.kind !== "null" && !resolvedTypeEqual(src, resolvedTypeOfCol(col.type, this))) {
@@ -23291,6 +23318,7 @@ export class Engine {
       }
       case "cast":
       case "arrayCast":
+      case "compositeCast":
       case "neg":
       case "not":
       case "isNull":
@@ -26152,6 +26180,7 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
       break;
     case "cast":
     case "arrayCast":
+    case "compositeCast":
     case "neg":
     case "not":
     case "isNull":
@@ -27668,6 +27697,7 @@ export function rexprIsConstant(e: RExpr): boolean {
       return rexprIsConstant(e.base);
     case "cast":
     case "arrayCast":
+    case "compositeCast":
     case "neg":
     case "not":
     case "isNull":
@@ -30441,6 +30471,7 @@ export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       return rexprReferencesOuter(e.operand, depth) || rexprReferencesOuter(e.thresholds, depth);
     case "cast":
     case "arrayCast":
+    case "compositeCast":
     case "neg":
     case "not":
     case "isNull":
@@ -30890,6 +30921,7 @@ function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
       return;
     case "cast":
     case "arrayCast":
+    case "compositeCast":
     case "neg":
     case "not":
     case "isNull":
@@ -31172,6 +31204,7 @@ export function collectTouched(e: RExpr, depth: number, touched: boolean[]): voi
       return;
     case "cast":
     case "arrayCast":
+    case "compositeCast":
     case "neg":
     case "not":
     case "isNull":
@@ -31602,6 +31635,7 @@ export function rebasePlaceholderCols(e: RExpr, from: number, target: number): v
       return;
     case "cast":
     case "arrayCast":
+    case "compositeCast":
     case "neg":
     case "not":
     case "isNull":
@@ -32003,6 +32037,11 @@ export type RExpr =
   // scalar cast). `toElem` is the target element ColType for the two array-producing casts and null
   // for array → text; the eval branches on the runtime value (text vs array).
   | { kind: "arrayCast"; toElem: ColType | null; operand: RExpr }
+  // A runtime cast that INVOLVES a composite type (spec/design/composite.md §8): text → composite
+  // (record_in per row, `to` = the composite's ColType) and composite → text (record_out per row,
+  // `to` = null). The eval branches on the runtime value (text vs composite). A `ROW(…)::type` cast
+  // needs no node — its fields are cast individually.
+  | { kind: "compositeCast"; to: ColType | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
   | { kind: "not"; operand: RExpr }
   | { kind: "arith"; op: BinaryOp; result: ScalarType; lhs: RExpr; rhs: RExpr }

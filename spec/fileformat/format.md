@@ -17,7 +17,15 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 43)
+## Version scope (`format_version` 44)
+
+`format_version` **44** — **composite column DEFAULTs** ([../design/composite.md §12](../design/composite.md)).
+A composite column entry's `flags` byte may set bit3 `default_is_expr`, and the expression
+DEFAULT's text (`u16` length + UTF-8, the same token rendering a scalar expression default uses)
+then follows the composite type name (*composite column* below). Every other composite-column flag
+but bit1 `not_null` is `XX001`. A file with no composite default changes only by its version byte +
+meta CRC; the `composite_type_table` golden now pins a composite default. Readers accept only the
+exact current version.
 
 `format_version` **43** — **timestamp precision and interval qualifier typmods**
 ([../design/timestamp.md §8](../design/timestamp.md), [../design/interval.md §6.1](../design/interval.md)).
@@ -862,10 +870,10 @@ constraint owns no extra B-tree (its backing GiST index is in the index list); a
 A **composite column** (a column whose type is a user-defined composite — `type_code == 14`)
 appends, in the column entry's typmod slot (where a decimal appends precision/scale), a
 `u16 type_name_len` then that many UTF-8 bytes naming the composite type. The named type must
-appear in this catalog's composite-type entries (else `XX001`). A composite column is **not** a
-key this slice — a composite `PRIMARY KEY` / index / `UNIQUE` column is rejected `0A000` at DDL
-([../design/composite.md §6](../design/composite.md)), so no composite key bytes ever reach a
-data record.
+appear in this catalog's composite-type entries (else `XX001`). The entry's `flags` byte carries
+only bit1 `not_null` and (**v44**) bit3 `default_is_expr`: a composite column's DEFAULT is always an
+expression default ([../design/composite.md §12](../design/composite.md)), whose expr-text
+(`u16` length + UTF-8) follows the type name when bit3 is set. Any other flag bit is `XX001`.
 
 An **array column** (a structural `T[]` type — `type_code == 15`, **v10**;
 [../design/array.md §3](../design/array.md)) appends, in the typmod slot, an **element type

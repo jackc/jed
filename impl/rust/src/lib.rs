@@ -294,6 +294,14 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "types.composite",
     // The bare row constructor (a, b, …) — the implicit-ROW spelling (composite.md §1).
     "types.composite_bare_row",
+    // A ROW(…) expression assigned to a composite column coerces field-by-field (composite.md §12).
+    "types.composite_row_assign",
+    // The runtime composite casts (composite.md §8): composite → text, runtime text → composite,
+    // and the structural ROW(…)::type cast.
+    "cast.composite",
+    // A non-NULL DEFAULT on a composite column, kept as an expression default (composite.md §12,
+    // format_version 44).
+    "ddl.composite_default",
     "types.array",
     // Array element subscript a[i] — 1-based, OOB/NULL → NULL, non-array base 42804 (array.md §6).
     "expr.array_subscript",

@@ -3850,6 +3850,14 @@ pub(crate) enum RExpr {
         inner: Box<RExpr>,
         to_elem: Option<ColType>,
     },
+    /// A runtime cast that *involves* a composite type (spec/design/composite.md §8): `text →
+    /// composite` (`record_in` per row, `to = Some(the composite's ColType)`) and `composite → text`
+    /// (`record_out` per row, `to = None`). The eval branches on the runtime value (Text vs
+    /// Composite). A `ROW(…)::type` cast needs no node — its fields are cast individually.
+    CompositeCast {
+        inner: Box<RExpr>,
+        to: Option<ColType>,
+    },
     Neg {
         operand: Box<RExpr>,
         result: ScalarType,

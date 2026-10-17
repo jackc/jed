@@ -26,15 +26,15 @@ import {
   truncateToChars,
   typeError,
 } from "./store.ts";
-import type { BinaryOp, Expr } from "./ast.ts";
+import type { BinaryOp, Expr, TypeMod } from "./ast.ts";
 import type { AggCtx, RExpr, ResolvedType } from "./executor.ts";
-import { atPosition, engineError, positionedAt } from "./errors.ts";
-import { exprLocation } from "./eval_ops.ts";
+import { EngineError, atPosition, engineError, positionedAt } from "./errors.ts";
+import { assignableTo, exprLocation } from "./eval_ops.ts";
 import type { DecimalTypmod, ScalarType, TemporalTypmod, Type } from "./types.ts";
 import { emptyRangeValue, parseByteaHex, parseRecordTokens, parseUuid } from "./value.ts";
 import { canonicalName, minOf, rank, roundToWidth, typeCanonicalName } from "./types.ts";
 import { radixDigitValue } from "./lexer.ts";
-import type { ColType, Column, CompositeType } from "./catalog.ts";
+import type { ColType, Column, CompositeField, CompositeType } from "./catalog.ts";
 import { resolvedRangeElementScalar } from "./scope.ts";
 import { elementScalar, finalizeRange, parseRangeText, rangeForElement } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
@@ -471,14 +471,15 @@ export function floatFromDecimalLiteral(
 // ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
 // canonicalize (spec/design/ranges.md §4/§5). Folds to a constRange. 22P02 malformed / 22000
 // lower>upper / 22003 canonicalize overflow.
-// resolveContainerAssign resolves an UPDATE (or ON CONFLICT DO UPDATE) assignment RHS against a
-// RANGE, ARRAY, or COMPOSITE column. Mirrors INSERT's value adaptation (ranges.md §5 / array.md §7 /
-// composite.md §8): a bare string literal adapts to the container via range_in / array_in /
-// record_in, a bare NULL is the typed NULL, and any other expression must resolve to the SAME
-// container type (matching element / the same named composite) else 42804. An anonymous ROW(…)
-// expression has no composite type to match (0A000, the INSERT … VALUES expression rule —
-// composite.md §12). A top-level $N parameter is deferred (0A000) — INSERT's param-to-container
-// handling is special and not generalized to the assignment RHS yet.
+// resolveContainerAssign resolves an UPDATE (or ON CONFLICT DO UPDATE, or INSERT … VALUES
+// expression slot) assignment RHS against a RANGE, ARRAY, or COMPOSITE column. Mirrors INSERT's
+// value adaptation (ranges.md §5 / array.md §7 / composite.md §8): a bare string literal adapts to
+// the container via range_in / array_in / record_in, a bare NULL is the typed NULL, a ROW(…)
+// constructor assigned to a composite coerces field-by-field to the composite's field types
+// (composite.md §12, PostgreSQL's record → composite assignment coercion), and any other expression
+// must resolve to the SAME container type (matching element / the same named composite) else 42804
+// — except an anonymous record that is not a ROW(…) constructor (a CASE, a subquery, a derived
+// column), which is PostgreSQL's 42846 "cannot cast type record to addr".
 export function resolveContainerAssign(
   scope: Scope,
   col: Column,
@@ -486,23 +487,138 @@ export function resolveContainerAssign(
   ag: AggCtx,
   params: ParamTypes,
 ): RExpr {
-  const colRT = resolvedTypeOfCol(col.type, scope.catalog);
+  return resolveContainerAssignTy(scope, col.type, col.name, e, ag, params);
+}
+
+// RowCoercion is how a ROW(…) constructor's fields coerce to a named composite's field types
+// (spec/design/composite.md §12): by the ASSIGNMENT rule of a stored column (each field must be
+// assignable to its field type, the value coerced at store), or by an EXPLICIT ::type cast (each
+// field explicitly cast to its field type) — PostgreSQL's coerce_record_to_complex under the
+// assignment and explicit coercion contexts.
+export type RowCoercion = "assign" | "explicit";
+
+// recordCastError is the 42846 cannot_coerce "cannot cast type record to T" a record → named-composite
+// coercion raises, as PostgreSQL does (composite.md §8/§12).
+export function recordCastError(typeName: string, detail: string): EngineError {
+  const msg =
+    detail === ""
+      ? `cannot cast type record to ${typeName}`
+      : `cannot cast type record to ${typeName}: ${detail}`;
+  return engineError("cannot_coerce", msg).noHint();
+}
+
+// resolveRowToComposite coerces a ROW(…) (or bare (a, b, …)) constructor's field expressions to the
+// named composite ct (spec/design/composite.md §12), recursing for a nested composite field (a
+// nested ROW(…) coerces one level down). The field count must equal the type's (42846 otherwise).
+// Under "assign" each field resolves with its field type as the literal hint and must be assignable
+// to it — a scalar field by the column assignment rule, a container field by
+// resolveContainerAssignTy — and the value is coerced when stored. Under "explicit" each field is
+// explicitly cast to its field type (the scalar / container cast surface), so the row's values
+// carry the target types at eval. Returns a row node typed as the named composite.
+export function resolveRowToComposite(
+  scope: Scope,
+  items: Expr[],
+  ct: CompositeType,
+  mode: RowCoercion,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (items.length !== ct.fields.length) {
+    const which =
+      items.length < ct.fields.length ? "input has too few columns" : "input has too many columns";
+    throw recordCastError(ct.name, which);
+  }
+  const nodes: RExpr[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!;
+    const f = ct.fields[i]!;
+    if (mode === "explicit") {
+      const [typeName, typeMod] = fieldCastTarget(f);
+      const cast: Expr = { kind: "cast", inner: item, typeName, typeMod };
+      nodes.push(resolve(scope, cast, null, ag, params).node);
+      continue;
+    }
+    if (f.type.kind === "scalar") {
+      const target = f.type.scalar;
+      const { node, type } = resolve(scope, item, target, ag, params);
+      if (!assignableTo(type, target)) {
+        throw positionedAt(
+          recordCastError(
+            ct.name,
+            `field ${f.name} is of type ${typeCanonicalName(f.type)} but expression is of type ${rtName(type)}`,
+          ),
+          exprLocation(item),
+        );
+      }
+      nodes.push(node);
+      continue;
+    }
+    // A container field that does not coerce fails the whole record → composite coercion:
+    // PostgreSQL's 42846 cannot_coerce, not the column-level 42804.
+    try {
+      nodes.push(resolveContainerAssignTy(scope, f.type, f.name, item, ag, params));
+    } catch (err) {
+      if (err instanceof EngineError && err.state === "datatype_mismatch")
+        err.state = "cannot_coerce";
+      throw err;
+    }
+  }
+  const type = resolvedTypeOfCol({ kind: "composite", name: ct.name }, scope.catalog);
+  return { node: { kind: "row", fields: nodes }, type };
+}
+
+// fieldCastTarget is the cast target (type name + modifier) naming a composite field's declared
+// type — the cast an explicit ROW(…)::type cast applies to that field: a scalar's canonical name
+// (with its numeric(p,s), varchar(n), or timestamp/interval modifier), a composite's name, an array's T[], a range's
+// name.
+function fieldCastTarget(f: CompositeField): [string, TypeMod | null] {
+  let typeMod: TypeMod | null = null;
+  if (f.decimal !== null && f.decimal.precision > 0) {
+    typeMod = {
+      precision: BigInt(f.decimal.precision),
+      scale: BigInt(f.decimal.scale),
+      intervalFields: 0,
+    };
+  } else if (f.varcharLen !== null) {
+    typeMod = { precision: BigInt(f.varcharLen), scale: null, intervalFields: 0 };
+  } else if (f.temporal !== null) {
+    typeMod = {
+      precision: f.temporal.precision === null ? null : BigInt(f.temporal.precision),
+      scale: null,
+      intervalFields: f.temporal.fields,
+    };
+  }
+  return [typeCanonicalName(f.type), typeMod];
+}
+
+// resolveContainerAssignTy is resolveContainerAssign over a bare container type and the name its
+// errors cite — shared by a column (UPDATE / DO UPDATE / an INSERT expression slot) and a composite
+// field one ROW(…) level down (resolveRowToComposite).
+export function resolveContainerAssignTy(
+  scope: Scope,
+  colType: Type,
+  colName: string,
+  e: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): RExpr {
+  const colRT = resolvedTypeOfCol(colType, scope.catalog);
   // A bare string literal adapts to the container context (the same string-adapts-to-context rule
   // the cast and INSERT VALUES paths use).
   if (e.kind === "literal" && e.literal.kind === "text") {
     const text = e.literal.text;
     const iz = scope.catalog.inputZone();
-    if (col.type.kind === "range") {
-      if (col.type.elem.kind !== "scalar")
+    if (colType.kind === "range") {
+      if (colType.elem.kind !== "scalar")
         throw new Error("a range element is always a scalar (ranges.md §2)");
-      const desc = rangeForElement(col.type.elem.scalar);
+      const desc = rangeForElement(colType.elem.scalar);
       if (desc === undefined) throw new Error("a range column's element always has a range type");
       const node = atPosition(e.loc, () => coerceStringToRangeExpr(text, desc, iz)).node;
       params.noteInputZone(iz);
       return node;
     }
-    if (col.type.kind === "composite") {
-      const ct = scope.catalog.compositeType(col.type.name);
+    if (colType.kind === "composite") {
+      const ct = scope.catalog.compositeType(colType.name);
       if (ct === undefined) throw new Error("a composite column's type exists in the catalog");
       const node = atPosition(e.loc, () =>
         coerceStringToComposite(text, ct, scope.catalog, iz),
@@ -511,7 +627,7 @@ export function resolveContainerAssign(
       return node;
     }
     // array
-    const elem = (col.type as { kind: "array"; elem: Type }).elem;
+    const elem = (colType as { kind: "array"; elem: Type }).elem;
     const val = atPosition(e.loc, () =>
       coerceStringToArray(text, scope.catalog.colTypeOf(elem), iz),
     );
@@ -523,8 +639,14 @@ export function resolveContainerAssign(
   }
   // A bind parameter assigned to a container column takes the column's type (api.md §5).
   if (e.kind === "param") {
-    const colRt = resolvedTypeOfCol(col.type, scope.catalog);
-    return resolveParamNode(scope, e, scope.catalog.colTypeOf(col.type), colRt, params).node;
+    const colRt = resolvedTypeOfCol(colType, scope.catalog);
+    return resolveParamNode(scope, e, scope.catalog.colTypeOf(colType), colRt, params).node;
+  }
+  // A ROW(…) constructor assigned to a composite coerces field-by-field (composite.md §12).
+  if (colType.kind === "composite" && e.kind === "row") {
+    const ct = scope.catalog.compositeType(colType.name);
+    if (ct === undefined) throw new Error("a composite column's type exists in the catalog");
+    return resolveRowToComposite(scope, e.fields, ct, "assign", ag, params).node;
   }
   // For an array column over a SCALAR element, pass the element type as the hint so a bare
   // ARRAY[1,2] constructor adapts its literal elements to the column's element type (the same
@@ -532,21 +654,21 @@ export function resolveContainerAssign(
   // narrower i32[]/i16[] column). A range gets no scalar hint (its bare-literal form was handled
   // above; other forms self-describe their element).
   let hint: ScalarType | null = null;
-  if (col.type.kind === "array" && col.type.elem.kind === "scalar") hint = col.type.elem.scalar;
+  if (colType.kind === "array" && colType.elem.kind === "scalar") hint = colType.elem.scalar;
   const { node, type } = resolve(scope, e, hint, ag, params);
   if (type.kind === "null") return node; // a NULL-typed expression (e.g. a CASE that may be NULL)
-  if (type.kind === "composite" && type.name === null) {
-    throw engineError(
-      "feature_not_supported",
-      `assigning a ROW expression to composite column ${col.name} is not supported yet`,
-    );
+  // An anonymous record that is not a ROW(…) constructor (a CASE over rows, a scalar subquery, a
+  // derived column) has no field expressions to coerce — PostgreSQL's "cannot cast type record to
+  // addr" (composite.md §12).
+  if (colType.kind === "composite" && type.kind === "composite" && type.name === null) {
+    throw positionedAt(recordCastError(colType.name, ""), exprLocation(e));
   }
   // Ranges/arrays are assignable only over equal element types (resolvedTypeEqual compares the
   // element recursively), matching the comparison rule (ranges.md §6 / array.md §5).
   if (!resolvedTypeEqual(type, colRT)) {
     throw positionedAt(
       assignmentError(
-        `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+        `column ${colName} is of type ${typeCanonicalName(colType)} but expression is of type ${rtName(type)}`,
       ),
       exprLocation(e),
     );

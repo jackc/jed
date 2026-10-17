@@ -250,7 +250,7 @@ description = "INSERT ... SELECT — insert the rows a query produces, through t
 
 [[capability]]
 id = "dml.insert_select_container"
-description = "INSERT ... SELECT into a CONTAINER column — an array, range, or composite column (spec/design/grammar.md §24, array.md §4, ranges.md §4, composite.md §12): a source column of exactly the column's type, or an untyped NULL, is stored through the same container codec as INSERT ... VALUES, so the row round-trips identically. The container assignment rule UPDATE and an INSERT VALUES expression already share: a different element type, range type, or composite type is 42804 at the up-front type gate (PostgreSQL would assignment-cast; jed's strict container rule), and an anonymous ROW(…) source column into a composite column is 0A000. Formerly 0A000 for every container column. CREATE TABLE … AS fills its container columns through it. Builds on dml.insert_select + types.array / types.range / types.composite"
+description = "INSERT ... SELECT into a CONTAINER column — an array, range, or composite column (spec/design/grammar.md §24, array.md §4, ranges.md §4, composite.md §12): a source column of exactly the column's type, or an untyped NULL, is stored through the same container codec as INSERT ... VALUES, so the row round-trips identically. The container assignment rule UPDATE and an INSERT VALUES expression already share: a different element type, range type, or composite type is 42804 at the up-front type gate (PostgreSQL would assignment-cast; jed's strict container rule), and an anonymous ROW(…) source column into a composite column is 42804 (a projected record is not a ROW constructor whose fields could coerce — PostgreSQL's cannot_coerce). Formerly 0A000 for every container column. CREATE TABLE … AS fills its container columns through it. Builds on dml.insert_select + types.array / types.range / types.composite"
 
 [[capability]]
 id = "dml.insert_select_setop"
@@ -258,7 +258,7 @@ description = "A set operation as the INSERT ... SELECT source (grammar.md §24/
 
 [[capability]]
 id = "dml.insert_values_expr"
-description = "General expressions in INSERT ... VALUES slots — arithmetic, function calls, CASE, casts, and scalar subqueries (grammar.md §16). A slot that is exactly a literal / $N / DEFAULT / literal-field ROW(…) or ARRAY[…] keeps its contextual adaptation; any other slot resolves against a column-less scope (no columns: 42703; aggregates: 42803) with the target column's type as its literal hint and must be assignable to it (42804, the INSERT ... SELECT gate; a range/array column follows UPDATE's container rule; a composite column takes a value of its own type, an anonymous ROW expression is 0A000). Every slot is evaluated before any row is written; uncorrelated subqueries fold once against the pre-statement snapshot; each expression slot accrues its evaluated tree per row (cost.md §3)"
+description = "General expressions in INSERT ... VALUES slots — arithmetic, function calls, CASE, casts, and scalar subqueries (grammar.md §16). A slot that is exactly a literal / $N / DEFAULT / literal-field ROW(…) or ARRAY[…] keeps its contextual adaptation; any other slot resolves against a column-less scope (no columns: 42703; aggregates: 42803) with the target column's type as its literal hint and must be assignable to it (42804, the INSERT ... SELECT gate; a range/array column follows UPDATE's container rule; a composite column takes a value of its own type, or a ROW(…) constructor coerced field-by-field — types.composite_row_assign). Every slot is evaluated before any row is written; uncorrelated subqueries fold once against the pre-statement snapshot; each expression slot accrues its evaluated tree per row (cost.md §3)"
 
 [[capability]]
 id = "dml.update"
@@ -871,6 +871,18 @@ description = "Row-valued subqueries (spec/design/grammar.md §26) — a ROW CON
 [[capability]]
 id = "types.composite_bare_row"
 description = "The bare row constructor (a, b, …) — PostgreSQL's implicit-ROW spelling (composite.md §1): two or more comma-separated expressions in parentheses build the same anonymous composite as ROW(a, b, …), usable anywhere an expression is (row comparison, an IN list of rows, a row-valued subquery's left operand). A single parenthesized expression stays a grouping. The bare row is not itself a field-access base — (1, 2).f1 is a syntax error (42601) while ((1, 2)).f1 selects a field, matching PG. Builds on types.composite"
+
+[[capability]]
+id = "ddl.composite_default"
+description = "A non-NULL DEFAULT on a composite column (composite.md §12) — a ROW(…) constructor (fields coerced by the assignment rule, a nested ROW(ROW(…), …) one level down), a record_in string literal, or any same-typed expression without a column reference — stored as an EXPRESSION default (format_version 44: composite column flags bit3 + the expr-text after the type name) and evaluated per applied row: an omitted column, a DEFAULT slot, UPDATE SET col = DEFAULT, ALTER TABLE ADD COLUMN (filling existing rows), ALTER COLUMN SET / DROP DEFAULT. Validated at DDL time: a malformed literal is 22P02, a field-count mismatch / non-composite expression 42804 (PostgreSQL 42846 for the record coercion — ledgered), a column reference 0A000. Builds on types.composite + ddl.column_default_expr"
+
+[[capability]]
+id = "cast.composite"
+description = "The runtime composite casts (composite.md §8): composite → text renders record_out per row (explicit only, like the array cast; a varchar(n) target truncates; an anonymous ROW(…) renders the same way; STABLE iff the type holds a timestamptz); runtime (non-literal) text → composite parses record_in per row against the target's field types (22P02 malformed or wrong field count, a field's own input error otherwise); and the structural ROW(…)::type cast — an anonymous ROW(…) or bare (a, b, …) constructor cast to a named composite casts each field explicitly to its field type (its numeric(p,s) / varchar(n) modifier applied, a nested ROW(…) cast one level down). A field-count mismatch, an uncastable field, an anonymous record that is not a ROW constructor, a different named composite, and a composite → scalar cast are 42804 (PostgreSQL 42846 — ledgered). Builds on types.composite"
+
+[[capability]]
+id = "types.composite_row_assign"
+description = "Assigning a ROW(…) expression to a composite column (composite.md §12) — a ROW(…) or bare (a, b, …) constructor with general-expression fields, in an INSERT … VALUES slot, an UPDATE SET, or an ON CONFLICT DO UPDATE SET, coerces field-by-field to the column's named composite by the assignment rule (PostgreSQL's record → composite coercion): each field resolves with its field type as the literal hint and must be assignable to it (the scalar column rule; a container field by the container rule, so a nested ROW(ROW(…), …) coerces one level down into a nested composite field), and its value is coerced when stored (an integer range-checked 22003, a decimal rounded to its scale). A field-count mismatch, an unassignable field, and an anonymous record that is not a ROW constructor (a CASE over rows, a scalar subquery, an INSERT … SELECT column) are 42804 (PostgreSQL 42846 cannot_coerce — ledgered). Builds on types.composite"
 
 [[capability]]
 id = "query.table_column_alias"

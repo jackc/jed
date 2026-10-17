@@ -1444,6 +1444,12 @@ func renderRExpr(e *rExpr) string {
 		return "cast(" + renderRExpr(e.operand) + " as " + e.result.CanonicalName() + ")"
 	case reArrayCast:
 		return "array_cast(" + renderRExpr(e.operand) + ")"
+	case reCompositeCast:
+		target := "text"
+		if e.castElem != nil && e.castElem.Composite {
+			target = e.castElem.Name
+		}
+		return "cast(" + renderRExpr(e.operand) + " as " + target + ")"
 	case reNeg:
 		return "(-" + renderRExpr(e.operand) + ")"
 	case reNot:

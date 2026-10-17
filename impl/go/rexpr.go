@@ -408,6 +408,11 @@ const (
 	// element through the scalar cast). `castElem` is the target element ColType for the two
 	// array-producing casts and nil for array → text; the eval branches on the runtime value.
 	reArrayCast
+	// reCompositeCast is a runtime cast that INVOLVES a composite type (spec/design/composite.md §8):
+	// text → composite (record_in per row; `castElem` is the target composite ColType) and composite →
+	// text (record_out per row; `castElem` nil). The eval branches on the runtime value (Text vs
+	// Composite). A ROW(…)::type cast needs no node — its fields are cast individually.
+	reCompositeCast
 	reNeg
 	reNot
 	reArith
@@ -1148,7 +1153,7 @@ type rExpr struct {
 	typmod   *decimalTypmod  // reCast: a decimal target's numeric(p,s) typmod
 	varchar  *uint32         // reCast: a varchar(n) text target's max length — truncate (types.md §15)
 	temporal *temporalTypmod // reCast: a timestamp(p) / timestamptz(p) / qualified-interval target's typmod (timestamp.md §8, interval.md §6.1)
-	castElem *colType        // reArrayCast: the target element ColType (nil ⇒ array → text)
+	castElem *colType        // reArrayCast: the target element ColType (nil ⇒ array → text); reCompositeCast: the target composite ColType (nil ⇒ composite → text)
 	// trap is a reCast's trap classification (functions.md §15), recorded at resolve from the
 	// cast's source and target types (casts.toml); the zero value may trap. Read only by the
 	// planner's safe-conjunct gate (planner.md §3.5).

@@ -4,7 +4,7 @@ package jed
 // PG-clean oracle corpus cannot hold. The rendering of every type, the session-zone timestamptz form,
 // the 42P17 index rejection, and element-wise T[] → text[] agree with PostgreSQL and live in
 // suites/cast/scalar_to_text.test. Here: the casts are EXPLICIT only (an assignment or implicit use
-// is 42804 where PG accepts it), composite/range → text stay 0A000 (PG renders them), and the
+// is 42804 where PG accepts it), range → text stays 0A000 (PG renders it), and the
 // $1::text parameter declaration. Mirrors impl/rust/tests/cast_scalar_text.rs.
 
 import "testing"
@@ -32,17 +32,13 @@ func TestTextCastIsExplicitOnly(t *testing.T) {
 	}
 }
 
-// A composite or range value has no text cast yet (0A000), though PostgreSQL renders both.
-func TestCompositeAndRangeToTextAre0A000(t *testing.T) {
+// A range value has no text cast yet (0A000), though PostgreSQL renders it (composite → text
+// landed — cast/composite_casts.test).
+func TestRangeToTextIs0A000(t *testing.T) {
 	t.Parallel()
-	db := dbWith(t, "CREATE TYPE addr AS (street text, zip i32)")
-	for _, sql := range []string{
-		"SELECT ('(Main,90210)'::addr)::text",
-		"SELECT ('[1,5)'::i32range)::text",
-	} {
-		if code := castErrCode(t, db, sql); code != "0A000" {
-			t.Fatalf("%q: got %s, want 0A000", sql, code)
-		}
+	db := memDB().Session(SessionOptions{})
+	if code := castErrCode(t, db, "SELECT ('[1,5)'::i32range)::text"); code != "0A000" {
+		t.Fatalf("got %s, want 0A000", code)
 	}
 }
 

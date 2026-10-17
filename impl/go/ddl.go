@@ -817,13 +817,25 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 				}
 				identityKind = &k
 			}
-		} else if isComposite || isArray || isRange {
-			// A DEFAULT on a composite-, array-, or range-typed column is not supported this slice
-			// (composite.md §12 / array.md §12 / ranges.md §8), except a bare DEFAULT NULL: it is the
-			// same as no default (PostgreSQL stores none for it), so it records nothing.
+		} else if isComposite {
+			// A composite column's DEFAULT is always an EXPRESSION default (composite.md §12) — a
+			// ROW(…), a record_in string, a same-typed expression — validated against the column's
+			// type now and evaluated per applied row. A bare DEFAULT NULL is the same as no default
+			// (PostgreSQL stores none for it), so it records nothing.
+			if def.Default != nil && !isBareNullDefault(def.Default) {
+				de, err := db.buildContainerDefault(colType, def.Name, def.Default)
+				if err != nil {
+					return outcome{}, err
+				}
+				defaultExpr = de
+			}
+		} else if isArray || isRange {
+			// A DEFAULT on an array- or range-typed column is not supported this slice (array.md §12
+			// / ranges.md §8), except a bare DEFAULT NULL: it is the same as no default (PostgreSQL
+			// stores none for it), so it records nothing.
 			if def.Default != nil && !isBareNullDefault(def.Default) {
 				return outcome{}, newError(FeatureNotSupported,
-					"a DEFAULT on a composite-, array-, or range-typed column is not supported yet")
+					"a DEFAULT on an array- or range-typed column is not supported yet")
 			}
 		} else if def.Default != nil {
 			ty := colType.Scalar
@@ -1602,7 +1614,18 @@ func (db *engine) resolveDefaultExprsFor(table *catTable, need []bool, ptypes *p
 		if de.Unparsed {
 			return nil, unparsableDefaultError(table.Name, table.Columns[i].Name)
 		}
-		colScalar := table.Columns[i].Type.ScalarTy()
+		col := table.Columns[i]
+		if !col.Type.isScalar() {
+			// A composite column's default resolves by the container assignment rule it was
+			// validated with (a ROW(…) coerces field-by-field).
+			node, err := resolveContainerAssignTy(emptyScope(db), col.Type, col.Name, de.Expr, &aggCtx{collecting: false}, ptypes)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = node
+			continue
+		}
+		colScalar := col.Type.ScalarTy()
 		node, _, err := resolve(emptyScope(db), de.Expr, &colScalar, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
 			return nil, err
@@ -3073,12 +3096,32 @@ func retypeIdentitySequence(existing *sequenceDef, oldType, newType seqDataType)
 	return &def, nil
 }
 
+// buildContainerDefault validates a composite column's DEFAULT (composite.md §12) and keeps it as an
+// EXPRESSION default: the structural pre-walk (no column reference, subquery, …), then resolution
+// against an empty scope by the column assignment rule — a ROW(…) coerces field-by-field, a string
+// literal parses through record_in now (22P02 at CREATE, as in PostgreSQL), a bare NULL field adapts —
+// so a bad default fails at DDL time. Every application re-evaluates it per row.
+func (db *engine) buildContainerDefault(ty dataType, colName string, def *defaultDef) (*defaultExprDef, error) {
+	if err := rejectDefaultStructure(def.Expr); err != nil {
+		return nil, err
+	}
+	if _, err := resolveContainerAssignTy(emptyScope(db), ty, colName, def.Expr, &aggCtx{collecting: false}, &paramTypes{}); err != nil {
+		return nil, err
+	}
+	return &defaultExprDef{ExprText: def.Text, Expr: def.Expr}, nil
+}
+
 func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *defaultExprDef, error) {
 	if !col.Type.isScalar() {
 		// A bare DEFAULT NULL on a container column is the same as no default (PostgreSQL stores
-		// none for it); any other container DEFAULT is not supported yet.
+		// none for it); a composite column takes an expression default (composite.md §12); any other
+		// container DEFAULT is not supported yet.
 		if isBareNullDefault(def) {
 			return nil, nil, nil
+		}
+		if col.Type.IsComposite() {
+			de, err := db.buildContainerDefault(col.Type, col.Name, def)
+			return nil, de, err
 		}
 		return nil, nil, newError(FeatureNotSupported, "a DEFAULT on this container type is not supported yet")
 	}
@@ -3235,10 +3278,10 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 			}
 			col.Identity = &k
 		}
-	} else if ty.IsComposite() || ty.IsArray() || ty.IsRange() {
+	} else if ty.IsArray() || ty.IsRange() {
 		// A bare DEFAULT NULL is the same as no default (see createTable).
 		if def.Default != nil && !isBareNullDefault(def.Default) {
-			return catColumn{}, newError(FeatureNotSupported, "a DEFAULT on a composite-, array-, or range-typed column is not supported yet")
+			return catColumn{}, newError(FeatureNotSupported, "a DEFAULT on an array- or range-typed column is not supported yet")
 		}
 	} else if def.Default != nil {
 		dv, de, err := db.buildAlterDefault(col, def.Default)

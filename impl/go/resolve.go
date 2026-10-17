@@ -2546,9 +2546,9 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
 		// (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
 		// `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite
-		// operand is the identity. Every other operand (a runtime text expression, an anonymous
-		// ROW(…)) is a documented 0A000 narrowing this slice — relaxable. A type modifier on a
-		// composite is meaningless (0A000).
+		// operand is the identity; a ROW(…) constructor casts field-by-field; a runtime text
+		// expression parses through record_in per row (reCompositeCast). Any other source is 42804.
+		// A type modifier on a composite is meaningless (0A000).
 		if ct := s.catalog.readSnap().compositeType(e.Cast.TypeName); ct != nil {
 			if e.Cast.TypeMod != nil {
 				return nil, resolvedType{}, newError(FeatureNotSupported,
@@ -2560,11 +2560,19 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				params.noteInputZone(iz)
 				return node, rt, positionError(err, in.Pos)
 			}
+			// An anonymous ROW(…) (or bare (a, b, …)) constructor casts structurally: each field is
+			// explicitly cast to its field type (composite.md §8, PostgreSQL's record → composite
+			// coercion under the explicit context).
+			if e.Cast.Inner.Kind == exprRow {
+				return resolveRowToComposite(s, e.Cast.Inner.RowItems, ct, rowCoercionExplicit, ag, params)
+			}
+			snap := s.catalog.readSnap()
+			cty := compositeT(ct.Name)
+			targetRT := resolvedTypeOfCol(cty, snap)
 			// A bind parameter cast to a composite type takes that type (api.md §5).
 			if e.Cast.Inner.Kind == exprParam {
-				snap := s.catalog.readSnap()
-				pct := resolveColType(compositeT(ct.Name), snap.types)
-				return resolveParamNode(s, e.Cast.Inner, &pct, resolvedTypeOfCol(compositeT(ct.Name), snap), params)
+				pct := resolveColType(cty, snap.types)
+				return resolveParamNode(s, e.Cast.Inner, &pct, targetRT, params)
 			}
 			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 			if err != nil {
@@ -2572,13 +2580,24 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			}
 			switch {
 			case ity.kind == rtNull:
-				return rinner, resolvedTypeOfCol(compositeT(ct.Name), s.catalog.readSnap()), nil
+				return rinner, targetRT, nil
 			case ity.kind == rtComposite && ity.comp.named && ity.comp.name == ct.Name:
 				// An identical named composite is the identity cast.
 				return rinner, ity, nil
+			case ity.kind == rtText:
+				// A runtime text value parses through record_in per row (22P02 malformed, a field's
+				// own input error otherwise). A timestamptz field reads an offset-less string in the
+				// session zone, so the cast is then STABLE (42P17 in an index expression), like the
+				// array_in cast.
+				params.nonimmutable = params.nonimmutable || targetRT.containsTimestamptz()
+				to := resolveColType(cty, snap.types)
+				return &rExpr{kind: reCompositeCast, operand: rinner, castElem: &to}, targetRT, nil
+			case ity.kind == rtComposite && !ity.comp.named:
+				// An anonymous record that is not a ROW constructor (a derived column, a subquery) has
+				// no field expressions to cast — PostgreSQL's "cannot cast type record to addr" (42846).
+				return nil, resolvedType{}, recordCastError(ct.Name, "")
 			default:
-				return nil, resolvedType{}, newError(FeatureNotSupported,
-					"casting to a composite type is only supported from a string literal")
+				return nil, resolvedType{}, newError(CannotCoerce, "cannot cast type "+rtName(ity)+" to "+ct.Name)
 			}
 		}
 		target, tm, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
@@ -2652,7 +2671,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// assignment cast to text (a documented divergence), so INSERT INTO text_col VALUES (1) /
 		// text_col = 1 stay 42804. A varchar(n) length truncates the rendered text (types.md §15).
 		// `$1::text` declares the parameter as text, like every other cast target (api.md §5).
-		// Composite and range sources stay 0A000.
+		// A composite renders via record_out; a range source stays 0A000.
 		if target.IsText() {
 			var innerCtx *scalarType
 			if e.Cast.Inner.Kind == exprParam {
@@ -2873,6 +2892,11 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
 		if ity.kind == rtDate {
 			return nil, resolvedType{}, newError(FeatureNotSupported, "casting from a date type is not supported yet")
+		}
+		// A composite casts only to text or a composite (composite.md §8): a numeric target is a
+		// forbidden pair (42846 cannot_coerce, as PostgreSQL).
+		if ity.kind == rtComposite {
+			return nil, resolvedType{}, newError(CannotCoerce, "cannot cast type "+rtName(ity)+" to "+target.CanonicalName())
 		}
 		// Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
 		if ity.kind == rtArray {
@@ -4447,7 +4471,7 @@ func widenFloatToF64(node *rExpr, t resolvedType) *rExpr {
 // castToText converts a resolved operand of type ity to text (casts.toml, types.md §5) — the
 // explicit `x::text` cast and the `text || anynonarray` operand rendering (string-functions.md §5)
 // share it. target is the text-family cast target (text, or varchar whose length varcharLen
-// truncates). Composite and range sources stay 0A000.
+// truncates). A composite renders via record_out (reCompositeCast); a range source stays 0A000.
 func castToText(rinner *rExpr, ity resolvedType, target scalarType, varcharLen *uint32, params *paramTypes) (*rExpr, error) {
 	cast := &rExpr{kind: reCast, operand: rinner, result: target, varchar: varcharLen}
 	switch ity.kind {
@@ -4478,6 +4502,17 @@ func castToText(rinner *rExpr, ity resolvedType, target scalarType, varcharLen *
 		// §9.5).
 		params.nonimmutable = params.nonimmutable || (ity.elem != nil && ity.elem.containsTimestamptz())
 		return &rExpr{kind: reArrayCast, operand: rinner}, nil
+	case rtComposite:
+		// composite → text (spec/design/composite.md §8): record_out renders (…) per row. Explicit
+		// only, like the array cast; a timestamptz anywhere in the type renders in the session zone,
+		// so the cast is then STABLE. An anonymous ROW(…) renders the same way. A varchar(n) length
+		// wraps the render in the ordinary truncating text cast.
+		params.nonimmutable = params.nonimmutable || ity.containsTimestamptz()
+		node := &rExpr{kind: reCompositeCast, operand: rinner}
+		if varcharLen != nil {
+			return &rExpr{kind: reCast, operand: node, result: target, varchar: varcharLen}, nil
+		}
+		return node, nil
 	default:
 		return nil, newError(FeatureNotSupported, "casting to text is not supported yet")
 	}

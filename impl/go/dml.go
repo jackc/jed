@@ -1359,14 +1359,14 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 			if p := provided[i]; p >= 0 {
 				// A container column takes a source column of exactly its own type, or an untyped
 				// NULL — the container assignment rule UPDATE and an INSERT VALUES expression share
-				// (array.md §6, ranges.md §1, composite.md §12). An anonymous ROW(…) column has no
-				// composite type to match (0A000).
+				// (array.md §6, ranges.md §1, composite.md §12). An anonymous record column (a
+				// projected ROW(…)) is a source column, not a constructor whose fields could coerce —
+				// PostgreSQL's "cannot cast type record to addr" (42846).
 				if col.Type.IsComposite() || col.Type.IsArray() || col.Type.IsRange() {
 					src := q.columnTypes[p]
 					if src.kind == rtComposite && !src.comp.named {
-						return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
-							"inserting a ROW expression into composite column %s is not supported yet", col.Name,
-						))
+						return outcome{}, positionError(recordCastError(col.Type.CanonicalName(), ""),
+							outputColumnLocation(*ins.Query, p))
 					}
 					if src.kind != rtNull && !resolvedTypeEqual(src, resolvedTypeOfCol(col.Type, db.readSnap())) {
 						return outcome{}, assignmentError(fmt.Sprintf(
@@ -1601,8 +1601,8 @@ type valueExprs [][]*rExpr
 // §16), in value position order, against a column-less scope that admits subqueries and sees the
 // statement's CTE bindings. Each expression takes its target column's type as the literal hint and
 // must be storable there: a scalar column requires an assignable type (42804, the INSERT … SELECT
-// gate); a range/array column shares UPDATE's container rule; a composite column takes a NULL or a
-// value of that same composite type (an anonymous ROW(…) expression is 0A000, as for UPDATE). A slot
+// gate); a range/array/composite column shares UPDATE's container rule (a ROW(…) coerces
+// field-by-field to a composite column's type — composite.md §12). A slot
 // discarded by OVERRIDING USER VALUE is not resolved. Returns nil for a row with no expression slot.
 func (db *engine) resolveInsertRowExprs(values []insertValue, columns []catColumn, provided []int, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, error) {
 	if !slices.ContainsFunc(values, func(v insertValue) bool { return v.IsExpr }) {
@@ -1628,29 +1628,10 @@ func (db *engine) resolveInsertRowExprs(values []insertValue, columns []catColum
 		col := columns[columnAt[p]]
 		var node *rExpr
 		switch {
-		case col.Type.IsRange() || col.Type.IsArray():
+		case col.Type.IsRange() || col.Type.IsArray() || col.Type.IsComposite():
 			n, err := resolveContainerAssign(s, col, *v.Expr, &aggCtx{collecting: false}, ptypes)
 			if err != nil {
 				return nil, err
-			}
-			node = n
-		case col.Type.IsComposite():
-			n, ty, err := resolve(s, *v.Expr, nil, &aggCtx{collecting: false}, ptypes)
-			if err != nil {
-				return nil, err
-			}
-			switch {
-			case ty.kind == rtNull:
-			case ty.kind == rtComposite && !ty.comp.named:
-				return nil, newError(FeatureNotSupported, fmt.Sprintf(
-					"inserting a ROW expression into composite column %s is not supported yet", col.Name,
-				))
-			case resolvedTypeEqual(ty, resolvedTypeOfCol(col.Type, db.readSnap())):
-			default:
-				return nil, positionError(assignmentError(fmt.Sprintf(
-					"column %s is of type %s but expression is of type %s",
-					col.Name, col.Type.CanonicalName(), rtName(ty),
-				)), exprLocation(*v.Expr))
 			}
 			node = n
 		default:
@@ -4088,7 +4069,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 		} else {
 			// A composite, range, or array column: the RHS adapts (a bare string literal via
 			// record_in/range_in/array_in, a bare NULL to the typed NULL) or must resolve to the SAME
-			// container type; an anonymous ROW(…) expression is 0A000 (composite.md §12). Stored
+			// container type; a ROW(…) coerces field-by-field to a composite (composite.md §12). Stored
 			// through coerceForStore (carried on the plan as colType).
 			src, err := resolveContainerAssign(s, col, a.Value, &aggCtx{collecting: false}, ptypes)
 			if err != nil {

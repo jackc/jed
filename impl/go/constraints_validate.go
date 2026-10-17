@@ -348,6 +348,15 @@ func rejectDefaultStructure(e exprNode) error {
 			}
 		}
 		return nil
+	case exprRow, exprArray:
+		// Recurse into every ROW(…) field / ARRAY[…] element (a composite column's DEFAULT is a
+		// ROW(…) — composite.md §12).
+		for _, a := range e.RowItems {
+			if err := rejectDefaultStructure(a); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprFieldAccess, exprFieldStar:
 		// Recurse into the composite base (spec/design/composite.md §S4).
 		return rejectDefaultStructure(*e.Base)

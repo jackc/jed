@@ -616,7 +616,8 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value, iz *input
 		panic("a VALUES expression slot is evaluated by the caller")
 	case iv.IsRow:
 		if len(iv.Row) != len(ty.Fields) {
-			return Value{}, newError(DatatypeMismatch, fmt.Sprintf(
+			// PostgreSQL's 42846 "cannot cast type record to T" (composite.md §12).
+			return Value{}, newError(CannotCoerce, fmt.Sprintf(
 				"ROW has %d fields but composite type %s has %d", len(iv.Row), ty.Name, len(ty.Fields),
 			)).noHint()
 		}
