@@ -14,6 +14,7 @@ fn main() {
         lang: "rust",
         variant: "postgres-crate",
         open,
+        open_relaxed: None,
     });
 }
 

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use jed::{
     CreateOptions, Database, Environment, HostFunction, Locking, OpenOptions, PreparedStatement,
-    ScalarType, Session, SessionOptions, Value, Volatility,
+    ScalarType, Session, SessionOptions, Synchronous, Value, Volatility,
 };
 
 use jed_bench::{
@@ -17,7 +17,37 @@ fn main() {
         lang: "rust",
         variant: "core",
         open,
+        open_relaxed: Some(open_relaxed),
     });
+}
+
+/// A fresh scratch database under `synchronous = off` (spec/design/validated-cow.md §4): commits
+/// batch their durable barrier.
+fn open_relaxed(data_dir: &str) -> BoxResult<Box<dyn Engine>> {
+    open_scratch(data_dir, Synchronous::Off)
+}
+
+fn open_scratch(data_dir: &str, synchronous: Synchronous) -> BoxResult<Box<dyn Engine>> {
+    let locking = bench_locking()?;
+    let dir = format!("{data_dir}/scratch-rust-{}", std::process::id());
+    std::fs::create_dir_all(&dir)?;
+    let db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(format!("{dir}/scratch.jed"))),
+        locking,
+        environment: bench_environment()?,
+        synchronous,
+        ..Default::default()
+    })
+    .map_err(|e| e.to_string())?;
+    let sess = db.session(SessionOptions::default());
+    Ok(Box::new(JedEngine {
+        db,
+        sess,
+        stmt: None,
+        data_dir: data_dir.to_string(),
+        dataset: "scratch".to_string(),
+        scratch: Some(dir),
+    }))
 }
 
 struct JedEngine {
@@ -33,27 +63,10 @@ struct JedEngine {
 }
 
 fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
-    let locking = bench_locking()?;
     if dataset == "scratch" {
-        let dir = format!("{data_dir}/scratch-rust-{}", std::process::id());
-        std::fs::create_dir_all(&dir)?;
-        let db = Database::create(CreateOptions {
-            path: Some(std::path::PathBuf::from(format!("{dir}/scratch.jed"))),
-            locking,
-            environment: bench_environment()?,
-            ..Default::default()
-        })
-        .map_err(|e| e.to_string())?;
-        let sess = db.session(SessionOptions::default());
-        return Ok(Box::new(JedEngine {
-            db,
-            sess,
-            stmt: None,
-            data_dir: data_dir.to_string(),
-            dataset: dataset.to_string(),
-            scratch: Some(dir),
-        }));
+        return open_scratch(data_dir, Synchronous::On);
     }
+    let locking = bench_locking()?;
     let db = Database::open_with_options(
         format!("{data_dir}/{dataset}.jed"),
         OpenOptions {

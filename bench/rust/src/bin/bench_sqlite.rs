@@ -14,6 +14,7 @@ fn main() {
         lang: "rust",
         variant: "rusqlite",
         open,
+        open_relaxed: None,
     });
 }
 

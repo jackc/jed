@@ -212,20 +212,30 @@ function runReaderQuery(sess: Session, sql: string, args: Arg[], sum: Checksum |
   return drainRows(sess.query(sql, bindArgs(args)), sum);
 }
 
+function openScratch(dataDir: string, synchronous: "on" | "off"): Engine {
+  const dir = mkdtempSync(join(dataDir, "scratch-"));
+  const db = createDatabase({
+    path: join(dir, "scratch.jed"),
+    environment: benchEnvironment(),
+    synchronous,
+  });
+  return new JedEngine(db, dataDir, "scratch", dir);
+}
+
 await mainWith({
   engine: "jed",
   lang: "ts",
   variant: "core",
   async open(dataDir: string, dataset: string): Promise<Engine> {
     if (dataset === "scratch") {
-      const dir = mkdtempSync(join(dataDir, "scratch-"));
-      const db = createDatabase({
-        path: join(dir, "scratch.jed"),
-        environment: benchEnvironment(),
-      });
-      return new JedEngine(db, dataDir, dataset, dir);
+      return openScratch(dataDir, "on");
     }
     const db = openDatabase(join(dataDir, `${dataset}.jed`), { environment: benchEnvironment() });
     return new JedEngine(db, dataDir, dataset, null);
+  },
+  // A fresh scratch database under synchronous = off (spec/design/validated-cow.md §4): commits
+  // batch their durable barrier.
+  async openRelaxed(dataDir: string): Promise<Engine> {
+    return openScratch(dataDir, "off");
   },
 });

@@ -130,6 +130,7 @@ export interface Bench {
   batch: number;
   readers: number; // concurrent_read: reader Sessions
   hostFunctions: boolean; // calls the bench host functions (benchmarks.md §8.2)
+  relaxed: boolean; // write_durable under each engine's relaxed-durability mode (benchmarks.md §8)
   setupSql: string[];
   sqlOverride: Record<string, string>;
   setupSqlOverride: Record<string, string[]>;
@@ -208,6 +209,7 @@ export function loadCorpus(corpusDir: string): Bench[] {
       batch: num(raw.batch),
       readers: num(raw.readers),
       hostFunctions: raw.host_functions === true,
+      relaxed: raw.relaxed === true,
       setupSql: strList(raw.setup_sql),
       sqlOverride: (raw.sql_override as Record<string, string> | undefined) ?? {},
       setupSqlOverride: (raw.setup_sql_override as Record<string, string[]> | undefined) ?? {},
@@ -360,6 +362,10 @@ export interface Config {
   variant: string; // core | porsager | node-sqlite
   // dataset is "small" | "large" | "scratch"; "scratch" must yield a fresh, empty database.
   open(dataDir: string, dataset: string): Promise<Engine>;
+  // OPTIONAL: a fresh scratch database under jed's synchronous = off, for a `relaxed` bench
+  // (benchmarks.md §8). A jed driver without it skips such a bench; PostgreSQL and SQLite switch
+  // modes through the bench's setup_sql_override instead.
+  openRelaxed?(dataDir: string): Promise<Engine>;
 }
 
 // --- $N → ?N for SQLite (benchmarks.md §3) ---
@@ -440,7 +446,18 @@ async function runOne(
   want: string,
 ): Promise<ResultLine | null> {
   const startedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-  const eng = await cfg.open(dataDir, b.dataset);
+  let eng: Engine;
+  if (b.relaxed && cfg.engine === "jed") {
+    if (cfg.openRelaxed === undefined) {
+      process.stderr.write(
+        `  skip: ${cfg.engine}/${cfg.lang}/${cfg.variant} has no relaxed durability mode\n`,
+      );
+      return null;
+    }
+    eng = await cfg.openRelaxed(dataDir);
+  } else {
+    eng = await cfg.open(dataDir, b.dataset);
+  }
   if (b.kind === "cold_open") {
     // The fingerprint handle is closed before measuring, so every iteration opens a file no handle
     // in this process holds (benchmarks.md §8.3).
