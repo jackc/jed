@@ -5,7 +5,7 @@
 // (`.key`, `.*`, `.**`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`, and the
 // item methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level predicate
 // (comparison, `exists`, `like_regex`, `starts with`, `is unknown`, §4.4). Path variables (`$name`,
-// `$"name"`) are bound by the caller's Vars. The datetime methods and the `like_regex` `m` flag are
+// `$"name"`) are bound by the caller's Vars. The datetime methods and the `like_regex` `x` flag are
 // `0A000` (jsonpath.md §3.1, §4.3). A malformed path is `42601`. The compiled program is a pure
 // function of the source — kept
 // byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
@@ -997,7 +997,6 @@ class Parser {
           'XQuery "x" flag (expanded regular expressions) is not implemented',
         );
       }
-      if ((flags & REGEX_M) !== 0) throw unsupported('like_regex "m" flag');
     }
     const regex = compileLikeRegex(pattern, flags, this.prop);
     this.regexInsts += regexNinst(regex);
@@ -1225,7 +1224,8 @@ class Parser {
 }
 
 // compileLikeRegex compiles a like_regex pattern under its flags (jsonpath.md §4.3, regex.md §8d):
-// `i` folds the pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
+// `i` folds the pattern, `q` quotes it, `s` is dot-all (otherwise the mode is newline-sensitive),
+// and `m` makes `^`/`$` line anchors.
 // A quoted pattern is all literal, so `i` folds every character of it; otherwise the fold keeps the
 // letter after a backslash (regex.md §1).
 function compileLikeRegex(
@@ -1238,10 +1238,12 @@ function compileLikeRegex(
     p = (flags & REGEX_Q) !== 0 ? foldLowerSimple(pattern, prop) : foldRegexPattern(pattern, prop);
   }
   if ((flags & REGEX_Q) !== 0) {
-    return compileRegexMode(quoteRegex(p), { nlStop: false, dotAll: false });
+    return compileRegexMode(quoteRegex(p), { nlStop: false, dotAll: false, nlAnchor: false });
   }
-  if ((flags & REGEX_S) !== 0) return compileRegexMode(p, { nlStop: false, dotAll: true });
-  return compileRegexMode(p, { nlStop: true, dotAll: false });
+  // PostgreSQL's jspConvertRegexFlags: no `s` adds REG_NLSTOP, and `m` adds REG_NLANCH,
+  // independently of each other.
+  const dotAll = (flags & REGEX_S) !== 0;
+  return compileRegexMode(p, { nlStop: !dotAll, dotAll, nlAnchor: (flags & REGEX_M) !== 0 });
 }
 
 // compile compiles a jsonpath source string. Malformed → `42601`; a valid-PG but unsupported

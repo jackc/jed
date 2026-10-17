@@ -7,11 +7,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dbWith, errCode, query } from "./util.ts";
+import { dbWith, errCode } from "./util.ts";
 
-// The datetime item methods are 0A000 at compile, by decision (jsonpath.md §3.1), and so is the
-// like_regex `m` flag (jsonpath.md §4.3) unless `q` makes it moot. PostgreSQL compiles them, so each
-// is a documented divergence; the supported surface is oracle-clean in suites/json/.
+// The datetime item methods are 0A000 at compile, by decision (jsonpath.md §3.1). PostgreSQL
+// compiles them, so each is a documented divergence; the supported surface is oracle-clean in suites/json/.
 test("jsonpath unsupported constructs are 0A000", () => {
   const db = dbWith([]);
   for (const path of [
@@ -22,8 +21,6 @@ test("jsonpath unsupported constructs are 0A000", () => {
     "$.a.time_tz()",
     "$.a.timestamp()",
     "$.a.timestamp_tz(2)",
-    '$ ? (@ like_regex "^a" flag "m")', // the multi-line flag
-    '$ ? (@ like_regex "^a" flag "ims")',
   ]) {
     assert.equal(
       errCode(() => db.execute(`SELECT '${path}'::jsonpath`)),
@@ -31,11 +28,6 @@ test("jsonpath unsupported constructs are 0A000", () => {
       `path \`${path}\` should be 0A000`,
     );
   }
-  // Under `q` the pattern is a literal and `m` is ignored, as XQuery specifies.
-  assert.deepStrictEqual(
-    query(db, `SELECT jsonb_path_exists('"a^b"', '$ ? (@ like_regex "^b" flag "mq")')`),
-    [["true"]],
-  );
 });
 
 // A like_regex pattern is jed's regex subset (regex.md §2), not PostgreSQL's ARE: a construct only

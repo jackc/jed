@@ -165,6 +165,14 @@ SELECT 'axc' ~ '^a.c$' FROM one
 ----
 true
 
+# An unanchored match may start after a newline (the search steps over every code point).
+query BBB nosort
+SELECT ('a' || chr(10) || 'b') ~ 'b', ('a' || chr(10) || 'b') ~ 'b$', ('x' || chr(10) || 'yz') ~ '[a-z]z' FROM one
+----
+true
+true
+true
+
 # Case-insensitive `~*` and `!~*`.
 query B nosort
 SELECT 'FOO' ~* 'foo' FROM one

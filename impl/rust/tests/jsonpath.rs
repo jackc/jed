@@ -5,7 +5,7 @@
 //! number grammar). The agreeing behavior (the canonical render, malformed → 42601, the item
 //! methods) is oracle-clean in suites/json/jsonpath_literal.test and jsonpath_methods.test.
 
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions, Value};
+use jed::{CreateOptions, Database, Session, SessionOptions};
 
 fn err(db: &mut Session, sql: &str) -> String {
     db.query_outcome(sql, &[])
@@ -15,9 +15,8 @@ fn err(db: &mut Session, sql: &str) -> String {
         .to_string()
 }
 
-/// The datetime item methods are `0A000` at compile, by decision (jsonpath.md §3.1), and so is the
-/// `like_regex` `m` flag (jsonpath.md §4.3) unless `q` makes it moot. PostgreSQL compiles them, so
-/// each is a documented divergence; the supported surface is oracle-clean in suites/json/.
+/// The datetime item methods are `0A000` at compile, by decision (jsonpath.md §3.1). PostgreSQL
+/// compiles them, so each is a documented divergence; the supported surface is oracle-clean in suites/json/.
 #[test]
 fn jsonpath_unsupported_constructs_are_0a000() {
     let mut db = Database::create(CreateOptions::default())
@@ -31,24 +30,12 @@ fn jsonpath_unsupported_constructs_are_0a000() {
         "$.a.time_tz()",
         "$.a.timestamp()",
         "$.a.timestamp_tz(2)",
-        "$ ? (@ like_regex \"^a\" flag \"m\")", // the multi-line flag
-        "$ ? (@ like_regex \"^a\" flag \"ims\")",
     ] {
         assert_eq!(
             err(&mut db, &format!("SELECT '{path}'::jsonpath")),
             "0A000",
             "path `{path}` should be 0A000"
         );
-    }
-    // Under `q` the pattern is a literal and `m` is ignored, as XQuery specifies.
-    let sql = r#"SELECT jsonb_path_exists('"a^b"', '$ ? (@ like_regex "^b" flag "mq")')"#;
-    match db.query_outcome(sql, &[]).unwrap() {
-        Outcome::Query { rows, .. } => assert_eq!(
-            rows[0][0],
-            Value::Bool(true),
-            "flag mq should match the literal ^b"
-        ),
-        other => panic!("expected query, got {other:?}"),
     }
 }
 

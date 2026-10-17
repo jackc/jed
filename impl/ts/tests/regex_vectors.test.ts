@@ -15,6 +15,7 @@ const NO_PROPERTY = undefined;
 import { Meter } from "../src/cost.ts";
 import {
   compileRegex,
+  compileRegexMode,
   foldRegexPattern,
   regexClassListing,
   regexListing,
@@ -25,6 +26,13 @@ import {
 import { specPath } from "./tomlmini.ts";
 
 type Block = Map<string, string>;
+
+// compileCase compiles a vector's pattern; flags "m" selects the line-anchor mode (regex.md §8d).
+function compileCase(pat: string, flags: string) {
+  return flags.includes("m")
+    ? compileRegexMode(pat, { nlStop: false, dotAll: false, nlAnchor: true })
+    : compileRegex(pat);
+}
 
 // parseCaseBlocks splits a fixture into [[case]] blocks of key→raw-value, skipping comments/blanks.
 function parseCaseBlocks(path: string): Block[] {
@@ -102,7 +110,7 @@ test("regex program vectors match spec/regex/program_vectors.toml", () => {
     const pat = tomlUnquote(c.get("flags")).includes("i")
       ? foldRegexPattern(pattern, NO_PROPERTY)
       : pattern;
-    const prog = compileRegex(pat);
+    const prog = compileCase(pat, tomlUnquote(c.get("flags")));
     assert.deepEqual(regexListing(prog), parseStrArray(c.get("prog")), `program for ${pattern}`);
     assert.deepEqual(
       regexClassListing(prog),
@@ -122,7 +130,7 @@ test("regex match vectors match spec/regex/match_vectors.toml", () => {
     const insensitive = tomlUnquote(c.get("flags")).includes("i");
     const pat = insensitive ? foldRegexPattern(pattern, NO_PROPERTY) : pattern;
     const subj = insensitive ? foldLowerSimple(input, NO_PROPERTY) : input;
-    const prog = compileRegex(pat);
+    const prog = compileCase(pat, tomlUnquote(c.get("flags")));
     const cps = Array.from(subj, (ch) => ch.codePointAt(0) as number);
     const m = new Meter();
     const caps = regexRun(prog, cps, m);

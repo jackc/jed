@@ -18,9 +18,8 @@ func jpErr(t *testing.T, db dbHandle, sql string) string {
 	return err.(*EngineError).Code()
 }
 
-// The datetime item methods are 0A000 at compile, by decision (jsonpath.md §3.1), and so is the
-// like_regex `m` flag (jsonpath.md §4.3) unless `q` makes it moot. PostgreSQL compiles them, so each
-// is a documented divergence; the supported surface is oracle-clean in suites/json/.
+// The datetime item methods are 0A000 at compile, by decision (jsonpath.md §3.1). PostgreSQL
+// compiles them, so each is a documented divergence; the supported surface is oracle-clean in suites/json/.
 func TestJsonpathUnsupportedConstructsAre0A000(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
@@ -32,17 +31,10 @@ func TestJsonpathUnsupportedConstructsAre0A000(t *testing.T) {
 		"$.a.time_tz()",
 		"$.a.timestamp()",
 		"$.a.timestamp_tz(2)",
-		`$ ? (@ like_regex "^a" flag "m")`, // the multi-line flag
-		`$ ? (@ like_regex "^a" flag "ims")`,
 	} {
 		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "0A000" {
 			t.Errorf("path %q should be 0A000, got %s", path, got)
 		}
-	}
-	// Under `q` the pattern is a literal and `m` is ignored, as XQuery specifies.
-	rows := queryRows(t, db, `SELECT jsonb_path_exists('"a^b"', '$ ? (@ like_regex "^b" flag "mq")')`)
-	if v := rows[0][0]; v.Kind != ValBool || !v.boolVal() {
-		t.Errorf("flag mq should match the literal ^b, got %v", v)
 	}
 }
 

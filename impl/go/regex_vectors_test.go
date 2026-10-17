@@ -115,6 +115,14 @@ func parsePairs(val string) []int64 {
 	return out
 }
 
+// compileRegexCase compiles a vector's pattern; flags "m" selects the line-anchor mode (regex.md §8d).
+func compileRegexCase(pat, flags string) (*regexProgram, error) {
+	if strings.Contains(flags, "m") {
+		return compileRegexMode(pat, regexMode{nlAnchor: true})
+	}
+	return compileRegex(pat)
+}
+
 func TestRegexProgramVectors(t *testing.T) {
 	t.Parallel()
 	blocks := parseCaseBlocks(t, specPath(t, "regex/program_vectors.toml"))
@@ -127,7 +135,7 @@ func TestRegexProgramVectors(t *testing.T) {
 		if strings.Contains(tomlUnquote(c["flags"]), "i") {
 			pat = foldRegexPattern(pat, (*propertyTable)(nil))
 		}
-		prog, err := compileRegex(pat)
+		prog, err := compileRegexCase(pat, tomlUnquote(c["flags"]))
 		if err != nil {
 			t.Fatalf("compile %q: %v", pattern, err)
 		}
@@ -164,7 +172,7 @@ func TestRegexMatchVectors(t *testing.T) {
 			pat = foldRegexPattern(pat, (*propertyTable)(nil))
 			subj = foldLowerSimple(subj, (*propertyTable)(nil))
 		}
-		prog, err := compileRegex(pat)
+		prog, err := compileRegexCase(pat, tomlUnquote(c["flags"]))
 		if err != nil {
 			t.Fatalf("compile %q: %v", pattern, err)
 		}

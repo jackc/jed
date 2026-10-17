@@ -143,13 +143,21 @@ matched = true
 caps = [[0, 1]]
 steps = 11
 
-# `.` does NOT match newline (single-line default).
+# `.` does NOT match newline (single-line default). The unanchored prefix still steps over it.
 [[case]]
 pattern = "."
 input = "\n"
 matched = false
 caps = []
-steps = 4
+steps = 9
+
+# The unanchored prefix consumes a newline too (`anychar`), so a match may start after one.
+[[case]]
+pattern = "b"
+input = "a\nb"
+matched = true
+caps = [[2, 3]]
+steps = 21
 
 [[case]]
 pattern = "a.c"
@@ -267,3 +275,56 @@ input = "😀x"
 matched = false
 caps = []
 steps = 14
+
+# --- line-anchor mode (flags = "m", the jsonpath like_regex `m` flag, regex.md §8d) ----------
+# `^` also matches just after a newline and `$` just before one.
+[[case]]
+pattern = "^b$"
+flags = "m"
+input = "a\nb"
+matched = true
+caps = [[2, 3]]
+steps = 24
+
+[[case]]
+pattern = "a$"
+flags = "m"
+input = "a\nb"
+matched = true
+caps = [[0, 1]]
+steps = 12
+
+# An empty line between two newlines.
+[[case]]
+pattern = "^$"
+flags = "m"
+input = "a\n\nb"
+matched = true
+caps = [[2, 2]]
+steps = 18
+
+# `$` needs a newline (or the end) right after: not before another character.
+[[case]]
+pattern = "a$"
+flags = "m"
+input = "ab\nb"
+matched = false
+caps = []
+steps = 25
+
+# `\A` / `\z` stay string-anchored in line-anchor mode.
+[[case]]
+pattern = "\\Ab"
+flags = "m"
+input = "a\nb"
+matched = false
+caps = []
+steps = 20
+
+[[case]]
+pattern = "b\\z"
+flags = "m"
+input = "a\nb\n"
+matched = false
+caps = []
+steps = 25

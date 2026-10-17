@@ -28,12 +28,17 @@ const MAX_REGEX_CP = 0x10ffff;
 type RegexOp =
   | "char"
   | "any"
+  // Any code point, newline included: the unanchored prefix's consume step (regex.md §3.2).
+  | "anyChar"
   | "class"
   | "split"
   | "jmp"
   | "save"
   | "assertStart"
   | "assertEnd"
+  // `^` / `$` in the line-anchor mode (regex.md §8d): also just after / before a newline.
+  | "assertLineStart"
+  | "assertLineEnd"
   | "match";
 
 // One NFA instruction. x/y hold jump targets (absolute instruction indices) for split/jmp, the slot
@@ -79,6 +84,8 @@ export function regexListing(p: RegexProgram): string[] {
         return `char ${i.ch}`;
       case "any":
         return "any";
+      case "anyChar":
+        return "anychar";
       case "class":
         return `class ${i.x}`;
       case "split":
@@ -91,6 +98,10 @@ export function regexListing(p: RegexProgram): string[] {
         return "assertstart";
       case "assertEnd":
         return "assertend";
+      case "assertLineStart":
+        return "assertlinestart";
+      case "assertLineEnd":
+        return "assertlineend";
       case "match":
         return "match";
       default: {
@@ -141,7 +152,9 @@ type Node =
   | { kind: "repeat"; sub: Node; min: number; max: number | null; greedy: boolean }
   | { kind: "group"; sub: Node; index: number } // index>0 capturing (1-based), 0 non-capturing
   | { kind: "anchorStart" }
-  | { kind: "anchorEnd" };
+  | { kind: "anchorEnd" }
+  | { kind: "lineStart" }
+  | { kind: "lineEnd" };
 
 // ---------------------------------------------------------------------------
 // Parser: pattern text -> AST (chars are code-point strings via Array.from)
@@ -153,9 +166,12 @@ export type RegexMode = {
   nlStop: boolean;
   // dotAll lets `.` match a newline (the XQuery `s` flag).
   dotAll: boolean;
+  // nlAnchor lets `^`/`$` also anchor just after / before a newline (the XQuery `m` flag,
+  // PostgreSQL's REG_NLANCH). `\A`/`\z` stay string-anchored.
+  nlAnchor: boolean;
 };
 
-const NO_MODE: RegexMode = { nlStop: false, dotAll: false };
+const NO_MODE: RegexMode = { nlStop: false, dotAll: false, nlAnchor: false };
 
 // quoteRegex escapes every metacharacter of a pattern so it compiles to the literal string (the
 // XQuery `q` flag, regex.md §8d).
@@ -330,10 +346,10 @@ class RegexParser {
         return { kind: "any" };
       case "^":
         this.bump();
-        return { kind: "anchorStart" };
+        return this.mode.nlAnchor ? { kind: "lineStart" } : { kind: "anchorStart" };
       case "$":
         this.bump();
-        return { kind: "anchorEnd" };
+        return this.mode.nlAnchor ? { kind: "lineEnd" } : { kind: "anchorEnd" };
       case "\\":
         this.bump();
         return this.parseEscape();
@@ -653,6 +669,12 @@ class RegexCompiler {
       case "anchorEnd":
         this.pushInst({ op: "assertEnd", x: 0, y: 0, ch: 0 });
         return;
+      case "lineStart":
+        this.pushInst({ op: "assertLineStart", x: 0, y: 0, ch: 0 });
+        return;
+      case "lineEnd":
+        this.pushInst({ op: "assertLineEnd", x: 0, y: 0, ch: 0 });
+        return;
     }
   }
 
@@ -706,7 +728,7 @@ export function compileRegexMode(pattern: string, mode: RegexMode): RegexProgram
   const c = new RegexCompiler();
   // Wrapper (regex.md §3.2): lazy `.*?` prefix + group-0 save + match.
   c.pushInst({ op: "split", x: 3, y: 1, ch: 0 });
-  c.pushInst({ op: "any", x: 0, y: 0, ch: 0 });
+  c.pushInst({ op: "anyChar", x: 0, y: 0, ch: 0 });
   c.pushInst({ op: "jmp", x: 0, y: 0, ch: 0 });
   c.pushInst({ op: "save", x: 0, y: 0, ch: 0 });
   c.emit(root);
@@ -869,7 +891,7 @@ function regexSearch(
   let matched: CapNode | null = null;
 
   const marks = seen.marks;
-  addThread(p, clist, marks, nextGeneration(seen), 0, null, start, len, m);
+  addThread(p, clist, marks, nextGeneration(seen), 0, null, start, input, m);
 
   for (let sp = start; sp <= len; sp++) {
     const generation = nextGeneration(seen);
@@ -880,17 +902,22 @@ function regexSearch(
       switch (inst.op) {
         case "char":
           if (sp < len && input[sp] === inst.ch) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, len, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m);
           }
           break;
         case "any":
           if (sp < len && input[sp] !== 0x0a) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, len, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m);
+          }
+          break;
+        case "anyChar":
+          if (sp < len) {
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m);
           }
           break;
         case "class":
           if (sp < len && classAdmits(p.classes[inst.x], input[sp])) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, len, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m);
           }
           break;
         case "match":
@@ -919,9 +946,10 @@ function addThread(
   pc0: number,
   caps0: CapNode | null,
   sp: number,
-  len: number,
+  input: number[],
   m: Meter,
 ): void {
+  const len = input.length;
   const stack: Thread[] = [{ pc: pc0, caps: caps0 }];
   while (stack.length > 0) {
     const top = stack.pop() as Thread;
@@ -946,6 +974,12 @@ function addThread(
         break;
       case "assertEnd":
         if (sp === len) stack.push({ pc: top.pc + 1, caps: top.caps });
+        break;
+      case "assertLineStart":
+        if (sp === 0 || input[sp - 1] === 0x0a) stack.push({ pc: top.pc + 1, caps: top.caps });
+        break;
+      case "assertLineEnd":
+        if (sp === len || input[sp] === 0x0a) stack.push({ pc: top.pc + 1, caps: top.caps });
         break;
       default:
         // char / any / class / match — parked for the consume loop.

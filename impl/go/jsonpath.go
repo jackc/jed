@@ -14,7 +14,7 @@ import (
 // inside a subscript, or a parenthesized expression or predicate) followed by accessor steps (.key,
 // .*, .**, [subscripts] of any expression, [*], to slices, ?(filter), and the item methods of §3.1);
 // arithmetic (+ - * / %, unary + -, §3.2); a top-level predicate (comparison, exists, like_regex,
-// starts with, is unknown, §4.4). The datetime methods and the like_regex `m` flag are 0A000
+// starts with, is unknown, §4.4). The datetime methods and the like_regex `x` flag are 0A000
 // (jsonpath.md §3.1, §4.3). Path variables ($name, $"name") are bound by the caller's
 // jpVars. A malformed path is 42601. The
 // compiled program is a pure function of the source — kept byte-identical cross-core by the
@@ -3663,9 +3663,6 @@ func (p *jpParser) parseLikeRegex(left *jpPathExpr) (jpParsed, error) {
 		if flags&jpRegexX != 0 {
 			return jpParsed{}, newError(FeatureNotSupported, `XQuery "x" flag (expanded regular expressions) is not implemented`)
 		}
-		if flags&jpRegexM != 0 {
-			return jpParsed{}, jpUnsupported(`like_regex "m" flag`)
-		}
 	}
 	prog, err := jpCompileLikeRegex(pattern, flags, p.prop)
 	if err != nil {
@@ -3676,7 +3673,8 @@ func (p *jpParser) parseLikeRegex(left *jpPathExpr) (jpParsed, error) {
 }
 
 // jpCompileLikeRegex compiles a like_regex pattern under its flags (jsonpath.md §4.3, regex.md §8d):
-// `i` folds the pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
+// `i` folds the pattern, `q` quotes it, `s` is dot-all (otherwise the mode is newline-sensitive),
+// and `m` makes `^`/`$` line anchors.
 // A quoted pattern is all literal, so `i` folds every character of it; otherwise the fold keeps the
 // letter after a backslash (regex.md §1).
 func jpCompileLikeRegex(pattern string, flags uint8, prop *propertyTable) (*regexProgram, error) {
@@ -3690,10 +3688,10 @@ func jpCompileLikeRegex(pattern string, flags uint8, prop *propertyTable) (*rege
 	if flags&jpRegexQ != 0 {
 		return compileRegexMode(quoteRegex(pattern), regexMode{})
 	}
-	if flags&jpRegexS != 0 {
-		return compileRegexMode(pattern, regexMode{dotAll: true})
-	}
-	return compileRegexMode(pattern, regexMode{nlStop: true})
+	// PostgreSQL's jspConvertRegexFlags: no `s` adds REG_NLSTOP, and `m` adds REG_NLANCH,
+	// independently of each other.
+	dotAll := flags&jpRegexS != 0
+	return compileRegexMode(pattern, regexMode{dotAll: dotAll, nlStop: !dotAll, nlAnchor: flags&jpRegexM != 0})
 }
 
 // parseAdditive parses `+` and `-`, left-associative.

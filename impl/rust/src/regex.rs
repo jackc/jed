@@ -33,12 +33,19 @@ const MAX_CP: u32 = 0x10FFFF;
 pub enum Inst {
     Char(char),
     Any,
+    /// Any code point, `\n` included: the unanchored prefix's consume step (regex.md §3.2), so a
+    /// match may start after a newline.
+    AnyChar,
     Class(usize), // index into `Program::classes`
     Split(usize, usize),
     Jmp(usize),
     Save(usize),
     AssertStart,
     AssertEnd,
+    /// `^` in the line-anchor mode (regex.md §8d): the subject start or just after a `\n`.
+    AssertLineStart,
+    /// `$` in the line-anchor mode: the subject end or just before a `\n`.
+    AssertLineEnd,
     Match,
 }
 
@@ -85,12 +92,15 @@ impl Program {
             .map(|i| match i {
                 Inst::Char(c) => format!("char {}", *c as u32),
                 Inst::Any => "any".to_string(),
+                Inst::AnyChar => "anychar".to_string(),
                 Inst::Class(k) => format!("class {k}"),
                 Inst::Split(a, b) => format!("split {a} {b}"),
                 Inst::Jmp(a) => format!("jmp {a}"),
                 Inst::Save(n) => format!("save {n}"),
                 Inst::AssertStart => "assertstart".to_string(),
                 Inst::AssertEnd => "assertend".to_string(),
+                Inst::AssertLineStart => "assertlinestart".to_string(),
+                Inst::AssertLineEnd => "assertlineend".to_string(),
                 Inst::Match => "match".to_string(),
             })
             .collect()
@@ -153,6 +163,8 @@ enum Node {
     Group(Box<Node>, Option<usize>),
     AnchorStart,
     AnchorEnd,
+    LineStart,
+    LineEnd,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +185,9 @@ pub struct Mode {
     pub nl_stop: bool,
     /// Let `.` match a newline (the XQuery `s` flag).
     pub dot_all: bool,
+    /// Let `^`/`$` also anchor just after / before a newline (the XQuery `m` flag, PostgreSQL's
+    /// `REG_NLANCH`). `\A`/`\z` stay string-anchored.
+    pub nl_anchor: bool,
 }
 
 /// Escape every metacharacter of a pattern so it compiles to the literal string (the XQuery `q`
@@ -360,10 +375,16 @@ impl Parser {
             }
             '^' => {
                 self.bump();
+                if self.mode.nl_anchor {
+                    return Ok(Node::LineStart);
+                }
                 Ok(Node::AnchorStart)
             }
             '$' => {
                 self.bump();
+                if self.mode.nl_anchor {
+                    return Ok(Node::LineEnd);
+                }
                 Ok(Node::AnchorEnd)
             }
             '\\' => {
@@ -727,6 +748,14 @@ impl Compiler {
                 self.push(Inst::AssertEnd)?;
                 Ok(())
             }
+            Node::LineStart => {
+                self.push(Inst::AssertLineStart)?;
+                Ok(())
+            }
+            Node::LineEnd => {
+                self.push(Inst::AssertLineEnd)?;
+                Ok(())
+            }
         }
     }
 
@@ -778,6 +807,8 @@ fn clone_node(n: &Node) -> Node {
         Node::Group(s, i) => Node::Group(Box::new(clone_node(s)), *i),
         Node::AnchorStart => Node::AnchorStart,
         Node::AnchorEnd => Node::AnchorEnd,
+        Node::LineStart => Node::LineStart,
+        Node::LineEnd => Node::LineEnd,
     }
 }
 
@@ -834,7 +865,7 @@ pub fn compile_mode(pattern: &str, mode: Mode) -> Result<Program> {
     };
     // Wrapper (regex.md §3.2): lazy `.*?` prefix (unanchored, leftmost) + group-0 save + Match.
     c.push(Inst::Split(3, 1))?;
-    c.push(Inst::Any)?;
+    c.push(Inst::AnyChar)?;
     c.push(Inst::Jmp(0))?;
     c.push(Inst::Save(0))?;
     c.emit(&root)?;
@@ -1115,7 +1146,7 @@ impl Program {
         let mut matched: Option<R::Caps> = None;
 
         let generation = seen.next();
-        self.add_thread::<R>(&mut clist, seen, generation, 0, None, start, len, m)?;
+        self.add_thread::<R>(&mut clist, seen, generation, 0, None, start, input, m)?;
 
         for sp in start..=len {
             let generation = seen.next();
@@ -1126,6 +1157,7 @@ impl Program {
                 let advances = match &self.insts[pc] {
                     Inst::Char(c) => sp < len && input[sp] == *c,
                     Inst::Any => sp < len && input[sp] != '\n',
+                    Inst::AnyChar => sp < len,
                     Inst::Class(k) => sp < len && self.classes[*k].admits(input[sp]),
                     Inst::Match => {
                         matched = clist[i].caps.clone();
@@ -1142,7 +1174,7 @@ impl Program {
                         pc + 1,
                         caps,
                         sp + 1,
-                        len,
+                        input,
                         m,
                     )?;
                 }
@@ -1170,9 +1202,10 @@ impl Program {
         pc0: usize,
         caps0: Option<R::Caps>,
         sp: usize,
-        len: usize,
+        input: &[char],
         m: &mut Meter,
     ) -> Result<()> {
+        let len = input.len();
         let mut stack: Vec<Thread<R::Caps>> = vec![Thread {
             pc: pc0,
             caps: caps0,
@@ -1207,6 +1240,16 @@ impl Program {
                 }
                 Inst::AssertEnd => {
                     if sp == len {
+                        stack.push(Thread { pc: pc + 1, caps });
+                    }
+                }
+                Inst::AssertLineStart => {
+                    if sp == 0 || input[sp - 1] == '\n' {
+                        stack.push(Thread { pc: pc + 1, caps });
+                    }
+                }
+                Inst::AssertLineEnd => {
+                    if sp == len || input[sp] == '\n' {
                         stack.push(Thread { pc: pc + 1, caps });
                     }
                 }
