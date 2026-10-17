@@ -25,13 +25,12 @@ const at = (db: ReturnType<typeof dbWith>, expr: string, id: number): string =>
 
 // --- (a) jed-stricter grammar divergences on the RUNTIME path -------------------------------------
 
-test("runtime text cast uses jed's grammar (hex / underscore / NaN trap 22P02)", () => {
+test("runtime text cast uses jed's grammar (NaN numeric / hex float trap 22P02)", () => {
   // Each PG ACCEPTS but jed rejects, so they cannot be oracle-checked — proving the runtime path
-  // uses jed's own literal grammar, identical to the resolve-time literal form.
+  // uses the same grammar as the resolve-time literal form.
   for (const [s, expr] of [
-    ["0x10", "s :: int"], // PG: '0x10'::int4 → 16
-    ["1_000", "s :: int"], // PG: '1_000'::int4 → 1000
     ["NaN", "s :: numeric"], // PG: 'NaN'::numeric → NaN (jed decimal is finite)
+    ["0x10", "s :: float8"], // PG: glibc strtod reads the hex float → 16
   ]) {
     const db = seeded([s]);
     assert.equal(

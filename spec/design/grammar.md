@@ -223,6 +223,21 @@ Two lexer facts are easy to get subtly wrong across cores, so the grammar pins t
   spellings are indistinguishable past the lexer (a lone `!` is `42601`). The
   arithmetic operators `+ - * / %` are each single-character tokens; `*` is shared with the
   `SELECT *` glob and disambiguated by grammatical position (only the first select item).
+- **PostgreSQL 16+'s number forms, with PostgreSQL's scanner rules.** An integer literal may be
+  written with a **radix prefix** — `0x`/`0X` hexadecimal, `0o`/`0O` octal, `0b`/`0B` binary
+  (`0x1F` = `31`) — and every digit run (a decimal integer, a fraction, an exponent, a radix
+  integer's digits) may carry single **`_` separators** between digits (`1_000`, `1_000.000_1`,
+  `1e1_0`, `0xFF_FF`; one may follow a radix prefix, `0x_ff`). A radix literal is the same untyped
+  integer constant as the equal decimal literal, with the same `2^63` magnitude bound; it never
+  takes a fraction or exponent (`0x1.5` is `0x1` then `.5`, a parse error; `0x1e` is `30`). The
+  lexer scans a number the way PostgreSQL's `scan.l` does: the longest of the number patterns, and
+  a number **glued to an identifier character** — a letter, `_`, or any non-ASCII character
+  starting a word that would continue it (`123abc`, `1_`, `1__0`, `0x1g`, `1e`, `1.5x`, `1.5e1_`)
+  — is `42601` "trailing junk after numeric literal", as is an exponent sign with no digit
+  (`1e+`). A radix prefix with no digit (`0x`, `0x_`, `0o`, `0b`) is `42601` "invalid hexadecimal
+  / octal / binary integer". `1..2` lexes `1` then `..` (a parse error). So a number is always
+  separated from a following word by whitespace or punctuation: `SELECT 1x` is an error, never
+  `1 AS x`.
 - **A `.` makes a `number` a decimal literal** (§14), *or* is the `Dot` token of a qualified
   column reference (`t.col`, §15). The lexer scans one run of digits and, if a `.` follows (or
   leads, `.5`), continues into the fractional digits and emits a **decimal** token; with no `.`
@@ -267,8 +282,8 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   escapes `U&"caf\00e9"`, §3). A bare or quoted identifier longer than **63 bytes** (a quoted
   one measured on its decoded UTF-8 name) is **`42622`** `name_too_long`, where PostgreSQL silently
   truncates to `NAMEDATALEN − 1` ([cost.md](cost.md) §7, the identifier-length limit).
-- **Literal forms.** Integer, **decimal** (`1.50`, `.5`, and scientific `e`-notation
-  `1.5e3` / `5e2` / `1e-3` — §14), **single-quoted string** (the `text` type, `'alice'`, with
+- **Literal forms.** Integer (decimal or `0x`/`0o`/`0b` radix, with `_` separators — §4),
+  **decimal** (`1.50`, `.5`, and scientific `e`-notation `1.5e3` / `5e2` / `1e-3` — §14), **single-quoted string** (the `text` type, `'alice'`, with
   `''` for an embedded quote, or the Unicode-escape form `U&'…'`, §3), `TRUE`/`FALSE`, and `NULL`. `boolean` is now a storable column
   type as well as an expression type (boolean literals, comparison/logical results, and stored
   boolean columns — see [types.md](types.md) §9).
@@ -816,9 +831,10 @@ digit run with no `.` and no exponent stays an integer. The display **scale** is
 (scale 5). When the exponent drives the scale below zero the coefficient absorbs the shift as
 trailing zeros at scale 0. The result is cap-checked at resolve exactly like a written-out literal
 (`1e131072` traps `22003`; `5e2` into an integer column is the same `42804` as any decimal). A
-malformed exponent (`1e`, `1e+`, `1ex` — the `e` not followed by `[+-]?digit`) is **not** consumed
-as part of the number; it lexes as the trailing token and is rejected at parse, like any other
-junk after a literal. The lexer clamps an absurd exponent magnitude (a determinism/resource guard,
+malformed exponent (`1e`, `1e+`, `1ex` — the `e` not followed by `[+-]?digit`) is `42601` trailing
+junk after numeric literal, as PostgreSQL reports it (§4). `_` separators may sit between the
+digits of the integer part, the fraction, and the exponent (`1_000.000_1`, `1e1_0`); they carry no
+value and do not count toward the scale (`1.5_0` is scale `2`). The lexer clamps an absurd exponent magnitude (a determinism/resource guard,
 CLAUDE.md §13) so `1e9999999999` cannot materialize a gigabyte of coefficient zeros: a clamped
 exponent always still traps `22003` for a non-zero coefficient, the one documented divergence being
 that a *zero* coefficient with such an exponent (`0e9999999999`) reads as `0` here rather than
@@ -2717,9 +2733,10 @@ per-row in the evaluator** (`evalCast`), so it is now admitted for the **numeric
 targets — `i16`/`i32`/`i64`, `decimal`/`numeric` (with the typmod re-scale), `f32`/`f64`, and
 `boolean`. "One coercion, three syntaxes" extends to "one coercion, literal **or** runtime": the
 runtime path calls the identical `parse_int_literal` / `parse_decimal_literal` / `parse_f*_literal`
-/ `parse_bool_literal`, so jed's **own** literal grammar still governs (hex / digit-underscore trap
-`22P02`, as do `NaN` / `±Infinity` for the integer and decimal targets — the same documented PG
-divergences as the literal form; a float target accepts `NaN` / `±Infinity`, float.md §4), the cast
+/ `parse_bool_literal`, so the literal form's grammar governs — PostgreSQL's input functions,
+including the 0x/0o/0b and `_` integer/decimal forms (below); `NaN` / `±Infinity` trap `22P02` for
+the integer and decimal targets — the same documented PG divergence as the literal form; a float
+target accepts `NaN` / `±Infinity`, float.md §4), the cast
 node's existing `operator_eval` charge meters it, and a malformed / out-of-range value traps
 `22P02` / `22003` **per row** during the scan rather than at plan time. The runtime text→`T` cast to
 the **string-native** targets has landed by the same rule — each runs its literal's parser per row:
@@ -2742,13 +2759,18 @@ value literals, so `true 'x'` is not `CAST('x' AS true)`.)
 
 **Documented divergences from PostgreSQL** (we own our surface, CLAUDE.md §1):
 
-- For `integer`/`decimal`, jed coerces by its **own literal grammar**, not PG's input-function
-  extras: **hex/octal/binary** (`integer '0x10'`), **digit underscores** (`integer '1_000'`,
-  `numeric '1_000.5'`), and **`NaN` / `±Infinity`** (`numeric 'NaN'` — jed's decimal is always
-  finite, [decimal.md](decimal.md) §2) all trap `22P02` where PG accepts them. **Scientific
-  notation** is part of the decimal-literal grammar (§14), so `numeric '1.5e3'` is `1500`, as in
-  PG (an integer target rejects it, as PG's `int4in` does). This keeps `type 'string'` coercion
-  identical to writing the value as a native jed literal.
+- For `integer`/`decimal`, jed coerces with **PostgreSQL's input functions** (`pg_strtoint16/32/64`,
+  `numeric_in`), including PostgreSQL 16+'s **hex/octal/binary** (`integer '0x10'` = `16`,
+  `numeric '0xff'` = `255` at scale 0, of any size) and **digit underscores** (`integer '1_000'`,
+  `numeric '1_000.5'`) — the same forms as the native literals (§4) — and **scientific notation**
+  for decimal (`numeric '1.5e3'` is `1500`; an integer target rejects it, as `int4in` does). The
+  rules are PostgreSQL's exactly: surrounding `isspace` whitespace (including vertical tab) is
+  skipped; a `_` must sit between two digits (after a radix prefix it may lead; in a decimal it
+  may not touch the `.`); an integer whose magnitude overflows **while its digits are read** is
+  `22003` even with junk after it (`'99999999999x'::int`), but one that overflows only at the final
+  range check loses to the junk (`'0x80000000x'::int` is `22P02`). The one divergence is
+  **`NaN` / `±Infinity`** (`numeric 'NaN'` — jed's decimal is always finite,
+  [decimal.md](decimal.md) §2), which traps `22P02` where PG accepts it.
 - jed uses the **canonical single-word** type names: PG's multi-word `TIMESTAMP WITH TIME ZONE
   '…'` and the **precision typmod** form `TIMESTAMP(p) '…'` / `NUMERIC(p,s) '…'` are not typed
   literals here (a `(` after the name breaks the lookahead; typmod rides only on `CAST`).

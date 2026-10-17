@@ -1,0 +1,249 @@
+# PostgreSQL 16+ number input forms in TEXT input (spec/design/types.md §5, grammar.md §36): an
+# integer (i16/i32/i64) and a decimal read a 0x / 0o / 0b radix prefix (any case) and single `_`
+# separators between digits, exactly as PostgreSQL's pg_strtoint* and numeric_in. Every text → number
+# path shares the one parser: a typed literal, a string-literal cast, a runtime text cast, an array
+# element, and a composite field. Malformed forms are 22P02; a magnitude that overflows while its
+# digits are read is 22003 even when junk follows. Format + the `requires` gate:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.text, types.array, types.composite, cast.explicit, cast.string_literal, cast.operator, cast.runtime_text, cast.numeric_input_forms
+
+# ---- integer: radix prefixes and separators -------------------------------------------------------
+
+query IIIIIIIII nosort
+SELECT '0x10'::i32, '0o17'::i32, '0b101'::i32, '1_000'::i32, '  0X1f  '::i32, '-0x10'::i32, '+0b1'::i32, '0O7'::i32, '0B1'::i32
+----
+16
+15
+5
+1000
+31
+-16
+1
+7
+1
+
+# a `_` may follow the radix prefix; separators may sit between any two digits
+query IIII nosort
+SELECT '0x_10'::i32, '0x1_0'::i32, '1_000_000'::i64, '0_1'::i32
+----
+16
+16
+1000000
+1
+
+query II nosort
+SELECT integer '0x10', integer '1_000'
+----
+16
+1000
+
+# the extremes of each width, in radix form
+query IIIIII nosort
+SELECT '0x7fff'::i16, '-0x8000'::i16, '0x7fffffff'::i32, '-0x80000000'::i32, '0x7fffffffffffffff'::i64, '-0x8000000000000000'::i64
+----
+32767
+-32768
+2147483647
+-2147483648
+9223372036854775807
+-9223372036854775808
+
+query I nosort
+SELECT '9_223_372_036_854_775_807'::i64
+----
+9223372036854775807
+
+statement error 22003
+SELECT '0x8000'::i16
+
+statement error 22003
+SELECT '0x80000000'::i32
+
+statement error 22003
+SELECT '9_223_372_036_854_775_808'::i64
+
+# overflow is detected while the digits are read, before the trailing junk
+statement error 22003
+SELECT '99999999999x'::i32
+
+# but a magnitude that only overflows at the final range check loses to the junk
+statement error 22P02
+SELECT '0x80000000x'::i32
+
+# ---- integer: malformed forms ---------------------------------------------------------------------
+
+statement error 22P02
+SELECT '0x'::i32
+
+statement error 22P02
+SELECT '0x_'::i32
+
+statement error 22P02
+SELECT '-0x'::i32
+
+statement error 22P02
+SELECT '1__0'::i32
+
+statement error 22P02
+SELECT '1_'::i32
+
+statement error 22P02
+SELECT '_1'::i32
+
+statement error 22P02
+SELECT '_'::i32
+
+statement error 22P02
+SELECT '0x1__0'::i32
+
+statement error 22P02
+SELECT '0x10_'::i32
+
+statement error 22P02
+SELECT '00x10'::i32
+
+statement error 22P02
+SELECT '0b2'::i32
+
+statement error 22P02
+SELECT '0o8'::i32
+
+statement error 22P02
+SELECT '0x-1'::i32
+
+statement error 22P02
+SELECT '- 0x1'::i32
+
+statement error 22P02
+SELECT '1e1'::i32
+
+# ---- decimal --------------------------------------------------------------------------------------
+
+query DDDD nosort
+SELECT '1_000.5'::numeric, '1_000'::numeric, '1_0.0_1'::numeric, '1e1_0'::numeric
+----
+1000.5
+1000
+10.01
+10000000000
+
+query DDD nosort
+SELECT '.5_0'::numeric, '1_0e2'::numeric, '1.5_5e1'::numeric
+----
+0.50
+1000
+15.5
+
+# a radix integer is a decimal at scale 0 (any size)
+query DDDDDD nosort
+SELECT '0x10'::numeric, '0x_10'::numeric, '-0x10'::numeric, '0b1_0'::numeric, '0o1_7'::numeric, ' 0X1F '::numeric
+----
+16
+16
+-16
+2
+15
+31
+
+query DD nosort
+SELECT '0xffffffffffffffffffffffff'::numeric, '0x10e1'::numeric
+----
+79228162514264337593543950335
+4321
+
+query DD nosort
+SELECT '-0x0'::numeric, '0x10'::numeric(5,2)
+----
+0
+16.00
+
+statement error 22003
+SELECT '1_000'::numeric(3,0)
+
+statement error 22P02
+SELECT '0x'::numeric
+
+statement error 22P02
+SELECT '0x_'::numeric
+
+statement error 22P02
+SELECT '0x1.8'::numeric
+
+statement error 22P02
+SELECT '0x10_'::numeric
+
+statement error 22P02
+SELECT '0x1__0'::numeric
+
+statement error 22P02
+SELECT '00x10'::numeric
+
+statement error 22P02
+SELECT '1__0'::numeric
+
+statement error 22P02
+SELECT '1_.5'::numeric
+
+statement error 22P02
+SELECT '1._5'::numeric
+
+statement error 22P02
+SELECT '_1'::numeric
+
+statement error 22P02
+SELECT '1e_1'::numeric
+
+statement error 22P02
+SELECT '1e1_'::numeric
+
+# ---- every text -> number path shares the parser ----------------------------------------------------
+
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO s VALUES (1, '0x10'), (2, '1_000'), (3, ' -0b11 '), (4, '0o777')
+
+query IIID nosort
+SELECT id, v::i16, CAST(v AS i64), v::numeric FROM s ORDER BY id
+----
+1
+16
+16
+16
+2
+1000
+1000
+1000
+3
+-3
+-3
+-3
+4
+511
+511
+511
+
+statement ok
+INSERT INTO s VALUES (5, '1__0')
+
+statement error 22P02
+SELECT v::i32 FROM s WHERE id = 5
+
+query T nosort
+SELECT '{0x10,1_000,-0b1}'::i32[]::text
+----
+{16,1000,-1}
+
+query T nosort
+SELECT '{0x1_0,1_0.5}'::numeric[]::text
+----
+{16,10.5}
+
+statement ok
+CREATE TYPE pt AS (x i32, y numeric)
+
+query T nosort
+SELECT ('(0x10,1_0.5)'::pt).x::text || ' ' || ('(0x10,1_0.5)'::pt).y::text
+----
+16 10.5

@@ -117,19 +117,12 @@ test("malformed jsonpath is 42601", () => {
   );
 });
 
-// An item method reads a string with jed's OWN number grammars (grammar.md §36): decimal digits only,
-// no hex/octal/binary prefixes and no digit underscores, so those strings are 22036 where PostgreSQL
-// 16+ (int8in / numeric_in, and glibc strtod behind float8in) accepts them.
+// .double() reads a string with jed's float grammar (float.md §4): no hex floats and no digit
+// underscores, so "0x10" is 22036 where PostgreSQL's float8in (glibc strtod) accepts it. The integer
+// and decimal methods read PostgreSQL's input forms (the corpus).
 test("jsonpath method number grammar divergence", () => {
   const db = dbWith([]);
-  for (const [doc, path] of [
-    ['"0x10"', "$.bigint()"],
-    ['"1_000"', "$.bigint()"],
-    ['"0o17"', "$.integer()"],
-    ['"0x1A"', "$.number()"],
-    ['"1_0"', "$.decimal()"],
-    ['"0x10"', "$.double()"],
-  ]) {
+  for (const [doc, path] of [['"0x10"', "$.double()"]]) {
     assert.equal(
       errCode(() => db.execute(`SELECT jsonb_path_query_first('${doc}', '${path}')`)),
       "22036",

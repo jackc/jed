@@ -55,9 +55,8 @@ func TestRuntimeTextCastGrammarDivergences(t *testing.T) {
 	cases := []struct {
 		s, expr string
 	}{
-		{"0x10", "s :: int"},    // PG: '0x10'::int4 → 16; jed: decimal digits only → 22P02
-		{"1_000", "s :: int"},   // PG: '1_000'::int4 → 1000; jed: no underscores → 22P02
 		{"NaN", "s :: numeric"}, // PG: 'NaN'::numeric → NaN; jed decimal is finite → 22P02
+		{"0x10", "s :: float8"}, // PG: glibc strtod reads the hex float → 16; jed's float grammar → 22P02
 	}
 	for _, c := range cases {
 		db := seededText(t, c.s)

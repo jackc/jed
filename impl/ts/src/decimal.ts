@@ -117,6 +117,40 @@ export class Decimal {
     return Decimal.fromParts(neg, 0, limbs);
   }
 
+  // fromRadixDigits is the integer whose radix-base (2, 8, or 16) digits are `digits` (ASCII, no
+  // separators), at scale 0 — PostgreSQL numeric_in's non-decimal integer input (numeric '0xff',
+  // decimal.md §2). A value certainly above the MAX_INT_DIGITS cap traps 22003 before any
+  // conversion work (a resource guard: base^(n-1) >= 2^435412 > 10^131072); the caller's cap check
+  // decides the rest.
+  static fromRadixDigits(neg: boolean, digits: string, base: number): Decimal {
+    const sig = digits.replace(/^0+/, "");
+    const bits = base === 16 ? 4 : base === 8 ? 3 : 1;
+    if (sig.length > 0 && (sig.length - 1) * bits >= 435412) throw overflow();
+    // Fold the digits in groups worth at most 2^28, so each step is one multiply-by-small and add
+    // over the LSB-first limbs (products stay exact in a JS number).
+    const group = Math.floor(28 / bits);
+    const limbs: number[] = [];
+    for (let start = 0; start < sig.length; start += group) {
+      const end = Math.min(start + group, sig.length);
+      let carry = 0;
+      let mul = 1;
+      for (let k = start; k < end; k++) {
+        carry = carry * base + parseInt(sig[k]!, base);
+        mul *= base;
+      }
+      for (let k = 0; k < limbs.length; k++) {
+        const cur = limbs[k]! * mul + carry;
+        limbs[k] = cur % BASE;
+        carry = Math.floor(cur / BASE);
+      }
+      while (carry !== 0) {
+        limbs.push(carry % BASE);
+        carry = Math.floor(carry / BASE);
+      }
+    }
+    return Decimal.fromParts(neg, 0, limbs);
+  }
+
   // fromDigitsScale builds from a sign, an unscaled coefficient as a decimal-digit string
   // (leading zeros allowed), and a scale. The literal/parse entry point — it does NOT enforce
   // the precision/scale caps (the caller checks them at resolve, trapping 22003).

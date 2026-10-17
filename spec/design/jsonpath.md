@@ -107,8 +107,9 @@ character that could continue a name (`1.type()`, `01`, `1e`, `1~`, `1.é`) is t
 (`42601`), PostgreSQL's number-plus-one-`other`-byte rules. A sign is an operator, not part
 of the number: as in PostgreSQL's grammar, unary `+`/`-` applied to a number literal with no
 accessors folds into it (`-1`, `- -1` is `1`, `-(1)` is `-1`), while `-1.5.abs()` is unary minus
-applied to `1.5.abs()`, since accessors bind tighter. Like jed's SQL literals (grammar.md §36), jsonpath numbers take no `_` digit separators and no
-hex/octal/binary prefixes, which PostgreSQL 16+ accepts.
+applied to `1.5.abs()`, since accessors bind tighter. Unlike jed's SQL literals (grammar.md §4), jsonpath numbers take no `_` digit separators and no
+hex/octal/binary prefixes, which PostgreSQL 16+ accepts (`$ ? (@ == 0x10)`, `1_000`): a deferred
+divergence ([TODO.md](../../TODO.md)).
 
 The operators follow PostgreSQL's `jsonpath_gram.y` precedence, loosest first: `||`, `&&`, `!`, the
 comparisons, binary `+ -`, `* / %`, unary `+ -`, then accessors. `||` and `&&` take predicates and
@@ -136,7 +137,7 @@ followed by `{level}` or `{level to level}`, where a level is an unsigned intege
 (`$.** {2 to last}`; `{}`, `{1,2}`, `{1 to}`, `{+1}`, `{1.0}`, `{1e1}`, `{$x}` are `42601`, and `{01}`
 is trailing junk, `42601`). Like a number literal, a level takes no `_` digit separators and no
 hex/octal/binary prefix (`{1_000}`, `{0x10}` are `42601`; PostgreSQL 16+ accepts them — the same
-divergence as the number literals above). A level above 2147483647 is **`22003`** (`value "…" is out of range for
+deferred divergence as the number literals above). A level above 2147483647 is **`22003`** (`value "…" is out of range for
 type integer`), PostgreSQL's `pg_strtoint32` error, raised at compile. `**` after anything but `.`
 (`$**`, `$.a**`, `**`) is `42601`. `**` is one token, so `$.***` is `$.**` followed by a stray `*`
 (`42601`), and `$.*** 2` is `$.** * 2`, as in PostgreSQL.
@@ -328,10 +329,11 @@ the binary64 value, so every core agrees; no float-render ledger entry is needed
 returned as written — PostgreSQL validates it and keeps the `numeric`.
 
 **Number grammars.** `.bigint()`/`.integer()`/`.boolean()`/`.number()`/`.decimal()` read strings
-with jed's own integer and decimal grammars (grammar.md §36) and `.double()` with jed's float
-grammar (float.md §4). PostgreSQL 16+ also accepts `_` digit separators and hex/octal/binary
-integers (`"0x10".bigint()` is `16`), and its `float8in` accepts glibc's hex floats; jed reports
-`22036` for those, the same documented divergence as its SQL literals (a per-core test).
+with jed's integer and decimal input — PostgreSQL's, including the `_` digit separators and
+hex/octal/binary integers (`"0x10".bigint()` is `16`, `"1_000.5".number()` is `1000.5`; grammar.md
+§36) — and `.double()` with jed's float grammar (float.md §4). PostgreSQL's `float8in` also accepts
+glibc's hex floats (`"0x10".double()` is `16`); jed reports `22036`, the float grammar's documented
+divergence (a per-core test).
 
 **`.keyvalue()` ids.** `"id"` identifies the object a pair came from: PostgreSQL computes
 `10^10 × base + offset`, where `offset` is the object's byte offset inside its *base object* in

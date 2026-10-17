@@ -93,6 +93,42 @@ impl Decimal {
         Decimal { neg, scale, limbs }
     }
 
+    /// The integer whose radix-`base` (2, 8, or 16) digits are `digits` (ASCII, no separators), at
+    /// scale 0 — PostgreSQL `numeric_in`'s non-decimal integer input (`numeric '0xff'`, decimal.md
+    /// §2). A value certainly above the `MAX_INT_DIGITS` cap traps `22003` before any conversion
+    /// work (a resource guard: `base^(n-1) >= 2^435412 > 10^131072`); the caller's cap check
+    /// decides the rest.
+    pub fn from_radix_digits(neg: bool, digits: &str, base: u32) -> Result<Decimal> {
+        let sig = digits.trim_start_matches('0').as_bytes();
+        let bits = u64::from(base.trailing_zeros());
+        if !sig.is_empty() && (sig.len() as u64 - 1) * bits >= 435_412 {
+            return Err(overflow());
+        }
+        // Fold the digits in groups worth at most 2^28 (< BASE), so each step is one
+        // multiply-by-small and add over the LSB-first base-10^9 limbs.
+        let group = (28 / bits) as usize;
+        let mut limbs: Vec<u32> = Vec::new();
+        for chunk in sig.chunks(group) {
+            let mut carry: u64 = 0;
+            let mut mul: u64 = 1;
+            for &c in chunk {
+                let d = char::from(c).to_digit(base).expect("a radix digit");
+                carry = carry * u64::from(base) + u64::from(d);
+                mul *= u64::from(base);
+            }
+            for limb in limbs.iter_mut() {
+                let cur = u64::from(*limb) * mul + carry;
+                *limb = (cur % BASE) as u32;
+                carry = cur / BASE;
+            }
+            while carry != 0 {
+                limbs.push((carry % BASE) as u32);
+                carry /= BASE;
+            }
+        }
+        Ok(Decimal::from_parts(neg, 0, limbs))
+    }
+
     /// Zero at the given display scale.
     pub fn zero(scale: u32) -> Decimal {
         Decimal {

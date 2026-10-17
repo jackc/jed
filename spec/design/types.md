@@ -226,13 +226,13 @@ listed).
   `type 'string'` typed literal and `CAST(<string literal> AS T)` ([grammar.md](grammar.md) §36) —
   for every scalar `T`, folded at resolve (`INTEGER '42'`, `NUMERIC '1.5'`, `BOOLEAN 'true'`,
   `CAST('42' AS int)`). The coercion is the type's own parse (the §3 datetime parse, the §13/§14
-  bytea/uuid input, a decimal/integer/boolean parse matching jed's literal grammar), trapping
+  bytea/uuid input, PostgreSQL's decimal/integer/boolean input functions — grammar.md §36), trapping
   `22P02` (malformed) / `22003` (out of range) / `42704` (unknown type name). A **runtime** text→`T`
   cast on a *non-literal* text expression (`CAST(text_col AS int)`, `s :: numeric(10,2)`) now runs
   the **same per-type coercion per-row in the evaluator** for the **numeric + boolean** scalars —
   `i16`/`i32`/`i64`, `decimal`/`numeric` (typmod re-scale applied), `f32`/`f64`, and `boolean` —
-  reusing the identical parse functions as the literal form (so jed's own grammar still governs: hex
-  / underscore trap `22P02`, and so does `NaN` for an integer or decimal target), metered by the
+  reusing the identical parse functions as the literal form (PostgreSQL's input functions, with the
+  0x/0o/0b and `_` forms, grammar.md §36; `NaN` traps `22P02` for an integer or decimal target), metered by the
   cast node's `operator_eval`, trapping
   `22P02` / `22003` **per row**. The runtime `text → uuid` cast also landed (the uuid cast slice,
   §14: `uuid_in` at eval), and so did `text → date` (the literal's `parse_date` per row,

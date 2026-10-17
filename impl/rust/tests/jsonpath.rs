@@ -143,22 +143,15 @@ fn malformed_jsonpath_is_42601() {
     assert_eq!(err(&mut db, "SELECT '$[1 to'::jsonpath"), "42601");
 }
 
-/// An item method reads a string with jed's OWN number grammars (grammar.md §36): decimal digits
-/// only, no hex/octal/binary prefixes and no digit underscores, so those strings are `22036` where
-/// PostgreSQL 16+ (`int8in` / `numeric_in`, and glibc `strtod` behind `float8in`) accepts them.
+/// `.double()` reads a string with jed's float grammar (float.md §4): no hex floats and no digit
+/// underscores, so `"0x10"` is `22036` where PostgreSQL's `float8in` (glibc `strtod`) accepts it.
+/// The integer and decimal methods read PostgreSQL's input forms (the corpus).
 #[test]
 fn jsonpath_method_number_grammar_divergence() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    for (doc, path) in [
-        ("\"0x10\"", "$.bigint()"),
-        ("\"1_000\"", "$.bigint()"),
-        ("\"0o17\"", "$.integer()"),
-        ("\"0x1A\"", "$.number()"),
-        ("\"1_0\"", "$.decimal()"),
-        ("\"0x10\"", "$.double()"),
-    ] {
+    for (doc, path) in [("\"0x10\"", "$.double()")] {
         assert_eq!(
             err(
                 &mut db,

@@ -46,9 +46,8 @@ hatches — that curation is part of what keeps untrusted SQL safe). A few behav
   determinism, where PostgreSQL's sequences are deliberately non-transactional.
 - **A single writer at a time.** Readers never block except during the brief commit. This is not MVCC:
   there is one committed version plus one writer's pending changes.
-- **Stricter in places, by design.** jed uses its own number-literal grammar (hex, digit
-  underscores, and `NaN` are rejected with `22P02`), and several conversions PostgreSQL does
-  implicitly require an explicit `CAST` / `::`.
+- **Stricter in places, by design.** `numeric` input rejects `NaN` and `Infinity` (`22P02`), and
+  several conversions PostgreSQL does implicitly require an explicit `CAST` / `::`.
 
 Each intentional divergence is recorded in the relevant design doc in the
 [spec](https://github.com/jackc/jed/tree/master/spec).

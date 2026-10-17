@@ -5,40 +5,213 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
-// scanExponent: if b[i:] begins a well-formed exponent [eE][+-]?digit+, consume it and return
-// (exp, true, nextIndex) with the magnitude clamped to ±expLimit. Otherwise return (0, false, i)
-// — a bare e / ex is NOT part of the number (it lexes as the following token, exactly as before
-// e-notation existed; PostgreSQL likewise rejects 1e as trailing junk rather than the number 1).
-func scanExponent(b []byte, i int) (int64, bool, int) {
-	if i >= len(b) || (b[i] != 'e' && b[i] != 'E') {
-		return 0, false, i
+// numIdentStart reports whether c is a PostgreSQL identifier-start byte (scan.l ident_start:
+// [A-Za-z\x80-\xff_]). Used only to detect an identifier glued to a numeric literal (trailing
+// junk, grammar.md §4).
+func numIdentStart(c byte) bool {
+	return isASCIILetter(c) || c == '_' || c >= 0x80
+}
+
+// isASCIILetter reports whether c is an ASCII letter.
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// numIdentLen is the length of the PostgreSQL identifier (ident_start ident_cont*, where
+// ident_cont adds digits and '$') starting at b[p]; 0 when none starts there.
+func numIdentLen(b []byte, p int) int {
+	if p >= len(b) || !numIdentStart(b[p]) {
+		return 0
 	}
-	j := i + 1
-	neg := false
-	if j < len(b) && (b[j] == '+' || b[j] == '-') {
-		neg = b[j] == '-'
-		j++
+	q := p + 1
+	for q < len(b) && (numIdentStart(b[q]) || isDigitByte(b[q]) || b[q] == '$') {
+		q++
 	}
-	if j >= len(b) || b[j] < '0' || b[j] > '9' {
-		return 0, false, i // not a valid exponent — leave e for the next token
+	return q - p
+}
+
+// radixDigitValue is c's value as a digit of radix base (2, 8, 10, or 16), or -1.
+func radixDigitValue(c byte, base int) int {
+	v := -1
+	switch {
+	case c >= '0' && c <= '9':
+		v = int(c - '0')
+	case c >= 'a' && c <= 'f':
+		v = int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		v = int(c-'A') + 10
 	}
-	var exp int64
-	for j < len(b) && b[j] >= '0' && b[j] <= '9' {
-		if exp < expLimit {
-			exp = exp*10 + int64(b[j]-'0')
-			if exp > expLimit {
-				exp = expLimit
-			}
+	if v >= base {
+		return -1
+	}
+	return v
+}
+
+// isRadixDigitAt reports whether b[p] is a digit of radix base.
+func isRadixDigitAt(b []byte, p, base int) bool {
+	return p < len(b) && radixDigitValue(b[p], base) >= 0
+}
+
+// digitRunEnd is the end of the radix-base digit run (_? digit)* starting at b[p] — a '_' counts
+// only when a digit follows it (PostgreSQL's hexinteger tail; a decinteger caller first checks its
+// leading digit).
+func digitRunEnd(b []byte, p, base int) int {
+	for {
+		if isRadixDigitAt(b, p, base) {
+			p++
+		} else if p < len(b) && b[p] == '_' && isRadixDigitAt(b, p+1, base) {
+			p += 2
+		} else {
+			return p
 		}
-		j++
 	}
-	if neg {
-		exp = -exp
+}
+
+// stripUnderscores is text without its '_' digit separators.
+func stripUnderscores(text string) string {
+	return strings.ReplaceAll(text, "_", "")
+}
+
+// integerMagnitude is an integer literal's unsigned magnitude from its radix-base digits ('_'
+// separators allowed). It must be <= 2^63 so that -(2^63) = i64's minimum is reachable; anything
+// larger cannot be represented (42601). i64 cannot hold 2^63, so it is carried unsigned.
+func integerMagnitude(written, digits string, base int) (uint64, error) {
+	var n uint64
+	for k := 0; k < len(digits); k++ {
+		if digits[k] == '_' {
+			continue
+		}
+		d := uint64(radixDigitValue(digits[k], base))
+		if n > ((uint64(1)<<63)-d)/uint64(base) {
+			return 0, newError(SyntaxError, fmt.Sprintf("integer literal out of range: %s", written))
+		}
+		n = n*uint64(base) + d
 	}
-	return exp, true, j
+	return n, nil
+}
+
+// scanNumber scans the numeric literal starting at sql[start] (a digit, or a '.' followed by a
+// digit) with PostgreSQL's scan.l rules (grammar.md §4): a decimal integer digit (_? digit)*; a
+// radix integer 0x/0o/0b (_? digit)+ (a bare 0x / 0x_ is "invalid hexadecimal integer"); a decimal
+// with a '.' and/or an exponent [eE][+-]?decinteger. Any identifier character glued to the end
+// (123abc, 1_, 0x1g, 1e), or an exponent sign with no digit (1e+), is "trailing junk after numeric
+// literal". 1.. is the integer 1 followed by the .. (rescanned). Returns the token and the byte
+// offset just past it. All errors are 42601.
+func scanNumber(sql string, b []byte, start int) (token, int, error) {
+	at := func(k int) byte {
+		if k < len(b) {
+			return b[k]
+		}
+		return 0
+	}
+	junk := func(end int) error {
+		return newError(SyntaxError, fmt.Sprintf("trailing junk after numeric literal at or near %q", sql[start:end]))
+	}
+	// A radix integer: 0x… / 0o… / 0b….
+	if at(start) == '0' {
+		base, name := 0, ""
+		switch at(start + 1) {
+		case 'x', 'X':
+			base, name = 16, "hexadecimal"
+		case 'o', 'O':
+			base, name = 8, "octal"
+		case 'b', 'B':
+			base, name = 2, "binary"
+		}
+		if base != 0 {
+			end := digitRunEnd(b, start+2, base)
+			// 0 followed by an identifier is the longest junk reading (scan.l integer_junk).
+			junkEnd := start + 1 + numIdentLen(b, start+1)
+			if end > start+2 {
+				if junkEnd > end {
+					return token{}, 0, junk(junkEnd)
+				}
+				n, err := integerMagnitude(sql[start:end], sql[start+2:end], base)
+				if err != nil {
+					return token{}, 0, err
+				}
+				return token{Kind: tokInt, Int: n}, end, nil
+			}
+			failEnd := start + 2
+			if at(start+2) == '_' {
+				failEnd++
+			}
+			if junkEnd > failEnd {
+				return token{}, 0, junk(junkEnd)
+			}
+			return token{}, 0, newError(SyntaxError, fmt.Sprintf("invalid %s integer at or near %q", name, sql[start:failEnd]))
+		}
+	}
+	// A decimal integer part (empty for a leading-dot decimal .5).
+	intEnd := start
+	if isDigitByte(at(start)) {
+		intEnd = digitRunEnd(b, start, 10)
+	}
+	end := intEnd
+	frac, hasFrac := "", false
+	if at(intEnd) == '.' {
+		if at(intEnd+1) == '.' {
+			// scan.l numericfail: 1.. is the integer, and the .. is rescanned.
+			n, err := integerMagnitude(sql[start:intEnd], sql[start:intEnd], 10)
+			if err != nil {
+				return token{}, 0, err
+			}
+			return token{Kind: tokInt, Int: n}, intEnd, nil
+		}
+		fracStart := intEnd + 1
+		end = fracStart
+		if isDigitByte(at(fracStart)) {
+			// A fraction is a decinteger: it starts with a digit (a `_` right after the `.` is junk).
+			end = digitRunEnd(b, fracStart, 10)
+		}
+		frac, hasFrac = sql[fracStart:end], true
+	}
+	// An optional exponent [eE][+-]?decinteger; a bare e is junk below, e+ with no digit is junk
+	// here (scan.l realfail).
+	var exp int64
+	hasExp := false
+	if at(end) == 'e' || at(end) == 'E' {
+		neg := at(end+1) == '-'
+		signed := neg || at(end+1) == '+'
+		digitsStart := end + 1
+		if signed {
+			digitsStart++
+		}
+		if isDigitByte(at(digitsStart)) {
+			expEnd := digitRunEnd(b, digitsStart, 10)
+			// Clamp the magnitude to expLimit while accumulating (keeps it in i64 and bounds the
+			// coefficient the shared builder may materialize).
+			for k := digitsStart; k < expEnd; k++ {
+				if b[k] != '_' && exp < expLimit {
+					exp = min(exp*10+int64(b[k]-'0'), expLimit)
+				}
+			}
+			if neg {
+				exp = -exp
+			}
+			hasExp = true
+			end = expEnd
+		} else if signed {
+			return token{}, 0, junk(digitsStart)
+		}
+	}
+	if glued := numIdentLen(b, end); glued > 0 {
+		return token{}, 0, junk(end + glued)
+	}
+	intPart := stripUnderscores(sql[start:intEnd])
+	if !hasFrac && !hasExp {
+		n, err := integerMagnitude(sql[start:end], intPart, 10)
+		if err != nil {
+			return token{}, 0, err
+		}
+		return token{Kind: tokInt, Int: n}, end, nil
+	}
+	digits, scale := decimalFromParts(intPart, stripUnderscores(frac), hasExp, exp)
+	return token{Kind: tokDecimal, Word: digits, Int: uint64(scale)}, end, nil
 }
 
 // Lex tokenizes sql into tokens terminated by TokEof (CLAUDE.md §5: parsers are
@@ -416,46 +589,15 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 				tokens = append(tokens, token{Kind: tokQuotedIdent, Word: string(sb)})
 			}
 		case isDigit(c):
-			// A numeric literal. Scan the integer digits; a following '.' and/or scientific
-			// e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an
-			// INTEGER literal.
-			start := i
-			for i < len(b) && isDigit(b[i]) {
-				i++
+			// A numeric literal: an integer (decimal, or 0x/0o/0b radix), or a decimal (a '.'
+			// and/or an e-exponent), with '_' digit separators — PostgreSQL's scan.l number rules
+			// (grammar.md §4).
+			tok, end, err := scanNumber(sql, b, i)
+			if err != nil {
+				return nil, err
 			}
-			intPart := sql[start:i]
-			// Optional fractional part: `123.`, `123.45`. The fractional part may be empty.
-			frac := ""
-			hasFrac := false
-			if i < len(b) && b[i] == '.' {
-				hasFrac = true
-				i++ // consume '.'
-				fracStart := i
-				for i < len(b) && isDigit(b[i]) {
-					i++
-				}
-				frac = sql[fracStart:i]
-			}
-			// Optional exponent (`e3`, `E+2`, `e-10`); a well-formed exponent (even with no '.')
-			// makes the literal a decimal.
-			var exp int64
-			var hasExp bool
-			exp, hasExp, i = scanExponent(b, i)
-			if hasFrac || hasExp {
-				digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
-				tokens = append(tokens, token{Kind: tokDecimal, Word: digits, Int: uint64(scale)})
-			} else {
-				// Integer literal: an unsigned magnitude. The sign is TokMinus. The magnitude
-				// must be <= 2^63 so that -(2^63) = i64's minimum is reachable; anything
-				// larger cannot be represented (42601). i64 cannot hold 2^63, so carry it
-				// unsigned and let the parser convert.
-				text := intPart
-				n, err := strconv.ParseUint(text, 10, 64)
-				if err != nil || n > (uint64(1)<<63) {
-					return nil, newError(SyntaxError, fmt.Sprintf("integer literal out of range: %s", text))
-				}
-				tokens = append(tokens, token{Kind: tokInt, Int: n})
-			}
+			tokens = append(tokens, tok)
+			i = end
 		case c == '.':
 			// A '.' has two roles, disambiguated on the FOLLOWING byte alone (no preceding-token
 			// context, so the rule is trivially identical across cores — grammar.md §4): a digit
@@ -464,18 +606,12 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 			// identifier then `.<digit>` (`t.5`) — is invalid either way and lexes as a decimal,
 			// rejected at parse.
 			if i+1 < len(b) && isDigit(b[i+1]) {
-				i++ // consume '.'
-				fracStart := i
-				for i < len(b) && isDigit(b[i]) {
-					i++
+				tok, end, err := scanNumber(sql, b, i)
+				if err != nil {
+					return nil, err
 				}
-				frac := sql[fracStart:i]
-				// A leading-dot decimal may also carry an exponent (`.5e2`).
-				var exp int64
-				var hasExp bool
-				exp, hasExp, i = scanExponent(b, i)
-				digits, scale := decimalFromParts("", frac, hasExp, exp)
-				tokens = append(tokens, token{Kind: tokDecimal, Word: digits, Int: uint64(scale)})
+				tokens = append(tokens, tok)
+				i = end
 			} else {
 				tokens = append(tokens, token{Kind: tokDot})
 				i++
