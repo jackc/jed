@@ -321,7 +321,12 @@ Let `N` be a base relation's exact row count.
   type exactly as execution converts it; an element no key value can equal is read as NULL and
   contributes zero rows. Unlike an IN list, elements are not de-duplicated
   structurally (column statistics de-duplicate known values by key, [statistics.md §6](statistics.md)).
-  `ALL`, other operators, and other array operands keep `opaque`.
+- `x <> ALL(A)` (the array spelling of `NOT IN`) over the same array operands: the NOT rule applied
+  to the `x = ANY(A)` estimate, except that a NULL array, or a NULL element among `A`'s estimator
+  elements, proves zero true rows. An empty array keeps every row.
+- A folded uncorrelated `x [NOT] IN (SELECT ...)` (its value list, known after folding): the
+  `= ANY` / `<> ALL` rule over the list's values as literals.
+- Other `ALL` forms, other operators, and other array operands keep `opaque`.
 - `<>`: `N - equality_rows`.
 - One-sided `<`, `<=`, `>`, or `>=`: `scale_ceil(N, inequality)`.
 - A lower and upper comparison on the same resolved operand in one AND chain:
@@ -469,6 +474,11 @@ The following rules cover additional units:
 
 - fixed structural calls such as `timezone` and `sequence_advance` count once per estimated
   invocation when the corresponding built-in runs;
+- a quantified comparison (`x op ANY/ALL(A)`) counts one more `operator_eval` per element of `A`
+  when the estimator knows the element count — an `ARRAY[...]` constructor's elements, or a
+  plan-time-readable array's flattened elements (a NULL array has none) — matching the per-element
+  charge of the membership walk ([cost.md](cost.md) §3); an array of unknown length (an unbound
+  parameter, a column) adds none. A folded `IN` list counts one per value;
 - `decimal_work`, `collate`, `varlen_compare`, regex size extras, and `scalar_byte` (the
   output-constructing kernels of [cost.md](cost.md) §8) are zero without admitted value-size facts; constant operands may compute their exact structural work;
 - constant regex compilation may count its exact compiled-program work; a parameter pattern uses

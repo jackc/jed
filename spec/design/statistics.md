@@ -317,6 +317,8 @@ fallback remains authoritative.
   equality rows, a NULL element adds none, an element of unknown value adds the unbound-parameter
   equality rows, capped at `current_nonnull`. A promoted element is converted to the column's type
   first; one no column value can equal adds none.
+- `col <> ALL(array)` over the same arrays: `current_nonnull` minus the `= ANY` rows, or zero when
+  the array is NULL or holds a known NULL element (`<> ALL` is then never TRUE).
 - Inequality: add scaled MCV rows satisfying the operator. For histogram residual mass, find the
   lower-bound (`<`) or upper-bound (`<=`) insertion ordinal among the stored bounds and scale by
   `ordinal / (bound_count - 1)`, capped to residual mass. `>`/`>=` are the non-NULL complements.

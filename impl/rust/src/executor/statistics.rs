@@ -890,7 +890,12 @@ pub(crate) fn statistics_leaf_selectivity(
         let current = current_column_statistics(rel, column, catalog)?;
         let mut seen = HashSet::new();
         let mut rows = 0i64;
+        let mut has_null = false;
         for value in list {
+            if matches!(value, Value::Null) {
+                has_null = true;
+                continue;
+            }
             if let Some(key) = statistics_value_key(value, rel, column, catalog)
                 && seen.insert(key.clone())
             {
@@ -900,7 +905,11 @@ pub(crate) fn statistics_leaf_selectivity(
             }
         }
         if *negated {
-            rows = current.nonnull_rows.saturating_sub(rows);
+            rows = if has_null {
+                0
+            } else {
+                current.nonnull_rows.saturating_sub(rows)
+            };
         }
         return Some(statistics_fraction(rows, current.rows));
     }
@@ -912,9 +921,24 @@ pub(crate) fn statistics_leaf_selectivity(
         ..
     } = expr
         && (*elem_exact || *elem_promoted)
-        && estimator_any_array(expr)
     {
-        return statistics_any_array_selectivity(lhs, array, *elem_promoted, rel, catalog);
+        if estimator_any_array(expr) {
+            let (current, rows, _) =
+                statistics_array_equality_rows(lhs, array, *elem_promoted, rel, catalog)?;
+            return Some(statistics_fraction(rows, current.rows));
+        }
+        // `column <> ALL(array)`: the non-NULL rows outside the `= ANY` rows, or none when the
+        // array is NULL or holds a known NULL element.
+        if estimator_not_all_array(expr) {
+            let (current, rows, has_null) =
+                statistics_array_equality_rows(lhs, array, *elem_promoted, rel, catalog)?;
+            let rows = if has_null || estimator_null_array(array) {
+                0
+            } else {
+                current.nonnull_rows.saturating_sub(rows)
+            };
+            return Some(statistics_fraction(rows, current.rows));
+        }
     }
     let (column, op, literal) = statistics_comparison(expr, rel)?;
     let current = current_column_statistics(rel, column, catalog)?;
@@ -925,23 +949,25 @@ pub(crate) fn statistics_leaf_selectivity(
     Some(statistics_fraction(rows, current.rows))
 }
 
-/// Estimate `column = ANY(array)` from column statistics (statistics.md §6): the IN-list rule over
-/// the array's estimator elements — each distinct non-NULL element by statistics key adds its
-/// equality rows, a NULL element adds none, and an element of unknown value adds the NDV average. A
-/// promoted element type converts each known element to the column's type first, so an element no
-/// value can equal adds none.
-fn statistics_any_array_selectivity(
+/// The `column = ANY(array)` row count from column statistics (statistics.md §6), with the column's
+/// statistics and whether the array holds a known NULL element: the IN-list rule over the array's
+/// estimator elements — each distinct non-NULL element by statistics key adds its equality rows, a
+/// NULL element adds none, and an element of unknown value adds the NDV average. A promoted element
+/// type converts each known element to the column's type first, so an element no value can equal
+/// adds none.
+fn statistics_array_equality_rows<'a>(
     lhs: &RExpr,
     array: &RExpr,
     promoted: bool,
     rel: &ScopeRel<'_>,
-    catalog: &Engine,
-) -> Option<crate::estimator::Selectivity> {
+    catalog: &'a Engine,
+) -> Option<(CurrentColumnStatistics<'a>, i64, bool)> {
     use crate::estimator::sat_add;
     let column = statistics_column(lhs, rel)?;
     let current = current_column_statistics(rel, column, catalog)?;
     let mut seen = HashSet::new();
     let mut rows = 0i64;
+    let mut has_null = false;
     let key_type = rel.table.columns[column].ty.as_scalar();
     for elem in estimator_array_elements(array) {
         let elem = match key_type {
@@ -949,6 +975,7 @@ fn statistics_any_array_selectivity(
             _ => elem,
         };
         if estimator_is_null(&elem) {
+            has_null = true;
             continue;
         }
         if let Some(key) = statistics_literal_key(&elem, rel, column, catalog) {
@@ -962,7 +989,7 @@ fn statistics_any_array_selectivity(
         }
         rows = rows.min(current.nonnull_rows);
     }
-    Some(statistics_fraction(rows, current.rows))
+    Some((current, rows, has_null))
 }
 
 /// The rows a column comparison with a non-NULL plan-time literal admits (statistics.md §6). A

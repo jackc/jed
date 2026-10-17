@@ -583,19 +583,36 @@ pub(crate) fn estimator_predicate_selectivity(
         }
         RExpr::Column(_) => Selectivity::fraction(SELECTIVITY_BOOLEAN),
         // `x = ANY(array)` is the OR of `x = element` over its elements (estimator.md §7); a NULL
-        // element contributes zero true rows. Any other quantified comparison stays opaque.
+        // element contributes zero true rows.
         RExpr::Quantified { array, .. } if estimator_any_array(expr) => {
-            let parts = estimator_array_elements(array)
+            estimator_equality_disjunction(&estimator_array_elements(array))
+        }
+        // `x <> ALL(array)` is its complement, except that a NULL array or a known NULL element
+        // proves no row true. Any other quantified comparison stays opaque.
+        RExpr::Quantified { array, .. } if estimator_not_all_array(expr) => {
+            if estimator_null_array(array) {
+                return Selectivity::Zero;
+            }
+            let elems = estimator_array_elements(array);
+            if elems.iter().any(|elem| estimator_is_null(elem)) {
+                return Selectivity::Zero;
+            }
+            estimator_equality_disjunction(&elems).not()
+        }
+        // A folded `x [NOT] IN (SELECT ...)` reads its value list as `= ANY` / `<> ALL` over the
+        // same elements.
+        RExpr::InValues { list, negated, .. } => {
+            let elems: Vec<EstimatorValue<'_>> = list
                 .iter()
-                .map(|elem| {
-                    if estimator_is_null(elem) {
-                        Selectivity::Zero
-                    } else {
-                        Selectivity::fraction(SELECTIVITY_EQUALITY)
-                    }
-                })
+                .map(|v| EstimatorValue::Bound(value_to_rexpr(v)))
                 .collect();
-            crate::estimator::or_selectivities(parts)
+            if !*negated {
+                estimator_equality_disjunction(&elems)
+            } else if list.iter().any(|v| matches!(v, Value::Null)) {
+                Selectivity::Zero
+            } else {
+                estimator_equality_disjunction(&elems).not()
+            }
         }
         _ => crate::estimator::selectivity_class(ACCESS_UNSUPPORTED),
     }
@@ -1217,6 +1234,23 @@ pub(crate) fn estimator_array_elements(array: &RExpr) -> Vec<EstimatorValue<'_>>
         .collect()
 }
 
+/// §7.1's OR of one equality per estimator element; a NULL element contributes zero true rows.
+fn estimator_equality_disjunction(elems: &[EstimatorValue<'_>]) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    use crate::estimator_constants::SELECTIVITY_EQUALITY;
+    let parts = elems
+        .iter()
+        .map(|elem| {
+            if estimator_is_null(elem) {
+                Selectivity::Zero
+            } else {
+                Selectivity::fraction(SELECTIVITY_EQUALITY)
+            }
+        })
+        .collect();
+    crate::estimator::or_selectivities(parts)
+}
+
 /// Whether `e` is a `x = ANY(array)` the estimator reads as a disjunction of equalities: ANY (not
 /// ALL) equality over an array operand constant for the whole relation.
 pub(crate) fn estimator_any_array(e: &RExpr) -> bool {
@@ -1230,7 +1264,53 @@ pub(crate) fn estimator_any_array(e: &RExpr) -> bool {
     else {
         return false;
     };
-    match array.as_ref() {
+    estimator_array_operand(array)
+}
+
+/// Whether `e` is a `x <> ALL(array)` — the complement of `x = ANY(array)` — over an array operand
+/// constant for the whole relation.
+pub(crate) fn estimator_not_all_array(e: &RExpr) -> bool {
+    let RExpr::Quantified {
+        op: CmpOp::Ne,
+        all: true,
+        row_wise: false,
+        array,
+        ..
+    } = e
+    else {
+        return false;
+    };
+    estimator_array_operand(array)
+}
+
+/// Whether the estimator reads an array operand as NULL.
+pub(crate) fn estimator_null_array(array: &RExpr) -> bool {
+    estimator_value(array).is_some_and(|c| matches!(&*c, RExpr::ConstNull))
+}
+
+/// The element count of a quantified comparison's array operand when the estimator knows it
+/// (estimator.md §8.2): an `ARRAY[...]` constructor's elements, or a plan-time-readable array's
+/// flattened elements (a NULL array has none). `None` for any other operand.
+fn estimator_known_array_len(array: &RExpr) -> Option<i64> {
+    if let RExpr::Array {
+        elems,
+        nested: false,
+    } = array
+    {
+        return Some(elems.len() as i64);
+    }
+    match &*estimator_value(array)? {
+        RExpr::ConstNull => Some(0),
+        RExpr::ConstArray(a) => Some(a.elements.len() as i64),
+        _ => None,
+    }
+}
+
+/// Whether an array operand is constant for the whole relation: a parameter, an array constant, a
+/// NULL, a correlated outer column, or a one-dimensional `ARRAY[...]` of literals, parameters, and
+/// outer columns.
+fn estimator_array_operand(array: &RExpr) -> bool {
+    match array {
         RExpr::Param(_) | RExpr::ConstArray(_) | RExpr::ConstNull | RExpr::OuterColumn { .. } => {
             true
         }
@@ -1664,9 +1744,19 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
         | RExpr::DateClock { .. }
         | RExpr::ConstNull => return 0,
         RExpr::Subquery { lhs, .. } => estimator_operator_nodes(lhs.as_deref()),
-        RExpr::InValues { lhs, .. } => estimator_operator_nodes(Some(lhs)),
-        RExpr::Quantified { lhs, array, .. }
-        | RExpr::WidthBucketArray {
+        // A folded IN list charges one operator_eval per value, and a quantified comparison one per
+        // element it compares (cost.md §3); the estimator counts them when the elements are known.
+        RExpr::InValues { lhs, list, .. } => {
+            sat_add(estimator_operator_nodes(Some(lhs)), list.len() as i64)
+        }
+        RExpr::Quantified { lhs, array, .. } => sat_add(
+            sat_add(
+                estimator_operator_nodes(Some(lhs)),
+                estimator_operator_nodes(Some(array)),
+            ),
+            estimator_known_array_len(array).unwrap_or(0),
+        ),
+        RExpr::WidthBucketArray {
             operand: lhs,
             thresholds: array,
             ..

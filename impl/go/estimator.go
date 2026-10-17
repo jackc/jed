@@ -396,21 +396,42 @@ func predicateSelectivity(expr *rExpr) selectivityExpr {
 	case reColumn:
 		return fractionSelectivity(selectivityBoolean)
 	case reQuantified:
+		if estimatorNotAllArray(expr) {
+			// `x <> ALL(array)` is the complement of `x = ANY(array)` (estimator.md §7), except that a
+			// NULL array or a known NULL element proves no row true.
+			if estimatorNullArray(expr.rhs) {
+				return selectivityExpr{kind: selectivityZero}
+			}
+			elems := estimatorArrayElements(expr.rhs)
+			for _, elem := range elems {
+				if estimatorIsNull(elem) {
+					return selectivityExpr{kind: selectivityZero}
+				}
+			}
+			return equalityDisjunction(elems).Not()
+		}
 		if !estimatorAnyArray(expr) {
 			return estimatorSelectivityClass(accessUnsupported)
 		}
 		// `x = ANY(array)` is the OR of `x = element` over its elements (estimator.md §7); a NULL
 		// element contributes zero true rows.
-		elems := estimatorArrayElements(expr.rhs)
-		parts := make([]selectivityExpr, len(elems))
-		for i, elem := range elems {
-			if estimatorIsNull(elem) {
-				parts[i] = selectivityExpr{kind: selectivityZero}
-			} else {
-				parts[i] = fractionSelectivity(selectivityEquality)
-			}
+		return equalityDisjunction(estimatorArrayElements(expr.rhs))
+	case reInValues:
+		// A folded `x [NOT] IN (SELECT ...)` reads its value list as `= ANY` / `<> ALL` over the
+		// same elements (estimator.md §7).
+		elems := make([]*rExpr, len(expr.list))
+		hasNull := false
+		for i, v := range expr.list {
+			elems[i] = valueToRExpr(v)
+			hasNull = hasNull || v.Kind == ValNull
 		}
-		return orSelectivities(parts)
+		if !expr.negated {
+			return equalityDisjunction(elems)
+		}
+		if hasNull {
+			return selectivityExpr{kind: selectivityZero}
+		}
+		return equalityDisjunction(elems).Not()
 	default:
 		return estimatorSelectivityClass(accessUnsupported)
 	}
@@ -778,6 +799,20 @@ func foldEqualityPrefix(count int) selectivityExpr {
 	return result
 }
 
+// equalityDisjunction is §7.1's OR of one equality per estimator element; a NULL element
+// contributes zero true rows.
+func equalityDisjunction(elems []*rExpr) selectivityExpr {
+	parts := make([]selectivityExpr, len(elems))
+	for i, elem := range elems {
+		if estimatorIsNull(elem) {
+			parts[i] = selectivityExpr{kind: selectivityZero}
+		} else {
+			parts[i] = fractionSelectivity(selectivityEquality)
+		}
+	}
+	return orSelectivities(parts)
+}
+
 // orSelectivities folds disjunct estimates with the OR rule as a balanced tree (the halves split
 // at len/2), so an array of many elements cannot nest the program deeply. The OR rule's capped sum
 // is associative, so the tree shape never changes an estimate.
@@ -865,14 +900,54 @@ func estimatorAnyArray(e *rExpr) bool {
 	if e.kind != reQuantified || e.op != opEq || e.quantAll || e.rowWise {
 		return false
 	}
-	switch e.rhs.kind {
+	return estimatorArrayOperand(e.rhs)
+}
+
+// estimatorNotAllArray reports whether e is a `x <> ALL(array)` — the complement of `x = ANY(array)`
+// — over an array operand constant for the whole relation.
+func estimatorNotAllArray(e *rExpr) bool {
+	if e.kind != reQuantified || e.op != opNe || !e.quantAll || e.rowWise {
+		return false
+	}
+	return estimatorArrayOperand(e.rhs)
+}
+
+// estimatorNullArray reports an array operand the estimator reads as NULL.
+func estimatorNullArray(array *rExpr) bool {
+	c := estimatorValue(array)
+	return c != nil && c.kind == reConstNull
+}
+
+// estimatorKnownArrayLen is the element count of a quantified comparison's array operand when the
+// estimator knows it (estimator.md §8.2): an ARRAY[...] constructor's elements, or a plan-time-
+// readable array's flattened elements (a NULL array has none). ok=false for any other operand.
+func estimatorKnownArrayLen(array *rExpr) (int64, bool) {
+	if array.kind == reArray && !array.nested {
+		return int64(len(array.sargs)), true
+	}
+	if c := estimatorValue(array); c != nil {
+		switch c.kind {
+		case reConstNull:
+			return 0, true
+		case reConstArray:
+			return int64(len(c.cArray.Elements)), true
+		}
+	}
+	return 0, false
+}
+
+// estimatorArrayOperand reports an array operand constant for the whole relation: a parameter, an
+// array constant, a NULL, a correlated outer column, or a one-dimensional ARRAY[...] of literals,
+// parameters, and outer columns.
+func estimatorArrayOperand(array *rExpr) bool {
+	switch array.kind {
 	case reParam, reConstArray, reConstNull, reOuterColumn:
 		return true
 	case reArray:
-		if e.rhs.nested {
+		if array.nested {
 			return false
 		}
-		for _, elem := range e.rhs.sargs {
+		for _, elem := range array.sargs {
 			if !estimatorLiteral(elem) && elem.kind != reOuterColumn {
 				return false
 			}
@@ -1259,6 +1334,16 @@ func estimatorOperatorNodes(expr *rExpr) int64 {
 		return 0
 	}
 	total := int64(1)
+	// A quantified comparison charges one operator_eval per element it compares, and a folded IN
+	// list one per value (cost.md §3); the estimator counts them when the elements are known.
+	switch expr.kind {
+	case reQuantified:
+		if n, ok := estimatorKnownArrayLen(expr.rhs); ok {
+			total = satEstimateAdd(total, n)
+		}
+	case reInValues:
+		total = satEstimateAdd(total, int64(len(expr.list)))
+	}
 	total = satEstimateAdd(total, estimatorOperatorNodes(expr.operand))
 	total = satEstimateAdd(total, estimatorOperatorNodes(expr.lhs))
 	total = satEstimateAdd(total, estimatorOperatorNodes(expr.rhs))
