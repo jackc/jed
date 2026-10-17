@@ -47,6 +47,10 @@ thread_local! {
     pub(crate) static READ_PAGES_SENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Turns read-ahead off for connections made afterwards (the benchmark's baseline lane,
+/// `Database::set_page_client_read_ahead_for_testing`).
+pub(crate) static READ_AHEAD_DISABLED: AtomicBool = AtomicBool::new(false);
+
 /// The re-election trigger a handle installs on its connection ([`PsConnection::set_on_break`]).
 pub(crate) type OnBreak = Arc<dyn Fn() + Send + Sync>;
 
@@ -189,7 +193,7 @@ pub(crate) fn connect(
         host: Arc::clone(host),
         page_size: AtomicU32::new(0),
         max_read_pages: AtomicU32::new(1),
-        read_ahead: host.reads_ahead(),
+        read_ahead: host.reads_ahead() && !READ_AHEAD_DISABLED.load(Ordering::Relaxed),
         read_only: AtomicBool::new(false),
         owner_read_only: AtomicBool::new(false),
         owner_yields: AtomicBool::new(false),
