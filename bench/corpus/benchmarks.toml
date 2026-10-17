@@ -3308,3 +3308,41 @@ expect_rows_per_iter = 1
 gen = "int_uniform"
 min = 1
 max = 1000000
+
+# Ordered index keys (spec/design/indexes.md §10). A 100k-row scratch table whose `score` column is
+# indexed DESC: `ORDER BY score DESC LIMIT 10` walks the index forward and looks up only ten rows,
+# where before ordered keys the DESC order was a full scan + top-k sort. The NULLS LAST contrast is a
+# different order, so it keeps the full scan + top-k (made total by the id key).
+[[bench]]
+name = "index_desc_order_topn"
+description = "ORDER BY score DESC LIMIT 10 over a DESC-indexed 100k-row column (NULLs first) — the forward walk of the DESC index"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id, score FROM tdesc ORDER BY score DESC LIMIT 10"
+warmup = 20
+iterations = 200
+seed = 4303
+setup_sql = [
+  "DROP TABLE IF EXISTS tdesc",
+  "CREATE TABLE tdesc (id bigint PRIMARY KEY, score bigint)",
+  "INSERT INTO tdesc SELECT g, CASE WHEN g % 1000 = 0 THEN NULL ELSE (g * 7919) % 100003 END FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX tdesc_score ON tdesc (score DESC)"
+]
+
+[[bench]]
+name = "index_desc_range"
+description = "Range over a DESC-indexed 100k-row column: score >= 99000 (~1% of rows) — the swapped-endpoint index bound"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM tdesc WHERE score >= 99000"
+warmup = 20
+iterations = 200
+seed = 4303
+setup_sql = [
+  "DROP TABLE IF EXISTS tdesc",
+  "CREATE TABLE tdesc (id bigint PRIMARY KEY, score bigint)",
+  "INSERT INTO tdesc SELECT g, CASE WHEN g % 1000 = 0 THEN NULL ELSE (g * 7919) % 100003 END FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX tdesc_score ON tdesc (score DESC)"
+]
