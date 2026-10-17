@@ -35590,7 +35590,8 @@ export function aggregatePlan(
   }
   if (surface === "min" && code === "same_as_input") return ["min", t, undefined];
   if (surface === "max" && code === "same_as_input") return ["max", t, undefined];
-  if (surface === "bool_and" && code === "boolean") return ["boolAnd", { kind: "bool" }, undefined];
+  if ((surface === "bool_and" || surface === "every") && code === "boolean")
+    return ["boolAnd", { kind: "bool" }, undefined];
   if (surface === "bool_or" && code === "boolean") return ["boolOr", { kind: "bool" }, undefined];
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (B4). The (surface, result-code) pair
   // selects the result type + the two flags; the result code is "jsonb" or "json". asJson = the json

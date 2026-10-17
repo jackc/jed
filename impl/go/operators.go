@@ -6718,6 +6718,15 @@ var aggregates = []aggregateDesc{
 		Errors:      []string{},
 	},
 	{
+		Name:        "every",
+		Surface:     "every",
+		Arg:         "expr",
+		ArgFamilies: []string{"boolean"},
+		Result:      "boolean",
+		Null:        "aggregate",
+		Errors:      []string{},
+	},
+	{
 		Name:        "bool_or",
 		Surface:     "bool_or",
 		Arg:         "expr",

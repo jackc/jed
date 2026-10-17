@@ -740,7 +740,8 @@ unmetered.
 |---|---|---|---|
 | `bool_and(x)` | `boolean` | `boolean` | TRUE iff every non-NULL input is TRUE |
 | `bool_or(x)` | `boolean` | `boolean` | TRUE iff some non-NULL input is TRUE |
+| `every(x)` | `boolean` | `boolean` | the SQL-standard spelling of `bool_and` |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
-their non-NULL inputs. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
+their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
 state on the bounded-spill lane is `[bool or NULL]` ([memory.md](memory.md) §6.6).

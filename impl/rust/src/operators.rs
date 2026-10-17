@@ -6718,6 +6718,15 @@ pub const AGGREGATES: &[AggregateDesc] = &[
         errors: &[],
     },
     AggregateDesc {
+        name: "every",
+        surface: "every",
+        arg: "expr",
+        arg_families: &["boolean"],
+        result: "boolean",
+        null: "aggregate",
+        errors: &[],
+    },
+    AggregateDesc {
         name: "bool_or",
         surface: "bool_or",
         arg: "expr",
