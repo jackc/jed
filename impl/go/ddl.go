@@ -727,12 +727,22 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			// Create the OWNED sequence — a default ascending i64 for serial, or the IDENTITY column's
 			// `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
 			// expression default (format_version 8 mechanism).
-			seqName := db.chooseSerialSeqName(ct.Name, def.Name, pendingSerials, nil)
-			owner := &seqOwner{Table: ct.Name, Column: uint16(len(columns))} // this column's ordinal
+			// `SEQUENCE NAME` in the identity options names the sequence (sequences.md §13.1);
+			// otherwise PostgreSQL's ChooseRelationName auto-name.
 			var opts seqOptions
 			if def.Identity != nil {
 				opts = def.Identity.Options
 			}
+			seqName := opts.SequenceName
+			if seqName != "" {
+				if err := db.checkIdentitySequenceName(ct.Name, seqName, pendingSerials, nil); err != nil {
+					return outcome{}, err
+				}
+			} else {
+				seqName = db.chooseSerialSeqName(ct.Name, def.Name, pendingSerials, nil)
+			}
+			opts.SequenceName = ""
+			owner := &seqOwner{Table: ct.Name, Column: uint16(len(columns))} // this column's ordinal
 			// The owned sequence's data type follows the column (§14): serial → the pseudo-type,
 			// identity → the column type. An explicit `AS` inside the identity `( … )` options
 			// conflicts with that — 42601 (PG: "conflicting or redundant options"). serial carries no
@@ -2358,6 +2368,111 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					return outcome{}, newError(SyntaxError, "identity column cannot drop its default")
 				}
 				table.Columns[ci].Default, table.Columns[ci].DefaultExpr = nil, nil
+			case alterAddIdentity:
+				// alter.md §2.8, PostgreSQL's order: the owned sequence is defined first (type gate
+				// 22023, option errors, the name), then the column's prerequisites (55000).
+				if isAttachmentScope(at.DB) {
+					return outcome{}, newError(FeatureNotSupported, "a serial / IDENTITY column on an attached-database table is not supported yet")
+				}
+				col := table.Columns[ci]
+				dtype, ok := seqDataTypeForScalar(col.Type.ScalarTy())
+				if !ok || !col.Type.IsInteger() {
+					return outcome{}, newError(InvalidParameterValue, "identity column type must be smallint, integer, or bigint")
+				}
+				opts := edit.Identity.Options
+				if opts.DataType != "" {
+					return outcome{}, newError(SyntaxError, "conflicting or redundant options")
+				}
+				opts.DataType = dtype.PgName()
+				explicitName := opts.SequenceName
+				opts.SequenceName = ""
+				var reserved []string
+				for _, ix := range table.Indexes {
+					reserved = append(reserved, ix.Name)
+				}
+				seqName := explicitName
+				if seqName == "" {
+					seqName = db.chooseSerialSeqName(table.Name, col.Name, pendingSerials, reserved)
+				}
+				seq, err := buildSequenceDef(seqName, opts, &seqOwner{Table: table.Name, Column: uint16(ci)})
+				if err != nil {
+					return outcome{}, err
+				}
+				if explicitName != "" {
+					if err := db.checkIdentitySequenceName(table.Name, seqName, pendingSerials, reserved); err != nil {
+						return outcome{}, err
+					}
+				}
+				if !col.NotNull {
+					return outcome{}, newError(ObjectNotInPrerequisiteState, fmt.Sprintf(
+						"column \"%s\" of relation \"%s\" must be declared NOT NULL before identity can be added", col.Name, table.Name))
+				}
+				if col.Identity != nil {
+					return outcome{}, newError(ObjectNotInPrerequisiteState, fmt.Sprintf(
+						"column \"%s\" of relation \"%s\" is already an identity column", col.Name, table.Name))
+				}
+				if col.Default != nil || col.DefaultExpr != nil {
+					return outcome{}, newError(ObjectNotInPrerequisiteState, fmt.Sprintf(
+						"column \"%s\" of relation \"%s\" already has a default value", col.Name, table.Name))
+				}
+				pendingSerials = append(pendingSerials, seq)
+				exprText := nextvalDefaultText(seqName)
+				expr, err := parseExpression(exprText)
+				if err != nil {
+					return outcome{}, err
+				}
+				table.Columns[ci].DefaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr}
+				k := identityByDefault
+				if edit.Identity.Always {
+					k = identityAlways
+				}
+				table.Columns[ci].Identity = &k
+			case alterSetIdentity:
+				if table.Columns[ci].Identity == nil {
+					return outcome{}, notIdentityColumn(&table, ci)
+				}
+				if (edit.SeqOptions != seqOptions{}) || edit.Restart != nil {
+					dtype, ok := seqDataTypeForScalar(table.Columns[ci].Type.ScalarTy())
+					if !ok {
+						panic("identity column is integer")
+					}
+					pi, key := identitySequenceSlot(snap, original.Name, &table, ci, columnSources[ci].original, pendingSerials)
+					if pi >= 0 {
+						next, err := applySeqAlter(pendingSerials[pi], edit.SeqOptions, edit.Restart, dtype)
+						if err != nil {
+							return outcome{}, err
+						}
+						pendingSerials[pi] = next
+					} else {
+						next, err := applySeqAlter(snap.sequence(key), edit.SeqOptions, edit.Restart, dtype)
+						if err != nil {
+							return outcome{}, err
+						}
+						db.putSequenceRouted(next)
+					}
+				}
+				if edit.Generated != nil {
+					k := identityByDefault
+					if *edit.Generated {
+						k = identityAlways
+					}
+					table.Columns[ci].Identity = &k
+				}
+			case alterDropIdentity:
+				if table.Columns[ci].Identity == nil {
+					if edit.IfExists {
+						continue
+					}
+					return outcome{}, notIdentityColumn(&table, ci)
+				}
+				pi, key := identitySequenceSlot(snap, original.Name, &table, ci, columnSources[ci].original, pendingSerials)
+				if pi >= 0 {
+					pendingSerials = slices.Delete(pendingSerials, pi, pi+1)
+				} else {
+					db.removeSequenceRouted(key)
+				}
+				table.Columns[ci].Identity = nil
+				table.Columns[ci].Default, table.Columns[ci].DefaultExpr = nil, nil
 			case alterSetNotNull:
 				table.Columns[ci].NotNull = true
 			case alterDropNotNull:
@@ -2558,8 +2673,11 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	}
 	var rewriteRows []entry
 	rewriteNextRowid := int64(0)
-	if tableRewriteNeeded {
-		for _, seq := range pendingSerials {
+	// Make owned sequences (ADD COLUMN serial/identity, ADD IDENTITY) visible to their synthesized
+	// nextval defaults. Statement-level rollback restores the prior working root if any later
+	// validation fails.
+	for _, seq := range pendingSerials {
+		{
 			var sw *snapshot
 			if at.DB == nil {
 				if snap == db.tempSnap() {
@@ -2581,6 +2699,8 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 			sw.putSequence(seq)
 		}
+	}
+	if tableRewriteNeeded {
 		store := db.lkpStoreScoped(at.DB, original.Name)
 		oldMask := make([]bool, len(original.Columns))
 		for i := range oldMask {
@@ -2817,33 +2937,75 @@ func (db *engine) retypeAlterIdentitySequence(table, original *catTable, ci int,
 	if !oldOK || !newOK {
 		panic("identity column is integer")
 	}
-	for i, seq := range pending {
-		if seq.OwnedBy != nil && seq.OwnedBy.Table == table.Name && int(seq.OwnedBy.Column) == ci {
-			next, err := retypeIdentitySequence(seq, oldDtype, newDtype)
-			if err != nil {
-				return err
-			}
-			*pending[i] = *next
-			return nil
-		}
-	}
-	oldColumn := sources[ci].original
-	if oldColumn < 0 {
-		panic("added identity column has pending sequence")
-	}
-	for _, key := range snap.sequencesOwnedBy(original.Name) {
-		seq := snap.sequence(key)
-		if seq == nil || seq.OwnedBy == nil || int(seq.OwnedBy.Column) != oldColumn {
-			continue
-		}
-		next, err := retypeIdentitySequence(seq, oldDtype, newDtype)
+	pi, key := identitySequenceSlot(snap, original.Name, table, ci, sources[ci].original, pending)
+	if pi >= 0 {
+		next, err := retypeIdentitySequence(pending[pi], oldDtype, newDtype)
 		if err != nil {
 			return err
 		}
-		db.putSequenceRouted(next)
+		*pending[pi] = *next
 		return nil
 	}
-	panic("identity column has no owned sequence")
+	next, err := retypeIdentitySequence(snap.sequence(key), oldDtype, newDtype)
+	if err != nil {
+		return err
+	}
+	db.putSequenceRouted(next)
+	return nil
+}
+
+// identitySequenceSlot locates identity column ci's owned sequence during an ALTER TABLE action list
+// (alter.md §2.8): a pending index (created by an earlier ADD COLUMN / ADD IDENTITY action of the
+// same statement, key "") or, with index -1, the catalog key of an existing one. The column's
+// synthesized nextval('<seq>') default names it — possibly wrapped in the CAST an earlier ALTER
+// COLUMN … TYPE added — which tells the identity sequence apart from a leftover serial sequence the
+// same column may still own after DROP DEFAULT. oldCi is the column's pre-statement ordinal (-1 for
+// a column added by this statement). A sequence an earlier action dropped is already gone from snap.
+func identitySequenceSlot(snap *snapshot, originalName string, table *catTable, ci, oldCi int, pending []*sequenceDef) (int, string) {
+	defaultText := ""
+	if de := table.Columns[ci].DefaultExpr; de != nil {
+		defaultText = de.ExprText
+	}
+	namesIt := func(name string) bool { return strings.Contains(defaultText, nextvalDefaultText(name)) }
+	pendingOwned := func(seq *sequenceDef) bool {
+		return seq.OwnedBy != nil && seq.OwnedBy.Table == table.Name && int(seq.OwnedBy.Column) == ci
+	}
+	for i, seq := range pending {
+		if pendingOwned(seq) && namesIt(seq.Name) {
+			return i, ""
+		}
+	}
+	for i, seq := range pending {
+		if pendingOwned(seq) {
+			return i, ""
+		}
+	}
+	if oldCi < 0 {
+		panic("an added identity column has a pending sequence")
+	}
+	var owned []string
+	for _, key := range snap.sequencesOwnedBy(originalName) {
+		seq := snap.sequence(key)
+		if seq != nil && seq.OwnedBy != nil && int(seq.OwnedBy.Column) == oldCi {
+			owned = append(owned, key)
+		}
+	}
+	for _, key := range owned {
+		if namesIt(key) {
+			return -1, key
+		}
+	}
+	if len(owned) == 0 {
+		panic("identity column has an owned sequence")
+	}
+	return -1, owned[0]
+}
+
+// notIdentityColumn is the 55000 for an identity alteration of a column that is not an identity
+// column (PostgreSQL's ATExecSetIdentity / ATExecDropIdentity).
+func notIdentityColumn(table *catTable, ci int) error {
+	return newError(ObjectNotInPrerequisiteState, fmt.Sprintf(
+		"column \"%s\" of relation \"%s\" is not an identity column", table.Columns[ci].Name, table.Name))
 }
 
 func retypeIdentitySequence(existing *sequenceDef, oldType, newType seqDataType) (*sequenceDef, error) {
@@ -2993,11 +3155,19 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 		if isSerial && def.Default != nil {
 			return catColumn{}, newError(SyntaxError, fmt.Sprintf("multiple default values specified for column %s of table %s", def.Name, table.Name))
 		}
-		seqName := db.chooseSerialSeqName(table.Name, def.Name, *pending, reservedRelationNames)
 		var opts seqOptions
 		if def.Identity != nil {
 			opts = def.Identity.Options
 		}
+		seqName := opts.SequenceName
+		if seqName != "" {
+			if err := db.checkIdentitySequenceName(table.Name, seqName, *pending, reservedRelationNames); err != nil {
+				return catColumn{}, err
+			}
+		} else {
+			seqName = db.chooseSerialSeqName(table.Name, def.Name, *pending, reservedRelationNames)
+		}
+		opts.SequenceName = ""
 		if opts.DataType != "" {
 			return catColumn{}, newError(SyntaxError, "conflicting or redundant options")
 		}
@@ -3097,6 +3267,23 @@ func rewriteAlterTableExpressions(table *catTable, old, next string, tableRename
 			e.ExprText, e.Expr = text, expr
 			table.Indexes[i].Predicate = &e
 		}
+	}
+	return nil
+}
+
+// checkIdentitySequenceName validates an explicit identity `SEQUENCE NAME` (sequences.md §13.1): the
+// `jed_` reservation (42939), then the relation namespace as chooseSerialSeqName sees it — an
+// existing relation, the owning table, a pending owned sequence, or a caller-reserved name is 42P07.
+func (db *engine) checkIdentitySequenceName(table, name string, pending []*sequenceDef, reserved []string) error {
+	if err := checkReservedName("sequence", name); err != nil {
+		return err
+	}
+	taken := db.relationExists(name) || name == table || slices.Contains(reserved, name)
+	for _, s := range pending {
+		taken = taken || s.Name == name
+	}
+	if taken {
+		return newError(DuplicateTable, "relation already exists: "+name)
 	}
 	return nil
 }
@@ -3244,9 +3431,11 @@ func seqBoundCheckLast(lastValue, minValue, maxValue int64) error {
 // applySeqAlter re-edits an existing SequenceDef per ALTER SEQUENCE s <options>
 // (spec/design/sequences.md §15.2) — PG init_params with isInit=false. Only the WRITTEN options
 // change; LastValue/IsCalled are preserved unless restart is given. The value type is not persisted
-// (§14.4), so NO MINVALUE/NO MAXVALUE reset the open direction to the bigint bound and an explicit
-// bound is i64-checked only. options.DataType must be "" (the caller rejects AS as 0A000 first).
-func applySeqAlter(existing *sequenceDef, options seqOptions, restart *seqRestart) (*sequenceDef, error) {
+// (§14.4), so for ALTER SEQUENCE dtype is bigint: NO MINVALUE/NO MAXVALUE reset the open direction
+// to the bigint bound and an explicit bound is i64-checked only. An identity column's
+// `ALTER TABLE … ALTER COLUMN … SET` passes the column type instead (alter.md §2.8). options.DataType
+// must be "" (the caller rejects AS first).
+func applySeqAlter(existing *sequenceDef, options seqOptions, restart *seqRestart, dtype seqDataType) (*sequenceDef, error) {
 	def := *existing
 	if options.Increment != nil {
 		if *options.Increment == 0 {
@@ -3261,10 +3450,21 @@ func applySeqAlter(existing *sequenceDef, options seqOptions, restart *seqRestar
 		}
 		def.Cache = *options.Cache
 	}
-	// NO MINVALUE/NO MAXVALUE recompute the default for the (possibly new) INCREMENT sign — against
-	// the bigint range (the value type is not persisted, §14.4). An explicit bound is taken as
-	// written; an unwritten bound is preserved (PG keeps it even when the sign flips).
-	defMin, defMax := seqBigInt.DefaultBounds(def.Increment)
+	// NO MINVALUE/NO MAXVALUE recompute the default for the (possibly new) INCREMENT sign against
+	// dtype: bigint for ALTER SEQUENCE (the value type is not persisted, §14.4), the column type for
+	// an identity column's ALTER TABLE … ALTER COLUMN … SET (alter.md §2.8). An explicit bound must
+	// lie in dtype's range (MAX checked first, PG order); an unwritten bound is preserved (PG keeps it
+	// even when the sign flips).
+	defMin, defMax := dtype.DefaultBounds(def.Increment)
+	typeMin, typeMax := dtype.Range()
+	if options.MaxValue != nil && !options.MaxValue.NoValue && options.MaxValue.Value > typeMax {
+		return nil, newError(InvalidParameterValue, fmt.Sprintf(
+			"MAXVALUE (%d) is out of range for sequence data type %s", options.MaxValue.Value, dtype.PgName()))
+	}
+	if options.MinValue != nil && !options.MinValue.NoValue && options.MinValue.Value < typeMin {
+		return nil, newError(InvalidParameterValue, fmt.Sprintf(
+			"MINVALUE (%d) is out of range for sequence data type %s", options.MinValue.Value, dtype.PgName()))
+	}
 	if options.MinValue != nil {
 		if options.MinValue.NoValue {
 			def.MinValue = defMin
@@ -3900,6 +4100,9 @@ func (db *engine) executeCreateSequence(cs *createSequence) (outcome, error) {
 		}
 		return outcome{}, newError(DuplicateTable, "relation already exists: "+cs.Name)
 	}
+	if cs.Options.SequenceName != "" {
+		return outcome{}, newError(SyntaxError, "invalid sequence option SEQUENCE NAME")
+	}
 	def, err := buildSequenceDef(cs.Name, cs.Options, nil)
 	if err != nil {
 		return outcome{}, err
@@ -3970,7 +4173,10 @@ func (db *engine) executeAlterSequence(as *alterSequence) (outcome, error) {
 		if as.Options.DataType != "" {
 			return outcome{}, newError(FeatureNotSupported, "ALTER SEQUENCE ... AS type is not supported")
 		}
-		newDef, err := applySeqAlter(&existing, as.Options, as.Restart)
+		if as.Options.SequenceName != "" {
+			return outcome{}, newError(SyntaxError, "invalid sequence option SEQUENCE NAME")
+		}
+		newDef, err := applySeqAlter(&existing, as.Options, as.Restart, seqBigInt)
 		if err != nil {
 			return outcome{}, err
 		}

@@ -137,6 +137,18 @@ type alterColumnAction struct {
 	TypeName string
 	TypeMod  *typeMod
 	Using    *exprNode
+	// Identity is the alterAddIdentity spec: `ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY
+	// [( seq_options )]` (alter.md §2.8).
+	Identity *identitySpec
+	// Generated / SeqOptions / Restart are the alterSetIdentity list (alter.md §2.8): Generated is
+	// nil when no `SET GENERATED` was written, else true for ALWAYS and false for BY DEFAULT;
+	// SeqOptions and Restart edit the owned sequence exactly as `ALTER SEQUENCE` does, with the
+	// column type as the sequence type.
+	Generated  *bool
+	SeqOptions seqOptions
+	Restart    *seqRestart
+	// IfExists is alterDropIdentity's `DROP IDENTITY IF EXISTS`.
+	IfExists bool
 }
 
 type alterColumnKind int
@@ -147,6 +159,15 @@ const (
 	alterSetNotNull
 	alterDropNotNull
 	alterSetType
+	// alterAddIdentity makes an existing NOT NULL, default-less integer column an identity column
+	// with a new owned sequence (alter.md §2.8).
+	alterAddIdentity
+	// alterSetIdentity is one or more of `SET GENERATED …`, `SET <sequence_option>`, and
+	// `RESTART [[WITH] n]` on an identity column (alter.md §2.8).
+	alterSetIdentity
+	// alterDropIdentity drops the owned sequence and the synthesized default; the column stays
+	// NOT NULL (alter.md §2.8).
+	alterDropIdentity
 )
 
 // explain is a parsed `EXPLAIN [ANALYZE] <statement>` (spec/design/explain.md). Inner is the wrapped
@@ -456,6 +477,11 @@ type seqOptions struct {
 	Start    *int64
 	Cache    *int64
 	Cycle    *bool
+	// SequenceName is `SEQUENCE NAME name` — valid only inside an identity column's `( … )`
+	// options, where it names the owned sequence instead of the auto-chosen
+	// `<table>_<column>_seq` (sequences.md §13.1); "" = unset. Anywhere else (CREATE / ALTER
+	// SEQUENCE) it is 42601, as in PostgreSQL.
+	SequenceName string
 }
 
 // CreateSequence is a CREATE SEQUENCE [IF NOT EXISTS] <name> [options] statement — a named,

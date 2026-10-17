@@ -859,6 +859,8 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "pk_ordinal", Type: scalarT(scalarInt32)},
 			// The DEFAULT as canonical SQL text; NULL for none (introspection.md §5).
 			{Name: "column_default", Type: scalarT(scalarText)},
+			// 'ALWAYS' / 'BY DEFAULT' for an identity column, else NULL (introspection.md §5).
+			{Name: "identity_generation", Type: scalarT(scalarText)},
 		}}
 	case srfJedIndexes:
 		return &catTable{Name: "jed_indexes", Columns: []catColumn{
@@ -1010,7 +1012,8 @@ func (db *engine) jedTablesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) 
 // not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal is the 1-based
 // position in the PRIMARY KEY in KEY order (which may differ from declaration order —
 // constraints.md §3), NULL for a non-member; column_default is the canonical DEFAULT text
-// (catColumn.defaultText). The main database's views follow, in (view name, ordinal) order
+// (catColumn.defaultText); identity_generation is ALWAYS / BY DEFAULT for an identity column, else
+// NULL. The main database's views follow, in (view name, ordinal) order
 // (introspection.md §5): a view column's type is the type its planned body produces, and it is
 // nullable, keyless, and has no default. Cost mirrors jedTablesRows.
 func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
@@ -1036,6 +1039,14 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 			if text, ok := c.defaultText(); ok {
 				columnDefault = TextValue(text)
 			}
+			identityGeneration := NullValue()
+			if c.Identity != nil {
+				if *c.Identity == identityAlways {
+					identityGeneration = TextValue("ALWAYS")
+				} else {
+					identityGeneration = TextValue("BY DEFAULT")
+				}
+			}
 			out = append(out, storedRow{
 				TextValue(t.Name),
 				TextValue(c.Name),
@@ -1044,6 +1055,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				BoolValue(c.NotNull || c.PrimaryKey),
 				pkOrdinal,
 				columnDefault,
+				identityGeneration,
 			})
 		}
 	}
@@ -1066,6 +1078,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 					IntValue(int64(i + 1)),
 					TextValue(types[i]),
 					BoolValue(false),
+					NullValue(),
 					NullValue(),
 					NullValue(),
 				})
