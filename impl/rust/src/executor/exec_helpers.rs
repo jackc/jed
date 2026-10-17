@@ -1113,11 +1113,20 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::JsonSqlFn {
-            ctx, path, passing, ..
+            ctx,
+            path,
+            passing,
+            on_empty_default,
+            on_error_default,
+            ..
         } => {
             rexpr_references_outer(ctx, depth)
                 || rexpr_references_outer(path, depth)
-                || passing.iter().any(|p| rexpr_references_outer(p, depth))
+                || passing
+                    .iter()
+                    .chain(on_empty_default.as_deref())
+                    .chain(on_error_default.as_deref())
+                    .any(|p| rexpr_references_outer(p, depth))
         }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
@@ -1285,11 +1294,20 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             }
         }
         RExpr::JsonSqlFn {
-            ctx, path, passing, ..
+            ctx,
+            path,
+            passing,
+            on_empty_default,
+            on_error_default,
+            ..
         } => {
             collect_touched(ctx, depth, touched);
             collect_touched(path, depth, touched);
-            for p in passing {
+            for p in passing
+                .iter()
+                .chain(on_empty_default.as_deref())
+                .chain(on_error_default.as_deref())
+            {
                 collect_touched(p, depth, touched);
             }
         }

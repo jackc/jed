@@ -1009,8 +1009,15 @@ impl RExpr {
                 wrapper,
                 on_empty,
                 on_error,
+                on_empty_default,
+                on_error_default,
             } => outline(|| {
                 m.charge(COSTS.operator_eval);
+                let defaults = JsonDefaults {
+                    on_empty: on_empty_default.as_deref(),
+                    on_error: on_error_default.as_deref(),
+                    row,
+                };
                 let cv = ctx.eval(row, env, m)?;
                 let pv = path.eval(row, env, m)?;
                 if matches!(cv, Value::Null) || matches!(pv, Value::Null) {
@@ -1039,7 +1046,15 @@ impl RExpr {
                 let seq = match crate::jsonpath::eval(&compiled, &node, opts, m) {
                     Ok(s) => s,
                     Err(e) if is_sqljson_error(&e) => {
-                        return apply_json_behavior(*on_error, e, *returning, env, m);
+                        return apply_json_behavior(
+                            *on_error,
+                            JsonClause::Error,
+                            defaults,
+                            e,
+                            *returning,
+                            env,
+                            m,
+                        );
                     }
                     Err(e) => return Err(e),
                 };
@@ -1049,8 +1064,8 @@ impl RExpr {
                     && rexpr_is_constant(path)
                     && passing.iter().all(rexpr_is_constant);
                 eval_json_sql_result(
-                    *kind, seq, *returning, *decimal, *wrapper, *on_empty, *on_error, constant,
-                    env, m,
+                    *kind, seq, *returning, *decimal, *wrapper, *on_empty, *on_error, defaults,
+                    constant, env, m,
                 )
             }),
             // AND / OR short-circuit left to right (cost.md §3): a FALSE left operand decides AND,

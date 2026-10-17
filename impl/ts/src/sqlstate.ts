@@ -72,6 +72,7 @@ export type SqlState =
   | "undefined_object" // 42704 — {kind} does not exist: {name}
   | "invalid_column_reference" // 42P10 — for SELECT DISTINCT, ORDER BY expressions must appear in select list
   | "datatype_mismatch" // 42804 — datatype mismatch: {detail}
+  | "cannot_coerce" // 42846 — cannot cast behavior expression of type {type} to {type}
   | "invalid_foreign_key" // 42830 — there is no unique constraint matching given keys for referenced table {name}
   | "duplicate_column" // 42701 — duplicate column name: {name}
   | "duplicate_alias" // 42712 — table name {name} specified more than once
@@ -179,6 +180,7 @@ const CODES: Record<SqlState, string> = {
   undefined_object: "42704",
   invalid_column_reference: "42P10",
   datatype_mismatch: "42804",
+  cannot_coerce: "42846",
   invalid_foreign_key: "42830",
   duplicate_column: "42701",
   duplicate_alias: "42712",
@@ -302,6 +304,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "42704", name: "undefined_object", class: "syntax error or access rule violation" },
   { code: "42P10", name: "invalid_column_reference", class: "syntax error or access rule violation" },
   { code: "42804", name: "datatype_mismatch", class: "syntax error or access rule violation" },
+  { code: "42846", name: "cannot_coerce", class: "syntax error or access rule violation" },
   { code: "42830", name: "invalid_foreign_key", class: "syntax error or access rule violation" },
   { code: "42701", name: "duplicate_column", class: "syntax error or access rule violation" },
   { code: "42712", name: "duplicate_alias", class: "syntax error or access rule violation" },

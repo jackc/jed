@@ -1,0 +1,195 @@
+# The `DEFAULT expr` ON EMPTY / ON ERROR behavior of JSON_VALUE, JSON_QUERY, and a JSON_TABLE column
+# (spec/design/json-sql-functions.md §5.3). The expression is a constant, a function call, or an
+# operator expression, read against the RETURNING type (a string literal is that type); it is
+# evaluated only when its clause fires, and its own errors are not caught by ON ERROR.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: query.select, query.order_by, query.comma_from, ddl.create_table, dml.insert, types.i32, types.text, types.decimal, types.boolean, types.json, types.jsonb, types.jsonpath, func.jsonb_path, expr.json_query_fns, func.json_table, expr.json_behavior_default
+
+# ON EMPTY: a literal, an operator expression, a function call, a negative number. A string literal
+# is read as the RETURNING type.
+query IIIII nosort
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT 5 ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT 2 + 3 ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT length('abcd') ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT -1 ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT '7' ON EMPTY)
+----
+5
+5
+4
+-1
+7
+
+# The default applies only when its clause fires.
+query II nosort
+SELECT JSON_VALUE(jsonb '{"a": 1}', '$.a' RETURNING i32 DEFAULT 9 ON EMPTY), JSON_VALUE(jsonb '{"a": 1}', '$.a' RETURNING i32 DEFAULT 9 ON ERROR)
+----
+1
+1
+
+# Without RETURNING the result is text: a number is cast to it.
+query TT nosort
+SELECT JSON_VALUE(jsonb '{}', '$.a' DEFAULT 1 ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' DEFAULT 'none' || '!' ON EMPTY)
+----
+1
+none!
+
+# ON ERROR: a failed coercion, more than one item, a non-scalar item, a strict-mode missing member.
+query IIIII nosort
+SELECT JSON_VALUE(jsonb '{"a": "x"}', '$.a' RETURNING i32 DEFAULT 7 ON ERROR), JSON_VALUE(jsonb '{"a": [1, 2]}', '$.a[*]' RETURNING i32 DEFAULT 8 ON ERROR), JSON_VALUE(jsonb '{"a": [1, 2]}', '$.a' RETURNING i32 DEFAULT 9 ON ERROR), JSON_VALUE(jsonb '{}', 'strict $.a' RETURNING i32 DEFAULT 10 ON ERROR), JSON_VALUE(jsonb '{"a": "x"}', '$.a' RETURNING i32 DEFAULT 1 ON EMPTY DEFAULT 2 ON ERROR)
+----
+7
+8
+9
+10
+2
+
+query II nosort
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT 1 ON EMPTY DEFAULT 2 ON ERROR), JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT 3 ON EMPTY NULL ON ERROR)
+----
+1
+3
+
+# A value of another type is cast to the RETURNING type: a decimal rounds, a text value is parsed.
+# A NULL default is NULL.
+query IDTI nosort
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT 1.7 ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' RETURNING decimal DEFAULT 2 ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' RETURNING text DEFAULT 2.50 ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT '7'::text ON EMPTY)
+----
+2
+2
+2.50
+7
+
+query TI nosort
+SELECT JSON_VALUE(jsonb '{}', '$.a' DEFAULT NULL ON EMPTY), JSON_VALUE(jsonb '{"a": "x"}', '$.a' RETURNING i32 DEFAULT NULL ON ERROR)
+----
+NULL
+NULL
+
+# A boolean default: an i32 RETURNING casts it, a boolean RETURNING keeps it.
+query IB nosort
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT true ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' RETURNING boolean DEFAULT 1 > 0 ON EMPTY)
+----
+1
+true
+
+# A jsonb default is coerced as a JSON item would be.
+query IT nosort
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT jsonb '"3"' ON EMPTY), JSON_VALUE(jsonb '{}', '$.a' DEFAULT jsonb '"x"' ON EMPTY)
+----
+3
+x
+
+# ... and a failed coercion of it is 42804, which ON ERROR does not catch.
+statement error 42804
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT jsonb '"q"' ON EMPTY)
+
+statement error 42804
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT jsonb '"q"' ON EMPTY DEFAULT 4 ON ERROR)
+
+# An error evaluating the default propagates: ON ERROR does not catch it.
+statement error 22P02
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT 'abc'::text ON EMPTY)
+
+statement error 22P02
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT 'abc'::text ON EMPTY DEFAULT 9 ON ERROR)
+
+# A string literal that is not of the RETURNING type fails when the statement is resolved.
+statement error 22P02
+SELECT JSON_VALUE(jsonb '{"a": 1}', '$.a' RETURNING i32 DEFAULT 'abc' ON EMPTY)
+
+# JSON_QUERY: a string literal is read as jsonb; json and jsonb values are kept.
+query TTTT nosort
+SELECT JSON_QUERY(jsonb '{}', '$.a' DEFAULT '{"b": 2}' ON EMPTY), JSON_QUERY(jsonb '{}', '$.a' DEFAULT jsonb '[1, 2]' ON EMPTY), JSON_QUERY(jsonb '{}', '$.a' DEFAULT '[1]'::json ON EMPTY), JSON_QUERY(jsonb '{"a": [1, 2]}', '$.a[*]' DEFAULT '"err"' ON ERROR)
+----
+{"b": 2}
+[1, 2]
+[1]
+"err"
+
+query T nosort
+SELECT JSON_QUERY(jsonb '{}', '$.a' RETURNING json DEFAULT jsonb '{"y": 1, "x": 2}' ON EMPTY)
+----
+{"x": 2, "y": 1}
+
+# A type with no cast to the RETURNING type is 42846.
+statement error 42846
+SELECT JSON_QUERY(jsonb '{}', '$.a' DEFAULT 1 ON EMPTY)
+
+statement error 42846
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT jsonb '1' ON EMPTY DEFAULT '{}'::json ON ERROR)
+
+# The expression must be a constant, a function call, or an operator expression, and must not
+# reference a column (42804); JSON_EXISTS takes no DEFAULT (42601).
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text, j jsonb)
+
+statement ok
+INSERT INTO t VALUES (1, '5', '{"a": 1}'), (2, 'x', '{}')
+
+statement error 42804
+SELECT JSON_VALUE(j, '$.a' RETURNING i32 DEFAULT s::i32 ON EMPTY) FROM t
+
+statement error 42804
+SELECT JSON_VALUE(j, '$.a' RETURNING i32 DEFAULT length(s) ON EMPTY) FROM t
+
+statement error 42804
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT (SELECT 1) ON EMPTY)
+
+statement error 42804
+SELECT JSON_VALUE(jsonb '{}', '$.a' RETURNING i32 DEFAULT CASE WHEN true THEN 1 END ON EMPTY)
+
+statement error 42601
+SELECT JSON_EXISTS(jsonb '{}', '$.a' DEFAULT true ON ERROR)
+
+# Over table rows: the default fires per row.
+query II rowsort
+SELECT id, JSON_VALUE(j, '$.a' RETURNING i32 DEFAULT -1 ON EMPTY) FROM t
+----
+1
+1
+2
+-1
+
+# JSON_TABLE columns take the same defaults.
+query III nosort
+SELECT * FROM JSON_TABLE(jsonb '[{"a": 1}, {}]', '$[*]' COLUMNS (a i32 PATH '$.a' DEFAULT 7 ON EMPTY, b i32 PATH '$.b' DEFAULT -1 ON EMPTY, c i32 PATH '$.a' DEFAULT 2 + 2 ON ERROR))
+----
+1
+-1
+1
+7
+-1
+NULL
+
+query IT nosort
+SELECT * FROM JSON_TABLE(jsonb '[{"a": "x", "b": [1]}]', '$[*]' COLUMNS (a i32 PATH '$.a' DEFAULT 7 ON ERROR, b jsonb PATH '$.c' DEFAULT '{"none": true}' ON EMPTY))
+----
+7
+{"none": true}
+
+query IIT nosort
+SELECT t.id, jt.a, jt.n FROM t, JSON_TABLE(t.j, '$' COLUMNS (a i32 PATH '$.a' DEFAULT 0 ON EMPTY, NESTED PATH '$.k[*]' COLUMNS (n text PATH '$' DEFAULT 'z' ON EMPTY))) jt ORDER BY t.id
+----
+1
+1
+NULL
+2
+0
+NULL
+
+statement error 42804
+SELECT * FROM t, JSON_TABLE(t.j, '$' COLUMNS (a i32 PATH '$.a' DEFAULT t.id ON EMPTY))
+
+statement error 22P02
+SELECT * FROM JSON_TABLE(jsonb '[{}]', '$[*]' COLUMNS (a i32 PATH '$.a' DEFAULT 'abc'::text ON EMPTY DEFAULT 1 ON ERROR))
+
+# Divergences (oracle_overrides.toml). A boolean default for a RETURNING type other than boolean or
+# i32 is the JSON boolean (PostgreSQL 18 always makes it `false`, a bug in its transformJsonBehavior).
+query T nosort
+SELECT JSON_VALUE(jsonb '{}', '$.a' DEFAULT true ON EMPTY)
+----
+true
+
+# The default is evaluated only when its clause fires. PostgreSQL's planner folds an immutable
+# default first, so it raises 22012 here.
+query I nosort
+SELECT JSON_VALUE(jsonb '{"a": 1}', '$.a' RETURNING i32 DEFAULT 1 / 0 ON EMPTY)
+----
+1

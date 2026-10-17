@@ -892,8 +892,8 @@ type jtColumnRegular struct {
 	Path       *string
 	Wrapper    jsonWrapper
 	KeepQuotes bool
-	OnEmpty    *jsonOnBehavior
-	OnError    *jsonOnBehavior
+	OnEmpty    *jsonBehavior
+	OnError    *jsonBehavior
 }
 
 // JtColumnExists is `name type EXISTS [PATH p] [behavior ON ERROR]` — JSON_EXISTS of `p`, coerced
@@ -1622,8 +1622,16 @@ type jsonCtorExpr struct {
 	UniqueKeys bool
 }
 
-// JsonOnBehavior is a constant `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions
-// (json-sql-functions.md §5.2). `DEFAULT expr` is the deferred S3 follow-on (§5.3).
+// JsonBehavior is one parsed `ON EMPTY` / `ON ERROR` clause of JSON_VALUE / JSON_QUERY / a JSON_TABLE
+// column: a constant behavior, or `DEFAULT expr` (Kind jOBDefault, Default the expression —
+// json-sql-functions.md §5.3).
+type jsonBehavior struct {
+	Kind    jsonOnBehavior
+	Default *exprNode
+}
+
+// JsonOnBehavior is an `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions
+// (json-sql-functions.md §5.2). jOBDefault marks `DEFAULT expr`, whose expression is carried beside it.
 type jsonOnBehavior int
 
 const (
@@ -1638,6 +1646,8 @@ const (
 	// JOBEmptyArray / JOBEmptyObject — substitute an empty JSON array / object (JSON_QUERY).
 	jOBEmptyArray
 	jOBEmptyObject
+	// JOBDefault is `DEFAULT expr` — evaluate the expression (json-sql-functions.md §5.3).
+	jOBDefault
 )
 
 // JsonWrapper is JSON_QUERY's array-wrapper mode (json-sql-functions.md §5.2).
@@ -1710,8 +1720,8 @@ type jsonValueExpr struct {
 	Path      exprNode
 	Passing   []jsonPassing
 	Returning *string
-	OnEmpty   *jsonOnBehavior
-	OnError   *jsonOnBehavior
+	OnEmpty   *jsonBehavior
+	OnError   *jsonBehavior
 }
 
 // JsonQueryExpr is `JSON_QUERY(Ctx, Path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])`
@@ -1724,8 +1734,8 @@ type jsonQueryExpr struct {
 	Returning  *string
 	Wrapper    jsonWrapper
 	KeepQuotes bool
-	OnEmpty    *jsonOnBehavior
-	OnError    *jsonOnBehavior
+	OnEmpty    *jsonBehavior
+	OnError    *jsonBehavior
 }
 
 // IsDistinctExpr is `Lhs IS [NOT] DISTINCT FROM Rhs` — NULL-safe equality. Negated

@@ -289,11 +289,20 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
             rebase_placeholder_cols(b, from, target);
         }
         RExpr::JsonSqlFn {
-            ctx, path, passing, ..
+            ctx,
+            path,
+            passing,
+            on_empty_default,
+            on_error_default,
+            ..
         } => {
             rebase_placeholder_cols(ctx, from, target);
             rebase_placeholder_cols(path, from, target);
-            for p in passing {
+            for p in passing
+                .iter_mut()
+                .chain(on_empty_default.iter_mut().map(|d| &mut **d))
+                .chain(on_error_default.iter_mut().map(|d| &mut **d))
+            {
                 rebase_placeholder_cols(p, from, target);
             }
         }

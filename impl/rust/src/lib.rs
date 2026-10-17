@@ -1116,6 +1116,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "expr.jsonpath_any",
     // the SQL/JSON query functions JSON_EXISTS / JSON_VALUE / JSON_QUERY (S2, json-sql-functions.md §5).
     "expr.json_query_fns",
+    "expr.json_behavior_default",
     // JSON_TABLE with the default plan (T1, json-table.md §3): COLUMNS, FOR ORDINALITY, EXISTS, NESTED.
     "func.json_table",
     // the IS JSON predicate (S1) — well-formedness + kind + unique-keys (json-sql-functions.md §5).

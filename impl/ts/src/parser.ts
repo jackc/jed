@@ -30,6 +30,7 @@ import type {
   InsertValue,
   JoinClause,
   JoinKind,
+  JsonBehavior,
   JsonOnBehavior,
   JsonPredicateKind,
   JsonPassing,
@@ -5652,7 +5653,7 @@ class Parser {
   }
 
   // parseJsonBehavior parses one constant SQL/JSON behavior word (`ERROR` / `NULL` / `TRUE` / `FALSE`
-  // / `UNKNOWN` / `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is the deferred S3 follow-on (0A000).
+  // / `UNKNOWN` / `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is parsed by parseJsonOnClauses.
   private parseJsonBehavior(): JsonOnBehavior {
     switch (this.peekKeyword()) {
       case "error":
@@ -5686,8 +5687,8 @@ class Parser {
       }
       case "default":
         throw engineError(
-          "feature_not_supported",
-          "ON ERROR / ON EMPTY DEFAULT expr is not supported yet",
+          "syntax_error",
+          "invalid ON ERROR behavior: only ERROR, TRUE, FALSE, or UNKNOWN is allowed in ON ERROR for JSON_EXISTS()",
         );
       default:
         throw engineError("syntax_error", "expected a SQL/JSON ON ERROR/EMPTY behavior");
@@ -5706,23 +5707,47 @@ class Parser {
   }
 
   // parseJsonOnClauses parses the optional `<behavior> ON EMPTY` then `<behavior> ON ERROR` clauses
-  // (in that order).
-  private parseJsonOnClauses(): [JsonOnBehavior | null, JsonOnBehavior | null] {
-    let onEmpty: JsonOnBehavior | null = null;
-    let onError: JsonOnBehavior | null = null;
-    if (this.isJsonBehaviorStart() && this.peekOnClauseIs("empty")) {
-      const b = this.parseJsonBehavior();
+  // (in that order). A behavior is a constant word or `DEFAULT expr` (json-sql-functions.md §5.3);
+  // the expression ends at the `ON`.
+  private parseJsonOnClauses(): [JsonBehavior | null, JsonBehavior | null] {
+    let onEmpty: JsonBehavior | null = null;
+    let onError: JsonBehavior | null = null;
+    if (this.peekKeyword() === "default") {
+      const [b, which] = this.parseJsonDefaultBehavior();
+      if (which === "error") return [null, b];
+      onEmpty = b;
+    } else if (this.isJsonBehaviorStart() && this.peekOnClauseIs("empty")) {
+      const kind = this.parseJsonBehavior();
       this.advance(); // ON
       this.advance(); // EMPTY
-      onEmpty = b;
+      onEmpty = { kind, default: null };
     }
-    if (this.isJsonBehaviorStart() && this.peekOnClauseIs("error")) {
-      const b = this.parseJsonBehavior();
+    if (this.peekKeyword() === "default") {
+      const [b, which] = this.parseJsonDefaultBehavior();
+      if (which === "empty")
+        throw engineError("syntax_error", "ON EMPTY must come before ON ERROR");
+      onError = b;
+    } else if (this.isJsonBehaviorStart() && this.peekOnClauseIs("error")) {
+      const kind = this.parseJsonBehavior();
       this.advance(); // ON
       this.advance(); // ERROR
-      onError = b;
+      onError = { kind, default: null };
     }
     return [onEmpty, onError];
+  }
+
+  // parseJsonDefaultBehavior parses `DEFAULT expr ON EMPTY|ERROR` (the cursor at DEFAULT) → the
+  // behavior and which clause it answers.
+  private parseJsonDefaultBehavior(): [JsonBehavior, "empty" | "error"] {
+    this.advance(); // DEFAULT
+    const expr = this.parseExpr();
+    this.expectKeyword("on");
+    const which = this.peekKeyword();
+    if (which !== "empty" && which !== "error") {
+      throw engineError("syntax_error", "expected EMPTY or ERROR after ON");
+    }
+    this.advance();
+    return [{ kind: "default", default: expr }, which];
   }
 
   // parseJsonWrapperQuotes parses JSON_QUERY's optional

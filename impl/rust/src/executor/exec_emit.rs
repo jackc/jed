@@ -1572,11 +1572,20 @@ impl Engine {
                 Ok(())
             }
             RExpr::JsonSqlFn {
-                ctx, path, passing, ..
+                ctx,
+                path,
+                passing,
+                on_empty_default,
+                on_error_default,
+                ..
             } => {
                 self.fold_uncorrelated_in_rexpr(ctx, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(path, bound, ctes, cost)?;
-                for p in passing {
+                for p in passing
+                    .iter_mut()
+                    .chain(on_empty_default.iter_mut().map(|d| &mut **d))
+                    .chain(on_error_default.iter_mut().map(|d| &mut **d))
+                {
                     self.fold_uncorrelated_in_rexpr(p, bound, ctes, cost)?;
                 }
                 Ok(())

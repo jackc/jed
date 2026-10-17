@@ -499,6 +499,14 @@ name = "datatype_mismatch"
 class = "syntax error or access rule violation"
 template = "datatype mismatch: {detail}"
 
+# A SQL/JSON `ON EMPTY` / `ON ERROR` `DEFAULT expr` whose type has no cast to the RETURNING type
+# (../design/json-sql-functions.md §5.3) — PostgreSQL's code and message.
+[[error]]
+code = "42846"
+name = "cannot_coerce"
+class = "syntax error or access rule violation"
+template = "cannot cast behavior expression of type {type} to {type}"
+
 [[error]]
 code = "42830"
 name = "invalid_foreign_key"

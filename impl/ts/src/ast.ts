@@ -40,8 +40,8 @@ export type JsonPredicateKind = "value" | "scalar" | "array" | "object";
 // JsonOnBehavior: a constant `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions
 // (spec/design/json-sql-functions.md §5.2). "null" — substitute SQL NULL; "error" — raise the
 // underlying SQL/JSON error; "true"/"false"/"unknown" — only valid for JSON_EXISTS's `ON ERROR`;
-// "emptyArray"/"emptyObject" — substitute an empty JSON array / object (JSON_QUERY). `DEFAULT expr`
-// is the deferred S3 follow-on (§5.3).
+// "emptyArray"/"emptyObject" — substitute an empty JSON array / object (JSON_QUERY); "default" —
+// `DEFAULT expr`, whose expression is carried beside it (§5.3).
 export type JsonOnBehavior =
   | "null"
   | "error"
@@ -49,7 +49,13 @@ export type JsonOnBehavior =
   | "false"
   | "unknown"
   | "emptyArray"
-  | "emptyObject";
+  | "emptyObject"
+  | "default";
+
+// JsonBehavior: one parsed `ON EMPTY` / `ON ERROR` clause of JSON_VALUE / JSON_QUERY / a JSON_TABLE
+// column — a constant behavior, or `DEFAULT expr` (kind "default", `default` the expression —
+// spec/design/json-sql-functions.md §5.3).
+export type JsonBehavior = { kind: JsonOnBehavior; default: Expr | null };
 
 // JsonWrapper: JSON_QUERY's array-wrapper mode (spec/design/json-sql-functions.md §5.2). "without"
 // (`WITHOUT [ARRAY] WRAPPER`, default) — the sequence must be a singleton; "unconditional"
@@ -194,8 +200,8 @@ export type Expr =
       path: Expr;
       passing: JsonPassing[];
       returning: string | null;
-      onEmpty: JsonOnBehavior | null;
-      onError: JsonOnBehavior | null;
+      onEmpty: JsonBehavior | null;
+      onError: JsonBehavior | null;
     }
   // `JSON_QUERY(ctx, path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])` — extract a
   // JSON value (default `jsonb`). `wrapper` controls array-wrapping; `keepQuotes` controls scalar-
@@ -208,8 +214,8 @@ export type Expr =
       returning: string | null;
       wrapper: JsonWrapper;
       keepQuotes: boolean;
-      onEmpty: JsonOnBehavior | null;
-      onError: JsonOnBehavior | null;
+      onEmpty: JsonBehavior | null;
+      onError: JsonBehavior | null;
     }
   // `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
   // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
@@ -1078,8 +1084,8 @@ export type JtColumn =
       path: string | null;
       wrapper: JsonWrapper;
       keepQuotes: boolean;
-      onEmpty: JsonOnBehavior | null;
-      onError: JsonOnBehavior | null;
+      onEmpty: JsonBehavior | null;
+      onError: JsonBehavior | null;
     }
   // `name type EXISTS [PATH p] [behavior ON ERROR]` — JSON_EXISTS of `p`, coerced to `type`.
   | {

@@ -136,6 +136,8 @@ pub enum SqlState {
     InvalidColumnReference,
     /// 42804 — datatype mismatch: {detail}
     DatatypeMismatch,
+    /// 42846 — cannot cast behavior expression of type {type} to {type}
+    CannotCoerce,
     /// 42830 — there is no unique constraint matching given keys for referenced table {name}
     InvalidForeignKey,
     /// 42701 — duplicate column name: {name}
@@ -290,6 +292,7 @@ impl SqlState {
             SqlState::UndefinedObject => "42704",
             SqlState::InvalidColumnReference => "42P10",
             SqlState::DatatypeMismatch => "42804",
+            SqlState::CannotCoerce => "42846",
             SqlState::InvalidForeignKey => "42830",
             SqlState::DuplicateColumn => "42701",
             SqlState::DuplicateAlias => "42712",
@@ -403,6 +406,7 @@ impl SqlState {
             "42704" => Some(SqlState::UndefinedObject),
             "42P10" => Some(SqlState::InvalidColumnReference),
             "42804" => Some(SqlState::DatatypeMismatch),
+            "42846" => Some(SqlState::CannotCoerce),
             "42830" => Some(SqlState::InvalidForeignKey),
             "42701" => Some(SqlState::DuplicateColumn),
             "42712" => Some(SqlState::DuplicateAlias),
@@ -525,6 +529,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "42704", name: "undefined_object", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P10", name: "invalid_column_reference", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42804", name: "datatype_mismatch", class: "syntax error or access rule violation" },
+    ErrorDesc { code: "42846", name: "cannot_coerce", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42830", name: "invalid_foreign_key", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42701", name: "duplicate_column", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42712", name: "duplicate_alias", class: "syntax error or access rule violation" },

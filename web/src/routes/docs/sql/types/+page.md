@@ -150,7 +150,8 @@ FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
   jsonb_path_query_array('[3, 8, 12, 20]', '$[*] ? (@ >= $min && @ < $max)',
                          vars => '{"min": 5, "max": 15}')                     AS in_range,
   jsonb_path_query_array('[1, "x", 2]', '$[*].double()', silent => true)   AS before_error,
-  JSON_VALUE('{"price": 2.50}', '$.price * $qty' PASSING 4 AS qty)         AS total;`;
+  JSON_VALUE('{"price": 2.50}', '$.price * $qty' PASSING 4 AS qty)         AS total,
+  JSON_VALUE('{"price": 2.50}', '$.qty' RETURNING i32 DEFAULT 1 ON EMPTY)  AS qty;`;
 
 	const jsonpathPredicateDemo = `SELECT
   jsonb_path_query_array('["apple", "Avocado", "banana", 7]',
@@ -515,7 +516,11 @@ JSON error instead of raising it: the functions then return what they found befo
 are not UTF-8 fail with `22021`). Passing a date or timestamp value, or a `NaN` or infinite float, is not supported yet
 (`0A000`). The `_tz`
 forms of the functions (`jsonb_path_exists_tz`, …) behave the same; as in PostgreSQL they are
-`STABLE`, so an index expression cannot use them:
+`STABLE`, so an index expression cannot use them. `JSON_VALUE`, `JSON_QUERY`, and a `JSON_TABLE`
+column also take `ON EMPTY` and `ON ERROR` clauses, as in PostgreSQL: `NULL`, `ERROR`, `EMPTY
+ARRAY`/`EMPTY OBJECT`, or `DEFAULT expr`, where the expression is a constant, a function call, or an
+operator expression that names no column. It is converted to the `RETURNING` type and evaluated
+only when its clause applies:
 
 <LiveSql demo="jsonpathVarsDemo" query={jsonpathVarsDemo} rows={1} />
 

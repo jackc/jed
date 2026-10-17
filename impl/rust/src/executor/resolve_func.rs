@@ -2388,7 +2388,11 @@ fn render_explain_json_sql(
     wrapper: JsonWrapper,
     on_empty: JsonOnBehavior,
     on_error: JsonOnBehavior,
+    on_empty_default: Option<&RExpr>,
+    on_error_default: Option<&RExpr>,
 ) -> String {
+    let on_empty = explain_json_behavior(on_empty, on_empty_default);
+    let on_error = explain_json_behavior(on_error, on_error_default);
     let mut out = format!(
         "{}({}, {}",
         explain_json_sql_func(kind),
@@ -2403,23 +2407,19 @@ fn render_explain_json_sql(
     }
     match kind {
         JsonSqlKind::Exists => {
-            out.push_str(&format!(" {} on error", explain_json_behavior(on_error)));
+            out.push_str(&format!(" {on_error} on error"));
         }
         JsonSqlKind::Value => {
             out.push_str(&format!(
-                " returning {} {} on empty {} on error",
+                " returning {} {on_empty} on empty {on_error} on error",
                 explain_json_returning(returning, decimal),
-                explain_json_behavior(on_empty),
-                explain_json_behavior(on_error),
             ));
         }
         JsonSqlKind::Query => {
             out.push_str(&format!(
-                " returning {} {} keep quotes on scalar string {} on empty {} on error",
+                " returning {} {} keep quotes on scalar string {on_empty} on empty {on_error} on error",
                 explain_json_returning(returning, decimal),
                 explain_json_wrapper(wrapper),
-                explain_json_behavior(on_empty),
-                explain_json_behavior(on_error),
             ));
         }
     }
@@ -2444,15 +2444,19 @@ fn explain_json_wrapper(wrapper: JsonWrapper) -> &'static str {
     }
 }
 
-fn explain_json_behavior(behavior: JsonOnBehavior) -> &'static str {
+fn explain_json_behavior(behavior: JsonOnBehavior, default: Option<&RExpr>) -> String {
     match behavior {
-        JsonOnBehavior::Null => "null",
-        JsonOnBehavior::Error => "error",
-        JsonOnBehavior::True => "true",
-        JsonOnBehavior::False => "false",
-        JsonOnBehavior::Unknown => "unknown",
-        JsonOnBehavior::EmptyArray => "empty array",
-        JsonOnBehavior::EmptyObject => "empty object",
+        JsonOnBehavior::Null => "null".to_string(),
+        JsonOnBehavior::Error => "error".to_string(),
+        JsonOnBehavior::True => "true".to_string(),
+        JsonOnBehavior::False => "false".to_string(),
+        JsonOnBehavior::Unknown => "unknown".to_string(),
+        JsonOnBehavior::EmptyArray => "empty array".to_string(),
+        JsonOnBehavior::EmptyObject => "empty object".to_string(),
+        JsonOnBehavior::Default => format!(
+            "default {}",
+            render_rexpr(default.expect("a DEFAULT behavior carries its expression"))
+        ),
     }
 }
 
@@ -2608,6 +2612,8 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             wrapper,
             on_empty,
             on_error,
+            on_empty_default,
+            on_error_default,
         } => render_explain_json_sql(
             *kind,
             ctx,
@@ -2619,6 +2625,8 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             *wrapper,
             *on_empty,
             *on_error,
+            on_empty_default.as_deref(),
+            on_error_default.as_deref(),
         ),
         RExpr::IsNull { operand, negated } => format!(
             "({} is {}null)",
@@ -5811,8 +5819,13 @@ fn resolve_node(
             &None,
             JsonWrapper::Without,
             true,
-            &None,
-            on_error,
+            None,
+            on_error
+                .map(|kind| JsonBehavior {
+                    kind,
+                    default: None,
+                })
+                .as_ref(),
             agg,
             params,
         ),
@@ -5832,8 +5845,8 @@ fn resolve_node(
             returning,
             JsonWrapper::Without,
             true,
-            on_empty,
-            on_error,
+            on_empty.as_ref(),
+            on_error.as_ref(),
             agg,
             params,
         ),
@@ -5855,8 +5868,8 @@ fn resolve_node(
             returning,
             *wrapper,
             *keep_quotes,
-            on_empty,
-            on_error,
+            on_empty.as_ref(),
+            on_error.as_ref(),
             agg,
             params,
         ),

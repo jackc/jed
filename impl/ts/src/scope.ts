@@ -3231,16 +3231,18 @@ function renderExplainJsonSql(e: Extract<RExpr, { kind: "jsonSqlFn" }>): string 
     out += i === 0 ? " passing " : ", ";
     out += `${renderRExpr(e.args[2 + i]!)} as ${quoteIdentifier(e.passingNames[i]!)}`;
   }
+  const onEmpty = explainJsonBehavior(e.onEmpty, e.args[e.onEmptyDefault]);
+  const onError = explainJsonBehavior(e.onError, e.args[e.onErrorDefault]);
   if (e.sqlKind === "exists") {
-    out += ` ${explainJsonBehavior(e.onError)} on error`;
+    out += ` ${onError} on error`;
   } else if (e.sqlKind === "value") {
     out += ` returning ${explainJsonReturning(e.returning, e.decimal)}`;
-    out += ` ${explainJsonBehavior(e.onEmpty)} on empty ${explainJsonBehavior(e.onError)} on error`;
+    out += ` ${onEmpty} on empty ${onError} on error`;
   } else {
     out += ` returning ${explainJsonReturning(e.returning, e.decimal)}`;
     out += ` ${explainJsonWrapper(e.wrapper)}`;
     out += e.keepQuotes ? " keep quotes on scalar string" : " omit quotes on scalar string";
-    out += ` ${explainJsonBehavior(e.onEmpty)} on empty ${explainJsonBehavior(e.onError)} on error`;
+    out += ` ${onEmpty} on empty ${onError} on error`;
   }
   return out + ")";
 }
@@ -3257,7 +3259,12 @@ function explainJsonWrapper(wrapper: JsonWrapper): string {
   return `with ${wrapper} array wrapper`;
 }
 
-function explainJsonBehavior(behavior: JsonOnBehavior): string {
+// explainJsonBehavior renders an ON EMPTY / ON ERROR behavior; a DEFAULT renders its expression.
+function explainJsonBehavior(behavior: JsonOnBehavior, defaultExpr: RExpr | undefined): string {
+  if (behavior === "default") {
+    if (defaultExpr === undefined) throw new Error("a DEFAULT behavior carries its expression");
+    return `default ${renderRExpr(defaultExpr)}`;
+  }
   if (behavior === "emptyArray") return "empty array";
   if (behavior === "emptyObject") return "empty object";
   return behavior;

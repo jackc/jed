@@ -131,7 +131,8 @@ and derived-table paths already share:
 - **regular `name type [PATH p] [wrapper][quotes][ON …]`** — evaluate `p` (default
   `$.name`) relative to the current row item and coerce to `type`, exactly like `JSON_VALUE`
   (or `JSON_QUERY` when a `type`/`FORMAT JSON`/`WRAPPER` implies a structural result);
-  `ON EMPTY`/`ON ERROR` per column (constant behaviors only — `DEFAULT expr` follows S3).
+  `ON EMPTY`/`ON ERROR` per column (constant behaviors, or `DEFAULT expr` —
+  [json-sql-functions.md §5.3](json-sql-functions.md); an `EXISTS` column takes no `DEFAULT`).
 - **`name type EXISTS [PATH p]`** — `JSON_EXISTS` of `p` per row, coerced to `type`
   (typically `boolean`/`i32`).
 - **`NESTED [PATH] p [AS n] COLUMNS (…)`** — recursively expand a child path relative to the

@@ -259,7 +259,7 @@ func TestJsonPopulateNonCompositeAndComplexFieldDivergences(t *testing.T) {
 }
 
 // TestJSONQueryFnDeferredClausesAre0A000: the SQL/JSON query functions' deferred sub-clauses (S2,
-// json-sql-functions.md §5) each resolve to 0A000 — a DEFAULT-expr behavior, JSON_QUERY OMIT QUOTES,
+// json-sql-functions.md §5) each resolve to 0A000 — JSON_QUERY OMIT QUOTES
 // and a JSON_QUERY non-json RETURNING. A per-core test (the oracle corpus is
 // PG-clean, so a jed-defers case cannot live there). Mirrors impl/rust/tests/json.rs
 // json_query_fn_deferred_clauses_are_0a000.
@@ -267,7 +267,6 @@ func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
-		`SELECT JSON_VALUE('{"a":1}', '$.b' DEFAULT 'z' ON EMPTY)`,
 		`SELECT JSON_QUERY('{"a":1}', '$.a' OMIT QUOTES)`,
 		`SELECT JSON_QUERY('{"a":1}', '$.a' RETURNING int)`,
 	} {

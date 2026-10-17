@@ -11,11 +11,11 @@ use crate::ast::{
     CreateTable, CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete,
     DropIndex, DropSequence, DropTable, DropType, DropView, ExcludeDef, Expr, ForeignKeyDef,
     GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
-    JoinClause, JoinKind, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper,
-    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause,
-    SavepointOp, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos,
-    Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
-    Update, WindowDef, WithExpr, WithQuery,
+    JoinClause, JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable,
+    JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction,
+    ReturningClause, SavepointOp, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind,
+    SrcPos, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod,
+    UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::ast::{CycleClause, SearchClause};
@@ -1719,7 +1719,7 @@ impl Parser {
     }
 
     /// Parse one constant SQL/JSON behavior word (`ERROR` / `NULL` / `TRUE` / `FALSE` / `UNKNOWN` /
-    /// `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is the deferred S3 follow-on (0A000).
+    /// `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is parsed by [`Self::parse_json_on_clauses`].
     fn parse_json_behavior(&mut self) -> Result<JsonOnBehavior> {
         match self.peek_keyword().as_deref() {
             Some("error") => {
@@ -1757,9 +1757,8 @@ impl Parser {
                     _ => Ok(JsonOnBehavior::EmptyArray),
                 }
             }
-            Some("default") => Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "ON ERROR / ON EMPTY DEFAULT expr is not supported yet",
+            Some("default") => Err(syntax(
+                "invalid ON ERROR behavior: only ERROR, TRUE, FALSE, or UNKNOWN is allowed in ON ERROR for JSON_EXISTS()",
             )),
             _ => Err(syntax("expected a SQL/JSON ON ERROR/EMPTY behavior")),
         }
@@ -1779,24 +1778,69 @@ impl Parser {
     }
 
     /// Parse the optional `<behavior> ON EMPTY` then `<behavior> ON ERROR` clauses (in that order).
-    fn parse_json_on_clauses(
-        &mut self,
-    ) -> Result<(Option<JsonOnBehavior>, Option<JsonOnBehavior>)> {
+    /// A behavior is a constant word or `DEFAULT expr` (json-sql-functions.md §5.3); the expression
+    /// ends at the `ON`.
+    fn parse_json_on_clauses(&mut self) -> Result<(Option<JsonBehavior>, Option<JsonBehavior>)> {
         let mut on_empty = None;
         let mut on_error = None;
-        if self.is_json_behavior_start() && self.peek_on_clause_is("empty") {
-            let b = self.parse_json_behavior()?;
+        if self.peek_keyword().as_deref() == Some("default") {
+            let b = self.parse_json_default_behavior()?;
+            if self.expect_on_clause()? == "empty" {
+                on_empty = Some(b);
+            } else {
+                return Ok((None, Some(b)));
+            }
+        } else if self.is_json_behavior_start() && self.peek_on_clause_is("empty") {
+            let kind = self.parse_json_behavior()?;
             self.advance(); // ON
             self.advance(); // EMPTY
-            on_empty = Some(b);
+            on_empty = Some(JsonBehavior {
+                kind,
+                default: None,
+            });
         }
-        if self.is_json_behavior_start() && self.peek_on_clause_is("error") {
-            let b = self.parse_json_behavior()?;
+        if self.peek_keyword().as_deref() == Some("default") {
+            let b = self.parse_json_default_behavior()?;
+            if self.expect_on_clause()? == "empty" {
+                return Err(syntax("ON EMPTY must come before ON ERROR"));
+            }
+            on_error = Some(b);
+        } else if self.is_json_behavior_start() && self.peek_on_clause_is("error") {
+            let kind = self.parse_json_behavior()?;
             self.advance(); // ON
             self.advance(); // ERROR
-            on_error = Some(b);
+            on_error = Some(JsonBehavior {
+                kind,
+                default: None,
+            });
         }
         Ok((on_empty, on_error))
+    }
+
+    /// Parse `DEFAULT expr` of an `ON EMPTY` / `ON ERROR` clause (the cursor at `DEFAULT`).
+    fn parse_json_default_behavior(&mut self) -> Result<JsonBehavior> {
+        self.advance(); // DEFAULT
+        let expr = self.parse_expr()?;
+        Ok(JsonBehavior {
+            kind: JsonOnBehavior::Default,
+            default: Some(Box::new(expr)),
+        })
+    }
+
+    /// Consume `ON EMPTY` or `ON ERROR` after a `DEFAULT expr` behavior → `"empty"` / `"error"`.
+    fn expect_on_clause(&mut self) -> Result<&'static str> {
+        self.expect_keyword("on")?;
+        match self.peek_keyword().as_deref() {
+            Some("empty") => {
+                self.advance();
+                Ok("empty")
+            }
+            Some("error") => {
+                self.advance();
+                Ok("error")
+            }
+            _ => Err(syntax("expected EMPTY or ERROR after ON")),
+        }
     }
 
     /// Parse JSON_QUERY's optional `[WITH [COND|UNCOND] [ARRAY] WRAPPER | WITHOUT [ARRAY] WRAPPER]`

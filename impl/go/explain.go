@@ -1856,7 +1856,7 @@ func renderExplainJSONSQL(e *rExpr) string {
 	b.WriteString(renderRExpr(e.sargs[0]))
 	b.WriteString(", ")
 	b.WriteString(renderRExpr(e.sargs[1]))
-	for i, value := range e.sargs[2:] {
+	for i, value := range e.sargs[2 : 2+len(e.jsPassingNames)] {
 		if i == 0 {
 			b.WriteString(" passing ")
 		} else {
@@ -1869,15 +1869,15 @@ func renderExplainJSONSQL(e *rExpr) string {
 	switch e.jsKind {
 	case jsExists:
 		b.WriteByte(' ')
-		b.WriteString(explainJSONBehavior(e.jsOnError))
+		b.WriteString(explainJSONBehavior(e.jsOnError, e, e.jsOnErrorDefault))
 		b.WriteString(" on error")
 	case jsValue:
 		b.WriteString(" returning ")
 		b.WriteString(e.result.CanonicalName())
 		b.WriteByte(' ')
-		b.WriteString(explainJSONBehavior(e.jsOnEmpty))
+		b.WriteString(explainJSONBehavior(e.jsOnEmpty, e, e.jsOnEmptyDefault))
 		b.WriteString(" on empty ")
-		b.WriteString(explainJSONBehavior(e.jsOnError))
+		b.WriteString(explainJSONBehavior(e.jsOnError, e, e.jsOnErrorDefault))
 		b.WriteString(" on error")
 	case jsQuery:
 		b.WriteString(" returning ")
@@ -1890,9 +1890,9 @@ func renderExplainJSONSQL(e *rExpr) string {
 			b.WriteString(" omit quotes on scalar string")
 		}
 		b.WriteByte(' ')
-		b.WriteString(explainJSONBehavior(e.jsOnEmpty))
+		b.WriteString(explainJSONBehavior(e.jsOnEmpty, e, e.jsOnEmptyDefault))
 		b.WriteString(" on empty ")
-		b.WriteString(explainJSONBehavior(e.jsOnError))
+		b.WriteString(explainJSONBehavior(e.jsOnError, e, e.jsOnErrorDefault))
 		b.WriteString(" on error")
 	}
 	b.WriteByte(')')
@@ -1907,7 +1907,12 @@ func explainJSONWrapper(w jsonWrapper) string {
 	}[w]
 }
 
-func explainJSONBehavior(b jsonOnBehavior) string {
+// explainJSONBehavior renders an ON EMPTY / ON ERROR behavior; a DEFAULT renders its expression,
+// e.sargs[at].
+func explainJSONBehavior(b jsonOnBehavior, e *rExpr, at int) string {
+	if b == jOBDefault {
+		return "default " + renderRExpr(e.sargs[at])
+	}
 	return [...]string{
 		"null", "error", "true", "false", "unknown", "empty array", "empty object",
 	}[b]

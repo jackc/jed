@@ -139,6 +139,8 @@ const (
 	InvalidColumnReference
 	// DatatypeMismatch is 42804 — datatype mismatch: {detail}.
 	DatatypeMismatch
+	// CannotCoerce is 42846 — cannot cast behavior expression of type {type} to {type}.
+	CannotCoerce
 	// InvalidForeignKey is 42830 — there is no unique constraint matching given keys for referenced table {name}.
 	InvalidForeignKey
 	// DuplicateColumn is 42701 — duplicate column name: {name}.
@@ -354,6 +356,8 @@ func (s SqlState) Code() string {
 		return "42P10"
 	case DatatypeMismatch:
 		return "42804"
+	case CannotCoerce:
+		return "42846"
 	case InvalidForeignKey:
 		return "42830"
 	case DuplicateColumn:
@@ -518,6 +522,7 @@ var errorDescs = []errorDesc{
 	{Code: "42704", Name: "undefined_object", Class: "syntax error or access rule violation"},
 	{Code: "42P10", Name: "invalid_column_reference", Class: "syntax error or access rule violation"},
 	{Code: "42804", Name: "datatype_mismatch", Class: "syntax error or access rule violation"},
+	{Code: "42846", Name: "cannot_coerce", Class: "syntax error or access rule violation"},
 	{Code: "42830", Name: "invalid_foreign_key", Class: "syntax error or access rule violation"},
 	{Code: "42701", Name: "duplicate_column", Class: "syntax error or access rule violation"},
 	{Code: "42712", Name: "duplicate_alias", Class: "syntax error or access rule violation"},

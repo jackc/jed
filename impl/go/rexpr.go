@@ -1214,13 +1214,17 @@ type rExpr struct {
 	// §5, S2). `sargs` = [ctx, path, PASSING values…]; `result`/`typmod` hold the RETURNING scalar type
 	// + decimal typmod. jsKind selects the function; jsWrapper/jsKeepQuotes/jsOnEmpty/jsOnError drive
 	// the result; jsPassingNames are the PASSING variable names, in clause order (parallel to
-	// sargs[2:]).
-	jsPassingNames []string
-	jsKind         jsonSqlKind
-	jsWrapper      jsonWrapper
-	jsKeepQuotes   bool
-	jsOnEmpty      jsonOnBehavior
-	jsOnError      jsonOnBehavior
+	// sargs[2:2+len(jsPassingNames)]). jsOnEmptyDefault / jsOnErrorDefault are the sargs index of a
+	// `DEFAULT expr` behavior's expression (json-sql-functions.md §5.3), after the PASSING values;
+	// -1 when that behavior is not DEFAULT.
+	jsPassingNames   []string
+	jsKind           jsonSqlKind
+	jsWrapper        jsonWrapper
+	jsKeepQuotes     bool
+	jsOnEmpty        jsonOnBehavior
+	jsOnError        jsonOnBehavior
+	jsOnEmptyDefault int
+	jsOnErrorDefault int
 
 	// reJsonSetInsert: which path mutation (jsonb_set vs jsonb_insert), and whether it is
 	// jsonb_set_lax. Argument nodes are in `sargs` = [target, path, value, flag (, treatment)]
@@ -1752,6 +1756,10 @@ type jtColRegular struct {
 	wrapper jsonWrapper
 	onEmpty jsonOnBehavior
 	onError jsonOnBehavior
+	// onEmptyDefault / onErrorDefault are the `DEFAULT expr` expressions of onEmpty / onError
+	// (json-sql-functions.md §5.3); nil when that behavior is not DEFAULT.
+	onEmptyDefault *rExpr
+	onErrorDefault *rExpr
 }
 
 // jtColExists is an EXISTS column: JSON_EXISTS of `path`, coerced to `returning` (bool/int), written

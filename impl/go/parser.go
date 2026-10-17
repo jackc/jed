@@ -1934,7 +1934,7 @@ func (p *parser) parseJSONReturning() (*string, error) {
 }
 
 // parseJSONBehavior parses one constant SQL/JSON behavior word (`ERROR` / `NULL` / `TRUE` / `FALSE` /
-// `UNKNOWN` / `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is the deferred S3 follow-on (0A000).
+// `UNKNOWN` / `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is parsed by parseJSONOnClauses.
 func (p *parser) parseJSONBehavior() (jsonOnBehavior, error) {
 	switch p.peekKeyword() {
 	case "error":
@@ -1966,7 +1966,7 @@ func (p *parser) parseJSONBehavior() (jsonOnBehavior, error) {
 			return jOBEmptyArray, nil
 		}
 	case "default":
-		return 0, newError(FeatureNotSupported, "ON ERROR / ON EMPTY DEFAULT expr is not supported yet")
+		return 0, newError(SyntaxError, "invalid ON ERROR behavior: only ERROR, TRUE, FALSE, or UNKNOWN is allowed in ON ERROR for JSON_EXISTS()")
 	default:
 		return 0, newError(SyntaxError, "expected a SQL/JSON ON ERROR/EMPTY behavior")
 	}
@@ -1987,27 +1987,65 @@ func (p *parser) parseJSONOnErrorOnly() (*jsonOnBehavior, error) {
 }
 
 // parseJSONOnClauses parses the optional `<behavior> ON EMPTY` then `<behavior> ON ERROR` clauses (in
-// that order).
-func (p *parser) parseJSONOnClauses() (onEmpty, onError *jsonOnBehavior, err error) {
-	if p.isJSONBehaviorStart() && p.peekOnClauseIs("empty") {
-		b, e := p.parseJSONBehavior()
+// that order). A behavior is a constant word or `DEFAULT expr` (json-sql-functions.md §5.3); the
+// expression ends at the `ON`.
+func (p *parser) parseJSONOnClauses() (onEmpty, onError *jsonBehavior, err error) {
+	if p.peekKeyword() == "default" {
+		b, which, e := p.parseJSONDefaultBehavior()
+		if e != nil {
+			return nil, nil, e
+		}
+		if which == "error" {
+			return nil, b, nil
+		}
+		onEmpty = b
+	} else if p.isJSONBehaviorStart() && p.peekOnClauseIs("empty") {
+		kind, e := p.parseJSONBehavior()
 		if e != nil {
 			return nil, nil, e
 		}
 		p.advance() // ON
 		p.advance() // EMPTY
-		onEmpty = &b
+		onEmpty = &jsonBehavior{Kind: kind}
 	}
-	if p.isJSONBehaviorStart() && p.peekOnClauseIs("error") {
-		b, e := p.parseJSONBehavior()
+	if p.peekKeyword() == "default" {
+		b, which, e := p.parseJSONDefaultBehavior()
+		if e != nil {
+			return nil, nil, e
+		}
+		if which == "empty" {
+			return nil, nil, newError(SyntaxError, "ON EMPTY must come before ON ERROR")
+		}
+		onError = b
+	} else if p.isJSONBehaviorStart() && p.peekOnClauseIs("error") {
+		kind, e := p.parseJSONBehavior()
 		if e != nil {
 			return nil, nil, e
 		}
 		p.advance() // ON
 		p.advance() // ERROR
-		onError = &b
+		onError = &jsonBehavior{Kind: kind}
 	}
 	return onEmpty, onError, nil
+}
+
+// parseJSONDefaultBehavior parses `DEFAULT expr ON EMPTY|ERROR` (the cursor at DEFAULT) → the behavior
+// and which clause it answers ("empty" / "error").
+func (p *parser) parseJSONDefaultBehavior() (*jsonBehavior, string, error) {
+	p.advance() // DEFAULT
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, "", err
+	}
+	if err := p.expectKeyword("on"); err != nil {
+		return nil, "", err
+	}
+	which := p.peekKeyword()
+	if which != "empty" && which != "error" {
+		return nil, "", newError(SyntaxError, "expected EMPTY or ERROR after ON")
+	}
+	p.advance()
+	return &jsonBehavior{Kind: jOBDefault, Default: &expr}, which, nil
 }
 
 // parseJSONWrapperQuotes parses JSON_QUERY's optional `[WITH [COND|UNCOND] [ARRAY] WRAPPER | WITHOUT

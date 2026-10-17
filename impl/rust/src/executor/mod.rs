@@ -11,9 +11,9 @@ pub(crate) use crate::ast::{
     ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateTableAs,
     CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable,
     DropType, DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue,
-    JoinKind, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn,
-    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select,
-    SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef,
+    JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper,
+    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause,
+    Select, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef,
     TableRefPos, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
@@ -3897,6 +3897,11 @@ pub(crate) enum RExpr {
         wrapper: JsonWrapper,
         on_empty: JsonOnBehavior,
         on_error: JsonOnBehavior,
+        /// The `DEFAULT expr` of `on_empty` / `on_error` when that behavior is
+        /// [`JsonOnBehavior::Default`] (json-sql-functions.md §5.3): already coerced to the
+        /// RETURNING type, or `jsonb` coerced as a JSON item when the behavior fires.
+        on_empty_default: Option<Box<RExpr>>,
+        on_error_default: Option<Box<RExpr>>,
     },
     IsNull {
         operand: Box<RExpr>,
@@ -5426,6 +5431,11 @@ pub(crate) enum JtCol {
         wrapper: JsonWrapper,
         on_empty: JsonOnBehavior,
         on_error: JsonOnBehavior,
+        /// The index of the `DEFAULT expr` of `on_empty` / `on_error` among the plan's default
+        /// expressions (json-sql-functions.md §5.3), which follow the context and the `PASSING` values
+        /// in the SRF's arguments.
+        on_empty_default: Option<usize>,
+        on_error_default: Option<usize>,
     },
     /// An `EXISTS` column: JSON_EXISTS of `path`, coerced to `returning` (bool/int).
     Exists {
@@ -5810,8 +5820,8 @@ fn resolve_json_sql_fn(
     returning: &Option<String>,
     wrapper: JsonWrapper,
     keep_quotes: bool,
-    on_empty: &Option<JsonOnBehavior>,
-    on_error: &Option<JsonOnBehavior>,
+    on_empty: Option<&JsonBehavior>,
+    on_error: Option<&JsonBehavior>,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
@@ -5867,12 +5877,15 @@ fn resolve_json_sql_fn(
             "JSON_QUERY RETURNING a non-json type is not supported yet",
         ));
     }
-    let on_empty = on_empty.unwrap_or(JsonOnBehavior::Null);
-    let on_error = on_error.unwrap_or(match kind {
+    let (passing, passing_names) = resolve_json_passing(scope, passing, agg, params)?;
+    let (on_empty, on_empty_default) =
+        resolve_json_behavior(scope, on_empty, JsonOnBehavior::Null, returning_st, params)?;
+    let on_error_fallback = match kind {
         JsonSqlKind::Exists => JsonOnBehavior::False,
         _ => JsonOnBehavior::Null,
-    });
-    let (passing, passing_names) = resolve_json_passing(scope, passing, agg, params)?;
+    };
+    let (on_error, on_error_default) =
+        resolve_json_behavior(scope, on_error, on_error_fallback, returning_st, params)?;
     Ok((
         RExpr::JsonSqlFn {
             kind,
@@ -5885,9 +5898,103 @@ fn resolve_json_sql_fn(
             wrapper,
             on_empty,
             on_error,
+            on_empty_default: on_empty_default.map(Box::new),
+            on_error_default: on_error_default.map(Box::new),
         },
         resolved_type_of(returning_st),
     ))
+}
+
+/// Resolve an `ON EMPTY` / `ON ERROR` clause → its behavior (`fallback` when the clause is absent)
+/// and, for `DEFAULT expr`, the resolved expression (json-sql-functions.md §5.3). As PostgreSQL's
+/// `transformJsonBehavior`: the expression must be a constant, a non-aggregate function call, or an
+/// operator expression, possibly under casts (`42804` otherwise), must not reference a column
+/// (`42804`), and takes the RETURNING type as its hint, so a string literal is read as that type at
+/// resolve. A NULL, a value already of the RETURNING type, and a `jsonb` value (coerced as a JSON
+/// item when the behavior fires) are kept; a boolean is made a JSON boolean for the same runtime
+/// coercion unless the RETURNING type is `i32` (the cast); any other type is cast explicitly to the
+/// RETURNING type, `42846` when no cast exists.
+pub(crate) fn resolve_json_behavior(
+    scope: &Scope,
+    clause: Option<&JsonBehavior>,
+    fallback: JsonOnBehavior,
+    returning: ScalarType,
+    params: &mut ParamTypes,
+) -> Result<(JsonOnBehavior, Option<RExpr>)> {
+    let Some(clause) = clause else {
+        return Ok((fallback, None));
+    };
+    let Some(expr) = clause.default.as_deref() else {
+        return Ok((clause.kind, None));
+    };
+    if !json_default_shape_ok(expr) {
+        return Err(EngineError::new(
+            SqlState::DatatypeMismatch,
+            "can only specify a constant, non-aggregate function, or operator expression for DEFAULT",
+        ));
+    }
+    reject_default_structure(expr).map_err(|e| {
+        if e.code() == "0A000" && e.message.contains("column reference") {
+            EngineError::new(
+                SqlState::DatatypeMismatch,
+                "DEFAULT expression must not contain column references",
+            )
+        } else {
+            e
+        }
+    })?;
+    let (r, ty) = resolve(scope, expr, Some(returning), &mut AggCtx::Forbidden, params)?;
+    let target = resolved_type_of(returning);
+    let r = match ty {
+        ResolvedType::Null | ResolvedType::Jsonb => r,
+        _ if ty == target => r,
+        ResolvedType::Bool if returning != ScalarType::Int32 => RExpr::JsonImage {
+            func: JsonImageFunc::ToJsonb,
+            args: vec![r],
+            ty: ResolvedType::Bool,
+        },
+        _ => {
+            let cast = Expr::Cast {
+                inner: Box::new(expr.clone()),
+                type_name: returning.canonical_name().to_string(),
+                type_mod: None,
+                pos: SrcPos::NONE,
+            };
+            match resolve(scope, &cast, None, &mut AggCtx::Forbidden, params) {
+                Ok((r, _)) => r,
+                Err(e) if e.code() == "42804" || e.code() == "0A000" => {
+                    return Err(EngineError::new(
+                        SqlState::CannotCoerce,
+                        format!(
+                            "cannot cast behavior expression of type {} to {}",
+                            ty.type_name(),
+                            returning.canonical_name()
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    Ok((JsonOnBehavior::Default, Some(r)))
+}
+
+/// Whether a `DEFAULT expr` behavior has the shape PostgreSQL's `ValidJsonBehaviorDefaultExpr`
+/// admits: a constant, a function call, or an operator expression (not `AND`/`OR`/`NOT`, which are
+/// boolean expressions there), possibly under a cast or `COLLATE`.
+fn json_default_shape_ok(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(..) | Expr::TypedLiteral { .. } | Expr::Like { .. } | Expr::Regex { .. } => {
+            true
+        }
+        Expr::FuncCall {
+            over, over_name, ..
+        } => over.is_none() && over_name.is_none(),
+        Expr::Binary { op, .. } => !matches!(op, BinaryOp::And | BinaryOp::Or),
+        Expr::Unary { op, .. } => !matches!(op, UnaryOp::Not),
+        Expr::Cast { inner, .. } | Expr::Collate { inner, .. } => json_default_shape_ok(inner),
+        _ => false,
+    }
 }
 
 /// Resolve a `PASSING value [FORMAT JSON] AS name, …` clause (json-sql-functions.md §5.4) → the
@@ -6062,16 +6169,63 @@ fn is_sqljson_error(e: &EngineError) -> bool {
     e.code().starts_with("22")
 }
 
-/// Apply a constant `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING type. `underlying`
-/// is the SQL/JSON error this behavior replaces (raised verbatim by `ERROR`).
+/// The `DEFAULT expr` expressions of a SQL/JSON query function's `ON EMPTY` / `ON ERROR` clauses
+/// and the row they are evaluated against (json-sql-functions.md §5.3).
+#[derive(Clone, Copy)]
+pub(crate) struct JsonDefaults<'a> {
+    pub(crate) on_empty: Option<&'a RExpr>,
+    pub(crate) on_error: Option<&'a RExpr>,
+    pub(crate) row: &'a [Value],
+}
+
+/// Which clause a behavior answers: `ON EMPTY` or `ON ERROR` (named in a DEFAULT coercion error).
+#[derive(Clone, Copy)]
+enum JsonClause {
+    Empty,
+    Error,
+}
+
+/// Apply an `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING type. `underlying`
+/// is the SQL/JSON error this behavior replaces (raised verbatim by `ERROR`). A `DEFAULT expr` is
+/// evaluated here, outside the clause: its own errors propagate, as in PostgreSQL. Its value is
+/// already of the RETURNING type, except a `jsonb` value, which is coerced as a JSON item (PostgreSQL's
+/// runtime `json_populate_type` coercion); a failure there is `42804`.
 fn apply_json_behavior(
     behavior: JsonOnBehavior,
+    clause: JsonClause,
+    defaults: JsonDefaults<'_>,
     underlying: EngineError,
     returning: ScalarType,
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Value> {
     match behavior {
+        JsonOnBehavior::Default => {
+            let (expr, name) = match clause {
+                JsonClause::Empty => (defaults.on_empty, "EMPTY"),
+                JsonClause::Error => (defaults.on_error, "ERROR"),
+            };
+            let expr = expr.expect("a DEFAULT behavior carries its expression");
+            match expr.eval(defaults.row, env, meter)? {
+                Value::Jsonb(node) if !returning.is_jsonb() => {
+                    coerce_json_member(&node, &Type::Scalar(returning), None, env, meter).map_err(
+                        |e| {
+                            if !is_sqljson_error(&e) {
+                                return e;
+                            }
+                            EngineError::new(
+                        SqlState::DatatypeMismatch,
+                        format!(
+                            "could not coerce ON {name} expression (DEFAULT) to the RETURNING type"
+                        ),
+                    )
+                    .with_detail(Some(e.message.clone()))
+                        },
+                    )
+                }
+                v => Ok(v),
+            }
+        }
         JsonOnBehavior::Error => Err(underlying),
         JsonOnBehavior::Null => Ok(Value::Null),
         JsonOnBehavior::True => Ok(Value::Bool(true)),
@@ -6108,6 +6262,7 @@ fn eval_json_sql_result(
     wrapper: JsonWrapper,
     on_empty: JsonOnBehavior,
     on_error: JsonOnBehavior,
+    defaults: JsonDefaults<'_>,
     constant: bool,
     env: &EvalEnv,
     meter: &mut Meter,
@@ -6118,6 +6273,8 @@ fn eval_json_sql_result(
             if seq.is_empty() {
                 return apply_json_behavior(
                     on_empty,
+                    JsonClause::Empty,
+                    defaults,
                     EngineError::new(SqlState::NoSqlJsonItem, "no SQL/JSON item"),
                     returning,
                     env,
@@ -6127,6 +6284,8 @@ fn eval_json_sql_result(
             if seq.len() > 1 {
                 return apply_json_behavior(
                     on_error,
+                    JsonClause::Error,
+                    defaults,
                     EngineError::new(
                         SqlState::MoreThanOneSqlJsonItem,
                         "JSON path expression in JSON_VALUE should return singleton scalar item",
@@ -6141,6 +6300,8 @@ fn eval_json_sql_result(
             if matches!(item, JsonNode::Array(_) | JsonNode::Object(_)) {
                 return apply_json_behavior(
                     on_error,
+                    JsonClause::Error,
+                    defaults,
                     EngineError::new(
                         SqlState::SqlJsonScalarRequired,
                         "JSON path expression in JSON_VALUE should return singleton scalar item",
@@ -6154,9 +6315,15 @@ fn eval_json_sql_result(
             // a SQL/JSON error honored by ON ERROR.
             match coerce_json_member(item, &Type::Scalar(returning), decimal, env, meter) {
                 Ok(v) => Ok(v),
-                Err(e) if is_sqljson_error(&e) => {
-                    apply_json_behavior(on_error, e, returning, env, meter)
-                }
+                Err(e) if is_sqljson_error(&e) => apply_json_behavior(
+                    on_error,
+                    JsonClause::Error,
+                    defaults,
+                    e,
+                    returning,
+                    env,
+                    meter,
+                ),
                 Err(e) => Err(e),
             }
         }
@@ -6183,6 +6350,8 @@ fn eval_json_sql_result(
                     if seq.is_empty() {
                         return apply_json_behavior(
                             on_empty,
+                            JsonClause::Empty,
+                            defaults,
                             EngineError::new(SqlState::NoSqlJsonItem, "no SQL/JSON item"),
                             returning,
                             env,
@@ -6192,6 +6361,8 @@ fn eval_json_sql_result(
                     if seq.len() > 1 {
                         return apply_json_behavior(
                             on_error,
+                            JsonClause::Error,
+                            defaults,
                             EngineError::new(
                                 SqlState::MoreThanOneSqlJsonItem,
                                 "JSON path expression in JSON_QUERY should return singleton item without wrapper",
@@ -6319,6 +6490,7 @@ fn expand_jt_level(
     cols: &[JtCol],
     items: &[Cow<'_, JsonNode>],
     vars: crate::jsonpath::Vars<'_>,
+    defaults: &[RExpr],
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Vec<JtAssign>> {
@@ -6340,10 +6512,17 @@ fn expand_jt_level(
                     wrapper,
                     on_empty,
                     on_error,
+                    on_empty_default,
+                    on_error_default,
                 } => {
+                    let jd = JsonDefaults {
+                        on_empty: on_empty_default.map(|i| &defaults[i]),
+                        on_error: on_error_default.map(|i| &defaults[i]),
+                        row: &[],
+                    };
                     let v = eval_jt_regular(
                         item, path, vars, *query, *returning, *decimal, *wrapper, *on_empty,
-                        *on_error, env, meter,
+                        *on_error, jd, env, meter,
                     )?;
                     local.push((*idx, v));
                 }
@@ -6365,7 +6544,7 @@ fn expand_jt_level(
             .iter()
             .filter(|c| matches!(c, JtCol::Nested { .. }))
             .collect();
-        let nested_rows = expand_jt_nested(&nested, item, vars, env, meter)?;
+        let nested_rows = expand_jt_nested(&nested, item, vars, defaults, env, meter)?;
         for nr in nested_rows {
             let mut row = local.clone();
             row.extend(nr);
@@ -6382,6 +6561,7 @@ fn expand_jt_nested(
     children: &[&JtCol],
     item: &JsonNode,
     vars: crate::jsonpath::Vars<'_>,
+    defaults: &[RExpr],
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Vec<JtAssign>> {
@@ -6399,7 +6579,9 @@ fn expand_jt_nested(
                 Err(e) if is_sqljson_error(&e) => Vec::new(),
                 Err(e) => return Err(e),
             };
-            union.extend(expand_jt_level(columns, &child_seq, vars, env, meter)?);
+            union.extend(expand_jt_level(
+                columns, &child_seq, vars, defaults, env, meter,
+            )?);
         }
     }
     if union.is_empty() {
@@ -6421,6 +6603,7 @@ fn eval_jt_regular(
     wrapper: JsonWrapper,
     on_empty: JsonOnBehavior,
     on_error: JsonOnBehavior,
+    defaults: JsonDefaults<'_>,
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Value> {
@@ -6429,7 +6612,15 @@ fn eval_jt_regular(
     let seq = match crate::jsonpath::eval(&p, item, jt_eval(vars, casing), meter) {
         Ok(s) => s,
         Err(e) if is_sqljson_error(&e) => {
-            return apply_json_behavior(on_error, e, returning, env, meter);
+            return apply_json_behavior(
+                on_error,
+                JsonClause::Error,
+                defaults,
+                e,
+                returning,
+                env,
+                meter,
+            );
         }
         Err(e) => return Err(e),
     };
@@ -6440,7 +6631,7 @@ fn eval_jt_regular(
     };
     // A JSON_TABLE row item is never a constant operand, so a wrapped column charges its array.
     eval_json_sql_result(
-        kind, seq, returning, decimal, wrapper, on_empty, on_error, false, env, meter,
+        kind, seq, returning, decimal, wrapper, on_empty, on_error, defaults, false, env, meter,
     )
 }
 

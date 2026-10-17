@@ -373,7 +373,7 @@ wrapper_clause  ::= "WITH" ("CONDITIONAL"|"UNCONDITIONAL")? "ARRAY"? "WRAPPER"
 quotes_clause   ::= ("KEEP"|"OMIT") "QUOTES" ( "ON" "SCALAR" "STRING" )?
 on_clause       ::= behavior ( "ON" "EMPTY" | "ON" "ERROR" )
 behavior        ::= "ERROR" | "NULL" | "TRUE" | "FALSE" | "UNKNOWN"
-                  | "EMPTY" ("ARRAY"|"OBJECT")? | "DEFAULT" expr      (* DEFAULT deferred, §5.3 *)
+                  | "EMPTY" ("ARRAY"|"OBJECT")? | "DEFAULT" expr      (* DEFAULT: §5.3 *)
 json_constructor::= "JSON" "(" expr json_returning? ( ("WITH"|"WITHOUT") "UNIQUE" "KEYS"? )? ")"
 json_scalar     ::= "JSON_SCALAR" "(" expr ")"
 json_serialize  ::= "JSON_SERIALIZE" "(" expr json_returning? ")"
@@ -430,12 +430,40 @@ the context's conversion, not evaluation, so its `22P05` / `22P02` escape errors
 ([json.md §4.2](json.md)) propagate past `ON ERROR`, as in PostgreSQL. The exact PG codes match on
 `ERROR ON ERROR` (`2203F` non-scalar, `22034` >1 item).
 
+**`DEFAULT expr` (S3) has landed** (capability `expr.json_behavior_default`, all three cores) for
+`JSON_VALUE`, `JSON_QUERY`, and a regular `JSON_TABLE` column, following PostgreSQL's
+`transformJsonBehavior`:
+
+- **Shape.** The expression is a constant, a function call that is not an aggregate or window call,
+  or an operator expression (not `AND`/`OR`/`NOT`, which PostgreSQL parses as boolean expressions),
+  possibly under casts or `COLLATE`. Anything else (a column, a `CASE`, a subquery, a parameter) is
+  `42804` `can only specify a constant, non-aggregate function, or operator expression for DEFAULT`.
+  Inside that shape, a column reference anywhere is `42804` `DEFAULT expression must not contain
+  column references`; a subquery, an aggregate, or a parameter nested in it is rejected as in a column
+  `DEFAULT` ([constraints.md §2](constraints.md): `0A000`, `42803`, `42P02`). `JSON_EXISTS` and an `EXISTS` column take
+  no `DEFAULT` (`42601`, PostgreSQL's `invalid ON ERROR behavior`).
+- **Type.** The expression resolves with the RETURNING type as its hint, so a string literal is read
+  as that type when the statement is resolved (`DEFAULT 'abc'` for `RETURNING i32` is `22P02` even if
+  it never fires, as in PostgreSQL). A NULL and a value already of the RETURNING type are kept. A
+  `jsonb` value is kept and, when the behavior fires, coerced to the RETURNING type as a JSON item is
+  (PostgreSQL's runtime `json_populate_type` path); a failure there is `42804` `could not coerce ON
+  EMPTY expression (DEFAULT) to the RETURNING type`, with the underlying message as its detail. A
+  boolean is coerced the same way (as the JSON boolean), except for `RETURNING i32`, which casts it.
+  Any other type is cast explicitly to the RETURNING type; a pair with no cast is `42846` `cannot cast
+  behavior expression of type … to …`.
+- **Evaluation.** The expression is evaluated only when its clause fires, against the current row
+  (no column can appear, so this matters only for volatile functions). Its own errors, and a failed
+  coercion of it, propagate: `ON ERROR` does not catch them, as in PostgreSQL. EXPLAIN VERBOSE renders
+  it as `default <expr>`.
+
+Two documented divergences (oracle_overrides.toml): PostgreSQL's planner constant-folds an immutable
+DEFAULT expression, so an error in it (`DEFAULT 1 / 0`) is raised even when the behavior never fires;
+jed does no plan-time folding and raises it only when it fires. And PostgreSQL 18 builds the jsonb
+for a boolean DEFAULT from the behavior type rather than the value, so every boolean DEFAULT becomes
+`false` under a non-boolean, non-`integer` RETURNING type; jed uses the value.
+
 Still **deferred** (each `0A000`, a documented divergence):
 
-- **`ON ERROR / ON EMPTY DEFAULT expr`** makes the function partly non-constant and requires
-  a **guarded sub-evaluation** (try the kernel; on a SQL/JSON error substitute the default
-  expression without unwinding the statement) — a genuinely new evaluator capability. **It is
-  deferred to slice S3**.
 - **`JSON_QUERY OMIT QUOTES`** — PG returns the de-quoted scalar string still typed `jsonb`
   (an invalid-`jsonb` quirk that fits jed's strict static typing poorly); deferred.
 - **`JSON_QUERY RETURNING` a non-json type** — the wrapper/quotes result is a JSON value;
@@ -537,7 +565,7 @@ After the `jsonb` foundation ([json.md §12](json.md)) and `jsonpath` ([jsonpath
   (§5, §6.2). Grammar + simple kernels; no path needed beyond parsing. Capability `func.json_sql`.
 - **S2** — `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` with constant `ON ERROR`/`ON EMPTY`/
   `WRAPPER`/`QUOTES` (§5.2). Depends on P1 ([jsonpath.md](jsonpath.md)).
-- **S3** (deferred) — `ON ERROR / ON EMPTY DEFAULT expr` (the guarded sub-evaluation, §5.3).
+- **S3** ✅ — `ON ERROR / ON EMPTY DEFAULT expr` (§5.3). Capability `expr.json_behavior_default`.
 
 B-series runs in parallel off the J0/J-foundation and C0; S-series depends on the `jsonpath`
 type. The record-returning functions and `JSON_TABLE` are in [json-table.md](json-table.md).

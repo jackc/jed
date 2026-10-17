@@ -2919,7 +2919,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			resolvedType{kind: rtJson}, nil
 	case exprJsonExists:
 		return resolveJSONSqlFn(s, jsExists, e.JsonExists.Ctx, e.JsonExists.Path, e.JsonExists.Passing, nil,
-			jWWithout, true, nil, e.JsonExists.OnError, ag, params)
+			jWWithout, true, nil, jsonExistsBehavior(e.JsonExists.OnError), ag, params)
 	case exprJsonValue:
 		return resolveJSONSqlFn(s, jsValue, e.JsonValue.Ctx, e.JsonValue.Path, e.JsonValue.Passing, e.JsonValue.Returning,
 			jWWithout, true, e.JsonValue.OnEmpty, e.JsonValue.OnError, ag, params)

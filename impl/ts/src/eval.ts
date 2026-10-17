@@ -1,4 +1,11 @@
-import type { EvalEnv, JsonGetOp, RExpr, ResolvedType, ScalarFuncName } from "./executor.ts";
+import type {
+  EvalEnv,
+  JsonDefaults,
+  JsonGetOp,
+  RExpr,
+  ResolvedType,
+  ScalarFuncName,
+} from "./executor.ts";
 import type { Row } from "./storage.ts";
 import type { Meter } from "./cost.ts";
 import type { ThreeValued, Value } from "./value.ts";
@@ -2658,7 +2665,12 @@ function evalJsonSqlFnNode(e: Of<"jsonSqlFn">, row: Row, env: EvalEnv, m: Meter)
   const compiled = jsonPathCompileMetered(pv.text, m, env.environment.property());
   // The PASSING values, evaluated after the context and path (as in PostgreSQL) and outside ON
   // ERROR: each is a base object for .keyvalue() ids (jsonpath.md §3.1).
-  const passing = e.args.slice(2);
+  const passing = e.args.slice(2, 2 + e.passingNames.length);
+  const defaults: JsonDefaults = {
+    onEmpty: e.onEmptyDefault >= 0 ? e.args[e.onEmptyDefault]! : null,
+    onError: e.onErrorDefault >= 0 ? e.args[e.onErrorDefault]! : null,
+    row,
+  };
   const bindings = passingBindings(passing, e.passingNames, row, env, m);
   const vars: JsonPathVars = { kind: "passing", vars: bindings, count: passing.length };
   let seq: JsonNode[];
@@ -2668,7 +2680,7 @@ function evalJsonSqlFnNode(e: Of<"jsonSqlFn">, row: Row, env: EvalEnv, m: Meter)
     // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
     // else (a cost abort, a missing variable, etc.) propagates.
     if (isSqljsonError(err)) {
-      return applyJsonBehavior(e.onError, err, e.returning, env, m);
+      return applyJsonBehavior(e.onError, "error", defaults, err, e.returning, env, m);
     }
     throw err;
   }
@@ -2682,7 +2694,8 @@ function evalJsonSqlFnNode(e: Of<"jsonSqlFn">, row: Row, env: EvalEnv, m: Meter)
     e.wrapper,
     e.onEmpty,
     e.onError,
-    e.args.every(rexprIsConstant),
+    defaults,
+    e.args.slice(0, 2 + e.passingNames.length).every(rexprIsConstant),
     env,
     m,
   );

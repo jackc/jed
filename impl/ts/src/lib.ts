@@ -264,6 +264,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // semantics (existence / a single scalar / a json value) with RETURNING/wrapper/quotes/ON
   // EMPTY/ON ERROR sub-clauses (json-sql-functions.md §5).
   "expr.json_query_fns",
+  "expr.json_behavior_default",
   // JSON_TABLE with the default plan (T1, json-table.md §3): COLUMNS, FOR ORDINALITY, EXISTS, NESTED.
   "func.json_table",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +

@@ -602,7 +602,14 @@ impl Engine {
         let (passing, passing_names) =
             resolve_json_passing(&arg_scope, &jt.passing, &mut AggCtx::Forbidden, ptypes)?;
         let mut out_columns: Vec<Column> = Vec::new();
-        let columns = self.resolve_jt_columns(&jt.columns, &mut out_columns)?;
+        let mut defaults: Vec<RExpr> = Vec::new();
+        let columns = self.resolve_jt_columns(
+            &jt.columns,
+            &mut out_columns,
+            &arg_scope,
+            ptypes,
+            &mut defaults,
+        )?;
         let width = out_columns.len();
         let table = Box::new(Table {
             name: alias.unwrap_or("json_table").to_string(),
@@ -615,8 +622,10 @@ impl Engine {
             on_commit: crate::catalog::OnCommit::PreserveRows,
             scalar_func: false,
         });
+        // The args: the context, the PASSING values, then the columns' DEFAULT expressions.
         let mut args = vec![rctx];
         args.extend(passing);
+        args.extend(defaults);
         Ok((
             table,
             args,
@@ -630,11 +639,16 @@ impl Engine {
     }
 
     /// Recursively resolve a `JSON_TABLE` `COLUMNS` tree, flattening the leaf columns into
-    /// `out_columns` (pre-order, declaration order) and assigning each its flat output index.
+    /// `out_columns` (pre-order, declaration order) and assigning each its flat output index. A
+    /// column's `ON EMPTY` / `ON ERROR` `DEFAULT expr` is appended to `defaults` (json-sql-functions.md
+    /// §5.3), the column keeping its index.
     pub(crate) fn resolve_jt_columns(
         &self,
         cols: &[JtColumn],
         out_columns: &mut Vec<Column>,
+        arg_scope: &Scope,
+        ptypes: &mut ParamTypes,
+        defaults: &mut Vec<RExpr>,
     ) -> Result<Vec<JtCol>> {
         let mut resolved = Vec::with_capacity(cols.len());
         for col in cols {
@@ -678,6 +692,22 @@ impl Engine {
                         jt_compile_path(path.as_deref(), name, self.session.env.property())?;
                     let idx = out_columns.len();
                     out_columns.push(jt_column(name, st, None));
+                    let mut behavior = |clause: &Option<JsonBehavior>| -> Result<_> {
+                        let (b, default) = resolve_json_behavior(
+                            arg_scope,
+                            clause.as_ref(),
+                            JsonOnBehavior::Null,
+                            st,
+                            ptypes,
+                        )?;
+                        let at = default.map(|d| {
+                            defaults.push(d);
+                            defaults.len() - 1
+                        });
+                        Ok((b, at))
+                    };
+                    let (on_empty, on_empty_default) = behavior(on_empty)?;
+                    let (on_error, on_error_default) = behavior(on_error)?;
                     resolved.push(JtCol::Regular {
                         idx,
                         returning: st,
@@ -685,8 +715,10 @@ impl Engine {
                         path: compiled,
                         query,
                         wrapper: *wrapper,
-                        on_empty: on_empty.unwrap_or(JsonOnBehavior::Null),
-                        on_error: on_error.unwrap_or(JsonOnBehavior::Null),
+                        on_empty,
+                        on_error,
+                        on_empty_default,
+                        on_error_default,
                     });
                 }
                 JtColumn::Exists {
@@ -711,7 +743,8 @@ impl Engine {
                     let compiled =
                         crate::jsonpath::JsonPath::compile(path, self.session.env.property())?
                             .render();
-                    let nested = self.resolve_jt_columns(columns, out_columns)?;
+                    let nested =
+                        self.resolve_jt_columns(columns, out_columns, arg_scope, ptypes, defaults)?;
                     resolved.push(JtCol::Nested {
                         path: compiled,
                         columns: nested,
@@ -736,7 +769,15 @@ impl Engine {
             .expect("a JsonTable SRF carries its plan");
         // The PASSING values are evaluated first, as PostgreSQL's JSON_TABLE does (even for a NULL
         // context).
-        let bindings = passing_bindings(&srf.args[1..], &plan.passing_names, &[], env, meter)?;
+        let npass = plan.passing_names.len();
+        let bindings = passing_bindings(
+            &srf.args[1..1 + npass],
+            &plan.passing_names,
+            &[],
+            env,
+            meter,
+        )?;
+        let defaults = &srf.args[1 + npass..];
         let vars = crate::jsonpath::Vars::Passing {
             vars: &bindings,
             count: plan.passing_names.len() as i64,
@@ -761,7 +802,7 @@ impl Engine {
             Err(e) => return Err(e),
         };
         // Expand the column tree over the root sequence → sparse rows, then materialize.
-        let sparse = expand_jt_level(&plan.columns, &items, vars, env, meter)?;
+        let sparse = expand_jt_level(&plan.columns, &items, vars, defaults, env, meter)?;
         let mut out = Vec::with_capacity(sparse.len());
         for assignment in sparse {
             meter.guard()?;
