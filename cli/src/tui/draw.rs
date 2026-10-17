@@ -326,8 +326,8 @@ const HELP: &[&str] = &[
     "F1 / ?            this help · Esc closes",
     "Ctrl+Q            quit (an open transaction is rolled back)",
     "",
-    "jed cannot cancel a running statement; bound runaway queries",
-    "with --max-cost N (deterministic 54P01 abort).",
+    "The CLI cannot cancel a running statement; bound runaway",
+    "queries with --max-cost N (deterministic 54P01 abort).",
 ];
 
 fn draw_help(frame: &mut Frame) {

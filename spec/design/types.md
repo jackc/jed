@@ -851,7 +851,7 @@ value is already truncated/checked before it reaches the codec).
 
 **Deferred sub-features** (relaxable, each its own follow-on):
 
-- **`char(n)` / `character(n)`** — the blank-padded fixed-length string type is out of scope (a
+- **`char(n)` / `character(n)`** — the blank-padded fixed-length string type is deferred (a
   different storage/compare model); only `varchar(n)` (variable length, max `n`) is implemented.
 - **`varchar(n)[]`** — an array of length-limited text. A type modifier on an array type stays
   `0A000` ("a type modifier on an array type is not supported yet"), the **same** narrowing

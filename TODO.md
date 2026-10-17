@@ -58,6 +58,31 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ PG surface still narrower around names — a derived CHECK/FK name's collision walk avoids only its own table's constraint names, where PostgreSQL avoids every constraint name in the schema ([constraints.md §6.7](spec/design/constraints.md)).
 - [x] **Named + optional (DEFAULT) function arguments** — PG named notation `f(name => value)` + DEFAULT params; `make_interval`, then `make_timestamp`/`make_timestamptz`; `VARIADIC` (landed as **AF6** with the array type). → [functions.md §11](spec/design/functions.md)
   - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
+- [ ] **Common aggregates** — PostgreSQL's everyday aggregates that jed lacks: `string_agg` and
+  `array_agg` (order-sensitive; [determinism.md](spec/design/determinism.md) already classifies them),
+  `bool_and`/`bool_or`/`every`, `bit_and`/`bit_or`/`bit_xor`, and the statistical set —
+  `stddev`/`stddev_pop`/`stddev_samp`, `variance`/`var_pop`/`var_samp`, `covar_pop`/`covar_samp`,
+  `corr`, `regr_*` (exact over `decimal`, PostgreSQL's `float8` results over floats). Each needs its
+  spill/query-memory accounting (memory.md §6). _(size: M)_
+- [ ] **`NULLIF(a, b)`** — the SQL conditional beside `COALESCE`/`GREATEST`/`LEAST` (grammar.md §51–§52);
+  absent from the grammar today. _(size: S)_
+- [ ] **Everyday scalar functions** — `concat_ws`, `format()` (PostgreSQL's `%s`/`%I`/`%L`),
+  `array_to_string`, `string_to_array`, and a `gen_random_uuid` alias of `uuidv4` (through the
+  entropy seam). (`to_char` is tracked under `timestamp` below.) _(size: M)_
+- [ ] **Named windows** — the `WINDOW w AS (…)` clause + `OVER w` and window sharing, slice S5 of
+  [window.md](spec/design/window.md). _(size: S)_
+- [ ] **Revisit `DISTINCT ON`** — recorded out of scope in [grammar.md §11](spec/design/grammar.md), but
+  it is one of PostgreSQL's most-used extensions; decide whether to implement it or keep the
+  non-goal. _(size: M if implemented)_
+- [ ] **`MERGE`** — the SQL-standard (PostgreSQL 15+) `MERGE INTO … USING … ON … WHEN [NOT] MATCHED
+  THEN …`, sharing upsert's two-phase write machinery ([upsert.md](spec/design/upsert.md)). _(size: L)_
+- [ ] **`SAVEPOINT` / nested transactions** — deferred in [transactions.md §11](spec/design/transactions.md)
+  (`working` becomes a stack of snapshots; `ROLLBACK TO` pops to a marked root; a nested `BEGIN` is
+  `25001` today). ORMs (Rails, Django, SQLAlchemy) use savepoints for nested transactions, so this
+  gates good language bindings. _(size: M)_
+- [ ] **Decide: SQL-language triggers and functions** — SQLite-style triggers whose bodies are plain
+  SQL statements, and `CREATE FUNCTION … LANGUAGE sql`. Both stay pure, so neither conflicts with
+  CLAUDE.md §13. Record each as a scheduled item or an explicit non-goal. _(size: decision; L each if built)_
 
 ---
 
@@ -83,6 +108,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-ons (deferred `0A000`, hoisted from the done slices):_ the string-**dictionary builder** (opens the [json.md §3](spec/design/json.md) door); `jsonb`-as-PK/index ([encoding.md §2.13](spec/design/encoding.md)); `JSON_TABLE` explicit `PLAN` (T2); `ON ERROR/EMPTY DEFAULT <expr>` (S3); the jsonpath `like_regex` `m` flag (needs line anchors in the regex VM, [jsonpath.md §4.3](spec/design/jsonpath.md)); `PASSING … FORMAT JSON` of a `bytea` value ([json-sql-functions.md §5.4](spec/design/json-sql-functions.md)); and a NaN or ±Infinity float `PASSING` value (a `numeric` NaN/Infinity item in PG, which jed's finite `decimal` cannot hold, [json-sql-functions.md §5.4](spec/design/json-sql-functions.md)).
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — COMPLETE (S0–S6): the open `Type { Scalar | Composite(catalog-ref) }`, `CREATE`/`DROP TYPE`, nested + recursive types, storable composite column + recursive codec (`format_version` 9), `ROW(…)`, field access, element-wise compare/ORDER BY/DISTINCT/GROUP BY; array- and range-typed fields (the range field is `format_version` 41). Named composites only. → [composite.md](spec/design/composite.md)
   - [ ] _still narrowed (relaxable later):_ an anonymous `ROW(…)` *expression* (non-literal fields) assigned to a composite column — an `INSERT … VALUES` slot or an `UPDATE`/`ON CONFLICT DO UPDATE` RHS; an **array-of-composite** field as a key + a composite **FK** pairing (the remaining `0A000` key axes); a non-NULL `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` + anonymous `ROW(…)::type` casts; the nested `ROW(ROW(…),…)`-into-column constructor.
+- [ ] **Enum types** (`CREATE TYPE name AS ENUM (…)`) — PostgreSQL's ordered label sets: a named
+  catalog type (the composite precedent), ordered by declaration, keyable, `ALTER TYPE … ADD VALUE`;
+  a `format_version` bump. _(size: L)_
+- [ ] **Domains** (`CREATE DOMAIN name AS base [DEFAULT …] [NOT NULL] [CHECK (…)]`) — a named,
+  constrained base type, enforced at every assignment site and cast; squarely the "type system is
+  the product" theme (CLAUDE.md §4). _(size: L)_
 
 ---
 
@@ -115,6 +146,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _deferred:_ identity management (`ALTER COLUMN … ADD/DROP/SET GENERATED …`) — plausible once
     scheduled; the rest of PG's menu (OWNER/RLS/triggers/partitions/tablespaces/schemas/storage knobs) is
     deliberately out of scope, `0A000` (alter.md §6).
+- [ ] **Generated columns** (`GENERATED ALWAYS AS (expr) STORED`) — PostgreSQL and SQLite both have
+  them; jed has only identity columns. Stored text binds like a `CHECK`: persisted canonical token
+  text, the [index-dependencies.md](spec/design/index-dependencies.md) purity contract, host-function
+  dependencies as for `CHECK` (extensibility.md §7.1), and an entry in the
+  [compatibility.md](spec/design/compatibility.md) manifest if that lands. _(size: L)_
 - [x] **Temporary tables** — session-local temp relations with zero writes to the database file,
   each domain a per-session `MemoryBlockStore` + pager with within-session compaction; CREATE/DROP
   INDEX, serial/IDENTITY, composite columns, FOREIGN KEYs among temp tables (`42P16` across kinds);
@@ -231,6 +267,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     histogram (PostgreSQL's `elem_count_histogram`) for array `=`.
   - [ ] _follow-on:_ broader physical search — costed outer/barrier shapes, bushy trees, parallel
     plan search, or adaptive runtime re-planning; each requires a bounded deterministic contract.
+- [ ] **Parallel execution within a query** — fan one query's scans, joins, aggregation, and sorts
+  out across threads over the pinned snapshot (DuckDB does this; CLAUDE.md §2 cites Rayon-grade
+  parallelism as a reason to wrap Rust). Results, cost, and errors must stay identical to serial
+  execution: `ORDER BY` output and the error raised must not depend on scheduling, and order-sensitive
+  aggregates follow [determinism.md](spec/design/determinism.md). Needs the thread-count `CreateOptions`
+  knob (below) and a design doc first. _(size: XL)_
 
 ### Planner infrastructure
 
@@ -301,6 +343,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     mutable merge/split cases. Rust-only, no byte or cost change. _(size: M)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** — large `text`/`bytea`/`decimal`/`json` pushed out-of-line onto overflow-page chains (`format_version` 3), optionally LZ4-compressed first via a deterministic hand-rolled block codec (no third-party dep — a library fails §8 byte-identity). → [large-values.md](spec/design/large-values.md), [lz4.md](spec/fileformat/lz4.md)
   - [ ] _follow-on:_ chain sharing on rewrite (let a rewritten record keep an unchanged value's existing chain — a byte-layout change, lands in all cores + incremental tests together).
+- [ ] **Upgrade path for older files + an on-disk stability commitment (a 1.0 blocker)** — a reader
+  accepts only the current `format_version` ([format.md](spec/fileformat/format.md)), so every bump
+  strands existing files, and the CLI's `--dump` needs the old binary to cross. Decide the 1.0 policy:
+  an in-place upgrade on open, a `jed upgrade` that carries readers for older versions, or a frozen
+  format with additive changes only. Ratify or replace the
+  [compatibility.md](spec/design/compatibility.md) proposal alongside. _(size: L + decision)_
+- [ ] **Batched durability and group commit** — the `synchronous=off` setting exists, but its
+  background flusher and fsync coalescing across concurrent committers are deferred
+  ([transactions.md §9/§11](spec/design/transactions.md)). _(size: M)_
 
 ---
 
@@ -326,6 +377,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     `42883` there today); the dedicated resolvers (array, range-constructor, json-set functions)
     still type their own arguments; a parameter already typed by an earlier occurrence still counts
     as unknown in a later function argument.
+- [ ] **Integrity-check host API** — SQLite's `PRAGMA integrity_check` / `quick_check`: verify page
+  checksums, tree invariants, free-list and live-count accounting, and index ↔ table agreement on a
+  live database, returning structured findings. The checkers already exist in the simulation runners
+  and `spec/fileformat/verify.rb`; expose them through the host API and the CLI. _(size: M)_
+- [ ] **Change notifications** — host callbacks after a commit (tables touched, `txid`), plus a cheap
+  "has anything committed since" counter (SQLite's update/commit hooks and `PRAGMA data_version`), for
+  reactive embedded apps and cache invalidation. Must cover commits from other page-service
+  clients. _(size: M)_
+- [ ] **Database ↔ bytes** — open a database from a byte buffer and export one to bytes (SQLite's
+  `sqlite3_serialize` / `sqlite3_deserialize`), over the in-memory `MemoryBlockStore`; useful for
+  browsers, tests, and shipping prebuilt databases. _(size: S)_
 - [ ] **Storage hosts** — the five-method `BlockStore` byte device, host catalog, and decoration layering (encryption codec above the seam, replication tee below) authored in [hosts.md](spec/design/hosts.md). **Landed:** the per-core `FileBlockStore`s, the Node `fs` host, and the **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity vs goldens, a Playwright real-browser e2e run inside `mise run ci`). **Open:** OPFS disk-spill. → [hosts.md §3/§5/§7](spec/design/hosts.md)
 - [x] **jed-migrate — the schema-migration library** — tern-modeled, opt-in migration packages at
   `/migrate` (Go + Rust + TS; a NON-CORE consumer per language) over one shared contract +
@@ -366,6 +428,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **SQLancer-style metamorphic / generative testing** — **PARTIAL.** Built so far (`scripts/norec_gen.rb`; `mise run corpus:norec_sweep`, in `mise run ci`): the **NoREC** slice (pushdown vs non-optimizable rewrite must agree), the **TLP** slice (ternary-logic partitioning — now including **aggregate-TLP** for `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`, both ungrouped via scalar-subquery combination — `SUM` by `COALESCE` (grammar.md §51), `MIN`/`MAX` by `LEAST`/`GREATEST` (grammar.md §52), `AVG` as summed sums over summed counts with a by-construction `select_div_scale` expected — and per-`GROUP BY`-group via a UNION-ALL derived-table super-aggregate), and an automatic **reducer** (`scripts/reduce.rb`, ddmin). *Remaining:* **PQS** (pivoted query synthesis — needs an in-harness expression evaluator) and broader NoREC relations. _(size: M remaining)_
 - [ ] **Corpus growth** (ongoing) — keep adding `.test` coverage as each feature lands. Two **standing obligations** (conformance.md §5/§8): (a) on the PG-comparable surface, run `mise run corpus:check` and register any intentional divergence in the override ledger; (b) **when you add a query optimization or a new evaluable query shape, add a NoREC relation for it** to `norec_gen.rb` — the sweep does not discover new optimizations.
 - [x] **Deterministic simulation testing** — S1–S7 landed in all three cores ([spec/design/simulation-testing.md](spec/design/simulation-testing.md)): generator + runners + oracles, byte-identical transcripts and crash images across cores, resource limits and per-core I/O faults, spill faults through a spill-host seam in every core (sort, spool, hash, and temp-table spill), a simulated filesystem (`create`, compaction, file attachments with per-database oracles), simulated multi-process shared access, `verify.rb --check-image`, the reader-aware bounded-growth invariant, and the `corrupt` mode; `ci` runs the regression traces and a fixed sweep. It found three engine bugs (all fixed). **Standing obligation** (§13 of the design): a new page type, commit path, host operation, or storage setting grows the generator and checkers in the same change.
+- [ ] **Coverage-guided fuzzing of SQL text** — untrusted SQL must never crash a core (CLAUDE.md §13;
+  a panic is a denial of service), but the only fuzzer today mutates on-disk pages
+  (`impl/go/corruption_fuzz_test.go`). Add parser → resolver → executor fuzz targets in every core
+  (Go's built-in `testing.F`; a Rust/TS fuzzer is a tooling dependency needing §14 confirmation),
+  seeded from the corpus, with crashes reduced into regression `.test` entries. _(size: M)_
 - [ ] **Benchmark backfill** (ongoing) — grow `bench/corpus` beyond the v1 set (benchmarks.md §11): concurrent-reader cross-engine (PG/SQLite) + truly larger-than-pool eviction/thrashing variants (the jed-only resident and cold-population `concurrent_read_pk*_r{1,4}` pairs landed — benchmarks.md §8.1), durable-commit batch-size sweep. **Standing obligation** (§10): a perf-relevant feature lands with a benchmark; a perf-sensitive change runs the affected benchmarks before/after. _(size: M, ongoing)_
 
 ---
@@ -380,6 +447,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Ruby gem** — wrap the safe Rust core, shipped as a gem (conforms by construction; a distribution artifact, not an independent conformance voice). **Landed:** Slice 1 (the `cdylib` + a `fiddle`-loaded pure-Ruby gem), Slice 2 (`$N` bind params), Slice 3 (richer typed values — `BigDecimal`/`Date`/`Time`, AR-style), Slice 4 (host-loaded `JUCD`/`JTZ` bundles), Slice 5 (**host functions** — `Jed::ExtensionRegistry` with single-row and batch kernels upcalling through Fiddle closures, ABI v5, measured by the `host_function_*` triple, benchmarks.md §8.2), and the binding-overhead benchmark (`bench/ruby`). → [ruby.md](spec/design/ruby.md), [cores.md §6](spec/design/cores.md)
   - [ ] _follow-on (each its own slice):_ a **gem prepared-statement API** (isolates the pure FFI tax from per-call parse); **`interval`/`uuid`/`bytea`** typed coercion (left as String); **distributable packaging** — a `gem install`-able native gem via `rb-sys` + precompiled platform gems (or `magnus`), replacing the in-repo `mise run ruby:build` (a wrapper-module dep — needs §14 confirmation); an optional **Ruby conformance runner**; **host functions over `bytea`/`uuid`/`interval`/`json`/`jsonb`/`jsonpath`** (needs a native text→value parse at the boundary, ruby.md §5b); **`component_id`/`semantic_version` on gem host functions**, without which a gem host function can back neither an index nor a `CHECK` (extensibility.md §7.1/§8.1). _(size: L wrap)_
 - [ ] **Native Node/Rust reach package experiment** — the benchmark-capable prototype is built (`impl/node`, `bench-node-rust.ts`), exact-pinned, and checksum-verified against all 53 lanes. It is not production-complete: add the full typed value/error/session API, async/worker-thread story, host-function policy, prebuilt/provenance matrix, packaging tests, and a package-name/product decision before presenting it as an alternative to native TS. Do not count it as a conformance core—it echoes Rust. Current performance decision is workload-dependent; see [cores.md §5.2](spec/design/cores.md) and [benchmarks.md §7.3](spec/design/benchmarks.md). _(size: L wrap)_
+- [ ] **Python package** — the largest audience for embedded databases (the `sqlite3` module,
+  DuckDB), and absent from the plan. Likely a wrap of the safe Rust core (PyO3 or the C API below —
+  either needs §14 confirmation), with a DB-API 2.0 (PEP 249) surface, `Decimal`/`datetime`/`uuid`
+  value mapping, and prebuilt wheels. Record the native-vs-wrap call in [cores.md](spec/design/cores.md). _(size: L wrap)_
+- [ ] **Public, stable C API + header** — the Ruby gem already loads a Rust `cdylib`; promoting that
+  boundary to a documented, versioned C ABI lets PHP, Dart/Flutter, Elixir, and others bind cheaply
+  (SQLite's C API is the reason it is everywhere). _(size: L)_
 - [ ] **C#** core — **lean native** (value-type generics, `Span<T>`, NativeAOT → near-Rust speed *and* a clean pure-managed NuGet package; in-process host functions). Strongest native candidate. _(size: XL native / L wrap; §2)_
 - [ ] **Swift** core — **lean wrap** (UniFFI + XCFramework over the safe Rust core: Rust speed, well-trodden Apple packaging, untrusted-query safety preserved §13). Native only if hot-path per-row host functions make the FFI upcall tax dominant. _(size: L wrap / XL native; §2/§13)_
 - [ ] **Java** core — **conflicted**: wrap for performance (pre-Valhalla boxing + JIT warmup hurt a native core), native for clean pure-JAR packaging + in-process host functions (no JNI/upcall tax). Decide at scheduling time; Valhalla shifts it toward native. _(size: XL native / L wrap; §2)_
@@ -391,6 +465,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ non-strict host functions, host functions over container args, and runtime **enforcement** of the recorded `cross_core` declaration (taint/containment of non-cross-core results — no runtime taint mechanism exists yet, matching how `float` is handled at the spec layer). _(`immutable` is now enforced for index-backing, and an immutable host function may back an index — below.)_
 - [x] **Host functions in persisted indexes** (extensibility.md §14 step 4, all 3 cores, `format_version` 31) — **Model B (registry-only, no SQL DDL)**: a `HostFunction` gains `component_id` + `semantic_version`; an `immutable` + versioned host function may back an expression / partial index (`CREATE INDEX ON t (geo_hash(a))`). The index catalog persists a per-index host-function **dependency list** (`index_flags` bit2 `has_host_deps` + the `(name, arg types, result, component_id, semantic_version)` tuples); the per-statement re-resolution re-checks it — a **read** whose candidate index no longer matches skips it (correct heap scan), a **write** is refused (`XX002` component/version mismatch, `42883` missing function), never a silent stale-key read. Also **fixed a latent bug**: a host function (even `volatile`) previously leaked into an index expression (the immutability gate was purely syntactic) — now `42P17`. → [extensibility.md §7 / §8.1 / §11](spec/design/extensibility.md)
   - [ ] _follow-on:_ the full [compatibility.md](spec/design/compatibility.md) per-object graded reopen manifest (step 4 landed the index-only form); `REINDEX` to rebuild a stale/unusable index.
+- [ ] **Host-defined types and operator classes** — the designed but unscheduled steps 5–8 of
+  [extensibility.md §14](spec/design/extensibility.md): opaque host scalar types (Storable /
+  Equatable / Ordered) with derived `array<host-type>` and the graded reopen verdict for every object
+  kind; keyable host types (an order-preserving encoder + the invariant harness); host GIN/GiST
+  operator classes behind the unified seam; and SQL syntax to choose a non-default operator class.
+  _(size: XL across the steps)_
+- [ ] **Host aggregate and table-valued functions** — not yet designed. Host aggregates (state,
+  transition, final, as a batched kernel) and host functions that return rows usable in `FROM` (SQLite's
+  virtual tables, DuckDB's table functions — a host-extension row source, CLAUDE.md §9/§13). Design
+  in extensibility.md first. _(size: L each)_
 
 ---
 
@@ -412,6 +496,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - **Further collation expansion.** Curated tailorings, nondeterministic collations, `LIKE` under
   non-`C`, CLDR `shifted`, and CJK tier-3 data remain possibilities, not scheduled work.
   → [collation.md §14](spec/design/collation.md)
+- **Full-text search.** PostgreSQL (`tsvector`/`tsquery` + GIN) and SQLite (FTS5) both ship it. In
+  jed it would be a type pair, a tokenizer/stemmer data bundle loaded through the `Environment` (the
+  collation precedent), and a GIN operator class. Large; not scheduled.
 - **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep
   open, **designed in [encryption.md](spec/design/encryption.md)**: a page codec in the core
   above the block seam, a standardized AEAD under a deterministic `(page_index, txid)` nonce
@@ -476,7 +563,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `client-reclaims` plant.
   - [ ] **Phase 5 — SSH.** `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead
     and subtree fetch.
-  - [ ] **Phase 6 — backup.** Page-identical and compacted forms.
+  - [ ] **Phase 6 — backup.** Page-identical and compacted forms. This is also jed's answer to SQLite's
+    `sqlite3_backup` / `VACUUM INTO`, locally as well as over SSH.
   - [ ] **Phase 7 — replication.** The tee, retained log, `subscribe`, lineage and timelines (a format
     change), replicas and read replicas; amend replication.md.
 
