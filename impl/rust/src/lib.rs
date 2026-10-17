@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // regr_avgy(Y, X) — the mean of Y over the non-NULL pairs (aggregates.md §23).
+    "func.regr_avgy",
     // regr_avgx(Y, X) — the mean of X over the non-NULL pairs (aggregates.md §23).
     "func.regr_avgx",
     // regr_count(Y, X) — the number of non-NULL pairs (aggregates.md §23).

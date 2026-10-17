@@ -863,6 +863,8 @@ var SupportedCapabilities = []string{
 	// (key, value) pairs into one JSON object; _unique errors 22030 on a duplicate key
 	// (json-sql-functions.md §4).
 	"func.json_object_agg",
+	// regr_avgy(Y, X) — the mean of Y over the non-NULL pairs (aggregates.md §23).
+	"func.regr_avgy",
 	// regr_avgx(Y, X) — the mean of X over the non-NULL pairs (aggregates.md §23).
 	"func.regr_avgx",
 	// regr_count(Y, X) — the number of non-NULL pairs (aggregates.md §23).

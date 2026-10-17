@@ -992,6 +992,7 @@ fn finalize_exact_pair(stat: PairStat, n: i64, sums: &[Decimal; 5]) -> Result<Va
     let num_xy = count.mul_exact(sxy).add_uncapped(&sx.mul_exact(sy).neg());
     let r = match stat {
         PairStat::CovarPop => num_xy.div(&count.mul_exact(&count))?,
+        PairStat::RegrAvgy => sums[2].div(&count)?,
         PairStat::RegrAvgx => sums[0].div(&count)?,
         PairStat::Corr => {
             let num_x = count
@@ -1090,6 +1091,7 @@ fn finalize_float_pair(stat: PairStat, t: &[f64; 6]) -> Value {
     }
     Value::Float64(match stat {
         PairStat::CovarPop => sxy / n,
+        PairStat::RegrAvgy => t[3] / n,
         PairStat::RegrAvgx => t[1] / n,
         PairStat::Corr => {
             if t[2] == 0.0 || t[4] == 0.0 {
