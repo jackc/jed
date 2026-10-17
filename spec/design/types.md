@@ -273,8 +273,10 @@ listed).
   **named** (a literal or CAST). A **bare** string in a numeric context does **not** silently
   become a number: `WHERE int_col = '42'` is `42804` (§4), and a bare string adapts *only* to the
   string-native types (bytea/uuid/timestamp/timestamptz/interval, where the string is the only
-  literal form) — never to int/decimal/boolean. So `type 'string'` admits the *explicit* spelling
-  of a text→scalar cast without weakening the implicit rules.
+  literal form) — never to int/decimal/boolean. Only a *literal* adapts: a text-typed expression (a
+  text column, `||`, a subquery) stored into a string-native column is `42804`, as in PostgreSQL
+  ([grammar.md](grammar.md) §24). So `type 'string'` admits the *explicit* spelling of a
+  text→scalar cast without weakening the implicit rules.
 
 Cast modes are `implicit` / `assignment` / `explicit`. `assignment` (applied when a value is
 stored into a column, but not in comparisons or operators) is the mode of the three integer

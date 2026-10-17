@@ -162,9 +162,9 @@ func resolvedOfColumn(ty scalarType) resolvedType {
 // §24), before any row is produced (so it fires even over an empty source). It is the
 // authoritative family-level subset of storeValue and MUST agree with it: an integer assigns to
 // an integer or decimal column (int→decimal widens), a decimal only to a decimal column (decimal→int is
-// explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz (the documented text
-// adaptation — the per-row store then parses, trapping 22P02/22007 on malformed input),
-// boolean→boolean, uuid→uuid, bytea→bytea, JSON identities plus the assignment-only jsonb→json
+// explicit-CAST only), text only to text (a text-typed expression never becomes a uuid/bytea/datetime
+// value without a CAST, as in PostgreSQL; a bare string literal adapts before this gate — at resolve,
+// or via stringLiteralAdaptsTo for an INSERT ... SELECT projection), boolean→boolean, uuid→uuid, bytea→bytea, JSON identities plus the assignment-only jsonb→json
 // rendering cast, a timestamp only to a timestamp column and a
 // timestamptz only to a timestamptz column (the two never cross — they do not even compare,
 // timestamp.md), and a NULL-typed projection to any column (a NOT NULL target then traps 23502
@@ -180,8 +180,7 @@ func assignableTo(t resolvedType, colTy scalarType) bool {
 	case rtBool:
 		return colTy.IsBool()
 	case rtText:
-		return colTy.IsText() || colTy.IsUuid() || colTy.IsBytea() ||
-			colTy.IsTimestamp() || colTy.IsTimestamptz() || colTy.IsInterval() || colTy.IsDate()
+		return colTy.IsText()
 	case rtBytea:
 		return colTy.IsBytea()
 	case rtUuid:
@@ -210,6 +209,15 @@ func assignableTo(t resolvedType, colTy scalarType) bool {
 	default:
 		return false
 	}
+}
+
+// stringLiteralAdaptsTo reports whether a bare string literal projected by an INSERT ... SELECT
+// source adapts to a colTy column: the string-native types, whose input the per-row store parses
+// (22P02/22007/22008 on malformed input). PostgreSQL leaves such a literal `unknown` until it meets
+// the target column (spec/design/grammar.md §24); a numeric or boolean target still rejects it (42804).
+func stringLiteralAdaptsTo(colTy scalarType) bool {
+	return colTy.IsUuid() || colTy.IsBytea() || colTy.IsTimestamp() || colTy.IsTimestamptz() ||
+		colTy.IsInterval() || colTy.IsDate()
 }
 
 // rtName is t's type name, for a 42804 assignability message (the integer width is exact).

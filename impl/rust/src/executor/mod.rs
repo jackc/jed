@@ -2974,9 +2974,10 @@ impl ResolvedType {
     /// before any row is produced (so it fires even over an empty source). It is the
     /// authoritative family-level subset of `store_value` and MUST agree with it: an integer
     /// assigns to an integer or decimal column (int→decimal widens), a decimal only to a decimal column
-    /// (decimal→int is explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz/interval (the
-    /// documented text adaptation — the per-row store then parses, trapping 22P02/22007 on
-    /// malformed input), boolean→boolean, uuid→uuid, bytea→bytea, JSON identities plus the
+    /// (decimal→int is explicit-CAST only), text only to text (a text-typed expression never
+    /// becomes a uuid/bytea/datetime value without a CAST, as in PostgreSQL; a bare string literal
+    /// adapts before this gate — at resolve, or via [`string_literal_adapts_to`] for an
+    /// `INSERT ... SELECT` projection), boolean→boolean, uuid→uuid, bytea→bytea, JSON identities plus the
     /// assignment-only jsonb→json rendering cast, a timestamp only to a timestamp
     /// column and a timestamptz only to a timestamptz column (the two never cross — they do not
     /// even compare, timestamp.md), and a NULL-typed projection to any column (a NOT NULL target
@@ -2996,15 +2997,7 @@ impl ResolvedType {
             ResolvedType::Int(_) => col_ty.is_integer() || col_ty.is_decimal(),
             ResolvedType::Decimal => col_ty.is_decimal(),
             ResolvedType::Bool => col_ty.is_bool(),
-            ResolvedType::Text => {
-                col_ty.is_text()
-                    || col_ty.is_uuid()
-                    || col_ty.is_bytea()
-                    || col_ty.is_timestamp()
-                    || col_ty.is_timestamptz()
-                    || col_ty.is_interval()
-                    || col_ty.is_date()
-            }
+            ResolvedType::Text => col_ty.is_text(),
             ResolvedType::Bytea => col_ty.is_bytea(),
             ResolvedType::Uuid => col_ty.is_uuid(),
             ResolvedType::Json => col_ty.is_json(),
@@ -3021,6 +3014,19 @@ impl ResolvedType {
             ResolvedType::Float(st) => col_ty.is_float() && st.rank() <= col_ty.rank(),
         }
     }
+}
+
+/// Whether a bare string literal projected by an `INSERT ... SELECT` source adapts to a `col_ty`
+/// column: the string-native types, whose input the per-row store parses (22P02/22007/22008 on
+/// malformed input). PostgreSQL leaves such a literal `unknown` until it meets the target column
+/// (spec/design/grammar.md §24); a numeric or boolean target still rejects it (42804).
+pub(crate) fn string_literal_adapts_to(col_ty: ScalarType) -> bool {
+    col_ty.is_uuid()
+        || col_ty.is_bytea()
+        || col_ty.is_timestamp()
+        || col_ty.is_timestamptz()
+        || col_ty.is_interval()
+        || col_ty.is_date()
 }
 
 /// Render a projection's resolved types as their canonical names for the public `Outcome::Query`
