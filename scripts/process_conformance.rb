@@ -165,7 +165,10 @@ def run_scenario(path, first_core, second_core)
           actor_name = step.fetch("actor")
           command = step.fetch("command")
           if command == "start"
-            core = actor_name == "a" ? first_core : second_core
+            # `core` pins an actor to one core, for a role only that core implements (the stream
+            # transport's client is Rust's); otherwise "a" runs the pairing's first core, every other
+            # actor its second.
+            core = step["core"] || (actor_name == "a" ? first_core : second_core)
             actor_path = File.join(dir, "#{step.fetch('path', 'shared')}.jed")
             begin
               actors[actor_name] = Actor.new(core, step.fetch("argument"), actor_path)
