@@ -329,7 +329,11 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
   double-quote, backslash, or whitespace. Inside quotes, `"`→`\"` and `\`→`\\` (PG `array_out`
   *backslash-escapes* — the contrast with `record_out`, which *doubles*; pin against the oracle). A
   **NULL element** renders as the unquoted token `NULL` (the contrast with `record_out`, where a
-  NULL field is the empty string). The empty array renders `{}`. A **multidimensional** value renders
+  NULL field is the empty string). Each element renders by its element type's **output function**
+  — for a **boolean**, PG's `boolout` spelling `t`/`f` (`ARRAY[true,false]` → `{t,f}`), *not* the
+  conformance result cell's canonical `true`/`false` ([conformance.md §1](conformance.md)) nor the
+  `bool → text` cast's `true`/`false` (PG `booltext`, which the element-wise `bool[] → text[]` cast
+  uses: `ARRAY[true]::text[]` → `{true}`). The empty array renders `{}`. A **multidimensional** value renders
   with **nested braces** (`{{1,2},{3,4}}`), and a value with **any lower bound ≠ 1** is prefixed with
   a `[l1:u1][l2:u2]…=` bound spec (`[2:4]={1,2,3}`) — PG emits the prefix only then. **Recurses for
   composite elements** — and the two quoting layers nest exactly as PG does (oracle-pinned): the

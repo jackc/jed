@@ -1076,7 +1076,7 @@ func recordOutZoned(fields []Value, zone *ZoneRef) (string, error) {
 		if f.Kind == ValNull {
 			continue // a NULL field is the empty string between delimiters (unquoted)
 		}
-		s, err := f.renderZoned(zone)
+		s, err := f.renderElementZoned(zone)
 		if err != nil {
 			return "", err
 		}
@@ -1338,6 +1338,21 @@ func compositeTotalCmp(a, b []Value) int {
 	return cmpInt(len(a), len(b))
 }
 
+// renderElementZoned renders v as an element of a container's text (an array element or a composite
+// field): exactly renderZoned, except a boolean is PostgreSQL's boolout spelling t/f — the text
+// array_out / record_out embed ({t,f}, (t,1)). The top-level result cell keeps the canonical
+// true/false (conformance.md §1), and a bool -> text cast stays true/false as PostgreSQL's booltext
+// (spec/design/array.md §7).
+func (v Value) renderElementZoned(zone *ZoneRef) (string, error) {
+	if v.Kind == ValBool {
+		if v.boolVal() {
+			return "t", nil
+		}
+		return "f", nil
+	}
+	return v.renderZoned(zone)
+}
+
 // arrayOut renders an array's elements as PG array_out (spec/design/array.md §7): `{e1,e2,…}`. A
 // NULL element is the unquoted token `NULL`; every other element is rendered by its own Render and
 // double-quoted iff it is empty, equals the literal `NULL` (case-insensitive), or contains a
@@ -1410,7 +1425,7 @@ func renderArrayElem(e Value, b *strings.Builder, zone *ZoneRef) error {
 		b.WriteString("NULL")
 		return nil
 	}
-	s, err := e.renderZoned(zone)
+	s, err := e.renderElementZoned(zone)
 	if err != nil {
 		return err
 	}

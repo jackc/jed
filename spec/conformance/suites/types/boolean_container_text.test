@@ -1,0 +1,125 @@
+# A boolean INSIDE a container's text renders as PostgreSQL's boolout spelling `t`/`f`: an array
+# element (array_out, spec/design/array.md §7) and a composite field (record_out,
+# spec/design/composite.md §8), at any depth, in a result cell and through the `::text` cast. The top-level result cell keeps the canonical `true`/`false` (conformance.md §1), a bool → text cast stays `true`/`false` (PostgreSQL's
+# booltext), and JSON keeps its `true`/`false` literals. Format + the `requires` gate:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.i32, types.text, types.boolean, types.boolean_storable, types.array, types.array_multidim, types.composite, types.composite_array_field, types.array_composite, cast.explicit, cast.scalar_text, cast.array, types.json, func.json_builders
+
+# ---- arrays ---------------------------------------------------------------------------------------
+
+query T nosort
+SELECT ARRAY[true, false]::text
+----
+{t,f}
+
+query T nosort
+SELECT ARRAY[true, NULL, false]::text
+----
+{t,NULL,f}
+
+query T nosort
+SELECT ARRAY[ARRAY[true, false], ARRAY[false, true]]::text
+----
+{{t,f},{f,t}}
+
+query T nosort
+SELECT '[0:1]={true,false}'::boolean[]::text
+----
+[0:1]={t,f}
+
+# every accepted boolean input spelling renders t/f inside the array
+query T nosort
+SELECT '{t,true,yes,on,1,f,false,no,off,0}'::boolean[]::text
+----
+{t,t,t,t,t,f,f,f,f,f}
+
+# the element-wise bool[] -> text[] cast keeps booltext's `true`/`false` (the elements are text)
+query T nosort
+SELECT ARRAY[true, false]::text[]::text
+----
+{true,false}
+
+# the text round-trips through array_in
+query B nosort
+SELECT ARRAY[true, NULL, false]::text::boolean[] = ARRAY[true, NULL, false]
+----
+true
+
+# ---- stored bool[] column -------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE ba (id i32 PRIMARY KEY, flags boolean[])
+
+statement ok
+INSERT INTO ba VALUES (1, ARRAY[true, false]), (2, '{}'), (3, ARRAY[NULL::boolean]), (4, NULL)
+
+query IT nosort
+SELECT id, flags::text FROM ba ORDER BY id
+----
+1
+{t,f}
+2
+{}
+3
+{NULL}
+4
+NULL
+
+# a bool[] / composite result cell renders the same container text
+query T nosort
+SELECT flags FROM ba WHERE id = 1
+----
+{t,f}
+
+# ---- composites -----------------------------------------------------------------------------------
+
+query T nosort
+SELECT ROW(true, 1)
+----
+(t,1)
+
+query T nosort
+SELECT ROW(false, NULL::boolean, 'x')
+----
+(f,,x)
+
+statement ok
+CREATE TYPE flagged AS (on_ boolean, tags boolean[])
+
+statement ok
+CREATE TABLE ct (id i32 PRIMARY KEY, v flagged, vs flagged[])
+
+statement ok
+INSERT INTO ct VALUES (1, '(t,"{t,f}")', '{"(f,{t})","(t,)"}'), (2, '(,)', NULL)
+
+query ITT nosort
+SELECT id, v, vs FROM ct ORDER BY id
+----
+1
+(t,"{t,f}")
+{"(f,{t})","(t,)"}
+2
+(,)
+NULL
+
+# the composite text round-trips through record_in
+query B nosort
+SELECT '(t,"{t,f}")'::flagged = v FROM ct WHERE id = 1
+----
+true
+
+# ---- JSON keeps true/false ------------------------------------------------------------------------
+
+query TT nosort
+SELECT to_json(ARRAY[true, false])::text, to_json(ROW(true, ARRAY[false]))::text
+----
+[true,false]
+{"f1":true,"f2":[false]}
+
+# ---- top-level stays canonical --------------------------------------------------------------------
+
+query BT nosort
+SELECT true, true::text
+----
+true
+true

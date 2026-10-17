@@ -256,7 +256,9 @@ writer's pending catalog under the single-writer staging model (CLAUDE.md §3) �
   backslash, or whitespace. Inside the quotes PostgreSQL **doubles** an embedded `"` → `""` and
   `\` → `\\` (rowtypes.c `record_out` — *not* backslash-escaping; the oracle corrected the initial
   S3 `\"` rendering). A **NULL** field renders as the empty string between delimiters (unquoted).
-  The renderer recurses for nested composites. This is the determinism/oracle surface — it equals
+  Each field renders by its type's output function — a **boolean** field is PG's `boolout` `t`/`f`
+  (`ROW(true,1)` → `(t,1)`), as an array element is ([array.md §7](array.md)), not the result
+  cell's canonical `true`/`false`. The renderer recurses for nested composites. This is the determinism/oracle surface — it equals
   PG byte-for-byte (CLAUDE.md §8), verified by `mise run corpus:check`.
 - **`record_in`** (✅ S6) parses `(…)` into fields (top-level commas, respecting quotes/escapes/
   nesting) and recursively coerces each token to its field type — an empty **unquoted** token is

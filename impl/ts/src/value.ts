@@ -676,7 +676,7 @@ function recordOutZoned(fields: Value[], zone: ZoneRef | null): string {
     if (i > 0) out += ",";
     const f = fields[i]!;
     if (f.kind === "null") continue; // a NULL field is the empty string between delimiters (unquoted)
-    const s = renderZoned(f, zone);
+    const s = renderElementZoned(f, zone);
     if (recordFieldNeedsQuote(s)) {
       out += '"';
       for (const ch of s) {
@@ -691,6 +691,16 @@ function recordOutZoned(fields: Value[], zone: ZoneRef | null): string {
   }
   out += ")";
   return out;
+}
+
+// renderElementZoned renders v as an element of a container's text (an array element or a composite
+// field): exactly renderZoned, except a boolean is PostgreSQL's boolout spelling t/f — the text
+// array_out / record_out embed ({t,f}, (t,1)). The top-level result cell keeps the canonical
+// true/false (conformance.md §1), and a bool -> text cast stays true/false as PostgreSQL's booltext
+// (spec/design/array.md §7).
+function renderElementZoned(v: Value, zone: ZoneRef | null): string {
+  if (v.kind === "bool") return v.value ? "t" : "f";
+  return renderZoned(v, zone);
 }
 
 // recordFieldNeedsQuote reports whether a record_out field token must be double-quoted: the empty
@@ -772,7 +782,7 @@ function renderArrayDim(
 // renderArrayElem renders one array element (PG array_out quoting; a NULL element is unquoted NULL).
 function renderArrayElem(e: Value, zone: ZoneRef | null): string {
   if (e.kind === "null") return "NULL";
-  const s = renderZoned(e, zone);
+  const s = renderElementZoned(e, zone);
   if (!arrayElemNeedsQuote(s)) return s;
   let out = '"';
   for (const ch of s) {
