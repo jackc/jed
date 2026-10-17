@@ -1,5 +1,5 @@
 # Exact decimal transcendental step charges (cost.md §8). Values are PG-comparable; cost is jed-specific.
-# requires: query.select, query.select_no_from, types.decimal, expr.numeric_transcendental, resource.cost_metering
+# requires: query.select, query.select_no_from, types.decimal, expr.numeric_transcendental, func.mixed_numeric_args, resource.cost_metering
 
 # cost: 1097
 query D nosort
@@ -72,3 +72,24 @@ query D nosort
 SELECT exp(-1000.0)
 ----
 0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005075958897549457
+
+# A promoted integer argument (functions.md §9.2) is converted inside the kernel at scale 0, so the
+# call charges the kernel's work over the converted value, and no cast — one less than the explicit
+# log(2::numeric, 8.0), whose cast is its own expression.
+# cost: 242454
+query D nosort
+SELECT log(2, 8.0)
+----
+3.0000000000000000
+
+# cost: 242455
+query D nosort
+SELECT log(2::numeric, 8.0)
+----
+3.0000000000000000
+
+# cost: 209148
+query D nosort
+SELECT power(2.5, 2)
+----
+6.2500000000000000

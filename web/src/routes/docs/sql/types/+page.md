@@ -231,6 +231,11 @@ Every example below is a **live database in your browser**. Edit the SQL and run
 
 <LiveSql demo="decimalDemo" query={decimalDemo} rows={5} />
 
+The exact math functions take an integer next to a `numeric`, as in PostgreSQL: `power(2.0, 3)` and
+`log(2, 8.0)` return `numeric`. A float function takes a number literal next to a float, so
+`power(x, 3)` on a `f64` column returns `f64`. A float column next to an integer column still needs
+a cast (`42883`), and so does a call with only integers, such as `power(2, 3)`.
+
 ## Integers with defined overflow
 
 Integers are fixed-width (`i16`, `i32`, `i64`) and **trap on overflow** — there is no silent

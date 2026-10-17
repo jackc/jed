@@ -3637,10 +3637,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// the libm path; a decimal operand computes exactly via the PG-faithful kernel —
 			// byte-identical across cores (unlike the float arms). Domain errors: sqrt of a negative
 			// and the power domain errors → 2201F; ln of a non-positive → 2201E; overflow → 22003.
-			if vals[0].Kind != ValDecimal {
+			// The overload decides the kernel: a promoted integer argument of the decimal power
+			// converts to decimal (functions.md §9.2).
+			if e.result != scalarDecimal {
 				return evalFloatFunc(e.sfunc, vals, e.result)
 			}
-			a := *vals[0].decimal()
+			a := valueToDecimal(vals[0])
 			var r Decimal
 			var err error
 			switch e.sfunc {
@@ -3653,19 +3655,20 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			case sfLog10:
 				r, err = a.decLog10Metered(m)
 			default: // sfPow
-				r, err = decPowerMetered(a, *vals[1].decimal(), m)
+				r, err = decPowerMetered(a, valueToDecimal(vals[1]), m)
 			}
 			if err != nil {
 				return Value{}, err
 			}
 			return DecimalValue(r), nil
 		case sfLog:
-			// `log` is decimal-only: 1-arg = base-10 log, 2-arg = log(base, num) in any base.
-			a := *vals[0].decimal()
+			// `log` is decimal-only: 1-arg = base-10 log, 2-arg = log(base, num) in any base. A promoted
+			// integer argument converts to decimal (functions.md §9.2).
+			a := valueToDecimal(vals[0])
 			var r Decimal
 			var err error
 			if len(vals) > 1 {
-				r, err = decLogMetered(a, *vals[1].decimal(), m)
+				r, err = decLogMetered(a, valueToDecimal(vals[1]), m)
 			} else {
 				r, err = a.decLog10Metered(m)
 			}

@@ -2194,29 +2194,25 @@ impl RExpr {
                         Ok(Value::Decimal(d.dec_log10_metered(Some(m))?))
                     }
                     // `log` is decimal-only (no float `log` in the catalog): 1-arg = base-10 log,
-                    // 2-arg = log(base, num) in an arbitrary base.
+                    // 2-arg = log(base, num) in an arbitrary base. A promoted integer argument
+                    // converts to decimal (functions.md §9.2).
                     ScalarFunc::Log => {
-                        let Value::Decimal(a) = &vals[0] else {
-                            unreachable!("resolver restricts log to decimal operands")
-                        };
+                        let a = value_to_decimal(&vals[0]);
                         match vals.get(1) {
                             None => Ok(Value::Decimal(a.dec_log10_metered(Some(m))?)),
-                            Some(Value::Decimal(num)) => {
-                                Ok(Value::Decimal(Decimal::dec_log_metered(a, num, Some(m))?))
-                            }
-                            Some(_) => unreachable!("resolver restricts log's args to decimal"),
+                            Some(num) => Ok(Value::Decimal(Decimal::dec_log_metered(
+                                &a,
+                                &value_to_decimal(num),
+                                Some(m),
+                            )?)),
                         }
                     }
-                    ScalarFunc::Pow if matches!(&vals[0], Value::Decimal(_)) => {
-                        let Value::Decimal(base) = &vals[0] else {
-                            unreachable!()
-                        };
-                        let Value::Decimal(exp) = &vals[1] else {
-                            unreachable!("resolver restricts power's args to decimal")
-                        };
+                    // The decimal power: the overload decides the kernel, and a promoted integer
+                    // argument converts to decimal (functions.md §9.2).
+                    ScalarFunc::Pow if *result == ScalarType::Decimal => {
                         Ok(Value::Decimal(Decimal::dec_power_metered(
-                            base,
-                            exp,
+                            &value_to_decimal(&vals[0]),
+                            &value_to_decimal(&vals[1]),
                             Some(m),
                         )?))
                     }

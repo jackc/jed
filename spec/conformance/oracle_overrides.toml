@@ -460,7 +460,20 @@ reason = "jed: ln's numeric overload is arg_resolution = none, and a bare intege
 [[override]]
 file = "expr/numeric_transcendental.test"
 sql = "SELECT power(2, 10)"
-reason = "jed: power's numeric overload is arg_resolution = none over (decimal, decimal); two bare integers do not promote, so 42883. PostgreSQL casts int -> double precision and returns 1024. Explicit-cast-only for these functions (decimal.md §8). (`pow(numeric, numeric)` is a PG alias of power and matches jed, so it needs no override.)"
+reason = "jed: power's numeric overload promotes only a MIXED integer/decimal pair (arg_resolution = promote, functions.md §9.2); two integers match no row, so 42883. PostgreSQL casts int -> double precision and returns 1024. Explicit-cast-only for an all-integer call (decimal.md §8). (`pow(numeric, numeric)` is a PG alias of power and matches jed, so it needs no override.)"
+
+# --- a float VALUE never meets an integer value in a promoting function (functions.md §9.2): only a
+# numeric LITERAL adapts to a float argument, exactly as for the arithmetic operators (float.md §6).
+# PostgreSQL casts the integer to double precision implicitly.
+[[override]]
+file = "expr/mixed_numeric_args.test"
+sql = "SELECT power(f, i) FROM mn WHERE id = 1"
+reason = "jed: float is a strict island (float.md §6) — an i32 column does not implicitly become f64, so no power overload matches (42883); only an integer/decimal literal adapts to the float argument. PostgreSQL casts int -> double precision and returns 8."
+
+[[override]]
+file = "expr/mixed_numeric_args.test"
+sql = "SELECT width_bucket(f, i, 10, 5) FROM mn WHERE id = 1"
+reason = "jed: float is a strict island (float.md §6) — an i32 column bound does not implicitly become f64 beside an f64 operand, so no width_bucket form matches (42883); only literal bounds adapt. PostgreSQL casts int -> double precision and returns 2."
 
 # --- the `%` (modulo) operator over floats is a jed extension (IEEE fmod, float.md §4).
 # PostgreSQL ships no `%` operator for double precision / real (only mod() over numeric/int), so

@@ -338,7 +338,8 @@ pub(crate) fn resolve_func_call(
     }
     // `width_bucket(op, low, high, count)` — resolver-routed so the three value operands reconcile
     // across the integer/decimal families PG's implicit casts span (all-integer or mixed
-    // integer/decimal → numeric; all-float → float). count must be integer. result int4.
+    // integer/decimal → numeric; all-float → float, a numeric literal adapting to a float operand).
+    // count must be integer. result int4.
     if lname == "width_bucket" && args.len() == 4 {
         reject_named(&lname, arg_names)?;
         if star {
@@ -359,8 +360,20 @@ pub(crate) fn resolve_func_call(
             return Err(no_func_overload("width_bucket"));
         }
         // The value trio is EITHER all float (+NULL) → the float kernel, OR all integer/decimal
-        // (+NULL) → the numeric kernel; a float mixed with a decimal/integer is 42883.
+        // (+NULL) → the numeric kernel; a float mixed with a decimal/integer VALUE is 42883, while a
+        // numeric literal beside a float operand adapts to f64 (functions.md §9.2).
         let any_float = tys[..3].iter().any(|t| matches!(t, ResolvedType::Float(_)));
+        if any_float {
+            for i in 0..3 {
+                if matches!(tys[i], ResolvedType::Int(_) | ResolvedType::Decimal)
+                    && is_numeric_literal(&args[i])
+                {
+                    let (r, t) = float_literal(scope, &args[i], agg, params)?;
+                    rargs[i] = r;
+                    tys[i] = t;
+                }
+            }
+        }
         let ok = |t: &ResolvedType| {
             if any_float {
                 matches!(t, ResolvedType::Float(_) | ResolvedType::Null)
@@ -951,6 +964,13 @@ pub(crate) fn resolve_scalar_func(
             resolved_type_of(result),
         ));
     }
+    // A promoting two-argument function reconciles a mixed numeric pair as the arithmetic operators
+    // do (functions.md §9.2): power(2.0, 3) selects the decimal overload, pow(x_f64, 3) the float one.
+    if let Some(ptys) = promote_scalar_pair(scope, name, args, &mut rargs, &tys, agg, params)?
+        && let Some(desc) = lookup_scalar_overload(name, &ptys)
+    {
+        return adopt_scalar_overload(scope, name, args, desc, rargs, ptys, None, agg, params);
+    }
     // No overload takes the bare string literals as text, so retry with them unknown-typed, as
     // PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
     if let Some(literals) = bare_string_literals(args)
@@ -969,6 +989,72 @@ pub(crate) fn resolve_scalar_func(
         );
     }
     Err(no_func_overload(name))
+}
+
+/// Whether `name` has a two-argument catalog row with `arg_resolution = "promote"` — the rows whose
+/// mixed numeric pairs reconcile (functions.md §9.2).
+fn scalar_pair_promotes(name: &str) -> bool {
+    OPERATORS.iter().any(|o| {
+        o.kind == "function"
+            && o.name == name
+            && o.arg_families.len() == 2
+            && o.arg_resolution == "promote"
+    })
+}
+
+/// Whether `e` is a bare integer or decimal literal (a negative one included: the parser folds the
+/// sign into the literal).
+fn is_numeric_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(Literal::Int(_) | Literal::Decimal(_), _))
+}
+
+/// Re-resolve a numeric literal argument that faces a float argument as f64 — the type of every
+/// float overload's arguments (functions.md §9.2; PostgreSQL reads the constant as float8).
+fn float_literal(
+    scope: &Scope,
+    e: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    resolve(scope, e, Some(ScalarType::Float64), agg, params)
+}
+
+/// Reconcile the two resolved arguments of a promoting function (functions.md §9.2) the way the
+/// arithmetic operators reconcile their operands: an integer facing a decimal reads as decimal
+/// (compare.toml's promote-to-decimal — the kernel converts the value), and an integer or decimal
+/// LITERAL facing a float is re-resolved as f64 (float.md §4/§6; a value never becomes a float).
+/// `None` when the pair needs no reconciliation or has none. A re-resolved literal replaces its
+/// entry in `rargs`; the result is the reconciled pair of types.
+fn promote_scalar_pair(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    rargs: &mut [RExpr],
+    tys: &[ResolvedType],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<Option<Vec<ResolvedType>>> {
+    if tys.len() != 2 || !scalar_pair_promotes(name) {
+        return Ok(None);
+    }
+    let exact = |t: &ResolvedType| matches!(t, ResolvedType::Int(_) | ResolvedType::Decimal);
+    let float = |t: &ResolvedType| matches!(t, ResolvedType::Float(_));
+    let (l, r) = (&tys[0], &tys[1]);
+    if exact(l) && exact(r) && std::mem::discriminant(l) != std::mem::discriminant(r) {
+        return Ok(Some(vec![ResolvedType::Decimal, ResolvedType::Decimal]));
+    }
+    if float(l) != float(r) {
+        let other = if float(l) { 1 } else { 0 };
+        if !exact(&tys[other]) || !is_numeric_literal(&args[other]) {
+            return Ok(None);
+        }
+        let (re, t) = float_literal(scope, &args[other], agg, params)?;
+        rargs[other] = re;
+        let mut out = tys.to_vec();
+        out[other] = t;
+        return Ok(Some(out));
+    }
+    Ok(None)
 }
 
 /// Which arguments are bare string literals (`'…'`, not a typed literal or a cast), or `None` when

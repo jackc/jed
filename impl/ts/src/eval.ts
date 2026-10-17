@@ -2181,8 +2181,11 @@ function evalScalarFuncNode(e: Of<"scalarFunc">, row: Row, env: EvalEnv, m: Mete
     // EXACT-numeric transcendentals over decimal (decimal.md §8). Float operands returned
     // above; here the operand is decimal — a PG-faithful arbitrary-precision kernel,
     // byte-identical across cores. Domain errors: sqrt of a negative and the power domain
-    // errors → 2201F; ln/log of a non-positive → 2201E; exp/power overflow → 22003.
-    const a = (v0 as { dec: Decimal }).dec;
+    // errors → 2201F; ln/log of a non-positive → 2201E; exp/power overflow → 22003. A promoted
+    // integer argument of log/power converts to decimal (functions.md §9.2).
+    const toDec = (v: Value): Decimal =>
+      v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+    const a = toDec(v0);
     switch (e.func) {
       case "sqrt":
         return decimalValue(a.decSqrt(m));
@@ -2193,12 +2196,12 @@ function evalScalarFuncNode(e: Of<"scalarFunc">, row: Row, env: EvalEnv, m: Mete
       case "log10":
         return decimalValue(a.decLog10(m));
       case "log": {
-        const num = vals.length > 1 ? (vals[1] as { dec: Decimal }).dec : null;
+        const num = vals.length > 1 ? toDec(vals[1]!) : null;
         return decimalValue(num ? Decimal.decLog(a, num, m) : a.decLog10(m));
       }
       default: {
         // pow (the catalog `power(decimal,decimal)`, renamed to "pow" at resolve)
-        const exp = (vals[1] as { dec: Decimal }).dec;
+        const exp = toDec(vals[1]!);
         return decimalValue(Decimal.decPower(a, exp, m));
       }
     }
