@@ -164,10 +164,12 @@ const (
 	pairRegrSxy
 	pairRegrSlope
 	pairRegrIntercept
+	pairRegrR2
 )
 
 // pairSurfaces maps each two-argument statistical aggregate to its exact and float plans.
 var pairSurfaces = map[string][2]aggPlan{
+	"regr_r2":        {planRegrR2, planRegrR2Float},
 	"regr_intercept": {planRegrIntercept, planRegrInterceptFloat},
 	"regr_slope":     {planRegrSlope, planRegrSlopeFloat},
 	"regr_sxy":       {planRegrSxy, planRegrSxyFloat},
@@ -182,6 +184,7 @@ var pairSurfaces = map[string][2]aggPlan{
 
 // pairStats gives each two-argument plan its statistic.
 var pairStats = map[aggPlan]pairStat{
+	planRegrR2: pairRegrR2, planRegrR2Float: pairRegrR2,
 	planRegrIntercept: pairRegrIntercept, planRegrInterceptFloat: pairRegrIntercept,
 	planRegrSlope: pairRegrSlope, planRegrSlopeFloat: pairRegrSlope,
 	planRegrSxy: pairRegrSxy, planRegrSxyFloat: pairRegrSxy,
@@ -277,6 +280,16 @@ func (s *pairsExact) finalize(stat pairStat) (Value, error) {
 			return NullValue(), nil
 		}
 		r, err = s.sy.mulExact(s.sxx).sub(s.sx.mulExact(s.sxy)).Div(numX)
+	case pairRegrR2:
+		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
+		numY := n.mulExact(s.syy).sub(s.sy.mulExact(s.sy))
+		if numX.IsZero() {
+			return NullValue(), nil
+		}
+		if numY.IsZero() {
+			return DecimalValue(decimalFromInt64(1)), nil
+		}
+		r, err = numXY.mulExact(numXY).Div(numX.mulExact(numY))
 	default:
 		panic("unhandled pair statistic")
 	}
@@ -380,6 +393,14 @@ func (s *pairsFloat) finalize(stat pairStat) Value {
 			return NullValue()
 		}
 		return Float64Value((s.sy - float64(s.sx*s.sxy)/s.sxx) / s.n)
+	case pairRegrR2:
+		if s.sxx == 0 {
+			return NullValue()
+		}
+		if s.syy == 0 {
+			return Float64Value(1)
+		}
+		return Float64Value(float64(s.sxy*s.sxy) / float64(s.sxx*s.syy))
 	default:
 		panic("unhandled pair statistic")
 	}

@@ -6094,6 +6094,7 @@ impl MomentStat {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PairStat {
     CovarPop,
+    RegrR2,
     RegrIntercept,
     RegrSlope,
     RegrSxy,
@@ -6110,6 +6111,7 @@ impl PairStat {
     pub(crate) fn from_surface(surface: &str) -> Option<PairStat> {
         Some(match surface {
             "covar_pop" => PairStat::CovarPop,
+            "regr_r2" => PairStat::RegrR2,
             "regr_intercept" => PairStat::RegrIntercept,
             "regr_slope" => PairStat::RegrSlope,
             "regr_sxy" => PairStat::RegrSxy,

@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // regr_r2(Y, X) — the square of the correlation coefficient (aggregates.md §23).
+    "func.regr_r2",
     // regr_intercept(Y, X) — the least-squares intercept (aggregates.md §23).
     "func.regr_intercept",
     // regr_slope(Y, X) — the least-squares slope (aggregates.md §23).
