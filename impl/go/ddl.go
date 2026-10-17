@@ -3887,14 +3887,15 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		// A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
 		ciKeys = append(ciKeys, indexKey{Col: idx})
 	}
-	// GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an inverted
-	// index) and a single column only — both deferred 0A000.
+	// GIN has no uniqueness (undefined for an inverted index — spec/design/gin.md §3, 0A000). A
+	// multi-column GIN takes up to 32 key columns (PostgreSQL's INDEX_MAX_KEYS, 54011), each with its
+	// own operator class (§4.4).
 	if kind == indexGin {
 		if ci.Unique {
 			return outcome{}, newError(FeatureNotSupported, "access method gin does not support unique indexes")
 		}
-		if len(ciKeys) != 1 {
-			return outcome{}, newError(FeatureNotSupported, "a multi-column gin index is not supported yet")
+		if len(ciKeys) > ginMaxKeyColumns {
+			return outcome{}, newError(TooManyColumns, fmt.Sprintf("cannot use more than %d columns in an index", ginMaxKeyColumns))
 		}
 	}
 	// GiST narrowings (gist.md §1/§5/§11): no uniqueness (express it as EXCLUDE … WITH =, GX3) and a

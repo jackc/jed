@@ -194,6 +194,8 @@ pub enum SqlState {
     ProgramLimitExceeded,
     /// 54001 — statement too complex: nesting depth exceeds the maximum of {max}
     StatementTooComplex,
+    /// 54011 — cannot use more than {max} columns in an index
+    TooManyColumns,
     /// 54P01 — query exceeded the cost limit of {limit} (accrued {cost})
     CostLimitExceeded,
     /// 54P02 — session exceeded the lifetime cost limit of {limit} (accrued {cost})
@@ -323,6 +325,7 @@ impl SqlState {
             SqlState::TooManyConnections => "53300",
             SqlState::ProgramLimitExceeded => "54000",
             SqlState::StatementTooComplex => "54001",
+            SqlState::TooManyColumns => "54011",
             SqlState::CostLimitExceeded => "54P01",
             SqlState::SessionCostLimitExceeded => "54P02",
             SqlState::TempStorageLimitExceeded => "54P03",
@@ -438,6 +441,7 @@ impl SqlState {
             "53300" => Some(SqlState::TooManyConnections),
             "54000" => Some(SqlState::ProgramLimitExceeded),
             "54001" => Some(SqlState::StatementTooComplex),
+            "54011" => Some(SqlState::TooManyColumns),
             "54P01" => Some(SqlState::CostLimitExceeded),
             "54P02" => Some(SqlState::SessionCostLimitExceeded),
             "54P03" => Some(SqlState::TempStorageLimitExceeded),
@@ -562,6 +566,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "53300", name: "too_many_connections", class: "insufficient resources" },
     ErrorDesc { code: "54000", name: "program_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "54001", name: "statement_too_complex", class: "program limit exceeded" },
+    ErrorDesc { code: "54011", name: "too_many_columns", class: "program limit exceeded" },
     ErrorDesc { code: "54P01", name: "cost_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "54P02", name: "session_cost_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "54P03", name: "temp_storage_limit_exceeded", class: "program limit exceeded" },

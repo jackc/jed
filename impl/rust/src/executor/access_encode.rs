@@ -131,6 +131,10 @@ pub(crate) struct GinBound {
     /// source order. Empty for the ordinary single-conjunct bound; non-empty, `strategy` is the
     /// first arm's.
     pub(crate) or_arms: Vec<GinStrategy>,
+    /// The column tag of a multi-column GIN index (gin.md §4.4): the key position of the bound's
+    /// column, prefixed to every query term. `None` for a single-column index, whose entries carry
+    /// no tag.
+    pub(crate) tag: Option<u8>,
 }
 
 impl GinBound {
@@ -2384,10 +2388,29 @@ fn gin_candidate_term_estimate(
         e.rows = e.rows.min(current.nonnull_rows);
         e
     };
+    // A multi-column index's entries span every key column (gin.md §4.4): its total is the sum of
+    // each column's term occurrences (a column without term facts contributes none).
+    let total_entries = if bound.tag.is_some() {
+        rel.table
+            .indexes
+            .iter()
+            .find(|idx| idx.name == bound.name_key)
+            .and_then(IndexDef::column_ordinals)
+            .map_or(estimate.total_entries, |cols| {
+                cols.iter().fold(0i64, |acc, &c| {
+                    crate::estimator::sat_add(
+                        acc,
+                        statistics_gin_total_entries(rel, c, catalog).unwrap_or(0),
+                    )
+                })
+            })
+    } else {
+        estimate.total_entries
+    };
     let index = catalog.index_store_scoped(rel.db.as_deref(), &bound.name_key);
     let (nodes, height) = (index.node_count() as i64, index.height() as i64);
     let pages = estimator_clamp_pages(
-        statistics_scale(nodes, estimate.entries, estimate.total_entries.max(1)),
+        statistics_scale(nodes, estimate.entries, total_entries.max(1)),
         nodes,
         height,
     );
@@ -3675,29 +3698,35 @@ pub(crate) fn inventory_inl_candidates<'a>(
         if idx.kind != IndexKind::Gin {
             continue;
         }
-        let ci = idx.first_column();
-        let col_global = rel.offset + ci;
-        let Some(opclass) = GinOpclass::for_type(&rel.table.columns[ci].ty) else {
+        let Some(cols) = idx.column_ordinals() else {
             continue;
         };
-        for filter in &filters {
-            if let Some((strategy, _)) =
-                gin_sibling_match(filter, col_global, opclass, sibling_columns)
-            {
-                let name_key = idx.name.to_string();
-                candidates.push(storage_order_candidate(
-                    ScanCandidateKind::Gin,
-                    name_key.clone(),
-                    Some(ScanBound::Gin(GinBound {
-                        name_key,
-                        opclass,
-                        strategy,
-                        col_global,
-                        or_arms: Vec::new(),
-                    })),
-                    where_filter,
-                ));
-                break;
+        // Each key column in key order; the first with a sibling-operand conjunct is the bound.
+        'columns: for (pos, &ci) in cols.iter().enumerate() {
+            let col_global = rel.offset + ci;
+            let Some(opclass) = GinOpclass::for_type(&rel.table.columns[ci].ty) else {
+                continue;
+            };
+            for filter in &filters {
+                if let Some((strategy, _)) =
+                    gin_sibling_match(filter, col_global, opclass, sibling_columns)
+                {
+                    let name_key = idx.name.to_string();
+                    candidates.push(storage_order_candidate(
+                        ScanCandidateKind::Gin,
+                        name_key.clone(),
+                        Some(ScanBound::Gin(GinBound {
+                            name_key,
+                            opclass,
+                            strategy,
+                            col_global,
+                            or_arms: Vec::new(),
+                            tag: gin_column_tag(cols.len(), pos),
+                        })),
+                        where_filter,
+                    ));
+                    break 'columns;
+                }
             }
         }
     }
@@ -3965,32 +3994,74 @@ pub(crate) fn build_gin_bound_for_index(
     if idx.kind != IndexKind::Gin {
         return None;
     }
-    let ci = idx.first_column();
-    let col_global = offset + ci;
-    let opclass = GinOpclass::for_type(&columns[ci].ty)?;
-    if let Some((strategy, _)) = gin_match(filter, col_global, opclass) {
-        return Some(GinBound {
-            name_key: idx.name.to_string(),
-            opclass,
-            strategy,
-            col_global,
-            or_arms: Vec::new(),
-        });
+    let cols = idx.column_ordinals()?;
+    // A multi-column index serves a query on any of its columns (gin.md §4.4): the first key column,
+    // in key order, with a single accelerable conjunct is the bound; failing that, the first with a
+    // disjunctive one (§6.3).
+    let keyed: Vec<(Option<u8>, usize, GinOpclass)> = cols
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, &ci)| {
+            let opclass = GinOpclass::for_type(&columns[ci].ty)?;
+            Some((gin_column_tag(cols.len(), pos), offset + ci, opclass))
+        })
+        .collect();
+    for &(tag, col_global, opclass) in &keyed {
+        if let Some((strategy, _)) = gin_match(filter, col_global, opclass) {
+            return Some(GinBound {
+                name_key: idx.name.to_string(),
+                opclass,
+                strategy,
+                col_global,
+                or_arms: Vec::new(),
+                tag,
+            });
+        }
     }
     // No single accelerable conjunct: an `OR` conjunct whose every arm is one (an `IN` list over the
     // column) bounds the scan by the union of the arms' gathers (gin.md §6.3).
-    let or = gin_or_match(filter, col_global, opclass)?;
-    let or_arms: Vec<GinStrategy> = gin_or_arms(or)
-        .into_iter()
-        .map(|arm| gin_match(arm, col_global, opclass).map(|(s, _)| s))
-        .collect::<Option<_>>()?;
-    Some(GinBound {
-        name_key: idx.name.to_string(),
-        opclass,
-        strategy: or_arms[0],
-        col_global,
-        or_arms,
-    })
+    for &(tag, col_global, opclass) in &keyed {
+        let Some(or) = gin_or_match(filter, col_global, opclass) else {
+            continue;
+        };
+        let or_arms: Vec<GinStrategy> = gin_or_arms(or)
+            .into_iter()
+            .map(|arm| gin_match(arm, col_global, opclass).map(|(s, _)| s))
+            .collect::<Option<_>>()?;
+        return Some(GinBound {
+            name_key: idx.name.to_string(),
+            opclass,
+            strategy: or_arms[0],
+            col_global,
+            or_arms,
+            tag,
+        });
+    }
+    None
+}
+
+/// The most key columns a GIN index takes (gin.md §4.4) — PostgreSQL's `INDEX_MAX_KEYS`; each
+/// entry's column tag is one byte.
+pub(crate) const GIN_MAX_KEY_COLUMNS: usize = 32;
+
+/// The column tag a GIN index over `key_count` columns prefixes to the terms of its key position
+/// `pos` (gin.md §4.4): none for a single-column index (its entries are bare terms), else the
+/// position as one byte — PostgreSQL's per-entry attribute number, 0-based.
+pub(crate) fn gin_column_tag(key_count: usize, pos: usize) -> Option<u8> {
+    (key_count > 1).then(|| u8::try_from(pos).expect("a GIN index has at most 32 key columns"))
+}
+
+/// `term` under a multi-column index's column `tag` (gin.md §4.4): `tag ‖ term`, or the bare term.
+pub(crate) fn gin_tagged_term(tag: Option<u8>, term: Vec<u8>) -> Vec<u8> {
+    match tag {
+        None => term,
+        Some(tag) => {
+            let mut tagged = Vec::with_capacity(term.len() + 1);
+            tagged.push(tag);
+            tagged.extend_from_slice(&term);
+            tagged
+        }
+    }
 }
 
 /// The disjunctive GIN conjunct (gin.md §6.3): the first conjunct of the `WHERE` AND-chain that is an
@@ -4898,14 +4969,23 @@ pub(crate) fn gin_entries(
     storage_key: &[u8],
     row: &Row,
 ) -> Result<Vec<Vec<u8>>> {
-    let ci = cols[0];
-    // A large value spills like any variable-width value, so a stored row's array/document may be
-    // deferred; it must be resolved — skipping it would silently drop (or fail to remove) its
-    // posting entries.
-    let opclass = GinOpclass::for_type(&columns[ci].ty)
-        .expect("a GIN index column has an operator class (CREATE INDEX / ALTER gate)");
-    let terms = gin_value_terms(opclass, &*resident(&row[ci])?);
-    Ok(gin_entry_keys(terms, storage_key))
+    let mut entries = Vec::new();
+    for (pos, &ci) in cols.iter().enumerate() {
+        // A large value spills like any variable-width value, so a stored row's array/document may
+        // be deferred; it must be resolved — skipping it would silently drop (or fail to remove) its
+        // posting entries.
+        let opclass = GinOpclass::for_type(&columns[ci].ty)
+            .expect("a GIN index column has an operator class (CREATE INDEX / ALTER gate)");
+        let tag = gin_column_tag(cols.len(), pos);
+        let terms = gin_value_terms(opclass, &*resident(&row[ci])?)
+            .into_iter()
+            .map(|term| gin_tagged_term(tag, term))
+            .collect();
+        entries.extend(gin_entry_keys(terms, storage_key));
+    }
+    // A multi-column index's entries ascend by tag, then term; a duplicate key column yields the
+    // same terms under two tags, so the per-row set stays distinct.
+    Ok(entries)
 }
 
 /// One value's GIN term set (gin.md §4): its distinct terms in ascending byte order — an array's

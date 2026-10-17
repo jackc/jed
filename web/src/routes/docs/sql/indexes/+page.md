@@ -433,10 +433,13 @@ GIN this release covers a focused surface (it grows from here):
 
 - **A `jsonb` column** — the `jsonb_ops` operator class above, for `@>`, `<@`, `?`, `?|`, and `?&`.
 
-- **Or one column, an array** of the integers (`i16[]`, `i32[]`, `i64[]`), `text[]`, `bytea[]`,
+- **An array** of the integers (`i16[]`, `i32[]`, `i64[]`), `text[]`, `bytea[]`,
   `numeric[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`, `interval[]`, or
   the binary floats (`f32[]`, `f64[]`). A GIN term *is* the element's key encoding. Arrays of
-  composite or `jsonb` elements are rejected (`0A000`) for now, as is a multi-column GIN.
+  composite or `jsonb` elements are rejected (`0A000`) for now.
+- **Several columns in one index** — `CREATE INDEX … USING gin (tags, body)` indexes every listed
+  column (up to 32, arrays and `jsonb` mixed), and a query on any one of them uses it. When a query
+  constrains two of its columns, one bounds the scan and the other filters the fetched rows.
 - **Text elements match byte for byte** — `'Red' = ANY(tags)` does not find `{red}`, under any
   collation, as with text `=`. A `text[]` column with a `COLLATE` clause indexes the same way. An
   element longer than 128 bytes is indexed by its first 128 bytes, so very long elements that share

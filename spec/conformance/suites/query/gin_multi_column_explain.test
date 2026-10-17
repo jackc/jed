@@ -1,0 +1,120 @@
+# Multi-column GIN — the selected plan (jed-only: EXPLAIN is jed's own rendering, never
+# oracle-imported). Pins that a query on any key column of a multi-column GIN index takes the GIN
+# bound (spec/design/gin.md §4.4), that an OR across two of its columns does not, that a sibling
+# index-nested-loop bound reaches a later key column, and the estimates before and after ANALYZE
+# (whose page estimate scales against both columns' term occurrences). The rows are oracle-checked in
+# query/gin_multi_column.test. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, ddl.gin_multi_column, query.gin_scan, query.gin_any_eq, query.gin_jsonb_ops, query.gin_disjunction, query.gin_index_nested_loop, query.index_nested_loop, query.join_inner, query.qualified_column, query.logical_connectives, query.explain, dml.insert, dml.insert_select, query.select, query.set_returning, types.i32, types.text, types.array, types.jsonb, func.array_containment, func.array_quantified, func.jsonb_contains, func.json_builders, cast.operator, expr.arithmetic, expr.text_concat, maintenance.analyze, maintenance.analyze_gin_terms
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], doc jsonb)
+
+statement ok
+CREATE INDEX t_multi ON t USING gin (tags, doc)
+
+statement ok
+INSERT INTO t SELECT g::i32, ARRAY[g % 10, g % 7]::i32[], jsonb_build_object('k', g % 9, 'g' || (g % 5), true) FROM generate_series(1, 200) AS g
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE tags @> ARRAY[3]
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+GIN bound: using t_multi; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE doc ? 'g2'
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+GIN bound: using t_multi; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE doc ? 'g2' OR doc @> '{"k": 1}'
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+GIN bound: using t_multi; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE tags @> ARRAY[3] OR doc ? 'g2'
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+Full scan; touched=3
+
+statement ok
+CREATE TABLE q (id i32 PRIMARY KEY, key text)
+
+statement ok
+INSERT INTO q VALUES (1, 'g1'), (2, 'g4')
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT q.id, t.id FROM q JOIN t ON t.doc ? q.key
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+Scan q
+Full scan; touched=2
+1
+Scan t
+Index-nested-loop GIN bound: using t_multi; touched=2
+
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE doc ? 'g2'
+----
+0
+Filter
+conjuncts=1
+2
+14
+1
+Scan t
+GIN bound: using t_multi; touched=2
+2
+10
+
+statement ok
+ANALYZE t
+
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE doc ? 'g2'
+----
+0
+Filter
+conjuncts=1
+40
+242
+1
+Scan t
+GIN bound: using t_multi; touched=2
+40
+162
+
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE 3 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+46
+278
+1
+Scan t
+GIN bound: using t_multi; touched=2
+46
+186

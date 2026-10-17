@@ -435,6 +435,10 @@ type ginBoundPlan struct {
 	// column, in source order. Empty for the ordinary single-conjunct bound; non-empty, strategy is
 	// the first arm's.
 	orArms []ginStrategy
+	// tag/tagged is a multi-column GIN index's column tag for the bound's column (gin.md §4.4),
+	// prefixed to every query term; untagged for a single-column index.
+	tag    byte
+	tagged bool
 }
 
 // indexEqCol is one column of an index access predicate's equality prefix (indexes.md §5.1):
@@ -1557,18 +1561,23 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		if idx.Kind != indexGin {
 			continue
 		}
-		ci := idx.firstColumn()
-		colGlobal := rel.offset + ci
-		at := rel.table.Columns[ci].Type
-		jsonb := at.IsJsonb()
-		if at.Array == nil && !jsonb {
-			continue
-		}
-		for _, filter := range filters {
-			if s, _, ok := ginSiblingMatch(filter, colGlobal, jsonb, siblingColumns); ok {
-				bound := &scanBound{gin: newGinBoundPlan(idx.Name, at, s, colGlobal)}
-				candidates = append(candidates, storageOrderCandidate(scanCandidateGin, bound.gin.nameKey, bound, whereFilter))
-				break
+		cols := idx.columnOrdinals()
+		// Each key column in key order; the first with a sibling-operand conjunct is the bound.
+	columns:
+		for pos, ci := range cols {
+			colGlobal := rel.offset + ci
+			at := rel.table.Columns[ci].Type
+			jsonb := at.IsJsonb()
+			if at.Array == nil && !jsonb {
+				continue
+			}
+			for _, filter := range filters {
+				if s, _, ok := ginSiblingMatch(filter, colGlobal, jsonb, siblingColumns); ok {
+					bound := &scanBound{gin: newGinBoundPlan(idx.Name, at, s, colGlobal)}
+					bound.gin.tag, bound.gin.tagged = ginColumnTag(len(cols), pos)
+					candidates = append(candidates, storageOrderCandidate(scanCandidateGin, bound.gin.nameKey, bound, whereFilter))
+					break columns
+				}
 			}
 		}
 	}
@@ -1657,30 +1666,46 @@ func buildGinBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, off
 	if filter == nil || idx.Kind != indexGin {
 		return nil
 	}
-	ci := idx.firstColumn()
-	colGlobal := offset + ci
-	at := columns[ci].Type
-	jsonb := at.IsJsonb()
-	if at.Array == nil && !jsonb {
-		return nil // a GIN column is always an array or jsonb (the CREATE INDEX gate); defensive
-	}
-	if s, _, ok := ginMatch(filter, colGlobal, jsonb); ok {
-		return newGinBoundPlan(idx.Name, at, s, colGlobal)
+	cols := idx.columnOrdinals()
+	// A multi-column index serves a query on any of its columns (gin.md §4.4): the first key column,
+	// in key order, with a single accelerable conjunct is the bound; failing that, the first with a
+	// disjunctive one (§6.3).
+	for pos, ci := range cols {
+		at := columns[ci].Type
+		jsonb := at.IsJsonb()
+		if at.Array == nil && !jsonb {
+			continue // a GIN column is always an array or jsonb (the CREATE INDEX gate); defensive
+		}
+		if s, _, ok := ginMatch(filter, offset+ci, jsonb); ok {
+			gb := newGinBoundPlan(idx.Name, at, s, offset+ci)
+			gb.tag, gb.tagged = ginColumnTag(len(cols), pos)
+			return gb
+		}
 	}
 	// No single accelerable conjunct: an OR conjunct whose every arm is one (an IN list over the
 	// column) bounds the scan by the union of the arms' gathers (gin.md §6.3).
-	or := ginOrMatch(filter, colGlobal, jsonb)
-	if or == nil {
-		return nil
+	for pos, ci := range cols {
+		at := columns[ci].Type
+		jsonb := at.IsJsonb()
+		if at.Array == nil && !jsonb {
+			continue
+		}
+		colGlobal := offset + ci
+		or := ginOrMatch(filter, colGlobal, jsonb)
+		if or == nil {
+			continue
+		}
+		var arms []ginStrategy
+		for _, arm := range ginOrArms(or) {
+			s, _, _ := ginMatch(arm, colGlobal, jsonb)
+			arms = append(arms, s)
+		}
+		gb := newGinBoundPlan(idx.Name, at, arms[0], colGlobal)
+		gb.orArms = arms
+		gb.tag, gb.tagged = ginColumnTag(len(cols), pos)
+		return gb
 	}
-	var arms []ginStrategy
-	for _, arm := range ginOrArms(or) {
-		s, _, _ := ginMatch(arm, colGlobal, jsonb)
-		arms = append(arms, s)
-	}
-	gb := newGinBoundPlan(idx.Name, at, arms[0], colGlobal)
-	gb.orArms = arms
-	return gb
+	return nil
 }
 
 // ginOrMatch finds the disjunctive GIN conjunct (gin.md §6.3): the first conjunct of the WHERE
@@ -2693,6 +2718,11 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 			// the residual filter keep the right ones (gin.md §6 / §2.1). One such arm makes the
 			// whole disjunction fall back.
 			return store.ScanWithUnits(mask)
+		}
+		if gb.tagged {
+			for i, t := range q.terms {
+				q.terms[i] = ginTaggedTerm(gb.tag, t)
+			}
 		}
 		queries = append(queries, ginArmTerms{strategy: arm.strategy, terms: q.terms})
 	}

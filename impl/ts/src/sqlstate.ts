@@ -101,6 +101,7 @@ export type SqlState =
   | "too_many_connections" // 53300 — {detail}
   | "program_limit_exceeded" // 54000 — SQL statement exceeds the maximum length of {max} bytes
   | "statement_too_complex" // 54001 — statement too complex: nesting depth exceeds the maximum of {max}
+  | "too_many_columns" // 54011 — cannot use more than {max} columns in an index
   | "cost_limit_exceeded" // 54P01 — query exceeded the cost limit of {limit} (accrued {cost})
   | "session_cost_limit_exceeded" // 54P02 — session exceeded the lifetime cost limit of {limit} (accrued {cost})
   | "temp_storage_limit_exceeded" // 54P03 — temporary table storage exceeded the limit of {limit} bytes
@@ -210,6 +211,7 @@ const CODES: Record<SqlState, string> = {
   too_many_connections: "53300",
   program_limit_exceeded: "54000",
   statement_too_complex: "54001",
+  too_many_columns: "54011",
   cost_limit_exceeded: "54P01",
   session_cost_limit_exceeded: "54P02",
   temp_storage_limit_exceeded: "54P03",
@@ -335,6 +337,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "53300", name: "too_many_connections", class: "insufficient resources" },
   { code: "54000", name: "program_limit_exceeded", class: "program limit exceeded" },
   { code: "54001", name: "statement_too_complex", class: "program limit exceeded" },
+  { code: "54011", name: "too_many_columns", class: "program limit exceeded" },
   { code: "54P01", name: "cost_limit_exceeded", class: "program limit exceeded" },
   { code: "54P02", name: "session_cost_limit_exceeded", class: "program limit exceeded" },
   { code: "54P03", name: "temp_storage_limit_exceeded", class: "program limit exceeded" },

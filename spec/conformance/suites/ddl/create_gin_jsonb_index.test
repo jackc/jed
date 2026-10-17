@@ -31,8 +31,3 @@ CREATE INDEX i ON t USING gin (raw)
 
 statement error 0A000
 CREATE UNIQUE INDEX i ON t USING gin (doc)
-
-# --- jed narrowing: PG builds a multicolumn GIN (oracle override — gin.md §10); kept LAST ----
-
-statement error 0A000
-CREATE INDEX i ON t USING gin (doc, tags)

@@ -504,6 +504,17 @@ func ginDecimalByteaTableDB(t *testing.T) *Session {
 	return db
 }
 
+// ginMultiTableDB is the v43 multi-column GIN golden (gin.md §4.4): every entry is column_tag ‖ term
+// ‖ storage key over an i32[] and a jsonb column; NULL and empty values contribute nothing. Mirrors
+// verify.rb's GIN_MULTI_TABLE.
+func ginMultiTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], doc jsonb)")
+	run(t, db, `INSERT INTO t VALUES (1, '{1,2}', '{"a": 1}'), (2, '{2,2}', NULL), (3, NULL, '["x"]'), (4, '{}', '{}')`)
+	run(t, db, "CREATE INDEX i_multi_gin ON t USING gin (nums, doc)")
+	return db
+}
+
 // ginJsonbTableDB is the jsonb_ops GIN golden (gin.md §2.1/§4.1): keys at two levels, an array
 // string element (a KEY term) beside a member string value, every scalar kind, 1.5/1.50 as one number
 // term, a duplicate term, a top-level string, {}, a SQL NULL, and a negative number. Must match
@@ -1207,6 +1218,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"gin_float_table.jed", ginFloatTableDB},
 		{"gin_interval_table.jed", ginIntervalTableDB},
 		{"gin_jsonb_table.jed", ginJsonbTableDB},
+		{"gin_multi_table.jed", ginMultiTableDB},
 		{"gin_text_table.jed", ginTextTableDB},
 		{"gin_decimal_bytea_table.jed", ginDecimalByteaTableDB},
 		{"fk_table.jed", fkTableDB},
@@ -1296,6 +1308,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"gin_float_table.jed", ginFloatTableDB, "t"},
 		{"gin_interval_table.jed", ginIntervalTableDB, "t"},
 		{"gin_jsonb_table.jed", ginJsonbTableDB, "t"},
+		{"gin_multi_table.jed", ginMultiTableDB, "t"},
 		{"gin_text_table.jed", ginTextTableDB, "t"},
 		{"gin_decimal_bytea_table.jed", ginDecimalByteaTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},

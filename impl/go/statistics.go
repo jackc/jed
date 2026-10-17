@@ -316,6 +316,20 @@ func (db *engine) statisticsGinEstimate(rel scopeRel, column int, opclass ginOpc
 	return &ginTermEstimate{rows: rows, entries: entries, totalEntries: totalEntries}
 }
 
+// statisticsGinTotalEntries is a term-eligible column's estimated total GIN term occurrences at its
+// current row count (statistics.md §6.1), or ok=false without term facts.
+func (db *engine) statisticsGinTotalEntries(rel scopeRel, column int) (int64, bool) {
+	fact := db.columnStatisticsScoped(rel.db, rel.table.Name, column)
+	if fact == nil || fact.Terms == nil {
+		return 0, false
+	}
+	current := db.currentColumnStatistics(rel, column)
+	if current == nil {
+		return 0, false
+	}
+	return statisticsScale(current.rows, fact.Terms.Occurrences, fact.AnalyzedRows), true
+}
+
 // statisticsGinOperandValue is a GIN query operand's plan-time value (statistics.md §6.1): a
 // literal, a folded array literal, or a one-dimensional ARRAY[...] of literals.
 func statisticsGinOperandValue(operand *rExpr) (Value, bool) {

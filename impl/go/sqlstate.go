@@ -197,6 +197,8 @@ const (
 	ProgramLimitExceeded
 	// StatementTooComplex is 54001 — statement too complex: nesting depth exceeds the maximum of {max}.
 	StatementTooComplex
+	// TooManyColumns is 54011 — cannot use more than {max} columns in an index.
+	TooManyColumns
 	// CostLimitExceeded is 54P01 — query exceeded the cost limit of {limit} (accrued {cost}).
 	CostLimitExceeded
 	// SessionCostLimitExceeded is 54P02 — session exceeded the lifetime cost limit of {limit} (accrued {cost}).
@@ -416,6 +418,8 @@ func (s SqlState) Code() string {
 		return "54000"
 	case StatementTooComplex:
 		return "54001"
+	case TooManyColumns:
+		return "54011"
 	case CostLimitExceeded:
 		return "54P01"
 	case SessionCostLimitExceeded:
@@ -555,6 +559,7 @@ var errorDescs = []errorDesc{
 	{Code: "53300", Name: "too_many_connections", Class: "insufficient resources"},
 	{Code: "54000", Name: "program_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "54001", Name: "statement_too_complex", Class: "program limit exceeded"},
+	{Code: "54011", Name: "too_many_columns", Class: "program limit exceeded"},
 	{Code: "54P01", Name: "cost_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "54P02", Name: "session_cost_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "54P03", Name: "temp_storage_limit_exceeded", Class: "program limit exceeded"},
