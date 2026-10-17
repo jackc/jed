@@ -32256,6 +32256,8 @@ export type AggPlan =
   | "stddevSampFloat"
   | "stddevPop"
   | "stddevPopFloat"
+  // regr_count(Y, X) — the number of pairs whose arguments are both non-NULL (aggregates.md §23).
+  | "regrCount"
   // The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
   | "covarPop"
   | "covarPopFloat"
@@ -33009,6 +33011,9 @@ export function cloneAcc(a: Acc): Acc {
 // like a collated sort (spec/design/collation.md §11).
 export function foldAcc(a: Acc, v: Value, m: Meter): void {
   switch (a.plan) {
+    case "regrCount":
+      if (pairArgs(v) !== null) a.count += 1n;
+      break;
     case "covarPop":
     case "corr":
     case "covarSamp":
@@ -33271,6 +33276,7 @@ export function finalizeAcc(a: Acc): Value {
       return finalizeMoment(a);
     case "countStar":
     case "count":
+    case "regrCount":
       return intValue(a.count);
     case "sumInt":
       return a.seen ? intValue(a.sumInt) : nullValue();
@@ -36128,6 +36134,7 @@ export function aggregatePlan(
   if (surface === "bit_or" && code === "same_as_input") return ["bitOr", t, undefined];
   if (surface === "bit_xor" && code === "same_as_input") return ["bitXor", t, undefined];
   // An array input stacks into one more dimension of the same (dimension-agnostic) array type.
+  if (surface === "regr_count") return ["regrCount", { kind: "int", ty: "i64" }, undefined];
   // The statistical aggregates: exact over integer/decimal (a decimal result), float over float.
   const pair = PAIR_SURFACES[surface];
   if (pair !== undefined)
@@ -37799,6 +37806,7 @@ function packedStateBytes(accs: Acc[]): number {
     switch (a.plan) {
       case "countStar":
       case "count":
+      case "regrCount":
       case "jsonAgg":
       case "jsonObjectAgg":
         n += MEMORY_VALUE;

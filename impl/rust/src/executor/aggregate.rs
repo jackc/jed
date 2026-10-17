@@ -80,6 +80,7 @@ impl Acc {
         match plan {
             AggPlan::CountStar => Acc::CountStar(0),
             AggPlan::Count => Acc::Count(0),
+            AggPlan::RegrCount => Acc::RegrCount(0),
             AggPlan::SumInt => Acc::SumInt {
                 sum: 0,
                 seen: false,
@@ -339,6 +340,11 @@ impl Acc {
                 };
                 fold_float_moment(n, sx, sxx, x)?;
             }
+            Acc::RegrCount(n) => {
+                if pair_args(value).is_some() {
+                    *n += 1;
+                }
+            }
             Acc::PairsExact { n, sums, .. } => fold_exact_pair(n, sums, value, m)?,
             Acc::PairsFloat { t, .. } => fold_float_pair(t, value)?,
             Acc::StringAgg { rows, seen } => {
@@ -528,7 +534,7 @@ impl Acc {
     /// SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
     pub(crate) fn finalize(self) -> Result<Value> {
         Ok(match self {
-            Acc::CountStar(n) | Acc::Count(n) => Value::Int(n),
+            Acc::CountStar(n) | Acc::Count(n) | Acc::RegrCount(n) => Value::Int(n),
             Acc::SumInt { sum, seen } => {
                 if seen {
                     Value::Int(sum)

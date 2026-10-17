@@ -17,7 +17,7 @@ func blockingAccRow(a *acc) storedRow {
 		return storedRow{}
 	}
 	switch a.plan {
-	case planCountStar, planCount:
+	case planCountStar, planCount, planRegrCount:
 		return storedRow{IntValue(a.count)}
 	case planSumInt:
 		return storedRow{IntValue(a.sumInt), BoolValue(a.seen)}
@@ -66,7 +66,7 @@ func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
 		return a
 	}
 	switch a.plan {
-	case planCountStar, planCount:
+	case planCountStar, planCount, planRegrCount:
 		a.count = r[0].Int
 	case planSumInt:
 		a.sumInt = r[0].Int

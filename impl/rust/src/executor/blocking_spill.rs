@@ -1216,7 +1216,7 @@ fn fold_spilled_value(
 
 fn pack_acc(acc: Acc) -> Row {
     match acc {
-        Acc::CountStar(n) | Acc::Count(n) => vec![Value::Int(n)],
+        Acc::CountStar(n) | Acc::Count(n) | Acc::RegrCount(n) => vec![Value::Int(n)],
         Acc::SumInt { sum, seen } => vec![Value::Int(sum), Value::Bool(seen)],
         Acc::SumDecimal { sum, seen } => vec![Value::Decimal(sum), Value::Bool(seen)],
         Acc::Avg { sum, count } => vec![Value::Decimal(sum), Value::Int(count)],
@@ -1286,7 +1286,7 @@ fn unpack_acc(spec: &AggSpec, state: Row, zone: &crate::timezone::ZoneRef) -> Ac
         _ => unreachable!(),
     };
     match &mut acc {
-        Acc::CountStar(n) | Acc::Count(n) => *n = int(0),
+        Acc::CountStar(n) | Acc::Count(n) | Acc::RegrCount(n) => *n = int(0),
         Acc::SumInt { sum, seen } => {
             *sum = int(0);
             *seen = flag(1);

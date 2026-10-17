@@ -6160,6 +6160,8 @@ pub(crate) enum AggPlan {
         stat: MomentStat,
         float: bool,
     },
+    /// regr_count(Y, X) — the number of pairs whose arguments are both non-NULL (aggregates.md §23).
+    RegrCount,
     /// The two-argument statistical aggregates over (Y, X) (aggregates.md §23), exact or float.
     Pair {
         stat: PairStat,
@@ -6307,6 +6309,8 @@ pub(crate) struct JsonAggConv {
 pub(crate) enum Acc {
     CountStar(i64),
     Count(i64),
+    /// regr_count: the number of (Y, X) pairs with both arguments non-NULL.
+    RegrCount(i64),
     SumInt {
         sum: i64,
         seen: bool,
