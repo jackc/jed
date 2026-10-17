@@ -79,6 +79,10 @@ fn bind(stmt: &mut rusqlite::Statement<'_>, args: &[Arg]) -> rusqlite::Result<()
         match a {
             Arg::Int(n) => stmt.raw_bind_parameter(i + 1, n)?,
             Arg::Text(s) => stmt.raw_bind_parameter(i + 1, s)?,
+            // array_params() is false, so the runner skips any bench with an array parameter.
+            Arg::IntArray(_) => {
+                return Err(rusqlite::Error::InvalidParameterCount(i + 1, args.len()));
+            }
         }
     }
     Ok(())

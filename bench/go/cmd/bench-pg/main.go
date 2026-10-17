@@ -60,6 +60,9 @@ func (e *engine) StoredFingerprint() (string, error) {
 
 func (e *engine) Close() error { return e.conn.Close(context.Background()) }
 
+// ArrayParams reports that pgx binds an int_array parameter ([]int64) as a bigint[] (benchmarks.md §3).
+func (e *engine) ArrayParams() bool { return true }
+
 func (e *engine) Prepare(sql string) (bench.Stmt, error) {
 	e.n++
 	name := fmt.Sprintf("bench_%d", e.n)

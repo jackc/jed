@@ -17,7 +17,7 @@ import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WASI } from "node:wasi";
 
-import { type Arg, type Checksum, type Engine, mainWith, readSidecar } from "./lib.ts";
+import { type Arg, type Checksum, type Engine, mainWith, readSidecar, scalarArgs } from "./lib.ts";
 
 // The optimized release artifact (built by `mise run bench:build`). Compiled once; instantiated per open.
 const WASM_PATH = fileURLToPath(
@@ -100,7 +100,8 @@ class WasmJed {
   }
 
   // Encode bind args into the param buffer (u32 nparams; per arg: u8 tag; payload). INT=1, TEXT=4.
-  private params(args: Arg[]): { ptr: number; len: number } {
+  private params(all: Arg[]): { ptr: number; len: number } {
+    const args = scalarArgs(all);
     let len = 4;
     for (const a of args) len += typeof a === "bigint" ? 9 : 5 + te.encode(a).length;
     const ptr = this.ex.jed_alloc(len);

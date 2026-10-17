@@ -265,10 +265,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     - [x] _follow-on:_ an index-nested-loop sibling array column (`o.id = ANY(l.ids)`) — an inner
       PK / index interval set or tuple set with a sibling source. → [cost.md §3](spec/design/cost.md)
       "index-nested-loop"
+    - [x] _follow-on:_ a bench param generator that binds a real array (`int_array`; the
+      `any_array_pk_param` / `composite_pk_any_param` benches bind one `bigint[]`).
     - [ ] _follow-on:_ the shapes that still full-scan — a promoted `ARRAY[...]` constructor
       (`ARRAY[1::i32, 3::i32]` against an `i64` key) and promoted floats (`f32[]` against an `f64`
-      key). A bench param generator that binds a real array (`any_array_pk` and `composite_pk_any`
-      build one from eight scalars). _(size: S)_
+      key). _(size: S)_
     - [ ] _follow-on:_ an uncorrelated subquery inside a derived-table body is evaluated with the
       body (per row) instead of folded before its scan opens, so its `IN` point set widens to every
       key there. _(size: S)_

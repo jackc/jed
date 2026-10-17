@@ -115,6 +115,10 @@ pub struct Param {
     pub base: i64,
     pub off_min: i64,
     pub off_max: i64,
+    /// int_array: a one-dimensional bigint array bound as one parameter — its length drawn from
+    /// int_uniform(min_len, max_len), then each element from int_uniform(elem_min, elem_max).
+    pub elem_min: i64,
+    pub elem_max: i64,
 }
 
 pub struct Bench {
@@ -211,6 +215,8 @@ pub fn load_corpus(corpus_dir: &str) -> BoxResult<Vec<Bench>> {
                     base: int_field(pt, "base"),
                     off_min: int_field(pt, "off_min"),
                     off_max: int_field(pt, "off_max"),
+                    elem_min: int_field(pt, "elem_min"),
+                    elem_max: int_field(pt, "elem_max"),
                 });
             }
         }
@@ -326,6 +332,8 @@ pub fn stale_err(dataset: &str, engine: &str) -> Box<dyn Error> {
 pub enum Arg {
     Int(i64),
     Text(String),
+    /// An int_array parameter: a one-dimensional bigint array.
+    IntArray(Vec<i64>),
 }
 
 pub struct ParamStream {
@@ -361,6 +369,13 @@ impl ParamStream {
                     args.push(Arg::Int(base + self.prng.int_uniform(p.off_min, p.off_max)));
                 }
                 "text" => args.push(Arg::Text(self.prng.text(p.min_len, p.max_len))),
+                "int_array" => {
+                    let n = self.prng.int_uniform(p.min_len, p.max_len);
+                    let arr = (0..n)
+                        .map(|_| self.prng.int_uniform(p.elem_min, p.elem_max))
+                        .collect();
+                    args.push(Arg::IntArray(arr));
+                }
                 other => panic!("unknown param gen {other}"),
             }
         }
@@ -386,6 +401,12 @@ pub trait Engine {
     /// `bench_mix_batch`, benchmarks.md §8.2). The default `false` makes the runner SKIP a
     /// `host_functions = true` bench.
     fn host_functions(&self) -> bool {
+        false
+    }
+
+    /// Whether this driver binds an `int_array` parameter as an array (benchmarks.md §3). The
+    /// default `false` makes the runner SKIP a bench with one.
+    fn array_params(&self) -> bool {
         false
     }
 
@@ -565,6 +586,13 @@ fn run_one(
     if b.host_functions && !eng.host_functions() {
         eprintln!(
             "  skip: {}/{}/{} has no bench host functions",
+            cfg.engine, cfg.lang, cfg.variant
+        );
+        return Ok(None);
+    }
+    if b.params.iter().any(|p| p.generator == "int_array") && !eng.array_params() {
+        eprintln!(
+            "  skip: {}/{}/{} binds no array parameters",
             cfg.engine, cfg.lang, cfg.variant
         );
         return Ok(None);

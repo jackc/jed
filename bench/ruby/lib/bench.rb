@@ -212,6 +212,12 @@ module Bench
         warn "  skip: #{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]} has no concurrent_read support"
         next
       end
+      # The gem harness binds Integers and Strings only, so it skips a bench with an int_array
+      # parameter (spec/design/benchmarks.md §3).
+      if w.params.any? { |p| p.generator == "int_array" }
+        warn "  skip: #{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]} binds no array parameters"
+        next
+      end
       warn "#{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]}: #{w.name} (#{w.dataset}) ..."
       run_one(cfg, w, corpus_dir, data_dir, want).to_json_line(cfg)
     end
