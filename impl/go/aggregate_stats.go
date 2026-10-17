@@ -145,10 +145,9 @@ func (s *momentsFloat) variance(sample, stddev bool) Value {
 }
 
 // The two-argument statistical aggregates (spec/design/aggregates.md §23): covariance, correlation,
-// and the regr_* family over (Y, X) pairs whose arguments are both non-NULL. Over integer or decimal
-// input they are exact: the fold keeps N and the uncapped decimal sums Σx, Σx², Σy, Σy², and Σxy,
-// and each result is a decimal expression over them evaluated with jed's decimal operators. Over
-// float input they follow PostgreSQL's float8_regr_accum and its final functions, with an f64 result.
+// and the regr_* family over (Y, X) pairs whose arguments are both non-NULL. Like PostgreSQL, which
+// defines them only over float8, they widen integer and decimal arguments to f64 and follow
+// float8_regr_accum and its final functions, with an f64 result.
 
 // pairStat is which statistic a two-argument plan finalizes.
 type pairStat int
@@ -167,136 +166,34 @@ const (
 	pairRegrR2
 )
 
-// pairSurfaces maps each two-argument statistical aggregate to its exact and float plans.
-var pairSurfaces = map[string][2]aggPlan{
-	"regr_r2":        {planRegrR2, planRegrR2Float},
-	"regr_intercept": {planRegrIntercept, planRegrInterceptFloat},
-	"regr_slope":     {planRegrSlope, planRegrSlopeFloat},
-	"regr_sxy":       {planRegrSxy, planRegrSxyFloat},
-	"regr_syy":       {planRegrSyy, planRegrSyyFloat},
-	"regr_sxx":       {planRegrSxx, planRegrSxxFloat},
-	"regr_avgy":      {planRegrAvgy, planRegrAvgyFloat},
-	"regr_avgx":      {planRegrAvgx, planRegrAvgxFloat},
-	"corr":           {planCorr, planCorrFloat},
-	"covar_pop":      {planCovarPop, planCovarPopFloat},
-	"covar_samp":     {planCovarSamp, planCovarSampFloat},
+// pairSurfaces maps each two-argument statistical aggregate to its plan.
+var pairSurfaces = map[string]aggPlan{
+	"covar_pop":      planCovarPop,
+	"covar_samp":     planCovarSamp,
+	"corr":           planCorr,
+	"regr_avgx":      planRegrAvgx,
+	"regr_avgy":      planRegrAvgy,
+	"regr_sxx":       planRegrSxx,
+	"regr_syy":       planRegrSyy,
+	"regr_sxy":       planRegrSxy,
+	"regr_slope":     planRegrSlope,
+	"regr_intercept": planRegrIntercept,
+	"regr_r2":        planRegrR2,
 }
 
 // pairStats gives each two-argument plan its statistic.
 var pairStats = map[aggPlan]pairStat{
-	planRegrR2: pairRegrR2, planRegrR2Float: pairRegrR2,
-	planRegrIntercept: pairRegrIntercept, planRegrInterceptFloat: pairRegrIntercept,
-	planRegrSlope: pairRegrSlope, planRegrSlopeFloat: pairRegrSlope,
-	planRegrSxy: pairRegrSxy, planRegrSxyFloat: pairRegrSxy,
-	planRegrSyy: pairRegrSyy, planRegrSyyFloat: pairRegrSyy,
-	planRegrSxx: pairRegrSxx, planRegrSxxFloat: pairRegrSxx,
-	planRegrAvgy: pairRegrAvgy, planRegrAvgyFloat: pairRegrAvgy,
-	planRegrAvgx: pairRegrAvgx, planRegrAvgxFloat: pairRegrAvgx,
-	planCorr: pairCorr, planCorrFloat: pairCorr,
-	planCovarPop: pairCovarPop, planCovarPopFloat: pairCovarPop,
-	planCovarSamp: pairCovarSamp, planCovarSampFloat: pairCovarSamp,
-}
-
-// pairsExact is the exact two-argument moment state: the count of pairs and the decimal sums.
-type pairsExact struct {
-	n                     int64
-	sx, sxx, sy, syy, sxy Decimal
-}
-
-// fold adds one Row(Y, X) pair, skipping a pair with a NULL. Each fold charges decimal_work for the
-// three products and five additions, by the `*` and `+` formulas (spec/design/cost.md §3).
-func (s *pairsExact) fold(v Value, m *costMeter) error {
-	f := *v.composite()
-	if f[0].IsNull() || f[1].IsNull() {
-		return nil
-	}
-	y, x := toDecimal(f[0]), toDecimal(f[1])
-	x2, y2, xy := x.mulExact(x), y.mulExact(y), x.mulExact(y)
-	work := workMul(x, x) + workMul(y, y) + workMul(x, y) + workLinear(s.sx, x) + workLinear(s.sxx, x2) +
-		workLinear(s.sy, y) + workLinear(s.syy, y2) + workLinear(s.sxy, xy) - 8
-	m.Charge(costs.DecimalWork * work)
-	if err := m.Guard(); err != nil {
-		return err
-	}
-	s.sx, s.sxx = s.sx.AddUncapped(x), s.sxx.AddUncapped(x2)
-	s.sy, s.syy = s.sy.AddUncapped(y), s.syy.AddUncapped(y2)
-	s.sxy = s.sxy.AddUncapped(xy)
-	s.n++
-	return nil
-}
-
-// finalize evaluates the statistic over the exact sums (aggregates.md §23), with the exact numerators
-// numX = N·Σx² − Σx·Σx, numY = N·Σy² − Σy·Σy, and numXY = N·Σxy − Σx·Σy; "/" is jed's decimal
-// division (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair, and where
-// the table in aggregates.md §23 says.
-func (s *pairsExact) finalize(stat pairStat) (Value, error) {
-	if s.n == 0 {
-		return NullValue(), nil
-	}
-	n := decimalFromInt64(s.n)
-	numXY := n.mulExact(s.sxy).sub(s.sx.mulExact(s.sy))
-	var r Decimal
-	var err error
-	switch stat {
-	case pairCovarPop:
-		r, err = numXY.Div(n.mulExact(n))
-	case pairCovarSamp:
-		if s.n < 2 {
-			return NullValue(), nil
-		}
-		r, err = numXY.Div(n.mulExact(decimalFromInt64(s.n - 1)))
-	case pairCorr:
-		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
-		numY := n.mulExact(s.syy).sub(s.sy.mulExact(s.sy))
-		if numX.IsZero() || numY.IsZero() {
-			return NullValue(), nil
-		}
-		root, rerr := numX.mulExact(numY).DecSqrt()
-		if rerr != nil {
-			return NullValue(), rerr
-		}
-		r, err = numXY.Div(root)
-	case pairRegrAvgx:
-		r, err = s.sx.Div(n)
-	case pairRegrAvgy:
-		r, err = s.sy.Div(n)
-	case pairRegrSxx:
-		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
-		r, err = numX.Div(n)
-	case pairRegrSyy:
-		numY := n.mulExact(s.syy).sub(s.sy.mulExact(s.sy))
-		r, err = numY.Div(n)
-	case pairRegrSxy:
-		r, err = numXY.Div(n)
-	case pairRegrSlope:
-		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
-		if numX.IsZero() {
-			return NullValue(), nil
-		}
-		r, err = numXY.Div(numX)
-	case pairRegrIntercept:
-		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
-		if numX.IsZero() {
-			return NullValue(), nil
-		}
-		r, err = s.sy.mulExact(s.sxx).sub(s.sx.mulExact(s.sxy)).Div(numX)
-	case pairRegrR2:
-		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
-		numY := n.mulExact(s.syy).sub(s.sy.mulExact(s.sy))
-		if numX.IsZero() {
-			return NullValue(), nil
-		}
-		if numY.IsZero() {
-			return DecimalValue(decimalFromInt64(1)), nil
-		}
-		r, err = numXY.mulExact(numXY).Div(numX.mulExact(numY))
-	default:
-		panic("unhandled pair statistic")
-	}
-	if err != nil {
-		return NullValue(), err
-	}
-	return DecimalValue(r), nil
+	planCovarPop:      pairCovarPop,
+	planCovarSamp:     pairCovarSamp,
+	planCorr:          pairCorr,
+	planRegrAvgx:      pairRegrAvgx,
+	planRegrAvgy:      pairRegrAvgy,
+	planRegrSxx:       pairRegrSxx,
+	planRegrSyy:       pairRegrSyy,
+	planRegrSxy:       pairRegrSxy,
+	planRegrSlope:     pairRegrSlope,
+	planRegrIntercept: pairRegrIntercept,
+	planRegrR2:        pairRegrR2,
 }
 
 // pairsFloat is PostgreSQL's float8_regr_accum transition state: N, Σx, Sxx, Σy, Syy, and Sxy (the
@@ -305,8 +202,9 @@ type pairsFloat struct {
 	n, sx, sxx, sy, syy, sxy float64
 }
 
-// fold is float8_regr_accum over one Row(Y, X) pair (f32 widened to f64), skipping a pair with a
-// NULL: the two-variable Youngs-Cramer update. A finite input whose update overflows to ±Inf traps
+// fold is float8_regr_accum over one Row(Y, X) pair, skipping a pair with a NULL: the two-variable
+// Youngs-Cramer update. Each argument is first widened to f64 as PostgreSQL's casts to float8 do (an
+// integer to the nearest f64, a decimal by its correctly rounded conversion). A finite input whose update overflows to ±Inf traps
 // 22003; an infinite or NaN input makes the dependent sums NaN. As for the one-argument fold, the
 // explicit conversions keep each operation separately rounded.
 func (s *pairsFloat) fold(v Value) error {
@@ -314,7 +212,14 @@ func (s *pairsFloat) fold(v Value) error {
 	if f[0].IsNull() || f[1].IsNull() {
 		return nil
 	}
-	y, x := f[0].asF64(), f[1].asF64()
+	y, err := percentileInputF64(f[0])
+	if err != nil {
+		return err
+	}
+	x, err := percentileInputF64(f[1])
+	if err != nil {
+		return err
+	}
 	n := s.n + 1
 	sx, sy := s.sx+x, s.sy+y
 	sxx, syy, sxy := s.sxx, s.syy, s.sxy

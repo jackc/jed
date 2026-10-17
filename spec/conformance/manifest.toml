@@ -1106,51 +1106,51 @@ description = "stddev(x) (aggregates.md §23): PostgreSQL's historical alias for
 
 [[capability]]
 id = "func.covar_pop"
-description = "covar_pop(Y, X) (aggregates.md §23): the population covariance of the (Y, X) pairs whose arguments are both non-NULL; NULL over no pair. Over two f32/f64 arguments it is PostgreSQL's float8_regr_accum (two-variable Youngs-Cramer) and Sxy / N, an f64 result — an Infinity or NaN input gives NaN, a finite overflow traps 22003. Over two integer/decimal arguments (the exact_numeric pseudo-family) it is exact, a decimal result: (N·Σxy − Σx·Σy) / (N·N) with jed's decimal division — a ledgered divergence (PostgreSQL defines it only over float8). A float argument beside an exact one, or one argument, is 42883. The arguments travel as one row (one operator_eval per input row). Cost: decimal_work for the three products and five sums per exact pair. Builds on query.aggregates"
+description = "covar_pop(Y, X) (aggregates.md §23): the population covariance of the (Y, X) pairs whose arguments are both non-NULL; NULL over no pair. As in PostgreSQL, which defines it only over float8: any two numeric arguments (the numeric pseudo-family — integer, decimal, or float, in any mix), each widened to f64 as a cast to float8 does, folded by float8_regr_accum (two-variable Youngs-Cramer) and finalized as Sxy / N, an f64 result — an Infinity or NaN input gives NaN, a finite overflow traps 22003. A non-numeric argument, or one argument, is 42883. The arguments travel as one row (one operator_eval per input row). Builds on query.aggregates"
 
 [[capability]]
 id = "func.covar_samp"
-description = "covar_samp(Y, X) (aggregates.md §23): the sample covariance — as covar_pop with numXY / (N·(N−1)) over exact arguments and Sxy / (N−1) over float ones; NULL over fewer than two pairs. Builds on func.covar_pop"
+description = "covar_samp(Y, X) (aggregates.md §23): the sample covariance — as covar_pop, finalized as Sxy / (N − 1); NULL over fewer than two pairs. Builds on func.covar_pop"
 
 [[capability]]
 id = "func.corr"
-description = "corr(Y, X) (aggregates.md §23): the correlation coefficient — over exact arguments numXY / sqrt(numX·numY) with jed's decimal sqrt and division, over float ones PostgreSQL's Sxy / sqrt(Sxx·Syy); NULL over no pair or when either variable is constant (numX or numY is 0). Builds on func.covar_pop"
+description = "corr(Y, X) (aggregates.md §23): the correlation coefficient — as covar_pop, finalized as PostgreSQL's Sxy / sqrt(Sxx·Syy); NULL over no pair or when either variable is constant (Sxx or Syy is 0). Builds on func.covar_pop"
 
 [[capability]]
 id = "func.regr_count"
-description = "regr_count(Y, X) -> i64 (aggregates.md §23): the number of (Y, X) pairs whose arguments are both non-NULL, over two integer/decimal or two float arguments; 0 over no pair. A float argument beside an exact one, or one argument, is 42883. The arguments travel as one row (one operator_eval per input row). Builds on query.aggregates"
+description = "regr_count(Y, X) -> i64 (aggregates.md §23): the number of (Y, X) pairs whose arguments are both non-NULL, over any two numeric arguments; 0 over no pair. A non-numeric argument, or one argument, is 42883. The arguments travel as one row (one operator_eval per input row). Builds on query.aggregates"
 
 [[capability]]
 id = "func.regr_avgx"
-description = "regr_avgx(Y, X) (aggregates.md §23): the mean of the X arguments over the pairs whose arguments are both non-NULL — Σx / N with jed's decimal division over exact arguments, PostgreSQL's Sx / N over float ones; NULL over no pair. Builds on func.covar_pop"
+description = "regr_avgx(Y, X) (aggregates.md §23): the mean of the X arguments over the pairs whose arguments are both non-NULL — as covar_pop, finalized as Σx / N; NULL over no pair. Builds on func.covar_pop"
 
 [[capability]]
 id = "func.regr_avgy"
-description = "regr_avgy(Y, X) (aggregates.md §23): the mean of the Y arguments over the pairs whose arguments are both non-NULL — Σy / N over exact arguments, Sy / N over float ones; NULL over no pair. Builds on func.covar_pop"
+description = "regr_avgy(Y, X) (aggregates.md §23): the mean of the Y arguments over the pairs whose arguments are both non-NULL — as covar_pop, finalized as Σy / N; NULL over no pair. Builds on func.covar_pop"
 
 [[capability]]
 id = "func.regr_sxx"
-description = "regr_sxx(Y, X) (aggregates.md §23): the sum of squared deviations of X over the non-NULL pairs — numX / N over exact arguments, PostgreSQL's Sxx over float ones; NULL over no pair. Builds on func.covar_pop"
+description = "regr_sxx(Y, X) (aggregates.md §23): the sum of squared deviations of X over the non-NULL pairs — as covar_pop, finalized as PostgreSQL's Sxx; NULL over no pair. Builds on func.covar_pop"
 
 [[capability]]
 id = "func.regr_syy"
-description = "regr_syy(Y, X) (aggregates.md §23): the sum of squared deviations of Y over the non-NULL pairs — numY / N over exact arguments, PostgreSQL's Syy over float ones; NULL over no pair. Builds on func.covar_pop"
+description = "regr_syy(Y, X) (aggregates.md §23): the sum of squared deviations of Y over the non-NULL pairs — as covar_pop, finalized as PostgreSQL's Syy; NULL over no pair. Builds on func.covar_pop"
 
 [[capability]]
 id = "func.regr_sxy"
-description = "regr_sxy(Y, X) (aggregates.md §23): the sum of products of the deviations of X and Y over the non-NULL pairs — numXY / N over exact arguments, PostgreSQL's Sxy over float ones; NULL over no pair. Builds on func.covar_pop"
+description = "regr_sxy(Y, X) (aggregates.md §23): the sum of products of the deviations of X and Y over the non-NULL pairs — as covar_pop, finalized as PostgreSQL's Sxy; NULL over no pair. Builds on func.covar_pop"
 
 [[capability]]
 id = "func.regr_slope"
-description = "regr_slope(Y, X) (aggregates.md §23): the slope of the least-squares line — numXY / numX over exact arguments, PostgreSQL's Sxy / Sxx over float ones; NULL over no pair or when X is constant (numX or Sxx is 0). Builds on func.covar_pop"
+description = "regr_slope(Y, X) (aggregates.md §23): the slope of the least-squares line — as covar_pop, finalized as PostgreSQL's Sxy / Sxx; NULL over no pair or when X is constant (Sxx is 0). Builds on func.covar_pop"
 
 [[capability]]
 id = "func.regr_intercept"
-description = "regr_intercept(Y, X) (aggregates.md §23): the Y intercept of the least-squares line — (Σy·Σx² − Σx·Σxy) / numX over exact arguments, PostgreSQL's (Sy − Sx·Sxy / Sxx) / N over float ones; NULL over no pair or when X is constant. Builds on func.covar_pop"
+description = "regr_intercept(Y, X) (aggregates.md §23): the Y intercept of the least-squares line — as covar_pop, finalized as PostgreSQL's (Sy − Sx·Sxy / Sxx) / N; NULL over no pair or when X is constant. Builds on func.covar_pop"
 
 [[capability]]
 id = "func.regr_r2"
-description = "regr_r2(Y, X) (aggregates.md §23): the square of the correlation coefficient — (numXY·numXY) / (numX·numY) over exact arguments, PostgreSQL's (Sxy·Sxy) / (Sxx·Syy) over float ones; 1 when Y is constant, NULL over no pair or when X is constant. Builds on func.covar_pop"
+description = "regr_r2(Y, X) (aggregates.md §23): the square of the correlation coefficient — as covar_pop, finalized as PostgreSQL's (Sxy·Sxy) / (Sxx·Syy); 1 when Y is constant, NULL over no pair or when X is constant. Builds on func.covar_pop"
 
 [[capability]]
 id = "func.json_object_agg"

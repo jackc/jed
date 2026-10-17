@@ -1,6 +1,5 @@
 # Aggregate regr_count(Y, X) -> i64 (spec/design/aggregates.md §23): the number of (Y, X) pairs whose
-# arguments are both non-NULL — over two integer/decimal arguments or two float arguments. 0 over no
-# pair. Output name `regr_count`.
+# arguments are both non-NULL, over any two numeric arguments. 0 over no pair. Output name `regr_count`.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f64, resource.cost_metering, func.regr_count
 
 statement ok
@@ -69,9 +68,15 @@ SELECT id, regr_count(y, x) OVER (ORDER BY id) FROM t ORDER BY id
 5
 2
 
-# A float argument beside an exact one has no overload.
-statement error 42883
+# Any two numeric arguments, in any mix.
+# names: regr_count
+query I nosort
 SELECT regr_count(fy, x) FROM t
+----
+2
+
+statement error 42883
+SELECT regr_count(y, s) FROM (VALUES (1, 'a')) v(y, s)
 
 statement error 42883
 SELECT regr_count(y) FROM t

@@ -1,9 +1,7 @@
-# Aggregate covar_pop(Y, X) (spec/design/aggregates.md §23): the population covariance of the (Y, X)
-# pairs whose arguments are both non-NULL. Over two float arguments it is PostgreSQL's float8
-# algorithm with an f64 result; over two integer/decimal arguments it is exact, a decimal result —
-# a jed divergence (PostgreSQL defines it only over float8), ledgered in oracle_overrides.toml, whose
-# expected values equal PostgreSQL's numeric (N·Σxy − Σx·Σy) / (N·N). NULL over no pair. Output name
-# `covar_pop`.
+# Aggregate covar_pop(Y, X) (spec/design/aggregates.md §23): the population covariance of the (Y, X) pairs whose arguments are both non-NULL. Like PostgreSQL, which defines it
+# only over float8, it takes any two numeric arguments, widens each to f64 as a cast to float8 does,
+# and computes PostgreSQL's float8 algorithm with an f64 result. A pair with a NULL is skipped. Output
+# name `covar_pop`.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.covar_pop
 
 statement ok
@@ -37,7 +35,13 @@ SELECT g, covar_pop(fy, fx) FROM t GROUP BY g
 2
 0
 
-# A pair with a NULL is skipped; no pair: NULL.
+# One pair, and none (a pair with a NULL is skipped).
+# names: covar_pop
+query R nosort
+SELECT covar_pop(fy, fx) FROM t WHERE id = 6
+----
+0
+
 # names: covar_pop
 query R nosort
 SELECT covar_pop(fy, fx) FROM t WHERE id = 5
@@ -76,37 +80,38 @@ NaN
 statement error 22003
 SELECT covar_pop(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
 
-# Over integer and decimal arguments: exact.
+# Integer and decimal arguments widen to f64, in any mix with each other and with floats.
 # names: covar_pop
 # cost: 20
-query D nosort
+query R nosort
 SELECT covar_pop(y, x) FROM t
 ----
-5.6400000000000000
+5.64
 
-# names: covar_pop, covar_pop
-query DD nosort
-SELECT covar_pop(dy, dx), covar_pop(y, dx) FROM t
+# names: covar_pop, covar_pop, covar_pop
+query RRR nosort
+SELECT covar_pop(dy, dx), covar_pop(y, dx), covar_pop(fy, x) FROM t
 ----
-6.5859375000000000
-5.6200000000000000
+6.5859375
+5.62
+5.64
 
 # names: g, covar_pop
-query ID rowsort
+query IR rowsort
 SELECT g, covar_pop(dy, x) FROM t GROUP BY g
 ----
 1
-7.8611111111111111
+7.861111111111111
 2
-0.50000000000000000000
+0.5
 
 # names: covar_pop
-query D nosort
+query R nosort
 SELECT covar_pop(DISTINCT y, y) FROM t
 ----
-5.8400000000000000
+5.840000000000001
 
-# Wide decimals charge decimal_work for each pair's three products and five sums.
+# Wide decimals widen like any other: no decimal arithmetic is charged.
 statement ok
 CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
 
@@ -114,15 +119,14 @@ statement ok
 INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
 
 # names: covar_pop
-# cost: 180
-query D nosort
+# cost: 11
+query R nosort
 SELECT covar_pop(y, x) FROM big
 ----
-3016618463768323183122.6244700150259
+3.016618463768323e+21
 
-# A float argument beside an exact one has no overload.
 statement error 42883
-SELECT covar_pop(fy, x) FROM t
+SELECT covar_pop(y, s) FROM (VALUES (1, 'a')) v(y, s)
 
 statement error 42883
 SELECT covar_pop(y) FROM t

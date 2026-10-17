@@ -138,12 +138,7 @@ impl Acc {
                 sx: 0.0,
                 sxx: 0.0,
             },
-            AggPlan::Pair { stat, float: false } => Acc::PairsExact {
-                stat,
-                n: 0,
-                sums: Box::new(std::array::from_fn(|_| Decimal::from_i64(0))),
-            },
-            AggPlan::Pair { stat, float: true } => Acc::PairsFloat { stat, t: [0.0; 6] },
+            AggPlan::Pair { stat } => Acc::PairsFloat { stat, t: [0.0; 6] },
             AggPlan::StringAgg => Acc::StringAgg {
                 rows: Vec::new(),
                 seen: false,
@@ -345,7 +340,6 @@ impl Acc {
                     *n += 1;
                 }
             }
-            Acc::PairsExact { n, sums, .. } => fold_exact_pair(n, sums, value, m)?,
             Acc::PairsFloat { t, .. } => fold_float_pair(t, value)?,
             Acc::StringAgg { rows, seen } => {
                 // A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL
@@ -583,7 +577,6 @@ impl Acc {
                 let (sample, stddev) = stat.sample_stddev();
                 float_moment_variance(n, sxx, sample, stddev)
             }
-            Acc::PairsExact { stat, n, sums } => finalize_exact_pair(stat, n, &sums)?,
             Acc::PairsFloat { stat, t } => finalize_float_pair(stat, &t),
             Acc::StringAgg { rows, seen } => {
                 if seen {
@@ -943,141 +936,16 @@ fn pair_args(value: Value) -> Option<(Value, Value)> {
     }
 }
 
-/// Add one (Y, X) pair to the exact two-argument moments (aggregates.md §23), skipping a pair with a
-/// NULL. `sums` is [Σx, Σx², Σy, Σy², Σxy]. Each fold charges decimal_work for the three products
-/// and five additions, by the `*` and `+` formulas (spec/design/cost.md §3).
-fn fold_exact_pair(
-    n: &mut i64,
-    sums: &mut [Decimal; 5],
-    value: Value,
-    m: &mut Meter,
-) -> Result<()> {
-    let Some((y, x)) = pair_args(value) else {
-        return Ok(());
-    };
-    let (y, x) = (to_decimal(y), to_decimal(x));
-    let terms = [
-        x.clone(),
-        x.mul_exact(&x),
-        y.clone(),
-        y.mul_exact(&y),
-        x.mul_exact(&y),
-    ];
-    let work = decimal::work_mul(&x, &x)
-        + decimal::work_mul(&y, &y)
-        + decimal::work_mul(&x, &y)
-        + (0..5)
-            .map(|i| decimal::work_linear(&sums[i], &terms[i]))
-            .sum::<u64>()
-        - 8;
-    m.charge(COSTS.decimal_work * work as i64);
-    m.guard()?;
-    for (sum, term) in sums.iter_mut().zip(&terms) {
-        *sum = sum.add_uncapped(term);
-    }
-    *n += 1;
-    Ok(())
-}
-
-/// Evaluate a two-argument statistic over the exact sums (aggregates.md §23), with the exact
-/// numerators numX = N·Σx² − Σx·Σx, numY = N·Σy² − Σy·Σy, and numXY = N·Σxy − Σx·Σy; "/" is jed's
-/// decimal division (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair,
-/// and where the table in aggregates.md §23 says.
-fn finalize_exact_pair(stat: PairStat, n: i64, sums: &[Decimal; 5]) -> Result<Value> {
-    if n == 0 {
-        return Ok(Value::Null);
-    }
-    let [sx, _sxx, sy, _syy, sxy] = sums;
-    let count = Decimal::from_i64(n);
-    let num_xy = count.mul_exact(sxy).add_uncapped(&sx.mul_exact(sy).neg());
-    let r = match stat {
-        PairStat::CovarPop => num_xy.div(&count.mul_exact(&count))?,
-        PairStat::RegrR2 => {
-            let num_x = count
-                .mul_exact(&sums[1])
-                .add_uncapped(&sums[0].mul_exact(&sums[0]).neg());
-            let num_y = count
-                .mul_exact(&sums[3])
-                .add_uncapped(&sums[2].mul_exact(&sums[2]).neg());
-            if num_x.is_zero() {
-                return Ok(Value::Null);
-            }
-            if num_y.is_zero() {
-                return Ok(Value::Decimal(Decimal::from_i64(1)));
-            }
-            num_xy.mul_exact(&num_xy).div(&num_x.mul_exact(&num_y))?
-        }
-        PairStat::RegrIntercept => {
-            let num_x = count
-                .mul_exact(&sums[1])
-                .add_uncapped(&sums[0].mul_exact(&sums[0]).neg());
-            if num_x.is_zero() {
-                return Ok(Value::Null);
-            }
-            sums[2]
-                .mul_exact(&sums[1])
-                .add_uncapped(&sums[0].mul_exact(&sums[4]).neg())
-                .div(&num_x)?
-        }
-        PairStat::RegrSlope => {
-            let num_x = count
-                .mul_exact(&sums[1])
-                .add_uncapped(&sums[0].mul_exact(&sums[0]).neg());
-            if num_x.is_zero() {
-                return Ok(Value::Null);
-            }
-            num_xy.div(&num_x)?
-        }
-        PairStat::RegrSxy => num_xy.div(&count)?,
-        PairStat::RegrSyy => {
-            let num_y = count
-                .mul_exact(&sums[3])
-                .add_uncapped(&sums[2].mul_exact(&sums[2]).neg());
-            num_y.div(&count)?
-        }
-        PairStat::RegrSxx => {
-            let num_x = count
-                .mul_exact(&sums[1])
-                .add_uncapped(&sums[0].mul_exact(&sums[0]).neg());
-            num_x.div(&count)?
-        }
-        PairStat::RegrAvgy => sums[2].div(&count)?,
-        PairStat::RegrAvgx => sums[0].div(&count)?,
-        PairStat::Corr => {
-            let num_x = count
-                .mul_exact(&sums[1])
-                .add_uncapped(&sums[0].mul_exact(&sums[0]).neg());
-            let num_y = count
-                .mul_exact(&sums[3])
-                .add_uncapped(&sums[2].mul_exact(&sums[2]).neg());
-            if num_x.is_zero() || num_y.is_zero() {
-                return Ok(Value::Null);
-            }
-            num_xy.div(&num_x.mul_exact(&num_y).dec_sqrt()?)?
-        }
-        PairStat::CovarSamp => {
-            if n < 2 {
-                return Ok(Value::Null);
-            }
-            num_xy.div(&count.mul_exact(&Decimal::from_i64(n - 1)))?
-        }
-    };
-    Ok(Value::Decimal(r))
-}
-
-/// PostgreSQL's float8_regr_accum over one (Y, X) pair (f32 widened to f64), skipping a pair with a
-/// NULL: the two-variable Youngs-Cramer update of `t` = [N, Σx, Sxx, Σy, Syy, Sxy]. A finite input
+/// PostgreSQL's float8_regr_accum over one (Y, X) pair, skipping a pair with a NULL: the two-variable
+/// Youngs-Cramer update of `t` = [N, Σx, Sxx, Σy, Syy, Sxy]. A finite input
 /// whose update overflows to ±Inf traps 22003; an infinite or NaN input makes the dependent sums NaN.
 fn fold_float_pair(t: &mut [f64; 6], value: Value) -> Result<()> {
     let Some((y, x)) = pair_args(value) else {
         return Ok(());
     };
-    let f = |v: Value| match v {
-        Value::Float32(f) => f as f64,
-        Value::Float64(f) => f,
-        _ => unreachable!("the resolver gives a float pair float operands"),
-    };
-    let (y, x) = (f(y), f(x));
+    // Each argument is first widened to f64 as PostgreSQL's casts to float8 do (an integer to the
+    // nearest f64, a decimal by its correctly rounded conversion).
+    let (y, x) = (percentile_input_f64(&y)?, percentile_input_f64(&x)?);
     let [n0, sx0, sxx0, sy0, syy0, sxy0] = *t;
     let n = n0 + 1.0;
     let (sx, sy) = (sx0 + x, sy0 + y);

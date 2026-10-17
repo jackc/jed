@@ -32258,29 +32258,18 @@ export type AggPlan =
   | "stddevPopFloat"
   // regr_count(Y, X) — the number of pairs whose arguments are both non-NULL (aggregates.md §23).
   | "regrCount"
-  // The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
+  // The two-argument statistical aggregates (aggregates.md §23): f64 over numeric arguments.
   | "covarPop"
-  | "covarPopFloat"
   | "regrR2"
-  | "regrR2Float"
   | "regrIntercept"
-  | "regrInterceptFloat"
   | "regrSlope"
-  | "regrSlopeFloat"
   | "regrSxy"
-  | "regrSxyFloat"
   | "regrSyy"
-  | "regrSyyFloat"
   | "regrSxx"
-  | "regrSxxFloat"
   | "regrAvgy"
-  | "regrAvgyFloat"
   | "regrAvgx"
-  | "regrAvgxFloat"
   | "corr"
-  | "corrFloat"
   | "covarSamp"
-  | "covarSampFloat"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32566,9 +32555,8 @@ export type Acc = {
   momFN: number;
   momFSx: number;
   momFSxx: number;
-  // The two-argument statistical aggregates' running sums (aggregates.md §23): exact
-  // [Σx, Σx², Σy, Σy², Σxy] (with the count in momN), float [N, Σx, Sxx, Σy, Syy, Sxy].
-  pairSums: Decimal[];
+  // The two-argument statistical aggregates' float8_regr_accum state (aggregates.md §23):
+  // [N, Σx, Sxx, Σy, Syy, Sxy].
   pairF: number[];
   jsonAsJson: boolean;
   jsonStrict: boolean;
@@ -32639,7 +32627,6 @@ export function newAcc(
     momFN: 0,
     momFSx: 0,
     momFSxx: 0,
-    pairSums: [0, 1, 2, 3, 4].map(() => Decimal.fromBigInt(0n)),
     pairF: [0, 0, 0, 0, 0, 0],
     jsonAsJson,
     jsonStrict,
@@ -32821,45 +32808,34 @@ function foldFloatMoment(a: Acc, v: Value): void {
 }
 
 // The two-argument statistical aggregates (aggregates.md §23) over (Y, X) pairs whose arguments are
-// both non-NULL. PAIR_SURFACES maps each to its exact and float plans; PAIR_STATS gives each plan its
-// statistic.
+// both non-NULL, numeric arguments widened to f64. PAIR_SURFACES maps each to its plan; PAIR_STATS
+// gives each plan its statistic.
 type PairStat = "covarPop" | "covarSamp" | "corr" | "regrAvgx" | "regrAvgy" | "regrSxx" | "regrSyy" | "regrSxy" | "regrSlope" | "regrIntercept" | "regrR2";
-const PAIR_SURFACES: Record<string, [AggPlan, AggPlan]> = {
-  covar_pop: ["covarPop", "covarPopFloat"],
-  regr_r2: ["regrR2", "regrR2Float"],
-  regr_intercept: ["regrIntercept", "regrInterceptFloat"],
-  regr_slope: ["regrSlope", "regrSlopeFloat"],
-  regr_sxy: ["regrSxy", "regrSxyFloat"],
-  regr_syy: ["regrSyy", "regrSyyFloat"],
-  regr_sxx: ["regrSxx", "regrSxxFloat"],
-  regr_avgy: ["regrAvgy", "regrAvgyFloat"],
-  regr_avgx: ["regrAvgx", "regrAvgxFloat"],
-  corr: ["corr", "corrFloat"],
-  covar_samp: ["covarSamp", "covarSampFloat"],
+const PAIR_SURFACES: Record<string, AggPlan> = {
+  covar_pop: "covarPop",
+  regr_r2: "regrR2",
+  regr_intercept: "regrIntercept",
+  regr_slope: "regrSlope",
+  regr_sxy: "regrSxy",
+  regr_syy: "regrSyy",
+  regr_sxx: "regrSxx",
+  regr_avgy: "regrAvgy",
+  regr_avgx: "regrAvgx",
+  corr: "corr",
+  covar_samp: "covarSamp",
 };
 const PAIR_STATS: Partial<Record<AggPlan, PairStat>> = {
   covarPop: "covarPop",
-  covarPopFloat: "covarPop",
   regrR2: "regrR2",
-  regrR2Float: "regrR2",
   regrIntercept: "regrIntercept",
-  regrInterceptFloat: "regrIntercept",
   regrSlope: "regrSlope",
-  regrSlopeFloat: "regrSlope",
   regrSxy: "regrSxy",
-  regrSxyFloat: "regrSxy",
   regrSyy: "regrSyy",
-  regrSyyFloat: "regrSyy",
   regrSxx: "regrSxx",
-  regrSxxFloat: "regrSxx",
   regrAvgy: "regrAvgy",
-  regrAvgyFloat: "regrAvgy",
   regrAvgx: "regrAvgx",
-  regrAvgxFloat: "regrAvgx",
   corr: "corr",
-  corrFloat: "corr",
   covarSamp: "covarSamp",
-  covarSampFloat: "covarSamp",
 };
 
 // pairArgs splits a two-argument statistical aggregate's Row(Y, X) operand; null for a pair with a
@@ -32869,83 +32845,16 @@ function pairArgs(v: Value): [Value, Value] | null {
   return y.kind === "null" || x.kind === "null" ? null : [y, x];
 }
 
-// foldExactPair adds one (Y, X) pair to the exact two-argument moments, skipping a pair with a NULL.
-// Each fold charges decimal_work for the three products and five additions, by the `*` and `+`
-// formulas (spec/design/cost.md §3).
-function foldExactPair(a: Acc, v: Value, m: Meter): void {
-  const p = pairArgs(v);
-  if (p === null) return;
-  const y = toDecimal(p[0]);
-  const x = toDecimal(p[1]);
-  const terms = [x, x.mulExact(x), y, y.mulExact(y), x.mulExact(y)];
-  let work = workMul(x, x) + workMul(y, y) + workMul(x, y) - 8;
-  for (let i = 0; i < 5; i++) work += workLinear(a.pairSums[i]!, terms[i]!);
-  m.charge(COSTS.decimalWork * BigInt(work));
-  m.guard();
-  a.pairSums = a.pairSums.map((s, i) => s.addUncapped(terms[i]!));
-  a.momN += 1n;
-}
-
-// finalizeExactPair evaluates a two-argument statistic over the exact sums, with the exact numerators
-// numX = N·Σx² − Σx·Σx, numY = N·Σy² − Σy·Σy, and numXY = N·Σxy − Σx·Σy; "/" is jed's decimal
-// division (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair, and where
-// the table in aggregates.md §23 says.
-function finalizeExactPair(stat: PairStat, n: bigint, sums: Decimal[]): Value {
-  if (n === 0n) return nullValue();
-  const [sx, , sy, , sxy] = sums as [Decimal, Decimal, Decimal, Decimal, Decimal];
-  const count = Decimal.fromBigInt(n);
-  const numXY = count.mulExact(sxy).subUncapped(sx.mulExact(sy));
-  switch (stat) {
-    case "covarPop":
-      return decimalValue(numXY.div(count.mulExact(count)));
-    case "regrR2": {
-      const numX = count.mulExact(sums[1]!).subUncapped(sx.mulExact(sx));
-      const numY = count.mulExact(sums[3]!).subUncapped(sy.mulExact(sy));
-      if (numX.isZero()) return nullValue();
-      if (numY.isZero()) return decimalValue(Decimal.fromBigInt(1n));
-      return decimalValue(numXY.mulExact(numXY).div(numX.mulExact(numY)));
-    }
-    case "regrIntercept": {
-      const numX = count.mulExact(sums[1]!).subUncapped(sx.mulExact(sx));
-      if (numX.isZero()) return nullValue();
-      return decimalValue(sy.mulExact(sums[1]!).subUncapped(sx.mulExact(sxy)).div(numX));
-    }
-    case "regrSlope": {
-      const numX = count.mulExact(sums[1]!).subUncapped(sx.mulExact(sx));
-      return numX.isZero() ? nullValue() : decimalValue(numXY.div(numX));
-    }
-    case "regrSxy": return decimalValue(numXY.div(count));
-    case "regrSyy": {
-      const numY = count.mulExact(sums[3]!).subUncapped(sy.mulExact(sy));
-      return decimalValue(numY.div(count));
-    }
-    case "regrSxx": {
-      const numX = count.mulExact(sums[1]!).subUncapped(sx.mulExact(sx));
-      return decimalValue(numX.div(count));
-    }
-    case "regrAvgy": return decimalValue(sy.div(count));
-    case "regrAvgx": return decimalValue(sx.div(count));
-    case "corr": {
-      const numX = count.mulExact(sums[1]!).subUncapped(sx.mulExact(sx));
-      const numY = count.mulExact(sums[3]!).subUncapped(sy.mulExact(sy));
-      if (numX.isZero() || numY.isZero()) return nullValue();
-      return decimalValue(numXY.div(numX.mulExact(numY).decSqrt()));
-    }
-    case "covarSamp":
-      if (n < 2n) return nullValue();
-      return decimalValue(numXY.div(count.mulExact(Decimal.fromBigInt(n - 1n))));
-  }
-}
-
-// foldFloatPair is PostgreSQL's float8_regr_accum over one (Y, X) pair (f32 widened to f64), skipping
-// a pair with a NULL: the two-variable Youngs-Cramer update of [N, Σx, Sxx, Σy, Syy, Sxy]. A finite
+// foldFloatPair is PostgreSQL's float8_regr_accum over one (Y, X) pair, skipping a pair with a NULL:
+// each argument widened to f64 as PostgreSQL's casts to float8 do, then the two-variable Youngs-Cramer
+// update of [N, Σx, Sxx, Σy, Syy, Sxy]. A finite
 // input whose update overflows to ±Inf traps 22003; an infinite or NaN input makes the dependent sums
 // NaN.
 function foldFloatPair(a: Acc, v: Value): void {
   const p = pairArgs(v);
   if (p === null) return;
-  const y = (p[0] as { value: number }).value;
-  const x = (p[1] as { value: number }).value;
+  const y = percentileInputF64(p[0]);
+  const x = percentileInputF64(p[1]);
   const [n0, sx0, sxx0, sy0, syy0, sxy0] = a.pairF as [number, number, number, number, number, number];
   const n = n0 + 1;
   const sx = sx0 + x;
@@ -33079,7 +32988,6 @@ export function cloneAcc(a: Acc): Acc {
     jsonElems: a.jsonElems.slice(),
     arrElems: a.arrElems.slice(),
     strRows: a.strRows.slice(),
-    pairSums: a.pairSums.slice(),
     pairF: a.pairF.slice(),
     jsonPairs: a.jsonPairs.slice(),
     osaVals: a.osaVals ? a.osaVals.slice() : undefined,
@@ -33110,19 +33018,6 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
     case "regrAvgx":
     case "corr":
     case "covarSamp":
-      foldExactPair(a, v, m);
-      break;
-    case "covarPopFloat":
-    case "regrR2Float":
-    case "regrInterceptFloat":
-    case "regrSlopeFloat":
-    case "regrSxyFloat":
-    case "regrSyyFloat":
-    case "regrSxxFloat":
-    case "regrAvgyFloat":
-    case "regrAvgxFloat":
-    case "corrFloat":
-    case "covarSampFloat":
       foldFloatPair(a, v);
       break;
     case "varPop":
@@ -33369,18 +33264,6 @@ export function finalizeAcc(a: Acc): Value {
     case "regrAvgx":
     case "corr":
     case "covarSamp":
-      return finalizeExactPair(PAIR_STATS[a.plan]!, a.momN, a.pairSums);
-    case "covarPopFloat":
-    case "regrR2Float":
-    case "regrInterceptFloat":
-    case "regrSlopeFloat":
-    case "regrSxyFloat":
-    case "regrSyyFloat":
-    case "regrSxxFloat":
-    case "regrAvgyFloat":
-    case "regrAvgxFloat":
-    case "corrFloat":
-    case "covarSampFloat":
       return finalizeFloatPair(PAIR_STATS[a.plan]!, a.pairF);
     case "varPop":
     case "varPopFloat":
@@ -35962,8 +35845,10 @@ export function argFamily(t: ResolvedType): string | null {
 // familyMatches reports whether a resolved argument satisfies one catalog family slot. "any"
 // accepts everything (NULL included); a concrete family matches only its own type.
 export function familyMatches(slot: string, t: ResolvedType): boolean {
-  // The pseudo-family of the exact two-argument statistical aggregates (aggregates.md §23).
-  if (slot === "exact_numeric") return t.kind === "int" || t.kind === "decimal";
+  // The pseudo-family of the two-argument statistical aggregates (aggregates.md §23): any integer,
+  // decimal, or float argument, widened to f64.
+  if (slot === "numeric")
+    return t.kind === "int" || t.kind === "decimal" || t.kind === "float";
   return slot === "any" || argFamily(t) === slot;
 }
 
@@ -36060,8 +35945,8 @@ export function selectUnknownOverload(
 // single-type family its own scalar. null for "any" (and the polymorphic pseudo-families).
 export function familyParamType(family: string): ScalarType | null {
   switch (family) {
-    case "exact_numeric":
-      return "decimal";
+    case "numeric":
+      return "f64";
     case "integer":
       return "i64";
     case "float":
@@ -36254,10 +36139,7 @@ export function aggregatePlan(
   if (surface === "regr_count") return ["regrCount", { kind: "int", ty: "i64" }, undefined];
   // The statistical aggregates: exact over integer/decimal (a decimal result), float over float.
   const pair = PAIR_SURFACES[surface];
-  if (pair !== undefined)
-    return code === "f64"
-      ? [pair[1], { kind: "float", ty: "f64" }, undefined]
-      : [pair[0], { kind: "decimal" }, undefined];
+  if (pair !== undefined) return [pair, { kind: "float", ty: "f64" }, undefined];
   const moment = MOMENT_SURFACES[surface];
   if (moment !== undefined)
     return code === "f64"
@@ -37855,7 +37737,6 @@ function encodeBlockingAccs(keys: Value[], accs: Acc[]): Row {
         float64Value(a.momFN),
         float64Value(a.momFSx),
         float64Value(a.momFSxx),
-        ...a.pairSums.map(decimalValue),
         ...a.pairF.map(float64Value),
       ]),
     );
@@ -37887,8 +37768,7 @@ function decodeBlockingAccs(
     a.momFN = (mom[3]! as { value: number }).value;
     a.momFSx = (mom[4]! as { value: number }).value;
     a.momFSxx = (mom[5]! as { value: number }).value;
-    a.pairSums = mom.slice(6, 11).map((v) => (v as { dec: Decimal }).dec);
-    a.pairF = mom.slice(11, 17).map((v) => (v as { value: number }).value);
+    a.pairF = mom.slice(6, 12).map((v) => (v as { value: number }).value);
     return a;
   });
   return { keys, accs };
@@ -37906,10 +37786,8 @@ function packedStateBytes(accs: Acc[]): number {
     // An ordered aggregate (aggregates.md §22) keeps its tuples in the collections table too.
     if (a.ordRows !== undefined) continue;
     if (PAIR_STATS[a.plan] !== undefined) {
-      // Exact: [int N, decimal Σx, Σx², Σy, Σy², Σxy]; float: [f64 N, Σx, Sxx, Σy, Syy, Sxy].
-      n += a.plan.endsWith("Float")
-        ? 6 * MEMORY_VALUE
-        : MEMORY_VALUE + a.pairSums.reduce((b, d) => b + valueBytes(decimalValue(d)), 0);
+      // [f64 N, f64 Σx, f64 Sxx, f64 Σy, f64 Syy, f64 Sxy].
+      n += 6 * MEMORY_VALUE;
       continue;
     }
     const stat = MOMENT_STATS[a.plan];

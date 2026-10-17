@@ -63,9 +63,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   arrays stack a dimension), `string_agg` (text or bytea), the variance/standard-deviation family
   (`var_pop`, `var_samp`, `variance`, `stddev_pop`, `stddev_samp`, `stddev`), and the two-argument
   `covar_pop`, `covar_samp`, `corr`, `regr_count`, `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`,
-  `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`. The statistical set is exact over
-  integer/decimal input and PostgreSQL's `float8` algorithms over floats; the exact two-argument forms
-  are a ledgered divergence (PostgreSQL has only `float8` ones). → [aggregates.md §23](spec/design/aggregates.md)
+  `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`. The variance/stddev family is exact over
+  integer/decimal input (as in PostgreSQL) and uses PostgreSQL's `float8` algorithms over floats; the
+  two-argument set widens any numeric arguments to `f64`, as PostgreSQL does. → [aggregates.md §23](spec/design/aggregates.md)
 - [ ] **`NULLIF(a, b)`** — the SQL conditional beside `COALESCE`/`GREATEST`/`LEAST` (grammar.md §51–§52);
   absent from the grammar today. _(size: S)_
 - [ ] **Everyday scalar functions** — `concat_ws`, `format()` (PostgreSQL's `%s`/`%I`/`%L`),

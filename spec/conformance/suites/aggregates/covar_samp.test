@@ -1,9 +1,8 @@
-# Aggregate covar_samp(Y, X) (spec/design/aggregates.md §23): the sample covariance of the (Y, X) pairs whose arguments are both non-NULL, NULL over fewer than two pairs. Over two float arguments it is
-# PostgreSQL's float8 algorithm with an f64 result; over two integer/decimal arguments it is exact, a
-# decimal result — a jed divergence (PostgreSQL defines it only over float8), ledgered in
-# oracle_overrides.toml, whose expected values are PostgreSQL's numeric evaluation of the formula in
-# aggregates.md §23. A pair with a NULL is skipped. Output name `covar_samp`.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.covar_samp
+# Aggregate covar_samp(Y, X) (spec/design/aggregates.md §23): the sample covariance of the (Y, X) pairs whose arguments are both non-NULL, NULL over fewer than two pairs. Like PostgreSQL, which defines it
+# only over float8, it takes any two numeric arguments, widens each to f64 as a cast to float8 does,
+# and computes PostgreSQL's float8 algorithm with an f64 result. A pair with a NULL is skipped. Output
+# name `covar_samp`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.covar_samp, func.covar_pop
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, g i32, y i32, x i32, dy numeric(6,2), dx numeric(6,1), fy f64, fx f64, ry f32, rx f32)
@@ -81,37 +80,38 @@ NaN
 statement error 22003
 SELECT covar_samp(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
 
-# Over integer and decimal arguments: exact.
+# Integer and decimal arguments widen to f64, in any mix with each other and with floats.
 # names: covar_samp
 # cost: 20
-query D nosort
+query R nosort
 SELECT covar_samp(y, x) FROM t
 ----
-7.0500000000000000
+7.05
 
-# names: covar_samp, covar_samp
-query DD nosort
-SELECT covar_samp(dy, dx), covar_samp(y, dx) FROM t
+# names: covar_samp, covar_samp, covar_samp
+query RRR nosort
+SELECT covar_samp(dy, dx), covar_samp(y, dx), covar_samp(fy, x) FROM t
 ----
-8.7812500000000000
-7.0250000000000000
+8.78125
+7.025
+7.05
 
 # names: g, covar_samp
-query ID rowsort
+query IR rowsort
 SELECT g, covar_samp(dy, x) FROM t GROUP BY g
 ----
 1
-11.7916666666666667
+11.791666666666666
 2
-1.00000000000000000000
+1
 
 # names: covar_samp
-query D nosort
+query R nosort
 SELECT covar_samp(DISTINCT y, y) FROM t
 ----
-7.3000000000000000
+7.300000000000001
 
-# Wide decimals charge decimal_work for each pair's three products and five sums.
+# Wide decimals widen like any other: no decimal arithmetic is charged.
 statement ok
 CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
 
@@ -119,15 +119,14 @@ statement ok
 INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
 
 # names: covar_samp
-# cost: 180
-query D nosort
+# cost: 11
+query R nosort
 SELECT covar_samp(y, x) FROM big
 ----
-4524927695652484774683.9367050225388
+4.5249276956524843e+21
 
-# A float argument beside an exact one has no overload.
 statement error 42883
-SELECT covar_samp(fy, x) FROM t
+SELECT covar_samp(y, s) FROM (VALUES (1, 'a')) v(y, s)
 
 statement error 42883
 SELECT covar_samp(y) FROM t

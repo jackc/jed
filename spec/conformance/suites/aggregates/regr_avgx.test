@@ -1,8 +1,7 @@
-# Aggregate regr_avgx(Y, X) (spec/design/aggregates.md §23): the mean of the X arguments over the pairs whose arguments are both non-NULL. Over two float arguments it is
-# PostgreSQL's float8 algorithm with an f64 result; over two integer/decimal arguments it is exact, a
-# decimal result — a jed divergence (PostgreSQL defines it only over float8), ledgered in
-# oracle_overrides.toml, whose expected values are PostgreSQL's numeric evaluation of the formula in
-# aggregates.md §23. A pair with a NULL is skipped. Output name `regr_avgx`.
+# Aggregate regr_avgx(Y, X) (spec/design/aggregates.md §23): the mean of the X arguments over the pairs whose arguments are both non-NULL. Like PostgreSQL, which defines it
+# only over float8, it takes any two numeric arguments, widens each to f64 as a cast to float8 does,
+# and computes PostgreSQL's float8 algorithm with an f64 result. A pair with a NULL is skipped. Output
+# name `regr_avgx`.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.regr_avgx, func.covar_pop
 
 statement ok
@@ -81,37 +80,38 @@ Infinity
 statement error 22003
 SELECT regr_avgx(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
 
-# Over integer and decimal arguments: exact.
+# Integer and decimal arguments widen to f64, in any mix with each other and with floats.
 # names: regr_avgx
 # cost: 20
-query D nosort
+query R nosort
 SELECT regr_avgx(y, x) FROM t
 ----
-4.6000000000000000
+4.6
 
-# names: regr_avgx, regr_avgx
-query DD nosort
-SELECT regr_avgx(dy, dx), regr_avgx(y, dx) FROM t
+# names: regr_avgx, regr_avgx, regr_avgx
+query RRR nosort
+SELECT regr_avgx(dy, dx), regr_avgx(y, dx), regr_avgx(fy, x) FROM t
 ----
-4.8750000000000000
-4.8000000000000000
+4.875
+4.8
+4.6
 
 # names: g, regr_avgx
-query ID rowsort
+query IR rowsort
 SELECT g, regr_avgx(dy, x) FROM t GROUP BY g
 ----
 1
-5.3333333333333333
+5.333333333333333
 2
-2.0000000000000000
+2
 
 # names: regr_avgx
-query D nosort
+query R nosort
 SELECT regr_avgx(DISTINCT y, y) FROM t
 ----
-3.6000000000000000
+3.6
 
-# Wide decimals charge decimal_work for each pair's three products and five sums.
+# Wide decimals widen like any other: no decimal arithmetic is charged.
 statement ok
 CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
 
@@ -119,15 +119,14 @@ statement ok
 INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
 
 # names: regr_avgx
-# cost: 180
-query D nosort
+# cost: 11
+query R nosort
 SELECT regr_avgx(y, x) FROM big
 ----
-10471975515.71596667
+10471975515.715967
 
-# A float argument beside an exact one has no overload.
 statement error 42883
-SELECT regr_avgx(fy, x) FROM t
+SELECT regr_avgx(y, s) FROM (VALUES (1, 'a')) v(y, s)
 
 statement error 42883
 SELECT regr_avgx(y) FROM t

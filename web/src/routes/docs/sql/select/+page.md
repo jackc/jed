@@ -226,8 +226,9 @@ Beyond `count`, `sum`, `avg`, `min`, and `max`, the aggregates include `bool_and
 (`string_agg(name, ', ' ORDER BY name)`), and the statistical `var_pop`, `var_samp`, `variance`,
 `stddev_pop`, `stddev_samp`, `stddev`, `covar_pop`, `covar_samp`, `corr`, and `regr_count`,
 `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`, `regr_sxy`, `regr_slope`, `regr_intercept`, and
-`regr_r2`. The statistical aggregates are exact over integers and `numeric` (a `numeric` result) and
-follow PostgreSQL's `double precision` algorithms over floats.
+`regr_r2`. As in PostgreSQL, the variance and standard-deviation aggregates are exact over integers
+and `numeric` (a `numeric` result) and use `double precision` over floats, and the two-argument ones
+return `double precision` for any numeric arguments.
 An aggregate's argument list may end in its own `ORDER BY` — the order it folds its input in — which
 is what fixes the element order of `jsonb_agg` / `json_agg` and the last-wins key of
 `jsonb_object_agg` (`jsonb_agg(name ORDER BY price DESC)`, `jsonb_object_agg(k, v ORDER BY ts)`).

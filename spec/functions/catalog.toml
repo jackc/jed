@@ -5601,7 +5601,7 @@ errors         = ["22023", "22004", "0A000"]
 # arg           "star" = the COUNT(*) no-expression row counter; "expr" = general expression
 #               arguments, one per arg_families slot (string_agg takes two).
 # arg_families  required family of each expression argument ("any" = unconstrained;
-#               "exact_numeric" = the integer or decimal family).
+#               "numeric" = the integer, decimal, or float family).
 #               Omitted for arg = "star". SUM/AVG take a numeric family (integer/decimal —
 #               one row per family); COUNT(expr)/MIN/MAX take "any".
 # result        a scalar id (i64, decimal) OR a reserved widening id — "sum_widen"
@@ -6003,28 +6003,16 @@ null         = "aggregate"
 errors       = ["22003"]
 
 # The two-argument statistical aggregates (aggregates.md §23) over (Y, X) — covariance, correlation,
-# and the regr_* family. A pair with a NULL is skipped. Over two exact arguments (the
-# "exact_numeric" pseudo-family: integer or decimal) they are exact — the decimal sums Σx, Σx², Σy,
-# Σy², Σxy finalized by decimal expressions (a jed divergence: PostgreSQL defines them only over
-# float8). Over two float arguments they are PostgreSQL's float8 algorithms (float8_regr_accum, a
-# finite overflow traps 22003) with an f64 result. A float argument beside an exact one is 42883:
-# float stays a strict island.
+# and the regr_* family. A pair with a NULL is skipped. The arguments are any numeric pair (the
+# "numeric" pseudo-family: integer, decimal, or float), each widened to f64 as PostgreSQL's casts to
+# float8 do, and the computation is PostgreSQL's float8_regr_accum and its final functions (a finite
+# overflow traps 22003), with an f64 result — regr_count counts the pairs, an i64.
 [[aggregate]]
 name         = "covar_pop"
 kind         = "aggregate"
 surface      = "covar_pop"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "covar_pop"
-kind         = "aggregate"
-surface      = "covar_pop"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6034,17 +6022,7 @@ name         = "covar_samp"
 kind         = "aggregate"
 surface      = "covar_samp"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "covar_samp"
-kind         = "aggregate"
-surface      = "covar_samp"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6054,17 +6032,7 @@ name         = "corr"
 kind         = "aggregate"
 surface      = "corr"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "corr"
-kind         = "aggregate"
-surface      = "corr"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6074,17 +6042,7 @@ name         = "regr_count"
 kind         = "aggregate"
 surface      = "regr_count"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "i64"
-null         = "aggregate"
-errors       = []
-
-[[aggregate]]
-name         = "regr_count"
-kind         = "aggregate"
-surface      = "regr_count"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "i64"
 null         = "aggregate"
 errors       = []
@@ -6094,17 +6052,7 @@ name         = "regr_avgx"
 kind         = "aggregate"
 surface      = "regr_avgx"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "regr_avgx"
-kind         = "aggregate"
-surface      = "regr_avgx"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6114,17 +6062,7 @@ name         = "regr_avgy"
 kind         = "aggregate"
 surface      = "regr_avgy"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "regr_avgy"
-kind         = "aggregate"
-surface      = "regr_avgy"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6134,17 +6072,7 @@ name         = "regr_sxx"
 kind         = "aggregate"
 surface      = "regr_sxx"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "regr_sxx"
-kind         = "aggregate"
-surface      = "regr_sxx"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6154,17 +6082,7 @@ name         = "regr_syy"
 kind         = "aggregate"
 surface      = "regr_syy"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "regr_syy"
-kind         = "aggregate"
-surface      = "regr_syy"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6174,17 +6092,7 @@ name         = "regr_sxy"
 kind         = "aggregate"
 surface      = "regr_sxy"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "regr_sxy"
-kind         = "aggregate"
-surface      = "regr_sxy"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6194,17 +6102,7 @@ name         = "regr_slope"
 kind         = "aggregate"
 surface      = "regr_slope"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "regr_slope"
-kind         = "aggregate"
-surface      = "regr_slope"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6214,17 +6112,7 @@ name         = "regr_intercept"
 kind         = "aggregate"
 surface      = "regr_intercept"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "regr_intercept"
-kind         = "aggregate"
-surface      = "regr_intercept"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]
@@ -6234,17 +6122,7 @@ name         = "regr_r2"
 kind         = "aggregate"
 surface      = "regr_r2"
 arg          = "expr"
-arg_families = ["exact_numeric", "exact_numeric"]
-result       = "decimal"
-null         = "aggregate"
-errors       = ["22003"]
-
-[[aggregate]]
-name         = "regr_r2"
-kind         = "aggregate"
-surface      = "regr_r2"
-arg          = "expr"
-arg_families = ["float", "float"]
+arg_families = ["numeric", "numeric"]
 result       = "f64"
 null         = "aggregate"
 errors       = ["22003"]

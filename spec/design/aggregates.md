@@ -761,18 +761,18 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `stddev_pop(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the population standard deviation |
 | `stddev_samp(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the sample standard deviation |
 | `stddev(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | PostgreSQL's alias of `stddev_samp` |
-| `covar_pop(y, x)` | two exact / two float | `decimal` / `f64` | the population covariance |
-| `covar_samp(y, x)` | two exact / two float | `decimal` / `f64` | the sample covariance |
-| `corr(y, x)` | two exact / two float | `decimal` / `f64` | the correlation coefficient |
-| `regr_count(y, x)` | two exact / two float | `i64` | the number of pairs with both arguments non-NULL |
-| `regr_avgx(y, x)` | two exact / two float | `decimal` / `f64` | the mean of `x` |
-| `regr_avgy(y, x)` | two exact / two float | `decimal` / `f64` | the mean of `y` |
-| `regr_sxx(y, x)` | two exact / two float | `decimal` / `f64` | the sum of squared deviations of `x` |
-| `regr_syy(y, x)` | two exact / two float | `decimal` / `f64` | the sum of squared deviations of `y` |
-| `regr_sxy(y, x)` | two exact / two float | `decimal` / `f64` | the sum of products of the deviations |
-| `regr_slope(y, x)` | two exact / two float | `decimal` / `f64` | the least-squares slope |
-| `regr_intercept(y, x)` | two exact / two float | `decimal` / `f64` | the least-squares intercept |
-| `regr_r2(y, x)` | two exact / two float | `decimal` / `f64` | the square of the correlation coefficient |
+| `covar_pop(y, x)` | any two numeric | `f64` | the population covariance |
+| `covar_samp(y, x)` | any two numeric | `f64` | the sample covariance |
+| `corr(y, x)` | any two numeric | `f64` | the correlation coefficient |
+| `regr_count(y, x)` | any two numeric | `i64` | the number of pairs with both arguments non-NULL |
+| `regr_avgx(y, x)` | any two numeric | `f64` | the mean of `x` |
+| `regr_avgy(y, x)` | any two numeric | `f64` | the mean of `y` |
+| `regr_sxx(y, x)` | any two numeric | `f64` | the sum of squared deviations of `x` |
+| `regr_syy(y, x)` | any two numeric | `f64` | the sum of squared deviations of `y` |
+| `regr_sxy(y, x)` | any two numeric | `f64` | the sum of products of the deviations |
+| `regr_slope(y, x)` | any two numeric | `f64` | the least-squares slope |
+| `regr_intercept(y, x)` | any two numeric | `f64` | the least-squares intercept |
+| `regr_r2(y, x)` | any two numeric | `f64` | the square of the correlation coefficient |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive
@@ -858,11 +858,13 @@ bounded-spill lane: exact `[int N, decimal Σx, decimal Σx²]`, float `[f64 N, 
 
 **Two-argument statistical aggregates.** `covar_pop` and the rest take `(Y, X)` — the dependent
 variable first, as in PostgreSQL — and fold only the pairs whose arguments are **both** non-NULL; with
-no such pair the result is NULL. The catalog rows are `(exact_numeric, exact_numeric) → decimal` and
-`(float, float) → f64`, where `exact_numeric` is the integer or decimal family, so a float argument
-beside an exact one is `42883`: float stays a strict island (PostgreSQL instead casts both to
-`float8`). Over float arguments (`f32` widened to `f64`) they are PostgreSQL's `float8_regr_accum` —
-the two-variable Youngs-Cramer update of `(N, Σx, Sxx, Σy, Syy, Sxy)`:
+no such pair the result is NULL (`regr_count`: 0). PostgreSQL defines them only over `float8` and
+casts other numeric arguments to it, and jed matches that: the catalog row is
+`(numeric, numeric) → f64` (`regr_count → i64`), where the `numeric` pseudo-family is any integer,
+decimal, or float type, in any mix, and each argument is widened to `f64` before the fold as a cast to
+`float8` would (an integer to the nearest `f64`, a decimal by its correctly rounded conversion — the
+`percentile_cont` rule, §13). The fold is PostgreSQL's `float8_regr_accum`, the two-variable
+Youngs-Cramer update of `(N, Σx, Sxx, Σy, Syy, Sxy)`:
 
 ```
 N' = N + 1;  Σx' = Σx + x;  Σy' = Σy + y
@@ -872,34 +874,23 @@ if N > 0:  tx = x·N' − Σx';  ty = y·N' − Σy';  s = 1 / (N'·N)
 else:      Sxx' = Sxy' = NaN if x is NaN or ±Inf;  Syy' = Sxy' = NaN if y is NaN or ±Inf
 ```
 
-and each finalizes as PostgreSQL's `float8` final function. Over exact arguments they are **exact**,
-a deliberate divergence (PostgreSQL defines them only over `float8`, ledgered in
-`oracle_overrides.toml`): the fold keeps `N` and the uncapped decimal sums `Σx`, `Σx²`, `Σy`, `Σy²`,
-`Σxy` (charging `decimal_work` for the three products and five additions), and each result is a
-decimal expression over the exact numerators
+with each operation separately rounded, and each finalizes as PostgreSQL's `float8` final function
+below. Unlike the one-argument forms there is no exact variant: an integer or decimal argument yields
+the same `f64` PostgreSQL returns. The fold order is ledgered with the one-argument float forms
+(`float-moment-order`). Packed state on the bounded-spill lane: `[f64 N, f64 Σx, f64 Sxx, f64 Σy,
+f64 Syy, f64 Sxy]`; `regr_count` keeps only the pair count, packed `[int N]`.
 
-```
-numX  = N·Σx² − Σx·Σx      numY  = N·Σy² − Σy·Σy      numXY = N·Σxy − Σx·Σy
-```
-
-evaluated with jed's decimal operators — `/` at `select_div_scale`, half away from zero, `22003`
-past the cap, and `sqrt` as the `sqrt(numeric)` function chooses its scale — so each equals PostgreSQL's `numeric` evaluation of the same expression. Packed state
-on the bounded-spill lane: exact `[int N, decimal Σx, decimal Σx², decimal Σy, decimal Σy², decimal
-Σxy]`, float `[f64 N, f64 Σx, f64 Sxx, f64 Σy, f64 Syy, f64 Sxy]`. `regr_count` keeps only the pair count, packed `[int N]`, and
-charges no `decimal_work`. The float fold order is ledgered
-with the one-argument float forms (`float-moment-order`).
-
-| Aggregate | Exact result | Float result (PostgreSQL) | NULL when |
-|---|---|---|---|
-| `covar_pop(y, x)` | `numXY / (N·N)` | `Sxy / N` | no pair |
-| `covar_samp(y, x)` | `numXY / (N·(N − 1))` | `Sxy / (N − 1)` | fewer than two pairs |
-| `corr(y, x)` | `numXY / sqrt(numX·numY)` | `Sxy / sqrt(Sxx·Syy)` | no pair, or `numX` / `Sxx` or `numY` / `Syy` is 0 |
-| `regr_count(y, x)` | `N` (`i64`) | `N` (`i64`) | never (0 over no pair) |
-| `regr_avgx(y, x)` | `Σx / N` | `Σx / N` | no pair |
-| `regr_avgy(y, x)` | `Σy / N` | `Σy / N` | no pair |
-| `regr_sxx(y, x)` | `numX / N` | `Sxx` | no pair |
-| `regr_syy(y, x)` | `numY / N` | `Syy` | no pair |
-| `regr_sxy(y, x)` | `numXY / N` | `Sxy` | no pair |
-| `regr_slope(y, x)` | `numXY / numX` | `Sxy / Sxx` | no pair, or `numX` / `Sxx` is 0 |
-| `regr_intercept(y, x)` | `(Σy·Σx² − Σx·Σxy) / numX` | `(Σy − Σx·Sxy / Sxx) / N` | no pair, or `numX` / `Sxx` is 0 |
-| `regr_r2(y, x)` | `(numXY·numXY) / (numX·numY)`; 1 when `numY` is 0 | `(Sxy·Sxy) / (Sxx·Syy)`; 1 when `Syy` is 0 | no pair, or `numX` / `Sxx` is 0 |
+| Aggregate | Result (PostgreSQL's float8 final function) | NULL when |
+|---|---|---|
+| `covar_pop(y, x)` | `Sxy / N` | no pair |
+| `covar_samp(y, x)` | `Sxy / (N − 1)` | fewer than two pairs |
+| `corr(y, x)` | `Sxy / sqrt(Sxx·Syy)` | no pair, or `Sxx` or `Syy` is 0 |
+| `regr_count(y, x)` | `N` (`i64`) | never (0 over no pair) |
+| `regr_avgx(y, x)` | `Σx / N` | no pair |
+| `regr_avgy(y, x)` | `Σy / N` | no pair |
+| `regr_sxx(y, x)` | `Sxx` | no pair |
+| `regr_syy(y, x)` | `Syy` | no pair |
+| `regr_sxy(y, x)` | `Sxy` | no pair |
+| `regr_slope(y, x)` | `Sxy / Sxx` | no pair, or `Sxx` is 0 |
+| `regr_intercept(y, x)` | `(Σy − Σx·Sxy / Sxx) / N` | no pair, or `Sxx` is 0 |
+| `regr_r2(y, x)` | `(Sxy·Sxy) / (Sxx·Syy)`; 1 when `Syy` is 0 | no pair, or `Sxx` is 0 |

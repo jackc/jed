@@ -6178,10 +6178,10 @@ pub(crate) enum AggPlan {
     },
     /// regr_count(Y, X) — the number of pairs whose arguments are both non-NULL (aggregates.md §23).
     RegrCount,
-    /// The two-argument statistical aggregates over (Y, X) (aggregates.md §23), exact or float.
+    /// The two-argument statistical aggregates over (Y, X) (aggregates.md §23): numeric arguments
+    /// widened to f64, an f64 result.
     Pair {
         stat: PairStat,
-        float: bool,
     },
     /// json_agg / jsonb_agg (and the `_strict` variants) — aggregate the inputs' JSON images into a
     /// JSON array (json-sql-functions.md §4). `compact` selects the `json` (compact) vs `jsonb`
@@ -6395,13 +6395,6 @@ pub(crate) enum Acc {
         n: f64,
         sx: f64,
         sxx: f64,
-    },
-    /// The exact two-argument moments (aggregates.md §23): the count of pairs and the decimal sums
-    /// Σx, Σx², Σy, Σy², Σxy.
-    PairsExact {
-        stat: PairStat,
-        n: i64,
-        sums: Box<[Decimal; 5]>,
     },
     /// PostgreSQL's float8_regr_accum transition state: N, Σx, Sxx, Σy, Syy, Sxy, all f64.
     PairsFloat {
