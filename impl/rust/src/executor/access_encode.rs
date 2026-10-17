@@ -3538,7 +3538,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
     // Opclass sibling bounds follow the cheaper primary-key and ordered-B-tree paths. GiST precedes
     // GIN, matching ordinary SELECT planning. Only a bare earlier-sibling column is admissible.
     for idx in &rel.table.indexes {
-        if idx.kind != IndexKind::Gist || idx.keys.len() != 1 {
+        if idx.kind != IndexKind::Gist || idx.keys.len() != 1 || idx.predicate.is_some() {
             continue;
         }
         let ci = idx.first_column();
@@ -3885,14 +3885,15 @@ pub(crate) fn build_gin_bound_for_index(
 }
 
 /// Inventory one single-column GiST index. Multi-column GiST indexes are EXCLUDE backing structures
-/// and remain constraint-only, never planner candidates.
+/// and remain constraint-only, never planner candidates; so is the partial GiST index a partial
+/// `EXCLUDE … WHERE` builds (gist.md §7.1 — it holds only the predicate's rows).
 pub(crate) fn build_gist_bound_for_index(
     filter: &RExpr,
     idx: &IndexDef,
     columns: &[Column],
     offset: usize,
 ) -> Option<GistBound> {
-    if idx.kind != IndexKind::Gist || idx.keys.len() != 1 {
+    if idx.kind != IndexKind::Gist || idx.keys.len() != 1 || idx.predicate.is_some() {
         return None;
     }
     let ci = idx.first_column();
@@ -4446,7 +4447,11 @@ pub(crate) fn index_entry_key(
 /// and for a **partial** index iff its `WHERE predicate` evaluates to **TRUE** (the 3VL WHERE rule —
 /// FALSE and NULL are excluded). The predicate eval is unmetered maintenance work (like a key
 /// expression's — cost.md §3), so a throwaway [`Meter`] absorbs its charge.
-fn index_row_qualifies(rindex: &ResolvedIndex, row: &Row, env: &EvalEnv) -> Result<bool> {
+pub(crate) fn index_row_qualifies(
+    rindex: &ResolvedIndex,
+    row: &Row,
+    env: &EvalEnv,
+) -> Result<bool> {
     match &rindex.predicate {
         None => Ok(true),
         Some(pred) => {
@@ -4626,6 +4631,39 @@ pub(crate) fn exclusion_probe_query(
 /// excluded column of either row, or an empty range under `&&` (`range_overlaps` of an empty range
 /// is FALSE), makes that element not-TRUE → no conflict. Returns `true` only when EVERY element is
 /// definitely TRUE.
+/// One `EXCLUDE` constraint resolved for a statement (spec/design/gist.md §7): the constraint and
+/// its backing index resolved — the partial predicate (§7.1) and, for `USING btree` (§7.2), the
+/// ordered key the equality probe builds.
+pub(crate) struct ExclusionCheck {
+    pub(crate) exc: ExclusionConstraint,
+    pub(crate) rindex: ResolvedIndex,
+}
+
+/// A participating row's exclusion probe key (gist.md §7): the backing ordered index's slot prefix
+/// for a btree exclusion (§7.2 — two rows conflict iff the prefixes are equal), or the GiST
+/// conjunction query.
+pub(crate) enum ExclusionKey {
+    Btree(Vec<u8>),
+    Gist(Vec<crate::gist::GistQuery>, Vec<crate::gist::GistStrategy>),
+}
+
+/// Whether two participating rows conflict under one exclusion constraint, given their probe keys
+/// (gist.md §7): equal prefixes for a btree exclusion, the full `(expr_i op_i)` conjunction for a
+/// GiST one.
+pub(crate) fn exclusion_keys_conflict(
+    columns: &[Column],
+    exc: &ExclusionConstraint,
+    ka: &ExclusionKey,
+    a: &Row,
+    kb: &ExclusionKey,
+    b: &Row,
+) -> Result<bool> {
+    match (ka, kb) {
+        (ExclusionKey::Btree(pa), ExclusionKey::Btree(pb)) => Ok(pa == pb),
+        _ => exclusion_pair_conflicts(columns, exc, a, b),
+    }
+}
+
 pub(crate) fn exclusion_pair_conflicts(
     columns: &[Column],
     exc: &ExclusionConstraint,

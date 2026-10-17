@@ -17,7 +17,19 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 44)
+## Version scope (`format_version` 45)
+
+`format_version` **45** — **exclusion-constraint follow-ons** ([../design/gist.md §7.1/§7.2/§8](../design/gist.md)).
+No byte layout change. The `index_flags` bit1 `has_predicate` (and the v31/v32 dependency lists after
+it) is now legal on a **GiST** index that backs an exclusion constraint — the partial `EXCLUDE …
+WHERE (predicate)`, whose predicate is its backing index's — and an exclusion entry's `excl_index`
+may name an **ordered** (`index_kind = 0`) backing index with `unique` clear, every `excl_op` `=`
+(`EXCLUDE USING btree`). A v44 reader must reject such a file: it treats both shapes as `XX001`
+corruption, and were it to accept the bytes it would neither honor the predicate nor probe the
+btree index for an equal key, so it would enforce the wrong constraint. A partial GiST index that
+backs no exclusion, a partial GIN index, and a btree backing index that is unique or carries `&&`
+remain `XX001`. The new `exclude_followon_table` golden pins both shapes; a file with neither
+changes only by its version byte + meta CRC.
 
 `format_version` **44** — **composite column DEFAULTs** ([../design/composite.md §12](../design/composite.md)).
 A composite column entry's `flags` byte may set bit3 `default_is_expr`, and the expression
@@ -822,7 +834,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key **element** (a column or, **v26**, an expression): |
 | &nbsp;&nbsp;`key_element` ×`key_col_count` | per element a `u16` in **index-key order**: a **column ordinal** (`< col_count`; duplicates allowed — indexes.md §1; an out-of-range non-sentinel ordinal is `XX001`), **or** the sentinel **`0xFFFF`** (**new in v26**) marking an **expression key**, immediately followed by a `u16 expr_len` + `expr_len` UTF-8 bytes of the expression's canonical text (*Check-expression text* below). An expression element re-parses at load (kept unparsed on failure — [unparsable-definitions.md](../design/unparsable-definitions.md)) and re-resolves against this table's columns to recover its result type; a plain column index writes no `0xFFFF` and is byte-identical to v6 |
 | &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); **bit1 `has_predicate`** (**new in v27** — a partial index, indexes.md §9; the predicate text follows `index_root_page`); bit2 `has_host_deps` (v31), bit3 `has_timezone_deps` (v32); bits 4–7 reserved, written 0 (a set reserved bit is `XX001`) |
-| &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**new in v20** — a persisted R-tree, `index_root_page` points at its root, pages 5/6 above, [../design/gist.md](../design/gist.md)); `3…` reserved. At v20 a value `> 2` is `XX001`. A GIN/GiST index always has `index_flags` bit0 (`unique`) clear. A partial index (`index_flags` bit1) is B-tree only — `has_predicate` set with `index_kind != 0` is `XX001` |
+| &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**new in v20** — a persisted R-tree, `index_root_page` points at its root, pages 5/6 above, [../design/gist.md](../design/gist.md)); `3…` reserved. At v20 a value `> 2` is `XX001`. A GIN/GiST index always has `index_flags` bit0 (`unique`) clear. A partial index (`index_flags` bit1) is B-tree, or (**v45**) the GiST index backing a partial exclusion constraint — `has_predicate` set on a GIN index, or on a GiST index no exclusion names, is `XX001` |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
 | &nbsp;&nbsp;`index_pred_len` | u16 — **only present when `index_flags` bit1 (`has_predicate`)** (**new in v27**); written *after* `index_root_page` |
 | &nbsp;&nbsp;`index_pred` | UTF-8 — the partial index's predicate text (*Check-expression text* below), `index_pred_len` bytes; re-parses at load (kept unparsed on failure) and re-resolves against this table's columns (indexes.md §9) |
@@ -843,7 +855,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`excl_name_len` | u16 |
 | &nbsp;&nbsp;`excl_name` | UTF-8 (original case) — the constraint name |
 | &nbsp;&nbsp;`excl_index_len` | u16 |
-| &nbsp;&nbsp;`excl_index` | UTF-8 (original case) — the backing GiST index name (= `excl_name` for a GX3 constraint) |
+| &nbsp;&nbsp;`excl_index` | UTF-8 (original case) — the backing index name (= `excl_name`): a GiST index, or (**v45**, `EXCLUDE USING btree`) a non-unique ordered index whose every `excl_op` is `=` |
 | &nbsp;&nbsp;`excl_elem_count` | u16 — the constraint's element count (≥ 1, else `XX001`) |
 | &nbsp;&nbsp;&nbsp;&nbsp;`excl_col_ordinal` | u16 — the element's column ordinal into **this** table (per element) |
 | &nbsp;&nbsp;&nbsp;&nbsp;`excl_op` | u8 — the element's operator strategy (`0` = `&&`, `1` = `=`; other values are `XX001`) (per element, immediately after its `excl_col_ordinal`) |
@@ -1758,6 +1770,7 @@ the interior-node format and the split contract.
 | `gin_text_table.jed` | **GIN over text elements** (no version bump — the text key is already on disk) — a `USING gin` index over a `text[]` column: each term is the element's `C` text key (`text-terminated-escape` over its UTF-8, [../design/encoding.md §2.4](../design/encoding.md); [../design/gin.md §4.2](../design/gin.md)), never a collation sort key; a duplicate element is one entry, the empty string is a term, NULL elements and empty/NULL arrays have none. The over-128-byte cut form cannot fit this page size and is pinned cross-core by `query/gin_text_elements.test` costs |
 | `gin_decimal_bytea_table.jed` | **GIN over decimal and bytea elements** (no version bump — both keys are already on disk) — `USING gin` indexes over a `decimal[]` and a `bytea[]` column: a decimal term is the element's value-based `decimal-order-preserving` key ([../design/encoding.md §2.5](../design/encoding.md)), so `1.5` and `1.50` of one row are ONE entry while the stored values keep their scales, and `0.00` is the zero term `04`; a bytea term is its `bytea-terminated-escape` key ([../design/encoding.md §2.6](../design/encoding.md)) — an embedded `0x00` escaped, the empty value a term, a duplicate one entry ([../design/gin.md §4.3](../design/gin.md)). NULL elements and empty/NULL arrays have none. The over-128-byte cut forms cannot fit this page size and are pinned cross-core by the `query/gin_decimal_elements.test` and `query/gin_bytea_elements.test` costs |
 | `statistics_terms_table.jed` | **GIN term statistics** (v42) — a table with an `i32[]` column and a `jsonb` column analyzed after small inserts: each summary carries bit2 and its term facts; the array's complete list (`untracked_term_rows = 0`) holds a term shared by two rows ahead of single-row terms, and the `jsonb` list holds key and value terms ([../design/statistics.md §4.5](../design/statistics.md)). An `i32` column beside them has no term facts |
+| `exclude_followon_table.jed` | **Exclusion follow-ons** (v45) — an `EXCLUDE USING btree (a WITH =, c WITH =)` whose backing index `t_a_c_excl` is an ordered, non-unique two-column index (every row has an entry, NULL slots included) beside a partial `EXCLUDE USING gist (span WITH &&) WHERE (b > 0)` whose GiST index `t_span_excl` carries `has_predicate` + the text `b > 0` and holds only the rows the predicate admits ([../design/gist.md §7.1/§7.2](../design/gist.md)) |
 | `view_table.jed` | **views** (v38) — a table `t(a, b)` with two rows and three views: `v` = `SELECT * FROM t WHERE a > 0` (its stored text shows the frozen `"t" . "a" , "t" . "b"` expansion; dependency on `t` columns `a`, `b`), `w (x) AS SELECT a FROM v` (a column-list rename, a view dependency with no column list), and `n AS SELECT count(*) AS c FROM t` (a table dependency with zero columns); entries emitted after the table entry in name order `n`, `v`, `w` ([../design/views.md](../design/views.md)) |
 | `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |
 | `hostfunc_check_table.jed` | **host-function check dependencies** (v35) — `t_a_check` with `check_flags` 0 beside `t_a_check1`, which calls the host function `geo_hash(i64) -> i64` (component `com.example/geo_hash`, semantic version 1) and so carries flags 1 + the dependency list (empty table) |

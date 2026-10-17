@@ -217,87 +217,127 @@ fn constraint_name_taken(t: &Table, name: &str) -> bool {
         || t.exclusions.iter().any(|e| e.name == name)
 }
 
-/// Resolve the parts of an EXCLUDE definition that are independent of naming. CREATE TABLE and
-/// ALTER TABLE must share this path so their operator/opclass and duplicate-column gates cannot
-/// drift (spec/design/gist.md §7).
-fn resolve_exclusion_definition(
-    table: &Table,
-    using: Option<&str>,
-    elements: &[(String, String)],
-) -> Result<(Vec<usize>, Vec<ExclusionElement>)> {
-    if let Some(method) = using {
-        if method != "gist" {
-            return Err(EngineError::new(
-                SqlState::UndefinedObject,
-                format!("access method {method} does not support exclusion constraints"),
-            ));
-        }
+/// Resolve the access method of an EXCLUDE definition (spec/design/gist.md §7/§7.2): no `USING` or
+/// `USING btree` is the ordered B-tree (PostgreSQL's default access method), `USING gist` the GiST
+/// index. `gin` exists but cannot enforce an exclusion (`0A000`, PostgreSQL's "does not support
+/// exclusion constraints"); any other method name does not exist (`42704`, as for CREATE INDEX).
+fn exclusion_method(using: Option<&str>) -> Result<IndexKind> {
+    match using {
+        None | Some("btree") => Ok(IndexKind::Btree),
+        Some("gist") => Ok(IndexKind::Gist),
+        Some("gin") => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "access method gin does not support exclusion constraints".to_string(),
+        )),
+        Some(other) => Err(EngineError::new(
+            SqlState::UndefinedObject,
+            format!("access method does not exist: {other}"),
+        )),
     }
-    let mut columns = Vec::with_capacity(elements.len());
-    let mut resolved = Vec::with_capacity(elements.len());
-    for (column_name, operator) in elements {
-        let column = table
-            .columns
-            .iter()
-            .position(|c| c.name == *column_name)
-            .ok_or_else(|| {
-                EngineError::new(
-                    SqlState::UndefinedColumn,
-                    format!("column {column_name} named in key does not exist"),
-                )
-            })?;
-        if columns.contains(&column) {
-            return Err(EngineError::new(
-                SqlState::DuplicateColumn,
-                format!("column {column_name} appears twice in exclusion constraint"),
-            ));
-        }
-        let ty = &table.columns[column].ty;
-        let op = match operator.as_str() {
-            "&&" => {
-                if ty.range_element().is_none() {
-                    return Err(EngineError::new(
-                        SqlState::UndefinedObject,
-                        format!(
-                            "data type {} has no default operator class for access method gist that accepts operator &&",
-                            ty.canonical_name()
-                        ),
-                    ));
-                }
-                ExclusionOp::Overlaps
-            }
-            "=" => {
-                if is_gist_scalar_type(ty) {
-                    ExclusionOp::Equal
-                } else if is_gist_deferred_scalar_type(ty) {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        format!(
-                            "an exclusion constraint with = over {} is not supported yet",
-                            ty.canonical_name()
-                        ),
-                    ));
-                } else {
-                    return Err(EngineError::new(
-                        SqlState::UndefinedObject,
-                        format!(
-                            "data type {} has no default operator class for access method gist",
-                            ty.canonical_name()
-                        ),
-                    ));
-                }
-            }
-            other => {
+}
+
+impl Engine {
+    /// Resolve the parts of an EXCLUDE definition that are independent of naming: the access
+    /// method, the element columns, and their operators. CREATE TABLE and ALTER TABLE share this
+    /// path so their operator/opclass and duplicate-column gates cannot drift (spec/design/gist.md
+    /// §7). Under `btree` (§7.2) every column needs a key-encodable type (the CREATE INDEX gate) and
+    /// every operator must be `=` — the only commutative btree operator (`42809` otherwise, as in
+    /// PostgreSQL). Under `gist` the operators are `&&` (range) and `=` (fixed-width scalar).
+    fn resolve_exclusion_definition(
+        &self,
+        table: &Table,
+        using: Option<&str>,
+        elements: &[(String, String)],
+    ) -> Result<(IndexKind, Vec<usize>, Vec<ExclusionElement>)> {
+        let method = exclusion_method(using)?;
+        let mut columns = Vec::with_capacity(elements.len());
+        let mut resolved = Vec::with_capacity(elements.len());
+        for (column_name, operator) in elements {
+            let column = table
+                .columns
+                .iter()
+                .position(|c| c.name == *column_name)
+                .ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::UndefinedColumn,
+                        format!("column {column_name} named in key does not exist"),
+                    )
+                })?;
+            // A repeated column is harmless to a btree exclusion (its backing ordered index admits a
+            // repeated key column, as CREATE INDEX does — PostgreSQL accepts it); the GiST tuple bound
+            // keeps the GX3 narrowing (42701).
+            if method == IndexKind::Gist && columns.contains(&column) {
                 return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    format!("exclusion constraint operator {other} is not supported yet"),
+                    SqlState::DuplicateColumn,
+                    format!("column {column_name} appears twice in exclusion constraint"),
                 ));
             }
-        };
-        columns.push(column);
-        resolved.push(ExclusionElement { column, op });
+            let ty = &table.columns[column].ty;
+            let op = if method == IndexKind::Btree {
+                // The opclass first (PostgreSQL's ComputeIndexAttrs order), then the operator.
+                self.check_index_column_type(IndexKind::Btree, ty)?;
+                if operator != "=" {
+                    return Err(EngineError::new(
+                        SqlState::WrongObjectType,
+                        format!(
+                            "operator {operator} is not a commutative member of the btree operator family of {}",
+                            ty.canonical_name()
+                        ),
+                    ));
+                }
+                ExclusionOp::Equal
+            } else {
+                gist_exclusion_op(ty, operator)?
+            };
+            columns.push(column);
+            resolved.push(ExclusionElement { column, op });
+        }
+        Ok((method, columns, resolved))
     }
-    Ok((columns, resolved))
+}
+
+/// The GiST `WITH` operator of one EXCLUDE element over a column of type `ty` (gist.md §7): `&&`
+/// needs a range column (`range_ops`), `=` a fixed-width keyable scalar (the in-core `btree_gist`).
+fn gist_exclusion_op(ty: &Type, operator: &str) -> Result<ExclusionOp> {
+    match operator {
+        "&&" => {
+            if ty.range_element().is_none() {
+                return Err(EngineError::new(
+                    SqlState::UndefinedObject,
+                    format!(
+                        "data type {} has no default operator class for access method gist that accepts operator &&",
+                        ty.canonical_name()
+                    ),
+                ));
+            }
+            Ok(ExclusionOp::Overlaps)
+        }
+        "=" => {
+            if is_gist_scalar_type(ty) {
+                Ok(ExclusionOp::Equal)
+            } else if is_gist_deferred_scalar_type(ty) {
+                Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "an exclusion constraint with = over {} is not supported yet",
+                        ty.canonical_name()
+                    ),
+                ))
+            } else {
+                Err(EngineError::new(
+                    SqlState::UndefinedObject,
+                    format!(
+                        "data type {} has no default operator class for access method gist",
+                        ty.canonical_name()
+                    ),
+                ))
+            }
+        }
+        other => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            format!("exclusion constraint operator {other} is not supported yet"),
+        )),
+    }
 }
 
 /// Where an identity column's owned sequence lives during an `ALTER TABLE` action list
@@ -438,6 +478,28 @@ impl Engine {
             || ty.is_range()
             || is_array_keyable(ty)
             || (ty.is_composite() && self.read_snap().resolve_col_type(ty).keyable())
+    }
+
+    /// Validate a partial index's `WHERE predicate` (spec/design/indexes.md §9) — shared by
+    /// `CREATE INDEX … WHERE` and the partial `EXCLUDE … WHERE (predicate)` (gist.md §7.1) so the
+    /// two cannot drift: a subquery is `0A000` and a bind parameter `42P02` (structural pre-walk);
+    /// an aggregate `42803`, a window `42P20`, a non-boolean `42804` (the Forbidden-context boolean
+    /// resolve); a non-immutable dependency `42P17` (index-dependencies.md). Host-function and
+    /// time-zone dependencies accumulate into `host_deps` / `timezone_deps`. Returns the stored form
+    /// (the canonical text + the unresolved AST, re-resolved per statement).
+    pub(crate) fn resolve_index_predicate(
+        &self,
+        table: &Table,
+        pred: &crate::ast::IndexPredicate,
+        host_deps: &mut Vec<HostFuncDep>,
+        timezone_deps: &mut TimeZoneDeps,
+    ) -> Result<IndexKeyExpr> {
+        self.admit_index_expr(table, &pred.expr, true, host_deps, timezone_deps)?;
+        Ok(IndexKeyExpr {
+            expr_text: pred.text.clone(),
+            expr: pred.expr.clone(),
+            unparsed: false,
+        })
     }
 
     /// The `CREATE INDEX` column-type gate for one index kind (indexes.md §1, gin.md §3, gist.md §6):
@@ -1727,8 +1789,22 @@ impl Engine {
         // name; 42P07/42710 across the relation + constraint namespaces), and build the
         // **multi-column** GiST index that enforces it. The probe + `23P01` live in INSERT/UPDATE.
         for exc in &ct.excludes {
-            let (indices, elements) =
-                resolve_exclusion_definition(&table, exc.using.as_deref(), &exc.elements)?;
+            let (method, indices, elements) =
+                self.resolve_exclusion_definition(&table, exc.using.as_deref(), &exc.elements)?;
+            // The partial form's predicate (gist.md §7.1), validated as a partial index's.
+            let mut host_deps = Vec::new();
+            let mut timezone_deps = TimeZoneDeps::default();
+            let predicate = match &exc.predicate {
+                Some(p) => Some(self.resolve_index_predicate(
+                    &table,
+                    p,
+                    &mut host_deps,
+                    &mut timezone_deps,
+                )?),
+                None => None,
+            };
+            sort_host_deps(&mut host_deps);
+            timezone_deps.validate()?;
             // Name the constraint (= its backing index name). An explicit name checks the relation
             // namespace (42P07) then the table's constraint names (42710); a derived
             // `<table>_<cols>_excl` suffix-walks both.
@@ -1783,12 +1859,15 @@ impl Engine {
                 IndexDef {
                     name: name.clone(),
                     keys: indices.into_iter().map(IndexKey::Column).collect(),
+                    // A btree exclusion's index is NOT unique (PostgreSQL's indisunique = false):
+                    // the constraint, not the index, enforces it (23P01, gist.md §7.2), so it is no
+                    // FOREIGN KEY target and no ON CONFLICT column-list arbiter.
                     unique: false,
-                    kind: IndexKind::Gist,
-                    predicate: None,
-                    // A GiST exclusion-backing index is plain-column — no host dependency.
-                    host_deps: Vec::new(),
-                    timezone_deps: TimeZoneDeps::default(),
+                    kind: method,
+                    predicate,
+                    // Plain-column keys; only a partial predicate can carry a dependency.
+                    host_deps,
+                    timezone_deps,
                 },
             );
             table.exclusions.push(ExclusionConstraint {
@@ -2384,7 +2463,21 @@ impl Engine {
                             }),
                             ColumnSource::Added => false,
                         };
-                        if !cascade && (self_ref_fk_dep || incoming_dep) {
+                        // A partial exclusion whose predicate (but no element) reads the column
+                        // depends on it NORMALLY, as in PostgreSQL: RESTRICT refuses, CASCADE drops
+                        // the constraint (gist.md §7.1). An element column is an internal one.
+                        let exclusion_predicate_dep = table.exclusions.iter().any(|e| {
+                            !e.elements.iter().any(|x| x.column == ci)
+                                && table.indexes.iter().any(|i| {
+                                    i.name == e.index
+                                        && i.predicate.as_ref().is_some_and(|p| {
+                                            check_referenced_columns(&p.expr, &table.columns)
+                                                .contains(&ci)
+                                        })
+                                })
+                        });
+                        if !cascade && (self_ref_fk_dep || incoming_dep || exclusion_predicate_dep)
+                        {
                             return Err(EngineError::new(
                                 SqlState::DependentObjectsStillExist,
                                 format!(
@@ -2436,8 +2529,12 @@ impl Engine {
                             }
                             !uses
                         });
+                        let indexes = &table.indexes;
                         table.exclusions.retain(|e| {
-                            let uses = e.elements.iter().any(|x| x.column == ci);
+                            // An element column, or a column of a partial exclusion's predicate
+                            // (whose backing index the predicate check above just removed).
+                            let uses = e.elements.iter().any(|x| x.column == ci)
+                                || !indexes.iter().any(|i| i.name == e.index);
                             if uses {
                                 removed.push(e.name.to_string());
                             }
@@ -2904,11 +3001,26 @@ impl Engine {
                                 added_constraints.insert(name.to_string());
                             }
                             AlterConstraintDef::Exclude(d) => {
-                                let (cols, els) = resolve_exclusion_definition(
+                                let (method, cols, els) = self.resolve_exclusion_definition(
                                     &table,
                                     d.using.as_deref(),
                                     &d.elements,
                                 )?;
+                                // The partial form's predicate (gist.md §7.1), validated as a
+                                // partial index's, against the working table.
+                                let mut host_deps = Vec::new();
+                                let mut timezone_deps = TimeZoneDeps::default();
+                                let predicate = match &d.predicate {
+                                    Some(p) => Some(self.resolve_index_predicate(
+                                        &table,
+                                        p,
+                                        &mut host_deps,
+                                        &mut timezone_deps,
+                                    )?),
+                                    None => None,
+                                };
+                                sort_host_deps(&mut host_deps);
+                                timezone_deps.validate()?;
                                 let name = if let Some(name) = d.name {
                                     check_reserved_name("constraint", &name)?;
                                     if working_relation_taken(
@@ -2950,10 +3062,10 @@ impl Engine {
                                     name: name.clone(),
                                     keys: cols.into_iter().map(IndexKey::Column).collect(),
                                     unique: false,
-                                    kind: IndexKind::Gist,
-                                    predicate: None,
-                                    host_deps: Vec::new(),
-                                    timezone_deps: TimeZoneDeps::default(),
+                                    kind: method,
+                                    predicate,
+                                    host_deps,
+                                    timezone_deps,
                                 });
                                 table.exclusions.push(ExclusionConstraint {
                                     name: name.clone(),
@@ -3921,27 +4033,56 @@ impl Engine {
                     }
                 }
             }
-            for ex in table
+            // EXCLUDE validation over the existing rows (gist.md §7, alter.md §5): every unordered
+            // pair of PARTICIPATING rows — those a partial constraint's predicate admits (§7.1) —
+            // charges one constraint_check; a pair conflicts when both carry a probe key and the
+            // keys conflict (equal ordered prefixes for a btree exclusion, §7.2, the conjunction
+            // for a GiST one).
+            let validated: Vec<ExclusionConstraint> = table
                 .exclusions
                 .iter()
                 .filter(|e| added_constraints.contains(&e.name.to_string()))
-            {
-                for i in 0..rows.len() {
-                    let mut a = rows[i].1.clone();
+                .cloned()
+                .collect();
+            for ex in &validated {
+                let def = table
+                    .indexes
+                    .iter()
+                    .find(|i| i.name == ex.index)
+                    .expect("an exclusion constraint has its backing index");
+                let chk = ExclusionCheck {
+                    exc: ex.clone(),
+                    rindex: self.resolve_index(&table, def)?,
+                };
+                let mut members: Vec<(Row, Option<ExclusionKey>)> = Vec::new();
+                for (_, r) in &rows {
+                    let mut a = r.clone();
                     store.resolve_inline_columns(&mut a)?;
+                    if !self.exclusion_participates(&chk, &a)? {
+                        continue;
+                    }
+                    let k = self.exclusion_key(&chk, &table.columns, &col_types, &colls, &a)?;
+                    members.push((a, k));
+                }
+                for i in 0..members.len() {
                     for j in 0..i {
                         meter.charge(COSTS.constraint_check);
                         meter.guard()?;
-                        let mut b = rows[j].1.clone();
-                        store.resolve_inline_columns(&mut b)?;
-                        if exclusion_pair_conflicts(&table.columns, ex, &a, &b)? {
+                        let ((a, ka), (b, kb)) = (&members[i], &members[j]);
+                        let conflict = match (ka, kb) {
+                            (Some(ka), Some(kb)) => {
+                                exclusion_keys_conflict(&table.columns, ex, ka, a, kb, b)?
+                            }
+                            _ => false,
+                        };
+                        if conflict {
                             return Err(EngineError::exclusion_violation(&table.name, &ex.name)
                                 .with_detail(self.exclusion_detail(
                                     &table.name,
                                     &table.columns,
                                     ex,
-                                    &a,
-                                    &b,
+                                    a,
+                                    b,
                                     false,
                                 )));
                         }
@@ -4002,7 +4143,13 @@ impl Engine {
         if rekeyed {
             ws.rebuild_alter_indexes(&original, &table, &constraint_entries, page_size)?;
         } else {
-            ws.sync_alter_constraint_indexes(&original, &table, &constraint_entries, page_size)?;
+            ws.sync_alter_constraint_indexes(
+                &original,
+                &table,
+                &constraint_entries,
+                page_size,
+                ir,
+            )?;
         }
         ws.cascade_dropped_unique_fks(&table.name, &cascade_unique_cols);
         if rewrite_needed {
@@ -5072,12 +5219,12 @@ impl Engine {
                         ),
                     ));
                 }
-                self.admit_index_expr(table, &pred.expr, true, &mut host_deps, &mut timezone_deps)?;
-                Some(IndexKeyExpr {
-                    expr_text: pred.text.clone(),
-                    expr: pred.expr.clone(),
-                    unparsed: false,
-                })
+                Some(self.resolve_index_predicate(
+                    table,
+                    pred,
+                    &mut host_deps,
+                    &mut timezone_deps,
+                )?)
             }
         };
         sort_host_deps(&mut host_deps);

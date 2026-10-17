@@ -708,6 +708,32 @@ fn gist_exclude_table_db() -> Session {
     db
 }
 
+/// The v45 exclusion follow-ons (spec/design/gist.md §7.1/§7.2): an `EXCLUDE USING btree` whose
+/// backing index is an ordered, non-unique two-column B-tree, beside a partial `EXCLUDE USING gist …
+/// WHERE (b > 0)` whose GiST index carries the predicate and holds only rows 1 and 4. Mirrors the Ruby
+/// reference's `EXCLUDE_FOLLOWON_TABLE`.
+fn exclude_followon_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, a i32, c text, span i32range, b i32, \
+         EXCLUDE USING btree (a WITH =, c WITH =), \
+         EXCLUDE USING gist (span WITH &&) WHERE (b > 0))",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, 1, 'x', '[1,5)', 1), (2, 1, 'y', '[1,5)', 0), \
+         (3, 2, 'x', '[3,8)', NULL), (4, NULL, 'x', '[10,20)', 2), (5, 1, NULL, '[2,4)', -1)",
+    );
+    db
+}
+
 /// `i_tags_gin` / `i_r_gin` — gIN indexes over f64[] and f32[] columns (kind 1) — the float GIN element golden
 /// (spec/design/gin.md §2/§4): each GIN term is the element's canonicalizing float-order-preserving
 /// key (encoding.md §2.8), so -0 and +0 share a term (row 1's tags) and every NaN is ONE term (row
@@ -2069,6 +2095,7 @@ fn write_matches_goldens() {
         ("gist_range_table.jed", gist_range_table_db),
         ("gist_scalar_table.jed", gist_scalar_table_db),
         ("gist_exclude_table.jed", gist_exclude_table_db),
+        ("exclude_followon_table.jed", exclude_followon_table_db),
         ("array_composite_table.jed", array_composite_table_db),
         (
             "composite_array_field_table.jed",
@@ -2178,6 +2205,7 @@ fn read_goldens_reproduces_rows() {
         ("gist_range_table.jed", gist_range_table_db, "t"),
         ("gist_scalar_table.jed", gist_scalar_table_db, "t"),
         ("gist_exclude_table.jed", gist_exclude_table_db, "booking"),
+        ("exclude_followon_table.jed", exclude_followon_table_db, "t"),
         ("array_composite_table.jed", array_composite_table_db, "t"),
         (
             "composite_array_field_table.jed",

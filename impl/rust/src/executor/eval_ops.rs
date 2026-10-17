@@ -2199,6 +2199,10 @@ pub(crate) enum Arbiter {
     PrimaryKey,
     /// A unique index, by position in the table's `indexes` list.
     Index(usize),
+    /// An `EXCLUDE` constraint, by position in the table's `exclusions` list — named by
+    /// `ON CONSTRAINT`, and legal only with `DO NOTHING` (spec/design/upsert.md §2, PostgreSQL's
+    /// `42809` for `DO UPDATE`).
+    Exclusion(usize),
 }
 
 /// The resolved `ON CONFLICT` action (spec/design/upsert.md §5).
@@ -2404,6 +2408,9 @@ pub(crate) fn resolve_arbiter(
             {
                 return Ok(Some(Arbiter::Index(i)));
             }
+            if let Some(i) = tdef.exclusions.iter().position(|e| e.name == *name) {
+                return Ok(Some(Arbiter::Exclusion(i)));
+            }
             Err(EngineError::new(
                 SqlState::UndefinedObject,
                 format!("constraint {} for table {} does not exist", name, tdef.name),
@@ -2427,6 +2434,7 @@ pub(crate) fn arbiter_key(
     match arb {
         Arbiter::PrimaryKey => Ok(Some(encode_pk_key(pk, col_types, colls, row)?)),
         Arbiter::Index(i) => index_prefix_key(col_types, colls, &rindexes[*i], row, env),
+        Arbiter::Exclusion(_) => unreachable!("an exclusion arbiter has no arbiter key"),
     }
 }
 

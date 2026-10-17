@@ -363,7 +363,8 @@ jed_constraints(
   columns     text[],            -- member/local column names: UNIQUE members, FK local columns,
                                  --   or EXCLUDE columns (constraint order); NULL for a CHECK
   expression  text,              -- the CHECK expression text (the persisted canonical token form,
-                                 --   constraints.md §4.5 — cross-core byte-identical); NULL otherwise
+                                 --   constraints.md §4.5 — cross-core byte-identical), or a partial
+                                 --   EXCLUDE's WHERE predicate text (gist.md §7.1); NULL otherwise
   ref_table   text,              -- FOREIGN KEY: the referenced (parent) table name; NULL otherwise
   ref_columns text[],            -- FOREIGN KEY: the referenced parent column names (list order);
                                  --   NULL otherwise
@@ -375,7 +376,7 @@ jed_constraints(
 
 **`jed_indexes` lists every secondary index** in `table.indexes` — a plain `CREATE INDEX`, a
 `CREATE UNIQUE INDEX`, the unique index that *backs* a `UNIQUE` constraint (constraints.md §5), and
-the GiST index that *backs* an `EXCLUDE` constraint (gist.md §7). A constraint-backing index
+the index — GiST, or a non-unique ordered one for `USING btree` — that *backs* an `EXCLUDE` constraint (gist.md §7). A constraint-backing index
 therefore appears in **both** `jed_indexes` and `jed_constraints` under the same name — the same
 parallel PostgreSQL keeps between `pg_indexes` and `pg_constraint`, and the join key between the two
 relations. `is_unique` is the catalog's `unique` flag; `method` renders the index kind;
@@ -399,7 +400,9 @@ which jed does not have. `operators` was added after I2 under the §5 "growth by
 rule, and so was `match_type`: an FK's match type, `'simple'` (the default, written or not) or
 `'full'`, lowercased like `type` and `jed_indexes.method` (PostgreSQL's `pg_constraint.confmatchtype`
 holds `s` / `f`).
-`expression` is populated for `type = 'check'` only, from the persisted canonical expression text
+`expression` is populated for `type = 'check'`, and for a **partial** `type = 'exclude'` (its
+`WHERE (predicate)`, the backing index's predicate text — gist.md §7.1, the same text
+`jed_indexes.predicate` shows), from the persisted canonical expression text
 (constraints.md §4.5), which is already cross-core byte-identical, so it needs no new
 canonical-form work (contrast the deferred `DEFAULT` rendering of §5).
 

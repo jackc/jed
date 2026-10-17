@@ -1128,18 +1128,27 @@ impl Snapshot {
         next: &Table,
         entries: &std::collections::HashMap<String, Vec<Vec<u8>>>,
         page_size: u32,
+        index_rename: Option<(&str, &str)>,
     ) -> Result<()> {
         let live: std::collections::HashSet<String> =
             next.indexes.iter().map(|i| i.name.to_string()).collect();
         for i in &old.indexes {
             let k = i.name.to_string();
-            if !live.contains(&k) {
+            if !live.contains(&k) && index_rename.is_none_or(|(from, _)| from != k) {
                 std::sync::Arc::make_mut(&mut self.index_stores).remove(&k);
                 std::sync::Arc::make_mut(&mut self.gist_trees).remove(&k);
             }
         }
-        let prior: std::collections::HashSet<String> =
-            old.indexes.iter().map(|i| i.name.to_string()).collect();
+        // A RENAME CONSTRAINT of a UNIQUE / EXCLUDE moved its backing index's store to the new name
+        // (`alter_table_catalog`), so the renamed index is a prior one: keep its entries.
+        let prior: std::collections::HashSet<String> = old
+            .indexes
+            .iter()
+            .map(|i| match index_rename {
+                Some((from, to)) if i.name == from => to.to_string(),
+                _ => i.name.to_string(),
+            })
+            .collect();
         for i in &next.indexes {
             let k = i.name.to_string();
             let rebuild = entries.contains_key(&k);

@@ -1534,7 +1534,12 @@ impl Engine {
                     Value::Text(t.name.clone()),
                     Value::Text("exclude".to_string()),
                     text_arr(cols),
-                    Value::Null,
+                    // A partial exclusion's WHERE predicate text (gist.md §7.1); NULL otherwise.
+                    t.indexes
+                        .iter()
+                        .find(|i| i.name == exc.index)
+                        .and_then(|i| i.predicate.as_ref())
+                        .map_or(Value::Null, |p| Value::Text(p.expr_text.clone())),
                     Value::Null,
                     Value::Null,
                     text_arr(ops),

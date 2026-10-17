@@ -78,7 +78,21 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 			}
 		}
 	}
-	if !d.Cascade && (selfRefFkDep || incomingDep) {
+	// A partial exclusion whose predicate (but no element) reads the column depends on it NORMALLY,
+	// as in PostgreSQL: RESTRICT refuses, CASCADE drops the constraint (gist.md §7.1). An element
+	// column is an internal one.
+	exclusionPredicateDep := false
+	for _, ex := range t.Exclusions {
+		if slices.ContainsFunc(ex.Elements, func(el exclusionElement) bool { return el.Column == ci }) {
+			continue
+		}
+		for _, ix := range t.Indexes {
+			if ix.Name == ex.Index && ix.Predicate != nil && usesExpr(ix.Predicate.Expr) {
+				exclusionPredicateDep = true
+			}
+		}
+	}
+	if !d.Cascade && (selfRefFkDep || incomingDep || exclusionPredicateDep) {
 		return newError(DependentObjectsStillExist, "cannot drop column "+d.Name+" because other objects depend on it").
 			hinted(hintDropCascade)
 	}
@@ -129,7 +143,9 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	t.Indexes = indexes
 	exclusions := t.Exclusions[:0]
 	for _, ex := range t.Exclusions {
-		uses := false
+		// An element column, or a column of a partial exclusion's predicate (whose backing index the
+		// predicate check above just removed).
+		uses := !slices.ContainsFunc(t.Indexes, func(ix indexDef) bool { return ix.Name == ex.Index })
 		for _, el := range ex.Elements {
 			uses = uses || el.Column == ci
 		}
@@ -432,40 +448,15 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 		return nil
 	}
 	d := def.Exclude
-	if d.Using != "" && d.Using != "gist" {
-		return newError(UndefinedObject, "access method "+d.Using+" does not support exclusion constraints")
+	method, cols, elements, err := db.resolveExclusionDefinition(t, d.Using, d.Elements)
+	if err != nil {
+		return err
 	}
-	cols := make([]int, 0, len(d.Elements))
-	elements := make([]exclusionElement, 0, len(d.Elements))
-	for _, el := range d.Elements {
-		ci := t.ColumnIndex(el.Column)
-		if ci < 0 {
-			return newError(UndefinedColumn, "column "+el.Column+" named in key does not exist")
-		}
-		if slices.Contains(cols, ci) {
-			return newError(DuplicateColumn, "column "+el.Column+" appears twice in exclusion constraint")
-		}
-		ty := t.Columns[ci].Type
-		var op exclusionOp
-		switch el.Op {
-		case "&&":
-			if !ty.IsRange() {
-				return newError(UndefinedObject, "data type "+ty.CanonicalName()+" has no default operator class for access method gist that accepts operator &&")
-			}
-			op = exclOverlaps
-		case "=":
-			if isGistScalarType(ty) {
-				op = exclEqual
-			} else if isGistDeferredScalarType(ty) {
-				return newError(FeatureNotSupported, "an exclusion constraint with = over "+ty.CanonicalName()+" is not supported yet")
-			} else {
-				return newError(UndefinedObject, "data type "+ty.CanonicalName()+" has no default operator class for access method gist")
-			}
-		default:
-			return newError(FeatureNotSupported, "exclusion constraint operator "+el.Op+" is not supported yet")
-		}
-		cols = append(cols, ci)
-		elements = append(elements, exclusionElement{Column: ci, Op: op})
+	// The partial form's predicate (gist.md §7.1), validated as a partial index's, against the
+	// working table.
+	predicate, hostDeps, timezoneDeps, err := db.resolveExclusionPredicate(t, d.Predicate)
+	if err != nil {
+		return err
 	}
 	name := d.Name
 	if name != "" {
@@ -483,7 +474,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			return relationTaken(n) || constraintNameTaken(t, n) || schemaConstraintNameTaken(snap, t.Name, n)
 		})
 	}
-	t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Kind: indexGist})
+	t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Kind: method, Predicate: predicate, HostDeps: hostDeps, TimezoneDeps: timezoneDeps})
 	sort.SliceStable(t.Indexes, func(i, j int) bool { return t.Indexes[i].Name < t.Indexes[j].Name })
 	t.Exclusions = append(t.Exclusions, exclusionConstraint{Name: name, Index: name, Elements: elements})
 	sort.SliceStable(t.Exclusions, func(i, j int) bool {
@@ -784,31 +775,64 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 			}
 		}
 	}
+	// EXCLUDE validation over the existing rows (gist.md §7, alter.md §5): every unordered pair of
+	// PARTICIPATING rows — those a partial constraint's predicate admits (§7.1) — charges one
+	// constraint_check; a pair conflicts when both carry a probe key and the keys conflict (equal
+	// ordered prefixes for a btree exclusion, §7.2, the conjunction for a GiST one).
 	for _, ex := range t.Exclusions {
 		if !st.added[ex.Name] {
 			continue
 		}
-		for i := 0; i < len(rows); i++ {
-			a, err := store.resolveInlineColumns(rows[i].Row)
+		pos := slices.IndexFunc(t.Indexes, func(ix indexDef) bool { return ix.Name == ex.Index })
+		if pos < 0 {
+			panic("an exclusion constraint has its backing index")
+		}
+		ri, err := db.resolveIndex(t, t.Indexes[pos])
+		if err != nil {
+			return nil, err
+		}
+		chk := &exclusionCheck{exc: ex, rindex: ri}
+		type member struct {
+			row storedRow
+			key exclusionKey
+			has bool
+		}
+		var members []member
+		for _, e := range rows {
+			a, err := store.resolveInlineColumns(e.Row)
 			if err != nil {
 				return nil, err
 			}
+			ok, err := db.exclusionParticipates(chk, a)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			k, has, err := db.exclusionKeyFor(chk, t.Columns, colTypes, colls, a)
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, member{row: a, key: k, has: has})
+		}
+		for i := range members {
 			for j := 0; j < i; j++ {
 				meter.Charge(costs.ConstraintCheck)
 				if err := meter.Guard(); err != nil {
 					return nil, err
 				}
-				b, err := store.resolveInlineColumns(rows[j].Row)
-				if err != nil {
-					return nil, err
-				}
-				conflict, err := exclusionPairConflicts(t.Columns, ex, a, b)
-				if err != nil {
-					return nil, err
+				a, b := members[i], members[j]
+				conflict := false
+				if a.has && b.has {
+					conflict, err = exclusionKeysConflict(t.Columns, ex, a.key, a.row, b.key, b.row)
+					if err != nil {
+						return nil, err
+					}
 				}
 				if conflict {
 					return nil, newExclusionViolation(t.Name, ex.Name).
-						withDetail(db.exclusionDetail(t.Name, t.Columns, ex, a, b, false))
+						withDetail(db.exclusionDetail(t.Name, t.Columns, ex, a.row, b.row, false))
 				}
 			}
 		}

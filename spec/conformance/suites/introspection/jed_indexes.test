@@ -9,7 +9,7 @@
 # jed_columns.pk_ordinal. Resolution / qualifier scoping / read-only rejection / privileges / cost
 # are the same model as jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT
 # PostgreSQL-oracle-checked.
-# requires: introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, ddl.exclusion_constraint, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
+# requires: introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, ddl.exclusion_constraint, ddl.exclusion_btree, ddl.exclusion_partial, types.boolean, types.boolean_storable, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
 
 # --- an empty database lists no indexes (catalog relations are not themselves indexes) ------------
 
@@ -229,3 +229,23 @@ query I nosort
 SELECT count(*) FROM jed_indexes
 ----
 4
+
+# --- EXCLUDE follow-ons (gist.md §7.1/§7.2): a btree exclusion's backing index is an ordered,
+# NON-unique index; a partial exclusion's backing index carries the predicate --------------------
+
+statement ok
+CREATE TABLE shift (id i32 PRIMARY KEY, worker i32, span i32range, live boolean, EXCLUDE (worker WITH =), EXCLUDE USING gist (span WITH &&) WHERE (live))
+
+query TTBTT nosort
+SELECT name, columns::text, is_unique, method, predicate FROM jed_indexes WHERE table_name = 'shift' ORDER BY name
+----
+shift_span_excl
+{span}
+false
+gist
+live
+shift_worker_excl
+{worker}
+false
+btree
+NULL

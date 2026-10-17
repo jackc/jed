@@ -1315,7 +1315,9 @@ func (p *parser) atExclusionTableConstraint() bool {
 // parseExclusionTableConstraint parses one `[CONSTRAINT name] EXCLUDE [USING method] ( col WITH op
 // [, col2 WITH op2 ...] )` (the cursor is verified by atExclusionTableConstraint). Each operand is a
 // bare column name; the WITH operator is captured as its source text (= / &&) and mapped to a
-// strategy at execution (spec/design/gist.md §7). The USING method (only gist) is captured verbatim.
+// strategy at execution (spec/design/gist.md §7). The USING method (btree / gist) is captured
+// verbatim and validated at execution; an optional `WHERE ( predicate )` follows (the partial form,
+// §7.1).
 func (p *parser) parseExclusionTableConstraint() (excludeDef, error) {
 	var name string
 	if p.peekKeyword() == "constraint" {
@@ -1364,7 +1366,27 @@ func (p *parser) parseExclusionTableConstraint() (excludeDef, error) {
 		}
 		break
 	}
-	return excludeDef{Name: name, Using: using, Elements: elements}, nil
+	// The partial form `WHERE ( predicate )` (gist.md §7.1) — PostgreSQL's ExclusionWhereClause
+	// requires the parentheses. The text captured is the inner expression's (the partial-index
+	// predicate's canonical form, indexes.md §9).
+	var predicate *indexPredicate
+	if p.peekKeyword() == "where" {
+		p.advance()
+		if err := p.expect(tokLParen); err != nil {
+			return excludeDef{}, err
+		}
+		start := p.pos
+		expr, err := p.parseExpr()
+		if err != nil {
+			return excludeDef{}, err
+		}
+		text := renderTokens(p.tokens[start:p.pos])
+		if err := p.expect(tokRParen); err != nil {
+			return excludeDef{}, err
+		}
+		predicate = &indexPredicate{Text: text, Expr: expr}
+	}
+	return excludeDef{Name: name, Using: using, Elements: elements, Predicate: predicate}, nil
 }
 
 // atForeignKeyTableConstraint reports whether the cursor sits on a table-level FOREIGN KEY

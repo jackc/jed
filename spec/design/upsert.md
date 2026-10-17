@@ -120,10 +120,17 @@ is never an arbiter.)
 - **`ON CONSTRAINT name`.** By exact name ([grammar.md §3](grammar.md)): the synthesized
   **`<table>_pkey`** names the primary key (jed does not persist that name but accepts it as
   an arbiter spelling — symmetric with the `23505` message, constraints.md §5.4); otherwise
-  a **unique index** of that name. A name matching neither — including a *non-unique* index —
-  is **`42704`** (*constraint "name" for table "table" does not exist*).
+  a **unique index** of that name; otherwise an **`EXCLUDE` constraint** of that name
+  ([gist.md §7](gist.md)), which arbitrates `DO NOTHING` only — `DO UPDATE` with an exclusion
+  arbiter is **`42809`** (*ON CONFLICT DO UPDATE not supported with exclusion constraints*,
+  PostgreSQL's). A name matching none — including a *non-unique* index — is **`42704`**
+  (*constraint "name" for table "table" does not exist*). A column-list target never infers an
+  exclusion constraint (its backing index is not unique, even an all-`=` btree one), so it is
+  `42P10` as above.
 - **No target.** Legal **only** with `DO NOTHING`, where the arbiter is **any** uniqueness
-  constraint: the row is skipped if it conflicts on the PK or *any* unique index. `DO UPDATE`
+  or exclusion constraint: the row is skipped if it conflicts on the PK, *any* unique index, or
+  *any* `EXCLUDE` constraint (an exclusion conflict is with a stored row or with an earlier row the
+  statement already plans to insert — the §3 row-at-a-time visibility). `DO UPDATE`
   with no target is **`42601`** (*ON CONFLICT DO UPDATE requires inference specification or
   constraint name*) — PostgreSQL's message, raised at plan time.
 
@@ -195,6 +202,14 @@ updates, each in phase-1 order). So `ON CONFLICT (id) DO UPDATE SET id = exclude
 onto a key some other row holds is `23505`, as in PostgreSQL, while a proposal whose key an
 earlier update vacated is inserted (probed: `VALUES (1, …), (1, …) … DO UPDATE SET id = 7`
 moves row 1 to 7 and then inserts a new row 1).
+
+**Exclusion constraints** ([gist.md §7](gist.md)) join the same model. An exclusion arbiter
+(`ON CONSTRAINT <exclusion> DO NOTHING`) has no arbiter key: step 1–3 become "does any stored row,
+or any insert this statement already planned, conflict with `R` under that constraint?" — skip if
+so, else plan an insert. The no-target skip asks the same of every exclusion constraint, after the
+PK / unique checks. Every remaining exclusion conflict — of a planned insert or an updated row's new
+values, against stored rows the statement keeps or against each other — is validated against the
+end state after the FOREIGN KEY checks, trapping **`23P01`**.
 
 ## 4. The second-affect rule (`21000`)
 
@@ -333,7 +348,9 @@ except `42P09` (`ambiguous_alias`), added with the target alias (§5). The codes
 | `21000` | `DO UPDATE` would affect a row a second time (§4). Message: *ON CONFLICT DO UPDATE command cannot affect row a second time*. |
 | `42601` | `DO UPDATE` with no conflict target (§2). Message: *ON CONFLICT DO UPDATE requires inference specification or constraint name*. |
 | `42P10` | A column-list target matches no unique index / PK, including one whose `COLLATE` / operator-class decoration no index satisfies (§2). Message: *there is no unique or exclusion constraint matching the ON CONFLICT specification*. Also `ASC`/`DESC` or `NULLS FIRST`/`LAST` on a target element (*ASC/DESC is not allowed in ON CONFLICT clause*, *NULLS FIRST/LAST is not allowed in ON CONFLICT clause*). |
-| `42704` | `ON CONSTRAINT name` names no unique constraint (§2). Message: *constraint "name" for table "table" does not exist*. Also an element's unknown collation (*collation "x" does not exist*) or operator class (*operator class "x" does not exist for access method "btree"*). |
+| `42704` | `ON CONSTRAINT name` names no unique or exclusion constraint (§2). Message: *constraint "name" for table "table" does not exist*. Also an element's unknown collation (*collation "x" does not exist*) or operator class (*operator class "x" does not exist for access method "btree"*). |
+| `42809` | `ON CONSTRAINT` names an exclusion constraint with `DO UPDATE` (§2). Message: *ON CONFLICT DO UPDATE not supported with exclusion constraints*. |
+| `23P01` | An exclusion conflict the arbiter does not cover (§3, [gist.md §7](gist.md)). |
 | `42703` | An unknown column in the target list or `SET` (§2, §5). |
 | `42P01` | A `SET`/`WHERE`/`RETURNING` reference qualified by the table's name under an `AS alias` (§5). |
 | `42P09` | `excluded.col` in `DO UPDATE` when the target is itself labeled `excluded` (§5). |

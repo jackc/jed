@@ -130,6 +130,10 @@ neither maintained nor trusted for an access path. This is the index rule of
   table's other indexes rebuild normally with `REINDEX INDEX`.
 - **Proceeds:** `DROP INDEX` of it, `DROP TABLE`, `ALTER TABLE … ADD COLUMN` (with or without a
   default; it leaves every index entry valid), and every read.
+- **A partial `EXCLUDE … WHERE (predicate)`** ([gist.md §7.1](gist.md)) keeps its predicate on its
+  backing index, so the same rules apply to it, with one difference: its backing index belongs to the
+  constraint, so `DROP INDEX` is `2BP01` and the handle is `ALTER TABLE … DROP CONSTRAINT`, which
+  proceeds. The fixture's table `e` pins it.
 
 ## 4. Introspection
 

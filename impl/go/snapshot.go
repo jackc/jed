@@ -1313,21 +1313,28 @@ func (s *snapshot) alterTableRewrite(t *catTable, colTypes []colType, entries []
 
 // syncAlterConstraintIndexes applies the backing-store delta for ALTER TABLE slice 2 after the
 // final catalog and row validation have succeeded. Entries are already sorted by raw key bytes.
-func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32) error {
+// indexOld/indexNew name a RENAME CONSTRAINT's backing-index rename ("" when none).
+func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32, indexOld, indexNew string) error {
 	live := make(map[string]bool, len(next.Indexes))
 	for _, ix := range next.Indexes {
 		live[ix.Name] = true
 	}
 	for _, ix := range old.Indexes {
 		key := ix.Name
-		if !live[key] {
+		if !live[key] && (indexOld == "" || key != indexOld) {
 			delete(s.indexStores, key)
 			delete(s.gistTrees, key)
 		}
 	}
+	// A RENAME CONSTRAINT of a UNIQUE / EXCLUDE moved its backing index's store to the new name
+	// (alterTableCatalog), so the renamed index is a prior one: keep its entries.
 	oldNames := make(map[string]bool, len(old.Indexes))
 	for _, ix := range old.Indexes {
-		oldNames[ix.Name] = true
+		if indexOld != "" && ix.Name == indexOld {
+			oldNames[indexNew] = true
+		} else {
+			oldNames[ix.Name] = true
+		}
 	}
 	for _, ix := range next.Indexes {
 		key := ix.Name

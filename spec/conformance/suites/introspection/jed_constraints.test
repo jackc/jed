@@ -11,7 +11,7 @@
 # b-tree index; a constraint-backing index appears in both jed_constraints and jed_indexes under the
 # same name. Resolution / scoping / read-only / privileges / cost are the jed_tables model.
 # jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: introspect.constraints, introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.foreign_key_match_full, ddl.not_null, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range, types.array, expr.array_subscript, ddl.gist_scalar_index
+# requires: introspect.constraints, introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.exclusion_btree, ddl.exclusion_partial, ddl.alter_table, types.boolean, types.boolean_storable, ddl.foreign_key_match_full, ddl.not_null, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range, types.array, expr.array_subscript, ddl.gist_scalar_index
 
 # --- an empty database lists no constraints -------------------------------------------------------
 
@@ -112,6 +112,37 @@ span
 
 statement ok
 DROP TABLE booking
+
+# --- EXCLUDE … WHERE: expression is the partial predicate's canonical text (gist.md §7.1); a btree
+# exclusion (§7.2) is an exclusion, not a uniqueness constraint, though it is all `=` --------------
+
+statement ok
+CREATE TABLE shift (id i32 PRIMARY KEY, worker i32, span i32range, live boolean, EXCLUDE (worker WITH =), EXCLUDE USING gist (span WITH &&) WHERE (live AND worker > 0))
+
+query TTTT nosort
+SELECT name, type, columns::text, expression FROM jed_constraints WHERE table_name = 'shift' ORDER BY name
+----
+shift_span_excl
+exclude
+{span}
+live and worker > 0
+shift_worker_excl
+exclude
+{worker}
+NULL
+
+# RENAME COLUMN rewrites the stored predicate
+statement ok
+ALTER TABLE shift RENAME COLUMN worker TO staff
+
+query TT nosort
+SELECT name, expression FROM jed_constraints WHERE table_name = 'shift' AND expression IS NOT NULL
+----
+shift_span_excl
+live and "staff" > 0
+
+statement ok
+DROP TABLE shift
 
 # --- CHECK: the canonical expression text is a compatibility surface (constraints.md §4.5) --------
 

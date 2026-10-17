@@ -274,16 +274,21 @@ type createTableAs struct {
 }
 
 // ExcludeDef is one parsed EXCLUDE constraint (spec/design/gist.md §7, grammar.md): the optional
-// explicit CONSTRAINT name (empty = unnamed; it names the backing GiST index), the optional USING
-// method (empty = the default gist; anything else is 42704 at execution), and the (column, operator)
-// element list in declaration order. Each operand is a bare column name; the operator is the WITH
-// operator's source text (= or &&). Execution resolves the columns + operators
-// (42703/42701/42704/0A000), creates the multi-column GiST index, and names the unnamed ones.
+// explicit CONSTRAINT name (empty = unnamed; it names the backing index), the optional USING method
+// (empty or btree = the PostgreSQL default ordered B-tree, gist = GiST; anything else is 42704 at
+// execution), the (column, operator) element list in declaration order, and the optional
+// `WHERE (predicate)` of the partial form (gist.md §7.1). Each operand is a bare column name; the
+// operator is the WITH operator's source text. Execution resolves the columns + operators
+// (42703/42701/42704/42809/0A000), creates the backing index (a multi-column GiST index, or an
+// ordered B-tree for USING btree — §7.2), and names the unnamed ones.
 type excludeDef struct {
 	Name  string
 	Using string
 	// Elements is (column name, operator source text) per element, in declaration order.
 	Elements []excludeElementDef
+	// Predicate is the partial form's WHERE (predicate) (gist.md §7.1): the inner expression and its
+	// canonical text, stored like a partial index's predicate (indexes.md §9). Nil when absent.
+	Predicate *indexPredicate
 }
 
 // ExcludeElementDef is one parsed (column WITH operator) element of an EXCLUDE constraint.

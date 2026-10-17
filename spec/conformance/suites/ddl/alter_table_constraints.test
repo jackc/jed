@@ -146,7 +146,7 @@ statement ok
 CREATE TABLE alter_implicit_names (id i32 PRIMARY KEY, v i32, span int4range)
 
 statement ok
-ALTER TABLE alter_implicit_names ADD UNIQUE (v), ADD UNIQUE (v), ADD EXCLUDE (span WITH &&), ADD EXCLUDE (span WITH &&)
+ALTER TABLE alter_implicit_names ADD UNIQUE (v), ADD UNIQUE (v), ADD EXCLUDE USING gist (span WITH &&), ADD EXCLUDE USING gist (span WITH &&)
 
 statement ok
 ALTER TABLE alter_implicit_names DROP CONSTRAINT alter_implicit_names_v_key1, DROP CONSTRAINT alter_implicit_names_span_excl1

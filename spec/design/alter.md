@@ -180,7 +180,8 @@ row is `23503`; an `EXCLUDE` with a conflicting pair is `23P01`. Validation uses
 **end-state** semantics as everything else (§4). This retires the standing
 `ALTER TABLE … ADD CONSTRAINT` follow-ons noted under the FK and EXCLUDE items in
 [TODO.md](../../TODO.md). The scan charges its ordinary page/row/evaluation units; additionally,
-each candidate tuple in a self-referential FK search and each unordered EXCLUDE row pair charges
+each candidate tuple in a self-referential FK search and each unordered EXCLUDE row pair (of rows a
+partial constraint's predicate admits — [gist.md §7.1](gist.md)) charges
 `constraint_check` and guards immediately, bounding the otherwise quadratic validation work
 deterministically ([cost.md](cost.md) §3).
 
@@ -295,9 +296,11 @@ internal/external distinction: same-table `CHECK`, index (including a UNIQUE bac
 under `RESTRICT` (the default). A FOREIGN KEY owned by the column through its local (referencing)
 side is likewise dropped automatically. An FK that uses the column only on its referenced side
 (including a self-referential FK) is an external dependency and blocks with `2BP01` unless
-`CASCADE` drops it. Dropping a column also rewrites any stored expression text (§0.2) that survives;
-a `CHECK`, expression index, or partial-index predicate that referenced the column is removed with
-its owning object.
+`CASCADE` drops it. So is a column that only a partial `EXCLUDE`'s `WHERE` predicate reads (none of
+its excluded columns — PostgreSQL records that as a normal dependency): `2BP01` unless `CASCADE`
+drops the constraint ([gist.md §7.1](gist.md)). Dropping a column also rewrites any stored expression
+text (§0.2) that survives; a `CHECK`, expression index, or partial-index predicate that referenced the
+column is removed with its owning object.
 A column a **view** references is an external dependency too: `2BP01` under `RESTRICT`; `CASCADE`
 drops those views and every view depending on them ([views.md](views.md) §6.1). Dropping an unreferenced column removes
 its entry from any view column alias list that reaches it ([views.md](views.md) §6/§7).

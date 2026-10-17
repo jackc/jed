@@ -685,10 +685,16 @@ func encodePkKey(colTypes []colType, pk []int, colls []*Collation, row storedRow
 }
 
 // arbiter is which uniqueness constraint an ON CONFLICT arbitrates (spec/design/upsert.md §2):
-// the primary key (isPK), or a unique index by position in table.Indexes (indexPos).
+// the primary key (isPK), a unique index by position in table.Indexes (indexPos), or an exclusion
+// constraint by position in table.Exclusions (isExclusion/exclusionPos).
 type arbiter struct {
 	isPK     bool
 	indexPos int
+	// isExclusion marks an EXCLUDE constraint arbiter, by position in table.Exclusions
+	// (exclusionPos) — named by ON CONSTRAINT, and legal only with DO NOTHING
+	// (spec/design/upsert.md §2, PostgreSQL's 42809 for DO UPDATE).
+	isExclusion  bool
+	exclusionPos int
 }
 
 // conflictPlan is a resolved ON CONFLICT clause (spec/design/upsert.md), built by resolveOnConflict.
@@ -866,6 +872,11 @@ func (db *engine) resolveArbiter(table *catTable, target *conflictTarget, indexP
 			return &arbiter{indexPos: i}, nil
 		}
 	}
+	for i, e := range table.Exclusions {
+		if e.Name == target.Constraint {
+			return &arbiter{isExclusion: true, exclusionPos: i}, nil
+		}
+	}
 	return nil, newError(UndefinedObject, fmt.Sprintf(
 		"constraint %s for table %s does not exist", target.Constraint, table.Name,
 	))
@@ -962,6 +973,11 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 	if arb == nil {
 		return nil, newError(SyntaxError,
 			"ON CONFLICT DO UPDATE requires inference specification or constraint name")
+	}
+	// An exclusion constraint arbitrates DO NOTHING only (PostgreSQL's infer_arbiter_indexes).
+	if arb.isExclusion {
+		return nil, newError(WrongObjectType,
+			"ON CONFLICT DO UPDATE not supported with exclusion constraints")
 	}
 	s := onConflictExcludedScope(db, table, vw, alias)
 	// SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once, exactly as
@@ -2164,33 +2180,15 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 	// statement's END STATE: each new row must conflict with no STORED row (probe the backing GiST
 	// tree, whose leaf recheck is the full (expr_i op_i) conjunction) and no OTHER new row of this
 	// batch (pairwise — the resident tree holds only stored rows). The NULL rule / empty-range exempt
-	// a row. Unmetered validation, before any write.
+	// a row, as does a partial constraint's not-TRUE predicate (§7.1); a btree exclusion probes its
+	// ordered index for an equal key (§7.2). Unmetered validation, before any write.
 	if len(table.Exclusions) > 0 {
-		tcols := table.Columns
-		for _, exc := range table.Exclusions {
-			for _, pr := range prepared {
-				other, conflict, err := db.insertExclusionConflictsStored(dbScope, table.Name, tcols, exc, pr.row)
-				if err != nil {
-					return nil, err
-				}
-				if conflict {
-					return nil, newExclusionViolation(table.Name, exc.Name).
-						withDetail(db.exclusionDetail(table.Name, tcols, exc, pr.row, other, true))
-				}
-			}
-			for i := range prepared {
-				for j := 0; j < i; j++ {
-					newRow, other := prepared[i].row, prepared[j].row
-					conflict, err := exclusionPairConflicts(tcols, exc, newRow, other)
-					if err != nil {
-						return nil, err
-					}
-					if conflict {
-						return nil, newExclusionViolation(table.Name, exc.Name).
-							withDetail(db.exclusionDetail(table.Name, tcols, exc, newRow, other, true))
-					}
-				}
-			}
+		newRows := make([]storedRow, len(prepared))
+		for i, pr := range prepared {
+			newRows[i] = pr.row
+		}
+		if err := db.validateExclusions(dbScope, table, store.colTypes, newRows, nil); err != nil {
+			return nil, err
 		}
 	}
 
@@ -2378,15 +2376,8 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		}
 	}
 
-	for _, exc := range table.Exclusions {
-		other, conflict, err := db.insertExclusionConflictsStored(dbScope, table.Name, table.Columns, exc, row)
-		if err != nil {
-			return nil, err
-		}
-		if conflict {
-			return nil, newExclusionViolation(table.Name, exc.Name).
-				withDetail(db.exclusionDetail(table.Name, table.Columns, exc, row, other, true))
-		}
+	if err := db.validateExclusions(dbScope, table, store.colTypes, []storedRow{row}, nil); err != nil {
+		return nil, err
 	}
 
 	meter.Charge(costs.ValueCompress * cunits)
@@ -2495,33 +2486,217 @@ func (db *engine) validateInsertFKStored(relation string, columns []catColumn, f
 	return nil
 }
 
-// insertExclusionConflictsStored probes the resident GiST rows for one candidate. The batch caller
-// separately retains its pairwise end-state pass; the stored-row semantics are shared. On a conflict
-// it returns the conflicting stored row — the least storage key among the matches, for a
-// deterministic Detail (error-fields.md §9.2).
-func (db *engine) insertExclusionConflictsStored(dbScope *string, table string, columns []catColumn, exc exclusionConstraint, row storedRow) (storedRow, bool, error) {
-	query, strats, ok, err := exclusionProbeQuery(columns, exc, row)
+// exclusionCheck is one EXCLUDE constraint resolved for a statement (spec/design/gist.md §7): the
+// constraint and its backing index resolved — the partial predicate (§7.1) and, for USING btree
+// (§7.2), the ordered key the equality probe builds.
+type exclusionCheck struct {
+	exc    exclusionConstraint
+	rindex resolvedIndex
+}
+
+// exclusionKey is a participating row's exclusion probe key (gist.md §7): the backing ordered
+// index's slot prefix for a btree exclusion (§7.2 — two rows conflict iff the prefixes are equal),
+// or the GiST conjunction query.
+type exclusionKey struct {
+	btree  bool
+	prefix []byte
+	query  []gistQuery
+	strats []gistStrategy
+}
+
+// exclusionKeysConflict reports whether two participating rows conflict under one exclusion
+// constraint, given their probe keys (gist.md §7): equal prefixes for a btree exclusion, the full
+// (expr_i op_i) conjunction for a GiST one.
+func exclusionKeysConflict(columns []catColumn, exc exclusionConstraint, ka exclusionKey, a storedRow, kb exclusionKey, b storedRow) (bool, error) {
+	if ka.btree && kb.btree {
+		return bytes.Equal(ka.prefix, kb.prefix), nil
+	}
+	return exclusionPairConflicts(columns, exc, a, b)
+}
+
+// exclusionChecks resolves a table's EXCLUDE constraints for one statement (spec/design/gist.md
+// §7): each constraint with its backing index resolved — the partial predicate (§7.1) and, for a
+// btree exclusion (§7.2), the ordered key. A backing index whose stored predicate did not parse is
+// XX003 (unparsable-definitions.md §3.4): such a constraint cannot be enforced.
+func (db *engine) exclusionChecks(table *catTable) ([]exclusionCheck, error) {
+	out := make([]exclusionCheck, 0, len(table.Exclusions))
+	for _, exc := range table.Exclusions {
+		pos := -1
+		for i := range table.Indexes {
+			if table.Indexes[i].Name == exc.Index {
+				pos = i
+				break
+			}
+		}
+		if pos < 0 {
+			return nil, newError(DataCorrupted, "an exclusion constraint has its backing index")
+		}
+		rindex, err := db.resolveIndex(table, table.Indexes[pos])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, exclusionCheck{exc: exc, rindex: rindex})
+	}
+	return out, nil
+}
+
+// exclusionParticipates reports whether row participates in an exclusion constraint at all:
+// always, unless the constraint is partial and its predicate is not TRUE for the row (gist.md §7.1
+// — PostgreSQL's partial exclusion; the predicate eval is unmetered, like a partial index's).
+func (db *engine) exclusionParticipates(chk *exclusionCheck, row storedRow) (bool, error) {
+	return indexRowQualifies(&chk.rindex, row, db.indexMaintEnv())
+}
+
+// exclusionKeyFor is a row's exclusion probe key (gist.md §7), or ok=false when the row can never
+// conflict: its predicate is not TRUE (§7.1), an excluded column is NULL (the NULL rule), or a &&
+// column holds the empty range. A btree exclusion's key (§7.2) is the backing ordered index's slot
+// prefix — two participating rows conflict iff their prefixes are equal, exactly UNIQUE's rule —
+// and a GiST exclusion's the conjunction query.
+func (db *engine) exclusionKeyFor(chk *exclusionCheck, columns []catColumn, colTypes []colType, colls []*Collation, row storedRow) (exclusionKey, bool, error) {
+	if chk.rindex.Kind == indexBtree {
+		// indexPrefix applies the predicate and the NULL rule.
+		prefix, ok, err := db.indexPrefix(colTypes, colls, &chk.rindex, row)
+		if err != nil || !ok {
+			return exclusionKey{}, false, err
+		}
+		return exclusionKey{btree: true, prefix: prefix}, true, nil
+	}
+	if ok, err := db.exclusionParticipates(chk, row); err != nil || !ok {
+		return exclusionKey{}, false, err
+	}
+	q, strats, ok, err := exclusionProbeQuery(columns, chk.exc, row)
 	if err != nil || !ok {
-		return nil, false, err
+		return exclusionKey{}, false, err
 	}
-	tree := db.readSnap().gistTreeFor(exc.Index)
-	if tree == nil {
-		return nil, false, nil
+	return exclusionKey{query: q, strats: strats}, true, nil
+}
+
+// exclusionStoredConflict returns the stored row a participating new row conflicts with under one
+// exclusion constraint (gist.md §7), skipping the rows this statement rewrites (rewritten storage
+// keys — an UPDATE's vacated old rows; nil for INSERT). The conflicting stored row is the one with
+// the least storage key (a deterministic Detail — error-fields.md §9.2). The backing index holds
+// only participating rows (a partial index), so every hit participates.
+func (db *engine) exclusionStoredConflict(dbScope *string, table string, chk *exclusionCheck, key exclusionKey, rewritten map[string]struct{}) (storedRow, bool, error) {
+	var hit []byte
+	found := false
+	if key.btree {
+		// Entries sharing the prefix sit adjacent in storage-key order (indexes.md §8).
+		entries, err := db.lkpIndexStoreScoped(dbScope, chk.rindex.Name).RangeEntries(uniqueProbeBound(key.prefix))
+		if err != nil {
+			return nil, false, err
+		}
+		for _, e := range entries {
+			suffix := e.Key[len(key.prefix):]
+			if _, own := rewritten[string(suffix)]; own {
+				continue
+			}
+			hit, found = suffix, true
+			break
+		}
+	} else if tree := db.readSnap().gistTreeFor(chk.rindex.Name); tree != nil {
+		hits, _, _ := tree.search(key.query, key.strats)
+		hit, found = leastKey(hits, rewritten)
 	}
-	hits, _, _ := tree.search(query, strats)
-	first, found := leastKey(hits, nil)
 	if !found {
 		return nil, false, nil
 	}
-	// A matched entry names a stored row unless the index pages disagree with the table's.
-	other, exists, err := db.lkpStoreScoped(dbScope, table).Get(first)
+	// A matched entry always names a stored row; one that does not is a corrupt index.
+	other, exists, err := db.lkpStoreScoped(dbScope, table).Get(hit)
 	if err != nil {
 		return nil, false, err
 	}
 	if !exists {
-		return nil, false, newError(DataCorrupted, "a GiST entry references a stored row")
+		return nil, false, newError(DataCorrupted, "an exclusion index entry references a stored row")
 	}
 	return other, true, nil
+}
+
+// exclusionConflictsPlanned reports whether a proposed ON CONFLICT DO NOTHING row conflicts under
+// one exclusion constraint with a stored row or with an insert this statement already planned
+// (planned) — the row-at-a-time visibility upsert.md §3 reproduces (gist.md §7).
+func (db *engine) exclusionConflictsPlanned(dbScope *string, table string, chk *exclusionCheck, columns []catColumn, colTypes []colType, colls []*Collation, row storedRow, planned []storedRow) (bool, error) {
+	key, ok, err := db.exclusionKeyFor(chk, columns, colTypes, colls, row)
+	if err != nil || !ok {
+		return false, err
+	}
+	if _, hit, err := db.exclusionStoredConflict(dbScope, table, chk, key, nil); err != nil || hit {
+		return hit, err
+	}
+	for _, p := range planned {
+		pk, ok, err := db.exclusionKeyFor(chk, columns, colTypes, colls, p)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			continue
+		}
+		conflict, err := exclusionKeysConflict(columns, chk.exc, key, row, pk, p)
+		if err != nil || conflict {
+			return conflict, err
+		}
+	}
+	return false, nil
+}
+
+// validateExclusions validates the participating rows of one statement against a table's exclusion
+// constraints (gist.md §7), in constraint (name) order: each must conflict with no stored row
+// outside rewritten and with no earlier row of rows (pairwise — the backing index holds only stored
+// rows). The first conflict traps 23P01 with PostgreSQL's "conflicts with existing key" Detail.
+// Unmetered validation, before any write. colTypes is the store's cached per-column types.
+func (db *engine) validateExclusions(dbScope *string, table *catTable, colTypes []colType, rows []storedRow, rewritten map[string]struct{}) error {
+	if len(table.Exclusions) == 0 || len(rows) == 0 {
+		return nil
+	}
+	checks, err := db.exclusionChecks(table)
+	if err != nil {
+		return err
+	}
+	tcols := table.Columns
+	colls := db.columnCollations(tcols)
+	for ci := range checks {
+		chk := &checks[ci]
+		keys := make([]exclusionKey, len(rows))
+		has := make([]bool, len(rows))
+		for i, row := range rows {
+			k, ok, err := db.exclusionKeyFor(chk, tcols, colTypes, colls, row)
+			if err != nil {
+				return err
+			}
+			keys[i], has[i] = k, ok
+		}
+		for i, row := range rows {
+			if !has[i] {
+				continue
+			}
+			other, conflict, err := db.exclusionStoredConflict(dbScope, table.Name, chk, keys[i], rewritten)
+			if err != nil {
+				return err
+			}
+			if conflict {
+				return newExclusionViolation(table.Name, chk.exc.Name).
+					withDetail(db.exclusionDetail(table.Name, tcols, chk.exc, row, other, true))
+			}
+		}
+		for i := range rows {
+			if !has[i] {
+				continue
+			}
+			for j := 0; j < i; j++ {
+				if !has[j] {
+					continue
+				}
+				conflict, err := exclusionKeysConflict(tcols, chk.exc, keys[i], rows[i], keys[j], rows[j])
+				if err != nil {
+					return err
+				}
+				if conflict {
+					return newExclusionViolation(table.Name, chk.exc.Name).
+						withDetail(db.exclusionDetail(table.Name, tcols, chk.exc, rows[i], rows[j], true))
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // foldConflictPlan folds globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their
@@ -2591,6 +2766,14 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		if def.Unique {
 			uniqIdx = append(uniqIdx, i)
 		}
+	}
+
+	// The exclusion constraints (gist.md §7), parallel to table.Exclusions — the no-target DO
+	// NOTHING arbiter skips on any of them, an ON CONSTRAINT exclusion arbiter on its own
+	// (upsert.md §2).
+	excChecks, err := db.exclusionChecks(table)
+	if err != nil {
+		return 0, nil, err
 	}
 
 	// A planned update: the existing row's old storage key, its new one (they differ when the DO
@@ -2686,6 +2869,22 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			if committed || inBatch {
 				continue // skip
 			}
+			// An exclusion conflict is a conflict too (PostgreSQL arbitrates every exclusion
+			// constraint for a no-target DO NOTHING).
+			excluded := false
+			for ci := range excChecks {
+				hit, err := db.exclusionConflictsPlanned(dbScope, table.Name, &excChecks[ci], table.Columns, store.colTypes, colls, row, inserts)
+				if err != nil {
+					return 0, nil, err
+				}
+				if hit {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue // skip
+			}
 			if pkk != nil {
 				insPk[string(pkk)] = struct{}{}
 			}
@@ -2697,6 +2896,24 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				if ok {
 					insPrefixes[u][string(prefix)] = struct{}{}
 				}
+			}
+			if err := viewCheck(row); err != nil {
+				return 0, nil, err
+			}
+			inserts = append(inserts, row)
+			continue
+		}
+
+		// An ON CONSTRAINT exclusion arbiter (DO NOTHING only — resolveOnConflict rejects DO UPDATE
+		// with 42809): skip a row this constraint excludes against a stored row or an earlier planned
+		// insert; any other conflict is caught by the end-state validation.
+		if plan.arb.isExclusion {
+			hit, err := db.exclusionConflictsPlanned(dbScope, table.Name, &excChecks[plan.arb.exclusionPos], table.Columns, store.colTypes, colls, row, inserts)
+			if err != nil {
+				return 0, nil, err
+			}
+			if hit {
+				continue // skip
 			}
 			if err := viewCheck(row); err != nil {
 				return 0, nil, err
@@ -2998,6 +3215,23 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				return 0, nil, newFKViolationInsert(relation, fk.Name).
 					withDetail(db.fkChildDetail(relation, table.Columns, fk, row))
 			}
+		}
+	}
+
+	// EXCLUDE (gist.md §7) over the END STATE, as INSERT and UPDATE: each inserted row and each
+	// updated NEW row must conflict with no stored row the statement keeps (an updated row's old
+	// version is vacated) and with no other new row. A conflict a DO NOTHING arbiter covers was
+	// skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
+	{
+		rewritten := make(map[string]struct{}, len(updates))
+		excRows := make([]storedRow, 0, len(updates)+len(inserts))
+		for _, u := range updates {
+			rewritten[string(u.key)] = struct{}{}
+			excRows = append(excRows, u.newRow)
+		}
+		excRows = append(excRows, inserts...)
+		if err := db.validateExclusions(dbScope, table, store.colTypes, excRows, rewritten); err != nil {
+			return 0, nil, err
 		}
 	}
 
@@ -4451,55 +4685,18 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 	// must conflict with no OTHER row in the statement's END STATE — neither a STORED row that is NOT
 	// being updated (probe the backing GiST tree, drop a hit whose storage key is a rewritten OLD key
 	// — that row is vacated) nor another updated NEW row (pairwise). The NULL rule / empty-range
-	// exempt a row. An end-state-valid swap thus succeeds where PG fails the per-row transient (the
-	// documented UNIQUE end-state divergence). Unmetered, phase 1, before any write.
+	// exempt a row, as does a partial constraint's not-TRUE predicate (§7.1); a btree exclusion probes
+	// its ordered index (§7.2). An end-state-valid swap thus succeeds where PG fails the per-row
+	// transient (the documented UNIQUE end-state divergence). Unmetered, phase 1, before any write.
 	if len(table.Exclusions) > 0 && len(updates) > 0 {
 		rewritten := make(map[string]struct{}, len(updates))
-		for _, u := range updates {
+		newRows := make([]storedRow, len(updates))
+		for i, u := range updates {
 			rewritten[string(u.key)] = struct{}{}
+			newRows[i] = u.row
 		}
-		for _, exc := range table.Exclusions {
-			ikey := exc.Index
-			for _, u := range updates {
-				q, strats, ok, err := exclusionProbeQuery(table.Columns, exc, u.row)
-				if err != nil {
-					return outcome{}, err
-				}
-				if !ok {
-					continue
-				}
-				// The least non-vacated stored match (a deterministic Detail, error-fields.md §9.2).
-				var hit []byte
-				conflict := false
-				if tree := db.readSnap().gistTreeFor(ikey); tree != nil {
-					hits, _, _ := tree.search(q, strats)
-					hit, conflict = leastKey(hits, rewritten)
-				}
-				if conflict {
-					other, exists, err := store.Get(hit)
-					if err != nil {
-						return outcome{}, err
-					}
-					if !exists {
-						return outcome{}, newError(DataCorrupted, "a GiST entry references a stored row")
-					}
-					return outcome{}, newExclusionViolation(table.Name, exc.Name).
-						withDetail(db.exclusionDetail(table.Name, table.Columns, exc, u.row, other, true))
-				}
-			}
-			for i := range updates {
-				for j := 0; j < i; j++ {
-					newRow, other := updates[i].row, updates[j].row
-					conflict, err := exclusionPairConflicts(table.Columns, exc, newRow, other)
-					if err != nil {
-						return outcome{}, err
-					}
-					if conflict {
-						return outcome{}, newExclusionViolation(table.Name, exc.Name).
-							withDetail(db.exclusionDetail(table.Name, table.Columns, exc, newRow, other, true))
-					}
-				}
-			}
+		if err := db.validateExclusions(upd.DB, table, store.colTypes, newRows, rewritten); err != nil {
+			return outcome{}, err
 		}
 	}
 

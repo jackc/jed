@@ -193,6 +193,36 @@ run: ALTER TABLE ex ADD EXCLUDE USING gist (r WITH &&)
 code: 23P01
 detail: Key (r)=([3,7)) conflicts with key (r)=([1,5)).
 
+# EXCLUDE USING btree (gist.md §7.2): PostgreSQL's exclusion Detail, never the unique one.
+case: btree exclusion against stored row
+setup: CREATE TABLE ex (id i32 PRIMARY KEY, a i32, c text, EXCLUDE (a WITH =, c WITH =))
+setup: INSERT INTO ex VALUES (1, 1, 'x')
+run: INSERT INTO ex VALUES (2, 1, 'x')
+code: 23P01
+detail: Key (a, c)=(1, x) conflicts with existing key (a, c)=(1, x).
+
+case: btree exclusion update
+setup: CREATE TABLE ex (id i32 PRIMARY KEY, a i32, EXCLUDE USING btree (a WITH =))
+setup: INSERT INTO ex VALUES (1, 1), (2, 2)
+run: UPDATE ex SET a = 1 WHERE id = 2
+code: 23P01
+detail: Key (a)=(1) conflicts with existing key (a)=(1).
+
+case: btree exclusion add constraint over existing rows
+setup: CREATE TABLE ex (id i32 PRIMARY KEY, a i32)
+setup: INSERT INTO ex VALUES (1, 7), (2, 7)
+run: ALTER TABLE ex ADD EXCLUDE (a WITH =)
+code: 23P01
+detail: Key (a)=(7) conflicts with key (a)=(7).
+
+# The partial form (gist.md §7.1): the Detail names the excluded columns only.
+case: partial exclusion
+setup: CREATE TABLE ex (id i32 PRIMARY KEY, r i32range, live boolean, EXCLUDE USING gist (r WITH &&) WHERE (live))
+setup: INSERT INTO ex VALUES (1, '[1,5)', true), (2, '[1,5)', false)
+run: INSERT INTO ex VALUES (3, '[3,7)', true)
+code: 23P01
+detail: Key (r)=([3,7)) conflicts with existing key (r)=([1,5)).
+
 # --- 23514 check / 23502 not null: "Failing row contains" ----------------------------------------
 
 case: check failing row

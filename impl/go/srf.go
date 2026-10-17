@@ -1296,12 +1296,19 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				cols[j] = t.Columns[el.Column].Name
 				ops[j] = exclusionOpSymbol(el.Op)
 			}
+			// A partial exclusion's WHERE predicate text (gist.md §7.1); NULL otherwise.
+			expression := NullValue()
+			for _, ix := range t.Indexes {
+				if ix.Name == exc.Index && ix.Predicate != nil {
+					expression = TextValue(ix.Predicate.ExprText)
+				}
+			}
 			out = append(out, storedRow{
 				TextValue(exc.Name),
 				TextValue(t.Name),
 				TextValue("exclude"),
 				textArr(cols),
-				NullValue(),
+				expression,
 				NullValue(),
 				NullValue(),
 				textArr(ops),

@@ -645,15 +645,20 @@ export type CreateTableAs = {
 };
 
 // ExcludeDef is one parsed EXCLUDE constraint (spec/design/gist.md §7, grammar.md): the optional
-// explicit CONSTRAINT name (null = unnamed; it names the backing GiST index), the optional USING
-// method (null = the default gist; anything else is 42704 at execution), and the (column, operator)
-// element list in declaration order. Each operand is a bare column name; the operator is the WITH
-// operator's source text (= or &&). Execution resolves the columns + operators
-// (42703/42701/42704/0A000), creates the multi-column GiST index, and names the unnamed ones.
+// explicit CONSTRAINT name (null = unnamed; it names the backing index), the optional USING method
+// (null = btree, PostgreSQL's default — §7.2; gist; anything else is 42704 at execution), the
+// (column, operator) element list in declaration order, and the optional `WHERE (predicate)` of the
+// partial form (§7.1). Each operand is a bare column name; the operator is the WITH operator's
+// source text. Execution resolves the columns + operators (42703/42701/42704/42809/0A000), creates
+// the backing index (a multi-column GiST index, or an ordered B-tree for btree), and names the
+// unnamed ones.
 export type ExcludeDef = {
   name: string | null;
   using: string | null;
   elements: { column: string; op: string }[];
+  // The partial form's predicate: its canonical text + parsed AST, stored like a partial index's
+  // predicate (indexes.md §9). undefined for a non-partial constraint.
+  predicate?: { text: string; expr: Expr };
 };
 
 // RefAction is a referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md
