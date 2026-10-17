@@ -300,6 +300,80 @@ fn resolve_exclusion_definition(
     Ok((columns, resolved))
 }
 
+/// Where an identity column's owned sequence lives during an `ALTER TABLE` action list
+/// (alter.md §2.8): pending (created by an earlier ADD COLUMN / ADD IDENTITY action of the same
+/// statement) or already in the catalog under `key`.
+enum IdentitySeqSlot {
+    Pending(usize),
+    Existing(String),
+}
+
+/// Locate identity column `ci`'s owned sequence. The column's synthesized `nextval('<seq>')`
+/// default names it, which tells the identity sequence apart from a leftover `serial` sequence the
+/// same column may still own after `DROP DEFAULT`. `old_ci` is the column's pre-statement ordinal
+/// (`None` for a column added by this statement).
+fn identity_sequence_slot(
+    snap: &Snapshot,
+    original_name: &str,
+    table: &Table,
+    ci: usize,
+    old_ci: Option<usize>,
+    pending: &[SequenceDef],
+    dropped: &std::collections::HashSet<String>,
+) -> IdentitySeqSlot {
+    // The default is `nextval ( '<seq>' )`, possibly wrapped in the CAST an earlier
+    // `ALTER COLUMN … TYPE` added; the quoted name inside the call identifies the sequence.
+    let default_text = table.columns[ci]
+        .default_expr
+        .as_ref()
+        .map_or("", |d| d.expr_text.as_str());
+    let names_it = |name: &str| default_text.contains(nextval_default_text(name).as_str());
+    let pending_owned = |seq: &SequenceDef| {
+        seq.owned_by
+            .as_ref()
+            .is_some_and(|o| o.table == table.name && usize::from(o.column) == ci)
+    };
+    if let Some(si) = pending
+        .iter()
+        .position(|seq| pending_owned(seq) && names_it(&seq.name))
+        .or_else(|| pending.iter().position(pending_owned))
+    {
+        return IdentitySeqSlot::Pending(si);
+    }
+    let old_ci = old_ci.expect("an added identity column has a pending sequence");
+    let owned: Vec<String> = snap
+        .sequences_owned_by(original_name)
+        .into_iter()
+        .filter(|key| {
+            !dropped.contains(key)
+                && snap.sequence(key).is_some_and(|seq| {
+                    seq.owned_by
+                        .as_ref()
+                        .is_some_and(|o| usize::from(o.column) == old_ci)
+                })
+        })
+        .collect();
+    let key = owned
+        .iter()
+        .find(|key| names_it(key))
+        .or(owned.first())
+        .cloned()
+        .expect("identity column has an owned sequence");
+    IdentitySeqSlot::Existing(key)
+}
+
+/// 55000 for an identity alteration of a column that is not an identity column (PostgreSQL's
+/// `ATExecSetIdentity` / `ATExecDropIdentity`).
+fn not_identity_column(table: &Table, ci: usize) -> EngineError {
+    EngineError::new(
+        SqlState::ObjectNotInPrerequisiteState,
+        format!(
+            "column \"{}\" of relation \"{}\" is not an identity column",
+            table.columns[ci].name, table.name
+        ),
+    )
+}
+
 /// Retype an IDENTITY-owned sequence with PostgreSQL's `ALTER SEQUENCE AS` rules: bounds equal to
 /// the old type defaults become the new defaults, explicit bounds are preserved, and the start +
 /// current value must fit the new type and resulting bounds.
@@ -956,8 +1030,28 @@ impl Engine {
                 // Create the OWNED sequence — a default ascending i64 for `serial`, or the IDENTITY
                 // column's `( seq_options )` (defaulting the same way) — and synthesize the
                 // `DEFAULT nextval('<auto-name>')` expression default (format_version 8 mechanism).
-                let seqname =
-                    self.choose_serial_seq_name(&ct.name, &def.name, &pending_serials, &[]);
+                // `SEQUENCE NAME` in the identity options names the sequence (sequences.md §13.1);
+                // otherwise PostgreSQL's ChooseRelationName auto-name.
+                let explicit_name = def
+                    .identity
+                    .as_ref()
+                    .and_then(|id| id.options.sequence_name.clone());
+                let seqname = match explicit_name {
+                    Some(n) => {
+                        check_reserved_name("sequence", &n)?;
+                        if self.relation_exists(&n)
+                            || n == ct.name
+                            || pending_serials.iter().any(|s| s.name == n)
+                        {
+                            return Err(EngineError::new(
+                                SqlState::DuplicateTable,
+                                format!("relation already exists: {n}"),
+                            ));
+                        }
+                        n
+                    }
+                    None => self.choose_serial_seq_name(&ct.name, &def.name, &pending_serials, &[]),
+                };
                 let owner = SeqOwner {
                     table: ct.name.clone(),
                     column: columns.len() as u16, // this column's ordinal (pushed below)
@@ -977,6 +1071,7 @@ impl Engine {
                         "conflicting or redundant options".to_string(),
                     ));
                 }
+                opts.sequence_name = None;
                 let seq_scalar = serial_kind.unwrap_or_else(|| ty.scalar());
                 opts.data_type = Some(
                     SeqDataType::for_scalar(seq_scalar)
@@ -2948,6 +3043,183 @@ impl Engine {
                             table.columns[ci].default = None;
                             table.columns[ci].default_expr = None;
                         }
+                        AlterColumnKind::AddIdentity(spec) => {
+                            // alter.md §2.8, PostgreSQL's order: the owned sequence is defined
+                            // first (type gate 22023, option errors, the name), then the column's
+                            // prerequisites (55000).
+                            if attachment_scope {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "a serial / IDENTITY column on an attached-database table is not supported yet",
+                                ));
+                            }
+                            let col = &table.columns[ci];
+                            let Some(dtype) = SeqDataType::for_scalar(col.ty.scalar())
+                                .filter(|_| col.ty.is_integer())
+                            else {
+                                return Err(EngineError::new(
+                                    SqlState::InvalidParameterValue,
+                                    "identity column type must be smallint, integer, or bigint",
+                                ));
+                            };
+                            let mut opts = spec.options.clone();
+                            if opts.data_type.is_some() {
+                                return Err(EngineError::new(
+                                    SqlState::SyntaxError,
+                                    "conflicting or redundant options",
+                                ));
+                            }
+                            opts.data_type = Some(dtype.pg_name().to_string());
+                            let explicit_name = opts.sequence_name.take();
+                            let reserved: Vec<String> =
+                                table.indexes.iter().map(|i| i.name.clone()).collect();
+                            let seqname = match &explicit_name {
+                                Some(n) => n.clone(),
+                                None => self.choose_serial_seq_name(
+                                    &table.name,
+                                    &col.name,
+                                    &pending_serials,
+                                    &reserved,
+                                ),
+                            };
+                            let seq = build_sequence_def(
+                                &seqname,
+                                &opts,
+                                Some(SeqOwner {
+                                    table: table.name.clone(),
+                                    column: ci as u16,
+                                }),
+                            )?;
+                            if explicit_name.is_some() {
+                                self.check_identity_sequence_name(
+                                    &table.name,
+                                    &seqname,
+                                    &pending_serials,
+                                    &reserved,
+                                )?;
+                            }
+                            let col = &table.columns[ci];
+                            if !col.not_null {
+                                return Err(EngineError::new(
+                                    SqlState::ObjectNotInPrerequisiteState,
+                                    format!(
+                                        "column \"{}\" of relation \"{}\" must be declared NOT NULL before identity can be added",
+                                        col.name, table.name
+                                    ),
+                                ));
+                            }
+                            if col.identity.is_some() {
+                                return Err(EngineError::new(
+                                    SqlState::ObjectNotInPrerequisiteState,
+                                    format!(
+                                        "column \"{}\" of relation \"{}\" is already an identity column",
+                                        col.name, table.name
+                                    ),
+                                ));
+                            }
+                            if col.default.is_some() || col.default_expr.is_some() {
+                                return Err(EngineError::new(
+                                    SqlState::ObjectNotInPrerequisiteState,
+                                    format!(
+                                        "column \"{}\" of relation \"{}\" already has a default value",
+                                        col.name, table.name
+                                    ),
+                                ));
+                            }
+                            pending_serials.push(seq);
+                            let expr_text = nextval_default_text(&seqname);
+                            table.columns[ci].default_expr = Some(DefaultExpr {
+                                expr: crate::parser::parse_expression(&expr_text)?,
+                                expr_text,
+                                unparsed: false,
+                            });
+                            table.columns[ci].identity = Some(if spec.always {
+                                IdentityKind::Always
+                            } else {
+                                IdentityKind::ByDefault
+                            });
+                        }
+                        AlterColumnKind::SetIdentity {
+                            generated,
+                            options,
+                            restart,
+                        } => {
+                            if table.columns[ci].identity.is_none() {
+                                return Err(not_identity_column(&table, ci));
+                            }
+                            if options != SeqOptions::default() || restart.is_some() {
+                                let dtype = SeqDataType::for_scalar(table.columns[ci].ty.scalar())
+                                    .expect("identity column is integer");
+                                match identity_sequence_slot(
+                                    &snap,
+                                    &original.name,
+                                    &table,
+                                    ci,
+                                    match column_sources[ci] {
+                                        ColumnSource::Original(o) => Some(o),
+                                        ColumnSource::Added => None,
+                                    },
+                                    &pending_serials,
+                                    &dropped_owned_sequences,
+                                ) {
+                                    IdentitySeqSlot::Pending(si) => {
+                                        pending_serials[si] = apply_seq_alter(
+                                            &pending_serials[si],
+                                            &options,
+                                            restart,
+                                            dtype,
+                                        )?;
+                                    }
+                                    IdentitySeqSlot::Existing(key) => {
+                                        let current = self
+                                            .sequence(&key)
+                                            .cloned()
+                                            .expect("identity owned sequence exists");
+                                        self.put_sequence_routed(apply_seq_alter(
+                                            &current, &options, restart, dtype,
+                                        )?);
+                                    }
+                                }
+                            }
+                            if let Some(always) = generated {
+                                table.columns[ci].identity = Some(if always {
+                                    IdentityKind::Always
+                                } else {
+                                    IdentityKind::ByDefault
+                                });
+                            }
+                        }
+                        AlterColumnKind::DropIdentity { if_exists } => {
+                            if table.columns[ci].identity.is_none() {
+                                if if_exists {
+                                    continue;
+                                }
+                                return Err(not_identity_column(&table, ci));
+                            }
+                            match identity_sequence_slot(
+                                &snap,
+                                &original.name,
+                                &table,
+                                ci,
+                                match column_sources[ci] {
+                                    ColumnSource::Original(o) => Some(o),
+                                    ColumnSource::Added => None,
+                                },
+                                &pending_serials,
+                                &dropped_owned_sequences,
+                            ) {
+                                IdentitySeqSlot::Pending(si) => {
+                                    pending_serials.remove(si);
+                                }
+                                IdentitySeqSlot::Existing(key) => {
+                                    dropped_owned_sequences.insert(key.clone());
+                                    self.remove_sequence_routed(&key);
+                                }
+                            }
+                            table.columns[ci].identity = None;
+                            table.columns[ci].default = None;
+                            table.columns[ci].default_expr = None;
+                        }
                         AlterColumnKind::SetNotNull => table.columns[ci].not_null = true,
                         AlterColumnKind::DropNotNull => {
                             if table.columns[ci].identity.is_some() {
@@ -3116,41 +3388,34 @@ impl Engine {
                                     .expect("identity column is integer");
                                 let new_dtype = SeqDataType::for_scalar(target.ty.scalar())
                                     .expect("identity column is integer");
-                                if let Some(si) = pending_serials.iter().position(|seq| {
-                                    seq.owned_by.as_ref().is_some_and(|owner| {
-                                        owner.table == table.name && usize::from(owner.column) == ci
-                                    })
-                                }) {
-                                    pending_serials[si] = retype_identity_sequence(
-                                        &pending_serials[si],
-                                        old_dtype,
-                                        new_dtype,
-                                    )?;
-                                } else {
-                                    let old_ci = match column_sources[ci] {
-                                        ColumnSource::Original(old) => old,
-                                        ColumnSource::Added => {
-                                            panic!("added identity column has pending sequence")
-                                        }
-                                    };
-                                    let key = snap
-                                        .sequences_owned_by(&original.name)
-                                        .into_iter()
-                                        .find(|key| {
-                                            snap.sequence(key)
-                                                .and_then(|seq| seq.owned_by.as_ref())
-                                                .is_some_and(|owner| {
-                                                    usize::from(owner.column) == old_ci
-                                                })
-                                        })
-                                        .expect("identity column has owned sequence");
-                                    let current = self
-                                        .sequence(&key)
-                                        .cloned()
-                                        .expect("identity owned sequence exists");
-                                    self.put_sequence_routed(retype_identity_sequence(
-                                        &current, old_dtype, new_dtype,
-                                    )?);
+                                match identity_sequence_slot(
+                                    &snap,
+                                    &original.name,
+                                    &table,
+                                    ci,
+                                    match column_sources[ci] {
+                                        ColumnSource::Original(o) => Some(o),
+                                        ColumnSource::Added => None,
+                                    },
+                                    &pending_serials,
+                                    &dropped_owned_sequences,
+                                ) {
+                                    IdentitySeqSlot::Pending(si) => {
+                                        pending_serials[si] = retype_identity_sequence(
+                                            &pending_serials[si],
+                                            old_dtype,
+                                            new_dtype,
+                                        )?;
+                                    }
+                                    IdentitySeqSlot::Existing(key) => {
+                                        let current = self
+                                            .sequence(&key)
+                                            .cloned()
+                                            .expect("identity owned sequence exists");
+                                        self.put_sequence_routed(retype_identity_sequence(
+                                            &current, old_dtype, new_dtype,
+                                        )?);
+                                    }
                                 }
                             }
                             table.columns[ci] = target;
@@ -3287,18 +3552,19 @@ impl Engine {
         meter.guard()?;
         let mut rewrite_entries: Option<Vec<(Vec<u8>, Row)>> = None;
         let mut rewrite_next_rowid = 0i64;
-        if table_rewrite_needed {
-            // Make owned sequences visible to their synthesized nextval defaults. Statement-level
-            // rollback restores the prior working root if any later validation fails.
-            for seq in pending_serials.iter().cloned() {
-                match at.db.as_deref().map(str::to_string) {
-                    None if temp_scope => self.temp_working_mut().put_sequence(seq),
-                    None => self.working_mut().put_sequence(seq),
-                    Some(q) if q == "temp" => self.temp_working_mut().put_sequence(seq),
-                    Some(q) if q == "main" => self.working_mut().put_sequence(seq),
-                    Some(q) => self.attach_write_snap(&q).put_sequence(seq),
-                }
+        // Make owned sequences (ADD COLUMN serial/identity, ADD IDENTITY) visible to their
+        // synthesized nextval defaults. Statement-level rollback restores the prior working root if
+        // any later validation fails.
+        for seq in pending_serials.iter().cloned() {
+            match at.db.as_deref().map(str::to_string) {
+                None if temp_scope => self.temp_working_mut().put_sequence(seq),
+                None => self.working_mut().put_sequence(seq),
+                Some(q) if q == "temp" => self.temp_working_mut().put_sequence(seq),
+                Some(q) if q == "main" => self.working_mut().put_sequence(seq),
+                Some(q) => self.attach_write_snap(&q).put_sequence(seq),
             }
+        }
+        if table_rewrite_needed {
             let old_mask = vec![true; original.columns.len()];
             let store = self.store_scoped(at.db.as_deref(), &original.name);
             let (mut rows, pages, slabs) = store.scan_with_units(&old_mask)?;
@@ -4015,17 +4281,28 @@ impl Engine {
                     ),
                 ));
             }
-            let seqname = self.choose_serial_seq_name(
-                &table.name,
-                &def.name,
-                pending_serials,
-                reserved_relation_names,
-            );
             let mut opts = def
                 .identity
                 .as_ref()
                 .map(|x| x.options.clone())
                 .unwrap_or_default();
+            let seqname = match opts.sequence_name.take() {
+                Some(n) => {
+                    self.check_identity_sequence_name(
+                        &table.name,
+                        &n,
+                        pending_serials,
+                        reserved_relation_names,
+                    )?;
+                    n
+                }
+                None => self.choose_serial_seq_name(
+                    &table.name,
+                    &def.name,
+                    pending_serials,
+                    reserved_relation_names,
+                ),
+            };
             if opts.data_type.is_some() {
                 return Err(EngineError::new(
                     SqlState::SyntaxError,
@@ -5153,6 +5430,12 @@ impl Engine {
                 format!("relation already exists: {}", cs.name),
             ));
         }
+        if cs.options.sequence_name.is_some() {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "invalid sequence option SEQUENCE NAME".to_string(),
+            ));
+        }
         let def = build_sequence_def(&cs.name, &cs.options, None)?;
         self.working_mut().put_sequence(def);
         Ok(Outcome::Statement {
@@ -5248,7 +5531,13 @@ impl Engine {
                         "ALTER SEQUENCE ... AS type is not supported".to_string(),
                     ));
                 }
-                let new_def = apply_seq_alter(&existing, &options, restart)?;
+                if options.sequence_name.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "invalid sequence option SEQUENCE NAME".to_string(),
+                    ));
+                }
+                let new_def = apply_seq_alter(&existing, &options, restart, SeqDataType::BigInt)?;
                 self.put_sequence_routed(new_def);
             }
             AlterSeqAction::Rename(new_name) => {

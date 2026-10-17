@@ -167,6 +167,23 @@ pub enum AlterColumnKind {
         type_mod: Option<TypeMod>,
         using: Option<Expr>,
     },
+    /// `ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]` (alter.md §2.8): make an
+    /// existing NOT NULL, default-less integer column an identity column with a new owned sequence.
+    AddIdentity(IdentitySpec),
+    /// One or more of `SET GENERATED { ALWAYS | BY DEFAULT }`, `SET <sequence_option>`, and
+    /// `RESTART [[WITH] n]` on an identity column (alter.md §2.8). `generated` is `Some(true)` for
+    /// ALWAYS, `Some(false)` for BY DEFAULT; `options`/`restart` edit the owned sequence exactly as
+    /// `ALTER SEQUENCE` does, with the column type as the sequence type.
+    SetIdentity {
+        generated: Option<bool>,
+        options: SeqOptions,
+        restart: Option<Option<i64>>,
+    },
+    /// `DROP IDENTITY [IF EXISTS]` (alter.md §2.8): drop the owned sequence and the synthesized
+    /// default; the column stays NOT NULL.
+    DropIdentity {
+        if_exists: bool,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -438,6 +455,10 @@ pub struct SeqOptions {
     pub start: Option<i64>,
     pub cache: Option<i64>,
     pub cycle: Option<bool>,
+    /// `SEQUENCE NAME name` — valid only inside an identity column's `( … )` options, where it names
+    /// the owned sequence instead of the auto-chosen `<table>_<column>_seq` (sequences.md §13.1).
+    /// Anywhere else (CREATE / ALTER SEQUENCE) it is 42601, as in PostgreSQL.
+    pub sequence_name: Option<String>,
 }
 
 /// `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` — a named, persisted i64 generator

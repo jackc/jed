@@ -1992,6 +1992,30 @@ impl Engine {
     /// relation, not equal to the table being created, not already chosen by an earlier `serial`
     /// column of the same statement (`pending`), and not held by a caller-known pending relation.
     /// Identifier-derived, so deterministic.
+    /// Validate an explicit identity `SEQUENCE NAME` (sequences.md §13.1): the `jed_` reservation
+    /// (42939), then the relation namespace as `choose_serial_seq_name` sees it — an existing
+    /// relation, the owning table, a pending owned sequence, or a caller-reserved name is 42P07.
+    pub(crate) fn check_identity_sequence_name(
+        &self,
+        table: &str,
+        name: &str,
+        pending: &[SequenceDef],
+        reserved: &[String],
+    ) -> Result<()> {
+        crate::executor::check_reserved_name("sequence", name)?;
+        if self.relation_exists(name)
+            || name == table
+            || pending.iter().any(|s| s.name == name)
+            || reserved.iter().any(|r| r == name)
+        {
+            return Err(EngineError::new(
+                SqlState::DuplicateTable,
+                format!("relation already exists: {name}"),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn choose_serial_seq_name(
         &self,
         table: &str,

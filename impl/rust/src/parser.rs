@@ -2052,79 +2052,101 @@ impl Parser {
                     };
                     restart = Some(v);
                 }
-                // `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw
-                // type name is stored; it is resolved (and a non-integer type rejected 22023) at
-                // execution. Inside an IDENTITY column's `( … )` a set `data_type` is 42601.
-                Some("as") => {
-                    self.dup_check(seq.data_type.is_some(), "AS")?;
-                    self.advance();
-                    seq.data_type = Some(self.expect_type_name()?);
-                }
-                Some("increment") => {
-                    self.dup_check(seq.increment.is_some(), "INCREMENT")?;
-                    self.advance();
-                    self.consume_keyword("by");
-                    seq.increment = Some(self.parse_signed_int_literal()?);
-                }
-                Some("minvalue") => {
-                    self.dup_check(seq.min_value.is_some(), "MINVALUE")?;
-                    self.advance();
-                    seq.min_value = Some(Some(self.parse_signed_int_literal()?));
-                }
-                Some("maxvalue") => {
-                    self.dup_check(seq.max_value.is_some(), "MAXVALUE")?;
-                    self.advance();
-                    seq.max_value = Some(Some(self.parse_signed_int_literal()?));
-                }
-                Some("start") => {
-                    self.dup_check(seq.start.is_some(), "START")?;
-                    self.advance();
-                    self.consume_keyword("with");
-                    seq.start = Some(self.parse_signed_int_literal()?);
-                }
-                Some("cache") => {
-                    self.dup_check(seq.cache.is_some(), "CACHE")?;
-                    self.advance();
-                    seq.cache = Some(self.parse_signed_int_literal()?);
-                }
-                Some("cycle") => {
-                    self.dup_check(seq.cycle.is_some(), "CYCLE")?;
-                    self.advance();
-                    seq.cycle = Some(true);
-                }
-                // `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
-                Some("no") => {
-                    self.advance();
-                    match self.peek_keyword().as_deref() {
-                        Some("minvalue") => {
-                            self.dup_check(seq.min_value.is_some(), "MINVALUE")?;
-                            self.advance();
-                            seq.min_value = Some(None);
-                        }
-                        Some("maxvalue") => {
-                            self.dup_check(seq.max_value.is_some(), "MAXVALUE")?;
-                            self.advance();
-                            seq.max_value = Some(None);
-                        }
-                        Some("cycle") => {
-                            self.dup_check(seq.cycle.is_some(), "CYCLE")?;
-                            self.advance();
-                            seq.cycle = Some(false);
-                        }
-                        other => {
-                            return Err(syntax(format!(
-                                "expected MINVALUE, MAXVALUE, or CYCLE after NO, found {other:?}"
-                            )));
-                        }
+                _ => {
+                    if !self.parse_one_seq_option(&mut seq)? {
+                        break;
                     }
                 }
-                _ => break,
             }
         }
         if parenthesized {
             self.expect(&Token::RParen)?;
         }
         Ok((seq, restart))
+    }
+
+    /// One order-free sequence option (`sequence_option` in grammar.ebnf) into `seq`, or `false`
+    /// when the next token starts none. Shared by the CREATE/ALTER SEQUENCE and identity `( … )`
+    /// option loops and by `ALTER TABLE … ALTER COLUMN … SET <sequence_option>` (alter.md §2.8).
+    fn parse_one_seq_option(&mut self, seq: &mut SeqOptions) -> Result<bool> {
+        match self.peek_keyword().as_deref() {
+            // `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw
+            // type name is stored; it is resolved (and a non-integer type rejected 22023) at
+            // execution. Inside an IDENTITY column's `( … )` a set `data_type` is 42601.
+            Some("as") => {
+                self.dup_check(seq.data_type.is_some(), "AS")?;
+                self.advance();
+                seq.data_type = Some(self.expect_type_name()?);
+            }
+            Some("increment") => {
+                self.dup_check(seq.increment.is_some(), "INCREMENT")?;
+                self.advance();
+                self.consume_keyword("by");
+                seq.increment = Some(self.parse_signed_int_literal()?);
+            }
+            Some("minvalue") => {
+                self.dup_check(seq.min_value.is_some(), "MINVALUE")?;
+                self.advance();
+                seq.min_value = Some(Some(self.parse_signed_int_literal()?));
+            }
+            Some("maxvalue") => {
+                self.dup_check(seq.max_value.is_some(), "MAXVALUE")?;
+                self.advance();
+                seq.max_value = Some(Some(self.parse_signed_int_literal()?));
+            }
+            Some("start") => {
+                self.dup_check(seq.start.is_some(), "START")?;
+                self.advance();
+                self.consume_keyword("with");
+                seq.start = Some(self.parse_signed_int_literal()?);
+            }
+            Some("cache") => {
+                self.dup_check(seq.cache.is_some(), "CACHE")?;
+                self.advance();
+                seq.cache = Some(self.parse_signed_int_literal()?);
+            }
+            Some("cycle") => {
+                self.dup_check(seq.cycle.is_some(), "CYCLE")?;
+                self.advance();
+                seq.cycle = Some(true);
+            }
+            // `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
+            Some("no") => {
+                self.advance();
+                match self.peek_keyword().as_deref() {
+                    Some("minvalue") => {
+                        self.dup_check(seq.min_value.is_some(), "MINVALUE")?;
+                        self.advance();
+                        seq.min_value = Some(None);
+                    }
+                    Some("maxvalue") => {
+                        self.dup_check(seq.max_value.is_some(), "MAXVALUE")?;
+                        self.advance();
+                        seq.max_value = Some(None);
+                    }
+                    Some("cycle") => {
+                        self.dup_check(seq.cycle.is_some(), "CYCLE")?;
+                        self.advance();
+                        seq.cycle = Some(false);
+                    }
+                    other => {
+                        return Err(syntax(format!(
+                            "expected MINVALUE, MAXVALUE, or CYCLE after NO, found {other:?}"
+                        )));
+                    }
+                }
+            }
+            // `SEQUENCE NAME name` — identity options only; the executor rejects it elsewhere
+            // (42601, sequences.md §13.1).
+            Some("sequence") if self.peek_keyword_at(1).as_deref() == Some("name") => {
+                self.dup_check(seq.sequence_name.is_some(), "SEQUENCE NAME")?;
+                self.advance();
+                self.advance();
+                seq.sequence_name = Some(self.expect_identifier()?);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT | CASCADE]` (grammar.md §44). `CASCADE`
@@ -2383,7 +2405,32 @@ impl Parser {
                             self.advance();
                         }
                         let column = self.expect_identifier()?;
+                        let set_target = self.peek_keyword_at(1);
                         let kind = match self.peek_keyword().as_deref() {
+                            // The identity option list (alter.md §2.8): `SET GENERATED …`,
+                            // `SET <sequence_option>`, `RESTART …`, in any order.
+                            Some("restart") => self.parse_alter_identity_options()?,
+                            Some("set")
+                                if !matches!(
+                                    set_target.as_deref(),
+                                    Some("default" | "data" | "not")
+                                ) =>
+                            {
+                                self.parse_alter_identity_options()?
+                            }
+                            Some("add") => {
+                                self.advance();
+                                self.expect_keyword("generated")?;
+                                let always = self.parse_generated_when()?;
+                                self.expect_keyword("as")?;
+                                self.expect_keyword("identity")?;
+                                let options = if matches!(self.peek(), Token::LParen) {
+                                    self.parse_sequence_options(true)?
+                                } else {
+                                    SeqOptions::default()
+                                };
+                                AlterColumnKind::AddIdentity(IdentitySpec { always, options })
+                            }
                             Some("set") => {
                                 self.advance();
                                 if self.peek_keyword().as_deref() == Some("default") {
@@ -2407,6 +2454,17 @@ impl Parser {
                                 if self.peek_keyword().as_deref() == Some("default") {
                                     self.advance();
                                     AlterColumnKind::DropDefault
+                                } else if self.peek_keyword().as_deref() == Some("identity") {
+                                    self.advance();
+                                    let if_exists = if self.peek_keyword().as_deref() == Some("if")
+                                    {
+                                        self.advance();
+                                        self.expect_keyword("exists")?;
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    AlterColumnKind::DropIdentity { if_exists }
                                 } else {
                                     self.expect_keyword("not")?;
                                     self.expect_keyword("null")?;
@@ -2441,6 +2499,87 @@ impl Parser {
             db,
             if_exists,
             action,
+        })
+    }
+
+    /// `ALWAYS` (true) or `BY DEFAULT` (false) after `GENERATED`.
+    fn parse_generated_when(&mut self) -> Result<bool> {
+        match self.peek_keyword().as_deref() {
+            Some("always") => {
+                self.advance();
+                Ok(true)
+            }
+            Some("by") => {
+                self.advance();
+                self.expect_keyword("default")?;
+                Ok(false)
+            }
+            other => Err(syntax(format!(
+                "expected ALWAYS or BY DEFAULT after GENERATED, found {other:?}"
+            ))),
+        }
+    }
+
+    /// The identity alteration list of `ALTER [COLUMN] c` (alter.md §2.8, PostgreSQL's
+    /// `alter_identity_column_option_list`): one or more of `SET GENERATED { ALWAYS | BY DEFAULT }`,
+    /// `SET <sequence_option>`, and `RESTART [[WITH] n]`, order-free, each at most once (42601).
+    /// `SET AS`, `SET RESTART`, and `SET SEQUENCE NAME` are 42601 ("not supported here").
+    fn parse_alter_identity_options(&mut self) -> Result<AlterColumnKind> {
+        let mut generated: Option<bool> = None;
+        let mut options = SeqOptions::default();
+        let mut restart: Option<Option<i64>> = None;
+        loop {
+            match self.peek_keyword().as_deref() {
+                Some("restart") => {
+                    self.dup_check(restart.is_some(), "RESTART")?;
+                    self.advance();
+                    let v = if matches!(self.peek(), Token::Int(_) | Token::Minus)
+                        || self.peek_keyword().as_deref() == Some("with")
+                    {
+                        self.consume_keyword("with");
+                        Some(self.parse_signed_int_literal()?)
+                    } else {
+                        None
+                    };
+                    restart = Some(v);
+                }
+                Some("set")
+                    if !matches!(
+                        self.peek_keyword_at(1).as_deref(),
+                        Some("default" | "data" | "not")
+                    ) =>
+                {
+                    self.advance();
+                    match self.peek_keyword().as_deref() {
+                        Some("generated") => {
+                            self.dup_check(generated.is_some(), "SET GENERATED")?;
+                            self.advance();
+                            generated = Some(self.parse_generated_when()?);
+                        }
+                        Some(opt @ ("as" | "restart")) => {
+                            return Err(syntax(format!(
+                                "sequence option \"{opt}\" not supported here"
+                            )));
+                        }
+                        Some("sequence") => {
+                            return Err(syntax("invalid sequence option SEQUENCE NAME"));
+                        }
+                        other => {
+                            if !self.parse_one_seq_option(&mut options)? {
+                                return Err(syntax(format!(
+                                    "expected an identity option after SET, found {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(AlterColumnKind::SetIdentity {
+            generated,
+            options,
+            restart,
         })
     }
 

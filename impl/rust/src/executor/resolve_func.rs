@@ -3003,6 +3003,7 @@ pub(crate) fn apply_seq_alter(
     existing: &SequenceDef,
     options: &SeqOptions,
     restart: Option<Option<i64>>,
+    dtype: SeqDataType,
 ) -> Result<SequenceDef> {
     debug_assert!(
         options.data_type.is_none(),
@@ -3027,11 +3028,35 @@ pub(crate) fn apply_seq_alter(
         }
         def.cache = c;
     }
-    // `NO MINVALUE`/`NO MAXVALUE` recompute the default for the (possibly new) INCREMENT sign — but
-    // against the bigint range, since the value type is not persisted (§14.4). An explicit bound is
-    // taken as written (i64-bounded only). An unwritten bound is preserved (PG keeps it even when the
-    // INCREMENT sign flips — sequences.md §15.2).
-    let (def_min, def_max) = SeqDataType::BigInt.default_bounds(def.increment);
+    // `NO MINVALUE`/`NO MAXVALUE` recompute the default for the (possibly new) INCREMENT sign
+    // against `dtype`: bigint for `ALTER SEQUENCE`, since the value type is not persisted (§14.4),
+    // the column type for an identity column's `ALTER TABLE … ALTER COLUMN … SET` (alter.md §2.8).
+    // An explicit bound must lie in `dtype`'s range (MAX checked first, PG order). An unwritten
+    // bound is preserved (PG keeps it even when the INCREMENT sign flips — sequences.md §15.2).
+    let (def_min, def_max) = dtype.default_bounds(def.increment);
+    let (type_min, type_max) = dtype.range();
+    if let Some(Some(v)) = options.max_value
+        && v > type_max
+    {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "MAXVALUE ({v}) is out of range for sequence data type {}",
+                dtype.pg_name()
+            ),
+        ));
+    }
+    if let Some(Some(v)) = options.min_value
+        && v < type_min
+    {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "MINVALUE ({v}) is out of range for sequence data type {}",
+                dtype.pg_name()
+            ),
+        ));
+    }
     match options.min_value {
         Some(Some(v)) => def.min_value = v,
         Some(None) => def.min_value = def_min,
