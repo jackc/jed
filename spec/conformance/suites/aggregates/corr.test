@@ -1,0 +1,133 @@
+# Aggregate corr(Y, X) (spec/design/aggregates.md §23): the correlation coefficient of the (Y, X) pairs whose arguments are both non-NULL, NULL when either variable is constant. Over two float arguments it is
+# PostgreSQL's float8 algorithm with an f64 result; over two integer/decimal arguments it is exact, a
+# decimal result — a jed divergence (PostgreSQL defines it only over float8), ledgered in
+# oracle_overrides.toml, whose expected values are PostgreSQL's numeric evaluation of the formula in
+# aggregates.md §23. A pair with a NULL is skipped. Output name `corr`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.corr
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, y i32, x i32, dy numeric(6,2), dx numeric(6,1), fy f64, fx f64, ry f32, rx f32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1, 2, 1.50, 2.0, 1, 2, 1, 2), (2, 1, 3, 5, 2.25, 5.5, 3, 5, 3, 5), (3, 1, 4, 4, NULL, 4.5, 4, 4, 4, 4), (4, 1, 8, 9, 8.00, 9.0, 8, 9, 8, 9), (5, 2, NULL, 1, 1.00, NULL, NULL, 1, NULL, 1), (6, 2, 2, 3, 2.00, 3.0, 2, 3, 2, 3)
+
+# The arguments travel as one row: 6 rows read + 1 leaf page read + 6 row packs + 6 accumulated + 1
+# produced.
+# names: corr
+# cost: 20
+query R nosort
+SELECT corr(fy, fx) FROM t
+----
+0.9657534246575342
+
+# f32 arguments widen to f64.
+# names: corr
+query R nosort
+SELECT corr(ry, rx) FROM t
+----
+0.9657534246575342
+
+# names: g, corr
+query IR rowsort
+SELECT g, corr(fy, fx) FROM t GROUP BY g
+----
+1
+0.9615384615384616
+2
+NULL
+
+# One pair, and none (a pair with a NULL is skipped).
+# names: corr
+query R nosort
+SELECT corr(fy, fx) FROM t WHERE id = 6
+----
+NULL
+
+# names: corr
+query R nosort
+SELECT corr(fy, fx) FROM t WHERE id = 5
+----
+NULL
+
+# names: corr
+query R nosort
+SELECT corr(fy, fx * 2) FILTER (WHERE id > 1) FROM t
+----
+0.9518072289156626
+
+# names: id, corr
+query IR nosort
+SELECT id, corr(fy, fx) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+NULL
+2
+1
+3
+0.7857142857142858
+4
+0.9615384615384616
+5
+0.9615384615384616
+6
+0.9657534246575342
+
+# names: corr
+query R nosort
+SELECT corr(y, x) FROM (VALUES (1.0::f64, 'Infinity'::f64), (2.0::f64, 3.0::f64)) v(y, x)
+----
+NaN
+
+statement error 22003
+SELECT corr(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
+
+# Over integer and decimal arguments: exact.
+# names: corr
+# cost: 20
+query D nosort
+SELECT corr(y, x) FROM t
+----
+0.96575342465753424658
+
+# names: corr, corr
+query DD nosort
+SELECT corr(dy, dx), corr(y, dx) FROM t
+----
+0.92073978190759628866
+0.96068516427184777546
+
+# names: g, corr
+query ID rowsort
+SELECT g, corr(dy, x) FROM t GROUP BY g
+----
+1
+0.94419399122604417874
+2
+1.00000000000000000000
+
+# names: corr
+query D nosort
+SELECT corr(DISTINCT y, y) FROM t
+----
+1.00000000000000000000
+
+# Wide decimals charge decimal_work for each pair's three products and five sums.
+statement ok
+CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
+
+statement ok
+INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
+
+# names: corr
+# cost: 180
+query D nosort
+SELECT corr(y, x) FROM big
+----
+0.40964401594808833149862359
+
+# A float argument beside an exact one has no overload.
+statement error 42883
+SELECT corr(fy, x) FROM t
+
+statement error 42883
+SELECT corr(y) FROM t

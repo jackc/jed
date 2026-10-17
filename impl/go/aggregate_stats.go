@@ -156,16 +156,19 @@ type pairStat int
 const (
 	pairCovarPop pairStat = iota
 	pairCovarSamp
+	pairCorr
 )
 
 // pairSurfaces maps each two-argument statistical aggregate to its exact and float plans.
 var pairSurfaces = map[string][2]aggPlan{
+	"corr":       {planCorr, planCorrFloat},
 	"covar_pop":  {planCovarPop, planCovarPopFloat},
 	"covar_samp": {planCovarSamp, planCovarSampFloat},
 }
 
 // pairStats gives each two-argument plan its statistic.
 var pairStats = map[aggPlan]pairStat{
+	planCorr: pairCorr, planCorrFloat: pairCorr,
 	planCovarPop: pairCovarPop, planCovarPopFloat: pairCovarPop,
 	planCovarSamp: pairCovarSamp, planCovarSampFloat: pairCovarSamp,
 }
@@ -218,6 +221,17 @@ func (s *pairsExact) finalize(stat pairStat) (Value, error) {
 			return NullValue(), nil
 		}
 		r, err = numXY.Div(n.mulExact(decimalFromInt64(s.n - 1)))
+	case pairCorr:
+		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
+		numY := n.mulExact(s.syy).sub(s.sy.mulExact(s.sy))
+		if numX.IsZero() || numY.IsZero() {
+			return NullValue(), nil
+		}
+		root, rerr := numX.mulExact(numY).DecSqrt()
+		if rerr != nil {
+			return NullValue(), rerr
+		}
+		r, err = numXY.Div(root)
 	default:
 		panic("unhandled pair statistic")
 	}
@@ -296,6 +310,11 @@ func (s *pairsFloat) finalize(stat pairStat) Value {
 			return NullValue()
 		}
 		return Float64Value(s.sxy / (s.n - 1))
+	case pairCorr:
+		if s.sxx == 0 || s.syy == 0 {
+			return NullValue()
+		}
+		return Float64Value(s.sxy / math.Sqrt(float64(s.sxx*s.syy)))
 	default:
 		panic("unhandled pair statistic")
 	}

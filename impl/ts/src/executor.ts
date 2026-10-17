@@ -32259,6 +32259,8 @@ export type AggPlan =
   // The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
   | "covarPop"
   | "covarPopFloat"
+  | "corr"
+  | "corrFloat"
   | "covarSamp"
   | "covarSampFloat"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
@@ -32803,14 +32805,17 @@ function foldFloatMoment(a: Acc, v: Value): void {
 // The two-argument statistical aggregates (aggregates.md §23) over (Y, X) pairs whose arguments are
 // both non-NULL. PAIR_SURFACES maps each to its exact and float plans; PAIR_STATS gives each plan its
 // statistic.
-type PairStat = "covarPop" | "covarSamp";
+type PairStat = "covarPop" | "covarSamp" | "corr";
 const PAIR_SURFACES: Record<string, [AggPlan, AggPlan]> = {
   covar_pop: ["covarPop", "covarPopFloat"],
+  corr: ["corr", "corrFloat"],
   covar_samp: ["covarSamp", "covarSampFloat"],
 };
 const PAIR_STATS: Partial<Record<AggPlan, PairStat>> = {
   covarPop: "covarPop",
   covarPopFloat: "covarPop",
+  corr: "corr",
+  corrFloat: "corr",
   covarSamp: "covarSamp",
   covarSampFloat: "covarSamp",
 };
@@ -32851,6 +32856,12 @@ function finalizeExactPair(stat: PairStat, n: bigint, sums: Decimal[]): Value {
   switch (stat) {
     case "covarPop":
       return decimalValue(numXY.div(count.mulExact(count)));
+    case "corr": {
+      const numX = count.mulExact(sums[1]!).subUncapped(sx.mulExact(sx));
+      const numY = count.mulExact(sums[3]!).subUncapped(sy.mulExact(sy));
+      if (numX.isZero() || numY.isZero()) return nullValue();
+      return decimalValue(numXY.div(numX.mulExact(numY).decSqrt()));
+    }
     case "covarSamp":
       if (n < 2n) return nullValue();
       return decimalValue(numXY.div(count.mulExact(Decimal.fromBigInt(n - 1n))));
@@ -32912,6 +32923,8 @@ function finalizeFloatPair(stat: PairStat, t: number[]): Value {
   switch (stat) {
     case "covarPop":
       return float64Value(sxy / n);
+    case "corr":
+      return t[2] === 0 || t[4] === 0 ? nullValue() : float64Value(sxy / Math.sqrt(t[2]! * t[4]!));
     case "covarSamp":
       return n < 2 ? nullValue() : float64Value(sxy / (n - 1));
   }
@@ -32997,10 +33010,12 @@ export function cloneAcc(a: Acc): Acc {
 export function foldAcc(a: Acc, v: Value, m: Meter): void {
   switch (a.plan) {
     case "covarPop":
+    case "corr":
     case "covarSamp":
       foldExactPair(a, v, m);
       break;
     case "covarPopFloat":
+    case "corrFloat":
     case "covarSampFloat":
       foldFloatPair(a, v);
       break;
@@ -33238,9 +33253,11 @@ export function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
 export function finalizeAcc(a: Acc): Value {
   switch (a.plan) {
     case "covarPop":
+    case "corr":
     case "covarSamp":
       return finalizeExactPair(PAIR_STATS[a.plan]!, a.momN, a.pairSums);
     case "covarPopFloat":
+    case "corrFloat":
     case "covarSampFloat":
       return finalizeFloatPair(PAIR_STATS[a.plan]!, a.pairF);
     case "varPop":
