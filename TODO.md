@@ -66,8 +66,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`. The variance/stddev family is exact over
   integer/decimal input (as in PostgreSQL) and uses PostgreSQL's `float8` algorithms over floats; the
   two-argument set widens any numeric arguments to `f64`, as PostgreSQL does. → [aggregates.md §23](spec/design/aggregates.md)
-- [ ] **`NULLIF(a, b)`** — the SQL conditional beside `COALESCE`/`GREATEST`/`LEAST` (grammar.md §51–§52);
-  absent from the grammar today. _(size: S)_
 - [ ] **Everyday scalar functions** — `concat_ws`, `format()` (PostgreSQL's `%s`/`%I`/`%L`),
   `array_to_string`, `string_to_array`, and a `gen_random_uuid` alias of `uuidv4` (through the
   entropy seam). (`to_char` is tracked under `timestamp` below.) _(size: M)_

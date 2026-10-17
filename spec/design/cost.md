@@ -183,6 +183,9 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
   an explicit `<` chain**: each comparison after the first non-NULL argument charges the same
   size-scaled `decimal_work` / `varlen_compare` / `collate` a binary comparison would, so a fold
   over many large values cannot do unbounded comparison work under the ceiling — §6/§13.
+  `NULLIF(a, b)` ([grammar.md](grammar.md) §58) is likewise eager: one `operator_eval` for the
+  node, then both operands in source order, then the size-scaled `decimal_work` /
+  `varlen_compare` its `=` comparison charges — `NULLIF(1, 1/0)` traps.
   `width_bucket(operand, thresholds)` meters each step of its binary search the same way: one
   `operator_eval` plus the comparison's size-scaled work per step, at most `⌈log₂(n + 1)⌉` steps —
   [array-functions.md](array-functions.md) §14.)

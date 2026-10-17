@@ -157,6 +157,13 @@ func rejectCheckStructure(e exprNode) error {
 			}
 		}
 		return nil
+	case exprNullIf:
+		for _, a := range e.NullIf {
+			if err := rejectCheckStructure(a); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprFieldAccess, exprFieldStar:
 		// Recurse into the composite base (spec/design/composite.md §S4) so a forbidden
 		// subquery/aggregate/parameter hidden there is still rejected.
@@ -334,6 +341,13 @@ func rejectDefaultStructure(e exprNode) error {
 			}
 		}
 		return nil
+	case exprNullIf:
+		for _, a := range e.NullIf {
+			if err := rejectDefaultStructure(a); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprFieldAccess, exprFieldStar:
 		// Recurse into the composite base (spec/design/composite.md §S4).
 		return rejectDefaultStructure(*e.Base)
@@ -456,6 +470,10 @@ func checkReferencedColumns(e exprNode, columns []catColumn) []int {
 			for _, a := range e.GreatestLeast {
 				walk(a)
 			}
+		case exprNullIf:
+			for _, a := range e.NullIf {
+				walk(a)
+			}
 		case exprFuncCall:
 			for _, a := range e.FuncCall.Args {
 				walk(*a)
@@ -560,6 +578,13 @@ func indexExprHasSubquery(e exprNode) bool {
 			return false
 		case exprGreatestLeast:
 			for _, a := range e.GreatestLeast {
+				if walk(a) {
+					return true
+				}
+			}
+			return false
+		case exprNullIf:
+			for _, a := range e.NullIf {
 				if walk(a) {
 					return true
 				}
@@ -749,6 +774,13 @@ func indexExprFirstParam(e exprNode) (uint64, bool) {
 			return 0, false
 		case exprGreatestLeast:
 			for _, a := range e.GreatestLeast {
+				if n, ok := walk(a); ok {
+					return n, true
+				}
+			}
+			return 0, false
+		case exprNullIf:
+			for _, a := range e.NullIf {
 				if n, ok := walk(a); ok {
 					return n, true
 				}

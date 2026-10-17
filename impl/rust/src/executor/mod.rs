@@ -3970,6 +3970,19 @@ pub(crate) enum RExpr {
         greatest: bool,
         collation: Option<std::sync::Arc<Collation>>,
     },
+    /// A resolved `NULLIF(a, b)` (grammar.md §58) — `args` is exactly `[a, b]`. EAGER: both
+    /// arguments are evaluated, `a` first. When both are non-NULL and `a = b` the result is NULL;
+    /// otherwise it is `a`. The pair passed the `=` comparability gate at resolve, and the result
+    /// type is `a`'s, except that an integer `a` facing a decimal `b` becomes decimal
+    /// (`coerce_decimal`, PostgreSQL's `int = numeric` resolution). `widen_float` widens an f32
+    /// operand to f64 for the comparison only (a mixed-width float pair; the result keeps `a`'s
+    /// width, PostgreSQL's `float48eq`). Equality is byte equality under every deterministic
+    /// collation, so no collation is carried (collation.md §7).
+    NullIf {
+        args: Vec<RExpr>,
+        coerce_decimal: bool,
+        widen_float: bool,
+    },
     /// A scalar-function call (abs/round, spec/design/functions.md §9), evaluated per row in
     /// any context. `result` is the static result type — for `abs` over an integer it is the
     /// operand's integer type, so the magnitude is range-checked at that boundary (the same
@@ -4689,7 +4702,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
                 + els.as_deref().map_or(0, sub)
         }
         Expr::Coalesce(args) => args.iter().map(sub).sum(),
-        Expr::GreatestLeast { args, .. } => args.iter().map(sub).sum(),
+        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => args.iter().map(sub).sum(),
         Expr::FuncCall { args, .. } => args.iter().map(sub).sum(),
     }
 }

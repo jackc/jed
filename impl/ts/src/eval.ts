@@ -451,6 +451,8 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return evalCoalesceNode(e, row, env, m);
     case "greatestLeast":
       return evalGreatestLeastNode(e, row, env, m);
+    case "nullIf":
+      return evalNullIfNode(e, row, env, m);
     case "hostFunc":
       return evalHostFuncNode(e, row, env, m);
     case "scalarFunc":
@@ -1428,6 +1430,23 @@ function evalGreatestLeastNode(e: Of<"greatestLeast">, row: Row, env: EvalEnv, m
     }
   }
   return best ?? nullValue();
+}
+
+function evalNullIfNode(e: Of<"nullIf">, row: Row, env: EvalEnv, m: Meter): Value {
+  // NULLIF is EAGER (grammar.md §58): charge the node, evaluate a then b (both, always —
+  // NULLIF(1, 1/0) traps), then compare them as `=` does, charging the same size-scaled work
+  // (decimalWork / varlenCompare). Equal → NULL; otherwise — including when either side is NULL —
+  // the result is a.
+  m.charge(COSTS.operatorEval);
+  const a = evalExpr(e.args[0]!, row, env, m);
+  const b = evalExpr(e.args[1]!, row, env, m);
+  m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
+  m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(a, b) - 1));
+  m.guard();
+  // A mixed-width float pair compares at f64 (the implicit f32 → f64 cast).
+  const widen = (v: Value): Value => (e.widenFloat && v.kind === "f32" ? float64Value(v.value) : v);
+  if (eq3(widen(a), widen(b)) === "true") return nullValue();
+  return coerceCaseValue(a, e.coerceDecimal);
 }
 
 function evalHostFuncNode(e: Of<"hostFunc">, row: Row, env: EvalEnv, m: Meter): Value {

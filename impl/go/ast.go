@@ -1260,6 +1260,9 @@ const (
 	// (spec/design/grammar.md §52). NULL arguments are ignored; the result is NULL only when
 	// every argument is NULL. Unlike COALESCE it is EAGER — every argument is evaluated.
 	exprGreatestLeast
+	// ExprNullIf is NULLIF(a, b) — NULL when a = b, else a (spec/design/grammar.md §58). EAGER:
+	// both arguments are evaluated.
+	exprNullIf
 	// ExprScalarSubquery is a scalar subquery `( query_expr )` in expression position
 	// (spec/design/grammar.md §26). resolve plans it once against the scope chain; an uncorrelated
 	// one is then folded to a constant, a correlated one is re-executed per outer row.
@@ -1457,9 +1460,11 @@ type exprNode struct {
 	// distinguishes GREATEST (true, max) from LEAST (false, min).
 	GreatestLeast []exprNode
 	Greatest      bool
-	Subquery      *queryExpr      // ExprScalarSubquery, ExprExists (the inner query)
-	InSubquery    *inSubqueryExpr // ExprInSubquery
-	Quantified    *quantifiedExpr // ExprQuantified
+	// NullIf is the [a, b] argument pair of an ExprNullIf (exactly two, in source order).
+	NullIf     []exprNode
+	Subquery   *queryExpr      // ExprScalarSubquery, ExprExists (the inner query)
+	InSubquery *inSubqueryExpr // ExprInSubquery
+	Quantified *quantifiedExpr // ExprQuantified
 
 	QuantifiedSubquery *quantifiedSubqueryExpr // ExprQuantifiedSubquery
 	RowItems           []exprNode              // ExprRow (the ROW(...) field expressions, in order)

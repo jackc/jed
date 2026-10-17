@@ -1498,6 +1498,8 @@ func renderRExpr(e *rExpr) string {
 			return explainExprCall("greatest", e.sargs)
 		}
 		return explainExprCall("least", e.sargs)
+	case reNullIf:
+		return explainExprCall("nullif", e.sargs)
 	case reScalarFunc:
 		if e.sfunc == sfByteaConcat || e.sfunc == sfTextConcat {
 			// bytea / text || renders as its binary operator form, like jsonb `||`.

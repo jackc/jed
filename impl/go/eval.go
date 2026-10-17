@@ -2689,6 +2689,39 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		return best, nil
+	case reNullIf:
+		// NULLIF is EAGER (grammar.md §58): charge the node, evaluate a then b (both, always —
+		// NULLIF(1, 1/0) traps), then compare them as `=` does, charging the same size-scaled work
+		// (decimal_work / varlen_compare). Equal → NULL; otherwise — including when either side is
+		// NULL — the result is a.
+		m.Charge(costs.OperatorEval)
+		a, err := e.sargs[0].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		b, err := e.sargs[1].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		m.Charge(costs.DecimalWork * (decimalCmpWork(a, b) - 1))
+		m.Charge(costs.VarlenCompare * (varlenCompareWork(a, b) - 1))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		ca, cb := a, b
+		if e.nullifWidenFloat {
+			// A mixed-width float pair compares at f64 (the implicit f32 → f64 cast).
+			if ca.Kind == ValFloat32 {
+				ca = Float64Value(ca.asF64())
+			}
+			if cb.Kind == ValFloat32 {
+				cb = Float64Value(cb.asF64())
+			}
+		}
+		if ca.Eq3(cb) == True {
+			return NullValue(), nil
+		}
+		return coerceCase(a, e.caseDecimal), nil
 	case reHostFunc:
 		// A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the injection
 		// seam. The kernel is reached BY ID through the frozen registry — the path the compiled

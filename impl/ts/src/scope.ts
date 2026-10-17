@@ -1332,6 +1332,7 @@ export function countSelfRefsExpr(e: Expr, name: string): number {
       );
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
     case "funcCall":
       return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
@@ -2244,6 +2245,7 @@ export function exprCallsSeqMutator(e: Expr): boolean {
       );
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       return e.args.some(exprCallsSeqMutator);
     case "scalarSubquery":
     case "exists":
@@ -2599,6 +2601,7 @@ export function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): vo
       break;
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       for (const a of e.args) collectExprPrivs(a, req, locals);
       break;
     case "scalarSubquery":
@@ -2690,6 +2693,7 @@ export function exprReadsColumns(e: Expr): boolean {
       );
     case "coalesce":
     case "greatestLeast":
+    case "nullIf":
       return e.args.some(exprReadsColumns);
     case "quantified":
       return exprReadsColumns(e.lhs) || exprReadsColumns(e.array);
@@ -3149,6 +3153,8 @@ export function renderRExpr(e: RExpr): string {
       return explainCall("coalesce", e.args);
     case "greatestLeast":
       return explainCall(e.greatest ? "greatest" : "least", e.args);
+    case "nullIf":
+      return explainCall("nullif", e.args);
     case "scalarFunc":
       // bytea / text || renders as its operator, like the jsonb concat (it has no function-call name).
       if (e.func === "bytea_concat" || e.func === "text_concat")

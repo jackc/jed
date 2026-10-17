@@ -1188,6 +1188,7 @@ primary        ::= number
                  | case_expr
                  | coalesce_expr
                  | greatest_least_expr
+                 | nullif_expr
                  | function_call
                  | "EXISTS" "(" subquery_expr ")"
                  | "ROW" "(" ( expr ( "," expr )* )? ")"
@@ -1270,6 +1271,18 @@ coalesce_expr  ::= "COALESCE" "(" expr ( "," expr )* ")"
  * col_name_keyword classification. Un-aliased output name: `greatest` / `least` (PostgreSQL; the
  * fixed keyword lowercased — no expression printer needed, the §8 rule-4 rationale). */
 greatest_least_expr ::= ( "GREATEST" | "LEAST" ) "(" expr ( "," expr )* ")"
+
+/* NULLIF(a, b) (../design/grammar.md §58) — NULL when a = b, else a. Exactly two arguments (any
+ * other count is 42601, PostgreSQL's shape). The operands resolve as an `=` pair and must be
+ * comparable by `=` (json/jsonpath 42883, a cross-family pair 42804, a text pair's collation
+ * conflict 42P21/42P22); a NULL on either side never matches, so the result is then a. The result
+ * takes a's type after PostgreSQL's `=` resolution (an unknown a takes b's type, all-NULL is text,
+ * an integer a facing a decimal b is decimal). EAGER like GREATEST/LEAST — both operands are
+ * evaluated (NULLIF(1, 1/0) traps 22012). "NULLIF" stays non-reserved: the form is recognized ONLY
+ * when the keyword is immediately followed by "(" (the EXTRACT/JSON one-token lookahead, §8), so
+ * the word remains usable as a column name — observably PostgreSQL's col_name_keyword
+ * classification. Un-aliased output name: `nullif` (PostgreSQL; the fixed keyword lowercased). */
+nullif_expr    ::= "NULLIF" "(" expr "," expr ")"
 
 /* EXTRACT(field FROM source) (../design/timezones.md §9.2, ../design/grammar.md §50) — the SQL
  * special form for a single datetime field, equal to PostgreSQL's `extract(text, value)` but with

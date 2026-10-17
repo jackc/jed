@@ -470,6 +470,11 @@ const (
 	// selects max vs min; the winner is chosen by the unified type's total order (valueCmp).
 	// `caseDecimal` is reused for the widen-to-decimal flag.
 	reGreatestLeast
+	// reNullIf is NULLIF(a, b) (spec/design/grammar.md §58): `sargs` is exactly [a, b], both
+	// evaluated (EAGER). Equal non-NULL operands give NULL; otherwise the result is a. caseDecimal
+	// widens an integer a to decimal (an integer a facing a decimal b); nullifWidenFloat compares a
+	// mixed-width float pair at f64 while the result keeps a's width.
+	reNullIf
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
 	reScalarFunc
@@ -1155,6 +1160,8 @@ type rExpr struct {
 	caseDecimal bool
 	// reGreatestLeast: true for GREATEST (max), false for LEAST (min).
 	greatest bool
+	// reNullIf: compare a mixed-width float pair at f64 (the implicit f32 -> f64 cast).
+	nullifWidenFloat bool
 
 	// reScalarFunc: the scalar function (abs/round) and its argument nodes. `result` holds the
 	// static result type — for abs over an integer it is the operand's integer type, so the

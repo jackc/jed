@@ -400,7 +400,7 @@ written at, grouping parentheses excluded — a function call's name, an operato
 operand's location, a prefix operator, a `CASE` keyword, a literal (a folded negative number's minus
 sign), a `::` cast's operand. jed records it only where it is exact; for an expression whose leftmost
 token it does not record (a bind parameter, a scalar subquery, `EXISTS`, `ROW(…)`, `ARRAY[…]`,
-`COALESCE`, `GREATEST`, `EXTRACT`, the SQL/JSON constructors, `CAST(x AS t)` of a non-literal whose
+`COALESCE`, `GREATEST`, `NULLIF`, `EXTRACT`, the SQL/JSON constructors, `CAST(x AS t)` of a non-literal whose
 PostgreSQL location depends on whether the cast is a no-op) the location is unknown and the error
 carries no position, rather than a wrong one.
 

@@ -368,6 +368,7 @@ export function outputName(scope: Scope, e: Expr): string {
   if (e.kind === "coalesce") return "coalesce";
   // The fixed keyword lowercased (PG; grammar.md §52).
   if (e.kind === "greatestLeast") return e.greatest ? "greatest" : "least";
+  if (e.kind === "nullIf") return "nullif";
   if (e.kind === "fieldAccess") return e.field;
   // A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to the
   // same base. A non-column base falls through to `?column?`.
@@ -1025,7 +1026,47 @@ function resolveNode(
       return resolveCoalesceExpr(scope, e, ag, params);
     case "greatestLeast":
       return resolveGreatestLeastExpr(scope, e, ag, params);
+    case "nullIf":
+      return resolveNullIfExpr(scope, e, ag, params);
   }
+}
+
+function resolveNullIfExpr(
+  scope: Scope,
+  e: Of<"nullIf">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // NULLIF(a, b) (grammar.md §58) is PostgreSQL's `CASE WHEN a = b THEN NULL ELSE a END` with `a`
+  // evaluated once. The operands resolve exactly as an `=` pair (an adaptable literal or parameter
+  // takes its type from its sibling) and pass the `=` comparability gate.
+  const p = resolveOperandPair(scope, e.args[0]!, e.args[1]!, ag, params);
+  classifyComparable(p.lt, p.rt);
+  // A text pair derives the comparison collation like `=` does, so a conflict is 42P21 and an
+  // indeterminate implicit pair 42P22. Equality ignores the collation itself.
+  if (rtCollatable(p.lt) && rtCollatable(p.rt)) {
+    resolveDeriv(
+      scope.catalog,
+      combineDeriv(deriveCollation(scope, e.args[0]!), deriveCollation(scope, e.args[1]!)),
+    );
+  }
+  // The result is a's type after PostgreSQL's `=` resolution: an unknown (NULL) a takes b's type
+  // (text when both are NULL), and an integer a facing a decimal b becomes decimal (there is no
+  // int = numeric operator). Every other comparable pair keeps a's type: the integer widths and
+  // f32/f64 have cross-type operators.
+  let type: ResolvedType = p.lt;
+  let coerceDecimal = false;
+  if (p.lt.kind === "null") {
+    type = p.rt.kind === "null" ? { kind: "text" } : p.rt;
+  } else if (p.lt.kind === "int" && p.rt.kind === "decimal") {
+    type = { kind: "decimal" };
+    coerceDecimal = true;
+  }
+  const widenFloat = p.lt.kind === "float" && p.rt.kind === "float" && p.lt.ty !== p.rt.ty;
+  return {
+    node: { kind: "nullIf", args: [p.rl, p.rr], coerceDecimal, widenFloat },
+    type,
+  };
 }
 
 function resolveRowExpr(
@@ -2620,7 +2661,8 @@ export function deriveCollation(scope: Scope, e: Expr): Deriv {
     if (e.els !== null) d = combineDeriv(d, deriveCollation(scope, e.els));
     return d;
   }
-  if (e.kind === "coalesce" || e.kind === "greatestLeast") return combineDerivs(scope, e.args);
+  if (e.kind === "coalesce" || e.kind === "greatestLeast" || e.kind === "nullIf")
+    return combineDerivs(scope, e.args);
   // ARRAY[e1, …] combines its elements, like a function's arguments (collation.md §1 "A text[]
   // carries its elements' collation").
   if (e.kind === "array") return combineDerivs(scope, e.elements);
@@ -2732,6 +2774,10 @@ export function deriveTypmod(scope: Scope, e: Expr): Typmod {
     case "coalesce":
     case "greatestLeast":
       return commonTypmod(e.args.map((a) => deriveTypmod(scope, a)));
+    // NULLIF returns its first argument, so it keeps that argument's typmod (PostgreSQL's
+    // exprTypmod); an integer `a` widened to decimal has none, as integers carry none.
+    case "nullIf":
+      return deriveTypmod(scope, e.args[0]!);
     case "scalarSubquery":
       // A scalar subquery: its output column's typmod, recorded when resolve planned it.
       return scope.subqueryDerivs.get(e.query)?.typmod ?? TYPMOD_NONE;

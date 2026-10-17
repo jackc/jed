@@ -14,7 +14,7 @@
 # The vendored `unicode` collation is the CLDR-DUCET root: a < A < b < B (lowercase before its
 # uppercase). Built-in C is byte / code-point order: A(0x41) < B < a(0x61) < b.
 # Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_expr, query.order_by_window, query.where_eq, query.cross_join, query.derived_table, query.values, query.union, query.distinct, query.aggregates, query.group_by, query.group_by_expr, query.window, query.window_ranking, query.window_offset, query.window_aggregate, query.ordered_set_aggregate, query.ordered_set_collation, query.within_group_expr, query.subquery_scalar, query.subquery_in, query.subquery_quantified, query.subquery_correlated, func.array_quantified, types.array, expr.case, expr.coalesce, expr.greatest_least, expr.collate, ddl.collate_column, cast.explicit, cast.operator, types.varchar_length, types.i32, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_expr, query.order_by_window, query.where_eq, query.cross_join, query.derived_table, query.values, query.union, query.distinct, query.aggregates, query.group_by, query.group_by_expr, query.window, query.window_ranking, query.window_offset, query.window_aggregate, query.ordered_set_aggregate, query.ordered_set_collation, query.within_group_expr, query.subquery_scalar, query.subquery_in, query.subquery_quantified, query.subquery_correlated, func.array_quantified, types.array, expr.case, expr.coalesce, expr.greatest_least, expr.nullif, expr.collate, ddl.collate_column, cast.explicit, cast.operator, types.varchar_length, types.i32, types.text
 
 # load-collation: unicode = collation/17.0.0/root.allkeys
 
@@ -92,6 +92,15 @@ SELECT s FROM ct ORDER BY greatest(s, 'A'), id
 ----
 A
 a
+b
+B
+
+# NULLIF returns its first argument and carries the combined collation, so it orders by `unicode`.
+query T nosort
+SELECT s FROM ct ORDER BY nullif(s, 'z')
+----
+a
+A
 b
 B
 
@@ -254,6 +263,9 @@ SELECT s FROM ct, cc WHERE coalesce(s, c) < 'x'
 
 statement error 42P22
 SELECT s FROM ct, cc WHERE greatest(s, c) IS NULL
+
+statement error 42P22
+SELECT nullif(s, c) FROM ct, cc
 
 statement error 42P22
 SELECT max(lpad(s, 2, c)) FROM ct, cc

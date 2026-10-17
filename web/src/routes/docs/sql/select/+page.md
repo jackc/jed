@@ -504,7 +504,7 @@ re-evaluated for each row of `a`. As with any `LATERAL` reference, the group may
 of a `RIGHT` or `FULL` join to the table it references (`42P10`); a `RIGHT JOIN LATERAL` *inside* the
 group may reference a table to the group's left.
 
-## Conditional expressions (`CASE`, `COALESCE`, `GREATEST`/`LEAST`)
+## Conditional expressions (`CASE`, `COALESCE`, `GREATEST`/`LEAST`, `NULLIF`)
 
 `CASE` is the SQL conditional: the searched form `CASE WHEN cond THEN r … [ELSE e] END` returns
 the first `WHEN` whose condition is true (an unmatched `CASE` with no `ELSE` is `NULL`), and the
@@ -526,6 +526,14 @@ unification. Unlike `CASE`/`COALESCE` they are **eager** — every argument is e
 `greatest(1, 1/0)` does divide by zero:
 
 <LiveSql demo="conditional" {seed} query={conditional} rows={4} />
+
+`NULLIF(a, b)` is the inverse of `COALESCE`: it returns `NULL` when `a = b`, and `a` otherwise — the
+usual guard against dividing by zero (`total / nullif(n, 0)` is `NULL`, not an error, when `n` is
+0) or for treating a placeholder as missing (`nullif(trim(name), '')`). A `NULL` on either side never
+matches, so `nullif(a, NULL)` is `a`. The two operands are compared like `a = b`, so they must be
+comparable, and the result has `a`'s type — except that an integer compared with a `decimal` gives a
+`decimal`, as in PostgreSQL. Like `GREATEST`/`LEAST` it is eager: both operands are always
+evaluated.
 
 ## Set-returning functions in `FROM`
 

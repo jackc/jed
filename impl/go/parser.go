@@ -6368,6 +6368,28 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		}
 		return exprNode{Kind: exprGreatestLeast, GreatestLeast: args, Greatest: greatest}, nil
 	}
+	// `NULLIF(a, b)` — NULL when a = b, else a (grammar.md §58). Recognized only when NULLIF is
+	// immediately followed by `(` (the same one-token lookahead), so the word stays usable as a
+	// column name. Exactly two arguments: any other count is 42601, as in PostgreSQL's grammar.
+	if p.peekKeyword() == "nullif" && p.peekKindAt(1) == tokLParen {
+		p.advance() // NULLIF
+		p.advance() // (
+		a, err := p.parseExpr()
+		if err != nil {
+			return exprNode{}, err
+		}
+		if err := p.expect(tokComma); err != nil {
+			return exprNode{}, err
+		}
+		b, err := p.parseExpr()
+		if err != nil {
+			return exprNode{}, err
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
+		}
+		return exprNode{Kind: exprNullIf, NullIf: []exprNode{a, b}}, nil
+	}
 	if p.peekKeyword() == "case" {
 		casePos := p.here()
 		p.advance()
