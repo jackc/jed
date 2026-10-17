@@ -56,6 +56,7 @@ import {
   PS_INVALIDATE_ALL,
   PS_MAX_FRAME_LENGTH,
   PS_PROTOCOL_VERSION,
+  psMaxReadPages,
   type PsIndexedPage,
   type PsMessage,
 } from "./codec.ts";
@@ -533,6 +534,27 @@ export class PageClient implements PageClientHandle {
       throw this.broken!;
     }
     return reply.pages[0]!;
+  }
+
+  // readPages fetches a batch of pages under the newest pinned version (a backup's copy, README.md
+  // §6.6). The batch holds at most maxReadPages() indices.
+  readPages(indices: number[]): Uint8Array[] {
+    let newest = this.writeTxid;
+    for (const v of this.held) if (v > newest) newest = v;
+    if (newest === 0n) {
+      throw engineError("io_error", "a page client read a page with no pinned snapshot");
+    }
+    const reply = this.roundTrip({ kind: "read_pages", txid: newest, indices: [...indices] });
+    if (reply.kind !== "pages" || reply.pages.length !== indices.length) {
+      this.breakWith(engineError("protocol_violation", "unexpected reply to read_pages"));
+      throw this.broken!;
+    }
+    return reply.pages;
+  }
+
+  // maxReadPages is the most indices one read_pages may name on this connection (README.md §3.1).
+  maxReadPages(): number {
+    return psMaxReadPages(this.pageSize);
   }
 
   // commit sends a CommitDelta (README §3.5): commit_begin with the meta and the manifest chain, the

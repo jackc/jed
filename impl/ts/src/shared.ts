@@ -211,6 +211,8 @@ export interface ServiceHandoffHost {
   readonly shutdownGraceMs: number;
   // relaxed is the handle's synchronous = off, whatever role it holds (validated-cow.md §4).
   readonly relaxed: boolean;
+  // skipFsync is the handle's fsync=off open setting (a backup's file skips its barriers too).
+  readonly skipFsync: boolean;
   // elect runs the election loop under the open timeout, keeping the path claim: it returns the new
   // role (an owner opened with recovery and serving, or an opened client). 55006 on timeout.
   elect(pauseUntilMs: number): ServiceRole;
@@ -317,6 +319,10 @@ export interface PageClientHandle {
   failedCommit(error: unknown): { error: unknown; notCommitted: boolean };
   // releasePin sends end_read for a held version.
   releasePin(v: bigint): void;
+  // readPages fetches a batch of at most maxReadPages() pages under the newest pinned version (a
+  // backup's copy, spec/pageservice/README.md §6.6).
+  readPages(indices: number[]): Uint8Array[];
+  maxReadPages(): number;
   close(): void;
   // --- handoff (spec/pageservice/README.md §6.5) ---
   // ownerReadOnly and ownerYields are the owner's hello_ok flags.

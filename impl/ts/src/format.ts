@@ -162,7 +162,7 @@ const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
 const PAGE_INTERIOR = 3; // page_type for a B-tree interior node
 const PAGE_OVERFLOW = 4; // page_type for an out-of-line value slab (large-values.md §12)
-const PAGE_FREELIST = 7; // page_type for a persisted free-list page (v25 — item_count u32 free page indices, chained by next_page; spec/fileformat/format.md *Free-list page*)
+export const PAGE_FREELIST = 7; // page_type for a persisted free-list page (v25 — item_count u32 free page indices, chained by next_page; spec/fileformat/format.md *Free-list page*)
 export const ROOT_PAGE = 2; // catalog root of a fresh empty db (relocatable thereafter); exported for within-session compaction (persist.ts maybeCompact)
 // Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md
 // §12/§13; format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len),
@@ -3479,13 +3479,26 @@ function collectLeafOverflow(
   seen: Set<number>,
   depth: number,
 ): void {
+  collectLeafOverflowWith((p) => paging.readBlock(p), pageIdx, colTypes, reached, seen, depth);
+}
+
+// collectLeafOverflowWith is collectLeafOverflow over a page reader (a backup's walk,
+// spec/design/page-service.md §9, reads through it too).
+export function collectLeafOverflowWith(
+  read: (page: number) => Uint8Array,
+  pageIdx: number,
+  colTypes: ColType[],
+  reached: Set<number>,
+  seen: Set<number>,
+  depth: number,
+): void {
   if (seen.has(pageIdx)) throw engineError("data_corrupted", "B-tree page reached twice");
   seen.add(pageIdx);
   if (depth > MAX_TREE_DEPTH)
     throw engineError("data_corrupted", "B-tree deeper than any valid tree");
-  const pg = parsePage(paging.readBlock(pageIdx));
+  const pg = parsePage(read(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
-    const fetch = (p: number): Uint8Array => paging.readBlock(p);
+    const fetch = read;
     const n = pg.itemCount;
     const dirs = parsePaxLeaf(pg.payload, n, colTypes);
     for (let c = 0; c < colTypes.length; c++) {
@@ -3512,7 +3525,7 @@ function collectLeafOverflow(
     const cur = { pos: 0 };
     const cps: number[] = [];
     for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readU32(pg.payload, cur));
-    for (const cp of cps) collectLeafOverflow(paging, cp, colTypes, reached, seen, depth + 1);
+    for (const cp of cps) collectLeafOverflowWith(read, cp, colTypes, reached, seen, depth + 1);
     return;
   }
   throw engineError("data_corrupted", "expected a B-tree node page");
@@ -3849,10 +3862,26 @@ export function loadEnginePaged(
   paging: SharedPaging,
   environment: Environment = new Environment(),
 ): Engine {
+  return loadEnginePagedAt(paging, environment, {});
+}
+
+// LoadAt adjusts loadEnginePagedAt for a backup's walk (spec/design/page-service.md §9): meta names
+// the version to load instead of the one recovery selects, and gist sees every GiST R-tree page the
+// load reads. A load at a given meta leaves the engine's free list empty (an older version's free
+// list may name pages a newer commit reused, which the pager's current recovery dependencies would
+// misreport as corrupt) and leaves the pager's adopted commit untouched.
+export type LoadAt = { meta?: CommitMeta; gist?: (page: number) => void };
+
+export function loadEnginePagedAt(
+  paging: SharedPaging,
+  environment: Environment,
+  at: LoadAt,
+): Engine {
   const pageSize = paging.pageSize();
   if (!pageSizeValid(pageSize)) {
     throw engineError("data_corrupted", "invalid page size");
   }
+  if (at.meta !== undefined) return loadAtMeta(paging, environment, at.meta, null, new Set(), at);
 
   // Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn write),
   // read as individual blocks through the pager.
@@ -3879,7 +3908,27 @@ export function loadEnginePaged(
     }
   }
   if (selected === undefined) throw engineError("data_corrupted", "no valid meta page");
-  const mt = selected.meta;
+  const other = parseCommitMeta(blocks[1 - selected.slot]!, pageSize, physicalPages);
+  const adopt = {
+    bytes: selected.bytes,
+    slot: selected.slot,
+    bothSlots: other !== null && other.txid === selected.meta.txid,
+  };
+  return loadAtMeta(paging, environment, selected.meta, adopt, protectedPages, at);
+}
+
+// loadAtMeta loads the catalog and interior skeleton the meta mt publishes. adopt is the selected
+// meta slot (its bytes, its slot, and whether both slots carry its txid; null for a backup's load at a given meta, which reads no free list and adopts
+// nothing into the pager).
+function loadAtMeta(
+  paging: SharedPaging,
+  environment: Environment,
+  mt: CommitMeta,
+  adopt: { bytes: Uint8Array; slot: number; bothSlots: boolean } | null,
+  protectedPages: Set<number>,
+  at: LoadAt,
+): Engine {
+  const pageSize = paging.pageSize();
 
   const snap = new Snapshot(environment, mt.txid);
   const statisticsExpected = new Map<string, readonly [number, number, number]>();
@@ -4024,6 +4073,7 @@ export function loadEnginePaged(
           readGistLeafKeys(
             (p) => {
               live.gist++;
+              at.gist?.(p);
               const pg2 = parsePage(paging.readBlock(p));
               return { pageType: pg2.pageType, itemCount: pg2.itemCount, payload: pg2.payload };
             },
@@ -4072,7 +4122,8 @@ export function loadEnginePaged(
   db.pageCount = mt.pageCount;
   // v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability walk
   // (spec/fileformat/format.md *Reclamation*).
-  db.freePages = readFreeList(paging, mt.freeListHead, mt.pageCount, protectedPages);
+  if (adopt !== null)
+    db.freePages = readFreeList(paging, mt.freeListHead, mt.pageCount, protectedPages);
   // Every persisted free page is dead at the committed version (the free-list is "as of" mt.txid), so its
   // reuse generation is mt.txid: at open oldest_live == committed and any later reader pins ≥ the committed
   // version, so reuse is safe (transactions.md §8, the free-list generation gate).
@@ -4088,14 +4139,15 @@ export function loadEnginePaged(
   // they join the post-commit residency flip like the loaded stores attached above.
   snap.storePaging = paging;
   // The floor slot (validated-cow.md §4): the selected slot, or txid & 1 when both slots carry it.
-  const other = parseCommitMeta(blocks[1 - selected.slot]!, pageSize, physicalPages);
-  paging.adoptCommit(
-    mt.txid,
-    metaChecksum(selected.bytes),
-    mt.dirtyCount !== 0,
-    selected.slot,
-    other !== null && other.txid === mt.txid,
-  );
+  if (adopt !== null) {
+    paging.adoptCommit(
+      mt.txid,
+      metaChecksum(adopt.bytes),
+      mt.dirtyCount !== 0,
+      adopt.slot,
+      adopt.bothSlots,
+    );
+  }
   return db;
 }
 
@@ -4473,7 +4525,7 @@ type Page = {
 
 // parsePage parses one standalone page block (header + payload). The single-block reader the
 // demand-paged loader and fault path use (a page read through the pager is exactly one block).
-function parsePage(block: Uint8Array): Page {
+export function parsePage(block: Uint8Array): Page {
   if (block.length < PAGE_HEADER)
     throw engineError("data_corrupted", "page shorter than its header");
   const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);

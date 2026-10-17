@@ -33,6 +33,7 @@ export type HandoffOptions = {
   idleInTransactionTimeoutMs?: number;
   maxConnections?: number;
   synchronous?: "on" | "off";
+  skipFsync?: boolean;
 };
 
 // HandoffHosts are a handle's hosts under the page service: its lock host (the OS by default), its
@@ -52,6 +53,7 @@ export class ServiceHandoff implements ServiceHandoffHost {
   readonly ownership: Ownership;
   readonly yieldGraceMs: number;
   readonly shutdownGraceMs: number;
+  readonly skipFsync: boolean;
   readonly limits: OwnerLimits;
   // relaxed is the handle's synchronous = off, whatever role it holds: its file attachments follow it
   // (validated-cow.md §4).
@@ -87,6 +89,7 @@ export class ServiceHandoff implements ServiceHandoffHost {
     this.relaxed = options.synchronous === "off";
     this.yieldGraceMs = options.yieldGraceMs ?? DEFAULT_YIELD_GRACE_MS;
     this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
+    this.skipFsync = options.skipFsync ?? false;
     this.limits = {
       idleInTransactionTimeoutMs:
         options.idleInTransactionTimeoutMs ?? DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,

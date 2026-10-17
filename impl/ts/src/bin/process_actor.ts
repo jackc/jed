@@ -12,6 +12,7 @@ import {
   type Environment,
   EnvironmentBuilder,
   attachFile,
+  backupForTesting,
   crashBeforeNextPageServiceAckForTesting,
   hangUpNextPageServiceAckForTesting,
   intValue,
@@ -141,6 +142,14 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
       case "COMPACT":
         database.compact(argument || "main");
         break;
+      case "BACKUP": {
+        // The backup test entry point (spec/design/page-service.md §9): BACKUP <form>\t<dest>.
+        const tab = argument.indexOf("\t");
+        const form = tab < 0 ? argument : argument.slice(0, tab);
+        const dest = tab < 0 ? "" : argument.slice(tab + 1);
+        backupForTesting(database, dest, form === "page_identical");
+        break;
+      }
       case "MAX_STORAGE_BYTES":
         database.setMaxStorageBytes("main", BigInt(argument));
         break;
