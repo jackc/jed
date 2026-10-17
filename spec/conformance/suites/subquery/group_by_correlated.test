@@ -1,0 +1,194 @@
+# A correlated GROUP BY key (spec/design/grammar.md §26): a GROUP BY inside a subquery may be — or
+# contain — a column of an enclosing query. The outer column is a per-evaluation constant of the
+# enclosing row, so grouping by it alone puts every input row in one group (no rows → no group, so
+# an empty input yields no row and a scalar subquery NULL, unlike GROUP BY ()). The key is
+# materialized as an expression evaluated per input row against the outer-row environment, a
+# projection / HAVING / ORDER BY that repeats it matches the key, and a subquery correlated only
+# through its GROUP BY re-executes per outer row. Results verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.qualified_column, query.table_alias, query.aggregates, query.group_by, query.group_by_expr, query.having, query.grouping_sets, query.lateral, func.array_agg, expr.arithmetic, query.subquery_scalar, query.subquery_exists, query.subquery_correlated, query.group_by_correlated, types.i32
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, b i32)
+
+statement ok
+INSERT INTO o VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO u VALUES (1, 1), (2, 2), (3, 1)
+
+# Grouping by an outer column alone: one group holding every u row, per outer row.
+query II nosort
+SELECT o.id, (SELECT count(*) FROM u GROUP BY o.x) FROM o ORDER BY o.id
+----
+1
+3
+2
+3
+
+# The grouped outer column projected back (bare and qualified spellings).
+query II nosort
+SELECT o.id, (SELECT o.x FROM u GROUP BY o.x) FROM o ORDER BY o.id
+----
+1
+10
+2
+20
+
+query II nosort
+SELECT o.id, (SELECT x FROM u GROUP BY x) FROM o ORDER BY o.id
+----
+1
+10
+2
+20
+
+# A select-list ordinal naming an outer column.
+query II nosort
+SELECT o.id, (SELECT o.x FROM u GROUP BY 1) FROM o ORDER BY o.id
+----
+1
+10
+2
+20
+
+# An expression key mixing a local and an outer column; the projection repeats the key.
+query II nosort
+SELECT o.id, (SELECT u.b + o.x FROM u GROUP BY u.b + o.x ORDER BY 1 LIMIT 1) FROM o ORDER BY o.id
+----
+1
+11
+2
+21
+
+query IT nosort
+SELECT o.id, (SELECT array_agg(u.b + o.x ORDER BY u.b) FROM u GROUP BY u.b + o.x ORDER BY 1 LIMIT 1) FROM o ORDER BY o.id
+----
+1
+{11,11}
+2
+{21,21}
+
+# A local column not in the key is still 42803.
+statement error 42803
+SELECT o.id, (SELECT u.b FROM u GROUP BY o.x) FROM o
+
+statement error 42803
+SELECT o.id, (SELECT u.b FROM u GROUP BY u.b + o.x) FROM o
+
+# No input rows: grouping by an outer column yields no group (a NULL scalar), unlike GROUP BY ().
+query II nosort
+SELECT o.id, (SELECT count(*) FROM u WHERE u.b > 5 GROUP BY o.x) FROM o ORDER BY o.id
+----
+1
+NULL
+2
+NULL
+
+query II nosort
+SELECT o.id, (SELECT count(*) FROM u WHERE u.b > 5 GROUP BY ()) FROM o ORDER BY o.id
+----
+1
+0
+2
+0
+
+# An outer key beside a local one: the local key decides the groups.
+query II nosort
+SELECT o.id, (SELECT count(*) FROM u GROUP BY o.x, u.b ORDER BY 1 LIMIT 1) FROM o ORDER BY o.id
+----
+1
+1
+2
+1
+
+# HAVING over the outer key.
+query II nosort
+SELECT o.id, (SELECT count(*) FROM u GROUP BY o.x HAVING o.x > 10) FROM o ORDER BY o.id
+----
+1
+NULL
+2
+3
+
+# Several outer keys.
+query I rowsort
+SELECT (SELECT count(*) FROM u GROUP BY o.x, o.id) FROM o
+----
+3
+3
+
+# Correlated only through GROUP BY inside EXISTS (u is non-empty, so every outer row qualifies).
+query I nosort
+SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM u GROUP BY o.x) ORDER BY o.id
+----
+1
+2
+
+# A LATERAL derived table grouping by the outer column.
+query III nosort
+SELECT o.id, l.c, l.x FROM o, LATERAL (SELECT count(*) AS c, o.x FROM u GROUP BY o.x) l ORDER BY o.id
+----
+1
+3
+10
+2
+3
+20
+
+# A grandparent (skip-level) outer key.
+query II nosort
+SELECT o.id, (SELECT (SELECT count(*) FROM u GROUP BY o.x) FROM u u2 WHERE u2.id = o.id) FROM o ORDER BY o.id
+----
+1
+3
+2
+3
+
+# ROLLUP over an outer key: the key's group plus the grand total — two rows, so a scalar
+# subquery is a cardinality violation.
+statement error 21000
+SELECT o.id, (SELECT count(*) FROM u GROUP BY ROLLUP (o.x)) FROM o
+
+query III rowsort
+SELECT o.id, l.k, l.c FROM o, LATERAL (SELECT o.x AS k, count(*) AS c FROM u GROUP BY ROLLUP (o.x)) l
+----
+1
+10
+3
+1
+NULL
+3
+2
+20
+3
+2
+NULL
+3
+
+# The outer key read back under either spelling sees the grouped value (NULL in the grand total).
+query IIII rowsort
+SELECT o.id, l.* FROM o, LATERAL (SELECT x, o.x, count(*) FROM u GROUP BY ROLLUP (x)) l
+----
+1
+10
+10
+3
+1
+NULL
+NULL
+3
+2
+20
+20
+3
+2
+NULL
+NULL
+3
+
+# GROUPING() of an outer column belongs to the outer query level, so PostgreSQL rejects it.
+statement error 42803
+SELECT o.id, l.* FROM o, LATERAL (SELECT GROUPING(o.x) AS g, count(*) FROM u GROUP BY ROLLUP (o.x)) l

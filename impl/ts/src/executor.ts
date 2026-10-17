@@ -16699,13 +16699,26 @@ export class Engine {
             "could not identify an equality operator for type json",
           ).noHint();
         }
-        // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
-        const pos = groupKeyExprs.findIndex((gk) => gk !== null && exprEqual(gk.canon, gr.canon));
+        // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`); a bare
+        // enclosing-query column key is matched by the column it names, whatever its spelling
+        // (query.group_by_correlated).
+        const node = gr.node;
+        const outer =
+          node.kind === "outerColumn" ? { level: node.level, index: node.index } : undefined;
+        const pos = groupKeyExprs.findIndex(
+          (gk) =>
+            gk !== null &&
+            (exprEqual(gk.canon, gr.canon) ||
+              (outer !== undefined &&
+                gk.outer !== undefined &&
+                gk.outer.level === outer.level &&
+                gk.outer.index === outer.index)),
+        );
         if (pos >= 0) return groupKeys[pos]!;
         const synth = inputWidth + groupExprs.length;
         groupExprs.push(gr.node);
         groupKeys.push(synth);
-        groupKeyExprs.push({ canon: gr.canon, ty: gr.ty });
+        groupKeyExprs.push({ canon: gr.canon, ty: gr.ty, outer });
         return synth;
       }),
     );
@@ -28686,6 +28699,9 @@ export function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolea
   // a subquery whose ONLY outer reference is in its ORDER BY is still correlated and must re-execute per
   // outer row (else its OuterColumn reads an empty outer-row environment).
   for (const oe of plan.orderExprs) if (rexprReferencesOuter(oe, depth)) return true;
+  // A materialized GROUP BY key may likewise be (or contain) an enclosing-query column
+  // (query.group_by_correlated): a subquery correlated only through its GROUP BY re-executes per outer row.
+  for (const ge of plan.groupExprs) if (rexprReferencesOuter(ge, depth)) return true;
   // A set-returning relation's arguments may carry a correlated reference (an implicitly-lateral SRF
   // arg sees params / outer / an earlier sibling — functions.md §10, grammar.md §44), making the
   // enclosing query correlated. A derived table's body may too: a LATERAL body is one frame deeper
@@ -29557,6 +29573,7 @@ export function collectTouchedPlan(plan: QueryPlan, depth: number, touched: bool
     // through one of them is left unfetched by the lazy/masked scan (large-values.md §14) and the
     // correlated subquery re-executes against NULL — a memory-vs-disk divergence.
     for (const oe of plan.orderExprs) collectTouched(oe, depth, touched);
+    for (const ge of plan.groupExprs) collectTouched(ge, depth, touched);
     for (const rel of plan.rels) {
       if (rel.srf !== undefined) {
         for (const a of rel.srf.args) collectTouched(a, depth, touched);
@@ -29766,22 +29783,14 @@ export function resolveGroupNamed(
       }
       throw e;
     }
-    if (r.level !== 0) {
-      throw engineError(
-        "feature_not_supported",
-        "GROUP BY may not reference an outer query column",
-      );
-    }
+    // An enclosing-query column is a per-evaluation constant: materialize it as an expression key
+    // (query.group_by_correlated, grammar.md §26).
+    if (r.level !== 0) return resolveGroupExpr(scope, term, params);
     return { kind: "column", index: r.index };
   }
   if (term.kind === "qualifiedColumn") {
     const r = scope.resolveQualifiedAt(term.qualifier, term.name, term.loc);
-    if (r.level !== 0) {
-      throw engineError(
-        "feature_not_supported",
-        "GROUP BY may not reference an outer query column",
-      );
-    }
+    if (r.level !== 0) return resolveGroupExpr(scope, term, params);
     return { kind: "column", index: r.index };
   }
   return resolveGroupExpr(scope, term, params);
@@ -29816,6 +29825,22 @@ export function matchGroupExpr(ag: AggCtx, e: Expr): { slot: number; ty: Resolve
   for (let p = 0; p < gke.length; p++) {
     const gk = gke[p];
     if (gk !== null && gk !== undefined && exprEqual(gk.canon, e)) return { slot: p, ty: gk.ty };
+  }
+  return null;
+}
+
+// matchGroupOuter returns the master position and type if the enclosing-query column at
+// (level, index) is a GROUP BY key in this aggregate context (query.group_by_correlated).
+export function matchGroupOuter(
+  ag: AggCtx,
+  level: number,
+  index: number,
+): { slot: number; ty: ResolvedType } | null {
+  const gke = ag.groupKeyExprs;
+  if (gke === undefined) return null;
+  for (let p = 0; p < gke.length; p++) {
+    const o = gke[p]?.outer;
+    if (o !== undefined && o.level === level && o.index === index) return { slot: p, ty: gke[p]!.ty };
   }
   return null;
 }
@@ -32588,7 +32613,15 @@ export type HypoParams = {
 // GroupKeyExpr records a general-expression GROUP BY key (`GROUP BY a + b`, aggregates.md §15): its
 // canonical AST (so a matching projection / HAVING / ORDER BY expression resolves to its synthetic
 // slot) and its resolved type.
-export type GroupKeyExpr = { canon: Expr; ty: ResolvedType };
+// A general-expression GROUP BY key: its canonical AST and resolved type, plus — when the key is a
+// bare enclosing-query column (query.group_by_correlated) — that column's (level, index), so every
+// spelling of the same outer column (`x`, `o.x`) matches it, as PostgreSQL matches grouping
+// expressions by the resolved column.
+export type GroupKeyExpr = {
+  canon: Expr;
+  ty: ResolvedType;
+  outer?: { level: number; index: number } | undefined;
+};
 
 export type AggCtx = {
   collecting: boolean;

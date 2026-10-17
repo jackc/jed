@@ -3,7 +3,7 @@
 # per outer row. Covers correlated EXISTS / scalar / IN, correlation in a JOIN ON, an outer
 # reference inside an aggregate argument, multi-level + skip-level (grandparent) correlation, a
 # correlated ORDER BY key (an inner ORDER BY referencing an enclosing-query column — now allowed,
-# query.order_by_correlated), and the degenerate GROUP BY-outer-key narrowing (still 0A000). Results
+# query.order_by_correlated; a correlated GROUP BY key is group_by_correlated.test). Results
 # verified against PostgreSQL 18.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.order_by_correlated, query.qualified_column, query.table_alias, query.join_inner, query.aggregates, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.i32, resource.cost_metering
 
@@ -140,10 +140,6 @@ INSERT INTO inr VALUES (1, 10)
 
 statement error 42702
 SELECT t1.id FROM t1 JOIN t3 ON t1.id = t3.id WHERE EXISTS (SELECT 1 FROM inr WHERE inr.x = v)
-
-# Degenerate narrowing: GROUPING a subquery BY an enclosing-query column is still 0A000.
-statement error 0A000
-SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 GROUP BY t1.v)
 
 # A correlated ORDER BY key — an inner ORDER BY referencing an enclosing-query column — is now
 # allowed (query.order_by_correlated). The outer column is a per-evaluation constant of the enclosing

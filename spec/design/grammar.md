@@ -548,7 +548,22 @@ Both a bare/qualified outer-column key and a general expression that *contains* 
 against the outer-row environment (never a local sort-row slot, which holds only this query's columns).
 A subquery correlated **only** through its `ORDER BY` is still correlated, so it re-executes per outer
 row (the correlation detector inspects the materialized order expressions). Skip-level (grandparent)
-references work. The analogous degenerate `GROUP BY` by an enclosing column stays `0A000`.
+references work.
+
+**Correlated `GROUP BY` key (now supported, `query.group_by_correlated`).** A `GROUP BY` inside a
+subquery may be — or contain — a column of an enclosing query: `SELECT (SELECT count(*) FROM u GROUP
+BY t.a) FROM t`, `GROUP BY u.b + t.a`, or an ordinal / bare name that resolves to an outer column. As
+in PostgreSQL the outer column is a per-evaluation constant, so grouping by it alone puts every input
+row of one execution in a **single group** — and an empty input forms **no** group (a scalar subquery
+is NULL, unlike `GROUP BY ()`'s one grand-total row). The key is materialized like a general-expression
+key (aggregates.md §15): an `OuterColumn` expression evaluated per input row against the outer-row
+environment, so a subquery correlated only through its `GROUP BY` re-executes per outer row (the
+correlation detector and the touched-column walk inspect the materialized group keys). A select-list /
+`HAVING` / `ORDER BY` reference to a grouped outer column reads the group's key slot whatever its
+spelling (`x` or `t.x` — PostgreSQL matches the resolved column), so a `ROLLUP (t.x)` grand-total row
+sees it NULL. A local column outside the key is still `42803`. `GROUPING(t.x)` of an outer column
+belongs to the outer query level, which PostgreSQL rejects (`42803`); jed does too. Skip-level
+(grandparent) outer keys work. No cost change: an outer column is a leaf (no `operator_eval`).
 
 **Window function / `GROUPING()` inside a key (now supported, `query.order_by_window` /
 `query.order_by_grouping`).** An `ORDER BY` key may be — or contain — a **window function**
@@ -2178,10 +2193,10 @@ real cause (the type can't be determined) and is consistent with its strict, no-
 
 **Deferred narrowings (each relaxable later)**
 
-- **A correlated reference as a `GROUP BY` / `ORDER BY` key** — grouping or ordering a subquery
-  *by an enclosing-query column* (a per-outer-row constant — degenerate) is **`0A000`**; the
-  key machinery is flat local indices. WHERE / HAVING / `ON` / select-list correlation is fully
-  supported.
+- **A correlated reference as a `GROUP BY` / `ORDER BY` key** — landed: grouping or ordering a
+  subquery by an enclosing-query column (a per-outer-row constant) is `query.group_by_correlated` /
+  `query.order_by_correlated` (above). A correlated window `PARTITION BY` / `ORDER BY` key stays
+  `0A000`.
 - **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) landed as its own
   slice; see §42.
 - **`ANY` / `ALL` over a subquery** — `x op ANY/ALL(SELECT …)` landed (the subquery spelling of `IN`);

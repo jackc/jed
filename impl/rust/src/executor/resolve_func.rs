@@ -3976,6 +3976,12 @@ pub(crate) fn resolve_column_ref(
     match r {
         Resolved::Local(idx) => collect_column(scope, agg, idx, name),
         Resolved::Outer { level, index } => {
+            // An enclosing-query column that is itself a GROUP BY key of this query reads the
+            // group's key slot (query.group_by_correlated) — so a ROLLUP grand-total row sees it
+            // NULL, as in PostgreSQL.
+            if let Some((slot, ty)) = match_group_outer(agg, level, index) {
+                return Ok((RExpr::Column(slot), ty));
+            }
             let ty = resolved_type_of_col(&scope.column_of(r).ty, scope.catalog);
             Ok((RExpr::OuterColumn { level, index }, ty))
         }

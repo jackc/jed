@@ -1007,6 +1007,13 @@ pub(crate) fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> boo
             .order_exprs
             .iter()
             .any(|oe| rexpr_references_outer(oe, depth))
+        // A materialized GROUP BY key may likewise be (or contain) an enclosing-query column
+        // (query.group_by_correlated): a subquery correlated only through its GROUP BY re-executes
+        // per outer row.
+        || sp
+            .group_exprs
+            .iter()
+            .any(|ge| rexpr_references_outer(ge, depth))
         // A set-returning relation's arguments may carry a correlated reference (an implicitly-
         // lateral SRF arg sees params / outer / an earlier sibling — functions.md §10, grammar.md
         // §44), which makes the enclosing query correlated, so it must NOT be folded once.

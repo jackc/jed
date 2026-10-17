@@ -15,6 +15,7 @@ import {
   isOrderedSetAggregateName,
   isWindowOnlyName,
   matchGroupExpr,
+  matchGroupOuter,
   coerceCompatibleArg,
   matchPoly,
   noAggOverload,
@@ -428,6 +429,12 @@ export function resolveColumnRef(
 ): { node: RExpr; type: ResolvedType } {
   if (r.layer !== undefined) return resolveLayerRef(scope, ag, r, name);
   if (r.level === 0) return collectColumn(scope, ag, r.index, name);
+  // An enclosing-query column that is itself a GROUP BY key of this query reads the group's key slot
+  // (query.group_by_correlated) — so a ROLLUP grand-total row sees it NULL, as in PostgreSQL.
+  if (ag.collecting) {
+    const m = matchGroupOuter(ag, r.level, r.index);
+    if (m !== null) return { node: { kind: "column", index: m.slot }, type: m.ty };
+  }
   return {
     node: { kind: "outerColumn", level: r.level, index: r.index },
     type: resolvedTypeOfCol(scope.columnOf(r).type, scope.catalog),

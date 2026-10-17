@@ -50,10 +50,11 @@ pub(crate) fn resolve_group_named(
     match term {
         Expr::Column(name, pos) => match scope.resolve_bare_at(name, *pos) {
             Ok(Resolved::Local(idx)) => Ok(GroupKeyResolved::Column(idx)),
-            Ok(Resolved::Outer { .. } | Resolved::Layer { .. }) => Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "GROUP BY may not reference an outer query column",
-            )),
+            // An enclosing-query column is a per-evaluation constant: materialize it as an
+            // expression key (query.group_by_correlated, grammar.md §26).
+            Ok(Resolved::Outer { .. } | Resolved::Layer { .. }) => {
+                resolve_group_expr(scope, term, params)
+            }
             // No input column of this name: try an output alias (`SELECT a+b AS s … GROUP BY s`).
             // If none matches either, propagate the original 42703.
             Err(e) if e.state == SqlState::UndefinedColumn => {
@@ -70,10 +71,9 @@ pub(crate) fn resolve_group_named(
             pos,
         } => match scope.resolve_qualified_at(qualifier, name, *pos)? {
             Resolved::Local(idx) => Ok(GroupKeyResolved::Column(idx)),
-            Resolved::Outer { .. } | Resolved::Layer { .. } => Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "GROUP BY may not reference an outer query column",
-            )),
+            Resolved::Outer { .. } | Resolved::Layer { .. } => {
+                resolve_group_expr(scope, term, params)
+            }
         },
         _ => resolve_group_expr(scope, term, params),
     }
@@ -125,7 +125,29 @@ pub(crate) fn match_group_expr(agg: &AggCtx, e: &Expr) -> Option<(usize, Resolve
         _ => return None,
     };
     gke.iter().enumerate().find_map(|(p, gk)| match gk {
-        Some((ge, ty)) if ge == e => Some((p, ty.clone())),
+        Some((ge, ty, _)) if ge == e => Some((p, ty.clone())),
+        _ => None,
+    })
+}
+
+/// If the enclosing-query column at `(level, index)` is a `GROUP BY` key in this aggregate context,
+/// return that group's master position and type (query.group_by_correlated).
+pub(crate) fn match_group_outer(
+    agg: &AggCtx,
+    level: usize,
+    index: usize,
+) -> Option<(usize, ResolvedType)> {
+    let gke = match agg {
+        AggCtx::Collect {
+            group_key_exprs, ..
+        }
+        | AggCtx::GroupedWindow {
+            group_key_exprs, ..
+        } => group_key_exprs,
+        _ => return None,
+    };
+    gke.iter().enumerate().find_map(|(p, gk)| match gk {
+        Some((_, ty, Some(o))) if *o == (level, index) => Some((p, ty.clone())),
         _ => None,
     })
 }
@@ -342,6 +364,9 @@ pub(crate) fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut
             // memory-vs-disk divergence.
             for oe in &sp.order_exprs {
                 collect_touched(oe, depth, touched);
+            }
+            for ge in &sp.group_exprs {
+                collect_touched(ge, depth, touched);
             }
             for r in &sp.rels {
                 if let Some(srf) = &r.srf {

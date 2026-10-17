@@ -5903,6 +5903,12 @@ impl ScanSource {
 // resolves normally and an aggregate call is a 42803 grouping error.
 // ============================================================================
 
+/// A general-expression `GROUP BY` key (aggregates.md §15): its canonical AST, its resolved type, and
+/// — when the key is a bare enclosing-query column (query.group_by_correlated) — that column's
+/// `(level, index)`, so every spelling of the same outer column (`x`, `o.x`) matches it, as PostgreSQL
+/// matches grouping expressions by the resolved column.
+pub(crate) type GroupKeyExpr = (Expr, ResolvedType, Option<(usize, usize)>);
+
 /// The aggregate-resolution context threaded through `resolve`.
 pub(crate) enum AggCtx {
     /// Aggregates are not allowed here (a FuncCall is 42803); columns resolve normally.
@@ -5919,7 +5925,7 @@ pub(crate) enum AggCtx {
         /// it is a general **expression** key (`GROUP BY a + b`, aggregates.md §15) — so a projection
         /// / HAVING / ORDER BY expression that structurally matches it resolves to that group's
         /// synthetic slot — or `None` for a plain **column** key (matched by the column path instead).
-        group_key_exprs: Vec<Option<(Expr, ResolvedType)>>,
+        group_key_exprs: Vec<Option<GroupKeyExpr>>,
         specs: Vec<AggSpec>,
         /// One entry per `GROUPING(c1, …, ck)` call collected from the projection / HAVING — each is
         /// the list of master-grouping-column POSITIONS (indices into `group_keys`) of its arguments.
@@ -5954,7 +5960,7 @@ pub(crate) enum AggCtx {
         group_keys: Vec<usize>,
         /// Parallel to `group_keys` — see `Collect::group_key_exprs` (general-expression group keys,
         /// aggregates.md §15). A grouped+window query matches them the same way in its projection.
-        group_key_exprs: Vec<Option<(Expr, ResolvedType)>>,
+        group_key_exprs: Vec<Option<GroupKeyExpr>>,
         agg_specs: Vec<AggSpec>,
         /// `GROUPING(...)` calls collected from the projection / HAVING when the query ALSO has window
         /// functions (GROUPING SETS + window, aggregates.md §21) — same as `Collect::grouping_specs`.
