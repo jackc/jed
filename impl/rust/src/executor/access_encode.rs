@@ -6098,6 +6098,9 @@ pub(crate) enum AggPlan {
     ArrayAgg {
         nested: bool,
     },
+    /// string_agg(value, delimiter) — the non-NULL values joined in fold order, each after the first
+    /// preceded by its own row's delimiter (aggregates.md §23). The operand is a 2-field Row.
+    StringAgg,
     /// json_agg / jsonb_agg (and the `_strict` variants) — aggregate the inputs' JSON images into a
     /// JSON array (json-sql-functions.md §4). `compact` selects the `json` (compact) vs `jsonb`
     /// (canonical) result render; `strict` skips a NULL input (else a NULL → JSON null).
@@ -6286,6 +6289,12 @@ pub(crate) enum Acc {
         seen: bool,
         nested: bool,
         shape: Option<(Vec<usize>, Vec<i32>)>,
+    },
+    /// string_agg: the `[value, delimiter]` of every row with a non-NULL value, in fold order; `seen`
+    /// marks that one was folded.
+    StringAgg {
+        rows: Vec<Vec<Value>>,
+        seen: bool,
     },
     MinMax {
         cur: Option<Value>,

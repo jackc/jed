@@ -125,6 +125,10 @@ impl Acc {
                 is_and: true,
             },
             AggPlan::Bit(op) => Acc::Bit { cur: None, op },
+            AggPlan::StringAgg => Acc::StringAgg {
+                rows: Vec::new(),
+                seen: false,
+            },
             AggPlan::ArrayAgg { nested } => Acc::ArrayAgg {
                 elems: Vec::new(),
                 seen: false,
@@ -290,6 +294,17 @@ impl Acc {
                     });
                 }
             }
+            Acc::StringAgg { rows, seen } => {
+                // A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL
+                // string_agg_transfn).
+                let Value::Composite(fields) = value else {
+                    unreachable!("string_agg's operand is a 2-field Row")
+                };
+                if !matches!(fields[0], Value::Null) {
+                    *seen = true;
+                    rows.push(fields);
+                }
+            }
             Acc::ArrayAgg {
                 elems,
                 seen,
@@ -410,6 +425,12 @@ impl Acc {
                 crate::memsize::value_bytes(value)
             }
             Acc::ArrayAgg { .. } => crate::memsize::value_bytes(value),
+            Acc::StringAgg { .. } => match value {
+                Value::Composite(fields) if !matches!(fields[0], Value::Null) => {
+                    crate::memsize::key_bytes(fields)
+                }
+                _ => 0,
+            },
             _ => 0,
         }
     }
@@ -498,6 +519,13 @@ impl Acc {
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
             Acc::Bool { cur, .. } => cur.map_or(Value::Null, Value::Bool),
             Acc::Bit { cur, .. } => cur.map_or(Value::Null, Value::Int),
+            Acc::StringAgg { rows, seen } => {
+                if seen {
+                    finalize_string_agg(rows)
+                } else {
+                    Value::Null
+                }
+            }
             Acc::ArrayAgg {
                 elems,
                 seen,
@@ -770,4 +798,32 @@ pub(crate) fn finalize_array_agg(nested: bool, elems: Vec<Value>) -> Value {
         out.elements.extend(a.elements);
     }
     Value::Array(out)
+}
+
+/// Join string_agg's non-NULL values in fold order (aggregates.md §23): the first value alone, each
+/// later one preceded by its own row's delimiter (none when the delimiter is NULL). The result is
+/// bytea over bytea values, else text.
+pub(crate) fn finalize_string_agg(rows: Vec<Vec<Value>>) -> Value {
+    let bytea = matches!(rows[0][0], Value::Bytea(_));
+    let mut out: Vec<u8> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            push_string_agg_bytes(&mut out, &row[1]);
+        }
+        push_string_agg_bytes(&mut out, &row[0]);
+    }
+    if bytea {
+        Value::Bytea(out)
+    } else {
+        Value::Text(String::from_utf8(out).expect("joined text stays UTF-8"))
+    }
+}
+
+fn push_string_agg_bytes(out: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Text(s) => out.extend_from_slice(s.as_bytes()),
+        Value::Bytea(b) => out.extend_from_slice(b),
+        Value::Null => {}
+        _ => unreachable!("string_agg joins text or bytea"),
+    }
 }

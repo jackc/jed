@@ -375,6 +375,7 @@ it is folded:
 |---|---|
 | `json_agg`, `jsonb_agg` (and `_strict`, which retains no NULL) | `value_bytes(argument)` |
 | `array_agg` (NULLs included) | `value_bytes(argument)` |
+| `string_agg` (rows with a non-NULL value) | `value_bytes(value) + value_bytes(delimiter)` |
 | `json_object_agg`, `jsonb_object_agg` (and `_unique`, `_strict`) | `value_bytes(key) + value_bytes(value)` |
 | `mode`, `percentile_disc`, `percentile_cont` (non-NULL inputs) | `value_bytes(argument)` |
 | `rank`, `dense_rank`, `percent_rank`, `cume_dist` (hypothetical-set) | `row_bytes(WITHIN GROUP key tuple)` |
@@ -451,10 +452,10 @@ Because the measures depend on what each element holds, the bounded-spill lane's
 | Structure | Element |
 |---|---|
 | Stage spools | relation rows (untouched slots NULL), physically placed driver and combined join rows, NULL-extended rows, post-WHERE rows (the WHERE pass always copies into a new spool, filter or not), group rows, and `ORDER BY` rows decorated with every order-expression value and then every order key (a collated key as `bytea` of its sort key) |
-| Group state map | key: the group-key values; value: `[int ordinal, composite(packed) per aggregate]`, packed as `count` → `[int]`, integer `sum` → `[int, bool seen]`, decimal `sum` → `[decimal, bool]`, `avg` → `[decimal, int count]`, float `sum`/`avg` → `[f64, int, bool, bool, bool]`, `min`/`max`, `bool_and`, `bool_or`, and the `bit_*` aggregates → `[value or NULL]`, JSON aggregates and `array_agg` → `[bool seen]` (`array_agg` over arrays appends `int ndim` and each input dimension's `int length, int lower bound`), ordered-set, hypothetical, and any in-aggregate `ORDER BY` → `[]` |
+| Group state map | key: the group-key values; value: `[int ordinal, composite(packed) per aggregate]`, packed as `count` → `[int]`, integer `sum` → `[int, bool seen]`, decimal `sum` → `[decimal, bool]`, `avg` → `[decimal, int count]`, float `sum`/`avg` → `[f64, int, bool, bool, bool]`, `min`/`max`, `bool_and`, `bool_or`, and the `bit_*` aggregates → `[value or NULL]`, JSON aggregates, `array_agg`, and `string_agg` → `[bool seen]` (`array_agg` over arrays appends `int ndim` and each input dimension's `int length, int lower bound`), ordered-set, hypothetical, and any in-aggregate `ORDER BY` → `[]` |
 | Group key spool | the group-key values, one row per group in creation order |
 | `DISTINCT`-aggregate set / object-agg unique set | `[int ordinal, int aggregate index, value]` / `[int ordinal, int aggregate index, text key]` |
-| Retained aggregate inputs (hash rows, keyed by `ordinal × aggregates + index`) | `json_agg` → `[jsonb node]`; `array_agg` → `[value]`; `json_object_agg` → `[text key, value]`; ordered-set → `[value]` (`percentile_cont`: `[f64]`); hypothetical → the key tuple; in-aggregate `ORDER BY` → `[sort key…, argument]`, sorted at finalize and folded into a fresh collection of the plan's own shape |
+| Retained aggregate inputs (hash rows, keyed by `ordinal × aggregates + index`) | `json_agg` → `[jsonb node]`; `array_agg` → `[value]`; `string_agg` → `[value, delimiter]`; `json_object_agg` → `[text key, value]`; ordered-set → `[value]` (`percentile_cont`: `[f64]`); hypothetical → the key tuple; in-aggregate `ORDER BY` → `[sort key…, argument]`, sorted at finalize and folded into a fresh collection of the plan's own shape |
 | Spilled hash-join build | `[bytea encoded key, composite(build row)]` (the key encoding is the §8 byte contract) |
 | Probe matches / right-match set | a per-left-row spool of matched build rows / `[int match ordinal]` |
 | Finalization | ordered-set sorter rows `[value]` or `[value, bytea collation key]`; percentile spool of sorted rows; `json_object_agg` sorter rows `[int UTF-8 length, text key, jsonb]`; dense-rank distinct set of key tuples |

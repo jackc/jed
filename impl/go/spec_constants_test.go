@@ -601,7 +601,7 @@ func TestRegistryCoversCatalog(t *testing.T) {
 	for i := range aggregates {
 		a := &aggregates[i]
 		switch a.Result {
-		case "i64", "decimal", "sum_widen", "same_as_input", "json", "jsonb", "boolean", "array_of_input":
+		case "i64", "decimal", "sum_widen", "same_as_input", "json", "jsonb", "boolean", "array_of_input", "text", "bytea":
 		default:
 			t.Fatalf("aggregate %s has unhandled result code %s", a.Name, a.Result)
 		}
@@ -614,6 +614,14 @@ func TestRegistryCoversCatalog(t *testing.T) {
 		}
 		pt := probe(a.ArgFamilies[0])
 		found := lookupAggregateOverload(surface, pt)
+		if len(a.ArgFamilies) > 1 {
+			// A multi-argument aggregate (aggregates.md §23) resolves through the overload selector.
+			tys := make([]resolvedType, len(a.ArgFamilies))
+			for j, fam := range a.ArgFamilies {
+				tys[j] = probe(fam)
+			}
+			found, _ = selectAggregateOverload(surface, tys, nil)
+		}
 		if found == nil {
 			t.Fatalf("aggregate %s expr overload not found for its family", a.Surface)
 		}

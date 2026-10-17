@@ -887,7 +887,7 @@ pub(crate) fn resolve_scalar_func(
 
 /// Which arguments are bare string literals (`'…'`, not a typed literal or a cast), or `None` when
 /// there are none.
-fn bare_string_literals(args: &[Expr]) -> Option<Vec<bool>> {
+pub(crate) fn bare_string_literals(args: &[Expr]) -> Option<Vec<bool>> {
     let marks: Vec<bool> = args
         .iter()
         .map(|a| matches!(a, Expr::Literal(Literal::Text(_), _)))

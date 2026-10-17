@@ -192,6 +192,9 @@ const (
 	planArrayAgg // array_agg(x) — the inputs, NULLs included, as a 1-D array (aggregates.md §23)
 	// array_agg(x) over an array input — the inputs stacked into an array of one more dimension.
 	planArrayAggArray
+	// string_agg(value, delimiter) — the non-NULL values joined, each after the first preceded by its
+	// own row's delimiter (aggregates.md §23). The operand is a 2-field Row(value, delimiter).
+	planStringAgg
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -341,6 +344,9 @@ type acc struct {
 	arrElems   []Value
 	arrDims    []int
 	arrLbounds []int32
+	// string_agg accumulator (aggregates.md §23): the Row(value, delimiter) of every row with a
+	// non-NULL value, in fold order; `seen` marks that one was folded.
+	strRows []Value
 	// Ordered-set aggregate state (spec/design/aggregates.md §13): the WITHIN GROUP direction +
 	// the **evaluated** percentile fraction for this group, plus the collected non-NULL values
 	// (percentile_cont widens to f64 into osaFloats; mode/percentile_disc keep the Value in
@@ -471,6 +477,9 @@ func (a *acc) clone() *acc {
 	if a.arrElems != nil {
 		c.arrElems = append([]Value(nil), a.arrElems...)
 	}
+	if a.strRows != nil {
+		c.strRows = append([]Value(nil), a.strRows...)
+	}
 	if a.objPairs != nil {
 		// Deep-copy the (key, value) pairs slice (as jsonElems above) so a cloned-finalize over a
 		// window peer-group doesn't alias the still-running acc.
@@ -582,6 +591,12 @@ func (a *acc) fold(v Value, m *costMeter) error {
 			} else {
 				a.cur = IntValue(bitFold(a.plan, a.cur.Int, v.Int))
 			}
+		}
+	case planStringAgg:
+		// A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
+		if !(*v.composite())[0].IsNull() {
+			a.seen = true
+			a.strRows = append(a.strRows, v)
 		}
 	case planArrayAgg:
 		a.seen = true
@@ -732,6 +747,10 @@ func (a *acc) retainedBytes(v Value) int64 {
 		return memValueBytes(v)
 	case planArrayAgg, planArrayAggArray:
 		return memValueBytes(v)
+	case planStringAgg:
+		if fields := *v.composite(); !fields[0].IsNull() {
+			return memKeyBytes(fields)
+		}
 	}
 	return 0
 }
@@ -897,6 +916,11 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), nil
 		}
 		return finalizeArrayAgg(a.plan, a.arrElems)
+	case planStringAgg:
+		if !a.seen {
+			return NullValue(), nil
+		}
+		return finalizeStringAgg(a.strRows), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
 	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:
@@ -919,6 +943,24 @@ func finalizeArrayAgg(plan aggPlan, elems []Value) (Value, error) {
 		return ArrayValue(append([]Value(nil), elems...)), nil
 	}
 	return buildNestedArray(elems)
+}
+
+// finalizeStringAgg joins string_agg's non-NULL values in fold order (aggregates.md §23): the first
+// value alone, each later one preceded by its own row's delimiter (none when the delimiter is NULL).
+// The result is bytea over bytea values, else text.
+func finalizeStringAgg(rows []Value) Value {
+	var b strings.Builder
+	for i, r := range rows {
+		f := *r.composite()
+		if i > 0 && !f[1].IsNull() {
+			b.WriteString(f[1].str())
+		}
+		b.WriteString(f[0].str())
+	}
+	if (*rows[0].composite())[0].Kind == ValBytea {
+		return ByteaValue([]byte(b.String()))
+	}
+	return TextValue(b.String())
 }
 
 // finalizeOrderedSet computes an ordered-set aggregate's value over its collected group

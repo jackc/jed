@@ -35,7 +35,7 @@ func blockingAccRow(a *acc) storedRow {
 		return storedRow{a.cur}
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict,
 		planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique,
-		planArrayAgg:
+		planArrayAgg, planStringAgg:
 		return storedRow{BoolValue(a.seen)}
 	case planArrayAggArray:
 		// The seen flag, then the first input's shape: its dimension count and each (length, lower
@@ -77,7 +77,7 @@ func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
 		}
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict,
 		planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique,
-		planArrayAgg:
+		planArrayAgg, planStringAgg:
 		a.seen = r[0].boolVal()
 	case planArrayAggArray:
 		a.seen = r[0].boolVal()
@@ -301,7 +301,7 @@ func blockingFold(a *acc, v Value, m *costMeter, unique *stateMap, prefix []Valu
 	}
 	// The retained input now lives in the collection rows; drop it from the accumulator so a
 	// long-lived one (an ordered aggregate's finalize fold) never re-retains it.
-	a.jsonElems, a.objPairs, a.osaVals, a.osaFloats, a.arrElems = nil, nil, nil, nil, nil
+	a.jsonElems, a.objPairs, a.osaVals, a.osaFloats, a.arrElems, a.strRows = nil, nil, nil, nil, nil, nil
 	return nil
 }
 
@@ -320,6 +320,11 @@ func blockingRetain(a *acc, owner uint64, collections *hashRows) error {
 	}
 	for _, v := range a.arrElems {
 		if err := collections.push(owner, storedRow{v}); err != nil {
+			return err
+		}
+	}
+	for _, v := range a.strRows {
+		if err := collections.push(owner, storedRow(*v.composite())); err != nil {
 			return err
 		}
 	}
@@ -446,6 +451,15 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			fraction = &v
 		}
 		return db.blockingOrderedSet(a, fraction, collections, owner)
+	case planStringAgg:
+		if !a.seen {
+			return NullValue(), nil
+		}
+		var rows []Value
+		if err := collections.each(owner, func(row storedRow) error { rows = append(rows, CompositeValue(row)); return nil }); err != nil {
+			return NullValue(), err
+		}
+		return finalizeStringAgg(rows), nil
 	case planArrayAgg, planArrayAggArray:
 		if !a.seen {
 			return NullValue(), nil

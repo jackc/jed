@@ -327,6 +327,9 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
     "boolean",
     // array_agg (aggregates.md §23).
     "array_of_input",
+    // string_agg (aggregates.md §23).
+    "text",
+    "bytea",
   ]);
   for (const a of AGGREGATES) {
     assert.ok(
