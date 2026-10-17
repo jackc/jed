@@ -293,6 +293,7 @@ import {
   indexDetailByName,
   pkDetail,
 } from "./error_detail.ts";
+import { QUOTED_KEYWORDS } from "./pg_keywords_gen.ts";
 import { type PrivilegeSet, Privileges } from "./privileges.ts";
 import type { HostFunctions, HostFuncEntry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
@@ -1450,10 +1451,10 @@ export function likeEscapeText(pattern: string, escapeChar: string): string {
   return out;
 }
 
-// quoteIdentText is quote_ident(s) (string-functions.md §3): wrap s as a SQL identifier — returned
-// unchanged if it is already a safe unquoted identifier (^[a-z_][a-z0-9_]*$), else double-quoted
-// with each internal " doubled. jed quotes by the LEXICAL pattern only — no reserved-keyword
-// quoting (jed has no enumerated keyword set), a documented divergence from PostgreSQL.
+// quoteIdentText is quote_ident(s) (string-functions.md §3), PostgreSQL's quote_identifier: wrap s
+// as a SQL identifier — returned unchanged if it is a safe unquoted identifier (^[a-z_][a-z0-9_]*$)
+// that is not one of PostgreSQL's quoted (non-unreserved) keywords, else double-quoted with each
+// internal " doubled. Shared by quote_ident and format's %I.
 export function quoteIdentText(s: string): string {
   let safe = s.length > 0;
   for (let i = 0; i < s.length && safe; i++) {
@@ -1461,7 +1462,7 @@ export function quoteIdentText(s: string): string {
     const lower = code === 95 || (code >= 97 && code <= 122); // '_' or a-z
     safe = i === 0 ? lower : lower || (code >= 48 && code <= 57); // + 0-9 after the first
   }
-  if (safe) return s;
+  if (safe && !QUOTED_KEYWORDS.has(s)) return s;
   let out = '"';
   for (const c of s) out += c === '"' ? '""' : c;
   return out + '"';
@@ -30862,7 +30863,7 @@ export type RangeSetOpName =
 
 // VariadicFuncName is the internal identity of a VARIADIC counting-function node
 // (spec/design/array-functions.md §12). Both return i32; the call form lives on the node.
-export type VariadicFuncName = "num_nulls" | "num_nonnulls";
+export type VariadicFuncName = "num_nulls" | "num_nonnulls" | "concat" | "concat_ws" | "format";
 
 // JsonBuildKind selects which json/jsonb builder a "jsonBuild" RExpr node is (json-sql-functions.md
 // §2): "array" — json[b]_build_array, every argument is one array element (NULL → JSON null);
@@ -37093,6 +37094,13 @@ function resolveHostScalar(
   };
 }
 
+// fixedSlotMatches reports whether a VARIADIC function's FIXED parameter (concat_ws's separator,
+// format's format string) admits an argument of type t: its family, or an untyped NULL, which is the
+// NULL of that family (functions.md §9.1).
+function fixedSlotMatches(slot: string, t: ResolvedType): boolean {
+  return t.kind === "null" || familyMatches(slot, t);
+}
+
 // resolveVariadicFunc resolves a VARIADIC scalar-function call (num_nulls/num_nonnulls —
 // array-functions.md §12). The lone catalog row's last parameter is variadic; the call is EITHER a
 // spread of trailing arguments OR (with the VARIADIC keyword) a single array passed directly.
@@ -37120,7 +37128,9 @@ export function resolveVariadicFunc(
     // their concrete families; the last operand MUST be an array (else 42804).
     if (e.args.length !== k) throw noFuncOverload(name);
     for (let i = 0; i < e.args.length; i++) {
-      const r = resolve(scope, e.args[i]!, null, ag, params);
+      // A fixed parameter offers its family's literal hint (format($1, …) types $1 text).
+      const hint = i + 1 < k ? familyHint(desc.argFamilies[i]!) : null;
+      const r = resolve(scope, e.args[i]!, hint, ag, params);
       if (i + 1 === k) {
         // the variadic (array) operand
         if (r.type.kind !== "array") {
@@ -37130,7 +37140,7 @@ export function resolveVariadicFunc(
         // "any" accepts any element type; a concrete variadic family must match.
         if (varFamily !== "any" && !familyMatches(varFamily, r.type.elem))
           throw noFuncOverload(name);
-      } else if (!familyMatches(desc.argFamilies[i]!, r.type)) {
+      } else if (!fixedSlotMatches(desc.argFamilies[i]!, r.type)) {
         throw noFuncOverload(name);
       }
       rargs.push(r.node);
@@ -37138,22 +37148,29 @@ export function resolveVariadicFunc(
     }
   } else {
     // Spread form: at least `k` args (so a variadic function needs ≥1 variadic arg — num_nulls() is
-    // 42883). The json builders are the exception: a ZERO-arg spread is valid (json_build_array() →
-    // [], json_build_object() → {}), so their floor is the fixed-param count (k-1 = 0). The fixed
-    // params match their concrete families; every argument from the variadic slot onward matches the
-    // variadic element family ("any" ⇒ all).
-    const minArgs = jsonBuild !== null ? k - 1 : k;
+    // 42883). The json builders and format are the exceptions: a ZERO-arg spread is valid
+    // (json_build_array() → [], format('x') — PostgreSQL's one-argument format(text) row), so their
+    // floor is the fixed-param count (k-1). The fixed params match their concrete families; every
+    // argument from the variadic slot onward matches the variadic element family ("any" ⇒ all).
+    const minArgs = jsonBuild !== null || name === "format" ? k - 1 : k;
     if (e.args.length < minArgs) throw noFuncOverload(name);
     for (let i = 0; i < e.args.length; i++) {
-      const r = resolve(scope, e.args[i]!, null, ag, params);
-      const slot = i < k - 1 ? desc.argFamilies[i]! : varFamily;
-      if (!familyMatches(slot, r.type)) throw noFuncOverload(name);
+      const hint = i < k - 1 ? familyHint(desc.argFamilies[i]!) : null;
+      const r = resolve(scope, e.args[i]!, hint, ag, params);
+      const ok =
+        i < k - 1
+          ? fixedSlotMatches(desc.argFamilies[i]!, r.type)
+          : familyMatches(varFamily, r.type);
+      if (!ok) throw noFuncOverload(name);
       rargs.push(r.node);
       rtypes.push(r.type);
     }
   }
 
   const result = scalarResultType(desc.result, []);
+  // Catalog volatility is persisted-index admission data (concat / concat_ws / format are STABLE,
+  // as in PostgreSQL — index-dependencies.md).
+  params.nonimmutable ||= desc.volatility !== "immutable";
   if (jsonBuild !== null) {
     // A timestamptz argument renders in the session zone (json-sql-functions.md §2.2).
     params.nonimmutable ||= rtypes.some(containsTimestamptz);

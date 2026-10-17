@@ -2218,6 +2218,9 @@ count (up to about 16k groups under `MAX_REGEX_PROGRAM`, [regex.md](regex.md) §
 | `regexp_replace` | amplifier | S1 | `regex_step`, plus UTF-8 bytes of the replacement once per match | UTF-8 bytes of the result |
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
 | `regexp_match`, `regexp_matches` | amplifier | S4 | none beyond `regex_step` | Σ `payload` of the capture arrays |
+| `concat` (spread or `VARIADIC`) | growth | — | — | UTF-8 bytes of the result |
+| `concat_ws` (spread or `VARIADIC`) | amplifier | — | — | Σ UTF-8 bytes of the non-NULL arguments' text + (count − 1) × UTF-8 bytes of the separator |
+| `format` | amplifier | — | UTF-8 bytes of the format string | UTF-8 bytes of the literal text plus each conversion's text and padding |
 | jsonb `\|\|`, `jsonb_set`, `jsonb_set_lax` (its set branches), `jsonb_insert`, `json[b]_build_array`/`_object` (spread or `VARIADIC`), `json[b]_object(text[] [, text[]])`, `to_json`, `to_jsonb`, `array_to_json`, `row_to_json`, `JSON_SCALAR`, `JSON_SERIALIZE`, `jsonb_path_query_array`, `JSON_QUERY` when a wrapper builds an array | growth | S2 | — | `payload(result)` |
 | `jsonb_pretty` | amplifier | S2 | `payload(jsonb)` | UTF-8 bytes of the result |
 | `encode`, `quote_literal`, `quote_ident`, `quote_nullable`, `like_escape`; casts from an array, `bytea`, or `jsonb` to `text`, and from `jsonb` to `json` | growth | S3 | — | UTF-8 bytes of the result |
@@ -2260,8 +2263,14 @@ The amplifiers' exact sizes:
   a time to measure them, since each is bounded by its input. Indentation makes the
   output grow with depth times node count (depth ≤ `MAX_JSON_DEPTH`,
   [json.md](json.md) §6.4), which is why this kernel is an amplifier.
+- `concat_ws`, `format` ([string-functions.md](string-functions.md) §6): each argument the
+  function uses is rendered to its output text first, which is bounded by its input (a
+  `timestamptz` charges its `timezone` unit then). `concat_ws` sizes the joined text;
+  `format` parses its whole format string in one pass, reporting a malformed specifier in scan
+  order, and sizes the literal spans plus each conversion's (quoted) text and its padding
+  spaces. Padding is never materialized before the reservation.
 
-`replace`, `regexp_replace`, and `jsonb_pretty` also reject a size above
+`replace`, `regexp_replace`, `jsonb_pretty`, `concat_ws`, and `format` also reject a size above
 `MAX_RESULT_CHARS` with `54000`, before the output charge, like `repeat`. The array
 amplifiers (`array_replace`, `regexp_match`, `regexp_matches`) have no structural cap; the
 cost ceiling and the scalar allowance bound them.

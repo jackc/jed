@@ -774,6 +774,9 @@ pub(crate) fn variadic_func_id(name: &str) -> VariadicFunc {
     match name {
         "num_nulls" => VariadicFunc::NumNulls,
         "num_nonnulls" => VariadicFunc::NumNonnulls,
+        "concat" => VariadicFunc::Concat,
+        "concat_ws" => VariadicFunc::ConcatWs,
+        "format" => VariadicFunc::Format,
         _ => unreachable!("variadic_func_id: {name} is not a catalog variadic function"),
     }
 }

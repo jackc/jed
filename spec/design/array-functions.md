@@ -828,6 +828,14 @@ The two kernels:
     returns NULL on a **NULL whole-array** operand. Both are oracle-pinned PG behavior, and both fall
     out of the `none` discipline (the kernel inspects null-ness itself) plus the array form's
     "evaluate-the-array-first" short-circuit.
+19. **Fixed parameters.** The json builders, then `concat_ws` and `format`
+    ([string-functions.md](string-functions.md) §6), are variadic rows with a leading fixed `text`
+    parameter. A fixed parameter resolves with its family's literal hint, so `format($1, 1)` types `$1`
+    text, and admits an untyped `NULL` (the NULL of its family, [functions.md](functions.md) §9.1), so
+    `concat_ws(NULL, 1)` resolves and returns NULL. `format`, like the json builders, allows a spread of
+    zero variadic arguments (`format('x')`, PostgreSQL's separate one-argument row). The variadic
+    resolver applies the row's catalog `volatility` as index admission data, so the STABLE `concat`,
+    `concat_ws`, and `format` are `42P17` in an index expression.
 
 ## 13. AF7 — the surface over composite element types (+ `unnest(composite[])`)
 

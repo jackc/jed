@@ -105,6 +105,12 @@ func variadicFuncID(name string) variadicFunc {
 		return vfNumNulls
 	case "num_nonnulls":
 		return vfNumNonnulls
+	case "concat":
+		return vfConcat
+	case "concat_ws":
+		return vfConcatWs
+	case "format":
+		return vfFormat
 	default:
 		panic("variadicFuncID: " + name + " is not a catalog variadic function")
 	}
@@ -3819,6 +3825,13 @@ func resolveHostScalar(s *scope, name string, tys []resolvedType) (int, scalarTy
 	return id, reg.function(id).result, true
 }
 
+// fixedSlotMatches reports whether a VARIADIC function's FIXED parameter (concat_ws's separator,
+// format's format string) admits an argument of type t: its family, or an untyped NULL, which is the
+// NULL of that family (functions.md §9.1).
+func fixedSlotMatches(slot string, t resolvedType) bool {
+	return t.kind == rtNull || familyMatches(slot, t)
+}
+
 // variadicNotArray is the 42804 raised when a VARIADIC operand is not an array (array-functions.md
 // §12 / §7).
 func variadicNotArray() error {
@@ -3848,7 +3861,12 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 			return nil, resolvedType{}, noFuncOverload(name)
 		}
 		for i, a := range fc.Args {
-			r, t, err := resolve(s, *a, nil, ag, params)
+			// A fixed parameter offers its family's literal hint (format($1, …) types $1 text).
+			var hint *scalarType
+			if i+1 < k {
+				hint = familyHint(desc.ArgFamilies[i])
+			}
+			r, t, err := resolve(s, *a, hint, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -3862,7 +3880,7 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 				if varFamily != "any" && !familyMatches(varFamily, *t.elem) {
 					return nil, resolvedType{}, noFuncOverload(name)
 				}
-			} else if !familyMatches(desc.ArgFamilies[i], t) {
+			} else if !fixedSlotMatches(desc.ArgFamilies[i], t) {
 				return nil, resolvedType{}, noFuncOverload(name)
 			}
 			rargs = append(rargs, r)
@@ -3870,27 +3888,32 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 		}
 	} else {
 		// Spread form: at least k args (so a variadic function needs ≥1 variadic arg — num_nulls()
-		// is 42883). The json builders are the exception: a ZERO-arg spread is valid
-		// (json_build_array() → [], json_build_object() → {}), so their floor is the fixed-param
-		// count (k-1 = 0). The fixed params match their concrete families; every argument from the
-		// variadic slot onward matches the variadic element family ("any" ⇒ all).
+		// is 42883). The json builders and format are the exceptions: a ZERO-arg spread is valid
+		// (json_build_array() → [], format('x') — PostgreSQL's one-argument format(text) row), so
+		// their floor is the fixed-param count (k-1). The fixed params match their concrete families;
+		// every argument from the variadic slot onward matches the variadic element family ("any" ⇒
+		// all).
 		minArgs := k
-		if _, _, ok := jsonBuildClassify(name); ok {
+		if _, _, ok := jsonBuildClassify(name); ok || name == "format" {
 			minArgs = k - 1
 		}
 		if len(fc.Args) < minArgs {
 			return nil, resolvedType{}, noFuncOverload(name)
 		}
 		for i, a := range fc.Args {
-			r, t, err := resolve(s, *a, nil, ag, params)
+			var hint *scalarType
+			if i < k-1 {
+				hint = familyHint(desc.ArgFamilies[i])
+			}
+			r, t, err := resolve(s, *a, hint, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			slot := varFamily
+			ok := familyMatches(varFamily, t)
 			if i < k-1 {
-				slot = desc.ArgFamilies[i]
+				ok = fixedSlotMatches(desc.ArgFamilies[i], t)
 			}
-			if !familyMatches(slot, t) {
+			if !ok {
 				return nil, resolvedType{}, noFuncOverload(name)
 			}
 			rargs = append(rargs, r)
@@ -3899,6 +3922,9 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 	}
 
 	result := scalarResultType(desc.Result, nil)
+	// Catalog volatility is persisted-index admission data (concat / concat_ws / format are STABLE,
+	// as in PostgreSQL — index-dependencies.md).
+	params.nonimmutable = params.nonimmutable || desc.Volatility != "immutable"
 	// The json/jsonb builders share the spread/array-form validation above but their own eval node
 	// and a json/jsonb result; the count functions (num_nulls/num_nonnulls) keep reVariadic.
 	if kind, isJSON, ok := jsonBuildClassify(name); ok {

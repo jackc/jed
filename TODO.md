@@ -52,8 +52,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     (`WHERE 10 / d > 1 AND d <> 0`) can succeed there and traps here; jed keeps source order.
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions. → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ a general implicit argument-coercion pass. (`ceil`/`floor`/`mod`/`sign` and text `length`/`lower`/`upper` have since landed in their own slices.)
-- [x] **Scalar string / text functions** — PG's string surface as built-ins with code-point semantics (`length`/`substr`/`lpad`/`btrim`/`replace`/`translate`/`repeat`/`strpos`/`split_part`/`encode`/`decode`/`quote_*`/…). → [string-functions.md](spec/design/string-functions.md)
-  - [ ] _follow-on:_ full-Unicode `initcap` word classification + non-ASCII titlecasing; keyword-aware `quote_ident`.
+- [x] **Scalar string / text functions** — PG's string surface as built-ins with code-point semantics (`length`/`substr`/`lpad`/`btrim`/`replace`/`translate`/`repeat`/`strpos`/`split_part`/`encode`/`decode`/`quote_*`/`concat`/`concat_ws`/`format`/…). → [string-functions.md](spec/design/string-functions.md)
+  - [ ] _follow-on:_ full-Unicode `initcap` word classification + non-ASCII titlecasing.
 - [x] **Double-quoted identifiers + PostgreSQL identifier folding** — bare identifiers fold to lowercase, `"…"` names are exact (any UTF-8, `""` escape, `""` → `42601`); every name comparison, catalog key, and canonical name order is byte-exact; host-API names are verbatim; `nextval('…')` text parses as an identifier (`42602`); auto-names derive from exact names; the `jed_` reservation is byte-exact; `format_version` 37. → [grammar.md §3](spec/design/grammar.md)
   - [ ] _follow-on:_ PG surface still narrower around names — a derived CHECK/FK name's collision walk avoids only its own table's constraint names, where PostgreSQL avoids every constraint name in the schema ([constraints.md §6.7](spec/design/constraints.md)).
 - [x] **Named + optional (DEFAULT) function arguments** — PG named notation `f(name => value)` + DEFAULT params; `make_interval`, then `make_timestamp`/`make_timestamptz`; `VARIADIC` (landed as **AF6** with the array type). → [functions.md §11](spec/design/functions.md)
@@ -66,8 +66,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`. The variance/stddev family is exact over
   integer/decimal input (as in PostgreSQL) and uses PostgreSQL's `float8` algorithms over floats; the
   two-argument set widens any numeric arguments to `f64`, as PostgreSQL does. → [aggregates.md §23](spec/design/aggregates.md)
-- [ ] **Everyday scalar functions** — `concat_ws`, `format()` (PostgreSQL's `%s`/`%I`/`%L`),
-  `array_to_string`, `string_to_array`, and a `gen_random_uuid` alias of `uuidv4` (through the
+- [ ] **Everyday scalar functions** — `array_to_string`, `string_to_array`, and a `gen_random_uuid` alias of `uuidv4` (through the
   entropy seam). (`to_char` is tracked under `timestamp` below.) _(size: M)_
 - [x] **Named windows** — the `WINDOW w AS (…)` clause + `OVER w`, base-window extension, and the
   shared partition/sort pass, slice S5 of [window.md](spec/design/window.md) §5.3: PostgreSQL's

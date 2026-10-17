@@ -89,6 +89,8 @@ mod plan_query;
 mod planner;
 mod srf;
 pub(crate) use kernels::*;
+mod text_build;
+pub(crate) use text_build::*;
 mod store_encode;
 pub(crate) use store_encode::*;
 mod eval_ops;
@@ -3571,6 +3573,12 @@ pub(crate) enum VariadicFunc {
     NumNulls,
     /// num_nonnulls(VARIADIC "any") → i32 — the mirror: the count of non-NULL arguments/elements.
     NumNonnulls,
+    /// concat(VARIADIC "any") → text — the non-NULL arguments' output text, joined (string-functions.md §6).
+    Concat,
+    /// concat_ws(sep, VARIADIC "any") → text — the non-NULL arguments joined by `sep` (NULL sep → NULL).
+    ConcatWs,
+    /// format(formatstr, VARIADIC "any") → text — PostgreSQL's printf-style %s / %I / %L.
+    Format,
 }
 
 /// Which scalar jsonpath query function an [`RExpr::JsonPathFn`] node is (jsonpath.md §5).

@@ -1818,7 +1818,7 @@ func explainRangeSetOp(op rangeSetOp) string {
 }
 
 func explainVariadicFunc(f variadicFunc) string {
-	return [...]string{"num_nulls", "num_nonnulls"}[f]
+	return [...]string{"num_nulls", "num_nonnulls", "concat", "concat_ws", "format"}[f]
 }
 
 // explainJSONImageFunc is the SQL name of a JSON-image function (json-sql-functions.md §2.2).

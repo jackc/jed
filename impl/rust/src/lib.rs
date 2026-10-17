@@ -56,6 +56,7 @@ mod pager;
 mod pageservice;
 mod paging;
 mod parser;
+mod pg_keywords_gen;
 mod pmap;
 mod privileges;
 mod range;
@@ -912,6 +913,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "expr.ilike",
     "expr.like_escape",
     "expr.text_concat",
+    "expr.text_build",
     "expr.regex_match",
     "expr.regex_imatch",
     "expr.case",

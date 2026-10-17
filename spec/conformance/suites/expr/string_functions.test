@@ -925,6 +925,27 @@ SELECT quote_ident('a"b')
 ----
 "a""b"
 
+# PostgreSQL's reserved, column-name, and type/function-name keywords are quoted; an unreserved
+# keyword (abort, name, text) and a non-keyword stay bare (spec/grammar/pg_keywords.toml)
+query TTTTTTTT nosort
+SELECT quote_ident('select'), quote_ident('table'), quote_ident('integer'), quote_ident('left'), quote_ident('xmltable'), quote_ident('abort'), quote_ident('name'), quote_ident('selects')
+----
+"select"
+"table"
+"integer"
+"left"
+"xmltable"
+abort
+name
+selects
+
+# a keyword is matched exactly: an upper-case spelling is quoted for its case alone
+query TT nosort
+SELECT quote_ident('SELECT'), quote_ident('_select')
+----
+"SELECT"
+_select
+
 # STRICT: NULL → NULL
 query T
 SELECT quote_ident(NULL::text)
