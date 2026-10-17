@@ -179,6 +179,10 @@
 #   gin_any  — `c = ANY(tags)` over a GIN-indexed array column gathers c's single posting list
 #              (gin.md §6); the equivalent `'{c}' <@ tags` is NOT GIN-accelerated (full scan). Both
 #              must return identical rows (single-term gather oracle).
+#   gin_or   — `tags IN (Q1, Q2)` / an OR of GIN arms on one column gathers the union of the arms
+#              (gin.md §6.3); the same predicates with one arm spelled `NOT (tags <> Q)` / `Q <@ tags`
+#              hold an arm no GIN strategy matches, so they full scan. Both must return the
+#              by-construction rows.
 #   gin_eq   — `tags = Q` over a GIN-indexed array column gathers candidates via the @>-superset
 #              bound + residual = (gin.md §6); the equivalent `NOT (tags <> Q)` is NOT GIN-accelerated
 #              (full scan). Both must return identical rows (exact-equality gather oracle).
@@ -480,6 +484,10 @@ GIN_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan dml.i
 GIN_ANY_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_any_eq dml.insert
                  dml.insert_multi_row query.select query.order_by types.i32 types.array
                  func.array_quantified func.array_containment].freeze
+GIN_OR_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_any_eq
+                query.gin_array_eq query.gin_disjunction dml.insert dml.insert_multi_row query.select
+                query.order_by query.where_eq query.logical_connectives expr.in_list types.i32
+                types.array func.array_containment func.array_quantified cast.operator].freeze
 GIN_EQ_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_array_eq dml.insert
                 dml.insert_multi_row query.select query.order_by query.where_eq types.i32
                 types.array].freeze
@@ -3215,6 +3223,62 @@ def gen_gin_any(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: GIN disjunctions (IN / OR of GIN arms via the GIN index vs arms it cannot serve) --
+# `col IN (Q1, Q2)` and an OR whose every arm is a GIN-accelerable conjunct on one GIN-indexed column
+# bound the scan by the union of the arms' gathers (spec/design/gin.md §6.3; query.gin_disjunction).
+# The SEMANTICALLY IDENTICAL spellings `NOT (tags <> Q1) OR NOT (tags <> Q2)` and `Q <@ tags OR …` hold
+# arms no GIN strategy matches, so the OR is not a GIN candidate and full scans. Both must return the
+# by-construction rows. No NULL elements are generated; an empty `{}` row and a NULL row are, so the
+# `= '{}'` arm (which makes the whole disjunction fall back to the full scan) is exercised too.
+def gen_gin_or(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(14, random: rng).sort
+  null_id = ids.sample(random: rng)
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { rng.rand(0..4) }]
+  end
+  live = rows.reject { |_id, t| t.nil? }
+  ids_where = ->(pred) { live.select { |_id, t| pred.call(t) }.map { |id, _| id.to_s } }
+  arr = ->(t) { "'{#{t.join(',')}}'::i32[]" }
+  existing = live.map { |_id, t| t }
+  pick = -> { existing.sample(random: rng) || [] }
+  q1 = pick.call
+  q2 = [pick.call, [rng.rand(0..4), rng.rand(0..4)], []].sample(random: rng)
+  k1 = rng.rand(0..5)
+  k2 = rng.rand(0..5)
+  a1 = [rng.rand(0..4)]
+  a2 = [rng.rand(0..4), rng.rand(0..5)]
+
+  out = header(seed, GIN_OR_REQ, "GIN disjunction (IN / OR of GIN arms via the GIN index vs arms it cannot serve)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, tags i32[])")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, t| "(#{id}, #{t.nil? ? 'NULL' : arr.call(t)})" }.join(', ')}")
+
+  pair = lambda do |title, fast, slow, exp|
+    out << "# #{title}"
+    out << "# GIN bound (the union of the arms' gathers)"
+    q(out, "I", "SELECT id FROM t WHERE #{fast} ORDER BY id", exp)
+    out << "# full scan (an arm no GIN strategy matches) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE #{slow} ORDER BY id", exp)
+  end
+  pair.call("IN (#{q1.inspect}, #{q2.inspect})",
+            "tags IN (#{arr.call(q1)}, #{arr.call(q2)})",
+            "NOT (tags <> #{arr.call(q1)}) OR NOT (tags <> #{arr.call(q2)})",
+            ids_where.call(->(t) { t == q1 || t == q2 }))
+  pair.call("@> #{a1.inspect} OR && #{a2.inspect} OR #{k1} = ANY",
+            "tags @> #{arr.call(a1)} OR tags && #{arr.call(a2)} OR #{k1} = ANY(tags)",
+            "#{arr.call(a1)} <@ tags OR tags && #{arr.call(a2)} OR #{k1} = ANY(tags)",
+            ids_where.call(->(t) { a1.all? { |e| t.include?(e) } || a2.any? { |e| t.include?(e) } || t.include?(k1) }))
+  pair.call("#{k1} = ANY OR #{k2} = ANY",
+            "#{k1} = ANY(tags) OR #{k2} = ANY(tags)",
+            "#{k1} = ANY(tags) OR #{arr.call([k2])} <@ tags",
+            ids_where.call(->(t) { t.include?(k1) || t.include?(k2) }))
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: GIN-bounded array equality (= via the GIN index vs NOT(<>) full scan) -----------
 # `col = Q` over a GIN-indexed array column gathers candidates via the @>-superset bound (Q's
 # distinct non-NULL elements, since col = Q ⟹ col @> Q) + the residual = (spec/design/gin.md §6;
@@ -5262,6 +5326,7 @@ SCENARIOS = {
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),
+  "gin_or" => method(:gen_gin_or),
   "gin_float" => method(:gen_gin_float),
   "gin_interval" => method(:gen_gin_interval),
   "gin_mut" => method(:gen_gin_mutation),

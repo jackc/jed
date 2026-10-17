@@ -430,6 +430,11 @@ type ginBoundPlan struct {
 	// jsonb is true for a jsonb column (the jsonb_ops opclass, gin.md §2.1; elemType unused), false
 	// for an array column (array_ops). It selects which strategies ginMatch admits.
 	jsonb bool
+	// orArms is a disjunctive bound's per-arm strategies (gin.md §6.3): every arm of an OR conjunct
+	// (an IN list desugars to one) whose every disjunct holds an accelerable conjunct on this
+	// column, in source order. Empty for the ordinary single-conjunct bound; non-empty, strategy is
+	// the first arm's.
+	orArms []ginStrategy
 }
 
 // indexEqCol is one column of an index access predicate's equality prefix (indexes.md §5.1):
@@ -1662,7 +1667,66 @@ func buildGinBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, off
 	if s, _, ok := ginMatch(filter, colGlobal, jsonb); ok {
 		return newGinBoundPlan(idx.Name, at, s, colGlobal)
 	}
+	// No single accelerable conjunct: an OR conjunct whose every arm is one (an IN list over the
+	// column) bounds the scan by the union of the arms' gathers (gin.md §6.3).
+	or := ginOrMatch(filter, colGlobal, jsonb)
+	if or == nil {
+		return nil
+	}
+	var arms []ginStrategy
+	for _, arm := range ginOrArms(or) {
+		s, _, _ := ginMatch(arm, colGlobal, jsonb)
+		arms = append(arms, s)
+	}
+	gb := newGinBoundPlan(idx.Name, at, arms[0], colGlobal)
+	gb.orArms = arms
+	return gb
+}
+
+// ginOrMatch finds the disjunctive GIN conjunct (gin.md §6.3): the first conjunct of the WHERE
+// AND-chain that is an OR (an IN list over the column desugars to one) every one of whose disjuncts
+// — flattened left to right — holds a constant accelerable conjunct on the indexed column
+// (ginMatch). Returns the OR node; ginOrArms lists its disjuncts.
+func ginOrMatch(filter *rExpr, colGlobal int, jsonb bool) *rExpr {
+	if filter == nil {
+		return nil
+	}
+	switch filter.kind {
+	case reAnd:
+		if or := ginOrMatch(filter.lhs, colGlobal, jsonb); or != nil {
+			return or
+		}
+		return ginOrMatch(filter.rhs, colGlobal, jsonb)
+	case reOr:
+		for _, arm := range ginOrArms(filter) {
+			if _, _, ok := ginMatch(arm, colGlobal, jsonb); !ok {
+				return nil
+			}
+		}
+		return filter
+	}
 	return nil
+}
+
+// ginOrArms is the disjuncts of an OR node, flattened in source order.
+func ginOrArms(or *rExpr) []*rExpr {
+	if or.kind == reOr {
+		return append(ginOrArms(or.lhs), ginOrArms(or.rhs)...)
+	}
+	return []*rExpr{or}
+}
+
+// ginBoundQuery recovers the query node a constant GIN bound gathers from in the plan's filter at
+// execution: the single conjunct's query operand, or a disjunctive bound's OR node (gin.md §6.3).
+// Plan time and execution use the same matchers, so they agree on the conjunct by construction.
+func ginBoundQuery(filter *rExpr, gb *ginBoundPlan) *rExpr {
+	if len(gb.orArms) == 0 {
+		if _, q, ok := ginMatch(filter, gb.colGlobal, gb.jsonb); ok {
+			return q
+		}
+		return nil
+	}
+	return ginOrMatch(filter, gb.colGlobal, gb.jsonb)
 }
 
 // newGinBoundPlan builds the plan for one GIN index over a column of type colTy (an array — array_ops
@@ -2533,10 +2597,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.gin != nil {
-		var query *rExpr
-		if _, q, ok := ginMatch(plan.filter, b.gin.colGlobal, b.gin.jsonb); ok {
-			query = q
-		}
+		query := ginBoundQuery(plan.filter, b.gin)
 		entries, pages, slabs, err := db.ginBoundRows(tableName, b.gin, query, nil, env, meter, mask, false)
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
@@ -2597,26 +2658,51 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 	}
 	// Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
 	// §3): evaluate Q on a scratch meter. queryRow is nil for an ordinary constant bound and the
-	// combined left-hand row for an index-nested-loop sibling bound.
-	qv, err := query.eval(queryRow, env, env.exec.session.scratchMeter())
-	if err != nil {
-		return nil, 0, 0, err
+	// combined left-hand row for an index-nested-loop sibling bound. A disjunctive bound's query is its
+	// OR node (gin.md §6.3): every arm's operand is extracted, in source order, before any posting
+	// list is read.
+	type ginArm struct {
+		strategy ginStrategy
+		operand  *rExpr
 	}
-	if gb.jsonb {
-		if qv, err = residentValue(qv); err != nil {
-			return nil, 0, 0, err
+	arms := []ginArm{{gb.strategy, query}}
+	if len(gb.orArms) > 0 {
+		arms = arms[:0]
+		for _, arm := range ginOrArms(query) {
+			s, q, _ := ginMatch(arm, gb.colGlobal, gb.jsonb)
+			arms = append(arms, ginArm{s, q})
 		}
 	}
-	q := ginQueryTerms(gb.opclass(), gb.strategy, qv)
-	switch q.kind {
-	case ginQueryEmpty:
-		return nil, 0, 0, nil
-	case ginQueryFullScan:
-		// Rows the index cannot enumerate (they carry no terms) may match: scan them all and let the
-		// residual filter keep the right ones (gin.md §6 / §2.1).
-		return store.ScanWithUnits(mask)
+	var queries []ginArmTerms
+	for _, arm := range arms {
+		qv, err := arm.operand.eval(queryRow, env, env.exec.session.scratchMeter())
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		if gb.jsonb {
+			if qv, err = residentValue(qv); err != nil {
+				return nil, 0, 0, err
+			}
+		}
+		q := ginQueryTerms(gb.opclass(), arm.strategy, qv)
+		switch q.kind {
+		case ginQueryEmpty:
+			continue
+		case ginQueryFullScan:
+			// Rows the index cannot enumerate (they carry no terms) may match: scan them all and let
+			// the residual filter keep the right ones (gin.md §6 / §2.1). One such arm makes the
+			// whole disjunction fall back.
+			return store.ScanWithUnits(mask)
+		}
+		queries = append(queries, ginArmTerms{strategy: arm.strategy, terms: q.terms})
 	}
-	return db.ginGather(store, gb, q.terms, gb.strategy.isAny(), meter, mask, keysOnly)
+	return db.ginGather(store, gb, queries, meter, mask, keysOnly)
+}
+
+// ginArmTerms is one gathered arm of a GIN bound: its strategy and distinct query terms.
+type ginArmTerms struct {
+	strategy ginStrategy
+	terms    [][]byte
 }
 
 // isAny reports whether the strategy's posting lists combine by union (mode ANY: `&&`, `?|`) rather
@@ -2742,30 +2828,25 @@ func arrayQueryTerms(strategy ginStrategy, elem scalarType, qv Value) ginQuery {
 // candidate storage keys, ascending byte (= storage-key) order, each point-looked-up so lookups and
 // emitted rows follow storage order exactly as a full scan (gin.md §6/§8). gin_entry (per posting
 // entry visited) is charged on meter; the (pages, slabs) block is returned for the caller.
-func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, terms [][]byte, any bool, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
+func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, arms []ginArmTerms, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
 	istore := db.lkpIndexStore(gb.nameKey)
 	g := ginGatherer{istore: istore}
 	var cand [][]byte
-	if any {
-		// mode ANY (`&&`, `?|`) → the union of every whole posting list
-		postings := make([][][]byte, 0, len(terms))
-		for _, t := range terms {
-			keys, e := g.postingList(t)
+	if len(arms) == 1 {
+		if cand, err = g.arm(arms[0].strategy, arms[0].terms); err != nil {
+			return nil, 0, 0, err
+		}
+	} else {
+		// A disjunction: each arm's candidates in source order, unioned (gin.md §6.3).
+		postings := make([][][]byte, 0, len(arms))
+		for _, arm := range arms {
+			keys, e := g.arm(arm.strategy, arm.terms)
 			if e != nil {
 				return nil, 0, 0, e
 			}
 			postings = append(postings, keys)
 		}
 		cand = unionPostings(postings)
-	} else {
-		// mode ALL → the skip-scan intersection (gin.md §6.2). `= ANY` and `?` are a single term, so
-		// the intersection is that lone posting list; array `=` gathers the same superset as `@>`
-		// (the residual makes it exact); the jsonb_ops gathers are supersets the residual rechecks.
-		c, e := g.intersect(terms)
-		if e != nil {
-			return nil, 0, 0, e
-		}
-		cand = c
 	}
 	meter.Charge(costs.GinEntry * int64(g.entries))
 	pages = g.pages
@@ -3912,6 +3993,26 @@ func ginPostingBound(term []byte) keyBound {
 
 // postingList reads term's whole posting list (a prefix range scan), charging its overlap nodes and
 // entries, and returns the storage keys (the suffix after the term) in ascending order.
+// arm is one strategy's candidates over its distinct query terms: mode ANY (`&&`, `?|`) → the
+// union of every whole posting list; mode ALL → the skip-scan intersection (gin.md §6.2). `= ANY` and
+// `?` are a single term, so the intersection is that lone posting list; array `=` gathers the same
+// superset as `@>` (the residual makes it exact); the jsonb_ops gathers are supersets the residual
+// rechecks.
+func (g *ginGatherer) arm(strategy ginStrategy, terms [][]byte) ([][]byte, error) {
+	if !strategy.isAny() {
+		return g.intersect(terms)
+	}
+	postings := make([][][]byte, 0, len(terms))
+	for _, t := range terms {
+		keys, e := g.postingList(t)
+		if e != nil {
+			return nil, e
+		}
+		postings = append(postings, keys)
+	}
+	return unionPostings(postings), nil
+}
+
 func (g *ginGatherer) postingList(term []byte) ([][]byte, error) {
 	es, p, _, err := g.istore.RangeScanWithUnits(ginPostingBound(term), nil)
 	if err != nil {

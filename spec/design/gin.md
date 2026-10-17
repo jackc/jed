@@ -43,9 +43,10 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   conjunct `col @> const` (contains), `col && const` (overlaps), `const = ANY(col)` (the
   array spelling of membership — semantically `col @> ARRAY[const]`), or `col = const`
   (exact array equality — a `col @> distinct(const)` bound + the residual `=` filter, §6)
-  against a GIN-indexed column bounds the scan to candidate rows (§6). `<@` (contained-by)
-  and `IN` membership over a scalar list are **not** GIN-accelerated this slice (they still
-  run, by full scan — §10). On a `jsonb` column the accelerated conjuncts are `col @> const`
+  against a GIN-indexed column bounds the scan to candidate rows (§6). An `IN` list over the column
+  (`col IN (Q1, Q2)`, which is `col = Q1 OR col = Q2`) and any `OR` of accelerable conjuncts on the
+  column bound it by the union of the arms' gathers (§6.3). `<@` (contained-by) is **not**
+  GIN-accelerated this slice (it still runs, by full scan — §10). On a `jsonb` column the accelerated conjuncts are `col @> const`
   (equivalently `const <@ col`), `col ? const`, `col ?| const`, and `col ?& const` (§2.1).
 - **`UNIQUE` is meaningless for GIN and rejected.** An inverted index has many entries per
   row, so uniqueness is undefined; `CREATE UNIQUE INDEX … USING gin` is `0A000` (§3). A GIN
@@ -504,10 +505,42 @@ advancing long lists by the short one's keys, expressed as leaf-local probes of 
 obligation — [conformance.md §8](conformance.md)): ordinary single-relation/mutation bounds require
 a **constant** query operand; join INL additionally admits the bare earlier-sibling operand in §6.1,
 but not an expression, the indexed relation's own column, a later sibling, or a correlated outer
-operand. The accelerated operators are **`@>`, `&&`, `= ANY`, and array `=` only** (no `<@` or
-`IN` over a scalar list). With a non-blocking `LIMIT`, posting-list gather/combine remains complete
+operand. The accelerated operators are **`@>`, `&&`, `= ANY`, and array `=` only** (no `<@`); `IN`
+lists and `OR`s of them are §6.3. With a non-blocking `LIMIT`, posting-list gather/combine remains complete
 and fully charged, then storage-key-ordered table point-lookups and residual work stop at the window
 (mutations have no `LIMIT`).
+
+### 6.3 Disjunctions (`IN` lists and `OR` of GIN arms)
+
+When no single conjunct of the `WHERE` AND-chain is accelerable on an index's column, the planner
+looks for a **disjunctive** conjunct: the first `OR` in the AND-chain whose every disjunct — the `OR`
+tree flattened left to right — holds a constant accelerable conjunct on that column (the same
+matcher as a single bound, so a disjunct may be an `AND` that contains one). `col IN (Q1, …, Qn)`
+desugars to `col = Q1 OR … OR col = Qn` ([grammar.md §20](grammar.md)), so an `IN` list over a
+GIN-indexed array column is the common case. This is PostgreSQL's `BitmapOr` of GIN index scans
+(oracle-checked with `EXPLAIN`). Arms may mix strategies (`@>`, `&&`, `= ANY`, `=`, and on a `jsonb`
+column `@>`, `?`, `?|`, `?&`). A single accelerable conjunct, when present, is preferred and the `OR`
+stays a residual filter. An `OR` with any arm the index cannot serve is not a GIN candidate.
+
+**Execution.** Every arm's operand is evaluated and its terms extracted first, in source order
+(unmetered, as for one bound). A provably-empty arm (§6 step 1) contributes nothing. An arm whose
+matches the index cannot enumerate (`col = '{}'`, `@> '{}'`, a term-less jsonb `@>`, a key-less `?&`)
+makes the **whole** bound fall back to the full scan. Otherwise each remaining arm gathers as its own
+strategy — mode ANY a union of whole lists, mode ALL the skip-scan of §6.2 — in source order, charging
+its `page_read` and `gin_entry` exactly as a single bound would; arms whose term sets overlap are
+gathered independently. The candidate set is the union of the arms' storage keys, point-looked-up
+once each in storage-key order, and the complete `WHERE` remains the residual filter, so rows are the
+full scan's.
+
+**Estimate.** The structural access selectivity is the OR fold ([estimator.md §7.1](estimator.md)) of
+each arm's access-method class in source order. With GIN term statistics, each arm takes its term
+estimate (statistics.md §6.1) and the bound's rows, `gin_entry`, and pages use their sums (rows capped
+at the column's non-NULL rows); one arm without a term estimate keeps the structural default for the
+whole bound.
+
+Narrowings: constant operands only — a sibling index-nested-loop (§6.1) still uses only a single
+conjunct; one index per bound (an `OR` whose arms use two different indexes, which PostgreSQL also
+serves with `BitmapOr`, is not combined).
 
 ### 6.1 Join sibling query operands
 
@@ -642,9 +675,10 @@ rows, `gin_entry` reads, and index pages, and the predicate's logical selectivit
 - **`text[]`, `bytea[]`, and `decimal[]` terms are cut at 128 bytes** (§4.2, §4.3) — PG keeps the
   whole element. Lossy and rechecked; unobservable in results.
 - **Single-column only** — PG supports multicolumn GIN; jed is `0A000` this slice (§3).
-- **`<@` / `IN` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a broad scan +
-  recheck); jed runs `<@` and `IN`-over-a-scalar-list by full scan this slice (a cost/plan
-  difference, never a result difference — §10). **Array `=` IS accelerated** (§1/§6) — a
+- **`<@` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a broad scan +
+  recheck); jed runs `<@` by full scan this slice (a cost/plan difference, never a result
+  difference — §10). `IN` lists and `OR`s of GIN arms on one index are accelerated as PG's
+  `BitmapOr` does (§6.3); a `BitmapOr` across different indexes is not. **Array `=` IS accelerated** (§1/§6) — a
   `col @> distinct(Q)` bound + the residual `=` filter; PG's `array_ops` GIN opclass includes
   the `=` strategy (`GinEqualStrategy`, strategy 4), so this **matches** PG (both can use the
   index; same rows either way). PG's `ginarrayconsistent` *also* marks the `=` strategy
@@ -697,8 +731,9 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   terms*). Every scalar key type is now admitted. Arrays of composite or `jsonb` elements remain
   `0A000`: each needs a term rule for a non-scalar value (a composite key exists,
   [encoding.md §2.15](encoding.md); `jsonb` has none).
-- **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
-  scalar list. (`const = ANY(col)` membership and array `=` have landed — §1/§6.)
+- **More operators** — `<@` (contained-by, a broad scan + recheck). (`const = ANY(col)`
+  membership, array `=`, and `IN` lists / `OR`s of GIN arms have landed — §1/§6/§6.3.) An `OR`
+  whose arms use different indexes (PostgreSQL's general `BitmapOr`) is not combined.
 - **Multi-column GIN** and general correlated / expression / same-or-later-relation query operands.
   (Bare earlier-sibling operands, GIN and ordered-index bounds for `UPDATE`/`DELETE` scans, and
   bounded LIMIT streaming have landed — §6/§6.1 and

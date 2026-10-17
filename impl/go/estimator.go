@@ -1150,24 +1150,7 @@ func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivi
 		}
 		return estimatorSelectivityClass(accessGistRange)
 	case scanCandidateGin:
-		switch candidate.bound.gin.strategy {
-		case ginContains:
-			return estimatorSelectivityClass(accessGinContains)
-		case ginOverlaps:
-			return estimatorSelectivityClass(accessGinOverlaps)
-		case ginMember:
-			return estimatorSelectivityClass(accessGinMember)
-		case ginJsonbContains:
-			return estimatorSelectivityClass(accessGinJsonbContains)
-		case ginJsonbExists:
-			return estimatorSelectivityClass(accessGinJsonbExists)
-		case ginJsonbExistsAny:
-			return estimatorSelectivityClass(accessGinJsonbExistsAny)
-		case ginJsonbExistsAll:
-			return estimatorSelectivityClass(accessGinJsonbExistsAll)
-		default:
-			return estimatorSelectivityClass(accessGinEqual)
-		}
+		return candidate.bound.gin.structuralSelectivity()
 	case scanCandidatePKInterval:
 		if candidate.bound.pkSet.tuple != nil {
 			ks := candidate.bound.pkSet
@@ -1524,6 +1507,42 @@ func (db *engine) estimateScanCandidates(candidates []scanCandidate, rel scopeRe
 	return out
 }
 
+// structuralSelectivity is a GIN bound's structural access selectivity (estimator.md §7): its
+// strategy's access-method class, or for a disjunctive bound the OR fold of every arm's class in
+// source order.
+func (gb *ginBoundPlan) structuralSelectivity() selectivityExpr {
+	if len(gb.orArms) == 0 {
+		return gb.strategy.accessSelectivity()
+	}
+	parts := make([]selectivityExpr, len(gb.orArms))
+	for i, arm := range gb.orArms {
+		parts[i] = arm.accessSelectivity()
+	}
+	return orSelectivities(parts)
+}
+
+// accessSelectivity is the strategy's access-method class (spec/cost/estimator.toml).
+func (s ginStrategy) accessSelectivity() selectivityExpr {
+	switch s {
+	case ginContains:
+		return estimatorSelectivityClass(accessGinContains)
+	case ginOverlaps:
+		return estimatorSelectivityClass(accessGinOverlaps)
+	case ginMember:
+		return estimatorSelectivityClass(accessGinMember)
+	case ginJsonbContains:
+		return estimatorSelectivityClass(accessGinJsonbContains)
+	case ginJsonbExists:
+		return estimatorSelectivityClass(accessGinJsonbExists)
+	case ginJsonbExistsAny:
+		return estimatorSelectivityClass(accessGinJsonbExistsAny)
+	case ginJsonbExistsAll:
+		return estimatorSelectivityClass(accessGinJsonbExistsAll)
+	default:
+		return estimatorSelectivityClass(accessGinEqual)
+	}
+}
+
 // ginCandidateTermOverride is a GIN candidate's scan rows, gin_entry work, and index pages from its
 // column's term statistics (statistics.md §6.1).
 type ginCandidateTermOverride struct {
@@ -1537,11 +1556,43 @@ func (db *engine) ginCandidateTermEstimate(bound *scanBound, residual *rExpr, re
 		return ginCandidateTermOverride{}, false
 	}
 	gb := bound.gin
-	strategy, operand, ok := ginMatch(residual, gb.colGlobal, gb.jsonb)
-	if !ok || strategy != gb.strategy || gb.colGlobal < rel.offset {
+	if gb.colGlobal < rel.offset {
 		return ginCandidateTermOverride{}, false
 	}
-	estimate := db.statisticsGinEstimate(rel, gb.colGlobal-rel.offset, gb.opclass(), strategy, operand)
+	column := gb.colGlobal - rel.offset
+	var estimate *ginTermEstimate
+	if len(gb.orArms) == 0 {
+		strategy, operand, ok := ginMatch(residual, gb.colGlobal, gb.jsonb)
+		if !ok || strategy != gb.strategy {
+			return ginCandidateTermOverride{}, false
+		}
+		estimate = db.statisticsGinEstimate(rel, column, gb.opclass(), strategy, operand)
+	} else {
+		// A disjunctive bound (gin.md §6.3) prices every arm and sums them (the OR rule's
+		// disjoint-union upper estimate, estimator.md §7.1); any arm without a term estimate keeps
+		// the structural default for the whole bound.
+		or := ginOrMatch(residual, gb.colGlobal, gb.jsonb)
+		if or == nil {
+			return ginCandidateTermOverride{}, false
+		}
+		for _, arm := range ginOrArms(or) {
+			strategy, operand, _ := ginMatch(arm, gb.colGlobal, gb.jsonb)
+			e := db.statisticsGinEstimate(rel, column, gb.opclass(), strategy, operand)
+			if e == nil {
+				return ginCandidateTermOverride{}, false
+			}
+			if estimate == nil {
+				estimate = &ginTermEstimate{totalEntries: e.totalEntries}
+			}
+			estimate.rows = satEstimateAdd(estimate.rows, e.rows)
+			estimate.entries = satEstimateAdd(estimate.entries, e.entries)
+		}
+		current := db.currentColumnStatistics(rel, column)
+		if current == nil {
+			return ginCandidateTermOverride{}, false
+		}
+		estimate.rows = min64(estimate.rows, current.nonnullRows)
+	}
 	if estimate == nil {
 		return ginCandidateTermOverride{}, false
 	}

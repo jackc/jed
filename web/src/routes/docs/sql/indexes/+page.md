@@ -358,6 +358,11 @@ It accelerates the two array set operators, array membership, and exact equality
   equal arrays contain the same elements, jed gathers the same candidates as `@>` and then the
   residual `=` enforces order and length — **stricter** than containment.
 
+An **`IN` list** over the column (`tags IN (ARRAY[1, 2], ARRAY[3])`), or any **`OR`** whose every
+arm is one of these on the same column (`tags @> ARRAY[3] OR 7 = ANY(tags)`), uses the index too:
+jed gathers each arm's rows and takes their union, as PostgreSQL's bitmap OR does. An `OR` with an
+arm the index cannot serve (`tags @> ARRAY[3] OR n = 5`) is a full scan.
+
 The original `WHERE` stays as the residual filter, so the answer is identical to the full-scan
 answer — the index is transparent. The same bound applies to **`UPDATE` and `DELETE`**: a mutation
 whose `WHERE` is GIN-accelerable narrows its target-row scan through the index too, so the rows it
@@ -451,8 +456,8 @@ GIN this release covers a focused surface (it grows from here):
   counts as 30 days, a day as 24 hours), so `1 mon`, `30 days`, and `720:00:00` are one term:
   `'1 mon'::interval = ANY(col)` finds a stored `{30 days}`, exactly as the full scan would. The
   stored values keep their own spelling.
-- **For arrays, `@>`, `&&`, `= ANY`, and array `=` only** — `<@` (contained-by) and `IN` over a scalar list
-  still run, by full scan; they are not GIN-accelerated yet.
+- **For arrays, `@>`, `&&`, `= ANY`, and array `=`**, and `IN` lists or `OR`s of them — `<@`
+  (contained-by) still runs by full scan; it is not GIN-accelerated yet.
 - **No `UNIQUE`** — an inverted index has many entries per row, so `CREATE UNIQUE INDEX … USING gin`
   is rejected (`0A000`), matching PostgreSQL.
 

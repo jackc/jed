@@ -1,0 +1,172 @@
+# GIN disjunctions — the selected plan (jed-only: EXPLAIN is jed's own rendering, never
+# oracle-imported). Pins that an `IN` list over a GIN-indexed column and an `OR` whose every arm is a
+# GIN-accelerable conjunct on that column take the GIN bound (spec/design/gin.md §6.3) for SELECT,
+# UPDATE, and DELETE, over array and jsonb columns; that an `OR` with an arm the index cannot serve
+# stays a full scan; and that a single accelerable conjunct beside the `OR` is the bound instead.
+# The rows are oracle-checked in query/gin_disjunction.test.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, query.gin_jsonb_ops, query.gin_disjunction, query.logical_connectives, query.explain, dml.explain, expr.in_list, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, types.i32, types.text, types.array, types.jsonb, func.array_containment, func.array_quantified, func.jsonb_contains, func.json_builders, query.set_returning, cast.operator, expr.text_concat, expr.arithmetic, dml.insert_select, maintenance.analyze, maintenance.analyze_gin_terms
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], n i32)
+
+statement ok
+CREATE INDEX t_tags_gin ON t USING gin (tags)
+
+statement ok
+INSERT INTO t SELECT g::i32, ARRAY[g % 10, g % 7]::i32[], g::i32 FROM generate_series(1, 200) AS g
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[3,4])
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+GIN bound: using t_tags_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE tags @> ARRAY[3] OR tags && ARRAY[5,7] OR 8 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+GIN bound: using t_tags_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE (tags @> ARRAY[1] AND n > 2) OR tags = ARRAY[5,5]
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+GIN bound: using t_tags_gin; touched=3
+
+# an arm the index cannot serve: no GIN candidate
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE tags @> ARRAY[4] OR n = 3
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+Full scan; touched=3
+
+# a single accelerable conjunct is the bound; the OR beside it filters
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM t WHERE tags @> ARRAY[9] AND (tags @> ARRAY[1] OR tags @> ARRAY[2])
+----
+0
+Filter
+conjuncts=2
+1
+Scan t
+GIN bound: using t_tags_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) UPDATE t SET n = 0 WHERE tags IN (ARRAY[1,1], ARRAY[2,2])
+----
+0
+Update t
+sets=1
+1
+Filter
+conjuncts=1
+2
+Scan t
+GIN bound: using t_tags_gin; touched=1
+
+query ITT nosort
+EXPLAIN (COSTS false) DELETE FROM t WHERE tags @> ARRAY[6] OR tags @> ARRAY[3]
+----
+0
+Delete t
+-
+1
+Filter
+conjuncts=1
+2
+Scan t
+GIN bound: using t_tags_gin; touched=1
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, doc jsonb)
+
+statement ok
+CREATE INDEX d_doc_gin ON d USING gin (doc)
+
+statement ok
+INSERT INTO d SELECT g::i32, jsonb_build_object('k', g % 9, 'g' || (g % 5), true) FROM generate_series(1, 200) AS g
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM d WHERE doc @> '{"k": 2}' OR doc ? 'g3'
+----
+0
+Filter
+conjuncts=1
+1
+Scan d
+GIN bound: using d_doc_gin; touched=2
+
+# jsonb `=` has no jsonb_ops strategy: no GIN candidate
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM d WHERE doc IN ('{"k": 2}'::jsonb, '{}'::jsonb)
+----
+0
+Filter
+conjuncts=1
+1
+Scan d
+Full scan; touched=2
+
+# the estimates: the OR fold of each arm's access-method class, then (after ANALYZE) the sum of the
+# arms' GIN term estimates
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[3,4])
+----
+0
+Filter
+conjuncts=1
+2
+35
+1
+Scan t
+GIN bound: using t_tags_gin; touched=2
+4
+13
+
+statement ok
+ANALYZE t
+
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[3,4])
+----
+0
+Filter
+conjuncts=1
+2
+341
+1
+Scan t
+GIN bound: using t_tags_gin; touched=2
+22
+229
+
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE tags @> ARRAY[3] OR tags && ARRAY[5,7] OR 8 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+131
+1442
+1
+Scan t
+GIN bound: using t_tags_gin; touched=2
+131
+394

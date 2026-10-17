@@ -1295,9 +1295,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		if sb.gin != nil {
 			var query *rExpr
 			if plan.filter != nil {
-				if _, q, ok := ginMatch(plan.filter, sb.gin.colGlobal, sb.gin.jsonb); ok {
-					query = q
-				}
+				query = ginBoundQuery(plan.filter, sb.gin)
 			}
 			entries, pages, slabs, err = db.ginBoundRows(plan.rels[0].tableName, sb.gin, query, nil, env, meter, plan.relMasks[0], true)
 		} else {
@@ -2370,9 +2368,7 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 				}
 			}
 		} else if access := plan.accessPredicate(); access != nil {
-			if _, q, ok := ginMatch(access, sb.gin.colGlobal, sb.gin.jsonb); ok {
-				query = q
-			}
+			query = ginBoundQuery(access, sb.gin)
 		}
 		entries, pages, sl, err := db.ginBoundRows(rel.tableName, sb.gin, query, left, env, meter, plan.relMasks[ri], false)
 		if err != nil {
