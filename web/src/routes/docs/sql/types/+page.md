@@ -96,6 +96,12 @@
   (ARRAY[1, 2, 3]::i32[])::i64[]             AS widen_elements,
   (ARRAY[1.7, 2.2, -2.5]::numeric[])::i32[]  AS round_elements;`;
 
+	const arrayTextDemo = `SELECT
+  array_to_string(ARRAY['a', NULL, 'c'], ', ')       AS skip_nulls,
+  array_to_string(ARRAY['a', NULL, 'c'], ', ', '-')  AS null_as_dash,
+  string_to_array('x,y,,z', ',')                     AS split,
+  string_to_array('abc', NULL)                       AS chars;`;
+
 	const jsonUpdateDemo = `CREATE TABLE docs (id i32 PRIMARY KEY, body jsonb, raw json);
 INSERT INTO docs VALUES (1, '{"a":1}', '{ "a" : 1 }');
 UPDATE docs
@@ -426,6 +432,14 @@ Concatenation and the array builders and search functions (`||`, `array_append`,
 own, as in PostgreSQL: the result's element type is the common type of the arguments. So
 `ARRAY[1::i32] || 9000000000::i64` is an `i64[]` and `ARRAY[1, 2] || 2.5` a `numeric[]`. A float
 never meets an integer or `numeric` implicitly, so mixing those is still an error (`42883`).
+
+To join an array's elements with a separator, or split a string into a `text[]`, use
+`array_to_string(array, sep [, null_string])` and `string_to_array(text, sep [, null_string])`.
+`array_to_string` writes each element's plain text (no `{…}` quoting) and skips `NULL` elements
+unless you give a `null_string` to print instead; `string_to_array` turns pieces equal to
+`null_string` into `NULL`, and a `NULL` separator splits a string into its characters:
+
+<LiveSql query={arrayTextDemo} rows={1} />
 
 ## JSON assignment
 

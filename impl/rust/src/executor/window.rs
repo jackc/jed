@@ -1419,6 +1419,13 @@ mod registry_tests {
                 );
                 continue;
             }
+            if o.name == "string_to_array" {
+                // The non-polymorphic array builder (array-functions.md §15), resolver-routed to its
+                // ArrayFunc kernel; its result is the concrete text[].
+                let _ = array_func_id(o.name);
+                assert_eq!(o.result, "text[]", "string_to_array result code");
+                continue;
+            }
             if is_array_func_name(o.name) {
                 // A polymorphic array function (array-functions.md §2): its kernel id comes from
                 // `array_func_id` and its result is a reserved poly code or a scalar id.

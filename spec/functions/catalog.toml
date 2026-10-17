@@ -3187,6 +3187,20 @@ null           = "propagates"
 errors         = []
 volatility     = "volatile"
 
+# gen_random_uuid: PostgreSQL's older name for uuidv4 (PG 13+) — the SAME kernel and entropy draw
+# (two PRNG draws, version 4 + RFC variant), so under one seed the two spellings return the same
+# value (entropy.md §3).
+[[operator]]
+name           = "gen_random_uuid"
+kind           = "function"
+arity          = 0
+arg_families   = []
+arg_resolution = "none"
+result         = "uuid"
+null           = "propagates"
+errors         = []
+volatility     = "volatile"
+
 [[operator]]
 name           = "uuidv7"
 kind           = "function"
@@ -3617,6 +3631,64 @@ arg_resolution = "none"
 result         = "i32[]"
 null           = "none"
 errors         = ["0A000"]
+
+# === array <-> text conversion (../design/array-functions.md §15) ==============================
+# array_to_string(a, sep [, null_string]) → text: every element of `a` (any dimensionality,
+# flattened in row-major order) rendered as its type's output text (PG's element output function —
+# NOT array_out's quoting), joined by `sep`. A NULL element is skipped, or replaced by null_string
+# when that is given and non-NULL. An empty array → ''. A NULL array or NULL sep → NULL (null =
+# "none": the kernel decides, since a NULL null_string just means "skip"). An untyped array operand
+# is 42804 (the polymorphic type is indeterminate; PostgreSQL's code). An amplifier (cost.md §8.1):
+# the separator and null_string multiply by the element count, so the exact output size is charged
+# and reserved before the string is built, and a size above MAX_RESULT_CHARS is 54000.
+[[operator]]
+volatility     = "immutable"
+name           = "array_to_string"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "none"
+errors         = ["42804", "54000"]
+
+[[operator]]
+volatility     = "immutable"
+name           = "array_to_string"
+kind           = "function"
+arity          = 3
+arg_families   = ["anyarray", "text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "none"
+errors         = ["42804", "54000"]
+
+# string_to_array(s, sep [, null_string]) → text[]: `s` split at each non-overlapping occurrence of
+# `sep` (left to right), as a one-dimensional text[]. A NULL `sep` splits into single characters;
+# an empty `sep` gives the whole string as one element; an empty `s` gives the empty array {}. A
+# piece equal to a non-NULL null_string becomes a NULL element. A NULL `s` → NULL. Not an
+# amplifier: the pieces partition `s` (cost.md §8.1 "Parsing text into an array").
+[[operator]]
+volatility     = "immutable"
+name           = "string_to_array"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text[]"
+null           = "none"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "string_to_array"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "text[]"
+null           = "none"
+errors         = []
 
 # --- the `||` array concatenation operator (../design/array-functions.md §8) -----------------
 # A new operator KIND "concat": a binary infix `||` with its own precedence (37 — tighter than the
@@ -4125,8 +4197,8 @@ errors         = ["22011"]
 
 # substring(string, start[, count]) — the SQL-standard name of substr, for text and bytea (the same
 # kernel). The parser also desugars the special form SUBSTRING(x FROM s [FOR l]) / SUBSTRING(x FOR l
-# [FROM s]) to these calls (grammar.ebnf `substring_expr`; FOR-only starts at 1). PG's regex forms
-# (substring(text FROM pattern), SIMILAR … ESCAPE) are not catalogued: a text `from` is 42883.
+# [FROM s]) to these calls (grammar.ebnf `substring_expr`; FOR-only starts at 1). A text `from`
+# selects the regex form substring(text, text) below; the SIMILAR … ESCAPE form is not catalogued.
 [[operator]]
 volatility     = "immutable"
 name           = "substring"
@@ -4170,6 +4242,25 @@ arg_resolution = "none"
 result         = "bytea"
 null           = "propagates"
 errors         = ["22011"]
+
+# substring(string, pattern) / SUBSTRING(string FROM pattern) → text — PostgreSQL's POSIX-regex
+# substring (regex.md §8e): the first match of `pattern` (jed's RE2-subset Pike VM); when the
+# pattern has a capture group, the text the FIRST group captured, else the whole match. No match,
+# or a first group that did not participate, → NULL. Resolver-routed to the RegexFunc node like
+# regexp_substr (it is regexp_substr(string, pattern, 1, 1, '', k) with k = 1 if the pattern has a
+# group, else 0). Overload choice: a text (or bare string literal, or untyped NULL / `$N`) second
+# argument takes this row — text wins among the candidates (functions.md §9.1), as in PostgreSQL.
+# STRICT.
+[[operator]]
+volatility     = "immutable"
+name           = "substring"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B"]
 
 # overlay(string PLACING new FROM start [FOR count]) — the SQL standard's splice: the string with
 # `count` units starting at the 1-based `start` replaced by `new` (count defaults to length(new)).

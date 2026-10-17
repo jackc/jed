@@ -937,3 +937,114 @@ pub(crate) fn eval_decimal_arith(op: ArithOp, a: Decimal, b: Decimal) -> Result<
     };
     Ok(Value::Decimal(r))
 }
+
+/// `array_to_string(a, sep [, null_string])` (array-functions.md §15): the elements of `a` in
+/// row-major order (any dimensionality), each rendered as its type's output text, joined by `sep`;
+/// a NULL element is skipped, or written as `null_string` when that is given and non-NULL. A NULL
+/// array or separator is NULL; an empty array is ''. An amplifier (cost.md §8.1): the input array is
+/// charged, each element rendered (a finite `timestamptz` in the session zone, one `timezone` unit
+/// each), the exact UTF-8 size computed and capped at `MAX_RESULT_CHARS` (`54000`), then charged and
+/// reserved before the result is joined.
+pub(crate) fn array_to_string_value(
+    vals: &[Value],
+    zone: &crate::timezone::ZoneRef,
+    meter: &mut Meter,
+) -> Result<Value> {
+    let a = match &vals[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Array(a) => a,
+        _ => unreachable!("array_to_string: array operand"),
+    };
+    let sep = match &vals[1] {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(s) => s.as_str(),
+        _ => unreachable!("array_to_string: text separator"),
+    };
+    let null_string = match vals.get(2) {
+        Some(Value::Text(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    meter.charge(COSTS.scalar_byte * crate::memsize::payload_bytes(&vals[0]));
+    meter.guard()?;
+    let zoned: u64 = a.elements.iter().map(Value::zone_render_count).sum();
+    if zoned > 0 {
+        meter.charge(COSTS.timezone * zoned as i64);
+        meter.guard()?;
+    }
+    // Render the printed items (each bounded by its input), then size the joined result: the
+    // items' UTF-8 bytes plus one separator between each adjacent pair.
+    let mut items: Vec<Option<String>> = Vec::with_capacity(a.elements.len());
+    let mut size: i64 = 0;
+    for e in &a.elements {
+        let item = match e {
+            Value::Null if null_string.is_none() => continue,
+            Value::Null => None,
+            // PostgreSQL's boolout spelling, not the `bool → text` cast's true/false.
+            Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
+            v => Some(v.render_in(zone)?),
+        };
+        size = size.saturating_add(item.as_deref().or(null_string).map_or(0, str::len) as i64);
+        items.push(item);
+    }
+    if items.len() > 1 {
+        size = size.saturating_add((items.len() as i64 - 1).saturating_mul(sep.len() as i64));
+    }
+    if size > MAX_RESULT_CHARS {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "requested length too large",
+        ));
+    }
+    meter.charge(COSTS.scalar_byte * size);
+    meter.guard()?;
+    meter.reserve_scalar(size)?;
+    let mut out = String::with_capacity(size as usize);
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(sep);
+        }
+        out.push_str(item.as_deref().or(null_string).unwrap_or(""));
+    }
+    Ok(Value::Text(out))
+}
+
+/// `string_to_array(s, sep [, null_string])` (array-functions.md §15): `s` split at each
+/// non-overlapping occurrence of `sep`, left to right, as a one-dimensional `text[]`. A NULL `sep`
+/// splits `s` into its characters; an empty `sep` keeps `s` whole; an empty `s` is the empty array.
+/// A piece equal to a non-NULL `null_string` becomes a NULL element. A NULL `s` is NULL. Not charged
+/// beyond the call's `operator_eval`: the pieces partition `s` (cost.md §8.1).
+pub(crate) fn string_to_array_value(vals: &[Value]) -> Value {
+    let s = match &vals[0] {
+        Value::Null => return Value::Null,
+        Value::Text(s) => s.as_str(),
+        _ => unreachable!("string_to_array: text operand"),
+    };
+    let null_string = match vals.get(2) {
+        Some(Value::Text(n)) => Some(n.as_str()),
+        _ => None,
+    };
+    if s.is_empty() {
+        return Value::Array(ArrayVal::empty());
+    }
+    let pieces: Vec<&str> = match &vals[1] {
+        Value::Null => s
+            .char_indices()
+            .map(|(i, c)| &s[i..i + c.len_utf8()])
+            .collect(),
+        Value::Text(sep) if sep.is_empty() => vec![s],
+        Value::Text(sep) => s.split(sep.as_str()).collect(),
+        _ => unreachable!("string_to_array: text separator"),
+    };
+    Value::Array(ArrayVal::one_dim(
+        pieces
+            .into_iter()
+            .map(|p| {
+                if Some(p) == null_string {
+                    Value::Null
+                } else {
+                    Value::Text(p.to_string())
+                }
+            })
+            .collect(),
+    ))
+}

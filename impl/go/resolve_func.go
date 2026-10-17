@@ -398,7 +398,7 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfUuidExtractVersion
 	case "uuid_extract_timestamp":
 		return sfUuidExtractTimestamp
-	case "uuidv4":
+	case "uuidv4", "gen_random_uuid": // gen_random_uuid is PostgreSQL's older name (entropy.md §3)
 		return sfUuidv4
 	case "uuidv7":
 		return sfUuidv7
@@ -601,6 +601,10 @@ func arrayFuncID(name string) arrayFunc {
 		return afReplace
 	case "array_position":
 		return afPosition
+	case "array_to_string":
+		return afToString
+	case "string_to_array":
+		return afStringToArray
 	case "array_positions":
 		return afPositions
 	default:
@@ -898,6 +902,62 @@ func elemScalarHint(t resolvedType) (scalarType, bool) {
 	}
 }
 
+// resolveArrayTextFunc resolves array_to_string(anyarray, text [, text]) and
+// string_to_array(text, text [, text]) (array-functions.md §15). The text slots take a text hint, so
+// a bare string literal, an untyped NULL, or a bare $N adapts to text; any other type is 42883.
+// array_to_string's first argument must be an array: an untyped operand there leaves the polymorphic
+// type undetermined (42804, PostgreSQL), and a non-array is 42883.
+func resolveArrayTextFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	name := fc.Name
+	if len(fc.Args) != 2 && len(fc.Args) != 3 {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	toString := name == "array_to_string"
+	untyped := func() error {
+		return newError(DatatypeMismatch, "could not determine polymorphic type because input has type unknown")
+	}
+	textHint := scalarText
+	rargs := make([]*rExpr, len(fc.Args))
+	for i, a := range fc.Args {
+		if i == 0 && toString {
+			// An untyped operand (a bare string literal or $N) cannot bind the polymorphic type.
+			if (a.Kind == exprLiteral && a.Literal.Kind == literalText) || a.Kind == exprParam {
+				return nil, resolvedType{}, untyped()
+			}
+			r, t, err := resolve(s, *a, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch t.kind {
+			case rtArray:
+			case rtNull:
+				return nil, resolvedType{}, untyped()
+			default:
+				return nil, resolvedType{}, noFuncOverload(name)
+			}
+			rargs[i] = r
+			continue
+		}
+		r, t, err := resolve(s, *a, &textHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if t.kind != rtText && t.kind != rtNull {
+			return nil, resolvedType{}, noFuncOverload(name)
+		}
+		rargs[i] = r
+	}
+	result := resolvedType{kind: rtText}
+	if !toString {
+		elem := resolvedType{kind: rtText}
+		result = resolvedType{kind: rtArray, elem: &elem}
+	}
+	return &rExpr{kind: reArrayFunc, afunc: arrayFuncID(name), sargs: rargs}, result, nil
+}
+
 // resolveArrayFunc resolves a polymorphic array function call (array-functions.md §3): resolve the
 // arguments, unify ELEM across the anyarray/anyelement slots to pick the overload (42883 on no
 // match), and compute the result type from the matched result code. Two passes (§2): pass 1 resolves
@@ -1076,6 +1136,13 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		}
 		rargs[i] = r
 	}
+	return regexFuncNode(s, rfn, flagsIdx, rargs, params)
+}
+
+// regexFuncNode builds the reRegexFunc node over resolved arguments (source and pattern at 0 and 1,
+// the flags at flagsIdx, -1 for none): precompile a constant pattern and pick the result type.
+// Shared by the regexp_* functions and the regex substring(text, text) overload (regex.md §8e).
+func regexFuncNode(s *scope, rfn regexFunc, flagsIdx int, rargs []*rExpr, params *paramTypes) (*rExpr, resolvedType, error) {
 	// Precompile a constant pattern (rargs[1]) once, folding it for a statically-constant `i` flag.
 	insensitiveKnown, insensitive := true, false
 	if flagsIdx >= 0 {
@@ -1099,7 +1166,7 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	}
 	var result resolvedType
 	switch rfn {
-	case rxReplace, rxSubstr:
+	case rxReplace, rxSubstr, rxSubstring:
 		result = resolvedType{kind: rtText}
 	case rxMatch, rxSplitToArray, rxSplitToTable:
 		elem := resolvedType{kind: rtText}
@@ -3273,6 +3340,15 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveAggregate(s, fc, ag, params)
 	}
+	// The array <-> text conversions (array-functions.md §15): array_to_string's anyarray slot binds
+	// no result type and string_to_array's text[] result is not scalar, so both have their own
+	// resolver (ahead of the generic polymorphic path, which cannot adapt their text slots).
+	if name == "array_to_string" || name == "string_to_array" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return resolveArrayTextFunc(s, fc, ag, params)
+	}
 	// The polymorphic array functions (array-functions.md §2) are also Kind=="function", so they
 	// must be intercepted BEFORE the generic scalar path — their anyarray/anyelement slots need §2
 	// unification, which lookupScalarOverload's exact-family match cannot do.
@@ -3792,6 +3868,11 @@ func adoptScalarOverload(s *scope, fc *funcCallExpr, desc *operatorDesc, rargs [
 		} else {
 			tys[i] = resolvedTypeOf(st)
 		}
+	}
+	// The regex overload substring(text, text) (regex.md §8e) runs on the reRegexFunc node, which owns
+	// pattern precompilation and the regex cost units.
+	if name == "substring" && len(desc.ArgFamilies) == 2 && desc.ArgFamilies[1] == "text" {
+		return regexFuncNode(s, rxSubstring, -1, rargs, params)
 	}
 	epoch := name == "date_part" && len(rargs) > 0 && rargs[0].kind == reConstText && strings.EqualFold(rargs[0].cText, "epoch")
 	params.nonimmutable = params.nonimmutable || (desc.Volatility != "immutable" && !epoch)

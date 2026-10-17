@@ -23,13 +23,16 @@ import {
   float64Value,
   intValue,
   nullValue,
+  renderIn,
   textValue,
+  zoneRenderCount,
 } from "./value.ts";
 import { type QueryAccount, StateCharge } from "./cost.ts";
-import { entryBytes, payloadBytes, valueBytes } from "./memsize.ts";
+import { entryBytes, payloadBytes, utf8Length, valueBytes } from "./memsize.ts";
 import { COSTS } from "./costs.ts";
 import {
   arraySubscriptErr,
+  MAX_RESULT_CHARS,
   distinctRowKey,
   promote,
   resolvedTypeEqual,
@@ -55,7 +58,7 @@ import {
 } from "./range.ts";
 import { engineError } from "./errors.ts";
 import { assignmentError, storeValue, typeError } from "./store.ts";
-import type { InputZone } from "./timezone.ts";
+import type { InputZone, ZoneRef } from "./timezone.ts";
 import { valueCmp } from "./window.ts";
 import type { Row } from "./storage.ts";
 import type { Meter } from "./cost.ts";
@@ -122,6 +125,10 @@ export function evalArrayFunc(func: ArrayFuncName, vals: Value[], m: Meter): Val
       return arrayRemoveValue(vals[0]!, vals[1]!);
     case "array_replace":
       return arrayReplaceValue(vals[0]!, vals[1]!, vals[2]!, m);
+    case "array_to_string":
+      throw new Error("unreachable: array_to_string renders in the session zone (eval)");
+    case "string_to_array":
+      return stringToArrayValue(vals);
     case "array_position":
       return arrayPositionValue(vals[0]!, vals[1]!, vals.length > 2 ? vals[2]! : null);
     case "array_positions":
@@ -354,6 +361,74 @@ export function arrayReplaceValue(arr: Value, from: Value, to: Value, m: Meter):
     lbounds: [...arr.lbounds],
     elements,
   };
+}
+
+// arrayToStringValue is array_to_string(a, sep [, null_string]) (array-functions.md §15): the
+// elements of a in row-major order (any dimensionality), each rendered as its type's output text,
+// joined by sep; a NULL element is skipped, or written as null_string when that is given and
+// non-NULL. A NULL array or separator is NULL; an empty array is ''. An amplifier (cost.md §8.1):
+// the input array is charged, each element rendered (a finite timestamptz in the session zone, one
+// timezone unit each), the exact UTF-8 size computed and capped at MAX_RESULT_CHARS (54000), then
+// charged and reserved before the result is joined.
+export function arrayToStringValue(vals: Value[], zone: ZoneRef, m: Meter): Value {
+  const arr = vals[0]!;
+  const sepV = vals[1]!;
+  if (arr.kind !== "array" || sepV.kind !== "text") return nullValue();
+  const sep = sepV.text;
+  const nullV = vals[2];
+  const nullString = nullV !== undefined && nullV.kind === "text" ? nullV.text : null;
+  m.charge(COSTS.scalarByte * BigInt(payloadBytes(arr)));
+  m.guard();
+  const zoned = arr.elements.reduce((n, el) => n + zoneRenderCount(el), 0);
+  if (zoned > 0) {
+    m.charge(COSTS.timezone * BigInt(zoned));
+    m.guard();
+  }
+  // Render the printed items (each bounded by its input), then size the joined result: the items'
+  // UTF-8 bytes plus one separator between each adjacent pair.
+  const items: string[] = [];
+  let size = 0n;
+  for (const e of arr.elements) {
+    let item: string;
+    if (e.kind === "null") {
+      if (nullString === null) continue;
+      item = nullString;
+    } else if (e.kind === "bool") {
+      // PostgreSQL's boolout spelling, not the bool → text cast's true/false.
+      item = e.value ? "t" : "f";
+    } else {
+      item = renderIn(e, zone);
+    }
+    size += BigInt(utf8Length(item));
+    items.push(item);
+  }
+  if (items.length > 1) size += BigInt(items.length - 1) * BigInt(utf8Length(sep));
+  if (size > MAX_RESULT_CHARS)
+    throw engineError("program_limit_exceeded", "requested length too large");
+  m.charge(COSTS.scalarByte * size);
+  m.guard();
+  m.reserveScalar(size);
+  return textValue(items.join(sep));
+}
+
+// stringToArrayValue is string_to_array(s, sep [, null_string]) (array-functions.md §15): s split
+// at each non-overlapping occurrence of sep, left to right, as a one-dimensional text[]. A NULL sep
+// splits s into its characters (code points); an empty sep keeps s whole; an empty s is the empty
+// array. A piece equal to a non-NULL null_string becomes a NULL element. A NULL s is NULL. Not
+// charged beyond the call's operator_eval: the pieces partition s (cost.md §8.1).
+export function stringToArrayValue(vals: Value[]): Value {
+  const sv = vals[0]!;
+  if (sv.kind !== "text") return nullValue();
+  const s = sv.text;
+  const nullV = vals[2];
+  const nullString = nullV !== undefined && nullV.kind === "text" ? nullV.text : null;
+  if (s === "") return emptyArray();
+  const sepV = vals[1]!;
+  let pieces: string[];
+  if (sepV.kind !== "text") pieces = Array.from(s);
+  else if (sepV.text === "") pieces = [s];
+  else pieces = s.split(sepV.text);
+  return arrayValue(pieces.map((p) => (p === nullString ? nullValue() : textValue(p))));
 }
 
 // arrayPositionValue is array_position(a, e[, start]) (array-functions.md §8): the SUBSCRIPT (in the

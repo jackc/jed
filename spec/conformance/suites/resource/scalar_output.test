@@ -1,11 +1,11 @@
 # Output-constructing kernels (spec/design/cost.md §8.1, memory.md §1), slice S1. Growth kernels
 # (ARRAY[…] and the array builders) charge scalar_byte × payload(result) to cost after building it
 # and never reserve the scalar allowance; constant-only operands are free, like a literal. Amplifiers
-# (replace, regexp_replace, array_replace) charge their input scan, then size, charge, and reserve
+# (replace, regexp_replace, array_replace, array_to_string) charge their input scan, then size, charge, and reserve
 # their exact output before building it, even over constants. payload is memory.md §3's measure: UTF-8
 # bytes for text, the byte length for bytea, 16 per dimension plus 32 + payload per element for an array.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, types.array, types.bytea, types.i32, types.text, expr.text_concat, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, func.array_to_string, func.string_to_array, types.array, types.bytea, types.i32, types.text, expr.text_concat, resource.cost_metering, resource.cost_limit, resource.scalar_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32[], s text)
@@ -371,4 +371,36 @@ SELECT array_replace(ARRAY['a', 'a'], 'a', 'xyz')
 query T nosort
 SELECT array_replace(NULL::i32[], 1, 2)
 ----
+NULL
+
+# === array_to_string ===
+
+# Charged even over constants: input payload 16 + 3 × 32 = 112, output '1,2,3' = 5.
+# cost: 120
+query T nosort
+SELECT array_to_string(ARRAY[1, 2, 3], ',')
+----
+1,2,3
+
+# The separator and the null string are sized into the output: 'a--*--b' = 7 bytes.
+# max_scalar_bytes: 7
+query T nosort
+SELECT array_to_string(ARRAY['a', NULL, 'b'], '--', '*')
+----
+a--*--b
+
+# max_scalar_bytes: 6
+statement error 54P04
+SELECT array_to_string(ARRAY['a', NULL, 'b'], '--', '*')
+
+# A separator repeated between 1001 elements sizes past MAX_RESULT_CHARS before anything is built.
+statement error 54000
+SELECT array_to_string(string_to_array(repeat(',', 1000), ','), repeat('x', 2000000))
+
+# A NULL array or separator is NULL and charges nothing.
+# max_scalar_bytes: 1
+query TT nosort
+SELECT array_to_string(NULL::i32[], ','), array_to_string(ARRAY[1], NULL)
+----
+NULL
 NULL

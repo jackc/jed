@@ -187,10 +187,6 @@ NULL
 NULL
 NULL
 
-# PG's regular-expression forms (substring(text FROM pattern)) are not supported
-statement error 42883
-SELECT substring('hello' FROM 'l+')
-
 # === get_byte(bytea, n) → int: the 0-based n-th byte, unsigned ===============================
 
 query III nosort

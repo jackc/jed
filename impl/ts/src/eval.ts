@@ -61,6 +61,7 @@ import {
   encodeBytea,
   dateClockValue,
   dateMidnightMicros,
+  arrayToStringValue,
   evalArrayFunc,
   evalDateArith,
   evalDateConvert,
@@ -1226,10 +1227,13 @@ function evalRegexFuncNode(e: Of<"regexFunc">, row: Row, env: EvalEnv, m: Meter)
     case "count":
       return intValue(BigInt(regexpCount(prog, matchCps, start0, m)));
     default: {
-      // substr / instr — both find the N-th match's subexpr span.
+      // substr / substring / instr — each finds the N-th match's subexpr span.
       const caps = regexpNthMatch(prog, matchCps, start0, nth, m);
-      const noMatch = (): Value => (e.func === "substr" ? nullValue() : intValue(0n));
+      const noMatch = (): Value => (e.func !== "instr" ? nullValue() : intValue(0n));
       if (caps === null) return noMatch();
+      // substring(text, text) reports the first capture group when the pattern has one, else the
+      // whole match (regex.md §8e).
+      if (e.func === "substring" && prog.ngroups > 0) subexpr = 1;
       // `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
       // or a non-participating group (-1) → NULL / 0.
       if (subexpr > prog.ngroups) return noMatch();
@@ -1237,7 +1241,7 @@ function evalRegexFuncNode(e: Of<"regexFunc">, row: Row, env: EvalEnv, m: Meter)
       const s2 = regexSlot(prog, caps, si);
       const e2 = regexSlot(prog, caps, si + 1);
       if (s2 < 0 || e2 < 0) return noMatch();
-      if (e.func === "substr") {
+      if (e.func !== "instr") {
         return { kind: "text", text: String.fromCodePoint(...origCps.slice(s2, e2)) };
       }
       // endoption 0 → first-char position, 1 → after-last-char (1-based).
@@ -2212,6 +2216,9 @@ function evalArrayFuncNode(e: Of<"arrayFunc">, row: Row, env: EvalEnv, m: Meter)
   m.charge(COSTS.operatorEval);
   const vals: Value[] = [];
   for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+  // array_to_string renders its elements in the session zone (an amplifier that charges itself,
+  // cost.md §8.1).
+  if (e.func === "array_to_string") return arrayToStringValue(vals, env.exec.session.timeZone, m);
   const out = evalArrayFunc(e.func, vals, m);
   // The builders are growth kernels (cost.md §8.1), free over constant operands.
   if (

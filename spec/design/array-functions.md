@@ -37,7 +37,8 @@
 > thresholds array (`suites/expr/width_bucket_array.test`, oracle-checked). §2.1 — the
 > **`anycompatible` widening** of the builders, the search/edit functions, and `||`: their element
 > type is the common type of the arguments, not one exact type (`suites/expr/array_compatible.test`,
-> capability `func.array_compatible`, oracle-checked).
+> capability `func.array_compatible`, oracle-checked). §15 — the **array ↔ text conversions**
+> `array_to_string` / `string_to_array` (`suites/expr/array_text_conversion.test`, oracle-checked).
 
 ## 1. Why a new layer
 
@@ -1031,3 +1032,52 @@ cross-core-identical, asserted with `# cost:` in the corpus.
 26. **`json` thresholds are a resolve-time `42883`.** PG raises the same code at execution (*"could
     not identify a comparison function for type json"*), so jed differs only when the operand is NULL
     (PG then returns NULL without looking for a comparator).
+
+## 15. `array_to_string` / `string_to_array` — the array ↔ text conversions
+
+PostgreSQL's two array/text converters, oracle-checked (`suites/expr/array_text_conversion.test`,
+capabilities `func.array_to_string` + `func.string_to_array`). Both resolve through a dedicated
+resolver ahead of the polymorphic path (§2): `array_to_string`'s `anyarray` slot binds no result
+type, and `string_to_array` has no polymorphic slot but a `text[]` result the scalar path cannot
+carry. Their text slots take a `text` hint, so a bare string literal, an untyped `NULL`, or a bare
+`$N` adapts to `text`; any other type is `42883`.
+
+### 15.1 Semantics
+
+- **`array_to_string(a, sep [, null_string])` → `text`.** Every element of `a`, flattened in
+  row-major order (so a multidimensional array joins all its elements), rendered as its type's
+  **output text** — PostgreSQL's element output function, not `array_out`'s quoting: a text
+  element is its characters (`a b`, `"q"`, `NULL` unquoted), a boolean `t`/`f` (`boolout`, not the
+  `bool → text` cast's `true`/`false`), a decimal keeps its scale, a `bytea` is `\x` hex, a
+  composite its record text, a `timestamptz` the session-zone render. The items are joined by
+  `sep`. A NULL element is skipped, or written as `null_string` when that is given and non-NULL
+  (an empty `null_string` still counts as an item, so its separators appear: `a,,c`). An empty
+  array is `''`. A NULL array or a NULL `sep` is NULL; a NULL `null_string` is the two-argument
+  form. Non-strict (`null = "none"`), as in PostgreSQL's three-argument form.
+- **`string_to_array(s, sep [, null_string])` → `text[]`.** `s` split at each non-overlapping
+  occurrence of `sep`, scanning left to right, as a one-dimensional `text[]` with lower bound 1
+  (`'a,b,,c'` → `{a,b,"",c}`, `'xx'` on `'x'` → `{"","",""}`). A NULL `sep` splits `s` into its
+  characters (code points); an empty `sep` keeps `s` as one element; an empty `s` is the empty
+  array `{}` whatever the separator. A piece equal to a non-NULL `null_string` becomes a NULL
+  element. A NULL `s` is NULL. Matching is exact code-point comparison (jed's `C` collation, so
+  no collation-sensitive matching arises).
+
+### 15.2 Errors
+
+An untyped `array_to_string` array operand (a bare `NULL`, string literal, or `$N`) cannot bind
+the polymorphic type: **`42804`**, PostgreSQL's code for it ("could not determine polymorphic type
+because input has type unknown"). A non-array first argument is `42883`. A result above
+`MAX_RESULT_CHARS` is `54000`.
+
+### 15.3 Cost
+
+One `operator_eval` for the node. `array_to_string` is an **amplifier** ([cost.md](cost.md) §8.1):
+the separator and the null string are repeated once per element, so an operand controls the
+output's multiple of the input. It charges `scalar_byte × payload(a)` for its input and guards,
+charges one `timezone` unit per finite `timestamptz` element it renders, renders each item (each is
+bounded by its element), computes the exact UTF-8 size of the joined result, rejects a size above
+`MAX_RESULT_CHARS` with `54000`, then charges `scalar_byte × size`, guards, and reserves `size`
+against the scalar allowance before joining. A NULL result charges nothing. `string_to_array`
+charges nothing beyond its `operator_eval`: its pieces partition the input, and turning the array
+back into text needs a covered renderer such as `array_to_string` (the "parsing text into an array"
+case of cost.md §8.1).

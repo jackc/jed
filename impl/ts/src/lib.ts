@@ -297,6 +297,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "func.regexp_substr",
   "func.regexp_instr",
   "func.regexp_split_to_array",
+  // The regex substring(text, text) / SUBSTRING(x FROM pattern) (regex.md §8e).
+  "func.substring_regex",
+  // The array <-> text conversions (array-functions.md §15).
+  "func.array_to_string",
+  "func.string_to_array",
   "func.regexp_matches",
   "func.regexp_split_to_table",
   // Array function surface AF3 (array-functions.md §9): the polymorphic SRF unnest(anyarray) — a

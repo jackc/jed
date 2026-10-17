@@ -23,6 +23,22 @@ SELECT uuidv4()
 ----
 975835de-1c97-46ce-bfc8-46100bfc1e42
 
+# --- gen_random_uuid: PostgreSQL's alias of uuidv4 — the same kernel, so the same draws ---------
+# seed: 1
+# cost: 2
+query T nosort
+SELECT gen_random_uuid()
+----
+910a2dec-8902-4cc1-beeb-8da1658eec67
+
+# two calls in one statement draw successively from the one source, exactly as two uuidv4() calls
+# seed: 1
+query TB nosort
+SELECT gen_random_uuid(), uuid_extract_version(gen_random_uuid()) = 4
+----
+910a2dec-8902-4cc1-beeb-8da1658eec67
+true
+
 # --- uuidv7: the injected clock is embedded as the 48-bit ms field; version 7, RFC variant ---
 # seed: 1
 # clock: 1721056591872000

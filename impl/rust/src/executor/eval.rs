@@ -1299,6 +1299,7 @@ impl RExpr {
                             flags = text(v);
                         }
                     }
+                    RegexFunc::Substring => {}
                     RegexFunc::Match
                     | RegexFunc::Like
                     | RegexFunc::SplitToArray
@@ -1392,7 +1393,8 @@ impl RExpr {
                     | RegexFunc::Like
                     | RegexFunc::SplitToArray
                     | RegexFunc::Matches
-                    | RegexFunc::SplitToTable => {}
+                    | RegexFunc::SplitToTable
+                    | RegexFunc::Substring => {}
                 }
                 // Validate flags: `i` and `g` are known, anything else is 2201B. Then (PG order) `g`
                 // on a function that does not take it — all but regexp_replace / regexp_matches — is
@@ -1490,24 +1492,33 @@ impl RExpr {
                     RegexFunc::Count => {
                         Ok(Value::Int(prog.regexp_count(&match_chars, start0, m)?))
                     }
-                    RegexFunc::Substr => match prog.nth_match(&match_chars, start0, nth, m)? {
-                        None => Ok(Value::Null),
-                        Some(caps) => {
-                            // `subexpr` selects the whole match (0) or a capture group; out of range
-                            // (> group count) or a non-participating group (-1) → NULL.
-                            if subexpr > prog.ngroups as i64 {
-                                return Ok(Value::Null);
+                    RegexFunc::Substr | RegexFunc::Substring => {
+                        match prog.nth_match(&match_chars, start0, nth, m)? {
+                            None => Ok(Value::Null),
+                            Some(caps) => {
+                                // substring(text, text) reports the first capture group when the
+                                // pattern has one, else the whole match (regex.md §8d).
+                                let subexpr = if matches!(func, RegexFunc::Substring) {
+                                    i64::from(prog.ngroups > 0)
+                                } else {
+                                    subexpr
+                                };
+                                // `subexpr` selects the whole match (0) or a capture group; out of range
+                                // (> group count) or a non-participating group (-1) → NULL.
+                                if subexpr > prog.ngroups as i64 {
+                                    return Ok(Value::Null);
+                                }
+                                let si = 2 * subexpr as usize;
+                                let (s2, e2) = (prog.slot(&caps, si), prog.slot(&caps, si + 1));
+                                if s2 < 0 || e2 < 0 {
+                                    return Ok(Value::Null);
+                                }
+                                Ok(Value::Text(
+                                    orig_chars[s2 as usize..e2 as usize].iter().collect(),
+                                ))
                             }
-                            let si = 2 * subexpr as usize;
-                            let (s2, e2) = (prog.slot(&caps, si), prog.slot(&caps, si + 1));
-                            if s2 < 0 || e2 < 0 {
-                                return Ok(Value::Null);
-                            }
-                            Ok(Value::Text(
-                                orig_chars[s2 as usize..e2 as usize].iter().collect(),
-                            ))
                         }
-                    },
+                    }
                     RegexFunc::Instr => match prog.nth_match(&match_chars, start0, nth, m)? {
                         None => Ok(Value::Int(0)),
                         Some(caps) => {
@@ -3043,6 +3054,11 @@ impl RExpr {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(a.eval(row, env, m)?);
+                }
+                // array_to_string renders its elements in the session zone (an amplifier that
+                // charges itself, cost.md §8.1).
+                if matches!(func, ArrayFunc::ArrayToString) {
+                    return array_to_string_value(&vals, &env.exec.session.time_zone, m);
                 }
                 let out = eval_array_func(func, &vals, m)?;
                 // The builders are growth kernels (cost.md §8.1), free over constant operands.

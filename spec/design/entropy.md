@@ -88,6 +88,9 @@ seam's random source via the fill contract (§2); under the provided seeded sour
 splitmix64 stream serialized big-endian.
 
 ### uuidv4 — 122 random bits (16 bytes filled)
+`gen_random_uuid()` is PostgreSQL's older name for the same function: it resolves to the same
+kernel, so it draws the same bytes from the source and, under one seed, returns the same value.
+
 1. Fill `b[0..16]` from the random source. (Under the seeded source: draw 1 → bytes 0..7, draw 2 → bytes 8..15.)
 2. `b[6] = (b[6] & 0x0F) | 0x40`  — version 4.
 3. `b[8] = (b[8] & 0x3F) | 0x80`  — RFC 4122 variant.

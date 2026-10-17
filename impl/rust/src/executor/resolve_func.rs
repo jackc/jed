@@ -205,6 +205,19 @@ pub(crate) fn resolve_func_call(
             scope, &lname, args, star, distinct, filter, agg_order, agg, params,
         );
     }
+    // The array <-> text conversions (array-functions.md §15): array_to_string's anyarray slot binds
+    // no result type and string_to_array's text[] result is not scalar, so both have their own
+    // resolver (ahead of the generic polymorphic path, which cannot adapt their text slots).
+    if lname == "array_to_string" || lname == "string_to_array" {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_array_text_func(scope, &lname, args, agg, params);
+    }
     // The polymorphic array functions (array-functions.md §2) are also kind="function", so they
     // must be intercepted BEFORE the generic scalar path — their `anyarray`/`anyelement` slots need
     // §2 unification, which `lookup_scalar_overload`'s exact-family match cannot do.
@@ -471,6 +484,19 @@ pub(crate) fn resolve_regex_func(
             rargs.push(r);
         }
     }
+    regex_func_node(scope, func, flags_idx, rargs, params)
+}
+
+/// Build the [`RExpr::RegexFunc`] node over resolved arguments (source and pattern at 0 and 1, the
+/// flags at `flags_idx`): precompile a constant pattern and pick the result type. Shared by the
+/// regexp_* functions and the regex `substring(text, text)` overload (regex.md §8d).
+pub(crate) fn regex_func_node(
+    scope: &Scope,
+    func: RegexFunc,
+    flags_idx: Option<usize>,
+    rargs: Vec<RExpr>,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
     // Precompile a constant pattern (rargs[1]) once, folding it for a statically-constant `i` flag.
     let insensitive = match flags_idx.map(|i| &rargs[i]) {
         Some(RExpr::ConstText(f)) => Some(f.contains('i')),
@@ -495,7 +521,7 @@ pub(crate) fn resolve_regex_func(
         params.uncacheable = true;
     }
     let result = match func {
-        RegexFunc::Replace | RegexFunc::Substr => ResolvedType::Text,
+        RegexFunc::Replace | RegexFunc::Substr | RegexFunc::Substring => ResolvedType::Text,
         RegexFunc::Match | RegexFunc::SplitToArray | RegexFunc::SplitToTable => {
             ResolvedType::Array(Box::new(ResolvedType::Text))
         }
@@ -512,6 +538,66 @@ pub(crate) fn resolve_regex_func(
             args: rargs,
             program: program.map(Box::new),
             compile_charged: std::cell::Cell::new(false),
+        },
+        result,
+    ))
+}
+
+/// The 42804 PostgreSQL raises when array_to_string's anyarray operand is untyped.
+fn untyped_array_operand() -> EngineError {
+    EngineError::new(
+        SqlState::DatatypeMismatch,
+        "could not determine polymorphic type because input has type unknown",
+    )
+}
+
+/// Resolve `array_to_string(anyarray, text [, text])` / `string_to_array(text, text [, text])`
+/// (array-functions.md §15). The text slots take a `text` hint, so a bare string literal, an untyped
+/// NULL, or a bare `$N` adapts to text; any other type is 42883. array_to_string's first argument
+/// must be an array: an untyped operand there leaves the polymorphic type undetermined (42804,
+/// PostgreSQL), and a non-array is 42883.
+pub(crate) fn resolve_array_text_func(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(no_func_overload(name));
+    }
+    let to_string = name == "array_to_string";
+    let mut rargs = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        if i == 0 && to_string {
+            // An untyped operand (a bare string literal or `$N`) cannot bind the polymorphic type.
+            if matches!(a, Expr::Literal(Literal::Text(_), _) | Expr::Param(_)) {
+                return Err(untyped_array_operand());
+            }
+            let (r, t) = resolve(scope, a, None, agg, params)?;
+            match t {
+                ResolvedType::Array(_) => {}
+                ResolvedType::Null => return Err(untyped_array_operand()),
+                _ => return Err(no_func_overload(name)),
+            }
+            rargs.push(r);
+            continue;
+        }
+        let (r, t) = resolve(scope, a, Some(ScalarType::Text), agg, params)?;
+        if !matches!(t, ResolvedType::Text | ResolvedType::Null) {
+            return Err(no_func_overload(name));
+        }
+        rargs.push(r);
+    }
+    let result = if to_string {
+        ResolvedType::Text
+    } else {
+        ResolvedType::Array(Box::new(ResolvedType::Text))
+    };
+    Ok((
+        RExpr::ArrayFunc {
+            func: array_func_id(name),
+            args: rargs,
         },
         result,
     ))
@@ -926,6 +1012,11 @@ fn adopt_scalar_overload(
         } else {
             *t = resolved_type_of(st);
         }
+    }
+    // The regex overload substring(text, text) (regex.md §8d) runs on the RegexFunc node, which owns
+    // pattern precompilation and the regex cost units.
+    if name == "substring" && desc.arg_families == ["text", "text"] {
+        return regex_func_node(scope, RegexFunc::Substring, None, rargs, params);
     }
     // Catalog volatility is executable admission data. date_part's epoch overload
     // is refined by its constant field, without erasing dependencies of either child.
@@ -2103,6 +2194,8 @@ fn explain_array_func(func: &ArrayFunc) -> &str {
         ArrayFunc::ArrayCat => "array_cat",
         ArrayFunc::ArrayRemove => "array_remove",
         ArrayFunc::ArrayReplace => "array_replace",
+        ArrayFunc::ArrayToString => "array_to_string",
+        ArrayFunc::StringToArray => "string_to_array",
         ArrayFunc::ArrayPosition => "array_position",
         ArrayFunc::ArrayPositions => "array_positions",
         ArrayFunc::Contains => "contains",
@@ -2130,6 +2223,7 @@ pub(crate) fn explain_regex_func(func: RegexFunc) -> &'static str {
         RegexFunc::Like => "regexp_like",
         RegexFunc::Count => "regexp_count",
         RegexFunc::Substr => "regexp_substr",
+        RegexFunc::Substring => "substring",
         RegexFunc::Instr => "regexp_instr",
         RegexFunc::SplitToArray => "regexp_split_to_array",
         RegexFunc::Matches => "regexp_matches",

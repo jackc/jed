@@ -110,7 +110,7 @@ browser — the same engine, no file. Create one by calling the unified create c
 Everything a database takes from outside the engine, except its storage, arrives in one immutable
 **`Environment`** passed in the open/create options: the Unicode collation and casing data, the
 time-zone data, [host functions](../host-functions/), and the random and clock sources behind
-`uuidv4`/`uuidv7` and `now()`. Build it once with a builder and pass the same environment to every
+`uuidv4` (and its alias `gen_random_uuid`)/`uuidv7` and `now()`. Build it once with a builder and pass the same environment to every
 database that should share those inputs; omit it and the database gets a fresh, empty one (`C`
 collation and ASCII casing, `UTC` and fixed offsets, no host functions, OS randomness, the wall
 clock).

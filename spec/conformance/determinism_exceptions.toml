@@ -42,7 +42,7 @@ reason       = "The surface is deliberately hand-written in each independent cor
 # --- uuidv4: random generation on the entropy seam ---------------------------
 [[exception]]
 id           = "uuidv4-entropy"
-surface      = "uuidv4() (../design/entropy.md §3) — a random version-4 UUID"
+surface      = "uuidv4() and its alias gen_random_uuid() (../design/entropy.md §3) — a random version-4 UUID"
 class        = "B"
 drops        = []
 blast_radius = "the uuid result column; promotes to the row multiset / other columns ONLY if that uuid flows through a WHERE / ORDER BY...LIMIT / a key (uuid CAN be a primary key — that is the host's choice). On the INJECTED path (a `# seed:` directive injects the provided deterministic source) NOTHING is dropped: the spec'd splitmix64 source (entropy.md §2) makes the value byte-identical across Rust/Go/TS. In PRODUCTION the 16 bytes are drawn directly from the OS CSPRNG per call, so the value is non-deterministic AND unpredictable (not reconstructable from one sample) — only the random bytes vary; the bit layout (version/variant) stays in-contract."

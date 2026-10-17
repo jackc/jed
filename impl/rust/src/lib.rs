@@ -346,6 +346,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.regexp_split_to_array",
     "func.regexp_matches",
     "func.regexp_split_to_table",
+    // The regex substring(text, text) / SUBSTRING(x FROM pattern) (regex.md §8e).
+    "func.substring_regex",
+    // The array <-> text conversions (array-functions.md §15).
+    "func.array_to_string",
+    "func.string_to_array",
     // Array function surface AF3 (array-functions.md §9): the polymorphic SRF unnest(anyarray) — a
     // FROM-clause row source expanding an array into one row per element (functions.md §10).
     "func.unnest",
