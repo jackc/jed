@@ -1,8 +1,9 @@
 # Foreign keys inside a data-modifying (writable) WITH (spec/design/writable-cte.md §2,
-# constraints.md §6.4/§6.5). Every sub-statement READS the pre-statement snapshot, but a foreign key
-# is checked against the state the earlier sub-statements produced, like PostgreSQL's
-# end-of-statement RI checks: a parent a CTE inserts satisfies a child the primary writes, and a
-# parent a CTE deletes no longer does. Rows verified against the live PostgreSQL 18 oracle.
+# constraints.md §6.4/§6.5). Every sub-statement READS the pre-statement snapshot, but every foreign
+# key is checked at the end of the whole statement, against every sub-statement's writes, like
+# PostgreSQL's end-of-statement RI checks: a parent any part inserts satisfies a child any other part
+# writes, and a parent a part deletes no longer does. Rows verified against the live PostgreSQL 18
+# oracle.
 # requires: ddl.create_table, ddl.primary_key, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, dml.with_clause, query.select, query.where_eq, query.order_by, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32
 
 statement ok
@@ -88,3 +89,129 @@ SELECT id, pid FROM fc ORDER BY id
 4
 50
 5
+
+# Every foreign-key check waits for the end of the WHOLE statement (writable-cte.md §7, PostgreSQL's
+# end-of-statement RI triggers): a child a CTE inserts is satisfied by a parent a LATER CTE inserts.
+statement ok
+WITH c AS (INSERT INTO fc VALUES (60, 6)), p AS (INSERT INTO fp VALUES (6)) SELECT 1
+
+# ... or by the primary.
+statement ok
+WITH c AS (INSERT INTO fc VALUES (70, 7) RETURNING id) INSERT INTO fp VALUES (7)
+
+# A child re-pointed by a CTE at a parent a later CTE inserts.
+statement ok
+WITH u AS (UPDATE fc SET pid = 8 WHERE id = 50), p AS (INSERT INTO fp VALUES (8)) SELECT 1
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+4
+50
+8
+60
+6
+70
+7
+
+# A parent a CTE deletes while a LATER CTE re-points its last child elsewhere.
+statement ok
+WITH d AS (DELETE FROM fp WHERE id = 4), u AS (UPDATE fc SET pid = 1 WHERE pid = 4) SELECT 1
+
+# ... and while the primary deletes that child.
+statement ok
+WITH d AS (DELETE FROM fp WHERE id = 6) DELETE FROM fc WHERE pid = 6
+
+query I nosort
+SELECT id FROM fp ORDER BY id
+----
+1
+2
+3
+5
+7
+8
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+1
+50
+8
+70
+7
+
+# A parent a later CTE deletes no longer satisfies a child an earlier CTE inserts.
+statement error 23503
+WITH c AS (INSERT INTO fc VALUES (80, 2)), d AS (DELETE FROM fp WHERE id = 2) SELECT 1
+
+# A parent no sub-statement supplies still fails at the end of the statement.
+statement error 23503
+WITH c AS (INSERT INTO fc VALUES (80, 99)), p AS (INSERT INTO fp VALUES (9)) SELECT 1
+
+# A deferred foreign-key check runs after every other constraint: a later sub-statement's duplicate
+# key is reported first.
+statement error 23505
+WITH c AS (INSERT INTO fc VALUES (80, 99)), p AS (INSERT INTO fp VALUES (1)) SELECT 1
+
+# ... nothing changed.
+query I nosort
+SELECT id FROM fp ORDER BY id
+----
+1
+2
+3
+5
+7
+8
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+1
+50
+8
+70
+7
+
+# Referential actions run with the sub-statement that fires them; only the checks wait. A child the
+# primary inserts at a parent a CTE deletes (cascading its existing children) is still an orphan.
+statement ok
+CREATE TABLE ap (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE ac (id i32 PRIMARY KEY, pid i32 REFERENCES ap ON DELETE CASCADE ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO ap VALUES (1), (2), (3)
+
+statement ok
+INSERT INTO ac VALUES (1, 1), (2, 2)
+
+statement error 23503
+WITH d AS (DELETE FROM ap WHERE id = 1) INSERT INTO ac VALUES (100, 1)
+
+statement error 23503
+WITH u AS (UPDATE ap SET id = 20 WHERE id = 2) INSERT INTO ac VALUES (101, 2)
+
+statement ok
+WITH u AS (UPDATE ap SET id = 20 WHERE id = 2) INSERT INTO ac VALUES (101, 3)
+
+query II rowsort
+SELECT id, pid FROM ac
+----
+1
+1
+101
+3
+2
+20
+
+# A documented divergence (writable-cte.md §7): PostgreSQL runs the referenced CTE first and fires
+# its cascade at the end of the statement, deleting the new child too; jed's cascade ran with the
+# DELETE, before the child existed, so the child is an orphan.
+statement error 23503
+WITH d AS (DELETE FROM ap WHERE id = 1 RETURNING id) INSERT INTO ac SELECT 100, id FROM d

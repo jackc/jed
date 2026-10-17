@@ -369,9 +369,10 @@ Every part of the statement reads **one pre-statement snapshot** — of every ta
 temporary and attached-database tables included — so the parts cannot see each other's effects on
 the target tables, and data crosses only through a CTE's `RETURNING` buffer (`SELECT count(*) FROM
 inbox` next to the `DELETE` above still sees the rows). The data-modifying parts run once each, in
-order, and the whole statement is one all-or-nothing transaction. Foreign keys are checked against
-the earlier parts' writes: a parent row a CTE inserts satisfies a child row the statement inserts
-after it.
+order, and the whole statement is one all-or-nothing transaction. As in PostgreSQL, foreign keys are
+checked once, at the end of the whole statement, against every part's writes: a parent row any part
+inserts satisfies a child row any other part inserts, before or after it. Referential actions such
+as `ON DELETE CASCADE` run with the part that fires them.
 
 ### Recursive CTEs (`WITH RECURSIVE`)
 

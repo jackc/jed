@@ -679,8 +679,13 @@ func (db *engine) executeWithDml(wq *withQuery, params []Value) (outcome, error)
 	// each pin equals that domain's working state. Cleared on every exit path so the next statement
 	// reads normally.
 	db.session.readPin = db.captureReadPin()
+	// Every foreign-key check waits for the end of the whole statement (§7), then runs against the
+	// working state every sub-statement produced, in the order the checks were queued.
+	db.session.fkStatementDefer = true
 	out, err := db.runWithDml(wq, params)
 	db.session.readPin = nil
+	db.session.fkStatementDefer = false
+	db.session.fkDeferredChecks = nil
 	return out, err
 }
 
@@ -824,8 +829,14 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	case wq.Body.Delete != nil:
 		db.explainActual.record("Delete "+wq.Body.Delete.Table, out.Cost)
 	}
+	// (5) Settle every foreign-key check the parts queued, against the end state of the whole
+	//     statement (§7). A parent-side reverse match is metered (constraints.md §6.11).
+	fkMeter := db.session.newMeter()
+	if err := db.flushFkDeferredChecks(fkMeter); err != nil {
+		return outcome{}, err
+	}
 	releaseCteBuffers(db.session.queryAccount(), buffers)
-	out = addOutcomeCost(out, totalCost)
+	out = addOutcomeCost(out, totalCost+fkMeter.Accrued)
 	db.explainActual.recordParent("WITH", out.Cost)
 	return out, nil
 }

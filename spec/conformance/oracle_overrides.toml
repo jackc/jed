@@ -1889,3 +1889,8 @@ reason = "jed validates a re-keying DO UPDATE against the statement's END STATE 
 file = "types/interval_qualifier.test"
 sql = "SELECT interval '90:30' minute to second"
 reason = "jed: under MINUTE TO SECOND, `90:30` reads as 90 minutes 30 seconds and a minutes field past 59 is an interval field overflow, reported with jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. The same documented code divergence as `100000000000 years`."
+
+[[override]]
+file = "cte/data_modifying_foreign_key.test"
+sql = "WITH d AS (DELETE FROM ap WHERE id = 1 RETURNING id) INSERT INTO ac SELECT 100, id FROM d"
+reason = "jed: inside a data-modifying WITH the foreign-key CHECKS wait for the end of the statement, but referential ACTIONS run with the sub-statement that fires them (writable-cte.md §7). The DELETE's ON DELETE CASCADE runs before the primary inserts child 100, so child 100 is an orphan at the end of the statement (23503). PostgreSQL fires the cascade as an end-of-statement trigger, after the insert, so it deletes child 100 as well and the statement succeeds. PostgreSQL leaves the sub-statement order unspecified; jed's deterministic order runs actions in place."

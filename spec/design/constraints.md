@@ -652,6 +652,12 @@ local columns** (otherwise the value is unchanged and still valid — the same s
 maintenance uses, indexes.md §4). The check runs on the post-assignment row, in UPDATE's phase 1,
 against the **committed parent state plus the statement's end state**, exactly as INSERT.
 
+**Inside a data-modifying `WITH`.** Each sub-statement still validates its own batch, but the stored
+probe — and a MATCH FULL rejection — is queued instead of settled, together with the parent-side
+`NO ACTION`/`RESTRICT` searches of §6.5; the queue is settled in order once the whole statement has
+run, against the working state every sub-statement produced (PostgreSQL's end-of-statement RI
+triggers; [writable-cte.md](writable-cte.md) §7). Referential actions (§6.6) are not deferred.
+
 ### 6.5 Enforcement — the parent side (DELETE / UPDATE of the referenced table)
 
 A parent mutation must not leave a child pointing at a key that no longer exists. The directly

@@ -64,18 +64,33 @@ pub(crate) type ValueExprs = Vec<Vec<Option<RExpr>>>;
 
 const MAX_FK_ACTION_DEPTH: usize = 256;
 
-/// One inbound NO ACTION/RESTRICT probe saved until every generated write in the recursive closure
-/// has finished. `update` means the old parent key must first be re-probed in the final state.
-pub(super) struct FkDeferredCheck {
-    parent: Table,
-    child_table: String,
-    fk: ForeignKeyConstraint,
-    probe: FkProbe,
-    /// The parent tuple in FK slot order, for the child-key reverse probe.
-    values: Vec<Value>,
-    update: bool,
-    /// The FK's domain (session-local temp or main — temp-tables.md §8).
-    temp: bool,
+/// One foreign-key check saved for later. A [`FkDeferredCheck::Parent`] is an inbound NO
+/// ACTION/RESTRICT probe saved until every generated write in the recursive closure has finished
+/// (constraints.md §6.6). Inside a data-modifying `WITH`, every check — child-side existence and
+/// MATCH FULL included — waits for the end of the whole statement (writable-cte.md §7).
+pub(super) enum FkDeferredCheck {
+    /// `update` means the old parent key must first be re-probed in the final state.
+    Parent {
+        parent: Table,
+        child_table: String,
+        fk: ForeignKeyConstraint,
+        probe: FkProbe,
+        /// The parent tuple in FK slot order, for the child-key reverse probe.
+        values: Vec<Value>,
+        update: bool,
+        /// The FK's domain (session-local temp or main — temp-tables.md §8).
+        temp: bool,
+    },
+    /// A child row's existence check (constraints.md §6.4). `probe` is `None` when MATCH FULL
+    /// rejects the row's partly-NULL tuple (§6.3).
+    Child {
+        relation: String,
+        columns: Vec<Column>,
+        fk: ForeignKeyConstraint,
+        probe: Option<FkProbe>,
+        row: Row,
+        temp: bool,
+    },
 }
 
 impl Engine {
@@ -1512,14 +1527,14 @@ impl Engine {
                 let Some(probe) = fk_probe(fk, parent, &parent_colls, row, &fk.columns)? else {
                     // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
                     if fk_match_full_violated(fk, row) {
-                        return Err(EngineError::fk_violation_match_full(&relation, &fk.name));
+                        self.fk_child_check(&relation, columns, fk, None, row, fk_temp)?;
                     }
                     continue;
                 };
                 if batch.contains(probe.bytes()) {
                     continue;
                 }
-                self.validate_insert_fk_stored(&relation, columns, fk, &probe, row, fk_temp)?;
+                self.fk_child_check(&relation, columns, fk, Some(probe), row, fk_temp)?;
             }
         }
 
@@ -1713,14 +1728,14 @@ impl Engine {
             let Some(probe) = fk_probe(&fk, parent, &parent_colls, &row, &fk.columns)? else {
                 // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
                 if fk_match_full_violated(&fk, &row) {
-                    return Err(EngineError::fk_violation_match_full(&relation, &fk.name));
+                    self.fk_child_check(&relation, columns, &fk, None, &row, fk_temp)?;
                 }
                 continue;
             };
             if supplied.as_deref() == Some(probe.bytes()) {
                 continue;
             }
-            self.validate_insert_fk_stored(&relation, columns, &fk, &probe, &row, fk_temp)?;
+            self.fk_child_check(&relation, columns, &fk, Some(probe), &row, fk_temp)?;
         }
 
         self.validate_exclusions(table, &relation, &[&row], &HashSet::new())?;
@@ -2366,17 +2381,14 @@ impl Engine {
                 let Some(probe) = fk_probe(fk, parent, &parent_colls, row, &fk.columns)? else {
                     // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
                     if fk_match_full_violated(fk, row) {
-                        return Err(EngineError::fk_violation_match_full(&relation, &fk.name));
+                        self.fk_child_check(&relation, columns, fk, None, row, fk_temp)?;
                     }
                     continue;
                 };
                 if batch.contains(probe.bytes()) {
                     continue;
                 }
-                if !self.fk_probe_hits(&probe, &fk.ref_table, fk_temp)? {
-                    return Err(EngineError::fk_violation_insert(&relation, &fk.name)
-                        .with_detail(self.fk_child_detail(&relation, columns, fk, row)));
-                }
+                self.fk_child_check(&relation, columns, fk, Some(probe), row, fk_temp)?;
             }
         }
 
@@ -2580,25 +2592,6 @@ impl Engine {
             self.fk_domain(db_scope, table),
         )?;
         Ok((affected, returned))
-    }
-
-    /// Complete one INSERT child-side FK check after the caller has handled this statement's
-    /// end-state match. Shared by the batch and one-row paths so the stored-probe violation stays
-    /// identical (constraints.md §6.4/§7).
-    fn validate_insert_fk_stored(
-        &self,
-        relation: &str,
-        columns: &[Column],
-        fk: &ForeignKeyConstraint,
-        probe: &FkProbe,
-        row: &Row,
-        temp: bool,
-    ) -> Result<()> {
-        if !self.fk_probe_hits(probe, &fk.ref_table, temp)? {
-            return Err(EngineError::fk_violation_insert(relation, &fk.name)
-                .with_detail(self.fk_child_detail(relation, columns, fk, row)));
-        }
-        Ok(())
     }
 
     /// Resolve a table's `EXCLUDE` constraints for one statement (spec/design/gist.md §7): each
@@ -3292,35 +3285,107 @@ impl Engine {
         )
     }
 
-    /// Validate every deferred inbound edge after the recursive write closure reaches a fixed
-    /// point. Taking the queue avoids borrowing session state while probing the final snapshot.
-    fn flush_fk_deferred_checks(&mut self, meter: &mut Meter) -> Result<()> {
-        let checks = std::mem::take(&mut self.session.fk_deferred_checks);
+    /// Validate every deferred check after the recursive write closure reaches a fixed point (or,
+    /// inside a data-modifying `WITH`, after the whole statement — writable-cte.md §7), in queue
+    /// order. Taking the queue avoids borrowing session state while probing the final snapshot.
+    pub(crate) fn flush_fk_deferred_checks(&mut self, meter: &mut Meter) -> Result<()> {
+        let checks = std::mem::take(&mut *self.session.fk_deferred_checks.borrow_mut());
         for check in checks {
-            if check.update && self.fk_probe_hits(&check.probe, &check.parent.name, check.temp)? {
-                continue;
+            match check {
+                FkDeferredCheck::Child {
+                    relation,
+                    columns,
+                    fk,
+                    probe,
+                    row,
+                    temp,
+                } => self.fk_child_verdict(&relation, &columns, &fk, probe.as_ref(), &row, temp)?,
+                FkDeferredCheck::Parent {
+                    parent,
+                    child_table,
+                    fk,
+                    probe,
+                    values,
+                    update,
+                    temp,
+                } => {
+                    if update && self.fk_probe_hits(&probe, &parent.name, temp)? {
+                        continue;
+                    }
+                    if self.fk_child_references(
+                        &child_table,
+                        &fk,
+                        &parent,
+                        &values,
+                        probe.bytes(),
+                        temp,
+                        meter,
+                    )? {
+                        return Err(EngineError::fk_violation_delete(
+                            &parent.name,
+                            &fk.name,
+                            &child_table,
+                        )
+                        .with_detail(self.fk_parent_detail(
+                            &parent,
+                            &fk,
+                            &child_table,
+                            &values,
+                        )));
+                    }
+                }
             }
-            if self.fk_child_references(
-                &check.child_table,
-                &check.fk,
-                &check.parent,
-                &check.values,
-                check.probe.bytes(),
-                check.temp,
-                meter,
-            )? {
-                return Err(EngineError::fk_violation_delete(
-                    &check.parent.name,
-                    &check.fk.name,
-                    &check.child_table,
-                )
-                .with_detail(self.fk_parent_detail(
-                    &check.parent,
-                    &check.fk,
-                    &check.child_table,
-                    &check.values,
-                )));
-            }
+        }
+        Ok(())
+    }
+
+    /// Settle one child row's foreign-key check (constraints.md §6.4) once the caller has handled
+    /// this statement's own batch: `probe` is the row's parent probe, or `None` when MATCH FULL
+    /// rejects a partly-NULL tuple (§6.3). Inside a data-modifying `WITH` the check is queued for
+    /// the end of the whole statement instead, so a parent a LATER sub-statement writes satisfies it
+    /// (writable-cte.md §7).
+    pub(crate) fn fk_child_check(
+        &self,
+        relation: &str,
+        columns: &[Column],
+        fk: &ForeignKeyConstraint,
+        probe: Option<FkProbe>,
+        row: &Row,
+        temp: bool,
+    ) -> Result<()> {
+        if self.session.fk_statement_defer {
+            self.session
+                .fk_deferred_checks
+                .borrow_mut()
+                .push(FkDeferredCheck::Child {
+                    relation: relation.to_string(),
+                    columns: columns.to_vec(),
+                    fk: fk.clone(),
+                    probe,
+                    row: row.clone(),
+                    temp,
+                });
+            return Ok(());
+        }
+        self.fk_child_verdict(relation, columns, fk, probe.as_ref(), row, temp)
+    }
+
+    /// The immediate child-side verdict behind [`fk_child_check`](Engine::fk_child_check).
+    fn fk_child_verdict(
+        &self,
+        relation: &str,
+        columns: &[Column],
+        fk: &ForeignKeyConstraint,
+        probe: Option<&FkProbe>,
+        row: &Row,
+        temp: bool,
+    ) -> Result<()> {
+        let Some(probe) = probe else {
+            return Err(EngineError::fk_violation_match_full(relation, &fk.name));
+        };
+        if !self.fk_probe_hits(probe, &fk.ref_table, temp)? {
+            return Err(EngineError::fk_violation_insert(relation, &fk.name)
+                .with_detail(self.fk_child_detail(relation, columns, fk, row)));
         }
         Ok(())
     }
@@ -3362,10 +3427,12 @@ impl Engine {
         let Some(temp) = domain else {
             return Ok(());
         };
-        let root = self.session.fk_action_depth == 0;
+        // Inside a data-modifying WITH the checks wait for the end of the whole statement
+        // (writable-cte.md §7); otherwise the outermost closure settles them.
+        let root = self.session.fk_action_depth == 0 && !self.session.fk_statement_defer;
         if root {
             assert!(
-                self.session.fk_deferred_checks.is_empty(),
+                self.session.fk_deferred_checks.borrow().is_empty(),
                 "foreign-key deferred-check queue leaked across statements"
             );
         }
@@ -3401,15 +3468,18 @@ impl Engine {
                     else {
                         continue;
                     };
-                    self.session.fk_deferred_checks.push(FkDeferredCheck {
-                        parent: parent.clone(),
-                        child_table: child_name.clone(),
-                        fk: fk.clone(),
-                        probe,
-                        values: fk.ref_columns.iter().map(|&i| row[i].clone()).collect(),
-                        update: false,
-                        temp,
-                    });
+                    self.session
+                        .fk_deferred_checks
+                        .borrow_mut()
+                        .push(FkDeferredCheck::Parent {
+                            parent: parent.clone(),
+                            child_table: child_name.clone(),
+                            fk: fk.clone(),
+                            probe,
+                            values: fk.ref_columns.iter().map(|&i| row[i].clone()).collect(),
+                            update: false,
+                            temp,
+                        });
                 }
             }
             Ok(())
@@ -3419,7 +3489,7 @@ impl Engine {
         }
         self.session.read_pin = saved_pin;
         if root {
-            self.session.fk_deferred_checks.clear();
+            self.session.fk_deferred_checks.borrow_mut().clear();
         }
         result
     }
@@ -3439,10 +3509,12 @@ impl Engine {
         let Some(temp) = domain else {
             return Ok(());
         };
-        let root = self.session.fk_action_depth == 0;
+        // Inside a data-modifying WITH the checks wait for the end of the whole statement
+        // (writable-cte.md §7); otherwise the outermost closure settles them.
+        let root = self.session.fk_action_depth == 0 && !self.session.fk_statement_defer;
         if root {
             assert!(
-                self.session.fk_deferred_checks.is_empty(),
+                self.session.fk_deferred_checks.borrow().is_empty(),
                 "foreign-key deferred-check queue leaked across statements"
             );
         }
@@ -3499,15 +3571,18 @@ impl Engine {
                     {
                         continue;
                     }
-                    self.session.fk_deferred_checks.push(FkDeferredCheck {
-                        parent: parent.clone(),
-                        child_table: child_name.clone(),
-                        fk: fk.clone(),
-                        probe: old_probe,
-                        values: fk.ref_columns.iter().map(|&i| old_row[i].clone()).collect(),
-                        update: true,
-                        temp,
-                    });
+                    self.session
+                        .fk_deferred_checks
+                        .borrow_mut()
+                        .push(FkDeferredCheck::Parent {
+                            parent: parent.clone(),
+                            child_table: child_name.clone(),
+                            fk: fk.clone(),
+                            probe: old_probe,
+                            values: fk.ref_columns.iter().map(|&i| old_row[i].clone()).collect(),
+                            update: true,
+                            temp,
+                        });
                 }
             }
             Ok(())
@@ -3517,7 +3592,7 @@ impl Engine {
         }
         self.session.read_pin = saved_pin;
         if root {
-            self.session.fk_deferred_checks.clear();
+            self.session.fk_deferred_checks.borrow_mut().clear();
         }
         result
     }
@@ -4411,17 +4486,20 @@ impl Engine {
                 let Some(probe) = fk_probe(fk, parent, &parent_colls, new_row, &fk.columns)? else {
                     // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
                     if fk_match_full_violated(fk, new_row) {
-                        return Err(EngineError::fk_violation_match_full(&relation, &fk.name));
+                        let columns = self.relation_columns(upd.db.as_deref(), &upd.table);
+                        self.fk_child_check(&relation, &columns, fk, None, new_row, fk_temp)?;
                     }
                     continue;
                 };
                 if batch.contains(probe.bytes()) {
                     continue;
                 }
-                if !self.fk_probe_hits(&probe, &fk.ref_table, fk_temp)? {
+                // The column list is built only when it can be needed (a queued check or a miss).
+                if self.session.fk_statement_defer
+                    || !self.fk_probe_hits(&probe, &fk.ref_table, fk_temp)?
+                {
                     let columns = self.relation_columns(upd.db.as_deref(), &upd.table);
-                    return Err(EngineError::fk_violation_insert(&relation, &fk.name)
-                        .with_detail(self.fk_child_detail(&relation, &columns, fk, new_row)));
+                    self.fk_child_check(&relation, &columns, fk, Some(probe), new_row, fk_temp)?;
                 }
             }
         }

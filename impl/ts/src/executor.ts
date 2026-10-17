@@ -1922,6 +1922,35 @@ function locateLit(iv: InsertValue, e: unknown): unknown {
 const ZERO_STORAGE_KEY = new Uint8Array(8);
 const EMPTY_STORAGE_KEY = new Uint8Array(0);
 
+
+// FkDeferredCheck is one foreign-key check saved for later. A "parent" entry is an inbound NO
+// ACTION/RESTRICT probe saved until every generated write in the recursive closure has finished
+// (constraints.md §6.6); `update` means the old parent key must first be re-probed in the final
+// state. A "child" entry is a child row's existence check (§6.4), its probe null when MATCH FULL
+// rejects a partly-NULL tuple (§6.3); it is deferred only inside a data-modifying WITH, where every
+// check waits for the end of the whole statement (writable-cte.md §7).
+type FkDeferredCheck =
+  | {
+      kind: "parent";
+      parent: Table;
+      childTable: string;
+      fk: ForeignKey;
+      probe: FkProbe;
+      // The parent tuple in FK slot order, for the child-key reverse probe.
+      values: Value[];
+      update: boolean;
+      // The FK's domain (session-local temp or main — temp-tables.md §8).
+      temp: boolean;
+    }
+  | {
+      kind: "child";
+      relation: string;
+      columns: Column[];
+      fk: ForeignKey;
+      probe: FkProbe | null;
+      row: Row;
+      temp: boolean;
+    };
 export class Engine {
   commitChanges = { main: false, attached: false };
   // The last committed, immutable state — what fresh readers (and autocommit reads) see.
@@ -2088,19 +2117,14 @@ export class Engine {
   // The FROM relations hidden from the derived bodies being planned right now, innermost last
   // (spec/design/error-fields.md §11.8). Read only to build a hint.
   unseenFrames: UnseenFrame[] = [];
-  // Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
-  // reached its fixed point (§6.6). Empty between statements.
-  private fkDeferredChecks: {
-    parent: Table;
-    childTable: string;
-    fk: ForeignKey;
-    probe: FkProbe;
-    // The parent tuple in FK slot order, for the child-key reverse probe.
-    values: Value[];
-    update: boolean;
-    // The FK's domain (session-local temp or main — temp-tables.md §8).
-    temp: boolean;
-  }[] = [];
+  // Foreign-key checks deferred until the outermost recursive action closure has reached its fixed
+  // point (§6.6) or, inside a data-modifying WITH, until the whole statement has run
+  // (writable-cte.md §7). Empty between statements.
+  private fkDeferredChecks: FkDeferredCheck[] = [];
+  // Set while a data-modifying WITH runs its sub-statements: every foreign-key check is then queued
+  // in fkDeferredChecks and settled against the end state of the whole statement, PostgreSQL's
+  // end-of-statement RI-trigger timing (writable-cte.md §7).
+  private fkStatementDefer = false;
 
   // environment is the handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one
   // (§7). Every session minted over this engine receives it.
@@ -12282,11 +12306,12 @@ export class Engine {
         const probe = fkProbe(fk, parent, parentColls, pr.row, fk.columns);
         if (probe === null) {
           // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
-          if (fkMatchFullViolated(fk, pr.row)) throw fkViolationMatchFull(relation, fk.name);
+          if (fkMatchFullViolated(fk, pr.row))
+            this.fkChildCheck(relation, table.columns, fk, null, pr.row, fkTemp);
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        this.validateInsertFkStored(relation, table.columns, fk, probe, pr.row, fkTemp);
+        this.fkChildCheck(relation, table.columns, fk, probe, pr.row, fkTemp);
       }
     }
 
@@ -12460,13 +12485,14 @@ export class Engine {
       const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
       if (probe === null) {
         // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
-        if (fkMatchFullViolated(fk, row)) throw fkViolationMatchFull(relation, fk.name);
+        if (fkMatchFullViolated(fk, row))
+          this.fkChildCheck(relation, table.columns, fk, null, row, fkTemp);
         continue;
       }
       if (supplied !== null && cmpBytes(fkProbeBytes(supplied), fkProbeBytes(probe)) === 0) {
         continue;
       }
-      this.validateInsertFkStored(relation, table.columns, fk, probe, row, fkTemp);
+      this.fkChildCheck(relation, table.columns, fk, probe, row, fkTemp);
     }
 
     this.validateExclusions(dbScope, this.table(table.name) ?? table, [row], new Set<string>());
@@ -12504,16 +12530,36 @@ export class Engine {
     return returned;
   }
 
-  // Complete one child-side FK check after the caller handles the statement end-state match. The
-  // batch and one-row paths share the stored probe and violation construction.
-  private validateInsertFkStored(
+  // fkChildCheck settles one child row's foreign-key check (constraints.md §6.4) once the caller has
+  // handled this statement's own batch: probe is the row's parent probe, or null when MATCH FULL
+  // rejects a partly-NULL tuple (§6.3). Inside a data-modifying WITH the check is queued for the end
+  // of the whole statement instead, so a parent a LATER sub-statement writes satisfies it
+  // (writable-cte.md §7).
+  private fkChildCheck(
     relation: string,
     columns: Column[],
     fk: ForeignKey,
-    probe: FkProbe,
+    probe: FkProbe | null,
     row: Row,
     temp: boolean,
   ): void {
+    if (this.fkStatementDefer) {
+      this.fkDeferredChecks.push({ kind: "child", relation, columns, fk, probe, row, temp });
+      return;
+    }
+    this.fkChildVerdict(relation, columns, fk, probe, row, temp);
+  }
+
+  // fkChildVerdict is the immediate child-side verdict behind fkChildCheck.
+  private fkChildVerdict(
+    relation: string,
+    columns: Column[],
+    fk: ForeignKey,
+    probe: FkProbe | null,
+    row: Row,
+    temp: boolean,
+  ): void {
+    if (probe === null) throw fkViolationMatchFull(relation, fk.name);
     if (!this.fkProbeHits(probe, fk.refTable, temp))
       throw fkViolationInsert(relation, fk.name).withDetail(
         fkChildDetail(this.session, relation, columns, fk, row),
@@ -13257,15 +13303,12 @@ export class Engine {
         const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
         if (probe === null) {
           // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
-          if (fkMatchFullViolated(fk, row)) throw fkViolationMatchFull(relation, fk.name);
+          if (fkMatchFullViolated(fk, row))
+            this.fkChildCheck(relation, table.columns, fk, null, row, fkTemp);
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        if (!this.fkProbeHits(probe, fk.refTable, fkTemp)) {
-          throw fkViolationInsert(relation, fk.name).withDetail(
-            fkChildDetail(this.session, relation, table.columns, fk, row),
-          );
-        }
+        this.fkChildCheck(relation, table.columns, fk, probe, row, fkTemp);
       }
     }
 
@@ -13594,12 +13637,24 @@ export class Engine {
     );
   }
 
-  // flushFkDeferredChecks validates the complete recursive closure. The queue order is the
-  // deterministic depth-first action visitation order; no check can enqueue more work.
+  // flushFkDeferredChecks validates the complete recursive closure (or, inside a data-modifying WITH,
+  // the whole statement — writable-cte.md §7). The queue order is the deterministic depth-first
+  // action visitation order; no check can enqueue more work.
   private flushFkDeferredChecks(meter: Meter): void {
     const checks = this.fkDeferredChecks;
     this.fkDeferredChecks = [];
     for (const check of checks) {
+      if (check.kind === "child") {
+        this.fkChildVerdict(
+          check.relation,
+          check.columns,
+          check.fk,
+          check.probe,
+          check.row,
+          check.temp,
+        );
+        continue;
+      }
       if (check.update && this.fkProbeHits(check.probe, check.parent.name, check.temp)) continue;
       if (
         this.fkChildReferences(
@@ -13641,7 +13696,9 @@ export class Engine {
     // An attached-database table has no foreign keys (attached-databases.md §8).
     if (domain === null) return;
     const temp = domain;
-    const root = this.session.fkActionDepth === 0;
+    // Inside a data-modifying WITH the checks wait for the end of the whole statement
+    // (writable-cte.md §7); otherwise the outermost closure settles them.
+    const root = this.session.fkActionDepth === 0 && !this.fkStatementDefer;
     if (root && this.fkDeferredChecks.length !== 0) {
       throw new Error("foreign-key deferred-check queue leaked across statements");
     }
@@ -13667,6 +13724,7 @@ export class Engine {
           const probe = fkProbe(fk, parent, parentColls, row, fk.refColumns);
           if (probe !== null) {
             this.fkDeferredChecks.push({
+              kind: "parent",
               parent,
               childTable,
               fk,
@@ -13695,7 +13753,9 @@ export class Engine {
     // An attached-database table has no foreign keys (attached-databases.md §8).
     if (domain === null) return;
     const temp = domain;
-    const root = this.session.fkActionDepth === 0;
+    // Inside a data-modifying WITH the checks wait for the end of the whole statement
+    // (writable-cte.md §7); otherwise the outermost closure settles them.
+    const root = this.session.fkActionDepth === 0 && !this.fkStatementDefer;
     if (root && this.fkDeferredChecks.length !== 0) {
       throw new Error("foreign-key deferred-check queue leaked across statements");
     }
@@ -13729,6 +13789,7 @@ export class Engine {
           const newProbe = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
           if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))) continue;
           this.fkDeferredChecks.push({
+            kind: "parent",
             parent,
             childTable,
             fk,
@@ -14418,15 +14479,12 @@ export class Engine {
         const probe = fkProbe(fk, parent, parentColls, u.row, fk.columns);
         if (probe === null) {
           // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
-          if (fkMatchFullViolated(fk, u.row)) throw fkViolationMatchFull(relation, fk.name);
+          if (fkMatchFullViolated(fk, u.row))
+            this.fkChildCheck(relation, table.columns, fk, null, u.row, fkTemp);
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        if (!this.fkProbeHits(probe, fk.refTable, fkTemp)) {
-          throw fkViolationInsert(relation, fk.name).withDetail(
-            fkChildDetail(this.session, relation, table.columns, fk, u.row),
-          );
-        }
+        this.fkChildCheck(relation, table.columns, fk, probe, u.row, fkTemp);
       }
     }
 
@@ -15110,10 +15168,15 @@ export class Engine {
     // each pin equals that domain's working state. Cleared on every exit path so the next statement
     // reads normally.
     this.session.readPin = this.captureReadPin();
+    // Every foreign-key check waits for the end of the whole statement (§7), then runs against the
+    // working state every sub-statement produced, in the order the checks were queued.
+    this.fkStatementDefer = true;
     try {
       return this.runWithDml(wq, params);
     } finally {
       this.session.readPin = null;
+      this.fkStatementDefer = false;
+      this.fkDeferredChecks = [];
     }
   }
 
@@ -15239,8 +15302,12 @@ export class Engine {
       this.recordExplainActual("Update " + body.table, outcome.cost);
     else if (body.kind === "delete")
       this.recordExplainActual("Delete " + body.table, outcome.cost);
+    // (5) Settle every foreign-key check the parts queued, against the end state of the whole
+    //     statement (§7). A parent-side reverse match is metered (constraints.md §6.11).
+    const fkMeter = this.session.newMeter();
+    this.flushFkDeferredChecks(fkMeter);
     releaseCteBuffers(this.session.queryAccount, buffers);
-    outcome = addOutcomeCost(outcome, totalCost.value);
+    outcome = addOutcomeCost(outcome, totalCost.value + fkMeter.accrued);
     this.recordExplainActualParent("WITH", outcome.cost);
     return outcome;
   }
