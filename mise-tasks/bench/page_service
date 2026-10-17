@@ -92,6 +92,10 @@ Dir.mktmpdir("jed-page-service-bench-") do |dir|
     path = File.join(dir, "service-#{owner_core}.jed")
     owner = Actor.new(owner_core, "create", path)
     load(owner)
+    # Reopened like the alone lane, so the two differ only in serving: a handle that loaded the data
+    # itself holds a differently shaped resident tree.
+    owner.close
+    owner = Actor.new(owner_core, "open", path)
     owner_lanes(owner, owner_core, "owner")
     BENCH_CORES.each do |client_core|
       client = Actor.new(client_core, "open", path)
