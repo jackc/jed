@@ -86,7 +86,7 @@ pub(crate) struct ServiceHandoff {
     path: PathBuf,
     /// The handle's open options: promotion opens the file with them, and an owner reads its limits
     /// and ownership preference from them.
-    opts: OpenOptions,
+    pub(super) opts: OpenOptions,
     limits: OwnerLimits,
     /// Serializes role changes: re-election, promotion, yield, close.
     mu: Mutex<()>,

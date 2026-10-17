@@ -165,6 +165,13 @@ fn run() -> Result<(), EngineError> {
                     argument
                 })
                 .map(|_| String::new()),
+            // The backup test entry point (spec/design/page-service.md §9): BACKUP <form>\t<dest>.
+            "BACKUP" => {
+                let (form, dest) = argument.split_once('\t').unwrap_or((argument, ""));
+                database
+                    .backup_for_testing(dest, form == "page_identical")
+                    .map(|_| String::new())
+            }
             "MAX_STORAGE_BYTES" => database
                 .set_max_storage_bytes("main", argument.parse().expect("MAX_STORAGE_BYTES bytes"))
                 .map(|_| String::new()),

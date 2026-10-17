@@ -1357,6 +1357,20 @@ impl Snapshot {
         self.index_stores.values()
     }
 
+    /// Every table data store, in ascending name byte order (a backup's walk, spec/design/
+    /// page-service.md §9).
+    pub(crate) fn stores_by_name(&self) -> Vec<&TableStore> {
+        let mut names: Vec<&String> = self.stores.keys().collect();
+        names.sort();
+        names.into_iter().map(|name| &self.stores[name]).collect()
+    }
+
+    /// This snapshot's domain paging context ([`Snapshot::store_paging`]), the pager its pages are
+    /// read through.
+    pub(crate) fn store_paging(&self) -> Option<&std::sync::Arc<crate::paging::SharedPaging>> {
+        self.store_paging.as_ref()
+    }
+
     /// The resident GiST R-tree of the named index (exact key), or `None` if the index is not
     /// GiST / not present (spec/design/gist.md §4.1). The planner descends it for a `&&`/`@>` bound.
     pub(crate) fn gist_tree(
