@@ -1,103 +1,302 @@
-# Multi-column secondary index with a VARIABLE-WIDTH trailing key column
-# (spec/design/indexes.md §5, encoding.md §2.4/§2.5/§2.6/§2.10).
+# Multi-column secondary index with a VARIABLE-WIDTH range / trailing key column
+# (spec/design/indexes.md §5.1, encoding.md §2.4/§2.5/§2.6/§2.10).
 #
-# The index-bounded scan (query/index_scan.test) walks each index entry and skips the
-# remaining key components to recover the row's storage key. That skip advances over each
-# trailing component by its FIXED key width, which exists only for the fixed-width scalars.
-# A tail column of a variable-width type (text / decimal / bytea / interval — all keyable)
-# has no fixed width, so an equality on the LEADING column must NOT push down through such
-# an index: it falls back to the full scan + residual filter (the same narrowing as a
-# non-scalar / range tail column). The rows are identical either way; only the cost differs,
-# so engagement is pinned the cost way (query/index_scan.test, collation/collated_pushdown.test):
-# each variable-width-tail query costs the FULL scan, proving the bound did NOT engage —
-#   full scan = page_read(1) + storage_row_read(rows) + filter operator_evals(rows) + row_produced(matches).
-# The closing fixed-width control proves the guard is PRECISE: a multi-column index whose
-# tail is fixed-width DOES still push down (strictly lower cost). This is the cross-core
-# contract (Rust == Go == TS). Before the fix, the variable-width tail-skip aborted the
-# scan (a panic / mis-parsed key) instead of returning these rows.
-# Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, types.text, types.decimal, types.bytea, resource.cost_metering
+# The index-bounded scan walks each admitted index entry and skips the key components after the
+# equality prefix to recover the row's storage key. Every scalar key encoding is self-delimiting —
+# a fixed width, or its own terminator (text/bytea `00 01` with `00 FF` escaping an embedded NUL,
+# decimal's class byte + exponent + pair bytes + terminator, interval's 16-byte span) — so a
+# variable-width element may be the RANGE element or a TRAILING element of the bound. The rows are
+# identical with or without the bound; engagement is pinned the cost way (a full scan of each table
+# costs strictly more) plus EXPLAIN. NULL tail slots (the one-byte 0x01 tag), an embedded NUL, and
+# negative / zero decimals exercise each skip rule. This is the cross-core contract
+# (Rust == Go == TS). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, query.limit, query.set_returning, query.index_range, query.index_variable_width_tail, types.i32, types.text, types.decimal, types.bytea, types.interval, null.three_valued, resource.cost_metering
 
-# --- text tail column --------------------------------------------------------------
+# --- text tail column ------------------------------------------------------------------------------
 
 statement ok
 CREATE TABLE vt (id i32 PRIMARY KEY, a i32, b text)
 
 statement ok
-INSERT INTO vt VALUES (1, 10, 'apple'), (2, 10, 'banana'), (3, 20, 'cherry'), (4, 10, 'date'), (5, 30, 'elderberry')
+INSERT INTO vt SELECT g, g % 4, 'v' || (g * 7 % 13) FROM generate_series(1, 40) AS g
+
+statement ok
+INSERT INTO vt VALUES (41, 1, NULL), (42, 1, 'v')
 
 statement ok
 CREATE INDEX vt_ab ON vt (a, b)
 
-# equality on the leading column would attempt the index bound, whose tail-skip over the
-# `text` component has no fixed width — so it does NOT push down. Full scan, correct rows:
-# page_read(1) + 5 storage_row_read + 5 filter evals + 3 produced = 14.
-# cost: 14
-query I nosort
-SELECT id FROM vt WHERE a = 10 ORDER BY id
+# equality on the leading column: the trailing text slot is skipped by its terminator.
+# cost: 49
+query IT rowsort
+SELECT id, b FROM vt WHERE a = 1
 ----
 1
-2
-4
+v7
+13
+v0
+17
+v2
+21
+v4
+25
+v6
+29
+v8
+33
+v10
+37
+v12
+41
+NULL
+42
+v
+5
+v9
+9
+v11
 
-# --- decimal tail column -----------------------------------------------------------
+# a RANGE on the text element after the equality prefix
+# cost: 31
+query IT rowsort
+SELECT id, b FROM vt WHERE a = 1 AND b >= 'v4' AND b < 'v8'
+----
+1
+v7
+21
+v4
+25
+v6
+
+# a bare range on a leading text column of a single-column index
+statement ok
+CREATE INDEX vt_b ON vt (b)
+
+# cost: 16
+query I rowsort
+SELECT id FROM vt WHERE b > 'v8'
+----
+18
+31
+5
+
+# --- decimal tail column ---------------------------------------------------------------------------
 
 statement ok
 CREATE TABLE vd (id i32 PRIMARY KEY, a i32, b decimal)
 
 statement ok
-INSERT INTO vd VALUES (1, 10, 1.5), (2, 10, 2.25), (3, 20, 3.0), (4, 10, 4.125)
+INSERT INTO vd SELECT g, g % 3, (g - 20) * 1.25 FROM generate_series(1, 36) AS g
+
+statement ok
+INSERT INTO vd VALUES (37, 1, NULL), (38, 1, 0), (39, 1, -0.001), (40, 1, 123456789.000000001)
 
 statement ok
 CREATE INDEX vd_ab ON vd (a, b)
 
-# full scan: page_read(1) + 4 storage_row_read + 4 filter evals + 3 produced = 12.
-# cost: 12
-query I nosort
-SELECT id FROM vd WHERE a = 10 ORDER BY id
+# cost: 65
+query ID rowsort
+SELECT id, b FROM vd WHERE a = 1
 ----
 1
-2
+-23.75
+10
+-12.50
+13
+-8.75
+16
+-5.00
+19
+-1.25
+22
+2.50
+25
+6.25
+28
+10.00
+31
+13.75
+34
+17.50
+37
+NULL
+38
+0
+39
+-0.001
 4
+-20.00
+40
+123456789.000000001
+7
+-16.25
 
-# --- bytea tail column -------------------------------------------------------------
+# a decimal RANGE crossing zero (negative, zero, and positive class bytes)
+# cost: 118
+query ID rowsort
+SELECT id, b FROM vd WHERE a = 1 AND b > -5 AND b <= 5
+----
+19
+-1.25
+22
+2.50
+38
+0
+39
+-0.001
+
+# --- bytea tail column -----------------------------------------------------------------------------
 
 statement ok
 CREATE TABLE vb (id i32 PRIMARY KEY, a i32, b bytea)
 
 statement ok
-INSERT INTO vb VALUES (1, 10, '\x0102'), (2, 10, '\x03'), (3, 20, '\x04'), (4, 10, '\xdeadbeef')
+INSERT INTO vb SELECT g, g % 3, decode(lpad(to_hex(g * 37 % 256), 2, '0') || '00' || lpad(to_hex(g), 2, '0'), 'hex') FROM generate_series(1, 30) AS g
+
+statement ok
+INSERT INTO vb VALUES (31, 1, NULL), (32, 1, '\x'), (33, 1, '\x0000')
 
 statement ok
 CREATE INDEX vb_ab ON vb (a, b)
 
-# full scan: page_read(1) + 4 storage_row_read + 4 filter evals + 3 produced = 12.
-# cost: 12
-query I nosort
-SELECT id FROM vb WHERE a = 10 ORDER BY id
+# cost: 53
+query IT rowsort
+SELECT id, b FROM vb WHERE a = 1
 ----
 1
-2
+\x250001
+10
+\x72000a
+13
+\xe1000d
+16
+\x500010
+19
+\xbf0013
+22
+\x2e0016
+25
+\x9d0019
+28
+\x0c001c
+31
+NULL
+32
+\x
+33
+\x0000
 4
+\x940004
+7
+\x030007
 
-# --- fixed-width tail control: pushdown still engages ------------------------------
-
-statement ok
-CREATE TABLE fw (id i32 PRIMARY KEY, a i32, c i32)
-
-statement ok
-INSERT INTO fw VALUES (1, 10, 100), (2, 10, 200), (3, 20, 300), (4, 10, 400), (5, 30, 500)
-
-statement ok
-CREATE INDEX fw_ac ON fw (a, c)
-
-# the (a, c) tail is fixed-width, so this DOES push down — index node(1) + 3 point lookups
-# + 3 storage_row_read + 3 filter evals + 3 produced = 13, strictly cheaper than the 14 a
-# full scan of these 5 rows would cost (the same scan the variable-width tails are forced into).
-# cost: 13
-query I nosort
-SELECT id FROM fw WHERE a = 10 ORDER BY id
+# cost: 49
+query I rowsort
+SELECT id FROM vb WHERE a = 1 AND b < '\x80'
 ----
 1
+10
+16
+22
+28
+32
+33
+7
+
+# --- interval tail column --------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE vi (id i32 PRIMARY KEY, a i32, b interval)
+
+statement ok
+INSERT INTO vi SELECT g, g % 3, g * interval '7 hours' FROM generate_series(1, 30) AS g
+
+statement ok
+INSERT INTO vi VALUES (31, 1, NULL), (32, 1, '1 mon'), (33, 1, '-30 days')
+
+statement ok
+CREATE INDEX vi_ab ON vi (a, b)
+
+# cost: 43
+query IT rowsort
+SELECT id, b FROM vi WHERE a = 1 AND b >= '3 days'
+----
+13
+91:00:00
+16
+112:00:00
+19
+133:00:00
+22
+154:00:00
+25
+175:00:00
+28
+196:00:00
+32
+1 mon
+
+# --- a variable-width element in the middle, fixed-width element after it --------------------------
+
+statement ok
+CREATE TABLE vm (id i32 PRIMARY KEY, a i32, b text, c i32)
+
+statement ok
+INSERT INTO vm SELECT g, g % 2, 'k' || (g % 5), g FROM generate_series(1, 40) AS g
+
+statement ok
+CREATE INDEX vm_abc ON vm (a, b, c)
+
+# cost: 29
+query I rowsort
+SELECT id FROM vm WHERE a = 0 AND b = 'k2'
+----
+12
 2
+22
+32
+
+# cost: 57
+query I rowsort
+SELECT id FROM vm WHERE a = 0 AND b > 'k2'
+----
+14
+18
+24
+28
+34
+38
 4
+8
+
+# writes keep the index entries current (the bound reads only through the index)
+statement ok
+UPDATE vm SET b = 'k9' WHERE id = 2
+
+statement ok
+DELETE FROM vm WHERE id = 4
+
+# cost: 57
+query I rowsort
+SELECT id FROM vm WHERE a = 0 AND b > 'k2'
+----
+14
+18
+2
+24
+28
+34
+38
+8
+
+# a LIMIT streams the bound in index order
+# cost: 52
+query IT nosort
+SELECT id, b FROM vm WHERE a = 1 AND b >= 'k3' ORDER BY id LIMIT 3
+----
+3
+k3
+9
+k4
+13
+k3

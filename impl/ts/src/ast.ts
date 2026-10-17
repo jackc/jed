@@ -964,6 +964,9 @@ export type Insert = {
 // apply; for DO NOTHING `assignments` is empty and `filter` null.
 export type OnConflict = {
   target: ConflictTarget | null;
+  // The optional `WHERE index_predicate` after a `( col, … )` target (upsert.md §2): it lets a
+  // PARTIAL unique index whose predicate it implies be inferred as the arbiter.
+  indexPredicate: Expr | null;
   doUpdate: boolean;
   assignments: Assignment[];
   filter: Expr | null;

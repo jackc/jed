@@ -24,7 +24,8 @@ INSERT INTO t [ AS alias ] [(cols)] { VALUES ... | SELECT ... }
   ON CONFLICT [ conflict_target ] conflict_action
   [ RETURNING ... ]
 
-conflict_target ::= ( col [, ...] )            -- index inference (column SET)
+conflict_target ::= ( col [, ...] ) [ WHERE index_predicate ]
+                                               -- index inference (column SET)
                   | ON CONSTRAINT name          -- a named unique index, or <table>_pkey
 
 conflict_action ::= DO NOTHING
@@ -63,6 +64,22 @@ is never an arbiter.)
   (jed folds identical-list uniques, so this is rare), the **primary key wins**, then unique
   indexes in ascending name byte order (the catalog's standing deterministic order,
   constraints.md §5.4).
+- **`( col [, ...] ) WHERE index_predicate` — partial-index inference.** A **partial** unique
+  index ([indexes.md §9](indexes.md)) is never inferred from a bare column list (`42P10` when it is
+  the only match, as in PostgreSQL); restating its predicate makes it inferable. The
+  `index_predicate` resolves against the target table's columns like a partial-index predicate,
+  after the list's columns are checked (`42703` first): a subquery is `0A000`, a parameter `$N`
+  `42P02`, an unknown column `42703`, `excluded.col` `42P01`, an aggregate `42803`, a window
+  function `42P20`; its type and mutability are **not** checked (PostgreSQL's — a non-boolean
+  predicate is no error, it merely implies nothing). Among the unique indexes / primary key whose
+  column set equals the list, a non-partial one is inferable whether or not a `WHERE` is given,
+  and a partial one iff the `WHERE` implies its predicate under the [indexes.md §9.1](indexes.md)
+  prover (`WHERE status = 'active' AND amt > 0` implies `status = 'active'`; `WHERE n > 3` implies
+  `n > 0`). Precedence: the primary key, then the non-partial unique indexes, then the implied
+  partial ones, each group in name byte order. A proposed row whose predicate is **not TRUE** has no
+  entry in the partial index, so its arbiter key is NULL-like: it never conflicts on that arbiter,
+  never counts as a duplicate proposal (§4), and is an ordinary insert (probed). The `WHERE` is not
+  allowed through an updatable view (`0A000`, a narrowing).
 - **`ON CONSTRAINT name`.** By exact name ([grammar.md §3](grammar.md)): the synthesized
   **`<table>_pkey`** names the primary key (jed does not persist that name but accepts it as
   an arbiter spelling — symmetric with the `23505` message, constraints.md §5.4); otherwise
@@ -261,6 +278,14 @@ except `42P09` (`ambiguous_alias`), added with the target alias (§5). The codes
 - **Which constraint name a `23505` reports** when several are violated follows jed's standing
   deterministic order (PK first, then unique indexes by name byte order), not PG's
   index-creation order (constraints.md §5.4). The code is identical.
+- **One arbiter where PostgreSQL may take several.** PostgreSQL treats *every* inferable unique
+  index as an arbiter; jed takes the first by the §2 precedence. The two agree whenever a
+  non-partial unique index or the primary key matches (any conflict on an implied partial index
+  is also a conflict on it, with the same existing row); they can differ only when two or more
+  *partial* unique indexes over the same columns are all implied — a conflict on a later one is
+  then a `23505` in jed rather than the action.
+- **`ON CONFLICT (…) WHERE …` through an updatable view** is `0A000` (PostgreSQL rewrites the
+  predicate onto the base table).
 - **No `DETAIL` line in the message.** jed's messages are single-line house style; the codes match.
   The `Key (…)=(…) already exists.` text is the structured `Detail` field
   ([error-fields.md](error-fields.md) §9).
@@ -268,7 +293,7 @@ except `42P09` (`ambiguous_alias`), added with the target alias (§5). The codes
 ## 10. Deferred (each its own later slice)
 
 Assigning a primary-key column on the conflict-action path (§5);
-the partial-index `WHERE index_predicate` in a conflict target (jed has no partial indexes)
-and `COLLATE`/opclass inference decorations; multi-column `SET (a,b) = (...)`; and the GIN /
+the `WHERE index_predicate` through an updatable view; several partial arbiters at once (§9);
+`COLLATE`/opclass inference decorations; multi-column `SET (a,b) = (...)`; and the GIN /
 ordered-index acceleration of the arbiter probe (the probe reuses the unique-index point/range
 lookup, which is already a probe, so this is a non-issue for unique arbiters).

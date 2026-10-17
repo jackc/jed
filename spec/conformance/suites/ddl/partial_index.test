@@ -2,8 +2,8 @@
 # indexes only the rows whose predicate is TRUE (the 3VL WHERE rule — FALSE and NULL are excluded),
 # and for UNIQUE constrains only those rows. B-tree only this slice. Maintenance is uniform (a row
 # maps to a set of entries, empty when the predicate is not TRUE), so INSERT/UPDATE/DELETE need no
-# special code; the planner uses the index ONLY when the WHERE contains a conjunct structurally equal
-# to the predicate (the syntactic implication gate). The ROWS never change with or without the
+# special code; the planner uses the index ONLY when the WHERE implies the predicate (here, by a
+# conjunct structurally equal to it — indexes.md §9.1). The ROWS never change with or without the
 # pushdown (the WHERE stays the residual filter) — only cost does; the `# cost:` lines pin the
 # cross-core index-bound usage (query.index_partial). Rows + error codes AGREE with PostgreSQL
 # (oracle-checked); the jed-specific pieces (the predicate column in jed_indexes, the

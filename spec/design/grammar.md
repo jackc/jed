@@ -3322,7 +3322,9 @@ name as the qualifier for the existing row in `SET`/`WHERE` (and in `RETURNING`)
   matched as an order-independent **set** against a unique index / the primary key
   (`ON CONFLICT (b, a)` matches `UNIQUE (a, b)`); no match is **`42P10`**. **`ON CONSTRAINT
   name`** names a unique index, or the synthesized **`<table>_pkey`** for the primary key; a
-  miss is **`42704`**. An unknown column in the list is **`42703`**.
+  miss is **`42704`**. An unknown column in the list is **`42703`**. A column list may be followed
+  by **`WHERE index_predicate`**, which lets a **partial** unique index whose predicate it implies
+  be inferred ([upsert.md](upsert.md) §2); `ON CONSTRAINT` takes no `WHERE`.
 - **`DO UPDATE` requires a target** (**`42601`** without one); **`DO NOTHING`** may omit it,
   in which case **any** uniqueness conflict is skipped. The arbiter **only** arbitrates its
   own constraint — a conflict on a **different** unique/PK constraint still traps **`23505`**.

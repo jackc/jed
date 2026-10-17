@@ -45,6 +45,25 @@ INSERT INTO orders VALUES
 WHERE status = 'active' AND customer = 10
 ORDER BY id;`;
 
+	const softSeed = `CREATE TABLE task (
+  id         i32 PRIMARY KEY,
+  title      text NOT NULL,
+  priority   i32 NOT NULL,
+  deleted_at timestamptz
+);
+CREATE INDEX task_live ON task (priority) WHERE deleted_at IS NULL;
+INSERT INTO task VALUES
+  (1, 'ship',   2, NULL),
+  (2, 'triage', 1, '2024-01-01 00:00:00+00'),
+  (3, 'review', 3, NULL),
+  (4, 'plan',   1, NULL),
+  (5, 'archive', 5, '2024-02-01 00:00:00+00');`;
+
+	const softQuery = `SELECT title, priority FROM task
+WHERE deleted_at IS NULL
+ORDER BY priority
+LIMIT 2;`;
+
 	const nullSeed = `CREATE TABLE accounts (id int PRIMARY KEY, email text, deleted_at timestamptz);
 CREATE UNIQUE INDEX active_email ON accounts (email) WHERE deleted_at IS NULL;
 INSERT INTO accounts VALUES (1, 'ada@example.com', NULL), (2, 'ada@example.com', '2024-01-01 00:00:00+00');`;
@@ -133,6 +152,11 @@ discrete `range` is stored canonical, so `'[1,4]'::int4range` and `'[1,5)'::int4
 A composite value keys by each field's own key in order (NULLs last per field). The one type that
 still cannot be a key is an **array whose element is a composite**.
 
+An index may combine several columns. A lookup can use any number of leading columns with `=`,
+followed by a range (`<`, `<=`, `>`, `>=`, `BETWEEN`) on the next one, and every column type above
+can take either role. So an index on `(region, name)` serves `region = 1 AND name > 'K'`, and an index
+on a `text` column serves `name >= 'K' AND name < 'P'` on its own.
+
 The `city` table below indexes its `region` code (`1` = Asia, `2` = Europe). Run the lookup, then
 edit the `WHERE` to `region = 2` — the selective equality chooses the index and narrows the scan to
 the matching rows. A broad range may deliberately choose the full scan instead, avoiding an index
@@ -194,7 +218,7 @@ for the rows that matter:
 CREATE INDEX orders_active ON orders (customer) WHERE status = 'active';
 ```
 
-jed uses a partial index to accelerate a query **only when the query's `WHERE` contains the index
+jed uses a partial index to accelerate a query **only when the query's `WHERE` implies the index
 predicate** — that is what guarantees every row the query wants is in the index. So
 `WHERE status = 'active' AND customer = 10` seeks `orders_active`, while a bare `WHERE customer = 10`
 takes a full scan (it can't assume all `customer = 10` rows are active). Run the gated query below,
@@ -208,8 +232,34 @@ A **`UNIQUE`** partial index constrains only the qualifying rows: `CREATE UNIQUE
 `cancelled` order may still reuse that customer freely. The predicate is a boolean expression over
 the table's own columns and must be **immutable** — jed rejects a non-boolean predicate with
 `42804`, and an aggregate / window / subquery / bind-parameter / non-immutable predicate with the
-same codes an expression key uses. Implication matching is **syntactic** (as in PostgreSQL): jed
-uses the index when the `WHERE` restates the predicate, not when it merely implies it.
+same codes an expression key uses.
+
+The `WHERE` need not restate the predicate word for word. jed proves implication with a bounded
+version of PostgreSQL's rules: each `AND`ed part of the predicate must follow from the query's
+conditions, and `OR`, `IN (…)`, `= ANY(ARRAY[…])`, and `BETWEEN` are taken apart on either side.
+Comparisons with constants of the same type imply each other the way you would expect: an index
+`WHERE amount > 0` serves `WHERE amount > 50`, `WHERE amount = 7`, and `WHERE amount IN (3, 9)`, but
+not `WHERE amount >= 0`, which also admits `0`. A comparison with a constant also implies
+`column IS NOT NULL`. A bind parameter `$1` is never treated as a known value here, so
+`WHERE amount > $1` does not use an index `WHERE amount > 0`.
+
+A partial index can also be read **whole**. When the `WHERE` implies the predicate but puts no
+condition on the indexed columns, jed may walk the entire (small) index instead of the table, which
+also delivers rows in index order. The classic case is a soft-delete index over the few live rows:
+`ORDER BY priority LIMIT 2` below walks `task_live` in priority order and stops after two rows, with
+no sort. `EXPLAIN` shows the walk as `Index scan: using task_live`.
+
+<LiveSql demo="softQuery" seed={softSeed} query={softQuery} rows={4} />
+
+A partial index also serves an `OR` / `IN` list on its key, the `ORDER BY … LIMIT` walk, and the inner
+side of an index nested-loop join. For a join, the join's own `ON` must imply the predicate, or the
+predicate must be one that a missing row (`NULL` in every column, as an outer join produces) can never
+satisfy. A `LEFT JOIN … WHERE b.deleted_at IS NULL` therefore does not probe an index `WHERE deleted_at
+IS NULL`, because that would miss rows.
+
+To use a **partial unique index** as the arbiter of an upsert, restate (or imply) its predicate after
+the conflict target, as in PostgreSQL: `INSERT … ON CONFLICT (customer) WHERE status = 'active' DO
+UPDATE …`. See [upsert with `ON CONFLICT`](../tables/).
 
 ### Timestamps and timezone data
 

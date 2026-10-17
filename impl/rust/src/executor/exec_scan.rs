@@ -140,15 +140,6 @@ fn process_streaming_row(
     Ok(plan.limit.is_none_or(|limit| (out.len() as i64) < limit))
 }
 
-fn index_row_key<'a>(entry_key: &'a [u8], prefix_len: usize, suffix: &[ScalarType]) -> &'a [u8] {
-    let mut at = prefix_len;
-    for &ty in suffix {
-        at = crate::encoding::key_slot_end(entry_key, at, ty);
-    }
-    // A corrupt entry shorter than its components yields an empty storage key, which names no row.
-    entry_key.get(at..).unwrap_or(&[])
-}
-
 #[allow(clippy::too_many_arguments)]
 fn scan_stream_table_interval(
     store: &TableStore,
@@ -340,7 +331,7 @@ impl Engine {
                     if can_pull {
                         let mut visit = |entry_key: &[u8], _row: &Row| -> Result<bool> {
                             meter.guard()?;
-                            let row_key = index_row_key(entry_key, prefix_len, &ib.suffix_types);
+                            let row_key = index_entry_row_key(entry_key, prefix_len, &ib.suffix);
                             let (row, pages, slabs) =
                                 store.get_with_units(row_key, &plan.rel_masks[0])?;
                             let row = row.ok_or_else(|| {
@@ -385,7 +376,7 @@ impl Engine {
                         let mut more = true;
                         let mut visit = |entry_key: &[u8], _row: &Row| -> Result<bool> {
                             meter.guard()?;
-                            let row_key = index_row_key(entry_key, prefix_len, &suffix);
+                            let row_key = index_entry_row_key(entry_key, prefix_len, &suffix);
                             let (row, pages, slabs) =
                                 store.get_with_units(row_key, &plan.rel_masks[0])?;
                             let row = row.ok_or_else(|| {

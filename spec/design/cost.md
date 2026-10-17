@@ -589,7 +589,8 @@ point-set/range intersection).
   fixed-policy selector still applies (the initial per-relation bounds of a join), a tuple set
   replaces the contiguous PK bound, which it is always contained in.
 - **Multi-column secondary indexes — index tuple interval sets** (`query.composite_key_set`). A
-  B-tree secondary index whose keys are all plain columns `(c1, …, cn)` and which is not partial takes
+  B-tree secondary index whose keys are all plain columns `(c1, …, cn)` — a partial one only when the
+  WHERE implies its predicate (indexes.md §9.1; for an index-nested-loop inner, §9.3) — takes
   the same member walk over its key columns instead of its leading column's set alone, so on an index
   over `(a, b)`, `a = 1 AND b = ANY($1)` probes `(1, b)` for each element instead of the whole `a = 1`
   index prefix. Point members, the final member, the candidate's existence (some consumed member has
@@ -601,13 +602,12 @@ point-set/range intersection).
   - **No tuple point.** An index entry's key is the member slots followed by the row's storage key,
     so even with every member consumed as a point the prefix gives `[P, prefix-successor(P))`.
   - **Suffix eligibility.** Each admitted entry's row storage key is recovered by skipping the
-    probe's known prefix and then stepping over every remaining key slot: a lone `0x01` NULL tag, or
-    `0x00` and the body — a fixed-width body by its width, and a C-collated `text` or `bytea` body by
-    its `0x00 0x01` terminator (an escaped `0x00 0xFF` is content), a `decimal` body by its class byte
-    (zero alone) or its `0x00` terminator after the exponent (`0xFF` for a negative value), and an
-    `interval` body by its 16 bytes ([encoding.md](encoding.md) §2.4–§2.6, §2.10). A slot that may be
-    stepped over must be one of these; a collated `text` key (the UCA sort key, §2.12) and the
-    unkeyed JSON types are not. Let `t` be the position of the first consumed member after the
+    probe's known prefix and then stepping over every remaining key slot by its self-delimiting slot
+    rule — the one rule the index bound uses ([indexes.md](indexes.md) §5.1): a lone `0x01` NULL tag,
+    or `0x00` and a body whose length its own encoding fixes (a fixed width, `interval`'s 16 bytes,
+    the C `text`/`bytea` terminator, the `decimal` class byte or terminator, or a collated `text`
+    sort key's three weight levels and its terminated identical level). Every scalar key type is
+    steppable; a container (range/array/composite) column and the unkeyed JSON types are not. Let `t` be the position of the first consumed member after the
     leading one that has a set or is the final member (the number of consumed members if none):
     every key column at position `t` or later must be steppable, and a leading member whose set or
     clip holds a non-equality comparison must be steppable too. Otherwise the index has no
@@ -630,7 +630,7 @@ A canonical interval-set bound takes the **eager materialize path** — the sing
 it, exactly as they do an index / GIN / GiST bound. `spec/conformance/suites/query/or_in_point_lookup.test`
 pins point costs cross-core; `query/interval_set.test` pins clipping, range union, overlap merging,
 and fallbacks. Secondary-index range intervals recover row-key suffixes by the suffix rule above,
-so a C-collated `text` leading range union steps over its own slot; a collated one falls back.
+so a `text` leading range union, C-collated or collated, steps over its own slot.
 `query/composite_key_set.test` pins the PK and index tuple sets.
 
 ### Index-bounded scan — a secondary index narrows a base-relation scan
@@ -672,9 +672,11 @@ index tree shape, the entry-key encoding, and the overlap rule are all §8 contr
 non-blocking `LIMIT`, the index range is pulled in entry order: its structural index-tree page block
 is charged up front, while admitted-row point-lookups, `storage_row_read`, residual evaluation, and
 projection stop at `OFFSET+LIMIT` survivors. An `ORDER BY` can elide its sort only when it is exactly
-this same index order; an incompatible order keeps eager gather + sort. **Narrowing** (indexes.md
-§5): the range column and every trailing column are **fixed-width** (indexes.md §5.1 — an
-equality-prefix column may be variable-width).
+this same index order; an incompatible order keeps eager gather + sort. Every scalar key element
+may follow the equality prefix — fixed-width or variable-width, its slot skipped by its own
+encoding (indexes.md §5.1, `query.index_variable_width_tail`); a container element after the
+prefix leaves the index out of the bound. A **full partial-index scan** (indexes.md §9.2) is this
+same block over the whole index range: the index's full node count, then one point fetch per entry.
 
 **DDL costs.** `CREATE INDEX` charges its build scan over the existing rows: `page_read` ×
 the **table's** full node count + `storage_row_read` per row (the build's touched set — the

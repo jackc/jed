@@ -3095,7 +3095,9 @@ impl Parser {
         self.advance(); // ON
         self.advance(); // CONFLICT
 
-        // Optional conflict target: a `( col, … )` column list or `ON CONSTRAINT name`.
+        // Optional conflict target: a `( col, … )` column list (with an optional `WHERE
+        // index_predicate`) or `ON CONSTRAINT name`.
+        let mut index_predicate = None;
         let target = if matches!(self.peek(), Token::LParen) {
             self.advance(); // '('
             let mut cols = Vec::new();
@@ -3107,6 +3109,7 @@ impl Parser {
                     other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
                 }
             }
+            index_predicate = self.parse_optional_where()?;
             Some(ConflictTarget::Columns(cols))
         } else if self.peek_keyword().as_deref() == Some("on") {
             self.advance(); // ON
@@ -3156,7 +3159,11 @@ impl Parser {
                 )));
             }
         };
-        Ok(Some(OnConflict { target, action }))
+        Ok(Some(OnConflict {
+            target,
+            index_predicate,
+            action,
+        }))
     }
 
     /// One parenthesized `( <value> [, <value>]* )` row of an INSERT.

@@ -44,7 +44,7 @@ impl Engine {
         self.index_scan_bound_entries(
             table_name,
             &ib.name_key,
-            &ib.suffix_types,
+            &ib.suffix,
             &bound,
             prefix_len,
             mask,
@@ -57,7 +57,7 @@ impl Engine {
         &self,
         table_name: &str,
         name_key: &str,
-        suffix_types: &[ScalarType],
+        suffix: &[KeySlot],
         bound: &KeyBound,
         prefix_byte_len: usize,
         mask: &[bool],
@@ -65,7 +65,7 @@ impl Engine {
         index_store_bound_entries(
             self.index_store(name_key),
             self.store(table_name),
-            suffix_types,
+            suffix,
             bound,
             prefix_byte_len,
             mask,
@@ -419,7 +419,7 @@ impl Engine {
 pub(crate) fn index_store_bound_entries(
     istore: &TableStore,
     store: &TableStore,
-    suffix_types: &[ScalarType],
+    suffix: &[KeySlot],
     bound: &KeyBound,
     prefix_byte_len: usize,
     mask: &[bool],
@@ -430,15 +430,10 @@ pub(crate) fn index_store_bound_entries(
     let mut slabs = 0usize;
     let mut rows = Vec::with_capacity(entries.len());
     for (ekey, _) in entries {
-        // Skip the equality prefix by its known byte length, then each remaining key component
-        // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the body stepped over by width or
-        // delimiter, indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
-        let mut at = prefix_byte_len;
-        for &ty in suffix_types {
-            at = crate::encoding::key_slot_end(&ekey, at, ty);
-        }
-        // A corrupt entry shorter than its components yields an empty storage key (no row).
-        let row_key = ekey.get(at..).unwrap_or(&[]);
+        // Skip the equality prefix by its known byte length, then each remaining key component by
+        // its self-delimiting slot (indexes.md §5.1); the suffix after them is the row's storage
+        // key (indexes.md §3). A corrupt entry yields an empty storage key (no row).
+        let row_key = index_entry_row_key(&ekey, prefix_byte_len, suffix);
         let (row, n, s) = store.get_with_units(row_key, mask)?;
         pages += n;
         slabs += s;

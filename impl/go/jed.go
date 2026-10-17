@@ -279,9 +279,21 @@ var SupportedCapabilities = []string{
 	// Index expression bound — the planner structurally matches a WHERE conjunct against an
 	// expression index key (lower(email) = $1 seeks) (spec/design/indexes.md §5).
 	"query.index_expr",
-	// Partial-index bound — the planner uses a partial index only when the WHERE contains a
-	// conjunct structurally equal to the index predicate (spec/design/indexes.md §9).
+	// Partial-index bound — the planner uses a partial index only when the WHERE implies the index
+	// predicate (spec/design/indexes.md §9).
 	"query.index_partial",
+	// A variable-width (text/decimal/bytea/interval) range or trailing index key element, skipped
+	// by its self-delimiting encoding (spec/design/indexes.md §5.1).
+	"query.index_variable_width_tail",
+	// The partial-index predicate-implication prover (spec/design/indexes.md §9.1).
+	"query.index_partial_implication",
+	// A full partial-index scan with no access predicate, and its ORDER BY walk (indexes.md §9.2).
+	"query.index_partial_full_scan",
+	// Partial indexes on the OR/IN interval-set and index-nested-loop paths (indexes.md §9.3).
+	"query.index_partial_access_paths",
+	// ON CONFLICT (cols) WHERE index_predicate — partial unique-index arbiter inference
+	// (spec/design/upsert.md §2).
+	"dml.upsert_partial_arbiter",
 	// EXPLAIN — render the selected plan as deterministic depth/node/detail/est_rows/est_cost rows
 	// without executing it (spec/design/explain.md).
 	"query.explain",

@@ -1184,10 +1184,10 @@ func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivi
 		}
 		ks := candidate.bound.indexSet
 		if len(ks.tuple) > 1 {
-			return tupleSetSelectivity(ks.tuple, len(ks.colTypes), unique, structuralTupleMemberSelectivity)
+			return tupleSetSelectivity(ks.tuple, len(ks.slots), unique, structuralTupleMemberSelectivity)
 		}
 		lead := ks.tuple[0]
-		return intervalSelectivity(lead.specs, lead.clip, unique && len(ks.colTypes) == 1, lead.colType)
+		return intervalSelectivity(lead.specs, lead.clip, unique && len(ks.slots) == 1, lead.colType)
 	default:
 		return selectivityExpr{kind: selectivityAll}
 	}
@@ -1230,6 +1230,82 @@ func (db *engine) intervalSelectivityWithStatistics(
 }
 
 func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandidate, rel scopeRel) selectivityExpr {
+	access := db.accessSelectivityWithStatistics(candidate, rel)
+	return db.partialIndexScanSelectivity(access, candidate, rel)
+}
+
+// partialIndexScanSelectivity narrows a candidate's access selectivity by a PARTIAL index's predicate:
+// the index holds only its qualifying rows (indexes.md §9), so its scan rows are the access
+// predicate's rows further narrowed by the index predicate (estimator.md §7). Each top-level
+// predicate conjunct that reads no column of a key element the access predicate constrains applies
+// its structural (statistics-free) selectivity, in predicate order. A conjunct over a constrained
+// column is skipped, since it usually restates the access predicate's own range.
+func (db *engine) partialIndexScanSelectivity(access selectivityExpr, candidate scanCandidate, rel scopeRel) selectivityExpr {
+	if access.kind == selectivityZero || access.kind == selectivityUnique {
+		return access
+	}
+	if candidate.bound == nil {
+		return access
+	}
+	var constrained int
+	switch {
+	case candidate.bound.index != nil:
+		constrained = len(candidate.bound.index.eqCols)
+		if candidate.bound.index.rangeTerms != nil {
+			constrained++
+		}
+	case candidate.bound.indexSet != nil:
+		constrained = len(candidate.bound.indexSet.tuple)
+	default:
+		return access
+	}
+	var idx *indexDef
+	for i := range rel.table.Indexes {
+		if rel.table.Indexes[i].Name == candidate.identity.indexName {
+			idx = &rel.table.Indexes[i]
+			break
+		}
+	}
+	if idx == nil || idx.Predicate == nil {
+		return access
+	}
+	rindex, err := db.resolveIndex(rel.table, *idx)
+	if err != nil || rindex.Predicate == nil {
+		return access
+	}
+	read := make([]bool, len(rel.table.Columns))
+	for i, key := range rindex.Keys {
+		if i >= constrained {
+			break
+		}
+		if key.Expr == nil {
+			read[key.Col] = true
+		} else {
+			collectTouched(key.Expr, 0, read)
+		}
+	}
+	var conjuncts []*rExpr
+	flattenEstimatorBoolean(rindex.Predicate, reAnd, &conjuncts)
+	result := access
+	for _, conjunct := range conjuncts {
+		touched := make([]bool, len(rel.table.Columns))
+		collectTouched(conjunct, 0, touched)
+		overlaps := false
+		for i := range touched {
+			if touched[i] && read[i] {
+				overlaps = true
+				break
+			}
+		}
+		if overlaps {
+			continue
+		}
+		result = result.And(predicateSelectivity(conjunct))
+	}
+	return result
+}
+
+func (db *engine) accessSelectivityWithStatistics(candidate scanCandidate, rel scopeRel) selectivityExpr {
 	structural := candidateAccessSelectivity(candidate, rel)
 	if structural.kind == selectivityZero || structural.kind == selectivityUnique {
 		return structural
@@ -1323,7 +1399,7 @@ func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandida
 		}
 		bound := candidate.bound.indexSet
 		if len(bound.tuple) > 1 {
-			return tupleSetSelectivity(bound.tuple, len(bound.colTypes), index.Unique, func(m *tupleMember) selectivityExpr {
+			return tupleSetSelectivity(bound.tuple, len(bound.slots), index.Unique, func(m *tupleMember) selectivityExpr {
 				return db.statisticsTupleMemberSelectivity(m, rel)
 			})
 		}

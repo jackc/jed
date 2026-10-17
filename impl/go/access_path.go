@@ -299,23 +299,23 @@ func (ks *pkKeySetPlan) intervals(params []Value, outer []storedRow, left stored
 
 // indexKeySetPlan is the pkKeySetPlan analog over a B-tree secondary index whose keys are plain
 // columns (indexes.md §5; cost.md §3 "Multi-column secondary indexes"): tuple is the consumed key
-// columns in key order, walked as a composite-PK tuple set's members, and colTypes is every key
-// column's type — the per-entry key-suffix skip. A tuple of one member is the leading-column
+// columns in key order, walked as a composite-PK tuple set's members, and slots is every key
+// column's self-delimiting slot form (indexes.md §5.1) — the per-entry key-suffix skip. A tuple of one member is the leading-column
 // interval set. allFixed reports that every key column is fixed-width, so the probes merge as the
 // PK's do.
 type indexKeySetPlan struct {
 	nameKey  string
 	tuple    []tupleMember
-	colTypes []scalarType
+	slots    []keySlot
 	allFixed bool
 }
 
 // indexProbe is one canonical index interval with its row-key suffix recovery: the known prefix
-// byte length skipped first, then the width-skipped member slots after it.
+// byte length skipped first, then the self-delimiting member slots after it (indexes.md §5.1).
 type indexProbe struct {
 	bound     keyBound
 	prefixLen int
-	suffix    []scalarType
+	suffix    []keySlot
 }
 
 // probes resolves the set's canonical index-key intervals for one execution, in index-key order.
@@ -324,14 +324,14 @@ func (ks *indexKeySetPlan) probes(params []Value, outer []storedRow, left stored
 	var out []indexProbe
 	for _, p := range prefixes {
 		if !hasFinal {
-			out = append(out, indexProbe{bound: keyBound{lo: p, loInc: true, hi: prefixSuccessor(p)}, prefixLen: len(p), suffix: ks.colTypes[consumed:]})
+			out = append(out, indexProbe{bound: keyBound{lo: p, loInc: true, hi: prefixSuccessor(p)}, prefixLen: len(p), suffix: ks.slots[consumed:]})
 			continue
 		}
 		for _, iv := range final {
 			phys := indexLogicalInterval(iv)
 			b := keyBound{lo: concatKey(p, phys.lo), loInc: phys.loInc, hi: concatKey(p, phys.hi), hiInc: phys.hiInc}
 			if !boundEmpty(b) {
-				out = append(out, indexProbe{bound: b, prefixLen: len(p), suffix: ks.colTypes[consumed-1:]})
+				out = append(out, indexProbe{bound: b, prefixLen: len(p), suffix: ks.slots[consumed-1:]})
 			}
 		}
 	}
@@ -347,7 +347,7 @@ func (ks *indexKeySetPlan) probes(params []Value, outer []storedRow, left stored
 	merged := mergeKeyIntervals(bounds, true)
 	out = out[:0]
 	for _, b := range merged {
-		out = append(out, indexProbe{bound: b, suffix: ks.colTypes})
+		out = append(out, indexProbe{bound: b, suffix: ks.slots})
 	}
 	return out
 }
@@ -442,15 +442,19 @@ type indexEqCol struct {
 // (rangeTerms / rangeType). The inventory owns one plan per eligible index; the selector chooses
 // among them. At exec time buildIndexBound turns these into a concrete index-key
 // range: the equality prefix bytes P = concatenated present slots, then the range (if any)
-// intersected relative to P. suffixTypes are the types of the index columns AFTER the equality
-// prefix (columns[len(eqCols):]) — the range column (if any) plus every trailing column — each
-// FIXED-WIDTH so an admitted entry's row-key suffix is recovered by width-skipping them past P.
+// intersected relative to P. suffix holds the slot forms of the index key elements AFTER the
+// equality prefix (keys[len(eqCols):]) — the range element (if any) plus every trailing element —
+// each skipped by its self-delimiting encoding so an admitted entry's row-key suffix is recovered
+// past P. An empty eqCols with no range is a FULL partial-index scan (indexes.md §9.2).
 type indexBoundPlan struct {
-	nameKey     string // the index store's key — the exact index name
-	eqCols      []indexEqCol
-	rangeType   scalarType  // the range column's type (meaningful iff rangeTerms != nil)
-	rangeTerms  []boundTerm // range conjuncts on the column after the equality prefix (nil ⇒ none)
-	suffixTypes []scalarType
+	nameKey   string // the index store's key — the exact index name
+	eqCols    []indexEqCol
+	rangeType scalarType // the range column's type (meaningful iff rangeTerms != nil)
+	// rangeColl is the range column's key collation: a collated text column encodes its endpoints
+	// as the column collation's UCA sort key, the stored key form (encoding.md §2.12).
+	rangeColl  *Collation
+	rangeTerms []boundTerm // range conjuncts on the column after the equality prefix (nil ⇒ none)
+	suffix     []keySlot
 }
 
 // buildIndexAccessPredicate constructs an index access predicate for idx over rel (indexes.md
@@ -482,7 +486,10 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 		return nil
 	}
 	var eqCols []indexEqCol
+	// (A partial index's predicate needs no NULL-rejection here: every bound term below is a strict
+	// comparison on this relation's key, so its WHERE conjunct rejects a NULL-extended row.)
 	var rangeType scalarType
+	var rangeColl *Collation
 	var rangeTerms []boundTerm
 	for i := range rindex.Keys {
 		key := rindex.Keys[i]
@@ -548,6 +555,7 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 		}
 		if len(ranges) > 0 {
 			rangeType = ty
+			rangeColl = coll
 			rangeTerms = ranges
 		}
 		break // first non-equality element ends the prefix (with or without a trailing range)
@@ -555,28 +563,119 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	if len(eqCols) == 0 && rangeTerms == nil {
 		return nil // nothing bound
 	}
-	// Eligibility: every key element from the range element onward (keys[len(eqCols):]) is
-	// width-skipped past the known equality prefix to recover the storage key, so each must be a
-	// fixed-width scalar (a column's type, or an expression's result type). The equality-prefix
-	// elements may be any width — their slots are matched as the known prefix bytes.
-	suffix := make([]scalarType, 0, len(rindex.Keys)-len(eqCols))
-	for _, key := range rindex.Keys[len(eqCols):] {
-		var s scalarType
-		var ok bool
-		if key.Expr == nil {
-			s, ok = rel.table.Columns[key.Col].Type.AsScalar()
-		} else {
-			s, ok = key.Ty.AsScalar()
-		}
-		if !ok || !s.IsFixedWidth() {
-			return nil
-		}
-		suffix = append(suffix, s)
+	suffix, ok := indexSuffixSlots(rel, rindex, len(eqCols))
+	if !ok {
+		return nil
 	}
 	return &indexBoundPlan{
 		nameKey: idx.Name, eqCols: eqCols,
-		rangeType: rangeType, rangeTerms: rangeTerms, suffixTypes: suffix,
+		rangeType: rangeType, rangeColl: rangeColl, rangeTerms: rangeTerms, suffix: suffix,
 	}
+}
+
+// indexSuffixSlots is the slot forms of the resolved index's key elements from `from` onward
+// (indexes.md §5.1): each is skipped past the known equality prefix to recover an entry's storage
+// key, so each must be a scalar with a key encoding (a column's type, or an expression's result
+// type). ok=false when one is a container (range/array/composite) element.
+func indexSuffixSlots(rel scopeRel, rindex resolvedIndex, from int) ([]keySlot, bool) {
+	suffix := make([]keySlot, 0, max(len(rindex.Keys)-from, 0))
+	for _, key := range rindex.Keys[from:] {
+		var slot keySlot
+		if key.Expr == nil {
+			col := rel.table.Columns[key.Col]
+			s, ok := col.Type.AsScalar()
+			if !ok {
+				return nil, false
+			}
+			if slot, ok = keySlotForScalar(s, col.Collation != ""); !ok {
+				return nil, false
+			}
+		} else {
+			s, ok := key.Ty.AsScalar()
+			if !ok {
+				return nil, false
+			}
+			if slot, ok = keySlotForScalar(s, key.Coll != nil); !ok {
+				return nil, false
+			}
+		}
+		suffix = append(suffix, slot)
+	}
+	return suffix, true
+}
+
+// buildPartialIndexFullScan is a FULL partial-index scan (indexes.md §9.2): a B-tree PARTIAL index
+// whose predicate the WHERE implies (§9.1) is a complete source of the query's rows even without an
+// equality/range access predicate, so it is a candidate that walks the whole (narrow) index. Offered
+// only for a single-relation scan (a join's relation never NULL-extends here) and only when no
+// ordinary access predicate already bounds this index. Every key element must be skippable (§5.1).
+func (db *engine) buildPartialIndexFullScan(filter *rExpr, rel scopeRel, idx indexDef) *indexBoundPlan {
+	if idx.Kind != indexBtree || idx.Predicate == nil {
+		return nil
+	}
+	rindex, err := db.resolveIndex(rel.table, idx)
+	if err != nil || rindex.Predicate == nil {
+		return nil
+	}
+	if !filterImpliesPredicate(filter, rindex.Predicate, rel.offset) {
+		return nil
+	}
+	// A skewed collated key element's stored order is not the loaded collation's; never walk it
+	// (the read-safety rule, collation.md §12).
+	for _, key := range rindex.Keys {
+		if key.Expr == nil {
+			if _, push := db.keyCollationCtx(rel.table.Columns[key.Col]); !push {
+				return nil
+			}
+		}
+	}
+	suffix, ok := indexSuffixSlots(rel, rindex, 0)
+	if !ok {
+		return nil
+	}
+	return &indexBoundPlan{nameKey: idx.Name, suffix: suffix}
+}
+
+// inventorySingleRelationCandidates is the single-relation access inventory (estimator.md §9.1,
+// §9.3): inventoryScanCandidates plus a FULL partial-index scan for every partial index whose
+// predicate the WHERE implies and that has no ordinary access-predicate candidate (indexes.md §9.2),
+// in canonical kind/name order.
+func inventorySingleRelationCandidates(filter *rExpr, rel scopeRel, db *engine) []scanCandidate {
+	candidates := inventoryScanCandidates(filter, rel, db)
+	if filter == nil || rel.isAttachment() {
+		return candidates
+	}
+	added := false
+	for _, idx := range rel.table.Indexes {
+		hasBound := false
+		for _, c := range candidates {
+			if c.identity.kind == scanCandidateBtree && c.identity.indexName == idx.Name {
+				hasBound = true
+				break
+			}
+		}
+		if hasBound {
+			continue
+		}
+		if ib := db.buildPartialIndexFullScan(filter, rel, idx); ib != nil {
+			candidates = append(candidates, indexOrderCandidate(scanCandidateBtree, ib.nameKey, &scanBound{index: ib}, filter))
+			added = true
+		}
+	}
+	if added {
+		sortScanCandidates(candidates)
+	}
+	return candidates
+}
+
+func sortScanCandidates(candidates []scanCandidate) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i].identity, candidates[j].identity
+		if a.kind != b.kind {
+			return a.kind < b.kind
+		}
+		return bytes.Compare([]byte(a.indexName), []byte(b.indexName)) < 0
+	})
 }
 
 // detectScanBound picks one SELECT relation's scan bound (cost.md §3; indexes.md §5). It is the
@@ -634,13 +733,7 @@ func inventoryScanCandidates(filter *rExpr, rel scopeRel, db *engine) []scanCand
 		}
 	}
 	candidates = append(candidates, full)
-	sort.SliceStable(candidates, func(i, j int) bool {
-		a, b := candidates[i].identity, candidates[j].identity
-		if a.kind != b.kind {
-			return a.kind < b.kind
-		}
-		return bytes.Compare([]byte(a.indexName), []byte(b.indexName)) < 0
-	})
+	sortScanCandidates(candidates)
 	return candidates
 }
 
@@ -733,13 +826,17 @@ func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx ind
 	if filter == nil {
 		return nil
 	}
-	return db.buildIndexIntervalSetPlanConjuncts(flattenConjuncts(filter), rel, idx, nil)
+	// A PARTIAL index serves the set only when the WHERE implies its predicate (indexes.md §9.1);
+	// the set's own disjunction is a NULL-rejecting conjunct on this relation's key.
+	partialOK := idx.Predicate == nil || db.partialIndexImplied(filter, rel.table, rel.offset, idx)
+	return db.buildIndexIntervalSetPlanConjuncts(flattenConjuncts(filter), rel, idx, nil, partialOK)
 }
 
 // buildIndexIntervalSetPlanConjuncts is buildIndexIntervalSetPlan over an AND-chain's conjuncts;
-// siblings admits a sibling column as a member's source (an index-nested-loop inner).
-func (db *engine) buildIndexIntervalSetPlanConjuncts(conjuncts []*rExpr, rel scopeRel, idx indexDef, siblings columnRanges) *indexKeySetPlan {
-	if idx.Kind != indexBtree || idx.Predicate != nil {
+// siblings admits a sibling column as a member's source (an index-nested-loop inner). partialOK is the
+// caller's proof that a PARTIAL index's predicate is implied (indexes.md §9.1, §9.3).
+func (db *engine) buildIndexIntervalSetPlanConjuncts(conjuncts []*rExpr, rel scopeRel, idx indexDef, siblings columnRanges, partialOK bool) *indexKeySetPlan {
+	if idx.Kind != indexBtree || (idx.Predicate != nil && !partialOK) {
 		return nil
 	}
 	cols := idx.columnOrdinals()
@@ -750,11 +847,18 @@ func (db *engine) buildIndexIntervalSetPlanConjuncts(conjuncts []*rExpr, rel sco
 	if !hasSet {
 		return nil
 	}
-	// skippable reports a key column whose slot an admitted entry can step over without knowing its
-	// value: a fixed-width or self-delimiting C-collated slot (keySlotSkippable).
-	skippable := func(c int) bool {
+	// slotOf is a key column's self-delimiting slot form (indexes.md §5.1): every scalar key type,
+	// collated text included, can be stepped over without knowing its value.
+	slotOf := func(c int) (keySlot, bool) {
 		s, ok := rel.table.Columns[c].Type.AsScalar()
-		return ok && keySlotSkippable(s) && rel.table.Columns[c].Collation == ""
+		if !ok {
+			return keySlot{}, false
+		}
+		return keySlotForScalar(s, rel.table.Columns[c].Collation != "")
+	}
+	skippable := func(c int) bool {
+		_, ok := slotOf(c)
+		return ok
 	}
 	// A leading range, or a leading membership subquery (which widens to the whole index if it is
 	// read before its fold), leaves the leading slot to be stepped over.
@@ -770,17 +874,18 @@ func (db *engine) buildIndexIntervalSetPlanConjuncts(conjuncts []*rExpr, rel sco
 			break
 		}
 	}
-	colTypes := make([]scalarType, len(cols))
+	slots := make([]keySlot, len(cols))
 	allFixed := true
 	for i, c := range cols {
-		s, ok := rel.table.Columns[c].Type.AsScalar()
-		if i >= t && !skippable(c) {
+		slot, skip := slotOf(c)
+		if i >= t && !skip {
 			return nil
 		}
+		s, ok := rel.table.Columns[c].Type.AsScalar()
 		allFixed = allFixed && ok && s.IsFixedWidth()
-		colTypes[i] = s
+		slots[i] = slot
 	}
-	return &indexKeySetPlan{nameKey: idx.Name, tuple: members, colTypes: colTypes, allFixed: allFixed}
+	return &indexKeySetPlan{nameKey: idx.Name, tuple: members, slots: slots, allFixed: allFixed}
 }
 
 // planMutationScan selects an UPDATE/DELETE target access path by cost (estimator.md §9.3): every
@@ -796,7 +901,7 @@ func (db *engine) planMutationScan(scope *string, table *catTable, filter *rExpr
 		return plan
 	}
 	rel := scopeRel{label: table.Name, table: table, offset: 0, db: scope}
-	candidates := inventoryScanCandidates(filter, rel, db)
+	candidates := inventorySingleRelationCandidates(filter, rel, db)
 	plan.bound = selectCostedScanCandidate(candidates, db.estimateScanCandidates(candidates, rel, false), selectLegacyScanCandidate(candidates))
 	return plan
 }
@@ -1210,6 +1315,40 @@ func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *sc
 	return candidates[0].bound
 }
 
+// partialIndexImplied reports whether the WHERE filter implies a partial index's resolved predicate
+// (indexes.md §9.1). An index whose predicate does not resolve (an unparsable one) is never implied.
+func (db *engine) partialIndexImplied(filter *rExpr, table *catTable, offset int, idx indexDef) bool {
+	rindex, err := db.resolveIndex(table, idx)
+	if err != nil || rindex.Predicate == nil {
+		return false
+	}
+	return filterImpliesPredicate(filter, rindex.Predicate, offset)
+}
+
+// inlPartialAdmissible reports whether a PARTIAL index may serve as an index-nested-loop inner
+// (indexes.md §9.3): the join's own on must imply its predicate, or on together with the where must
+// imply a NULL-rejecting predicate. A WHERE conjunct holds only for the final rows, and a later outer
+// join may NULL-extend this relation; a NULL-rejecting predicate makes every such row fail the
+// implied WHERE anyway.
+func (db *engine) inlPartialAdmissible(on, whereFilter *rExpr, rel scopeRel, idx indexDef) bool {
+	rindex, err := db.resolveIndex(rel.table, idx)
+	if err != nil || rindex.Predicate == nil {
+		return false
+	}
+	pred := rindex.Predicate
+	if on != nil && filterImpliesPredicate(on, pred, rel.offset) {
+		return true
+	}
+	var filters []*rExpr
+	if on != nil {
+		filters = append(filters, on)
+	}
+	if whereFilter != nil {
+		filters = append(filters, whereFilter)
+	}
+	return predicateRejectsNull(pred) && filtersImplyPredicate(filters, pred, rel.offset)
+}
+
 // inventoryINLCandidates returns every sibling-dependent access path for rel in canonical
 // estimator order. siblingColumns is the selected physical-left relation's logical slot interval;
 // this is deliberately independent of FROM ordinal so P7 can cost the reverse orientation.
@@ -1278,10 +1417,10 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		if idx.Kind != indexBtree {
 			continue
 		}
-		// A PARTIAL index holds only its qualifying rows (indexes.md §9), and this bound never checks
-		// that the query implies the predicate, so a partial index is not an INL inner (as for ORDER-BY
-		// skip-sort and interval sets). That also keeps out one whose predicate did not parse.
-		if idx.Predicate != nil {
+		// A PARTIAL index holds only its qualifying rows (indexes.md §9), so it is an INL inner only
+		// when the join's conditions imply its predicate (§9.3). One whose predicate did not parse
+		// never resolves, so it stays out.
+		if idx.Predicate != nil && !db.inlPartialAdmissible(on, whereFilter, rel, idx) {
 			continue
 		}
 		// The index-nested-loop sibling bound is column-only this slice (an expression index takes
@@ -1295,13 +1434,22 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		if !ok {
 			continue
 		}
+		// Every trailing column is skipped by its self-delimiting slot (indexes.md §5.1).
+		suffix := make([]keySlot, 0, len(cols)-1)
 		unskippableTail := false
 		for _, c := range cols[1:] {
-			s, ok := rel.table.Columns[c].Type.AsScalar()
-			if !ok || !s.IsFixedWidth() {
+			col := rel.table.Columns[c]
+			s, ok := col.Type.AsScalar()
+			if !ok {
 				unskippableTail = true
 				break
 			}
+			slot, ok := keySlotForScalar(s, col.Collation != "")
+			if !ok {
+				unskippableTail = true
+				break
+			}
+			suffix = append(suffix, slot)
 		}
 		if unskippableTail {
 			continue
@@ -1324,16 +1472,12 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		if siblingEq {
 			// This slice keeps the index-nested-loop bound single-column-equality (a leading key
 			// column bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md
-			// §3 "index-nested-loop"). suffixTypes are the trailing columns (columns[1:], fixed-width
-			// by the unskippableTail check above), width-skipped past the single equality slot.
-			tail := make([]scalarType, 0, len(cols)-1)
-			for _, c := range cols[1:] {
-				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
-			}
+			// §3 "index-nested-loop"). suffix holds the trailing columns' slots (columns[1:]),
+			// skipped past the single equality slot.
 			bound := &scanBound{index: &indexBoundPlan{
-				nameKey:     idx.Name,
-				eqCols:      []indexEqCol{{colType: ty, coll: coll, srcs: eqs}},
-				suffixTypes: tail,
+				nameKey: idx.Name,
+				eqCols:  []indexEqCol{{colType: ty, coll: coll, srcs: eqs}},
+				suffix:  suffix,
 			}}
 			candidates = append(candidates, indexOrderCandidate(scanCandidateBtree, bound.index.nameKey, bound, whereFilter))
 		}
@@ -1356,7 +1500,7 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		candidates = append(candidates, storageOrderCandidate(scanCandidatePKInterval, "", &scanBound{pkSet: pkSet}, whereFilter))
 	}
 	for _, idx := range rel.table.Indexes {
-		if is := db.buildIndexIntervalSetPlanConjuncts(conjuncts, rel, idx, siblingColumns); is != nil && keySetUsesSibling(nil, nil, is.tuple) {
+		if is := db.buildIndexIntervalSetPlanConjuncts(conjuncts, rel, idx, siblingColumns, idx.Predicate == nil || db.inlPartialAdmissible(on, whereFilter, rel, idx)); is != nil && keySetUsesSibling(nil, nil, is.tuple) {
 			candidates = append(candidates, indexOrderCandidate(scanCandidateIndexInterval, is.nameKey, &scanBound{indexSet: is}, whereFilter))
 		}
 	}
@@ -1806,7 +1950,7 @@ func (db *engine) indexBoundEntries(tableName string, ib *indexBoundPlan, params
 	if empty {
 		return nil, 0, 0, nil
 	}
-	return db.indexScanBoundEntries(tableName, ib.nameKey, ib.suffixTypes, b, prefixByteLen, mask)
+	return db.indexScanBoundEntries(tableName, ib.nameKey, ib.suffix, b, prefixByteLen, mask)
 }
 
 // buildIndexBound turns an index access predicate into a concrete index-key range at exec time
@@ -1846,9 +1990,8 @@ func (db *engine) buildIndexBound(ib *indexBoundPlan, params []Value, outer []st
 	// (the 0x01 NULL tag sorts after every 0x00 present slot at this position).
 	b = keyBound{lo: append([]byte(nil), p...), loInc: true, hi: append(append([]byte(nil), p...), 0x01), hiInc: false}
 	for _, t := range ib.rangeTerms {
-		// The range column is fixed-width (indexes.md §5.1 eligibility), so it is never collated: the
-		// probe encodes with a nil collation.
-		key, isNull, ok := encodeBoundKey(ib.rangeType, t.src, params, outer, nil, left)
+		// A collated range column's probe is the collation's sort key (the stored key form).
+		key, isNull, ok := encodeBoundKey(ib.rangeType, t.src, params, outer, ib.rangeColl, left)
 		if isNull {
 			return keyBound{}, 0, true
 		}
@@ -1881,8 +2024,8 @@ func (db *engine) buildIndexBound(ib *indexBoundPlan, params []Value, outer []st
 // suffix-skip that recovers each entry's row storage key (indexes.md §5.1). Shared by the
 // access-predicate bound (indexBoundRows) and the OR / IN-list point-set (indexPointRows) so both
 // drive the identical per-entry fetch — same cost by construction.
-func (db *engine) indexScanBound(tableName, nameKey string, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (rows []storedRow, pages, slabs int, err error) {
-	entries, pages, slabs, err := db.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, prefixByteLen, mask)
+func (db *engine) indexScanBound(tableName, nameKey string, suffix []keySlot, b keyBound, prefixByteLen int, mask []bool) (rows []storedRow, pages, slabs int, err error) {
+	entries, pages, slabs, err := db.indexScanBoundEntries(tableName, nameKey, suffix, b, prefixByteLen, mask)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -1895,14 +2038,14 @@ func (db *engine) indexScanBound(tableName, nameKey string, suffixTypes []scalar
 
 // indexScanBoundEntries is the key-preserving core of the ordered-index gather. Candidate ordering
 // and units are identical to indexScanBound; only the already-recovered storage key is retained.
-func (db *engine) indexScanBoundEntries(tableName, nameKey string, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (out []entry, pages, slabs int, err error) {
-	return indexStoreBoundEntries(db.lkpIndexStore(nameKey), db.lkpStore(tableName), suffixTypes, b, prefixByteLen, mask)
+func (db *engine) indexScanBoundEntries(tableName, nameKey string, suffix []keySlot, b keyBound, prefixByteLen int, mask []bool) (out []entry, pages, slabs int, err error) {
+	return indexStoreBoundEntries(db.lkpIndexStore(nameKey), db.lkpStore(tableName), suffix, b, prefixByteLen, mask)
 }
 
 // indexStoreBoundEntries is indexScanBoundEntries over already-resolved index and table stores, for
 // a caller that must not take the temp-first name walk (an FK action scoped to its own domain,
 // constraints.md §6.6).
-func indexStoreBoundEntries(istore, store *tableStore, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (out []entry, pages, slabs int, err error) {
+func indexStoreBoundEntries(istore, store *tableStore, suffix []keySlot, b keyBound, prefixByteLen int, mask []bool) (out []entry, pages, slabs int, err error) {
 	// The index store has no payload columns, so its mask is empty and its fused scan contributes
 	// only the index-tree page_read count (no spill/compress units).
 	entries, pages, _, err := istore.RangeScanWithUnits(b, nil)
@@ -1910,18 +2053,10 @@ func indexStoreBoundEntries(istore, store *tableStore, suffixTypes []scalarType,
 		return nil, 0, 0, err
 	}
 	for _, e := range entries {
-		// Skip the equality prefix by its known byte length, then each remaining key component
-		// (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the body stepped over by width or
-		// delimiter, indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
-		at := prefixByteLen
-		for _, ty := range suffixTypes {
-			at = keySlotEnd(e.Key, at, ty)
-		}
-		// A short entry (a page that disagrees with its index) yields an empty key, which names no row.
-		var rowKey []byte
-		if at <= len(e.Key) {
-			rowKey = e.Key[at:]
-		}
+		// Skip the equality prefix by its known byte length, then each remaining key component by
+		// its self-delimiting slot (indexes.md §5.1); the suffix after them is the row's storage
+		// key (indexes.md §3). A corrupt entry yields an empty storage key (no row).
+		rowKey := indexEntryRowKey(e.Key, prefixByteLen, suffix)
 		row, ok, n, sl, err := store.GetWithUnits(rowKey, mask)
 		if err != nil {
 			return nil, 0, 0, err
@@ -1939,10 +2074,10 @@ func indexStoreBoundEntries(istore, store *tableStore, suffixTypes []scalarType,
 // indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
 // equality prefix scan [0x00‖value, byte-successor) over the index B-tree plus, per admitted entry,
 // the row's point lookup. Used by the OR / IN-list secondary-index point-set (indexKeySetRows),
-// where each distinct list value is one such point probe. suffixTypes are the trailing key
-// components (columns[1:], fixed-width), width-skipped past the single leading slot.
-func (db *engine) indexPointRows(tableName, nameKey string, suffixTypes []scalarType, valueKey []byte, mask []bool) (rows []storedRow, pages, slabs int, err error) {
-	entries, pages, slabs, err := db.indexPointEntries(tableName, nameKey, suffixTypes, valueKey, mask)
+// where each distinct list value is one such point probe. suffix holds the trailing key
+// components' slots (columns[1:]), skipped past the single leading slot.
+func (db *engine) indexPointRows(tableName, nameKey string, suffix []keySlot, valueKey []byte, mask []bool) (rows []storedRow, pages, slabs int, err error) {
+	entries, pages, slabs, err := db.indexPointEntries(tableName, nameKey, suffix, valueKey, mask)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -1953,10 +2088,10 @@ func (db *engine) indexPointRows(tableName, nameKey string, suffixTypes []scalar
 	return rows, pages, slabs, nil
 }
 
-func (db *engine) indexPointEntries(tableName, nameKey string, suffixTypes []scalarType, valueKey []byte, mask []bool) (entries []entry, pages, slabs int, err error) {
+func (db *engine) indexPointEntries(tableName, nameKey string, suffix []keySlot, valueKey []byte, mask []bool) (entries []entry, pages, slabs int, err error) {
 	prefix := append([]byte{0x00}, valueKey...)
 	b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
-	return db.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, len(prefix), mask)
+	return db.indexScanBoundEntries(tableName, nameKey, suffix, b, len(prefix), mask)
 }
 
 func buildLogicalInterval(keyType scalarType, terms []boundTerm, params []Value, outer []storedRow, coll *Collation, left storedRow) (keyBound, bool) {
@@ -3010,28 +3145,6 @@ func collationsEqual(a, b *Collation) bool {
 	return a.Name == b.Name
 }
 
-// filterImpliesPredicate reports whether the WHERE filter implies a PARTIAL index's predicate
-// (spec/design/indexes.md §9). jed's syntactic test (PG's, not a prover): every top-level conjunct
-// of pred must be present as a top-level conjunct of filter (so a conjunctive predicate a AND b is
-// implied by a WHERE that lists both a and b). pred is in table-local column coords; a filter
-// conjunct is global, so it is matched shifted by offset. Sound-if-conservative: a miss means the
-// index is not used (a correct full scan + residual filter).
-func filterImpliesPredicate(filter, pred *rExpr, offset int) bool {
-	if pred.kind == reAnd {
-		return filterImpliesPredicate(filter, pred.lhs, offset) &&
-			filterImpliesPredicate(filter, pred.rhs, offset)
-	}
-	// filter contains a top-level conjunct structurally equal to pred.
-	var contains func(f *rExpr) bool
-	contains = func(f *rExpr) bool {
-		if f.kind == reAnd {
-			return contains(f.lhs) || contains(f.rhs)
-		}
-		return rexprEqShifted(f, pred, offset)
-	}
-	return contains(filter)
-}
-
 // asBoundTerm recognizes a single comparison conjunct: a comparison (=,<,<=,>,>=) whose one side
 // matches the bound's key operand (a bare LOCAL column at key.col, or the resolved index
 // expression — a correlated reOuterColumn is a different kind, so it never matches) and whose
@@ -3665,7 +3778,7 @@ type indexOrderPlan struct {
 // match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
 // the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
 // multi-column index would tie-break by the remaining index columns, not the PK.
-func (db *engine) orderSatisfiedByIndexes(table *catTable, offset int, order []orderSlot) []indexOrderPlan {
+func (db *engine) orderSatisfiedByIndexes(table *catTable, offset int, order []orderSlot, filter *rExpr) []indexOrderPlan {
 	pkWidth, ok := pkStorageWidth(table)
 	if !ok {
 		return nil
@@ -3675,12 +3788,13 @@ func (db *engine) orderSatisfiedByIndexes(table *catTable, offset int, order []o
 		if idx.Kind != indexBtree {
 			continue // only an ordered B-tree realizes the column order (GIN/GiST do not)
 		}
-		// A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds
-		// only its qualifying rows, so walking it would drop rows unless the query implies the
-		// predicate — that gate lives only on the access-predicate bound. Stays non-partial (a
-		// follow-on); falling through leaves a correct full-scan + sort.
+		// A PARTIAL index holds only its qualifying rows (indexes.md §9), so walking it for order
+		// is sound only when the WHERE implies its predicate (§9.1). The caller is a single-relation
+		// scan, so no row is NULL-extended.
 		if idx.Predicate != nil {
-			continue
+			if filter == nil || !db.partialIndexImplied(filter, table, offset, idx) {
+				continue
+			}
 		}
 		// ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression
 		// index key is a follow-on — indexes.md §5).
@@ -3726,8 +3840,8 @@ func (db *engine) orderSatisfiedByIndexes(table *catTable, offset int, order []o
 	return matches
 }
 
-func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []orderSlot) *indexOrderPlan {
-	matches := db.orderSatisfiedByIndexes(table, offset, order)
+func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []orderSlot, filter *rExpr) *indexOrderPlan {
+	matches := db.orderSatisfiedByIndexes(table, offset, order, filter)
 	if len(matches) == 0 {
 		return nil
 	}

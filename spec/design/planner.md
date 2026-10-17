@@ -592,7 +592,10 @@ is:
    no second tree.
 2. **B-tree index access predicate** — the **lowest-name** (byte order) index yielding a
    non-empty equality-prefix (+ optional trailing range) predicate; column and expression
-   keys; a partial index only when a WHERE conjunct structurally implies its predicate.
+   keys; a partial index only when the WHERE implies its predicate ([indexes.md](indexes.md)
+   §9.1). The single-relation cost selector also inventories a **full partial-index scan** for a
+   partial index whose predicate the WHERE implies but whose keys it does not bound (indexes.md
+   §9.2); the structural selector never sees that candidate.
 3. **GiST bound** — a range/scalar operator conjunct over a GiST-indexed column.
 4. **GIN bound** — an array-operator conjunct (`@>`, `&&`, `= ANY`, `=`) over a
    GIN-indexed column.

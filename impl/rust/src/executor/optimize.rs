@@ -1093,7 +1093,11 @@ impl Engine {
                 plan.phys.rel_estimates.push(Vec::new());
                 continue;
             }
-            let candidates = inventory_scan_candidates(plan.filter.access(), rel, scope.catalog);
+            let candidates = if plan.rels.len() == 1 {
+                inventory_single_relation_candidates(plan.filter.access(), rel, scope.catalog)
+            } else {
+                inventory_scan_candidates(plan.filter.access(), rel, scope.catalog)
+            };
             let estimates = estimate_scan_candidates(
                 &candidates,
                 rel,
@@ -1129,7 +1133,7 @@ impl Engine {
             return;
         }
         let rel = &scope.rels[0];
-        let access = inventory_scan_candidates(plan.filter.access(), rel, scope.catalog);
+        let access = inventory_single_relation_candidates(plan.filter.access(), rel, scope.catalog);
         if access.is_empty() {
             return;
         }
@@ -1147,7 +1151,13 @@ impl Engine {
             && plan.order_exprs.is_empty()
             && pk_dir.is_none()
         {
-            order_satisfied_by_indexes(rel.table, plan.rels[0].offset, &plan.order, self)
+            order_satisfied_by_indexes(
+                rel.table,
+                plan.rels[0].offset,
+                &plan.order,
+                plan.filter.access(),
+                self,
+            )
         } else {
             Vec::new()
         };
@@ -1324,8 +1334,14 @@ impl Engine {
             // index-order exec resolves its index store UNSCOPED, so gate it off (perf follow-on).
             && !scope.rels[0].is_attachment()
         {
-            order_satisfied_by_index(scope.rels[0].table, plan.rels[0].offset, &plan.order, self)
-                .filter(|io| index_order_compatible_bound(io, plan.phys.rel_bounds[0].as_ref()))
+            order_satisfied_by_index(
+                scope.rels[0].table,
+                plan.rels[0].offset,
+                &plan.order,
+                plan.filter.access(),
+                self,
+            )
+            .filter(|io| index_order_compatible_bound(io, plan.phys.rel_bounds[0].as_ref()))
         } else {
             None
         };

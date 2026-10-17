@@ -225,7 +225,12 @@ func (db *engine) ruleScanBounds(plan *selectPlan, rels []scopeRel) {
 		if plan.rels[i].srf != nil || plan.rels[i].derived != nil || plan.rels[i].cte != nil {
 			continue
 		}
-		candidates := inventoryScanCandidates(plan.accessPredicate(), rel, db)
+		var candidates []scanCandidate
+		if len(plan.rels) == 1 {
+			candidates = inventorySingleRelationCandidates(plan.accessPredicate(), rel, db)
+		} else {
+			candidates = inventoryScanCandidates(plan.accessPredicate(), rel, db)
+		}
 		producesRows := len(rels) == 1 && !plan.isAgg && !plan.distinct && plan.limit == nil && plan.offset == nil && !plan.hasWindow
 		plan.phys.relEstimates[i] = db.estimateScanCandidates(candidates, rel, producesRows)
 		legacy := selectLegacyScanCandidate(candidates)
@@ -258,7 +263,7 @@ func (db *engine) ruleCostedSingleRelationPipeline(plan *selectPlan, rels []scop
 		return
 	}
 	rel := rels[0]
-	access := inventoryScanCandidates(plan.accessPredicate(), rel, db)
+	access := inventorySingleRelationCandidates(plan.accessPredicate(), rel, db)
 	if len(access) == 0 {
 		return
 	}
@@ -270,7 +275,7 @@ func (db *engine) ruleCostedSingleRelationPipeline(plan *selectPlan, rels []scop
 	var indexOrders []indexOrderPlan
 	if !rel.isAttachment() && !plan.isAgg && !plan.hasWindow && !plan.distinct &&
 		len(plan.order) > 0 && len(plan.orderExprs) == 0 && !pkOrdered {
-		indexOrders = db.orderSatisfiedByIndexes(rel.table, plan.rels[0].offset, plan.order)
+		indexOrders = db.orderSatisfiedByIndexes(rel.table, plan.rels[0].offset, plan.order, plan.accessPredicate())
 	}
 
 	pipelines := make([]singleRelationPipelineCandidate, 0, len(access)+len(indexOrders))
@@ -998,7 +1003,7 @@ func (db *engine) ruleOrderByIndexScan(plan *selectPlan, rels []scopeRel) {
 	if !plan.isAgg && !plan.hasWindow && !plan.distinct && !plan.phys.pkOrdered && plan.limit != nil &&
 		len(plan.order) > 0 && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && plan.rels[0].srf == nil &&
 		plan.rels[0].cte == nil && plan.rels[0].derived == nil {
-		io := db.orderSatisfiedByIndex(rels[0].table, plan.rels[0].offset, plan.order)
+		io := db.orderSatisfiedByIndex(rels[0].table, plan.rels[0].offset, plan.order, plan.accessPredicate())
 		if io != nil && indexOrderCompatibleBound(io, plan.phys.relBounds[0]) {
 			plan.phys.indexOrder = io
 		}

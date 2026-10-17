@@ -1,0 +1,70 @@
+# A COLLATED text element as the range element or a trailing element of an ordered-index access
+# predicate (spec/design/indexes.md §5.1, encoding.md §2.12). A collated key stores the column
+# collation's UCA sort key — three levels of 2-byte weights, each ended by a 0x0000 separator, then
+# the identical level (the string's terminated `C` key) — so the slot is self-delimiting and an
+# admitted entry's storage key is recovered by skipping it. A range on the collated element encodes
+# its endpoints as sort keys, so it range-scans the index in collation order. Engagement is pinned
+# the cost way: each query reads only its range, strictly less than a full scan of the 30 rows.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.collate_column, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.set_returning, query.index_range, query.index_variable_width_tail, types.i32, types.text, null.three_valued, resource.cost_metering
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE cv (id i32 PRIMARY KEY, g i32, name text COLLATE "unicode")
+
+statement ok
+INSERT INTO cv SELECT n, n % 3, 'x' || n FROM generate_series(1, 24) AS n
+
+statement ok
+INSERT INTO cv VALUES (25, 1, 'a'), (26, 1, 'A'), (27, 1, 'b'), (28, 1, 'B'), (29, 1, NULL), (30, 1, 'z')
+
+statement ok
+CREATE INDEX cv_g_name ON cv (g, name)
+
+# the trailing collated slot is skipped to reach the storage key
+# cost: 33
+query IT rowsort
+SELECT id, name FROM cv WHERE g = 2
+----
+11
+x11
+14
+x14
+17
+x17
+2
+x2
+20
+x20
+23
+x23
+5
+x5
+8
+x8
+
+# a range on the collated element after the equality prefix: unicode order a < A < b < B < … < z
+# cost: 37
+query IT rowsort
+SELECT id, name FROM cv WHERE g = 1 AND name > 'a' AND name < 'x'
+----
+26
+A
+27
+b
+28
+B
+
+statement ok
+CREATE INDEX cv_name ON cv (name)
+
+# a bare range on a collated leading element
+# cost: 25
+query IT rowsort
+SELECT id, name FROM cv WHERE name >= 'B' AND name <= 'x1'
+----
+1
+x1
+28
+B

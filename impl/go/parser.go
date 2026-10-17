@@ -3383,8 +3383,10 @@ func (p *parser) parseOnConflict() (*onConflict, error) {
 	p.advance() // ON
 	p.advance() // CONFLICT
 
-	// Optional conflict target: a `( col, … )` column list or `ON CONSTRAINT name`.
+	// Optional conflict target: a `( col, … )` column list (with an optional `WHERE
+	// index_predicate`) or `ON CONSTRAINT name`.
 	var target *conflictTarget
+	var indexPredicate *exprNode
 	if p.peek().Kind == tokLParen {
 		p.advance() // '('
 		var cols []string
@@ -3403,6 +3405,11 @@ func (p *parser) parseOnConflict() (*onConflict, error) {
 			}
 			break
 		}
+		pred, err := p.parseOptionalWhere()
+		if err != nil {
+			return nil, err
+		}
+		indexPredicate = pred
 		target = &conflictTarget{Columns: cols}
 	} else if p.peekKeyword() == "on" {
 		p.advance() // ON
@@ -3423,7 +3430,7 @@ func (p *parser) parseOnConflict() (*onConflict, error) {
 	switch p.peekKeyword() {
 	case "nothing":
 		p.advance()
-		return &onConflict{Target: target, DoUpdate: false}, nil
+		return &onConflict{Target: target, IndexPredicate: indexPredicate, DoUpdate: false}, nil
 	case "update":
 		p.advance()
 		if err := p.expectKeyword("set"); err != nil {
@@ -3454,7 +3461,7 @@ func (p *parser) parseOnConflict() (*onConflict, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &onConflict{Target: target, DoUpdate: true, Assignments: assignments, Filter: filter}, nil
+		return &onConflict{Target: target, IndexPredicate: indexPredicate, DoUpdate: true, Assignments: assignments, Filter: filter}, nil
 	default:
 		return nil, newError(SyntaxError,
 			fmt.Sprintf("expected NOTHING or UPDATE after ON CONFLICT DO, found %q", p.peekKeyword()))

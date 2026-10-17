@@ -684,6 +684,9 @@ pub struct OnConflict {
     /// The optional conflict target (the arbiter). `None` is legal only with `DoNothing`
     /// (any uniqueness conflict is then skipped); `DoUpdate` with `None` is 42601.
     pub target: Option<ConflictTarget>,
+    /// The optional `WHERE index_predicate` after a `( col, … )` target (upsert.md §2): it lets a
+    /// PARTIAL unique index whose predicate it implies be inferred as the arbiter.
+    pub index_predicate: Option<Expr>,
     pub action: ConflictAction,
 }
 

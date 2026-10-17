@@ -1643,6 +1643,21 @@ P6b adds `order_only_index_limit` and `gist_range_select`, and treats `gin_conta
 interval-set choices across every native core; timings remain observational and checksum equality is
 the benchmark gate.
 
+The secondary-index follow-ons add three scratch lanes. `index_vartail_prefix` bounds an index on
+`(a, s text)` by `a = $1`, which needs the variable-width slot skip (indexes.md §5.1).
+`partial_index_implied_range` queries a partial index `WHERE amt > 0` with a literal range that
+implies the predicate (§9.1). `partial_index_live_topn` walks a soft-delete partial index for
+`ORDER BY k LIMIT 10` with no key condition (§9.2). Alternating base/after runs (base `172e3b0a`,
+two rounds each, jed harnesses only, p50; the machine was shared with another benchmark run):
+
+| lane | Rust base → after | Go base → after | TS base → after |
+|---|---|---|---|
+| `index_vartail_prefix` | 20.6–20.9 → 0.061–0.065 ms | 27.9 → 0.061–0.110 ms | 55.7–57.0 → 0.24–0.34 ms |
+| `partial_index_implied_range` | 8.1–8.9 → 0.076–0.077 ms | 9.5–10.3 → 0.086–0.087 ms | 24.2–24.7 → 0.32 ms |
+| `partial_index_live_topn` | 6.7 → 0.005 ms | 8.6–9.0 → 0.004–0.021 ms | 25.5–28.3 → 0.027 ms |
+
+Every core and both variants returned the same checksums.
+
 ### Unchanged writable commit regression
 
 `go test -C impl/go -run '^$' -bench BenchmarkWritableNoopCommit -benchtime=300x -count=3`
