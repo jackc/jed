@@ -1,0 +1,87 @@
+# Aggregate bit_and(integer) -> the input type (spec/design/aggregates.md §23): the bitwise AND of
+# the non-NULL inputs. NULL inputs are skipped; an empty or all-NULL group -> NULL. Output name
+# `bit_and`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i16, types.i32, types.i64, resource.cost_metering, func.bit_and
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, a i32, s i16, l i64)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 7, 12, -1), (2, 1, NULL, NULL, NULL), (3, 1, 13, 10, 9223372036854775807), (4, 2, -1, -6, -9223372036854775808), (5, 2, -8, 3, 5), (6, 3, NULL, NULL, NULL)
+
+# 6 rows read + 1 leaf page read + 6 accumulated + 1 produced.
+# names: bit_and
+# cost: 14
+query I nosort
+SELECT bit_and(a) FROM t
+----
+0
+
+# names: bit_and, bit_and, bit_and
+query III nosort
+SELECT bit_and(a), bit_and(s), bit_and(l) FROM t WHERE g = 1
+----
+5
+8
+9223372036854775807
+
+# names: bit_and, bit_and, bit_and
+query III nosort
+SELECT bit_and(a), bit_and(s), bit_and(l) FROM t WHERE g = 2
+----
+-8
+2
+0
+
+# All-NULL and empty groups are NULL.
+# names: g, bit_and
+query II rowsort
+SELECT g, bit_and(a) FROM t GROUP BY g
+----
+1
+5
+2
+-8
+3
+NULL
+
+# names: bit_and
+query I nosort
+SELECT bit_and(a) FROM t WHERE g = 9
+----
+NULL
+
+# names: bit_and
+query I nosort
+SELECT bit_and(a + 1) FROM t WHERE g = 1
+----
+8
+
+# names: bit_and
+query I nosort
+SELECT bit_and(DISTINCT a) FILTER (WHERE id < 4) FROM t
+----
+5
+
+# names: id, bit_and
+query II nosort
+SELECT id, bit_and(a) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+7
+2
+7
+3
+5
+4
+5
+5
+0
+6
+0
+
+statement error 42883
+SELECT bit_and(a::numeric) FROM t
+
+statement error 42883
+SELECT bit_and(a > 0) FROM t

@@ -1206,6 +1206,7 @@ fn pack_acc(acc: Acc) -> Row {
         ],
         Acc::MinMax { cur, .. } => vec![cur.unwrap_or(Value::Null)],
         Acc::Bool { cur, .. } => vec![cur.map_or(Value::Null, Value::Bool)],
+        Acc::Bit { cur, .. } => vec![cur.map_or(Value::Null, Value::Int)],
         Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => vec![Value::Bool(seen)],
         Acc::OrderedSet { .. } | Acc::Hypothetical { .. } | Acc::Ordered { .. } => Vec::new(),
     }
@@ -1262,6 +1263,12 @@ fn unpack_acc(spec: &AggSpec, state: Row, zone: &crate::timezone::ZoneRef) -> Ac
         Acc::Bool { cur, .. } => {
             *cur = match state[0] {
                 Value::Bool(b) => Some(b),
+                _ => None,
+            }
+        }
+        Acc::Bit { cur, .. } => {
+            *cur = match state[0] {
+                Value::Int(n) => Some(n),
                 _ => None,
             }
         }

@@ -124,6 +124,7 @@ impl Acc {
                 cur: None,
                 is_and: true,
             },
+            AggPlan::Bit(op) => Acc::Bit { cur: None, op },
             AggPlan::BoolOr => Acc::Bool {
                 cur: None,
                 is_and: false,
@@ -269,6 +270,15 @@ impl Acc {
                         None => b,
                         Some(c) if *is_and => c && b,
                         Some(c) => c || b,
+                    });
+                }
+            }
+            Acc::Bit { cur, op } => {
+                // NULLs are skipped (aggregates.md §23). The result stays within the input width.
+                if let Value::Int(v) = value {
+                    *cur = Some(match (*cur, *op) {
+                        (None, _) => v,
+                        (Some(c), BitOp::And) => c & v,
                     });
                 }
             }
@@ -466,6 +476,7 @@ impl Acc {
             } => finalize_float_fold(width, is_avg, total, count, any_nan, pos_inf, neg_inf)?,
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
             Acc::Bool { cur, .. } => cur.map_or(Value::Null, Value::Bool),
+            Acc::Bit { cur, .. } => cur.map_or(Value::Null, Value::Int),
             // json_agg/jsonb_agg: NULL over an empty group; else the JSON array (json: PG's
             // `", "`-joined element texts; jsonb: the canonical array).
             Acc::JsonAgg {

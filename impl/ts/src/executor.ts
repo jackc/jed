@@ -32237,6 +32237,7 @@ export type AggPlan =
   | "max"
   | "boolAnd" // bool_and(x) — TRUE iff every non-NULL input is TRUE (aggregates.md §23)
   | "boolOr" // bool_or(x) — TRUE iff some non-NULL input is TRUE (aggregates.md §23)
+  | "bitAnd" // bit_and(x) — the bitwise AND of the non-NULL integer inputs (aggregates.md §23)
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32737,6 +32738,11 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       // skipped. A FALSE input decides bool_and, a TRUE one bool_or.
       if (v.kind === "bool" && (a.cur === null || v.value === (a.plan === "boolOr"))) a.cur = v;
       break;
+    case "bitAnd":
+      // The running bitwise fold of the non-NULL inputs (aggregates.md §23); NULLs are skipped. The
+      // result stays within the input width, so it never overflows.
+      if (v.kind === "int") a.cur = a.cur === null ? v : intValue((a.cur as { int: bigint }).int & v.int);
+      break;
     case "jsonAgg":
       // Called once per group row, NULL-valued rows INCLUDED. `seen` marks the group non-empty even
       // when the strict filter drops this row (so a one-NULL-row strict group finalizes to [] not
@@ -32883,6 +32889,7 @@ export function finalizeAcc(a: Acc): Value {
     case "max":
     case "boolAnd":
     case "boolOr":
+    case "bitAnd":
       return a.cur ?? nullValue();
     case "jsonAgg": {
       // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array (json:
@@ -35593,6 +35600,7 @@ export function aggregatePlan(
   if ((surface === "bool_and" || surface === "every") && code === "boolean")
     return ["boolAnd", { kind: "bool" }, undefined];
   if (surface === "bool_or" && code === "boolean") return ["boolOr", { kind: "bool" }, undefined];
+  if (surface === "bit_and" && code === "same_as_input") return ["bitAnd", t, undefined];
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (B4). The (surface, result-code) pair
   // selects the result type + the two flags; the result code is "jsonb" or "json". asJson = the json
   // result type; strict = the _strict variant (skip a NULL-valued row).
@@ -37231,6 +37239,7 @@ function packedStateBytes(accs: Acc[]): number {
       case "max":
       case "boolAnd":
       case "boolOr":
+      case "bitAnd":
         n += valueBytes(a.cur ?? nullValue());
         break;
       default:

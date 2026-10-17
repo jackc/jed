@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // bit_and(integer) — the bitwise AND of the non-NULL inputs (aggregates.md §23).
+    "func.bit_and",
     // every(boolean) — the SQL-standard spelling of bool_and (aggregates.md §23).
     "func.every",
     // bool_or(boolean) — TRUE iff some non-NULL input is TRUE (aggregates.md §23).

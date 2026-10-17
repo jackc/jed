@@ -863,6 +863,8 @@ var SupportedCapabilities = []string{
 	// (key, value) pairs into one JSON object; _unique errors 22030 on a duplicate key
 	// (json-sql-functions.md §4).
 	"func.json_object_agg",
+	// bit_and(integer) — the bitwise AND of the non-NULL inputs (aggregates.md §23).
+	"func.bit_and",
 	// every(boolean) — the SQL-standard spelling of bool_and (aggregates.md §23).
 	"func.every",
 	// bool_or(boolean) — TRUE iff some non-NULL input is TRUE (aggregates.md §23).

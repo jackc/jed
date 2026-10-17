@@ -6057,6 +6057,12 @@ pub(crate) enum WindowPlan {
     NthValue,
 }
 
+/// The bitwise operation a bit aggregate folds with (aggregates.md §23).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BitOp {
+    And,
+}
+
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
 /// (the PG widening — spec/design/aggregates.md §3).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6082,6 +6088,9 @@ pub(crate) enum AggPlan {
     BoolAnd,
     /// bool_or(x) — TRUE iff some non-NULL input is TRUE (aggregates.md §23).
     BoolOr,
+    /// bit_and / bit_or / bit_xor(x) — the bitwise fold of the non-NULL integer inputs, result the
+    /// input type (aggregates.md §23).
+    Bit(BitOp),
     /// json_agg / jsonb_agg (and the `_strict` variants) — aggregate the inputs' JSON images into a
     /// JSON array (json-sql-functions.md §4). `compact` selects the `json` (compact) vs `jsonb`
     /// (canonical) result render; `strict` skips a NULL input (else a NULL → JSON null).
@@ -6255,6 +6264,12 @@ pub(crate) enum Acc {
     Bool {
         cur: Option<bool>,
         is_and: bool,
+    },
+    /// bit_and / bit_or / bit_xor: the running bitwise fold of the non-NULL inputs, `None` until one
+    /// is folded (aggregates.md §23).
+    Bit {
+        cur: Option<i64>,
+        op: BitOp,
     },
     MinMax {
         cur: Option<Value>,

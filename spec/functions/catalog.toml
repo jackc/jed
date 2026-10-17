@@ -5756,6 +5756,18 @@ result       = "boolean"
 null         = "aggregate"
 errors       = []
 
+# bit_and(integer) -> the input type (aggregates.md §23): the bitwise AND of the non-NULL inputs; NULL
+# over an empty/all-NULL group. Order-insensitive; never overflows (the result stays within the width).
+[[aggregate]]
+name         = "bit_and"
+kind         = "aggregate"
+surface      = "bit_and"
+arg          = "expr"
+arg_families = ["integer"]
+result       = "same_as_input"
+null         = "aggregate"
+errors       = []
+
 # json/jsonb array aggregates (B4, json-sql-functions.md §4): aggregate the input values into a JSON
 # array, in the group's row order (or the in-aggregate ORDER BY). json_agg/jsonb_agg INCLUDE a NULL
 # input (as JSON null); the _strict variants SKIP a NULL input. Result NULL over an empty group. Each
