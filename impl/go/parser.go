@@ -480,32 +480,34 @@ func unloggedNotSupported() error {
 	return newError(FeatureNotSupported, "unlogged tables are not supported")
 }
 
-// atDeferredCreateView reports whether the statement is one of the deferred `CREATE … VIEW` forms
-// (views.md §12): `CREATE [OR REPLACE] TEMP | TEMPORARY VIEW`, `CREATE [OR REPLACE] RECURSIVE VIEW`,
-// `CREATE MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
+// atDeferredCreateView reports whether the statement is the deferred `CREATE MATERIALIZED VIEW`
+// (views.md §12), recognized by keyword sequence so it fails 0A000, not 42601.
 func (p *parser) atDeferredCreateView() bool {
+	return p.peekKeywordAt(1) == "materialized" && p.peekKeywordAt(2) == "view"
+}
+
+// atCreateView reports whether the statement is `CREATE [OR REPLACE] [TEMP | TEMPORARY] [RECURSIVE]
+// VIEW` (views.md §1, §10, §17).
+func (p *parser) atCreateView() bool {
 	at := 1
 	if p.peekKeywordAt(1) == "or" && p.peekKeywordAt(2) == "replace" {
 		at = 3
 	}
-	switch p.peekKeywordAt(at) {
-	case "temp", "temporary", "recursive", "materialized":
-		return p.peekKeywordAt(at+1) == "view"
+	if k := p.peekKeywordAt(at); k == "temp" || k == "temporary" {
+		at++
 	}
-	return false
+	if p.peekKeywordAt(at) == "recursive" {
+		at++
+	}
+	return p.peekKeywordAt(at) == "view"
 }
 
-// atCreateView reports whether the statement is `CREATE [OR REPLACE] VIEW` (views.md §1).
-func (p *parser) atCreateView() bool {
-	return p.peekKeywordAt(1) == "view" ||
-		(p.peekKeywordAt(1) == "or" && p.peekKeywordAt(2) == "replace" && p.peekKeywordAt(3) == "view")
-}
-
-// parseCreateView parses `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS
-// subquery_expr` (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end of
-// the statement and is captured as its canonical token text. A trailing `WITH [CASCADED | LOCAL] CHECK
-// OPTION` is cut off before the body and gives the view a check option (§15.6). A `WITH ( … )` option
-// list after the name is a deferred form (0A000). `OR REPLACE` with `IF NOT EXISTS` is 42601.
+// parseCreateView parses `CREATE [OR REPLACE] [TEMP | TEMPORARY] [RECURSIVE] VIEW [IF NOT EXISTS]
+// [db.]name [(col, …)] [WITH (option, …)] AS subquery_expr` (views.md §1, grammar.md §54). The body
+// runs from the token after `AS` to the end of the statement and is captured as its canonical token
+// text. A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body and gives the view
+// a check option (§15.6). `RECURSIVE` requires the column list and stores the body wrapped as `WITH
+// RECURSIVE` (§17). `OR REPLACE` with `IF NOT EXISTS` is 42601.
 func (p *parser) parseCreateView() (*createView, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
@@ -516,6 +518,14 @@ func (p *parser) parseCreateView() (*createView, error) {
 		if err := p.expectKeyword("replace"); err != nil {
 			return nil, err
 		}
+	}
+	temporary := p.peekKeyword() == "temp" || p.peekKeyword() == "temporary"
+	if temporary {
+		p.advance()
+	}
+	recursive := p.peekKeyword() == "recursive"
+	if recursive {
+		p.advance()
 	}
 	if err := p.expectKeyword("view"); err != nil {
 		return nil, err
@@ -535,9 +545,6 @@ func (p *parser) parseCreateView() (*createView, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.peekKeyword() == "with" && p.peekKindAt(1) == tokLParen {
-		return nil, newError(FeatureNotSupported, "view options (WITH ( … )) are not supported")
-	}
 	var columns []string
 	if p.peek().Kind == tokLParen {
 		p.advance()
@@ -553,6 +560,16 @@ func (p *parser) parseCreateView() (*createView, error) {
 			p.advance()
 		}
 		if err := p.expect(tokRParen); err != nil {
+			return nil, err
+		}
+	}
+	if recursive && columns == nil {
+		return nil, newError(SyntaxError, "CREATE RECURSIVE VIEW requires a column list")
+	}
+	var options []viewOption
+	if p.peekKeyword() == "with" && p.peekKindAt(1) == tokLParen {
+		p.advance() // WITH
+		if options, err = p.parseViewOptions(); err != nil {
 			return nil, err
 		}
 	}
@@ -576,19 +593,126 @@ func (p *parser) parseCreateView() (*createView, error) {
 	if checkAt >= 0 && end != checkAt {
 		return nil, newError(SyntaxError, "unexpected trailing input")
 	}
-	body := renderTokens(p.tokens[start:end])
+	if recursive && checkAt >= 0 {
+		return nil, newError(FeatureNotSupported, "WITH CHECK OPTION not supported on recursive views")
+	}
 	// The body's token positions, through the token after it (the re-lexed body's TokEof), so
 	// validating the body reports positions into the statement (spec/design/error-fields.md §10.1).
 	var bodyPositions []int32
 	if end < len(p.positions) {
 		bodyPositions = append([]int32(nil), p.positions[start:end+1]...)
 	}
-	return &createView{Name: name, DB: db, OrReplace: orReplace, IfNotExists: ifNotExists, Columns: columns, Body: body, BodyPositions: bodyPositions, CheckOption: option}, nil
+	var body string
+	if recursive {
+		// `with recursive "name" ( "c" , … ) as ( <body> ) select "c" , … from "name"` (views.md
+		// §17). The synthesized tokens take the positions of the body's first token and of the token
+		// after it, so an error inside the body still points into it.
+		prefix, suffix := recursiveViewWrapper(name, columns)
+		if len(bodyPositions) > 0 {
+			first, last := bodyPositions[0], bodyPositions[len(bodyPositions)-1]
+			positions := make([]int32, 0, len(prefix)+len(bodyPositions)+len(suffix))
+			for range prefix {
+				positions = append(positions, first)
+			}
+			positions = append(positions, bodyPositions[:len(bodyPositions)-1]...)
+			for i := 0; i <= len(suffix); i++ {
+				positions = append(positions, last)
+			}
+			bodyPositions = positions
+		}
+		tokens := append([]token(nil), prefix...)
+		tokens = append(tokens, p.tokens[start:end]...)
+		tokens = append(tokens, suffix...)
+		body = renderTokens(tokens)
+	} else {
+		body = renderTokens(p.tokens[start:end])
+	}
+	return &createView{Name: name, DB: db, OrReplace: orReplace, IfNotExists: ifNotExists, Columns: columns, Body: body, BodyPositions: bodyPositions, CheckOption: option, Temporary: temporary, Options: options}, nil
+}
+
+// parseViewOptions parses `( name [= value] [, …] )` — a view option list (views.md §16). The name is
+// an identifier; the value a word, string, or (signed) number, kept as written for the executor to
+// validate.
+func (p *parser) parseViewOptions() ([]viewOption, error) {
+	if err := p.expect(tokLParen); err != nil {
+		return nil, err
+	}
+	var out []viewOption
+	for {
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		opt := viewOption{Name: name}
+		if p.peek().Kind == tokEq {
+			p.advance()
+			if opt.Value, err = p.parseViewOptionValue(); err != nil {
+				return nil, err
+			}
+			opt.HasValue = true
+		}
+		out = append(out, opt)
+		if p.peek().Kind == tokComma {
+			p.advance()
+			continue
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+}
+
+// parseViewOptionValue parses one view option value (views.md §16): a word (folded), a quoted
+// identifier, a string, or an integer with an optional sign, as text.
+func (p *parser) parseViewOptionValue() (string, error) {
+	negative := p.peek().Kind == tokMinus
+	if negative {
+		p.advance()
+	}
+	t := p.peek()
+	var value string
+	switch {
+	case !negative && (t.Kind == tokWord || t.Kind == tokQuotedIdent || t.Kind == tokStr):
+		value = t.Word
+	case t.Kind == tokInt && negative:
+		value = fmt.Sprintf("-%d", t.Int)
+	case t.Kind == tokInt:
+		value = fmt.Sprintf("%d", t.Int)
+	default:
+		return "", newError(SyntaxError, "expected an option value")
+	}
+	p.advance()
+	return value, nil
+}
+
+// recursiveViewWrapper returns the tokens a `CREATE RECURSIVE VIEW name (cols) AS body` wraps around
+// its body (views.md §17): `with recursive "name" ( "c" , … ) as (` before it and `) select "c" , …
+// from "name"` after it. Every substituted name is a quoted identifier (views.md §5).
+func recursiveViewWrapper(name string, cols []string) (prefix, suffix []token) {
+	word := func(w string) token { return token{Kind: tokWord, Word: w} }
+	list := func(out []token) []token {
+		for i, c := range cols {
+			if i > 0 {
+				out = append(out, token{Kind: tokComma})
+			}
+			out = append(out, nameToken(c))
+		}
+		return out
+	}
+	prefix = []token{word("with"), word("recursive"), nameToken(name), {Kind: tokLParen}}
+	prefix = list(prefix)
+	prefix = append(prefix, token{Kind: tokRParen}, word("as"), token{Kind: tokLParen})
+	suffix = []token{{Kind: tokRParen}, word("select")}
+	suffix = list(suffix)
+	suffix = append(suffix, word("from"), nameToken(name))
+	return prefix, suffix
 }
 
 // parseAlterView parses `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }`
-// (views.md §7.1). The other ALTER VIEW actions (`ALTER [COLUMN]`, `OWNER TO`, `SET …`, `RESET …`) are
-// recognized by their first keyword and refused with 0A000.
+// (views.md §7.1), or a comma list of `ALTER [COLUMN] c { SET DEFAULT expr | DROP DEFAULT }`, `SET (
+// option, … )`, and `RESET ( name, … )` (§16). `OWNER TO` and `SET SCHEMA` are recognized and refused
+// with 0A000.
 func (p *parser) parseAlterView() (*alterView, error) {
 	if err := p.expectKeyword("alter"); err != nil {
 		return nil, err
@@ -608,12 +732,20 @@ func (p *parser) parseAlterView() (*alterView, error) {
 	if av.DB, av.Name, err = p.parseQualifiedTableName(); err != nil {
 		return nil, err
 	}
-	switch p.peekKeyword() {
-	case "rename":
-	case "alter", "owner", "set", "reset":
-		return nil, newError(FeatureNotSupported, "this form of ALTER VIEW is not supported")
-	default:
-		return nil, newError(SyntaxError, "expected RENAME after ALTER VIEW name")
+	if p.peekKeyword() != "rename" {
+		edit, err := p.parseViewEdit()
+		if err != nil {
+			return nil, err
+		}
+		av.Edits = []viewEdit{edit}
+		for p.peek().Kind == tokComma {
+			p.advance()
+			if edit, err = p.parseViewEdit(); err != nil {
+				return nil, err
+			}
+			av.Edits = append(av.Edits, edit)
+		}
+		return av, nil
 	}
 	p.advance() // RENAME
 	if p.peekKeyword() == "to" {
@@ -639,6 +771,68 @@ func (p *parser) parseAlterView() (*alterView, error) {
 	}
 	av.RenameColumn = &renamePair{Old: old, New: next}
 	return av, nil
+}
+
+// parseViewEdit parses one non-rename ALTER VIEW action (views.md §16).
+func (p *parser) parseViewEdit() (viewEdit, error) {
+	switch kw := p.peekKeyword(); {
+	case kw == "alter":
+		p.advance()
+		if p.peekKeyword() == "column" {
+			p.advance()
+		}
+		column, err := p.expectIdentifier()
+		if err != nil {
+			return viewEdit{}, err
+		}
+		switch p.peekKeyword() {
+		case "set":
+			p.advance()
+			if err := p.expectKeyword("default"); err != nil {
+				return viewEdit{}, err
+			}
+			start := p.pos
+			e, err := p.parseExpr()
+			if err != nil {
+				return viewEdit{}, err
+			}
+			return viewEdit{
+				Kind: viewEditSetDefault, Column: column,
+				Default: defaultDef{Expr: e, Text: renderTokens(p.tokens[start:p.pos])},
+			}, nil
+		case "drop":
+			p.advance()
+			if err := p.expectKeyword("default"); err != nil {
+				return viewEdit{}, err
+			}
+			return viewEdit{Kind: viewEditDropDefault, Column: column}, nil
+		}
+		return viewEdit{}, newError(SyntaxError, "expected SET or DROP")
+	case kw == "set" && p.peekKindAt(1) == tokLParen:
+		p.advance()
+		options, err := p.parseViewOptions()
+		if err != nil {
+			return viewEdit{}, err
+		}
+		return viewEdit{Kind: viewEditSetOptions, Options: options}, nil
+	case kw == "reset":
+		p.advance()
+		options, err := p.parseViewOptions()
+		if err != nil {
+			return viewEdit{}, err
+		}
+		names := make([]string, 0, len(options))
+		for _, o := range options {
+			if o.HasValue {
+				return viewEdit{}, newError(SyntaxError, "RESET must not include values for parameters")
+			}
+			names = append(names, o.Name)
+		}
+		return viewEdit{Kind: viewEditResetOptions, Names: names}, nil
+	case kw == "owner" || kw == "set":
+		return viewEdit{}, newError(FeatureNotSupported, "this form of ALTER VIEW is not supported")
+	}
+	return viewEdit{}, newError(SyntaxError, "expected RENAME, ALTER, SET, or RESET after ALTER VIEW name")
 }
 
 // trailingCheckOption returns the index and option of a trailing `WITH [CASCADED | LOCAL] CHECK
@@ -2568,7 +2762,7 @@ func (p *parser) parseDropType() (*dropType, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Optional trailing RESTRICT / CASCADE (a keyword, consumed here; CASCADE is 0A000 at exec).
+	// Optional trailing RESTRICT / CASCADE: CASCADE drops the dependent views (views.md §6.1).
 	cascade := false
 	switch p.peekKeyword() {
 	case "restrict":
@@ -2577,10 +2771,7 @@ func (p *parser) parseDropType() (*dropType, error) {
 		p.advance()
 		cascade = true
 	}
-	if cascade {
-		return nil, newError(FeatureNotSupported, "DROP TYPE ... CASCADE is not supported")
-	}
-	return &dropType{Name: name, IfExists: ifExists}, nil
+	return &dropType{Name: name, IfExists: ifExists, Cascade: cascade}, nil
 }
 
 // parseCreateSequence parses `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]`
@@ -2838,10 +3029,7 @@ func (p *parser) parseDropSequence() (*dropSequence, error) {
 		p.advance()
 		cascade = true
 	}
-	if cascade {
-		return nil, newError(FeatureNotSupported, "DROP SEQUENCE ... CASCADE is not supported")
-	}
-	return &dropSequence{Names: names, IfExists: ifExists}, nil
+	return &dropSequence{Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
 // parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-5

@@ -1,0 +1,289 @@
+# View column defaults (spec/design/views.md §16.1): ALTER VIEW v ALTER [COLUMN] c SET DEFAULT expr
+# / DROP DEFAULT, and the same ALTER TABLE forms on a view. An INSERT through the view fills a column
+# it does not supply — or a DEFAULT slot — from the view's default before the base table's, and a
+# chain of views applies the default of the view nearest the target first; UPDATE … SET c = DEFAULT
+# assigns the target view's default, else NULL. Every record is PostgreSQL-oracle-checked; the
+# jed-specific behavior (introspection, the stored text, the dump) is in views_defaults_jed.test.
+# requires: ddl.view, ddl.view_default, dml.view_write, dml.view_on_conflict, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.sequence, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.insert_default_values, dml.update, dml.insert_on_conflict, dml.returning, query.select, query.select_star, query.where_eq, query.order_by, types.i32, types.i64, types.text
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32 DEFAULT 5, b text DEFAULT 'base', c i32)
+
+statement ok
+CREATE VIEW v AS SELECT id, a, b FROM t
+
+statement ok
+ALTER VIEW v ALTER COLUMN a SET DEFAULT 10
+
+statement ok
+ALTER VIEW v ALTER b SET DEFAULT 'view'
+
+# an omitted column takes the view's default; a column the view does not show takes the table's
+statement ok
+INSERT INTO v (id) VALUES (1)
+
+# a DEFAULT slot takes the view's default too
+statement ok
+INSERT INTO v VALUES (2, DEFAULT, DEFAULT)
+
+statement ok
+INSERT INTO v VALUES (3, 30, DEFAULT), (4, DEFAULT, 'four')
+
+# a direct INSERT into the table still takes the table's defaults
+statement ok
+INSERT INTO t (id) VALUES (5)
+
+query IITI nosort
+SELECT id, a, b, c FROM t ORDER BY id
+----
+1
+10
+view
+NULL
+2
+10
+view
+NULL
+3
+30
+view
+NULL
+4
+10
+four
+NULL
+5
+5
+base
+NULL
+
+# UPDATE … SET c = DEFAULT assigns the view's default
+statement ok
+UPDATE v SET a = DEFAULT, b = DEFAULT WHERE id = 5
+
+query IIT nosort
+SELECT id, a, b FROM t WHERE id = 5
+----
+5
+10
+view
+
+# DROP DEFAULT: the base table's default applies to an INSERT again, and UPDATE assigns NULL
+statement ok
+ALTER VIEW v ALTER COLUMN a DROP DEFAULT
+
+statement ok
+INSERT INTO v (id) VALUES (6)
+
+statement ok
+UPDATE v SET a = DEFAULT WHERE id = 1
+
+query II nosort
+SELECT id, a FROM t WHERE id IN (1, 6) ORDER BY id
+----
+1
+NULL
+6
+5
+
+# DROP DEFAULT of a column without one is a no-op
+statement ok
+ALTER VIEW v ALTER COLUMN a DROP DEFAULT
+
+# SET DEFAULT NULL is no default: the base table's applies
+statement ok
+ALTER VIEW v ALTER COLUMN a SET DEFAULT NULL
+
+statement ok
+INSERT INTO v (id) VALUES (7)
+
+query I nosort
+SELECT a FROM t WHERE id = 7
+----
+5
+
+# ALTER TABLE on a view sets and drops a view column default too
+statement ok
+ALTER TABLE v ALTER COLUMN a SET DEFAULT 7
+
+statement ok
+INSERT INTO v (id) VALUES (8)
+
+statement ok
+ALTER TABLE v ALTER COLUMN b DROP DEFAULT
+
+statement ok
+INSERT INTO v (id) VALUES (9)
+
+query IIT nosort
+SELECT id, a, b FROM t WHERE id IN (8, 9) ORDER BY id
+----
+8
+7
+view
+9
+7
+base
+
+# DEFAULT VALUES fills every column from the defaults
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY DEFAULT 1, x text)
+
+statement ok
+CREATE VIEW dv AS SELECT id, x FROM d
+
+statement ok
+ALTER VIEW dv ALTER x SET DEFAULT 'dv'
+
+statement ok
+INSERT INTO dv DEFAULT VALUES
+
+query IT nosort
+SELECT id, x FROM d
+----
+1
+dv
+
+# an expression default is evaluated for each row
+statement ok
+CREATE SEQUENCE s
+
+statement ok
+ALTER VIEW dv ALTER id SET DEFAULT nextval('s') + 100
+
+statement ok
+INSERT INTO dv (x) VALUES ('p'), ('q')
+
+query IT nosort
+SELECT id, x FROM d ORDER BY id
+----
+1
+dv
+101
+p
+102
+q
+
+# RETURNING sees the filled-in row
+query IT nosort
+INSERT INTO dv (x) VALUES ('r') RETURNING id, x
+----
+103
+r
+
+# a chain of views: the view nearest the target with a default wins, else the next one down
+statement ok
+CREATE VIEW v2 AS SELECT id, a, b FROM v
+
+statement ok
+INSERT INTO v2 (id) VALUES (20)
+
+statement ok
+ALTER VIEW v2 ALTER a SET DEFAULT 200
+
+statement ok
+INSERT INTO v2 (id) VALUES (21)
+
+query II nosort
+SELECT id, a FROM t WHERE id IN (20, 21) ORDER BY id
+----
+20
+7
+21
+200
+
+# UPDATE through the chain uses only the target view's default (NULL when it has none)
+statement ok
+UPDATE v2 SET b = DEFAULT WHERE id = 20
+
+query T nosort
+SELECT b FROM t WHERE id = 20
+----
+NULL
+
+# INSERT … ON CONFLICT DO UPDATE SET c = DEFAULT assigns the view's default
+statement ok
+INSERT INTO v (id, a) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET a = DEFAULT
+
+query I nosort
+SELECT a FROM t WHERE id = 1
+----
+7
+
+# the proposed row an ON CONFLICT sees has the view's defaults filled in
+statement ok
+ALTER VIEW v ALTER b SET DEFAULT 'proposed'
+
+statement ok
+INSERT INTO v (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET b = excluded.b
+
+query T nosort
+SELECT b FROM t WHERE id = 1
+----
+proposed
+
+# a default on a read-only column makes it a target of every INSERT: 0A000
+statement ok
+CREATE VIEW w AS SELECT id, a + 1 AS x FROM t
+
+statement ok
+ALTER VIEW w ALTER x SET DEFAULT 3
+
+statement error 0A000
+INSERT INTO w (id) VALUES (50)
+
+statement ok
+ALTER VIEW w ALTER x DROP DEFAULT
+
+statement ok
+INSERT INTO w (id) VALUES (50)
+
+# CREATE OR REPLACE VIEW keeps the defaults of the columns it keeps; RENAME COLUMN keeps it too
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT id, a, b, c FROM t
+
+statement ok
+ALTER VIEW v RENAME COLUMN a TO aa
+
+statement ok
+INSERT INTO v (id) VALUES (60)
+
+query IIT nosort
+SELECT id, a, b FROM t WHERE id = 60
+----
+60
+7
+proposed
+
+# --- errors ---------------------------------------------------------------------------------------
+
+# an unknown column
+statement error 42703
+ALTER VIEW v ALTER COLUMN zz SET DEFAULT 1
+
+statement error 42703
+ALTER VIEW v ALTER COLUMN zz DROP DEFAULT
+
+# the default must be assignable to the column's type
+statement error 42804
+ALTER VIEW v ALTER COLUMN aa SET DEFAULT true
+
+# a default cannot reference a column, contain a subquery, or aggregate
+statement error 0A000
+ALTER VIEW v ALTER COLUMN aa SET DEFAULT id
+
+statement error 0A000
+ALTER VIEW v ALTER COLUMN aa SET DEFAULT (SELECT 1)
+
+statement error 42803
+ALTER VIEW v ALTER COLUMN aa SET DEFAULT sum(1)
+
+# a missing view, and a table through ALTER VIEW
+statement error 42P01
+ALTER VIEW nosuch ALTER COLUMN a SET DEFAULT 1
+
+statement ok
+ALTER VIEW IF EXISTS nosuch ALTER COLUMN a SET DEFAULT 1
+
+statement error 42809
+ALTER VIEW t ALTER COLUMN a SET DEFAULT 1

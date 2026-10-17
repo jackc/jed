@@ -243,9 +243,10 @@ structural comparator (§5) whether or not the column is a key.
 
 ## 7. `DROP TYPE` and dependency tracking
 
-`DROP TYPE` is **`RESTRICT` by default and RESTRICT-only** this slice (`CASCADE` is `0A000`). It
+`DROP TYPE` is **`RESTRICT` by default**. It
 fails with **`2BP01`** if any table column or any other composite type's field still references
-the type; otherwise it removes the type from the catalog. `DROP TYPE IF EXISTS` on a missing type
+the type, or a view depends on it ([views.md](views.md) §6.2). `CASCADE` drops the dependent views;
+`CASCADE` of a type a column or field references is `0A000` (PostgreSQL would drop the column too); otherwise it removes the type from the catalog. `DROP TYPE IF EXISTS` on a missing type
 is a no-op success; without `IF EXISTS`, a missing type is `42704`. The check runs against the
 writer's pending catalog under the single-writer staging model (CLAUDE.md §3) — the type set a
 `DROP` sees is the same one a concurrent reader does not, until commit.
@@ -340,7 +341,7 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
 | A `CREATE TABLE … AS` or view column of type `record` / `record[]` (§13) | `42P16` invalid_table_definition |
 | `unnest(record[])` in `FROM` without a column-definition list (§13) | `42601` syntax_error |
 | A column-definition list whose shape does not match the record's fields (§13) | `42804` datatype_mismatch |
-| A composite `PRIMARY KEY`/index/`UNIQUE` whose type transitively contains an **array-of-composite** field; a composite **FK** pairing; bare `(a,b)`; `ALTER TYPE`; `DROP TYPE … CASCADE` | `0A000` feature_not_supported |
+| A composite `PRIMARY KEY`/index/`UNIQUE` whose type transitively contains an **array-of-composite** field; a composite **FK** pairing; bare `(a,b)`; `ALTER TYPE`; `DROP TYPE … CASCADE` of a type a column or field uses | `0A000` feature_not_supported |
 
 ## 12. Delivery (sub-slices)
 

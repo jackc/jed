@@ -212,14 +212,15 @@ fn serialization_error_leaves_writer_usable_without_storage_work() {
             d.writes.clear();
             d.syncs = 0;
         }
-        let columns = (0..40)
-            .map(|i| format!("c{i} i32"))
-            .collect::<Vec<_>>()
-            .join(",");
+        // A CHECK text longer than its u16 length field cannot be serialized (0A000).
+        let long = "x".repeat(70_000);
         assert_eq!(
-            execute(&mut db, &format!("CREATE TABLE wide ({columns})"))
-                .unwrap_err()
-                .code(),
+            execute(
+                &mut db,
+                &format!("CREATE TABLE wide (c text CHECK (c <> '{long}'))")
+            )
+            .unwrap_err()
+            .code(),
             "0A000"
         );
         {

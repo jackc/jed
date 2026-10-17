@@ -409,43 +409,57 @@ sequence_option ::= "AS" type_name
                   | "CYCLE" | "NO" "CYCLE"
                   | "SEQUENCE" "NAME" identifier
 signed_integer ::= "-"? integer
-drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
+drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* ("CASCADE" | "RESTRICT")?
 
-/* CREATE [OR REPLACE] VIEW / DROP VIEW / ALTER VIEW (../design/views.md, ../design/grammar.md §54).
- * A view is a named, persisted query in the relation namespace (a collision with a
- * table/index/sequence/view is 42P07). The body is a subquery_expr planned in an isolated scope (no
- * correlation, no outer CTEs, no $N — 42P02); it is stored as canonical token text with every
- * expanded "*" frozen into an explicit column list. The optional column list renames the output
- * columns (longer than the body is 42601; a duplicate final output name is 42701). "IF NOT EXISTS"
- * is a jed extension (PG has no such syntax): a taken name is a silent no-op decided before the body
- * is planned. "OR REPLACE" redefines an existing view (views.md §1.2): the existing output columns
- * must keep their names, types, and collations (42P16), new columns may be appended, a body that
- * would read the view itself is 42P17, and a non-view name is 42809. "OR REPLACE" together with
- * "IF NOT EXISTS" is 42601. A database qualifier other than "main" is 0A000. A trailing
- * "WITH [CASCADED | LOCAL] CHECK OPTION" (bare "WITH CHECK OPTION" is CASCADED) gives the view a
- * check option (views.md §15.6); it is not part of the stored body, and on a body that is not
- * automatically updatable it is 0A000. Recognized with 0A000, never 42601 (deferred follow-ons):
- * "TEMP"/"TEMPORARY", "RECURSIVE", "MATERIALIZED", and a "WITH ( … )" option list after the name.
- * VIEW is non-reserved and recognized positionally after CREATE [OR REPLACE] / DROP / ALTER, so
- * "CREATE TABLE view (…)" still names a table.
+/* CREATE [OR REPLACE] [TEMP] [RECURSIVE] VIEW / DROP VIEW / ALTER VIEW (../design/views.md,
+ * ../design/grammar.md §54). A view is a named, persisted query in the relation namespace (a
+ * collision with a table/index/sequence/view is 42P07). The body is a subquery_expr planned in an
+ * isolated scope (no correlation, no outer CTEs, no $N — 42P02); it is stored as canonical token text
+ * with every expanded "*" frozen into an explicit column list. The optional column list renames the
+ * output columns (longer than the body is 42601; a duplicate final output name is 42701). "IF NOT
+ * EXISTS" is a jed extension (PG has no such syntax): a taken name is a silent no-op decided before the
+ * body is planned. "OR REPLACE" redefines an existing view (views.md §1.2): the existing output
+ * columns must keep their names, types, and collations (42P16), new columns may be appended, a body
+ * that would read the view itself is 42P17, and a non-view name is 42809. "OR REPLACE" together with
+ * "IF NOT EXISTS" is 42601. "TEMP"/"TEMPORARY" or a "temp." qualifier makes a temporary view
+ * (views.md §10; TEMP with another qualifier is 42601); a body reading a temporary relation makes one
+ * too; an attachment qualifier is 0A000. "RECURSIVE" (views.md §17) requires the column list (42601)
+ * and stores the body as "with recursive name (cols) as (body) select cols from name". "WITH ( … )"
+ * after the column list sets view options (views.md §16.2: check_option, security_barrier,
+ * security_invoker; a value is a word, string, quoted identifier, or signed integer; validation is
+ * 22023). A trailing "WITH [CASCADED | LOCAL] CHECK OPTION" (bare "WITH CHECK OPTION" is CASCADED)
+ * gives the view a check option (views.md §15.6); it is not part of the stored body, and on a body
+ * that is not automatically updatable it is 0A000 (on a recursive view always 0A000). "MATERIALIZED"
+ * is recognized and refused with 0A000. VIEW is non-reserved and recognized positionally after
+ * CREATE [OR REPLACE] [TEMP] [RECURSIVE] / DROP / ALTER, so "CREATE TABLE view (…)" still names a table.
  *
  * DROP VIEW is DROP TABLE's shape: two-phase / all-or-nothing, deduplicated; a missing view is 42P01
  * unless IF EXISTS; a non-view relation is 42809 (not suppressed by IF EXISTS); a view another view
- * depends on is 2BP01 unless that dependent is in the same drop set. CASCADE behaves like RESTRICT
- * when no view depends on a target, and is 0A000 when one does (a follow-on).
+ * depends on is 2BP01 unless that dependent is in the same drop set or CASCADE drops it.
  *
  * ALTER VIEW renames a view or one of its output columns (views.md §7.1); the views that read it
  * are rewritten to keep binding it. A missing view is 42P01 unless IF EXISTS (a silent no-op); a
  * non-view relation is 42809; a taken new name is 42P07; RENAME COLUMN of a missing column is 42703
- * and to an existing name 42701. "ALTER TABLE v RENAME …" on a view is the same statement. Every
- * other ALTER VIEW action is recognized and refused with 0A000. */
-create_view    ::= "CREATE" ("OR" "REPLACE")? "VIEW" ("IF" "NOT" "EXISTS")? qualified_table
-                   ("(" identifier ("," identifier)* ")")? "AS" subquery_expr
+ * and to an existing name 42701. "ALTER TABLE v RENAME …" on a view is the same statement. The
+ * other actions (views.md §16), as a comma list applied in order, set or drop a column default
+ * ("ALTER TABLE v ALTER [COLUMN] c SET/DROP DEFAULT" too) and set or reset view options (RESET with
+ * a value is 42601); "OWNER TO" and "SET SCHEMA" are recognized and refused with 0A000. */
+create_view    ::= "CREATE" ("OR" "REPLACE")? ("TEMP" | "TEMPORARY")? "RECURSIVE"? "VIEW"
+                   ("IF" "NOT" "EXISTS")? qualified_table
+                   ("(" identifier ("," identifier)* ")")?
+                   ("WITH" view_options)? "AS" subquery_expr
                    ("WITH" ("CASCADED" | "LOCAL")? "CHECK" "OPTION")?
+view_options   ::= "(" view_option ("," view_option)* ")"
+view_option    ::= identifier ("=" view_option_value)?
+view_option_value ::= identifier | string | "-"? integer
 drop_view      ::= "DROP" "VIEW" ("IF" "EXISTS")? qualified_table ("," qualified_table)*
                    ("CASCADE" | "RESTRICT")?
-alter_view     ::= "ALTER" "VIEW" ("IF" "EXISTS")? qualified_table "RENAME"
-                   ( "TO" identifier | "COLUMN"? identifier "TO" identifier )
+alter_view     ::= "ALTER" "VIEW" ("IF" "EXISTS")? qualified_table
+                   ( "RENAME" ( "TO" identifier | "COLUMN"? identifier "TO" identifier )
+                   | view_action ("," view_action)* )
+view_action    ::= "ALTER" "COLUMN"? identifier ( "SET" "DEFAULT" expr | "DROP" "DEFAULT" )
+                 | "SET" view_options
+                 | "RESET" "(" identifier ("," identifier)* ")"
 
 /* ALTER SEQUENCE [IF EXISTS] name <action> (../design/sequences.md §4/§15). Two action forms:
  *   (a) the order-free option set — the SAME sequence_option list as CREATE (MINUS "AS", which is

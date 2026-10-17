@@ -1,7 +1,7 @@
 # WITH CHECK OPTION — the jed-specific behavior of spec/design/views.md §15.6 that PostgreSQL cannot
 # oracle-check: the session privilege envelope (the check needs nothing beyond the write's privilege
 # on the view, §15.4), the recorded divergences (§12: EXCLUDE and the UPDATE end-state checks come
-# before the check option; `WITH ( check_option = … )` is 0A000; CREATE VIEW IF NOT EXISTS), and
+# before the check option; CREATE VIEW IF NOT EXISTS), and
 # cost (the check is metered expression work on each new row; EXPLAIN is unchanged).
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # requires: ddl.view, dml.view_write, dml.view_check_option, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default, ddl.exclusion_constraint, types.range, dml.insert, dml.insert_multi_row, dml.update, dml.returning, query.select, query.where_eq, query.order_by, query.explain, dml.explain, func.abs, expr.arithmetic, expr.case, resource.cost_metering, types.i32, session.privileges
@@ -34,13 +34,6 @@ statement error 42501
 INSERT INTO v VALUES (4, 40)
 
 # --- view options and IF NOT EXISTS --------------------------------------------------------------
-
-# The `WITH ( … )` option spelling is not supported (PostgreSQL accepts check_option there).
-statement error 0A000
-CREATE VIEW o1 WITH (check_option = local) AS SELECT id, a FROM t WHERE a > 0
-
-statement error 0A000
-ALTER VIEW v SET (check_option = local)
 
 # IF NOT EXISTS on a taken name is a silent no-op; the skipped clause is not validated.
 statement ok

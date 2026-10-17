@@ -1116,6 +1116,20 @@ func viewTableDB(t *testing.T) *Session {
 	return db
 }
 
+// viewOptionsTableDB is the view_options_table.jed golden (format_version 43, spec/design/views.md
+// §6/§16): column defaults, the view flags byte, sequence and type dependencies, and a view entry
+// spanning catalog pages.
+func viewOptionsTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize, goldenEnv()).Session(SessionOptions{})
+	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
+	run(t, db, "CREATE SEQUENCE s")
+	run(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)")
+	run(t, db, "CREATE VIEW d WITH (security_barrier, security_invoker) AS SELECT a, b, nextval('s') AS n, NULL::addr AS x FROM t")
+	run(t, db, "ALTER VIEW d ALTER b SET DEFAULT 'z', ALTER a SET DEFAULT 1 + 1")
+	run(t, db, "CREATE VIEW long_v AS SELECT 1 AS c1, 2 AS c2, 3 AS c3, 4 AS c4, 5 AS c5, 6 AS c6, 7 AS c7, 8 AS c8, 9 AS c9, 10 AS c10, 11 AS c11, 12 AS c12, 13 AS c13, 14 AS c14, 15 AS c15, 16 AS c16, 17 AS c17, 18 AS c18, 19 AS c19, 20 AS c20, 21 AS c21, 22 AS c22, 23 AS c23, 24 AS c24, 25 AS c25, 26 AS c26, 27 AS c27, 28 AS c28, 29 AS c29, 30 AS c30")
+	return db
+}
+
 // collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
 // collations): the loaded unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
 // 17.0.0) as the per-database default (is_default), a column with explicit COLLATE "unicode" (flags
@@ -1241,6 +1255,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"serial_table.jed", serialTableDB},
 		{"identity_table.jed", identityTableDB},
 		{"view_table.jed", viewTableDB},
+		{"view_options_table.jed", viewOptionsTableDB},
 		{"collation_table.jed", collationTableDB},
 		{"collation_pk_table.jed", collationPKTableDB},
 		{"collation_array_table.jed", collationArrayTableDB},
@@ -1333,6 +1348,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"serial_table.jed", serialTableDB, "t"},
 		{"identity_table.jed", identityTableDB, "t"},
 		{"view_table.jed", viewTableDB, "t"},
+		{"view_options_table.jed", viewOptionsTableDB, "t"},
 		{"collation_table.jed", collationTableDB, "t"},
 		{"collation_pk_table.jed", collationPKTableDB, "t"},
 		{"collation_array_table.jed", collationArrayTableDB, "t"},
@@ -1616,6 +1632,35 @@ func TestViewGoldenReadsBack(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("jed_views check_option = %v, want %v", got, want)
+	}
+}
+
+// Loading view_options_table.jed restores the defaults, options, and the long view (views.md §16).
+func TestViewOptionsGoldenReadsBack(t *testing.T) {
+	loaded, err := loadEngine(fixture(t, "view_options_table.jed"), NewEnvironment())
+	if err != nil {
+		t.Fatalf("load view_options_table.jed: %v", err)
+	}
+	got := queryRows(t, loaded, "SELECT name, security_barrier, security_invoker FROM jed_views ORDER BY name")
+	want := [][]Value{
+		{TextValue("d"), BoolValue(true), BoolValue(true)},
+		{TextValue("long_v"), BoolValue(false), BoolValue(false)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("jed_views options = %v, want %v", got, want)
+	}
+	got = queryRows(t, loaded, "SELECT name, column_default FROM jed_columns WHERE table_name = 'd' ORDER BY ordinal")
+	want = [][]Value{
+		{TextValue("a"), TextValue("1 + 1")},
+		{TextValue("b"), TextValue("'z'")},
+		{TextValue("n"), NullValue()},
+		{TextValue("x"), NullValue()},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("jed_columns defaults = %v, want %v", got, want)
+	}
+	if got := queryRows(t, loaded, "SELECT c30 FROM long_v"); !reflect.DeepEqual(got, [][]Value{{IntValue(30)}}) {
+		t.Fatalf("SELECT c30 FROM long_v = %v", got)
 	}
 }
 

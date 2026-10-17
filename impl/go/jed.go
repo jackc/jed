@@ -1078,6 +1078,12 @@ var SupportedCapabilities = []string{
 	"dml.view_check_option",
 	"dml.view_on_conflict",
 	"ddl.view_cascade",
+	"ddl.view_recursive",
+	"ddl.view_default",
+	"ddl.view_options",
+	"ddl.view_temp",
+	"ddl.view_dependencies",
+	"ddl.view_long_definition",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

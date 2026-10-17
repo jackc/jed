@@ -3648,15 +3648,19 @@ option's behavior are specified in [explain.md](explain.md).
 ## 54. `CREATE VIEW` / `DROP VIEW` / `ALTER VIEW` ([views.md](views.md))
 
 ```
-CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS subquery_expr
+CREATE [OR REPLACE] [TEMP | TEMPORARY] [RECURSIVE] VIEW [IF NOT EXISTS] [main. | temp.]name
+    [( col [, …] )] [WITH ( option [= value] [, …] )] AS subquery_expr
     [WITH [CASCADED | LOCAL] CHECK OPTION]
 DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
-ALTER VIEW [IF EXISTS] [main.]name RENAME TO new_name
-ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
+ALTER VIEW [IF EXISTS] [main. | temp.]name RENAME TO new_name
+ALTER VIEW [IF EXISTS] [main. | temp.]name RENAME [COLUMN] col TO new_col
+ALTER VIEW [IF EXISTS] [main. | temp.]name
+    { ALTER [COLUMN] col { SET DEFAULT expr | DROP DEFAULT } | SET ( option [= value] [, …] )
+    | RESET ( option [, …] ) } [, …]
 ```
 
-`VIEW` is recognized **positionally** after `CREATE`, `CREATE OR REPLACE`, `DROP`, and `ALTER`, and is
-not reserved (§3): `CREATE TABLE view (…)` names a table `view`, and `SELECT view FROM t` reads a
+`VIEW` is recognized **positionally** after `CREATE [OR REPLACE] [TEMP | TEMPORARY] [RECURSIVE]`, `DROP`,
+and `ALTER`, and is not reserved (§3): `CREATE TABLE view (…)` names a table `view`, and `SELECT view FROM t` reads a
 column. The body runs from the token after `AS` to the end of the statement, or to a trailing `WITH
 [CASCADED | LOCAL] CHECK OPTION`, and is a `subquery_expr`
 (an optional `WITH`, then a query expression with its own `ORDER BY` / `LIMIT`). Its token sequence
@@ -3668,10 +3672,15 @@ view named `if`. `OR REPLACE` with `IF NOT EXISTS` is `42601`. In `ALTER VIEW �
 `RENAME` selects the view rename, as in `ALTER TABLE … RENAME` ([alter.md](alter.md) §1), so a column
 named `to` is renamed with `RENAME COLUMN to TO x`.
 
-Deferred forms are **recognized** so they fail with `0A000` rather than a syntax error: `CREATE TEMP`/
-`TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`, `CREATE MATERIALIZED VIEW`, `CREATE VIEW v WITH ( … )`
-(view options), and every `ALTER VIEW` action other than `RENAME`. Each is detected by its keyword
-sequence before the body is parsed.
+`TEMP`/`TEMPORARY` makes a temporary view ([views.md](views.md) §10). `RECURSIVE` requires the column
+list (`42601`) and wraps the body as `with recursive "name" ( "cols" ) as ( body ) select "cols" from
+"name"` before it is stored ([views.md](views.md) §17). The option list `WITH ( name [= value], … )`
+follows the column list (PostgreSQL's position); an option value is a word, a string, a quoted
+identifier, or an integer with an optional sign, validated at execution ([views.md](views.md) §16.2).
+The non-rename `ALTER VIEW` actions are a comma list; `RESET` with a value is `42601`, and `OWNER TO`
+and `SET SCHEMA` are recognized and refused with `0A000`, as is `CREATE MATERIALIZED VIEW`, each
+detected by its keyword sequence. `DROP SEQUENCE` and `DROP TYPE` accept `CASCADE`, which drops the
+dependent views ([views.md](views.md) §6.2).
 
 The trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is recognized at the end of the token stream and
 cut off before the body is parsed, so the unreserved `with` is never read as a table alias; the rest

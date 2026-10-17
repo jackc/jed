@@ -98,6 +98,8 @@ func run() error {
 	var reader *jed.Session
 	var writer *jed.Session
 	scanner := bufio.NewScanner(os.Stdin)
+	// A command line carries hex-encoded SQL, which may exceed bufio's 64 KiB default token.
+	scanner.Buffer(make([]byte, 64*1024), 16<<20)
 	for scanner.Scan() {
 		command, argument, _ := strings.Cut(scanner.Text(), "\t")
 		var value string
@@ -240,6 +242,8 @@ func ownerIdle(root string) error {
 	fmt.Println("READY")
 	var db *jed.Database
 	scanner := bufio.NewScanner(os.Stdin)
+	// A command line carries hex-encoded SQL, which may exceed bufio's 64 KiB default token.
+	scanner.Buffer(make([]byte, 64*1024), 16<<20)
 	for scanner.Scan() {
 		command, argument, _ := strings.Cut(scanner.Text(), "\t")
 		var err error

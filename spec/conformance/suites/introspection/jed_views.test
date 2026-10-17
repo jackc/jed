@@ -168,7 +168,7 @@ v
 v2
 w
 
-# --- scope: the temp domain has no views; an unknown qualifier is 42P01 -----------------------------
+# --- scope: no temporary view here; an unknown qualifier is 42P01 -----------------------------------
 
 query T rowsort
 SELECT name FROM temp.jed_views

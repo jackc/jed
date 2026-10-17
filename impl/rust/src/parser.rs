@@ -19,7 +19,7 @@ use crate::ast::{
     WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
-use crate::ast::{CycleClause, SearchClause};
+use crate::ast::{CycleClause, SearchClause, ViewEdit, ViewOption};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::{lex, lex_with_positions};
@@ -401,42 +401,53 @@ impl Parser {
         Ok(())
     }
 
-    /// Whether the statement is one of the deferred `CREATE … VIEW` forms (views.md §12): `CREATE
-    /// [OR REPLACE] TEMP | TEMPORARY VIEW`, `CREATE [OR REPLACE] RECURSIVE VIEW`, `CREATE
-    /// MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
+    /// Whether the statement is the deferred `CREATE MATERIALIZED VIEW` (views.md §12), recognized
+    /// by keyword sequence so it fails 0A000, not 42601.
     fn at_deferred_create_view(&self) -> bool {
-        let kw = |i: usize| self.peek_keyword_at(i);
-        let at = if kw(1).as_deref() == Some("or") && kw(2).as_deref() == Some("replace") {
-            3
-        } else {
-            1
-        };
-        matches!(
-            kw(at).as_deref(),
-            Some("temp") | Some("temporary") | Some("recursive") | Some("materialized")
-        ) && kw(at + 1).as_deref() == Some("view")
+        self.peek_keyword_at(1).as_deref() == Some("materialized")
+            && self.peek_keyword_at(2).as_deref() == Some("view")
     }
 
-    /// Whether the statement is `CREATE [OR REPLACE] VIEW` (views.md §1).
+    /// Whether the statement is `CREATE [OR REPLACE] [TEMP | TEMPORARY] [RECURSIVE] VIEW` (views.md
+    /// §1, §10, §17).
     fn at_create_view(&self) -> bool {
         let kw = |i: usize| self.peek_keyword_at(i);
-        kw(1).as_deref() == Some("view")
-            || (kw(1).as_deref() == Some("or")
-                && kw(2).as_deref() == Some("replace")
-                && kw(3).as_deref() == Some("view"))
+        let mut at = 1;
+        if kw(1).as_deref() == Some("or") && kw(2).as_deref() == Some("replace") {
+            at = 3;
+        }
+        if matches!(kw(at).as_deref(), Some("temp") | Some("temporary")) {
+            at += 1;
+        }
+        if kw(at).as_deref() == Some("recursive") {
+            at += 1;
+        }
+        kw(at).as_deref() == Some("view")
     }
 
-    /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr` (views.md
-    /// §1, grammar.md §54). The body runs from the token after `AS` to the end of the statement and
-    /// is captured as its canonical token text. A trailing `WITH [CASCADED | LOCAL] CHECK OPTION`
-    /// is cut off before the body and gives the view a check option (§15.6). A `WITH ( … )` option
-    /// list after the name is a deferred form (0A000). `OR REPLACE` with `IF NOT EXISTS` is 42601.
+    /// `CREATE [OR REPLACE] [TEMP | TEMPORARY] [RECURSIVE] VIEW [IF NOT EXISTS] [db.]name
+    /// [(col, …)] [WITH (option, …)] AS subquery_expr` (views.md §1, grammar.md §54). The body runs
+    /// from the token after `AS` to the end of the statement and is captured as its canonical token
+    /// text. A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body and gives
+    /// the view a check option (§15.6). `RECURSIVE` requires the column list and stores the body
+    /// wrapped as `WITH RECURSIVE` (§17). `OR REPLACE` with `IF NOT EXISTS` is 42601.
     fn parse_create_view(&mut self) -> Result<CreateView> {
         self.expect_keyword("create")?;
         let or_replace = self.peek_keyword().as_deref() == Some("or");
         if or_replace {
             self.advance(); // OR
             self.expect_keyword("replace")?;
+        }
+        let temporary = matches!(
+            self.peek_keyword().as_deref(),
+            Some("temp") | Some("temporary")
+        );
+        if temporary {
+            self.advance();
+        }
+        let recursive = self.peek_keyword().as_deref() == Some("recursive");
+        if recursive {
+            self.advance();
         }
         self.expect_keyword("view")?;
         // A two-token lookahead keeps a lone `if` an ordinary view name (`CREATE VIEW if AS …`).
@@ -453,14 +464,6 @@ impl Parser {
             ));
         }
         let (db, name) = self.parse_qualified_table_name()?;
-        if self.peek_keyword().as_deref() == Some("with")
-            && matches!(self.peek_at(1), Token::LParen)
-        {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "view options (WITH ( … )) are not supported",
-            ));
-        }
         let columns = if matches!(self.peek(), Token::LParen) {
             self.advance();
             let mut cols = vec![self.expect_identifier()?];
@@ -472,6 +475,17 @@ impl Parser {
             Some(cols)
         } else {
             None
+        };
+        if recursive && columns.is_none() {
+            return Err(syntax("CREATE RECURSIVE VIEW requires a column list"));
+        }
+        let options = if self.peek_keyword().as_deref() == Some("with")
+            && matches!(self.peek_at(1), Token::LParen)
+        {
+            self.advance(); // WITH
+            self.parse_view_options()?
+        } else {
+            Vec::new()
         };
         self.expect_keyword("as")?;
         // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body is parsed
@@ -495,13 +509,39 @@ impl Parser {
                 )));
             }
         }
-        let body = render_tokens(&self.tokens[start..end]);
+        if recursive && check_option.is_some() {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "WITH CHECK OPTION not supported on recursive views",
+            ));
+        }
         // `render_tokens` re-lexes to the same token sequence, so the body's tokens keep the
         // statement's positions (and its `Eof` the position of the token after the body).
-        let body_positions = self
+        let mut body_positions = self
             .positions
             .get(start..=end)
             .map_or_else(Vec::new, <[u32]>::to_vec);
+        let body = if recursive {
+            // `with recursive "name" ( "c" , … ) as ( <body> ) select "c" , … from "name"`
+            // (views.md §17). The synthesized tokens take the positions of the body's first token
+            // and of the token after it, so an error inside the body still points into it.
+            let cols = columns.clone().unwrap_or_default();
+            let (prefix, suffix) = recursive_view_wrapper(&name, &cols);
+            if !body_positions.is_empty() {
+                let first = body_positions[0];
+                let last = *body_positions.last().expect("non-empty");
+                let mut positions = vec![first; prefix.len()];
+                positions.extend_from_slice(&body_positions[..body_positions.len() - 1]);
+                positions.extend(std::iter::repeat_n(last, suffix.len() + 1));
+                body_positions = positions;
+            }
+            let mut tokens = prefix;
+            tokens.extend_from_slice(&self.tokens[start..end]);
+            tokens.extend(suffix);
+            render_tokens(&tokens)
+        } else {
+            render_tokens(&self.tokens[start..end])
+        };
         Ok(CreateView {
             name,
             db,
@@ -511,7 +551,51 @@ impl Parser {
             body,
             body_positions,
             check_option,
+            temporary,
+            options,
         })
+    }
+
+    /// `( name [= value] [, …] )` — a view option list (views.md §16). The name is an identifier;
+    /// the value a word, string, or (signed) number, kept as written for the executor to validate.
+    fn parse_view_options(&mut self) -> Result<Vec<ViewOption>> {
+        self.expect(&Token::LParen)?;
+        let mut out = Vec::new();
+        loop {
+            let name = self.expect_identifier()?;
+            let value = if matches!(self.peek(), Token::Eq) {
+                self.advance();
+                Some(self.parse_view_option_value()?)
+            } else {
+                None
+            };
+            out.push(ViewOption { name, value });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            self.expect(&Token::RParen)?;
+            return Ok(out);
+        }
+    }
+
+    /// One view option value (views.md §16): a word (folded), a quoted identifier, a string, or an
+    /// integer with an optional sign, as text.
+    fn parse_view_option_value(&mut self) -> Result<String> {
+        let negative = matches!(self.peek(), Token::Minus);
+        if negative {
+            self.advance();
+        }
+        let value = match self.peek().clone() {
+            Token::Word(w) | Token::QuotedIdent(w) | Token::Str(w) if !negative => w,
+            Token::Int(n) if negative => format!("-{n}"),
+            Token::Int(n) => n.to_string(),
+            other => {
+                return Err(syntax(format!("expected an option value, found {other:?}")));
+            }
+        };
+        self.advance();
+        Ok(value)
     }
 
     /// The index and option of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the end of the
@@ -540,9 +624,10 @@ impl Parser {
         None
     }
 
-    /// `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }` (views.md §7.1).
-    /// The other `ALTER VIEW` actions (`ALTER [COLUMN]`, `OWNER TO`, `SET …`, `RESET …`) are
-    /// recognized by their first keyword and refused with 0A000.
+    /// `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }` (views.md §7.1),
+    /// or a comma list of `ALTER [COLUMN] c { SET DEFAULT expr | DROP DEFAULT }`, `SET ( option, … )`,
+    /// and `RESET ( name, … )` (§16). `OWNER TO` and `SET SCHEMA` are recognized and refused with
+    /// 0A000.
     fn parse_alter_view(&mut self) -> Result<AlterView> {
         self.expect_keyword("alter")?;
         self.expect_keyword("view")?;
@@ -552,15 +637,18 @@ impl Parser {
             self.expect_keyword("exists")?;
         }
         let (db, name) = self.parse_qualified_table_name()?;
-        match self.peek_keyword().as_deref() {
-            Some("rename") => {}
-            Some("alter") | Some("owner") | Some("set") | Some("reset") => {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "this form of ALTER VIEW is not supported",
-                ));
+        if self.peek_keyword().as_deref() != Some("rename") {
+            let mut edits = vec![self.parse_view_edit()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                edits.push(self.parse_view_edit()?);
             }
-            _ => return Err(syntax("expected RENAME after ALTER VIEW name")),
+            return Ok(AlterView {
+                name,
+                db,
+                if_exists,
+                action: AlterViewAction::Edits(edits),
+            });
         }
         self.advance(); // RENAME
         let action = if self.peek_keyword().as_deref() == Some("to") {
@@ -581,6 +669,59 @@ impl Parser {
             if_exists,
             action,
         })
+    }
+
+    /// One non-rename `ALTER VIEW` action (views.md §16).
+    fn parse_view_edit(&mut self) -> Result<ViewEdit> {
+        match self.peek_keyword().as_deref() {
+            Some("alter") => {
+                self.advance();
+                if self.peek_keyword().as_deref() == Some("column") {
+                    self.advance();
+                }
+                let column = self.expect_identifier()?;
+                match self.peek_keyword().as_deref() {
+                    Some("set") => {
+                        self.advance();
+                        self.expect_keyword("default")?;
+                        let start = self.pos;
+                        let expr = self.parse_expr()?;
+                        let text = render_tokens(&self.tokens[start..self.pos]);
+                        Ok(ViewEdit::SetDefault {
+                            column,
+                            def: DefaultDef { expr, text },
+                        })
+                    }
+                    Some("drop") => {
+                        self.advance();
+                        self.expect_keyword("default")?;
+                        Ok(ViewEdit::DropDefault { column })
+                    }
+                    other => Err(syntax(format!("expected SET or DROP, found {other:?}"))),
+                }
+            }
+            Some("set") if matches!(self.peek_at(1), Token::LParen) => {
+                self.advance();
+                Ok(ViewEdit::SetOptions(self.parse_view_options()?))
+            }
+            Some("reset") => {
+                self.advance();
+                let options = self.parse_view_options()?;
+                if options.iter().any(|o| o.value.is_some()) {
+                    return Err(syntax("RESET must not include values for parameters"));
+                }
+                Ok(ViewEdit::ResetOptions(
+                    options.into_iter().map(|o| o.name).collect(),
+                ))
+            }
+            Some("owner") | Some("set") => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "this form of ALTER VIEW is not supported",
+            )),
+            _ => Err(syntax(
+                "expected RENAME, ALTER, SET, or RESET after ALTER VIEW name",
+            )),
+        }
     }
 
     /// `DROP VIEW [IF EXISTS] [db.]name [, …] [CASCADE | RESTRICT]` (views.md §1). `IF EXISTS` is a
@@ -2331,7 +2472,7 @@ impl Parser {
             self.expect_keyword("exists")?;
         }
         let name = self.expect_identifier()?;
-        // Optional trailing RESTRICT / CASCADE (a keyword, consumed here; CASCADE is 0A000 at exec).
+        // Optional trailing RESTRICT / CASCADE: CASCADE drops the dependent views (views.md §6.1).
         let cascade = match self.peek_keyword().as_deref() {
             Some("restrict") => {
                 self.advance();
@@ -2343,13 +2484,11 @@ impl Parser {
             }
             _ => false,
         };
-        if cascade {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "DROP TYPE ... CASCADE is not supported".to_string(),
-            ));
-        }
-        Ok(DropType { name, if_exists })
+        Ok(DropType {
+            name,
+            if_exists,
+            cascade,
+        })
     }
 
     /// `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` (spec/design/grammar.md §44). The
@@ -2533,13 +2672,11 @@ impl Parser {
             }
             _ => false,
         };
-        if cascade {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "DROP SEQUENCE ... CASCADE is not supported".to_string(),
-            ));
-        }
-        Ok(DropSequence { names, if_exists })
+        Ok(DropSequence {
+            names,
+            if_exists,
+            cascade,
+        })
     }
 
     /// `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md §15). After the name
@@ -7925,4 +8062,31 @@ fn unlogged_not_supported() -> EngineError {
         SqlState::FeatureNotSupported,
         "unlogged tables are not supported",
     )
+}
+
+/// The tokens a `CREATE RECURSIVE VIEW name (cols) AS body` wraps around its body (views.md §17):
+/// `with recursive "name" ( "c" , … ) as (` before it and `) select "c" , … from "name"` after it.
+/// Every substituted name is a quoted identifier (views.md §5).
+pub(crate) fn recursive_view_wrapper(name: &str, cols: &[String]) -> (Vec<Token>, Vec<Token>) {
+    let quoted = |n: &str| Token::QuotedIdent(n.to_string());
+    let list = |out: &mut Vec<Token>| {
+        for (i, c) in cols.iter().enumerate() {
+            if i > 0 {
+                out.push(Token::Comma);
+            }
+            out.push(quoted(c));
+        }
+    };
+    let mut prefix = vec![
+        Token::Word("with".into()),
+        Token::Word("recursive".into()),
+        quoted(name),
+        Token::LParen,
+    ];
+    list(&mut prefix);
+    prefix.extend([Token::RParen, Token::Word("as".into()), Token::LParen]);
+    let mut suffix = vec![Token::RParen, Token::Word("select".into())];
+    list(&mut suffix);
+    suffix.extend([Token::Word("from".into()), quoted(name)]);
+    (prefix, suffix)
 }

@@ -100,11 +100,9 @@ func TestSerializationErrorLeavesWriterUsable(t *testing.T) {
 				db, rec, _ = recordedCommitEngine(t, base.buf)
 			}
 			rec.ops = nil
-			columns := make([]string, 40)
-			for i := range columns {
-				columns[i] = fmt.Sprintf("c%d i32", i)
-			}
-			_, err = execute(db, "CREATE TABLE wide ("+strings.Join(columns, ",")+")")
+			// A CHECK text longer than its u16 length field cannot be serialized (0A000).
+			long := strings.Repeat("x", 70_000)
+			_, err = execute(db, "CREATE TABLE wide (c text CHECK (c <> '"+long+"'))")
 			if e, ok := err.(*EngineError); !ok || e.Code() != "0A000" {
 				t.Fatalf("expected serialization size error, got %v", err)
 			}

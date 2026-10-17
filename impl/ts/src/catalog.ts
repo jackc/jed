@@ -376,10 +376,18 @@ export type ViewDef = {
   depth: number;
   // The view's check option, if any (spec/design/views.md §15.6).
   checkOption: CheckOption | null;
+  // Each output column's default (views.md §16.1), index-aligned with columns.
+  defaults: (DefaultExpr | null)[];
+  // The security_barrier option (views.md §16.2).
+  securityBarrier: boolean;
+  // The security_invoker option (views.md §16.2): the body's relations are checked against the
+  // session that reads or writes through the view.
+  securityInvoker: boolean;
 };
 
-// ViewDepKind is what a view dependency names (format.md *View entry* dep_kind: table 0, view 1).
-export type ViewDepKind = "table" | "view";
+// ViewDepKind is what a view dependency names (format.md *View entry* dep_kind: table 0, view 1,
+// sequence 2, type 3 — v43).
+export type ViewDepKind = "table" | "view" | "sequence" | "type";
 
 // ViewDep is one persisted view dependency (spec/design/views.md §6): a table with the exact set of
 // its columns the body references (ascending byte order), or a view (no columns).

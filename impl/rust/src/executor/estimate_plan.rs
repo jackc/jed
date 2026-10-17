@@ -439,8 +439,11 @@ impl Engine {
             }
             _ => {}
         }
-        // jed_columns lists the main database's view columns after its tables' (introspection.md §5).
-        let view_rows = if srf.kind == SrfKind::JedColumns && srf.introspect_scope == "main" {
+        // jed_columns lists the main database's (or, scoped temp, the session's temporary) view
+        // columns after its tables' (introspection.md §5).
+        let view_rows = if srf.kind == SrfKind::JedColumns
+            && matches!(srf.introspect_scope.as_str(), "main" | "temp")
+        {
             snap.views_sorted()
                 .into_iter()
                 .fold(0, |rows, view| sat_add(rows, view.columns.len() as i64))

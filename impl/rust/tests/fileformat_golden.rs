@@ -1821,6 +1821,70 @@ fn view_table_db() -> Session {
     db
 }
 
+/// The `view_options_table.jed` golden (format_version 43, spec/design/views.md §6/§16): column
+/// defaults, the view flags byte, sequence and type dependencies, and a view entry spanning catalog
+/// pages.
+fn view_options_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    run(&mut db, "CREATE SEQUENCE s");
+    run(&mut db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)");
+    run(
+        &mut db,
+        "CREATE VIEW d WITH (security_barrier, security_invoker) AS SELECT a, b, nextval('s') AS n, NULL::addr AS x FROM t",
+    );
+    run(
+        &mut db,
+        "ALTER VIEW d ALTER b SET DEFAULT 'z', ALTER a SET DEFAULT 1 + 1",
+    );
+    run(
+        &mut db,
+        "CREATE VIEW long_v AS SELECT 1 AS c1, 2 AS c2, 3 AS c3, 4 AS c4, 5 AS c5, 6 AS c6, 7 AS c7, 8 AS c8, 9 AS c9, 10 AS c10, 11 AS c11, 12 AS c12, 13 AS c13, 14 AS c14, 15 AS c15, 16 AS c16, 17 AS c17, 18 AS c18, 19 AS c19, 20 AS c20, 21 AS c21, 22 AS c22, 23 AS c23, 24 AS c24, 25 AS c25, 26 AS c26, 27 AS c27, 28 AS c28, 29 AS c29, 30 AS c30",
+    );
+    db
+}
+
+/// Loading `view_options_table.jed` restores the defaults, options, and the long view.
+#[test]
+fn view_options_golden_reads_back() {
+    let mut db = Database::from_image(&fixture("view_options_table.jed"), golden_env())
+        .unwrap_or_else(|e| panic!("load view_options_table.jed: {}", e.message))
+        .session(SessionOptions::default());
+    let text = |s: &str| Value::Text(s.to_string());
+    assert_eq!(
+        query_rows(
+            &mut db,
+            "SELECT name, security_barrier, security_invoker FROM jed_views ORDER BY name"
+        ),
+        vec![
+            vec![text("d"), Value::Bool(true), Value::Bool(true)],
+            vec![text("long_v"), Value::Bool(false), Value::Bool(false)],
+        ]
+    );
+    assert_eq!(
+        query_rows(
+            &mut db,
+            "SELECT name, column_default FROM jed_columns WHERE table_name = 'd' ORDER BY ordinal"
+        ),
+        vec![
+            vec![text("a"), text("1 + 1")],
+            vec![text("b"), text("'z'")],
+            vec![text("n"), Value::Null],
+            vec![text("x"), Value::Null],
+        ]
+    );
+    assert_eq!(
+        query_rows(&mut db, "SELECT c30 FROM long_v"),
+        vec![vec![Value::Int(30)]]
+    );
+}
+
 fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
         .query_outcome(sql, &[])
@@ -2144,6 +2208,7 @@ fn write_matches_goldens() {
         ("serial_table.jed", serial_table_db),
         ("identity_table.jed", identity_table_db),
         ("view_table.jed", view_table_db),
+        ("view_options_table.jed", view_options_table_db),
         ("array_table.jed", array_table_db),
         ("range_table.jed", range_table_db),
         ("range_pk_table.jed", range_pk_table_db),
@@ -2282,6 +2347,7 @@ fn read_goldens_reproduces_rows() {
         ("serial_table.jed", serial_table_db, "t"),
         ("identity_table.jed", identity_table_db, "t"),
         ("view_table.jed", view_table_db, "t"),
+        ("view_options_table.jed", view_options_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("max_sep_table.jed", max_sep_table_db, "m"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),

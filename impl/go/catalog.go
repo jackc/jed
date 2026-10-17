@@ -400,6 +400,22 @@ type viewDef struct {
 	Depth int
 	// CheckOption is the view's check option, if any (spec/design/views.md §15.6).
 	CheckOption checkOption
+	// Defaults are each output column's default (spec/design/views.md §16.1), index-aligned with
+	// Columns (nil = none).
+	Defaults []*defaultExprDef
+	// SecurityBarrier is the security_barrier option (views.md §16.2).
+	SecurityBarrier bool
+	// SecurityInvoker is the security_invoker option (views.md §16.2): the body's relations are
+	// checked against the session that reads or writes through the view.
+	SecurityInvoker bool
+}
+
+// viewDefault is the default of a view's column i, or nil.
+func (v *viewDef) viewDefault(i int) *defaultExprDef {
+	if i < len(v.Defaults) {
+		return v.Defaults[i]
+	}
+	return nil
 }
 
 // viewDepKind is what a view dependency names (format.md *View entry* dep_kind).
@@ -408,6 +424,11 @@ type viewDepKind uint8
 const (
 	viewDepTable viewDepKind = 0
 	viewDepView  viewDepKind = 1
+	// viewDepSequence is a sequence the body names in a constant nextval / currval / setval argument
+	// (§6, v43).
+	viewDepSequence viewDepKind = 2
+	// viewDepType is a composite type the body names or outputs (§6, v43).
+	viewDepType viewDepKind = 3
 )
 
 // viewDep is one persisted view dependency (spec/design/views.md §6): a table with the exact set of

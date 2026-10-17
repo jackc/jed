@@ -101,6 +101,9 @@ pub(crate) struct ViewWrite {
     pub(crate) top: WriteLayer,
     pub(crate) targets: Vec<String>,
     pub(crate) conflict_set: Vec<String>,
+    /// The base columns (by ordinal) whose default an INSERT through the view replaces with a view
+    /// column default, nearest the target first (views.md §16.1). Empty for UPDATE and DELETE.
+    pub(crate) default_overrides: Vec<(usize, DefaultExpr)>,
 }
 
 impl ViewWrite {
@@ -231,20 +234,28 @@ impl Engine {
     /// view behind an attachment qualifier is 0A000 (views.md §10).
     pub(crate) fn dml_target_view(&self, db: Option<&str>, name: &str) -> Result<Option<ViewDef>> {
         self.reject_attached_view(db, name)?;
-        let snap = match db {
+        let view = match db {
             None => {
                 if self.table(name).is_some() {
                     return Ok(None);
                 }
-                self.read_snap()
+                self.visible_view(name)
             }
-            Some("main") => self.read_snap(),
+            Some("main") => {
+                if self.read_snap().table(name).is_some() {
+                    return Ok(None);
+                }
+                self.read_snap().view(name)
+            }
+            Some("temp") => {
+                if self.is_temp_table(name) {
+                    return Ok(None);
+                }
+                self.temp_read_snap().view(name)
+            }
             Some(_) => return Ok(None),
         };
-        if snap.table(name).is_some() {
-            return Ok(None);
-        }
-        Ok(snap.view(name).cloned())
+        Ok(view.cloned())
     }
 
     /// The single FROM item of an automatically updatable body (views.md §15.1), or `None`. For
@@ -294,8 +305,7 @@ impl Engine {
         {
             return None;
         }
-        let snap = self.read_snap();
-        if snap.table(&tref.name).is_none() && snap.view(&tref.name).is_none() {
+        if self.table(&tref.name).is_none() && self.visible_view(&tref.name).is_none() {
             return None;
         }
         if check_cols {
@@ -404,11 +414,10 @@ impl Engine {
                 .updatable_shape(level_body, kind != WriteKind::Delete)
                 .ok_or_else(|| not_updatable(kind, &level_view.name))?;
             let label = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
-            let snap = self.read_snap();
-            let below_names = match snap.table(&tref.name) {
+            let below_names = match self.table(&tref.name) {
                 Some(t) => t.columns.iter().map(|c| c.name.clone()).collect(),
-                None => snap
-                    .view(&tref.name)
+                None => self
+                    .visible_view(&tref.name)
                     .expect("an updatable FROM item")
                     .columns
                     .clone(),
@@ -429,6 +438,14 @@ impl Engine {
             if kind != WriteKind::Delete {
                 let mut ordered = cur.clone();
                 ordered.extend_from_slice(&set_cur);
+                // An INSERT also targets every column of this view that has a default, which it
+                // fills when the statement does not (views.md §16.1).
+                if kind == WriteKind::Insert {
+                    ordered.extend(
+                        (0..cols.len())
+                            .filter(|&c| level_view.defaults.get(c).is_some_and(Option::is_some)),
+                    );
+                }
                 ordered.sort_unstable();
                 if let Some(&c) = ordered
                     .iter()
@@ -454,8 +471,8 @@ impl Engine {
                 cur = cur.iter().map(down).collect();
                 set_cur = set_cur.iter().map(down).collect();
             }
-            let next = snap.view(&tref.name).cloned();
-            let base = snap.table(&tref.name).cloned();
+            let next = self.visible_view(&tref.name).cloned();
+            let base = self.table(&tref.name).cloned();
             let tref_rename = tref.column_aliases.clone();
             let filter = sel.filter.clone();
             levels.push(ChainLevel {
@@ -485,6 +502,28 @@ impl Engine {
                     ));
                 }
                 seen.push(c);
+            }
+        }
+        // The view column defaults an INSERT applies (views.md §16.1): each base column takes the
+        // default of the first view, from the target down, that has one for a column leading to it.
+        let mut default_overrides: Vec<(usize, DefaultExpr)> = Vec::new();
+        if kind == WriteKind::Insert {
+            for (k, level) in levels.iter().enumerate() {
+                for (c, default) in level.view.defaults.iter().enumerate() {
+                    let Some(default) = default else {
+                        continue;
+                    };
+                    let mut idx = c;
+                    for below in &levels[k..] {
+                        idx = match below.cols[idx] {
+                            LayerCol::Ref(j) => j,
+                            LayerCol::Expr(_) => unreachable!("a defaulted column is updatable"),
+                        };
+                    }
+                    if !default_overrides.iter().any(|(i, _)| *i == idx) {
+                        default_overrides.push((idx, default.clone()));
+                    }
+                }
             }
         }
         // Build the layers bottom-up: the table, then each view.
@@ -538,6 +577,7 @@ impl Engine {
                 .collect(),
             table: table.name.clone(),
             top: layer,
+            default_overrides,
         }))
     }
 
@@ -740,19 +780,63 @@ impl Engine {
         }) = &mut ins.on_conflict
         {
             for (a, base) in assignments.iter_mut().zip(&vw.conflict_set) {
-                a.column = base.clone();
                 if a.is_default {
                     a.is_default = false;
-                    a.value = Expr::Literal(Literal::Null, SrcPos::NONE);
+                    a.value = self.view_set_default(&vw.view, &a.column)?;
                 }
+                a.column = base.clone();
             }
         }
         Ok(Some(vw))
     }
 
+    /// The base table an INSERT through a view writes, with the view column defaults it applies in
+    /// place of the table's own (views.md §16.1). On an identity column the view default is a
+    /// supplied value: `OVERRIDING USER VALUE` discards it, and a `GENERATED ALWAYS` column takes it
+    /// only under `OVERRIDING SYSTEM VALUE` (else 428C9), as in PostgreSQL.
+    pub(crate) fn table_with_view_defaults(
+        &self,
+        table: &Table,
+        vw: &ViewWrite,
+        overriding: Option<Overriding>,
+    ) -> Result<Table> {
+        let mut out = table.clone();
+        for (i, default) in &vw.default_overrides {
+            let col = &mut out.columns[*i];
+            match (col.identity, overriding) {
+                (Some(_), Some(Overriding::User)) => continue,
+                (Some(IdentityKind::Always), o) if o != Some(Overriding::System) => {
+                    return Err(EngineError::new(
+                        SqlState::GeneratedAlways,
+                        format!("cannot insert a non-DEFAULT value into column {}", col.name),
+                    ));
+                }
+                _ => {}
+            }
+            col.default = None;
+            col.default_expr = Some(default.clone());
+        }
+        Ok(out)
+    }
+
+    /// The view default `SET c = DEFAULT` assigns through a view (views.md §16.1): the target view's
+    /// own default for column `c`, else NULL — never a default further down the chain or the base
+    /// column's (PostgreSQL's rewrite). An unparsable default is XX003.
+    fn view_set_default(&self, view: &str, column: &str) -> Result<Expr> {
+        let def = self.visible_view(view).and_then(|v| {
+            let i = v.columns.iter().position(|c| c == column)?;
+            v.defaults.get(i).cloned().flatten()
+        });
+        match def {
+            None => Ok(Expr::Literal(Literal::Null, SrcPos::NONE)),
+            Some(d) if d.unparsed => Err(unparsable_default_error(view, column)),
+            Some(d) => Ok(d.expr),
+        }
+    }
+
     /// Retarget an UPDATE through an updatable view at its base table (views.md §15.2): each
-    /// assignment names its base column, and `SET c = DEFAULT` assigns the view column's default,
-    /// which is NULL (jed has no view column defaults).
+    /// assignment names its base column, and `SET c = DEFAULT` assigns the view column's default
+    /// (§16.1), else NULL.
     pub(crate) fn rewrite_update_target(&self, upd: &mut Update) -> Result<Option<ViewWrite>> {
         let targets: Vec<String> = upd.assignments.iter().map(|a| a.column.clone()).collect();
         let target_pos: Vec<SrcPos> = upd.assignments.iter().map(|a| a.pos).collect();
@@ -771,11 +855,11 @@ impl Engine {
         upd.table = vw.table.clone();
         upd.db = None;
         for (a, base) in upd.assignments.iter_mut().zip(&vw.targets) {
-            a.column = base.clone();
             if a.is_default {
                 a.is_default = false;
-                a.value = Expr::Literal(Literal::Null, SrcPos::NONE);
+                a.value = self.view_set_default(&vw.view, &a.column)?;
             }
+            a.column = base.clone();
         }
         Ok(Some(vw))
     }

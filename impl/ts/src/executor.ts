@@ -71,6 +71,8 @@ import type {
   FrameBound,
   WithExpr,
   WithQuery,
+  Overriding,
+  ViewEdit,
 } from "./ast.ts";
 import {
   paramIsNull,
@@ -270,9 +272,8 @@ import {
   pagePayload,
   recordCompressUnits,
   resolveUnfetchedSelf,
-  PAGE_HEADER,
   typeCodeForScalar,
-  viewEntryBytes,
+  compareViewDeps,
 } from "./format.ts";
 import {
   commitDurableAttachment,
@@ -343,10 +344,12 @@ import type { SharedPaging } from "./paging.ts";
 import {
   MAX_EXPR_DEPTH,
   parseExpression,
+  parseNameText,
   parseSQL,
   parseViewDefinition,
   parseViewDefinitionAt,
   quoteIdentifier,
+  renderTokens,
   rewriteColumnIdentifier,
   rewriteTableQualifier,
 } from "./parser.ts";
@@ -371,6 +374,9 @@ import {
   viewsUsing,
   forgetViews,
   viewsInDependencyOrder,
+  duplicateViewOption,
+  outputCompositeNames,
+  parseViewOptions,
 } from "./views.ts";
 import { type KeyBound, type PNode, colAt, colIsNull, compareBytes, unboundedBound } from "./pmap.ts";
 import {
@@ -505,6 +511,7 @@ import {
   timestamptzValue,
   uuidValue,
   zoneRenderCount,
+  sqlLiteral,
 } from "./value.ts";
 import {
   type EvalOpts as JsonPathEvalOpts,
@@ -4055,7 +4062,16 @@ export class Engine {
         (stmt.kind === "alterTable" &&
           (stmt.db !== undefined
             ? stmt.db === "temp"
-            : this.isTempTable(stmt.name))) ||
+            : this.isTempTable(stmt.name) || this.isTempView(stmt.name))) ||
+        // A temporary view's DDL is temp DDL too (views.md §10): spelled TEMP or temp., or naming
+        // one of the session's temporary views.
+        (stmt.kind === "createView" && (stmt.temporary || stmt.db === "temp")) ||
+        (stmt.kind === "dropView" &&
+          stmt.names.some(({ db, name }) =>
+            db !== undefined ? db === "temp" : this.isTempView(name),
+          )) ||
+        (stmt.kind === "alterView" &&
+          (stmt.db !== undefined ? stmt.db === "temp" : this.isTempView(stmt.name))) ||
         (stmt.kind === "alterSequence" && this.isTempSequence(stmt.name))
       ) {
         allowed = this.session.allowTempDdl;
@@ -4128,6 +4144,12 @@ export class Engine {
     } catch {
       return;
     }
+    // A `SET c = DEFAULT` through a view assigns the view column default (views.md §16.1).
+    upd.assignments.forEach((a, i) => {
+      if (written.assignments[i]!.isDefault && !a.isDefault) {
+        collectExprPrivs(a.value, req, new Set());
+      }
+    });
     const table = this.lkpTableScoped(upd.db, upd.table);
     if (table === undefined) return;
     collectAssignmentDefaultPrivs(table, upd.assignments, req);
@@ -4136,13 +4158,35 @@ export class Engine {
 
   private collectInsertCatalogPrivs(written: Insert, req: PrivReq): void {
     let ins: Insert;
+    let vw: ViewWrite | null;
     try {
-      ins = this.rewriteInsertTarget(written).ins;
+      ({ ins, vw } = this.rewriteInsertTarget(written));
     } catch {
       return;
     }
-    const table = this.lkpTableScoped(ins.db, ins.table);
-    if (table === undefined) return;
+    const base = this.lkpTableScoped(ins.db, ins.table);
+    if (base === undefined) return;
+    let table: Table = base;
+    // The view column defaults the INSERT applies replace the table's (views.md §16.1).
+    if (vw !== null && vw.defaultOverrides.length > 0) {
+      try {
+        table = this.tableWithViewDefaults(table, vw, ins.overriding);
+      } catch {
+        return;
+      }
+    }
+    if (
+      vw !== null &&
+      ins.onConflict !== null &&
+      ins.onConflict.doUpdate &&
+      written.onConflict !== null &&
+      written.onConflict.doUpdate
+    ) {
+      const was = written.onConflict.assignments;
+      ins.onConflict.assignments.forEach((a, i) => {
+        if (was[i]!.isDefault) collectExprPrivs(a.value, req, new Set());
+      });
+    }
     // The columns this INSERT defaults, exactly as execution selects them: every column the list
     // omits (all of them for DEFAULT VALUES), every OVERRIDING USER VALUE identity column, and every
     // column a VALUES row fills with DEFAULT. An unknown or repeated list column is skipped —
@@ -4766,7 +4810,7 @@ export class Engine {
     }
     let rows = 0n;
     // jed_columns lists the main database's view columns after its tables' (introspection.md §5).
-    if (srf.kind === "jed_columns" && srf.introspectScope === "main") {
+    if (srf.kind === "jed_columns" && (srf.introspectScope === "main" || srf.introspectScope === "temp")) {
       for (const view of snap.viewsSorted()) rows = saturatingEstimateAdd(rows, BigInt(view.columns.length));
     }
     for (const table of snap.tablesSorted()) {
@@ -7842,7 +7886,7 @@ export class Engine {
     // A view depending on a table being dropped blocks the statement under RESTRICT; CASCADE drops
     // it, with every view depending on it (views.md §6).
     const cascadeViews = this.dropTableViews(
-      targets.filter((t) => t.scope === "persistent").map((t) => t.key),
+      targets.map((t) => t.key),
       dt.cascade,
     );
     const persistentSeen = new Set(
@@ -7874,7 +7918,7 @@ export class Engine {
     // ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
     // now-dangling FK constraint (in place, preserving its rows), each in its own domain: views live
     // only in the main database, and an FK in its tables' domain.
-    for (const name of cascadeViews) this.working().removeView(name);
+    for (const name of cascadeViews) this.removeViewScoped(name);
     for (const d of cascadeRemovals) {
       this.working().removeForeignKey(d.refTableKey, d.fkName);
     }
@@ -7933,7 +7977,8 @@ export class Engine {
     if (original === undefined) {
       // A view: its renames are the view renames (views.md §7.1); every other action is the wrong
       // object kind (42809, views.md §2).
-      if (snap.view(at.name) !== undefined) {
+      const tempView = (at.db === undefined || at.db === "temp") && this.isTempView(at.name);
+      if (snap.view(at.name) !== undefined || tempView) {
         if (at.action.kind === "renameTable") {
           return this.executeAlterView({
             kind: "alterView",
@@ -7951,6 +7996,30 @@ export class Engine {
             ifExists: at.ifExists,
             action: at.action,
           });
+        }
+        // `ALTER COLUMN … SET / DROP DEFAULT` on a view is the view's own column default (views.md
+        // §16.1), as in PostgreSQL.
+        if (at.action.kind === "actions") {
+          const edits: ViewEdit[] = [];
+          for (const a of at.action.actions) {
+            if (a.kind === "alterColumn" && a.edit.action.kind === "setDefault") {
+              edits.push({ kind: "setDefault", column: a.edit.column, default: a.edit.action.default });
+            } else if (a.kind === "alterColumn" && a.edit.action.kind === "dropDefault") {
+              edits.push({ kind: "dropDefault", column: a.edit.column });
+            } else {
+              edits.length = 0;
+              break;
+            }
+          }
+          if (edits.length > 0) {
+            return this.executeAlterView({
+              kind: "alterView",
+              name: at.name,
+              db: at.db,
+              ifExists: at.ifExists,
+              action: { kind: "edits", edits },
+            });
+          }
         }
         throw engineError("wrong_object_type", `${at.name} is not a table`);
       }
@@ -7995,7 +8064,7 @@ export class Engine {
           `cannot alter table ${original.name} because view ${dependent.name} depends on it`,
         );
       }
-    } else if (!tempScope) {
+    } else {
       const rewrites =
         at.action.kind === "renameTable" ||
         at.action.kind === "renameColumn" ||
@@ -8290,7 +8359,7 @@ export class Engine {
                     `cannot drop column ${action.name} of table ${original.name} because view ${users[0]} depends on it`,
                   ).hinted(DROP_CASCADE);
                 }
-                const closure = this.readSnap().viewDropClosure(users);
+                const closure = this.viewDropClosureAny(users);
                 forgetViews(viewPlan, closure);
                 for (const name of closure) cascadeDroppedViews.add(name);
               }
@@ -9461,7 +9530,7 @@ export class Engine {
     // Drop the views a DROP COLUMN … CASCADE took (views.md §6), then rewrite and re-validate the
     // surviving dependent views against the post-statement catalog (§7/§8); a failure is 0A000 and
     // discards the whole statement.
-    for (const name of cascadeDroppedViews) this.working().removeView(name);
+    for (const name of cascadeDroppedViews) this.removeViewScoped(name);
     if (viewPlan !== null) {
       const change: ViewAlterChange = viewChange ?? {
         kind: "other",
@@ -9734,8 +9803,10 @@ export class Engine {
       // The sequence funnel walks session-local → persistent, so an owned TEMP sequence's name joins
       // the namespace (temp-tables.md §8) — a collision with it is 42P07 too.
       this.sequence(name) !== undefined ||
-      // Views share the relation namespace (spec/design/views.md §2).
-      this.readSnap().view(name) !== undefined
+      // Views share the relation namespace (spec/design/views.md §2), the session's temporary
+      // views included (§10).
+      this.readSnap().view(name) !== undefined ||
+      this.tempSnap().view(name) !== undefined
     );
   }
 
@@ -10619,11 +10690,23 @@ export class Engine {
     }
     const dep = this.compositeDependentAny(dt.name);
     if (dep !== null) {
+      // PostgreSQL's CASCADE would drop the column or field too: not supported (composite.md §7).
+      // CASCADE drops only dependent views (views.md §6.1).
+      if (dt.cascade) {
+        throw engineError(
+          "feature_not_supported",
+          `DROP TYPE ... CASCADE of a type a column or field uses is not supported: ${dep}`,
+        );
+      }
       throw engineError(
         "dependent_objects_still_exist",
         "cannot drop type " + dt.name + " because other objects depend on it: " + dep,
       );
     }
+    // A view that depends on the type blocks the drop under RESTRICT (2BP01); CASCADE drops it, with
+    // every view that depends on it (views.md §6.1).
+    const views = this.dropDependentViews([["type", dt.name]], dt.cascade, (d) => `type ${d.name}`);
+    for (const name of views) this.removeViewScoped(name);
     this.working().removeType(dt.name);
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
@@ -10659,6 +10742,12 @@ export class Engine {
         throw engineError("undefined_table", `sequence does not exist: ${name}`);
       }
       if (seq.ownedBy !== undefined) {
+        if (ds.cascade) {
+          throw engineError(
+            "feature_not_supported",
+            `DROP SEQUENCE ... CASCADE of the owned sequence ${seq.name} is not supported`,
+          );
+        }
         // The owning table is always present (its own DROP TABLE would auto-drop this sequence
         // first), so the column name for the detail resolves. The scope-aware lkpTable finds an
         // owned TEMP sequence's temp owner (temp-tables.md §8).
@@ -10671,6 +10760,14 @@ export class Engine {
           `cannot drop sequence ${seq.name} because other objects depend on it: default value for column ${colName} of table ${tableName} depends on sequence ${seq.name}`,
         );
       }
+      // A view that depends on the sequence blocks the drop under RESTRICT (2BP01); CASCADE drops
+      // it, with every view that depends on it (views.md §6.1).
+      const views = this.dropDependentViews(
+        [["sequence", name]],
+        ds.cascade,
+        (d) => `sequence ${d.name}`,
+      );
+      for (const view of views) this.removeViewScoped(view);
       // Not owned: remove from whichever scope owns it (a temp sequence is always owned, so this
       // routed path is reached only for a plain persistent sequence — temp-tables.md §8).
       this.removeSequenceRouted(name);
@@ -10728,6 +10825,8 @@ export class Engine {
         },
       );
     }
+    // The views that name the sequence keep naming it (views.md §7.2).
+    this.renameSequenceInViews(existing.name, newName);
     // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
     // scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
     let w: Snapshot;
@@ -11602,10 +11701,16 @@ export class Engine {
         "ON CONFLICT on an attached-database table is not supported yet",
       );
     }
-    const table = this.lkpTableScoped(ins.db, ins.table); // scope-aware temp-first (temp-tables.md §3)
-    if (!table) {
+    const found = this.lkpTableScoped(ins.db, ins.table); // scope-aware temp-first (temp-tables.md §3)
+    if (!found) {
       throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
     }
+    // An INSERT through a view fills its columns from the view column defaults first (views.md
+    // §16.1).
+    const table =
+      vw !== null && vw.defaultOverrides.length > 0
+        ? this.tableWithViewDefaults(found, vw, ins.overriding)
+        : found;
     // Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
     // maintained B-tree would mix two orderings (collation.md §12, XX002).
     this.ensureCollationsWritable(table.columns);
@@ -15197,19 +15302,42 @@ export class Engine {
     trace.catalogRels.add(tref.name);
   }
 
-  // traceTableItem records a FROM item that binds a base table. A persistent view may read only the
-  // persistent relations of its own database: a temporary table (bare or temp.-qualified) or an
-  // attached database's table is 0A000 (views.md §10).
+  // traceSequence records the sequence a traced body names in the constant first argument of
+  // nextval / currval / setval (views.md §6). The name must be a sequence, else 42P01, as
+  // PostgreSQL's regclass reading of the constant fails at definition. A temporary sequence makes the
+  // view temporary (§10). Text that is not one identifier is left to the call to report.
+  traceSequence(text: string): void {
+    if (this.viewTrace === null) return;
+    let name: string;
+    try {
+      name = parseNameText(text);
+    } catch {
+      return;
+    }
+    if (this.sequence(name) === undefined) {
+      throw engineError("undefined_table", `relation "${name}" does not exist`);
+    }
+    if (this.isTempSequence(name)) this.viewTrace.readsTemp = true;
+    this.viewTrace.sequences.add(name);
+  }
+
+  // traceType records a composite type a traced body names as a type — a cast target or a typed
+  // literal (views.md §6).
+  traceType(name: string): void {
+    this.viewTrace?.types.add(name);
+  }
+
+  // traceTableItem records a FROM item that binds a base table. A view may read only the relations
+  // of its own database and the session's temporary domain — reading a temporary one makes the view
+  // temporary — so an attached database's table is 0A000 (views.md §10).
   private traceTableItem(tref: TableRef, table: Table): void {
     const trace = this.viewTrace;
     if (trace === null) return;
     const temp = tref.db === undefined ? this.isTempTable(tref.name) : tref.db === "temp";
-    if (temp) {
-      throw viewNotSupported(`a view cannot read the temporary relation "${tref.name}"`);
-    }
     if (isAttachmentScope(tref.db)) {
       throw viewNotSupported(`a view cannot read the attached relation "${tref.db}.${tref.name}"`);
     }
+    if (temp) trace.readsTemp = true;
     const pos = tref.pos ?? { name: -1, alias: null, list: null, depth: 0 };
     trace.items.set(pos.name, { kind: "table", name: table.name, pos });
   }
@@ -15279,12 +15407,22 @@ export class Engine {
   // built-in catalog relation, then a table (session-local temp first for a bare name), then a view.
   // Only bare and main. names reach a view; another qualifier never does (§10).
   private relationView(db: string | undefined, name: string): ViewDef | undefined {
-    if (db !== undefined && db !== "main") return undefined;
-    const snap = this.readSnap();
-    const view = snap.view(name);
-    if (view === undefined || catalogRelKind(name) !== undefined) return undefined;
-    const table = db === undefined ? this.lkpTable(name) : snap.table(name);
-    return table === undefined ? view : undefined;
+    let view: ViewDef | undefined;
+    let shadowed: boolean;
+    if (db === undefined) {
+      view = this.visibleView(name);
+      shadowed = this.lkpTable(name) !== undefined;
+    } else if (db === "main") {
+      view = this.readSnap().view(name);
+      shadowed = this.readSnap().table(name) !== undefined;
+    } else if (db === "temp") {
+      view = this.tempSnap().view(name);
+      shadowed = this.isTempTable(name);
+    } else {
+      return undefined;
+    }
+    if (view === undefined || shadowed || catalogRelKind(name) !== undefined) return undefined;
+    return view;
   }
 
   // viewReference returns, if the FROM item tref names a view, the equivalent derived table
@@ -15357,6 +15495,7 @@ export class Engine {
   ): QueryPlan {
     if (this.viewTrace !== null) {
       const pos = written.pos ?? { name: -1, alias: null, list: null, depth: 0 };
+      if (this.tempSnap().view(viewName) !== undefined) this.viewTrace.readsTemp = true;
       this.viewTrace.items.set(pos.name, { kind: "view", name: viewName, pos });
     }
     return this.inViewBody(site, () => {
@@ -15393,12 +15532,17 @@ export class Engine {
     this.rejectAttachedView(db, name);
     if (db === undefined) {
       if (this.lkpTable(name) !== undefined) return undefined;
-    } else if (db !== "main") {
-      return undefined;
+      return this.visibleView(name);
     }
-    const snap = this.readSnap();
-    if (snap.table(name) !== undefined) return undefined;
-    return snap.view(name);
+    if (db === "main") {
+      if (this.readSnap().table(name) !== undefined) return undefined;
+      return this.readSnap().view(name);
+    }
+    if (db === "temp") {
+      if (this.isTempTable(name)) return undefined;
+      return this.tempSnap().view(name);
+    }
+    return undefined;
   }
 
   // updatableShape returns the single FROM item of an automatically updatable body (views.md §15.1),
@@ -15436,8 +15580,9 @@ export class Engine {
     ) {
       return null;
     }
-    const snap = this.readSnap();
-    if (snap.table(tref.name) === undefined && snap.view(tref.name) === undefined) return null;
+    if (this.lkpTable(tref.name) === undefined && this.visibleView(tref.name) === undefined) {
+      return null;
+    }
     if (checkCols) {
       const label = tref.alias ?? tref.name;
       const plain =
@@ -15536,10 +15681,9 @@ export class Engine {
       if (shape === null) throw notUpdatable(levelView.name);
       const { sel, tref } = shape;
       const label = tref.alias ?? tref.name;
-      const snap = this.readSnap();
-      const base = snap.table(tref.name);
+      const base = this.lkpTable(tref.name);
       const belowNames = renamedNames(
-        base !== undefined ? base.columns.map((c) => c.name) : snap.view(tref.name)!.columns,
+        base !== undefined ? base.columns.map((c) => c.name) : this.visibleView(tref.name)!.columns,
         tref.columnAliases,
       );
       const items = sel.items.kind === "list" ? sel.items.items : [];
@@ -15548,7 +15692,15 @@ export class Engine {
         return j >= 0 ? { kind: "ref", ref: j } : { kind: "expr", expr: it.expr };
       });
       if (checkCols) {
-        const readOnly = cur.concat(setCur).filter((c) => cols[c]!.kind === "expr");
+        const ordered = cur.concat(setCur);
+        // An INSERT also targets every column of this view that has a default, which it fills when
+        // the statement does not (views.md §16.1).
+        if (kind === "insert") {
+          for (let c = 0; c < cols.length; c++) {
+            if ((levelView.defaults[c] ?? null) !== null) ordered.push(c);
+          }
+        }
+        const readOnly = ordered.filter((c) => cols[c]!.kind === "expr");
         if (readOnly.length > 0) {
           const first = Math.min(...readOnly);
           const verb = kind === "insert" ? "insert into" : "update";
@@ -15567,7 +15719,7 @@ export class Engine {
         tableRename = tref.columnAliases;
         break;
       }
-      levelView = snap.view(tref.name)!;
+      levelView = this.visibleView(tref.name)!;
       rename = tref.columnAliases;
     }
     // 6. Two targets that reach the same table column (42701): among the statement's targets, then
@@ -15578,6 +15730,23 @@ export class Engine {
           throw engineError("duplicate_column", `column ${table.columns[c]!.name} assigned more than once`);
         }
       });
+    }
+    // The view column defaults an INSERT applies (views.md §16.1): each base column takes the
+    // default of the first view, from the target down, that has one for a column leading to it.
+    const defaultOverrides: [number, DefaultExpr][] = [];
+    if (kind === "insert") {
+      for (let k = 0; k < levels.length; k++) {
+        levels[k]!.view.defaults.forEach((d, c) => {
+          if (d === null) return;
+          let idx = c;
+          for (const below of levels.slice(k)) {
+            const lc = below.cols[idx]!;
+            if (lc.kind !== "ref") throw new Error("a defaulted column is updatable");
+            idx = lc.ref;
+          }
+          if (!defaultOverrides.some(([i]) => i === idx)) defaultOverrides.push([idx, d]);
+        });
+      }
     }
     // Build the layers bottom-up: the table, then each view.
     const tableCols = table.columns.map((c, i) =>
@@ -15620,7 +15789,43 @@ export class Engine {
       top: layer,
       targets: cur.map((c) => table.columns[c]!.name),
       conflictSet: setCur.map((c) => table.columns[c]!.name),
+      defaultOverrides,
     };
+  }
+
+  // tableWithViewDefaults is the base table an INSERT through a view writes, with the view column
+  // defaults it applies in place of the table's own (views.md §16.1). On an identity column the view
+  // default is a supplied value: OVERRIDING USER VALUE discards it, and a GENERATED ALWAYS column
+  // takes it only under OVERRIDING SYSTEM VALUE (else 428C9), as in PostgreSQL.
+  tableWithViewDefaults(table: Table, vw: ViewWrite, overriding: Overriding | null): Table {
+    const columns = table.columns.slice();
+    for (const [i, d] of vw.defaultOverrides) {
+      const col = columns[i]!;
+      if (col.identity !== null && overriding === "user") continue;
+      if (col.identity === "always" && overriding !== "system") {
+        throw engineError(
+          "generated_always",
+          `cannot insert a non-DEFAULT value into column ${col.name}`,
+        );
+      }
+      columns[i] = { ...col, default: null, defaultExpr: d };
+    }
+    return { ...table, columns };
+  }
+
+  // viewSetDefault is the value `SET c = DEFAULT` assigns through a view (views.md §16.1): the target
+  // view's own default for column c, else NULL — never a default further down the chain or the base
+  // column's (PostgreSQL's rewrite). An unparsable default is XX003.
+  private viewSetDefault(view: string, column: string): Expr {
+    const v = this.visibleView(view);
+    let d: DefaultExpr | null = null;
+    if (v !== undefined) {
+      const i = v.columns.indexOf(column);
+      if (i >= 0) d = v.defaults[i] ?? null;
+    }
+    if (d === null) return { kind: "literal", literal: { kind: "null" } };
+    if (d.unparsed) throw unparsableDefaultError(view, column);
+    return d.expr;
   }
 
   // planWriteTarget plans the target view as a read of it at the statement's top level would
@@ -15713,7 +15918,7 @@ export class Engine {
     if (onConflict !== null && onConflict.doUpdate) {
       const assignments = onConflict.assignments.map((a, i) =>
         a.isDefault
-          ? { column: vw.conflictSet[i]!, isDefault: false, value: { kind: "literal", literal: { kind: "null" } } as Expr }
+          ? { ...a, column: vw.conflictSet[i]!, isDefault: false, value: this.viewSetDefault(vw.view, a.column) }
           : { ...a, column: vw.conflictSet[i]! },
       );
       onConflict = { ...onConflict, assignments };
@@ -15723,7 +15928,7 @@ export class Engine {
 
   // rewriteUpdateTarget retargets an UPDATE through an updatable view at its base table (views.md
   // §15.2): each assignment names its base column, and `SET c = DEFAULT` assigns the view column's
-  // default, which is NULL (jed has no view column defaults).
+  // default (§16.1), else NULL.
   rewriteUpdateTarget(upd: Update): { upd: Update; vw: ViewWrite | null } {
     const vw = this.prepareViewWrite(
       upd.db,
@@ -15736,7 +15941,7 @@ export class Engine {
     const { db: _db, ...rest } = upd;
     const assignments = upd.assignments.map((a, i) =>
       a.isDefault
-        ? { column: vw.targets[i]!, isDefault: false, value: { kind: "literal", literal: { kind: "null" } } as Expr }
+        ? { ...a, column: vw.targets[i]!, isDefault: false, value: this.viewSetDefault(vw.view, a.column) }
         : { ...a, column: vw.targets[i]! },
     );
     return { upd: { ...rest, table: vw.table, assignments }, vw };
@@ -15757,18 +15962,117 @@ export class Engine {
     return viewsInDependencyOrder(this.readSnap().viewsSorted());
   }
 
-  // isView reports whether name names a view of the main database (the relation namespace, §2).
+  // isView reports whether name names a view visible to the session: a temporary view of the session
+  // or a view of the main database (the relation namespace, views.md §2/§10).
   private isView(name: string): boolean {
-    return this.readSnap().view(name) !== undefined;
+    return this.visibleView(name) !== undefined;
+  }
+
+  // visibleView is the view `name` visible to the session, the session's temporary view first
+  // (views.md §10). Preclude-overlaps keeps a name in at most one domain (temp-tables.md §3).
+  private visibleView(name: string): ViewDef | undefined {
+    return this.tempSnap().view(name) ?? this.readSnap().view(name);
+  }
+
+  // isTempView reports whether name is a temporary view of the session (views.md §10).
+  private isTempView(name: string): boolean {
+    return this.tempSnap().view(name) !== undefined;
+  }
+
+  // sessionViews is every view visible to the session — the main database's and the session's
+  // temporary ones — in name byte order (views.md §10).
+  private sessionViews(): ViewDef[] {
+    return [...this.readSnap().viewsSorted(), ...this.tempSnap().viewsSorted()].sort((a, b) =>
+      compareTextC(a.name, b.name),
+    );
+  }
+
+  // viewsDependingOnAny is the views, of either domain, that depend on the object `name` of the given
+  // kind, in name byte order (views.md §6).
+  private viewsDependingOnAny(kind: ViewDepKind, name: string): ViewDef[] {
+    return this.sessionViews().filter((v) =>
+      v.deps.some((d) => d.kind === kind && d.name === name),
+    );
+  }
+
+  // viewDropClosureAny is the views a CASCADE drop removes (views.md §6.1), across both domains: the
+  // seeds and every view that depends on one of them, transitively.
+  private viewDropClosureAny(seeds: Iterable<string>): Set<string> {
+    const closure = new Set(seeds);
+    for (;;) {
+      const added = this.sessionViews().filter(
+        (v) => !closure.has(v.name) && v.deps.some((d) => d.kind === "view" && closure.has(d.name)),
+      );
+      if (added.length === 0) return closure;
+      for (const v of added) closure.add(v.name);
+    }
+  }
+
+  // viewsDependingOnSet is the views of either domain whose dependency list names one of `objects`,
+  // with the first such dependency, in view name byte order (the 2BP01 scan, views.md §6).
+  private viewsDependingOnSet(objects: [ViewDepKind, string][]): [string, ViewDep][] {
+    const out: [string, ViewDep][] = [];
+    for (const v of this.sessionViews()) {
+      const d = v.deps.find((d) => objects.some(([k, n]) => k === d.kind && n === d.name));
+      if (d !== undefined) out.push([v.name, d]);
+    }
+    return out;
+  }
+
+  // putViewScoped installs a view in its domain: the session's temporary domain or the main database.
+  private putViewScoped(def: ViewDef, temp: boolean): void {
+    if (temp) {
+      this.session.tx!.tempDirty = true;
+      this.session.tx!.tempWorking.putView(def);
+    } else {
+      this.working().putView(def);
+    }
+  }
+
+  // removeViewScoped removes the view `name` from whichever domain holds it.
+  private removeViewScoped(name: string): void {
+    if (this.isTempView(name)) {
+      this.session.tx!.tempDirty = true;
+      this.session.tx!.tempWorking.removeView(name);
+    } else {
+      this.working().removeView(name);
+    }
+  }
+
+  // dropDependentViews is the views a drop of the objects `dropped` reaches (views.md §6/§6.1): under
+  // RESTRICT the first view in name byte order that depends on one of them is 2BP01, naming what
+  // (`describe`) it depends on; under CASCADE the closure of those views is returned to be dropped
+  // with them.
+  private dropDependentViews(
+    dropped: [ViewDepKind, string][],
+    cascade: boolean,
+    describe: (d: ViewDep) => string,
+  ): Set<string> {
+    const users = this.viewsDependingOnSet(dropped);
+    if (users.length > 0 && !cascade) {
+      const [view, dep] = users[0]!;
+      throw engineError(
+        "dependent_objects_still_exist",
+        `cannot drop ${describe(dep)} because view ${view} depends on it`,
+      ).hinted(DROP_CASCADE);
+    }
+    return this.viewDropClosureAny(users.map(([v]) => v));
   }
 
   // executeCreateView runs CREATE VIEW (views.md §1.1).
   private executeCreateView(cv: CreateView): Outcome {
     const done: Outcome = { kind: "statement", cost: 0n, rowsAffected: null };
-    // 1. The database qualifier (the allow_ddl gate already ran in admission): main is the only
-    //    database a view may live in this slice.
-    if (cv.db !== undefined && cv.db !== "main") {
-      if (cv.db === "temp") throw viewNotSupported("temporary views are not supported");
+    // 1. The database qualifier (the allow_ddl / allow_temp_ddl gate already ran in admission):
+    //    main, or temp for a temporary view (§10); a TEMP view names no other database.
+    let temporary = cv.temporary;
+    if (cv.db === "temp") {
+      temporary = true;
+    } else if (cv.db !== undefined && cv.temporary) {
+      throw engineError(
+        "syntax_error",
+        `a temporary view cannot be created in database "${cv.db}"`,
+      );
+    } else if (cv.db !== undefined && cv.db !== "main") {
       if (this.attachReadSnap(cv.db) === undefined) {
         throw engineError("undefined_table", `database "${cv.db}" is not attached`);
       }
@@ -15788,8 +16092,14 @@ export class Engine {
     if (param !== undefined) {
       throw engineError("undefined_parameter", `there is no parameter $${param.paramIndex}`);
     }
+    // The WITH ( … ) options (§16.2, 22023), merged with a trailing check option.
+    const options = parseViewOptions(cv.options);
+    if (options.checkOption !== undefined && cv.checkOption !== null) {
+      throw duplicateViewOption("check_option");
+    }
+    const checkOption = options.checkOption ?? cv.checkOption;
     // A check option needs the view's own body to be updatable for INSERT / UPDATE (§15.6).
-    if (cv.checkOption !== null && this.updatableShape(body, true) === null) {
+    if (checkOption !== null && this.updatableShape(body, true) === null) {
       throw viewNotSupported(
         "WITH CHECK OPTION is supported only on automatically updatable views",
       );
@@ -15831,16 +16141,11 @@ export class Engine {
       // later uses (spec/design/error-fields.md §10.1).
       body = parseViewDefinition(cv.body).body;
     }
-    const deps = this.traceDependencies(trace);
+    const deps = this.traceDependencies(trace, bodyTypes);
+    // A body that reads a temporary relation makes the view temporary, as in PostgreSQL (§10).
+    if (trace.readsTemp) temporary = true;
     // 7. The creating session's SELECT privilege on every relation the body reads (§9).
-    const privileges = this.session.privileges;
-    if (!privileges.isPermissive()) {
-      for (const name of [...deps.map((d) => d.name), ...trace.catalogRels]) {
-        if (!privileges.allowsTable(name, "select")) {
-          throw engineError("insufficient_privilege", `permission denied for table ${name}`);
-        }
-      }
-    }
+    this.checkViewOwnerPrivileges(deps, trace);
     // 8. A taken name: 42P07, or under OR REPLACE the replacement of a view (§1.2) and 42809 for any
     //    other relation.
     let replaced: ViewDef | undefined;
@@ -15848,8 +16153,15 @@ export class Engine {
       if (!cv.orReplace) {
         throw engineError("duplicate_table", `relation "${cv.name}" already exists`);
       }
-      replaced = this.readSnap().view(cv.name);
+      replaced = this.visibleView(cv.name);
       if (replaced === undefined) throw notAView(cv.name);
+      // A temporary view stays temporary under OR REPLACE; a persistent view cannot be replaced by a
+      // temporary one (preclude-overlaps, §10).
+      if (this.isTempView(cv.name)) {
+        temporary = true;
+      } else if (temporary) {
+        throw engineError("duplicate_table", `relation "${cv.name}" already exists`);
+      }
       // 9. Column compatibility (42P16), 10. no cycle (42P17).
       this.checkViewReplacement(
         replaced,
@@ -15865,7 +16177,14 @@ export class Engine {
         );
       }
     }
-    // 9 (12 under OR REPLACE). Write the catalog entry; it must fit one catalog page.
+    // 9 (12 under OR REPLACE). Write the catalog entry. A replacement keeps the defaults of the
+    // columns it keeps (§16.1); its options are the statement's.
+    const defaults: (DefaultExpr | null)[] = columns.map(() => null);
+    if (replaced !== undefined) {
+      replaced.defaults.forEach((d, i) => {
+        defaults[i] = d;
+      });
+    }
     const def: ViewDef = {
       name: cv.name,
       columns,
@@ -15873,13 +16192,32 @@ export class Engine {
       deps,
       body,
       depth,
-      checkOption: cv.checkOption,
+      checkOption,
+      defaults,
+      securityBarrier: options.securityBarrier ?? false,
+      securityInvoker: options.securityInvoker ?? false,
     };
-    this.checkViewEntryFits(def);
-    this.working().putView(def);
+    this.putViewScoped(def, temporary);
     // 11. The views that read a replaced view are re-validated against the replacement (§8).
     if (replaced !== undefined) this.revalidateAfterReplace(replaced);
     return done;
+  }
+
+  // checkViewOwnerPrivileges is the owner check of a view (views.md §9): the session needs SELECT on
+  // every persistent table and view the body reads and on each jed_ catalog relation it names
+  // (42501). A temporary relation is the session's own and is not privilege-checked, as everywhere.
+  private checkViewOwnerPrivileges(deps: ViewDep[], trace: ViewTrace): void {
+    const privileges = this.session.privileges;
+    if (privileges.isPermissive()) return;
+    const read = deps
+      .filter((d) => d.kind === "table" || d.kind === "view")
+      .filter((d) => !this.isTempTable(d.name) && !this.isTempView(d.name))
+      .map((d) => d.name);
+    for (const name of [...read, ...trace.catalogRels]) {
+      if (!privileges.allowsTable(name, "select")) {
+        throw engineError("insufficient_privilege", `permission denied for table ${name}`);
+      }
+    }
   }
 
   // checkViewReplacement is the CREATE OR REPLACE VIEW column compatibility check (views.md §1.2 step
@@ -15948,7 +16286,6 @@ export class Engine {
   // viewReads reports whether a body with dependency list `deps` reads the view `target`, directly
   // or through other views (the 42P17 cycle check, views.md §1.2 step 10).
   private viewReads(deps: ViewDep[], target: string): boolean {
-    const snap = this.readSnap();
     const pending = deps.filter((d) => d.kind === "view").map((d) => d.name);
     const seen = new Set<string>();
     while (pending.length > 0) {
@@ -15956,7 +16293,7 @@ export class Engine {
       if (name === target) return true;
       if (seen.has(name)) continue;
       seen.add(name);
-      const view = snap.view(name);
+      const view = this.visibleView(name);
       if (view !== undefined) {
         for (const d of view.deps) if (d.kind === "view") pending.push(d.name);
       }
@@ -15969,12 +16306,11 @@ export class Engine {
   // direct dependent must also keep its dependency list and reference no column the replacement
   // appended.
   private revalidateAfterReplace(old: ViewDef): void {
-    const snap = this.readSnap();
     const readers = new Set<string>();
     const pending = [old.name];
     while (pending.length > 0) {
       const name = pending.pop()!;
-      for (const v of snap.viewsDependingOn("view", name)) {
+      for (const v of this.viewsDependingOnAny("view", name)) {
         if (!readers.has(v.name)) {
           readers.add(v.name);
           pending.push(v.name);
@@ -15986,51 +16322,55 @@ export class Engine {
         `cannot replace view ${old.name} because it would change the definition of view ${view}`,
       );
     for (const name of [...readers].sort(compareTextC)) {
-      const view = snap.view(name)!;
+      const view = this.visibleView(name)!;
       if (view.body === null) throw unparsableViewError(name);
-      let trace: ViewTrace;
+      let traced: { plan: QueryPlan; trace: ViewTrace };
       try {
-        trace = this.traceViewBody(view.body).trace;
+        traced = this.traceViewBody(view.body);
       } catch (e) {
         if (isUnparsableError(e)) throw e;
         throw breaks(name);
       }
+      const trace = traced.trace;
       if (!view.deps.some((d) => d.kind === "view" && d.name === old.name)) continue;
       const ordinals = trace.viewColumns.get(old.name) ?? new Set<number>();
       const captured = [...ordinals].some((o) => o >= old.columns.length);
-      if (captured || !depsEqual(this.traceDependencies(trace), view.deps)) throw breaks(name);
-    }
-  }
-
-  // checkViewEntryFits: a view's catalog entry must fit one catalog page (format.md *Catalog*); a
-  // longer definition is 0A000 (views.md §1.1 step 9).
-  private checkViewEntryFits(def: ViewDef): void {
-    const cap = this.pageSize - PAGE_HEADER;
-    if (1 + viewEntryBytes(def).length > cap) {
-      throw viewNotSupported(`the definition of view "${def.name}" is too long`);
+      if (
+        captured ||
+        !depsEqual(this.traceDependencies(trace, traced.plan.columnTypes), view.deps)
+      ) {
+        throw breaks(name);
+      }
     }
   }
 
   // traceDependencies is the persisted dependency list of a traced view body (views.md §6): every
-  // bound table (with its referenced columns, by current name) and view, in ascending name byte
-  // order.
-  private traceDependencies(trace: ViewTrace): ViewDep[] {
+  // bound table (with its referenced columns, by current name) and view, every sequence the body
+  // names, and every composite type it names or outputs (`output`, the planned column types), in
+  // ascending (name, kind) byte order.
+  private traceDependencies(trace: ViewTrace, output: ResolvedType[]): ViewDep[] {
     const deps = new Map<string, ViewDep>();
-    for (const item of trace.itemsInOrder()) {
-      if (!deps.has(item.name)) deps.set(item.name, { kind: item.kind, name: item.name, columns: [] });
-    }
-    const snap = this.readSnap();
+    const key = (kind: ViewDepKind, name: string) => kind + "\0" + name;
+    const add = (kind: ViewDepKind, name: string): ViewDep => {
+      let dep = deps.get(key(kind, name));
+      if (dep === undefined) {
+        dep = { kind, name, columns: [] };
+        deps.set(key(kind, name), dep);
+      }
+      return dep;
+    };
+    for (const item of trace.itemsInOrder()) add(item.kind, item.name);
+    for (const name of trace.sequences) add("sequence", name);
+    const types = new Set(trace.types);
+    for (const t of output) outputCompositeNames(t, types);
+    for (const name of types) add("type", name);
     for (const [table, ordinals] of trace.columns) {
-      const t = snap.table(table);
+      const t = this.lkpTable(table);
       if (t === undefined) continue;
       for (const ordinal of ordinals) {
         const col = t.columns[ordinal];
         if (col === undefined) continue;
-        let dep = deps.get(table);
-        if (dep === undefined) {
-          dep = { kind: "table", name: table, columns: [] };
-          deps.set(table, dep);
-        }
+        const dep = add("table", table);
         if (!dep.columns.includes(col.name)) dep.columns.push(col.name);
       }
     }
@@ -16045,14 +16385,18 @@ export class Engine {
       if (isCatalogRelName(name)) {
         throw engineError("wrong_object_type", `cannot drop system relation "${name}"`);
       }
-      if (db !== undefined && db !== "main") {
-        if (db === "temp") {
-          if (this.isTempTable(name) || this.isTempSequence(name)) {
-            throw engineError("wrong_object_type", `"${name}" is not a view`);
-          }
+      if (db === "main") {
+        if (this.isTempView(name)) {
+          if (dv.ifExists) continue;
+          throw engineError("undefined_table", `view "main.${name}" does not exist`);
+        }
+      } else if (db === "temp") {
+        if (!this.isTempView(name)) {
+          if (this.isTempTable(name) || this.isTempSequence(name)) throw notAView(name);
           if (dv.ifExists) continue;
           throw engineError("undefined_table", `view "temp.${name}" does not exist`);
         }
+      } else if (db !== undefined) {
         if (this.attachReadSnap(db) === undefined) {
           throw engineError("undefined_table", `database "${db}" is not attached`);
         }
@@ -16065,16 +16409,15 @@ export class Engine {
         targets.push(name);
         continue;
       }
-      if (this.relationExists(name)) {
-        throw engineError("wrong_object_type", `"${name}" is not a view`);
-      }
+      if (this.relationExists(name)) throw notAView(name);
       if (dv.ifExists) continue;
       throw engineError("undefined_table", `view "${name}" does not exist`);
     }
     // Phase 2: under RESTRICT a dependent view outside the drop set blocks (2BP01), naming the first
-    // in name byte order; under CASCADE every dependent view is dropped too, transitively.
-    if (dv.cascade) targets = [...this.readSnap().viewDropClosure(targets)];
-    for (const dependent of this.readSnap().viewsSorted()) {
+    // in name byte order; under CASCADE every dependent view is dropped too, transitively. Both
+    // domains: a temporary view may read a persistent one (§10).
+    if (dv.cascade) targets = [...this.viewDropClosureAny(targets)];
+    for (const dependent of this.sessionViews()) {
       if (targets.includes(dependent.name)) continue;
       const dep = dependent.deps.find((d) => d.kind === "view" && targets.includes(d.name));
       if (dep === undefined) continue;
@@ -16084,7 +16427,7 @@ export class Engine {
       ).hinted(DROP_CASCADE);
     }
     // Phase 3: remove.
-    for (const name of targets) this.working().removeView(name);
+    for (const name of targets) this.removeViewScoped(name);
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -16093,7 +16436,7 @@ export class Engine {
   // views.md §4.1).
   stmtIsWriteWithViews(stmt: Statement): boolean {
     if (stmtIsWrite(stmt)) return true;
-    if (this.readSnap().views.size === 0) return false;
+    if (this.readSnap().views.size === 0 && this.tempSnap().views.size === 0) return false;
     let inner = stmt;
     if (inner.kind === "explain") {
       if (!inner.analyze) return false;
@@ -16148,42 +16491,117 @@ export class Engine {
   // collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads
   // or writes through (transitively) to its privilege requirements (views.md §9, §15.4): function
   // EXECUTE is the reader's or writer's, as for a derived table. The relations inside a body are NOT
-  // added — the view is the privilege boundary.
+  // added — the view is the privilege boundary — except through a security_invoker view (§16.2),
+  // whose body's relations are checked against the reader, and whose base relation needs the
+  // writer's privileges on the view.
   private collectViewFunctionPrivs(req: PrivReq): void {
-    if (this.readSnap().views.size === 0) return;
+    if (this.readSnap().views.size === 0 && this.tempSnap().views.size === 0) return;
+    const writeTargets = req.tables
+      .filter((t) => t.priv === "insert" || t.priv === "update" || t.priv === "delete")
+      .map((t) => t.name);
     const pending = [...req.relations];
-    for (const t of req.tables) {
-      if (t.priv === "insert" || t.priv === "update" || t.priv === "delete") {
-        pending.push({ db: undefined, name: t.name });
-      }
-    }
+    for (const name of writeTargets) pending.push({ db: undefined, name });
     const functions: string[] = [];
     this.walkReadViews(pending, (_view, body) => {
       functions.push(...body.functions);
       return false;
     });
     req.functions.push(...functions);
+    const tables = this.invokerReadPrivs([...req.relations]);
+    tables.push(...this.invokerWritePrivs(req.tables, writeTargets));
+    req.tables.push(...tables);
+  }
+
+  // invokerReadPrivs is the SELECT privileges a read of the relations `pending` needs inside
+  // security_invoker views (views.md §16.2): each such view's body reads its relations as the reader,
+  // as a derived table would, and a security_invoker view it reads in turn is checked the same way. A
+  // definer view's body is not entered.
+  private invokerReadPrivs(
+    pending: { db: string | undefined; name: string }[],
+  ): PrivReq["tables"] {
+    const out: PrivReq["tables"] = [];
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const ref = pending.pop()!;
+      const view = this.relationView(ref.db, ref.name);
+      if (view === undefined || !view.securityInvoker || seen.has(view.name)) continue;
+      seen.add(view.name);
+      if (view.body === null) continue;
+      const body: PrivReq = {
+        tables: [],
+        relations: [],
+        functions: [],
+        isDdl: false,
+        isTempDdl: false,
+      };
+      collectQueryPrivs(view.body, body, new Set());
+      out.push(...body.tables);
+      pending.push(...body.relations);
+    }
+    return out;
+  }
+
+  // invokerWritePrivs is the privileges a write through a security_invoker view needs on the
+  // relations below it (views.md §16.2): every privilege the statement needs on the view is needed
+  // on its base relation too, plus SELECT there when the view's WHERE is evaluated (an UPDATE or
+  // DELETE), and what a subquery in that WHERE reads. A chain continues while the base relation is
+  // itself a security_invoker view.
+  private invokerWritePrivs(stmt: PrivReq["tables"], targets: string[]): PrivReq["tables"] {
+    const out: PrivReq["tables"] = [];
+    for (const target of targets) {
+      const privs = stmt.filter((t) => t.name === target).map((t) => t.priv);
+      let name = target;
+      const seen = new Set<string>();
+      for (;;) {
+        const view = this.relationView(undefined, name);
+        if (view === undefined || !view.securityInvoker || seen.has(view.name)) break;
+        seen.add(view.name);
+        if (view.body === null) break;
+        const shape = this.updatableShape(view.body, false);
+        if (shape === null) break;
+        const { sel, tref } = shape;
+        if (sel.filter !== null) {
+          if (privs.some((p) => p === "update" || p === "delete") && !privs.includes("select")) {
+            privs.push("select");
+          }
+          const req: PrivReq = {
+            tables: [],
+            relations: [],
+            functions: [],
+            isDdl: false,
+            isTempDdl: false,
+          };
+          collectExprPrivs(sel.filter, req, new Set());
+          out.push(...req.tables);
+        }
+        for (const p of privs) out.push({ name: tref.name, priv: p });
+        name = tref.name;
+      }
+    }
+    return out;
   }
 
   // dropTableViews is the DROP TABLE view-dependency check (§6). Under RESTRICT a view depending on
-  // a table being dropped blocks the statement (2BP01), naming the first in name byte order. Under
-  // CASCADE it returns the views to drop with the tables: every view depending on one of them, and
-  // every view depending on one of those, transitively.
+  // a table being dropped — or on a sequence a dropped table owns, which the drop takes with it —
+  // blocks the statement (2BP01), naming the first in name byte order. Under CASCADE it returns the
+  // views to drop with the tables: every view depending on one of them, and every view depending on
+  // one of those, transitively. Views of both domains count (§10).
   private dropTableViews(targets: string[], cascade: boolean): Set<string> {
-    const snap = this.readSnap();
-    const seeds: string[] = [];
-    for (const view of snap.viewsSorted()) {
-      const dep = view.deps.find((d) => d.kind === "table" && targets.includes(d.name));
-      if (dep === undefined) continue;
-      if (!cascade) {
-        throw engineError(
-          "dependent_objects_still_exist",
-          `cannot drop table ${dep.name} because view ${view.name} depends on it`,
-        ).hinted(DROP_CASCADE);
+    const dropped: [ViewDepKind, string][] = [];
+    const owner = new Map<string, string>();
+    for (const t of targets) {
+      dropped.push(["table", t]);
+      const owned = this.isTempTable(t)
+        ? this.tempSnap().sequencesOwnedBy(t)
+        : this.readSnap().sequencesOwnedBy(t);
+      for (const sq of owned) {
+        owner.set(sq, t);
+        dropped.push(["sequence", sq]);
       }
-      seeds.push(view.name);
     }
-    return snap.viewDropClosure(seeds);
+    return this.dropDependentViews(dropped, cascade, (d) =>
+      d.kind === "sequence" ? `table ${owner.get(d.name)}` : `table ${d.name}`,
+    );
   }
 
   // prepareViewAlter captures the views that depend on `table` (of the main database) before an
@@ -16207,7 +16625,7 @@ export class Engine {
     columns: string[],
     rewrites: boolean,
   ): ViewAlterPlan | null {
-    const dependents = this.readSnap().viewsDependingOn(kind, name);
+    const dependents = this.viewsDependingOnAny(kind, name);
     if (dependents.length === 0) return null;
     const plan: ViewAlterPlan = { kind, table: name, columns, views: [] };
     for (const view of dependents) {
@@ -16230,26 +16648,41 @@ export class Engine {
     return plan;
   }
 
-  // executeAlterView runs `ALTER VIEW [IF EXISTS] [main.]v RENAME TO v2` / `RENAME [COLUMN] a TO b`,
-  // and the same ALTER TABLE forms on a view (views.md §7.1). The views that read v are rewritten to
-  // keep binding it, then re-validated (§8).
+  // executeAlterView runs `ALTER VIEW [IF EXISTS] [main. | temp.]v RENAME TO v2` / `RENAME [COLUMN] a
+  // TO b`, and the same ALTER TABLE forms on a view (views.md §7.1): the views that read v are
+  // rewritten to keep binding it, then re-validated (§8). The other actions — column defaults and
+  // options — change only the view's own entry (§16).
   private executeAlterView(av: AlterView): Outcome {
     const done: Outcome = { kind: "statement", cost: 0n, rowsAffected: null };
-    // 1. The database qualifier (the allow_ddl gate already ran in admission).
-    if (av.db !== undefined && av.db !== "main") {
-      if (av.db === "temp") throw viewNotSupported("temporary views are not supported");
+    // 1. The database qualifier (the allow_ddl / allow_temp_ddl gate already ran in admission).
+    let view: ViewDef | undefined;
+    if (av.db === undefined) view = this.visibleView(av.name);
+    else if (av.db === "main") view = this.readSnap().view(av.name);
+    else if (av.db === "temp") view = this.tempSnap().view(av.name);
+    else {
       if (this.attachReadSnap(av.db) === undefined) {
         throw engineError("undefined_table", `database "${av.db}" is not attached`);
       }
       throw viewNotSupported("views in an attached database are not supported");
     }
     // 2. The name: a view, else 42809 for another relation, else 42P01 (IF EXISTS: no-op).
-    const view = this.readSnap().view(av.name);
     if (view === undefined) {
-      if (isCatalogRelName(av.name) || this.relationExists(av.name)) throw notAView(av.name);
+      // Another relation of the named database (the session's whole namespace when bare).
+      let other: boolean;
+      if (av.db === undefined) {
+        other = this.relationExists(av.name);
+      } else {
+        const snap = av.db === "main" ? this.readSnap() : this.tempSnap();
+        other =
+          snap.table(av.name) !== undefined ||
+          snap.findIndex(av.name) !== null ||
+          snap.sequence(av.name) !== undefined;
+      }
+      if (isCatalogRelName(av.name) || other) throw notAView(av.name);
       if (av.ifExists) return done;
       throw engineError("undefined_table", `relation "${av.name}" does not exist`);
     }
+    const temp = this.isTempView(view.name);
     // 3. The new name or the column.
     let change: ViewAlterChange;
     if (av.action.kind === "renameTo") {
@@ -16259,7 +16692,7 @@ export class Engine {
         throw engineError("duplicate_table", `relation "${next}" already exists`);
       }
       change = { kind: "renameRelation", newName: next };
-    } else {
+    } else if (av.action.kind === "renameColumn") {
       const { oldName, newName } = av.action;
       const ordinal = view.columns.indexOf(oldName);
       if (ordinal < 0) throw engineError("undefined_column", `column "${oldName}" does not exist`);
@@ -16270,20 +16703,145 @@ export class Engine {
         );
       }
       change = { kind: "renameColumn", ordinal, newName };
+    } else {
+      const edited = this.applyViewEdits(view, av.action.edits);
+      this.putViewScoped(edited, temp);
+      return done;
     }
     // 4. Capture the dependents against the pre-statement catalog, rename, then rewrite and
     //    re-validate them (5).
     const plan = this.prepareDependents("view", view.name, view.columns.slice(), true);
     const renamed: ViewDef = { ...view, columns: view.columns.slice() };
     if (change.kind === "renameRelation") {
-      this.working().removeView(view.name);
+      this.removeViewScoped(view.name);
       renamed.name = change.newName;
     } else if (change.kind === "renameColumn") {
       renamed.columns[change.ordinal] = change.newName;
     }
-    this.working().putView(renamed);
+    this.putViewScoped(renamed, temp);
     if (plan !== null) this.finishViewAlter(plan, change);
     return done;
+  }
+
+  // applyViewEdits applies the non-rename ALTER VIEW actions to view, in order (views.md §16): a
+  // column default is validated against the column's type, from the planned body, as a table column's
+  // SET DEFAULT is; SET ( … ) validates its options (22023) and a check option the view's shape
+  // (0A000); RESET ( … ) clears the named options (an unknown name is ignored, as in PostgreSQL).
+  // Turning security_invoker off makes the view a definer view, so the session must pass the owner
+  // check (§9).
+  private applyViewEdits(view: ViewDef, edits: ViewEdit[]): ViewDef {
+    const out: ViewDef = { ...view, defaults: view.defaults.slice() };
+    let columns: Column[] | null = null;
+    const columnIndex = (name: string): number => {
+      const i = view.columns.indexOf(name);
+      if (i < 0) {
+        throw engineError(
+          "undefined_column",
+          `column "${name}" of relation "${view.name}" does not exist`,
+        );
+      }
+      return i;
+    };
+    for (const edit of edits) {
+      if (edit.kind === "setDefault") {
+        const i = columnIndex(edit.column);
+        if (columns === null) columns = this.viewTypedColumns(view);
+        const col = this.buildAlterDefault(columns[i]!, edit.default);
+        if (col.defaultExpr !== null) {
+          out.defaults[i] = col.defaultExpr;
+        } else if (col.default !== null && col.default.kind !== "null") {
+          const exprText = sqlLiteral(col.default);
+          out.defaults[i] = { exprText, expr: parseExpression(exprText) };
+        } else {
+          out.defaults[i] = null;
+        }
+      } else if (edit.kind === "dropDefault") {
+        out.defaults[columnIndex(edit.column)] = null;
+      } else if (edit.kind === "setOptions") {
+        const options = parseViewOptions(edit.options);
+        if (options.checkOption !== undefined) {
+          if (view.body === null) throw unparsableViewError(view.name);
+          if (this.updatableShape(view.body, true) === null) {
+            throw viewNotSupported(
+              "WITH CHECK OPTION is supported only on automatically updatable views",
+            );
+          }
+          out.checkOption = options.checkOption;
+        }
+        if (options.securityBarrier !== undefined) out.securityBarrier = options.securityBarrier;
+        if (options.securityInvoker !== undefined) out.securityInvoker = options.securityInvoker;
+      } else {
+        for (const name of edit.names) {
+          if (name === "check_option") out.checkOption = null;
+          else if (name === "security_barrier") out.securityBarrier = false;
+          else if (name === "security_invoker") out.securityInvoker = false;
+        }
+      }
+    }
+    if (view.securityInvoker && !out.securityInvoker) {
+      if (view.body === null) throw unparsableViewError(view.name);
+      const { trace } = this.traceViewBody(view.body);
+      this.checkViewOwnerPrivileges(view.deps, trace);
+    }
+    return out;
+  }
+
+  // renameSequenceInViews runs for ALTER SEQUENCE s RENAME TO s2 (views.md §7.2): every view that
+  // depends on s keeps naming it — the constant argument of each nextval / currval / setval call
+  // that names s becomes 's2' (the new name as an identifier, quoted when it must be), and the
+  // dependency follows. Sequences are resolved by name everywhere, so every such constant names this
+  // sequence.
+  private renameSequenceInViews(old: string, next: string): void {
+    for (const view of this.viewsDependingOnAny("sequence", old)) {
+      const tokens = lex(view.definition);
+      for (let i = 0; i + 2 < tokens.length; i++) {
+        const t = tokens[i]!;
+        const call =
+          t.kind === "word" &&
+          (t.word === "nextval" || t.word === "currval" || t.word === "setval") &&
+          tokens[i + 1]!.kind === "lparen";
+        const arg = tokens[i + 2]!;
+        if (!call || arg.kind !== "str") continue;
+        let named: string | null;
+        try {
+          named = parseNameText(arg.str!);
+        } catch {
+          named = null;
+        }
+        if (named === old) tokens[i + 2] = { kind: "str", str: quoteIdentifier(next) };
+      }
+      let end = tokens.findIndex((t) => t.kind === "eof");
+      if (end < 0) end = tokens.length;
+      const definition = renderTokens(tokens.slice(0, end));
+      const { body, depth } = parseViewDefinition(definition);
+      const deps = view.deps.map((d) =>
+        d.kind === "sequence" && d.name === old ? { ...d, name: next } : d,
+      );
+      deps.sort(compareViewDeps);
+      const temp = this.isTempView(view.name);
+      this.putViewScoped({ ...view, definition, deps, body, depth }, temp);
+    }
+  }
+
+  // viewTypedColumns is the output columns of view as table columns typed by its planned body
+  // (views.md §16.1): what a column default is validated against. An untyped NULL column is text.
+  private viewTypedColumns(view: ViewDef): Column[] {
+    const body = view.body;
+    if (body === null) throw unparsableViewError(view.name);
+    const plan = this.inViewBody({ depth: 0, bodyDepth: view.depth }, () =>
+      this.planQuery(body, null, [], new ParamTypes()),
+    );
+    const types: ResolvedType[] = plan.columnTypes.map((t) =>
+      t.kind === "null" ? { kind: "text" } : t,
+    );
+    return cteSyntheticTableCols(
+      view.name,
+      view.columns,
+      types,
+      queryPlanColumnDerivs(plan),
+      null,
+      null,
+    ).columns;
   }
 
   // finishViewAlter runs after an ALTER TABLE changed the working catalog: rewrite each dependent
@@ -16305,29 +16863,20 @@ export class Engine {
         throw alterBreaksView(plan, view.name);
       }
       if (definition !== view.definition || !depsEqual(expected, view.deps)) {
-        const updated: ViewDef = {
-          name: view.name,
-          columns: view.columns.slice(),
-          definition,
-          deps: expected,
-          body,
-          depth,
-          checkOption: view.checkOption,
-        };
-        this.checkViewEntryFits(updated);
-        this.working().putView(updated);
+        const updated: ViewDef = { ...view, definition, deps: expected, body, depth };
+        this.putViewScoped(updated, this.isTempView(view.name));
       }
       rewritten.push({ name: view.name, body, expected });
     }
     for (const { name, body, expected } of rewritten) {
-      let trace: ViewTrace;
+      let traced: { plan: QueryPlan; trace: ViewTrace };
       try {
-        trace = this.traceViewBody(body).trace;
+        traced = this.traceViewBody(body);
       } catch (e) {
         if (isUnparsableError(e)) throw e;
         throw alterBreaksView(plan, name);
       }
-      if (!depsEqual(this.traceDependencies(trace), expected)) {
+      if (!depsEqual(this.traceDependencies(traced.trace, traced.plan.columnTypes), expected)) {
         throw alterBreaksView(plan, name);
       }
     }
@@ -19062,12 +19611,13 @@ export class Engine {
         ]);
       }
     }
-    // Views live only in the main database; an attached database's views are not readable
-    // (views.md §10), so their columns are not listed.
-    if (srf.introspectScope === "main") {
+    // Views live in the main database and the session's temporary domain; an attached database's
+    // views are not readable (views.md §10), so their columns are not listed.
+    if (srf.introspectScope === "main" || srf.introspectScope === "temp") {
       for (const v of snap.viewsSorted()) {
         const types = this.viewColumnTypes(v);
         for (let i = 0; i < v.columns.length; i++) {
+          const d = v.defaults[i] ?? null;
           meter.guard();
           meter.charge(COSTS.generatedRow);
           out.push([
@@ -19077,7 +19627,7 @@ export class Engine {
             textValue(types[i]!),
             boolValue(false),
             nullValue(),
-            nullValue(),
+            d === null ? nullValue() : textValue(d.exprText),
             nullValue(),
           ]);
         }
@@ -19138,6 +19688,8 @@ export class Engine {
         textValue(
           v.checkOption === null ? "NONE" : v.checkOption === "local" ? "LOCAL" : "CASCADED",
         ),
+        boolValue(v.securityBarrier),
+        boolValue(v.securityInvoker),
       ]);
     }
     return out;
@@ -33871,6 +34423,8 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("definition", "text", true),
         textArr("columns", true),
         col("check_option", "text", true),
+        col("security_barrier", "boolean", true),
+        col("security_invoker", "boolean", true),
       ]);
     case "jed_type_fields":
       return table("jed_type_fields", [
@@ -39802,6 +40356,14 @@ export function resolveScalarFunc(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  // A view body depends on the sequence a constant sequence-function argument names
+  // (spec/design/views.md §6).
+  if (e.name === "nextval" || e.name === "currval" || e.name === "setval") {
+    const first = e.args[0];
+    if (first !== undefined && first.kind === "literal" && first.literal.kind === "text") {
+      scope.catalog.traceSequence(first.literal.text);
+    }
+  }
   let name = e.name as ScalarFuncName;
   // char_length / character_length are SQL-standard aliases of length (string-functions.md) with NO
   // catalog row of their own, so rewrite them to length BEFORE the lookup (unlike power/ceiling,

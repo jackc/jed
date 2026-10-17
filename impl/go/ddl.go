@@ -1983,7 +1983,11 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 			tempSeen[tgt.key] = true
 		}
 	}
-	cascadeViews, err := db.dropTableViews(persistent, dt.Cascade)
+	allTargets := make([]string, len(targets))
+	for i, tgt := range targets {
+		allTargets[i] = tgt.key
+	}
+	cascadeViews, err := db.dropTableViews(allTargets, dt.Cascade)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -2006,7 +2010,7 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	// now-dangling FK constraint (in place, preserving its rows), each in its own domain: views live
 	// only in the main database, and an FK in its tables' domain.
 	for _, name := range cascadeViews {
-		db.working().removeView(name)
+		db.removeViewScoped(name)
 	}
 	for _, d := range cascadeRemovals {
 		db.working().removeForeignKey(d.refTableKey, d.fkName)
@@ -2044,6 +2048,26 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 
 // executeAlterTable implements ALTER TABLE slices 1-5 (alter.md §1-§3.4).
 // It edits one private table copy, validates the final state, and publishes one catalog mutation.
+// alterTableViewEdits maps an ALTER TABLE action list on a view to the view edits it means (views.md
+// §16.1): every action must be ALTER COLUMN … SET DEFAULT / DROP DEFAULT, else nil.
+func alterTableViewEdits(actions []alterTableEdit) []viewEdit {
+	if len(actions) == 0 {
+		return nil
+	}
+	edits := make([]viewEdit, 0, len(actions))
+	for _, a := range actions {
+		switch {
+		case a.Column != nil && a.Column.Kind == alterSetDefault && a.Column.Default != nil:
+			edits = append(edits, viewEdit{Kind: viewEditSetDefault, Column: a.Column.Column, Default: *a.Column.Default})
+		case a.Column != nil && a.Column.Kind == alterDropDefault:
+			edits = append(edits, viewEdit{Kind: viewEditDropDefault, Column: a.Column.Column})
+		default:
+			return nil
+		}
+	}
+	return edits
+}
+
 func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if err := checkCatalogRelWrite(at.Name); err != nil {
 		return outcome{}, err
@@ -2078,12 +2102,18 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if !ok {
 		// A view: its renames are the view renames (views.md §7.1); every other action is the wrong
 		// object kind (42809, views.md §2).
-		if snap.view(at.Name) != nil {
+		tempView := (at.DB == nil || *at.DB == "temp") && db.isTempView(at.Name)
+		if snap.view(at.Name) != nil || tempView {
 			if at.RenameTable != "" || at.RenameColumn != nil {
 				return db.executeAlterView(&alterView{
 					Name: at.Name, DB: at.DB, IfExists: at.IfExists,
 					RenameTo: at.RenameTable, RenameColumn: at.RenameColumn,
 				})
+			}
+			// ALTER COLUMN … SET / DROP DEFAULT on a view is the view's own column default (views.md
+			// §16.1), as in PostgreSQL.
+			if edits := alterTableViewEdits(at.Actions); edits != nil {
+				return db.executeAlterView(&alterView{Name: at.Name, DB: at.DB, IfExists: at.IfExists, Edits: edits})
 			}
 			return outcome{}, newError(WrongObjectType, at.Name+" is not a table")
 		}
@@ -2172,23 +2202,21 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	// and rewritten + re-validated after the change. A table of an attached database with dependent
 	// views refuses every ALTER TABLE: re-validating views there is a follow-on (views.md §10).
 	var viewPlan *viewAlterPlan
-	if snap != db.tempSnap() {
-		if isAttachmentScope(at.DB) {
-			if deps := snap.viewsDependingOn(viewDepTable, original.Name); len(deps) > 0 {
-				return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
-					"cannot alter table %s because view %s depends on it", original.Name, deps[0].Name))
-			}
-		} else {
-			rewrites := at.RenameTable != "" || at.RenameColumn != nil
-			for _, a := range at.Actions {
-				rewrites = rewrites || a.DropColumn != nil
-			}
-			vp, err := db.prepareViewAlter(original, rewrites)
-			if err != nil {
-				return outcome{}, err
-			}
-			viewPlan = vp
+	if isAttachmentScope(at.DB) {
+		if deps := snap.viewsDependingOn(viewDepTable, original.Name); len(deps) > 0 {
+			return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+				"cannot alter table %s because view %s depends on it", original.Name, deps[0].Name))
 		}
+	} else {
+		rewrites := at.RenameTable != "" || at.RenameColumn != nil
+		for _, a := range at.Actions {
+			rewrites = rewrites || a.DropColumn != nil
+		}
+		vp, err := db.prepareViewAlter(original, rewrites)
+		if err != nil {
+			return outcome{}, err
+		}
+		viewPlan = vp
 	}
 	viewChange := viewAlterChange{kind: viewAlterOther}
 	// The views a DROP COLUMN … CASCADE drops (views.md §6), and the pre-statement ordinals of the
@@ -2383,7 +2411,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 							return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
 								"cannot drop column %s of table %s because view %s depends on it", a.DropColumn.Name, original.Name, users[0])).hinted(hintDropCascade)
 						}
-						closure := snap.viewDropClosure(users)
+						closure := db.viewDropClosureAny(users)
 						viewPlan.forget(closure)
 						cascadeDroppedViews = append(cascadeDroppedViews, closure...)
 					}
@@ -3056,7 +3084,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	// surviving dependent views against the post-statement catalog (§7/§8); a failure is 0A000 and
 	// discards the whole statement.
 	for _, name := range cascadeDroppedViews {
-		db.working().removeView(name)
+		db.removeViewScoped(name)
 	}
 	if viewPlan != nil {
 		if viewChange.kind == viewAlterOther {
@@ -3762,8 +3790,9 @@ func (db *engine) relationExists(name string) bool {
 	if _, _, ok := db.tempSnap().findIndex(name); ok {
 		return true
 	}
-	// A view shares the relation namespace (spec/design/views.md §2).
-	if db.readSnap().view(name) != nil {
+	// A view shares the relation namespace (spec/design/views.md §2), a temporary view included
+	// (§10).
+	if db.visibleView(name) != nil {
 		return true
 	}
 	// The sequence funnel walks session-local → persistent, so an owned TEMP sequence's name joins the
@@ -4526,8 +4555,24 @@ func (db *engine) executeDropType(dt *dropType) (outcome, error) {
 		return outcome{}, newError(UndefinedObject, "type does not exist: "+dt.Name)
 	}
 	if dep, ok := db.compositeDependentAny(dt.Name); ok {
+		// PostgreSQL's CASCADE would drop the column or field too: not supported (composite.md §7).
+		// CASCADE drops only dependent views (views.md §6.1).
+		if dt.Cascade {
+			return outcome{}, newError(FeatureNotSupported,
+				"DROP TYPE ... CASCADE of a type a column or field uses is not supported: "+dep)
+		}
 		return outcome{}, newError(DependentObjectsStillExist,
 			"cannot drop type "+dt.Name+" because other objects depend on it: "+dep)
+	}
+	// A view that depends on the type blocks the drop under RESTRICT (2BP01); CASCADE drops it, with
+	// every view that depends on it (views.md §6.1).
+	views, err := db.dropDependentViews([]viewObject{{kind: viewDepType, name: dt.Name}}, dt.Cascade,
+		func(d viewDep) string { return "type " + d.Name })
+	if err != nil {
+		return outcome{}, err
+	}
+	for _, name := range views {
+		db.removeViewScoped(name)
 	}
 	db.working().removeType(dt.Name)
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
@@ -4575,6 +4620,10 @@ func (db *engine) executeDropSequence(ds *dropSequence) (outcome, error) {
 			return outcome{}, newError(UndefinedTable, "sequence does not exist: "+name)
 		}
 		if seq.OwnedBy != nil {
+			if ds.Cascade {
+				return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+					"DROP SEQUENCE ... CASCADE of the owned sequence %s is not supported", seq.Name))
+			}
 			// The owning table is always present (its own DROP TABLE would auto-drop this sequence
 			// first), so the column name for the detail resolves. The scope-aware lkpTable finds an
 			// owned TEMP sequence's temp owner (temp-tables.md §8).
@@ -4589,6 +4638,16 @@ func (db *engine) executeDropSequence(ds *dropSequence) (outcome, error) {
 				"cannot drop sequence %s because other objects depend on it: default value for column %s of table %s depends on sequence %s",
 				seq.Name, colName, tableName, seq.Name,
 			))
+		}
+		// A view that depends on the sequence blocks the drop under RESTRICT (2BP01); CASCADE drops
+		// it, with every view that depends on it (views.md §6.1).
+		views, err := db.dropDependentViews([]viewObject{{kind: viewDepSequence, name: name}}, ds.Cascade,
+			func(d viewDep) string { return "sequence " + d.Name })
+		if err != nil {
+			return outcome{}, err
+		}
+		for _, view := range views {
+			db.removeViewScoped(view)
 		}
 		// Not owned: remove from whichever scope owns it (a temp sequence is always owned, so this
 		// routed path is reached only for a plain persistent sequence — temp-tables.md §8).
@@ -4655,6 +4714,10 @@ func (db *engine) alterSequenceRename(existing *sequenceDef, newName string) err
 		// the temp snapshot (temp-tables.md §8).
 		db.setColumnDefaultExprRouted(existing.OwnedBy.Table,
 			int(existing.OwnedBy.Column), &defaultExprDef{ExprText: exprText, Expr: expr})
+	}
+	// The views that name the sequence keep naming it (views.md §7.2).
+	if err := db.renameSequenceInViews(existing.Name, newName); err != nil {
+		return err
 	}
 	// Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
 	// scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).

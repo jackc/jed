@@ -2013,7 +2013,7 @@ func (db *engine) estimateCatalogRows(srf *srfPlan) int64 {
 	}
 	var rows int64
 	// jed_columns lists the main database's view columns after its tables' (introspection.md §5).
-	if srf.kind == srfJedColumns && srf.introspectScope == "main" {
+	if srf.kind == srfJedColumns && (srf.introspectScope == "main" || srf.introspectScope == "temp") {
 		for _, view := range snap.viewsSorted() {
 			rows = satEstimateAdd(rows, int64(len(view.Columns)))
 		}

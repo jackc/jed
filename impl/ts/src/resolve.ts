@@ -1342,6 +1342,7 @@ function resolveTypedLiteralExpr(
   // A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
   // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
   const ct = scope.catalog.compositeType(e.typeName);
+  if (ct !== undefined) scope.catalog.traceType(ct.name);
   if (ct !== undefined)
     return atPosition(e.loc, () =>
       foldInSessionZone(scope, params, (iz) =>
@@ -1741,6 +1742,7 @@ function resolveCastExpr(
       elemCol = { kind: "scalar", scalar: elemScalar };
       elemRt = resolvedTypeOf(elemScalar);
     } else if (baseComposite !== undefined) {
+      scope.catalog.traceType(baseComposite.name);
       const elemTy = compositeT(baseComposite.name);
       elemCol = scope.catalog.colTypeOf(elemTy);
       elemRt = resolvedTypeOfCol(elemTy, scope.catalog);
@@ -1870,6 +1872,7 @@ function resolveCastExpr(
   // through record_in per row. A type modifier on a composite is meaningless (0A000).
   const ct = scope.catalog.compositeType(e.typeName);
   if (ct !== undefined) {
+    scope.catalog.traceType(ct.name);
     if (e.typeMod !== null) {
       throw engineError(
         "feature_not_supported",

@@ -6,7 +6,7 @@
 
 pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
-    AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
+    AlterColumnAction, AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
     AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, BinaryOp, CheckOption,
     ConflictAction, ConflictColumn, ConflictTarget, CreateIndex, CreateSequence, CreateTable,
     CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex,
@@ -15,7 +15,7 @@ pub(crate) use crate::ast::{
     JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding,
     QueryExpr, RefAction, Reindex, ReindexKind, ReturningClause, Select, SelectItems, SeqOptions,
     SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef,
-    TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    TypeMod, UnaryOp, Update, ViewEdit, ViewOption, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -5785,6 +5785,8 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("definition", ScalarType::Text, true),
                 text_arr("columns", true),
                 col("check_option", ScalarType::Text, true),
+                col("security_barrier", ScalarType::Bool, true),
+                col("security_invoker", ScalarType::Bool, true),
             ],
         ),
         _ => unreachable!("only catalog-relation kinds reach catalog_rel_table"),

@@ -113,13 +113,19 @@ end
 # Loaded as a library (the page-service benchmark reuses Actor), the corpus run below is skipped.
 return if ENV["JED_PROCESS_DRIVER_LIBRARY"]
 
+# A step's SQL may write `{{repeat <char> <count>}}` for a run of one character, so a corpus file can
+# hold a statement too long to spell out (cow_serialization_error.process.toml).
+def expand_sql(sql)
+  sql.gsub(/\{\{repeat (\S) (\d+)\}\}/) { Regexp.last_match(1) * Regexp.last_match(2).to_i }
+end
+
 def actor_command(step, dir)
   command = step.fetch("command").upcase
   argument = if step.fetch("command") == "attach"
                [step.fetch("name"), step.fetch("read_only", false) ? "1" : "0",
                 File.join(dir, "#{step.fetch('path')}.jed")].join("\t")
              elsif step.key?("sql")
-               step.fetch("sql").unpack1("H*")
+               expand_sql(step.fetch("sql")).unpack1("H*")
              else
                step.fetch("argument", "").to_s
              end

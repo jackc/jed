@@ -74,12 +74,16 @@ SELECT lastval()               -- the value the most recent nextval returned thi
   `setval`) the first to **mutate** the database during expression evaluation. **`lastval()`** takes
   no argument (the first 0-arg sequence function). `setval`/`lastval` land in **S2** (§11) — their
   precise semantics are §4 (`setval`) and §6 (`lastval`).
-- **`DROP SEQUENCE`** is `RESTRICT` by default and RESTRICT-only this slice (`CASCADE` is `0A000`).
-  A missing sequence is `42P01` (sequences share the relation namespace — like `DROP TABLE`), unless
-  `IF EXISTS`. **No dependency tracking this slice:** a plain `column DEFAULT nextval('s')` does *not*
-  create a dependency in PostgreSQL either (only `serial`/`OWNED BY`/identity do, both deferred), so
-  `DROP SEQUENCE` of a sequence named in some column default succeeds and a later `INSERT` raises
-  `42P01` at evaluation — exactly PG.
+- **`DROP SEQUENCE`** is `RESTRICT` by default. `CASCADE` drops the views that depend on the sequence
+  ([views.md](views.md) §6.1); `CASCADE` of an owned sequence stays `0A000`. A missing sequence is
+  `42P01` (sequences share the relation namespace — like `DROP TABLE`), unless `IF EXISTS`. A view
+  that names the sequence in a constant `nextval` / `currval` / `setval` argument blocks the drop with
+  `2BP01` (views.md §6). **A plain `column DEFAULT nextval('s')` records no dependency:** `DROP
+  SEQUENCE` of a sequence named in some column default succeeds, and a later `INSERT` raises `42P01`
+  at evaluation. This is a **divergence**: PostgreSQL reads the constant as a `regclass` and records a
+  dependency, so it refuses that `DROP SEQUENCE` with `2BP01` (*default value for column a of table t
+  depends on sequence s*). (Pinned against the PG 18 oracle; an earlier version of this document said
+  PostgreSQL records none.)
 - **`ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`** landed in **S2** (§4). **S6 (§15)** broadens
   `ALTER` to the **definition-changing option set** — the *same* order-free options as `CREATE`
   (`INCREMENT`/`MINVALUE`/`MAXVALUE`/`START`/`CACHE`/`[NO] CYCLE`), plus `RESTART` as an interleavable
@@ -356,8 +360,10 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
 3. **~~`bigint`-only~~ — CLOSED in S5 (§14).** `AS smallint | integer | bigint` is now supported; a
    sequence's value type sets its default/validated bounds (the counter stays `i64` internally). The
    type is not persisted (it is reducible to the bounds — §14). `ALTER … AS type` stays `0A000`.
-4. **No implicit dependency from a plain `DEFAULT nextval('s')`** — matches PG (only `serial`/identity
-   create one); `DROP SEQUENCE` needs no dependency tracking this slice (§1).
+4. **No implicit dependency from a plain `DEFAULT nextval('s')`** — a **divergence**: PostgreSQL records
+   one (the `regclass` constant), so its `DROP SEQUENCE` of such a sequence is `2BP01`; jed drops it
+   and the `INSERT` that would apply the default fails `42P01` (§1). Only `serial`/identity (the owner
+   link) and views ([views.md](views.md) §6) create a dependency in jed.
 5. **`nextval`/`setval` make the statement a write** — required by the single-writer staging model
    (§4); a `SELECT nextval('s')` commits a new snapshot. Observably matches PG (the value persists).
 6. **Session-local `currval`/`lastval` with `55000`** — adopted as-is (§6).
@@ -372,7 +378,7 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
    exactly — a too-large `nextval` traps `2200H` at the sequence (PG's behavior), not `22003` at the
    INSERT coercion. The divergence is removed (no oracle override).
 10. **The owned (`serial`) sequence is dropped with its table; dropping it alone is `2BP01`** (§12) —
-    the `OWNED BY` dependency. Matches PG. Unlike a *plain* `DEFAULT nextval('s')` (decision 4, no
+    the `OWNED BY` dependency. Matches PG. Unlike a *plain* `DEFAULT nextval('s')` (decision 4, no jed
     dependency), a `serial`-created sequence carries a persisted owner link.
 11. **~~IDENTITY sequences are `bigint`-flavored~~ — CLOSED in S5 (§14).** A `GENERATED … AS IDENTITY`
     column's owned sequence now follows the **column type** (`i16` → `AS smallint`, `i32` → `AS
@@ -520,8 +526,8 @@ type is key-encodable, so the PK gate is satisfied; the column is then PK + `NOT
 ### 12.3 `OWNED BY` — the dependency (`DROP TABLE` auto-drop, `DROP SEQUENCE` 2BP01)
 
 The persisted `owned_by` link (§3) is the only thing distinguishing a `serial`-created sequence from a
-manually-created one referenced by a plain `DEFAULT nextval('s')` (which creates **no** dependency,
-decision 4). It drives two behaviors, both matching PG:
+manually-created one referenced by a plain `DEFAULT nextval('s')` (which creates **no** dependency in
+jed — decision 4, a PG divergence). It drives two behaviors, both matching PG:
 
 - **`DROP TABLE t`** auto-drops every sequence `owned_by` `t`, silently, as part of the drop (after
   the `FOREIGN KEY`-dependent check, which an owned sequence never trips). The owned sequences are
@@ -529,7 +535,7 @@ decision 4). It drives two behaviors, both matching PG:
   database the link is still present (v14), so the auto-drop survives a close/open cycle.
 - **`DROP SEQUENCE s`** where `s` is owned is `2BP01 dependent_objects_still_exist` —
   "cannot drop sequence *s* because other objects depend on it: default value for column *c* of table
-  *t* depends on sequence *s*" (RESTRICT; `CASCADE` is `0A000` this slice). The owner table is always
+  *t* depends on sequence *s*" (RESTRICT; `CASCADE` of an owned sequence is `0A000`). The owner table is always
   present when this fires (the table's own `DROP TABLE` would have auto-dropped the sequence first),
   so the column name for the detail is always resolvable.
 
@@ -809,9 +815,10 @@ it is not `[a-z_][a-z0-9_]*`, as §12.2 step 6; regenerating the
 subsequent `INSERT` advances the renamed sequence — matching PG's observable behavior. The `owned_by`
 pair (`table`, column-ordinal) is untouched, so `DROP TABLE` auto-drop (§12.3) and the `2BP01` on a
 direct `DROP SEQUENCE` of the renamed owned sequence both still hold. (A *plain* `DEFAULT nextval('s')`
-on a non-owned sequence is **not** rewritten — it has no `owned_by` link and PG makes no dependency
-either, §10 decision 4 — so renaming such a sequence then inserting raises `42P01`, exactly as in PG
-where the un-tracked textual reference likewise breaks.)
+on a non-owned sequence is **not** rewritten — it has no `owned_by` link in jed, §10 decision 4 — so
+renaming such a sequence then inserting raises `42P01`. A recorded divergence: PostgreSQL binds the
+constant as a `regclass`, so its default keeps following the renamed sequence. A view that names the
+sequence is rewritten, as for an owned one ([views.md](views.md) §7.2).)
 
 ### 15.4 Determinism
 

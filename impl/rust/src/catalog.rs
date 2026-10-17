@@ -505,6 +505,14 @@ pub struct ViewDef {
     pub depth: usize,
     /// The view's check option, if any (spec/design/views.md §15.6).
     pub check_option: Option<crate::ast::CheckOption>,
+    /// Each output column's default (spec/design/views.md §16.1), index-aligned with `columns`:
+    /// the canonical text, parsed (`unparsed` when this binary cannot parse it).
+    pub defaults: Vec<Option<DefaultExpr>>,
+    /// The `security_barrier` option (views.md §16.2): no outer predicate is pushed into the body.
+    pub security_barrier: bool,
+    /// The `security_invoker` option (views.md §16.2): the body's relations are checked against
+    /// the session that reads or writes through the view.
+    pub security_invoker: bool,
 }
 
 /// What a view dependency names (format.md *View entry* `dep_kind`).
@@ -512,6 +520,10 @@ pub struct ViewDef {
 pub enum ViewDepKind {
     Table,
     View,
+    /// A sequence the body names in a constant `nextval` / `currval` / `setval` argument (§6, v43).
+    Sequence,
+    /// A composite type the body names or outputs (§6, v43).
+    Type,
 }
 
 /// One persisted view dependency (spec/design/views.md §6): a table with the exact set of its

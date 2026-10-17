@@ -1,0 +1,290 @@
+# skip: disk — temporary views and tables cannot survive the disk-mode per-record reopen
+# (spec/design/conformance.md §3).
+# The jed-specific behavior of the view follow-ons (spec/design/views.md §10, §16) that PostgreSQL
+# cannot oracle-check: column defaults in jed_columns (a constant folded to its typed literal, an
+# expression's canonical text), the view options in jed_views, security_invoker's privilege effect
+# under the session envelope (§16.2), and temporary views — temp.jed_views / temp.jed_columns, the
+# temp. qualifier, the preclude-overlaps rules under OR REPLACE (§10), and the allow_temp_ddl gate.
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: ddl.sequence, ddl.view, ddl.view_default, ddl.view_options, ddl.view_temp, ddl.view_alter, ddl.view_replace, dml.view_write, introspect.views, introspect.columns, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.temp_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.aggregates, types.i32, types.text, types.timestamptz, types.decimal, session.privileges, session.allow_ddl, session.allow_temp_ddl
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text, ts timestamptz, d decimal)
+
+statement ok
+CREATE VIEW v AS SELECT id, a, b, ts, d FROM t
+
+# --- column defaults in jed_columns ---------------------------------------------------------------
+
+statement ok
+ALTER VIEW v ALTER a SET DEFAULT 1 + 1, ALTER b SET DEFAULT 'it''s', ALTER ts SET DEFAULT '2024-01-01 12:00:00+02', ALTER d SET DEFAULT 1.50
+
+query TT nosort
+SELECT name, column_default FROM jed_columns WHERE table_name = 'v' ORDER BY ordinal
+----
+id
+NULL
+a
+1 + 1
+b
+'it''s'
+ts
+'2024-01-01 10:00:00+00'
+d
+1.50
+
+statement ok
+INSERT INTO v (id) VALUES (1)
+
+query ITTT nosort
+SELECT a, b, ts::text, d::text FROM t
+----
+2
+it's
+2024-01-01 10:00:00+00
+1.50
+
+# DEFAULT NULL is no default
+statement ok
+ALTER VIEW v ALTER d SET DEFAULT NULL
+
+query T nosort
+SELECT column_default FROM jed_columns WHERE table_name = 'v' AND name = 'd'
+----
+NULL
+
+# --- options in jed_views ---------------------------------------------------------------------------
+
+statement ok
+CREATE VIEW o WITH (security_barrier, check_option = local) AS SELECT id, a FROM t WHERE a > 0
+
+query TTBB nosort
+SELECT name, check_option, security_barrier, security_invoker FROM jed_views ORDER BY name
+----
+o
+LOCAL
+true
+false
+v
+NONE
+false
+false
+
+statement ok
+ALTER VIEW o SET (security_invoker = on), RESET (security_barrier, check_option)
+
+query TTBB nosort
+SELECT name, check_option, security_barrier, security_invoker FROM jed_views WHERE name = 'o'
+----
+o
+NONE
+false
+true
+
+# --- security_invoker: the body's relations are checked against the session using the view ----------
+
+statement ok
+CREATE VIEW dv AS SELECT id, a FROM t
+
+statement ok
+CREATE VIEW iv WITH (security_invoker) AS SELECT id, a FROM t
+
+# a definer view needs SELECT on the view only
+# default_privileges: NONE
+# grant: SELECT ON dv
+query I nosort
+SELECT count(*) FROM dv
+----
+1
+
+# an invoker view also needs SELECT on what its body reads
+# default_privileges: NONE
+# grant: SELECT ON iv
+statement error 42501
+SELECT count(*) FROM iv
+
+# default_privileges: NONE
+# grant: SELECT ON iv
+# grant: SELECT ON t
+query I nosort
+SELECT count(*) FROM iv
+----
+1
+
+# an invoker view over a definer view checks the definer view, not its body
+statement ok
+CREATE VIEW iv2 WITH (security_invoker) AS SELECT id FROM dv
+
+# default_privileges: NONE
+# grant: SELECT ON iv2
+# grant: SELECT ON dv
+query I nosort
+SELECT count(*) FROM iv2
+----
+1
+
+# a write through an invoker view needs the privilege on the base relation too
+# default_privileges: NONE
+# grant: INSERT ON iv
+statement error 42501
+INSERT INTO iv (id) VALUES (2)
+
+# default_privileges: NONE
+# grant: INSERT ON iv
+# grant: INSERT ON t
+statement ok
+INSERT INTO iv (id) VALUES (2)
+
+# an UPDATE through an invoker view whose WHERE is evaluated reads the base relation too
+statement ok
+CREATE VIEW iw WITH (security_invoker) AS SELECT id, a FROM t WHERE id > 0
+
+# default_privileges: NONE
+# grant: UPDATE ON iw
+# grant: UPDATE ON t
+statement error 42501
+UPDATE iw SET a = 5
+
+# default_privileges: NONE
+# grant: UPDATE ON iw
+# grant: UPDATE, SELECT ON t
+statement ok
+UPDATE iw SET a = 5
+
+# turning security_invoker off makes it a definer view: the session needs SELECT on what it reads
+# default_privileges: NONE
+statement error 42501
+ALTER VIEW iv SET (security_invoker = false)
+
+statement ok
+ALTER VIEW iv SET (security_invoker = false)
+
+# --- temporary views -------------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP VIEW tv AS SELECT id, a FROM t
+
+statement ok
+CREATE VIEW temp.tv2 AS SELECT id FROM t
+
+query T nosort
+SELECT name FROM temp.jed_views ORDER BY name
+----
+tv
+tv2
+
+query T nosort
+SELECT name FROM jed_views WHERE name LIKE 'tv%'
+----
+
+query TT nosort
+SELECT table_name, name FROM temp.jed_columns WHERE table_name = 'tv' ORDER BY ordinal
+----
+tv
+id
+tv
+a
+
+query I nosort
+SELECT count(*) FROM temp.tv
+----
+2
+
+statement error 42P01
+SELECT count(*) FROM main.tv
+
+# CREATE OR REPLACE VIEW of a temporary view keeps it temporary (PostgreSQL would create a second,
+# persistent view alongside it in another schema)
+statement ok
+CREATE OR REPLACE VIEW tv AS SELECT id, a, b FROM t
+
+query T nosort
+SELECT name FROM temp.jed_views WHERE name = 'tv'
+----
+tv
+
+# a persistent view cannot be replaced by a temporary one (preclude-overlaps)
+statement error 42P07
+CREATE OR REPLACE TEMP VIEW v AS SELECT id, a, b, ts, d FROM t
+
+# a temporary view name precludes a persistent relation of the same name, and the reverse
+statement error 42P07
+CREATE TABLE tv (x i32)
+
+statement error 42P07
+CREATE SEQUENCE tv
+
+statement error 42P07
+ALTER TABLE t RENAME TO tv
+
+statement error 42P07
+ALTER VIEW v RENAME TO tv
+
+# ALTER TABLE reaches a temporary view as it reaches a persistent one
+statement ok
+ALTER TABLE tv ALTER COLUMN b SET DEFAULT 'tb'
+
+statement ok
+ALTER TABLE tv RENAME TO tv8
+
+statement ok
+ALTER TABLE tv8 RENAME TO tv
+
+query T nosort
+SELECT column_default FROM temp.jed_columns WHERE table_name = 'tv' AND name = 'b'
+----
+'tb'
+
+statement error 42P07
+CREATE TEMP VIEW v AS SELECT 1 AS x
+
+# TEMP with a main. qualifier is a syntax error (the CREATE TEMP TABLE precedent)
+statement error 42601
+CREATE TEMP VIEW main.x AS SELECT 1 AS x
+
+# a temporary view's DDL is gated by allow_temp_ddl, not allow_ddl
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+CREATE TEMP VIEW tv3 AS SELECT id FROM t
+
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+DROP VIEW tv3
+
+# allow_ddl: on
+# allow_temp_ddl: off
+statement error 42501
+CREATE TEMP VIEW tv3 AS SELECT id FROM t
+
+# allow_ddl: on
+# allow_temp_ddl: off
+statement error 42501
+ALTER VIEW tv RENAME TO tv9
+
+# a persistent view's DDL is not temp DDL, even over a temp table, under allow_temp_ddl alone
+statement ok
+CREATE TEMP TABLE tt (z i32)
+
+# allow_ddl: off
+# allow_temp_ddl: on
+statement error 42501
+CREATE VIEW over_tt AS SELECT z FROM tt
+
+statement ok
+DROP TABLE tt
+
+# DROP TABLE of a persistent table a temporary view reads needs CASCADE
+statement error 2BP01
+DROP TABLE t
+
+statement ok
+DROP VIEW tv, tv2
+
+statement ok
+DROP TABLE t CASCADE
+
+query T nosort
+SELECT name FROM jed_views
+----

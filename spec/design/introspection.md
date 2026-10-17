@@ -292,10 +292,12 @@ PostgreSQL's `column_default`, which is NULL for an identity column, jed's keeps
 `suites/introspection/jed_columns_identity.test`.
 
 **View columns** (added after I1). `jed_columns` also lists one row per output column of every view of
-the **main** database, after the tables, as PostgreSQL's `information_schema.columns` does.
+the **main** database (and, read as `temp.jed_columns`, of the session's temporary views — views.md
+§10), after the tables, as PostgreSQL's `information_schema.columns` does.
 `table_name` is the view name, `name` its stored output name (views.md §3), and `ordinal` its 1-based
-position. A view column has no `NOT NULL` constraint, key, or default (view column defaults are a
-deferred views follow-on), so `not_null` is `false` and `pk_ordinal` and `column_default` are NULL.
+position. A view column has no `NOT NULL` constraint or key, so `not_null` is `false` and `pk_ordinal`
+is NULL; `column_default` is the column's view default (views.md §16.1) — its stored canonical text,
+a constant already folded to its SQL literal — or NULL.
 A consumer tells a view's columns from a table's by joining `jed_views` or `jed_tables`; no column was
 added for it.
 
@@ -320,8 +322,7 @@ still one `generated_row` per produced row. Planning needs no privilege on the v
 reads — `SELECT` on `jed_columns` is the whole gate, as for every other row.
 
 An attached database's views are not readable (views.md §10), so a `<attachment>.jed_columns` read
-lists no view columns; `temp` holds no views. Listing an attachment's view columns arrives with views
-over attachments.
+lists no view columns. Listing an attachment's view columns arrives with views over attachments.
 
 Deliberately minimal otherwise: no row-count column yet (v28 persists the fact for planning, but
 exposing it is a separate introspection-surface decision), and no collation column yet.
@@ -540,9 +541,13 @@ jed_views(
   name        text   NOT NULL,  -- the view name (exact, grammar.md §3)
   definition  text   NOT NULL,  -- the stored canonical definition (views.md §3/§5/§7)
   columns     text[] NOT NULL,  -- the output column names, in order
-  check_option text  NOT NULL   -- 'NONE', 'LOCAL', or 'CASCADED' (views.md §15.6)
+  check_option text  NOT NULL,  -- 'NONE', 'LOCAL', or 'CASCADED' (views.md §15.6)
+  security_barrier boolean NOT NULL,  -- the view option (views.md §16.2)
+  security_invoker boolean NOT NULL   -- the view option (views.md §16.2)
 )
 ```
+
+`temp.jed_views` lists the session's temporary views (views.md §10).
 
 One row per view of the qualified database, generated in ascending name byte order, with every
 §5 gate inherited unchanged (resolution, scoping, read-only `42809` — including `DROP VIEW

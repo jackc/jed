@@ -17,12 +17,13 @@
 // followed by the canonical re-render (format.md *Check-expression text*). A nested view reference
 // records only the view itself: its own body is planned with the trace suspended.
 
-import type { TableRef, TableRefPos } from "./ast.ts";
+import type { CheckOption, TableRef, TableRefPos, ViewOption } from "./ast.ts";
 import type { Table, ViewDef, ViewDep, ViewDepKind } from "./catalog.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import { type ResolvedType, temporalTypmodText } from "./executor.ts";
 import type { Typmod } from "./resolve.ts";
 import { rtName } from "./scope.ts";
+import { compareViewDeps } from "./format.ts";
 import { lex } from "./lexer.ts";
 import { renderTokens } from "./parser.ts";
 import type { Token } from "./token.ts";
@@ -49,6 +50,12 @@ export class ViewTrace {
   // Every referenced column of a view: view name → column ordinals. Not a persisted dependency (§6):
   // re-validation after CREATE OR REPLACE VIEW reads it (§8).
   viewColumns: Map<string, Set<number>> = new Map();
+  // The sequences the body names in a constant nextval / currval / setval argument (§6).
+  sequences: Set<string> = new Set();
+  // The composite types the body names as a type (§6); the output column types join at CREATE.
+  types: Set<string> = new Set();
+  // Whether the body reads a temporary relation or sequence, so the view is temporary (§10).
+  readsTemp = false;
 
   addColumn(table: string, ordinal: number): void {
     addOrdinal(this.columns, table, ordinal);
@@ -171,10 +178,102 @@ export function freezeStars(tokens: Token[], trace: ViewTrace): string {
   return renderTokens(out);
 }
 
-// sortedDeps returns deps in ascending name byte order, each table's columns in byte order.
+// sortDeps returns deps in ascending (name bytes, kind code) order, each table's columns in byte
+// order.
 export function sortDeps(deps: ViewDep[]): ViewDep[] {
   for (const d of deps) d.columns.sort(compareTextC);
-  return deps.sort((a, b) => compareTextC(a.name, b.name));
+  return deps.sort(compareViewDeps);
+}
+
+// outputCompositeNames adds the named composite types a view output column of type t carries — the
+// type itself or an array's element type (views.md §6).
+export function outputCompositeNames(t: ResolvedType, out: Set<string>): void {
+  if (t.kind === "composite") {
+    if (t.name !== null) out.add(t.name);
+  } else if (t.kind === "array") {
+    outputCompositeNames(t.elem, out);
+  }
+}
+
+// ViewOptionValues is the view options a WITH ( … ) or SET ( … ) list sets (views.md §16.2): each
+// defined when the list names it.
+export type ViewOptionValues = {
+  checkOption?: CheckOption;
+  securityBarrier?: boolean;
+  securityInvoker?: boolean;
+};
+
+// duplicateViewOption is the 22023 a view option named twice raises (PostgreSQL's message).
+export function duplicateViewOption(name: string): EngineError {
+  return engineError("invalid_parameter_value", `parameter "${name}" specified more than once`);
+}
+
+// parseViewOptions validates a view option list (views.md §16.2), PostgreSQL's reloption rules: the
+// names are check_option (local or cascaded, case-insensitive), security_barrier, and
+// security_invoker (booleans); a name without a value is true. An unknown name, a repeated one, or a
+// bad value is 22023.
+export function parseViewOptions(options: ViewOption[]): ViewOptionValues {
+  const out: ViewOptionValues = {};
+  for (const opt of options) {
+    const value = opt.value ?? "true";
+    if (opt.name === "check_option") {
+      if (out.checkOption !== undefined) throw duplicateViewOption(opt.name);
+      const v = asciiLower(value);
+      if (v === "local") out.checkOption = "local";
+      else if (v === "cascaded") out.checkOption = "cascaded";
+      else {
+        throw engineError(
+          "invalid_parameter_value",
+          `invalid value for enum option "check_option": ${value}`,
+        );
+      }
+    } else if (opt.name === "security_barrier" || opt.name === "security_invoker") {
+      const key = opt.name === "security_barrier" ? "securityBarrier" : "securityInvoker";
+      if (out[key] !== undefined) throw duplicateViewOption(opt.name);
+      const b = parseReloptionBool(value);
+      if (b === null) {
+        throw engineError(
+          "invalid_parameter_value",
+          `invalid value for boolean option "${opt.name}": ${value}`,
+        );
+      }
+      out[key] = b;
+    } else {
+      throw engineError("invalid_parameter_value", `unrecognized parameter "${opt.name}"`);
+    }
+  }
+  return out;
+}
+
+function asciiLower(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+// parseReloptionBool is PostgreSQL's parse_bool (views.md §16.2): a case-insensitive prefix of true,
+// false, yes, or no; on, or a prefix of off of at least two characters; 1 or 0.
+function parseReloptionBool(value: string): boolean | null {
+  const v = asciiLower(value);
+  if (v.length === 0) return null;
+  switch (v[0]) {
+    case "t":
+      return "true".startsWith(v) ? true : null;
+    case "f":
+      return "false".startsWith(v) ? false : null;
+    case "y":
+      return "yes".startsWith(v) ? true : null;
+    case "n":
+      return "no".startsWith(v) ? false : null;
+    case "o":
+      if (v === "on") return true;
+      if (v.length >= 2 && "off".startsWith(v)) return false;
+      return null;
+    case "1":
+      return v.length === 1 ? true : null;
+    case "0":
+      return v.length === 1 ? false : null;
+    default:
+      return null;
+  }
 }
 
 // depsEqual reports whether two dependency lists are identical.
@@ -258,7 +357,7 @@ export function forgetViews(plan: ViewAlterPlan, dropped: Set<string>): void {
 // survive it (§8).
 export function alterBreaksView(plan: ViewAlterPlan, view: string): EngineError {
   return viewNotSupported(
-    `cannot alter ${plan.kind} ${plan.table} because it would change the definition of view ${view}`,
+    `cannot alter ${plan.kind === "view" ? "view" : "table"} ${plan.table} because it would change the definition of view ${view}`,
   );
 }
 
@@ -289,7 +388,7 @@ export function renamedDeps(
       dep.columns.sort(compareTextC);
     }
   }
-  out.sort((a, b) => compareTextC(a.name, b.name));
+  out.sort(compareViewDeps);
   return out;
 }
 

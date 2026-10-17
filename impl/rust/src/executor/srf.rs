@@ -1154,12 +1154,13 @@ impl Engine {
                 ]);
             }
         }
-        // Views live only in the main database; an attached database's views are not readable
-        // (views.md §10), so their columns are not listed.
-        if srf.introspect_scope == "main" {
+        // Views live in the main database and the session's temporary domain; an attached
+        // database's views are not readable (views.md §10), so their columns are not listed.
+        if matches!(srf.introspect_scope.as_str(), "main" | "temp") {
             for v in snap.views_sorted() {
                 let types = self.view_column_types(v)?;
                 for (i, (name, ty)) in v.columns.iter().zip(types).enumerate() {
+                    let default = v.defaults.get(i).cloned().flatten();
                     meter.guard()?;
                     meter.charge(COSTS.generated_row);
                     out.push(vec![
@@ -1169,7 +1170,7 @@ impl Engine {
                         Value::Text(ty),
                         Value::Bool(false),
                         Value::Null,
-                        Value::Null,
+                        default.map_or(Value::Null, |d| Value::Text(d.expr_text)),
                         Value::Null,
                     ]);
                 }
@@ -1262,6 +1263,8 @@ impl Engine {
                     }
                     .to_string(),
                 ),
+                Value::Bool(v.security_barrier),
+                Value::Bool(v.security_invoker),
             ]);
         }
         Ok(out)

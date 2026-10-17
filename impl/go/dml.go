@@ -1245,6 +1245,15 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	if !ok {
 		return outcome{}, newError(UndefinedTable, "table does not exist: "+ins.Table).withPosition(int32(ins.TablePos))
 	}
+	// An INSERT through a view fills its columns from the view column defaults first (views.md
+	// §16.1).
+	if vw != nil && len(vw.defaultOverrides) > 0 {
+		defaulted, derr := db.tableWithViewDefaults(table, vw, ins.Overriding)
+		if derr != nil {
+			return outcome{}, derr
+		}
+		table = defaulted
+	}
 	// Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
 	// maintained B-tree would mix two orderings (collation.md §12, XX002).
 	if err := db.ensureCollationsWritable(table.Columns); err != nil {
@@ -1780,6 +1789,15 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table)
 	if !ok {
 		return nil, newError(UndefinedTable, "table does not exist: "+ins.Table).withPosition(int32(ins.TablePos))
+	}
+	// An INSERT through a view fills its columns from the view column defaults first (views.md
+	// §16.1).
+	if vw != nil && len(vw.defaultOverrides) > 0 {
+		defaulted, err := db.tableWithViewDefaults(table, vw, ins.Overriding)
+		if err != nil {
+			return nil, err
+		}
+		table = defaulted
 	}
 	if err := db.ensureCollationsWritable(table.Columns); err != nil {
 		return nil, err

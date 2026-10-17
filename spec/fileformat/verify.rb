@@ -27,7 +27,11 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 47 # v47: multi-column GIN indexes — a GIN index may list several key columns, and each
+VERSION = 48 # v48: view column defaults, dependency kinds 2 (sequence) / 3 (composite type), and a
+# view flags byte (security_barrier, security_invoker) in the view entry; a catalog entry longer than a
+# page spans consecutive catalog pages flagged `continued` in header byte 1 (views.md §3/§6/§16,
+# format.md *Catalog*). No other byte layout change.
+# v47: multi-column GIN indexes — a GIN index may list several key columns, and each
 # term of a multi-column GIN index is prefixed by its column_tag (u8, the 0-based key position,
 # gin.md §4.4) — and GIN posting runs: every GIN tree record is a run of one term's storage keys,
 # term ‖ last ‖ front-coded body ‖ u16 body length (gin.md §4.5). No catalog byte layout change.
@@ -1566,6 +1570,32 @@ VIEW_TABLE = {
   ]
 }.freeze
 
+# VIEW OPTIONS (v43 — spec/design/views.md §6/§16, format.md *View entry* and *Catalog*): pins a
+# view column default (the column flags byte + the u32-length text — a folded constant and an
+# expression), the view flags byte (security_barrier, security_invoker), the sequence (2) and
+# composite-type (3) dependency kinds in (name, kind) order, and a view entry longer than a catalog
+# page spanning three chain pages flagged `continued`. The cores build this via
+#   CREATE TYPE addr AS (street text, zip i32); CREATE SEQUENCE s;
+#   CREATE TABLE t (a i32 PRIMARY KEY, b text);
+#   CREATE VIEW d WITH (security_barrier, security_invoker) AS
+#     SELECT a, b, nextval(s) AS n, NULL::addr AS x FROM t;
+#   ALTER VIEW d ALTER b SET DEFAULT z, ALTER a SET DEFAULT 1 + 1;
+#   CREATE VIEW long_v AS SELECT 1 AS c1, 2 AS c2, …, 30 AS c30
+VIEW_OPTIONS_TABLE = {
+  types: [ctype("addr", [field("street", "text"), field("zip", "i32")])],
+  sequences: [seq("s", increment: 1, min_value: 1, max_value: 9_223_372_036_854_775_807, start: 1)],
+  tables: [{ name: "t", columns: [col("a", "i32", pk: true), col("b", "text")], rows: [] }],
+  views: [
+    { name: "d", columns: %w[a b n x], defaults: { "a" => "1 + 1", "b" => "'z'" },
+      definition: "select a , b , nextval ( 's' ) as n , null :: addr as x from t",
+      deps: [{ kind: 3, name: "addr", columns: [] }, { kind: 2, name: "s", columns: [] },
+             { kind: 0, name: "t", columns: %w[a b] }],
+      check_option: 0, security_barrier: true, security_invoker: true },
+    { name: "long_v", columns: (1..30).map { |i| "c#{i}" },
+      definition: "select 1 as c1 , 2 as c2 , 3 as c3 , 4 as c4 , 5 as c5 , 6 as c6 , 7 as c7 , 8 as c8 , 9 as c9 , 10 as c10 , 11 as c11 , 12 as c12 , 13 as c13 , 14 as c14 , 15 as c15 , 16 as c16 , 17 as c17 , 18 as c18 , 19 as c19 , 20 as c20 , 21 as c21 , 22 as c22 , 23 as c23 , 24 as c24 , 25 as c25 , 26 as c26 , 27 as c27 , 28 as c28 , 29 as c29 , 30 as c30", deps: [], check_option: 0 }
+  ]
+}.freeze
+
 # collation_table (v18): a reference-only COLLATION entry (entry_kind 3) + per-column collations. The
 # real `unicode` collation (the version-pinned CLDR-DUCET root, UCA/UCD 17.0.0) is referenced and set
 # as the per-database default (the is_default flag); the entry is metadata only — name + version pin +
@@ -1862,6 +1892,9 @@ FIXTURES = ([
   { file: "identity_table.jed", page_size: 256,
     sequences: IDENTITY_TABLE[:sequences], tables: IDENTITY_TABLE[:tables] },
   { file: "view_table.jed", page_size: 256, tables: VIEW_TABLE[:tables], views: VIEW_TABLE[:views] },
+  { file: "view_options_table.jed", page_size: 256, types: VIEW_OPTIONS_TABLE[:types],
+    sequences: VIEW_OPTIONS_TABLE[:sequences], tables: VIEW_OPTIONS_TABLE[:tables],
+    views: VIEW_OPTIONS_TABLE[:views] },
   { file: "collation_table.jed", page_size: 256,
     collations: COLLATION_TABLE[:collations], tables: COLLATION_TABLE[:tables] },
   { file: "collation_pk_table.jed", page_size: 256,
@@ -2767,16 +2800,28 @@ def sequence_entry_bytes(s)
 end
 
 # Serialize a view catalog entry's BODY (after the entry_kind=5 byte, v38 — format.md *View entry*):
-# the name, the output column names, the definition (u32 length + canonical token text), then the
-# dependency list in name byte order — per dependency a kind byte (0 table, 1 view), the name, and the
-# table's referenced column names in byte order (none for a view) — then (v39) the check_option byte.
+# the name; the output columns, each its name then (v43) a flags byte (bit0 has_default) and, when
+# set, the default's text (u32 length + canonical text); the definition (u32 length + canonical token
+# text); the dependency list in (name, kind) byte order — per dependency a kind byte (0 table, 1 view,
+# v43: 2 sequence, 3 composite type), the name, and a table's referenced column names in byte order
+# (none for any other kind); (v39) the check_option byte; (v43) the view flags byte (bit0
+# security_barrier, bit1 security_invoker).
 def view_entry_bytes(v)
   str = ->(x) { u16(x.bytesize) + x.b }
   out = str.(v[:name])
   out << u16(v[:columns].size)
-  v[:columns].each { |c| out << str.(c) }
+  defaults = v[:defaults] || {}
+  v[:columns].each do |c|
+    out << str.(c)
+    d = defaults[c]
+    if d
+      out << [1].pack("C") << u32(d.bytesize) << d.b
+    else
+      out << [0].pack("C")
+    end
+  end
   out << u32(v[:definition].bytesize) << v[:definition].b
-  deps = v[:deps].sort_by { |d| d[:name] }
+  deps = v[:deps].sort_by { |d| [d[:name].b, d[:kind]] }
   out << u16(deps.size)
   deps.each do |d|
     out << [d[:kind]].pack("C") << str.(d[:name])
@@ -2785,6 +2830,7 @@ def view_entry_bytes(v)
     cols.each { |c| out << str.(c) }
   end
   out << [v[:check_option] || 0].pack("C")
+  out << [(v[:security_barrier] ? 1 : 0) | (v[:security_invoker] ? 2 : 0)].pack("C")
   out.b
 end
 
@@ -2794,9 +2840,19 @@ def decode_view_entry(buf, pos)
   name, pos = take_str(buf, pos)
   ncols, pos = take(buf, pos, 2)
   columns = []
+  defaults = {}
   ncols.unpack1("n").times do
     c, pos = take_str(buf, pos)
     columns << c
+    fb, pos = take(buf, pos, 1)
+    case fb.getbyte(0)
+    when 0 then nil
+    when 1
+      dl, pos = take(buf, pos, 4)
+      d, pos = take(buf, pos, dl.unpack1("N"))
+      defaults[c] = d.force_encoding("UTF-8")
+    else raise "unknown view column flags"
+    end
   end
   dl, pos = take(buf, pos, 4)
   definition, pos = take(buf, pos, dl.unpack1("N"))
@@ -2805,7 +2861,7 @@ def decode_view_entry(buf, pos)
   nd.unpack1("n").times do
     kb, pos = take(buf, pos, 1)
     kind = kb.getbyte(0)
-    raise "unknown view dependency kind" unless [0, 1].include?(kind)
+    raise "unknown view dependency kind" unless [0, 1, 2, 3].include?(kind)
 
     dname, pos = take_str(buf, pos)
     nc, pos = take(buf, pos, 2)
@@ -2814,7 +2870,7 @@ def decode_view_entry(buf, pos)
       c, pos = take_str(buf, pos)
       cols << c
     end
-    raise "a view dependency lists columns" if kind == 1 && !cols.empty?
+    raise "a non-table view dependency lists columns" if kind != 0 && !cols.empty?
 
     deps << { kind: kind, name: dname, columns: cols }
   end
@@ -2822,16 +2878,23 @@ def decode_view_entry(buf, pos)
   check_option = cb.getbyte(0)
   raise "unknown view check_option" unless [0, 1, 2].include?(check_option)
 
-  [{ name: name, columns: columns, definition: definition.force_encoding("UTF-8"), deps: deps,
-     check_option: check_option }, pos]
+  fl, pos = take(buf, pos, 1)
+  flags = fl.getbyte(0)
+  raise "unknown view flags" unless flags & ~3 == 0
+
+  [{ name: name, columns: columns, defaults: defaults, definition: definition.force_encoding("UTF-8"),
+     deps: deps, check_option: check_option, security_barrier: flags & 1 != 0,
+     security_invoker: flags & 2 != 0 }, pos]
 end
 
 # The view content a fixture should decode to (name-sorted, dependencies and their columns sorted).
 def expected_views(fx)
   (fx[:views] || []).sort_by { |v| v[:name] }.map do |v|
-    { name: v[:name], columns: v[:columns], definition: v[:definition],
-      deps: v[:deps].sort_by { |d| d[:name] }.map { |d| { kind: d[:kind], name: d[:name], columns: d[:columns].sort } },
-      check_option: v[:check_option] || 0 }
+    { name: v[:name], columns: v[:columns], defaults: v[:defaults] || {}, definition: v[:definition],
+      deps: v[:deps].sort_by { |d| [d[:name].b, d[:kind]] }
+                    .map { |d| { kind: d[:kind], name: d[:name], columns: d[:columns].sort } },
+      check_option: v[:check_option] || 0, security_barrier: v[:security_barrier] || false,
+      security_invoker: v[:security_invoker] || false }
   end
 end
 
@@ -3576,6 +3639,36 @@ def emit_leaf_pax(recs, cap, alloc, pages)
   out
 end
 
+# Lay catalog entries out on pages of capacity `cap` (format.md *Catalog*, v43): packed greedily,
+# each wholly on one page, except that an entry longer than `cap` starts a fresh page and spans as
+# many pages as it needs — the first with item_count 1, the rest 0, every page of the run but the
+# last flagged `continued` (header byte 1 bit0); the entry after it starts a fresh page.
+def catalog_layout(entries, cap)
+  out = []
+  cur = { count: 0, continued: false, payload: +"".b }
+  entries.each do |e|
+    if e.bytesize > cap
+      if cur[:count].positive?
+        out << cur
+        cur = { count: 0, continued: false, payload: +"".b }
+      end
+      chunks = (0...e.bytesize).step(cap).map { |o| e.byteslice(o, cap) }
+      chunks.each_with_index do |c, i|
+        out << { count: i.zero? ? 1 : 0, continued: i + 1 < chunks.size, payload: c.b }
+      end
+      next
+    end
+    if cur[:count].positive? && cur[:payload].bytesize + e.bytesize > cap
+      out << cur
+      cur = { count: 0, continued: false, payload: +"".b }
+    end
+    cur[:count] += 1
+    cur[:payload] << e
+  end
+  out << cur if cur[:count].positive? || out.empty?
+  out
+end
+
 def pack(sizes, cap)
   groups = []
   cur = []
@@ -3609,9 +3702,10 @@ def write_meta(image, ps, slot, page_size, txid, root, page_count, live = page_c
   image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
 end
 
-def write_page(image, ps, index, type, item_count, next_page, payload)
+def write_page(image, ps, index, type, item_count, next_page, payload, flags: 0)
   off = index * ps
   image[off, 1] = [type].pack("C")
+  image[off + 1, 1] = [flags].pack("C")
   image[off + 4, 4] = u32(item_count)
   image[off + 8, 4] = u32(next_page)
   image[off + PAGE_HEADER, payload.bytesize] = payload unless payload.empty?
@@ -3832,8 +3926,8 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
   sorted.each { |t| cat_entries.concat(statistics_entries(t)) }
   # View entries (kind 5, v38) come last, in view-name byte order (format.md *View entry*).
   views.sort_by { |v| v[:name] }.each { |v| cat_entries << ("\x05".b + view_entry_bytes(v)) }
-  cat_groups = pack(cat_entries.map(&:bytesize), cap)
-  page_count = cat_root + cat_groups.size
+  cat_layout = catalog_layout(cat_entries, cap)
+  page_count = cat_root + cat_layout.size
 
   image = "\x00".b * (page_count * ps)
   write_meta(image, ps, 0, page_size, TXID, cat_root, page_count)
@@ -3841,11 +3935,10 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
 
   data_pages.each { |index, (type, count, payload, nxt)| write_page(image, ps, index, type, count, nxt || 0, payload) }
 
-  cat_groups.each_with_index do |group, gi|
+  cat_layout.each_with_index do |cp, gi|
     index = cat_root + gi
-    nxt = gi + 1 < cat_groups.size ? index + 1 : 0
-    payload = group.map { |ei| cat_entries[ei] }.join.b
-    write_page(image, ps, index, PAGE_CATALOG, group.size, nxt, payload)
+    nxt = gi + 1 < cat_layout.size ? index + 1 : 0
+    write_page(image, ps, index, PAGE_CATALOG, cp[:count], nxt, cp[:payload], flags: cp[:continued] ? 1 : 0)
   end
 
   image
@@ -4214,7 +4307,7 @@ def read_page(image, ps, index)
   # Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
   raise "page checksum mismatch (corrupted page)" unless page_crc(p) == p.byteslice(12, 4).unpack1("N")
   $reached << index if $reached
-  { type: p.getbyte(0), item_count: p.byteslice(4, 4).unpack1("N"),
+  { type: p.getbyte(0), flags: p.getbyte(1), item_count: p.byteslice(4, 4).unpack1("N"),
     next_page: p.byteslice(8, 4).unpack1("N"), payload: p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
 end
 
@@ -5093,40 +5186,60 @@ def decode_image(image)
   cat = meta[:root_page]
   while cat != 0
     pg = read_page(image, ps, cat)
-    raise "expected a catalog page" unless pg[:type] == PAGE_CATALOG
+    raise "expected a catalog page" unless pg[:type] == PAGE_CATALOG && (pg[:flags] & ~1).zero?
+
+    # A catalog entry longer than a page continues on the following chain pages (v43).
+    nxt = pg[:next_page]
+    payload = pg[:payload]
+    if pg[:flags] & 1 == 1
+      raise "a continued catalog page holds other entries" unless pg[:item_count] == 1
+
+      payload = payload.dup
+      loop do
+        raise "a continued catalog entry ends the chain" if nxt.zero?
+
+        cp = read_page(image, ps, nxt)
+        raise "bad catalog continuation page" unless cp[:type] == PAGE_CATALOG && cp[:item_count].zero? &&
+                                                        (cp[:flags] & ~1).zero?
+
+        payload << cp[:payload]
+        nxt = cp[:next_page]
+        break if (cp[:flags] & 1).zero?
+      end
+    end
 
     pos = 0
     pg[:item_count].times do
-      kb, pos = take(pg[:payload], pos, 1) # entry_kind: 0 table, 1 composite, 2 sequence, 3 collation
+      kb, pos = take(payload, pos, 1) # entry_kind: 0 table, 1 composite, 2 sequence, 3 collation
       kind = kb.getbyte(0)
       if kind == 1
-        ct, pos = decode_composite_type_entry(pg[:payload], pos)
+        ct, pos = decode_composite_type_entry(payload, pos)
         types << ct
         $ctypes[ct[:name]] = ct[:fields]
         next
       end
       if kind == 2
-        s, pos = decode_sequence_entry(pg[:payload], pos)
+        s, pos = decode_sequence_entry(payload, pos)
         sequences << s
         next
       end
       if kind == 3
-        c, pos = decode_collation_entry(pg[:payload], pos)
+        c, pos = decode_collation_entry(payload, pos)
         collations << c
         next
       end
       if kind == 4
-        pos = decode_statistics_entry(pg[:payload], pos, tables, statistics, statistics_expected)
+        pos = decode_statistics_entry(payload, pos, tables, statistics, statistics_expected)
         next
       end
       if kind == 5
-        v, pos = decode_view_entry(pg[:payload], pos)
+        v, pos = decode_view_entry(payload, pos)
         views << v
         next
       end
       raise "unknown catalog entry kind #{kind}" unless kind.zero?
 
-      entry, pos = decode_table_entry(pg[:payload], pos)
+      entry, pos = decode_table_entry(payload, pos)
       rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns])
       raise "persisted row_count does not match decoded rows" unless entry[:row_count] == rows.length
       indexes = entry[:indexes].map do |ix|
@@ -5141,7 +5254,7 @@ def decode_image(image)
       tables << { name: entry[:name], columns: entry[:columns], pk: entry[:pk],
                   checks: entry[:checks], indexes: indexes, rows: rows }
     end
-    cat = pg[:next_page]
+    cat = nxt
   end
   statistics_expected.each do |(table, column), (mcv_count, histogram_count, term_count)|
     item = statistics.find { |s| s[:table] == table && s[:column] == column }

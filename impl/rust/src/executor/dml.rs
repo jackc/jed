@@ -255,6 +255,16 @@ impl Engine {
             )
             .at_target(table_pos.0)
         })?;
+        // An INSERT through a view fills its columns from the view column defaults first
+        // (views.md §16.1).
+        let defaulted;
+        let tdef = match vw.as_ref().filter(|v| !v.default_overrides.is_empty()) {
+            Some(v) => {
+                defaulted = self.table_with_view_defaults(tdef, v, overriding)?;
+                &defaulted
+            }
+            None => tdef,
+        };
 
         // Snapshot the catalog data each row is validated against, ending the `tdef`
         // borrow so phase 1 can read the store (dup-key check) and phase 2 can mutate it.

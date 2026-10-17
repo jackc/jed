@@ -1,0 +1,122 @@
+# A view's dependencies on sequences and composite types (spec/design/views.md §6): a view depends on
+# each sequence a constant nextval / currval / setval argument names and on each composite type its
+# body names as a type or outputs, as PostgreSQL records them. DROP SEQUENCE / DROP TYPE of one is
+# 2BP01 unless CASCADE, which drops the dependent views; a constant naming no sequence is 42P01 at
+# CREATE VIEW; a sequence named by a computed string is not a dependency. ALTER SEQUENCE … RENAME
+# keeps the view working. Every record is PostgreSQL-oracle-checked.
+# requires: ddl.view, ddl.view_dependencies, ddl.view_cascade, ddl.sequence, ddl.alter_sequence, func.sequence, ddl.serial, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, query.select, types.composite, types.array_composite, cast.operator, types.i32, types.i64, types.text
+
+statement ok
+CREATE SEQUENCE s
+
+statement ok
+CREATE VIEW vs AS SELECT nextval('s') AS n
+
+query I nosort
+SELECT n FROM vs
+----
+1
+
+statement error 2BP01
+DROP SEQUENCE s
+
+# a sequence named by a computed string is not a dependency
+statement ok
+CREATE SEQUENCE s2
+
+statement ok
+CREATE VIEW vs2 AS SELECT nextval('s' || '2') AS n
+
+statement ok
+DROP SEQUENCE s2
+
+statement error 42P01
+SELECT n FROM vs2
+
+statement ok
+DROP VIEW vs2
+
+# a constant naming no sequence fails the definition
+statement error 42P01
+CREATE VIEW bad AS SELECT nextval('nosuch') AS n
+
+# a rename keeps the view reading the sequence
+statement ok
+ALTER SEQUENCE s RENAME TO s9
+
+query B nosort
+SELECT n > 0 FROM vs
+----
+true
+
+statement error 2BP01
+DROP SEQUENCE s9
+
+statement ok
+CREATE VIEW vs3 AS SELECT currval('s9') AS c
+
+statement ok
+DROP SEQUENCE s9 CASCADE
+
+statement error 42P01
+SELECT * FROM vs
+
+statement error 42P01
+SELECT * FROM vs3
+
+# a view over a serial column's sequence depends on it, so DROP TABLE needs CASCADE
+statement ok
+CREATE TABLE t (id serial PRIMARY KEY, a i32)
+
+statement ok
+CREATE VIEW vn AS SELECT nextval('t_id_seq') AS n
+
+statement error 2BP01
+DROP TABLE t
+
+statement ok
+DROP TABLE t CASCADE
+
+statement error 42P01
+SELECT * FROM vn
+
+# --- composite types ----------------------------------------------------------------------------------
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE VIEW vt AS SELECT ('(Main,90210)'::addr).zip AS z
+
+query I nosort
+SELECT z FROM vt
+----
+90210
+
+statement error 2BP01
+DROP TYPE addr
+
+# an output column of the type, or of an array of it, is a dependency too
+statement ok
+CREATE VIEW vt2 AS SELECT NULL::addr AS x
+
+statement ok
+CREATE VIEW vt3 AS SELECT CAST(NULL AS addr[]) AS x
+
+statement ok
+DROP VIEW vt
+
+statement error 2BP01
+DROP TYPE addr
+
+statement ok
+DROP VIEW vt2
+
+statement error 2BP01
+DROP TYPE addr
+
+statement ok
+DROP TYPE addr CASCADE
+
+statement error 42P01
+SELECT * FROM vt3

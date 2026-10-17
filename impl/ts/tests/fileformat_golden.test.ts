@@ -11,7 +11,7 @@ import { test } from "node:test";
 import { Engine, Environment, execute } from "../src/tooling.ts";
 import { crc32Ieee, loadEngine, toImage } from "../src/format.ts";
 import { scalarT } from "../src/types.ts";
-import { intValue, type Value } from "../src/value.ts";
+import { boolValue, intValue, type Value } from "../src/value.ts";
 import { specPath } from "./tomlmini.ts";
 import { bytesEqual, fillerBytesHex, fillerText } from "./util.ts";
 
@@ -1152,6 +1152,24 @@ function viewTableDB(): Engine {
   return db;
 }
 
+// viewOptionsTableDB is the view_options_table.jed golden (format_version 43, spec/design/views.md
+// §6/§16): column defaults, the view flags byte, sequence and type dependencies, and a view entry
+// spanning catalog pages.
+function viewOptionsTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TYPE addr AS (street text, zip i32)");
+  run(db, "CREATE SEQUENCE s");
+  run(db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)");
+  run(
+    db,
+    "CREATE VIEW d WITH (security_barrier, security_invoker) AS SELECT a, b, nextval('s') AS n, NULL::addr AS x FROM t",
+  );
+  run(db, "ALTER VIEW d ALTER b SET DEFAULT 'z', ALTER a SET DEFAULT 1 + 1");
+  const cols = Array.from({ length: 30 }, (_, i) => `${i + 1} AS c${i + 1}`).join(", ");
+  run(db, `CREATE VIEW long_v AS SELECT ${cols}`);
+  return db;
+}
+
 // collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
 // collations): the loaded unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
 // 17.0.0) as the per-database default (is_default), a column with explicit COLLATE "unicode" (flags
@@ -1288,6 +1306,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "serial_table.jed", build: serialTableDB },
     { name: "identity_table.jed", build: identityTableDB },
     { name: "view_table.jed", build: viewTableDB },
+    { name: "view_options_table.jed", build: viewOptionsTableDB },
     { name: "collation_table.jed", build: collationTableDB },
     { name: "collation_pk_table.jed", build: collationPKTableDB },
     { name: "collation_array_table.jed", build: collationArrayTableDB },
@@ -1377,6 +1396,7 @@ test("read goldens reproduces rows", () => {
     { name: "serial_table.jed", build: serialTableDB, table: "t" },
     { name: "identity_table.jed", build: identityTableDB, table: "t" },
     { name: "view_table.jed", build: viewTableDB, table: "t" },
+    { name: "view_options_table.jed", build: viewOptionsTableDB, table: "t" },
     { name: "collation_table.jed", build: collationTableDB, table: "t" },
     { name: "collation_pk_table.jed", build: collationPKTableDB, table: "t" },
     { name: "collation_array_table.jed", build: collationArrayTableDB, table: "t" },
@@ -1662,6 +1682,31 @@ test("view golden reads back", () => {
     [text("v"), text("CASCADED")],
     [text("w"), text("LOCAL")],
   ]);
+});
+
+// Loading view_options_table.jed restores the defaults, options, and the long view.
+test("view options golden reads back", () => {
+  const db = loadEngine(fixture("view_options_table.jed"), GOLDEN_ENV);
+  assert.deepStrictEqual(
+    rows(db, "SELECT name, security_barrier, security_invoker FROM jed_views ORDER BY name"),
+    [
+      [text("d"), boolValue(true), boolValue(true)],
+      [text("long_v"), boolValue(false), boolValue(false)],
+    ],
+  );
+  assert.deepStrictEqual(
+    rows(
+      db,
+      "SELECT name, column_default FROM jed_columns WHERE table_name = 'd' ORDER BY ordinal",
+    ),
+    [
+      [text("a"), text("1 + 1")],
+      [text("b"), text("'z'")],
+      [text("n"), { kind: "null" }],
+      [text("x"), { kind: "null" }],
+    ],
+  );
+  assert.deepStrictEqual(rows(db, "SELECT c30 FROM long_v"), [[intValue(30n)]]);
 });
 
 // A view entry's check_option byte outside 0–2 is corruption (XX001, format.md *View entry*).
