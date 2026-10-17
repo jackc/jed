@@ -5725,10 +5725,21 @@ errors       = []
 
 # bool_and / bool_or (boolean) -> boolean (aggregates.md §23): TRUE iff every (some) non-NULL input
 # is TRUE; NULL over an empty/all-NULL group. Order-insensitive (commutative, associative, idempotent).
+# every is the SQL-standard spelling of bool_and.
 [[aggregate]]
 name         = "bool_and"
 kind         = "aggregate"
 surface      = "bool_and"
+arg          = "expr"
+arg_families = ["boolean"]
+result       = "boolean"
+null         = "aggregate"
+errors       = []
+
+[[aggregate]]
+name         = "every"
+kind         = "aggregate"
+surface      = "every"
 arg          = "expr"
 arg_families = ["boolean"]
 result       = "boolean"

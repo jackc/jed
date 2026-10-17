@@ -3050,7 +3050,7 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 		return planMin, t
 	case surface == "max" && result == "same_as_input":
 		return planMax, t
-	case surface == "bool_and" && result == "boolean":
+	case (surface == "bool_and" || surface == "every") && result == "boolean":
 		return planBoolAnd, resolvedType{kind: rtBool}
 	case surface == "bool_or" && result == "boolean":
 		return planBoolOr, resolvedType{kind: rtBool}

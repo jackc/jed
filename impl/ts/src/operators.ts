@@ -6455,6 +6455,15 @@ export const AGGREGATES: readonly AggregateDesc[] = [
     errors: [],
   },
   {
+    name: "every",
+    surface: "every",
+    arg: "expr",
+    argFamilies: ["boolean"],
+    result: "boolean",
+    null: "aggregate",
+    errors: [],
+  },
+  {
     name: "bool_or",
     surface: "bool_or",
     arg: "expr",

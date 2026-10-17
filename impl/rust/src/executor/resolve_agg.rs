@@ -1467,7 +1467,7 @@ pub(crate) fn aggregate_plan(
         // MIN/MAX accept any ordered scalar; the result is the argument's own type.
         ("min", "same_as_input") => (AggPlan::Min, t.clone()),
         ("max", "same_as_input") => (AggPlan::Max, t.clone()),
-        ("bool_and", "boolean") => (AggPlan::BoolAnd, ResolvedType::Bool),
+        ("bool_and" | "every", "boolean") => (AggPlan::BoolAnd, ResolvedType::Bool),
         ("bool_or", "boolean") => (AggPlan::BoolOr, ResolvedType::Bool),
         // json/jsonb array aggregates (B4). `compact` is the json (vs jsonb) render; `_strict`
         // skips a NULL input. The result type is json/jsonb (the catalog `result` code).
