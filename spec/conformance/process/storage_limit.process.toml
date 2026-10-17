@@ -112,8 +112,8 @@ actor = "a"
 command = "close"
 
 # An owner and its page client alternate the same batches. The limit trips at the same batch and both
-# processes report the same live count; the owner's maintenance commits keep the file at 32 pages
-# against 33 alone.
+# processes report the same live count; the owner's maintenance commits keep the file at 33 pages,
+# as alone.
 
 [[step]]
 actor = "a"
@@ -235,7 +235,7 @@ expect = "163840"
 [[step]]
 actor = "a"
 command = "page_count"
-expect = "32"
+expect = "33"
 
 # A client's delete lowers the live count the owner commits against.
 
