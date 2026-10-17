@@ -37,6 +37,14 @@ impl LeafSource for PagedSource<'_> {
     fn load_leaf(&self, page: u32) -> Result<Arc<Node>> {
         self.paging.fault_leaf(page, self.col_types)
     }
+
+    fn prefetches(&self) -> bool {
+        self.paging.batches_reads()
+    }
+
+    fn prefetch(&self, pages: &[u32]) {
+        self.paging.prefetch_leaves(pages, self.col_types);
+    }
 }
 
 /// A **pull** scan cursor over a [`TableStore`]'s `(key, row)` pairs within a bound (the S3

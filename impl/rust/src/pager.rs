@@ -441,6 +441,17 @@ impl Pager {
         )
     }
 
+    /// Read several pages in one store request when the store batches reads (a page client,
+    /// spec/design/page-service.md §5.3), page by page otherwise.
+    pub(crate) fn read_blocks(&mut self, indices: &[u32]) -> Result<Vec<Vec<u8>>> {
+        self.store.read_pages(indices, self.page_size)
+    }
+
+    /// Whether the store fetches several pages in one request.
+    pub(crate) fn batches_reads(&self) -> bool {
+        self.store.batches_reads()
+    }
+
     /// Write one page (`bytes`) at block `index`. Overwrites in place — `persist` always
     /// [`reserve`](Pager::reserve)s the high-water first, so the target is already-allocated space
     /// (a reused free page, or a preallocated slot past the old high-water). `bytes` is one page wide.
