@@ -32728,6 +32728,7 @@ export function finalizeArrayAgg(plan: AggPlan, elems: Value[]): Value {
 const MOMENT_SURFACES: Record<string, [AggPlan, AggPlan]> = {
   var_pop: ["varPop", "varPopFloat"],
   var_samp: ["varSamp", "varSampFloat"],
+  variance: ["varSamp", "varSampFloat"],
 };
 const MOMENT_STATS: Partial<
   Record<AggPlan, { sample: boolean; stddev: boolean; float: boolean }>

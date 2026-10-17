@@ -199,6 +199,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json[b]_object_agg[_unique] (B4) — the JSON-object aggregate builders (json-sql-functions.md §4).
   // Aggregate a group's (key, value) pairs into one JSON object; _unique errors 22030 on a dup key.
   "func.json_object_agg",
+  // variance(x) — the alias of var_samp (aggregates.md §23).
+  "func.variance",
   // var_samp(x) — the sample variance (aggregates.md §23).
   "func.var_samp",
   // var_pop(x) — the population variance; exact over integer/decimal (aggregates.md §23).

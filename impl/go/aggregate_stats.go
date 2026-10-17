@@ -13,6 +13,7 @@ import "math"
 var momentSurfaces = map[string][2]aggPlan{
 	"var_pop":  {planVarPop, planVarPopFloat},
 	"var_samp": {planVarSamp, planVarSampFloat},
+	"variance": {planVarSamp, planVarSampFloat},
 }
 
 // momentStat is what a statistical plan finalizes: a sample (N − 1) or population (N) statistic, and
