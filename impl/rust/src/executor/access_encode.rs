@@ -5492,6 +5492,10 @@ pub(crate) enum FkProbe {
     /// A parent unique index's prefix (0x00-tagged slots, in index-key order) + the exact
     /// index name.
     Unique { index: String, prefix: Vec<u8> },
+    /// A complete tuple with no equal in the parent's key types — an integer outside a narrower
+    /// referenced integer column's range, a non-integral decimal or an inexact `f64` against an
+    /// integer or `f32` column (constraints.md §6.2 step 5). It matches no parent key.
+    Absent,
 }
 
 impl FkProbe {
@@ -5502,8 +5506,58 @@ impl FkProbe {
         match self {
             FkProbe::Pk(b) => b,
             FkProbe::Unique { prefix, .. } => prefix,
+            // Every PK key and unique-index prefix is non-empty, so this matches none of them.
+            FkProbe::Absent => &[],
         }
     }
+}
+
+/// Whether a foreign key may pair a local (referencing) column of type `local` with a referenced
+/// column of type `referenced` (constraints.md §6.2 step 5): the same type (typmods are not part of
+/// it), two integer types in either direction, an integer referencing a `decimal`, or `f32` with
+/// `f64` in either direction. These are the pairs PostgreSQL accepts whose equality jed's comparison
+/// matrix also defines (spec/types/compare.toml); every other pair is `42804`.
+pub(crate) fn fk_types_comparable(local: &Type, referenced: &Type) -> bool {
+    if local == referenced {
+        return true;
+    }
+    let (Some(l), Some(r)) = (local.as_scalar(), referenced.as_scalar()) else {
+        return false;
+    };
+    (l.is_integer() && (r.is_integer() || r.is_decimal())) || (l.is_float() && r.is_float())
+}
+
+/// `v` — a value of one foreign-key column — as the EQUAL value of its paired column's type
+/// `target` (constraints.md §6.2 step 5), or `None` when that type holds no equal value: an integer
+/// outside a narrower integer type's range, a non-integral (or out-of-range) decimal against an
+/// integer type, a `f64` that no `f32` represents exactly. Equality is exact, so a converted value
+/// encodes to exactly the key bytes of every equal stored value. Same-type values pass unchanged.
+pub(crate) fn fk_value_as<'a>(
+    target: &Type,
+    v: &'a Value,
+) -> Result<Option<std::borrow::Cow<'a, Value>>> {
+    use std::borrow::Cow;
+    let Some(t) = target.as_scalar() else {
+        return Ok(Some(Cow::Borrowed(v)));
+    };
+    Ok(match v {
+        Value::Unfetched(u) => {
+            let resolved = crate::format::resolve_unfetched_self(u)?;
+            fk_value_as(target, &resolved)?.map(|c| Cow::Owned(c.into_owned()))
+        }
+        Value::Int(n) if t.is_integer() => t.in_range(*n).then_some(Cow::Borrowed(v)),
+        Value::Int(n) if t.is_decimal() => Some(Cow::Owned(Value::Decimal(Decimal::from_i64(*n)))),
+        Value::Decimal(d) if t.is_integer() => d
+            .to_i64_round()
+            .filter(|&n| t.in_range(n) && Decimal::from_i64(n).cmp_value(d).is_eq())
+            .map(|n| Cow::Owned(Value::Int(n))),
+        Value::Float32(f) if t.is_float64() => Some(Cow::Owned(Value::Float64(*f as f64))),
+        Value::Float64(f) if t.is_float32() => {
+            let n = *f as f32;
+            (f.is_nan() || n as f64 == *f).then_some(Cow::Owned(Value::Float32(n)))
+        }
+        _ => Some(Cow::Borrowed(v)),
+    })
 }
 
 /// Build the parent-key probe for `fk` from `row`, taking each referenced parent column's value
@@ -5531,6 +5585,21 @@ pub(crate) fn fk_probe(
             .position(|&r| r == pcol)
             .expect("a parent key column is one of the FK's referenced columns");
         &row[ordinals[i]]
+    };
+    // Each value as its equal of the parent column's type (§6.2 step 5); a value with none matches
+    // no parent key.
+    let mut parent_values: Vec<Option<std::borrow::Cow<'_, Value>>> =
+        vec![None; parent.columns.len()];
+    for &pcol in &fk.ref_columns {
+        match fk_value_as(&parent.columns[pcol].ty, value_for(pcol))? {
+            Some(v) => parent_values[pcol] = Some(v),
+            None => return Ok(Some(FkProbe::Absent)),
+        }
+    }
+    let value_for = |pcol: usize| -> &Value {
+        parent_values[pcol]
+            .as_deref()
+            .expect("a parent key column is one of the FK's referenced columns")
     };
     // The probe must match the PARENT's stored key, so a collated parent key column is encoded with
     // the PARENT's collation (encoding.md §2.12), independent of the child column's own collation.
@@ -5639,14 +5708,16 @@ fn fk_reverse_tail_fixed(child: &Table, tail: &[IndexKey]) -> bool {
 }
 
 /// Encode a parent tuple (FK slot order) as the chosen child key's probe prefix: bare member
-/// encodings for the PK, `0x00`-tagged slots for an index (constraints.md §6.5 step 3).
+/// encodings for the PK, `0x00`-tagged slots for an index (constraints.md §6.5 step 3). Each value
+/// is first taken as its equal of the child column's type (§6.2 step 5); `None` when one has no
+/// equal there, so no child row can reference the tuple.
 pub(crate) fn fk_reverse_prefix(
     path: &FkReversePath,
     fk: &ForeignKeyConstraint,
     child: &Table,
     child_colls: &[Option<std::sync::Arc<Collation>>],
     values: &[Value],
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     let mut prefix = Vec::new();
     for (i, &c) in path.cols.iter().enumerate() {
         let slot = fk
@@ -5654,11 +5725,10 @@ pub(crate) fn fk_reverse_prefix(
             .iter()
             .position(|&local| local == c)
             .expect("a reverse-path column is one of the FK's local columns");
-        let b = encode_typed_key(
-            &child.columns[c].ty,
-            &values[slot],
-            child_colls[c].as_deref(),
-        )?;
+        let Some(value) = fk_value_as(&child.columns[c].ty, &values[slot])? else {
+            return Ok(None);
+        };
+        let b = encode_typed_key(&child.columns[c].ty, &value, child_colls[c].as_deref())?;
         if path.index.is_some() {
             // the index column's §2.16 present slot (a DESC key inverts its body)
             path.orders[i].push_present(&mut prefix, &b);
@@ -5666,7 +5736,7 @@ pub(crate) fn fk_reverse_prefix(
             prefix.extend_from_slice(&b);
         }
     }
-    Ok(prefix)
+    Ok(Some(prefix))
 }
 
 /// Pick the child reverse-match path deterministically: the child PK, then usable non-partial

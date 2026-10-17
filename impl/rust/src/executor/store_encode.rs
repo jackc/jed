@@ -19,6 +19,22 @@ impl AssignPlan {
     }
 }
 
+/// An `ON UPDATE CASCADE` value — of the referenced column's type — prepared for a referencing
+/// column of another comparable type (constraints.md §6.6): PostgreSQL's assignment cast. A decimal
+/// rounds half away from zero into an integer column and a `f64` rounds to nearest into a `f32`
+/// column, each `22003` out of range; integers and `f32` values pass to [`store_value`], which
+/// range-checks or widens them. A same-type value passes unchanged.
+pub(crate) fn fk_cascade_value(v: Value, target: ScalarType) -> Result<Value> {
+    match v {
+        Value::Decimal(d) if target.is_integer() => match d.to_i64_round() {
+            Some(n) if target.in_range(n) => Ok(Value::Int(n)),
+            _ => Err(overflow(target)),
+        },
+        Value::Float64(f) if target.is_float32() => cast_from_float(f, target, None),
+        v => Ok(v),
+    }
+}
+
 /// Coerce a value into a column for storage (shared by INSERT and UPDATE). NULL honours NOT
 /// NULL (23502); an integer into an integer column is range-checked (22003); an integer into
 /// a decimal column widens (int→decimal) then coerces to the typmod; a decimal into a decimal

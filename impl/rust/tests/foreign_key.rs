@@ -1,7 +1,8 @@
 //! FOREIGN KEY constraints — `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES …` and the
 //! column-level `REFERENCES` (spec/design/constraints.md §6, grammar.md §43). Covers what the
 //! shared corpus (`ddl/foreign_key*.test`) cannot: the jed-specific divergences from PostgreSQL
-//! (strict same-type pairing and the end-state parent UPDATE), plus
+//! (the end-state parent UPDATE; the type-pairing divergences live in
+//! ddl/foreign_key_cross_type.test with ledgered overrides), plus
 //! catalog introspection (constraint names, the resolved ordinals). The agreeing behavior — the
 //! 23503 enforcement at every write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the
 //! corpus's job. Mirrored in impl/go/foreign_key_test.go and impl/ts/tests/foreign_key.test.ts.
@@ -54,27 +55,6 @@ fn naming_and_catalog_order() {
         "CREATE TABLE r (id i32 PRIMARY KEY, x i32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
     ]);
     assert_eq!(fk_names(&db2, "r"), vec!["r_x_fkey", "r_x_fkey1"]);
-}
-
-/// jed is STRICTER than PostgreSQL on type pairing: corresponding columns must be the SAME scalar
-/// type (42804), where PG allows any comparable pair (e.g. i32 ↔ i64). A documented divergence
-/// (spec/design/constraints.md §6.7).
-#[test]
-fn strict_same_type_pairing() {
-    let mut db = db_with(&["CREATE TABLE p (id i32 PRIMARY KEY)"]);
-    // i64 referencing an i32 PK — jed rejects (PG would allow).
-    assert_eq!(
-        err(&mut db, "CREATE TABLE c1 (x i64 REFERENCES p)"),
-        "42804"
-    );
-    // text referencing an i32 PK — both jed and PG reject 42804 (sanity).
-    assert_eq!(
-        err(&mut db, "CREATE TABLE c2 (x text REFERENCES p)"),
-        "42804"
-    );
-    // The same type is accepted.
-    db.query_outcome("CREATE TABLE c3 (x i32 REFERENCES p)", &[])
-        .unwrap();
 }
 
 /// All five actions are stored; their behavior lives in the shared conformance corpus (§6.6).

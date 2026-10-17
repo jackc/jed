@@ -69,7 +69,7 @@ import { engineError } from "./errors.ts";
 import {
   encodeTypedKey,
   Engine,
-  fkTypesEqual,
+  fkTypesComparable,
   isGinElementType,
   isGistScalarType,
   sameSet,
@@ -4213,10 +4213,10 @@ function validateLoadedReferences(snap: Snapshot): void {
         const o = fk.refColumns[i]!;
         if (o >= parent.columns.length)
           throw engineError("data_corrupted", "invalid foreign-key referenced column ordinal");
-        if (!fkTypesEqual(t.columns[fk.columns[i]!]!.type, parent.columns[o]!.type))
+        if (!fkTypesComparable(t.columns[fk.columns[i]!]!.type, parent.columns[o]!.type))
           throw engineError(
             "data_corrupted",
-            "foreign key " + fk.name + " pairs columns of different types",
+            "foreign key " + fk.name + " pairs columns of incomparable types",
           );
       }
       const refSet = sortedUnique(fk.refColumns);

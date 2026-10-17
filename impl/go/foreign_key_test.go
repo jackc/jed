@@ -3,7 +3,8 @@ package jed
 // FOREIGN KEY constraints — `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES …` and the
 // column-level `REFERENCES` (spec/design/constraints.md §6, grammar.md §43). Covers what the
 // shared corpus (ddl/foreign_key*.test) cannot: the jed-specific divergences from PostgreSQL
-// (strict same-type pairing and the end-state parent UPDATE), plus
+// (the end-state parent UPDATE; the type-pairing divergences live in
+// ddl/foreign_key_cross_type.test with ledgered overrides), plus
 // catalog introspection (constraint names, the resolved ordinals). The agreeing behavior — the
 // 23503 enforcement at every write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the
 // corpus's job. Mirrors impl/rust/tests/foreign_key.rs and impl/ts/tests/foreign_key.test.ts.
@@ -68,22 +69,6 @@ func TestForeignKeyNamingAndOrder(t *testing.T) {
 	)
 	if got := fkNames(t, db2, "r"); !slices.Equal(got, []string{"r_x_fkey", "r_x_fkey1"}) {
 		t.Fatalf("auto-name suffix walk: got %v", got)
-	}
-}
-
-// jed is STRICTER than PostgreSQL on type pairing: corresponding columns must be the SAME scalar
-// type (42804), where PG allows any comparable pair (e.g. i32 ↔ i64) — constraints.md §6.7.
-func TestForeignKeyStrictTypePairing(t *testing.T) {
-	t.Parallel()
-	db := fkSetup(t, "CREATE TABLE p (id i32 PRIMARY KEY)")
-	if got := fkErr(t, db, "CREATE TABLE c1 (x i64 REFERENCES p)"); got != "42804" {
-		t.Fatalf("i64→i32 pk: got %s, want 42804", got)
-	}
-	if got := fkErr(t, db, "CREATE TABLE c2 (x text REFERENCES p)"); got != "42804" {
-		t.Fatalf("text→i32 pk: got %s, want 42804", got)
-	}
-	if _, err := queryOutcome(db, "CREATE TABLE c3 (x i32 REFERENCES p)", nil); err != nil {
-		t.Fatalf("same-type FK should be accepted: %v", err)
 	}
 }
 

@@ -4635,7 +4635,10 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 				return outcome{}, err
 			}
 			if mapped != nil {
-				raw = mapped[slices.Index(upd.fkTarget.fk.Columns, p.idx)]
+				raw, err = fkCascadeValue(mapped[slices.Index(upd.fkTarget.fk.Columns, p.idx)], p.target)
+				if err != nil {
+					return outcome{}, err
+				}
 			}
 			// NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
 			if p.notNull && raw.Kind == ValNull {

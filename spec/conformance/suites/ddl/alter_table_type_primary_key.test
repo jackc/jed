@@ -1,6 +1,6 @@
 # ALTER TABLE slice 5: ALTER COLUMN TYPE and standalone ADD/DROP PRIMARY KEY rewrites. The custom
 # DROP PRIMARY KEY spelling and ignored explicit PK handle are jed-specific; do not oracle-check.
-# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.unique, ddl.check, ddl.foreign_key, ddl.secondary_index, ddl.identity, ddl.sequence, func.sequence, dml.insert, dml.insert_column_list, dml.delete, query.select, query.order_by, query.where_eq, types.i16, types.i32, types.i64, types.text, types.json, expr.arithmetic, resource.cost_metering
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.unique, ddl.check, ddl.foreign_key, ddl.foreign_key_cross_type, ddl.secondary_index, ddl.identity, ddl.sequence, func.sequence, dml.insert, dml.insert_column_list, dml.delete, query.select, query.order_by, query.where_eq, types.i16, types.i32, types.i64, types.text, types.json, expr.arithmetic, resource.cost_metering
 
 statement ok
 CREATE TABLE alter_type (id i32 PRIMARY KEY, v i32 DEFAULT 7, CONSTRAINT alter_type_v_key UNIQUE (v), CHECK (v > 0))
@@ -225,12 +225,16 @@ CREATE TABLE alter_pk_parent (id i32 PRIMARY KEY)
 statement ok
 CREATE TABLE alter_pk_child (id i32 PRIMARY KEY, parent_id i32 REFERENCES alter_pk_parent(id))
 
-# A type change cannot leave either side of an FK with incompatible static types.
+# A type change cannot leave either side of an FK with incomparable static types.
 statement error 42804
-ALTER TABLE alter_pk_child ALTER parent_id TYPE i64
+ALTER TABLE alter_pk_child ALTER parent_id TYPE text
 
 statement error 42804
-ALTER TABLE alter_pk_parent ALTER id TYPE i64
+ALTER TABLE alter_pk_parent ALTER id TYPE text
+
+# Another integer type stays comparable (constraints.md §6.2 step 5).
+statement ok
+ALTER TABLE alter_pk_child ALTER parent_id TYPE i64
 
 statement error 2BP01
 ALTER TABLE alter_pk_parent DROP PRIMARY KEY

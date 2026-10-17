@@ -1784,7 +1784,7 @@ MALFORMED_SHAPE_TABLE = {
 }.freeze
 
 MALFORMED_FK_TYPE_TABLES = [
-  { name: "c", columns: [col("id", "i32", pk: true), col("pid", "i64")],
+  { name: "c", columns: [col("id", "i32", pk: true), col("pid", "text")],
     fks: [{ name: "c_pid_fkey", local: [1], ref_table: "p", ref: [0] }], rows: [] },
   { name: "p", columns: [col("pid", "i32", pk: true)], rows: [] }
 ].freeze
@@ -1803,7 +1803,7 @@ MALFORMED_FIXTURES = [
   # The catalog claims 25 rows over a 20-row tree: invisible until a write's count disagrees with it.
   { file: "malformed_row_count.jed", page_size: 256, tables: [PK_TABLE.merge(row_count: 25)],
     malformed: :none, reject: true },
-  # Semantic lies the decoder does not model: an FK pairing i64 with an i32 key, a column whose
+  # Semantic lies the decoder does not model: an FK pairing text with an i32 key, a column whose
   # composite type is not in the catalog.
   { file: "malformed_fk_type.jed", page_size: 256, tables: MALFORMED_FK_TYPE_TABLES, malformed: :none },
   { file: "malformed_missing_type.jed", page_size: 256, types: [ctype("ghost", [field("x", "i32")])],

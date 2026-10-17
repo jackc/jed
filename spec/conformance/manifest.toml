@@ -114,7 +114,7 @@ description = "CHECK constraints — column-level and table-level [CONSTRAINT na
 
 [[capability]]
 id = "ddl.foreign_key"
-description = "FOREIGN KEY constraints — column-level REFERENCES and table-level [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent (cols) with ON DELETE/UPDATE NO ACTION|RESTRICT|CASCADE|SET NULL|SET DEFAULT: child INSERT/UPDATE and parent DELETE/UPDATE enforcement, recursive generated actions through the ordinary DML pipeline, MATCH SIMPLE NULL exemption, and action-failure rollback; referenced columns must be the parent PK or a UNIQUE set (42830), same-type pairing (42804, stricter than PG), PG auto-naming, per-table constraint namespace 42710; DROP TABLE of a referenced table is 2BP01; action codes persisted in the v30 catalog (spec/design/constraints.md §6, grammar.md §43)"
+description = "FOREIGN KEY constraints — column-level REFERENCES and table-level [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent (cols) with ON DELETE/UPDATE NO ACTION|RESTRICT|CASCADE|SET NULL|SET DEFAULT: child INSERT/UPDATE and parent DELETE/UPDATE enforcement, recursive generated actions through the ordinary DML pipeline, MATCH SIMPLE NULL exemption, and action-failure rollback; referenced columns must be the parent PK or a UNIQUE set (42830), comparable-type pairing (42804 otherwise; cross-type pairs are ddl.foreign_key_cross_type), PG auto-naming, per-table constraint namespace 42710; DROP TABLE of a referenced table is 2BP01; action codes persisted in the v30 catalog (spec/design/constraints.md §6, grammar.md §43)"
 
 [[capability]]
 id = "ddl.constraint_name_schema"
@@ -123,6 +123,10 @@ description = "A derived constraint name's collision walk spans the table's sche
 [[capability]]
 id = "ddl.foreign_key_match_full"
 description = "FOREIGN KEY … MATCH FULL | MATCH SIMPLE (spec/design/constraints.md §6.3, grammar.md §43): an optional match type after the referenced-column list and before the ON DELETE/UPDATE actions. MATCH SIMPLE (the default) exempts a referencing tuple with any NULL; MATCH FULL exempts only the all-NULL tuple and rejects a partly-NULL one with 23503 (PostgreSQL's DETAIL 'MATCH FULL does not allow mixing of null and nonnull key values.') at every child-side write — INSERT, UPDATE, ON CONFLICT DO UPDATE, generated SET NULL / SET DEFAULT action rows, and ALTER TABLE … ADD FOREIGN KEY validation. MATCH PARTIAL is 0A000 (PostgreSQL's 'MATCH PARTIAL not yet implemented'). Persisted as bit 6 of the v40 foreign-key actions byte; surfaced as jed_constraints.match_type. Builds on ddl.foreign_key"
+
+[[capability]]
+id = "ddl.foreign_key_cross_type"
+description = "FOREIGN KEY column pairs of different but comparable types (spec/design/constraints.md §6.2 step 5): two integer types (i16/i32/i64) in either direction, an integer referencing a decimal, and f32 with f64 in either direction — the pairs PostgreSQL accepts (a cross-type btree equality or an implicit cast to the referenced type) whose equality jed's comparison matrix also defines; typmods (varchar(n), decimal(p,s)) never matter. A referencing value matches a parent key it equals, so a value the other type cannot hold exactly (an out-of-range integer, a non-integral decimal, a f64 no f32 represents) matches nothing — 23503 on the child side, never a stranded reference on the parent side, through the parent key, a child index, or a child scan alike. ON UPDATE CASCADE assigns the parent's new value with PostgreSQL's assignment cast (an integer range check, decimal rounding half away from zero, f64 → f32 rounding; 22003 out of range), then re-checks the rewritten row. Every other pair stays 42804 — including int/decimal → float and the date/timestamp/timestamptz pairs PostgreSQL accepts (a documented divergence, §6.7). The pairing is derived from the column types, so the catalog bytes are unchanged (no format_version change). Builds on ddl.foreign_key"
 
 [[capability]]
 id = "ddl.foreign_key_child_index"

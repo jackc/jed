@@ -1752,11 +1752,11 @@ impl Engine {
                     ),
                 ));
             }
-            // 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they
-            // are key-encodable, so a same-typed local column is key-encodable too — no separate
-            // 0A000 type gate is needed.
+            // 8. Comparable-type pairing (§6.2 step 5). The referenced columns are a PK/UNIQUE key,
+            // so they are key-encodable; every admitted local type (the same type, another integer,
+            // the other float width) is key-encodable too — no separate 0A000 type gate is needed.
             for (li, ri) in local.iter().zip(&refs) {
-                if table.columns[*li].ty != parent.columns[*ri].ty {
+                if !fk_types_comparable(&table.columns[*li].ty, &parent.columns[*ri].ty) {
                     return Err(EngineError::new(
                         SqlState::DatatypeMismatch,
                         format!(
@@ -3010,7 +3010,10 @@ impl Engine {
                                     })
                                 };
                                 for (&li, &ri) in local.iter().zip(&refs) {
-                                    if table.columns[li].ty != parent.columns[ri].ty {
+                                    if !fk_types_comparable(
+                                        &table.columns[li].ty,
+                                        &parent.columns[ri].ty,
+                                    ) {
                                         return Err(EngineError::new(
                                             SqlState::DatatypeMismatch,
                                             format!(
@@ -3673,7 +3676,10 @@ impl Engine {
                     snap.table(&fk.ref_table).expect("existing FK parent")
                 };
                 for (&local, &referenced) in fk.columns.iter().zip(&fk.ref_columns) {
-                    if table.columns[local].ty != parent.columns[referenced].ty {
+                    if !fk_types_comparable(
+                        &table.columns[local].ty,
+                        &parent.columns[referenced].ty,
+                    ) {
                         return Err(type_error(format!(
                             "foreign key constraint {} cannot be implemented: key columns {} and {} are of incompatible types: {} and {}",
                             fk.name,
@@ -3706,7 +3712,10 @@ impl Engine {
                         ) else {
                             continue;
                         };
-                        if child.columns[local].ty != table.columns[new_ref].ty {
+                        if !fk_types_comparable(
+                            &child.columns[local].ty,
+                            &table.columns[new_ref].ty,
+                        ) {
                             return Err(type_error(format!(
                                 "foreign key constraint {} cannot be implemented: key columns {} and {} are of incompatible types: {} and {}",
                                 fk.name,
