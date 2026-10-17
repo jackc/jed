@@ -2217,6 +2217,7 @@ count (up to about 16k groups under `MAX_REGEX_PROGRAM`, [regex.md](regex.md) §
 | `replace(s, from, to)` | amplifier | S1 | UTF-8 bytes of `s` | UTF-8 bytes of the result |
 | `regexp_replace` | amplifier | S1 | `regex_step`, plus UTF-8 bytes of the replacement once per match | UTF-8 bytes of the result |
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
+| `array_to_string(a, sep [, null_string])` | amplifier | S1 | `payload(a)` | UTF-8 bytes of the result |
 | `regexp_match`, `regexp_matches` | amplifier | S4 | none beyond `regex_step` | Σ `payload` of the capture arrays |
 | `concat` (spread or `VARIADIC`) | growth | — | — | UTF-8 bytes of the result |
 | `concat_ws` (spread or `VARIADIC`) | amplifier | — | — | Σ UTF-8 bytes of the non-NULL arguments' text + (count − 1) × UTF-8 bytes of the separator |
@@ -2255,6 +2256,12 @@ The amplifiers' exact sizes:
 - `array_replace`: `payload(a) + Σ (value_bytes(new) − value_bytes(e))` over the
   matched elements `e`. Elements that compare equal can still differ in payload, for
   example decimals of different scale.
+- `array_to_string`: `Σ len(item) + (k − 1) × len(sep)` in UTF-8 bytes over the `k` printed items
+  (each non-NULL element's output text, plus `null_string` for each NULL element when it is
+  given), or 0 when `k = 0`. A core renders each element to measure it, since each is bounded by
+  its input; a finite `timestamptz` element also charges one `timezone` unit, as the array → text
+  cast does. Separator and null string repeat per element, which is why this kernel is an
+  amplifier ([array-functions.md](array-functions.md) §15).
 - `jsonb_pretty`: the UTF-8 length of the rendering, computed by walking the tree
   with the renderer's exact whitespace rules. A container contributes its brackets,
   a newline plus `4 × depth` spaces before each member and before the close, a
@@ -2270,7 +2277,7 @@ The amplifiers' exact sizes:
   order, and sizes the literal spans plus each conversion's (quoted) text and its padding
   spaces. Padding is never materialized before the reservation.
 
-`replace`, `regexp_replace`, `jsonb_pretty`, `concat_ws`, and `format` also reject a size above
+`replace`, `regexp_replace`, `array_to_string`, `jsonb_pretty`, `concat_ws`, and `format` also reject a size above
 `MAX_RESULT_CHARS` with `54000`, before the output charge, like `repeat`. The array
 amplifiers (`array_replace`, `regexp_match`, `regexp_matches`) have no structural cap; the
 cost ceiling and the scalar allowance bound them.
@@ -2310,7 +2317,7 @@ Rules for both classes:
   every evaluation, and charging them would tax keyset predicates such as
   `(a, b) > (1, 'x')` for no protection.
 - Results that are an operand or part of one, or an operand-sized copy:
-  substrings (including `regexp_substr`), trims, `split_part`, `set_byte` / `set_bit`,
+  substrings (including `regexp_substr` and the regex `substring`), trims, `split_part`, `set_byte` / `set_bit`,
   subscripts and slices, jsonb extraction (`->`, `->>`, `#>`, `#>>`),
   `jsonb_strip_nulls`, `array_remove`, jsonb `-`, `CASE`, `COALESCE`,
   `GREATEST`/`LEAST`.
@@ -2332,7 +2339,7 @@ Rules for both classes:
   input, so each can grow it.
 - Parsing text into an array, `json`, `jsonb`, composite, or range: the result is
   bounded by the input text, and getting back to text for another round needs a
-  covered renderer. `regexp_split_to_array` and `regexp_split_to_table` are the same
+  covered renderer. `string_to_array`, `regexp_split_to_array`, and `regexp_split_to_table` are the same
   case: their pieces partition the subject, so their text never exceeds it, and the
   array adds at most one element header per character.
 - Aggregates (`json_agg`, `jsonb_object_agg`, `array_agg`, `string_agg`, …): each input came from a

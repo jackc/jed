@@ -34,6 +34,10 @@ ORDER BY id;`;
 
 	const match = `SELECT regexp_match('carol+news@example.com', '^([^@]+)@(.+)$') AS parts;`;
 
+	const substringRegex = `SELECT substring('order-1234' FROM '[0-9]+')       AS digits,
+       substring('key=value' FROM '=(.*)')          AS after_eq,
+       substring('nothing here' FROM '[0-9]+')      AS no_match;`;
+
 	const matches = `SELECT m[1] AS key, m[2] AS value
 FROM regexp_matches('host=db1 port=5432 user=app', '(\\w+)=(\\w+)', 'g') AS m;`;
 
@@ -51,7 +55,8 @@ ORDER BY id;`;
 
 jed offers three ways to match text against a pattern: SQL `LIKE` / `ILIKE`, the
 regular-expression operators `~` `~*` `!~` `!~*`, and the `regexp_*` functions
-(`regexp_replace`, `regexp_match`, `regexp_matches`, and the split functions).
+(`regexp_replace`, `regexp_match`, `regexp_matches`, the split functions, and the regex form of
+`substring`).
 
 ## `LIKE` / `ILIKE`
 
@@ -119,6 +124,16 @@ Reordering with capture groups:
 (or the whole match when the pattern has no group), or `NULL` when there is no match.
 
 <LiveSql query={match} rows={1} />
+
+## `substring(… FROM pattern)`
+
+`SUBSTRING(source FROM pattern)`, or the function form `substring(source, pattern)`, returns the
+text of the first match: the first capture group when the pattern has one, otherwise the whole
+match, and `NULL` when nothing matches. A quoted second argument is a pattern, as in PostgreSQL, so
+`substring('hello' FROM '2')` searches for `2`; pass an integer (`FROM 2`) for the position form.
+The SQL-standard `SIMILAR` form (`FROM pattern FOR escape`) is not supported.
+
+<LiveSql query={substringRegex} rows={1} />
 
 ## `regexp_matches`
 

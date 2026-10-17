@@ -2016,3 +2016,114 @@ func requireTextOrNull(t resolvedType) error {
 	}
 	return typeError("LIKE requires text operands")
 }
+
+// arrayToStringValue is array_to_string(a, sep [, null_string]) (array-functions.md §15): the
+// elements of a in row-major order (any dimensionality), each rendered as its type's output text,
+// joined by sep; a NULL element is skipped, or written as null_string when that is given and
+// non-NULL. A NULL array or separator is NULL; an empty array is ”. An amplifier (cost.md §8.1):
+// the input array is charged, each element rendered (a finite timestamptz in the session zone, one
+// timezone unit each), the exact UTF-8 size computed and capped at maxResultChars (54000), then
+// charged and reserved before the result is joined.
+func arrayToStringValue(vals []Value, zone ZoneRef, m *costMeter) (Value, error) {
+	if vals[0].Kind == ValNull || vals[1].Kind == ValNull {
+		return NullValue(), nil
+	}
+	a := vals[0].arrayVal()
+	sep := vals[1].str()
+	hasNull := len(vals) > 2 && vals[2].Kind != ValNull
+	nullString := ""
+	if hasNull {
+		nullString = vals[2].str()
+	}
+	m.Charge(costs.ScalarByte * memPayloadBytes(vals[0]))
+	if err := m.Guard(); err != nil {
+		return Value{}, err
+	}
+	var zoned int64
+	for _, e := range a.Elements {
+		zoned += e.zoneRenderCount()
+	}
+	if zoned > 0 {
+		m.Charge(costs.Timezone * zoned)
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+	}
+	// Render the printed items (each bounded by its input), then size the joined result: the items'
+	// UTF-8 bytes plus one separator between each adjacent pair.
+	items := make([]string, 0, len(a.Elements))
+	var size int64
+	for _, e := range a.Elements {
+		var item string
+		switch {
+		case e.Kind == ValNull && !hasNull:
+			continue
+		case e.Kind == ValNull:
+			item = nullString
+		case e.Kind == ValBool:
+			// PostgreSQL's boolout spelling, not the bool → text cast's true/false.
+			item = "f"
+			if e.boolVal() {
+				item = "t"
+			}
+		default:
+			s, err := e.renderIn(zone)
+			if err != nil {
+				return Value{}, err
+			}
+			item = s
+		}
+		size += int64(len(item))
+		items = append(items, item)
+	}
+	if len(items) > 1 {
+		size += int64(len(items)-1) * int64(len(sep))
+	}
+	if size > maxResultChars {
+		return Value{}, newError(ProgramLimitExceeded, "requested length too large")
+	}
+	m.Charge(costs.ScalarByte * size)
+	if err := m.Guard(); err != nil {
+		return Value{}, err
+	}
+	if err := m.ReserveScalar(size); err != nil {
+		return Value{}, err
+	}
+	return TextValue(strings.Join(items, sep)), nil
+}
+
+// stringToArrayValue is string_to_array(s, sep [, null_string]) (array-functions.md §15): s split
+// at each non-overlapping occurrence of sep, left to right, as a one-dimensional text[]. A NULL sep
+// splits s into its characters; an empty sep keeps s whole; an empty s is the empty array. A piece
+// equal to a non-NULL null_string becomes a NULL element. A NULL s is NULL. Not charged beyond the
+// call's operator_eval: the pieces partition s (cost.md §8.1).
+func stringToArrayValue(vals []Value) Value {
+	if vals[0].Kind == ValNull {
+		return NullValue()
+	}
+	s := vals[0].str()
+	hasNull := len(vals) > 2 && vals[2].Kind != ValNull
+	if s == "" {
+		return arrayValueOf(emptyArray())
+	}
+	var pieces []string
+	switch {
+	case vals[1].Kind == ValNull:
+		for _, r := range s {
+			pieces = append(pieces, string(r))
+		}
+	case vals[1].str() == "":
+		pieces = []string{s}
+	default:
+		pieces = strings.Split(s, vals[1].str())
+	}
+	elems := make([]Value, len(pieces))
+	for i, p := range pieces {
+		if hasNull && p == vals[2].str() {
+			elems[i] = NullValue()
+		} else {
+			elems[i] = TextValue(p)
+		}
+	}
+	return ArrayValue(elems)
+}

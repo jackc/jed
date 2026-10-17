@@ -702,7 +702,8 @@ pub(crate) fn scalar_func_id(name: &str) -> ScalarFunc {
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
         "uuid_extract_version" => ScalarFunc::UuidExtractVersion,
         "uuid_extract_timestamp" => ScalarFunc::UuidExtractTimestamp,
-        "uuidv4" => ScalarFunc::Uuidv4,
+        // gen_random_uuid is PostgreSQL's older name for uuidv4 (same kernel, entropy.md §3).
+        "uuidv4" | "gen_random_uuid" => ScalarFunc::Uuidv4,
         "uuidv7" => ScalarFunc::Uuidv7,
         "now" => ScalarFunc::Now,
         "clock_timestamp" => ScalarFunc::ClockTimestamp,
@@ -876,6 +877,8 @@ pub(crate) fn array_func_id(name: &str) -> ArrayFunc {
         "array_cat" => ArrayFunc::ArrayCat,
         "array_remove" => ArrayFunc::ArrayRemove,
         "array_replace" => ArrayFunc::ArrayReplace,
+        "array_to_string" => ArrayFunc::ArrayToString,
+        "string_to_array" => ArrayFunc::StringToArray,
         "array_position" => ArrayFunc::ArrayPosition,
         "array_positions" => ArrayFunc::ArrayPositions,
         _ => unreachable!("array_func_id: {name} is not a catalog array function"),

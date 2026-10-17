@@ -955,22 +955,24 @@ const (
 type arrayFunc int
 
 const (
-	afNdims       arrayFunc = iota // array_ndims(anyarray) → i32; NULL for the empty array
-	afLength                       // array_length(anyarray, integer) → i32; NULL if empty / out of range
-	afLower                        // array_lower(anyarray, integer) → i32
-	afUpper                        // array_upper(anyarray, integer) → i32
-	afCardinality                  // cardinality(anyarray) → i32; 0 for the empty array
-	afDims                         // array_dims(anyarray) → text; NULL for the empty array
-	afAppend                       // array_append(anyarray, anyelement) → anyarray; non-strict; 22000 if multidim
-	afPrepend                      // array_prepend(anyelement, anyarray) → anyarray
-	afCat                          // array_cat(anyarray, anyarray) → anyarray; 2202E on incompatible dims
-	afRemove                       // array_remove(anyarray, anyelement) → anyarray; 1-D/empty only (0A000); lb preserved
-	afReplace                      // array_replace(anyarray, anyelement, anyelement) → anyarray; any dim, shape preserved
-	afPosition                     // array_position(anyarray, anyelement[, integer]) → i32; 1-D/empty (0A000); NULL start 22004
-	afPositions                    // array_positions(anyarray, anyelement) → i32[]; 1-D/empty only (0A000)
-	afContains                     // a @> b (anyarray, anyarray) → boolean; does a contain b; strict eq; any dim (§10)
-	afContainedBy                  // a <@ b (anyarray, anyarray) → boolean; is a contained by b (b @> a) (§10)
-	afOverlaps                     // a && b (anyarray, anyarray) → boolean; do a and b share an element; strict eq (§10)
+	afNdims         arrayFunc = iota // array_ndims(anyarray) → i32; NULL for the empty array
+	afLength                         // array_length(anyarray, integer) → i32; NULL if empty / out of range
+	afLower                          // array_lower(anyarray, integer) → i32
+	afUpper                          // array_upper(anyarray, integer) → i32
+	afCardinality                    // cardinality(anyarray) → i32; 0 for the empty array
+	afDims                           // array_dims(anyarray) → text; NULL for the empty array
+	afAppend                         // array_append(anyarray, anyelement) → anyarray; non-strict; 22000 if multidim
+	afPrepend                        // array_prepend(anyelement, anyarray) → anyarray
+	afCat                            // array_cat(anyarray, anyarray) → anyarray; 2202E on incompatible dims
+	afRemove                         // array_remove(anyarray, anyelement) → anyarray; 1-D/empty only (0A000); lb preserved
+	afReplace                        // array_replace(anyarray, anyelement, anyelement) → anyarray; any dim, shape preserved
+	afPosition                       // array_position(anyarray, anyelement[, integer]) → i32; 1-D/empty (0A000); NULL start 22004
+	afPositions                      // array_positions(anyarray, anyelement) → i32[]; 1-D/empty only (0A000)
+	afContains                       // a @> b (anyarray, anyarray) → boolean; does a contain b; strict eq; any dim (§10)
+	afContainedBy                    // a <@ b (anyarray, anyarray) → boolean; is a contained by b (b @> a) (§10)
+	afOverlaps                       // a && b (anyarray, anyarray) → boolean; do a and b share an element; strict eq (§10)
+	afToString                       // array_to_string(anyarray, text[, text]) → text; an amplifier (§15)
+	afStringToArray                  // string_to_array(text, text[, text]) → text[] (§15)
 )
 
 // rangeFunc selects a polymorphic range accessor (spec/design/range-functions.md §1, RF1). Like
@@ -1008,6 +1010,9 @@ const (
 	// srfRegexpSplitToTable relation. Its eval yields the regexp_split_to_array pieces, which the SRF
 	// producer unpacks one row each.
 	rxSplitToTable
+	// rxSubstring is substring(string, pattern) / SUBSTRING(string FROM pattern) (regex.md §8e): the
+	// first match's first capture group when the pattern has one, else the whole match.
+	rxSubstring
 )
 
 // rangeOp selects a range BOOLEAN operator (spec/design/range-functions.md §3, RF3). Each is a binary

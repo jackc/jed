@@ -166,6 +166,10 @@ func evalArrayFunc(fn arrayFunc, vals []Value, m *costMeter) (Value, error) {
 		return arrayPositionValue(vals[0], vals[1], start)
 	case afPositions:
 		return arrayPositionsValue(vals[0], vals[1])
+	case afToString:
+		panic("array_to_string renders in the session zone (eval)")
+	case afStringToArray:
+		return stringToArrayValue(vals), nil
 	case afContains:
 		return arrayContainsValue(vals[0], vals[1])
 	case afContainedBy:
@@ -2370,19 +2374,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return IntValue(cnt), nil
-		default: // rxSubstr, rxInstr — both find the N-th match's subexpr span.
+		default: // rxSubstr, rxSubstring, rxInstr — each finds the N-th match's subexpr span.
 			caps, ok, err := prog.nthMatch(matchRunes, int(start0), nth, m)
 			if err != nil {
 				return Value{}, err
 			}
 			noMatch := func() Value {
-				if e.rxFunc == rxSubstr {
+				if e.rxFunc != rxInstr {
 					return NullValue()
 				}
 				return IntValue(0)
 			}
 			if !ok {
 				return noMatch(), nil
+			}
+			// substring(text, text) reports the first capture group when the pattern has one, else
+			// the whole match (regex.md §8e).
+			if e.rxFunc == rxSubstring && prog.ngroups > 0 {
+				subexpr = 1
 			}
 			// `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
 			// or a non-participating group (-1) → NULL / 0.
@@ -2394,7 +2403,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if s2 < 0 || e2 < 0 {
 				return noMatch(), nil
 			}
-			if e.rxFunc == rxSubstr {
+			if e.rxFunc != rxInstr {
 				return TextValue(string(origRunes[s2:e2])), nil
 			}
 			// endoption 0 → first-char position, 1 → after-last-char (1-based).
@@ -3693,6 +3702,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			vals[i] = v
+		}
+		// array_to_string renders its elements in the session zone (an amplifier that charges
+		// itself, cost.md §8.1).
+		if e.afunc == afToString {
+			return arrayToStringValue(vals, env.exec.session.timeZone, m)
 		}
 		out, err := evalArrayFunc(e.afunc, vals, m)
 		if err != nil {

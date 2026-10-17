@@ -1,0 +1,117 @@
+# The POSIX-regex substring (spec/design/regex.md §8e): substring(string, pattern) and the special
+# form SUBSTRING(string FROM pattern) → text. The first match of the pattern (jed's RE2-subset Pike
+# VM); when the pattern has a capture group, the text the FIRST group captured, else the whole
+# match. No match, or a first group that did not participate, → NULL. STRICT. A text second argument
+# selects this overload over substring(text, integer): a bare string literal or an untyped NULL is
+# text-preferred (functions.md §9.1), as in PostgreSQL. The patterns here are in the subset where
+# jed's leftmost-first match agrees with PostgreSQL's; a divergent case is ledgered in
+# oracle_overrides.toml. PostgreSQL-oracle-verified (postgres:18). Format: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, func.substring_regex, func.regexp_substr, types.i32, types.text, types.bytea, null.three_valued
+
+# --- no group: the whole match ---------------------------------------------------------------
+query TTT nosort
+SELECT substring('hello' FROM 'l+'), substring('Thomas' FROM '...$'), substring('foo123bar' FROM '[0-9]+')
+----
+ll
+mas
+123
+
+# --- with groups: the first capturing group (a non-capturing group does not count) ------------
+query TTT nosort
+SELECT substring('hello' FROM '(l)(o)'), substring('Thomas' FROM '(?:o)(m)'), substring('foo123bar', '([a-z]+)([0-9]+)')
+----
+l
+m
+foo
+
+# an optional first group that took part, and one that did not (NULL)
+query TT nosort
+SELECT substring('Thomas' FROM 'h(o)?'), substring('foobar' FROM 'o(x)?b')
+----
+o
+NULL
+
+# --- no match, and NULL operands -------------------------------------------------------------
+query TTTT nosort
+SELECT substring('hello' FROM 'x'), substring(NULL FROM 'a'), substring('abc' FROM NULL), substring('abc', NULL::text)
+----
+NULL
+NULL
+NULL
+NULL
+
+# --- overload choice: an untyped literal second argument is the regex form ---------------------
+# '2' is a pattern (no digit in 'hello' → NULL); the integer 2 is the 1-based start position.
+query TT nosort
+SELECT substring('hello' FROM '2'), substring('hello' FROM 2)
+----
+NULL
+ello
+
+# an untyped parameter there is typed text, so it binds a pattern
+# params: 'l+'
+query T nosort
+SELECT substring('hello' FROM $1)
+----
+ll
+
+# --- match choice: jed's leftmost-first alternation (the regex.md §1 flavor divergence) ---------
+# The first alternative that matches wins ('ab'); PostgreSQL's ARE engine prefers the longest match
+# of an unquantified alternation ('abc'). Ledgered in oracle_overrides.toml.
+query T nosort
+SELECT substring('xabcd' FROM 'ab|abc')
+----
+ab
+
+# --- over columns (a per-row pattern compiles per row)------------------------------------------
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text, p text)
+
+statement ok
+INSERT INTO t VALUES
+  (1, 'order-1234', '[0-9]+'),
+  (2, 'key=value', '=(.*)'),
+  (3, 'nothing', 'z'),
+  (4, NULL, 'a'),
+  (5, 'abc', NULL)
+
+query IT nosort
+SELECT id, substring(s FROM p) FROM t ORDER BY id
+----
+1
+1234
+2
+value
+3
+NULL
+4
+NULL
+5
+NULL
+
+query IT nosort
+SELECT id, substring(s FROM '^([a-z]+)') FROM t ORDER BY id
+----
+1
+order
+2
+key
+3
+nothing
+4
+NULL
+5
+abc
+
+# --- errors ----------------------------------------------------------------------------------------
+# an invalid pattern
+statement error 2201B
+SELECT substring('abc' FROM '(')
+
+# a bytea subject has no regex overload
+statement error 42883
+SELECT substring('\x01'::bytea FROM 'a'::text)
+
+# the three-argument text form is PostgreSQL's SIMILAR substring, which jed does not implement
+statement error 42883
+SELECT substring('abc' FROM 'b' FOR '#')

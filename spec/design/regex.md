@@ -593,6 +593,38 @@ backslash is kept, so `\D \W \S \A` keep their meaning.
 
 ---
 
+## 8e. The regex `substring(text, text)` / `SUBSTRING(text FROM pattern)`
+
+PostgreSQL's POSIX-regex substring: `substring(string, pattern)`, and the special form
+`SUBSTRING(string FROM pattern)`, which the parser rewrites to that call
+([string-functions.md](string-functions.md) §4). It returns the text of the **first** match of
+`pattern`: when the pattern has at least one capture group, the text the **first** group captured
+(a non-capturing `(?:…)` group does not count); otherwise the whole match. No match, or a first
+group that did not take part in the match (`'o(x)?b'`), is **NULL**. STRICT: a NULL argument is
+NULL. There are no flags.
+
+It is exactly `regexp_substr(string, pattern, 1, 1, '', k)` with `k = 1` if the pattern has a group,
+else `0`: the same `RegexFunc` node (the internal kind `Substring`), the same constant-pattern
+precompilation (§5), and the same cost — one `operator_eval`, `regex_compile`, and `regex_step` per
+step explored. Like `regexp_substr` its result is a slice of the subject, so it charges no
+`scalar_byte` ([cost.md](cost.md) §8.1).
+
+**Overload choice.** `substring(text, text)` is a catalog row beside the position forms
+`substring(text, integer [, integer])`, chosen by the generic overload rule. A text second argument
+selects it, and so does an untyped one (a bare string literal, `NULL`, or `$N`), because `text` wins
+among the candidates ([functions.md](functions.md) §9.1), as in PostgreSQL. So
+`SUBSTRING('hello' FROM '2')` searches for the pattern `2` and returns NULL, and a `$1` there is typed
+`text`; `SUBSTRING('hello' FROM 2)` is the position form. Before this overload landed such calls were
+`42883`. A `bytea` subject has no regex form (`42883`).
+
+**Match choice.** The match is jed's leftmost-first match (§4), so where PostgreSQL's ARE engine
+would prefer a longer match the results differ: `SUBSTRING('xabcd' FROM 'ab|abc')` is `ab` in jed and
+`abc` in PostgreSQL. This is the flavor divergence of §1, ledgered in `oracle_overrides.toml` for the
+corpus rows that show it. The three-argument SQL-standard form `SUBSTRING(s FROM pattern FOR escape)`
+is PostgreSQL's `SIMILAR` substring and is excluded with `SIMILAR TO` (§10): it is `42883`.
+
+---
+
 ## 9. Cross-core fixtures
 
 Two TOML fixture families in [`spec/regex/`](../regex/) (the `spec/encoding/` precedent), the
@@ -634,12 +666,14 @@ backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`, named groups. And
   `expr.regex_imatch` (`~*`/`!~*`, builds on `expr.regex_match`), `resource.regex_program_limit`;
   Slice 2 adds `func.regexp_replace`, `func.regexp_match`; Slice 3 adds `func.regexp_count`,
   `func.regexp_instr`, `func.regexp_substr`, `func.regexp_like`; Slice 4 adds
-  `func.regexp_matches`, `func.regexp_split_to_table`, `func.regexp_split_to_array`.
+  `func.regexp_matches`, `func.regexp_split_to_table`, `func.regexp_split_to_array`; §8e adds
+  `func.substring_regex`.
 - Corpus: `suites/expr/regex.test` (operators, NULL/42804/2201B, code-point/astral, `# cost:` pins),
   `suites/resource/regex_program_limit.test` (`54001` boundary, jed-specific — not oracle-checked),
   `suites/expr/regexp_functions.test` (Slice 2), `suites/expr/regexp_oracle_functions.test` (Slice 3),
   `suites/query/regexp_srf.test` (Slice 4), `suites/expr/regex_case_insensitive_escapes.test` (the
-  §1 pattern fold keeps escape letters: `\D \W \S \A` under `~*` and `'i'`).
+  §1 pattern fold keeps escape letters: `\D \W \S \A` under `~*` and `'i'`), `suites/expr/substring_regex.test`
+  (§8e).
 - **Oracle divergence** (§7 conformance): jed's flavor is the RE2 subset, so only the **PG-agreeing
   subset** is oracle-checkable (`mise run corpus:check`); flavor-divergent cases (a pattern PG accepts
   via a backref, greedy-edge differences) get **hand-authored expected output + an

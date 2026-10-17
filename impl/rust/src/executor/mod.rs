@@ -3450,6 +3450,12 @@ pub(crate) enum ArrayFunc {
     /// array_positions(anyarray, anyelement) → i32[] — the i32[] of every match's subscript
     /// (empty {} if none); 1-D/empty only (0A000) (§8).
     ArrayPositions,
+    /// array_to_string(anyarray, text[, text]) → text — the elements' output text joined by the
+    /// separator; NULL elements skipped or replaced by the null string (§15). An amplifier.
+    ArrayToString,
+    /// string_to_array(text, text[, text]) → text[] — the string split at the separator (a NULL
+    /// separator splits into characters); pieces equal to the null string become NULL (§15).
+    StringToArray,
     /// `a @> b` (anyarray, anyarray) → boolean — does `a` CONTAIN `b`: is every element of `b`
     /// present in `a` (STRICT equality, NULL matches nothing) over the flattened multiset, any
     /// dimensionality (§10). A NULL whole-array operand → NULL.
@@ -3501,6 +3507,9 @@ pub(crate) enum RegexFunc {
     Count,
     /// regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text (regex.md §8b).
     Substr,
+    /// substring(string, pattern) / `SUBSTRING(string FROM pattern)` → text (regex.md §8d): the
+    /// first match's first capture group when the pattern has one, else the whole match.
+    Substring,
     /// regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer
     /// (regex.md §8b).
     Instr,

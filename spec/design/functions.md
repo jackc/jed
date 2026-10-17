@@ -26,7 +26,7 @@ The catalog now lists:
 | `comparison` (NULL-safe) | `IS DISTINCT FROM`, `IS NOT DISTINCT FROM` | `boolean` |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
-| `function` (scalar) | `abs` `round` (§9), `make_interval`/`make_timestamp`/`make_timestamptz` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` (§12), `num_nulls`/`num_nonnulls` (VARIADIC, array-functions.md §12) | per-function |
+| `function` (scalar) | `abs` `round` (§9), `make_interval`/`make_timestamp`/`make_timestamptz` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4` (alias `gen_random_uuid`)/`uuidv7`, `now`/`clock_timestamp` (§12), `num_nulls`/`num_nonnulls` (VARIADIC, array-functions.md §12) | per-function |
 | `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `i64` / `decimal` / widened (§8) |
 | `set_returning` | `generate_series`, `unnest` (§10, array-functions.md §9) | a row **set** (§10) |
 
@@ -345,7 +345,10 @@ from the function's signatures (`translate($1, 'a', 'b')` types `$1` text; `tran
 
 So `length($1)` and `substr(NULL, 1)` pick the `text` overloads over `bytea`, `json_typeof($1)`
 types `$1` json, `uuidv7($1)` types it interval, and `date_part('year', NULL)` is `42725`, as in
-PostgreSQL.
+PostgreSQL. The same rule chooses between `substring(text, integer)` and the regex
+`substring(text, text)` ([regex.md](regex.md) §8e): `substring(s, $1)`, `substring(s, NULL)`, and
+`SUBSTRING(s FROM '2')` (a bare string literal resolves as `text`) all take the regex form, as
+PostgreSQL does; only an integer argument selects the position form.
 
 **Two PostgreSQL heuristics are deliberately left out.** PostgreSQL then prefers a category's
 *preferred* type (`float8` among the numeric types) and, failing that, assumes an unknown argument
@@ -616,7 +619,7 @@ PostgreSQL's UUID functions split cleanly along jed's determinism contract
   `uuid_extract_timestamp(uuid) → timestamptz` are deterministic functions of their input
   bits — immutable, fully in-contract, oracle-checked against PostgreSQL 18. They reuse the §9
   scalar-function mold (`[[operator]]`, `kind = "function"`), one row each.
-- **Generators (the seam slice):** `uuidv4()` (random) and `uuidv7([shift interval])`
+- **Generators (the seam slice):** `uuidv4()` (random; PostgreSQL's `gen_random_uuid()` is an alias) and `uuidv7([shift interval])`
   (wall-clock + random) are **volatile** — they read entropy and the clock, the class-**B**
   case (determinism.md §5). They land on a host-injected **random + clock seam** — two functions
   the host supplies ([entropy.md](entropy.md)) — so they stay *deterministic given the seam

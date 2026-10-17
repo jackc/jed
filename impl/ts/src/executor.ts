@@ -30802,6 +30802,9 @@ export type ArrayFuncName =
   | "array_replace"
   | "array_position"
   | "array_positions"
+  // The array <-> text conversions (array-functions.md §15), resolver-routed.
+  | "array_to_string"
+  | "string_to_array"
   // The containment/overlap operators `@>`/`<@`/`&&` (array-functions.md §10) — not catalog function
   // names; resolved via resolveContainment, which selects these kernel ids directly.
   | "contains"
@@ -30822,7 +30825,10 @@ export type RegexFuncName =
   | "instr"
   | "split_to_array"
   | "matches"
-  | "split_to_table";
+  | "split_to_table"
+  // substring(string, pattern) / SUBSTRING(string FROM pattern) (regex.md §8e): the first match's
+  // first capture group when the pattern has one, else the whole match. EXPLAIN renders `substring`.
+  | "substring";
 
 export type RangeFuncName =
   | "lower"
@@ -36498,6 +36504,13 @@ export function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveAggregate(scope, e, ag, params);
   }
+  // The array <-> text conversions (array-functions.md §15): array_to_string's anyarray slot binds
+  // no result type and string_to_array's text[] result is not scalar, so both have their own
+  // resolver (ahead of the generic polymorphic path, which cannot adapt their text slots).
+  if (lname === "array_to_string" || lname === "string_to_array") {
+    rejectNamed(lname, e.argNames);
+    return resolveArrayTextFunc(scope, e, ag, params);
+  }
   // The polymorphic array functions (array-functions.md §2) are also kind === "function", so they
   // must be intercepted BEFORE the generic scalar path — their anyarray/anyelement slots need §2
   // unification, which lookupScalarOverload's exact-family match cannot do.
@@ -36712,6 +36725,19 @@ export function resolveRegexFunc(
       rargs.push(r.node);
     }
   }
+  return regexFuncNode(scope, func, flagsIdx, rargs, params);
+}
+
+// regexFuncNode builds the regexFunc node over resolved arguments (source and pattern at 0 and 1,
+// the flags at flagsIdx, -1 for none): precompile a constant pattern and pick the result type.
+// Shared by the regexp_* functions and the regex substring(text, text) overload (regex.md §8e).
+function regexFuncNode(
+  scope: Scope,
+  func: RegexFuncName,
+  flagsIdx: number,
+  rargs: RExpr[],
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
   // Precompile a constant pattern (rargs[1]) once, folding it for a statically-constant `i` flag.
   let insensitive: boolean | null = false;
   if (flagsIdx >= 0) {
@@ -36729,7 +36755,7 @@ export function resolveRegexFunc(
   // reused plan would under-charge the 2nd+ execute — never cache such a plan.
   if (program !== null) params.uncacheable = true;
   let type: ResolvedType;
-  if (func === "replace" || func === "substr") type = { kind: "text" };
+  if (func === "replace" || func === "substr" || func === "substring") type = { kind: "text" };
   else if (func === "match" || func === "split_to_array" || func === "split_to_table")
     type = { kind: "array", elem: { kind: "text" } };
   // The SRF transport: an array of the per-match text[] captures (the SRF types its column).
@@ -37016,12 +37042,19 @@ export function resolveScalarFunc(
       tys[i] = resolvedTypeOf(st);
     }
   }
+  // The regex overload substring(text, text) (regex.md §8e) runs on the regexFunc node, which owns
+  // pattern precompilation and the regex cost units.
+  if ((name as string) === "substring" && desc.argFamilies.length === 2 && desc.argFamilies[1] === "text") {
+    return regexFuncNode(scope, "substring", -1, rargs, params);
+  }
   // Eval-kernel aliases that share a backing kernel id: `power(x, y)` is PG's name for jed's pow (the
   // name gap, float.md §8); `ceiling` is PG's alias of `ceil` (functions.md §9). The catalog lookup
   // above used the spelled name (both have catalog rows); the kernel reuses pow/ceil.
   let func: ScalarFuncName = name;
   if ((func as string) === "power") func = "pow";
   if ((func as string) === "ceiling") func = "ceil";
+  // gen_random_uuid is PostgreSQL's older name for uuidv4 (entropy.md §3): the same kernel and draws.
+  if ((func as string) === "gen_random_uuid") func = "uuidv4";
   // `substring` is the SQL name of substr (string-functions.md §4); both share the substr kernel.
   if ((func as string) === "substring") func = "substr";
   // `position(string, substring)` — the POSITION(sub IN s) special form's call — shares the strpos
@@ -37493,6 +37526,47 @@ export function elemScalarHint(t: ResolvedType): ScalarType | null {
     default:
       return null;
   }
+}
+
+// resolveArrayTextFunc resolves array_to_string(anyarray, text [, text]) and
+// string_to_array(text, text [, text]) (array-functions.md §15). The text slots take a text hint, so
+// a bare string literal, an untyped NULL, or a bare $N adapts to text; any other type is 42883.
+// array_to_string's first argument must be an array: an untyped operand there leaves the polymorphic
+// type undetermined (42804, PostgreSQL), and a non-array is 42883.
+function resolveArrayTextFunc(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const name = e.name as ArrayFuncName;
+  if (e.args.length !== 2 && e.args.length !== 3) throw noFuncOverload(name);
+  const toString = name === "array_to_string";
+  const untyped = () =>
+    engineError(
+      "datatype_mismatch",
+      "could not determine polymorphic type because input has type unknown",
+    );
+  const rargs: RExpr[] = [];
+  e.args.forEach((a, i) => {
+    if (i === 0 && toString) {
+      // An untyped operand (a bare string literal or $N) cannot bind the polymorphic type.
+      if ((a.kind === "literal" && a.literal.kind === "text") || a.kind === "param") throw untyped();
+      const r = resolve(scope, a, null, ag, params);
+      if (r.type.kind === "null") throw untyped();
+      if (r.type.kind !== "array") throw noFuncOverload(name);
+      rargs.push(r.node);
+      return;
+    }
+    const r = resolve(scope, a, "text", ag, params);
+    if (r.type.kind !== "text" && r.type.kind !== "null") throw noFuncOverload(name);
+    rargs.push(r.node);
+  });
+  const type: ResolvedType = toString
+    ? { kind: "text" }
+    : { kind: "array", elem: { kind: "text" } };
+  return { node: { kind: "arrayFunc", func: name, args: rargs }, type };
 }
 
 // resolveArrayFunc resolves a polymorphic array function call (array-functions.md §3): resolve the

@@ -77,6 +77,10 @@ pub(crate) fn eval_array_func(func: &ArrayFunc, vals: &[Value], m: &mut Meter) -
         ArrayFunc::ArrayCat => array_cat_values(&vals[0], &vals[1]),
         ArrayFunc::ArrayRemove => array_remove_value(&vals[0], &vals[1]),
         ArrayFunc::ArrayReplace => array_replace_value(&vals[0], &vals[1], &vals[2], m),
+        ArrayFunc::ArrayToString => {
+            unreachable!("array_to_string renders in the session zone (eval)")
+        }
+        ArrayFunc::StringToArray => Ok(string_to_array_value(vals)),
         ArrayFunc::ArrayPosition => array_position_value(&vals[0], &vals[1], vals.get(2)),
         ArrayFunc::ArrayPositions => array_positions_value(&vals[0], &vals[1]),
         ArrayFunc::Contains => array_contains_value(&vals[0], &vals[1]),

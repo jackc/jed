@@ -512,6 +512,15 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			}
 			continue
 		}
+		if o.Name == "string_to_array" {
+			// The non-polymorphic array builder (array-functions.md §15), resolver-routed to its
+			// array kernel; its result is the concrete text[].
+			_ = arrayFuncID(o.Name)
+			if o.Result != "text[]" {
+				t.Errorf("string_to_array result code %q", o.Result)
+			}
+			continue
+		}
 		if isArrayFuncName(o.Name) {
 			// A polymorphic array function (array-functions.md §2): its kernel id comes from
 			// arrayFuncID and its result is a reserved poly code or a scalar id.

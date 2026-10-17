@@ -1798,7 +1798,7 @@ func explainScalarFunc(f scalarFunc) string {
 }
 
 func explainArrayFunc(f arrayFunc) string {
-	return [...]string{"array_ndims", "array_length", "array_lower", "array_upper", "cardinality", "array_dims", "array_append", "array_prepend", "array_cat", "array_remove", "array_replace", "array_position", "array_positions", "array_to_json", "contains", "contained_by", "overlaps"}[f]
+	return [...]string{"array_ndims", "array_length", "array_lower", "array_upper", "cardinality", "array_dims", "array_append", "array_prepend", "array_cat", "array_remove", "array_replace", "array_position", "array_positions", "contains", "contained_by", "overlaps", "array_to_string", "string_to_array"}[f]
 }
 
 func explainRangeFunc(f rangeFunc) string {
@@ -1806,7 +1806,7 @@ func explainRangeFunc(f rangeFunc) string {
 }
 
 func explainRegexFunc(f regexFunc) string {
-	return [...]string{"regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr", "regexp_split_to_array", "regexp_matches", "regexp_split_to_table"}[f]
+	return [...]string{"regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr", "regexp_split_to_array", "regexp_matches", "regexp_split_to_table", "substring"}[f]
 }
 
 func explainRangeOp(op rangeOp) string {

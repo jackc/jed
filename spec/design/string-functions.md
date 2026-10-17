@@ -428,8 +428,15 @@ are STRICT and ride the scalar-function mold (§1), except `||`, which has its o
   `substring(x, start[, count])`, with `start = 1` when only `FOR` is given (PostgreSQL's rewrite),
   so it applies to `text` and `bytea` alike and is labelled `substring`. It is recognized only for
   an unquoted `substring` whose first argument is followed by `FROM` or `FOR`; the comma form is an
-  ordinary call. PG's regular-expression forms (`substring(text FROM pattern)`, `SIMILAR … ESCAPE`)
-  are not implemented: they reach `substring(text, text)`, which has no overload (`42883`, ledgered).
+  ordinary call. A **text** `FROM` operand is PostgreSQL's regular-expression form
+  `substring(text FROM pattern)`: it reaches the regex overload `substring(text, text)` ([regex.md](regex.md)
+  §8e), which returns the first match's first capture group, or the whole match when the pattern
+  has no group, and NULL on no match. Overload choice follows [functions.md](functions.md) §9.1: an
+  untyped second argument (a bare string literal, `NULL`, or `$N`) prefers `text`, so
+  `SUBSTRING('hello' FROM '2')` is a regex search (NULL, as in PostgreSQL), while `FROM 2` is the
+  position form. The three-text-argument SQL-standard `SIMILAR … ESCAPE` form
+  (`SUBSTRING(s FROM p FOR esc)`) is excluded with `SIMILAR TO`: it reaches `substring(text, text,
+  text)`, which has no overload (`42883`, ledgered).
 - **`get_byte(bytea, n)` → int** — the `n`-th byte, **0-based**, as an unsigned 0–255. An index
   outside `[0, length − 1]` (negative, or any index into an empty value) traps **`2202E`** with
   PostgreSQL's message, `index n out of valid range, 0..length−1` (`0..-1` for an empty value).
