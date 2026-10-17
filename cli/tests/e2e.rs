@@ -831,3 +831,140 @@ fn a_dbfile_is_not_shadowed_by_the_migrate_verb() {
     assert_eq!((r.code, r.stderr.as_str()), (0, ""));
     assert!(r.stdout.contains("x"), "{}", r.stdout);
 }
+
+/// A directory holding a fake `ssh` that runs its remote command locally (with this build's `jed`
+/// first on `PATH`) and logs the destination and command, so `jed ssh://…` is tested end to end
+/// without reaching any host.
+#[cfg(unix)]
+fn fake_ssh_dir(name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("jed_e2e_{}_{name}_bin", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_jed"), dir.join("jed")).unwrap();
+    let ssh = dir.join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\n\
+         # Fake ssh: skip options up to --, log the destination and command, run it locally.\n\
+         while [ \"$1\" != \"--\" ]; do shift; done\n\
+         shift\n\
+         printf '%s|%s\\n' \"$1\" \"$2\" >> \"$(dirname \"$0\")/log\"\n\
+         shift\n\
+         exec sh -c \"$*\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+#[cfg(unix)]
+fn run_with_path(bin: &std::path::Path, args: &[&str]) -> Run {
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_jed"))
+        .args(args)
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn jed");
+    Run {
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+        code: out.status.code().unwrap(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_url_opens_a_remote_database_through_jed_pages() {
+    let bin = fake_ssh_dir("ssh");
+    // A space and a quote in the path: the remote command must quote it for the remote shell.
+    let db = bin.join("my db's.jed");
+    let db_str = db.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            db_str,
+            "-c",
+            "CREATE TABLE t (a i32 PRIMARY KEY); INSERT INTO t VALUES (1)",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    let url = format!("ssh://app@dbhost:2222{db_str}");
+
+    let r = run_with_path(
+        &bin,
+        &[
+            &url,
+            "-q",
+            "-c",
+            "INSERT INTO t VALUES (2)",
+            "-c",
+            "SELECT a FROM t ORDER BY a",
+        ],
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, " a\n---\n 1\n 2\n(2 rows, cost 5)\n");
+    let log = std::fs::read_to_string(bin.join("log")).unwrap();
+    let first = log.lines().next().unwrap();
+    assert_eq!(
+        first,
+        format!("app@dbhost|jed pages '{}'", db_str.replace('\'', r"'\''"))
+    );
+
+    // --readonly over ssh: reads work, writes fail 25006.
+    let r = run_with_path(
+        &bin,
+        &["--readonly", &url, "-c", "INSERT INTO t VALUES (3)"],
+    );
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("ERROR 25006"), "stderr: {}", r.stderr);
+
+    // The commit landed in the file.
+    let r = run(&[db_str, "-q", "-c", "SELECT count(*) AS n FROM t"], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(r.stdout.contains(" 2\n"), "stdout: {}", r.stdout);
+
+    // A missing remote file is the remote's 58P01.
+    let missing = format!("ssh://dbhost{}", bin.join("missing.jed").display());
+    let r = run_with_path(&bin, &[&missing, "-c", "SELECT 1"]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("ERROR 58P01"), "stderr: {}", r.stderr);
+
+    // --create and a malformed URL are usage errors.
+    let r = run_with_path(&bin, &["--create", &url]);
+    assert_eq!(r.code, 1);
+    let r = run_with_path(&bin, &["ssh://dbhost", "-c", "SELECT 1"]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("bad ssh:// URL"), "stderr: {}", r.stderr);
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
+#[test]
+fn pages_subcommand_rejects_bad_usage() {
+    let r = run(&["pages"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("missing DBFILE"), "stderr: {}", r.stderr);
+    let r = run(&["pages", "--nope", "x.jed"], "");
+    assert_eq!(r.code, 1);
+    // The first frame must be hello: anything else gets a fatal error frame, not SQL output.
+    let db = tmp("pages_garbage.jed");
+    let r = run(&["--create", db.to_str().unwrap()], "");
+    assert_eq!(r.code, 0);
+    let r = run(
+        &["pages", db.to_str().unwrap()],
+        "garbage that is not a frame",
+    );
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.starts_with("jed pages: ERROR"),
+        "stderr: {}",
+        r.stderr
+    );
+    remove_db(&db);
+}

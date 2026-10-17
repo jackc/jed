@@ -6,6 +6,7 @@ mod args;
 mod csv;
 mod dump;
 mod migrate;
+mod remote;
 mod render;
 mod script;
 mod session;
@@ -34,6 +35,11 @@ fn run() -> u8 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("migrate") {
         return migrate::run(&argv[1..]);
+    }
+    // `jed pages DBFILE` (cli.md §8): the remote end of `jed ssh://host/DBFILE`. Like `migrate`, a
+    // reserved first token; a database file named `pages` is reached as `jed ./pages`.
+    if argv.first().map(String::as_str) == Some("pages") {
+        return remote::pages(&argv[1..]);
     }
 
     let parsed = match args::parse(argv.into_iter()) {
@@ -143,6 +149,9 @@ fn open_database(a: &args::Args) -> Result<(jed::Session, String), u8> {
             "memory".to_string(),
         ));
     };
+    if let Some(url) = path.to_str().filter(|p| remote::is_ssh_url(p)) {
+        return open_remote(a, url);
+    }
     let result = if a.create {
         Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(path)),
@@ -174,6 +183,36 @@ fn open_database(a: &args::Args) -> Result<(jed::Session, String), u8> {
             if e.code() == "58P01" {
                 eprintln!("hint: pass --create to make a new database");
             }
+            Err(1)
+        }
+    }
+}
+
+/// Open `jed ssh://[user@]host[:port]/path` (cli.md §8): a page client over `ssh host jed pages
+/// /path`.
+fn open_remote(a: &args::Args, url: &str) -> Result<(jed::Session, String), u8> {
+    if a.create {
+        eprintln!("jed: --create cannot make a database over ssh://; create it on the remote host");
+        return Err(1);
+    }
+    let parsed = match remote::parse_ssh_url(url) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("jed: {e}");
+            return Err(1);
+        }
+    };
+    match remote::open(&parsed, url, a.readonly) {
+        Ok(db) => {
+            let source = if a.readonly {
+                format!("{url} (read-only)")
+            } else {
+                url.to_string()
+            };
+            Ok((db.session(SessionOptions::default()), source))
+        }
+        Err(e) => {
+            eprintln!("ERROR {}: {}", e.code(), e.message);
             Err(1)
         }
     }
