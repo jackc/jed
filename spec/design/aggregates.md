@@ -254,7 +254,7 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   unioned grouping-set rows; `GROUPING()` and window functions coexist in one query (§21).
 - **The in-aggregate `ORDER BY`** (landed) — `json_agg(x ORDER BY y DESC)` folds the input rows in
   key order (§22).
-- **General-purpose aggregates** (landing) — PostgreSQL's boolean, bitwise, collecting, and
+- **General-purpose aggregates** (landed) — PostgreSQL's boolean, bitwise, collecting, and
   statistical aggregates (§23).
 
 ## 11. `FILTER (WHERE cond)` — restricting an aggregate's input rows
@@ -775,8 +775,9 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `regr_r2(y, x)` | two exact / two float | `decimal` / `f64` | the square of the correlation coefficient |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
-their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
-state on the bounded-spill lane is `[bool or NULL]` ([memory.md](memory.md) §6.6).
+their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive
+([determinism.md](determinism.md) §7). Their packed state on the bounded-spill lane is
+`[bool or NULL]` ([memory.md](memory.md) §6.6).
 
 **Bitwise aggregates.** `bit_and`, `bit_or`, and `bit_xor` fold their non-NULL integer inputs with
 the two's-complement bitwise operator and return the input's own type, so they never overflow. They

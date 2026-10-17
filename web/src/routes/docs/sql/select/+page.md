@@ -221,9 +221,13 @@ the first select-list item), each with optional `ASC` / `DESC` and `NULLS FIRST`
 Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
 (`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).
-Beyond `count`, `sum`, `avg`, `min`, and `max`, the aggregates include `bool_and`, `bool_or`, `every`, `bit_and`, `bit_or`, `bit_xor`,
-`array_agg` (`array_agg(name ORDER BY price)`), `string_agg` (`string_agg(name, ', ' ORDER BY name)`), and the statistical `var_pop`, `var_samp`, `variance`, `stddev_pop`,\n`stddev_samp`, `stddev`, `covar_pop`, `covar_samp`, and `corr` — exact over
-integers and `numeric` — with `regr_count`, `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`, `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`.
+Beyond `count`, `sum`, `avg`, `min`, and `max`, the aggregates include `bool_and`, `bool_or`,
+`every`, `bit_and`, `bit_or`, `bit_xor`, `array_agg` (`array_agg(name ORDER BY price)`), `string_agg`
+(`string_agg(name, ', ' ORDER BY name)`), and the statistical `var_pop`, `var_samp`, `variance`,
+`stddev_pop`, `stddev_samp`, `stddev`, `covar_pop`, `covar_samp`, `corr`, and `regr_count`,
+`regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`, `regr_sxy`, `regr_slope`, `regr_intercept`, and
+`regr_r2`. The statistical aggregates are exact over integers and `numeric` (a `numeric` result) and
+follow PostgreSQL's `double precision` algorithms over floats.
 An aggregate's argument list may end in its own `ORDER BY` — the order it folds its input in — which
 is what fixes the element order of `jsonb_agg` / `json_agg` and the last-wins key of
 `jsonb_object_agg` (`jsonb_agg(name ORDER BY price DESC)`, `jsonb_object_agg(k, v ORDER BY ts)`).
