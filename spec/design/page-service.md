@@ -302,6 +302,13 @@ carry everything required.
   a barrier, and advances `txid`. [transactions.md](transactions.md) §2.1 (no mutation,
   no barrier, no `txid` advance) needs an explicit carve-out for it, and it is a distinct delta kind
   in the replication log (§10) and in simulation histories (§15).
+- **Relaxed durability.** Under `synchronous = off` the owner's own commits, its maintenance commits
+  included, batch their barrier ([validated-cow.md](validated-cow.md) §4). A client cannot see the
+  owner's pending set, which a cumulative manifest would have to name, so the owner flushes it before
+  granting a `begin_write`, and every client commit keeps its own barrier at the point of no return:
+  a client's `synchronous` setting does not reach the owner, so the owner treats it as `on`. Close,
+  yield, and shutdown flush before ownership moves; a successor after an owner crash stabilizes the
+  adopted generation as always (validated-cow.md §3).
 - **Compaction** is an ordinary owner operation: it requires the owner's watermark drained (now
   including client pins) and the writer gate, and fails `55006` rather than waiting, as today. After
   the rename, clients' next `begin_read` receives "invalidate all"; a pinned client blocks compaction.

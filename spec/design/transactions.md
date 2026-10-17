@@ -450,12 +450,31 @@ database-level **`synchronous`** setting governs *when* the fsync fires relative
   in the whole-image era; dirty-page write + meta-slot publish + `fsync` in Phase 6). Safe; the
   per-statement cost under autocommit is the familiar SQLite/PG `synchronous_commit = on` cost,
   and the escape hatch is an explicit `BEGIN … COMMIT` (one fsync for many statements).
-- **`off` / relaxed** — a commit is **visible in memory immediately** but the fsync is
-  **batched / deferred** (e.g. on a checkpoint, on `close`, or by a background flush). Faster;
-  a crash may lose the **last few committed transactions** but **never corrupts**, because the
-  on-disk image is always a valid *older* snapshot (the root is published atomically — §2,
-  [storage.md](storage.md) §4). This is the standard `PRAGMA synchronous=OFF` /
-  `synchronous_commit=off` trade.
+- **`off` / relaxed** — a commit is **visible in memory immediately** but its fsync is
+  **batched / deferred**: one later barrier (a *flush*) makes a whole run of commits durable at
+  once. Faster; a power loss or OS crash may lose the **commits acknowledged since the last flush**
+  but **never corrupts**, because the on-disk image always holds a valid *older* snapshot (the root
+  is published atomically — §2, [storage.md](storage.md) §4). This is the standard
+  `PRAGMA synchronous=OFF` / `synchronous_commit=off` trade. **Built** — the protocol, its flush
+  points, and the precise guarantee are [validated-cow.md](validated-cow.md) §4. In short:
+
+  - every relaxed commit writes its pages and meta before it returns (meta last), so a crash of the
+    process alone loses no acknowledged commit;
+  - a flush happens when a batch reaches the **cap** (its pending pages fill one page's worth of
+    manifest entries), on `close`, before a page client's write transaction is granted the owner's
+    gate, and at compaction or the stabilization of an adopted generation; the cap flush runs on a
+    background goroutine/thread in Go and Rust and inline in TypeScript, and the next commit waits for
+    it, so every core writes the same bytes;
+  - while a batch is pending, commits allocate only from the high-water (a page the durable fallback
+    still needs is never overwritten) and their manifests vouch for every page written since the
+    floor, so recovery lands **between the last flush and the newest attempted commit**.
+
+  Results, plans, and cost are identical in both modes; only when the barrier runs differs. The
+  setting is a **handle** setting (`create`/`open`, [api.md](api.md) §2.1), not stored in the file,
+  and applies to the handle's file attachments too; an in-memory database ignores it. There is
+  deliberately **no time-based flush yet**: the interval and its knob are an open decision
+  ([../../TODO.md](../../TODO.md)), so an idle relaxed handle stays undurable until its next cap
+  flush or `close`.
 
 **The seam, default `on`.** The fsync is the single chokepoint at the commit boundary; `off`
 (batching/group-commit) is an additive change behind it and can land later. **Phase 5** kept
@@ -511,22 +530,22 @@ relaxed mode above), never from a weaker flush under `synchronous=on`. Consequen
 benchmarks against default SQLite/PostgreSQL on macOS compare different guarantees
 ([benchmarks.md](benchmarks.md) §8, *Durability caveats*).
 
-**`skip_fsync` — the built dev/testing knob (distinct from `synchronous=off`).** `synchronous=off`
-above is a *durability-preserving* relaxation (batched/deferred fsync, **never corrupts** — a valid
-older snapshot always remains). Realizing it on a copy-on-write engine is subtle: because the durable
-on-disk root would then lag the in-memory one, the allocator must **not reuse a page the lagging
-durable snapshot still references** (else a power loss corrupts the fallback), so it needs a
-durable-watermark-gated reclamation pass — hence "designed, not yet built." The **implemented** knob is
-**`skip_fsync`** (api.md §2.1; Go `.SkipFsync`, TS `{ skipFsync }`): a create/open handle setting that
-makes the per-commit `fdatasync` barriers (and the create-time image + durable-grow fsyncs) **no-ops**.
-A commit writes the *identical bytes in the same order* — byte/cost/result-neutral, and reclamation is
-untouched (it still reclaims exactly as `synchronous=on`, because `skip_fsync` makes no durability
-promise it must protect) — but the
-flush is skipped entirely. So it is **not** "never corrupts": durable across a **process** crash (the
-OS page cache flushes) but **not** an OS crash / power loss — the standard `PRAGMA synchronous=OFF`
-trade, for throwaway/rebuildable databases, bulk loads, and the conformance disk harness (which reopens
-a temp image before every record to exercise the on-disk read path, where the fsync-per-commit was
-~78% of disk-mode wall time). Production that must not lose a commit keeps the default fsync-on path.
+**`skip_fsync` — the dev/testing knob (distinct from `synchronous=off`).** `synchronous=off` above
+is a *durability-preserving* relaxation (deferred fsync, **never corrupts** — a valid older snapshot
+always remains). Realizing it on a copy-on-write engine is subtle — the durable on-disk root lags the
+in-memory one, so the allocator must not reuse a page the lagging durable snapshot still references —
+which is why it carries its own allocation rules ([validated-cow.md](validated-cow.md) §4).
+**`skip_fsync`** (api.md §2.1; Go `.SkipFsync`, TS `{ skipFsync }`) is different: a create/open handle
+setting that makes the per-commit `fdatasync` barriers (and the create-time image + durable-grow
+fsyncs) **no-ops**. A commit writes the *identical bytes in the same order* — byte/cost/result-neutral,
+and reclamation is untouched (it still reclaims exactly as `synchronous=on`, because `skip_fsync` makes
+no durability promise it must protect) — but the flush is skipped entirely. So it is **not** "never
+corrupts": durable across a **process** crash (the OS page cache flushes) but **not** an OS crash /
+power loss, for throwaway/rebuildable databases, bulk loads, and the conformance disk harness (which
+reopens a temp image before every record to exercise the on-disk read path, where the
+fsync-per-commit was ~78% of disk-mode wall time). Production that must not lose a commit keeps the
+default fsync-on path; production that can lose the last few commits but never its file uses
+`synchronous=off`.
 
 ## 10. Concurrency mechanism & the testing split
 
@@ -661,9 +680,15 @@ a")` drives the same mechanism ([api.md](api.md) §2.2).
   (bbolt's model), holding it across any read-only prologue. Deferring acquisition until the
   first write (more read concurrency) is a future optimization; not foreclosed, but it carries
   upgrade/deadlock hazards a single up-front grab avoids.
-- **Group-commit / async durability** — the `synchronous=off` batching machinery beyond the
-  seam (background flusher, fsync coalescing across concurrent committers) is deferred (§9). The
-  seam is built; the policy is not.
+- **Group-commit / async durability** — the `synchronous=off` batching machinery is built (§9,
+  [validated-cow.md](validated-cow.md) §4): the batch cap, the background cap flush, and fsync
+  coalescing across every committer of the handle (its sessions on any thread, and its owner-side
+  maintenance commits) — successive commits share one barrier. Still open: a **time-based** flush
+  (its interval and knob are undecided), and coalescing for page clients' commits (a client's
+  `synchronous` setting does not reach the owner, which barriers every client commit). Under
+  `synchronous=on` a commit holds the writer gate through its barrier, as PostgreSQL makes a commit
+  visible only once durable; overlapping the next writer with that barrier would need it to build on
+  an unpublished snapshot (early lock release), which is not foreclosed and not planned.
 - **MVCC / multiple concurrent committed versions** — explicitly **not** this (CLAUDE.md §3):
   one committed version plus one working set, period.
 - **Isolation levels other than snapshot** — no `SET TRANSACTION ISOLATION LEVEL`; snapshot

@@ -87,12 +87,61 @@ func (p *pager) abandonValidatedCommit() {
 	p.commitInProgress = false
 }
 
-func (p *pager) finishValidatedCommit(m []byte) {
+// finishValidatedCommit records a commit whose meta m was written to slot. durable is whether its
+// barrier ran (synchronous = on, or a page client's commit): the meta is then the floor and nothing is
+// pending. A relaxed commit instead adds its own dirty entries to the pending set (validated-cow.md §4).
+func (p *pager) finishValidatedCommit(m []byte, slot uint32, durable bool, dirty []manifestEntry) {
 	p.validatedMeta = append(p.validatedMeta[:0], m...)
 	// Rebuild protection when a shared reload next parses this locally-published root.
 	p.manifestProtected = nil
 	p.recoverySync = false
 	p.commitInProgress = false
+	if durable {
+		p.floorSlot = slot
+		p.pending = nil
+		return
+	}
+	if p.pending == nil {
+		p.pending = make(map[uint32]uint64, len(dirty))
+	}
+	for _, e := range dirty {
+		p.pending[e.index] = e.digest
+	}
+}
+
+// commitSlot is the meta slot the next commit writes: the one not holding the floor (format.md, *Slot
+// alternation*). Under synchronous = on this is txid & 1.
+func (p *pager) commitSlot() uint32 { return p.floorSlot ^ 1 }
+
+// pendingEntries is the pending set in page order (validated-cow.md §4).
+func (p *pager) pendingEntries() []manifestEntry {
+	entries := make([]manifestEntry, 0, len(p.pending))
+	for id, digest := range p.pending {
+		entries = append(entries, manifestEntry{index: id, digest: digest})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].index < entries[j].index })
+	return entries
+}
+
+// flushPending is a flush (validated-cow.md §4): one durable barrier makes every pending commit
+// durable, so the newest meta — in the non-floor slot — becomes the floor. A failed barrier poisons the
+// pager (sync), so the next commit and close report it.
+func (p *pager) flushPending() error {
+	if len(p.pending) == 0 {
+		return nil
+	}
+	if err := p.sync(); err != nil {
+		return err
+	}
+	p.floorSlot ^= 1
+	p.pending = nil
+	return nil
+}
+
+// batchCapReached reports whether the pending set fills the inline manifest of one meta page: the
+// batch cap, after which a flush follows (validated-cow.md §4).
+func (p *pager) batchCapReached() bool {
+	return len(p.pending) >= manifestInlineCapacity(int(p.pageSize))
 }
 
 func (p *pager) selectValidatedMeta() (meta, error) {
@@ -105,14 +154,17 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 		return meta{}, err
 	}
 	blocks := [][]byte{b0, b1}
+	slots := []uint32{0, 1}
 	if a, ok := parseMeta(b0); ok {
 		if b, ok := parseMeta(b1); ok && b.txid > a.txid {
 			blocks[0], blocks[1] = b1, b0
+			slots[0], slots[1] = 1, 0
 		}
 	} else {
 		blocks[0], blocks[1] = b1, b0
+		slots[0], slots[1] = 1, 0
 	}
-	for _, raw := range blocks {
+	for k, raw := range blocks {
 		m, ok := parseMeta(raw)
 		if !ok || m.pageCount > p.allocatedPages {
 			continue
@@ -133,6 +185,16 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 			adopted := !bytes.Equal(raw, p.validatedMeta)
 			p.validatedMeta = append(p.validatedMeta[:0], raw...)
 			p.recoverySync = p.recoverySync || (adopted && m.dirtyCount != 0)
+			if adopted {
+				// The adopted generation is the floor once stabilized (validated-cow.md §3–§4). When both
+				// slots carry its txid (create, compaction), the floor slot is txid & 1, so the next commit
+				// writes the other slot exactly as txid parity would.
+				p.floorSlot = slots[k]
+				if other, ok := parseMeta(blocks[1-k]); ok && other.txid == m.txid {
+					p.floorSlot = uint32(m.txid & 1)
+				}
+				p.pending = nil
+			}
 		}
 		return m, nil
 	}
@@ -209,10 +271,26 @@ func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
 	return valid, nil
 }
 
+// manifestEntry is one manifest record: a page id and the CRC-64 of its complete encoded bytes.
+type manifestEntry struct {
+	index  uint32
+	digest uint64
+}
+
+// manifestEntriesOf digests written pages for a manifest.
+func manifestEntriesOf(pages []dirtyPage) []manifestEntry {
+	entries := make([]manifestEntry, len(pages))
+	for i, pg := range pages {
+		entries[i] = manifestEntry{index: pg.index, digest: commitCRC64(0, pg.bytes)}
+	}
+	return entries
+}
+
 // commitManifest encodes the fixed meta inline region and the reserved overflow
-// chain. The dirty set includes free-list pages, but not the manifest itself.
-func commitManifest(ps uint32, txid uint64, root, pageCount, head, livePages uint32, dirty []dirtyPage, manifestIDs []uint32) ([]byte, []dirtyPage) {
-	ordered := append([]dirtyPage(nil), dirty...)
+// chain. The entries include free-list pages, but not the manifest itself; under
+// batched durability they also include the pending set (validated-cow.md §4).
+func commitManifest(ps uint32, txid uint64, root, pageCount, head, livePages uint32, entries []manifestEntry, manifestIDs []uint32) ([]byte, []dirtyPage) {
+	ordered := append([]manifestEntry(nil), entries...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
 	meta := metaPage(ps, txid, root, pageCount, head, livePages)
 	binary.BigEndian.PutUint32(meta[40:], uint32(len(ordered)))
@@ -220,10 +298,10 @@ func commitManifest(ps uint32, txid uint64, root, pageCount, head, livePages uin
 	if len(manifestIDs) > 0 {
 		binary.BigEndian.PutUint32(meta[36:], manifestIDs[0])
 	}
-	encode := func(b []byte, records []dirtyPage) {
-		for i, pg := range records {
-			binary.BigEndian.PutUint32(b[i*12:], pg.index)
-			binary.BigEndian.PutUint64(b[i*12+4:], commitCRC64(0, pg.bytes))
+	encode := func(b []byte, records []manifestEntry) {
+		for i, e := range records {
+			binary.BigEndian.PutUint32(b[i*12:], e.index)
+			binary.BigEndian.PutUint64(b[i*12+4:], e.digest)
 		}
 	}
 	inline := min(len(ordered), manifestInlineCapacity(int(ps)))
@@ -260,10 +338,15 @@ type validatedCommitPlan struct {
 	free            []uint32
 	pageCount, live uint32
 	generation      uint64
+	// dirty is the commit's own manifest entries (its body and free-list pages), which a relaxed commit
+	// adds to the pending set (validated-cow.md §4).
+	dirty []manifestEntry
 }
 
-func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse bool, livePages uint32) (validatedCommitPlan, error) {
-	candidates, live, gen, err := freeListCandidates(snap, paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim)
+// planValidatedCommit plans the free list and manifest. pending is the batch's pending set (nil under
+// synchronous = on): its pages join the manifest and stay off the free list (validated-cow.md §4).
+func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse bool, livePages uint32, pending []manifestEntry) (validatedCommitPlan, error) {
+	candidates, live, gen, err := freeListCandidates(snap, paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending)
 	if err != nil {
 		return validatedCommitPlan{}, err
 	}
@@ -300,16 +383,17 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		if err != nil {
 			return validatedCommitPlan{}, err
 		}
-		left := max(0, len(write.pages)+len(fl)-manifestInlineCapacity(ps))
+		left := max(0, len(pending)+len(write.pages)+len(fl)-manifestInlineCapacity(ps))
 		required := (left + manifestOverflowCapacity(ps) - 1) / manifestOverflowCapacity(ps)
 		if required > reserved {
 			reserved = required
 			continue
 		}
-		dirty := make([]dirtyPage, 0, len(write.pages)+len(fl))
-		dirty = append(dirty, write.pages...)
-		dirty = append(dirty, fl...)
-		meta, overflow := commitManifest(pageSize, snap.txid, write.rootPage, pc, head, livePages, dirty, ids)
-		return validatedCommitPlan{pages: append(fl, overflow...), meta: meta, free: free, pageCount: pc, live: live, generation: gen}, nil
+		dirty := make([]manifestEntry, 0, len(write.pages)+len(fl))
+		dirty = append(dirty, manifestEntriesOf(write.pages)...)
+		dirty = append(dirty, manifestEntriesOf(fl)...)
+		entries := append(append(make([]manifestEntry, 0, len(pending)+len(dirty)), pending...), dirty...)
+		meta, overflow := commitManifest(pageSize, snap.txid, write.rootPage, pc, head, livePages, entries, ids)
+		return validatedCommitPlan{pages: append(fl, overflow...), meta: meta, free: free, pageCount: pc, live: live, generation: gen, dirty: dirty}, nil
 	}
 }

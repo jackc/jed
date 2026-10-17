@@ -114,6 +114,21 @@ module SimPlant
                "commitDurable(snap, false, r.client.reuseGrant, budget)",
                "commitDurable(snap, true, true, budget)"]]
     ),
+    # Batched durability (validated-cow.md §4; simulation-testing.md §14 S9).
+    Plant.new(
+      name: "relaxed-parity-slot",
+      protection: "a pending commit writes the slot that does not hold the floor (validated-cow.md §4 rule 1)",
+      profile: "relaxed",
+      edits: [["impl/go/validated_commit.go",
+               "func (p *pager) commitSlot() uint32 { return p.floorSlot ^ 1 }",
+               "func (p *pager) commitSlot() uint32 { return uint32(binary.BigEndian.Uint64(p.validatedMeta[12:20])+1) & 1 }"]]
+    ),
+    Plant.new(
+      name: "relaxed-reuse",
+      protection: "a commit inside a relaxed batch never reuses the free list (validated-cow.md §4 rule 3)",
+      profile: "relaxed",
+      edits: [["impl/go/shared.go", "canReuse = canReuse && !pending", "canReuse = canReuse || pending"]]
+    ),
   ].freeze
 
   module_function

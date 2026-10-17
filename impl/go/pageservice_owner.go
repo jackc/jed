@@ -237,8 +237,9 @@ func (o *pageServiceOwner) start() error {
 	return nil
 }
 
-// readCommittedMeta reads the meta slot that published txid. Every commit writes slot txid & 1, so it
-// is the one to read; the parse check guards a slot a later commit already overwrote.
+// readCommittedMeta reads the meta slot that published txid. A commit writes slot txid & 1 unless a
+// relaxed batch put it in the other slot (format.md, *Slot alternation*), so both are tried; the parse
+// check guards a slot a later commit already overwrote.
 func readCommittedMeta(paging *sharedPaging, txid uint64) ([]byte, error) {
 	var meta []byte
 	err := paging.withPager(func(p *pager) error {
@@ -262,10 +263,14 @@ func readCommittedMeta(paging *sharedPaging, txid uint64) ([]byte, error) {
 func (o *pageServiceOwner) seedResolution(paging *sharedPaging, txid uint64, meta []byte) {
 	if txid > 0 {
 		_ = paging.withPager(func(p *pager) error {
-			block, err := p.readBlock(uint32(txid&1) ^ 1)
-			if err == nil {
+			for slot := uint32(0); slot < 2; slot++ {
+				block, err := p.readBlock(slot)
+				if err != nil {
+					continue
+				}
 				if m, ok := parseMeta(block); ok && m.txid == txid-1 {
 					o.resolution = append(o.resolution, psResolution{txid: m.txid, digest: commitCRC64(0, block)})
+					break
 				}
 			}
 			return nil
@@ -897,6 +902,20 @@ func (sc *psServerConn) waitForGate(requestID uint32, m psBeginWrite) {
 	o := sc.owner
 	c := o.core
 	err := o.acquireGate(m.lockTimeoutMs, sc.done)
+	if err == nil {
+		// The owner's own relaxed commits are flushed before a client plans against the committed meta:
+		// a client cannot name the owner's pending set in its manifest (README.md §3.5). A failed flush
+		// poisons the owner, which stops serving.
+		st := c.storage
+		st.mu.Lock()
+		ferr := st.flush()
+		st.mu.Unlock()
+		if ferr != nil {
+			o.releaseGate()
+			err = ferr
+			go o.stopServing()
+		}
+	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	sc.waiting = false
@@ -1173,13 +1192,16 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 	o.commitMu.Lock()
 	st.mu.Lock()
 	err := st.paging.withPager(func(p *pager) error {
-		if err := p.writeBlock(uint32(d.txid&1), d.meta); err != nil {
+		// The slot not holding the committed meta, which the begin_write flush made the floor
+		// (README.md §3.5); a client commit always keeps its own barrier.
+		slot := p.commitSlot()
+		if err := p.writeBlock(slot, d.meta); err != nil {
 			return err
 		}
 		if err := p.sync(); err != nil {
 			return err
 		}
-		p.finishValidatedCommit(d.meta)
+		p.finishValidatedCommit(d.meta, slot, true, nil)
 		p.manifestProtected = d.protected
 		return nil
 	})

@@ -36,6 +36,7 @@ module SimGen
     "temp_buffers" => [0],
     "max_query_memory_bytes" => [0],
     "max_storage_bytes" => [0],
+    "synchronous" => ["on"],
     "steps" => 300,
     "max_tables" => 3,
     "max_rows" => 300,
@@ -177,6 +178,10 @@ module SimGen
         # (54P06, or a 54P05 that aborted the block), so every commit is as uncertain as a faulted one.
         @limited ||= value.positive? && !%w[work_mem temp_buffers].include?(knob)
       end
+      # The durability mode (validated-cow.md §4). Drawn like the handle settings above, so a profile
+      # that leaves it at "on" generates exactly the traces it did before the mode existed.
+      synchronous = knob_value(@p["synchronous"])
+      header << "# synchronous: #{synchronous}" if synchronous != "on"
       header << "# processes: service" if @service
       header << "# clock: 1700000000000000"
       bootstrap

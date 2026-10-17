@@ -171,6 +171,7 @@ func openServiceWith(h *serviceHandoff, claim bool) (*Database, error) {
 		c.handoff = h
 		h.attachHost(c)
 		c.storage.budget.limit = opts.MaxStorageBytes
+		c.storage.relaxed = opts.Synchronous == SynchronousOff
 		r := &serviceRole{gen: 1, client: election.client}
 		c.installRole(r, e)
 		c.watchClient(r)
@@ -196,6 +197,7 @@ func startServiceOwner(e *engine, coord *fileCoordinator, h *serviceHandoff) (*D
 	c.handoff = h
 	h.attachHost(c)
 	c.storage.budget.limit = h.opts.MaxStorageBytes
+	c.storage.relaxed = h.opts.Synchronous == SynchronousOff
 	o, err := newPageServiceOwner(c, e.paging, e.committed.txid, h, coord)
 	if err != nil {
 		_ = e.paging.close()

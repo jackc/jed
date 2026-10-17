@@ -147,7 +147,85 @@ re-reads meta. A page client's commit is validated by the owner before it is wri
 ([page-service.md](page-service.md) §5.6). The owner's fast path retains zero foreground
 coordination syscalls and zero per-transaction meta reads.
 
-## 4. Integration and verification
+## 4. Batched durability (`synchronous = off`)
+
+Under the relaxed `synchronous` mode ([transactions.md](transactions.md) §9) a commit is atomic and
+visible as soon as its meta is written, but its durable barrier is deferred: one later barrier, a
+**flush**, makes a whole run of commits durable at once. The protocol above needs four extra rules,
+because the meta of a commit that is not yet durable must not overwrite the only durable fallback,
+and the manifest of the newest meta must vouch for every page written since that fallback.
+
+Each durable file domain (the main file, each writable file attachment) keeps two facts in memory:
+
+- the **floor**: the newest generation known durable, and the meta slot that holds it;
+- the **pending set**: the page id and CRC-64 digest of every body page (tree, catalog, overflow,
+  GiST, and free-list pages — never meta or manifest pages) written by a commit after the floor.
+
+The rules:
+
+1. **Slot.** A commit writes its meta to the slot that does **not** hold the floor. When nothing is
+   pending, the floor is the previous generation, so this alternates exactly as `txid & 1` does under
+   `synchronous = on`; while commits are pending, every one of them overwrites the same non-floor
+   slot. At open the floor slot is the slot of the selected candidate, or slot `txid & 1` when both
+   slots carry the selected `txid` (`create`, compaction). An adopted generation is stabilized before
+   the first write (§3), so it is the floor by then.
+2. **Cumulative manifest.** A commit's manifest lists the pending set plus its own dirty pages, in
+   page order. A meta that validates therefore proves every page written since the floor that it
+   could depend on, not only its own.
+3. **No reuse while pending.** A commit that begins with a non-empty pending set allocates every
+   page — tree, catalog, free-list chain, and manifest — from the high-water, never from the free
+   list. So no page is written twice between two flushes: each pending digest stays exact, and no
+   dependency of the floor, nor of any pending generation, is ever overwritten. The first commit
+   after a flush plans exactly as under `synchronous = on`.
+4. **Free-list exclusion.** A commit's persisted free list excludes the whole pending set, since
+   every pending page is a dependency of its manifest. Reclamation still runs; a page orphaned
+   during a batch is listed by the first reclamation after the floor moves past it.
+
+A relaxed commit writes its pages and meta as usual and publishes **without** the barrier. A
+**flush** executes the host's ordinary durable `sync`; on success the floor becomes the newest
+generation (in the slot it was written to) and the pending set empties. The flush points:
+
+- **The batch cap.** When a commit leaves the pending set with at least
+  `I = floor((page_size − 64) / 12)` entries — the inline manifest capacity (§2) — the batch ends
+  with it and a flush follows. The cap bounds a pending commit's manifest, the pages recovery
+  validates, and the growth that rule 3 defers, to about one page's worth of entries; at 4 KiB pages
+  a one-row commit dirties three or four pages, so one barrier serves about a hundred commits.
+- **Close** (and detaching a file attachment) flushes before releasing the file; a failed flush is
+  the error `close` reports.
+- **A page client's `begin_write`.** The owner flushes before granting the gate
+  ([page-service.md](page-service.md) §6), so a client plans against a durable floor with its own
+  manifest only (the client cannot see the owner's pending set).
+- **Compaction** writes a new, already durable image and empties the pending set; any trailing
+  truncation of the file likewise runs only when nothing is pending.
+- **Stabilization** of an adopted generation (§3) is a flush.
+
+The cap flush may run **in the background** (a goroutine in Go, a thread in Rust): the commit that
+reached the cap returns at once, and the domain's next commit, compaction, flush, or close first waits
+for that barrier to finish. TypeScript runs it inline, since its engine has no second thread, and so
+does the deterministic simulator in every core. Because every later commit plans only after the
+flush completes, which commits a flush covers, which slot each meta lands in, and every page id are
+functions of the commit sequence alone — the same in every core and with or without the background
+thread. Background flushing changes only *when* the barrier runs.
+
+A flush that fails poisons the handle like any failed barrier: the next commit and `close` report it.
+The commit that reached the cap is already published, so a failed cap flush does not fail it. A
+failed barrier may also have dropped pending pages from the operating system's cache (Linux
+"fsyncgate"), so pages the published snapshot needs could now read stale: the cap flush therefore
+**revokes** the storage, and every later read fails `58030` too until the database is reopened through
+recovery — never `XX001` or wrong rows.
+
+**Guarantee.** After a power loss or an OS crash, recovery selects a generation between the floor —
+the newest generation a flush, a close, a stabilization, or an acknowledged `synchronous = on` commit
+made durable — and the newest commit attempted. Acknowledged commits after the floor may be lost,
+newest first, but a recovered generation is always one complete committed snapshot: the rules above
+keep the floor's own dependencies intact and reject any newer meta whose pending pages did not all
+land, so atomicity is never lost and recovery never fails with `XX001`. Every relaxed commit has
+issued all of its writes to the operating system, meta last, before it returns, so a crash of the
+process alone, with the kernel surviving, loses no acknowledged commit. (The simulator's process-crash
+model lets each write of the crashing step be issued or not independently, which is more pessimistic;
+it checks only the floor.)
+
+## 5. Integration and verification
 
 The manifest hashes encoded logical pages at the existing pager seam. A future encryption
 decorator must continue exposing exactly those bytes after decryption; the protocol makes
