@@ -99,9 +99,9 @@ The account is **live**: a reservation adds bytes, a release returns them. A
 reservation succeeds if `used + bytes <= limit` (equality allowed, overflow-safe as
 in §1); otherwise the statement fails with `54P05 query_memory_limit_exceeded`
 ("query memory exceeded the limit of N bytes"). Only reservations can fail; a
-release never errors and never takes `used` below the balance the account opened
-with (zero, or the transaction's pending writes, §7) — a release past it is an
-accounting bug, clamped and counted by the conformance runners.
+release never errors and never takes `used` below the pending writes the account
+holds (zero without a transaction, §7) — a release past it is an accounting bug,
+clamped and counted by the conformance runners.
 
 Scope and lifetime follow the scalar allowance: one account per SQL statement,
 shared by every internal meter of that statement (subqueries, CTE parts, set-op
@@ -175,7 +175,7 @@ It is filled in by owner class:
 | Slice | Owner | Status |
 |---|---|---|
 | Q1 | **Rows** — row buffers of statement execution and engine result collectors | implemented |
-| Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`json_agg`/`jsonb_agg` and the other JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition state, columnar lanes, spill spools' resident buffers, recursive-CTE dedup sets | implemented (§6) |
+| Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`json_agg`/`jsonb_agg` and the other JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition state, columnar lanes, spill spools' resident buffers, recursive-CTE dedup sets, and the transient state of §6.8 (collation decorations, window operand caches, merge-heap heads) | implemented (§6) |
 | Q3 | **Pending writes** — the stored bytes a transaction stages, surviving statement boundaries and released at commit/rollback | implemented (§7) |
 | Q4 | **Storage** — database-owned: committed in-memory storage under `max_storage_bytes`; page caches stay under `cache_bytes`, evict-only | Q4a implemented (§8) |
 
@@ -485,14 +485,44 @@ grows and nothing is charged on the error's way out. The set-operation combine a
 the recursive CTE run between their parts' meters and reserve against the account
 directly, as their Q1 reservations do.
 
-### 6.8 Not covered
+### 6.8 Transient state
 
-Q2 leaves these transient, input-proportional allocations outside the account:
-collation sort-key decorations (computed from already-charged text), a window
-frame's cached operand values, merge-heap heads of spilled runs, the index lists
-that partition or permute an already-charged buffer, and the per-row key
-encodings a hash probe computes and discards. They are bounded by charged state
-times a small factor; they are guardrail overshoot, not unbounded growth.
+Some operators build short-lived state beside what they already hold: the collation sort keys a
+collated sort decorates its input with, a window's cache of evaluated operands, and the head rows
+an external merge reads back from its runs. Each is proportional to charged input, but together
+they can hold a multiple of it, so they are charged too:
+
+| Owner | Reserve | Release |
+|---|---|---|
+| **Collation decorations** of an eager collated sort — `ORDER BY` (the eager sort and the collated survivor buffer, §6.4) and a set operation's `ORDER BY` | `sort_key_bytes(keys)` per row, after its keys are built | all of them, once the rows are undecorated (sorted) |
+| Collation decorations of a collated **top-k heap** | `sort_key_bytes(keys)` per retained row, after the row's own reservation (if any, §6.4) | an evicted row's, after its replacement is reserved (and after the evicted row's own release); the rest once the heap is sorted |
+| Collation decorations of a collated **window** order (window.md §5) | `sort_key_bytes(keys)` per row, as each shared partition/sort group's keys are built (after that group's partition entries) | with the partition tables, when the window stage completes |
+| Collation decorations of an ordered-set aggregate's collated `WITHIN GROUP` finalize sort (`mode`, `percentile_disc`) | `sort_key_bytes([key])` per retained input, as its key is built | all of them, once the inputs are sorted |
+| A window's **operand cache**: `lag`/`lead` and `first_value`/`last_value`/`nth_value` evaluate their value operand for every row of the partition; an aggregate over an explicit frame caches each operand the first time a frame visits it | `value_bytes(operand)` as each operand is evaluated into the cache | all of the partition's, once its results are computed (for an aggregate, after the accumulator's own release) |
+| **Merge-heap heads** of an external sort's spilled runs (spill.md §4) | `row_bytes(head)` as a head read from a run file enters the heap (the final in-memory buffer's rows are already charged with it, so its heads reserve nothing) | when the head is popped, after the next head of the same run is reserved |
+
+```
+sort_key_bytes(keys) = Σ (VALUE + length(k)) over the non-NULL collated keys k
+```
+
+A sort key is measured as the `bytea` value it is (§3); a NULL key (a NULL collated slot) holds no
+key and counts nothing. The bounded-spill lane's own collated sorts already carry their keys inside
+spool and sorter elements (§6.6), as do in-aggregate `ORDER BY` tuples (§6.3), so they add nothing
+here.
+
+The decorations and operand caches are not spill structures: a rejected reservation fails `54P05`
+under the cost-first rule (§6.7). Merge-heap heads belong to a spill structure that has already
+spilled everything it can, so a head the account rejects is held uncharged instead, like a
+spill structure's rejected element (§6.6). That overshoot is at most one row per run, and a sorter
+keeps at most one run per bit of the machine word (spill.md §4), so a budget below `work_mem`
+still never fails a sort. The binary compaction that merges two runs while the sort is still
+reading input charges its two heads the same way.
+
+**Not covered.** The index lists that partition or permute an already-charged buffer, a per-spec
+copy of shared window keys, the per-row key encodings a hash probe computes and discards, and the
+values a window computes before it appends them as results (§5.1, charged when appended). They
+are bounded by charged state times a small factor; they are guardrail overshoot, not unbounded
+growth.
 
 ## 7. Q3: pending writes
 
@@ -511,6 +541,7 @@ adds its **stored bytes**:
 
 ```
 stored_bytes(record) = record_size + Σ chain_payload(externalized value)
+pending(transaction) = Σ stored_bytes(v) over the versions v it wrote that its working state still holds
 ```
 
 `record_size` is the record's on-disk size ([format.md](../fileformat/format.md)
@@ -519,14 +550,19 @@ raw bytes when stored external-plain and its compressed block when stored
 external-compressed ([large-values.md](large-values.md) §2). Each secondary, GIN,
 or GiST index entry is a record of its own. Both terms are fixed by the file
 format's byte contract, so for a given page size the measure is cross-core
-identical and independent of leaf state and of in-memory versus file backing. A
-delete stages nothing.
+identical and independent of leaf state and of in-memory versus file backing.
 
-The balance is **cumulative** within a transaction: replacing a row stages a new
-version, charged again, though the pending set keeps only the latest. Q3 bounds a
-transaction's write volume, not the net residency of its dirty pages. Dirty-page
-amplification — a small update decodes a whole leaf — stays outside the account;
-it is bounded by the page reads the write performed, which `max_cost` meters.
+The balance is **net**: it counts only the versions the transaction's working state still holds.
+Each store remembers, per key, the stored bytes of the version written since the store was last
+published (by a commit). A write that replaces such a version returns its bytes as it adds the new
+one's, and a delete returns them; so rewriting one row many times holds one version, and deleting
+a row the transaction inserted holds nothing. Replacing or deleting a *committed* version returns
+nothing, since the transaction never charged it, and a delete stages nothing. A store that is
+replaced whole (a table rewrite, `DROP`) takes its staged versions with it. The per-key record is
+itself transient state of the pending set, proportional to it and not charged.
+
+Dirty-page amplification — a small update decodes a whole leaf — stays outside the account; it is
+bounded by the page reads the write performed, which `max_cost` meters.
 
 ### 7.2 Lifetime
 
@@ -546,6 +582,16 @@ Under a finite budget:
 
 - **Each statement's account opens holding the transaction's pending bytes**, so
   its reservations (§5, §6) must fit beside them.
+- **After each write phase**, the account brings the pending bytes it holds to the
+  transaction's current pending bytes: growth is reserved (and can fail `54P05`, cost
+  first, §2), a shrink is returned. A write phase is the moment a DML step has
+  written its rows and their index entries: an `INSERT`'s rows (the `VALUES` fast
+  path's single row too), an upsert's inserts and updates, an `UPDATE`'s new
+  versions, and a `DELETE`'s removals. It runs before the step's foreign-key actions,
+  which are write phases of their own, as is each data-modifying CTE sub-statement.
+  Rows the statement still holds then — `RETURNING` results, the source rows of
+  `INSERT … SELECT` (§5.3), an outer statement's buffers — are charged beside the
+  writes, so the statement needs both.
 - **After each successful statement** — every statement inside an explicit block,
   and an autocommit write before it commits — the transaction's pending bytes alone
   must fit the budget, or the statement fails `54P05`. Cost wins (§2): a statement
@@ -553,12 +599,12 @@ Under a finite budget:
   instead. The failure is an ordinary statement failure: an autocommit write
   commits nothing, and an explicit block enters the failed state.
 
-Both count toward the statement's peak, so in memory mode a record's peak is still
-its minimal passing budget. Like `max_temp_storage_bytes`, the check runs at the statement
-boundary: within one statement, writes are bounded by `max_cost` and by the Q1
-buffers that feed them (INSERT … SELECT keeps its source rows charged), and they
-are checked once the statement completes. Thresholds are pinned by
-`resource/query_memory_pending.test`.
+All count toward the statement's peak, so in memory mode a record's peak is still
+its minimal passing budget. The end-of-statement check covers the writes that are not a DML
+write phase — an index build, a table rewrite — which are checked once their statement
+completes. Within a write phase, writes are bounded by `max_cost` and by the buffers that feed
+them: every row a phase writes was already built (and its source charged) before the phase
+began. Thresholds are pinned by `resource/query_memory_pending.test`.
 
 ## 8. Q4: storage
 
@@ -663,9 +709,9 @@ holds, tried in this order:
    last commit), there is no forced compaction; closing the old readers is the
    remedy. The walk is O(pages), but it only runs on a commit that would otherwise
    fail.
-3. **The repair exemption:** the commit stages no record version (§7.1 — pure
-   `DELETE`s and drops; `UPDATE`, upserts, and FK actions that write rows all
-   stage) and rewrites no more catalog pages than the last commit did. Copy-on-write
+3. **The repair exemption:** the commit holds no staged record version (§7.1 — pure
+   `DELETE`s and drops, and rows the transaction wrote and deleted again; `UPDATE`,
+   upserts, and FK actions that write rows all stage) and rewrites no more catalog pages than the last commit did. Copy-on-write
    needs fresh pages for a delete's new path *before* the old path is dead, so
    without this rule a database at its limit could never delete its way back. The
    catalog clause keeps empty-object DDL (`CREATE TABLE` with no rows) from growing

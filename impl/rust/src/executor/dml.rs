@@ -1640,6 +1640,7 @@ impl Engine {
                 }
             }
         }
+        self.sync_pending_writes(meter)?;
         Ok(returned)
     }
 
@@ -1830,6 +1831,7 @@ impl Engine {
                 }
             }
         }
+        self.sync_pending_writes(meter)?;
         Ok(returned)
     }
 
@@ -2471,6 +2473,7 @@ impl Engine {
                 }
             }
         }
+        self.sync_pending_writes(meter)?;
         self.apply_fk_update_actions(
             &fk_parent,
             &fk_updates,
@@ -3522,6 +3525,7 @@ impl Engine {
                 istore.remove(ek)?;
             }
         }
+        self.sync_pending_writes(&mut meter)?;
         if !matched.is_empty() {
             self.mark_estimator_mutation(del.db.as_deref(), &del.table);
         }
@@ -4275,6 +4279,7 @@ impl Engine {
                 }
             }
         }
+        self.sync_pending_writes(&mut meter)?;
         if !updates.is_empty() {
             self.mark_estimator_mutation(upd.db.as_deref(), &upd.table);
         }

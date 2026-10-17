@@ -21,7 +21,7 @@ import type {
   WindowSpec,
 } from "./executor.ts";
 import type { FrameExclusion } from "./ast.ts";
-import { type Meter, StateCharge } from "./cost.ts";
+import { type Meter, type QueryAccount, StateCharge } from "./cost.ts";
 import {
   cloneAcc,
   cmpBytes,
@@ -36,7 +36,7 @@ import {
   unfoldAcc,
 } from "./executor.ts";
 import { COSTS } from "./costs.ts";
-import { entryBytes, rowBytes } from "./memsize.ts";
+import { entryBytes, rowBytes, sortKeyBytes, valueBytes } from "./memsize.ts";
 import { engineError } from "./errors.ts";
 import { intervalCmp } from "./interval.ts";
 import { rangeTotalCmp } from "./range.ts";
@@ -517,7 +517,9 @@ export function applyWindowStage(
     }
     // Collated UCA sort-key bytes for the shared order's collated slots (window.md §3/§5); null
     // when no key is collated, an unmapped code point throws 0A000 here.
-    const collKeys = windowCollKeys(rows, rep.order);
+    const built = windowCollKeys(rows, rep.order, meter);
+    if (built !== null) partCharge += built.charged;
+    const collKeys = built === null ? null : built.keys;
     // Sort each partition by the shared window ORDER BY. Array#sort is stable, so a full tie keeps
     // ascending original index = PK scan order (the §3 PK tie-break).
     if (rep.order.length > 0) {
@@ -632,9 +634,14 @@ export function applyWindowStage(
         case "lag":
         case "lead": {
           const np = ordered.length;
+          // The partition's operand cache is transient operator state (memory.md §6.8), released
+          // once the partition's results are computed.
+          const operands = meter.stateCharge();
           const vals: Value[] = new Array(np);
           for (let i = 0; i < np; i++) {
-            vals[i] = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
+            const v = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
+            if (operands.active()) operands.reserve(meter, valueBytes(v));
+            vals[i] = v;
           }
           // offset: evaluated once from the first sorted row. NULL → NULL for every row (PG);
           // absent → 1. A small offset, but compared in number space (a huge offset just lands
@@ -664,6 +671,7 @@ export function applyWindowStage(
               }
             }
           }
+          operands.releaseAll();
           break;
         }
         // An aggregate over the default frame (window.md §6): RANGE UNBOUNDED PRECEDING TO CURRENT
@@ -737,10 +745,15 @@ export function applyWindowStage(
             const exclude = spec.frame?.exclude ?? "noOthers";
             const vals: Value[] = new Array(np);
             const valSet: boolean[] = new Array(np).fill(false);
+            // The cached operands are transient operator state (memory.md §6.8): each reserves its
+            // value_bytes when first cached, all released at the end of the partition.
+            const operands = meter.stateCharge();
             const evalAt = (k: number): Value => {
               if (!hasOperand) return nullValue();
               if (!valSet[k]) {
-                vals[k] = evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter);
+                const v = evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter);
+                if (operands.active()) operands.reserve(meter, valueBytes(v));
+                vals[k] = v;
                 valSet[k] = true;
               }
               return vals[k]!;
@@ -805,6 +818,7 @@ export function applyWindowStage(
               }
               meter.releaseQuery(accCharge);
             }
+            operands.releaseAll();
           }
           break;
         }
@@ -813,10 +827,14 @@ export function applyWindowStage(
         case "lastValue":
         case "nthValue": {
           const np = ordered.length;
-          // The value expression, evaluated once per row (sorted order).
+          // The value expression, evaluated once per row (sorted order) — the partition's operand
+          // cache, transient operator state (memory.md §6.8).
+          const operands = meter.stateCharge();
           const vals: Value[] = new Array(np);
           for (let i = 0; i < np; i++) {
-            vals[i] = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
+            const v = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
+            if (operands.active()) operands.reserve(meter, valueBytes(v));
+            vals[i] = v;
           }
           // nth_value's position — evaluated once; NULL → NULL for all; < 1 → 22016.
           let nth: number | null = 0; // unused for first/last
@@ -872,6 +890,7 @@ export function applyWindowStage(
             }
             results[ordered[pos]!] = out;
           }
+          operands.releaseAll();
           break;
         }
       }
@@ -889,9 +908,11 @@ export function applyWindowStage(
 // stable sort over the value comparator; if ANY key carries a collation, the collation-aware
 // sortRowsCollated decorate sorter runs instead (it can throw — an unmapped code point is 0A000).
 // (Array.prototype.sort is stable in modern engines — the runtime jed targets, spill.md §6.)
-export function sortRows(rows: Row[], order: OrderSlot[]): void {
+// A collated sort's decorations are transient operator state charged to acct (memory.md §6.8); a
+// rejected reservation throws 54P05 for the caller's cost-first check.
+export function sortRows(rows: Row[], order: OrderSlot[], acct: QueryAccount): void {
   if (order.some((k) => k.collation !== null)) {
-    sortRowsCollated(rows, order);
+    sortRowsCollated(rows, order, acct);
     return;
   }
   rows.sort((a, b) => cmpRowsByOrder(a, b, order));
@@ -911,17 +932,34 @@ export function cmpRowsByOrder(a: Row, b: Row, order: OrderSlot[]): number {
 // slots (if any), indexed in parallel with rows, so the partition sort AND peer determination
 // (ranking, frame peer groups) honor the collation identically (window.md §3/§5). Returns null when no
 // key is collated. An unmapped code point throws 0A000 here, at this deterministic per-row point.
-export function windowCollKeys(rows: Row[], order: OrderSlot[]): (Uint8Array | null)[][] | null {
+//
+// Each row's keys are transient operator state (memory.md §6.8): reserved through meter as they are
+// built and held until the window stage completes — `charged` is what the caller adds to the stage's
+// partition charge.
+export function windowCollKeys(
+  rows: Row[],
+  order: OrderSlot[],
+  meter: Meter,
+): { keys: (Uint8Array | null)[][]; charged: number } | null {
   if (!order.some((k) => k.collation !== null)) return null;
-  return rows.map((row) => {
+  const active = meter.queryMemoryActive();
+  let charged = 0;
+  const all: (Uint8Array | null)[][] = [];
+  for (const row of rows) {
     const keys: (Uint8Array | null)[] = [];
     for (const k of order) {
       if (k.collation === null) continue;
       const v = row[k.idx]!;
       keys.push(collatedSortKey(k.collation, v)); // NULL → null, handled by NULL placement
     }
-    return keys;
-  });
+    if (active) {
+      const bytes = sortKeyBytes(keys);
+      meter.reserveQuery(bytes);
+      charged += bytes;
+    }
+    all.push(keys);
+  }
+  return { keys: all, charged };
 }
 
 // cmpWindowRows compares two rows of the window buffer (by their index a/b into the full row array) by
@@ -968,14 +1006,20 @@ export function cmpWindowRows(
 // for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
 // (cost.md §3); the collate cost is charged at the comparison evaluator (collation.md §11). A
 // collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
-export function sortRowsCollated(rows: Row[], order: OrderSlot[]): void {
+// Each row's decoration reserves its sortKeyBytes as it is built; all are released once the rows are
+// undecorated (memory.md §6.8).
+export function sortRowsCollated(rows: Row[], order: OrderSlot[], acct: QueryAccount): void {
+  const charge = new StateCharge(acct);
   // (keys[i], row) per row; a keys entry is null for a NULL value, the sort-key bytes otherwise.
-  const deco: { keys: (Uint8Array | null)[]; row: Row }[] = rows.map((row) => ({
-    keys: collationKeysForRow(row, order),
-    row,
-  }));
+  const deco: { keys: (Uint8Array | null)[]; row: Row }[] = [];
+  for (const row of rows) {
+    const keys = collationKeysForRow(row, order);
+    if (charge.active()) charge.reserveDirect(sortKeyBytes(keys));
+    deco.push({ keys, row });
+  }
   deco.sort((a, b) => cmpDecorated(a.keys, a.row, b.keys, b.row, order));
   for (let i = 0; i < deco.length; i++) rows[i] = deco[i]!.row;
+  charge.releaseAll();
 }
 
 function collationKeysForRow(row: Row, order: OrderSlot[]): (Uint8Array | null)[] {
@@ -1001,6 +1045,10 @@ export class TopKKeeper {
   // The retained rows' query-memory charge when the heap is sort state (the streaming-sort lane,
   // memory.md §6.4); inert for the eager top-k selection, whose rows are Q1 buffer rows.
   private charge: StateCharge = new StateCharge();
+  // The retained items' collation decorations (memory.md §6.8), when the heap is collated: each
+  // retained item reserves its sort keys with its row, released when it is evicted or the heap is
+  // finished.
+  private decorations: StateCharge = new StateCharge();
 
   constructor(k: bigint, order: OrderSlot[], collated: boolean) {
     this.k = k;
@@ -1013,6 +1061,13 @@ export class TopKKeeper {
   // throws 54P05 from push for the caller's Meter.costFirst.
   withCharge(charge: StateCharge): this {
     this.charge = charge;
+    return this;
+  }
+
+  // withDecorations charges the retained items' collation decorations to acct (memory.md §6.8). A
+  // rejected reservation throws 54P05 from push for the caller's cost-first check.
+  withDecorations(acct: QueryAccount): this {
+    if (this.collated) this.decorations = new StateCharge(acct);
     return this;
   }
 
@@ -1034,12 +1089,17 @@ export class TopKKeeper {
     if (this.k === 0n) return;
     if (BigInt(this.items.length) < this.k) {
       if (this.charge.active()) this.charge.reserveDirect(rowBytes(item.row));
+      if (this.decorations.active()) this.decorations.reserveDirect(sortKeyBytes(item.keys));
       this.items.push(item);
       this.siftUp(this.items.length - 1);
     } else if (this.compare(item, this.items[0]!) < 0) {
       if (this.charge.active()) {
         this.charge.reserveDirect(rowBytes(item.row));
         this.charge.release(rowBytes(this.items[0]!.row));
+      }
+      if (this.decorations.active()) {
+        this.decorations.reserveDirect(sortKeyBytes(item.keys));
+        this.decorations.release(sortKeyBytes(this.items[0]!.keys));
       }
       this.items[0] = item;
       this.siftDown(0);
@@ -1072,6 +1132,8 @@ export class TopKKeeper {
 
   finish(): Row[] {
     this.items.sort((a, b) => this.compare(a, b));
+    // Undecorated: the decorations go (memory.md §6.8).
+    this.decorations.releaseAll();
     return this.items.map((item) => item.row);
   }
 
@@ -1081,12 +1143,12 @@ export class TopKKeeper {
   }
 }
 
-export function topKRows(rows: Row[], order: OrderSlot[], k: bigint): Row[] {
+export function topKRows(rows: Row[], order: OrderSlot[], k: bigint, acct: QueryAccount): Row[] {
   const keeper = new TopKKeeper(
     k,
     order,
     order.some((key) => key.collation !== null),
-  );
+  ).withDecorations(acct);
   for (const row of rows) keeper.push(row);
   return keeper.finish();
 }

@@ -184,7 +184,13 @@ impl Sorter {
                     _ => 0,
                 })
                 .sum();
-            let merged = merge_pair_to_file(sources, count, self.keys.clone(), spill.as_ref())?;
+            let merged = merge_pair_to_file(
+                sources,
+                count,
+                self.keys.clone(),
+                spill.as_ref(),
+                self.charge.sibling(),
+            )?;
             self.runs.truncate(n - 2);
             self.run_levels.truncate(n - 2);
             self.runs.push(merged);
@@ -199,6 +205,7 @@ impl Sorter {
     pub(crate) fn finish(mut self) -> Result<SortedRows> {
         let keys = self.keys.clone();
         self.buf.sort_by(|a, b| Sorter::cmp_rows(&keys, a, b));
+        let heads = self.charge.sibling();
         let charge = std::mem::take(&mut self.charge);
         if self.runs.is_empty() {
             return Ok(SortedRows::InMemory(
@@ -214,38 +221,30 @@ impl Sorter {
             sources.push(Source::open_file(run)?);
         }
         sources.push(Source::Mem(std::mem::take(&mut self.buf).into_iter()));
-        let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(sources.len());
-        for (i, src) in sources.iter_mut().enumerate() {
-            if let Some(row) = src.next()? {
-                heap.push(HeapItem {
-                    row,
-                    source: i,
-                    keys: keys.clone(),
-                });
-            }
-        }
+        let mut merger = Merger {
+            sources,
+            heap: BinaryHeap::new(),
+            heads,
+        };
         self.runs.clear();
-        Ok(SortedRows::Merge(Merger { sources, heap }, charge))
+        merger.prime(&keys)?;
+        Ok(SortedRows::Merge(merger, charge))
     }
 }
 
 fn merge_pair_to_file(
-    mut sources: Vec<Source>,
+    sources: Vec<Source>,
     count: u64,
     keys: Arc<Vec<SortKey>>,
     spill: &dyn SpillHost,
+    heads: StateCharge,
 ) -> Result<Arc<dyn SpillFile>> {
-    let mut heap = BinaryHeap::new();
-    for (source, src) in sources.iter_mut().enumerate() {
-        if let Some(row) = src.next()? {
-            heap.push(HeapItem {
-                row,
-                source,
-                keys: keys.clone(),
-            });
-        }
-    }
-    let mut merger = Merger { sources, heap };
+    let mut merger = Merger {
+        sources,
+        heap: BinaryHeap::new(),
+        heads,
+    };
+    merger.prime(&keys)?;
     let file: Arc<dyn SpillFile> = Arc::from(spill.create("merge")?);
     let mut writer = BufWriter::new(SpillAppender::new(file.clone(), 0));
     let result = (|| -> Result<()> {
@@ -363,21 +362,61 @@ impl Source {
 pub(crate) struct Merger {
     sources: Vec<Source>,
     heap: BinaryHeap<HeapItem>,
+    /// The heads read back from spilled runs (memory.md §6.8): each reserves its `row_bytes` as it
+    /// enters the heap and is released when it leaves. The final in-memory buffer's rows are already
+    /// charged with it, so its heads reserve nothing. The merge cannot spill further, so a head whose
+    /// reservation the account rejects is held uncharged (at most one row per run).
+    heads: StateCharge,
 }
 
 impl Merger {
+    /// Reserve a head from source `i` if it fits, returning the bytes it holds: a spilled run's row
+    /// is new memory; a rejected head, and the in-memory buffer's, hold nothing.
+    fn charge_head(&mut self, i: usize, row: &Row) -> i64 {
+        if !self.heads.active() || !matches!(self.sources[i], Source::File { .. }) {
+            return 0;
+        }
+        let bytes = crate::memsize::row_bytes(row);
+        if self.heads.try_reserve_direct(bytes) {
+            bytes
+        } else {
+            0
+        }
+    }
+
+    /// Read each source's first row into the heap, in source order.
+    fn prime(&mut self, keys: &Arc<Vec<SortKey>>) -> Result<()> {
+        for i in 0..self.sources.len() {
+            if let Some(row) = self.sources[i].next()? {
+                let charged = self.charge_head(i, &row);
+                self.heap.push(HeapItem {
+                    row,
+                    source: i,
+                    keys: keys.clone(),
+                    charged,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The next row in order. The popped head's source replaces it (reserved first), then the popped
+    /// head's charge is released as the row leaves the merge.
     fn next(&mut self) -> Result<Option<Row>> {
         let Some(item) = self.heap.pop() else {
             return Ok(None);
         };
         // Advance the source the popped row came from and re-insert its next head.
         if let Some(row) = self.sources[item.source].next()? {
+            let charged = self.charge_head(item.source, &row);
             self.heap.push(HeapItem {
                 row,
                 source: item.source,
                 keys: item.keys.clone(),
+                charged,
             });
         }
+        self.heads.release(item.charged);
         Ok(Some(item.row))
     }
 }
@@ -399,6 +438,8 @@ struct HeapItem {
     row: Row,
     source: usize,
     keys: Arc<Vec<SortKey>>,
+    /// The query-memory bytes this head holds (zero for the in-memory buffer's rows).
+    charged: i64,
 }
 
 impl PartialEq for HeapItem {
@@ -862,11 +903,68 @@ mod bounded_run_tests {
     /// An account below `work_mem` makes the sorter write a run whenever it rejects a row, instead of
     /// failing `54P05`; the output is still the stable sort (memory.md §6.4/§6.6).
     #[test]
+    fn merge_heads_of_spilled_runs_are_charged() {
+        // memory.md §6.8: each head read back from a spilled run reserves its row_bytes while it is in
+        // the merge heap; the final in-memory buffer's rows are already charged with the buffer.
+        let acct = crate::cost::QueryAccount {
+            used: std::rc::Rc::new(std::cell::Cell::new(0)),
+            limit: 1 << 40,
+            floor: std::rc::Rc::new(std::cell::Cell::new(0)),
+        };
+        let row_size = crate::memsize::row_bytes(&[Value::Int(0), Value::Int(0)]);
+        let mut sort = Sorter::new(
+            vec![(0, false, false, None)],
+            (row_size * 3) as usize,
+            Some(crate::spillhost::os_spill_host(std::env::temp_dir())),
+            StateCharge::new(acct.clone()),
+        );
+        for i in 0..10 {
+            sort.push(vec![Value::Int(i % 3), Value::Int(i)]).unwrap();
+        }
+        let buffered = sort.buf.len() as i64;
+        let runs = sort.runs.len() as i64;
+        assert!(runs > 0);
+        let mut rows = sort.finish().unwrap();
+        assert_eq!(acct.used.get(), (runs + buffered) * row_size);
+        let mut count = 0;
+        while rows.next().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 10);
+        rows.release();
+        assert_eq!(acct.used.get(), 0);
+
+        // A head the account rejects is held uncharged: the merge cannot spill further.
+        let tight = crate::cost::QueryAccount {
+            used: std::rc::Rc::new(std::cell::Cell::new(0)),
+            limit: 1,
+            floor: std::rc::Rc::new(std::cell::Cell::new(0)),
+        };
+        let mut sort = Sorter::new(
+            vec![(0, false, false, None)],
+            (row_size * 3) as usize,
+            Some(crate::spillhost::os_spill_host(std::env::temp_dir())),
+            StateCharge::new(tight.clone()),
+        );
+        for i in 0..10 {
+            sort.push(vec![Value::Int(i % 3), Value::Int(i)]).unwrap();
+        }
+        let mut rows = sort.finish().unwrap();
+        let mut count = 0;
+        while rows.next().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 10);
+        drop(rows);
+        assert_eq!(tight.used.get(), 0);
+    }
+
+    #[test]
     fn rejected_reservations_write_runs_instead_of_failing() {
         let acct = crate::cost::QueryAccount {
             used: std::rc::Rc::new(std::cell::Cell::new(0)),
             limit: 1000,
-            floor: 0,
+            floor: std::rc::Rc::new(std::cell::Cell::new(0)),
         };
         let mut sort = Sorter::new(
             vec![(0, false, false, None)],

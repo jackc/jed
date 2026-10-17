@@ -964,8 +964,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			// re-reserve the kept rows (never more than was released).
 			releaseRowsMasked(meter, rows, memMask)
 			var err error
-			rows, err = topKRows(rows, plan.order, *plan.phys.topK)
-			if err != nil {
+			rows, err = topKRows(rows, plan.order, *plan.phys.topK, meter.query)
+			if err = meter.costFirst(err); err != nil {
 				return emitter{}, err
 			}
 			for _, row := range rows {
@@ -974,7 +974,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				}
 			}
 		} else {
-			if err := sortRows(rows, plan.order); err != nil {
+			if err := meter.costFirst(sortRows(rows, plan.order, meter.query)); err != nil {
 				return emitter{}, err
 			}
 		}
@@ -1257,6 +1257,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					// An in-aggregate ORDER BY (aggregates.md §22): fold the buffered arguments in key
 					// order into the plan's own accumulator, charging the fold (its decimal_work /
 					// generated_row and its retention) as usual.
+					var v Value
+					var ferr error
 					if a.ordered {
 						spec := plan.aggSpecs[si]
 						inner := newAccFromSpecUnordered(spec, db.session.timeZone)
@@ -1268,9 +1270,10 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 								return emitter{}, ferr
 							}
 						}
-						a = inner
+						v, ferr = inner.finalize()
+					} else {
+						v, ferr = a.finalizeMetered(meter)
 					}
-					v, ferr := a.finalize()
 					if ferr != nil {
 						return emitter{}, ferr
 					}
@@ -1329,7 +1332,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			if err := materializeOrderExprs(groupRows, plan.orderExprs, env, meter); err != nil {
 				return emitter{}, err
 			}
-			if err := sortRows(groupRows, plan.order); err != nil {
+			if err := meter.costFirst(sortRows(groupRows, plan.order, meter.query)); err != nil {
 				return emitter{}, err
 			}
 			if selectActualRootNode(plan) != "Sort" {

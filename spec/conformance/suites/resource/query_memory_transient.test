@@ -1,0 +1,137 @@
+# Transient operator state (memory.md §6.8): the collation decorations a collated sort builds — each
+# non-NULL collated key counts as the bytea value of its sort key — and a window's cached frame
+# operands, charged beside the Q1 row buffers and Q2 state of the same statement and released when
+# the sort or the partition completes. A jed-specific resource contract, not a PostgreSQL limit. Each
+# budget is the exact peak of logical bytes the statement holds; the record below it at budget - 1
+# fails 54P05. On a file-backed database these shapes take other lanes, whose peaks
+# `mise run conformance:query_memory` cross-checks between cores, so this file pins the in-memory
+# lanes only.
+# skip: disk — blocking operators take the bounded-spill lane on file-backed databases
+# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, types.text, types.i32, query.order_by, query.limit, query.order_by_topk, query.window, query.window_aggregate, query.window_frame, query.aggregates, query.ordered_set_aggregate, query.set_returning, dml.insert_select, expr.collate, resource.query_memory
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO c VALUES (1, 'b'), (2, 'A'), (3, 'a'), (4, NULL)
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO d SELECT x, repeat(chr(101 - x), 40) FROM generate_series(1, 4) x
+
+# A collated ORDER BY decorates every row with its sort key while it sorts.
+# max_query_memory_bytes: 528
+query IT nosort
+SELECT id, s FROM c ORDER BY s COLLATE "unicode", id
+----
+3
+a
+2
+A
+1
+b
+4
+NULL
+
+# max_query_memory_bytes: 527
+statement error 54P05
+SELECT id, s FROM c ORDER BY s COLLATE "unicode", id
+
+# A collated top-k heap holds the decorations of the rows it retains.
+# max_query_memory_bytes: 640
+query I nosort
+SELECT id FROM d ORDER BY s COLLATE "unicode" LIMIT 1
+----
+4
+
+# max_query_memory_bytes: 639
+statement error 54P05
+SELECT id FROM d ORDER BY s COLLATE "unicode" LIMIT 1
+
+# A collated window holds its rows' sort keys until the window stage completes.
+# max_query_memory_bytes: 688
+query II rowsort
+SELECT id, row_number() OVER (ORDER BY s COLLATE "unicode") FROM c
+----
+1
+3
+2
+2
+3
+1
+4
+4
+
+# max_query_memory_bytes: 687
+statement error 54P05
+SELECT id, row_number() OVER (ORDER BY s COLLATE "unicode") FROM c
+
+# An ordered-set aggregate's collated finalize sort decorates its retained inputs.
+# max_query_memory_bytes: 659
+query T nosort
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY s COLLATE "unicode") FROM c
+----
+A
+
+# max_query_memory_bytes: 658
+statement error 54P05
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY s COLLATE "unicode") FROM c
+
+# lag caches its partition's operand values while it computes the partition; with offset 3 only
+# the last row's result holds one.
+# max_query_memory_bytes: 864
+query IT rowsort
+SELECT id, lag(s, 3) OVER (ORDER BY id) FROM d
+----
+1
+NULL
+2
+NULL
+3
+NULL
+4
+dddddddddddddddddddddddddddddddddddddddd
+
+# max_query_memory_bytes: 863
+statement error 54P05
+SELECT id, lag(s, 3) OVER (ORDER BY id) FROM d
+
+# So does first_value over an explicit frame.
+# max_query_memory_bytes: 864
+query IT rowsort
+SELECT id, first_value(s) OVER (ORDER BY id ROWS BETWEEN 3 FOLLOWING AND 3 FOLLOWING) FROM d
+----
+1
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+2
+NULL
+3
+NULL
+4
+NULL
+
+# max_query_memory_bytes: 863
+statement error 54P05
+SELECT id, first_value(s) OVER (ORDER BY id ROWS BETWEEN 3 FOLLOWING AND 3 FOLLOWING) FROM d
+
+# An aggregate over a moving frame caches each operand once.
+# max_query_memory_bytes: 864
+query II rowsort
+SELECT id, count(s) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM d
+----
+1
+1
+2
+2
+3
+2
+4
+2
+
+# max_query_memory_bytes: 863
+statement error 54P05
+SELECT id, count(s) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM d

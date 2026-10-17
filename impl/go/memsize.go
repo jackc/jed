@@ -146,3 +146,15 @@ func memMapEntryBytes(key, value []Value) int64 {
 func memHashRowBytes(row []Value) int64 {
 	return memoryEntry + memRowBytes(row)
 }
+
+// memSortKeyBytes is a collation decoration's measure (memory.md §6.8): each non-NULL collated key
+// counts as the bytea value of its sort key, VALUE + length; a NULL key (a nil slot) counts nothing.
+func memSortKeyBytes(keys [][]byte) int64 {
+	var n int64
+	for _, k := range keys {
+		if k != nil {
+			n += memoryValue + int64(len(k))
+		}
+	}
+	return n
+}

@@ -1383,7 +1383,7 @@ impl Engine {
         }
 
         if !plan.order.is_empty() {
-            sort_rows(&mut rows, &plan.order)?;
+            sort_rows(&mut rows, &plan.order, &acct)?;
             if root_node != "Sort"
                 && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
             {

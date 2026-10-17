@@ -65,8 +65,9 @@ Functions whose output is at most a small multiple of their inputs do not use th
 large bulk statements are not capped by it. These are the array builders (`ARRAY[…]`,
 `array_append`, `array_cat`, array `||`), the JSON builders (`jsonb_build_object`, `to_jsonb`,
 `jsonb_set`, jsonb `||`, and the like), and the functions and casts that render text with escapes
-or hex (`concat`, `encode`, `quote_literal`, `quote_ident`, `quote_nullable`, and casts from an array,
-`bytea`, or `jsonb` to text). Instead they charge one cost unit per byte they build (32 per array element or JSON node
+or hex (`concat`, `encode`, `quote_literal`, `quote_ident`, `quote_nullable`, casts from an array,
+`bytea`, or `jsonb` to text, and `->>`, `#>>`, `jsonb_each_text`, and `jsonb_array_elements_text`
+when the member they return is an object or array). Instead they charge one cost unit per byte they build (32 per array element or JSON node
 plus its contents), which lets `max_cost` stop a query that doubles a value over and over. A value
 built only from constants, such as `ARRAY[1, 2, 3]` in a `WHERE` clause, costs nothing extra.
 
@@ -82,7 +83,8 @@ materialized relations, join results, grouped and `DISTINCT` rows, set-operation
 `RETURNING` results, and the rows the engine's own collect-everything helpers (Rust `query_rows`,
 TypeScript `Statement.all()`) gather — plus the working state of the operators that produce them:
 hash-join tables, group and dedup tables, aggregate inputs such as `json_agg`'s, window
-partitions, and sort buffers. It also holds the writes an open transaction has staged but not yet
+partitions and the operand values a window caches, sort buffers, the sort keys a collated sort
+builds, and the rows a spilled sort reads back to merge. It also holds the writes an open transaction has staged but not yet
 committed (see below). It is **unlimited by default** — like `max_cost`, a host serving untrusted
 SQL opts in. Set it through session options or `set_max_query_memory_bytes(bytes)` /
 `SetMaxQueryMemoryBytes(bytes)` / `setMaxQueryMemoryBytes(bytes)`; non-positive values restore
@@ -97,11 +99,13 @@ almost nothing. A cursor keeps its statement's budget until it closes.
 
 Uncommitted writes count against the same budget. Every row version and index entry a transaction
 writes reserves its stored size — its on-disk record plus any value stored out of line — until the
-transaction commits or rolls back. Each statement starts with those bytes already counted, and after
-every statement they must still fit, so a long transaction of many small `INSERT`s fails with
-`54P05` instead of growing without bound. Rewriting the same row counts again: the budget bounds how
-much a transaction writes, not how much it ends up holding. Temporary tables are bounded by
-`max_temp_storage_bytes` instead.
+transaction commits or rolls back. Each statement starts with those bytes already counted, a write
+adds its own as soon as it has written its rows (beside whatever the statement still holds, such as
+an `INSERT … SELECT`'s source rows or a `RETURNING` result), and after every statement they must
+still fit, so a long transaction of many small `INSERT`s fails with `54P05` instead of growing
+without bound. The count is what the transaction ends up holding: rewriting a row it already wrote
+replaces that row's bytes rather than adding to them, and deleting a row it inserted gives them
+back. Temporary tables are bounded by `max_temp_storage_bytes` instead.
 
 ## Storage limit
 
@@ -167,11 +171,12 @@ is the limit for them.
 
 These budgets are **guardrails, not a process-memory cap**. The query-memory budget covers row
 buffers and operator state: hash-join tables, group, `DISTINCT`, and set-operation tables,
-`json_agg`-style and ordered-set accumulators, window partitions, sort buffers and top-k heaps,
-the resident part of spilling operators, and the writes pending in an open transaction. The
+`json_agg`-style and ordered-set accumulators, window partitions and operand caches, sort buffers,
+top-k heaps, and collation sort keys, the resident part of spilling operators and the rows they
+merge back, and the writes pending in an open transaction. The
 storage limit covers an in-memory database's committed pages. A file-backed database's page cache
 is bounded by its `cache_bytes` open option, which evicts pages and never fails a query (see the
-page cache section above). Still uncovered: a size cap for file-backed databases and scalar kernels beyond the ones listed above. On native file hosts,
+page cache section above). On native file hosts,
 sort, hash JOIN, aggregation, and DISTINCT spill when they exceed `work_mem` — and also when the
 query-memory budget would otherwise reject them, so a large sort or aggregate spills rather than
 fails and releases its charge as it spills. Row buffers that cannot spill, such as a derived

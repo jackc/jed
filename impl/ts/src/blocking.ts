@@ -318,19 +318,34 @@ export class SpoolSorter {
     this.owned.add(spool);
     return spool;
   }
+  // merge stably merges two adjacent runs (a earlier) into a fresh run. Each head read back from a run
+  // reserves its rowBytes on a sibling of the sorter's charge while it is in the merge (memory.md
+  // §6.8): the replacement head is reserved before the leaving head is released. The merge cannot
+  // spill further, so a head the account rejects is held uncharged.
   private merge(a: RowSpool, b: RowSpool): RowSpool {
     const out = this.fresh();
+    const heads = this.charge.sibling();
     const ai = a[Symbol.iterator]();
     const bi = b[Symbol.iterator]();
     let av = ai.next();
+    let ac = av.done ? 0 : chargeHead(heads, av.value);
     let bv = bi.next();
+    let bc = bv.done ? 0 : chargeHead(heads, bv.value);
     while (!av.done || !bv.done) {
       if (bv.done || (!av.done && this.compare(av.value, bv.value) <= 0)) {
-        out.push(av.value!);
+        const row = av.value!;
+        const held = ac;
         av = ai.next();
+        ac = av.done ? 0 : chargeHead(heads, av.value);
+        heads.release(held);
+        out.push(row);
       } else {
-        out.push(bv.value);
+        const row = bv.value;
+        const held = bc;
         bv = bi.next();
+        bc = bv.done ? 0 : chargeHead(heads, bv.value);
+        heads.release(held);
+        out.push(row);
       }
     }
     a.close();
@@ -349,8 +364,6 @@ export class SpoolSorter {
     this.bytes += bytes;
     if (rejected || this.bytes > this.budget) {
       this.flush();
-      // The run left memory: its rows' charge goes with it (memory.md §6.4/§6.6).
-      this.charge.releaseAll();
     }
   }
   private flush(): void {
@@ -359,6 +372,9 @@ export class SpoolSorter {
     for (const row of this.chunk) run.push(row);
     this.chunk = [];
     this.bytes = 0;
+    // The run left memory: its rows' charge goes with it (memory.md §6.4/§6.6), before any compaction
+    // merge reserves its heads.
+    this.charge.releaseAll();
     let level = 0;
     while (this.levels[level] !== undefined) {
       run = this.merge(this.levels[level]!, run);
@@ -367,17 +383,23 @@ export class SpoolSorter {
     }
     this.levels[level] = run;
   }
-  finishSpool(): RowSpool {
-    if (this.chunk.length > 0) this.flush();
-    let result: RowSpool | undefined;
+  // finishSpool returns the sorted output: the final chunk, stable-sorted, stays in memory (still charged
+  // with the sorter) and is k-way merged with the spilled runs, earliest input first (memory.md §6.8).
+  finishSpool(): SortedSpool {
+    this.chunk.sort(this.compare);
+    const runs: RowSpool[] = [];
     for (let level = this.levels.length - 1; level >= 0; level--) {
       const run = this.levels[level];
-      if (run !== undefined) result = result === undefined ? run : this.merge(result, run);
+      if (run !== undefined) {
+        runs.push(run);
+        this.owned.delete(run);
+      }
     }
-    result ??= this.fresh();
-    this.owned.delete(result);
     this.levels = [];
-    return result;
+    const mem = this.chunk;
+    this.chunk = [];
+    this.bytes = 0;
+    return new SortedSpool(runs, mem, this.compare, this.charge.sibling());
   }
   finish(): { next(): Row | null; close(): void } {
     const out = this.finishSpool();
@@ -413,11 +435,134 @@ export function sortSpool(
   sink: SpillSink,
 ): RowSpool {
   const sorter = new SpoolSorter(compare, budget, sink);
+  let sorted: SortedSpool | null = null;
   try {
     for (const row of input) sorter.push(row);
-    return sorter.finishSpool();
+    sorted = sorter.finishSpool();
+    const out = new RowSpool(budget, sink);
+    for (const row of sorted) out.push(row);
+    return out;
   } finally {
+    sorted?.close();
     sorter.close();
+  }
+}
+
+// chargeHead reserves a merge head read back from a spilled run if it fits, returning the bytes it
+// holds: zero when the account is unlimited or rejects it (memory.md §6.8).
+function chargeHead(heads: StateCharge, row: Row): number {
+  if (!heads.active()) return 0;
+  const bytes = rowBytes(row);
+  return heads.tryReserveDirect(bytes) ? bytes : 0;
+}
+
+type MergeHead = { row: Row; source: number; charged: number };
+
+// SortedSpool is a SpoolSorter's sorted output, read once: a k-way merge of the spilled runs (earliest
+// input first) and the final in-memory chunk last, ties broken by the lower source — exactly input
+// order. The heads read back from runs reserve their rowBytes while they are in the merge heap; the
+// in-memory chunk's rows are already charged with the sorter, so its heads reserve nothing (memory.md
+// §6.8). The heads are read (and reserved) when the output is built, as the merge is primed. close
+// discards the runs and returns any head still charged.
+export class SortedSpool implements Iterable<Row> {
+  private runs: RowSpool[];
+  private mem: Row[];
+  private compare: (a: Row, b: Row) => number;
+  private heads: StateCharge;
+  private sources: Iterator<Row>[] = [];
+  private heap: MergeHead[] = [];
+  constructor(
+    runs: RowSpool[],
+    mem: Row[],
+    compare: (a: Row, b: Row) => number,
+    heads: StateCharge,
+  ) {
+    this.runs = runs;
+    this.mem = mem;
+    this.compare = compare;
+    this.heads = heads;
+    if (runs.length === 0) return;
+    this.sources = runs.map((run) => run[Symbol.iterator]());
+    this.sources.push(mem[Symbol.iterator]());
+    // Read each source's first row into the heap, in source order.
+    for (let i = 0; i < this.sources.length; i++) {
+      const next = this.sources[i]!.next();
+      if (!next.done)
+        this.heapPush(this.heap, {
+          row: next.value,
+          source: i,
+          charged: this.charge(i, next.value),
+        });
+    }
+  }
+  // charge reserves a head from source if it is a spilled run's (the in-memory chunk's hold nothing).
+  private charge(source: number, row: Row): number {
+    return source === this.sources.length - 1 ? 0 : chargeHead(this.heads, row);
+  }
+  *[Symbol.iterator](): Generator<Row> {
+    if (this.runs.length === 0) {
+      yield* this.mem;
+      return;
+    }
+    const sources = this.sources;
+    const heap = this.heap;
+    const charge = (source: number, row: Row): number => this.charge(source, row);
+    while (heap.length > 0) {
+      // The popped head's source replaces it (reserved first), then the popped head's charge is
+      // released as the row leaves the merge.
+      const top = this.heapPop(heap);
+      const next = sources[top.source]!.next();
+      if (!next.done) {
+        this.heapPush(heap, {
+          row: next.value,
+          source: top.source,
+          charged: charge(top.source, next.value),
+        });
+      }
+      this.heads.release(top.charged);
+      yield top.row;
+    }
+  }
+  close(): void {
+    for (const run of this.runs) run.close();
+    this.runs = [];
+    this.mem = [];
+    this.heads.releaseAll();
+  }
+  // less(a, b) is true when a comes out first: smaller by the order keys, ties by lower source.
+  private less(a: MergeHead, b: MergeHead): boolean {
+    const c = this.compare(a.row, b.row);
+    if (c !== 0) return c < 0;
+    return a.source < b.source;
+  }
+  private heapPush(h: MergeHead[], item: MergeHead): void {
+    h.push(item);
+    let i = h.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (!this.less(h[i]!, h[parent]!)) break;
+      [h[i], h[parent]] = [h[parent]!, h[i]!];
+      i = parent;
+    }
+  }
+  private heapPop(h: MergeHead[]): MergeHead {
+    const top = h[0]!;
+    const last = h.pop()!;
+    if (h.length > 0) {
+      h[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = 2 * i + 2;
+        let m = i;
+        if (l < h.length && this.less(h[l]!, h[m]!)) m = l;
+        if (r < h.length && this.less(h[r]!, h[m]!)) m = r;
+        if (m === i) break;
+        [h[i], h[m]] = [h[m]!, h[i]!];
+        i = m;
+      }
+    }
+    return top;
   }
 }
 

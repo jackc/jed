@@ -220,9 +220,18 @@ func ResetQueryMemoryPeak() { queryMemoryPeak.Store(0) }
 type queryAccount struct {
 	used  *int64
 	limit int64
-	// floor is the balance the account opened with — its transaction's pending writes (memory.md §7).
-	// The statement's releases return only what it reserved, so none may take used below it.
-	floor int64
+	// floor is the transaction's pending writes the account holds (memory.md §7): the opening
+	// balance, moved by each within-statement sync (syncPending). The statement's releases return
+	// only what it reserved, so none may take used below it. Shared like used (nil reads as 0).
+	floor *int64
+}
+
+// floorVal is the pending writes the account holds (0 for an account with no floor).
+func (a queryAccount) floorVal() int64 {
+	if a.floor == nil {
+		return 0
+	}
+	return *a.floor
 }
 
 // active reports whether the account has a finite budget. Every admission site tests this first,
@@ -259,12 +268,34 @@ func (a queryAccount) release(bytes int64) {
 	if !a.active() {
 		return
 	}
-	if bytes > *a.used-a.floor {
+	floor := a.floorVal()
+	if bytes > *a.used-floor {
 		queryMemoryUnderflows.Add(1)
-		*a.used = min(a.floor, *a.used)
+		*a.used = min(floor, *a.used)
 		return
 	}
 	*a.used -= bytes
+}
+
+// syncPending brings the held pending writes to pending, the transaction's current pending bytes
+// (the within-statement check, memory.md §7.3): growth is reserved and can fail 54P05; a shrink (a
+// write that displaced a version the transaction staged) returns the difference.
+func (a queryAccount) syncPending(pending int64) error {
+	if a.limit <= 0 || a.used == nil {
+		return nil
+	}
+	floor := a.floorVal()
+	if pending > floor {
+		if err := a.reserve(pending - floor); err != nil {
+			return err
+		}
+	} else {
+		*a.used -= floor - pending
+	}
+	if a.floor != nil {
+		*a.floor = pending
+	}
+	return nil
 }
 
 // admitRow admits a projected row (memory.md §5.1).
@@ -301,6 +332,18 @@ func measureRows[R ~[]Value](a queryAccount, rows []R) int64 {
 // reservation adds no guard point.
 func (m *costMeter) reserveQuery(bytes int64) error {
 	if err := m.query.reserve(bytes); err != nil {
+		if cerr := m.Guard(); cerr != nil {
+			return cerr
+		}
+		return err
+	}
+	return nil
+}
+
+// syncPending is the within-statement pending-write check (memory.md §7.3): bring the account's held
+// pending writes to pending. A rejected growth consults the cost guard first (memory.md §2).
+func (m *costMeter) syncPending(pending int64) error {
+	if err := m.query.syncPending(pending); err != nil {
 		if cerr := m.Guard(); cerr != nil {
 			return cerr
 		}
@@ -382,6 +425,14 @@ type stateCharge struct {
 }
 
 func newStateCharge(acct queryAccount) *stateCharge { return &stateCharge{acct: acct} }
+
+// sibling is a fresh, empty charge against the same account (an inert charge stays inert).
+func (c *stateCharge) sibling() *stateCharge {
+	if c == nil {
+		return nil
+	}
+	return newStateCharge(c.acct)
+}
 
 // active reports whether the account has a finite budget — callers skip measuring otherwise.
 func (c *stateCharge) active() bool { return c != nil && c.acct.active() }

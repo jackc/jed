@@ -8,9 +8,15 @@ use super::*;
 /// Sort `rows` by the ORDER BY `order` keys (spec/design/grammar.md §10). The all-`C` fast path is a
 /// stable `sort_by` over the value comparator; if ANY key carries a collation, the collation-aware
 /// `sort_rows_collated` decorate-sorter runs instead (it can fail — an unmapped code point is 0A000).
-pub(crate) fn sort_rows(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()> {
+/// A collated sort's decorations are transient operator state charged to `acct` (memory.md §6.8);
+/// a rejected reservation is returned for the caller's cost-first check.
+pub(crate) fn sort_rows(
+    rows: &mut Vec<Row>,
+    order: &[crate::spill::SortKey],
+    acct: &crate::cost::QueryAccount,
+) -> Result<()> {
     if order.iter().any(|(_, _, _, c)| c.is_some()) {
-        return sort_rows_collated(rows, order);
+        return sort_rows_collated(rows, order, acct);
     }
     rows.sort_by(|a, b| cmp_rows_by_order(a, b, order));
     Ok(())
@@ -424,9 +430,14 @@ pub(crate) fn group_window_specs(specs: &[WindowSpec]) -> Vec<Vec<usize>> {
 /// peer groups) honor the collation identically. Built once per group (the decorate pattern); an
 /// unmapped code point fails 0A000 at this deterministic per-row point. Empty when no key is
 /// collated, and the comparator stays on raw bytes.
+///
+/// Each row's keys are transient operator state (memory.md §6.8): reserved on `charge` as they are
+/// built and held until the window stage completes.
 pub(crate) fn window_coll_keys(
     rows: &[Row],
     order: &[crate::spill::SortKey],
+    charge: &mut crate::cost::StateCharge,
+    meter: &mut Meter,
 ) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
     if !order.iter().any(|(_, _, _, c)| c.is_some()) {
         return Ok(Vec::new());
@@ -439,6 +450,9 @@ pub(crate) fn window_coll_keys(
                 // NULL (a collated slot is text / text[]) is `None` — handled by NULL placement.
                 keys.push(collation_sort_key(c, &row[*idx])?);
             }
+        }
+        if charge.active() {
+            charge.reserve(meter, crate::memsize::sort_key_bytes(&keys))?;
         }
         all.push(keys);
     }
@@ -513,7 +527,7 @@ pub(crate) fn apply_window_stage(
         }
         // Collated UCA sort-key bytes for the shared order's collated slots (window.md §3/§5), built
         // once per group; an unmapped code point fails 0A000 here. Empty when no key is collated.
-        let coll_keys = window_coll_keys(rows, &rep.order)?;
+        let coll_keys = window_coll_keys(rows, &rep.order, &mut part_charge, meter)?;
         // Sort each partition by the shared window ORDER BY. `slice::sort_by` is stable, so a full
         // tie keeps ascending original index = PK scan order (the §3 PK tie-break).
         for part in &mut partitions {
@@ -633,9 +647,16 @@ pub(crate) fn apply_window_stage(
                 // NULL); the default per out-of-range row.
                 WindowPlan::Lag | WindowPlan::Lead => {
                     let np = ordered.len();
+                    // The partition's operand cache is transient operator state (memory.md §6.8),
+                    // released once the partition's results are computed.
+                    let mut cache = meter.state_charge();
                     let mut vals: Vec<Value> = Vec::with_capacity(np);
                     for &ri in &ordered {
-                        vals.push(spec.args[0].eval(&rows[ri], env, meter)?);
+                        let v = spec.args[0].eval(&rows[ri], env, meter)?;
+                        if cache.active() {
+                            cache.reserve(meter, crate::memsize::value_bytes(&v))?;
+                        }
+                        vals.push(v);
                     }
                     let offset = if spec.args.len() >= 2 {
                         match spec.args[1].eval(&rows[ordered[0]], env, meter)? {
@@ -668,6 +689,7 @@ pub(crate) fn apply_window_stage(
                             }
                         };
                     }
+                    cache.release_all();
                 }
                 // An aggregate over the default frame (window.md §6): RANGE UNBOUNDED PRECEDING TO
                 // CURRENT ROW with a window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the
@@ -764,15 +786,23 @@ pub(crate) fn apply_window_stage(
                             .as_ref()
                             .map_or(crate::ast::FrameExclusion::NoOthers, |f| f.exclude);
                         let mut vals: Vec<Option<Value>> = vec![None; np];
-                        let eval_at = |k: usize,
-                                       m: &mut Meter,
-                                       vals: &mut Vec<Option<Value>>|
+                        // The cached operands are transient operator state (memory.md §6.8): each
+                        // reserves its value_bytes when first cached, all released at the end of the
+                        // partition.
+                        let mut cache = meter.state_charge();
+                        let mut eval_at = |k: usize,
+                                           m: &mut Meter,
+                                           vals: &mut Vec<Option<Value>>|
                          -> Result<Value> {
                             if !has_operand {
                                 return Ok(Value::Null);
                             }
                             if vals[k].is_none() {
-                                vals[k] = Some(spec.args[0].eval(&rows[ordered[k]], env, m)?);
+                                let v = spec.args[0].eval(&rows[ordered[k]], env, m)?;
+                                if cache.active() {
+                                    cache.reserve(m, crate::memsize::value_bytes(&v))?;
+                                }
+                                vals[k] = Some(v);
                             }
                             Ok(vals[k].as_ref().unwrap().clone())
                         };
@@ -862,15 +892,23 @@ pub(crate) fn apply_window_stage(
                             }
                             meter.release_query(acc_charge);
                         }
+                        drop(eval_at);
+                        cache.release_all();
                     }
                 }
                 // Frame-sensitive value pickers (S4, window.md §4): first/last/nth row of the frame.
                 WindowPlan::FirstValue | WindowPlan::LastValue | WindowPlan::NthValue => {
                     let np = ordered.len();
-                    // The value expression, evaluated once per row (sorted order).
+                    // The value expression, evaluated once per row (sorted order) — the partition's
+                    // operand cache, transient operator state (memory.md §6.8).
+                    let mut cache = meter.state_charge();
                     let mut vals: Vec<Value> = Vec::with_capacity(np);
                     for &ri in &ordered {
-                        vals.push(spec.args[0].eval(&rows[ri], env, meter)?);
+                        let v = spec.args[0].eval(&rows[ri], env, meter)?;
+                        if cache.active() {
+                            cache.reserve(meter, crate::memsize::value_bytes(&v))?;
+                        }
+                        vals.push(v);
                     }
                     // nth_value's position — evaluated once; NULL → NULL for all; < 1 → 22016.
                     let nth = if matches!(spec.plan, WindowPlan::NthValue) {
@@ -917,6 +955,7 @@ pub(crate) fn apply_window_stage(
                             _ => Value::Null,
                         };
                     }
+                    cache.release_all();
                 }
             }
         }
@@ -1006,17 +1045,25 @@ pub(crate) fn cmp_window_rows(
 /// for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
 /// (cost.md §3); the `collate` cost is charged at the comparison evaluator (collation.md §11). A
 /// collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
+/// Each row's decoration reserves its [`crate::memsize::sort_key_bytes`] as it is built; all are
+/// released once the rows are undecorated (memory.md §6.8).
 pub(crate) fn sort_rows_collated(
     rows: &mut Vec<Row>,
     order: &[crate::spill::SortKey],
+    acct: &crate::cost::QueryAccount,
 ) -> Result<()> {
+    let mut charge = crate::cost::StateCharge::new(acct.clone());
     let mut decorated: Vec<(Vec<Option<Vec<u8>>>, Row)> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
         let keys = collation_keys_for_row(&row, order)?;
+        if charge.active() {
+            charge.reserve_direct(crate::memsize::sort_key_bytes(&keys))?;
+        }
         decorated.push((keys, row));
     }
     decorated.sort_by(|a, b| cmp_decorated(a, b, order));
     rows.extend(decorated.into_iter().map(|(_, row)| row));
+    charge.release_all();
     Ok(())
 }
 
@@ -1106,6 +1153,10 @@ pub(crate) struct TopKKeeper {
     /// The retained rows' query-memory charge when the heap is sort state (the streaming-sort lane,
     /// memory.md §6.4); inert for the eager top-k selection, whose rows are Q1 buffer rows.
     charge: crate::cost::StateCharge,
+    /// The retained items' collation decorations (memory.md §6.8), when the heap is collated: each
+    /// retained item reserves its sort keys with its row, released when it is evicted or the heap is
+    /// finished.
+    decorations: crate::cost::StateCharge,
 }
 
 impl TopKKeeper {
@@ -1117,7 +1168,17 @@ impl TopKKeeper {
             order: order.to_vec(),
             items: Vec::new(),
             charge: crate::cost::StateCharge::default(),
+            decorations: crate::cost::StateCharge::default(),
         }
+    }
+
+    /// Charge the retained items' collation decorations to `acct` (memory.md §6.8). A rejected
+    /// reservation returns `54P05` from `push` for the caller's cost-first check.
+    pub(crate) fn with_decorations(mut self, acct: &crate::cost::QueryAccount) -> Self {
+        if self.collated {
+            self.decorations = crate::cost::StateCharge::new(acct.clone());
+        }
+        self
     }
 
     /// Charge the retained rows to `charge` (memory.md §6.4): a retained row reserves its `row_bytes`,
@@ -1158,6 +1219,10 @@ impl TopKKeeper {
                 self.charge
                     .reserve_direct(crate::memsize::row_bytes(&item.row))?;
             }
+            if self.decorations.active() {
+                self.decorations
+                    .reserve_direct(crate::memsize::sort_key_bytes(&item.keys))?;
+            }
             self.items.push(item);
             self.sift_up(self.items.len() - 1);
         } else if self.cmp(&item, &self.items[0]).is_lt() {
@@ -1166,6 +1231,12 @@ impl TopKKeeper {
                     .reserve_direct(crate::memsize::row_bytes(&item.row))?;
                 let evicted = crate::memsize::row_bytes(&self.items[0].row);
                 self.charge.release(evicted);
+            }
+            if self.decorations.active() {
+                self.decorations
+                    .reserve_direct(crate::memsize::sort_key_bytes(&item.keys))?;
+                let evicted = crate::memsize::sort_key_bytes(&self.items[0].keys);
+                self.decorations.release(evicted);
             }
             self.items[0] = item;
             self.sift_down(0);
@@ -1220,6 +1291,8 @@ impl TopKKeeper {
             };
             by_key.then_with(|| a.pos.cmp(&b.pos))
         });
+        // Undecorated: the decorations go (memory.md §6.8).
+        self.decorations.release_all();
         (
             self.items.into_iter().map(|item| item.row).collect(),
             charge,
@@ -1231,9 +1304,10 @@ pub(crate) fn top_k_rows(
     rows: Vec<Row>,
     order: &[crate::spill::SortKey],
     k: i64,
+    acct: &crate::cost::QueryAccount,
 ) -> Result<Vec<Row>> {
     let collated = order.iter().any(|key| key.3.is_some());
-    let mut keeper = TopKKeeper::new(k, order, collated);
+    let mut keeper = TopKKeeper::new(k, order, collated).with_decorations(acct);
     for row in rows {
         keeper.push(row)?;
     }

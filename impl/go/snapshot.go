@@ -323,10 +323,14 @@ func (s *snapshot) stagedBytes() int64 {
 // state.
 func (s *snapshot) clearStaged() {
 	for _, store := range s.stores {
-		store.clearStaged()
+		if store.hasStaging() {
+			store.clearStaged()
+		}
 	}
 	for _, store := range s.indexStores {
-		store.clearStaged()
+		if store.hasStaging() {
+			store.clearStaged()
+		}
 	}
 }
 

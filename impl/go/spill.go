@@ -146,7 +146,11 @@ func (s *sorter) spillRun() error {
 // Binary compaction bounds both the final merge fan-in and the run directory.
 // Merges join adjacent input intervals, retaining the old stable tie-break.
 // The merged run replaces both inputs, which it closes (deleting them) on success or failure.
+// Each head read back from a run reserves its row_bytes while it is held (memory.md §6.8) on a
+// sibling of the sorter's charge; a head the account rejects is held uncharged.
 func (s *sorter) mergeRunPair(left, right spillFile) (spillFile, error) {
+	heads := s.charge.sibling()
+	defer heads.releaseAll()
 	a, err := openRunSource(left)
 	if err != nil {
 		_ = right.close()
@@ -174,17 +178,36 @@ func (s *sorter) mergeRunPair(left, right spillFile) (spillFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	var aCharged, bCharged int64
+	if ah {
+		aCharged = chargeMergeHead(heads, true, ar)
+	}
 	br, bh, err := b.next()
 	if err != nil {
 		return nil, err
 	}
+	if bh {
+		bCharged = chargeMergeHead(heads, true, br)
+	}
 	for ah || bh {
 		if ah && (!bh || cmpRows(s.keys, ar, br) <= 0) {
 			spillWriteRow(w, ar)
+			popped := aCharged
+			aCharged = 0
 			ar, ah, err = a.next()
+			if err == nil && ah {
+				aCharged = chargeMergeHead(heads, true, ar)
+			}
+			heads.release(popped)
 		} else {
 			spillWriteRow(w, br)
+			popped := bCharged
+			bCharged = 0
 			br, bh, err = b.next()
+			if err == nil && bh {
+				bCharged = chargeMergeHead(heads, true, br)
+			}
+			heads.release(popped)
 		}
 		if err != nil {
 			return nil, err
@@ -202,6 +225,7 @@ func (s *sorter) mergeRunPair(left, right spillFile) (spillFile, error) {
 // and k-way-merges it with the runs.
 func (s *sorter) finish() (*sortedRows, error) {
 	s.sortBuf()
+	heads := s.charge.sibling()
 	charge := s.charge
 	s.charge = nil
 	if len(s.runs) == 0 {
@@ -229,23 +253,25 @@ func (s *sorter) finish() (*sortedRows, error) {
 	}
 	sources = append(sources, &mergeSource{mem: s.buf})
 	h := &mergeHeap{keys: s.keys}
+	m := &merger{sources: sources, heap: h, heads: heads}
 	for i, src := range sources {
 		row, ok, err := src.next()
 		if err != nil {
 			for _, o := range sources {
 				o.close()
 			}
+			heads.releaseAll()
 			charge.releaseAll()
 			return nil, err
 		}
 		if ok {
-			h.items = append(h.items, &mergeItem{row: row, source: i})
+			h.items = append(h.items, &mergeItem{row: row, source: i, charged: m.chargeHead(i, row)})
 		}
 	}
 	heap.Init(h)
 	s.runs = nil
 	s.buf = nil
-	return &sortedRows{merge: &merger{sources: sources, heap: h}, charge: charge}, nil
+	return &sortedRows{merge: m, charge: charge}, nil
 }
 
 // sortedRows is the sorted output stream (spec/design/spill.md §4). The window/projection loop pulls
@@ -295,6 +321,7 @@ func (r *sortedRows) close() {
 		r.stream.close()
 	}
 	if r.merge != nil {
+		r.merge.heads.releaseAll()
 		for _, s := range r.merge.sources {
 			s.close()
 		}
@@ -305,8 +332,35 @@ func (r *sortedRows) close() {
 type merger struct {
 	sources []*mergeSource
 	heap    *mergeHeap
+	// heads is the charge of the heads read back from spilled runs (memory.md §6.8): each reserves
+	// its row_bytes as it enters the heap and is released when it leaves. The final in-memory
+	// buffer's rows are already charged with it, so its heads reserve nothing. The merge cannot spill
+	// further, so a head whose reservation the account rejects is held uncharged (at most one row
+	// per run).
+	heads *stateCharge
 }
 
+// chargeHead reserves a head from source i if it fits, returning the bytes it holds: a spilled
+// run's row is new memory; a rejected head, and the in-memory buffer's, hold nothing.
+func (m *merger) chargeHead(i int, row storedRow) int64 {
+	return chargeMergeHead(m.heads, m.sources[i].isFile, row)
+}
+
+// chargeMergeHead is the shared head-reservation rule (memory.md §6.8): a head read back from a
+// run file try-reserves its row_bytes; anything else, or a rejected head, holds nothing.
+func chargeMergeHead(heads *stateCharge, fromFile bool, row storedRow) int64 {
+	if !heads.active() || !fromFile {
+		return 0
+	}
+	bytes := memRowBytes(row)
+	if heads.tryReserveDirect(bytes) {
+		return bytes
+	}
+	return 0
+}
+
+// next returns the next row in order. The popped head's source replaces it (reserved first), then
+// the popped head's charge is released as the row leaves the merge.
 func (m *merger) next() (storedRow, bool, error) {
 	if m.heap.Len() == 0 {
 		return nil, false, nil
@@ -317,8 +371,9 @@ func (m *merger) next() (storedRow, bool, error) {
 		return nil, false, err
 	}
 	if ok {
-		heap.Push(m.heap, &mergeItem{row: row, source: it.source})
+		heap.Push(m.heap, &mergeItem{row: row, source: it.source, charged: m.chargeHead(it.source, row)})
 	}
+	m.heads.release(it.charged)
 	return it.row, true, nil
 }
 
@@ -379,6 +434,8 @@ func (s *mergeSource) close() {
 type mergeItem struct {
 	row    storedRow
 	source int
+	// charged is the query-memory bytes this head holds (zero for the in-memory buffer's rows).
+	charged int64
 }
 
 type mergeHeap struct {

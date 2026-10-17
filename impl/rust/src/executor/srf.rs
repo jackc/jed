@@ -1653,7 +1653,12 @@ impl Engine {
                     meter.guard()?;
                     meter.charge(COSTS.generated_row);
                     let v = if matches!(srf.kind, SrfKind::JsonbArrayElementsText) {
-                        json::node_to_text(e).map_or(Value::Null, Value::Text)
+                        let v = json::node_to_text(e).map_or(Value::Null, Value::Text);
+                        // A container element's render is a growth kernel (cost.md §8.1, S5).
+                        if json::is_container(e) && !rexpr_is_constant(&srf.args[0]) {
+                            charge_output(meter, &v)?;
+                        }
+                        v
                     } else {
                         Value::Jsonb(e.clone())
                     };
@@ -1692,7 +1697,12 @@ impl Engine {
                     // (key text, value): jsonb_each keeps the value node; _text renders ->>-style
                     // (a string member's raw content, a JSON null → SQL NULL, else canonical).
                     let value = if matches!(srf.kind, SrfKind::JsonbEachText) {
-                        json::node_to_text(v).map_or(Value::Null, Value::Text)
+                        let value = json::node_to_text(v).map_or(Value::Null, Value::Text);
+                        // A container member's render is a growth kernel (cost.md §8.1, S5).
+                        if json::is_container(v) && !rexpr_is_constant(&srf.args[0]) {
+                            charge_output(meter, &value)?;
+                        }
+                        value
                     } else {
                         Value::Jsonb(v.clone())
                     };

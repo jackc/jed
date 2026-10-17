@@ -153,3 +153,11 @@ export function mapEntryBytes(key: Value[], value: Value[]): number {
 export function hashRowBytes(row: Value[]): number {
   return MEMORY_ENTRY + rowBytes(row);
 }
+
+// sortKeyBytes is a collation decoration's measure (memory.md §6.8): each non-NULL collated key counts
+// as the bytea value of its sort key, VALUE + length; a NULL key (an absent slot) counts nothing.
+export function sortKeyBytes(keys: (Uint8Array | null)[]): number {
+  let n = 0;
+  for (const k of keys) if (k !== null) n += MEMORY_VALUE + k.length;
+  return n;
+}

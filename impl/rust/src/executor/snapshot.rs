@@ -1413,14 +1413,14 @@ impl Snapshot {
     }
 
     /// Clear every store's staged bytes: this working snapshot is being published by a commit
-    /// (memory.md §7). Copies a store map only when one of its stores staged something.
+    /// (memory.md §7). Copies a store map only when one of its stores changed since publication.
     pub(crate) fn clear_staged(&mut self) {
-        if self.stores.values().any(|s| s.staged_bytes() != 0) {
+        if self.stores.values().any(|s| s.has_staging()) {
             for store in std::sync::Arc::make_mut(&mut self.stores).values_mut() {
                 store.clear_staged();
             }
         }
-        if self.index_stores.values().any(|s| s.staged_bytes() != 0) {
+        if self.index_stores.values().any(|s| s.has_staging()) {
             for store in std::sync::Arc::make_mut(&mut self.index_stores).values_mut() {
                 store.clear_staged();
             }

@@ -57,9 +57,10 @@ pub static QUERY_MEMORY_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::
 pub(crate) struct QueryAccount {
     pub(crate) used: Rc<Cell<i64>>,
     pub(crate) limit: i64,
-    /// The balance the account opened with — its transaction's pending writes (memory.md §7). The
-    /// statement's releases return only what it reserved, so none may take `used` below this.
-    pub(crate) floor: i64,
+    /// The transaction's pending writes the account holds (memory.md §7): the opening balance, moved
+    /// by each within-statement sync ([`QueryAccount::sync_pending`]). The statement's releases
+    /// return only what it reserved, so none may take `used` below this. Shared like `used`.
+    pub(crate) floor: Rc<Cell<i64>>,
 }
 
 impl QueryAccount {
@@ -99,14 +100,32 @@ impl QueryAccount {
             return;
         }
         let used = self.used.get();
-        if bytes > used - self.floor {
+        let floor = self.floor.get();
+        if bytes > used - floor {
             // An accounting bug (a release without its reservation). Clamp, and count it so the
             // conformance harness's accounting mode can fail the record that caused it.
             QUERY_MEMORY_UNDERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.used.set(self.floor.min(used));
+            self.used.set(floor.min(used));
             return;
         }
         self.used.set(used - bytes);
+    }
+
+    /// Bring the held pending writes to `pending`, the transaction's current pending bytes (the
+    /// within-statement check, memory.md §7.3): growth is reserved and can fail `54P05`; a shrink
+    /// (a write that displaced a version the transaction staged) returns the difference.
+    pub(crate) fn sync_pending(&self, pending: i64) -> Result<()> {
+        if self.limit <= 0 {
+            return Ok(());
+        }
+        let floor = self.floor.get();
+        if pending > floor {
+            self.reserve(pending - floor)?;
+        } else {
+            self.used.set(self.used.get() - (floor - pending));
+        }
+        self.floor.set(pending);
+        Ok(())
     }
 
     /// Admit a projected row (memory.md §5.1).
@@ -146,6 +165,11 @@ pub(crate) struct StateCharge {
 impl StateCharge {
     pub(crate) fn new(acct: QueryAccount) -> Self {
         StateCharge { acct, held: 0 }
+    }
+
+    /// A fresh, empty charge against the same account (an inert charge stays inert).
+    pub(crate) fn sibling(&self) -> Self {
+        StateCharge::new(self.acct.clone())
     }
 
     /// Whether the account has a finite budget — callers skip measuring otherwise.
@@ -291,6 +315,16 @@ impl Meter {
     /// Return `bytes` of live query memory; never errors, never below zero.
     pub fn release_query(&mut self, bytes: i64) {
         self.query.release(bytes);
+    }
+
+    /// The within-statement pending-write check (memory.md §7.3): bring the account's held pending
+    /// writes to `pending`. A rejected growth consults the cost guard first (memory.md §2).
+    pub(crate) fn sync_pending(&mut self, pending: i64) -> Result<()> {
+        if let Err(e) = self.query.sync_pending(pending) {
+            self.guard()?;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Apply the cost-wins rule to a reservation made without this meter (a spill structure or sorter
@@ -552,7 +586,7 @@ mod resource_tests {
         let acct = QueryAccount {
             used: Rc::new(Cell::new(30)),
             limit: 100,
-            floor: 30,
+            floor: Rc::new(Cell::new(30)),
         };
         acct.reserve(20).unwrap();
         let before = QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed);

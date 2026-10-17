@@ -1,0 +1,77 @@
+# Output-constructing kernels (spec/design/cost.md §8.1), slice S5: jsonb extraction renders. The text
+# forms of jsonb extraction — ->>, #>>, jsonb_each_text, and jsonb_array_elements_text — return a
+# string member's own unescaped text, which is part of the operand, but render an object or array
+# member as JSON text, escaping its strings exactly as a jsonb → text cast does. That render is a
+# growth kernel: it charges scalar_byte × the rendered UTF-8 bytes, never reserves the scalar
+# allowance, and is free over constant operands. json (text) extraction returns its verbatim text and
+# charges nothing.
+# jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.order_by, query.set_returning, types.i32, types.text, types.json, types.jsonb, func.json_processing, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, j jsonb, js json)
+
+statement ok
+INSERT INTO t VALUES (1, '{"o": {"k": "a\"b"}, "a": [1, {"x": "y"}], "s": "q\"r"}', '{"o": {"k": 1}}')
+
+# The baseline scan for the column cases below.
+# cost: 3
+query I nosort
+SELECT id FROM t
+----
+1
+
+# ->> of an object member renders it: {"k": "a\"b"} is 13 bytes.
+# cost: 17
+query T nosort
+SELECT j->>'o' FROM t
+----
+{"k": "a\"b"}
+
+# A string member is its own unescaped text, part of the operand: no render charge.
+# cost: 4
+query T nosort
+SELECT j->>'s' FROM t
+----
+q"r
+
+# #>> renders the same way: [1, {"x": "y"}] is 15 bytes.
+# cost: 19
+query T nosort
+SELECT j #>> '{a}' FROM t
+----
+[1, {"x": "y"}]
+
+# Constant operands are free.
+# cost: 2
+query T nosort
+SELECT '{"o": [1, 2]}'::jsonb ->> 'o'
+----
+[1, 2]
+
+# json extraction returns the member's verbatim text: no render.
+# cost: 4
+query T nosort
+SELECT js->>'o' FROM t
+----
+{"k": 1}
+
+# jsonb_each_text renders each container member: 15 bytes for a, 13 for o, nothing for the string s.
+# cost: 36
+query TT nosort
+SELECT key, value FROM t, jsonb_each_text(t.j) ORDER BY key
+----
+a
+[1, {"x": "y"}]
+o
+{"k": "a\"b"}
+s
+q"r
+
+# jsonb_array_elements_text renders the container element {"x": "y"} (10 bytes); the number 1 is free.
+# cost: 17
+query T nosort
+SELECT value FROM t, jsonb_array_elements_text(t.j->'a')
+----
+1
+{"x": "y"}

@@ -1244,7 +1244,7 @@ fn element_in_array(arr: &[JsonNode], e: &JsonNode) -> bool {
 }
 
 /// Whether a node is a container (object or array) vs a scalar (null/bool/number/string).
-fn is_container(n: &JsonNode) -> bool {
+pub(crate) fn is_container(n: &JsonNode) -> bool {
     matches!(n, JsonNode::Object(_) | JsonNode::Array(_))
 }
 

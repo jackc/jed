@@ -977,7 +977,9 @@ impl Engine {
         }
         // Adopt the transaction's temp changes into the committed temp snapshot (temp-tables.md §5) — the
         // temp analogue of publishing `committed`, but purely in memory. SessionState-local temp lives on
-        // the session.
+        // the session. Its stores' staging state resets like main's (memory.md §7), though temp writes
+        // are never pending.
+        temp_working.clear_staged();
         self.session.temp_committed = temp_working;
         // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and
         // adopt it into this engine's pinned attached view, so `publish` swaps a new `Roots::attached`. An

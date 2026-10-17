@@ -214,6 +214,7 @@ import {
   jsonbOut,
   makeObject as jsonMakeObject,
   nodeToText,
+  isContainer as isJsonContainer,
   checkJsonEscapes,
   parsePreservingJson,
   parseShapeJson,
@@ -911,7 +912,13 @@ function evalJsonGetNode(e: Of<"jsonGet">, row: Row, env: EvalEnv, m: Meter): Va
   if (accessed === null) return nullValue();
   if (e.op === "arrow" || e.op === "hashArrow") return jsonbValue(accessed);
   const t = nodeToText(accessed);
-  return t === null ? nullValue() : textValue(t);
+  const out = t === null ? nullValue() : textValue(t);
+  // Rendering a container escapes it, so it can grow: a growth kernel (cost.md §8.1, S5), free when
+  // both operands are constant.
+  if (isJsonContainer(accessed) && !(rexprIsConstant(e.base) && rexprIsConstant(e.arg))) {
+    chargeOutput(m, out);
+  }
+  return out;
 }
 
 function evalJsonContainsNode(e: Of<"jsonContains">, row: Row, env: EvalEnv, m: Meter): Value {

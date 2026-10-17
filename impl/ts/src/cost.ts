@@ -40,8 +40,9 @@ export const queryMemoryPeak = { value: 0 };
 // logical bytes stay far below 2^53 (a huge limit is clamped to Number.MAX_SAFE_INTEGER).
 export class QueryAccount {
   used = 0;
-  // floor is the balance the account opened with — its transaction's pending writes (memory.md §7).
-  // The statement's releases return only what it reserved, so none may take used below it.
+  // floor is the transaction's pending writes the account holds (memory.md §7): the opening balance,
+  // moved by each within-statement sync (syncPending). The statement's releases return only what it
+  // reserved, so none may take used below it. Shared with the account by every meter of the statement.
   floor = 0;
   readonly limit: number;
 
@@ -86,6 +87,20 @@ export class QueryAccount {
     this.used -= bytes;
   }
 
+  // syncPending brings the held pending writes to pending, the transaction's current pending bytes
+  // (the within-statement check, memory.md §7.3): growth is reserved and can throw 54P05; a shrink (a
+  // write that displaced a version the transaction staged) returns the difference.
+  syncPending(pending: number): void {
+    if (this.limit <= 0) return;
+    const floor = this.floor;
+    if (pending > floor) {
+      this.reserve(pending - floor);
+    } else {
+      this.used -= floor - pending;
+    }
+    this.floor = pending;
+  }
+
   // admitRow admits a projected row (memory.md §5.1).
   admitRow(row: Value[]): void {
     if (this.limit > 0) this.reserve(rowBytes(row));
@@ -115,6 +130,11 @@ export class StateCharge {
 
   constructor(acct: QueryAccount = UNLIMITED_QUERY_ACCOUNT) {
     this.acct = acct;
+  }
+
+  // sibling is a fresh, empty charge against the same account (an inert charge stays inert).
+  sibling(): StateCharge {
+    return new StateCharge(this.acct);
   }
 
   // active reports whether the account has a finite budget — callers skip measuring otherwise.
@@ -231,6 +251,16 @@ export class Meter {
   reserveQuery(bytes: number): void {
     try {
       this.query.reserve(bytes);
+    } catch (e) {
+      this.guard();
+      throw e;
+    }
+  }
+  // syncPending is the within-statement pending-write check (memory.md §7.3): bring the account's held
+  // pending writes to pending. A rejected growth consults the cost guard first (memory.md §2).
+  syncPending(pending: number): void {
+    try {
+      this.query.syncPending(pending);
     } catch (e) {
       this.guard();
       throw e;

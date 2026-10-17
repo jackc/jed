@@ -814,7 +814,7 @@ impl Engine {
         dst.scalar_bytes = src.scalar_bytes.clone();
         dst.max_query_memory_bytes = src.max_query_memory_bytes;
         dst.query_bytes = src.query_bytes.clone();
-        dst.query_floor = src.query_floor;
+        dst.query_floor = src.query_floor.clone();
         dst.lifetime_max_cost = src.lifetime_max_cost;
         dst.lifetime_total = src.lifetime_total.clone(); // shared gauge — streaming cost counts (§5)
         dst.cancel = src.cancel.clone();
@@ -1560,14 +1560,16 @@ impl Engine {
             if let Some(k) = plan.phys.top_k {
                 // The selection discards rows: release the buffer, re-reserve the kept rows.
                 charge.release_all();
-                rows = top_k_rows(rows, &plan.order, k)?;
+                let acct = meter.query.clone();
+                rows = meter.cost_first(top_k_rows(rows, &plan.order, k, &acct))?;
                 if charge.active() {
                     for row in &rows {
                         charge.reserve(meter, crate::memsize::row_bytes(row))?;
                     }
                 }
             } else {
-                sort_rows(&mut rows, &plan.order)?;
+                let acct = meter.query.clone();
+                meter.cost_first(sort_rows(&mut rows, &plan.order, &acct))?;
             }
             (
                 total,

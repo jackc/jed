@@ -1838,10 +1838,18 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case jgArrow, jgHashArrow:
 			return JsonbValue(*accessed), nil
 		default: // jgArrowText, jgHashArrowText
+			out := NullValue()
 			if s, ok := jsonNodeToText(accessed); ok {
-				return TextValue(s), nil
+				out = TextValue(s)
 			}
-			return NullValue(), nil
+			// Rendering a container escapes it, so it can grow: a growth kernel (cost.md §8.1, S5),
+			// free when both operands are constant.
+			if jsonIsContainer(accessed) && !(rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs)) {
+				if err := chargeOutput(m, out); err != nil {
+					return Value{}, err
+				}
+			}
+			return out, nil
 		}
 	case reJsonContains:
 		// `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5). One

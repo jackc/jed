@@ -404,6 +404,17 @@ func (db *engine) checkStatementBudgets(cost int64) error {
 	return db.checkPendingWrites(cost)
 }
 
+// syncPendingWrites is the within-statement pending-write check (spec/design/memory.md §7.3), run
+// after each write phase: the statement's account brings the pending writes it holds to the
+// transaction's current pending bytes, so they must fit beside the statement's live reservations
+// (54P05, cost first). Inert, and free, without a finite budget.
+func (db *engine) syncPendingWrites(meter *costMeter) error {
+	if !meter.queryMemoryActive() {
+		return nil
+	}
+	return meter.syncPending(db.session.pendingWriteBytes())
+}
+
 // checkPendingWrites enforces the query-memory budget on the open transaction's pending writes after a
 // statement (spec/design/memory.md §7): the stored bytes its working snapshots have staged must fit
 // maxQueryMemoryBytes, or the statement fails 54P05 — after a reached cost ceiling, which wins

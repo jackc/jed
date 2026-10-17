@@ -1,13 +1,15 @@
 # Pending writes (memory.md §7, Q3): every record version a transaction stages into a table or index
 # reserves its stored bytes — the on-disk record plus any out-of-line payload — against the session's
-# query-memory budget until the transaction commits or rolls back. Each statement opens its account
-# holding the pending bytes, and after each statement the pending bytes alone must fit the budget. A
-# jed-specific resource contract, not a PostgreSQL limit. Here a t row stores 21 bytes with a 10-byte
-# text value and 31 bytes with a 20-byte one.
+# query-memory budget until the transaction commits or rolls back. The measure is net: a write that
+# replaces or deletes a version the transaction staged returns that version's bytes. Each statement
+# opens its account holding the pending bytes, takes on its own staged bytes after each write phase,
+# and after each statement the pending bytes alone must fit the budget. A jed-specific resource
+# contract, not a PostgreSQL limit. Here a t row stores 21 bytes with a 10-byte text value and 31 bytes
+# with a 20-byte one.
 # skip: disk — a transaction and the attached in-memory database cannot span the disk-mode
 # per-record reopen
 # attach: aux
-# requires: harness.attach, attach.in_memory, query.qualified_table, txn.explicit, txn.failed_state, query.select, ddl.create_table, ddl.secondary_index, dml.insert, dml.insert_select, dml.update, query.aggregates, query.set_returning, types.text, types.json, func.json_agg, resource.query_memory
+# requires: harness.attach, attach.in_memory, query.qualified_table, txn.explicit, txn.failed_state, query.select, ddl.create_table, ddl.secondary_index, dml.insert, dml.insert_select, dml.update, dml.delete, query.aggregates, query.set_returning, types.text, types.json, func.json_agg, resource.query_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v text)
@@ -31,17 +33,73 @@ SELECT 1
 ----
 1
 
-# Rewriting a row stages a new version, charged again: the pending bytes are cumulative.
+# Rewriting a row the block staged replaces that version: the pending bytes are net, so a same-size
+# rewrite leaves them at 52.
 statement ok
 UPDATE t SET v = 'cccccccccc' WHERE id = 1
 
-# max_query_memory_bytes: 105
+# max_query_memory_bytes: 84
 query I nosort
 SELECT 1
 ----
 1
 
-# max_query_memory_bytes: 104
+# max_query_memory_bytes: 83
+statement error 54P05
+SELECT 1
+
+statement ok
+ROLLBACK
+
+# A longer rewrite holds only the new version: 31 + 31.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'aaaaaaaaaa')
+
+statement ok
+INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
+
+statement ok
+UPDATE t SET v = 'dddddddddddddddddddd' WHERE id = 1
+
+# max_query_memory_bytes: 94
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 93
+statement error 54P05
+SELECT 1
+
+statement ok
+ROLLBACK
+
+# Deleting a row the block staged returns its bytes: 31 remain.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'aaaaaaaaaa')
+
+statement ok
+INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
+
+statement ok
+UPDATE t SET v = 'dddddddddddddddddddd' WHERE id = 1
+
+statement ok
+DELETE FROM t WHERE id = 2
+
+# max_query_memory_bytes: 63
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 62
 statement error 54P05
 SELECT 1
 
@@ -53,7 +111,57 @@ SELECT count(*) FROM t
 ----
 0
 
-# A write statement's own pending bytes are checked when it completes.
+# A committed row rewritten twice holds one pending version, and deleting it stages nothing.
+statement ok
+INSERT INTO t VALUES (1, 'aaaaaaaaaa')
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE t SET v = 'bbbbbbbbbb' WHERE id = 1
+
+statement ok
+UPDATE t SET v = 'cccccccccc' WHERE id = 1
+
+# max_query_memory_bytes: 53
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 52
+statement error 54P05
+SELECT 1
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE t SET v = 'bbbbbbbbbb' WHERE id = 1
+
+statement ok
+UPDATE t SET v = 'cccccccccc' WHERE id = 1
+
+statement ok
+DELETE FROM t WHERE id = 1
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+statement ok
+ROLLBACK
+
+statement ok
+DELETE FROM t
+
+# A write statement's own pending bytes join its account as soon as its write phase completes.
 statement ok
 BEGIN
 
@@ -124,6 +232,19 @@ query I nosort
 SELECT count(*) FROM t
 ----
 3
+
+# INSERT ... SELECT keeps its source rows charged until the statement ends (memory.md §5.3), and they
+# are still held when its 52 staged bytes join the account: the statement needs both.
+# max_query_memory_bytes: 443
+statement error 54P05
+INSERT INTO t SELECT id + 10, v FROM t WHERE id <= 2
+
+# max_query_memory_bytes: 444
+statement ok
+INSERT INTO t SELECT id + 10, v FROM t WHERE id <= 2
+
+statement ok
+DELETE FROM t WHERE id > 10
 
 # A value stored out of line counts its overflow-chain payload.
 statement ok

@@ -916,7 +916,7 @@ pub struct SessionState {
     pub(crate) max_query_memory_bytes: i64,
     pub(crate) query_bytes: std::rc::Rc<std::cell::Cell<i64>>,
     /// The pending-write balance the current statement's account opened with (memory.md §7).
-    pub(crate) query_floor: i64,
+    pub(crate) query_floor: std::rc::Rc<std::cell::Cell<i64>>,
     /// The open transaction, if any. `None` is autocommit between statements (transactions.md
     /// §4.1); a single-statement autocommit write opens one implicitly for its duration. The
     /// `Idle`/`Open`/`Failed` status (session.md §2.2) is derived from this ([`TxStatus::of`]).
@@ -1086,7 +1086,7 @@ impl SessionState {
         crate::cost::QueryAccount {
             used: self.query_bytes.clone(),
             limit: self.max_query_memory_bytes,
-            floor: self.query_floor,
+            floor: self.query_floor.clone(),
         }
     }
 
@@ -1114,7 +1114,7 @@ impl SessionState {
             0
         };
         self.query_bytes = std::rc::Rc::new(std::cell::Cell::new(pending));
-        self.query_floor = pending;
+        self.query_floor = std::rc::Rc::new(std::cell::Cell::new(pending));
     }
 
     /// The stored bytes the open transaction's working snapshots (main and attached databases) have
@@ -1148,7 +1148,7 @@ impl SessionState {
             scalar_bytes: std::rc::Rc::new(std::cell::Cell::new(0)),
             max_query_memory_bytes: opts.max_query_memory_bytes,
             query_bytes: std::rc::Rc::new(std::cell::Cell::new(0)),
-            query_floor: 0,
+            query_floor: std::rc::Rc::new(std::cell::Cell::new(0)),
             max_cost: opts.max_cost,
             lifetime_max_cost: opts.lifetime_max_cost,
             lifetime_total: std::rc::Rc::new(std::cell::Cell::new(0)),

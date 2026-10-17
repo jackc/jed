@@ -268,7 +268,7 @@ type sessionState struct {
 	queryBytes          *int64
 	maxQueryMemoryBytes int64
 	// queryFloor is the pending-write balance the current statement's account opened with (memory.md §7).
-	queryFloor int64
+	queryFloor *int64
 	// fkActionDepth bounds recursive generated referential-action statements (§6.6).
 	fkActionDepth int
 	// fkDeferredChecks holds inbound NO ACTION/RESTRICT probes until the outermost generated
@@ -1707,10 +1707,10 @@ func (s *sessionState) queryAccount() queryAccount {
 func (s *sessionState) resetStatementMemory() {
 	s.scalarBytes = new(int64)
 	s.queryBytes = new(int64)
-	s.queryFloor = 0
+	s.queryFloor = new(int64)
 	if s.maxQueryMemoryBytes > 0 {
-		s.queryFloor = s.pendingWriteBytes()
-		*s.queryBytes = s.queryFloor
+		*s.queryFloor = s.pendingWriteBytes()
+		*s.queryBytes = *s.queryFloor
 	}
 }
 

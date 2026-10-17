@@ -293,6 +293,9 @@ func (db *engine) commitTx() (outcome, error) {
 			return outcome{}, err
 		}
 	}
+	// Its stores' staging state resets like main's (memory.md §7), though temp writes are never
+	// pending.
+	tx.tempWorking.clearStaged()
 	tx.tempWorking.freezeMutationGenerations()
 	db.session.tempCommitted = tx.tempWorking
 	// Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and adopt it

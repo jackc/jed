@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { RowSpool, SpillMap, SpillMultiMap, SpoolSorter, sortSpool } from "../src/blocking.ts";
 import { QueryAccount, StateCharge } from "../src/cost.ts";
+import { rowBytes } from "../src/memsize.ts";
 import { EngineError, createDatabase, queryOutcome, render, type Engine } from "../src/tooling.ts";
 import { FileSpillSink } from "../src/spillfile.ts";
 import {
@@ -204,6 +205,51 @@ test("spool and skewed bucket replay stay streaming with bounded descriptors", (
 test("scratch codec preserves signed values and empty recursive arrays", () => {
   const row = [intValue(-123n), arrayValue([]), arrayValue([intValue(-1n)])];
   assert.deepEqual(decodeSpillRow(encodeSpillRow(row)), row);
+});
+
+// memory.md §6.8: each head read back from a spilled run reserves its row_bytes while it is in the
+// merge heap; the final in-memory buffer's rows are already charged with the buffer. A head the account
+// rejects is held uncharged: the merge cannot spill further.
+test("merge heads of spilled runs are charged", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-blocking-test-"));
+  const files = new FileSpillSink(dir);
+  // A run-file-only sink selects the external Sorter; a scratch sink selects the SpoolSorter.
+  const runSink: SpillSink = { writeRun: (bytes) => files.writeRun(bytes) };
+  const compare = (a: readonly unknown[], b: readonly unknown[]) =>
+    Number((a[0] as { int: bigint }).int) - Number((b[0] as { int: bigint }).int);
+  const rowSize = rowBytes([intValue(0n), intValue(0n)]);
+  const drain = (sorted: { next(): unknown; close(): void }) => {
+    let count = 0;
+    while (sorted.next() !== null) count++;
+    return count;
+  };
+  try {
+    // Budget 3 rows: rows 0-3 and 4-7 spill as runs, rows 8-9 stay buffered. The external Sorter
+    // keeps both runs; the SpoolSorter compacts them into one.
+    for (const [make, runs] of [
+      [(c: StateCharge) => new Sorter(compare, rowSize * 3, runSink, c), 2],
+      [(c: StateCharge) => new SpoolSorter(compare, rowSize * 3, files, c), 1],
+    ] as const) {
+      const acct = new QueryAccount(2 ** 40);
+      const sort = make(new StateCharge(acct));
+      for (let i = 0; i < 10; i++) sort.push([intValue(BigInt(i % 3)), intValue(BigInt(i))]);
+      const sorted = sort.finish();
+      assert.equal(acct.used, (runs + 2) * rowSize);
+      assert.equal(drain(sorted), 10);
+      sorted.close();
+      assert.equal(acct.used, 0);
+
+      const tight = new QueryAccount(1);
+      const tightSort = make(new StateCharge(tight));
+      for (let i = 0; i < 10; i++) tightSort.push([intValue(BigInt(i % 3)), intValue(BigInt(i))]);
+      const tightSorted = tightSort.finish();
+      assert.equal(drain(tightSorted), 10);
+      tightSorted.close();
+      assert.equal(tight.used, 0);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // An account well below work_mem makes each spill structure spill on its first rejected reservation

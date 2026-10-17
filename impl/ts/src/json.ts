@@ -1168,7 +1168,7 @@ function nodesEqual(a: JsonNode, b: JsonNode): boolean {
 
 // isContainer reports whether a node is a container (object or array) vs a scalar
 // (null/bool/number/string).
-function isContainer(n: JsonNode): boolean {
+export function isContainer(n: JsonNode): boolean {
   return n.kind === "object" || n.kind === "array";
 }
 
