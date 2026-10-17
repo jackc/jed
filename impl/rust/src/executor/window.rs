@@ -1552,7 +1552,7 @@ mod registry_tests {
                     "decimal" => ResolvedType::Decimal,
                     "float" => ResolvedType::Float(ScalarType::Float64),
                     "boolean" => ResolvedType::Bool,
-                    "exact_numeric" => ResolvedType::Decimal,
+                    "numeric" => ResolvedType::Float(ScalarType::Float64),
                     "text" => ResolvedType::Text,
                     "bytea" => ResolvedType::Bytea,
                     _ => ResolvedType::Int(ScalarType::Int32), // "any"

@@ -207,29 +207,18 @@ const (
 	planStddevSampFloat
 	// regr_count(Y, X) — the number of pairs whose arguments are both non-NULL (aggregates.md §23).
 	planRegrCount
-	// The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
+	// The two-argument statistical aggregates (aggregates.md §23): f64 over numeric arguments.
 	planCovarPop
-	planCovarPopFloat
 	planCovarSamp
-	planCovarSampFloat
 	planCorr
-	planCorrFloat
 	planRegrAvgx
-	planRegrAvgxFloat
 	planRegrAvgy
-	planRegrAvgyFloat
 	planRegrSxx
-	planRegrSxxFloat
 	planRegrSyy
-	planRegrSyyFloat
 	planRegrSxy
-	planRegrSxyFloat
 	planRegrSlope
-	planRegrSlopeFloat
 	planRegrIntercept
-	planRegrInterceptFloat
 	planRegrR2
-	planRegrR2Float
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -386,8 +375,7 @@ type acc struct {
 	// over integer/decimal input, PostgreSQL's float8 transition values over float input.
 	exact momentsExact
 	float momentsFloat
-	pairs pairsExact
-	fpair pairsFloat
+	pairs pairsFloat
 	// Ordered-set aggregate state (spec/design/aggregates.md §13): the WITHIN GROUP direction +
 	// the **evaluated** percentile fraction for this group, plus the collected non-NULL values
 	// (percentile_cont widens to f64 into osaFloats; mode/percentile_disc keep the Value in
@@ -638,9 +626,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		return a.float.fold(v)
 	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy, planRegrSxy, planRegrSlope, planRegrIntercept, planRegrR2:
-		return a.pairs.fold(v, m)
-	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat, planRegrSyyFloat, planRegrSxyFloat, planRegrSlopeFloat, planRegrInterceptFloat, planRegrR2Float:
-		return a.fpair.fold(v)
+		return a.pairs.fold(v)
 	case planRegrCount:
 		if f := *v.composite(); !f[0].IsNull() && !f[1].IsNull() {
 			a.count++
@@ -981,9 +967,7 @@ func (a *acc) finalize() (Value, error) {
 		st := momentStats[a.plan]
 		return a.float.variance(st.sample, st.stddev), nil
 	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy, planRegrSxy, planRegrSlope, planRegrIntercept, planRegrR2:
-		return a.pairs.finalize(pairStats[a.plan])
-	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat, planRegrSyyFloat, planRegrSxyFloat, planRegrSlopeFloat, planRegrInterceptFloat, planRegrR2Float:
-		return a.fpair.finalize(pairStats[a.plan]), nil
+		return a.pairs.finalize(pairStats[a.plan]), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
 	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:

@@ -66,9 +66,10 @@ func argFamily(t resolvedType) string {
 // familyMatches reports whether a resolved argument satisfies one catalog family slot. "any"
 // accepts everything (NULL included); a concrete family matches only its own type.
 func familyMatches(slot string, t resolvedType) bool {
-	if slot == "exact_numeric" {
-		// The pseudo-family of the exact two-argument statistical aggregates (aggregates.md §23).
-		return t.kind == rtInt || t.kind == rtDecimal
+	if slot == "numeric" {
+		// The pseudo-family of the two-argument statistical aggregates (aggregates.md §23): any
+		// integer, decimal, or float argument, widened to f64.
+		return t.kind == rtInt || t.kind == rtDecimal || t.kind == rtFloat32 || t.kind == rtFloat64
 	}
 	return slot == "any" || argFamily(t) == slot
 }
@@ -244,8 +245,8 @@ func selectUnknownOverload(name string, tys []resolvedType, literals []bool) (*o
 // each single-type family its own scalar. ok=false for "any" (and the polymorphic pseudo-families).
 func familyParamType(family string) (scalarType, bool) {
 	switch family {
-	case "exact_numeric":
-		return scalarDecimal, true
+	case "numeric":
+		return scalarFloat64, true
 	case "integer":
 		return scalarInt64, true
 	case "float":
@@ -3032,11 +3033,8 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 		return planRegrCount, resolvedType{kind: rtInt, intTy: scalarInt64}
 	}
 	// The statistical aggregates: exact over integer/decimal (a decimal result), float over float.
-	if plans, ok := pairSurfaces[surface]; ok {
-		if result == "f64" {
-			return plans[1], resolvedType{kind: rtFloat64}
-		}
-		return plans[0], resolvedType{kind: rtDecimal}
+	if plan, ok := pairSurfaces[surface]; ok {
+		return plan, resolvedType{kind: rtFloat64}
 	}
 	if plans, ok := momentSurfaces[surface]; ok {
 		if result == "f64" {

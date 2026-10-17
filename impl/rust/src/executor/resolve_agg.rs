@@ -480,9 +480,13 @@ pub(crate) fn arg_family(t: &ResolvedType) -> Option<&'static str> {
 /// Whether a resolved argument satisfies one catalog family slot. "any" accepts everything
 /// (NULL included); a concrete family matches only its own type.
 pub(crate) fn family_matches(slot: &str, t: &ResolvedType) -> bool {
-    if slot == "exact_numeric" {
-        // The pseudo-family of the exact two-argument statistical aggregates (aggregates.md §23).
-        return matches!(t, ResolvedType::Int(_) | ResolvedType::Decimal);
+    if slot == "numeric" {
+        // The pseudo-family of the two-argument statistical aggregates (aggregates.md §23): any
+        // integer, decimal, or float argument, widened to f64.
+        return matches!(
+            t,
+            ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Float(_)
+        );
     }
     slot == "any" || arg_family(t) == Some(slot)
 }
@@ -617,7 +621,7 @@ pub(crate) fn select_unknown_overload(
 /// single-type family its own scalar. `None` for `any` (and the polymorphic pseudo-families).
 pub(crate) fn family_param_type(family: &str) -> Option<ScalarType> {
     Some(match family {
-        "exact_numeric" => ScalarType::Decimal,
+        "numeric" => ScalarType::Float64,
         "integer" => ScalarType::Int64,
         "float" => ScalarType::Float64,
         "decimal" => ScalarType::Decimal,
@@ -1584,18 +1588,13 @@ pub(crate) fn aggregate_plan(
         ("bit_or", "same_as_input") => (AggPlan::Bit(BitOp::Or), t.clone()),
         ("bit_xor", "same_as_input") => (AggPlan::Bit(BitOp::Xor), t.clone()),
         ("regr_count", "i64") => (AggPlan::RegrCount, ResolvedType::Int(ScalarType::Int64)),
-        // The two-argument statistical aggregates, likewise exact or float.
-        (s, "decimal" | "f64") if PairStat::from_surface(s).is_some() => {
-            let stat = PairStat::from_surface(s).unwrap();
-            if result == "f64" {
-                (
-                    AggPlan::Pair { stat, float: true },
-                    ResolvedType::Float(ScalarType::Float64),
-                )
-            } else {
-                (AggPlan::Pair { stat, float: false }, ResolvedType::Decimal)
-            }
-        }
+        // The two-argument statistical aggregates: numeric arguments widened to f64.
+        (s, "f64") if PairStat::from_surface(s).is_some() => (
+            AggPlan::Pair {
+                stat: PairStat::from_surface(s).unwrap(),
+            },
+            ResolvedType::Float(ScalarType::Float64),
+        ),
         // The statistical aggregates: exact over integer/decimal (a decimal result), float over
         // float.
         (s, "decimal" | "f64") if MomentStat::from_surface(s).is_some() => {

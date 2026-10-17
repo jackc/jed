@@ -1,8 +1,7 @@
-# Aggregate regr_sxx(Y, X) (spec/design/aggregates.md §23): the sum of squared deviations of X over the pairs whose arguments are both non-NULL. Over two float arguments it is
-# PostgreSQL's float8 algorithm with an f64 result; over two integer/decimal arguments it is exact, a
-# decimal result — a jed divergence (PostgreSQL defines it only over float8), ledgered in
-# oracle_overrides.toml, whose expected values are PostgreSQL's numeric evaluation of the formula in
-# aggregates.md §23. A pair with a NULL is skipped. Output name `regr_sxx`.
+# Aggregate regr_sxx(Y, X) (spec/design/aggregates.md §23): the sum of squared deviations of X over the pairs whose arguments are both non-NULL. Like PostgreSQL, which defines it
+# only over float8, it takes any two numeric arguments, widens each to f64 as a cast to float8 does,
+# and computes PostgreSQL's float8 algorithm with an f64 result. A pair with a NULL is skipped. Output
+# name `regr_sxx`.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.regr_sxx, func.covar_pop
 
 statement ok
@@ -81,37 +80,38 @@ NaN
 statement error 22003
 SELECT regr_sxx(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
 
-# Over integer and decimal arguments: exact.
+# Integer and decimal arguments widen to f64, in any mix with each other and with floats.
 # names: regr_sxx
 # cost: 20
-query D nosort
+query R nosort
 SELECT regr_sxx(y, x) FROM t
 ----
-29.2000000000000000
+29.2
 
-# names: regr_sxx, regr_sxx
-query DD nosort
-SELECT regr_sxx(dy, dx), regr_sxx(y, dx) FROM t
+# names: regr_sxx, regr_sxx, regr_sxx
+query RRR nosort
+SELECT regr_sxx(dy, dx), regr_sxx(y, dx), regr_sxx(fy, x) FROM t
 ----
-29.1875000000000000
-29.3000000000000000
+29.1875
+29.3
+29.2
 
 # names: g, regr_sxx
-query ID rowsort
+query IR rowsort
 SELECT g, regr_sxx(dy, x) FROM t GROUP BY g
 ----
 1
-24.6666666666666667
+24.666666666666664
 2
-2.0000000000000000
+2
 
 # names: regr_sxx
-query D nosort
+query R nosort
 SELECT regr_sxx(DISTINCT y, y) FROM t
 ----
-29.2000000000000000
+29.200000000000003
 
-# Wide decimals charge decimal_work for each pair's three products and five sums.
+# Wide decimals widen like any other: no decimal arithmetic is charged.
 statement ok
 CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
 
@@ -119,15 +119,14 @@ statement ok
 INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
 
 # names: regr_sxx
-# cost: 180
-query D nosort
+# cost: 11
+query R nosort
 SELECT regr_sxx(y, x) FROM big
 ----
-657973626503669769067.54689961
+6.579736265036695e+20
 
-# A float argument beside an exact one has no overload.
 statement error 42883
-SELECT regr_sxx(fy, x) FROM t
+SELECT regr_sxx(y, s) FROM (VALUES (1, 'a')) v(y, s)
 
 statement error 42883
 SELECT regr_sxx(y) FROM t

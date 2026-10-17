@@ -1243,10 +1243,6 @@ fn pack_acc(acc: Acc) -> Row {
         Acc::MomentsFloat { n, sx, sxx, .. } => {
             vec![Value::Float64(n), Value::Float64(sx), Value::Float64(sxx)]
         }
-        // [int N, decimal Σx, decimal Σx², decimal Σy, decimal Σy², decimal Σxy].
-        Acc::PairsExact { n, sums, .. } => std::iter::once(Value::Int(n))
-            .chain(sums.into_iter().map(Value::Decimal))
-            .collect(),
         // [f64 N, f64 Σx, f64 Sxx, f64 Σy, f64 Syy, f64 Sxy].
         Acc::PairsFloat { t, .. } => t.into_iter().map(Value::Float64).collect(),
         // The seen flag; over array inputs then the first input's shape — its dimension count and
@@ -1348,10 +1344,6 @@ fn unpack_acc(spec: &AggSpec, state: Row, zone: &crate::timezone::ZoneRef) -> Ac
             *n = f(0);
             *sx = f(1);
             *sxx = f(2);
-        }
-        Acc::PairsExact { n, sums, .. } => {
-            *n = int(0);
-            **sums = std::array::from_fn(|i| dec(1 + i));
         }
         Acc::PairsFloat { t, .. } => {
             *t = std::array::from_fn(|i| match state[i] {

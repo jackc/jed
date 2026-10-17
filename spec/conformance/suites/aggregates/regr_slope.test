@@ -1,8 +1,7 @@
-# Aggregate regr_slope(Y, X) (spec/design/aggregates.md §23): the slope of the least-squares line through the pairs whose arguments are both non-NULL, NULL when X is constant. Over two float arguments it is
-# PostgreSQL's float8 algorithm with an f64 result; over two integer/decimal arguments it is exact, a
-# decimal result — a jed divergence (PostgreSQL defines it only over float8), ledgered in
-# oracle_overrides.toml, whose expected values are PostgreSQL's numeric evaluation of the formula in
-# aggregates.md §23. A pair with a NULL is skipped. Output name `regr_slope`.
+# Aggregate regr_slope(Y, X) (spec/design/aggregates.md §23): the slope of the least-squares line through the pairs whose arguments are both non-NULL, NULL when X is constant. Like PostgreSQL, which defines it
+# only over float8, it takes any two numeric arguments, widens each to f64 as a cast to float8 does,
+# and computes PostgreSQL's float8 algorithm with an f64 result. A pair with a NULL is skipped. Output
+# name `regr_slope`.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.regr_slope, func.covar_pop
 
 statement ok
@@ -81,37 +80,38 @@ NaN
 statement error 22003
 SELECT regr_slope(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
 
-# Over integer and decimal arguments: exact.
+# Integer and decimal arguments widen to f64, in any mix with each other and with floats.
 # names: regr_slope
 # cost: 20
-query D nosort
+query R nosort
 SELECT regr_slope(y, x) FROM t
 ----
-0.96575342465753424658
+0.9657534246575342
 
-# names: regr_slope, regr_slope
-query DD nosort
-SELECT regr_slope(dy, dx), regr_slope(y, dx) FROM t
+# names: regr_slope, regr_slope, regr_slope
+query RRR nosort
+SELECT regr_slope(dy, dx), regr_slope(y, dx), regr_slope(fy, x) FROM t
 ----
-0.90256959314775160600
-0.95904436860068259386
+0.9025695931477516
+0.9590443686006827
+0.9657534246575342
 
 # names: g, regr_slope
-query ID rowsort
+query IR rowsort
 SELECT g, regr_slope(dy, x) FROM t GROUP BY g
 ----
 1
-0.95608108108108108108
+0.9560810810810811
 2
-0.50000000000000000000
+0.5
 
 # names: regr_slope
-query D nosort
+query R nosort
 SELECT regr_slope(DISTINCT y, y) FROM t
 ----
-1.00000000000000000000
+1
 
-# Wide decimals charge decimal_work for each pair's three products and five sums.
+# Wide decimals widen like any other: no decimal arithmetic is charged.
 statement ok
 CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
 
@@ -119,15 +119,14 @@ statement ok
 INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
 
 # names: regr_slope
-# cost: 180
-query D nosort
+# cost: 11
+query R nosort
 SELECT regr_slope(y, x) FROM big
 ----
-13.7541309055105343
+13.75413090551054
 
-# A float argument beside an exact one has no overload.
 statement error 42883
-SELECT regr_slope(fy, x) FROM t
+SELECT regr_slope(y, s) FROM (VALUES (1, 'a')) v(y, s)
 
 statement error 42883
 SELECT regr_slope(y) FROM t

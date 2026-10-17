@@ -291,8 +291,8 @@ operation rather than discovering sensitivity at runtime:
 | `SUM`/`AVG` over **decimal** | no (**resolved**) | values associative; the fold checks the cap only on the **final** result (the `add_uncapped` accumulator path — [decimal.md](decimal.md) §2), matching PG → order-independent. (Previously trapped on the first over-cap intermediate, an order-dependent trap; that edge is closed.) |
 | `SUM`/`AVG` over **float** | yes (value) | **C**: ledgered (`float-sum-order`) — streaming scan-order fold, order-independence declined as float over-investment (§6, float.md §7). Parallelism *joins* this existing exemption, never creates it. |
 | `bit_and`/`bit_or`/`bit_xor`, `every`, `regr_count` | no (commutative+associative) | parallel-safe |
-| statistical aggregates over **int/decimal** (`var_*`, `stddev*`, `covar_*`, `corr`, `regr_*`) | no (exact decimal sums; only the final result is cap-checked) | parallel-safe |
-| statistical aggregates over **float** | yes (value) | **C**: ledgered (`float-moment-order`) — PostgreSQL's Youngs-Cramer fold in scan order, the same footing as float `SUM`/`AVG` ([aggregates.md](aggregates.md) §23) |
+| `var_*`, `stddev*` over **int/decimal** | no (exact decimal sums; only the final result is cap-checked) | parallel-safe |
+| `var_*`, `stddev*` over **float**; `covar_*`, `corr`, `regr_*` (except `regr_count`) over any numeric input | yes (value) | **C**: ledgered (`float-moment-order`) — PostgreSQL's Youngs-Cramer fold in scan order, the same footing as float `SUM`/`AVG` ([aggregates.md](aggregates.md) §23) |
 | `string_agg`, `array_agg`, `json_agg` | yes (inherently) | **B/C** below — concatenation order *is* the meaning |
 
 **Three resolutions for an order-sensitive operation** (prefer the determinism-preserving):

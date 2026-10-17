@@ -1,9 +1,8 @@
-# Aggregate corr(Y, X) (spec/design/aggregates.md §23): the correlation coefficient of the (Y, X) pairs whose arguments are both non-NULL, NULL when either variable is constant. Over two float arguments it is
-# PostgreSQL's float8 algorithm with an f64 result; over two integer/decimal arguments it is exact, a
-# decimal result — a jed divergence (PostgreSQL defines it only over float8), ledgered in
-# oracle_overrides.toml, whose expected values are PostgreSQL's numeric evaluation of the formula in
-# aggregates.md §23. A pair with a NULL is skipped. Output name `corr`.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.corr
+# Aggregate corr(Y, X) (spec/design/aggregates.md §23): the correlation coefficient of the (Y, X) pairs whose arguments are both non-NULL, NULL when either variable is constant. Like PostgreSQL, which defines it
+# only over float8, it takes any two numeric arguments, widens each to f64 as a cast to float8 does,
+# and computes PostgreSQL's float8 algorithm with an f64 result. A pair with a NULL is skipped. Output
+# name `corr`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f32, types.f64, resource.cost_metering, func.corr, func.covar_pop
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, g i32, y i32, x i32, dy numeric(6,2), dx numeric(6,1), fy f64, fx f64, ry f32, rx f32)
@@ -81,37 +80,38 @@ NaN
 statement error 22003
 SELECT corr(y, x) FROM (VALUES (1e308::f64, 1.0::f64), (-1e308::f64, 2.0::f64)) v(y, x)
 
-# Over integer and decimal arguments: exact.
+# Integer and decimal arguments widen to f64, in any mix with each other and with floats.
 # names: corr
 # cost: 20
-query D nosort
+query R nosort
 SELECT corr(y, x) FROM t
 ----
-0.96575342465753424658
+0.9657534246575342
 
-# names: corr, corr
-query DD nosort
-SELECT corr(dy, dx), corr(y, dx) FROM t
+# names: corr, corr, corr
+query RRR nosort
+SELECT corr(dy, dx), corr(y, dx), corr(fy, x) FROM t
 ----
-0.92073978190759628866
-0.96068516427184777546
+0.9207397819075961
+0.9606851642718476
+0.9657534246575342
 
 # names: g, corr
-query ID rowsort
+query IR rowsort
 SELECT g, corr(dy, x) FROM t GROUP BY g
 ----
 1
-0.94419399122604417874
+0.9441939912260442
 2
-1.00000000000000000000
+1
 
 # names: corr
-query D nosort
+query R nosort
 SELECT corr(DISTINCT y, y) FROM t
 ----
-1.00000000000000000000
+1
 
-# Wide decimals charge decimal_work for each pair's three products and five sums.
+# Wide decimals widen like any other: no decimal arithmetic is charged.
 statement ok
 CREATE TABLE big (id i32 PRIMARY KEY, y numeric, x numeric)
 
@@ -119,15 +119,14 @@ statement ok
 INSERT INTO big VALUES (1, 123456789012.123456789, 5), (2, -987654321098.987654321, 6.25), (3, 5, 31415926535.8979)
 
 # names: corr
-# cost: 180
-query D nosort
+# cost: 11
+query R nosort
 SELECT corr(y, x) FROM big
 ----
-0.40964401594808833149862359
+0.40964401594808836
 
-# A float argument beside an exact one has no overload.
 statement error 42883
-SELECT corr(fy, x) FROM t
+SELECT corr(y, s) FROM (VALUES (1, 'a')) v(y, s)
 
 statement error 42883
 SELECT corr(y) FROM t

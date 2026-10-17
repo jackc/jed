@@ -95,9 +95,9 @@ REQUIRED_FIELDS  = %w[name kind arity arg_families arg_resolution result null er
 # these reserved widening ids; `null` is the single "aggregate" skip-NULL discipline.
 RESERVED_AGG_RESULTS = %w[sum_widen same_as_input array_of_input].to_set
 AGG_ARGS             = %w[star expr].to_set
-# Aggregate argument pseudo-families: "any" (unconstrained) and "exact_numeric" (the integer or
-# decimal family — the exact two-argument statistical aggregates, ../design/aggregates.md §23).
-AGG_PSEUDO_FAMILIES  = %w[any exact_numeric].to_set
+# Aggregate argument pseudo-families: "any" (unconstrained) and "numeric" (the integer, decimal, or
+# float family — the two-argument statistical aggregates, ../design/aggregates.md §23).
+AGG_PSEUDO_FAMILIES  = %w[any numeric].to_set
 AGG_NULL_BEHAVIORS   = %w[aggregate].to_set
 AGG_REQUIRED_FIELDS  = %w[name kind surface arg result null errors].freeze
 
