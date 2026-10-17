@@ -6061,14 +6061,25 @@ pub(crate) enum WindowPlan {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MomentStat {
     VarPop,
+    VarSamp,
 }
 
 impl MomentStat {
+    /// The statistic a one-argument statistical aggregate's surface names.
+    pub(crate) fn from_surface(surface: &str) -> Option<MomentStat> {
+        Some(match surface {
+            "var_pop" => MomentStat::VarPop,
+            "var_samp" => MomentStat::VarSamp,
+            _ => return None,
+        })
+    }
+
     /// Whether the statistic is a sample (N − 1) rather than a population (N) one, and whether it
     /// is a standard deviation rather than a variance.
     pub(crate) fn sample_stddev(self) -> (bool, bool) {
         match self {
             MomentStat::VarPop => (false, false),
+            MomentStat::VarSamp => (true, false),
         }
     }
 }

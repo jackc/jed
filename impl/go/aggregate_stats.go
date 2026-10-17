@@ -9,6 +9,22 @@ import "math"
 // Over float input they follow PostgreSQL's float8 transition (the Youngs-Cramer update of
 // float8_accum) and return f64.
 
+// momentSurfaces maps each one-argument statistical aggregate to its exact and float plans.
+var momentSurfaces = map[string][2]aggPlan{
+	"var_pop":  {planVarPop, planVarPopFloat},
+	"var_samp": {planVarSamp, planVarSampFloat},
+}
+
+// momentStat is what a statistical plan finalizes: a sample (N − 1) or population (N) statistic, and
+// a standard deviation or a variance.
+type momentStat struct{ sample, stddev bool }
+
+// momentStats gives each statistical plan's statistic.
+var momentStats = map[aggPlan]momentStat{
+	planVarPop: {}, planVarPopFloat: {},
+	planVarSamp: {sample: true}, planVarSampFloat: {sample: true},
+}
+
 // momentsExact is the exact one-argument moment state: the count of non-NULL inputs and the decimal
 // sums of x and x².
 type momentsExact struct {

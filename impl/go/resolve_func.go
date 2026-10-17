@@ -3022,6 +3022,13 @@ func lookupAggregateOverload(surface string, t resolvedType) *aggregateDesc {
 // result code keeps the name gate + overload validation data-driven while the kernel stays
 // hand-written (§5). surface is the (folded) call name; result the matched row's code.
 func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedType) {
+	// The statistical aggregates: exact over integer/decimal (a decimal result), float over float.
+	if plans, ok := momentSurfaces[surface]; ok {
+		if result == "f64" {
+			return plans[1], resolvedType{kind: rtFloat64}
+		}
+		return plans[0], resolvedType{kind: rtDecimal}
+	}
 	switch {
 	case surface == "count":
 		return planCount, resolvedType{kind: rtInt, intTy: scalarInt64}
@@ -3064,10 +3071,6 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 		return planStringAgg, resolvedType{kind: rtText}
 	case surface == "string_agg" && result == "bytea":
 		return planStringAgg, resolvedType{kind: rtBytea}
-	case surface == "var_pop" && result == "decimal":
-		return planVarPop, resolvedType{kind: rtDecimal}
-	case surface == "var_pop" && result == "f64":
-		return planVarPopFloat, resolvedType{kind: rtFloat64}
 	case surface == "array_agg" && result == "array_of_input":
 		// An array input stacks into one more dimension of the same (dimension-agnostic) array type.
 		if t.kind == rtArray {

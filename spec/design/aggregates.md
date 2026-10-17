@@ -756,6 +756,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `array_agg(x)` | any | `T[]`, or the input array type | the inputs, NULLs included, as an array |
 | `string_agg(x, d)` | `text, text` / `bytea, bytea` | `text` / `bytea` | the non-NULL values joined by the delimiters |
 | `var_pop(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the population variance |
+| `var_samp(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the sample variance |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -832,3 +833,4 @@ order, which the determinism ledger records as `float-moment-order` (the same fo
 bounded-spill lane: exact `[int N, decimal Σx, decimal Σx²]`, float `[f64 N, f64 Σx, f64 Sxx]`.
 
 - `var_pop` is the population variance.
+- `var_samp` is the sample variance; NULL over fewer than two inputs.

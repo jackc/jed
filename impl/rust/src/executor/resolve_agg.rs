@@ -1578,20 +1578,22 @@ pub(crate) fn aggregate_plan(
         ("bit_and", "same_as_input") => (AggPlan::Bit(BitOp::And), t.clone()),
         ("bit_or", "same_as_input") => (AggPlan::Bit(BitOp::Or), t.clone()),
         ("bit_xor", "same_as_input") => (AggPlan::Bit(BitOp::Xor), t.clone()),
-        ("var_pop", "decimal") => (
-            AggPlan::Moment {
-                stat: MomentStat::VarPop,
-                float: false,
-            },
-            ResolvedType::Decimal,
-        ),
-        ("var_pop", "f64") => (
-            AggPlan::Moment {
-                stat: MomentStat::VarPop,
-                float: true,
-            },
-            ResolvedType::Float(ScalarType::Float64),
-        ),
+        // The statistical aggregates: exact over integer/decimal (a decimal result), float over
+        // float.
+        (s, "decimal" | "f64") if MomentStat::from_surface(s).is_some() => {
+            let stat = MomentStat::from_surface(s).unwrap();
+            if result == "f64" {
+                (
+                    AggPlan::Moment { stat, float: true },
+                    ResolvedType::Float(ScalarType::Float64),
+                )
+            } else {
+                (
+                    AggPlan::Moment { stat, float: false },
+                    ResolvedType::Decimal,
+                )
+            }
+        }
         ("string_agg", "text") => (AggPlan::StringAgg, ResolvedType::Text),
         ("string_agg", "bytea") => (AggPlan::StringAgg, ResolvedType::Bytea),
         // An array input stacks into one more dimension of the same (dimension-agnostic) array type.

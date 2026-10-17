@@ -32250,6 +32250,8 @@ export type AggPlan =
   // result), PostgreSQL's float8 algorithms over float input (the *Float plans, f64 result).
   | "varPop"
   | "varPopFloat"
+  | "varSamp"
+  | "varSampFloat"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32720,6 +32722,22 @@ export function finalizeArrayAgg(plan: AggPlan, elems: Value[]): Value {
   };
 }
 
+// MOMENT_SURFACES maps each one-argument statistical aggregate to its exact and float plans
+// (aggregates.md §23); MOMENT_STATS gives each statistical plan what it finalizes — a sample (N − 1)
+// or population (N) statistic, a standard deviation or a variance — and whether it is the float form.
+const MOMENT_SURFACES: Record<string, [AggPlan, AggPlan]> = {
+  var_pop: ["varPop", "varPopFloat"],
+  var_samp: ["varSamp", "varSampFloat"],
+};
+const MOMENT_STATS: Partial<
+  Record<AggPlan, { sample: boolean; stddev: boolean; float: boolean }>
+> = {
+  varPop: { sample: false, stddev: false, float: false },
+  varPopFloat: { sample: false, stddev: false, float: true },
+  varSamp: { sample: true, stddev: false, float: false },
+  varSampFloat: { sample: true, stddev: false, float: true },
+};
+
 // foldExactMoment adds one input to the exact one-argument moments (aggregates.md §23), skipping
 // NULL. Each fold charges decimal_work for the square and the two additions, by the `*` and `+`
 // formulas (spec/design/cost.md §3).
@@ -32757,6 +32775,15 @@ function foldFloatMoment(a: Acc, v: Value): void {
   a.momFN = n;
   a.momFSx = sx;
   a.momFSxx = sxx;
+}
+
+// finalizeMoment finalizes a statistical plan (aggregates.md §23): numeric_stddev_internal over the
+// exact moments, the float8 final functions over the float ones.
+function finalizeMoment(a: Acc): Value {
+  const stat = MOMENT_STATS[a.plan]!;
+  if (stat.float) return floatMomentVariance(a, stat.sample, stat.stddev);
+  const r = momentVariance(a.momN, a.momSx, a.momSxx, stat.sample, stat.stddev);
+  return r === null ? nullValue() : decimalValue(r);
 }
 
 // isInf reports whether x is +Infinity or -Infinity (C's isinf).
@@ -32827,6 +32854,13 @@ export function cloneAcc(a: Acc): Acc {
 // like a collated sort (spec/design/collation.md §11).
 export function foldAcc(a: Acc, v: Value, m: Meter): void {
   switch (a.plan) {
+    case "varPop":
+    case "varPopFloat":
+    case "varSamp":
+    case "varSampFloat":
+      if (MOMENT_STATS[a.plan]!.float) foldFloatMoment(a, v);
+      else foldExactMoment(a, v, m);
+      break;
     case "countStar":
       a.count += 1n;
       break;
@@ -32911,12 +32945,6 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
           a.cur = intValue(a.plan === "bitAnd" ? c & v.int : a.plan === "bitOr" ? c | v.int : c ^ v.int);
         }
       }
-      break;
-    case "varPop":
-      foldExactMoment(a, v, m);
-      break;
-    case "varPopFloat":
-      foldFloatMoment(a, v);
       break;
     case "stringAgg": {
       // A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
@@ -33055,6 +33083,11 @@ export function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
 // empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
 export function finalizeAcc(a: Acc): Value {
   switch (a.plan) {
+    case "varPop":
+    case "varPopFloat":
+    case "varSamp":
+    case "varSampFloat":
+      return finalizeMoment(a);
     case "countStar":
     case "count":
       return intValue(a.count);
@@ -33095,12 +33128,6 @@ export function finalizeAcc(a: Acc): Value {
       return a.seen ? finalizeArrayAgg(a.plan, a.arrElems) : nullValue();
     case "stringAgg":
       return a.seen ? finalizeStringAgg(a.strRows) : nullValue();
-    case "varPop": {
-      const r = momentVariance(a.momN, a.momSx, a.momSxx, false, false);
-      return r === null ? nullValue() : decimalValue(r);
-    }
-    case "varPopFloat":
-      return floatMomentVariance(a, false, false);
     case "jsonAgg": {
       // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array (json:
       // PG's ", "-joined element texts; jsonb: the canonical array).
@@ -35916,9 +35943,12 @@ export function aggregatePlan(
   if (surface === "bit_or" && code === "same_as_input") return ["bitOr", t, undefined];
   if (surface === "bit_xor" && code === "same_as_input") return ["bitXor", t, undefined];
   // An array input stacks into one more dimension of the same (dimension-agnostic) array type.
-  if (surface === "var_pop" && code === "decimal") return ["varPop", { kind: "decimal" }, undefined];
-  if (surface === "var_pop" && code === "f64")
-    return ["varPopFloat", { kind: "float", ty: "f64" }, undefined];
+  // The statistical aggregates: exact over integer/decimal (a decimal result), float over float.
+  const moment = MOMENT_SURFACES[surface];
+  if (moment !== undefined)
+    return code === "f64"
+      ? [moment[1], { kind: "float", ty: "f64" }, undefined]
+      : [moment[0], { kind: "decimal" }, undefined];
   if (surface === "string_agg" && code === "text") return ["stringAgg", { kind: "text" }, undefined];
   if (surface === "string_agg" && code === "bytea")
     return ["stringAgg", { kind: "bytea" }, undefined];
@@ -37557,6 +37587,14 @@ function packedStateBytes(accs: Acc[]): number {
     n += MEMORY_VALUE;
     // An ordered aggregate (aggregates.md §22) keeps its tuples in the collections table too.
     if (a.ordRows !== undefined) continue;
+    const stat = MOMENT_STATS[a.plan];
+    if (stat !== undefined) {
+      // Exact: [int N, decimal Σx, decimal Σx²]; float: [f64 N, f64 Σx, f64 Sxx].
+      n += stat.float
+        ? 3 * MEMORY_VALUE
+        : MEMORY_VALUE + valueBytes(decimalValue(a.momSx)) + valueBytes(decimalValue(a.momSxx));
+      continue;
+    }
     switch (a.plan) {
       case "countStar":
       case "count":
@@ -37587,14 +37625,6 @@ function packedStateBytes(accs: Acc[]): number {
       case "arrayAgg":
       case "stringAgg":
         n += MEMORY_VALUE;
-        break;
-      case "varPop":
-        // [int n, decimal Σx, decimal Σx²].
-        n += MEMORY_VALUE + valueBytes(decimalValue(a.momSx)) + valueBytes(decimalValue(a.momSxx));
-        break;
-      case "varPopFloat":
-        // [f64 N, f64 Σx, f64 Sxx].
-        n += 3 * MEMORY_VALUE;
         break;
       case "arrayAggArray":
         // [bool seen, int ndim, (int length, int lower bound) per dimension of the first input].
