@@ -1050,11 +1050,17 @@ export type JsonTable = {
   columns: JtColumn[];
 };
 
-// JsonPassing is one `PASSING value [FORMAT JSON] AS name` argument of a SQL/JSON query function or
-// `JSON_TABLE` (json-sql-functions.md §5.4): binds the path variable `$name` to the value.
-// `formatJson` records that `FORMAT JSON` was written (a character-string value is parsed as JSON
-// text).
-export type JsonPassing = { expr: Expr; formatJson: boolean; name: string };
+// JsonPassing is one `PASSING value [FORMAT JSON [ENCODING name]] AS name` argument of a SQL/JSON
+// query function or `JSON_TABLE` (json-sql-functions.md §5.4): binds the path variable `$name` to
+// the value. `formatJson` records that `FORMAT JSON` was written (a character-string value is parsed
+// as JSON text); `encoding` is the canonical name (UTF8, UTF16, or UTF32) of an ENCODING clause — the
+// encoding a bytea value is in — or null when absent.
+export type JsonPassing = {
+  expr: Expr;
+  formatJson: boolean;
+  encoding: string | null;
+  name: string;
+};
 
 // JtColumn is one `JSON_TABLE` COLUMNS entry (json-table.md §3.3), a discriminated union over the
 // four column kinds.

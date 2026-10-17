@@ -31,6 +31,7 @@ export type SqlState =
   | "sequence_generator_limit_exceeded" // 2200H — nextval: reached {bound} value of sequence {sequence}
   | "invalid_row_count_in_limit_clause" // 2201W — LIMIT must not be negative
   | "invalid_row_count_in_offset_clause" // 2201X — OFFSET must not be negative
+  | "character_not_in_repertoire" // 22021 — invalid byte sequence for encoding "UTF8": {detail}
   | "invalid_parameter_value" // 22023 — invalid parameter value: {detail}
   | "invalid_escape_sequence" // 22025 — {detail}
   | "invalid_regular_expression" // 2201B — invalid regular expression: {detail}
@@ -137,6 +138,7 @@ const CODES: Record<SqlState, string> = {
   sequence_generator_limit_exceeded: "2200H",
   invalid_row_count_in_limit_clause: "2201W",
   invalid_row_count_in_offset_clause: "2201X",
+  character_not_in_repertoire: "22021",
   invalid_parameter_value: "22023",
   invalid_escape_sequence: "22025",
   invalid_regular_expression: "2201B",
@@ -259,6 +261,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "2200H", name: "sequence_generator_limit_exceeded", class: "data exception" },
   { code: "2201W", name: "invalid_row_count_in_limit_clause", class: "data exception" },
   { code: "2201X", name: "invalid_row_count_in_offset_clause", class: "data exception" },
+  { code: "22021", name: "character_not_in_repertoire", class: "data exception" },
   { code: "22023", name: "invalid_parameter_value", class: "data exception" },
   { code: "22025", name: "invalid_escape_sequence", class: "data exception" },
   { code: "2201B", name: "invalid_regular_expression", class: "data exception" },

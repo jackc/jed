@@ -4352,10 +4352,12 @@ export function resolveJsonSqlFn(
 // float is the number float8_numeric/float4_numeric makes of it, a jsonb value is itself, and every
 // other type is converted to jsonb — a json value parsed (last duplicate key wins), anything else by
 // to_jsonb. FORMAT JSON parses a text value as JSON instead (22P02 on malformed text) and converts
-// every other type by to_jsonb. 0A000: a date/timestamp/timestamptz value, which PostgreSQL passes
-// as a jsonpath datetime item (jed has none, by decision, jsonpath.md §3.1); and, deferred, a NaN or
-// ±Infinity float (at evaluation), which PostgreSQL passes as a numeric NaN/±Infinity that jed's
-// decimal cannot hold, and FORMAT JSON on a bytea value (an encoded JSON text). Port of impl/rust
+// every other type by to_jsonb, except a bytea value: that is UTF-8 encoded JSON text, left as bytea
+// here and decoded by passingBindings. ENCODING is only allowed on a bytea value (42804), and only
+// UTF8 is supported (22023, PostgreSQL's conversion error). 0A000: a date/timestamp/timestamptz
+// value, which PostgreSQL passes as a jsonpath datetime item (jed has none, by decision, jsonpath.md
+// §3.1); and, deferred, a NaN or ±Infinity float (at evaluation), which PostgreSQL passes as a
+// numeric NaN/±Infinity that jed's decimal cannot hold. Port of impl/rust
 // `resolve_json_passing`.
 export function resolveJsonPassing(
   scope: Scope,
@@ -4385,9 +4387,23 @@ export function resolveJsonPassing(
       varcharLen: null,
       operand: r.node,
     });
+    if (p.encoding !== null) {
+      if (ty.kind !== "bytea") {
+        throw engineError(
+          "datatype_mismatch",
+          "JSON ENCODING clause is only allowed for bytea input type",
+        );
+      }
+      if (p.encoding !== "UTF8") {
+        throw engineError(
+          "invalid_parameter_value",
+          `invalid source encoding name "${p.encoding}"`,
+        );
+      }
+    }
     let value: RExpr;
     if (ty.kind === "bytea" && p.formatJson) {
-      throw unsupported("FORMAT JSON bytea");
+      value = r.node;
     } else if (ty.kind === "null" || ty.kind === "jsonb") {
       value = r.node;
     } else if (ty.kind === "json" || (ty.kind === "text" && p.formatJson)) {

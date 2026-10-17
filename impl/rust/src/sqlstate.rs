@@ -54,6 +54,8 @@ pub enum SqlState {
     InvalidRowCountInLimitClause,
     /// 2201X — OFFSET must not be negative
     InvalidRowCountInOffsetClause,
+    /// 22021 — invalid byte sequence for encoding "UTF8": {detail}
+    CharacterNotInRepertoire,
     /// 22023 — invalid parameter value: {detail}
     InvalidParameterValue,
     /// 22025 — {detail}
@@ -247,6 +249,7 @@ impl SqlState {
             SqlState::SequenceGeneratorLimitExceeded => "2200H",
             SqlState::InvalidRowCountInLimitClause => "2201W",
             SqlState::InvalidRowCountInOffsetClause => "2201X",
+            SqlState::CharacterNotInRepertoire => "22021",
             SqlState::InvalidParameterValue => "22023",
             SqlState::InvalidEscapeSequence => "22025",
             SqlState::InvalidRegularExpression => "2201B",
@@ -359,6 +362,7 @@ impl SqlState {
             "2200H" => Some(SqlState::SequenceGeneratorLimitExceeded),
             "2201W" => Some(SqlState::InvalidRowCountInLimitClause),
             "2201X" => Some(SqlState::InvalidRowCountInOffsetClause),
+            "22021" => Some(SqlState::CharacterNotInRepertoire),
             "22023" => Some(SqlState::InvalidParameterValue),
             "22025" => Some(SqlState::InvalidEscapeSequence),
             "2201B" => Some(SqlState::InvalidRegularExpression),
@@ -480,6 +484,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "2200H", name: "sequence_generator_limit_exceeded", class: "data exception" },
     ErrorDesc { code: "2201W", name: "invalid_row_count_in_limit_clause", class: "data exception" },
     ErrorDesc { code: "2201X", name: "invalid_row_count_in_offset_clause", class: "data exception" },
+    ErrorDesc { code: "22021", name: "character_not_in_repertoire", class: "data exception" },
     ErrorDesc { code: "22023", name: "invalid_parameter_value", class: "data exception" },
     ErrorDesc { code: "22025", name: "invalid_escape_sequence", class: "data exception" },
     ErrorDesc { code: "2201B", name: "invalid_regular_expression", class: "data exception" },

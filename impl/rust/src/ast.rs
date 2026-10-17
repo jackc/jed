@@ -941,6 +941,9 @@ pub struct JsonPassing {
     pub expr: Expr,
     /// `FORMAT JSON` was written: a character-string value is parsed as JSON text.
     pub format_json: bool,
+    /// `FORMAT JSON ENCODING name`: the canonical encoding name (`UTF8`, `UTF16`, or `UTF32`) a
+    /// `bytea` value is encoded in (json-sql-functions.md §5.4).
+    pub encoding: Option<String>,
     pub name: String,
 }
 

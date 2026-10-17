@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Function- and operator-call overload resolution (spec/design/extensibility.md §5). This file holds
@@ -2596,10 +2597,12 @@ func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, passing []
 // float8_numeric/float4_numeric makes of it, a jsonb value is itself, and every other type is
 // converted to jsonb — a json value parsed (last duplicate key wins), anything else by to_jsonb.
 // FORMAT JSON parses a text value as JSON instead (22P02 on malformed text) and converts every other
-// type by to_jsonb. 0A000: a date/timestamp/timestamptz value, which PostgreSQL passes as a jsonpath
-// datetime item (jed has none, by decision, jsonpath.md §3.1); and, deferred, a NaN or ±Infinity
-// float (at evaluation), which PostgreSQL passes as a numeric NaN/±Infinity that jed's decimal
-// cannot hold, and FORMAT JSON on a bytea value (an encoded JSON text).
+// type by to_jsonb, except a bytea value: that is UTF-8 encoded JSON text, left as bytea here and
+// decoded by passingBindings. ENCODING is only allowed on a bytea value (42804), and only UTF8 is
+// supported (22023, PostgreSQL's conversion error). 0A000: a date/timestamp/timestamptz value, which
+// PostgreSQL passes as a jsonpath datetime item (jed has none, by decision, jsonpath.md §3.1); and,
+// deferred, a NaN or ±Infinity float (at evaluation), which PostgreSQL passes as a numeric
+// NaN/±Infinity that jed's decimal cannot hold.
 func resolveJSONPassing(s *scope, passing []jsonPassing, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, error) {
 	exprs := make([]*rExpr, 0, len(passing))
 	names := make([]string, 0, len(passing))
@@ -2621,10 +2624,18 @@ func resolveJSONPassing(s *scope, passing []jsonPassing, ag *aggCtx, params *par
 			t := ty
 			return &rExpr{kind: reJsonImage, jiFunc: jiToJsonb, sargs: []*rExpr{r}, jiType: &t}
 		}
+		if p.Encoding != "" {
+			if ty.kind != rtBytea {
+				return nil, nil, newError(DatatypeMismatch, "JSON ENCODING clause is only allowed for bytea input type")
+			}
+			if p.Encoding != "UTF8" {
+				return nil, nil, newError(InvalidParameterValue, `invalid source encoding name "`+p.Encoding+`"`)
+			}
+		}
 		var value *rExpr
 		switch {
 		case ty.kind == rtBytea && p.FormatJSON:
-			return nil, nil, unsupported("FORMAT JSON bytea")
+			value = r
 		case ty.kind == rtNull || ty.kind == rtJsonb:
 			value = r
 		case ty.kind == rtJson || (ty.kind == rtText && p.FormatJSON):
@@ -2678,12 +2689,53 @@ func passingBindings(exprs []*rExpr, names []string, row storedRow, env *evalEnv
 			node = JsonNode{Kind: JString, S: v.str()}
 		case ValJsonb:
 			node = *v.jsonb()
+		case ValBytea:
+			// FORMAT JSON on a bytea value: UTF-8 encoded JSON text, parsed as the text cast does.
+			m.Charge(costs.OperatorEval)
+			text, err := decodeUTF8Text(v.str())
+			if err != nil {
+				return nil, err
+			}
+			if node, err = jsonbIn(text); err != nil {
+				return nil, err
+			}
 		default:
 			panic("resolveJSONPassing converts every other type to jsonb")
 		}
 		bindings = append(bindings, jpBinding{name: names[i], value: node})
 	}
 	return passingVars(bindings), nil
+}
+
+// decodeUTF8Text checks UTF-8 bytes as text, as PostgreSQL's convert_from(…, 'UTF8') verifies them:
+// an invalid sequence or a NUL byte is 22021, naming the sequence's bytes (up to its expected length,
+// at most what remains) as PostgreSQL's report_invalid_encoding does.
+func decodeUTF8Text(b string) (string, error) {
+	for i := 0; i < len(b); {
+		r, size := utf8.DecodeRuneInString(b[i:])
+		if r != 0 && (r != utf8.RuneError || size > 1) {
+			i += size
+			continue
+		}
+		want := 1
+		switch lead := b[i]; {
+		case lead&0x80 == 0:
+			want = 1
+		case lead&0xe0 == 0xc0:
+			want = 2
+		case lead&0xf0 == 0xe0:
+			want = 3
+		case lead&0xf8 == 0xf0:
+			want = 4
+		}
+		end := min(i+want, len(b))
+		parts := make([]string, 0, want)
+		for _, c := range []byte(b[i:end]) {
+			parts = append(parts, fmt.Sprintf("0x%02x", c))
+		}
+		return "", newError(CharacterNotInRepertoire, `invalid byte sequence for encoding "UTF8": `+strings.Join(parts, " "))
+	}
+	return b, nil
 }
 
 // resolveJsonpathArgs resolves the `(target jsonb, path jsonpath [, vars jsonb [, silent boolean]])`

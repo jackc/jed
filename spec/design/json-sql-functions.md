@@ -365,7 +365,8 @@ json_exists_func::= "JSON_EXISTS" "(" ctx "," path json_passing?
 ctx             ::= expr ( "FORMAT" "JSON" )?           (* json/jsonb/text coerced to jsonb *)
 path            ::= string_literal                      (* compiled to jsonpath *)
 json_passing    ::= "PASSING" passing_arg ( "," passing_arg )*
-passing_arg     ::= expr ( "FORMAT" "JSON" )? "AS" identifier   (* binds $identifier in the path, §5.4 *)
+passing_arg     ::= expr ( "FORMAT" "JSON" ( "ENCODING" identifier )? )? "AS" identifier
+                                                        (* binds $identifier in the path, §5.4 *)
 json_returning  ::= "RETURNING" type ( "FORMAT" "JSON" )?
 wrapper_clause  ::= "WITH" ("CONDITIONAL"|"UNCONDITIONAL")? "ARRAY"? "WRAPPER"
                   | "WITHOUT" "ARRAY"? "WRAPPER"
@@ -464,7 +465,18 @@ Each value becomes a jsonpath item the way PostgreSQL's `transformJsonPassingArg
   an `interval`/`uuid`/`bytea`/range/`jsonpath` the string of its text output. A `timestamptz` inside
   one renders in the session zone, which makes the expression nonimmutable, as for `to_jsonb`;
 - `FORMAT JSON` parses a `text` value as JSON text (`22P02` when malformed) and leaves `json`/`jsonb`
-  alone; any other type is converted by `to_jsonb`, so a `date` becomes a string.
+  alone. A `bytea` value is UTF-8 encoded JSON text, as PostgreSQL reads it in a UTF-8 database: the
+  bytes are checked as `convert_from(…, 'UTF8')` checks them (an invalid sequence or a NUL byte is
+  `22021`, `invalid byte sequence for encoding "UTF8": 0x..`, naming the sequence's bytes; a leading
+  byte-order mark is kept, so it is then `22P02`), then parsed as the text cast parses (one
+  `operator_eval`). Any other type is converted by `to_jsonb`, so a `date` becomes a string.
+- `FORMAT JSON ENCODING name` names the encoding of a `bytea` value. As in PostgreSQL's
+  `makeJsonEncoding`, the name is `UTF8`, `UTF16`, or `UTF32`, matched case-insensitively (any other
+  is `22023` `unrecognized JSON encoding`, at parse), and the clause on a non-`bytea` value is `42804`
+  (`JSON ENCODING clause is only allowed for bytea input type`). PostgreSQL cannot convert from UTF16
+  or UTF32 and raises `22023` (`invalid source encoding name "UTF16"`) when it converts the value; jed
+  raises the same error at resolve, so it is raised even when the value is never evaluated or is NULL
+  (a documented divergence on a statement that fails in PostgreSQL for any non-NULL value).
 
 **Not supported (`0A000`), ledgered.** A `date`, `timestamp`, or `timestamptz` value without
 `FORMAT JSON` is a jsonpath *datetime item* in PostgreSQL, with its own `.type()` and comparison
@@ -472,8 +484,7 @@ rules. jed's jsonpath has no datetime items, by decision ([jsonpath.md §3.1](js
 `d::text` (or use `FORMAT JSON`, which makes it a string) instead. **Deferred (`0A000`),
 ledgered.** A NaN or ±Infinity float without `FORMAT JSON` is a `numeric` NaN/Infinity item in
 PostgreSQL, which jed's finite `decimal` cannot hold; it is raised when the value is evaluated, since
-a float column's other values pass. (Under `FORMAT JSON` it is `to_jsonb`'s string.) `FORMAT JSON`
-on a `bytea` value (encoded JSON text, with an optional `ENCODING`) is deferred too.
+a float column's other values pass. (Under `FORMAT JSON` it is `to_jsonb`'s string.)
 
 Evaluation order follows PostgreSQL's. For the query functions the context and path come first (a
 NULL either way is SQL NULL without evaluating the `PASSING` values), then the `PASSING` values in

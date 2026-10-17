@@ -510,7 +510,9 @@ JSON error instead of raising it: the functions then return what they found befo
 `JSON_EXISTS`, `JSON_VALUE`, `JSON_QUERY`, and `JSON_TABLE` bind variables with
 `PASSING value AS name`. A variable with no value fails with `42704`, and `vars` must be an object
 (`22023`). A float is passed as PostgreSQL passes it, as a number rounded to 15 significant digits
-(6 for `f32`). Passing a date or timestamp value, or a `NaN` or infinite float, is not supported yet
+(6 for `f32`). `PASSING value FORMAT JSON AS name` parses a `text` value as JSON, and reads a
+`bytea` value as UTF-8 encoded JSON text (`FORMAT JSON ENCODING UTF8` says so explicitly; bytes that
+are not UTF-8 fail with `22021`). Passing a date or timestamp value, or a `NaN` or infinite float, is not supported yet
 (`0A000`). The `_tz`
 forms of the functions (`jsonb_path_exists_tz`, …) behave the same; as in PostgreSQL they are
 `STABLE`, so an index expression cannot use them:

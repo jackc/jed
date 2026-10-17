@@ -299,12 +299,57 @@ export function passingBindings(
       case "jsonb":
         node = v.node;
         break;
+      case "bytea":
+        // FORMAT JSON on a bytea value: UTF-8 encoded JSON text, parsed as the text cast does.
+        m.charge(COSTS.operatorEval);
+        node = jsonbIn(decodeUtf8Text(v.bytes));
+        break;
       default:
         throw new Error("resolveJsonPassing converts every other type to jsonb");
     }
     bindings.push({ name: names[i]!, value: node });
   }
   return passingVars(bindings);
+}
+
+// The decoder for a checked UTF-8 byte string; a leading byte-order mark is kept, as PostgreSQL does.
+const UTF8_TEXT = new TextDecoder("utf-8", { ignoreBOM: true });
+
+// decodeUtf8Text checks UTF-8 bytes as text, as PostgreSQL's convert_from(…, 'UTF8') verifies them:
+// an invalid sequence or a NUL byte is 22021, naming the sequence's bytes (up to its expected length,
+// at most what remains) as PostgreSQL's report_invalid_encoding does.
+function decodeUtf8Text(b: Uint8Array): string {
+  const cont = (i: number, lo = 0x80, hi = 0xbf): boolean =>
+    i < b.length && b[i]! >= lo && b[i]! <= hi;
+  for (let i = 0; i < b.length; ) {
+    const c = b[i]!;
+    let size = 0;
+    if (c >= 0x01 && c <= 0x7f) size = 1;
+    else if (c >= 0xc2 && c <= 0xdf) size = cont(i + 1) ? 2 : 0;
+    else if (c === 0xe0) size = cont(i + 1, 0xa0) && cont(i + 2) ? 3 : 0;
+    else if (c === 0xed) size = cont(i + 1, 0x80, 0x9f) && cont(i + 2) ? 3 : 0;
+    else if (c >= 0xe1 && c <= 0xef) size = cont(i + 1) && cont(i + 2) ? 3 : 0;
+    else if (c === 0xf0) size = cont(i + 1, 0x90) && cont(i + 2) && cont(i + 3) ? 4 : 0;
+    else if (c === 0xf4) size = cont(i + 1, 0x80, 0x8f) && cont(i + 2) && cont(i + 3) ? 4 : 0;
+    else if (c >= 0xf1 && c <= 0xf3) size = cont(i + 1) && cont(i + 2) && cont(i + 3) ? 4 : 0;
+    if (size > 0) {
+      i += size;
+      continue;
+    }
+    let want = 1;
+    if ((c & 0xe0) === 0xc0) want = 2;
+    else if ((c & 0xf0) === 0xe0) want = 3;
+    else if ((c & 0xf8) === 0xf0) want = 4;
+    const seq = Array.from(
+      b.subarray(i, Math.min(i + want, b.length)),
+      (x) => `0x${x.toString(16).padStart(2, "0")}`,
+    );
+    throw engineError(
+      "character_not_in_repertoire",
+      `invalid byte sequence for encoding "UTF8": ${seq.join(" ")}`,
+    );
+  }
+  return UTF8_TEXT.decode(b);
 }
 
 // evalFilter evaluates a predicate in a filter context — WHERE, ON, HAVING, a partial index's WHERE,

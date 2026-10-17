@@ -5618,7 +5618,7 @@ class Parser {
     return false;
   }
 
-  // parseJsonPassing parses an optional `PASSING value [FORMAT JSON] AS name [, …]` clause of a
+  // parseJsonPassing parses an optional `PASSING value [FORMAT JSON [ENCODING name]] AS name [, …]` clause of a
   // SQL/JSON query function or `JSON_TABLE` (json-sql-functions.md §5.4) → its arguments (empty when
   // absent). The name is any identifier, folded like one (`AS X` binds `$x`; `AS "X"` binds `$X`).
   private parseJsonPassing(): JsonPassing[] {
@@ -5628,9 +5628,14 @@ class Parser {
     for (;;) {
       const expr = this.parseExpr();
       const formatJson = this.skipFormatJson();
+      let encoding: string | null = null;
+      if (formatJson && this.peekKeyword() === "encoding") {
+        this.advance(); // ENCODING
+        encoding = jsonEncodingName(this.expectIdentifier());
+      }
       this.expectKeyword("as");
       const name = this.expectIdentifier();
-      passing.push({ expr, formatJson, name });
+      passing.push({ expr, formatJson, encoding, name });
       if (this.peek().kind !== "comma") return passing;
       this.advance();
     }
@@ -6279,4 +6284,19 @@ function rejectSecondWith(body: QueryExpr): void {
   if (body.kind === "withExpr") {
     throw engineError("syntax_error", "multiple WITH clauses not allowed");
   }
+}
+
+// jsonEncodingName is the canonical name of a SQL/JSON ENCODING clause's encoding
+// (json-sql-functions.md §5.4): UTF8, UTF16, or UTF32, matched case-insensitively as PostgreSQL's
+// makeJsonEncoding does. Any other name is 22023.
+function jsonEncodingName(name: string): string {
+  switch (name.toLowerCase()) {
+    case "utf8":
+      return "UTF8";
+    case "utf16":
+      return "UTF16";
+    case "utf32":
+      return "UTF32";
+  }
+  throw engineError("invalid_parameter_value", `unrecognized JSON encoding: ${name}`);
 }

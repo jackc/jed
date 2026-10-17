@@ -180,6 +180,15 @@ name = "invalid_row_count_in_offset_clause"
 class = "data exception"
 template = "OFFSET must not be negative"
 
+# Bytes that are not valid UTF-8 where text is required: a `bytea` value passed with `FORMAT JSON`
+# (../design/json-sql-functions.md §5.4). PostgreSQL's message; {detail} lists the offending
+# sequence's bytes as `0x..` (up to its expected length), and a NUL byte is invalid too.
+[[error]]
+code = "22021"
+name = "character_not_in_repertoire"
+class = "data exception"
+template = "invalid byte sequence for encoding \"UTF8\": {detail}"
+
 [[error]]
 code = "22023"
 name = "invalid_parameter_value"
