@@ -1583,6 +1583,7 @@ pub(crate) fn aggregate_plan(
         ("bit_and", "same_as_input") => (AggPlan::Bit(BitOp::And), t.clone()),
         ("bit_or", "same_as_input") => (AggPlan::Bit(BitOp::Or), t.clone()),
         ("bit_xor", "same_as_input") => (AggPlan::Bit(BitOp::Xor), t.clone()),
+        ("regr_count", "i64") => (AggPlan::RegrCount, ResolvedType::Int(ScalarType::Int64)),
         // The two-argument statistical aggregates, likewise exact or float.
         (s, "decimal" | "f64") if PairStat::from_surface(s).is_some() => {
             let stat = PairStat::from_surface(s).unwrap();

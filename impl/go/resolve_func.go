@@ -3028,6 +3028,9 @@ func lookupAggregateOverload(surface string, t resolvedType) *aggregateDesc {
 // result code keeps the name gate + overload validation data-driven while the kernel stays
 // hand-written (§5). surface is the (folded) call name; result the matched row's code.
 func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedType) {
+	if surface == "regr_count" {
+		return planRegrCount, resolvedType{kind: rtInt, intTy: scalarInt64}
+	}
 	// The statistical aggregates: exact over integer/decimal (a decimal result), float over float.
 	if plans, ok := pairSurfaces[surface]; ok {
 		if result == "f64" {

@@ -764,6 +764,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `covar_pop(y, x)` | two exact / two float | `decimal` / `f64` | the population covariance |
 | `covar_samp(y, x)` | two exact / two float | `decimal` / `f64` | the sample covariance |
 | `corr(y, x)` | two exact / two float | `decimal` / `f64` | the correlation coefficient |
+| `regr_count(y, x)` | two exact / two float | `i64` | the number of pairs with both arguments non-NULL |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -875,7 +876,8 @@ numX  = N·Σx² − Σx·Σx      numY  = N·Σy² − Σy·Σy      numXY = N�
 evaluated with jed's decimal operators — `/` at `select_div_scale`, half away from zero, `22003`
 past the cap, and `sqrt` as the `sqrt(numeric)` function chooses its scale — so each equals PostgreSQL's `numeric` evaluation of the same expression. Packed state
 on the bounded-spill lane: exact `[int N, decimal Σx, decimal Σx², decimal Σy, decimal Σy², decimal
-Σxy]`, float `[f64 N, f64 Σx, f64 Sxx, f64 Σy, f64 Syy, f64 Sxy]`. The float fold order is ledgered
+Σxy]`, float `[f64 N, f64 Σx, f64 Sxx, f64 Σy, f64 Syy, f64 Sxy]`. `regr_count` keeps only the pair count, packed `[int N]`, and
+charges no `decimal_work`. The float fold order is ledgered
 with the one-argument float forms (`float-moment-order`).
 
 | Aggregate | Exact result | Float result (PostgreSQL) | NULL when |
@@ -883,3 +885,4 @@ with the one-argument float forms (`float-moment-order`).
 | `covar_pop(y, x)` | `numXY / (N·N)` | `Sxy / N` | no pair |
 | `covar_samp(y, x)` | `numXY / (N·(N − 1))` | `Sxy / (N − 1)` | fewer than two pairs |
 | `corr(y, x)` | `numXY / sqrt(numX·numY)` | `Sxy / sqrt(Sxx·Syy)` | no pair, or `numX` / `Sxx` or `numY` / `Syy` is 0 |
+| `regr_count(y, x)` | `N` (`i64`) | `N` (`i64`) | never (0 over no pair) |

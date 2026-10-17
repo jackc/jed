@@ -1,0 +1,77 @@
+# Aggregate regr_count(Y, X) -> i64 (spec/design/aggregates.md §23): the number of (Y, X) pairs whose
+# arguments are both non-NULL — over two integer/decimal arguments or two float arguments. 0 over no
+# pair. Output name `regr_count`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i32, types.decimal, types.f64, resource.cost_metering, func.regr_count
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, y i32, x i32, dx numeric(6,1), fy f64, fx f64)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1, 2, 2.0, 1, 2), (2, 1, 3, NULL, 5.5, 3, NULL), (3, 1, NULL, 4, 4.5, NULL, 4), (4, 2, 8, 9, NULL, 8, 9), (5, 2, NULL, NULL, 1.0, NULL, NULL)
+
+# The arguments travel as one row: 5 rows read + 1 leaf page read + 5 row packs + 5 accumulated + 1
+# produced.
+# names: regr_count
+# cost: 17
+query I nosort
+SELECT regr_count(y, x) FROM t
+----
+2
+
+# names: regr_count, regr_count, regr_count
+query III nosort
+SELECT regr_count(fy, fx), regr_count(y, dx), regr_count(x, x) FROM t
+----
+2
+2
+3
+
+# names: g, regr_count
+query II rowsort
+SELECT g, regr_count(y, x) FROM t GROUP BY g
+----
+1
+1
+2
+1
+
+# No pair: 0.
+# names: regr_count
+query I nosort
+SELECT regr_count(y, x) FROM t WHERE id = 5
+----
+0
+
+# names: regr_count
+query I nosort
+SELECT regr_count(y, x) FROM t WHERE g = 9
+----
+0
+
+# names: regr_count
+query I nosort
+SELECT regr_count(DISTINCT y, y) FILTER (WHERE id < 5) FROM t
+----
+3
+
+# names: id, regr_count
+query II nosort
+SELECT id, regr_count(y, x) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+1
+2
+1
+3
+1
+4
+2
+5
+2
+
+# A float argument beside an exact one has no overload.
+statement error 42883
+SELECT regr_count(fy, x) FROM t
+
+statement error 42883
+SELECT regr_count(y) FROM t

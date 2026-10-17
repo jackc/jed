@@ -205,6 +205,8 @@ const (
 	planStddevPopFloat
 	planStddevSamp
 	planStddevSampFloat
+	// regr_count(Y, X) — the number of pairs whose arguments are both non-NULL (aggregates.md §23).
+	planRegrCount
 	// The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
 	planCovarPop
 	planCovarPopFloat
@@ -623,6 +625,10 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		return a.pairs.fold(v, m)
 	case planCovarPopFloat, planCovarSampFloat, planCorrFloat:
 		return a.fpair.fold(v)
+	case planRegrCount:
+		if f := *v.composite(); !f[0].IsNull() && !f[1].IsNull() {
+			a.count++
+		}
 	case planStringAgg:
 		// A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL string_agg_transfn).
 		if !(*v.composite())[0].IsNull() {
@@ -827,7 +833,7 @@ func (a *acc) unfold(v Value, _ *costMeter) {
 // empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
 func (a *acc) finalize() (Value, error) {
 	switch a.plan {
-	case planCountStar, planCount:
+	case planCountStar, planCount, planRegrCount:
 		return IntValue(a.count), nil
 	case planSumInt:
 		if a.seen {
