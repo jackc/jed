@@ -16,6 +16,7 @@ import {
   hangUpNextPageServiceAckForTesting,
   intValue,
   openDatabase,
+  pageServiceAttachmentRoleForTesting,
   pageServiceRoleForTesting,
   render,
   type Session,
@@ -107,6 +108,9 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
         database.attach(name!, attachFile(attachmentPath!), readOnly === "1");
         break;
       }
+      case "DETACH":
+        database.detach(argument);
+        break;
       case "QUERY_I64":
         value = queryI64(database, sql(argument));
         break;
@@ -158,8 +162,12 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
         crashBeforeNextPageServiceAckForTesting(database);
         break;
       case "ROLE":
-        // The page-service role test hook (spec/pageservice/README.md §6.5).
-        value = pageServiceRoleForTesting(database);
+        // The page-service role test hook (spec/pageservice/README.md §6.5): main's, or an
+        // attachment's when the step names one.
+        value =
+          argument === ""
+            ? pageServiceRoleForTesting(database)
+            : pageServiceAttachmentRoleForTesting(database, argument);
         break;
       case "TXID":
         value = database.txid.toString();

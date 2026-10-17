@@ -969,6 +969,9 @@ impl<'a> Runner<'a> {
     /// re-attach every tracked attachment whose file exists.
     fn open(&mut self) -> Result<(), String> {
         self.open_proc(0).map_err(|e| e.to_string())?;
+        if self.service {
+            return Ok(()); // open_proc re-attached them
+        }
         for name in self.attached_names() {
             let file = self.dbs[&name].file.clone();
             if self.disk().file(&file).is_none() {
@@ -981,11 +984,18 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
-    /// Attach the existing file of attachment `name` read-write to the current process.
+    /// Attach the existing file of attachment `name` read-write to the current process: under the
+    /// page service in a service trace (owner or page client of the file, README.md §6.6),
+    /// uncoordinated otherwise.
     fn attach(&self, name: &str) -> Result<(), EngineError> {
         let file = &self.dbs[name].file;
+        let locking = if self.service {
+            Locking::Auto
+        } else {
+            Locking::None
+        };
         self.db()
-            .attach(name, AttachSource::file(file).locking(Locking::None), false)
+            .attach(name, AttachSource::file(file).locking(locking), false)
     }
 
     /// Start process `pid`. A service trace elects it through the simulated lock host and network,
@@ -1007,6 +1017,25 @@ impl<'a> Runner<'a> {
         self.procs.insert(pid, Proc { db: db.clone() });
         self.cur = pid;
         self.db = Some(db);
+        if self.service {
+            // Every process attaches every tracked attachment whose file exists: the owner of the
+            // file, or a page client of whichever process owns it (repair_co_ownership made main's
+            // owner attach every one first).
+            for name in self.attached_names() {
+                let file = self.dbs[&name].file.clone();
+                if self.disk().file(&file).is_none() {
+                    continue;
+                }
+                if let Err(e) = self.attach(&name) {
+                    let _ = self.close_proc(pid);
+                    return Err(EngineError::new(
+                        e.state,
+                        format!("re-attach {name}: {}", e.message),
+                    ));
+                }
+            }
+            self.net.settle();
+        }
         Ok(())
     }
 
@@ -1066,12 +1095,79 @@ impl<'a> Runner<'a> {
         }
     }
 
-    /// The running process that owns the database under the page service.
+    /// The running process that owns the main database under the page service.
     fn owner_pid(&self) -> Option<u32> {
+        self.owner_pid_of("main")
+    }
+
+    /// The running process that owns database `name` under the page service.
+    fn owner_pid_of(&self, name: &str) -> Option<u32> {
         self.procs
             .iter()
-            .find(|(_, p)| p.db.sim_is_owner())
+            .find(|(_, p)| {
+                p.db.sim_service_db(name)
+                    .is_some_and(|db| db.sim_is_owner())
+            })
             .map(|(pid, _)| *pid)
+    }
+
+    /// The running processes, in order, that own main or an attachment under the page service.
+    fn owner_pids(&self) -> Vec<u32> {
+        let order = self.order();
+        self.procs
+            .iter()
+            .filter(|(_, p)| {
+                order.iter().any(|name| {
+                    p.db.sim_service_db(name)
+                        .is_some_and(|db| db.sim_is_owner())
+                })
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+
+    /// Attach file database `name` in every running process of a service trace (README.md §6.6):
+    /// main's owner first — so it owns the file too, and one process owns every database — then the
+    /// others in process order, each a page client of it. With no owner of main, the lowest
+    /// process's read begin first re-elects it. A process that already has it attached is skipped.
+    /// It leaves the attaching owner as the step's process.
+    fn attach_everywhere(&mut self, i: usize, name: &str) -> bool {
+        let first = match self.owner_pid() {
+            Some(pid) => pid,
+            None => {
+                let first = self.live_pids()[0];
+                self.select_proc(first);
+                let d = self.committed_digest("main");
+                let v = self.db().version();
+                if !self.observe(i, &format!("attaching p{first}"), v, d) {
+                    return false;
+                }
+                self.net.settle();
+                first
+            }
+        };
+        let mut order = vec![first];
+        order.extend(self.live_pids().into_iter().filter(|pid| *pid != first));
+        for pid in order {
+            self.select_proc(pid);
+            if self.db().sim_has_attachment(name) {
+                continue;
+            }
+            let result = self.attach(name);
+            self.net.settle();
+            if let Err(e) = result {
+                self.select_proc(first);
+                self.attach_failed(i, name, e);
+                return false;
+            }
+        }
+        self.select_proc(first);
+        true
+    }
+
+    /// Whether every running process has attachment `name` attached.
+    fn attached_in_all(&self, name: &str) -> bool {
+        self.procs.values().all(|p| p.db.sim_has_attachment(name))
     }
 
     /// Load the engine over the simulated main file.
@@ -1166,10 +1262,24 @@ impl<'a> Runner<'a> {
     /// than dropped (a drop would end its page-service role cleanly), and the network closes its
     /// listener and connections, as the kernel closes a dead process's sockets.
     fn drop_proc(&mut self, pid: u32) {
-        if self.relaxed && self.procs.get(&pid).is_some_and(|p| p.db.sim_is_owner()) {
+        if self.relaxed
+            && let Some(p) = self.procs.get(&pid)
+        {
             // A dead owner's batch may be lost back to the floor (validated-cow.md §4): the
-            // simulated process crash may drop writes of the step that acknowledged a commit.
-            self.main_db_mut().owner_lost = true;
+            // simulated process crash may drop writes of the step that acknowledged a commit. Each
+            // database it owned (main or an attachment under the service) has its own batch.
+            let owned: Vec<String> = self
+                .dbs
+                .keys()
+                .filter(|name| {
+                    p.db.sim_service_db(name)
+                        .is_some_and(|db| db.sim_is_owner())
+                })
+                .cloned()
+                .collect();
+            for name in owned {
+                self.sdb(&name).owner_lost = true;
+            }
         }
         for sid in self.sessions_of(pid) {
             let ss = self.sessions.remove(&sid);
@@ -1197,19 +1307,30 @@ impl<'a> Runner<'a> {
     /// another process adopts — so the version may be newer than the last this runner saw, but never
     /// older, and its contents must be a generation the history records.
     fn observe(&mut self, i: usize, who: &str, v: u64, d: Option<String>) -> bool {
-        let m = self.main_db();
+        self.observe_db(i, "main", who, v, d)
+    }
+
+    /// [`observe`](Self::observe) for database `name`: under the page service every attachment is
+    /// shared too.
+    fn observe_db(&mut self, i: usize, name: &str, who: &str, v: u64, d: Option<String>) -> bool {
+        let what = if name == "main" {
+            String::new()
+        } else {
+            format!(" of {name}")
+        };
+        let m = &self.dbs[name];
         let msg = match &d {
-            None => Some(format!("{who}: version {v} is unreadable")),
+            None => Some(format!("{who}: version {v}{what} is unreadable")),
             Some(_) if v < m.version && (!m.owner_lost || v < m.floor) => Some(format!(
-                "{who} sees version {v} after version {} was published",
+                "{who} sees version {v}{what} after version {} was published",
                 m.version
             )),
             Some(_) if v > m.max_attempted => Some(format!(
-                "{who} sees version {v}, which was never attempted (latest attempted {})",
+                "{who} sees version {v}{what}, which was never attempted (latest attempted {})",
                 m.max_attempted
             )),
             Some(d) if !m.in_history(v, d) => Some(format!(
-                "{who} sees version {v} with contents (digest {d}) no transaction produced"
+                "{who} sees version {v}{what} with contents (digest {d}) no transaction produced"
             )),
             Some(_) => None,
         };
@@ -1217,7 +1338,7 @@ impl<'a> Runner<'a> {
             self.fail(i, msg);
             return false;
         }
-        let m = self.main_db_mut();
+        let m = self.sdb(name);
         m.version = v;
         m.last_digest = d.expect("checked above");
         m.owner_lost = false;
@@ -1246,7 +1367,10 @@ impl<'a> Runner<'a> {
     /// Start a process (S5) and check what it sees.
     fn step_spawn(&mut self, i: usize, pid: u32) {
         if self.procs.contains_key(&pid) {
-            self.fail(i, format!("spawn p{pid}: already running"));
+            // The generator cannot know a fault killed the owner and that p0 restarted since.
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"spawn\",\"pid\":{pid},\"skip\":true}}"
+            ));
             return;
         }
         if let Err(e) = self.open_proc(pid) {
@@ -1266,8 +1390,21 @@ impl<'a> Runner<'a> {
         if !self.observe(i, &format!("spawned p{pid}"), v, d) {
             return;
         }
+        let mut versions: HashMap<String, u64> = HashMap::new();
+        for name in self.attached_names() {
+            if self.db_version(&name) == 0 {
+                continue;
+            }
+            let ad = self.committed_digest(&name);
+            let av = self.db_version(&name);
+            if !self.observe_db(i, &name, &format!("spawned p{pid}"), av, ad) {
+                return;
+            }
+            versions.insert(name.clone(), self.db_version(&name));
+        }
+        let dbs = self.versions_json(&versions);
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"spawn\",\"pid\":{pid},\"version\":{v}}}"
+            "{{\"i\":{i},\"op\":\"spawn\",\"pid\":{pid},\"version\":{v}{dbs}}}"
         ));
     }
 
@@ -1680,14 +1817,26 @@ impl<'a> Runner<'a> {
         // In a service trace any other fault kills the owner, the only process that touches the file,
         // whichever process's step drove its I/O; the others keep running over the same kernel state.
         if self.service && self.procs.len() > 1 {
-            let pid = self.owner_pid().unwrap_or(self.cur);
-            self.drop_proc(pid);
-            self.disk().process_death();
-            self.emit(format!(
-                "{{\"i\":{i},\"op\":\"killed\",\"pid\":{pid},\"fired\":{}}}",
-                go_quote(fired)
-            ));
-            return true;
+            // Every owner — of main or of an attachment — is a process that may have touched a file
+            // after the fault fired, so each dies; with attachments owned elsewhere that may be more
+            // than one.
+            let mut pids = self.owner_pids();
+            if pids.is_empty() {
+                pids = vec![self.cur];
+            }
+            if pids.len() < self.procs.len() {
+                for pid in &pids {
+                    self.drop_proc(*pid);
+                }
+                self.disk().process_death();
+                for pid in &pids {
+                    self.emit(format!(
+                        "{{\"i\":{i},\"op\":\"killed\",\"pid\":{pid},\"fired\":{}}}",
+                        go_quote(fired)
+                    ));
+                }
+                return true;
+            }
         }
         self.recover(i, fired)
     }
@@ -1735,13 +1884,23 @@ impl<'a> Runner<'a> {
             if !self.observe(i, &format!("session {}", st.sid), v, d) {
                 return;
             }
+            for name in self.attached_names() {
+                let v = s.sim_attached_version(&name);
+                if v == 0 {
+                    continue;
+                }
+                let d = self.digest_of(&mut s, &name);
+                if !self.observe_db(i, &name, &format!("session {}", st.sid), v, d) {
+                    return;
+                }
+            }
         }
         // A session pins every database's committed root when it opens.
         let version = s.version();
         let mut pins: HashMap<String, u64> = HashMap::new();
         pins.insert("main".to_string(), version);
         for name in self.attached_names() {
-            let v = self.db_version(&name);
+            let v = s.sim_attached_version(&name);
             if v != 0 {
                 pins.insert(name, v);
             }
@@ -1833,6 +1992,9 @@ impl<'a> Runner<'a> {
                 return;
             }
             for (k, name) in dbs.iter().enumerate() {
+                if !ss.pins.contains_key(name) {
+                    continue;
+                }
                 let now = self.db_version(name);
                 let (version, file) = {
                     let d = &self.dbs[name];
@@ -1878,6 +2040,9 @@ impl<'a> Runner<'a> {
         ));
         let quiet = self.quiet();
         for (k, name) in dbs.iter().enumerate() {
+            if !ss.pins.contains_key(name) {
+                continue; // not attached in this session's process when it opened: it cannot have written it
+            }
             let (base, last_digest) = {
                 let d = &self.dbs[name];
                 (d.version, d.last_digest.clone())
@@ -1913,6 +2078,15 @@ impl<'a> Runner<'a> {
                     // follows.
                     published = Some(inflight.clone());
                 }
+                if published.is_none()
+                    && self.service
+                    && !self.disk().dead()
+                    && self.digest_err.as_ref().map(engine_code).as_deref() == Some("08006")
+                {
+                    // An armed disconnect landed in the read-back's own frames: read it again,
+                    // re-electing first.
+                    published = self.committed_digest(name);
+                }
                 if published.is_none() && self.service && self.disk().dead() {
                     // The owner died later in this step (its maintenance commit hit the fault), so
                     // nothing can be read back through it; the acknowledged commit is checked by the
@@ -1940,7 +2114,10 @@ impl<'a> Runner<'a> {
                 d.version = now;
                 d.last_digest = inflight.clone();
                 d.max_attempted = d.max_attempted.max(now);
-                let client = self.db().sim_page_client().is_some();
+                let client = self
+                    .db()
+                    .sim_service_db(name)
+                    .is_some_and(|db| db.sim_page_client().is_some());
                 let relaxed = self.relaxed;
                 let d = self.sdb(name);
                 if !relaxed || client {
@@ -1950,8 +2127,8 @@ impl<'a> Runner<'a> {
                 if !self.violation.is_empty() {
                     return;
                 }
-                if self.service && name == "main" {
-                    self.service_committed(i, base, now, &inflight);
+                if self.service {
+                    self.service_committed(i, name, base, now, &inflight);
                     if !self.violation.is_empty() {
                         return;
                     }
@@ -1977,11 +2154,15 @@ impl<'a> Runner<'a> {
     /// free list, so the free list it persists is a subset of its base's. And an owner may follow a
     /// client's commit with a maintenance commit — the unchanged snapshot at the next versions —
     /// which joins the history with the same contents.
-    fn service_committed(&mut self, i: usize, base: u64, now: u64, digest: &str) {
-        if self.db().sim_page_client().is_none() {
+    fn service_committed(&mut self, i: usize, name: &str, base: u64, now: u64, digest: &str) {
+        if self
+            .db()
+            .sim_service_db(name)
+            .is_none_or(|db| db.sim_page_client().is_none())
+        {
             return;
         }
-        if let Some(image) = self.image("main")
+        if let Some(image) = self.image(name)
             && let (Some(before), Some(after)) = (
                 sim_free_list(&image, self.page_size, base),
                 sim_free_list(&image, self.page_size, now),
@@ -2001,20 +2182,25 @@ impl<'a> Runner<'a> {
         if self.disk().dead() {
             // The owner died later in this step; it may have been writing a maintenance commit,
             // which recovery may select: the same contents at the next version.
-            let d = self.main_db_mut();
+            let d = self.sdb(name);
             d.add_history(now + 1, digest.to_string());
             d.max_attempted = d.max_attempted.max(now + 1);
             return;
         }
-        let Some(owner) = self.owner_pid() else {
+        let Some(owner) = self.owner_pid_of(name) else {
             return;
         };
-        let ov = self.procs[&owner].db.version();
+        let owner_db = &self.procs[&owner].db;
+        let ov = if name == "main" {
+            owner_db.version()
+        } else {
+            owner_db.sim_attached_version(name).unwrap_or(0)
+        };
         if ov <= now {
             return;
         }
         let relaxed = self.relaxed;
-        let d = self.main_db_mut();
+        let d = self.sdb(name);
         for v in now + 1..=ov {
             d.add_history(v, digest.to_string());
         }
@@ -2023,9 +2209,16 @@ impl<'a> Runner<'a> {
         if !relaxed {
             d.floor = ov; // the maintenance commit is an owner commit: batched under synchronous = off
         }
-        self.emit(format!(
-            "{{\"i\":{i},\"op\":\"maintenance\",\"version\":{ov}}}"
-        ));
+        if name == "main" {
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"maintenance\",\"version\":{ov}}}"
+            ));
+        } else {
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"maintenance\",\"db\":{},\"version\":{ov}}}",
+                go_quote(name)
+            ));
+        }
     }
 
     /// Whether the process writing database `name` holds no relaxed commit pending a flush — no
@@ -2034,7 +2227,7 @@ impl<'a> Runner<'a> {
     /// service the owner writes the file; with no owner running, nothing is claimed.
     fn engine_flushed(&self, name: &str) -> bool {
         let db = if self.service {
-            let Some(owner) = self.owner_pid() else {
+            let Some(owner) = self.owner_pid_of(name) else {
                 return false;
             };
             &self.procs[&owner].db
@@ -2408,11 +2601,10 @@ impl<'a> Runner<'a> {
     /// simulated filesystem if it does not exist — create's temp file, sync, rename, and directory
     /// barrier, any of which a fault may interrupt. Already attached, it only reports.
     fn step_attach(&mut self, i: usize, name: &str) {
-        if self.service {
-            self.fail(i, "attach is single-process only".to_string());
-            return;
-        }
-        if self.dbs.contains_key(name) && self.db_version(name) != 0 {
+        if self.dbs.contains_key(name)
+            && self.db_version(name) != 0
+            && (!self.service || self.attached_in_all(name))
+        {
             let v = self.dbs[name].version;
             self.emit(format!(
                 "{{\"i\":{i},\"op\":\"attach\",\"db\":{},\"version\":{v}}}",
@@ -2457,7 +2649,11 @@ impl<'a> Runner<'a> {
             }
             self.sdb(name).floor = 1; // create returned: the file and its directory entry are durable
         }
-        if let Err(e) = self.attach(name) {
+        if self.service {
+            if !self.attach_everywhere(i, name) {
+                return;
+            }
+        } else if let Err(e) = self.attach(name) {
             self.attach_failed(i, name, e);
             return;
         }
@@ -2490,14 +2686,19 @@ impl<'a> Runner<'a> {
         let mut entries: Vec<String> = Vec::new();
         let mut main_line = String::new();
         for name in self.order() {
+            if self.service && name != "main" && self.db_version(&name) == 0 {
+                // This process is not attached to it: a faulted attach killed the process attaching
+                // it before this one did; the next attach step repairs that.
+                continue;
+            }
             let (v, d) = self.committed_view(&name);
-            let d = if self.service && name == "main" {
+            let d = if self.service {
                 // Another process may have died leaving a newer complete generation this one now
                 // adopts.
-                if !self.observe(i, "check", v, d) {
+                if !self.observe_db(i, &name, "check", v, d) {
                     return;
                 }
-                self.main_db().last_digest.clone()
+                self.dbs[&name].last_digest.clone()
             } else {
                 let db = &self.dbs[&name];
                 match d.filter(|d| v == db.version && *d == db.last_digest) {
@@ -2568,16 +2769,25 @@ impl<'a> Runner<'a> {
         let mut main_d = String::new();
         for name in self.order() {
             let v = self.db_version(&name);
+            if v == 0 && name != "main" && self.service && self.dbs[&name].floor == 0 {
+                let file = self.dbs[&name].file.clone();
+                if self.disk().file(&file).is_none() {
+                    // A faulted attach killed its owner before create returned (S8 kills only the
+                    // owner, so no recovery ran to forget it): the file may legitimately be gone.
+                    self.dbs.remove(&name);
+                    continue;
+                }
+            }
             if v == 0 {
                 self.fail(i, format!("a clean reopen lost attachment {name}"));
                 return false;
             }
             let d = self.committed_digest(&name);
             let shown = d.clone().unwrap_or_default();
-            if self.service && name == "main" {
+            if self.service {
                 // A process killed mid-commit may have left a complete generation no survivor began
                 // on yet.
-                if !self.observe(i, "reopened p0", v, d) {
+                if !self.observe_db(i, &name, "reopened p0", v, d) {
                     return false;
                 }
             } else {

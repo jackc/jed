@@ -109,6 +109,8 @@ func run() error {
 		case "ATTACH":
 			parts := strings.SplitN(argument, "\t", 3)
 			err = db.Attach(parts[0], jed.AttachFile(parts[2]), parts[1] == "1")
+		case "DETACH":
+			err = db.Detach(argument)
 		case "QUERY_I64":
 			value, err = queryI64(db, sql(argument))
 		case "READ_OPEN":
@@ -157,8 +159,13 @@ func run() error {
 			// Exit instead of acknowledging the next client commit (spec/pageservice/README.md §6.5).
 			jed.CrashBeforeNextPageServiceAckForTesting(db)
 		case "ROLE":
-			// The page-service role test hook (spec/pageservice/README.md §6.5).
-			value = jed.PageServiceRoleForTesting(db)
+			// The page-service role test hook (spec/pageservice/README.md §6.5): main's, or an
+			// attachment's when the step names one.
+			if argument == "" {
+				value = jed.PageServiceRoleForTesting(db)
+			} else {
+				value = jed.PageServiceAttachmentRoleForTesting(db, argument)
+			}
 		case "TXID":
 			value = strconv.FormatUint(db.Txid(), 10)
 		case "PAGE_COUNT":

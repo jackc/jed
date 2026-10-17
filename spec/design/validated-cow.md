@@ -216,9 +216,10 @@ generation (in the slot it was written to) and the pending set empties. The flus
 - **A page client's `begin_write`.** The owner flushes before granting the gate
   ([page-service.md](page-service.md) §6), so a client plans against a durable floor with its own
   manifest only (the client cannot see the owner's pending set). The floor and pending set belong
-  to one file domain, so when file attachments join the service each attachment's owner flushes
-  that attachment's pending set before granting its gate, independently of `main`; a client never
-  commits on top of another process's pending batch.
+  to one file domain, so under the service each file attachment's owner flushes that attachment's
+  pending set before granting its gate, independently of `main` (a file attachment follows its
+  handle's `synchronous` setting, [pageservice/README.md](../pageservice/README.md) §6.6); a client
+  never commits on top of another process's pending batch.
 - **Compaction** writes a new, already durable image and empties the pending set.
 - **Stabilization** of an adopted generation (§3) is a flush.
 

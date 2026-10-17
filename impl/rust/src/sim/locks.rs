@@ -155,10 +155,12 @@ impl LockHost for SimLockHost {
             .remove(path);
     }
 
-    fn open_bundle(&self, _path: &Path) -> Result<LockFiles> {
+    /// Name the database's two bundle locks after its path: main and each file attachment have
+    /// their own (spec/pageservice/README.md §6.6).
+    fn open_bundle(&self, path: &Path) -> Result<LockFiles> {
         Ok(LockFiles {
-            presence: Box::new("presence".to_string()),
-            arrival: Box::new("arrival".to_string()),
+            presence: Box::new(format!("{}.lock/presence", path.display())),
+            arrival: Box::new(format!("{}.lock/arrival", path.display())),
         })
     }
 
@@ -166,13 +168,16 @@ impl LockHost for SimLockHost {
         Ok(())
     }
 
-    fn close_files(&self, _files: &LockFiles) {
+    /// Release this process's locks on the bundle's two files, as closing them does.
+    fn close_files(&self, files: &LockFiles) {
         let mut t = lock(&self.table);
         if t.current.get(&self.pid) != Some(&self.incarnation) {
             return; // a later process now has this id; its locks are not ours
         }
-        for holders in t.holders.values_mut() {
-            holders.remove(&self.pid);
+        for handle in [&files.presence, &files.arrival] {
+            if let Some(holders) = t.holders.get_mut(lock_name(handle)) {
+                holders.remove(&self.pid);
+            }
         }
     }
 

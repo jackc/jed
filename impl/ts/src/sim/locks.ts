@@ -63,14 +63,19 @@ export class SimLockHost implements LockHost {
     this.claimed.delete(path);
   }
 
-  openBundle(_path: string): LockFiles {
-    return { presence: "presence", arrival: "arrival" };
+  // openBundle names the database's two bundle locks after its path: main and each file attachment
+  // have their own (spec/pageservice/README.md §6.6).
+  openBundle(path: string): LockFiles {
+    return { presence: path + ".lock/presence", arrival: path + ".lock/arrival" };
   }
 
   validateMarker(_path: string): void {}
 
-  closeFiles(_files: LockFiles): void {
-    for (const holders of this.table.holders.values()) holders.delete(this.pidNum);
+  // closeFiles releases this process's locks on the bundle's two files, as closing them does.
+  closeFiles(files: LockFiles): void {
+    for (const handle of [files.presence, files.arrival]) {
+      if (typeof handle === "string") this.table.holders.get(handle)?.delete(this.pidNum);
+    }
   }
 
   // tryLock takes or converts this process's lock on the named file if no other process conflicts:

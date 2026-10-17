@@ -339,7 +339,16 @@ func (db *engine) commitTx() (outcome, error) {
 			}
 			stagesRows := ws.stagedBytes() != 0
 			ws.clearStaged()
-			if att.isFile() {
+			if att.svc != nil {
+				// A file attachment under the page service commits through its inner handle, under the
+				// gate this writer took for it (page-service.md §5.5).
+				ws.txid = db.attachedCommitted[name].txid + 1
+				committed, err := att.svc.core.commitServiceAttachment(ws, stagesRows)
+				if err != nil {
+					return outcome{}, err
+				}
+				ws = committed
+			} else if att.isFile() {
 				// Advance the version for the alternating meta slot + reopen (like the main file commit).
 				ws.txid = db.attachedCommitted[name].txid + 1
 				// The file form of the attachment's storage budget (memory.md §8.7) reads its published

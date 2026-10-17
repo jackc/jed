@@ -146,8 +146,11 @@ bundle owns the file and serves a same-user endpoint; any other opener becomes a
 reading pages through it and committing through it, and a client opened `read_only` gets a read-only
 connection. The owner's foreground transaction path is identical to the uncoordinated path.
 `exclusive` is a non-serving owner (a second opener waits, then fails `55006`); `auto` selects it
-where serving is unavailable (Windows for now), and OPFS is inherently exclusive. A file attachment is
-a non-serving owner of its file under `auto` and `exclusive` until attachments join the service.
+where serving is unavailable (Windows for now), and OPFS is inherently exclusive. A file attachment
+under `auto` is elected owner or page client of its file like an open, with its own role, taking main's
+ownership preference and owner limits when main is under the page service
+([spec/pageservice/README.md](../pageservice/README.md) §6.6); under `exclusive` it is a non-serving
+owner.
 `none` is the unsafe escape hatch for an externally coordinated or static file; network filesystems
 require that external coordinator. An unsupported requested mode fails closed `0A000`.
 

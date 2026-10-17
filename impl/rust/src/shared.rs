@@ -183,10 +183,30 @@ pub(crate) struct Attachment {
     #[allow(dead_code)]
     name: String,
     mode: AttachMode,
-    /// The block store (file or in-memory) + pager + page accounting.
-    storage: Storage,
+    /// The block store (file or in-memory) + pager + page accounting; `None` for a service
+    /// attachment, whose storage is its inner handle's.
+    storage: Option<Storage>,
     /// Independent native coordination for a file attachment; absent for memory or locking=none.
     coordinator: Option<Arc<FileCoordinator>>,
+    /// The inner handle of a file attachment under the page service (shared_attach.rs): its own
+    /// owner or page-client role over the attached file. Its storage is the attachment's (`storage`
+    /// is then `None`). `real_path` is the attached file's resolved path, the writer-gate order key
+    /// (page-service.md §5.5).
+    svc: Option<Arc<Shared>>,
+    real_path: std::path::PathBuf,
+}
+
+impl Attachment {
+    /// Run `f` on this attachment's storage: its own, or a service attachment's inner handle's.
+    fn with_storage<R>(&mut self, f: impl FnOnce(&mut Storage) -> R) -> R {
+        match &self.svc {
+            Some(inner) => f(&mut inner.storage.lock().expect("storage lock not poisoned")),
+            None => f(self
+                .storage
+                .as_mut()
+                .expect("an attachment off the page service owns its storage")),
+        }
+    }
 }
 
 /// Selects the backing for a database attached via [`Database::attach`]
@@ -1189,6 +1209,15 @@ pub(crate) struct Shared {
     writer_role: Mutex<Option<Arc<handoff::ServiceRole>>>,
     /// Advances when a foreign txid is adopted; prepared plans clear lazily when this changes.
     plan_epoch: AtomicU64,
+    /// The file attachments under the page service (shared_attach.rs). `held_gates` and
+    /// `writer_pins` are the current writer's: the gates it took after the in-process writer gate,
+    /// in real-path order, and its pins on read-only service attachments (set and cleared under the
+    /// writer gate).
+    service_attach_count: AtomicUsize,
+    held_gates: Mutex<Vec<attach::GateRef>>,
+    writer_pins: Mutex<attach::AttachPins>,
+    /// The attachment an inner handle serves (unset for a host-facing handle: main).
+    name: std::sync::OnceLock<String>,
     /// The handle's environment (spec/design/environment.md), given in the create/open options: the
     /// loaded Unicode and time-zone data, the host functions, and the random and clock sources. Every
     /// minted session, attachment, temp domain, and reload uses it. `Send + Sync`, so the `Send +
@@ -1211,46 +1240,61 @@ impl Shared {
 
     /// Claim the in-process writer gate. Under the page service a writer also takes the owner's gate.
     fn acquire_writer(&self, timeout_ms: u64) -> Result<()> {
+        self.acquire_writer_scoped(timeout_ms, true)
+    }
+
+    /// Claim the in-process writer gate, then (when `gates` is set) the gates of main and of the
+    /// service attachments, in real-path order (page-service.md §5.5). Attach and detach take only
+    /// the in-process gate: they change only this handle's registry and never wait for another
+    /// process's writer (README.md §6.6).
+    fn acquire_writer_scoped(&self, timeout_ms: u64, gates: bool) -> Result<()> {
         self.acquire_local_writer();
-        #[cfg(unix)]
-        if self.handoff.get().is_some() {
+        if !self.under_page_service()
+            && let Err(error) = self.check_coordinator_pids()
+        {
+            self.release_local_writer();
+            return Err(error);
+        }
+        if gates
+            && (self.under_page_service() || self.service_attach_count.load(Ordering::Acquire) > 0)
+        {
             // Under the page service a writer takes the owner's gate — its own, or through
             // begin_write — and an owner then adopts any client commit published since its last
             // transaction (page-service.md §5.5, §7; README.md §6.5).
-            if let Err(error) = self.begin_service_write(timeout_ms) {
+            if let Err(error) = self.acquire_gates(timeout_ms) {
                 self.release_local_writer();
                 return Err(error);
             }
-            return Ok(());
-        }
-        #[cfg(not(unix))]
-        let _ = timeout_ms;
-        if let Err(error) = self.check_coordinator_pids() {
-            self.release_local_writer();
-            return Err(error);
         }
         Ok(())
     }
 
-    /// Release the writer gate and wake one waiter.
+    /// Release the writer gate and wake one waiter: the writer's pins on read-only service
+    /// attachments first, then the gates in reverse order, then the in-process gate.
     fn release_writer(&self) {
-        #[cfg(unix)]
-        if self.handoff.get().is_some() {
-            self.release_service_write();
-        }
+        let pins =
+            std::mem::take(&mut *self.writer_pins.lock().expect("writer pins lock poisoned"));
+        drop(pins);
+        let held = std::mem::take(&mut *self.held_gates.lock().expect("held gates lock poisoned"));
+        self.release_gates(held);
         self.release_local_writer();
     }
 
-    /// Whether other processes may commit to this database, so a read session refreshes at its
-    /// first read: true exactly under the page service. A page client's read begin is its
-    /// begin_read round trip (README.md §6.3); an owner's adopts any client commit published since
-    /// (page-service.md §7).
-    fn has_shared_coordinator(&self) -> bool {
+    /// Whether main is under the page service.
+    fn under_page_service(&self) -> bool {
         #[cfg(unix)]
         if self.handoff.get().is_some() {
             return true;
         }
         false
+    }
+
+    /// Whether other processes may commit to this database or one of its attachments, so a read
+    /// session refreshes at its first read: true under the page service. A page client's read
+    /// begin is its begin_read round trip (README.md §6.3); an owner's adopts any client commit
+    /// published since (page-service.md §7).
+    fn has_shared_coordinator(&self) -> bool {
+        self.under_page_service() || self.service_attach_count.load(Ordering::Acquire) > 0
     }
 
     fn check_coordinator_pids(&self) -> Result<()> {
@@ -1580,7 +1624,7 @@ impl Shared {
         let mut snap = (*committed).clone();
         snap.txid = new_txid;
         let budget = BudgetCtx {
-            name: "main",
+            name: self.domain_name(),
             prev: &committed,
             can_compact: false,
             stages_rows: false,
@@ -1800,6 +1844,20 @@ impl Shared {
     ) -> Result<Option<StagedCommit>> {
         // The attachment's committed root and the watermark, read before the attachments lock: the
         // budget's forced compaction rebuilds the free list from that root (memory.md §8.3).
+        let service = self
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned")
+            .get(name)
+            .and_then(|att| att.svc.clone());
+        if let Some(inner) = service {
+            // A file attachment under the page service commits through its inner handle, under the
+            // gate this writer took for it (page-service.md §5.5).
+            snap.txid = base_txid + 1;
+            let committed = inner.commit_service_attachment(snap, stages_rows)?;
+            *snap = (*committed).clone();
+            return Ok(None);
+        }
         let prev = self.committed_attachment(name);
         let can_compact = self.can_compact_committed();
         let mut atts = self
@@ -1807,7 +1865,11 @@ impl Shared {
             .lock()
             .expect("attachments lock not poisoned");
         if let Some(att) = atts.get_mut(name) {
-            if att.storage.path.is_some() {
+            let att_storage = att
+                .storage
+                .as_mut()
+                .expect("an attachment off the page service owns its storage");
+            if att_storage.path.is_some() {
                 snap.txid = base_txid + 1;
                 let prev = prev.expect("an attached file has a committed root");
                 let budget = BudgetCtx {
@@ -1818,8 +1880,7 @@ impl Shared {
                 };
                 // A local reader pins the whole roots map, so reuse is safe only when that common
                 // watermark says no older attachment root is live.
-                att.storage
-                    .commit_durable(snap, can_reclaim, can_reclaim, Some(&budget))?;
+                att_storage.commit_durable(snap, can_reclaim, can_reclaim, Some(&budget))?;
                 snap.demote_clean_leaves(); // post-commit residency flip (bplus-reshape.md B4)
             } else {
                 let budget = prev.as_deref().map(|prev| BudgetCtx {
@@ -1829,8 +1890,7 @@ impl Shared {
                     stages_rows,
                 });
                 let staged =
-                    att.storage
-                        .stage_in_memory(snap, budget.as_ref(), name.to_string())?;
+                    att_storage.stage_in_memory(snap, budget.as_ref(), name.to_string())?;
                 return Ok(Some(staged));
             }
         }
@@ -1862,7 +1922,7 @@ impl Shared {
             if let (Some(att), Some(snap)) =
                 (atts.get_mut(&commit.name), attached.get(&commit.name))
             {
-                let _ = att.storage.adopt_staged(snap, commit, can_reclaim);
+                let _ = att.with_storage(|st| st.adopt_staged(snap, commit, can_reclaim));
             }
         }
     }
@@ -1878,7 +1938,7 @@ impl Shared {
             .lock()
             .expect("attachments lock not poisoned");
         match atts.get_mut(&lname) {
-            Some(att) if lname != "temp" => f(&mut att.storage),
+            Some(att) if lname != "temp" => att.with_storage(f),
             _ => Err(EngineError::new(
                 SqlState::UndefinedObject,
                 format!("database \"{name}\" is not attached"),
@@ -1924,24 +1984,39 @@ impl Shared {
         let mut attached = attached.to_vec();
         attached.sort_by(|a, b| a.0.cmp(b.0));
         for (name, snap) in &attached {
-            let Some(prev) = self.committed_attachment(name) else {
+            let Some(prev) = self.attached_root(name) else {
                 continue;
             };
+            let service = self
+                .attachments
+                .lock()
+                .expect("attachments lock not poisoned")
+                .get(*name)
+                .and_then(|att| att.svc.clone());
+            if let Some(inner) = service {
+                // A service attachment's commit runs through its inner handle: its reader registry
+                // (which counts other processes' pins when it owns the file) gates reuse and
+                // compaction.
+                inner.precheck_service_budget(name, snap, &prev)?;
+                continue;
+            }
             let mut atts = self
                 .attachments
                 .lock()
                 .expect("attachments lock not poisoned");
             if let Some(att) = atts.get_mut(*name) {
-                att.storage.precheck_budget(
-                    snap,
-                    true,
-                    &BudgetCtx {
-                        name,
-                        prev: &prev,
-                        can_compact,
-                        stages_rows: snap.staged_bytes() != 0,
-                    },
-                )?;
+                att.with_storage(|st| {
+                    st.precheck_budget(
+                        snap,
+                        true,
+                        &BudgetCtx {
+                            name,
+                            prev: &prev,
+                            can_compact,
+                            stages_rows: snap.staged_bytes() != 0,
+                        },
+                    )
+                })?;
             }
         }
         // An unchanged main does not persist, so it has no budget to check (transactions.md §2.1).
@@ -2206,7 +2281,7 @@ impl Shared {
         }
         let can_reuse = oldest >= st.free_gen_txid;
         let budget = BudgetCtx {
-            name: "main",
+            name: self.domain_name(),
             prev: &prev,
             can_compact,
             stages_rows,
@@ -2231,7 +2306,9 @@ impl Shared {
             .lock()
             .expect("attachments lock not poisoned")
             .get(name)
-            .is_some_and(|a| a.storage.path.is_some())
+            .is_some_and(|a| {
+                a.svc.is_some() || a.storage.as_ref().is_some_and(|st| st.path.is_some())
+            })
     }
 
     /// The page size of the host attachment `name`'s OWN page space (attached-databases.md §2) — used to
@@ -2241,8 +2318,8 @@ impl Shared {
         self.attachments
             .lock()
             .expect("attachments lock not poisoned")
-            .get(name)
-            .map(|a| a.storage.page_size)
+            .get_mut(name)
+            .map(|a| a.with_storage(|st| st.page_size))
             .expect("attachment exists (the qualifier gate passed)")
     }
 
@@ -2277,7 +2354,10 @@ impl Shared {
         let mut names: Vec<_> = atts.keys().cloned().collect();
         names.sort();
         for name in names {
-            let flushed = atts.get_mut(&name).expect("listed above").storage.flush();
+            let flushed = atts
+                .get_mut(&name)
+                .expect("listed above")
+                .with_storage(|st| st.flush());
             if result.is_ok() {
                 result = flushed;
             }
@@ -2450,6 +2530,10 @@ impl Database {
             #[cfg(unix)]
             writer_role: Mutex::new(None),
             plan_epoch: AtomicU64::new(0),
+            service_attach_count: AtomicUsize::new(0),
+            held_gates: Mutex::new(Vec::new()),
+            writer_pins: Mutex::new(attach::AttachPins::default()),
+            name: std::sync::OnceLock::new(),
             env,
         });
         Database(shared)
@@ -2563,7 +2647,14 @@ impl Database {
     /// `55006` while a write transaction or reader is open on this handle or another process has the
     /// file open. Not metered and not reachable from SQL.
     pub fn compact(&self, name: &str) -> Result<()> {
-        let lname = name.to_string();
+        self.compact_named(name, name)
+    }
+
+    /// Compact database `lname` of this handle, naming it `name` in errors (an inner handle of a
+    /// service attachment compacts its main under the attachment's name).
+    fn compact_named(&self, lname: &str, name: &str) -> Result<()> {
+        let lname = lname.to_string();
+        let mut service = None;
         let read_only = if lname == "main" {
             self.0.read_only()
         } else {
@@ -2574,7 +2665,10 @@ impl Database {
                 .expect("attachments lock not poisoned")
                 .get(&lname)
             {
-                Some(attachment) if lname != "temp" => attachment.mode == AttachMode::ReadOnly,
+                Some(attachment) if lname != "temp" => {
+                    service = attachment.svc.clone();
+                    attachment.mode == AttachMode::ReadOnly
+                }
                 _ => {
                     return Err(EngineError::new(
                         SqlState::UndefinedObject,
@@ -2588,6 +2682,20 @@ impl Database {
                 SqlState::ReadOnlySqlTransaction,
                 format!("cannot compact read-only database \"{name}\""),
             ));
+        }
+        if let Some(inner) = service {
+            // A service attachment is compacted by its inner handle, under its own gate and
+            // watermark (page-service.md §6): only its owner can, and only with no pin from any
+            // process.
+            if !self.0.try_acquire_local_writer() {
+                return Err(EngineError::new(
+                    SqlState::ObjectInUse,
+                    format!("cannot compact database \"{name}\" while a write transaction is open"),
+                ));
+            }
+            let result = Database(inner).compact_named("main", name);
+            self.0.release_local_writer();
+            return result;
         }
         #[cfg(unix)]
         if self.0.handoff.get().is_some() && self.0.service_owner().is_none() && lname == "main" {
@@ -2874,16 +2982,27 @@ impl Database {
         // Open a file source BEFORE taking the writer gate (an open may block on I/O and can fail): a
         // standalone engine over the file, whose committed snapshot + storage identity become the
         // attachment. If the name is taken, the built `Storage` drops here (closing the just-opened file).
+        let locking = if source.file {
+            crate::coordinator::resolve_mode(source.locking)?
+        } else {
+            Locking::None
+        };
+        // Under the page service the attachment is owner or page client of its file, elected as an
+        // open is (page-service.md §5.5).
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut service: Option<(Arc<Shared>, std::path::PathBuf)> = None;
+        #[cfg(unix)]
+        if source.file && locking == Locking::Auto {
+            let path = source.path.as_ref().expect("a file source carries a path");
+            service = Some(
+                self.0
+                    .open_service_attachment(name, path, &source, read_only)?,
+            );
+        }
         let file_backing: Option<(Storage, Snapshot, Option<Arc<FileCoordinator>>)> = if source.file
+            && service.is_none()
         {
             let path = source.path.as_ref().expect("a file source carries a path");
-            // A file attachment is a non-serving owner of its file until attachments join the page
-            // service (page-service.md §5.5): another process holding the file makes the attach
-            // wait, then fail 55006.
-            let locking = match source.locking {
-                Locking::Auto => Locking::Exclusive,
-                other => other,
-            };
             let coordinator =
                 FileCoordinator::open(path, locking, source.file_lock_timeout_ms)?.map(Arc::new);
             let canonical = coordinator
@@ -2948,7 +3067,17 @@ impl Database {
         } else {
             None
         };
-        self.0.acquire_writer(0)?;
+        // Close a just-opened service attachment's inner handle when the attach fails.
+        let release_service = |service: Option<(Arc<Shared>, std::path::PathBuf)>| {
+            if let Some((inner, _)) = service {
+                let _ = Database(inner).close();
+            }
+        };
+        if let Err(error) = self.0.acquire_writer_scoped(0, false) {
+            release_service(service);
+            return Err(error);
+        }
+        let mut service = service;
         let result = (|| {
             {
                 let atts = self
@@ -2965,17 +3094,30 @@ impl Database {
             }
             // A file source becomes (its storage, its committed root); an in-memory source is a fresh,
             // empty snapshot whose NEW stores attach to its OWN paging (the temp seam — a snapshot's
-            // `store_paging` is "the paging new stores bind to").
-            let (storage, root, coordinator) = match file_backing {
-                Some((st, committed, coordinator)) => (st, committed, coordinator),
-                None => {
+            // `store_paging` is "the paging new stores bind to"). A service attachment's storage is
+            // its inner handle's.
+            let (storage, root, coordinator, svc, real_path) = match (service.take(), file_backing)
+            {
+                (Some((inner, real)), _) => {
+                    let root = (*inner.pin()).clone();
+                    (None, root, None, Some(inner), real)
+                }
+                (None, Some((st, committed, coordinator))) => (
+                    Some(st),
+                    committed,
+                    coordinator,
+                    None,
+                    std::path::PathBuf::new(),
+                ),
+                (None, None) => {
                     let mut storage = Storage::new_temp(self.0.page_size());
                     storage.budget.limit = source.max_storage_bytes;
                     let mut empty = Snapshot::with_environment(self.0.env.clone());
                     empty.set_store_paging(storage.paging().clone());
-                    (storage, empty, None)
+                    (Some(storage), empty, None, None, std::path::PathBuf::new())
                 }
             };
+            let is_service = svc.is_some();
             let mode = if read_only {
                 AttachMode::ReadOnly
             } else {
@@ -2992,14 +3134,24 @@ impl Database {
                         mode,
                         storage,
                         coordinator,
+                        svc,
+                        real_path,
                     },
                 );
             self.0.attachment_count.fetch_add(1, Ordering::Release);
+            if is_service {
+                self.0.service_attach_count.fetch_add(1, Ordering::Release);
+            }
+            // Read-modify-write the roots in place under the pin lock (the publish order: live,
+            // then roots): a page client's adoption may replace main's committed root meanwhile,
+            // since attach and detach hold no service gate.
+            let _live = self.0.live.lock().expect("live lock not poisoned");
             let mut r = self.0.roots.write().expect("roots lock not poisoned");
             r.attached.insert(lname.clone(), Arc::new(root));
             Ok(())
         })();
         self.0.release_writer();
+        release_service(service); // the name was taken
         result
     }
 
@@ -3011,8 +3163,8 @@ impl Database {
     /// released, under the writer gate.
     pub fn detach(&self, name: &str) -> Result<()> {
         let lname = name.to_string();
-        self.0.acquire_writer(0)?;
-        let mut removed = None;
+        self.0.acquire_writer_scoped(0, false)?;
+        let mut removed: Option<Attachment> = None;
         let result = (|| {
             {
                 let atts = self
@@ -3040,16 +3192,40 @@ impl Database {
                 .expect("attachments lock not poisoned")
                 .remove(&lname);
             self.0.attachment_count.fetch_sub(1, Ordering::Release);
+            if let Some(inner) = removed.as_ref().and_then(|att| att.svc.as_ref()) {
+                self.0.service_attach_count.fetch_sub(1, Ordering::Release);
+                // Keep the plan-cache epoch monotone: plan_epoch_now no longer sums this inner
+                // handle's epoch.
+                self.0.plan_epoch.fetch_add(
+                    inner.plan_epoch.load(Ordering::Acquire) + 1,
+                    Ordering::Release,
+                );
+            }
+            // Read-modify-write the roots in place under the pin lock (the publish order: live,
+            // then roots): a page client's adoption may replace main's committed root meanwhile,
+            // since attach and detach hold no service gate.
+            let _live = self.0.live.lock().expect("live lock not poisoned");
             let mut r = self.0.roots.write().expect("roots lock not poisoned");
             r.attached.remove(&lname);
             Ok(())
         })();
         self.0.release_writer();
+        let mut result = result;
+        if let Some(inner) = removed.as_mut().and_then(|att| att.svc.take()) {
+            // Close the inner handle: an owner flushes its pending relaxed commits (validated-cow.md
+            // §4), drains its clients, and hands ownership on; a client closes its connection
+            // (README.md §6.5).
+            drop(removed);
+            let closed = Database(inner).close();
+            if result.is_ok() {
+                result = closed;
+            }
+            return result;
+        }
         // A detached file attachment's pending relaxed commits become durable before its file is
         // released (validated-cow.md §4); a failed flush is what detach reports.
-        let mut result = result;
-        if let Some(att) = removed.as_mut() {
-            let flushed = att.storage.flush();
+        if let Some(storage) = removed.as_mut().and_then(|att| att.storage.as_mut()) {
+            let flushed = storage.flush();
             if result.is_ok() {
                 result = flushed;
             }
@@ -3066,7 +3242,8 @@ impl Database {
     /// never blocking a writer — and `close`/`Drop` deregisters. A write through it is `25006`.
     /// (The old `SharedDb::read()` → `ReadHandle`.)
     pub fn read_session(&self) -> Session {
-        let (snap, attached, version, generation) = self.0.pin_latest(); // atomic load+register (§8): no gap
+        // atomic load+register (§8): no gap; service attachments pinned with it
+        let ((snap, attached, version, generation), pin_atts) = self.0.pin_latest_all();
         let mut engine = Engine::from_snapshot((*snap).clone());
         self.0.configure_engine(&mut engine);
         engine.read_only = true; // the executor rejects writes (25006) / poisons a read-only block
@@ -3079,11 +3256,12 @@ impl Database {
             gate_held: false,
             pinned: Some(version),
             pin_gen: generation,
+            pin_atts,
             role_gen: generation,
             base_version: version,
             pending_error: None,
             refresh_on_next_read: self.0.has_shared_coordinator(),
-            plan_epoch: self.0.plan_epoch.load(Ordering::Acquire),
+            plan_epoch: self.0.plan_epoch_now(),
         }
     }
 
@@ -3109,7 +3287,7 @@ impl Database {
         let mut engine = Engine::from_snapshot((*base).clone());
         self.0.configure_engine(&mut engine);
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
-        engine.attached_committed = attached; // pin the attached roots together (§5)
+        engine.attached_committed = self.0.writer_view(attached); // the attached roots together (§5)
         engine
             .begin_tx(Some(true))
             .expect("a fresh handle has no open transaction");
@@ -3120,11 +3298,12 @@ impl Database {
             gate_held: true,
             pinned: None,
             pin_gen: 0,
+            pin_atts: attach::AttachPins::default(),
             role_gen: self.0.writer_gen(),
             base_version,
             pending_error: None,
             refresh_on_next_read: false,
-            plan_epoch: self.0.plan_epoch.load(Ordering::Acquire),
+            plan_epoch: self.0.plan_epoch_now(),
         }
     }
 
@@ -3139,8 +3318,9 @@ impl Database {
         // A read-only file-backed core mints read-only sessions (a write is `25006`); it pins the
         // committed version in the watermark ATOMICALLY like a read session (§8). A writable core mints
         // the autocommit lazy-gate session — no persistent pin (each autocommit read pins per statement).
-        let (snap, attached, version, access, pinned, generation) = if self.0.read_only() {
-            let (snap, attached, version, generation) = self.0.pin_latest();
+        let (snap, attached, version, access, pinned, generation, pin_atts) = if self.0.read_only()
+        {
+            let ((snap, attached, version, generation), pin_atts) = self.0.pin_latest_all();
             (
                 snap,
                 attached,
@@ -3148,11 +3328,20 @@ impl Database {
                 Access::ReadOnly,
                 Some(version),
                 generation,
+                pin_atts,
             )
         } else {
             let (snap, attached) = self.0.pin_roots();
             let version = snap.txid;
-            (snap, attached, version, Access::ReadWrite, None, 0)
+            (
+                snap,
+                attached,
+                version,
+                Access::ReadWrite,
+                None,
+                0,
+                attach::AttachPins::default(),
+            )
         };
         let mut engine = Engine::from_snapshot((*snap).clone());
         self.0.configure_engine(&mut engine);
@@ -3172,11 +3361,12 @@ impl Database {
             gate_held: false,
             pinned,
             pin_gen: generation,
+            pin_atts,
             role_gen: generation,
             base_version: version,
             pending_error: None,
             refresh_on_next_read: access == Access::ReadOnly && self.0.has_shared_coordinator(),
-            plan_epoch: self.0.plan_epoch.load(Ordering::Acquire),
+            plan_epoch: self.0.plan_epoch_now(),
         }
     }
 }
@@ -3251,6 +3441,9 @@ pub struct Session {
     /// the session's open transaction or pinned snapshot began under (README.md §6.5).
     pin_gen: u64,
     role_gen: u64,
+    /// The pins on file attachments under the page service taken with `pinned`
+    /// (shared_attach.rs), released after it.
+    pin_atts: attach::AttachPins,
 }
 
 impl Session {
@@ -3329,16 +3522,21 @@ impl Session {
             && !self.engine.in_transaction()
             && !self.engine.stmt_is_write_with_views(ast)
         {
-            // refresh_and_pin: an owner's adoption of client commits or a page client's begin_read,
-            // then the atomic load+register.
-            let (snap, attached, version, generation) = self.shared.refresh_and_pin()?;
+            // refresh_and_pin: an owner's adoption of client commits or a page client's begin_read
+            // (and each service attachment's read begin), then the atomic load+register.
+            let ((snap, attached, version, generation), atts) =
+                self.shared.refresh_and_pin_all()?;
             self.base_version = version;
             self.engine.committed = (*snap).clone();
             self.engine.attached_committed = attached;
-            provisional = Some(self.shared.reader_pin_for(version, generation));
+            // Main's pin, then the attachments' (released in that order).
+            provisional = Some(Box::new((
+                self.shared.reader_pin_for(version, generation),
+                atts,
+            )));
         }
         // After the refresh: a reload it adopted invalidates cached plans.
-        let epoch = self.shared.plan_epoch.load(Ordering::Acquire);
+        let epoch = self.shared.plan_epoch_now();
         if epoch != self.plan_epoch {
             if let Some(cache) = cache {
                 cache.borrow_mut().take();
@@ -3378,7 +3576,7 @@ impl Session {
                 // registers a per-cursor pin on its already-mint-protected version.
                 let pin = match provisional.take() {
                     Some(p) => p,
-                    None => self.shared.reader_pin(self.base_version),
+                    None => self.cursor_pin(),
                 };
                 let open_stream = self.engine.open_stream_guard();
                 rows.attach_pin(Box::new((pin, open_stream)));
@@ -3397,7 +3595,7 @@ impl Session {
                 // open-stream guard, as above).
                 let pin = match provisional.take() {
                     Some(p) => p,
-                    None => self.shared.reader_pin(self.base_version),
+                    None => self.cursor_pin(),
                 };
                 let open_stream = self.engine.open_stream_guard();
                 rows.attach_pin(Box::new((pin, open_stream)));
@@ -3424,14 +3622,17 @@ impl Session {
         }
         // Pin the new version before releasing the old one: a page client's owner pin on the new
         // version is kept by this registration (spec/pageservice/README.md §6.3).
-        let (snap, attached, version, generation) = self.shared.refresh_and_pin()?;
+        let ((snap, attached, version, generation), atts) = self.shared.refresh_and_pin_all()?;
         if let Some(old) = self.pinned.take() {
             self.shared
                 .live
                 .lock()
                 .expect("live lock not poisoned")
                 .deregister_in(self.pin_gen, old);
+            // The old attachment pins after main's.
+            drop(std::mem::take(&mut self.pin_atts));
         }
+        self.pin_atts = atts;
         self.base_version = version;
         self.engine.committed = (*snap).clone();
         self.engine.attached_committed = attached;
@@ -3566,11 +3767,13 @@ impl Session {
         } else {
             // A READ ONLY block pins its snapshot atomically (load+register under one lock, §8), so the
             // version it reads can never be reclaimed in a load→register gap.
-            let (snap, attached, version, generation) = self.shared.refresh_and_pin()?;
+            let ((snap, attached, version, generation), atts) =
+                self.shared.refresh_and_pin_all()?;
             self.base_version = version;
             self.engine.committed = (*snap).clone();
             self.engine.attached_committed = attached;
             self.pinned = Some(version);
+            self.pin_atts = atts;
             self.pin_gen = generation;
             self.role_gen = generation;
         }
@@ -3635,7 +3838,18 @@ impl Session {
                 .lock()
                 .expect("live lock not poisoned")
                 .deregister_in(self.pin_gen, v);
+            drop(std::mem::take(&mut self.pin_atts)); // after main's pin
         }
+    }
+
+    /// A cursor's pins when it does not adopt an autocommit read's: the attachment pins
+    /// ([`Shared::cursor_attach_pins`]), then one more pin on the session's base version. Dropped
+    /// main first, then the attachments.
+    fn cursor_pin(&self) -> Box<dyn std::any::Any> {
+        let atts = self
+            .shared
+            .cursor_attach_pins(&self.pin_atts, self.gate_held);
+        Box::new((self.shared.reader_pin(self.base_version), atts))
     }
 
     /// Fail a statement of a transaction (or a read-only session's pinned snapshot) that began
@@ -3643,7 +3857,7 @@ impl Session {
     fn stale_role(&self) -> Result<()> {
         #[cfg(unix)]
         {
-            if self.shared.handoff.get().is_none() {
+            if !self.shared.has_shared_coordinator() {
                 return Ok(());
             }
             let open = self.engine.in_transaction()
@@ -3653,15 +3867,24 @@ impl Session {
             if !open {
                 return Ok(());
             }
-            let stale = match self.shared.current_role() {
-                None => true,
-                Some(role) => {
-                    self.role_gen != role.generation
-                        || role.client.as_ref().is_some_and(|conn| conn.is_broken())
+            if self.shared.handoff.get().is_some() {
+                let stale = match self.shared.current_role() {
+                    None => true,
+                    Some(role) => {
+                        self.role_gen != role.generation
+                            || role.client.as_ref().is_some_and(|conn| conn.is_broken())
+                    }
+                };
+                if stale {
+                    return Err(handoff::stale_role());
                 }
-            };
-            if stale {
-                return Err(handoff::stale_role());
+            }
+            // A file attachment under the page service changes role on its own (shared_attach.rs).
+            if self.gate_held {
+                return self.shared.writer_stale();
+            }
+            if self.pinned.is_some() {
+                return self.pin_atts.stale();
             }
         }
         Ok(())
@@ -3673,7 +3896,8 @@ impl Session {
         let (snap, attached) = self.shared.pin_roots();
         self.base_version = snap.txid;
         self.engine.committed = (*snap).clone();
-        self.engine.attached_committed = attached; // re-pin the latest attached roots together (§5)
+        // The latest attached roots together (§5), with the writer's service attachments.
+        self.engine.attached_committed = self.shared.writer_view(attached);
     }
 
     /// Publish the engine's committed root into the shared cell at the next version (the §3 commit
@@ -4215,6 +4439,17 @@ pub(crate) struct SimLiveState {
 }
 
 #[cfg(feature = "sim")]
+impl Session {
+    /// The version of attachment `name` this session reads (its pinned or base root), or 0.
+    pub(crate) fn sim_attached_version(&self, name: &str) -> u64 {
+        self.engine
+            .attached_committed
+            .get(name)
+            .map_or(0, |snap| snap.txid)
+    }
+}
+
+#[cfg(feature = "sim")]
 impl Database {
     pub(crate) fn sim_live_state(&self) -> SimLiveState {
         let committed = self
@@ -4288,7 +4523,7 @@ impl Database {
     }
 
     /// Run main's cap flush on the committing thread (a page-service process opened with its
-    /// synchronous setting from the options).
+    /// synchronous setting from the options). File attachments inherit it.
     pub(crate) fn sim_set_inline_flush(&self) {
         self.0
             .storage
@@ -4313,8 +4548,8 @@ impl Database {
             .attachments
             .lock()
             .expect("attachments lock not poisoned")
-            .get(name)
-            .is_some_and(|a| a.storage.engine_pending())
+            .get_mut(name)
+            .is_some_and(|a| a.with_storage(|st| st.engine_pending()))
     }
 
     /// Whether database `name` (`main` or an attachment) holds no relaxed commit pending a flush
@@ -4332,19 +4567,41 @@ impl Database {
             .attachments
             .lock()
             .expect("attachments lock not poisoned")
-            .get(name)
-            .is_some_and(|a| a.storage.engine_flushed())
+            .get_mut(name)
+            .is_some_and(|a| a.with_storage(|st| st.engine_flushed()))
     }
 
-    /// The committed version of attachment `name`, or `None` if it is not attached.
+    /// The committed version of attachment `name` this handle has adopted (a service attachment's
+    /// inner handle's), or `None` if it is not attached.
     pub(crate) fn sim_attached_version(&self, name: &str) -> Option<u64> {
+        if !self.sim_has_attachment(name) {
+            return None;
+        }
+        self.0.attached_root(name).map(|snap| snap.txid)
+    }
+
+    /// Whether attachment `name` is attached to this handle.
+    pub(crate) fn sim_has_attachment(&self, name: &str) -> bool {
         self.0
-            .roots
-            .read()
-            .expect("roots lock not poisoned")
-            .attached
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned")
+            .contains_key(name)
+    }
+
+    /// The handle whose page-service role serves database `name`: this one for main, an attachment's
+    /// inner handle (README.md §6.6), or `None` when `name` is not attached under the service.
+    pub(crate) fn sim_service_db(&self, name: &str) -> Option<Database> {
+        if name == "main" {
+            return Some(self.clone());
+        }
+        self.0
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned")
             .get(name)
-            .map(|snap| snap.txid)
+            .and_then(|att| att.svc.clone())
+            .map(Database)
     }
 
     /// Database `name`'s page high-water and in-memory free-list length — the allocator state its
@@ -4360,12 +4617,12 @@ impl Database {
             let st = self.0.storage.lock().expect("storage lock not poisoned");
             return Some(of(&st));
         }
-        let atts = self
+        let mut atts = self
             .0
             .attachments
             .lock()
             .expect("attachments lock not poisoned");
-        atts.get(name).map(|a| of(&a.storage))
+        atts.get_mut(name).map(|a| a.with_storage(|st| of(st)))
     }
 }
 
@@ -4465,6 +4722,11 @@ impl Database {
     pub fn close(self) -> Result<()> {
         #[cfg(unix)]
         self.0.end_service(true);
+        // Each file attachment under the page service ends its own role too (README.md §6.6).
+        #[cfg(unix)]
+        for inner in self.0.service_inners() {
+            inner.end_service(true);
+        }
         // A relaxed domain's pending commits become durable before the handle is released
         // (validated-cow.md §4); a failed flush is what close reports.
         self.0.flush_all()
@@ -5460,6 +5722,8 @@ mod multi_root_failure_tests {
             .get_mut("b")
             .unwrap()
             .storage
+            .as_ref()
+            .unwrap()
             .paging
             .pager()
             .arm_fault(Fault::new(FaultPoint::BodyWrite(1), None));
@@ -5671,3 +5935,6 @@ mod batched_durability_tests;
 #[cfg(unix)]
 #[path = "shared_handoff.rs"]
 mod handoff;
+
+#[path = "shared_attach.rs"]
+mod attach;

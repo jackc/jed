@@ -1,0 +1,171 @@
+schema_version = 1
+name = "attachment-gate-order"
+description = "Two processes each own one file and attach the other's (page-service.md §5.5): a writer takes every writer gate, local or remote, in real-path byte order (x before y in both processes), so writers crossing owners queue instead of deadlocking, and each writes the other's database through its owner."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+path = "x"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "create"
+path = "y"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "a"
+command = "attach"
+name = "ydb"
+path = "y"
+
+[[step]]
+actor = "b"
+command = "attach"
+name = "xdb"
+path = "x"
+
+[[step]]
+actor = "a"
+command = "role"
+argument = "ydb"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "role"
+argument = "xdb"
+expect = "client"
+
+# a holds x's gate (its own) and y's (b's): b's writer waits for x's, holding nothing.
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "10000"
+async = true
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+[[step]]
+actor = "b"
+command = "await"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO xdb.t VALUES (2)"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "300"
+expect_error = "55P03"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+# b's writer holds both gates; a's writer takes x's (its own) and waits for y's.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (10)"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "10000"
+async = true
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "await"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO ydb.t VALUES (11)"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "10,11"
+
+# One transaction still writes at most one durable database.
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (3)"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO ydb.t VALUES (12)"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+expect_error = "0A000"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM xdb.t"
+expect = "2"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"

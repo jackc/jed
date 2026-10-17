@@ -319,9 +319,8 @@ when no owner answers. A `hello` refused with `53300` (the owner's connection li
 open at once, like `0A000`.
 
 `create` under `locking = auto` takes `presence EX` with the exclusive acquisition loop and is the
-owner, whatever its ownership preference. A client whose owner exits re-elects (§6.5). File
-attachments are non-serving owners of their files (locking.md §4) until they join the service with the
-cross-owner gate order of page-service.md §5.5.
+owner, whatever its ownership preference. A client whose owner exits re-elects (§6.5). A file
+attachment runs this election on its own file (§6.6).
 
 ### 6.2 The owner
 
@@ -526,7 +525,54 @@ further `hello` is answered with a fatal `53300` (PostgreSQL's `too_many_connect
 election fails at once; a re-electing client keeps trying until its open timeout.
 
 **Test hook.** Each core exposes a test-only call that reports a handle's role: `owner`, `client`, or
-`none` (not under the page service). The real-process corpus uses it.
+`none` (not under the page service), and the same for one of its file attachments (§6.6). The
+real-process corpus uses it.
+
+### 6.6 File attachments
+
+A file attachment (attached-databases.md §4) under `locking = auto` is a database of its own under the
+service (page-service.md §5.5). The wire protocol is unchanged: an attachment's connection is an
+ordinary connection to the attached file's owner.
+
+- **Election.** Attaching runs the §6.1 election on the attached file, under the attachment's
+  `file_lock_timeout_ms` and with its read-only mode: the attaching process becomes the file's owner,
+  serving it, or a page client of whichever process owns it, whether that process has the file open as
+  its main database or as an attachment. The attachment then has its own role, connection, reader
+  registry, resolution window, and handoff (§6.5), independent of main's and of every other attachment's:
+  each re-elects, promotes, yields, and drains on its own. When main is under the page service, the
+  attachment takes main's ownership preference and owner limits; otherwise the defaults. The
+  process-local duplicate-open check covers attachments as it covers opens (`55006`).
+- **Reads.** Every read begin that pins a snapshot for a local reader (§6.3) also pins each such
+  attachment's newest snapshot through its own role — an owner adopts its clients' commits, a client
+  sends `begin_read` — and the reader's end releases those pins, so each attachment's watermark counts
+  the reader. A read-only session pins them, like main, at its first read. There is no common commit
+  point across databases owned by different processes; a reader's view of each is that database's
+  newest commit at its begin.
+- **The writer gates.** A writable transaction takes the process's in-process writer gate, then the
+  writer gate of main (when main is under the page service) and of every read-write such attachment,
+  whether or not the transaction will write it, **in byte order of the resolved real paths** the
+  elections used. Each gate is the owner's own gate when this process owns that file, otherwise
+  `begin_write` to its owner (§3.5). Every process orders the same paths the same way, so no wait cycle
+  forms across owners. Each wait is bounded by the session's `lock_timeout_ms` (`55P03`); a failed
+  wait releases the gates already held in reverse order. A read-only attachment is pinned at the write
+  begin instead, as a reader would pin it. Attaching and detaching change only this process's handle,
+  so they take only the in-process gate and never wait for another process's writer.
+- **Commit.** An attachment's commit runs through its role, under the gate its transaction holds: the
+  owner's validated-COW commit, or a client's `CommitDelta` with the §6.4 outcome rules, its lost
+  acknowledgement resolved by the attachment's own re-election. A transaction still writes at most one
+  durable database (attached-databases.md §5).
+- **Durability.** An attachment follows its handle's `synchronous` setting (validated-cow.md §4). Its
+  floor and pending set are its own file domain's: under `synchronous = off` the attachment's owner
+  flushes the attachment's pending batch before granting its gate to a client (§3.5), local or
+  remote, independently of main, and that flush shrinks nothing. Trailing truncation of the attached
+  file follows the owner rules of page-service.md §6: only its owner's own commits truncate, and a
+  client committing to the attachment through its owner never does.
+- **Role changes.** A transaction that pinned an attachment, or took its gate, under a role the
+  attachment no longer has fails `08006` at its next statement and at `COMMIT`, as §6.5 says for main.
+- **Compaction** of an attachment is its owner's (§6.4): a client's fails `55006`.
+- **Detach and close** end the attachment's role: an owner drains its clients for its shutdown grace and
+  releases ownership, and a client closes its connection (§6.5). Detaching a pinned attachment is still
+  `55006`.
 
 ## 7. The corpus through a client
 

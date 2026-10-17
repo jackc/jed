@@ -138,3 +138,17 @@ export function pageServiceRoleForTesting(db: object): "owner" | "client" | "non
   };
   return internal.core.handoff === null ? "none" : internal.core.roleKind;
 }
+
+// pageServiceAttachmentRoleForTesting reports the page-service role of attachment name: "owner",
+// "client", or "none" (not under the page service, between roles, or not attached). Test-only
+// (spec/pageservice/README.md §6.6).
+export function pageServiceAttachmentRoleForTesting(
+  db: object,
+  name: string,
+): "owner" | "client" | "none" {
+  const internal = db as {
+    core: { attachments: Map<string, { svc: { db: object } | null }> };
+  };
+  const svc = internal.core.attachments.get(name)?.svc ?? null;
+  return svc === null ? "none" : pageServiceRoleForTesting(svc.db);
+}

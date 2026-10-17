@@ -72,15 +72,20 @@ func (h *simLockHost) claimPath(path string) bool {
 
 func (h *simLockHost) releasePath(path string) { delete(h.claimed, path) }
 
-func (h *simLockHost) openBundle(string) (lockFiles, error) {
-	return lockFiles{presence: "presence", arrival: "arrival"}, nil
+// openBundle names the database's two bundle locks after its path: main and each file attachment have
+// their own (spec/pageservice/README.md §6.6).
+func (h *simLockHost) openBundle(path string) (lockFiles, error) {
+	return lockFiles{presence: path + ".lock/presence", arrival: path + ".lock/arrival"}, nil
 }
 
 func (h *simLockHost) validateMarker(string) error { return nil }
 
-func (h *simLockHost) closeFiles(lockFiles) {
-	for _, holders := range h.table.holders {
-		delete(holders, h.pidNum)
+// closeFiles releases this process's locks on the bundle's two files, as closing them does.
+func (h *simLockHost) closeFiles(files lockFiles) {
+	for _, l := range []lockHandle{files.presence, files.arrival} {
+		if name, ok := l.(string); ok {
+			delete(h.table.holders[name], h.pidNum)
+		}
 	}
 }
 

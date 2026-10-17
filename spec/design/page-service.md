@@ -234,14 +234,17 @@ client resolves the outcome with `commit_status` (§8.4).
 **Attachments: one global acquisition order across owners** (decided at ratification). Each
 attached file has its own owner, so one process may own `main` and be a client of an attachment, or
 the reverse. The one-durable-writer-per-transaction rule ([attached-databases.md](attached-databases.md))
-is unchanged, and so is locking.md §6's conservative rule: a writable transaction acquires the writer
+is unchanged, and so is the conservative rule that every writable transaction takes every writer gate,
+whatever it writes: it acquires the writer
 gate of `main` and of every read-write file attachment, **in normalized (real-path) UTF-8 byte
 order**, whether a given gate is local (this process owns that file: its in-process gate) or remote
 (another process owns it: `begin_write` to that owner). Every process uses the same total order over
 the same real paths, so no wait cycle can form across owners. Each wait is also bounded by the session
 `lock_timeout_ms` (`55P03`) as a backstop, and an acquisition failure releases the gates already held
-in reverse order. A future target-declaring transaction API may narrow the set, as locking.md §6
-already allows.
+in reverse order. A future target-declaring transaction API may narrow the set. **Landed:** each
+attachment under `locking = auto` is elected owner or page client of its file exactly as an open is,
+with its own role and handoff; read begins pin it through that role, and attaching or detaching waits
+for no other process. The exact rules are [spec/pageservice/README.md](../pageservice/README.md) §6.6.
 
 ### 5.6 Commit
 
@@ -674,12 +677,12 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
 3. ✅ **Write path** in Rust, Go, and TS (landed, under the test-only `locking = service`): writer
    gate, reuse grant, `commit` with validation, owner adoption, the reclamation rule, `commit_status`,
    the idle-in-transaction timeout ([spec/pageservice/README.md](../pageservice/README.md) §3.5, §6.4).
-   File attachments under the service, with the cross-owner gate order of §5.5, follow separately.
+   File attachments under the service, with the cross-owner gate order of §5.5, landed after phase 4
+   ([spec/pageservice/README.md](../pageservice/README.md) §6.6).
 4. ✅ **Handoff** (landed): promotion, yield, graceful close, timeouts
    ([spec/pageservice/README.md](../pageservice/README.md) §6.5); the process-corpus rewrite;
    simulation testing of an owner and its clients ([simulation-testing.md](simulation-testing.md) §14
-   S8); retiring shared mode and the `shared` option; the new bundle marker. File attachments are
-   owner-only non-serving owners until they join the service.
+   S8); retiring shared mode and the `shared` option; the new bundle marker.
 5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree
    fetch.
 6. **Backup**: page-identical and compacted forms.

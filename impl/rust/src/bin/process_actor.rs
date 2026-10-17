@@ -112,6 +112,7 @@ fn run() -> Result<(), EngineError> {
                     .attach(name, AttachSource::file(path), read_only)
                     .map(|_| String::new())
             }
+            "DETACH" => database.detach(argument).map(|_| String::new()),
             "QUERY_I64" => decode_sql(argument).and_then(|sql| query_i64(&mut database, &sql)),
             "READ_OPEN" => {
                 reader = Some(database.read_session());
@@ -185,8 +186,14 @@ fn run() -> Result<(), EngineError> {
                 database.crash_before_next_page_service_ack_for_testing();
                 Ok(String::new())
             }
-            // The page-service role test hook (spec/pageservice/README.md §6.5).
-            "ROLE" => Ok(database.page_service_role_for_testing().to_string()),
+            // The page-service role test hook (spec/pageservice/README.md §6.5): main's, or an
+            // attachment's when the step names one.
+            "ROLE" if argument.is_empty() => {
+                Ok(database.page_service_role_for_testing().to_string())
+            }
+            "ROLE" => Ok(database
+                .page_service_attachment_role_for_testing(argument)
+                .to_string()),
             "TXID" => Ok(database.txid().to_string()),
             "PAGE_COUNT" => Ok(database.page_count().to_string()),
             "CLOSE" => {

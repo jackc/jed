@@ -126,14 +126,17 @@ Ordinary spawn/exec paths inherit no bundle descriptors (`CLOEXEC`).
   [spec/pageservice/README.md](../pageservice/README.md) §6.1 and §6.5: try `presence EX` without
   waiting (unless the opener's preference is `never`, or a handoff pauses it); otherwise connect to the
   owner the record names; repeat until `file_lock_timeout_ms`, then `55006`.
-- **Exclusive acquisition loop** (`exclusive`, `create`, and file attachments): poll `presence EX` with
+- **Exclusive acquisition loop** (`exclusive`, `create`, and `exclusive` file attachments): poll `presence EX` with
   nonblocking tries until it succeeds or `file_lock_timeout_ms` passes (`55006`, with "owned by another
   user's process" or "owned by a non-serving process" from the owner record when it says so). A
   non-serving owner writes an owner record with the serving flag clear, so page-service openers word
   their timeout correctly, and removes it at close before releasing `presence`.
-- **File attachments** are non-serving owners of their files until attachments join the page service
-  (page-service.md §5.5; TODO.md): attaching a file that another process owns waits, then fails
-  `55006`. A transaction still writes at most one durable database.
+- **File attachments** under `auto` run the page-service election on their own file: the attaching
+  process owns and serves it, or is a page client of whichever process owns it, as main or as an
+  attachment ([spec/pageservice/README.md](../pageservice/README.md) §6.6). A writable transaction then
+  takes the writer gate of main and of every read-write such attachment in real-path byte order
+  (page-service.md §5.5). An `exclusive` attachment is a non-serving owner, acquired with the exclusive
+  loop. A transaction still writes at most one durable database.
 
 ## 5. Transactions across processes
 
@@ -251,7 +254,7 @@ never imports the addon.
 This surface is host state, so the release-blocking real-process corpus
 (`spec/conformance/process/`, `mise run concurrency:process`, part of `mise run ci`) is the authority:
 election, reads and writes through the service, promotion, yield, graceful close, owner and client
-kills, commit resolution, owner limits, exclusive owners, and owner-only file attachments, in every
+kills, commit resolution, owner limits, exclusive owners, and file attachments under the service, in every
 Rust/Go/Node pairing ([concurrency-testing.md](concurrency-testing.md) §10). Unknown-marker failure,
 hard-link rejection, and symlink identity stay per-core unit tests. Simulation testing of an owner and
 its clients is [simulation-testing.md](simulation-testing.md).

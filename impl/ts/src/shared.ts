@@ -204,9 +204,13 @@ export type ServiceRole = {
 // implementation is pageservice/handoff.ts, injected by file.ts so this module stays browser-clean):
 // the ownership preference and grace periods, and the election a role change runs.
 export interface ServiceHandoffHost {
+  // path is the database's resolved real path, the writer-gate order key (page-service.md §5.5).
+  readonly path: string;
   readonly ownership: "prefer" | "yield" | "never";
   readonly yieldGraceMs: number;
   readonly shutdownGraceMs: number;
+  // relaxed is the handle's synchronous = off, whatever role it holds (validated-cow.md §4).
+  readonly relaxed: boolean;
   // elect runs the election loop under the open timeout, keeping the path claim: it returns the new
   // role (an owner opened with recovery and serving, or an opened client). 55006 on timeout.
   elect(pauseUntilMs: number): ServiceRole;
@@ -434,6 +438,14 @@ class SharedCore {
   private serviceEpoch = 0;
   private serviceLocalOldest = false;
   planEpoch = 0;
+  // serviceAttachCount counts the file attachments under the page service (page-service.md §5.5).
+  // heldGates and writerPins are the current writer's: the gates it took after the in-process writer
+  // flag, in real-path order, and its pins on read-only service attachments.
+  serviceAttachCount = 0;
+  private heldGates: GateRef[] = [];
+  private writerPins: AttachPin[] = [];
+  // name is the attachment an inner handle serves ("" for a host-facing handle: main).
+  name = "";
   // The handle's Environment (spec/design/environment.md §3): fixed at open/create and shared (by
   // reference) by every minted session, attachment, and temp domain — the storage owner's.
   readonly environment: Environment;
@@ -446,18 +458,25 @@ class SharedCore {
   }
 
   acquireWriter(timeoutMs: number): void {
+    this.acquireWriterScoped(timeoutMs, true);
+  }
+
+  // acquireWriterScoped takes the in-process writer flag, then (when gates is set) the gates of main and
+  // of the service attachments, in real-path order (page-service.md §5.5). Attach and detach take only
+  // the in-process flag: they change only this handle's registry, and waiting there on a gate another
+  // process's writer holds could deadlock against that process's own attach.
+  acquireWriterScoped(timeoutMs: number, gates: boolean): void {
     if (this.writerActive) {
       throw engineError("active_sql_transaction", "there is already a writer in progress");
     }
     this.writerActive = true;
-    if (this.handoff !== null) {
+    if (gates && (this.handoff !== null || this.serviceAttachCount > 0)) {
       // Under the page service a writer takes the owner's gate — its own, or through begin_write — and
       // an owner then adopts any client commit published since its last transaction (page-service.md
       // §5.5, §7; README §6.5).
       try {
-        this.beginServiceWrite(timeoutMs);
+        this.acquireGates(timeoutMs);
       } catch (error) {
-        this.releaseServiceGate();
         this.writerActive = false;
         throw error;
       }
@@ -465,10 +484,188 @@ class SharedCore {
     try {
       this.checkPid();
     } catch (error) {
-      this.releaseServiceGate();
-      this.writerActive = false;
+      this.releaseWriter();
       throw error;
     }
+  }
+
+  // acquireGates takes, after the in-process writer flag the caller holds, the writer gate of main
+  // (when main is under the page service) and of every read-write service attachment, in real-path
+  // byte order (page-service.md §5.5). Each wait is bounded by timeoutMs; a failure releases the gates
+  // already held in reverse order. Read-only service attachments are then refreshed and pinned for the
+  // writer, in real-path order.
+  private acquireGates(timeoutMs: number): void {
+    const gates: GateRef[] = [];
+    if (this.handoff !== null) gates.push({ path: this.handoff.path, att: null });
+    const readOnly: ServiceAttachment[] = [];
+    for (const svc of this.serviceAttachments()) {
+      if (svc.readOnly) readOnly.push(svc);
+      else gates.push({ path: svc.realPath, att: svc });
+    }
+    // A stable sort: main's gate and an attachment's never share a path (one open per path).
+    gates.sort((a, b) => compareFilePaths(a.path, b.path));
+    const held: GateRef[] = [];
+    for (const gate of gates) {
+      try {
+        if (gate.att === null) this.beginServiceWrite(timeoutMs);
+        else gate.att.core.acquireWriter(timeoutMs);
+      } catch (error) {
+        if (gate.att === null) this.releaseMainGate();
+        this.releaseGates(held);
+        throw error;
+      }
+      held.push(gate);
+    }
+    const pins: AttachPin[] = [];
+    for (const svc of readOnly) {
+      try {
+        pins.push(pinServiceAttachment(svc));
+      } catch (error) {
+        releaseAttachPins(pins);
+        this.releaseGates(held);
+        throw error;
+      }
+    }
+    this.heldGates = held;
+    this.writerPins = pins;
+  }
+
+  // releaseGates releases held gates in reverse order.
+  private releaseGates(held: GateRef[]): void {
+    for (let i = held.length - 1; i >= 0; i--) {
+      const gate = held[i]!;
+      if (gate.att === null) this.releaseMainGate();
+      else gate.att.core.releaseWriter();
+    }
+  }
+
+  // releaseMainGate ends main's page-service write: a client's open write transaction, and the owner's
+  // gate this thread holds. A no-op when neither is held.
+  private releaseMainGate(): void {
+    this.writerClient?.endWrite();
+    this.writerClient = null;
+    this.releaseServiceGate();
+  }
+
+  // --- file attachments under the page service (page-service.md §5.5; README §6.6) ---
+
+  // serviceAttachments lists the attachments under the page service in real-path byte order.
+  serviceAttachments(): ServiceAttachment[] {
+    if (this.serviceAttachCount === 0) return [];
+    const out: ServiceAttachment[] = [];
+    for (const att of this.attachments.values()) {
+      if (att.svc !== null) out.push(att.svc as ServiceAttachment);
+    }
+    out.sort((a, b) => compareFilePaths(a.realPath, b.realPath));
+    return out;
+  }
+
+  // attachedRoot is the committed root of attachment name as the handle knows it now: a service
+  // attachment's inner handle's committed snapshot, any other attachment's published root.
+  attachedRoot(name: string): Snapshot | undefined {
+    const svc = this.attachments.get(name)?.svc ?? null;
+    if (svc !== null) return (svc as ServiceAttachment).core.committed;
+    return this.attached.get(name);
+  }
+
+  // hasSharedCoordinator reports whether other processes may commit to this database or one of its
+  // attachments: true under the page service.
+  hasSharedCoordinator(): boolean {
+    return this.handoff !== null || this.serviceAttachCount > 0;
+  }
+
+  // refreshAndPinAll is a read begin over main and every service attachment: main first, then each
+  // attachment in real-path order (refreshAndPin for each). It returns main's pinned version and role
+  // generation and the attachment pins.
+  refreshAndPinAll(): { version: bigint; gen: number; atts: AttachPin[] } {
+    const version = this.refreshAndPin();
+    const gen = this.roleGen;
+    const atts: AttachPin[] = [];
+    for (const svc of this.serviceAttachments()) {
+      try {
+        atts.push(pinServiceAttachment(svc));
+      } catch (error) {
+        this.deregister(version, gen);
+        releaseAttachPins(atts);
+        throw error;
+      }
+    }
+    return { version, gen, atts };
+  }
+
+  // cursorAttachPins are the attachment pins a cursor takes beside its main pin: one more on each of
+  // the reader's pins, and for a writer, one more on each read-only attachment's pin and one on each
+  // gated attachment's committed snapshot (its base).
+  cursorAttachPins(readerPins: AttachPin[], writer: boolean): AttachPin[] {
+    if (!writer) return addAttachPins(readerPins);
+    const pins = addAttachPins(this.writerPins);
+    for (const gate of this.heldGates) {
+      if (gate.att === null) continue;
+      const inner = gate.att.core;
+      const v = inner.committed.txid;
+      inner.register(v);
+      pins.push({ name: gate.att.name, core: inner, gen: inner.roleGen, v, snap: inner.committed });
+    }
+    return pins;
+  }
+
+  // writerView returns the attached roots with the writer's service attachments overlaid: a gated
+  // attachment's committed snapshot (current: no other process can commit it) and a read-only one's
+  // pinned snapshot. Caller holds the writer gates.
+  writerView(): Map<string, Snapshot> {
+    if (this.heldGates.length === 0 && this.writerPins.length === 0) return this.attached;
+    const attached = new Map(this.attached);
+    for (const gate of this.heldGates) {
+      if (gate.att !== null) attached.set(gate.att.name, gate.att.core.committed);
+    }
+    for (const pin of this.writerPins) attached.set(pin.name, pin.snap);
+    return attached;
+  }
+
+  // writerStale throws 08006 when an attachment the writer holds the gate or a pin of changed role
+  // since (README §6.5). Caller holds the writer gates.
+  writerStale(): void {
+    for (const gate of this.heldGates) {
+      if (gate.att === null) continue;
+      const inner = gate.att.core;
+      if (inner.writerRoleChanged() || inner.client?.lost()) throw errStaleRole();
+    }
+    attachPinsStale(this.writerPins);
+  }
+
+  // commitServiceAttachment commits a service attachment's working snapshot through this inner handle,
+  // under the gate the outer writer holds (page-service.md §5.5): the role decides the path — an
+  // owner's validated-COW commit, or a client's CommitDelta through its owner, with a lost
+  // acknowledgement resolved by re-election — then publishes it as a main commit is published. It
+  // returns the attachment's committed snapshot afterwards.
+  commitServiceAttachment(snap: Snapshot, stagesRows: boolean): Snapshot {
+    this.persist(snap, stagesRows);
+    if (this.writerRoleChanged()) {
+      // A lost acknowledgement resolved as committed under a new role: that role's committed state
+      // already holds the commit (README §6.5).
+      return this.committed;
+    }
+    snap.demoteCleanLeaves();
+    if (this.client === null || snap.txid > this.committed.txid) this.committed = snap;
+    if (this.service !== null) this.publishService(snap.txid);
+    if (this.client !== null && this.storage.lastCommitMeta !== null) {
+      this.client.adoptOwnCommit(snap.txid, this.storage.lastCommitMeta);
+    }
+    return this.committed;
+  }
+
+  // planEpochNow is the handle's plan-cache epoch: its own, plus every service attachment's inner one,
+  // so an inner handle's adoption of another process's catalog invalidates this handle's cached plans.
+  planEpochNow(): number {
+    let epoch = this.planEpoch;
+    for (const svc of this.serviceAttachments()) epoch += svc.core.planEpoch;
+    return epoch;
+  }
+
+  // domainName is the database name this core's storage-limit errors name: main, or the attachment an
+  // inner handle serves.
+  domainName(): string {
+    return this.name !== "" ? this.name : "main";
   }
 
   // tryAcquireLocalWriter claims the in-process writer flag only if it is free right now, with no
@@ -480,12 +677,21 @@ class SharedCore {
     return true;
   }
 
+  // releaseWriter releases the writer's read-only attachment pins, then its gates in reverse order
+  // (main's included; compaction's gate too), then the in-process writer flag.
   releaseWriter(): void {
     if (!this.writerActive) return;
-    this.writerClient?.endWrite();
-    this.writerClient = null;
-    this.releaseServiceGate();
-    this.writerActive = false;
+    const pins = this.writerPins;
+    const gates = this.heldGates;
+    this.writerPins = [];
+    this.heldGates = [];
+    try {
+      releaseAttachPins(pins);
+      this.releaseGates(gates);
+      this.releaseMainGate();
+    } finally {
+      this.writerActive = false;
+    }
   }
 
   // --- page-service roles and handoff (spec/pageservice/README.md §6.5) ---
@@ -948,7 +1154,7 @@ class SharedCore {
     snap.txid = newTxid;
     try {
       persistImpl(st, snap, true, true, {
-        name: "main",
+        name: this.domainName(),
         prev,
         canCompact: true,
         stagesRows: false,
@@ -1047,7 +1253,12 @@ class SharedCore {
   // the pager usable; any other (the outcome unknown) keeps it refusing commits until reopen.
   private persistClient(snap: Snapshot, stagesRows: boolean): void {
     const client = this.client!;
-    const budget: BudgetCtx = { name: "main", prev: this.committed, canCompact: false, stagesRows };
+    const budget: BudgetCtx = {
+      name: this.domainName(),
+      prev: this.committed,
+      canCompact: false,
+      stagesRows,
+    };
     try {
       persistImpl(this.storage, snap, false, client.reuseGrant, budget, false);
     } catch (error) {
@@ -1177,7 +1388,7 @@ class SharedCore {
     // so both hold and behavior (and on-disk bytes) are identical to an ungated commit.
     const oldest = this.oldestLiveVersion(snap.txid);
     const budget: BudgetCtx = {
-      name: "main",
+      name: this.domainName(),
       prev: this.committed,
       canCompact: this.canCompactCommitted(),
       stagesRows,
@@ -1193,7 +1404,7 @@ class SharedCore {
 
   // committedAttachment is the published committed root of attachment name (exact), if attached.
   committedAttachment(name: string): Snapshot | undefined {
-    return this.attached.get(name);
+    return this.attachedRoot(name);
   }
 
   // canCompactCommitted reports whether the committed snapshots may be compacted now (memory.md §8.3):
@@ -1217,13 +1428,26 @@ class SharedCore {
     const canCompact = this.canCompactCommitted();
     const sorted = [...attached].sort((a, b) => compareFilePaths(a[0], b[0])); // UTF-8 byte order
     for (const [name, snap] of sorted) {
-      const prev = this.attached.get(name);
+      const prev = this.attachedRoot(name);
       const att = this.attachments.get(name);
       if (prev === undefined || att === undefined) continue;
-      precheckBudget(att.storage, snap, true, {
+      let reuse = true;
+      let compactable = canCompact;
+      if (att.svc !== null) {
+        // A service attachment's commit runs through its inner handle: its reader registry (which
+        // counts other processes' pins when it owns the file) gates reuse and compaction.
+        const inner = (att.svc as ServiceAttachment).core;
+        compactable = inner.canCompactCommitted();
+        reuse = inner.oldestLiveVersion(prev.txid + 1n) >= inner.storage.freeGenTxid;
+        if (inner.client !== null) {
+          reuse = inner.client.reuseGrant;
+          compactable = false;
+        }
+      }
+      precheckBudget(att.storage, snap, reuse, {
         name,
         prev,
-        canCompact,
+        canCompact: compactable,
         stagesRows: snap.stagedBytes() !== 0,
       });
     }
@@ -1233,7 +1457,7 @@ class SharedCore {
     const reuse =
       this.client !== null ? this.client.reuseGrant : oldest >= this.storage.freeGenTxid;
     precheckBudget(this.storage, main, reuse, {
-      name: "main",
+      name: this.domainName(),
       prev: this.committed,
       canCompact,
       stagesRows: mainStagesRows,
@@ -1355,6 +1579,98 @@ function closeDomain(st: Engine): unknown {
   return error;
 }
 
+
+// --- File attachments under the page service (spec/design/page-service.md §5.5; spec/pageservice/
+// README.md §6.6). An attachment opened under `locking = "auto"` has its own coordination domain: an
+// inner handle elected on the attached file exactly as an open is — the owner, serving it, or a page
+// client of whichever process owns it — with its own role, handoff, reader registry, and writer gate.
+// The outer handle's sessions use it as a database of the handle:
+//   - a read begin pins every such attachment's newest snapshot through its inner handle (an owner
+//     adopts its clients' commits; a client sends begin_read) and releases the pins when the reader ends;
+//   - a write begin takes, after the in-process writer flag, the writer gate of main (when main is under
+//     the page service) and of every read-write such attachment, in real-path byte order, releasing the
+//     gates already held in reverse order on failure; read-only such attachments are pinned instead;
+//   - an attachment's commit runs through its inner handle under the gate the writer holds.
+// The one-durable-writer rule is unchanged (attached-databases.md §5). ---
+
+// ServiceAttachment is a file attachment under the page service: its inner handle (and that handle's
+// core) and the attached file's resolved real path, the writer-gate order key.
+class ServiceAttachment {
+  readonly name: string;
+  readonly readOnly: boolean;
+  readonly db: Database;
+  readonly core: SharedCore;
+  readonly realPath: string;
+
+  constructor(name: string, readOnly: boolean, db: Database, core: SharedCore, realPath: string) {
+    this.name = name;
+    this.readOnly = readOnly;
+    this.db = db;
+    this.core = core;
+    this.realPath = realPath;
+  }
+
+  commitServiceAttachment(snap: Snapshot, stagesRows: boolean): Snapshot {
+    return this.core.commitServiceAttachment(snap, stagesRows);
+  }
+}
+
+// AttachPin is one reader pin on a service attachment's inner reader registry, with the snapshot it
+// pins and the role generation it was registered under.
+type AttachPin = { name: string; core: SharedCore; gen: number; v: bigint; snap: Snapshot };
+
+// GateRef is one writer gate a writer holds: main's (att null) or a service attachment's.
+type GateRef = { path: string; att: ServiceAttachment | null };
+
+// coreOf is the shared core of a handle this module built (an attachment's inner handle).
+function coreOf(db: Database): SharedCore {
+  return (db as unknown as { core: SharedCore }).core;
+}
+
+// pinServiceAttachment runs the inner handle's read begin and pins its newest snapshot.
+function pinServiceAttachment(svc: ServiceAttachment): AttachPin {
+  const inner = svc.core;
+  const v = inner.refreshAndPin();
+  return { name: svc.name, core: inner, gen: inner.roleGen, v, snap: inner.committed };
+}
+
+// overlayAttachPins returns attached with each pin's snapshot as its attachment's root.
+function overlayAttachPins(
+  attached: Map<string, Snapshot>,
+  pins: AttachPin[],
+): Map<string, Snapshot> {
+  if (pins.length === 0) return attached;
+  const out = new Map(attached);
+  for (const pin of pins) out.set(pin.name, pin.snap);
+  return out;
+}
+
+// releaseAttachPins releases reader pins on service attachments, in the order they were taken.
+function releaseAttachPins(pins: AttachPin[]): void {
+  for (const pin of pins) pin.core.deregister(pin.v, pin.gen);
+}
+
+// addAttachPins registers one more pin on each pinned version (a cursor outliving its reader's pin),
+// skipping a pin whose inner role has changed: that role's registry is gone.
+function addAttachPins(pins: AttachPin[]): AttachPin[] {
+  const out: AttachPin[] = [];
+  for (const pin of pins) {
+    const c = pin.core;
+    if (c.roleGen === pin.gen && (c.live.get(pin.v) ?? 0) > 0) {
+      c.register(pin.v);
+      out.push(pin);
+    }
+  }
+  return out;
+}
+
+// attachPinsStale throws 08006 when a pinned attachment's inner handle changed role since the pin.
+function attachPinsStale(pins: AttachPin[]): void {
+  for (const pin of pins) {
+    if (pin.core.roleGen !== pin.gen || pin.core.client?.lost()) throw errStaleRole();
+  }
+}
+
 // compactStorage replaces storage st with the from-scratch image of snap at txid (host compaction,
 // spec/design/api.md §2.6) and returns the committed snapshot reloaded from it. A file is rewritten
 // through the host's registered file compactor (file.ts compactFile); an in-memory domain swaps in a new
@@ -1455,14 +1771,22 @@ export function attachFile(
 // feature_not_supported (a pure in-memory build has no file layer to reach).
 // files is main's file host (null is the host's own), so an attachment opens through the same
 // filesystem as main — the deterministic simulator's (simulation-testing.md §14 S4) included.
-type OpenedAttachment = { engine: Engine; coordinator: FileCoordinatorHost | null };
-// relaxed is main's synchronous = off, which a file attachment follows (validated-cow.md §4).
+// relaxed is main's synchronous = off, which a file attachment follows (validated-cow.md §4), under
+// the page service too.
+// mainHandoff is main's page-service handoff (null when main is not under the page service): a file
+// attachment under the page service copies its hosts and limits (page-service.md §5.5). The opener
+// returns an opened file (its storage Engine and coordinator), or, under the page service, the inner
+// handle elected on the attached file and the file's resolved real path (the writer-gate order key).
+export type OpenedAttachment =
+  | { kind: "file"; engine: Engine; coordinator: FileCoordinatorHost | null }
+  | { kind: "service"; service: Database; realPath: string };
 type FileAttachOpener = (
   source: AttachSource,
   readOnly: boolean,
   files: FileHost | null,
   environment: Environment,
   relaxed: boolean,
+  mainHandoff: ServiceHandoffHost | null,
 ) => OpenedAttachment;
 let fileAttachOpener: FileAttachOpener | null = null;
 
@@ -1572,6 +1896,7 @@ export class Database {
     let storage: Engine;
     let root: Snapshot;
     let coordinator: FileCoordinatorHost | null = null;
+    let svc: ServiceAttachment | null = null;
     if (source.file) {
       if (fileAttachOpener === null) {
         // A pure in-memory build (no node/OPFS host imported) has no file layer to reach.
@@ -1584,8 +1909,48 @@ export class Database {
         readOnly,
         c.storage.fileHost,
         c.environment,
-        c.storage.relaxed,
+        // A page client's own storage never batches; the handle's setting is its handoff's.
+        c.handoff !== null ? c.handoff.relaxed : c.storage.relaxed,
+        c.handoff,
       );
+      if (opened.kind === "service") {
+        // Under the page service the attachment is owner or page client of its file, elected as an
+        // open is (page-service.md §5.5); its storage is the inner handle's, whatever its role.
+        const inner = coreOf(opened.service);
+        inner.name = lname;
+        if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
+          opened.service.close(); // release the just-opened file — the name is taken
+          throw engineError("duplicate_object", `database "${name}" already exists`);
+        }
+        inner.storage.storageBudget.limit = source.maxStorageBytes ?? 0n;
+        svc = new ServiceAttachment(lname, readOnly, opened.service, inner, opened.realPath);
+        try {
+          c.acquireWriterScoped(0, false);
+        } catch (error) {
+          opened.service.close();
+          throw error;
+        }
+        try {
+          const service = svc;
+          c.attachments.set(lname, {
+            name: lname,
+            readOnly,
+            get storage(): Engine {
+              return service.core.storage;
+            },
+            coordinator: null,
+            svc: service,
+          });
+          c.serviceAttachCount++;
+          // Publish a NEW attached map so a live reader's pinned map is unaffected.
+          const na = new Map(c.attached);
+          na.set(lname, inner.committed);
+          c.attached = na;
+        } finally {
+          c.releaseWriter();
+        }
+        return;
+      }
       const engine = opened.engine;
       // The attachment's storage reaches the same file host as main (compaction, directory barrier).
       engine.fileHost = c.storage.fileHost;
@@ -1614,7 +1979,7 @@ export class Database {
       root = empty;
     }
     try {
-      c.acquireWriter(0);
+      c.acquireWriterScoped(0, false);
     } catch (error) {
       storage.paging?.close();
       coordinator?.close();
@@ -1622,7 +1987,7 @@ export class Database {
     }
     try {
       // Publish a NEW attached map so a live reader's pinned map is unaffected.
-      c.attachments.set(lname, { name: lname, readOnly, storage, coordinator });
+      c.attachments.set(lname, { name: lname, readOnly, storage, coordinator, svc: null });
       const na = new Map(c.attached);
       na.set(lname, root);
       c.attached = na;
@@ -1640,7 +2005,7 @@ export class Database {
   detach(name: string): void {
     const lname = name;
     const c = this.core;
-    c.acquireWriter(0);
+    c.acquireWriterScoped(0, false);
     let att: Attachment;
     try {
       if (lname === "main" || lname === "temp" || !c.attachments.has(lname)) {
@@ -1651,11 +2016,22 @@ export class Database {
       }
       att = c.attachments.get(lname)!;
       c.attachments.delete(lname);
+      if (att.svc !== null) {
+        c.serviceAttachCount--;
+        // Keep the plan-cache epoch monotone: planEpochNow no longer sums this inner handle's epoch.
+        c.planEpoch += (att.svc as ServiceAttachment).core.planEpoch + 1;
+      }
       const na = new Map(c.attached);
       na.delete(lname);
       c.attached = na;
     } finally {
       c.releaseWriter();
+    }
+    if (att.svc !== null) {
+      // Close the inner handle: an owner drains its clients and hands ownership on; a client closes
+      // its connection (README §6.5).
+      (att.svc as ServiceAttachment).db.close();
+      return;
     }
     // Release a file attachment's OS handle once it is unpublished and unreferenced (a no-op for an
     // in-memory attachment), its pending relaxed commits flushed first (validated-cow.md §4). No live
@@ -1674,10 +2050,16 @@ export class Database {
   // on a host that cannot replace a file atomically (OPFS), and 55006 while a write transaction or reader
   // is open on this handle or another process has the file open. Not metered and not reachable from SQL.
   compact(name: string): void {
+    this.compactAs(name, name);
+  }
+
+  // compactAs compacts database lname of this handle, naming it name in errors (an inner handle of a
+  // service attachment compacts its main under the attachment's name).
+  private compactAs(lname: string, name: string): void {
     const c = this.core;
-    const lname = name;
     let storage: Engine;
     let readOnly: boolean;
+    let service: ServiceAttachment | null = null;
     if (lname === "main") {
       storage = c.storage;
       readOnly = c.readOnly;
@@ -1688,9 +2070,26 @@ export class Database {
       }
       storage = att.storage;
       readOnly = att.readOnly;
+      service = att.svc as ServiceAttachment | null;
     }
     if (readOnly) {
       throw engineError("read_only_sql_transaction", `cannot compact read-only database "${name}"`);
+    }
+    if (service !== null) {
+      // A service attachment is compacted by its inner handle, under its own gate and watermark
+      // (page-service.md §6): only its owner can, and only with no pin from any process.
+      if (!c.tryAcquireLocalWriter()) {
+        throw engineError(
+          "object_in_use",
+          `cannot compact database "${name}" while a write transaction is open`,
+        );
+      }
+      try {
+        service.db.compactAs("main", name);
+      } finally {
+        c.releaseWriter();
+      }
+      return;
     }
     // A durable store without a path is the OPFS host (opfs.ts leaves path null), which has no atomic
     // file replace yet (hosts.md §5).
@@ -1740,14 +2139,15 @@ export class Database {
   // deregister (advancing the watermark), since JS has no destructor. (The old SharedDb.read().)
   readSession(): Session {
     this.core.checkPid();
-    this.core.refreshAndPin();
+    const pinned = this.core.refreshAndPinAll();
     const snap = this.core.committed; // pinned (immutable — no clone)
     const engine = databaseFromSnapshot(snap, this.core);
     // The attached roots are pinned together with the committed root (attached-databases.md §5), so the
     // session sees a consistent cross-database snapshot; it routes attachment persists via the core.
+    // Each service attachment's pinned snapshot is overlaid (page-service.md §5.5).
     engine.core = this.core;
-    engine.attachedCommitted = this.core.attached;
-    return new Session(this.core, engine, "ro", snap.txid, snap.txid);
+    engine.attachedCommitted = overlayAttachPins(this.core.attached, pinned.atts);
+    return new Session(this.core, engine, "ro", snap.txid, snap.txid, false, pinned.atts);
   }
 
   // writeSession opens a READ WRITE session with an eager open write block (spec/design/session.md
@@ -1767,7 +2167,7 @@ export class Database {
       // committed = the immutable base; beginTx clones it to working.
       const engine = databaseFromSnapshot(base, this.core);
       engine.core = this.core;
-      engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
+      engine.attachedCommitted = this.core.writerView(); // pin the attached roots together (§5)
       engine.beginTx(true);
       return new Session(this.core, engine, "rw", base.txid, null, true);
     } catch (error) {
@@ -1786,16 +2186,17 @@ export class Database {
   session(opts: SessionOptions = {}): Session {
     this.core.checkPid();
     // A read-only file-backed core mints read-only sessions, pinned at the refreshed version.
-    if (this.core.readOnly) this.core.refreshAndPin();
+    const atts = this.core.readOnly ? this.core.refreshAndPinAll().atts : [];
     const snap = this.core.committed;
     const engine = databaseFromSnapshot(snap, this.core);
     engine.session = new SessionState(this.core.environment, opts);
     engine.core = this.core;
-    engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
+    // pin the attached roots together (§5), each service attachment's pinned snapshot overlaid
+    engine.attachedCommitted = overlayAttachPins(this.core.attached, atts);
     // A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
     // version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
     if (this.core.readOnly) {
-      return new Session(this.core, engine, "ro", snap.txid, snap.txid);
+      return new Session(this.core, engine, "ro", snap.txid, snap.txid, false, atts);
     }
     return new Session(this.core, engine, "rw", snap.txid, null);
   }
@@ -1966,12 +2367,25 @@ export class Database {
     st.paging = null;
     // Release any still-attached file databases (an in-memory attachment's close is a no-op), so the host
     // need not detach before close (attached-databases.md §4). Order-independent (just closing).
+    // A service attachment's inner handle closes last, in real-path order: an owner drains its clients
+    // and hands ownership on, a client closes its connection (README §6.5).
+    const inners = this.core.serviceAttachments();
     for (const att of this.core.attachments.values()) {
+      if (att.svc !== null) continue;
       const e = closeDomain(att.storage);
       if (error === null) error = e;
       att.coordinator?.close();
     }
     this.core.attachments = new Map();
+    this.core.serviceAttachCount = 0;
+    for (const inner of inners) {
+      try {
+        inner.db.close();
+      } catch (e) {
+        // The other handles still close; the first failure (a failed flush) is what close reports.
+        if (error === null) error = e;
+      }
+    }
     this.core.coordinator?.close();
     this.core.coordinator = null;
     if (error !== null) throw error;
@@ -2140,6 +2554,10 @@ export class Session {
   // pinGen the one pinnedVersion was registered under (spec/pageservice/README.md §6.5).
   private roleGen: number;
   private pinGen: number;
+  // pinAtts are the pins on file attachments under the page service taken with pinnedVersion, released
+  // with it; stmtAtts are an autocommit read's, for the one statement (page-service.md §5.5).
+  private pinAtts: AttachPin[];
+  private stmtAtts: AttachPin[] | null = null;
 
   constructor(
     core: SharedCore,
@@ -2148,6 +2566,7 @@ export class Session {
     baseVersion: bigint,
     pinnedVersion: bigint | null,
     gateHeld = false,
+    pinAtts: AttachPin[] = [],
   ) {
     this.core = core;
     this.engine = engine;
@@ -2155,22 +2574,27 @@ export class Session {
     this.baseVersion = baseVersion;
     this.pinnedVersion = pinnedVersion;
     this.gateHeld = gateHeld;
-    this.planEpoch = core.planEpoch;
+    this.pinAtts = pinAtts;
+    this.planEpoch = core.planEpochNow();
     this.roleGen = core.roleGen;
     this.pinGen = core.roleGen;
   }
 
   // checkRole fails a statement of a transaction (or a read-only session's pinned snapshot) that began
-  // under a page-service role the handle no longer has, or whose connection ended (README §6.5).
+  // under a page-service role the handle no longer has, or whose connection ended (README §6.5) — main's,
+  // or that of a file attachment under the page service the transaction pinned or took the gate of.
   private checkRole(): void {
     const core = this.core;
-    if (core.handoff === null) return;
+    if (!core.hasSharedCoordinator()) return;
     const open =
       this.engine.session.tx !== null || (this.access === "ro" && this.pinnedVersion !== null);
     if (!open) return;
-    if (this.roleGen !== core.roleGen || core.client?.lost()) {
+    if (core.handoff !== null && (this.roleGen !== core.roleGen || core.client?.lost())) {
       throw errStaleRole();
     }
+    // A file attachment under the page service changes role on its own.
+    if (this.gateHeld) core.writerStale();
+    else if (this.pinnedVersion !== null) attachPinsStale(this.pinAtts);
   }
 
   // execute runs a (possibly mutating) statement on this session, binding $N params (spec/design/
@@ -2218,10 +2642,17 @@ export class Session {
       this.engine.session.tx === null &&
       !this.engine.stmtIsWriteWithViews(stmt)
     ) {
-      // Under the page service the read begins on the current role (re-electing when needed).
-      if (this.core.handoff !== null || this.core.client !== null) {
-        autoPin = this.core.refreshAndPin();
-        autoPinGen = this.core.roleGen;
+      // Under the page service the read begins on the current role (re-electing when needed), and on
+      // every file attachment under it (page-service.md §5.5).
+      if (
+        this.core.handoff !== null ||
+        this.core.client !== null ||
+        this.core.serviceAttachCount > 0
+      ) {
+        const pinned = this.core.refreshAndPinAll();
+        autoPin = pinned.version;
+        autoPinGen = pinned.gen;
+        this.stmtAtts = pinned.atts;
       } else this.core.refreshShared();
       this.refreshCommitted();
     }
@@ -2229,7 +2660,11 @@ export class Session {
     try {
       return this.routeStmt(stmt, params, holder, insertHolder);
     } finally {
+      // Main's pin first, then the attachments' in the order they were taken.
+      const atts = this.stmtAtts ?? [];
+      this.stmtAtts = null;
       this.core.deregister(autoPin, autoPinGen);
+      releaseAttachPins(atts);
     }
   }
 
@@ -2241,10 +2676,11 @@ export class Session {
     holder: ScanCacheHolder | null,
     insertHolder: InsertCacheHolder | null,
   ): Rows {
-    if (this.planEpoch !== this.core.planEpoch) {
+    const epoch = this.core.planEpochNow();
+    if (this.planEpoch !== epoch) {
       if (holder !== null) holder.cache = null;
       if (insertHolder !== null) insertHolder.cache = null;
-      this.planEpoch = this.core.planEpoch;
+      this.planEpoch = epoch;
     }
     // A read served by a lazy lane never reaches the materialized dispatch, so enforce the read-path
     // admission gates (failed-block 25P02 / lifetime 54P02 / privilege 42501) here — after refreshing so
@@ -2263,6 +2699,8 @@ export class Session {
       const version = this.baseVersion;
       const gen = this.core.roleGen;
       this.core.register(version);
+      // The cursor pins the service attachments it reads beside main (page-service.md §5.5).
+      const atts = this.core.cursorAttachPins(this.stmtAtts ?? this.pinAtts, this.gateHeld);
       // A live streaming cursor also blocks within-session temp compaction: it faults its pinned temp
       // tree lazily, so a temp commit must not reclaim a page it may still read (temp-tables.md §6). The
       // counter is on the session's engine (single-threaded), like the write path it gates.
@@ -2271,6 +2709,7 @@ export class Session {
       rows.attachPin(() => {
         this.engine.openStreams--;
         this.core.deregister(version, gen);
+        releaseAttachPins(atts);
       });
       // A drain-time fault inside an open block aborts it (the open-time lane errors are poisoned at the
       // catch below); a no-op for an autocommit read.
@@ -2415,10 +2854,11 @@ export class Session {
       this.acquireGate();
       this.refreshCommitted();
     } else {
-      this.core.refreshAndPin();
+      const pinned = this.core.refreshAndPinAll();
+      this.pinAtts = pinned.atts;
       this.refreshCommitted();
       this.pinnedVersion = this.baseVersion;
-      this.pinGen = this.core.roleGen;
+      this.pinGen = pinned.gen;
     }
     this.roleGen = this.core.roleGen;
     return this.engine.beginTx(writable);
@@ -2473,17 +2913,25 @@ export class Session {
   private finishBlock(): void {
     this.releaseGate();
     if (this.pinnedVersion !== null) {
+      // Main's pin first, then the attachments' in the order they were taken.
+      const atts = this.pinAtts;
+      this.pinAtts = [];
       this.core.deregister(this.pinnedVersion, this.pinGen);
       this.pinnedVersion = null;
+      releaseAttachPins(atts);
     }
   }
 
   // refreshCommitted re-pins the latest committed root as this session's base (spec/design/session.md
-  // §2.4): the autocommit read/write path always works against the newest committed state.
+  // §2.4): the autocommit read/write path always works against the newest committed state. The
+  // attached roots are pinned together (§5), with the file attachments under the page service
+  // overlaid: the writer's view when this session holds the gate, else the reader's pins.
   private refreshCommitted(): void {
     this.baseVersion = this.core.committed.txid;
     this.engine.committed = this.core.committed;
-    this.engine.attachedCommitted = this.core.attached; // pin the latest attached roots together (§5)
+    this.engine.attachedCommitted = this.gateHeld
+      ? this.core.writerView()
+      : overlayAttachPins(this.core.attached, this.stmtAtts ?? this.pinAtts);
   }
 
   // publish stores the engine's committed root into the shared cell at the next version (the §3 commit

@@ -376,7 +376,7 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   `spec/conformance/process/*.process.toml` corpus drives real Rust/Go/Node actor processes in every
   supported pairing over one file. Explicit barriers, kill hooks, and invariant checks cover the
   page service (election, reads and writes through the owner, promotion, yield, graceful close, commit
-  resolution), exclusive owners, owner-only file attachments, crash release, and cross-core
+  resolution, file attachments under the service), exclusive owners, crash release, and cross-core
   interoperability. It joins `mise run ci` with the `file.page_service` capability and is
   release-blocking for multi-process file access;
   this behavior must not live only in three mirrored per-core tests.
@@ -387,9 +387,9 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   produce **byte-identical transcripts and crash images**. The simulated filesystem covers `create`,
   compaction's rename and directory barrier, and file attachments; spill and temp-table spill go
   through a simulated spill host whose I/O can fail; and simulated processes run as a page-service owner
-  and its page clients over a simulated lock host and network — promotion, lost connections, lost
-  commit acknowledgements, and owner crashes mid-commit, with the commit-role rule (only the owner
-  rebuilds the free list) as an oracle; traces may run under `synchronous = off`, whose batches and
+  and its page clients, of main and of file attachments, over a simulated lock host and network —
+  promotion, lost connections, lost commit acknowledgements, and owner crashes mid-commit, with the
+  commit-role rule (only the owner rebuilds the free list) as an oracle; traces may run under `synchronous = off`, whose batches and
   cap flushes the floor rules follow. Oracles, per database: recovery lands between the
   durability floor and the newest attempted commit and matches a recorded generation; a reader sees
   its pinned version; no `XX001`; image and live integrity checks; with no reader pinned the file
@@ -773,8 +773,10 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   `commit_status`); `ownership = prefer | yield | never` lets a tool hand ownership to an application;
   a read-only owner yields to a writer; a closing owner drains its clients. The wire contract is shared
   data with byte fixtures (`spec/pageservice/`). It replaced the earlier shared-by-default protocol as a
-  clean break (bundle marker `protocol-v2`; shared mode had no production users). File attachments are
-  owner-only non-serving owners until attachments join the service. Decided at ratification: the
+  clean break (bundle marker `protocol-v2`; shared mode had no production users). A file attachment is
+  elected owner or page client of its own file, and a writer takes every gate, local or remote, in
+  real-path byte order (no cross-owner wait cycle; `lock_timeout_ms` backstop); it follows the handle's
+  `synchronous` setting, its owner flushing its own batch before granting its gate. Decided at ratification: the
   endpoint lives in the bundle (runtime-directory fallback); `begin_read` is always a round trip; no
   client request timeout; Rust on Windows is a non-serving owner only for now. Rust/Go use
   `flock`/`LockFileEx` without dependencies; Node uses the first-party minimal Rust Node-API lock

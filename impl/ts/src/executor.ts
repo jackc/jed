@@ -3795,6 +3795,15 @@ export class Engine {
         // A FILE attachment commits DURABLY (dirty pages + alternating meta slot + fsync, its own page
         // space); an in-memory one packs via stageInMemory (NO fsync). At most one file attachment is
         // dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
+        if (att.svc !== null) {
+          // A file attachment under the page service commits through its inner handle, under the gate
+          // this writer took for it (page-service.md §5.5).
+          ws.txid = (this.attachedCommitted.get(name)?.txid ?? 0n) + 1n;
+          const committed = att.svc.commitServiceAttachment(ws, stagesRows);
+          ws.freezeMutationGenerations();
+          na.set(name, committed);
+          continue;
+        }
         if (att.storage.path !== null) {
           ws.txid = (this.attachedCommitted.get(name)?.txid ?? 0n) + 1n; // alternating meta slot + reopen
           if (prev === undefined) throw new Error("an attached file has a committed root");
