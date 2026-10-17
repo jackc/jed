@@ -27,7 +27,10 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 48 # v48: view column defaults, dependency kinds 2 (sequence) / 3 (composite type), and a
+VERSION = 49 # v49: batched durability — a commit writes the meta slot not holding the newest durable
+# meta, and a pending commit's manifest lists every page written since that floor; no byte layout
+# change (validated-cow.md §4).
+# v48: view column defaults, dependency kinds 2 (sequence) / 3 (composite type), and a
 # view flags byte (security_barrier, security_invoker) in the view entry; a catalog entry longer than a
 # page spans consecutive catalog pages flagged `continued` in header byte 1 (views.md §3/§6/§16,
 # format.md *Catalog*). No other byte layout change.

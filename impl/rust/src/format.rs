@@ -150,7 +150,11 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v48: view column defaults, view dependency kinds 2 (sequence) / 3 (composite type), a view flags
 // byte (security_barrier, security_invoker), and catalog entries longer than a page spanning
 // consecutive catalog pages flagged `continued` (spec/design/views.md §3/§6/§16, format.md *Catalog*).
-pub(crate) const FORMAT_VERSION: u16 = 48;
+// v49: batched durability (spec/design/validated-cow.md §4): a commit writes the meta slot that does
+// not hold the newest durable meta (`txid & 1` under synchronous = on, one slot for a whole relaxed
+// batch), and a pending commit's manifest also lists every body page written since that floor; no
+// byte layout change.
+pub(crate) const FORMAT_VERSION: u16 = 49;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
