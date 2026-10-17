@@ -866,7 +866,8 @@ func estimatorIntervalSpecs(specs []intervalSpec, keyType scalarType) []interval
 			continue
 		}
 		for _, elem := range estimatorArrayElements(spec.array) {
-			out = append(out, intervalSpec{terms: []boundTerm{{op: opEq, src: estimatorPointElement(keyType, elem)}}})
+			terms := append([]boundTerm{{op: opEq, src: estimatorPointElement(keyType, elem)}}, spec.terms...)
+			out = append(out, intervalSpec{terms: terms})
 		}
 	}
 	return out

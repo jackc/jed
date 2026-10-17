@@ -25112,7 +25112,9 @@ function estimatorIntervalSpecs(specs: IntervalSpec[], keyType: ScalarType): Int
       continue;
     }
     for (const elem of estimatorArrayElements(spec.array)) {
-      out.push({ terms: [{ op: "eq", src: estimatorPointElement(keyType, elem) }] });
+      out.push({
+        terms: [{ op: "eq", src: estimatorPointElement(keyType, elem) }, ...spec.terms],
+      });
     }
   }
   return out;
@@ -26026,15 +26028,28 @@ export function reduceIntervalUnion(
   }
   const arraySpec = asArrayPointSpec(e, keyIdx, keyType, colColl);
   if (arraySpec !== null) return [arraySpec];
+  // A leaf is an AND of same-key comparisons (BETWEEN's resolved shape) and at most one `= ANY`
+  // array, whose points those comparisons clip.
   const terms: BoundTerm[] = [];
+  let array: IntervalSpec["array"];
   const walk = (x: RExpr): boolean => {
     if (x.kind === "and") return walk(x.lhs) && walk(x.rhs);
     const t = asBoundTerm(x, { kind: "column", index: keyIdx }, keyType, colColl, null);
-    if (t === null) return false;
-    terms.push(t);
-    return true;
+    if (t !== null) {
+      terms.push(t);
+      return true;
+    }
+    if (array === undefined) {
+      const spec = asArrayPointSpec(x, keyIdx, keyType, colColl);
+      if (spec !== null) {
+        array = spec.array;
+        return true;
+      }
+    }
+    return false;
   };
-  return walk(e) && terms.length > 0 ? [{ terms }] : null;
+  if (!walk(e) || (terms.length === 0 && array === undefined)) return null;
+  return [array === undefined ? { terms } : { terms, array }];
 }
 
 // asArrayPointSpec reports whether e is `key = ANY(array)` whose array elements are points of the
@@ -29108,11 +29123,18 @@ export function canonicalIntervalSet(
   const intervals: KeyBound[] = [];
   for (const spec of specs) {
     if (spec.array !== undefined) {
+      // An array disjunct's points are clipped by its own leaf's comparisons, then the clip.
+      let pointClip = clip;
+      if (spec.terms.length > 0) {
+        const b = buildLogicalInterval(keyType, spec.terms, params, outer, coll, left);
+        if (b === null) continue;
+        pointClip = intersectBounds(b, clip);
+      }
       for (const key of arrayPointKeys(keyType, spec.array, params, outer, coll)) {
         const point = unboundedBound();
         intersectLo(point, key, true);
         intersectHi(point, key, true);
-        const b = intersectBounds(point, clip);
+        const b = intersectBounds(point, pointClip);
         if (!boundEmpty(b)) intervals.push(b);
       }
       continue;
@@ -29187,19 +29209,28 @@ function memberPoints(m: TupleMember, params: Value[], outer: Row[], left: Row):
   if (clip === null) return [];
   if (m.specs === null) return clip.lo !== null ? [clip.lo] : [];
   const keys: Uint8Array[] = [];
-  const keep = (key: Uint8Array): void => {
+  const keep = (key: Uint8Array, within: KeyBound): void => {
     const point = unboundedBound();
     intersectLo(point, key, true);
     intersectHi(point, key, true);
-    if (!boundEmpty(intersectBounds(point, clip))) keys.push(key);
+    if (!boundEmpty(intersectBounds(point, within))) keys.push(key);
   };
   for (const spec of m.specs) {
     if (spec.array !== undefined) {
-      for (const key of arrayPointKeys(m.colType, spec.array, params, outer, m.coll)) keep(key);
+      // The array's points are clipped by their own leaf's comparisons as well as the clip.
+      let within = clip;
+      if (spec.terms.length > 0) {
+        const b = buildLogicalInterval(m.colType, spec.terms, params, outer, m.coll, left);
+        if (b === null) continue;
+        within = intersectBounds(b, clip);
+      }
+      for (const key of arrayPointKeys(m.colType, spec.array, params, outer, m.coll)) {
+        keep(key, within);
+      }
       continue;
     }
     const b = buildLogicalInterval(m.colType, spec.terms, params, outer, m.coll, left);
-    if (b !== null && b.lo !== null) keep(b.lo);
+    if (b !== null && b.lo !== null) keep(b.lo, clip);
   }
   keys.sort(compareBytes);
   const out: Uint8Array[] = [];

@@ -1139,7 +1139,9 @@ fn estimator_interval_terms(
             continue;
         };
         for src in estimator_array_point_sources(array, key_type) {
-            out.push(Cow::Owned(vec![BoundTerm { op: CmpOp::Eq, src }]));
+            let mut terms = vec![BoundTerm { op: CmpOp::Eq, src }];
+            terms.extend(spec.terms.iter().cloned());
+            out.push(Cow::Owned(terms));
         }
     }
     out
@@ -2641,25 +2643,45 @@ pub(crate) fn reduce_interval_union(
     if let Some(spec) = as_array_point_spec(e, key_idx, key_type, col_coll) {
         return Some(vec![spec]);
     }
+    // A leaf is an AND of same-key comparisons (BETWEEN's resolved shape) and at most one `= ANY`
+    // array, whose points those comparisons clip.
     fn leaf_terms(
         e: &RExpr,
         key_idx: usize,
         key_type: ScalarType,
         col_coll: Option<&str>,
-        out: &mut Vec<BoundTerm>,
+        out: &mut IntervalSpec,
     ) -> bool {
         if let RExpr::And(l, r) = e {
             return leaf_terms(l, key_idx, key_type, col_coll, out)
                 && leaf_terms(r, key_idx, key_type, col_coll, out);
         }
-        let before = out.len();
-        collect_bound_terms(e, &KeyMatch::Column(key_idx), key_type, col_coll, None, out);
-        out.len() == before + 1
+        let before = out.terms.len();
+        collect_bound_terms(
+            e,
+            &KeyMatch::Column(key_idx),
+            key_type,
+            col_coll,
+            None,
+            &mut out.terms,
+        );
+        if out.terms.len() == before + 1 {
+            return true;
+        }
+        out.terms.truncate(before);
+        if out.array.is_none()
+            && let Some(spec) = as_array_point_spec(e, key_idx, key_type, col_coll)
+        {
+            out.array = spec.array;
+            return true;
+        }
+        false
     }
-    let mut terms = Vec::new();
-    leaf_terms(e, key_idx, key_type, col_coll, &mut terms)
-        .then_some(IntervalSpec { terms, array: None })
-        .map(|s| vec![s])
+    let mut spec = IntervalSpec {
+        terms: Vec::new(),
+        array: None,
+    };
+    leaf_terms(e, key_idx, key_type, col_coll, &mut spec).then(|| vec![spec])
 }
 
 /// Whether `e` is `key = ANY(array)` whose array elements are points of the key (cost.md §3
@@ -5237,11 +5259,21 @@ pub(crate) fn canonical_interval_set(
     let mut intervals: Vec<KeyBound> = Vec::with_capacity(specs.len());
     for spec in specs {
         if let Some(array) = &spec.array {
+            // An array disjunct's points are clipped by its own leaf's comparisons, then the clip.
+            let point_clip = if spec.terms.is_empty() {
+                clip.clone()
+            } else if let Some(b) =
+                build_logical_interval(key_type, &spec.terms, params, outer, coll, left)
+            {
+                intersect_bounds(b, &clip)
+            } else {
+                continue;
+            };
             for key in array_point_keys(key_type, array, params, outer, coll) {
                 let mut point = KeyBound::unbounded();
                 intersect_lo(&mut point, &key, true);
                 intersect_hi(&mut point, &key, true);
-                let b = intersect_bounds(point, &clip);
+                let b = intersect_bounds(point, &point_clip);
                 if !bound_empty(&b) {
                     intervals.push(b);
                 }
@@ -5348,25 +5380,35 @@ fn member_points(
     let Some(specs) = &m.specs else {
         return clip.lo.into_iter().collect();
     };
-    let inside = |key: &[u8]| {
+    let inside = |key: &[u8], within: &KeyBound| {
         let mut point = KeyBound::unbounded();
         intersect_lo(&mut point, key, true);
         intersect_hi(&mut point, key, true);
-        !bound_empty(&intersect_bounds(point, &clip))
+        !bound_empty(&intersect_bounds(point, within))
     };
     let mut keys: Vec<Vec<u8>> = Vec::new();
     for spec in specs {
         if let Some(array) = &spec.array {
+            // The array's points are clipped by their own leaf's comparisons as well as the clip.
+            let within = if spec.terms.is_empty() {
+                clip.clone()
+            } else if let Some(b) =
+                build_logical_interval(m.col_type, &spec.terms, params, outer, coll, left)
+            {
+                intersect_bounds(b, &clip)
+            } else {
+                continue;
+            };
             keys.extend(
                 array_point_keys(m.col_type, array, params, outer, coll)
                     .into_iter()
-                    .filter(|key| inside(key)),
+                    .filter(|key| inside(key, &within)),
             );
             continue;
         }
         if let Some(b) = build_logical_interval(m.col_type, &spec.terms, params, outer, coll, left)
             && let Some(key) = b.lo
-            && inside(&key)
+            && inside(&key, &clip)
         {
             keys.push(key);
         }

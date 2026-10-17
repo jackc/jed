@@ -437,7 +437,8 @@ weight; the owning base unit still counts the operation. Runtime metering remain
   admitted resident structural descent count where available, otherwise the estimated non-leaf
   pages of its bound. Both retain their ordinary table-fetch and residual costs.
 - Interval sets sum disjoint interval page estimates in canonical interval order with saturation.
-  A `key = ANY(A)` disjunct contributes one equality disjunct per estimator element of `A` (§7), so
+  A `key = ANY(A)` disjunct contributes one equality disjunct per estimator element of `A` (§7),
+  each conjoined with the comparisons of the AND leaf the array sits in, so
   an interval set estimates exactly as the IN-list of its points; the OR fold over many elements is
   evaluated as a balanced tree (halves split at `len / 2`), which the OR rule's capped sum makes
   shape-independent.

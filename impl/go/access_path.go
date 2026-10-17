@@ -967,20 +967,29 @@ func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl strin
 	if spec, ok := asArrayPointSpec(e, keyIdx, keyType, colColl); ok {
 		return []intervalSpec{spec}, true
 	}
+	// A leaf is an AND of same-key comparisons (BETWEEN's resolved shape) and at most one `= ANY`
+	// array, whose points those comparisons clip.
 	var terms []boundTerm
+	var array *rExpr
 	var walk func(*rExpr) bool
 	walk = func(x *rExpr) bool {
 		if x.kind == reAnd {
 			return walk(x.lhs) && walk(x.rhs)
 		}
-		t, ok := asBoundTerm(x, columnMatch(keyIdx), keyType, colColl, nil)
-		if ok {
+		if t, ok := asBoundTerm(x, columnMatch(keyIdx), keyType, colColl, nil); ok {
 			terms = append(terms, t)
+			return true
 		}
-		return ok
+		if array == nil {
+			if spec, ok := asArrayPointSpec(x, keyIdx, keyType, colColl); ok {
+				array = spec.array
+				return true
+			}
+		}
+		return false
 	}
-	if walk(e) && len(terms) > 0 {
-		return []intervalSpec{{terms: terms}}, true
+	if walk(e) && (len(terms) > 0 || array != nil) {
+		return []intervalSpec{{terms: terms, array: array}}, true
 	}
 	return nil, false
 }
@@ -1855,8 +1864,17 @@ func canonicalIntervalSet(keyType scalarType, specs []intervalSpec, clipTerms []
 	intervals := make([]keyBound, 0, len(specs))
 	for _, spec := range specs {
 		if spec.array != nil {
+			// An array disjunct's points are clipped by its own leaf's comparisons, then the clip.
+			pointClip := clip
+			if len(spec.terms) > 0 {
+				b, empty := buildLogicalInterval(keyType, spec.terms, params, outer, coll, left)
+				if empty {
+					continue
+				}
+				pointClip = intersectBounds(b, clip)
+			}
 			for _, key := range arrayPointKeys(keyType, spec.array, params, outer, coll) {
-				b := intersectBounds(intersectHi(intersectLo(unboundedBound(), key, true), key, true), clip)
+				b := intersectBounds(intersectHi(intersectLo(unboundedBound(), key, true), key, true), pointClip)
 				if !boundEmpty(b) {
 					intervals = append(intervals, b)
 				}
@@ -1932,20 +1950,29 @@ func memberPoints(m tupleMember, params []Value, outer []storedRow, left storedR
 		return [][]byte{clip.lo}
 	}
 	var keys [][]byte
-	keep := func(key []byte) {
-		if !boundEmpty(intersectBounds(keyBound{lo: key, loInc: true, hi: key, hiInc: true}, clip)) {
+	keep := func(key []byte, within keyBound) {
+		if !boundEmpty(intersectBounds(keyBound{lo: key, loInc: true, hi: key, hiInc: true}, within)) {
 			keys = append(keys, key)
 		}
 	}
 	for _, spec := range m.specs {
 		if spec.array != nil {
+			// The array's points are clipped by their own leaf's comparisons as well as the clip.
+			within := clip
+			if len(spec.terms) > 0 {
+				b, empty := buildLogicalInterval(m.colType, spec.terms, params, outer, m.coll, left)
+				if empty {
+					continue
+				}
+				within = intersectBounds(b, clip)
+			}
 			for _, key := range arrayPointKeys(m.colType, spec.array, params, outer, m.coll) {
-				keep(key)
+				keep(key, within)
 			}
 			continue
 		}
 		if b, empty := buildLogicalInterval(m.colType, spec.terms, params, outer, m.coll, left); !empty {
-			keep(b.lo)
+			keep(b.lo, clip)
 		}
 	}
 	sort.SliceStable(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })

@@ -59,7 +59,7 @@
 #   any_array — `key = ANY(array)` over a PK or leading index column lowers to one point per element
 #              (cost.md §3 "OR / IN-list"); `key + 0 = ANY(array)` full-scans. Constructor, cast, and
 #              multidimensional arrays, NULL/duplicate/absent elements, an empty array, an OR
-#              disjunct, a range clip, promoted element types (an out-of-range i64, a fractional
+#              disjunct, a range clip, an ANY under an AND leaf of an OR, promoted element types (an out-of-range i64, a fractional
 #              decimal, integers against a decimal key), and a mutation end state must all agree.
 #   composite_key_set — IN / OR / `= ANY` sets on a composite PK's members lower to a tuple
 #              interval set (cost.md §3 "Composite primary keys"): the cartesian product of the
@@ -1598,6 +1598,8 @@ def gen_any_array(seed)
 
   cut = pick.sort[1]
   pair.call("a range clip", "id", "ARRAY[#{pick.join(', ')}]", by_id.call(pick.select { |id| id > cut }), " AND KEY > #{cut}")
+  pair.call("an ANY under an AND leaf of an OR", "id", "ARRAY[#{pick.join(', ')}]",
+            by_id.call((pick.select { |id| id > cut } + [other]).uniq), " AND KEY > #{cut} OR KEY = #{other}")
 
   vals = rows.map { |_id, v, _w| v }.compact.uniq.sample(2, random: rng)
   vals = [0, 1] if vals.size < 2
