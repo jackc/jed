@@ -187,6 +187,7 @@ const (
 	planBoolAnd        // bool_and(x) — TRUE iff every non-NULL input is TRUE (aggregates.md §23)
 	planBoolOr         // bool_or(x) — TRUE iff some non-NULL input is TRUE (aggregates.md §23)
 	planBitAnd         // bit_and(x) — the bitwise AND of the non-NULL integer inputs (aggregates.md §23)
+	planBitOr          // bit_or(x) — the bitwise OR of the non-NULL integer inputs
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
 	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
@@ -559,14 +560,14 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				a.cur, a.hasCur = v, true
 			}
 		}
-	case planBitAnd:
+	case planBitAnd, planBitOr:
 		// The running bitwise fold of the non-NULL inputs (aggregates.md §23); NULLs are skipped. The
 		// result stays within the input width, so it never overflows.
 		if !v.IsNull() {
 			if !a.hasCur {
 				a.cur, a.hasCur = v, true
 			} else {
-				a.cur = IntValue(a.cur.Int & v.Int)
+				a.cur = IntValue(bitFold(a.plan, a.cur.Int, v.Int))
 			}
 		}
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
@@ -648,6 +649,16 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		panic("a hypothetical-set accumulator buffers tuples in the fold loop")
 	}
 	return nil
+}
+
+// bitFold applies a bit aggregate's bitwise operator (aggregates.md §23).
+func bitFold(plan aggPlan, cur, v int64) int64 {
+	switch plan {
+	case planBitAnd:
+		return cur & v
+	default: // planBitOr
+		return cur | v
+	}
 }
 
 // retainedBytes is the query-memory bytes folding v makes this accumulator retain (memory.md §6.3):
@@ -836,7 +847,7 @@ func (a *acc) finalize() (Value, error) {
 		// A hypothetical-set aggregate is finalized in the group-emission loop (it needs the spec's
 		// per-key sort specs), never through acc.finalize (aggregates.md §19).
 		panic("a hypothetical-set accumulator is finalized in the group-emission loop")
-	default: // planMin, planMax, planBoolAnd, planBoolOr, planBitAnd
+	default: // planMin, planMax, planBoolAnd, planBoolOr, and the bit plans
 		if a.hasCur {
 			return a.cur, nil
 		}

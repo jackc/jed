@@ -6745,6 +6745,15 @@ pub const AGGREGATES: &[AggregateDesc] = &[
         errors: &[],
     },
     AggregateDesc {
+        name: "bit_or",
+        surface: "bit_or",
+        arg: "expr",
+        arg_families: &["integer"],
+        result: "same_as_input",
+        null: "aggregate",
+        errors: &[],
+    },
+    AggregateDesc {
         name: "jsonb_agg",
         surface: "jsonb_agg",
         arg: "expr",

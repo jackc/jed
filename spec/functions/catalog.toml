@@ -5756,12 +5756,23 @@ result       = "boolean"
 null         = "aggregate"
 errors       = []
 
-# bit_and(integer) -> the input type (aggregates.md §23): the bitwise AND of the non-NULL inputs; NULL
-# over an empty/all-NULL group. Order-insensitive; never overflows (the result stays within the width).
+# bit_and / bit_or (integer) -> the input type (aggregates.md §23): the bitwise AND / OR of the
+# non-NULL inputs; NULL over an empty/all-NULL group. Order-insensitive; never overflows (the result
+# stays within the width).
 [[aggregate]]
 name         = "bit_and"
 kind         = "aggregate"
 surface      = "bit_and"
+arg          = "expr"
+arg_families = ["integer"]
+result       = "same_as_input"
+null         = "aggregate"
+errors       = []
+
+[[aggregate]]
+name         = "bit_or"
+kind         = "aggregate"
+surface      = "bit_or"
 arg          = "expr"
 arg_families = ["integer"]
 result       = "same_as_input"

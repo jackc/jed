@@ -279,6 +279,7 @@ impl Acc {
                     *cur = Some(match (*cur, *op) {
                         (None, _) => v,
                         (Some(c), BitOp::And) => c & v,
+                        (Some(c), BitOp::Or) => c | v,
                     });
                 }
             }
