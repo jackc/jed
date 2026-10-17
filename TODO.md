@@ -394,9 +394,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   timings, allocation evidence, checksums, and decisions live in
   [benchmarks.md](spec/design/benchmarks.md), [pager.md](spec/design/pager.md), and
   [locking.md §9.3](spec/design/locking.md).
-  - [ ] _follow-on:_ evaluate unique-dirty mutation for remove/rebalance separately; Slice 3 deliberately
-    leaves DELETE on the pure copy-on-write path until its own allocation evidence justifies the extra
-    mutable merge/split cases. Rust-only, no byte or cost change. _(size: M)_
+  - [x] _follow-on:_ unique-dirty mutation for remove/rebalance (Rust). Removes and merges now edit a
+    uniquely owned dirty path in place under INSERT's `Arc::get_mut` + `page == 0` rule; tree shape,
+    bytes, and costs are unchanged. Allocator calls fall 89% for 1,000 consecutive deletes and 99% for
+    a 10,000-row range delete, and the new `delete_*` lanes run 2–32× faster.
+    → [benchmarks.md](spec/design/benchmarks.md) ("DELETE unique-dirty result"),
+    [transactions.md §3](spec/design/transactions.md)
+  - [ ] _follow-on:_ the same DELETE/rebalance transient for Go and TypeScript, over their INSERT
+    mutation-generation tokens. Measure first: their delete path's allocation and GC profile differs
+    from Rust's. _(size: M)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** — large `text`/`bytea`/`decimal`/`json` pushed out-of-line onto overflow-page chains (`format_version` 3), optionally LZ4-compressed first via a deterministic hand-rolled block codec (no third-party dep — a library fails §8 byte-identity). → [large-values.md](spec/design/large-values.md), [lz4.md](spec/fileformat/lz4.md)
   - [ ] _follow-on:_ chain sharing on rewrite (let a rewritten record keep an unchanged value's existing chain — a byte-layout change, lands in all cores + incremental tests together).
 - [ ] **Upgrade path for older files + an on-disk stability commitment (a 1.0 blocker)** — a reader

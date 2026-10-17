@@ -158,8 +158,21 @@ boundary.
 
 In every core a qualifying leaf edits its key/row/weight vectors in place; a qualifying interior
 replaces the changed child or inserts a propagated separator in place. Overflow still runs the same
-size-fit and split builders, preserving the exact split point, separator, tree shape, and bytes. This
-transient covers insert/overwrite only; delete/rebalance deliberately remains pure path-copy.
+size-fit and split builders, preserving the exact split point, separator, tree shape, and bytes. In Go
+and TypeScript this transient covers insert/overwrite only; their delete/rebalance remains pure
+path-copy.
+
+**Rust dirty DELETE transients (2026-10, no format or cost change).** Rust applies the same
+`Arc::get_mut` + `page == 0` rule to remove and rebalance. A qualifying leaf removes the record from
+its vectors in place; a qualifying interior replaces the changed child and then runs the unchanged
+merge-then-maybe-split rebalance on itself: the parent's separator/child lists are edited in place,
+and a leaf merge moves a qualifying operand's vectors into the merged leaf instead of copying them.
+Every fallible step (faulting a sibling, decoding a Packed/clean sibling) completes before any vector
+moves. An interior merge still copies its two operands' separator/child lists, because an abandoned
+merge must leave them untouched. The merge, split, and abandon decisions and their inputs are those of
+the path-copy form, so tree shape and bytes are identical; a focused test pins the edited tree to a
+pinned (always path-copied) twin after every step. The measurements are in
+[benchmarks.md](benchmarks.md) ("DELETE unique-dirty result").
 
 **Decided shape: a copy-on-write B+tree** (v24 — [bplus-reshape.md](bplus-reshape.md); it was
 a CLRS-style B-tree with records at every level through v23). Chosen deliberately as the
