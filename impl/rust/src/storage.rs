@@ -165,8 +165,12 @@ pub struct TableStore {
     staged: i64,
     /// The stored bytes of each version written since publication that the store still holds, by
     /// key (a one-value `[Int]` row): what a replace or remove of that key returns (memory.md §7.1).
-    /// A persistent map, so a snapshot clone stays O(1).
+    /// A persistent map, so a snapshot clone stays O(1). Kept only while `net` is set.
     staged_keys: PMap,
+    /// Whether writes record their key in `staged_keys` — set by the executor before each write
+    /// from the session's budget (memory.md §7.1). A version written without it is counted but not
+    /// recorded, so a later rewrite of it is counted again.
+    net: bool,
 }
 
 impl TableStore {
@@ -183,6 +187,7 @@ impl TableStore {
             paging: None,
             staged: 0,
             staged_keys: PMap::new(),
+            net: false,
         }
     }
 
@@ -199,6 +204,7 @@ impl TableStore {
             paging: self.paging.clone(),
             staged: 0,
             staged_keys: PMap::new(),
+            net: self.net,
         }
     }
 
@@ -244,6 +250,11 @@ impl TableStore {
         self.staged
     }
 
+    /// Record (or stop recording) staged keys for the writes that follow (memory.md §7.1).
+    pub(crate) fn set_net_staging(&mut self, net: bool) {
+        self.net = net;
+    }
+
     /// Whether the store changed since publication (it holds staging state to clear).
     pub(crate) fn has_staging(&self) -> bool {
         self.staged != 0 || !self.staged_keys.is_empty()
@@ -258,12 +269,17 @@ impl TableStore {
     /// Record `key`'s new version as staged with `stored` bytes, returning the bytes of the staged
     /// version it displaces, if any (memory.md §7.1): the pending bytes are net.
     fn stage(&mut self, key: &[u8], stored: i64) -> Result<()> {
+        if !self.net {
+            // Not recorded: the version is counted, but a later write cannot return it.
+            self.staged = self.staged.saturating_add(stored);
+            return Ok(());
+        }
         let w = key.len() as u32 + 8; // any weight: this in-memory map never serializes
         let old = self.staged_keys.insert(
             key.to_vec(),
             vec![Value::Int(stored)],
             w,
-            self.cap,
+            STAGED_KEYS_CAP,
             crate::format::leaf_shape(&[]),
             None,
         )?;
@@ -273,9 +289,12 @@ impl TableStore {
 
     /// Return the bytes of `key`'s staged version, if it has one (memory.md §7.1).
     fn unstage(&mut self, key: &[u8]) -> Result<()> {
-        let old = self
-            .staged_keys
-            .remove(key, self.cap, crate::format::leaf_shape(&[]), None)?;
+        if self.staged_keys.is_empty() {
+            return Ok(());
+        }
+        let old =
+            self.staged_keys
+                .remove(key, STAGED_KEYS_CAP, crate::format::leaf_shape(&[]), None)?;
         self.staged -= staged_of(old);
         Ok(())
     }
@@ -753,6 +772,11 @@ impl TableStore {
         self.rows.resident_record_bytes()
     }
 }
+
+/// The node capacity of a store's staged-key map. Small nodes keep the copy-on-write path a write
+/// copies after each statement's snapshot clone short; the map never serializes, so any capacity
+/// is correct.
+const STAGED_KEYS_CAP: usize = 512;
 
 /// The stored bytes a staged-key entry records (zero for none).
 fn staged_of(entry: Option<Row>) -> i64 {

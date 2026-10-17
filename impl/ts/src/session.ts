@@ -251,6 +251,11 @@ export class SessionState {
       this.queryAccount.used = this.queryAccount.floor;
     }
   }
+  // netStaging reports whether the session's writes keep the per-key record that makes pending writes
+  // net (memory.md §7.1): only under a finite query-memory budget, so the default path pays nothing.
+  netStaging(): boolean {
+    return this.maxQueryMemoryBytes > 0n;
+  }
   // pendingWriteBytes is the stored bytes the open transaction's working snapshots (main and attached
   // databases) have staged — its pending writes (memory.md §7). Session-local temp tables are bounded
   // by maxTempStorageBytes instead. Zero with no open transaction.

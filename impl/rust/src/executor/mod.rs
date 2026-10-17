@@ -1117,6 +1117,12 @@ impl SessionState {
         self.query_floor = std::rc::Rc::new(std::cell::Cell::new(pending));
     }
 
+    /// Whether the session's writes keep the per-key record that makes pending writes net (memory.md
+    /// §7.1): only under a finite query-memory budget, so the default path pays nothing.
+    pub(crate) fn net_staging(&self) -> bool {
+        self.max_query_memory_bytes > 0
+    }
+
     /// The stored bytes the open transaction's working snapshots (main and attached databases) have
     /// staged — its pending writes (memory.md §7). Session-local temp tables are bounded by
     /// `temp_buffers` instead. Zero with no open transaction.

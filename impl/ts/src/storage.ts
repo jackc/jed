@@ -34,6 +34,11 @@ const LANE_SPAN: Span = { start: 0, end: 0 };
 // STAGED_SHAPE is the leaf shape of a store's staged-key map: no value columns (memory.md §7.1).
 const STAGED_SHAPE: LeafShape = leafShape([]);
 
+// STAGED_KEYS_CAP is the node capacity of a store's staged-key map. Small nodes keep the copy-on-write
+// path a write copies after each statement's snapshot clone short; the map never serializes, so any
+// capacity is correct.
+const STAGED_KEYS_CAP = 512;
+
 // stagedOf is the stored bytes a staged-key entry records (zero for none).
 function stagedOf(entry: Row | undefined): number {
   const v = entry?.[0];
@@ -91,8 +96,12 @@ export class TableStore {
   private staged = 0;
   // stagedKeys is the stored bytes of each version written since publication that the store still
   // holds, by key (a one-value [int] row): what a replace or remove of that key returns (memory.md
-  // §7.1). A persistent map, so a snapshot clone stays O(1).
+  // §7.1). A persistent map, so a snapshot clone stays O(1). Kept only while net is set.
   private stagedKeys = new PMap();
+  // net is whether writes record their key in stagedKeys — set by the executor before each write from
+  // the session's budget (memory.md §7.1). A version written without it is counted but not recorded,
+  // so a later rewrite of it is counted again.
+  private net = false;
 
   constructor(
     cap: number,
@@ -122,6 +131,7 @@ export class TableStore {
     );
     store.staged = this.staged;
     store.stagedKeys = this.stagedKeys.clone();
+    store.net = this.net;
     return store;
   }
 
@@ -129,13 +139,20 @@ export class TableStore {
   // an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
   // carries over (it is monotonic, never reused); nothing is staged, since nothing is written.
   truncated(): TableStore {
-    return new TableStore(this.cap, this.colTypes, new PMap(), this.nextRowid, this.paging);
+    const store = new TableStore(this.cap, this.colTypes, new PMap(), this.nextRowid, this.paging);
+    store.net = this.net;
+    return store;
   }
 
   // stagedBytes is the net stored bytes of the versions written since this store was last published
   // (memory.md §7).
   stagedBytes(): number {
     return this.staged;
+  }
+
+  // setNetStaging records (or stops recording) staged keys for the writes that follow (memory.md §7.1).
+  setNetStaging(net: boolean): void {
+    this.net = net;
   }
 
   // hasStaging reports whether the store changed since publication (it holds staging state to clear).
@@ -152,12 +169,17 @@ export class TableStore {
   // stage records key's new version as staged with stored bytes, returning the bytes of the staged
   // version it displaces, if any (memory.md §7.1): the pending bytes are net.
   private stage(key: Uint8Array, stored: number): void {
+    if (!this.net) {
+      // Not recorded: the version is counted, but a later write cannot return it.
+      this.staged += stored;
+      return;
+    }
     const w = key.length + 8; // any weight: this in-memory map never serializes
     const old = this.stagedKeys.insert(
       key,
       [{ kind: "int", int: BigInt(stored) }],
       w,
-      this.cap,
+      STAGED_KEYS_CAP,
       STAGED_SHAPE,
       null,
     );
@@ -166,7 +188,8 @@ export class TableStore {
 
   // unstage returns the bytes of key's staged version, if it has one (memory.md §7.1).
   private unstage(key: Uint8Array): void {
-    const old = this.stagedKeys.remove(key, this.cap, STAGED_SHAPE, null);
+    if (this.stagedKeys.isEmpty()) return;
+    const old = this.stagedKeys.remove(key, STAGED_KEYS_CAP, STAGED_SHAPE, null);
     this.staged -= stagedOf(old);
   }
 

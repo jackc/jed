@@ -1672,10 +1672,14 @@ impl Engine {
     /// transaction). Routes a session-local temp write to `temp_working`, leaving the main image
     /// untouched.
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
-        if self.is_temp_table(name) {
-            return self.temp_working_mut().store_mut(name);
-        }
-        self.working_mut().store_mut(name)
+        let net = self.session.net_staging();
+        let store = if self.is_temp_table(name) {
+            self.temp_working_mut().store_mut(name)
+        } else {
+            self.working_mut().store_mut(name)
+        };
+        store.set_net_staging(net);
+        store
     }
 
     /// Shared read access to a secondary index's store (the index is known to exist). `name_key` is
@@ -1701,10 +1705,14 @@ impl Engine {
     /// Mutable access to a secondary index's store; routes a temp table's index to the working temp
     /// snapshot (session-local → main).
     pub(crate) fn index_store_mut(&mut self, name_key: &str) -> &mut TableStore {
-        if self.temp_read_snap().has_index_store(name_key) {
-            return self.temp_working_mut().index_store_mut(name_key);
-        }
-        self.working_mut().index_store_mut(name_key)
+        let net = self.session.net_staging();
+        let store = if self.temp_read_snap().has_index_store(name_key) {
+            self.temp_working_mut().index_store_mut(name_key)
+        } else {
+            self.working_mut().index_store_mut(name_key)
+        };
+        store.set_net_staging(net);
+        store
     }
 
     /// The snapshot a foreign key's tables live in (spec/design/temp-tables.md §8): an FK never

@@ -43,9 +43,18 @@ type tableStore struct {
 	staged int64
 	// stagedKeys is the stored bytes of each version written since publication that the store still
 	// holds, by key (a one-value [Int] row): what a replace or remove of that key returns (memory.md
-	// §7.1). A persistent map, so a snapshot clone stays O(1).
+	// §7.1). A persistent map, so a snapshot clone stays O(1). Kept only while net is set.
 	stagedKeys pMap
+	// net is whether writes record their key in stagedKeys — set by the executor before each write
+	// from the session's budget (memory.md §7.1). A version written without it is counted but not
+	// recorded, so a later rewrite of it is counted again.
+	net bool
 }
+
+// stagedKeysCap is the node capacity of a store's staged-key map. Small nodes keep the copy-on-write
+// path a write copies after each statement's snapshot clone short; the map never serializes, so any
+// capacity is correct.
+const stagedKeysCap = 512
 
 // NewTableStore builds an empty store for a table whose columns have the given resolved types,
 // serializing at page payload cap (= page_size − 16). In-memory (no paging) until attachPaging.
@@ -62,7 +71,7 @@ func (s *tableStore) clone() *tableStore {
 	if !s.stagedKeys.IsEmpty() {
 		stagedKeys = s.stagedKeys.clone()
 	}
-	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, staged: s.staged, stagedKeys: stagedKeys}
+	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, staged: s.staged, stagedKeys: stagedKeys, net: s.net}
 }
 
 func (s *tableStore) freezeMutationGeneration() { s.rows.freezeMutationGeneration() }
@@ -71,7 +80,7 @@ func (s *tableStore) freezeMutationGeneration() { s.rows.freezeMutationGeneratio
 // an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
 // carries over (it is monotonic, never reused); nothing is staged, since nothing is written.
 func (s *tableStore) truncated() *tableStore {
-	return &tableStore{nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging}
+	return &tableStore{nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging, net: s.net}
 }
 
 // attachPaging attaches this database's shared paging context (the demand-paged file load, format.go):
@@ -174,6 +183,14 @@ func (s *tableStore) weight(key []byte, row storedRow) (uint32, int64) {
 // (memory.md §7).
 func (s *tableStore) stagedBytes() int64 { return s.staged }
 
+// setNetStaging records (or stops recording) staged keys for the writes that follow (memory.md §7.1).
+// A nil store (an absent attachment) is left alone.
+func (s *tableStore) setNetStaging(net bool) {
+	if s != nil {
+		s.net = net
+	}
+}
+
 // hasStaging reports whether the store changed since publication (it holds staging state to clear).
 func (s *tableStore) hasStaging() bool { return s.staged != 0 || !s.stagedKeys.IsEmpty() }
 
@@ -186,8 +203,13 @@ func (s *tableStore) clearStaged() {
 // stage records key's new version as staged with stored bytes, displacing the staged version it
 // replaces, if any (memory.md §7.1): the pending bytes are net.
 func (s *tableStore) stage(key []byte, stored int64) error {
+	if !s.net {
+		// Not recorded: the version is counted, but a later write cannot return it.
+		s.staged = saturatingCostAdd(s.staged, stored)
+		return nil
+	}
 	w := uint32(len(key)) + 8 // any weight: this in-memory map never serializes
-	old, _, err := s.stagedKeys.Insert(append([]byte(nil), key...), storedRow{IntValue(stored)}, w, s.cap, leafShapeFor(nil), nil)
+	old, _, err := s.stagedKeys.Insert(append([]byte(nil), key...), storedRow{IntValue(stored)}, w, stagedKeysCap, leafShapeFor(nil), nil)
 	if err != nil {
 		return err
 	}
@@ -197,7 +219,10 @@ func (s *tableStore) stage(key []byte, stored int64) error {
 
 // unstage returns the bytes of key's staged version, if it has one (memory.md §7.1).
 func (s *tableStore) unstage(key []byte) error {
-	old, _, err := s.stagedKeys.Remove(key, s.cap, leafShapeFor(nil), nil)
+	if s.stagedKeys.IsEmpty() {
+		return nil
+	}
+	old, _, err := s.stagedKeys.Remove(key, stagedKeysCap, leafShapeFor(nil), nil)
 	if err != nil {
 		return err
 	}

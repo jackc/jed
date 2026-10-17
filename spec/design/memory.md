@@ -553,13 +553,21 @@ format's byte contract, so for a given page size the measure is cross-core
 identical and independent of leaf state and of in-memory versus file backing.
 
 The balance is **net**: it counts only the versions the transaction's working state still holds.
-Each store remembers, per key, the stored bytes of the version written since the store was last
-published (by a commit). A write that replaces such a version returns its bytes as it adds the new
-one's, and a delete returns them; so rewriting one row many times holds one version, and deleting
-a row the transaction inserted holds nothing. Replacing or deleting a *committed* version returns
-nothing, since the transaction never charged it, and a delete stages nothing. A store that is
-replaced whole (a table rewrite, `DROP`) takes its staged versions with it. The per-key record is
-itself transient state of the pending set, proportional to it and not charged.
+Under a finite budget, each store remembers, per key, the stored bytes of the version written since
+the store was last published (by a commit). A write that replaces such a version returns its bytes
+as it adds the new one's, and a delete returns them; so rewriting one row many times holds one
+version, and deleting a row the transaction inserted holds nothing. Replacing or deleting a
+*committed* version returns nothing, since the transaction never charged it, and a delete stages
+nothing. A store that is replaced whole (a table rewrite, `DROP`) takes its staged versions with it.
+The per-key record is itself transient state of the pending set, proportional to it and not
+charged.
+
+The record is kept only for writes made while the session has a finite budget: the executor sets
+it on each store it hands a write, from the writing session's setting. A write made with no budget
+still adds its bytes, so a budget set later in the transaction sees them, but it is not
+remembered, so a later rewrite or delete of that row returns nothing — the conservative,
+cumulative measure. This keeps the unlimited default free (§2): the record costs a second tree
+write per staged version, measurably slowing bulk `INSERT`s.
 
 Dirty-page amplification — a small update decodes a whole leaf — stays outside the account; it is
 bounded by the page reads the write performed, which `max_cost` meters.
