@@ -8,7 +8,7 @@
 // Browser-clean: imports only host-agnostic core, no `node:*`, so it lands in a browser bundle.
 
 import type { Engine, Snapshot } from "./executor.ts";
-import { buildCommitManifest, metaChecksum } from "./commit_manifest.ts";
+import { buildCommitManifest, manifestEntriesOf, metaChecksum } from "./commit_manifest.ts";
 import { engineError } from "./errors.ts";
 import type { FileHost } from "./filehost.ts";
 import { cacheLeaves } from "./paging.ts";
@@ -218,7 +218,16 @@ export function precheckBudget(
 ): void {
   if (db.paging === null || db.storageBudget.limit <= 0n) return;
   if (db.persistHook !== null) {
-    const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, reuse);
+    // Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its floor.
+    const write = incrementalImage(
+      snap,
+      db.pageSize,
+      db.pageCount,
+      db.freePages,
+      db.paging,
+      reuse,
+      floorFreeFor(db, db.paging.hasPending()),
+    );
     try {
       admitFile(db, write, budget.prev, budget);
     } finally {
@@ -245,11 +254,24 @@ export function persistImpl(
   canReuse = true,
   budget: BudgetCtx | null = null,
 ): IncrementalWrite {
-  if (db.paging !== null && db.persistHook !== null) db.paging.checkDurableCommit();
+  let allowed: Set<number> | null = null;
+  if (db.paging !== null && db.persistHook !== null) {
+    const pending = db.paging.hasPending();
+    db.paging.checkDurableCommit();
+    allowed = reuseAllowed(db, pending);
+  }
   const write =
     db.paging !== null && db.persistHook === null
       ? planInMemory(db, snap, canReuse, budget)
-      : incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, canReuse);
+      : incrementalImage(
+          snap,
+          db.pageSize,
+          db.pageCount,
+          db.freePages,
+          db.paging,
+          canReuse,
+          allowed,
+        );
   if (db.paging === null) return write; // a bare engine with no byte store: nothing to write
   const reclaim = canReclaim ?? db.openStreams === 0;
   // DURABLE (file or OPFS — both reopened, both set a persistHook; the OPFS host leaves `path` null, so
@@ -257,7 +279,7 @@ export function persistImpl(
   // store (persistHook null) keeps its free-list in RAM.
   if (db.persistHook !== null) {
     const live = admitFile(db, write, budget?.prev ?? db.committed, budget);
-    commitFile(db, snap, write, live, reclaim, canReuse);
+    commitFile(db, snap, write, live, reclaim, canReuse, allowed);
   } else commitInMemory(db, snap, write, reclaim);
   return write;
 }
@@ -265,6 +287,49 @@ export function persistImpl(
 // DirectorySync makes the directory holding the database file at path durable, through files (null is
 // the OS). Registered by the Node host (file.ts), so this module stays browser-clean.
 type DirectorySync = (files: FileHost | null, path: string) => void;
+// relaxedFile reports whether db's commits batch their barrier (synchronous = off, validated-cow.md
+// §4): a durable domain of a relaxed handle.
+function relaxedFile(db: Engine): boolean {
+  return db.relaxed && db.persistHook !== null && db.paging !== null;
+}
+
+// reuseAllowed is the reuse restriction of the commit about to plan (validated-cow.md §4 rule 3). With
+// nothing pending the floor is the committed generation, so a relaxed domain records the pages free
+// now — the floor's free list — and allows them all; while a batch is pending only those not yet
+// consumed may be reused, since a page freed during the batch may still be needed by the floor. A
+// synchronous = on domain is never restricted.
+function reuseAllowed(db: Engine, pending: boolean): Set<number> | null {
+  if (!relaxedFile(db)) return null;
+  if (!pending) {
+    db.floorFree = new Set(db.freePages);
+    return null;
+  }
+  return floorFreeFor(db, true);
+}
+
+// floorFreeFor is the restriction a pending batch plans under, without recording a new floor.
+function floorFreeFor(db: Engine, pending: boolean): Set<number> | null {
+  if (!pending || !relaxedFile(db)) return null;
+  return db.floorFree ?? new Set();
+}
+
+// capFlush ends a batch that reached the cap (validated-cow.md §4). TypeScript has no second engine
+// thread, so it runs inline after the commit that reached the cap, which is already published and
+// still succeeds. A failed barrier may have dropped pending pages from the OS cache ("fsyncgate"), so
+// pages the published snapshot needs could now read stale: the storage is revoked, and every later
+// read, commit, and close fails 58030 until the database is reopened through recovery.
+function capFlush(db: Engine): void {
+  const paging = db.paging!;
+  try {
+    paging.flushPending();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    paging.revoke(
+      engineError("io_error", "a deferred durability flush failed; reopen the database: " + msg),
+    );
+  }
+}
+
 let directorySync: DirectorySync | null = null;
 
 // registerDirectorySync installs the host's directory barrier for syncDirectoryOnce (called once, at
@@ -301,6 +366,7 @@ function commitFile(
   live: LiveCount,
   canReclaim: boolean,
   canReuse: boolean,
+  allowed: Set<number> | null,
 ): void {
   syncDirectoryOnce(db);
   const paging = db.paging!;
@@ -311,6 +377,9 @@ function commitFile(
     paging.writeBlock(pg.index, pg.bytes);
     paging.invalidate(pg.index);
   }
+  // A relaxed batch's pending set joins the manifest and stays off the free list (validated-cow.md §4).
+  const relaxed = relaxedFile(db);
+  const pending = paging.pendingEntries();
   const plan = planFreeList(
     snap,
     paging,
@@ -323,6 +392,8 @@ function commitFile(
     db.pageSize,
     canReclaim,
     canReuse,
+    pending,
+    allowed,
   );
   verifyLiveCount(snap, paging, write, live);
   paging.reserve(plan.newPageCount);
@@ -330,10 +401,12 @@ function commitFile(
     paging.writeBlock(pg.index, pg.bytes);
     paging.invalidate(pg.index);
   }
+  // The commit's own entries (its body and free-list pages) join the pending set of a relaxed commit.
+  const dirty = manifestEntriesOf([...write.pages, ...plan.pages]);
   const manifest = buildCommitManifest(
     db.pageSize,
     snap.txid,
-    [...write.pages, ...plan.pages],
+    [...pending, ...dirty],
     plan.manifestIds,
   );
   for (const pg of manifest.pages) {
@@ -349,9 +422,14 @@ function commitFile(
     live.live,
     manifest,
   );
-  paging.writeBlock(Number(snap.txid & 1n), meta);
-  paging.sync(); // one durability barrier covers body + descriptor + meta
+  // The slot not holding the floor (format.md, *Slot alternation*): txid & 1 under synchronous = on.
+  const slot = paging.commitSlot();
+  paging.writeBlock(slot, meta);
+  // One durability barrier covers body + descriptor + meta; a relaxed commit defers it to a flush.
+  if (!relaxed) paging.sync();
   paging.finishDurableCommit(snap.txid, metaChecksum(meta));
+  paging.recordCommit(snap.txid, metaChecksum(meta), slot, !relaxed, dirty);
+  const capReached = relaxed && paging.batchCapReached();
   db.lastCommitMeta = meta;
   db.lastCommitWritten = [...write.pages, ...plan.pages, ...manifest.pages].map((pg) => pg.index);
   db.pageCount = plan.newPageCount;
@@ -359,6 +437,7 @@ function commitFile(
   db.liveAtCompaction = plan.newLive;
   db.freeGenTxid = plan.newGen;
   db.live = live;
+  if (capReached) capFlush(db);
 }
 
 // commitInMemory is the IN-MEMORY branch of persistImpl: a MemoryBlockStore is never reopened, so it

@@ -12,6 +12,7 @@ import { test } from "node:test";
 import {
   buildCommitManifest,
   crc64Update,
+  manifestEntriesOf,
   manifestInlineCapacity,
   manifestOverflowCapacity,
 } from "../src/commit_manifest.ts";
@@ -182,7 +183,7 @@ function testDelta(
   const overflow = Math.ceil(left / manifestOverflowCapacity(ps));
   const ids: number[] = [];
   for (let i = 0; i < overflow; i++) ids.push(pageCount++);
-  const manifest = buildCommitManifest(ps, 6n, dirty, ids);
+  const manifest = buildCommitManifest(ps, 6n, manifestEntriesOf(dirty), ids);
   const meta = metaPage(ps, 6n, indices[0]!, pageCount, 0, indices.length, manifest);
   return {
     cb: {

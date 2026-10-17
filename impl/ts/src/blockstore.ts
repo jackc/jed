@@ -68,6 +68,41 @@ export class ClosedBlockStore implements BlockStore {
   }
 }
 
+// FailingBlockStore is the store of revoked storage (spec/design/validated-cow.md §4): after a failed
+// deferred durability flush the pages a published snapshot needs may read stale, so every operation
+// fails with the revocation error until the database is reopened through recovery.
+export class FailingBlockStore implements BlockStore {
+  private readonly error: Error;
+
+  constructor(error: Error) {
+    this.error = error;
+  }
+
+  readAt(_offset: number, _len: number): Uint8Array {
+    throw this.error;
+  }
+
+  writeAt(_offset: number, _bytes: Uint8Array): void {
+    throw this.error;
+  }
+
+  sync(): void {
+    throw this.error;
+  }
+
+  size(): number {
+    throw this.error;
+  }
+
+  setSize(_bytes: number): void {
+    throw this.error;
+  }
+
+  close(): void {
+    // Nothing to release: the file was closed when this store took its place.
+  }
+}
+
 function closedError(): Error {
   return engineError(
     "io_error",

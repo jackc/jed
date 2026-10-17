@@ -11,7 +11,8 @@
 // fault-injection seam (spec/design/storage.md §7) lives here, not in the host — it tests the commit
 // recipe, which is host-independent (hosts.md §3).
 
-import type { BlockStore } from "./blockstore.ts";
+import { type BlockStore, FailingBlockStore } from "./blockstore.ts";
+import { type ManifestEntry, manifestInlineCapacity } from "./commit_manifest.ts";
 import { type EngineError, engineError } from "./errors.ts";
 
 // PREALLOC_CHUNK_BYTES is the MAXIMUM file-growth step — ~1 MiB worth of pages. The file grows
@@ -68,6 +69,16 @@ function injectedCrash(): EngineError {
   return engineError("io_error", "injected commit crash (fault injection)");
 }
 
+// BatchMirror is where a page-service owner's batched-durability facts are mirrored for its service
+// (spec/design/validated-cow.md §4, page-service.md §6): the floor slot and whether a batch is pending.
+// The service flushes a pending batch before granting a client begin_write and moves the floor at each
+// client commit; the pager reconciles with the mirror before it reads its own batch state.
+export interface BatchMirror {
+  floorSlot(): number;
+  batchPending(): boolean;
+  publishBatch(floorSlot: number, pending: boolean): void;
+}
+
 // A block device: fixed-size pages addressed by index, over a BlockStore host kept open for the
 // handle's life. One page at a time (storage.md §2); the demand-paging buffer pool (P6.4b) faults
 // pages in through readBlock.
@@ -98,6 +109,15 @@ export class Pager {
   // trustMeta is set on a page client's pager: the owner validated the meta it serves (or wrote it), so
   // the client adopts it without re-reading its manifest pages (spec/design/page-service.md §5.3).
   trustMeta = false;
+  // Batched durability (spec/design/validated-cow.md §4). floorSlot is the meta slot holding the
+  // newest durable meta; every file commit writes the other one. pending is the CRC-64 of every body
+  // page (never a meta or manifest page) written by a commit after the floor — what a pending commit's
+  // manifest lists besides its own pages. Empty under synchronous = on. publishedMeta is the identity
+  // of the last meta this pager wrote or selected, so a selection of a different one is an adoption.
+  private floorSlot = 1;
+  private pending = new Map<number, bigint>();
+  private publishedMeta = "";
+  private batchMirror: BatchMirror | null = null;
 
   private constructor(store: BlockStore, pageSize: number, allocatedPages: number) {
     this.store = store;
@@ -226,9 +246,139 @@ export class Pager {
 
   // A recovered descriptor can represent a complete but unacknowledged transaction. Make that
   // generation durable before any successor overwrites its fallback or relies on inherited pages.
-  adoptCommit(txid: bigint, checksum: number, needsSync: boolean): void {
+  // slot is the selected meta's slot and bothSlots whether the other slot carries the same txid: an
+  // adopted generation is the floor once stabilized, in slot txid & 1 when both slots carry it
+  // (create, compaction), and nothing is pending (validated-cow.md §3–§4).
+  adoptCommit(
+    txid: bigint,
+    checksum: number,
+    needsSync: boolean,
+    slot: number,
+    bothSlots: boolean,
+  ): void {
     const identity = `${txid}:${checksum}`;
     if (identity !== this.acknowledgedMeta) this.adoptedNeedsSync = needsSync;
+    if (identity !== this.publishedMeta) {
+      this.publishedMeta = identity;
+      this.floorSlot = bothSlots ? Number(txid & 1n) : slot;
+      this.pending.clear();
+      this.publishBatch();
+    }
+  }
+
+  // --- batched durability (spec/design/validated-cow.md §4) ---
+
+  // setBatchMirror mirrors the batch state into a page-service owner's shared state (null: none).
+  setBatchMirror(mirror: BatchMirror | null): void {
+    this.batchMirror = mirror;
+    this.publishBatch();
+  }
+
+  // reconcileBatch adopts what the service did meanwhile: a flush before a client begin_write empties
+  // the pending set, and a client commit moves the floor.
+  private reconcileBatch(): void {
+    const mirror = this.batchMirror;
+    if (mirror === null) return;
+    this.floorSlot = mirror.floorSlot();
+    if (!mirror.batchPending()) this.pending.clear();
+  }
+
+  private publishBatch(): void {
+    this.batchMirror?.publishBatch(this.floorSlot, this.pending.size > 0);
+  }
+
+  // setFloorSlot sets the floor slot of a freshly created file (both slots carry the bootstrap txid).
+  setFloorSlot(slot: number): void {
+    this.floorSlot = slot;
+    this.publishBatch();
+  }
+
+  // commitSlot is the meta slot the next commit writes: the one not holding the floor (format.md, *Slot
+  // alternation*). Under synchronous = on this is txid & 1.
+  commitSlot(): number {
+    this.reconcileBatch();
+    return this.floorSlot ^ 1;
+  }
+
+  // hasPending reports whether a relaxed batch is pending a flush.
+  hasPending(): boolean {
+    this.reconcileBatch();
+    return this.pending.size > 0;
+  }
+
+  // pendingEntries is the pending set in page order.
+  pendingEntries(): ManifestEntry[] {
+    this.reconcileBatch();
+    return [...this.pending]
+      .map(([index, checksum]) => ({ index, checksum }))
+      .sort((a, b) => a.index - b.index);
+  }
+
+  // recordCommit records a commit whose meta (txid, checksum) was written to slot. durable is whether
+  // its barrier ran: the meta is then the floor and nothing is pending. A relaxed commit instead adds
+  // its own dirty entries to the pending set.
+  recordCommit(
+    txid: bigint,
+    checksum: number,
+    slot: number,
+    durable: boolean,
+    dirty: ManifestEntry[],
+  ): void {
+    this.reconcileBatch();
+    this.publishedMeta = `${txid}:${checksum}`;
+    if (durable) {
+      this.floorSlot = slot;
+      this.pending.clear();
+    } else {
+      for (const e of dirty) this.pending.set(e.index, e.checksum);
+    }
+    this.publishBatch();
+  }
+
+  // batchCapReached reports whether the pending set fills the inline manifest of one meta page: the
+  // batch cap, after which a flush follows.
+  batchCapReached(): boolean {
+    this.reconcileBatch();
+    return this.pending.size >= manifestInlineCapacity(this.pageSize);
+  }
+
+  // flushPending is a flush: one durable barrier makes every pending commit durable, so the newest
+  // meta — in the non-floor slot — becomes the floor. A failed barrier refuses every later commit.
+  flushPending(): void {
+    this.reconcileBatch();
+    if (this.pending.size === 0) return;
+    if (this.commitRequiresReopen()) {
+      throw engineError("io_error", "database writer requires reopen after failed commit");
+    }
+    try {
+      this.sync();
+    } catch (e) {
+      this.poisoned = true;
+      throw e;
+    }
+    this.floorSlot ^= 1;
+    this.pending.clear();
+    this.publishBatch();
+  }
+
+  // batchFlushed reports whether nothing awaits a barrier: no pending set, no adopted generation awaiting
+  // stabilization, no failed commit (the simulator's flush oracle).
+  batchFlushed(): boolean {
+    this.reconcileBatch();
+    return this.pending.size === 0 && !this.adoptedNeedsSync && !this.commitRequiresReopen();
+  }
+
+  // revoke makes every later access fail with error: the storage can no longer be trusted (a failed
+  // deferred flush may have dropped pending pages from the OS cache). Pages already in the pool still
+  // serve the snapshots that cached them.
+  revoke(error: Error): void {
+    try {
+      this.store.close();
+    } catch {
+      // The descriptor is released either way.
+    }
+    this.store = new FailingBlockStore(error);
+    this.poisoned = true;
   }
 
   // Check before serialization can fault inherited pages; an encoding error leaves

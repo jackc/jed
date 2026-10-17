@@ -349,6 +349,13 @@ class SimDB {
   free = 0; // the free list the next commit allocates from
   lacBound = 0; // ≥ the engine's live-at-last-reclamation
   last: SimGrowth = { reclaimed: false, high: 0, free: 0 }; // the previous commit in this lifetime
+  // batchOpen is whether the current step began with a relaxed batch pending on this database's file:
+  // its commit keeps the batch's pages off the free list and reuses only the floor's free pages
+  // (validated-cow.md §4), so the bounded-growth assertions do not apply to it.
+  batchOpen = false;
+  // ownerLost is set when an owner died under synchronous = off: until a process observes main again,
+  // it may have recovered any version from the floor up.
+  ownerLost = false;
 
   constructor(name: string, file: string) {
     this.name = name;
@@ -462,6 +469,10 @@ export class SimRunner {
   private tempBuffers: number; // a session's temp_buffers: past it, a temp domain spills (temp-tables.md §6)
   private maxQueryMemory: bigint; // a trace session's max_query_memory_bytes (oracle reads: unlimited)
   private maxStorageBytes: bigint; // the database's max_storage_bytes
+  // relaxed is the header's synchronous = off (validated-cow.md §4): every process batches its
+  // barriers, flushing inline (TypeScript always does) so the barrier lands in the step that reached
+  // the batch cap.
+  private relaxed: boolean;
 
   fs: SimFS;
   private db: Database | null = null; // the database of the process running the current step
@@ -507,6 +518,7 @@ export class SimRunner {
     this.tempBuffers = atoi(tr.header.get("temp_buffers"));
     this.maxQueryMemory = parseInt64(tr.header.get("max_query_memory_bytes"));
     this.maxStorageBytes = parseInt64(tr.header.get("max_storage_bytes"));
+    this.relaxed = tr.header.get("synchronous") === "off";
     let sector = atoi(tr.header.get("sector"));
     if (sector <= 0) sector = SECTOR_DEFAULT;
     this.fs = new SimFS(this.seed, sector, ps);
@@ -656,6 +668,7 @@ export class SimRunner {
     // Create, compaction, and attachments go through the simulated filesystem.
     e.fileHost = this.fs;
     e.persistHook = persistImpl;
+    e.relaxed = this.relaxed;
     // Spill and temp-table spill scratch files, whose operations can fail.
     e.spillSink = this.fs.spillSink();
     return e;
@@ -800,7 +813,10 @@ export class SimRunner {
     const armed = this.armed;
     this.armed = null;
     const start = new Map<string, bigint>();
-    for (const [name, d] of this.dbs) start.set(name, d.version);
+    for (const [name, d] of this.dbs) {
+      start.set(name, d.version);
+      d.batchOpen = this.relaxed && !this.engineFlushed(d);
+    }
     const pid = this.stepPid(st);
     if (pid !== null && st.kind !== "spawn" && !this.selectProc(pid)) {
       if (st.kind === "open") {
@@ -853,8 +869,31 @@ export class SimRunner {
     // the step began can no longer be lost (§8.2).
     for (const [name, d] of this.dbs) {
       const f = this.fs.files.get(d.file);
+      if (f === undefined) continue;
       const s0 = start.get(name);
-      if (f?.barrierOK && s0 !== undefined && s0 > d.floor) d.floor = s0;
+      // Under synchronous = off a barrier proves the step's starting version durable only when the
+      // engine was not batching then: a pending version may be durable by accident (a file growth is a
+      // full fsync) and still be overwritten by the next commit of its batch (validated-cow.md §4).
+      if (f.barrierOK && !d.batchOpen && s0 !== undefined && s0 > d.floor) d.floor = s0;
+      if (
+        !this.relaxed ||
+        this.fs.dead ||
+        this.fs.fired !== "" ||
+        d.version <= d.floor ||
+        !this.engineFlushed(d)
+      ) {
+        continue;
+      }
+      // The engine holds nothing pending: it treats the published version as flushed, and will
+      // overwrite only the other slot. Hold it to that, after checking the claim against the disk.
+      if (f.metaPending()) {
+        this.fail(
+          i,
+          `durability: the engine treats version ${d.version} of ${d.name} as flushed, but no barrier covered its meta`,
+        );
+        return false;
+      }
+      d.floor = d.version;
     }
     if (armed === null) return true;
     if (armed.kind === "disconnect") {
@@ -1169,6 +1208,11 @@ export class SimRunner {
           return;
         }
         let published = this.committedDigest(d);
+        if (published === null && this.relaxed && this.fs.fired !== "") {
+          // The batch cap's flush failed in this step and revoked the storage, so nothing can be read
+          // back; the acknowledged commit is checked by the recovery that follows.
+          published = inflight.digest;
+        }
         if (published === null && this.service && this.fs.dead) {
           // The owner died later in this step (its maintenance commit hit the fault), so nothing can be
           // read back through it; the acknowledged commit is checked by the recovery that follows.
@@ -1189,7 +1233,9 @@ export class SimRunner {
         d.version = now;
         d.lastDigest = inflight.digest;
         if (now > d.maxAttempted) d.maxAttempted = now;
-        d.floor = now; // acknowledged under synchronous = on (§8.2)
+        if (!this.relaxed || coreOf(this.database).client !== null) {
+          d.floor = now; // acknowledged under synchronous = on, or a page client's commit (§8.2)
+        }
         this.checkGrowth(i, d, quiet);
         if (this.violation !== "") return;
         if (this.service && d.name === "main") {
@@ -1200,6 +1246,9 @@ export class SimRunner {
         this.fail(i, `commit jumped ${d.name} from version ${base} to ${now}`);
         return;
       }
+    }
+    if (this.relaxed && this.fs.fired !== "") {
+      return; // a failed cap flush revoked the storage; the recovery that follows checks it
     }
     try {
       this.checkLive();
@@ -1245,8 +1294,26 @@ export class SimRunner {
     for (let v = now + 1n; v <= ov; v++) d.addHistory(v, digest);
     d.version = ov;
     if (ov > d.maxAttempted) d.maxAttempted = ov;
-    d.floor = ov;
+    if (!this.relaxed) d.floor = ov; // the maintenance commit is an owner commit: batched under off
     this.emit(`{"i":${i},"op":"maintenance","version":${ov}}`);
+  }
+
+  // engineFlushed reports whether the process writing database d holds no relaxed commit pending a
+  // flush — no pending set, no adopted generation awaiting stabilization, no failed barrier — so its
+  // published version is the one it treats as durable (validated-cow.md §4). Under the page service
+  // the owner writes the file; with no owner running, nothing is claimed.
+  private engineFlushed(d: SimDB): boolean {
+    let db = this.db;
+    if (this.service) {
+      const owner = this.ownerPid();
+      if (owner < 0) return false;
+      db = this.procs.get(owner)!.db;
+    }
+    if (db === null) return false;
+    const core = coreOf(db);
+    const st = d.name === "main" ? core.storage : core.attachments.get(d.name)?.storage;
+    if (st === undefined || st.paging === null) return false;
+    return st.paging.batchFlushed();
   }
 
   // --- bounded growth (simulation-testing.md §8.3) ----------------------------------------------
@@ -1293,6 +1360,15 @@ export class SimRunner {
     let written = 0;
     for (const pg of this.fs.files.get(d.file)!.pages) if (pg >= 2) written++;
     const before = d.last;
+    if (d.batchOpen) {
+      // A commit inside a relaxed batch neither reuses nor frees the batch's pages (validated-cow.md
+      // §4); only the bounds carry forward.
+      d.high = pc;
+      d.free = free;
+      d.lacBound = Math.max(d.lacBound, live + written);
+      d.last = { reclaimed: false, high: 0, free: 0 };
+      return;
+    }
     if (
       quiet &&
       before.reclaimed &&
@@ -1800,6 +1876,13 @@ export class SimRunner {
   // dropProc abandons process pid as a crash does: its sessions and Database vanish without closing,
   // and the kernel releases its locks.
   private dropProc(pid: number): void {
+    const p = this.procs.get(pid);
+    const main = this.dbs.get("main");
+    if (this.relaxed && p !== undefined && coreOf(p.db).service !== null && main !== undefined) {
+      // A dead owner's batch may be lost back to the floor (validated-cow.md §4): the simulated
+      // process crash may drop writes of the step that acknowledged a commit.
+      main.ownerLost = true;
+    }
     for (const sid of this.sessionsOf(pid)) this.sessions.delete(sid);
     this.locks?.release(pid);
     this.procs.delete(pid);
@@ -1815,7 +1898,7 @@ export class SimRunner {
   private observe(i: number, who: string, v: bigint, d: string | null): boolean {
     const m = this.main();
     if (d === null) this.fail(i, `${who}: version ${v} is unreadable`);
-    else if (v < m.version) {
+    else if (v < m.version && (!m.ownerLost || v < m.floor)) {
       this.fail(i, `${who} sees version ${v} after version ${m.version} was published`);
     } else if (v > m.maxAttempted) {
       this.fail(
@@ -1828,6 +1911,7 @@ export class SimRunner {
     if (this.violation !== "") return false;
     m.version = v;
     m.lastDigest = d!;
+    m.ownerLost = false;
     return true;
   }
 

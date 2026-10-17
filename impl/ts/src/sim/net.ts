@@ -400,10 +400,27 @@ class SimServed implements ServedDb, OwnerLink {
     try {
       const paging = this.storage.paging;
       if (paging === null) return false;
-      paging.writeBlock(Number(d.txid & 1n), d.meta);
+      // The slot not holding the committed meta (README §3.5), as the production worker writes it.
+      const slot = this.state.floorSlot() ^ 1;
+      paging.writeBlock(slot, d.meta);
       paging.sync();
+      this.state.publishBatch(slot, false);
       paging.finishDurableCommit(d.txid, metaChecksum(d.meta));
       paging.cacheValidation(d.meta, new Set(d.written));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // flushBatch is the owner's batch flush before a begin_write (validated-cow.md §4), through the
+  // owner's pager as the client commits are.
+  flushBatch(): boolean {
+    try {
+      const paging = this.storage.paging;
+      if (paging === null) return false;
+      paging.sync();
+      this.state.batchFlushed();
       return true;
     } catch {
       return false;

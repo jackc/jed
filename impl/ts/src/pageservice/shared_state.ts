@@ -74,6 +74,12 @@ const RESOLUTION_COUNT = 8;
 const RESOLUTION_NEXT = 9;
 const ACK_HOOK = 10;
 const OWNER_STATE = 11;
+// Batched durability (spec/design/validated-cow.md §4): the meta slot holding the newest durable meta,
+// and whether the engine thread holds relaxed commits pending a flush. The engine thread publishes both
+// after each own commit and flush; the worker flushes a pending batch before granting a begin_write and
+// moves the floor at each client commit, always holding the writer gate.
+const FLOOR_SLOT = 12;
+const BATCH_PENDING = 13;
 const HEADER_I32 = 16;
 
 // BigInt64 slots.
@@ -223,6 +229,27 @@ export class ServiceState {
 
   takeAckHook(): number {
     return Atomics.exchange(this.header, ACK_HOOK, ACK_NORMAL);
+  }
+
+  // --- batched durability (validated-cow.md §4): the pager's BatchMirror, plus the worker's side ---
+
+  floorSlot(): number {
+    return Atomics.load(this.header, FLOOR_SLOT);
+  }
+
+  batchPending(): boolean {
+    return Atomics.load(this.header, BATCH_PENDING) !== 0;
+  }
+
+  publishBatch(floorSlot: number, pending: boolean): void {
+    Atomics.store(this.header, FLOOR_SLOT, floorSlot);
+    Atomics.store(this.header, BATCH_PENDING, pending ? 1 : 0);
+  }
+
+  // batchFlushed records the worker's flush of a pending batch: the newest meta, in the non-floor
+  // slot, is the floor now.
+  batchFlushed(): void {
+    this.publishBatch(this.floorSlot() ^ 1, false);
   }
 
   // --- handoff (README §6.5) ---

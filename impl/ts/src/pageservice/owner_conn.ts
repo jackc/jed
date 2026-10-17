@@ -98,6 +98,10 @@ export interface ServedDb {
   // commitDelta writes a completed delta's meta and runs the single durable barrier; false when it
   // failed (the meta may be durable).
   commitDelta(d: Delta): boolean;
+  // flushBatch makes the owner's pending relaxed commits durable (spec/design/validated-cow.md §4): the
+  // file's durable barrier, after which the newest meta is the floor (ServiceState.batchFlushed).
+  // false when the barrier failed. Called holding the writer gate.
+  flushBatch(): boolean;
   // maintenanceDue reports, holding the state lock after a client commit was published, whether to
   // hand the gate to the engine thread (computed is the service's own estimate); maintain tells the
   // engine thread, which runs the maintenance commit and releases the gate.
@@ -121,6 +125,14 @@ export class Failure extends Error {
     super(message);
     this.sqlstate = sqlstate;
     this.fatal = fatal;
+  }
+}
+
+// FlushFailure is a failed flush of the owner's pending batch at a begin_write: the error answer,
+// after which the owner stops serving.
+class FlushFailure extends Failure {
+  constructor() {
+    super("58030", "the database owner could not make its pending commits durable", false);
   }
 }
 
@@ -545,6 +557,8 @@ export class Connection {
       this.send(requestId, this.startWrite(m));
     } catch (error) {
       this.fail(requestId, error);
+      // A failed flush of the owner's batch poisons the owner, which stops serving (README §3.5).
+      if (error instanceof FlushFailure) this.db.stopServing();
     }
   }
 
@@ -553,6 +567,12 @@ export class Connection {
   // free list's generation (page-service.md §6). Later pins are on this snapshot or newer.
   private startWrite(m: PsBeginWrite): PsMessage {
     const state = this.db.state;
+    // The owner's own relaxed commits are flushed before a client plans against the committed meta: a
+    // client cannot name the owner's pending set in its manifest (README §3.5).
+    if (state.batchPending() && !this.db.flushBatch()) {
+      state.releaseGate();
+      throw new FlushFailure();
+    }
     let txid: bigint;
     let grant: boolean;
     let meta: Uint8Array;

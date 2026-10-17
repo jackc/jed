@@ -755,6 +755,13 @@ class SharedCore {
     );
     const paging = storage.paging;
     if (paging !== null) {
+      // Pending relaxed commits become durable before ownership moves (page-service.md §6). A failed
+      // flush poisons the pager; the next owner stabilizes whatever it adopts.
+      try {
+        paging.flushPending();
+      } catch {
+        // See above.
+      }
       paging.swapStore(new RevokedBlockStore()).close();
       paging.poison();
     }
@@ -1325,6 +1332,26 @@ class SharedCore {
   }
 }
 
+// closeDomain flushes a storage domain's pending relaxed commits (validated-cow.md §4) and closes its
+// paging, returning the first error (null when none). The paging is closed whether the flush failed or
+// not.
+function closeDomain(st: Engine): unknown {
+  const paging = st.paging;
+  if (paging === null) return null;
+  let error: unknown = null;
+  try {
+    paging.flushPending();
+  } catch (e) {
+    error = e;
+  }
+  try {
+    paging.close();
+  } catch (e) {
+    if (error === null) error = e;
+  }
+  return error;
+}
+
 // compactStorage replaces storage st with the from-scratch image of snap at txid (host compaction,
 // spec/design/api.md §2.6) and returns the committed snapshot reloaded from it. A file is rewritten
 // through the host's registered file compactor (file.ts compactFile); an in-memory domain swaps in a new
@@ -1426,11 +1453,13 @@ export function attachFile(
 // files is main's file host (null is the host's own), so an attachment opens through the same
 // filesystem as main — the deterministic simulator's (simulation-testing.md §14 S4) included.
 type OpenedAttachment = { engine: Engine; coordinator: FileCoordinatorHost | null };
+// relaxed is main's synchronous = off, which a file attachment follows (validated-cow.md §4).
 type FileAttachOpener = (
   source: AttachSource,
   readOnly: boolean,
   files: FileHost | null,
   environment: Environment,
+  relaxed: boolean,
 ) => OpenedAttachment;
 let fileAttachOpener: FileAttachOpener | null = null;
 
@@ -1547,7 +1576,13 @@ export class Database {
       }
       // Open the file BEFORE the dup check (an open may throw 58P01/XX001); on a name conflict close it.
       // The attachment resolves against, and runs with, main's environment (environment.md §3).
-      const opened = fileAttachOpener(source, readOnly, c.storage.fileHost, c.environment);
+      const opened = fileAttachOpener(
+        source,
+        readOnly,
+        c.storage.fileHost,
+        c.environment,
+        c.storage.relaxed,
+      );
       const engine = opened.engine;
       // The attachment's storage reaches the same file host as main (compaction, directory barrier).
       engine.fileHost = c.storage.fileHost;
@@ -1620,9 +1655,12 @@ export class Database {
       c.releaseWriter();
     }
     // Release a file attachment's OS handle once it is unpublished and unreferenced (a no-op for an
-    // in-memory attachment). No live reader can still fault it — detach-in-use was rejected above.
-    att.storage.paging?.close();
+    // in-memory attachment), its pending relaxed commits flushed first (validated-cow.md §4). No live
+    // reader can still fault it — detach-in-use was rejected above. A failed flush is what detach
+    // reports.
+    const error = closeDomain(att.storage);
     att.coordinator?.close();
+    if (error !== null) throw error;
   }
 
   // compact compacts database name — `main` or an attachment, by exact name — returning its dead
@@ -1917,21 +1955,23 @@ export class Database {
     this.closeStorage();
   }
 
+  // closeStorage releases main and every attachment, each relaxed domain's pending commits flushed
+  // first (validated-cow.md §4); it throws the first failed flush or close after releasing them all.
   private closeStorage(): void {
     const st = this.core.storage;
-    if (st.paging !== null) {
-      st.paging.close();
-      st.paging = null;
-    }
+    let error = closeDomain(st);
+    st.paging = null;
     // Release any still-attached file databases (an in-memory attachment's close is a no-op), so the host
     // need not detach before close (attached-databases.md §4). Order-independent (just closing).
     for (const att of this.core.attachments.values()) {
-      att.storage.paging?.close();
+      const e = closeDomain(att.storage);
+      if (error === null) error = e;
       att.coordinator?.close();
     }
     this.core.attachments = new Map();
     this.core.coordinator?.close();
     this.core.coordinator = null;
+    if (error !== null) throw error;
   }
 
   // fromImage lifts a from-scratch on-disk image (spec/fileformat/format.md) into an in-memory host

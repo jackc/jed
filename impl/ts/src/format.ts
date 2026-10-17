@@ -3142,22 +3142,34 @@ class PageAlloc {
   // the single-handle case leave it true (oldest_live == committed ⇒ no page is still observed), so the
   // on-disk byte layout is unchanged whenever no reader pins an older version.
   private reuse: boolean;
+  // allowed, when set, restricts reuse to these free pages — while a relaxed batch is pending, only the
+  // pages already free at the floor (spec/design/validated-cow.md §4 rule 3). A free page it passes
+  // over stays on the list (skipped). null allows every free page.
+  private allowed: Set<number> | null;
+  private skipped: number[] = [];
 
-  constructor(free: number[], next: number, reuse = true) {
+  constructor(free: number[], next: number, reuse = true, allowed: Set<number> | null = null) {
     this.free = free;
     this.next = next;
     this.reuse = reuse;
+    this.allowed = allowed;
   }
 
   take(): number {
-    if (this.reuse && this.cursor < this.free.length) return this.free[this.cursor++]!;
+    while (this.reuse && this.cursor < this.free.length) {
+      const p = this.free[this.cursor++]!;
+      if (this.allowed === null || this.allowed.has(p)) return p;
+      this.skipped.push(p);
+    }
     if (this.next >= 0xffff_ffff)
       throw engineError("program_limit_exceeded", "database page limit exceeded");
     return this.next++;
   }
 
+  // remaining is the free list this commit did not consume: the skipped pages, then the rest (both
+  // ascending, every skipped page below the rest).
   remaining(): number[] {
-    return this.free.slice(this.cursor);
+    return [...this.skipped, ...this.free.slice(this.cursor)];
   }
 }
 
@@ -3175,6 +3187,7 @@ export function incrementalImage(
   free: number[],
   paging: SharedPaging | null,
   reuse = true,
+  allowed: Set<number> | null = null,
 ): IncrementalWrite {
   const ps = pageSize;
   const capacity = ps - PAGE_HEADER;
@@ -3184,7 +3197,7 @@ export function incrementalImage(
   // Allocate from the free-list first (reclaiming dead pages), then extend the file — unless the
   // watermark defers reuse (reuse false), in which case only the high-water is drawn and the whole
   // free-list carries through unconsumed for persistence (PageAlloc.reuse, transactions.md §8).
-  const alloc = new PageAlloc(free, startPage, reuse);
+  const alloc = new PageAlloc(free, startPage, reuse, allowed);
 
   const pages: { index: number; bytes: Uint8Array }[] = [];
   const kept = new Set<number>();
@@ -3703,6 +3716,8 @@ export function planFreeList(
   ps: number,
   canReclaim: boolean,
   canReuse: boolean,
+  pending: { index: number }[] = [],
+  allowed: Set<number> | null = null,
 ): {
   pages: { index: number; bytes: Uint8Array }[];
   head: number;
@@ -3724,10 +3739,13 @@ export function planFreeList(
   if (compact) {
     const reached = reachablePages(snap, paging, catRoot);
     for (const w of written) reached.add(w.index);
+    newLive = reached.size;
+    // A relaxed batch's pending pages are manifest dependencies the rebuilt list must exclude, though
+    // they are not live (validated-cow.md §4 rule 4).
+    for (const e of pending) reached.add(e.index);
     const free: number[] = [];
     for (let p = ROOT_PAGE; p < pageCount; p++) if (!reached.has(p)) free.push(p);
     persistList = free;
-    newLive = reached.size;
     newGen = snap.txid; // the recomputed list is proven dead at snap.txid (the §8 reuse gate)
   }
   // The free-list CHAIN pages overwrite in place, so they may only land on pages no live reader can
@@ -3735,7 +3753,12 @@ export function planFreeList(
   // than the free-list generation may still reference one of those pages (transactions.md §8) — the same
   // hazard as data-page reuse. When the watermark defers reuse the chain must grow the high-water instead
   // (empty `safe`), exactly as the data allocator does.
-  const safe = canReuse ? freeRemaining : [];
+  // A pending batch reuses only pages free at its floor (validated-cow.md §4 rule 3).
+  const safe = !canReuse
+    ? []
+    : allowed === null
+      ? freeRemaining
+      : freeRemaining.filter((p) => allowed.has(p));
   // Joint allocation is monotone: reserve descriptor overflow pages first, then encode the free
   // list with those reservations removed. Growing the reservation can shrink the free-list chain,
   // so a final descriptor may have empty tail pages; never release/reallocate them in this trial.
@@ -3758,7 +3781,7 @@ export function planFreeList(
       next,
     );
     const required = Math.ceil(
-      Math.max(0, written.length + s.pages.length - manifestInlineCapacity(ps)) /
+      Math.max(0, pending.length + written.length + s.pages.length - manifestInlineCapacity(ps)) /
         manifestOverflowCapacity(ps),
     );
     if (required > manifestCount) {
@@ -3799,12 +3822,13 @@ export function loadEnginePaged(
   const physicalPages = paging.physicalPages();
   const blocks = [paging.readBlock(0), paging.readBlock(1)];
   const candidates = blocks
-    .map((bytes) => ({ bytes, meta: parseCommitMeta(bytes, pageSize, physicalPages) }))
+    .map((bytes, slot) => ({ bytes, slot, meta: parseCommitMeta(bytes, pageSize, physicalPages) }))
     .filter(
-      (candidate): candidate is { bytes: Uint8Array; meta: CommitMeta } => candidate.meta !== null,
+      (candidate): candidate is { bytes: Uint8Array; slot: number; meta: CommitMeta } =>
+        candidate.meta !== null,
     )
     .sort((a, b) => (a.meta.txid > b.meta.txid ? -1 : a.meta.txid < b.meta.txid ? 1 : 0));
-  let selected: { bytes: Uint8Array; meta: CommitMeta } | undefined;
+  let selected: { bytes: Uint8Array; slot: number; meta: CommitMeta } | undefined;
   let protectedPages = new Set<number>();
   for (const candidate of candidates) {
     const validated =
@@ -4026,7 +4050,15 @@ export function loadEnginePaged(
   // Stores created in a LATER session bind this same pager at creation (Snapshot.storePaging), so
   // they join the post-commit residency flip like the loaded stores attached above.
   snap.storePaging = paging;
-  paging.adoptCommit(mt.txid, metaChecksum(selected.bytes), mt.dirtyCount !== 0);
+  // The floor slot (validated-cow.md §4): the selected slot, or txid & 1 when both slots carry it.
+  const other = parseCommitMeta(blocks[1 - selected.slot]!, pageSize, physicalPages);
+  paging.adoptCommit(
+    mt.txid,
+    metaChecksum(selected.bytes),
+    mt.dirtyCount !== 0,
+    selected.slot,
+    other !== null && other.txid === mt.txid,
+  );
   return db;
 }
 

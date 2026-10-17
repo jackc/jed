@@ -18,7 +18,8 @@ import type { PNode } from "./pmap.ts";
 import { BufferPool } from "./bufferpool.ts";
 import { engineError } from "./errors.ts";
 import { decodeLeafNode, sameLeafShape } from "./format.ts";
-import type { CommitFault, Pager } from "./pager.ts";
+import type { ManifestEntry } from "./commit_manifest.ts";
+import type { BatchMirror, CommitFault, Pager } from "./pager.ts";
 
 // DEFAULT_CACHE_BYTES is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
 // OpenOptions.cacheBytes default (spec/design/pager.md §3, api.md §2.1). Sized so the dominant case —
@@ -106,8 +107,52 @@ export class SharedPaging {
     this.pager.refreshAllocatedPages();
   }
 
-  adoptCommit(txid: bigint, checksum: number, needsSync: boolean): void {
-    this.pager.adoptCommit(txid, checksum, needsSync);
+  adoptCommit(
+    txid: bigint,
+    checksum: number,
+    needsSync: boolean,
+    slot: number,
+    bothSlots: boolean,
+  ): void {
+    this.pager.adoptCommit(txid, checksum, needsSync, slot, bothSlots);
+  }
+
+  // Batched durability (spec/design/validated-cow.md §4; Pager has the details).
+  setBatchMirror(mirror: BatchMirror | null): void {
+    this.pager.setBatchMirror(mirror);
+  }
+  setFloorSlot(slot: number): void {
+    this.pager.setFloorSlot(slot);
+  }
+  commitSlot(): number {
+    return this.pager.commitSlot();
+  }
+  hasPending(): boolean {
+    return this.pager.hasPending();
+  }
+  pendingEntries(): ManifestEntry[] {
+    return this.pager.pendingEntries();
+  }
+  recordCommit(
+    txid: bigint,
+    checksum: number,
+    slot: number,
+    durable: boolean,
+    dirty: ManifestEntry[],
+  ): void {
+    this.pager.recordCommit(txid, checksum, slot, durable, dirty);
+  }
+  batchCapReached(): boolean {
+    return this.pager.batchCapReached();
+  }
+  flushPending(): void {
+    this.pager.flushPending();
+  }
+  batchFlushed(): boolean {
+    return this.pager.batchFlushed();
+  }
+  revoke(error: Error): void {
+    this.pager.revoke(error);
   }
 
   checkDurableCommit(): void {

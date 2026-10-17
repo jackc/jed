@@ -33,12 +33,19 @@ import { OpfsBlockStore, type SyncAccessHandle } from "./opfsblockstore.ts";
 // DatabaseOptions / OpenOptions mirror file.ts (spec/design/api.md §2/§2.1): create-time pageSize is
 // fixed into the file's meta; open-time cacheBytes / readOnly / workMem are handle settings.
 // environment is the handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one.
-export type DatabaseOptions = { pageSize?: number; environment?: Environment };
+// synchronous is the durability mode (file.ts Synchronous, spec/design/transactions.md §9): "off"
+// batches the barrier (spec/design/validated-cow.md §4). Default "on"; a handle setting.
+export type DatabaseOptions = {
+  pageSize?: number;
+  environment?: Environment;
+  synchronous?: "on" | "off";
+};
 export type OpenOptions = {
   cacheBytes?: number;
   readOnly?: boolean;
   workMem?: number;
   environment?: Environment;
+  synchronous?: "on" | "off";
 };
 
 // createOpfsWithHandle creates a new file-backed database over an already-acquired, EMPTY OPFS sync
@@ -71,6 +78,9 @@ export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOpt
   );
   // Tables built in this session bind this pager at creation (Snapshot.storePaging), so their
   // committed leaves demote at each commit — same residency shape as after a reopen (file.ts create).
+  // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
+  db.paging.setFloorSlot(Number(db.committed.txid & 1n));
+  db.relaxed = opts.synchronous === "off";
   db.committed.storePaging = db.paging;
   return db;
 }
@@ -90,6 +100,7 @@ export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions =
   );
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   db.readOnly = readOnly;
+  db.relaxed = opts.synchronous === "off";
   // 0 (or unset) ⇒ the default budget, not unlimited (matching Go/Rust); unbounded is setWorkMem(0).
   if (opts.workMem) db.session.workMem = opts.workMem;
   return db;
@@ -101,8 +112,15 @@ export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions =
 export function closeOpfs(db: Engine): void {
   db.rollbackTx();
   if (db.paging !== null) {
-    db.paging.close(); // releases the exclusive sync access handle
+    const paging = db.paging;
     db.paging = null;
+    // A relaxed handle's pending commits become durable before the handle is released
+    // (validated-cow.md §4); a failed flush is what close reports.
+    try {
+      paging.flushPending();
+    } finally {
+      paging.close(); // releases the exclusive sync access handle
+    }
   }
 }
 
