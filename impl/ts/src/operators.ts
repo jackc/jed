@@ -6500,6 +6500,15 @@ export const AGGREGATES: readonly AggregateDesc[] = [
     errors: [],
   },
   {
+    name: "array_agg",
+    surface: "array_agg",
+    arg: "expr",
+    argFamilies: ["any"],
+    result: "array_of_input",
+    null: "aggregate",
+    errors: ["22004", "2202E", "54000", "42725"],
+  },
+  {
     name: "jsonb_agg",
     surface: "jsonb_agg",
     arg: "expr",

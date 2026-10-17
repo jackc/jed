@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // array_agg(x) — the inputs as an array, or stacked arrays (aggregates.md §23).
+    "func.array_agg",
     // bit_xor(integer) — the bitwise XOR of the non-NULL inputs (aggregates.md §23).
     "func.bit_xor",
     // bit_or(integer) — the bitwise OR of the non-NULL inputs (aggregates.md §23).

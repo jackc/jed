@@ -1433,6 +1433,16 @@ pub(crate) fn lookup_aggregate_overload(
     })
 }
 
+/// Reject an untyped NULL operand of an aggregate whose result type is derived from it (array_agg —
+/// aggregates.md §23). PostgreSQL's 42725: array_agg has an element and an array overload, and an
+/// unknown argument matches both.
+pub(crate) fn check_polymorphic_agg_operand(desc: &AggregateDesc, t: &ResolvedType) -> Result<()> {
+    if desc.result == "array_of_input" && matches!(t, ResolvedType::Null) {
+        return Err(ambiguous_func_overload(&desc.surface.to_ascii_lowercase()));
+    }
+    Ok(())
+}
+
 /// The runtime plan + result type for an aggregate over operand type `t`, from the matched
 /// overload's `surface` + catalog `result` code (the PG widening — aggregates.md §3). The plan
 /// is the aggregate's kernel id (fold/finalize switch on it); selecting it from the registered
@@ -1472,6 +1482,14 @@ pub(crate) fn aggregate_plan(
         ("bit_and", "same_as_input") => (AggPlan::Bit(BitOp::And), t.clone()),
         ("bit_or", "same_as_input") => (AggPlan::Bit(BitOp::Or), t.clone()),
         ("bit_xor", "same_as_input") => (AggPlan::Bit(BitOp::Xor), t.clone()),
+        // An array input stacks into one more dimension of the same (dimension-agnostic) array type.
+        ("array_agg", "array_of_input") => match t {
+            ResolvedType::Array(_) => (AggPlan::ArrayAgg { nested: true }, t.clone()),
+            _ => (
+                AggPlan::ArrayAgg { nested: false },
+                ResolvedType::Array(Box::new(t.clone())),
+            ),
+        },
         // json/jsonb array aggregates (B4). `compact` is the json (vs jsonb) render; `_strict`
         // skips a NULL input. The result type is json/jsonb (the catalog `result` code).
         ("jsonb_agg", "jsonb") => (
@@ -1635,6 +1653,7 @@ pub(crate) fn resolve_aggregate(
         }
         let (r, t) = resolve(scope, arg, None, &mut sub, params)?;
         let desc = lookup_aggregate_overload(name, &t).ok_or_else(|| no_agg_overload(name))?;
+        check_polymorphic_agg_operand(desc, &t)?;
         let (plan, result) = aggregate_plan(name, desc.result, &t);
         if distinct {
             reject_json_distinct(&t)?;
@@ -2577,6 +2596,7 @@ pub(crate) fn resolve_window_call(
             let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
             let desc =
                 lookup_aggregate_overload(&lname, &t).ok_or_else(|| no_agg_overload(&lname))?;
+            check_polymorphic_agg_operand(desc, &t)?;
             let (plan, result) = aggregate_plan(&lname, desc.result, &t);
             wargs.push(r); // the aggregate operand → args[0]
             if matches!(plan, AggPlan::JsonAgg { .. }) {

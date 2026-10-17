@@ -98,6 +98,9 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		if desc == nil {
 			return nil, resolvedType{}, noAggOverload(name)
 		}
+		if err := checkPolymorphicAggOperand(desc, t); err != nil {
+			return nil, resolvedType{}, err
+		}
 		plan, result = aggregatePlan(name, desc.Result, t)
 		operand = r
 		// A JSON aggregate converts each input by its static type (json-sql-functions.md §4).
@@ -765,6 +768,9 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 			if desc == nil {
 				return nil, resolvedType{}, noAggOverload(name)
 			}
+			if err := checkPolymorphicAggOperand(desc, t); err != nil {
+				return nil, resolvedType{}, err
+			}
 			wagg, result = aggregatePlan(name, desc.Result, t)
 			wargs = append(wargs, r) // the aggregate operand → args[0]
 			if isJSONAggPlan(wagg) {
@@ -1152,6 +1158,16 @@ func aggArg(fc *funcCallExpr) (exprNode, error) {
 			hinted(hintFunctionNoMatch)
 	}
 	return *fc.Args[0], nil
+}
+
+// checkPolymorphicAggOperand rejects an untyped NULL operand of an aggregate whose result type is
+// derived from it (array_agg — aggregates.md §23). PostgreSQL's 42725: array_agg has an element and
+// an array overload, and an unknown argument matches both.
+func checkPolymorphicAggOperand(desc *aggregateDesc, t resolvedType) error {
+	if desc.Result == "array_of_input" && t.kind == rtNull {
+		return ambiguousFuncOverload(toLowerASCII(desc.Surface))
+	}
+	return nil
 }
 
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.

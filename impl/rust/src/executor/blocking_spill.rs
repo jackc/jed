@@ -1039,6 +1039,16 @@ impl Engine {
                     _ => unreachable!(),
                 })
             }
+            Acc::ArrayAgg { seen, nested, .. } => {
+                if !seen {
+                    return Ok(Value::Null);
+                }
+                let mut elems = Vec::new();
+                while let Some(mut row) = values.next()? {
+                    elems.push(row.remove(0));
+                }
+                Ok(super::aggregate::finalize_array_agg(nested, elems))
+            }
             Acc::JsonAgg {
                 compact,
                 seen,
@@ -1171,6 +1181,11 @@ fn fold_spilled_value(
                 collections.push(owner, vec![Value::Text(key), value])?;
             }
         }
+        Acc::ArrayAgg { elems, .. } => {
+            for elem in elems.drain(..) {
+                collections.push(owner, vec![elem])?;
+            }
+        }
         Acc::OrderedSet { vals, floats, .. } => {
             for value in vals.drain(..) {
                 collections.push(owner, vec![value])?;
@@ -1207,6 +1222,25 @@ fn pack_acc(acc: Acc) -> Row {
         Acc::MinMax { cur, .. } => vec![cur.unwrap_or(Value::Null)],
         Acc::Bool { cur, .. } => vec![cur.map_or(Value::Null, Value::Bool)],
         Acc::Bit { cur, .. } => vec![cur.map_or(Value::Null, Value::Int)],
+        // The seen flag; over array inputs then the first input's shape — its dimension count and
+        // each (length, lower bound) pair — so a later input is checked against it.
+        Acc::ArrayAgg {
+            seen,
+            nested,
+            shape,
+            ..
+        } => {
+            let mut row = vec![Value::Bool(seen)];
+            if nested {
+                let (dims, lbounds) = shape.unwrap_or_default();
+                row.push(Value::Int(dims.len() as i64));
+                for (d, l) in dims.iter().zip(&lbounds) {
+                    row.push(Value::Int(*d as i64));
+                    row.push(Value::Int(*l as i64));
+                }
+            }
+            row
+        }
         Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => vec![Value::Bool(seen)],
         Acc::OrderedSet { .. } | Acc::Hypothetical { .. } | Acc::Ordered { .. } => Vec::new(),
     }
@@ -1270,6 +1304,20 @@ fn unpack_acc(spec: &AggSpec, state: Row, zone: &crate::timezone::ZoneRef) -> Ac
             *cur = match state[0] {
                 Value::Int(n) => Some(n),
                 _ => None,
+            }
+        }
+        Acc::ArrayAgg {
+            seen,
+            nested,
+            shape,
+            ..
+        } => {
+            *seen = flag(0);
+            if *nested && int(1) > 0 {
+                let n = int(1) as usize;
+                let dims = (0..n).map(|i| int(2 + 2 * i) as usize).collect();
+                let lbounds = (0..n).map(|i| int(3 + 2 * i) as i32).collect();
+                *shape = Some((dims, lbounds));
             }
         }
         Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => *seen = flag(0),

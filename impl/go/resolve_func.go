@@ -3060,6 +3060,13 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 		return planBitOr, t
 	case surface == "bit_xor" && result == "same_as_input":
 		return planBitXor, t
+	case surface == "array_agg" && result == "array_of_input":
+		// An array input stacks into one more dimension of the same (dimension-agnostic) array type.
+		if t.kind == rtArray {
+			return planArrayAggArray, t
+		}
+		elem := t
+		return planArrayAgg, resolvedType{kind: rtArray, elem: &elem}
 	case surface == "jsonb_agg" && result == "jsonb":
 		return planJsonbAgg, resolvedType{kind: rtJsonb}
 	case surface == "json_agg" && result == "json":

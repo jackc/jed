@@ -125,6 +125,12 @@ impl Acc {
                 is_and: true,
             },
             AggPlan::Bit(op) => Acc::Bit { cur: None, op },
+            AggPlan::ArrayAgg { nested } => Acc::ArrayAgg {
+                elems: Vec::new(),
+                seen: false,
+                nested,
+                shape: None,
+            },
             AggPlan::BoolOr => Acc::Bool {
                 cur: None,
                 is_and: false,
@@ -284,6 +290,18 @@ impl Acc {
                     });
                 }
             }
+            Acc::ArrayAgg {
+                elems,
+                seen,
+                nested,
+                shape,
+            } => {
+                if *nested {
+                    check_array_agg_input(shape, &value)?;
+                }
+                *seen = true;
+                elems.push(value);
+            }
             Acc::JsonAgg {
                 elems,
                 compact,
@@ -391,6 +409,7 @@ impl Acc {
             Acc::OrderedSet { .. } if !matches!(value, Value::Null) => {
                 crate::memsize::value_bytes(value)
             }
+            Acc::ArrayAgg { .. } => crate::memsize::value_bytes(value),
             _ => 0,
         }
     }
@@ -479,6 +498,18 @@ impl Acc {
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
             Acc::Bool { cur, .. } => cur.map_or(Value::Null, Value::Bool),
             Acc::Bit { cur, .. } => cur.map_or(Value::Null, Value::Int),
+            Acc::ArrayAgg {
+                elems,
+                seen,
+                nested,
+                ..
+            } => {
+                if seen {
+                    finalize_array_agg(nested, elems)
+                } else {
+                    Value::Null
+                }
+            }
             // json_agg/jsonb_agg: NULL over an empty group; else the JSON array (json: PG's
             // `", "`-joined element texts; jsonb: the canonical array).
             Acc::JsonAgg {
@@ -670,4 +701,73 @@ pub(crate) fn push_json_object_agg_pair(out: &mut String, i: usize, key: &str, v
         Value::Json(t) => out.push_str(t),
         _ => out.push_str("null"),
     }
+}
+
+/// Validate one input of array_agg over arrays (PostgreSQL `accumArrayResultArr`, aggregates.md §23):
+/// a NULL is 22004, an empty first input 2202E, a result past `MAXDIM` 54000, and an input whose shape
+/// differs from the first's 2202E. The first input records the shape.
+fn check_array_agg_input(shape: &mut Option<(Vec<usize>, Vec<i32>)>, value: &Value) -> Result<()> {
+    let arr = match value {
+        Value::Null => {
+            return Err(EngineError::new(
+                SqlState::NullValueNotAllowed,
+                "cannot accumulate null arrays",
+            ));
+        }
+        Value::Array(a) => a,
+        _ => unreachable!("the resolver gives a nested array_agg an array operand"),
+    };
+    match shape {
+        None => {
+            if arr.ndim() == 0 {
+                return Err(EngineError::new(
+                    SqlState::ArraySubscriptError,
+                    "cannot accumulate empty arrays",
+                ));
+            }
+            if arr.ndim() + 1 > 6 {
+                return Err(EngineError::new(
+                    SqlState::ProgramLimitExceeded,
+                    format!(
+                        "number of array dimensions ({}) exceeds the maximum allowed (6)",
+                        arr.ndim() + 1
+                    ),
+                ));
+            }
+            *shape = Some((arr.dims.clone(), arr.lbounds.clone()));
+        }
+        Some((dims, lbounds)) => {
+            if &arr.dims != dims || &arr.lbounds != lbounds {
+                return Err(EngineError::new(
+                    SqlState::ArraySubscriptError,
+                    "cannot accumulate arrays of different dimensionality",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// array_agg's result over a non-empty group's inputs (aggregates.md §23): a 1-D array of the inputs,
+/// or — over array inputs, whose shapes the fold has already matched — the inputs stacked into one
+/// more dimension (lower bound 1).
+pub(crate) fn finalize_array_agg(nested: bool, elems: Vec<Value>) -> Value {
+    if !nested {
+        return Value::Array(ArrayVal::one_dim(elems));
+    }
+    let n = elems.len();
+    let mut out = ArrayVal::empty();
+    for (i, v) in elems.into_iter().enumerate() {
+        let Value::Array(a) = v else {
+            unreachable!("a nested array_agg holds only arrays")
+        };
+        if i == 0 {
+            out.dims = std::iter::once(n).chain(a.dims.iter().copied()).collect();
+            out.lbounds = std::iter::once(1)
+                .chain(a.lbounds.iter().copied())
+                .collect();
+        }
+        out.elements.extend(a.elements);
+    }
+    Value::Array(out)
 }
