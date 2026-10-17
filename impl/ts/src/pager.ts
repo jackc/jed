@@ -95,6 +95,9 @@ export class Pager {
   private acknowledgedMeta = "";
   private validatedMeta: Uint8Array | null = null;
   private validatedPages: Set<number> | null = null;
+  // trustMeta is set on a page client's pager: the owner validated the meta it serves (or wrote it), so
+  // the client adopts it without re-reading its manifest pages (spec/design/page-service.md §5.3).
+  trustMeta = false;
 
   private constructor(store: BlockStore, pageSize: number, allocatedPages: number) {
     this.store = store;
@@ -302,6 +305,7 @@ export class Pager {
   }
 
   cachedValidation(meta: Uint8Array): Set<number> | null {
+    if (this.trustMeta) return new Set();
     const cached = this.validatedMeta;
     if (cached === null || cached.length !== meta.length) return null;
     for (let i = 0; i < meta.length; i++) if (cached[i] !== meta[i]) return null;

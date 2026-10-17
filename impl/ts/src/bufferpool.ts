@@ -84,6 +84,14 @@ export class BufferPool {
     return this.slots.length;
   }
 
+  // invalidateAll drops every cached page — a page client told by the owner that its whole cache may be
+  // stale (spec/pageservice/README.md §3.2).
+  invalidateAll(): void {
+    this.slots = [];
+    this.index = new Map();
+    this.hand = 0;
+  }
+
   // invalidate drops any cached entry for page — required when a commit REWRITES a page in place, which
   // happens when within-session compaction (a reclaim domain — temp, or an in-memory database with
   // reclamation on) hands a freed page id back to a new node: the pool caches by page id, so the stale

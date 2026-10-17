@@ -15,6 +15,13 @@ START_TIMEOUT = 15
 COMMAND_TIMEOUT = 10
 
 class Actor
+  # The per-command reply deadline; the page-service benchmark (mise-tasks/bench/page_service) raises it.
+  class << self
+    attr_writer :command_timeout
+
+    def command_timeout = @command_timeout || COMMAND_TIMEOUT
+  end
+
   def initialize(core, action, path)
     command = case core
               when "rust" then [File.join(ROOT, "impl/rust/target/release/process_actor")]
@@ -30,7 +37,7 @@ class Actor
   def command(name, argument = "")
     @stdin.puts(argument.empty? ? name : "#{name}\t#{argument}")
     @stdin.flush
-    parse(read_line(COMMAND_TIMEOUT))
+    parse(read_line(Actor.command_timeout))
   end
 
   def kill
@@ -42,7 +49,7 @@ class Actor
   def close
     return unless @wait.alive?
     command("CLOSE")
-    @wait.join(COMMAND_TIMEOUT) or raise "actor did not exit after CLOSE"
+    @wait.join(Actor.command_timeout) or raise "actor did not exit after CLOSE"
     close_pipes
   end
 
@@ -73,6 +80,9 @@ class Actor
   end
 end
 
+# Loaded as a library (the page-service benchmark reuses Actor), the corpus run below is skipped.
+return if ENV["JED_PROCESS_DRIVER_LIBRARY"]
+
 def actor_command(step, dir)
   command = step.fetch("command").upcase
   argument = if step.fetch("command") == "attach"
@@ -84,6 +94,14 @@ def actor_command(step, dir)
                step.fetch("argument", "").to_s
              end
   [command, argument]
+end
+
+def step_satisfied?(step, result)
+  if (expected = step["expect_error"])
+    result[0] == :error && result[1] == expected
+  else
+    result[0] == :ok && result[1] == step.fetch("expect", "")
+  end
 end
 
 def run_scenario(path, first_core, second_core)
@@ -122,6 +140,16 @@ def run_scenario(path, first_core, second_core)
           end
           wire, argument = actor_command(step, dir)
           result = actor.command(wire, argument)
+          # `retry_ms`: an outcome that holds only eventually, such as an owner observing a page
+          # client's asynchronous end_read (spec/pageservice/README.md §6.3), is retried until the
+          # step's expectation holds or the bound passes.
+          if (retry_ms = step["retry_ms"])
+            deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + retry_ms / 1000.0
+            until step_satisfied?(step, result) || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+              sleep 0.02
+              result = actor.command(wire, argument)
+            end
+          end
           if expected = step["expect_error"]
             unless result[0] == :error && result[1] == expected
               raise "expected #{expected}, got #{result.inspect}"

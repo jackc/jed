@@ -27,6 +27,9 @@ const (
 	leaseShared
 	leaseExclusive
 	leasePoisoned
+	// leaseServiceOwner is the page-service owner (page-service.md §4.1): presence EX for the whole
+	// tenure and no join window, like exclusive, plus a serving endpoint.
+	leaseServiceOwner
 )
 
 type lockFiles struct {
@@ -125,7 +128,8 @@ func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *ui
 	}
 
 	state := leaseShared
-	if mode == LockingExclusive {
+	// Creating under LockingService takes presence EX like exclusive: the creator is the owner.
+	if mode == LockingExclusive || mode == LockingService {
 		for {
 			if err := lockUntil(host, files.transition, true, deadline, path, false); err != nil {
 				_ = host.unlock(files.arrival)
@@ -139,6 +143,9 @@ func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *ui
 			}
 			if ok {
 				state = leaseExclusive
+				if mode == LockingService {
+					state = leaseServiceOwner
+				}
 				break
 			}
 			if err := checkLockDeadline(host, deadline, path, false); err != nil {
@@ -184,7 +191,7 @@ func (c *fileCoordinator) checkPID() error {
 
 func (c *fileCoordinator) startProbe(tick func()) {
 	c.started.Store(true)
-	if c.lease() == leaseExclusive {
+	if c.lease() == leaseExclusive || c.lease() == leaseServiceOwner {
 		close(c.done)
 		return
 	}
@@ -334,8 +341,11 @@ func resolvedLocking(mode Locking) (Locking, error) {
 	if mode == LockingAuto {
 		mode = LockingShared
 	}
-	if mode > LockingNone {
+	if mode > LockingService {
 		return 0, newError(FeatureNotSupported, "unknown file locking mode")
+	}
+	if mode == LockingService && !pageServiceSupported() {
+		return 0, newError(FeatureNotSupported, "the page service is unavailable on "+runtime.GOOS)
 	}
 	if !osLocksSupported() && mode != LockingNone {
 		return 0, newError(FeatureNotSupported, "file locking is unavailable on "+runtime.GOOS)

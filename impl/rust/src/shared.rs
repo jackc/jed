@@ -93,6 +93,13 @@ use std::cell::RefCell;
 #[derive(Default)]
 struct LiveRegistry {
     counts: BTreeMap<u64, usize>,
+    /// A page-service owner's published meta and invalidation window (spec/pageservice/README.md
+    /// §4), kept here so it changes under the same lock as reader pins and the published root.
+    #[cfg(unix)]
+    service: Option<crate::pageservice::owner::ServiceWindow>,
+    /// A page client's owner pins (README.md §6.3): one per version a local reader pins.
+    #[cfg(unix)]
+    client: Option<crate::pageservice::client::ClientLink>,
 }
 
 impl LiveRegistry {
@@ -105,6 +112,11 @@ impl LiveRegistry {
             *c -= 1;
             if *c == 0 {
                 self.counts.remove(&version);
+                // A page client releases its owner pin when the version's last local reader ends.
+                #[cfg(unix)]
+                if let Some(link) = &mut self.client {
+                    link.release(version);
+                }
             }
         }
     }
@@ -114,6 +126,9 @@ impl LiveRegistry {
         self.counts.keys().next().copied()
     }
 }
+
+/// A pinned committed snapshot, the attached roots pinned with it, and its registered version.
+type PinnedRoots = (Arc<Snapshot>, HashMap<String, Arc<Snapshot>>, u64);
 
 /// The published committed root (spec/design/transactions.md §2): the file `Snapshot`. Held under one
 /// lock so a reader pins it while a concurrent commit swaps in a new one — a published snapshot is
@@ -293,6 +308,11 @@ pub(crate) struct Storage {
     files: Option<Arc<dyn crate::filehost::FileHost>>,
     /// Whether this handle has made the file's directory entry durable ([`Storage::sync_directory_once`]).
     dir_synced: bool,
+    /// Set on a page-service owner's main domain: each file commit records its meta page and the
+    /// page indices it wrote in `last_commit`, which publication hands to the service window
+    /// (spec/pageservice/README.md §4).
+    record_commits: bool,
+    last_commit: Option<(Vec<u8>, Vec<u32>)>,
 }
 
 /// The `max_storage_bytes` state of one domain (memory.md §8.1–§8.3, §8.7): the limit, plus what
@@ -389,6 +409,8 @@ impl Storage {
             live: crate::format::LiveCount::default(),
             files: None,
             dir_synced: false,
+            record_commits: false,
+            last_commit: None,
         }
     }
 
@@ -772,6 +794,15 @@ impl Storage {
         for (index, _) in write.pages.iter().chain(plan.auxiliary.iter()) {
             self.paging.invalidate(*index);
         }
+        if self.record_commits {
+            let written = write
+                .pages
+                .iter()
+                .chain(plan.auxiliary.iter())
+                .map(|(index, _)| *index)
+                .collect();
+            self.last_commit = Some((plan.meta.clone(), written));
+        }
         self.page_count = plan.page_count;
         self.free_pages = plan.persisted;
         self.live_at_compaction = plan.live;
@@ -976,6 +1007,13 @@ pub(crate) struct Shared {
     attachment_count: AtomicUsize,
     /// Native file coordination. `None` for memory or explicit `locking=none`.
     coordinator: Option<Arc<FileCoordinator>>,
+    /// The serving state of a page-service owner (spec/design/page-service.md §4.1); `None` otherwise.
+    #[cfg(unix)]
+    service: Mutex<Option<Arc<crate::pageservice::owner::PageServiceOwner>>>,
+    /// A page client's connection to its owner (page-service.md §4.2); `None` otherwise. At most one
+    /// of `service` and `client` is set, and only under the test-only `Locking::Service`.
+    #[cfg(unix)]
+    client: Option<Arc<crate::pageservice::client::PsConnection>>,
     /// Advances when a foreign txid is adopted; prepared plans clear lazily when this changes.
     plan_epoch: AtomicU64,
     /// The handle's environment (spec/design/environment.md), given in the create/open options: the
@@ -1119,6 +1157,11 @@ impl Shared {
     }
 
     fn has_shared_coordinator(&self) -> bool {
+        // A page client's read begin is its begin_read round trip (README.md §6.3).
+        #[cfg(unix)]
+        if self.client.is_some() {
+            return true;
+        }
         if self
             .coordinator
             .as_ref()
@@ -1170,6 +1213,12 @@ impl Shared {
     /// Adopt foreign main and attachment roots while shared. Each file has its own short commit-SH
     /// gate; the resulting immutable roots are published together after all refreshes complete.
     fn refresh_shared(&self) -> Result<()> {
+        // A page client refreshes only where a read pins its snapshot ([`refresh_and_pin`]): its
+        // begin_read takes an owner pin that the reader that follows must register.
+        #[cfg(unix)]
+        if self.client.is_some() {
+            return Ok(());
+        }
         if !self.has_shared_coordinator() {
             return Ok(());
         }
@@ -1212,6 +1261,155 @@ impl Shared {
             self.reload_attachment_from_pager(&name)?;
         }
         Ok(())
+    }
+
+    /// A read begin that pins its snapshot (locking.md §5.1): refresh from the other processes, then
+    /// pin the latest committed roots like [`pin_latest`](Self::pin_latest). A page client's
+    /// begin_read and the local pin that keeps its owner pin happen under one registry lock, so the
+    /// owner pin can never be released in between (spec/pageservice/README.md §6.3).
+    fn refresh_and_pin(&self) -> Result<PinnedRoots> {
+        #[cfg(unix)]
+        if let Some(conn) = &self.client {
+            let mut live = self.client_refresh(conn)?;
+            let r = self.roots.read().expect("roots lock not poisoned");
+            let version = r.committed.txid;
+            live.register(version);
+            return Ok((r.committed.clone(), r.attached.clone(), version));
+        }
+        self.refresh_shared()?;
+        Ok(self.pin_latest())
+    }
+
+    /// A page client's read begin (README.md §3.2, §6.3): one begin_read round trip, then the cache
+    /// invalidation and, when the owner's version moved (or the whole cache was invalidated), the
+    /// adoption of its snapshot. Returns with the registry lock held and the reply's pin recorded,
+    /// for the caller to register the reader that keeps it. Serialized by the connection's cache lock,
+    /// so the cache always corresponds to exactly one adopted version.
+    #[cfg(unix)]
+    fn client_refresh(
+        &self,
+        conn: &Arc<crate::pageservice::client::PsConnection>,
+    ) -> Result<std::sync::MutexGuard<'_, LiveRegistry>> {
+        let mut cache = conn.cache.lock().expect("client cache lock poisoned");
+        let begun = conn.begin_read(cache.incarnation, cache.adopted)?;
+        let mut live = self.live.lock().expect("live lock not poisoned");
+        live.client
+            .as_mut()
+            .expect("a page client's registry links its connection")
+            .take(begun.txid);
+        let all = begun.invalidate == crate::pageservice::codec::INVALIDATE_ALL
+            || begun.incarnation != cache.incarnation;
+        let paging = self
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .paging
+            .clone();
+        if all {
+            paging.invalidate_all();
+        } else {
+            for index in &begun.indices {
+                paging.invalidate(*index);
+            }
+        }
+        if !all && begun.txid <= cache.adopted {
+            return Ok(live);
+        }
+        conn.set_meta(begun.meta);
+        paging.pager().refresh_allocated_pages()?;
+        let engine = Engine::open_shared_paging(Arc::clone(&paging), &self.env)?;
+        {
+            let mut storage = self.storage.lock().expect("storage lock not poisoned");
+            storage.page_count = engine.page_count;
+            storage.free_pages = engine.free_pages.clone();
+            storage.live_at_compaction = engine.live_at_compaction;
+            storage.free_gen_txid = engine.free_gen_txid;
+            storage.live = engine.live;
+        }
+        self.roots
+            .write()
+            .expect("roots lock not poisoned")
+            .committed = Arc::new(engine.committed);
+        cache.incarnation = begun.incarnation;
+        cache.adopted = begun.txid;
+        self.plan_epoch.fetch_add(1, Ordering::Release);
+        Ok(live)
+    }
+
+    /// Pin the committed snapshot for a page-service connection (README.md §3.2): the pin, the
+    /// snapshot, its meta page, and the invalidation list are read under the registry lock, which
+    /// publication also takes, so they are consistent. `None` when this core does not serve.
+    #[cfg(unix)]
+    pub(crate) fn page_service_begin_read(
+        &self,
+        pins: &mut crate::pageservice::owner::ConnPins,
+        incarnation: &crate::pageservice::codec::Id16,
+        last_txid: u64,
+    ) -> Option<crate::pageservice::codec::ReadBegun> {
+        let mut live = self.live.lock().expect("live lock not poisoned");
+        let txid = self
+            .roots
+            .read()
+            .expect("roots lock not poisoned")
+            .committed
+            .txid;
+        let window = live.service.as_ref()?;
+        let (invalidate, indices) = window.invalidation(incarnation, last_txid, txid);
+        let begun = crate::pageservice::codec::ReadBegun {
+            incarnation: window.incarnation(),
+            txid,
+            invalidate,
+            indices,
+            meta: window.meta().to_vec(),
+        };
+        live.register(txid);
+        *pins.entry(txid).or_insert(0) += 1;
+        Some(begun)
+    }
+
+    /// The page count bounding a `read_pages` that names `txid`, or `None` when the connection does
+    /// not pin it (README.md §3.3).
+    #[cfg(unix)]
+    pub(crate) fn page_service_page_count(
+        &self,
+        pins: &crate::pageservice::owner::ConnPins,
+        txid: u64,
+    ) -> Option<u32> {
+        let live = self.live.lock().expect("live lock not poisoned");
+        if pins.get(&txid).copied().unwrap_or(0) == 0 {
+            return None;
+        }
+        live.service.as_ref().map(|window| window.page_count())
+    }
+
+    /// Release one of a connection's pins on `txid` (README.md §3.4); `false` when it holds none.
+    #[cfg(unix)]
+    pub(crate) fn page_service_end_read(
+        &self,
+        pins: &mut crate::pageservice::owner::ConnPins,
+        txid: u64,
+    ) -> bool {
+        let mut live = self.live.lock().expect("live lock not poisoned");
+        let Some(count) = pins.get_mut(&txid) else {
+            return false;
+        };
+        *count -= 1;
+        if *count == 0 {
+            pins.remove(&txid);
+        }
+        live.deregister(txid);
+        true
+    }
+
+    /// Release every pin of a closed connection.
+    #[cfg(unix)]
+    pub(crate) fn page_service_release_pins(&self, pins: &mut crate::pageservice::owner::ConnPins) {
+        let mut live = self.live.lock().expect("live lock not poisoned");
+        for (txid, count) in std::mem::take(pins) {
+            for _ in 0..count {
+                live.deregister(txid);
+            }
+        }
     }
 
     /// Reload the newest CRC-valid meta through this handle's existing pager. Caller holds the
@@ -1429,7 +1627,8 @@ impl Shared {
                 }
             }
         }
-        let live = self.live.lock().expect("live lock not poisoned");
+        #[allow(unused_mut)]
+        let mut live = self.live.lock().expect("live lock not poisoned");
         if live.oldest().is_some() {
             return Err(EngineError::new(
                 SqlState::ObjectInUse,
@@ -1449,6 +1648,8 @@ impl Shared {
                 .expect("attachment exists (checked by compact)")
         };
         let compacted = self.with_storage(lname, |st| st.compact(&prev, prev.txid + 1))?;
+        #[cfg(unix)]
+        let compacted_txid = compacted.txid;
         let mut roots = self.roots.write().expect("roots lock not poisoned");
         if main {
             roots.committed = Arc::new(compacted);
@@ -1458,6 +1659,25 @@ impl Shared {
                 .insert(lname.to_string(), Arc::new(compacted));
         }
         drop(roots);
+        // A page-service owner restarts its invalidation window at the compacted snapshot and reads
+        // pages from the replacement file (spec/pageservice/README.md §4, §6.2).
+        #[cfg(unix)]
+        if main && live.service.is_some() {
+            let paging = self
+                .storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .paging
+                .clone();
+            let meta = crate::pageservice::owner::committed_meta(&paging, compacted_txid)?;
+            live.service
+                .as_mut()
+                .expect("checked above")
+                .reset(compacted_txid, meta);
+            if let Some(owner) = self.service.lock().expect("service lock poisoned").as_ref() {
+                owner.reopen_file()?;
+            }
+        }
         drop(live);
         self.plan_epoch.fetch_add(1, Ordering::Release);
         Ok(())
@@ -1783,10 +2003,25 @@ impl Shared {
         // Take `live` THEN `roots` (the same order as `pin_latest`), so a reader registering a pin is
         // serialized against this publish (transactions.md §8): it either sees the old committed and is
         // counted at that version, or sees the new one — never a version the reclamation watermark misses.
-        let _live = self.live.lock().expect("live lock not poisoned");
+        // A page-service owner publishes the commit's meta page and written indices with the root
+        // (spec/pageservice/README.md §6.2).
+        #[cfg(unix)]
+        let commit = self
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .last_commit
+            .take();
+        #[allow(unused_mut)]
+        let mut live = self.live.lock().expect("live lock not poisoned");
+        #[cfg(unix)]
+        if let (Some(window), Some((meta, written))) = (live.service.as_mut(), commit) {
+            window.published(committed.txid, meta, written);
+        }
         let mut r = self.roots.write().expect("roots lock not poisoned");
         r.committed = committed;
         r.attached = attached;
+        drop(live);
     }
 
     /// Publish new attached roots beside the unchanged main root (an attachment-only commit,
@@ -1964,6 +2199,26 @@ impl Shared {
     }
 }
 
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // A page-service owner stops serving first: clients see EOF and the endpoint and owner
+        // record are removed while presence EX is still held (the coordinator drops after this).
+        #[cfg(unix)]
+        if let Some(owner) = self
+            .service
+            .get_mut()
+            .ok()
+            .and_then(|service| service.take())
+        {
+            owner.shutdown();
+        }
+        #[cfg(unix)]
+        if let Some(conn) = &self.client {
+            conn.close();
+        }
+    }
+}
+
 /// An RAII reader-liveness pin for a streaming cursor (spec/design/streaming.md §5): registered in
 /// the [`LiveRegistry`] when the cursor is built ([`Shared::reader_pin`]) and deregistered on `Drop`
 /// (cursor `close`/drop, or the transient mint-a-session `Database::query` whose session is dropped
@@ -2043,6 +2298,21 @@ impl Database {
     }
 
     fn from_engine_coordinated(engine: Engine, coordinator: Option<FileCoordinator>) -> Database {
+        Self::from_engine_parts(
+            engine,
+            coordinator,
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    /// [`from_engine_coordinated`](Self::from_engine_coordinated), plus a page client's link to its
+    /// owner (spec/pageservice/README.md §6.3) when the engine reads through the page service.
+    fn from_engine_parts(
+        engine: Engine,
+        coordinator: Option<FileCoordinator>,
+        #[cfg(unix)] client: Option<crate::pageservice::client::ClientLink>,
+    ) -> Database {
         let env = engine.session.env.clone();
         let coordinator = coordinator.map(Arc::new);
         let paging = engine
@@ -2068,6 +2338,8 @@ impl Database {
             live: engine.live,
             files: None,
             dir_synced: false,
+            record_commits: false,
+            last_commit: None,
         };
         let shared = Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -2078,11 +2350,19 @@ impl Database {
             writer_free: Condvar::new(),
             held_coordinators: Mutex::new(Vec::new()),
             held_coordinator_count: AtomicUsize::new(0),
-            live: Mutex::new(LiveRegistry::default()),
+            #[cfg(unix)]
+            client: client.as_ref().map(|link| Arc::clone(&link.conn)),
+            live: Mutex::new(LiveRegistry {
+                #[cfg(unix)]
+                client,
+                ..LiveRegistry::default()
+            }),
             storage: Mutex::new(storage),
             attachments: Mutex::new(HashMap::new()),
             attachment_count: AtomicUsize::new(0),
             coordinator,
+            #[cfg(unix)]
+            service: Mutex::new(None),
             plan_epoch: AtomicU64::new(0),
             env,
         });
@@ -2303,12 +2583,17 @@ impl Database {
                     },
                 )?;
                 engine.set_environment(env);
+                let canonical = canonical.to_path_buf();
                 let db = Database::from_engine_coordinated(engine, coordinator);
                 db.0.storage
                     .lock()
                     .expect("storage lock not poisoned")
                     .budget
                     .limit = opts.max_storage_bytes;
+                if opts.locking == Locking::Service {
+                    // The creator took presence EX: it is the owner and serves (README.md §6.1).
+                    return start_service_owner(db, &canonical);
+                }
                 Ok(db)
             }
             // in-memory never fsyncs; skip_fsync is a no-op
@@ -2333,6 +2618,9 @@ impl Database {
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
+        if opts.locking == Locking::Service {
+            return open_service(path.as_ref(), opts);
+        }
         let max_storage_bytes = opts.max_storage_bytes;
         let coordinator =
             FileCoordinator::open(path.as_ref(), opts.locking, opts.file_lock_timeout_ms)?;
@@ -2408,6 +2696,13 @@ impl Database {
         let file_backing: Option<(Storage, Snapshot, Option<Arc<FileCoordinator>>)> = if source.file
         {
             let path = source.path.as_ref().expect("a file source carries a path");
+            if source.locking == Locking::Service {
+                // Attachments join the page service with its write path (page-service.md §16 phase 3).
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "file attachments do not support the page service yet",
+                ));
+            }
             let coordinator =
                 FileCoordinator::open(path, source.locking, source.file_lock_timeout_ms)?
                     .map(Arc::new);
@@ -2468,6 +2763,8 @@ impl Database {
                 live: engine.live,
                 files,
                 dir_synced: false,
+                record_commits: false,
+                last_commit: None,
             };
             Some((storage, engine.committed, coordinator))
         } else {
@@ -2702,6 +2999,121 @@ impl Database {
     }
 }
 
+/// Make a freshly created or opened `db` the page-service owner of the database at `path`
+/// (spec/pageservice/README.md §6.2): draw the incarnation, record the committed meta page, then
+/// write the owner record, bind the endpoint, and start accepting. The caller holds presence EX.
+#[cfg(unix)]
+fn start_service_owner(db: Database, path: &Path) -> Result<Database> {
+    use crate::pageservice::owner;
+    let shared = &db.0;
+    let incarnation = owner::new_incarnation()?;
+    let (paging, page_size, read_only) = {
+        let mut storage = shared.storage.lock().expect("storage lock not poisoned");
+        storage.record_commits = true;
+        (storage.paging.clone(), storage.page_size, storage.read_only)
+    };
+    {
+        let mut live = shared.live.lock().expect("live lock not poisoned");
+        let txid = shared
+            .roots
+            .read()
+            .expect("roots lock not poisoned")
+            .committed
+            .txid;
+        let meta = owner::committed_meta(&paging, txid)?;
+        live.service = Some(owner::ServiceWindow::new(incarnation, txid, meta));
+    }
+    let serving = owner::PageServiceOwner::start(shared, path, incarnation, page_size, read_only)?;
+    *shared.service.lock().expect("service lock poisoned") = Some(serving);
+    Ok(db)
+}
+
+#[cfg(not(unix))]
+fn start_service_owner(_db: Database, _path: &Path) -> Result<Database> {
+    Err(crate::coordinator::service_unsupported())
+}
+
+/// Open `path` under the test-only `Locking::Service` (spec/pageservice/README.md §6.1): as the
+/// serving owner, or as a read-only page client of the owner.
+#[cfg(unix)]
+fn open_service(path: &Path, opts: OpenOptions) -> Result<Database> {
+    use crate::pageservice::election::{Election, elect};
+    let real = crate::coordinator::resolve_open_path(path)?;
+    match elect(real.clone(), opts.file_lock_timeout_ms)? {
+        Election::Owner(coordinator) => {
+            let max_storage_bytes = opts.max_storage_bytes;
+            let engine = Engine::open_with_options(
+                &real,
+                OpenOptions {
+                    // Coordination is the election's presence EX.
+                    locking: Locking::None,
+                    ..opts
+                },
+            )?;
+            let db = Database::from_engine_coordinated(engine, Some(coordinator));
+            db.0.storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .budget
+                .limit = max_storage_bytes;
+            start_service_owner(db, &real)
+        }
+        Election::Client(conn) => {
+            let result = open_page_client(&conn, opts);
+            if result.is_err() {
+                conn.close();
+            }
+            result
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn open_service(_path: &Path, _opts: OpenOptions) -> Result<Database> {
+    Err(crate::coordinator::service_unsupported())
+}
+
+/// Build a read-only database over a connected page client (README.md §6.3): one begin_read pins and
+/// adopts the owner's committed snapshot, the ordinary loader reads the catalog skeleton through the
+/// service, and the open's pin is released — no local reader follows the open; every read begins
+/// with its own begin_read.
+#[cfg(unix)]
+fn open_page_client(
+    conn: &Arc<crate::pageservice::client::PsConnection>,
+    opts: OpenOptions,
+) -> Result<Database> {
+    use crate::pageservice::client::{ClientLink, ClientPins, ServiceBlockStore};
+    let begun = conn.begin_read([0; 16], 0)?;
+    let mut link = ClientLink {
+        conn: Arc::clone(conn),
+        pins: ClientPins::default(),
+    };
+    link.take(begun.txid);
+    {
+        let mut cache = conn.cache.lock().expect("client cache lock poisoned");
+        cache.incarnation = begun.incarnation;
+        cache.adopted = begun.txid;
+    }
+    conn.set_meta(begun.meta);
+    let loaded = (|| {
+        let mut pager = crate::pager::Pager::from_store(Box::new(ServiceBlockStore {
+            conn: Arc::clone(conn),
+        }))?;
+        pager.set_trust_meta();
+        let capacity = crate::paging::cache_leaves(opts.cache_bytes, pager.page_size());
+        Engine::open_paged(pager, capacity, &opts.environment)
+    })();
+    link.release(begun.txid);
+    let mut engine = loaded?;
+    engine.path = Some(conn.db_path().to_path_buf());
+    engine.spill = Some(crate::spillhost::os_spill_host(std::env::temp_dir()));
+    engine.read_only = true;
+    if opts.work_mem != 0 {
+        engine.session.work_mem = opts.work_mem;
+    }
+    Ok(Database::from_engine_parts(engine, None, Some(link)))
+}
+
 /// The access mode a [`Session`] was minted with (spec/design/session.md §2.4/§5.1). Distinct from
 /// the privilege envelope (§5.3): `ReadOnly` is the coarse snapshot read-only mode (a write is
 /// `25006`), the analogue of the old `ReadHandle`.
@@ -2902,15 +3314,16 @@ impl Session {
         if !self.refresh_on_next_read {
             return Ok(());
         }
-        self.shared.refresh_shared()?;
-        if let Some(version) = self.pinned.take() {
+        // Pin the new version before releasing the old one: a page client's owner pin on the new
+        // version is kept by this registration (spec/pageservice/README.md §6.3).
+        let (snap, attached, version) = self.shared.refresh_and_pin()?;
+        if let Some(old) = self.pinned.take() {
             self.shared
                 .live
                 .lock()
                 .expect("live lock not poisoned")
-                .deregister(version);
+                .deregister(old);
         }
-        let (snap, attached, version) = self.shared.pin_latest();
         self.base_version = version;
         self.engine.committed = (*snap).clone();
         self.engine.attached_committed = attached;
@@ -3040,10 +3453,9 @@ impl Session {
             self.gate_held = true;
             self.refresh_committed();
         } else {
-            self.shared.refresh_shared()?;
             // A READ ONLY block pins its snapshot atomically (load+register under one lock, §8), so the
             // version it reads can never be reclaimed in a load→register gap.
-            let (snap, attached, version) = self.shared.pin_latest();
+            let (snap, attached, version) = self.shared.refresh_and_pin()?;
             self.base_version = version;
             self.engine.committed = (*snap).clone();
             self.engine.attached_committed = attached;

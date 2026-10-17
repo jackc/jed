@@ -39,7 +39,10 @@ import {
   registerFileCompactor,
 } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
-import { FileCoordinator } from "./coordinator.ts";
+import { canonicalOpenPath, FileCoordinator, osLocks, resolvedLocking } from "./coordinator.ts";
+import { openPageClient } from "./pageservice/client.ts";
+import { electService } from "./pageservice/election.ts";
+import { ServiceOwner } from "./pageservice/owner.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -59,7 +62,11 @@ export type DatabaseOptions = { pageSize?: number; noSync?: boolean; environment
 // commits write identical bytes in the same order but skip the fdatasync barrier. DEV/TESTING ONLY —
 // durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database (no
 // path) which never fsyncs. Byte/cost/result-neutral; default false.
-export type Locking = "auto" | "shared" | "exclusive" | "none";
+// "service" is the TEST-ONLY page-service mode (spec/design/page-service.md §16): the opener becomes the
+// owner when it can take presence EX, otherwise a read-only page client of the owner. It exists until
+// the page service's handoff phase replaces shared mode; never mix it with shared or exclusive openers
+// of one database. Unix only (0A000 elsewhere).
+export type Locking = "auto" | "shared" | "exclusive" | "none" | "service";
 
 export type CreateOptions = {
   path?: string;
@@ -225,6 +232,13 @@ export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): 
 // attachments too.
 registerFileAttachOpener((source, readOnly, files, environment) => {
   const path = source.path!;
+  if (source.locking === "service") {
+    // Attachments join the page service with its write path (page-service.md §16 phase 3).
+    throw engineError(
+      "feature_not_supported",
+      "file attachments do not support the page service yet",
+    );
+  }
   const coordinator = FileCoordinator.open(path, source.locking, source.fileLockTimeoutMs);
   try {
     coordinator?.lockCommitShared();
@@ -431,6 +445,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
         environment: opts.environment,
       });
       engine.storageBudget.limit = maxStorageBytes;
+      if (opts.locking === "service") return startServiceOwner(engine, coordinator!);
       return Database.fromEngine(engine, coordinator);
     } catch (error) {
       coordinator?.close();
@@ -444,6 +459,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
 // the host Database handle with its default session (the back-compat bridge, spec/design/session.md §2.4).
 export function openDatabase(path: string, opts: OpenOptions = {}): Database {
+  if (opts.locking === "service") return openServiceDatabase(path, opts);
   const coordinator = FileCoordinator.open(path, opts.locking, opts.fileLockTimeoutMs);
   try {
     coordinator?.lockCommitShared();
@@ -458,6 +474,47 @@ export function openDatabase(path: string, opts: OpenOptions = {}): Database {
     coordinator?.close();
     throw error;
   }
+}
+
+// openServiceDatabase opens path under the test-only `locking = service` (spec/pageservice/README.md
+// §6.1): as the serving owner when the election takes presence EX, otherwise as a read-only page client.
+function openServiceDatabase(path: string, opts: OpenOptions): Database {
+  resolvedLocking("service");
+  const real = canonicalOpenPath(path);
+  const election = electService(osLocks, real, opts.fileLockTimeoutMs);
+  const environment = opts.environment ?? new Environment();
+  if (election.client !== null) {
+    const client = election.client;
+    try {
+      const engine = openPageClient(client, opts, environment);
+      return Database.fromEngine(engine, null, { client });
+    } catch (error) {
+      client.close();
+      throw error;
+    }
+  }
+  const coordinator = FileCoordinator.fromElection(osLocks, real, election.owner);
+  let engine: Engine;
+  try {
+    engine = open(real, { ...opts, locking: "none", environment });
+  } catch (error) {
+    coordinator.close();
+    throw error;
+  }
+  return startServiceOwner(engine, coordinator);
+}
+
+// startServiceOwner lifts an opened or created engine into a serving owner's handle; the caller's
+// coordinator holds presence EX. A failure to serve closes the handle (releasing presence).
+function startServiceOwner(engine: Engine, coordinator: FileCoordinator): Database {
+  let service: ServiceOwner;
+  try {
+    service = ServiceOwner.start(engine, coordinator.path);
+  } catch (error) {
+    Database.fromEngine(engine, coordinator).close();
+    throw error;
+  }
+  return Database.fromEngine(engine, coordinator, { service });
 }
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an

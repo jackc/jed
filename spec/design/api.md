@@ -147,6 +147,13 @@ and commit append-only. `exclusive` never opens a join window. `none` is the uns
 externally coordinated or static file; network filesystems require that external coordinator. An
 unsupported requested mode fails closed `0A000`.
 
+A fifth value, **`service`**, is **test-only** until the page service's handoff phase replaces shared
+mode ([page-service.md](page-service.md) §16): the opener that takes `presence EX` becomes the
+page-service owner and serves a same-user endpoint; any other opener becomes a read-only page client
+of it (phase 2), whose writes are `25006`. Unix only (`0A000` elsewhere); file attachments reject it
+(`0A000`). It is spelled `Locking::Service` / `LockingService` / `"service"`, is never documented as
+a production option, and must never share a database with a shared or exclusive opener.
+
 `file_lock_timeout_ms` (default **5000**, `0` = fail immediately) bounds shared join / exclusive open
 and returns `55006` on expiry. It is distinct from the session `lock_timeout_ms` (`0` = no deadline),
 which bounds the cross-process writer gate and returns `55P03`. Both use monotonic host time and are

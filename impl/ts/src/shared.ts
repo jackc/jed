@@ -114,6 +114,46 @@ import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
 import { renderIn, type Value } from "./value.ts";
 
+// ServiceOwnerHandle is a serving page-service owner as the core sees it (spec/design/page-service.md
+// §4.1, §14; the Node implementation is pageservice/owner.ts, injected by file.ts so this module stays
+// browser-clean). Its lock orders client pins against the core's commit publication and watermark.
+export interface ServiceOwnerHandle {
+  lock(): void;
+  unlock(): void;
+  // oldestPinnedLocked is the oldest version any client connection pins, or null (lock held).
+  oldestPinnedLocked(): bigint | null;
+  // published records a main-database commit: its version, meta page, and written page indices.
+  published(txid: bigint, meta: Uint8Array, written: number[]): void;
+  // compactedLocked resets the service after compaction published txid over paging (lock held).
+  compactedLocked(txid: bigint, paging: SharedPaging): void;
+  // close stops serving (clients see EOF) and removes the endpoint and owner record.
+  close(): void;
+}
+
+// ClientReadBegun is a page client's begin_read reply as the core uses it (spec/pageservice/README.md
+// §3.2): invalidateAll also covers an incarnation change.
+export type ClientReadBegun = {
+  txid: bigint;
+  incarnation: Uint8Array;
+  invalidateAll: boolean;
+  indices: number[];
+  meta: Uint8Array;
+};
+
+// PageClientHandle is a page client as the core sees it (spec/design/page-service.md §4.2; the Node
+// implementation is pageservice/client.ts). held is the set of versions it pins at the owner.
+export interface PageClientHandle {
+  readonly held: Set<bigint>;
+  readonly adopted: bigint;
+  // beginRead runs begin_read and records the pin it carries (a duplicate is released at once).
+  beginRead(): ClientReadBegun;
+  // adopt makes reply's version the client's cache version (its meta then serves pages 0 and 1).
+  adopt(reply: ClientReadBegun): void;
+  // releasePin sends end_read for a held version.
+  releasePin(v: bigint): void;
+  close(): void;
+}
+
 const pathEncoder = new TextEncoder();
 function compareFilePaths(left: string, right: string): number {
   const a = pathEncoder.encode(left);
@@ -185,6 +225,10 @@ class SharedCore {
   // write is 25006. Always false for an in-memory core.
   readOnly = false;
   coordinator: FileCoordinatorHost | null;
+  // service is set on a page-service owner, client on a page client (spec/design/page-service.md §4);
+  // at most one is set, and only under the test-only `locking = service`.
+  service: ServiceOwnerHandle | null = null;
+  client: PageClientHandle | null = null;
   planEpoch = 0;
   // The handle's Environment (spec/design/environment.md §3): fixed at open/create and shared (by
   // reference) by every minted session, attachment, and temp domain — the storage owner's.
@@ -280,7 +324,10 @@ class SharedCore {
     for (const attachment of this.attachments.values()) attachment.coordinator?.checkPid();
   }
 
+  // A page client sends nothing here: only a read begin that pins a local reader talks to the owner
+  // (refreshAndPin), since a pin taken where no reader follows would leak (README §6.3).
   refreshShared(): void {
+    if (this.client !== null) return;
     if (!this.hasSharedCoordinator()) return;
     const coordinator = this.coordinator;
     if (coordinator?.state === "shared") {
@@ -307,6 +354,61 @@ class SharedCore {
       } finally {
         attachedCoordinator.unlockCommit();
       }
+    }
+  }
+
+  // clientRefresh is a page client's read begin (spec/pageservice/README.md §6.3): one begin_read, the
+  // cache invalidation it names, and — when the owner's version moved or the cache was invalidated
+  // wholesale — the adoption of its meta, catalog/interior skeleton, and a new plan epoch. The pin the
+  // reply carries is held for the local reader that follows.
+  private clientRefresh(): void {
+    const client = this.client!;
+    const paging = this.storage.paging;
+    if (paging === null) throw engineError("io_error", "database storage is closed");
+    const reply = client.beginRead();
+    if (reply.invalidateAll) paging.invalidateAll();
+    else for (const index of reply.indices) paging.invalidate(index);
+    if (!reply.invalidateAll && reply.txid <= client.adopted) return;
+    client.adopt(reply);
+    paging.refreshAllocatedPages();
+    const loaded = loadEnginePaged(paging, this.environment);
+    this.storage.pageCount = loaded.pageCount;
+    this.storage.freePages = loaded.freePages;
+    this.storage.live = loaded.live;
+    this.committed = loaded.committed;
+    this.planEpoch++;
+  }
+
+  // refreshAndPin is a read begin that pins a local reader: refresh to the latest committed version and
+  // register it in the live registry, returning it. On a page client this is the begin_read round
+  // trip, and the reply's pin is kept for exactly this registration: the engine thread runs the
+  // refresh and the registration with nothing in between, so no end_read for the version can be sent
+  // before its reader is registered (README §6.3).
+  refreshAndPin(): bigint {
+    if (this.client !== null) this.clientRefresh();
+    else this.refreshShared();
+    const version = this.committed.txid;
+    this.register(version);
+    return version;
+  }
+
+  // releaseIdlePins ends a page client's pins on every version no local reader pins — after an open or
+  // a read begin no reader followed (README §6.3: an idle client pins nothing).
+  releaseIdlePins(): void {
+    const client = this.client;
+    if (client === null) return;
+    for (const v of [...client.held]) if (!this.live.has(v)) client.releasePin(v);
+  }
+
+  // servicePinned is the oldest version a page-service client pins, or null (none, or not an owner).
+  private servicePinned(): bigint | null {
+    const service = this.service;
+    if (service === null) return null;
+    service.lock();
+    try {
+      return service.oldestPinnedLocked();
+    } finally {
+      service.unlock();
     }
   }
 
@@ -435,14 +537,29 @@ class SharedCore {
         `cannot compact database "${name}" while a reader is open`,
       );
     }
-    const prev = main ? this.committed : this.attached.get(lname)!;
-    const compacted = compactStorage(this.storageFor(lname), prev, prev.txid + 1n);
-    if (main) {
-      this.committed = compacted;
-    } else {
-      const attached = new Map(this.attached);
-      attached.set(lname, compacted);
-      this.attached = attached;
+    // A page-service owner holds its lock across the compaction, so no client can pin the old file in
+    // between; a client pin is a reader (55006), exactly like a local one.
+    const service = main ? this.service : null;
+    service?.lock();
+    try {
+      if (service !== null && service.oldestPinnedLocked() !== null) {
+        throw engineError(
+          "object_in_use",
+          `cannot compact database "${name}" while a reader is open`,
+        );
+      }
+      const prev = main ? this.committed : this.attached.get(lname)!;
+      const compacted = compactStorage(this.storageFor(lname), prev, prev.txid + 1n);
+      if (main) {
+        this.committed = compacted;
+        service?.compactedLocked(compacted.txid, this.storage.paging!);
+      } else {
+        const attached = new Map(this.attached);
+        attached.set(lname, compacted);
+        this.attached = attached;
+      }
+    } finally {
+      service?.unlock();
     }
     this.planEpoch++;
   }
@@ -569,7 +686,7 @@ class SharedCore {
   // (attached-databases.md §5): the committing writer holds the writer flag but is not itself in `live`,
   // so an empty registry means no other session can observe a page the commit is about to reclaim.
   hasLiveReaders(): boolean {
-    return this.live.size > 0;
+    return this.live.size > 0 || this.servicePinned() !== null;
   }
 
   // adoptAttachments adopts the in-memory attachment commits commitTx staged, after main persisted and
@@ -607,15 +724,21 @@ class SharedCore {
 
   deregister(version: bigint): void {
     const c = (this.live.get(version) ?? 0) - 1;
-    if (c <= 0) this.live.delete(version);
-    else this.live.set(version, c);
+    if (c <= 0) {
+      this.live.delete(version);
+      // A page client's owner pin on a version lives only while a local reader pins it (README §6.3).
+      if (this.client?.held.has(version)) this.client.releasePin(version);
+    } else this.live.set(version, c);
   }
 
   // oldest is the oldest still-pinned version, or the committed version when no reader is live. The
   // map scan is order-independent (a minimum), so no map iteration order leaks (CLAUDE.md §8).
+  // A page-service owner's client pins count like local readers (spec/pageservice/README.md §4).
   oldest(): bigint {
     let oldest = this.committed.txid;
     for (const v of this.live.keys()) if (v < oldest) oldest = v;
+    const pinned = this.servicePinned();
+    if (pinned !== null && pinned < oldest) oldest = pinned;
     return oldest;
   }
 
@@ -627,6 +750,8 @@ class SharedCore {
   oldestLiveVersion(newTxid: bigint): bigint {
     let oldest = newTxid;
     for (const v of this.live.keys()) if (v < oldest) oldest = v;
+    const pinned = this.servicePinned();
+    if (pinned !== null && pinned < oldest) oldest = pinned;
     return oldest;
   }
 }
@@ -700,7 +825,7 @@ export function registerFileCompactor(fn: FileCompactor): void {
 export type AttachSource = {
   file: boolean;
   path?: string;
-  locking?: "auto" | "shared" | "exclusive" | "none";
+  locking?: "auto" | "shared" | "exclusive" | "none" | "service";
   fileLockTimeoutMs?: number;
   maxStorageBytes?: bigint;
 };
@@ -774,13 +899,22 @@ export class Database {
   // carry the shared paging, so every pinned/cloned snapshot faults clean pages through the one pool
   // (spec/design/pager.md).
   // The engine carries the handle's Environment (its session's), which the shared core adopts.
-  static fromEngine(engine: Engine, coordinator: FileCoordinatorHost | null = null): Database {
+  // pageService carries a page-service owner or client (test-only `locking = service`, file.ts).
+  static fromEngine(
+    engine: Engine,
+    coordinator: FileCoordinatorHost | null = null,
+    pageService: { service?: ServiceOwnerHandle; client?: PageClientHandle } = {},
+  ): Database {
     // v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
     // persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at each
     // commit or they would leak permanently (format.md *Reclamation*).
     engine.reclaimWithinSession = true;
     const core = new SharedCore(engine.committed, engine, coordinator);
     core.readOnly = engine.readOnly;
+    core.service = pageService.service ?? null;
+    core.client = pageService.client ?? null;
+    // No local reader follows an open, so a client's open-time pin is released at once.
+    core.releaseIdlePins();
     coordinator?.startProbe(() => core.coordinationTick());
     return Database.over(core);
   }
@@ -960,9 +1094,8 @@ export class Database {
   // deregister (advancing the watermark), since JS has no destructor. (The old SharedDb.read().)
   readSession(): Session {
     this.core.checkPid();
-    this.core.refreshShared();
-    const snap = this.core.committed; // pin (immutable — no clone)
-    this.core.register(snap.txid);
+    this.core.refreshAndPin();
+    const snap = this.core.committed; // pinned (immutable — no clone)
     const engine = databaseFromSnapshot(snap, this.core);
     // The attached roots are pinned together with the committed root (attached-databases.md §5), so the
     // session sees a consistent cross-database snapshot; it routes attachment persists via the core.
@@ -1006,7 +1139,8 @@ export class Database {
   // independent owns-its-Engine session.)
   session(opts: SessionOptions = {}): Session {
     this.core.checkPid();
-    if (this.core.readOnly) this.core.refreshShared();
+    // A read-only file-backed core mints read-only sessions, pinned at the refreshed version.
+    if (this.core.readOnly) this.core.refreshAndPin();
     const snap = this.core.committed;
     const engine = databaseFromSnapshot(snap, this.core);
     engine.session = new SessionState(this.core.environment, opts);
@@ -1015,7 +1149,6 @@ export class Database {
     // A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
     // version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
     if (this.core.readOnly) {
-      this.core.register(snap.txid);
       return new Session(this.core, engine, "ro", snap.txid, snap.txid);
     }
     return new Session(this.core, engine, "rw", snap.txid, null);
@@ -1158,6 +1291,11 @@ export class Database {
   // close closes the backing byte store (an in-memory store's close is a no-op). The bare
   // convenience methods autocommit, so there is never uncommitted work to discard. Idempotent.
   close(): void {
+    // A page-service owner stops serving first: clients see EOF while presence EX is still held
+    // (page-service.md §4.1). A client's connection closes with its byte store below.
+    this.core.service?.close();
+    this.core.service = null;
+    this.core.client?.close();
     const st = this.core.storage;
     if (st.paging !== null) {
       st.paging.close();
@@ -1563,9 +1701,8 @@ export class Session {
       this.acquireGate();
       this.refreshCommitted();
     } else {
-      this.core.refreshShared();
+      this.core.refreshAndPin();
       this.refreshCommitted();
-      this.core.register(this.baseVersion);
       this.pinnedVersion = this.baseVersion;
     }
     return this.engine.beginTx(writable);
@@ -1662,6 +1799,15 @@ export class Session {
       this.baseVersion += 1n;
     }
     this.core.committed = snap;
+    const service = this.core.service;
+    if (changes.main && service !== null && this.core.storage.lastCommitMeta !== null) {
+      // The page service publishes the same version with its meta and written pages (README.md §4).
+      service.published(
+        snap.txid,
+        this.core.storage.lastCommitMeta,
+        this.core.storage.lastCommitWritten,
+      );
+    }
     // The N-root commit (attached-databases.md §5): publish the new attached roots the commit adopted
     // (commitTx already staged each dirtied attachment's working root into its in-RAM store and adopted
     // it into engine.attachedCommitted) together with the new main root, so a reader pins a consistent

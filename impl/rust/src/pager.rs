@@ -64,6 +64,9 @@ pub(crate) struct Pager {
     needs_stabilize: bool,
     commit_in_progress: bool,
     poisoned: bool,
+    /// Set on a page client's pager: the owner validated the meta it serves (or wrote it), so the
+    /// client adopts it without re-reading its manifest pages (page-service.md §5.3).
+    trust_meta: bool,
     /// The armed one-shot commit fault — the **fault-injection seam** (spec/design/storage.md §7),
     /// `#[cfg(test)]` so it is **entirely absent from a production build** (zero footprint). `None`
     /// unless a test armed one with [`arm_fault`](Pager::arm_fault).
@@ -141,6 +144,7 @@ impl Pager {
             needs_stabilize: false,
             commit_in_progress: false,
             poisoned: false,
+            trust_meta: false,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
@@ -185,6 +189,15 @@ impl Pager {
     /// must be closed and reopened (a failed compaction after its rename, api.md §2.6).
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
+    }
+
+    /// Adopt meta pages without manifest validation (a page client, page-service.md §5.3).
+    pub(crate) fn set_trust_meta(&mut self) {
+        self.trust_meta = true;
+    }
+
+    pub(crate) fn trusts_meta(&self) -> bool {
+        self.trust_meta
     }
 
     pub(crate) fn allocated_pages(&self) -> u32 {

@@ -93,6 +93,11 @@ export class SharedPaging {
     this.pool.invalidate(page);
   }
 
+  // invalidateAll drops the whole pool (a page client's wholesale invalidation, README.md §3.2).
+  invalidateAll(): void {
+    this.pool.invalidateAll();
+  }
+
   sync(): void {
     this.pager.sync();
   }

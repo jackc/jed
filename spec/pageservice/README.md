@@ -193,7 +193,8 @@ A stream socket (`AF_UNIX`), never in Linux's abstract namespace.
 
 1. **Bundle.** `<path>.lock/uid-<uid>/endpoint`, when that path is at most **100 bytes**. The owner
    creates `uid-<uid>` with mode `0700` if absent and serves from it only if it is a real directory
-   (not a symlink) owned by the owner's uid with mode exactly `0700`.
+   (not a symlink) owned by the owner's effective uid with mode exactly `0700`: permission bits
+   `0700` and no setuid, setgid, or sticky bit.
 2. **Runtime directory** (the path would be longer than 100 bytes, or the bundle directory failed the
    check above): `<dir>/jed-<first 8 bytes of the incarnation, 16 hex>.sock`, where `<dir>` is the
    first that exists and passes the same ownership and `0700` check: `$XDG_RUNTIME_DIR` (Linux),
@@ -205,3 +206,86 @@ removes its endpoint when it closes. Directory search permission is the access c
 checks it on `connect`, so only processes of the owner's user can connect (page-service.md §13).
 
 Windows serving is not yet specified (page-service.md §14): `locking = service` fails `0A000` there.
+
+## 6. Roles under `locking = service` (phase 2)
+
+The behavior every core implements for the read path. It is host state, so the real-process corpus
+(`spec/conformance/process/`) and the corpus-through-a-client run (§7) check it, not byte fixtures.
+
+### 6.1 Election at open
+
+1. Resolve the path and prepare the bundle exactly as a coordinated open does (locking.md §3.1),
+   including the process-local duplicate-open check and the hard-link rejection. Take `arrival SH` and
+   validate the marker.
+2. Loop until `file_lock_timeout_ms`:
+   - Try `presence EX` without waiting. On success the opener is the **owner**: it releases `arrival`
+     and opens the file as an alone process does, without a join-window probe.
+   - Otherwise read the owner record. If it parses, names this process's uid, and is serving,
+     connect to its endpoint and send `hello`. On `hello_ok` the opener is a **client**: it releases
+     `arrival` and closes its bundle handles (a client holds no bundle lock, page-service.md §4.2). A
+     refused `hello` (`0A000`) fails the open; a failed connect or a dropped connection is retried.
+   - Pause briefly and repeat.
+3. On timeout fail `55006` naming the path, adding "owned by another user's process" or "owned by a
+   non-serving process" when the last record read said so.
+
+`create` under `locking = service` takes `presence EX` with the exclusive acquisition loop and is the
+owner. Phase 2 has no promotion: a client whose owner exits fails every later request with `08006`
+until it is reopened. File attachments do not support `locking = service` yet (`0A000`).
+
+### 6.2 The owner
+
+- After opening, it draws its incarnation, records the committed meta page (the slot whose `txid` is
+  the committed one), writes the owner record, binds the endpoint (§5.2), and accepts connections,
+  each served concurrently with the owner's own sessions.
+- Each owner commit of the main database publishes, together with its new root and under the same
+  lock that orders reader pins against publication, the commit's meta page and its written indices
+  (§4). A begin_read therefore always returns a meta page and invalidation list consistent with the
+  snapshot it pins.
+- A connection's pins count in the owner's reader registry, so they hold back free-page reuse,
+  in-commit reclamation, and compaction (`55006` while any client pins) exactly as local readers do.
+- Pages are read from the file at their index; the owner may use a separate read handle so a page
+  read never waits for its own commit's barrier. Compaction resets the window (§4).
+- Phase 2 answers `begin_write` with a non-fatal `25006` error and every other write-path, ownership,
+  or reserved request with a fatal `08P01`.
+- On close it stops accepting, closes every connection (clients see EOF), and removes its endpoint
+  and owner record before releasing `presence`.
+
+### 6.3 The client
+
+- Its pager's byte store serves page indices 0 and 1 from the meta page of the last `read_begun` it
+  adopted, and every other page through `read_pages`. It trusts that meta (no manifest re-validation;
+  page-service.md §5.3); each page's own CRC-32 is still checked on decode. Its handle is read-only:
+  a write is `25006`.
+- **Read begin.** At each read begin that pins a snapshot for a local reader (a read-only session's
+  first read, `BEGIN READ ONLY`, and the like), a client sends `begin_read` with its cache's incarnation and adopted `txid`. It drops the listed
+  indices (or, for `invalidate = 1`, its whole page cache) from its buffer pool; when the reply's
+  `txid` is newer than its adopted one (or the cache was invalidated wholesale) it adopts the meta,
+  reloads its catalog/interior skeleton, and invalidates its plan caches. Read begins and adoptions
+  are serialized, so the cache always corresponds to exactly one adopted version.
+- **Pin discipline.** A client holds exactly one owner pin on each version a local reader pins, and
+  no other: an idle client pins nothing, so it never holds back compaction. A read begin's
+  `read_begun` pin is kept for the local reader it begins: no `end_read` for that version may be sent
+  between the reply and the local reader's registration, even if every other local reader of the
+  version ends in between. When the reply duplicates a pin already held, the client sends `end_read`
+  for the duplicate at once. Refreshes that begin no local reader (a writer's begin) send nothing. When a
+  version's last local reader ends, the client sends `end_read` for it. `read_pages` names the newest
+  version the client holds a pin on, chosen and sent while no `end_read` for that version can overtake
+  it on the connection: page counts only grow between compactions and a pin blocks compaction, so the
+  newest pinned version bounds every page of every older pinned one.
+- Requests are sent one at a time on the connection (phase 2 does not pipeline). A lost connection
+  fails the request, and every later one, with `08006`.
+- Closing the client closes the connection; the owner releases its pins at EOF.
+- `end_read` and EOF are asynchronous: the owner releases a pin when it reads them, which may be a
+  moment after the client's reader ended. So another process's compaction right after that can
+  still fail `55006` (compaction never waits); a caller that needs it retries.
+
+## 7. The corpus through a client
+
+`mise run conformance:service` runs the SQL corpus with each core as a page client of another core's
+owner (Rust→Go, Go→TS, TS→Rust, as client→owner). It is the disk storage mode (conformance.md §3)
+with the owner swapped out of process: the harness creates the database under `locking = service`,
+runs each write record as the owner, and, before each `query` record, closes its handle, has the
+other core's owner actor open the file, and opens a page client to run the record with a fresh
+session. A record the client rejects with `25006` (a writing query, such as `INSERT … RETURNING`)
+is run again as the owner. Rows, errors, plans, and costs must match the corpus exactly, because page
+reads are logical cost units. Files skipped in disk mode are skipped here too.

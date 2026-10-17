@@ -159,7 +159,7 @@ const MAX_PAGE_SIZE: usize = 65536;
 /// (format.md *Page model* — the nine values `{256, 512, … 65536}`). Power-of-two keeps every page
 /// boundary sector-aligned (the SSD target, CLAUDE.md §9) and shrinks the legal set; `is_power_of_two()`
 /// also excludes `0`, so the pager's `page_size` divisor is never zero.
-fn page_size_valid(ps: usize) -> bool {
+pub(crate) fn page_size_valid(ps: usize) -> bool {
     ps.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&ps)
 }
 /// `page_type` for a catalog page.
@@ -2394,7 +2394,10 @@ impl Engine {
             let mut selected = None;
             for (mut m, bytes) in candidates {
                 let physical = pg.allocated_pages();
-                let protected = if let Some(pages) = pg.cached_validation(bytes) {
+                let protected = if pg.trusts_meta() {
+                    // A page client adopts the owner's meta as served (page-service.md §5.3).
+                    Some(Arc::new(HashSet::new()))
+                } else if let Some(pages) = pg.cached_validation(bytes) {
                     Some(pages)
                 } else {
                     commit_manifest::validate(bytes, physical, |id| pg.read_block(id))?
@@ -4207,6 +4210,12 @@ pub(crate) fn sim_meta_of(image: &[u8], ps: u32, v: u64) -> Option<(u32, u32)> {
         .filter_map(|slot| read_meta(image, ps as usize, slot))
         .find(|m| m.txid == v)
         .map(|m| (m.page_count, m.live_pages))
+}
+
+/// The `(txid, page_count)` of a standalone meta block, or `None` if it is not a valid meta — the
+/// page service's view of a meta page (spec/pageservice/README.md §3.2–§3.3).
+pub(crate) fn meta_txid_and_page_count(m: &[u8]) -> Option<(u64, u32)> {
+    parse_meta(m).map(|meta| (meta.txid, meta.page_count))
 }
 
 /// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole

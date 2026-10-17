@@ -1,0 +1,117 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Benchmark the page service: alone-owner fast path and warm/cold page-client reads, every core pairing"
+#MISE depends=["ts:lock_build"]
+#USAGE arg "[cores]" help="Comma-separated cores to include (default rust,go,node)"
+
+# The page-service benchmark (spec/design/benchmarks.md §12). Wall-clock, never conformance: it runs
+# outside `mise run ci`, but every timed loop returns a checksum and the run fails when two engines
+# disagree. It drives the real-process actors (scripts/process_conformance.rb's Actor) so each core
+# is measured as owner and as client of every core, with the same deterministic workload:
+#
+#   alone        the shared-mode alone fast path (`create`), the baseline every owner must match;
+#   owner        a page-service owner with no client (`create-service`): the alone-owner fast path;
+#   client cold  a freshly opened page client's first scan / first point lookups (every leaf fetched
+#                through read_pages);
+#   client warm  the same reads once the client's buffer pool holds the pages (one begin_read round
+#                trip per query).
+#
+# Tunables: JED_PS_BENCH_ROWS (default 200000), JED_PS_BENCH_LOOKUPS (default 20000),
+# JED_PS_BENCH_COMMITS (default 200). Results: bench/results/page-service-<stamp>.jsonl.
+
+require "json"
+require "tmpdir"
+require "fileutils"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+ENV["JED_PROCESS_DRIVER_LIBRARY"] = "1"
+require_relative "../../scripts/process_conformance"
+
+ROWS = Integer(ENV.fetch("JED_PS_BENCH_ROWS", "200000"))
+LOOKUPS = Integer(ENV.fetch("JED_PS_BENCH_LOOKUPS", "20000"))
+COMMITS = Integer(ENV.fetch("JED_PS_BENCH_COMMITS", "200"))
+BENCH_CORES = (ENV["usage_cores"]&.split(",") || %w[rust go node]).freeze
+Actor.command_timeout = 600
+
+sh "cargo", "build", "--release", "--quiet", "--bin", "process_actor", "--manifest-path", RUST_MANIFEST
+sh "go", "build", "-o", "process_actor", "./cmd/process_actor", chdir: GO_DIR
+
+def hex(sql) = sql.unpack1("H*")
+
+def must(actor, name, argument = "")
+  status, value, detail = actor.command(name, argument)
+  raise "#{name} failed: #{value} #{detail}" unless status == :ok
+
+  value
+end
+
+# One timed loop: returns [milliseconds per iteration... as total ms, checksum].
+def time(actor, command, iterations)
+  ns, checksum = must(actor, command, [iterations, ROWS].join("\t")).split(":").map { Integer(_1) }
+  [ns / 1e6, checksum]
+end
+
+def load(actor)
+  must(actor, "EXEC", hex("CREATE TABLE bench_ps (id i64 PRIMARY KEY, v i64, pad text)"))
+  must(actor, "EXEC", hex("INSERT INTO bench_ps SELECT g, g * 3, repeat('p', 64) FROM generate_series(1, #{ROWS}) g"))
+end
+
+RESULTS = []
+CHECKSUMS = Hash.new { |h, k| h[k] = {} }
+
+def record(lane, owner, client, iterations, ms, checksum)
+  RESULTS << { lane: lane, owner: owner, client: client, iterations: iterations,
+               us_per_op: (ms * 1000.0 / iterations).round(3), checksum: checksum }
+  CHECKSUMS[lane][[owner, client]] = checksum
+  printf("  %-20s owner %-5s client %-5s %10.3f us/op\n", lane, owner, client || "-", ms * 1000.0 / iterations)
+end
+
+# The alone and owner fast paths: warm lookups, warm scans, durable commits.
+def owner_lanes(actor, core, label)
+  time(actor, "TIME_LOOKUPS", LOOKUPS / 4) # warm the leaf cache
+  record("#{label}_lookup", core, nil, LOOKUPS, *time(actor, "TIME_LOOKUPS", LOOKUPS))
+  time(actor, "TIME_SCAN", 1)
+  record("#{label}_scan", core, nil, 5, *time(actor, "TIME_SCAN", 5))
+end
+
+Dir.mktmpdir("jed-page-service-bench-") do |dir|
+  BENCH_CORES.each do |owner_core|
+    puts "#{owner_core}:"
+    alone_path = File.join(dir, "alone-#{owner_core}.jed")
+    alone = Actor.new(owner_core, "create", alone_path)
+    load(alone)
+    owner_lanes(alone, owner_core, "alone")
+    record("alone_commit", owner_core, nil, COMMITS, *time(alone, "TIME_COMMITS", COMMITS))
+    alone.close
+
+    path = File.join(dir, "service-#{owner_core}.jed")
+    owner = Actor.new(owner_core, "create-service", path)
+    load(owner)
+    owner_lanes(owner, owner_core, "owner")
+    BENCH_CORES.each do |client_core|
+      client = Actor.new(client_core, "open-service", path)
+      record("client_cold_scan", owner_core, client_core, 1, *time(client, "TIME_SCAN", 1))
+      record("client_warm_scan", owner_core, client_core, 5, *time(client, "TIME_SCAN", 5))
+      client.close
+      client = Actor.new(client_core, "open-service", path)
+      record("client_cold_lookup", owner_core, client_core, LOOKUPS / 4, *time(client, "TIME_LOOKUPS", LOOKUPS / 4))
+      time(client, "TIME_LOOKUPS", LOOKUPS / 4)
+      record("client_warm_lookup", owner_core, client_core, LOOKUPS, *time(client, "TIME_LOOKUPS", LOOKUPS))
+      client.close
+    end
+    record("owner_commit", owner_core, nil, COMMITS, *time(owner, "TIME_COMMITS", COMMITS))
+    owner.close
+  end
+end
+
+FileUtils.mkdir_p(File.join(ROOT, "bench/results"))
+out = File.join(ROOT, "bench/results/page-service-#{stamp}.jsonl")
+File.write(out, RESULTS.map { JSON.generate(_1) }.join("\n") + "\n")
+puts "\nresults: #{out}"
+# Every engine reads the same rows: a lane's checksums must agree across every owner and client.
+CHECKSUMS.each do |lane, sums|
+  next if lane.end_with?("_commit")
+
+  abort "checksum disagreement in #{lane}: #{sums.inspect}" unless sums.values.uniq.size == 1
+end
+puts "checksums agree across every core and pairing"

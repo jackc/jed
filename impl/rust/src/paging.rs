@@ -109,6 +109,12 @@ impl SharedPaging {
         self.pool.invalidate(page);
     }
 
+    /// Drop every resident leaf (a page client whose owner invalidated its whole cache,
+    /// spec/pageservice/README.md §3.2).
+    pub(crate) fn invalidate_all(&self) {
+        self.pool.invalidate_all();
+    }
+
     /// The pool's leaf-page capacity — carried over to the replacement pool when compaction
     /// reopens the database (spec/design/api.md §2.6).
     pub(crate) fn capacity(&self) -> usize {

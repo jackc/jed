@@ -950,6 +950,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "introspect.type_fields",
   // Stable lock-bundle protocol for safe shared multi-process main files and file attachments.
   "file.shared_process",
+  // The page service's read path under the test-only `locking = service` (spec/design/page-service.md
+  // phase 2, spec/pageservice/README.md §6).
+  "file.page_service",
   // Base-table column alias lists `FROM t AS x (p, q)` (grammar.md §15, views V3): a pure
   // resolution-time relabeling of the columns a FROM item exposes.
   "query.table_column_alias",

@@ -434,11 +434,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     as shared data, field encodings, and byte fixtures checked by a Ruby verifier under `mise run
     verify`; `08006`, `08007`, `08P01`, `25P03` registered; a hand-written codec per core (Rust, Go,
     TS) tested against the fixtures.
-  - [ ] **Phase 2 — read path.** Rust, Go, TS: election by `presence EX`, the owner record, the
-    same-user endpoint, `hello`/`begin_read`/`read_pages`/`end_read`, incarnation ids and client
-    cache invalidation, read-only connections, the TS worker-thread client and service. Proven by
-    process-corpus election/read cases in every pairing and by the SQL corpus run read-only through a
-    client of another core's owner; benchmarks for the alone-owner fast path and warm/cold client reads.
+  - [x] **Phase 2 — read path.** ✅ **landed** (test-only `locking = service`): Rust, Go, TS
+    election by `presence EX`, the owner record, the same-user endpoint,
+    `hello`/`begin_read`/`read_pages`/`end_read`, incarnation ids and client cache invalidation,
+    read-only connections, the TS worker-thread client and service (one I/O worker per process).
+    Proven by the `service_*` process-corpus scenarios in every pairing and by `conformance:service`
+    (the SQL corpus with every query answered by a page client of another core's owner, part of
+    `ci`); `bench:page_service` measures the alone-owner fast path and warm/cold client reads
+    (benchmarks.md §12). Known gaps for later phases: a plain `BEGIN` on a client takes no owner pin;
+    the TS owner bounds distinct pinned versions at 4096 (`54000`).
   - [ ] **Phase 3 — write path.** The writer gate across processes, the reuse grant, `commit`
     (`CommitDelta`) with owner validation (`08P01`), owner adoption, owner-only free-list rebuilds by
     maintenance commits (a transactions.md §2.1 carve-out), `commit_status`, the idle-in-transaction

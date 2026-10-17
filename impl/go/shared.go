@@ -124,7 +124,11 @@ type sharedCore struct {
 	attachments     map[string]*attachment
 	attachmentCount atomic.Int64
 	coordinator     *fileCoordinator
-	planEpoch       atomic.Uint64
+	// service is set on a page-service owner (page-service.md §4.1); client on a page client (§4.2).
+	// At most one is set, and only under the test-only LockingService.
+	service   *pageServiceOwner
+	client    *psClient
+	planEpoch atomic.Uint64
 	// env is the handle's Environment (spec/design/environment.md), supplied in the create/open
 	// options (or a fresh empty one), shared (by pointer) into every minted session's sessionState and
 	// every attachment's snapshot. Never nil; immutable for the handle's lifetime.
@@ -142,7 +146,7 @@ func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
 			return err
 		}
 		switch c.coordinator.lease() {
-		case leaseAlone, leaseExclusive:
+		case leaseAlone, leaseExclusive, leaseServiceOwner:
 			return nil
 		case leasePoisoned:
 			c.writeMu.Unlock()
@@ -210,6 +214,9 @@ func (c *sharedCore) writableCoordinators() []*fileCoordinator {
 }
 
 func (c *sharedCore) hasSharedCoordinator() bool {
+	if c.client != nil {
+		return true
+	}
 	if c.coordinator != nil && c.coordinator.lease() == leaseShared {
 		return true
 	}
@@ -254,6 +261,11 @@ func (c *sharedCore) attachment(name string) *attachment {
 }
 
 func (c *sharedCore) refreshShared() error {
+	if c.client != nil {
+		// A page client refreshes only at a read begin that pins a local reader (refreshAndPin): a
+		// begin_read pin taken here would have no reader to keep it (spec/pageservice/README.md §6.3).
+		return nil
+	}
 	if !c.hasSharedCoordinator() {
 		return nil
 	}
@@ -549,6 +561,12 @@ type storage struct {
 	files fileHost
 	// dirSynced is whether this handle has made the file's directory entry durable (syncDirectoryOnce).
 	dirSynced bool
+	// lastMeta and lastWritten are the last file commit's meta page and the page indices it wrote —
+	// what a page-service owner publishes to its clients (spec/pageservice/README.md §4). Recorded
+	// only when recordCommits is set (a serving owner), so the alone path does no extra work.
+	recordCommits bool
+	lastMeta      []byte
+	lastWritten   []uint32
 }
 
 // syncDirectoryOnce makes the database file's directory durable before the first durable commit after
@@ -852,6 +870,16 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	}); err != nil {
 		return err
 	}
+	if st.recordCommits {
+		st.lastMeta = plan.meta
+		st.lastWritten = st.lastWritten[:0]
+		for _, pg := range write.pages {
+			st.lastWritten = append(st.lastWritten, pg.index)
+		}
+		for _, pg := range plan.pages {
+			st.lastWritten = append(st.lastWritten, pg.index)
+		}
+	}
 	st.pageCount, st.freePages = plan.pageCount, plan.free
 	st.liveAtCompaction, st.freeGenTxid = plan.live, plan.generation
 	st.live = live
@@ -1133,6 +1161,31 @@ func (c *sharedCore) pinLatest() (*roots, uint64) {
 	return rt, v
 }
 
+// refreshAndPin is a read begin: refresh against other processes (shared mode's meta refresh, or a
+// page client's begin_read), then pin the latest committed version for a local reader. A page client's
+// begin_read pin stays reserved until the local pin is registered, so no concurrent reader's end can
+// release it in between (spec/pageservice/README.md §6.3).
+func (c *sharedCore) refreshAndPin() (*roots, uint64, error) {
+	if c.client == nil {
+		if err := c.refreshShared(); err != nil {
+			return nil, 0, err
+		}
+		rt, v := c.pinLatest()
+		return rt, v, nil
+	}
+	reserved, err := c.clientRefresh()
+	if err != nil {
+		return nil, 0, err
+	}
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	rt := c.roots.Load()
+	v := rt.committed.txid
+	c.live[v]++
+	c.client.unreserve(reserved)
+	return rt, v, nil
+}
+
 // deregisterPin drops one reader pin on version v (the inverse of pinLatest / the per-query pin),
 // advancing the watermark when the last pin at v closes.
 func (c *sharedCore) deregisterPin(v uint64) {
@@ -1140,6 +1193,9 @@ func (c *sharedCore) deregisterPin(v uint64) {
 	defer c.liveMu.Unlock()
 	if c.live[v]--; c.live[v] <= 0 {
 		delete(c.live, v)
+		if c.client != nil {
+			c.client.releasePin(v)
+		}
 	}
 }
 
@@ -1560,6 +1616,9 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		}
 		return nil, err
 	}
+	if opts.Locking == LockingService {
+		return startServiceOwner(e, coordinator, path, opts.MaxStorageBytes)
+	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
 	return databaseOver(c), nil
@@ -1597,6 +1656,9 @@ func OpenDatabase(path string) (*Database, error) {
 // OpenDatabaseWithOptions opens an existing file-backed database at path with explicit open settings
 // (buffer-pool budget, read-only mode, work-mem) and returns the host handle with its default session.
 func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
+	if opts.Locking == LockingService {
+		return openServiceDatabase(path, opts)
+	}
 	coordinator, real, err := prepareOpenCoordinator(path, opts.Locking, opts.FileLockTimeoutMs)
 	if err != nil {
 		return nil, err
@@ -1710,6 +1772,10 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	if source.file {
 		var real string
 		var err error
+		if source.locking == LockingService {
+			// Attachments join the page service with its write path (page-service.md §16 phase 3).
+			return newError(FeatureNotSupported, "file attachments do not support the page service yet")
+		}
 		coordinator, real, err = prepareOpenCoordinator(source.path, source.locking, source.fileLockTimeoutMs)
 		if err != nil {
 			return err
@@ -1935,6 +2001,11 @@ func (c *sharedCore) compactLocked(lname, name string) error {
 	}
 	if main {
 		c.roots.Store(&roots{committed: compacted, attached: rt.attached})
+		if c.service != nil {
+			if err := c.service.compacted(compacted.txid); err != nil {
+				return err
+			}
+		}
 	} else {
 		attached := make(map[string]*snapshot, len(rt.attached))
 		for key, root := range rt.attached {
@@ -2142,6 +2213,11 @@ func (db *Database) UpgradeCollations() (int, error) {
 // methods autocommit, so there is never uncommitted work to discard. Idempotent.
 func (db *Database) Close() error {
 	c := db.core
+	if c.service != nil {
+		// Stop serving first: clients see EOF while presence EX is still held (page-service.md §4.1).
+		c.service.close()
+		c.service = nil
+	}
 	c.writeMu.Lock()
 	if st := c.storage; st.paging != nil {
 		_ = st.paging.close()
@@ -2340,13 +2416,15 @@ func (s *Session) refreshInitialRead() error {
 	if !s.refreshOnNextRead {
 		return nil
 	}
-	if err := s.core.refreshShared(); err != nil {
+	// Pin the new version before releasing the old one: a page client's owner pin on a version lives
+	// only while some local reader pins it (spec/pageservice/README.md §6.3).
+	rt, v, err := s.core.refreshAndPin()
+	if err != nil {
 		return err
 	}
 	if s.pinned {
 		s.core.deregisterPin(s.pinVersion)
 	}
-	rt, v := s.core.pinLatest()
 	s.baseVersion = v
 	s.pinVersion = v
 	s.pinned = true
@@ -2443,12 +2521,12 @@ func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 		s.gateHeld = true
 		s.refreshCommitted()
 	} else {
-		if err := s.core.refreshShared(); err != nil {
-			return outcome{}, err
-		}
 		// A READ ONLY block pins its snapshot atomically (load+register under one lock, §8), so the
 		// version it reads can never be reclaimed in a load→register gap.
-		rt, v := s.core.pinLatest()
+		rt, v, err := s.core.refreshAndPin()
+		if err != nil {
+			return outcome{}, err
+		}
 		s.baseVersion = v
 		s.engine.committed = rt.committed
 		s.engine.attachedCommitted = rt.attached
@@ -2561,6 +2639,11 @@ func (s *Session) publish() error {
 	// reclamation watermark could miss.
 	s.core.liveMu.Lock()
 	s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
+	if changes.main && s.core.service != nil {
+		// The page service publishes the same version with its meta and written pages (README.md §4).
+		st := s.core.storage
+		s.core.service.published(snap.txid, st.lastMeta, st.lastWritten)
+	}
 	s.core.liveMu.Unlock()
 	s.core.adoptAttachments(staged, s.engine.attachedCommitted)
 	return nil

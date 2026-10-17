@@ -23,6 +23,11 @@ pub enum Locking {
     Shared,
     Exclusive,
     None,
+    /// The TEST-ONLY page-service mode (spec/design/page-service.md §16): the opener becomes the
+    /// owner when it can take presence EX, otherwise a read-only page client of the owner. It exists
+    /// until the page service's handoff phase replaces shared mode; never mix it with shared or
+    /// exclusive openers of one database. Unix only (`0A000` elsewhere).
+    Service,
 }
 
 pub const DEFAULT_FILE_LOCK_TIMEOUT_MS: u64 = 5_000;

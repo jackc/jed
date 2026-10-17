@@ -32,6 +32,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(test)]
 use std::thread::{self, JoinHandle};
 
+#[path = "conformance/service.rs"]
+mod service;
+
 thread_local! {
     /// The peak sink of `JED_CONFORMANCE_QUERY_MEMORY_PEAKS` (the per-record query-memory peak mode,
     /// `mise run conformance:query_memory`): the open output and the file being walked.
@@ -99,8 +102,20 @@ fn main() -> ExitCode {
     // disk through the demand-paged buffer pool. The two modes catch DIVERGENCES between resident and
     // on-disk-faulted reads (the window-operand touched-set bug the in-memory pass could not see).
     // Every record's SQL-in → rows/error/cost-out must be IDENTICAL in both modes.
-    let disk = std::env::args().any(|a| a == "disk");
-    let mode = if disk { "disk" } else { "memory" };
+    // The SERVICE mode (spec/pageservice/README.md §7) is the disk mode with each query record run
+    // as a page client of another core's owner (JED_SERVICE_OWNER = rust | go | node).
+    let service_mode = std::env::args().any(|a| a == "service");
+    let disk = service_mode || std::env::args().any(|a| a == "disk");
+    let mut mode = if disk { "disk" } else { "memory" }.to_string();
+    if service_mode {
+        let core = std::env::var("JED_SERVICE_OWNER").unwrap_or_default();
+        let root = suites.join("../../..");
+        if let Err(e) = service::start(&core, &root) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+        mode = format!("service, owner {core}");
+    }
     // The disk pass recounts every commit's live pages by reachability (memory.md §8.7), so the whole
     // corpus checks the incremental count the file-backed storage limit relies on.
     jed::tooling::VERIFY_LIVE_PAGES.store(disk, std::sync::atomic::Ordering::Relaxed);
@@ -187,6 +202,14 @@ fn main() -> ExitCode {
     }
 
     println!("\n[{mode}] {passed} passed, {failed} failed, {skipped} skipped");
+    if service_mode {
+        println!(
+            "[{mode}] {} query records answered by a page client; {} writing queries run by the owner",
+            service::CLIENT_QUERIES.load(Ordering::Relaxed),
+            service::OWNER_RETRIES.load(Ordering::Relaxed)
+        );
+        service::stop();
+    }
     if forced_temp_buffers().is_some() {
         let spills = jed::tooling::TEMP_SPILLS.load(std::sync::atomic::Ordering::Relaxed);
         println!("[{mode}] forced temp spill: {spills} temp domain(s) spilled");
@@ -950,6 +973,21 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     // then the files are removed.
     let tmp_path = if disk { Some(disk_temp_path()) } else { None };
     let _guard = TempGuard(tmp_path.clone());
+    // Service mode: the owner actor closes the database it owns before the files are removed (this
+    // guard drops after `db`, before `_guard`).
+    struct ServiceRelease;
+    impl Drop for ServiceRelease {
+        fn drop(&mut self) {
+            service::release();
+        }
+    }
+    let _service_release = ServiceRelease;
+    let service_mode = service::active();
+    let locking = if service_mode {
+        jed::Locking::Service
+    } else {
+        jed::Locking::Auto
+    };
     // The file's environment: the harness's switchable sources plus the bundles it asks for. Every
     // database the file runs against (the fresh one, a disk-mode reopen, a fixture) uses it.
     let sources = HarnessSources::new();
@@ -964,6 +1002,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         Some(p) => Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(p)),
             skip_fsync: true,
+            locking,
             environment: env.clone(),
             ..Default::default()
         })
@@ -1031,7 +1070,20 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     let mut pending_vars: Vec<(String, String)> = Vec::new();
     let mut pending_timezone: Option<String> = None;
 
-    while let Some(line) = lines.next() {
+    // Service mode: `after_prev` is the position just after the previous record — a query the page
+    // client refuses as a write (25006) rewinds there and runs again, its directives re-read, as the
+    // owner (spec/pageservice/README.md §7).
+    let mut after_prev = lines.clone();
+    let mut record_done = false;
+    let mut force_owner = false;
+    loop {
+        if record_done {
+            after_prev = lines.clone();
+            record_done = false;
+        }
+        let Some(line) = lines.next() else {
+            break;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -1163,14 +1215,22 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         // Drop the session and handle explicitly before reopening. Assignment evaluates its right-hand
         // side before dropping the previous value, which shared coordination correctly rejects as a
         // duplicate in-process open of the same path.
+        // In service mode the reopened handle is a page client of the owner actor for a `query`
+        // record and the owner itself for any other (spec/pageservice/README.md §7).
+        record_done = true;
+        let mut client_record = false;
         if disk && on_temp {
             let p = tmp_path.as_ref().expect("disk mode has a temp path");
+            client_record = service_mode && trimmed.starts_with("query") && !force_owner;
+            force_owner = false;
             drop(sess);
             drop(db);
+            service::prepare_reopen(p, client_record)?;
             db = Database::open_with_options(
                 p,
                 jed::OpenOptions {
                     skip_fsync: true, // fsync=off (throwaway image)
+                    locking,
                     environment: env.clone(),
                     ..Default::default()
                 },
@@ -1323,7 +1383,18 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                     }
                     expected.push(l.trim().to_string());
                 }
-                let outcome = drain_query(&mut sess, &sql, &params).map_err(|e| {
+                let result = drain_query(&mut sess, &sql, &params);
+                if client_record {
+                    if matches!(&result, Err(e) if e.code() == "25006") {
+                        // A writing query: run it again as the owner.
+                        lines = after_prev.clone();
+                        force_owner = true;
+                        service::count_owner_retry();
+                        continue;
+                    }
+                    service::count_client_query();
+                }
+                let outcome = result.map_err(|e| {
                     format!(
                         "query failed with {}: {}\n  SQL: {sql}",
                         e.code(),

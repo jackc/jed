@@ -426,6 +426,15 @@ co-resident processes with append-only commits trip at the same batch with the s
 though the co-resident file grows to nearly twice the length. A peer's delete lowers the count the
 other process commits against.
 
+The page service's read path (page-service.md phase 2) runs here too, under the test-only
+`locking = service` actions `create-service` and `open-service`: `service_reads` elects the creator
+owner and the second opener a page client, then checks fresh reads after the owner's commits, a pinned
+read session, correct reads after the owner reuses freed pages (the client's invalidation list),
+compaction refused while a client pins and allowed after, and `25006` for a client write.
+`service_owner_exit` kills the owner: the client fails `08006` (no promotion before phase 4) and
+the next opener is elected owner. A step's `retry_ms` bounds an outcome that holds only eventually,
+such as an owner observing a client's asynchronous `end_read`.
+
 The corpus, not per-core copies, covers:
 
 - first-rollout/unknown-marker failure, join, alone→shared→alone transitions, and open/writer timeout;

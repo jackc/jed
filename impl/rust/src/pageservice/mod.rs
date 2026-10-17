@@ -1,8 +1,19 @@
 //! The page service (spec/design/page-service.md): one owner process serves pages to client
 //! processes over a local endpoint.
 //!
-//! Phase 1 is the wire codec alone ([`codec`]): framing, the message catalog, and the owner record,
-//! hand-written from spec/pageservice/ and tested against its shared byte fixtures. Nothing here
-//! opens a socket yet.
+//! Phase 1 is the wire codec ([`codec`]): framing, the message catalog, and the owner record,
+//! hand-written from spec/pageservice/ and tested against its shared byte fixtures. Phase 2 is the
+//! read path under the test-only `Locking::Service` (spec/pageservice/README.md §6): the election at
+//! open ([`election`]), the serving owner ([`owner`]), the read-only page client ([`client`]), and the
+//! endpoint and owner record on the filesystem ([`endpoint`]). Unix only: Windows serving is not yet
+//! specified (page-service.md §14), so `Locking::Service` fails `0A000` elsewhere.
 
+#[cfg(unix)]
+pub(crate) mod client;
 pub mod codec;
+#[cfg(unix)]
+pub(crate) mod election;
+#[cfg(unix)]
+pub(crate) mod endpoint;
+#[cfg(unix)]
+pub(crate) mod owner;

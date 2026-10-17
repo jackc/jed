@@ -1608,6 +1608,10 @@ id = "file.shared_process"
 description = "Crash-clean shared multi-process access to one file (and independently coordinated file attachments): stable protocol-v1 lock bundle, one global writer with 55P03 timeout, immutable pinned snapshots, commit-gated meta refresh, append-only co-resident commits, and a zero-foreground-lock alone lease (spec/design/locking.md). Host/process conformance, not SQL corpus records."
 
 [[capability]]
+id = "file.page_service"
+description = "The page service's read path under the test-only `locking = service` value (spec/design/page-service.md phase 2, spec/pageservice/README.md §6): election by presence EX, the owner record and same-user endpoint, hello/begin_read/read_pages/end_read, incarnation-scoped client cache invalidation, client pins in the owner's watermark, read-only page clients (25006), and 08006 after the owner dies. Host/process conformance, not SQL corpus records."
+
+[[capability]]
 id = "storage.unparsable_definitions"
 description = "Opening a file whose stored SQL this binary cannot parse (spec/design/unparsable-definitions.md): a view body, CHECK, expression DEFAULT, expression index key, or partial-index predicate whose text the parser rejects is kept, unparsed and byte-for-byte, instead of failing the load XX001. Only a statement that needs the object's parsed form fails, with XX003, before touching a row: a reference to the view (and jed_columns), a write that evaluates the check or applies the default, a write that maintains the index, and the ALTER TABLE actions that analyze or rewrite the text. Reads proceed and skip the index; DROP of each object and DROP TABLE work. Exercised against the Ruby-forged fixture unparsable_definitions.jed."
 

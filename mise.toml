@@ -227,10 +227,24 @@ cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.to
 (cd impl/ts && node src/bin/conformance.ts)
 '''
 
+# The corpus through a page client (spec/pageservice/README.md §7): each core runs the disk mode with
+# every query record answered as a page client of another core's owner (the test-only
+# `locking = service`). Rows, errors, plans, and costs must be unchanged. Also part of conformance:all.
+[tasks."conformance:service"]
+description = "Run the corpus with each core as a page client of another core's owner (Rust->Go, Go->TS, TS->Rust)"
+depends = ["ts:lock_build"]
+run = [
+  "cargo build --release --bin process_actor --bin conformance --manifest-path impl/rust/Cargo.toml",
+  "cd impl/go && go build -o process_actor ./cmd/process_actor",
+  "JED_SERVICE_OWNER=go impl/rust/target/release/conformance service",
+  "cd impl/go && JED_SERVICE_OWNER=node go run ./cmd/conformance service",
+  "cd impl/ts && JED_SERVICE_OWNER=rust node src/bin/conformance.ts service",
+]
+
 # Layer 4 of the concurrency contract (CLAUDE.md §7): spec/conformance/process/*.process.toml drives
 # real Rust/Go/Node actor processes over one shared file. Part of `ci`.
 [tasks."concurrency:process"]
-description = "Run the real-process shared-file corpus across every Rust/Go/Node pairing"
+description = "Run the real-process corpus (shared mode and the page service) across every Rust/Go/Node pairing"
 depends = ["ts:lock_build"]
 run = [
   "cargo build --release --bin process_actor --manifest-path impl/rust/Cargo.toml",

@@ -37,13 +37,27 @@ func run() int {
 	// leaves from disk through the demand-paged buffer pool. The two modes catch DIVERGENCES between
 	// resident and on-disk-faulted reads (the window-operand touched-set bug the in-memory pass could
 	// not see). Every record's SQL-in → rows/error/cost-out must be IDENTICAL in both modes.
-	disk := len(os.Args) > 1 && os.Args[1] == "disk"
+	disk := len(os.Args) > 1 && (os.Args[1] == "disk" || os.Args[1] == "service")
+	// The SERVICE mode (spec/pageservice/README.md §7) is the disk mode with each query record run as a
+	// page client of another core's owner (JED_SERVICE_OWNER = rust | go | node).
+	if len(os.Args) > 1 && os.Args[1] == "service" {
+		actor, err := startOwnerActor(os.Getenv("JED_SERVICE_OWNER"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		serviceOwner = actor
+		defer actor.stop()
+	}
 	// The disk pass recounts every commit's live pages by reachability (memory.md §8.7), so the whole
 	// corpus checks the incremental count the file-backed storage limit relies on.
 	jed.SetVerifyLivePages(disk)
 	mode := "memory"
 	if disk {
 		mode = "disk"
+	}
+	if serviceOwner != nil {
+		mode = "service, owner " + os.Getenv("JED_SERVICE_OWNER")
 	}
 
 	suites := suitesDir()
@@ -154,6 +168,9 @@ func run() int {
 	}
 
 	fmt.Printf("\n[%s] %d passed, %d failed, %d skipped\n", mode, passed, failed, skipped)
+	if serviceOwner != nil {
+		fmt.Printf("[%s] %d query records answered by a page client; %d writing queries run by the owner\n", mode, clientQueries, ownerRetries)
+	}
 	if forced >= 0 {
 		spills := jed.TempSpills()
 		fmt.Printf("[%s] forced temp spill: %d temp domain(s) spilled\n", mode, spills)
@@ -992,7 +1009,7 @@ func runFile(text string, disk bool) error {
 		// fsync=off (api.md §2.1): the disk pass reopens a throwaway temp image before every record to
 		// exercise the on-disk faulted read path — durability across an OS crash is irrelevant, so skip
 		// the per-commit fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true, Environment: env})
+		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true, Environment: env, Locking: serviceLocking()})
 		if err != nil {
 			removeTempDB(tmpPath)
 			return fmt.Errorf("disk mode: create %s: %w", tmpPath, err)
@@ -1027,12 +1044,27 @@ func runFile(text string, disk bool) error {
 	// demand-paged store (leaves fault on access — the on-disk read path the memory pass never reaches).
 	// A fresh session is minted; only per-record directives (re-applied below) and committed data (on the
 	// file) carry across — which is exactly why reopen-fragile files are `# skip: disk`.
-	reopenDisk := func() error {
+	// In service mode, client says which role the reopened handle takes: a page client of the owner
+	// actor (which then owns the file) or the owner itself (spec/pageservice/README.md §7).
+	actorOwns := false
+	reopenDisk := func(client bool) error {
 		sess.Close()
 		if err := db.Close(); err != nil {
 			return fmt.Errorf("disk reopen: close: %w", err)
 		}
-		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{SkipFsync: true, Environment: env}) // fsync=off (throwaway image)
+		if serviceOwner != nil && client != actorOwns {
+			var err error
+			if client {
+				err = serviceOwner.open(tmpPath)
+			} else {
+				err = serviceOwner.close()
+			}
+			if err != nil {
+				return err
+			}
+			actorOwns = client
+		}
+		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{SkipFsync: true, Environment: env, Locking: serviceLocking()}) // fsync=off (throwaway image)
 		if err != nil {
 			return fmt.Errorf("disk reopen: open %s: %w", tmpPath, err)
 		}
@@ -1050,9 +1082,15 @@ func runFile(text string, disk bool) error {
 		cleanup = func() {
 			sess.Close()
 			db.Close()
+			if actorOwns {
+				_ = serviceOwner.close()
+			}
 			removeTempDB(tmpPath)
 		}
 	}
+	// afterPrev is the line just after the previous record: a service-mode query the client refuses as
+	// a write (25006) rewinds there and runs again, its directives re-read, as the owner.
+	afterPrev, recordDone, forceOwner := 0, false, false
 	defer func() { cleanup() }()
 	i := 0
 	// A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
@@ -1091,6 +1129,9 @@ func runFile(text string, disk bool) error {
 	var pendingVars []varPair
 	var pendingTimezone *string
 	for i < len(lines) {
+		if recordDone {
+			afterPrev, recordDone = i, false
+		}
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			i++
@@ -1235,8 +1276,12 @@ func runFile(text string, disk bool) error {
 		// committed state carries on the file; the fresh session re-receives the per-record directives
 		// applied just below). Writes reopen too — an UPDATE/DELETE over a faulted leaf exercises the
 		// resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
+		recordDone = true
+		clientRecord := false
 		if disk && onTemp {
-			if err := reopenDisk(); err != nil {
+			clientRecord = serviceOwner != nil && strings.HasPrefix(line, "query") && !forceOwner
+			forceOwner = false
+			if err := reopenDisk(clientRecord); err != nil {
 				return err
 			}
 		}
@@ -1427,6 +1472,15 @@ func runFile(text string, disk bool) error {
 				cols = 1
 			}
 			actual, names, types, cost, err := drainQuery(sess, sql, params, sortmode, cols)
+			if err != nil && clientRecord && codeOf(err) == "25006" {
+				// A writing query: run it again as the owner.
+				i, recordDone, forceOwner = afterPrev, false, true
+				ownerRetries++
+				continue
+			}
+			if clientRecord {
+				clientQueries++
+			}
 			if err != nil {
 				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
 			}

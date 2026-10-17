@@ -207,6 +207,20 @@ impl<T> BufferPool<T> {
     }
 }
 
+impl<T> BufferPool<T> {
+    /// Drop every cached page and detach every in-flight load — a page client told by the owner
+    /// that its whole cache may be stale (spec/pageservice/README.md §3.2).
+    pub(crate) fn invalidate_all(&self) {
+        let mut state = self.state.lock().expect("buffer pool mutex poisoned");
+        state.slots.clear();
+        state.index.clear();
+        state.hand = 0;
+        for (_, flight) in state.loading.drain() {
+            flight.invalidate();
+        }
+    }
+}
+
 impl<T> PoolState<T> {
     /// Insert a freshly-loaded page, evicting one under CLOCK if at capacity.
     fn insert(&mut self, page_id: u32, value: Arc<T>) {

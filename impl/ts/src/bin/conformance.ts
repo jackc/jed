@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { Decimal } from "../decimal.ts";
+import { OwnerActor } from "./conformance_service.ts";
 import { DEFAULT_WORK_MEM } from "../spill.ts";
 import { resolveZone } from "../timezone.ts";
 import {
@@ -822,6 +823,19 @@ function createsTempTable(text: string): boolean {
   return upper.includes("CREATE TEMP ") || upper.includes("CREATE TEMPORARY ");
 }
 
+// serviceOwner is the owner actor in service mode (spec/pageservice/README.md §7); null in the memory
+// and disk modes. clientQueries counts the query records a page client answered; ownerRetries those it
+// refused as writes (25006) and the owner then ran.
+let serviceOwner: OwnerActor | null = null;
+let clientQueries = 0;
+let ownerRetries = 0;
+
+// serviceLocking is the file locking mode the harness opens with: the test-only page-service mode in
+// service mode, the default otherwise.
+function serviceLocking(): "service" | undefined {
+  return serviceOwner !== null ? "service" : undefined;
+}
+
 function runFile(text: string, disk: boolean): void {
   // In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
   // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
@@ -841,7 +855,12 @@ function runFile(text: string, disk: boolean): void {
   let dbHandle: Database | null = null;
   if (tmpDir !== null && tmpPath !== null) {
     try {
-      dbHandle = createDatabase({ path: tmpPath, skipFsync: true, environment: env });
+      dbHandle = createDatabase({
+        path: tmpPath,
+        skipFsync: true,
+        environment: env,
+        locking: serviceLocking(),
+      });
     } catch (e) {
       rmSync(tmpDir, { recursive: true, force: true });
       throw e;
@@ -863,6 +882,13 @@ function runFile(text: string, disk: boolean): void {
   let db = attachDb.session();
   // Main's `# max_storage_bytes:` limit, re-applied to each disk-mode reopen (a handle setting).
   let mainStorageLimit = 0n;
+  // In service mode, actorOwns is whether the owner actor currently owns the file (the harness then
+  // reopens as its page client). afterPrev is the line just after the previous record: a query the
+  // client refuses as a write (25006) rewinds there and runs again, its directives re-read, as the owner.
+  let actorOwns = false;
+  let afterPrev = 0;
+  let recordDone = false;
+  let forceOwner = false;
   try {
     const lines = text.split("\n");
     const c: Cursor = { i: 0 };
@@ -895,6 +921,10 @@ function runFile(text: string, disk: boolean): void {
     const pendingVars: Array<[string, string]> = [];
     let pendingTimezone: string | null = null;
     while (c.i < lines.length) {
+      if (recordDone) {
+        afterPrev = c.i;
+        recordDone = false;
+      }
       const line = lines[c.i]!.trim();
       if (line === "") {
         c.i++;
@@ -1052,10 +1082,26 @@ function runFile(text: string, disk: boolean): void {
       // committed state carries on the file; the fresh session re-receives the per-record directives
       // applied just below). Writes reopen too — an UPDATE/DELETE over a faulted leaf exercises the
       // resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
+      // In service mode a query record reopens as a page client of the owner actor, every other
+      // record as the owner (spec/pageservice/README.md §7).
+      recordDone = true;
+      let clientRecord = false;
       if (disk && onTemp) {
+        clientRecord = serviceOwner !== null && line.startsWith("query") && !forceOwner;
+        forceOwner = false;
+        db.close();
         dbHandle!.close();
+        if (serviceOwner !== null && clientRecord !== actorOwns) {
+          if (clientRecord) serviceOwner.open(tmpPath!);
+          else serviceOwner.close();
+          actorOwns = clientRecord;
+        }
         // fsync=off (throwaway image); the same environment, as a host reopening with its own.
-        dbHandle = openDatabase(tmpPath!, { skipFsync: true, environment: env });
+        dbHandle = openDatabase(tmpPath!, {
+          skipFsync: true,
+          environment: env,
+          locking: serviceLocking(),
+        });
         dbHandle.setMaxStorageBytes("main", mainStorageLimit);
         attachDb = dbHandle;
         db = dbHandle.session();
@@ -1199,8 +1245,17 @@ function runFile(text: string, disk: boolean): void {
         try {
           drained = drainQuery(db, sql, params);
         } catch (e) {
+          if (clientRecord && codeOf(e) === "25006") {
+            // A writing query: run it again as the owner.
+            c.i = afterPrev;
+            recordDone = false;
+            forceOwner = true;
+            ownerRetries++;
+            continue;
+          }
           throw new Error(`query failed with ${msgOf(e)}\n  SQL: ${sql}`);
         }
+        if (clientRecord) clientQueries++;
         const outcome = drained.outcome;
         const cols = coltypes.length === 0 ? 1 : coltypes.length;
         const actual = renderDrained(drained, cols, sortmode);
@@ -1234,6 +1289,7 @@ function runFile(text: string, disk: boolean): void {
     // §6; JS has no destructor to release it).
     db.close();
     if (dbHandle !== null) dbHandle.close();
+    if (actorOwns) serviceOwner!.close();
     if (tmpDir !== null) rmSync(tmpDir, { recursive: true, force: true });
   }
 }
@@ -1586,8 +1642,15 @@ function main(): number {
   // the demand-paged buffer pool. The two modes catch DIVERGENCES between resident and on-disk-faulted
   // reads (the window-operand touched-set bug the in-memory pass could not see). Every record's SQL-in →
   // rows/error/cost-out must be IDENTICAL in both modes.
-  const disk = process.argv.slice(2).includes("disk");
-  const mode = disk ? "disk" : "memory";
+  // The SERVICE mode (spec/pageservice/README.md §7) is the disk mode with each query record run as a
+  // page client of another core's owner (JED_SERVICE_OWNER = rust | go | node).
+  const service = process.argv.slice(2).includes("service");
+  const disk = service || process.argv.slice(2).includes("disk");
+  let mode = disk ? "disk" : "memory";
+  if (service) {
+    serviceOwner = new OwnerActor(process.env.JED_SERVICE_OWNER ?? "", repoRoot());
+    mode = `service, owner ${process.env.JED_SERVICE_OWNER}`;
+  }
   // The disk pass recounts every commit's live pages by reachability (memory.md §8.7), so the whole
   // corpus checks the incremental count the file-backed storage limit relies on.
   verifyLivePages.enabled = disk;
@@ -1657,6 +1720,12 @@ function main(): number {
   }
 
   console.log(`\n[${mode}] ${passed} passed, ${failed} failed, ${skipped} skipped`);
+  if (serviceOwner !== null) {
+    console.log(
+      `[${mode}] ${clientQueries} query records answered by a page client; ${ownerRetries} writing queries run by the owner`,
+    );
+    serviceOwner.stop();
+  }
   if (forcedTemp) {
     console.log(`[${mode}] forced temp spill: ${tempSpills.count} temp domain(s) spilled`);
     if (tempSpills.count === 0 && !disk && passed > 0) {

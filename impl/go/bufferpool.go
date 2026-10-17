@@ -154,6 +154,20 @@ func (p *bufferPool) invalidate(page uint32) {
 	}
 }
 
+// invalidateAll drops every cached page and detaches every in-flight load — a page client told by the
+// owner that its whole cache may be stale (spec/pageservice/README.md §3.2).
+func (p *bufferPool) invalidateAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.slots = p.slots[:0]
+	p.index = make(map[uint32]int, initialBufferPoolIndexCapacity(p.capacity))
+	p.hand = 0
+	for page, flight := range p.loading {
+		flight.invalidated = true
+		delete(p.loading, page)
+	}
+}
+
 func (p *bufferPool) invalidateLocked(page uint32) {
 	i, ok := p.index[page]
 	if !ok {

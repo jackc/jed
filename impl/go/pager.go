@@ -79,8 +79,11 @@ type pager struct {
 	validatedMeta     []byte
 	manifestProtected map[uint32]bool
 	recoverySync      bool
-	commitInProgress  bool
-	poisoned          bool
+	// trustMeta is set on a page client's pager: the owner validated the meta it serves (or wrote it),
+	// so the client adopts it without re-reading its manifest pages (page-service.md §5.3).
+	trustMeta        bool
+	commitInProgress bool
+	poisoned         bool
 }
 
 // faultPoint selects a point in the commit write sequence at which the fault-injection seam

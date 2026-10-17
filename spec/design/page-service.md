@@ -644,10 +644,11 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
 
 ## 16. Phases
 
-1. **Spec**: message catalog and framing (`spec/pageservice/`), byte fixtures, error registrations
-   (`08006`, `08007`, `08P01`, `25P03`).
-2. **Read path** in Rust, Go, and TS: election, endpoint,
-   `hello`/`begin_read`/`read_pages`/`end_read`, client cache coherence, read-only clients.
+1. ✅ **Spec** (landed): message catalog and framing (`spec/pageservice/`), byte fixtures, error
+   registrations (`08006`, `08007`, `08P01`, `25P03`).
+2. ✅ **Read path** in Rust, Go, and TS (landed, under the test-only `locking = service`): election,
+   endpoint, `hello`/`begin_read`/`read_pages`/`end_read`, client cache coherence, read-only clients
+   ([spec/pageservice/README.md](../pageservice/README.md) §6–§7).
 3. **Write path**: writer gate, reuse grant, `commit` with validation, owner adoption, the
    reclamation rule, `commit_status`.
 4. **Handoff**: promotion, yield, graceful close, timeouts; the process-corpus rewrite; simulation

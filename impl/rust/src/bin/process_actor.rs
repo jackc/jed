@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use jed::{
-    AttachSource, CreateOptions, Database, EngineError, Locking, OpenOptions, Session,
+    AttachSource, CreateOptions, Database, EngineError, Environment, Locking, OpenOptions, Session,
     SessionOptions, Value,
 };
 
@@ -19,13 +19,19 @@ fn run() -> Result<(), EngineError> {
     let mut args = std::env::args().skip(1);
     let action = args.next().expect("usage: process_actor create|open PATH");
     let path = PathBuf::from(args.next().expect("usage: process_actor create|open PATH"));
+    if action == "owner-idle" {
+        // The corpus-through-a-client driver (spec/pageservice/README.md §7): open and close
+        // databases as their page-service owner on command. PATH is the repository root.
+        return owner_idle(&path);
+    }
     let timeout = args.next().and_then(|s| s.parse().ok()).unwrap_or(5000);
-    let locking = if action == "open-exclusive" {
-        Locking::Exclusive
-    } else {
-        Locking::Shared
+    let locking = match action.as_str() {
+        "open-exclusive" => Locking::Exclusive,
+        // The test-only page-service mode (spec/design/page-service.md §16).
+        "create-service" | "open-service" => Locking::Service,
+        _ => Locking::Shared,
     };
-    let mut database = if action == "create" {
+    let mut database = if action == "create" || action == "create-service" {
         Database::create(CreateOptions {
             path: Some(path),
             locking,
@@ -121,6 +127,10 @@ fn run() -> Result<(), EngineError> {
             "STORAGE_BYTES" => database
                 .storage_bytes("main")
                 .map(|bytes| bytes.to_string()),
+            // The page-service benchmark's timed loops (spec/design/benchmarks.md §12).
+            "TIME_LOOKUPS" | "TIME_SCAN" | "TIME_COMMITS" => {
+                timed(&mut database, command, argument)
+            }
             "TXID" => Ok(database.txid().to_string()),
             "PAGE_COUNT" => Ok(database.page_count().to_string()),
             "CLOSE" => {
@@ -138,6 +148,110 @@ fn run() -> Result<(), EngineError> {
         }
     }
     Ok(())
+}
+
+/// Serve `OWNER_OPEN <hex path>` / `OWNER_CLOSE` / `CLOSE`: own one database at a time under the
+/// test-only page-service mode, so another core's conformance harness can run queries as its client.
+fn owner_idle(root: &std::path::Path) -> Result<(), EngineError> {
+    let environment = owner_environment(root)?;
+    println!("READY");
+    io::stdout().flush().expect("flush READY");
+    let mut database: Option<Database> = None;
+    for line in io::stdin().lock().lines() {
+        let line = line.expect("read actor command");
+        let (command, argument) = line.split_once('\t').unwrap_or((&line, ""));
+        let result = match command {
+            "OWNER_OPEN" => decode_sql(argument).and_then(|path| {
+                Database::open_with_options(
+                    path,
+                    OpenOptions {
+                        locking: Locking::Service,
+                        skip_fsync: true,
+                        file_lock_timeout_ms: 5000,
+                        environment: environment.clone(),
+                        ..OpenOptions::default()
+                    },
+                )
+                .map(|db| database = Some(db))
+            }),
+            "OWNER_CLOSE" => match database.take() {
+                Some(db) => db.close(),
+                None => Ok(()),
+            },
+            "CLOSE" => {
+                if let Some(db) = database.take() {
+                    let _ = db.close();
+                }
+                reply_ok("");
+                return Ok(());
+            }
+            other => panic!("unknown owner-idle command {other}"),
+        };
+        match result {
+            Ok(()) => reply_ok(""),
+            Err(error) => reply_error(&error),
+        }
+    }
+    Ok(())
+}
+
+/// The spec's Unicode and time-zone bundles: like any opener, an owner must resolve the collations
+/// a file's catalog references (`XX002` otherwise), and the corpus files use these.
+fn owner_environment(root: &std::path::Path) -> Result<Environment, EngineError> {
+    let read =
+        |rel: &str| std::fs::read(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    Ok(Environment::builder()
+        .load_unicode_data(&read("spec/collation/fixtures/unicode.jucd"))?
+        .load_time_zone_data(&read("spec/tz/fixtures/tzdata.jtz"))?
+        .build())
+}
+
+/// Runs one of the page-service benchmark's loops (spec/design/benchmarks.md §12) and returns
+/// "<elapsed ns>:<checksum>". `argument` is "<iterations>[\t<rows>]". Probe k reads id
+/// (k * 7919) mod rows + 1, so every core runs the same workload; the checksum is the sum of the
+/// values read (TIME_LOOKUPS), the last scan's sum (TIME_SCAN), or 0 (TIME_COMMITS).
+fn timed(database: &mut Database, command: &str, argument: &str) -> Result<String, EngineError> {
+    let mut fields = argument.split('\t');
+    let n: i64 = fields
+        .next()
+        .and_then(|s| s.parse().ok())
+        .expect("iterations");
+    let rows: i64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let mut checksum = 0i64;
+    let start = std::time::Instant::now();
+    let int = |value: &Value| match value {
+        Value::Int(v) => *v,
+        other => panic!("expected an integer, got {other:?}"),
+    };
+    match command {
+        "TIME_LOOKUPS" => {
+            let stmt = database.prepare("SELECT v FROM bench_ps WHERE id = $1")?;
+            for k in 0..n {
+                let mut rows_out =
+                    database.query_prepared(&stmt, &[Value::Int(k * 7919 % rows + 1)])?;
+                for row in rows_out.by_ref() {
+                    checksum += int(&row[0]);
+                }
+                rows_out.error()?;
+            }
+        }
+        "TIME_SCAN" => {
+            for _ in 0..n {
+                let mut rows_out = database.query("SELECT sum(v)::i64 FROM bench_ps", &[])?;
+                for row in rows_out.by_ref() {
+                    checksum = int(&row[0]);
+                }
+                rows_out.error()?;
+            }
+        }
+        _ => {
+            let stmt = database.prepare("UPDATE bench_ps SET v = v + 1 WHERE id = $1")?;
+            for k in 0..n {
+                database.execute_prepared(&stmt, &[Value::Int(k * 7919 % rows + 1)])?;
+            }
+        }
+    }
+    Ok(format!("{}:{checksum}", start.elapsed().as_nanos()))
 }
 
 trait QueryHandle {

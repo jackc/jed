@@ -355,6 +355,14 @@ which an in-memory database never does ([memory.md](memory.md) §6.6) — opts o
 with **`# skip: memory[ — reason]`**. `mise run conformance` runs both modes on all three cores; `mise run
 ci` gates on both.
 
+A third mode, **`service`** (harness arg `service`, owner core in `JED_SERVICE_OWNER`), is the disk
+mode with the owner moved to another core's process: every `query` record runs on a read-only **page
+client** of that owner, and every other record (or a writing query the client refuses `25006`) as
+the owner itself ([../pageservice/README.md](../pageservice/README.md) §7). Page reads are logical
+cost units, so rows, errors, plans, and costs must be unchanged across the page service and across
+cores. `mise run conformance:service` (and `conformance:all`, so `mise run ci`) runs Rust→Go,
+Go→TS, and TS→Rust as client→owner. It skips what the disk mode skips.
+
 ## 4. Determinism rules
 
 The agent loop and cross-impl sync both depend on bit-reproducibility (CLAUDE.md §10).

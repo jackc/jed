@@ -145,14 +145,24 @@ function openBundle(path: string): LockFiles {
   return opened as LockFiles;
 }
 
-function resolvedLocking(mode: Locking | undefined): Locking {
+export function resolvedLocking(mode: Locking | undefined): Locking {
   const value = mode ?? "auto";
   if (value === "auto") return "shared";
   if (value === "shared" || value === "exclusive" || value === "none") return value;
+  if (value === "service") {
+    // The test-only page-service mode (spec/design/page-service.md §16): Unix only (README §5.2).
+    if (process.platform === "win32" || typeof process.geteuid !== "function") {
+      throw engineError(
+        "feature_not_supported",
+        `the page service is unavailable on ${process.platform}`,
+      );
+    }
+    return value;
+  }
   throw engineError("feature_not_supported", `unknown file locking mode: ${String(value)}`);
 }
 
-function timeoutValue(value: number | undefined): number {
+export function timeoutValue(value: number | undefined): number {
   const timeout = value ?? DEFAULT_FILE_LOCK_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeout) || timeout < 0) {
     throw engineError(
@@ -212,7 +222,7 @@ export const osLocks: LockHost = {
 
 // lockUntil polls handle until it is locked or the deadline (microseconds on host's clock; null is
 // none) passes.
-function lockUntil(
+export function lockUntil(
   host: LockHost,
   handle: LockHandle,
   exclusive: boolean,
@@ -232,7 +242,7 @@ function lockUntil(
   }
 }
 
-function canonicalOpenPath(path: string): string {
+export function canonicalOpenPath(path: string): string {
   let real: string;
   try {
     real = realpathSync(path);
@@ -314,7 +324,8 @@ export class FileCoordinator implements FileCoordinatorHost {
       lockUntil(host, files.arrival, false, deadline, path, false);
       host.validateMarker(path);
       let state: LeaseState;
-      if (mode === "exclusive") {
+      // Creating under the page service takes presence EX like exclusive: the creator is the owner.
+      if (mode === "exclusive" || mode === "service") {
         for (;;) {
           lockUntil(host, files.transition, true, deadline, path, false);
           const alone = host.tryLock(files.presence, true);
@@ -345,6 +356,12 @@ export class FileCoordinator implements FileCoordinatorHost {
       host.releasePath(path);
       throw error;
     }
+  }
+
+  // fromElection wraps the bundle an elected page-service owner holds (presence EX, arrival released):
+  // it behaves as an exclusive lease — no join-window probe (spec/pageservice/README.md §6.1).
+  static fromElection(host: LockHost, path: string, files: LockFiles): FileCoordinator {
+    return new FileCoordinator(host, path, files, "exclusive");
   }
 
   checkPid(): void {

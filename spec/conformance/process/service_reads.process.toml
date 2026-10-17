@@ -1,0 +1,132 @@
+schema_version = 1
+name = "service-election-and-reads"
+description = "Page service phase 2: the creator owns and serves; a second opener becomes a read-only page client whose reads follow the owner's commits, keep a pinned snapshot, see reused pages correctly, and hold back compaction."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, v text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 40) FROM generate_series(1, 1000) g"
+
+# The second opener cannot take presence EX, so it connects as a page client.
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64 FROM t"
+expect = "1000:500500"
+
+# A read session pins its snapshot across the owner's commit.
+[[step]]
+actor = "b"
+command = "read_open"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "1000"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "DELETE FROM t WHERE id > 500"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT count(*) FROM t WHERE id > 900"
+expect = "100"
+
+# While a client pins an older snapshot, the owner cannot compact.
+[[step]]
+actor = "a"
+command = "compact"
+expect_error = "55006"
+
+[[step]]
+actor = "b"
+command = "read_close"
+
+# A new read begins with a begin_read round trip and sees the latest commit.
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64 FROM t"
+expect = "500:125250"
+
+# Churn: with no older pin the owner reuses freed pages; the client's cache must drop each
+# reused index (the begin_read invalidation list) to keep reading correct rows.
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = repeat('y', 40) WHERE id <= 250"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('z', 40) FROM generate_series(2001, 2300) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "DELETE FROM t WHERE id BETWEEN 100 AND 199"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64, count(*) FILTER (WHERE v = repeat('y', 40)) FROM t"
+expect = "700:755450:150"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = 'w' WHERE id > 2000"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FILTER (WHERE v = 'w'), count(*) FILTER (WHERE v = repeat('z', 40)) FROM t"
+expect = "300:0"
+
+# A page client is read-only in phase 2.
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1, 'nope')"
+expect_error = "25006"
+
+# With no client pin left, compaction succeeds; the next read begin is told to drop its whole cache.
+# end_read has no reply, so the owner may see the client's last release a moment later: retry.
+[[step]]
+actor = "a"
+command = "compact"
+retry_ms = 2000
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64 FROM t"
+expect = "700:755450"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

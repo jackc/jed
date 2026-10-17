@@ -1,13 +1,14 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-#MISE description="Run every corpus walk concurrently: plain, forced-spill, query-memory (and --checked Rust)"
+#MISE description="Run every corpus walk concurrently: plain, forced-spill, query-memory, page-service (and --checked Rust)"
 #MISE depends=["ts:lock_build"]
 #USAGE flag "--checked" help="Also walk with the Rust `checked` profile (debug assertions + overflow checks)"
 #USAGE arg "[filter]" help="Run only corpus files whose path contains this substring"
 
 # A WALK is one run of a core's conformance runner over the shared corpus in one configuration (core
 # x storage mode x harness settings). This task runs the walks of `conformance`, `conformance:spill`,
-# `conformance:query_memory`, and with --checked `conformance:rust:checked`, all at once. Each walk is
+# `conformance:query_memory`, `conformance:service`, and with --checked `conformance:rust:checked`, all
+# at once. Each walk is
 # an independent single-threaded process, so on a many-core machine the whole set takes about as
 # long as its slowest walk. Those tasks remain for running one family on its own.
 #
@@ -38,6 +39,9 @@ sh "cargo", "build", "--release", "--quiet", "--bin", "conformance", "--manifest
 sh "cargo", "build", "--profile", "checked", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST if CHECKED
 go_bin = File.join(GO_DIR, "bin", "conformance#{EXE}")
 sh "go", "build", "-o", go_bin, "./cmd/conformance", chdir: GO_DIR
+# The page-service walks start another core's process actor as the owner (spec/pageservice/README.md §7).
+sh "cargo", "build", "--release", "--quiet", "--bin", "process_actor", "--manifest-path", RUST_MANIFEST
+sh "go", "build", "-o", "process_actor", "./cmd/process_actor", chdir: GO_DIR
 rust_target = File.expand_path(ENV.fetch("CARGO_TARGET_DIR", "impl/rust/target"), ROOT)
 
 # core => [argv, working directory], matching the per-core tasks in mise.toml.
@@ -46,6 +50,9 @@ CORES = {
   "go" => [[go_bin], GO_DIR],
   "ts" => [%w[node src/bin/conformance.ts], TS_DIR],
 }.freeze
+
+# client core => owner core for the page-service walks.
+SERVICE_PAIRS = { "rust" => "go", "go" => "ts", "ts" => "rust" }.freeze
 
 common_env = ENV["usage_filter"] ? { "JED_CONFORMANCE_FILTER" => ENV["usage_filter"] } : {}
 Dir.mktmpdir("jed-conformance-all") do |dir|
@@ -71,6 +78,11 @@ Dir.mktmpdir("jed-conformance-all") do |dir|
   CORES.each_key do |core|
     add.("spill #{core} operators", core, ["disk"], "JED_CONFORMANCE_WORK_MEM" => "256")
     add.("spill #{core} temp tables", core, [], "JED_CONFORMANCE_TEMP_BUFFERS" => "1")
+  end
+  # `conformance:service`: each core as a page client of another core's owner, so every core is
+  # client once and owner once (spec/pageservice/README.md §7).
+  SERVICE_PAIRS.each do |client, owner|
+    add.("service #{client} client, #{owner} owner", client, ["service"], "JED_SERVICE_OWNER" => owner == "ts" ? "node" : owner)
   end
   # `conformance:query_memory`: accounting active in every mode, each core writing its peaks.
   peaks = Hash.new { |hash, mode| hash[mode] = {} }

@@ -229,19 +229,34 @@ impl FileCoordinator {
         if mode == Locking::None {
             return Ok(None);
         }
-        let path = fs::canonicalize(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                EngineError::new(
-                    SqlState::UndefinedFile,
-                    format!("database file does not exist: {}", path.display()),
-                )
-            } else {
-                io_error("resolve database path", e)
-            }
-        })?;
-        #[cfg(any(unix, windows))]
-        reject_hard_link(&path)?;
+        let path = resolve_open_path(path)?;
         Self::acquire(Arc::new(OsLockHost), path, mode, timeout_ms).map(Some)
+    }
+
+    /// The registered participant of a page-service owner elected at open
+    /// (spec/pageservice/README.md §6.1): presence EX held for its whole tenure and no join-window
+    /// probe, exactly like an exclusive opener. `files` are the bundle locks the election opened;
+    /// the path is already claimed.
+    pub(crate) fn elected_owner(
+        host: Arc<dyn LockHost>,
+        path: PathBuf,
+        files: LockFiles,
+    ) -> FileCoordinator {
+        let opener_pid = host.pid();
+        FileCoordinator {
+            host,
+            path,
+            files,
+            state: AtomicU8::new(LeaseState::Exclusive as u8),
+            signal: Arc::new(ProbeSignal {
+                stop: AtomicBool::new(false),
+                wake_mu: Mutex::new(()),
+                wake: Condvar::new(),
+            }),
+            probe: Mutex::new(None),
+            probe_started: AtomicBool::new(false),
+            opener_pid,
+        }
     }
 
     /// Prepare coordination for an absent database path before the initial image is published.
@@ -494,12 +509,30 @@ impl Drop for FileCoordinator {
     }
 }
 
-fn try_lock(host: &dyn LockHost, handle: &LockHandle, exclusive: bool) -> Result<bool> {
+/// Resolve an existing database path as a coordinated open does (locking.md §3.1): symlinks
+/// followed, the result absolute, and a hard-linked file rejected.
+pub(crate) fn resolve_open_path(path: &Path) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            EngineError::new(
+                SqlState::UndefinedFile,
+                format!("database file does not exist: {}", path.display()),
+            )
+        } else {
+            io_error("resolve database path", e)
+        }
+    })?;
+    #[cfg(any(unix, windows))]
+    reject_hard_link(&resolved)?;
+    Ok(resolved)
+}
+
+pub(crate) fn try_lock(host: &dyn LockHost, handle: &LockHandle, exclusive: bool) -> Result<bool> {
     host.try_lock(handle, exclusive)
         .map_err(classify_lock_error)
 }
 
-fn lock_until(
+pub(crate) fn lock_until(
     host: &dyn LockHost,
     handle: &LockHandle,
     exclusive: bool,
@@ -516,11 +549,11 @@ fn lock_until(
     }
 }
 
-fn deadline(host: &dyn LockHost, timeout_ms: u64) -> Option<Instant> {
+pub(crate) fn deadline(host: &dyn LockHost, timeout_ms: u64) -> Option<Instant> {
     Some(host.now() + Duration::from_millis(timeout_ms))
 }
 
-fn check_deadline(
+pub(crate) fn check_deadline(
     host: &dyn LockHost,
     deadline: Option<Instant>,
     path: &Path,
@@ -544,6 +577,16 @@ fn check_deadline(
 }
 
 fn resolve_mode(mode: Locking) -> Result<Locking> {
+    if mode == Locking::Service {
+        // Creating under the test-only page-service mode takes presence EX like an exclusive opener:
+        // the creator is the owner (spec/pageservice/README.md §6.1). Windows serving is not yet
+        // specified (page-service.md §14).
+        return if cfg!(unix) {
+            Ok(Locking::Exclusive)
+        } else {
+            Err(service_unsupported())
+        };
+    }
     #[cfg(any(unix, windows))]
     {
         Ok(if mode == Locking::Auto {
@@ -563,6 +606,14 @@ fn resolve_mode(mode: Locking) -> Result<Locking> {
             ))
         }
     }
+}
+
+/// `locking = service` off Unix (page-service.md §14).
+pub(crate) fn service_unsupported() -> EngineError {
+    EngineError::new(
+        SqlState::FeatureNotSupported,
+        "the page service is unavailable on this platform",
+    )
 }
 
 fn open_bundle(path: &Path) -> Result<LockFiles> {
@@ -701,7 +752,7 @@ fn classify_lock_error(error: std::io::Error) -> EngineError {
     }
 }
 
-fn lock_error(error: std::io::Error, path: &Path) -> EngineError {
+pub(crate) fn lock_error(error: std::io::Error, path: &Path) -> EngineError {
     let mut classified = classify_lock_error(error);
     classified.message = format!("{}: {}", classified.message, path.display());
     classified

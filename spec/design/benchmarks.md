@@ -1642,3 +1642,23 @@ At baseline `cb80cdff`, the Linux/amd64 local five-sample medians were 46.4 µs 
 were 1.59 µs, 4.35 µs, and 60.3 µs respectively (the UPDATE control is unchanged within noise). These are local filesystem measurements,
 not predictions for macOS/APFS. Storage regression tests separately require zero writes/barriers
 for unchanged domains; timings are not conformance assertions.
+
+## 12. Page-service benchmarks
+
+`mise run bench:page_service [cores]` measures the page service ([page-service.md](page-service.md)
+§15) through the real-process actors, so every core is measured as owner and as client of every core
+over one deterministic workload: a 200 000-row `bench_ps (id i64 PRIMARY KEY, v i64, pad text)` table,
+point lookups of id `(k × 7919) mod rows + 1`, a `sum(v)` scan, and single-row durable commits. Each
+timed loop returns a checksum; the run fails if any engine or pairing disagrees. Lanes:
+
+| Lane | What it measures |
+|---|---|
+| `alone_*` | the shared-mode alone fast path (`locking = auto`), the baseline |
+| `owner_*` | a page-service owner with no client: the alone-owner fast path, which must match `alone_*` |
+| `client_cold_scan` / `client_cold_lookup` | a freshly opened page client's first reads: every leaf it touches is fetched with `read_pages` |
+| `client_warm_scan` / `client_warm_lookup` | the same reads with the client's buffer pool warm: one `begin_read` round trip per query |
+
+It is a wall-clock benchmark outside `mise run ci` (§10); results go to
+`bench/results/page-service-<stamp>.jsonl`. The before/after check that the page-service hooks cost the
+ordinary alone path nothing uses the standard lanes (`point_lookup_pk`, `full_scan_agg`,
+`insert_commit_durable`) of `bench:run`, alternating base and changed binaries.

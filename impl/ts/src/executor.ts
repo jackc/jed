@@ -1898,6 +1898,12 @@ export class Engine {
   // live is the live-page accounting of the committed file state (spec/design/memory.md §8.7): read
   // from the meta at open and advanced by every durable commit. Unused for an in-memory storage.
   live: LiveCount;
+  // lastCommitMeta and lastCommitWritten are the last durable file commit's meta page and the page
+  // indices it wrote (body, free-list, and manifest-overflow pages; the meta slots excluded) — what a
+  // page-service owner publishes to its clients (spec/pageservice/README.md §4). Set by persist.ts
+  // commitFile; null / empty until the first commit.
+  lastCommitMeta: Uint8Array | null;
+  lastCommitWritten: number[];
   // tempStorage is the SESSION-LOCAL temp domain's storage Engine (temp-tables.md §6): the private in-RAM
   // MemoryBlockStore + pager + pinned pool its temp tables ride, with within-session compaction on.
   // Created lazily on the first session-local temp DDL (newTempStorage); null until then. Its pageCount
@@ -1991,6 +1997,8 @@ export class Engine {
     this.liveAtCompaction = 0;
     this.freeGenTxid = 0n;
     this.live = { live: 0, catalog: 0, gist: 0 };
+    this.lastCommitMeta = null;
+    this.lastCommitWritten = [];
     this.tempStorage = null;
     this.spilled = false;
     this.openStreams = 0;

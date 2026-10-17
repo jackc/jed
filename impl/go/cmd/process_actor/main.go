@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	jed "github.com/jackc/jed/impl/go"
 )
@@ -31,11 +33,20 @@ func run() error {
 	}
 	var db *jed.Database
 	var err error
-	locking := jed.LockingShared
-	if os.Args[1] == "open-exclusive" {
-		locking = jed.LockingExclusive
+	if os.Args[1] == "owner-idle" {
+		// The corpus-through-a-client driver (spec/pageservice/README.md §7): open and close databases
+		// as their page-service owner on command.
+		return ownerIdle(os.Args[2])
 	}
-	if os.Args[1] == "create" {
+	locking := jed.LockingShared
+	switch os.Args[1] {
+	case "open-exclusive":
+		locking = jed.LockingExclusive
+	case "create-service", "open-service":
+		// The test-only page-service mode (spec/design/page-service.md §16).
+		locking = jed.LockingService
+	}
+	if os.Args[1] == "create" || os.Args[1] == "create-service" {
 		db, err = jed.CreateDatabase(jed.CreateOptions{Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout})
 	} else {
 		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{Locking: locking, FileLockTimeoutMs: &timeout})
@@ -96,6 +107,9 @@ func run() error {
 			var bytes int64
 			bytes, err = db.StorageBytes("main")
 			value = strconv.FormatInt(bytes, 10)
+		case "TIME_LOOKUPS", "TIME_SCAN", "TIME_COMMITS":
+			// The page-service benchmark's timed loops (spec/design/benchmarks.md §12).
+			value, err = timed(db, command, argument)
 		case "TXID":
 			value = strconv.FormatUint(db.Txid(), 10)
 		case "PAGE_COUNT":
@@ -166,4 +180,113 @@ func replyError(err error) {
 	} else {
 		fmt.Printf("ERR\tXXXXX\t%s\n", hex.EncodeToString([]byte(err.Error())))
 	}
+}
+
+// ownerIdle serves OWNER_OPEN <hex path> / OWNER_CLOSE / CLOSE: it owns one database at a time under
+// the test-only page-service mode, so another core's conformance harness can run queries as its client.
+// root is the repository root, whose spec bundles the owner loads.
+func ownerIdle(root string) error {
+	env, err := ownerEnvironment(root)
+	if err != nil {
+		return err
+	}
+	fmt.Println("READY")
+	var db *jed.Database
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		command, argument, _ := strings.Cut(scanner.Text(), "\t")
+		var err error
+		switch command {
+		case "OWNER_OPEN":
+			timeout := uint64(5000)
+			db, err = jed.OpenDatabaseWithOptions(sql(argument), jed.OpenOptions{Locking: jed.LockingService, SkipFsync: true, FileLockTimeoutMs: &timeout, Environment: env})
+		case "OWNER_CLOSE":
+			if db != nil {
+				err = db.Close()
+				db = nil
+			}
+		case "CLOSE":
+			if db != nil {
+				_ = db.Close()
+			}
+			replyOK("")
+			return nil
+		default:
+			panic("unknown owner-idle command " + command)
+		}
+		if err != nil {
+			replyError(err)
+		} else {
+			replyOK("")
+		}
+	}
+	return scanner.Err()
+}
+
+// ownerEnvironment loads the spec's Unicode and time-zone bundles: like any opener, an owner must
+// resolve the collations a file's catalog references (XX002 otherwise), and the corpus files use these.
+func ownerEnvironment(root string) (*jed.Environment, error) {
+	b := jed.NewEnvironmentBuilder()
+	unicode, err := os.ReadFile(filepath.Join(root, "spec", "collation", "fixtures", "unicode.jucd"))
+	if err != nil {
+		return nil, err
+	}
+	if err := b.LoadUnicodeData(unicode); err != nil {
+		return nil, err
+	}
+	tz, err := os.ReadFile(filepath.Join(root, "spec", "tz", "fixtures", "tzdata.jtz"))
+	if err != nil {
+		return nil, err
+	}
+	if err := b.LoadTimeZoneData(tz); err != nil {
+		return nil, err
+	}
+	return b.Build(), nil
+}
+
+// timed runs one of the page-service benchmark's loops (spec/design/benchmarks.md §12) and returns
+// "<elapsed ns>:<checksum>". argument is "<iterations>[\t<rows>]". Probe k reads id
+// (k * 7919) mod rows + 1, so every core runs the same workload; the checksum is the sum of the
+// values read (TIME_LOOKUPS), the last scan's sum (TIME_SCAN), or 0 (TIME_COMMITS).
+func timed(db *jed.Database, command, argument string) (string, error) {
+	fields := strings.Split(argument, "\t")
+	n, _ := strconv.ParseInt(fields[0], 10, 64)
+	rows := int64(1)
+	if len(fields) > 1 {
+		rows, _ = strconv.ParseInt(fields[1], 10, 64)
+	}
+	ctx := context.Background()
+	var checksum int64
+	start := time.Now()
+	switch command {
+	case "TIME_LOOKUPS":
+		stmt, err := db.Prepare("SELECT v FROM bench_ps WHERE id = $1")
+		if err != nil {
+			return "", err
+		}
+		for k := int64(0); k < n; k++ {
+			var v int64
+			if err := db.QueryRowPrepared(ctx, stmt, k*7919%rows+1).Scan(&v); err != nil {
+				return "", err
+			}
+			checksum += v
+		}
+	case "TIME_SCAN":
+		for k := int64(0); k < n; k++ {
+			if err := db.QueryRow(ctx, "SELECT sum(v)::i64 FROM bench_ps").Scan(&checksum); err != nil {
+				return "", err
+			}
+		}
+	case "TIME_COMMITS":
+		stmt, err := db.Prepare("UPDATE bench_ps SET v = v + 1 WHERE id = $1")
+		if err != nil {
+			return "", err
+		}
+		for k := int64(0); k < n; k++ {
+			if _, err := db.ExecPrepared(ctx, stmt, k*7919%rows+1); err != nil {
+				return "", err
+			}
+		}
+	}
+	return fmt.Sprintf("%d:%d", time.Since(start).Nanoseconds(), checksum), nil
 }

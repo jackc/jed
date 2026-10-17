@@ -417,6 +417,8 @@ function commitFile(
   paging.writeBlock(Number(snap.txid & 1n), meta);
   paging.sync(); // one durability barrier covers body + descriptor + meta
   paging.finishDurableCommit(snap.txid, metaChecksum(meta));
+  db.lastCommitMeta = meta;
+  db.lastCommitWritten = [...write.pages, ...plan.pages, ...manifest.pages].map((pg) => pg.index);
   db.pageCount = plan.newPageCount;
   db.freePages = plan.persisted;
   db.liveAtCompaction = plan.newLive;

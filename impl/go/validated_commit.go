@@ -110,6 +110,11 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 		if !ok || m.pageCount > p.allocatedPages {
 			continue
 		}
+		if p.trustMeta {
+			p.validatedMeta = append(p.validatedMeta[:0], raw...)
+			p.manifestProtected = map[uint32]bool{}
+			return m, nil
+		}
 		if !bytes.Equal(raw, p.validatedMeta) || p.manifestProtected == nil {
 			valid, err := p.validateCommitManifest(m, raw)
 			if err != nil {
