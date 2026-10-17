@@ -184,8 +184,7 @@ impl Engine {
                 self.index_bound_entries(table_name, ib, params, &[], mask, &[])?
             }
             Some(ScanBound::Gin(gb)) => {
-                let query =
-                    filter.and_then(|f| gin_match(f, gb.col_global, gb.opclass).map(|(_, q)| q));
+                let query = filter.and_then(|f| gin_bound_query(f, gb));
                 self.gin_bound_rows(table_name, gb, query, &[], env, meter, mask, false)?
             }
             Some(ScanBound::Gist(gb)) => {
@@ -245,20 +244,37 @@ impl Engine {
         // Extract the query's distinct terms. This (the opclass `extract_query_terms`) is a pure
         // planning step, NOT metered (cost.md §3) — evaluate `Q` on a scratch meter. `Q` is a
         // `query_row` is empty for a constant bound and the combined left row for a sibling INL.
-        let qv = match query {
-            Some(q) => q.eval(query_row, env, &mut env.exec.session.scratch_meter())?,
-            None => return Ok((Vec::new(), (0, 0))),
+        let Some(query) = query else {
+            return Ok((Vec::new(), (0, 0)));
         };
-        let terms = match gin_query_terms(gb.opclass, gb.strategy, &qv) {
-            GinQuery::Empty => return Ok((Vec::new(), (0, 0))),
-            // Rows the index cannot enumerate (they carry no terms) may match: scan them all and let
-            // the residual filter keep the right ones (gin.md §6 / §2.1).
-            GinQuery::FullScan => {
-                let (entries, pages, slabs) = store.scan_with_units(mask)?;
-                return Ok((entries, (pages, slabs)));
+        // A disjunctive bound's query is its `OR` node (gin.md §6.3): every arm's operand is
+        // extracted, in source order, before any posting list is read.
+        let arms: Vec<(GinStrategy, &RExpr)> = if gb.or_arms.is_empty() {
+            vec![(gb.strategy, query)]
+        } else {
+            gin_or_arms(query)
+                .into_iter()
+                .map(|arm| {
+                    gin_match(arm, gb.col_global, gb.opclass)
+                        .expect("a disjunctive GIN bound's arms each match (plan-time detection)")
+                })
+                .collect()
+        };
+        let mut queries = Vec::with_capacity(arms.len());
+        for (strategy, operand) in arms {
+            let qv = operand.eval(query_row, env, &mut env.exec.session.scratch_meter())?;
+            match gin_query_terms(gb.opclass, strategy, &qv) {
+                GinQuery::Empty => {}
+                // Rows the index cannot enumerate (they carry no terms) may match: scan them all and
+                // let the residual filter keep the right ones (gin.md §6 / §2.1). One such arm makes
+                // the whole disjunction fall back.
+                GinQuery::FullScan => {
+                    let (entries, pages, slabs) = store.scan_with_units(mask)?;
+                    return Ok((entries, (pages, slabs)));
+                }
+                GinQuery::Terms(terms) => queries.push((strategy, terms)),
             }
-            GinQuery::Terms(terms) => terms,
-        };
+        }
 
         // Gather each term's posting list: the entry range [term, successor) of the GIN tree
         // (gin.md §4). The entry is `term ‖ storage_key` and every term self-delimits — an
@@ -269,19 +285,16 @@ impl Engine {
         let mut gather = GinGather::default();
         // The candidate storage keys, in ascending byte (= storage-key) order, so the point lookups
         // and the emitted rows follow storage order exactly as a full scan would (gin.md §6/§8).
-        let candidates: Vec<Vec<u8>> = if gb.strategy.is_any() {
-            // mode ANY (`&&`, `?|`) → the union of every whole posting list
+        let candidates: Vec<Vec<u8>> = if queries.len() == 1 {
+            let (strategy, terms) = queries.pop().expect("one arm");
+            gather.arm(istore, strategy, terms)?
+        } else {
+            // A disjunction: each arm's candidates in source order, unioned (gin.md §6.3).
             let mut union = BTreeSet::new();
-            for term in &terms {
-                union.extend(gather.posting_list(istore, term)?);
+            for (strategy, terms) in queries {
+                union.extend(gather.arm(istore, strategy, terms)?);
             }
             union.into_iter().collect()
-        } else {
-            // mode ALL → intersection. `= ANY` (Member) and `?` are a single term, so the
-            // intersection is that lone posting list; array `=` (Equal) gathers the same superset as
-            // `@>` over `Q`'s distinct non-NULL terms (the residual `=` makes it exact downstream) —
-            // gin.md §6; the `jsonb_ops` gathers are supersets the residual rechecks (§2.1).
-            gather.intersect(istore, terms)?
         };
         meter.charge(COSTS.gin_entry * gather.entries as i64);
         let mut pages = gather.pages;
@@ -475,6 +488,28 @@ impl GinGather {
             .into_iter()
             .map(|(ekey, _)| ekey[term.len()..].to_vec())
             .collect())
+    }
+
+    /// One strategy's candidates over its distinct query terms: mode ANY (`&&`, `?|`) → the union
+    /// of every whole posting list; mode ALL → the intersection. `= ANY` (Member) and `?` are a single
+    /// term, so the intersection is that lone posting list; array `=` (Equal) gathers the same
+    /// superset as `@>` over `Q`'s distinct non-NULL terms (the residual `=` makes it exact
+    /// downstream) — gin.md §6; the `jsonb_ops` gathers are supersets the residual rechecks (§2.1).
+    fn arm(
+        &mut self,
+        istore: &TableStore,
+        strategy: GinStrategy,
+        terms: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>> {
+        if strategy.is_any() {
+            let mut union = BTreeSet::new();
+            for term in &terms {
+                union.extend(self.posting_list(istore, term)?);
+            }
+            Ok(union.into_iter().collect())
+        } else {
+            self.intersect(istore, terms)
+        }
     }
 
     /// A term's whole posting list (a prefix range scan).

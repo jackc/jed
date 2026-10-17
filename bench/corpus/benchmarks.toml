@@ -2755,6 +2755,37 @@ gen = "int_uniform"
 min = 1
 max = 500
 
+# GIN disjunction: an IN list of array constants over the GIN-indexed column is an OR of array
+# equalities, which jed bounds by the union of each arm's `@>`-superset gather (spec/design/gin.md
+# §6.3; query.gin_disjunction) — PostgreSQL's BitmapOr of GIN index scans. Before the disjunction
+# bound jed full-scanned all 200k rows per query. The answer is index-independent, so the
+# cross-engine checksum holds.
+[[bench]]
+name = "gin_in"
+description = "GIN IN list: rows whose tags array equals one of three query arrays — the union of three equality gathers over a 200k-row bigint[] column"
+dataset = "gin"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM docs WHERE tags IN (ARRAY[$1::bigint, $2::bigint], ARRAY[$3::bigint], ARRAY[$2::bigint, $3::bigint]) ORDER BY id"
+warmup = 200
+iterations = 2000
+seed = 4213
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
+
 # GIN-bounded DELETE: a mutation whose WHERE has a GIN-accelerable `@>` conjunct bounds its
 # target-row scan through the GIN index (spec/design/gin.md §6; query.gin_mutation), just like the
 # gin_contains SELECT — instead of full-scanning the 200k rows. Each iteration BEGINs, deletes the

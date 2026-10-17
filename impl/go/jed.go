@@ -360,6 +360,7 @@ var SupportedCapabilities = []string{
 	// GIN over a jsonb column — the jsonb_ops opclass: key/value terms (flag ‖ terminated body, cut at
 	// 128 bytes), accelerating @> / <@ / ? / ?| / ?& (gin.md §2.1/§4.1).
 	"query.gin_jsonb_ops",
+	"query.gin_disjunction",
 	"query.is_null",
 	"query.order_by",
 	// Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

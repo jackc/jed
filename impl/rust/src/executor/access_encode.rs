@@ -126,6 +126,28 @@ pub(crate) struct GinBound {
     pub(crate) strategy: GinStrategy,
     /// The GIN-indexed column's global scope index (`rel.offset + ci`).
     pub(crate) col_global: usize,
+    /// A disjunctive bound (gin.md §6.3): the strategy of every arm of an `OR` conjunct (an `IN`
+    /// list desugars to one) whose every disjunct holds an accelerable conjunct on this column, in
+    /// source order. Empty for the ordinary single-conjunct bound; non-empty, `strategy` is the
+    /// first arm's.
+    pub(crate) or_arms: Vec<GinStrategy>,
+}
+
+impl GinBound {
+    /// The bound's structural access selectivity (estimator.md §7): its strategy's access-method
+    /// class, or for a disjunctive bound the OR fold of every arm's class in source order.
+    pub(crate) fn structural_selectivity(&self) -> crate::estimator::Selectivity {
+        use crate::estimator::{or_selectivities, selectivity_class};
+        if self.or_arms.is_empty() {
+            return selectivity_class(self.strategy.access_method());
+        }
+        or_selectivities(
+            self.or_arms
+                .iter()
+                .map(|arm| selectivity_class(arm.access_method()))
+                .collect(),
+        )
+    }
 }
 
 /// One column of an index access predicate's equality prefix (indexes.md §5.1): the column's
@@ -1633,7 +1655,7 @@ fn estimator_candidate_selectivity(
                 selectivity_class(ACCESS_GIST_RANGE)
             }
         }
-        Some(ScanBound::Gin(bound)) => selectivity_class(bound.strategy.access_method()),
+        Some(ScanBound::Gin(bound)) => bound.structural_selectivity(),
         Some(ScanBound::PkSet(bound)) => pk_set_structural_selectivity(bound),
         Some(ScanBound::IndexSet(bound)) => {
             let unique = rel
@@ -2331,12 +2353,37 @@ fn gin_candidate_term_estimate(
     let Some(ScanBound::Gin(bound)) = bound else {
         return None;
     };
-    let (strategy, operand) = gin_match(residual?, bound.col_global, bound.opclass)?;
-    if strategy != bound.strategy {
-        return None;
-    }
     let column = bound.col_global.checked_sub(rel.offset)?;
-    let estimate = statistics_gin_estimate(rel, column, bound.opclass, strategy, operand, catalog)?;
+    let estimate = if bound.or_arms.is_empty() {
+        let (strategy, operand) = gin_match(residual?, bound.col_global, bound.opclass)?;
+        if strategy != bound.strategy {
+            return None;
+        }
+        statistics_gin_estimate(rel, column, bound.opclass, strategy, operand, catalog)?
+    } else {
+        // A disjunctive bound (gin.md §6.3) prices every arm and sums them (the OR rule's
+        // disjoint-union upper estimate, estimator.md §7.1); any arm without a term estimate keeps
+        // the structural default for the whole bound.
+        let arms = gin_or_arms(gin_or_match(residual?, bound.col_global, bound.opclass)?);
+        let mut sum: Option<GinTermEstimate> = None;
+        for arm in arms {
+            let (strategy, operand) = gin_match(arm, bound.col_global, bound.opclass)?;
+            let e =
+                statistics_gin_estimate(rel, column, bound.opclass, strategy, operand, catalog)?;
+            sum = Some(match sum {
+                None => e,
+                Some(acc) => GinTermEstimate {
+                    rows: acc.rows.saturating_add(e.rows),
+                    entries: acc.entries.saturating_add(e.entries),
+                    total_entries: acc.total_entries,
+                },
+            });
+        }
+        let mut e = sum?;
+        let current = current_column_statistics(rel, column, catalog)?;
+        e.rows = e.rows.min(current.nonnull_rows);
+        e
+    };
     let index = catalog.index_store_scoped(rel.db.as_deref(), &bound.name_key);
     let (nodes, height) = (index.node_count() as i64, index.height() as i64);
     let pages = estimator_clamp_pages(
@@ -2506,9 +2553,7 @@ pub(crate) fn estimate_selected_scan(
                     crate::estimator_constants::ACCESS_GIST_RANGE
                 },
             ),
-            Some(ScanBound::Gin(bound)) => {
-                crate::estimator::selectivity_class(bound.strategy.access_method())
-            }
+            Some(ScanBound::Gin(bound)) => bound.structural_selectivity(),
             Some(ScanBound::PkSet(bound)) => pk_set_structural_selectivity(bound),
             Some(ScanBound::IndexSet(bound)) => {
                 let unique = rel
@@ -3648,6 +3693,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
                         opclass,
                         strategy,
                         col_global,
+                        or_arms: Vec::new(),
                     })),
                     where_filter,
                 ));
@@ -3928,9 +3974,62 @@ pub(crate) fn build_gin_bound_for_index(
             opclass,
             strategy,
             col_global,
+            or_arms: Vec::new(),
         });
     }
-    None
+    // No single accelerable conjunct: an `OR` conjunct whose every arm is one (an `IN` list over the
+    // column) bounds the scan by the union of the arms' gathers (gin.md §6.3).
+    let or = gin_or_match(filter, col_global, opclass)?;
+    let or_arms: Vec<GinStrategy> = gin_or_arms(or)
+        .into_iter()
+        .map(|arm| gin_match(arm, col_global, opclass).map(|(s, _)| s))
+        .collect::<Option<_>>()?;
+    Some(GinBound {
+        name_key: idx.name.to_string(),
+        opclass,
+        strategy: or_arms[0],
+        col_global,
+        or_arms,
+    })
+}
+
+/// The disjunctive GIN conjunct (gin.md §6.3): the first conjunct of the `WHERE` AND-chain that is an
+/// `OR` (an `IN` list over the column desugars to one) every one of whose disjuncts — flattened left
+/// to right — holds a constant accelerable conjunct on the indexed column (`gin_match`). Returns the
+/// `OR` node; [`gin_or_arms`] lists its disjuncts.
+pub(crate) fn gin_or_match(
+    filter: &RExpr,
+    col_global: usize,
+    opclass: GinOpclass,
+) -> Option<&RExpr> {
+    match filter {
+        RExpr::And(l, r) => {
+            gin_or_match(l, col_global, opclass).or_else(|| gin_or_match(r, col_global, opclass))
+        }
+        RExpr::Or(..) => gin_or_arms(filter)
+            .into_iter()
+            .all(|arm| gin_match(arm, col_global, opclass).is_some())
+            .then_some(filter),
+        _ => None,
+    }
+}
+
+/// The disjuncts of an `OR` node, flattened in source order.
+pub(crate) fn gin_or_arms(or: &RExpr) -> Vec<&RExpr> {
+    let mut arms = Vec::new();
+    estimator_flatten_boolean(or, false, &mut arms);
+    arms
+}
+
+/// The query node a constant GIN bound gathers from, recovered from the plan's filter at execution:
+/// the single conjunct's query operand, or a disjunctive bound's `OR` node (gin.md §6.3). Plan time
+/// and execution use the same matchers, so they agree on the conjunct by construction.
+pub(crate) fn gin_bound_query<'a>(filter: &'a RExpr, gb: &GinBound) -> Option<&'a RExpr> {
+    if gb.or_arms.is_empty() {
+        gin_match(filter, gb.col_global, gb.opclass).map(|(_, q)| q)
+    } else {
+        gin_or_match(filter, gb.col_global, gb.opclass)
+    }
 }
 
 /// Inventory one single-column GiST index. Multi-column GiST indexes are EXCLUDE backing structures

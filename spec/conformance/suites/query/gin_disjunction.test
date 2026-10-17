@@ -1,0 +1,215 @@
+# GIN disjunctions — an `IN` list over a GIN-indexed column, or any `OR` whose every arm holds an
+# accelerable GIN conjunct on that column, bounds the scan by the UNION of the arms' gathers
+# (spec/design/gin.md §6.3; PostgreSQL's BitmapOr of GIN index scans). `col IN (Q1, Q2)` desugars to
+# `col = Q1 OR col = Q2`, so each arm is an array-equality gather; arms may mix strategies (`@>`,
+# `&&`, `= ANY`, `=`, and the jsonb_ops shapes) and may be ANDs that hold one. The whole WHERE stays
+# the residual filter, so the rows are the full scan's — the oracle agrees.
+#
+# The `# cost:` assertions pin that the bound is taken: each arm's posting reads (page_read +
+# gin_entry), one point lookup per candidate of the union, and the residual operator_eval per
+# candidate. An arm whose query is provably empty (a NULL `Q`) reads nothing; an arm whose matches the
+# index cannot enumerate (`col = '{}'`) makes the whole disjunction fall back to the full scan. An
+# `OR` with an arm the index cannot serve is not a GIN candidate. Costs are cross-core identical
+# (CLAUDE.md §8); query/gin_disjunction_explain.test pins the plans.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, query.gin_jsonb_ops, query.gin_disjunction, query.logical_connectives, expr.in_list, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, types.i32, types.text, types.array, types.jsonb, func.array_containment, func.array_quantified, func.jsonb_contains, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], n i32)
+
+statement ok
+CREATE INDEX t_tags_gin ON t USING gin (tags)
+
+statement ok
+INSERT INTO t VALUES
+  (1, '{1,2}', 1),
+  (2, '{2,1}', 2),
+  (3, '{3}', 3),
+  (4, '{1,2,3}', 4),
+  (5, '{}', 5),
+  (6, NULL, 6),
+  (7, '{4,5}', 7),
+  (8, '{5}', 8),
+  (9, '{1,NULL}', 9),
+  (10, '{6,7}', 10)
+
+# ---- IN over array constants: the union of each equality gather ---------------------------------
+
+# cost: 33
+query I nosort
+SELECT id FROM t WHERE tags IN ('{1,2}'::i32[], '{3}'::i32[]) ORDER BY id
+----
+1
+3
+
+# the same list with ARRAY constructors
+# cost: 40
+query I nosort
+SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[3]) ORDER BY id
+----
+1
+3
+
+# overlapping arms: a row in both arms' gathers is fetched once
+# cost: 57
+query I nosort
+SELECT id FROM t WHERE tags IN (ARRAY[1,2], ARRAY[2,1], ARRAY[1,2,3]) ORDER BY id
+----
+1
+2
+4
+
+# a NULL arm reads nothing; the other arm still gathers
+# cost: 16
+query I nosort
+SELECT id FROM t WHERE tags IN (NULL, ARRAY[5]) ORDER BY id
+----
+8
+
+# an arm with an empty array matches rows the index cannot enumerate: the whole bound falls back
+# to the full scan (cost includes every row)
+# cost: 51
+query I nosort
+SELECT id FROM t WHERE tags IN ('{}'::i32[], ARRAY[3]) ORDER BY id
+----
+3
+5
+
+# an arm holding a NULL element still gathers its non-NULL terms (array `=` treats NULL elements as
+# equal, so row 9 matches)
+# cost: 44
+query I nosort
+SELECT id FROM t WHERE tags IN (ARRAY[1,NULL], ARRAY[6,7]) ORDER BY id
+----
+9
+10
+
+# ---- OR of mixed strategies -----------------------------------------------------------------------
+
+# cost: 44
+query I nosort
+SELECT id FROM t WHERE tags @> ARRAY[3] OR tags && ARRAY[5,7] ORDER BY id
+----
+3
+4
+7
+8
+10
+
+# cost: 25
+query I nosort
+SELECT id FROM t WHERE 4 = ANY(tags) OR tags @> ARRAY[2,3] ORDER BY id
+----
+4
+7
+
+# an arm may be an AND holding the accelerable conjunct
+# cost: 59
+query I nosort
+SELECT id FROM t WHERE (tags @> ARRAY[1] AND n > 2) OR tags = ARRAY[5] ORDER BY id
+----
+4
+8
+9
+
+# an OR combined with another conjunct: the disjunction bounds the scan, the rest filters
+# cost: 50
+query I nosort
+SELECT id FROM t WHERE n < 8 AND (tags @> ARRAY[1] OR tags @> ARRAY[5]) ORDER BY id
+----
+1
+2
+4
+7
+
+# an arm the index cannot serve (n = 3) leaves the query a full scan
+# cost: 52
+query I nosort
+SELECT id FROM t WHERE tags @> ARRAY[4] OR n = 3 ORDER BY id
+----
+3
+7
+
+# NOT IN is an AND of `<>`, never a GIN bound
+# cost: 76
+query I nosort
+SELECT id FROM t WHERE tags NOT IN (ARRAY[1,2], ARRAY[3]) ORDER BY id
+----
+2
+4
+5
+7
+8
+9
+10
+
+# ---- jsonb_ops arms -------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, doc jsonb)
+
+statement ok
+CREATE INDEX d_doc_gin ON d USING gin (doc)
+
+statement ok
+INSERT INTO d VALUES
+  (1, '{"a": 1, "b": "x"}'),
+  (2, '{"a": 2}'),
+  (3, '{"c": [1, 2]}'),
+  (4, '["b", "c"]'),
+  (5, '{}'),
+  (6, NULL)
+
+# cost: 25
+query I nosort
+SELECT id FROM d WHERE doc @> '{"a": 2}' OR doc ? 'c' ORDER BY id
+----
+2
+3
+4
+
+# cost: 25
+query I nosort
+SELECT id FROM d WHERE doc ?| '{b,zz}' OR doc @> '{"c": [2]}' ORDER BY id
+----
+1
+3
+4
+
+# IN over jsonb has no jsonb_ops strategy (`=`): a full scan
+# cost: 26
+query I nosort
+SELECT id FROM d WHERE doc IN ('{"a": 2}'::jsonb, '{}'::jsonb) ORDER BY id
+----
+2
+5
+
+# ---- GIN-bounded mutations ------------------------------------------------------------------------
+
+# cost: 34
+statement ok
+UPDATE t SET n = n + 100 WHERE tags IN (ARRAY[3], ARRAY[5])
+
+query II nosort
+SELECT id, n FROM t WHERE n > 100 ORDER BY id
+----
+3
+103
+8
+108
+
+# cost: 24
+statement ok
+DELETE FROM t WHERE tags @> ARRAY[6] OR tags = ARRAY[3]
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+4
+5
+6
+7
+8
+9

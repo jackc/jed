@@ -412,9 +412,10 @@ impl Engine {
                 }
             }
             Some(ScanBound::Gin(gb)) => {
-                let query = plan.filter.get().and_then(|filter| {
-                    gin_match(filter, gb.col_global, gb.opclass).map(|(_, q)| q)
-                });
+                let query = plan
+                    .filter
+                    .get()
+                    .and_then(|filter| gin_bound_query(filter, gb));
                 let (mut candidates, (pages, slabs)) = self.gin_bound_rows(
                     &plan.rels[0].table_name,
                     gb,
@@ -2341,9 +2342,7 @@ impl Engine {
                                     .map(|(_, q)| q)
                             })
                     } else {
-                        plan.filter
-                            .access()
-                            .and_then(|f| gin_match(f, gb.col_global, gb.opclass).map(|(_, q)| q))
+                        plan.filter.access().and_then(|f| gin_bound_query(f, gb))
                     };
                     let (pairs, units) = self.gin_bound_rows(
                         &rel.table_name,

@@ -637,6 +637,9 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   or reversed opclass operators full-scans, and both must reach the same end state;
   **gin_inl** — a GIN `@>` query from an earlier sibling is compared with the equivalent reversed
   `<@` spelling that defeats the sibling bound, including NULL/empty query arrays;
+  **gin_or** — a GIN disjunction (`tags IN (Q1, Q2)`, an `OR` of `@>`/`&&`/`= ANY` arms) is compared
+  with the same predicate with one arm spelled `NOT (tags <> Q)` / `Q <@ tags`, which no GIN
+  strategy matches, so the `OR` full scans (gin.md §6.3);
   **gist_inl** — GiST range `@>` and scalar `=` sibling bounds are compared with equivalent `<@`
   and paired-inequality full-scan spellings, including NULL/empty range queries;
   **topk** — a blocking ORDER BY LIMIT/OFFSET heap is compared with a DISTINCT-gated full sort over

@@ -10953,18 +10953,28 @@ export class Engine {
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
     // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
     // §3): evaluate Q on a scratch meter. queryRow is empty for a constant bound and the combined
-    // left row for a sibling INL.
-    const qv = evalExpr(query, queryRow, env, env.exec.session.scratchMeter());
-    const extracted = ginQueryTerms(gb.strategy, gb.elemType, qv);
-    if (extracted.kind === "empty") return { entries: [], pages: 0, slabs: 0 };
-    if (extracted.kind === "fullScan") {
-      // Rows the index cannot enumerate (they carry no terms) may match: scan them all and let the
-      // residual filter keep the right ones (gin.md §6 / §2.1).
-      const u = store.scanWithUnits(mask);
-      return { entries: u.entries, pages: u.pages, slabs: u.slabs };
+    // left row for a sibling INL. A disjunctive bound's query is its OR node (gin.md §6.3): every
+    // arm's operand is extracted, in source order, before any posting list is read.
+    const arms: { strategy: GinStrategy; query: RExpr }[] =
+      gb.orArms.length === 0
+        ? [{ strategy: gb.strategy, query }]
+        : ginOrArms(query).map(
+            (arm) => ginMatch(arm, gb.colGlobal, ginStrategyOpclass(gb.strategy))!,
+          );
+    const queries: { strategy: GinStrategy; terms: Uint8Array[] }[] = [];
+    for (const arm of arms) {
+      const qv = evalExpr(arm.query, queryRow, env, env.exec.session.scratchMeter());
+      const extracted = ginQueryTerms(arm.strategy, gb.elemType, qv);
+      if (extracted.kind === "empty") continue;
+      if (extracted.kind === "fullScan") {
+        // Rows the index cannot enumerate (they carry no terms) may match: scan them all and let the
+        // residual filter keep the right ones (gin.md §6 / §2.1). One such arm makes the whole
+        // disjunction fall back.
+        const u = store.scanWithUnits(mask);
+        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
+      }
+      queries.push({ strategy: arm.strategy, terms: extracted.terms });
     }
-    const terms = extracted.terms;
-    const anyMode = gb.strategy === "overlaps" || gb.strategy === "jsonHasAnyKey";
 
     // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
     // (gin.md §4). The entry is encode(term) ‖ storage_key and every term self-delimits — an
@@ -10974,14 +10984,12 @@ export class Engine {
     const istore = this.lkpIndexStore(gb.nameKey);
     const gather = new GinGather(istore);
     // The candidate storage keys, ascending byte (= storage-key) order, so the point lookups and
-    // emitted rows follow storage order exactly as a full scan (gin.md §6/§8). && / ?| (mode ANY) →
-    // the union of every whole posting list. Mode ALL → intersection: = ANY (member) and ? are a
-    // single term, so the intersection is that lone posting list; array = (equal) gathers the same
-    // superset as @> over Q's distinct non-NULL terms (the residual = makes it exact downstream); two
-    // or more terms take the skip-scan intersection (gin.md §6.2).
-    const cand = anyMode
-      ? unionPostings(terms.map((t) => gather.postingList(t)))
-      : gather.intersect(terms);
+    // emitted rows follow storage order exactly as a full scan (gin.md §6/§8). A disjunction unions
+    // each arm's candidates, arms in source order (gin.md §6.3).
+    const cand =
+      queries.length === 1
+        ? gather.arm(queries[0]!.strategy, queries[0]!.terms)
+        : unionPostings(queries.map((q) => gather.arm(q.strategy, q.terms)));
     meter.charge(COSTS.ginEntry * BigInt(gather.entries));
     let pages = gather.pages;
 
@@ -21242,8 +21250,8 @@ export class Engine {
         }
       } else {
         const access = accessPredicate(plan);
-        if (access !== null)
-          m = ginMatch(access, relBound.gin.colGlobal, ginStrategyOpclass(relBound.gin.strategy));
+        const q = access === null ? null : ginQueryOperand(access, relBound.gin);
+        if (q !== null) m = { strategy: relBound.gin.strategy, query: q };
       }
       const r = this.ginBoundRows(
         rel.tableName,
@@ -24012,7 +24020,19 @@ export type GinBound = {
   elemType: ScalarType;
   strategy: GinStrategy;
   colGlobal: number;
+  // A disjunctive bound's per-arm strategies (gin.md §6.3): every arm of an OR conjunct (an IN list
+  // desugars to one) whose every disjunct holds an accelerable conjunct on this column, in source
+  // order. Empty for the ordinary single-conjunct bound; non-empty, strategy is the first arm's.
+  orArms: GinStrategy[];
 };
+
+// ginStructuralSelectivity is a GIN bound's structural access selectivity (estimator.md §7): its
+// strategy's access-method class, or for a disjunctive bound the OR fold of every arm's class in
+// source order.
+function ginStructuralSelectivity(gb: GinBound): Selectivity {
+  if (gb.orArms.length === 0) return selectivityClass(ginAccessClass(gb.strategy));
+  return orSelectivities(gb.orArms.map((arm) => selectivityClass(ginAccessClass(arm))));
+}
 
 // IndexEqCol is one column of an index access predicate's equality prefix (indexes.md §5.1): the
 // column's storage type, its key collation (non-null only for a Full-collated text column), and every
@@ -25078,11 +25098,37 @@ function ginCandidateTermEstimate(
 ): { rows: bigint; entries: bigint; pages: bigint } | null {
   if (bound === null || bound.kind !== "gin" || residual === null) return null;
   const gb = bound.gin;
-  const m = ginMatch(residual, gb.colGlobal, ginStrategyOpclass(gb.strategy));
-  if (m === null || m.strategy !== gb.strategy) return null;
   if (gb.colGlobal < rel.offset) return null;
   const column = gb.colGlobal - rel.offset;
-  const estimate = statisticsGinEstimate(rel, column, m.strategy, m.query, engine);
+  const opclass = ginStrategyOpclass(gb.strategy);
+  let estimate: GinTermEstimate | null = null;
+  if (gb.orArms.length === 0) {
+    const m = ginMatch(residual, gb.colGlobal, opclass);
+    if (m === null || m.strategy !== gb.strategy) return null;
+    estimate = statisticsGinEstimate(rel, column, m.strategy, m.query, engine);
+  } else {
+    // A disjunctive bound (gin.md §6.3) prices every arm and sums them (the OR rule's disjoint-union
+    // upper estimate, estimator.md §7.1); any arm without a term estimate keeps the structural
+    // default for the whole bound.
+    const or = ginOrMatch(residual, gb.colGlobal, opclass);
+    if (or === null) return null;
+    for (const arm of ginOrArms(or)) {
+      const m = ginMatch(arm, gb.colGlobal, opclass)!;
+      const e = statisticsGinEstimate(rel, column, m.strategy, m.query, engine);
+      if (e === null) return null;
+      estimate =
+        estimate === null
+          ? { ...e }
+          : {
+              rows: saturatingEstimateAdd(estimate.rows, e.rows),
+              entries: saturatingEstimateAdd(estimate.entries, e.entries),
+              totalEntries: estimate.totalEntries,
+            };
+    }
+    const current = currentColumnStatistics(engine, rel, column);
+    if (current === null || estimate === null) return null;
+    if (estimate.rows > current.nonnullRows) estimate.rows = current.nonnullRows;
+  }
   if (estimate === null) return null;
   const index = engine.estimatorIndexStore(rel.db, gb.nameKey);
   const nodes = BigInt(index.nodeCount());
@@ -26110,9 +26156,7 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
     case "gist":
       return selectivityClass(bound.gist.strategy === "equal" ? ACCESS_GIST_EQUAL : ACCESS_GIST_RANGE);
     case "gin":
-      return selectivityClass(
-        ginAccessClass(bound.gin.strategy),
-      );
+      return ginStructuralSelectivity(bound.gin);
     case "pkSet":
       if (bound.pkSet.tuple !== undefined) {
         return tupleSetSelectivity(
@@ -27723,7 +27767,32 @@ export function buildGinBoundForIndex(
   if (opclass === null) return null; // defensive: CREATE INDEX enforces an operator class
   const m = ginMatch(filter, colGlobal, opclass);
   if (m !== null) return ginBoundOf(idx.name, colType, m.strategy, colGlobal);
-  return null;
+  // No single accelerable conjunct: an OR conjunct whose every arm is one (an IN list over the
+  // column) bounds the scan by the union of the arms' gathers (gin.md §6.3).
+  const or = ginOrMatch(filter, colGlobal, opclass);
+  if (or === null) return null;
+  const arms = ginOrArms(or).map((arm) => ginMatch(arm, colGlobal, opclass)!.strategy);
+  return { ...ginBoundOf(idx.name, colType, arms[0]!, colGlobal), orArms: arms };
+}
+
+// ginOrMatch finds the disjunctive GIN conjunct (gin.md §6.3): the first conjunct of the WHERE
+// AND-chain that is an OR (an IN list over the column desugars to one) every one of whose disjuncts —
+// flattened left to right — holds a constant accelerable conjunct on the indexed column (ginMatch).
+// Returns the OR node; ginOrArms lists its disjuncts.
+export function ginOrMatch(filter: RExpr, colGlobal: number, opclass: GinOpclass): RExpr | null {
+  if (filter.kind === "and")
+    return (
+      ginOrMatch(filter.lhs, colGlobal, opclass) ?? ginOrMatch(filter.rhs, colGlobal, opclass)
+    );
+  if (filter.kind !== "or") return null;
+  return ginOrArms(filter).every((arm) => ginMatch(arm, colGlobal, opclass) !== null)
+    ? filter
+    : null;
+}
+
+// ginOrArms is the disjuncts of an OR node, flattened in source order.
+export function ginOrArms(or: RExpr): RExpr[] {
+  return or.kind === "or" ? [...ginOrArms(or.lhs), ...ginOrArms(or.rhs)] : [or];
 }
 
 // ginBoundOf builds a GinBound for a GIN index over a column of type colType.
@@ -27738,6 +27807,7 @@ export function ginBoundOf(
     elemType: colType.kind === "array" ? typeScalar(colType.elem) : typeScalar(colType),
     strategy,
     colGlobal,
+    orArms: [],
   };
 }
 
@@ -27776,10 +27846,13 @@ export function ginSiblingMatch(
   );
 }
 
-// ginQueryOperand recovers a GIN bound's query operand from the live filter at exec time, under the
-// bound's own opclass (so it re-finds the conjunct the planner matched).
+// ginQueryOperand recovers a GIN bound's query node from the live filter at exec time, under the
+// bound's own opclass (so it re-finds the conjunct the planner matched): the single conjunct's query
+// operand, or a disjunctive bound's OR node (gin.md §6.3).
 export function ginQueryOperand(filter: RExpr, gb: GinBound): RExpr | null {
-  return ginMatch(filter, gb.colGlobal, ginStrategyOpclass(gb.strategy))?.query ?? null;
+  const opclass = ginStrategyOpclass(gb.strategy);
+  if (gb.orArms.length > 0) return ginOrMatch(filter, gb.colGlobal, opclass);
+  return ginMatch(filter, gb.colGlobal, opclass)?.query ?? null;
 }
 
 function ginMatchOperand(
@@ -28786,6 +28859,17 @@ class GinGather {
   }
 
   // postingList is a term's whole posting list (a prefix range scan).
+  // arm is one strategy's candidates over its distinct query terms: mode ANY (&&, ?|) → the union of
+  // every whole posting list; mode ALL → intersection. = ANY (member) and ? are a single term, so the
+  // intersection is that lone posting list; array = (equal) gathers the same superset as @> over Q's
+  // distinct non-NULL terms (the residual = makes it exact downstream); two or more terms take the
+  // skip-scan intersection (gin.md §6.2).
+  arm(strategy: GinStrategy, terms: Uint8Array[]): Uint8Array[] {
+    return strategy === "overlaps" || strategy === "jsonHasAnyKey"
+      ? unionPostings(terms.map((t) => this.postingList(t)))
+      : this.intersect(terms);
+  }
+
   postingList(term: Uint8Array): Uint8Array[] {
     return this.read(GinGather.postingBound(term), term);
   }
