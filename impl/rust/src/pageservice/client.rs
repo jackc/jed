@@ -637,6 +637,36 @@ impl PsConnection {
         }
     }
 
+    /// Fetch a batch of pages under the newest pinned version (a backup's copy, README.md §6.6).
+    /// The batch holds at most [`max_read_pages`](Self::max_read_pages) indices.
+    pub(crate) fn read_pages(&self, indices: &[u32]) -> Result<Vec<Vec<u8>>> {
+        let reply = self.round_trip(|| {
+            let txid = self
+                .held_max
+                .load(Ordering::Acquire)
+                .max(self.write_txid.load(Ordering::Acquire));
+            if txid == 0 {
+                return Err(EngineError::new(
+                    SqlState::ObjectNotInPrerequisiteState,
+                    "a page client read a page outside any transaction",
+                ));
+            }
+            Ok(Message::ReadPages(ReadPages {
+                txid,
+                indices: indices.to_vec(),
+            }))
+        })?;
+        match reply {
+            Message::Pages(pages) if pages.pages.len() == indices.len() => Ok(pages.pages),
+            _ => Err(violation("unexpected reply to read_pages")),
+        }
+    }
+
+    /// The most indices one `read_pages` may name on this connection (README.md §3.1).
+    pub(crate) fn max_read_pages(&self) -> usize {
+        crate::pageservice::codec::max_read_pages(self.page_size.load(Ordering::Acquire)) as usize
+    }
+
     pub(crate) fn set_meta(&self, meta: Vec<u8>) {
         *self.meta.lock().expect("meta lock poisoned") = meta;
     }

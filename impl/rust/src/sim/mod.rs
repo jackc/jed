@@ -137,8 +137,10 @@ fn trace_paths(input: &str) -> std::io::Result<Vec<PathBuf>> {
 struct Step {
     line: usize,
     kind: String,
-    /// open (the session's process), spawn, exit, kill
+    /// open (the session's process), spawn, exit, kill, backup (when `has_pid`)
     pid: u32,
+    /// Whether a `backup` step names its process; without one it runs in the lowest running.
+    has_pid: bool,
     sid: String,
     mode: String,
     sql: String,
@@ -195,6 +197,7 @@ fn parse(text: &str) -> Result<Trace, String> {
             line: n + 1,
             kind: fields[0].to_string(),
             pid: 0,
+            has_pid: false,
             sid: String::new(),
             mode: String::new(),
             sql: String::new(),
@@ -256,6 +259,21 @@ fn parse(text: &str) -> Result<Trace, String> {
                     return Err(format!("line {}: compact [<database>]", n + 1));
                 }
                 st.sid = fields.get(1).copied().unwrap_or("main").to_string();
+            }
+            "backup" => {
+                if (fields.len() != 2 && fields.len() != 3)
+                    || (fields[1] != "page_identical" && fields[1] != "compacted")
+                {
+                    return Err(format!(
+                        "line {}: backup page_identical|compacted [p<N>]",
+                        n + 1
+                    ));
+                }
+                st.mode = fields[1].to_string();
+                if fields.len() == 3 {
+                    st.pid = parse_pid(fields[2]).map_err(|e| format!("line {}: {e}", n + 1))?;
+                    st.has_pid = true;
+                }
             }
             "corrupt" => params(&mut st, &fields[1..])?,
             "check" | "reopen" | "tick" => {}
@@ -692,6 +710,8 @@ struct Runner<'a> {
     diagnostics: Vec<(String, String)>,
     /// When set, each recovery's image is written to `<prefix>.step<N>[.<db>].img`.
     image_prefix: Option<PathBuf>,
+    /// Backup steps run, naming each destination.
+    backups: usize,
 }
 
 fn engine_code(e: &EngineError) -> String {
@@ -903,6 +923,7 @@ impl<'a> Runner<'a> {
             digest_err: None,
             diagnostics: Vec::new(),
             image_prefix: None,
+            backups: 0,
         }
     }
 
@@ -1359,6 +1380,7 @@ impl<'a> Runner<'a> {
     fn step_pid(&self, st: &Step) -> Option<u32> {
         match st.kind.as_str() {
             "open" | "spawn" | "exit" | "kill" => Some(st.pid),
+            "backup" if st.has_pid => Some(st.pid),
             "on" | "commit" | "rollback" | "close" => self.sessions.get(&st.sid).map(|ss| ss.pid),
             _ => self.procs.keys().next().copied(),
         }
@@ -1684,6 +1706,13 @@ impl<'a> Runner<'a> {
                 ));
                 return true;
             }
+            if st.kind == "backup" {
+                self.emit(format!(
+                    "{{\"i\":{i},\"op\":\"backup\",\"pid\":{},\"skip\":true}}",
+                    st.pid
+                ));
+                return true;
+            }
             if self.procs.is_empty() {
                 self.fail(i, "no process is running".to_string());
                 return false;
@@ -1708,6 +1737,7 @@ impl<'a> Runner<'a> {
             "rollback" | "close" => self.step_end(i, st),
             "check" => self.step_check(i),
             "compact" => self.step_compact(i, &st.sid),
+            "backup" => self.step_backup(i, st),
             "attach" => self.step_attach(i, &st.sid),
             "reopen" => {
                 if !self.step_reopen(i) {
@@ -2595,6 +2625,96 @@ impl<'a> Runner<'a> {
         d.version = now;
         d.floor = now; // the rename and the directory barrier completed
         self.observe_growth(name);
+    }
+
+    /// `backup page_identical|compacted [p<N>]` (spec/design/page-service.md §9): the process backs
+    /// main up into a new file through the simulated filesystem, while every other session keeps its
+    /// pins and its writer gate. A backup that fails leaves no destination. One that succeeds is
+    /// checked at once, as a new process would open it: its version is the pinned snapshot's
+    /// (page-identical) or the one after it (compacted), the snapshot is the newest committed
+    /// generation, its contents are that generation's, and the integrity checker accepts the image.
+    /// Its image hash makes the cores' backups byte-identical (§8.4).
+    fn step_backup(&mut self, i: usize, st: &Step) {
+        self.backups += 1;
+        let dest = format!("{}.backup{}", self.main_db().file, self.backups);
+        let form = go_quote(&st.mode);
+        if let Err(e) = self
+            .db()
+            .backup_for_testing(&dest, st.mode == "page_identical")
+        {
+            let code = engine_code(&e);
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"backup\",\"form\":{form},\"error\":{}}}",
+                go_quote(&code)
+            ));
+            if code == "XX001" {
+                self.fail(i, format!("corruption: backup reported XX001: {e}"));
+            } else if self.disk().file(&dest).is_some() {
+                self.fail(i, "a failed backup left its destination".to_string());
+            }
+            return;
+        }
+        let Some(image) = self.disk().image(&dest) else {
+            self.fail(i, "a successful backup left no destination".to_string());
+            return;
+        };
+        if let Some(prefix) = &self.image_prefix {
+            let _ = std::fs::write(format!("{}.step{i}.backup.img", prefix.display()), &image);
+        }
+        let engine = match Engine::from_image_in(&image, &self.env) {
+            Ok(engine) => engine,
+            Err(e) => {
+                self.fail(i, format!("the backup does not open: {e}"));
+                return;
+            }
+        };
+        let v = engine.committed.txid;
+        let snapshot = if st.mode == "compacted" { v - 1 } else { v };
+        let copy = Database::from_engine(engine);
+        let mut rs = copy.read_session();
+        let dg = self.digest_of(&mut rs, "main");
+        rs.close();
+        let _ = copy.close();
+        let main_version = self.main_db().version;
+        let dg = match dg {
+            None => {
+                let why = self
+                    .digest_err
+                    .as_ref()
+                    .map_or("<nil>".to_string(), |e| e.to_string());
+                self.fail(i, format!("the backup cannot be read: {why}"));
+                return;
+            }
+            Some(_) if snapshot < main_version => {
+                self.fail(
+                    i,
+                    format!(
+                        "the backup copied version {snapshot}, older than the committed {main_version}"
+                    ),
+                );
+                return;
+            }
+            Some(dg) if !self.main_db().in_history(snapshot, &dg) => {
+                self.fail(
+                    i,
+                    format!("the backup holds contents (digest {dg}) version {snapshot} never had"),
+                );
+                return;
+            }
+            Some(dg) => dg,
+        };
+        let (live, pages, free) = match check::integrity(&image, v) {
+            Ok(r) => r,
+            Err(e) => {
+                self.fail(i, format!("backup integrity: {e}"));
+                return;
+            }
+        };
+        let hash = image_hash(&image, pages, self.page_size);
+        self.emit(format!(
+            "{{\"i\":{i},\"op\":\"backup\",\"form\":{form},\"version\":{v},\"digest\":{},\"live\":{live},\"pages\":{pages},\"free\":{free},\"image\":\"{hash:016x}\"}}",
+            go_quote(&dg)
+        ));
     }
 
     /// Attach file database `name` to the running process (S4), first creating its file through the

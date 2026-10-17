@@ -27,6 +27,8 @@ mod array_key;
 mod array_quantified;
 #[path = "../tests/attach.rs"]
 mod attach;
+#[path = "../tests/backup.rs"]
+mod backup;
 #[path = "../tests/boolean_key.rs"]
 mod boolean_key;
 #[path = "../tests/cancellation.rs"]

@@ -204,7 +204,7 @@ const PAGE_OVERFLOW: u8 = 4;
 /// ordinary body page whose payload is `item_count` big-endian `u32` free page indices, chained by
 /// `next_page`. Persists the free-list so open reads it directly (meta offset 28 → the chain head)
 /// instead of reconstructing it by walking every leaf.
-const PAGE_FREELIST: u8 = 7;
+pub(crate) const PAGE_FREELIST: u8 = 7;
 
 /// Value-codec presence tags beyond `0x00` present-inline-plain / `0x01` NULL
 /// (spec/design/large-values.md §12/§13; spec/fileformat/format.md "Large values"):
@@ -2557,12 +2557,28 @@ impl Engine {
         paging: Arc<SharedPaging>,
         env: &crate::environment::Environment,
     ) -> Result<Engine> {
+        Self::open_shared_paging_at(paging, env, LoadAt::default())
+    }
+
+    /// [`open_shared_paging`](Engine::open_shared_paging) adjusted by `at` for a backup's walk
+    /// (spec/design/page-service.md §9): `at.meta` names the version to load instead of the one
+    /// recovery selects, and `at.gist` sees every GiST R-tree page the load reads. A load at a given
+    /// meta leaves the engine's free list empty: an older version's free list may name pages a newer
+    /// commit reused, which the pager's current recovery dependencies would misreport as corrupt.
+    pub(crate) fn open_shared_paging_at(
+        paging: Arc<SharedPaging>,
+        env: &crate::environment::Environment,
+        at: LoadAt<'_>,
+    ) -> Result<Engine> {
         let page_size = paging.pager().page_size() as usize;
         if !page_size_valid(page_size) {
             return Err(corrupt("invalid page size"));
         }
 
-        let meta = {
+        let given = at.meta.is_some();
+        let meta = if let Some(m) = at.meta {
+            m.clone()
+        } else {
             let mut pg = paging.pager();
             let blocks = [pg.read_block(0)?, pg.read_block(1)?];
             let mut candidates: Vec<_> = blocks
@@ -2794,6 +2810,9 @@ impl Engine {
                             read_gist_leaf_keys(
                                 &|p| {
                                     gist_pages.set(gist_pages.get() + 1);
+                                    if let Some(hook) = at.gist {
+                                        hook(p);
+                                    }
                                     let block = paging.pager().read_block(p)?;
                                     let pg = parse_page(&block)?;
                                     Ok((pg.page_type, pg.item_count, pg.payload.to_vec()))
@@ -2849,12 +2868,14 @@ impl Engine {
         db.page_count = meta.page_count;
         // v25: load the free-list directly from the persisted chain (meta offset 28) — no
         // reachability walk (spec/fileformat/format.md *Reclamation*).
-        db.free_pages = read_free_list(
-            &paging,
-            meta.free_list_head,
-            meta.page_count,
-            &meta.protected,
-        )?;
+        if !given {
+            db.free_pages = read_free_list(
+                &paging,
+                meta.free_list_head,
+                meta.page_count,
+                &meta.protected,
+            )?;
+        }
         // Every persisted free page is dead at the committed version (the free-list is "as of" meta.txid),
         // so its reuse generation is meta.txid: at open oldest_live == committed and any later reader pins
         // ≥ the committed version, so reuse is safe (transactions.md §8, the free-list generation gate).
@@ -2873,6 +2894,15 @@ impl Engine {
     }
 }
 
+/// How [`Engine::open_shared_paging_at`] differs from an ordinary load: a backup's walk
+/// (spec/design/page-service.md §9) loads the version `meta` names and sees every GiST R-tree page
+/// the load reads through `gist`.
+#[derive(Default)]
+pub(crate) struct LoadAt<'a> {
+    pub(crate) meta: Option<&'a Meta>,
+    pub(crate) gist: Option<&'a dyn Fn(u32)>,
+}
+
 /// Walk a table's on-disk B-tree, reading each **leaf** and adding the overflow chain pages its
 /// records reference to `reached` (spec/design/large-values.md §12). Interior separators are
 /// skipped here — `read_skeleton_node` already collected their chains. Used only for tables with
@@ -2887,17 +2917,37 @@ fn collect_leaf_overflow(
     seen: &mut HashSet<u32>,
     depth: usize,
 ) -> Result<()> {
+    collect_leaf_overflow_with(
+        &|p| paging.pager().read_block(p),
+        page_idx,
+        col_types,
+        reached,
+        seen,
+        depth,
+    )
+}
+
+/// [`collect_leaf_overflow`] over a page reader: the commit path's reads go to the pager it already
+/// holds, a backup's take the pager lock per page.
+pub(crate) fn collect_leaf_overflow_with(
+    read: &dyn Fn(u32) -> Result<Vec<u8>>,
+    page_idx: u32,
+    col_types: &Arc<Vec<ColType>>,
+    reached: &mut HashSet<u32>,
+    seen: &mut HashSet<u32>,
+    depth: usize,
+) -> Result<()> {
     if !seen.insert(page_idx) {
         return Err(corrupt("B-tree page reached twice"));
     }
     if depth > MAX_TREE_DEPTH {
         return Err(corrupt("B-tree deeper than any valid tree"));
     }
-    let block = paging.pager().read_block(page_idx)?;
+    let block = read(page_idx)?;
     let page = parse_page(&block)?;
     match page.page_type {
         PAGE_LEAF => {
-            let fetch = |p: u32| paging.pager().read_block(p);
+            let fetch = |p: u32| read(p);
             let n = page.item_count as usize;
             // The reachability walk discards each value right after `mark_chains` (only an external
             // chain matters here, never an inline-deferred body), so the form-(a) `Arc` wrap (L3)
@@ -2941,7 +2991,7 @@ fn collect_leaf_overflow(
                 cps.push(read_u32(page.payload, &mut pos)?);
             }
             for cp in cps {
-                collect_leaf_overflow(paging, cp, col_types, reached, seen, depth + 1)?;
+                collect_leaf_overflow_with(read, cp, col_types, reached, seen, depth + 1)?;
             }
             Ok(())
         }
@@ -4677,17 +4727,18 @@ fn write_meta(
 }
 
 /// A validated meta slot's salient fields.
-struct Meta {
+#[derive(Clone)]
+pub(crate) struct Meta {
     protected: Arc<HashSet<u32>>,
-    txid: u64,
-    root_page: u32,
+    pub(crate) txid: u64,
+    pub(crate) root_page: u32,
     /// On-disk page high-water — the next free page an incremental commit appends at (P6.1 part B).
-    page_count: u32,
+    pub(crate) page_count: u32,
     /// The persisted free-list head (v25 — meta offset 28): the first `page_type 7` page, or `0`
     /// for an empty free-list. Open follows this chain instead of reconstructing the free-list.
-    free_list_head: u32,
+    pub(crate) free_list_head: u32,
     /// The exact live page count (v34 — meta offset 56, spec/design/memory.md §8.7).
-    live_pages: u32,
+    pub(crate) live_pages: u32,
 }
 
 /// The meta page a demand-paged open selected (deterministic-simulation integrity checker,
@@ -4840,7 +4891,7 @@ pub(crate) fn test_page(ps: usize, page_type: u8, payload: &[u8]) -> Vec<u8> {
 
 /// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole
 /// image) and the demand-paged loader (which reads meta slots 0/1 as individual blocks).
-fn parse_meta(m: &[u8]) -> Option<Meta> {
+pub(crate) fn parse_meta(m: &[u8]) -> Option<Meta> {
     if m.len() < 64 || u32::from_be_bytes(m[8..12].try_into().unwrap()) as usize != m.len() {
         return None;
     }
