@@ -32256,6 +32256,9 @@ export type AggPlan =
   | "stddevSampFloat"
   | "stddevPop"
   | "stddevPopFloat"
+  // The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
+  | "covarPop"
+  | "covarPopFloat"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32541,6 +32544,10 @@ export type Acc = {
   momFN: number;
   momFSx: number;
   momFSxx: number;
+  // The two-argument statistical aggregates' running sums (aggregates.md §23): exact
+  // [Σx, Σx², Σy, Σy², Σxy] (with the count in momN), float [N, Σx, Sxx, Σy, Syy, Sxy].
+  pairSums: Decimal[];
+  pairF: number[];
   jsonAsJson: boolean;
   jsonStrict: boolean;
   // For the "jsonObjectAgg" plan (B4): the (key text, value image) pairs in row order (the image as
@@ -32610,6 +32617,8 @@ export function newAcc(
     momFN: 0,
     momFSx: 0,
     momFSxx: 0,
+    pairSums: [0, 1, 2, 3, 4].map(() => Decimal.fromBigInt(0n)),
+    pairF: [0, 0, 0, 0, 0, 0],
     jsonAsJson,
     jsonStrict,
     jsonPairs: [],
@@ -32789,6 +32798,114 @@ function foldFloatMoment(a: Acc, v: Value): void {
   a.momFSxx = sxx;
 }
 
+// The two-argument statistical aggregates (aggregates.md §23) over (Y, X) pairs whose arguments are
+// both non-NULL. PAIR_SURFACES maps each to its exact and float plans; PAIR_STATS gives each plan its
+// statistic.
+type PairStat = "covarPop";
+const PAIR_SURFACES: Record<string, [AggPlan, AggPlan]> = {
+  covar_pop: ["covarPop", "covarPopFloat"],
+};
+const PAIR_STATS: Partial<Record<AggPlan, PairStat>> = {
+  covarPop: "covarPop",
+  covarPopFloat: "covarPop",
+};
+
+// pairArgs splits a two-argument statistical aggregate's Row(Y, X) operand; null for a pair with a
+// NULL.
+function pairArgs(v: Value): [Value, Value] | null {
+  const [y, x] = (v as { fields: Value[] }).fields as [Value, Value];
+  return y.kind === "null" || x.kind === "null" ? null : [y, x];
+}
+
+// foldExactPair adds one (Y, X) pair to the exact two-argument moments, skipping a pair with a NULL.
+// Each fold charges decimal_work for the three products and five additions, by the `*` and `+`
+// formulas (spec/design/cost.md §3).
+function foldExactPair(a: Acc, v: Value, m: Meter): void {
+  const p = pairArgs(v);
+  if (p === null) return;
+  const y = toDecimal(p[0]);
+  const x = toDecimal(p[1]);
+  const terms = [x, x.mulExact(x), y, y.mulExact(y), x.mulExact(y)];
+  let work = workMul(x, x) + workMul(y, y) + workMul(x, y) - 8;
+  for (let i = 0; i < 5; i++) work += workLinear(a.pairSums[i]!, terms[i]!);
+  m.charge(COSTS.decimalWork * BigInt(work));
+  m.guard();
+  a.pairSums = a.pairSums.map((s, i) => s.addUncapped(terms[i]!));
+  a.momN += 1n;
+}
+
+// finalizeExactPair evaluates a two-argument statistic over the exact sums. With
+// numXY = N·Σxy − Σx·Σy computed exactly, covar_pop = numXY / (N·N); "/" is jed's decimal division
+// (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair.
+function finalizeExactPair(stat: PairStat, n: bigint, sums: Decimal[]): Value {
+  if (n === 0n) return nullValue();
+  const [sx, , sy, , sxy] = sums as [Decimal, Decimal, Decimal, Decimal, Decimal];
+  const count = Decimal.fromBigInt(n);
+  const numXY = count.mulExact(sxy).subUncapped(sx.mulExact(sy));
+  switch (stat) {
+    case "covarPop":
+      return decimalValue(numXY.div(count.mulExact(count)));
+  }
+}
+
+// foldFloatPair is PostgreSQL's float8_regr_accum over one (Y, X) pair (f32 widened to f64), skipping
+// a pair with a NULL: the two-variable Youngs-Cramer update of [N, Σx, Sxx, Σy, Syy, Sxy]. A finite
+// input whose update overflows to ±Inf traps 22003; an infinite or NaN input makes the dependent sums
+// NaN.
+function foldFloatPair(a: Acc, v: Value): void {
+  const p = pairArgs(v);
+  if (p === null) return;
+  const y = (p[0] as { value: number }).value;
+  const x = (p[1] as { value: number }).value;
+  const [n0, sx0, sxx0, sy0, syy0, sxy0] = a.pairF as [number, number, number, number, number, number];
+  const n = n0 + 1;
+  const sx = sx0 + x;
+  const sy = sy0 + y;
+  let sxx = sxx0;
+  let syy = syy0;
+  let sxy = sxy0;
+  if (n0 > 0) {
+    const tmpX = x * n - sx;
+    const tmpY = y * n - sy;
+    const scale = 1 / (n * n0);
+    sxx += tmpX * tmpX * scale;
+    syy += tmpY * tmpY * scale;
+    sxy += tmpX * tmpY * scale;
+    if (isInf(sx) || isInf(sxx) || isInf(sy) || isInf(syy) || isInf(sxy)) {
+      if (
+        ((isInf(sx) || isInf(sxx)) && !isInf(sx0) && !isInf(x)) ||
+        ((isInf(sy) || isInf(syy)) && !isInf(sy0) && !isInf(y)) ||
+        (isInf(sxy) && !isInf(sx0) && !isInf(x) && !isInf(sy0) && !isInf(y))
+      )
+        throw overflow("f64");
+      if (isInf(sxx)) sxx = Number.NaN;
+      if (isInf(syy)) syy = Number.NaN;
+      if (isInf(sxy)) sxy = Number.NaN;
+    }
+  } else {
+    if (!Number.isFinite(x)) {
+      sxx = Number.NaN;
+      sxy = Number.NaN;
+    }
+    if (!Number.isFinite(y)) {
+      syy = Number.NaN;
+      sxy = Number.NaN;
+    }
+  }
+  a.pairF = [n, sx, sxx, sy, syy, sxy];
+}
+
+// finalizeFloatPair is PostgreSQL's float8 final function for a two-argument statistic over
+// [N, Σx, Sxx, Σy, Syy, Sxy]: covar_pop = Sxy / N. NULL over no pair.
+function finalizeFloatPair(stat: PairStat, t: number[]): Value {
+  const [n, , , , , sxy] = t as [number, number, number, number, number, number];
+  if (n < 1) return nullValue();
+  switch (stat) {
+    case "covarPop":
+      return float64Value(sxy / n);
+  }
+}
+
 // finalizeMoment finalizes a statistical plan (aggregates.md §23): numeric_stddev_internal over the
 // exact moments, the float8 final functions over the float ones.
 function finalizeMoment(a: Acc): Value {
@@ -32851,6 +32968,8 @@ export function cloneAcc(a: Acc): Acc {
     jsonElems: a.jsonElems.slice(),
     arrElems: a.arrElems.slice(),
     strRows: a.strRows.slice(),
+    pairSums: a.pairSums.slice(),
+    pairF: a.pairF.slice(),
     jsonPairs: a.jsonPairs.slice(),
     osaVals: a.osaVals ? a.osaVals.slice() : undefined,
     osaFloats: a.osaFloats ? a.osaFloats.slice() : undefined,
@@ -32866,6 +32985,12 @@ export function cloneAcc(a: Acc): Acc {
 // like a collated sort (spec/design/collation.md §11).
 export function foldAcc(a: Acc, v: Value, m: Meter): void {
   switch (a.plan) {
+    case "covarPop":
+      foldExactPair(a, v, m);
+      break;
+    case "covarPopFloat":
+      foldFloatPair(a, v);
+      break;
     case "varPop":
     case "varPopFloat":
     case "varSamp":
@@ -33099,6 +33224,10 @@ export function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
 // empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
 export function finalizeAcc(a: Acc): Value {
   switch (a.plan) {
+    case "covarPop":
+      return finalizeExactPair(PAIR_STATS[a.plan]!, a.momN, a.pairSums);
+    case "covarPopFloat":
+      return finalizeFloatPair(PAIR_STATS[a.plan]!, a.pairF);
     case "varPop":
     case "varPopFloat":
     case "varSamp":
@@ -35678,6 +35807,8 @@ export function argFamily(t: ResolvedType): string | null {
 // familyMatches reports whether a resolved argument satisfies one catalog family slot. "any"
 // accepts everything (NULL included); a concrete family matches only its own type.
 export function familyMatches(slot: string, t: ResolvedType): boolean {
+  // The pseudo-family of the exact two-argument statistical aggregates (aggregates.md §23).
+  if (slot === "exact_numeric") return t.kind === "int" || t.kind === "decimal";
   return slot === "any" || argFamily(t) === slot;
 }
 
@@ -35774,6 +35905,8 @@ export function selectUnknownOverload(
 // single-type family its own scalar. null for "any" (and the polymorphic pseudo-families).
 export function familyParamType(family: string): ScalarType | null {
   switch (family) {
+    case "exact_numeric":
+      return "decimal";
     case "integer":
       return "i64";
     case "float":
@@ -35964,6 +36097,11 @@ export function aggregatePlan(
   if (surface === "bit_xor" && code === "same_as_input") return ["bitXor", t, undefined];
   // An array input stacks into one more dimension of the same (dimension-agnostic) array type.
   // The statistical aggregates: exact over integer/decimal (a decimal result), float over float.
+  const pair = PAIR_SURFACES[surface];
+  if (pair !== undefined)
+    return code === "f64"
+      ? [pair[1], { kind: "float", ty: "f64" }, undefined]
+      : [pair[0], { kind: "decimal" }, undefined];
   const moment = MOMENT_SURFACES[surface];
   if (moment !== undefined)
     return code === "f64"
@@ -37561,6 +37699,8 @@ function encodeBlockingAccs(keys: Value[], accs: Acc[]): Row {
         float64Value(a.momFN),
         float64Value(a.momFSx),
         float64Value(a.momFSxx),
+        ...a.pairSums.map(decimalValue),
+        ...a.pairF.map(float64Value),
       ]),
     );
   return row;
@@ -37591,6 +37731,8 @@ function decodeBlockingAccs(
     a.momFN = (mom[3]! as { value: number }).value;
     a.momFSx = (mom[4]! as { value: number }).value;
     a.momFSxx = (mom[5]! as { value: number }).value;
+    a.pairSums = mom.slice(6, 11).map((v) => (v as { dec: Decimal }).dec);
+    a.pairF = mom.slice(11, 17).map((v) => (v as { value: number }).value);
     return a;
   });
   return { keys, accs };
@@ -37607,6 +37749,13 @@ function packedStateBytes(accs: Acc[]): number {
     n += MEMORY_VALUE;
     // An ordered aggregate (aggregates.md §22) keeps its tuples in the collections table too.
     if (a.ordRows !== undefined) continue;
+    if (PAIR_STATS[a.plan] !== undefined) {
+      // Exact: [int N, decimal Σx, Σx², Σy, Σy², Σxy]; float: [f64 N, Σx, Sxx, Σy, Syy, Sxy].
+      n += a.plan.endsWith("Float")
+        ? 6 * MEMORY_VALUE
+        : MEMORY_VALUE + a.pairSums.reduce((b, d) => b + valueBytes(decimalValue(d)), 0);
+      continue;
+    }
     const stat = MOMENT_STATS[a.plan];
     if (stat !== undefined) {
       // Exact: [int N, decimal Σx, decimal Σx²]; float: [f64 N, f64 Σx, f64 Sxx].

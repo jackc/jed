@@ -761,6 +761,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `stddev_pop(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the population standard deviation |
 | `stddev_samp(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the sample standard deviation |
 | `stddev(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | PostgreSQL's alias of `stddev_samp` |
+| `covar_pop(y, x)` | two exact / two float | `decimal` / `f64` | the population covariance |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -842,3 +843,39 @@ bounded-spill lane: exact `[int N, decimal Σx, decimal Σx²]`, float `[f64 N, 
 - `stddev_pop` is the population standard deviation, the square root of `var_pop`.
 - `stddev_samp` is the sample standard deviation, the square root of `var_samp`.
 - `stddev` is PostgreSQL's historical alias of `stddev_samp`.
+
+**Two-argument statistical aggregates.** `covar_pop` and the rest take `(Y, X)` — the dependent
+variable first, as in PostgreSQL — and fold only the pairs whose arguments are **both** non-NULL; with
+no such pair the result is NULL. The catalog rows are `(exact_numeric, exact_numeric) → decimal` and
+`(float, float) → f64`, where `exact_numeric` is the integer or decimal family, so a float argument
+beside an exact one is `42883`: float stays a strict island (PostgreSQL instead casts both to
+`float8`). Over float arguments (`f32` widened to `f64`) they are PostgreSQL's `float8_regr_accum` —
+the two-variable Youngs-Cramer update of `(N, Σx, Sxx, Σy, Syy, Sxy)`:
+
+```
+N' = N + 1;  Σx' = Σx + x;  Σy' = Σy + y
+if N > 0:  tx = x·N' − Σx';  ty = y·N' − Σy';  s = 1 / (N'·N)
+           Sxx' = Sxx + tx·tx·s;  Syy' = Syy + ty·ty·s;  Sxy' = Sxy + tx·ty·s
+           a ±Inf among them is 22003 when its inputs were finite, else that sum becomes NaN
+else:      Sxx' = Sxy' = NaN if x is NaN or ±Inf;  Syy' = Sxy' = NaN if y is NaN or ±Inf
+```
+
+and each finalizes as PostgreSQL's `float8` final function. Over exact arguments they are **exact**,
+a deliberate divergence (PostgreSQL defines them only over `float8`, ledgered in
+`oracle_overrides.toml`): the fold keeps `N` and the uncapped decimal sums `Σx`, `Σx²`, `Σy`, `Σy²`,
+`Σxy` (charging `decimal_work` for the three products and five additions), and each result is a
+decimal expression over the exact numerators
+
+```
+numX  = N·Σx² − Σx·Σx      numY  = N·Σy² − Σy·Σy      numXY = N·Σxy − Σx·Σy
+```
+
+evaluated with jed's decimal operators — `/` at `select_div_scale`, half away from zero, `22003`
+past the cap — so each equals PostgreSQL's `numeric` evaluation of the same expression. Packed state
+on the bounded-spill lane: exact `[int N, decimal Σx, decimal Σx², decimal Σy, decimal Σy², decimal
+Σxy]`, float `[f64 N, f64 Σx, f64 Sxx, f64 Σy, f64 Syy, f64 Sxy]`. The float fold order is ledgered
+with the one-argument float forms (`float-moment-order`).
+
+| Aggregate | Exact result | Float result (PostgreSQL) | NULL when |
+|---|---|---|---|
+| `covar_pop(y, x)` | `numXY / (N·N)` | `Sxy / N` | no pair |

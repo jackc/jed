@@ -143,3 +143,142 @@ func (s *momentsFloat) variance(sample, stddev bool) Value {
 	}
 	return Float64Value(r)
 }
+
+// The two-argument statistical aggregates (spec/design/aggregates.md §23): covariance, correlation,
+// and the regr_* family over (Y, X) pairs whose arguments are both non-NULL. Over integer or decimal
+// input they are exact: the fold keeps N and the uncapped decimal sums Σx, Σx², Σy, Σy², and Σxy,
+// and each result is a decimal expression over them evaluated with jed's decimal operators. Over
+// float input they follow PostgreSQL's float8_regr_accum and its final functions, with an f64 result.
+
+// pairStat is which statistic a two-argument plan finalizes.
+type pairStat int
+
+const (
+	pairCovarPop pairStat = iota
+)
+
+// pairSurfaces maps each two-argument statistical aggregate to its exact and float plans.
+var pairSurfaces = map[string][2]aggPlan{
+	"covar_pop": {planCovarPop, planCovarPopFloat},
+}
+
+// pairStats gives each two-argument plan its statistic.
+var pairStats = map[aggPlan]pairStat{
+	planCovarPop: pairCovarPop, planCovarPopFloat: pairCovarPop,
+}
+
+// pairsExact is the exact two-argument moment state: the count of pairs and the decimal sums.
+type pairsExact struct {
+	n                     int64
+	sx, sxx, sy, syy, sxy Decimal
+}
+
+// fold adds one Row(Y, X) pair, skipping a pair with a NULL. Each fold charges decimal_work for the
+// three products and five additions, by the `*` and `+` formulas (spec/design/cost.md §3).
+func (s *pairsExact) fold(v Value, m *costMeter) error {
+	f := *v.composite()
+	if f[0].IsNull() || f[1].IsNull() {
+		return nil
+	}
+	y, x := toDecimal(f[0]), toDecimal(f[1])
+	x2, y2, xy := x.mulExact(x), y.mulExact(y), x.mulExact(y)
+	work := workMul(x, x) + workMul(y, y) + workMul(x, y) + workLinear(s.sx, x) + workLinear(s.sxx, x2) +
+		workLinear(s.sy, y) + workLinear(s.syy, y2) + workLinear(s.sxy, xy) - 8
+	m.Charge(costs.DecimalWork * work)
+	if err := m.Guard(); err != nil {
+		return err
+	}
+	s.sx, s.sxx = s.sx.AddUncapped(x), s.sxx.AddUncapped(x2)
+	s.sy, s.syy = s.sy.AddUncapped(y), s.syy.AddUncapped(y2)
+	s.sxy = s.sxy.AddUncapped(xy)
+	s.n++
+	return nil
+}
+
+// finalize evaluates the statistic over the exact sums (aggregates.md §23). With
+// numXY = N·Σxy − Σx·Σy computed exactly, covar_pop = numXY / (N·N); "/" is jed's decimal division
+// (select_div_scale, half away from zero, 22003 past the cap). NULL over no pair.
+func (s *pairsExact) finalize(stat pairStat) (Value, error) {
+	if s.n == 0 {
+		return NullValue(), nil
+	}
+	n := decimalFromInt64(s.n)
+	numXY := n.mulExact(s.sxy).sub(s.sx.mulExact(s.sy))
+	var r Decimal
+	var err error
+	switch stat {
+	default: // pairCovarPop
+		r, err = numXY.Div(n.mulExact(n))
+	}
+	if err != nil {
+		return NullValue(), err
+	}
+	return DecimalValue(r), nil
+}
+
+// pairsFloat is PostgreSQL's float8_regr_accum transition state: N, Σx, Sxx, Σy, Syy, and Sxy (the
+// sums of squared and cross deviations from the running means), all f64.
+type pairsFloat struct {
+	n, sx, sxx, sy, syy, sxy float64
+}
+
+// fold is float8_regr_accum over one Row(Y, X) pair (f32 widened to f64), skipping a pair with a
+// NULL: the two-variable Youngs-Cramer update. A finite input whose update overflows to ±Inf traps
+// 22003; an infinite or NaN input makes the dependent sums NaN. As for the one-argument fold, the
+// explicit conversions keep each operation separately rounded.
+func (s *pairsFloat) fold(v Value) error {
+	f := *v.composite()
+	if f[0].IsNull() || f[1].IsNull() {
+		return nil
+	}
+	y, x := f[0].asF64(), f[1].asF64()
+	n := s.n + 1
+	sx, sy := s.sx+x, s.sy+y
+	sxx, syy, sxy := s.sxx, s.syy, s.sxy
+	if s.n > 0 {
+		tmpX := float64(x*n) - sx
+		tmpY := float64(y*n) - sy
+		scale := 1.0 / float64(n*s.n)
+		sxx += float64(float64(tmpX*tmpX) * scale)
+		syy += float64(float64(tmpY*tmpY) * scale)
+		sxy += float64(float64(tmpX*tmpY) * scale)
+		inf := math.IsInf
+		if inf(sx, 0) || inf(sxx, 0) || inf(sy, 0) || inf(syy, 0) || inf(sxy, 0) {
+			if ((inf(sx, 0) || inf(sxx, 0)) && !inf(s.sx, 0) && !inf(x, 0)) ||
+				((inf(sy, 0) || inf(syy, 0)) && !inf(s.sy, 0) && !inf(y, 0)) ||
+				(inf(sxy, 0) && !inf(s.sx, 0) && !inf(x, 0) && !inf(s.sy, 0) && !inf(y, 0)) {
+				return overflowFloatErr()
+			}
+			if inf(sxx, 0) {
+				sxx = math.NaN()
+			}
+			if inf(syy, 0) {
+				syy = math.NaN()
+			}
+			if inf(sxy, 0) {
+				sxy = math.NaN()
+			}
+		}
+	} else {
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			sxx, sxy = math.NaN(), math.NaN()
+		}
+		if math.IsNaN(y) || math.IsInf(y, 0) {
+			syy, sxy = math.NaN(), math.NaN()
+		}
+	}
+	*s = pairsFloat{n: n, sx: sx, sxx: sxx, sy: sy, syy: syy, sxy: sxy}
+	return nil
+}
+
+// finalize is PostgreSQL's float8 final function for the statistic: covar_pop = Sxy / N. NULL over
+// no pair.
+func (s *pairsFloat) finalize(stat pairStat) Value {
+	if s.n < 1 {
+		return NullValue()
+	}
+	switch stat {
+	default: // pairCovarPop
+		return Float64Value(s.sxy / s.n)
+	}
+}

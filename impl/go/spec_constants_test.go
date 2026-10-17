@@ -489,6 +489,8 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			return resolvedType{kind: rtBytea}
 		case "boolean":
 			return resolvedType{kind: rtBool}
+		case "exact_numeric":
+			return resolvedType{kind: rtDecimal}
 		case "json":
 			return resolvedType{kind: rtJson}
 		case "jsonb":

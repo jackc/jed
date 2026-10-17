@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // covar_pop(Y, X) — the population covariance; exact over integer/decimal (aggregates.md §23).
+    "func.covar_pop",
     // stddev(x) — the alias of stddev_samp (aggregates.md §23).
     "func.stddev",
     // stddev_samp(x) — the sample standard deviation (aggregates.md §23).

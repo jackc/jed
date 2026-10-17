@@ -6090,6 +6090,22 @@ impl MomentStat {
     }
 }
 
+/// Which statistic a two-argument statistical aggregate finalizes (aggregates.md §23).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairStat {
+    CovarPop,
+}
+
+impl PairStat {
+    /// The statistic a two-argument statistical aggregate's surface names.
+    pub(crate) fn from_surface(surface: &str) -> Option<PairStat> {
+        Some(match surface {
+            "covar_pop" => PairStat::CovarPop,
+            _ => return None,
+        })
+    }
+}
+
 /// The bitwise operation a bit aggregate folds with (aggregates.md §23).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BitOp {
@@ -6138,6 +6154,11 @@ pub(crate) enum AggPlan {
     /// (decimal result), PostgreSQL's float8 algorithm over float input (`float`, f64 result).
     Moment {
         stat: MomentStat,
+        float: bool,
+    },
+    /// The two-argument statistical aggregates over (Y, X) (aggregates.md §23), exact or float.
+    Pair {
+        stat: PairStat,
         float: bool,
     },
     /// json_agg / jsonb_agg (and the `_strict` variants) — aggregate the inputs' JSON images into a
@@ -6350,6 +6371,18 @@ pub(crate) enum Acc {
         n: f64,
         sx: f64,
         sxx: f64,
+    },
+    /// The exact two-argument moments (aggregates.md §23): the count of pairs and the decimal sums
+    /// Σx, Σx², Σy, Σy², Σxy.
+    PairsExact {
+        stat: PairStat,
+        n: i64,
+        sums: Box<[Decimal; 5]>,
+    },
+    /// PostgreSQL's float8_regr_accum transition state: N, Σx, Sxx, Σy, Syy, Sxy, all f64.
+    PairsFloat {
+        stat: PairStat,
+        t: [f64; 6],
     },
     MinMax {
         cur: Option<Value>,
