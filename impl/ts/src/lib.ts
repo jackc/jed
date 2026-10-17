@@ -199,6 +199,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json[b]_object_agg[_unique] (B4) — the JSON-object aggregate builders (json-sql-functions.md §4).
   // Aggregate a group's (key, value) pairs into one JSON object; _unique errors 22030 on a dup key.
   "func.json_object_agg",
+  // bit_or(integer) — the bitwise OR of the non-NULL inputs (aggregates.md §23).
+  "func.bit_or",
   // bit_and(integer) — the bitwise AND of the non-NULL inputs (aggregates.md §23).
   "func.bit_and",
   // every(boolean) — the SQL-standard spelling of bool_and (aggregates.md §23).

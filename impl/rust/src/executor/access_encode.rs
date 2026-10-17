@@ -6061,6 +6061,7 @@ pub(crate) enum WindowPlan {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BitOp {
     And,
+    Or,
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type

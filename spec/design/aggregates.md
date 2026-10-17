@@ -742,12 +742,13 @@ unmetered.
 | `bool_or(x)` | `boolean` | `boolean` | TRUE iff some non-NULL input is TRUE |
 | `every(x)` | `boolean` | `boolean` | the SQL-standard spelling of `bool_and` |
 | `bit_and(x)` | `i16`/`i32`/`i64` | the input type | the bitwise AND of the non-NULL inputs |
+| `bit_or(x)` | `i16`/`i32`/`i64` | the input type | the bitwise OR of the non-NULL inputs |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
 state on the bounded-spill lane is `[bool or NULL]` ([memory.md](memory.md) §6.6).
 
-**Bitwise aggregates.** `bit_and` folds its non-NULL integer inputs with the two's-complement bitwise
-operator and returns the input's own type, so it never overflows. It is order-insensitive. Its packed
-state on the bounded-spill lane is `[int or NULL]`. (PostgreSQL also defines it over `bit` strings,
+**Bitwise aggregates.** `bit_and` and `bit_or` fold their non-NULL integer inputs with the
+two's-complement bitwise operator and return the input's own type, so they never overflow. They are order-insensitive. Their packed
+state on the bounded-spill lane is `[int or NULL]`. (PostgreSQL also defines them over `bit` strings,
 which jed does not have.)

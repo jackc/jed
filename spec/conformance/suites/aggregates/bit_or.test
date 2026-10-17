@@ -1,0 +1,102 @@
+# Aggregate bit_or(integer) -> the input type (spec/design/aggregates.md §23): the bitwise OR of
+# the non-NULL inputs. NULL inputs are skipped; an empty or all-NULL group -> NULL. Output name
+# `bit_or`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i16, types.i32, types.i64, resource.cost_metering, func.bit_or, func.bit_and
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, a i32, s i16, l i64)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 7, 12, -1), (2, 1, NULL, NULL, NULL), (3, 1, 13, 10, 9223372036854775807), (4, 2, -1, -6, -9223372036854775808), (5, 2, -8, 3, 5), (6, 3, NULL, NULL, NULL)
+
+# 6 rows read + 1 leaf page read + 6 accumulated + 1 produced.
+# names: bit_or
+# cost: 14
+query I nosort
+SELECT bit_or(a) FROM t
+----
+-1
+
+# names: bit_or, bit_or, bit_or
+query III nosort
+SELECT bit_or(a), bit_or(s), bit_or(l) FROM t WHERE g = 1
+----
+15
+14
+-1
+
+# names: bit_or, bit_or, bit_or
+query III nosort
+SELECT bit_or(a), bit_or(s), bit_or(l) FROM t WHERE g = 2
+----
+-1
+-5
+-9223372036854775803
+
+# All-NULL and empty groups are NULL.
+# names: g, bit_or
+query II rowsort
+SELECT g, bit_or(a) FROM t GROUP BY g
+----
+1
+15
+2
+-1
+3
+NULL
+
+# names: bit_or
+query I nosort
+SELECT bit_or(a) FROM t WHERE g = 9
+----
+NULL
+
+# names: bit_or
+query I nosort
+SELECT bit_or(a + 1) FROM t WHERE g = 1
+----
+14
+
+# names: bit_or
+query I nosort
+SELECT bit_or(DISTINCT a) FILTER (WHERE id < 4) FROM t
+----
+15
+
+# names: id, bit_or
+query II nosort
+SELECT id, bit_or(a) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+7
+2
+7
+3
+15
+4
+-1
+5
+-1
+6
+-1
+
+statement error 42883
+SELECT bit_or(a::numeric) FROM t
+
+statement error 42883
+SELECT bit_or(a > 0) FROM t
+
+# Beside bit_and over the same rows.
+# names: g, bit_and, bit_or
+query III rowsort
+SELECT g, bit_and(l), bit_or(l) FROM t GROUP BY g
+----
+1
+9223372036854775807
+-1
+2
+0
+-9223372036854775803
+3
+NULL
+NULL
