@@ -2704,21 +2704,23 @@ gen = "int_uniform"
 min = 0
 max = 999
 
-# GIN jsonb_ops jsonpath (spec/design/gin.md §2.2; query.gin_jsonb_jsonpath): `doc @@ '$.n == K'`
-# extracts the KEY term n and the number term K (an AND the skip-scan intersects), the same 100 rows
-# as gin_jsonb_contains. Before the jsonpath strategies jed full-scanned (and re-evaluated the path
-# over) all 100k documents per query. PostgreSQL's jsonb_ops serves @@ the same way; the answer is
-# index-independent, so the checksum holds. The path is built as text and cast, which both engines
-# accept.
+# GIN jsonb_ops jsonpath (spec/design/gin.md §2.2; query.gin_jsonb_jsonpath): `doc @@ '$.n == 7 &&
+# $.kind == "k7"'` extracts the KEY terms n and kind, the number term 7, and the string k7 as a key
+# OR a value (lax mode) — an AND the skip-scan intersects before the OR — matching the 100 documents
+# with g % 1000 = 7 (whose g % 50 is 7 too). Before the jsonpath strategies jed full-scanned (and re-evaluated
+# the path over) all 100k documents per query. PostgreSQL's jsonb_ops serves @@ the same way; the
+# answer is index-independent, so the checksum holds. The path is a literal (jed casts only a
+# literal to jsonpath), so every iteration runs the same query.
 [[bench]]
 name = "gin_jsonb_path_match"
-description = "GIN jsonb_ops @@: documents matching the jsonpath $.n == $1 — a key + number term intersection over a 100k-row jsonb column (100 rows per query)"
+description = "GIN jsonb_ops @@: documents matching $.n == 7 && $.kind == \"k7\" — a four-term intersection then a key-or-value OR over a 100k-row jsonb column (100 rows per query)"
 dataset = "scratch"
 kind = "query"
 engines = ["jed", "postgres"]
-sql = "SELECT id FROM jdocs WHERE doc @@ ('$.n == ' || ($1::bigint)::text)::jsonpath ORDER BY id"
-warmup = 200
-iterations = 2000
+sql = "SELECT id FROM jdocs WHERE doc @@ '$.n == 7 && $.kind == \"k7\"' ORDER BY id"
+expect_rows_per_iter = 100
+warmup = 5
+iterations = 100
 seed = 4292
 setup_sql = [
   "DROP TABLE IF EXISTS jdocs",
@@ -2726,11 +2728,6 @@ setup_sql = [
   "INSERT INTO jdocs SELECT g, jsonb_build_object('kind', 'k' || (g % 50)::text, 'tag' || (g % 97)::text, true, 'n', g % 1000) FROM generate_series(1, 100000) AS g",
   "CREATE INDEX jdocs_doc_gin ON jdocs USING gin (doc)"
 ]
-
-[[bench.param]]
-gen = "int_uniform"
-min = 0
-max = 999
 
 [[bench]]
 name = "gin_jsonb_exists"
@@ -2795,8 +2792,8 @@ dataset = "gin"
 kind = "query"
 engines = ["jed", "postgres"]
 sql = "SELECT id FROM docs WHERE tags IN (ARRAY[$1::bigint, $2::bigint], ARRAY[$3::bigint], ARRAY[$2::bigint, $3::bigint]) ORDER BY id"
-warmup = 200
-iterations = 2000
+warmup = 20
+iterations = 300
 seed = 4213
 
 [[bench.param]]

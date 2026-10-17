@@ -2973,7 +2973,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	}
 	rekeyed := rewriteRows != nil && pkRekeyed
 	if rekeyed {
-		constraintEntries = map[string][][]byte{}
+		constraintEntries = map[string][]indexEntry{}
 		colls := db.columnCollations(table.Columns)
 		for _, ix := range table.Indexes {
 			ri, err := db.resolveIndex(&table, ix)
@@ -2986,9 +2986,11 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				if err != nil {
 					return outcome{}, err
 				}
-				constraintEntries[key] = append(constraintEntries[key], es...)
+				for _, ek := range es {
+					constraintEntries[key] = append(constraintEntries[key], indexEntry{ek, len(entry.Key)})
+				}
 			}
-			slices.SortFunc(constraintEntries[key], bytes.Compare)
+			sortIndexEntries(constraintEntries[key])
 		}
 	}
 	var ws *snapshot
@@ -4020,14 +4022,8 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		db.working().putIndex(tableKey, def, db.pageSize)
 	}
 	istore := db.writeIndexStoreScoped(ci.DB, nameKey)
-	for _, ek := range entries {
-		inserted, err := istore.Insert(ek, nil)
-		if err != nil {
-			return outcome{}, err
-		}
-		if !inserted {
-			return outcome{}, newError(DataCorrupted, "index entry keys are unique (storage-key suffix)")
-		}
+	if err := indexBuildInsert(istore, def.Kind, entries); err != nil {
+		return outcome{}, err
 	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
 }
@@ -4045,7 +4041,7 @@ type reindexRebuilt struct {
 	scope    string
 	tableKey string
 	def      indexDef
-	entries  [][]byte
+	entries  []indexEntry
 }
 
 // executeReindex runs a REINDEX (spec/design/indexes.md §10): rebuild each target index in place from
@@ -4123,14 +4119,9 @@ func (db *engine) executeReindex(rx *reindexStmt) (outcome, error) {
 		snap.putIndex(rb.tableKey, rb.def, pageSize)
 		scope := rb.scope
 		istore := db.writeIndexStoreScoped(&scope, nameKey)
-		for _, ek := range rb.entries {
-			inserted, err := istore.Insert(ek, nil)
-			if err != nil {
-				return outcome{}, err
-			}
-			if !inserted {
-				return outcome{}, newError(DataCorrupted, "index entry keys are unique (storage-key suffix)")
-			}
+		// The same build insert as CREATE INDEX, so a GIN index's posting runs come out identical.
+		if err := indexBuildInsert(istore, rb.def.Kind, rb.entries); err != nil {
+			return outcome{}, err
 		}
 	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
@@ -4319,7 +4310,7 @@ func (db *engine) admitIndexExpr(table *catTable, expr exprNode, predicate bool,
 // slabs). A UNIQUE definition verifies the rows (23505, indexes.md §8). An expression key evaluating
 // with an error aborts the build, so nothing is registered. A nil scope keeps the bare temp-first
 // funnel.
-func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDef, meter *costMeter) ([][]byte, error) {
+func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDef, meter *costMeter) ([]indexEntry, error) {
 	columns := table.Columns
 	// Per-column frozen collations for the collated text key form (§2.12); nil everywhere for a
 	// C-only / non-text table (the fast path).
@@ -4354,7 +4345,7 @@ func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDe
 		return nil, err
 	}
 	meter.Charge(costs.PageRead*int64(nodes) + costs.ValueDecompress*int64(slabs))
-	entries := make([][]byte, 0, len(stored))
+	entries := make([]indexEntry, 0, len(stored))
 	// A UNIQUE build verifies the existing rows before the index is registered
 	// (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
 	// prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
@@ -4388,7 +4379,9 @@ func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDe
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, eks...)
+		for _, ek := range eks {
+			entries = append(entries, indexEntry{ek, len(e.Key)})
+		}
 	}
 	if err := meter.Guard(); err != nil {
 		return nil, err
@@ -4396,7 +4389,7 @@ func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDe
 	// Sorted by entry key (indexes.md §1): every insert is then a right-edge append, so the built tree
 	// packs ~full instead of splintering under the storage-key order the scan produced (random in
 	// entry-key space). Part of the byte contract — the sort fixes the built tree's shape across cores.
-	slices.SortFunc(entries, bytes.Compare)
+	sortIndexEntries(entries)
 	return entries, nil
 }
 

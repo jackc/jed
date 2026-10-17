@@ -730,6 +730,148 @@ def check_ordered_file(filename)
   checked
 end
 
+
+# --- GIN posting runs (gin.md §4.5, format_version 47) -------------------------------------------
+# An independent reference of the run codec and of run maintenance over one term's posting list.
+# A term's runs are kept as an ascending list of key lists (ascending by last key = run-key order).
+GIN_RUN_MAX_BYTES = 64
+
+def gin_run_varint(v)
+  out = "".b
+  loop do
+    byte = v & 0x7F
+    v >>= 7
+    if v.zero?
+      out << byte.chr
+      return out
+    end
+    out << (byte | 0x80).chr
+  end
+end
+
+def gin_run_shared(a, b)
+  n = 0
+  n += 1 while n < a.bytesize && n < b.bytesize && a.getbyte(n) == b.getbyte(n)
+  n
+end
+
+def gin_run_encode(term, keys)
+  last = keys.last
+  body = "".b
+  prev = last
+  keys[0...-1].each do |k|
+    shared = gin_run_shared(prev, k)
+    body << gin_run_varint(shared) << gin_run_varint(k.bytesize - shared) << k.byteslice(shared..)
+    prev = k
+  end
+  (term + last + body + [body.bytesize].pack("n")).b
+end
+
+def gin_run_decode(term_len, run)
+  body_len = run.byteslice(-2, 2).unpack1("n")
+  last = run.byteslice(term_len, run.bytesize - 2 - body_len - term_len)
+  body = run.byteslice(run.bytesize - 2 - body_len, body_len)
+  keys = []
+  at = 0
+  read = lambda do
+    v = 0
+    shift = 0
+    loop do
+      byte = body.getbyte(at)
+      at += 1
+      v |= (byte & 0x7F) << shift
+      shift += 7
+      return v if (byte & 0x80).zero?
+    end
+  end
+  while at < body.bytesize
+    shared = read.call
+    suffix = read.call
+    prev = keys.last || last
+    keys << (prev.byteslice(0, shared) + body.byteslice(at, suffix)).b
+    at += suffix
+  end
+  keys << last
+end
+
+def gin_run_pack(term, keys)
+  runs = []
+  start = 0
+  while start < keys.size
+    stop = start + 1
+    stop += 1 while stop < keys.size && gin_run_encode(term, keys[start..stop]).bytesize <= GIN_RUN_MAX_BYTES
+    runs << keys[start...stop]
+    start = stop
+  end
+  runs
+end
+
+def gin_run_split(term, keys)
+  return [keys] if keys.size == 1 || gin_run_encode(term, keys).bytesize <= GIN_RUN_MAX_BYTES
+
+  mid = (keys.size + 1) / 2
+  gin_run_split(term, keys[0...mid]) + gin_run_split(term, keys[mid..])
+end
+
+# Add `key` (gin.md §4.5): the first run whose last key is >= key takes it, split in halves when it
+# outgrows the limit; a key above every run joins the last run when it stays within the limit, else
+# starts a new run.
+def gin_run_insert(term, runs, key)
+  i = runs.index { |r| r.last >= key }
+  if i
+    return runs if runs[i].include?(key)
+
+    keys = (runs[i] + [key]).sort
+    return runs[0...i] + gin_run_split(term, keys) + runs[(i + 1)..]
+  end
+  if !runs.empty? && gin_run_encode(term, runs.last + [key]).bytesize <= GIN_RUN_MAX_BYTES
+    return runs[0...-1] + [runs.last + [key]]
+  end
+  runs + [[key]]
+end
+
+def gin_run_remove(term, runs, key)
+  i = runs.index { |r| r.last >= key }
+  return runs unless i && runs[i].include?(key)
+
+  keys = runs[i] - [key]
+  runs[0...i] + (keys.empty? ? [] : gin_run_split(term, keys)) + runs[(i + 1)..]
+end
+
+# Verify spec/encoding/gin_posting_runs.toml: each `[[run]]`'s encoding and decoding, each
+# `[[pack]]`'s greedy packing, and each `[[history]]`'s maintenance result.
+def check_gin_runs_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  unhex = ->(h) { [h].pack("H*").b }
+  checked = 0
+  (data["run"] || []).each do |c|
+    term = unhex.call(c["term"])
+    keys = c["keys"].map(&unhex)
+    got = hex(gin_run_encode(term, keys))
+    fail!("gin run #{c['keys']}: #{got} want #{c['run']}") unless got == c["run"]
+    fail!("gin run #{c['run']}: decode mismatch") unless gin_run_decode(term.bytesize, unhex.call(c["run"])) == keys
+    checked += 1
+  end
+  (data["pack"] || []).each do |c|
+    term = unhex.call(c["term"])
+    got = gin_run_pack(term, c["keys"].map(&unhex)).map { |r| hex(gin_run_encode(term, r)) }
+    fail!("gin pack #{c['keys']}: #{got} want #{c['runs']}") unless got == c["runs"]
+    checked += 1
+  end
+  (data["history"] || []).each do |c|
+    term = unhex.call(c["term"])
+    runs = []
+    c["ops"].each do |op|
+      key = unhex.call(op[1..])
+      runs = op.start_with?("+") ? gin_run_insert(term, runs, key) : gin_run_remove(term, runs, key)
+    end
+    got = runs.map { |r| hex(gin_run_encode(term, r)) }
+    fail!("gin history #{c['name']}: #{got} want #{c['runs']}") unless got == c["runs"]
+    checked += 1
+  end
+  checked
+end
+
 def label_of(c) = c["null"] ? "NULL" : c["value"]
 
 def main
@@ -814,6 +956,9 @@ def main
 
   # Ordered index slots (§2.16): every keyable type's body in all four ASC/DESC x NULLS orders.
   checked += check_ordered_file("ordered.toml")
+
+  # GIN posting runs (gin.md §4.5): the run codec, the build's greedy packing, and run maintenance.
+  checked += check_gin_runs_file("gin_posting_runs.toml")
 
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end

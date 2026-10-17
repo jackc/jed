@@ -184,3 +184,68 @@ fn gin_jsonb_terms_match_vectors() {
     }
     assert!(checked > 20);
 }
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn hex_list(v: &toml::Value) -> Vec<Vec<u8>> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|s| unhex(s.as_str().unwrap()))
+        .collect()
+}
+
+/// The GIN posting-run vectors (spec/encoding/gin_posting_runs.toml, gin.md §4.5): the run codec,
+/// the build's greedy packing, and run maintenance over an in-memory index store.
+#[test]
+fn gin_posting_runs_match_vectors() {
+    use jed::gin_runs::{decode_run, encode_run, gin_insert, gin_remove, pack_runs};
+    let v: toml::Value = toml::from_str(&spec("encoding/gin_posting_runs.toml")).unwrap();
+    let mut checked = 0;
+    for case in v["run"].as_array().unwrap() {
+        let term = unhex(case["term"].as_str().unwrap());
+        let keys = hex_list(&case["keys"]);
+        let run = encode_run(&term, &keys);
+        assert_eq!(hex(&run), case["run"].as_str().unwrap());
+        assert_eq!(decode_run(term.len(), &run).unwrap(), keys);
+        checked += 1;
+    }
+    for case in v["pack"].as_array().unwrap() {
+        let term = unhex(case["term"].as_str().unwrap());
+        let got: Vec<String> = pack_runs(&term, &hex_list(&case["keys"]))
+            .iter()
+            .map(|r| hex(r))
+            .collect();
+        let want: Vec<String> = hex_list(&case["runs"]).iter().map(|r| hex(r)).collect();
+        assert_eq!(got, want);
+        checked += 1;
+    }
+    for case in v["history"].as_array().unwrap() {
+        let term = unhex(case["term"].as_str().unwrap());
+        let mut store = jed::storage::TableStore::new(4080, Vec::new());
+        for op in case["ops"].as_array().unwrap() {
+            let op = op.as_str().unwrap();
+            let key = unhex(&op[1..]);
+            if op.starts_with('+') {
+                gin_insert(&mut store, &term, &key).unwrap();
+            } else {
+                gin_remove(&mut store, &term, &key).unwrap();
+            }
+        }
+        let got: Vec<String> = store
+            .iter_entries()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| hex(k))
+            .collect();
+        let want: Vec<String> = hex_list(&case["runs"]).iter().map(|r| hex(r)).collect();
+        assert_eq!(got, want, "history {}", case["name"]);
+        checked += 1;
+    }
+    assert!(checked >= 10);
+}

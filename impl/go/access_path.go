@@ -2,6 +2,7 @@ package jed
 
 import (
 	"bytes"
+	"cmp"
 	"math"
 	"slices"
 	"sort"
@@ -2756,6 +2757,77 @@ func (gb *ginBoundPlan) opclass() ginOpclass {
 	return ginOpclass{jsonb: gb.jsonb, elem: gb.elemType}
 }
 
+// ginGroupLookups: a skip-scan leaf group of at most this many candidates finds each candidate's run
+// by its own lookup; a larger one scans the group's runs once (gin.md §6.2). An implementation
+// choice: both find the same postings and the group's charges do not depend on it.
+const ginGroupLookups = 4
+
+// ginProbeGroupLookups is one leaf group's surviving candidates by a lookup per candidate — the first
+// run at or after term ‖ c holds c if any run does — and (as a one-element slice, nil when none) the
+// key of the run at or after the last candidate.
+func ginProbeGroupLookups(istore *tableStore, term []byte, group [][]byte) (end, found [][]byte, err error) {
+	var decodedRun []byte
+	var keys [][]byte
+	for _, c := range group {
+		run, err := ginRunAtOrAfter(istore, term, c)
+		if err != nil {
+			return nil, nil, err
+		}
+		if run == nil {
+			break // no later candidate has a run either
+		}
+		if !bytes.Equal(run, decodedRun) {
+			if keys, err = ginDecodeRun(len(term), run); err != nil {
+				return nil, nil, err
+			}
+			decodedRun = run
+		}
+		if _, ok := ginSearchKeys(keys, c); ok {
+			found = append(found, c)
+		}
+		end = [][]byte{run}
+	}
+	return end, found, nil
+}
+
+// ginProbeGroupScan is one leaf group's surviving candidates by one scan of its runs, from
+// term ‖ c_first through the first run past last (= term ‖ c_last), and that run's key.
+func ginProbeGroupScan(istore *tableStore, term []byte, group [][]byte, first, last []byte) (end, found [][]byte, err error) {
+	var runs [][]byte
+	past := false
+	b := ginPostingBound(term)
+	b.lo = first
+	if err := istore.ScanRange(b, func(k []byte, _ storedRow) (bool, error) {
+		runs = append(runs, append([]byte{}, k...))
+		past = bytes.Compare(k, last) > 0
+		return !past, nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	decodedAt := -1
+	var keys [][]byte
+	for _, c := range group {
+		key := append(append([]byte{}, term...), c...)
+		at := sort.Search(len(runs), func(k int) bool { return bytes.Compare(runs[k], key) >= 0 })
+		if at == len(runs) {
+			break
+		}
+		if at != decodedAt {
+			if keys, err = ginDecodeRun(len(term), runs[at]); err != nil {
+				return nil, nil, err
+			}
+			decodedAt = at
+		}
+		if _, ok := ginSearchKeys(keys, c); ok {
+			found = append(found, c)
+		}
+	}
+	if past {
+		end = [][]byte{runs[len(runs)-1]}
+	}
+	return end, found, nil
+}
+
 // ginQueryKind is the outcome of a GIN opclass's extract_query_terms (gin.md §2/§6): distinct query
 // terms to gather (sorted), a provably-empty bound, or the full-scan fallback for a query whose
 // matches the index cannot enumerate.
@@ -4121,43 +4193,83 @@ func (g *ginGatherer) postingList(term []byte) ([][]byte, error) {
 		return nil, err
 	}
 	g.pages += p
-	g.entries += len(es)
-	keys := make([][]byte, len(es))
-	for i := range es {
-		keys[i] = es[i].Key[len(term):]
+	return g.decodeRuns(term, es)
+}
+
+// decodeRuns is the storage keys of a term's run records (gin.md §4.5), charging one gin_entry each.
+func (g *ginGatherer) decodeRuns(term []byte, es []entry) ([][]byte, error) {
+	var keys [][]byte
+	for _, e := range es {
+		ks, err := ginDecodeRun(len(term), e.Key)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, ks...)
 	}
+	g.entries += len(keys)
 	return keys, nil
 }
 
 // intersect is the ALL-mode skip-scan intersection (gin.md §6.2). The terms are ordered by their
-// posting range's skeleton overlap count (ties by bytes); the first list is read whole, and each
-// following term is probed at the surviving candidates in leaf groups — runs of consecutive
-// candidates whose probe keys fall in one leaf — each charging its root-to-leaf path once and one
-// gin_entry per step of the cheaper leaf-local match. Stops once no candidate survives. The spans and
-// the grouping read only the resident skeleton and are unmetered.
+// posting range's skeleton overlap count; a term whose range lies in one leaf is peeked — its run
+// records read, charging the path — and ordered by its run count and bytes, ties by term bytes. The
+// first list is read whole, and each following term is probed at the surviving candidates in leaf
+// groups — runs of consecutive candidates whose probe keys fall in one leaf — each reading the runs
+// from its first probe key through the run past its last, charging the nodes that range overlaps and
+// one gin_entry per step of the cheaper leaf-local match. Stops once no candidate survives.
 func (g *ginGatherer) intersect(terms [][]byte) ([][]byte, error) {
 	if len(terms) == 0 {
 		return nil, nil
 	}
+	if len(terms) == 1 {
+		return g.postingList(terms[0])
+	}
+	height := g.istore.Height()
 	type spanned struct {
-		span int
-		term []byte
+		span, runs, bytes int
+		term              []byte
+		peeked            []entry
+		wasPeeked         bool
 	}
 	ordered := make([]spanned, len(terms))
 	for i, t := range terms {
-		ordered[i] = spanned{g.istore.OverlapNodeCount(ginPostingBound(t)), t}
+		o := spanned{span: g.istore.OverlapNodeCount(ginPostingBound(t)), term: t}
+		if o.span <= height {
+			es, p, _, err := g.istore.RangeScanWithUnits(ginPostingBound(t), nil)
+			if err != nil {
+				return nil, err
+			}
+			g.pages += p
+			o.runs, o.peeked, o.wasPeeked = len(es), es, true
+			for _, e := range es {
+				o.bytes += len(e.Key)
+			}
+		} else {
+			o.runs, o.bytes = math.MaxInt, math.MaxInt
+		}
+		ordered[i] = o
 	}
 	slices.SortFunc(ordered, func(a, b spanned) int {
-		if a.span != b.span {
-			return a.span - b.span
+		switch {
+		case a.span != b.span:
+			return cmp.Compare(a.span, b.span)
+		case a.runs != b.runs:
+			return cmp.Compare(a.runs, b.runs)
+		case a.bytes != b.bytes:
+			return cmp.Compare(a.bytes, b.bytes)
 		}
 		return bytes.Compare(a.term, b.term)
 	})
-	cand, err := g.postingList(ordered[0].term)
+	var cand [][]byte
+	var err error
+	if ordered[0].wasPeeked {
+		cand, err = g.decodeRuns(ordered[0].term, ordered[0].peeked)
+	} else {
+		cand, err = g.postingList(ordered[0].term)
+	}
 	if err != nil {
 		return nil, err
 	}
-	height := g.istore.Height()
 	probe := func(term, key []byte) []byte {
 		return append(append(make([]byte, 0, len(term)+len(key)), term...), key...)
 	}
@@ -4174,26 +4286,32 @@ func (g *ginGatherer) intersect(terms [][]byte) ([][]byte, error) {
 			for j+1 < len(cand) && g.istore.OverlapNodeCount(span(first, probe(term, cand[j+1]))) == height {
 				j++
 			}
-			// One leaf: its root-to-leaf path once, then the cheaper leaf-local match — a probe per
-			// candidate, or a merge with the term's entries between the first and last candidate —
-			// one gin_entry per step.
-			found, path, _, err := g.istore.RangeScanWithUnits(span(first, probe(term, cand[j])), nil)
+			// One leaf: the runs from term ‖ c_i through the run holding (or following) c_j — the first
+			// run past term ‖ c_j (gin.md §4.5/§6.2). The group charges the nodes that range overlaps
+			// (its root-to-leaf path when the run is in the same leaf), then the cheaper leaf-local match
+			// — a probe per candidate, or a merge with the runs' storage keys — one gin_entry per step.
+			last := probe(term, cand[j])
+			group := cand[i : j+1]
+			// The run past term ‖ c_j ends the charged range; membership is found by a lookup per
+			// candidate when the group is small, else by one scan of the group's runs — the same
+			// answer and charges either way.
+			var end, found [][]byte
+			var err error
+			if len(group) <= ginGroupLookups {
+				end, found, err = ginProbeGroupLookups(g.istore, term, group)
+			} else {
+				end, found, err = ginProbeGroupScan(g.istore, term, group, first, last)
+			}
 			if err != nil {
 				return nil, err
 			}
-			g.pages += path
-			g.entries += min(j+1-i, len(found))
-			// Both lists ascend, so a merge keeps the candidates whose entry was found.
-			f := 0
-			for _, c := range cand[i : j+1] {
-				for f < len(found) && bytes.Compare(found[f].Key[len(term):], c) < 0 {
-					f++
-				}
-				if f < len(found) && bytes.Equal(found[f].Key[len(term):], c) {
-					survivors = append(survivors, c)
-					f++
-				}
+			stop := last
+			if end != nil {
+				stop = end[0]
 			}
+			g.pages += g.istore.OverlapNodeCount(span(first, stop))
+			g.entries += len(group)
+			survivors = append(survivors, found...)
 			i = j + 1
 		}
 		cand = survivors

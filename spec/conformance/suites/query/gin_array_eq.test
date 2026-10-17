@@ -36,7 +36,7 @@ INSERT INTO t VALUES
 
 # --- col = const: exact equality, gathered as @> distinct(const) + residual = ------------------
 # = {10,20,30} → row 1 only (the @>{10,20,30} gather is a superset; residual = confirms)
-# cost: 15
+# cost: 13
 query I nosort
 SELECT id FROM t WHERE tags = ARRAY[10,20,30] ORDER BY id
 ----
@@ -51,7 +51,7 @@ SELECT id FROM t WHERE tags = ARRAY[20,40] ORDER BY id
 
 # = {10,10,20} → row 4 only (duplicate elements: distinct terms {10,20} gather rows 1 and 4;
 # residual = rejects row 1 {10,20,30} on cardinality/multiset)
-# cost: 17
+# cost: 18
 query I nosort
 SELECT id FROM t WHERE tags = ARRAY[10,10,20] ORDER BY id
 ----
@@ -59,13 +59,13 @@ SELECT id FROM t WHERE tags = ARRAY[10,10,20] ORDER BY id
 
 # order-sensitive: = {20,10} → empty (gather @>{10,20} admits rows 1 and 4; residual = rejects
 # both — array `=` is ordered, {10,...} ≠ {20,...})
-# cost: 16
+# cost: 17
 query I nosort
 SELECT id FROM t WHERE tags = ARRAY[20,10] ORDER BY id
 ----
 
 # miss: = {10,20,40} → empty (no row has all of 10,20,40 → empty candidate set, no residual work)
-# cost: 11
+# cost: 8
 query I nosort
 SELECT id FROM t WHERE tags = ARRAY[10,20,40] ORDER BY id
 ----
@@ -92,7 +92,7 @@ statement ok
 DELETE FROM t WHERE id = 1
 
 # row 1 is gone — = {10,20,30} now matches nothing
-# cost: 6
+# cost: 3
 query I nosort
 SELECT id FROM t WHERE tags = ARRAY[10,20,30] ORDER BY id
 ----

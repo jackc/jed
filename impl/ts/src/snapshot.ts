@@ -4,6 +4,7 @@
 // pmap.ts / §3). A reader holds a Snapshot and is thereby stable for its life: a later commit
 // produces a new Snapshot and never mutates this one. (JavaScript has no shared-memory threads for
 // live objects, so P5.3b gives snapshot ISOLATION across async interleavings, not CPU parallelism.)
+import { type IndexEntry, indexBuildInsert, sortIndexEntries } from "./gin_runs.ts";
 import type {
   ColType,
   CompositeType,
@@ -31,7 +32,6 @@ import { versionSkew } from "./collation.ts";
 import type { Environment } from "./environment.ts";
 import { engineError } from "./errors.ts";
 import type { Entry, Row } from "./storage.ts";
-import { compareBytes } from "./pmap.ts";
 import { compareTextC } from "./value.ts";
 import { pagePayload } from "./format.ts";
 import { compositeRefName } from "./types.ts";
@@ -586,12 +586,13 @@ export class Snapshot {
             "collation upgrade of a table with a partial index is not supported yet",
           );
         }
-        const ekeys: Uint8Array[] = [];
+        const ekeys: IndexEntry[] = [];
         for (const e of entries)
-          ekeys.push(...indexEntryKeysColumns(table.columns, colTypes, colls, def, e.key, e.row));
-        ekeys.sort(compareBytes);
+          for (const ek of indexEntryKeysColumns(table.columns, colTypes, colls, def, e.key, e.row))
+            ekeys.push({ key: ek, skeyLen: e.key.length });
+        sortIndexEntries(ekeys);
         const fresh = new TableStore(pagePayload(pageSize), []);
-        for (const ek of ekeys) fresh.insert(ek, []);
+        indexBuildInsert(fresh, def.kind, ekeys);
         this.putIndexStore(def.name, fresh);
       }
     }
@@ -1033,7 +1034,7 @@ export class Snapshot {
   syncAlterConstraintIndexes(
     old: Table,
     next: Table,
-    entries: Map<string, Uint8Array[]>,
+    entries: Map<string, IndexEntry[]>,
     pageSize: number,
     indexRename?: { oldName: string; newName: string },
   ): void {
@@ -1060,7 +1061,7 @@ export class Snapshot {
       }
       const s = new TableStore(pagePayload(pageSize), []);
       if (this.storePaging !== null) s.attachPaging(this.storePaging);
-      for (const e of entries.get(k) ?? []) s.insert(e, []);
+      indexBuildInsert(s, i.kind, entries.get(k) ?? []);
       this.indexStores.set(k, s);
     }
   }
@@ -1068,7 +1069,7 @@ export class Snapshot {
   rebuildAlterIndexes(
     old: Table,
     next: Table,
-    entries: Map<string, Uint8Array[]>,
+    entries: Map<string, IndexEntry[]>,
     pageSize: number,
   ): void {
     for (const index of old.indexes) {
@@ -1080,7 +1081,7 @@ export class Snapshot {
       const key = index.name;
       const store = new TableStore(pagePayload(pageSize), []);
       if (this.storePaging !== null) store.attachPaging(this.storePaging);
-      for (const entry of entries.get(key) ?? []) store.insert(entry, []);
+      indexBuildInsert(store, index.kind, entries.get(key) ?? []);
       this.indexStores.set(key, store);
     }
   }

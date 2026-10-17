@@ -454,6 +454,63 @@ bound's rows and `gin_entry` come from its column's facts unchanged; only its pa
 against the index's total entries, the sum of every key column's estimated term occurrences (a column
 without term facts contributes none).
 
+### 4.5 Posting runs (`format_version` 43)
+
+The entry tree does not store one record per `(term, row)` posting. Each term's posting list — its
+storage keys, ascending — is cut into **runs**, and each run is one record whose key is:
+
+```
+run_key = term ‖ last ‖ body ‖ u16 BE len(body)
+body    = for each storage key k_i of the run but the last, ascending:
+            varint(shared) ‖ varint(len(k_i) − shared) ‖ k_i[shared ..]
+          where shared = the common-prefix length of k_i and the previous key
+          (k_0's previous key is `last`); varint = unsigned LEB128
+```
+
+`term` is the column tag and term of §4/§4.4 (the posting prefix); `last` is the run's largest storage
+key. The records stay empty-payload B-tree keys, so pages, splits, commit, and reclamation are the
+ordinary index machinery ([indexes.md §6](indexes.md)). A term's runs are still exactly the prefix
+range `[term, successor(term))`. They sort by `last` — storage keys are prefix-free, so `term ‖ last`
+decides the order — and the run that holds a storage key `k`, or would hold it, is **the first record
+at or after `term ‖ k`**: a forward lookup, with no predecessor search. A decoder knows the term's
+length (every reader looks up a known term), finds the body length in the last two bytes, and rejects
+a malformed run (lengths out of range, keys not strictly ascending, an empty key) as `XX001`.
+
+**Size.** A run grows to at most `GIN_RUN_MAX_BYTES` = 64 bytes of key, so a separator copied into an
+interior node ([indexes.md §6](indexes.md)) stays short; a run of one storage key may be longer (a long
+term or key alone) and is then its old single entry plus two bytes. Front coding keeps the shared
+prefix of neighbouring storage keys once: an `i64` primary key costs about 3 bytes per posting instead
+of `term + 8` plus a record slot. On 100,000 rows, a GIN over a three-element `i64[]` column shrinks
+from 1,280 to 256 pages, and one over a four-key `jsonb` document from 2,560 to 512 (4 KiB pages).
+
+**Build.** `CREATE INDEX` (and every rebuild — `ALTER TABLE … TYPE`, a re-keying `ALTER`, the
+collation realign) packs each term's sorted storage keys **greedily**: a run takes the next key while
+its key stays within 64 bytes. Runs are inserted in key order, so the from-scratch tree is a function
+of the posting set, and that is the image the golden fixtures pin.
+
+**Maintenance.** Each posting insert or removal edits one run, in the statement's existing entry
+order (§5):
+
+- **Insert `(term, k)`.** The run at or after `term ‖ k` takes `k` (its `last` is larger, so `k` lands
+  inside it); if the run now exceeds 64 bytes it is split into its first `⌈n/2⌉` keys and the rest,
+  each split again the same way until it fits or holds one key. With no such run, `k` is above every
+  run of the term: it joins the term's **last** run (the last record before `term ‖ k`) when that run
+  stays within 64 bytes, and otherwise starts a new run `{k}`. Appending ascending keys therefore packs
+  exactly as the build does.
+- **Remove `(term, k)`.** The run at or after `term ‖ k` loses `k`; an emptied run is deleted, and a
+  run whose recoding grew past the limit (a removed middle key can lengthen the next key's suffix) is
+  split as above. Runs are never merged.
+
+Each edit costs one run (at most 64 bytes plus one key) regardless of the posting list's length, so
+maintenance stays bounded per posting. The layout depends on the statement history, as a B-tree's
+shape does; the same history produces the same records in every core.
+`spec/encoding/gin_posting_runs.toml` pins the codec, the greedy build, and maintenance histories,
+verified by an independent Ruby reference and checked by every core.
+
+**Readers.** A posting read decodes every run of its range and charges one `gin_entry` per storage
+key decoded (§6). Term statistics ([statistics.md §4.5](statistics.md)) count postings from the table
+rows, never from the index, so they are unchanged.
+
 **Term extraction is a SET (dedup is mandatory, not an optimization).** A row
 `{1, 1, 2}` yields the terms `{1, 2}` — one entry each. Two `1` entries for one row would
 be the identical key `encode(1) ‖ storage_key` and collide on insert (the index's
@@ -564,30 +621,36 @@ gather is, for distinct query terms `t₁ … t_k` (`k ≥ 2`):
 1. **Order the terms.** Each term's **span** is the number of entry-tree nodes its posting range
    `[t, byte-successor(t))` overlaps — the overlap-node count a full read of that list would charge as
    `page_read`, computed from the resident tree skeleton without reading a leaf (the estimator's
-   count, [estimator.md §8.1](estimator.md)). Terms are ordered by ascending span, ties by ascending
-   term bytes. Computing spans is **unmetered** planning work bounded by `k ×` the tree height.
+   count, [estimator.md §8.1](estimator.md)). Computing spans is **unmetered** planning work bounded by
+   `k ×` the tree height. Because runs (§4.5) put many postings in one leaf, many terms share the
+   minimum span, so a term whose range lies in **one leaf** (span = height) is **peeked**: its range is
+   read, charging that path as `page_read` (no `gin_entry`), and its run-record count and total run
+   bytes become its finer measure. Terms are ordered by ascending span, then run count, then run bytes
+   (a term that is not peeked sorts after every peeked term of its span), then term bytes.
 2. **Read the driver.** The first term's posting list is read whole, as a prefix range scan, charging
-   its overlap nodes as `page_read` and each entry as `gin_entry`. Its storage keys, ascending, are the
-   candidates `C`.
+   its overlap nodes as `page_read` and each decoded posting as `gin_entry`; a peeked driver's runs are
+   already read and charge only their postings. Its storage keys, ascending, are the candidates `C`.
 3. **Probe each following term in order**, while `C` is non-empty. Walk `C` ascending, cutting it
    into **leaf groups**: a group starts at the next unprocessed candidate `c_i` and extends to
    `c_{i+1}, c_{i+2}, …` while the inclusive range `[t ‖ c_i, t ‖ c_j]` still overlaps a single leaf —
-   its overlap-node count equals the entry tree's height (again skeleton-only and unmetered). Each
-   group reads its one leaf: it charges the root-to-leaf path (the tree height) as `page_read` once.
-   It then matches its candidates by the cheaper of two leaf-local walks: probing each candidate for
-   its exact entry `t ‖ c`, or merging with the entries of `t` in `[t ‖ c_first, t ‖ c_last]` (both
-   ends inclusive). It charges one `gin_entry` per step: `min(candidates in the group, entries of t
-   in that range)`. A candidate survives when its entry exists. The survivors become `C`.
+   its overlap-node count equals the entry tree's height (again skeleton-only and unmetered). A
+   candidate's posting lives in the first run at or after `t ‖ c` (§4.5), so a group reads the runs
+   from `t ‖ c_i` through the first run past `t ‖ c_j` (or to the term's end), and charges the nodes
+   the range `[t ‖ c_i, E]` overlaps as `page_read`, `E` being that last run's key (or `t ‖ c_j` when
+   the term ends first) — the root-to-leaf path when the run is in the same leaf. It then probes each
+   candidate in its run, charging one `gin_entry` per candidate of the group. A candidate survives when
+   its posting exists. The survivors become `C`. (How a core finds the runs — a lookup per candidate
+   for a small group, one scan of the group's runs for a large one — is an implementation choice that
+   changes neither the answer nor the charges.)
 4. **Stop early.** Once `C` is empty the remaining terms are not read and charge nothing.
 
 The result is exactly the intersection of the posting lists, in storage-key order, so rows and
 emission order are unchanged; only `page_read` and `gin_entry` change. Every input — the skeleton,
-the height, the term bytes, the storage keys — is cross-core identical, so the order, the groups, and
-the charges are a byte contract like the rest of the gather (§8). A probed term costs at most one
-`gin_entry` per candidate rather than one per posting entry, and never more than the entries of its
-own list between the candidates, plus one root-to-leaf path per leaf its candidates land in. The
-candidates are a subset of the driver's list, so a common term costs no more than the driver does,
-and over a one-leaf entry tree no intersection costs more than reading every list whole. This is PostgreSQL's GIN "fast scan" idea,
+the height, the run records, the term bytes, the storage keys — is cross-core identical, so the
+order, the peeks, the groups, and the charges are a byte contract like the rest of the gather (§8). A probed term costs one
+`gin_entry` per candidate rather than one per posting entry, plus about one root-to-leaf path per leaf
+its candidates land in. The candidates are a subset of the driver's list, so a common term costs no
+more than the driver does. This is PostgreSQL's GIN "fast scan" idea,
 advancing long lists by the short one's keys, expressed as leaf-local probes of the entry tree.
 
 **Narrowings this slice** (documented, relaxable, each a follow-on with its own NoREC
@@ -657,10 +720,10 @@ A GIN-bounded scan accrues, in place of the full-scan block:
 
 - **`page_read` × the entry-tree nodes** each posting read overlaps — the same overlap-node rule
   as the ordered index, applied to every whole-list read (mode ANY, a single-term gather, the
-  ALL-mode driver), plus the root-to-leaf path once per leaf group of the ALL-mode skip-scan (§6.2)
-  (a logical count, never faulted).
-- **`gin_entry` × the posting entries visited** across those reads, plus one per candidate the
-  skip-scan's leaf-local match steps — the per-entry gather/combine work (intersection/union), which `page_read`
+  ALL-mode driver), plus each peek and the nodes each leaf group of the ALL-mode skip-scan overlaps
+  (§6.2) (a logical count, never faulted).
+- **`gin_entry` × the postings decoded** across those reads, plus one per candidate the
+  skip-scan probes — the per-posting gather/combine work (intersection/union), which `page_read`
   alone (a per-*node* count)
   under-bounds when a term's posting list is long. This is the unit that makes a
   many-term or high-posting `@>`/`&&` cost proportional to its real work, so a `max_cost`
@@ -706,8 +769,9 @@ is a clean break (CLAUDE.md §1); a reader accepts only version 13.
 already holds several columns — but a reader now admits a GIN index with 1–32 key columns (each with
 a GIN operator class; anything else is `XX001`), and a multi-column index's entries carry the column
 tag of §4.4. Older readers would misread such an index, hence the version bump; every single-column
-GIN is byte-identical to v42. `fixtures/gin_multi_table.jed` pins the tagged entries of a GIN over an
-`i32[]` and a `jsonb` column.
+GIN is byte-identical to v42 in its terms. The same version stores every GIN tree's records as the
+posting runs of §4.5, so every GIN golden's tree changed; `fixtures/gin_multi_table.jed` pins the
+tagged runs of a GIN over an `i32[]` and a `jsonb` column.
 
 `jsonb_ops` needs no format change: the operator class follows from the indexed column's catalog
 type (`jsonb` → `jsonb_ops`, an array → `array_ops`), so a reader recovers it without a new byte.
@@ -773,6 +837,9 @@ rows, `gin_entry` reads, and index pages, and the predicate's logical selectivit
 - **Multi-column GIN** matches PostgreSQL's surface (§4.4), with two plan narrowings: conjuncts on
   two columns of one index are not combined into one scan (PG combines them in one index scan), and
   an `OR` across two columns is not a bound. Same rows either way.
+- **Posting storage** — PostgreSQL keeps a short posting list inline in its entry tuple and a long
+  one in a separate posting tree, varbyte-coding item pointers; jed keeps every posting list as 64-byte
+  front-coded runs in the one entry tree (§4.5). Storage only; unobservable in results.
 - **`<@` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a broad scan +
   recheck); jed runs `<@` by full scan this slice (a cost/plan difference, never a result
   difference — §10). `IN` lists and `OR`s of GIN arms on one index are accelerated as PG's
@@ -842,8 +909,7 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   (Bare earlier-sibling operands, GIN and ordered-index bounds for `UPDATE`/`DELETE` scans, and
   bounded LIMIT streaming have landed — §6/§6.1 and
   [indexes.md §5.1](indexes.md).)
-- **Posting-list run compression** — a long contiguous run of one term's entries
-  (a term present in very many rows) is stored as the raw entry sequence this slice; PG's
-  posting-tree TID compression is a later storage optimization, byte-contract-pinned when it lands.
+- **Posting runs** have landed (§4.5). Runs are never merged after deletes, and a posting list
+  stays inside the one entry tree (no separate posting tree, PostgreSQL's layout for a very long list).
 - **Recheck elision** — proving the `array_ops` gather exact and dropping the residual
   `operator_eval` for non-lossy opclasses.

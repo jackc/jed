@@ -3874,7 +3874,8 @@ impl Engine {
                 }
             }
         }
-        let mut constraint_entries = std::collections::HashMap::<String, Vec<Vec<u8>>>::new();
+        let mut constraint_entries =
+            std::collections::HashMap::<String, Vec<(Vec<u8>, usize)>>::new();
         if !added_constraints.is_empty() {
             // Presence in this map is also the publication-time identity marker for a newly-added
             // backing index. Seed empty indexes so DROP+ADD name reuse cannot retain the old store.
@@ -3981,14 +3982,18 @@ impl Engine {
                     constraint_entries
                         .entry(ix.name.to_string())
                         .or_default()
-                        .extend(self.index_entries(
-                            &table.columns,
-                            &col_types,
-                            &colls,
-                            &ri,
-                            &key,
-                            &row,
-                        )?);
+                        .extend(
+                            self.index_entries(
+                                &table.columns,
+                                &col_types,
+                                &colls,
+                                &ri,
+                                &key,
+                                &row,
+                            )?
+                            .into_iter()
+                            .map(|ek| (ek, key.len())),
+                        );
                 }
             }
             for fk in table
@@ -4112,14 +4117,11 @@ impl Engine {
                 let ri = self.resolve_index(&table, ix)?;
                 let out = constraint_entries.entry(ix.name.to_string()).or_default();
                 for (key, row) in rewrite_entries.as_ref().unwrap() {
-                    out.extend(self.index_entries(
-                        &table.columns,
-                        &col_types,
-                        &colls,
-                        &ri,
-                        key,
-                        row,
-                    )?);
+                    out.extend(
+                        self.index_entries(&table.columns, &col_types, &colls, &ri, key, row)?
+                            .into_iter()
+                            .map(|ek| (ek, key.len())),
+                    );
                 }
                 out.sort();
             }
@@ -5334,6 +5336,7 @@ impl Engine {
         meter.guard()?;
 
         let name_key = def.name.to_string();
+        let kind = def.kind;
         let ps = self.page_size;
         // Register the index catalog entry + its (empty) store in the snapshot that owns the table
         // (the resolution walk — temp-tables.md §2/§8): a session-local temp table's index lives in the
@@ -5354,13 +5357,7 @@ impl Engine {
             self.working_mut().put_index(&table_key, def, ps);
         }
         let istore = self.index_store_mut_scoped(ci.db.as_deref(), &name_key);
-        for ek in entries {
-            if !istore.insert(ek, Vec::new())? {
-                return Err(crate::error::EngineError::data_corrupted(
-                    "index entry keys are unique (storage-key suffix)",
-                ));
-            }
-        }
+        index_build_insert(istore, kind, entries)?;
         Ok(Outcome::Statement {
             cost: meter.accrued,
             rows_affected: None,
@@ -5378,7 +5375,7 @@ impl Engine {
     pub(crate) fn execute_reindex(&mut self, rx: Reindex) -> Result<Outcome> {
         let targets = self.reindex_targets(&rx)?;
         let mut meter = self.session.new_meter();
-        let mut rebuilt: Vec<(String, String, IndexDef, Vec<Vec<u8>>)> = Vec::new();
+        let mut rebuilt: Vec<(String, String, IndexDef, Vec<(Vec<u8>, usize)>)> = Vec::new();
         for (scope, table_key, names) in &targets {
             if names.is_empty() {
                 continue;
@@ -5415,16 +5412,12 @@ impl Engine {
                     self.attach_write_snap(&other)
                 }
             };
+            let kind = def.kind;
             snap.remove_index(&table_key, &name_key);
             snap.put_index(&table_key, def, ps);
             let istore = self.index_store_mut_scoped(Some(&scope), &name_key);
-            for ek in entries {
-                if !istore.insert(ek, Vec::new())? {
-                    return Err(crate::error::EngineError::data_corrupted(
-                        "index entry keys are unique (storage-key suffix)",
-                    ));
-                }
-            }
+            // The same build insert as CREATE INDEX, so a GIN index's posting runs come out identical.
+            index_build_insert(istore, kind, entries)?;
         }
         Ok(Outcome::Statement {
             cost: meter.accrued,
@@ -5648,7 +5641,7 @@ impl Engine {
         table: &Table,
         def: &IndexDef,
         meter: &mut Meter,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<(Vec<u8>, usize)>> {
         let columns = table.columns.clone();
         let colls = self.column_collations(&columns);
         let mut mask = vec![false; columns.len()];
@@ -5675,7 +5668,8 @@ impl Engine {
         // read). Built before the `&mut self` writes below, so the `&self` borrow is released first.
         let rindex = self.resolve_index(table, def)?;
         let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
-        let mut entries: Vec<Vec<u8>> = Vec::new();
+        // Each entry with its storage-key length (a GIN entry's term ‖ storage-key split, gin.md §4.5).
+        let mut entries: Vec<(Vec<u8>, usize)> = Vec::new();
         // A UNIQUE build verifies the existing rows before the index is registered
         // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
         // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
@@ -5719,9 +5713,11 @@ impl Engine {
                         ),
                     );
                 }
-                entries.extend(index_entry_keys(
-                    &columns, &col_types, &colls, &rindex, &key, &row, &env,
-                )?);
+                entries.extend(
+                    index_entry_keys(&columns, &col_types, &colls, &rindex, &key, &row, &env)?
+                        .into_iter()
+                        .map(|ek| (ek, key.len())),
+                );
             }
         }
         meter.guard()?;

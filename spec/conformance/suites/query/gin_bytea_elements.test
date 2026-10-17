@@ -88,7 +88,7 @@ SELECT id FROM tb WHERE b = ARRAY['\x61'::bytea] ORDER BY id
 ----
 2
 
-# cost: 9
+# cost: 10
 query I nosort
 SELECT id FROM tb WHERE b = ARRAY['\x00'::bytea, '\x0000'::bytea, '\x00'::bytea] ORDER BY id
 ----

@@ -108,7 +108,7 @@ SELECT id FROM iv WHERE v @> '{30 days}'::interval[] ORDER BY id
 7
 
 # @> with two elements (the two-posting-list intersection): 720 hours and 48 hours → id 1
-# cost: 8
+# cost: 9
 query I nosort
 SELECT id FROM iv WHERE v @> '{720 hours,48 hours}'::interval[] ORDER BY id
 ----

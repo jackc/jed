@@ -712,11 +712,14 @@ A GIN-bounded scan accrues, in place of the full-scan block:
 
 - **`page_read` × the entry-tree nodes** each posting read overlaps — the same overlap-node rule as
   the ordered index. A union (`&&`, `?|`) or a single-term gather reads each term's prefix range
-  whole. An intersection of two or more terms (`@>`, array `=`, `?&`) reads only its shortest list
-  whole, then probes each other term at the surviving candidates, charging the root-to-leaf path
-  once per leaf the candidates land in, and stops once none survive (the skip-scan, gin.md §6.2).
-- **`gin_entry` × the posting entries visited** across those reads, plus the skip-scan's leaf-local
-  match steps (per leaf, the fewer of its candidates and the term's entries between them) — the per-entry combine work that the per-node `page_read` under-meters when a
+  whole. An intersection of two or more terms (`@>`, array `=`, `?&`) first peeks every term whose
+  posting range lies in one leaf (charging that path), reads only the shortest list whole, then probes
+  each other term at the surviving candidates, charging the nodes each leaf group's run range overlaps
+  (its root-to-leaf path when the group's runs share a leaf), and stops once none survive (the
+  skip-scan, gin.md §6.2). A posting is a storage key inside a run record (gin.md §4.5), so one leaf
+  holds several times as many postings as it did single entries.
+- **`gin_entry` × the postings decoded** across those reads, plus the skip-scan's probes (one per
+  candidate of each leaf group) — the per-posting combine work that the per-node `page_read` under-meters when a
   posting list is long. The skip-scan's term ordering and leaf grouping read only the resident tree
   skeleton and are unmetered.
 - **Per candidate row** (post-combine, point-looked-up in storage-key order): `page_read` × the

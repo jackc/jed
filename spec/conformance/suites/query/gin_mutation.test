@@ -60,7 +60,7 @@ SELECT id, m FROM t ORDER BY id
 0
 
 # --- UPDATE via @> (contains): rows whose tags contain BOTH 10 and 20 → ids 1,4 get m = 1 --------
-# cost: 16
+# cost: 17
 statement ok
 UPDATE t SET m = 1 WHERE tags @> ARRAY[10,20]
 
@@ -131,7 +131,7 @@ SELECT id, m FROM t ORDER BY id
 
 # --- DELETE via = (exact array equality): tags exactly {10,20} → id 4 (the @>-superset gather +
 # residual = makes it exact — only id 4, not id 1 which merely CONTAINS {10,20}) -----------------
-# cost: 16
+# cost: 17
 statement ok
 DELETE FROM t WHERE tags = ARRAY[10,20]
 

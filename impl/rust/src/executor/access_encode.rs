@@ -5060,6 +5060,88 @@ pub(crate) fn gin_element_term(elem: ScalarType, v: &Value) -> Vec<u8> {
     }
 }
 
+/// One index's phase-2 entry moves for one row: the `(entry key, storage-key length)` pairs to remove
+/// and to insert.
+pub(crate) type IndexMoves = Vec<(Vec<(Vec<u8>, usize)>, Vec<(Vec<u8>, usize)>)>;
+
+/// Insert one logical index entry (`entry` ends in a `skey_len`-byte storage key). A GIN entry
+/// `term ‖ storage_key` joins its term's posting runs (gin.md §4.5); every other entry is its own
+/// record. `false` when the entry is already present.
+pub(crate) fn index_entry_insert(
+    istore: &mut TableStore,
+    kind: IndexKind,
+    entry: Vec<u8>,
+    skey_len: usize,
+) -> Result<bool> {
+    if kind == IndexKind::Gin {
+        let split = entry.len() - skey_len;
+        crate::gin_runs::gin_insert(istore, &entry[..split], &entry[split..])
+    } else {
+        istore.insert(entry, Vec::new())
+    }
+}
+
+/// Fill an empty index store from its complete entry list, sorted by entry key (indexes.md §1): each
+/// entry its own record, or for GIN each term's storage keys packed greedily into posting runs
+/// (gin.md §4.5). Every insert is a right-edge append, so the built tree's shape is a function of the
+/// entry set — part of the byte contract.
+pub(crate) fn index_build_insert(
+    istore: &mut TableStore,
+    kind: IndexKind,
+    entries: Vec<(Vec<u8>, usize)>,
+) -> Result<()> {
+    let duplicate = || {
+        crate::error::EngineError::data_corrupted(
+            "index entry keys are unique (storage-key suffix)",
+        )
+    };
+    if kind != IndexKind::Gin {
+        for (ek, _) in entries {
+            if !istore.insert(ek, Vec::new())? {
+                return Err(duplicate());
+            }
+        }
+        return Ok(());
+    }
+    let mut i = 0;
+    while i < entries.len() {
+        let term = &entries[i].0[..entries[i].0.len() - entries[i].1];
+        let mut keys = Vec::new();
+        let mut j = i;
+        while j < entries.len() {
+            let (ek, skey_len) = &entries[j];
+            let split = ek.len() - skey_len;
+            if &ek[..split] != term {
+                break;
+            }
+            keys.push(ek[split..].to_vec());
+            j += 1;
+        }
+        for run in crate::gin_runs::pack_runs(term, &keys) {
+            if !istore.insert(run, Vec::new())? {
+                return Err(duplicate());
+            }
+        }
+        i = j;
+    }
+    Ok(())
+}
+
+/// Remove one logical index entry (see [`index_entry_insert`]). `false` when it is absent.
+pub(crate) fn index_entry_remove(
+    istore: &mut TableStore,
+    kind: IndexKind,
+    entry: &[u8],
+    skey_len: usize,
+) -> Result<bool> {
+    if kind == IndexKind::Gin {
+        let split = entry.len() - skey_len;
+        crate::gin_runs::gin_remove(istore, &entry[..split], &entry[split..])
+    } else {
+        istore.remove(entry)
+    }
+}
+
 /// `term ‖ storage_key` for each (sorted, distinct) term — a GIN index's entry keys for one row.
 fn gin_entry_keys(terms: Vec<Vec<u8>>, storage_key: &[u8]) -> Vec<Vec<u8>> {
     terms

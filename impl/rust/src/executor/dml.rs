@@ -1547,7 +1547,7 @@ impl Engine {
         // and written after the rows (indexes.md §4 — an index write cannot fail, so
         // all-or-nothing is unchanged).
         let store = self.store_mut_scoped(db_scope, table);
-        let mut index_inserts: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
+        let mut index_inserts: Vec<Vec<(Vec<u8>, usize)>> = vec![Vec::new(); indexes.len()];
         for (ri, (key, row)) in prepared.into_iter().enumerate() {
             let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
             // Append the final storage key to each phase-1 entry prefix (byte-identical to
@@ -1556,7 +1556,7 @@ impl Engine {
                 for p in prefixes {
                     let mut ek = p.clone();
                     ek.extend_from_slice(&key);
-                    index_inserts[k].push(ek);
+                    index_inserts[k].push((ek, key.len()));
                 }
             }
             if !store.insert(key, row)? {
@@ -1573,8 +1573,8 @@ impl Engine {
         }
         for (k, def) in indexes.iter().enumerate() {
             let istore = self.index_store_mut_scoped(db_scope, &def.name.to_string());
-            for ek in index_inserts[k].drain(..) {
-                if !istore.insert(ek, Vec::new())? {
+            for (ek, skey_len) in index_inserts[k].drain(..) {
+                if !index_entry_insert(istore, def.kind, ek, skey_len)? {
                     // A cross-sub-statement unique-index collision under the read pin (as above).
                     return Err(EngineError::unique_violation(&relation, &def.name));
                 }
@@ -1737,16 +1737,18 @@ impl Engine {
                 entry.extend_from_slice(&key);
             }
         }
+        let key_len = key.len();
         if !self.store_mut_scoped(db_scope, table).insert(key, row)? {
             return Err(EngineError::unique_violation(
                 &relation,
                 pkey_name(&relation),
             ));
         }
+        let skey_len = key_len;
         for (def, entries) in indexes.iter().zip(index_entries) {
             let istore = self.index_store_mut_scoped(db_scope, &def.name.to_string());
             for entry in entries {
-                if !istore.insert(entry, Vec::new())? {
+                if !index_entry_insert(istore, def.kind, entry, skey_len)? {
                     return Err(EngineError::unique_violation(&relation, &def.name));
                 }
             }
@@ -2449,8 +2451,7 @@ impl Engine {
             }
             insert_prefixes.push(rp);
         }
-        let mut index_moves: Vec<Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> =
-            vec![Vec::new(); indexes.len()];
+        let mut index_moves: Vec<IndexMoves> = vec![Vec::new(); indexes.len()];
         for (old_key, new_key, new_row, old_row) in &updates {
             for (k, rindex) in rindexes.iter().enumerate() {
                 // A re-keyed row moves EVERY entry (the storage-key suffix changed); otherwise only
@@ -2459,15 +2460,15 @@ impl Engine {
                     self.index_entries(columns, &col_types, &colls, rindex, old_key, old_row)?;
                 let new_eks =
                     self.index_entries(columns, &col_types, &colls, rindex, new_key, new_row)?;
-                let removals: Vec<Vec<u8>> = old_eks
+                let removals: Vec<(Vec<u8>, usize)> = old_eks
                     .iter()
                     .filter(|e| !new_eks.contains(*e))
-                    .cloned()
+                    .map(|e| (e.clone(), old_key.len()))
                     .collect();
-                let insertions: Vec<Vec<u8>> = new_eks
+                let insertions: Vec<(Vec<u8>, usize)> = new_eks
                     .iter()
                     .filter(|e| !old_eks.contains(*e))
-                    .cloned()
+                    .map(|e| (e.clone(), new_key.len()))
                     .collect();
                 if !removals.is_empty() || !insertions.is_empty() {
                     index_moves[k].push((removals, insertions));
@@ -2486,7 +2487,7 @@ impl Engine {
                 store.remove(old_key)?;
             }
         }
-        let mut index_adds: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
+        let mut index_adds: Vec<Vec<(Vec<u8>, usize)>> = vec![Vec::new(); indexes.len()];
         for (ri, row) in inserts.into_iter().enumerate() {
             let key = if pk.is_empty() {
                 encode_int(ScalarType::Int64, store.alloc_rowid())
@@ -2497,7 +2498,7 @@ impl Engine {
                 for p in prefixes {
                     let mut ek = p.clone();
                     ek.extend_from_slice(&key);
-                    index_adds[k].push(ek);
+                    index_adds[k].push((ek, key.len()));
                 }
             }
             if !store.insert(key, row)? {
@@ -2528,13 +2529,13 @@ impl Engine {
             let istore = self.index_store_mut(&def.name.to_string());
             if rekeyed {
                 for (removals, _) in &index_moves[k] {
-                    for old_ek in removals {
-                        istore.remove(old_ek)?;
+                    for (old_ek, skey_len) in removals {
+                        index_entry_remove(istore, def.kind, old_ek, *skey_len)?;
                     }
                 }
             }
-            for ek in index_adds[k].drain(..) {
-                if !istore.insert(ek, Vec::new())? {
+            for (ek, skey_len) in index_adds[k].drain(..) {
+                if !index_entry_insert(istore, def.kind, ek, skey_len)? {
                     if rekeyed {
                         return Err(EngineError::unique_violation(&relation, &def.name));
                     }
@@ -2545,12 +2546,12 @@ impl Engine {
             }
             for (removals, insertions) in index_moves[k].drain(..) {
                 if !rekeyed {
-                    for old_ek in removals {
-                        istore.remove(&old_ek)?;
+                    for (old_ek, skey_len) in removals {
+                        index_entry_remove(istore, def.kind, &old_ek, skey_len)?;
                     }
                 }
-                for new_ek in insertions {
-                    if !istore.insert(new_ek, Vec::new())? {
+                for (new_ek, skey_len) in insertions {
+                    if !index_entry_insert(istore, def.kind, new_ek, skey_len)? {
                         if rekeyed {
                             return Err(EngineError::unique_violation(&relation, &def.name));
                         }
@@ -3766,17 +3767,14 @@ impl Engine {
             Some(t) => self.resolve_table_indexes(t)?,
             None => Vec::new(),
         };
-        let mut to_remove: Vec<Vec<Vec<u8>>> = vec![Vec::new(); rindexes.len()];
+        let mut to_remove: Vec<Vec<(Vec<u8>, usize)>> = vec![Vec::new(); rindexes.len()];
         for (kx, rindex) in rindexes.iter().enumerate() {
             for (k, row) in &matched {
-                to_remove[kx].extend(self.index_entries(
-                    &tcolumns,
-                    &tcol_types,
-                    &colls,
-                    rindex,
-                    k,
-                    row,
-                )?);
+                to_remove[kx].extend(
+                    self.index_entries(&tcolumns, &tcol_types, &colls, rindex, k, row)?
+                        .into_iter()
+                        .map(|ek| (ek, k.len())),
+                );
             }
         }
         // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
@@ -3787,8 +3785,8 @@ impl Engine {
         }
         for (kx, def) in indexes.iter().enumerate() {
             let istore = self.index_store_mut_scoped(del.db.as_deref(), &def.name.to_string());
-            for ek in &to_remove[kx] {
-                istore.remove(ek)?;
+            for (ek, skey_len) in &to_remove[kx] {
+                index_entry_remove(istore, def.kind, ek, *skey_len)?;
             }
         }
         self.sync_pending_writes(&mut meter)?;
@@ -4452,8 +4450,7 @@ impl Engine {
         // moves EVERY one of its entries (the suffix changed); a non-PK UPDATE keeps the
         // suffix and moves only entries whose indexed columns changed. Computed before the
         // rewrite consumes the rows.
-        let mut index_moves: Vec<Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> =
-            vec![Vec::new(); indexes.len()];
+        let mut index_moves: Vec<IndexMoves> = vec![Vec::new(); indexes.len()];
         for (old_key, new_key, new_row, old_row) in &updates {
             for (k, rindex) in rindexes.iter().enumerate() {
                 // The row's old and new entry SETS (one entry for an ordered index, one per term
@@ -4465,15 +4462,15 @@ impl Engine {
                     self.index_entries(&tcolumns, &col_types, &colls, rindex, old_key, old_row)?;
                 let new_eks =
                     self.index_entries(&tcolumns, &col_types, &colls, rindex, new_key, new_row)?;
-                let removals: Vec<Vec<u8>> = old_eks
+                let removals: Vec<(Vec<u8>, usize)> = old_eks
                     .iter()
                     .filter(|e| !new_eks.contains(*e))
-                    .cloned()
+                    .map(|e| (e.clone(), old_key.len()))
                     .collect();
-                let insertions: Vec<Vec<u8>> = new_eks
+                let insertions: Vec<(Vec<u8>, usize)> = new_eks
                     .iter()
                     .filter(|e| !old_eks.contains(*e))
-                    .cloned()
+                    .map(|e| (e.clone(), new_key.len()))
                     .collect();
                 if !removals.is_empty() || !insertions.is_empty() {
                     index_moves[k].push((removals, insertions));
@@ -4510,13 +4507,13 @@ impl Engine {
             for (k, def) in indexes.iter().enumerate() {
                 let istore = self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_string());
                 for (removals, _) in &index_moves[k] {
-                    for old_ek in removals {
-                        istore.remove(old_ek)?;
+                    for (old_ek, skey_len) in removals {
+                        index_entry_remove(istore, def.kind, old_ek, *skey_len)?;
                     }
                 }
                 for (_, insertions) in &index_moves[k] {
-                    for new_ek in insertions {
-                        if !istore.insert(new_ek.clone(), Vec::new())? {
+                    for (new_ek, skey_len) in insertions {
+                        if !index_entry_insert(istore, def.kind, new_ek.clone(), *skey_len)? {
                             // A cross-sub-statement collision under the read pin (as above).
                             return Err(EngineError::unique_violation(&relation, &def.name));
                         }
@@ -4530,11 +4527,11 @@ impl Engine {
             for (k, def) in indexes.iter().enumerate() {
                 let istore = self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_string());
                 for (removals, insertions) in index_moves[k].drain(..) {
-                    for old_ek in removals {
-                        istore.remove(&old_ek)?;
+                    for (old_ek, skey_len) in removals {
+                        index_entry_remove(istore, def.kind, &old_ek, skey_len)?;
                     }
-                    for new_ek in insertions {
-                        if !istore.insert(new_ek, Vec::new())? {
+                    for (new_ek, skey_len) in insertions {
+                        if !index_entry_insert(istore, def.kind, new_ek, skey_len)? {
                             return Err(crate::error::EngineError::data_corrupted(
                                 "index entry keys are unique (storage-key suffix)",
                             ));

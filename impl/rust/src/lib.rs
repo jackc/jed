@@ -48,6 +48,7 @@ mod formatting;
 mod formatting_gen;
 mod formatting_num;
 mod gin_jsonpath;
+mod gin_runs;
 mod gist;
 mod interval;
 mod json;

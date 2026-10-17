@@ -21,41 +21,41 @@ statement ok
 INSERT INTO s SELECT g, ARRAY[0, g % 7, g % 100 + 1000], jsonb_build_object('n', g % 50, 'all', true) FROM generate_series(1, 3000) AS g
 
 # a rare term (30 rows) drives; the common term 0 is probed at those 30 candidates only
-# cost: 241
+# cost: 220
 query I nosort
 SELECT count(*) FROM s WHERE tags @> '{0,1050}'::i64[]
 ----
 30
 
 # two selective terms: the rarer drives, the other is probed
-# cost: 93
+# cost: 92
 query I nosort
 SELECT count(*) FROM s WHERE tags @> '{3,1050}'::i64[]
 ----
 5
 
 # dense candidates: term 3 drives (~1/7 of the rows) and term 0 is probed leaf by leaf
-# cost: 3036
+# cost: 3017
 query I nosort
 SELECT count(*) FROM s WHERE tags @> '{0,3}'::i64[]
 ----
 429
 
 # an absent term has the smallest span and an empty list: nothing else is read
-# cost: 3
+# cost: 5
 query I nosort
 SELECT count(*) FROM s WHERE tags @> '{0,3,99999}'::i64[]
 ----
 0
 
 # jsonb_ops: the number term drives; the "n" and "all" key terms are in every document
-# cost: 615
+# cost: 560
 query I nosort
 SELECT count(*) FROM s WHERE doc @> '{"n": 7, "all": true}'
 ----
 60
 
-# cost: 21040
+# cost: 21012
 query I nosort
 SELECT count(*) FROM s WHERE doc ?& '{n,all}'
 ----
