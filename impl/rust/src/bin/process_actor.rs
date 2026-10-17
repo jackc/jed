@@ -24,6 +24,26 @@ fn run() -> Result<(), EngineError> {
         // databases as their page-service owner on command. PATH is the repository root.
         return owner_idle(&path);
     }
+    if action == "pages" || action == "pages-read-only" {
+        // The serving side of the stream transport (spec/pageservice/README.md §5.4), as `jed pages`:
+        // the actor's stdin/stdout are one page-service connection.
+        // A failure was already answered on the stream; stdout must carry nothing else.
+        #[cfg(unix)]
+        if let Err(error) = Database::serve_page_stream(
+            &path,
+            OpenOptions::default(),
+            action == "pages-read-only",
+            Box::new(io::stdin()),
+            Box::new(io::stdout()),
+        ) {
+            eprintln!("ERROR {}: {}", error.code(), error.message);
+            std::process::exit(1);
+        }
+        #[cfg(unix)]
+        return Ok(());
+        #[cfg(not(unix))]
+        panic!("the stream transport is Unix-only");
+    }
     // Positional arguments after the path: the open timeout, then the page-service owner's
     // idle-in-transaction timeout (spec/design/page-service.md §11.1). key=value arguments set the
     // handoff options (spec/pageservice/README.md §6.5): ownership=prefer|yield|never, yield_grace,
@@ -61,7 +81,33 @@ fn run() -> Result<(), EngineError> {
         "open-exclusive" => Locking::Exclusive,
         _ => Locking::Auto,
     };
-    let mut database = if action == "create" {
+    let mut database = if action == "open-remote" || action == "open-remote-read-only" {
+        // A page client over the stream transport, whose transport command is this actor serving
+        // PATH (`pages`): what `jed ssh://host/path` runs, without SSH.
+        #[cfg(unix)]
+        {
+            let exe = std::env::current_exe().expect("actor executable path");
+            let serve = if action == "open-remote" {
+                "pages"
+            } else {
+                "pages-read-only"
+            };
+            Database::open_remote(
+                vec![
+                    exe.to_string_lossy().into_owned(),
+                    serve.to_string(),
+                    path.to_string_lossy().into_owned(),
+                ],
+                &format!("remote:{}", path.display()),
+                OpenOptions {
+                    file_lock_timeout_ms: timeout,
+                    ..OpenOptions::default()
+                },
+            )?
+        }
+        #[cfg(not(unix))]
+        panic!("the stream transport is Unix-only")
+    } else if action == "create" {
         Database::create(CreateOptions {
             path: Some(path),
             locking,

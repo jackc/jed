@@ -492,6 +492,16 @@ impl ServerConn {
     }
 }
 
+/// What [`PageServiceOwner::add_connection`] did with a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Added {
+    Serving,
+    /// The owner stopped serving; the connection was closed.
+    OwnerClosed,
+    /// The stream could not be cloned; the connection was closed.
+    Failed,
+}
+
 /// The serving state of an owner: its read handle, endpoint, connections, and writer gate. Shut down
 /// explicitly ([`shutdown`](Self::shutdown)) before the owner releases presence.
 pub(crate) struct PageServiceOwner {
@@ -658,14 +668,25 @@ impl PageServiceOwner {
                 Ok(None) => return,
                 Err(_) => continue,
             };
+            if self.add_connection(stream) == Added::OwnerClosed {
+                return;
+            }
+        }
+    }
+
+    /// Serve one more connection, accepted on the endpoint or handed over by the host (the stdio
+    /// transport of `jed pages`, spec/pageservice/README.md §5.4). A connection added after the
+    /// owner stopped serving is closed at once.
+    pub(crate) fn add_connection(self: &Arc<Self>, stream: Box<dyn PsStream>) -> Added {
+        {
             let mut conns = self.conns.lock().expect("connections lock poisoned");
             if conns.closed {
                 stream.close_both();
-                return;
+                return Added::OwnerClosed;
             }
             let (Ok(control), Ok(sender)) = (stream.clone_stream(), stream.clone_stream()) else {
                 stream.close_both();
-                continue;
+                return Added::Failed;
             };
             conns.next_id += 1;
             let id = conns.next_id;
@@ -695,6 +716,7 @@ impl PageServiceOwner {
                 .threads
                 .push(thread::spawn(move || owner.serve_connection(conn, stream)));
         }
+        Added::Serving
     }
 
     /// Make the next client commit drop its connection instead of acknowledging (test hook).
