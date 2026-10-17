@@ -3058,6 +3058,8 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 		return planBitAnd, t
 	case surface == "bit_or" && result == "same_as_input":
 		return planBitOr, t
+	case surface == "bit_xor" && result == "same_as_input":
+		return planBitXor, t
 	case surface == "jsonb_agg" && result == "jsonb":
 		return planJsonbAgg, resolvedType{kind: rtJsonb}
 	case surface == "json_agg" && result == "json":

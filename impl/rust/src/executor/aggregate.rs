@@ -280,6 +280,7 @@ impl Acc {
                         (None, _) => v,
                         (Some(c), BitOp::And) => c & v,
                         (Some(c), BitOp::Or) => c | v,
+                        (Some(c), BitOp::Xor) => c ^ v,
                     });
                 }
             }

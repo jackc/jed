@@ -1471,6 +1471,7 @@ pub(crate) fn aggregate_plan(
         ("bool_or", "boolean") => (AggPlan::BoolOr, ResolvedType::Bool),
         ("bit_and", "same_as_input") => (AggPlan::Bit(BitOp::And), t.clone()),
         ("bit_or", "same_as_input") => (AggPlan::Bit(BitOp::Or), t.clone()),
+        ("bit_xor", "same_as_input") => (AggPlan::Bit(BitOp::Xor), t.clone()),
         // json/jsonb array aggregates (B4). `compact` is the json (vs jsonb) render; `_strict`
         // skips a NULL input. The result type is json/jsonb (the catalog `result` code).
         ("jsonb_agg", "jsonb") => (
