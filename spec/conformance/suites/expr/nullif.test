@@ -8,7 +8,7 @@
 # operators). Exactly two arguments (any other count is 42601); a distinct grammar node — not a
 # catalog function — so `nullif` stays usable as a column name. Output name `nullif`.
 # Oracle-checked against PostgreSQL 18. Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.nullif, expr.comparison_value, expr.arithmetic, cast.explicit, error.division_by_zero, types.i16, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, types.date, types.array, types.json, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.nullif, expr.comparison_value, expr.arithmetic, cast.explicit, error.division_by_zero, types.i16, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, types.date, types.array, types.json, null.three_valued, session.privileges, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, s text)
@@ -191,6 +191,14 @@ SELECT nullif, NULLIF(nullif, 0) FROM kw ORDER BY id
 4
 0
 NULL
+
+# NULLIF is a grammar node, not a catalog function, so it carries no EXECUTE privilege: revoking
+# EXECUTE on the name `nullif` does not affect it (as in PostgreSQL, which has no such object).
+# revoke: EXECUTE ON nullif
+query I nosort
+SELECT NULLIF(3, 1)
+----
+3
 
 # --- NULLIF in a CHECK constraint and an expression DEFAULT ------------------------------------
 

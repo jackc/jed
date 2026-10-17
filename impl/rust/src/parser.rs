@@ -5818,13 +5818,17 @@ impl Parser {
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
             return outline(|| {
+                let pos = self.here();
                 self.advance(); // NULLIF
                 self.advance(); // (
                 let a = self.parse_expr()?;
                 self.expect(&Token::Comma)?;
                 let b = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
-                Ok(Expr::NullIf(vec![a, b]))
+                Ok(Expr::NullIf {
+                    args: vec![a, b],
+                    pos,
+                })
             });
         }
         if self.peek_keyword().as_deref() == Some("case") {

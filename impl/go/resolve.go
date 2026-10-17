@@ -1795,7 +1795,7 @@ func locateNodeError(err error, e exprNode) error {
 			}
 			pos = e.Pos
 		}
-	case exprIsDistinct, exprLike, exprRegex, exprInSubquery, exprQuantified, exprQuantifiedSubquery:
+	case exprIsDistinct, exprNullIf, exprLike, exprRegex, exprInSubquery, exprQuantified, exprQuantifiedSubquery:
 		if operatorError {
 			operatorHint = hintOperatorNoMatch
 			pos = e.Pos

@@ -261,7 +261,7 @@ export type Expr =
   | { kind: "greatestLeast"; args: Expr[]; greatest: boolean }
   // NULLIF(a, b) — NULL when a = b, else a (spec/design/grammar.md §58). `args` is exactly [a, b]
   // (any other count is 42601 at parse). EAGER — both arguments are evaluated.
-  | { kind: "nullIf"; args: Expr[] }
+  | { kind: "nullIf"; args: Expr[]; loc?: SrcLoc }
   // A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is the
   // (folded or quoted) name, resolved byte-exactly: an aggregate (COUNT/SUM/MIN/MAX/AVG), a
   // scalar function (abs/round, kind = "function", spec/design/functions.md §9), or 42883. `star`

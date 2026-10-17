@@ -4702,7 +4702,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
                 + els.as_deref().map_or(0, sub)
         }
         Expr::Coalesce(args) => args.iter().map(sub).sum(),
-        Expr::GreatestLeast { args, .. } | Expr::NullIf(args) => args.iter().map(sub).sum(),
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => args.iter().map(sub).sum(),
         Expr::FuncCall { args, .. } => args.iter().map(sub).sum(),
     }
 }

@@ -6372,6 +6372,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	// immediately followed by `(` (the same one-token lookahead), so the word stays usable as a
 	// column name. Exactly two arguments: any other count is 42601, as in PostgreSQL's grammar.
 	if p.peekKeyword() == "nullif" && p.peekKindAt(1) == tokLParen {
+		nullifPos := p.here()
 		p.advance() // NULLIF
 		p.advance() // (
 		a, err := p.parseExpr()
@@ -6388,7 +6389,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprNullIf, NullIf: []exprNode{a, b}}, nil
+		return exprNode{Kind: exprNullIf, NullIf: []exprNode{a, b}, Pos: nullifPos}, nil
 	}
 	if p.peekKeyword() == "case" {
 		casePos := p.here()

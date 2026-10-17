@@ -987,13 +987,13 @@ code: 42883
 position: 18
 hint: No function matches the given name and argument types. You might need to add explicit type casts.
 
-# jed: jed has no NULLIF, so this is its unknown-function error (the function hint). PostgreSQL
-# rewrites NULLIF to `=` and reports a missing operator, with the operator hint, at the same token.
+# jed: NULLIF's operands are an `=` pair, so the mismatch is the operator error at the NULLIF token
+# with the operator hint, as in PostgreSQL; the code is jed's cross-family 42804 (PostgreSQL 42883).
 case: NULLIF
 run: SELECT NULLIF(1, 'a'::text)
-code: 42883
+code: 42804
 position: 8
-hint: No function matches the given name and argument types. You might need to add explicit type casts.
+hint: No operator matches the given name and argument types. You might need to add explicit type casts.
 
 case: function position in a script
 script: SELECT 1; SELECT nofunc(2)

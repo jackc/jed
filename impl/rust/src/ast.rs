@@ -1525,8 +1525,12 @@ pub enum Expr {
     },
     /// `NULLIF(a, b)` — NULL when `a = b`, else `a` (grammar.md §58). Exactly two arguments
     /// (`[a, b]`; any other count is 42601 at parse). EAGER like GREATEST/LEAST — both arguments
-    /// are evaluated; the pair must be comparable by `=`, and the result takes `a`'s type.
-    NullIf(Vec<Expr>),
+    /// are evaluated; the pair must be comparable by `=`, and the result takes `a`'s type. `pos` is
+    /// the `NULLIF` keyword's character position, where an `=` type error points (PostgreSQL).
+    NullIf {
+        args: Vec<Expr>,
+        pos: SrcPos,
+    },
     /// A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is
     /// the (folded or quoted) name, resolved byte-exactly: an aggregate (COUNT/SUM/MIN/MAX/
     /// AVG, kind = "aggregate"), a scalar function (abs/round, kind = "function",
