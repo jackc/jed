@@ -95,6 +95,24 @@ impl Engine {
         inner: Statement,
         params: &[Value],
     ) -> Result<Outcome> {
+        // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7) renders the plan of the query the
+        // statement runs. Its checks before anything is created run first — the target, the query's
+        // analysis, the name — and an `IF NOT EXISTS` that skips a taken name renders no plan. Only
+        // ANALYZE runs the statement itself.
+        let (inner, run) = match inner {
+            Statement::CreateTable(ct) if ct.as_query.is_some() => {
+                if self.ctas_prepare(&ct, params)?.is_none() {
+                    let ct = Statement::CreateTable(ct);
+                    return self.explain_outcome(Vec::new(), analyze, costs, lane, &ct);
+                }
+                let query = &ct.as_query.as_ref().expect("checked above").query;
+                (
+                    super::create_table_as::ctas_query_statement(query),
+                    Some(Statement::CreateTable(ct)),
+                )
+            }
+            inner => (inner, None),
+        };
         // Bound values make EXPLAIN show the custom plan (estimator.md §6.1): a probe pass types
         // each `$N`, then every planning pass below — and an ANALYZE's execution — sees the values.
         // A `$N` still renders symbolically. Without values a `$N` is planned unbound.
@@ -110,7 +128,7 @@ impl Engine {
             planning.bind(&bound);
         }
         if analyze {
-            return self.execute_explain_analyze(verbose, costs, lane, inner, params);
+            return self.execute_explain_analyze(verbose, costs, lane, inner, run, params);
         }
         let estimates = self
             .estimate_explain(&inner)?
@@ -120,7 +138,7 @@ impl Engine {
         let mut r = ExplainRender::with_estimates(estimates);
         r.verbose = verbose;
         self.render_explain(&mut r, &inner, 0)?;
-        self.explain_outcome(r.rows, analyze, costs, lane, &inner)
+        self.explain_outcome(r.rows, analyze, costs, lane, run.as_ref().unwrap_or(&inner))
     }
 
     /// Render the plan AND run the inner statement, reporting the inner's ACTUAL accrued cost + row
@@ -130,13 +148,16 @@ impl Engine {
     /// [`stmt_is_write`]). Privileges + the lifetime budget were already admitted on the EXPLAIN, and
     /// the write gate / commit are the outer autocommit's, so the inner runs through the raw
     /// [`Self::dispatch_stmt_body`]. The EXPLAIN statement's OWN cost is one `row_produced` per plan
-    /// row (independent of the inner cost, which appears only in the root).
+    /// row (independent of the inner cost, which appears only in the root). `run`, when given, is the
+    /// statement executed in place of the rendered `inner` — a `CREATE TABLE … AS`, whose rendered
+    /// plan is its query's (create-table-as.md §7).
     pub(crate) fn execute_explain_analyze(
         &mut self,
         _verbose: bool,
         costs: bool,
         lane: bool,
         inner: Statement,
+        run: Option<Statement>,
         params: &[Value],
     ) -> Result<Outcome> {
         // Render the plan tree first (plan-only, no execution — pre-mutation).
@@ -149,10 +170,10 @@ impl Engine {
         body.verbose = _verbose;
         self.render_explain(&mut body, &inner, 0)?;
         // Execute the inner statement for real, capturing its actual accrued cost + row count.
-        let inner_for_output = inner.clone();
+        let inner_for_output = run.clone().unwrap_or_else(|| inner.clone());
         self.explain_actual
             .replace(Some(ActualCostProfile::default()));
-        let inner_result = self.dispatch_stmt_body(inner, params);
+        let inner_result = self.dispatch_stmt_body(run.unwrap_or(inner), params);
         let profile = self.explain_actual.replace(None).unwrap_or_default();
         let inner_out = inner_result?;
         let actual_rows = match &inner_out {

@@ -132,7 +132,12 @@ import {
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { optimizeSelect } from "./optimize.ts";
-import { ctasColumns, rejectPseudoType } from "./create_table_as.ts";
+import {
+  ctasColumns,
+  ctasQueryStatement,
+  rejectPseudoType,
+  withIsDataModifying,
+} from "./create_table_as.ts";
 import {
   notRecursiveError,
   planSearchCycle,
@@ -324,6 +329,7 @@ import {
   rewriteViewText,
   sortDeps,
   viewNotSupported,
+  viewColumnTypeText,
   viewOutputNames,
   viewUsing,
   viewsUsing,
@@ -3842,6 +3848,14 @@ export class Engine {
       for (const cte of stmt.ctes) this.collectCteCatalogPrivs(cte.body, req);
       this.collectCteCatalogPrivs(stmt.body, req);
     } else if (stmt.kind === "explain") this.collectCatalogExprPrivs(stmt.inner, req);
+    else if (stmt.kind === "createTable") {
+      // A `CREATE TABLE … AS` whose own WITH writes (create-table-as.md §1) runs those writes,
+      // unless WITH NO DATA never runs the query.
+      const cta = stmt.asQuery;
+      if (cta !== null && cta.withData && cta.query.kind === "withExpr") {
+        for (const cte of cta.query.ctes) this.collectCteCatalogPrivs(cte.body, req);
+      }
+    }
   }
 
   private collectCteCatalogPrivs(body: CteBody, req: PrivReq): void {
@@ -5199,6 +5213,18 @@ export class Engine {
   // per emitted plan row. EXPLAIN ANALYZE (analyze true) delegates to executeExplainAnalyze, which also
   // runs the inner statement.
   private executeExplain(ex: Explain, params: Value[]): Outcome {
+    // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7) renders the plan of the query the statement
+    // runs. Its checks before anything is created run first — the target, the query's analysis, the
+    // name — and an IF NOT EXISTS that skips a taken name renders no plan. Only ANALYZE runs the
+    // statement itself (`run`).
+    let run: Statement | null = null;
+    if (ex.inner.kind === "createTable" && ex.inner.asQuery !== null) {
+      if (this.ctasPrepare(ex.inner, ex.inner.asQuery, params) === null) {
+        return this.explainOutcome([], ex, ex.inner);
+      }
+      run = ex.inner;
+      ex = { ...ex, inner: ctasQueryStatement(ex.inner.asQuery.query) };
+    }
     // Bound values make EXPLAIN show the custom plan (estimator.md §6.1): a probe pass types each $N,
     // then every planning pass below — and an ANALYZE's execution — sees the values. A $N still
     // renders symbolically. Without values a $N is planned unbound.
@@ -5210,15 +5236,15 @@ export class Engine {
         types.types = planning.probeTypes();
         planning.bind(bindParams(params, types.finalize(), this.inputZone()));
       }
-      return this.executeExplainPlanned(ex, params);
+      return this.executeExplainPlanned(ex, run, params);
     } finally {
       planning.end();
     }
   }
 
-  private executeExplainPlanned(ex: Explain, params: Value[]): Outcome {
+  private executeExplainPlanned(ex: Explain, run: Statement | null, params: Value[]): Outcome {
     if (ex.analyze) {
-      return this.executeExplainAnalyze(ex, params);
+      return this.executeExplainAnalyze(ex, run, params);
     }
     const estimates = this.estimateExplain(ex.inner).map((estimate) => ({
       rows: estimate.rows,
@@ -5227,7 +5253,7 @@ export class Engine {
     const r = new ExplainRender(estimates);
     r.verbose = ex.verbose;
     this.renderExplain(r, ex.inner, 0);
-    return this.explainOutcome(r.rows, ex);
+    return this.explainOutcome(r.rows, ex, run ?? ex.inner);
   }
 
   // executeExplainAnalyze renders the plan AND runs the inner statement, reporting the inner's ACTUAL
@@ -5237,7 +5263,9 @@ export class Engine {
   // statement executes for real (a DML inner mutates, and the outer autocommit commits it — EXPLAIN
   // ANALYZE of a write IS a write, classified by stmtIsWrite). The EXPLAIN statement's OWN cost is one
   // rowProduced per emitted plan row (independent of the inner cost, which appears only in the root).
-  private executeExplainAnalyze(ex: Explain, params: Value[]): Outcome {
+  // `run`, when given, is the statement executed in place of the rendered inner — a `CREATE TABLE …
+  // AS`, whose rendered plan is its query's (create-table-as.md §7).
+  private executeExplainAnalyze(ex: Explain, run: Statement | null, params: Value[]): Outcome {
     const inner = ex.inner;
     // Render the plan tree first (plan-only, no execution — pre-mutation).
     const estimates = this.estimateExplain(inner).map((estimate) => ({
@@ -5261,7 +5289,7 @@ export class Engine {
     this.explainActualFoldSuppress = 0;
     let innerOut: Outcome;
     try {
-      innerOut = this.dispatchStmtBody(inner, params);
+      innerOut = this.dispatchStmtBody(run ?? inner, params);
     } finally {
       this.explainActualProfile = previousProfile;
       this.explainActualFrames = previousFrames;
@@ -5312,7 +5340,7 @@ export class Engine {
     for (const row of body.rows) {
       r.rows.push({ ...row, depth: row.depth + 1 });
     }
-    return this.explainOutcome(r.rows, ex);
+    return this.explainOutcome(r.rows, ex, run ?? inner);
   }
 
   private recordExplainActual(node: string, cost: bigint): void {
@@ -5374,8 +5402,9 @@ export class Engine {
   }
 
   // explainOutcome wraps rendered plan rows as a query Outcome, charging the EXPLAIN's own cost — one
-  // rowProduced per emitted plan row (a deterministic function of the plan-row count).
-  private explainOutcome(rows: ExplainRow[], ex: Explain): Outcome {
+  // rowProduced per emitted plan row (a deterministic function of the plan-row count). The LANE tag
+  // is that of `stmt`, the statement the EXPLAIN runs (a `CREATE TABLE … AS`, not its rendered query).
+  private explainOutcome(rows: ExplainRow[], ex: Explain, stmt: Statement): Outcome {
     const meter = this.session.newMeter();
     meter.charge(COSTS.rowProduced * BigInt(rows.length));
     const columnNames = ["depth", "node", "detail"];
@@ -5392,7 +5421,7 @@ export class Engine {
       columnNames.push("lane");
       columnTypes.push("text");
     }
-    const lane = ex.lane ? this.explainLane(ex.inner) : "";
+    const lane = ex.lane ? this.explainLane(stmt) : "";
     const outRows = rows.map((row) => {
       const out = [intValue(BigInt(row.depth)), textValue(row.node), textValue(row.detail)];
       if (ex.costs) out.push(intValue(row.estRows), intValue(row.estCost));
@@ -6103,23 +6132,15 @@ export class Engine {
   }
 
   // executeCreateTableAs executes a `CREATE TABLE … AS` (spec/design/create-table-as.md §3). The checks
-  // run in PostgreSQL's order: the target database and the `jed_` reservation, then everything
-  // planning the query raises, then a taken name (IF NOT EXISTS skips here, after the query was
-  // analyzed), then the column checks of ctasColumns (create_table_as.ts). The table is created
-  // through CREATE TABLE's shared registration; WITH DATA then fills it by running `INSERT INTO
-  // <table> <query>`, whose outcome (rows, cost, errors) is the statement's.
+  // run in PostgreSQL's order: those of ctasPrepare (the target database and the `jed_` reservation,
+  // then everything planning the query raises, then a taken name — IF NOT EXISTS skips here, after
+  // the query was analyzed), then the column checks of ctasColumns (create_table_as.ts). The table is
+  // created through CREATE TABLE's shared registration; WITH DATA then fills it by running `INSERT
+  // INTO <table> <query>`, whose outcome (rows, cost, errors) is the statement's.
   private executeCreateTableAs(ct: CreateTable, cta: CreateTableAs, params: Value[]): Outcome {
+    const plan = this.ctasPrepare(ct, cta, params);
+    if (plan === null) return { kind: "statement", cost: 0n, rowsAffected: null };
     const { targetTemp, attachName } = this.createTableTarget(ct);
-    checkReservedName("table", ct.name);
-    // Plan the query once, for its output columns. Its `$N` parameters are typed and bound as a
-    // query's are, so a wrong parameter count or an untyped parameter fails here.
-    const ptypes = new ParamTypes();
-    const plan = this.planQuery(cta.query, null, [], ptypes);
-    bindParams(params, ptypes.finalize(), this.inputZone());
-    if (this.createTableNameTaken(ct.name, attachName)) {
-      if (ct.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
-      throw engineError("duplicate_table", "relation already exists: " + ct.name);
-    }
     const columns = ctasColumns(
       ct,
       cta,
@@ -6132,17 +6153,58 @@ export class Engine {
     // Fill the new table: the rows, cost, and errors are exactly `INSERT INTO t <query>`'s. The target
     // is named in its own database, so no other relation of the same name can capture it.
     const db = attachName !== "" ? attachName : targetTemp ? "temp" : "main";
-    const ins: Insert = {
+    const insert = (query: QueryExpr): Insert => ({
       kind: "insert",
       table: ct.name,
       db,
       columns: null,
       overriding: null,
-      source: { kind: "query", query: cta.query },
+      source: { kind: "query", query },
       onConflict: null,
       returning: null,
-    };
-    return this.executeInsertCached(ins, params, EMPTY_CTE_CTX, null, false);
+    });
+    // A data-modifying WITH is the statement's own (create-table-as.md §1): the fill is `WITH … INSERT
+    // INTO t <body>`, run by the writable-CTE orchestrator, so every part reads the pre-statement
+    // snapshot (with the new, empty table) and runs exactly once.
+    const q = cta.query;
+    if (q.kind === "withExpr" && withIsDataModifying(q)) {
+      const wq: WithQuery = {
+        kind: "with",
+        ctes: q.ctes,
+        body: insert(q.body),
+        recursive: q.recursive,
+      };
+      return this.executeWithDml(wq, params);
+    }
+    return this.executeInsertCached(insert(q), params, EMPTY_CTE_CTX, null, false);
+  }
+
+  // ctasPrepare runs the checks of a `CREATE TABLE … AS` before anything is created
+  // (create-table-as.md §3 steps 2–4), shared with `EXPLAIN CREATE TABLE … AS` (§7): the target
+  // database and the `jed_` reservation, the query planned with its parameters typed and bound, and
+  // the name check. It returns the planned query, or null when IF NOT EXISTS skips a taken name.
+  ctasPrepare(ct: CreateTable, cta: CreateTableAs, params: Value[]): QueryPlan | null {
+    const { attachName } = this.createTableTarget(ct);
+    checkReservedName("table", ct.name);
+    // Plan the query once, for its output columns. Its `$N` parameters are typed and bound as a
+    // query's are, so a wrong parameter count or an untyped parameter fails here.
+    const ptypes = new ParamTypes();
+    const q = cta.query;
+    let plan: QueryPlan;
+    if (q.kind === "withExpr" && withIsDataModifying(q)) {
+      // A data-modifying WITH plans as the statement's own WITH (writable-cte.md): its CTEs first,
+      // then the body that reads them.
+      const bindings = this.planCteBindings(q.ctes, q.recursive, [], null, ptypes, q.body);
+      plan = this.planQuery(q.body, null, bindings, ptypes);
+    } else {
+      plan = this.planQuery(q, null, [], ptypes);
+    }
+    bindParams(params, ptypes.finalize(), this.inputZone());
+    if (this.createTableNameTaken(ct.name, attachName)) {
+      if (ct.ifNotExists) return null;
+      throw engineError("duplicate_table", "relation already exists: " + ct.name);
+    }
+    return plan;
   }
 
   // createTableTarget resolves the database a CREATE TABLE writes into (attached-databases.md §3,
@@ -14438,15 +14500,17 @@ export class Engine {
 
   // viewColumnTypes returns the canonical type text of each output column of view
   // (introspection.md §5): the body is planned exactly as a reference to the view would plan it, so
-  // a body that cannot be planned raises the error reading the view would. An untyped NULL column
-  // reads as text, the type a derived-table column of unknown type takes.
+  // a body that cannot be planned raises the error reading the view would. The text carries the
+  // typmod the column keeps (create-table-as.md §2), and an untyped NULL column reads as text, the
+  // type a derived-table column of unknown type takes.
   private viewColumnTypes(view: ViewDef): string[] {
     const body = view.body;
     if (body === null) throw unparsableViewError(view.name);
     const plan = this.inViewBody({ depth: 0, bodyDepth: view.depth }, () =>
       this.planQuery(body, null, [], new ParamTypes()),
     );
-    return plan.columnTypes.map((t) => (t.kind === "null" ? "text" : rtName(t)));
+    const typmods = queryPlanColumnTypmods(plan);
+    return plan.columnTypes.map((t, i) => viewColumnTypeText(t, typmods[i]!));
   }
 
   // planViewReference plans a view reference's body (views.md §4.1): a fresh top-level scope with no
@@ -14472,7 +14536,7 @@ export class Engine {
           columnTypes: plan.columnTypes,
           columnNames: plan.columnNames,
           columnDerivs: queryPlanColumnDerivs(plan),
-          columnTypmods: plan.columnTypes.map(() => TYPMOD_NONE),
+          columnTypmods: queryPlanColumnTypmods(plan),
         });
       }
       return plan;
@@ -14742,7 +14806,7 @@ export class Engine {
         columnTypes: plan.columnTypes,
         columnNames: plan.columnNames,
         columnDerivs: queryPlanColumnDerivs(plan),
-        columnTypmods: plan.columnTypes.map(() => TYPMOD_NONE),
+        columnTypmods: queryPlanColumnTypmods(plan),
       });
       return metas;
     });
@@ -14955,7 +15019,13 @@ export class Engine {
       replaced = this.readSnap().view(cv.name);
       if (replaced === undefined) throw notAView(cv.name);
       // 9. Column compatibility (42P16), 10. no cycle (42P17).
-      this.checkViewReplacement(replaced, columns, bodyTypes, bodyDerivs);
+      this.checkViewReplacement(
+        replaced,
+        columns,
+        bodyTypes,
+        bodyDerivs,
+        queryPlanColumnTypmods(first.plan),
+      );
       if (this.viewReads(deps, cv.name)) {
         throw engineError(
           "invalid_object_definition",
@@ -14982,13 +15052,15 @@ export class Engine {
 
   // checkViewReplacement is the CREATE OR REPLACE VIEW column compatibility check (views.md §1.2 step
   // 9, PostgreSQL's checkViewColumns): no fewer columns, then each existing column keeps its name,
-  // type, and collation, all 42P16. The existing types and collations come from planning the view's
-  // current body; a body that no longer plans compares only the names and the count.
+  // type (typmod included), and collation, all 42P16. The existing types and collations come from
+  // planning the view's current body; a body that no longer plans compares only the names and the
+  // count.
   private checkViewReplacement(
     old: ViewDef,
     names: string[],
     types: ResolvedType[],
     derivs: Deriv[],
+    typmods: Typmod[],
   ): void {
     const invalid = (msg: string): EngineError => engineError("invalid_table_definition", msg);
     if (names.length < old.columns.length) throw invalid("cannot drop columns from view");
@@ -15009,9 +15081,11 @@ export class Engine {
       }
       if (current === null) continue;
       const oldType = current.columnTypes[i]!;
-      if (!astDeepEqual(oldType, types[i])) {
+      const wasType = viewColumnTypeText(oldType, queryPlanColumnTypmods(current)[i]!);
+      const isType = viewColumnTypeText(types[i]!, typmods[i]!);
+      if (!astDeepEqual(oldType, types[i]) || wasType !== isType) {
         throw invalid(
-          `cannot change data type of view column "${oldName}" from ${rtName(oldType)} to ${rtName(types[i]!)}`,
+          `cannot change data type of view column "${oldName}" from ${wasType} to ${isType}`,
         );
       }
       const was = this.viewCollation(queryPlanColumnDerivs(current)[i]!);

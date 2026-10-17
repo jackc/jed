@@ -64,7 +64,7 @@ import type {
   FrameMode,
   FrameExclusion,
 } from "./ast.ts";
-import { emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
+import { cteBodyAsQuery, emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
 import type { OnCommitAction } from "./catalog.ts";
 import { EngineError, engineError } from "./errors.ts";
@@ -377,6 +377,17 @@ export function parseSQL(sql: string): Statement {
   }
 }
 
+// SelectInto is the target of a `SELECT … INTO [TEMP | TEMPORARY] [TABLE] [db.]name`
+// (create-table-as.md §6).
+type SelectInto = { temp: boolean; db: string | undefined; name: string };
+
+// unloggedNotSupported is the error of `CREATE UNLOGGED TABLE` and `SELECT … INTO UNLOGGED`
+// (create-table-as.md §6): jed has no unlogged tables — every table is durable (CLAUDE.md §9) — so
+// the form is recognized and refused.
+function unloggedNotSupported(): EngineError {
+  return engineError("feature_not_supported", "unlogged tables are not supported");
+}
+
 // Parser is a token cursor over a single statement.
 class Parser {
   private tokens: Token[];
@@ -402,6 +413,22 @@ class Parser {
   // The furthest token index the parse has examined through peek / advance — the token a parse
   // error is positioned at (spec/design/error-fields.md §10.3).
   private furthest: number;
+  // SELECT … INTO (spec/design/create-table-as.md §6): whether the next selectCore is the leftmost
+  // SELECT of the statement's own query, the one place an INTO clause may appear. Set for a query
+  // statement (and a CREATE VIEW body, which refuses it); the first selectCore takes it, so every
+  // later or nested one sees false.
+  private intoOk = false;
+  // Whether the statement's own query is being parsed (a query statement or a CREATE VIEW body), so
+  // an INTO on a later set-operation arm is "only allowed on first SELECT" rather than "not allowed
+  // here".
+  private intoTop = false;
+  // Whether the query is a CREATE VIEW body: its leftmost INTO is 0A000.
+  private intoView = false;
+  // How many query constructs (a SELECT's clauses, a CTE body) enclose the cursor within the
+  // statement's own query: an INTO at depth 0 is on a set-operation arm.
+  private intoNest = 0;
+  // The INTO target the leftmost SELECT named, taken by the statement-level caller.
+  private selectInto: SelectInto | null = null;
 
   // A parser over stored text passes no positions (error-fields.md §10.1); parseSQL passes the
   // host-written text's.
@@ -509,14 +536,14 @@ class Parser {
       case "insert":
         return this.parseInsert();
       case "select":
-        return this.parseQueryExpr();
+        return this.parseIntoQuery(() => this.parseQueryExpr());
       // A top-level VALUES query (grammar.md §25): `VALUES (…), (…) [ORDER BY …]`.
       case "values":
-        return this.parseQueryExpr();
+        return this.parseIntoQuery(() => this.parseQueryExpr());
       // `WITH …` at statement start can only begin a query with common table expressions
       // (spec/design/cte.md). `with` is non-reserved but unambiguous here.
       case "with":
-        return this.parseWithStatement();
+        return this.parseIntoQuery(() => this.parseWithStatement());
       case "update":
         return this.parseUpdate();
       case "delete":
@@ -539,11 +566,79 @@ class Parser {
         return { kind: "savepoint", op: "release", name: this.parseSavepointName() };
       case "":
         // A leading `(` can only begin a parenthesized query (grammar.md §25).
-        if (this.peek().kind === "lparen") return this.parseQueryExpr();
+        if (this.peek().kind === "lparen") return this.parseIntoQuery(() => this.parseQueryExpr());
         throw engineError("syntax_error", "expected a SQL statement");
       default:
         throw engineError("syntax_error", `unexpected keyword '${this.peekKeyword()}'`);
     }
+  }
+
+  // parseIntoQuery parses a query statement whose leftmost SELECT may carry INTO
+  // (spec/design/create-table-as.md §6). A query with an INTO target is the statement `CREATE [TEMP]
+  // TABLE target AS query`.
+  private parseIntoQuery(parse: () => Statement): Statement {
+    this.intoOk = true;
+    this.intoTop = true;
+    const stmt = parse();
+    this.intoOk = false;
+    this.intoTop = false;
+    const into = this.selectInto;
+    if (into === null) return stmt;
+    this.selectInto = null;
+    let query: QueryExpr;
+    if (stmt.kind === "select" || stmt.kind === "setOp") {
+      query = stmt;
+    } else if (stmt.kind === "with" && cteBodyAsQuery(stmt.body) !== null) {
+      query = {
+        kind: "withExpr",
+        ctes: stmt.ctes,
+        recursive: stmt.recursive,
+        body: cteBodyAsQuery(stmt.body)!,
+      };
+    } else {
+      throw engineError("syntax_error", "SELECT ... INTO is not allowed here");
+    }
+    return {
+      kind: "createTable",
+      name: into.name,
+      db: into.db,
+      temp: into.temp,
+      ifNotExists: false,
+      columns: [],
+      tablePks: [],
+      checks: [],
+      uniques: [],
+      fks: [],
+      excludes: [],
+      asQuery: { columnNames: null, query, withData: true },
+    };
+  }
+
+  // parseSelectInto parses the `INTO [TEMPORARY | TEMP] [TABLE] [db.]name` of a SELECT … INTO, after
+  // its select list (spec/design/create-table-as.md §6). owner is whether this SELECT is the
+  // statement's leftmost one. Anywhere else the clause is 42601 — on a later set-operation arm "INTO
+  // is only allowed on first SELECT", in a subquery, CTE body, or another statement's query "not
+  // allowed here" — and in a CREATE VIEW body 0A000, as in PostgreSQL. TEMP, TEMPORARY, UNLOGGED,
+  // and TABLE are words of the clause unless a `.` follows (a database qualifier).
+  private parseSelectInto(owner: boolean): void {
+    this.advance(); // INTO
+    if (!owner) {
+      const msg =
+        this.intoTop && this.intoNest === 1
+          ? "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT"
+          : "SELECT ... INTO is not allowed here";
+      throw engineError("syntax_error", msg);
+    }
+    if (this.intoView) {
+      throw engineError("feature_not_supported", "views must not contain SELECT INTO");
+    }
+    const word = (w: string): boolean => this.peekKeyword() === w && this.peekKindAt(1) !== "dot";
+    const temp = word("temp") || word("temporary");
+    if (temp) this.advance();
+    else if (word("unlogged")) throw unloggedNotSupported();
+    if (word("table")) this.advance();
+    const [db, name] = this.parseQualifiedTableName();
+    this.selectInto = { temp, db, name };
   }
 
   // atDeferredCreateView reports whether the statement is one of the deferred `CREATE … VIEW` forms
@@ -664,7 +759,10 @@ class Parser {
     const trailing = this.trailingCheckOption();
     if (trailing !== null) this.tokens[trailing.at] = { kind: "eof" };
     const start = this.pos;
+    // The body's leftmost SELECT may not take INTO (0A000, create-table-as.md §6).
+    this.intoOk = this.intoTop = this.intoView = true;
     this.parseSubquery();
+    this.intoOk = this.intoTop = this.intoView = false;
     const end = this.pos;
     if (trailing !== null && end !== trailing.at) {
       throw engineError("syntax_error", "unexpected trailing input");
@@ -890,23 +988,36 @@ class Parser {
   }
 
   // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / VALUES /
-  // WITH / a parenthesized query) or a DML statement (INSERT / UPDATE / DELETE). DDL, transaction
+  // WITH / a parenthesized query), a DML statement (INSERT / UPDATE / DELETE), or a CREATE TABLE … AS
+  // (create-table-as.md §7). Other DDL, transaction
   // control, and a nested EXPLAIN have no query plan to render and are rejected 42601.
   private parseExplainInner(): Statement {
     switch (this.peekKeyword()) {
       case "select":
       case "values":
-        return this.parseQueryExpr();
+        return this.parseIntoQuery(() => this.parseQueryExpr());
       case "with":
-        return this.parseWithStatement();
+        return this.parseIntoQuery(() => this.parseWithStatement());
       case "insert":
         return this.parseInsert();
       case "update":
         return this.parseUpdate();
       case "delete":
         return this.parseDelete();
+      // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no plan to
+      // render.
+      case "create": {
+        if (this.atCreateView()) {
+          throw engineError("syntax_error", "EXPLAIN does not support 'create'");
+        }
+        const ct = this.parseCreateTable();
+        if (ct.kind === "createTable" && ct.asQuery === null) {
+          throw engineError("syntax_error", "EXPLAIN does not support CREATE TABLE without AS");
+        }
+        return ct;
+      }
       case "":
-        if (this.peek().kind === "lparen") return this.parseQueryExpr();
+        if (this.peek().kind === "lparen") return this.parseIntoQuery(() => this.parseQueryExpr());
         throw engineError("syntax_error", "expected a statement after EXPLAIN");
       default:
         throw engineError("syntax_error", `EXPLAIN does not support '${this.peekKeyword()}'`);
@@ -928,6 +1039,7 @@ class Parser {
     // `CREATE TABLE temp (...)` is an ordinary persistent table named "temp".
     const temp = this.peekKeyword() === "temp" || this.peekKeyword() === "temporary";
     if (temp) this.advance();
+    else if (this.peekKeyword() === "unlogged") throw unloggedNotSupported();
     this.expectKeyword("table");
     // `IF NOT EXISTS` (grammar.md §13) is recognized by a two-token lookahead, so a lone `if` stays an
     // ordinary non-reserved table name: `CREATE TABLE if (...)` creates a table named `if` (the DROP
@@ -2681,7 +2793,13 @@ class Parser {
       }
     }
     // The primary may be a data-modifying statement (spec/design/writable-cte.md): a leading
-    // INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr.
+    // INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr. A data-modifying
+    // primary's SELECT is another statement's query, where INTO is not allowed.
+    const kw = this.peekKeyword();
+    if (kw === "insert" || kw === "update" || kw === "delete") {
+      this.intoOk = false;
+      this.intoTop = false;
+    }
     const body = this.parseCteBody(false);
     return { kind: "with", ctes, body, recursive };
   }
@@ -2749,7 +2867,13 @@ class Parser {
       materialized = false;
     }
     this.expect("lparen");
+    // A CTE body's SELECT never takes the statement's INTO (create-table-as.md §6).
+    const intoOk = this.intoOk;
+    this.intoOk = false;
+    this.intoNest++;
     const body = this.parseCteBody(true);
+    this.intoNest--;
+    this.intoOk = intoOk;
     this.expect("rparen");
     const search = this.peekKeyword() === "search" ? this.parseSearchClause() : null;
     const cycle = this.peekKeyword() === "cycle" ? this.parseCycleClause() : null;
@@ -3026,6 +3150,8 @@ class Parser {
       return q;
     }
     if (this.peekKeyword() === "values") {
+      // A VALUES operand is no SELECT, so a later arm cannot take the statement's INTO.
+      this.intoOk = false;
       return valuesQuery(this.parseValuesBody(), [], null, null);
     }
     return this.parseSelectCore();
@@ -3168,7 +3294,13 @@ class Parser {
       }
     }
 
+    // Only the statement's leftmost SELECT may take an INTO (create-table-as.md §6), so this one owns
+    // it and every SELECT nested in its clauses does not.
+    const owner = this.intoOk;
+    this.intoOk = false;
+    this.intoNest++;
     const items = this.parseSelectItems();
+    if (this.peekKeyword() === "into") this.parseSelectInto(owner);
     let from: TableRef | null = null;
     let joins: JoinClause[] = [];
     if (this.peekKeyword() === "from") {
@@ -3184,6 +3316,7 @@ class Parser {
 
     // WINDOW name AS ( definition ) (, …) — named windows referenced by OVER name (window.md §5).
     const windows = this.parseWindowClause();
+    this.intoNest--;
 
     return {
       kind: "select",

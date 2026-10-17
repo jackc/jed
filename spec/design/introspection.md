@@ -301,12 +301,12 @@ body**, exactly as a reference to the view would plan it. The `type` text is the
 query over the view produces, rendered by the same rules as above with two consequences of being a
 *result* type:
 
-- **No typmods.** The `type` text is the result type without a typmod, so a `varchar(10)` column
-  reads as `text` and `decimal(8,2)` as `decimal`. This is the comparison `CREATE OR REPLACE VIEW`
-  already makes ("type without typmods", views.md §1.2). PostgreSQL keeps a typmod through a bare
-  column reference; jed's planner now tracks those typmods too (`CREATE TABLE … AS` keeps them,
-  [create-table-as.md](create-table-as.md) §2), but view columns do not report them yet, so this is a
-  recorded divergence and a follow-on.
+- **The typmods the body keeps.** The `type` text carries the typmod the column's output keeps
+  ([create-table-as.md](create-table-as.md) §2, PostgreSQL's `exprTypmod`): a bare reference to a
+  `varchar(10)` column reads as `varchar(10)` and to a `decimal(8,2)` one as `decimal(8,2)`, through
+  any chain of views, while an expression over them (`price * 2`) has none (`decimal`). This is the
+  type `CREATE OR REPLACE VIEW` compares (views.md §1.2) and the one `CREATE TABLE … AS` from the
+  view creates. An array column keeps no element typmod (create-table-as.md §5).
 - **An untyped NULL reads as `text`**, the type a derived-table column of unknown type takes, and
   what PostgreSQL resolves an `unknown` view column to.
 

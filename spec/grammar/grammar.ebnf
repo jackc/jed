@@ -76,14 +76,17 @@ sql_statement  ::= create_table
  * boolean option list are mutually exclusive spellings. Option values default to TRUE when omitted;
  * TRUE/FALSE/ON/OFF are accepted. An option may occur at most once. EXPLAIN and option words are
  * recognized POSITIONALLY and are NOT reserved (§3). The inner statement is restricted to a query or
- * DML (never DDL, transaction control, or a nested EXPLAIN). A "(" right after EXPLAIN opens the option
- * list unless "(", "SELECT", "VALUES (", or a WITH clause follows it — then it begins a parenthesized
- * query ("EXPLAIN (SELECT 1)", ../design/grammar.md §25). */
+ * DML (never DDL, transaction control, or a nested EXPLAIN) — the one exception is CREATE TABLE … AS,
+ * whose rendered plan is its query's (../design/create-table-as.md §7); the column-definition form of
+ * CREATE TABLE is 42601. A "(" right after EXPLAIN opens the option list unless "(", "SELECT",
+ * "VALUES (", or a WITH clause follows it — then it begins a parenthesized query ("EXPLAIN (SELECT
+ * 1)", ../design/grammar.md §25). */
 explain        ::= "EXPLAIN" ( "ANALYZE" | explain_options )? explainable
 explain_options ::= "(" explain_option ( "," explain_option )* ")"
 explain_option ::= ( "ANALYZE" | "VERBOSE" | "COSTS" | "LANE" ) explain_boolean?
 explain_boolean ::= "TRUE" | "FALSE" | "ON" | "OFF"
 explainable    ::= query_statement | insert | update | delete
+                 | "CREATE" table_scope? "TABLE" ("IF" "NOT" "EXISTS")? qualified_table create_table_as
 
 /* Deterministic column-statistics collection (../design/statistics.md). One target per statement;
  * an omitted column list means every declared column. Database-wide/multi-target ANALYZE and PG's
@@ -112,7 +115,8 @@ analyze        ::= "ANALYZE" qualified_table ("(" identifier ("," identifier)* "
  * no-op success instead of 42P07, decided before any column/constraint work so the skipped
  * definition is neither validated nor created (../design/grammar.md §13); the jed_ reservation
  * (42939) is not suppressed. Recognized by a two-token lookahead, so a lone "if" stays an identifier
- * and "CREATE TABLE if (...)" creates a table named "if" (PG-faithful). */
+ * and "CREATE TABLE if (...)" creates a table named "if" (PG-faithful). "CREATE UNLOGGED TABLE" is
+ * recognized and refused 0A000: every jed table is durable (../design/create-table-as.md §6). */
 create_table   ::= "CREATE" table_scope? "TABLE" ("IF" "NOT" "EXISTS")? qualified_table
                    ( "(" table_element ("," table_element)* ")" on_commit? | create_table_as )
 table_scope    ::= "TEMPORARY" | "TEMP"
@@ -126,7 +130,9 @@ on_commit      ::= "ON" "COMMIT" ("PRESERVE" "ROWS" | "DELETE" "ROWS" | "DROP")
  * "AS", by "ON" (ON COMMIT precedes AS, as in PostgreSQL), or by a parenthesized list of bare names
  * followed by "AS" or "ON" — a column definition always has a type after its name, so nothing is
  * lost. The trailing "WITH" ["NO"] "DATA" is cut off before the query is parsed (an unreserved
- * "with" would otherwise read as a table alias — the CREATE VIEW check-option precedent). */
+ * "with" would otherwise read as a table alias — the CREATE VIEW check-option precedent). The query's
+ * own WITH may hold a data-modifying CTE: it is then the statement's writable WITH
+ * (../design/create-table-as.md §1); one nested deeper stays 0A000. */
 create_table_as ::= ("(" identifier ("," identifier)* ")")? on_commit? "AS" subquery_expr
                     ("WITH" "NO"? "DATA")?
 
@@ -749,11 +755,23 @@ set_operand    ::= select_core | values_body | "(" subquery_expr ")"
  * "SELECT distinct" at end of input is a column reference (the DISTINCT lookahead is unchanged)
  * and "SELECT from" reads "from" as a column — both resolve to 42703, a documented divergence
  * from PG's empty-target-list form (../design/grammar.md §34). */
-select_core    ::= "SELECT" "DISTINCT"? select_items ("FROM" from_clause)?
+ *   SELECT … INTO (../design/create-table-as.md §6): an into_clause after the select items makes
+ * the statement CREATE [TEMP] TABLE target AS <the query without it>. It is allowed only on the
+ * statement's leftmost select_core — of a query statement (its first set-operation arm, inside its
+ * parentheses, or the primary query of a WITH) or of EXPLAIN's query. On a later set-operation arm
+ * it is 42601 "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT"; in a subquery,
+ * derived table, CTE body, INSERT source, the query of CREATE TABLE … AS, or a WITH whose primary is
+ * DML, 42601 "SELECT ... INTO is not allowed here"; as the leftmost SELECT of a CREATE VIEW body
+ * 0A000. TEMP, TEMPORARY, UNLOGGED, and TABLE are words of the clause unless "." follows (a database
+ * qualifier); UNLOGGED is 0A000. "INTO" is a bare-label stop word (../design/grammar.md §8), so
+ * after a select item it begins this clause rather than an output label. */
+select_core    ::= "SELECT" "DISTINCT"? select_items into_clause? ("FROM" from_clause)?
                    where_clause?
                    group_by?
                    having_clause?
                    window_clause?
+
+into_clause    ::= "INTO" ("TEMPORARY" | "TEMP" | "UNLOGGED")? "TABLE"? qualified_table
 
 /* The WINDOW clause names reusable window definitions referenced by "OVER name" or extended by
  * another definition's leading name (../design/window.md §5). It runs in the window stage with

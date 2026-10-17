@@ -385,14 +385,16 @@ impl Engine {
                     plan.column_names().to_vec(),
                     plan.column_types().to_vec(),
                     plan.column_derivs().to_vec(),
+                    plan.column_typmods().to_vec(),
                 )
             });
     }
 
     /// The canonical type text of each output column of `view` (introspection.md §5): the body is
     /// planned exactly as a reference to the view would plan it, so a body that cannot be planned
-    /// raises the error reading the view would. An untyped NULL column reads as `text`, the type a
-    /// derived-table column of unknown type takes.
+    /// raises the error reading the view would. The text carries the typmod the column keeps
+    /// (create-table-as.md §2), and an untyped NULL column reads as `text`, the type a derived-table
+    /// column of unknown type takes.
     pub(crate) fn view_column_types(&self, view: &ViewDef) -> Result<Vec<String>> {
         let Some(body) = &view.body else {
             return Err(unparsable_view_error(&view.name));
@@ -408,10 +410,8 @@ impl Engine {
         Ok(plan
             .column_types()
             .iter()
-            .map(|t| match t {
-                ResolvedType::Null => "text".to_string(),
-                t => t.type_name(),
-            })
+            .zip(plan.column_typmods())
+            .map(|(t, tm)| view_column_type_text(t, *tm))
             .collect())
     }
 
@@ -420,13 +420,13 @@ impl Engine {
     /// A shape is read only for its own outputs and pushability, never for its relations' bodies.
     pub(crate) fn view_stand_in(&self, view_name: &str) -> Option<QueryPlan> {
         let columns = self.view_columns.borrow();
-        let (names, types, derivs) = columns.get(view_name)?;
+        let (names, types, derivs, typmods) = columns.get(view_name)?;
         Some(QueryPlan::Values(ValuesPlan {
             rows: Vec::new(),
             column_types: types.clone(),
             column_names: names.clone(),
             column_derivs: derivs.clone(),
-            column_typmods: vec![Typmod::NONE; types.len()],
+            column_typmods: typmods.clone(),
         }))
     }
 
@@ -530,6 +530,7 @@ impl Engine {
         let body_names = plan.column_names().to_vec();
         let body_types = plan.column_types().to_vec();
         let body_derivs = plan.column_derivs().to_vec();
+        let body_typmods = plan.column_typmods().to_vec();
         let columns = view_output_names(&body_names, cv.columns.as_deref())?;
         // A view column cannot be an anonymous record (or an array of one) — 42P16, as for a
         // CREATE TABLE … AS column (composite.md §1).
@@ -596,7 +597,7 @@ impl Engine {
                 return Err(not_a_view(&cv.name));
             };
             // 9. Column compatibility (42P16), 10. no cycle (42P17).
-            self.check_view_replacement(&old, &columns, &body_types, &body_derivs)?;
+            self.check_view_replacement(&old, &columns, &body_types, &body_derivs, &body_typmods)?;
             if self.view_reads(&deps, &cv.name) {
                 return Err(EngineError::new(
                     SqlState::InvalidObjectDefinition,
@@ -633,8 +634,8 @@ impl Engine {
     }
 
     /// `CREATE OR REPLACE VIEW` column compatibility (views.md §1.2 step 9, PostgreSQL's
-    /// checkViewColumns): no fewer columns, then each existing column keeps its name, type, and
-    /// collation, all 42P16. The existing types and collations come from planning the view's
+    /// checkViewColumns): no fewer columns, then each existing column keeps its name, type (typmod
+    /// included), and collation, all 42P16. The existing types and collations come from planning the view's
     /// current body; a body that no longer plans compares only the names and the count.
     fn check_view_replacement(
         &self,
@@ -642,6 +643,7 @@ impl Engine {
         names: &[String],
         types: &[ResolvedType],
         derivs: &[Deriv],
+        typmods: &[Typmod],
     ) -> Result<()> {
         let invalid = |msg: String| EngineError::new(SqlState::InvalidTableDefinition, msg);
         if names.len() < old.columns.len() {
@@ -653,7 +655,13 @@ impl Engine {
             .body
             .as_ref()
             .and_then(|body| self.trace_view_body(body).ok())
-            .map(|(plan, _)| (plan.column_types().to_vec(), plan.column_derivs().to_vec()));
+            .map(|(plan, _)| {
+                (
+                    plan.column_types().to_vec(),
+                    plan.column_derivs().to_vec(),
+                    plan.column_typmods().to_vec(),
+                )
+            });
         for (i, old_name) in old.columns.iter().enumerate() {
             if names[i] != *old_name {
                 return Err(invalid(format!(
@@ -661,14 +669,16 @@ impl Engine {
                     names[i]
                 )));
             }
-            let Some((old_types, old_derivs)) = &current else {
+            let Some((old_types, old_derivs, old_typmods)) = &current else {
                 continue;
             };
-            if old_types[i] != types[i] {
+            let (was, is) = (
+                view_column_type_text(&old_types[i], old_typmods[i]),
+                view_column_type_text(&types[i], typmods[i]),
+            );
+            if old_types[i] != types[i] || was != is {
                 return Err(invalid(format!(
-                    "cannot change data type of view column \"{old_name}\" from {} to {}",
-                    old_types[i].type_name(),
-                    types[i].type_name()
+                    "cannot change data type of view column \"{old_name}\" from {was} to {is}"
                 )));
             }
             let (was, is) = (
@@ -930,6 +940,18 @@ impl Engine {
 
 /// The view's output column names (views.md §1): the column list applied over the body's names
 /// left to right. A longer list is 42601; a duplicate final name is 42701; no column is 0A000.
+/// The type text of a view output column (introspection.md §5, views.md §1.2): the result type with
+/// the typmod the column keeps applied at a scalar leaf (`varchar(3)`, `decimal(5,2)`), and an
+/// untyped NULL as `text`. An array keeps no element typmod (create-table-as.md §5).
+pub(crate) fn view_column_type_text(t: &ResolvedType, tm: Typmod) -> String {
+    match (t, tm.varchar_len, tm.decimal) {
+        (ResolvedType::Null, _, _) => "text".to_string(),
+        (ResolvedType::Text, Some(n), _) => format!("varchar({n})"),
+        (ResolvedType::Decimal, _, Some(d)) => format!("decimal({},{})", d.precision, d.scale),
+        (t, _, _) => t.type_name(),
+    }
+}
+
 pub(crate) fn view_output_names(
     body_names: &[String],
     list: Option<&[String]>,

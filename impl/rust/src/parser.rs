@@ -73,6 +73,29 @@ pub struct Parser {
     /// The furthest token index the parse has examined through `peek` / `advance` — the token a
     /// parse error is positioned at (spec/design/error-fields.md §10.3).
     furthest: std::cell::Cell<usize>,
+    /// `SELECT … INTO` (spec/design/create-table-as.md §6): whether the next `select_core` is the
+    /// leftmost SELECT of the statement's own query, the one place an `INTO` clause may appear. Set
+    /// for a query statement (and a `CREATE VIEW` body, which refuses it); the first `select_core`
+    /// takes it, so every later or nested one sees `false`.
+    into_ok: bool,
+    /// Whether the statement's own query is being parsed (a query statement or a `CREATE VIEW`
+    /// body), so an `INTO` on a later set-operation arm is *only allowed on first SELECT* rather than
+    /// *not allowed here*.
+    into_top: bool,
+    /// Whether the query is a `CREATE VIEW` body: its leftmost `INTO` is 0A000.
+    into_view: bool,
+    /// How many query constructs (a SELECT's clauses, a CTE body) enclose the cursor within the
+    /// statement's own query: an `INTO` at depth 0 is on a set-operation arm.
+    into_nest: usize,
+    /// The `INTO` target the leftmost SELECT named, taken by the statement-level caller.
+    select_into: Option<SelectInto>,
+}
+
+/// The target of a `SELECT … INTO [TEMP | TEMPORARY] [TABLE] [db.]name` (create-table-as.md §6).
+struct SelectInto {
+    temp: bool,
+    db: Option<String>,
+    name: String,
 }
 
 impl Parser {
@@ -92,6 +115,11 @@ impl Parser {
             max_depth: 0,
             bare_row_end: 0,
             paren_query: Vec::new(),
+            into_ok: false,
+            into_top: false,
+            into_view: false,
+            into_nest: 0,
+            select_into: None,
         };
         p.paren_query = p.compute_paren_query();
         p
@@ -252,12 +280,12 @@ impl Parser {
                 Ok(Statement::AlterTable(self.parse_alter_table()?))
             }
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
-            Some("select") => self.parse_query_expr(),
+            Some("select") => self.parse_into_query(Self::parse_query_expr),
             // A top-level `VALUES` query (grammar.md §25): `VALUES (…), (…) [ORDER BY …]`.
-            Some("values") => self.parse_query_expr(),
+            Some("values") => self.parse_into_query(Self::parse_query_expr),
             // `WITH …` at statement start can only begin a query with common table expressions
             // (spec/design/cte.md). `with` is non-reserved but unambiguous here.
-            Some("with") => self.parse_with_statement(),
+            Some("with") => self.parse_into_query(Self::parse_with_statement),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
             Some("explain") => self.parse_explain(),
@@ -280,9 +308,95 @@ impl Parser {
             }
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
             // A leading `(` can only begin a parenthesized query (grammar.md §25).
-            None if matches!(self.peek(), Token::LParen) => self.parse_query_expr(),
+            None if matches!(self.peek(), Token::LParen) => {
+                self.parse_into_query(Self::parse_query_expr)
+            }
             None => Err(syntax("expected a SQL statement")),
         }
+    }
+
+    /// Parse a query statement whose leftmost SELECT may carry `INTO` (spec/design/create-table-as.md
+    /// §6). A query with an `INTO` target is the statement `CREATE [TEMP] TABLE target AS query`.
+    fn parse_into_query(&mut self, parse: fn(&mut Self) -> Result<Statement>) -> Result<Statement> {
+        self.into_ok = true;
+        self.into_top = true;
+        let stmt = parse(self)?;
+        self.into_ok = false;
+        self.into_top = false;
+        let Some(into) = self.select_into.take() else {
+            return Ok(stmt);
+        };
+        let query = match stmt {
+            Statement::Select(sel) => QueryExpr::Select(Box::new(sel)),
+            Statement::SetOp(so) => QueryExpr::SetOp(Box::new(so)),
+            Statement::With(WithQuery {
+                ctes,
+                body: CteBody::Query(body),
+                recursive,
+            }) => QueryExpr::With(Box::new(WithExpr {
+                ctes,
+                recursive,
+                body: Box::new(body),
+            })),
+            _ => return Err(syntax("SELECT ... INTO is not allowed here")),
+        };
+        Ok(Statement::CreateTable(CreateTable {
+            name: into.name,
+            temp: into.temp,
+            if_not_exists: false,
+            columns: Vec::new(),
+            table_pks: Vec::new(),
+            checks: Vec::new(),
+            uniques: Vec::new(),
+            foreign_keys: Vec::new(),
+            excludes: Vec::new(),
+            db: into.db,
+            on_commit: None,
+            as_query: Some(Box::new(CreateTableAs {
+                column_names: None,
+                query,
+                with_data: true,
+            })),
+        }))
+    }
+
+    /// The `INTO [TEMPORARY | TEMP] [TABLE] [db.]name` of a `SELECT … INTO`, after its select list
+    /// (spec/design/create-table-as.md §6). `owner` is whether this SELECT is the statement's
+    /// leftmost one. Anywhere else the clause is 42601 — on a later set-operation arm *INTO is only
+    /// allowed on first SELECT*, in a subquery, CTE body, or another statement's query *not allowed
+    /// here* — and in a `CREATE VIEW` body 0A000, as in PostgreSQL. `TEMP`, `TEMPORARY`, `UNLOGGED`,
+    /// and `TABLE` are words of the clause unless a `.` follows (a database qualifier).
+    fn parse_select_into(&mut self, owner: bool) -> Result<()> {
+        self.advance(); // INTO
+        if !owner {
+            let msg = if self.into_top && self.into_nest == 1 {
+                "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT"
+            } else {
+                "SELECT ... INTO is not allowed here"
+            };
+            return Err(syntax(msg));
+        }
+        if self.into_view {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "views must not contain SELECT INTO",
+            ));
+        }
+        let word = |p: &Self, w: &str| {
+            p.peek_keyword().as_deref() == Some(w) && !matches!(p.peek_at(1), Token::Dot)
+        };
+        let temp = word(self, "temp") || word(self, "temporary");
+        if temp {
+            self.advance();
+        } else if word(self, "unlogged") {
+            return Err(unlogged_not_supported());
+        }
+        if word(self, "table") {
+            self.advance();
+        }
+        let (db, name) = self.parse_qualified_table_name()?;
+        self.select_into = Some(SelectInto { temp, db, name });
+        Ok(())
     }
 
     /// Whether the statement is one of the deferred `CREATE … VIEW` forms (views.md §12): `CREATE
@@ -366,7 +480,10 @@ impl Parser {
             option
         });
         let start = self.pos;
+        // The body's leftmost SELECT may not take `INTO` (0A000, create-table-as.md §6).
+        (self.into_ok, self.into_top, self.into_view) = (true, true, true);
         self.parse_subquery()?;
+        (self.into_ok, self.into_top, self.into_view) = (false, false, false);
         let end = self.pos;
         if let Some((at, _)) = trailing {
             if end != at {
@@ -694,13 +811,24 @@ impl Parser {
     /// control, and a nested `EXPLAIN` have no query plan to render and are rejected `42601`.
     fn parse_explain_inner(&mut self) -> Result<Statement> {
         match self.peek_keyword().as_deref() {
-            Some("select") | Some("values") => self.parse_query_expr(),
-            Some("with") => self.parse_with_statement(),
+            Some("select") | Some("values") => self.parse_into_query(Self::parse_query_expr),
+            Some("with") => self.parse_into_query(Self::parse_with_statement),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
+            // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no
+            // plan to render.
+            Some("create") if !self.at_create_view() => {
+                let ct = self.parse_create_table()?;
+                if ct.as_query.is_none() {
+                    return Err(syntax("EXPLAIN does not support CREATE TABLE without AS"));
+                }
+                Ok(Statement::CreateTable(ct))
+            }
             Some(other) => Err(syntax(format!("EXPLAIN does not support '{other}'"))),
-            None if matches!(self.peek(), Token::LParen) => self.parse_query_expr(),
+            None if matches!(self.peek(), Token::LParen) => {
+                self.parse_into_query(Self::parse_query_expr)
+            }
             None => Err(syntax("expected a statement after EXPLAIN")),
         }
     }
@@ -724,6 +852,8 @@ impl Parser {
         );
         if temp {
             self.advance();
+        } else if self.peek_keyword().as_deref() == Some("unlogged") {
+            return Err(unlogged_not_supported());
         }
         self.expect_keyword("table")?;
         // `IF NOT EXISTS` (grammar.md §13) is recognized by a two-token lookahead, so a lone `if`
@@ -3129,7 +3259,15 @@ impl Parser {
             }
         }
         // The primary may be a data-modifying statement (spec/design/writable-cte.md): a leading
-        // INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr.
+        // INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr. A
+        // data-modifying primary's SELECT is another statement's query, where `INTO` is not allowed.
+        if matches!(
+            self.peek_keyword().as_deref(),
+            Some("insert") | Some("update") | Some("delete")
+        ) {
+            self.into_ok = false;
+            self.into_top = false;
+        }
         let body = self.parse_cte_body(false)?;
         Ok(Statement::With(WithQuery {
             ctes,
@@ -3205,7 +3343,12 @@ impl Parser {
             _ => None,
         };
         self.expect(&Token::LParen)?;
+        // A CTE body's SELECT never takes the statement's `INTO` (create-table-as.md §6).
+        let into_ok = std::mem::replace(&mut self.into_ok, false);
+        self.into_nest += 1;
         let body = self.parse_cte_body(true)?;
+        self.into_nest -= 1;
+        self.into_ok = into_ok;
         self.expect(&Token::RParen)?;
         let search = if self.peek_keyword().as_deref() == Some("search") {
             Some(self.parse_search_clause()?)
@@ -3505,6 +3648,8 @@ impl Parser {
             return Ok(q);
         }
         if self.peek_keyword().as_deref() == Some("values") {
+            // A VALUES operand is no SELECT, so a later arm cannot take the statement's `INTO`.
+            self.into_ok = false;
             let rows = self.parse_values_body()?;
             return Ok(values_query(rows, Vec::new(), None, None));
         }
@@ -3551,12 +3696,19 @@ impl Parser {
         };
 
         // The SELECT is filled in place on the heap, so the clauses below — each of which may
-        // recurse into a subquery — share a small frame (spec/design/cost.md §7.1).
+        // recurse into a subquery — share a small frame (spec/design/cost.md §7.1). Only the
+        // statement's leftmost SELECT may take an `INTO` (create-table-as.md §6), so this one owns
+        // it and every SELECT nested in its clauses does not.
+        let owner = std::mem::replace(&mut self.into_ok, false);
+        self.into_nest += 1;
         let mut sel = empty_select(distinct);
         outline(|| -> Result<()> {
             sel.items = self.parse_select_items()?;
             Ok(())
         })?;
+        if self.peek_keyword().as_deref() == Some("into") {
+            self.parse_select_into(owner)?;
+        }
         if self.peek_keyword().as_deref() == Some("from") {
             self.advance(); // FROM
             let (f, j) = self.parse_from_clause()?;
@@ -3574,6 +3726,7 @@ impl Parser {
             sel.windows = self.parse_window_clause()?;
             Ok(())
         })?;
+        self.into_nest -= 1;
         Ok(sel)
     }
 
@@ -7438,4 +7591,13 @@ fn json_encoding_name(name: &str) -> Result<String> {
             format!("unrecognized JSON encoding: {name}"),
         )),
     }
+}
+
+/// `CREATE UNLOGGED TABLE` and `SELECT … INTO UNLOGGED` (create-table-as.md §6): jed has no unlogged
+/// tables — every table is durable (CLAUDE.md §9) — so the form is recognized and refused.
+fn unlogged_not_supported() -> EngineError {
+    EngineError::new(
+        SqlState::FeatureNotSupported,
+        "unlogged tables are not supported",
+    )
 }

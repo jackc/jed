@@ -8,13 +8,16 @@
 > `exprTypmod` in `nodeFuncs.c`) was pinned against the live oracle (CLAUDE.md §1); the recorded
 > divergences are in §5.
 >
-> **Status: landed (all three cores).** Corpus: `ddl/create_table_as.test` (PostgreSQL-checked),
-> `ddl/create_table_as_types.test` (the created types, through `jed_columns`),
-> `ddl/create_table_as_temp.test` (temp, `ON COMMIT`, atomicity, the session envelope),
+> **Status: landed (all three cores)**, with its follow-ons: a data-modifying `WITH` in the query
+> (§1), `SELECT … INTO` (§6), and `EXPLAIN [ANALYZE] CREATE TABLE … AS` (§7). Corpus:
+> `ddl/create_table_as.test` (PostgreSQL-checked), `ddl/create_table_as_types.test` (the created
+> types, through `jed_columns`), `ddl/create_table_as_temp.test` (temp, `ON COMMIT`, atomicity, the
+> session envelope), `ddl/create_table_as_writable_with.test` and `ddl/select_into.test`
+> (PostgreSQL-checked), `ddl/select_into_jed.test`, `ddl/explain_create_table_as.test`,
 > `attach/create_table_as.test`, `collation/create_table_as.test`, and
 > `dml/insert_select_container.test` (the container `INSERT … SELECT` the fill relies on, §3).
-> Capability `ddl.create_table_as`. No `format_version` change: the created table is an ordinary
-> table.
+> Capabilities `ddl.create_table_as`, `ddl.create_table_as_writable_with`, `ddl.select_into`, and
+> `ddl.explain_create_table_as`. No `format_version` change: the created table is an ordinary table.
 
 ## 1. Surface
 
@@ -30,6 +33,13 @@ CREATE [ TEMP | TEMPORARY ] TABLE [ IF NOT EXISTS ] [ db . ] name [ ( column_nam
   a derived table or a view body accepts ([grammar.md](grammar.md) §42, [views.md](views.md) §1). It
   may read the main database, the session's temp tables, and any attachment by its qualifier.
   PostgreSQL's `AS TABLE name` and `AS EXECUTE name` forms are absent, as jed has neither query form.
+- **A data-modifying `WITH`.** The query's own `WITH` — written right after `AS`, or inside the
+  query's parentheses (`AS (WITH … SELECT …)`) — may hold a data-modifying CTE
+  (`CREATE TABLE t AS WITH d AS (DELETE FROM src … RETURNING *) SELECT * FROM d`). It is then the
+  statement's writable `WITH` ([writable-cte.md](writable-cte.md)), as PostgreSQL treats the CTAS
+  query as a top-level statement: its CTEs and its body are planned as a top-level `WITH`'s, and the
+  fill (§3) runs them. A data-modifying CTE in a `WITH` nested any deeper — a derived table, a
+  subquery, a set-operation arm — stays `0A000`, as in PostgreSQL ([cte.md](cte.md) §7).
 - **The form is recognized after the table name** by the keyword `AS`, the keyword `ON` (an `ON
   COMMIT` clause comes before `AS`, as in PostgreSQL; the column-definition form needs `(` there), or
   a parenthesized list of bare names followed by `AS` or `ON`. A column definition always has a type
@@ -85,8 +95,9 @@ A column is created for each output column of the query, in order, with:
     parameter — has none.
 
   The typmod is a planning fact carried with each query output column, so the same rule types a
-  derived table, CTE, or view reference's columns for the outer query. An array keeps no element
-  typmod (§5).
+  derived table, CTE, or view reference's columns for the outer query, and a view's own columns
+  report it: `jed_columns` renders a view column's type with it, and `CREATE OR REPLACE VIEW`
+  compares it ([views.md](views.md) §1.2/§11). An array keeps no element typmod (§5).
 - **its collation** (a `text` or `text[]` column) — the collation the output derives
   ([collation.md](collation.md) §1): a column's, an explicit `COLLATE`, a collatable function's or
   operator's propagated one. An output that derives none (a literal, an untyped `NULL`) takes the
@@ -132,6 +143,13 @@ In PostgreSQL's order (parse analysis, then `CreateTableAsRelExists`, then `into
    table. The affected-row count is the number of rows inserted. **`WITH NO DATA`** stops after step
    6: cost `0`, no row count, and the query is never run, so its runtime errors cannot fire.
 
+   A query whose own `WITH` writes (§1) is filled by `WITH <its CTEs> INSERT INTO <db>.<name>
+   <its body>` instead, run by the writable-CTE orchestrator ([writable-cte.md](writable-cte.md)
+   §2–§6): every part reads the pre-statement snapshot — which holds the new, still-empty table — so
+   the body sees a data-modifying CTE's `RETURNING` rows but not its writes; each data-modifying CTE
+   runs exactly once, in list order, referenced or not; and the cost is that statement's. `WITH NO
+   DATA` and an `IF NOT EXISTS` skip run no part of the query, so nothing is written.
+
 The created columns' types equal the query's by construction, so the fill relies on `INSERT …
 SELECT` accepting a source column of exactly a container column's type: an array, range, or
 composite column takes a source column of the same type or an untyped `NULL`, the container rule
@@ -149,6 +167,8 @@ or `allow_temp_ddl` for a temp table), plus — because the query runs — `SELE
 `EXECUTE` on every function the query reads or calls, exactly as the same query would need. `WITH NO
 DATA` never runs the query, so it needs nothing on what the query names (PostgreSQL plans no
 executor for it). The new table needs no `INSERT` privilege to be filled (PostgreSQL 18 checks none).
+A data-modifying CTE (§1) needs its write privilege on its target (session.md §5.3, as in any writable
+`WITH`), again only under `WITH DATA`.
 
 ## 5. Divergences and deferred work
 
@@ -159,19 +179,73 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | A bare integer literal's column (`AS SELECT 1 AS a`) is `i64`; PostgreSQL's is `integer` | a projected integer literal is `i64` in jed ([types.md](types.md) §6) |
 | An array column keeps no element typmod: `ARRAY[name]` over a `varchar(5)`, `ARRAY(SELECT price …)`, and `x::varchar(3)[]` make `text[]` / `decimal[]`; PostgreSQL keeps `varchar(5)[]` | a typmod on an array element is a deferred column form (`0A000`, [array.md](array.md) §12) |
 | A filled `INTERSECT` / `EXCEPT` column whose operands' typmods differ has none; PostgreSQL's planner reports the left operand's (`numeric(10,2)` for `SELECT price … INTERSECT SELECT 1.5`) | jed uses the analysis-level common typmod, PostgreSQL's own answer under `WITH NO DATA` and for `UNION` |
-| A data-modifying `WITH` in the query is `0A000`; PostgreSQL runs it | the query is a nested `subquery_expr`, where a data-modifying CTE is top-level only ([cte.md](cte.md) §7); a follow-on |
 | A missing bound parameter is `42601` (*bind parameter count mismatch*); PostgreSQL's simple protocol says `42P02` | jed's parameter binding, the same for every query (api.md §5) |
 | A query that reads a relation the session may not read is `42501` before the name check, so even a skipped `IF NOT EXISTS` raises it; PostgreSQL checks privileges when the query runs, after the skip | jed authorizes a statement before running any of it ([session.md](session.md) §5.3) |
 | `CREATE TEMP TABLE IF NOT EXISTS p AS …` with a persistent `p` creates nothing; PostgreSQL creates a shadowing `pg_temp.p` | the preclude-overlaps temp namespace (temp-tables.md §3) |
 | A collated column on a temp or attached table is `0A000` | the temp / attachment narrowing of `CREATE TABLE` (temp-tables.md §8, attached-databases.md §8) |
-| `EXPLAIN [ANALYZE] CREATE TABLE … AS` is `42601` | `EXPLAIN` takes a query or DML statement ([explain.md](explain.md) §1) |
+| `CREATE UNLOGGED TABLE` and `SELECT … INTO UNLOGGED` are `0A000`; PostgreSQL creates an unlogged table | every jed table is durable (CLAUDE.md §9); jed has no unlogged storage (§6) |
+| `EXPLAIN ANALYZE CREATE TABLE … AS` in a read-only transaction is `25006`; PostgreSQL 18 runs it and creates the table | EXPLAIN ANALYZE of a write is a write ([explain.md](explain.md) §1); PostgreSQL's plain `CREATE TABLE … AS` is refused there too |
+| `EXPLAIN ANALYZE CREATE TABLE … AS … WITH NO DATA` runs no part of the query; PostgreSQL runs its data-modifying CTEs (its executor starts the plan without fetching a row, then finishes the CTEs) | `WITH NO DATA` never runs the query (§3), and ANALYZE runs the statement as written (§7) |
 
 Deferred follow-ons, none foreclosed:
 
-- a data-modifying `WITH` in the query, run as the statement's own writable `WITH`
-  ([writable-cte.md](writable-cte.md));
-- `SELECT … INTO new_table` (PostgreSQL's older spelling of the same statement);
-- `EXPLAIN [ANALYZE] CREATE TABLE … AS`;
 - array element typmods, when array columns can declare them;
-- view columns reporting the typmods their bodies keep (`jed_columns`, `CREATE OR REPLACE VIEW`'s
-  type comparison — [views.md](views.md) §12), now that query outputs carry them.
+- `LOCAL` / `GLOBAL` before `TEMP` (PostgreSQL's deprecated spellings), absent from `CREATE TABLE`
+  too.
+
+## 6. `SELECT … INTO`
+
+```
+SELECT [ DISTINCT ] select_items INTO [ TEMPORARY | TEMP ] [ TABLE ] [ db . ] name [ FROM … ] …
+```
+
+PostgreSQL's older spelling of `CREATE [TEMP] TABLE name AS <the query without the INTO clause>`: the
+same statement, with the same columns (§2), checks and their order (§3), rows, cost, privileges (§4),
+and result (the inserted row count). The clause has no column list, `ON COMMIT`, `IF NOT EXISTS`, or
+`WITH [NO] DATA` — a taken name is `42P07`. It follows the select list (before `FROM`), as in
+PostgreSQL; anywhere after it is a syntax error.
+
+**Where it may appear.** Only on the statement's **leftmost `SELECT`**: the first `SELECT` of a query
+statement — its first set-operation arm, inside its parentheses, or the primary query of a `WITH`
+(whose CTEs, a data-modifying one included, become the CTAS query's own `WITH`, §1) — or of the
+query `EXPLAIN` takes. Everywhere else it is refused, with PostgreSQL's codes and messages:
+
+| Position | Error |
+|---|---|
+| a later set-operation arm (`SELECT … UNION SELECT … INTO t`), parenthesized or not | `42601` *INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT* |
+| a subquery, derived table, CTE body, `INSERT` source, the query of `CREATE TABLE … AS`, or a `WITH` whose primary is DML | `42601` *SELECT ... INTO is not allowed here* |
+| the leftmost `SELECT` of a `CREATE VIEW` body | `0A000` *views must not contain SELECT INTO* |
+| after a `VALUES` list | `42601` (a syntax error, as in PostgreSQL) |
+
+The parser decides this: the first `select_core` of a query statement owns the clause, and every
+`SELECT` nested in its clauses, in a CTE body, or after a `VALUES` operand does not.
+
+**The target words.** `TEMP` / `TEMPORARY` make the table temporary, and `TABLE` is optional; each is
+a word of the clause unless a `.` follows it, so `INTO temp.t` names the `temp` database. A qualified
+target follows `CREATE TABLE`'s rules (`main.`, `temp.`, an attachment; `INTO TEMP main.t` is
+`42601`). `UNLOGGED` is recognized and refused `0A000` *unlogged tables are not supported*, as is
+`CREATE UNLOGGED TABLE` (§5): every jed table is durable.
+
+## 7. `EXPLAIN [ANALYZE] CREATE TABLE … AS`
+
+`EXPLAIN` accepts a `CREATE [TEMP] TABLE … AS` (and so a `SELECT … INTO`) as its statement; the
+column-definition form of `CREATE TABLE` stays `42601` ([explain.md](explain.md) §1). It renders the
+plan of the **query the statement runs**, exactly as `EXPLAIN` of that query statement renders it —
+the same nodes, estimates, and details, and for a data-modifying `WITH` (§1) the complete `WITH` tree
+([explain.md](explain.md) §6). PostgreSQL renders the query's plan the same way, with no node of its
+own for the table.
+
+Before rendering, the checks `CREATE TABLE … AS` makes before anything exists run in its order (§3
+steps 1–4): the privileges, the target database and the `jed_` reservation, the query's analysis and
+its parameters, then the name — `42P07`, or under `IF NOT EXISTS` a taken name renders **no plan
+rows** (PostgreSQL's empty plan and notice). Plain `EXPLAIN` stops there: it creates nothing, is a
+read (so it runs in a read-only transaction), and the column checks of §3 step 5 (`42P22`, `42601`,
+`42P16`, `42701`, the column types) do not run — PostgreSQL makes them only when the table is
+defined.
+
+`EXPLAIN ANALYZE` runs the statement: it creates and fills the table (a write, committed by an
+autocommit invocation), and its `Analyze` root reports the statement's cost and inserted row count
+([explain.md](explain.md) §3), with every rendered node's `actual_cost` attributed from that run — the
+fill is the query's own execution, so the attribution is that of `EXPLAIN ANALYZE` of the query.
+Under `WITH NO DATA` it creates the empty table and runs nothing of the query: cost `0`, rows `0`,
+and every `actual_cost` `0`. The `LANE` tag is `buffered`, the lane of every write.

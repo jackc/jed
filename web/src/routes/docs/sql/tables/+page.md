@@ -111,8 +111,30 @@ CREATE TABLE account_shape AS SELECT * FROM account WITH NO DATA;   -- same colu
 
 The query is checked before the table name, so `CREATE TABLE IF NOT EXISTS … AS` still reports an
 error in the query even when the table exists. A query that reads tables needs the `SELECT`
-privilege on them, unless `WITH NO DATA` is used. A data-modifying `WITH` in the query is not
-supported yet (`0A000`). See [temporary tables](../temp-tables/) for `CREATE TEMP TABLE … AS`.
+privilege on them, unless `WITH NO DATA` is used. See [temporary tables](../temp-tables/) for
+`CREATE TEMP TABLE … AS`.
+
+The query's `WITH` may change data, as in PostgreSQL. Its `INSERT`, `UPDATE`, or `DELETE` runs once,
+and its `RETURNING` rows can fill the new table. The rest of the query does not see those changes,
+only the returned rows:
+
+```sql
+CREATE TABLE closed AS
+  WITH d AS (DELETE FROM txn WHERE amount < 20 RETURNING *) SELECT * FROM d;
+```
+
+`SELECT … INTO` is PostgreSQL's older way to write the same statement. The `INTO` clause goes after
+the select list, and `TEMP` makes a temporary table:
+
+```sql
+SELECT owner, balance INTO rich FROM account WHERE balance > 60;
+SELECT id INTO TEMP recent FROM txn;
+```
+
+Only the first `SELECT` of a statement can have `INTO`. In a subquery, a `WITH` query, or a later
+`UNION` branch it is error `42601`, and in a view it is error `0A000`. jed has no unlogged tables, so
+`INTO UNLOGGED` and `CREATE UNLOGGED TABLE` are error `0A000`. `EXPLAIN CREATE TABLE … AS` shows the
+plan of the query; see [EXPLAIN](../explain/).
 
 ## Names and quoted identifiers
 

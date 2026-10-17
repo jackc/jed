@@ -7,7 +7,8 @@
 // executor.ts; this file holds the column derivation. Mirrors impl/rust/src/executor/create_table_as.rs
 // and impl/go create_table_as.go.
 
-import type { CreateTable, CreateTableAs } from "./ast.ts";
+import type { CreateTable, CreateTableAs, QueryExpr, Statement, WithExpr } from "./ast.ts";
+import { cteBodyIsDataModifying } from "./ast.ts";
 import type { Column } from "./catalog.ts";
 import { engineError } from "./errors.ts";
 import {
@@ -134,4 +135,17 @@ function ctasColumnType(name: string, rt: ResolvedType): Type {
     );
   }
   return ty;
+}
+
+// withIsDataModifying reports whether a `CREATE TABLE … AS` query's own WITH holds a data-modifying
+// CTE (create-table-as.md §1), which makes it the statement's writable WITH.
+export function withIsDataModifying(w: WithExpr): boolean {
+  return w.ctes.some((c) => cteBodyIsDataModifying(c.body));
+}
+
+// ctasQueryStatement is the query statement a `CREATE TABLE … AS` runs (create-table-as.md §7): its
+// query as a top-level SELECT, set operation, or WITH — what `EXPLAIN CREATE TABLE … AS` renders.
+export function ctasQueryStatement(query: QueryExpr): Statement {
+  if (query.kind !== "withExpr") return query;
+  return { kind: "with", ctes: query.ctes, body: query.body, recursive: query.recursive };
 }

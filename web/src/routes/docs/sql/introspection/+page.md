@@ -48,8 +48,9 @@ Nine relations ship today:
   text — an expression default in its stored canonical form, such as `uuidv7 ( )`, or a constant
   as a literal of its stored value, such as `1.50` or `'draft'`; `NULL` for no default), and
   `identity_generation` (`ALWAYS` or `BY DEFAULT` for an identity column, `NULL` otherwise). A view
-  column's `type` is the type a query over the view produces, so it carries no length or precision
-  (`text`, not `varchar(80)`); a view column is never `not_null`, keyed, or defaulted. Views
+  column's `type` is the type a query over the view produces: a column read straight from a table
+  keeps its length or precision (`varchar(80)`), and a computed one has none (`text`); a view column
+  is never `not_null`, keyed, defaulted, or an identity. Views
   in attached databases are not listed.
 - **`jed_indexes`** — one row per secondary index: `name`, `table_name`, `columns` (a `text[]` of
   the indexed column names in key order), `is_unique`, and `method` (`btree` / `gin` / `gist`).

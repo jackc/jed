@@ -89,6 +89,30 @@ type parser struct {
 	// furthest is the furthest token index the parse has examined through peek / advance — the token
 	// a parse error is positioned at (spec/design/error-fields.md §10.3).
 	furthest int
+	// intoOK is whether the next parseSelectCore is the leftmost SELECT of the statement's own query,
+	// the one place a `SELECT … INTO` clause may appear (spec/design/create-table-as.md §6). Set for
+	// a query statement (and a CREATE VIEW body, which refuses it); the first parseSelectCore takes
+	// it, so every later or nested one sees false.
+	intoOK bool
+	// intoTop is whether the statement's own query is being parsed (a query statement or a CREATE
+	// VIEW body), so an INTO on a later set-operation arm is "only allowed on first SELECT" rather
+	// than "not allowed here".
+	intoTop bool
+	// intoView is whether the query is a CREATE VIEW body: its leftmost INTO is 0A000.
+	intoView bool
+	// intoNest is how many query constructs (a SELECT's clauses, a CTE body) enclose the cursor
+	// within the statement's own query: an INTO at depth 0 is on a set-operation arm.
+	intoNest int
+	// selectInto is the INTO target the leftmost SELECT named, taken by the statement-level caller.
+	selectInto *selectIntoTarget
+}
+
+// selectIntoTarget is the target of a `SELECT … INTO [TEMP | TEMPORARY] [TABLE] [db.]name`
+// (spec/design/create-table-as.md §6).
+type selectIntoTarget struct {
+	temp bool
+	db   *string
+	name string
 }
 
 // NewParser builds a parser over the given tokens of stored text: no source positions are recorded
@@ -322,14 +346,14 @@ func (p *parser) parseStatement() (statement, error) {
 		}
 		return statement{Insert: ins}, nil
 	case "select":
-		return p.parseQueryExpr()
+		return p.parseIntoQuery(p.parseQueryExpr)
 	// A top-level VALUES query (grammar.md §25): `VALUES (…), (…) [ORDER BY …]`.
 	case "values":
-		return p.parseQueryExpr()
+		return p.parseIntoQuery(p.parseQueryExpr)
 	// `WITH …` at statement start can only begin a query with common table expressions
 	// (spec/design/cte.md). `with` is non-reserved but unambiguous here.
 	case "with":
-		return p.parseWithStatement()
+		return p.parseIntoQuery(p.parseWithStatement)
 	case "update":
 		upd, err := p.parseUpdate()
 		if err != nil {
@@ -367,12 +391,87 @@ func (p *parser) parseStatement() (statement, error) {
 	case "":
 		// A leading `(` can only begin a parenthesized query (grammar.md §25).
 		if p.peek().Kind == tokLParen {
-			return p.parseQueryExpr()
+			return p.parseIntoQuery(p.parseQueryExpr)
 		}
 		return statement{}, newError(SyntaxError, "expected a SQL statement")
 	default:
 		return statement{}, newError(SyntaxError, fmt.Sprintf("unexpected keyword '%s'", p.peekKeyword()))
 	}
+}
+
+// parseIntoQuery parses a query statement whose leftmost SELECT may carry INTO
+// (spec/design/create-table-as.md §6). A query with an INTO target is the statement
+// `CREATE [TEMP] TABLE target AS query`.
+func (p *parser) parseIntoQuery(parse func() (statement, error)) (statement, error) {
+	p.intoOK, p.intoTop = true, true
+	stmt, err := parse()
+	if err != nil {
+		return statement{}, err
+	}
+	p.intoOK, p.intoTop = false, false
+	into := p.selectInto
+	if into == nil {
+		return stmt, nil
+	}
+	p.selectInto = nil
+	var query queryExpr
+	switch {
+	case stmt.Select != nil:
+		query = queryExpr{Select: stmt.Select}
+	case stmt.SetOp != nil:
+		query = queryExpr{SetOp: stmt.SetOp}
+	case stmt.With != nil && stmt.With.Body.Query != nil:
+		query = queryExpr{With: &withExpr{Ctes: stmt.With.Ctes, Recursive: stmt.With.Recursive, Body: stmt.With.Body.Query}}
+	default:
+		return statement{}, newError(SyntaxError, "SELECT ... INTO is not allowed here")
+	}
+	return statement{CreateTable: &createTable{
+		Name: into.name, Temp: into.temp, DB: into.db,
+		AsQuery: &createTableAs{Query: query, WithData: true},
+	}}, nil
+}
+
+// parseSelectInto parses the `INTO [TEMPORARY | TEMP] [TABLE] [db.]name` of a `SELECT … INTO`, after
+// its select list (spec/design/create-table-as.md §6). owner is whether this SELECT is the statement's
+// leftmost one. Anywhere else the clause is 42601 — on a later set-operation arm "INTO is only allowed
+// on first SELECT", in a subquery, CTE body, or another statement's query "not allowed here" — and in
+// a CREATE VIEW body 0A000, as in PostgreSQL. TEMP, TEMPORARY, UNLOGGED, and TABLE are words of the
+// clause unless a `.` follows (a database qualifier).
+func (p *parser) parseSelectInto(owner bool) error {
+	p.advance() // INTO
+	if !owner {
+		msg := "SELECT ... INTO is not allowed here"
+		if p.intoTop && p.intoNest == 1 {
+			msg = "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT"
+		}
+		return newError(SyntaxError, msg)
+	}
+	if p.intoView {
+		return newError(FeatureNotSupported, "views must not contain SELECT INTO")
+	}
+	word := func(w string) bool { return p.peekKeyword() == w && p.peekKindAt(1) != tokDot }
+	temp := word("temp") || word("temporary")
+	if temp {
+		p.advance()
+	} else if word("unlogged") {
+		return unloggedNotSupported()
+	}
+	if word("table") {
+		p.advance()
+	}
+	db, name, err := p.parseQualifiedTableName()
+	if err != nil {
+		return err
+	}
+	p.selectInto = &selectIntoTarget{temp: temp, db: db, name: name}
+	return nil
+}
+
+// unloggedNotSupported is the error for `CREATE UNLOGGED TABLE` and `SELECT … INTO UNLOGGED`
+// (create-table-as.md §6): jed has no unlogged tables — every table is durable (CLAUDE.md §9) — so
+// the form is recognized and refused.
+func unloggedNotSupported() error {
+	return newError(FeatureNotSupported, "unlogged tables are not supported")
 }
 
 // atDeferredCreateView reports whether the statement is one of the deferred `CREATE … VIEW` forms
@@ -461,9 +560,12 @@ func (p *parser) parseCreateView() (*createView, error) {
 		p.tokens[checkAt] = token{Kind: tokEof}
 	}
 	start := p.pos
+	// The body's leftmost SELECT may not take INTO (0A000, create-table-as.md §6).
+	p.intoOK, p.intoTop, p.intoView = true, true, true
 	if _, err := p.parseSubquery(); err != nil {
 		return nil, err
 	}
+	p.intoOK, p.intoTop, p.intoView = false, false, false
 	end := p.pos
 	if checkAt >= 0 && end != checkAt {
 		return nil, newError(SyntaxError, "unexpected trailing input")
@@ -789,9 +891,9 @@ func (p *parser) parseExplain() (statement, error) {
 func (p *parser) parseExplainInner() (statement, error) {
 	switch p.peekKeyword() {
 	case "select", "values":
-		return p.parseQueryExpr()
+		return p.parseIntoQuery(p.parseQueryExpr)
 	case "with":
-		return p.parseWithStatement()
+		return p.parseIntoQuery(p.parseWithStatement)
 	case "insert":
 		ins, err := p.parseInsert()
 		if err != nil {
@@ -810,9 +912,23 @@ func (p *parser) parseExplainInner() (statement, error) {
 			return statement{}, err
 		}
 		return statement{Delete: del}, nil
+	// `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no plan
+	// to render.
+	case "create":
+		if p.atCreateView() {
+			return statement{}, newError(SyntaxError, "EXPLAIN does not support 'create'")
+		}
+		ct, err := p.parseCreateTable()
+		if err != nil {
+			return statement{}, err
+		}
+		if ct.AsQuery == nil {
+			return statement{}, newError(SyntaxError, "EXPLAIN does not support CREATE TABLE without AS")
+		}
+		return statement{CreateTable: ct}, nil
 	case "":
 		if p.peek().Kind == tokLParen {
-			return p.parseQueryExpr()
+			return p.parseIntoQuery(p.parseQueryExpr)
 		}
 		return statement{}, newError(SyntaxError, "expected a statement after EXPLAIN")
 	default:
@@ -838,6 +954,8 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 	temp := p.peekKeyword() == "temp" || p.peekKeyword() == "temporary"
 	if temp {
 		p.advance()
+	} else if p.peekKeyword() == "unlogged" {
+		return nil, unloggedNotSupported()
 	}
 	if err := p.expectKeyword("table"); err != nil {
 		return nil, err
@@ -3476,7 +3594,12 @@ func (p *parser) parseWithStatement() (statement, error) {
 		}
 	}
 	// The primary may be a data-modifying statement (spec/design/writable-cte.md): a leading
-	// INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr.
+	// INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr. A data-modifying
+	// primary's SELECT is another statement's query, where INTO is not allowed.
+	switch p.peekKeyword() {
+	case "insert", "update", "delete":
+		p.intoOK, p.intoTop = false, false
+	}
 	body, err := p.parseCteBody(false)
 	if err != nil {
 		return statement{}, err
@@ -3586,10 +3709,16 @@ func (p *parser) parseCte() (cte, error) {
 	if err := p.expect(tokLParen); err != nil {
 		return cte{}, err
 	}
+	// A CTE body's SELECT never takes the statement's INTO (create-table-as.md §6).
+	intoOK := p.intoOK
+	p.intoOK = false
+	p.intoNest++
 	body, err := p.parseCteBody(true)
 	if err != nil {
 		return cte{}, err
 	}
+	p.intoNest--
+	p.intoOK = intoOK
 	if err := p.expect(tokRParen); err != nil {
 		return cte{}, err
 	}
@@ -3882,6 +4011,8 @@ func (p *parser) parseSetOperand() (queryExpr, error) {
 		return q, nil
 	}
 	if p.peekKeyword() == "values" {
+		// A VALUES operand is no SELECT, so a later arm cannot take the statement's INTO.
+		p.intoOK = false
 		rows, err := p.parseValuesBody()
 		if err != nil {
 			return queryExpr{}, err
@@ -4026,9 +4157,19 @@ func (p *parser) parseSelectCore() (*selectStmt, error) {
 		}
 	}
 
+	// Only the statement's leftmost SELECT may take an INTO (create-table-as.md §6), so this one owns
+	// it and every SELECT nested in its clauses does not.
+	owner := p.intoOK
+	p.intoOK = false
+	p.intoNest++
 	items, err := p.parseSelectItems()
 	if err != nil {
 		return nil, err
+	}
+	if p.peekKeyword() == "into" {
+		if err := p.parseSelectInto(owner); err != nil {
+			return nil, err
+		}
 	}
 	var from *tableRef
 	var joins []joinClause
@@ -4061,6 +4202,7 @@ func (p *parser) parseSelectCore() (*selectStmt, error) {
 	if err := p.parseWindowClause(sel); err != nil {
 		return nil, err
 	}
+	p.intoNest--
 
 	return sel, nil
 }

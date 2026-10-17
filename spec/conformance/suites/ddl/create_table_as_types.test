@@ -7,7 +7,7 @@
 # EXCEPT column where the operands disagree; jed uses the operands' common typmod, PostgreSQL's own
 # WITH NO DATA answer. jed_columns is jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-
 # checked; ddl/create_table_as.test observes the same typmods through PostgreSQL-checked behavior.
-# requires: ddl.create_table_as, introspect.columns, ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.union, query.intersect, query.except, query.values_query, query.join_left, query.join_using, query.subquery_scalar, query.window, query.aggregates, expr.coalesce, expr.arithmetic, cast.explicit, types.i32, types.i64, types.decimal, types.text, types.varchar_length, types.array, types.range, types.composite
+# requires: ddl.create_table_as, introspect.columns, ddl.view, ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.union, query.intersect, query.except, query.values_query, query.join_left, query.join_using, query.subquery_scalar, query.window, query.aggregates, expr.coalesce, expr.arithmetic, cast.explicit, types.i32, types.i64, types.decimal, types.text, types.varchar_length, types.array, types.range, types.composite
 
 statement ok
 CREATE TYPE pt AS (label varchar(4), x decimal(6,2))
@@ -213,3 +213,52 @@ query I nosort
 SELECT count(*) FROM c10
 ----
 0
+
+# --- a view's columns report the typmods its body keeps, through a view over a view, and a CREATE
+# TABLE … AS from the view keeps them (introspection.md §5, views.md §11) ---------------------------
+
+statement ok
+CREATE VIEW vt1 AS SELECT price, name, price * 2 AS twice FROM src
+
+statement ok
+CREATE VIEW vt2 AS SELECT name, price, twice, name::varchar(2) AS short FROM vt1
+
+query TTT nosort
+SELECT table_name, name, type FROM jed_columns WHERE table_name IN ('vt1', 'vt2') ORDER BY table_name, ordinal
+----
+vt1
+price
+decimal(10,2)
+vt1
+name
+varchar(5)
+vt1
+twice
+decimal
+vt2
+name
+varchar(5)
+vt2
+price
+decimal(10,2)
+vt2
+twice
+decimal
+vt2
+short
+varchar(2)
+
+statement ok
+CREATE TABLE c11 AS SELECT * FROM vt2
+
+query TT nosort
+SELECT name, type FROM jed_columns WHERE table_name = 'c11' ORDER BY ordinal
+----
+name
+varchar(5)
+price
+decimal(10,2)
+twice
+decimal
+short
+varchar(2)

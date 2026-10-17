@@ -3726,7 +3726,17 @@ is cut off before the query is parsed, the CREATE VIEW check-option precedent (�
 unreserved `with` after a `FROM` item would otherwise read as its alias — `AS SELECT … FROM t AS
 "with" WITH NO DATA` still parses. Any other trailing word is `42601`. The query's `$N` placeholders
 bind as a query's do (create-table-as.md §1); PostgreSQL's `AS TABLE name` / `AS EXECUTE name` forms
-are absent.
+are absent. The query's own `WITH` may hold a data-modifying CTE, which makes it the statement's
+writable `WITH` (create-table-as.md §1).
+
+`SELECT … INTO [TEMP | TEMPORARY] [TABLE] [db.]name` (`into_clause` after a `select_core`'s select
+items) is the same statement spelled PostgreSQL's older way (create-table-as.md §6). Only the
+statement's leftmost `SELECT` may carry it — elsewhere `42601` (*INTO is only allowed on first
+SELECT of UNION/INTERSECT/EXCEPT* on a later set-operation arm, *SELECT ... INTO is not allowed
+here* in any nested query), and `0A000` in a `CREATE VIEW` body. `INTO` is a bare-label stop word
+(§8), so after an expression it always begins the clause. `UNLOGGED` (here and in `CREATE UNLOGGED
+TABLE`) is `0A000`. `EXPLAIN` accepts `CREATE TABLE … AS` and `SELECT … INTO` (create-table-as.md
+§7).
 
 ## 58. `NULLIF`
 

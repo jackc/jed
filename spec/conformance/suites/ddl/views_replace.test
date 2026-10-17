@@ -3,8 +3,8 @@
 # views that read it keep working and see the new definition. Incompatible columns are 42P16 in
 # PostgreSQL's order (fewer columns, then per column name, type, collation); a non-view name is
 # 42809; body errors come first. Every record is PostgreSQL-oracle-checked; the jed-only behavior
-# (capture refusal, the cycle check, typmods) is in views_jed.test.
-# requires: ddl.view, ddl.view_replace, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.sequence, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.qualified_column, cast.operator, query.derived_table, types.i32, types.i64, types.text
+# (capture refusal, the cycle check, an unbounded varchar replacing text) is in views_jed.test.
+# requires: ddl.view, ddl.view_replace, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.sequence, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.qualified_column, cast.operator, query.derived_table, types.i32, types.i64, types.text, types.decimal, types.varchar_length
 
 statement ok
 CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32)
@@ -255,3 +255,43 @@ DROP SEQUENCE s
 
 statement ok
 DROP TABLE t
+
+# --- a column's type includes the typmod its body keeps (create-table-as.md §2) ------------------------
+
+statement ok
+CREATE TABLE tm (k i32 PRIMARY KEY, d varchar(3), n decimal(5,2))
+
+statement ok
+CREATE VIEW vtm AS SELECT d, n FROM tm
+
+statement error 42P16
+CREATE OR REPLACE VIEW vtm AS SELECT d::varchar(4) AS d, n FROM tm
+
+statement error 42P16
+CREATE OR REPLACE VIEW vtm AS SELECT d, n::decimal(6,2) AS n FROM tm
+
+statement error 42P16
+CREATE OR REPLACE VIEW vtm AS SELECT d::text AS d, n FROM tm
+
+statement error 42P16
+CREATE OR REPLACE VIEW vtm AS SELECT d, n::decimal AS n FROM tm
+
+# the same typmods, through casts, and an appended column
+statement ok
+CREATE OR REPLACE VIEW vtm AS SELECT d::varchar(3) AS d, n::decimal(5,2) AS n, k FROM tm
+
+statement ok
+INSERT INTO tm VALUES (1, 'abc', 1.5)
+
+query TDI nosort
+SELECT * FROM vtm
+----
+abc
+1.50
+1
+
+statement ok
+DROP VIEW vtm
+
+statement ok
+DROP TABLE tm

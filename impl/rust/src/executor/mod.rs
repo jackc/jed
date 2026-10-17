@@ -618,8 +618,8 @@ pub struct Engine {
     pub(crate) unseen_frames: std::cell::RefCell<Vec<UnseenFrame>>,
 }
 
-/// A view body's output columns: names, types, and collation derivations.
-pub(crate) type ViewColumns = (Vec<String>, Vec<ResolvedType>, Vec<Deriv>);
+/// A view body's output columns: names, types, collation derivations, and typmods.
+pub(crate) type ViewColumns = (Vec<String>, Vec<ResolvedType>, Vec<Deriv>, Vec<Typmod>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ActualCostKey {

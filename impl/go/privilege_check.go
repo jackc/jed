@@ -550,6 +550,13 @@ func (db *engine) collectCatalogExprPrivs(stmt statement, req *privReq) {
 	if stmt.Explain != nil {
 		db.collectCatalogExprPrivs(*stmt.Explain.Inner, req)
 	}
+	// A CREATE TABLE … AS whose own WITH writes (create-table-as.md §1) runs those writes, unless
+	// WITH NO DATA never runs the query.
+	if ct := stmt.CreateTable; ct != nil && ct.AsQuery != nil && ct.AsQuery.WithData && ct.AsQuery.Query.With != nil {
+		for i := range ct.AsQuery.Query.With.Ctes {
+			db.collectCteCatalogPrivs(&ct.AsQuery.Query.With.Ctes[i].Body, req)
+		}
+	}
 }
 
 func (db *engine) collectCteCatalogPrivs(body *cteBody, req *privReq) {

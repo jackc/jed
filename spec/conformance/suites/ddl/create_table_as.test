@@ -556,6 +556,7 @@ CREATE TABLE bad AS SELECT 1 WITH
 statement error 42601
 CREATE TABLE bad AS SELECT 1 WITH SOME DATA
 
-# a data-modifying WITH in the query is not supported yet (create-table-as.md §5); PostgreSQL runs it
+# a data-modifying WITH nested below the query's own WITH is 0A000, as in PostgreSQL (the query's
+# own data-modifying WITH is ddl/create_table_as_writable_with.test)
 statement error 0A000
-CREATE TABLE bad AS WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id) SELECT id FROM d
+CREATE TABLE bad AS SELECT * FROM (WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id) SELECT id FROM d) s

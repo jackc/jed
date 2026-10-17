@@ -356,3 +356,8 @@ uncorrelated expression subquery is included at its containing visible operator 
 Plain EXPLAIN also supports a data-modifying `WITH`: every `CTE <name>` definition and its complete
 write subtree are displayed in authored order, followed by the primary query or DML subtree, without
 running any of them.
+
+`EXPLAIN CREATE TABLE … AS` (and `EXPLAIN SELECT … INTO`) shows the plan of the statement's query, as
+in PostgreSQL. Plain `EXPLAIN` creates nothing. It still checks the query and the table name, and
+with `IF NOT EXISTS` an existing table gives an empty plan. `EXPLAIN ANALYZE` creates and fills the
+table, and its `Analyze` node reports the statement's cost and the number of rows inserted.

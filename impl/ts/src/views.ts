@@ -20,6 +20,9 @@
 import type { TableRef, TableRefPos } from "./ast.ts";
 import type { Table, ViewDef, ViewDep, ViewDepKind } from "./catalog.ts";
 import { type EngineError, engineError } from "./errors.ts";
+import type { ResolvedType } from "./executor.ts";
+import type { Typmod } from "./resolve.ts";
+import { rtName } from "./scope.ts";
 import { lex } from "./lexer.ts";
 import { renderTokens } from "./parser.ts";
 import type { Token } from "./token.ts";
@@ -91,6 +94,19 @@ export function renamedBaseTable(table: Table, tref: TableRef, list: string[]): 
     ...table,
     columns: table.columns.map((c, i) => (i < list.length ? { ...c, name: list[i]! } : c)),
   };
+}
+
+// viewColumnTypeText is the type text of a view output column (introspection.md §5, views.md §1.2):
+// the result type with the typmod the column keeps applied at a scalar leaf (`varchar(3)`,
+// `decimal(5,2)`), and an untyped NULL as text. An array keeps no element typmod
+// (create-table-as.md §5).
+export function viewColumnTypeText(t: ResolvedType, tm: Typmod): string {
+  if (t.kind === "null") return "text";
+  if (t.kind === "text" && tm.varcharLen !== null) return `varchar(${tm.varcharLen})`;
+  if (t.kind === "decimal" && tm.decimal !== null) {
+    return `decimal(${tm.decimal.precision},${tm.decimal.scale})`;
+  }
+  return rtName(t);
 }
 
 // viewOutputNames is the view's output column names (views.md §1): the column list applied over the

@@ -3,7 +3,7 @@
 # Views — the jed-specific behavior of spec/design/views.md that PostgreSQL cannot oracle-check:
 # the IF NOT EXISTS extension, the jed_ reservation, 0A000 for the deferred forms, temp scope,
 # untracked dependencies, a rolled-back CASCADE, re-validation after ALTER TABLE, CREATE OR REPLACE
-# VIEW, and ALTER VIEW (§8), the cycle check and typmod rule of OR REPLACE (§1.2), the session
+# VIEW, and ALTER VIEW (§8), the cycle check and the unbounded-varchar rule of OR REPLACE (§1.2), the session
 # privilege envelope (§9), and transactions.
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # requires: ddl.view, ddl.view_cascade, dml.view_write, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, types.decimal, types.varchar_length, types.composite, cast.operator, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
@@ -471,19 +471,18 @@ DROP VIEW rcte, rv2, ramb, rcap, rv8
 statement ok
 DROP TABLE p2, q2
 
-# --- typmods are not part of a view column's type (PostgreSQL refuses these with 42P16) -----------
+# --- a view column's type includes its typmod (views_replace.test), but jed's varchar is text with a
+# length typmod, so an unbounded varchar replaces a text column (PostgreSQL refuses: they are two
+# types there) ---------------------------------------------------------------------------------------
 
 statement ok
-CREATE TABLE tm (k i32 PRIMARY KEY, d varchar(3), n decimal(5,2))
+CREATE TABLE tm (k i32 PRIMARY KEY, d text, n decimal(5,2))
 
 statement ok
 CREATE VIEW vtm AS SELECT d, n FROM tm
 
 statement ok
-CREATE OR REPLACE VIEW vtm AS SELECT d::varchar(4) AS d, n::decimal(6,2) AS n FROM tm
-
-statement ok
-CREATE OR REPLACE VIEW vtm AS SELECT d::text AS d, n FROM tm
+CREATE OR REPLACE VIEW vtm AS SELECT d::varchar AS d, n FROM tm
 
 statement error 42P16
 CREATE OR REPLACE VIEW vtm AS SELECT d, n::i64 AS n FROM tm
