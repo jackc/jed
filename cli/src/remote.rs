@@ -1,4 +1,4 @@
-//! Remote databases over SSH (spec/design/cli.md §8; spec/pageservice/README.md §5.4).
+//! Remote databases over SSH (spec/design/cli.md §3; spec/pageservice/README.md §5.3).
 //!
 //! - `jed ssh://[user@]host[:port]/path` opens the database at `path` on `host` as a page client:
 //!   the CLI runs `ssh [-p port] [user@]host jed pages /path`, and that process's stdin and stdout
@@ -140,7 +140,7 @@ Serve one page-service connection for DBFILE on stdin/stdout: the remote end of
 DBFILE, or owns DBFILE itself (handing ownership to an application that asks).
   --read-only   refuse writes on the connection, whatever the client asks";
 
-/// `jed pages …` (cli.md §8). Exit status 0 when the connection ended, 1 on a usage error or when
+/// `jed pages …` (cli.md §3). Exit status 0 when the connection ended, 1 on a usage error or when
 /// the database could not be served (the client was told why on the stream).
 pub fn pages(argv: &[String]) -> u8 {
     let mut read_only = false;

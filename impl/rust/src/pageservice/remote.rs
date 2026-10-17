@@ -1,4 +1,4 @@
-//! The stream transport (spec/design/page-service.md §2, §13; spec/pageservice/README.md §5.4): the
+//! The stream transport (spec/design/page-service.md §2, §13; spec/pageservice/README.md §5.3): the
 //! same protocol over a pair of pipes instead of a local socket, which is how a client on another
 //! machine reaches an owner over SSH.
 //!
@@ -287,7 +287,7 @@ fn send_fatal(output: &mut dyn Write, request_id: u32, error: &EngineError) {
 }
 
 /// Serve one page-service connection arriving on `input`/`output` for the database at `path`: the
-/// `jed pages` command (spec/pageservice/README.md §5.4). `read_only` makes the connection
+/// `jed pages` command (spec/pageservice/README.md §5.3). `read_only` makes the connection
 /// read-only whatever the client asks. Returns when the connection ends.
 ///
 /// The first frame must be `hello`. When the database has a live serving owner the stream is relayed

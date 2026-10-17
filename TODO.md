@@ -651,8 +651,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       disk faults kill the owner, `disconnect` steps and frame faults, the commit-role oracle, owner
       maintenance commits in the history; the `service` profile, a regression trace, and the
       `client-reclaims` plant.
-  - [ ] **Phase 5 — SSH.** `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead
-    and subtree fetch.
+  - [x] **Phase 5 — SSH.** ✅ **landed** (Rust and the CLI): the stream transport
+    (`Database::open_remote` over a transport command's stdio; `Database::serve_page_stream`, run by
+    `jed pages [--read-only] DBFILE`, relaying to the live owner or owning as a `yield` owner), the CLI
+    opening `ssh://[user@]host[:port]/path` through the system `ssh`, and client-side read-ahead /
+    subtree fetch over the unchanged `read_pages` for stream clients (spec/pageservice/README.md §5.3,
+    page-service.md §5.3, cli.md §3). No wire change. Proven by `service_stream.process.toml` (a Rust
+    stream client against owners of every core), Rust host-API tests, and CLI e2e tests with a fake
+    `ssh`; `bench:page_service` adds `stream_cold_scan` with and without read-ahead.
+    - [ ] **Decide: configuring the remote binary and the ssh command** (maintainer). Today the CLI runs
+      `ssh` from `PATH` and `jed` from the remote `PATH`, with no option for either (an environment
+      variable, a flag, or a URL query are the candidates).
+    - [ ] **Go / TS stream clients**, when a program needs remote access from them (page-service.md §14);
+      a transport, not a protocol, change. Read-ahead would then be ported with them.
   - [x] **Phase 6 — backup.** ✅ **landed** (Rust, Go, TS). Page-identical and compacted forms — jed's
     answer to SQLite's `sqlite3_backup` / `VACUUM INTO`, locally as well as over SSH. A backup pins one
     committed snapshot like a reader (never the writer gate) and walks it with its own engine in every

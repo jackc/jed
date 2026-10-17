@@ -1782,6 +1782,11 @@ timed loop returns a checksum; the run fails if any engine or pairing disagrees.
 | `client_cold_scan` / `client_cold_lookup` | a freshly opened page client's first reads: every leaf it touches is fetched with `read_pages` |
 | `client_warm_scan` / `client_warm_lookup` | the same reads with the client's buffer pool warm: one `begin_read` round trip per query |
 | `client_commit` | the same single-row durable commits run by a page client: `begin_write`, the `CommitDelta`, and the owner's validation, write, and barrier. Compare `owner_commit`. Commit lanes run after every pairing's reads, since they change the rows |
+| `stream_cold_scan` / `stream_cold_scan_no_read_ahead` | a Rust page client over the stream transport (what `jed ssh://` runs), its transport the actor serving `pages` and relaying to the owner, with every client request held `JED_PS_BENCH_LATENCY_US` (default 500 µs) as a network round trip: the first scan with read-ahead (page-service.md §5.3), and the same scan with read-ahead off |
+
+At 50 000 rows and 500 µs (Linux, release builds, 2026-10-17) the stream cold scan took 44 ms with
+read-ahead and 418 ms without against a Rust owner (49 ms and 436 ms against a Go owner); the
+local-socket cold scan, which does not read ahead, took 42 ms.
 
 It is a wall-clock benchmark outside `mise run ci` (§10); results go to
 `bench/results/page-service-<stamp>.jsonl`. The before/after check that the page-service hooks cost the

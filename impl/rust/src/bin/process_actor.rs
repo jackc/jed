@@ -25,7 +25,7 @@ fn run() -> Result<(), EngineError> {
         return owner_idle(&path);
     }
     if action == "pages" || action == "pages-read-only" {
-        // The serving side of the stream transport (spec/pageservice/README.md §5.4), as `jed pages`:
+        // The serving side of the stream transport (spec/pageservice/README.md §5.3), as `jed pages`:
         // the actor's stdin/stdout are one page-service connection.
         // An optional third argument delays every client request by that many microseconds, a
         // network round trip for the page-service benchmark's stream lanes.
@@ -34,7 +34,10 @@ fn run() -> Result<(), EngineError> {
         let input: Box<dyn io::Read + Send> = if latency_us == 0 {
             Box::new(io::stdin())
         } else {
-            Box::new(Delayed(io::stdin(), std::time::Duration::from_micros(latency_us)))
+            Box::new(Delayed(
+                io::stdin(),
+                std::time::Duration::from_micros(latency_us),
+            ))
         };
         #[cfg(unix)]
         if let Err(error) = Database::serve_page_stream(

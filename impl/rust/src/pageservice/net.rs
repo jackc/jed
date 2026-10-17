@@ -70,7 +70,7 @@ pub(crate) fn dial_unix(endpoint: &str) -> std::io::Result<Box<dyn PsStream>> {
 }
 
 /// A page-service connection over a pair of byte pipes: a child process's stdio on the client side
-/// (the SSH transport, spec/pageservice/README.md §5.4), this process's stdin/stdout on the
+/// (the SSH transport, spec/pageservice/README.md §5.3), this process's stdin/stdout on the
 /// `jed pages` side. A pump thread moves the input pipe into a buffer, so [`close_both`] wakes a
 /// blocked reader at once even though a pipe read cannot be interrupted. Each `write` writes and
 /// flushes the whole buffer, so a frame written with one `write_all` leaves the process whole.

@@ -96,6 +96,29 @@ Node uses a small first-party native helper solely for OS file locks because Nod
 builds do not load the helper. A missing platform artifact fails closed instead of using PID or mtime
 leases.
 
+## Opening a database on another machine
+
+The same page service runs over SSH, with no server to install and no port to open. The `jed` CLI
+opens `ssh://[user@]host[:port]/path`:
+
+```sh
+jed ssh://app@db1/srv/app.jed -c "SELECT count(*) FROM orders"
+jed --readonly ssh://db1/~/app.jed --dump > app.sql
+```
+
+It runs your `ssh` as `ssh app@db1 jed pages /srv/app.jed`, so the remote host needs `jed` on its
+`PATH`. Your engine runs the queries, fetching pages over SSH (a scan fetches up to 64 pages per
+round trip), and commits go to whichever process owns the file there. If an application on that
+host has the file open, `jed pages` passes the connection to it. If nothing does, `jed pages` opens
+the file itself and hands it over when an application opens it. `--readonly` asks for a read-only
+connection. On the server, `command="jed pages --read-only /srv/app.jed"` in `authorized_keys`
+limits a key to reading that one database. SSH handles authentication and encryption, using your ssh
+configuration.
+
+In Rust, `Database::open_remote(command, name, options)` opens a database through any command whose
+stdin and stdout carry the connection (`["ssh", "--", "db1", "jed pages '/srv/app.jed'"]`).
+`Database::serve_page_stream` implements the serving side. Go and Node have no remote client yet.
+
 ## Reclaiming space (compaction)
 
 jed reuses the pages that deletes and updates free. When the free pages are at the end of a file, a

@@ -28,7 +28,7 @@ fn main() -> ExitCode {
 // Exit codes (cli.md §3): 0 success · 1 startup/usage error · 2 a SQL statement
 // failed in script mode.
 fn run() -> u8 {
-    // The one reserved first-token word (cli.md, design.md §9): `jed migrate …` is the
+    // A reserved first-token word (cli.md §3.1, design.md §9): `jed migrate …` is the
     // migration subcommand. Any other first token is the DBFILE, exactly as before — a
     // database file literally named `migrate` is reached by qualifying its path
     // (`jed ./migrate`). Everything after the `migrate` token is parsed by the subcommand.
@@ -36,7 +36,7 @@ fn run() -> u8 {
     if argv.first().map(String::as_str) == Some("migrate") {
         return migrate::run(&argv[1..]);
     }
-    // `jed pages DBFILE` (cli.md §8): the remote end of `jed ssh://host/DBFILE`. Like `migrate`, a
+    // `jed pages DBFILE` (cli.md §3): the remote end of `jed ssh://host/DBFILE`. Like `migrate`, a
     // reserved first token; a database file named `pages` is reached as `jed ./pages`.
     if argv.first().map(String::as_str) == Some("pages") {
         return remote::pages(&argv[1..]);
@@ -188,7 +188,7 @@ fn open_database(a: &args::Args) -> Result<(jed::Session, String), u8> {
     }
 }
 
-/// Open `jed ssh://[user@]host[:port]/path` (cli.md §8): a page client over `ssh host jed pages
+/// Open `jed ssh://[user@]host[:port]/path` (cli.md §3): a page client over `ssh host jed pages
 /// /path`.
 fn open_remote(a: &args::Args, url: &str) -> Result<(jed::Session, String), u8> {
     if a.create {
