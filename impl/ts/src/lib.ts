@@ -199,6 +199,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json[b]_object_agg[_unique] (B4) — the JSON-object aggregate builders (json-sql-functions.md §4).
   // Aggregate a group's (key, value) pairs into one JSON object; _unique errors 22030 on a dup key.
   "func.json_object_agg",
+  // regr_sxx(Y, X) — the sum of squared deviations of X (aggregates.md §23).
+  "func.regr_sxx",
   // regr_avgy(Y, X) — the mean of Y over the non-NULL pairs (aggregates.md §23).
   "func.regr_avgy",
   // regr_avgx(Y, X) — the mean of X over the non-NULL pairs (aggregates.md §23).
