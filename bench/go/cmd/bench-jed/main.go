@@ -12,7 +12,34 @@ import (
 )
 
 func main() {
-	bench.Main(bench.Config{Engine: "jed", Lang: "go", Variant: "core", Open: open})
+	bench.Main(bench.Config{Engine: "jed", Lang: "go", Variant: "core", Open: open, OpenRelaxed: openRelaxed})
+}
+
+// openRelaxed creates a fresh scratch database under synchronous = off (spec/design/validated-cow.md
+// §4): commits batch their durable barrier.
+func openRelaxed(dataDir string) (bench.Engine, error) {
+	return openScratch(dataDir, jed.SynchronousOff)
+}
+
+func openScratch(dataDir string, synchronous jed.Synchronous) (bench.Engine, error) {
+	e := &engine{dataDir: dataDir, dataset: "scratch"}
+	env, err := benchEnvironment()
+	if err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp(dataDir, "scratch-")
+	if err != nil {
+		return nil, err
+	}
+	e.scratch = dir
+	db, err := jed.CreateDatabase(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed"), Environment: env, Synchronous: synchronous})
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, err
+	}
+	e.db = db
+	e.sess = db.Session(jed.SessionOptions{})
+	return e, nil
 }
 
 type engine struct {
@@ -24,25 +51,13 @@ type engine struct {
 }
 
 func open(dataDir, dataset string) (bench.Engine, error) {
+	if dataset == "scratch" {
+		return openScratch(dataDir, jed.SynchronousOn)
+	}
 	e := &engine{dataDir: dataDir, dataset: dataset}
 	env, err := benchEnvironment()
 	if err != nil {
 		return nil, err
-	}
-	if dataset == "scratch" {
-		dir, err := os.MkdirTemp(dataDir, "scratch-")
-		if err != nil {
-			return nil, err
-		}
-		e.scratch = dir
-		db, err := jed.CreateDatabase(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed"), Environment: env})
-		if err != nil {
-			os.RemoveAll(dir)
-			return nil, err
-		}
-		e.db = db
-		e.sess = db.Session(jed.SessionOptions{})
-		return e, nil
 	}
 	db, err := jed.OpenDatabaseWithOptions(filepath.Join(dataDir, dataset+".jed"), jed.OpenOptions{Environment: env})
 	if err != nil {

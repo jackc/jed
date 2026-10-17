@@ -85,6 +85,10 @@ type Config struct {
 	Lang    string // go | rust | ts
 	Variant string // core | pgx | modernc | mattn-cgo | ...
 	Open    func(dataDir, dataset string) (Engine, error)
+	// OpenRelaxed opens a fresh scratch database under jed's synchronous = off, for a `relaxed`
+	// bench (benchmarks.md §8). A jed driver without it skips such a bench; PostgreSQL and SQLite
+	// switch modes through the bench's setup_sql_override instead.
+	OpenRelaxed func(dataDir string) (Engine, error)
 }
 
 // Result is one JSONL line (spec/design/benchmarks.md §6); field order is the contract.
@@ -155,7 +159,15 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 		Fingerprint: want, StartedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	eng, err := cfg.Open(dataDir, b.Dataset)
+	open := cfg.Open
+	if b.Relaxed && cfg.Engine == "jed" {
+		if cfg.OpenRelaxed == nil {
+			fmt.Fprintf(os.Stderr, "  skip: %s/%s/%s has no relaxed durability mode\n", cfg.Engine, cfg.Lang, cfg.Variant)
+			return res, errSkip
+		}
+		open = func(dataDir, _ string) (Engine, error) { return cfg.OpenRelaxed(dataDir) }
+	}
+	eng, err := open(dataDir, b.Dataset)
 	if err != nil {
 		return res, err
 	}

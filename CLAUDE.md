@@ -389,7 +389,8 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   through a simulated spill host whose I/O can fail; and simulated processes run as a page-service owner
   and its page clients over a simulated lock host and network — promotion, lost connections, lost
   commit acknowledgements, and owner crashes mid-commit, with the commit-role rule (only the owner
-  rebuilds the free list) as an oracle. Oracles, per database: recovery lands between the
+  rebuilds the free list) as an oracle; traces may run under `synchronous = off`, whose batches and
+  cap flushes the floor rules follow. Oracles, per database: recovery lands between the
   durability floor and the newest attempted commit and matches a recorded generation; a reader sees
   its pinned version; no `XX001`; image and live integrity checks; with no reader pinned the file
   stops growing (the reader-aware bounded-growth check); a bit flipped at rest is `XX001` or harmless,
@@ -641,6 +642,17 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   barriers remain additional; this is one barrier for steady-state commits. No WAL, body redo,
   or new host durability primitive. The same v33 bytes and protocol bind Rust, Go, TypeScript,
   and shared-file access. [spec/design/validated-cow.md](spec/design/validated-cow.md).
+- **Batched durability — `synchronous = off` (format v43).** A relaxed commit is atomic and
+  visible once its pages and meta are written; one later **flush** makes a run of commits durable.
+  Every commit pending after the newest durable meta (the floor) writes the slot not holding it, lists
+  every page written since the floor in its manifest, reuses only pages the floor already had free,
+  and keeps the batch's pages off the free list, so a power loss recovers a complete generation between the floor
+  and the newest attempted commit and never corrupts; a process crash loses no acknowledged commit.
+  The batch ends at the inline-manifest cap (flushed on a background goroutine/thread in Go/Rust,
+  inline in TS — the next commit waits, so bytes never depend on timing), at close, before a page
+  client's `begin_write`, and at compaction. Under `synchronous = on` the slot rule is `txid & 1` and
+  nothing changes. No time-based flush yet (its interval is undecided). Trailing truncation, when it
+  lands, must run only with nothing pending. [spec/design/validated-cow.md](spec/design/validated-cow.md) §4.
 - **Live page count (format v34).** Meta offset 56 records the exact number of pages reachable
   from the catalog root (catalog chain, tree and GiST nodes, live overflow chains — never meta,
   free-list, or manifest pages). Every commit advances it by an exact delta — its written pages

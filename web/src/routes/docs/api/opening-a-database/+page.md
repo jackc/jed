@@ -35,10 +35,26 @@ statements **atomically**, run them in one `update` closure — or on a single s
 jed keeps durable data in one file without a WAL. Commits write changed pages once, record their
 checksums with the new root, and finish with one durable flush in the steady state. Opening validates
 the latest commit before adopting it; file growth and resuming writes after recovery can require
-additional flushes. Format v34 requires all processes sharing a file to use a compatible jed version.
+additional flushes. All processes sharing a file must use a jed that reads the same format version.
 After a storage write or flush error, close and reopen the handle before writing again so recovery
 can determine the committed outcome. An encoding or size error before storage writes does not
 require reopening; discard the failed transaction and continue using the handle.
+
+### Relaxed durability
+
+If losing the last few commits in a power failure is acceptable but a damaged file is not, open or
+create the database with `synchronous` off: `synchronous: Synchronous::Off` (Rust),
+`Synchronous: jed.SynchronousOff` (Go), or `{ synchronous: "off" }` (TypeScript, including the
+browser's OPFS `create` / `open`). A commit then returns as soon as its pages are written, and a single
+flush later makes a whole run of commits durable together — when the run fills its batch, and when
+you close the database. A power loss or OS crash can lose the commits made since the last flush, but
+the file always reopens to one complete committed state, never a mix; a crash of your process alone
+loses nothing it committed. Query results and costs are the same in both modes.
+
+`close` reports a flush that failed. After any failed flush the handle refuses further reads and
+writes until you reopen it. There is no timed flush yet, so a relaxed database that sits idle stays
+unflushed until its next batch fills or it closes. This is different from `skip_fsync`, which skips
+the flushes entirely and can leave a corrupted file after an OS crash: use it only for scratch data.
 
 ## Opening a file from a newer jed
 

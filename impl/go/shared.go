@@ -308,6 +308,9 @@ type storage struct {
 	flushing *backgroundFlush
 	// inlineFlush runs the cap flush in the committing goroutine instead (the deterministic simulator).
 	inlineFlush bool
+	// floorFree is the free list as of the floor — recorded by the first commit of a relaxed batch —
+	// the only pages a pending commit may reuse (validated-cow.md §4 rule 3).
+	floorFree map[uint32]bool
 }
 
 // backgroundFlush is one background cap flush (validated-cow.md §4).
@@ -367,6 +370,36 @@ func capFlush(paging *sharedPaging) error {
 		paging.revoke(newError(IoError, "a deferred durability flush failed; reopen the database: "+err.Error()))
 	}
 	return err
+}
+
+// reuseAllowed is the reuse restriction of the commit about to plan (validated-cow.md §4 rule 3).
+// With nothing pending the floor is the committed generation, so a relaxed domain records the pages
+// free now — the floor's free list — and allows them all; while a batch is pending only those not yet
+// consumed may be reused, since a page freed during the batch may still be needed by the floor. A
+// synchronous = on domain is never restricted. Caller holds st.mu.
+func (st *storage) reuseAllowed(pending bool) map[uint32]bool {
+	if !st.relaxedFile() {
+		return nil
+	}
+	if !pending {
+		st.floorFree = make(map[uint32]bool, len(st.freePages))
+		for _, p := range st.freePages {
+			st.floorFree[p] = true
+		}
+		return nil
+	}
+	return st.floorFreeFor(true)
+}
+
+// floorFreeFor is the restriction a pending batch plans under, without recording a new floor.
+func (st *storage) floorFreeFor(pending bool) map[uint32]bool {
+	if !pending || !st.relaxedFile() {
+		return nil
+	}
+	if st.floorFree == nil {
+		return map[uint32]bool{}
+	}
+	return st.floorFree
 }
 
 // relaxedFile reports whether this domain's commits batch their barrier.
@@ -584,10 +617,8 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		}); err != nil {
 			return err
 		}
-		// While a relaxed batch is pending, nothing is reused: every page comes from the high-water
-		// (validated-cow.md §4 rule 3).
-		canReuse = canReuse && !pending
-		write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, canReuse, st.paging)
+		allowed := st.reuseAllowed(pending)
+		write, err := snap.incrementalImageAllowed(st.pageSize, st.pageCount, st.freePages, canReuse, allowed, st.paging)
 		if err != nil {
 			return err
 		}
@@ -595,7 +626,7 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		if err != nil {
 			return err
 		}
-		return st.commitFile(snap, write, live, canReclaim, canReuse)
+		return st.commitFile(snap, write, live, canReclaim, canReuse, allowed)
 	}
 	write, err := st.planInMemory(snap, canReuse, budget)
 	if err != nil {
@@ -609,7 +640,7 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 // then publishes the alternate meta (carrying live, the live-page count this
 // commit publishes — memory.md §8.7) and syncs once. Caller holds st.mu and has
 // checked writer admission before assigning dirty-node page ids.
-func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveCount, canReclaim, canReuse bool) error {
+func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveCount, canReclaim, canReuse bool, allowed map[uint32]bool) error {
 	st.syncDirectoryOnce()
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.beginValidatedCommit(); err != nil {
@@ -631,7 +662,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	relaxed := st.relaxedFile()
 	var pending []manifestEntry
 	_ = st.paging.withPager(func(p *pager) error { pending = p.pendingEntries(); return nil })
-	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, live.live, pending)
+	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, live.live, pending, allowed)
 	if err != nil {
 		return err
 	}
@@ -830,9 +861,10 @@ func (st *storage) precheckBudget(snap *snapshot, reuse bool, budget *budgetCtx)
 		if err := st.awaitFlush(); err != nil {
 			return err
 		}
-		// Plan exactly as the commit will: nothing is reused while a relaxed batch is pending.
-		_ = st.paging.withPager(func(p *pager) error { reuse = reuse && len(p.pending) == 0; return nil })
-		write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, reuse, st.paging)
+		// Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its floor.
+		pending := false
+		_ = st.paging.withPager(func(p *pager) error { pending = len(p.pending) > 0; return nil })
+		write, err := snap.incrementalImageAllowed(st.pageSize, st.pageCount, st.freePages, reuse, st.floorFreeFor(pending), st.paging)
 		if err != nil {
 			return err
 		}

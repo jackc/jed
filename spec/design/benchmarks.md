@@ -1003,6 +1003,8 @@ Optional keys:
 - `setup_sql = ["..."]` — write kinds only: statements run once before warmup.
 - `host_functions = true` — the bench calls the bench host functions (§8.2); a driver that
   does not register them skips it.
+- `relaxed = true` — `write_durable` only: run the lane under each engine's relaxed-durability
+  mode (§8). A jed driver that cannot open with `synchronous = off` skips it.
 - `[bench.sql_override]` / `[bench.setup_sql_override]` — per-engine SQL text keyed by
   `jed` / `postgres` / `sqlite`, used only where dialects genuinely diverge (v1 uses it
   once, for the scratch table's SQLite rowid-pk DDL — §8).
@@ -1386,9 +1388,13 @@ Two write kinds:
   Measures executor/binding throughput without growing the database. The post-run sanity
   `count(*)` must equal the dataset's committed row count.
 - **`write_durable`** — per iteration: one statement as its own durable commit — the full
-  fsync path. jed: autocommit (`synchronous=on` is the only mode today); PostgreSQL:
+  fsync path. jed: autocommit under the default `synchronous=on`; PostgreSQL:
   default `synchronous_commit=on`; SQLite: `PRAGMA journal_mode=DELETE; PRAGMA
-  synchronous=FULL`. The final `count(*)` must equal the count right after `setup_sql`, plus
+  synchronous=FULL`. With `relaxed = true` each engine instead runs the mode that may lose the
+  newest commits to a power failure but never corrupts: jed opens the scratch file with
+  `synchronous = off` (one barrier per batch, [validated-cow.md](validated-cow.md) §4),
+  PostgreSQL sets `synchronous_commit = off`, and SQLite runs `journal_mode=WAL` with
+  `synchronous=NORMAL` — the latter two through the bench's `setup_sql_override`. The final `count(*)` must equal the count right after `setup_sql`, plus
   `warmup + iterations` when the statement is an `INSERT` (an `UPDATE` lane such as
   `update_commit_durable` changes rows in place).
 
