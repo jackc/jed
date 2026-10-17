@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // regr_syy(Y, X) — the sum of squared deviations of Y (aggregates.md §23).
+    "func.regr_syy",
     // regr_sxx(Y, X) — the sum of squared deviations of X (aggregates.md §23).
     "func.regr_sxx",
     // regr_avgy(Y, X) — the mean of Y over the non-NULL pairs (aggregates.md §23).
