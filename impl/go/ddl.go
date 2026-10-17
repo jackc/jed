@@ -981,6 +981,16 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		}
 		return false
 	}
+	// A derived name also walks past every constraint name of the table's database domain — its
+	// schema (constraints.md §6.7, PostgreSQL's ChooseConstraintName); an explicit one is checked
+	// against this table alone.
+	domain := db.readSnap()
+	if targetTemp {
+		domain = db.tempSnap()
+	} else if attachName != "" {
+		domain = db.attachReadSnap(attachName)
+	}
+	schemaTaken := func(name string) bool { return schemaConstraintNameTaken(domain, "", name) }
 	for i := range ct.Checks {
 		def := &ct.Checks[i]
 		name := def.Name
@@ -991,10 +1001,11 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			}
 		} else {
 			cols := checkReferencedColumns(def.Expr, columns)
+			derivedTaken := func(n string) bool { return nameTaken(n) || schemaTaken(n) }
 			if len(cols) == 1 {
-				name = chooseObjectName(table.Name, columns[cols[0]].Name, true, "check", nameTaken)
+				name = chooseObjectName(table.Name, columns[cols[0]].Name, true, "check", derivedTaken)
 			} else {
-				name = chooseObjectName(table.Name, "", false, "check", nameTaken)
+				name = chooseObjectName(table.Name, "", false, "check", derivedTaken)
 			}
 		}
 		checks = append(checks, checkConstraint{Name: name, ExprText: def.Text, Expr: def.Expr, HostDeps: checkDeps[i]})
@@ -1071,7 +1082,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		} else {
 			addition := nameAddition(columnNames(table.Columns, ru.cols))
 			name = chooseObjectName(table.Name, addition, true, "key", func(n string) bool {
-				return relationTaken(n) || checkNameTaken(n)
+				return relationTaken(n) || checkNameTaken(n) || schemaTaken(n)
 			})
 		}
 		// Insert in catalog (ascending name byte) order — indexes.md §6.
@@ -1173,45 +1184,39 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			return outcome{}, newError(InvalidForeignKey,
 				"number of referencing and referenced columns for foreign key disagree")
 		}
-		// 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
+		// 5. Name — the per-table constraint namespace: the CHECK and UNIQUE constraints already
+		// defined (PostgreSQL creates the indexes before the FKs) and the earlier FKs (§6.2/§6.7). A
+		// derived name also walks past the domain's other tables' constraint names.
+		fkLocalTaken := func(candidate string) bool {
+			for _, c := range table.Checks {
+				if c.Name == candidate {
+					return true
+				}
+			}
+			for _, ix := range table.Indexes {
+				if ix.Unique && ix.Name == candidate {
+					return true
+				}
+			}
+			for _, f := range resolvedFks {
+				if f.Name == candidate {
+					return true
+				}
+			}
+			return false
+		}
 		var name string
 		if fk.Name != "" {
-			collide := false
-			for _, c := range table.Checks {
-				if c.Name == fk.Name {
-					collide = true
-					break
-				}
-			}
-			if !collide {
-				for _, f := range resolvedFks {
-					if f.Name == fk.Name {
-						collide = true
-						break
-					}
-				}
-			}
-			if collide {
+			if fkLocalTaken(fk.Name) {
 				return outcome{}, newError(DuplicateObject,
 					"constraint "+fk.Name+" for relation "+table.Name+" already exists")
 			}
 			name = fk.Name
 		} else {
 			addition := nameAddition(columnNames(table.Columns, local))
-			fkNameTaken := func(candidate string) bool {
-				for _, c := range table.Checks {
-					if c.Name == candidate {
-						return true
-					}
-				}
-				for _, f := range resolvedFks {
-					if f.Name == candidate {
-						return true
-					}
-				}
-				return false
-			}
-			name = chooseObjectName(table.Name, addition, true, "fkey", fkNameTaken)
+			name = chooseObjectName(table.Name, addition, true, "fkey", func(n string) bool {
+				return fkLocalTaken(n) || schemaTaken(n)
+			})
 		}
 		// 6. Resolve and store the selected referential actions (§6.6).
 		onDelete, err := newFkAction(fk.OnDelete, "DELETE")
@@ -1373,7 +1378,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		} else {
 			addition := nameAddition(columnNames(table.Columns, indices))
 			name = chooseObjectName(table.Name, addition, true, "excl", func(n string) bool {
-				return relTaken(n) || conTaken(n)
+				return relTaken(n) || conTaken(n) || schemaTaken(n)
 			})
 		}
 		// Insert the backing GiST index in catalog (ascending name byte) order.

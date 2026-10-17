@@ -312,8 +312,9 @@ the expression mentions —
 
 - exactly one → `<table>_<column>_check`;
 - zero or several → `<table>_check`;
-- if that name is taken (by any earlier-named check, explicit or derived), append the
-  smallest positive integer that frees it (`<table>_<column>_check1`, `…2`, …).
+- if that name is taken (by any earlier-named check, explicit or derived, or by a constraint
+  of another table in the same schema — below), append the smallest positive integer that
+  frees it (`<table>_<column>_check1`, `…2`, …).
 
 A name that would exceed the 63-byte identifier limit is cut to fit, PostgreSQL's way — the
 longer of the table and column parts shortened first, the suffix applied to the label
@@ -323,6 +324,28 @@ Derived names are built from the **exact** table/column names (no case change �
 `"Tab"` gives `Tab_…_check`, as PostgreSQL). Naming is a single pass in textual definition order — an
 explicit name colliding with an *earlier* derived name is `42710` (derived names never
 yield; oracle-probed).
+
+**A derived name walks the whole schema.** PostgreSQL's `ChooseConstraintName` (and
+`ChooseRelationName` for a constraint's index) skips a candidate that *any* constraint in the
+table's namespace already holds, not only one of this table's. jed matches it: every derived
+constraint name — `CHECK` (here), `UNIQUE` (§5.3), `FOREIGN KEY` (§6.2 step 7), and `EXCLUDE`
+([gist.md §7](gist.md)), at `CREATE TABLE` and at `ALTER TABLE … ADD` — is suffix-walked past the
+constraint names (checks, unique constraints, foreign keys, exclusion constraints) of **every
+table of the same database domain**. A domain is jed's equivalent of a PostgreSQL schema:
+
+- the **main database** is one schema;
+- the session's **temporary tables** are another — PostgreSQL's `pg_temp` is its own schema, so a
+  temp table's derived name never yields to a persistent table's constraint, nor the reverse
+  (the relation namespace is still shared, [temp-tables.md §3](temp-tables.md));
+- each **attached database** is its own — it is a separate database
+  ([attached-databases.md §3](attached-databases.md)).
+
+The other tables are read as the statement found them (an `ALTER TABLE` that cascades away
+another table's FK does not free that name for its own later `ADD` — a corner PostgreSQL
+resolves the other way). An **explicit** name still collides only within its own table (`42710`),
+as PostgreSQL's per-relation `ConstraintNameIsUsed`, so two tables may hold the same explicit
+constraint name. The table's primary key takes no part: its derived `<table>_pkey` is not
+persisted (§5.4), and no derived name of another label can equal it.
 
 ### 4.4 Enforcement
 
@@ -431,8 +454,9 @@ After the folds, each surviving constraint names its index, in textual order:
   is PG's probed order;
 - an **omitted** name derives PostgreSQL's choice: the exact-name
   `<table>_<col>_<col>…_key` (members in list order), suffix-walked past **both**
-  namespaces (a check named `t_a_key` pushes the derived name to `t_a_key1` — probed), cut
-  to fit 63 bytes ([grammar.md §3.1](grammar.md)).
+  namespaces (a check named `t_a_key` pushes the derived name to `t_a_key1` — probed) — the
+  constraint namespace being the whole schema's (§4.3) — cut to fit 63 bytes
+  ([grammar.md §3.1](grammar.md)).
 
 The `_key` suffix (vs `CREATE INDEX`'s `_idx`) is the only naming difference from a plain
 index; the walk rule is otherwise [indexes.md §2](indexes.md)'s.
@@ -543,10 +567,11 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
 7. **Naming.** An explicit `CONSTRAINT <name>` is used as the name; otherwise the name is derived,
    PostgreSQL's algorithm: exact-name `<table>_<localcol>_<localcol>…_fkey` (every local column in
    list order, joined by `_`, cut to fit 63 bytes — [grammar.md §3.1](grammar.md)), suffix-walked
-   past the table's **constraint namespace** (its checks and earlier FKs) with the smallest positive
-   integer that frees it (`…_fkey1`, `…_fkey2`, …). An
-   explicit name colliding with an existing check or FK name is **`42710`** (`constraint <name> for
-   relation <table> already exists`). The FK shares the per-table **constraint** namespace with
+   past the table's **constraint namespace** (its checks, its UNIQUE constraints — PostgreSQL
+   creates a table's indexes before its FKs — and earlier FKs) and the constraint names of the
+   schema's other tables (§4.3), with the smallest positive integer that frees it (`…_fkey1`,
+   `…_fkey2`, …). An explicit name colliding with an existing check, UNIQUE, or FK name of the
+   table is **`42710`** (`constraint <name> for relation <table> already exists`). The FK shares the per-table **constraint** namespace with
    `CHECK` (§4.3); it creates **no** relation object, so — unlike a `UNIQUE` constraint's backing
    index — its name is **not** in the relation namespace and never collides with a table/index name
    (a minor divergence, §6.7).
@@ -769,14 +794,10 @@ and compression work **does** accrue to the originating statement's cost and to 
   CHECK), not the relation namespace — `CREATE TABLE fk_name (…)` does not collide with an FK named
   `fk_name`. PG keeps constraint names per-table too, so this matches PG; the note is only that, like
   the PK's `_pkey`, jed does not reserve FK names in the relation namespace.
-- **Derived-name collisions are per table.** A derived CHECK or FK name (§4.3, §6.2 step 7) is
-  suffix-walked past *this table's* constraint names only; PostgreSQL's `ChooseConstraintName`
-  avoids every constraint name in the schema. The two differ only when another table already holds
-  the same name — rare for short names (table `t_a` with a multi-column check vs. table `t`'s check
-  on `a`, both `t_a_check`), more likely once names are cut to 63 bytes ([grammar.md
-  §3.1](grammar.md)): two tables whose names share their first 29 bytes, each with an unnamed FK on
-  the same 63-byte column, get the same `…_fkey` in jed where PostgreSQL names the second `…_fkey1`.
-  (UNIQUE / EXCLUDE / index / sequence names walk the shared relation namespace and match.)
+- **Derived-name walks see the statement's starting schema.** A derived name avoids every
+  constraint name in its schema, as PostgreSQL's does (§4.3); the one difference is that the
+  schema's *other* tables are read as the statement found them, so a constraint an `ALTER TABLE`
+  cascades away from another table frees its name only for later statements.
 - **No PostgreSQL system-catalog surface.** FKs are observable through enforcement, the per-core
   host catalog, and jed's `jed_constraints` surface; there is no `pg_constraint`. `ALTER TABLE …
   ADD/DROP CONSTRAINT` supports FKs, while `DROP TABLE … CASCADE` remains outside the grammar

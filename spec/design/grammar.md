@@ -188,7 +188,8 @@ byte for byte (`makeObjectName` / `ChooseRelationName` / `ChooseConstraintName` 
   `pg_mbcliplen`), so a cut never splits a character, and the name is
   `name1[_name2]_label`. The label is never cut.
 - **Collision.** If the name is taken in its namespace (the object kind's existing rules —
-  constraints.md §4.3/§5.3/§6.2, indexes.md §2, sequences.md §12), the label becomes `label1`,
+  constraints.md §4.3/§5.3/§6.2, indexes.md §2, sequences.md §12; a constraint's namespace is every
+  constraint name of its schema, constraints.md §4.3), the label becomes `label1`,
   `label2`, … and the name is rebuilt from the same parts, so a longer label shortens the parts
   (`…_abcde_check`, then `…_abcd_check1`). The derived PK name is not persisted and takes no suffix
   (constraints.md §5.4).
