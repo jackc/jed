@@ -470,7 +470,7 @@ point-set/range intersection).
 - **Which predicates lower.** The top-level AND-chain is flattened, and the **first** conjunct that
   reduces to a pure disjunction of same-key intervals is the bound. An OR node reduces iff both
   operands reduce; a leaf is one same-type comparison, or an AND of comparisons on that key
-  (BETWEEN's resolved shape). Direct same-key comparison conjuncts outside the OR clip every
+  (BETWEEN's resolved shape) with at most one `key = ANY(array)` among them (below). Direct same-key comparison conjuncts outside the OR clip every
   disjunct, so `key IN (...) AND key > c` probes only surviving points. A `NOT`, non-bound
   expression, promoted comparison, unsafe collation, or comparison on a different column makes a
   disjunct non-reducing, so a **mixed**
@@ -510,8 +510,11 @@ point-set/range intersection).
 
 - **`key = ANY(array)` — the array spelling of IN.** An ANY equality whose left operand is the bare
   key (`query.any_array_point_lookup`) is one disjunct of the same interval set, so it may be the
-  bounding conjunct itself, a leaf of a same-key OR (`key = ANY(a) OR key = 7`), or be clipped by a
-  same-key range (`key = ANY(a) AND key > 3`). It qualifies only when (a) it is `= ANY`/`= SOME` — not
+  bounding conjunct itself, a leaf of a same-key OR (`key = ANY(a) OR key = 7`), be clipped by a
+  same-key range (`key = ANY(a) AND key > 3`), or sit under an AND leaf of a same-key OR
+  (`(key = ANY(a) AND key > 3) OR key = 1`), where the leaf's other comparisons clip its points
+  before the set's clip does. A leaf holds at most one array; a second ANY in it is not a bound, so
+  the leaf does not reduce. It qualifies only when (a) it is `= ANY`/`= SOME` — not
   `ALL`, not another operator, not the row-valued subquery form; (b) the array's resolved element type
   is the key's scalar type (a bare `ARRAY[…]` and a `$N` adapt to the key's type), or a **promoted**
   type whose every value either converts exactly to the key's type or equals no key value: an integer

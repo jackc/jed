@@ -59,6 +59,21 @@ PK interval set: id; intervals=2; arrays=1; touched=2
 3
 4
 
+# An ANY under an AND leaf of a same-key OR is one disjunct, its points clipped by the leaf.
+query ITTII nosort
+EXPLAIN SELECT a FROM t WHERE (id = ANY(ARRAY[1, 3, 5]) AND id > 2) OR id = 1
+----
+0
+Filter
+conjuncts=1
+2
+33
+1
+Scan t
+PK interval set: id; intervals=2; arrays=1; touched=2
+3
+4
+
 # ALL does not lower. `<> ALL` estimates as the complement of `= ANY` over the same elements: each of
 # the four equalities is one of six rows (rounded up), leaving two. The Filter's cost counts one
 # operator_eval per element the residual compares.
