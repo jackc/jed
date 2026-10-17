@@ -201,6 +201,18 @@ func simParse(text string) (simTrace, error) {
 			if err := params(fields[1:]); err != nil {
 				return tr, err
 			}
+		case "backup":
+			if (len(fields) != 2 && len(fields) != 3) || (fields[1] != "page_identical" && fields[1] != "compacted") {
+				return tr, fmt.Errorf("line %d: backup page_identical|compacted [p<N>]", n+1)
+			}
+			st.mode, st.pid = fields[1], -1 // no p<N>: the lowest running process
+			if len(fields) == 3 {
+				pid, err := simPid(fields[2])
+				if err != nil {
+					return tr, fmt.Errorf("line %d: %v", n+1, err)
+				}
+				st.pid = pid
+			}
 		case "check", "reopen", "tick":
 		default:
 			return tr, fmt.Errorf("line %d: unknown step %q", n+1, st.kind)
@@ -464,6 +476,7 @@ type simRunner struct {
 	digestErr      error             // why the most recent digest failed
 	diagnostics    map[string]string // artifact name → contents, written on a violation
 	imagePrefix    string            // when set, each recovery's image is written to <prefix>.step<N>[.<db>].img
+	backups        int               // backup steps run, naming each destination
 }
 
 func newSimRunner(tr simTrace) *simRunner {
@@ -894,6 +907,10 @@ func (r *simRunner) step(i int) (cont bool) {
 				r.emit(`{"i":%d,"op":"open","sid":%q,"skip":true}`, i, st.sid)
 				return true
 			}
+			if st.kind == "backup" {
+				r.emit(`{"i":%d,"op":"backup","pid":%d,"skip":true}`, i, st.pid)
+				return true
+			}
 			if len(r.procs) == 0 {
 				r.fail(i, "no process is running")
 				return false
@@ -923,6 +940,8 @@ func (r *simRunner) step(i int) (cont bool) {
 		r.stepCheck(i)
 	case "compact":
 		r.stepCompact(i, st.sid)
+	case "backup":
+		r.stepBackup(i, st)
 	case "attach":
 		r.stepAttach(i, st.sid)
 	case "reopen":
@@ -1825,6 +1844,77 @@ func (r *simRunner) stepCompact(i int, name string) {
 	r.observeGrowth(d)
 }
 
+// stepBackup is `backup page_identical|compacted [p<N>]` (spec/design/page-service.md §9): the process
+// backs main up into a new file through the simulated filesystem, while every other session keeps its
+// pins and its writer gate. A backup that fails leaves no destination. One that succeeds is checked at
+// once, as a new process would open it: its version is the pinned snapshot's (page-identical) or the
+// one after it (compacted), the snapshot is the newest committed generation, its contents are that
+// generation's, and the integrity checker accepts the image. Its image hash makes the cores' backups
+// byte-identical (§8.4).
+func (r *simRunner) stepBackup(i int, st simStep) {
+	d := r.main()
+	r.backups++
+	dest := fmt.Sprintf("%s.backup%d", d.file, r.backups)
+	err := BackupForTesting(r.db, dest, st.mode == "page_identical")
+	if err != nil {
+		code := simCode(err)
+		if strings.HasPrefix(code, "non-engine") {
+			r.fail(i, "%s", code)
+			return
+		}
+		r.emit(`{"i":%d,"op":"backup","form":%q,"error":%q}`, i, st.mode, code)
+		switch {
+		case code == "XX001":
+			r.fail(i, "corruption: backup reported XX001: %v", err)
+		case r.fs.files[dest] != nil:
+			r.fail(i, "a failed backup left its destination")
+		}
+		return
+	}
+	f := r.fs.files[dest]
+	if f == nil {
+		r.fail(i, "a successful backup left no destination")
+		return
+	}
+	image := append([]byte(nil), f.cache...)
+	if r.imagePrefix != "" {
+		_ = os.WriteFile(fmt.Sprintf("%s.step%d.backup.img", r.imagePrefix, i), image, 0o644)
+	}
+	e, err := loadEngine(image, r.env)
+	if err != nil {
+		r.fail(i, "the backup does not open: %v", err)
+		return
+	}
+	v := e.committed.txid
+	snapshot := v
+	if st.mode == "compacted" {
+		snapshot = v - 1
+	}
+	copyDB := databaseOver(sharedCoreFromEngine(e))
+	defer copyDB.Close()
+	rs := copyDB.ReadSession()
+	dg, ok := r.digest(rs, d)
+	rs.Close()
+	switch {
+	case !ok:
+		r.fail(i, "the backup cannot be read: %v", r.digestErr)
+		return
+	case snapshot < d.version:
+		r.fail(i, "the backup copied version %d, older than the committed %d", snapshot, d.version)
+		return
+	case !d.history[snapshot][dg]:
+		r.fail(i, "the backup holds contents (digest %s) version %d never had", dg, snapshot)
+		return
+	}
+	live, pages, free, err := simIntegrity(image, v)
+	if err != nil {
+		r.fail(i, "backup integrity: %v", err)
+		return
+	}
+	r.emit(`{"i":%d,"op":"backup","form":%q,"version":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"}`,
+		i, st.mode, v, dg, live, pages, free, simImageHash(image, pages, r.pageSize))
+}
+
 // stepAttach attaches file database name to the running process (S4), first creating its file
 // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
 // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
@@ -2310,6 +2400,10 @@ func (r *simRunner) stepPid(st simStep) (int, bool) {
 	switch st.kind {
 	case "open", "spawn", "exit", "kill":
 		return st.pid, true
+	case "backup":
+		if st.pid >= 0 {
+			return st.pid, true
+		}
 	case "on", "commit", "rollback", "close":
 		if ss := r.sessions[st.sid]; ss != nil {
 			return ss.pid, true

@@ -139,6 +139,10 @@ func run() error {
 				name = "main"
 			}
 			err = db.Compact(name)
+		case "BACKUP":
+			// The backup test entry point (spec/design/page-service.md §9): BACKUP <form>\t<dest>.
+			form, dest, _ := strings.Cut(argument, "\t")
+			err = jed.BackupForTesting(db, dest, form == "page_identical")
 		case "MAX_STORAGE_BYTES":
 			bytes, parseErr := strconv.ParseInt(argument, 10, 64)
 			if parseErr != nil {

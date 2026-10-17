@@ -52,7 +52,7 @@ module SimGen
       "create_table" => 2, "drop_table" => 1, "create_index" => 2, "drop_index" => 1,
       "add_column" => 1, "analyze" => 1, "reindex" => 1, "sequence" => 1, "invalid" => 1,
       "commit" => 9, "rollback" => 2, "check" => 2, "reopen" => 1, "clock" => 1,
-      "crash_power" => 1, "crash_process" => 1, "compact" => 0,
+      "crash_power" => 1, "crash_process" => 1, "compact" => 0, "backup" => 0,
       "spawn" => 0, "exit" => 0, "kill" => 0, "disconnect" => 0,
       "attach" => 0, "corrupt" => 0, "temp_table" => 0, "temp_insert" => 0, "temp_read" => 0
     },
@@ -62,7 +62,7 @@ module SimGen
     "faults" => {
       "commit_fault" => 150, "chain" => 150, "power_loss" => 5, "process_crash" => 3,
       "io_error_write" => 1, "io_error_sync" => 1, "read_error" => 0, "enospc" => 0, "disconnect" => 0,
-      "compact_fault" => 300, "nth_max" => 1, "attach_fault" => 0, "spill_fault" => 0,
+      "compact_fault" => 300, "backup_fault" => 0, "nth_max" => 1, "attach_fault" => 0, "spill_fault" => 0,
       "survive" => [100, 900], "tear" => [0, 400], "issue" => [200, 900], "io_p" => [50, 500],
       "flips" => [1, 3], "reseal" => 0, "frames_max" => 8
     }
@@ -232,6 +232,7 @@ module SimGen
       when "crash_power" then crash_power
       when "crash_process" then crash_process
       when "compact" then compact
+      when "backup" then backup
       when "spawn" then spawn if @service
       when "exit" then exit_process if @service
       when "kill" then kill_process_step if @service
@@ -391,6 +392,41 @@ module SimGen
       db = dbs.empty? || @rng.chance(500) ? nil : @rng.pick(dbs)
       emit(db ? "compact #{db}" : "compact")
       fault_kills(line, @procs.min) if faulted
+    end
+
+    # A backup of main (page-service.md §9) in either form, from a random running process: it pins
+    # like a reader and never waits for the writer. A fault may land in its file writes (the temp
+    # file's sync, the directory's) or, in a service trace, end the connection its page reads use.
+    def backup
+      form = @rng.chance(500) ? "page_identical" : "compacted"
+      pid = @service ? @rng.pick(@procs) : 0
+      faulted = @rng.chance(@p.dig("faults", "backup_fault"))
+      if faulted
+        kind = if @service && @rng.chance(400)
+                 "disconnect nth=#{@rng.range(1, @p.dig("faults", "frames_max") || 8)}"
+               elsif @rng.chance(500)
+                 "power_loss survive=#{draw('survive')} tear=#{draw('tear')} nth=#{@rng.range(1, 2)}"
+               else
+                 "process_crash issue=#{draw('issue')} nth=#{@rng.range(1, 2)}"
+               end
+        line = "fault #{kind}"
+        emit(line)
+      end
+      # A faulted backup runs in the lowest running process (no ` p<N>`), so the step never skips and
+      # its fault always fires: the model must not forget sessions a skipped step left alive.
+      emit(@service && !faulted ? "backup #{form} p#{pid}" : "backup #{form}")
+      return unless faulted
+
+      # The fault kills the owner (or, on a power loss or with one process, every process), not
+      # necessarily the backup's process, so a writer elsewhere may live on: forget the sessions only
+      # when every process dies.
+      if line.start_with?("fault disconnect")
+        nil # a lost connection kills no process
+      elsif !@service || line.start_with?("fault power_loss") || @procs.length < 2
+        kill_sessions
+      else
+        @after_crash = true
+      end
     end
 
     def crash_power

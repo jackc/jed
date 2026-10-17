@@ -357,6 +357,35 @@ func (cl *psClient) readPage(index uint32) ([]byte, error) {
 	return append([]byte(nil), pages.pages[0]...), nil
 }
 
+// readPages fetches a batch of pages under the newest pinned version (a backup's copy, README.md
+// §6.6). The batch holds at most maxReadPages indices.
+func (cl *psClient) readPages(indices []uint32) ([][]byte, error) {
+	reply, err := cl.roundTripWith(func() (psMessage, error) {
+		txid := cl.readTxid.Load()
+		if txid == 0 {
+			return nil, newError(ObjectNotInPrerequisiteState, "a page client read a page outside any transaction")
+		}
+		return psReadPages{txid: txid, indices: indices}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	pages, ok := reply.(psPages)
+	if !ok || len(pages.pages) != len(indices) {
+		return nil, newError(ProtocolViolation, "unexpected reply to read_pages")
+	}
+	out := make([][]byte, len(pages.pages))
+	for i, page := range pages.pages {
+		out[i] = append([]byte(nil), page...)
+	}
+	return out, nil
+}
+
+// maxReadPages is the most indices one read_pages may name on this connection (README.md §3.1).
+func (cl *psClient) maxReadPages() int {
+	return min(psMaxReadPagesCap, (psMaxFrameLength-psHeaderLength)/int(cl.pageSize.Load()))
+}
+
 // close drops the connection; the owner releases every pin and the gate at EOF.
 func (cl *psClient) close() {
 	cl.closeOnce.Do(func() {

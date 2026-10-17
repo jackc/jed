@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 # Layer-4 real-process shared-file driver (spec/design/concurrency-testing.md §10).
 
+require "json"
 require "open3"
 require "tmpdir"
 require "timeout"
@@ -124,6 +125,9 @@ def actor_command(step, dir)
   argument = if step.fetch("command") == "attach"
                [step.fetch("name"), step.fetch("read_only", false) ? "1" : "0",
                 File.join(dir, "#{step.fetch('path')}.jed")].join("\t")
+             elsif step.fetch("command") == "backup"
+               # BACKUP <form>\t<dest>: a backup of main to <path>.jed (spec/design/page-service.md §9).
+               [step.fetch("form"), File.join(dir, "#{step.fetch('path')}.jed")].join("\t")
              elsif step.key?("sql")
                expand_sql(step.fetch("sql")).unpack1("H*")
              else
@@ -175,6 +179,19 @@ def run_scenario(path, first_core, second_core)
           if command == "sleep"
             # A pause between steps, for a timeout to expire (the idle-in-transaction timeout).
             sleep Integer(step.fetch("argument")) / 1000.0
+            next
+          end
+          if command == "check_image"
+            # The independent Ruby decoder (spec/fileformat/verify.rb --check-image) on a file the
+            # scenario wrote (a backup): it must decode, and `expect` names its "txid:live:pages:free".
+            check_image(File.join(dir, "#{step.fetch('path')}.jed"), step["expect"])
+            next
+          end
+          if command == "same_bytes"
+            # Two files' committed images must be byte-identical (a compacted backup and the file host
+            # compaction leaves for the same snapshot).
+            first, second = step.fetch("paths").map { |p| committed_image(File.join(dir, "#{p}.jed")) }
+            raise "#{step.fetch('paths').join(' and ')} differ" unless first == second
             next
           end
           actor = actors.fetch(actor_name)
@@ -251,18 +268,34 @@ def run_scenario(path, first_core, second_core)
     end
     image = nil
     if data["byte_identical"]
-      image = File.binread(File.join(dir, "shared.jed"))
-      ps = image.byteslice(8, 4).unpack1("N")
-      # Successful final commits have complete meta candidates; trim unreferenced
-      # preallocation, which is not part of the logical file byte contract.
-      page_count = [0, ps].map { |offset| image.byteslice(offset + 24, 4).unpack1("N") }.max
+      image = committed_image(File.join(dir, "shared.jed"))
+      page_count = image.bytesize / image.byteslice(8, 4).unpack1("N")
       if data["max_page_count"] && page_count > data["max_page_count"]
         raise "page reuse did not bound growth: #{page_count} > #{data['max_page_count']}"
       end
-      image = image.byteslice(0, ps * page_count)
     end
-    [name, image]
+    # byte_identical_files: further files (backups) whose bytes must agree across core pairings.
+    files = data.fetch("byte_identical_files", []).to_h { |p| [p, File.binread(File.join(dir, "#{p}.jed"))] }
+    [name, image ? { "shared" => image }.merge(files) : (files.empty? ? nil : files)]
   end
+end
+
+# A database file's committed image: successful final commits have complete meta candidates, so trim
+# unreferenced preallocation past the larger slot's page count, which is not part of the logical file
+# byte contract.
+def committed_image(path)
+  image = File.binread(path)
+  ps = image.byteslice(8, 4).unpack1("N")
+  page_count = [0, ps].map { |offset| image.byteslice(offset + 24, 4).unpack1("N") }.max
+  image.byteslice(0, ps * page_count)
+end
+
+def check_image(path, expected)
+  stdout, stderr, status = Open3.capture3("ruby", File.join(ROOT, "spec/fileformat/verify.rb"), "--check-image", path)
+  result = JSON.parse(stdout.lines.last || "{}")
+  raise "verify.rb --check-image #{File.basename(path)}: #{result['error'] || stderr}" unless status.success? && result["error"].nil?
+  got = result.values_at("version", "live", "pages", "free").join(":")
+  raise "check_image #{File.basename(path)}: expected #{expected}, got #{got}" if expected && got != expected
 end
 
 # Every (scenario, pairing) runs in its own temp directory over its own files, so pairings share no
@@ -298,7 +331,8 @@ jobs.each do |job|
   error = job[:error]&.message
   if error.nil? && job[:image]
     reference = (references[job[:path]] ||= job[:image])
-    error = "final incremental bytes differ across core pairings" unless job[:image] == reference
+    differing = job[:image].keys.reject { |file| job[:image][file] == reference[file] }
+    error = "final bytes of #{differing.join(', ')} differ across core pairings" unless differing.empty?
   end
   if error
     warn "FAIL #{File.basename(job[:path])} #{pairing}: #{error}"
