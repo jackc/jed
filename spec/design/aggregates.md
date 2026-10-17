@@ -765,6 +765,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `covar_samp(y, x)` | two exact / two float | `decimal` / `f64` | the sample covariance |
 | `corr(y, x)` | two exact / two float | `decimal` / `f64` | the correlation coefficient |
 | `regr_count(y, x)` | two exact / two float | `i64` | the number of pairs with both arguments non-NULL |
+| `regr_avgx(y, x)` | two exact / two float | `decimal` / `f64` | the mean of `x` |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -886,3 +887,4 @@ with the one-argument float forms (`float-moment-order`).
 | `covar_samp(y, x)` | `numXY / (N·(N − 1))` | `Sxy / (N − 1)` | fewer than two pairs |
 | `corr(y, x)` | `numXY / sqrt(numX·numY)` | `Sxy / sqrt(Sxx·Syy)` | no pair, or `numX` / `Sxx` or `numY` / `Syy` is 0 |
 | `regr_count(y, x)` | `N` (`i64`) | `N` (`i64`) | never (0 over no pair) |
+| `regr_avgx(y, x)` | `Σx / N` | `Σx / N` | no pair |
