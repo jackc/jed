@@ -6,7 +6,7 @@
 //! and the item methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level
 //! predicate (comparison, `exists`, `like_regex`, `starts with`, `is unknown`, §4.4). Path
 //! variables (`$name`, `$"name"`) are bound by the caller's [`Vars`]. The datetime methods and the
-//! `like_regex` `m` flag are `0A000` (jsonpath.md §3.1, §4.3). A malformed path is `42601`. The
+//! `like_regex` `x` flag are `0A000` (jsonpath.md §3.1, §4.3). A malformed path is `42601`. The
 //! compiled program is a pure function of the source — kept byte-identical cross-core by the
 //! conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned).
 
@@ -3270,7 +3270,7 @@ impl Parser<'_> {
     }
 
     /// Parse the rest of `expr like_regex "pattern" [flag "flags"]` after `like_regex` and compile
-    /// the pattern (jsonpath.md §4.3): an unknown flag is `42601`, `x` or `m` without `q` `0A000`,
+    /// the pattern (jsonpath.md §4.3): an unknown flag is `42601`, `x` without `q` `0A000`,
     /// a malformed pattern `2201B`.
     fn parse_like_regex(&mut self, left: PathExpr) -> Result<Parsed> {
         self.skip_ws()?;
@@ -3303,9 +3303,6 @@ impl Parser<'_> {
                     SqlState::FeatureNotSupported,
                     "XQuery \"x\" flag (expanded regular expressions) is not implemented",
                 ));
-            }
-            if flags & REGEX_M != 0 {
-                return Err(unsupported("like_regex \"m\" flag"));
             }
         }
         let program = compile_like_regex(&pattern, flags, self.casing)?;
@@ -3444,16 +3441,13 @@ fn compile_like_regex(
             crate::regex::Mode::default(),
         );
     }
-    let mode = if flags & REGEX_S != 0 {
-        crate::regex::Mode {
-            dot_all: true,
-            nl_stop: false,
-        }
-    } else {
-        crate::regex::Mode {
-            dot_all: false,
-            nl_stop: true,
-        }
+    // PostgreSQL's jspConvertRegexFlags: no `s` adds REG_NLSTOP, and `m` adds REG_NLANCH,
+    // independently of each other (jsonpath.md §4.3).
+    let dot_all = flags & REGEX_S != 0;
+    let mode = crate::regex::Mode {
+        dot_all,
+        nl_stop: !dot_all,
+        nl_anchor: flags & REGEX_M != 0,
     };
     crate::regex::compile_mode(pattern, mode)
 }

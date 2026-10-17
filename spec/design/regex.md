@@ -84,8 +84,8 @@ to tightest: **alternation** `|` → **concatenation** → **quantifier** (`* + 
 | `\<metachar>` | a literal metacharacter — `\. \* \+ \? \( \) \[ \] \{ \} \| \^ \$ \\` |
 | `(...)` | capturing group (group index = its `(` order, 1-based) |
 | `(?:...)` | non-capturing group |
-| `^` `$` | zero-width anchors: start / end of the whole subject (no multiline) |
-| `\A` `\z` | zero-width string-boundary anchors: start / **absolute** end of the whole subject — identical to `^`/`$` while there is no multiline mode, spelled separately so they stay string-anchored once one lands. `\z` is jed's RE2/PCRE spelling (PostgreSQL uses `\Z` for it) |
+| `^` `$` | zero-width anchors: start / end of the whole subject (no multiline for the SQL operators; jsonpath `like_regex`'s `m` flag makes them line anchors, §8d) |
+| `\A` `\z` | zero-width string-boundary anchors: start / **absolute** end of the whole subject — identical to `^`/`$` outside the line-anchor mode, and string-anchored in it (§8d). `\z` is jed's RE2/PCRE spelling (PostgreSQL uses `\Z` for it) |
 
 **Quantifiers** apply to the immediately preceding atom; each has a **greedy** and a **lazy**
 (`?`-suffixed) form:
@@ -138,15 +138,18 @@ indices.
 |---|---|---|
 | `Char` | `c` (code point) | if `sp < len` and `input[sp] == c`: thread → `pc+1` at `sp+1`; else die |
 | `Any`  | — | if `sp < len` and `input[sp] != '\n'`: thread → `pc+1` at `sp+1`; else die |
+| `AnyChar` | — | if `sp < len`: thread → `pc+1` at `sp+1`; else die (any code point, `\n` included — only the §3.2 prefix emits it) |
 | `Class`| `k` (class-table index) | if `sp < len` and `class[k]` admits `input[sp]`: thread → `pc+1` at `sp+1`; else die |
 | `Split`| `x, y` | fork: add thread at `x` (**higher priority**), then at `y` |
 | `Jmp`  | `x` | thread → `x` |
 | `Save` | `n` (slot) | set capture slot `n` = `sp`; thread → `pc+1` |
 | `AssertStart` | — | if `sp == 0`: thread → `pc+1`; else die |
 | `AssertEnd`   | — | if `sp == len`: thread → `pc+1`; else die |
+| `AssertLineStart` | — | if `sp == 0` or `input[sp-1] == '\n'`: thread → `pc+1`; else die (line-anchor mode, §8d) |
+| `AssertLineEnd`   | — | if `sp == len` or `input[sp] == '\n'`: thread → `pc+1`; else die (line-anchor mode, §8d) |
 | `Match`| — | accept; record capture slots |
 
-`Char`/`Any`/`Class` are **consuming** (advance `sp`); the rest are zero-width (epsilon). A class
+`Char`/`Any`/`AnyChar`/`Class` are **consuming** (advance `sp`); the rest are zero-width (epsilon). A class
 table is an array of `{negated, ranges:[(lo,hi)…]}` referenced by index; identical classes are
 **not** deduplicated (a fresh index per class occurrence — keeps emission a pure function of
 position; the fixtures pin the indices).
@@ -157,7 +160,7 @@ The whole program is, in order:
 
 ```
 0: Split  3, 1        # implicit LAZY .*? prefix → match may start at any position, leftmost preferred
-1: Any                #   consume one code point …
+1: AnyChar            #   consume one code point (a newline too, so a match may start after one) …
 2: Jmp    0           #   … and retry the prefix
 3: Save   0           # group 0 (whole match) opens
    <emit(root)>       # the pattern body (§3.3)
@@ -256,6 +259,7 @@ for sp := 0 .. len (inclusive):
         switch prog[t.pc]:                       # (the state was already charged when add_thread explored it)
             Char c:  if sp < len and input[sp] == c:        add_thread(nlist, {t.pc+1, t.saves}, sp+1)
             Any:     if sp < len and input[sp] != '\n':     add_thread(nlist, {t.pc+1, t.saves}, sp+1)
+            AnyChar: if sp < len:                          add_thread(nlist, {t.pc+1, t.saves}, sp+1)
             Class k: if sp < len and class_admits(k, input[sp]): add_thread(nlist, {t.pc+1, t.saves}, sp+1)
             Match:   matched := t.saves
                      break                       # CUT lower-priority threads in clist (leftmost-first)
@@ -282,7 +286,9 @@ add_thread(list, t, sp):
         Save n:       s2 := t.saves.with(n, sp); add_thread(list, {t.pc+1, s2}, sp)          # a new version (§4.1)
         AssertStart:  if sp == 0:   add_thread(list, {t.pc+1, t.saves}, sp)
         AssertEnd:    if sp == len: add_thread(list, {t.pc+1, t.saves}, sp)
-        _:            list.append(t)             # Char / Any / Class / Match — parked for the consume loop
+        AssertLineStart: if sp == 0 or input[sp-1] == '\n':   add_thread(list, {t.pc+1, t.saves}, sp)
+        AssertLineEnd:   if sp == len or input[sp] == '\n':   add_thread(list, {t.pc+1, t.saves}, sp)
+        _:            list.append(t)             # Char / Any / AnyChar / Class / Match — parked for the consume loop
 ```
 
 A real implementation makes `add_thread` **iterative** (an explicit work stack, pushing the `y`
@@ -574,8 +580,9 @@ no `scalar_byte`: their pieces partition the subject, so their text never exceed
 ## 8d. Compile modes for jsonpath `like_regex`
 
 The jsonpath `like_regex` predicate ([jsonpath.md](jsonpath.md) §4.3) compiles its pattern with
-PostgreSQL's XQuery flag translation, which needs three compile modes the SQL operators do not use.
-Each is a transform at parse time; the instruction set, the VM, and the costs are unchanged.
+PostgreSQL's XQuery flag translation, which needs four compile modes the SQL operators do not use.
+Each is a transform at parse time; the costs are unchanged, and only the line-anchor mode needs
+instructions of its own.
 
 - **Newline-sensitive** (the default for `like_regex`, PostgreSQL's `REG_NLSTOP`). A negated
   bracket class `[^…]` does not match `\n`: the parser adds `\n` to its range list before
@@ -584,6 +591,11 @@ Each is a transform at parse time; the instruction set, the VM, and the costs ar
 - **Dot-all** (the `s` flag). `.` matches every code point, `\n` included: it compiles to a `Class`
   instruction over an empty negated class instead of `Any` (one instruction either way). A negated
   bracket class matches `\n`, the SQL operators' behavior.
+- **Line-anchor** (the `m` flag, PostgreSQL's `REG_NLANCH`). `^` compiles to `AssertLineStart` and
+  `$` to `AssertLineEnd` (§3.1): each also matches just after / just before a `\n`, so `^b$` matches
+  `"a\nb"`. Only `\n` breaks a line (`$` does not match before a `\r`). `\A` and `\z` keep the string
+  anchors. It combines with either of the modes above: `m` without `s` keeps `.` and `[^…]` off
+  `\n`, as PostgreSQL's flag translation sets `REG_NLSTOP` and `REG_NLANCH` independently.
 - **Quote** (the `q` flag). The whole pattern is a literal: every metacharacter of §2 is escaped
   with `\` before parsing, so the program is a sequence of `Char` instructions.
 
@@ -649,8 +661,8 @@ corpus (§11).
   [functions.md](functions.md) §10). The functions themselves **landed in Slice 4** (§8c), and the
   Oracle-compat functions in Slice 3 (§8b).
 - `\b` word boundary, POSIX `[[:class:]]`, numeric escapes `\xHH`/`\x{…}`, Unicode-property classes
-  `\p{…}` (ties into the collation Unicode-property work), the `m`/`x` flags and inline `(?i)`.
-  (The `s` flag exists only for jsonpath `like_regex`, §8d.)
+  `\p{…}` (ties into the collation Unicode-property work), the `m`/`x` flags and inline `(?i)` on
+  the SQL operators. (The `s` and `m` flags exist only for jsonpath `like_regex`, §8d.)
 - A lazy-DFA fast path (perf only — same semantics); regex-driven index acceleration (anchored
   `~ '^literal'` → a PK/index bound, the point-lookup precedent).
 

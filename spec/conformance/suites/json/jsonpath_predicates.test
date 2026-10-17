@@ -419,6 +419,61 @@ true
 true
 true
 
+# An unanchored match may start after a newline, in every mode.
+query BBB nosort
+SELECT jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "b")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "b$")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "b" flag "s")')
+----
+true
+true
+true
+
+# flag "m": `^` and `$` also match just after and just before a newline (PostgreSQL's REG_NLANCH).
+# Without it they anchor the whole string. \A stays the string start.
+query BBBBBB nosort
+SELECT jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "^b$" flag "m")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "^b$")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a$" flag "m")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a$")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "\\Ab" flag "m")'), jsonb_path_exists('"a\r\nb"', '$ ? (@ like_regex "a$" flag "m")')
+----
+true
+false
+true
+false
+false
+false
+
+# m is independent of s: without s, `.` and [^…] still stop at a newline; flag order does not matter.
+query BBBBB nosort
+SELECT jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a.b" flag "m")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a[^x]b" flag "m")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a.b" flag "ms")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a.b" flag "sm")'), jsonb_path_exists('"a\nB"', '$ ? (@ like_regex "^b" flag "mi")')
+----
+false
+false
+true
+true
+true
+
+# Each line of a multi-line string is tested; an empty line is a line.
+query T rowsort
+SELECT * FROM jsonb_path_query('["x\ny", "y\nx", "xy", "\n\n"]', '$[*] ? (@ like_regex "^y" flag "m")')
+----
+"x\ny"
+"y\nx"
+
+query BB nosort
+SELECT jsonb_path_exists('"a\n\nb"', '$ ? (@ like_regex "^$" flag "m")'), jsonb_path_exists('"ab"', '$ ? (@ like_regex "^$" flag "m")')
+----
+true
+false
+
+# Under q the pattern is a literal and m is ignored, as XQuery specifies.
+query BB nosort
+SELECT jsonb_path_exists('"a^b"', '$ ? (@ like_regex "^b" flag "mq")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "^b" flag "mq")')
+----
+true
+false
+
+query T nosort
+SELECT '$ ? (@ like_regex "^a" flag "mi")'::jsonpath
+----
+$?(@ like_regex "^a" flag "im")
+
 # flag "i" folds the pattern's literals but keeps the letter after a backslash (regex.md §1), so
 # \D \W \S keep their meaning and \A stays the start anchor.
 query BBBBBB nosort

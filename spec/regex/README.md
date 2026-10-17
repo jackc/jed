@@ -24,14 +24,19 @@ order. The per-core test renders its compiled program to this canonical listing 
 | `jmp A` | `Jmp` to index A |
 | `char N` | `Char`, N = the matched code point (decimal) |
 | `any` | `Any` (any code point except `\n`) |
+| `anychar` | `AnyChar` (any code point, `\n` included — the unanchored prefix's consume step) |
 | `class K` | `Class`, K = index into `classes` |
 | `save N` | `Save` capture slot N |
-| `assertstart` / `assertend` | `^` / `$` anchors |
+| `assertstart` / `assertend` | `^` / `$` anchors (and `\A` / `\z`) |
+| `assertlinestart` / `assertlineend` | `^` / `$` in the line-anchor mode (`flags = "m"`) |
 | `match` | `Match` (accept) |
 
 **Class listing format** (one string per class, in `classes` order): the ranges as `lo-hi` code-point
 pairs (decimal) joined by `,`, prefixed with `^` when negated. E.g. `97-99` is `[a-c]`; `^48-57` is
 `[^0-9]`. Ranges are sorted by `lo` and merged (regex.md §3.4).
+
+`flags = "m"` compiles in the line-anchor mode of [regex.md §8d](../design/regex.md) (the jsonpath
+`like_regex` `m` flag) and nothing else; `match_vectors.toml` uses it the same way.
 
 `flags = "i"` folds the pattern with simple lowercasing *before* compiling (the `~*` / ILIKE
 mechanism), so `(pattern="A", flags="i")` compiles identically to `(pattern="a")`. The fold skips the

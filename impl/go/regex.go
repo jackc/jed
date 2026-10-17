@@ -33,12 +33,19 @@ type regexOp uint8
 const (
 	opChar regexOp = iota
 	opAny
+	// opAnyChar is any code point, newline included: the unanchored prefix's consume step
+	// (regex.md §3.2), so a match may start after a newline.
+	opAnyChar
 	opClass
 	opSplit
 	opJmp
 	opSave
 	opAssertStart
 	opAssertEnd
+	// opAssertLineStart is `^` in the line-anchor mode (regex.md §8d): the subject start or just
+	// after a newline. opAssertLineEnd is `$` there: the subject end or just before a newline.
+	opAssertLineStart
+	opAssertLineEnd
 	opMatch
 )
 
@@ -92,6 +99,8 @@ func (p *regexProgram) listing() []string {
 			out[i] = fmt.Sprintf("char %d", in.ch)
 		case opAny:
 			out[i] = "any"
+		case opAnyChar:
+			out[i] = "anychar"
 		case opClass:
 			out[i] = fmt.Sprintf("class %d", in.x)
 		case opSplit:
@@ -104,6 +113,10 @@ func (p *regexProgram) listing() []string {
 			out[i] = "assertstart"
 		case opAssertEnd:
 			out[i] = "assertend"
+		case opAssertLineStart:
+			out[i] = "assertlinestart"
+		case opAssertLineEnd:
+			out[i] = "assertlineend"
 		case opMatch:
 			out[i] = "match"
 		}
@@ -159,6 +172,8 @@ const (
 	nGroup
 	nAnchorStart
 	nAnchorEnd
+	nLineStart
+	nLineEnd
 )
 
 type regexNode struct {
@@ -190,6 +205,9 @@ type regexMode struct {
 	nlStop bool
 	// dotAll lets `.` match a newline (the XQuery `s` flag).
 	dotAll bool
+	// nlAnchor lets `^`/`$` also anchor just after / before a newline (the XQuery `m` flag,
+	// PostgreSQL's REG_NLANCH). `\A`/`\z` stay string-anchored.
+	nlAnchor bool
 }
 
 // quoteRegex escapes every metacharacter of a pattern so it compiles to the literal string (the
@@ -395,9 +413,15 @@ func (p *regexParser) parseAtom() (*regexNode, error) {
 		return &regexNode{kind: nAny}, nil
 	case '^':
 		p.bump()
+		if p.mode.nlAnchor {
+			return &regexNode{kind: nLineStart}, nil
+		}
 		return &regexNode{kind: nAnchorStart}, nil
 	case '$':
 		p.bump()
+		if p.mode.nlAnchor {
+			return &regexNode{kind: nLineEnd}, nil
+		}
 		return &regexNode{kind: nAnchorEnd}, nil
 	case '\\':
 		p.bump()
@@ -781,6 +805,12 @@ func (c *regexCompiler) emit(n *regexNode) error {
 	case nAnchorEnd:
 		_, err := c.push(regexInst{op: opAssertEnd})
 		return err
+	case nLineStart:
+		_, err := c.push(regexInst{op: opAssertLineStart})
+		return err
+	case nLineEnd:
+		_, err := c.push(regexInst{op: opAssertLineEnd})
+		return err
 	}
 	return nil
 }
@@ -855,7 +885,7 @@ func compileRegexMode(pattern string, mode regexMode) (*regexProgram, error) {
 	if _, err := c.push(regexInst{op: opSplit, x: 3, y: 1}); err != nil {
 		return nil, err
 	}
-	if _, err := c.push(regexInst{op: opAny}); err != nil {
+	if _, err := c.push(regexInst{op: opAnyChar}); err != nil {
 		return nil, err
 	}
 	if _, err := c.push(regexInst{op: opJmp, x: 0}); err != nil {
@@ -1096,7 +1126,7 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 	var matched C
 	found := false
 
-	if err := pikeAddThread[C, R](p, &clist, seen, seen.next(), 0, unset, start, length, m); err != nil {
+	if err := pikeAddThread[C, R](p, &clist, seen, seen.next(), 0, unset, start, input, m); err != nil {
 		return regexCaps{}, false, err
 	}
 
@@ -1110,19 +1140,25 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 			switch in.op {
 			case opChar:
 				if sp < length && input[sp] == in.ch {
-					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, m); err != nil {
 						return regexCaps{}, false, err
 					}
 				}
 			case opAny:
 				if sp < length && input[sp] != '\n' {
-					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, m); err != nil {
+						return regexCaps{}, false, err
+					}
+				}
+			case opAnyChar:
+				if sp < length {
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, m); err != nil {
 						return regexCaps{}, false, err
 					}
 				}
 			case opClass:
 				if sp < length && p.classes[in.x].admits(input[sp]) {
-					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, m); err != nil {
 						return regexCaps{}, false, err
 					}
 				}
@@ -1146,8 +1182,9 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 // consuming/Match threads to *list, deduping by pc within this generation. Iterative (explicit
 // stack) so a long Jmp/Split chain cannot overflow the native stack; the y arm of a Split is pushed
 // before x so x is processed first (higher priority). Charges regex_step per explored state.
-func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], seen *regexSeen, generation uint32, pc0 int, caps0 C, sp, length int, m *costMeter) error {
+func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], seen *regexSeen, generation uint32, pc0 int, caps0 C, sp int, input []rune, m *costMeter) error {
 	var rep R
+	length := len(input)
 	stack := []regexThread[C]{{pc0, caps0}}
 	for len(stack) > 0 {
 		top := stack[len(stack)-1]
@@ -1173,6 +1210,14 @@ func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], 
 			}
 		case opAssertEnd:
 			if sp == length {
+				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
+			}
+		case opAssertLineStart:
+			if sp == 0 || input[sp-1] == '\n' {
+				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
+			}
+		case opAssertLineEnd:
+			if sp == length || input[sp] == '\n' {
 				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
 			}
 		default:

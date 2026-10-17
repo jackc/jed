@@ -518,8 +518,9 @@ The XQuery `flag` string is translated as PostgreSQL's `jspConvertRegexFlags` do
 - **`s`** (dot-all) — `.` and `[^…]` match `\n` (regex.md §8d).
 - **`q`** (quote) — the pattern is a literal string (regex.md §8d); `s`, `m`, and `x` are then
   ignored, as XQuery specifies.
-- **`m`** (multi-line `^`/`$`) — **unsupported, `0A000`**, raised at compile unless `q` is also set: jed's
-  VM has no line anchors. A documented divergence; PostgreSQL supports it.
+- **`m`** (multi-line `^`/`$`, PostgreSQL's `REG_NLANCH`) — `^` and `$` also match just after and
+  just before a `\n` (the line-anchor mode, regex.md §8d); `\A`/`\z` still anchor the whole string.
+  It is independent of `s`: without `s`, `.` and `[^…]` still stop at `\n`.
 - **`x`** (XQuery whitespace) — **`0A000`** unless `q` is set, as in PostgreSQL (`XQuery "x" flag
   (expanded regular expressions) is not implemented`).
 
@@ -782,8 +783,8 @@ error, so silent mode and `ON ERROR` do not suppress them (§5).
 Reuse existing codes where PG does: **`42601`** for a malformed path *literal* (syntax-error
 class, at resolve) and an unrecognized `like_regex` flag character, **`22023`** for a `.decimal()`
 precision or scale outside PostgreSQL's `numeric` typmod ranges, **`2201B`** for a malformed
-`like_regex` pattern (`54001` for an oversized one), **`0A000`** for the unsupported `m`/`x` regex
-flags (§4.3), **`22003`** for a `.**` level above 2147483647 (§2), and **`22P02`** for malformed JSON in the
+`like_regex` pattern (`54001` for an oversized one), **`0A000`** for the unsupported `x` regex
+flag (§4.3), **`22003`** for a `.**` level above 2147483647 (§2), and **`22P02`** for malformed JSON in the
 `json_in`/`jsonb_in` document-input path ([json.md §6.3](json.md)). A string escape that decodes
 to NUL is **`22P05`**, an unpaired surrogate escape **`22P02`** (§2.1), and a path with no tokens
 **`22P02`** (§2.4). Arithmetic raises the
@@ -849,9 +850,9 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     **Not supported, by decision (`0A000`, §3.1):** the datetime methods, and with them the `_tz`
     functions' time zone use and `PASSING` a date/time value (a datetime item).
   - **Predicates** ✅ — `exists (…)`, `like_regex` with its flags (§4.3, onto the Pike VM's
-    newline-sensitive / dot-all / quote modes, regex.md §8d), `starts with`, and `(…) is unknown`
-    (§4.4 rules 5–7), in filters and as top-level predicates. Capability `expr.jsonpath_predicates`.
-    **Unsupported (`0A000`, §4.3):** the `m` flag (and `x`, as in PostgreSQL).
+    newline-sensitive / dot-all / line-anchor / quote modes, regex.md §8d), `starts with`, and
+    `(…) is unknown` (§4.4 rules 5–7), in filters and as top-level predicates. Capability
+    `expr.jsonpath_predicates`. **Unsupported (`0A000`, §4.3):** the `x` flag, as in PostgreSQL.
   - **Any-level accessor** ✅ — `.**` with `{n}` / `{n to m}` / `last` bounds (§3.3), suppressing
     navigation errors below it in either mode. Capability `expr.jsonpath_any`.
 - **P3** — the `_tz` variants (§5.1): ✅ as STABLE twins. They have no datetime comparisons to

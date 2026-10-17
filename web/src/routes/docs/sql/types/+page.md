@@ -521,8 +521,9 @@ Besides comparisons, a `jsonpath` filter or top-level predicate may use PostgreS
 predicates: `exists (path)`, `starts with "prefix"` (or a variable), `like_regex "pattern"` with an
 optional `flag` string, and `(predicate) is unknown`. `like_regex` uses jed's regular expressions (see
 [pattern matching](/docs/sql/pattern-matching)), with the flags `i` (ignore case), `s` (`.` matches a
-newline), and `q` (the pattern is literal text). Without `s`, `.` and `[^…]` do not match a newline.
-The `m` flag is not supported (`0A000`), and `x` is not supported in PostgreSQL either. The `.**`
+newline), `m` (`^` and `$` also match at the start and end of each line), and `q` (the pattern is
+literal text). Without `s`, `.` and `[^…]` do not match a newline. The `x` flag is not supported, as
+in PostgreSQL. The `.**`
 accessor reaches every level below an item: `$.**` is the item and all its descendants,
 `$.**{2}` only level 2, and `$.**{1 to last}` everything below the item. As in PostgreSQL, a path
 continuing after `.**` skips the items it does not apply to, even in `strict` mode. In `lax` mode it

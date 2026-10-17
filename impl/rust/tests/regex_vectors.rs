@@ -83,6 +83,21 @@ fn parse_str_array(val: &str) -> Vec<String> {
     inner.split(',').map(|p| unquote(p.trim())).collect()
 }
 
+/// Compile a vector's pattern; `flags = "m"` selects the line-anchor mode (regex.md §8d).
+fn compile_case(pat: &str, flags: &str) -> jed::error::Result<jed::regex::Program> {
+    if flags.contains('m') {
+        jed::regex::compile_mode(
+            pat,
+            jed::regex::Mode {
+                nl_anchor: true,
+                ..Default::default()
+            },
+        )
+    } else {
+        compile(pat)
+    }
+}
+
 #[test]
 fn program_vectors_match() {
     let text = std::fs::read_to_string("../../spec/regex/program_vectors.toml")
@@ -101,8 +116,8 @@ fn program_vectors_match() {
         } else {
             c.pattern.clone()
         };
-        let prog =
-            compile(&pat).unwrap_or_else(|e| panic!("compile {:?}: {}", c.pattern, e.message));
+        let prog = compile_case(&pat, &c.flags)
+            .unwrap_or_else(|e| panic!("compile {:?}: {}", c.pattern, e.message));
         assert_eq!(
             prog.listing(),
             c.prog,
@@ -215,8 +230,8 @@ fn match_vectors_match() {
         } else {
             (c.pattern.clone(), c.input.clone())
         };
-        let prog =
-            compile(&pat).unwrap_or_else(|e| panic!("compile {:?}: {}", c.pattern, e.message));
+        let prog = compile_case(&pat, &c.flags)
+            .unwrap_or_else(|e| panic!("compile {:?}: {}", c.pattern, e.message));
         let chars: Vec<char> = subj.chars().collect();
         let mut m = Meter::new();
         let caps = prog.run(&chars, &mut m).unwrap();
