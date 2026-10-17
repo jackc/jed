@@ -3116,6 +3116,7 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::AlterTable(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
+            | Statement::Reindex(_)
             | Statement::CreateType(_)
             | Statement::DropType(_)
             | Statement::CreateSequence(_)
@@ -3388,6 +3389,19 @@ pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
         Statement::Analyze(analyze) => {
             req.is_ddl = true;
             req.need_table(&analyze.name, Privilege::Select);
+        }
+        // REINDEX is maintenance like ANALYZE (session.md §5.3): `allow_ddl`, plus SELECT on the
+        // target table — an INDEX target's owning table is added by `check_privileges`, which can
+        // resolve the index. DATABASE / SYSTEM need only `allow_ddl` (PostgreSQL's database-owner
+        // check). The temp split (`allow_temp_ddl`) does not apply: it governs schema creation and
+        // removal, not maintenance (spec/design/indexes.md §10).
+        Statement::Reindex(rx) => {
+            req.is_ddl = true;
+            if rx.kind == ReindexKind::Table
+                && let Some(name) = &rx.name
+            {
+                req.need_table(name, Privilege::Select);
+            }
         }
         Statement::CreateTable(ct) => {
             req.is_ddl = true;
@@ -3910,6 +3924,7 @@ pub(crate) fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::AlterTable(_) => "ALTER TABLE",
         Statement::CreateIndex(_) => "CREATE INDEX",
         Statement::DropIndex(_) => "DROP INDEX",
+        Statement::Reindex(_) => "REINDEX",
         Statement::CreateType(_) => "CREATE TYPE",
         Statement::DropType(_) => "DROP TYPE",
         Statement::CreateSequence(_) => "CREATE SEQUENCE",

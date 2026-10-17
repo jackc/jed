@@ -233,6 +233,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // CREATE INDEX IF NOT EXISTS name — a taken relation name is a no-op success rather than 42P07,
     // decided after the definition validates and before the build (grammar.md §30, indexes.md §1).
     "ddl.create_index_if_not_exists",
+    // REINDEX INDEX / TABLE / DATABASE / SYSTEM — rebuild indexes in place from their stored
+    // definitions, re-admitting dependencies against the current environment (indexes.md §10).
+    "ddl.reindex",
     // DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
     "ddl.drop_table",
     // DROP TABLE IF EXISTS — the idempotent form: a missing table is a no-op success rather

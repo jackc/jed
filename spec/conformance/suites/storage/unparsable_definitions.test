@@ -10,7 +10,7 @@
 #   p (id, v) rows (1,1) (2,2); UNIQUE partial index p_future_idx on v whose predicate does not parse
 # The two unparsed indexes are forged EMPTY although their tables have rows, so a planner that used
 # either would lose rows. jed-specific, so cross-core-checked, not PostgreSQL-oracle-checked.
-# requires: harness.fixture_open, storage.unparsable_definitions, introspect.tables, introspect.views, introspect.columns, introspect.indexes, introspect.constraints, ddl.view, ddl.view_alter, ddl.view_cascade, dml.view_write, ddl.check, ddl.column_default_expr, ddl.index_expr, ddl.index_partial, ddl.alter_table, ddl.drop_table, dml.insert, dml.insert_column_list, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text
+# requires: harness.fixture_open, storage.unparsable_definitions, introspect.tables, introspect.views, introspect.columns, introspect.indexes, introspect.constraints, ddl.view, ddl.view_alter, ddl.view_cascade, dml.view_write, ddl.check, ddl.column_default_expr, ddl.index_expr, ddl.index_partial, ddl.reindex, ddl.alter_table, ddl.drop_table, dml.insert, dml.insert_column_list, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text
 # fixture: fileformat/fixtures/unparsable_definitions.jed
 
 # --- views (§3.1) ----------------------------------------------------------------------------------
@@ -274,6 +274,20 @@ UPDATE x SET v = 5 WHERE id = 1
 statement error XX003
 DELETE FROM x WHERE id = 1
 
+# A rebuild needs the parsed definition (indexes.md §10): XX003 for the unparsed index, and for every
+# form that reaches it. The table's other index rebuilds on its own.
+statement error XX003
+REINDEX INDEX x_future_idx
+
+statement error XX003
+REINDEX TABLE x
+
+statement error XX003
+REINDEX DATABASE
+
+statement ok
+REINDEX INDEX x_v_idx
+
 statement ok
 DROP INDEX x_future_idx
 
@@ -320,6 +334,9 @@ SELECT t.id, p.id FROM t JOIN p ON p.v = t.v
 
 statement error XX003
 INSERT INTO p VALUES (3, 3)
+
+statement error XX003
+REINDEX INDEX p_future_idx
 
 statement error XX003
 ALTER TABLE p ALTER COLUMN v TYPE i64
