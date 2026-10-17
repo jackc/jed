@@ -711,7 +711,7 @@ impl Decimal {
 
     /// Exact product (scale s1+s2), NO cap check — the running form of `*` for the kernels
     /// (PG `mul_var` does not cap; only `make_result` does).
-    fn mul_exact(&self, other: &Decimal) -> Decimal {
+    pub(crate) fn mul_exact(&self, other: &Decimal) -> Decimal {
         Decimal::from_parts(
             self.neg ^ other.neg,
             self.scale + other.scale,
@@ -2039,4 +2039,40 @@ fn increment_digits(digits: &str) -> String {
     }
     b.insert(0, b'1');
     String::from_utf8(b).expect("ASCII digits")
+}
+
+/// PostgreSQL's `numeric_stddev_internal` (spec/design/aggregates.md §23) over the exact moments of
+/// `n` non-NULL inputs (`sx` = Σx, `sxx` = Σx²): `None` over no input (or one, for a sample); else
+/// (N·Σx² − (Σx)²) / (N·N) for the population or / (N·(N−1)) for a sample, divided at
+/// `select_div_scale` and rounded half away from zero, then (for a standard deviation) its square
+/// root at the same scale. A numerator that is not positive yields 0. Traps 22003 past the cap.
+pub(crate) fn moment_variance(
+    n: i64,
+    sx: &Decimal,
+    sxx: &Decimal,
+    sample: bool,
+    stddev: bool,
+) -> Result<Option<Decimal>> {
+    if n == 0 || (sample && n <= 1) {
+        return Ok(None);
+    }
+    let count = Decimal::from_i64(n);
+    let rscale = sx.scale as i64 * 2;
+    let numerator = count
+        .mul_var(sxx, rscale)
+        .add_uncapped(&sx.mul_var(sx, rscale).neg());
+    if numerator.is_negative() || numerator.is_zero() {
+        return Ok(Some(Decimal::from_i64(0)));
+    }
+    let denominator = count.mul_exact(&if sample {
+        Decimal::from_i64(n - 1)
+    } else {
+        count.clone()
+    });
+    let scale = select_div_scale(&numerator, &denominator) as i64;
+    let mut result = numerator.div_var(&denominator, scale)?;
+    if stddev {
+        result = result.sqrt_var(scale, None)?;
+    }
+    Ok(Some(result.check_cap()?))
 }

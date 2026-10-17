@@ -1291,3 +1291,27 @@ function incrementDigits(digits: string): string {
   }
   return `1${b.join("")}`;
 }
+
+// momentVariance is PostgreSQL's numeric_stddev_internal (spec/design/aggregates.md §23) over the
+// exact moments of `n` non-NULL inputs (sx = Σx, sxx = Σx²): null over no input (or one, for a
+// sample); else (N·Σx² − (Σx)²) / (N·N) for the population or / (N·(N−1)) for a sample, divided at
+// select_div_scale and rounded half away from zero, then (for a standard deviation) its square root
+// at the same scale. A numerator that is not positive yields 0. Throws 22003 past the cap.
+export function momentVariance(
+  n: bigint,
+  sx: Decimal,
+  sxx: Decimal,
+  sample: boolean,
+  stddev: boolean,
+): Decimal | null {
+  if (n === 0n || (sample && n <= 1n)) return null;
+  const count = Decimal.fromBigInt(n);
+  const rscale = sx.scale * 2;
+  const numerator = count.mulVar(sxx, rscale).subUncapped(sx.mulVar(sx, rscale));
+  if (numerator.neg || numerator.isZero()) return Decimal.fromBigInt(0n);
+  const denominator = count.mulExact(sample ? Decimal.fromBigInt(n - 1n) : count);
+  const scale = selectDivScale(numerator, denominator);
+  let result = numerator.divVar(denominator, scale);
+  if (stddev) result = result.sqrtVar(scale);
+  return result.checkCap();
+}

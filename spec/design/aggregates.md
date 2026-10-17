@@ -755,6 +755,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `bit_xor(x)` | `i16`/`i32`/`i64` | the input type | the bitwise XOR of the non-NULL inputs |
 | `array_agg(x)` | any | `T[]`, or the input array type | the inputs, NULLs included, as an array |
 | `string_agg(x, d)` | `text, text` / `bytea, bytea` | `text` / `bytea` | the non-NULL values joined by the delimiters |
+| `var_pop(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the population variance |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -797,3 +798,37 @@ string value still counts). The two arguments share a family — `(text, text) �
 `[value, delimiter]` of every row with a non-NULL value as query-memory operator state
 (`value_bytes(value) + value_bytes(delimiter)`); on the bounded-spill lane those are its retained
 aggregate rows and its packed state is `[bool seen]`.
+
+**Statistical aggregates.** Over **integer or decimal** input they are **exact** and return
+`decimal`: the fold keeps the count `N` and the uncapped decimal sums `Σx` and `Σx²` (charging
+`decimal_work` for the square and both additions by the `*` and `+` formulas, [cost.md](cost.md) §3),
+and finalization is PostgreSQL's `numeric_stddev_internal`, so the result matches PostgreSQL's
+`numeric` digit for digit:
+
+```
+rscale      = 2 · scale(Σx)
+numerator   = mul_var(N, Σx², rscale) − mul_var(Σx, Σx, rscale)     -- exact
+denominator = N · N          (population)        N · (N − 1)   (sample)
+variance    = numerator / denominator   at select_div_scale(numerator, denominator), half away
+stddev      = sqrt_var(variance, that same scale)
+```
+
+A numerator that is not positive yields `0` (scale 0). The result is NULL over no input, and over a
+single input for the sample forms; past the decimal cap it is `22003`. Over **float** input (`f32`
+widened to `f64`, as PostgreSQL's `float4_accum` does) they are PostgreSQL's `float8` algorithms and
+return `f64`: the fold is `float8_accum`'s Youngs-Cramer update of `(N, Σx, Sxx)`
+
+```
+N' = N + 1;  Σx' = Σx + x
+if N > 0:  t = x·N' − Σx';  Sxx' = Sxx + t·t / (N'·N)
+           if Σx' or Sxx' is ±Inf: 22003 when Σx and x were finite, else Sxx' = NaN
+else:      Sxx' = NaN if x is NaN or ±Inf
+```
+
+with each operation separately rounded (no fused multiply-add), and finalization divides `Sxx` by `N`
+or `N − 1` (and takes `sqrt` for a standard deviation). The float fold's low bits depend on fold
+order, which the determinism ledger records as `float-moment-order` (the same footing as float
+`SUM`/`AVG`, [float.md](float.md) §7); the exact forms are order-independent. Packed state on the
+bounded-spill lane: exact `[int N, decimal Σx, decimal Σx²]`, float `[f64 N, f64 Σx, f64 Sxx]`.
+
+- `var_pop` is the population variance.

@@ -1237,6 +1237,12 @@ fn pack_acc(acc: Acc) -> Row {
         Acc::MinMax { cur, .. } => vec![cur.unwrap_or(Value::Null)],
         Acc::Bool { cur, .. } => vec![cur.map_or(Value::Null, Value::Bool)],
         Acc::Bit { cur, .. } => vec![cur.map_or(Value::Null, Value::Int)],
+        Acc::MomentsExact { n, sx, sxx, .. } => {
+            vec![Value::Int(n), Value::Decimal(sx), Value::Decimal(sxx)]
+        }
+        Acc::MomentsFloat { n, sx, sxx, .. } => {
+            vec![Value::Float64(n), Value::Float64(sx), Value::Float64(sxx)]
+        }
         // The seen flag; over array inputs then the first input's shape — its dimension count and
         // each (length, lower bound) pair — so a later input is checked against it.
         Acc::ArrayAgg {
@@ -1322,6 +1328,20 @@ fn unpack_acc(spec: &AggSpec, state: Row, zone: &crate::timezone::ZoneRef) -> Ac
                 Value::Int(n) => Some(n),
                 _ => None,
             }
+        }
+        Acc::MomentsExact { n, sx, sxx, .. } => {
+            *n = int(0);
+            *sx = dec(1);
+            *sxx = dec(2);
+        }
+        Acc::MomentsFloat { n, sx, sxx, .. } => {
+            let f = |i: usize| match state[i] {
+                Value::Float64(v) => v,
+                _ => unreachable!(),
+            };
+            *n = f(0);
+            *sx = f(1);
+            *sxx = f(2);
         }
         Acc::ArrayAgg {
             seen,

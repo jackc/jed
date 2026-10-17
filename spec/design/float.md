@@ -275,7 +275,9 @@ so a future parallel plan may reorder the fold without a contract break (the poi
 now rather than re-visiting under parallelism). It is a documented divergence from PG (whose float
 sum is likewise order-dependent), and the value stays within the `R`-tag tolerance of PG (§9). Int
 and decimal `SUM`/`AVG`, and `MIN`/`MAX`/`COUNT`, remain order-independent and fully in-contract
-(§1) — this exemption is float `SUM`/`AVG` only.
+(§1) — this exemption is float `SUM`/`AVG` only. The float statistical aggregates (`var_pop` and the
+rest of [aggregates.md](aggregates.md) §23) fold PostgreSQL's Youngs-Cramer update in scan order on
+the same footing, ledgered separately as `float-moment-order`.
 
 **Algorithm** (the identical steps every core runs — CLAUDE.md §2/§5):
 

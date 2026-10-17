@@ -125,6 +125,18 @@ impl Acc {
                 is_and: true,
             },
             AggPlan::Bit(op) => Acc::Bit { cur: None, op },
+            AggPlan::Moment { stat, float: false } => Acc::MomentsExact {
+                stat,
+                n: 0,
+                sx: Decimal::from_i64(0),
+                sxx: Decimal::from_i64(0),
+            },
+            AggPlan::Moment { stat, float: true } => Acc::MomentsFloat {
+                stat,
+                n: 0.0,
+                sx: 0.0,
+                sxx: 0.0,
+            },
             AggPlan::StringAgg => Acc::StringAgg {
                 rows: Vec::new(),
                 seen: false,
@@ -293,6 +305,33 @@ impl Acc {
                         (Some(c), BitOp::Xor) => c ^ v,
                     });
                 }
+            }
+            Acc::MomentsExact { n, sx, sxx, .. } => {
+                // NULLs are skipped. Each fold charges decimal_work for the square and the two
+                // additions, by the `*` and `+` formulas (spec/design/cost.md §3).
+                if !matches!(value, Value::Null) {
+                    let x = to_decimal(value);
+                    let x2 = x.mul_exact(&x);
+                    m.charge(
+                        COSTS.decimal_work
+                            * ((decimal::work_mul(&x, &x) - 1 + decimal::work_linear(sx, &x) - 1
+                                + decimal::work_linear(sxx, &x2)
+                                - 1) as i64),
+                    );
+                    m.guard()?;
+                    *sx = sx.add_uncapped(&x);
+                    *sxx = sxx.add_uncapped(&x2);
+                    *n += 1;
+                }
+            }
+            Acc::MomentsFloat { n, sx, sxx, .. } => {
+                let x = match value {
+                    Value::Null => return Ok(()),
+                    Value::Float32(f) => f as f64,
+                    Value::Float64(f) => f,
+                    _ => unreachable!("the resolver gives a float moment a float operand"),
+                };
+                fold_float_moment(n, sx, sxx, x)?;
             }
             Acc::StringAgg { rows, seen } => {
                 // A NULL value is skipped; a NULL delimiter adds nothing (PostgreSQL
@@ -519,6 +558,17 @@ impl Acc {
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
             Acc::Bool { cur, .. } => cur.map_or(Value::Null, Value::Bool),
             Acc::Bit { cur, .. } => cur.map_or(Value::Null, Value::Int),
+            Acc::MomentsExact {
+                stat, n, sx, sxx, ..
+            } => {
+                let (sample, stddev) = stat.sample_stddev();
+                decimal::moment_variance(n, &sx, &sxx, sample, stddev)?
+                    .map_or(Value::Null, Value::Decimal)
+            }
+            Acc::MomentsFloat { stat, n, sxx, .. } => {
+                let (sample, stddev) = stat.sample_stddev();
+                float_moment_variance(n, sxx, sample, stddev)
+            }
             Acc::StringAgg { rows, seen } => {
                 if seen {
                     finalize_string_agg(rows)
@@ -826,4 +876,39 @@ fn push_string_agg_bytes(out: &mut Vec<u8>, v: &Value) {
         Value::Null => {}
         _ => unreachable!("string_agg joins text or bytea"),
     }
+}
+
+/// PostgreSQL's float8_accum (and float4_accum, which widens to f64 first) — the Youngs-Cramer update
+/// of the one-argument float moments (aggregates.md §23). A finite input whose update overflows to
+/// ±Inf traps 22003; an infinite or NaN input makes Sxx NaN.
+fn fold_float_moment(n: &mut f64, sx: &mut f64, sxx: &mut f64, x: f64) -> Result<()> {
+    let n1 = *n + 1.0;
+    let sx1 = *sx + x;
+    let mut sxx1 = *sxx;
+    if *n > 0.0 {
+        let tmp = x * n1 - sx1;
+        sxx1 += tmp * tmp / (n1 * *n);
+        if sx1.is_infinite() || sxx1.is_infinite() {
+            if !sx.is_infinite() && !x.is_infinite() {
+                return Err(overflow(ScalarType::Float64));
+            }
+            sxx1 = f64::NAN;
+        }
+    } else if x.is_nan() || x.is_infinite() {
+        sxx1 = f64::NAN;
+    }
+    *n = n1;
+    *sx = sx1;
+    *sxx = sxx1;
+    Ok(())
+}
+
+/// float8_var_pop / float8_var_samp / float8_stddev_pop / float8_stddev_samp: NULL over no input (or
+/// one, for a sample); else Sxx / N or Sxx / (N − 1), square-rooted for a standard deviation.
+fn float_moment_variance(n: f64, sxx: f64, sample: bool, stddev: bool) -> Value {
+    if n == 0.0 || (sample && n <= 1.0) {
+        return Value::Null;
+    }
+    let r = sxx / if sample { n - 1.0 } else { n };
+    Value::Float64(if stddev { r.sqrt() } else { r })
 }

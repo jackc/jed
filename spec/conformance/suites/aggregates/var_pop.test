@@ -1,0 +1,135 @@
+# Aggregate var_pop(x) (spec/design/aggregates.md §23): the population variance of the non-NULL
+# inputs. Over integer or decimal input it is exact — PostgreSQL's numeric computation, a decimal
+# result at select_div_scale; over f32/f64 input it is PostgreSQL's float8 algorithm with an f64
+# result. NULL over an empty group. Output name `var_pop`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, resource.cost_metering, func.var_pop
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, a i32, s i16, l i64, d numeric(10,2), f f64, r f32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1, 1, 1, 1.50, 1.0, 1.5), (2, 1, 2, 2, 2, 2.25, 2.0, 2.5), (3, 1, 3, 3, 3, 3.00, 3.0, 3.5), (4, 1, 4, 4, 4, 4.75, 4.0, 4.5), (5, 2, NULL, NULL, NULL, NULL, NULL, NULL), (6, 2, 7, 7, 7, 7.00, 7.0, 7.0)
+
+# names: var_pop
+query D nosort
+SELECT var_pop(a) FROM t WHERE g = 1
+----
+1.2500000000000000
+
+# names: var_pop, var_pop, var_pop
+query DDD nosort
+SELECT var_pop(s), var_pop(l), var_pop(d) FROM t WHERE g = 1
+----
+1.2500000000000000
+1.2500000000000000
+1.4531250000000000
+
+# Over every row (NULL skipped): 6 rows read + 1 leaf page read + 6 accumulated + 1 produced.
+# names: var_pop
+# cost: 14
+query D nosort
+SELECT var_pop(a) FROM t
+----
+4.2400000000000000
+
+# names: var_pop
+query D nosort
+SELECT var_pop(d * 3) FROM t
+----
+34.9650000000000000
+
+# One input (the NULL is skipped): 0. No input: NULL.
+# names: var_pop
+query D nosort
+SELECT var_pop(a) FROM t WHERE g = 2
+----
+0
+
+# names: var_pop
+query D nosort
+SELECT var_pop(a) FROM t WHERE id = 6
+----
+0
+
+# names: var_pop
+query D nosort
+SELECT var_pop(a) FROM t WHERE g = 9
+----
+NULL
+
+# names: g, var_pop
+query ID rowsort
+SELECT g, var_pop(d) FROM t GROUP BY g
+----
+1
+1.4531250000000000
+2
+0
+
+# names: var_pop
+query D nosort
+SELECT var_pop(DISTINCT a % 2) FROM t
+----
+0.25000000000000000000
+
+# names: var_pop
+query D nosort
+SELECT var_pop(a) FILTER (WHERE id < 3) FROM t
+----
+0.25000000000000000000
+
+# Wide decimals charge decimal_work for each fold's square and two sums.
+statement ok
+CREATE TABLE big (id i32 PRIMARY KEY, x numeric)
+
+statement ok
+INSERT INTO big VALUES (1, 123456789012.123456789), (2, -987654321098.987654321), (3, 5)
+
+# names: var_pop
+# cost: 123
+query D nosort
+SELECT var_pop(x) FROM big
+----
+247252281751074870273980.115802656367288185
+
+# Over float input: f64.
+# names: var_pop, var_pop
+query RR nosort
+SELECT var_pop(f), var_pop(r) FROM t
+----
+4.24
+3.56
+
+# names: id, var_pop
+query IR nosort
+SELECT id, var_pop(f) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+0
+2
+0.25
+3
+0.6666666666666666
+4
+1.25
+5
+1.25
+6
+4.24
+
+# A float input of Infinity or NaN gives NaN.
+# names: var_pop
+query R nosort
+SELECT var_pop(x) FROM (VALUES (1.0::f64), ('Infinity'::f64)) v(x)
+----
+NaN
+
+# A finite overflow traps.
+statement error 22003
+SELECT var_pop(x) FROM (VALUES (1e308::f64), (-1e308::f64)) v(x)
+
+statement error 42883
+SELECT var_pop(a > 1) FROM t
+
+statement error 42883
+SELECT var_pop(f, f) FROM t

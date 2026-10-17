@@ -1535,6 +1535,7 @@ mod registry_tests {
                         | "array_of_input"
                         | "text"
                         | "bytea"
+                        | "f64"
                 ),
                 "aggregate {} has unhandled result code {}",
                 a.name,
