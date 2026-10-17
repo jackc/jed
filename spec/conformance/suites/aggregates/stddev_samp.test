@@ -1,0 +1,143 @@
+# Aggregate stddev_samp(x) (spec/design/aggregates.md §23): the sample standard deviation of the non-NULL
+# inputs. Over integer or decimal input it is exact — PostgreSQL's numeric computation, a decimal
+# result at select_div_scale; over f32/f64 input it is PostgreSQL's float8 algorithm with an f64
+# result. NULL over an empty group. Output name `stddev_samp`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.window_aggregate, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, resource.cost_metering, func.stddev_samp, func.var_samp
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, a i32, s i16, l i64, d numeric(10,2), f f64, r f32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1, 1, 1, 1.50, 1.0, 1.5), (2, 1, 2, 2, 2, 2.25, 2.0, 2.5), (3, 1, 3, 3, 3, 3.00, 3.0, 3.5), (4, 1, 4, 4, 4, 4.75, 4.0, 4.5), (5, 2, NULL, NULL, NULL, NULL, NULL, NULL), (6, 2, 7, 7, 7, 7.00, 7.0, 7.0)
+
+# names: stddev_samp
+query D nosort
+SELECT stddev_samp(a) FROM t WHERE g = 1
+----
+1.2909944487358056
+
+# names: stddev_samp, stddev_samp, stddev_samp
+query DDD nosort
+SELECT stddev_samp(s), stddev_samp(l), stddev_samp(d) FROM t WHERE g = 1
+----
+1.2909944487358056
+1.2909944487358056
+1.3919410907075055
+
+# Over every row (NULL skipped): 6 rows read + 1 leaf page read + 6 accumulated + 1 produced.
+# names: stddev_samp
+# cost: 14
+query D nosort
+SELECT stddev_samp(a) FROM t
+----
+2.3021728866442676
+
+# names: stddev_samp
+query D nosort
+SELECT stddev_samp(d * 3) FROM t
+----
+6.6110702613117038
+
+# One input (the NULL is skipped) or none: NULL.
+# names: stddev_samp
+query D nosort
+SELECT stddev_samp(a) FROM t WHERE g = 2
+----
+NULL
+
+# names: stddev_samp
+query D nosort
+SELECT stddev_samp(a) FROM t WHERE id = 6
+----
+NULL
+
+# names: stddev_samp
+query D nosort
+SELECT stddev_samp(a) FROM t WHERE g = 9
+----
+NULL
+
+# names: g, stddev_samp
+query ID rowsort
+SELECT g, stddev_samp(d) FROM t GROUP BY g
+----
+1
+1.3919410907075055
+2
+NULL
+
+# names: stddev_samp
+query D nosort
+SELECT stddev_samp(DISTINCT a % 2) FROM t
+----
+0.70710678118654752440
+
+# names: stddev_samp
+query D nosort
+SELECT stddev_samp(a) FILTER (WHERE id < 3) FROM t
+----
+0.70710678118654752440
+
+# Wide decimals charge decimal_work for each fold's square and two sums.
+statement ok
+CREATE TABLE big (id i32 PRIMARY KEY, x numeric)
+
+statement ok
+INSERT INTO big VALUES (1, 123456789012.123456789), (2, -987654321098.987654321), (3, 5)
+
+# names: stddev_samp
+# cost: 123
+query D nosort
+SELECT stddev_samp(x) FROM big
+----
+608997883926.218831825634481947
+
+# Over float input: f64.
+# names: stddev_samp, stddev_samp
+query RR nosort
+SELECT stddev_samp(f), stddev_samp(r) FROM t
+----
+2.3021728866442674
+2.1095023109728985
+
+# names: id, stddev_samp
+query IR nosort
+SELECT id, stddev_samp(f) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+NULL
+2
+0.7071067811865476
+3
+1
+4
+1.2909944487358056
+5
+1.2909944487358056
+6
+2.3021728866442674
+
+# A float input of Infinity or NaN gives NaN.
+# names: stddev_samp
+query R nosort
+SELECT stddev_samp(x) FROM (VALUES (1.0::f64), ('Infinity'::f64)) v(x)
+----
+NaN
+
+# A finite overflow traps.
+statement error 22003
+SELECT stddev_samp(x) FROM (VALUES (1e308::f64), (-1e308::f64)) v(x)
+
+statement error 42883
+SELECT stddev_samp(a > 1) FROM t
+
+statement error 42883
+SELECT stddev_samp(f, f) FROM t
+
+# The square root of var_samp, at the variance's own scale.
+# names: var_samp, stddev_samp
+query DD nosort
+SELECT var_samp(a), stddev_samp(a) FROM t
+----
+5.3000000000000000
+2.3021728866442676

@@ -37,9 +37,9 @@ func blockingAccRow(a *acc) storedRow {
 		planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique,
 		planArrayAgg, planStringAgg:
 		return storedRow{BoolValue(a.seen)}
-	case planVarPop, planVarSamp, planStddevPop:
+	case planVarPop, planVarSamp, planStddevSamp, planStddevPop:
 		return storedRow{IntValue(a.exact.n), DecimalValue(a.exact.sx), DecimalValue(a.exact.sxx)}
-	case planVarPopFloat, planVarSampFloat, planStddevPopFloat:
+	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		return storedRow{Float64Value(a.float.n), Float64Value(a.float.sx), Float64Value(a.float.sxx)}
 	case planArrayAggArray:
 		// The seen flag, then the first input's shape: its dimension count and each (length, lower
@@ -83,9 +83,9 @@ func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
 		planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique,
 		planArrayAgg, planStringAgg:
 		a.seen = r[0].boolVal()
-	case planVarPop, planVarSamp, planStddevPop:
+	case planVarPop, planVarSamp, planStddevSamp, planStddevPop:
 		a.exact = momentsExact{n: r[0].Int, sx: *r[1].decimal(), sxx: *r[2].decimal()}
-	case planVarPopFloat, planVarSampFloat, planStddevPopFloat:
+	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		a.float = momentsFloat{n: r[0].F64(), sx: r[1].F64(), sxx: r[2].F64()}
 	case planArrayAggArray:
 		a.seen = r[0].boolVal()
