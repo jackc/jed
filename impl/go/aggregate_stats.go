@@ -160,10 +160,12 @@ const (
 	pairRegrAvgx
 	pairRegrAvgy
 	pairRegrSxx
+	pairRegrSyy
 )
 
 // pairSurfaces maps each two-argument statistical aggregate to its exact and float plans.
 var pairSurfaces = map[string][2]aggPlan{
+	"regr_syy":   {planRegrSyy, planRegrSyyFloat},
 	"regr_sxx":   {planRegrSxx, planRegrSxxFloat},
 	"regr_avgy":  {planRegrAvgy, planRegrAvgyFloat},
 	"regr_avgx":  {planRegrAvgx, planRegrAvgxFloat},
@@ -174,6 +176,7 @@ var pairSurfaces = map[string][2]aggPlan{
 
 // pairStats gives each two-argument plan its statistic.
 var pairStats = map[aggPlan]pairStat{
+	planRegrSyy: pairRegrSyy, planRegrSyyFloat: pairRegrSyy,
 	planRegrSxx: pairRegrSxx, planRegrSxxFloat: pairRegrSxx,
 	planRegrAvgy: pairRegrAvgy, planRegrAvgyFloat: pairRegrAvgy,
 	planRegrAvgx: pairRegrAvgx, planRegrAvgxFloat: pairRegrAvgx,
@@ -248,6 +251,9 @@ func (s *pairsExact) finalize(stat pairStat) (Value, error) {
 	case pairRegrSxx:
 		numX := n.mulExact(s.sxx).sub(s.sx.mulExact(s.sx))
 		r, err = numX.Div(n)
+	case pairRegrSyy:
+		numY := n.mulExact(s.syy).sub(s.sy.mulExact(s.sy))
+		r, err = numY.Div(n)
 	default:
 		panic("unhandled pair statistic")
 	}
@@ -337,6 +343,8 @@ func (s *pairsFloat) finalize(stat pairStat) Value {
 		return Float64Value(s.sy / s.n)
 	case pairRegrSxx:
 		return Float64Value(s.sxx)
+	case pairRegrSyy:
+		return Float64Value(s.syy)
 	default:
 		panic("unhandled pair statistic")
 	}

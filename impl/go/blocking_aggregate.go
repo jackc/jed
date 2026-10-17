@@ -41,10 +41,10 @@ func blockingAccRow(a *acc) storedRow {
 		return storedRow{IntValue(a.exact.n), DecimalValue(a.exact.sx), DecimalValue(a.exact.sxx)}
 	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		return storedRow{Float64Value(a.float.n), Float64Value(a.float.sx), Float64Value(a.float.sxx)}
-	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx:
+	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy:
 		s := a.pairs
 		return storedRow{IntValue(s.n), DecimalValue(s.sx), DecimalValue(s.sxx), DecimalValue(s.sy), DecimalValue(s.syy), DecimalValue(s.sxy)}
-	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat:
+	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat, planRegrSyyFloat:
 		s := a.fpair
 		return storedRow{Float64Value(s.n), Float64Value(s.sx), Float64Value(s.sxx), Float64Value(s.sy), Float64Value(s.syy), Float64Value(s.sxy)}
 	case planArrayAggArray:
@@ -93,9 +93,9 @@ func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
 		a.exact = momentsExact{n: r[0].Int, sx: *r[1].decimal(), sxx: *r[2].decimal()}
 	case planVarPopFloat, planVarSampFloat, planStddevSampFloat, planStddevPopFloat:
 		a.float = momentsFloat{n: r[0].F64(), sx: r[1].F64(), sxx: r[2].F64()}
-	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx:
+	case planCovarPop, planCovarSamp, planCorr, planRegrAvgx, planRegrAvgy, planRegrSxx, planRegrSyy:
 		a.pairs = pairsExact{n: r[0].Int, sx: *r[1].decimal(), sxx: *r[2].decimal(), sy: *r[3].decimal(), syy: *r[4].decimal(), sxy: *r[5].decimal()}
-	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat:
+	case planCovarPopFloat, planCovarSampFloat, planCorrFloat, planRegrAvgxFloat, planRegrAvgyFloat, planRegrSxxFloat, planRegrSyyFloat:
 		a.fpair = pairsFloat{n: r[0].F64(), sx: r[1].F64(), sxx: r[2].F64(), sy: r[3].F64(), syy: r[4].F64(), sxy: r[5].F64()}
 	case planArrayAggArray:
 		a.seen = r[0].boolVal()

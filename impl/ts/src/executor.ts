@@ -32261,6 +32261,8 @@ export type AggPlan =
   // The two-argument statistical aggregates (aggregates.md §23), exact and float as above.
   | "covarPop"
   | "covarPopFloat"
+  | "regrSyy"
+  | "regrSyyFloat"
   | "regrSxx"
   | "regrSxxFloat"
   | "regrAvgy"
@@ -32813,9 +32815,10 @@ function foldFloatMoment(a: Acc, v: Value): void {
 // The two-argument statistical aggregates (aggregates.md §23) over (Y, X) pairs whose arguments are
 // both non-NULL. PAIR_SURFACES maps each to its exact and float plans; PAIR_STATS gives each plan its
 // statistic.
-type PairStat = "covarPop" | "covarSamp" | "corr" | "regrAvgx" | "regrAvgy" | "regrSxx";
+type PairStat = "covarPop" | "covarSamp" | "corr" | "regrAvgx" | "regrAvgy" | "regrSxx" | "regrSyy";
 const PAIR_SURFACES: Record<string, [AggPlan, AggPlan]> = {
   covar_pop: ["covarPop", "covarPopFloat"],
+  regr_syy: ["regrSyy", "regrSyyFloat"],
   regr_sxx: ["regrSxx", "regrSxxFloat"],
   regr_avgy: ["regrAvgy", "regrAvgyFloat"],
   regr_avgx: ["regrAvgx", "regrAvgxFloat"],
@@ -32825,6 +32828,8 @@ const PAIR_SURFACES: Record<string, [AggPlan, AggPlan]> = {
 const PAIR_STATS: Partial<Record<AggPlan, PairStat>> = {
   covarPop: "covarPop",
   covarPopFloat: "covarPop",
+  regrSyy: "regrSyy",
+  regrSyyFloat: "regrSyy",
   regrSxx: "regrSxx",
   regrSxxFloat: "regrSxx",
   regrAvgy: "regrAvgy",
@@ -32873,6 +32878,10 @@ function finalizeExactPair(stat: PairStat, n: bigint, sums: Decimal[]): Value {
   switch (stat) {
     case "covarPop":
       return decimalValue(numXY.div(count.mulExact(count)));
+    case "regrSyy": {
+      const numY = count.mulExact(sums[3]!).subUncapped(sy.mulExact(sy));
+      return decimalValue(numY.div(count));
+    }
     case "regrSxx": {
       const numX = count.mulExact(sums[1]!).subUncapped(sx.mulExact(sx));
       return decimalValue(numX.div(count));
@@ -32946,6 +32955,8 @@ function finalizeFloatPair(stat: PairStat, t: number[]): Value {
   switch (stat) {
     case "covarPop":
       return float64Value(sxy / n);
+    case "regrSyy":
+      return float64Value(t[4]!);
     case "regrSxx":
       return float64Value(t[2]!);
     case "regrAvgy":
@@ -33042,6 +33053,7 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       if (pairArgs(v) !== null) a.count += 1n;
       break;
     case "covarPop":
+    case "regrSyy":
     case "regrSxx":
     case "regrAvgy":
     case "regrAvgx":
@@ -33050,6 +33062,7 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       foldExactPair(a, v, m);
       break;
     case "covarPopFloat":
+    case "regrSyyFloat":
     case "regrSxxFloat":
     case "regrAvgyFloat":
     case "regrAvgxFloat":
@@ -33291,6 +33304,7 @@ export function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
 export function finalizeAcc(a: Acc): Value {
   switch (a.plan) {
     case "covarPop":
+    case "regrSyy":
     case "regrSxx":
     case "regrAvgy":
     case "regrAvgx":
@@ -33298,6 +33312,7 @@ export function finalizeAcc(a: Acc): Value {
     case "covarSamp":
       return finalizeExactPair(PAIR_STATS[a.plan]!, a.momN, a.pairSums);
     case "covarPopFloat":
+    case "regrSyyFloat":
     case "regrSxxFloat":
     case "regrAvgyFloat":
     case "regrAvgxFloat":
