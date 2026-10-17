@@ -577,6 +577,54 @@ setup_sql = [
   "INSERT INTO dp_ref_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
 ]
 
+# The broader safe-conjunct gate (query.safe_conjunct_gate): a classified function (`length`) and a
+# proven LIKE now run inside each scan. Each 4,000-row input keeps 2% of its rows; the expression ON
+# key keeps nested loop, so the pushed form runs ON over 80 × 80 pairs. Before the gate admitted
+# functions, the `length(l.s) = 3` conjunct stayed above the join and ON ran over 4,000 × 80 pairs.
+[[bench]]
+name = "safe_conjunct_pushdown_join"
+description = "A `length()` and a LIKE conjunct run inside each scan: 80×80 nested-loop pairs instead of 4,000×80"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM sc_left l JOIN sc_right r ON l.k + 0 = r.k WHERE length(l.s) = 3 AND r.s LIKE 'ab_'"
+warmup = 2
+iterations = 20
+seed = 4290
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS sc_right",
+  "DROP TABLE IF EXISTS sc_left",
+  "CREATE TABLE sc_left (id bigint PRIMARY KEY, k bigint, s text)",
+  "CREATE TABLE sc_right (id bigint PRIMARY KEY, k bigint, s text)",
+  "INSERT INTO sc_left SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 'abc' ELSE 'abcdef' END FROM generate_series(1, 4000) AS g",
+  "INSERT INTO sc_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 'abc' ELSE 'abcdef' END FROM generate_series(1, 4000) AS g"
+]
+
+# Pushdown into a widened set-operation arm (query.derived_pushdown, planner.md §3.6). The integer arm
+# is unified to bigint without a value change, so `s.id = 50000` moves into both arms and seeks each
+# 100k-row table's primary key. Before, the widened arm blocked the move and both tables were read in
+# full before the outer filter.
+[[bench]]
+name = "widened_arm_pushdown_pk"
+description = "A conjunct over an integer UNION ALL bigint body moves into both arms and seeks two 100k-row PKs"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT s.id FROM (SELECT id FROM wa_narrow UNION ALL SELECT id FROM wa_wide) s WHERE s.id = 50000"
+warmup = 20
+iterations = 1000
+seed = 4291
+expect_rows_per_iter = 2
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS wa_wide",
+  "DROP TABLE IF EXISTS wa_narrow",
+  "CREATE TABLE wa_narrow (id integer PRIMARY KEY, v bigint)",
+  "CREATE TABLE wa_wide (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO wa_narrow SELECT CAST(g AS integer), g % 1000 FROM generate_series(1, 100000) AS g",
+  "INSERT INTO wa_wide SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
+]
+
 # Stage-2 pushdown below a grouped body's grouping (query.derived_pushdown) and its results-identical
 # outer-filter reference. Moved into the body, `d.g = 500` bounds the (g, id) primary-key prefix, so
 # one 100-row group is read and aggregated; spelled `d.g + 0`, all 100k rows are grouped into 1,000
