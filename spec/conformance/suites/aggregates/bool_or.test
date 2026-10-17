@@ -1,0 +1,107 @@
+# Aggregate bool_or(boolean) -> boolean (spec/design/aggregates.md §23): TRUE iff some non-NULL
+# input is TRUE. NULL inputs are skipped; an empty or all-NULL group -> NULL. Output name `bool_or`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.having, query.window_aggregate, types.i32, types.boolean_storable, resource.cost_metering, func.bool_or
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, b boolean)
+
+statement ok
+INSERT INTO t VALUES (1, 1, false), (2, 1, NULL), (3, 1, false), (4, 2, false), (5, 2, true), (6, 3, NULL)
+
+# 6 rows read + 1 leaf page read + 6 accumulated + 1 produced.
+# names: bool_or
+# cost: 14
+query B nosort
+SELECT bool_or(b) FROM t
+----
+true
+
+# names: bool_or
+query B nosort
+SELECT bool_or(b) FROM t WHERE g = 1
+----
+false
+
+# All-NULL and empty groups are NULL.
+# names: bool_or
+query B nosort
+SELECT bool_or(b) FROM t WHERE g = 3
+----
+NULL
+
+# names: bool_or
+query B nosort
+SELECT bool_or(b) FROM t WHERE g = 4
+----
+NULL
+
+# names: g, bool_or
+query IB rowsort
+SELECT g, bool_or(b) FROM t GROUP BY g
+----
+1
+false
+2
+true
+3
+NULL
+
+# Beside bool_and over the same rows.
+# names: g, bool_and, bool_or
+query IBB rowsort
+SELECT g, bool_and(b), bool_or(b) FROM t GROUP BY g
+----
+1
+false
+false
+2
+false
+true
+3
+NULL
+NULL
+
+# names: bool_or
+query B nosort
+SELECT bool_or(id > 5) FROM t
+----
+true
+
+# names: bool_or
+query B nosort
+SELECT bool_or(DISTINCT b) FROM t WHERE g = 2
+----
+true
+
+# names: bool_or
+query B nosort
+SELECT bool_or(b) FILTER (WHERE id <> 5) FROM t
+----
+false
+
+# names: bool_or
+query B nosort
+SELECT bool_or(b) FROM t HAVING bool_or(b)
+----
+true
+
+# As a window function: a running disjunction over id order.
+# names: id, bool_or
+query IB nosort
+SELECT id, bool_or(b) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+false
+2
+false
+3
+false
+4
+false
+5
+true
+6
+true
+
+statement error 42883
+SELECT bool_or(g) FROM t

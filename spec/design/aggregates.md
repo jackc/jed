@@ -739,7 +739,8 @@ unmetered.
 | Aggregate | Argument | Result | Value |
 |---|---|---|---|
 | `bool_and(x)` | `boolean` | `boolean` | TRUE iff every non-NULL input is TRUE |
+| `bool_or(x)` | `boolean` | `boolean` | TRUE iff some non-NULL input is TRUE |
 
-**Boolean aggregates.** `bool_and` is the running conjunction of its non-NULL inputs. It is
-order-insensitive ([determinism.md](determinism.md) §7). Its packed state on the bounded-spill lane is
-`[bool or NULL]` ([memory.md](memory.md) §6.6).
+**Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
+their non-NULL inputs. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
+state on the bounded-spill lane is `[bool or NULL]` ([memory.md](memory.md) §6.6).

@@ -5723,12 +5723,22 @@ result       = "same_as_input"
 null         = "aggregate"
 errors       = []
 
-# bool_and(boolean) -> boolean (aggregates.md §23): TRUE iff every non-NULL input is TRUE; NULL over
-# an empty/all-NULL group. Order-insensitive (commutative, associative, idempotent).
+# bool_and / bool_or (boolean) -> boolean (aggregates.md §23): TRUE iff every (some) non-NULL input
+# is TRUE; NULL over an empty/all-NULL group. Order-insensitive (commutative, associative, idempotent).
 [[aggregate]]
 name         = "bool_and"
 kind         = "aggregate"
 surface      = "bool_and"
+arg          = "expr"
+arg_families = ["boolean"]
+result       = "boolean"
+null         = "aggregate"
+errors       = []
+
+[[aggregate]]
+name         = "bool_or"
+kind         = "aggregate"
+surface      = "bool_or"
 arg          = "expr"
 arg_families = ["boolean"]
 result       = "boolean"
