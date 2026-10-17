@@ -24,7 +24,9 @@ schema_version = 1
 #    fail to open; invalidate them.
 # 12: the on-disk format bumped 47 → 48 (view column defaults and options, view sequence/type
 #    dependencies, multi-page catalog entries), so v47 datasets fail to open; invalidate them.
-generator_version = 12
+# 13: the on-disk format bumped 48 → 49 (batched durability's meta-slot rule); a reader accepts
+#    only the exact current version, so invalidate the v48 datasets.
+generator_version = 13
 
 [[dataset]]
 name = "small"
