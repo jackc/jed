@@ -93,12 +93,12 @@ The contract every rewrite rule meets:
   literal of unknown value.
 - **Results-identical, and never a new error.** The same rows on every core. A rewrite may
   evaluate an expression on rows the unrewritten plan would not reach only when that expression is
-  structurally unable to trap; it may skip evaluations the unrewritten plan performs — exactly as a
+  unable to trap (§3.5); it may skip evaluations the unrewritten plan performs — exactly as a
   scan bound already does — so an error that plan would raise can go unraised. Error visitation, and
   the point where a cost ceiling aborts (54P01), are defined by the selected (rewritten) plan, as for
   every physical choice ([estimator.md](estimator.md) §1). This holds under the left-to-right
   `AND`/`OR` short-circuit ([cost.md](cost.md) §3), whose skips depend on conjunct order: a moved
-  conjunct is structurally non-trapping, so running it ahead of an earlier conjunct cannot raise,
+  conjunct is non-trapping (§3.5), so running it ahead of an earlier conjunct cannot raise,
   and it only removes rows; the conjuncts left behind keep their source order. So every conjunct
   of the rewritten plan runs on a subset of the rows where the source-order AND would reach it —
   reordering by pushdown can skip an error, never introduce one.
@@ -173,12 +173,14 @@ With no contradiction, each top-level WHERE conjunct, in source order, is **push
   conjunct on it stays in the residual);
 - no outer join NULL-extends relation `i`: for the left-deep FROM, `joins[k]` LEFT marks
   `rels[k+1]`, RIGHT marks every `rels[0..k]`, FULL marks both;
-- the conjunct is **pushdown-safe**: a tree of AND/OR/NOT over comparisons (`= <> < <= > >=`, except a
-  collated ordering comparison), IS [NOT] NULL, IS [NOT] DISTINCT FROM, and bare boolean columns, whose
-  operands are bare columns, literals, and parameters. Every such node is structurally unable to
+- the conjunct is **pushdown-safe** (§3.5): a tree of AND/OR/NOT over comparisons (`= <> < <= > >=`,
+  except a collated ordering comparison), IS [NOT] NULL, IS [NOT] DISTINCT FROM, [NOT] LIKE / ILIKE with
+  a proven pattern, and boolean-valued operands, whose operands are **non-trapping value
+  expressions**: bare columns, literals, parameters, and the casts and built-in functions the catalog
+  classifies `traps = false`, applied to non-trapping value expressions. Every such node is unable to
   trap and reads only the current row, so evaluating it on a row the join would have discarded can
-  neither raise an error nor change a value. Casts, arithmetic, functions, CASE, subqueries, and
-  outer references stay in the residual.
+  neither raise an error nor change a value. Arithmetic, trapping casts and functions, CASE,
+  subqueries, and outer references stay in the residual.
 
 A pushed conjunct then takes the first of these forms that applies:
 
@@ -214,10 +216,12 @@ A derived body is **body-pushable** when it is
   that partitions by an expression (`PARTITION BY k + 0`) or by other columns only, blocks the column.
   In a grouped SELECT the key is the grouping column itself (window keys resolve against the grouped
   row);
-- for a set operation, column `j` is pushable in both arms **and** each arm's column type is exactly
-  the set operation's unified output type, recursively — an arm the set operation widens
-  (`i32` under an `i64` output, `i32` under `decimal`, `f32` under `f64`) blocks the column, since the
-  conjunct was resolved against the widened type.
+- for a set operation, column `j` is pushable in both arms **and** each arm's column type reaches the
+  set operation's unified output type by a **value-preserving widening** (§3.6), recursively: the same
+  type, an integer width (`i32` under `i64`, and arrays or records that differ only in integer
+  widths), `i16`/`i32`/`i64` under `decimal`, `f32` under `f64`, or an arm column of the NULL type. The
+  conjunct was resolved against the unified type, so a widened arm receives it with the widening
+  applied to the arm column (§3.6).
 
 Each admitted shape preserves the answer because a pushdown-safe conjunct over bare output columns
 gives the same answer for every row in one **equality class** (equal values compare equal under every
@@ -242,6 +246,17 @@ collation is deterministic):
   any match judge the conjunct alike: `filter(A op B) = filter(A) op filter(B)` for every operator and
   multiplicity (an `EXCEPT ALL` right row the filter drops could only have cancelled a left row the
   filter also drops).
+
+Every argument above needs the conjunct to give one answer for every member of an equality class.
+Comparisons, null tests, LIKE over text, and every function and cast classified `traps = false` with
+`preserves_equality = true` do: equal arguments give equal results. A cast classified
+`preserves_equality = false` does not: `decimal` and the floats have equal values that render
+differently (`1.5 = 1.50`, `-0 = 0`), so `x::text = '1.50'` can separate rows `DISTINCT`, a grouping,
+a window partition, or a set operation's match treat as one. A conjunct containing such a cast is
+therefore body-pushed only into a **non-matching** body: every SELECT it reaches is ungrouped, has no
+`DISTINCT` and no window function, and every set operation on the way is `UNION ALL`. Otherwise it
+takes the scan form (when the SELECT has another relation) or stays in the residual. Scan and ON
+pushdown filter a relation's rows before anything matches them, so they need no such condition.
 
 **Body form.** A derived body's pushed conjuncts — the WHERE's, in source order, after any §3.3 ON
 conjuncts pushed to the same relation — are appended to the body's own WHERE as a left-deep AND:
@@ -330,8 +345,7 @@ EXPLAIN renders a scan-pushed filter on its relation's node (`Scan`, `Subquery`,
 Filter node ([explain.md](explain.md) §5).
 
 **Not pushed into a body.** A materialized CTE (§3.4) is scan-pushed only: its body runs once for every
-reference. Pushdown through a lateral relation and into an arm a set operation widens remain
-follow-ons.
+reference. Pushdown through a lateral relation remains a follow-on.
 
 ### 3.3 ON pushdown (`query.on_pushdown`)
 
@@ -436,6 +450,88 @@ node under the `WITH` node then renders no body (it would never run); its estima
 definition's rows with zero cost, as for any inlined CTE. A CTE that is not expanded — materialized,
 unreferenced, or referenced only from a data-modifying part — keeps its body under the `WITH` node
 ([explain.md](explain.md) §5).
+
+### 3.5 The safe-conjunct gate (`query.safe_conjunct_gate`)
+
+A conjunct moves (§3.2–§3.4) only when it is **pushdown-safe**: evaluating it on any row of its
+relation, in any order relative to the other conjuncts, raises no error and yields the value it would
+have yielded where it was written. The gate is decided per node over the resolved expression:
+
+- a **predicate** node is AND / OR / NOT over predicates; a comparison (`= <> < <= > >=`) between two
+  non-trapping value expressions, unless it is an ordering comparison (`< <= > >=`) under a non-`C`
+  collation (its sort-key kernel can fail on unloaded collation data); IS [NOT] NULL or IS [NOT]
+  DISTINCT FROM over non-trapping value expressions; a proven LIKE (below); or a non-trapping value
+  expression itself (a bare boolean column, a boolean function such as `starts_with`, a cast to
+  `boolean`);
+- a **non-trapping value expression** is a bare column, a literal, a parameter, or one of these over
+  non-trapping value expressions:
+  - a **cast** whose row in [casts.toml](../types/casts.toml) is classified `traps = false`, without
+    a `numeric(p,s)` typmod (whose rounding can overflow, `22003`); a `varchar(n)` length only
+    truncates. The resolver records the classification on the cast node from the cast's source and
+    target types, since the node itself carries only its target;
+  - a call of a **built-in function** whose catalog name is classified `traps = false`
+    ([functions.md](functions.md) §15) — the scalar function calls and the text case folders
+    (`lower`/`upper`, collation.md §16). The classification is name-level, so the planner looks it up
+    by the call's catalog name.
+
+Everything else stays in place: arithmetic (overflow, division by zero), every trapping cast or
+function, `CASE` / `COALESCE` / `GREATEST` / `LEAST`, array, range, and json operators, regular
+expressions, subqueries, outer references, and host functions (opaque, CLAUDE.md §13). A
+`traps = false` classification asserts that the kernel raises nothing for any argument values, is
+immutable, and reads only its arguments and the handle's immutable Environment data; cost (`54P01`)
+and the plan-defined query-memory aborts are not traps — their visitation is defined by the selected
+plan (§3).
+
+**Plan-time pattern proofs (LIKE).** `s [NOT] LIKE p` and `s [NOT] ILIKE p` trap (`22025`) only when
+the pattern ends with an unpaired escape character. The gate admits one when `s` is a non-trapping
+value expression and `p` is a **plan-time literal** whose value is NULL (the result is NULL, no
+match runs) or text in which every `\` is followed by another character, read left to right in
+pairs. The matcher only ever reads the pattern at the pair boundaries of that scan, so such a pattern
+never reaches the error. ILIKE folds both sides 1:1 by code point and no character folds to `\`, so
+the unfolded pattern decides. `LIKE … ESCAPE e` desugars to `like_escape(p, e)`, which traps, so it is
+never admitted.
+
+A plan-time literal is a literal or a **parameter**, read through the custom-plan frame exactly as
+contradiction detection reads it (§3.1, [estimator.md](estimator.md) §6.1): in the probe frame,
+reading the parameter's value marks the statement parameter-sensitive and the proof fails, so the
+probe plan keeps the conjunct in place; each execution then plans with its binding, where the bound
+value decides. An unbound parameter is never proven. So `WHERE a.s LIKE $1` is pushed when `$1` is
+bound to `'ab%'` and kept in the residual when it is bound to `'ab\'`, where it raises `22025` on the
+first joined row it is evaluated on.
+
+**Cost decision.** The gate decides only *which* conjuncts move; each moved conjunct is charged by its
+form exactly as §3.2–§3.4 state, now including the casts and functions inside it: their
+`operator_eval` (and any size-scaled or output-byte units, cost.md §8.1) are charged on every row the
+pushed conjunct is evaluated on, instead of on the joined or combined rows. Conjuncts the old
+structural gate admitted are unchanged; conjuncts with a `traps = false` cast or function, or a proven
+LIKE, now move where they used to stay in the residual, so their costs change as §3.2 describes
+(usually down, not monotone). The estimator counts their nodes exactly as it counts a residual's
+([estimator.md](estimator.md) §8.3).
+
+### 3.6 Widened set-operation arms (`query.derived_pushdown`)
+
+A set operation converts each arm's values to its unified column types when it combines them
+([grammar.md](grammar.md) §25): an integer becomes a `decimal` of scale 0, an `f32` becomes the
+exact `f64`, and every other unification (integer widths, alone or inside arrays and anonymous records,
+and a NULL-typed column) leaves the value unchanged. A conjunct over the set operation's output was
+resolved against the unified type, so body pushdown (§3.2) rewrites each reference for each arm: a
+reference to an arm column whose type is unified without a value change becomes the bare arm column;
+a reference to an `i16`/`i32`/`i64` arm column under a `decimal` output becomes `CAST(col AS decimal)`,
+and to an `f32` arm column under an `f64` output `CAST(col AS f64)` — the very conversion the set
+operation applies to that arm's values. The pushed conjunct therefore judges, in the arm, exactly
+the value it would have judged above the set operation: NULL stays NULL, the conversion never traps
+(both are `traps = false`, `preserves_equality = true` casts), and no text is converted, so collation
+is unaffected. Any other type difference keeps the column unpushable. In a nested set operation the
+conversion is decided from the leaf arm's column type and the outermost unified type; the
+intermediate conversions compose to it.
+
+**Cost decision.** A conjunct pushed into a widened arm charges as any body-pushed conjunct (§3.2),
+per row of that arm; each inserted cast adds its `operator_eval` on every evaluation of the
+reference, as an ordinary cast does (as the f32 → f64 widening casts `CASE` and `COALESCE` insert
+do). An integer-width arm needs no cast and charges exactly what a
+same-typed arm does. A bare arm reference can bound the arm's access path; a cast reference cannot,
+but still filters the arm's rows before the combine. Previously such a conjunct stayed in the outer
+SELECT and was charged once per combined row.
 
 ## 4. Stage 3 — physical/access-path selection: the rule inventory
 

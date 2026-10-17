@@ -201,35 +201,41 @@ Full scan; touched=1
 12
 13
 
-# A widened arm (i32 under an i64 output) keeps the conjunct in the outer Filter.
+# A widened arm (i32 under an i64 output) takes the conjunct as written: the set operation's integer
+# widening changes no value, so each arm seeks its own primary key (planner.md §3.6).
 query ITTII nosort
 EXPLAIN SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id FROM n) s WHERE s.id = 2
 ----
 0
+Subquery s
+-
+2
+10
+1
+Union
+all
+2
+8
+2
 Filter
 conjuncts=1
 1
-45
-1
-Subquery s
--
-14
-30
-2
-Union
-all
-14
-30
+4
 3
 Scan t
-Full scan; touched=1
-12
-25
+PK bound: id = 2; touched=1
+1
+2
+2
+Filter
+conjuncts=1
+1
+4
 3
 Scan n
-Full scan; touched=1
+PK bound: id = 2; touched=1
+1
 2
-5
 
 # In a join, a set-operation body takes the conjunct into its arms rather than filtering its rows.
 query ITTII nosort

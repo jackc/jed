@@ -304,6 +304,7 @@ import { type PrivilegeSet, Privileges } from "./privileges.ts";
 import type { HostFunctions, HostFuncEntry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { FileHost } from "./filehost.ts";
+import type { TrapClass } from "./trap_class.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
   MAX_EXPR_DEPTH,
@@ -17537,7 +17538,7 @@ export class Engine {
       const replan = (parent: Scope | null, ctes: CteBinding[]): QueryPlan =>
         pushed.length === 0
           ? this.planQuery(body, parent, ctes, ptypes)
-          : this.replanPushedQuery(body, shape, pushed, parent, ctes, ptypes);
+          : this.replanPushedQuery(body, shape, pushed, shape.columnTypes, parent, ctes, ptypes);
       // A view body is planned in its isolated scope (views.md §4.1); an inlined CTE's body against
       // the bindings before it (planner.md §3.4).
       const site = isolated[i] ?? null;
@@ -17556,25 +17557,28 @@ export class Engine {
   // output-column numbering pushed into it: a SELECT gets them substituted to the FROM slots its
   // outputs read (below its grouping, when grouped) and appended to its WHERE; a set operation pushes
   // them into each arm and keeps its own unified types, ORDER BY, and operator. first is the
-  // expression's first plan, whose output mapping the replanned SELECT reproduces.
+  // expression's first plan, whose output mapping the replanned SELECT reproduces; want is the
+  // outermost body's output types, which the conjuncts were resolved against (a widened arm reads
+  // its column through a widening cast).
   private replanPushedQuery(
     qe: QueryExpr,
     first: QueryPlan,
     pushed: RExpr[],
+    want: ResolvedType[],
     parent: Scope | null,
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): QueryPlan {
     if (first.kind === "select") {
-      const moved = pushed.map((c) => substituteBodyColumns(c, first));
+      const moved = pushed.map((c) => substituteBodyColumns(c, first, want));
       return this.planSelectPushed(qe as Select, parent, ctes, ptypes, moved);
     }
     const so = first as SetOpPlan;
     const syntax = qe as SetOp;
     return {
       ...so,
-      lhs: this.replanPushedQuery(syntax.lhs, so.lhs, pushed, parent, ctes, ptypes),
-      rhs: this.replanPushedQuery(syntax.rhs, so.rhs, pushed, parent, ctes, ptypes),
+      lhs: this.replanPushedQuery(syntax.lhs, so.lhs, pushed, want, parent, ctes, ptypes),
+      rhs: this.replanPushedQuery(syntax.rhs, so.rhs, pushed, want, parent, ctes, ptypes),
     };
   }
 
@@ -30887,6 +30891,10 @@ export type RExpr =
       // explicit-cast rule, spec/design/types.md §15). null for any non-text / unbounded target.
       varcharLen: number | null;
       operand: RExpr;
+      // The cast's trap classification (functions.md §15), recorded at resolve from its source and
+      // target types (casts.toml); absent ⇒ "may". Read only by the planner's safe-conjunct gate
+      // (planner.md §3.5).
+      trap?: TrapClass;
     }
   // A cast that INVOLVES an array type (spec/design/array.md §7), none expressible by the scalar
   // `cast` node (whose `target` is a ScalarType): runtime text → T[] (array_in per row), array →

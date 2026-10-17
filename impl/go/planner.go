@@ -1495,7 +1495,7 @@ func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isol
 			if len(pushed) == 0 {
 				return db.planQuery(*bodyExpr, parent, ctes, ptypes)
 			}
-			return db.replanPushedQuery(*bodyExpr, shape, pushed, parent, ctes, ptypes)
+			return db.replanPushedQuery(*bodyExpr, shape, pushed, shape.columnTypes(), parent, ctes, ptypes)
 		}
 		var body queryPlan
 		err := db.planAgain(ctes, func() error {
@@ -1534,12 +1534,13 @@ func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isol
 // numbering pushed into it: a SELECT gets them substituted to the FROM slots its outputs read (below
 // its grouping, when grouped) and appended to its WHERE; a set operation pushes them into each arm and
 // keeps its own unified types, ORDER BY, and operator. first is the expression's first plan, whose
-// output mapping the replanned SELECT reproduces.
-func (db *engine) replanPushedQuery(qe queryExpr, first *queryPlan, pushed []*rExpr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
+// output mapping the replanned SELECT reproduces; want is the outermost body's output types, which
+// the conjuncts were resolved against (a widened arm reads its column through a widening cast).
+func (db *engine) replanPushedQuery(qe queryExpr, first *queryPlan, pushed []*rExpr, want []resolvedType, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
 	if first.sel != nil {
 		moved := make([]*rExpr, len(pushed))
 		for k, c := range pushed {
-			moved[k] = substituteBodyColumns(c, first.sel)
+			moved[k] = substituteBodyColumns(c, first.sel, want)
 		}
 		body, err := db.planSelectPushed(qe.Select, parent, ctes, ptypes, moved)
 		if err != nil {
@@ -1548,11 +1549,11 @@ func (db *engine) replanPushedQuery(qe queryExpr, first *queryPlan, pushed []*rE
 		return queryPlan{sel: body}, nil
 	}
 	so := *first.setop
-	lhs, err := db.replanPushedQuery(qe.SetOp.Lhs, &first.setop.lhs, pushed, parent, ctes, ptypes)
+	lhs, err := db.replanPushedQuery(qe.SetOp.Lhs, &first.setop.lhs, pushed, want, parent, ctes, ptypes)
 	if err != nil {
 		return queryPlan{}, err
 	}
-	rhs, err := db.replanPushedQuery(qe.SetOp.Rhs, &first.setop.rhs, pushed, parent, ctes, ptypes)
+	rhs, err := db.replanPushedQuery(qe.SetOp.Rhs, &first.setop.rhs, pushed, want, parent, ctes, ptypes)
 	if err != nil {
 		return queryPlan{}, err
 	}

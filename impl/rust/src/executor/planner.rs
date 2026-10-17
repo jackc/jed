@@ -2073,11 +2073,15 @@ impl Engine {
                 .derived
                 .take()
                 .expect("a shaped relation has a planned body");
+            // The pushed conjuncts were resolved against the body's output types (planner.md §3.6).
+            let want = shape.column_types().to_vec();
             let replan = |parent: Option<&Scope<'a>>, ctes: &'a [&'a CteBinding], ptypes| {
                 if pushed.is_empty() {
                     self.plan_query(body_expr, parent, ctes, ptypes)
                 } else {
-                    self.replan_pushed_query(body_expr, *shape, &pushed, parent, ctes, ptypes)
+                    self.replan_pushed_query(
+                        body_expr, *shape, &pushed, &want, parent, ctes, ptypes,
+                    )
                 }
             };
             // A view body is planned in its isolated scope (views.md §4.1); an inlined CTE's body
@@ -2105,12 +2109,15 @@ impl Engine {
     /// pushed into it: a SELECT gets them substituted to the FROM slots its outputs read (below its
     /// grouping, when grouped) and appended to its WHERE; a set operation pushes them into each arm
     /// and keeps its own unified types, ORDER BY, and operator. `first` is the expression's first
-    /// plan, whose output mapping the replanned SELECT reproduces.
+    /// plan, whose output mapping the replanned SELECT reproduces; `want` is the outermost body's
+    /// output types, which the conjuncts were resolved against (a widened arm reads its column
+    /// through a widening cast).
     fn replan_pushed_query<'a>(
         &'a self,
         qe: &QueryExpr,
         first: QueryPlan,
         pushed: &[RExpr],
+        want: &[ResolvedType],
         parent: Option<&Scope<'a>>,
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
@@ -2119,7 +2126,7 @@ impl Engine {
             (QueryExpr::Select(sel), QueryPlan::Select(first)) => {
                 let moved = pushed
                     .iter()
-                    .map(|c| substitute_body_columns(c, &first))
+                    .map(|c| substitute_body_columns(c, &first, want))
                     .collect();
                 Ok(QueryPlan::Select(
                     self.plan_select_pushed(sel, parent, ctes, ptypes, moved)?,
@@ -2139,8 +2146,10 @@ impl Engine {
                     limit,
                     offset,
                 } = *first;
-                let lhs = self.replan_pushed_query(&so.lhs, lhs, pushed, parent, ctes, ptypes)?;
-                let rhs = self.replan_pushed_query(&so.rhs, rhs, pushed, parent, ctes, ptypes)?;
+                let lhs =
+                    self.replan_pushed_query(&so.lhs, lhs, pushed, want, parent, ctes, ptypes)?;
+                let rhs =
+                    self.replan_pushed_query(&so.rhs, rhs, pushed, want, parent, ctes, ptypes)?;
                 Ok(QueryPlan::SetOp(Box::new(SetOpPlan {
                     op,
                     all,

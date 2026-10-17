@@ -267,6 +267,7 @@ var SupportedCapabilities = []string{
 	"query.where_contradiction",
 	"dml.where_contradiction",
 	"query.derived_pushdown",
+	"query.safe_conjunct_gate",
 	"query.on_pushdown",
 	"query.index_nested_loop",
 	"query.hash_join",

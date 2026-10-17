@@ -1,0 +1,277 @@
+# EXPLAIN of the broader safe-conjunct gate (spec/design/planner.md §3.5) and widened set-operation
+# arms (§3.6). A conjunct with a `traps = false` cast or function, or a LIKE with a proven pattern,
+# renders on its relation's Scan (or inside a derived body); anything that can trap stays in the
+# residual Filter. A cast that can separate equal values (a decimal render) stays out of a body that
+# matches rows. A widened arm reads its column through the set operation's widening cast. This
+# rendering, and the DISTINCT representative the lossy case keeps, are jed-specific and not
+# oracle-imported.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.column_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.qualified_column, query.join_inner, query.union, query.distinct, query.aggregates, query.group_by, query.derived_table, query.point_lookup, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.safe_conjunct_gate, query.explain, expr.like, expr.arithmetic, func.casing, func.abs, cast.explicit, cast.scalar_text, cast.runtime_text, null.three_valued, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, s text, k i32, d decimal, f f64)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, aid i32, w i32)
+
+statement ok
+CREATE TABLE r (id i32 PRIMARY KEY, v f32)
+
+statement ok
+INSERT INTO a VALUES (1, 'alpha', 1, 1.5, 0.5), (2, 'Beta', 2, 2.50, -1.25), (3, 'ab', 3, NULL, 2.0), (4, NULL, NULL, 1.50, NULL), (5, 'abcde', 2, 3, 1.5), (6, 'a\b', 1, 0.10, 4.0)
+
+statement ok
+INSERT INTO b VALUES (10, 1, 100), (11, 2, 200), (12, 3, 300), (13, 5, 500), (14, 5, 501), (15, 7, 700), (16, 4, 4000), (17, 6, 60)
+
+statement ok
+INSERT INTO r VALUES (1, 0.5), (2, 1.25), (3, NULL), (4, 3.5)
+
+# A classified function and a classified cast run on a's Scan; the residual Filter is gone.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE length(a.s) > 3 AND CAST(a.k AS text) <> '3'
+----
+0
+Nested Loop
+inner; on=(#0 = #6); output=[#0, #7]
+1
+55
+1
+Scan a
+Full scan; touched=3; filter=((length(#1) > 3) and (cast(#2 as text) <> '3'))
+1
+37
+1
+Scan b
+Full scan; touched=2
+8
+9
+
+# A LIKE whose literal pattern has no unpaired trailing escape moves ...
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.s LIKE 'ab%'
+----
+0
+Nested Loop
+inner; on=(#0 = #6); output=[#0, #7]
+1
+31
+1
+Scan a
+Full scan; touched=2; filter=(#1 like 'ab%')
+1
+13
+1
+Scan b
+Full scan; touched=2
+8
+9
+
+# ... and one ending in a lone escape stays in the residual (EXPLAIN does not run it).
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.s LIKE 'ab\'
+----
+0
+Filter
+filter=(#1 like 'ab\\'); output=[#0, #7]
+1
+42
+1
+Nested Loop
+inner; on=(#0 = #6)
+8
+33
+2
+Scan b
+Full scan; touched=2
+8
+9
+2
+Scan a
+Index-nested-loop PK bound: id = join; touched=2
+8
+16
+
+# Arithmetic, a text parse, and abs (whose integer overload overflows) can trap: all stay.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.k + 0 > 1 AND CAST(a.s AS i32) = 1 AND abs(a.k) > 1
+----
+0
+Filter
+filter=((((#2 + 0) > 1) and (cast(#1 as i32) = 1)) and (abs(#2) > 1)); output=[#0, #7]
+1
+73
+1
+Nested Loop
+inner; on=(#0 = #6)
+1
+64
+2
+Scan a
+Full scan; touched=3
+6
+7
+2
+Scan b
+Full scan; touched=2
+8
+9
+
+# A function over a grouping column moves below a grouped body's Aggregate.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT g.s, g.c FROM (SELECT s, count(*) AS c FROM a GROUP BY s) g WHERE lower(g.s) = 'beta'
+----
+0
+Subquery g
+output=[#0, #1]
+1
+22
+1
+Aggregate
+groups=1 aggs=1; output=[#0, #1]
+1
+21
+2
+Filter
+filter=(lower(#1) = 'beta')
+1
+19
+3
+Scan a
+Full scan; touched=1
+6
+7
+
+# A decimal render can separate 1.5 from 1.50, which DISTINCT treats as one row: the conjunct stays
+# above the DISTINCT body, ...
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT q.d FROM (SELECT DISTINCT d FROM a) q WHERE CAST(q.d AS text) = '1.50'
+----
+0
+Filter
+filter=(cast(#0 as text) = '1.50'); output=[#0]
+1
+26
+1
+Subquery q
+-
+6
+13
+2
+Distinct
+output=[#3]
+6
+13
+3
+Scan a
+Full scan; touched=1
+6
+7
+
+# ... which keeps the first of the equal rows, 1.5, so nothing renders as '1.50'.
+query D nosort
+SELECT q.d FROM (SELECT DISTINCT d FROM a) q WHERE CAST(q.d AS text) = '1.50'
+----
+
+# A UNION ALL body matches no rows, so the same conjunct moves into each arm.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT q.d FROM (SELECT d FROM a UNION ALL SELECT d FROM a) q WHERE CAST(q.d AS text) = '1.50'
+----
+0
+Subquery q
+output=[#0]
+2
+42
+1
+Union
+all
+2
+40
+2
+Filter
+filter=(cast(#3 as text) = '1.50'); output=[#3]
+1
+20
+3
+Scan a
+Full scan; touched=1
+6
+7
+2
+Filter
+filter=(cast(#3 as text) = '1.50'); output=[#3]
+1
+20
+3
+Scan a
+Full scan; touched=1
+6
+7
+
+# A widened arm: the i32 arm reads k through CAST(… AS decimal), the decimal arm reads d bare.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT s.x FROM (SELECT k AS x FROM a UNION SELECT d FROM a) s WHERE s.x >= 2
+----
+0
+Subquery s
+output=[#0]
+4
+40
+1
+Union
+distinct
+4
+36
+2
+Filter
+filter=(cast(#2 as decimal) >= 2); output=[#2]
+2
+21
+3
+Scan a
+Full scan; touched=1
+6
+7
+2
+Filter
+filter=(#3 >= 2); output=[#3]
+2
+15
+3
+Scan a
+Full scan; touched=1
+6
+7
+
+# An f32 arm under an f64 output reads v through CAST(… AS f64).
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT s.v FROM (SELECT v FROM r UNION ALL SELECT f FROM a) s WHERE s.v > 1
+----
+0
+Subquery s
+output=[#0]
+4
+34
+1
+Union
+all
+4
+30
+2
+Filter
+filter=(cast(#1 as f64) > 1); output=[#1]
+2
+15
+3
+Scan r
+Full scan; touched=1
+4
+5
+2
+Filter
+filter=(#4 > 1); output=[#4]
+2
+15
+3
+Scan a
+Full scan; touched=1
+6
+7

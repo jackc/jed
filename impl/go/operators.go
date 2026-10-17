@@ -34,6 +34,11 @@ type operatorDesc struct {
 	// charges in place of OperatorEval. 0 = absent ⇒ use the uniform OperatorEval. Size-scaled
 	// cost (DecimalWork / VarlenCompare / …) is separate from this static base.
 	Cost int64
+	// Traps is the trap classification (functions.md §15): false asserts the kernel raises
+	// nothing for any arguments, is immutable, and reads only its arguments. Name-level.
+	Traps bool
+	// PreservesEq (with Traps false): equal arguments give equal results (preserves_equality).
+	PreservesEq bool
 }
 
 // Operators lists every operator in the catalog, in catalog order.
@@ -54,6 +59,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "and",
@@ -71,6 +78,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "not",
@@ -88,6 +97,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -105,6 +116,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -122,6 +135,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -139,6 +154,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -156,6 +173,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -173,6 +192,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -190,6 +211,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -207,6 +230,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -224,6 +249,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -241,6 +268,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -258,6 +287,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -275,6 +306,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -292,6 +325,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -309,6 +344,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -326,6 +363,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -343,6 +382,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -360,6 +401,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "like",
@@ -377,6 +420,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ilike",
@@ -394,6 +439,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regex_match",
@@ -411,6 +458,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regex_imatch",
@@ -428,6 +477,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -445,6 +496,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -462,6 +515,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -479,6 +534,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -496,6 +553,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -513,6 +572,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -530,6 +591,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -547,6 +610,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -564,6 +629,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -581,6 +648,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -598,6 +667,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -615,6 +686,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -632,6 +705,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -649,6 +724,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -666,6 +743,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -683,6 +762,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -700,6 +781,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -717,6 +800,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -734,6 +819,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -751,6 +838,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -768,6 +857,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -785,6 +876,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -802,6 +895,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -819,6 +914,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -836,6 +933,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -853,6 +952,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -870,6 +971,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -887,6 +990,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -904,6 +1009,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -921,6 +1028,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -938,6 +1047,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -955,6 +1066,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -972,6 +1085,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -989,6 +1104,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -1006,6 +1123,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -1023,6 +1142,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -1040,6 +1161,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -1057,6 +1180,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -1074,6 +1199,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -1091,6 +1218,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -1108,6 +1237,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -1125,6 +1256,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -1142,6 +1275,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -1159,6 +1294,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -1176,6 +1313,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -1193,6 +1332,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -1210,6 +1351,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -1227,6 +1370,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -1244,6 +1389,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -1261,6 +1408,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -1278,6 +1427,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -1295,6 +1446,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -1312,6 +1465,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -1329,6 +1484,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -1346,6 +1503,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -1363,6 +1522,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -1380,6 +1541,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "eq",
@@ -1397,6 +1560,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ne",
@@ -1414,6 +1579,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lt",
@@ -1431,6 +1598,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gt",
@@ -1448,6 +1617,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "le",
@@ -1465,6 +1636,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ge",
@@ -1482,6 +1655,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -1499,6 +1674,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -1516,6 +1693,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_null",
@@ -1533,6 +1712,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "is_not_null",
@@ -1550,6 +1731,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -1567,6 +1750,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -1584,6 +1769,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mul",
@@ -1601,6 +1788,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "div",
@@ -1618,6 +1807,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mod",
@@ -1635,6 +1826,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "neg",
@@ -1652,6 +1845,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -1669,6 +1864,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -1686,6 +1883,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mul",
@@ -1703,6 +1902,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "div",
@@ -1720,6 +1921,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mod",
@@ -1737,6 +1940,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "neg",
@@ -1754,6 +1959,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -1771,6 +1978,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -1788,6 +1997,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "neg",
@@ -1805,6 +2016,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -1822,6 +2035,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -1839,6 +2054,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -1856,6 +2073,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -1873,6 +2092,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -1890,6 +2111,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -1907,6 +2130,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -1924,6 +2149,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -1941,6 +2168,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mul",
@@ -1958,6 +2187,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mul",
@@ -1975,6 +2206,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mul",
@@ -1992,6 +2225,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mul",
@@ -2009,6 +2244,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "div",
@@ -2026,6 +2263,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "div",
@@ -2043,6 +2282,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -2060,6 +2301,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -2077,6 +2320,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -2094,6 +2339,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -2111,6 +2358,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -2128,6 +2377,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -2145,6 +2396,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -2162,6 +2415,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "add",
@@ -2179,6 +2434,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sub",
@@ -2196,6 +2453,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mul",
@@ -2213,6 +2472,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "div",
@@ -2230,6 +2491,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "mod",
@@ -2247,6 +2510,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "neg",
@@ -2264,6 +2529,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "abs",
@@ -2281,6 +2548,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "abs",
@@ -2298,6 +2567,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "round",
@@ -2315,6 +2586,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "round",
@@ -2332,6 +2605,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "round",
@@ -2349,6 +2624,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "round",
@@ -2366,6 +2643,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ceil",
@@ -2383,6 +2662,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ceil",
@@ -2400,6 +2681,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ceiling",
@@ -2417,6 +2700,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ceiling",
@@ -2434,6 +2719,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "floor",
@@ -2451,6 +2738,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "floor",
@@ -2468,6 +2757,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "trunc",
@@ -2485,6 +2776,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "trunc",
@@ -2502,6 +2795,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "trunc",
@@ -2519,6 +2814,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "trunc",
@@ -2536,6 +2833,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "abs",
@@ -2553,6 +2852,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ceil",
@@ -2570,6 +2871,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ceiling",
@@ -2587,6 +2890,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "floor",
@@ -2604,6 +2909,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "trunc",
@@ -2621,6 +2928,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "round",
@@ -2638,6 +2947,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "round",
@@ -2655,6 +2966,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sqrt",
@@ -2672,6 +2985,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "exp",
@@ -2689,6 +3004,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ln",
@@ -2706,6 +3023,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "log10",
@@ -2723,6 +3042,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "pow",
@@ -2740,6 +3061,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "power",
@@ -2757,6 +3080,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sqrt",
@@ -2774,6 +3099,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "exp",
@@ -2791,6 +3118,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "ln",
@@ -2808,6 +3137,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "log",
@@ -2825,6 +3156,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "log10",
@@ -2842,6 +3175,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "log",
@@ -2859,6 +3194,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "power",
@@ -2876,6 +3213,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "pow",
@@ -2893,6 +3232,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sin",
@@ -2910,6 +3251,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "cos",
@@ -2927,6 +3270,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "tan",
@@ -2944,6 +3289,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "cbrt",
@@ -2961,6 +3308,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "pi",
@@ -2978,6 +3327,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "radians",
@@ -2995,6 +3346,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "degrees",
@@ -3012,6 +3365,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "asin",
@@ -3029,6 +3384,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "acos",
@@ -3046,6 +3403,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "atan",
@@ -3063,6 +3422,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "atan2",
@@ -3080,6 +3441,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "cot",
@@ -3097,6 +3460,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sinh",
@@ -3114,6 +3479,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "cosh",
@@ -3131,6 +3498,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "tanh",
@@ -3148,6 +3517,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "asinh",
@@ -3165,6 +3536,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "acosh",
@@ -3182,6 +3555,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "atanh",
@@ -3199,6 +3574,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sign",
@@ -3216,6 +3593,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sign",
@@ -3233,6 +3612,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "factorial",
@@ -3250,6 +3631,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "scale",
@@ -3267,6 +3650,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "min_scale",
@@ -3284,6 +3669,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "trim_scale",
@@ -3301,6 +3688,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "make_interval",
@@ -3318,6 +3707,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "justify_hours",
@@ -3335,6 +3726,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "justify_days",
@@ -3352,6 +3745,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "justify_interval",
@@ -3369,6 +3764,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "age",
@@ -3386,6 +3783,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "age",
@@ -3403,6 +3802,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "age",
@@ -3420,6 +3821,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "age",
@@ -3437,6 +3840,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "make_timestamp",
@@ -3454,6 +3859,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "make_timestamptz",
@@ -3471,6 +3878,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "make_timestamptz",
@@ -3488,6 +3897,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "make_date",
@@ -3505,6 +3916,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "current_date",
@@ -3522,6 +3935,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "date_part",
@@ -3539,6 +3954,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "date_part",
@@ -3556,6 +3973,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "date_part",
@@ -3573,6 +3992,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "date_part",
@@ -3590,6 +4011,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_char",
@@ -3777,6 +4200,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "uuid_extract_timestamp",
@@ -3794,6 +4219,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "uuidv4",
@@ -3811,6 +4238,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "gen_random_uuid",
@@ -3845,6 +4274,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "uuidv7",
@@ -3862,6 +4293,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "now",
@@ -3879,6 +4312,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "clock_timestamp",
@@ -3896,6 +4331,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "nextval",
@@ -3913,6 +4350,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "currval",
@@ -3930,6 +4369,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "setval",
@@ -3947,6 +4388,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "setval",
@@ -3964,6 +4407,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lastval",
@@ -3981,6 +4426,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "current_setting",
@@ -3998,6 +4445,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "current_setting",
@@ -4015,6 +4464,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "num_nulls",
@@ -4032,6 +4483,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "num_nonnulls",
@@ -4049,6 +4502,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_ndims",
@@ -4066,6 +4521,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_length",
@@ -4083,6 +4540,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_lower",
@@ -4100,6 +4559,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_upper",
@@ -4117,6 +4578,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "cardinality",
@@ -4134,6 +4597,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_dims",
@@ -4151,6 +4616,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_to_json",
@@ -4168,6 +4635,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_to_json",
@@ -4185,6 +4654,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_append",
@@ -4202,6 +4673,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_prepend",
@@ -4219,6 +4692,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_cat",
@@ -4236,6 +4711,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_remove",
@@ -4253,6 +4730,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_replace",
@@ -4270,6 +4749,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_position",
@@ -4287,6 +4768,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_position",
@@ -4304,6 +4787,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_positions",
@@ -4321,6 +4806,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_to_string",
@@ -4406,6 +4893,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "concat",
@@ -4423,6 +4912,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "concat",
@@ -4440,6 +4931,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "concat",
@@ -4457,6 +4950,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "concat",
@@ -4474,6 +4969,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "contains",
@@ -4491,6 +4988,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "contained_by",
@@ -4508,6 +5007,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "overlaps",
@@ -4525,6 +5026,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "contains",
@@ -4542,6 +5045,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "contains",
@@ -4559,6 +5064,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "contained_by",
@@ -4576,6 +5083,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "contained_by",
@@ -4593,6 +5102,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "overlaps",
@@ -4610,6 +5121,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "strictly_left",
@@ -4627,6 +5140,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "strictly_right",
@@ -4644,6 +5159,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "not_extend_right",
@@ -4661,6 +5178,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "not_extend_left",
@@ -4678,6 +5197,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "adjacent",
@@ -4695,6 +5216,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lower",
@@ -4712,6 +5235,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "upper",
@@ -4729,6 +5254,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "lower",
@@ -4746,6 +5273,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "upper",
@@ -4763,6 +5292,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "length",
@@ -4780,6 +5311,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "length",
@@ -4797,6 +5330,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "char_length",
@@ -4814,6 +5349,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "character_length",
@@ -4831,6 +5368,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "octet_length",
@@ -4848,6 +5387,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "octet_length",
@@ -4865,6 +5406,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "bit_length",
@@ -4882,6 +5425,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "bit_length",
@@ -4899,6 +5444,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "substr",
@@ -4916,6 +5463,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "substr",
@@ -4933,6 +5482,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "substr",
@@ -4950,6 +5501,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "substr",
@@ -4967,6 +5520,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "substring",
@@ -4984,6 +5539,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "substring",
@@ -5001,6 +5558,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "substring",
@@ -5018,6 +5577,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "substring",
@@ -5035,6 +5596,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "substring",
@@ -5069,6 +5632,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "overlay",
@@ -5086,6 +5651,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "overlay",
@@ -5103,6 +5670,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "overlay",
@@ -5120,6 +5689,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "left",
@@ -5137,6 +5708,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "right",
@@ -5154,6 +5727,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lpad",
@@ -5171,6 +5746,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lpad",
@@ -5188,6 +5765,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "rpad",
@@ -5205,6 +5784,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "rpad",
@@ -5222,6 +5803,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "btrim",
@@ -5239,6 +5822,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "btrim",
@@ -5256,6 +5841,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "btrim",
@@ -5273,6 +5860,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "ltrim",
@@ -5290,6 +5879,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "ltrim",
@@ -5307,6 +5898,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "ltrim",
@@ -5324,6 +5917,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "rtrim",
@@ -5341,6 +5936,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "rtrim",
@@ -5358,6 +5955,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "rtrim",
@@ -5375,6 +5974,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "replace",
@@ -5392,6 +5993,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "translate",
@@ -5409,6 +6012,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "repeat",
@@ -5426,6 +6031,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "reverse",
@@ -5443,6 +6050,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "strpos",
@@ -5460,6 +6069,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "position",
@@ -5477,6 +6088,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "position",
@@ -5494,6 +6107,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "split_part",
@@ -5511,6 +6126,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "starts_with",
@@ -5528,6 +6145,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "ascii",
@@ -5545,6 +6164,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "chr",
@@ -5562,6 +6183,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "initcap",
@@ -5579,6 +6202,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "to_hex",
@@ -5596,6 +6221,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "encode",
@@ -5613,6 +6240,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "decode",
@@ -5630,6 +6259,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "get_byte",
@@ -5647,6 +6278,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "set_byte",
@@ -5664,6 +6297,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "get_bit",
@@ -5681,6 +6316,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "set_bit",
@@ -5698,6 +6335,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "md5",
@@ -5715,6 +6354,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "md5",
@@ -5732,6 +6373,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         false,
+		PreservesEq:   true,
 	},
 	{
 		Name:          "sha224",
@@ -5749,6 +6392,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sha256",
@@ -5766,6 +6411,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sha384",
@@ -5783,6 +6430,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "sha512",
@@ -5800,6 +6449,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "quote_literal",
@@ -5817,6 +6468,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "quote_ident",
@@ -5834,6 +6487,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "quote_nullable",
@@ -5851,6 +6506,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "like_escape",
@@ -5868,6 +6525,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "concat",
@@ -5936,6 +6595,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_replace",
@@ -5953,6 +6614,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_match",
@@ -5970,6 +6633,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_match",
@@ -5987,6 +6652,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_split_to_array",
@@ -6004,6 +6671,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_split_to_array",
@@ -6021,6 +6690,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_like",
@@ -6038,6 +6709,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_like",
@@ -6055,6 +6728,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_count",
@@ -6072,6 +6747,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_count",
@@ -6089,6 +6766,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_count",
@@ -6106,6 +6785,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_substr",
@@ -6123,6 +6804,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_substr",
@@ -6140,6 +6823,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_substr",
@@ -6157,6 +6842,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_substr",
@@ -6174,6 +6861,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_substr",
@@ -6191,6 +6880,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_instr",
@@ -6208,6 +6899,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_instr",
@@ -6225,6 +6918,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_instr",
@@ -6242,6 +6937,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_instr",
@@ -6259,6 +6956,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_instr",
@@ -6276,6 +6975,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_instr",
@@ -6293,6 +6994,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "isempty",
@@ -6310,6 +7013,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lower_inc",
@@ -6327,6 +7032,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "upper_inc",
@@ -6344,6 +7051,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "lower_inf",
@@ -6361,6 +7070,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "upper_inf",
@@ -6378,6 +7089,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "i32range",
@@ -6395,6 +7108,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "i32range",
@@ -6412,6 +7127,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "i64range",
@@ -6429,6 +7146,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "i64range",
@@ -6446,6 +7165,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "numrange",
@@ -6463,6 +7184,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "numrange",
@@ -6480,6 +7203,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "tsrange",
@@ -6497,6 +7222,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "tsrange",
@@ -6514,6 +7241,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "tstzrange",
@@ -6531,6 +7260,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "tstzrange",
@@ -6548,6 +7279,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "daterange",
@@ -6565,6 +7298,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "daterange",
@@ -6582,6 +7317,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "range_union",
@@ -6599,6 +7336,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "range_difference",
@@ -6616,6 +7355,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "range_intersect",
@@ -6633,6 +7374,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "range_merge",
@@ -6650,6 +7393,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "jsonb_typeof",
@@ -6667,6 +7412,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "json_typeof",
@@ -6684,6 +7431,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "jsonb_array_length",
@@ -6701,6 +7450,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "json_array_length",
@@ -6718,6 +7469,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "jsonb_strip_nulls",
@@ -6735,6 +7488,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "json_strip_nulls",
@@ -6752,6 +7507,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "jsonb_pretty",
@@ -6769,6 +7526,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_jsonb",
@@ -6786,6 +7545,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_json",
@@ -6803,6 +7564,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "json_scalar",
@@ -6820,6 +7583,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "json_serialize",
@@ -6837,6 +7602,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "json_serialize",
@@ -6854,6 +7621,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "jsonb_build_array",
@@ -6871,6 +7640,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "json_build_array",
@@ -6888,6 +7659,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "jsonb_build_object",
@@ -6905,6 +7678,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "json_build_object",
@@ -6922,6 +7697,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 }
 
@@ -7801,4 +8578,41 @@ var windows = []windowDesc{
 		Null:           "frame",
 		Errors:         []string{"22016"},
 	},
+}
+
+// castTrapDesc is one cast spec/types/casts.toml classifies traps = false (functions.md §15):
+// it raises nothing for any source value. PreservesEq says equal sources give equal
+// results.
+type castTrapDesc struct {
+	From        string
+	To          string
+	PreservesEq bool
+}
+
+// nonTrappingCasts lists every non-trapping cast, in casts.toml order (the planner's
+// safe-conjunct gate, planner.md §3.5). A cast absent from it may trap.
+var nonTrappingCasts = []castTrapDesc{
+	{From: "i16", To: "i32", PreservesEq: true},
+	{From: "i16", To: "i64", PreservesEq: true},
+	{From: "i32", To: "i64", PreservesEq: true},
+	{From: "i16", To: "decimal", PreservesEq: true},
+	{From: "i32", To: "decimal", PreservesEq: true},
+	{From: "i64", To: "decimal", PreservesEq: true},
+	{From: "i16", To: "f64", PreservesEq: true},
+	{From: "i32", To: "f64", PreservesEq: true},
+	{From: "i64", To: "f64", PreservesEq: true},
+	{From: "f32", To: "f64", PreservesEq: true},
+	{From: "i16", To: "f32", PreservesEq: true},
+	{From: "i32", To: "f32", PreservesEq: true},
+	{From: "i64", To: "f32", PreservesEq: true},
+	{From: "boolean", To: "i32", PreservesEq: true},
+	{From: "i32", To: "boolean", PreservesEq: true},
+	{From: "uuid", To: "text", PreservesEq: true},
+	{From: "i16", To: "text", PreservesEq: true},
+	{From: "i32", To: "text", PreservesEq: true},
+	{From: "i64", To: "text", PreservesEq: true},
+	{From: "decimal", To: "text", PreservesEq: false},
+	{From: "f32", To: "text", PreservesEq: false},
+	{From: "f64", To: "text", PreservesEq: false},
+	{From: "boolean", To: "text", PreservesEq: true},
 }

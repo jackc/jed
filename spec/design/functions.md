@@ -795,3 +795,46 @@ curated exception). All are `kind = "function"`, `result = "i64"`, `null = "prop
 
 These stay within the §13 untrusted-query guarantee: no host reach, deterministic, and cost-bounded
 (`nextval`/`setval` each charge one `sequence_advance` unit, [cost.md](cost.md)).
+
+## 15. Trap classification (`traps`, `preserves_equality`) — what the planner may move
+
+The planner moves a predicate to where fewer or other rows reach it — into a relation's scan, into a
+derived body, below a grouping or a window, into each arm of a set operation
+([planner.md](planner.md) §3.2–§3.6). There it runs on rows the written plan would never have
+evaluated it on, so it must not be able to raise an error there. Whether a node can raise is a fact
+about its kernel, so it is catalog data, not planner code:
+
+- **`traps`** (optional boolean, absent ⇒ `true`). `traps = false` asserts that the kernel raises no
+  error for **any** argument values of **any** overload: it is a total function of its arguments
+  (or NULL), it is `immutable`, and it reads nothing but its arguments and the handle's immutable
+  Environment data (the casing tables `lower`/`upper` consult). The cost meter's aborts (`54P01`,
+  `54P02`) and the query-memory account's are not traps: they are guardrails whose firing point the
+  selected plan defines (planner.md §3). A kernel that reserves against the scalar allowance (an
+  amplifier, [cost.md](cost.md) §8.1, `54P04`) does trap. Absent is the conservative default; a row
+  is marked only after its kernel has been read in every core.
+- **`preserves_equality`** (required boolean when `traps = false`). `true` asserts that equal
+  arguments give equal results, so a predicate over the result gives one answer for every row in an
+  equality class — what moving below `DISTINCT`, a grouping, a window partition, or a set
+  operation's row match needs (planner.md §3.2). `false` marks a kernel that can separate equal
+  values; `decimal` and the floats have them (`1.5 = 1.50`, `-0 = 0`).
+
+Both fields are **name-level**, like `cost` (§8): every overload sharing a function name must agree,
+because the planner looks them up by the call's name. `verify.rb` also requires `traps = false` rows
+to declare no `errors` and to be `immutable`. The classified functions are the text functions whose
+kernels cannot fail — `length`, `char_length`, `character_length`, `octet_length`, `bit_length`,
+`lower`, `upper`, `btrim`, `ltrim`, `rtrim`, `reverse`, `strpos`, `position`, `starts_with`, `ascii`,
+`initcap`, `md5` — all `preserves_equality = true` (text and bytea equality is byte identity, and
+equal ranges have equal bounds). The amplifiers (`replace`, `repeat`, the pads), the growth kernels,
+and everything that can raise stay unclassified.
+
+Casts carry the same two fields in [../types/casts.toml](../types/casts.toml), per `(from, to)` row:
+the integer widenings, integer → `decimal` / `f32` / `f64`, `f32` → `f64`, `boolean` ↔ `i32`, and
+integer / `boolean` / `uuid` → `text` are `traps = false, preserves_equality = true`; `decimal` /
+`f32` / `f64` → `text` are `traps = false, preserves_equality = false`. A cast row with an
+`on_overflow` trap is never `traps = false`. The codegen emits the classified functions and casts
+into each core's descriptor tables (`operators.*`). Unclassified casts (narrowing, text parsing, the
+datetime family, `timestamptz` → `text` in the session zone) keep their traps.
+
+Beyond the classification, one predicate is proven safe at plan time from a literal operand: a LIKE
+whose pattern has no unpaired trailing escape (planner.md §3.5), read through the custom-plan frame
+when the pattern is a parameter.

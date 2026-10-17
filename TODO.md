@@ -309,13 +309,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     like a derived table and takes the same body pushdown (§3.4; its definition plans with reference
     expansion off and each body expands at most once, so chains plan linearly). EXPLAIN renders such
     a body under its `CTE Scan`. NoREC `cte_window_pushdown`.
-  - [ ] _follow-on:_ push into a **widened set-operation arm** (would need the conjunct re-resolved at
-    the arm's type), into each reference of a multiply-referenced `NOT MATERIALIZED` CTE (needs a
+  - [x] push into a **widened set-operation arm** — the arm reads its column through the set
+    operation's own widening: bare for an integer width, `CAST(col AS decimal|f64)` for int→decimal /
+    f32→f64 ([planner.md §3.6](spec/design/planner.md)). NoREC `safe_conjunct_pushdown`.
+  - [ ] _follow-on:_ push into each reference of a multiply-referenced `NOT MATERIALIZED` CTE (needs a
     planning-work bound: expanding every reference re-plans a chain exponentially), into a CTE
     referenced from a data-modifying part (planned only when it runs), and through a lateral
     relation.
-  - [ ] _follow-on:_ broader safe-conjunct gate (non-trapping casts/functions via a catalog
-    `traps` classification) and parameter-time proofs.
+  - [x] **broader safe-conjunct gate** (`query.safe_conjunct_gate`, [planner.md §3.5](spec/design/planner.md))
+    — a catalog-level `traps` / `preserves_equality` classification, name-level in catalog.toml and
+    per row in casts.toml, codegen'd into every core ([functions.md §15](spec/design/functions.md)):
+    the non-trapping text functions (`length`, `lower`/`upper`, the trims, `strpos`, `starts_with`, …)
+    and casts (integer widenings, integer → decimal/float, `f32` → `f64`, `boolean` ↔ `i32`, renders
+    to `text`) move; a decimal/float render (`preserves_equality = false`) moves into a body only when
+    the body matches no rows. **Parameter-time proof:** a LIKE / ILIKE moves when its pattern is a
+    plan-time literal with no unpaired trailing escape, a bound parameter read through the custom-plan
+    frame. NoREC `safe_conjunct_pushdown`.
+  - [ ] _follow-on:_ more plan-time proofs and classifications — integer `/` and `%` by a literal or
+    bound divisor outside {0, −1}, a regular expression whose literal pattern compiles at plan time,
+    the remaining non-trapping built-ins (numeric `trunc`/`sign`/`scale`, the range accessors, the
+    SHA-2 digests), the datetime renders; and widening the hash join's own residual gate
+    ([cost.md §3](spec/design/cost.md)), which still admits only bare-column comparisons.
   - [ ] _follow-on:_ plan-time **constant folding** / CSE / eliding a pushed recheck that its own
     access bound already guarantees — each removes `operator_eval` charges, so each needs its own
     explicit cost decision (the framing above), not a silent apply.

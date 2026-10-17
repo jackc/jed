@@ -219,8 +219,9 @@ history-dependent switch is excluded.
 
 **Rule.** The plan of every execution is the plan physical selection produces when each bound value
 is available as a plan-time constant of its parameter's resolved type, at exactly the sites where a
-literal of that type would be read: the estimator (§7, §7.2, [statistics.md §6](statistics.md)) and
-the stage-2 contradiction proof ([planner.md](planner.md) §3.1). Call it the *custom plan*.
+literal of that type would be read: the estimator (§7, §7.2, [statistics.md §6](statistics.md)), the
+stage-2 contradiction proof, and the safe-conjunct gate's LIKE pattern proof ([planner.md](planner.md)
+§3.1, §3.5). Call it the *custom plan*.
 Resolution (parse, name binding, parameter types, errors) does not depend on values; only physical
 selection and estimation see them. Results never depend on the plan; the cost of an execution may,
 deterministically, through the values, exactly as the cost of the equivalent literal query does. A
@@ -775,7 +776,7 @@ the authored position. The selected physical order defines deterministic error v
 An INL bound for the newly appended relation may use a sibling column from any relation already in
 the physical left prefix. A hash alternative may use equality keys from any newly-ready `ON` tree
 between that prefix and the appended relation. Hash remains legal only when the *complete* newly-ready
-set passes the existing non-trapping safe-conjunct gate; every newly-ready tree remains an
+set passes the hash join's structural non-trapping leaf gate (cost.md §3; not the broader pushdown gate of planner.md §3.5); every newly-ready tree remains an
 authoritative residual recheck in authored order.
 
 ### 10.2 Partial state and exhaustive DP

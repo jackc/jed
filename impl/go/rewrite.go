@@ -120,7 +120,9 @@ func rewriteWhere(plan *selectPlan) {
 		if plan.rels[ri].lateral || !pushdownSafe(c) {
 			return pushedConjunct{}, false
 		}
-		if body := bodies[ri]; body != nil {
+		// A conjunct that may separate equal values moves only into a body that matches no rows
+		// (planner.md §3.2).
+		if body := bodies[ri]; body != nil && (!conjunctLossy(c) || nonMatchingBody(body)) {
 			if moved, ok := bodyConjunct(c, plan.rels[ri].offset, body); ok {
 				return pushedConjunct{expr: moved, ri: ri, body: true}, true
 			}
@@ -296,17 +298,16 @@ func bodyInputColumn(b *selectPlan, j int) (int, bool) {
 }
 
 // bodyOutputPushable reports whether output column j of a body-pushable plan reads a bare body
-// column of type want in every SELECT it combines: a set operation's arms (and its own unified
-// column) must already have that exact type, so no arm value is widened after the pushed conjunct
-// would have judged it.
+// column in every SELECT it combines, each of a type the set operations widen to want without a
+// value change or through a widening cast (armWidening, planner.md §3.6).
 func bodyOutputPushable(q *queryPlan, j int, want resolvedType) bool {
 	if q.sel != nil {
 		_, ok := bodyInputColumn(q.sel, j)
-		return ok && resolvedTypeEqual(q.sel.columnTypes[j], want)
+		_, widens := armWidening(q.sel.columnTypes[j], want)
+		return ok && widens
 	}
 	so := q.setop
-	return resolvedTypeEqual(so.columnTypes[j], want) &&
-		bodyOutputPushable(&so.lhs, j, want) && bodyOutputPushable(&so.rhs, j, want)
+	return bodyOutputPushable(&so.lhs, j, want) && bodyOutputPushable(&so.rhs, j, want)
 }
 
 // bodyConjunct returns a pushdown-safe conjunct over a derived relation (whose columns start at
@@ -326,9 +327,9 @@ func bodyConjunct(c *rExpr, offset int, body *queryPlan) (*rExpr, bool) {
 			ok = j >= 0 && j < len(types) && bodyOutputPushable(body, j, types[j])
 			return
 		}
-		walk(e.lhs)
-		walk(e.rhs)
-		walk(e.operand)
+		for _, child := range rexprChildren(e) {
+			walk(child)
+		}
 	}
 	walk(c)
 	if !ok {
@@ -338,20 +339,41 @@ func bodyConjunct(c *rExpr, offset int, body *queryPlan) (*rExpr, bool) {
 }
 
 // substituteBodyColumns clones a conjunct in a body's output-column numbering with every column
-// replaced by the FROM slot that SELECT body's output reads. bodyConjunct already proved each
+// replaced by the FROM slot that SELECT body's output reads. want is the outermost body's output
+// types, which the conjunct was resolved against: an output the set operations widen with a value
+// change is read through the widening cast (planner.md §3.6). bodyConjunct already proved each
 // reference maps.
-func substituteBodyColumns(e *rExpr, body *selectPlan) *rExpr {
+func substituteBodyColumns(e *rExpr, body *selectPlan, want []resolvedType) *rExpr {
+	return mapPushedColumns(e, func(col *rExpr) *rExpr {
+		j := col.index
+		c := *col
+		c.index, _ = bodyInputColumn(body, j)
+		if target, _ := armWidening(body.columnTypes[j], want[j]); target != nil {
+			return &rExpr{kind: reCast, operand: &c, result: *target, trap: trapNone}
+		}
+		return &c
+	})
+}
+
+// mapPushedColumns clones a pushdown-safe tree with every column node replaced by column(node).
+// Only the pushdownSafe node kinds reach it; their children live in lhs / rhs / operand / sargs.
+func mapPushedColumns(e *rExpr, column func(*rExpr) *rExpr) *rExpr {
 	if e == nil {
 		return nil
 	}
-	c := *e
-	if c.kind == reColumn {
-		c.index, _ = bodyInputColumn(body, e.index)
-		return &c
+	if e.kind == reColumn {
+		return column(e)
 	}
-	c.lhs = substituteBodyColumns(e.lhs, body)
-	c.rhs = substituteBodyColumns(e.rhs, body)
-	c.operand = substituteBodyColumns(e.operand, body)
+	c := *e
+	c.lhs = mapPushedColumns(e.lhs, column)
+	c.rhs = mapPushedColumns(e.rhs, column)
+	c.operand = mapPushedColumns(e.operand, column)
+	if e.sargs != nil {
+		c.sargs = make([]*rExpr, len(e.sargs))
+		for i, a := range e.sargs {
+			c.sargs[i] = mapPushedColumns(a, column)
+		}
+	}
 	return &c
 }
 
@@ -445,9 +467,9 @@ func conjunctSingleRelation(plan *selectPlan, c *rExpr) (int, bool) {
 			owner = ri
 			return
 		}
-		walk(e.lhs)
-		walk(e.rhs)
-		walk(e.operand)
+		for _, child := range rexprChildren(e) {
+			walk(child)
+		}
 	}
 	walk(c)
 	return owner, ok && owner >= 0
@@ -462,38 +484,35 @@ func relationOfSlot(plan *selectPlan, slot int) int {
 	return -1
 }
 
-// pushdownSafe is the structural safety gate (planner.md §3.2): the conjunct must be unable to
-// trap and must read nothing but the row, constants and parameters — so evaluating it on a row the
-// join would never have produced can raise no error a non-pushed plan would not, and its value is
-// the same wherever it runs. The admitted shapes are boolean combinations (AND/OR/NOT) of
-// comparisons, IS [NOT] NULL, and IS [NOT] DISTINCT FROM over bare columns, literals and parameters,
-// plus a bare boolean column. A collated ordering comparison is excluded (its sort-key kernel can
-// fail on unloaded data); every other node kind — casts, arithmetic, functions, subqueries, outer
-// references — stays in the residual.
+// pushdownSafe is the safe-conjunct gate (planner.md §3.5): the conjunct must be unable to trap and
+// must read nothing but the row, constants and parameters — so evaluating it on a row the join would
+// never have produced can raise no error a non-pushed plan would not, and its value is the same
+// wherever it runs. The admitted shapes are boolean combinations (AND/OR/NOT) of comparisons, IS
+// [NOT] NULL, IS [NOT] DISTINCT FROM, and LIKE / ILIKE with a proven pattern, over non-trapping
+// value expressions (nonTrapping: columns, literals, parameters, and the classified casts and
+// functions), plus a boolean-valued non-trapping expression. A collated ordering comparison is
+// excluded (its sort-key kernel can fail on unloaded data); every other node kind — arithmetic,
+// trapping casts and functions, subqueries, outer references — stays in the residual.
 func pushdownSafe(e *rExpr) bool {
 	switch e.kind {
 	case reAnd, reOr:
 		return pushdownSafe(e.lhs) && pushdownSafe(e.rhs)
 	case reNot:
 		return pushdownSafe(e.operand)
-	case reColumn:
-		return true
 	case reCompare:
 		if e.collation != nil && e.op != opEq && e.op != opNe {
 			return false
 		}
-		return pushdownLeaf(e.lhs) && pushdownLeaf(e.rhs)
+		return nonTrapping(e.lhs) && nonTrapping(e.rhs)
 	case reDistinct:
-		return pushdownLeaf(e.lhs) && pushdownLeaf(e.rhs)
+		return nonTrapping(e.lhs) && nonTrapping(e.rhs)
 	case reIsNull:
-		return pushdownLeaf(e.operand)
+		return nonTrapping(e.operand)
+	case reLike:
+		return nonTrapping(e.lhs) && likePatternProven(e.rhs)
 	default:
-		return false
+		return nonTrapping(e)
 	}
-}
-
-func pushdownLeaf(e *rExpr) bool {
-	return e.kind == reColumn || e.kind == reParam || estimatorLiteral(e)
 }
 
 // andConjunct appends c to a left-deep AND chain (source order is preserved by the caller).
@@ -507,15 +526,9 @@ func andConjunct(acc, c *rExpr) *rExpr {
 // rebaseColumns clones a pushdown-safe tree with every column slot shifted down by offset, so it
 // evaluates against the relation's own row. Only the pushdownSafe node kinds reach it.
 func rebaseColumns(e *rExpr, offset int) *rExpr {
-	if e == nil {
-		return nil
-	}
-	c := *e
-	if c.kind == reColumn {
+	return mapPushedColumns(e, func(col *rExpr) *rExpr {
+		c := *col
 		c.index -= offset
-	}
-	c.lhs = rebaseColumns(e.lhs, offset)
-	c.rhs = rebaseColumns(e.rhs, offset)
-	c.operand = rebaseColumns(e.operand, offset)
-	return &c
+		return &c
+	})
 }

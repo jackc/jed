@@ -18,6 +18,7 @@ require "toml-rb"
 REPO = File.expand_path("..", __dir__)
 CATALOG = File.join(REPO, "spec", "functions", "catalog.toml")
 RANGES_SRC = File.join(REPO, "spec", "types", "ranges.toml")
+CASTS_SRC = File.join(REPO, "spec", "types", "casts.toml")
 
 # (relative path, builder method) for each generated file.
 TARGETS = [
@@ -75,6 +76,30 @@ def windows
   catalog["window"] || []
 end
 
+# The casts spec/types/casts.toml classifies `traps = false` (functions.md §15, planner.md §3.5): the
+# planner's safe-conjunct gate reads them. Each is [from, to, preserves_equality]. A classified row
+# must carry no on_overflow trap and must declare preserves_equality; an unclassified row must not.
+def non_trapping_casts
+  data = TomlRB.load_file(CASTS_SRC)
+  (data["cast"] || []).filter_map do |c|
+    id = "#{c['from']} -> #{c['to']}"
+    tr = c.fetch("traps", true)
+    fail!("#{CASTS_SRC}: cast #{id}: traps must be a boolean") unless [true, false].include?(tr)
+    if tr
+      fail!("#{CASTS_SRC}: cast #{id}: preserves_equality needs traps = false") if c.key?("preserves_equality")
+      next
+    end
+    fail!("#{CASTS_SRC}: cast #{id}: traps = false with an on_overflow trap") if c.key?("on_overflow")
+    pe = c["preserves_equality"]
+    fail!("#{CASTS_SRC}: cast #{id}: traps = false requires a boolean preserves_equality") unless [true, false].include?(pe)
+    [c["from"], c["to"], pe]
+  end
+end
+
+# The two trap-classification fields of an operator row (functions.md §15): absent traps ⇒ true.
+def op_traps(op) = op.fetch("traps", true)
+def op_preserves_equality(op) = op_traps(op) ? false : op.fetch("preserves_equality")
+
 # Range types (the [[range]] array of spec/types/ranges.toml) — the six built-in range
 # types as data. A STRUCTURAL container over a scalar element; the codec/comparator/text-I/O
 # stay hand-written per core (CLAUDE.md §5), only this type-set table is shared.
@@ -109,6 +134,8 @@ def rust_entry(op)
     "        volatility: #{rust_str(op.fetch('volatility'))},",
     "        variadic: #{op['variadic'] ? 'true' : 'false'},",
     "        cost: #{op['cost'] || 0},",
+    "        traps: #{op_traps(op)},",
+    "        preserves_equality: #{op_preserves_equality(op)},",
     "    },",
   ].join("\n")
 end
@@ -199,6 +226,11 @@ def rust_file(ops, aggs, srfs, wins)
         /// in place of `operator_eval`. 0 = absent ⇒ use the uniform `operator_eval`. Size-scaled
         /// cost (decimal_work / varlen_compare / …) is separate from this static base.
         pub cost: i64,
+        /// Trap classification (functions.md §15): false asserts the kernel raises nothing for any
+        /// arguments, is immutable, and reads only its arguments. Name-level. Default true.
+        pub traps: bool,
+        /// With `traps = false`: equal arguments give equal results (functions.md §15).
+        pub preserves_equality: bool,
     }
 
     /// Every operator in the catalog, in catalog order.
@@ -276,6 +308,21 @@ def rust_file(ops, aggs, srfs, wins)
     pub const WINDOWS: &[WindowDesc] = &[
     #{wins.map { |w| rust_window_entry(w) }.join("\n")}
     ];
+
+    /// One cast spec/types/casts.toml classifies `traps = false` (functions.md §15): it raises
+    /// nothing for any source value. `preserves_equality` says equal sources give equal results.
+    pub struct CastTrapDesc {
+        pub from: &'static str,
+        pub to: &'static str,
+        pub preserves_equality: bool,
+    }
+
+    /// Every non-trapping cast, in casts.toml order (the planner's safe-conjunct gate,
+    /// planner.md §3.5). A cast absent from this table may trap.
+    #[rustfmt::skip]
+    pub const NON_TRAPPING_CASTS: &[CastTrapDesc] = &[
+    #{non_trapping_casts.map { |f, t, pe| "    CastTrapDesc { from: #{rust_str(f)}, to: #{rust_str(t)}, preserves_equality: #{pe} }," }.join("\n")}
+    ];
   RS
 end
 
@@ -340,6 +387,8 @@ def go_entry(op)
     ["Volatility",    go_str(op.fetch("volatility"))],
     ["Variadic",      variadic_bool(op)],
     ["Cost",          (op["cost"] || 0).to_s],
+    ["Traps",         op_traps(op).to_s],
+    ["PreservesEq",   op_preserves_equality(op).to_s],
   ]
   w = fields.map { |k, _| k.length }.max
   lines = fields.map { |k, v| "\t\t#{k}:#{' ' * (w - k.length + 1)}#{v}," }
@@ -434,6 +483,11 @@ def go_file(ops, aggs, srfs, wins)
     \t// charges in place of OperatorEval. 0 = absent ⇒ use the uniform OperatorEval. Size-scaled
     \t// cost (DecimalWork / VarlenCompare / …) is separate from this static base.
     \tCost int64
+    \t// Traps is the trap classification (functions.md §15): false asserts the kernel raises
+    \t// nothing for any arguments, is immutable, and reads only its arguments. Name-level.
+    \tTraps bool
+    \t// PreservesEq (with Traps false): equal arguments give equal results (preserves_equality).
+    \tPreservesEq bool
     }
 
     // Operators lists every operator in the catalog, in catalog order.
@@ -507,6 +561,21 @@ def go_file(ops, aggs, srfs, wins)
     var windows = []windowDesc{
     #{wins.map { |w| go_window_entry(w) }.join("\n")}
     }
+
+    // castTrapDesc is one cast spec/types/casts.toml classifies traps = false (functions.md §15):
+    // it raises nothing for any source value. PreservesEq says equal sources give equal
+    // results.
+    type castTrapDesc struct {
+    \tFrom        string
+    \tTo          string
+    \tPreservesEq bool
+    }
+
+    // nonTrappingCasts lists every non-trapping cast, in casts.toml order (the planner's
+    // safe-conjunct gate, planner.md §3.5). A cast absent from it may trap.
+    var nonTrappingCasts = []castTrapDesc{
+    #{non_trapping_casts.map { |f, t, pe| "\t{From: #{go_str(f)}, To: #{go_str(t)}, PreservesEq: #{pe}}," }.join("\n")}
+    }
   GO
 end
 
@@ -573,6 +642,8 @@ def ts_entry(op)
   lines << "    volatility: #{ts_str(op.fetch('volatility'))},"
   lines << "    variadic: #{variadic_bool(op)},"
   lines << "    cost: #{op['cost'] || 0},"
+  lines << "    traps: #{op_traps(op)},"
+  lines << "    preservesEquality: #{op_preserves_equality(op)},"
   lines << "  },"
   lines.join("\n")
 end
@@ -657,6 +728,11 @@ def ts_file(ops, aggs, srfs, wins)
       // place of operatorEval. 0 = absent ⇒ use the uniform operatorEval. Size-scaled cost
       // (decimalWork / varlenCompare / …) is separate from this static base.
       cost: number;
+      // Trap classification (functions.md §15): false asserts the kernel raises nothing for any
+      // arguments, is immutable, and reads only its arguments. Name-level. Default true.
+      traps: boolean;
+      // With traps = false: equal arguments give equal results (functions.md §15).
+      preservesEquality: boolean;
     }
 
     // Every operator in the catalog, in catalog order.
@@ -729,6 +805,20 @@ def ts_file(ops, aggs, srfs, wins)
     // Every window-exclusive function in the catalog, in catalog order.
     export const WINDOWS: readonly WindowDesc[] = [
     #{wins.map { |w| ts_window_entry(w) }.join("\n")}
+    ];
+
+    // One cast spec/types/casts.toml classifies traps = false (functions.md §15): it raises nothing
+    // for any source value. `preservesEquality` says equal sources give equal results.
+    export interface CastTrapDesc {
+      from: string;
+      to: string;
+      preservesEquality: boolean;
+    }
+
+    // Every non-trapping cast, in casts.toml order (the planner's safe-conjunct gate,
+    // planner.md §3.5). A cast absent from this table may trap.
+    export const NON_TRAPPING_CASTS: readonly CastTrapDesc[] = [
+    #{non_trapping_casts.map { |f, t, pe| "  { from: #{ts_str(f)}, to: #{ts_str(t)}, preservesEquality: #{pe} }," }.join("\n")}
     ];
   TS
 end

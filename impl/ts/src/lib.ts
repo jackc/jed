@@ -429,6 +429,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Stage-2 predicate pushdown into derived bodies / computed relations, and out of a join's ON
   // (spec/design/planner.md §3.2, §3.3).
   "query.derived_pushdown",
+  "query.safe_conjunct_gate",
   "query.on_pushdown",
   "query.index_nested_loop",
   "query.hash_join",

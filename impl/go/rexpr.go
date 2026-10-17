@@ -1148,10 +1148,14 @@ type rExpr struct {
 	typmod   *decimalTypmod // reCast: a decimal target's numeric(p,s) typmod
 	varchar  *uint32        // reCast: a varchar(n) text target's max length — truncate (types.md §15)
 	castElem *colType       // reArrayCast: the target element ColType (nil ⇒ array → text)
-	lhs      *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
-	rhs      *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
-	operand  *rExpr         // reCast, reNeg, reNot, reIsNull, reCasing
-	negated  bool           // reIsNull, reDistinct
+	// trap is a reCast's trap classification (functions.md §15), recorded at resolve from the
+	// cast's source and target types (casts.toml); the zero value may trap. Read only by the
+	// planner's safe-conjunct gate (planner.md §3.5).
+	trap    trapClass
+	lhs     *rExpr // reArith, reCompare, reAnd, reOr, reDistinct
+	rhs     *rExpr // reArith, reCompare, reAnd, reOr, reDistinct
+	operand *rExpr // reCast, reNeg, reNot, reIsNull, reCasing
+	negated bool   // reIsNull, reDistinct
 	// insensitive carries ILIKE (reLike) / ~* (reRegex); casingUpper selects upper vs lower
 	// (reCasing) — both collation.md §16.
 	insensitive bool

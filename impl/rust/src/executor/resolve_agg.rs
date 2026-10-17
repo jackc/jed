@@ -1072,6 +1072,7 @@ pub(crate) fn coerce_compatible_arg(
             target,
             typmod: None,
             varchar_len: None,
+            trap: TrapClass::May,
         }
     } else {
         RExpr::ArrayCast {
