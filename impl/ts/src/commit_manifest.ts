@@ -39,6 +39,13 @@ export const manifestOverflowCapacity = (pageSize: number): number =>
   Math.floor((pageSize - 32) / 12);
 export type WrittenPage = { index: number; bytes: Uint8Array };
 type Entry = { index: number; checksum: bigint };
+// ManifestEntry is one manifest record: a page id and the CRC-64 of its complete encoded bytes.
+export type ManifestEntry = Entry;
+
+// manifestEntriesOf digests written pages for a manifest.
+export function manifestEntriesOf(pages: WrittenPage[]): ManifestEntry[] {
+  return pages.map((pg) => ({ index: pg.index, checksum: crc64Update(0n, pg.bytes) }));
+}
 export type CommitManifest = { entries: Entry[]; pages: WrittenPage[]; chainChecksum: bigint };
 export type CommitMeta = {
   txid: bigint;
@@ -80,15 +87,15 @@ function chainUpdate(crc: bigint, index: number, bytes: Uint8Array): bigint {
   return crc64Update(crc64Update(crc, id), bytes);
 }
 
+// buildCommitManifest encodes the manifest of a commit's entries: its body and free-list pages, never
+// the manifest itself, and under batched durability also the pending set (validated-cow.md §4).
 export function buildCommitManifest(
   pageSize: number,
   txid: bigint,
-  written: WrittenPage[],
+  dirty: ManifestEntry[],
   overflowIds: number[],
 ): CommitManifest {
-  const entries = written
-    .map((pg) => ({ index: pg.index, checksum: crc64Update(0n, pg.bytes) }))
-    .sort((a, b) => a.index - b.index);
+  const entries = dirty.slice().sort((a, b) => a.index - b.index);
   for (let i = 1; i < entries.length; i++) {
     if (entries[i].index === entries[i - 1].index)
       throw engineError("data_corrupted", "duplicate commit page");
@@ -139,7 +146,7 @@ export function parseCommitMeta(
   const dv = view(block);
   if (
     dv.getUint32(0, false) !== 0x4a454442 ||
-    dv.getUint16(4, false) !== 48 || // format_version (format.ts FORMAT_VERSION)
+    dv.getUint16(4, false) !== 49 || // format_version (format.ts FORMAT_VERSION)
     dv.getUint16(6, false) !== 0 ||
     dv.getUint32(8, false) !== pageSize ||
     dv.getUint32(32, false) !== metaChecksum(block) ||

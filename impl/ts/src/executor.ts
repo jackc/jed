@@ -2041,6 +2041,12 @@ export class Engine {
   // last successful in-memory commit wrote, for the forced compaction and the repair exemption (§8.3).
   // Only an in-memory main / in-memory attachment is checked against it (persist.ts planInMemory).
   storageBudget: StorageBudget;
+  // relaxed is the handle's synchronous = off (spec/design/validated-cow.md §4): a durable (file or
+  // OPFS) commit defers its barrier to a flush. Never set on in-memory or page-client storage.
+  relaxed: boolean;
+  // floorFree is the free list as of the floor — recorded by the first commit of a relaxed batch — the
+  // only pages a pending commit may reuse (validated-cow.md §4 rule 3).
+  floorFree: Set<number> | null;
   // commitStagesRows is whether the last commitTx staged any record version into main (memory.md
   // §8.3): a commit that stages none — pure deletes and drops — may exceed max_storage_bytes so a full
   // database can be repaired. Read by Session.publish, which persists main after commitTx.
@@ -2121,6 +2127,8 @@ export class Engine {
     this.spilled = false;
     this.openStreams = 0;
     this.storageBudget = { limit: 0n, lastCatRoot: 0, lastWritten: [], lastCatalogPages: 0 };
+    this.relaxed = false;
+    this.floorFree = null;
     this.commitStagesRows = false;
   }
 

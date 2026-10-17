@@ -68,10 +68,19 @@ export type DatabaseOptions = { pageSize?: number; noSync?: boolean; environment
 // coordination (an unsafe escape hatch).
 export type Locking = "auto" | "exclusive" | "none";
 
+// Synchronous is the durability mode of a file-backed handle (spec/design/transactions.md §9, api.md
+// §2.1): "on" (the default) makes every commit durable before it returns; "off" acknowledges a commit
+// once its pages and meta are written and batches the barrier — a later flush (the batch cap, close,
+// …) makes a run of commits durable together. A power loss or OS crash can lose the commits
+// acknowledged since the last flush, never the file's integrity (spec/design/validated-cow.md §4). A
+// handle setting, not stored in the file; the handle's file attachments follow it. Ignored in memory.
+export type Synchronous = "on" | "off";
+
 export type CreateOptions = {
   path?: string;
   pageSize?: number;
   skipFsync?: boolean;
+  synchronous?: Synchronous;
   locking?: Locking;
   fileLockTimeoutMs?: number;
   // idleInTransactionTimeoutMs, idleSessionTimeoutMs, yieldGraceMs, shutdownGraceMs, maxConnections,
@@ -128,6 +137,8 @@ export function createVia(files: FileHost, path: string, opts: DatabaseOptions =
     throw e;
   }
   db.paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize));
+  // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
+  db.paging.setFloorSlot(Number(db.committed.txid & 1n));
   db.committed.storePaging = db.paging;
   // Scratch is independent of the persistence path: a read-only database directory must still be
   // able to serve a bounded ORDER BY (spill.md §4, api.md §2.1).
@@ -176,6 +187,8 @@ export type OpenOptions = {
   readOnly?: boolean;
   workMem?: number;
   skipFsync?: boolean;
+  // synchronous is the durability mode (Synchronous above; transactions.md §9). Default "on".
+  synchronous?: Synchronous;
   locking?: Locking;
   fileLockTimeoutMs?: number;
   // idleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write
@@ -241,6 +254,7 @@ export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): 
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
     db.storageBudget.limit = opts.maxStorageBytes ?? 0n;
+    db.relaxed = opts.synchronous === "off";
     // Scratch is independent of the persistence path, so read-only database filesystems remain
     // readable when ORDER BY crosses work_mem (spill.md §4, api.md §2.1).
     db.spillSink = new FileSpillSink(tmpdir());
@@ -263,15 +277,17 @@ export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): 
 //
 // A file attachment is a non-serving owner of its file until attachments join the page service
 // (page-service.md §5.5): another process holding the file makes the attach wait, then fail 55006.
-registerFileAttachOpener((source, readOnly, files, environment) => {
+registerFileAttachOpener((source, readOnly, files, environment, relaxed) => {
   const path = source.path!;
   const locking = resolvedLocking(source.locking) === "none" ? "none" : "exclusive";
   const coordinator = FileCoordinator.open(path, locking, source.fileLockTimeoutMs);
   try {
+    // A file attachment follows the handle's synchronous setting (validated-cow.md §4).
     const engine = openVia(files ?? osFiles, coordinator?.path ?? path, {
       readOnly,
       locking: "none",
       environment,
+      synchronous: relaxed ? "off" : "on",
     });
     return { engine, coordinator };
   } catch (error) {
@@ -466,6 +482,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
         environment: opts.environment,
       });
       engine.storageBudget.limit = maxStorageBytes;
+      engine.relaxed = opts.synchronous === "off";
       if (coordinator?.serving === true) {
         // The creator is the owner (README §6.1); its handle keeps the path claim across roles.
         const path = coordinator.path;
@@ -477,7 +494,13 @@ export function createDatabase(opts: CreateOptions = {}): Database {
           opts.fileLockTimeoutMs,
           {},
           environment,
-          () => open(path, { skipFsync: opts.skipFsync, environment, locking: "none" }),
+          () =>
+            open(path, {
+              skipFsync: opts.skipFsync,
+              synchronous: opts.synchronous,
+              environment,
+              locking: "none",
+            }),
         );
         return startServiceOwner(engine, coordinator, handoff);
       }
@@ -592,8 +615,15 @@ export function close(db: Engine): void {
   db.releaseTempStorage();
   db.path = null;
   if (db.paging !== null) {
-    db.paging.close(); // drop the open fd (close it)
+    const paging = db.paging;
     db.paging = null;
+    // A relaxed engine's pending commits become durable before the file is released
+    // (validated-cow.md §4); a failed flush is what close reports.
+    try {
+      paging.flushPending();
+    } finally {
+      paging.close(); // drop the open fd (close it)
+    }
   }
 }
 

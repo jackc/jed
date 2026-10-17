@@ -546,6 +546,15 @@ export class SimFile implements BlockStore {
     else vs.push(bytes.slice());
   }
 
+  // metaPending reports whether a meta-slot write is still pending, not yet covered by a barrier: the
+  // disk fact the relaxed-durability oracle checks an engine's flush claim against (§8.2).
+  metaPending(): boolean {
+    if (this.cache.length < 12) return false;
+    const c = this.cache;
+    const ps = ((c[8]! << 24) | (c[9]! << 16) | (c[10]! << 8) | c[11]!) >>> 0;
+    return this.pending.has(0) || this.pending.has(ps);
+  }
+
   // sortedPending returns the pending offsets in ascending order: no map order may leak.
   private sortedPending(): number[] {
     return [...this.pending.keys()].sort((a, b) => a - b);

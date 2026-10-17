@@ -187,11 +187,27 @@ class Served implements ServedDb {
   // abandonDelta: the pages already written are unreachable orphans; nothing to undo.
   abandonDelta(_w: WriteTxn): void {}
 
-  // commitDelta writes the meta and runs the single durable barrier (skipped under fsync=off).
+  // commitDelta writes the meta to the slot not holding the committed meta (the begin_write flush made
+  // it the floor, README §3.5) and runs the single durable barrier (skipped under fsync=off): a client
+  // commit always keeps its own barrier, so its slot is the floor afterwards.
   commitDelta(d: Delta): boolean {
     try {
-      this.writePage(Number(d.txid & 1n), d.meta);
+      const slot = this.state.floorSlot() ^ 1;
+      this.writePage(slot, d.meta);
       if (!this.noSync) fdatasyncSync(this.file());
+      this.state.publishBatch(slot, false);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // flushBatch is the owner's batch flush before a begin_write (validated-cow.md §4): a durable
+  // barrier on this handle covers the engine thread's writes too (fsync is per file).
+  flushBatch(): boolean {
+    try {
+      if (!this.noSync) fdatasyncSync(this.file());
+      this.state.batchFlushed();
       return true;
     } catch {
       return false;

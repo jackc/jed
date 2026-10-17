@@ -55,8 +55,9 @@ export type OwnerLimits = {
   preferYield: boolean;
 };
 
-// readCommittedMeta reads the meta slot that published txid. Every commit writes slot txid & 1, so it
-// is the one to read; the parse check guards a slot a later commit already overwrote.
+// readCommittedMeta reads the meta slot that published txid. A commit writes slot txid & 1 unless a
+// relaxed batch put it in the other slot (format.md, *Slot alternation*), so both are tried; the parse
+// check guards a slot a later commit already overwrote.
 function readCommittedMeta(paging: SharedPaging, txid: bigint): Uint8Array {
   const slot = Number(txid & 1n);
   for (const index of [slot, slot ^ 1]) {
@@ -160,13 +161,19 @@ export class ServiceOwner implements ServiceOwnerHandle {
     // The resolution window starts with the recovered meta slots (README §4): the committed one and,
     // when the other slot holds the commit just before it, that one too.
     if (txid > 0n) {
-      const other = paging.readBlock(Number(txid & 1n) ^ 1);
-      const parsed = parseCommitMeta(other, paging.pageSize(), paging.physicalPages());
-      if (parsed !== null && parsed.txid === txid - 1n) {
-        owner.state.recordResolutionLocked(parsed.txid, other);
+      for (let slot = 0; slot < 2; slot++) {
+        const other = paging.readBlock(slot);
+        const parsed = parseCommitMeta(other, paging.pageSize(), paging.physicalPages());
+        if (parsed !== null && parsed.txid === txid - 1n) {
+          owner.state.recordResolutionLocked(parsed.txid, other);
+          break;
+        }
       }
     }
     owner.state.resetLocked(txid, meta, false);
+    // The service sees the owner's batched-durability state (validated-cow.md §4): it flushes a pending
+    // batch before granting a begin_write and writes a client commit's meta to the non-floor slot.
+    paging.setBatchMirror(owner.state);
     owner.state.setEngineFactsLocked(storage.freeGenTxid, storage.liveAtCompaction, null);
     host.writeOwnerRecord(dbPath, {
       serving: owner.endpoint !== "",
@@ -235,6 +242,7 @@ export class ServiceOwner implements ServiceOwnerHandle {
   // invalid, and the worker reopens its file handle. The caller holds the lock (and no pin exists).
   compactedLocked(txid: bigint, paging: SharedPaging, facts: ServiceEngineFacts): void {
     this.state.resetLocked(txid, readCommittedMeta(paging, txid), true);
+    paging.setBatchMirror(this.state);
     this.state.setEngineFactsLocked(facts.freeGenTxid, facts.liveAtCompaction, facts.localOldest);
   }
 
