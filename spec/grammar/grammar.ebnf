@@ -559,16 +559,26 @@ literal_value  ::= literal | parameter
  * the "excluded" pseudo-relation (a bare/qualified column = the EXISTING row; with an INSERT alias the
  * qualifier is the alias, and a target labeled "excluded" makes `excluded.col` 42P09). The optional
  * conflict_target names the arbiter: a column list (matched as a SET against a unique index / the
- * primary key — no match is 42P10; an optional WHERE index_predicate also admits a PARTIAL unique
- * index whose predicate it implies) or "ON CONSTRAINT name" (a unique-index name or the synthesized
+ * primary key, each element optionally decorated with COLLATE / an operator class — no match is
+ * 42P10; an optional WHERE index_predicate also admits a PARTIAL unique index whose predicate it
+ * implies) or "ON CONSTRAINT name" (a unique-index name or the synthesized
  * <table>_pkey — a miss is 42704). "DO UPDATE" REQUIRES a target (42601 without one); "DO NOTHING"
  * may omit it (ANY unique/PK conflict is then skipped). A conflict on a NON-arbiter constraint
- * still traps 23505; two proposed rows sharing the arbiter key are 21000 under DO UPDATE (skipped
- * under DO NOTHING). "ON"/"CONFLICT"/"NOTHING"/"EXCLUDED"/"DO" are NOT reserved (§3). */
+ * still traps 23505; a proposed row whose conflicting row this statement already inserted or
+ * updated is 21000 under DO UPDATE (skipped under DO NOTHING). DO UPDATE SET may assign a primary-key
+ * column, re-keying the existing row. "ON"/"CONFLICT"/"NOTHING"/"EXCLUDED"/"DO" are NOT reserved (§3). */
 on_conflict    ::= "ON" "CONFLICT" conflict_target? conflict_action
 
-conflict_target ::= "(" identifier ("," identifier)* ")" where_clause?
+conflict_target ::= "(" conflict_element ("," conflict_element)* ")" where_clause?
                   | "ON" "CONSTRAINT" identifier
+
+/* A conflict-target element (../design/upsert.md §2): a column plus PostgreSQL's optional
+ * inference decorations. COLLATE takes a quoted collation name (as the COLLATE operator, §47);
+ * the operator class is a bare identifier recognized positionally — any word after the column and
+ * its COLLATE that is not ASC/DESC/NULLS — so it stays non-reserved. ASC/DESC and NULLS
+ * FIRST/LAST parse (PostgreSQL's index_elem) only so that resolution can reject them with 42P10. */
+conflict_element ::= identifier collate_clause? identifier?
+                     ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
 
 conflict_action ::= "DO" "NOTHING"
                   | "DO" "UPDATE" "SET" update_assignment ("," update_assignment)* where_clause?

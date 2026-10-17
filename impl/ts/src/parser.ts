@@ -25,6 +25,7 @@ import type {
   GroupItem,
   IdentitySpec,
   IndexKeyElem,
+  ConflictColumn,
   ConflictTarget,
   Insert,
   InsertValue,
@@ -2658,6 +2659,43 @@ class Parser {
     };
   }
 
+  // parseConflictColumn parses one `ON CONFLICT ( … )` inference element (spec/design/upsert.md §2):
+  // a column, an optional `COLLATE "name"`, an optional operator-class word (any word other than
+  // ASC/DESC/NULLS — positional, so non-reserved), then PostgreSQL's ASC/DESC and NULLS FIRST|LAST,
+  // which are recorded for resolution to reject (42P10).
+  private parseConflictColumn(): ConflictColumn {
+    const name = this.expectIdentifier();
+    let collation: string | null = null;
+    if (this.peekKeyword() === "collate") {
+      this.advance();
+      collation = this.expectCollationName();
+    }
+    let opclass: string | null = null;
+    const t = this.peek();
+    if (
+      (t.kind === "word" && t.word !== "asc" && t.word !== "desc" && t.word !== "nulls") ||
+      t.kind === "quotedIdent"
+    ) {
+      opclass = this.expectIdentifier();
+    }
+    let ordering = false;
+    if (this.peekKeyword() === "asc" || this.peekKeyword() === "desc") {
+      this.advance();
+      ordering = true;
+    }
+    let nulls = false;
+    if (this.peekKeyword() === "nulls") {
+      this.advance();
+      const k = this.peekKeyword();
+      if (k !== "first" && k !== "last") {
+        throw engineError("syntax_error", "expected FIRST or LAST after NULLS");
+      }
+      this.advance();
+      nulls = true;
+    }
+    return { name, collation, opclass, ordering, nulls };
+  }
+
   // parseOnConflict parses the optional `ON CONFLICT [target] action` clause (UPSERT —
   // spec/design/upsert.md), after the source and before RETURNING. ON / CONFLICT / DO / NOTHING /
   // CONSTRAINT are not reserved (§3); the clause is recognized by the `ON CONFLICT` two-keyword lead.
@@ -2674,9 +2712,9 @@ class Parser {
     let indexPredicate: Expr | null = null;
     if (this.peek().kind === "lparen") {
       this.advance(); // '('
-      const cols: string[] = [];
+      const cols: ConflictColumn[] = [];
       for (;;) {
-        cols.push(this.expectIdentifier());
+        cols.push(this.parseConflictColumn());
         const k = this.advance().kind;
         if (k === "comma") continue;
         if (k === "rparen") break;

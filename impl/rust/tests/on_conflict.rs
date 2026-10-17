@@ -19,13 +19,6 @@ fn db_with(sql: &[&str]) -> Session {
     db
 }
 
-fn err(db: &mut Session, sql: &str) -> String {
-    db.query_outcome(sql, &[])
-        .expect_err(&format!("expected an error from {sql:?}"))
-        .code()
-        .to_string()
-}
-
 fn affected(db: &mut Session, sql: &str) -> Option<i64> {
     match db
         .query_outcome(sql, &[])
@@ -34,25 +27,6 @@ fn affected(db: &mut Session, sql: &str) -> Option<i64> {
         Outcome::Statement { rows_affected, .. } => rows_affected,
         Outcome::Query { .. } => panic!("expected a statement outcome from {sql:?}"),
     }
-}
-
-/// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is still `0A000` — a
-/// deferred follow-on. The standalone UPDATE re-keying has landed (§11 step 6), but extending it
-/// to the upsert conflict path is separate. PostgreSQL allows it (probed: `SET id =
-/// excluded.id + 100` re-keys the row).
-#[test]
-fn do_update_pk_column_assignment_is_unsupported() {
-    let mut db = db_with(&[
-        "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
-        "INSERT INTO t VALUES (1, 10)",
-    ]);
-    assert_eq!(
-        err(
-            &mut db,
-            "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100"
-        ),
-        "0A000"
-    );
 }
 
 /// The affected-row count (api.md §4) the corpus's `statement ok` cannot assert: an ON CONFLICT

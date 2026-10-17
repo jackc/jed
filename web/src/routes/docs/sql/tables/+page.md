@@ -421,6 +421,14 @@ arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_p
   SET balance = a.balance + excluded.balance RETURNING a.balance;` names the existing row `a`. Once
   aliased, the table is referred to only by its alias (`account.balance` would be `42P01`), in the
   `DO UPDATE` and in `RETURNING` alike.
+- **Changing the key** — `INSERT INTO account VALUES (1, 'Ada', 0) ON CONFLICT (id) DO UPDATE SET
+  id = 100;` moves the existing row to key `100`, as `UPDATE … SET id = …` would: its indexes and any
+  foreign keys that reference it follow, and a key another row already holds raises `23505`.
+- **Collation and operator-class decorations** — a target element may name the collation or
+  B-tree operator class its unique index must use, as in PostgreSQL: `ON CONFLICT (email COLLATE "C")`
+  or `ON CONFLICT (id int4_ops)`. jed keys each column under its own collation and its type's
+  default class (`text_ops`, `int4_ops`, `numeric_ops`, …), so a decoration that names anything else
+  matches no index (`42P10`); an unknown collation or class is `42704`.
 
 `RETURNING` can also compare row versions. `old.balance` is the value before the change and
 `new.balance` the value after it; an `INSERT` has an all-`NULL` old row and a `DELETE` an all-`NULL`
@@ -433,5 +441,6 @@ UPDATE account SET balance = balance + 25
   RETURNING WITH (OLD AS before, NEW AS after) before.balance, after.balance;
 ```
 
-A conflict on a constraint *other* than the arbiter still raises `23505`, and a single statement that
-would update the same existing row twice raises `21000`. The whole statement is all-or-nothing.
+A conflict on a constraint *other* than the arbiter still raises `23505`, and a single statement whose
+proposed row conflicts with a row that same statement already inserted or updated raises `21000`.
+The whole statement is all-or-nothing.

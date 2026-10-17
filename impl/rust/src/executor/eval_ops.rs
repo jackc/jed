@@ -2015,20 +2015,127 @@ pub(crate) enum ConflictActionPlan {
     },
 }
 
+/// The written-ordering check on one `ON CONFLICT` inference element (spec/design/upsert.md §2),
+/// raised before the element's column is looked up — PostgreSQL's order: `ASC`/`DESC`, then
+/// `NULLS FIRST|LAST`, each 42P10.
+pub(crate) fn check_conflict_ordering(c: &ConflictColumn) -> Result<()> {
+    if c.ordering {
+        return Err(EngineError::new(
+            SqlState::InvalidColumnReference,
+            "ASC/DESC is not allowed in ON CONFLICT clause",
+        ));
+    }
+    if c.nulls {
+        return Err(EngineError::new(
+            SqlState::InvalidColumnReference,
+            "NULLS FIRST/LAST is not allowed in ON CONFLICT clause",
+        ));
+    }
+    Ok(())
+}
+
+/// The decoration-name check on one `ON CONFLICT` inference element (spec/design/upsert.md §2),
+/// after its column is found: the collation must be `C` or loaded, the operator class one of
+/// jed's B-tree classes — each 42704.
+pub(crate) fn check_conflict_names(catalog: &Engine, c: &ConflictColumn) -> Result<()> {
+    if let Some(coll) = &c.collation {
+        resolve_collation_name(catalog, coll)?;
+    }
+    if let Some(op) = &c.opclass
+        && canonical_btree_opclass(op).is_none()
+    {
+        return Err(EngineError::new(
+            SqlState::UndefinedObject,
+            format!("operator class \"{op}\" does not exist for access method \"btree\""),
+        ));
+    }
+    Ok(())
+}
+
+/// Every scalar type, for the operator-class name set.
+const ALL_SCALARS: [ScalarType; 17] = [
+    ScalarType::Int16,
+    ScalarType::Int32,
+    ScalarType::Int64,
+    ScalarType::Text,
+    ScalarType::Bool,
+    ScalarType::Decimal,
+    ScalarType::Bytea,
+    ScalarType::Uuid,
+    ScalarType::Timestamp,
+    ScalarType::Timestamptz,
+    ScalarType::Interval,
+    ScalarType::Float32,
+    ScalarType::Float64,
+    ScalarType::Date,
+    ScalarType::Json,
+    ScalarType::Jsonb,
+    ScalarType::JsonPath,
+];
+
+/// A B-tree operator-class name resolved to the class jed keys with (spec/design/upsert.md §2):
+/// a scalar's default class, a container's polymorphic class, or `varchar_ops` — PostgreSQL's
+/// alias of `text_ops` (same family and input type). `None` names no jed class.
+pub(crate) fn canonical_btree_opclass(name: &str) -> Option<&'static str> {
+    if name == "varchar_ops" {
+        return Some("text_ops");
+    }
+    ["array_ops", "range_ops", "record_ops"]
+        .into_iter()
+        .chain(ALL_SCALARS.iter().filter_map(|s| s.btree_opclass()))
+        .find(|o| *o == name)
+}
+
+/// The B-tree operator class a column's keys use: its type's default class (upsert.md §2).
+fn column_btree_opclass(ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Scalar(s) => s.btree_opclass(),
+        Type::Array(_) => Some("array_ops"),
+        Type::Range(_) => Some("range_ops"),
+        Type::Composite(_) => Some("record_ops"),
+        Type::Record(_) => None,
+    }
+}
+
+/// Whether a column's index keys satisfy an inference element's decorations (upsert.md §2): a
+/// `COLLATE` needs a collatable column (text / text[]) frozen under that collation, an operator
+/// class needs the column type's default class. Every jed key over a column shares the column's
+/// collation and class, so this depends on the column alone.
+fn conflict_decorations_hold(col: &Column, c: &ConflictColumn) -> bool {
+    if let Some(coll) = &c.collation {
+        let collatable = match &col.ty {
+            Type::Scalar(ScalarType::Text) => true,
+            Type::Array(e) => matches!(**e, Type::Scalar(ScalarType::Text)),
+            _ => false,
+        };
+        if !collatable || col.collation.as_deref().unwrap_or("C") != coll.as_str() {
+            return false;
+        }
+    }
+    if let Some(op) = &c.opclass
+        && canonical_btree_opclass(op) != column_btree_opclass(&col.ty)
+    {
+        return false;
+    }
+    true
+}
+
 /// Resolve an `ON CONFLICT` target into an `Arbiter` (spec/design/upsert.md §2): a column list is
 /// matched as an order-independent SET against a unique index / the primary key (no match →
-/// 42P10); `ON CONSTRAINT name` names a unique index or the synthesized `<table>_pkey` (miss →
-/// 42704). `None` target → `None` arbiter (legal only with `DO NOTHING`).
+/// 42P10), each element first checked in order (ASC/DESC 42P10, column 42703, collation /
+/// operator class 42704) and its decorations then narrowing the match; `ON CONSTRAINT name` names
+/// a unique index or the synthesized `<table>_pkey` (miss → 42704). `None` target → `None`
+/// arbiter (legal only with `DO NOTHING`).
 ///
 /// `index_predicate` is the resolved `WHERE index_predicate` of a column target (table-local
 /// columns): with it, a PARTIAL unique index whose predicate it implies (indexes.md §9.1) is also
 /// inferable, after the PK and every non-partial unique index (each in name byte order). Without it
-/// no partial index is inferred, as in PostgreSQL.
+/// no partial index is inferred, as in PostgreSQL. The decorations narrow partial candidates too.
 pub(crate) fn resolve_arbiter(
+    catalog: &Engine,
     tdef: &Table,
     target: Option<&ConflictTarget>,
     index_predicate: Option<&RExpr>,
-    catalog: &Engine,
 ) -> Result<Option<Arbiter>> {
     let target = match target {
         None => return Ok(None),
@@ -2038,10 +2145,17 @@ pub(crate) fn resolve_arbiter(
     match target {
         ConflictTarget::Columns(cols) => {
             let mut want = std::collections::BTreeSet::new();
+            let mut decorations_hold = true;
             for c in cols {
-                want.insert(col_idx(tdef, c)?); // unknown column → 42703
+                check_conflict_ordering(c)?;
+                let idx = col_idx(tdef, &c.name)?; // unknown column → 42703
+                check_conflict_names(catalog, c)?;
+                decorations_hold &= conflict_decorations_hold(&tdef.columns[idx], c);
+                want.insert(idx);
             }
-            if !pk.is_empty()
+            // A decoration its column's keys do not satisfy rules out every index (upsert.md §2).
+            if decorations_hold
+                && !pk.is_empty()
                 && pk
                     .iter()
                     .copied()
@@ -2055,7 +2169,8 @@ pub(crate) fn resolve_arbiter(
                 // expression unique index is arbitrated by `ON CONSTRAINT <name>` — upsert.md §3).
                 // A PARTIAL unique index is matched only through an implying `WHERE
                 // index_predicate` (below), as in PostgreSQL.
-                if def.unique
+                if decorations_hold
+                    && def.unique
                     && def.predicate.is_none()
                     && def.column_ordinals().is_some_and(|c| {
                         c.into_iter().collect::<std::collections::BTreeSet<_>>() == want
@@ -2064,7 +2179,7 @@ pub(crate) fn resolve_arbiter(
                     return Ok(Some(Arbiter::Index(i)));
                 }
             }
-            if let Some(filter) = index_predicate {
+            if let Some(filter) = index_predicate.filter(|_| decorations_hold) {
                 for (i, def) in tdef.indexes.iter().enumerate() {
                     if def.unique
                         && def.predicate.is_some()

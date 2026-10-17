@@ -3373,6 +3373,47 @@ func (p *parser) parseInsert() (*insert, error) {
 	return &insert{Table: table, TablePos: tablePos, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
 }
 
+// parseConflictColumn parses one `ON CONFLICT ( … )` inference element (spec/design/upsert.md §2):
+// a column, an optional `COLLATE "name"`, an optional operator-class word (any word other than
+// ASC/DESC/NULLS — positional, so non-reserved), then PostgreSQL's ASC/DESC and NULLS FIRST|LAST,
+// which are recorded for resolution to reject (42P10).
+func (p *parser) parseConflictColumn() (conflictColumn, error) {
+	var col conflictColumn
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return col, err
+	}
+	col.Name = name
+	if p.peekKeyword() == "collate" {
+		p.advance()
+		coll, err := p.expectCollationName()
+		if err != nil {
+			return col, err
+		}
+		col.Collation = &coll
+	}
+	if t := p.peek(); (t.Kind == tokWord && t.Word != "asc" && t.Word != "desc" && t.Word != "nulls") || t.Kind == tokQuotedIdent {
+		op, err := p.expectIdentifier()
+		if err != nil {
+			return col, err
+		}
+		col.Opclass = &op
+	}
+	if k := p.peekKeyword(); k == "asc" || k == "desc" {
+		p.advance()
+		col.Ordering = true
+	}
+	if p.peekKeyword() == "nulls" {
+		p.advance()
+		if k := p.peekKeyword(); k != "first" && k != "last" {
+			return col, newError(SyntaxError, "expected FIRST or LAST after NULLS")
+		}
+		p.advance()
+		col.Nulls = true
+	}
+	return col, nil
+}
+
 // parseOnConflict parses the optional `ON CONFLICT [target] action` clause (UPSERT —
 // spec/design/upsert.md), after the source and before RETURNING. ON / CONFLICT / DO / NOTHING /
 // CONSTRAINT are not reserved (§3); the clause is recognized by the `ON CONFLICT` two-keyword lead.
@@ -3389,13 +3430,13 @@ func (p *parser) parseOnConflict() (*onConflict, error) {
 	var indexPredicate *exprNode
 	if p.peek().Kind == tokLParen {
 		p.advance() // '('
-		var cols []string
+		var cols []conflictColumn
 		for {
-			name, err := p.expectIdentifier()
+			col, err := p.parseConflictColumn()
 			if err != nil {
 				return nil, err
 			}
-			cols = append(cols, name)
+			cols = append(cols, col)
 			switch p.advance().Kind {
 			case tokComma:
 				continue

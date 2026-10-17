@@ -110,6 +110,7 @@ impl ViewWrite {
     /// (`42P10`). A view has no constraints, so `ON CONSTRAINT` is always `42704`.
     pub(crate) fn conflict_target(
         &self,
+        catalog: &Engine,
         table: &Table,
         target: Option<&ConflictTarget>,
     ) -> Result<Option<ConflictTarget>> {
@@ -120,20 +121,28 @@ impl ViewWrite {
                 format!("constraint {name} for table {} does not exist", self.view),
             )),
             Some(ConflictTarget::Columns(cols)) => {
+                // Each element in order: its written ordering, the view column, then its
+                // decoration names (upsert.md §2) — PostgreSQL resolves the target against the
+                // view before the rewrite maps it.
                 let mut positions = Vec::with_capacity(cols.len());
                 for c in cols {
+                    check_conflict_ordering(c)?;
                     let k = self
                         .top
                         .columns
                         .iter()
-                        .position(|col| col.name == *c)
-                        .ok_or_else(|| undefined_column(c))?;
+                        .position(|col| col.name == c.name)
+                        .ok_or_else(|| undefined_column(&c.name))?;
+                    check_conflict_names(catalog, c)?;
                     positions.push(k);
                 }
                 let mut base = Vec::with_capacity(positions.len());
-                for k in positions {
+                for (c, k) in cols.iter().zip(positions) {
                     match self.top.follow(k) {
-                        Follow::Base(i) => base.push(table.columns[i].name.clone()),
+                        Follow::Base(i) => base.push(ConflictColumn {
+                            name: table.columns[i].name.clone(),
+                            ..c.clone()
+                        }),
                         Follow::Expr(..) => {
                             return Err(EngineError::new(
                                 SqlState::InvalidColumnReference,

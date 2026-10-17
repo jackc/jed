@@ -8,7 +8,7 @@ pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
     AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
     AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, BinaryOp, CheckOption,
-    ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateTableAs,
+    ConflictAction, ConflictColumn, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateTableAs,
     CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable,
     DropType, DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue,
     JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper,

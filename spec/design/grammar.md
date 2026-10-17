@@ -3305,7 +3305,7 @@ stay `0A000`.
 constraint takes a **conflict action** instead of trapping `23505`.
 
 ```
-ON CONFLICT [ ( col [, …] ) | ON CONSTRAINT name ] { DO NOTHING | DO UPDATE SET … [WHERE …] }
+ON CONFLICT [ ( col [COLLATE "c"] [opclass] [, …] ) | ON CONSTRAINT name ] { DO NOTHING | DO UPDATE SET … [WHERE …] }
 ```
 
 The target may carry an alias (`INSERT INTO t AS a …`, `AS` required): it replaces the table's
@@ -3322,14 +3322,22 @@ name as the qualifier for the existing row in `SET`/`WHERE` (and in `RETURNING`)
   matched as an order-independent **set** against a unique index / the primary key
   (`ON CONFLICT (b, a)` matches `UNIQUE (a, b)`); no match is **`42P10`**. **`ON CONSTRAINT
   name`** names a unique index, or the synthesized **`<table>_pkey`** for the primary key; a
-  miss is **`42704`**. An unknown column in the list is **`42703`**. A column list may be followed
-  by **`WHERE index_predicate`**, which lets a **partial** unique index whose predicate it implies
-  be inferred ([upsert.md](upsert.md) §2); `ON CONSTRAINT` takes no `WHERE`.
+  miss is **`42704`**. An unknown column in the list is **`42703`**. A list element may carry
+  PostgreSQL's inference decorations — `COLLATE "name"` and a bare B-tree operator-class name
+  (`text_ops`, `int4_ops`, …) — which keep only the indexes keyed under that collation / class
+  (else `42P10`); an unknown collation or class is `42704`, and `ASC`/`DESC`/`NULLS FIRST|LAST`
+  on an element is `42P10` (upsert.md §2). The class is recognized positionally (any word after
+  the column and its `COLLATE` other than `ASC`/`DESC`/`NULLS`), so it stays non-reserved. A
+  column list may be followed by **`WHERE index_predicate`**, which lets a **partial** unique
+  index whose predicate it implies be inferred ([upsert.md](upsert.md) §2); `ON CONSTRAINT` takes
+  no `WHERE`.
 - **`DO UPDATE` requires a target** (**`42601`** without one); **`DO NOTHING`** may omit it,
   in which case **any** uniqueness conflict is skipped. The arbiter **only** arbitrates its
   own constraint — a conflict on a **different** unique/PK constraint still traps **`23505`**.
-- Two **proposed** rows sharing the arbiter key are **`21000`** under `DO UPDATE` (*cannot
-  affect row a second time*) and **skipped** under `DO NOTHING`.
+- A proposed row whose conflicting row this statement already inserted or updated is
+  **`21000`** under `DO UPDATE` (*cannot affect row a second time*) and **skipped** under
+  `DO NOTHING` (upsert.md §4). `DO UPDATE SET` may assign a primary-key column, re-keying the
+  existing row (upsert.md §5).
 
 The whole feature is two-phase / all-or-nothing with **sequential planning** so a later
 proposed row observes earlier ones (PostgreSQL's row-at-a-time visibility, reproduced over

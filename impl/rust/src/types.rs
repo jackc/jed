@@ -91,6 +91,31 @@ impl ScalarType {
         }
     }
 
+    /// The PostgreSQL name of the type's default B-tree operator class (`btree_opclass` in
+    /// spec/types/scalars.toml) — the class every jed B-tree key over the type uses, matched by an
+    /// `ON CONFLICT` inference decoration (spec/design/upsert.md §2). `None` for a type with no
+    /// B-tree class (json, jsonpath).
+    pub fn btree_opclass(self) -> Option<&'static str> {
+        Some(match self {
+            ScalarType::Int16 => "int2_ops",
+            ScalarType::Int32 => "int4_ops",
+            ScalarType::Int64 => "int8_ops",
+            ScalarType::Text => "text_ops",
+            ScalarType::Bool => "bool_ops",
+            ScalarType::Decimal => "numeric_ops",
+            ScalarType::Bytea => "bytea_ops",
+            ScalarType::Uuid => "uuid_ops",
+            ScalarType::Timestamp => "timestamp_ops",
+            ScalarType::Timestamptz => "timestamptz_ops",
+            ScalarType::Interval => "interval_ops",
+            ScalarType::Float32 => "float4_ops",
+            ScalarType::Float64 => "float8_ops",
+            ScalarType::Date => "date_ops",
+            ScalarType::Jsonb => "jsonb_ops",
+            ScalarType::Json | ScalarType::JsonPath => return None,
+        })
+    }
+
     /// Resolve a type name (canonical or alias) to a type, by exact (folded) name (grammar.md §3).
     /// Returns None for an unknown name. Canonical names state width in bits under the
     /// `i`/`f` prefix (i16/i32/i64, f32/f64 — the Rust/Zig convention). Accepted aliases:

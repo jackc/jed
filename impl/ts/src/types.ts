@@ -158,6 +158,48 @@ export function isFloat(t: ScalarType): boolean {
   return t === "f32" || t === "f64";
 }
 
+// btreeOpclass is the PostgreSQL name of the type's default B-tree operator class (btree_opclass in
+// spec/types/scalars.toml) — the class every jed B-tree key over the type uses, matched by an ON
+// CONFLICT inference decoration (spec/design/upsert.md §2). null for a type with no B-tree class
+// (json, jsonpath).
+export function btreeOpclass(t: ScalarType): string | null {
+  switch (t) {
+    case "i16":
+      return "int2_ops";
+    case "i32":
+      return "int4_ops";
+    case "i64":
+      return "int8_ops";
+    case "text":
+      return "text_ops";
+    case "boolean":
+      return "bool_ops";
+    case "decimal":
+      return "numeric_ops";
+    case "bytea":
+      return "bytea_ops";
+    case "uuid":
+      return "uuid_ops";
+    case "timestamp":
+      return "timestamp_ops";
+    case "timestamptz":
+      return "timestamptz_ops";
+    case "interval":
+      return "interval_ops";
+    case "f32":
+      return "float4_ops";
+    case "f64":
+      return "float8_ops";
+    case "date":
+      return "date_ops";
+    case "jsonb":
+      return "jsonb_ops";
+    case "json":
+    case "jsonpath":
+      return null;
+  }
+}
+
 // canonicalName is the single name used in all output (determinism — CLAUDE.md §10).
 // It is the identity for this union, but kept as a function to mirror the Go/Rust API.
 export function canonicalName(t: ScalarType): string {

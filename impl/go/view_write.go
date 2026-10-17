@@ -104,7 +104,7 @@ type viewWrite struct {
 // column list names view columns, each of which must exist (42703) and lead to a base column — a
 // read-only column leads to an expression, which no unique index's column list matches (42P10). A
 // view has no constraints, so ON CONSTRAINT is always 42704.
-func (vw *viewWrite) conflictTarget(table *catTable, target *conflictTarget) (*conflictTarget, error) {
+func (vw *viewWrite) conflictTarget(catalog *engine, table *catTable, target *conflictTarget) (*conflictTarget, error) {
 	if target == nil {
 		return nil, nil
 	}
@@ -112,27 +112,36 @@ func (vw *viewWrite) conflictTarget(table *catTable, target *conflictTarget) (*c
 		return nil, newError(UndefinedObject, fmt.Sprintf(
 			"constraint %s for table %s does not exist", target.Constraint, vw.view))
 	}
+	// Each element in order: its written ordering, the view column, then its decoration names
+	// (upsert.md §2) — PostgreSQL resolves the target against the view before the rewrite maps it.
 	positions := make([]int, len(target.Columns))
 	for i, c := range target.Columns {
+		if err := checkConflictOrdering(c); err != nil {
+			return nil, err
+		}
 		positions[i] = -1
 		for k, col := range vw.top.columns {
-			if col.Name == c {
+			if col.Name == c.Name {
 				positions[i] = k
 				break
 			}
 		}
 		if positions[i] < 0 {
-			return nil, newError(UndefinedColumn, "column does not exist: "+c)
+			return nil, newError(UndefinedColumn, "column does not exist: "+c.Name)
+		}
+		if err := checkConflictNames(catalog, c); err != nil {
+			return nil, err
 		}
 	}
-	mapped := &conflictTarget{Columns: make([]string, len(positions))}
+	mapped := &conflictTarget{Columns: make([]conflictColumn, len(positions))}
 	for i, k := range positions {
 		base, owner, _ := vw.top.follow(k)
 		if owner != nil {
 			return nil, newError(InvalidColumnReference,
 				"there is no unique or exclusion constraint matching the ON CONFLICT specification")
 		}
-		mapped.Columns[i] = table.Columns[base].Name
+		mapped.Columns[i] = target.Columns[i]
+		mapped.Columns[i].Name = table.Columns[base].Name
 	}
 	return mapped, nil
 }

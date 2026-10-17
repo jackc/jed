@@ -7,7 +7,7 @@
 use crate::ast::{
     AlterColumnAction, AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence,
     AlterTable, AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, Assignment,
-    BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictTarget, CreateIndex, CreateSequence,
+    BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictColumn, ConflictTarget, CreateIndex, CreateSequence,
     CreateTable, CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete,
     DropIndex, DropSequence, DropTable, DropType, DropView, ExcludeDef, Expr, ForeignKeyDef,
     GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
@@ -3083,6 +3083,52 @@ impl Parser {
         }
     }
 
+    /// Parse one `ON CONFLICT ( … )` inference element (spec/design/upsert.md §2): a column, an
+    /// optional `COLLATE "name"`, an optional operator-class word (any word other than
+    /// ASC/DESC/NULLS — positional, so non-reserved), then PostgreSQL's ASC/DESC and
+    /// NULLS FIRST|LAST, which are recorded for resolution to reject (42P10).
+    fn parse_conflict_column(&mut self) -> Result<ConflictColumn> {
+        let name = self.expect_identifier()?;
+        let collation = if self.peek_keyword().as_deref() == Some("collate") {
+            self.advance();
+            Some(self.expect_collation_name()?)
+        } else {
+            None
+        };
+        let opclass = match self.peek() {
+            Token::Word(w) if !matches!(w.as_str(), "asc" | "desc" | "nulls") => {
+                Some(self.expect_identifier()?)
+            }
+            Token::QuotedIdent(_) => Some(self.expect_identifier()?),
+            _ => None,
+        };
+        let ordering = matches!(self.peek_keyword().as_deref(), Some("asc" | "desc"));
+        if ordering {
+            self.advance();
+        }
+        let nulls = self.peek_keyword().as_deref() == Some("nulls");
+        if nulls {
+            self.advance();
+            match self.peek_keyword().as_deref() {
+                Some("first" | "last") => {
+                    self.advance();
+                }
+                other => {
+                    return Err(syntax(format!(
+                        "expected FIRST or LAST after NULLS, found {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(ConflictColumn {
+            name,
+            collation,
+            opclass,
+            ordering,
+            nulls,
+        })
+    }
+
     /// Parse the optional `ON CONFLICT [target] action` clause (UPSERT — spec/design/upsert.md),
     /// after the source and before RETURNING. `ON`/`CONFLICT`/`DO`/`NOTHING`/`CONSTRAINT` are not
     /// reserved (§3); the clause is recognized by the `ON CONFLICT` two-keyword lead.
@@ -3102,7 +3148,7 @@ impl Parser {
             self.advance(); // '('
             let mut cols = Vec::new();
             loop {
-                cols.push(self.expect_identifier()?);
+                cols.push(self.parse_conflict_column()?);
                 match self.advance() {
                     Token::Comma => continue,
                     Token::RParen => break,

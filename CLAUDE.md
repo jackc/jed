@@ -906,8 +906,8 @@ The design is optimized for AI agents even more than for humans. In practice:
    statement's end state, so a collision traps **`23505`** (and a referenced key whose
    re-key would strand a child traps `23503`); an end-state-valid swap/cascade succeeds where
    PostgreSQL fails the per-row transient (the same end-state divergence `UNIQUE` carries —
-   `spec/design/constraints.md` §6.5/§6.7). The DO UPDATE conflict-path equivalent remains a
-   deferred `0A000` follow-on (upsert.md §9). (b) there is **no cross-statement transaction**
+   `spec/design/constraints.md` §6.5/§6.7). `INSERT … ON CONFLICT DO UPDATE` re-keys the
+   conflicting row the same way (upsert.md §5). (b) there is **no cross-statement transaction**
    yet (the §3 staging-buffer model is still future) — UPDATE's two-phase pass gives
    per-statement atomicity without it. The no-PK synthetic rowid became a **monotonic
    counter** (never reused), reconstructed on load, so `DELETE` then `INSERT` cannot collide.

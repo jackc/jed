@@ -164,6 +164,19 @@ fn scalar_types_match_spec() {
     );
 }
 
+/// Every scalar's default B-tree operator class (`btree_opclass`, spec/design/upsert.md §2) matches
+/// `ScalarType::btree_opclass`; a type without the field has no class.
+#[test]
+fn btree_opclasses_match_spec() {
+    let v: toml::Value = toml::from_str(&spec("types/scalars.toml")).unwrap();
+    for t in v["type"].as_array().expect("[[type]] array") {
+        let id = t["id"].as_str().unwrap();
+        let st = ScalarType::from_name(id).unwrap_or_else(|| panic!("unknown type id {id}"));
+        let want = t.get("btree_opclass").map(|o| o.as_str().unwrap());
+        assert_eq!(st.btree_opclass(), want, "{id} btree_opclass");
+    }
+}
+
 #[test]
 fn is_fixed_width_partitions_width_bytes_domain() {
     // The index tail-slot skip (executor.rs `index_bound_rows`) advances over each trailing key

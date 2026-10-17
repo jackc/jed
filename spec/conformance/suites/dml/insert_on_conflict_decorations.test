@@ -1,0 +1,357 @@
+# INSERT ... ON CONFLICT inference decorations (spec/design/upsert.md §2): a conflict-target element
+# may carry COLLATE "name" and/or a bare B-tree operator-class name. A decoration keeps only the
+# unique indexes whose key on that column uses that collation / class (PostgreSQL's
+# infer_collation_opclass_match); jed keys every column under its frozen collation and its type's
+# default B-tree class, so an unsatisfied decoration is 42P10. Per element, in order: ASC/DESC or
+# NULLS FIRST|LAST is 42P10, then the column (42703), then the collation / class name (42704).
+# Every column whose collation matters is declared with an explicit COLLATE, so PostgreSQL keys it
+# under that named collation exactly as jed does (an un-annotated PostgreSQL column uses its
+# "default" collation instead — upsert.md §9).
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.insert_on_conflict_decorations, dml.returning, dml.insert_column_list, query.select, query.order_by, query.aggregates, types.i16, types.i32, types.i64, types.text, types.varchar_length, types.boolean, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.date, types.interval, types.f32, types.f64, types.array, types.range, types.composite, ddl.collate_column, expr.collate, ddl.view, dml.view_write, dml.view_on_conflict
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE dc (id i32 PRIMARY KEY, name text COLLATE "C" UNIQUE, n i32 UNIQUE)
+
+statement ok
+INSERT INTO dc VALUES (1, 'a', 1)
+
+# COLLATE naming the column's own collation matches its unique index: DO UPDATE takes it.
+query ITI nosort
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "C") DO UPDATE SET n = 10 RETURNING *
+----
+1
+a
+10
+
+# The column's default B-tree class matches, alone or with the COLLATE.
+statement ok
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name text_ops) DO NOTHING
+
+statement ok
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "C" text_ops) DO NOTHING
+
+# varchar_ops is PostgreSQL's alias of text_ops (same family, same input type).
+statement ok
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name varchar_ops) DO NOTHING
+
+# An integer column's class: int4_ops matches an i32 key; the PRIMARY KEY is decorated the same way.
+statement ok
+INSERT INTO dc VALUES (3, 'z', 10) ON CONFLICT (n int4_ops) DO NOTHING
+
+query ITI rowsort
+INSERT INTO dc VALUES (1, 'q', 7) ON CONFLICT (id int4_ops) DO UPDATE SET n = excluded.n RETURNING *
+----
+1
+a
+7
+
+# A decoration does not change the arbiter's coverage: a non-arbiter conflict still traps 23505.
+statement error 23505
+INSERT INTO dc VALUES (9, 'a', 99) ON CONFLICT (n int4_ops) DO NOTHING
+
+# Two elements may name one column; each decoration must hold.
+statement ok
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name, name COLLATE "C") DO NOTHING
+
+query ITI nosort
+SELECT * FROM dc ORDER BY id
+----
+1
+a
+7
+
+# --- decorations no index satisfies: 42P10 ------------------------------------------------------
+
+# A different collation than the column's.
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "unicode") DO NOTHING
+
+# COLLATE on a non-collatable column (an integer key has no collation).
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (n COLLATE "C") DO NOTHING
+
+# int8_ops shares int4_ops's family but not its input type.
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (n int8_ops) DO NOTHING
+
+# A class of another type.
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (n text_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name range_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "C" int4_ops) DO UPDATE SET n = 1
+
+# A decorated column set no unique index covers.
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "C", id) DO NOTHING
+
+# --- per-element errors, in element order -----------------------------------------------------------
+
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name ASC) DO NOTHING
+
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name DESC) DO NOTHING
+
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name NULLS FIRST) DO NOTHING
+
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (n ASC NULLS LAST) DO NOTHING
+
+# ASC/DESC is rejected before its element's column is looked up ...
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (nosuch DESC) DO NOTHING
+
+# ... and after an earlier element's.
+statement error 42703
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (nosuch, name DESC) DO NOTHING
+
+statement error 42P10
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "nope" DESC) DO NOTHING
+
+# The column precedes its collation and class names.
+statement error 42703
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (nosuch COLLATE "nope") DO NOTHING
+
+statement error 42703
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (nosuch nope_ops) DO NOTHING
+
+# An unknown collation, an unknown class: 42704; the collation precedes the class.
+statement error 42704
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "nope") DO NOTHING
+
+statement error 42704
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name nope_ops) DO NOTHING
+
+statement error 42704
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "nope" nope_ops) DO NOTHING
+
+# A non-B-tree class is not a B-tree class.
+statement error 42704
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name jsonb_path_ops) DO NOTHING
+
+# An element's unknown class is found before a later element's unknown column.
+statement error 42704
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name nope_ops, nosuch) DO NOTHING
+
+statement error 42704
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "nope", nosuch) DO NOTHING
+
+# Repeated COLLATE is a syntax error.
+statement error 42601
+INSERT INTO dc VALUES (2, 'a', 2) ON CONFLICT (name COLLATE "C" COLLATE "C") DO NOTHING
+
+statement ok
+DROP TABLE dc
+
+# --- a linguistic collation ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE dl (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE, tags text[] COLLATE "C" UNIQUE, vc varchar(8) COLLATE "C" UNIQUE)
+
+statement ok
+INSERT INTO dl VALUES (1, 'a', '{a}', 'x')
+
+query ITTT nosort
+INSERT INTO dl VALUES (2, 'a', '{b}', 'y') ON CONFLICT (name COLLATE "unicode") DO UPDATE SET vc = 'w' RETURNING *
+----
+1
+a
+{a}
+w
+
+statement error 42P10
+INSERT INTO dl VALUES (2, 'a', '{b}', 'y') ON CONFLICT (name COLLATE "C") DO NOTHING
+
+# A text[] column is collatable: its COLLATE matches, and its class is array_ops.
+statement ok
+INSERT INTO dl VALUES (3, 'z', '{a}', 'y') ON CONFLICT (tags COLLATE "C") DO NOTHING
+
+statement ok
+INSERT INTO dl VALUES (3, 'z', '{a}', 'y') ON CONFLICT (tags array_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dl VALUES (3, 'z', '{a}', 'y') ON CONFLICT (tags text_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dl VALUES (3, 'z', '{a}', 'y') ON CONFLICT (tags COLLATE "unicode") DO NOTHING
+
+# A varchar column keys under text_ops (varchar_ops is its alias).
+statement ok
+INSERT INTO dl VALUES (3, 'z', '{q}', 'w') ON CONFLICT (vc text_ops) DO NOTHING
+
+statement ok
+INSERT INTO dl VALUES (3, 'z', '{q}', 'w') ON CONFLICT (vc COLLATE "C" varchar_ops) DO NOTHING
+
+query ITTT nosort
+SELECT * FROM dl ORDER BY id
+----
+1
+a
+{a}
+w
+
+statement ok
+DROP TABLE dl
+
+# --- each type's default class ----------------------------------------------------------------------
+
+statement ok
+CREATE TYPE dpair AS (a i32, b i32)
+
+statement ok
+CREATE TABLE dt (k16 i16 UNIQUE, k64 i64 UNIQUE, kb boolean UNIQUE, kd decimal UNIQUE, kby bytea UNIQUE, ku uuid UNIQUE, kts timestamp UNIQUE, ktz timestamptz UNIQUE, kdt date UNIQUE, kiv interval UNIQUE, kf4 f32 UNIQUE, kf8 f64 UNIQUE, ka i32[] UNIQUE, kr int4range UNIQUE, kc dpair UNIQUE)
+
+statement ok
+INSERT INTO dt VALUES (1, 1, true, 1.5, '\x01', '00000000-0000-0000-0000-000000000001', '2024-01-01 00:00:00', '2024-01-01 00:00:00+00', '2024-01-01', '1 day', 1.5, 1.5, '{1}', '[1,5)', '(1,2)')
+
+statement ok
+INSERT INTO dt VALUES (1, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (k16 int2_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 1, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (k64 int8_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, true, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (kb bool_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 1.50, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (kd numeric_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x01', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (kby bytea_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000001', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (ku uuid_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-01 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (kts timestamp_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-01 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (ktz timestamptz_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-01', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (kdt date_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '24 hours', 2.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (kiv interval_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 1.5, 2.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (kf4 float4_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 1.5, '{2}', '[2,5)', '(2,2)') ON CONFLICT (kf8 float8_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{1}', '[2,5)', '(2,2)') ON CONFLICT (ka array_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[1,5)', '(2,2)') ON CONFLICT (kr range_ops) DO NOTHING
+
+statement ok
+INSERT INTO dt VALUES (2, 2, false, 2.5, '\x02', '00000000-0000-0000-0000-000000000002', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '2024-01-02', '2 days', 2.5, 2.5, '{2}', '[2,5)', '(1,2)') ON CONFLICT (kc record_ops) DO NOTHING
+
+# Every proposal above conflicted on its decorated arbiter and was skipped.
+query I nosort
+SELECT count(*) FROM dt
+----
+1
+
+# A same-family neighbor of each class is still a different class.
+statement error 42P10
+INSERT INTO dt (k16) VALUES (1) ON CONFLICT (k16 int4_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dt (kts) VALUES ('2024-01-01 00:00:00') ON CONFLICT (kts timestamptz_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dt (kdt) VALUES ('2024-01-01') ON CONFLICT (kdt timestamp_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dt (kf4) VALUES (1.5) ON CONFLICT (kf4 float8_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dt (kc) VALUES ('(1,2)') ON CONFLICT (kc array_ops) DO NOTHING
+
+statement ok
+DROP TABLE dt
+
+statement ok
+DROP TYPE dpair
+
+# --- through an updatable view: the element names a view column; its decorations apply to the base
+# column it maps to, and are checked per element against the view first ---------------------------
+
+statement ok
+CREATE TABLE dvt (id i32 PRIMARY KEY, name text COLLATE "C" UNIQUE, n i32)
+
+statement ok
+CREATE VIEW dv AS SELECT id AS vid, name AS vname, n + 1 AS vn FROM dvt
+
+statement ok
+INSERT INTO dvt VALUES (1, 'a', 1)
+
+query ITI nosort
+INSERT INTO dv (vid, vname) VALUES (2, 'a') ON CONFLICT (vname COLLATE "C" text_ops) DO UPDATE SET vid = 1 RETURNING *
+----
+1
+a
+2
+
+statement error 42P10
+INSERT INTO dv (vid, vname) VALUES (2, 'a') ON CONFLICT (vid int8_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dv (vid, vname) VALUES (2, 'a') ON CONFLICT (vname DESC) DO NOTHING
+
+statement error 42703
+INSERT INTO dv (vid, vname) VALUES (2, 'a') ON CONFLICT (name COLLATE "C") DO NOTHING
+
+statement error 42704
+INSERT INTO dv (vid, vname) VALUES (2, 'a') ON CONFLICT (vname COLLATE "nope") DO NOTHING
+
+# A read-only view column's unknown class is found before it is mapped (42P10 would follow).
+statement error 42704
+INSERT INTO dv (vid, vname) VALUES (2, 'a') ON CONFLICT (vn nope_ops) DO NOTHING
+
+statement error 42P10
+INSERT INTO dv (vid, vname) VALUES (2, 'a') ON CONFLICT (vn int4_ops) DO NOTHING
+
+statement ok
+DROP VIEW dv
+
+statement ok
+DROP TABLE dvt
+
+# --- divergences (upsert.md §9; oracle_overrides.toml) ---------------------------------------------
+
+statement ok
+CREATE TABLE dd (id i32 PRIMARY KEY, name text UNIQUE)
+
+statement ok
+INSERT INTO dd VALUES (1, 'a')
+
+# jed has no "default" collation object: an unknown collation, 42704 (PostgreSQL matches).
+statement error 42704
+INSERT INTO dd VALUES (2, 'a') ON CONFLICT (name COLLATE "default") DO NOTHING
+
+# A PostgreSQL B-tree class jed does not offer is unknown, 42704 (PostgreSQL: 42P10).
+statement error 42704
+INSERT INTO dd VALUES (2, 'a') ON CONFLICT (name text_pattern_ops) DO NOTHING
+
+# A class name is bare: schema qualification is not in jed's grammar, 42601 (PostgreSQL matches).
+statement error 42601
+INSERT INTO dd VALUES (2, 'a') ON CONFLICT (name pg_catalog.text_ops) DO NOTHING
+
+# An un-annotated column is frozen under the database default, here "C", so COLLATE "C" matches its
+# key and the conflicting proposal is skipped. PostgreSQL keys it under its distinct "default"
+# collation: 42P10. (Last: a PostgreSQL-failing `statement ok` must not reach the oracle's replay of
+# later records — conformance.md §5.)
+statement ok
+INSERT INTO dd VALUES (2, 'a') ON CONFLICT (name COLLATE "C") DO NOTHING

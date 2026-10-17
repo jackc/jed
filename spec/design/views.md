@@ -970,7 +970,7 @@ end-state primary-key, `UNIQUE`, and `FOREIGN KEY` checks follow phase 1, so a c
 is reported before them (§12).
 
 **Everything else** is the base statement's: the arbiter only arbitrates its own constraint, the
-second-affect rule (`21000`), the `DO UPDATE` narrowings (a primary-key or container column is
-`0A000`), two-phase validation, privileges checked on `v` exactly as on a table (§15.4), and cost: no charge for the view, so a statement without a
+second-affect rule (`21000`), a primary-key assignment re-keying the row, the `DO UPDATE` narrowings
+(a container column is `0A000`), two-phase validation, privileges checked on `v` exactly as on a table (§15.4), and cost: no charge for the view, so a statement without a
 check option costs its equivalent base statement, and a check option adds its `WHERE` evaluations
 (§15.6). `EXPLAIN` renders the base statement (`Insert t`). A writable CTE may hold the statement.

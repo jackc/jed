@@ -7,28 +7,13 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Handle, dbWith, errCode, queryOutcome } from "./util.ts";
+import { type Handle, dbWith, queryOutcome } from "./util.ts";
 
 function affected(db: Handle, sql: string): number | null {
   const out = queryOutcome(db, sql);
   assert.equal(out.kind, "statement", `expected a statement outcome from ${sql}`);
   return out.kind === "statement" ? out.rowsAffected : null;
 }
-
-// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is still 0A000 — a
-// deferred follow-on. The standalone UPDATE re-keying has landed (§11 step 6); extending it to
-// the upsert conflict path is separate. PostgreSQL allows it.
-test("ON CONFLICT DO UPDATE assigning a PK column is 0A000", () => {
-  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 10)"]);
-  assert.equal(
-    errCode(() =>
-      db.execute(
-        "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100",
-      ),
-    ),
-    "0A000",
-  );
-});
 
 // The affected-row count (api.md §4) the corpus's `statement ok` cannot assert: an ON CONFLICT
 // counts the inserted + updated rows; rows skipped by DO NOTHING (or a DO UPDATE WHERE that is

@@ -1,9 +1,8 @@
 # Writing through an updatable view — the jed-specific behavior of spec/design/views.md §15 that
 # PostgreSQL cannot oracle-check: the session privilege envelope, which checks the written view like a
 # table (§15.4), the recorded divergences (§12: 55000 before column errors, 0A000 before
-# expression errors, 42701 for two view columns over one base column, the ON CONFLICT DO UPDATE
-# primary-key narrowing, the list-less INSERT arity rule), and the plan/cost equivalence with the base
-# statement (§15.5, §15.7).
+# expression errors, 42701 for two view columns over one base column, the list-less INSERT arity
+# rule), and the plan/cost equivalence with the base statement (§15.5, §15.7).
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # requires: ddl.view, dml.view_write, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_on_conflict, dml.view_on_conflict, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.order_by, query.group_by, query.aggregates, query.explain, dml.explain, func.abs, expr.arithmetic, resource.cost_metering, types.i32, types.text, session.privileges
 
@@ -162,10 +161,6 @@ INSERT INTO v (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET a2 = nosuch_f
 # ON CONFLICT on a view that is not updatable is 55000 before a conflict-target error (PG: 42703)
 statement error 55000
 INSERT INTO vg VALUES (1, 1) ON CONFLICT (nosuch) DO NOTHING
-
-# DO UPDATE cannot assign a primary-key column (upsert.md §9), through a view too (PG allows it)
-statement error 0A000
-INSERT INTO v (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET id = 2
 
 # a list-less INSERT supplies every view column, as for a table (PG accepts fewer)
 statement ok
