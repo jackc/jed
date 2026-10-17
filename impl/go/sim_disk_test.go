@@ -66,6 +66,7 @@ const (
 	simReadError  // per-core: which reads happen depends on buffer-pool policy
 	simENOSPC     // per-core: when the file grows depends on preallocation policy
 	simSpillError // per-core: what a core spills, and in which operations, is its own codec's business
+	simDisconnect // a page-service connection ends at the step's nth frame (S8); the network's, not the disk's
 )
 
 // simFault is one armed fault (simulation-testing.md §6.3). Permille fields are 0..1000.

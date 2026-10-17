@@ -4173,6 +4173,22 @@ pub(crate) fn sim_selected_meta(paging: &SharedPaging) -> Result<SimMeta> {
     Err(corrupt("no meta page was selected by the open"))
 }
 
+/// The free list the meta slot of `image` holding version `v` persists (the simulator's commit-role
+/// rule, spec/design/simulation-testing.md §14 S8); `None` when no slot holds it or the chain is
+/// unreadable.
+#[cfg(feature = "sim")]
+pub(crate) fn sim_free_list(image: &[u8], ps: u32, v: u64) -> Option<Vec<u32>> {
+    let m = (0..2)
+        .filter_map(|slot| read_meta(image, ps as usize, slot))
+        .find(|m| m.txid == v)?;
+    let pager = Pager::from_store(Box::new(crate::blockstore::MemoryBlockStore::new(
+        image.to_vec(),
+    )))
+    .ok()?;
+    let paging = SharedPaging::new(pager, 1);
+    read_free_list(&paging, m.free_list_head, m.page_count, &HashSet::new()).ok()
+}
+
 /// The page high-water and live page count of the meta slot of `image` holding version `v`
 /// (the simulator's bounded-growth check, spec/design/simulation-testing.md §8.3).
 #[cfg(feature = "sim")]

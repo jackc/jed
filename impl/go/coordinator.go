@@ -136,7 +136,7 @@ func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *ui
 	if err := lockUntil(host, files.presence, true, deadline, path, false); err != nil {
 		_ = host.unlock(files.arrival)
 		reason := ""
-		if record, ok := readOwnerRecord(path); ok {
+		if record, ok := host.readOwnerRecord(path); ok {
 			switch {
 			case record.uid != currentUID():
 				reason = "owned by another user's process"
@@ -153,9 +153,7 @@ func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *ui
 	c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid()}
 	if mode == LockingExclusive {
 		c.state.Store(uint32(leaseExclusive))
-		if host == osLocks {
-			c.record = writeOwnerRecord(path, ownerRecord{uid: currentUID(), incarnation: newIncarnation(), pid: uint32(os.Getpid())}) == nil
-		}
+		c.record = host.writeOwnerRecord(path, ownerRecord{uid: currentUID(), incarnation: newIncarnation(), pid: uint32(os.Getpid())}) == nil
 	} else {
 		c.state.Store(uint32(leaseServiceOwner))
 		c.keepPath = true
@@ -176,7 +174,7 @@ func (c *fileCoordinator) checkPID() error {
 func (c *fileCoordinator) close() {
 	c.once.Do(func() {
 		if c.record {
-			_ = os.Remove(ownerRecordPath(c.path))
+			c.host.removeOwnerRecord(c.path)
 		}
 		c.host.closeFiles(c.files)
 		if !c.keepPath {

@@ -90,17 +90,41 @@ type serviceHandoff struct {
 	ownership Ownership
 	limits    ownerLimits
 	timeoutMs uint64
+	// files is the file host (nil: the OS); background starts a re-election as soon as a connection
+	// ends. The simulator sets its own file host and turns background off, so every re-election runs
+	// at a transaction begin, in trace order.
+	files      fileHost
+	spill      spillHost
+	background bool
 	// mu serializes role changes: re-election, promotion, yield, close.
 	mu     sync.Mutex
 	closed atomic.Bool
 }
 
 func newServiceHandoff(host lockHost, path string, opts OpenOptions) *serviceHandoff {
-	h := &serviceHandoff{host: host, path: path, opts: opts, ownership: opts.Ownership, limits: ownerLimitsFrom(opts), timeoutMs: defaultFileLockTimeoutMs}
+	h := &serviceHandoff{host: host, path: path, opts: opts, ownership: opts.Ownership, limits: ownerLimitsFrom(opts), timeoutMs: defaultFileLockTimeoutMs, background: true}
 	if opts.FileLockTimeoutMs != nil {
 		h.timeoutMs = *opts.FileLockTimeoutMs
 	}
 	return h
+}
+
+// attachHost gives a new handle's storage the handoff's file and spill hosts (the simulator's in a
+// simulation; the OS defaults otherwise).
+func (h *serviceHandoff) attachHost(c *sharedCore) {
+	c.storage.files = h.files
+	if h.spill != nil {
+		c.storage.spill = h.spill
+	} else {
+		c.storage.spill = osSpillHost{dir: os.TempDir()}
+	}
+}
+
+func (h *serviceHandoff) fileHost() fileHost {
+	if h.files == nil {
+		return osFiles
+	}
+	return h.files
 }
 
 func errNoOwner() error {
@@ -184,6 +208,9 @@ func (c *sharedCore) installRole(next *serviceRole, e *engine) {
 
 // watchClient re-elects in the background as soon as r's connection ends (README.md §6.5).
 func (c *sharedCore) watchClient(r *serviceRole) {
+	if !c.handoff.background {
+		return
+	}
 	r.client.setOnBreak(func() {
 		go func() { _ = c.reelect(r) }()
 	})
@@ -247,7 +274,7 @@ func (c *sharedCore) promote(stale *serviceRole, coord *fileCoordinator) error {
 	opts := h.opts
 	opts.Locking = LockingNone
 	opts.Environment = c.env
-	e, err := openWithOptions(h.path, opts)
+	e, err := openVia(h.fileHost(), h.path, opts)
 	if err != nil {
 		coord.close()
 		return err
@@ -289,12 +316,12 @@ func (c *sharedCore) releaseOwnership(r *serviceRole, next *serviceRole) {
 
 // canOpenReadWrite reports whether this user can open path read-write (README.md §6.5 case 2): opened
 // and closed unused, so the read-only owner never holds write access.
-func canOpenReadWrite(path string) bool {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+func canOpenReadWrite(files fileHost, path string) bool {
+	store, err := files.openStore(path, true, false)
 	if err != nil {
 		return false
 	}
-	_ = f.Close()
+	_ = store.close()
 	return true
 }
 
@@ -302,7 +329,7 @@ func canOpenReadWrite(path string) bool {
 // ownership and waits, under the session's lock timeout, for the connection to end, then re-elects.
 func (c *sharedCore) requestWriteOwnership(r *serviceRole, deadline time.Time) error {
 	h := c.handoff
-	if h.ownership == OwnershipNever || !canOpenReadWrite(h.path) {
+	if h.ownership == OwnershipNever || !canOpenReadWrite(h.fileHost(), h.path) {
 		return newError(ReadOnlySqlTransaction, "the database owner opened the file read-only")
 	}
 	cl := r.client

@@ -7,6 +7,7 @@ package jed
 // processes sharing one lock table, so the protocol runs, crashes, and interleaves deterministically.
 
 import (
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -28,6 +29,15 @@ type lockHost interface {
 	// pause waits between polls of a contended lock.
 	pause()
 	pid() int
+	// The page service's host operations (spec/pageservice/README.md §5): the owner record in the
+	// bundle and the owner's endpoint. The simulator substitutes an in-memory network.
+	readOwnerRecord(dbPath string) (ownerRecord, bool)
+	writeOwnerRecord(dbPath string, r ownerRecord) error
+	removeOwnerRecord(dbPath string)
+	endpointPath(dbPath string, uid uint32, incarnation id16) string
+	listen(endpoint string) (net.Listener, error)
+	dial(endpoint string) (net.Conn, error)
+	removeEndpoint(endpoint string)
 }
 
 // osLocks is the production coordination host.
@@ -76,3 +86,16 @@ func closeOSLockFiles(f lockFiles) {
 		}
 	}
 }
+
+func (osLockHost) readOwnerRecord(dbPath string) (ownerRecord, bool) { return readOwnerRecord(dbPath) }
+
+func (osLockHost) writeOwnerRecord(dbPath string, r ownerRecord) error {
+	return writeOwnerRecord(dbPath, r)
+}
+func (osLockHost) removeOwnerRecord(dbPath string) { _ = os.Remove(ownerRecordPath(dbPath)) }
+func (osLockHost) endpointPath(dbPath string, uid uint32, incarnation id16) string {
+	return endpointPath(dbPath, uid, incarnation)
+}
+func (osLockHost) listen(endpoint string) (net.Listener, error) { return listenEndpoint(endpoint) }
+func (osLockHost) dial(endpoint string) (net.Conn, error)       { return dialEndpoint(endpoint) }
+func (osLockHost) removeEndpoint(endpoint string)               { _ = os.Remove(endpoint) }

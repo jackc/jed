@@ -22,6 +22,7 @@ import type { Locking } from "./file.ts";
 import type { LockFiles, LockHandle, LockHost } from "./lockhost.ts";
 import {
   currentUid,
+  endpointPath,
   newIncarnation,
   ownerRecordPath,
   pageServiceSupported,
@@ -187,7 +188,8 @@ export function timeoutValue(value: number | undefined): number {
 }
 
 // osLocks is the production coordination host: the native whole-file locks, the monotonic clock,
-// and a RETRY_MS sleep between polls.
+// a RETRY_MS sleep between polls, and the owner record and endpoint on the filesystem. It has no
+// pageNet: the page service runs on worker threads over OS sockets.
 export const osLocks: LockHost = {
   claimPath(path: string): boolean {
     if (openPaths.has(path)) return false;
@@ -226,6 +228,15 @@ export const osLocks: LockHost = {
   pid(): number {
     return process.pid;
   },
+  readOwnerRecord,
+  writeOwnerRecord,
+  removeOwnerRecord(dbPath: string): void {
+    removeQuietly(ownerRecordPath(dbPath));
+  },
+  endpointPath(dbPath: string, uid: number, incarnation: Uint8Array): string {
+    return endpointPath(dbPath, uid, incarnation);
+  },
+  removeEndpoint: removeQuietly,
 };
 
 // lockUntil polls handle until it is locked or the deadline (microseconds on host's clock; null is
@@ -349,7 +360,7 @@ export class FileCoordinator implements FileCoordinatorHost {
         try {
           lockUntil(host, files.presence, true, deadline, path, false);
         } catch (error) {
-          const reason = host === osLocks ? ownerReason(path) : "";
+          const reason = ownerReason(host, path);
           if (reason === "") throw error;
           throw engineError("object_in_use", `database file is in use: ${path} (${reason})`);
         }
@@ -357,9 +368,8 @@ export class FileCoordinator implements FileCoordinatorHost {
         host.unlock(files.arrival);
       }
       const coordinator = new FileCoordinator(host, path, files, mode !== "exclusive");
-      if (mode === "exclusive") {
-        if (host === osLocks) coordinator.writeRecord();
-      } else coordinator.keepPath = true;
+      if (mode === "exclusive") coordinator.writeRecord();
+      else coordinator.keepPath = true;
       return coordinator;
     } catch (error) {
       if (files !== null) host.closeFiles(files);
@@ -380,7 +390,7 @@ export class FileCoordinator implements FileCoordinatorHost {
   // advisory — only the words of another opener's timeout depend on it — so a failure is ignored.
   private writeRecord(): void {
     try {
-      writeOwnerRecord(this.path, {
+      this.host.writeOwnerRecord(this.path, {
         serving: false,
         uid: currentUid(),
         incarnation: newIncarnation(),
@@ -405,7 +415,7 @@ export class FileCoordinator implements FileCoordinatorHost {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    if (this.record) removeQuietly(ownerRecordPath(this.path));
+    if (this.record) this.host.removeOwnerRecord(this.path);
     this.host.closeFiles(this.files);
     if (!this.keepPath) this.host.releasePath(this.path);
   }
@@ -414,8 +424,8 @@ export class FileCoordinator implements FileCoordinatorHost {
 // ownerReason words why presence EX is held elsewhere, from the owner record: another user's
 // process or a non-serving one ("" when the record is absent or names a serving owner of this
 // user).
-function ownerReason(path: string): string {
-  const record = readOwnerRecord(path);
+function ownerReason(host: LockHost, path: string): string {
+  const record = host.readOwnerRecord(path);
   if (record === null) return "";
   if (record.uid !== currentUid()) return "owned by another user's process";
   if (!record.serving) return "owned by a non-serving process";

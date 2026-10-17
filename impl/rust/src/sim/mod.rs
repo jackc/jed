@@ -19,14 +19,14 @@
 mod check;
 mod disk;
 mod locks;
+mod net;
 
-use crate::coordinator::FileCoordinator;
 use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES};
 use crate::environment::Environment;
 use crate::error::EngineError;
 use crate::executor::Engine;
-use crate::file::{DatabaseOptions, Locking};
-use crate::format::sim_meta_of;
+use crate::file::{DatabaseOptions, Locking, OpenOptions};
+use crate::format::{sim_free_list, sim_meta_of};
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, cache_leaves};
 use crate::seam::{ClockSource, RandomSource, SeededRandom, seeded_random_source};
@@ -34,6 +34,7 @@ use crate::shared::{AttachSource, Database, Session};
 use disk::{
     Fault, FaultKind, LANE_SESSION, MAIN_FILE, SimFs, SimHost, SimSpill, SimStore, decide, fnv,
 };
+use net::SimNet;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -43,6 +44,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SECTOR_DEFAULT: usize = 64;
+
+/// A simulated owner's shutdown grace (S8): its clients' pinned readers live in other processes,
+/// which no single step can end, so a closing owner always waits out the grace.
+const SERVICE_GRACE_MS: u64 = 1000;
 
 /// The message and backtrace of the most recent panic, captured by the hook [`main`] installs so a
 /// panicking step becomes a violation with its stack (the Go runner's `recover` + `debug.Stack`).
@@ -206,7 +211,7 @@ fn parse(text: &str) -> Result<Trace, String> {
                     st.pid = parse_pid(fields[3]).map_err(|e| format!("line {}: {e}", n + 1))?;
                 }
             }
-            "spawn" | "exit" | "kill" => {
+            "spawn" | "exit" | "kill" | "disconnect" => {
                 if fields.len() != 2 {
                     return Err(format!("line {}: {} p<N>", n + 1, st.kind));
                 }
@@ -309,6 +314,11 @@ fn fault_of(st: &Step) -> Result<Fault, String> {
         "spill_error" => {
             let mut f = Fault::new(FaultKind::SpillError);
             f.p = st.int_param("p");
+            return Ok(f);
+        }
+        "disconnect" => {
+            let mut f = Fault::new(FaultKind::Disconnect);
+            f.nth = st.int_param("nth");
             return Ok(f);
         }
         _ => {}
@@ -520,8 +530,8 @@ struct SimSession {
     pid: u32,
 }
 
-/// One simulated process: a Database over the shared simulated filesystem (in a shared trace, with
-/// its own coordinator over the simulated lock table — S5).
+/// One simulated process: a Database over the shared simulated filesystem (in a service trace, its
+/// own lock host over the simulated lock table and network — S8).
 struct Proc {
     db: Database,
 }
@@ -623,9 +633,11 @@ struct Runner<'a> {
     db: Option<Database>,
     fs: Arc<Mutex<SimFs>>,
 
-    // Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
-    // coordination. Multi-process traces are unsupported until they return with the page service.
-    shared: bool,
+    // Processes (simulation-testing.md §14 S8). A single-process trace has only p0, opened without
+    // coordination; a `# processes: service` trace opens every process under the page service, over
+    // the simulated lock host and network: the first is the owner, later ones its clients.
+    service: bool,
+    net: Arc<SimNet>,
     procs: BTreeMap<u32, Proc>,
     /// The process running the current step.
     cur: u32,
@@ -845,8 +857,8 @@ impl<'a> Runner<'a> {
             max_storage_bytes,
             sessions: HashMap::new(),
             db: None,
-            // Multi-process traces return with the page service (simulation-testing.md).
-            shared: false,
+            service: tr.header("processes") == "service",
+            net: SimNet::new(),
             procs: BTreeMap::new(),
             cur: 0,
             locks: None,
@@ -947,18 +959,82 @@ impl<'a> Runner<'a> {
             .attach(name, AttachSource::file(file).locking(Locking::None), false)
     }
 
-    /// Start process `pid`.
+    /// Start process `pid`. A service trace elects it through the simulated lock host and network,
+    /// exactly as `Database::open_with_options` does through the OS host.
     fn open_proc(&mut self, pid: u32) -> Result<(), EngineError> {
-        let db = Database::from_engine(self.open_engine()?);
-        // Create, compaction, and attachments go through the simulated filesystem.
-        db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
-        if self.max_storage_bytes > 0 {
-            db.set_max_storage_bytes("main", self.max_storage_bytes)?;
-        }
+        let db = if self.service {
+            self.open_service_proc(pid)?
+        } else {
+            let db = Database::from_engine(self.open_engine()?);
+            // Create, compaction, and attachments go through the simulated filesystem.
+            db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
+            if self.max_storage_bytes > 0 {
+                db.set_max_storage_bytes("main", self.max_storage_bytes)?;
+            }
+            db
+        };
         self.procs.insert(pid, Proc { db: db.clone() });
         self.cur = pid;
         self.db = Some(db);
         Ok(())
+    }
+
+    /// Open process `pid` under the page service (S8): its own lock host over the shared lock table
+    /// and network, the simulated filesystem and spill host, and no background re-election, so a
+    /// client re-elects at its next transaction begin, in trace order. Every owner limit that would
+    /// start a timer is off.
+    fn open_service_proc(&mut self, pid: u32) -> Result<Database, EngineError> {
+        let table = self
+            .locks
+            .get_or_insert_with(|| locks::new_table(self.clock.clone()))
+            .clone();
+        let host = Arc::new(locks::SimLockHost::new(
+            table.clone(),
+            pid,
+            self.net.clone(),
+        ));
+        let cache = if self.cache_bytes <= 0 {
+            DEFAULT_CACHE_BYTES
+        } else {
+            self.cache_bytes as usize
+        };
+        let opts = OpenOptions {
+            cache_bytes: cache,
+            file_lock_timeout_ms: crate::file::DEFAULT_FILE_LOCK_TIMEOUT_MS,
+            idle_in_transaction_timeout_ms: 0,
+            idle_session_timeout_ms: Some(0),
+            shutdown_grace_ms: Some(SERVICE_GRACE_MS),
+            environment: self.env.clone(),
+            max_storage_bytes: self.max_storage_bytes,
+            ..OpenOptions::default()
+        };
+        let opened = Database::sim_open_service(
+            host,
+            Arc::new(SimHost(self.fs.clone())),
+            Arc::new(SimSpill(self.fs.clone())),
+            Path::new(MAIN_FILE),
+            opts,
+        );
+        match opened {
+            Ok(db) => {
+                self.net.settle();
+                Ok(db)
+            }
+            Err(e) => {
+                locks::release(&table, pid);
+                self.net.kill(pid);
+                self.net.settle();
+                Err(e)
+            }
+        }
+    }
+
+    /// The running process that owns the database under the page service.
+    fn owner_pid(&self) -> Option<u32> {
+        self.procs
+            .iter()
+            .find(|(_, p)| p.db.sim_is_owner())
+            .map(|(pid, _)| *pid)
     }
 
     /// Load the engine over the simulated main file.
@@ -1038,22 +1114,39 @@ impl<'a> Runner<'a> {
         if let Some(table) = &self.locks {
             locks::release(table, pid);
         }
+        if self.service {
+            self.net.kill(pid);
+            self.net.settle();
+        }
         result
     }
 
     /// Abandon process `pid` as a crash does: its sessions and Database vanish without closing, and
     /// the kernel releases its locks.
+    ///
+    /// Under the page service a dead process does nothing more — no rollback frame, no release of
+    /// ownership, no removal of its owner record — so its sessions and Database are leaked rather
+    /// than dropped (a drop would end its page-service role cleanly), and the network closes its
+    /// listener and connections, as the kernel closes a dead process's sockets.
     fn drop_proc(&mut self, pid: u32) {
         for sid in self.sessions_of(pid) {
-            self.sessions.remove(&sid);
+            let ss = self.sessions.remove(&sid);
+            if self.service {
+                std::mem::forget(ss);
+            }
         }
         self.sessions_changed();
         if let Some(table) = &self.locks {
             locks::release(table, pid);
         }
-        self.procs.remove(&pid);
+        let proc = self.procs.remove(&pid);
         if self.cur == pid {
             self.db = None;
+        }
+        if self.service {
+            std::mem::forget(proc);
+            self.net.kill(pid);
+            self.net.settle();
         }
     }
 
@@ -1195,12 +1288,12 @@ impl<'a> Runner<'a> {
     /// session (a reader pins its snapshot), no other process (co-resident commits are append-only),
     /// and no fault.
     fn quiet(&self) -> bool {
-        !self.shared && self.sessions.is_empty() && !self.disk().armed()
+        !self.service && self.sessions.is_empty() && !self.disk().armed()
     }
 
     fn run(&mut self) {
         let processes = self.tr.header("processes");
-        if !processes.is_empty() {
+        if !processes.is_empty() && processes != "service" {
             self.violation = format!("unsupported processes mode {processes}");
             return;
         }
@@ -1319,10 +1412,23 @@ impl<'a> Runner<'a> {
                 return true;
             }
             "tick" => {
-                if let Some(table) = &self.locks {
-                    locks::run_probes(table, None);
-                }
                 self.emit(format!("{{\"i\":{i},\"op\":\"tick\"}}"));
+                return true;
+            }
+            "disconnect" => {
+                // The process's connection to the owner ends (S8): both ends see end of stream.
+                let pid = st.pid;
+                let client = self.procs.get(&pid).and_then(|p| p.db.sim_page_client());
+                let Some(client) = client else {
+                    self.emit(format!(
+                        "{{\"i\":{i},\"op\":\"disconnect\",\"pid\":{pid},\"skip\":true}}"
+                    ));
+                    return true;
+                };
+                drop(client);
+                self.net.disconnect(pid);
+                self.net.settle();
+                self.emit(format!("{{\"i\":{i},\"op\":\"disconnect\",\"pid\":{pid}}}"));
                 return true;
             }
             "exit" => {
@@ -1396,7 +1502,17 @@ impl<'a> Runner<'a> {
                 return false;
             }
         }
-        self.disk().begin_step(i as u64, armed);
+        let disk_fault = match armed {
+            Some(f) if f.kind == FaultKind::Disconnect => {
+                self.net.begin_step(f.nth);
+                None
+            }
+            other => {
+                self.net.begin_step(0);
+                other
+            }
+        };
+        self.disk().begin_step(i as u64, disk_fault);
         match st.kind.as_str() {
             "spawn" => self.step_spawn(i, st.pid),
             "open" => self.step_open(i, st),
@@ -1412,6 +1528,9 @@ impl<'a> Runner<'a> {
                 }
             }
             _ => {}
+        }
+        if self.service {
+            self.net.settle();
         }
         if !self.violation.is_empty() {
             return false;
@@ -1433,6 +1552,19 @@ impl<'a> Runner<'a> {
         let Some(armed) = armed else {
             return true;
         };
+        if armed.kind == FaultKind::Disconnect {
+            // A lost connection ends no process: its client re-elects at its next begin.
+            let fired = if self.net.disconnected() {
+                "frame"
+            } else {
+                "end"
+            };
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"disconnected\",\"fired\":{}}}",
+                go_quote(fired)
+            ));
+            return true;
+        }
         // Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
         let fired = {
             let disk = self.disk();
@@ -1447,10 +1579,10 @@ impl<'a> Runner<'a> {
             self.disk().power_loss(i as u64, armed.survive, armed.tear);
             return self.recover(i, fired);
         }
-        // In a shared trace any other fault kills only the process running the step; the others keep
-        // running over the same kernel state.
-        if self.shared && self.procs.len() > 1 {
-            let pid = self.cur;
+        // In a service trace any other fault kills the owner, the only process that touches the file,
+        // whichever process's step drove its I/O; the others keep running over the same kernel state.
+        if self.service && self.procs.len() > 1 {
+            let pid = self.owner_pid().unwrap_or(self.cur);
             self.drop_proc(pid);
             self.disk().process_death();
             self.emit(format!(
@@ -1499,7 +1631,7 @@ impl<'a> Runner<'a> {
         if self.max_query_memory > 0 {
             s.set_max_query_memory_bytes(self.max_query_memory);
         }
-        if self.shared {
+        if self.service {
             let d = self.digest_of(&mut s, "main");
             let v = s.version();
             if !self.observe(i, &format!("session {}", st.sid), v, d) {
@@ -1562,6 +1694,11 @@ impl<'a> Runner<'a> {
     }
 
     fn check_live(&self) -> Result<(), String> {
+        if self.db().sim_page_client().is_some() {
+            // A page client reads pages only under a pinned transaction; its trees are the owner's
+            // pages, which the owner's own live check covers.
+            return Ok(());
+        }
         self.oracle(|| check::check_live(self.db()))
     }
 
@@ -1631,8 +1768,15 @@ impl<'a> Runner<'a> {
             .collect();
         let main_version = versions["main"];
         let dbs_field = self.versions_json(&versions);
+        let role = if !self.service {
+            ""
+        } else if self.db().sim_page_client().is_some() {
+            ",\"role\":\"client\""
+        } else {
+            ",\"role\":\"owner\""
+        };
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"commit\",\"sid\":{sid},\"version\":{main_version}{dbs_field}}}"
+            "{{\"i\":{i},\"op\":\"commit\",\"sid\":{sid},\"version\":{main_version}{dbs_field}{role}}}"
         ));
         let quiet = self.quiet();
         for (k, name) in dbs.iter().enumerate() {
@@ -1664,7 +1808,13 @@ impl<'a> Runner<'a> {
                     );
                     return;
                 };
-                let published = self.committed_digest(name);
+                let mut published = self.committed_digest(name);
+                if published.is_none() && self.service && self.disk().dead() {
+                    // The owner died later in this step (its maintenance commit hit the fault), so
+                    // nothing can be read back through it; the acknowledged commit is checked by the
+                    // recovery that follows.
+                    published = Some(inflight.clone());
+                }
                 if published.as_deref() != Some(inflight.as_str()) {
                     self.diagnostics = vec![
                         ("before-commit.txt".to_string(), inflight_text),
@@ -1684,12 +1834,18 @@ impl<'a> Runner<'a> {
                 let d = self.sdb(name);
                 d.add_history(now, inflight.clone());
                 d.version = now;
-                d.last_digest = inflight;
+                d.last_digest = inflight.clone();
                 d.max_attempted = d.max_attempted.max(now);
                 d.floor = now; // acknowledged under synchronous = on (§8.2)
                 self.check_growth(i, name, quiet);
                 if !self.violation.is_empty() {
                     return;
+                }
+                if self.service && name == "main" {
+                    self.service_committed(i, base, now, &inflight);
+                    if !self.violation.is_empty() {
+                        return;
+                    }
                 }
             } else {
                 self.fail(
@@ -1702,6 +1858,59 @@ impl<'a> Runner<'a> {
         if let Err(e) = self.check_live() {
             self.fail(i, format!("after commit: {e}"));
         }
+    }
+
+    /// The page-service checks after a commit of main published version `now` over `base` (S8). A
+    /// page client's commit must obey the commit-role rule (page-service.md §6): it never rebuilds the
+    /// free list, so the free list it persists is a subset of its base's. And an owner may follow a
+    /// client's commit with a maintenance commit — the unchanged snapshot at the next versions —
+    /// which joins the history with the same contents.
+    fn service_committed(&mut self, i: usize, base: u64, now: u64, digest: &str) {
+        if self.db().sim_page_client().is_none() {
+            return;
+        }
+        if let Some(image) = self.image("main")
+            && let (Some(before), Some(after)) = (
+                sim_free_list(&image, self.page_size, base),
+                sim_free_list(&image, self.page_size, now),
+            )
+        {
+            let was: HashSet<u32> = before.into_iter().collect();
+            if let Some(pg) = after.into_iter().find(|pg| !was.contains(pg)) {
+                self.fail(
+                    i,
+                    format!(
+                        "commit-role rule: a page client's commit (version {now}) freed page {pg}, which its base's free list does not hold"
+                    ),
+                );
+                return;
+            }
+        }
+        if self.disk().dead() {
+            // The owner died later in this step; it may have been writing a maintenance commit,
+            // which recovery may select: the same contents at the next version.
+            let d = self.main_db_mut();
+            d.add_history(now + 1, digest.to_string());
+            d.max_attempted = d.max_attempted.max(now + 1);
+            return;
+        }
+        let Some(owner) = self.owner_pid() else {
+            return;
+        };
+        let ov = self.procs[&owner].db.version();
+        if ov <= now {
+            return;
+        }
+        let d = self.main_db_mut();
+        for v in now + 1..=ov {
+            d.add_history(v, digest.to_string());
+        }
+        d.version = ov;
+        d.max_attempted = d.max_attempted.max(ov);
+        d.floor = ov;
+        self.emit(format!(
+            "{{\"i\":{i},\"op\":\"maintenance\",\"version\":{ov}}}"
+        ));
     }
 
     // --- bounded growth (simulation-testing.md §8.3) ---
@@ -1734,7 +1943,7 @@ impl<'a> Runner<'a> {
     ///     or written by the commit itself (its manifest and free-list pages);
     ///   - the next quiet commit reuses that free list before it grows the file.
     fn check_growth(&mut self, i: usize, name: &str, quiet: bool) {
-        if self.shared {
+        if self.service {
             return;
         }
         let version = self.dbs[name].version;
@@ -1816,12 +2025,26 @@ impl<'a> Runner<'a> {
         } else {
             // Snapshot isolation: a reader still sees exactly the version of every database it
             // pinned, however many commits, reclamations, and page reuses happened since.
+            let mut lost = false;
             if !ss.write {
                 for name in self.order() {
                     let Some(&pin) = ss.pins.get(&name) else {
                         continue;
                     };
                     let d = self.digest_of(&mut ss.s, &name);
+                    if d.is_none()
+                        && self.service
+                        && self
+                            .digest_err
+                            .as_ref()
+                            .is_some_and(|e| e.code() == "08006")
+                    {
+                        // Under the page service a read transaction open across a change of its
+                        // process's role fails 08006 (spec/pageservice/README.md §6.5): it never sees
+                        // other contents.
+                        lost = true;
+                        break;
+                    }
                     let ok = d.is_some_and(|d| self.dbs[&name].in_history(pin, &d));
                     if !ok {
                         self.fail(
@@ -1836,6 +2059,12 @@ impl<'a> Runner<'a> {
                 }
             }
             ss.s.close();
+            if lost {
+                self.emit(format!(
+                    "{{\"i\":{i},\"op\":{op},\"sid\":{sid},\"lost\":true}}"
+                ));
+                return;
+            }
         }
         self.emit(format!("{{\"i\":{i},\"op\":{op},\"sid\":{sid}}}"));
     }
@@ -1910,7 +2139,7 @@ impl<'a> Runner<'a> {
     /// simulated filesystem if it does not exist — create's temp file, sync, rename, and directory
     /// barrier, any of which a fault may interrupt. Already attached, it only reports.
     fn step_attach(&mut self, i: usize, name: &str) {
-        if self.shared {
+        if self.service {
             self.fail(i, "attach is single-process only".to_string());
             return;
         }
@@ -1993,7 +2222,7 @@ impl<'a> Runner<'a> {
         let mut main_line = String::new();
         for name in self.order() {
             let (v, d) = self.committed_view(&name);
-            let d = if self.shared && name == "main" {
+            let d = if self.service && name == "main" {
                 // Another process may have died leaving a newer complete generation this one now
                 // adopts.
                 if !self.observe(i, "check", v, d) {
@@ -2070,7 +2299,7 @@ impl<'a> Runner<'a> {
             }
             let d = self.committed_digest(&name);
             let shown = d.clone().unwrap_or_default();
-            if self.shared && name == "main" {
+            if self.service && name == "main" {
                 // A process killed mid-commit may have left a complete generation no survivor began
                 // on yet.
                 if !self.observe(i, "reopened p0", v, d) {

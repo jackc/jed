@@ -27,20 +27,17 @@
 //! mutex.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::fs::File;
 use std::io::Write;
-use std::net::Shutdown;
-use std::os::unix::fs::FileExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::coordinator::FileCoordinator;
+use crate::coordinator::{FileCoordinator, LockHost};
 use crate::error::{EngineError, Result, SqlState};
 use crate::file::Ownership;
+use crate::filehost::{FileHost, PageReader};
 use crate::pageservice::codec::{
     BeginRead, BeginWrite, COMMIT_STATUS_COMMITTED, COMMIT_STATUS_NOT_COMMITTED,
     COMMIT_STATUS_UNKNOWN, CommitBegin, CommitPages, CommitStatusReply, Committed,
@@ -52,14 +49,11 @@ use crate::pageservice::codec::{
     Pages, encode_frame, max_read_pages, read_frame,
 };
 use crate::pageservice::delta::{Delta, DeltaBase, begin_delta};
-use crate::pageservice::endpoint;
+use crate::pageservice::net::{PsListener, PsStream};
 use crate::shared::Shared;
 
 /// The resolution window keeps the newest commits, like the invalidation window (README.md §4).
 const RESOLUTION_WINDOW_COMMITS: usize = INVALIDATION_WINDOW_COMMITS as usize;
-
-/// How often a draining owner checks for running transactions (README.md §6.5).
-const DRAIN_POLL: Duration = Duration::from_millis(10);
 
 /// The commit-acknowledgement test hooks (README.md §6.4–§6.5): acknowledge normally, drop the
 /// connection, or exit the process instead of acknowledging the next client commit.
@@ -454,9 +448,9 @@ struct ConnState {
 struct ServerConn {
     id: u64,
     /// The write half: replies come from the serve thread and from a `begin_write`'s gate waiter.
-    sender: Mutex<UnixStream>,
+    sender: Mutex<Box<dyn PsStream>>,
     /// A second handle on the socket, so the owner can shut it down without the send lock.
-    control: UnixStream,
+    control: Box<dyn PsStream>,
     /// Set when the serve thread ends, so a gate waiter gives up.
     closed: AtomicBool,
     state: Mutex<ConnState>,
@@ -485,7 +479,7 @@ impl ServerConn {
 
     /// Drop the connection (the commit-resolution test hook, the idle-session timeout, a release).
     fn hang_up(&self) {
-        let _ = self.control.shutdown(Shutdown::Both);
+        self.control.close_both();
     }
 }
 
@@ -505,12 +499,18 @@ pub(crate) struct PageServiceOwner {
     /// The handoff state; `admission` wakes the owner's own begins when a drain ends.
     handoff: Mutex<HandoffState>,
     admission: Condvar,
+    /// The handle's lock host (the owner record, the endpoint, the drain's clock) and file host (the
+    /// read handle): the OS, or the simulator's.
+    host: Arc<dyn LockHost>,
+    files: Arc<dyn FileHost>,
     /// The owner's own read handle on the database: page reads are positioned reads on it,
     /// independent of the pager's lock, so a client never waits on the owner's commit. Compaction
     /// replaces it.
-    file: RwLock<File>,
+    file: RwLock<Box<dyn PageReader>>,
     endpoint: Option<PathBuf>,
     conns: Mutex<Conns>,
+    /// The bound endpoint, so a shutdown can wake the accept loop.
+    listener: Mutex<Option<Arc<dyn PsListener>>>,
     accept: Mutex<Option<JoinHandle<()>>>,
     pub(crate) gate: WriterGate,
     /// Held from a client commit's point of no return through its publication, and by adoption,
@@ -537,15 +537,12 @@ impl PageServiceOwner {
         preference: Ownership,
         limits: OwnerLimits,
         coord: Option<FileCoordinator>,
+        host: Arc<dyn LockHost>,
+        files: Arc<dyn FileHost>,
     ) -> Result<Arc<PageServiceOwner>> {
-        let file = File::open(db_path).map_err(|e| {
-            EngineError::new(
-                SqlState::IoError,
-                format!("open database for page service: {e}"),
-            )
-        })?;
-        let uid = endpoint::current_uid(&endpoint::bundle_dir(db_path))?;
-        let endpoint_path = endpoint::endpoint_path(db_path, uid, &incarnation);
+        let file = files.open_reader(db_path)?;
+        let uid = host.current_uid(db_path)?;
+        let endpoint_path = host.endpoint_path(db_path, uid, &incarnation);
         Ok(Arc::new(PageServiceOwner {
             shared,
             db_path: db_path.to_path_buf(),
@@ -562,6 +559,8 @@ impl PageServiceOwner {
                 draining: false,
             }),
             admission: Condvar::new(),
+            host,
+            files,
             file: RwLock::new(file),
             endpoint: endpoint_path,
             conns: Mutex::new(Conns {
@@ -570,6 +569,7 @@ impl PageServiceOwner {
                 open: HashMap::new(),
                 threads: Vec::new(),
             }),
+            listener: Mutex::new(None),
             accept: Mutex::new(None),
             gate: WriterGate::new(),
             commit_lock: Mutex::new(()),
@@ -592,16 +592,14 @@ impl PageServiceOwner {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         };
-        endpoint::write_owner_record(&self.db_path, &record)?;
+        self.host.write_owner_record(&self.db_path, &record)?;
         let Some(path) = &self.endpoint else {
             return Ok(());
         };
-        // Only a presence-EX holder reaches here, so a file already at the path is a dead owner's.
-        let _ = std::fs::remove_file(path);
-        let listener = match UnixListener::bind(path) {
-            Ok(listener) => listener,
+        let listener: Arc<dyn PsListener> = match self.host.listen(path) {
+            Ok(listener) => Arc::from(listener),
             Err(e) => {
-                let _ = endpoint::write_owner_record(
+                let _ = self.host.write_owner_record(
                     &self.db_path,
                     &OwnerRecord {
                         serving: false,
@@ -615,22 +613,46 @@ impl PageServiceOwner {
                 ));
             }
         };
+        *self.listener.lock().expect("listener lock poisoned") = Some(Arc::clone(&listener));
         let acceptor = Arc::clone(self);
         *self.accept.lock().expect("accept lock poisoned") =
             Some(thread::spawn(move || acceptor.accept_loop(listener)));
         Ok(())
     }
 
-    fn accept_loop(self: Arc<Self>, listener: UnixListener) {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else {
-                continue;
+    /// Wake the blocking accept; it sees `closed` and returns.
+    fn wake_accept(&self) {
+        let listener = self
+            .listener
+            .lock()
+            .expect("listener lock poisoned")
+            .clone();
+        if let Some(listener) = listener {
+            listener.close();
+        }
+    }
+
+    /// Accept until the owner closes, then drop the endpoint (the socket closes with the last handle
+    /// on it, so a late dial is refused rather than left unanswered).
+    fn accept_loop(self: Arc<Self>, listener: Arc<dyn PsListener>) {
+        self.accept_connections(listener.as_ref());
+        self.listener.lock().expect("listener lock poisoned").take();
+    }
+
+    fn accept_connections(self: &Arc<Self>, listener: &dyn PsListener) {
+        loop {
+            let stream = match listener.accept() {
+                Ok(Some(stream)) => stream,
+                Ok(None) => return,
+                Err(_) => continue,
             };
             let mut conns = self.conns.lock().expect("connections lock poisoned");
             if conns.closed {
+                stream.close_both();
                 return;
             }
-            let (Ok(control), Ok(sender)) = (stream.try_clone(), stream.try_clone()) else {
+            let (Ok(control), Ok(sender)) = (stream.clone_stream(), stream.clone_stream()) else {
+                stream.close_both();
                 continue;
             };
             conns.next_id += 1;
@@ -656,7 +678,7 @@ impl PageServiceOwner {
             });
             conns.open.insert(id, Arc::clone(&conn));
             conns.threads.retain(|t| !t.is_finished());
-            let owner = Arc::clone(&self);
+            let owner = Arc::clone(self);
             conns
                 .threads
                 .push(thread::spawn(move || owner.serve_connection(conn, stream)));
@@ -741,16 +763,17 @@ impl PageServiceOwner {
 
     /// Wait for running transactions to finish, up to `grace` (README.md §6.5). `true` when the
     /// yield's `requester` disconnected first (the yield is cancelled).
+    /// Polls through the lock host, whose clock the simulator advances.
     fn drain(&self, shared: &Shared, grace: Duration, own: bool, requester: Option<u64>) -> bool {
-        let deadline = Instant::now() + grace;
+        let deadline = self.host.now() + grace;
         loop {
             if requester.is_some_and(|id| self.connection_gone(id)) {
                 return true;
             }
-            if self.drained(shared, own) || Instant::now() >= deadline {
+            if self.drained(shared, own) || self.host.now() >= deadline {
                 return false;
             }
-            thread::sleep(DRAIN_POLL);
+            self.host.pause();
         }
     }
 
@@ -851,12 +874,7 @@ impl PageServiceOwner {
     /// Reopen the read handle after compaction replaced the file. The caller holds the writer gate
     /// and no pin exists, so no page read is in flight.
     pub(crate) fn reopen_file(&self) -> Result<()> {
-        let file = File::open(&self.db_path).map_err(|e| {
-            EngineError::new(
-                SqlState::IoError,
-                format!("reopen database for page service: {e}"),
-            )
-        })?;
+        let file = self.files.open_reader(&self.db_path)?;
         *self.file.write().expect("page-service file lock poisoned") = file;
         Ok(())
     }
@@ -875,9 +893,8 @@ impl PageServiceOwner {
             )
         };
         let accept = self.accept.lock().expect("accept lock poisoned").take();
-        if let (Some(accept), Some(path)) = (accept, &self.endpoint) {
-            // Wake the blocking accept; it sees `closed` and returns.
-            let _ = UnixStream::connect(path);
+        if let Some(accept) = accept {
+            self.wake_accept();
             join_unless_current(accept);
         }
         for conn in conns {
@@ -891,9 +908,9 @@ impl PageServiceOwner {
     /// Remove the endpoint and the owner record, while presence EX is still held.
     pub(crate) fn remove_serving(&self) {
         if let Some(path) = &self.endpoint {
-            let _ = std::fs::remove_file(path);
+            self.host.remove_endpoint(path);
         }
-        let _ = std::fs::remove_file(endpoint::owner_record_path(&self.db_path));
+        self.host.remove_owner_record(&self.db_path);
     }
 
     /// The owner's response to a write or sync failure in a client commit (page-service.md §5.6):
@@ -908,15 +925,12 @@ impl PageServiceOwner {
                 conn.hang_up();
             }
         }
-        if let Some(path) = &self.endpoint {
-            // Wake the blocking accept; it sees `closed` and returns.
-            let _ = UnixStream::connect(path);
-        }
+        self.wake_accept();
     }
 
     /// Run one connection until EOF or a protocol violation, then abort its write transaction
     /// (unless past the point of no return) and release its pins.
-    fn serve_connection(self: Arc<Self>, conn: Arc<ServerConn>, mut stream: UnixStream) {
+    fn serve_connection(self: Arc<Self>, conn: Arc<ServerConn>, mut stream: Box<dyn PsStream>) {
         let id = conn.id;
         if self.limits.idle_in_transaction.is_some() || self.limits.idle_session.is_some() {
             let owner = Arc::clone(&self);
@@ -925,13 +939,15 @@ impl PageServiceOwner {
                 Some(thread::spawn(move || owner.watch_idle(watched)));
         }
         self.serve_frames(&conn, &mut stream);
-        let _ = stream.shutdown(Shutdown::Both);
         self.end_connection(&conn);
         self.conns
             .lock()
             .expect("connections lock poisoned")
             .open
             .remove(&id);
+        // Closed last, after the connection's state is released: the simulator treats a closed end
+        // as settled.
+        stream.close_both();
     }
 
     /// The end of a connection: abort its write transaction unless it is past the point of no
@@ -959,7 +975,7 @@ impl PageServiceOwner {
         }
     }
 
-    fn serve_frames(self: &Arc<Self>, conn: &Arc<ServerConn>, stream: &mut UnixStream) {
+    fn serve_frames(self: &Arc<Self>, conn: &Arc<ServerConn>, stream: &mut Box<dyn PsStream>) {
         let mut hello_done = false;
         loop {
             let (request_id, message) = match read_frame(stream, self.page_size) {
@@ -1159,10 +1175,7 @@ impl PageServiceOwner {
                 ));
             }
             let mut page = vec![0u8; self.page_size as usize];
-            file.read_exact_at(&mut page, u64::from(index) * u64::from(self.page_size))
-                .map_err(|e| {
-                    EngineError::new(SqlState::IoError, format!("page service read: {e}"))
-                })?;
+            file.read_exact_at(&mut page, u64::from(index) * u64::from(self.page_size))?;
             pages.push(page);
         }
         Ok(Some(Message::Pages(Pages { pages })))

@@ -61,6 +61,8 @@ type psClient struct {
 	// handoffPaused is set by a yield-begun notice naming another connection and cleared by a
 	// yield-cancelled notice (README.md §6.5).
 	handoffPaused atomic.Bool
+	// now is the host's clock (the simulator's in a simulation), for the handoff pause.
+	now func() time.Time
 
 	// incarnation and adopted name the cache this process holds (README.md §3.2); refreshMu
 	// serializes begin_read + adoption so the cache always matches exactly one adopted version.
@@ -99,12 +101,12 @@ func connectionLost(err error) error {
 
 // connectPageClient dials the endpoint and runs hello. A dial or handshake failure the opener may
 // retry is returned as retry=true; an owner's refusal (0A000: protocol or format mismatch) is final.
-func connectPageClient(dbPath, endpoint string, readOnly bool) (cl *psClient, retry bool, err error) {
-	conn, err := dialEndpoint(endpoint)
+func connectPageClient(host lockHost, dbPath, endpoint string, readOnly bool) (cl *psClient, retry bool, err error) {
+	conn, err := host.dial(endpoint)
 	if err != nil {
 		return nil, true, err
 	}
-	cl = &psClient{dbPath: dbPath, conn: conn, pending: map[uint32]chan psReply{}, held: map[uint64]bool{}, reserved: map[uint64]int{}, done: make(chan struct{})}
+	cl = &psClient{dbPath: dbPath, conn: conn, pending: map[uint32]chan psReply{}, held: map[uint64]bool{}, reserved: map[uint64]int{}, done: make(chan struct{}), now: host.now}
 	go cl.readLoop()
 	var flags uint8
 	if readOnly {
@@ -193,14 +195,13 @@ func (cl *psClient) breakWith(err error) {
 	first := cl.broken == nil
 	if first {
 		cl.broken = err
-		cl.brokenAt = time.Now()
+		cl.brokenAt = cl.now()
 	}
 	pending := cl.pending
 	cl.pending = map[uint32]chan psReply{}
 	broken := cl.broken
 	onBreak := cl.onBreak
 	cl.pendMu.Unlock()
-	_ = cl.conn.Close()
 	for _, ch := range pending {
 		ch <- psReply{err: broken}
 	}
@@ -210,6 +211,8 @@ func (cl *psClient) breakWith(err error) {
 			onBreak()
 		}
 	}
+	// Closed last: the simulator treats a closed end as settled.
+	_ = cl.conn.Close()
 }
 
 // setOnBreak installs the re-election trigger (watchClient).

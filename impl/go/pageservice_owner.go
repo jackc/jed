@@ -110,7 +110,10 @@ type pageServiceOwner struct {
 	// on it, independent of the pager's lock, so a client never waits on the owner's commit. Compaction
 	// replaces it.
 	fileMu sync.RWMutex
-	file   *os.File
+	file   blockStore
+	// host and files are the handle's lock host and file host (the OS, or the simulator's).
+	host  lockHost
+	files fileHost
 
 	listener net.Listener
 	endpoint string
@@ -191,6 +194,8 @@ func newPageServiceOwner(c *sharedCore, paging *sharedPaging, txid uint64, h *se
 		preference:  h.ownership,
 		limits:      h.limits,
 		coord:       coord,
+		host:        h.host,
+		files:       h.fileHost(),
 		conns:       map[*psServerConn]struct{}{},
 		gate:        make(chan struct{}, 1),
 		closing:     make(chan struct{}),
@@ -201,8 +206,8 @@ func newPageServiceOwner(c *sharedCore, paging *sharedPaging, txid uint64, h *se
 	}
 	o.meta, o.metaTxid, o.windowStart = meta, txid, txid
 	o.seedResolution(paging, txid, meta)
-	if o.file, err = os.Open(h.path); err != nil {
-		return nil, newError(IoError, "open database for page service: "+err.Error())
+	if o.file, err = o.files.openStore(h.path, true, true); err != nil {
+		return nil, err
 	}
 	return o, nil
 }
@@ -211,18 +216,18 @@ func newPageServiceOwner(c *sharedCore, paging *sharedPaging, txid uint64, h *se
 // private endpoint directory, or a failed bind) still owns and records that it does not serve.
 func (o *pageServiceOwner) start() error {
 	uid := currentUID()
-	o.endpoint = endpointPath(o.dbPath, uid, o.incarnation)
+	o.endpoint = o.host.endpointPath(o.dbPath, uid, o.incarnation)
 	record := ownerRecord{serving: o.endpoint != "", uid: uid, incarnation: o.incarnation, pid: uint32(os.Getpid()), endpoint: o.endpoint}
-	if err := writeOwnerRecord(o.dbPath, record); err != nil {
+	if err := o.host.writeOwnerRecord(o.dbPath, record); err != nil {
 		return err
 	}
 	if o.endpoint == "" {
 		return nil
 	}
-	listener, err := listenEndpoint(o.endpoint)
+	listener, err := o.host.listen(o.endpoint)
 	if err != nil {
 		o.endpoint = ""
-		_ = writeOwnerRecord(o.dbPath, ownerRecord{uid: uid, incarnation: o.incarnation, pid: uint32(os.Getpid())})
+		_ = o.host.writeOwnerRecord(o.dbPath, ownerRecord{uid: uid, incarnation: o.incarnation, pid: uint32(os.Getpid())})
 		return newError(IoError, "bind page-service endpoint: "+err.Error())
 	}
 	o.listener = listener
@@ -298,15 +303,15 @@ func (o *pageServiceOwner) compacted(txid uint64) error {
 	if err != nil {
 		return err
 	}
-	file, err := os.Open(o.dbPath)
+	file, err := o.files.openStore(o.dbPath, true, true)
 	if err != nil {
-		return newError(IoError, "reopen database for page service: "+err.Error())
+		return err
 	}
 	o.fileMu.Lock()
 	old := o.file
 	o.file = file
 	o.fileMu.Unlock()
-	_ = old.Close()
+	_ = old.close()
 	o.meta, o.metaTxid = meta, txid
 	o.window, o.windowStart = nil, txid
 	o.recordResolution(txid, meta)
@@ -432,12 +437,12 @@ func (o *pageServiceOwner) connections() []*psServerConn {
 // is still held.
 func (o *pageServiceOwner) removeServing() {
 	if o.endpoint != "" {
-		_ = os.Remove(o.endpoint)
+		o.host.removeEndpoint(o.endpoint)
 	}
-	_ = os.Remove(ownerRecordPath(o.dbPath))
+	o.host.removeOwnerRecord(o.dbPath)
 	o.fileMu.Lock()
 	if o.file != nil {
-		_ = o.file.Close()
+		_ = o.file.close()
 		o.file = nil
 	}
 	o.fileMu.Unlock()
@@ -496,7 +501,7 @@ func (o *pageServiceOwner) drained(own bool) bool {
 // drain waits for running transactions to finish, up to grace (README.md §6.5). It reports true when
 // the yield's requester disconnected first (the yield is cancelled).
 func (o *pageServiceOwner) drain(grace time.Duration, own bool, requester *psServerConn) bool {
-	deadline := time.Now().Add(grace)
+	deadline := o.host.now().Add(grace)
 	for {
 		if requester != nil {
 			requester.mu.Lock()
@@ -506,10 +511,10 @@ func (o *pageServiceOwner) drain(grace time.Duration, own bool, requester *psSer
 				return true
 			}
 		}
-		if o.drained(own) || !time.Now().Before(deadline) {
+		if o.drained(own) || !o.host.now().Before(deadline) {
 			return false
 		}
-		time.Sleep(psDrainPoll)
+		o.host.pause()
 	}
 }
 
@@ -547,7 +552,7 @@ func (o *pageServiceOwner) yield(requester *psServerConn) {
 		o.endDrain()
 		return
 	}
-	next := &serviceRole{gen: r.gen + 1, pauseUntil: time.Now().Add(psHandoffPause)}
+	next := &serviceRole{gen: r.gen + 1, pauseUntil: h.host.now().Add(psHandoffPause)}
 	c.releaseOwnership(r, next)
 	h.mu.Unlock()
 	o.endDrain()
@@ -631,7 +636,6 @@ func (o *pageServiceOwner) acceptLoop() {
 func (sc *psServerConn) serve() {
 	o := sc.owner
 	defer func() {
-		_ = sc.conn.Close()
 		sc.mu.Lock()
 		sc.closed = true
 		sc.parked = nil
@@ -647,6 +651,9 @@ func (sc *psServerConn) serve() {
 		o.connMu.Lock()
 		delete(o.conns, sc)
 		o.connMu.Unlock()
+		// Closed last, after the connection's state is released: the simulator treats a closed end as
+		// settled.
+		_ = sc.conn.Close()
 		o.wg.Done()
 	}()
 	helloDone := false
@@ -807,9 +814,9 @@ func (sc *psServerConn) readPages(m psReadPages) (psMessage, error) {
 		if index < 2 || index >= pageCount {
 			return nil, newError(ProtocolViolation, "read_pages names a page outside the pinned snapshot")
 		}
-		page := make([]byte, o.pageSize)
-		if _, err := o.file.ReadAt(page, int64(index)*int64(o.pageSize)); err != nil {
-			return nil, newError(IoError, "page service read: "+err.Error())
+		page, err := o.file.readAt(int64(index)*int64(o.pageSize), int(o.pageSize))
+		if err != nil {
+			return nil, err
 		}
 		pages[i] = page
 	}

@@ -52,7 +52,7 @@ module SimGen
       "add_column" => 1, "analyze" => 1, "sequence" => 1, "invalid" => 1,
       "commit" => 9, "rollback" => 2, "check" => 2, "reopen" => 1, "clock" => 1,
       "crash_power" => 1, "crash_process" => 1, "compact" => 0,
-      "spawn" => 0, "exit" => 0, "kill" => 0, "tick" => 0,
+      "spawn" => 0, "exit" => 0, "kill" => 0, "disconnect" => 0,
       "attach" => 0, "corrupt" => 0, "temp_table" => 0, "temp_insert" => 0, "temp_read" => 0
     },
     "values" => {
@@ -60,10 +60,10 @@ module SimGen
     },
     "faults" => {
       "commit_fault" => 150, "chain" => 150, "power_loss" => 5, "process_crash" => 3,
-      "io_error_write" => 1, "io_error_sync" => 1, "read_error" => 0, "enospc" => 0,
+      "io_error_write" => 1, "io_error_sync" => 1, "read_error" => 0, "enospc" => 0, "disconnect" => 0,
       "compact_fault" => 300, "nth_max" => 1, "attach_fault" => 0, "spill_fault" => 0,
       "survive" => [100, 900], "tear" => [0, 400], "issue" => [200, 900], "io_p" => [50, 500],
-      "flips" => [1, 3], "reseal" => 0
+      "flips" => [1, 3], "reseal" => 0, "frames_max" => 8
     }
   }.freeze
 
@@ -150,7 +150,7 @@ module SimGen
       @readers = {}         # reader session id => table names visible at its open
       @sequences = []       # sequence names ever created
       @next = Hash.new(0)   # name counters
-      @shared = @p["processes"] == "shared" # several processes over one file (slice S5)
+      @service = @p["processes"] == "service" # an owner and page clients over one file (slice S8)
       @procs = [0]          # the running processes
       @pid_of = {}          # session id => its process
       # File attachments (slice S4): name => :yes (attached, its file durable) or :maybe (a create
@@ -177,7 +177,7 @@ module SimGen
         # (54P06, or a 54P05 that aborted the block), so every commit is as uncertain as a faulted one.
         @limited ||= value.positive? && !%w[work_mem temp_buffers].include?(knob)
       end
-      header << "# processes: shared" if @shared
+      header << "# processes: service" if @service
       header << "# clock: 1700000000000000"
       bootstrap
       step_once while @lines.length < @steps
@@ -227,10 +227,10 @@ module SimGen
       when "crash_power" then crash_power
       when "crash_process" then crash_process
       when "compact" then compact
-      when "spawn" then spawn if @shared
-      when "exit" then exit_process if @shared
-      when "kill" then kill_process_step if @shared
-      when "tick" then emit("tick") if @shared
+      when "spawn" then spawn if @service
+      when "exit" then exit_process if @service
+      when "kill" then kill_process_step if @service
+      when "disconnect" then emit("disconnect p#{@rng.pick(@procs)}") if @service
       when "attach" then attach
       when "corrupt" then corrupt
       when "temp_table", "temp_insert", "temp_read" then temp_statement(action)
@@ -258,24 +258,22 @@ module SimGen
       emit("open #{sid} read#{in_process(sid)}")
     end
 
-    # In a shared trace a session opens in a random running process (` p<N>`); otherwise in p0, with
+    # In a service trace a session opens in a random running process (` p<N>`); otherwise in p0, with
     # no suffix and no draw.
     def in_process(sid)
-      return "" unless @shared
+      return "" unless @service
 
       pid = @rng.pick(@procs)
       @pid_of[sid] = pid
       " p#{pid}"
     end
 
-    # --- processes (slice S5) ---------------------------------------------------------------------
+    # --- processes (slice S8) ---------------------------------------------------------------------
 
-    # Joining needs the running processes' probes to make room, and a process holding an open write
-    # session cannot until that writer ends — which no single simulated step can wait for — so a
-    # process spawns only while no writer is open.
+    # A process spawns as the owner when none runs, otherwise as a page client of the owner.
     def spawn
       free = (0...@p["max_procs"]).reject { |pid| @procs.include?(pid) }
-      return if free.empty? || @writer
+      return if free.empty?
 
       pid = @rng.pick(free)
       @procs = (@procs + [pid]).sort
@@ -309,14 +307,21 @@ module SimGen
       @procs = [0] if @procs.empty?
     end
 
-    # A fault on a step kills the process running it; a power loss kills them all (S5). In a single-
-    # process trace every fault ends every session.
+    # A fault on a step kills the owner, the only process that touches the file; a power loss kills
+    # them all (S8). The model does not track which process owns, so it forgets only the faulted
+    # writer; the runner skips any later step that names a session of the dead owner. A disconnect
+    # kills no process. In a single-process trace every fault ends every session.
     def fault_kills(line, pid)
-      if !@shared || line.start_with?("fault power_loss") || @procs.length < 2
+      if line.start_with?("fault disconnect")
+        return
+      elsif !@service || line.start_with?("fault power_loss") || @procs.length < 2
         kill_sessions
       else
         @after_crash = true
-        end_process(pid)
+        if @writer && @pid_of[@writer] == pid
+          @writer = nil
+          @working = nil
+        end
       end
     end
 
@@ -340,6 +345,8 @@ module SimGen
       if faulted
         merge_uncertain
         fault_kills(line, @pid_of[@writer])
+        @writer = nil
+        @working = nil
       elsif @limited
         merge_uncertain
         @writer = nil
@@ -396,7 +403,7 @@ module SimGen
     # Attach a file database (creating its file if it does not exist). Attaching takes the writer gate,
     # so it waits for no writer; a fault may crash create at its temp-file or directory barrier.
     def attach
-      return if @shared || @writer || @p["attachments"].zero?
+      return if @service || @writer || @p["attachments"].zero?
 
       name = "a#{@rng.range(1, @p['attachments'])}"
       faulted = @attached[name] != :yes && @rng.chance(@p.dig("faults", "attach_fault"))
@@ -421,7 +428,7 @@ module SimGen
     # Bit rot in the main file (simulation-testing.md §6.3): the runner ends every session cleanly,
     # flips bits, reads everything back, and repairs the bits.
     def corrupt
-      return if @shared
+      return if @service
 
       reseal = @rng.chance(@p.dig("faults", "reseal")) ? " reseal=1" : ""
       emit("corrupt flips=#{@rng.range(*@p.dig('faults', 'flips'))}#{reseal}")
@@ -507,13 +514,14 @@ module SimGen
     end
 
     def fault_line
-      kinds = %w[power_loss process_crash io_error_write io_error_sync read_error enospc]
+      kinds = %w[power_loss process_crash io_error_write io_error_sync read_error enospc disconnect]
       case @rng.weighted(@p["faults"].slice(*kinds))
       when "power_loss" then "fault power_loss survive=#{draw('survive')} tear=#{draw('tear')}#{nth}"
       when "process_crash" then "fault process_crash issue=#{draw('issue')}#{nth}"
       when "io_error_write" then "fault io_error op=write p=#{draw('io_p')}"
       when "read_error" then "fault read_error p=#{draw('io_p')}"
       when "enospc" then "fault enospc"
+      when "disconnect" then "fault disconnect nth=#{@rng.range(1, @p.dig("faults", "frames_max") || 8)}"
       else "fault io_error op=sync nth=#{@rng.range(1, 2)}"
       end
     end

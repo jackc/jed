@@ -10,6 +10,7 @@ package jed
 import (
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,6 +59,7 @@ type simLockHost struct {
 	table   *simLockTable
 	pidNum  int
 	claimed map[string]bool // the process-local open registry
+	net     *simNet         // the page service's records, endpoints, and connections (sim_net_test.go)
 }
 
 func (h *simLockHost) claimPath(path string) bool {
@@ -106,7 +108,8 @@ func (h *simLockHost) unlock(l lockHandle) error {
 	return nil
 }
 
-func (h *simLockHost) now() time.Time { return time.UnixMicro(*h.table.clock) }
+// now reads the simulated clock atomically: a client's connection goroutine reads it too.
+func (h *simLockHost) now() time.Time { return time.UnixMicro(atomic.LoadInt64(h.table.clock)) }
 
 func (h *simLockHost) pause() {
 	t := h.table
@@ -115,7 +118,7 @@ func (h *simLockHost) pause() {
 		panic(fmt.Sprintf("simulated deadlock: process p%d waited %d polls for a lock", h.pidNum, t.polls))
 	}
 	t.runProbes(h.pidNum)
-	*t.clock += simLockPoll
+	atomic.AddInt64(t.clock, simLockPoll)
 }
 
 func (h *simLockHost) pid() int { return h.pidNum }

@@ -60,6 +60,42 @@ pub(crate) trait LockHost: Send + Sync {
     fn pause(&self);
     /// The process id the fork check compares.
     fn pid(&self) -> u32;
+
+    // The page service's host operations (spec/pageservice/README.md §5): the owner record in the
+    // bundle, this user's id, and the owner's endpoint. The simulator substitutes an in-memory
+    // network.
+
+    /// The owner record of the database at `db_path`, or `None` when absent or unparsable.
+    #[cfg(unix)]
+    fn read_owner_record(&self, db_path: &Path) -> Option<crate::pageservice::codec::OwnerRecord>;
+    #[cfg(unix)]
+    fn write_owner_record(
+        &self,
+        db_path: &Path,
+        record: &crate::pageservice::codec::OwnerRecord,
+    ) -> Result<()>;
+    #[cfg(unix)]
+    fn remove_owner_record(&self, db_path: &Path);
+    /// This process's user id, as the owner record names it.
+    #[cfg(unix)]
+    fn current_uid(&self, db_path: &Path) -> Result<u32>;
+    /// Where the owner of `db_path` binds its endpoint; `None` when it cannot serve.
+    #[cfg(unix)]
+    fn endpoint_path(
+        &self,
+        db_path: &Path,
+        uid: u32,
+        incarnation: &crate::pageservice::codec::Id16,
+    ) -> Option<PathBuf>;
+    #[cfg(unix)]
+    fn listen(
+        &self,
+        endpoint: &Path,
+    ) -> std::io::Result<Box<dyn crate::pageservice::net::PsListener>>;
+    #[cfg(unix)]
+    fn dial(&self, endpoint: &str) -> std::io::Result<Box<dyn crate::pageservice::net::PsStream>>;
+    #[cfg(unix)]
+    fn remove_endpoint(&self, endpoint: &Path);
 }
 
 /// The production coordination host: `flock` / `LockFileEx` on the bundle files.
@@ -124,6 +160,63 @@ impl LockHost for OsLockHost {
 
     fn pid(&self) -> u32 {
         std::process::id()
+    }
+
+    #[cfg(unix)]
+    fn read_owner_record(&self, db_path: &Path) -> Option<crate::pageservice::codec::OwnerRecord> {
+        crate::pageservice::endpoint::read_owner_record(db_path)
+    }
+
+    #[cfg(unix)]
+    fn write_owner_record(
+        &self,
+        db_path: &Path,
+        record: &crate::pageservice::codec::OwnerRecord,
+    ) -> Result<()> {
+        crate::pageservice::endpoint::write_owner_record(db_path, record)
+    }
+
+    #[cfg(unix)]
+    fn remove_owner_record(&self, db_path: &Path) {
+        let _ = fs::remove_file(crate::pageservice::endpoint::owner_record_path(db_path));
+    }
+
+    #[cfg(unix)]
+    fn current_uid(&self, db_path: &Path) -> Result<u32> {
+        use crate::pageservice::endpoint;
+        endpoint::current_uid(&endpoint::bundle_dir(db_path))
+    }
+
+    #[cfg(unix)]
+    fn endpoint_path(
+        &self,
+        db_path: &Path,
+        uid: u32,
+        incarnation: &crate::pageservice::codec::Id16,
+    ) -> Option<PathBuf> {
+        crate::pageservice::endpoint::endpoint_path(db_path, uid, incarnation)
+    }
+
+    #[cfg(unix)]
+    fn listen(
+        &self,
+        endpoint: &Path,
+    ) -> std::io::Result<Box<dyn crate::pageservice::net::PsListener>> {
+        // Only a presence-EX holder binds, so a file already at the path is a dead owner's.
+        let _ = fs::remove_file(endpoint);
+        Ok(Box::new(crate::pageservice::net::UnixEndpoint::bind(
+            endpoint.to_path_buf(),
+        )?))
+    }
+
+    #[cfg(unix)]
+    fn dial(&self, endpoint: &str) -> std::io::Result<Box<dyn crate::pageservice::net::PsStream>> {
+        crate::pageservice::net::dial_unix(endpoint)
+    }
+
+    #[cfg(unix)]
+    fn remove_endpoint(&self, endpoint: &Path) {
+        let _ = fs::remove_file(endpoint);
     }
 }
 
@@ -233,7 +326,7 @@ impl FileCoordinator {
             lock_until(h, &files.arrival, false, deadline, &path, false)?;
             let owned = h.validate_marker(&path).and_then(|()| {
                 lock_until(h, &files.presence, true, deadline, &path, false).map_err(|e| {
-                    match owner_reason(&path) {
+                    match owner_reason(h, &path) {
                         Some(reason) => EngineError::new(
                             SqlState::ObjectInUse,
                             format!("database file is in use: {} ({reason})", path.display()),
@@ -273,16 +366,16 @@ impl FileCoordinator {
     fn write_non_serving_record(&mut self) {
         #[cfg(unix)]
         {
-            use crate::pageservice::{codec::OwnerRecord, endpoint, owner::new_incarnation};
+            use crate::pageservice::{codec::OwnerRecord, owner::new_incarnation};
             let written = (|| {
                 let record = OwnerRecord {
                     serving: false,
-                    uid: endpoint::current_uid(&endpoint::bundle_dir(&self.path))?,
+                    uid: self.host.current_uid(&self.path)?,
                     incarnation: new_incarnation()?,
                     pid: std::process::id(),
                     endpoint: String::new(),
                 };
-                endpoint::write_owner_record(&self.path, &record)
+                self.host.write_owner_record(&self.path, &record)
             })();
             self.record = written.is_ok();
         }
@@ -313,7 +406,7 @@ impl Drop for FileCoordinator {
     fn drop(&mut self) {
         #[cfg(unix)]
         if self.record {
-            let _ = fs::remove_file(crate::pageservice::endpoint::owner_record_path(&self.path));
+            self.host.remove_owner_record(&self.path);
         }
         self.host.close_files(&self.files);
         if !self.keep_path {
@@ -324,10 +417,9 @@ impl Drop for FileCoordinator {
 
 /// The owner record's wording for a presence EX this opener could not take (README.md §6.1).
 #[cfg(unix)]
-fn owner_reason(path: &Path) -> Option<&'static str> {
-    use crate::pageservice::endpoint;
-    let record = endpoint::read_owner_record(path)?;
-    let uid = endpoint::current_uid(&endpoint::bundle_dir(path)).ok()?;
+fn owner_reason(host: &dyn LockHost, path: &Path) -> Option<&'static str> {
+    let record = host.read_owner_record(path)?;
+    let uid = host.current_uid(path).ok()?;
     if record.uid != uid {
         Some("owned by another user's process")
     } else if !record.serving {
@@ -338,7 +430,7 @@ fn owner_reason(path: &Path) -> Option<&'static str> {
 }
 
 #[cfg(not(unix))]
-fn owner_reason(_path: &Path) -> Option<&'static str> {
+fn owner_reason(_host: &dyn LockHost, _path: &Path) -> Option<&'static str> {
     None
 }
 

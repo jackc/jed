@@ -1,7 +1,8 @@
 // The page-service owner, engine-thread half (spec/design/page-service.md §4.1, §14;
 // spec/pageservice/README.md §6.2, §6.4): it draws the incarnation, records the committed meta, writes
 // the owner record, and asks the process's service worker (owner_worker.ts, one per process, reused
-// across opens) to bind the endpoint and serve.
+// across opens) to bind the endpoint and serve — or, in the deterministic simulator, the lock host's
+// in-memory network (net.ts), which serves on this thread.
 // Afterwards the engine thread touches the shared state only to publish a main-database commit, to
 // read client pins into its reader watermark, to reset the window at compaction, to take the writer
 // gate, and — when a client commit was published or the gate handed over, which one atomic load at each
@@ -15,18 +16,13 @@ import { parseCommitMeta } from "../commit_manifest.ts";
 import { engineError } from "../errors.ts";
 import type { Engine } from "../executor.ts";
 import { FORMAT_VERSION } from "../format.ts";
+import type { LockHost } from "../lockhost.ts";
 import type { SharedPaging } from "../paging.ts";
 import type { ServiceEngineFacts, ServiceOwnerHandle, ServicePending } from "../shared.ts";
 import { type BlockingChannel, ProcessWorker } from "./blocking.ts";
-import {
-  currentUid,
-  newIncarnation,
-  endpointPath,
-  ownerRecordPath,
-  removeQuietly,
-  writeOwnerRecord,
-} from "./endpoint.ts";
+import { currentUid, newIncarnation } from "./endpoint.ts";
 import { PS_NOTICE_SHUTDOWN_BEGUN } from "./codec.ts";
+import type { OwnerLink, OwnerServeArgs } from "./net.ts";
 import type { OwnerNotice, OwnerPoison, OwnerServe, OwnerStop } from "./owner_worker.ts";
 import {
   ACK_CRASH,
@@ -71,33 +67,95 @@ function readCommittedMeta(paging: SharedPaging, txid: bigint): Uint8Array {
   throw engineError("data_corrupted", "no meta slot carries the committed txid");
 }
 
+// WorkerOwnerLink serves one database on the process's service worker over an OS socket.
+class WorkerOwnerLink implements OwnerLink {
+  readonly gateWaits = true;
+  private readonly channel: BlockingChannel;
+  private readonly id = ++nextServedId;
+  private readonly notify: MessagePort;
+
+  // The worker binds the endpoint and serves; a bind failure throws.
+  constructor(args: OwnerServeArgs) {
+    const channel = serviceWorker.acquire();
+    const { port1, port2 } = new MessageChannel();
+    const serve: OwnerServe = {
+      op: "serve",
+      id: this.id,
+      state: args.state.buffer,
+      dbPath: args.dbPath,
+      endpoint: args.endpoint,
+      pageSize: args.pageSize,
+      formatVersion: args.formatVersion,
+      incarnation: args.incarnation,
+      ownerReadOnly: args.ownerReadOnly,
+      preferYield: args.preferYield,
+      noSync: args.noSync,
+      idleTimeoutMs: args.idleTimeoutMs,
+      idleSessionTimeoutMs: args.idleSessionTimeoutMs,
+      maxConnections: args.maxConnections,
+      notify: port2,
+    };
+    const answer = channel.request(serve, [port2]) as { ok?: boolean; error?: string };
+    if (answer.ok !== true) {
+      port1.close();
+      serviceWorker.release();
+      throw engineError("io_error", `bind page-service endpoint: ${answer.error ?? "failed"}`);
+    }
+    // A gate handed over between transactions is taken at the next event-loop turn, and an accepted
+    // ownership request starts the drain there; the port never keeps the process alive.
+    port1.on("message", (message: string) => {
+      if (message === "maintain") args.onMaintain();
+      else if (message === "yield") args.onYield();
+    });
+    port1.unref();
+    this.channel = channel;
+    this.notify = port1;
+  }
+
+  stop(): void {
+    this.channel.request({ op: "stop", id: this.id } satisfies OwnerStop);
+    serviceWorker.release();
+    this.notify.close();
+  }
+
+  poison(): void {
+    this.channel.request({ op: "poison", id: this.id } satisfies OwnerPoison);
+  }
+
+  notice(kind: number): void {
+    this.channel.request({ op: "notice", id: this.id, kind } satisfies OwnerNotice);
+  }
+}
+
 export class ServiceOwner implements ServiceOwnerHandle {
   private readonly state = new ServiceState();
   private readonly dbPath: string;
   private readonly endpoint: string;
-  // channel is the service worker's while this owner serves (id names it there); null otherwise.
-  private channel: BlockingChannel | null = null;
-  private readonly id = ++nextServedId;
-  // notify receives the worker's gate handoffs; handoff is the core's handler for them.
-  private notify: MessagePort | null = null;
+  private readonly host: LockHost;
+  // link is the service serving this database; null for an owner that could not bind, or after close.
+  private link: OwnerLink | null = null;
+  // handoff is the core's handler for a gate handed over for a maintenance commit.
   private handoff: (() => void) | null = null;
   // yieldRequested is the core's handler for an accepted request_ownership (README §6.5).
   private yieldRequested: (() => void) | null = null;
+  // localOldest is the core's oldest local pin, for a same-thread service (the simulator).
+  private localOldest: (() => bigint | null) | null = null;
 
-  private constructor(dbPath: string, endpoint: string) {
+  private constructor(dbPath: string, endpoint: string, host: LockHost) {
     this.dbPath = dbPath;
     this.endpoint = endpoint;
+    this.host = host;
   }
 
-  // start makes the storage engine at dbPath a serving owner. The caller holds presence EX. An owner
-  // that cannot pick a private endpoint directory still owns and records flags = 0.
-  static start(storage: Engine, dbPath: string, limits: OwnerLimits): ServiceOwner {
+  // start makes the storage engine at dbPath a serving owner through host. The caller holds presence
+  // EX. An owner that cannot pick a private endpoint directory still owns and records flags = 0.
+  static start(storage: Engine, dbPath: string, limits: OwnerLimits, host: LockHost): ServiceOwner {
     const paging = storage.paging;
     if (paging === null) throw engineError("io_error", "database storage is closed");
     const incarnation = newIncarnation();
     const txid = storage.committed.txid;
     const uid = currentUid();
-    const owner = new ServiceOwner(dbPath, endpointPath(dbPath, uid, incarnation));
+    const owner = new ServiceOwner(dbPath, host.endpointPath(dbPath, uid, incarnation), host);
     const meta = readCommittedMeta(paging, txid);
     // The resolution window starts with the recovered meta slots (README §4): the committed one and,
     // when the other slot holds the commit just before it, that one too.
@@ -110,7 +168,7 @@ export class ServiceOwner implements ServiceOwnerHandle {
     }
     owner.state.resetLocked(txid, meta, false);
     owner.state.setEngineFactsLocked(storage.freeGenTxid, storage.liveAtCompaction, null);
-    writeOwnerRecord(dbPath, {
+    host.writeOwnerRecord(dbPath, {
       serving: owner.endpoint !== "",
       uid,
       incarnation,
@@ -119,13 +177,10 @@ export class ServiceOwner implements ServiceOwnerHandle {
     });
     if (owner.endpoint === "") return owner;
     // Only a presence-EX holder reaches here, so a socket already at the path is a dead owner's.
-    removeQuietly(owner.endpoint);
-    const channel = serviceWorker.acquire();
-    const { port1, port2 } = new MessageChannel();
-    const serve: OwnerServe = {
-      op: "serve",
-      id: owner.id,
-      state: owner.state.buffer,
+    host.removeEndpoint(owner.endpoint);
+    const args: OwnerServeArgs = {
+      state: owner.state,
+      storage,
       dbPath,
       endpoint: owner.endpoint,
       pageSize: paging.pageSize(),
@@ -137,24 +192,19 @@ export class ServiceOwner implements ServiceOwnerHandle {
       idleTimeoutMs: limits.idleInTransactionTimeoutMs,
       idleSessionTimeoutMs: limits.idleSessionTimeoutMs,
       maxConnections: limits.maxConnections,
-      notify: port2,
+      onMaintain: () => owner.handoff?.(),
+      onYield: () => owner.yieldRequested?.(),
+      localOldest: () => owner.localOldest?.() ?? null,
     };
-    const answer = channel.request(serve, [port2]) as { ok?: boolean; error?: string };
-    if (answer.ok !== true) {
-      port1.close();
-      serviceWorker.release();
-      removeQuietly(ownerRecordPath(dbPath));
-      throw engineError("io_error", `bind page-service endpoint: ${answer.error ?? "failed"}`);
+    try {
+      owner.link =
+        host.pageNet !== undefined
+          ? host.pageNet.serve(host.pid(), args)
+          : new WorkerOwnerLink(args);
+    } catch (error) {
+      host.removeOwnerRecord(dbPath);
+      throw error;
     }
-    // A gate handed over between transactions is taken at the next event-loop turn, and an accepted
-    // ownership request starts the drain there; the port never keeps the process alive.
-    port1.on("message", (message: string) => {
-      if (message === "maintain") owner.handoff?.();
-      else if (message === "yield") owner.yieldRequested?.();
-    });
-    port1.unref();
-    owner.notify = port1;
-    owner.channel = channel;
     return owner;
   }
 
@@ -216,7 +266,7 @@ export class ServiceOwner implements ServiceOwnerHandle {
       const seen = this.state.gate();
       if (seen === GATE_HANDED && this.state.takeHanded()) return true;
       if (seen === GATE_FREE || seen === GATE_HANDED) continue;
-      const remaining = deadline - Date.now();
+      const remaining = this.link === null || this.link.gateWaits ? deadline - Date.now() : 0;
       if (remaining <= 0) {
         throw engineError("lock_not_available", "could not obtain the database writer lock");
       }
@@ -244,7 +294,7 @@ export class ServiceOwner implements ServiceOwnerHandle {
   // every connection and accepts no more.
   stopServing(): void {
     this.state.poison();
-    this.channel?.request({ op: "poison", id: this.id } satisfies OwnerPoison);
+    this.link?.poison();
   }
 
   clearLocalOldest(): void {
@@ -259,6 +309,10 @@ export class ServiceOwner implements ServiceOwnerHandle {
 
   onYield(handler: () => void): void {
     this.yieldRequested = handler;
+  }
+
+  onLocalOldest(oldest: () => bigint | null): void {
+    this.localOldest = oldest;
   }
 
   hangUpNextAck(): void {
@@ -282,10 +336,10 @@ export class ServiceOwner implements ServiceOwnerHandle {
 
   // --- handoff (README §6.5) ---
 
-  // serving reports whether the service worker serves this database (false for an owner that could
-  // not bind, or after close).
+  // serving reports whether a service serves this database (false for an owner that could not bind,
+  // or after close).
   serving(): boolean {
-    return this.channel !== null;
+    return this.link !== null;
   }
 
   // admitting reports whether the owner serves normally; otherwise its own begins wait for the drain.
@@ -316,11 +370,7 @@ export class ServiceOwner implements ServiceOwnerHandle {
     this.state.lock();
     this.state.setOwnerStateLocked(OWNER_CLOSING);
     this.state.unlock();
-    this.channel?.request({
-      op: "notice",
-      id: this.id,
-      kind: PS_NOTICE_SHUTDOWN_BEGUN,
-    } satisfies OwnerNotice);
+    this.link?.notice(PS_NOTICE_SHUTDOWN_BEGUN);
   }
 
   // clientsIdle reports whether no client transaction is running: no connection pins a snapshot and
@@ -339,15 +389,14 @@ export class ServiceOwner implements ServiceOwnerHandle {
   // close stops serving: every client sees EOF, then the endpoint and owner record are removed. The
   // caller releases presence afterwards.
   close(): void {
-    if (this.channel !== null) {
-      this.channel.request({ op: "stop", id: this.id } satisfies OwnerStop);
-      this.channel = null;
-      serviceWorker.release();
-      removeQuietly(this.endpoint);
+    if (this.link !== null) {
+      this.link.stop();
+      this.link = null;
+      this.host.removeEndpoint(this.endpoint);
     }
-    this.notify?.close();
-    this.notify = null;
     this.handoff = null;
-    removeQuietly(ownerRecordPath(this.dbPath));
+    this.yieldRequested = null;
+    this.localOldest = null;
+    this.host.removeOwnerRecord(this.dbPath);
   }
 }

@@ -2,7 +2,8 @@
 // §6.4): a process that is not the owner runs its own engine over a pager whose byte store reads pages
 // from, and commits whole CommitDeltas through, the owner's page service instead of the file. A worker
 // thread (client_worker.ts) owns the socket; the engine thread posts each request and blocks in
-// Atomics.wait for the reply, matching it by request id.
+// Atomics.wait for the reply, matching it by request id. The transport is a link (net.ts): the socket
+// worker's (WorkerLink), or the deterministic simulator's in-memory network.
 //
 // Pins. The client holds exactly one owner pin on each version a local reader pins, and no other
 // (README §6.3): begin_read's pin is recorded at once (a duplicate is released at once) and kept for
@@ -43,6 +44,7 @@ import {
   STATUS_PAUSED,
 } from "./client_status.ts";
 import type { ClientAnswer, ClientRequest } from "./client_worker.ts";
+import type { ClientLink } from "./net.ts";
 import {
   decodeFrame,
   encodeFrame,
@@ -123,6 +125,92 @@ export class CommitLost extends Error {
 const socketWorker = new ProcessWorker(new URL("./client_worker.ts", import.meta.url));
 let nextConn = 0;
 
+// WorkerLink is a connection on the process's socket worker (client_worker.ts): the engine thread posts
+// each request and blocks in Atomics.wait for the answer. The worker records the connection's end and
+// the owner's notices in a status buffer read here with atomic loads, and announces the end on an
+// event port.
+export class WorkerLink implements ClientLink {
+  private readonly channel: BlockingChannel;
+  private readonly conn = ++nextConn;
+  private readonly status = new SharedArrayBuffer(STATUS_BYTES);
+  private readonly statusFlags = new Int32Array(this.status, 0, 2);
+  private readonly events: MessagePort;
+  private readonly remoteEvents: MessagePort;
+  // attached is set once the status buffer and the event port went to the worker.
+  private attached = false;
+
+  constructor() {
+    this.channel = socketWorker.acquire();
+    const { port1, port2 } = new MessageChannel();
+    this.events = port1;
+    this.remoteEvents = port2;
+    this.events.unref();
+  }
+
+  connect(endpoint: string): ClientAnswer {
+    const request: ClientRequest = { op: "connect", conn: this.conn, endpoint };
+    if (this.attached) return this.channel.request(request) as ClientAnswer;
+    this.attached = true;
+    request.status = this.status;
+    request.events = this.remoteEvents;
+    return this.channel.request(request, [this.remoteEvents]) as ClientAnswer;
+  }
+
+  send(frame: Uint8Array, reply: boolean): void {
+    this.channel.post({ op: "send", conn: this.conn, frame, reply } as ClientRequest);
+  }
+
+  wait(): ClientAnswer {
+    return this.channel.wait() as ClientAnswer;
+  }
+
+  next(): ClientAnswer {
+    return this.channel.request({ op: "next", conn: this.conn } as ClientRequest) as ClientAnswer;
+  }
+
+  disconnect(): void {
+    this.channel.post({ op: "disconnect", conn: this.conn } as ClientRequest);
+  }
+
+  close(): void {
+    this.channel.post({ op: "forget", conn: this.conn } as ClientRequest);
+    socketWorker.release();
+    this.events.close();
+  }
+
+  lost(): boolean {
+    return Atomics.load(this.statusFlags, STATUS_LOST) === 1;
+  }
+
+  waitForLoss(deadlineMs: number): boolean {
+    for (;;) {
+      if (this.lost()) return true;
+      const remaining = deadlineMs - Date.now();
+      if (remaining <= 0) return false;
+      Atomics.wait(
+        this.statusFlags,
+        STATUS_LOST,
+        0,
+        Number.isFinite(remaining) ? remaining : undefined,
+      );
+    }
+  }
+
+  pausedBy(): bigint | null {
+    if (Atomics.load(this.statusFlags, STATUS_PAUSED) !== 1) return null;
+    return new BigInt64Array(this.status, NOTICE_CONN_OFFSET, 1)[0]!;
+  }
+
+  lostAtMs(): number {
+    return new Float64Array(this.status, LOST_AT_OFFSET, 1)[0]!;
+  }
+
+  onLost(handler: () => void): void {
+    this.events.on("message", handler);
+    this.events.unref();
+  }
+}
+
 // ConnectResult is one connection attempt's outcome: a connected client, or an error the election may
 // retry (a failed connect or a dropped connection) or must report (the owner refused hello).
 export type ConnectResult = { ok: true } | { ok: false; retry: boolean; error: EngineError };
@@ -148,8 +236,8 @@ export class PageClient implements PageClientHandle {
   // (0 when none).
   private gateHeld = false;
   private writeTxid = 0n;
-  private readonly channel: BlockingChannel;
-  private readonly conn = ++nextConn;
+  // link is the connection's transport: the socket worker, or the simulator's in-memory network.
+  private readonly link: ClientLink;
   private nextId = 0;
   // broken is the sticky failure after the connection is lost (08006) or a fatal error.
   private broken: EngineError | null = null;
@@ -159,58 +247,36 @@ export class PageClient implements PageClientHandle {
   // discard holds the request ids whose replies nobody waits for (a fire-and-forget
   // request_ownership); they are dropped when they arrive.
   private readonly discard = new Set<number>();
-  // The status buffer the socket worker writes (client_worker.ts), and the event port it announces the
-  // connection's end on; attached is set once both went to the worker.
-  private readonly status = new SharedArrayBuffer(STATUS_BYTES);
-  private readonly statusFlags = new Int32Array(this.status, 0, 2);
-  private readonly events: MessagePort;
-  private readonly remoteEvents: MessagePort;
-  private attached = false;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, link: ClientLink = new WorkerLink()) {
     this.dbPath = dbPath;
-    this.channel = socketWorker.acquire();
-    const { port1, port2 } = new MessageChannel();
-    this.events = port1;
-    this.remoteEvents = port2;
-    this.events.unref();
+    this.link = link;
   }
 
   // onLost installs the handler run (on the event loop) when the connection ends.
   onLost(handler: () => void): void {
-    this.events.on("message", handler);
-    this.events.unref();
+    this.link.onLost(handler);
   }
 
-  // lost reports whether the connection has ended (noticed by the socket worker or by this thread).
+  // lost reports whether the connection has ended (noticed by the link or by this thread).
   lost(): boolean {
-    return this.broken !== null || Atomics.load(this.statusFlags, STATUS_LOST) === 1;
+    return this.broken !== null || this.link.lost();
   }
 
   // waitForLoss blocks until the connection ends or deadlineMs (Date.now() scale; Infinity: no
   // deadline) passes; it reports whether the connection ended.
   waitForLoss(deadlineMs: number): boolean {
-    for (;;) {
-      if (this.lost()) return true;
-      const remaining = deadlineMs - Date.now();
-      if (remaining <= 0) return false;
-      Atomics.wait(
-        this.statusFlags,
-        STATUS_LOST,
-        0,
-        Number.isFinite(remaining) ? remaining : undefined,
-      );
-    }
+    if (this.broken !== null) return true;
+    return this.link.waitForLoss(deadlineMs);
   }
 
   // handoffPauseUntil is when this client's handoff pause ends (README §6.5; 0: not paused): a
   // yield-begun notice naming another connection pauses presence tries for HANDOFF_PAUSE_MS after the
   // connection ends.
   handoffPauseUntil(): number {
-    if (Atomics.load(this.statusFlags, STATUS_PAUSED) !== 1) return 0;
-    const requester = new BigInt64Array(this.status, NOTICE_CONN_OFFSET, 1)[0]!;
-    if (requester === this.connectionId) return 0;
-    const lostAt = new Float64Array(this.status, LOST_AT_OFFSET, 1)[0]!;
+    const requester = this.link.pausedBy();
+    if (requester === null || requester === this.connectionId) return 0;
+    const lostAt = this.link.lostAtMs();
     return (lostAt > 0 ? lostAt : Date.now()) + HANDOFF_PAUSE_MS;
   }
 
@@ -220,15 +286,7 @@ export class PageClient implements PageClientHandle {
     this.broken = null;
     this.nextId = 0;
     this.pageSize = 0;
-    const request: ClientRequest = { op: "connect", conn: this.conn, endpoint };
-    let answer: ClientAnswer;
-    if (this.attached) answer = this.channel.request(request) as ClientAnswer;
-    else {
-      this.attached = true;
-      request.status = this.status;
-      request.events = this.remoteEvents;
-      answer = this.channel.request(request, [this.remoteEvents]) as ClientAnswer;
-    }
+    const answer = this.link.connect(endpoint);
     if (!("ok" in answer)) {
       return { ok: false, retry: true, error: connectionLost("lost" in answer ? answer.lost : "") };
     }
@@ -243,13 +301,13 @@ export class PageClient implements PageClientHandle {
         clientName: "jed-ts",
       });
     } catch (error) {
-      this.channel.post({ op: "disconnect", conn: this.conn } as ClientRequest);
+      this.link.disconnect();
       const e = error as EngineError;
       // A full owner (53300) is retried by a re-election; the election decides.
       return { ok: false, retry: e.code() === "08006" || e.code() === "53300", error: e };
     }
     if (reply.kind !== "hello_ok" || !pageSizeValid(reply.pageSize)) {
-      this.channel.post({ op: "disconnect", conn: this.conn } as ClientRequest);
+      this.link.disconnect();
       return {
         ok: false,
         retry: false,
@@ -275,7 +333,7 @@ export class PageClient implements PageClientHandle {
   // a frame answering no waiting request breaks the client (a fatal error for a reply-less request
   // breaks it with that error).
   private awaitReply(id: number): PsMessage {
-    let answer = this.channel.wait() as ClientAnswer;
+    let answer = this.link.wait();
     for (;;) {
       if ("lost" in answer) {
         this.unsent = answer.unsent === true;
@@ -300,10 +358,7 @@ export class PageClient implements PageClientHandle {
         (decoded.requestId === 0 && reply.kind === "notice") ||
         (decoded.requestId !== id && this.discard.delete(decoded.requestId))
       ) {
-        answer = this.channel.request({
-          op: "next",
-          conn: this.conn,
-        } as ClientRequest) as ClientAnswer;
+        answer = this.link.next();
         continue;
       }
       if (decoded.requestId !== id) {
@@ -328,9 +383,9 @@ export class PageClient implements PageClientHandle {
   private send(m: PsMessage, reply: boolean): number {
     this.nextId = this.nextId === 0xffff_ffff ? 1 : this.nextId + 1;
     const frame = encodeFrame(this.nextId, m, this.pageSize);
-    this.channel.post({ op: "send", conn: this.conn, frame, reply } as ClientRequest);
+    this.link.send(frame, reply);
     if (!reply) {
-      const answer = this.channel.wait() as ClientAnswer;
+      const answer = this.link.wait();
       if ("lost" in answer) this.broken = connectionLost(answer.lost);
     }
     return this.nextId;
@@ -338,7 +393,7 @@ export class PageClient implements PageClientHandle {
 
   private breakWith(error: EngineError): void {
     this.broken = error;
-    this.channel.post({ op: "disconnect", conn: this.conn } as ClientRequest);
+    this.link.disconnect();
   }
 
   // request runs one request/reply round trip for a caller outside the engine paths (commit
@@ -561,6 +616,12 @@ export class PageClient implements PageClientHandle {
     if (this.broken === null && !this.closed) this.send({ kind: "end_read", txid: v }, false);
   }
 
+  // disconnect drops the connection without breaking the client, which notices at its next request
+  // (the simulator's `disconnect` step).
+  disconnect(): void {
+    this.link.disconnect();
+  }
+
   // close drops the connection (the owner releases every pin and the gate at EOF) and stops the socket
   // thread.
   close(): void {
@@ -569,9 +630,7 @@ export class PageClient implements PageClientHandle {
     if (this.broken === null) {
       this.broken = engineError("connection_failure", "the page-service connection is closed");
     }
-    this.channel.post({ op: "forget", conn: this.conn } as ClientRequest);
-    socketWorker.release();
-    this.events.close();
+    this.link.close();
   }
 }
 

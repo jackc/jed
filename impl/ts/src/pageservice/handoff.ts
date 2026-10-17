@@ -10,6 +10,8 @@ import { closeSync, openSync } from "node:fs";
 import { FileCoordinator, osLocks } from "../coordinator.ts";
 import type { Environment } from "../environment.ts";
 import type { Engine } from "../executor.ts";
+import type { FileHost } from "../filehost.ts";
+import type { LockHost } from "../lockhost.ts";
 import type { ServiceHandoffHost, ServiceRole } from "../shared.ts";
 import type { ClientOpenOptions } from "./client.ts";
 import { electService } from "./election.ts";
@@ -32,6 +34,18 @@ export type HandoffOptions = {
   maxConnections?: number;
 };
 
+// HandoffHosts are a handle's hosts under the page service: its lock host (the OS by default), its
+// file host (null: the OS), a hook that gives an elected client's engine the handle's spill and file
+// hosts, and whether a client re-elects in the background as soon as its connection ends. The
+// deterministic simulator substitutes its own and turns background off, so every re-election runs at
+// a transaction begin, in trace order.
+export type HandoffHosts = {
+  lock?: LockHost;
+  files?: FileHost | null;
+  adoptClient?: (engine: Engine) => void;
+  background?: boolean;
+};
+
 export class ServiceHandoff implements ServiceHandoffHost {
   readonly path: string;
   readonly ownership: Ownership;
@@ -45,6 +59,10 @@ export class ServiceHandoff implements ServiceHandoffHost {
   // openOwner opens the file as an owner opening it does (recovery and the stabilization a writable
   // handle performs), with the handle's open options.
   private readonly openOwner: () => Engine;
+  readonly host: LockHost;
+  private readonly files: FileHost | null;
+  private readonly adoptClient: ((engine: Engine) => void) | null;
+  readonly background: boolean;
 
   constructor(
     path: string,
@@ -54,8 +72,13 @@ export class ServiceHandoff implements ServiceHandoffHost {
     clientOpen: ClientOpenOptions,
     environment: Environment,
     openOwner: () => Engine,
+    hosts: HandoffHosts = {},
   ) {
     this.path = path;
+    this.host = hosts.lock ?? osLocks;
+    this.files = hosts.files ?? null;
+    this.adoptClient = hosts.adoptClient ?? null;
+    this.background = hosts.background ?? true;
     this.ownership = options.ownership ?? "prefer";
     this.yieldGraceMs = options.yieldGraceMs ?? DEFAULT_YIELD_GRACE_MS;
     this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
@@ -76,17 +99,19 @@ export class ServiceHandoff implements ServiceHandoffHost {
   // elect runs the election (an open's when first, else a re-election that keeps the path claim):
   // an elected client arrives opened; an elected owner holds presence EX.
   electAtOpen(): ReturnType<typeof electService> {
-    return electService(osLocks, this.path, this.timeoutMs, this.readOnly, {
+    const won = electService(this.host, this.path, this.timeoutMs, this.readOnly, {
       never: this.ownership === "never",
       pauseUntilMs: 0,
       reelect: false,
       open: this.clientOpen,
       environment: this.environment,
     });
+    if (won.engine !== null) this.adoptClient?.(won.engine);
+    return won;
   }
 
   elect(pauseUntilMs: number): ServiceRole {
-    const won = electService(osLocks, this.path, this.timeoutMs, this.readOnly, {
+    const won = electService(this.host, this.path, this.timeoutMs, this.readOnly, {
       never: this.ownership === "never",
       pauseUntilMs,
       reelect: true,
@@ -94,6 +119,7 @@ export class ServiceHandoff implements ServiceHandoffHost {
       environment: this.environment,
     });
     if (won.client !== null) {
+      this.adoptClient?.(won.engine);
       return {
         kind: "client",
         engine: won.engine,
@@ -103,7 +129,7 @@ export class ServiceHandoff implements ServiceHandoffHost {
       };
     }
     // Promotion: presence EX is held; open the file as an owner and serve it.
-    const coordinator = FileCoordinator.fromElection(osLocks, this.path, won.owner);
+    const coordinator = FileCoordinator.fromElection(this.host, this.path, won.owner);
     return this.startOwner(coordinator);
   }
 
@@ -118,7 +144,7 @@ export class ServiceHandoff implements ServiceHandoffHost {
       throw error;
     }
     try {
-      const service = ServiceOwner.start(engine, this.path, this.limits);
+      const service = ServiceOwner.start(engine, this.path, this.limits, this.host);
       return { kind: "owner", engine, service, client: null, coordinator };
     } catch (error) {
       engine.paging?.close();
@@ -130,7 +156,8 @@ export class ServiceHandoff implements ServiceHandoffHost {
 
   canOpenReadWrite(): boolean {
     try {
-      closeSync(openSync(this.path, "r+"));
+      if (this.files !== null) this.files.openStore(this.path, true, false).close();
+      else closeSync(openSync(this.path, "r+"));
       return true;
     } catch {
       return false;
@@ -138,6 +165,15 @@ export class ServiceHandoff implements ServiceHandoffHost {
   }
 
   releasePath(): void {
-    osLocks.releasePath(this.path);
+    this.host.releasePath(this.path);
+  }
+
+  // nowMicros and pause are the lock host's clock and poll pause, which a drain reads.
+  nowMicros(): number {
+    return this.host.nowMicros();
+  }
+
+  pause(): void {
+    this.host.pause();
   }
 }

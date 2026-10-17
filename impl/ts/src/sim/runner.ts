@@ -6,23 +6,28 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import type { BlockStore } from "../blockstore.ts";
 import { parseCommitMeta } from "../commit_manifest.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "../costs.ts";
 import { EngineError, engineError } from "../errors.ts";
 import type { Engine } from "../executor.ts";
 // The Node file host registers the file compactor, the attach opener, and the directory barrier the
 // engine reaches through Engine.fileHost (here the simulated filesystem).
-import { close as closeEngine, createVia } from "../file.ts";
+import { close as closeEngine, createVia, openServiceWith } from "../file.ts";
 import { loadEnginePaged } from "../format.ts";
 import { Pager } from "../pager.ts";
+import type { PageClient } from "../pageservice/client.ts";
+import { readFreeListChain } from "../pageservice/delta.ts";
+import { ServiceHandoff } from "../pageservice/handoff.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import { persistImpl } from "../persist.ts";
 import { Environment } from "../environment.ts";
 import { type ClockSource, osRandomSource, type RandomSource, SeededRandom } from "../seam.ts";
 import { attachFile, Database, type Session } from "../shared.ts";
 import { CheckError, checkImage, checkLive as checkLiveDatabase } from "./check.ts";
-import { SimDeadlock, type SimLockHost, type SimLockTable } from "./locks.ts";
+import { SimDeadlock, SimLockHost, SimLockTable } from "./locks.ts";
 import { LANE_SESSION, MAIN_FILE, SimFS, type SimFault } from "./disk.ts";
+import { SimNet } from "./net.ts";
 import {
   atoi,
   compareUtf8,
@@ -91,6 +96,7 @@ export function parseTrace(text: string): SimTrace {
       case "spawn":
       case "exit":
       case "kill":
+      case "disconnect":
         if (f.length !== 2) throw new Error(`line ${n + 1}: ${st.kind} p<N>`);
         st.pid = parsePid(f[1]!, n + 1);
         break;
@@ -197,6 +203,8 @@ function faultOf(st: SimStep): SimFault {
       return { ...f, kind: "enospc" };
     case "spill_error":
       return { ...f, kind: "spill_error", p: intParam(st, "p") };
+    case "disconnect":
+      return { ...f, kind: "disconnect", nth: intParam(st, "nth") };
   }
   const params = [...st.params].map(([k, v]) => `${k}:${v}`).join(" ");
   throw new CheckError(`line ${st.line}: unsupported fault ${st.mode} map[${params}]`);
@@ -307,9 +315,15 @@ type SimSession = {
   pid: number; // the process the session lives in
 };
 
-// SimProc is one simulated process: a Database over the shared simulated filesystem, and in a shared
-// trace its own lock host (S5).
+// SimProc is one simulated process: a Database over the shared simulated filesystem, and in a service
+// trace its own lock host (S8).
 type SimProc = { pid: number; db: Database; host: SimLockHost | null };
+
+// SIM_SERVICE_GRACE_MS is a simulated owner's shutdown grace: its clients' pinned readers live in other
+// processes, which no single step can end, so a closing owner always waits out the grace.
+const SIM_SERVICE_GRACE_MS = 1000;
+// SIM_FILE_LOCK_TIMEOUT_MS is every simulated process's open timeout (the engine default).
+const SIM_FILE_LOCK_TIMEOUT_MS = 5000;
 
 // SimGrowth is what a commit left behind, for the next commit's bounded-growth check.
 type SimGrowth = {
@@ -357,6 +371,8 @@ class SimDB {
 // The internals of a Database the runner reads: the published roots and each domain's storage owner.
 type CoreView = {
   committed: { txid: bigint };
+  service: object | null;
+  client: PageClient | null;
   attached: Map<string, { txid: bigint }>;
   storage: Engine;
   attachments: Map<string, { storage: Engine }>;
@@ -450,9 +466,11 @@ export class SimRunner {
   private db: Database | null = null; // the database of the process running the current step
   private sessions = new Map<string, SimSession>();
 
-  // Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
-  // coordination. Multi-process traces are unsupported until they return with the page service.
-  private shared: boolean;
+  // Processes (simulation-testing.md §14 S8). A single-process trace has only p0, opened without
+  // coordination; a `# processes: service` trace opens every process under the page service, over the
+  // simulated lock host and network: the first is the owner, later ones its clients.
+  private service: boolean;
+  private net = new SimNet();
   private procs = new Map<number, SimProc>();
   private cur = 0; // the process running the current step
   private locks: SimLockTable | null = null;
@@ -491,9 +509,7 @@ export class SimRunner {
     let sector = atoi(tr.header.get("sector"));
     if (sector <= 0) sector = SECTOR_DEFAULT;
     this.fs = new SimFS(this.seed, sector, ps);
-    // Multi-process traces return with the page service (simulation-testing.md); run() rejects
-    // them.
-    this.shared = false;
+    this.service = tr.header.get("processes") === "service";
   }
 
   private fail(step: number, msg: string): void {
@@ -549,18 +565,87 @@ export class SimRunner {
     this.database.attach(name, attachFile(this.dbs.get(name)!.file, { locking: "none" }), false);
   }
 
-  // openProc starts process pid.
+  // openProc starts process pid. A service trace elects it through the simulated lock host and
+  // network, exactly as openDatabase does through the OS host.
   private openProc(pid: number): void {
-    const db = this.openDatabase();
-    this.procs.set(pid, { pid, db, host: null });
+    let host: SimLockHost | null = null;
+    let db: Database;
+    if (this.service) {
+      if (this.locks === null) {
+        this.locks = new SimLockTable({
+          get: () => this.clock,
+          advance: (micros) => {
+            this.clock += micros;
+          },
+        });
+      }
+      host = new SimLockHost(this.locks, pid, this.net);
+      db = this.openServiceProc(pid, host);
+    } else db = this.openDatabase();
+    this.procs.set(pid, { pid, db, host });
     this.cur = pid;
     this.db = db;
+  }
+
+  // openServiceProc opens process pid under the page service (S8): its own lock host over the shared
+  // lock table and network, the simulated filesystem and spill sink, and no background re-election, so
+  // a client re-elects at its next transaction begin, in trace order. Every owner limit that would
+  // start a timer is off.
+  private openServiceProc(pid: number, host: SimLockHost): Database {
+    const handoff = new ServiceHandoff(
+      MAIN_FILE,
+      {
+        idleInTransactionTimeoutMs: 0,
+        idleSessionTimeoutMs: 0,
+        shutdownGraceMs: SIM_SERVICE_GRACE_MS,
+      },
+      false,
+      SIM_FILE_LOCK_TIMEOUT_MS,
+      { cacheBytes: this.cacheBytes > 0 ? this.cacheBytes : undefined },
+      this.environment,
+      () => this.openEngine(this.fs.openStore(MAIN_FILE, false, false)),
+      {
+        lock: host,
+        files: this.fs,
+        adoptClient: (e) => {
+          e.fileHost = this.fs;
+          e.spillSink = this.fs.spillSink();
+        },
+        background: false,
+      },
+    );
+    let db: Database;
+    try {
+      db = openServiceWith(handoff);
+    } catch (e) {
+      this.locks!.release(pid);
+      this.net.kill(pid);
+      throw e;
+    }
+    if (this.maxStorageBytes > 0n) db.setMaxStorageBytes("main", this.maxStorageBytes);
+    return db;
+  }
+
+  // ownerPid is the running process that owns the database under the page service, or -1.
+  private ownerPid(): number {
+    for (const pid of this.livePids()) {
+      if (coreOf(this.procs.get(pid)!.db).service !== null) return pid;
+    }
+    return -1;
   }
 
   private openDatabase(): Database {
     const main = this.fs.main();
     if (main === undefined) throw engineError("io_error", "the database file is gone");
-    const pager = Pager.fromStore(main);
+    const db = Database.fromEngine(this.openEngine(main), null);
+    if (this.maxStorageBytes > 0n) db.setMaxStorageBytes("main", this.maxStorageBytes);
+    return db;
+  }
+
+  // openEngine opens the main database's engine over store through the ordinary demand-paged loader,
+  // with the simulated filesystem as its file host and spill sink.
+  private openEngine(store: BlockStore): Engine {
+    const pager = Pager.fromStore(store);
     const cache = this.cacheBytes > 0 ? this.cacheBytes : DEFAULT_CACHE_BYTES;
     const e = loadEnginePaged(
       new SharedPaging(pager, cacheLeaves(cache, pager.pageSize)),
@@ -572,14 +657,12 @@ export class SimRunner {
     e.persistHook = persistImpl;
     // Spill and temp-table spill scratch files, whose operations can fail.
     e.spillSink = this.fs.spillSink();
-    const db = Database.fromEngine(e, null);
-    if (this.maxStorageBytes > 0n) db.setMaxStorageBytes("main", this.maxStorageBytes);
-    return db;
+    return e;
   }
 
   run(): void {
     const processes = this.tr.header.get("processes");
-    if (processes !== undefined && processes !== "") {
+    if (processes !== undefined && processes !== "" && processes !== "service") {
       this.violation = `unsupported processes mode ${processes}`;
       return;
     }
@@ -659,6 +742,19 @@ export class SimRunner {
       case "tick":
         this.emit(`{"i":${i},"op":"tick"}`);
         return true;
+      case "disconnect": {
+        // The process's connection to the owner ends (S8): both ends see end of stream.
+        const p = this.procs.get(st.pid);
+        const client = p !== undefined ? coreOf(p.db).client : null;
+        if (client === null) {
+          this.emit(`{"i":${i},"op":"disconnect","pid":${st.pid},"skip":true}`);
+          return true;
+        }
+        client.disconnect();
+        this.net.pump();
+        this.emit(`{"i":${i},"op":"disconnect","pid":${st.pid}}`);
+        return true;
+      }
       case "exit": {
         if (!this.procs.has(st.pid)) {
           this.emit(`{"i":${i},"op":"exit","pid":${st.pid},"skip":true}`);
@@ -715,7 +811,9 @@ export class SimRunner {
         return false;
       }
     }
-    this.fs.beginStep(i, armed);
+    const diskFault = armed !== null && armed.kind === "disconnect" ? null : armed;
+    this.net.beginStep(armed !== null && armed.kind === "disconnect" ? armed.nth : 0);
+    this.fs.beginStep(i, diskFault);
     // Entropy drawn during this step comes from its session's stream (none outside a session step).
     this.random.active = this.sessions.get(st.sid)?.random ?? null;
     switch (st.kind) {
@@ -748,6 +846,7 @@ export class SimRunner {
         if (!this.stepReopen(i)) return false;
         break;
     }
+    if (this.service) this.net.pump();
     if (this.violation !== "") return false;
     // A completed barrier made every earlier write durable: the generation a database published when
     // the step began can no longer be lost (§8.2).
@@ -757,16 +856,23 @@ export class SimRunner {
       if (f?.barrierOK && s0 !== undefined && s0 > d.floor) d.floor = s0;
     }
     if (armed === null) return true;
+    if (armed.kind === "disconnect") {
+      // A lost connection ends no process: its client re-elects at its next begin.
+      const how = this.net.disconnected ? "frame" : "end";
+      this.emit(`{"i":${i},"op":"disconnected","fired":${goQuote(how)}}`);
+      return true;
+    }
     // Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
     const fired = this.fs.fired === "" ? "end" : this.fs.fired;
     if (armed.kind === "power_loss") {
       this.fs.powerLoss(i, armed.survive, armed.tear);
       return this.recover(i, fired);
     }
-    // In a shared trace any other fault kills only the process running the step; the others keep
-    // running over the same kernel state.
-    if (this.shared && this.procs.size > 1) {
-      const dead = this.cur;
+    // In a service trace any other fault kills the owner, the only process that touches the file,
+    // whichever process's step drove its I/O; the others keep running over the same kernel state.
+    if (this.service && this.procs.size > 1) {
+      let dead = this.ownerPid();
+      if (dead < 0) dead = this.cur;
       this.dropProc(dead);
       this.fs.processDeath();
       this.emit(`{"i":${i},"op":"killed","pid":${dead},"fired":${goQuote(fired)}}`);
@@ -818,7 +924,7 @@ export class SimRunner {
     if (this.workMem > 0) s.setWorkMem(this.workMem);
     if (this.tempBuffers > 0) s.setTempBuffers(this.tempBuffers);
     if (this.maxQueryMemory > 0n) s.setMaxQueryMemoryBytes(this.maxQueryMemory);
-    if (this.shared) {
+    if (this.service) {
       const d = this.digest(s, this.main());
       if (!this.observe(i, "session " + st.sid, s.version, d)) return;
     }
@@ -879,6 +985,9 @@ export class SimRunner {
 
   // checkLive runs the live integrity checker with read faults suspended, like every oracle read.
   private checkLive(): void {
+    // A page client reads pages only under a pinned transaction; its trees are the owner's pages,
+    // which the owner's own live check covers.
+    if (coreOf(this.database).client !== null) return;
     this.fs.oracle = true;
     try {
       checkLiveDatabase(this.database);
@@ -938,7 +1047,8 @@ export class SimRunner {
 
   // committedView is the version and digest of database d a fresh read session sees.
   private committedView(d: SimDB): { v: bigint; dg: string | null } {
-    const rs = this.database.readSession();
+    const rs = this.readSession();
+    if (rs === null) return { v: this.dbVersion(d), dg: null };
     try {
       const dg = this.digest(rs, d);
       return { v: this.dbVersion(d), dg };
@@ -947,8 +1057,23 @@ export class SimRunner {
     }
   }
 
+  // readSession opens a fresh read session, or records why it could not and returns null: the TS
+  // session begins (and, under the page service, may re-elect) at open, where Go's defers that to its
+  // first read, which the digest then reports.
+  private readSession(): Session | null {
+    try {
+      return this.database.readSession();
+    } catch (e) {
+      if (!isEngineError(e)) throw e;
+      this.digestErr = e;
+      this.lastDigestText = "";
+      return null;
+    }
+  }
+
   private committedDigest(d: SimDB): string | null {
-    const rs = this.database.readSession();
+    const rs = this.readSession();
+    if (rs === null) return null;
     try {
       return this.digest(rs, d);
     } finally {
@@ -959,7 +1084,7 @@ export class SimRunner {
   // quiet reports whether the commit being checked ran with nothing that may hold reclamation back: no
   // other session (a reader pins its snapshot), no other process, and no fault.
   private quiet(): boolean {
-    return !this.shared && this.sessions.size === 0 && this.fs.fault === null;
+    return !this.service && this.sessions.size === 0 && this.fs.fault === null;
   }
 
   private stepCommit(i: number, st: SimStep): void {
@@ -1012,9 +1137,13 @@ export class SimRunner {
     }
     const versions = new Map<string, bigint>();
     for (const d of dbs) versions.set(d.name, this.dbVersion(d));
+    let role = "";
+    if (this.service) {
+      role = coreOf(this.database).client !== null ? `,"role":"client"` : `,"role":"owner"`;
+    }
     this.emit(
       `{"i":${i},"op":"commit","sid":${goQuote(st.sid)},"version":${versions.get("main")}` +
-        `${this.versionsJSON(versions)}}`,
+        `${this.versionsJSON(versions)}${role}}`,
     );
     const quiet = this.quiet();
     for (let k = 0; k < dbs.length; k++) {
@@ -1038,7 +1167,12 @@ export class SimRunner {
           );
           return;
         }
-        const published = this.committedDigest(d);
+        let published = this.committedDigest(d);
+        if (published === null && this.service && this.fs.dead) {
+          // The owner died later in this step (its maintenance commit hit the fault), so nothing can be
+          // read back through it; the acknowledged commit is checked by the recovery that follows.
+          published = inflight.digest;
+        }
         if (published === null || published !== inflight.digest) {
           this.diagnostics = new Map([
             ["before-commit.txt", inflight.text],
@@ -1057,6 +1191,10 @@ export class SimRunner {
         d.floor = now; // acknowledged under synchronous = on (§8.2)
         this.checkGrowth(i, d, quiet);
         if (this.violation !== "") return;
+        if (this.service && d.name === "main") {
+          this.serviceCommitted(i, d, base, now, inflight.digest);
+          if (this.violation !== "") return;
+        }
       } else {
         this.fail(i, `commit jumped ${d.name} from version ${base} to ${now}`);
         return;
@@ -1067,6 +1205,47 @@ export class SimRunner {
     } catch (e) {
       this.fail(i, "after commit: " + errText(e));
     }
+  }
+
+  // serviceCommitted runs the page-service checks after a commit of main published version now over
+  // base (S8). A page client's commit must obey the commit-role rule (page-service.md §6): it never
+  // rebuilds the free list, so the free list it persists is a subset of its base's. And an owner may
+  // follow a client's commit with a maintenance commit — the unchanged snapshot at the next versions —
+  // which joins the history with the same contents.
+  private serviceCommitted(i: number, d: SimDB, base: bigint, now: bigint, digest: string): void {
+    if (coreOf(this.database).client === null) return;
+    const image = this.image(d);
+    const before = freeListOf(image, this.pageSize, base);
+    const after = freeListOf(image, this.pageSize, now);
+    if (before !== null && after !== null) {
+      const was = new Set(before);
+      for (const pg of after) {
+        if (!was.has(pg)) {
+          this.fail(
+            i,
+            `commit-role rule: a page client's commit (version ${now}) freed page ${pg}, which its ` +
+              `base's free list does not hold`,
+          );
+          return;
+        }
+      }
+    }
+    if (this.fs.dead) {
+      // The owner died later in this step; it may have been writing a maintenance commit, which
+      // recovery may select: the same contents at the next version.
+      d.addHistory(now + 1n, digest);
+      if (now + 1n > d.maxAttempted) d.maxAttempted = now + 1n;
+      return;
+    }
+    const owner = this.ownerPid();
+    if (owner < 0) return;
+    const ov = versionOf(this.procs.get(owner)!.db);
+    if (ov <= now) return;
+    for (let v = now + 1n; v <= ov; v++) d.addHistory(v, digest);
+    d.version = ov;
+    if (ov > d.maxAttempted) d.maxAttempted = ov;
+    d.floor = ov;
+    this.emit(`{"i":${i},"op":"maintenance","version":${ov}}`);
   }
 
   // --- bounded growth (simulation-testing.md §8.3) ----------------------------------------------
@@ -1101,7 +1280,7 @@ export class SimRunner {
   //     written by the commit itself (its manifest and free-list pages);
   //   - the next quiet commit reuses that free list before it grows the file.
   private checkGrowth(i: number, d: SimDB, quiet: boolean): void {
-    if (this.shared) return;
+    if (this.service) return;
     const meta = metaOf(this.image(d), this.pageSize, d.version);
     if (meta === null) return;
     const pc = meta.pageCount;
@@ -1159,11 +1338,18 @@ export class SimRunner {
     } else {
       // Snapshot isolation: a reader still sees exactly the version of every database it pinned,
       // however many commits, reclamations, and page reuses happened since.
+      let lost = false;
       if (!ss.write) {
         for (const d of this.order()) {
           const pin = ss.pins.get(d.name);
           if (pin === undefined) continue;
           const dg = this.digest(ss.s, d);
+          if (dg === null && this.service && errCode(this.digestErr) === "08006") {
+            // Under the page service a read transaction open across a change of its process's role
+            // fails 08006 (spec/pageservice/README.md §6.5): it never sees other contents.
+            lost = true;
+            break;
+          }
           if (dg === null || !d.inHistory(pin, dg)) {
             this.fail(i, `isolation: reader ${st.sid} no longer sees version ${pin} of ${d.name}`);
             break;
@@ -1171,6 +1357,10 @@ export class SimRunner {
         }
       }
       closeQuietly(ss.s);
+      if (lost) {
+        this.emit(`{"i":${i},"op":${goQuote(st.kind)},"sid":${goQuote(st.sid)},"lost":true}`);
+        return;
+      }
     }
     this.emit(`{"i":${i},"op":${goQuote(st.kind)},"sid":${goQuote(st.sid)}}`);
   }
@@ -1233,7 +1423,7 @@ export class SimRunner {
   // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
   // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
   private stepAttach(i: number, name: string): void {
-    if (this.shared) {
+    if (this.service) {
       this.fail(i, "attach is single-process only");
       return;
     }
@@ -1290,7 +1480,7 @@ export class SimRunner {
     let mainLine = "";
     for (const d of this.order()) {
       const { v, dg } = this.committedView(d);
-      if (this.shared && d.name === "main") {
+      if (this.service && d.name === "main") {
         // Another process may have died leaving a newer complete generation this one now adopts.
         if (!this.observe(i, "check", v, dg)) return;
       } else if (dg === null || v !== d.version || dg !== d.lastDigest) {
@@ -1350,7 +1540,7 @@ export class SimRunner {
       }
       const v = this.dbVersion(d);
       const dg = this.committedDigest(d);
-      if (this.shared && d.name === "main") {
+      if (this.service && d.name === "main") {
         // A process killed mid-commit may have left a complete generation no survivor began on yet.
         if (!this.observe(i, "reopened p0", v, dg)) return false;
       } else if (v !== d.version || dg === null || dg !== d.lastDigest) {
@@ -1598,6 +1788,7 @@ export class SimRunner {
     } finally {
       this.locks?.release(pid);
       this.procs.delete(pid);
+      if (this.service) this.net.kill(pid);
     }
   }
 
@@ -1608,6 +1799,8 @@ export class SimRunner {
     this.locks?.release(pid);
     this.procs.delete(pid);
     if (this.cur === pid) this.db = null;
+    // The kernel closes a dead process's sockets.
+    if (this.service) this.net.kill(pid);
   }
 
   // observe checks the version and contents a process sees of main when it begins (S5): in a shared
@@ -1718,6 +1911,30 @@ function simQuery(
   const h = new Fnv64();
   h.update(utf8(rendered.join("\x1e")));
   return { n: rendered.length, affected: affected ?? -1, hash: h.hex(), cost };
+}
+
+// freeListOf reads the free list the meta slot holding version v persists, from a file image.
+function freeListOf(image: Uint8Array | null, ps: number, v: bigint): number[] | null {
+  if (image === null) return null;
+  for (let slot = 0; slot < 2; slot++) {
+    const off = slot * ps;
+    if (off + ps > image.length) continue;
+    const m = parseCommitMeta(image.subarray(off, off + ps), ps, 0xffff_ffff);
+    if (m === null || m.txid !== v) continue;
+    try {
+      return readFreeListChain(
+        (p) => {
+          if ((p + 1) * ps > image.length) throw new Error("short image");
+          return image.subarray(p * ps, (p + 1) * ps);
+        },
+        m.freeListHead,
+        m.pageCount,
+      );
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 // imageHash folds the logical image — the pages below the high-water — into FNV-1a 64 (§8.4).

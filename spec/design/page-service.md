@@ -1,6 +1,6 @@
 # Page service — one owner process, page-level clients — design
 
-> **Status: RATIFIED DESIGN (2026-10-16); phases 1–3 landed, phase 4 landing, 5–7 to come (§16).** This document
+> **Status: RATIFIED DESIGN (2026-10-16); phases 1–4 landed, 5–7 to come (§16).** This document
 > replaced the earlier shared multi-process protocol with a single **owner** process that alone
 > touches the database file and serves **pages** to every other process over a local endpoint, and
 > extends the same service over SSH for remote access, backup, and replication. The message catalog,
@@ -657,11 +657,11 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
    gate, reuse grant, `commit` with validation, owner adoption, the reclamation rule, `commit_status`,
    the idle-in-transaction timeout ([spec/pageservice/README.md](../pageservice/README.md) §3.5, §6.4).
    File attachments under the service, with the cross-owner gate order of §5.5, follow separately.
-4. **Handoff**: promotion, yield, graceful close, timeouts
-   ([spec/pageservice/README.md](../pageservice/README.md) §6.5), the process-corpus rewrite, retiring
-   shared mode and the `shared` option, and the new bundle marker have landed (file attachments are
-   owner-only non-serving owners until they join the service); simulation testing of an owner and its
-   clients is in progress.
+4. ✅ **Handoff** (landed): promotion, yield, graceful close, timeouts
+   ([spec/pageservice/README.md](../pageservice/README.md) §6.5); the process-corpus rewrite;
+   simulation testing of an owner and its clients ([simulation-testing.md](simulation-testing.md) §14
+   S8); retiring shared mode and the `shared` option; the new bundle marker. File attachments are
+   owner-only non-serving owners until they join the service.
 5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree
    fetch.
 6. **Backup**: page-identical and compacted forms.

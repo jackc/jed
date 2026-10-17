@@ -7,10 +7,11 @@
 //! processes' presence probes and advances the simulated clock, so the holder can react and
 //! deadlines expire in simulated time.
 //!
-//! Unused while multi-process traces are unsupported: they return with the page service, whose
-//! owner and clients will run over this host.
+//! The host also carries the page service's owner record, endpoints, and connections, over the
+//! simulated network ([`super::net`]), for the owner and page clients of a `service` trace (S8).
 #![allow(dead_code)]
 
+use super::net::SimNet;
 use crate::coordinator::{LockFiles, LockHandle, LockHost};
 use crate::error::Result;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -110,10 +111,12 @@ pub(crate) struct SimLockHost {
     incarnation: u64,
     /// The process-local open registry.
     claimed: Mutex<HashSet<PathBuf>>,
+    /// The page service's records, endpoints, and connections.
+    net: Arc<SimNet>,
 }
 
 impl SimLockHost {
-    pub(crate) fn new(table: SharedTable, pid: u32) -> SimLockHost {
+    pub(crate) fn new(table: SharedTable, pid: u32, net: Arc<SimNet>) -> SimLockHost {
         let incarnation = {
             let mut t = lock(&table);
             t.next_incarnation += 1;
@@ -126,6 +129,7 @@ impl SimLockHost {
             pid,
             incarnation,
             claimed: Mutex::new(HashSet::new()),
+            net,
         }
     }
 }
@@ -222,5 +226,55 @@ impl LockHost for SimLockHost {
 
     fn pid(&self) -> u32 {
         self.pid
+    }
+
+    fn read_owner_record(&self, db_path: &Path) -> Option<crate::pageservice::codec::OwnerRecord> {
+        self.net.read_owner_record(db_path)
+    }
+
+    fn write_owner_record(
+        &self,
+        db_path: &Path,
+        record: &crate::pageservice::codec::OwnerRecord,
+    ) -> Result<()> {
+        self.net.write_owner_record(db_path, record);
+        Ok(())
+    }
+
+    fn remove_owner_record(&self, db_path: &Path) {
+        self.net.remove_owner_record(db_path);
+    }
+
+    /// Every simulated process runs as one user.
+    fn current_uid(&self, _db_path: &Path) -> Result<u32> {
+        Ok(1000)
+    }
+
+    fn endpoint_path(
+        &self,
+        _db_path: &Path,
+        _uid: u32,
+        incarnation: &crate::pageservice::codec::Id16,
+    ) -> Option<PathBuf> {
+        let hex: String = incarnation[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Some(PathBuf::from(format!("sim-endpoint-{hex}")))
+    }
+
+    fn listen(
+        &self,
+        endpoint: &Path,
+    ) -> std::io::Result<Box<dyn crate::pageservice::net::PsListener>> {
+        Ok(self.net.listen(endpoint, self.pid))
+    }
+
+    fn dial(&self, endpoint: &str) -> std::io::Result<Box<dyn crate::pageservice::net::PsStream>> {
+        self.net.dial(endpoint, self.pid)
+    }
+
+    fn remove_endpoint(&self, endpoint: &Path) {
+        self.net.remove_endpoint(endpoint);
     }
 }

@@ -2524,7 +2524,13 @@ impl Database {
                         ownership: opts.ownership,
                         ..OpenOptions::default()
                     };
-                    return start_service_owner(db, &canonical, coordinator, open_opts);
+                    return start_service_owner(
+                        db,
+                        &canonical,
+                        coordinator,
+                        open_opts,
+                        os_service_hosts(),
+                    );
                 }
                 let db = Database::from_engine_coordinated(engine, coordinator);
                 db.0.storage
@@ -2925,6 +2931,14 @@ impl Database {
 #[cfg(unix)]
 use handoff::{open_service, start_service_owner};
 
+#[cfg(unix)]
+fn os_service_hosts() -> handoff::ServiceHosts {
+    handoff::ServiceHosts::os()
+}
+
+#[cfg(not(unix))]
+fn os_service_hosts() {}
+
 /// Off Unix `Locking::Auto` resolves to a non-serving owner (page-service.md §14), so no handle
 /// serves or becomes a page client.
 #[cfg(not(unix))]
@@ -2933,6 +2947,7 @@ fn start_service_owner(
     _path: &Path,
     _coordinator: FileCoordinator,
     _opts: OpenOptions,
+    _hosts: (),
 ) -> Result<Database> {
     unreachable!("the page service is Unix-only")
 }
@@ -3951,6 +3966,42 @@ impl Database {
             free_pages: st.free_pages.clone(),
             paging: st.paging.clone(),
         }
+    }
+
+    /// The page-service connection of a page-client handle (S8), `None` for an owner or a handle
+    /// outside the page service.
+    #[cfg(unix)]
+    pub(crate) fn sim_page_client(&self) -> Option<Arc<crate::pageservice::client::PsConnection>> {
+        self.0.page_client()
+    }
+
+    /// Whether this handle is the page-service owner (S8).
+    #[cfg(unix)]
+    pub(crate) fn sim_is_owner(&self) -> bool {
+        self.0.service_owner().is_some()
+    }
+
+    /// Open the database at `path` under the page service over the simulator's hosts (S8): the
+    /// election, then the owner or page-client role it wins.
+    #[cfg(unix)]
+    pub(crate) fn sim_open_service(
+        host: Arc<dyn crate::coordinator::LockHost>,
+        files: Arc<dyn crate::filehost::FileHost>,
+        spill: Arc<dyn crate::spillhost::SpillHost>,
+        path: &Path,
+        opts: OpenOptions,
+    ) -> Result<Database> {
+        handoff::open_service_with(
+            handoff::ServiceHosts {
+                host,
+                files: Some(files),
+                spill: Some(spill),
+                background: false,
+            },
+            path,
+            opts,
+            true,
+        )
     }
 
     /// Route MAIN's file operations (compaction, the first commit's directory barrier, opening a

@@ -15,6 +15,35 @@ use crate::error::{EngineError, Result, SqlState};
 /// A positioned write into a file being filled: `(byte offset, bytes)`.
 pub(crate) type WriteAt<'a> = dyn FnMut(u64, &[u8]) -> Result<()> + 'a;
 
+/// Positioned reads of a database file that many threads may issue at once: the page-service
+/// owner's read handle (spec/pageservice/README.md §6.2), independent of the pager's lock.
+pub(crate) trait PageReader: Send + Sync {
+    /// Fill `buf` from byte `offset`.
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()>;
+}
+
+/// A [`PageReader`] over a byte store, serialized by a mutex (a host without positioned reads on a
+/// shared handle — the simulator's).
+struct StoreReader(std::sync::Mutex<Box<dyn BlockStore>>);
+
+impl PageReader for StoreReader {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        let bytes = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read_at(offset, buf.len())?;
+        if bytes.len() != buf.len() {
+            return Err(EngineError::new(
+                SqlState::IoError,
+                "page service read: short read",
+            ));
+        }
+        buf.copy_from_slice(&bytes);
+        Ok(())
+    }
+}
+
 pub(crate) trait FileHost: Send + Sync {
     /// Resolve symlinks, so a rename replaces the real file, never a symlink naming it.
     fn real_path(&self, path: &Path) -> Result<PathBuf>;
@@ -44,6 +73,26 @@ pub(crate) trait FileHost: Send + Sync {
         no_sync: bool,
         read_only: bool,
     ) -> Result<Box<dyn BlockStore>>;
+    /// Open an existing file read-only for concurrent positioned reads.
+    fn open_reader(&self, path: &Path) -> Result<Box<dyn PageReader>> {
+        Ok(Box::new(StoreReader(std::sync::Mutex::new(
+            self.open_store(path, true, true)?,
+        ))))
+    }
+}
+
+/// The OS page reader: positioned reads on a shared file handle, which never contend.
+#[cfg(unix)]
+struct OsPageReader(File);
+
+#[cfg(unix)]
+impl PageReader for OsPageReader {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.0
+            .read_exact_at(buf, offset)
+            .map_err(|e| EngineError::new(SqlState::IoError, format!("page service read: {e}")))
+    }
 }
 
 /// The production file host.
@@ -128,5 +177,16 @@ impl FileHost for OsFileHost {
             Err(e) => return Err(io_error(e)),
         };
         Ok(Box::new(FileBlockStore::new(file, no_sync)))
+    }
+
+    #[cfg(unix)]
+    fn open_reader(&self, path: &Path) -> Result<Box<dyn PageReader>> {
+        let file = File::open(path).map_err(|e| {
+            EngineError::new(
+                SqlState::IoError,
+                format!("open database for page service: {e}"),
+            )
+        })?;
+        Ok(Box::new(OsPageReader(file)))
     }
 }

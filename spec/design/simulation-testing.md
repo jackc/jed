@@ -1,7 +1,7 @@
 # Deterministic simulation testing — design
 
-> **Status: S1–S7 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
-> retired with shared mode, and an owner-and-client slice follows), including spill faults, temp-table spill, file
+> **Status: S1–S8 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
+> retired with shared mode and succeeded by S8, an owner and its page clients), including spill faults, temp-table spill, file
 > attachments, `create`, the bounded-growth invariant, and the `corrupt` mode. A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
@@ -50,7 +50,9 @@ every precondition:
   interleaving.
 - **The engine has no background work on the paths simulated.** In production code, the only
   goroutines and threads are the page service's (the owner's listener and connections, a client's
-  socket) and Go's context-cancellation watcher. Neither runs on a simulated single-process trace.
+  socket) and Go's context-cancellation watcher. Neither runs on a simulated single-process trace; a
+  multi-process trace (S8) settles the page service's connections after every step, so they add no
+  ordering of their own.
 - **Allocation is deterministic.** The free-list and manifest planning algorithm is specified
   ([validated-cow.md](validated-cow.md) §2) and produces byte-identical files across cores, so the
   **set** of pages a commit writes, and their bytes, is identical in every core.
@@ -66,8 +68,8 @@ Those stay with the race-detector modes, Layer 4, and the durability benchmarks 
 watermark, manifest overflow, live-page-count bookkeeping, unchanged-commit elision, poisoned
 handles, recovered-generation stabilization, large-value overflow chains, buffer-pool eviction,
 spill and temp-table spill, `max_storage_bytes`, `create`, compaction, file attachments, and
-at-rest corruption. Multiple processes (an owner and its page clients) return with a later slice
-(§14, item 5).
+at-rest corruption, and multiple processes under the page service: an owner and its page clients,
+promotion, lost connections, and lost commit acknowledgements (§14, S8).
 
 **Non-goals:**
 - **SQL semantics.** The PostgreSQL oracle, the cross-core corpus, and NoREC already cover them. The
@@ -136,6 +138,7 @@ check
 | `corrupt flips=N [reseal=1]` | Bit rot in the main file (§6.3). Ends every session cleanly, flips bits, opens and reads, then repairs. |
 | `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
+| `spawn <p>`, `exit <p>`, `kill <p>`, `disconnect <p>` | Multi-process traces only (S8): start process `p` (owner when none runs, else a page client), close it cleanly (an owner drains its clients for its shutdown grace), crash it alone, or end its connection to the owner. `open <sid> <mode> p<N>` opens a session in `p` (default `p0`). |
 
 **Every faulted step and every crash ends the process.** After the step, the runner abandons the
 `Database` and its sessions and opens the disk as a new process would; that recovery and its oracle
@@ -493,6 +496,7 @@ defaults, which `mixed.toml` restates):
 | `attachments` | File attachments created under crashes, per-database recovery, writes to one durable database per transaction |
 | `growth` | Short-lived readers between long runs of quiet commits, for the bounded-growth check (§8.3) |
 | `corruption` | `corrupt` steps, with and without `reseal` |
+| `service` | An owner and page clients: spawns, exits, kills, lost connections, client commits, promotion (S8) |
 
 A profile changes what is emitted, never what is checked: every oracle runs on every trace.
 
@@ -543,7 +547,7 @@ oracles are what the test means.
 | Per-core exhaustive crash tests | **Keep.** They enumerate every subset of small commits, an exhaustiveness random search cannot promise. The simulator covers the long histories they cannot express. |
 | `spec/fileformat/verify.rb` | **Extended in slice S6** with `--check-image`, an independent fourth voice for §8.3 and for which generation recovery should select. |
 | Concurrency Layers 1–3 | **Keep.** The race-detector modes test real threads. The simulator tests faults over logical interleavings. |
-| Process corpus (Layer 4) | **Keep, release-blocking.** Real kernel lock semantics and real process death cannot be simulated. The planned owner-and-client slice (§14, item 5) will explore the page service's state machine randomly. |
+| Process corpus (Layer 4) | **Keep, release-blocking.** Real kernel lock semantics and real process death cannot be simulated. S8 explores the page service's state machine randomly; Layer 4 stays the authority for real sockets, kernel locks, and process death. |
 | Durability benchmarks | **Keep.** Only real hardware says whether the barrier contract holds on a real device (§6.4). |
 
 ## 13. The obligation to grow it
@@ -619,9 +623,7 @@ primitive) gets a simulated implementation.
    shared mode: processes joining, leaving, and dying around one file under the shared lock protocol
    (the `shared` profile, `# processes: shared` traces, and the `ignore-co-residents` plant). The page
    service replaced shared mode ([locking.md](locking.md) §1), so the profile and plant were removed
-   and a trace with a `processes` header is now reported as unsupported. Multi-process traces return
-   in a later slice of the same phase, which simulates an owner and its page clients over a
-   simulated transport. Until then Layer 4 is the only multi-process coverage.
+   and S8 replaced the multi-process half with an owner and its page clients.
 6. **S6 — Independent checker. Landed.** `verify.rb --check-image` decodes a crash image as a fourth
    voice: it selects the generation recovery must select and checks the live count and free list.
    The driver compares its decision with every recovery a core reports (`sim:regress` always,
@@ -642,6 +644,48 @@ primitive) gets a simulated implementation.
    just before, storage.md §6). One gap remains: the generated reads never spill an `ORDER BY`
    sorter run (only spools, hash partitions, and temp stores spill), so `spill_error` does not yet
    reach the `sort`/`merge` scratch files; the unit and forced-spill corpus runs still cover them.
+
+8. **S8 — An owner and its page clients. Landed.** A trace with `# processes: service` opens every
+   process under the page service ([page-service.md](page-service.md)) through the simulated lock
+   host, which also holds the page service's owner record and endpoints, and a simulated **network**
+   of in-memory stream connections. The first process is the owner; later ones are page clients,
+   whose pages and commits pass through the owner's real connection code.
+   - **Determinism.** The owner's and clients' connection goroutines and threads still run, so after
+     every step the runner waits until the network is **quiescent**: every byte written has been read,
+     every reader is blocked waiting for more or has closed its end after handling end of stream, and
+     every pending connection has been accepted. Within a step, a write returns only once the peer
+     has read it and waits for more, so each connection's frames and their effects happen in one order.
+     A lost connection marks end of stream on both ends rather than closing either, so both readers
+     handle it before the network settles. So an asynchronous frame (`end_read`, `abort`), an end
+     of stream, or a maintenance commit that follows an acknowledgement is always complete before the
+     next step. A client never re-elects in the background: it re-elects at its next transaction
+     begin, in trace order. Owner timers are off (the idle timeouts are 0), the shutdown grace is
+     1000 ms of simulated time, and every wait (an election, a re-election, a drain) polls through the
+     lock host, advancing the simulated clock. Incarnation ids are random but never reach a
+     transcript. Each core writes each frame with one write, so frame counts agree across cores.
+   - **Faults.** Only the owner touches the file, so a disk fault (`process_crash`, `io_error`)
+     armed on any step lands in the owner's I/O, and the faulted step kills the **owner**, whichever
+     process's step drove the I/O; a power loss kills every process. `kill p` closes the process's
+     listener and connections, as the kernel closes a dead process's sockets, and releases its locks.
+     `disconnect p` ends a client's connection; the armed `fault disconnect nth=N` ends the connection
+     carrying the step's `N`th frame (in either direction) instead of delivering it, which lands
+     before or after a commit's point of no return, so a client resolves a lost acknowledgement by
+     re-election: committed, not committed (`08006`), or unknown (`08007`). A disconnect kills no
+     process.
+   - **Oracles.** The storage oracles are unchanged. A read transaction open across a change of its
+     process's role may fail `08006` (README.md §6.5) — it must never see other contents. An owner's
+     **maintenance commit** after a client's commit (page-service.md §6) joins the history at the next
+     versions with the same contents; when the owner dies later in the step that acknowledged a client's
+     commit, the commit is checked by the recovery that follows (nothing can be read back through the
+     dead owner), and a half-written maintenance commit at the next version is an allowed outcome. The **commit-role rule**: a page client's commit never rebuilds
+     the free list, so the free list it persists is a subset of its base's. Each commit's transcript
+     line names its role. The live checker runs on the owner (a client reads pages only under a
+     pinned transaction), and the bounded-growth check stays single-process.
+   - In the first 20 `service` traces on Go: 360 commits, 98 kills, 55 connection drops, 22 owners
+     killed by a fault mid-step, 16 readers that lost their snapshot with `08006`, and four commits
+     whose outcome stayed unknown (`08007`), every one cross-checked by the oracles. The
+     `client-reclaims` plant (a client's commit reclaims and reuses as if it owned the file) is caught
+     in 10 of 40 traces. The regression trace `service-owner-and-clients.sim` keeps one such history.
 
 ## 15. Open questions
 

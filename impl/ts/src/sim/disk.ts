@@ -49,7 +49,9 @@ export type SimFaultKind =
   | "io_sync"
   | "read_error"
   | "enospc"
-  | "spill_error";
+  | "spill_error"
+  // A page-service connection ends at the step's nth frame (S8): the network's fault, not the disk's.
+  | "disconnect";
 
 // SimFault is one armed fault (simulation-testing.md §6.3). Permille fields are 0..1000.
 export type SimFault = {

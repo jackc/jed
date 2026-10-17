@@ -19,8 +19,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -28,6 +26,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::blockstore::BlockStore;
+use crate::coordinator::LockHost;
 use crate::error::{EngineError, Result, SqlState};
 use crate::pageservice::codec::{
     BeginRead, BeginWrite, CommitBegin, CommitPages, CommitStatus, ERROR_FLAG_FATAL, EndRead,
@@ -36,6 +35,7 @@ use crate::pageservice::codec::{
     NOTICE_YIELD_BEGUN, NOTICE_YIELD_CANCELLED, PROTOCOL_VERSION, ReadBegun, ReadPages, WriteBegun,
     encode_frame, read_frame,
 };
+use crate::pageservice::net::PsStream;
 
 /// How long a client that saw another connection's yield notice skips its presence tries after
 /// its connection ends, so the requester takes ownership (README.md §6.5).
@@ -46,7 +46,7 @@ pub(crate) type OnBreak = Arc<dyn Fn() + Send + Sync>;
 
 /// The send half of a connection, behind [`PsConnection::outbox`]: the send lock.
 struct Outbox {
-    stream: UnixStream,
+    stream: Box<dyn PsStream>,
     next_id: u32,
 }
 
@@ -83,7 +83,9 @@ pub(crate) struct PsConnection {
     broke: Condvar,
     /// A second handle on the socket, so [`close`](Self::close) can shut it down while the reader
     /// thread is blocked on it.
-    control: UnixStream,
+    control: Box<dyn PsStream>,
+    /// The lock host, whose clock times the handoff pause (the simulator's in a simulation).
+    host: Arc<dyn LockHost>,
     page_size: AtomicU32,
     /// `hello_ok` said the connection is read-only.
     read_only: AtomicBool,
@@ -148,13 +150,19 @@ pub(crate) enum Connect {
     Refused(EngineError),
 }
 
-/// Dial the owner's endpoint, start the reader thread, and run `hello`, asking for a read-only
-/// connection when `read_only`.
-pub(crate) fn connect(db_path: &Path, endpoint: &str, read_only: bool) -> Connect {
-    let Ok(stream) = UnixStream::connect(endpoint) else {
+/// Dial the owner's endpoint through `host`, start the reader thread, and run `hello`, asking for a
+/// read-only connection when `read_only`.
+pub(crate) fn connect(
+    host: &Arc<dyn LockHost>,
+    db_path: &Path,
+    endpoint: &str,
+    read_only: bool,
+) -> Connect {
+    let Ok(stream) = host.dial(endpoint) else {
         return Connect::Retry;
     };
-    let (Ok(control), Ok(reader)) = (stream.try_clone(), stream.try_clone()) else {
+    let (Ok(control), Ok(reader)) = (stream.clone_stream(), stream.clone_stream()) else {
+        stream.close_both();
         return Connect::Retry;
     };
     let conn = Arc::new(PsConnection {
@@ -168,6 +176,7 @@ pub(crate) fn connect(db_path: &Path, endpoint: &str, read_only: bool) -> Connec
         }),
         broke: Condvar::new(),
         control,
+        host: Arc::clone(host),
         page_size: AtomicU32::new(0),
         read_only: AtomicBool::new(false),
         owner_read_only: AtomicBool::new(false),
@@ -315,7 +324,7 @@ impl PsConnection {
             .waiters
             .lock()
             .expect("page-service waiters lock poisoned");
-        Some(waiters.broken_at.unwrap_or_else(Instant::now) + HANDOFF_PAUSE)
+        Some(waiters.broken_at.unwrap_or_else(|| self.host.now()) + HANDOFF_PAUSE)
     }
 
     /// Act on an owner notice (README.md §3.7, §6.5): another connection's yield pauses this
@@ -334,7 +343,7 @@ impl PsConnection {
 
     /// Read every reply frame and hand it to the request it answers. On a lost connection or a
     /// frame no request is waiting for, break the connection and fail every waiting request.
-    fn read_loop(self: Arc<Self>, mut stream: UnixStream) {
+    fn read_loop(self: Arc<Self>, mut stream: Box<dyn PsStream>) {
         loop {
             let (id, message) =
                 match read_frame(&mut stream, self.page_size.load(Ordering::Acquire)) {
@@ -380,8 +389,9 @@ impl PsConnection {
         }
     }
 
-    /// Make `error` the connection's sticky failure, shut the socket down, fail every waiting
-    /// request with it, and (the first time) start the handle's re-election.
+    /// Make `error` the connection's sticky failure, fail every waiting request with it, (the first
+    /// time) start the handle's re-election, and shut the socket down — last: the simulator treats a
+    /// closed end as settled.
     fn break_with(&self, error: EngineError) {
         let (pending, broken, on_break) = {
             let mut waiters = self
@@ -391,7 +401,7 @@ impl PsConnection {
             let mut on_break = None;
             if waiters.broken.is_none() {
                 waiters.broken = Some(error);
-                waiters.broken_at = Some(Instant::now());
+                waiters.broken_at = Some(self.host.now());
                 on_break = waiters.on_break.take();
                 self.broke.notify_all();
             }
@@ -401,13 +411,13 @@ impl PsConnection {
                 on_break,
             )
         };
-        let _ = self.control.shutdown(Shutdown::Both);
         for waiter in pending.into_values() {
             let _ = waiter.send(Err(broken.clone()));
         }
         if let Some(on_break) = on_break {
             on_break();
         }
+        self.control.close_both();
     }
 
     fn broken(&self) -> EngineError {

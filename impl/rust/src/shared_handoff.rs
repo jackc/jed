@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::coordinator::{LockHost, OsLockHost};
 use crate::file::Ownership;
+use crate::filehost::{FileHost, OsFileHost};
 use crate::pageservice::client::{ClientLink, ClientPins, HANDOFF_PAUSE, OnBreak, PsConnection};
 use crate::pageservice::codec::{COMMIT_STATUS_COMMITTED, COMMIT_STATUS_NOT_COMMITTED};
 use crate::pageservice::election::{ElectOptions, Election, elect};
@@ -27,6 +28,7 @@ use crate::pageservice::owner::{
     OwnerLimits, PageServiceOwner, ServiceWindow, committed_meta, new_incarnation, previous_meta,
 };
 use crate::paging::SharedPaging;
+use crate::spillhost::SpillHost;
 
 /// One role of a handle under the page service. Exactly one of `owner` and `client` is set, or
 /// neither while the handle waits to re-elect after releasing ownership (or after it closed).
@@ -52,9 +54,35 @@ impl ServiceRole {
     }
 }
 
+/// The hosts a page-service handle runs over: the lock host (bundle locks, the owner record, the
+/// endpoint and its connections, the clock), the file host (`None`: the OS) and spill host (`None`:
+/// the OS scratch directory), and whether a lost connection starts a re-election at once. The
+/// simulator sets its own hosts and turns `background` off, so every re-election runs at a
+/// transaction begin, in trace order.
+pub(crate) struct ServiceHosts {
+    pub(crate) host: Arc<dyn LockHost>,
+    pub(crate) files: Option<Arc<dyn FileHost>>,
+    pub(crate) spill: Option<Arc<dyn SpillHost>>,
+    pub(crate) background: bool,
+}
+
+impl ServiceHosts {
+    /// The production hosts.
+    pub(crate) fn os() -> ServiceHosts {
+        ServiceHosts {
+            host: Arc::new(OsLockHost),
+            files: None,
+            spill: None,
+            background: true,
+        }
+    }
+}
+
 /// A handle's page-service state that outlives its roles.
 pub(crate) struct ServiceHandoff {
     host: Arc<dyn LockHost>,
+    files: Option<Arc<dyn FileHost>>,
+    background: bool,
     path: PathBuf,
     /// The handle's open options: promotion opens the file with them, and an owner reads its limits
     /// and ownership preference from them.
@@ -90,25 +118,39 @@ fn resolution_unknown(message: &str) -> EngineError {
 
 /// Whether this user can open `path` read-write (README.md §6.5 case 2): opened and closed unused,
 /// so the read-only owner never holds write access.
-fn can_open_read_write(path: &Path) -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .is_ok()
+fn can_open_read_write(files: &dyn FileHost, path: &Path) -> bool {
+    files.open_store(path, true, false).is_ok()
+}
+
+impl ServiceHandoff {
+    /// The file host promotion and the owner's read handle open the file through.
+    fn file_host(&self) -> Arc<dyn FileHost> {
+        match &self.files {
+            Some(files) => Arc::clone(files),
+            None => Arc::new(OsFileHost),
+        }
+    }
 }
 
 impl Shared {
     /// Attach the page-service state to a freshly built core.
-    fn attach_handoff(
-        self: &Arc<Self>,
-        host: Arc<dyn LockHost>,
-        path: &Path,
-        mut opts: OpenOptions,
-    ) {
+    fn attach_handoff(self: &Arc<Self>, hosts: ServiceHosts, path: &Path, mut opts: OpenOptions) {
         opts.environment = self.env.clone();
+        {
+            // The handle's storage uses the handoff's file and spill hosts (the simulator's in a
+            // simulation; the OS defaults otherwise), whatever role it holds.
+            let mut storage = self.storage.lock().expect("storage lock not poisoned");
+            if let Some(files) = &hosts.files {
+                storage.files = Some(Arc::clone(files));
+            }
+            if let Some(spill) = &hosts.spill {
+                storage.spill = Some(Arc::clone(spill));
+            }
+        }
         let handoff = ServiceHandoff {
-            host,
+            host: hosts.host,
+            files: hosts.files,
+            background: hosts.background,
             path: path.to_path_buf(),
             limits: OwnerLimits::from_options(&opts),
             opts,
@@ -204,6 +246,9 @@ impl Shared {
         let (Some(conn), Some(handoff)) = (&role.client, self.handoff.get()) else {
             return;
         };
+        if !handoff.background {
+            return;
+        }
         let shared = handoff.shared.clone();
         let watched = Arc::downgrade(role);
         let trigger: OnBreak = Arc::new(move || {
@@ -307,7 +352,9 @@ impl Shared {
             .handoff
             .get()
             .expect("promotion runs under the page service");
-        let engine = Engine::open_with_options(
+        let files = handoff.file_host();
+        let engine = Engine::open_via(
+            files.as_ref(),
             &handoff.path,
             OpenOptions {
                 locking: Locking::None,
@@ -334,6 +381,8 @@ impl Shared {
             handoff.opts.ownership,
             handoff.limits,
             Some(coordinator),
+            Arc::clone(&handoff.host),
+            files,
         )?;
         let next = Arc::new(ServiceRole {
             generation: stale.generation + 1,
@@ -396,7 +445,10 @@ impl Shared {
                 return;
             }
         };
-        let next = ServiceRole::between(role.generation + 1, Some(Instant::now() + HANDOFF_PAUSE));
+        let next = ServiceRole::between(
+            role.generation + 1,
+            Some(handoff.host.now() + HANDOFF_PAUSE),
+        );
         self.release_ownership(&role, &next);
         drop(guard);
         owner.end_drain();
@@ -411,7 +463,9 @@ impl Shared {
         deadline: Option<Instant>,
     ) -> Result<()> {
         let handoff = self.handoff.get().expect("a page-service write begin");
-        if handoff.opts.ownership == Ownership::Never || !can_open_read_write(&handoff.path) {
+        if handoff.opts.ownership == Ownership::Never
+            || !can_open_read_write(handoff.file_host().as_ref(), &handoff.path)
+        {
             return Err(EngineError::new(
                 SqlState::ReadOnlySqlTransaction,
                 "the database owner opened the file read-only",
@@ -841,9 +895,10 @@ pub(super) fn start_service_owner(
     path: &Path,
     coordinator: FileCoordinator,
     opts: OpenOptions,
+    hosts: ServiceHosts,
 ) -> Result<Database> {
     let shared = &db.0;
-    shared.attach_handoff(Arc::new(OsLockHost), path, opts);
+    shared.attach_handoff(hosts, path, opts);
     let handoff = Arc::clone(shared.handoff.get().expect("attached above"));
     let (paging, page_size) = {
         let mut storage = shared.storage.lock().expect("storage lock not poisoned");
@@ -866,6 +921,8 @@ pub(super) fn start_service_owner(
         handoff.opts.ownership,
         handoff.limits,
         Some(coordinator),
+        Arc::clone(&handoff.host),
+        handoff.file_host(),
     )?;
     let role = Arc::new(ServiceRole {
         generation: 1,
@@ -883,7 +940,19 @@ pub(super) fn start_service_owner(
 /// serving owner, or as a page client of the owner.
 pub(super) fn open_service(path: &Path, opts: OpenOptions) -> Result<Database> {
     let real = crate::coordinator::resolve_open_path(path)?;
-    let host: Arc<dyn LockHost> = Arc::new(OsLockHost);
+    open_service_with(ServiceHosts::os(), &real, opts, true)
+}
+
+/// Run the election for the database at `real` (already resolved) over `hosts` and open the handle
+/// in the role it wins. `claim` is false when the caller already holds the process-local path claim.
+pub(crate) fn open_service_with(
+    hosts: ServiceHosts,
+    real: &Path,
+    opts: OpenOptions,
+    claim: bool,
+) -> Result<Database> {
+    let real = real.to_path_buf();
+    let host = Arc::clone(&hosts.host);
     let won = elect(
         &host,
         &real,
@@ -892,13 +961,18 @@ pub(super) fn open_service(path: &Path, opts: OpenOptions) -> Result<Database> {
             read_only: opts.read_only,
             never: opts.ownership == Ownership::Never,
             pause_until: None,
-            reelect: false,
+            reelect: !claim,
             opts: &opts,
         },
     )?;
     match won {
         Election::Owner(coordinator) => {
-            let engine = match Engine::open_with_options(
+            let files: Arc<dyn FileHost> = match &hosts.files {
+                Some(files) => Arc::clone(files),
+                None => Arc::new(OsFileHost),
+            };
+            let engine = match Engine::open_via(
+                files.as_ref(),
                 &real,
                 OpenOptions {
                     // Coordination is the election's presence EX.
@@ -909,7 +983,9 @@ pub(super) fn open_service(path: &Path, opts: OpenOptions) -> Result<Database> {
                 Ok(engine) => engine,
                 Err(e) => {
                     drop(coordinator);
-                    host.release_path(&real);
+                    if claim {
+                        host.release_path(&real);
+                    }
                     return Err(e);
                 }
             };
@@ -919,7 +995,7 @@ pub(super) fn open_service(path: &Path, opts: OpenOptions) -> Result<Database> {
                 .expect("storage lock not poisoned")
                 .budget
                 .limit = opts.max_storage_bytes;
-            start_service_owner(db, &real, coordinator, opts)
+            start_service_owner(db, &real, coordinator, opts, hosts)
         }
         Election::Client(conn, engine) => {
             let paging = engine.paging.clone();
@@ -931,7 +1007,7 @@ pub(super) fn open_service(path: &Path, opts: OpenOptions) -> Result<Database> {
                 storage.record_commits = true;
                 storage.budget.limit = opts.max_storage_bytes;
             }
-            db.0.attach_handoff(host, &real, opts);
+            db.0.attach_handoff(hosts, &real, opts);
             let role = Arc::new(ServiceRole {
                 generation: 1,
                 owner: None,

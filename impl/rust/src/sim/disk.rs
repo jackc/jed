@@ -87,6 +87,8 @@ pub(crate) enum FaultKind {
     Enospc,
     /// Per-core: what a core spills, and in which operations, is its own codec's business.
     SpillError,
+    /// A page-service connection ends at the step's nth frame (S8): the network's, not the disk's.
+    Disconnect,
 }
 
 /// One armed fault (simulation-testing.md §6.3). Permille fields are 0..1000.
@@ -259,6 +261,11 @@ impl SimFs {
     }
 
     /// Whether a fault is armed for the current step.
+    /// Whether the process died mid-step (every later call fails).
+    pub(crate) fn dead(&self) -> bool {
+        self.dead
+    }
+
     pub(crate) fn armed(&self) -> bool {
         self.fault.is_some()
     }

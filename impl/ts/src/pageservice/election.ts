@@ -11,7 +11,7 @@ import { EngineError, engineError } from "../errors.ts";
 import type { Engine } from "../executor.ts";
 import type { LockFiles, LockHost } from "../lockhost.ts";
 import { type ClientOpenOptions, openPageClient, PageClient } from "./client.ts";
-import { currentUid, readOwnerRecord } from "./endpoint.ts";
+import { currentUid } from "./endpoint.ts";
 
 // Election is the outcome: the owner keeps its bundle (presence EX held, arrival released); a client
 // holds no bundle lock and arrives opened (its engine over the connection).
@@ -59,22 +59,25 @@ export function electService(
     lockUntil(host, files.arrival, false, deadline, path, false);
     arrival = true;
     host.validateMarker(path);
+    // The handoff pause (Date.now() scale) is waited out on the lock host's clock, as every other
+    // wait of the election is (the simulator's in a simulation).
+    const pauseEnd = host.nowMicros() + Math.max(0, eo.pauseUntilMs - Date.now()) * 1000;
     let reason = "";
     for (;;) {
-      if (!eo.never && Date.now() >= eo.pauseUntilMs && host.tryLock(files.presence, true)) {
+      if (!eo.never && host.nowMicros() >= pauseEnd && host.tryLock(files.presence, true)) {
         host.unlock(files.arrival);
         arrival = false;
         const owner = files;
         files = null;
         return { owner, client: null, engine: null };
       }
-      const record = readOwnerRecord(path);
+      const record = host.readOwnerRecord(path);
       if (record === null) reason = "";
       else if (record.uid !== currentUid()) reason = "owned by another user's process";
       else if (!record.serving) reason = "owned by a non-serving process";
       else {
         reason = "";
-        const client = new PageClient(path);
+        const client = new PageClient(path, host.pageNet?.link(host.pid()));
         const result = client.connect(record.endpoint, readOnly);
         if (result.ok) {
           let engine: Engine | null = null;

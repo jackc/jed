@@ -21,4 +21,6 @@ pub(crate) mod election;
 #[cfg(unix)]
 pub(crate) mod endpoint;
 #[cfg(unix)]
+pub(crate) mod net;
+#[cfg(unix)]
 pub(crate) mod owner;

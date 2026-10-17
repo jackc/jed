@@ -386,8 +386,10 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   decided by a content-keyed function, so a run replays exactly from its seed and the three cores must
   produce **byte-identical transcripts and crash images**. The simulated filesystem covers `create`,
   compaction's rename and directory barrier, and file attachments; spill and temp-table spill go
-  through a simulated spill host whose I/O can fail; and simulated processes share one file under the
-  real locking protocol through a lock-host seam. Oracles, per database: recovery lands between the
+  through a simulated spill host whose I/O can fail; and simulated processes run as a page-service owner
+  and its page clients over a simulated lock host and network — promotion, lost connections, lost
+  commit acknowledgements, and owner crashes mid-commit, with the commit-role rule (only the owner
+  rebuilds the free list) as an oracle. Oracles, per database: recovery lands between the
   durability floor and the newest attempted commit and matches a recorded generation; a reader sees
   its pinned version; no `XX001`; image and live integrity checks; with no reader pinned the file
   stops growing (the reader-aware bounded-growth check); a bit flipped at rest is `XX001` or harmless,

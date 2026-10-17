@@ -3,9 +3,13 @@
 // bundle beside the database file, whole-file locks on it, the clock deadlines read, the pause
 // between polls of a contended lock, the process id the fork check compares, and the process-local
 // duplicate-open registry. Production uses the OS (coordinator.ts osLocks). The deterministic
-// simulator (spec/design/simulation-testing.md §14 S5) substitutes simulated processes sharing one
-// lock table, so the protocol runs, crashes, and interleaves deterministically. Type-only, so it
-// imports nothing.
+// simulator (spec/design/simulation-testing.md §14 S8) substitutes simulated processes sharing one
+// lock table and an in-memory page-service network, so the protocol runs, crashes, and interleaves
+// deterministically. It also holds the page service's host operations (spec/pageservice/README.md
+// §5): the owner record and the owner's endpoint. Type-only, so it imports nothing at run time.
+
+import type { PsOwnerRecord } from "./pageservice/codec.ts";
+import type { PageNet } from "./pageservice/net.ts";
 
 // A LockHandle is one bundle file's lock: a native lock file for the OS host.
 export type LockHandle = unknown;
@@ -31,4 +35,14 @@ export interface LockHost {
   // pause waits between polls of a contended lock.
   pause(): void;
   pid(): number;
+  // The page service's host operations (spec/pageservice/README.md §5): the owner record in the bundle
+  // (null when absent or unparsable), and the owner's endpoint path ("" when it cannot serve).
+  readOwnerRecord(dbPath: string): PsOwnerRecord | null;
+  writeOwnerRecord(dbPath: string, record: PsOwnerRecord): void;
+  removeOwnerRecord(dbPath: string): void;
+  endpointPath(dbPath: string, uid: number, incarnation: Uint8Array): string;
+  removeEndpoint(endpoint: string): void;
+  // pageNet is the simulator's in-memory page-service network. Absent (the OS host), an owner serves
+  // and a client connects on the process's worker threads over OS sockets.
+  readonly pageNet?: PageNet;
 }

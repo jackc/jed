@@ -173,6 +173,8 @@ export interface ServiceOwnerHandle {
   // --- handoff (spec/pageservice/README.md §6.5) ---
   // onYield installs the engine thread's handler for an accepted ownership request.
   onYield(handler: () => void): void;
+  // onLocalOldest installs the oldest-local-pin reader a same-thread service (the simulator) reads.
+  onLocalOldest(oldest: () => bigint | null): void;
   // admitting: the owner serves normally (no drain); yielding: it drains for a yield.
   admitting(): boolean;
   yielding(): boolean;
@@ -212,6 +214,12 @@ export interface ServiceHandoffHost {
   canOpenReadWrite(): boolean;
   // releasePath releases the process-local open-path claim when the handle closes.
   releasePath(): void;
+  // background: a client re-elects on the event loop as soon as its connection ends (false: only at
+  // its next transaction begin — the simulator's choice, so every re-election runs in trace order).
+  readonly background: boolean;
+  // nowMicros and pause are the lock host's clock and poll pause, which a close's drain reads.
+  nowMicros(): number;
+  pause(): void;
 }
 
 // HANDOFF_PAUSE_MS is how long a yielding owner skips presence tries after releasing ownership, so the
@@ -517,11 +525,16 @@ class SharedCore {
     if (service !== null) {
       service.onHandoff(() => this.serviceHandoff());
       service.onYield(() => this.yieldRequested(gen));
+      service.onLocalOldest(() => {
+        let oldest: bigint | null = null;
+        for (const v of this.live.keys()) if (oldest === null || v < oldest) oldest = v;
+        return oldest;
+      });
     }
     const client = this.client;
     if (client !== null) {
       this.releaseIdlePins();
-      client.onLost(() => this.backgroundReelect(gen));
+      if (this.handoff?.background !== false) client.onLost(() => this.backgroundReelect(gen));
       if (this.handoff?.ownership === "prefer" && client.ownerYields) {
         client.requestOwnershipNoWait();
       }
@@ -757,12 +770,14 @@ class SharedCore {
     this.yieldTimer = null;
     const service = this.service;
     if (service !== null) {
+      // The drain polls through the lock host, whose clock it reads (the simulator's in a simulation).
+      const handoff = this.handoff!;
       service.beginClosing();
-      const deadline = Date.now() + this.handoff!.shutdownGraceMs;
+      const deadline = handoff.nowMicros() + handoff.shutdownGraceMs * 1000;
       for (;;) {
         this.serviceHandoff();
-        if (service.clientsIdle(false) || Date.now() >= deadline) break;
-        sleepMs(DRAIN_POLL_MS);
+        if (service.clientsIdle(false) || handoff.nowMicros() >= deadline) break;
+        handoff.pause();
       }
       service.close();
     }

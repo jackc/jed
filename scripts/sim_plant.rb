@@ -104,6 +104,16 @@ module SimPlant
                "\tif pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) {\n\t\treturn page{}, newError(DataCorrupted, \"page checksum mismatch",
                "\tif false && pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) {\n\t\treturn page{}, newError(DataCorrupted, \"page checksum mismatch"]]
     ),
+    # The page service's commit-role rule (page-service.md §6): only the owner rebuilds the free list.
+    # The plant makes a page client reclaim and reuse as if it owned the file.
+    Plant.new(
+      name: "client-reclaims",
+      protection: "a page client's commit never rebuilds the free list or reuses without the owner's grant (page-service.md §6)",
+      profile: "service",
+      edits: [["impl/go/shared.go",
+               "commitDurable(snap, false, r.client.reuseGrant, budget)",
+               "commitDurable(snap, true, true, budget)"]]
+    ),
   ].freeze
 
   module_function

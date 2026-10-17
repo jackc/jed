@@ -39,7 +39,7 @@ import {
   registerFileCompactor,
 } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
-import { canonicalOpenPath, FileCoordinator, osLocks, resolvedLocking } from "./coordinator.ts";
+import { canonicalOpenPath, FileCoordinator, resolvedLocking } from "./coordinator.ts";
 import { type Ownership, ServiceHandoff } from "./pageservice/handoff.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
@@ -521,20 +521,26 @@ function openServiceDatabase(path: string, opts: OpenOptions): Database {
     environment,
     () => open(real, { ...opts, locking: "none", environment }),
   );
+  return openServiceWith(handoff);
+}
+
+// openServiceWith runs handoff's election at open and opens the handle in the role it wins: an
+// elected client arrives opened; an elected owner opens the file as an owner does (handoff's opener)
+// and serves it. The deterministic simulator opens its processes through it with its own hosts.
+export function openServiceWith(handoff: ServiceHandoff): Database {
   const election = handoff.electAtOpen();
   if (election.client !== null) {
     return Database.fromEngine(election.engine, null, { client: election.client, handoff });
   }
-  const coordinator = FileCoordinator.fromElection(osLocks, real, election.owner);
-  let engine: Engine;
+  const coordinator = FileCoordinator.fromElection(handoff.host, handoff.path, election.owner);
+  let role: ReturnType<ServiceHandoff["startOwner"]>;
   try {
-    engine = open(real, { ...opts, locking: "none", environment });
+    role = handoff.startOwner(coordinator);
   } catch (error) {
-    coordinator.close();
     handoff.releasePath();
     throw error;
   }
-  return startServiceOwner(engine, coordinator, handoff);
+  return Database.fromEngine(role.engine!, coordinator, { service: role.service!, handoff });
 }
 
 // startServiceOwner lifts an opened or created engine into a serving owner's handle; the caller's

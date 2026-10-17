@@ -63,7 +63,7 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool,
 	}
 	reason := ""
 	for {
-		if !eo.never && !time.Now().Before(eo.pauseUntil) {
+		if !eo.never && !host.now().Before(eo.pauseUntil) {
 			owned, err := host.tryLock(files.presence, true)
 			if err != nil {
 				_ = host.unlock(files.arrival)
@@ -77,7 +77,7 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool,
 				return serviceElection{owner: c}, nil
 			}
 		}
-		record, ok := readOwnerRecord(path)
+		record, ok := host.readOwnerRecord(path)
 		switch {
 		case !ok:
 			reason = ""
@@ -87,7 +87,7 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool,
 			reason = "owned by a non-serving process"
 		default:
 			reason = ""
-			cl, retry, err := connectPageClient(path, record.endpoint, readOnly)
+			cl, retry, err := connectPageClient(host, path, record.endpoint, readOnly)
 			if err == nil {
 				e, err := openPageClient(cl, eo.opts, eo.env)
 				if err == nil {
@@ -154,16 +154,22 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 	if opts.Environment == nil {
 		opts.Environment = NewEnvironment()
 	}
-	h := newServiceHandoff(osLocks, real, opts)
-	election, err := electService(osLocks, real, opts.FileLockTimeoutMs, opts.ReadOnly, electOptions{never: opts.Ownership == OwnershipNever, opts: opts, env: opts.Environment})
+	return openServiceWith(newServiceHandoff(osLocks, real, opts), true)
+}
+
+// openServiceWith runs the election for handoff h's database and opens the handle in the role it
+// wins. claim is false when the caller already holds the process-local path claim.
+func openServiceWith(h *serviceHandoff, claim bool) (*Database, error) {
+	opts := h.opts
+	election, err := electService(h.host, h.path, opts.FileLockTimeoutMs, opts.ReadOnly, electOptions{never: opts.Ownership == OwnershipNever, reelect: !claim, opts: opts, env: opts.Environment})
 	if err != nil {
 		return nil, err
 	}
 	if election.client != nil {
 		e := election.clientEngine
-		e.spill = osSpillHost{dir: os.TempDir()}
 		c := sharedCoreFromEngineCoordinated(e, nil)
 		c.handoff = h
+		h.attachHost(c)
 		c.storage.budget.limit = opts.MaxStorageBytes
 		r := &serviceRole{gen: 1, client: election.client}
 		c.installRole(r, e)
@@ -173,10 +179,12 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 	}
 	ownerOpts := opts
 	ownerOpts.Locking = LockingNone
-	e, err := openWithOptions(real, ownerOpts)
+	e, err := openVia(h.fileHost(), h.path, ownerOpts)
 	if err != nil {
 		election.owner.close()
-		osLocks.releasePath(real)
+		if claim {
+			h.host.releasePath(h.path)
+		}
 		return nil, err
 	}
 	return startServiceOwner(e, election.owner, h)
@@ -186,6 +194,7 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 func startServiceOwner(e *engine, coord *fileCoordinator, h *serviceHandoff) (*Database, error) {
 	c := sharedCoreFromEngineCoordinated(e, nil)
 	c.handoff = h
+	h.attachHost(c)
 	c.storage.budget.limit = h.opts.MaxStorageBytes
 	o, err := newPageServiceOwner(c, e.paging, e.committed.txid, h, coord)
 	if err != nil {

@@ -150,7 +150,7 @@ func simParse(text string) (simTrace, error) {
 				}
 				st.pid = pid
 			}
-		case "spawn", "exit", "kill":
+		case "spawn", "exit", "kill", "disconnect":
 			if len(fields) != 2 {
 				return tr, fmt.Errorf("line %d: %s p<N>", n+1, st.kind)
 			}
@@ -247,6 +247,8 @@ func simFaultOf(st simStep) (*simFault, error) {
 		return &simFault{kind: simENOSPC}, nil
 	case "spill_error":
 		return &simFault{kind: simSpillError, p: st.intParam("p")}, nil
+	case "disconnect":
+		return &simFault{kind: simDisconnect, nth: st.intParam("nth")}, nil
 	}
 	return nil, fmt.Errorf("line %d: unsupported fault %s %v", st.line, st.mode, st.params)
 }
@@ -417,13 +419,15 @@ type simRunner struct {
 	random *SeededRandom
 	active *simSession // the session whose stream random currently holds
 
-	// Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
-	// coordination; a `# processes: shared` trace opens every process with shared locking.
-	shared bool
-	procs  map[int]*simProc
-	cur    int // the process running the current step
-	locks  *simLockTable
-	armed  *simFault
+	// Processes (simulation-testing.md §14 S8). A single-process trace has only p0, opened without
+	// coordination; a `# processes: service` trace opens every process under the page service, over the
+	// simulated lock host and network: the first is the owner, later ones its clients.
+	service bool
+	net     *simNet
+	procs   map[int]*simProc
+	cur     int // the process running the current step
+	locks   *simLockTable
+	armed   *simFault
 
 	transcript strings.Builder
 
@@ -470,7 +474,8 @@ func newSimRunner(tr simTrace) *simRunner {
 		maxStorageBytes: maxStorageBytes,
 		fs:              newSimFS(seed, sector, uint32(ps)),
 		sessions:        map[string]*simSession{},
-		shared:          false, // multi-process traces return with the page service (simulation-testing.md)
+		service:         tr.header["processes"] == "service",
+		net:             newSimNet(),
 		procs:           map[int]*simProc{},
 		dbs:             map[string]*simDB{},
 		violationStep:   -1,
@@ -571,15 +576,68 @@ func (r *simRunner) attach(name string) error {
 	return r.db.Attach(name, AttachFileWithOptions(r.dbs[name].file, AttachFileOptions{Locking: LockingNone}), false)
 }
 
-// openProc starts process pid.
+// openProc starts process pid. A service trace elects it through the simulated lock host and
+// network, exactly as OpenDatabaseWithOptions does through the OS host.
 func (r *simRunner) openProc(pid int) error {
-	db, err := r.openDatabase(nil)
+	var db *Database
+	var err error
+	if r.service {
+		db, err = r.openServiceProc(pid)
+	} else {
+		db, err = r.openDatabase(nil)
+	}
 	if err != nil {
 		return err
 	}
 	r.procs[pid] = &simProc{pid: pid, db: db}
 	r.cur, r.db = pid, db
 	return nil
+}
+
+// simServiceGraceMs is a simulated owner's shutdown grace: its clients' pinned readers live in other
+// processes, which no single step can end, so a closing owner always waits out the grace.
+const simServiceGraceMs = 1000
+
+// openServiceProc opens process pid under the page service (S8): its own lock host over the shared
+// lock table and network, the simulated filesystem and spill host, and no background re-election, so a
+// client re-elects at its next transaction begin, in trace order. Every owner limit that would start a
+// timer is off.
+func (r *simRunner) openServiceProc(pid int) (*Database, error) {
+	if r.locks == nil {
+		r.locks = newSimLockTable(&r.clock, r.procBusy)
+	}
+	host := &simLockHost{table: r.locks, pidNum: pid, claimed: map[string]bool{}, net: r.net}
+	zero, grace, timeout := uint64(0), uint64(simServiceGraceMs), uint64(defaultFileLockTimeoutMs)
+	opts := OpenOptions{
+		CacheBytes:                 r.cacheBytes,
+		FileLockTimeoutMs:          &timeout,
+		IdleInTransactionTimeoutMs: &zero,
+		IdleSessionTimeoutMs:       &zero,
+		ShutdownGraceMs:            &grace,
+		Environment:                r.env,
+		MaxStorageBytes:            r.maxStorageBytes,
+	}
+	h := newServiceHandoff(host, simDiskPath, opts)
+	h.files, h.spill, h.background = r.fs, r.fs.spillHost(), false
+	db, err := openServiceWith(h, true)
+	if err != nil {
+		r.locks.release(pid)
+		r.net.kill(pid)
+		r.net.settle()
+		return nil, err
+	}
+	r.net.settle()
+	return db, nil
+}
+
+// ownerPid is the running process that owns the database under the page service, or -1.
+func (r *simRunner) ownerPid() int {
+	for _, pid := range r.livePids() {
+		if r.procs[pid].db.core.pageOwner() != nil {
+			return pid
+		}
+	}
+	return -1
 }
 
 // procBusy reports whether pid's presence probe would block: it takes the process's own writer gate,
@@ -623,7 +681,7 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 }
 
 func (r *simRunner) run() {
-	if p := r.tr.header["processes"]; p != "" {
+	if p := r.tr.header["processes"]; p != "" && p != "service" {
 		r.violation = "unsupported processes mode " + p
 		return
 	}
@@ -700,10 +758,22 @@ func (r *simRunner) step(i int) (cont bool) {
 		r.emit(`{"i":%d,"op":"clock"}`, i)
 		return true
 	case "tick":
-		if r.locks != nil {
-			r.locks.runProbes(-1)
-		}
 		r.emit(`{"i":%d,"op":"tick"}`, i)
+		return true
+	case "disconnect":
+		// The process's connection to the owner ends (S8): both ends see end of stream.
+		p := r.procs[st.pid]
+		var cl *psClient
+		if p != nil {
+			cl = p.db.core.pageClient()
+		}
+		if cl == nil {
+			r.emit(`{"i":%d,"op":"disconnect","pid":%d,"skip":true}`, i, st.pid)
+			return true
+		}
+		cl.conn.(*simConnEnd).drop()
+		r.net.settle()
+		r.emit(`{"i":%d,"op":"disconnect","pid":%d}`, i, st.pid)
 		return true
 	case "exit":
 		if r.procs[st.pid] == nil {
@@ -762,7 +832,14 @@ func (r *simRunner) step(i int) (cont bool) {
 			}
 		}
 	}
-	r.fs.beginStep(uint64(i), armed)
+	diskFault := armed
+	if armed != nil && armed.kind == simDisconnect {
+		diskFault = nil
+		r.net.beginStep(armed.nth)
+	} else {
+		r.net.beginStep(0)
+	}
+	r.fs.beginStep(uint64(i), diskFault)
 	switch st.kind {
 	case "spawn":
 		r.stepSpawn(i, st.pid)
@@ -785,6 +862,9 @@ func (r *simRunner) step(i int) (cont bool) {
 			return false
 		}
 	}
+	if r.service {
+		r.net.settle()
+	}
 	if r.violation != "" {
 		return false
 	}
@@ -798,6 +878,15 @@ func (r *simRunner) step(i int) (cont bool) {
 	if armed == nil {
 		return true
 	}
+	if armed.kind == simDisconnect {
+		// A lost connection ends no process: its client re-elects at its next begin.
+		fired := "end"
+		if r.net.disconnected {
+			fired = "frame"
+		}
+		r.emit(`{"i":%d,"op":"disconnected","fired":%q}`, i, fired)
+		return true
+	}
 	// Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
 	fired := r.fs.fired
 	if fired == "" {
@@ -807,10 +896,13 @@ func (r *simRunner) step(i int) (cont bool) {
 		r.fs.powerLoss(uint64(i), armed.survive, armed.tear)
 		return r.recover(i, fired)
 	}
-	// In a shared trace any other fault kills only the process running the step; the others keep
-	// running over the same kernel state.
-	if r.shared && len(r.procs) > 1 {
-		pid := r.cur
+	// In a service trace any other fault kills the owner, the only process that touches the file,
+	// whichever process's step drove its I/O; the others keep running over the same kernel state.
+	if r.service && len(r.procs) > 1 {
+		pid := r.ownerPid()
+		if pid < 0 {
+			pid = r.cur
+		}
 		r.dropProc(pid)
 		r.fs.processDeath()
 		r.emit(`{"i":%d,"op":"killed","pid":%d,"fired":%q}`, i, pid, fired)
@@ -885,7 +977,7 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 	if r.maxQueryMemory > 0 {
 		s.SetMaxQueryMemoryBytes(r.maxQueryMemory)
 	}
-	if r.shared {
+	if r.service {
 		d, ok := r.digest(s, r.main())
 		if !r.observe(i, "session "+st.sid, s.Version(), d, ok) {
 			return
@@ -1056,6 +1148,11 @@ func (r *simRunner) digest(s *Session, d *simDB) (string, bool) {
 
 // checkLive runs the live integrity checker with read faults suspended, like every oracle read.
 func (r *simRunner) checkLive() error {
+	if r.db.core.pageClient() != nil {
+		// A page client reads pages only under a pinned transaction; its trees are the owner's pages,
+		// which the owner's own live check covers.
+		return nil
+	}
 	r.fs.oracle = true
 	defer func() { r.fs.oracle = false }()
 	return simCheckLive(r.db)
@@ -1079,7 +1176,7 @@ func (r *simRunner) committedDigest(d *simDB) (string, bool) {
 // other session (a reader pins its snapshot), no other process (co-resident commits are append-only),
 // and no fault.
 func (r *simRunner) quiet() bool {
-	return !r.shared && len(r.sessions) == 0 && r.fs.fault == nil
+	return !r.service && len(r.sessions) == 0 && r.fs.fault == nil
 }
 
 func (r *simRunner) stepCommit(i int, st simStep) {
@@ -1131,7 +1228,14 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 	for _, d := range dbs {
 		versions[d.name] = r.dbVersion(d)
 	}
-	r.emit(`{"i":%d,"op":"commit","sid":%q,"version":%d%s}`, i, st.sid, versions["main"], r.versionsJSON(versions))
+	role := ""
+	if r.service {
+		role = `,"role":"owner"`
+		if r.db.core.pageClient() != nil {
+			role = `,"role":"client"`
+		}
+	}
+	r.emit(`{"i":%d,"op":"commit","sid":%q,"version":%d%s%s}`, i, st.sid, versions["main"], r.versionsJSON(versions), role)
 	quiet := r.quiet()
 	for k, d := range dbs {
 		base, now, in := d.version, versions[d.name], before[k]
@@ -1147,6 +1251,11 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 				return
 			}
 			published, ok := r.committedDigest(d)
+			if !ok && r.service && r.fs.dead {
+				// The owner died later in this step (its maintenance commit hit the fault), so nothing can be
+				// read back through it; the acknowledged commit is checked by the recovery that follows.
+				published, ok = in.digest, true
+			}
 			if !ok || published != in.digest {
 				r.diagnostics = map[string]string{"before-commit.txt": in.text, "after-commit.txt": r.lastDigestText}
 				r.fail(i, "version %d of %s does not contain what its transaction saw before commit", now, d.name)
@@ -1160,6 +1269,12 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			if r.violation != "" {
 				return
 			}
+			if r.service && d.name == "main" {
+				r.serviceCommitted(i, d, base, now, in.digest)
+				if r.violation != "" {
+					return
+				}
+			}
 		default:
 			r.fail(i, "commit jumped %s from version %d to %d", d.name, base, now)
 			return
@@ -1168,6 +1283,69 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 	if err := r.checkLive(); err != nil {
 		r.fail(i, "after commit: %v", err)
 	}
+}
+
+// serviceCommitted runs the page-service checks after a commit of main published version now over
+// base (S8). A page client's commit must obey the commit-role rule (page-service.md §6): it never
+// rebuilds the free list, so the free list it persists is a subset of its base's. And an owner may
+// follow a client's commit with a maintenance commit — the unchanged snapshot at the next versions —
+// which joins the history with the same contents.
+func (r *simRunner) serviceCommitted(i int, d *simDB, base, now uint64, digest string) {
+	if r.db.core.pageClient() == nil {
+		return
+	}
+	image := r.image(d)
+	before, okb := simFreeList(image, r.pageSize, base)
+	after, oka := simFreeList(image, r.pageSize, now)
+	if okb && oka {
+		was := make(map[uint32]bool, len(before))
+		for _, pg := range before {
+			was[pg] = true
+		}
+		for _, pg := range after {
+			if !was[pg] {
+				r.fail(i, "commit-role rule: a page client's commit (version %d) freed page %d, which its base's free list does not hold", now, pg)
+				return
+			}
+		}
+	}
+	if r.fs.dead {
+		// The owner died later in this step; it may have been writing a maintenance commit, which
+		// recovery may select: the same contents at the next version.
+		d.addHistory(now+1, digest)
+		d.maxAttempted = max(d.maxAttempted, now+1)
+		return
+	}
+	owner := r.ownerPid()
+	if owner < 0 {
+		return
+	}
+	ov := r.procs[owner].db.Version()
+	if ov <= now {
+		return
+	}
+	for v := now + 1; v <= ov; v++ {
+		d.addHistory(v, digest)
+	}
+	d.version, d.maxAttempted, d.floor = ov, max(d.maxAttempted, ov), ov
+	r.emit(`{"i":%d,"op":"maintenance","version":%d}`, i, ov)
+}
+
+// simFreeList reads the free list the meta slot holding version v persists, from a file image.
+func simFreeList(image []byte, ps uint32, v uint64) ([]uint32, bool) {
+	for slot := 0; slot < 2; slot++ {
+		m, valid := readMeta(image, int(ps), slot)
+		if !valid || m.txid != v {
+			continue
+		}
+		p, err := pagerFromStore(newMemoryBlockStore(append([]byte(nil), image...)))
+		if err != nil {
+			return nil, false
+		}
+		free, err := readFreeList(newSharedPaging(p, 1), m.freeListHead, m.pageCount)
+		return free, err == nil
+	}
+	return nil, false
 }
 
 // --- bounded growth (simulation-testing.md §8.3) ------------------------------------------------
@@ -1214,7 +1392,7 @@ func (r *simRunner) observeGrowth(d *simDB) {
 //     written by the commit itself (its manifest and free-list pages);
 //   - the next quiet commit reuses that free list before it grows the file.
 func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
-	if r.shared {
+	if r.service {
 		return
 	}
 	pc, live, ok := simMetaOf(r.image(d), r.pageSize, d.version)
@@ -1263,19 +1441,31 @@ func (r *simRunner) stepEnd(i int, st simStep) {
 	} else {
 		// Snapshot isolation: a reader still sees exactly the version of every database it pinned,
 		// however many commits, reclamations, and page reuses happened since.
+		lost := false
 		if !ss.write {
 			for _, d := range r.order() {
 				pin, pinned := ss.pins[d.name]
 				if !pinned {
 					continue
 				}
-				if dg, ok := r.digest(ss.s, d); !ok || !d.history[pin][dg] {
+				dg, ok := r.digest(ss.s, d)
+				if !ok && r.service && simCode(r.digestErr) == "08006" {
+					// Under the page service a read transaction open across a change of its process's role
+					// fails 08006 (spec/pageservice/README.md §6.5): it never sees other contents.
+					lost = true
+					break
+				}
+				if !ok || !d.history[pin][dg] {
 					r.fail(i, "isolation: reader %s no longer sees version %d of %s", st.sid, pin, d.name)
 					break
 				}
 			}
 		}
 		ss.s.Close()
+		if lost {
+			r.emit(`{"i":%d,"op":%q,"sid":%q,"lost":true}`, i, st.kind, st.sid)
+			return
+		}
 	}
 	r.emit(`{"i":%d,"op":%q,"sid":%q}`, i, st.kind, st.sid)
 }
@@ -1336,7 +1526,7 @@ func (r *simRunner) stepCompact(i int, name string) {
 // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
 // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
 func (r *simRunner) stepAttach(i int, name string) {
-	if r.shared {
+	if r.service {
 		r.fail(i, "attach is single-process only")
 		return
 	}
@@ -1399,7 +1589,7 @@ func (r *simRunner) stepCheck(i int) {
 	for _, d := range r.order() {
 		v, dg, ok := r.committedView(d)
 		switch {
-		case r.shared && d.name == "main":
+		case r.service && d.name == "main":
 			// Another process may have died leaving a newer complete generation this one now adopts.
 			if !r.observe(i, "check", v, dg, ok) {
 				return
@@ -1453,7 +1643,7 @@ func (r *simRunner) stepReopen(i int) bool {
 		}
 		v := r.dbVersion(d)
 		dg, ok := r.committedDigest(d)
-		if r.shared && d.name == "main" {
+		if r.service && d.name == "main" {
 			// A process killed mid-commit may have left a complete generation no survivor began on yet.
 			if !r.observe(i, "reopened p0", v, dg, ok) {
 				return false
@@ -1667,6 +1857,10 @@ func (r *simRunner) closeProc(pid int) error {
 		r.locks.release(pid)
 	}
 	delete(r.procs, pid)
+	if r.service {
+		r.net.kill(pid)
+		r.net.settle()
+	}
 	return err
 }
 
@@ -1682,6 +1876,11 @@ func (r *simRunner) dropProc(pid int) {
 	delete(r.procs, pid)
 	if r.cur == pid {
 		r.db = nil
+	}
+	if r.service {
+		// The kernel closes a dead process's sockets.
+		r.net.kill(pid)
+		r.net.settle()
 	}
 }
 

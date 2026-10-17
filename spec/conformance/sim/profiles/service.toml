@@ -1,0 +1,31 @@
+# An owner and its page clients over one file under the page service (page-service.md;
+# simulation-testing.md §14 S8): processes spawn as the owner or as clients and exit, die, or lose
+# their connection; a client commits through the owner, which follows with maintenance commits; a
+# fault in the owner's I/O kills the owner, so a client resolves a lost commit and promotes itself at
+# its next begin, recovering the generation the owner left.
+
+description = "An owner and page clients: promotion, lost connections, client commits"
+
+processes = "service"
+max_procs = 3
+page_sizes = [256, 512]
+max_readers = 4
+
+[weights]
+spawn = 8
+exit = 1
+kill = 1
+disconnect = 2
+open_read = 7
+close_read = 4
+crash_power = 1
+crash_process = 1
+
+[faults]
+commit_fault = 250
+nth_max = 2
+power_loss = 2
+process_crash = 7
+disconnect = 4
+frames_max = 8
+issue = [800, 1000]

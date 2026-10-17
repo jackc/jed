@@ -424,7 +424,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   WAL: COW + the root swap already give atomicity *and* lock-free concurrency. Trade:
   write-amplification. A **logical** changeset stream is a separate higher-layer door, not
   foreclosed, not scheduled.
-- **Page service (ratified 2026-10-16; phases 1–3 landed, phase 4 landing).** One owner process alone touches the
+- **Page service (ratified 2026-10-16; phases 1–4 landed).** One owner process alone touches the
   database file and serves pages and whole-commit deltas to client processes, each running its own
   engine, over a local socket or SSH. It replaced shared multi-process mode at phase 4 (`locking =
   auto`) and carries remote access, backup, and replication. → [page-service.md](spec/design/page-service.md) §16
@@ -456,7 +456,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     attached file (today an owner-only non-serving owner: another process holding it means `55006`),
     taking every writer gate, local or remote, in
     real-path order with `lock_timeout_ms` as the backstop (page-service.md §5.5).
-  - [ ] **Phase 4 — handoff.** Promotion, ownership preference and yield, graceful close, the grace
+  - [x] **Phase 4 — handoff.** ✅ **landed.** Promotion, ownership preference and yield, graceful close, the grace
     periods; the process-corpus rewrite; simulation testing of owner + clients; retire shared mode,
     the `shared` and test-only `service` values, and locking.md §4–§5; a new bundle marker.
     - [x] **Handoff** (test-only `locking = service`, Rust, Go, TS; spec/pageservice/README.md §6.5):
@@ -469,7 +469,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       non-serving owner where serving is unavailable), `exclusive` a non-serving owner, the
       `protocol-v2` bundle of `presence` and `arrival`, file attachments owner-only until the item
       above; the process corpus runs every scenario under it.
-    - [ ] Simulation testing of owner + clients over a simulated transport.
+    - [x] **Simulation of an owner and its clients** (simulation-testing.md §14 S8, all three cores):
+      `# processes: service` traces over a simulated lock host and network, settled after every step;
+      disk faults kill the owner, `disconnect` steps and frame faults, the commit-role oracle, owner
+      maintenance commits in the history; the `service` profile, a regression trace, and the
+      `client-reclaims` plant.
   - [ ] **Phase 5 — SSH.** `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead
     and subtree fetch.
   - [ ] **Phase 6 — backup.** Page-identical and compacted forms.

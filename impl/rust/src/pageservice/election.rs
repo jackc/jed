@@ -18,7 +18,6 @@ use crate::file::OpenOptions;
 use crate::pageservice::client::{
     ClientLink, ClientPins, Connect, PsConnection, ServiceBlockStore, connect,
 };
-use crate::pageservice::endpoint;
 
 /// The outcome of an election: the owner's coordinator, or a connected client with its engine over
 /// the connection.
@@ -69,7 +68,7 @@ pub(crate) fn elect(
             return Err(e);
         }
     };
-    match run(host.as_ref(), path, &files, eo) {
+    match run(host, path, &files, eo) {
         Ok(None) => Ok(Election::Owner(FileCoordinator::elected_owner(
             Arc::clone(host),
             path.to_path_buf(),
@@ -94,30 +93,29 @@ pub(crate) fn elect(
 /// The election loop under arrival SH: `None` when this opener took presence EX (the owner), the
 /// opened client when it became one. Arrival is released on every return.
 fn run(
-    host: &dyn LockHost,
+    host_arc: &Arc<dyn LockHost>,
     path: &Path,
     files: &LockFiles,
     eo: &ElectOptions<'_>,
 ) -> Result<Option<(Arc<PsConnection>, Engine)>> {
+    let host = host_arc.as_ref();
     let deadline = deadline(host, eo.timeout_ms);
     lock_until(host, &files.arrival, false, deadline, path, false)?;
     let result = (|| {
         host.validate_marker(path)?;
         loop {
-            let paused = eo.pause_until.is_some_and(|until| Instant::now() < until);
+            let paused = eo.pause_until.is_some_and(|until| host.now() < until);
             if !eo.never && !paused && try_lock(host, &files.presence, true)? {
                 return Ok(None);
             }
             // The last record read words the timeout error (README.md §6.1 step 3).
-            let reason = match endpoint::read_owner_record(path) {
+            let reason = match host.read_owner_record(path) {
                 None => "",
-                Some(record)
-                    if record.uid != endpoint::current_uid(&endpoint::bundle_dir(path))? =>
-                {
+                Some(record) if record.uid != host.current_uid(path)? => {
                     "owned by another user's process"
                 }
                 Some(record) if !record.serving => "owned by a non-serving process",
-                Some(record) => match connect(path, &record.endpoint, eo.read_only) {
+                Some(record) => match connect(host_arc, path, &record.endpoint, eo.read_only) {
                     Connect::Connected(conn) => match open_client_engine(&conn, eo.opts) {
                         Ok(engine) => return Ok(Some((conn, engine))),
                         Err(e) => {
@@ -183,6 +181,7 @@ fn open_client_engine(conn: &Arc<PsConnection>, opts: &OpenOptions) -> Result<En
     link.release(begun.txid);
     let mut engine = loaded?;
     engine.path = Some(conn.db_path().to_path_buf());
+    // The handle's spill host replaces it when the role is installed (`ServiceHandoff::attach_host`).
     engine.spill = Some(crate::spillhost::os_spill_host(std::env::temp_dir()));
     engine.read_only = conn.read_only();
     if opts.work_mem != 0 {
