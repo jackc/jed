@@ -1417,6 +1417,47 @@ impl Engine {
 /// The location of a query's output column `i` — a set-operation operand, an `INSERT … SELECT`
 /// source (spec/design/error-fields.md §10.2):
 /// the select-list expression of a plain `SELECT`; unknown for a `*` list or any other operand.
+/// Whether output column `i` of an `INSERT ... SELECT` source is a bare string literal that
+/// PostgreSQL leaves `unknown` for the target column to type: an item of a plain SELECT's list (also
+/// under a nested WITH) that no ORDER BY or GROUP BY key names by ordinal or alias. A set operation,
+/// a `VALUES` query, `SELECT DISTINCT`, or a sort/grouping key on the item resolves it to text first
+/// (spec/design/grammar.md §24).
+pub(crate) fn output_column_is_string_literal(q: &QueryExpr, i: usize) -> bool {
+    match q {
+        QueryExpr::Select(s) if !s.distinct => {
+            let SelectItems::Items(items) = &s.items else {
+                return false;
+            };
+            let Some(item) = items.get(i) else {
+                return false;
+            };
+            if !matches!(item.expr, Expr::Literal(Literal::Text(_), _)) {
+                return false;
+            }
+            let ordinal = i as i64 + 1;
+            let names_item = |e: &Expr| match e {
+                Expr::Literal(Literal::Int(n), _) => *n == ordinal,
+                Expr::Column(c, _) => item.alias.as_deref() == Some(c.as_str()),
+                _ => false,
+            };
+            let sorted = s.order_by.iter().any(|k| {
+                k.ordinal == Some(ordinal)
+                    || (k.ordinal.is_none()
+                        && k.expr.is_none()
+                        && k.qualifier.is_none()
+                        && item.alias.as_deref() == Some(k.column.as_str()))
+            });
+            let mut grouped = false;
+            for g in &s.group_by {
+                g.for_each_expr(&mut |e| grouped |= names_item(e));
+            }
+            !sorted && !grouped
+        }
+        QueryExpr::With(w) => output_column_is_string_literal(&w.body, i),
+        QueryExpr::Select(_) | QueryExpr::SetOp(_) => false,
+    }
+}
+
 pub(crate) fn output_column_location(q: &QueryExpr, i: usize) -> SrcPos {
     match q {
         QueryExpr::Select(s) => match &s.items {

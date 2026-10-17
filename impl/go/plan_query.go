@@ -2048,6 +2048,45 @@ func setopName(op setOpKind) string {
 // outputColumnLocation is the location of a query's output column i — a set-operation operand, an
 // INSERT … SELECT source (spec/design/error-fields.md §10.2): the select-list expression of a plain
 // SELECT; unknown (0) for a `*` list or any other operand.
+// outputColumnIsStringLiteral reports whether output column i of an INSERT ... SELECT source is a
+// bare string literal that PostgreSQL leaves `unknown` for the target column to type: an item of a
+// plain SELECT's list (also under a nested WITH) that no ORDER BY or GROUP BY key names by ordinal or
+// alias. A set operation, a VALUES query, SELECT DISTINCT, or a sort/grouping key on the item
+// resolves it to text first (spec/design/grammar.md §24).
+func outputColumnIsStringLiteral(q queryExpr, i int) bool {
+	if q.With != nil {
+		return outputColumnIsStringLiteral(*q.With.Body, i)
+	}
+	s := q.Select
+	if s == nil || s.Distinct || s.Items.All || i >= len(s.Items.Items) {
+		return false
+	}
+	item := s.Items.Items[i]
+	if item.Expr.Kind != exprLiteral || item.Expr.Literal.Kind != literalText {
+		return false
+	}
+	ordinal := int64(i + 1)
+	isAlias := func(name string) bool { return item.Alias != nil && *item.Alias == name }
+	for _, k := range s.OrderBy {
+		if (k.Ordinal != nil && *k.Ordinal == ordinal) ||
+			(k.Ordinal == nil && k.Expr == nil && k.Qualifier == "" && isAlias(k.Column)) {
+			return false
+		}
+	}
+	grouped := false
+	for gi := range s.GroupBy {
+		s.GroupBy[gi].forEachExpr(func(e *exprNode) {
+			switch {
+			case e.Kind == exprLiteral && e.Literal.Kind == literalInt && e.Literal.Int == ordinal:
+				grouped = true
+			case e.Kind == exprColumn && isAlias(e.Column):
+				grouped = true
+			}
+		})
+	}
+	return !grouped
+}
+
 func outputColumnLocation(q queryExpr, i int) srcPos {
 	if q.Select == nil || q.Select.Items.All || i >= len(q.Select.Items.Items) {
 		return 0

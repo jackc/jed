@@ -709,7 +709,13 @@ impl Engine {
                     if let Some(p) = provided[i] {
                         match &col.ty {
                             Type::Scalar(s) => {
-                                if !q.column_types[p].assignable_to(*s) {
+                                let literal_adapts =
+                                    matches!(q.column_types[p], ResolvedType::Text)
+                                        && super::string_literal_adapts_to(*s)
+                                        && super::plan_query::output_column_is_string_literal(
+                                            &source, p,
+                                        );
+                                if !q.column_types[p].assignable_to(*s) && !literal_adapts {
                                     return Err(assignment_error(format!(
                                         "column {} is of type {} but expression is of type {}",
                                         col.name,

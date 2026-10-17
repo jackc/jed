@@ -80,6 +80,7 @@ import {
 } from "./types.ts";
 import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
 import type { Expr, OrderKey, QueryExpr, SetOpKind, TypeMod } from "./ast.ts";
+import { forEachGroupExpr } from "./ast.ts";
 export function evalArrayFunc(func: ArrayFuncName, vals: Value[], m: Meter): Value {
   switch (func) {
     case "array_ndims": {
@@ -1035,6 +1036,41 @@ export function exprLocation(e: Expr): number | undefined {
 // outputColumnLocation is the location of a query's output column i — a set-operation operand, an
 // INSERT … SELECT source (spec/design/error-fields.md §10.2): the select-list expression of a plain
 // SELECT; undefined for a `*` list or any other operand.
+// outputColumnIsStringLiteral reports whether output column i of an INSERT ... SELECT source is a
+// bare string literal that PostgreSQL leaves `unknown` for the target column to type: an item of a
+// plain SELECT's list (also under a nested WITH) that no ORDER BY or GROUP BY key names by ordinal or
+// alias. A set operation, a VALUES query, SELECT DISTINCT, or a sort/grouping key on the item
+// resolves it to text first (spec/design/grammar.md §24).
+export function outputColumnIsStringLiteral(q: QueryExpr, i: number): boolean {
+  if (q.kind === "withExpr") return outputColumnIsStringLiteral(q.body, i);
+  if (q.kind !== "select" || q.distinct || q.items.kind !== "list") return false;
+  const item = q.items.items[i];
+  if (item === undefined || item.expr.kind !== "literal" || item.expr.literal.kind !== "text") {
+    return false;
+  }
+  const ordinal = i + 1;
+  const isAlias = (name: string) => item.alias !== null && item.alias === name;
+  for (const k of q.orderBy) {
+    if (
+      k.ordinal === ordinal ||
+      (k.ordinal === null && k.expr === null && k.qualifier === null && isAlias(k.column))
+    ) {
+      return false;
+    }
+  }
+  let grouped = false;
+  for (const g of q.groupBy) {
+    forEachGroupExpr(g, (e) => {
+      if (e.kind === "literal" && e.literal.kind === "int" && e.literal.int === BigInt(ordinal)) {
+        grouped = true;
+      } else if (e.kind === "column" && isAlias(e.name)) {
+        grouped = true;
+      }
+    });
+  }
+  return !grouped;
+}
+
 export function outputColumnLocation(q: QueryExpr, i: number): number | undefined {
   if (q.kind !== "select" || q.items.kind !== "list") return undefined;
   const item = q.items.items[i];
@@ -1068,6 +1104,21 @@ export function astDeepEqual(a: unknown, b: unknown): boolean {
   return true;
 }
 
+// stringLiteralAdaptsTo reports whether a bare string literal projected by an INSERT ... SELECT
+// source adapts to a colTy column: the string-native types, whose input the per-row store parses
+// (22P02/22007/22008 on malformed input). PostgreSQL leaves such a literal `unknown` until it meets
+// the target column (spec/design/grammar.md §24); a numeric or boolean target still rejects it (42804).
+export function stringLiteralAdaptsTo(colTy: ScalarType): boolean {
+  return (
+    isUuid(colTy) ||
+    isBytea(colTy) ||
+    isTimestamp(colTy) ||
+    isTimestamptz(colTy) ||
+    isInterval(colTy) ||
+    isDate(colTy)
+  );
+}
+
 // assignableTo is the authoritative scalar storage-assignment predicate used by INSERT ...
 // SELECT, expression defaults, UPDATE, and ON CONFLICT DO UPDATE. It is the family-level subset
 // of storeValue: identities for every storable scalar, lossless numeric widening, and jsonb → json
@@ -1090,15 +1141,10 @@ export function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
     case "bool":
       return isBool(colTy);
     case "text":
-      return (
-        isText(colTy) ||
-        isUuid(colTy) ||
-        isBytea(colTy) ||
-        isTimestamp(colTy) ||
-        isTimestamptz(colTy) ||
-        isInterval(colTy) ||
-        isDate(colTy)
-      );
+      // A text-typed expression never becomes a uuid/bytea/datetime value without a CAST, as in
+      // PostgreSQL; a bare string literal adapts before this gate — at resolve, or via
+      // stringLiteralAdaptsTo for an INSERT ... SELECT projection.
+      return isText(colTy);
     case "bytea":
       return isBytea(colTy);
     case "uuid":

@@ -1748,12 +1748,25 @@ say) is an assignment cast that traps `22003` per row when the value does not fi
 PostgreSQL ([types.md](types.md) §5) — **or** to a decimal column (int→decimal widens); a
 decimal only to a decimal column (decimal→int is explicit-`CAST` only); `f32` to an `f32` or
 `f64` column and `f64` only to `f64` (an integer or decimal never assigns to a float column); a
-text projection to text/uuid/bytea/timestamp/timestamptz/date/interval (the documented
-text-adaptation, [types.md](types.md) §6 — the per-row store parses); `jsonb` to `jsonb` or
+text projection only to a text column; `jsonb` to `jsonb` or
 `json` (the `jsonb → json` assignment cast, [json.md](json.md) §6.1); every other scalar only to
 its own type; and a **NULL-typed** projection to **any** column (a `NOT NULL` target then traps
 `23502` per row, if any). A column the list omits is not type-checked — it takes its default
 else NULL.
+
+**A bare string literal in the select list adapts.** PostgreSQL leaves a string literal `unknown`
+until it meets the target column, so `INSERT INTO t (d) SELECT '2024-01-01'` stores a date and
+`INSERT INTO t (u) SELECT id, '…'` a uuid. jed admits such a literal into a uuid, bytea, date,
+timestamp, timestamptz, or interval column, the per-row store parsing it (`22P02` / `22007` /
+`22008` on malformed input) — under the same conditions PostgreSQL leaves it untyped: the item of a
+plain `SELECT` list (WHERE, GROUP BY / ORDER BY on other columns, LIMIT, a nested WITH, an alias,
+and parentheses are all fine). A set operation, a `VALUES` query, `SELECT DISTINCT`, a derived table
+or CTE column, or an ORDER BY / GROUP BY key that names the item by ordinal or alias resolves the
+literal to `text` first, and then the text gate above makes it `42804`. A text-typed *expression* —
+a text column, `||`, `CAST(… AS text)`, a scalar subquery, `CASE` / `COALESCE` — is text, and is
+`42804` into any non-text column, as in PostgreSQL (`spec/conformance/suites/dml/text_storage_assign.test`).
+A numeric or boolean target does not take the literal (`42804`, where PostgreSQL parses it —
+[types.md](types.md) §5's "a bare string never becomes a number").
 
 **A container column** — an array, a range, or a composite — takes a projection of **exactly its
 own type** or a NULL-typed one, the container rule `UPDATE` and an `INSERT … VALUES` expression

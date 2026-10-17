@@ -1,0 +1,166 @@
+# Storing a text value into a string-native column (grammar.md §24, types.md §5). A bare string
+# LITERAL adapts to a uuid / bytea / date / timestamp / interval column — in INSERT ... VALUES,
+# UPDATE ... SET, and as an item of a plain INSERT ... SELECT list, where PostgreSQL leaves the
+# literal `unknown` until it meets the target column. A text-typed EXPRESSION (a text column, `||`,
+# a CAST to text, a scalar subquery, a CASE / COALESCE, a set operation, a VALUES query, a derived
+# table's column, SELECT DISTINCT, or a literal an ORDER BY / GROUP BY key names) is text, and text
+# never becomes one of these types without an explicit CAST: 42804, as in PostgreSQL, even over an
+# empty source. Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.insert_values_expr, dml.update, query.select, query.where_eq, query.order_by, query.order_by_ordinal, query.limit, query.distinct, query.group_by, query.union, query.values_query, query.subquery_scalar, query.cte, query.aggregates, expr.case, expr.coalesce, expr.text_concat, types.i32, types.text, types.varchar_length, types.uuid, types.bytea, types.date, types.timestamp, types.interval
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, x text, d text)
+
+statement ok
+INSERT INTO src VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01')
+
+statement ok
+CREATE TABLE dst (id i32 PRIMARY KEY, u uuid, b bytea, d date, ts timestamp, iv interval, vc varchar(5))
+
+# --- a bare string literal adapts ------------------------------------------------------
+statement ok
+INSERT INTO dst (id, u, b, d, ts, iv) VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '\xdead', '2024-01-01', '2024-01-01 12:00:00', '1 day')
+
+statement ok
+INSERT INTO dst (id, u, b, d, ts, iv) SELECT 2, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '\xbeef', '2024-01-02', '2024-01-02 12:00:00', '2 days'
+
+# WHERE, LIMIT, a nested WITH, an alias, and parentheses keep it a bare select-list literal
+statement ok
+INSERT INTO dst (id, d) SELECT id + 2, '2024-01-03' FROM src WHERE id > 0
+
+statement ok
+INSERT INTO dst (id, d) SELECT 4, '2024-01-04' LIMIT 1
+
+statement ok
+INSERT INTO dst (id, d) WITH w AS (SELECT 1) SELECT 5, '2024-01-05'
+
+statement ok
+INSERT INTO dst (id, d) SELECT 6, ('2024-01-06') AS c
+
+# sorting or grouping by ANOTHER column leaves the literal alone
+statement ok
+INSERT INTO dst (id, d) SELECT 7, '2024-01-07' ORDER BY 1
+
+statement ok
+INSERT INTO dst (id, d) SELECT 8, '2024-01-08' FROM src GROUP BY 1
+
+statement ok
+UPDATE dst SET d = '2024-02-01', iv = '3 hours' WHERE id = 1
+
+query TTTTT nosort
+SELECT u, b, d, ts, iv FROM dst WHERE id <= 2 ORDER BY id
+----
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+\xdead
+2024-02-01
+2024-01-01 12:00:00
+03:00:00
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+\xbeef
+2024-01-02
+2024-01-02 12:00:00
+2 days
+
+query IT nosort
+SELECT id, d FROM dst WHERE id > 2 ORDER BY id
+----
+3
+2024-01-03
+4
+2024-01-04
+5
+2024-01-05
+6
+2024-01-06
+7
+2024-01-07
+8
+2024-01-08
+
+# a malformed literal traps the target type's parse
+statement error 22007
+INSERT INTO dst (id, d) SELECT 9, 'garbage'
+
+# --- a text column is text --------------------------------------------------------------
+statement error 42804
+INSERT INTO dst (id, u) SELECT id + 10, x FROM src
+
+statement error 42804
+INSERT INTO dst (id, b) SELECT id + 10, x FROM src
+
+statement error 42804
+INSERT INTO dst (id, d) SELECT id + 10, d FROM src
+
+statement error 42804
+INSERT INTO dst (id, ts) SELECT id + 10, d FROM src
+
+statement error 42804
+INSERT INTO dst (id, iv) SELECT id + 10, x FROM src
+
+# the gate is up front, so it fires over an empty source
+statement error 42804
+INSERT INTO dst (id, d) SELECT id + 10, d FROM src WHERE id > 100
+
+statement error 42804
+UPDATE dst SET u = (SELECT x FROM src WHERE id = 1) WHERE id = 1
+
+statement error 42804
+UPDATE dst SET d = (SELECT d FROM src WHERE id = 1) WHERE id = 1
+
+# a varchar(n) column takes text by assignment, truncation rules aside
+statement ok
+INSERT INTO dst (id, vc) SELECT 20, 'abc'::text
+
+query T nosort
+SELECT vc FROM dst WHERE id = 20
+----
+abc
+
+# --- text-typed expressions are text ----------------------------------------------------
+statement error 42804
+INSERT INTO dst (id, d) VALUES (21, '2024-01-01'::text)
+
+statement error 42804
+INSERT INTO dst (id, d) VALUES (21, '2024-01-' || '01')
+
+statement error 42804
+UPDATE dst SET iv = 1::text WHERE id = 1
+
+statement error 42804
+INSERT INTO dst (id, d) SELECT 21, '2024-01-01'::text FROM src WHERE id > 100
+
+statement error 42804
+INSERT INTO dst (id, ts) SELECT 21, CASE WHEN true THEN '2024-01-01' END
+
+statement error 42804
+INSERT INTO dst (id, ts) SELECT 21, COALESCE('2024-01-01', NULL)
+
+# --- a literal the source resolves to text first ----------------------------------------
+statement error 42804
+INSERT INTO dst (id, d) SELECT 21, '2024-01-01' UNION ALL SELECT 22, '2024-01-02'
+
+statement error 42804
+INSERT INTO dst (id, d) SELECT * FROM (VALUES (21, '2024-01-01')) v
+
+statement error 42804
+INSERT INTO dst (id, d) SELECT 21, c FROM (SELECT '2024-01-01' AS c) q
+
+statement error 42804
+WITH w AS (SELECT '2024-01-01' AS c) INSERT INTO dst (id, d) SELECT 21, c FROM w
+
+statement error 42804
+INSERT INTO dst (id, d) SELECT DISTINCT 21, '2024-01-01'
+
+statement error 42804
+INSERT INTO dst (id, d) SELECT 21, '2024-01-01' ORDER BY 2
+
+statement error 42804
+INSERT INTO dst (id, d) SELECT 21, '2024-01-01' AS c ORDER BY c
+
+statement error 42804
+INSERT INTO dst (id, d) SELECT 21, '2024-01-01' GROUP BY 2
+
+query I nosort
+SELECT count(*) FROM dst
+----
+9

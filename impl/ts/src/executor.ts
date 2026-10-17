@@ -521,6 +521,7 @@ import {
   combineSetop,
   exprEqual,
   exprLocation,
+  outputColumnIsStringLiteral,
   outputColumnLocation,
   requireAssignable,
   resolveSetopOrderKey,
@@ -528,6 +529,7 @@ import {
   scalarForParamHint,
   setopName,
   requireSetopEquality,
+  stringLiteralAdaptsTo,
   unifySetopColumn,
   unifyValuesColumn,
   widenToUnified,
@@ -10849,7 +10851,11 @@ export class Engine {
           }
           continue;
         }
-        if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
+        const literalAdapts =
+          q.columnTypes[p]!.kind === "text" &&
+          stringLiteralAdaptsTo(col.type.scalar) &&
+          outputColumnIsStringLiteral(ins.source.query, p);
+        if (!assignableTo(q.columnTypes[p]!, col.type.scalar) && !literalAdapts) {
           throw positionedAt(
             assignmentError(
               `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,

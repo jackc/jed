@@ -1226,7 +1226,9 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 					}
 					continue
 				}
-				if !assignableTo(q.columnTypes[p], col.Type.ScalarTy()) {
+				literalAdapts := q.columnTypes[p].kind == rtText &&
+					stringLiteralAdaptsTo(col.Type.ScalarTy()) && outputColumnIsStringLiteral(*ins.Query, p)
+				if !assignableTo(q.columnTypes[p], col.Type.ScalarTy()) && !literalAdapts {
 					return outcome{}, positionError(assignmentError(fmt.Sprintf(
 						"column %s is of type %s but expression is of type %s",
 						col.Name, col.Type.CanonicalName(), rtName(q.columnTypes[p]),
