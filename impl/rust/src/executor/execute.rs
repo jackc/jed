@@ -1228,7 +1228,18 @@ impl Engine {
                 || matches!(stmt, Statement::DropSequence(ds) if ds.names.iter().any(|n| self.is_temp_sequence(n)))
                 || matches!(stmt, Statement::AlterTable(at) if match at.db.as_deref() {
                     Some(q) => q == "temp",
-                    None => self.is_temp_table(&at.name),
+                    None => self.is_temp_table(&at.name) || self.is_temp_view(&at.name),
+                })
+                // A temporary view's DDL is temp DDL too (views.md §10): spelled TEMP or `temp.`,
+                // or naming one of the session's temporary views.
+                || matches!(stmt, Statement::CreateView(cv) if cv.temporary || cv.db.as_deref() == Some("temp"))
+                || matches!(stmt, Statement::DropView(dv) if dv.names.iter().any(|(db, n)| match db.as_deref() {
+                    Some(q) => q == "temp",
+                    None => self.is_temp_view(n),
+                }))
+                || matches!(stmt, Statement::AlterView(av) if match av.db.as_deref() {
+                    Some(q) => q == "temp",
+                    None => self.is_temp_view(&av.name),
                 })
                 || matches!(stmt, Statement::AlterSequence(als) if self.is_temp_sequence(&als.name))
             {
@@ -1318,9 +1329,17 @@ impl Engine {
     }
 
     fn collect_update_catalog_privs(&self, upd: &Update, req: &mut PrivReq) {
+        let original = upd;
         let mut upd = upd.clone();
         if self.rewrite_update_target(&mut upd).is_err() {
             return;
+        }
+        // A `SET c = DEFAULT` through a view assigns the view column default (views.md §16.1).
+        let locals = HashSet::new();
+        for (a, was) in upd.assignments.iter().zip(&original.assignments) {
+            if was.is_default {
+                collect_expr_privs(&a.value, req, &locals);
+            }
         }
         let Some(table) = self.table_scoped(upd.db.as_deref(), &upd.table) else {
             return;
@@ -1330,13 +1349,47 @@ impl Engine {
     }
 
     fn collect_insert_catalog_privs(&self, ins: &Insert, req: &mut PrivReq) {
+        let original = ins;
         let mut ins = ins.clone();
-        if self.rewrite_insert_target(&mut ins).is_err() {
+        let Ok(vw) = self.rewrite_insert_target(&mut ins) else {
             return;
-        }
+        };
         let Some(table) = self.table_scoped(ins.db.as_deref(), &ins.table) else {
             return;
         };
+        // The view column defaults the INSERT applies replace the table's (views.md §16.1).
+        let defaulted;
+        let table = match vw.as_ref().filter(|v| !v.default_overrides.is_empty()) {
+            Some(v) => match self.table_with_view_defaults(table, v, ins.overriding) {
+                Ok(t) => {
+                    defaulted = t;
+                    &defaulted
+                }
+                Err(_) => return,
+            },
+            None => table,
+        };
+        if let (
+            Some(OnConflict {
+                action: ConflictAction::DoUpdate { assignments, .. },
+                ..
+            }),
+            Some(OnConflict {
+                action:
+                    ConflictAction::DoUpdate {
+                        assignments: was, ..
+                    },
+                ..
+            }),
+        ) = (&ins.on_conflict, &original.on_conflict)
+        {
+            let locals = HashSet::new();
+            for (a, w) in assignments.iter().zip(was) {
+                if w.is_default && vw.is_some() {
+                    collect_expr_privs(&a.value, req, &locals);
+                }
+            }
+        }
         // The columns this INSERT defaults, exactly as execution selects them (dml.rs): every column
         // the list omits (all of them for DEFAULT VALUES), every OVERRIDING USER VALUE identity
         // column, and every column a VALUES row fills with DEFAULT. An unknown or repeated list

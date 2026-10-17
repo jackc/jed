@@ -14,7 +14,7 @@
 // WHERE clauses become the statement's check-option checks (resolveViewChecks, §15.6).
 
 import type { CheckOption, ConflictColumn, ConflictTarget, Expr } from "./ast.ts";
-import type { Column, Table } from "./catalog.ts";
+import type { Column, DefaultExpr, Table } from "./catalog.ts";
 import type { EngineError } from "./errors.ts";
 import { engineError } from "./errors.ts";
 import type { RExpr } from "./executor.ts";
@@ -81,6 +81,9 @@ export type ViewWrite = {
   top: WriteLayer;
   targets: string[];
   conflictSet: string[];
+  // The base columns (by ordinal) whose default an INSERT through the view replaces with a view
+  // column default, nearest the target first (views.md §16.1). Empty for UPDATE and DELETE.
+  defaultOverrides: [number, DefaultExpr][];
 };
 
 // viewConflictTarget maps an ON CONFLICT target through the view to the base table (views.md

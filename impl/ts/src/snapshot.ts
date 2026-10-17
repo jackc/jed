@@ -853,6 +853,19 @@ export class Snapshot {
       for (const d of this.fkDependentsExcluding(drops)) {
         this.removeForeignKey(d.refTableKey, d.fkName);
       }
+      // The temporary views that read a dropped table, or a sequence it owns, go with it, as under
+      // DROP TABLE … CASCADE (views.md §10). Only temporary views can.
+      const owned = [...drops].flatMap((t) => this.sequencesOwnedBy(t));
+      const seeds = this.viewsSorted()
+        .filter((v) =>
+          v.deps.some(
+            (d) =>
+              (d.kind === "table" && drops.has(d.name)) ||
+              (d.kind === "sequence" && owned.includes(d.name)),
+          ),
+        )
+        .map((v) => v.name);
+      for (const view of this.viewDropClosure(seeds)) this.removeView(view);
     }
     for (const name of drops) {
       for (const sk of this.sequencesOwnedBy(name)) this.removeSequence(sk);

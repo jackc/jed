@@ -211,9 +211,10 @@ test("serialization errors leave local and recovered writers usable without stor
     const db = recovered ? openStore(store) : initial.db;
     const before = store.image();
     store.reset();
-    const columns = Array.from({ length: 40 }, (_, i) => `c${i} i32`).join(",");
+    // A CHECK text longer than its u16 length field cannot be serialized (0A000).
+    const long = "x".repeat(70_000);
     assert.throws(
-      () => execute(db, `CREATE TABLE wide (${columns})`),
+      () => execute(db, `CREATE TABLE wide (c text CHECK (c <> '${long}'))`),
       (error: unknown) => error instanceof EngineError && error.code() === "0A000",
     );
     assert.deepEqual(store.events, []);

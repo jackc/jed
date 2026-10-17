@@ -81,30 +81,9 @@ DROP VIEW tabs
 # --- deferred forms are recognized and refused with 0A000 -------------------------------------------
 
 statement error 0A000
-CREATE TEMP VIEW tv AS SELECT a FROM t
-
-statement error 0A000
-CREATE TEMPORARY VIEW tv AS SELECT a FROM t
-
-statement error 0A000
-CREATE RECURSIVE VIEW rv (n) AS SELECT 1
-
-statement error 0A000
 CREATE MATERIALIZED VIEW mv AS SELECT a FROM t
 
-statement error 0A000
-CREATE VIEW ov WITH (security_barrier) AS SELECT a FROM t
-
-statement error 0A000
-CREATE OR REPLACE TEMP VIEW tv AS SELECT a FROM t
-
-# ALTER VIEW actions other than RENAME
-statement error 0A000
-ALTER VIEW v ALTER COLUMN a SET DEFAULT 1
-
-statement error 0A000
-ALTER VIEW v ALTER a DROP DEFAULT
-
+# ALTER VIEW … OWNER TO and SET SCHEMA: jed has no owners or schemas
 statement error 0A000
 ALTER VIEW v OWNER TO someone
 
@@ -112,10 +91,7 @@ statement error 0A000
 ALTER VIEW v SET SCHEMA public
 
 statement error 0A000
-ALTER VIEW v SET (security_barrier = true)
-
-statement error 0A000
-ALTER VIEW v RESET (security_barrier)
+ALTER VIEW v ALTER COLUMN a SET DEFAULT 1, OWNER TO someone
 
 statement error 42P01
 SELECT * FROM cv
@@ -135,14 +111,15 @@ ALTER VIEW IF EXISTS t RENAME COLUMN a TO a9
 statement error 42939
 ALTER VIEW v RENAME TO jed_v
 
-# a qualifier other than main
-statement error 0A000
+# a temp. qualifier names the session's temporary views only
+statement error 42P01
 ALTER VIEW temp.v RENAME TO v9
 
 statement error 42P01
 ALTER VIEW nosuchdb.v RENAME TO v9
 
-statement error 0A000
+# a persistent view cannot be replaced by a temporary one
+statement error 42P07
 CREATE OR REPLACE VIEW temp.v AS SELECT a, b FROM t
 
 statement ok
@@ -160,8 +137,16 @@ SELECT * FROM main.mv
 ----
 x
 
-statement error 0A000
+statement ok
 CREATE VIEW temp.tv AS SELECT a FROM t
+
+query T nosort
+SELECT name FROM temp.jed_views
+----
+tv
+
+statement ok
+DROP VIEW temp.tv
 
 # a repeated name is deduplicated only after its qualifier is validated
 statement error 42P01
@@ -175,22 +160,37 @@ DROP VIEW mv, nosuchdb.mv
 statement error 42P01
 DROP SEQUENCE v
 
-# --- a persistent view may not read a temporary relation --------------------------------------------
+# --- a view that reads a temporary relation is temporary ---------------------------------------------
 
 statement ok
 CREATE TEMP TABLE tt (z i32)
 
-statement error 0A000
+statement ok
 CREATE VIEW tv AS SELECT z FROM tt
 
-statement error 0A000
-CREATE VIEW tv AS SELECT z FROM temp.tt
-
-statement error 0A000
-CREATE VIEW tv AS SELECT a FROM t WHERE a IN (SELECT z FROM tt)
+statement ok
+CREATE VIEW tv2 AS SELECT z FROM temp.tt
 
 statement ok
-DROP TABLE tt
+CREATE VIEW tv3 AS SELECT a FROM t WHERE a IN (SELECT z FROM tt)
+
+query T nosort
+SELECT name FROM temp.jed_views ORDER BY name
+----
+tv
+tv2
+tv3
+
+query T nosort
+SELECT name FROM jed_views WHERE name LIKE 'tv%'
+----
+
+statement ok
+DROP TABLE tt CASCADE
+
+query T nosort
+SELECT name FROM temp.jed_views
+----
 
 # --- a rolled-back CASCADE restores every view it dropped -------------------------------------------
 
@@ -240,7 +240,7 @@ CREATE TABLE child (r i32 REFERENCES parent (k))
 statement ok
 DROP TABLE parent CASCADE
 
-# --- untracked dependencies: a dropped sequence fails the view when it is used ----------------------
+# --- a view depends on the sequence it names (views.md §6) ---------------------------------------------
 
 statement ok
 CREATE SEQUENCE s
@@ -283,14 +283,14 @@ SELECT * FROM vs
 ----
 1
 
-statement ok
+statement error 2BP01
 DROP SEQUENCE s
+
+statement ok
+DROP SEQUENCE s CASCADE
 
 statement error 42P01
 SELECT * FROM vs
-
-statement ok
-DROP VIEW vs
 
 # --- `*` that cannot be expanded by name -------------------------------------------------------------
 
@@ -507,34 +507,22 @@ DROP VIEW vtm
 statement ok
 DROP TABLE tm
 
-# --- a broken view (an untracked dependency was dropped) can be repaired by replacing it -----------
+# --- a view depends on a composite type it names (views.md §6) ------------------------------------
 
 statement ok
 CREATE TYPE pair AS (x i32, y i32)
 
 statement ok
-CREATE VIEW vbroken AS SELECT ('(1,2)'::pair).x AS n
+CREATE VIEW vpair AS SELECT ('(1,2)'::pair).x AS n
 
-statement ok
+statement error 2BP01
 DROP TYPE pair
 
-statement error 42704
-SELECT * FROM vbroken
-
-# only the names and the count are compared: the type may differ from the broken body's
 statement ok
-CREATE OR REPLACE VIEW vbroken AS SELECT 'fixed' AS n
+DROP TYPE pair CASCADE
 
-query T nosort
-SELECT * FROM vbroken
-----
-fixed
-
-statement error 42P16
-CREATE OR REPLACE VIEW vbroken AS SELECT 'x' AS m
-
-statement ok
-DROP VIEW vbroken
+statement error 42P01
+SELECT * FROM vpair
 
 # --- transactions: CREATE / DROP VIEW roll back --------------------------------------------------
 

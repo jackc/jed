@@ -520,6 +520,11 @@ func (db *engine) checkPrivileges(stmt statement) error {
 			(stmt.DropIndex != nil && db.isTempIndex(stmt.DropIndex.Name)) ||
 			(stmt.DropSequence != nil && db.anyTempSequence(stmt.DropSequence.Names)) ||
 			(stmt.AlterTable != nil && db.alterTableTargetsTemp(stmt.AlterTable)) ||
+			// A temporary view's DDL is temp DDL too (views.md §10): spelled TEMP or temp., or naming
+			// one of the session's temporary views.
+			(stmt.CreateView != nil && (stmt.CreateView.Temporary || (stmt.CreateView.DB != nil && *stmt.CreateView.DB == "temp"))) ||
+			(stmt.DropView != nil && db.dropViewTargetsTemp(stmt.DropView)) ||
+			(stmt.AlterView != nil && db.viewNameTargetsTemp(stmt.AlterView.DB, stmt.AlterView.Name)) ||
 			(stmt.AlterSequence != nil && db.isTempSequence(stmt.AlterSequence.Name)):
 			allowed = db.session.allowTempDDL
 		default:
@@ -598,9 +603,19 @@ func (db *engine) collectCteCatalogPrivs(body *cteBody, req *privReq) {
 }
 
 func (db *engine) collectUpdateCatalogPrivs(upd *update, req *privReq) {
-	upd, _, err := db.rewriteUpdateTarget(upd)
+	original := upd
+	upd, vw, err := db.rewriteUpdateTarget(upd)
 	if err != nil {
 		return
+	}
+	// A SET c = DEFAULT through a view assigns the view column default (views.md §16.1).
+	if vw != nil {
+		locals := map[string]bool{}
+		for i := range upd.Assignments {
+			if original.Assignments[i].IsDefault {
+				collectExprPrivs(&upd.Assignments[i].Value, req, locals)
+			}
+		}
 	}
 	table, ok := db.lkpTableScoped(upd.DB, upd.Table)
 	if !ok {
@@ -611,13 +626,28 @@ func (db *engine) collectUpdateCatalogPrivs(upd *update, req *privReq) {
 }
 
 func (db *engine) collectInsertCatalogPrivs(ins *insert, req *privReq) {
-	ins, _, err := db.rewriteInsertTarget(ins)
+	original := ins
+	ins, vw, err := db.rewriteInsertTarget(ins)
 	if err != nil {
 		return
 	}
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table)
 	if !ok {
 		return
+	}
+	// The view column defaults the INSERT applies replace the table's (views.md §16.1).
+	if vw != nil && len(vw.defaultOverrides) > 0 {
+		if table, err = db.tableWithViewDefaults(table, vw, ins.Overriding); err != nil {
+			return
+		}
+	}
+	if vw != nil && ins.OnConflict != nil && ins.OnConflict.DoUpdate {
+		locals := map[string]bool{}
+		for i := range ins.OnConflict.Assignments {
+			if original.OnConflict.Assignments[i].IsDefault {
+				collectExprPrivs(&ins.OnConflict.Assignments[i].Value, req, locals)
+			}
+		}
 	}
 	// The columns this INSERT defaults, exactly as execution selects them (dml.go): every column the
 	// list omits (all of them for DEFAULT VALUES), every OVERRIDING USER VALUE identity column, and
@@ -693,7 +723,27 @@ func (db *engine) alterTableTargetsTemp(at *alterTable) bool {
 	if at.DB != nil {
 		return *at.DB == "temp"
 	}
-	return db.isTempTable(at.Name)
+	return db.isTempTable(at.Name) || db.isTempView(at.Name)
+}
+
+// viewNameTargetsTemp classifies a view name for the split DDL gate (views.md §10): temp.v is temp
+// DDL, another qualifier is not, and a bare name is when it names one of the session's temporary
+// views.
+func (db *engine) viewNameTargetsTemp(q *string, name string) bool {
+	if q != nil {
+		return *q == "temp"
+	}
+	return db.isTempView(name)
+}
+
+// dropViewTargetsTemp reports whether any name in a DROP VIEW list is temp DDL (viewNameTargetsTemp).
+func (db *engine) dropViewTargetsTemp(dv *dropView) bool {
+	for _, qn := range dv.Names {
+		if db.viewNameTargetsTemp(qn.DB, qn.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // gateReadLanes runs the admission gates that the lazy read lanes (tryScanQuery / tryDeferredQuery)

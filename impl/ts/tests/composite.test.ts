@@ -68,13 +68,18 @@ test("composite values persist through the on-disk image", () => {
   ]);
 });
 
-test("DROP TYPE ... CASCADE is 0A000", () => {
+// CASCADE drops only dependent views (views.md §6.1): a type a column uses is still 0A000, and an
+// unused type drops.
+test("DROP TYPE ... CASCADE of a type a column uses is 0A000", () => {
   const db = memDb().session();
   run(db, "CREATE TYPE addr AS (a i32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, x addr)");
   assert.equal(
     errCode(() => run(db, "DROP TYPE addr CASCADE")),
     "0A000",
   );
+  run(db, "DROP TABLE t");
+  run(db, "DROP TYPE addr CASCADE");
 });
 
 test("nested type self- or forward-reference is 42704", () => {

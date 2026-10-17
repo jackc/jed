@@ -98,6 +98,16 @@ type viewWrite struct {
 	top         *writeLayer
 	targets     []string
 	conflictSet []string
+	// defaultOverrides are the base columns (by ordinal) whose default an INSERT through the view
+	// replaces with a view column default, nearest the target first (views.md §16.1). Empty for UPDATE
+	// and DELETE.
+	defaultOverrides []viewDefaultOverride
+}
+
+// viewDefaultOverride is one base column whose default an INSERT through a view replaces.
+type viewDefaultOverride struct {
+	ordinal int
+	def     *defaultExprDef
 }
 
 // conflictTarget maps an ON CONFLICT target through the view to the base table (views.md §15.7): a
@@ -243,19 +253,24 @@ func (db *engine) dmlTargetView(q *string, name string) (*viewDef, error) {
 	if err := db.rejectAttachedView(q, name); err != nil {
 		return nil, err
 	}
-	snap := db.readSnap()
 	switch {
 	case q == nil:
 		if _, ok := db.lkpTable(name); ok {
 			return nil, nil
 		}
-	case *q != "main":
-		return nil, nil
+		return db.visibleView(name), nil
+	case *q == "main":
+		if _, ok := db.readSnap().table(name); ok {
+			return nil, nil
+		}
+		return db.readSnap().view(name), nil
+	case *q == "temp":
+		if db.isTempTable(name) {
+			return nil, nil
+		}
+		return db.tempSnap().view(name), nil
 	}
-	if _, ok := snap.table(name); ok {
-		return nil, nil
-	}
-	return snap.view(name), nil
+	return nil, nil
 }
 
 // updatableShape returns the single FROM item of an automatically updatable body (views.md §15.1),
@@ -290,8 +305,7 @@ func (db *engine) updatableShape(body *queryExpr, checkCols bool) (*selectStmt, 
 	if _, ok := catalogRelKind(tref.Name); ok {
 		return nil, nil
 	}
-	snap := db.readSnap()
-	if _, ok := snap.table(tref.Name); !ok && snap.view(tref.Name) == nil {
+	if _, ok := db.lkpTable(tref.Name); !ok && db.visibleView(tref.Name) == nil {
 		return nil, nil
 	}
 	if checkCols {
@@ -402,15 +416,14 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 		if tref.Alias != nil {
 			label = *tref.Alias
 		}
-		snap := db.readSnap()
 		var belowNames []string
-		base, isTable := snap.table(tref.Name)
+		base, isTable := db.lkpTable(tref.Name)
 		if isTable {
 			for _, c := range base.Columns {
 				belowNames = append(belowNames, c.Name)
 			}
 		} else {
-			belowNames = snap.view(tref.Name).Columns
+			belowNames = db.visibleView(tref.Name).Columns
 		}
 		belowNames = renamedNames(belowNames, tref.ColumnAliases)
 		cols := make([]layerCol, len(sel.Items.Items))
@@ -424,7 +437,17 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 		}
 		if checkCols {
 			first := -1
-			for _, c := range slices.Concat(cur, setCur) {
+			ordered := slices.Concat(cur, setCur)
+			// An INSERT also targets every column of this view that has a default, which it fills
+			// when the statement does not (views.md §16.1).
+			if kind == writeInsert {
+				for c := range cols {
+					if levelView.viewDefault(c) != nil {
+						ordered = append(ordered, c)
+					}
+				}
+			}
+			for _, c := range ordered {
 				if cols[c].expr != nil && (first < 0 || c < first) {
 					first = c
 				}
@@ -451,7 +474,7 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 			table, tableRename = base, tref.ColumnAliases
 			break
 		}
-		levelView = snap.view(tref.Name)
+		levelView = db.visibleView(tref.Name)
 		rename = tref.ColumnAliases
 	}
 	// 6. Two targets that reach the same table column (42701): among the statement's targets, then
@@ -460,6 +483,25 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 		for i, c := range list {
 			if slices.Contains(list[:i], c) {
 				return nil, newError(DuplicateColumn, fmt.Sprintf("column %s assigned more than once", table.Columns[c].Name))
+			}
+		}
+	}
+	// The view column defaults an INSERT applies (views.md §16.1): each base column takes the default
+	// of the first view, from the target down, that has one for a column leading to it.
+	var overrides []viewDefaultOverride
+	if kind == writeInsert {
+		for k, level := range levels {
+			for c, def := range level.view.Defaults {
+				if def == nil {
+					continue
+				}
+				idx := c
+				for _, below := range levels[k:] {
+					idx = below.cols[idx].ref
+				}
+				if !slices.ContainsFunc(overrides, func(o viewDefaultOverride) bool { return o.ordinal == idx }) {
+					overrides = append(overrides, viewDefaultOverride{ordinal: idx, def: def})
+				}
 			}
 		}
 	}
@@ -485,7 +527,7 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 			belowLabel: level.label, filter: level.filter, check: level.view.CheckOption,
 		}
 	}
-	vw := &viewWrite{view: layer.view, table: table.Name, top: layer}
+	vw := &viewWrite{view: layer.view, table: table.Name, top: layer, defaultOverrides: overrides}
 	for _, c := range cur {
 		vw.targets = append(vw.targets, table.Columns[c].Name)
 	}
@@ -658,11 +700,15 @@ func (db *engine) rewriteInsertTarget(ins *insert) (*insert, *viewWrite, error) 
 		oc := *ins.OnConflict
 		oc.Assignments = make([]assignment, len(ins.OnConflict.Assignments))
 		for i, a := range ins.OnConflict.Assignments {
-			a.Column = vw.conflictSet[i]
 			if a.IsDefault {
 				a.IsDefault = false
-				a.Value = exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}
+				v, err := db.viewSetDefault(vw.view, a.Column)
+				if err != nil {
+					return ins, nil, err
+				}
+				a.Value = v
 			}
+			a.Column = vw.conflictSet[i]
 			oc.Assignments[i] = a
 		}
 		c.OnConflict = &oc
@@ -670,9 +716,51 @@ func (db *engine) rewriteInsertTarget(ins *insert) (*insert, *viewWrite, error) 
 	return &c, vw, nil
 }
 
+// tableWithViewDefaults is the base table an INSERT through a view writes, with the view column
+// defaults it applies in place of the table's own (views.md §16.1). On an identity column the view
+// default is a supplied value: OVERRIDING USER VALUE discards it, and a GENERATED ALWAYS column takes
+// it only under OVERRIDING SYSTEM VALUE (else 428C9), as in PostgreSQL.
+func (db *engine) tableWithViewDefaults(table *catTable, vw *viewWrite, overriding *overridingKind) (*catTable, error) {
+	out := *table
+	out.Columns = append([]catColumn(nil), table.Columns...)
+	for _, o := range vw.defaultOverrides {
+		col := &out.Columns[o.ordinal]
+		if col.Identity != nil {
+			if overriding != nil && *overriding == overridingUser {
+				continue
+			}
+			if *col.Identity == identityAlways && (overriding == nil || *overriding != overridingSystem) {
+				return nil, newError(GeneratedAlways, fmt.Sprintf("cannot insert a non-DEFAULT value into column %s", col.Name))
+			}
+		}
+		col.Default = nil
+		col.DefaultExpr = o.def
+	}
+	return &out, nil
+}
+
+// viewSetDefault is the value `SET c = DEFAULT` assigns through a view (views.md §16.1): the target
+// view's own default for column c, else NULL — never a default further down the chain or the base
+// column's (PostgreSQL's rewrite). An unparsable default is XX003.
+func (db *engine) viewSetDefault(view, column string) (exprNode, error) {
+	var def *defaultExprDef
+	if v := db.visibleView(view); v != nil {
+		if i := slices.Index(v.Columns, column); i >= 0 {
+			def = v.viewDefault(i)
+		}
+	}
+	switch {
+	case def == nil:
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}, nil
+	case def.Unparsed:
+		return exprNode{}, unparsableDefaultError(view, column)
+	}
+	return def.Expr, nil
+}
+
 // rewriteUpdateTarget retargets an UPDATE through an updatable view at its base table (views.md
 // §15.2): each assignment names its base column, and `SET c = DEFAULT` assigns the view column's
-// default, which is NULL (jed has no view column defaults).
+// default (§16.1), else NULL.
 func (db *engine) rewriteUpdateTarget(upd *update) (*update, *viewWrite, error) {
 	targets := make([]string, len(upd.Assignments))
 	targetPos := make([]srcPos, len(upd.Assignments))
@@ -688,11 +776,15 @@ func (db *engine) rewriteUpdateTarget(upd *update) (*update, *viewWrite, error) 
 	c.Table, c.DB = vw.table, nil
 	c.Assignments = make([]assignment, len(upd.Assignments))
 	for i, a := range upd.Assignments {
-		a.Column = vw.targets[i]
 		if a.IsDefault {
 			a.IsDefault = false
-			a.Value = exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}
+			v, err := db.viewSetDefault(vw.view, a.Column)
+			if err != nil {
+				return upd, nil, err
+			}
+			a.Value = v
 		}
+		a.Column = vw.targets[i]
 		c.Assignments[i] = a
 	}
 	return &c, vw, nil

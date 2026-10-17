@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 )
 
 // Views (spec/design/views.md): CREATE VIEW / DROP VIEW, reading a view as the equivalent derived
@@ -39,6 +40,15 @@ type viewTrace struct {
 	viewColumns map[traceColumn]bool
 	// stars is each written star's expansion, keyed by its token position.
 	stars map[tokPos]traceStar
+	// sequences are the sequences the body names in a constant nextval / currval / setval argument
+	// (§6).
+	sequences map[string]bool
+	// types are the composite types the body names as a type (§6); the output column types join at
+	// CREATE.
+	types map[string]bool
+	// readsTemp is whether the body reads a temporary relation or sequence, so the view is temporary
+	// (§10).
+	readsTemp bool
 }
 
 func newViewTrace() *viewTrace {
@@ -48,6 +58,8 @@ func newViewTrace() *viewTrace {
 		columns:     map[traceColumn]bool{},
 		viewColumns: map[traceColumn]bool{},
 		stars:       map[tokPos]traceStar{},
+		sequences:   map[string]bool{},
+		types:       map[string]bool{},
 	}
 }
 
@@ -159,9 +171,39 @@ func (db *engine) traceStar(pos tokPos, qualified bool, cols []starColumn) {
 	}
 }
 
-// traceTableItem records a FROM item that binds a base table. A persistent view may read only the
-// persistent relations of its own database: a temporary table (bare or temp.-qualified) or an
-// attached database's table is 0A000 (views.md §10).
+// traceSequence records the sequence a traced body names in the constant first argument of nextval /
+// currval / setval (views.md §6). The name must be a sequence, else 42P01, as PostgreSQL's regclass
+// reading of the constant fails at definition. A temporary sequence makes the view temporary (§10).
+// Text that is not one identifier is left to the call to report.
+func (db *engine) traceSequence(text string) error {
+	if db.viewTrace == nil {
+		return nil
+	}
+	name, err := parseNameText(text)
+	if err != nil {
+		return nil
+	}
+	if db.sequence(name) == nil {
+		return newError(UndefinedTable, fmt.Sprintf("relation \"%s\" does not exist", name))
+	}
+	if db.isTempSequence(name) {
+		db.viewTrace.readsTemp = true
+	}
+	db.viewTrace.sequences[name] = true
+	return nil
+}
+
+// traceType records a composite type a traced body names as a type — a cast target or a typed
+// literal (views.md §6). Array suffixes are stripped by the caller.
+func (db *engine) traceType(name string) {
+	if db != nil && db.viewTrace != nil {
+		db.viewTrace.types[name] = true
+	}
+}
+
+// traceTableItem records a FROM item that binds a base table. A view may read only the relations of
+// its own database and the session's temporary domain — an attached database's table is 0A000; a
+// temporary table makes the view temporary (views.md §10).
 func (db *engine) traceTableItem(tref *tableRef, table *catTable) error {
 	if db.viewTrace == nil {
 		return nil
@@ -172,11 +214,11 @@ func (db *engine) traceTableItem(tref *tableRef, table *catTable) error {
 	} else {
 		temp = *tref.DB == "temp"
 	}
-	if temp {
-		return viewNotSupported(fmt.Sprintf("a view cannot read the temporary relation \"%s\"", tref.Name))
-	}
 	if isAttachmentScope(tref.DB) {
 		return viewNotSupported(fmt.Sprintf("a view cannot read the attached relation \"%s.%s\"", *tref.DB, tref.Name))
+	}
+	if temp {
+		db.viewTrace.readsTemp = true
 	}
 	db.viewTrace.items[tref.NamePos] = traceItem{
 		kind: viewDepTable, name: table.Name,
@@ -259,25 +301,29 @@ func (db *engine) traceViewBody(body *queryExpr) (queryPlan, *viewTrace, error) 
 // --- Reading a view (views.md §4) ------------------------------------------------------------------
 
 // relationView returns the view a relation reference that is not a CTE names, or nil (§4): a built-in
-// catalog relation, then a table (session-local temp first for a bare name), then a view. Only bare
-// and main. names reach a view; another qualifier never does (§10).
+// catalog relation, then a table (session-local temp first for a bare name), then a view (the
+// session's temporary view first). Only bare, main., and temp. names reach a view; another qualifier
+// never does (§10).
 func (db *engine) relationView(qualifier *string, name string) *viewDef {
-	if qualifier != nil && *qualifier != "main" {
+	var view *viewDef
+	shadowed := false
+	switch {
+	case qualifier == nil:
+		view = db.visibleView(name)
+		_, shadowed = db.lkpTable(name)
+	case *qualifier == "main":
+		view = db.readSnap().view(name)
+		_, shadowed = db.readSnap().table(name)
+	case *qualifier == "temp":
+		view = db.tempSnap().view(name)
+		shadowed = db.isTempTable(name)
+	default:
 		return nil
 	}
-	snap := db.readSnap()
-	view := snap.view(name)
-	if view == nil {
+	if view == nil || shadowed {
 		return nil
 	}
 	if _, ok := catalogRelKind(name); ok {
-		return nil
-	}
-	if qualifier == nil {
-		if _, ok := db.lkpTable(name); ok {
-			return nil
-		}
-	} else if _, ok := snap.table(name); ok {
 		return nil
 	}
 	return view
@@ -333,6 +379,9 @@ func (db *engine) viewReference(tref *tableRef, ctes []*cteBinding) (tableRef, s
 // the dependency on the view itself.
 func (db *engine) planViewReference(viewName string, body *queryExpr, written *tableRef, site viewSite, ptypes *paramTypes) (queryPlan, error) {
 	if db.viewTrace != nil {
+		if db.tempSnap().view(viewName) != nil {
+			db.viewTrace.readsTemp = true
+		}
 		db.viewTrace.items[written.NamePos] = traceItem{
 			kind: viewDepView, name: viewName,
 			namePos: written.NamePos, aliasPos: written.AliasPos, listOpen: written.ListOpen, listClose: written.ListClose,
@@ -444,23 +493,172 @@ func (db *engine) viewsInDependencyOrder() []*viewDef {
 	return out
 }
 
-// isView reports whether name names a view of the main database (the relation namespace, views.md
-// §2).
-func (db *engine) isView(name string) bool { return db.readSnap().view(name) != nil }
+// isView reports whether name names a view visible to the session: a temporary view of the session or
+// a view of the main database (the relation namespace, views.md §2/§10).
+func (db *engine) isView(name string) bool { return db.visibleView(name) != nil }
+
+// visibleView returns the view name visible to the session, the session's temporary view first
+// (views.md §10). Preclude-overlaps keeps a name in at most one domain (temp-tables.md §3).
+func (db *engine) visibleView(name string) *viewDef {
+	if v := db.tempSnap().view(name); v != nil {
+		return v
+	}
+	return db.readSnap().view(name)
+}
+
+// isTempView reports whether name is a temporary view of the session (views.md §10).
+func (db *engine) isTempView(name string) bool { return db.tempSnap().view(name) != nil }
+
+// sessionViews returns every view visible to the session — the main database's and the session's
+// temporary ones — in name byte order (views.md §10).
+func (db *engine) sessionViews() []*viewDef {
+	out := append(db.readSnap().viewsSorted(), db.tempSnap().viewsSorted()...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// hasAnyViews reports whether the main database or the session's temporary domain holds a view.
+func (db *engine) hasAnyViews() bool {
+	return len(db.readSnap().views) > 0 || len(db.tempSnap().views) > 0
+}
+
+// viewsDependingOnAny returns the views, of either domain, that depend on the object name of the
+// given kind, in name byte order (views.md §6).
+func (db *engine) viewsDependingOnAny(kind viewDepKind, name string) []*viewDef {
+	var out []*viewDef
+	for _, v := range db.sessionViews() {
+		for _, d := range v.Deps {
+			if d.Kind == kind && d.Name == name {
+				out = append(out, v)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// viewDropClosureAny returns the views a CASCADE drop removes (views.md §6.1), across both domains:
+// the seeds and every view that depends on one of them, transitively, in name byte order.
+func (db *engine) viewDropClosureAny(seeds []string) []string {
+	closure := map[string]bool{}
+	for _, s := range seeds {
+		closure[s] = true
+	}
+	for {
+		var added []string
+		for _, v := range db.sessionViews() {
+			if closure[v.Name] {
+				continue
+			}
+			for _, d := range v.Deps {
+				if d.Kind == viewDepView && closure[d.Name] {
+					added = append(added, v.Name)
+					break
+				}
+			}
+		}
+		if len(added) == 0 {
+			break
+		}
+		for _, n := range added {
+			closure[n] = true
+		}
+	}
+	out := make([]string, 0, len(closure))
+	for n := range closure {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// viewObject is a dropped object a view may depend on: its dependency kind and name.
+type viewObject struct {
+	kind viewDepKind
+	name string
+}
+
+// viewDependingOn is a view whose dependency list names a dropped object, with that dependency.
+type viewDependingOn struct {
+	view string
+	dep  viewDep
+}
+
+// viewsDependingOnSet returns the views of either domain whose dependency list names one of objects,
+// with the first such dependency, in view name byte order (the 2BP01 scan, views.md §6).
+func (db *engine) viewsDependingOnSet(objects []viewObject) []viewDependingOn {
+	var out []viewDependingOn
+	for _, v := range db.sessionViews() {
+		for _, d := range v.Deps {
+			if slices.ContainsFunc(objects, func(o viewObject) bool { return o.kind == d.Kind && o.name == d.Name }) {
+				out = append(out, viewDependingOn{view: v.Name, dep: d})
+				break
+			}
+		}
+	}
+	return out
+}
+
+// tempWorking is the session's temporary domain for a write, flagging it dirty (temp-tables.md §2).
+func (db *engine) tempWorking() *snapshot {
+	db.session.tx.tempDirty = true
+	return db.session.tx.tempWorking
+}
+
+// putViewScoped installs a view in its domain: the session's temporary domain or the main database.
+func (db *engine) putViewScoped(def *viewDef, temp bool) {
+	if temp {
+		db.tempWorking().putView(def)
+	} else {
+		db.working().putView(def)
+	}
+}
+
+// removeViewScoped removes the view name from whichever domain holds it.
+func (db *engine) removeViewScoped(name string) {
+	if db.isTempView(name) {
+		db.tempWorking().removeView(name)
+	} else {
+		db.working().removeView(name)
+	}
+}
+
+// dropDependentViews returns the views a drop of the objects dropped reaches (views.md §6/§6.1):
+// under RESTRICT the first view in name byte order that depends on one of them is 2BP01, naming what
+// (describe, e.g. `sequence s`) it depends on; under CASCADE the closure of those views is returned
+// to be dropped with them.
+func (db *engine) dropDependentViews(dropped []viewObject, cascade bool, describe func(viewDep) string) ([]string, error) {
+	users := db.viewsDependingOnSet(dropped)
+	if len(users) > 0 && !cascade {
+		return nil, newError(DependentObjectsStillExist, fmt.Sprintf(
+			"cannot drop %s because view %s depends on it", describe(users[0].dep), users[0].view)).hinted(hintDropCascade)
+	}
+	if len(users) == 0 {
+		return nil, nil
+	}
+	seeds := make([]string, len(users))
+	for i, u := range users {
+		seeds[i] = u.view
+	}
+	return db.viewDropClosureAny(seeds), nil
+}
 
 // --- CREATE VIEW (views.md §1.1) -------------------------------------------------------------------
 
 func (db *engine) executeCreateView(cv *createView) (outcome, error) {
-	// 1. The database qualifier (the allow_ddl gate already ran in admission): main is the only
-	//    database a view may live in this slice.
+	// 1. The database qualifier (the allow_ddl / allow_temp_ddl gate already ran in admission): main,
+	//    or temp for a temporary view (§10); a TEMP view names no other database.
+	temporary := cv.Temporary
 	if cv.DB != nil {
-		switch *cv.DB {
-		case "main":
-		case "temp":
-			return outcome{}, viewNotSupported("temporary views are not supported")
+		switch q := *cv.DB; {
+		case q == "temp":
+			temporary = true
+		case cv.Temporary:
+			return outcome{}, newError(SyntaxError, fmt.Sprintf("a temporary view cannot be created in database \"%s\"", q))
+		case q == "main":
 		default:
-			if db.attachReadSnap(*cv.DB) == nil {
-				return outcome{}, newError(UndefinedTable, `database "`+*cv.DB+`" is not attached`)
+			if db.attachReadSnap(q) == nil {
+				return outcome{}, newError(UndefinedTable, `database "`+q+`" is not attached`)
 			}
 			return outcome{}, viewNotSupported("views in an attached database are not supported")
 		}
@@ -493,8 +691,20 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 			return outcome{}, newError(UndefinedParameter, fmt.Sprintf("there is no parameter $%d", t.Int))
 		}
 	}
+	// The WITH ( … ) options (§16.2, 22023), merged with a trailing check option.
+	options, err := parseViewOptions(cv.Options)
+	if err != nil {
+		return outcome{}, err
+	}
+	check := cv.CheckOption
+	if options.hasCheck {
+		if cv.CheckOption != checkOptionNone {
+			return outcome{}, duplicateViewOption("check_option")
+		}
+		check = options.check
+	}
 	// A check option needs the view's own body to be updatable for INSERT / UPDATE (§15.6).
-	if cv.CheckOption != checkOptionNone {
+	if check != checkOptionNone {
 		if sel, _ := db.updatableShape(body, true); sel == nil {
 			return outcome{}, viewNotSupported("WITH CHECK OPTION is supported only on automatically updatable views")
 		}
@@ -547,24 +757,12 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 		}
 		body = stored
 	}
-	deps := db.traceDependencies(trace)
+	deps := db.traceDependencies(trace, bodyTypes)
+	// A body that reads a temporary relation makes the view temporary, as in PostgreSQL (§10).
+	temporary = temporary || trace.readsTemp
 	// 7. The creating session's SELECT privilege on every relation the body reads (§9).
-	if !db.session.privileges.IsPermissive() {
-		var read []string
-		for _, d := range deps {
-			read = append(read, d.Name)
-		}
-		var cats []string
-		for name := range trace.catalogRels {
-			cats = append(cats, name)
-		}
-		sort.Strings(cats)
-		read = append(read, cats...)
-		for _, name := range read {
-			if !db.session.privileges.AllowsTable(name, PrivSelect) {
-				return outcome{}, newError(InsufficientPrivilege, "permission denied for table "+name)
-			}
-		}
+	if err := db.checkViewOwnerPrivileges(deps, trace); err != nil {
+		return outcome{}, err
 	}
 	// 8. A taken name: 42P07, or under OR REPLACE the replacement of a view (§1.2) and 42809 for any
 	//    other relation.
@@ -573,9 +771,16 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 		if !cv.OrReplace {
 			return outcome{}, newError(DuplicateTable, fmt.Sprintf("relation \"%s\" already exists", cv.Name))
 		}
-		replaced = db.readSnap().view(cv.Name)
+		replaced = db.visibleView(cv.Name)
 		if replaced == nil {
 			return outcome{}, notAView(cv.Name)
+		}
+		// A temporary view stays temporary under OR REPLACE; a persistent view cannot be replaced by
+		// a temporary one (preclude-overlaps, §10).
+		if db.isTempView(cv.Name) {
+			temporary = true
+		} else if temporary {
+			return outcome{}, newError(DuplicateTable, fmt.Sprintf("relation \"%s\" already exists", cv.Name))
 		}
 		// 9. Column compatibility (42P16), 10. no cycle (42P17).
 		if err := db.checkViewReplacement(replaced, columns, bodyTypes, bodyDerivs, bodyTypmods); err != nil {
@@ -586,12 +791,19 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 				"infinite recursion detected in rules for relation \"%s\"", cv.Name))
 		}
 	}
-	// 9 (12 under OR REPLACE). Write the catalog entry; it must fit one catalog page.
-	def := &viewDef{Name: cv.Name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth, CheckOption: cv.CheckOption}
-	if err := db.checkViewEntryFits(def); err != nil {
-		return outcome{}, err
+	// 9 (12 under OR REPLACE). Write the catalog entry. A replacement keeps the defaults of the
+	// columns it keeps (§16.1); its options are the statement's.
+	defaults := make([]*defaultExprDef, len(columns))
+	if replaced != nil {
+		copy(defaults, replaced.Defaults)
 	}
-	db.working().putView(def)
+	def := &viewDef{
+		Name: cv.Name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth,
+		CheckOption: check, Defaults: defaults,
+		SecurityBarrier: options.securityBarrier != nil && *options.securityBarrier,
+		SecurityInvoker: options.securityInvoker != nil && *options.securityInvoker,
+	}
+	db.putViewScoped(def, temporary)
 	// 11. The views that read a replaced view are re-validated against the replacement (§8).
 	if replaced != nil {
 		if err := db.revalidateAfterReplace(replaced); err != nil {
@@ -599,6 +811,37 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 		}
 	}
 	return outcome{Kind: outcomeStatement}, nil
+}
+
+// checkViewOwnerPrivileges is the owner check of a view (views.md §9): the session needs SELECT on
+// every persistent table and view the body reads and on each jed_ catalog relation it names (42501).
+// A temporary relation is the session's own and is not privilege-checked, as everywhere.
+func (db *engine) checkViewOwnerPrivileges(deps []viewDep, trace *viewTrace) error {
+	if db.session.privileges.IsPermissive() {
+		return nil
+	}
+	var read []string
+	for _, d := range deps {
+		if d.Kind != viewDepTable && d.Kind != viewDepView {
+			continue
+		}
+		if db.isTempTable(d.Name) || db.isTempView(d.Name) {
+			continue
+		}
+		read = append(read, d.Name)
+	}
+	var cats []string
+	for name := range trace.catalogRels {
+		cats = append(cats, name)
+	}
+	sort.Strings(cats)
+	read = append(read, cats...)
+	for _, name := range read {
+		if !db.session.privileges.AllowsTable(name, PrivSelect) {
+			return newError(InsufficientPrivilege, "permission denied for table "+name)
+		}
+	}
+	return nil
 }
 
 // checkViewReplacement is the CREATE OR REPLACE VIEW column compatibility check (views.md §1.2 step 9,
@@ -659,7 +902,6 @@ func (db *engine) viewCollation(d deriv) (string, bool) {
 // viewReads reports whether a body with dependency list deps reads the view target, directly or
 // through other views (the 42P17 cycle check, views.md §1.2 step 10).
 func (db *engine) viewReads(deps []viewDep, target string) bool {
-	snap := db.readSnap()
 	var pending []string
 	for _, d := range deps {
 		if d.Kind == viewDepView {
@@ -677,7 +919,7 @@ func (db *engine) viewReads(deps []viewDep, target string) bool {
 			continue
 		}
 		seen[name] = true
-		if view := snap.view(name); view != nil {
+		if view := db.visibleView(name); view != nil {
 			for _, d := range view.Deps {
 				if d.Kind == viewDepView {
 					pending = append(pending, d.Name)
@@ -692,13 +934,12 @@ func (db *engine) viewReads(deps []viewDep, target string) bool {
 // every view that reads it, directly or through other views, must plan in name byte order; a direct
 // dependent must also keep its dependency list and reference no column the replacement appended.
 func (db *engine) revalidateAfterReplace(old *viewDef) error {
-	snap := db.readSnap()
 	readers := map[string]bool{}
 	pending := []string{old.Name}
 	for len(pending) > 0 {
 		name := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
-		for _, v := range snap.viewsDependingOn(viewDepView, name) {
+		for _, v := range db.viewsDependingOnAny(viewDepView, name) {
 			if !readers[v.Name] {
 				readers[v.Name] = true
 				pending = append(pending, v.Name)
@@ -715,11 +956,11 @@ func (db *engine) revalidateAfterReplace(old *viewDef) error {
 			"cannot replace view %s because it would change the definition of view %s", old.Name, view))
 	}
 	for _, name := range names {
-		view := snap.view(name)
+		view := db.visibleView(name)
 		if view.Unparsed {
 			return unparsableViewError(name)
 		}
-		_, trace, err := db.traceViewBody(view.Body)
+		plan, trace, err := db.traceViewBody(view.Body)
 		if isUnparsableError(err) {
 			return err
 		}
@@ -740,64 +981,168 @@ func (db *engine) revalidateAfterReplace(old *viewDef) error {
 				return breaks(name)
 			}
 		}
-		if !viewDepsEqual(db.traceDependencies(trace), view.Deps) {
+		if !viewDepsEqual(db.traceDependencies(trace, plan.columnTypes()), view.Deps) {
 			return breaks(name)
 		}
 	}
 	return nil
 }
 
-// checkViewEntryFits requires a view's catalog entry to fit one catalog page (format.md *Catalog*): a
-// longer definition is 0A000 (views.md §1.1 step 9).
-func (db *engine) checkViewEntryFits(def *viewDef) error {
-	pageSize := db.pageSize
-	if pageSize == 0 {
-		pageSize = DefaultPageSize
-	}
-	capacity := int(pageSize) - pageHeader
-	if 1+len(viewEntryBytes(def)) > capacity {
-		return viewNotSupported(fmt.Sprintf("the definition of view \"%s\" is too long", def.Name))
-	}
-	return nil
-}
-
 // traceDependencies is the persisted dependency list of a traced view body (views.md §6): every bound
-// table (with its referenced columns, by current name) and view, in ascending name byte order.
-func (db *engine) traceDependencies(trace *viewTrace) []viewDep {
-	deps := map[string]*viewDep{}
-	for _, item := range trace.items {
-		if deps[item.name] == nil {
-			deps[item.name] = &viewDep{Kind: item.kind, Name: item.name}
-		}
+// table (with its referenced columns, by current name) and view, every sequence the body names, and
+// every composite type it names or outputs (output, the planned column types), in ascending (name,
+// kind) byte order.
+func (db *engine) traceDependencies(trace *viewTrace, output []resolvedType) []viewDep {
+	type key struct {
+		name string
+		kind viewDepKind
 	}
-	snap := db.readSnap()
+	deps := map[key]*viewDep{}
+	add := func(kind viewDepKind, name string) *viewDep {
+		k := key{name: name, kind: kind}
+		if deps[k] == nil {
+			deps[k] = &viewDep{Kind: kind, Name: name}
+		}
+		return deps[k]
+	}
+	for _, item := range trace.items {
+		add(item.kind, item.name)
+	}
+	for name := range trace.sequences {
+		add(viewDepSequence, name)
+	}
+	types := map[string]bool{}
+	for name := range trace.types {
+		types[name] = true
+	}
+	for _, t := range output {
+		outputCompositeNames(t, types)
+	}
+	for name := range types {
+		add(viewDepType, name)
+	}
 	for col := range trace.columns {
-		table, ok := snap.table(col.table)
+		table, ok := db.lkpTable(col.table)
 		if !ok || col.ordinal >= len(table.Columns) {
 			continue
 		}
 		name := table.Columns[col.ordinal].Name
-		dep := deps[col.table]
-		if dep == nil {
-			dep = &viewDep{Kind: viewDepTable, Name: col.table}
-			deps[col.table] = dep
-		}
+		dep := add(viewDepTable, col.table)
 		if !slices.Contains(dep.Columns, name) {
 			dep.Columns = append(dep.Columns, name)
 		}
 	}
-	names := make([]string, 0, len(deps))
-	for name := range deps {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	out := make([]viewDep, 0, len(names))
-	for _, name := range names {
-		dep := *deps[name]
+	out := make([]viewDep, 0, len(deps))
+	for _, d := range deps {
+		dep := *d
 		sort.Strings(dep.Columns)
 		out = append(out, dep)
 	}
+	sort.Slice(out, func(i, j int) bool { return viewDepLess(out[i], out[j]) })
 	return out
+}
+
+// outputCompositeNames adds the named composite types a view output column of type t carries — the
+// type itself or an array's element type (views.md §6).
+func outputCompositeNames(t resolvedType, out map[string]bool) {
+	switch t.kind {
+	case rtComposite:
+		if t.comp != nil && t.comp.named {
+			out[t.comp.name] = true
+		}
+	case rtArray:
+		if t.elem != nil {
+			outputCompositeNames(*t.elem, out)
+		}
+	}
+}
+
+// viewOptionValues are the view options a WITH ( … ) or SET ( … ) list sets (views.md §16.2): each
+// set (hasCheck, non-nil) when the list names it.
+type viewOptionValues struct {
+	hasCheck        bool
+	check           checkOption
+	securityBarrier *bool
+	securityInvoker *bool
+}
+
+// duplicateViewOption is the 22023 a view option named twice raises (PostgreSQL's message).
+func duplicateViewOption(name string) error {
+	return newError(InvalidParameterValue, fmt.Sprintf("parameter \"%s\" specified more than once", name))
+}
+
+// parseViewOptions validates a view option list (views.md §16.2), PostgreSQL's reloption rules: the
+// names are check_option (local or cascaded, case-insensitive), security_barrier, and
+// security_invoker (booleans); a name without a value is true. An unknown name, a repeated one, or a
+// bad value is 22023.
+func parseViewOptions(options []viewOption) (viewOptionValues, error) {
+	var out viewOptionValues
+	for _, opt := range options {
+		value := "true"
+		if opt.HasValue {
+			value = opt.Value
+		}
+		switch opt.Name {
+		case "check_option":
+			if out.hasCheck {
+				return out, duplicateViewOption(opt.Name)
+			}
+			switch {
+			case asciiLower(value) == "local":
+				out.check = checkOptionLocal
+			case asciiLower(value) == "cascaded":
+				out.check = checkOptionCascaded
+			default:
+				return out, newError(InvalidParameterValue, fmt.Sprintf("invalid value for enum option \"check_option\": %s", value))
+			}
+			out.hasCheck = true
+		case "security_barrier", "security_invoker":
+			slot := &out.securityBarrier
+			if opt.Name == "security_invoker" {
+				slot = &out.securityInvoker
+			}
+			if *slot != nil {
+				return out, duplicateViewOption(opt.Name)
+			}
+			b, ok := parseReloptionBool(value)
+			if !ok {
+				return out, newError(InvalidParameterValue, fmt.Sprintf("invalid value for boolean option \"%s\": %s", opt.Name, value))
+			}
+			*slot = &b
+		default:
+			return out, newError(InvalidParameterValue, fmt.Sprintf("unrecognized parameter \"%s\"", opt.Name))
+		}
+	}
+	return out, nil
+}
+
+// parseReloptionBool is PostgreSQL's parse_bool (views.md §16.2): a case-insensitive prefix of true,
+// false, yes, or no; on, or a prefix of off of at least two characters; 1 or 0.
+func parseReloptionBool(value string) (bool, bool) {
+	v := asciiLower(value)
+	if v == "" {
+		return false, false
+	}
+	switch v[0] {
+	case 't':
+		return true, strings.HasPrefix("true", v)
+	case 'f':
+		return false, strings.HasPrefix("false", v)
+	case 'y':
+		return true, strings.HasPrefix("yes", v)
+	case 'n':
+		return false, strings.HasPrefix("no", v)
+	case 'o':
+		if v == "on" {
+			return true, true
+		}
+		return false, len(v) >= 2 && strings.HasPrefix("off", v)
+	case '1':
+		return true, len(v) == 1
+	case '0':
+		return false, len(v) == 1
+	}
+	return false, false
 }
 
 // --- DROP VIEW (views.md §1, §6) ---------------------------------------------------------------------
@@ -813,14 +1158,23 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 		if qn.DB != nil {
 			switch *qn.DB {
 			case "main":
+				if db.isTempView(name) {
+					if dv.IfExists {
+						continue
+					}
+					return outcome{}, newError(UndefinedTable, fmt.Sprintf("view \"main.%s\" does not exist", name))
+				}
 			case "temp":
-				if db.isTempTable(name) || db.isTempSequence(name) {
-					return outcome{}, newError(WrongObjectType, fmt.Sprintf("\"%s\" is not a view", name))
+				switch {
+				case db.isTempView(name):
+				case db.isTempTable(name) || db.isTempSequence(name):
+					return outcome{}, notAView(name)
+				default:
+					if dv.IfExists {
+						continue
+					}
+					return outcome{}, newError(UndefinedTable, fmt.Sprintf("view \"temp.%s\" does not exist", name))
 				}
-				if dv.IfExists {
-					continue
-				}
-				return outcome{}, newError(UndefinedTable, fmt.Sprintf("view \"temp.%s\" does not exist", name))
 			default:
 				if db.attachReadSnap(*qn.DB) == nil {
 					return outcome{}, newError(UndefinedTable, `database "`+*qn.DB+`" is not attached`)
@@ -838,7 +1192,7 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 			continue
 		}
 		if db.relationExists(name) {
-			return outcome{}, newError(WrongObjectType, fmt.Sprintf("\"%s\" is not a view", name))
+			return outcome{}, notAView(name)
 		}
 		if dv.IfExists {
 			continue
@@ -846,11 +1200,12 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 		return outcome{}, newError(UndefinedTable, fmt.Sprintf("view \"%s\" does not exist", name))
 	}
 	// Phase 2: under RESTRICT a dependent view outside the drop set blocks (2BP01), naming the first
-	// in name byte order; under CASCADE every dependent view is dropped too, transitively.
+	// in name byte order; under CASCADE every dependent view is dropped too, transitively. Both
+	// domains: a temporary view may read a persistent one (§10).
 	if dv.Cascade {
-		targets = db.readSnap().viewDropClosure(targets)
+		targets = db.viewDropClosureAny(targets)
 	}
-	for _, dependent := range db.readSnap().viewsSorted() {
+	for _, dependent := range db.sessionViews() {
 		if slices.Contains(targets, dependent.Name) {
 			continue
 		}
@@ -864,7 +1219,7 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 	}
 	// Phase 3: remove.
 	for _, name := range targets {
-		db.working().removeView(name)
+		db.removeViewScoped(name)
 	}
 	return outcome{Kind: outcomeStatement}, nil
 }
@@ -952,7 +1307,7 @@ func (db *engine) stmtIsWriteWithViews(stmt statement) bool {
 	if stmtIsWrite(stmt) {
 		return true
 	}
-	if len(db.readSnap().views) == 0 {
+	if !db.hasAnyViews() {
 		return false
 	}
 	if stmt.Explain != nil {
@@ -1004,16 +1359,22 @@ func (db *engine) walkReadViews(pending []relationRef, visit func(*viewDef, *pri
 // collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads or
 // writes through (transitively) to its privilege requirements (views.md §9, §15.4): function EXECUTE
 // is the reader's or writer's, as for a derived table. The relations inside a body are NOT added —
-// the view is the privilege boundary.
+// the view is the privilege boundary — except through a security_invoker view (§16.2), whose body's
+// relations are checked against the reader, and whose base relation needs the writer's privileges on
+// the view.
 func (db *engine) collectViewFunctionPrivs(req *privReq) {
-	if len(db.readSnap().views) == 0 {
+	if !db.hasAnyViews() {
 		return
 	}
-	pending := append([]relationRef(nil), req.relations...)
+	var writeTargets []string
 	for _, t := range req.tables {
 		if t.priv == PrivInsert || t.priv == PrivUpdate || t.priv == PrivDelete {
-			pending = append(pending, relationRef{name: t.name})
+			writeTargets = append(writeTargets, t.name)
 		}
+	}
+	pending := append([]relationRef(nil), req.relations...)
+	for _, name := range writeTargets {
+		pending = append(pending, relationRef{name: name})
 	}
 	var functions []string
 	db.walkReadViews(pending, func(_ *viewDef, body *privReq) bool {
@@ -1021,31 +1382,112 @@ func (db *engine) collectViewFunctionPrivs(req *privReq) {
 		return false
 	})
 	req.functions = append(req.functions, functions...)
+	tables := db.invokerReadPrivs(append([]relationRef(nil), req.relations...))
+	tables = append(tables, db.invokerWritePrivs(req.tables, writeTargets)...)
+	req.tables = append(req.tables, tables...)
+}
+
+// invokerReadPrivs returns the SELECT privileges a read of the relations pending needs inside
+// security_invoker views (views.md §16.2): each such view's body reads its relations as the reader,
+// as a derived table would, and a security_invoker view it reads in turn is checked the same way. A
+// definer view's body is not entered.
+func (db *engine) invokerReadPrivs(pending []relationRef) []privTableReq {
+	var out []privTableReq
+	seen := map[string]bool{}
+	for len(pending) > 0 {
+		ref := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		view := db.relationView(ref.db, ref.name)
+		if view == nil || !view.SecurityInvoker || seen[view.Name] {
+			continue
+		}
+		seen[view.Name] = true
+		if view.Unparsed {
+			continue
+		}
+		var body privReq
+		collectQueryPrivs(view.Body, &body, map[string]bool{})
+		out = append(out, body.tables...)
+		pending = append(pending, body.relations...)
+	}
+	return out
+}
+
+// invokerWritePrivs returns the privileges a write through a security_invoker view needs on the
+// relations below it (views.md §16.2): every privilege the statement needs on the view is needed on
+// its base relation too, plus SELECT there when the view's WHERE is evaluated (an UPDATE or DELETE),
+// and what a subquery in that WHERE reads. A chain continues while the base relation is itself a
+// security_invoker view.
+func (db *engine) invokerWritePrivs(stmt []privTableReq, targets []string) []privTableReq {
+	var out []privTableReq
+	for _, target := range targets {
+		var privs []Privilege
+		for _, t := range stmt {
+			if t.name == target {
+				privs = append(privs, t.priv)
+			}
+		}
+		name := target
+		seen := map[string]bool{}
+		for {
+			view := db.relationView(nil, name)
+			if view == nil || !view.SecurityInvoker || seen[view.Name] {
+				break
+			}
+			seen[view.Name] = true
+			if view.Unparsed {
+				break
+			}
+			sel, tref := db.updatableShape(view.Body, false)
+			if sel == nil {
+				break
+			}
+			if sel.Filter != nil {
+				if (slices.Contains(privs, PrivUpdate) || slices.Contains(privs, PrivDelete)) && !slices.Contains(privs, PrivSelect) {
+					privs = append(privs, PrivSelect)
+				}
+				var req privReq
+				collectExprPrivs(sel.Filter, &req, map[string]bool{})
+				out = append(out, req.tables...)
+			}
+			for _, p := range privs {
+				out = append(out, privTableReq{name: tref.Name, priv: p})
+			}
+			name = tref.Name
+		}
+	}
+	return out
 }
 
 // --- Dependencies on tables (views.md §6) ----------------------------------------------------------
 
 // dropTableViews is the DROP TABLE view-dependency check (§6). Under RESTRICT a view depending on a
-// table being dropped blocks the statement (2BP01), naming the first in name byte order. Under
-// CASCADE it returns the views to drop with the tables: every view depending on one of them, and
-// every view depending on one of those, transitively.
+// table being dropped — or on a sequence a dropped table owns, which the drop takes with it — blocks
+// the statement (2BP01), naming the first in name byte order. Under CASCADE it returns the views to
+// drop with the tables: every view depending on one of them, and every view depending on one of
+// those, transitively. Views of both domains count (§10).
 func (db *engine) dropTableViews(targets []string, cascade bool) ([]string, error) {
-	snap := db.readSnap()
-	var seeds []string
-	for _, view := range snap.viewsSorted() {
-		for _, d := range view.Deps {
-			if d.Kind != viewDepTable || !slices.Contains(targets, d.Name) {
-				continue
-			}
-			if !cascade {
-				return nil, newError(DependentObjectsStillExist, fmt.Sprintf(
-					"cannot drop table %s because view %s depends on it", d.Name, view.Name)).hinted(hintDropCascade)
-			}
-			seeds = append(seeds, view.Name)
-			break
+	var dropped []viewObject
+	owner := map[string]string{}
+	for _, t := range targets {
+		dropped = append(dropped, viewObject{kind: viewDepTable, name: t})
+		var owned []string
+		if db.isTempTable(t) {
+			owned = db.tempSnap().sequencesOwnedBy(t)
+		} else {
+			owned = db.readSnap().sequencesOwnedBy(t)
+		}
+		for _, s := range owned {
+			owner[s] = t
+			dropped = append(dropped, viewObject{kind: viewDepSequence, name: s})
 		}
 	}
-	return snap.viewDropClosure(seeds), nil
+	return db.dropDependentViews(dropped, cascade, func(d viewDep) string {
+		if d.Kind == viewDepSequence {
+			return "table " + owner[d.Name]
+		}
+		return "table " + d.Name
+	})
 }
 
 // --- ALTER TABLE: rewrites (views.md §7) and re-validation (§8) -------------------------------------
@@ -1136,10 +1578,10 @@ func notAView(name string) error {
 	return newError(WrongObjectType, fmt.Sprintf("\"%s\" is not a view", name))
 }
 
-// prepareViewAlter captures the views that depend on table (of the main database) before an ALTER
-// TABLE runs. When the action edits view text (rewrites), each view is planned against the
-// pre-statement catalog to find the FROM items that bind the table; a view that cannot be planned
-// fails the statement (0A000). nil when no view depends on the table.
+// prepareViewAlter captures the views that depend on table before an ALTER TABLE runs. When the action
+// edits view text (rewrites), each view is planned against the pre-statement catalog to find the FROM
+// items that bind the table; a view that cannot be planned fails the statement (0A000). nil when no
+// view depends on the table. A temporary view of the session counts (§10).
 func (db *engine) prepareViewAlter(table *catTable, rewrites bool) (*viewAlterPlan, error) {
 	columns := make([]string, 0, len(table.Columns))
 	for _, c := range table.Columns {
@@ -1148,10 +1590,11 @@ func (db *engine) prepareViewAlter(table *catTable, rewrites bool) (*viewAlterPl
 	return db.prepareDependents(viewDepTable, table.Name, columns, rewrites)
 }
 
-// prepareDependents captures the views that depend on the table or view name before the statement
-// that alters it runs (§7/§7.1/§8). nil when no view depends on it.
+// prepareDependents captures the views, of either domain, that depend on the table or view name before
+// the statement that alters it runs (§7/§7.1/§8). nil when no view depends on it.
 func (db *engine) prepareDependents(kind viewDepKind, name string, columns []string, rewrites bool) (*viewAlterPlan, error) {
-	dependents := db.readSnap().viewsDependingOn(kind, name)
+	dependents := db.viewsDependingOnAny(kind, name)
+
 	if len(dependents) == 0 {
 		return nil, nil
 	}
@@ -1205,53 +1648,63 @@ func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) err
 		}
 		bodies[i], expecteds[i] = body, expected
 		if definition != view.Definition || !viewDepsEqual(expected, view.Deps) {
-			updated := &viewDef{
-				Name: view.Name, Columns: view.Columns, Definition: definition, Deps: expected, Body: body,
-				Depth: depth, CheckOption: view.CheckOption,
-			}
-			if err := db.checkViewEntryFits(updated); err != nil {
-				return err
-			}
-			db.working().putView(updated)
+			updated := *view
+			updated.Definition, updated.Deps, updated.Body, updated.Depth = definition, expected, body, depth
+			db.putViewScoped(&updated, db.isTempView(view.Name))
 		}
 	}
 	for i, view := range vp.views {
-		_, trace, err := db.traceViewBody(bodies[i])
+		plan, trace, err := db.traceViewBody(bodies[i])
 		if isUnparsableError(err) {
 			return err
 		}
 		if err != nil {
 			return alterBreaksView(vp, view.Name)
 		}
-		if !viewDepsEqual(db.traceDependencies(trace), expecteds[i]) {
+		if !viewDepsEqual(db.traceDependencies(trace, plan.columnTypes()), expecteds[i]) {
 			return alterBreaksView(vp, view.Name)
 		}
 	}
 	return nil
 }
 
-// executeAlterView runs `ALTER VIEW [IF EXISTS] [main.]v RENAME TO v2` / `RENAME [COLUMN] a TO b`, and
-// the same ALTER TABLE forms on a view (views.md §7.1). The views that read v are rewritten to keep
-// binding it, then re-validated (§8).
+// executeAlterView runs `ALTER VIEW [IF EXISTS] [main. | temp.]v RENAME TO v2` / `RENAME [COLUMN] a TO
+// b`, and the same ALTER TABLE forms on a view (views.md §7.1): the views that read v are rewritten to
+// keep binding it, then re-validated (§8). The other actions — column defaults and options — change
+// only the view's own entry (§16).
 func (db *engine) executeAlterView(av *alterView) (outcome, error) {
 	done := outcome{Kind: outcomeStatement}
-	// 1. The database qualifier (the allow_ddl gate already ran in admission).
-	if av.DB != nil {
-		switch *av.DB {
-		case "main":
-		case "temp":
-			return outcome{}, viewNotSupported("temporary views are not supported")
-		default:
-			if db.attachReadSnap(*av.DB) == nil {
-				return outcome{}, newError(UndefinedTable, `database "`+*av.DB+`" is not attached`)
-			}
-			return outcome{}, viewNotSupported("views in an attached database are not supported")
+	// 1. The database qualifier (the allow_ddl / allow_temp_ddl gate already ran in admission).
+	var view *viewDef
+	switch {
+	case av.DB == nil:
+		view = db.visibleView(av.Name)
+	case *av.DB == "main":
+		view = db.readSnap().view(av.Name)
+	case *av.DB == "temp":
+		view = db.tempSnap().view(av.Name)
+	default:
+		if db.attachReadSnap(*av.DB) == nil {
+			return outcome{}, newError(UndefinedTable, `database "`+*av.DB+`" is not attached`)
 		}
+		return outcome{}, viewNotSupported("views in an attached database are not supported")
 	}
 	// 2. The name: a view, else 42809 for another relation, else 42P01 (IF EXISTS: no-op).
-	view := db.readSnap().view(av.Name)
 	if view == nil {
-		if isCatalogRelName(av.Name) || db.relationExists(av.Name) {
+		// Another relation of the named database (the session's whole namespace when bare).
+		var other bool
+		if av.DB == nil {
+			other = db.relationExists(av.Name)
+		} else {
+			snap := db.readSnap()
+			if *av.DB != "main" {
+				snap = db.tempSnap()
+			}
+			_, isTable := snap.table(av.Name)
+			_, _, isIndex := snap.findIndex(av.Name)
+			other = isTable || isIndex || snap.sequence(av.Name) != nil
+		}
+		if isCatalogRelName(av.Name) || other {
 			return outcome{}, notAView(av.Name)
 		}
 		if av.IfExists {
@@ -1259,9 +1712,18 @@ func (db *engine) executeAlterView(av *alterView) (outcome, error) {
 		}
 		return outcome{}, newError(UndefinedTable, fmt.Sprintf("relation \"%s\" does not exist", av.Name))
 	}
+	temp := db.isTempView(view.Name)
 	// 3. The new name or the column.
 	var change viewAlterChange
-	if av.RenameColumn == nil {
+	switch {
+	case av.Edits != nil:
+		edited, err := db.applyViewEdits(view, av.Edits)
+		if err != nil {
+			return outcome{}, err
+		}
+		db.putViewScoped(edited, temp)
+		return done, nil
+	case av.RenameColumn == nil:
 		if err := checkReservedName("view", av.RenameTo); err != nil {
 			return outcome{}, err
 		}
@@ -1269,7 +1731,7 @@ func (db *engine) executeAlterView(av *alterView) (outcome, error) {
 			return outcome{}, newError(DuplicateTable, fmt.Sprintf("relation \"%s\" already exists", av.RenameTo))
 		}
 		change = viewAlterChange{kind: viewAlterRenameRelation, newName: av.RenameTo}
-	} else {
+	default:
 		ordinal := slices.Index(view.Columns, av.RenameColumn.Old)
 		if ordinal < 0 {
 			return outcome{}, newError(UndefinedColumn, fmt.Sprintf("column \"%s\" does not exist", av.RenameColumn.Old))
@@ -1289,18 +1751,195 @@ func (db *engine) executeAlterView(av *alterView) (outcome, error) {
 	renamed := *view
 	renamed.Columns = append([]string(nil), view.Columns...)
 	if change.kind == viewAlterRenameRelation {
-		db.working().removeView(view.Name)
+		db.removeViewScoped(view.Name)
 		renamed.Name = change.newName
 	} else {
 		renamed.Columns[change.ordinal] = change.newName
 	}
-	db.working().putView(&renamed)
+	db.putViewScoped(&renamed, temp)
 	if vp != nil {
 		if err := db.finishViewAlter(vp, change); err != nil {
 			return outcome{}, err
 		}
 	}
 	return done, nil
+}
+
+// applyViewEdits applies the non-rename ALTER VIEW actions to view, in order (views.md §16): a column
+// default is validated against the column's type, from the planned body, as a table column's SET
+// DEFAULT is; SET ( … ) validates its options (22023) and a check option the view's shape (0A000);
+// RESET ( … ) clears the named options (an unknown name is ignored, as in PostgreSQL). Turning
+// security_invoker off makes the view a definer view, so the session must pass the owner check (§9).
+func (db *engine) applyViewEdits(view *viewDef, edits []viewEdit) (*viewDef, error) {
+	out := *view
+	out.Defaults = make([]*defaultExprDef, len(view.Columns))
+	copy(out.Defaults, view.Defaults)
+	var columns []catColumn
+	columnIndex := func(name string) (int, error) {
+		if i := slices.Index(view.Columns, name); i >= 0 {
+			return i, nil
+		}
+		return -1, newError(UndefinedColumn, fmt.Sprintf("column \"%s\" of relation \"%s\" does not exist", name, view.Name))
+	}
+	for _, edit := range edits {
+		switch edit.Kind {
+		case viewEditSetDefault:
+			i, err := columnIndex(edit.Column)
+			if err != nil {
+				return nil, err
+			}
+			if columns == nil {
+				if columns, err = db.viewTypedColumns(view); err != nil {
+					return nil, err
+				}
+			}
+			def := edit.Default
+			val, expr, err := db.buildAlterDefault(columns[i], &def)
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case (val != nil && val.IsNull()) || (val == nil && expr == nil):
+				out.Defaults[i] = nil
+			case val != nil:
+				text := val.sqlLiteral()
+				e, err := parseExpression(text)
+				if err != nil {
+					return nil, err
+				}
+				out.Defaults[i] = &defaultExprDef{ExprText: text, Expr: e}
+			default:
+				out.Defaults[i] = expr
+			}
+		case viewEditDropDefault:
+			i, err := columnIndex(edit.Column)
+			if err != nil {
+				return nil, err
+			}
+			out.Defaults[i] = nil
+		case viewEditSetOptions:
+			options, err := parseViewOptions(edit.Options)
+			if err != nil {
+				return nil, err
+			}
+			if options.hasCheck {
+				if view.Unparsed {
+					return nil, unparsableViewError(view.Name)
+				}
+				if sel, _ := db.updatableShape(view.Body, true); sel == nil {
+					return nil, viewNotSupported("WITH CHECK OPTION is supported only on automatically updatable views")
+				}
+				out.CheckOption = options.check
+			}
+			if options.securityBarrier != nil {
+				out.SecurityBarrier = *options.securityBarrier
+			}
+			if options.securityInvoker != nil {
+				out.SecurityInvoker = *options.securityInvoker
+			}
+		case viewEditResetOptions:
+			for _, name := range edit.Names {
+				switch name {
+				case "check_option":
+					out.CheckOption = checkOptionNone
+				case "security_barrier":
+					out.SecurityBarrier = false
+				case "security_invoker":
+					out.SecurityInvoker = false
+				}
+			}
+		}
+	}
+	if view.SecurityInvoker && !out.SecurityInvoker {
+		if view.Unparsed {
+			return nil, unparsableViewError(view.Name)
+		}
+		_, trace, err := db.traceViewBody(view.Body)
+		if err != nil {
+			return nil, err
+		}
+		if err := db.checkViewOwnerPrivileges(view.Deps, trace); err != nil {
+			return nil, err
+		}
+	}
+	return &out, nil
+}
+
+// renameSequenceInViews is ALTER SEQUENCE s RENAME TO s2's effect on views (views.md §7.2): every view
+// that depends on s keeps naming it — the constant argument of each nextval / currval / setval call
+// that names s becomes 's2' (the new name as an identifier, quoted when it must be), and the
+// dependency follows. Sequences are resolved by name everywhere, so every such constant names this
+// sequence.
+func (db *engine) renameSequenceInViews(old, new string) error {
+	for _, view := range db.viewsDependingOnAny(viewDepSequence, old) {
+		tokens, err := lex(view.Definition)
+		if err != nil {
+			return err
+		}
+		for i := 0; i+2 < len(tokens); i++ {
+			t := tokens[i]
+			call := t.Kind == tokWord && (t.Word == "nextval" || t.Word == "currval" || t.Word == "setval") &&
+				tokens[i+1].Kind == tokLParen
+			if !call || tokens[i+2].Kind != tokStr {
+				continue
+			}
+			if n, err := parseNameText(tokens[i+2].Word); err == nil && n == old {
+				tokens[i+2] = token{Kind: tokStr, Word: quoteIdentifier(new)}
+			}
+		}
+		end := len(tokens)
+		for i, t := range tokens {
+			if t.Kind == tokEof {
+				end = i
+				break
+			}
+		}
+		definition := renderTokens(tokens[:end])
+		body, depth, err := parseViewDefinition(definition)
+		if err != nil {
+			return err
+		}
+		deps := make([]viewDep, len(view.Deps))
+		for i, d := range view.Deps {
+			if d.Kind == viewDepSequence && d.Name == old {
+				d.Name = new
+			}
+			deps[i] = d
+		}
+		sort.SliceStable(deps, func(i, j int) bool { return viewDepLess(deps[i], deps[j]) })
+		updated := *view
+		updated.Definition, updated.Deps, updated.Body, updated.Depth = definition, deps, body, depth
+		db.putViewScoped(&updated, db.isTempView(view.Name))
+	}
+	return nil
+}
+
+// viewTypedColumns returns the output columns of view as table columns typed by its planned body
+// (views.md §16.1): what a column default is validated against. An untyped NULL column is text.
+func (db *engine) viewTypedColumns(view *viewDef) ([]catColumn, error) {
+	if view.Unparsed {
+		return nil, unparsableViewError(view.Name)
+	}
+	var plan queryPlan
+	err := db.inViewBody(viewSite{depth: 0, bodyDepth: view.Depth}, func() error {
+		var perr error
+		plan, perr = db.planQuery(*view.Body, nil, nil, &paramTypes{})
+		return perr
+	})
+	if err != nil {
+		return nil, err
+	}
+	types := append([]resolvedType(nil), plan.columnTypes()...)
+	for i, t := range types {
+		if t.kind == rtNull {
+			types[i] = resolvedType{kind: rtText}
+		}
+	}
+	synth, err := cteSyntheticTableCols(view.Name, view.Columns, types, plan.columnDerivs(), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return synth.Columns, nil
 }
 
 // viewDepsEqual reports whether two dependency lists are identical.
@@ -1338,7 +1977,7 @@ func renamedDeps(deps []viewDep, vp *viewAlterPlan, change viewAlterChange) []vi
 		}
 		out[i] = d
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	sort.SliceStable(out, func(i, j int) bool { return viewDepLess(out[i], out[j]) })
 	return out
 }
 

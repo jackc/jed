@@ -931,6 +931,13 @@ pub(crate) fn resolve_scalar_func(
             "* is only valid as the argument of COUNT",
         ));
     }
+    // A view body depends on the sequence a constant sequence-function argument names
+    // (spec/design/views.md §6).
+    if matches!(name, "nextval" | "currval" | "setval")
+        && let Some(Expr::Literal(Literal::Text(text), _)) = args.first()
+    {
+        scope.catalog.trace_sequence(text)?;
+    }
     let mut rargs = Vec::with_capacity(args.len());
     let mut tys = Vec::with_capacity(args.len());
     for a in args {
@@ -5045,6 +5052,7 @@ fn resolve_node(
             // A composite type name (`addr '(Main,90210)'`) coerces the string via `record_in`
             // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
             if let Some(ct) = scope.catalog.composite_type(type_name) {
+                scope.catalog.trace_type(&ct.name);
                 return fold_in_session_zone(scope, params, |iz| {
                     coerce_string_to_composite(text, ct, scope.catalog, iz)
                 })
@@ -5229,6 +5237,7 @@ fn resolve_node(
                     Some(s) => (ColType::Scalar(s), resolved_type_of(s)),
                     None => match scope.catalog.composite_type(base) {
                         Some(ct) => {
+                            scope.catalog.trace_type(&ct.name);
                             let cty = Type::Composite(crate::types::CompositeRef {
                                 name: ct.name.clone(),
                             });
@@ -5364,6 +5373,7 @@ fn resolve_node(
             // `ROW(…)`) is a documented `0A000` narrowing this slice — relaxable. A type modifier on
             // a composite is meaningless (`0A000`).
             if let Some(ct) = scope.catalog.composite_type(type_name) {
+                scope.catalog.trace_type(&ct.name);
                 if type_mod.is_some() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,

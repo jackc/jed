@@ -2318,6 +2318,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
 		// (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
 		if ct := s.catalog.readSnap().compositeType(e.TypeLitName); ct != nil {
+			s.catalog.traceType(ct.Name)
 			iz := s.catalog.inputZone()
 			node, rt, err := coerceStringToComposite(e.TypeLitText, ct, s.catalog, iz)
 			params.noteInputZone(iz)
@@ -2453,6 +2454,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				elemCol = scalarColType(elemScalar)
 				elemRT = resolvedTypeOf(elemScalar)
 			} else if ctype := snap.compositeType(base); ctype != nil {
+				s.catalog.traceType(ctype.Name)
 				elemTy := compositeT(ctype.Name)
 				elemCol = resolveColType(elemTy, snap.types)
 				elemRT = resolvedTypeOfCol(elemTy, snap)
@@ -2550,6 +2552,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// expression parses through record_in per row (reCompositeCast). Any other source is 42804.
 		// A type modifier on a composite is meaningless (0A000).
 		if ct := s.catalog.readSnap().compositeType(e.Cast.TypeName); ct != nil {
+			s.catalog.traceType(ct.Name)
 			if e.Cast.TypeMod != nil {
 				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"a type modifier is not supported on a composite type")

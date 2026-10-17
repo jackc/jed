@@ -2009,6 +2009,7 @@ impl Engine {
             || self.temp_read_snap().find_index(name).is_some()
             || self.sequence(name).is_some()
             || self.read_snap().view(name).is_some()
+            || self.temp_read_snap().view(name).is_some()
     }
 
     /// Choose the auto-generated name for a `serial` column's OWNED sequence (sequences.md §12),

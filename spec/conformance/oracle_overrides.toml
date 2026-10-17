@@ -345,12 +345,12 @@ file = "types/float_literal_adaptation.test"
 sql = "SELECT id FROM t WHERE 0.1 = ANY(a)"
 reason = "jed: the bare decimal scalar of `x = ANY(f32[])` adapts to the f32 element type (float.md §4; array-functions.md §11.3 — the comparison operators' literal adaptation), so the stored f32 0.1 element matches and row 1 is returned. PostgreSQL compares numeric with real as double precision, where the widened binary32 0.1 differs from the double 0.1, and returns no row. A documented literal-typing divergence."
 
-# --- DROP TYPE ... CASCADE is not supported this slice (RESTRICT-only — composite.md §7). PG drops
-# the type and everything depending on it; jed rejects CASCADE 0A000 (RESTRICT is the only behavior).
+# --- DROP TYPE ... CASCADE of a type a table column uses is not supported (composite.md §7). PG drops
+# the type and the column depending on it; jed rejects that CASCADE 0A000 (it drops only views).
 [[override]]
 file = "ddl/create_type.test"
 sql = "DROP TYPE addr CASCADE"
-reason = "jed: DROP TYPE ... CASCADE is not supported this slice (0A000); RESTRICT is the default and only behavior (composite.md §7). PostgreSQL performs the cascading drop."
+reason = "jed: DROP TYPE ... CASCADE drops only the views that depend on the type (views.md §6.1); a type a table column or composite field uses is 0A000 under CASCADE (composite.md §7). PostgreSQL drops the column too."
 
 # --- composite comparison error codes: jed reports an incomparable pair as 42804 datatype_mismatch
 # (the strict type system's uniform comparison gate — composite.md §5), where PostgreSQL surfaces a

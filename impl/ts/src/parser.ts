@@ -10,6 +10,8 @@ import type {
   BinaryOp,
   CheckDef,
   CheckOption,
+  ViewEdit,
+  ViewOption,
   Cte,
   CteBody,
   CycleClause,
@@ -651,35 +653,26 @@ class Parser {
     this.selectInto = { temp, db, name };
   }
 
-  // atDeferredCreateView reports whether the statement is one of the deferred `CREATE … VIEW` forms
-  // (views.md §12): `CREATE [OR REPLACE] TEMP | TEMPORARY VIEW`, `CREATE [OR REPLACE] RECURSIVE
-  // VIEW`, `CREATE MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
+  // atDeferredCreateView reports whether the statement is the deferred `CREATE MATERIALIZED VIEW`
+  // (views.md §12), recognized by keyword sequence so it fails 0A000, not 42601.
   private atDeferredCreateView(): boolean {
-    const at = this.peekKeywordAt(1) === "or" && this.peekKeywordAt(2) === "replace" ? 3 : 1;
-    switch (this.peekKeywordAt(at)) {
-      case "temp":
-      case "temporary":
-      case "recursive":
-      case "materialized":
-        return this.peekKeywordAt(at + 1) === "view";
-      default:
-        return false;
-    }
+    return this.peekKeywordAt(1) === "materialized" && this.peekKeywordAt(2) === "view";
   }
 
-  // atCreateView reports whether the statement is `CREATE [OR REPLACE] VIEW` (views.md §1).
+  // atCreateView reports whether the statement is `CREATE [OR REPLACE] [TEMP | TEMPORARY]
+  // [RECURSIVE] VIEW` (views.md §1, §10, §17).
   private atCreateView(): boolean {
-    return (
-      this.peekKeywordAt(1) === "view" ||
-      (this.peekKeywordAt(1) === "or" &&
-        this.peekKeywordAt(2) === "replace" &&
-        this.peekKeywordAt(3) === "view")
-    );
+    let at = 1;
+    if (this.peekKeywordAt(1) === "or" && this.peekKeywordAt(2) === "replace") at = 3;
+    const t = this.peekKeywordAt(at);
+    if (t === "temp" || t === "temporary") at++;
+    if (this.peekKeywordAt(at) === "recursive") at++;
+    return this.peekKeywordAt(at) === "view";
   }
 
   // parseAlterView parses `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }`
-  // (views.md §7.1). The other ALTER VIEW actions (`ALTER [COLUMN]`, `OWNER TO`, `SET …`, `RESET …`)
-  // are recognized by their first keyword and refused with 0A000.
+  // (views.md §7.1), or a comma list of `ALTER [COLUMN] c { SET DEFAULT expr | DROP DEFAULT }`,
+  // `SET ( option, … )`, and `RESET ( name, … )` (§16). `OWNER TO` and `SET SCHEMA` are 0A000.
   private parseAlterView(): Statement {
     this.expectKeyword("alter");
     this.expectKeyword("view");
@@ -690,16 +683,13 @@ class Parser {
       ifExists = true;
     }
     const [db, name] = this.parseQualifiedTableName();
-    switch (this.peekKeyword()) {
-      case "rename":
-        break;
-      case "alter":
-      case "owner":
-      case "set":
-      case "reset":
-        throw engineError("feature_not_supported", "this form of ALTER VIEW is not supported");
-      default:
-        throw engineError("syntax_error", "expected RENAME after ALTER VIEW name");
+    if (this.peekKeyword() !== "rename") {
+      const edits = [this.parseViewEdit()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        edits.push(this.parseViewEdit());
+      }
+      return { kind: "alterView", name, db, ifExists, action: { kind: "edits", edits } };
     }
     this.advance(); // RENAME
     if (this.peekKeyword() === "to") {
@@ -724,12 +714,95 @@ class Parser {
     };
   }
 
-  // parseCreateView parses `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS
-  // subquery_expr` (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end
-  // of the statement and is captured as its canonical token text. A trailing `WITH [CASCADED |
-  // LOCAL] CHECK OPTION` is cut off before the body and gives the view a check option (§15.6). A
-  // `WITH ( … )` option list after the name is a deferred form (0A000). `OR REPLACE` with `IF NOT
-  // EXISTS` is 42601.
+  // parseViewEdit parses one non-rename ALTER VIEW action (views.md §16).
+  private parseViewEdit(): ViewEdit {
+    const kw = this.peekKeyword();
+    if (kw === "alter") {
+      this.advance();
+      if (this.peekKeyword() === "column") this.advance();
+      const column = this.expectIdentifier();
+      const next = this.peekKeyword();
+      if (next === "set") {
+        this.advance();
+        this.expectKeyword("default");
+        const start = this.pos;
+        const expr = this.parseExpr();
+        return {
+          kind: "setDefault",
+          column,
+          default: { expr, text: renderTokens(this.tokens.slice(start, this.pos)) },
+        };
+      }
+      if (next === "drop") {
+        this.advance();
+        this.expectKeyword("default");
+        return { kind: "dropDefault", column };
+      }
+      throw engineError("syntax_error", `expected SET or DROP, found ${next ?? "end of input"}`);
+    }
+    if (kw === "set" && this.peekKindAt(1) === "lparen") {
+      this.advance();
+      return { kind: "setOptions", options: this.parseViewOptions() };
+    }
+    if (kw === "reset") {
+      this.advance();
+      const options = this.parseViewOptions();
+      if (options.some((o) => o.value !== null)) {
+        throw engineError("syntax_error", "RESET must not include values for parameters");
+      }
+      return { kind: "resetOptions", names: options.map((o) => o.name) };
+    }
+    if (kw === "owner" || kw === "set") {
+      throw engineError("feature_not_supported", "this form of ALTER VIEW is not supported");
+    }
+    throw engineError(
+      "syntax_error",
+      "expected RENAME, ALTER, SET, or RESET after ALTER VIEW name",
+    );
+  }
+
+  // parseViewOptions parses `( name [= value] [, …] )` — a view option list (views.md §16).
+  private parseViewOptions(): ViewOption[] {
+    this.expect("lparen");
+    const out: ViewOption[] = [];
+    for (;;) {
+      const name = this.expectIdentifier();
+      let value: string | null = null;
+      if (this.peek().kind === "eq") {
+        this.advance();
+        value = this.parseViewOptionValue();
+      }
+      out.push({ name, value });
+      if (this.peek().kind === "comma") {
+        this.advance();
+        continue;
+      }
+      this.expect("rparen");
+      return out;
+    }
+  }
+
+  // parseViewOptionValue parses one view option value (views.md §16): a word (folded), a quoted
+  // identifier, a string, or an integer with an optional sign, as text.
+  private parseViewOptionValue(): string {
+    const negative = this.peek().kind === "minus";
+    if (negative) this.advance();
+    const t = this.peek();
+    let value: string;
+    if (!negative && t.kind === "word") value = t.word!;
+    else if (!negative && (t.kind === "quotedIdent" || t.kind === "str")) value = t.str!;
+    else if (t.kind === "int") value = (negative ? "-" : "") + t.int!.toString();
+    else throw engineError("syntax_error", `expected an option value, found ${t.kind}`);
+    this.advance();
+    return value;
+  }
+
+  // parseCreateView parses `CREATE [OR REPLACE] [TEMP | TEMPORARY] [RECURSIVE] VIEW [IF NOT EXISTS]
+  // [db.]name [(col, …)] [WITH (option, …)] AS subquery_expr` (views.md §1, grammar.md §54). The
+  // body runs from the token after `AS` to the end of the statement and is captured as its canonical
+  // token text. A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body and
+  // gives the view a check option (§15.6). RECURSIVE requires the column list and stores the body
+  // wrapped as `WITH RECURSIVE` (§17). `OR REPLACE` with `IF NOT EXISTS` is 42601.
   private parseCreateView(): Statement {
     this.expectKeyword("create");
     const orReplace = this.peekKeyword() === "or";
@@ -737,6 +810,11 @@ class Parser {
       this.advance(); // OR
       this.expectKeyword("replace");
     }
+    const tk = this.peekKeyword();
+    const temporary = tk === "temp" || tk === "temporary";
+    if (temporary) this.advance();
+    const recursive = this.peekKeyword() === "recursive";
+    if (recursive) this.advance();
     this.expectKeyword("view");
     // A two-token lookahead keeps a lone `if` an ordinary view name (`CREATE VIEW if AS …`).
     const ifNotExists =
@@ -750,9 +828,6 @@ class Parser {
       );
     }
     const [db, name] = this.parseQualifiedTableName();
-    if (this.peekKeyword() === "with" && this.peekKindAt(1) === "lparen") {
-      throw engineError("feature_not_supported", "view options (WITH ( … )) are not supported");
-    }
     let columns: string[] | null = null;
     if (this.peek().kind === "lparen") {
       this.advance();
@@ -762,6 +837,14 @@ class Parser {
         columns.push(this.expectIdentifier());
       }
       this.expect("rparen");
+    }
+    if (recursive && columns === null) {
+      throw engineError("syntax_error", "CREATE RECURSIVE VIEW requires a column list");
+    }
+    let options: ViewOption[] = [];
+    if (this.peekKeyword() === "with" && this.peekKindAt(1) === "lparen") {
+      this.advance(); // WITH
+      options = this.parseViewOptions();
     }
     this.expectKeyword("as");
     // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body is parsed (an
@@ -777,11 +860,35 @@ class Parser {
     if (trailing !== null && end !== trailing.at) {
       throw engineError("syntax_error", "unexpected trailing input");
     }
-    const body = renderTokens(this.tokens.slice(start, end));
+    const checkOption = trailing === null ? null : trailing.option;
+    if (recursive && checkOption !== null) {
+      throw engineError(
+        "feature_not_supported",
+        "WITH CHECK OPTION not supported on recursive views",
+      );
+    }
     // renderTokens re-lexes to the same token sequence, so the body's tokens keep the statement's
     // positions (and its eof the position of the token after the body).
-    const bodyLocs = this.positions.slice(start, end + 1);
-    const checkOption = trailing === null ? null : trailing.option;
+    let bodyLocs = this.positions.slice(start, end + 1);
+    let body: string;
+    if (recursive) {
+      // `with recursive "name" ( "c" , … ) as ( <body> ) select "c" , … from "name"` (views.md
+      // §17). The synthesized tokens take the positions of the body's first token and of the token
+      // after it, so an error inside the body still points into it.
+      const [prefix, suffix] = recursiveViewWrapper(name, columns!);
+      if (bodyLocs.length > 0) {
+        const firstLoc = bodyLocs[0]!;
+        const lastLoc = bodyLocs[bodyLocs.length - 1]!;
+        const locs: typeof bodyLocs = [];
+        for (let i = 0; i < prefix.length; i++) locs.push(firstLoc);
+        locs.push(...bodyLocs.slice(0, bodyLocs.length - 1));
+        for (let i = 0; i < suffix.length + 1; i++) locs.push(lastLoc);
+        bodyLocs = locs;
+      }
+      body = renderTokens([...prefix, ...this.tokens.slice(start, end), ...suffix]);
+    } else {
+      body = renderTokens(this.tokens.slice(start, end));
+    }
     return {
       kind: "createView",
       name,
@@ -792,6 +899,8 @@ class Parser {
       body,
       bodyLocs,
       checkOption,
+      temporary,
+      options,
     };
   }
 
@@ -2031,10 +2140,7 @@ class Parser {
       this.advance();
       cascade = true;
     }
-    if (cascade) {
-      throw engineError("feature_not_supported", "DROP TYPE ... CASCADE is not supported");
-    }
-    return { kind: "dropType", name, ifExists };
+    return { kind: "dropType", name, ifExists, cascade };
   }
 
   // parseCreateSequence parses `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]`
@@ -2223,10 +2329,7 @@ class Parser {
       this.advance();
       cascade = true;
     }
-    if (cascade) {
-      throw engineError("feature_not_supported", "DROP SEQUENCE ... CASCADE is not supported");
-    }
-    return { kind: "dropSequence", names, ifExists };
+    return { kind: "dropSequence", names, ifExists, cascade };
   }
 
   // Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-5 execute the
@@ -6860,4 +6963,29 @@ function jsonEncodingName(name: string): string {
       return "UTF32";
   }
   throw engineError("invalid_parameter_value", `unrecognized JSON encoding: ${name}`);
+}
+
+// recursiveViewWrapper is the tokens a `CREATE RECURSIVE VIEW name (cols) AS body` wraps around its
+// body (views.md §17): `with recursive "name" ( "c" , … ) as (` before it and `) select "c" , … from
+// "name"` after it. Every substituted name is a quoted identifier (views.md §5).
+export function recursiveViewWrapper(name: string, cols: string[]): [Token[], Token[]] {
+  const quotedTok = (n: string): Token => ({ kind: "quotedIdent", str: n });
+  const list = (out: Token[]) => {
+    cols.forEach((c, i) => {
+      if (i > 0) out.push({ kind: "comma" });
+      out.push(quotedTok(c));
+    });
+  };
+  const prefix: Token[] = [
+    { kind: "word", word: "with" },
+    { kind: "word", word: "recursive" },
+    quotedTok(name),
+    { kind: "lparen" },
+  ];
+  list(prefix);
+  prefix.push({ kind: "rparen" }, { kind: "word", word: "as" }, { kind: "lparen" });
+  const suffix: Token[] = [{ kind: "rparen" }, { kind: "word", word: "select" }];
+  list(suffix);
+  suffix.push({ kind: "word", word: "from" }, quotedTok(name));
+  return [prefix, suffix];
 }

@@ -209,10 +209,12 @@ on one of those, and so on. `DROP COLUMN … CASCADE` drops only the views that 
 table's other views keep working. Unlike PostgreSQL, jed does not print a *drop cascades to* notice,
 so check `jed_views` if you need to know what went.
 
-Dependencies cover tables, columns, and other views. A view does **not** track the sequences,
-composite types, or collations its query names. Dropping one of those succeeds, and the view then
-fails with the ordinary error when it is next read. (PostgreSQL refuses the drop for sequences and
-types.)
+Dependencies also cover the **sequences** a view names in `nextval('s')`, `currval('s')`, or
+`setval('s', …)` (a constant name; one that names no sequence is `42P01` at `CREATE VIEW`), and the
+**composite types** it casts to or returns. `DROP SEQUENCE` and `DROP TYPE` of one is `2BP01`, and
+`CASCADE` drops the dependent views. `ALTER SEQUENCE s RENAME TO s2` updates the views that use `s`.
+Collations and host functions are not tracked: SQL cannot drop them, and a view whose collation or
+function is missing fails with the ordinary error when it is read.
 
 ## Renaming tables and columns
 
@@ -261,8 +263,67 @@ table.
 
 A missing view is `42P01` unless you write `IF EXISTS`. Naming a table, index, or sequence is
 `42809`. A new name that is taken is `42P07`. Renaming a column that does not exist is `42703`, and
-to a name the view already has is `42701`. The other `ALTER VIEW` forms, such as `OWNER TO` and
-`SET (…)`, are not supported (`0A000`).
+to a name the view already has is `42701`. `OWNER TO` and `SET SCHEMA` are not supported (`0A000`):
+jed has no owners or schemas.
+
+## Column defaults
+
+A view column can have a default of its own, used when writing through the view:
+
+```sql
+ALTER VIEW open_tasks ALTER COLUMN title SET DEFAULT 'untitled';
+ALTER VIEW open_tasks ALTER COLUMN title DROP DEFAULT;
+```
+
+An `INSERT` through the view fills a column it leaves out, or writes as `DEFAULT`, from the view's
+default before the table's; through a chain of views, the default of the view nearest the statement
+wins. `UPDATE … SET c = DEFAULT` assigns the view's default, or `NULL` when it has none. The default is
+checked like a table column's (`42804` for the wrong type, `0A000` for a column reference or
+subquery). A default on a computed column makes every `INSERT` through the view fail with `0A000`, as
+in PostgreSQL. `ALTER TABLE v ALTER COLUMN c SET DEFAULT …` works on a view too, and
+`jed_columns.column_default` shows the default.
+
+## View options
+
+```sql
+CREATE VIEW v WITH (security_invoker) AS SELECT …;
+ALTER VIEW v SET (check_option = local, security_barrier);
+ALTER VIEW v RESET (security_barrier);
+```
+
+The options are PostgreSQL's:
+
+- `check_option` (`local` or `cascaded`) is another way to write `WITH … CHECK OPTION`.
+- `security_invoker` checks the tables the view reads against the session reading it (and, for a
+  write, the table underneath against the session writing), instead of making the view a privilege
+  boundary ([below](#privileges)).
+- `security_barrier` is accepted and stored. jed already never evaluates a condition from the outer
+  query on a row the view's own `WHERE` rejects, so it changes nothing.
+
+Values are booleans in PostgreSQL's spellings (`true`, `on`, `yes`, `1`, …); a bare name means
+`true`. An unknown option or a bad value is `22023`. `CREATE OR REPLACE VIEW` replaces the options,
+and `jed_views` shows them.
+
+## Recursive views
+
+```sql
+CREATE RECURSIVE VIEW countdown (n) AS
+  VALUES (3) UNION ALL SELECT n - 1 FROM countdown WHERE n > 1;
+```
+
+This is PostgreSQL's shorthand for a view over `WITH RECURSIVE countdown (n) AS (…) SELECT n FROM
+countdown`, and jed stores it that way. The column list is required.
+
+<a id="temporary-views"></a>
+
+## Temporary views
+
+`CREATE TEMP VIEW` (or `CREATE VIEW temp.v`) makes a view that only the current session sees and that
+goes away when the session ends. A view that reads a temporary table is temporary too, as in
+PostgreSQL (jed prints no notice). A temporary view can read temporary and persistent tables, and
+dropping or altering a table it reads in the same session is checked as for any view. Another
+session's statements do not see it, so they are not blocked by it. `temp.jed_views` lists the
+session's temporary views. Temporary view DDL is allowed by `allow_temp_ddl`.
 
 ## Other table changes are checked
 
@@ -321,7 +382,8 @@ Everything in the clause is written in the view's columns:
 - The conflict target `(id)` names view columns, each mapped to its table column, and must match the
   table's primary key or a `UNIQUE` constraint. A computed column such as `owner_tag` matches none
   (`42P10`), and `ON CONSTRAINT` is `42704`, because a view has no constraints.
-- `DO UPDATE SET` assigns view columns (a computed one is `0A000`, and `= DEFAULT` sets `NULL`).
+- `DO UPDATE SET` assigns view columns (a computed one is `0A000`, and `= DEFAULT` sets the view
+  column's default, or `NULL`).
   `excluded.col` and the view's name (or the `AS` alias) read the proposed and the existing row
   through the view's columns, computed ones included.
 - The view's `WHERE` does not limit which existing row is updated: task 2 is done, so the view does
@@ -370,6 +432,8 @@ write. Two orderings differ from PostgreSQL: a row that violates both an `EXCLUD
 check option reports `44000`, and an `UPDATE` reports a later row's `CHECK` or `UNIQUE` failure
 before an earlier row's check-option failure.
 
+<a id="privileges"></a>
+
 ## Privileges
 
 A view is a privilege boundary, as in PostgreSQL:
@@ -380,6 +444,8 @@ A view is a privilege boundary, as in PostgreSQL:
 - **Creating or replacing a view** needs `allow_ddl` and `SELECT` on every table and view its query
   reads, checked against the creating session (`42501`). A session cannot create a view over data it
   could not read itself. Renaming a view needs `allow_ddl`.
+- **A `security_invoker` view** also needs the reading session's `SELECT` on the tables and views its
+  query reads, and a write through it needs the writer's privilege on the table underneath.
 - **Writing through a view** is checked like writing a table: `INSERT`, `UPDATE`, or `DELETE` on the
   view, plus `SELECT` on it when the statement reads the view's columns. The table underneath is not
   checked, so a host can let a session change some rows of a table without any grant on the table.
@@ -392,7 +458,8 @@ Privileges are configured by the host. See [Authorization](../../api/authorizati
 
 `jed_views` lists each view's `name`, its stored `definition` (normalized: lowercase keywords,
 single-spaced tokens, `*` expanded, renames applied), its output `columns` as a `text[]`, and its
-`check_option` (`NONE`, `LOCAL`, or `CASCADED`). Views
+`check_option` (`NONE`, `LOCAL`, or `CASCADED`), and its `security_barrier` and `security_invoker`
+options. Views
 are not listed in `jed_tables`, but `jed_columns` lists each view column with the type a query
 over the view produces (with no length or precision: `text`, not `varchar(80)`). See
 [Introspection](../introspection/).
@@ -401,9 +468,6 @@ over the view produces (with no length or precision: `text`, not `varchar(80)`).
 
 Each of these is `0A000` today:
 
-- `ALTER VIEW` forms other than `RENAME`.
-- View options written as `WITH (…)`, including `WITH (check_option = local)`. Write the clause
-  form, `WITH LOCAL CHECK OPTION`, instead.
-- `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW`.
-- Temporary views, and a view that reads a temporary table.
+- `CREATE MATERIALIZED VIEW`.
+- `ALTER VIEW … OWNER TO` and `SET SCHEMA`.
 - Views in an attached database, and views whose query reads an attached database.

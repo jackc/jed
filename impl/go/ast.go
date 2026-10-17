@@ -513,6 +513,8 @@ type typeFieldDef struct {
 type dropType struct {
 	Name     string
 	IfExists bool
+	// Cascade also drops the views that depend on the type (views.md §6.1).
+	Cascade bool
 }
 
 // SeqOptions is the parsed, order-free sequence-option set shared by CREATE SEQUENCE and an
@@ -572,6 +574,8 @@ type seqBound struct {
 type dropSequence struct {
 	Names    []string
 	IfExists bool
+	// Cascade also drops the views that depend on a dropped sequence (views.md §6.1).
+	Cascade bool
 }
 
 // createView is `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
@@ -594,6 +598,43 @@ type createView struct {
 	// CheckOption is a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH
 	// CHECK OPTION` is checkOptionCascaded.
 	CheckOption checkOption
+	// Temporary is `CREATE TEMP | TEMPORARY VIEW` (views.md §10, temp-tables.md §14).
+	Temporary bool
+	// Options are the `WITH ( name [= value], … )` view options after the name (views.md §16),
+	// unvalidated.
+	Options []viewOption
+}
+
+// viewOption is one `name [= value]` entry of a view option list (spec/design/views.md §16). The name
+// is folded as an identifier; the value keeps its spelling (a word, a string, or a number), HasValue
+// false when absent. The executor validates both (22023).
+type viewOption struct {
+	Name     string
+	Value    string
+	HasValue bool
+}
+
+// viewEditKind is one non-rename ALTER VIEW action (spec/design/views.md §16).
+type viewEditKind uint8
+
+const (
+	// viewEditSetDefault is `ALTER [COLUMN] c SET DEFAULT expr`.
+	viewEditSetDefault viewEditKind = iota
+	// viewEditDropDefault is `ALTER [COLUMN] c DROP DEFAULT`.
+	viewEditDropDefault
+	// viewEditSetOptions is `SET ( name [= value], … )`.
+	viewEditSetOptions
+	// viewEditResetOptions is `RESET ( name, … )`.
+	viewEditResetOptions
+)
+
+// viewEdit is one non-rename ALTER VIEW action (spec/design/views.md §16).
+type viewEdit struct {
+	Kind    viewEditKind
+	Column  string
+	Default defaultDef
+	Options []viewOption
+	Names   []string
 }
 
 // checkOption is a view's check option (spec/design/views.md §15.6). The values are the persisted
@@ -614,6 +655,9 @@ type alterView struct {
 	IfExists     bool
 	RenameTo     string
 	RenameColumn *renamePair
+	// Edits is a comma list of the non-rename actions (views.md §16), applied in order; when set,
+	// RenameTo and RenameColumn are unset.
+	Edits []viewEdit
 }
 
 // dropView is `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1). Each

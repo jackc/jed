@@ -193,7 +193,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   → [temp-tables.md](spec/design/temp-tables.md)
   - [ ] _follow-on:_ a host-configurable spill directory (shared with the external sort) so WASI/OPFS
     hosts can offer a temp spill target; migrating a shrunken spilled domain back into RAM.
-  - [ ] _follow-on:_ temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
+  - [x] _follow-on:_ temporary views — landed with the view follow-ons below. → [views.md §10](spec/design/views.md)
 - [x] **`CREATE TABLE … AS`** — `CREATE [TEMP] TABLE [IF NOT EXISTS] name [(cols)] [ON COMMIT …] AS
   query [WITH [NO] DATA]`, PostgreSQL's: columns typed from the query with the typmods its outputs
   keep (`exprTypmod`, now tracked through every query output), filled as `INSERT … SELECT` (which now
@@ -223,12 +223,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `ALTER TABLE … DROP COLUMN` `CASCADE` dropping the closure of dependent views) and V9
   (`WITH [CASCADED | LOCAL] CHECK OPTION`: `44000` on an `INSERT`/`UPDATE` whose new row a checked
   view would not show, `format_version` 39, `jed_views.check_option`), and V10 (`INSERT … ON
-  CONFLICT` through an updatable view, written in the view's columns).
+  CONFLICT` through an updatable view, written in the view's columns). V11–V16 landed too: `CREATE
+  RECURSIVE VIEW` (§17), temporary views and views that become temporary by reading a temp relation
+  (§10), view column defaults and `ALTER VIEW … SET / RESET` options (`check_option`,
+  `security_barrier`, `security_invoker` — §16), dependencies on sequences and composite types with
+  `DROP SEQUENCE / DROP TYPE … CASCADE` (collations and host functions deliberately record none —
+  §6.2), and catalog entries longer than a page (`format_version` 43).
   → [views.md](spec/design/views.md)
-  - [ ] _follow-on:_ view column defaults,
-    view options and the other `ALTER VIEW` actions, materialized and recursive views, temporary views, views in or over attached
-    databases, dependency tracking for
-    sequences/types/collations/host functions, definitions longer than one catalog page. (View
+  - [ ] _follow-on:_ materialized views, views in or over attached databases. (View
     columns in `jed_columns` have landed — [introspection.md §5](spec/design/introspection.md).) → [views.md §12](spec/design/views.md)
 
 ---

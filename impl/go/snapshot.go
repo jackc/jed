@@ -1092,6 +1092,27 @@ func (s *snapshot) applyOnCommitActions() (bool, error) {
 		for _, d := range s.foreignKeyDependentsExcluding(drops) {
 			s.removeForeignKey(d.refTableKey, d.fkName)
 		}
+		// The temporary views that read a dropped table, or a sequence it owns, go with it, as under
+		// DROP TABLE … CASCADE (views.md §10). Only temporary views can.
+		owned := map[string]bool{}
+		for name := range drops {
+			for _, sk := range s.sequencesOwnedBy(name) {
+				owned[sk] = true
+			}
+		}
+		var seeds []string
+		for _, v := range s.viewsSorted() {
+			for _, d := range v.Deps {
+				if (d.Kind == viewDepTable && drops[d.Name]) || (d.Kind == viewDepSequence && owned[d.Name]) {
+					seeds = append(seeds, v.Name)
+					break
+				}
+			}
+		}
+		for _, view := range s.viewDropClosure(seeds) {
+			s.removeView(view)
+			changed = true
+		}
 	}
 	for name := range drops {
 		for _, sk := range s.sequencesOwnedBy(name) {

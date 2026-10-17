@@ -817,7 +817,8 @@ export type TypeFieldDef = {
 // (spec/design/composite.md §7). RESTRICT (the default and only behavior this slice) fails with
 // 2BP01 if a table column or another composite type still references it; CASCADE is 0A000. A
 // missing type without IF EXISTS is 42704.
-export type DropType = { kind: "dropType"; name: string; ifExists: boolean };
+// `cascade`: also drop the views that depend on the type (views.md §6.1).
+export type DropType = { kind: "dropType"; name: string; ifExists: boolean; cascade: boolean };
 
 // SeqOptions is the parsed, order-free sequence-option set shared by CREATE SEQUENCE and an
 // IDENTITY column's optional `( seq_options )` (spec/design/sequences.md §13). Each is captured as
@@ -895,6 +896,8 @@ export type DropSequence = {
   kind: "dropSequence";
   names: string[];
   ifExists: boolean;
+  // CASCADE: also drop the views that depend on a dropped sequence (views.md §6.1).
+  cascade: boolean;
 };
 
 // SeqRestart is a parsed RESTART pseudo-option on ALTER SEQUENCE (spec/design/sequences.md §15):
@@ -1548,7 +1551,22 @@ export type CreateView = {
   // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH CHECK OPTION` is
   // "cascaded".
   checkOption: CheckOption | null;
+  // `CREATE TEMP | TEMPORARY VIEW` (views.md §10, temp-tables.md §14).
+  temporary: boolean;
+  // The `WITH ( name [= value], … )` view options after the column list (views.md §16), unvalidated.
+  options: ViewOption[];
 };
+
+// ViewOption is one `name [= value]` entry of a view option list (views.md §16). The name is folded
+// as an identifier; the value keeps its spelling, null when absent. The executor validates both.
+export type ViewOption = { name: string; value: string | null };
+
+// ViewEdit is one non-rename ALTER VIEW action (views.md §16).
+export type ViewEdit =
+  | { kind: "setDefault"; column: string; default: DefaultDef }
+  | { kind: "dropDefault"; column: string }
+  | { kind: "setOptions"; options: ViewOption[] }
+  | { kind: "resetOptions"; names: string[] };
 
 // CheckOption is a view's check option (spec/design/views.md §15.6).
 export type CheckOption = "local" | "cascaded";
@@ -1562,7 +1580,8 @@ export type AlterView = {
   ifExists: boolean;
   action:
     | { kind: "renameTo"; newName: string }
-    | { kind: "renameColumn"; oldName: string; newName: string };
+    | { kind: "renameColumn"; oldName: string; newName: string }
+    | { kind: "edits"; edits: ViewEdit[] };
 };
 
 // DropView is `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1).

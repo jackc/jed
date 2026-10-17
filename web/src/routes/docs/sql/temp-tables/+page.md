@@ -180,7 +180,10 @@ one, or a permanent table referencing a temp one, is rejected with `42P16`, as i
 `ON COMMIT` follows PostgreSQL too. Committing would empty an `ON COMMIT DELETE ROWS` table, so a
 table that references it must also be `ON COMMIT DELETE ROWS`; otherwise the commit fails with
 `0A000` and the transaction is rolled back. When an `ON COMMIT DROP` table is dropped, a remaining
-table's foreign key to it is dropped with it.
+table's foreign key to it is dropped with it, and so are the temporary views that read it.
+
+A view over a temp table is a [temporary view](../views/#temporary-views): it lives with the session's
+temp tables, and `CREATE TEMP VIEW` makes one directly.
 
 ## Not yet supported on a temp table
 

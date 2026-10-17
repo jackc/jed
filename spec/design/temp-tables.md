@@ -222,8 +222,9 @@ temp table's (never-serialized) catalog entry:
   (it is internal and monotonic, §7 of transactions.md).
 - **`DROP`** — the commit drops the table exactly as `DROP TABLE … CASCADE` would (PostgreSQL's drop
   is `CASCADE`): its indexes and the sequences it owns go with it, and a surviving temp table's
-  `FOREIGN KEY` that references it is dropped (§8). Views over temp relations are `0A000`, so nothing
-  else can depend on it.
+  `FOREIGN KEY` that references it is dropped (§8), and so is every temporary view that reads it or a
+  sequence it owns, with the views over those ([views.md](views.md) §10). Only a temporary view can
+  depend on a temporary table.
 
 **When the actions run.** At every successful commit of a read-write transaction — `COMMIT`, an
 autocommit statement's implicit commit, a host `commit()`/`update` closure, and the implicit
@@ -604,6 +605,6 @@ and memory-only per the design decision:
   ([attached-databases.md](attached-databases.md) §6). Not deferred — deliberately not part of temp.
 - A host-configurable spill directory (shared with the external sort — spill.md), so a WASI or OPFS
   host could offer a temp spill target; and migrating a shrunken spilled domain back into RAM.
-- Temporary **views** / a session-local relation namespace object beyond tables. Persistent views
-  have landed ([views.md](views.md)); `CREATE TEMP VIEW` and a persistent view over a temp relation
-  are `0A000` until then (views.md §10).
+- ~~Temporary views~~ — **landed** ([views.md](views.md) §10): `CREATE TEMP VIEW`, `CREATE VIEW
+  temp.v`, and a view over a temporary relation live in the session's temporary domain, in its
+  preclude-overlaps namespace, gated by `allow_temp_ddl` when spelled temporary.

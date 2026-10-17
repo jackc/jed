@@ -3990,6 +3990,15 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	name := fc.Name
+	// A view body depends on the sequence a constant sequence-function argument names
+	// (spec/design/views.md §6).
+	if (name == "nextval" || name == "currval" || name == "setval") && len(fc.Args) > 0 && s.catalog != nil {
+		if a := fc.Args[0]; a.Kind == exprLiteral && a.Literal != nil && a.Literal.Kind == literalText {
+			if err := s.catalog.traceSequence(a.Literal.Str); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+	}
 	rargs := make([]*rExpr, 0, len(fc.Args))
 	tys := make([]resolvedType, 0, len(fc.Args))
 	for _, a := range fc.Args {

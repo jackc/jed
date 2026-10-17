@@ -75,6 +75,10 @@ CREATE TABLE p (home addr PRIMARY KEY)
 statement ok
 DROP TABLE p
 
-# DROP TYPE ... CASCADE is not supported (RESTRICT-only this slice). PostgreSQL drops with CASCADE.
+# DROP TYPE ... CASCADE of a type a column uses is not supported: PostgreSQL drops the column too.
+# (CASCADE that drops only dependent views is supported — ddl/views_dependencies.test.)
+statement ok
+CREATE TABLE p2 (id i32, home addr)
+
 statement error 0A000
 DROP TYPE addr CASCADE

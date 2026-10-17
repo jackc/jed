@@ -494,6 +494,8 @@ pub struct TypeFieldDef {
 pub struct DropType {
     pub name: String,
     pub if_exists: bool,
+    /// `CASCADE`: also drop the views that depend on the type (views.md §6.1).
+    pub cascade: bool,
 }
 
 /// The parsed, order-free sequence options shared by `CREATE SEQUENCE` and an IDENTITY column's
@@ -545,6 +547,8 @@ pub struct IdentitySpec {
 pub struct DropSequence {
     pub names: Vec<String>,
     pub if_exists: bool,
+    /// `CASCADE`: also drop the views that depend on a dropped sequence (views.md §6.1).
+    pub cascade: bool,
 }
 
 /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
@@ -568,6 +572,19 @@ pub struct CreateView {
     /// A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH CHECK
     /// OPTION` is `Cascaded`.
     pub check_option: Option<CheckOption>,
+    /// `CREATE TEMP | TEMPORARY VIEW` (views.md §10, temp-tables.md §14).
+    pub temporary: bool,
+    /// The `WITH ( name [= value], … )` view options after the name (views.md §16), unvalidated.
+    pub options: Vec<ViewOption>,
+}
+
+/// One `name [= value]` entry of a view option list (spec/design/views.md §16). The name is folded
+/// as an identifier; the value keeps its spelling (a word, a string, or a number), `None` when
+/// absent. The executor validates both (22023).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ViewOption {
+    pub name: String,
+    pub value: Option<String>,
 }
 
 /// A view's check option (spec/design/views.md §15.6).
@@ -603,6 +620,21 @@ pub enum AlterViewAction {
     RenameTo(String),
     /// `RENAME [COLUMN] old TO new`.
     RenameColumn { old: String, new: String },
+    /// A comma list of the non-rename actions (views.md §16), applied in order.
+    Edits(Vec<ViewEdit>),
+}
+
+/// One non-rename `ALTER VIEW` action (spec/design/views.md §16).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ViewEdit {
+    /// `ALTER [COLUMN] c SET DEFAULT expr`.
+    SetDefault { column: String, def: DefaultDef },
+    /// `ALTER [COLUMN] c DROP DEFAULT`.
+    DropDefault { column: String },
+    /// `SET ( name [= value], … )`.
+    SetOptions(Vec<ViewOption>),
+    /// `RESET ( name, … )`.
+    ResetOptions(Vec<String>),
 }
 
 /// `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md §4/§15). A missing

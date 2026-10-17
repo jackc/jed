@@ -461,7 +461,8 @@ step `repeat` count, `expect_max` for an upper bound, and extra actor arguments 
 observing a client's asynchronous `end_read` or a handoff completing. An `async` step sends its
 command without waiting; a later `await` step on the same actor checks its reply (or, after an async
 `close`, waits for the actor to exit). A `start` step may `expect_error` a failed open, and every actor
-must exit with status 0 after `close`.
+must exit with status 0 after `close`. A step's `sql` may write `{{repeat <char> <count>}}` for a run of
+one character, which the driver expands, so a statement too long to spell out fits in the file.
 
 The corpus, not per-core copies, covers:
 

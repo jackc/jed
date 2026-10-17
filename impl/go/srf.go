@@ -924,6 +924,8 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "definition", Type: scalarT(scalarText), NotNull: true},
 			{Name: "columns", Type: textArr, NotNull: true},
 			{Name: "check_option", Type: scalarT(scalarText), NotNull: true},
+			{Name: "security_barrier", Type: scalarT(scalarBool), NotNull: true},
+			{Name: "security_invoker", Type: scalarT(scalarBool), NotNull: true},
 		}}
 	default: // srfJedStatistics
 		return &catTable{Name: "jed_statistics", Columns: []catColumn{
@@ -1068,9 +1070,9 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 			})
 		}
 	}
-	// Views live only in the main database; an attached database's views are not readable
-	// (views.md §10), so their columns are not listed.
-	if sp.introspectScope == "main" {
+	// Views live in the main database and the session's temporary domain; an attached database's
+	// views are not readable (views.md §10), so their columns are not listed.
+	if sp.introspectScope == "main" || sp.introspectScope == "temp" {
 		for _, v := range snap.viewsSorted() {
 			types, err := db.viewColumnTypes(v)
 			if err != nil {
@@ -1081,6 +1083,10 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 					return nil, err
 				}
 				m.Charge(costs.GeneratedRow)
+				def := NullValue()
+				if d := v.viewDefault(i); d != nil {
+					def = TextValue(d.ExprText)
+				}
 				out = append(out, storedRow{
 					TextValue(v.Name),
 					TextValue(name),
@@ -1088,7 +1094,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 					TextValue(types[i]),
 					BoolValue(false),
 					NullValue(),
-					NullValue(),
+					def,
 					NullValue(),
 				})
 			}
@@ -1454,7 +1460,10 @@ func (db *engine) jedViewsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 		case checkOptionCascaded:
 			check = "CASCADED"
 		}
-		out = append(out, storedRow{TextValue(v.Name), TextValue(v.Definition), ArrayValue(cols), TextValue(check)})
+		out = append(out, storedRow{
+			TextValue(v.Name), TextValue(v.Definition), ArrayValue(cols), TextValue(check),
+			BoolValue(v.SecurityBarrier), BoolValue(v.SecurityInvoker),
+		})
 	}
 	return out, nil
 }

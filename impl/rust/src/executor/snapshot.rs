@@ -885,6 +885,27 @@ impl Snapshot {
             for d in self.foreign_key_dependents_excluding(&drops) {
                 self.remove_foreign_key(&d.ref_table_key, &d.fk_name);
             }
+            // The temporary views that read a dropped table, or a sequence it owns, go with it, as
+            // under DROP TABLE … CASCADE (views.md §10). Only temporary views can.
+            let owned: Vec<String> = drops
+                .iter()
+                .flat_map(|t| self.sequences_owned_by(t))
+                .collect();
+            let seeds: Vec<String> = self
+                .views_sorted()
+                .into_iter()
+                .filter(|v| {
+                    v.deps.iter().any(|d| match d.kind {
+                        ViewDepKind::Table => drops.contains(&d.name),
+                        ViewDepKind::Sequence => owned.contains(&d.name),
+                        _ => false,
+                    })
+                })
+                .map(|v| v.name.clone())
+                .collect();
+            for view in self.view_drop_closure(seeds) {
+                self.remove_view(&view);
+            }
         }
         for name in &drops {
             for sk in self.sequences_owned_by(name) {

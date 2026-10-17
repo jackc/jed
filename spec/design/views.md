@@ -4,13 +4,14 @@
 > **named, persisted query** that the FROM clause references like a table. This doc is the contract all three cores implement in lockstep
 > (CLAUDE.md §2). The grammar is in [../grammar/grammar.ebnf](../grammar/grammar.ebnf) and
 > [grammar.md](grammar.md) §54. The byte layout is in [../fileformat/format.md](../fileformat/format.md)
-> (`format_version` 38; the check option, 39). The errors are codes in [../errors/registry.toml](../errors/registry.toml).
+> (`format_version` 38; the check option, 39; column defaults, options, sequence and type dependencies,
+> and entries longer than a page, 43). The errors are codes in [../errors/registry.toml](../errors/registry.toml).
 > PostgreSQL behavior was pinned against the live `postgres:18` oracle (CLAUDE.md §1).
 > A view with PostgreSQL's simple single-relation shape is **automatically updatable**: `INSERT`,
 > `UPDATE`, and `DELETE` on it write its base relation (§15), and `WITH [CASCADED | LOCAL] CHECK
-> OPTION` keeps those writes inside the view (§15.6). There is no materialized, recursive, or
-> temporary view (§12). `CREATE OR REPLACE VIEW` (§1.2) and view renames
-> (§7.1) redefine a view in place.
+> OPTION` keeps those writes inside the view (§15.6). A view may be temporary (§10) or recursive
+> (§17), and its columns may have defaults and the view options (§16); there is no materialized view
+> (§12). `CREATE OR REPLACE VIEW` (§1.2) and view renames (§7.1) redefine a view in place.
 
 A view is the fifth kind of database-level catalog object, after tables, composite types, sequences,
 and collation references. It has no storage of its own. Reading a view plans its stored query in
@@ -31,11 +32,15 @@ Everything below follows from three choices:
 ## 1. Surface
 
 ```
-CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS query
+CREATE [OR REPLACE] [TEMP | TEMPORARY] [RECURSIVE] VIEW [IF NOT EXISTS] [main. | temp.]name
+    [( col [, …] )] [WITH ( option [= value] [, …] )] AS query
     [WITH [CASCADED | LOCAL] CHECK OPTION]
 DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
-ALTER VIEW [IF EXISTS] [main.]name RENAME TO new_name
-ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
+ALTER VIEW [IF EXISTS] [main. | temp.]name RENAME TO new_name
+ALTER VIEW [IF EXISTS] [main. | temp.]name RENAME [COLUMN] col TO new_col
+ALTER VIEW [IF EXISTS] [main. | temp.]name action [, …]
+    -- action: ALTER [COLUMN] col SET DEFAULT expr | ALTER [COLUMN] col DROP DEFAULT
+    --       | SET ( option [= value] [, …] ) | RESET ( option [, …] )
 ```
 
 - **`query`** is a `subquery_expr`: an optional `WITH` clause, then a `SELECT`, `VALUES` query
@@ -63,7 +68,11 @@ ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
 - **`WITH [CASCADED | LOCAL] CHECK OPTION`** after the body gives the view a **check option**
   (§15.6). `WITH CHECK OPTION` is `CASCADED`. The clause is not part of the body or of the stored
   definition (§3).
-- **`ALTER VIEW … RENAME`** renames a view or one of its output columns (§7.1).
+- **`ALTER VIEW … RENAME`** renames a view or one of its output columns (§7.1). The other
+  `ALTER VIEW` actions set column defaults and options (§16); `OWNER TO` and `SET SCHEMA` are
+  `0A000` (jed has neither owners nor schemas).
+- **`TEMP` / `TEMPORARY`** makes a temporary view (§10); **`RECURSIVE`** is PostgreSQL's shorthand
+  for a view over `WITH RECURSIVE` (§17); **`WITH ( options )`** sets the view options (§16.2).
 - **`DROP VIEW`** follows `DROP TABLE`'s shape ([grammar.md](grammar.md) §13). It is two-phase and
   all-or-nothing over a comma list. A repeated name is deduplicated. A missing name is **`42P01`**
   (*view does not exist*) unless `IF EXISTS`, which skips just that name. A name that resolves to
@@ -78,15 +87,19 @@ ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
 
 ### 1.1 Validation order at `CREATE VIEW` (deterministic, PG-matched)
 
-1. The `allow_ddl` gate (`42501`), then the database qualifier: `main` is accepted, `temp` and any
-   attachment are `0A000` (§10), and an unknown qualifier is `42P01`.
+1. The `allow_ddl` gate (`42501`; `allow_temp_ddl` for a view spelled `TEMP` or `temp.`, §10), then
+   the database qualifier: `main` is accepted, `temp` makes the view temporary, `TEMP` with any other
+   qualifier is `42601` (the `CREATE TEMP TABLE` precedent), an attachment is `0A000` (§10), and an
+   unknown qualifier is `42P01`.
 2. The `jed_` reservation (`42939`, kind `view`, [introspection.md](introspection.md) §4).
 3. `IF NOT EXISTS` and a taken name: a silent no-op, and nothing below runs.
 4. The body is planned in the isolated view scope (§4.1). Every resolution error surfaces here:
    `42P01`, `42703`, `42702`, `42883`, `42804`, and so on. A `$N` is **`42P02`** (*there is no
    parameter $N*, PostgreSQL). A data-modifying `WITH` is **`0A000`** (*views must not contain
-   data-modifying statements in WITH*, PostgreSQL). A temp or attached relation is `0A000` (§10).
-   With a check option, the body must then have the updatable shape of §15.1 for `INSERT` and
+   data-modifying statements in WITH*, PostgreSQL). An attached relation is `0A000`; a temporary
+   relation makes the view temporary (§10). A constant `nextval` / `currval` / `setval` argument
+   naming no sequence is `42P01` (§6). Then the `WITH ( … )` options are validated (`22023`, §16.2;
+   PostgreSQL also reports body errors first). With a check option, the body must then have the updatable shape of §15.1 for `INSERT` and
    `UPDATE`, including at least one updatable column, else **`0A000`** (*WITH CHECK OPTION is
    supported only on automatically updatable views*, PostgreSQL). A `*` select item counts as
    updatable columns, since it expands to column references (§5). Only the view's own body is
@@ -102,8 +115,9 @@ ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
    before the name collision, so `CREATE VIEW v AS SELECT * FROM nosuch` is `42P01` even when `v`
    exists. Under `OR REPLACE`, a name taken by a view continues at §1.2 step 9, and a name taken by
    any other relation is **`42809`** (*"t" is not a view*).
-9. The catalog entry is written. A definition whose entry does not fit one catalog page is
-   `0A000` (the catalog's one-page-per-entry rule, format.md *Catalog*).
+9. The catalog entry is written, in the main database or the session's temporary domain (§10).
+   An entry longer than a catalog page spans consecutive catalog pages (format.md *Catalog*, v43);
+   there is no length limit.
 
 ### 1.2 `CREATE OR REPLACE VIEW` (PG-matched)
 
@@ -138,7 +152,9 @@ privilege check all come first, as in PostgreSQL), and then:
     A failure is **`0A000`** (*cannot replace view v because it would change the definition of view
     w*).
 12. The catalog entry is replaced: the new definition, output columns, dependency list, and depth,
-    under the same name. A definition that does not fit one catalog page is `0A000`, as at create.
+    under the same name. The defaults of the columns it keeps are kept (§16.1); its options are the
+    statement's (§16.2). A temporary view stays temporary; a persistent view cannot be replaced by a
+    temporary one (`42P07`, §10).
 
 The replacement's check option, or its absence, replaces the view's (PostgreSQL's behavior):
 `CREATE OR REPLACE VIEW` without the clause removes a check option the view had.
@@ -169,7 +185,8 @@ Statements that name a relation of a specific kind treat a view as the wrong kin
 | `CREATE INDEX … ON v` | `42809` *cannot create index on relation "v"* | same |
 | `REFERENCES v` (a foreign-key parent) | `42809` *referenced relation "v" is not a table* | same |
 | `ALTER TABLE v RENAME TO …` / `RENAME [COLUMN] …` | the view rename (§7.1) | same |
-| Any other `ALTER TABLE v …` action | `42809` | same |
+| `ALTER TABLE v ALTER [COLUMN] c SET DEFAULT … / DROP DEFAULT` (a list of only these) | the view column default (§16.1) | same |
+| Any other `ALTER TABLE v …` action | `42809` | PG also accepts `SET` / `RESET` options |
 | `ALTER VIEW t RENAME …` (`t` a table, index, or sequence) | `42809` *"t" is not a view*, also with `IF EXISTS` | PG renames a table's column through `ALTER VIEW` |
 | `CREATE OR REPLACE VIEW t …` (`t` not a view) | `42809` *"t" is not a view* | same |
 | `ANALYZE v` | a no-op success | PG warns and succeeds |
@@ -179,7 +196,7 @@ Statements that name a relation of a specific kind treat a view as the wrong kin
 not automatically updatable (§15.1). The rejection happens when the DML target is resolved, before
 any column, value, or `RETURNING` check (§15.3).
 
-## 3. Persistence (`format_version` 38, check option 39)
+## 3. Persistence (`format_version` 38, check option 39, v43)
 
 A view is a catalog entry with `entry_kind = 5` ([../fileformat/format.md](../fileformat/format.md)
 *View entry*). It records:
@@ -190,7 +207,14 @@ A view is a catalog entry with `entry_kind = 5` ([../fileformat/format.md](../fi
 - the **definition**: the canonical token text of the body after `*` expansion (§5);
 - the **dependency list**: every table and view the body reads, with, for each table, the exact set
   of its columns the body references (§6);
-- the **check option**: none, `LOCAL`, or `CASCADED` (§15.6, `format_version` 39).
+- the **check option**: none, `LOCAL`, or `CASCADED` (§15.6, `format_version` 39);
+- each output column's **default**, as canonical text (§16.1, v43);
+- the **options** `security_barrier` and `security_invoker` (§16.2, v43).
+
+The dependency list also names the sequences and composite types the body uses (§6, v43). An entry
+longer than one catalog page spans consecutive catalog pages (format.md *Catalog*, v43). A
+temporary view's entry lives in the session's temporary domain, which is never written to the file
+(temp-tables.md §2).
 
 **Canonical text.** The body is the token sequence after `AS` to the end of the statement. Each
 token is rendered by the closed per-token table in format.md *Check-expression text* and the tokens
@@ -408,11 +432,37 @@ Dropping views is a catalog edit with zero cost, like the drop itself. PostgreSQ
 *drop cascades to* notice; jed has no notice channel (§12). The statement is all-or-nothing: a
 later failure, or a rollback of its transaction, restores every view it dropped.
 
-**Not tracked.** A view does not record dependencies on sequences named in `nextval('s')`, on
-composite types named in casts, on collations, or on host functions. Dropping such an object
-succeeds, and the view then fails *when used* with the ordinary error (`42P01`, `42704`, `42883`).
-PostgreSQL tracks some of these (sequences and types) and refuses the drop with `2BP01`. That is a
-recorded divergence (§12). Because open never plans, the database still opens.
+### 6.2 Sequences, composite types, collations, and host functions (v43)
+
+PostgreSQL records a view's dependencies on the sequences and types its expressions name; jed
+matches it (pinned against the PG 18 oracle):
+
+- **Sequences.** A view depends on each sequence named by the **constant** first argument of
+  `nextval`, `currval`, or `setval` (`nextval('s')`), parsed as one identifier as at evaluation. The
+  name must be a sequence when the body is traced (at `CREATE VIEW` and re-validation), else
+  **`42P01`** (*relation "s" does not exist*) — PostgreSQL's `regclass` reading of the constant fails
+  the same way. A computed name (`nextval('s' || '2')`) is no dependency. A temporary sequence makes
+  the view temporary (§10).
+- **Composite types.** A view depends on each composite type its body names as a type — a cast
+  target (`::addr`, `CAST(… AS addr[])`, an array suffix stripped), a typed literal (`addr '(…)'`) —
+  and on the composite type, or array element type, of each output column.
+- **Enforcement.** `DROP SEQUENCE s` / `DROP TYPE addr` while a view depends on it is **`2BP01`**
+  (*cannot drop sequence s because view v depends on it*); under `CASCADE` the dependent views are
+  dropped, with the closure of §6.1. (`CASCADE` of an owned sequence, or of a type a table column or
+  composite field uses, stays `0A000` — PostgreSQL would also drop the column default or column.)
+  `DROP TABLE t` drops the sequences `t` owns (sequences.md §12), so a view depending on one of them
+  blocks the `DROP TABLE` (`2BP01`) unless `CASCADE`. `ALTER SEQUENCE s RENAME TO s2` rewrites the view
+  (§7.2). jed has no `ALTER TYPE … RENAME`.
+- **Collations and host functions record nothing.** SQL cannot drop either: a collation comes from a
+  bundle loaded into the environment, a host function from the host's registration
+  ([extensibility.md](extensibility.md) §7). A view stores no value derived from them, so a changed
+  implementation or version cannot leave stored data stale; it follows the `DEFAULT` rule of
+  extensibility.md §7.1.1 (resolve only where applied, persist nothing). A view whose collation or
+  host function the reopening environment lacks fails *when used*, with the ordinary error (`42704`,
+  `42883`); the database still opens, because open never plans.
+
+The dependency list is sorted by `(name, kind)` byte order (a type may share a table's name).
+Re-validation (§8) compares the whole list, these kinds included.
 
 ## 7. `RENAME` rewrites the stored text
 
@@ -468,8 +518,9 @@ ALTER VIEW [IF EXISTS] [main.]v RENAME [COLUMN] a TO b
 `ALTER TABLE v RENAME TO …` and `ALTER TABLE v RENAME [COLUMN] …` on a view are the same
 statements, as in PostgreSQL. Validation, in order:
 
-1. The `allow_ddl` gate (`42501`), then the qualifier: `main` is accepted, `temp` and any
-   attachment are `0A000` (§10), and an unknown qualifier is `42P01`.
+1. The `allow_ddl` gate (`42501`; `allow_temp_ddl` for a temporary view, §10), then the qualifier:
+   `main` names the main database's views, `temp` the session's temporary views, an attachment is
+   `0A000` (§10), and an unknown qualifier is `42P01`.
 2. The name. No relation `v` is **`42P01`** (*relation "v" does not exist*), or a silent no-op
    under `IF EXISTS`. Under `ALTER VIEW`, a table, index, or sequence `v` is **`42809`** (*"v" is
    not a view*), and `IF EXISTS` does not suppress it.
@@ -495,9 +546,17 @@ exposed before the statement. Over `v(a, b)`, a dependent's `FROM v` becomes
 `from v as "v" ( "a" )` when `a` is renamed. This is PostgreSQL's behavior: its dependents keep the
 names they were defined with (`pg_get_viewdef` shows `aa AS a`).
 
-Other `ALTER VIEW` actions (`ALTER COLUMN … SET/DROP DEFAULT`, `OWNER TO`, `SET SCHEMA`, `SET` /
-`RESET` options) are **`0A000`** (§12). Statements that rename a view are zero-cost, transactional
-DDL like the others (§1).
+The column-default and option actions are §16. `OWNER TO` and `SET SCHEMA` are **`0A000`** (jed has
+no owners or schemas). Statements that alter a view are zero-cost, transactional DDL like the others
+(§1).
+
+### 7.2 Renaming a sequence
+
+`ALTER SEQUENCE s RENAME TO s2` rewrites every view that depends on `s` (§6.2): the constant argument
+of each `nextval` / `currval` / `setval` call in its definition that names `s` becomes `'s2'` (the new
+name as an identifier, quoted inside the string when it must be), and the dependency follows.
+Sequences are resolved by name everywhere, so every such constant names this sequence. PostgreSQL
+keeps the view working through the sequence's OID; the result is the same.
 
 ## 8. Re-validation after a change to a dependency
 
@@ -562,6 +621,13 @@ when the owner would be fixed:
 - **`DROP VIEW`** and **`ALTER VIEW`** require `allow_ddl`.
 - **Writing through a view** (§15.4) requires the writer's privilege on the view only, as for a
   table.
+- **A `security_invoker` view** (§16.2) is checked as PostgreSQL checks one: reading it also needs the
+  reader's `SELECT` on every relation its body reads (a `security_invoker` view among them is checked
+  the same way; a definer view's body is not entered), and writing through it also needs, on its base
+  relation, every privilege the statement needs on the view, plus `SELECT` there when the view's
+  `WHERE` is evaluated (an `UPDATE` or `DELETE`) and what a subquery in that `WHERE` reads. The owner
+  check at `CREATE VIEW` still runs. A view that stops being `security_invoker` (`SET` / `RESET`)
+  becomes a definer view, so the altering session must pass the owner check then (`42501`).
 
 This keeps CLAUDE.md §13 intact. A view grants no read its creator lacked. Reading through it is
 bounded by the reading session's cost ceiling, lifetime budget, and query-memory limit like any
@@ -569,12 +635,39 @@ other query. The built-in surface stays pure.
 
 ## 10. Scope: temporary and attached databases
 
-- **Temporary views** (`CREATE TEMP VIEW`, `CREATE VIEW temp.v`) are `0A000`. They are a
-  temp-tables follow-on ([temp-tables.md](temp-tables.md) §14).
-- **A persistent view may not read a temporary relation.** A body that names a temp table (bare or
-  `temp.`-qualified) is `0A000`. PostgreSQL silently makes such a view temporary; jed has no
-  temporary views yet (§12). Under the preclude-overlaps rule
-  ([temp-tables.md](temp-tables.md) §3) a temp table cannot later shadow a name a view reads.
+- **Temporary views** (`CREATE TEMP | TEMPORARY VIEW`, `CREATE VIEW temp.v`) live in the session's
+  temporary domain, beside its temporary tables ([temp-tables.md](temp-tables.md) §2, §14): they are
+  never written to the file, are private to the session, and are dropped when it closes. A view whose
+  body reads a temporary table, view, or sequence is temporary too, as in PostgreSQL (which also emits
+  a notice; jed has none). A temporary view may read persistent relations of the main database and
+  temporary ones; a persistent view never reads a temporary relation, because it would have become
+  temporary.
+- **Namespace.** A temporary view joins the session's preclude-overlaps namespace (temp-tables.md
+  §3): its name may not be taken by a temporary or persistent relation (`42P07`), and a persistent
+  relation may not take it. A bare name resolves to the temporary view first. `temp.v` names only
+  the session's temporary views and `main.v` only the main database's. `CREATE OR REPLACE VIEW v` of a
+  temporary view replaces it and it stays temporary, whatever the new body reads; `CREATE OR REPLACE
+  VIEW` that would make a persistent view temporary (spelled `TEMP` or reading a temporary relation)
+  is `42P07`. PostgreSQL instead creates a second view of the same name in another schema; jed has one
+  namespace (§12).
+- **Everything else is a view's behavior**: reading, writing through it (§15), renames (§7.1),
+  defaults and options (§16), `DROP VIEW`, re-validation, and `CASCADE`. Its dependencies (§6) are
+  enforced within the session: dropping, altering, or renaming a persistent or temporary relation the
+  session's temporary views depend on is refused, rewritten, or re-validated exactly as for a
+  persistent view, and `CASCADE` drops them. An `ON COMMIT DROP` temporary table takes the temporary
+  views over it (and over the sequences it owns) with it, as its `DROP TABLE … CASCADE` would
+  (temp-tables.md §5.1).
+- **Other sessions.** Another session's DDL does not see this session's temporary views, so it is not
+  blocked by them, and a temporary view over a persistent table another session drops or renames
+  fails *when used*, with the ordinary error. PostgreSQL's catalog is shared, so there a temporary
+  view blocks the other session's `DROP TABLE` (§12). Maintaining a registry of every session's
+  private objects is what temp-tables.md §3 deliberately avoids.
+- **The gate.** DDL spelled `TEMP` or `temp.`, or naming a temporary view (`DROP VIEW`, `ALTER VIEW`,
+  `ALTER TABLE`), is gated by `allow_temp_ddl` (temp-tables.md §5). A view that becomes temporary
+  only because its body reads a temporary relation is spelled persistent and is gated by
+  `allow_ddl`.
+- **Introspection.** `temp.jed_views` and `temp.jed_columns` list the temporary views; the unqualified
+  relations list the main database's (§11).
 - **Attached databases.** `CREATE VIEW reports.v`, a body naming `reports.t`, and a reference to a
   view through an attachment qualifier (`FROM reports.v`, or a write target `INSERT INTO reports.v`)
   are all `0A000` in this slice. A file
@@ -595,14 +688,17 @@ jed_views(
   name        text   NOT NULL,  -- the view name (exact, grammar.md §3)
   definition  text   NOT NULL,  -- the stored canonical definition (§3), after * expansion and renames
   columns     text[] NOT NULL,  -- the output column names, in order
-  check_option text  NOT NULL   -- 'NONE', 'LOCAL', or 'CASCADED' (§15.6)
+  check_option text  NOT NULL,  -- 'NONE', 'LOCAL', or 'CASCADED' (§15.6)
+  security_barrier boolean NOT NULL,  -- the view option (§16.2)
+  security_invoker boolean NOT NULL   -- the view option (§16.2)
 )
 ```
 
 `check_option` uses `information_schema.views.check_option`'s spelling. Views are **not** listed in
 `jed_tables`, which describes stored tables. This is PostgreSQL's `pg_tables` / `pg_views` split.
 Their columns **are** listed in `jed_columns`, as in PostgreSQL's `information_schema.columns`: one
-row per output column, nullable, keyless, with no default. A view's column types are not catalog
+row per output column, nullable, keyless, with the column's view default (§16.1) as
+`column_default`. A view's column types are not catalog
 facts (§3), so reading `jed_columns` plans each view's body to type its columns; the types are
 result types reported with the typmod each column keeps ([introspection.md](introspection.md) §5 *View
 columns*).
@@ -612,7 +708,9 @@ columns*).
 in dependency order among views (a view after every view it reads; ties in name byte order). The
 output column list is always written, so the recreated view has the same column names even when the
 body's own names differ. A view with a check option ends `… <definition> WITH LOCAL CHECK OPTION;`
-or `… WITH CASCADED CHECK OPTION;`.
+or `… WITH CASCADED CHECK OPTION;`. A view with `security_barrier` or `security_invoker` writes `WITH
+(security_barrier, security_invoker)` before `AS`, and each column default follows as `ALTER VIEW v
+ALTER COLUMN c SET DEFAULT <text>;`. Temporary views are not dumped.
 
 ## 12. Divergences and deferred work
 
@@ -637,9 +735,14 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | A bare integer literal cannot replace an `i32` view column (`0 AS d`); PG accepts it | a projected integer literal is `i64` in jed ([types.md](types.md) §6) |
 | `CREATE OR REPLACE VIEW` compares collation names: a column of the default collation replaced by the same collation named explicitly is accepted; PG refuses (`default` and `"C"` are different collation objects there) | jed has no separate default-collation object |
 | `ALTER VIEW t RENAME COLUMN …` on a table is `42809`; PG renames the table's column | `ALTER VIEW` names views only, as its `RENAME TO` already does in PG |
-| `ALTER VIEW` actions other than `RENAME` are `0A000` | defaults, owners, schemas, and view options are follow-ons or absent |
-| A view over a temp relation is `0A000`; PG makes it temporary | temporary views are a follow-on |
-| Dropping a sequence or composite type a view uses succeeds; the view fails at use | those dependencies are not tracked (§6) |
+| `ALTER VIEW … OWNER TO` / `SET SCHEMA` are `0A000` | jed has no owners or schemas |
+| A temporary view does not block another session's DDL on the persistent relations it reads | temporary views are private to the session (§10, temp-tables.md §3) |
+| `CREATE OR REPLACE VIEW v` of a temporary view replaces it (it stays temporary); a replacement that would make a persistent view temporary is `42P07`; PG creates a second view in another schema | jed has one relation namespace (§10) |
+| `security_barrier` changes no plan | jed never evaluates an outer condition on a row the view's own `WHERE` rejects (§16.2) |
+| `DROP SEQUENCE` / `DROP TYPE … CASCADE` of an owned sequence or of a type a column uses is `0A000`; PG drops the default or column | `CASCADE` drops only views (§6.2) |
+| A view records no dependency on a collation or host function | neither can be dropped through SQL; a view stores no derived value (§6.2) |
+| A view column default's own `nextval('s')` records no dependency; PG records one | view defaults follow jed's table-default rule (sequences.md §1) |
+| PG also accepts `ALTER TABLE v SET / RESET (options)` on a view; jed accepts only the `ALTER VIEW` spelling | the `ALTER TABLE` grammar has no option lists |
 | A zero-column view is `0A000` | the canonical text cannot express an empty select list after `*` expansion |
 | `ANALYZE v` succeeds silently; PG also emits a warning | jed has no notice channel |
 | `DROP … CASCADE` drops dependent views silently; PG also emits a *drop cascades to* notice | jed has no notice channel |
@@ -648,18 +751,12 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 
 Deferred follow-ons, none foreclosed:
 
-- the other `ALTER VIEW` actions: column defaults (`UPDATE v SET c = DEFAULT` would then assign
-  them, §15.2), `SET` / `RESET` view options;
-- `WITH (options)`, including `WITH (check_option = …)` and `ALTER VIEW … SET (check_option = …)`
-  (`0A000`; the `WITH … CHECK OPTION` clause is the supported spelling, §15.6);
 - `INSTEAD OF` behavior for views that are not automatically updatable (jed has no triggers or
   rules);
 - an updatability column in `jed_views` (PostgreSQL's `information_schema.views.is_updatable`);
-- `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW` (`0A000`);
-- temporary views and views in or over attached databases (`0A000`), including `ALTER TABLE` of an
-  attached table that one of its database's views depends on;
-- dependency tracking for sequences, composite types, collations, and host functions;
-- definitions longer than one catalog page (`0A000`), which would need an overflow chain.
+- `CREATE MATERIALIZED VIEW` (`0A000`);
+- views in or over attached databases (`0A000`), including `ALTER TABLE` of an attached table that
+  one of its database's views depends on.
 
 ## 13. Determinism and the cross-core contract
 
@@ -708,10 +805,18 @@ Deferred follow-ons, none foreclosed:
 10. **V10 — `INSERT … ON CONFLICT` through an updatable view** (§15.7): the conflict target mapped
     through the view, `DO UPDATE` in the view's columns on the existing row and on `excluded`, and
     the check option on every inserted and updated row.
+11. **V11 — `CREATE RECURSIVE VIEW`** (§17).
+12. **V12 — temporary views** (§10), including views that become temporary.
+13. **V13 — view column defaults** (§16.1), `format_version` 43.
+14. **V14 — view options** (§16.2): `WITH ( … )`, `SET` / `RESET`, `security_invoker`.
+15. **V15 — sequence and composite-type dependencies** (§6.2), `format_version` 43.
+16. **V16 — definitions longer than one catalog page** (format.md *Catalog*, `format_version` 43).
 
 Capabilities: `ddl.view` (V1), `ddl.view_rename` (V2 + V4), `query.table_column_alias` (V3),
 `introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6), `dml.view_write` (V7),
-`ddl.view_cascade` (V8), `dml.view_check_option` (V9), `dml.view_on_conflict` (V10).
+`ddl.view_cascade` (V8), `dml.view_check_option` (V9), `dml.view_on_conflict` (V10),
+`ddl.view_recursive` (V11), `ddl.view_temp` (V12), `ddl.view_default` (V13), `ddl.view_options` (V14),
+`ddl.view_dependencies` (V15), `ddl.view_long_definition` (V16).
 
 ## 15. Writing through a view
 
@@ -776,17 +881,19 @@ is read (§4), where `w` filters the derived table's body. (PostgreSQL's rewrite
 view's qualification to the statement's `WHERE`.)
 
 **`UPDATE v SET c = e, … WHERE p`** is `UPDATE b … WHERE w AND p`, with `w` as for `DELETE`. Each
-assignment to view column `c` assigns `c`'s base column the value of `e`. `SET c = DEFAULT` assigns the view column's own default, as in PostgreSQL. jed has no view column
-defaults (§12), so that is NULL, not the base column's default; on a `GENERATED ALWAYS` identity
-base column it is therefore `428C9`. An update may change a row so that `w` no longer holds; unless a
+assignment to view column `c` assigns `c`'s base column the value of `e`. `SET c = DEFAULT` assigns
+the view column's own default (§16.1), as in PostgreSQL — the target view's, never one further down a
+chain — else NULL, never the base column's default; on a `GENERATED ALWAYS` identity base column it is
+therefore `428C9`. An update may change a row so that `w` no longer holds; unless a
 check option applies (§15.6), the row stays updated and leaves the view.
 
 **`INSERT INTO v [(c, …)] source`** inserts into `b`. The target view columns are the listed ones,
 or, without a list, every column of `v` in order. The source supplies exactly one value per target,
 as for a table ([grammar.md](grammar.md) §12; PostgreSQL also accepts fewer values without a list, a
 recorded narrowing for tables too), so a list-less `INSERT` into a view with a read-only column is
-`0A000`. Each target assigns its base column. Every column of `b` that no target assigns takes its
-own default, else NULL, exactly like an omitted column of a direct `INSERT INTO b`. That covers the columns `v`
+`0A000`. Each target assigns its base column. A view column with a default (§16.1) that the statement
+does not supply, or supplies as `DEFAULT`, takes the view's default. Every column of `b` that is still
+unassigned takes its own default, else NULL, exactly like an omitted column of a direct `INSERT INTO b`. That covers the columns `v`
 does not output, the view columns the statement omits, and a `DEFAULT` slot. `DEFAULT VALUES`
 assigns no column. `OVERRIDING SYSTEM VALUE` and `OVERRIDING USER VALUE` apply to `b`'s identity
 columns. `w` is not checked unless a check option applies (§15.6), so without one an inserted row may
@@ -946,7 +1053,7 @@ is checked for `42703` before any `42P10`.
 unknown one is `42703`, a read-only one `0A000` (*cannot insert into column "c" of view "v"*, the
 first read-only target, `INSERT` or `SET`, in the view's column order), the same column twice or two
 columns over one base column `42701`. Each assigns its base column. `SET c = DEFAULT` assigns the view
-column's default, NULL, as `UPDATE` does (§15.2); the base column's default is not used.
+column's default (§16.1), else NULL, as `UPDATE` does (§15.2); the base column's default is not used.
 
 **Names in `SET`, `WHERE`, and `RETURNING`.** The existing row is visible under `v`'s name (or the
 `AS` alias) with `v`'s columns, and `excluded` is the proposed row with `v`'s columns. A read-only
@@ -974,3 +1081,96 @@ second-affect rule (`21000`), a primary-key assignment re-keying the row, the `D
 (a container column is `0A000`), two-phase validation, privileges checked on `v` exactly as on a table (§15.4), and cost: no charge for the view, so a statement without a
 check option costs its equivalent base statement, and a check option adds its `WHERE` evaluations
 (§15.6). `EXPLAIN` renders the base statement (`Insert t`). A writable CTE may hold the statement.
+
+## 16. Column defaults and view options
+
+### 16.1 Column defaults (`format_version` 43)
+
+```
+ALTER VIEW [IF EXISTS] v ALTER [COLUMN] c SET DEFAULT expr [, …]
+ALTER VIEW [IF EXISTS] v ALTER [COLUMN] c DROP DEFAULT [, …]
+ALTER TABLE v ALTER [COLUMN] c SET DEFAULT expr / DROP DEFAULT   -- the same, on a view
+```
+
+A view column may have a default of its own, as in PostgreSQL. It is used only by writes through
+the view (§15): an `INSERT` fills a view column it does not supply — or supplies as `DEFAULT` — from
+the view's default before the base table's; in a chain the view nearest the target that has a
+default for a column leading to a base column wins (PostgreSQL's per-level rewrite); `UPDATE … SET c
+= DEFAULT` and `ON CONFLICT DO UPDATE SET c = DEFAULT` assign the target view's own default, else
+NULL. `RETURNING` and `excluded` see the filled-in row. On an identity base column the view default
+is a supplied value: `OVERRIDING USER VALUE` discards it, and a `GENERATED ALWAYS` column takes it
+only under `OVERRIDING SYSTEM VALUE`, else `428C9`.
+
+A default on a **read-only** column (§15.1) makes that column a target of every `INSERT` through the
+view, so the `INSERT` is `0A000` (*cannot insert into column "x" of view "w"*), as in PostgreSQL.
+Any view may have defaults; a view that is not updatable never uses them.
+
+**Validation**, in order: the view (`42P01` / `42809`, `IF EXISTS`), the column (`42703`, *column "c"
+of relation "v" does not exist*), then the expression exactly as a table column's `SET DEFAULT`
+validates it ([alter.md](alter.md), [constraints.md](constraints.md) §2) against the column's type
+from the planned body (an untyped NULL column is `text`; a container type is `0A000`): a column
+reference or subquery `0A000`, an aggregate `42803`, a type mismatch `42804`. `SET DEFAULT NULL` is no
+default (PostgreSQL stores none). `DROP DEFAULT` of a column without one is a no-op.
+
+**Storage.** The default is persisted in the view entry as canonical text: an expression as its
+token text (format.md *Check-expression text*), a constant folded at `ALTER` time to the column type
+and stored as its SQL literal (the introspection rendering — `5`, `1.50`, `'it''s'`, a `timestamptz`
+in UTC), so it re-reads to the same value whatever the session settings. It is resolved only by a
+write that applies it (extensibility.md §7.1.1), so a function it calls needs the writer's
+`EXECUTE` then. A default that does not parse in this binary is kept and is `XX003` when applied.
+`CREATE OR REPLACE VIEW` keeps the defaults of the columns it keeps; `RENAME COLUMN` keeps a column's
+default. `jed_columns.column_default` shows it; the dump writes it (§11). A default's sequence is no
+dependency (§12).
+
+### 16.2 View options (`format_version` 43)
+
+```
+CREATE VIEW v [(cols)] WITH ( option [= value] [, …] ) AS …
+ALTER VIEW v SET ( option [= value] [, …] ) [, …]
+ALTER VIEW v RESET ( option [, …] ) [, …]
+```
+
+PostgreSQL's view reloptions:
+
+- **`check_option`** — `local` or `cascaded` (case-insensitive; a word, string, or quoted
+  identifier): the check option of §15.6 by another spelling. Naming it in `WITH ( … )` together
+  with a trailing `WITH … CHECK OPTION` is `22023` (*parameter "check_option" specified more than
+  once*). Setting it on a view that is not automatically updatable is `0A000`. `RESET` removes it.
+- **`security_barrier`** — a boolean. PostgreSQL uses it to keep outer conditions that may leak
+  from being evaluated on rows the view's `WHERE` rejects. jed already never does that for any view:
+  a condition pushed into a view body is appended after the body's own `WHERE`, whose `AND` chain
+  stops at the first conjunct that is not TRUE ([planner.md](planner.md) §3.2, cost.md §3), and only
+  structurally non-trapping conjuncts are pushed. So the option is stored and reported and changes no
+  plan.
+- **`security_invoker`** — a boolean: the privilege checks of §9 against the session using the view.
+
+Values follow PostgreSQL's `parse_bool`: a case-insensitive prefix of `true`, `false`, `yes`, or
+`no`; `on`; a prefix of `off` of at least two letters; `1` or `0`. A name without a value is `true`.
+An unrecognized name, a repeated name, or a bad value is **`22023`** (*unrecognized parameter "x"*,
+*invalid value for boolean option "security_barrier": maybe*, *invalid value for enum option
+"check_option": foo*). `RESET` with a value is `42601`; `RESET` of an unknown name is ignored, as in
+PostgreSQL. A list of `ALTER VIEW` actions applies in order. Options are validated after the body
+(§1.1 step 4). `CREATE OR REPLACE VIEW` replaces the options with the statement's. The options are
+persisted in the view entry's flags byte, shown in `jed_views`, and dumped (§11).
+
+## 17. `CREATE RECURSIVE VIEW`
+
+```
+CREATE [OR REPLACE] [TEMP] RECURSIVE VIEW [IF NOT EXISTS] name ( col [, …] ) AS query
+```
+
+PostgreSQL's shorthand: the view is the view over `WITH RECURSIVE name (cols) AS (query) SELECT cols
+FROM name`, so the body may name the view, which there is the recursive CTE. The stored definition is
+that query, built from the body's tokens and rendered canonically with every substituted name a
+quoted identifier:
+
+```
+with recursive "name" ( "c1" , … ) as ( <body> ) select "c1" , … from "name"
+```
+
+The column list is required (`42601`); a list longer than the body's columns is the CTE's `42P10`, a
+shorter one renames the leading columns and the view has only those. `WITH CHECK OPTION` is `0A000`
+(*WITH CHECK OPTION not supported on recursive views*), and the view is not updatable (`55000`: its
+body is a `WITH` query). From then on it is an ordinary view: renaming it changes its catalog key and
+not the CTE inside its definition, and the dump writes it as a plain `CREATE VIEW` of the stored text.
+`IF NOT EXISTS` is the jed extension of §1 (PostgreSQL has no `IF NOT EXISTS` here).

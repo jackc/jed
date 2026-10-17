@@ -17,7 +17,19 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 47)
+## Version scope (`format_version` 48)
+
+`format_version` **48** — **view column defaults, view options, sequence and type dependencies, and
+catalog entries longer than a page** ([../design/views.md](../design/views.md) §3, §6.2, §16). Every
+view entry changes (*View entry* below): each output column's name is followed by a `u8 col_flags`
+(bit0 `has_default`; bits 1–7 reserved, `XX001`) and, when bit0 is set, the default's canonical text
+(`u32` length + UTF-8); `dep_kind` gains `2` = sequence and `3` = composite type (no columns), and the
+dependency list sorts by `(dep_name, dep_kind)`; a trailing `u8 view_flags` follows `check_option`
+(bit0 `security_barrier`, bit1 `security_invoker`; bits 2–7 reserved, `XX001`). The catalog chain may
+hold an entry longer than a catalog page: it starts a fresh page and spans consecutive chain pages,
+each flagged `continued` in header byte 1 but the last (*Catalog* below); through v47 such an entry was
+`0A000`. A file with no view and no over-long entry changes only by its version byte + meta CRC.
+Readers accept only the exact current version.
 
 `format_version` **47** — **multi-column GIN indexes** ([../design/gin.md §4.4/§7](../design/gin.md)).
 A GIN index may list 1–32 key columns, each of which must have a GIN operator class (else `XX001`).
@@ -762,7 +774,7 @@ poisoned-handle behavior are part of the durable protocol, not additional on-dis
 | offset | size | field |
 |---|---|---|
 | 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior**; `7` = **free-list**; `8` = **commit manifest overflow** (v33, above) |
-| 1 | 1 | reserved (0) |
+| 1 | 1 | `page_flags` (u8) — on a catalog page (v43), bit0 `continued`: the page's last entry continues on the next chain page (*Catalog*); bits 1–7 reserved, `0`. `0` on every other page type |
 | 2 | 2 | reserved (0) |
 | 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |
 | 8 | 4 | `next_page` (u32) — catalog / overflow / free-list / manifest: next page of the chain, or 0. B-tree nodes write `0` here. |
@@ -800,8 +812,20 @@ a sequence entry ([../design/sequences.md §3](../design/sequences.md)), `3` = a
 view (5)**, each object group in ascending
 name byte order (v37: every group, collations included, sorts by its exact name). Each page's `item_count` is the number of entries (of any kind) it holds;
 entries are packed greedily into the chain, kind-tagged in stream order, exactly as table entries
-were through v8 (a single entry must fit one page, i.e. ≤ `C`, else `0A000`; the `RECORD_MAX = C/2`
-cap is a B-tree-record rule and does **not** apply to catalog entries, which never split). Each group
+were through v8, each wholly on one page (the `RECORD_MAX = C/2` cap is a B-tree-record rule and does
+**not** apply to catalog entries). **An entry longer than `C` (v43)** — through v42 `0A000` — starts a
+fresh page (the page before it closes, even if it has room) and spans `ceil(len / C)` consecutive chain
+pages: the first holds the entry's first `C` bytes with `item_count = 1`, each later one the next `C`
+bytes (the last the remainder, zero-filled) with `item_count = 0`, and every page of the run but the
+last sets `page_flags` bit0 `continued`. The entry after it starts a fresh page. A reader that meets a
+`continued` page concatenates its payload with those of the following chain pages through the first
+unflagged one and decodes the one entry from the result. A `continued` page with `item_count ≠ 1`, a
+continuation page with `item_count ≠ 0` or of another type, a run that ends the chain, or a set
+reserved flag bit is `XX001`. Every page of the run is a catalog page: it is rewritten with the chain at
+each commit, counted in `live_pages`, and walked by reclamation like any other. The fields inside an
+entry keep their lengths: an expression text stored with a `u16` length (a column `DEFAULT`, a `CHECK`,
+an expression index key, a partial-index predicate) longer than 65535 bytes is `0A000` at commit,
+before any page is written. Each group
 is emitted in **ascending byte order of the name** (the engine stores each object set in a map
 keyed by the exact name; sorting by that key removes any iteration-order leak — CLAUDE.md §8;
 names are unique, so there are no ties).
@@ -994,7 +1018,7 @@ bounds are nondecreasing. Terms are distinct and ordered by descending `row_coun
 bytes; a summary's bit2 must equal the column's term eligibility, and a term-ineligible summary has
 no term items. Bad flags/counts/order/references/types/bytes are `XX001`.
 
-### View entry (`entry_kind = 5`, v38; `check_option` v39)
+### View entry (`entry_kind = 5`, v38; `check_option` v39; v43)
 
 A view entry records a `CREATE VIEW` definition ([../design/views.md](../design/views.md)). It owns
 no B-tree.
@@ -1008,25 +1032,30 @@ no B-tree.
 | per output column (×`col_count`): | |
 | &nbsp;&nbsp;`col_name_len` | u16 — ≥ 1 |
 | &nbsp;&nbsp;`col_name` | UTF-8 — the output column name, in output order |
+| &nbsp;&nbsp;`col_flags` | u8 (v43) — bit0 `has_default`; bits 1–7 reserved (`XX001`) |
+| &nbsp;&nbsp;`default_len` | u32 — only when bit0: the column default's canonical text (views.md §16.1) |
+| &nbsp;&nbsp;`default` | `default_len` bytes UTF-8 |
 | `def_len` | u32 |
 | `def` | `def_len` bytes UTF-8 — the definition: the body's canonical token text (*Check-expression text* below) after `*` expansion and `RENAME` rewrites (views.md §5/§7) |
-| `dep_count` | u16 — the tables and views the body reads (≥ 1 is not required: a body over only CTEs, `VALUES`, functions, or `jed_` relations has none) |
+| `dep_count` | u16 — the tables, views, sequences, and composite types the body uses (≥ 1 is not required: a body over only CTEs, `VALUES`, functions, or `jed_` relations has none) |
 | per dependency (×`dep_count`): | |
-| &nbsp;&nbsp;`dep_kind` | u8 — `0` = table, `1` = view; other values `XX001` |
+| &nbsp;&nbsp;`dep_kind` | u8 — `0` = table, `1` = view, `2` = sequence (v43), `3` = composite type (v43); other values `XX001` |
 | &nbsp;&nbsp;`dep_name_len` | u16 |
 | &nbsp;&nbsp;`dep_name` | UTF-8 — the exact table or view name, in the same database |
-| &nbsp;&nbsp;`dep_col_count` | u16 — `0` for a view dependency (a non-zero count there is `XX001`); for a table, the number of its referenced columns (may be `0`, e.g. `SELECT count(*) FROM t`) |
+| &nbsp;&nbsp;`dep_col_count` | u16 — `0` for a view, sequence, or type dependency (a non-zero count there is `XX001`); for a table, the number of its referenced columns (may be `0`, e.g. `SELECT count(*) FROM t`) |
 | &nbsp;&nbsp;per referenced column (×`dep_col_count`): `u16` length + UTF-8 | the exact column name |
 | `check_option` | u8 (v39) — `0` = none, `1` = `WITH LOCAL CHECK OPTION`, `2` = `WITH CASCADED CHECK OPTION` (views.md §15.6); other values `XX001` |
+| `view_flags` | u8 (v43) — bit0 `security_barrier`, bit1 `security_invoker` (views.md §16.2); bits 2–7 reserved (`XX001`) |
 
-Dependencies are emitted in ascending byte order of `dep_name` (a table and a view cannot share a
-name). Each dependency's columns are emitted in ascending byte order of the column name. Output
+Dependencies are emitted in ascending byte order of `dep_name`, then `dep_kind` (v43: a composite
+type may share a table's name). Each dependency's columns are emitted in ascending byte order of the column name. Output
 columns are emitted in output order. The reader trusts these orders and rejects, as `XX001`:
-a dependency naming no table or view of its kind in this catalog, a listed column missing from its
+a dependency naming no table, view, sequence, or composite type of its kind in this catalog, a listed column missing from its
 table, a dependency on the view itself or any cycle through view dependencies, an empty or
 duplicate output column name, and a duplicate dependency or column. A `def` that does not parse as a
 `subquery_expr` is not corruption: the view is kept, unparsed, and every use of it is `XX003`
-([unparsable-definitions.md](../design/unparsable-definitions.md)). The definition is **parsed but not planned** at open (views.md §3). A commit
+([unparsable-definitions.md](../design/unparsable-definitions.md)); so is a column `default` that does not parse, whose
+application is then `XX003`. The definition is **parsed but not planned** at open (views.md §3). A commit
 writes the retained text and lists back verbatim, so the bytes are stable across create → commit →
 load → commit.
 

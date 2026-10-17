@@ -83,8 +83,10 @@ Nine relations ship today:
 - **`jed_views`** — one row per [view](../views/): `name`, `definition` (the stored query text,
   normalized: lowercase keywords, single-spaced tokens, `*` expanded into explicit columns, and
   renames applied), `columns` (a `text[]` of the output column names, in order), and
-  `check_option` (`NONE`, `LOCAL`, or `CASCADED`). Views are not listed in `jed_tables`; their
-  columns are listed in `jed_columns`.
+  `check_option` (`NONE`, `LOCAL`, or `CASCADED`), and the `security_barrier` and
+  `security_invoker` options (booleans). Views are not listed in `jed_tables`; their columns are
+  listed in `jed_columns`, with a view column default as `column_default`. `temp.jed_views` lists the
+  session's temporary views.
 
 <LiveSql {seed} {query} rows={10} />
 

@@ -736,6 +736,10 @@ never noticed the swap.
   supplies the column, a `SELECT`, and a `DELETE` with no `SET DEFAULT` action are unaffected. This
   is the §11 graded-verdict principle (contain the blast radius to what actually needs the code),
   applied to the simplest dependent object.
+- **Views follow this rule** ([views.md](views.md) §6.2). A view body is re-resolved at every use and
+  stores no value derived from a function, so a view persists no host-function dependency and a
+  missing function is `42883` only for a statement that reads the view. A view column default
+  (views.md §16.1) is a `DEFAULT` and is resolved only by a write that applies it.
 
 #### 7.1.2 `CHECK`
 

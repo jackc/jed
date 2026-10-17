@@ -146,7 +146,11 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // timezone dependencies; a DESC / NULLS FIRST key's entry slots use the encoding.md §2.16 ordered
 // slot. An index with only default (ASC NULLS LAST) keys is byte-identical to v45
 // (spec/design/indexes.md §11).
-pub(crate) const FORMAT_VERSION: u16 = 47;
+// v47: multi-column GIN indexes + GIN posting runs (spec/design/gin.md §4.4/§4.5).
+// v48: view column defaults, view dependency kinds 2 (sequence) / 3 (composite type), a view flags
+// byte (security_barrier, security_invoker), and catalog entries longer than a page spanning
+// consecutive catalog pages flagged `continued` (spec/design/views.md §3/§6/§16, format.md *Catalog*).
+pub(crate) const FORMAT_VERSION: u16 = 48;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -1686,23 +1690,19 @@ impl Snapshot {
         }
         cat_entries.extend(statistics_catalog_entries(self));
         cat_entries.extend(view_catalog_entries(self));
-        let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
-        let cat_groups = pack(&entry_sizes, cap)?;
-        let page_count = cat_root + cat_groups.len() as u32;
+        check_catalog_text_lengths(self)?;
+        let cat_layout = catalog_layout(&cat_entries, cap);
+        let page_count = cat_root + cat_layout.len() as u32;
 
         // Catalog chain.
-        for (gi, group) in cat_groups.iter().enumerate() {
+        for (gi, cp) in cat_layout.iter().enumerate() {
             let index = cat_root + gi as u32;
-            let next = if gi + 1 < cat_groups.len() {
+            let next = if gi + 1 < cat_layout.len() {
                 index + 1
             } else {
                 0
             };
-            let mut payload = Vec::new();
-            for &ei in group {
-                payload.extend_from_slice(&cat_entries[ei]);
-            }
-            body.page(index, PAGE_CATALOG, group.len() as u32, next, &payload)?;
+            (body.sink)(index, &make_catalog_page(page_size as usize, cp, next))?;
         }
 
         // Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct
@@ -2221,24 +2221,17 @@ impl Snapshot {
         }
         cat_entries.extend(statistics_catalog_entries(self));
         cat_entries.extend(view_catalog_entries(self));
-        let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
-        let cat_groups = pack(&entry_sizes, cap)?;
-        let cat_pages: Vec<u32> = (0..cat_groups.len()).map(|_| alloc.take()).collect();
+        check_catalog_text_lengths(self)?;
+        let cat_layout = catalog_layout(&cat_entries, cap);
+        let cat_pages: Vec<u32> = (0..cat_layout.len()).map(|_| alloc.take()).collect();
         let cat_root = cat_pages[0];
-        for (gi, group) in cat_groups.iter().enumerate() {
-            let next_page = if gi + 1 < cat_groups.len() {
+        for (gi, cp) in cat_layout.iter().enumerate() {
+            let next_page = if gi + 1 < cat_layout.len() {
                 cat_pages[gi + 1]
             } else {
                 0
             };
-            let mut payload = Vec::new();
-            for &ei in group {
-                payload.extend_from_slice(&cat_entries[ei]);
-            }
-            pages.push((
-                cat_pages[gi],
-                make_page(ps, PAGE_CATALOG, group.len() as u32, next_page, &payload),
-            ));
+            pages.push((cat_pages[gi], make_catalog_page(ps, cp, next_page)));
         }
 
         if alloc.exhausted {
@@ -2605,24 +2598,60 @@ impl Engine {
             }
             let block = paging.pager().read_block(cat_page)?;
             let page = parse_page(&block)?;
-            if page.page_type != PAGE_CATALOG {
+            if page.page_type != PAGE_CATALOG || page.flags & !1 != 0 {
                 return Err(corrupt("expected a catalog page"));
             }
             live.catalog += 1;
+            // A catalog entry longer than a page continues on the following chain pages (v43):
+            // header byte 1 bit0 `continued` on every page of the run but the last.
+            let mut next = page.next_page;
+            let joined: Vec<u8>;
+            let payload: &[u8] = if page.flags & 1 != 0 {
+                if page.item_count != 1 {
+                    return Err(corrupt("a continued catalog page holds other entries"));
+                }
+                let mut buf = page.payload.to_vec();
+                loop {
+                    if next == 0 {
+                        return Err(corrupt("a continued catalog entry ends the chain"));
+                    }
+                    if !cat_seen.insert(next) {
+                        return Err(corrupt("catalog chain revisits a page"));
+                    }
+                    let block = paging.pager().read_block(next)?;
+                    let cont = parse_page(&block)?;
+                    if cont.page_type != PAGE_CATALOG
+                        || cont.item_count != 0
+                        || cont.flags & !1 != 0
+                    {
+                        return Err(corrupt("bad catalog continuation page"));
+                    }
+                    live.catalog += 1;
+                    buf.extend_from_slice(cont.payload);
+                    next = cont.next_page;
+                    if cont.flags & 1 == 0 {
+                        break;
+                    }
+                }
+                joined = buf;
+                &joined
+            } else {
+                page.payload
+            };
             let mut pos = 0usize;
             for _ in 0..page.item_count {
                 // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered
                 // now; its nested refs are validated after the full walk), 0 = a table entry.
-                let kind = read_u8(page.payload, &mut pos)?;
+                let kind = read_u8(payload, &mut pos)?;
                 if kind == 1 {
-                    let ct = decode_composite_type_entry(page.payload, &mut pos)?;
+                    let ct = decode_composite_type_entry(payload, &mut pos)?;
                     snap.put_type(ct);
                     types_checked = false;
                     continue;
                 }
                 if kind == 2 {
                     // A sequence entry (v12): self-contained, registered directly (no two-pass).
-                    let s = decode_sequence_entry(page.payload, &mut pos)?;
+                    let s = decode_sequence_entry(payload, &mut pos)?;
                     snap.put_sequence(s);
                     continue;
                 }
@@ -2630,7 +2659,7 @@ impl Engine {
                     // A collation snapshot (v17): the baked `.coll` artifact + an `is_default` flag
                     // (spec/design/collation.md §5). Registered directly; the default restores the
                     // per-database default collation.
-                    let (coll, is_default) = decode_collation_entry(page.payload, &mut pos, env)?;
+                    let (coll, is_default) = decode_collation_entry(payload, &mut pos, env)?;
                     if is_default {
                         snap.set_default_collation(Some(coll.name.clone()));
                     }
@@ -2639,7 +2668,7 @@ impl Engine {
                 }
                 if kind == 4 {
                     decode_statistics_entry(
-                        page.payload,
+                        payload,
                         &mut pos,
                         &mut snap,
                         &mut statistics_expected,
@@ -2649,14 +2678,14 @@ impl Engine {
                 if kind == 5 {
                     // A view entry (v38): parsed now, validated once every table and view is
                     // registered (its dependencies may name later entries).
-                    loaded_views.push(decode_view_entry(page.payload, &mut pos)?);
+                    loaded_views.push(decode_view_entry(payload, &mut pos)?);
                     continue;
                 }
                 if kind != 0 {
                     return Err(corrupt("unknown catalog entry kind"));
                 }
                 let (table, root_data_page, row_count, index_roots) =
-                    decode_table_entry(page.payload, &mut pos)?;
+                    decode_table_entry(payload, &mut pos)?;
                 // Every record costs at least its 4-byte key-directory entry in some leaf, so no
                 // table holds more rows than the file has room for. Checking keeps a corrupt count
                 // from sizing allocations later.
@@ -2758,7 +2787,7 @@ impl Engine {
                     snap.put_index_store(idx.name.to_string(), istore);
                 }
             }
-            cat_page = page.next_page;
+            cat_page = next;
         }
 
         for ((table, column), (mcv_count, histogram_count, term_count)) in statistics_expected {
@@ -4406,6 +4435,113 @@ pub(crate) fn meta_page(
     p
 }
 
+/// The table catalog entry stores each expression text — a column DEFAULT, a CHECK, an expression
+/// index key, a partial-index predicate — with a `u16` length (format.md *Catalog*), so a longer one
+/// cannot be written: `0A000`, before any page is (views.md §3; a catalog entry itself may span
+/// pages since v43).
+fn check_catalog_text_lengths(snap: &Snapshot) -> Result<()> {
+    let too_long = |t: &str| t.len() > u16::MAX as usize;
+    for table in snap.tables_sorted() {
+        let long = table
+            .columns
+            .iter()
+            .filter_map(|c| c.default_expr.as_ref())
+            .any(|d| too_long(&d.expr_text))
+            || table.checks.iter().any(|c| too_long(&c.expr_text))
+            || table.indexes.iter().any(|ix| {
+                ix.keys
+                    .iter()
+                    .any(|k| matches!(k, IndexKey::Expr(e) if too_long(&e.expr_text)))
+                    || ix
+                        .predicate
+                        .as_ref()
+                        .is_some_and(|p| too_long(&p.expr_text))
+            });
+        if long {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                format!(
+                    "a stored expression of table {} is longer than 65535 bytes",
+                    table.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One page of the catalog chain (format.md *Catalog*, v43): its entry count, whether its last
+/// entry continues on the next page (header byte 1, bit0 `continued`), and its payload.
+pub(crate) struct CatalogPage {
+    item_count: u32,
+    continued: bool,
+    payload: Vec<u8>,
+}
+
+/// Lay the catalog entries out on pages of capacity `cap` (format.md *Catalog*, v43): entries are
+/// packed greedily, each wholly on one page; an entry longer than `cap` starts a fresh page and
+/// spans as many pages as it needs — the first holds the entry's first `cap` bytes with
+/// `item_count = 1`, each later one the next bytes with `item_count = 0`, and every page but the
+/// last has `continued` set. The entry after it starts a fresh page.
+pub(crate) fn catalog_layout(entries: &[Vec<u8>], cap: usize) -> Vec<CatalogPage> {
+    let mut out: Vec<CatalogPage> = Vec::new();
+    let mut cur = CatalogPage {
+        item_count: 0,
+        continued: false,
+        payload: Vec::new(),
+    };
+    for e in entries {
+        if e.len() > cap {
+            if cur.item_count > 0 {
+                out.push(std::mem::replace(
+                    &mut cur,
+                    CatalogPage {
+                        item_count: 0,
+                        continued: false,
+                        payload: Vec::new(),
+                    },
+                ));
+            }
+            let chunks: Vec<&[u8]> = e.chunks(cap).collect();
+            for (i, chunk) in chunks.iter().enumerate() {
+                out.push(CatalogPage {
+                    item_count: u32::from(i == 0),
+                    continued: i + 1 < chunks.len(),
+                    payload: chunk.to_vec(),
+                });
+            }
+            continue;
+        }
+        if cur.item_count > 0 && cur.payload.len() + e.len() > cap {
+            out.push(std::mem::replace(
+                &mut cur,
+                CatalogPage {
+                    item_count: 0,
+                    continued: false,
+                    payload: Vec::new(),
+                },
+            ));
+        }
+        cur.item_count += 1;
+        cur.payload.extend_from_slice(e);
+    }
+    if cur.item_count > 0 || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A catalog page's full bytes: `make_page` with header byte 1 bit0 `continued` (v43).
+fn make_catalog_page(ps: usize, cp: &CatalogPage, next_page: u32) -> Vec<u8> {
+    let mut p = make_page(ps, PAGE_CATALOG, cp.item_count, next_page, &cp.payload);
+    if cp.continued {
+        p[1] = 1;
+        let crc = page_crc(&p);
+        p[12..16].copy_from_slice(&crc.to_be_bytes());
+    }
+    p
+}
+
 /// A catalog / B-tree page's full `page_size` bytes (header + payload, zero-padded). `to_image`
 /// copies it into the image; an incremental commit pwrites it directly (`file.rs`). Single-sources
 /// the page byte layout.
@@ -4682,6 +4818,8 @@ fn select_meta(image: &[u8], ps: usize) -> Result<Meta> {
 /// A parsed page: header fields + a borrowed payload slice.
 struct Page<'a> {
     page_type: u8,
+    /// Header byte 1: on a catalog page, bit0 `continued` (v43); 0 elsewhere.
+    flags: u8,
     item_count: u32,
     next_page: u32,
     payload: &'a [u8],
@@ -4702,6 +4840,7 @@ fn parse_page(block: &[u8]) -> Result<Page<'_>> {
     }
     Ok(Page {
         page_type: block[0],
+        flags: block[1],
         item_count: u32::from_be_bytes([block[4], block[5], block[6], block[7]]),
         next_page: u32::from_be_bytes([block[8], block[9], block[10], block[11]]),
         payload: &block[PAGE_HEADER..],
@@ -5246,8 +5385,10 @@ fn view_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
 }
 
 /// Serialize a view catalog entry's BODY (after its `entry_kind = 5` byte) — format.md *View
-/// entry*: the name, the output column names, the definition (`u32` length), the dependency list
-/// (already in name byte order, each table's columns in name byte order), and the check option.
+/// entry*: the name; the output columns, each its name, a flags byte (bit0 `has_default`, v43), and
+/// the default's text when set; the definition (`u32` length); the dependency list (in `(name,
+/// kind)` byte order, each table's columns in name byte order); the check option; and the view
+/// flags byte (v43: bit0 `security_barrier`, bit1 `security_invoker`).
 pub(crate) fn view_entry_bytes(v: &crate::catalog::ViewDef) -> Vec<u8> {
     let mut out = Vec::new();
     let put_str = |out: &mut Vec<u8>, s: &str| {
@@ -5256,17 +5397,22 @@ pub(crate) fn view_entry_bytes(v: &crate::catalog::ViewDef) -> Vec<u8> {
     };
     put_str(&mut out, &v.name);
     out.extend_from_slice(&(v.columns.len() as u16).to_be_bytes());
-    for c in &v.columns {
+    for (i, c) in v.columns.iter().enumerate() {
         put_str(&mut out, c);
+        match v.defaults.get(i).and_then(Option::as_ref) {
+            Some(d) => {
+                out.push(1);
+                out.extend_from_slice(&(d.expr_text.len() as u32).to_be_bytes());
+                out.extend_from_slice(d.expr_text.as_bytes());
+            }
+            None => out.push(0),
+        }
     }
     out.extend_from_slice(&(v.definition.len() as u32).to_be_bytes());
     out.extend_from_slice(v.definition.as_bytes());
     out.extend_from_slice(&(v.deps.len() as u16).to_be_bytes());
     for d in &v.deps {
-        out.push(match d.kind {
-            crate::catalog::ViewDepKind::Table => 0,
-            crate::catalog::ViewDepKind::View => 1,
-        });
+        out.push(view_dep_kind_code(d.kind));
         put_str(&mut out, &d.name);
         out.extend_from_slice(&(d.columns.len() as u16).to_be_bytes());
         for c in &d.columns {
@@ -5278,41 +5424,62 @@ pub(crate) fn view_entry_bytes(v: &crate::catalog::ViewDef) -> Vec<u8> {
         Some(crate::ast::CheckOption::Local) => 1,
         Some(crate::ast::CheckOption::Cascaded) => 2,
     });
+    out.push(u8::from(v.security_barrier) | (u8::from(v.security_invoker) << 1));
     out
 }
 
+/// A view dependency's `dep_kind` byte (format.md *View entry*).
+pub(crate) fn view_dep_kind_code(kind: crate::catalog::ViewDepKind) -> u8 {
+    use crate::catalog::ViewDepKind;
+    match kind {
+        ViewDepKind::Table => 0,
+        ViewDepKind::View => 1,
+        ViewDepKind::Sequence => 2,
+        ViewDepKind::Type => 3,
+    }
+}
+
 /// Decode a view catalog entry's body (inverse of `view_entry_bytes`); the caller has consumed the
-/// `entry_kind` byte. The definition is parsed (kept unparsed if it does not parse as a `subquery_expr`) but
-/// never planned (views.md §3).
+/// `entry_kind` byte. The definition and each column default are parsed (kept unparsed if they do
+/// not parse) but never planned (views.md §3).
 fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::ViewDef> {
     use crate::catalog::{ViewDep, ViewDepKind};
     let name = read_string(buf, pos)?;
     let col_count = read_u16(buf, pos)?;
     let mut columns = Vec::with_capacity(col_count as usize);
+    let mut defaults = Vec::with_capacity(col_count as usize);
     for _ in 0..col_count {
         columns.push(read_string(buf, pos)?);
+        let default = match read_u8(buf, pos)? {
+            0 => None,
+            1 => {
+                let expr_text = read_long_string(buf, pos, "view column default")?;
+                let (expr, unparsed) = parse_stored_expression(&expr_text);
+                Some(crate::catalog::DefaultExpr {
+                    expr_text,
+                    expr,
+                    unparsed,
+                })
+            }
+            _ => return Err(corrupt("unknown view column flags")),
+        };
+        defaults.push(default);
     }
-    let def_len = read_u32(buf, pos)? as usize;
-    let end = pos
-        .checked_add(def_len)
-        .filter(|&e| e <= buf.len())
-        .ok_or_else(|| corrupt("truncated view definition"))?;
-    let definition = std::str::from_utf8(&buf[*pos..end])
-        .map_err(|_| corrupt("view definition is not UTF-8"))?
-        .to_string();
-    *pos = end;
+    let definition = read_long_string(buf, pos, "view definition")?;
     let dep_count = read_u16(buf, pos)?;
     let mut deps = Vec::with_capacity(dep_count as usize);
     for _ in 0..dep_count {
         let kind = match read_u8(buf, pos)? {
             0 => ViewDepKind::Table,
             1 => ViewDepKind::View,
+            2 => ViewDepKind::Sequence,
+            3 => ViewDepKind::Type,
             _ => return Err(corrupt("unknown view dependency kind")),
         };
         let dep_name = read_string(buf, pos)?;
         let n = read_u16(buf, pos)?;
-        if kind == ViewDepKind::View && n != 0 {
-            return Err(corrupt("a view dependency lists columns"));
+        if kind != ViewDepKind::Table && n != 0 {
+            return Err(corrupt("a non-table view dependency lists columns"));
         }
         let mut cols = Vec::with_capacity(n as usize);
         for _ in 0..n {
@@ -5330,6 +5497,10 @@ fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::View
         2 => Some(crate::ast::CheckOption::Cascaded),
         _ => return Err(corrupt("unknown view check option")),
     };
+    let flags = read_u8(buf, pos)?;
+    if flags & !0b11 != 0 {
+        return Err(corrupt("unknown view flags"));
+    }
     // A definition this binary cannot parse — typically newer syntax — is kept, unparsed, rather than
     // failing the load (spec/design/unparsable-definitions.md): every use of the view is XX003.
     let (body, depth) = match crate::parser::parse_view_definition(&definition) {
@@ -5344,13 +5515,31 @@ fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::View
         body,
         depth,
         check_option,
+        defaults,
+        security_barrier: flags & 1 != 0,
+        security_invoker: flags & 2 != 0,
     })
 }
 
+/// A `u32`-length-prefixed UTF-8 string (a view definition or column default).
+fn read_long_string(buf: &[u8], pos: &mut usize, what: &str) -> Result<String> {
+    let len = read_u32(buf, pos)? as usize;
+    let end = pos
+        .checked_add(len)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| corrupt(&format!("truncated {what}")))?;
+    let text = std::str::from_utf8(&buf[*pos..end])
+        .map_err(|_| corrupt(&format!("{what} is not UTF-8")))?
+        .to_string();
+    *pos = end;
+    Ok(text)
+}
+
 /// Validate the loaded views against the catalog and register them (format.md *View entry*): each
-/// dependency names an existing table / view of its kind, each listed column exists in its table,
-/// the view-dependency graph is acyclic, output names are non-empty and unique, and no dependency or
-/// column repeats. Any violation is XX001.
+/// dependency names an existing table / view / sequence / composite type of its kind, each listed
+/// column exists in its table, the dependencies are in `(name, kind)` order without repeats, the
+/// view-dependency graph is acyclic, and output names are non-empty and unique. Any violation is
+/// XX001.
 fn install_views(snap: &mut Snapshot, views: Vec<crate::catalog::ViewDef>) -> Result<()> {
     use crate::catalog::ViewDepKind;
     let names: HashSet<String> = views.iter().map(|v| v.name.clone()).collect();
@@ -5370,8 +5559,13 @@ fn install_views(snap: &mut Snapshot, views: Vec<crate::catalog::ViewDef>) -> Re
             return Err(corrupt("a view name collides with another relation"));
         }
         for (i, d) in v.deps.iter().enumerate() {
-            if v.deps[..i].iter().any(|e| e.name == d.name) {
-                return Err(corrupt("duplicate view dependency"));
+            if i > 0 {
+                let prev = &v.deps[i - 1];
+                if (prev.name.as_bytes(), view_dep_kind_code(prev.kind))
+                    >= (d.name.as_bytes(), view_dep_kind_code(d.kind))
+                {
+                    return Err(corrupt("view dependencies out of order or repeated"));
+                }
             }
             match d.kind {
                 ViewDepKind::Table => {
@@ -5390,6 +5584,16 @@ fn install_views(snap: &mut Snapshot, views: Vec<crate::catalog::ViewDef>) -> Re
                 ViewDepKind::View => {
                     if !names.contains(&d.name) {
                         return Err(corrupt("a view depends on a missing view"));
+                    }
+                }
+                ViewDepKind::Sequence => {
+                    if snap.sequence(&d.name).is_none() {
+                        return Err(corrupt("a view depends on a missing sequence"));
+                    }
+                }
+                ViewDepKind::Type => {
+                    if snap.composite_type(&d.name).is_none() {
+                        return Err(corrupt("a view depends on a missing type"));
                     }
                 }
             }

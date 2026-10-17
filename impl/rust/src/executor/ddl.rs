@@ -2054,12 +2054,31 @@ impl Engine {
         let Some(original_ref) = snap.table(&at.name) else {
             // A view: its renames are the view renames (views.md §7.1); every other action is the
             // wrong object kind (42809, views.md §2).
-            if snap.view(&at.name).is_some() {
+            let temp_view =
+                matches!(at.db.as_deref(), None | Some("temp")) && self.is_temp_view(&at.name);
+            if snap.view(&at.name).is_some() || temp_view {
                 let action = match at.action {
                     AlterTableAction::RenameTable(new) => Some(AlterViewAction::RenameTo(new)),
                     AlterTableAction::RenameColumn { old, new } => {
                         Some(AlterViewAction::RenameColumn { old, new })
                     }
+                    // `ALTER COLUMN … SET / DROP DEFAULT` on a view is the view's own column
+                    // default (views.md §16.1), as in PostgreSQL.
+                    AlterTableAction::Actions(edits) => edits
+                        .into_iter()
+                        .map(|edit| match edit {
+                            AlterTableEdit::AlterColumn(AlterColumnAction {
+                                column,
+                                action: AlterColumnKind::SetDefault(def),
+                            }) => Some(ViewEdit::SetDefault { column, def }),
+                            AlterTableEdit::AlterColumn(AlterColumnAction {
+                                column,
+                                action: AlterColumnKind::DropDefault,
+                            }) => Some(ViewEdit::DropDefault { column }),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .map(AlterViewAction::Edits),
                     _ => None,
                 };
                 if let Some(action) = action {
@@ -2139,9 +2158,7 @@ impl Engine {
         // edits their text — and rewritten + re-validated after the change. A table of an attached
         // database with dependent views refuses every ALTER TABLE: re-validating views there is a
         // follow-on (views.md §10).
-        let mut view_plan = if temp_scope {
-            None
-        } else if attachment_scope {
+        let mut view_plan = if attachment_scope {
             if let Some(v) = snap
                 .views_depending_on(ViewDepKind::Table, &original.name)
                 .first()
@@ -2185,6 +2202,7 @@ impl Engine {
                     || temp_namespace.table(name).is_some()
                     || temp_namespace.find_index(name).is_some()
                     || temp_namespace.sequence(name).is_some()
+                    || temp_namespace.view(name).is_some()
             }
         };
         let mut dropped_owned_sequences = std::collections::HashSet::<String>::new();
@@ -2428,7 +2446,7 @@ impl Engine {
                                 .hinted(error_hint::DROP_CASCADE));
                             }
                             if !users.is_empty() {
-                                let closure = main_namespace.view_drop_closure(users);
+                                let closure = self.view_drop_closure_any(users);
                                 vp.forget(&closure);
                                 cascade_dropped_views.extend(closure);
                             }
@@ -4175,7 +4193,7 @@ impl Engine {
         // the surviving dependent views against the post-statement catalog (§7/§8); a failure is
         // 0A000 and discards the whole statement.
         for name in &cascade_dropped_views {
-            self.working_mut().remove_view(name);
+            self.remove_view_scoped(name);
         }
         if let Some(plan) = view_plan {
             let change = view_change.unwrap_or_else(|| ViewAlterChange::Other {
@@ -4268,7 +4286,7 @@ impl Engine {
         })
     }
 
-    fn build_alter_default(
+    pub(crate) fn build_alter_default(
         &self,
         col: &Column,
         def: &DefaultDef,
@@ -4976,7 +4994,8 @@ impl Engine {
             .filter(|(_, scope)| matches!(scope, Scope::Persistent))
             .map(|(key, _)| key.clone())
             .collect();
-        let cascade_views = self.drop_table_views(&persistent, dt.cascade)?;
+        let all_targets: Vec<String> = targets.iter().map(|(key, _)| key.clone()).collect();
+        let cascade_views = self.drop_table_views(&all_targets, dt.cascade)?;
         let temp_seen: BTreeSet<String> = targets
             .iter()
             .filter(|(_, scope)| matches!(scope, Scope::Temp))
@@ -5011,7 +5030,7 @@ impl Engine {
         // now-dangling FK constraint (in place, preserving its rows), each in its own domain: views
         // live only in the main database, and an FK in its tables' domain.
         for name in &cascade_views {
-            self.working_mut().remove_view(name);
+            self.remove_view_scoped(name);
         }
         for d in &cascade_removals {
             self.working_mut()
@@ -5926,6 +5945,16 @@ impl Engine {
             ));
         }
         if let Some(dep) = self.composite_dependent_any(&dt.name) {
+            // PostgreSQL's CASCADE would drop the column or field too: not supported
+            // (composite.md §7). CASCADE drops only dependent views (views.md §6.1).
+            if dt.cascade {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "DROP TYPE ... CASCADE of a type a column or field uses is not supported: {dep}"
+                    ),
+                ));
+            }
             return Err(EngineError::new(
                 SqlState::DependentObjectsStillExist,
                 format!(
@@ -5933,6 +5962,15 @@ impl Engine {
                     dt.name, dep
                 ),
             ));
+        }
+        // A view that depends on the type blocks the drop under RESTRICT (2BP01); CASCADE drops it,
+        // with every view that depends on it (views.md §6.1).
+        let views =
+            self.drop_dependent_views(&[(ViewDepKind::Type, dt.name.clone())], dt.cascade, |d| {
+                format!("type {}", d.name)
+            })?;
+        for name in &views {
+            self.remove_view_scoped(name);
         }
         let key = dt.name.to_string();
         self.working_mut().remove_type(&key);
@@ -6000,6 +6038,14 @@ impl Engine {
                     .map(|o| (s.name.clone(), o.table.clone(), o.column)),
             };
             if let Some((seq_name, owner_table, owner_col)) = owner {
+                if ds.cascade {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "DROP SEQUENCE ... CASCADE of the owned sequence {seq_name} is not supported"
+                        ),
+                    ));
+                }
                 // The owning table is always present (its own DROP TABLE would auto-drop this
                 // sequence first), so the column name for the detail resolves. The scope-aware
                 // `table` funnel finds an owned TEMP sequence's temp owner (temp-tables.md §8).
@@ -6020,6 +6066,16 @@ impl Engine {
                         "cannot drop sequence {seq_name} because other objects depend on it: default value for column {col_name} of table {table_name} depends on sequence {seq_name}"
                     ),
                 ));
+            }
+            // A view that depends on the sequence blocks the drop under RESTRICT (2BP01); CASCADE
+            // drops it, with every view that depends on it (views.md §6.1).
+            let views = self.drop_dependent_views(
+                &[(ViewDepKind::Sequence, name.clone())],
+                ds.cascade,
+                |d| format!("sequence {}", d.name),
+            )?;
+            for view in &views {
+                self.remove_view_scoped(view);
             }
             // Not owned: remove from whichever scope owns it (a temp sequence is always owned, so this
             // routed path is reached only for a plain persistent sequence — temp-tables.md §8).
@@ -6116,6 +6172,8 @@ impl Engine {
                 },
             );
         }
+        // The views that name the sequence keep naming it (views.md §7.2).
+        self.rename_sequence_in_views(&existing.name, new_name)?;
         // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
         // scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
         let is_temp = self.is_temp_sequence(&existing.name);
