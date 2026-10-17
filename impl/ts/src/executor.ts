@@ -25841,10 +25841,22 @@ function buildIndexIntervalSetPlan(
   idx: IndexDef,
   snap: Snapshot,
 ): IndexKeySet | null {
+  return buildIndexIntervalSetPlanConjuncts(flattenConjuncts(filter), rel, idx, snap, null);
+}
+
+// buildIndexIntervalSetPlanConjuncts is buildIndexIntervalSetPlan over an AND-chain's conjuncts;
+// siblingRange admits a sibling column as a member's source (an index-nested-loop inner).
+function buildIndexIntervalSetPlanConjuncts(
+  conjuncts: RExpr[],
+  rel: ScopeRel,
+  idx: IndexDef,
+  snap: Snapshot,
+  siblingRange: ColumnRange,
+): IndexKeySet | null {
   if (idx.kind !== "btree" || idx.predicate !== undefined) return null;
   const cols = indexColumnOrdinals(idx);
   if (cols === null) return null;
-  const { tuple, hasSet } = walkTupleMembers(flattenConjuncts(filter), rel, cols, snap);
+  const { tuple, hasSet } = walkTupleMembers(conjuncts, rel, cols, snap, siblingRange);
   if (!hasSet) return null;
   // A key column whose slot an admitted entry can step over without knowing its value: a fixed-width
   // or self-delimiting C-collated slot (keySlotSkippable).
@@ -25890,22 +25902,24 @@ export function detectIntervalSet(
   coll: Collation | null,
 ): { specs: IntervalSpec[]; clip: BoundTerm[] } | null {
   if (filter === null) return null;
+  return detectIntervalSetConjuncts(flattenConjuncts(filter), keyIdx, keyType, coll, null);
+}
+
+// detectIntervalSetConjuncts is detectIntervalSet over an AND-chain's conjuncts; siblingRange admits
+// a sibling column as a source (an index-nested-loop inner, cost.md §3 "JOIN").
+function detectIntervalSetConjuncts(
+  conjuncts: RExpr[],
+  keyIdx: number,
+  keyType: ScalarType,
+  coll: Collation | null,
+  siblingRange: ColumnRange,
+): { specs: IntervalSpec[]; clip: BoundTerm[] } | null {
   const colColl = coll !== null ? coll.name : null;
-  const conjuncts: RExpr[] = [];
-  const flatten = (e: RExpr): void => {
-    if (e.kind === "and") {
-      flatten(e.lhs);
-      flatten(e.rhs);
-      return;
-    }
-    conjuncts.push(e);
-  };
-  flatten(filter);
   let found = -1;
   let specs: IntervalSpec[] | null = null;
   for (let i = 0; i < conjuncts.length; i++) {
     if (!intervalSetConjunctKind(conjuncts[i]!)) continue;
-    const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, keyType, colColl);
+    const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, keyType, colColl, siblingRange);
     if (reduced !== null) {
       found = i;
       specs = reduced;
@@ -25921,7 +25935,7 @@ export function detectIntervalSet(
       { kind: "column", index: keyIdx },
       keyType,
       colColl,
-      null,
+      siblingRange,
     );
     if (t !== null) clip.push(t);
   }
@@ -25935,13 +25949,25 @@ export function detectTupleIntervalSet(
   rel: ScopeRel,
   snap: Snapshot,
 ): PkKeySet | null {
+  if (filter === null) return null;
+  return detectTupleIntervalSetConjuncts(flattenConjuncts(filter), rel, snap, null);
+}
+
+// detectTupleIntervalSetConjuncts is detectTupleIntervalSet over an AND-chain's conjuncts;
+// siblingRange admits a sibling column as a member's source (an index-nested-loop inner).
+function detectTupleIntervalSetConjuncts(
+  conjuncts: RExpr[],
+  rel: ScopeRel,
+  snap: Snapshot,
+  siblingRange: ColumnRange,
+): PkKeySet | null {
   const pk = pkIndices(rel.table);
-  if (pk.length < 2 || filter === null) return null;
+  if (pk.length < 2) return null;
   const allFixed = pk.every((ci) => {
     const ty = typeAsScalar(rel.table.columns[ci]!.type);
     return ty !== undefined && isFixedWidth(ty);
   });
-  const { tuple, hasSet } = walkTupleMembers(flattenConjuncts(filter), rel, pk, snap);
+  const { tuple, hasSet } = walkTupleMembers(conjuncts, rel, pk, snap, siblingRange);
   if (!hasSet) return null;
   return {
     pkType: tuple[0]!.colType,
@@ -25955,8 +25981,9 @@ export function detectTupleIntervalSet(
 }
 
 // flattenConjuncts lists the top-level AND-chain's conjuncts in order.
-function flattenConjuncts(filter: RExpr): RExpr[] {
+function flattenConjuncts(filter: RExpr | null): RExpr[] {
   const conjuncts: RExpr[] = [];
+  if (filter === null) return conjuncts;
   const flatten = (e: RExpr): void => {
     if (e.kind === "and") {
       flatten(e.lhs);
@@ -25978,6 +26005,7 @@ function walkTupleMembers(
   rel: ScopeRel,
   cols: number[],
   snap: Snapshot,
+  siblingRange: ColumnRange,
 ): { tuple: TupleMember[]; hasSet: boolean } {
   const tuple: TupleMember[] = [];
   let hasSet = false;
@@ -25993,7 +26021,7 @@ function walkTupleMembers(
     let specs: IntervalSpec[] | null = null;
     for (let i = 0; i < conjuncts.length; i++) {
       if (!intervalSetConjunctKind(conjuncts[i]!)) continue;
-      const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, ty, colColl);
+      const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, ty, colColl, siblingRange);
       if (reduced !== null) {
         found = i;
         specs = reduced;
@@ -26003,7 +26031,13 @@ function walkTupleMembers(
     const clip: BoundTerm[] = [];
     for (let i = 0; i < conjuncts.length; i++) {
       if (i === found) continue;
-      const t = asBoundTerm(conjuncts[i]!, { kind: "column", index: keyIdx }, ty, colColl, null);
+      const t = asBoundTerm(
+        conjuncts[i]!,
+        { kind: "column", index: keyIdx },
+        ty,
+        colColl,
+        siblingRange,
+      );
       if (t !== null) clip.push(t);
     }
     const hasEq = clip.some((t) => t.op === "eq");
@@ -26033,15 +26067,16 @@ export function reduceIntervalUnion(
   keyIdx: number,
   keyType: ScalarType,
   colColl: string | null,
+  siblingRange: ColumnRange = null,
 ): IntervalSpec[] | null {
   if (e.kind === "or") {
-    const l = reduceIntervalUnion(e.lhs, keyIdx, keyType, colColl);
+    const l = reduceIntervalUnion(e.lhs, keyIdx, keyType, colColl, siblingRange);
     if (l === null) return null;
-    const r = reduceIntervalUnion(e.rhs, keyIdx, keyType, colColl);
+    const r = reduceIntervalUnion(e.rhs, keyIdx, keyType, colColl, siblingRange);
     if (r === null) return null;
     return l.concat(r);
   }
-  const arraySpec = asArrayPointSpec(e, keyIdx, keyType, colColl);
+  const arraySpec = asArrayPointSpec(e, keyIdx, keyType, colColl, siblingRange);
   if (arraySpec !== null) return [arraySpec];
   // A leaf is an AND of same-key comparisons (BETWEEN's resolved shape) and at most one `= ANY`
   // array, whose points those comparisons clip.
@@ -26049,13 +26084,13 @@ export function reduceIntervalUnion(
   let array: IntervalSpec["array"];
   const walk = (x: RExpr): boolean => {
     if (x.kind === "and") return walk(x.lhs) && walk(x.rhs);
-    const t = asBoundTerm(x, { kind: "column", index: keyIdx }, keyType, colColl, null);
+    const t = asBoundTerm(x, { kind: "column", index: keyIdx }, keyType, colColl, siblingRange);
     if (t !== null) {
       terms.push(t);
       return true;
     }
     if (array === undefined) {
-      const spec = asArrayPointSpec(x, keyIdx, keyType, colColl);
+      const spec = asArrayPointSpec(x, keyIdx, keyType, colColl, siblingRange);
       if (spec !== null) {
         array = spec.array;
         return true;
@@ -26073,6 +26108,25 @@ export function reduceIntervalUnion(
 // is exactly the key's type, or a promoted type whose values convert exactly to the key
 // (elemPromoted); a promoted array must be readable as a value, since its elements convert through
 // pointValue.
+// keySetUsesSibling reports an interval or tuple set with a sibling column among its sources (a
+// comparison source, an array operand, or an ARRAY[...] element): an index-nested-loop set.
+function keySetUsesSibling(specs: IntervalSpec[], clip: BoundTerm[], tuple: TupleMember[]): boolean {
+  const termsUse = (terms: BoundTerm[]): boolean => terms.some((t) => t.src.kind === "column");
+  const specsUse = (specs: IntervalSpec[]): boolean =>
+    specs.some(
+      (spec) =>
+        termsUse(spec.terms) ||
+        (spec.array !== undefined &&
+          (spec.array.kind === "column" ||
+            (spec.array.kind === "array" && spec.array.elements.some((e) => e.kind === "column")))),
+    );
+  return (
+    specsUse(specs) ||
+    termsUse(clip) ||
+    tuple.some((m) => specsUse(m.specs ?? []) || termsUse(m.clip))
+  );
+}
+
 // intervalSetConjunctKind reports a conjunct kind that may reduce to an interval set: an OR, an
 // `= ANY` array, or a membership subquery (or its folded IN list).
 function intervalSetConjunctKind(e: RExpr): boolean {
@@ -26126,6 +26180,7 @@ function asArrayPointSpec(
   keyIdx: number,
   keyType: ScalarType,
   colColl: string | null,
+  siblingRange: ColumnRange,
 ): IntervalSpec | null {
   if (isSubqueryPointSource(e, keyIdx, colColl)) return { terms: [], array: e };
   if (
@@ -26139,7 +26194,7 @@ function asArrayPointSpec(
   )
     return null;
   const cmpColl = e.collation !== null ? e.collation.name : null;
-  if (cmpColl !== colColl || !isArrayPointSource(e.array, keyType, e.elemExact === true)) {
+  if (cmpColl !== colColl || !isArrayPointSource(e.array, keyType, e.elemExact === true, siblingRange)) {
     return null;
   }
   return { terms: [], array: e.array };
@@ -26149,17 +26204,25 @@ function asArrayPointSpec(
 // readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
 // outer column, or — for an exact element type only — a one-dimensional ARRAY[...] whose every
 // element is a constant key source.
-function isArrayPointSource(e: RExpr, keyType: ScalarType, exact: boolean): boolean {
+function isArrayPointSource(
+  e: RExpr,
+  keyType: ScalarType,
+  exact: boolean,
+  siblingRange: ColumnRange,
+): boolean {
   switch (e.kind) {
     case "param":
     case "constArray":
     case "constNull":
     case "outerColumn":
       return true;
+    case "column":
+      // Index-nested-loop: a sibling array column of the selected physical-left relation.
+      return columnRangeContains(siblingRange, e.index);
     case "array":
       if (e.nested || !exact) return false;
       for (const elem of e.elements) {
-        if (!isConstSource(elem, keyType, null)) return false;
+        if (!isConstSource(elem, keyType, siblingRange)) return false;
       }
       return true;
     default:
@@ -26206,6 +26269,7 @@ function arrayPointKeys(
   params: Value[],
   outer: Row[],
   coll: Collation | null,
+  left: Row,
 ): Uint8Array[] | null {
   const keys: Uint8Array[] = [];
   // A membership subquery's points come from its fold; not yet folded, it has none: the caller
@@ -26217,7 +26281,7 @@ function arrayPointKeys(
   if (src.kind === "inValues") return valuePointKeys(keyType, src.list, coll);
   if (src.kind === "array") {
     for (const elem of src.elements) {
-      const encoded = encodeBoundKey(keyType, elem, params, outer, coll, []);
+      const encoded = encodeBoundKey(keyType, elem, params, outer, coll, left);
       if (encoded.kind === "key") keys.push(encoded.key);
     }
     return keys;
@@ -26232,6 +26296,10 @@ function arrayPointKeys(
       break;
     case "constArray":
       v = src.value;
+      break;
+    case "column":
+      // Index-nested-loop: the sibling column of the current combined left-hand row.
+      v = left[src.index] ?? null;
       break;
   }
   if (v === null || v.kind !== "array") return keys;
@@ -26384,6 +26452,44 @@ export function inventoryINLCandidates(
         },
       };
       candidates.push(indexOrderCandidate("btree", idx.name, bound, whereFilter));
+    }
+  }
+  // Interval and tuple sets bound to a sibling (cost.md §3 "JOIN"): a PK or index set one of whose
+  // sources is a sibling column — `id = ANY(s.ids)`, `tenant = s.tenant AND id IN (1, 2)` — is
+  // evaluated per outer row. A set with constant sources only is the ordinary relation bound.
+  const conjuncts = [...flattenConjuncts(on), ...flattenConjuncts(whereFilter)];
+  let pkSet: PkKeySet | null = detectTupleIntervalSetConjuncts(conjuncts, rel, snap, siblingRange);
+  const pkLocal = primaryKeyIndex(rel.table);
+  if (pkSet === null && pkLocal >= 0) {
+    const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
+    const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
+    if (sty !== undefined && ctx !== null) {
+      const set = detectIntervalSetConjuncts(
+        conjuncts,
+        rel.offset + pkLocal,
+        sty,
+        ctx.coll,
+        siblingRange,
+      );
+      if (set !== null) pkSet = { pkType: sty, coll: ctx.coll, ...set };
+    }
+  }
+  if (pkSet !== null && keySetUsesSibling(pkSet.specs, pkSet.clip, pkSet.tuple ?? [])) {
+    candidates.push(
+      storageOrderCandidate("pk_interval", "", { kind: "pkSet", pkSet }, whereFilter),
+    );
+  }
+  for (const idx of rel.table.indexes) {
+    const set = buildIndexIntervalSetPlanConjuncts(conjuncts, rel, idx, snap, siblingRange);
+    if (set !== null && keySetUsesSibling([], [], set.tuple)) {
+      candidates.push(
+        indexOrderCandidate(
+          "index_interval",
+          set.nameKey,
+          { kind: "indexSet", indexSet: set },
+          whereFilter,
+        ),
+      );
     }
   }
   // Opclass sibling bounds follow the cheaper PK and ordered-B-tree paths. GiST precedes GIN,
@@ -29208,7 +29314,7 @@ export function canonicalIntervalSet(
         if (b === null) continue;
         pointClip = intersectBounds(b, clip);
       }
-      const keys = arrayPointKeys(keyType, spec.array, params, outer, coll);
+      const keys = arrayPointKeys(keyType, spec.array, params, outer, coll, left);
       if (keys === null) {
         if (!boundEmpty(pointClip)) intervals.push(pointClip);
         continue;
@@ -29308,7 +29414,7 @@ function memberPoints(m: TupleMember, params: Value[], outer: Row[], left: Row):
         if (b === null) continue;
         within = intersectBounds(b, clip);
       }
-      const points = arrayPointKeys(m.colType, spec.array, params, outer, m.coll);
+      const points = arrayPointKeys(m.colType, spec.array, params, outer, m.coll, left);
       if (points === null) return null;
       for (const key of points) keep(key, within);
       continue;

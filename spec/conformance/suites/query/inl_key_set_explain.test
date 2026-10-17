@@ -1,0 +1,234 @@
+# EXPLAIN of index-nested-loop interval and tuple sets (spec/design/cost.md §3 "JOIN", explain.md §5):
+# an inner relation's PK or index set with a sibling source renders as an `Index-nested-loop` interval
+# set on the inner Scan. Rows and costs are pinned in inl_key_set.test. The plans are jed-owned, so
+# this file is cross-core checked, not oracle-checked.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.join_inner, query.join_left, query.index_nested_loop, query.logical_connectives, query.explain, query.set_returning, func.array_quantified, types.array, cast.array, types.i32, types.i64
+
+statement ok
+CREATE TABLE orders (id i64 PRIMARY KEY, v i64)
+
+statement ok
+INSERT INTO orders SELECT g, g * 10 FROM generate_series(1, 2000) AS g
+
+statement ok
+CREATE TABLE lists (k i64 PRIMARY KEY, ids i64[], ids32 i32[])
+
+statement ok
+INSERT INTO lists VALUES (1, '{5,1999,5,4000}', '{5,1999}'), (2, '{17,NULL}', '{17,NULL}'), (3, NULL, NULL), (4, '{}', '{}')
+
+# --- an inner PK set per outer row ----------------------------------------------------------------
+
+# Each outer row's array is a set of PK points: a duplicate, an absent key, a NULL element, a NULL
+# array, and an empty array contribute nothing.
+query ITTII nosort
+EXPLAIN SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids)
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+40
+157
+1
+Scan lists
+Full scan; touched=2
+4
+5
+1
+Scan orders
+Index-nested-loop PK interval set: id; intervals=1; arrays=1; touched=2
+40
+72
+
+# A promoted i32[] converts each element to the i64 key.
+query ITTII nosort
+EXPLAIN SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids32)
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+40
+157
+1
+Scan lists
+Full scan; touched=2
+4
+5
+1
+Scan orders
+Index-nested-loop PK interval set: id; intervals=1; arrays=1; touched=2
+40
+72
+
+# A same-key range clips each outer row's points.
+query ITTII nosort
+EXPLAIN SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids) AND o.id < 100
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+8
+65
+1
+Scan lists
+Full scan; touched=2
+4
+5
+1
+Scan orders
+Index-nested-loop PK interval set: id; intervals=1; arrays=1; touched=2; filter:conjuncts=1
+8
+44
+
+# A LEFT JOIN keeps the outer rows with no match.
+query ITTII nosort
+EXPLAIN SELECT l.k, o.v FROM lists l LEFT JOIN orders o ON o.id = ANY(l.ids)
+----
+0
+Nested Loop
+left; on:conjuncts=1
+40
+157
+1
+Scan lists
+Full scan; touched=2
+4
+5
+1
+Scan orders
+Index-nested-loop PK interval set: id; intervals=1; arrays=1; touched=2
+40
+72
+
+# --- an inner secondary index -----------------------------------------------------------------------
+
+statement ok
+CREATE TABLE ix (id i64 PRIMARY KEY, x i64, w i64)
+
+statement ok
+INSERT INTO ix SELECT g, g % 700, g FROM generate_series(1, 2000) AS g
+
+statement ok
+CREATE INDEX ix_x ON ix (x)
+
+query ITTII nosort
+EXPLAIN SELECT l.k, ix.w FROM lists l JOIN ix ON ix.x = ANY(l.ids)
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+400
+2033
+1
+Scan lists
+Full scan; touched=2
+4
+5
+1
+Scan ix
+Index-nested-loop Index interval set: using ix_x; intervals=1; arrays=1; touched=2
+400
+1228
+
+# --- tuple-set members from a sibling --------------------------------------------------------------
+
+statement ok
+CREATE TABLE tenants (tenant i64 PRIMARY KEY, name i64)
+
+statement ok
+INSERT INTO tenants VALUES (2, 20), (3, 30)
+
+statement ok
+CREATE TABLE tp (tenant i64, id i64, w i64, PRIMARY KEY (tenant, id))
+
+statement ok
+INSERT INTO tp SELECT t, i, t * 10000 + i FROM generate_series(1, 4) AS t, generate_series(1, 2000) AS i
+
+# The sibling tenant is each probe's leading point, then the IN list's points.
+query ITTII nosort
+EXPLAIN SELECT t.name, tp.w FROM tenants t JOIN tp ON tp.tenant = t.tenant AND tp.id IN (1, 5, 1999)
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+6
+55
+1
+Scan tenants
+Full scan; touched=2
+2
+3
+1
+Scan tp
+Index-nested-loop PK interval set: tenant, id; intervals=3; touched=3; filter:conjuncts=1
+6
+40
+
+# A final range member under the sibling point.
+query ITTII nosort
+EXPLAIN SELECT t.name, tp.w FROM tenants t JOIN tp ON tp.tenant = t.tenant AND tp.id > 1997
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+10
+83
+1
+Scan tenants
+Full scan; touched=2
+2
+3
+1
+Scan tp
+Index-nested-loop PK bound: tenant = join and id > 1997; touched=3; filter:conjuncts=1
+10
+60
+
+# The sibling array as the set of a later member.
+query ITTII nosort
+EXPLAIN SELECT l.k, tp.w FROM lists l JOIN tp ON tp.tenant = 3 AND tp.id = ANY(l.ids)
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+4
+101
+1
+Scan lists
+Full scan; touched=2
+4
+5
+1
+Scan tp
+Index-nested-loop PK interval set: tenant, id; intervals=1; arrays=1; touched=3; filter:conjuncts=1
+4
+88
+
+statement ok
+CREATE TABLE ti (id i64 PRIMARY KEY, tenant i64, k i64)
+
+statement ok
+INSERT INTO ti SELECT g, g % 4, g % 500 FROM generate_series(1, 2000) AS g
+
+statement ok
+CREATE INDEX ti_tk ON ti (tenant, k)
+
+# An index tuple set: the sibling tenant, then the array's points.
+query ITTII nosort
+EXPLAIN SELECT t.name, ti.id FROM tenants t JOIN ti ON ti.tenant = t.tenant AND ti.k = ANY(ARRAY[7, 300])
+----
+0
+Nested Loop
+inner; on:conjuncts=2
+4
+47
+1
+Scan tenants
+Full scan; touched=2
+2
+3
+1
+Scan ti
+Index-nested-loop Index interval set: using ti_tk (tenant, k); intervals=1; arrays=1; touched=3
+4
+16

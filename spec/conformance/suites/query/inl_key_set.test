@@ -1,0 +1,189 @@
+# Index-nested-loop interval and tuple sets (spec/design/cost.md §3 "JOIN", "OR / IN-list",
+# "Composite primary keys", "Multi-column secondary indexes"). A join's inner relation takes an
+# interval or tuple set one of whose sources is a column of the physical-left relation, evaluated per
+# outer row: `o.id = ANY(l.ids)` probes each element of the outer row's array, and `tp.tenant =
+# t.tenant AND tp.id IN (1, 5)` probes the outer row's (tenant, id) tuples, instead of scanning the
+# inner relation (or the tenant's whole prefix) for every outer row. The whole ON and WHERE stay the
+# residual, so the rows are unchanged and only the cost drops. Rows verified against the live
+# PostgreSQL 18 oracle; the costs are jed-owned, so the `# cost:` lines are the cross-core pin. The
+# plans are pinned in inl_key_set_explain.test.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.join_inner, query.join_left, query.index_nested_loop, query.logical_connectives, query.set_returning, func.array_quantified, types.array, cast.array, types.i32, types.i64, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE orders (id i64 PRIMARY KEY, v i64)
+
+statement ok
+INSERT INTO orders SELECT g, g * 10 FROM generate_series(1, 2000) AS g
+
+statement ok
+CREATE TABLE lists (k i64 PRIMARY KEY, ids i64[], ids32 i32[])
+
+statement ok
+INSERT INTO lists VALUES (1, '{5,1999,5,4000}', '{5,1999}'), (2, '{17,NULL}', '{17,NULL}'), (3, NULL, NULL), (4, '{}', '{}')
+
+# --- an inner PK set per outer row ----------------------------------------------------------------
+
+# Each outer row's array is a set of PK points: a duplicate, an absent key, a NULL element, a NULL
+# array, and an empty array contribute nothing.
+# cost: 26
+query II rowsort
+SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids)
+----
+1
+19990
+1
+50
+2
+170
+
+# A promoted i32[] converts each element to the i64 key.
+# cost: 24
+query II rowsort
+SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids32)
+----
+1
+19990
+1
+50
+2
+170
+
+# A same-key range clips each outer row's points.
+# cost: 19
+query II rowsort
+SELECT l.k, o.v FROM lists l JOIN orders o ON o.id = ANY(l.ids) AND o.id < 100
+----
+1
+50
+2
+170
+
+# A LEFT JOIN keeps the outer rows with no match.
+# cost: 28
+query II rowsort
+SELECT l.k, o.v FROM lists l LEFT JOIN orders o ON o.id = ANY(l.ids)
+----
+1
+19990
+1
+50
+2
+170
+3
+NULL
+4
+NULL
+
+# --- an inner secondary index -----------------------------------------------------------------------
+
+statement ok
+CREATE TABLE ix (id i64 PRIMARY KEY, x i64, w i64)
+
+statement ok
+INSERT INTO ix SELECT g, g % 700, g FROM generate_series(1, 2000) AS g
+
+statement ok
+CREATE INDEX ix_x ON ix (x)
+
+# cost: 49
+query II rowsort
+SELECT l.k, ix.w FROM lists l JOIN ix ON ix.x = ANY(l.ids)
+----
+1
+1405
+1
+5
+1
+705
+2
+1417
+2
+17
+2
+717
+
+# --- tuple-set members from a sibling --------------------------------------------------------------
+
+statement ok
+CREATE TABLE tenants (tenant i64 PRIMARY KEY, name i64)
+
+statement ok
+INSERT INTO tenants VALUES (2, 20), (3, 30)
+
+statement ok
+CREATE TABLE tp (tenant i64, id i64, w i64, PRIMARY KEY (tenant, id))
+
+statement ok
+INSERT INTO tp SELECT t, i, t * 10000 + i FROM generate_series(1, 4) AS t, generate_series(1, 2000) AS i
+
+# The sibling tenant is each probe's leading point, then the IN list's points.
+# cost: 57
+query II rowsort
+SELECT t.name, tp.w FROM tenants t JOIN tp ON tp.tenant = t.tenant AND tp.id IN (1, 5, 1999)
+----
+20
+20001
+20
+20005
+20
+21999
+30
+30001
+30
+30005
+30
+31999
+
+# A final range member under the sibling point.
+# cost: 31
+query II rowsort
+SELECT t.name, tp.w FROM tenants t JOIN tp ON tp.tenant = t.tenant AND tp.id > 1997
+----
+20
+21998
+20
+21999
+20
+22000
+30
+31998
+30
+31999
+30
+32000
+
+# The sibling array as the set of a later member.
+# cost: 29
+query II rowsort
+SELECT l.k, tp.w FROM lists l JOIN tp ON tp.tenant = 3 AND tp.id = ANY(l.ids)
+----
+1
+30005
+1
+31999
+2
+30017
+
+statement ok
+CREATE TABLE ti (id i64 PRIMARY KEY, tenant i64, k i64)
+
+statement ok
+INSERT INTO ti SELECT g, g % 4, g % 500 FROM generate_series(1, 2000) AS g
+
+statement ok
+CREATE INDEX ti_tk ON ti (tenant, k)
+
+# An index tuple set: the sibling tenant, then the array's points.
+# cost: 47
+query II rowsort
+SELECT t.name, ti.id FROM tenants t JOIN ti ON ti.tenant = t.tenant AND ti.k = ANY(ARRAY[7, 300])
+----
+30
+1007
+30
+1507
+30
+507
+30
+7
