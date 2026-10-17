@@ -2728,12 +2728,17 @@ impl<'a> Scope<'a> {
         {
             return e;
         }
-        let hint = match (e.state, qualifier) {
+        let (hint, detail) = match (e.state, qualifier) {
             (SqlState::UndefinedColumn, _) => self.column_hint(qualifier, name),
             (SqlState::UndefinedTable, Some(q)) => self.table_hint(q),
-            _ => None,
+            _ => (None, None),
         };
-        e.with_position(pos.0).with_hint(hint)
+        let e = e.with_position(pos.0).with_hint(hint);
+        if e.detail.is_none() {
+            e.with_detail(detail)
+        } else {
+            e
+        }
     }
 
     /// The labeled relations this level can see, in the §11.1 walk order: the FROM relations in
@@ -2815,10 +2820,10 @@ impl<'a> Scope<'a> {
         out
     }
 
-    /// PostgreSQL's `errorMissingColumn` hint (spec/design/error-fields.md §11.1, §11.8): a
-    /// relation that has the column but cannot be seen from here yields the LATERAL or qualified-name
-    /// hint; otherwise the misspelled-column suggestion.
-    fn column_hint(&self, qualifier: Option<&str>, name: &str) -> Option<String> {
+    /// PostgreSQL's `errorMissingColumn` hint and detail (spec/design/error-fields.md §11.1, §11.8):
+    /// a relation that has the column but cannot be seen from here yields the "cannot be referenced"
+    /// detail and the LATERAL or qualified-name hint; otherwise the misspelled-column suggestion.
+    fn column_hint(&self, qualifier: Option<&str>, name: &str) -> (Option<String>, Option<String>) {
         let entries = self.hint_walk();
         let mut m = error_hint::FuzzyColumnMatch::new(qualifier, name);
         let mut exact: Vec<&HintEntry> = Vec::new();
@@ -2832,32 +2837,45 @@ impl<'a> Scope<'a> {
             }
         }
         match exact.as_slice() {
-            [] => m.hint(),
-            [e] if e.lateral_ok => Some(error_hint::LATERAL_COLUMN.to_string()),
-            [e] if qualifier.is_none() && e.qualified_only => {
-                Some(error_hint::QUALIFY_COLUMN.to_string())
+            [] => (m.hint(), None),
+            [e] => {
+                let hint = if e.lateral_ok {
+                    Some(error_hint::LATERAL_COLUMN.to_string())
+                } else if qualifier.is_none() && e.qualified_only {
+                    Some(error_hint::QUALIFY_COLUMN.to_string())
+                } else {
+                    None
+                };
+                let detail = error_hint::unreachable_column_detail(name, &e.label);
+                (hint, Some(detail))
             }
-            [_] => None,
-            _ => qualifier
-                .is_none()
-                .then(|| error_hint::TRY_QUALIFIED.to_string()),
+            _ => (
+                qualifier
+                    .is_none()
+                    .then(|| error_hint::TRY_QUALIFIED.to_string()),
+                Some(error_hint::unreachable_columns_detail(name)),
+            ),
         }
     }
 
-    /// PostgreSQL's `errorMissingRTE` hint (spec/design/error-fields.md §11.2, §11.8): the first
-    /// relation in the walk labeled `qualifier`, or naming that base table or view. A visible one
-    /// under a different label is the table-alias hint; one hidden from a non-LATERAL subquery is the
-    /// LATERAL hint.
-    fn table_hint(&self, qualifier: &str) -> Option<String> {
+    /// PostgreSQL's `errorMissingRTE` hint and detail (spec/design/error-fields.md §11.2, §11.8): the
+    /// first relation in the walk labeled `qualifier`, or naming that base table or view. A visible
+    /// one under a different label is the table-alias hint; any other found relation gets the
+    /// "cannot be referenced" detail, plus the LATERAL hint when it is hidden from a non-LATERAL
+    /// subquery.
+    fn table_hint(&self, qualifier: &str) -> (Option<String>, Option<String>) {
         let entries = self.hint_walk();
-        let e = entries
+        let Some(e) = entries
             .iter()
-            .find(|e| e.label == qualifier || e.catalog.as_deref() == Some(qualifier))?;
-        if e.visible {
-            (e.label != qualifier).then(|| error_hint::alias_hint(&e.label))
-        } else {
-            e.lateral_ok.then(|| error_hint::LATERAL_TABLE.to_string())
+            .find(|e| e.label == qualifier || e.catalog.as_deref() == Some(qualifier))
+        else {
+            return (None, None);
+        };
+        if e.visible && e.label != qualifier {
+            return (Some(error_hint::alias_hint(&e.label)), None);
         }
+        let hint = (!e.visible && e.lateral_ok).then(|| error_hint::LATERAL_TABLE.to_string());
+        (hint, Some(error_hint::unreachable_table_detail(&e.label)))
     }
 
     /// The column at a flat index in THIS scope (the index is known valid — resolution made it).
@@ -4608,6 +4626,7 @@ fn count_sublink_self_refs(s: &Select, name: &str) -> usize {
 /// `carried` is the number of hidden trailing outputs a SEARCH / CYCLE recursive term carries
 /// (recursive-cte.md §9), which are not compared.
 fn check_recursive_column_types(
+    anchor_ast: &QueryExpr,
     anchor: &QueryPlan,
     recursive: &QueryPlan,
     name: &str,
@@ -4624,6 +4643,8 @@ fn check_recursive_column_types(
         ));
     }
     for (i, (at, rt)) in a.iter().zip(r.iter()).enumerate() {
+        // PostgreSQL reports a column the recursive term changes at the non-recursive term's column.
+        let at_col = plan_query::output_column_location(anchor_ast, i).0;
         let unified = unify_setop_column(at, rt, SetOpKind::Union)?;
         if &unified != at {
             return Err(EngineError::new(
@@ -4635,7 +4656,8 @@ fn check_recursive_column_types(
                     unified.type_name(),
                 ),
             )
-            .hinted(error_hint::RECURSIVE_TERM_TYPE));
+            .hinted(error_hint::RECURSIVE_TERM_TYPE)
+            .with_position(at_col));
         }
         // The non-recursive term also fixed the column's typmod, so the overall common typmod must
         // equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
@@ -4651,7 +4673,8 @@ fn check_recursive_column_types(
                     typmod_type_name(at, overall_mod),
                 ),
             )
-            .hinted(error_hint::RECURSIVE_TERM_TYPE));
+            .hinted(error_hint::RECURSIVE_TERM_TYPE)
+            .with_position(at_col));
         }
         if !union_all {
             require_setop_equality(at)?;
@@ -4673,7 +4696,9 @@ fn check_recursive_column_types(
                         "recursive query \"{name}\" column {} has collation \"{non_rec}\" in non-recursive term but collation \"{all}\" overall",
                         i + 1,
                     ),
-                ));
+                )
+                .hinted(error_hint::RECURSIVE_TERM_COLLATION)
+                .with_position(at_col));
             }
         }
     }
@@ -4775,7 +4800,7 @@ fn count_self_refs_tableref(tref: &TableRef, name: &str) -> usize {
 fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
     let sub = |x: &Expr| count_self_refs_expr(x, name);
     match e {
-        Expr::ScalarSubquery(q) | Expr::Exists(q) => count_self_refs_query(q, name),
+        Expr::ScalarSubquery(q, _) | Expr::Exists(q, _) => count_self_refs_query(q, name),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             sub(lhs) + count_self_refs_query(query, name)
         }
@@ -4783,8 +4808,8 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
-        | Expr::Param(_) => 0,
-        Expr::Row(items) | Expr::Array(items) => items.iter().map(sub).sum(),
+        | Expr::Param(_, _) => 0,
+        Expr::Row(items, _) | Expr::Array(items, _) => items.iter().map(sub).sum(),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => sub(base),
         // `t.*` is a leaf (a relation name, no sub-expression) — no sublink to recurse into.
         Expr::QualifiedStar { .. } => 0,
@@ -4829,7 +4854,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
                 + whens.iter().map(|(c, r)| sub(c) + sub(r)).sum::<usize>()
                 + els.as_deref().map_or(0, sub)
         }
-        Expr::Coalesce(args) => args.iter().map(sub).sum(),
+        Expr::Coalesce(args, _) => args.iter().map(sub).sum(),
         Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => args.iter().map(sub).sum(),
         Expr::FuncCall { args, .. } => args.iter().map(sub).sum(),
     }
@@ -6016,6 +6041,8 @@ pub(crate) fn resolve_json_behavior(
                 type_name: returning.canonical_name().to_string(),
                 type_mod: None,
                 pos: SrcPos::NONE,
+                cast_pos: SrcPos::NONE,
+                type_pos: SrcPos::NONE,
             };
             match resolve(scope, &cast, None, &mut AggCtx::Forbidden, params) {
                 Ok((r, _)) => r,
@@ -6076,7 +6103,10 @@ pub(crate) fn resolve_json_passing(
     let mut exprs = Vec::with_capacity(passing.len());
     let mut names = Vec::with_capacity(passing.len());
     for p in passing {
-        let hint = if matches!(p.expr, Expr::Literal(Literal::Text(_), _) | Expr::Param(_)) {
+        let hint = if matches!(
+            p.expr,
+            Expr::Literal(Literal::Text(_), _) | Expr::Param(_, _)
+        ) {
             Some(ScalarType::Text)
         } else {
             None

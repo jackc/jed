@@ -291,6 +291,31 @@ func (db *engine) dispatchStmtBody(stmt statement, params []Value) (outcome, err
 }
 
 func (db *engine) dispatchStmtBodyCached(stmt statement, params []Value, ic *insertStmtCache, allowInsertFill bool) (outcome, error) {
+	// The database a table-naming error concerns (spec/design/error-fields.md §12): the statement's
+	// target qualifier, else the implicit scope. UPDATE and DELETE stamp their own (they also run as
+	// writable-CTE children).
+	var targetDB *string
+	switch {
+	case stmt.CreateTable != nil && stmt.CreateTable.Temp:
+		temp := "temp"
+		targetDB = &temp
+	case stmt.CreateTable != nil:
+		targetDB = stmt.CreateTable.DB
+	case stmt.AlterTable != nil:
+		targetDB = stmt.AlterTable.DB
+	case stmt.CreateIndex != nil:
+		targetDB = stmt.CreateIndex.DB
+	case stmt.Insert != nil:
+		targetDB = stmt.Insert.DB
+	}
+	out, err := db.dispatchStmtTarget(stmt, params, ic, allowInsertFill)
+	if err != nil {
+		return out, db.stampDatabase(targetDB, err)
+	}
+	return out, nil
+}
+
+func (db *engine) dispatchStmtTarget(stmt statement, params []Value, ic *insertStmtCache, allowInsertFill bool) (outcome, error) {
 	switch {
 	case stmt.Analyze != nil:
 		if err := rejectParamsForDDL(params); err != nil {
@@ -635,7 +660,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			} else if ctype := db.readSnap().compositeType(base); ctype != nil {
 				colType = arrayT(compositeT(ctype.Name))
 			} else {
-				return outcome{}, newError(UndefinedObject, "type does not exist: "+base)
+				return outcome{}, newError(UndefinedObject, "type does not exist: "+base).withPosition(int32(def.TypePos))
 			}
 			isArray = true
 		} else if rdesc, ok := rangeByName(def.TypeName); ok {
@@ -669,7 +694,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			colType = compositeT(ctype.Name)
 			isComposite = true
 		} else {
-			return outcome{}, newError(UndefinedObject, "type does not exist: "+def.TypeName)
+			return outcome{}, newError(UndefinedObject, "type does not exist: "+def.TypeName).withPosition(int32(def.TypePos))
 		}
 		if def.PrimaryKey {
 			// The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
@@ -1856,7 +1881,7 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 		d := deps[0]
 		return outcome{}, newError(DependentObjectsStillExist,
 			"cannot drop table "+d.droppedName+" because other objects depend on it: constraint "+
-				d.fkName+" on table "+d.refTableName)
+				d.fkName+" on table "+d.refTableName).hinted(hintDropCascade)
 	}
 	// ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
 	// now-dangling FK constraint (in place, preserving its rows), each in its own domain: views live
@@ -2237,7 +2262,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					if users := viewPlan.viewsUsing(columnSources[ci].original); len(users) > 0 {
 						if !a.DropColumn.Cascade {
 							return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
-								"cannot drop column %s of table %s because view %s depends on it", a.DropColumn.Name, original.Name, users[0]))
+								"cannot drop column %s of table %s because view %s depends on it", a.DropColumn.Name, original.Name, users[0])).hinted(hintDropCascade)
 						}
 						closure := snap.viewDropClosure(users)
 						viewPlan.forget(closure)
@@ -2296,7 +2321,8 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					}
 				}
 				if !a.DropPrimaryKey.Cascade && (localDeps || incomingDeps) {
-					return outcome{}, newError(DependentObjectsStillExist, "cannot drop primary key because other objects depend on it")
+					return outcome{}, newError(DependentObjectsStillExist, "cannot drop primary key because other objects depend on it").
+						hinted(hintDropCascade)
 				}
 				if a.DropPrimaryKey.Cascade {
 					kept := table.ForeignKeys[:0]
@@ -3094,7 +3120,7 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 		} else if c := db.readSnap().compositeType(base); c != nil {
 			ty = arrayT(compositeT(c.Name))
 		} else {
-			return catColumn{}, newError(UndefinedObject, "type does not exist: "+base)
+			return catColumn{}, newError(UndefinedObject, "type does not exist: "+base).withPosition(int32(def.TypePos))
 		}
 	} else if r, ok := rangeByName(def.TypeName); ok {
 		if def.TypeMod != nil {
@@ -3116,7 +3142,7 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 		}
 		ty = compositeT(c.Name)
 	} else {
-		return catColumn{}, newError(UndefinedObject, "type does not exist: "+def.TypeName)
+		return catColumn{}, newError(UndefinedObject, "type does not exist: "+def.TypeName).withPosition(int32(def.TypePos))
 	}
 
 	collation := ""
@@ -4231,7 +4257,8 @@ func (db *engine) executeDropIndex(di *dropIndex) (outcome, error) {
 			for _, e := range t.Exclusions {
 				if e.Index == di.Name {
 					return outcome{}, newError(DependentObjectsStillExist,
-						"cannot drop index "+di.Name+" because constraint "+di.Name+" on table "+t.Name+" requires it")
+						"cannot drop index "+di.Name+" because constraint "+di.Name+" on table "+t.Name+" requires it").
+						hinted(dropOwnerInsteadHint(di.Name, t.Name))
 				}
 			}
 		}

@@ -7,6 +7,7 @@ package jed
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // The SqlState type + its Code() mapping are generated from spec/errors/registry.toml
@@ -25,6 +26,10 @@ type EngineError struct {
 	ConstraintName string
 	// TableName is the relation the failing write targeted.
 	TableName string
+	// DatabaseName is the database holding TableName — `main`, `temp`, or a host attachment's name.
+	// jed's analog of PostgreSQL's SchemaName: set whenever TableName is (spec/design/error-fields.md
+	// §12).
+	DatabaseName string
 	// ColumnName is the column at fault — set for 23502 (and 22001 truncation).
 	ColumnName string
 	// DataTypeName is the data type at fault — set for 22003 / 22001.
@@ -48,6 +53,12 @@ type EngineError struct {
 	// it absent), so an enclosing context never adds its default hint (spec/design/error-fields.md
 	// §11.7). Internal bookkeeping, not a field.
 	hintDecided bool
+	// hasSlot / slotRow / slotValue record the INSERT VALUES slot (row, value) whose stored value
+	// raised this error, set where the row is built so the statement can point the error at the slot's
+	// literal (spec/design/error-fields.md §10.2). Internal bookkeeping, not a field.
+	hasSlot   bool
+	slotRow   int
+	slotValue int
 }
 
 // newError builds an EngineError.
@@ -116,6 +127,52 @@ func (e *EngineError) defaultHint(text string) *EngineError {
 		return e
 	}
 	return e.hinted(text)
+}
+
+// atSlot records the VALUES slot value (of row 0) a row-building error came from (§10.2), unless one
+// is already recorded. A no-op for a non-EngineError.
+func atSlot(err error, value int) error {
+	var e *EngineError
+	if errors.As(err, &e) && !e.hasSlot {
+		e.hasSlot, e.slotRow, e.slotValue = true, 0, value
+	}
+	return err
+}
+
+// atRow moves a recorded VALUES slot to row (§10.2). A no-op for an error with no slot.
+func atRow(err error, row int) error {
+	var e *EngineError
+	if errors.As(err, &e) && e.hasSlot {
+		e.slotRow = row
+	}
+	return err
+}
+
+// locateValueSlot points an INSERT VALUES store error at the literal of the slot it came from
+// (spec/design/error-fields.md §10.2): see locateLit. An error from an expression slot, a default, or
+// a non-VALUES source passes through.
+func locateValueSlot(rows [][]insertValue, err error) error {
+	var e *EngineError
+	if !errors.As(err, &e) || !e.hasSlot || e.slotRow >= len(rows) || e.slotValue >= len(rows[e.slotRow]) {
+		return err
+	}
+	return locateLit(rows[e.slotRow][e.slotValue], err)
+}
+
+// locateLit: PostgreSQL coerces a VALUES literal to its column at parse time, so a type mismatch and
+// a string's input error point at the literal; a length check (22001) and a number's range check run
+// later and carry no position (spec/design/error-fields.md §10.2). A non-literal slot passes through.
+func locateLit(iv insertValue, err error) error {
+	var e *EngineError
+	if !errors.As(err, &e) || iv.IsDefault || iv.IsParam || iv.IsRow || iv.IsArray || iv.IsExpr {
+		return err
+	}
+	positioned := e.State == DatatypeMismatch ||
+		(iv.Lit.Kind == literalText && strings.HasPrefix(e.Code(), "22") && e.State != StringDataRightTruncation)
+	if positioned {
+		e.withPosition(int32(iv.LitPos))
+	}
+	return err
 }
 
 // locateError stamps an error leaving an expression node's resolution with pos unless an inner node
@@ -242,6 +299,29 @@ func newExclusionViolation(table, constraint string) *EngineError {
 	return newError(ExclusionViolation,
 		"conflicting key value violates exclusion constraint: "+constraint).
 		withTable(table).withConstraint(constraint)
+}
+
+// newGeneratedAlwaysInsert is 428C9 — an INSERT supplies a non-DEFAULT value to GENERATED ALWAYS
+// identity column without OVERRIDING SYSTEM VALUE, with PostgreSQL's Detail and Hint
+// (spec/design/error-fields.md §11.9).
+func newGeneratedAlwaysInsert(column string) *EngineError {
+	return newError(GeneratedAlways, "cannot insert a non-DEFAULT value into column "+column).
+		withDetail(identityAlwaysDetail(column)).
+		hinted("Use OVERRIDING SYSTEM VALUE to override.")
+}
+
+// newGeneratedAlwaysUpdate is 428C9 — an UPDATE assigns GENERATED ALWAYS identity column a value
+// other than DEFAULT, with PostgreSQL's Detail (spec/design/error-fields.md §11.9).
+func newGeneratedAlwaysUpdate(column string) *EngineError {
+	return newError(GeneratedAlways, "column "+column+" can only be updated to DEFAULT").
+		withDetail(identityAlwaysDetail(column)).
+		noHint()
+}
+
+// identityAlwaysDetail is PostgreSQL's 428C9 Detail for a GENERATED ALWAYS identity column
+// (rewriteHandler.c).
+func identityAlwaysDetail(column string) string {
+	return "Column \"" + column + "\" is an identity column defined as GENERATED ALWAYS."
 }
 
 // newNotNullViolation — 23502, a NULL into NOT NULL `column`. The table is stamped at the

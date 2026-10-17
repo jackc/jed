@@ -170,7 +170,7 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 				return nil, err
 			}
 			bindings[bi].starHidden = 0
-			if err := checkRecursiveColumnTypes(&bindings[bi].plan, &rhsPlan, lname, unionAll, added); err != nil {
+			if err := checkRecursiveColumnTypes(so.Lhs, &bindings[bi].plan, &rhsPlan, lname, unionAll, added); err != nil {
 				return nil, err
 			}
 			bindings[bi].recursive = &recursiveTerm{plan: rhsPlan, unionAll: unionAll, searchCycle: sc}
@@ -1372,7 +1372,7 @@ func selectExprs(s *selectStmt) []exprNode {
 // assignable to them — a literal adapts, an equal type passes, a WIDER type is 42804 (matching
 // PostgreSQL). Mechanically the would-be UNION unified type must EQUAL the anchor type; any widening
 // of the anchor is the error. An arity mismatch is 42601, like a plain UNION.
-func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionAll bool, carried int) error {
+func checkRecursiveColumnTypes(anchorAST queryExpr, anchor, recursive *queryPlan, name string, unionAll bool, carried int) error {
 	a := anchor.columnTypes()
 	all := recursive.columnTypes()
 	r := all[:len(all)-carried]
@@ -1380,6 +1380,8 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 		return newError(SyntaxError, "each UNION query must have the same number of columns")
 	}
 	for i := range a {
+		// PostgreSQL reports a column the recursive term changes at the non-recursive term's column.
+		atCol := int32(outputColumnLocation(anchorAST, i))
 		unified, err := unifySetopColumn(a[i], r[i], setOpUnion)
 		if err != nil {
 			return err
@@ -1388,7 +1390,7 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 			return newError(DatatypeMismatch, fmt.Sprintf(
 				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
 				name, i+1, rtName(a[i]), rtName(unified),
-			)).hinted(hintRecursiveTermType)
+			)).hinted(hintRecursiveTermType).withPosition(atCol)
 		}
 		// The non-recursive term also fixed the column's typmod, so the overall common typmod must
 		// equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
@@ -1398,7 +1400,7 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 			return newError(DatatypeMismatch, fmt.Sprintf(
 				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
 				name, i+1, typmodTypeName(a[i], atMod), typmodTypeName(a[i], overallMod),
-			)).hinted(hintRecursiveTermType)
+			)).hinted(hintRecursiveTermType).withPosition(atCol)
 		}
 		if !unionAll {
 			if err := requireSetopEquality(a[i]); err != nil {
@@ -1419,7 +1421,7 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 				return newError(CollationMismatch, fmt.Sprintf(
 					"recursive query \"%s\" column %d has collation \"%s\" in non-recursive term but collation \"%s\" overall",
 					name, i+1, nonRec, all,
-				))
+				)).hinted(hintRecursiveTermCollation).withPosition(atCol)
 			}
 		}
 	}
@@ -1780,9 +1782,10 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 	// Every form but UNION ALL matches rows, so each column needs an equality operator (42883 for
 	// json / jsonpath, as PostgreSQL).
 	if so.Op != setOpUnion || !so.All {
-		for _, t := range columnTypes {
+		// PostgreSQL reports a missing equality operator at the left operand's column.
+		for i, t := range columnTypes {
 			if err := requireSetopEquality(t); err != nil {
-				return nil, err
+				return nil, positionError(err, outputColumnLocation(so.Lhs, i))
 			}
 		}
 	}

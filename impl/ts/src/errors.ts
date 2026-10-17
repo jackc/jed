@@ -22,6 +22,9 @@ export class EngineError extends Error {
   state: SqlState;
   constraintName?: string;
   tableName?: string;
+  // The database holding `tableName` — `main`, `temp`, or a host attachment's name. jed's analog of
+  // PostgreSQL's SchemaName: set whenever `tableName` is (spec/design/error-fields.md §12).
+  databaseName?: string;
   columnName?: string;
   dataTypeName?: string;
   // PostgreSQL's DETAIL sentence naming the offending values (`Key (id)=(1) already exists.`) — set
@@ -42,6 +45,10 @@ export class EngineError extends Error {
   // an enclosing context never adds its default hint (spec/design/error-fields.md §11.7). Internal
   // bookkeeping, not a field.
   hintDecided?: boolean;
+  // The INSERT VALUES slot [row, value] whose stored value raised this error, set where the row is
+  // built so the statement can point the error at the slot's literal (spec/design/error-fields.md
+  // §10.2). Internal bookkeeping, not a field.
+  slot?: [number, number];
 
   constructor(state: SqlState, message: string) {
     super(`${sqlStateCode(state)}: ${message}`);
@@ -63,6 +70,15 @@ export class EngineError extends Error {
   }
   withTable(name: string): this {
     this.tableName = name;
+    return this;
+  }
+  // withDatabase stamps DatabaseName with the database holding the error's table
+  // (spec/design/error-fields.md §12): set only when TableName is set and no inner site already
+  // named the database.
+  withDatabase(database: string): this {
+    if (this.tableName !== undefined && this.databaseName === undefined) {
+      this.databaseName = database;
+    }
     return this;
   }
   withColumn(name: string): this {
@@ -106,6 +122,16 @@ export class EngineError extends Error {
   // coordinates of the script that contains it (spec/design/error-fields.md §10.1).
   shiftPosition(chars: number): this {
     if (this.position !== undefined) this.position += chars;
+    return this;
+  }
+  // atSlot records the VALUES slot `value` (of row 0) a row-building error came from (§10.2).
+  atSlot(value: number): this {
+    if (this.slot === undefined) this.slot = [0, value];
+    return this;
+  }
+  // atRow moves a recorded slot to VALUES row `row` (§10.2).
+  atRow(row: number): this {
+    if (this.slot !== undefined) this.slot = [row, this.slot[1]];
     return this;
   }
   // withHint sets Hint unless one is already set (spec/design/error-fields.md §11).
@@ -235,6 +261,29 @@ export function exclusionViolation(table: string, constraint: string): EngineErr
   )
     .withTable(table)
     .withConstraint(constraint);
+}
+
+// generatedAlwaysInsert — 428C9, an INSERT supplies a non-DEFAULT value to GENERATED ALWAYS
+// identity `column` without OVERRIDING SYSTEM VALUE, with PostgreSQL's Detail and Hint
+// (error-fields.md §11.9).
+export function generatedAlwaysInsert(column: string): EngineError {
+  return engineError("generated_always", `cannot insert a non-DEFAULT value into column ${column}`)
+    .withDetail(identityAlwaysDetail(column))
+    .hinted("Use OVERRIDING SYSTEM VALUE to override.");
+}
+
+// generatedAlwaysUpdate — 428C9, an UPDATE assigns GENERATED ALWAYS identity `column` a value other
+// than DEFAULT, with PostgreSQL's Detail (error-fields.md §11.9).
+export function generatedAlwaysUpdate(column: string): EngineError {
+  return engineError("generated_always", `column ${column} can only be updated to DEFAULT`)
+    .withDetail(identityAlwaysDetail(column))
+    .noHint();
+}
+
+// identityAlwaysDetail is PostgreSQL's 428C9 Detail for a GENERATED ALWAYS identity column
+// (rewriteHandler.c).
+function identityAlwaysDetail(column: string): string {
+  return `Column "${column}" is an identity column defined as GENERATED ALWAYS.`;
 }
 
 // notNullViolation — 23502, a NULL into NOT NULL `column`. The table is stamped at the DML

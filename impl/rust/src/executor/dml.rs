@@ -171,7 +171,10 @@ impl Engine {
         params: &[Value],
         ctx: CteCtx,
     ) -> Result<Outcome> {
+        // A writable-CTE child names its own target database (spec/design/error-fields.md §12).
+        let db = ins.db.clone();
         self.execute_insert_cached(ins, params, ctx, None, false)
+            .map_err(|e| self.stamp_database(db.as_deref(), e))
     }
 
     pub(crate) fn execute_insert_cached(
@@ -408,13 +411,7 @@ impl Engine {
                         .iter()
                         .any(|values| !matches!(values[p], InsertValue::Default))
                     {
-                        return Err(EngineError::new(
-                            SqlState::GeneratedAlways,
-                            format!(
-                                "cannot insert a non-DEFAULT value into column {}",
-                                columns[i].name
-                            ),
-                        ));
+                        return Err(EngineError::generated_always_insert(&columns[i].name));
                     }
                 }
                 // Resolve the RETURNING projection after the source (PostgreSQL's analysis
@@ -508,7 +505,7 @@ impl Engine {
                                 // takes the normal materialize path (parse to a value);
                                 // non-literal text DATA (INSERT … SELECT, a $N bind) stays strict —
                                 // the specials are literal/cast syntax, not an assignment coercion.
-                                InsertValue::Lit(Literal::Text(s))
+                                InsertValue::Lit(Literal::Text(s), _)
                                     if matches!(&col_types[i], ColType::Scalar(sc) if sc.is_date())
                                         && crate::date::date_clock_special(s).is_some() =>
                                 {
@@ -526,7 +523,7 @@ impl Engine {
                                     &bound,
                                     &self.input_zone(),
                                 )
-                                .map_err(assignment_hint)?,
+                                .map_err(|e| locate_lit(other, assignment_hint(e)))?,
                             };
                         }
                     }
@@ -579,25 +576,28 @@ impl Engine {
                             &bound,
                             ctx,
                             &mut meter,
-                        )?
+                        )
+                        .map_err(|e| locate_value_slot(&rows_in, e))?
                     }),
-                    None => self.run_insert_rows(
-                        &table,
-                        db.as_deref(),
-                        &columns,
-                        &pk,
-                        &checks,
-                        &view_checks,
-                        &default_exprs,
-                        &stmt_rng,
-                        &provided,
-                        rows,
-                        conflict_plan.as_ref(),
-                        returning_nodes,
-                        &bound,
-                        ctx,
-                        &mut meter,
-                    )?,
+                    None => self
+                        .run_insert_rows(
+                            &table,
+                            db.as_deref(),
+                            &columns,
+                            &pk,
+                            &checks,
+                            &view_checks,
+                            &default_exprs,
+                            &stmt_rng,
+                            &provided,
+                            rows,
+                            conflict_plan.as_ref(),
+                            returning_nodes,
+                            &bound,
+                            ctx,
+                            &mut meter,
+                        )
+                        .map_err(|e| locate_value_slot(&rows_in, e))?,
                 };
                 if affected > 0 {
                     self.mark_estimator_mutation(db.as_deref(), &table);
@@ -621,13 +621,7 @@ impl Engine {
                 // VALUE` is `428C9` — raised up front (PG raises it at rewrite), firing even over a
                 // zero-row source.
                 if let Some(&(i, _)) = always_targeted.first() {
-                    return Err(EngineError::new(
-                        SqlState::GeneratedAlways,
-                        format!(
-                            "cannot insert a non-DEFAULT value into column {}",
-                            columns[i].name
-                        ),
-                    ));
+                    return Err(EngineError::generated_always_insert(&columns[i].name));
                 }
                 // Plan the source query, then resolve the RETURNING projection (PostgreSQL's
                 // analysis order — both precede any execution), threading ONE ParamTypes so a
@@ -1117,12 +1111,8 @@ impl Engine {
                 .iter()
                 .any(|values| !matches!(values[target.pos], InsertValue::Default))
             {
-                return Err(EngineError::new(
-                    SqlState::GeneratedAlways,
-                    format!(
-                        "cannot insert a non-DEFAULT value into column {}",
-                        table.columns[target.col].name
-                    ),
+                return Err(EngineError::generated_always_insert(
+                    &table.columns[target.col].name,
                 ));
             }
         }
@@ -1224,7 +1214,7 @@ impl Engine {
                             ctx,
                             &mut meter,
                         )?,
-                        InsertValue::Lit(Literal::Text(s))
+                        InsertValue::Lit(Literal::Text(s), _)
                             if matches!(&plan.col_types[i], ColType::Scalar(sc) if sc.is_date())
                                 && crate::date::date_clock_special(s).is_some() =>
                         {
@@ -1242,7 +1232,7 @@ impl Engine {
                             bound,
                             &self.input_zone(),
                         )
-                        .map_err(assignment_hint)?,
+                        .map_err(|e| locate_lit(other, assignment_hint(e)))?,
                     };
                 }
             }
@@ -1288,28 +1278,31 @@ impl Engine {
                     bound,
                     ctx,
                     &mut meter,
-                )?,
+                )
+                .map_err(|e| locate_value_slot(rows_in, e))?,
             ),
             None => {
-                let returned = self.insert_rows(
-                    &plan.table.name,
-                    ins.db.as_deref(),
-                    &plan.table.columns,
-                    &plan.pk,
-                    &plan.checks,
-                    &[],
-                    &plan.default_exprs,
-                    &plan.rindexes,
-                    &plan.colls,
-                    &plan.col_types,
-                    &stmt_rng,
-                    &plan.provided,
-                    rows,
-                    returning,
-                    bound,
-                    ctx,
-                    &mut meter,
-                )?;
+                let returned = self
+                    .insert_rows(
+                        &plan.table.name,
+                        ins.db.as_deref(),
+                        &plan.table.columns,
+                        &plan.pk,
+                        &plan.checks,
+                        &[],
+                        &plan.default_exprs,
+                        &plan.rindexes,
+                        &plan.colls,
+                        &plan.col_types,
+                        &stmt_rng,
+                        &plan.provided,
+                        rows,
+                        returning,
+                        bound,
+                        ctx,
+                        &mut meter,
+                    )
+                    .map_err(|e| locate_value_slot(rows_in, e))?;
                 (rows_in.len() as i64, returned)
             }
         };
@@ -1400,17 +1393,19 @@ impl Engine {
             ctes: CteCtx::empty(),
             host_batch: None,
         };
-        for values in &rows {
-            let row = self.build_insert_row(
-                columns,
-                col_types,
-                provided,
-                values,
-                default_exprs,
-                rng,
-                meter,
-                &relation,
-            )?;
+        for (r, values) in rows.iter().enumerate() {
+            let row = self
+                .build_insert_row(
+                    columns,
+                    col_types,
+                    provided,
+                    values,
+                    default_exprs,
+                    rng,
+                    meter,
+                    &relation,
+                )
+                .map_err(|e| e.at_row(r))?;
 
             // CHECK constraints, in name order, on the fully-coerced candidate row — after
             // NOT NULL (`build_insert_row` above), before the key/duplicate check (PG's per-row
@@ -1928,10 +1923,7 @@ impl Engine {
                     // §13.4): an ordinary assignment is 428C9; the DEFAULT
                     // form advances the owned sequence through its expression default.
                     if tdef.columns[idx].identity == Some(IdentityKind::Always) && !a.is_default {
-                        return Err(EngineError::new(
-                            SqlState::GeneratedAlways,
-                            format!("column {} can only be updated to DEFAULT", a.column),
-                        ));
+                        return Err(EngineError::generated_always_update(&a.column));
                     }
                     // Assigning a PRIMARY KEY member re-keys the existing row (upsert.md §5), the
                     // standalone UPDATE rule carried onto the conflict path.
@@ -2122,19 +2114,21 @@ impl Engine {
             eval_view_checks(view_checks, row, &env, meter)
         };
 
-        for values in &rows {
+        for (r, values) in rows.iter().enumerate() {
             // Build + coerce the candidate row, then CHECK — the INSERT per-row order
             // (NOT NULL before CHECK before conflict; constraints.md §4.4).
-            let row = self.build_insert_row(
-                columns,
-                &col_types,
-                provided,
-                values,
-                default_exprs,
-                rng,
-                meter,
-                &relation,
-            )?;
+            let row = self
+                .build_insert_row(
+                    columns,
+                    &col_types,
+                    provided,
+                    values,
+                    default_exprs,
+                    rng,
+                    meter,
+                    &relation,
+                )
+                .map_err(|e| e.at_row(r))?;
             self.eval_checks(checks, &row, rng, &relation, meter)?;
 
             match &plan.arbiter {
@@ -2712,7 +2706,13 @@ impl Engine {
                     &col.name,
                     &self.input_zone(),
                 )
-                .map_err(|e| assignment_hint(e.with_table(relation)))?,
+                .map_err(|e| {
+                    let e = assignment_hint(e.with_table(relation));
+                    match provided[i] {
+                        Some(p) => e.at_slot(p),
+                        None => e,
+                    }
+                })?,
             );
         }
         if let Some(i) = null_col {
@@ -3370,6 +3370,18 @@ impl Engine {
     /// so the map is not modified while iterating.
     pub(crate) fn execute_delete(
         &mut self,
+        del: Delete,
+        params: &[Value],
+        ctx: CteCtx,
+    ) -> Result<Outcome> {
+        // The error names the target's database (spec/design/error-fields.md §12).
+        let db = del.db.clone();
+        self.execute_delete_target(del, params, ctx)
+            .map_err(|e| self.stamp_database(db.as_deref(), e))
+    }
+
+    fn execute_delete_target(
+        &mut self,
         mut del: Delete,
         params: &[Value],
         ctx: CteCtx,
@@ -3666,6 +3678,18 @@ impl Engine {
     /// updates every row.
     pub(crate) fn execute_update(
         &mut self,
+        upd: Update,
+        params: &[Value],
+        ctx: CteCtx,
+    ) -> Result<Outcome> {
+        // The error names the target's database (spec/design/error-fields.md §12).
+        let db = upd.db.clone();
+        self.execute_update_target(upd, params, ctx)
+            .map_err(|e| self.stamp_database(db.as_deref(), e))
+    }
+
+    fn execute_update_target(
+        &mut self,
         mut upd: Update,
         params: &[Value],
         ctx: CteCtx,
@@ -3763,10 +3787,7 @@ impl Engine {
             // An ordinary assignment is 428C9; the DEFAULT form below is allowed and advances the
             // owned sequence through its expression default.
             if table.columns[idx].identity == Some(IdentityKind::Always) && !a.is_default {
-                return Err(EngineError::new(
-                    SqlState::GeneratedAlways,
-                    format!("column {} can only be updated to DEFAULT", a.column),
-                ));
+                return Err(EngineError::generated_always_update(&a.column));
             }
             if plans.iter().any(|p| p.idx == idx) {
                 return Err(EngineError::new(
@@ -4416,6 +4437,37 @@ impl Engine {
 /// columns) and every column a VALUES row fills with a top-level `DEFAULT`. `rows` is empty for a
 /// SELECT source, whose projection never yields `DEFAULT`. A row of the wrong arity is skipped here;
 /// the caller reports it.
+/// Point an INSERT VALUES store error at the literal of the slot it came from (spec/design/
+/// error-fields.md §10.2): see [`locate_lit`]. An error from an expression slot, a default, or a
+/// non-VALUES source passes through.
+pub(crate) fn locate_value_slot(rows: &[Vec<InsertValue>], e: EngineError) -> EngineError {
+    match e
+        .slot
+        .and_then(|(r, p)| rows.get(r).and_then(|row| row.get(p)))
+    {
+        Some(iv) => locate_lit(iv, e),
+        None => e,
+    }
+}
+
+/// PostgreSQL coerces a VALUES literal to its column at parse time, so a type mismatch and a
+/// string's input error point at the literal; a length check (22001) and a number's range check
+/// run later and carry no position (spec/design/error-fields.md §10.2).
+pub(crate) fn locate_lit(iv: &InsertValue, e: EngineError) -> EngineError {
+    let InsertValue::Lit(lit, pos) = iv else {
+        return e;
+    };
+    let positioned = e.state == SqlState::DatatypeMismatch
+        || (matches!(lit, Literal::Text(_))
+            && e.code().starts_with("22")
+            && e.state != SqlState::StringDataRightTruncation);
+    if positioned {
+        e.with_position(pos.0)
+    } else {
+        e
+    }
+}
+
 pub(crate) fn insert_default_needs(
     provided: &[Option<usize>],
     rows: &[Vec<InsertValue>],

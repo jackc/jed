@@ -838,12 +838,16 @@ type tmFromChar struct {
 	cc, j, us, yysz, clock, tzsign, tzh, tzm, ff              int32
 }
 
+// fmHint is formatting.c's hint on a fixed-width field the source string cannot fill.
+const fmHint = "If your source string is not fixed-width, try using the \"FM\" modifier."
+
 func (t *tmFromChar) setMode(mode int) error {
 	if mode != fmtModeNone {
 		if t.mode == fmtModeNone {
 			t.mode = mode
 		} else if t.mode != mode {
-			return newError(InvalidDatetimeFormat, "invalid combination of date conventions")
+			return newError(InvalidDatetimeFormat, "invalid combination of date conventions").
+				hinted("Do not mix Gregorian and ISO week date conventions in a formatting template.")
 		}
 	}
 	return nil
@@ -852,7 +856,8 @@ func (t *tmFromChar) setMode(mode int) error {
 // fromCharSetInt is formatting.c's from_char_set_int: a field may be set twice only to one value.
 func fromCharSetInt(dest *int32, value int32, n *fmtNode) error {
 	if *dest != 0 && *dest != value {
-		return newError(InvalidDatetimeFormat, "conflicting values for \""+n.key.name+"\" field in formatting string")
+		return newError(InvalidDatetimeFormat, "conflicting values for \""+n.key.name+"\" field in formatting string").
+			withDetail("This value contradicts a previous setting for the same field type.")
 	}
 	*dest = value
 	return nil
@@ -954,20 +959,26 @@ func (r *dchReader) parseIntLen(dest *int32, ln int, i int) (int, error) {
 		r.pos = e
 	} else {
 		if used < ln {
-			return -1, newError(InvalidDatetimeFormat, "source string too short for \""+n.key.name+"\" formatting field")
+			return -1, newError(InvalidDatetimeFormat, "source string too short for \""+n.key.name+"\" formatting field").
+				withDetail("Field requires " + strconv.Itoa(ln) + " characters, but only " + strconv.Itoa(used) + " remain.").
+				hinted(fmHint)
 		}
 		var last int
 		result, last, erange = cStrtol(cp, 0)
 		if last > 0 && last < ln {
-			return -1, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+n.key.name+"\"")
+			return -1, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+n.key.name+"\"").
+				withDetail("Field requires " + strconv.Itoa(ln) + " characters, but only " + strconv.Itoa(last) + " could be parsed.").
+				hinted(fmHint)
 		}
 		r.pos += last
 	}
 	if r.pos == init {
-		return -1, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+n.key.name+"\"")
+		return -1, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+n.key.name+"\"").
+			withDetail("Value must be an integer.")
 	}
 	if erange || result < math.MinInt32 || result > math.MaxInt32 {
-		return -1, newError(DatetimeFieldOverflow, "value for \""+n.key.name+"\" in source string is out of range")
+		return -1, newError(DatetimeFieldOverflow, "value for \""+n.key.name+"\" in source string is out of range").
+			withDetail("Value must be in the range " + strconv.Itoa(math.MinInt32) + " to " + strconv.Itoa(math.MaxInt32) + ".")
 	}
 	if dest != nil {
 		if err := fromCharSetInt(dest, int32(result), n); err != nil {
@@ -1008,7 +1019,8 @@ func (r *dchReader) seqSearch(words []string, i int) (int, error) {
 				break
 			}
 		}
-		return 0, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+r.nodes[i].key.name+"\"")
+		return 0, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+r.nodes[i].key.name+"\"").
+			withDetail("The given value did not match any of the allowed values for this field.")
 	}
 	r.pos += ln
 	return idx, nil
@@ -1383,7 +1395,8 @@ func toTimestampParts(input, tmpl string) (tm pgTm, fsec int32, fprec int32, has
 	}
 	if tmfc.clock == 12 {
 		if tm.hour < 1 || tm.hour > 12 {
-			err = newError(InvalidDatetimeFormat, "hour \""+strconv.Itoa(int(tm.hour))+"\" is invalid for the 12-hour clock")
+			err = newError(InvalidDatetimeFormat, "hour \""+strconv.Itoa(int(tm.hour))+"\" is invalid for the 12-hour clock").
+				hinted("Use the 24-hour clock, or give an hour between 1 and 12.")
 			return
 		}
 		if tmfc.pm != 0 && tm.hour < 12 {

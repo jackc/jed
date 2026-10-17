@@ -7,7 +7,12 @@
 use jed::{CreateOptions, Database, EngineError, Privilege, PrivilegeSet, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
-    let mut db = Database::create(CreateOptions::default())
+    db_in(CreateOptions::default(), sql)
+}
+
+/// A session over a fresh in-memory database created with `opts`, after running `sql`.
+fn db_in(opts: CreateOptions, sql: &[&str]) -> Session {
+    let mut db = Database::create(opts)
         .unwrap()
         .session(SessionOptions::default());
     for s in sql {
@@ -302,12 +307,16 @@ fn detail_shared_cases() {
 #[derive(Default)]
 struct PositionCase {
     name: String,
+    unicode: bool,
+    attach: Vec<String>,
     setup: Vec<String>,
     run: String,
     script: bool,
     code: String,
     position: Option<u32>,
     hint: Option<String>,
+    detail: Option<String>,
+    database: Option<String>,
 }
 
 fn parse_position_cases(text: &str) -> Vec<PositionCase> {
@@ -326,6 +335,8 @@ fn parse_position_cases(text: &str) -> Vec<PositionCase> {
         let c = cases.last_mut().expect("a directive before the first case");
         if let Some(v) = line.strip_prefix("setup: ") {
             c.setup.push(v.to_string());
+        } else if let Some(v) = line.strip_prefix("attach: ") {
+            c.attach.push(v.to_string());
         } else if let Some(v) = line.strip_prefix("run: ") {
             c.run = v.to_string();
         } else if let Some(v) = line.strip_prefix("script: ") {
@@ -337,6 +348,12 @@ fn parse_position_cases(text: &str) -> Vec<PositionCase> {
             c.position = Some(v.parse().expect("a position number"));
         } else if let Some(v) = line.strip_prefix("hint: ") {
             c.hint = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("detail: ") {
+            c.detail = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("database: ") {
+            c.database = Some(v.to_string());
+        } else if line == "load-unicode" {
+            c.unicode = true;
         } else if line != "no-position" {
             panic!("unknown position_cases directive: {line}");
         }
@@ -344,8 +361,22 @@ fn parse_position_cases(text: &str) -> Vec<PositionCase> {
     cases
 }
 
-/// The `Position` and `Hint` fields (spec/design/error-fields.md §10, §11): every case of the
-/// shared, language-neutral fixture — the same file the Go and TS cores run.
+/// An environment that loaded jed's pinned production Unicode bundle, for a `load-unicode` case.
+fn unicode_environment() -> jed::Environment {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spec/collation/fixtures/unicode.jucd"
+    );
+    let bytes = std::fs::read(path).expect("read unicode.jucd");
+    jed::Environment::builder()
+        .load_unicode_data(&bytes)
+        .expect("load unicode.jucd")
+        .build()
+}
+
+/// The `Position`, `Hint`, `Detail`, and `DatabaseName` fields (spec/design/error-fields.md
+/// §10–§12): every case of the shared, language-neutral fixture — the same file the Go and TS cores
+/// run.
 #[test]
 fn position_hint_shared_cases() {
     let path = concat!(
@@ -355,10 +386,24 @@ fn position_hint_shared_cases() {
     let text = std::fs::read_to_string(path).expect("read position_cases.txt");
     let cases = parse_position_cases(&text);
     assert!(!cases.is_empty());
+    let unicode = unicode_environment();
     let mut failures = Vec::new();
     for c in &cases {
-        let setup: Vec<&str> = c.setup.iter().map(String::as_str).collect();
-        let mut db = db_with(&setup);
+        let mut opts = CreateOptions::default();
+        if c.unicode {
+            opts.environment = unicode.clone();
+        }
+        let handle = Database::create(opts).unwrap();
+        for name in &c.attach {
+            handle
+                .attach(name, jed::AttachSource::memory(), false)
+                .expect("attach");
+        }
+        let mut db = handle.session(SessionOptions::default());
+        for s in &c.setup {
+            db.query_outcome(s, &[])
+                .unwrap_or_else(|e| panic!("{}: setup {s:?}: {}", c.name, e.message));
+        }
         let result = if c.script {
             db.execute_script(&c.run).map(|_| ())
         } else {
@@ -367,17 +412,26 @@ fn position_hint_shared_cases() {
         match result {
             Ok(()) => failures.push(format!("{}: expected {} but succeeded", c.name, c.code)),
             Err(e) => {
-                if e.code() != c.code || e.position != c.position || e.hint != c.hint {
+                if e.code() != c.code
+                    || e.position != c.position
+                    || e.hint != c.hint
+                    || e.detail != c.detail
+                    || e.database_name != c.database
+                {
                     failures.push(format!(
-                        "{}: got {} {:?} {:?} ({}), want {} {:?} {:?}",
+                        "{}: got {} {:?} {:?} {:?} {:?} ({}), want {} {:?} {:?} {:?} {:?}",
                         c.name,
                         e.code(),
                         e.position,
                         e.hint,
+                        e.detail,
+                        e.database_name,
                         e.message,
                         c.code,
                         c.position,
-                        c.hint
+                        c.hint,
+                        c.detail,
+                        c.database
                     ));
                 }
             }

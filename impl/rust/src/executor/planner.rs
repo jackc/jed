@@ -1084,7 +1084,8 @@ impl Engine {
                                         SqlState::UndefinedFunction,
                                         "could not identify an equality operator for type json",
                                     )
-                                    .no_hint());
+                                    .no_hint()
+                                    .with_position(key.location().0));
                                 }
                                 if !group_keys.contains(&idx) {
                                     group_keys.push(idx);
@@ -1105,7 +1106,8 @@ impl Engine {
                                         SqlState::UndefinedFunction,
                                         "could not identify an equality operator for type json",
                                     )
-                                    .no_hint());
+                                    .no_hint()
+                                    .with_position(key.location().0));
                                 }
                                 // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`);
                                 // a bare enclosing-query column key is matched by the column it names,
@@ -1340,12 +1342,12 @@ impl Engine {
             // SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality
             // operator (PG ships no opclass — spec/design/json.md §5), so a json output column under
             // DISTINCT is 42883. jsonb IS distinguishable (its btree equality, §5).
-            if sel.distinct && column_types.iter().any(|t| matches!(t, ResolvedType::Json)) {
-                return Err(EngineError::new(
-                    SqlState::UndefinedFunction,
-                    "could not identify an equality operator for type json",
-                )
-                .no_hint());
+            if sel.distinct
+                && let Some(i) = column_types
+                    .iter()
+                    .position(|t| matches!(t, ResolvedType::Json))
+            {
+                return Err(distinct_json_error(&sel.items, i));
             }
             // Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
             // (spec/design/collation.md §1 "A sort or grouping target").
@@ -1456,6 +1458,8 @@ impl Engine {
             let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(order_by_ref.len());
             let mut order_exprs: Vec<RExpr> = Vec::new();
             for key in order_by_ref {
+                // A key with no ordering operator is reported where it was written (error-fields.md
+                // §10.2).
                 outline(|| -> Result<()> {
                     // Classify the key into a row slot (a column / ordinal-to-column) or a source expression
                     // (a general expression, or an ordinal pointing at a computed projection).
@@ -1715,7 +1719,8 @@ impl Engine {
                         }
                     }
                     Ok(())
-                })?;
+                })
+                .map_err(|e| at_order_key(e, key))?;
             }
             // All specs are now final (an ORDER BY key may have introduced a window function / aggregate /
             // GROUPING()). Recompute `has_window` and rebase every placeholder — in the projections, HAVING,
@@ -2561,6 +2566,42 @@ fn derived_join_group(plan: Option<&QueryPlan>) -> Option<&JoinGroupLayout> {
 fn locate_srf_error(e: EngineError, tref: &TableRef) -> EngineError {
     if e.state == SqlState::UndefinedFunction {
         e.locate(tref.pos.src.0)
+    } else {
+        e
+    }
+}
+
+/// SELECT DISTINCT over a `json` output column `i` (42883), reported at that select item when the
+/// list has no `*` expansion to shift the columns (spec/design/error-fields.md §10.2). Cold and out of
+/// line, so the planner's frame stays within the stack budget (cost.md §7.1).
+#[cold]
+#[inline(never)]
+fn distinct_json_error(items: &SelectItems, i: usize) -> EngineError {
+    let at = match items {
+        SelectItems::Items(items)
+            if !items.iter().any(|it| {
+                matches!(it.expr, Expr::QualifiedStar { .. } | Expr::FieldStar { .. })
+            }) =>
+        {
+            items.get(i).map_or(SrcPos::NONE, |it| it.expr.location())
+        }
+        _ => SrcPos::NONE,
+    };
+    EngineError::new(
+        SqlState::UndefinedFunction,
+        "could not identify an equality operator for type json",
+    )
+    .no_hint()
+    .with_position(at.0)
+}
+
+/// An ORDER BY key's missing ordering operator (42883), reported where the key was written
+/// (spec/design/error-fields.md §10.2); any other error passes through.
+#[cold]
+#[inline(never)]
+fn at_order_key(e: EngineError, key: &OrderKey) -> EngineError {
+    if e.state == SqlState::UndefinedFunction && e.message.starts_with("could not identify") {
+        e.with_position(key.location().0)
     } else {
         e
     }

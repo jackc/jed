@@ -48,9 +48,13 @@ import {
   LATERAL_COLUMN,
   LATERAL_TABLE,
   QUALIFY_COLUMN,
+  RECURSIVE_TERM_COLLATION,
   RECURSIVE_TERM_TYPE,
   TRY_QUALIFIED,
   aliasHint,
+  unreachableColumnDetail,
+  unreachableColumnsDetail,
+  unreachableTableDetail,
 } from "./error_hint.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import {
@@ -101,7 +105,7 @@ import type {
   WithQuery,
 } from "./ast.ts";
 import { cteBodyAsQuery, cteBodyIsDataModifying, forEachGroupExpr } from "./ast.ts";
-import { requireSetopEquality, unifySetopColumn } from "./eval_ops.ts";
+import { outputColumnLocation, requireSetopEquality, unifySetopColumn } from "./eval_ops.ts";
 import type { Value } from "./value.ts";
 import { render, renderFloatPg } from "./value.ts";
 import {
@@ -746,10 +750,12 @@ export class Scope {
     ) {
       return e;
     }
-    let hint: string | undefined;
-    if (code === "42703") hint = this.columnHint(qualifier, name);
-    else if (code === "42P01" && qualifier !== null) hint = this.tableHint(qualifier);
-    return e.withPosition(loc).withHint(hint);
+    let hd: [string | undefined, string | undefined] = [undefined, undefined];
+    if (code === "42703") hd = this.columnHint(qualifier, name);
+    else if (code === "42P01" && qualifier !== null) hd = this.tableHint(qualifier);
+    e.withPosition(loc).withHint(hd[0]);
+    if (e.detail === undefined) e.withDetail(hd[1]);
+    return e;
   }
 
   // hintRelations is the labeled relations this level can see, in the §11.1 walk order: the FROM
@@ -817,10 +823,14 @@ export class Scope {
     return out;
   }
 
-  // columnHint is PostgreSQL's errorMissingColumn hint (spec/design/error-fields.md §11.1, §11.8): a
-  // relation that has the column but cannot be seen from here yields the LATERAL or qualified-name
-  // hint; otherwise the misspelled-column suggestion.
-  private columnHint(qualifier: string | null, name: string): string | undefined {
+  // columnHint is PostgreSQL's errorMissingColumn [hint, detail] (spec/design/error-fields.md §11.1,
+  // §11.8): a relation that has the column but cannot be seen from here yields the "cannot be
+  // referenced" detail and the LATERAL or qualified-name hint; otherwise the misspelled-column
+  // suggestion.
+  private columnHint(
+    qualifier: string | null,
+    name: string,
+  ): [string | undefined, string | undefined] {
     const entries = this.hintWalk();
     const m = new FuzzyColumnMatch(qualifier, name);
     const exact: HintEntry[] = [];
@@ -829,25 +839,28 @@ export class Scope {
       for (const col of e.columns) m.offer(e.label, penalty, col);
       if (penalty === 0 && e.columns.includes(name)) exact.push(e);
     }
-    if (exact.length === 0) return m.hint();
+    if (exact.length === 0) return [m.hint(), undefined];
     if (exact.length === 1) {
       const e = exact[0]!;
-      if (e.lateralOk) return LATERAL_COLUMN;
-      if (qualifier === null && e.qualifiedOnly) return QUALIFY_COLUMN;
-      return undefined;
+      let hint: string | undefined;
+      if (e.lateralOk) hint = LATERAL_COLUMN;
+      else if (qualifier === null && e.qualifiedOnly) hint = QUALIFY_COLUMN;
+      return [hint, unreachableColumnDetail(name, e.label)];
     }
-    return qualifier === null ? TRY_QUALIFIED : undefined;
+    return [qualifier === null ? TRY_QUALIFIED : undefined, unreachableColumnsDetail(name)];
   }
 
-  // tableHint is PostgreSQL's errorMissingRTE hint (spec/design/error-fields.md §11.2, §11.8): the
-  // first relation in the walk labeled `qualifier`, or naming that base table or view. A visible one
-  // under a different label is the table-alias hint; one hidden from a non-LATERAL subquery is the
-  // LATERAL hint.
-  private tableHint(qualifier: string): string | undefined {
+  // tableHint is PostgreSQL's errorMissingRTE [hint, detail] (spec/design/error-fields.md §11.2,
+  // §11.8): the first relation in the walk labeled `qualifier`, or naming that base table or view. A
+  // visible one under a different label is the table-alias hint; any other found relation gets the
+  // "cannot be referenced" detail, plus the LATERAL hint when it is hidden from a non-LATERAL
+  // subquery.
+  private tableHint(qualifier: string): [string | undefined, string | undefined] {
     const e = this.hintWalk().find((h) => h.label === qualifier || h.catalog === qualifier);
-    if (e === undefined) return undefined;
-    if (e.visible) return e.label !== qualifier ? aliasHint(e.label) : undefined;
-    return e.lateralOk ? LATERAL_TABLE : undefined;
+    if (e === undefined) return [undefined, undefined];
+    if (e.visible && e.label !== qualifier) return [aliasHint(e.label), undefined];
+    const hint = !e.visible && e.lateralOk ? LATERAL_TABLE : undefined;
+    return [hint, unreachableTableDetail(e.label)];
   }
 
   // columnAt returns the column at a flat index in THIS scope (index known valid).
@@ -1449,6 +1462,7 @@ export function selectExprs(s: Select): Expr[] {
 // PostgreSQL). Mechanically the would-be UNION unified type must EQUAL the anchor type; any widening
 // of the anchor is the error. An arity mismatch is 42601, like a plain UNION.
 export function checkRecursiveColumnTypes(
+  anchorAst: QueryExpr,
   anchor: QueryPlan,
   recursive: QueryPlan,
   name: string,
@@ -1461,12 +1475,16 @@ export function checkRecursiveColumnTypes(
     throw engineError("syntax_error", "each UNION query must have the same number of columns");
   }
   for (let i = 0; i < a.length; i++) {
+    // PostgreSQL reports a column the recursive term changes at the non-recursive term's column.
+    const atCol = outputColumnLocation(anchorAst, i);
     const unified = unifySetopColumn(a[i]!, r[i]!, "union");
     if (rtName(unified) !== rtName(a[i]!)) {
       throw engineError(
         "datatype_mismatch",
         `recursive query "${name}" column ${i + 1} has type ${rtName(a[i]!)} in non-recursive term but type ${rtName(unified)} overall`,
-      ).hinted(RECURSIVE_TERM_TYPE);
+      )
+        .hinted(RECURSIVE_TERM_TYPE)
+        .withPosition(atCol);
     }
     // The non-recursive term also fixed the column's typmod, so the overall common typmod must
     // equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
@@ -1476,7 +1494,9 @@ export function checkRecursiveColumnTypes(
       throw engineError(
         "datatype_mismatch",
         `recursive query "${name}" column ${i + 1} has type ${typmodTypeName(a[i]!, atMod)} in non-recursive term but type ${typmodTypeName(a[i]!, overallMod)} overall`,
-      ).hinted(RECURSIVE_TERM_TYPE);
+      )
+        .hinted(RECURSIVE_TERM_TYPE)
+        .withPosition(atCol);
     }
     if (!unionAll) requireSetopEquality(a[i]!);
     // The non-recursive term fixed the relation's collation, so the UNION's overall common
@@ -1491,7 +1511,9 @@ export function checkRecursiveColumnTypes(
         throw engineError(
           "collation_mismatch",
           `recursive query "${name}" column ${i + 1} has collation "${nonRec}" in non-recursive term but collation "${all}" overall`,
-        );
+        )
+          .hinted(RECURSIVE_TERM_COLLATION)
+          .withPosition(atCol);
       }
     }
   }

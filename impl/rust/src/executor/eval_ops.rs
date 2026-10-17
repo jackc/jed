@@ -1496,7 +1496,7 @@ pub(crate) fn resolve_container_assign(
         return Ok(RExpr::ConstNull);
     }
     // A bind parameter assigned to a container column takes the column's type (api.md §5).
-    if let Expr::Param(n1) = e {
+    if let Expr::Param(n1, _) = e {
         let ct = resolve_col_type(&col.ty, &scope.catalog.read_snap().types);
         return Ok(resolve_param_node(scope, *n1, Some(ct), col_rt, params)?.0);
     }

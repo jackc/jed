@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -740,6 +741,27 @@ func (db *engine) tempUnpinnedSnap() *snapshot {
 func (db *engine) isTempTable(name string) bool {
 	_, ok := db.tempSnap().table(name)
 	return ok
+}
+
+// stampDatabase stamps DatabaseName on an error a statement targeting qualifier.table raised
+// (spec/design/error-fields.md §12): the database holding the error's TableName — the qualifier when
+// the statement named one, else `temp` for a session-local temporary table and `main` otherwise (a
+// bare name reaches only those two, attached-databases.md §3). An error with no TableName, or one
+// whose database an inner site already named, passes through.
+func (db *engine) stampDatabase(qualifier *string, err error) error {
+	var e *EngineError
+	if !errors.As(err, &e) || e.TableName == "" || e.DatabaseName != "" {
+		return err
+	}
+	switch {
+	case qualifier != nil:
+		e.DatabaseName = *qualifier
+	case db.isTempTable(e.TableName):
+		e.DatabaseName = "temp"
+	default:
+		e.DatabaseName = "main"
+	}
+	return err
 }
 
 // checkTableQualifier validates an optional database qualifier on a table reference against the

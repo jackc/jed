@@ -269,6 +269,10 @@ type positionCase struct {
 	code     string
 	position int32  // 0 = the Position must be absent (`no-position`)
 	hint     string // "" = the Hint must be absent
+	detail   string // "" = the Detail must be absent
+	database string // "" = the DatabaseName must be absent
+	unicode  bool   // `load-unicode`: create the database over the pinned Unicode bundle
+	attach   []string
 }
 
 func parsePositionCases(t *testing.T, text string) []positionCase {
@@ -303,6 +307,14 @@ func parsePositionCases(t *testing.T, text string) []positionCase {
 			c.position = int32(n)
 		} else if v, ok := strings.CutPrefix(line, "hint: "); ok {
 			c.hint = v
+		} else if v, ok := strings.CutPrefix(line, "detail: "); ok {
+			c.detail = v
+		} else if v, ok := strings.CutPrefix(line, "database: "); ok {
+			c.database = v
+		} else if v, ok := strings.CutPrefix(line, "attach: "); ok {
+			c.attach = append(c.attach, v)
+		} else if line == "load-unicode" {
+			c.unicode = true
 		} else if line != "no-position" {
 			t.Fatalf("unknown position_cases directive: %q", line)
 		}
@@ -310,8 +322,8 @@ func parsePositionCases(t *testing.T, text string) []positionCase {
 	return cases
 }
 
-// The Position and Hint fields (spec/design/error-fields.md §10, §11): every case of the shared,
-// language-neutral fixture — the same file the Rust and TS cores run.
+// The Position, Hint, Detail, and DatabaseName fields (spec/design/error-fields.md §10–§12): every
+// case of the shared, language-neutral fixture — the same file the Rust and TS cores run.
 func TestErrorFieldsPositionHintSharedCases(t *testing.T) {
 	text, err := os.ReadFile("../../spec/errors/position_cases.txt")
 	if err != nil {
@@ -323,7 +335,22 @@ func TestErrorFieldsPositionHintSharedCases(t *testing.T) {
 	}
 	var failures []string
 	for _, c := range cases {
-		db := fkSetup(t, c.setup...)
+		var env *Environment
+		if c.unicode {
+			env = testEnv("unicode")
+		}
+		handle := memDBIn(env)
+		for _, name := range c.attach {
+			if err := handle.Attach(name, AttachMemory(), false); err != nil {
+				t.Fatalf("%s: attach %q: %v", c.name, name, err)
+			}
+		}
+		db := handle.Session(SessionOptions{})
+		for _, s := range c.setup {
+			if _, err := queryOutcome(db, s, nil); err != nil {
+				t.Fatalf("%s: setup %q: %v", c.name, s, err)
+			}
+		}
 		if c.script {
 			_, err = db.ExecuteScript(c.run)
 		} else {
@@ -338,9 +365,11 @@ func TestErrorFieldsPositionHintSharedCases(t *testing.T) {
 			failures = append(failures, fmt.Sprintf("%s: non-engine error %v", c.name, err))
 			continue
 		}
-		if e.Code() != c.code || e.Position != c.position || e.Hint != c.hint {
-			failures = append(failures, fmt.Sprintf("%s: got %s %d %q (%s), want %s %d %q",
-				c.name, e.Code(), e.Position, e.Hint, e.Message, c.code, c.position, c.hint))
+		if e.Code() != c.code || e.Position != c.position || e.Hint != c.hint ||
+			e.Detail != c.detail || e.DatabaseName != c.database {
+			failures = append(failures, fmt.Sprintf("%s: got %s %d %q %q %q (%s), want %s %d %q %q %q",
+				c.name, e.Code(), e.Position, e.Hint, e.Detail, e.DatabaseName, e.Message,
+				c.code, c.position, c.hint, c.detail, c.database))
 		}
 	}
 	if len(failures) > 0 {

@@ -51,7 +51,7 @@ fn added_col(k: usize) -> Expr {
 }
 
 fn row_of(cols: &[usize]) -> Expr {
-    Expr::Row(cols.iter().map(|&i| user_col(i)).collect())
+    Expr::Row(cols.iter().map(|&i| user_col(i)).collect(), SrcPos::NONE)
 }
 
 fn int_lit(n: i64) -> Expr {
@@ -101,6 +101,7 @@ impl Engine {
                         type_name: st.canonical_name().to_string(),
                         text: s.clone(),
                         pos: *pos,
+                        type_pos: SrcPos::NONE,
                     };
                 }
             }
@@ -208,21 +209,21 @@ impl Engine {
                 // ROW(0, cols) / ROW(parent.f1 + 1, cols) — the depth, then the columns.
                 let mut first = vec![int_lit(0)];
                 first.extend(cols.iter().map(|&i| user_col(i)));
-                anchor_exprs.push(Expr::Row(first));
+                anchor_exprs.push(Expr::Row(first, SrcPos::NONE));
                 let depth = Expr::FieldAccess {
                     base: Box::new(added_col(k)),
                     field: "f1".to_string(),
                 };
                 let mut next = vec![binary(BinaryOp::Add, depth, int_lit(1))];
                 next.extend(cols.iter().map(|&i| user_col(i)));
-                recursive_exprs.push(Expr::Row(next));
+                recursive_exprs.push(Expr::Row(next, SrcPos::NONE));
             } else {
                 // ARRAY[ROW(cols)] / parent || ARRAY[ROW(cols)] — the path of rows seen.
-                anchor_exprs.push(Expr::Array(vec![row_of(cols)]));
+                anchor_exprs.push(Expr::Array(vec![row_of(cols)], SrcPos::NONE));
                 recursive_exprs.push(binary(
                     BinaryOp::Concat,
                     added_col(k),
-                    Expr::Array(vec![row_of(cols)]),
+                    Expr::Array(vec![row_of(cols)], SrcPos::NONE),
                 ));
             }
         }
@@ -240,10 +241,12 @@ impl Engine {
                     type_name: mark.ty.type_name(),
                     type_mod: None,
                     pos: SrcPos::NONE,
+                    cast_pos: SrcPos::NONE,
+                    type_pos: SrcPos::NONE,
                 }
             };
             anchor_exprs.push(default);
-            anchor_exprs.push(Expr::Array(vec![row_of(cols)]));
+            anchor_exprs.push(Expr::Array(vec![row_of(cols)], SrcPos::NONE));
             // CASE WHEN ROW(cols) = ANY (parent path) THEN value ELSE default END.
             recursive_exprs.push(Expr::Case {
                 operand: None,
@@ -259,11 +262,12 @@ impl Engine {
                 )],
                 els: Some(Box::new(mark.default.clone())),
                 pos: SrcPos::NONE,
+                when_pos: vec![SrcPos::NONE],
             });
             recursive_exprs.push(binary(
                 BinaryOp::Concat,
                 added_col(path_k),
-                Expr::Array(vec![row_of(cols)]),
+                Expr::Array(vec![row_of(cols)], SrcPos::NONE),
             ));
             filter = Some(binary(BinaryOp::Ne, added_col(mark_k), mark.value.clone()));
         }

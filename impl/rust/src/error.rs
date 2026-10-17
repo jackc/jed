@@ -41,6 +41,9 @@ pub struct ErrorFields {
     /// The relation the failing write targeted — set for the class-23 violations
     /// and stamped onto a column-store failure at the DML boundary.
     pub table_name: Option<String>,
+    /// The database holding `table_name` — `main`, `temp`, or a host attachment's name. jed's analog
+    /// of PostgreSQL's `SchemaName`: set whenever `table_name` is (spec/design/error-fields.md §12).
+    pub database_name: Option<String>,
     /// The column at fault — set for 23502 (and 22001 truncation).
     pub column_name: Option<String>,
     /// The data type at fault — set for 22003 / 22001.
@@ -63,6 +66,10 @@ pub struct ErrorFields {
     /// so an enclosing context never adds its default hint (spec/design/error-fields.md §11.7).
     /// Internal bookkeeping, not a field.
     pub(crate) hint_decided: bool,
+    /// The INSERT VALUES slot `(row, value)` whose stored value raised this error, set where the row
+    /// is built so the statement can point the error at the slot's literal (spec/design/
+    /// error-fields.md §10.2). Internal bookkeeping, not a field.
+    pub(crate) slot: Option<(usize, usize)>,
 }
 
 impl std::ops::Deref for EngineError {
@@ -85,12 +92,17 @@ impl fmt::Debug for EngineError {
 }
 
 impl EngineError {
+    // Out of line and cold: the field block is built in this frame, not in every caller's, so the
+    // recursive resolve/eval frames stay within the MAX_EXPR_DEPTH stack budget (cost.md §7.1).
+    #[cold]
+    #[inline(never)]
     pub fn new(state: SqlState, message: impl Into<String>) -> Self {
         EngineError(Box::new(ErrorFields {
             state,
             message: message.into(),
             constraint_name: None,
             table_name: None,
+            database_name: None,
             column_name: None,
             data_type_name: None,
             detail: None,
@@ -98,6 +110,7 @@ impl EngineError {
             hint: None,
             located: false,
             hint_decided: false,
+            slot: None,
         }))
     }
 
@@ -124,6 +137,16 @@ impl EngineError {
     #[must_use]
     pub(crate) fn with_table(mut self, name: impl Into<String>) -> Self {
         self.table_name = Some(name.into());
+        self
+    }
+
+    /// Stamp `DatabaseName` with the database holding the error's table (spec/design/error-fields.md
+    /// §12): set only when `TableName` is set and no inner site already named the database.
+    #[must_use]
+    pub(crate) fn with_database(mut self, database: &str) -> Self {
+        if self.table_name.is_some() && self.database_name.is_none() {
+            self.database_name = Some(database.to_string());
+        }
         self
     }
 
@@ -179,6 +202,24 @@ impl EngineError {
     pub(crate) fn shift_position(mut self, chars: u32) -> Self {
         if let Some(p) = self.position {
             self.position = Some(p + chars);
+        }
+        self
+    }
+
+    /// Record the VALUES slot `value` (of row 0) a row-building error came from (§10.2).
+    #[must_use]
+    pub(crate) fn at_slot(mut self, value: usize) -> Self {
+        if self.slot.is_none() {
+            self.slot = Some((0, value));
+        }
+        self
+    }
+
+    /// Move a recorded slot to VALUES row `row` (§10.2).
+    #[must_use]
+    pub(crate) fn at_row(mut self, row: usize) -> Self {
+        if let Some((_, v)) = self.slot {
+            self.slot = Some((row, v));
         }
         self
     }
@@ -297,6 +338,28 @@ impl EngineError {
         .with_constraint(constraint)
     }
 
+    /// 428C9 — an INSERT supplies a non-DEFAULT value to GENERATED ALWAYS identity `column` without
+    /// `OVERRIDING SYSTEM VALUE`, with PostgreSQL's Detail and Hint (error-fields.md §11.9).
+    pub(crate) fn generated_always_insert(column: &str) -> Self {
+        EngineError::new(
+            SqlState::GeneratedAlways,
+            format!("cannot insert a non-DEFAULT value into column {column}"),
+        )
+        .with_detail(Some(identity_always_detail(column)))
+        .hinted("Use OVERRIDING SYSTEM VALUE to override.")
+    }
+
+    /// 428C9 — an UPDATE assigns GENERATED ALWAYS identity `column` a value other than DEFAULT, with
+    /// PostgreSQL's Detail (error-fields.md §11.9).
+    pub(crate) fn generated_always_update(column: &str) -> Self {
+        EngineError::new(
+            SqlState::GeneratedAlways,
+            format!("column {column} can only be updated to DEFAULT"),
+        )
+        .with_detail(Some(identity_always_detail(column)))
+        .no_hint()
+    }
+
     /// 23502 — a NULL into NOT NULL `column`. The table is stamped at the DML boundary
     /// (`with_table`), where the relation name is in scope.
     pub(crate) fn not_null_violation(column: &str) -> Self {
@@ -306,6 +369,11 @@ impl EngineError {
         )
         .with_column(column)
     }
+}
+
+/// PostgreSQL's 428C9 Detail for a GENERATED ALWAYS identity column (`rewriteHandler.c`).
+fn identity_always_detail(column: &str) -> String {
+    format!("Column \"{column}\" is an identity column defined as GENERATED ALWAYS.")
 }
 
 impl fmt::Display for EngineError {

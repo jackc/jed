@@ -584,7 +584,7 @@ pub(crate) fn resolve_array_text_func(
     for (i, a) in args.iter().enumerate() {
         if i == 0 && to_string {
             // An untyped operand (a bare string literal or `$N`) cannot bind the polymorphic type.
-            if matches!(a, Expr::Literal(Literal::Text(_), _) | Expr::Param(_)) {
+            if matches!(a, Expr::Literal(Literal::Text(_), _) | Expr::Param(_, _)) {
                 return Err(untyped_array_operand());
             }
             let (r, t) = resolve(scope, a, None, agg, params)?;
@@ -1091,7 +1091,7 @@ fn adopt_scalar_overload(
         let Some(st) = family_param_type(desc.arg_families[i]) else {
             continue;
         };
-        if literal || matches!(args[i], Expr::Param(_)) {
+        if literal || matches!(args[i], Expr::Param(_, _)) {
             let (r, rt) = resolve(scope, &args[i], Some(st), agg, params)?;
             rargs[i] = r;
             *t = rt;
@@ -1601,7 +1601,7 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
         // output column after the selected field). Any other expression takes `?column?`.
         Expr::FuncCall { name, .. } => name.to_string(),
         // The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
-        Expr::Coalesce(_) => "coalesce".to_string(),
+        Expr::Coalesce(_, _) => "coalesce".to_string(),
         // The fixed keyword lowercased (PG; grammar.md §52).
         Expr::GreatestLeast { greatest, .. } => {
             if *greatest { "greatest" } else { "least" }.to_string()
@@ -1831,7 +1831,7 @@ pub(crate) fn adopt_container_param(
     other: &ResolvedType,
     params: &mut ParamTypes,
 ) -> Result<Option<(RExpr, ResolvedType)>> {
-    let Expr::Param(n1) = e else {
+    let Expr::Param(n1, _) = e else {
         return Ok(None);
     };
     let Some(ct) = container_param_type(scope, other) else {
@@ -3280,8 +3280,8 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
-        | Expr::Param(_) => false,
-        Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_calls_seq_mutator),
+        | Expr::Param(_, _) => false,
+        Expr::Row(es, _) | Expr::Array(es, _) => es.iter().any(expr_calls_seq_mutator),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_calls_seq_mutator(base),
         Expr::QualifiedStar { .. } => false,
         Expr::Subscript { base, subscripts } => {
@@ -3338,11 +3338,11 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
                     .any(|(c, r)| expr_calls_seq_mutator(c) || expr_calls_seq_mutator(r))
                 || els.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
         }
-        Expr::Coalesce(args) => args.iter().any(expr_calls_seq_mutator),
+        Expr::Coalesce(args, _) => args.iter().any(expr_calls_seq_mutator),
         Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(expr_calls_seq_mutator)
         }
-        Expr::ScalarSubquery(q) | Expr::Exists(q) => query_calls_seq_mutator(q),
+        Expr::ScalarSubquery(q, _) | Expr::Exists(q, _) => query_calls_seq_mutator(q),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             expr_calls_seq_mutator(lhs) || query_calls_seq_mutator(query)
         }
@@ -3734,8 +3734,8 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
-        | Expr::Param(_) => {}
-        Expr::Row(es) | Expr::Array(es) => {
+        | Expr::Param(_, _) => {}
+        Expr::Row(es, _) | Expr::Array(es, _) => {
             for x in es {
                 collect_expr_privs(x, req, locals);
             }
@@ -3819,7 +3819,7 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
                 collect_expr_privs(x, req, locals);
             }
         }
-        Expr::Coalesce(args) => {
+        Expr::Coalesce(args, _) => {
             for a in args {
                 collect_expr_privs(a, req, locals);
             }
@@ -3829,7 +3829,7 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
                 collect_expr_privs(a, req, locals);
             }
         }
-        Expr::ScalarSubquery(q) | Expr::Exists(q) => collect_query_privs(q, req, locals),
+        Expr::ScalarSubquery(q, _) | Expr::Exists(q, _) => collect_query_privs(q, req, locals),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             collect_expr_privs(lhs, req, locals);
             collect_query_privs(query, req, locals);
@@ -3848,9 +3848,9 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
 pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
     match e {
         Expr::Column(_, _) | Expr::QualifiedColumn { .. } => true,
-        Expr::ScalarSubquery(_) | Expr::Exists(_) => true,
-        Expr::Literal(_, _) | Expr::TypedLiteral { .. } | Expr::Param(_) => false,
-        Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_reads_columns),
+        Expr::ScalarSubquery(_, _) | Expr::Exists(_, _) => true,
+        Expr::Literal(_, _) | Expr::TypedLiteral { .. } | Expr::Param(_, _) => false,
+        Expr::Row(es, _) | Expr::Array(es, _) => es.iter().any(expr_reads_columns),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_reads_columns(base),
         // `t.*` reads the relation's columns (e.g. `RETURNING t.*`).
         Expr::QualifiedStar { .. } => true,
@@ -3907,7 +3907,7 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
                     .any(|(c, r)| expr_reads_columns(c) || expr_reads_columns(r))
                 || els.as_ref().is_some_and(|x| expr_reads_columns(x))
         }
-        Expr::Coalesce(args) => args.iter().any(expr_reads_columns),
+        Expr::Coalesce(args, _) => args.iter().any(expr_reads_columns),
         Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             args.iter().any(expr_reads_columns)
         }
@@ -4152,7 +4152,7 @@ fn plan_membership_subquery(
     inner: &QueryExpr,
     params: &mut ParamTypes,
 ) -> Result<(QueryPlan, ResolvedType, bool)> {
-    if let Expr::Row(items) = lhs {
+    if let Expr::Row(items, _) = lhs {
         let (plan, ty) = plan_row_subquery(scope, inner, items.len(), params)?;
         return Ok((plan, ty, true));
     }
@@ -4260,8 +4260,8 @@ impl FirstPass {
 pub(crate) fn hint_sensitive(e: &Expr) -> bool {
     match e {
         Expr::Literal(Literal::Int(_) | Literal::Decimal(_) | Literal::Text(_), _)
-        | Expr::Param(_) => true,
-        Expr::Array(items) => items.iter().any(hint_sensitive),
+        | Expr::Param(_, _) => true,
+        Expr::Array(items, _) => items.iter().any(hint_sensitive),
         Expr::Collate { inner, .. } => hint_sensitive(inner),
         Expr::Unary {
             op: UnaryOp::Neg,
@@ -4298,7 +4298,7 @@ fn resolve_first_node(
         });
     }
     match e {
-        Expr::Array(items) => {
+        Expr::Array(items, _) => {
             let mut nodes = Vec::with_capacity(items.len());
             let mut elem_types = Vec::with_capacity(items.len());
             let mut shapes = Vec::with_capacity(items.len());
@@ -4375,7 +4375,7 @@ fn re_resolve_node(
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     match (e, first.shape, first.node) {
-        (Expr::Array(items), Shape::Array(shapes), RExpr::Array { elems, .. }) => {
+        (Expr::Array(items, _), Shape::Array(shapes), RExpr::Array { elems, .. }) => {
             let mut nodes = Vec::with_capacity(items.len());
             let mut elem_types = Vec::with_capacity(items.len());
             for ((it, node), (ty, shape)) in items.iter().zip(elems).zip(shapes) {
@@ -4573,6 +4573,16 @@ fn locate_node_error(err: EngineError, e: &Expr) -> EngineError {
         // input-converted here, like PostgreSQL's parse-time coercion of an unknown literal: any
         // input error points at the literal.
         Expr::Literal(Literal::Text(_), pos) => *pos,
+        // A cast's unknown target type points at the type name; a cast with no conversion for its
+        // operand type at the `::` / `CAST` token (PostgreSQL's 42846, jed's 42804).
+        Expr::Cast { type_pos, .. } | Expr::TypedLiteral { type_pos, .. }
+            if err.state == SqlState::UndefinedObject =>
+        {
+            *type_pos
+        }
+        Expr::Cast { cast_pos, .. } if err.state == SqlState::DatatypeMismatch => *cast_pos,
+        // EXTRACT is PostgreSQL's `extract(…)` function: a source type with none is its lookup failure.
+        Expr::Extract { pos, .. } if err.state == SqlState::UndefinedFunction => *pos,
         _ => SrcPos::NONE,
     };
     // The operator's own type error — not one an operand decided, nor one positioned inside a
@@ -4613,7 +4623,7 @@ fn resolve_node(
         // context (its natural type), producing an ANONYMOUS composite (`name = None`, fields named
         // `f1, f2, …` per PG). Storing it into a named composite column matches structurally
         // (assignability at the store site coerces each field to the target's declared type).
-        Expr::Row(items) => outline(|| {
+        Expr::Row(items, _) => outline(|| {
             let mut nodes = Vec::with_capacity(items.len());
             let mut fields = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
@@ -4629,7 +4639,7 @@ fn resolve_node(
         // An `ARRAY[…]` constructor (spec/design/array.md §1): resolve each element (natural type),
         // unify to a common element type, and build a `RExpr::Array`. A bare empty `ARRAY[]` has no
         // element type to infer — use `'{}'::T[]` instead (the cast supplies the element type).
-        Expr::Array(items) => outline(|| {
+        Expr::Array(items, _) => outline(|| {
             if items.is_empty() {
                 return Err(type_error(
                     "cannot determine the element type of an empty ARRAY[]; write '{}'::T[]"
@@ -4743,7 +4753,7 @@ fn resolve_node(
             SqlState::SyntaxError,
             "t.* is only allowed in a select list",
         )),
-        Expr::Param(n1) => outline(|| {
+        Expr::Param(n1, _) => outline(|| {
             // A bind parameter is an adaptable operand (like an integer/string literal): it
             // takes its type from `ctx` — the sibling operand, target column, or CAST target.
             // Record the inferred type (None = no context here; `finalize` 42P18s a parameter
@@ -5023,6 +5033,7 @@ fn resolve_node(
             type_name,
             text,
             pos,
+            ..
         } => outline(|| {
             // A composite type name (`addr '(Main,90210)'`) coerces the string via `record_in`
             // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
@@ -5059,7 +5070,7 @@ fn resolve_node(
         // `plan_subquery` rejects a non-SELECT context and a `$N` inside (both 0A000). The fold
         // pass folds an uncorrelated one to a constant; a correlated one (an OuterColumn in its
         // plan) is re-executed per outer row by the evaluator.
-        Expr::ScalarSubquery(inner) => outline(|| {
+        Expr::ScalarSubquery(inner, _) => outline(|| {
             let plan = plan_subquery(scope, inner, params)?;
             if plan.column_types().len() != 1 {
                 return Err(EngineError::new(
@@ -5086,7 +5097,7 @@ fn resolve_node(
                 out_type,
             ))
         }),
-        Expr::Exists(inner) => outline(|| {
+        Expr::Exists(inner, _) => outline(|| {
             // EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
             // EXISTS parses as the unary `NOT` wrapping this, so `negated` here is always false.
             let plan = plan_subquery(scope, inner, params)?;
@@ -5146,7 +5157,7 @@ fn resolve_node(
         // validated at RESOLVE (not per row): an unsupported field for the source type is `0A000`, an
         // unrecognized field is `22023` — surfaced by probing the kernel with a zero value of the
         // source's family. The source must be a datetime type (else `42883`); the result is `numeric`.
-        Expr::Extract { field, source } => outline(|| {
+        Expr::Extract { field, source, .. } => outline(|| {
             use crate::datetime_fn::{ExtractSrc, extract_field};
             let (src_r, src_t) = resolve(scope, source, None, agg, params)?;
             // A NULL source has no resolvable family; the value propagates to NULL at eval (the field
@@ -5237,7 +5248,7 @@ fn resolve_node(
                     return Ok((RExpr::ConstNull, ResolvedType::Array(Box::new(elem_rt))));
                 }
                 // A bind parameter cast to an array type takes that type (api.md §5).
-                if let Expr::Param(n1) = inner.as_ref() {
+                if let Expr::Param(n1, _) = inner.as_ref() {
                     return resolve_param_node(
                         scope,
                         *n1,
@@ -5323,7 +5334,7 @@ fn resolve_node(
                     return Ok((RExpr::ConstNull, ResolvedType::Range(Box::new(elem_rt))));
                 }
                 // A bind parameter cast to a range type takes that type (api.md §5).
-                if let Expr::Param(n1) = inner.as_ref() {
+                if let Expr::Param(n1, _) = inner.as_ref() {
                     let elem = ColType::Scalar(crate::range::element_scalar(desc));
                     return resolve_param_node(
                         scope,
@@ -5360,7 +5371,7 @@ fn resolve_node(
                 }
                 let ct_name = ct.name.clone();
                 // A bind parameter cast to a composite type takes that type (api.md §5).
-                if let Expr::Param(n1) = inner.as_ref() {
+                if let Expr::Param(n1, _) = inner.as_ref() {
                     let cty = Type::Composite(crate::types::CompositeRef { name: ct_name });
                     let col = resolve_col_type(&cty, &scope.catalog.read_snap().types);
                     let rt = resolved_type_of_col(&cty, scope.catalog);
@@ -5413,7 +5424,7 @@ fn resolve_node(
             // `text`-literal operands and bind params are handled above / just below. A `NULL`
             // operand adapts to the target.
             if target.is_timestamp() || target.is_timestamptz() || target.is_date() {
-                if matches!(inner.as_ref(), Expr::Param(_)) {
+                if matches!(inner.as_ref(), Expr::Param(_, _)) {
                     // `$1::timestamp` declares the parameter as the target type (the cast-target
                     // parameter-typing case, api.md §5), exactly like the generic path below.
                     let (rinner, _) = resolve(scope, inner, Some(target), agg, params)?;
@@ -5467,7 +5478,7 @@ fn resolve_node(
             // + canonicalizes; json → jsonb re-parses + canonicalizes; jsonb → json renders the
             // canonical text; same-type is the identity. Any other source is a 42846 cast error.
             if target.is_json() || target.is_jsonb() {
-                if matches!(inner.as_ref(), Expr::Param(_)) {
+                if matches!(inner.as_ref(), Expr::Param(_, _)) {
                     let (rinner, _) = resolve(scope, inner, Some(target), agg, params)?;
                     return Ok((rinner, resolved_type_of(target)));
                 }
@@ -5500,7 +5511,7 @@ fn resolve_node(
             // rendered text (types.md §15). `$1::text` declares the parameter as text, like every
             // other cast target (api.md §5). Composite and range sources stay 0A000.
             if target.is_text() {
-                let (rinner, ity) = if matches!(inner.as_ref(), Expr::Param(_)) {
+                let (rinner, ity) = if matches!(inner.as_ref(), Expr::Param(_, _)) {
                     resolve(scope, inner, Some(ScalarType::Text), agg, params)?
                 } else {
                     resolve(scope, inner, None, agg, params)?
@@ -5518,7 +5529,7 @@ fn resolve_node(
             // A string LITERAL was coerced above; a NULL adapts; a bytea operand is the identity. Any
             // other source is a forbidden pair (42804).
             if target.is_bytea() {
-                if matches!(inner.as_ref(), Expr::Param(_)) {
+                if matches!(inner.as_ref(), Expr::Param(_, _)) {
                     let (rinner, _) = resolve(scope, inner, Some(ScalarType::Bytea), agg, params)?;
                     return Ok((rinner, ResolvedType::Bytea));
                 }
@@ -5547,7 +5558,7 @@ fn resolve_node(
             // string LITERAL operand was already coerced above (the §6 adaptation); `$1::uuid`
             // declares the param as uuid; a NULL adapts; a uuid operand is the identity.
             if target.is_uuid() {
-                if matches!(inner.as_ref(), Expr::Param(_)) {
+                if matches!(inner.as_ref(), Expr::Param(_, _)) {
                     let (rinner, _) = resolve(scope, inner, Some(ScalarType::Uuid), agg, params)?;
                     return Ok((rinner, ResolvedType::Uuid));
                 }
@@ -5576,7 +5587,7 @@ fn resolve_node(
             // expression). An interval operand is the identity; `$1::interval` declares the param as
             // interval; a NULL adapts. Any other source is a forbidden pair (42804).
             if target.is_interval() {
-                if matches!(inner.as_ref(), Expr::Param(_)) {
+                if matches!(inner.as_ref(), Expr::Param(_, _)) {
                     let (rinner, _) =
                         resolve(scope, inner, Some(ScalarType::Interval), agg, params)?;
                     return Ok((rinner, ResolvedType::Interval));
@@ -5610,7 +5621,7 @@ fn resolve_node(
             // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
             // context — its value is range-checked / coerced against `target` at eval — so changing
             // the context only for a parameter leaves all existing CAST behavior untouched.
-            let inner_ctx = if matches!(inner.as_ref(), Expr::Param(_)) {
+            let inner_ctx = if matches!(inner.as_ref(), Expr::Param(_, _)) {
                 Some(target)
             } else if target.is_bool() {
                 // A boolean TARGET accepts only an i32 source (the boolean cast slice). An untyped
@@ -5845,6 +5856,7 @@ fn resolve_node(
         Expr::JsonCtor {
             operand,
             unique_keys,
+            ..
         } => outline(|| {
             // JSON(text) parses a character string to a `json` value (verbatim). The operand must be
             // text (a bare string literal stays text); a non-text operand → 42804.
@@ -5871,6 +5883,7 @@ fn resolve_node(
             path,
             passing,
             on_error,
+            ..
         } => resolve_json_sql_fn(
             scope,
             JsonSqlKind::Exists,
@@ -5897,6 +5910,7 @@ fn resolve_node(
             returning,
             on_empty,
             on_error,
+            ..
         } => resolve_json_sql_fn(
             scope,
             JsonSqlKind::Value,
@@ -5920,6 +5934,7 @@ fn resolve_node(
             keep_quotes,
             on_empty,
             on_error,
+            ..
         } => resolve_json_sql_fn(
             scope,
             JsonSqlKind::Query,
@@ -6152,6 +6167,7 @@ fn resolve_node(
             operand,
             whens,
             els,
+            when_pos,
             ..
         } => outline(|| {
             // Resolve each branch's condition: searched form requires a boolean WHEN (42804
@@ -6160,11 +6176,12 @@ fn resolve_node(
             // operand is evaluated once per tested branch (the desugar model, like IN).
             let mut arms: Vec<(RExpr, RExpr)> = Vec::with_capacity(whens.len());
             let mut result_types: Vec<ResolvedType> = Vec::with_capacity(whens.len() + 1);
-            for (cond, res) in whens {
+            for (i, (cond, res)) in whens.iter().enumerate() {
                 let rcond = match operand {
                     Some(op) => {
-                        let eq =
-                            binary_expr(BinaryOp::Eq, (**op).clone(), cond.clone(), SrcPos::NONE);
+                        // The comparison is reported at its WHEN keyword (error-fields.md §10.2).
+                        let at = when_pos.get(i).copied().unwrap_or(SrcPos::NONE);
+                        let eq = binary_expr(BinaryOp::Eq, (**op).clone(), cond.clone(), at);
                         resolve(scope, &eq, None, agg, params)?.0
                     }
                     None => {
@@ -6209,12 +6226,12 @@ fn resolve_node(
             // before statement-wide parameter finalization (api.md §5, grammar.md §23).
             let hint = scalar_for_param_hint(&unified);
             for (_, result) in whens {
-                if let Expr::Param(n) = result {
+                if let Expr::Param(n, _) = result {
                     params.note((*n as usize) - 1, hint)?;
                 }
             }
             if let Some(result) = els {
-                if let Expr::Param(n) = &**result {
+                if let Expr::Param(n, _) = &**result {
                     params.note((*n as usize) - 1, hint)?;
                 }
             }
@@ -6227,7 +6244,7 @@ fn resolve_node(
                 unified,
             ))
         }),
-        Expr::Coalesce(args) => outline(|| {
+        Expr::Coalesce(args, _) => outline(|| {
             // COALESCE(a, b, …) (grammar.md §51): each argument resolves in the same agg context
             // (an aggregate argument is legal wherever an aggregate is), and the argument types
             // unify to one common type exactly like CASE's result arms.
@@ -6258,7 +6275,7 @@ fn resolve_node(
             // initially resolved without sibling context, so record the derived type now.
             let hint = scalar_for_param_hint(&unified);
             for a in args {
-                if let Expr::Param(n) = a {
+                if let Expr::Param(n, _) = a {
                     params.note((*n as usize) - 1, hint)?;
                 }
             }
@@ -6270,7 +6287,7 @@ fn resolve_node(
                 unified,
             ))
         }),
-        Expr::GreatestLeast { args, greatest } => outline(|| {
+        Expr::GreatestLeast { args, greatest, .. } => outline(|| {
             // GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg
             // context, and the argument types unify by CASE's rule (`unify_case_types`). The
             // winner is chosen by the unified type's total order at eval, so — unlike
@@ -6301,7 +6318,7 @@ fn resolve_node(
             // A bare parameter takes the unified scalar type (like CASE/COALESCE — grammar.md §42).
             let hint = scalar_for_param_hint(&unified);
             for a in args {
-                if let Expr::Param(n) = a {
+                if let Expr::Param(n, _) = a {
                     params.note((*n as usize) - 1, hint)?;
                 }
             }
@@ -6478,10 +6495,10 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
         }
         // `ARRAY[e1, …]` combines its elements, like a function's arguments (collation.md §1 "A
         // text[] carries its elements' collation").
-        Expr::Array(items) => combine_derivs(scope, items)?,
+        Expr::Array(items, _) => combine_derivs(scope, items)?,
         // A subscript or slice carries its array's collation (the subscripts are integers).
         Expr::Subscript { base, .. } => combine_deriv(Deriv::None, derive_collation(scope, base)?)?,
-        Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
+        Expr::Coalesce(args, _) | Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
             combine_derivs(scope, args)?
         }
         // An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
@@ -6503,7 +6520,7 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             None => Deriv::None,
         },
         // A scalar subquery: its output column's collation, recorded when `resolve` planned it.
-        Expr::ScalarSubquery(q) => {
+        Expr::ScalarSubquery(q, _) => {
             let key: *const QueryExpr = q.as_ref();
             scope
                 .subquery_derivs
@@ -6617,14 +6634,14 @@ pub(crate) fn derive_typmod(scope: &Scope, e: &Expr) -> Typmod {
                 .chain(whens.iter().map(|(_, r)| r))
                 .map(|x| derive_typmod(scope, x)),
         ),
-        Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } => {
+        Expr::Coalesce(args, _) | Expr::GreatestLeast { args, .. } => {
             common_typmod(args.iter().map(|a| derive_typmod(scope, a)))
         }
         // NULLIF returns its first argument, so it keeps that argument's typmod (PostgreSQL's
         // exprTypmod); an integer `a` widened to decimal has none, as integers carry none.
         Expr::NullIf { args, .. } => derive_typmod(scope, &args[0]),
         // A scalar subquery: its output column's typmod, recorded when `resolve` planned it.
-        Expr::ScalarSubquery(q) => {
+        Expr::ScalarSubquery(q, _) => {
             let key: *const QueryExpr = q.as_ref();
             scope
                 .subquery_derivs
@@ -6744,7 +6761,8 @@ pub(crate) fn reject_indeterminate_target(d: &Deriv) -> Result<()> {
         return Err(EngineError::new(
             SqlState::CollationMismatch,
             "collation mismatch between implicit collations",
-        ));
+        )
+        .hinted(error_hint::COLLATION_IMPLICIT_MISMATCH));
     }
     Ok(())
 }
@@ -6801,7 +6819,8 @@ pub(crate) fn common_collation(inputs: &[Deriv], none_ok: bool) -> Result<Deriv>
                 }
                 _ => "collation mismatch between implicit collations".to_string(),
             };
-            return Err(EngineError::new(SqlState::CollationMismatch, msg));
+            return Err(EngineError::new(SqlState::CollationMismatch, msg)
+                .hinted(error_hint::COLLATION_IMPLICIT_MISMATCH));
         }
         other => other,
     })
@@ -6852,7 +6871,8 @@ pub(crate) fn combine_deriv(a: Deriv, b: Deriv) -> Result<Deriv> {
                 return Err(EngineError::new(
                     SqlState::CollationMismatch,
                     format!("collation mismatch between explicit collations \"{x}\" and \"{y}\""),
-                ));
+                )
+                .no_hint());
             }
             Explicit(x)
         }
@@ -6883,7 +6903,8 @@ pub(crate) fn resolve_deriv(
         Deriv::Indeterminate | Deriv::Conflicted => Err(EngineError::new(
             SqlState::IndeterminateCollation,
             "could not determine which collation to use for string comparison",
-        )),
+        )
+        .hinted(error_hint::INDETERMINATE_COLLATION)),
     }
 }
 

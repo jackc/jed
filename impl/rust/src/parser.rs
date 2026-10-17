@@ -1042,6 +1042,7 @@ impl Parser {
     /// (the MAX_EXPR_DEPTH native-stack bound, cost.md §7).
     #[inline(never)]
     fn parse_json_query_function(&mut self, kw: &str) -> Result<Expr> {
+        let pos = self.here();
         self.advance(); // the function keyword
         self.advance(); // (
         let ctx = self.parse_expr()?;
@@ -1059,6 +1060,7 @@ impl Parser {
                     path: Box::new(path),
                     passing,
                     on_error,
+                    pos,
                 }
             }
             "json_value" => {
@@ -1071,6 +1073,7 @@ impl Parser {
                     returning,
                     on_empty,
                     on_error,
+                    pos,
                 }
             }
             _ => {
@@ -1086,6 +1089,7 @@ impl Parser {
                     keep_quotes,
                     on_empty,
                     on_error,
+                    pos,
                 }
             }
         };
@@ -1507,6 +1511,7 @@ impl Parser {
         foreign_keys: &mut Vec<ForeignKeyDef>,
     ) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
+        let type_pos = self.here();
         let base_type = self.expect_type_name()?;
         let type_mod = self.parse_type_mod()?;
         let is_array = self.consume_array_brackets()?;
@@ -1650,6 +1655,7 @@ impl Parser {
         Ok(ColumnDef {
             name,
             type_name,
+            type_pos,
             type_mod,
             primary_key,
             not_null,
@@ -3309,7 +3315,8 @@ impl Parser {
             self.advance();
             Ok(InsertValue::Param(n))
         } else {
-            Ok(InsertValue::Lit(self.parse_literal()?))
+            let pos = self.here();
+            Ok(InsertValue::Lit(self.parse_literal()?, pos))
         }
     }
 
@@ -4858,8 +4865,8 @@ impl Parser {
             nulls_first,
         };
         match expr {
-            Expr::Literal(Literal::Int(n), _) if allow_ordinal => {
-                mk(Some(n), None, None, String::new(), SrcPos::NONE, collation)
+            Expr::Literal(Literal::Int(n), pos) if allow_ordinal => {
+                mk(Some(n), None, None, String::new(), pos, collation)
             }
             Expr::Column(name, pos) => mk(None, None, None, name, pos, collation),
             Expr::QualifiedColumn {
@@ -5956,7 +5963,9 @@ impl Parser {
                     field_accessible = false;
                 }
                 Token::DoubleColon => {
+                    let cast_pos = self.here();
                     self.advance();
+                    let type_pos = self.here();
                     let base_type = self.expect_type_name()?;
                     let type_mod = self.parse_type_mod()?;
                     let is_array = self.consume_array_brackets()?;
@@ -5970,6 +5979,8 @@ impl Parser {
                         type_name,
                         type_mod,
                         pos: SrcPos::NONE,
+                        cast_pos,
+                        type_pos,
                     };
                     field_accessible = false;
                 }
@@ -6059,6 +6070,7 @@ impl Parser {
         }
         if matches!(self.peek(), Token::LParen) {
             return outline(|| {
+                let paren_pos = self.here();
                 self.advance();
                 // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
                 // `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise this is a
@@ -6066,7 +6078,7 @@ impl Parser {
                 if self.at_subquery_start() {
                     let q = self.parse_subquery()?;
                     self.expect(&Token::RParen)?;
-                    return Ok(Expr::ScalarSubquery(Box::new(q)));
+                    return Ok(Expr::ScalarSubquery(Box::new(q), paren_pos));
                 }
                 let e = self.parse_expr()?;
                 // `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
@@ -6080,7 +6092,7 @@ impl Parser {
                     }
                     self.expect(&Token::RParen)?;
                     self.bare_row_end = self.pos;
-                    return Ok(Expr::Row(fields));
+                    return Ok(Expr::Row(fields, paren_pos));
                 }
                 self.expect(&Token::RParen)?;
                 return Ok(e);
@@ -6094,11 +6106,12 @@ impl Parser {
             && self.is_query_start_at(self.pos + 2)
         {
             return outline(|| {
+                let pos = self.here();
                 self.advance(); // EXISTS
                 self.expect(&Token::LParen)?;
                 let q = self.parse_subquery()?;
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::Exists(Box::new(q)));
+                return Ok(Expr::Exists(Box::new(q), pos));
             });
         }
         if self.peek_keyword().as_deref() == Some("cast") {
@@ -6108,6 +6121,7 @@ impl Parser {
                 self.expect(&Token::LParen)?;
                 let inner = self.parse_expr()?;
                 self.expect_keyword("as")?;
+                let type_pos = self.here();
                 let base_type = self.expect_type_name()?;
                 let type_mod = self.parse_type_mod()?;
                 let is_array = self.consume_array_brackets()?;
@@ -6122,6 +6136,8 @@ impl Parser {
                     type_name,
                     type_mod,
                     pos: cast_pos,
+                    cast_pos,
+                    type_pos,
                 });
             });
         }
@@ -6134,6 +6150,7 @@ impl Parser {
             && matches!(self.peek_at(1), Token::LParen)
         {
             return outline(|| {
+                let pos = self.here();
                 self.advance(); // EXTRACT
                 self.expect(&Token::LParen)?;
                 let field = match self.peek() {
@@ -6157,6 +6174,7 @@ impl Parser {
                 return Ok(Expr::Extract {
                     field: field.to_ascii_lowercase(),
                     source: Box::new(source),
+                    pos,
                 });
             });
         }
@@ -6166,6 +6184,7 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("row") && matches!(self.peek_at(1), Token::LParen)
         {
             return outline(|| {
+                let pos = self.here();
                 self.advance(); // ROW
                 self.expect(&Token::LParen)?;
                 let mut fields = Vec::new();
@@ -6185,7 +6204,7 @@ impl Parser {
                 } else {
                     self.advance(); // the empty ROW() — consume ')'
                 }
-                return Ok(Expr::Row(fields));
+                return Ok(Expr::Row(fields, pos));
             });
         }
         // `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized only when
@@ -6195,6 +6214,7 @@ impl Parser {
             && matches!(self.peek_at(1), Token::LBracket)
         {
             return outline(|| {
+                let pos = self.here();
                 self.advance(); // ARRAY
                 self.expect(&Token::LBracket)?;
                 let mut elems = Vec::new();
@@ -6214,7 +6234,7 @@ impl Parser {
                 } else {
                     self.advance(); // the empty ARRAY[] — consume ']'
                 }
-                return Ok(Expr::Array(elems));
+                return Ok(Expr::Array(elems, pos));
             });
         }
         // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`,
@@ -6230,6 +6250,7 @@ impl Parser {
             && !matches!(self.peek(), Token::Word(w) if matches!(w.as_str(), "null" | "true" | "false"))
         {
             return outline(|| {
+                let type_pos = self.here();
                 let type_name = self.expect_identifier()?;
                 let pos = self.here();
                 if let Token::Str(text) = self.advance() {
@@ -6237,6 +6258,7 @@ impl Parser {
                         type_name,
                         text,
                         pos,
+                        type_pos,
                     });
                 }
                 unreachable!("peeked a string literal after the type name");
@@ -6248,6 +6270,7 @@ impl Parser {
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Str(_)))
         {
             return outline(|| {
+                let type_pos = self.here();
                 let type_name = self.expect_type_name()?;
                 let pos = self.here();
                 if let Token::Str(text) = self.advance() {
@@ -6255,6 +6278,7 @@ impl Parser {
                         type_name,
                         text,
                         pos,
+                        type_pos,
                     });
                 }
                 unreachable!("peeked a string literal after the type name");
@@ -6267,6 +6291,7 @@ impl Parser {
             && matches!(self.peek_at(1), Token::LParen)
         {
             return outline(|| {
+                let pos = self.here();
                 self.advance(); // JSON
                 self.advance(); // (
                 let operand = self.parse_expr()?;
@@ -6287,6 +6312,7 @@ impl Parser {
                 return Ok(Expr::JsonCtor {
                     operand: Box::new(operand),
                     unique_keys,
+                    pos,
                 });
             });
         }
@@ -6307,6 +6333,7 @@ impl Parser {
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
             return outline(|| {
+                let pos = self.here();
                 self.advance(); // COALESCE
                 self.advance(); // (
                 if matches!(self.peek(), Token::RParen) {
@@ -6321,7 +6348,7 @@ impl Parser {
                     self.advance(); // ,
                 }
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::Coalesce(args));
+                return Ok(Expr::Coalesce(args, pos));
             });
         }
         // `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52).
@@ -6334,6 +6361,7 @@ impl Parser {
         {
             return outline(|| {
                 let greatest = gl_kw.as_deref() == Some("greatest");
+                let pos = self.here();
                 self.advance(); // GREATEST / LEAST
                 self.advance(); // (
                 if matches!(self.peek(), Token::RParen) {
@@ -6352,7 +6380,11 @@ impl Parser {
                     self.advance(); // ,
                 }
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::GreatestLeast { args, greatest });
+                return Ok(Expr::GreatestLeast {
+                    args,
+                    greatest,
+                    pos,
+                });
             });
         }
         // `NULLIF(a, b)` — NULL when `a = b`, else `a` (grammar.md §58). Recognized only when
@@ -6388,7 +6420,9 @@ impl Parser {
                     Some(Box::new(self.parse_expr()?))
                 };
                 let mut whens = Vec::new();
+                let mut when_pos = Vec::new();
                 while self.peek_keyword().as_deref() == Some("when") {
+                    when_pos.push(self.here());
                     self.advance();
                     let cond = self.parse_expr()?;
                     self.expect_keyword("then")?;
@@ -6410,6 +6444,7 @@ impl Parser {
                     whens,
                     els,
                     pos: case_pos,
+                    when_pos,
                 });
             });
         }
@@ -6419,7 +6454,7 @@ impl Parser {
             Token::Param(n) => {
                 let n = *n;
                 self.advance();
-                Ok(Expr::Param(n))
+                Ok(Expr::Param(n, here))
             }
             Token::Int(m) => {
                 let m = *m;

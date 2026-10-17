@@ -1642,6 +1642,7 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 	if err != nil {
 		return columnDef{}, err
 	}
+	typePos := p.here()
 	typeName, err := p.expectTypeName()
 	if err != nil {
 		return columnDef{}, err
@@ -1796,7 +1797,7 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 			fk.Columns = []string{name}
 			*foreignKeys = append(*foreignKeys, fk)
 		default:
-			return columnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity, Collation: collation}, nil
+			return columnDef{Name: name, TypeName: typeName, TypePos: typePos, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity, Collation: collation}, nil
 		}
 	}
 }
@@ -3637,11 +3638,12 @@ func (p *parser) parseInsertValue() (insertValue, error) {
 		n := p.advance().Int
 		return insertValue{IsParam: true, Param: n}, nil
 	}
+	litPos := p.here()
 	lit, err := p.parseLiteral()
 	if err != nil {
 		return insertValue{}, err
 	}
-	return insertValue{Lit: lit}, nil
+	return insertValue{Lit: lit, LitPos: litPos}, nil
 }
 
 // parseLiteral parses a literal value for INSERT: an integer (with an optional leading
@@ -5553,7 +5555,7 @@ func classifyOrderKey(expr exprNode, collation string, descending, nullsFirst, a
 	case exprLiteral:
 		if allowOrdinal && expr.Literal != nil && expr.Literal.Kind == literalInt {
 			ord := expr.Literal.Int
-			return orderKey{Ordinal: &ord, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+			return orderKey{Ordinal: &ord, Pos: expr.Pos, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 		}
 	case exprColumn:
 		return orderKey{Column: expr.Column, Pos: expr.Pos, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
@@ -6479,7 +6481,9 @@ func (p *parser) parsePostfix() (exprNode, error) {
 			expr = exprNode{Kind: exprCollate, Collate: &collateExpr{Inner: expr, Collation: name}}
 			fieldAccessible = false
 		case p.peek().Kind == tokDoubleColon:
+			castPos := p.here()
 			p.advance()
+			typePos := p.here()
 			typeName, err := p.expectTypeName()
 			if err != nil {
 				return exprNode{}, err
@@ -6495,7 +6499,7 @@ func (p *parser) parsePostfix() (exprNode, error) {
 			if isArray {
 				typeName += "[]"
 			}
-			expr = exprNode{Kind: exprCast, Cast: &castExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod}}
+			expr = exprNode{Kind: exprCast, Cast: &castExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod, CastPos: castPos, TypePos: typePos}}
 			fieldAccessible = false
 		// `base[..][..]` — array subscript (spec/design/array.md §6). Applies to ANY base (no parens
 		// rule, unlike `.field`). Consecutive `[…]` brackets collect into ONE access (so `a[1][2]` is
@@ -6589,6 +6593,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		return exprNode{Kind: exprQualifiedColumn, Qualifier: qualifier, Column: name, Pos: pos}, nil
 	}
 	if p.peek().Kind == tokLParen {
+		parenPos := p.here()
 		p.advance()
 		// `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
 		// `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expr.
@@ -6600,7 +6605,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 			if err := p.expect(tokRParen); err != nil {
 				return exprNode{}, err
 			}
-			return exprNode{Kind: exprScalarSubquery, Subquery: &q}, nil
+			return exprNode{Kind: exprScalarSubquery, Subquery: &q, Pos: parenPos}, nil
 		}
 		e, err := p.parseExpr()
 		if err != nil {
@@ -6623,7 +6628,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 				return exprNode{}, err
 			}
 			p.bareRowEnd = p.pos
-			return exprNode{Kind: exprRow, RowItems: items}, nil
+			return exprNode{Kind: exprRow, RowItems: items, Pos: parenPos}, nil
 		}
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
@@ -6634,6 +6639,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	// open-paren + a query start (`SELECT`, or a nested `WITH` — cte.md §7) follows, so `exists`
 	// stays usable as a column / function name.
 	if p.peekKeyword() == "exists" && p.peekKindAt(1) == tokLParen && p.isQueryStartAtOffset(2) {
+		existsPos := p.here()
 		p.advance() // EXISTS
 		if err := p.expect(tokLParen); err != nil {
 			return exprNode{}, err
@@ -6645,12 +6651,13 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprExists, Subquery: &q}, nil
+		return exprNode{Kind: exprExists, Subquery: &q, Pos: existsPos}, nil
 	}
 	// `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when ROW is
 	// immediately followed by `(`, so `row` stays usable as a column / function name otherwise. The
 	// bare `(a, b)` form is parsed with the parenthesized expression above.
 	if p.peekKeyword() == "row" && p.peekKindAt(1) == tokLParen {
+		rowPos := p.here()
 		p.advance() // ROW
 		if err := p.expect(tokLParen); err != nil {
 			return exprNode{}, err
@@ -6675,11 +6682,12 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		} else {
 			p.advance() // the empty ROW() — consume ')'
 		}
-		return exprNode{Kind: exprRow, RowItems: items}, nil
+		return exprNode{Kind: exprRow, RowItems: items, Pos: rowPos}, nil
 	}
 	// `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized when ARRAY is
 	// immediately followed by `[`, so `array` stays usable as an identifier otherwise.
 	if p.peekKeyword() == "array" && p.peekKindAt(1) == tokLBracket {
+		arrayPos := p.here()
 		p.advance() // ARRAY
 		if err := p.expect(tokLBracket); err != nil {
 			return exprNode{}, err
@@ -6704,7 +6712,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		} else {
 			p.advance() // the empty ARRAY[] — consume ']'
 		}
-		return exprNode{Kind: exprArray, RowItems: items}, nil
+		return exprNode{Kind: exprArray, RowItems: items, Pos: arrayPos}, nil
 	}
 	if p.peekKeyword() == "cast" {
 		castPos := p.here()
@@ -6719,6 +6727,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expectKeyword("as"); err != nil {
 			return exprNode{}, err
 		}
+		typePos := p.here()
 		typeName, err := p.expectTypeName()
 		if err != nil {
 			return exprNode{}, err
@@ -6737,13 +6746,14 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprCast, Cast: &castExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}, Pos: castPos}, nil
+		return exprNode{Kind: exprCast, Cast: &castExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod, CastPos: castPos, TypePos: typePos}, Pos: castPos}, nil
 	}
 	// EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
 	// is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
 	// (the one-token lookahead, §8). The field is an identifier (bare or quoted) or a string literal —
 	// PostgreSQL's extract_arg — ASCII-lowercased, as the unit lookup folds it (timezones.md §9.6).
 	if p.peekKeyword() == "extract" && p.peekKindAt(1) == tokLParen {
+		extractPos := p.here()
 		p.advance() // EXTRACT
 		if err := p.expect(tokLParen); err != nil {
 			return exprNode{}, err
@@ -6770,7 +6780,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprExtract, Extract: &extractExpr{Field: asciiLower(field), Source: source}}, nil
+		return exprNode{Kind: exprExtract, Extract: &extractExpr{Field: asciiLower(field), Source: source}, Pos: extractPos}, nil
 	}
 	// A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
 	// CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed
@@ -6779,25 +6789,28 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	// usable as a column / function name otherwise. true/false/null are excluded (their own value
 	// literals). The type name is resolved (and the string coerced to it) at resolve; unknown → 42704.
 	if t0 := p.peek(); isIdentKind(t0.Kind) && !(t0.Kind == tokWord && (t0.Word == "null" || t0.Word == "true" || t0.Word == "false")) && p.peekKindAt(1) == tokStr {
+		typePos := p.here()
 		name := p.advance().Word // the named type (folded or quoted; resolved byte-exactly)
 		pos := p.here()
 		t := p.advance()
-		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, Pos: pos}, nil
+		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, TypeLitPos: typePos, Pos: pos}, nil
 	}
 	// The two-word `character varying '...'` typed literal (types.md §15).
 	if p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying" && p.peekKindAt(2) == tokStr {
+		typePos := p.here()
 		name, err := p.expectTypeName()
 		if err != nil {
 			return exprNode{}, err
 		}
 		pos := p.here()
 		t := p.advance()
-		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, Pos: pos}, nil
+		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, TypeLitPos: typePos, Pos: pos}, nil
 	}
 	// The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (json-sql-functions.md
 	// §5, S2) — keyword-led primaries with sub-clauses. Recognized by the function keyword immediately
 	// followed by `(`.
 	if kw := p.peekKeyword(); (kw == "json_exists" || kw == "json_value" || kw == "json_query") && p.peekKindAt(1) == tokLParen {
+		kwPos := p.here()
 		p.advance() // the function keyword
 		p.advance() // (
 		ctx, err := p.parseExpr()
@@ -6854,12 +6867,14 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
+		expr.Pos = kwPos
 		return expr, nil
 	}
 	// `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
 	// (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled above, a
 	// string follows) and a generic call by being the JSON keyword immediately followed by `(`.
 	if p.peekKeyword() == "json" && p.peekKindAt(1) == tokLParen {
+		jsonPos := p.here()
 		p.advance() // JSON
 		p.advance() // (
 		operand, err := p.parseExpr()
@@ -6878,13 +6893,14 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprJsonCtor, JsonCtorOf: &jsonCtorExpr{Operand: operand, UniqueKeys: uniqueKeys}}, nil
+		return exprNode{Kind: exprJsonCtor, JsonCtorOf: &jsonCtorExpr{Operand: operand, UniqueKeys: uniqueKeys}, Pos: jsonPos}, nil
 	}
 	// `COALESCE(a, b, …)` — the first-non-NULL conditional (grammar.md §51). Recognized only when
 	// COALESCE is immediately followed by `(` (the JSON(/EXTRACT( one-token lookahead), so the
 	// word stays usable as a column name. At least one argument (an empty list is 42601 —
 	// PostgreSQL's grammar has no empty form).
 	if p.peekKeyword() == "coalesce" && p.peekKindAt(1) == tokLParen {
+		coalescePos := p.here()
 		p.advance() // COALESCE
 		p.advance() // (
 		if p.peek().Kind == tokRParen {
@@ -6905,7 +6921,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprCoalesce, Coalesce: args}, nil
+		return exprNode{Kind: exprCoalesce, Coalesce: args, Pos: coalescePos}, nil
 	}
 	// `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52). Recognized
 	// only when the keyword is immediately followed by `(` (the same one-token lookahead), so the
@@ -6913,6 +6929,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	// PostgreSQL's grammar has no empty form).
 	if kw := p.peekKeyword(); (kw == "greatest" || kw == "least") && p.peekKindAt(1) == tokLParen {
 		greatest := kw == "greatest"
+		glPos := p.here()
 		p.advance() // GREATEST / LEAST
 		p.advance() // (
 		if p.peek().Kind == tokRParen {
@@ -6936,7 +6953,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprGreatestLeast, GreatestLeast: args, Greatest: greatest}, nil
+		return exprNode{Kind: exprGreatestLeast, GreatestLeast: args, Greatest: greatest, Pos: glPos}, nil
 	}
 	// `NULLIF(a, b)` — NULL when a = b, else a (grammar.md §58). Recognized only when NULLIF is
 	// immediately followed by `(` (the same one-token lookahead), so the word stays usable as a
@@ -6976,6 +6993,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		}
 		var whens []caseWhen
 		for p.peekKeyword() == "when" {
+			whenPos := p.here()
 			p.advance()
 			cond, err := p.parseExpr()
 			if err != nil {
@@ -6988,7 +7006,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			whens = append(whens, caseWhen{Cond: cond, Result: res})
+			whens = append(whens, caseWhen{Cond: cond, Result: res, Pos: whenPos})
 		}
 		if len(whens) == 0 {
 			return exprNode{}, newError(SyntaxError, "CASE requires at least one WHEN clause")
@@ -7012,7 +7030,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	here := p.here()
 	switch {
 	case t.Kind == tokParam:
-		return exprNode{Kind: exprParam, Param: p.advance().Int}, nil
+		return exprNode{Kind: exprParam, Param: p.advance().Int, Pos: here}, nil
 	case t.Kind == tokInt:
 		v, ok := foldInt(p.advance().Int, false)
 		if !ok {

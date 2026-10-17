@@ -580,6 +580,28 @@ impl Engine {
         insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
         allow_insert_fill: bool,
     ) -> Result<Outcome> {
+        // The database a table-naming error concerns (spec/design/error-fields.md §12): the
+        // statement's target qualifier, else the implicit scope. UPDATE and DELETE stamp their own
+        // (they also run as writable-CTE children).
+        let target_db = match &stmt {
+            Statement::CreateTable(ct) if ct.temp => Some("temp".to_string()),
+            Statement::CreateTable(ct) => ct.db.clone(),
+            Statement::AlterTable(at) => at.db.clone(),
+            Statement::CreateIndex(ci) => ci.db.clone(),
+            Statement::Insert(ins) => ins.db.clone(),
+            _ => None,
+        };
+        self.dispatch_stmt_target(stmt, params, insert_cache, allow_insert_fill)
+            .map_err(|e| self.stamp_database(target_db.as_deref(), e))
+    }
+
+    fn dispatch_stmt_target(
+        &mut self,
+        stmt: Statement,
+        params: &[Value],
+        insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
+        allow_insert_fill: bool,
+    ) -> Result<Outcome> {
         match stmt {
             Statement::Analyze(analyze) => {
                 reject_params_for_ddl(params)?;
@@ -903,7 +925,8 @@ impl Engine {
                                 return Err(EngineError::new(
                                     SqlState::UndefinedObject,
                                     format!("type does not exist: {base}"),
-                                ));
+                                )
+                                .with_position(def.type_pos.0));
                             }
                         }
                     }
@@ -951,7 +974,8 @@ impl Engine {
                     return Err(EngineError::new(
                         SqlState::UndefinedObject,
                         format!("type does not exist: {}", def.type_name),
-                    ));
+                    )
+                    .with_position(def.type_pos.0));
                 };
             if def.primary_key {
                 // The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
@@ -2300,7 +2324,8 @@ impl Engine {
                                         "cannot drop column {name} of table {} because view {view} depends on it",
                                         original.name
                                     ),
-                                ));
+                                )
+                                .hinted(error_hint::DROP_CASCADE));
                             }
                             if !users.is_empty() {
                                 let closure = main_namespace.view_drop_closure(users);
@@ -2347,7 +2372,8 @@ impl Engine {
                                 format!(
                                     "cannot drop column {name} because other objects depend on it"
                                 ),
-                            ));
+                            )
+                            .hinted(error_hint::DROP_CASCADE));
                         }
                         if cascade {
                             if let ColumnSource::Original(old_ci) = column_sources[ci] {
@@ -2556,7 +2582,8 @@ impl Engine {
                                 SqlState::DependentObjectsStillExist,
                                 "cannot drop primary key because other objects depend on it"
                                     .to_string(),
-                            ));
+                            )
+                            .hinted(error_hint::DROP_CASCADE));
                         }
                         if cascade {
                             table.foreign_keys.retain(|fk| {
@@ -2992,7 +3019,8 @@ impl Engine {
                                     format!(
                                         "cannot drop constraint {name} because other objects depend on it"
                                     ),
-                                ));
+                                )
+                                .hinted(error_hint::DROP_CASCADE));
                             }
                             if cascade {
                                 if let Some(old_cols) = original_cols {
@@ -3257,6 +3285,7 @@ impl Engine {
                                 &crate::ast::ColumnDef {
                                     name: table.columns[ci].name.clone(),
                                     type_name: type_name.clone(),
+                                    type_pos: SrcPos::NONE,
                                     type_mod,
                                     primary_key: false,
                                     not_null: false,
@@ -3293,6 +3322,8 @@ impl Engine {
                                 type_name: type_name.clone(),
                                 type_mod,
                                 pos: SrcPos::NONE,
+                                cast_pos: SrcPos::NONE,
+                                type_pos: SrcPos::NONE,
                             };
                             let (value, ty) = resolve(
                                 &Scope::single(self, &table),
@@ -3330,6 +3361,8 @@ impl Engine {
                                     type_name: type_name.clone(),
                                     type_mod,
                                     pos: SrcPos::NONE,
+                                    cast_pos: SrcPos::NONE,
+                                    type_pos: SrcPos::NONE,
                                 };
                                 let (node, _) = resolve(
                                     &Scope::single(self, &default_table),
@@ -3363,6 +3396,8 @@ impl Engine {
                                     type_name: type_name.clone(),
                                     type_mod,
                                     pos: SrcPos::NONE,
+                                    cast_pos: SrcPos::NONE,
+                                    type_pos: SrcPos::NONE,
                                 };
                                 resolve(
                                     &Scope::empty(self),
@@ -4137,7 +4172,8 @@ impl Engine {
                             return Err(EngineError::new(
                                 SqlState::UndefinedObject,
                                 format!("type does not exist: {base}"),
-                            ));
+                            )
+                            .with_position(def.type_pos.0));
                         }
                     },
                 }
@@ -4183,7 +4219,8 @@ impl Engine {
                 return Err(EngineError::new(
                     SqlState::UndefinedObject,
                     format!("type does not exist: {}", def.type_name),
-                ));
+                )
+                .with_position(def.type_pos.0));
             };
 
         let collation = if let Some(name) = &def.collation {
@@ -4743,7 +4780,8 @@ impl Engine {
                         "cannot drop table {} because other objects depend on it: constraint {} on table {}",
                         d.dropped_name, d.fk_name, d.ref_table_name
                     ),
-                ));
+                )
+                .hinted(error_hint::DROP_CASCADE));
             }
             (Vec::new(), Vec::new())
         };
@@ -5472,7 +5510,8 @@ impl Engine {
                             "cannot drop index {} because constraint {} on table {} requires it",
                             di.name, di.name, t.name
                         ),
-                    ));
+                    )
+                    .hinted(&error_hint::drop_owner_instead(&di.name, &t.name)));
                 }
             }
         }

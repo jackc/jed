@@ -859,7 +859,7 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 				continue
 			}
 			return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
-				"cannot drop view %s because view %s depends on it", d.Name, dependent.Name))
+				"cannot drop view %s because view %s depends on it", d.Name, dependent.Name)).hinted(hintDropCascade)
 		}
 	}
 	// Phase 3: remove.
@@ -1037,7 +1037,7 @@ func (db *engine) dropTableViews(targets []string, cascade bool) ([]string, erro
 			}
 			if !cascade {
 				return nil, newError(DependentObjectsStillExist, fmt.Sprintf(
-					"cannot drop table %s because view %s depends on it", d.Name, view.Name))
+					"cannot drop table %s because view %s depends on it", d.Name, view.Name)).hinted(hintDropCascade)
 			}
 			seeds = append(seeds, view.Name)
 			break

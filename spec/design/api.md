@@ -830,7 +830,10 @@ transaction state, `42` syntax/access, `57` operator intervention, `58` system, 
 identify *which* constraint fired without parsing the (non-contractual) message text. They are set
 on the integrity violations (23505/23514/23503/23P01 → constraint + table; 23502 → table + column)
 and the type errors (22003/22001 → data type). Absent fields are `None`/`""`/`undefined`. Additive:
-`.code()` and the rendered message format are unchanged.
+`.code()` and the rendered message format are unchanged. **`database_name`** (Go `DatabaseName`, TS
+`databaseName?`), jed's analog of PostgreSQL's `SchemaName`, is set whenever `table_name` is: the
+database holding the table — `main`, `temp`, or a host attachment's name ([error-fields.md](error-fields.md)
+§12).
 
 A fifth field, **`detail`** (Rust `detail: Option<String>`, Go `Detail`, TS `detail?`), carries
 PostgreSQL's DETAIL sentence naming the offending values: `Key (id)=(1) already exists.`,
@@ -842,11 +845,13 @@ is withheld when the session lacks `SELECT` on the table whose values it would s
 Two more fields locate and explain a mistake in the query text. **`position`** (Rust
 `position: Option<u32>`, Go `Position int32` with `0` absent, TS `position?`) is the 1-based
 **character** offset of the offending token: set on lexer/parser errors (except the class-54 limits),
-on a column reference's `42703`/`42702`/`42P01`, on an unknown INSERT column or SET target, and on an
-unknown FROM table. For `execute_script` it counts from the start of the script. **`hint`** (Rust
+on a column reference's `42703`/`42702`/`42P01`, on an unknown INSERT column or SET target, on an
+unknown FROM table, and on the resolver's type, cast, operator, function, sort-key, and literal-input
+errors ([error-fields.md](error-fields.md) §10.2). For `execute_script` it counts from the start of the script. **`hint`** (Rust
 `hint: Option<String>`, Go `Hint`, TS `hint?`) carries PostgreSQL's hints: the misspelled-column and
 table-alias suggestions (`Perhaps you meant to reference the column "t.name".`), the LATERAL hints, and
-the fixed function-lookup, operator-lookup, and assignment sentences. Both are additive metadata
+the fixed function-lookup, operator-lookup, assignment, collation, identity-column, and dependent-object
+sentences. Both are additive metadata
 ([error-fields.md](error-fields.md) §10, §11).
 
 ## 8. Cost ceiling (`max_cost`)

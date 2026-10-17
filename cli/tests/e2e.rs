@@ -94,6 +94,23 @@ fn script_stops_at_the_first_error_with_exit_2() {
 }
 
 #[test]
+fn a_non_main_database_follows_the_detail() {
+    // DatabaseName (spec/design/cli.md §5, error-fields.md §12): printed for `temp` / an
+    // attachment, not for `main`.
+    let r = run(
+        &[],
+        "CREATE TEMP TABLE t (id i32 PRIMARY KEY);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (1);\n",
+    );
+    assert_eq!(r.code, 2);
+    assert_eq!(
+        r.stderr,
+        "<stdin>:3: ERROR 23505: duplicate key value violates unique constraint: t_pkey\n\
+         DETAIL:  Key (id)=(1) already exists.\n\
+         DATABASE:  temp\n"
+    );
+}
+
+#[test]
 fn error_cursor_and_hint_follow_the_error_line() {
     // psql's `LINE n:` cursor (line within the statement) and the structured Hint
     // (spec/design/cli.md §5, error-fields.md §10/§11).

@@ -95,10 +95,13 @@ A failed statement raises an **`EngineError`** carrying a stable 5-char SQLSTATE
 match on the message text, which is informational. When the failure is a constraint or type
 violation, the error also carries **structured diagnostic fields** (modeled on pgx's `PgError`) so you
 can tell _which_ constraint fired without parsing the message: `constraint_name`, `table_name`,
-`column_name`, and `data_type_name`. A field is absent (`None` / `""` / `undefined`) when it does not
-apply. They are set on the integrity violations — `23505` unique, `23514` check, `23503` foreign key,
-`23P01` exclusion (→ constraint + table); `23502` not-null (→ table + column) — and the type errors
-`22003` / `22001` (→ data type).
+`database_name`, `column_name`, and `data_type_name`. A field is absent (`None` / `""` / `undefined`)
+when it does not apply. They are set on the integrity violations — `23505` unique, `23514` check,
+`23503` foreign key, `23P01` exclusion (→ constraint + table); `23502` not-null (→ table + column) — and
+the type errors `22003` / `22001` (→ data type). **`database_name`** (`DatabaseName` in Go,
+`databaseName` in TypeScript) is jed's counterpart of PostgreSQL's schema name: whenever `table_name`
+is set it names the database holding that table — `main`, `temp` for a temporary table, or the name a
+host attached a database under.
 
 ```rust
 // Rust — fields are `Option<String>` on the returned EngineError
@@ -160,15 +163,20 @@ parser raises, except the `54xxx` limits), on an unknown or ambiguous column ref
 operator with no implementation for its operand types (`42883` / `42804`, at the operator), on a
 non-boolean `WHERE` / `HAVING` / `ON` / `AND` / `OR` / `NOT` / `CASE WHEN` argument and a value of the
 wrong type for its column or for its `CASE` / `COALESCE` / `ARRAY` / `VALUES` / `UNION` siblings
-(`42804`, at that expression), and on a malformed string literal converted at resolve time
-(`'abc'::int`, `22P02` and the other input errors, at the literal). An error raised while running
+(`42804`, at that expression), on an unknown type name (`42704`), on a cast with no conversion (at
+the `::` or `CAST`), on a simple `CASE`'s comparison (at its `WHEN`), on a sort, grouping, or
+`DISTINCT` key with no ordering or equality operator, on a recursive query's column type, and on a
+malformed string literal converted at resolve time (`'abc'::int`, or an `INSERT … VALUES`
+literal, `22P02` and the other input errors, at the literal). An error raised while running
 the query — a cast of a column's value, say — has none. It
 counts characters, not bytes, and a syntax error at end of input points one past the last
 character. For `execute_script` it counts from the start of the whole script. It is absent
 (`None` / `0` / `undefined`) otherwise. **`hint`** (`Hint`) carries PostgreSQL's suggestion, in its
 exact words: for a misspelled column, a table name used in place of its alias, a column or table of
-a FROM item to the left of a subquery not marked `LATERAL`, a function or operator with no
-implementation for its argument types, and a value of the wrong type for its column:
+a FROM item to the left of a subquery not marked `LATERAL` (with a `detail` saying the item cannot be
+referenced from there), a function or operator with no implementation for its argument types, a
+value of the wrong type for its column, a collation conflict, a write to a `GENERATED ALWAYS`
+identity column, and a `DROP` that other objects depend on:
 
 | Statement | `code` | `position` | `hint` |
 |---|---|---|---|
@@ -198,7 +206,7 @@ try {
 ```
 
 The `jed` CLI prints both the way psql does: a `LINE n:` excerpt with a `^` under the position, then
-`HINT:  …`.
+`HINT:  …`. When the error's table is in an attached database or `temp`, a `DATABASE:  …` line follows.
 
 The rendered error message is unchanged — these fields are additive metadata alongside it.
 

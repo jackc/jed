@@ -416,17 +416,17 @@ no-detail
 
 # --- 22007 formatting: a quoted input slice that splits a UTF-8 character -------------------------
 # formatting.md §2: the message quotes a byte slice of the input; each maximal ill-formed
-# subsequence becomes one U+FFFD. PostgreSQL emits the raw bytes (not valid UTF-8) and also attaches
-# a Detail and a Hint here, which jed does not carry yet; these cases pin only the message bytes.
+# subsequence becomes one U+FFFD. PostgreSQL emits the raw bytes (not valid UTF-8). The Detail counts
+# bytes, as PostgreSQL's does; position_cases.txt pins the Hint.
 
 case: to_timestamp slice splits a 3-byte character
 run: SELECT to_timestamp('20€401', 'YYYYMM')
 code: 22007
 message: invalid value "20�" for "YYYY"
-no-detail
+detail: Field requires 4 characters, but only 2 could be parsed.
 
 case: to_timestamp slice splits a 4-byte character
 run: SELECT to_timestamp('2😀01', 'YYYYMM')
 code: 22007
 message: invalid value "2�" for "YYYY"
-no-detail
+detail: Field requires 4 characters, but only 1 could be parsed.

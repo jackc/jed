@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // SELECT planning, Stage 1 — the RESOLVE half (spec/design/planner.md §2): planSelect resolves a
@@ -743,7 +744,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				// `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md
 				// §5), so GROUP BY a json column is 42883. jsonb IS groupable.
 				if s.columnAt(gr.index).Type.IsJson() {
-					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint()
+					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint().
+						withPosition(int32(exprLocation(*key)))
 				}
 				idx = gr.index
 				found := false
@@ -770,7 +772,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					}
 				}
 				if gr.ty.kind == rtJson {
-					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint()
+					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint().
+						withPosition(int32(exprLocation(*key)))
 				}
 				// Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
 				// A bare enclosing-query column key is matched by the column it names, whatever its
@@ -946,9 +949,12 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// (PG ships no opclass — spec/design/json.md §5), so a json output column under DISTINCT is
 	// 42883. jsonb IS distinguishable (its btree equality, §5).
 	if sel.Distinct {
-		for _, t := range columnTypes {
+		for i, t := range columnTypes {
 			if t.kind == rtJson {
-				return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint()
+				// Reported at that select item (spec/design/error-fields.md §10.2), when the list has no
+				// `*` expansion to shift the columns.
+				return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint().
+					withPosition(int32(distinctItemLocation(sel.Items, i)))
 			}
 		}
 		// Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
@@ -1119,7 +1125,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				}
 				if ty.kind == rtJson {
 					return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
-						hinted(hintNoOrderingOperator)
+						hinted(hintNoOrderingOperator).withPosition(int32(key.location()))
 				}
 				var coll *Collation
 				if key.Collation != "" {
@@ -1141,7 +1147,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			// ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
 			if s.columnOf(r).Type.IsJson() {
 				return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
-					hinted(hintNoOrderingOperator)
+					hinted(hintNoOrderingOperator).withPosition(int32(key.location()))
 			}
 			idx := r.index
 			// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
@@ -1195,7 +1201,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		}
 		rexpr, ty, err = resolve(s, *orderExpr, nil, octx, ptypes)
 		if err != nil {
-			return nil, err
+			return nil, atOrderKey(err, key)
 		}
 		aggSpecs = octx.specs
 		groupingSpecs = octx.groupingSpecs
@@ -1208,7 +1214,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
 		if ty.kind == rtJson {
 			return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
-				hinted(hintNoOrderingOperator)
+				hinted(hintNoOrderingOperator).withPosition(int32(key.location()))
 		}
 		// The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
 		// parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
@@ -1874,4 +1880,32 @@ func derivedJoinGroup(plan *queryPlan) *joinGroupLayout {
 		return nil
 	}
 	return plan.sel.group
+}
+
+// distinctItemLocation is the location of SELECT DISTINCT output column i (spec/design/error-fields.md
+// §10.2): its select item's, or 0 when the list has a `*` / `t.*` / `(x).*` expansion that shifts the
+// columns.
+func distinctItemLocation(items selectItems, i int) srcPos {
+	if items.All {
+		return 0
+	}
+	for _, it := range items.Items {
+		if it.Expr.Kind == exprQualifiedStar || it.Expr.Kind == exprFieldStar {
+			return 0
+		}
+	}
+	if i >= len(items.Items) {
+		return 0
+	}
+	return exprLocation(items.Items[i].Expr)
+}
+
+// atOrderKey positions a sort key with no ordering operator where the key was written
+// (spec/design/error-fields.md §10.2); any other error passes through.
+func atOrderKey(err error, key orderKey) error {
+	var e *EngineError
+	if errors.As(err, &e) && e.State == UndefinedFunction && strings.HasPrefix(e.Message, "could not identify") {
+		e.withPosition(int32(key.location()))
+	}
+	return err
 }

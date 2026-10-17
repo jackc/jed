@@ -25,6 +25,26 @@ pub(crate) const ASSIGNMENT_MISMATCH: &str = "You will need to rewrite or cast t
 /// `42804` — a recursive CTE column whose recursive term changes its type (`parse_cte.c`).
 pub(crate) const RECURSIVE_TERM_TYPE: &str =
     "Cast the output of the non-recursive term to the correct type.";
+/// `42P21` — two different implicit collations meet where a collation is required at plan time
+/// (`select_common_collation`, `assign_collations_walker`, `parse_collate.c`).
+pub(crate) const COLLATION_IMPLICIT_MISMATCH: &str =
+    "You can choose the collation by applying the COLLATE clause to one or both expressions.";
+/// `42P21` — a recursive CTE's recursive term changes a column's collation (`parse_cte.c`).
+pub(crate) const RECURSIVE_TERM_COLLATION: &str =
+    "Use the COLLATE clause to set the collation of the non-recursive term.";
+/// `42P22` — no collation could be determined for a value that needs one (`varstr_cmp`,
+/// `intorel_startup`, …).
+pub(crate) const INDETERMINATE_COLLATION: &str =
+    "Use the COLLATE clause to set the collation explicitly.";
+/// `2BP01` — a `DROP` (or `ALTER TABLE … DROP`) that other objects depend on, where the statement
+/// accepts `CASCADE` (`reportDependentObjects`, `dependency.c`).
+pub(crate) const DROP_CASCADE: &str = "Use DROP ... CASCADE to drop the dependent objects too.";
+
+/// `2BP01` — dropping an index a constraint owns (`findDependentObjects`, `dependency.c`).
+pub(crate) fn drop_owner_instead(constraint: &str, table: &str) -> String {
+    format!("You can drop constraint {constraint} on table {table} instead.")
+}
+
 /// `42703` — the column is in a FROM item to the left of a non-LATERAL subquery (`errorMissingColumn`).
 pub(crate) const LATERAL_COLUMN: &str =
     "To reference that column, you must mark this subquery with LATERAL.";
@@ -137,6 +157,28 @@ impl<'n> FuzzyColumnMatch<'n> {
 /// The §11.2 table-alias hint for an aliased relation labeled `label`.
 pub(crate) fn alias_hint(label: &str) -> String {
     format!("Perhaps you meant to reference the table alias \"{label}\".")
+}
+
+/// `42703` Detail: one relation the reference cannot see has the column (`errorMissingColumn`,
+/// spec/design/error-fields.md §11.8).
+pub(crate) fn unreachable_column_detail(column: &str, label: &str) -> String {
+    format!(
+        "There is a column named \"{column}\" in table \"{label}\", but it cannot be referenced from this part of the query."
+    )
+}
+
+/// `42703` Detail: several relations the reference cannot see have the column (`errorMissingColumn`).
+pub(crate) fn unreachable_columns_detail(column: &str) -> String {
+    format!(
+        "There are columns named \"{column}\", but they are in tables that cannot be referenced from this part of the query."
+    )
+}
+
+/// `42P01` Detail: the qualifier names a relation the reference cannot see (`errorMissingRTE`).
+pub(crate) fn unreachable_table_detail(label: &str) -> String {
+    format!(
+        "There is an entry for table \"{label}\", but it cannot be referenced from this part of the query."
+    )
 }
 
 #[cfg(test)]

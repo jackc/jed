@@ -159,7 +159,7 @@ func (db *engine) ctasColumns(ct *createTable, plan *queryPlan, targetTemp bool)
 		if t.collatable() && (derivs[i].kind == derivIndeterminate || derivs[i].kind == derivConflicted) {
 			return nil, newError(IndeterminateCollation, fmt.Sprintf(
 				"no collation was derived for column \"%s\" with collatable type %s", names[i], rtName(t),
-			))
+			)).hinted(hintIndeterminateCollation)
 		}
 	}
 	if len(renames) > len(types) {

@@ -383,6 +383,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Stamp `DatabaseName` on an error a statement targeting `qualifier.table` raised
+    /// (spec/design/error-fields.md §12): the database holding the error's `TableName` — the
+    /// qualifier when the statement named one, else `temp` for a session-local temporary table and
+    /// `main` otherwise (a bare name reaches only those two, attached-databases.md §3). An error with
+    /// no `TableName`, or one whose database an inner site already named, passes through.
+    pub(crate) fn stamp_database(&self, qualifier: Option<&str>, e: EngineError) -> EngineError {
+        let Some(table) = e.table_name.as_deref() else {
+            return e;
+        };
+        if e.database_name.is_some() {
+            return e;
+        }
+        let db = match qualifier {
+            Some(q) => q.to_string(),
+            None if self.is_temp_table(table) => "temp".to_string(),
+            None => "main".to_string(),
+        };
+        e.with_database(&db)
+    }
+
     /// Reject a WRITE (DML or DDL) targeting a READ-ONLY host attachment with `25006`
     /// (attached-databases.md §4), before any I/O. A `None` scope, or `main`/`temp` (never read-only via
     /// a qualifier — the read-only *handle* path is separate), or a read-write attachment passes.

@@ -27,6 +27,25 @@ export const NO_ORDERING_OPERATOR = "Use an explicit ordering operator or modify
 export const ASSIGNMENT_MISMATCH = "You will need to rewrite or cast the expression.";
 // 42804 — a recursive CTE column whose recursive term changes its type (parse_cte.c).
 export const RECURSIVE_TERM_TYPE = "Cast the output of the non-recursive term to the correct type.";
+// 42P21 — two different implicit collations meet where a collation is required at plan time
+// (select_common_collation, assign_collations_walker, parse_collate.c).
+export const COLLATION_IMPLICIT_MISMATCH =
+  "You can choose the collation by applying the COLLATE clause to one or both expressions.";
+// 42P21 — a recursive CTE's recursive term changes a column's collation (parse_cte.c).
+export const RECURSIVE_TERM_COLLATION =
+  "Use the COLLATE clause to set the collation of the non-recursive term.";
+// 42P22 — no collation could be determined for a value that needs one (varstr_cmp,
+// intorel_startup, …).
+export const INDETERMINATE_COLLATION = "Use the COLLATE clause to set the collation explicitly.";
+// 2BP01 — a DROP (or ALTER TABLE … DROP) that other objects depend on, where the statement accepts
+// CASCADE (reportDependentObjects, dependency.c).
+export const DROP_CASCADE = "Use DROP ... CASCADE to drop the dependent objects too.";
+
+// dropOwnerInstead is the 2BP01 hint for dropping an index a constraint owns (findDependentObjects,
+// dependency.c).
+export function dropOwnerInstead(constraint: string, table: string): string {
+  return `You can drop constraint ${constraint} on table ${table} instead.`;
+}
 // 42703 — the column is in a FROM item to the left of a non-LATERAL subquery (errorMissingColumn).
 export const LATERAL_COLUMN = "To reference that column, you must mark this subquery with LATERAL.";
 // 42P01 — the table is a FROM item to the left of a non-LATERAL subquery (errorMissingRTE).
@@ -124,4 +143,22 @@ export class FuzzyColumnMatch {
 // aliasHint is the §11.2 table-alias hint for an aliased relation labeled `label`.
 export function aliasHint(label: string): string {
   return `Perhaps you meant to reference the table alias "${label}".`;
+}
+
+// unreachableColumnDetail is the 42703 Detail when one relation the reference cannot see has the
+// column (errorMissingColumn, spec/design/error-fields.md §11.8).
+export function unreachableColumnDetail(column: string, label: string): string {
+  return `There is a column named "${column}" in table "${label}", but it cannot be referenced from this part of the query.`;
+}
+
+// unreachableColumnsDetail is the 42703 Detail when several relations the reference cannot see have
+// the column (errorMissingColumn).
+export function unreachableColumnsDetail(column: string): string {
+  return `There are columns named "${column}", but they are in tables that cannot be referenced from this part of the query.`;
+}
+
+// unreachableTableDetail is the 42P01 Detail when the qualifier names a relation the reference
+// cannot see (errorMissingRTE).
+export function unreachableTableDetail(label: string): string {
+  return `There is an entry for table "${label}", but it cannot be referenced from this part of the query.`;
 }

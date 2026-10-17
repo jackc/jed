@@ -287,13 +287,21 @@ import {
   fkViolationDelete,
   fkViolationInsert,
   fkViolationMatchFull,
+  generatedAlwaysInsert,
+  generatedAlwaysUpdate,
   notNullViolation,
   pkeyName,
   positionedAt,
   stampTable,
   uniqueViolation,
 } from "./errors.ts";
-import { FUNCTION_AMBIGUOUS, FUNCTION_NO_MATCH, NO_ORDERING_OPERATOR } from "./error_hint.ts";
+import {
+  DROP_CASCADE,
+  FUNCTION_AMBIGUOUS,
+  FUNCTION_NO_MATCH,
+  NO_ORDERING_OPERATOR,
+  dropOwnerInstead,
+} from "./error_hint.ts";
 import {
   DETAIL_DUPLICATED,
   DETAIL_EXISTS,
@@ -552,6 +560,7 @@ import {
   combineSetop,
   exprEqual,
   exprLocation,
+  orderKeyLocation,
   outputColumnIsStringLiteral,
   outputColumnLocation,
   requireAssignable,
@@ -1836,6 +1845,29 @@ export function singleValuesInsertEligible(
   return candidateCount === 1 && !hasConflict;
 }
 
+// locateValueSlot points an INSERT VALUES store error at the literal of the slot it came from
+// (spec/design/error-fields.md §10.2): see locateLit. An error from an expression slot, a default, or
+// a non-VALUES source passes through. Rethrow the result.
+function locateValueSlot(rows: InsertValue[][], e: unknown): unknown {
+  if (!(e instanceof EngineError) || e.slot === undefined) return e;
+  const iv = rows[e.slot[0]]?.[e.slot[1]];
+  return iv === undefined ? e : locateLit(iv, e);
+}
+
+// locateLit: PostgreSQL coerces a VALUES literal to its column at parse time, so a type mismatch and
+// a string's input error point at the literal; a length check (22001) and a number's range check run
+// later and carry no position (spec/design/error-fields.md §10.2). Rethrow the result.
+function locateLit(iv: InsertValue, e: unknown): unknown {
+  if (!(e instanceof EngineError) || iv.kind !== "lit") return e;
+  const positioned =
+    e.state === "datatype_mismatch" ||
+    (iv.lit.kind === "text" &&
+      e.code().startsWith("22") &&
+      e.state !== "string_data_right_truncation");
+  if (positioned) e.withPosition(iv.loc);
+  return e;
+}
+
 const ZERO_STORAGE_KEY = new Uint8Array(8);
 const EMPTY_STORAGE_KEY = new Uint8Array(0);
 
@@ -2332,6 +2364,21 @@ export class Engine {
   // persistent, so this is the routing predicate the table/store funnels use.
   private isTempTable(name: string): boolean {
     return this.tempSnap().table(name) !== undefined;
+  }
+
+  // stampDatabase stamps DatabaseName on an error a statement targeting `qualifier.table` raised
+  // (spec/design/error-fields.md §12): the database holding the error's TableName — the qualifier
+  // when the statement named one, else `temp` for a session-local temporary table and `main`
+  // otherwise (a bare name reaches only those two, attached-databases.md §3). An error with no
+  // TableName, or one whose database an inner site already named, passes through.
+  private stampDatabase(qualifier: string | undefined, e: unknown): unknown {
+    if (!(e instanceof EngineError) || e.tableName === undefined) return e;
+    if (e.databaseName !== undefined) return e;
+    let db: string;
+    if (qualifier !== undefined) db = qualifier;
+    else if (this.isTempTable(e.tableName)) db = "temp";
+    else db = "main";
+    return e.withDatabase(db);
   }
 
   // checkTableQualifier validates an optional database qualifier on a table reference against the
@@ -4074,6 +4121,27 @@ export class Engine {
     params: Value[],
     insertHolder: InsertCacheHolder | null = null,
     allowInsertFill = false,
+  ): Outcome {
+    // The database a table-naming error concerns (spec/design/error-fields.md §12): the statement's
+    // target qualifier, else the implicit scope. UPDATE and DELETE stamp their own (they also run as
+    // writable-CTE children).
+    let targetDb: string | undefined;
+    if (stmt.kind === "createTable") targetDb = stmt.temp ? "temp" : stmt.db;
+    else if (stmt.kind === "alterTable" || stmt.kind === "createIndex" || stmt.kind === "insert") {
+      targetDb = stmt.db;
+    }
+    try {
+      return this.dispatchStmtTarget(stmt, params, insertHolder, allowInsertFill);
+    } catch (e) {
+      throw this.stampDatabase(targetDb, e);
+    }
+  }
+
+  private dispatchStmtTarget(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null,
+    allowInsertFill: boolean,
   ): Outcome {
     switch (stmt.kind) {
       case "analyze":
@@ -6455,7 +6523,9 @@ export class Engine {
         } else if (baseComposite !== undefined) {
           colType = arrayT(compositeT(baseComposite.name));
         } else {
-          throw engineError("undefined_object", "type does not exist: " + base);
+          throw engineError("undefined_object", "type does not exist: " + base).withPosition(
+            def.typeLoc,
+          );
         }
         decimal = null;
       } else if (rangeByName(def.typeName) !== undefined) {
@@ -6491,7 +6561,9 @@ export class Engine {
         colType = compositeT(ctype.name);
         decimal = null;
       } else {
-        throw engineError("undefined_object", "type does not exist: " + def.typeName);
+        throw engineError("undefined_object", "type does not exist: " + def.typeName).withPosition(
+          def.typeLoc,
+        );
       }
       // J1: json/jsonb columns are storable (the format-v19 value codec — spec/design/json.md §2/§4).
       // A json/jsonb PRIMARY KEY is still rejected 0A000 by the key-encodability gate below (PG ships
@@ -7522,11 +7594,34 @@ export class Engine {
           this.inputZone(),
         );
       } catch (e) {
-        throw assignmentHint(stampTable(e, table.name));
+        const err = assignmentHint(stampTable(e, table.name));
+        // Record the VALUES slot the value came from (spec/design/error-fields.md §10.2).
+        if (p >= 0 && err instanceof EngineError) err.atSlot(p);
+        throw err;
       }
     }
     if (nullCol >= 0) throw this.notNullRowViolation(table.name, table.columns[nullCol]!.name, row);
     return row;
+  }
+
+  // buildInsertRowAt is buildInsertRow for VALUES row r of a multi-row batch: a slot error it records
+  // moves to row r (spec/design/error-fields.md §10.2).
+  private buildInsertRowAt(
+    r: number,
+    table: Table,
+    colTypes: ColType[],
+    provided: number[],
+    values: Value[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    meter: Meter,
+  ): Row {
+    try {
+      return this.buildInsertRow(table, colTypes, provided, values, defaultExprs, rng, meter);
+    } catch (e) {
+      if (e instanceof EngineError) e.atRow(r);
+      throw e;
+    }
   }
 
   // notNullRowViolation is the 23502 for a NULL in NOT NULL column of the complete candidate row
@@ -7616,7 +7711,7 @@ export class Engine {
           d.fkName +
           " on table " +
           d.refTableName,
-      );
+      ).hinted(DROP_CASCADE);
     }
     // ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
     // now-dangling FK constraint (in place, preserving its rows), each in its own domain: views live
@@ -8035,7 +8130,7 @@ export class Engine {
                   throw engineError(
                     "dependent_objects_still_exist",
                     `cannot drop column ${action.name} of table ${original.name} because view ${users[0]} depends on it`,
-                  );
+                  ).hinted(DROP_CASCADE);
                 }
                 const closure = this.readSnap().viewDropClosure(users);
                 forgetViews(viewPlan, closure);
@@ -8078,7 +8173,7 @@ export class Engine {
               throw engineError(
                 "dependent_objects_still_exist",
                 `cannot drop column ${action.name} because other objects depend on it`,
-              );
+              ).hinted(DROP_CASCADE);
             if (action.cascade) {
               if (source.kind === "original")
                 for (const [key, child] of snap.tables)
@@ -8220,7 +8315,7 @@ export class Engine {
               throw engineError(
                 "dependent_objects_still_exist",
                 "cannot drop primary key because other objects depend on it",
-              );
+              ).hinted(DROP_CASCADE);
             if (action.cascade) {
               table.fks = table.fks.filter(
                 (fk) =>
@@ -8516,7 +8611,7 @@ export class Engine {
                 throw engineError(
                   "dependent_objects_still_exist",
                   `cannot drop constraint ${action.name} because other objects depend on it`,
-                );
+                ).hinted(DROP_CASCADE);
               if (action.cascade && hasOriginalCols)
                 cascadeUniqueCols.push(sortedUnique(originalCols));
               if (action.cascade)
@@ -9237,7 +9332,10 @@ export class Engine {
         composite = this.compositeType(base);
       if (scalar !== undefined) type = arrayT(scalarT(scalar));
       else if (composite !== undefined) type = arrayT(compositeT(composite.name));
-      else throw engineError("undefined_object", `type does not exist: ${base}`);
+      else
+        throw engineError("undefined_object", `type does not exist: ${base}`).withPosition(
+          def.typeLoc,
+        );
     } else if (rangeByName(def.typeName) !== undefined) {
       if (def.typeMod !== null)
         throw engineError(
@@ -9255,7 +9353,9 @@ export class Engine {
     } else {
       const composite = this.compositeType(def.typeName);
       if (composite === undefined)
-        throw engineError("undefined_object", `type does not exist: ${def.typeName}`);
+        throw engineError("undefined_object", `type does not exist: ${def.typeName}`).withPosition(
+          def.typeLoc,
+        );
       if (def.typeMod !== null)
         throw engineError(
           "feature_not_supported",
@@ -10133,7 +10233,7 @@ export class Engine {
             " on table " +
             owner.name +
             " requires it",
-        );
+        ).hinted(dropOwnerInstead(di.name, owner.name));
       }
       this.working().removeIndex(found[0], nameKey);
     }
@@ -11088,10 +11188,7 @@ export class Engine {
     }
     for (const at of alwaysTargeted) {
       if (rows.some((values) => values[at.pos]!.kind !== "default")) {
-        throw engineError(
-          "generated_always",
-          `cannot insert a non-DEFAULT value into column ${table.columns[at.col]!.name}`,
-        );
+        throw generatedAlwaysInsert(table.columns[at.col]!.name);
       }
     }
     const returning =
@@ -11158,7 +11255,11 @@ export class Engine {
             ? dateValue(0n)
             : dateClockValue(this, rng, this.session.environment, meter, sp.offsetDays);
         } else {
-          rv[p] = withAssignmentHint(() => materializeInsertValue(iv, ct, bound, this.inputZone()));
+          try {
+            rv[p] = materializeInsertValue(iv, ct, bound, this.inputZone());
+          } catch (e) {
+            throw locateLit(iv, assignmentHint(e));
+          }
         }
       }
       if (useSingle) singleValues = rv;
@@ -11173,45 +11274,50 @@ export class Engine {
       );
       meter.charge(foldCost.value);
     }
-    const returned = useSingle
-      ? this.insertOne(
-          plan.table,
-          store,
-          ins.db,
-          plan.pk,
-          plan.checks,
-          [],
-          plan.defaultExprs,
-          plan.rindexes,
-          plan.colls,
-          plan.colTypes,
-          rng,
-          plan.provided,
-          singleValues!,
-          returning,
-          bound,
-          ctx,
-          meter,
-        )
-      : this.insertRows(
-          plan.table,
-          store,
-          ins.db,
-          plan.pk,
-          plan.checks,
-          [],
-          plan.defaultExprs,
-          plan.rindexes,
-          plan.colls,
-          plan.colTypes,
-          rng,
-          plan.provided,
-          rows,
-          returning,
-          bound,
-          ctx,
-          meter,
-        );
+    let returned: Value[][] | null;
+    try {
+      returned = useSingle
+        ? this.insertOne(
+            plan.table,
+            store,
+            ins.db,
+            plan.pk,
+            plan.checks,
+            [],
+            plan.defaultExprs,
+            plan.rindexes,
+            plan.colls,
+            plan.colTypes,
+            rng,
+            plan.provided,
+            singleValues!,
+            returning,
+            bound,
+            ctx,
+            meter,
+          )
+        : this.insertRows(
+            plan.table,
+            store,
+            ins.db,
+            plan.pk,
+            plan.checks,
+            [],
+            plan.defaultExprs,
+            plan.rindexes,
+            plan.colls,
+            plan.colTypes,
+            rng,
+            plan.provided,
+            rows,
+            returning,
+            bound,
+            ctx,
+            meter,
+          );
+    } catch (e) {
+      throw locateValueSlot(rowsIn, e);
+    }
     if (rowsIn.length > 0) this.markEstimatorMutation(ins.db, ins.table);
     return dmlOutcome(
       plan.returning?.names ?? null,
@@ -11228,6 +11334,9 @@ export class Engine {
     const planning = Planning.begin();
     try {
       return this.executeInsertPlanned(written, params, ctx, planning);
+    } catch (e) {
+      // A writable-CTE child names its own target database (spec/design/error-fields.md §12).
+      throw this.stampDatabase(written.db, e);
     } finally {
       planning.end();
     }
@@ -11342,10 +11451,7 @@ export class Engine {
       // value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is 428C9 —
       // raised up front (PG raises it at rewrite), firing even over a zero-row source.
       if (alwaysTargeted.length > 0) {
-        throw engineError(
-          "generated_always",
-          `cannot insert a non-DEFAULT value into column ${table.columns[alwaysTargeted[0]!.col]!.name}`,
-        );
+        throw generatedAlwaysInsert(table.columns[alwaysTargeted[0]!.col]!.name);
       }
       // SELECT source (§24). Plan the source query, then resolve the RETURNING projection
       // (PostgreSQL's analysis order — both precede any execution), threading ONE ParamTypes
@@ -11493,10 +11599,7 @@ export class Engine {
     // values[pos] is in range.
     for (const at of alwaysTargeted) {
       if (rowsIn.some((values) => values[at.pos]!.kind !== "default")) {
-        throw engineError(
-          "generated_always",
-          `cannot insert a non-DEFAULT value into column ${table.columns[at.col]!.name}`,
-        );
+        throw generatedAlwaysInsert(table.columns[at.col]!.name);
       }
     }
     // Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
@@ -11565,9 +11668,11 @@ export class Engine {
               ? dateValue(0n)
               : dateClockValue(this, stmtRng, this.session.environment, meter, sp.offsetDays);
           } else {
-            rv[p] = withAssignmentHint(() =>
-              materializeInsertValue(iv, ct, bound, this.inputZone()),
-            );
+            try {
+              rv[p] = materializeInsertValue(iv, ct, bound, this.inputZone());
+            } catch (e) {
+              throw locateLit(iv, assignmentHint(e));
+            }
           }
         }
       }
@@ -11586,10 +11691,32 @@ export class Engine {
       vc.check = this.foldUncorrelatedInRExpr(vc.check, bound, ctx, foldCost);
     }
     meter.charge(foldCost.value);
-    const { affected, returned } = useSingle
-      ? {
-          affected: 1,
-          returned: this.insertOne(
+    let inserted: { affected: number; returned: Value[][] | null };
+    try {
+      inserted = useSingle
+        ? {
+            affected: 1,
+            returned: this.insertOne(
+              table,
+              store,
+              ins.db,
+              pk,
+              checks,
+              viewChecks,
+              defaultExprs,
+              this.resolveTableIndexes(table),
+              this.columnCollations(table.columns),
+              store.columnTypes(),
+              stmtRng,
+              provided,
+              singleValues!,
+              ret?.nodes ?? null,
+              bound,
+              ctx,
+              meter,
+            ),
+          }
+        : this.runInsertRows(
             table,
             store,
             ins.db,
@@ -11597,35 +11724,19 @@ export class Engine {
             checks,
             viewChecks,
             defaultExprs,
-            this.resolveTableIndexes(table),
-            this.columnCollations(table.columns),
-            store.columnTypes(),
             stmtRng,
             provided,
-            singleValues!,
+            rows,
+            cplan,
             ret?.nodes ?? null,
             bound,
             ctx,
             meter,
-          ),
-        }
-      : this.runInsertRows(
-          table,
-          store,
-          ins.db,
-          pk,
-          checks,
-          viewChecks,
-          defaultExprs,
-          stmtRng,
-          provided,
-          rows,
-          cplan,
-          ret?.nodes ?? null,
-          bound,
-          ctx,
-          meter,
-        );
+          );
+    } catch (e) {
+      throw locateValueSlot(rowsIn, e);
+    }
+    const { affected, returned } = inserted;
     if (affected > 0) this.markEstimatorMutation(ins.db, ins.table);
     return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
   }
@@ -11691,8 +11802,9 @@ export class Engine {
     // entry = prefix ‖ key is byte-identical to building it with the key directly (indexes.md §3/§4).
     const entryPrefixes: Uint8Array[][][] = [];
     let cunits = 0n;
-    for (const values of rows) {
-      const row = this.buildInsertRow(table, colTypes, provided, values, defaultExprs, rng, meter);
+    for (let r = 0; r < rows.length; r++) {
+      const values = rows[r]!;
+      const row = this.buildInsertRowAt(r, table, colTypes, provided, values, defaultExprs, rng, meter);
 
       // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
       // NULL (storeValue above), before the key/duplicate check (PG's per-row order,
@@ -12167,7 +12279,7 @@ export class Engine {
       // ordinary assignment is 428C9; the DEFAULT form advances the owned sequence through its
       // expression default.
       if (table.columns[idx]!.identity === "always" && !a.isDefault) {
-        throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
+        throw generatedAlwaysUpdate(a.column);
       }
       // Assigning a PRIMARY KEY member re-keys the existing row (upsert.md §5), the standalone
       // UPDATE rule carried onto the conflict path.
@@ -12433,10 +12545,11 @@ export class Engine {
       if (viewChecks.length > 0) evalViewChecks(viewChecks, row, checkEnv(), meter);
     };
 
-    for (const values of rows) {
+    for (let r = 0; r < rows.length; r++) {
+      const values = rows[r]!;
       // Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL before
       // CHECK before conflict; constraints.md §4.4).
-      const row = this.buildInsertRow(table, colTypes, provided, values, defaultExprs, rng, meter);
+      const row = this.buildInsertRowAt(r, table, colTypes, provided, values, defaultExprs, rng, meter);
       if (checks.length > 0) {
         meter.guard();
         evalChecks(checks, relation, row, checkEnv(), meter);
@@ -13120,6 +13233,9 @@ export class Engine {
     const planning = Planning.begin();
     try {
       return this.executeDeletePlanned(written, params, ctx, planning);
+    } catch (e) {
+      // The error names the target's database (spec/design/error-fields.md §12).
+      throw this.stampDatabase(written.db, e);
     } finally {
       planning.end();
     }
@@ -13339,6 +13455,9 @@ export class Engine {
     const planning = Planning.begin();
     try {
       return this.executeUpdatePlanned(written, params, ctx, planning);
+    } catch (e) {
+      // The error names the target's database (spec/design/error-fields.md §12).
+      throw this.stampDatabase(written.db, e);
     } finally {
       planning.end();
     }
@@ -13412,7 +13531,7 @@ export class Engine {
       // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
       // An ordinary assignment is 428C9; DEFAULT is allowed and advances the owned sequence.
       if (table.columns[idx]!.identity === "always" && !a.isDefault) {
-        throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
+        throw generatedAlwaysUpdate(a.column);
       }
       for (const p of plans) {
         if (p.idx === idx) {
@@ -14077,7 +14196,7 @@ export class Engine {
         if (anchorSrc.kind !== "query") {
           throw new Error("the anchor binding was just pushed as a query source");
         }
-        checkRecursiveColumnTypes(anchorSrc.plan, rhsPlan, lname, shape.unionAll, added);
+        checkRecursiveColumnTypes(so.lhs, anchorSrc.plan, rhsPlan, lname, shape.unionAll, added);
         bindings[bi]!.recursive = { plan: rhsPlan, unionAll: shape.unionAll, searchCycle: sc };
         continue;
       }
@@ -15590,7 +15709,7 @@ export class Engine {
       throw engineError(
         "dependent_objects_still_exist",
         `cannot drop view ${dep.name} because view ${dependent.name} depends on it`,
-      );
+      ).hinted(DROP_CASCADE);
     }
     // Phase 3: remove.
     for (const name of targets) this.working().removeView(name);
@@ -15688,7 +15807,7 @@ export class Engine {
         throw engineError(
           "dependent_objects_still_exist",
           `cannot drop table ${dep.name} because view ${view.name} depends on it`,
-        );
+        ).hinted(DROP_CASCADE);
       }
       seeds.push(view.name);
     }
@@ -15967,7 +16086,12 @@ export class Engine {
     });
     // Every form but UNION ALL matches rows, so each column needs an equality operator (42883 for
     // json / jsonpath, as PostgreSQL).
-    if (so.op !== "union" || !so.all) for (const t of columnTypes) requireSetopEquality(t);
+    if (so.op !== "union" || !so.all) {
+      // PostgreSQL reports a missing equality operator at the left operand's column.
+      columnTypes.forEach((t, i) =>
+        atPosition(outputColumnLocation(so.lhs, i), () => requireSetopEquality(t)),
+      );
+    }
     const columnNames = lhs.columnNames;
     // Each text column's common collation (spec/design/collation.md §1 "Set operations",
     // PostgreSQL): an implicit conflict is 42P21 except under UNION ALL, whose column then has none
@@ -16814,11 +16938,24 @@ export class Engine {
     // SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality operator
     // (PG ships no opclass — spec/design/json.md §5), so a json output column under DISTINCT is
     // 42883. jsonb IS distinguishable (its btree equality, §5).
-    if (sel.distinct && columnTypes.some((t) => t.kind === "json")) {
+    const jsonCol = sel.distinct ? columnTypes.findIndex((t) => t.kind === "json") : -1;
+    if (jsonCol >= 0) {
+      // Reported at that select item (error-fields.md §10.2), when the list has no `*` expansion to
+      // shift the columns.
+      let at: number | undefined;
+      if (
+        sel.items.kind === "list" &&
+        !sel.items.items.some((it) => it.expr.kind === "qualifiedStar" || it.expr.kind === "fieldStar")
+      ) {
+        const it = sel.items.items[jsonCol];
+        at = it === undefined ? undefined : exprLocation(it.expr);
+      }
       throw engineError(
         "undefined_function",
         "could not identify an equality operator for type json",
-      ).noHint();
+      )
+        .noHint()
+        .withPosition(at);
     }
     // Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
     // (spec/design/collation.md §1 "A sort or grouping target").
@@ -17019,175 +17156,187 @@ export class Engine {
     const orderExprs: RExpr[] = [];
     const items = sel.items;
     for (const key of sel.orderBy) {
-      // Classify the key into a row slot (a column / ordinal-to-column) or a source expression (a
-      // general expression, or an ordinal pointing at a computed projection).
-      let slotRes: Resolved | null = null;
-      let orderExpr: Expr | null = null;
-      if (key.ordinal !== null) {
-        const ord = key.ordinal;
-        const ncols = items.kind === "all" ? scope.width() : items.items.length;
-        if (ord < 1 || ord > ncols) {
-          throw engineError(
-            "invalid_column_reference",
-            `ORDER BY position ${ord} is not in select list`,
-          );
-        }
-        const pos = ord - 1;
-        if (items.kind === "all") {
-          slotRes = { level: 0, index: pos };
+      // A key with no ordering operator is reported where it was written (error-fields.md §10.2).
+      try {
+        // Classify the key into a row slot (a column / ordinal-to-column) or a source expression (a
+        // general expression, or an ordinal pointing at a computed projection).
+        let slotRes: Resolved | null = null;
+        let orderExpr: Expr | null = null;
+        if (key.ordinal !== null) {
+          const ord = key.ordinal;
+          const ncols = items.kind === "all" ? scope.width() : items.items.length;
+          if (ord < 1 || ord > ncols) {
+            throw engineError(
+              "invalid_column_reference",
+              `ORDER BY position ${ord} is not in select list`,
+            );
+          }
+          const pos = ord - 1;
+          if (items.kind === "all") {
+            slotRes = { level: 0, index: pos };
+          } else {
+            const e = items.items[pos]!.expr;
+            if (e.kind === "column") slotRes = scope.resolveBare(e.name);
+            else if (e.kind === "qualifiedColumn")
+              slotRes = scope.resolveQualified(e.qualifier, e.name);
+            else orderExpr = e;
+          }
+        } else if (key.expr !== null) {
+          orderExpr = key.expr;
+        } else if (key.qualifier !== null) {
+          // A qualified key (`t.a`) is always an input column — never an output alias (PG; §10).
+          slotRes = scope.resolveQualifiedAt(key.qualifier, key.column, key.loc);
         } else {
-          const e = items.items[pos]!.expr;
-          if (e.kind === "column") slotRes = scope.resolveBare(e.name);
-          else if (e.kind === "qualifiedColumn")
-            slotRes = scope.resolveQualified(e.qualifier, e.name);
-          else orderExpr = e;
+          // A bare name resolves an OUTPUT column (an AS alias or item's derived name) BEFORE an input
+          // column — PostgreSQL's SQL92 rule (grammar.md §10). A match routes the item EXACTLY like the
+          // same ORDER BY ordinal; no match falls through to the FROM scope (the prior behavior).
+          const matched = orderAliasMatch(items, key.column, scope);
+          if (matched === null) slotRes = scope.resolveBareAt(key.column, key.loc);
+          else if (matched.kind === "column") slotRes = scope.resolveBare(matched.name);
+          else if (matched.kind === "qualifiedColumn")
+            slotRes = scope.resolveQualified(matched.qualifier, matched.name);
+          else orderExpr = matched;
         }
-      } else if (key.expr !== null) {
-        orderExpr = key.expr;
-      } else if (key.qualifier !== null) {
-        // A qualified key (`t.a`) is always an input column — never an output alias (PG; §10).
-        slotRes = scope.resolveQualifiedAt(key.qualifier, key.column, key.loc);
-      } else {
-        // A bare name resolves an OUTPUT column (an AS alias or item's derived name) BEFORE an input
-        // column — PostgreSQL's SQL92 rule (grammar.md §10). A match routes the item EXACTLY like the
-        // same ORDER BY ordinal; no match falls through to the FROM scope (the prior behavior).
-        const matched = orderAliasMatch(items, key.column, scope);
-        if (matched === null) slotRes = scope.resolveBareAt(key.column, key.loc);
-        else if (matched.kind === "column") slotRes = scope.resolveBare(matched.name);
-        else if (matched.kind === "qualifiedColumn")
-          slotRes = scope.resolveQualified(matched.qualifier, matched.name);
-        else orderExpr = matched;
-      }
 
-      if (orderExpr === null) {
-        // A column / ordinal-to-column key resolves to a real row slot.
-        const r = slotRes!;
-        if (r.level !== 0) {
-          // A correlated (outer) column ORDER BY key — the local sort row has no slot for an
-          // enclosing-query column, so materialize it as an OuterColumn expression evaluated per row
-          // against the outer-row environment (query.order_by_correlated), exactly like a general-
-          // expression key. PostgreSQL accepts it (a degenerate constant leading key).
-          const col = scope.columnOf(r);
-          if (typeIsJson(col.type)) {
+        if (orderExpr === null) {
+          // A column / ordinal-to-column key resolves to a real row slot.
+          const r = slotRes!;
+          if (r.level !== 0) {
+            // A correlated (outer) column ORDER BY key — the local sort row has no slot for an
+            // enclosing-query column, so materialize it as an OuterColumn expression evaluated per row
+            // against the outer-row environment (query.order_by_correlated), exactly like a general-
+            // expression key. PostgreSQL accepts it (a degenerate constant leading key).
+            const col = scope.columnOf(r);
+            if (typeIsJson(col.type)) {
+              throw engineError(
+                "undefined_function",
+                "could not identify an ordering operator for type json",
+              ).hinted(NO_ORDERING_OPERATOR);
+            }
+            let oCollation: Collation | null = null;
+            if (key.collation !== null) {
+              if (!typeIsCollatable(col.type)) {
+                throw typeError(
+                  `collations are not supported by type ${typeCanonicalName(col.type)}`,
+                );
+              }
+              oCollation = resolveCollationName(scope.catalog, key.collation);
+            } else {
+              oCollation = columnCollation(scope, r);
+            }
+            const k = orderExprs.length;
+            // A column of a view being written through is its column or select item (views.md §15.2).
+            orderExprs.push(
+              r.layer === undefined
+                ? { kind: "outerColumn", level: r.level, index: r.index }
+                : resolveColumnRef(scope, { collecting: false, groupKeys: [], specs: [] }, r, key.column).node,
+            );
+            order.push({
+              idx: ORDER_EXPR_BASE + k,
+              descending: key.descending,
+              nullsFirst: key.nullsFirst,
+              collation: oCollation,
+            });
+            continue;
+          }
+          // `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
+          // ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
+          if (typeIsJson(scope.columnAt(r.index).type)) {
             throw engineError(
               "undefined_function",
               "could not identify an ordering operator for type json",
             ).hinted(NO_ORDERING_OPERATOR);
           }
-          let oCollation: Collation | null = null;
+          const idx = r.index;
+          // The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
+          // text column (42804) and name a loaded collation ("C" → byte order, else 42704); absent a
+          // clause, the key inherits the column's frozen (implicit) collation.
+          let collation: Collation | null = null;
           if (key.collation !== null) {
-            if (!typeIsCollatable(col.type)) {
+            if (!typeIsCollatable(scope.columnAt(idx).type)) {
               throw typeError(
-                `collations are not supported by type ${typeCanonicalName(col.type)}`,
+                `collations are not supported by type ${typeCanonicalName(scope.columnAt(idx).type)}`,
               );
             }
-            oCollation = resolveCollationName(scope.catalog, key.collation);
+            collation = resolveCollationName(scope.catalog, key.collation);
           } else {
-            oCollation = columnCollation(scope, r);
+            collation = columnCollation(scope, r);
           }
-          const k = orderExprs.length;
-          // A column of a view being written through is its column or select item (views.md §15.2).
-          orderExprs.push(
-            r.layer === undefined
-              ? { kind: "outerColumn", level: r.level, index: r.index }
-              : resolveColumnRef(scope, { collecting: false, groupKeys: [], specs: [] }, r, key.column).node,
-          );
+          let slot = idx;
+          if (isAgg) {
+            slot = groupKeys.indexOf(idx);
+            if (slot < 0) throw groupingErrorColumn(key.column);
+          }
           order.push({
-            idx: ORDER_EXPR_BASE + k,
+            idx: slot,
             descending: key.descending,
             nullsFirst: key.nullsFirst,
-            collation: oCollation,
+            collation,
           });
           continue;
         }
-        // `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
-        // ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
-        if (typeIsJson(scope.columnAt(r.index).type)) {
+
+        // Resolve the key expression in the SAME context the projection used, so a window function /
+        // GROUPING() / aggregate it contains collects into the shared specs and references the same
+        // placeholders (rebased together after this loop — grammar.md §10): a grouped query collects over
+        // the group keys + aggregates + GROUPING() calls (a new aggregate or GROUPING() the select list
+        // lacks is allowed); a window query collects window specs/keys; a grouped+window query does both
+        // (query.order_by_grouped_window); a plain query forbids aggregates (42803) and window functions
+        // (42P20).
+        const octx: AggCtx = hasWindowSyntax
+          ? {
+              collecting: isAgg,
+              groupKeys,
+              groupKeyExprs,
+              specs: aggSpecs,
+              groupingSpecs,
+              window: { base: WINDOW_RESULT_BASE, windowSpecs, windowKeys },
+            }
+          : { collecting: isAgg, groupKeys, groupKeyExprs, specs: aggSpecs, groupingSpecs };
+        const { node, type } = resolve(scope, orderExpr, null, octx, ptypes);
+        aggSpecs = octx.specs;
+        groupingSpecs = octx.groupingSpecs ?? groupingSpecs;
+        // A correlated ORDER BY expression (one referencing an enclosing query) is allowed
+        // (query.order_by_correlated): the outer column is a per-evaluation constant of the enclosing
+        // row, evaluated against the outer-row environment still in scope when materializeOrderExprs
+        // runs. PostgreSQL accepts it; it is a degenerate (constant) leading key.
+        // A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
+        if (type.kind === "json") {
           throw engineError(
             "undefined_function",
             "could not identify an ordering operator for type json",
           ).hinted(NO_ORDERING_OPERATOR);
         }
-        const idx = r.index;
-        // The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
-        // text column (42804) and name a loaded collation ("C" → byte order, else 42704); absent a
-        // clause, the key inherits the column's frozen (implicit) collation.
-        let collation: Collation | null = null;
+        // The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
+        // parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
+        // DERIVED from the key expression.
+        let coll: Collation | null = null;
         if (key.collation !== null) {
-          if (!typeIsCollatable(scope.columnAt(idx).type)) {
-            throw typeError(
-              `collations are not supported by type ${typeCanonicalName(scope.columnAt(idx).type)}`,
-            );
+          if (!rtCollatable(type) && type.kind !== "null") {
+            throw typeError(`collations are not supported by type ${rtName(type)}`);
           }
-          collation = resolveCollationName(scope.catalog, key.collation);
+          coll = resolveCollationName(scope.catalog, key.collation);
         } else {
-          collation = columnCollation(scope, r);
+          coll = sortTargetCollation(scope.catalog, deriveCollation(scope, orderExpr));
         }
-        let slot = idx;
-        if (isAgg) {
-          slot = groupKeys.indexOf(idx);
-          if (slot < 0) throw groupingErrorColumn(key.column);
-        }
+        const k = orderExprs.length;
+        orderExprs.push(node);
         order.push({
-          idx: slot,
+          idx: ORDER_EXPR_BASE + k,
           descending: key.descending,
           nullsFirst: key.nullsFirst,
-          collation,
+          collation: coll,
         });
-        continue;
-      }
-
-      // Resolve the key expression in the SAME context the projection used, so a window function /
-      // GROUPING() / aggregate it contains collects into the shared specs and references the same
-      // placeholders (rebased together after this loop — grammar.md §10): a grouped query collects over
-      // the group keys + aggregates + GROUPING() calls (a new aggregate or GROUPING() the select list
-      // lacks is allowed); a window query collects window specs/keys; a grouped+window query does both
-      // (query.order_by_grouped_window); a plain query forbids aggregates (42803) and window functions
-      // (42P20).
-      const octx: AggCtx = hasWindowSyntax
-        ? {
-            collecting: isAgg,
-            groupKeys,
-            groupKeyExprs,
-            specs: aggSpecs,
-            groupingSpecs,
-            window: { base: WINDOW_RESULT_BASE, windowSpecs, windowKeys },
-          }
-        : { collecting: isAgg, groupKeys, groupKeyExprs, specs: aggSpecs, groupingSpecs };
-      const { node, type } = resolve(scope, orderExpr, null, octx, ptypes);
-      aggSpecs = octx.specs;
-      groupingSpecs = octx.groupingSpecs ?? groupingSpecs;
-      // A correlated ORDER BY expression (one referencing an enclosing query) is allowed
-      // (query.order_by_correlated): the outer column is a per-evaluation constant of the enclosing
-      // row, evaluated against the outer-row environment still in scope when materializeOrderExprs
-      // runs. PostgreSQL accepts it; it is a degenerate (constant) leading key.
-      // A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
-      if (type.kind === "json") {
-        throw engineError(
-          "undefined_function",
-          "could not identify an ordering operator for type json",
-        ).hinted(NO_ORDERING_OPERATOR);
-      }
-      // The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
-      // parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
-      // DERIVED from the key expression.
-      let coll: Collation | null = null;
-      if (key.collation !== null) {
-        if (!rtCollatable(type) && type.kind !== "null") {
-          throw typeError(`collations are not supported by type ${rtName(type)}`);
+      } catch (e) {
+        if (
+          e instanceof EngineError &&
+          e.state === "undefined_function" &&
+          e.message.startsWith("42883: could not identify")
+        ) {
+          e.withPosition(orderKeyLocation(key));
         }
-        coll = resolveCollationName(scope.catalog, key.collation);
-      } else {
-        coll = sortTargetCollation(scope.catalog, deriveCollation(scope, orderExpr));
+        throw e;
       }
-      const k = orderExprs.length;
-      orderExprs.push(node);
-      order.push({
-        idx: ORDER_EXPR_BASE + k,
-        descending: key.descending,
-        nullsFirst: key.nullsFirst,
-        collation: coll,
-      });
     }
     return { order, orderExprs, aggSpecs, groupingSpecs };
   }
@@ -17234,7 +17383,9 @@ export class Engine {
             throw engineError(
               "undefined_function",
               "could not identify an equality operator for type json",
-            ).noHint();
+            )
+              .noHint()
+              .withPosition(exprLocation(key));
           }
           const idx = gr.index;
           if (!groupKeys.includes(idx)) {
@@ -17250,7 +17401,9 @@ export class Engine {
           throw engineError(
             "undefined_function",
             "could not identify an equality operator for type json",
-          ).noHint();
+          )
+            .noHint()
+            .withPosition(exprLocation(key));
         }
         // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`); a bare
         // enclosing-query column key is matched by the column it names, whatever its spelling
