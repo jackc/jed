@@ -1,0 +1,440 @@
+# Named windows — PostgreSQL's whole-clause rules (spec/design/window.md §5.3, PostgreSQL
+# transformWindowDefinitions / transformWindowFuncCall). A WINDOW name is an identifier (folded unless
+# quoted) scoped to its own query level: a subquery cannot see an enclosing query's WINDOW clause
+# (42704). A name defined twice in one clause is 42P20. Every entry is validated even when no OVER
+# references it — an unknown column (42703), a nested window function (42P20), a non-grouping column
+# in a grouped query (42803) — and an aggregate in an entry's keys makes the query an aggregate query;
+# a negative frame offset is a run-time check in PostgreSQL, so an unreferenced entry carrying one is
+# accepted. `OVER name` in WHERE / HAVING / GROUP BY / a JOIN ON is 42P20, as an inline OVER is. A
+# named window serves the query ORDER BY (by expression, ordinal, or alias), a DISTINCT, a view, a
+# CTE, and a set-operation arm, and its functions may nest inside other expressions.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_named, query.window_ranking, query.window_aggregate, query.window_frame, query.window_base_extend, query.order_by, query.group_by, query.aggregates, query.window_grouped, query.subquery_scalar, query.subquery_correlated, query.cte, query.union, query.distinct, query.window_frame_exclude, types.i32, query.aggregate_filter, query.derived_table, ddl.view
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 2, 50)
+
+# A name defined twice in one WINDOW clause is 42P20.
+statement error 42P20
+SELECT id FROM t WINDOW w AS (ORDER BY id), w AS (ORDER BY g)
+
+# An unquoted window name folds to lower case, like any identifier ...
+query II nosort
+SELECT id, row_number() OVER W FROM t WINDOW w AS (ORDER BY id DESC) ORDER BY id
+----
+1
+5
+2
+4
+3
+3
+4
+2
+5
+1
+
+# ... a quoted one keeps its case ...
+query II nosort
+SELECT id, row_number() OVER "W" FROM t WINDOW "W" AS (ORDER BY id DESC) ORDER BY id
+----
+1
+5
+2
+4
+3
+3
+4
+2
+5
+1
+
+# ... so a quoted "W" does not match the folded w (42704).
+statement error 42704
+SELECT id, row_number() OVER "W" FROM t WINDOW w AS (ORDER BY id DESC) ORDER BY id
+
+# A subquery cannot see the enclosing query's WINDOW clause.
+statement error 42704
+SELECT id, (SELECT count(*) OVER w FROM t t2 WHERE t2.id = t.id) FROM t WINDOW w AS (ORDER BY id)
+
+# A named window over the grouped rows.
+query ID nosort
+SELECT g, sum(sum(v)) OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) ORDER BY g
+----
+1
+30
+2
+150
+
+# An unreferenced entry's non-grouping column is 42803.
+statement error 42803
+SELECT g FROM t GROUP BY g WINDOW w AS (ORDER BY v)
+
+# A named-window call in the query ORDER BY only.
+query II nosort
+SELECT id, v FROM t WINDOW w AS (ORDER BY v DESC) ORDER BY row_number() OVER w
+----
+5
+50
+4
+40
+3
+30
+2
+20
+1
+10
+
+# A pure OVER w copies a framed (EXCLUDE) definition whole.
+query II nosort
+SELECT id, sum(v) OVER w FROM t WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) ORDER BY id
+----
+1
+20
+2
+40
+3
+60
+4
+80
+5
+40
+
+# Extending a PARTITION-only base with an ORDER BY and a frame.
+query II nosort
+SELECT id, sum(v) OVER (w ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t WINDOW w AS (PARTITION BY g) ORDER BY id
+----
+1
+10
+2
+30
+3
+30
+4
+70
+5
+90
+
+# A chained entry extended again inline with a frame.
+query II nosort
+SELECT id, sum(v) OVER (w2 ROWS UNBOUNDED PRECEDING) FROM t WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY v DESC) ORDER BY id
+----
+1
+30
+2
+20
+3
+120
+4
+90
+5
+50
+
+# A self-reference is 42704 (the base must be an earlier entry).
+statement error 42704
+SELECT id FROM t WINDOW w AS (w ORDER BY id)
+
+# A WINDOW clause in a set-operation arm.
+query II rowsort
+SELECT id, row_number() OVER w FROM t WINDOW w AS (ORDER BY id) UNION ALL SELECT id, 0 FROM t
+----
+1
+0
+1
+1
+2
+0
+2
+2
+3
+0
+3
+3
+4
+0
+4
+4
+5
+0
+5
+5
+
+# SELECT DISTINCT over a named-window result.
+query I rowsort
+SELECT DISTINCT count(*) OVER w FROM t WINDOW w AS (PARTITION BY g)
+----
+2
+3
+
+# A WINDOW clause in a CTE body.
+query II nosort
+WITH c AS (SELECT id, rank() OVER w AS r FROM t WINDOW w AS (ORDER BY g)) SELECT id, r FROM c ORDER BY id
+----
+1
+1
+2
+1
+3
+3
+4
+3
+5
+3
+
+# An unreferenced entry copying a framed base is 42P20.
+statement error 42P20
+SELECT id FROM t WINDOW w AS (ORDER BY id ROWS CURRENT ROW), w2 AS (w)
+
+# OVER name in HAVING is 42P20.
+statement error 42P20
+SELECT g FROM t GROUP BY g HAVING count(*) OVER w > 0 WINDOW w AS ()
+
+# OVER name in WHERE is 42P20.
+statement error 42P20
+SELECT id FROM t WHERE row_number() OVER w > 1 WINDOW w AS ()
+
+# An empty definition: the whole table is one partition.
+query II nosort
+SELECT id, count(*) OVER w FROM t WINDOW w AS () ORDER BY id
+----
+1
+5
+2
+5
+3
+5
+4
+5
+5
+5
+
+# Offset and value functions sharing one named window.
+query IIII nosort
+SELECT id, lag(v) OVER w, lead(v) OVER w, first_value(v) OVER w FROM t WINDOW w AS (PARTITION BY g ORDER BY v) ORDER BY id
+----
+1
+NULL
+20
+10
+2
+10
+NULL
+10
+3
+NULL
+40
+30
+4
+30
+50
+30
+5
+40
+NULL
+30
+
+# An unreferenced entry's unknown column is 42703.
+statement error 42703
+SELECT id FROM t WINDOW w AS (ORDER BY nosuch)
+
+# A window function inside an unreferenced entry's key is 42P20.
+statement error 42P20
+SELECT id FROM t WINDOW w AS (ORDER BY row_number() OVER ())
+
+# COLLATE on a non-text key of an unreferenced entry is 42804.
+statement error 42804
+SELECT id FROM t WINDOW w AS (ORDER BY v COLLATE "C")
+
+# A negative offset is checked only when an active window runs — an unreferenced entry is fine.
+statement ok
+SELECT id FROM t WINDOW w AS (ORDER BY id ROWS -1 PRECEDING)
+
+# An aggregate in an entry's keys groups the whole table, so the bare id is 42803 ...
+statement error 42803
+SELECT id FROM t WINDOW w AS (ORDER BY sum(v))
+
+# ... and a query of constants returns the single whole-table group.
+query I nosort
+SELECT 1 FROM t WINDOW w AS (ORDER BY sum(v))
+----
+1
+
+# A grouped query's unreferenced entry may order by an aggregate.
+query I nosort
+SELECT g FROM t GROUP BY g WINDOW w AS (ORDER BY count(*)) ORDER BY g
+----
+1
+2
+
+# A named window ordered by an aggregate over the grouped rows.
+query II nosort
+SELECT g, rank() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY sum(v) DESC) ORDER BY g
+----
+1
+2
+2
+1
+
+# OVER name in GROUP BY is 42P20.
+statement error 42P20
+SELECT g FROM t GROUP BY g, row_number() OVER w WINDOW w AS ()
+
+# OVER name in a JOIN ON is 42P20.
+statement error 42P20
+SELECT a.id FROM t a JOIN t b ON row_number() OVER w = 1 WINDOW w AS ()
+
+# A duplicate name is 42P20 even when the second entry names the first as its base.
+statement error 42P20
+SELECT id FROM t WINDOW w AS (ORDER BY id), w AS (w ROWS CURRENT ROW)
+
+# A base-extending window call in the query ORDER BY.
+query II nosort
+SELECT id, v FROM t WINDOW w AS (PARTITION BY g) ORDER BY sum(v) OVER (w ORDER BY id) DESC, id
+----
+5
+50
+4
+40
+2
+20
+3
+30
+1
+10
+
+# SELECT DISTINCT with the same named-window call in the select list and ORDER BY.
+query II nosort
+SELECT DISTINCT g, sum(v) OVER w FROM t WINDOW w AS (PARTITION BY g) ORDER BY sum(v) OVER w
+----
+1
+30
+2
+120
+
+# A view whose body has a WINDOW clause (stored as text, planned at each use).
+statement ok
+CREATE VIEW vw AS SELECT id, row_number() OVER w AS rn, sum(v) OVER (w ROWS UNBOUNDED PRECEDING) AS s FROM t WINDOW w AS (PARTITION BY g ORDER BY v DESC)
+
+query III nosort
+SELECT id, rn, s FROM vw ORDER BY id
+----
+1
+2
+30
+2
+1
+20
+3
+3
+120
+4
+2
+90
+5
+1
+50
+
+# ORDER BY an ordinal naming a named-window item ...
+query II nosort
+SELECT id, row_number() OVER w AS rn FROM t WINDOW w AS (ORDER BY v DESC) ORDER BY 2
+----
+5
+1
+4
+2
+3
+3
+2
+4
+1
+5
+
+# ... and its alias.
+query II nosort
+SELECT id, row_number() OVER w AS rn FROM t WINDOW w AS (ORDER BY v DESC) ORDER BY rn
+----
+5
+1
+4
+2
+3
+3
+2
+4
+1
+5
+
+# DISTINCT ordered by a named-window call plus a column.
+query II nosort
+SELECT DISTINCT g, count(*) OVER w FROM t WINDOW w AS (PARTITION BY g) ORDER BY count(*) OVER w, g
+----
+1
+2
+2
+3
+
+# Named-window calls nested inside a function argument and a CASE.
+query II nosort
+SELECT id, coalesce(lag(v) OVER w, 0) + CASE WHEN rank() OVER w = 1 THEN 100 ELSE 0 END FROM t WINDOW w AS (PARTITION BY g ORDER BY v) ORDER BY id
+----
+1
+100
+2
+10
+3
+100
+4
+30
+5
+40
+
+# FILTER on a named-window aggregate.
+query II nosort
+SELECT id, sum(v) FILTER (WHERE v > 10) OVER w FROM t WINDOW w AS (ORDER BY id) ORDER BY id
+----
+1
+NULL
+2
+20
+3
+50
+4
+90
+5
+140
+
+# A correlated subquery with its own WINDOW clause.
+query II nosort
+SELECT id, (SELECT max(r) FROM (SELECT rank() OVER w AS r FROM t t2 WHERE t2.g = t.g WINDOW w AS (ORDER BY v)) s) FROM t ORDER BY id
+----
+1
+2
+2
+2
+3
+3
+4
+3
+5
+3
+
+# A named window beside a correlated scalar subquery.
+query III nosort
+SELECT id, row_number() OVER w, (SELECT count(*) FROM t t2 WHERE t2.g = t.g) FROM t WINDOW w AS (PARTITION BY g ORDER BY id) ORDER BY id
+----
+1
+1
+2
+2
+2
+2
+3
+1
+3
+4
+2
+3
+5
+3
+3

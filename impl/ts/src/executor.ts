@@ -16175,6 +16175,17 @@ export class Engine {
       const cloned = cloneAst(sel.items);
       desugarItems(cloned, windowsResolved);
       itemsRef = cloned;
+      // The query ORDER BY may carry window calls too (`ORDER BY row_number() OVER w`), so its keys
+      // are desugared against the same WINDOW clause (window.md §5.3); the ORDER BY and DISTINCT
+      // checks below then read the desugared items and keys.
+      let orderBy = sel.orderBy;
+      if (orderByHasWindow(sel.orderBy)) {
+        orderBy = cloneAst(sel.orderBy);
+        for (const key of orderBy) {
+          if (key.expr !== null) desugarNamedWindows(key.expr, windowsResolved);
+        }
+      }
+      sel = { ...sel, items: itemsRef, orderBy };
     }
     const {
       nodes: projections,
@@ -16203,6 +16214,8 @@ export class Engine {
             columnTypmods,
           )
         : null;
+    // Validate every WINDOW-clause entry's keys and frame, referenced or not (window.md §5.3).
+    if (windowsResolved.length > 0) validateWindowClause(scope, windowsResolved, projAgg, ptypes);
     let aggSpecs = projAgg.specs;
     let groupingSpecs: number[][] = projAgg.groupingSpecs ?? [];
     // The collected window specs + materialized window-key expressions (empty unless a window query).
@@ -34093,6 +34106,11 @@ export function extendWindow(base: WindowDef, ext: WindowDef, baseName: string):
 export function resolveWindowClause(windows: [string, WindowDef][]): [string, WindowDef][] {
   const resolved: [string, WindowDef][] = [];
   for (const [name, def] of windows) {
+    // A name defined twice in one clause is 42P20 — checked before the base lookup, as
+    // PostgreSQL's transformWindowDefinitions does.
+    if (resolved.some(([n]) => n === name)) {
+      throw engineError("windowing_error", `window "${name}" is already defined`);
+    }
     let r = def;
     if (def.base != null && def.base !== "") {
       const base = lookupWindow(resolved, def.base);
@@ -35690,6 +35708,39 @@ export function windowKeySlot(rexpr: RExpr, clause: string, windowKeys: RExpr[])
 // aggregate key keeps its real slot; any compound key is materialized into windowKeys at a
 // WINDOW_KEY_BASE+k placeholder. A key referencing an enclosing-query column (a correlated window) is
 // 0A000; a window function inside a key is rejected by keyCtx (42P20).
+// validateWindowClause validates every resolved WINDOW-clause entry's keys and frame
+// (spec/design/window.md §5.3), even an entry no OVER references — PostgreSQL's
+// transformWindowDefinitions transforms the whole clause, so an unreferenced entry's unknown column
+// (42703), nested window function (42P20), non-grouping column in a grouped query (42803), or bad
+// frame is still an error. The keys resolve exactly as a referenced window's do (resolveWindowCall):
+// under the query's collecting context when it groups, else Forbidden. The resolution is discarded —
+// a scratch context and key list — so validation changes no plan, result, or cost. A negative frame
+// offset (22013) is not an error here: PostgreSQL raises it only when an active window runs.
+export function validateWindowClause(
+  scope: Scope,
+  windows: [string, WindowDef][],
+  ag: AggCtx,
+  params: ParamTypes,
+): void {
+  for (const [, wd] of windows) {
+    const sub: AggCtx = ag.collecting
+      ? {
+          collecting: true,
+          groupKeys: ag.groupKeys,
+          groupKeyExprs: ag.groupKeyExprs,
+          specs: [...ag.specs],
+          groupingSpecs: [...(ag.groupingSpecs ?? [])],
+        }
+      : { collecting: false, groupKeys: [], specs: [] };
+    try {
+      resolveWindowDef(scope, wd, sub, [], params);
+    } catch (err) {
+      if (err instanceof EngineError && err.code() === "22013") continue;
+      throw err;
+    }
+  }
+}
+
 export function resolveWindowDef(
   scope: Scope,
   wd: WindowDef,

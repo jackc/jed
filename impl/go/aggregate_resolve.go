@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -919,6 +920,34 @@ func windowKeySlot(rexpr *rExpr, clause string, windowKeys *[]*rExpr) (int, erro
 // aggregate key (reColumn) keeps its real slot; any compound key is materialized into windowKeys at a
 // windowKeyBase+k placeholder. A key referencing an enclosing-query column (a correlated window) is
 // 0A000; a window function inside a key is rejected by keyCtx (42P20).
+// validateWindowClause validates every resolved WINDOW-clause entry's keys and frame
+// (spec/design/window.md §5.3), even an entry no OVER references — PostgreSQL's
+// transformWindowDefinitions transforms the whole clause, so an unreferenced entry's unknown column
+// (42703), nested window function (42P20), non-grouping column in a grouped query (42803), or bad
+// frame is still an error. The keys resolve exactly as a referenced window's do (resolveWindowCall):
+// under the query's collecting context when it groups, else Forbidden. The resolution is discarded —
+// a scratch context and key list — so validation changes no plan, result, or cost. A negative frame
+// offset (22013) is not an error here: PostgreSQL raises it only when an active window runs.
+func validateWindowClause(s *scope, windows []namedWindow, ag *aggCtx, params *paramTypes) error {
+	for i := range windows {
+		var scratchKeys []*rExpr
+		sub := &aggCtx{}
+		if ag.collecting {
+			specs := append([]aggSpec(nil), ag.specs...)
+			groupingSpecs := append([][]int(nil), ag.groupingSpecs...)
+			sub = &aggCtx{collecting: true, groupKeys: ag.groupKeys, groupKeyExprs: ag.groupKeyExprs, specs: specs, groupingSpecs: groupingSpecs}
+		}
+		if _, _, _, err := resolveWindowDef(s, &windows[i].Def, sub, &scratchKeys, params); err != nil {
+			var ee *EngineError
+			if errors.As(err, &ee) && ee.Code() == "22013" {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rExpr, params *paramTypes) ([]int, []orderSlot, *resolvedFrame, error) {
 	partition := make([]int, 0, len(wd.Partition))
 	for _, key := range wd.Partition {

@@ -2313,6 +2313,21 @@ iterations = 10
 seed = 4222
 expect_rows_per_iter = 100
 
+# SHARED WINDOW (window.md §5.2/§5.3, S5). Four functions over ONE named window: jed partitions the
+# 10k rows by customer and sorts each partition once, then computes every function over the shared
+# sorted partitions (`group_window_specs`). The window ORDER BY ends in the unique id, so every
+# engine numbers, ranks, sums, and lags identically; sum(int) is bigint everywhere.
+[[bench]]
+name = "window_shared_named"
+description = "Four window functions over one named window (PARTITION BY customer_id ORDER BY amount, id) on 10k rows — one shared partition/sort pass"
+dataset = "small"
+kind = "query"
+sql = "SELECT id, row_number() OVER w AS rn, rank() OVER w AS rk, sum(amount) OVER w AS s, lag(amount) OVER w AS prev FROM orders WINDOW w AS (PARTITION BY customer_id ORDER BY amount, id) ORDER BY id"
+warmup = 2
+iterations = 10
+seed = 4224
+expect_rows_per_iter = 10000
+
 # Concurrent-reader throughput on the shared Database (the slice-7 convergence, session.md §2.4/§10;
 # the benchmarks.md §11 backfill now that file-backed concurrent sessions have landed). `kind =
 # "concurrent_read"` opens ONE Database and mints `readers` independent reader Sessions, then runs the

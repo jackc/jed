@@ -7205,6 +7205,14 @@ pub(crate) fn resolve_window_clause(
 ) -> Result<Vec<(String, WindowDef)>> {
     let mut resolved: Vec<(String, WindowDef)> = Vec::with_capacity(windows.len());
     for (name, def) in windows {
+        // A name defined twice in one clause is 42P20 — checked before the base lookup, as
+        // PostgreSQL's `transformWindowDefinitions` does.
+        if resolved.iter().any(|(n, _)| n == name) {
+            return Err(EngineError::new(
+                SqlState::WindowingError,
+                format!("window \"{name}\" is already defined"),
+            ));
+        }
         let r = if let Some(base_name) = &def.base {
             let base = lookup_window(&resolved, base_name)?;
             extend_window(&base, def, base_name)?

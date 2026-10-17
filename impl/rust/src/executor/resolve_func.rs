@@ -4490,7 +4490,7 @@ fn resolve_node(
             filter,
             variadic,
             over,
-            over_name: _, // desugared to `over` before resolution (window.md §5)
+            over_name,
             within_group,
             agg_order,
             ..
@@ -4550,6 +4550,22 @@ fn resolve_node(
             // is 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
             if within_group.is_some() {
                 return Err(no_agg_overload(&name.to_string()));
+            }
+            // An `OVER name` the desugar pass did not reach (window.md §5.3) sits where a window
+            // function cannot run (WHERE, HAVING, GROUP BY, a JOIN ON, …) — 42P20, PostgreSQL's
+            // context check, which precedes its name lookup; in a window context it names no
+            // WINDOW-clause entry — 42704.
+            if let Some(wname) = over_name {
+                return Err(match agg {
+                    AggCtx::Window { .. } | AggCtx::GroupedWindow { .. } => EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!("window \"{wname}\" does not exist"),
+                    ),
+                    _ => EngineError::new(
+                        SqlState::WindowingError,
+                        "window functions are not allowed here",
+                    ),
+                });
             }
             // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
             if let Some(wd) = over {

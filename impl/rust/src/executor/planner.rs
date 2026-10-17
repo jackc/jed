@@ -1239,6 +1239,22 @@ impl Engine {
             } else {
                 &sel.items
             };
+            // The query ORDER BY may carry window calls too (`ORDER BY row_number() OVER w`), so its
+            // keys are desugared against the same WINDOW clause (window.md §5.3).
+            let desugared_order;
+            let order_by_ref: &[OrderKey] =
+                if has_window_syntax && order_by_has_window(&sel.order_by) {
+                    let mut ob = sel.order_by.clone();
+                    for key in ob.iter_mut() {
+                        if let Some(e) = key.expr.as_mut() {
+                            desugar_named_windows(e, windows_ref)?;
+                        }
+                    }
+                    desugared_order = ob;
+                    &desugared_order
+                } else {
+                    &sel.order_by
+                };
             let (
                 mut projections,
                 mut column_names,
@@ -1276,6 +1292,10 @@ impl Engine {
                     None
                 })
             })?;
+            // Validate every WINDOW-clause entry's keys and frame, referenced or not (window.md §5.3).
+            if !windows_ref.is_empty() {
+                validate_window_clause(&scope, windows_ref, &mut agg_ctx, ptypes)?;
+            }
             // Pull the collected aggregate + window specs (and materialized window-key expressions) out of
             // the projection context. A grouped+window query (`GroupedWindow`) carries all; a plain
             // aggregate/window query carries one (the rest empty). spec/design/window.md §5.1.
@@ -1428,9 +1448,9 @@ impl Engine {
             // aggregate in a grouped query if it names one), collected into `order_exprs`, and given a
             // placeholder sort slot `ORDER_EXPR_BASE + k` rebased to `final_width + k` below — the
             // window-key precedent (window.md §5.1). The sort then runs over the appended values.
-            let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(sel.order_by.len());
+            let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(order_by_ref.len());
             let mut order_exprs: Vec<RExpr> = Vec::new();
-            for key in &sel.order_by {
+            for key in order_by_ref {
                 outline(|| -> Result<()> {
                     // Classify the key into a row slot (a column / ordinal-to-column) or a source expression
                     // (a general expression, or an ordinal pointing at a computed projection).
@@ -1826,7 +1846,7 @@ impl Engine {
                         };
                         matches!(r, Ok(Resolved::Local(i)) if projected.contains(&i))
                     };
-                    if !sel.order_by.iter().all(in_list) {
+                    if !order_by_ref.iter().all(in_list) {
                         return Err(EngineError::new(
                             SqlState::InvalidColumnReference,
                             "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
