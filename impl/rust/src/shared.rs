@@ -57,7 +57,7 @@
 //! return it. The [`Database`] (the `Send + Sync` core, the old `Database`) is reached via
 //! [`Database::core`] for genuine concurrency (it is what crosses threads and mints sessions).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 #[cfg(unix)]
 use std::sync::Weak;
@@ -330,6 +330,35 @@ pub(crate) struct Storage {
     /// Set on a page client's main domain: its file is the owner's, reached through the service
     /// store (page-service.md §4.2), so it never syncs the file's directory.
     service_client: bool,
+    /// The handle's synchronous = off (validated-cow.md §4): a file commit defers its barrier to a
+    /// flush. Ignored in memory and on a page client's storage, whose commits the owner syncs.
+    relaxed: bool,
+    /// The in-flight background cap flush, if any; every later storage operation waits for it first
+    /// ([`Storage::await_flush`]), so it changes only when the barrier runs, never what is written.
+    flushing: Option<std::thread::JoinHandle<Result<()>>>,
+    /// Run the cap flush on the committing thread instead (the deterministic simulator).
+    inline_flush: bool,
+    /// The free list as of the floor — recorded by the first commit of a relaxed batch — the only
+    /// pages a pending commit may reuse (validated-cow.md §4 rule 3).
+    floor_free: Option<Arc<HashSet<u32>>>,
+}
+
+/// One cap flush (validated-cow.md §4). A failed barrier may have dropped pending pages from the OS
+/// cache ("fsyncgate"), so pages the published snapshot needs could now read stale: the storage is
+/// revoked, and every later read, commit, and close fails `58030` until the database is reopened
+/// through recovery.
+fn cap_flush(paging: &crate::paging::SharedPaging) -> Result<()> {
+    let result = paging.pager().flush_pending();
+    if let Err(e) = &result {
+        paging.revoke(EngineError::new(
+            SqlState::IoError,
+            format!(
+                "a deferred durability flush failed; reopen the database: {}",
+                e.message
+            ),
+        ));
+    }
+    result
 }
 
 /// The `max_storage_bytes` state of one domain (memory.md §8.1–§8.3, §8.7): the limit, plus what
@@ -429,6 +458,10 @@ impl Storage {
             record_commits: false,
             last_commit: None,
             service_client: false,
+            relaxed: false,
+            flushing: None,
+            inline_flush: false,
+            floor_free: None,
         }
     }
 
@@ -669,11 +702,17 @@ impl Storage {
             return Ok(());
         }
         if self.path.is_some() {
-            let write = snap.incremental_image(
+            self.await_flush()?;
+            // Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its
+            // floor.
+            let pending = self.paging.pager().has_pending();
+            let allowed = self.floor_free_for(pending);
+            let write = snap.incremental_image_allowed(
                 self.page_size,
                 self.page_count,
                 &self.free_pages,
                 reuse,
+                allowed.as_deref(),
                 Some(&self.paging),
             )?;
             let admitted = self.admit_file(&write, budget);
@@ -694,6 +733,94 @@ impl Storage {
             self.page_count
         };
         i64::from(pages) * i64::from(self.page_size)
+    }
+
+    /// Wait for an in-flight background cap flush. Its error is the barrier's, which also revoked
+    /// the storage, so the next commit fails regardless.
+    pub(crate) fn await_flush(&mut self) -> Result<()> {
+        let Some(handle) = self.flushing.take() else {
+            return Ok(());
+        };
+        handle.join().unwrap_or_else(|_| {
+            Err(EngineError::new(
+                SqlState::IoError,
+                "a deferred durability flush panicked",
+            ))
+        })
+    }
+
+    /// Make every pending commit durable (validated-cow.md §4): close, detach, ownership release,
+    /// and a page client's `begin_write`.
+    pub(crate) fn flush(&mut self) -> Result<()> {
+        self.await_flush()?;
+        self.paging.pager().flush_pending()
+    }
+
+    /// End a batch that reached the cap: the flush runs on its own thread (or inline for the
+    /// simulator, or where the host has no threads), and the domain's next operation waits for it.
+    /// Its failure revokes the storage, so the next commit and close report it; the commit that
+    /// reached the cap is already published.
+    fn start_cap_flush(&mut self) {
+        let paging = Arc::clone(&self.paging);
+        if self.inline_flush {
+            let _ = cap_flush(&paging);
+            return;
+        }
+        let background = Arc::clone(&paging);
+        match std::thread::Builder::new()
+            .name("jed-cap-flush".into())
+            .spawn(move || cap_flush(&background))
+        {
+            Ok(handle) => self.flushing = Some(handle),
+            Err(_) => {
+                let _ = cap_flush(&paging);
+            }
+        }
+    }
+
+    /// The reuse restriction of the commit about to plan (validated-cow.md §4 rule 3). With nothing
+    /// pending the floor is the committed generation, so a relaxed domain records the pages free now
+    /// — the floor's free list — and allows them all; while a batch is pending only those not yet
+    /// consumed may be reused, since a page freed during the batch may still be needed by the floor.
+    /// A synchronous = on domain is never restricted.
+    fn reuse_allowed(&mut self, pending: bool) -> Option<Arc<HashSet<u32>>> {
+        if !self.relaxed_file() {
+            return None;
+        }
+        if !pending {
+            self.floor_free = Some(Arc::new(self.free_pages.iter().copied().collect()));
+            return None;
+        }
+        self.floor_free_for(true)
+    }
+
+    /// The restriction a pending batch plans under, without recording a new floor.
+    fn floor_free_for(&self, pending: bool) -> Option<Arc<HashSet<u32>>> {
+        if !pending || !self.relaxed_file() {
+            return None;
+        }
+        Some(
+            self.floor_free
+                .clone()
+                .unwrap_or_else(|| Arc::new(HashSet::new())),
+        )
+    }
+
+    /// Whether this domain's commits batch their barrier.
+    fn relaxed_file(&self) -> bool {
+        self.relaxed && self.path.is_some() && !self.service_client
+    }
+
+    /// Whether this domain holds no relaxed commit pending a flush — no pending set, no adopted
+    /// generation awaiting stabilization, no failed barrier, no flush in flight — so its published
+    /// version is the one it treats as durable (the simulator's floor rule).
+    #[cfg(feature = "sim")]
+    pub(crate) fn engine_flushed(&self) -> bool {
+        let pager = self.paging.pager();
+        !pager.has_pending()
+            && !pager.needs_stabilize()
+            && !pager.is_poisoned()
+            && self.flushing.is_none()
     }
 
     /// Make the database file's directory durable before the first durable commit after open
@@ -741,16 +868,30 @@ impl Storage {
     ) -> Result<()> {
         if self.path.is_some() {
             let ctx = budget.expect("a file commit names its previous snapshot");
-            self.paging.pager().check_commit()?;
-            let write = snap.incremental_image(
+            self.await_flush()?;
+            let pending = {
+                let pager = self.paging.pager();
+                pager.check_commit()?;
+                pager.has_pending()
+            };
+            let allowed = self.reuse_allowed(pending);
+            let write = snap.incremental_image_allowed(
                 self.page_size,
                 self.page_count,
                 &self.free_pages,
                 can_reuse,
+                allowed.as_deref(),
                 Some(&self.paging),
             )?;
             let live = self.admit_file(&write, ctx)?;
-            self.commit_file(snap, write, live, can_reclaim, can_reuse)
+            self.commit_file(
+                snap,
+                write,
+                live,
+                can_reclaim,
+                can_reuse,
+                allowed.as_deref(),
+            )
         } else {
             let write = self.plan_in_memory(snap, can_reuse, budget)?;
             self.commit_in_memory(snap, write, can_reclaim)
@@ -766,6 +907,7 @@ impl Storage {
         live: crate::format::LiveCount,
         can_reclaim: bool,
         can_reuse: bool,
+        allowed: Option<&HashSet<u32>>,
     ) -> Result<()> {
         self.sync_directory_once();
         let ps = self.page_size as usize;
@@ -781,6 +923,8 @@ impl Storage {
                 pager.write_block(*index, bytes)?;
             }
         }
+        let relaxed = self.relaxed_file();
+        let pending = self.paging.pager().pending_entries();
         let plan = crate::format::plan_free_list(
             snap,
             &self.paging,
@@ -795,18 +939,26 @@ impl Storage {
             can_reclaim,
             can_reuse,
             live.live,
+            &pending,
+            allowed,
         )?;
         crate::format::verify_live_count(snap, &self.paging, &write, live)?;
-        {
+        let cap_reached = {
             let mut pager = self.paging.pager();
             pager.reserve(plan.page_count)?;
             for (index, bytes) in &plan.auxiliary {
                 pager.write_block(*index, bytes)?;
             }
-            pager.write_block((snap.txid & 1) as u32, &plan.meta)?;
-            pager.sync()?;
-            pager.finish_commit(&plan.meta);
-        }
+            // The slot not holding the floor (format.md, *Slot alternation*); a relaxed commit
+            // defers its barrier to a flush (validated-cow.md §4).
+            let slot = pager.commit_slot();
+            pager.write_block(slot, &plan.meta)?;
+            if !relaxed {
+                pager.sync()?;
+            }
+            pager.finish_commit(&plan.meta, slot, !relaxed, &plan.dirty);
+            relaxed && pager.batch_cap_reached()
+        };
         // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
         // evicts a stale pool decode of any free page this commit reused for new content.
         for (index, _) in write.pages.iter().chain(plan.auxiliary.iter()) {
@@ -826,6 +978,9 @@ impl Storage {
         self.live_at_compaction = plan.live;
         self.free_gen_txid = plan.generation;
         self.live = live;
+        if cap_reached {
+            self.start_cap_flush();
+        }
         Ok(())
     }
 
@@ -916,6 +1071,9 @@ impl Storage {
     /// has no free list and no garbage, so the page accounting restarts from it, and the storage
     /// budget forgets the last commit's pages (none of them is dead now).
     pub(crate) fn compact(&mut self, snap: &Snapshot, txid: u64) -> Result<Snapshot> {
+        // The compacted image is durable on its own, which empties any pending batch; only an
+        // in-flight background flush of the old file must finish first (validated-cow.md §4).
+        self.await_flush()?;
         self.paging.pager().check_commit()?;
         let capacity = self.paging.capacity();
         let paging = match &self.path {
@@ -1225,6 +1383,16 @@ impl Shared {
         Ok(())
     }
 
+    /// Flush the owner's own relaxed commits before a client plans against the committed meta: a
+    /// client cannot name the owner's pending set in its manifest (README.md §3.5).
+    #[cfg(unix)]
+    pub(crate) fn page_service_flush(&self) -> Result<()> {
+        self.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .flush()
+    }
+
     /// End an owner-pager commit a client delta began but will never finish (an abort, a rejected
     /// delta, a revocation, or EOF): its pages are unreachable orphans.
     #[cfg(unix)]
@@ -1250,9 +1418,12 @@ impl Shared {
         let mut st = self.storage.lock().expect("storage lock not poisoned");
         {
             let mut pager = st.paging.pager();
-            pager.write_block((delta.txid & 1) as u32, &delta.meta)?;
+            // The slot not holding the committed meta, which the begin_write flush made the floor
+            // (README.md §3.5); a client commit always keeps its own barrier.
+            let slot = pager.commit_slot();
+            pager.write_block(slot, &delta.meta)?;
             pager.sync()?;
-            pager.finish_commit(&delta.meta);
+            pager.finish_commit(&delta.meta, slot, true, &[]);
             // The owner validated this commit's dependencies itself, so its reload need not
             // re-read them.
             pager.cache_validation(&delta.meta, Arc::new(delta.protected.clone()));
@@ -2055,6 +2226,31 @@ impl Shared {
     }
 }
 
+impl Shared {
+    /// Make every relaxed domain's pending commits durable (validated-cow.md §4) — main's, then each
+    /// attachment's — returning the first failure.
+    fn flush_all(&self) -> Result<()> {
+        let mut result = self
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .flush();
+        let mut atts = self
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned");
+        let mut names: Vec<_> = atts.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let flushed = atts.get_mut(&name).expect("listed above").storage.flush();
+            if result.is_ok() {
+                result = flushed;
+            }
+        }
+        result
+    }
+}
+
 impl Drop for Shared {
     fn drop(&mut self) {
         // A page-service owner that was not closed stops serving: clients see EOF, and the endpoint
@@ -2062,6 +2258,8 @@ impl Drop for Shared {
         // connection (README.md §6.5).
         #[cfg(unix)]
         self.end_service(false);
+        // No flush here: pending relaxed commits become durable at close (validated-cow.md §4),
+        // never in a destructor — a dropped handle is what a crashed process leaves behind.
     }
 }
 
@@ -2193,6 +2391,10 @@ impl Database {
             record_commits: false,
             last_commit: None,
             service_client: false,
+            relaxed: false,
+            flushing: None,
+            inline_flush: false,
+            floor_free: None,
         };
         let shared = Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -2515,6 +2717,7 @@ impl Database {
                         .limit = opts.max_storage_bytes;
                     let open_opts = OpenOptions {
                         skip_fsync: opts.skip_fsync,
+                        synchronous: opts.synchronous,
                         locking: Locking::Auto,
                         file_lock_timeout_ms: opts.file_lock_timeout_ms,
                         environment: env,
@@ -2536,11 +2739,11 @@ impl Database {
                     );
                 }
                 let db = Database::from_engine_coordinated(engine, coordinator);
-                db.0.storage
-                    .lock()
-                    .expect("storage lock not poisoned")
-                    .budget
-                    .limit = opts.max_storage_bytes;
+                {
+                    let mut storage = db.0.storage.lock().expect("storage lock not poisoned");
+                    storage.budget.limit = opts.max_storage_bytes;
+                    storage.relaxed = opts.synchronous == crate::file::Synchronous::Off;
+                }
                 Ok(db)
             }
             // in-memory never fsyncs; skip_fsync is a no-op
@@ -2570,6 +2773,7 @@ impl Database {
             return open_service(path.as_ref(), opts);
         }
         let max_storage_bytes = opts.max_storage_bytes;
+        let relaxed = opts.synchronous == crate::file::Synchronous::Off;
         let coordinator = FileCoordinator::open(path.as_ref(), locking, opts.file_lock_timeout_ms)?;
         let canonical = coordinator
             .as_ref()
@@ -2583,11 +2787,11 @@ impl Database {
             },
         )?;
         let db = Database::from_engine_coordinated(engine, coordinator);
-        db.0.storage
-            .lock()
-            .expect("storage lock not poisoned")
-            .budget
-            .limit = max_storage_bytes;
+        {
+            let mut storage = db.0.storage.lock().expect("storage lock not poisoned");
+            storage.budget.limit = max_storage_bytes;
+            storage.relaxed = relaxed;
+        }
         Ok(db)
     }
 
@@ -2652,13 +2856,11 @@ impl Database {
                 .map_or(path.as_path(), |coordinator| coordinator.path());
             // Through main's file host (crate::filehost), so the simulated filesystem serves
             // attachments too.
-            let files = self
-                .0
-                .storage
-                .lock()
-                .expect("storage lock not poisoned")
-                .files
-                .clone();
+            // A file attachment also follows the handle's synchronous setting (validated-cow.md §4).
+            let (files, relaxed, inline_flush) = {
+                let main = self.0.storage.lock().expect("storage lock not poisoned");
+                (main.files.clone(), main.relaxed, main.inline_flush)
+            };
             let os = crate::filehost::OsFileHost;
             let host: &dyn crate::filehost::FileHost = match &files {
                 Some(files) => files.as_ref(),
@@ -2702,6 +2904,10 @@ impl Database {
                 record_commits: false,
                 last_commit: None,
                 service_client: false,
+                relaxed,
+                flushing: None,
+                inline_flush,
+                floor_free: None,
             };
             Some((storage, engine.committed, coordinator))
         } else {
@@ -2804,6 +3010,15 @@ impl Database {
             Ok(())
         })();
         self.0.release_writer();
+        // A detached file attachment's pending relaxed commits become durable before its file is
+        // released (validated-cow.md §4); a failed flush is what detach reports.
+        let mut result = result;
+        if let Some(att) = removed.as_mut() {
+            let flushed = att.storage.flush();
+            if result.is_ok() {
+                result = flushed;
+            }
+        }
         // Dropping a coordinator joins its probe thread; do that only after releasing the local writer
         // barrier because the probe may already be waiting to enter it.
         drop(removed);
@@ -4029,6 +4244,43 @@ impl Database {
             .files = Some(files);
     }
 
+    /// Set main's synchronous = off (`relaxed`) and whether its cap flush runs on the committing
+    /// thread, so every flush lands in the step that caused it. File attachments inherit both.
+    pub(crate) fn sim_set_relaxed(&self, relaxed: bool, inline_flush: bool) {
+        let mut st = self.0.storage.lock().expect("storage lock not poisoned");
+        st.relaxed = relaxed;
+        st.inline_flush = inline_flush;
+    }
+
+    /// Run main's cap flush on the committing thread (a page-service process opened with its
+    /// synchronous setting from the options).
+    pub(crate) fn sim_set_inline_flush(&self) {
+        self.0
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .inline_flush = true;
+    }
+
+    /// Whether database `name` (`main` or an attachment) holds no relaxed commit pending a flush
+    /// ([`Storage::engine_flushed`]); `false` if there is no such database.
+    pub(crate) fn sim_engine_flushed(&self, name: &str) -> bool {
+        if name == "main" {
+            return self
+                .0
+                .storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .engine_flushed();
+        }
+        self.0
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned")
+            .get(name)
+            .is_some_and(|a| a.storage.engine_flushed())
+    }
+
     /// The committed version of attachment `name`, or `None` if it is not attached.
     pub(crate) fn sim_attached_version(&self, name: &str) -> Option<u64> {
         self.0
@@ -4153,7 +4405,9 @@ impl Database {
     pub fn close(self) -> Result<()> {
         #[cfg(unix)]
         self.0.end_service(true);
-        Ok(())
+        // A relaxed domain's pending commits become durable before the handle is released
+        // (validated-cow.md §4); a failed flush is what close reports.
+        self.0.flush_all()
     }
 }
 
@@ -5349,6 +5603,10 @@ mod temp_spill_internal_tests {
 #[cfg(test)]
 #[path = "unchanged_commit_tests.rs"]
 mod unchanged_commit_tests;
+
+#[cfg(test)]
+#[path = "batched_durability_tests.rs"]
+mod batched_durability_tests;
 
 #[cfg(unix)]
 #[path = "shared_handoff.rs"]

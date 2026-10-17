@@ -50,19 +50,23 @@ pub(super) fn overflow_needed(ps: usize, entries: usize) -> usize {
         .div_ceil((ps - OVERFLOW_HEADER) / ENTRY)
 }
 
-/// Return the final meta and overflow pages. The allocator has already reserved `ids`.
+/// The manifest entries — `(page id, CRC-64 of its complete encoded bytes)` — of written pages.
+pub(super) fn entries_of(pages: &[(u32, Vec<u8>)]) -> Vec<(u32, u64)> {
+    pages
+        .iter()
+        .map(|(id, bytes)| (*id, extend(0, bytes)))
+        .collect()
+}
+
+/// Return the final meta and overflow pages for the manifest `entries` (the commit's body and
+/// free-list pages, and under batched durability the pending set — validated-cow.md §4; never the
+/// manifest itself). The allocator has already reserved `ids`.
 pub(super) fn encode(
     mut meta: Vec<u8>,
-    written: &[(u32, Vec<u8>)],
-    auxiliary: &[(u32, Vec<u8>)],
+    mut entries: Vec<(u32, u64)>,
     ids: &[u32],
 ) -> (Vec<u8>, Vec<(u32, Vec<u8>)>) {
     let ps = meta.len();
-    let mut entries: Vec<_> = written
-        .iter()
-        .chain(auxiliary.iter())
-        .map(|(id, bytes)| (*id, extend(0, bytes)))
-        .collect();
     entries.sort_unstable_by_key(|e| e.0);
     let inline = entries.len().min((ps - HEADER) / ENTRY);
     let put_entries = |out: &mut [u8], entries: &[(u32, u64)]| {

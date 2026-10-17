@@ -562,6 +562,13 @@ struct SimDb {
     lac_bound: u32,
     /// The previous commit in this lifetime.
     last: Growth,
+    /// Whether the current step began with a relaxed batch pending on this database's file: its
+    /// commit allocates from the high-water and keeps the batch's pages off the free list
+    /// (validated-cow.md §4), so the bounded-growth assertions do not apply to it.
+    batch_open: bool,
+    /// Set when an owner died under synchronous = off: until a process observes main again, it may
+    /// have recovered any version from the floor up.
+    owner_lost: bool,
 }
 
 /// What a commit left behind, for the next commit's bounded-growth check.
@@ -588,6 +595,8 @@ impl SimDb {
             free: 0,
             lac_bound: 0,
             last: Growth::default(),
+            batch_open: false,
+            owner_lost: false,
         }
     }
 
@@ -630,6 +639,9 @@ struct Runner<'a> {
     max_query_memory: i64,
     /// The database's max_storage_bytes.
     max_storage_bytes: i64,
+    /// The header's synchronous = off (validated-cow.md §4): every process batches its barriers,
+    /// flushing inline so the barrier lands in the step that reached the batch cap.
+    relaxed: bool,
 
     sessions: HashMap<String, SimSession>,
     /// The database of the process running the current step.
@@ -858,6 +870,7 @@ impl<'a> Runner<'a> {
             temp_buffers,
             max_query_memory,
             max_storage_bytes,
+            relaxed: tr.header("synchronous") == "off",
             sessions: HashMap::new(),
             db: None,
             service: tr.header("processes") == "service",
@@ -971,6 +984,8 @@ impl<'a> Runner<'a> {
             let db = Database::from_engine(self.open_engine()?);
             // Create, compaction, and attachments go through the simulated filesystem.
             db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
+            // Every flush lands in the step that caused it.
+            db.sim_set_relaxed(self.relaxed, true);
             if self.max_storage_bytes > 0 {
                 db.set_max_storage_bytes("main", self.max_storage_bytes)?;
             }
@@ -1009,6 +1024,11 @@ impl<'a> Runner<'a> {
             shutdown_grace_ms: Some(SERVICE_GRACE_MS),
             environment: self.env.clone(),
             max_storage_bytes: self.max_storage_bytes,
+            synchronous: if self.relaxed {
+                crate::file::Synchronous::Off
+            } else {
+                crate::file::Synchronous::On
+            },
             ..OpenOptions::default()
         };
         let opened = Database::sim_open_service(
@@ -1020,6 +1040,7 @@ impl<'a> Runner<'a> {
         );
         match opened {
             Ok(db) => {
+                db.sim_set_inline_flush(); // every flush lands in the step that caused it
                 self.net.settle();
                 Ok(db)
             }
@@ -1132,6 +1153,11 @@ impl<'a> Runner<'a> {
     /// than dropped (a drop would end its page-service role cleanly), and the network closes its
     /// listener and connections, as the kernel closes a dead process's sockets.
     fn drop_proc(&mut self, pid: u32) {
+        if self.relaxed && self.procs.get(&pid).is_some_and(|p| p.db.sim_is_owner()) {
+            // A dead owner's batch may be lost back to the floor (validated-cow.md §4): the
+            // simulated process crash may drop writes of the step that acknowledged a commit.
+            self.main_db_mut().owner_lost = true;
+        }
         for sid in self.sessions_of(pid) {
             let ss = self.sessions.remove(&sid);
             if self.service {
@@ -1161,7 +1187,7 @@ impl<'a> Runner<'a> {
         let m = self.main_db();
         let msg = match &d {
             None => Some(format!("{who}: version {v} is unreadable")),
-            Some(_) if v < m.version => Some(format!(
+            Some(_) if v < m.version && (!m.owner_lost || v < m.floor) => Some(format!(
                 "{who} sees version {v} after version {} was published",
                 m.version
             )),
@@ -1181,6 +1207,7 @@ impl<'a> Runner<'a> {
         let m = self.main_db_mut();
         m.version = v;
         m.last_digest = d.expect("checked above");
+        m.owner_lost = false;
         true
     }
 
@@ -1489,6 +1516,10 @@ impl<'a> Runner<'a> {
             .iter()
             .map(|(name, d)| (name.clone(), d.version))
             .collect();
+        for name in self.order() {
+            let open = self.relaxed && !self.engine_flushed(&name);
+            self.sdb(&name).batch_open = open;
+        }
         if let Some(pid) = self.step_pid(st)
             && st.kind != "spawn"
             && !self.select_proc(pid)
@@ -1540,16 +1571,58 @@ impl<'a> Runner<'a> {
         }
         // A completed barrier made every earlier write durable: the generation a database published
         // when the step began can no longer be lost (§8.2).
+        // The engine's flush claims, read before the disk lock is taken.
+        let flushed: HashMap<String, bool> = if self.relaxed {
+            self.order()
+                .into_iter()
+                .map(|name| {
+                    let f = self.engine_flushed(&name);
+                    (name, f)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
         {
+            let relaxed = self.relaxed;
             let disk = self.fs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut violation = None;
             for (name, d) in self.dbs.iter_mut() {
                 let began = start.get(name).copied().unwrap_or(0);
-                if let Some(id) = disk.file(&d.file)
-                    && disk.barrier_ok(id)
-                    && began > d.floor
-                {
+                let Some(id) = disk.file(&d.file) else {
+                    continue;
+                };
+                // Under synchronous = off a barrier proves the step's starting version durable only
+                // when the engine was not batching then: a pending version may be durable by
+                // accident (a file growth is a full fsync) and still be overwritten by the next
+                // commit of its batch (validated-cow.md §4).
+                if disk.barrier_ok(id) && !d.batch_open && began > d.floor {
                     d.floor = began;
                 }
+                if !relaxed
+                    || disk.dead()
+                    || !disk.fired.is_empty()
+                    || d.version <= d.floor
+                    || !flushed.get(name).copied().unwrap_or(false)
+                {
+                    continue;
+                }
+                // The engine holds nothing pending: it treats the published version as flushed, and
+                // will overwrite only the other slot. Hold it to that, after checking the claim
+                // against the disk.
+                if disk.meta_pending(id) {
+                    violation = Some(format!(
+                        "durability: the engine treats version {} of {name} as flushed, but no barrier covered its meta",
+                        d.version
+                    ));
+                    break;
+                }
+                d.floor = d.version;
+            }
+            drop(disk);
+            if let Some(msg) = violation {
+                self.fail(i, msg);
+                return false;
             }
         }
         let Some(armed) = armed else {
@@ -1812,6 +1885,12 @@ impl<'a> Runner<'a> {
                     return;
                 };
                 let mut published = self.committed_digest(name);
+                if published.is_none() && self.relaxed && !self.disk().fired.is_empty() {
+                    // The batch cap's flush failed in this step and revoked the storage, so nothing
+                    // can be read back; the acknowledged commit is checked by the recovery that
+                    // follows.
+                    published = Some(inflight.clone());
+                }
                 if published.is_none() && self.service && self.disk().dead() {
                     // The owner died later in this step (its maintenance commit hit the fault), so
                     // nothing can be read back through it; the acknowledged commit is checked by the
@@ -1839,7 +1918,12 @@ impl<'a> Runner<'a> {
                 d.version = now;
                 d.last_digest = inflight.clone();
                 d.max_attempted = d.max_attempted.max(now);
-                d.floor = now; // acknowledged under synchronous = on (§8.2)
+                let client = self.db().sim_page_client().is_some();
+                let relaxed = self.relaxed;
+                let d = self.sdb(name);
+                if !relaxed || client {
+                    d.floor = now; // acknowledged under synchronous = on, or a page client's commit (§8.2)
+                }
                 self.check_growth(i, name, quiet);
                 if !self.violation.is_empty() {
                     return;
@@ -1857,6 +1941,9 @@ impl<'a> Runner<'a> {
                 );
                 return;
             }
+        }
+        if self.relaxed && !self.disk().fired.is_empty() {
+            return; // a failed cap flush revoked the storage; the recovery that follows checks it
         }
         if let Err(e) = self.check_live() {
             self.fail(i, format!("after commit: {e}"));
@@ -1904,16 +1991,38 @@ impl<'a> Runner<'a> {
         if ov <= now {
             return;
         }
+        let relaxed = self.relaxed;
         let d = self.main_db_mut();
         for v in now + 1..=ov {
             d.add_history(v, digest.to_string());
         }
         d.version = ov;
         d.max_attempted = d.max_attempted.max(ov);
-        d.floor = ov;
+        if !relaxed {
+            d.floor = ov; // the maintenance commit is an owner commit: batched under synchronous = off
+        }
         self.emit(format!(
             "{{\"i\":{i},\"op\":\"maintenance\",\"version\":{ov}}}"
         ));
+    }
+
+    /// Whether the process writing database `name` holds no relaxed commit pending a flush — no
+    /// pending set, no adopted generation awaiting stabilization, no failed barrier — so its
+    /// published version is the one it treats as durable (validated-cow.md §4). Under the page
+    /// service the owner writes the file; with no owner running, nothing is claimed.
+    fn engine_flushed(&self, name: &str) -> bool {
+        let db = if self.service {
+            let Some(owner) = self.owner_pid() else {
+                return false;
+            };
+            &self.procs[&owner].db
+        } else {
+            match &self.db {
+                Some(db) => db,
+                None => return false,
+            }
+        };
+        db.sim_engine_flushed(name)
     }
 
     // --- bounded growth (simulation-testing.md §8.3) ---
@@ -1972,6 +2081,16 @@ impl<'a> Runner<'a> {
             let d = &self.dbs[name];
             (d.last, d.high.wrapping_sub(d.free), d.lac_bound)
         };
+        if self.dbs[name].batch_open {
+            // A commit inside a relaxed batch neither reuses nor frees the batch's pages
+            // (validated-cow.md §4); only the bounds carry forward.
+            let d = self.sdb(name);
+            d.high = pc;
+            d.free = free;
+            d.lac_bound = d.lac_bound.max(live.wrapping_add(written));
+            d.last = Growth::default();
+            return;
+        }
         if quiet
             && before.reclaimed
             && pc > before.high

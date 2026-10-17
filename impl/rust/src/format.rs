@@ -2058,23 +2058,30 @@ struct PageAlloc<'a> {
     /// and the single-handle case leave it `true` (oldest_live == committed ⇒ no page is still observed),
     /// so the on-disk byte layout is unchanged whenever no reader pins an older version.
     reuse: bool,
+    /// When set, restricts reuse to these free pages — while a relaxed batch is pending, only the
+    /// pages already free at the floor (spec/design/validated-cow.md §4 rule 3). A free page it
+    /// passes over stays on the list (`skipped`). `None` allows every free page.
+    allowed: Option<&'a HashSet<u32>>,
+    skipped: Vec<u32>,
 }
 
 impl PageAlloc<'_> {
     fn take(&mut self) -> u32 {
-        if self.reuse && self.cursor < self.free.len() {
+        while self.reuse && self.cursor < self.free.len() {
             let p = self.free[self.cursor];
             self.cursor += 1;
-            p
-        } else {
-            let p = self.next;
-            if let Some(next) = self.next.checked_add(1) {
-                self.next = next;
-            } else {
-                self.exhausted = true;
+            if self.allowed.is_none_or(|allowed| allowed.contains(&p)) {
+                return p;
             }
-            p
+            self.skipped.push(p);
         }
+        let p = self.next;
+        if let Some(next) = self.next.checked_add(1) {
+            self.next = next;
+        } else {
+            self.exhausted = true;
+        }
+        p
     }
 }
 
@@ -2097,6 +2104,20 @@ impl Snapshot {
         reuse: bool,
         paging: Option<&SharedPaging>,
     ) -> Result<IncrementalWrite> {
+        self.incremental_image_allowed(page_size, start_page, free, reuse, None, paging)
+    }
+
+    /// [`incremental_image`](Self::incremental_image) with reuse restricted to `allowed` (`None`:
+    /// every free page — validated-cow.md §4 rule 3).
+    pub(crate) fn incremental_image_allowed(
+        &self,
+        page_size: u32,
+        start_page: u32,
+        free: &[u32],
+        reuse: bool,
+        allowed: Option<&HashSet<u32>>,
+        paging: Option<&SharedPaging>,
+    ) -> Result<IncrementalWrite> {
         let ps = page_size as usize;
         let cap = ps - PAGE_HEADER;
 
@@ -2112,6 +2133,8 @@ impl Snapshot {
             cursor: 0,
             next: start_page,
             reuse,
+            allowed,
+            skipped: Vec::new(),
         };
 
         let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -2248,7 +2271,12 @@ impl Snapshot {
             pages,
             root_page: cat_root,
             page_count: alloc.next,
-            free_remaining: alloc.free[alloc.cursor..].to_vec(),
+            // Both ascending, skipped first.
+            free_remaining: {
+                let mut rest = std::mem::take(&mut alloc.skipped);
+                rest.extend_from_slice(&alloc.free[alloc.cursor..]);
+                rest
+            },
             kept,
             shared_chains: shared,
             catalog_pages: cat_pages.len() as u32,
@@ -2544,11 +2572,15 @@ impl Engine {
             let blocks = [pg.read_block(0)?, pg.read_block(1)?];
             let mut candidates: Vec<_> = blocks
                 .iter()
-                .filter_map(|b| parse_meta(b).map(|m| (m, b)))
+                .enumerate()
+                .filter_map(|(slot, b)| parse_meta(b).map(|m| (m, b, slot as u32)))
                 .collect();
             candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
+            // Whether both slots carry the same txid (create, compaction): the floor slot is then
+            // txid & 1 (format.md, *Slot alternation*).
+            let same_txid = candidates.len() == 2 && candidates[0].0.txid == candidates[1].0.txid;
             let mut selected = None;
-            for (mut m, bytes) in candidates {
+            for (mut m, bytes, slot) in candidates {
                 let physical = pg.allocated_pages();
                 let protected = if pg.trusts_meta() {
                     // A page client adopts the owner's meta as served (page-service.md §5.3).
@@ -2562,10 +2594,12 @@ impl Engine {
                 if let Some(protected) = protected {
                     pg.cache_validation(bytes, Arc::clone(&protected));
                     m.protected = protected;
+                    let floor_slot = if same_txid { (m.txid & 1) as u32 } else { slot };
                     pg.adopt_generation(
                         m.txid,
                         u32::from_be_bytes(bytes[32..36].try_into().unwrap()),
                         bytes[40..44] != [0; 4],
+                        floor_slot,
                     );
                     selected = Some(m);
                     break;
@@ -3025,6 +3059,8 @@ pub(crate) fn plan_free_list(
     can_reclaim: bool,
     can_reuse: bool,
     live_pages: u32,
+    pending: &[(u32, u64)],
+    allowed: Option<&HashSet<u32>>,
 ) -> Result<CommitPlan> {
     // `live_at_compaction == 0` marks a store whose reclaimable set is unknown, so a commit that may
     // reclaim reconstructs it immediately even for a small file. Ordinary stores retain the amortized
@@ -3037,10 +3073,15 @@ pub(crate) fn plan_free_list(
         for (index, _) in written {
             reached.insert(*index);
         }
+        let live = reached.len() as u32;
+        // A relaxed batch's pending pages are manifest dependencies the rebuilt list must exclude,
+        // though they are not live (validated-cow.md §4).
+        for (index, _) in pending {
+            reached.insert(*index);
+        }
         let free: Vec<u32> = (ROOT_PAGE..page_count)
             .filter(|p| !reached.contains(p))
             .collect();
-        let live = reached.len() as u32;
         // The recomputed list is proven dead at snap.txid — its reuse generation (the §8 gate).
         (free, live, snap.txid)
     } else {
@@ -3051,7 +3092,20 @@ pub(crate) fn plan_free_list(
     // OLDER than the free-list generation may still reference one of those pages (transactions.md §8) —
     // the same hazard as data-page reuse. When the watermark defers reuse the chain must grow the
     // high-water instead (empty `safe`), exactly as the data allocator does.
-    let safe: &[u32] = if can_reuse { free_remaining } else { &[] };
+    let filtered: Vec<u32>;
+    let safe: &[u32] = match (can_reuse, allowed) {
+        (false, _) => &[],
+        (true, None) => free_remaining,
+        // A pending batch reuses only pages free at its floor (validated-cow.md §4 rule 3).
+        (true, Some(allowed)) => {
+            filtered = free_remaining
+                .iter()
+                .copied()
+                .filter(|id| allowed.contains(id))
+                .collect();
+            &filtered
+        }
+    };
     let mut n = 0;
     loop {
         let mut next = page_count;
@@ -3083,13 +3137,19 @@ pub(crate) fn plan_free_list(
             .collect();
         let (pages, head, persisted, new_pc) =
             serialize_free_list(&persist, &remaining, cap, ps, next)?;
-        let needed = commit_manifest::overflow_needed(ps, written.len() + pages.len());
+        let needed =
+            commit_manifest::overflow_needed(ps, pending.len() + written.len() + pages.len());
         if needed > n {
             n = needed;
             continue;
         }
         let base = meta_page(ps as u32, snap.txid, cat_root, new_pc, head, live_pages);
-        let (meta, overflow) = commit_manifest::encode(base, written, &pages, &ids);
+        let mut dirty = commit_manifest::entries_of(written);
+        dirty.extend(commit_manifest::entries_of(&pages));
+        let mut entries = Vec::with_capacity(pending.len() + dirty.len());
+        entries.extend_from_slice(pending);
+        entries.extend_from_slice(&dirty);
+        let (meta, overflow) = commit_manifest::encode(base, entries, &ids);
         let mut auxiliary = pages;
         auxiliary.extend(overflow);
         return Ok(CommitPlan {
@@ -3099,6 +3159,7 @@ pub(crate) fn plan_free_list(
             page_count: new_pc,
             live: new_live,
             generation: new_gen,
+            dirty,
         });
     }
 }
@@ -3110,6 +3171,9 @@ pub(crate) struct CommitPlan {
     pub page_count: u32,
     pub live: u32,
     pub generation: u64,
+    /// The commit's own manifest entries (its body and free-list pages), which a relaxed commit
+    /// adds to the pending set (validated-cow.md §4).
+    pub dirty: Vec<(u32, u64)>,
 }
 
 /// Add every node page of a resident B+tree to `reached`: an interior/leaf node's own set-once page,
@@ -4737,7 +4801,7 @@ pub(crate) fn encode_manifest(
     written: &[(u32, Vec<u8>)],
     ids: &[u32],
 ) -> (Vec<u8>, Vec<(u32, Vec<u8>)>) {
-    commit_manifest::encode(meta, written, &[], ids)
+    commit_manifest::encode(meta, commit_manifest::entries_of(written), ids)
 }
 
 /// A body page of type `page_type` (tests that build a commit delta by hand).

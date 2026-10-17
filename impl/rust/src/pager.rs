@@ -13,7 +13,7 @@
 
 use crate::blockstore::BlockStore;
 use crate::error::{EngineError, Result, SqlState};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 /// The **maximum** file-growth step — ~1 MiB worth of pages. The file grows *geometrically*
@@ -67,6 +67,13 @@ pub(crate) struct Pager {
     /// Set on a page client's pager: the owner validated the meta it serves (or wrote it), so the
     /// client adopts it without re-reading its manifest pages (page-service.md §5.3).
     trust_meta: bool,
+    /// Batched durability (validated-cow.md §4): the meta slot holding the newest durable meta;
+    /// every commit writes the other one.
+    floor_slot: u32,
+    /// The CRC-64 digest of every body page (never a meta or manifest page) written by a commit
+    /// after the floor, by page id — what a pending commit's manifest lists besides its own pages.
+    /// Empty under synchronous = on.
+    pending: BTreeMap<u32, u64>,
     /// The armed one-shot commit fault — the **fault-injection seam** (spec/design/storage.md §7),
     /// `#[cfg(test)]` so it is **entirely absent from a production build** (zero footprint). `None`
     /// unless a test armed one with [`arm_fault`](Pager::arm_fault).
@@ -145,6 +152,8 @@ impl Pager {
             commit_in_progress: false,
             poisoned: false,
             trust_meta: false,
+            floor_slot: 0,
+            pending: BTreeMap::new(),
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
@@ -215,11 +224,23 @@ impl Pager {
         self.validation = Some((meta.to_vec(), pages));
     }
 
-    pub(crate) fn adopt_generation(&mut self, txid: u64, crc: u32, descriptor: bool) {
+    /// Adopt the selected meta's generation. `floor_slot` is the slot it becomes the floor in once
+    /// stabilized (validated-cow.md §3–§4): the selected slot, or `txid & 1` when both slots carry
+    /// its txid (create, compaction), so the next commit writes the other slot exactly as txid
+    /// parity would. A newly adopted generation ends any pending batch.
+    pub(crate) fn adopt_generation(
+        &mut self,
+        txid: u64,
+        crc: u32,
+        descriptor: bool,
+        floor_slot: u32,
+    ) {
         let generation = Some((txid, crc));
         if self.adopted != generation {
             self.adopted = generation;
             self.needs_stabilize = descriptor && self.acknowledged != generation;
+            self.floor_slot = floor_slot;
+            self.pending.clear();
         }
     }
 
@@ -271,7 +292,17 @@ impl Pager {
         self.store.discard_pending();
     }
 
-    pub(crate) fn finish_commit(&mut self, meta: &[u8]) {
+    /// Record a commit whose `meta` was written to `slot`. `durable` is whether its barrier ran
+    /// (synchronous = on, or a page client's commit): the meta is then the floor and nothing is
+    /// pending. A relaxed commit instead adds its own `dirty` manifest entries to the pending set
+    /// (validated-cow.md §4).
+    pub(crate) fn finish_commit(
+        &mut self,
+        meta: &[u8],
+        slot: u32,
+        durable: bool,
+        dirty: &[(u32, u64)],
+    ) {
         self.validation = None;
         let generation = Some((
             u64::from_be_bytes(meta[12..20].try_into().unwrap()),
@@ -281,6 +312,76 @@ impl Pager {
         self.adopted = generation;
         self.needs_stabilize = false;
         self.commit_in_progress = false;
+        if durable {
+            self.floor_slot = slot;
+            self.pending.clear();
+            return;
+        }
+        for &(id, digest) in dirty {
+            self.pending.insert(id, digest);
+        }
+    }
+
+    /// The meta slot the next commit writes: the one not holding the floor (format.md, *Slot
+    /// alternation*). Under synchronous = on this is `txid & 1`.
+    pub(crate) fn commit_slot(&self) -> u32 {
+        self.floor_slot ^ 1
+    }
+
+    /// Set the floor slot directly: `create`'s bootstrap image carries the same txid in both slots,
+    /// so the floor is `txid & 1` (format.md, *Slot alternation*).
+    pub(crate) fn set_floor_slot(&mut self, slot: u32) {
+        self.floor_slot = slot;
+    }
+
+    /// Whether a relaxed batch is pending a flush.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The pending set in page order (validated-cow.md §4).
+    pub(crate) fn pending_entries(&self) -> Vec<(u32, u64)> {
+        self.pending
+            .iter()
+            .map(|(&id, &digest)| (id, digest))
+            .collect()
+    }
+
+    /// Whether an adopted generation still awaits its stabilizing barrier.
+    #[cfg(feature = "sim")]
+    pub(crate) fn needs_stabilize(&self) -> bool {
+        self.needs_stabilize
+    }
+
+    /// Whether a failed write or barrier poisoned this pager.
+    #[cfg(feature = "sim")]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// A flush (validated-cow.md §4): one durable barrier makes every pending commit durable, so
+    /// the newest meta — in the non-floor slot — becomes the floor. A failed barrier poisons the
+    /// pager ([`sync`](Pager::sync)), so the next commit reports it.
+    pub(crate) fn flush_pending(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        if self.poisoned {
+            return Err(EngineError::new(
+                SqlState::IoError,
+                "database writer requires reopen after failed commit",
+            ));
+        }
+        self.sync()?;
+        self.floor_slot ^= 1;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Whether the pending set fills the inline manifest of one meta page: the batch cap, after
+    /// which a flush follows (validated-cow.md §4).
+    pub(crate) fn batch_cap_reached(&self) -> bool {
+        self.pending.len() >= crate::format::manifest_capacities(self.page_size as usize).0
     }
 
     /// Arm a one-shot commit fault (the **fault-injection seam**, spec/design/storage.md §7) and
