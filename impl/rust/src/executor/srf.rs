@@ -1109,7 +1109,8 @@ impl Engine {
     /// (`catalog_type_text`); `not_null` covers a declared NOT NULL and PRIMARY KEY membership;
     /// `pk_ordinal` is the 1-based position in the PRIMARY KEY in KEY order (which may differ from
     /// declaration order — constraints.md §3), NULL for a non-member; `column_default` is the
-    /// canonical DEFAULT text (`Column::default_text`). The main database's views follow, in
+    /// canonical DEFAULT text (`Column::default_text`); `identity_generation` is `ALWAYS` / `BY DEFAULT`
+    /// for an identity column, else NULL. The main database's views follow, in
     /// (view name, ordinal) order (introspection.md §5): a view column's `type` is the type its
     /// planned body produces, and it is nullable, keyless, and has no default. Cost mirrors
     /// jed_tables_rows.
@@ -1137,6 +1138,11 @@ impl Engine {
                     Value::Bool(c.not_null || c.primary_key),
                     pk_ordinal,
                     c.default_text().map_or(Value::Null, Value::Text),
+                    match c.identity {
+                        Some(IdentityKind::Always) => Value::Text("ALWAYS".to_string()),
+                        Some(IdentityKind::ByDefault) => Value::Text("BY DEFAULT".to_string()),
+                        None => Value::Null,
+                    },
                 ]);
             }
         }
@@ -1154,6 +1160,7 @@ impl Engine {
                         Value::Int(i as i64 + 1),
                         Value::Text(ty),
                         Value::Bool(false),
+                        Value::Null,
                         Value::Null,
                         Value::Null,
                     ]);

@@ -5601,6 +5601,8 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("pk_ordinal", ScalarType::Int32, false),
                 // The DEFAULT as canonical SQL text; NULL for none (introspection.md §5).
                 col("column_default", ScalarType::Text, false),
+                // 'ALWAYS' / 'BY DEFAULT' for an identity column, else NULL (introspection.md §5).
+                col("identity_generation", ScalarType::Text, false),
             ],
         ),
         SrfKind::JedIndexes => table(
