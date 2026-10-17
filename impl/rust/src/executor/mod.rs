@@ -1035,9 +1035,14 @@ pub struct SessionState {
     /// arbitrarily long FK chain across cheap DDL statements, so generated child DML is capped at
     /// 256 nested calls to keep every core's native stack bounded (`54001`).
     pub(crate) fk_action_depth: usize,
-    /// Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
-    /// reached its fixed point (§6.6). Empty between statements.
-    fk_deferred_checks: Vec<dml::FkDeferredCheck>,
+    /// Foreign-key checks deferred until the outermost recursive action closure has reached its
+    /// fixed point (§6.6) or, inside a data-modifying `WITH`, until the whole statement has run
+    /// (writable-cte.md §7). Empty between statements.
+    fk_deferred_checks: std::cell::RefCell<Vec<dml::FkDeferredCheck>>,
+    /// Set while a data-modifying `WITH` runs its sub-statements: every foreign-key check is then
+    /// queued in [`fk_deferred_checks`](Self::fk_deferred_checks) and settled against the end state
+    /// of the whole statement, PostgreSQL's end-of-statement RI-trigger timing (writable-cte.md §7).
+    pub(crate) fk_statement_defer: bool,
 }
 
 /// Validate + canonicalize a session-variable name (spec/design/session.md §6.1). A variable must be
@@ -1198,7 +1203,8 @@ impl SessionState {
             env,
             read_pin: None,
             fk_action_depth: 0,
-            fk_deferred_checks: Vec::new(),
+            fk_deferred_checks: std::cell::RefCell::new(Vec::new()),
+            fk_statement_defer: false,
         }
     }
 

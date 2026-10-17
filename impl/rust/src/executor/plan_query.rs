@@ -705,8 +705,13 @@ impl Engine {
         // so the next statement reads normally.
         let pin = self.capture_read_pin();
         self.session.read_pin = Some(pin);
+        // Every foreign-key check waits for the end of the whole statement (§7), then runs against
+        // the working state every sub-statement produced, in the order the checks were queued.
+        self.session.fk_statement_defer = true;
         let result = self.run_with_dml(wq, params);
         self.session.read_pin = None;
+        self.session.fk_statement_defer = false;
+        self.session.fk_deferred_checks.borrow_mut().clear();
         result
     }
 
@@ -869,8 +874,12 @@ impl Engine {
         {
             profile.record(node, outcome.cost());
         }
+        // (5) Settle every foreign-key check the parts queued, against the end state of the whole
+        //     statement (§7). A parent-side reverse match is metered (constraints.md §6.11).
+        let mut fk_meter = self.session.new_meter();
+        self.flush_fk_deferred_checks(&mut fk_meter)?;
         release_cte_buffers(&self.session.query_account(), &buffers);
-        let outcome = add_outcome_cost(outcome, total_cost);
+        let outcome = add_outcome_cost(outcome, total_cost + fk_meter.accrued);
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.record_parent("WITH".to_string(), outcome.cost());
         }

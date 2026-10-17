@@ -116,15 +116,14 @@ snapshot taken before the first sub-statement runs. So:
   its own (a single DML's two-phase pass already needs no read-your-writes — §6 of
   [grammar.md](grammar.md)). A key collision the pin hides is still caught when the write meets the
   earlier sub-statement's row in `working` (`23505`, §7).
-- **Foreign keys are the exception: they are checked against the working state, not the pin.**
-  PostgreSQL runs its RI checks as end-of-statement triggers that see the statement's writes, so a
-  parent a CTE inserts satisfies a child the primary writes (`WITH p AS (INSERT INTO parent …
-  RETURNING id) INSERT INTO child SELECT … FROM p`), and a parent a CTE deletes no longer satisfies
-  one (`23503` — checking against the pin would commit an orphan). jed checks each sub-statement's
-  child-side probes (constraints.md §6.4) and parent-side `NO ACTION`/`RESTRICT` searches and
-  referential actions (§6.5–§6.6) against the transaction's working state when that sub-statement
-  validates, so they see every **earlier** sub-statement's writes. See §7 for the one ordering this
-  cannot reproduce.
+- **Foreign keys are the exception: they are checked against the working state, not the pin, at the
+  end of the whole statement.** PostgreSQL runs its RI checks as end-of-statement triggers that see
+  every sub-statement's writes, so a parent a CTE inserts satisfies a child the primary writes (`WITH
+  p AS (INSERT INTO parent … RETURNING id) INSERT INTO child SELECT … FROM p`) — or a child an
+  *earlier* CTE writes — and a parent a CTE deletes no longer satisfies one (`23503` — checking
+  against the pin would commit an orphan). jed queues every foreign-key check and settles the queue
+  once the primary has run (§7); referential actions (constraints.md §6.6) still run with the
+  sub-statement that fires them, against the working state.
 - **Writes** accumulate into each domain's working set in sub-statement order (§3).
 - The pin is cleared when the statement finishes (success or error), so the next statement reads
   normally.
@@ -217,17 +216,38 @@ A delete and an insert that do **not** overlap on a key compose without conflict
 pattern across two tables; a delete of a pre-existing key and an insert of a new key in the same
 table).
 
-### Foreign keys across sub-statements
+### Foreign keys across sub-statements — checked at the end of the statement
 
-A foreign key satisfied only by a **later** sub-statement is a known divergence, not yet removed:
-jed raises `23503` where PostgreSQL accepts. jed checks a sub-statement's foreign keys when that
-sub-statement validates (§2), against the writes of the sub-statements before it, while PostgreSQL
-defers every RI check to the end of the whole statement. So `WITH c AS (INSERT INTO child VALUES
-(5, 5)), p AS (INSERT INTO parent VALUES (5)) SELECT 1` and `WITH d AS (DELETE FROM parent WHERE
-id = 1), u AS (UPDATE child SET pid = 2 WHERE pid = 1) SELECT 1` fail in jed and succeed in
-PostgreSQL. Listing the sub-statement that makes the reference valid first (the parent insert before
-the child insert, the child re-point before the parent delete) gives PostgreSQL's result. Deferring
-these checks to the end of the statement is a tracked follow-on ([TODO.md](../../TODO.md)).
+PostgreSQL defers every RI check of a statement to its end, so a foreign key may be made valid by a
+**later** sub-statement. jed matches: while a data-modifying `WITH` runs, every foreign-key check a
+sub-statement (or a referential action it fires) would make is queued instead —
+
+- each **child-side** check (constraints.md §6.4): the referencing row's tuple, or its MATCH FULL
+  partly-NULL rejection (§6.3);
+- each **parent-side** `NO ACTION`/`RESTRICT` search (§6.5) for a parent tuple that disappeared;
+
+— and after the primary has run, the queue is settled in the order it was filled (sub-statement
+order, then each sub-statement's own §6.4/§6.6 order) against the transaction's working state,
+which now holds every sub-statement's writes. A parent re-keyed by an `UPDATE` is first re-probed,
+as for a single statement. The first failing check raises `23503` with the message it would have had
+immediately. So `WITH c AS (INSERT INTO child VALUES (5, 5)), p AS (INSERT INTO parent VALUES (5))
+SELECT 1` and `WITH d AS (DELETE FROM parent WHERE id = 1), u AS (UPDATE child SET pid = 2 WHERE
+pid = 1) SELECT 1` succeed, as in PostgreSQL. Because every check waits, a sub-statement's
+immediate error — `23505`, `23514`, `23502` — is reported before any queued `23503`, also as in
+PostgreSQL. A parent-side reverse match is metered as before (§6.11); its cost is part of the
+statement total.
+
+Referential **actions** (`CASCADE`, `SET NULL`, `SET DEFAULT` — constraints.md §6.6) are not
+deferred: each runs with the sub-statement whose parent write fires it, against the working state as
+the earlier sub-statements left it. PostgreSQL also fires actions as end-of-statement triggers, in
+the order it happened to execute the sub-statements — an order it leaves unspecified (§3), and in
+which it runs unreferenced data-modifying CTEs *after* the primary. With jed's deterministic lexical
+order, running an action at its sub-statement gives PostgreSQL's result in the common shapes: a
+child inserted by the primary at a parent a CTE deletes (or re-keys) with `ON DELETE CASCADE` (`ON
+UPDATE CASCADE`) is an orphan, `23503`, in both. A documented divergence remains where PostgreSQL
+runs the parent's sub-statement first: `WITH d AS (DELETE FROM parent WHERE id = 1 RETURNING id)
+INSERT INTO child SELECT 100, id FROM d` succeeds in PostgreSQL, whose cascade (fired at the end)
+deletes the new child as well, and fails `23503` in jed, whose cascade ran before the child existed.
 
 ## 8. Cost
 
@@ -248,7 +268,8 @@ The [cte.md](cte.md) §5 contract points hold, plus:
    (§3) — identical across cores, so the committed end state and every buffer are byte-identical.
 2. **The read pin** is the same pre-statement snapshot of every database domain in every core, so
    every sub-statement reads the identical rows (§2) and a write/write conflict resolves
-   identically (§7); foreign keys read the identical working state.
+   identically (§7); foreign keys are settled in the identical queue order against the identical
+   end state.
 3. **Buffer order** for a data-modifying CTE is its `RETURNING` output order — the affected-row
    order of the underlying DML, already a cross-core contract ([grammar.md §32](grammar.md);
    unspecified to the *user* without `ORDER BY`, but byte-identical across cores, compared `rowsort`

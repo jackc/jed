@@ -2226,14 +2226,16 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			if !ok {
 				// A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
 				if fkMatchFullViolated(fk, pr.row) {
-					return nil, newFKViolationMatchFull(relation, fk.Name)
+					if err := db.fkChildCheck(relation, table.Columns, fk, fkProbe{}, false, pr.row, fkTemp); err != nil {
+						return nil, err
+					}
 				}
 				continue
 			}
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
 			}
-			if err := db.validateInsertFKStored(relation, table.Columns, fk, probe, pr.row, fkTemp); err != nil {
+			if err := db.fkChildCheck(relation, table.Columns, fk, probe, true, pr.row, fkTemp); err != nil {
 				return nil, err
 			}
 		}
@@ -2427,14 +2429,16 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		if !probeOK {
 			// A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
 			if fkMatchFullViolated(fk, row) {
-				return nil, newFKViolationMatchFull(relation, fk.Name)
+				if err := db.fkChildCheck(relation, table.Columns, fk, fkProbe{}, false, row, fkTemp); err != nil {
+					return nil, err
+				}
 			}
 			continue
 		}
 		if suppliedOK && bytes.Equal(supplied.bytes, probe.bytes) {
 			continue
 		}
-		if err := db.validateInsertFKStored(relation, table.Columns, fk, probe, row, fkTemp); err != nil {
+		if err := db.fkChildCheck(relation, table.Columns, fk, probe, true, row, fkTemp); err != nil {
 			return nil, err
 		}
 	}
@@ -2535,9 +2539,27 @@ func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided [
 	return row, nil
 }
 
-// validateInsertFKStored completes one child-side FK check after the caller handles the statement
-// end-state match. The batch and one-row paths share the stored probe and violation construction.
-func (db *engine) validateInsertFKStored(relation string, columns []catColumn, fk *foreignKey, probe fkProbe, row storedRow, temp bool) error {
+// fkChildCheck settles one child row's foreign-key check (constraints.md §6.4) once the caller has
+// handled this statement's own batch: probe is the row's parent probe, or probeOK is false when
+// MATCH FULL rejects a partly-NULL tuple (§6.3). Inside a data-modifying WITH the check is queued
+// for the end of the whole statement instead, so a parent a LATER sub-statement writes satisfies
+// it (writable-cte.md §7).
+func (db *engine) fkChildCheck(relation string, columns []catColumn, fk *foreignKey, probe fkProbe, probeOK bool, row storedRow, temp bool) error {
+	if db.session.fkStatementDefer {
+		db.session.fkDeferredChecks = append(db.session.fkDeferredChecks, fkDeferredCheck{
+			child: true, relation: relation, columns: columns, fk: *fk, probe: probe,
+			probeOK: probeOK, row: row, temp: temp,
+		})
+		return nil
+	}
+	return db.fkChildVerdict(relation, columns, fk, probe, probeOK, row, temp)
+}
+
+// fkChildVerdict is the immediate child-side verdict behind fkChildCheck.
+func (db *engine) fkChildVerdict(relation string, columns []catColumn, fk *foreignKey, probe fkProbe, probeOK bool, row storedRow, temp bool) error {
+	if !probeOK {
+		return newFKViolationMatchFull(relation, fk.Name)
+	}
 	hit, err := db.fkProbeHits(probe, fk.RefTable, temp)
 	if err != nil {
 		return err
@@ -3263,20 +3285,17 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			if !ok {
 				// A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
 				if fkMatchFullViolated(fk, row) {
-					return 0, nil, newFKViolationMatchFull(relation, fk.Name)
+					if err := db.fkChildCheck(relation, table.Columns, fk, fkProbe{}, false, row, fkTemp); err != nil {
+						return 0, nil, err
+					}
 				}
 				continue
 			}
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
 			}
-			hit, err := db.fkProbeHits(probe, fk.RefTable, fkTemp)
-			if err != nil {
+			if err := db.fkChildCheck(relation, table.Columns, fk, probe, true, row, fkTemp); err != nil {
 				return 0, nil, err
-			}
-			if !hit {
-				return 0, nil, newFKViolationInsert(relation, fk.Name).
-					withDetail(db.fkChildDetail(relation, table.Columns, fk, row))
 			}
 		}
 	}
@@ -3604,9 +3623,11 @@ type fkUpdateTransition struct {
 	oldRow storedRow
 }
 
-// fkDeferredCheck is one inbound NO ACTION/RESTRICT probe saved until every generated write in the
-// recursive closure has finished. update is true when the old parent key may have been restored by
-// a later action and must be re-probed before checking the child.
+// fkDeferredCheck is one foreign-key check saved for later. A parent-side entry is an inbound NO
+// ACTION/RESTRICT probe saved until every generated write in the recursive closure has finished;
+// update is true when the old parent key may have been restored by a later action and must be
+// re-probed before checking the child. Inside a data-modifying WITH every check — child-side
+// existence and MATCH FULL included — waits for the end of the whole statement (writable-cte.md §7).
 type fkDeferredCheck struct {
 	parent     *catTable
 	childTable string
@@ -3615,6 +3636,13 @@ type fkDeferredCheck struct {
 	values     []Value // the parent tuple in FK slot order, for the child-key reverse probe
 	update     bool
 	temp       bool // the FK's domain (session-local temp or main — temp-tables.md §8)
+	// child marks a child row's existence check (constraints.md §6.4); probeOK is false when
+	// MATCH FULL rejects the row's partly-NULL tuple (§6.3).
+	child    bool
+	relation string
+	columns  []catColumn
+	row      storedRow
+	probeOK  bool
 }
 
 // runFkActionUpdate/Delete execute generated work through the ordinary DML pipeline. The nested
@@ -3765,6 +3793,12 @@ func fkTupleValues(row storedRow, refColumns []int) []Value {
 func (db *engine) flushFkDeferredChecks(meter *costMeter) error {
 	for i := range db.session.fkDeferredChecks {
 		check := &db.session.fkDeferredChecks[i]
+		if check.child {
+			if err := db.fkChildVerdict(check.relation, check.columns, &check.fk, check.probe, check.probeOK, check.row, check.temp); err != nil {
+				return err
+			}
+			continue
+		}
 		if check.update {
 			present, err := db.fkProbeHits(check.probe, check.parent.Name, check.temp)
 			if err != nil {
@@ -3796,7 +3830,9 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 	if !hasFKs {
 		return nil // an attached-database table has no foreign keys (attached-databases.md §8)
 	}
-	root := db.session.fkActionDepth == 0
+	// Inside a data-modifying WITH the checks wait for the end of the whole statement
+	// (writable-cte.md §7); otherwise the outermost closure settles them.
+	root := db.session.fkActionDepth == 0 && !db.session.fkStatementDefer
 	if root {
 		if len(db.session.fkDeferredChecks) != 0 {
 			panic("foreign-key deferred-check queue leaked across statements")
@@ -3865,7 +3901,9 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 	if !hasFKs {
 		return nil // an attached-database table has no foreign keys (attached-databases.md §8)
 	}
-	root := db.session.fkActionDepth == 0
+	// Inside a data-modifying WITH the checks wait for the end of the whole statement
+	// (writable-cte.md §7); otherwise the outermost closure settles them.
+	root := db.session.fkActionDepth == 0 && !db.session.fkStatementDefer
 	if root {
 		if len(db.session.fkDeferredChecks) != 0 {
 			panic("foreign-key deferred-check queue leaked across statements")
@@ -4818,20 +4856,17 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 			if !ok {
 				// A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
 				if fkMatchFullViolated(fk, u.row) {
-					return outcome{}, newFKViolationMatchFull(relation, fk.Name)
+					if err := db.fkChildCheck(relation, table.Columns, fk, fkProbe{}, false, u.row, fkTemp); err != nil {
+						return outcome{}, err
+					}
 				}
 				continue
 			}
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
 			}
-			hit, err := db.fkProbeHits(probe, fk.RefTable, fkTemp)
-			if err != nil {
+			if err := db.fkChildCheck(relation, table.Columns, fk, probe, true, u.row, fkTemp); err != nil {
 				return outcome{}, err
-			}
-			if !hit {
-				return outcome{}, newFKViolationInsert(relation, fk.Name).
-					withDetail(db.fkChildDetail(relation, table.Columns, fk, u.row))
 			}
 		}
 	}
