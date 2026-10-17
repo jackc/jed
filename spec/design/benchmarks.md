@@ -855,6 +855,65 @@ Chromium OPFS durability tests. The full `mise run ci` gate also passed, includi
 tests, the 2,280-check cross-core NoREC sweep, and the reducer self-test. No `/web` change is needed
 because SQL and host APIs are unchanged.
 
+**DELETE unique-dirty result (2026-10-17).** INSERT Slice 3 left remove/rebalance on the pure
+path-copy form. Every Rust delete therefore copied the whole holding leaf (`decoded_parts`) and the
+root-to-leaf interior spine, so repeated deletes in one transaction were O(leaf size) each. Rust now
+applies INSERT's rule (`Arc::get_mut` uniqueness plus `page == 0`) to remove and rebalance
+([transactions.md §3](transactions.md)). Go and TypeScript are unchanged. The merge, split, and
+abandon decisions are those of the path-copy form, so tree shape, bytes, and costs do not move.
+
+Four scratch lanes were added (`delete_rollback_serial`, `delete_rollback_random`,
+`delete_range_rollback`, `delete_insert_churn`). Each builds a fresh 100k-row
+`(id bigint PRIMARY KEY, v bigint, note text)` table and rolls each transaction back. The control
+is master `172e3b0a`.
+
+Allocation evidence came from a temporary counting global allocator (not committed). It wrapped
+one transaction over a durable 100k-row file database (`locking=exclusive`) and took the median of
+five retained transactions:
+
+| Workload / transaction | Alloc/realloc calls (base → after) | Requested bytes (base → after) |
+|---|---:|---:|
+| 1,000 consecutive-key deletes | 886,784 → 94,120 (−89.4%) | 67.9 MB → 6.0 MB (−91.1%) |
+| 1,000 random-key deletes | 737,108 → 261,448 (−64.5%) | 74.8 MB → 34.8 MB (−53.5%) |
+| one 10,000-row range delete | 7,671,169 → 55,431 (−99.3%) | 610.7 MB → 12.9 MB (−97.9%) |
+| 1,000 PK re-keys (delete + insert) | 937,060 → 144,396 (−84.6%) | 70.6 MB → 8.7 MB (−87.6%) |
+
+Random deletes keep the most allocation: each one usually faults and decodes a different clean
+leaf once, and that cost is inherent.
+
+Wall clock used four alternated base/after rounds of the Rust `bench-jed` binary. Each variant was
+built in its own worktree, run against the same corpus and data, and pinned to one CPU on a host
+that other benchmark jobs shared. Each cell is the median of the four process means; every
+checksum agreed.
+
+| Rust lane | Base | After | Change |
+|---|---:|---:|---:|
+| `delete_rollback_serial` | 28.006 ms | 2.807 ms | −90.0% |
+| `delete_rollback_random` | 33.946 ms | 16.220 ms | −52.2% |
+| `delete_range_rollback` | 249.540 ms | 7.934 ms | −96.8% |
+| `delete_insert_churn` | 29.265 ms | 5.130 ms | −82.5% |
+| `fk_cascade_delete_indexed` | 45.062 ms | 2.106 ms | −95.3% |
+| `fk_cascade_delete_unindexed` | 44.596 ms | 16.625 ms | −62.7% |
+| `fk_delete_parent_indexed` | 0.314 ms | 0.142 ms | −55.0% |
+| `secondary_pointset_delete` | 4.242 ms | 2.243 ms | −47.1% |
+| `gin_delete` | 2.094 ms | 1.333 ms | −36.3% |
+| `fk_delete_parent_unindexed` (scan-bound control) | 97.679 ms | 95.658 ms | −2.1% |
+| `insert_rollback` (control) | 2.738 ms | 2.783 ms | +1.7% |
+| `secondary_update` (control) | 0.392 ms | 0.395 ms | +0.7% |
+| `full_scan_agg_filter` (control) | 55.808 ms | 56.815 ms | +1.8% |
+| `point_lookup_pk` (control) | 2.5 µs | 2.7 µs | +8% (spread 59–201%, noise) |
+
+The read path is unchanged, so the controls stay within their own round-to-round spread. One
+smoke run on the base binary put the other engines on the same lanes (serial / random / range /
+churn, mean per transaction) at 17.6 / 51.8 / 10.7 / 24.2 ms for PostgreSQL and 0.33 / 49.7 / 0.56 /
+0.67 ms for SQLite. The
+gap that remains to SQLite on the serial and range lanes is the per-statement executor path plus
+merges, not tree copying. A focused test, `remove_in_place_matches_path_copy`, keeps the edited
+tree structurally identical to a pinned, always path-copied twin. It covers every step of 3,000
+removes, with variable weights so merges overflow and split back, plus interleaved re-inserts and
+misses. `remove_reuses_only_unique_dirty_paths` proves the alias guard and the clean-node guard by
+node identity. The same transient for Go and TypeScript is a separate follow-on in TODO.md.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:
@@ -1611,7 +1670,9 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
   keeping the busiest ~0.3% so the grouping rather than the result transfer dominates), on every
   engine;
 - ✅ UPDATE / DELETE throughput — `secondary_update`, `costed_update`, `secondary_pointset_delete`,
-  and the `fk_*delete*` lanes;
+  the `fk_*delete*` lanes, and the DELETE-heavy tree lanes `delete_rollback_serial` (leaf drains
+  and merges), `delete_rollback_random`, `delete_range_rollback` (10,000 rows in one statement), and
+  `delete_insert_churn` (PK re-keys);
 - ✅ **miss-heavy point lookups** — `point_lookup_pk_miss`: a scratch table holding every tenth key
   of 1..1,000,000, so ~90% of the uniform probes miss and each miss descends to a different leaf
   (probing past the end of the dense `large` keys would land on the one rightmost leaf every time);

@@ -142,15 +142,21 @@ impl Node {
 
     /// A fresh **dirty interior** node (page `0`) — separators + children, no records (v24).
     fn new_interior(keys: Vec<Vec<u8>>, children: Vec<Child>) -> Arc<Node> {
+        Arc::new(Node::interior(keys, children))
+    }
+
+    /// The bare dirty interior behind [`Node::new_interior`], for a caller that edits it before
+    /// sharing it (the delete path-copy rebalances the rebuilt parent in place).
+    fn interior(keys: Vec<Vec<u8>>, children: Vec<Child>) -> Node {
         debug_assert_eq!(children.len(), keys.len() + 1, "interior child count");
-        Arc::new(Node {
+        Node {
             keys,
             vals: Vec::new(),
             weights: Vec::new(),
             children,
             packed: None,
             page: AtomicU32::new(0),
-        })
+        }
     }
 
     /// A leaf reconstructed from disk at `page` (format.rs `read_tree`), already persisted and
@@ -795,26 +801,26 @@ impl PMap {
         shape: LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
-        let root = match self.root.as_ref() {
-            None => return Ok(None),
-            Some(r) => r.clone(),
+        let Some(root) = self.root.as_mut() else {
+            return Ok(None);
         };
-        let (new_root, removed) = node_remove(&root, key, src, cap, shape)?;
+        // `node_remove` leaves `root` untouched when the key is absent, else points it at the
+        // post-delete subtree (edited in place when uniquely owned and dirty, else path-copied).
+        let removed = node_remove(root, key, src, cap, shape)?;
         if removed.is_some() {
             // The root may have drained: an empty leaf becomes the empty map; a 0-key interior
             // root hands the root down a level (height shrinks). The root is exempt from the
-            // underfull rule, so no rebalance here.
-            self.root = if new_root.keys.is_empty() {
-                if new_root.is_leaf() {
+            // underfull rule, so no rebalance here. A root reached by a removal is decoded (a
+            // dirty leaf or an interior), so `keys` is its true key list.
+            if root.keys.is_empty() {
+                self.root = if root.is_leaf() {
                     None
                 } else {
                     // The lone surviving child becomes the new root — fault it if it is an OnDisk
                     // leaf (a tree of height 2 can collapse to its single bottom child).
-                    Some(child(&new_root, 0, src)?)
-                }
-            } else {
-                Some(new_root)
-            };
+                    Some(child(root, 0, src)?)
+                };
+            }
             self.count = self.count.map(|n| {
                 n.checked_sub(1)
                     .expect("a removed row implies a positive row count")
@@ -1358,60 +1364,104 @@ fn underfull(node: &Node, cap: usize, shape: LeafShape) -> bool {
     node.payload(shape) < cap / 2
 }
 
-/// Recursive delete (copy-on-write). Descends to the holding **leaf** (a separator equal to the
-/// key routes right and is never itself deleted — separators may go stale, format.md "Delete").
-/// Returns the rebuilt subtree (possibly underfull — the caller rebalances it) and the removed row
-/// (or `None` if absent). The touched child is rebalanced via [`rebalance_child`].
+/// Recursive delete. Descends to the holding **leaf** (a separator equal to the key routes right and
+/// is never itself deleted — separators may go stale, format.md "Delete"). When the key is absent,
+/// `node` is left untouched and `None` is returned. Otherwise `node` ends up pointing at the
+/// post-delete subtree (possibly underfull — the caller rebalances it) and the removed row is
+/// returned; the touched child is rebalanced via [`rebalance_child`].
+///
+/// A node that is dirty (`page == 0`) **and** uniquely owned ([`Arc::get_mut`]) is edited in place;
+/// any other node is path-copied, exactly as the INSERT path does ([`node_insert`]). Both forms run
+/// the same removal, merge, and split decisions on the same entry lists, so the resulting tree —
+/// its node boundaries, separators, and therefore its serialized bytes — is identical; only the
+/// number of node copies differs.
 fn node_remove(
-    node: &Arc<Node>,
+    node: &mut Arc<Node>,
     key: &[u8],
     src: Option<&dyn LeafSource>,
     cap: usize,
     shape: LeafShape,
-) -> Result<(Arc<Node>, Option<Row>)> {
+) -> Result<Option<Row>> {
     if node.is_leaf() {
-        return match node.search(key) {
-            Ok(i) => {
-                let (mut keys, mut vals, mut weights) = node.decoded_parts()?;
-                keys.remove(i);
-                let removed = vals.remove(i);
-                weights.remove(i);
-                Ok((Node::new_leaf(keys, vals, weights), Some(removed)))
-            }
-            Err(_) => Ok((node.clone(), None)),
+        let Ok(i) = node.search(key) else {
+            return Ok(None);
         };
+        if node.page.load(Ordering::Relaxed) == 0
+            && let Some(leaf) = Arc::get_mut(node)
+        {
+            debug_assert!(leaf.packed.is_none(), "a dirty leaf is decoded");
+            leaf.keys.remove(i);
+            leaf.weights.remove(i);
+            return Ok(Some(leaf.vals.remove(i)));
+        }
+        let (mut keys, mut vals, mut weights) = node.decoded_parts()?;
+        keys.remove(i);
+        let removed = vals.remove(i);
+        weights.remove(i);
+        *node = Node::new_leaf(keys, vals, weights);
+        return Ok(Some(removed));
     }
     let i = node.child_slot(key);
-    let c = child(node, i, src)?;
-    let (new_child, removed) = node_remove(&c, key, src, cap, shape)?;
+    if node.page.load(Ordering::Relaxed) == 0
+        && let Some(parent) = Arc::get_mut(node)
+    {
+        let removed = match &mut parent.children[i] {
+            Child::Resident(c) => node_remove(c, key, src, cap, shape)?,
+            Child::OnDisk(page) => {
+                // Fault the untouched leaf; it becomes a resident (rebuilt, dirty) child only when
+                // the key was actually there.
+                let mut c = match src {
+                    Some(s) => s.load_leaf(*page)?,
+                    None => {
+                        unreachable!("demand-paged leaf {page} reached with no buffer-pool source")
+                    }
+                };
+                let removed = node_remove(&mut c, key, src, cap, shape)?;
+                if removed.is_some() {
+                    parent.children[i] = Child::Resident(c);
+                }
+                removed
+            }
+        };
+        if removed.is_some() {
+            rebalance_child(parent, i, src, cap, shape)?;
+        }
+        return Ok(removed);
+    }
+    // Shared or published: path-copy. The local `Arc` clone keeps a resident child from looking
+    // unique, so the whole remaining path below a shared node is copied too.
+    let mut c = child(node, i, src)?;
+    let removed = node_remove(&mut c, key, src, cap, shape)?;
     if removed.is_none() {
-        return Ok((node.clone(), None));
+        return Ok(None);
     }
     let mut children = node.children.clone();
-    children[i] = Child::Resident(new_child);
-    let rebuilt = Node::new_interior(node.keys.clone(), children);
-    Ok((rebalance_child(&rebuilt, i, src, cap, shape)?, removed))
+    children[i] = Child::Resident(c);
+    let mut rebuilt = Node::interior(node.keys.clone(), children);
+    rebalance_child(&mut rebuilt, i, src, cap, shape)?;
+    *node = Arc::new(rebuilt);
+    Ok(removed)
 }
 
 /// If `node.children[i]` is underfull, merge it with an adjacent sibling (prefer the right one),
-/// then split the merged node back if it overflows — the unified rebalance (no borrow). Returns the
-/// rebuilt parent (which may itself have lost a key and become underfull — its own parent handles
-/// that as the recursion unwinds).
+/// then split the merged node back if it overflows — the unified rebalance (no borrow). Edits the
+/// (uniquely owned, dirty) parent `node`, which may itself lose a key and become underfull — its own
+/// parent handles that as the recursion unwinds.
 fn rebalance_child(
-    node: &Arc<Node>,
+    node: &mut Node,
     i: usize,
     src: Option<&dyn LeafSource>,
     cap: usize,
     shape: LeafShape,
-) -> Result<Arc<Node>> {
+) -> Result<()> {
     // `children[i]` was just rebuilt resident by `node_remove`, so inspecting it faults nothing.
     if !underfull(node.children[i].resident(), cap, shape) {
-        return Ok(node.clone());
+        return Ok(());
     }
     if node.children.len() < 2 {
         // A 0-key interior (one child, the degenerate max-separator shape) has no sibling to merge
         // with — its own parent merges *it* away; the root case collapses in `PMap::remove`.
-        return Ok(node.clone());
+        return Ok(());
     }
     let j = if i + 1 < node.children.len() {
         i
@@ -1421,6 +1471,48 @@ fn rebalance_child(
     merge_at(node, j, src, cap, shape)
 }
 
+/// A merge operand's leaf entries. A uniquely owned dirty resident leaf gives its vectors up
+/// (`Take`) — it is about to be replaced — while any other leaf is copied out (`Copy`).
+enum LeafParts {
+    Take,
+    Copy((Vec<Vec<u8>>, Vec<Row>, Vec<u32>)),
+}
+
+/// Resolve merge operand `slot` without consuming it: a uniquely owned dirty resident leaf is
+/// `Take`n later; any other leaf (shared, clean, or the just-faulted `loaded`) is decoded now.
+fn leaf_parts(slot: &mut Child, loaded: Option<&Arc<Node>>) -> Result<LeafParts> {
+    if let Child::Resident(n) = slot
+        && n.page.load(Ordering::Relaxed) == 0
+        && Arc::get_mut(n).is_some()
+    {
+        return Ok(LeafParts::Take);
+    }
+    let n = match (slot, loaded) {
+        (Child::Resident(n), _) => n,
+        (Child::OnDisk(_), Some(n)) => n,
+        (Child::OnDisk(p), None) => unreachable!("OnDisk merge operand {p} was not faulted"),
+    };
+    Ok(LeafParts::Copy(n.decoded_parts()?))
+}
+
+/// Move a `Take` operand's vectors out of its (uniquely owned, dirty) node, or return the copy.
+fn into_parts(slot: &mut Child, parts: LeafParts) -> (Vec<Vec<u8>>, Vec<Row>, Vec<u32>) {
+    match parts {
+        LeafParts::Copy(p) => p,
+        LeafParts::Take => {
+            let Child::Resident(n) = slot else {
+                unreachable!("a Take operand is resident")
+            };
+            let n = Arc::get_mut(n).expect("a Take operand stays uniquely owned");
+            (
+                std::mem::take(&mut n.keys),
+                std::mem::take(&mut n.vals),
+                std::mem::take(&mut n.weights),
+            )
+        }
+    }
+}
+
 /// Merge `children[j]` and `children[j+1]` into one node `M` (format.md "Delete"): a **leaf**
 /// merge concatenates the two record lists and the parent separator `j` is **removed** (it was a
 /// routing copy — nothing comes down); an **interior** merge **pulls the separator down** between
@@ -1428,28 +1520,53 @@ fn rebalance_child(
 /// replaces the pair (the parent loses one key); if it overflows, it is split 2-way by the
 /// balanced rule and the halves + the new separator replace the pair (the parent's key count is
 /// unchanged). An **interior** `M` that overflows but admits no valid split (near-cap separators)
-/// **abandons the merge** — the parent is returned unchanged (format.md "Delete", the deterministic
+/// **abandons the merge** — the parent is left unchanged (format.md "Delete", the deterministic
 /// abandon rule).
+///
+/// The parent is edited in place. A merged leaf takes a uniquely owned dirty operand's vectors
+/// instead of copying them; every fallible step (faulting, decoding) runs before any vector moves,
+/// so an error leaves the tree intact.
 fn merge_at(
-    node: &Arc<Node>,
+    node: &mut Node,
     j: usize,
     src: Option<&dyn LeafSource>,
     cap: usize,
     shape: LeafShape,
-) -> Result<Arc<Node>> {
+) -> Result<()> {
     // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
-    // still be an `OnDisk` leaf the delete never touched.
-    let left = child(node, j, src)?;
-    let right = child(node, j + 1, src)?;
+    // still be an `OnDisk` leaf the delete never touched — in left-then-right order.
+    let fault = |slot: &Child| -> Result<Option<Arc<Node>>> {
+        match slot {
+            Child::Resident(_) => Ok(None),
+            Child::OnDisk(p) => match src {
+                Some(s) => Ok(Some(s.load_leaf(*p)?)),
+                None => unreachable!("demand-paged leaf {p} reached with no buffer-pool source"),
+            },
+        }
+    };
+    let lloaded = fault(&node.children[j])?;
+    let rloaded = fault(&node.children[j + 1])?;
+    let left_is_leaf = match (&node.children[j], &lloaded) {
+        (Child::Resident(n), _) => n.is_leaf(),
+        (Child::OnDisk(_), _) => true,
+    };
 
-    let merged = if left.is_leaf() {
-        let (mut mkeys, mut mvals, mut mweights) = left.decoded_parts()?;
-        let (rkeys, rvals, rweights) = right.decoded_parts()?;
+    let merged = if left_is_leaf {
+        let (lslot, rslot) = node.children.split_at_mut(j + 1);
+        let (lslot, rslot) = (&mut lslot[j], &mut rslot[0]);
+        let lparts = leaf_parts(lslot, lloaded.as_ref())?;
+        let rparts = leaf_parts(rslot, rloaded.as_ref())?;
+        let (mut mkeys, mut mvals, mut mweights) = into_parts(lslot, lparts);
+        let (rkeys, rvals, rweights) = into_parts(rslot, rparts);
         mkeys.extend(rkeys);
         mvals.extend(rvals);
         mweights.extend(rweights);
         build_leaf(mkeys, mvals, mweights, cap, shape, None)
     } else {
+        // Interior operands are always resident. Their separator/child lists are copied (cheap
+        // `Arc` bumps): an abandoned merge must leave both exactly as they were.
+        let left = node.children[j].resident();
+        let right = node.children[j + 1].resident();
         let mut mkeys = left.keys.clone();
         mkeys.push(node.keys[j].clone());
         mkeys.extend(right.keys.iter().cloned());
@@ -1459,27 +1576,24 @@ fn merge_at(
             Some(ins) => ins,
             // No valid 2-way split point (near-cap separators): abandon the merge — the two
             // children and the parent separator stay exactly as they were (underfull tolerated).
-            None => return Ok(node.clone()),
+            None => return Ok(()),
         }
     };
 
-    let mut keys = node.keys.clone();
-    let mut children = node.children.clone();
     match merged {
         Ins::Kept => unreachable!("fresh merge builders never edit an existing node"),
         Ins::Whole(m) => {
-            keys.remove(j);
-            children[j] = Child::Resident(m);
-            children.remove(j + 1);
-            Ok(Node::new_interior(keys, children))
+            node.keys.remove(j);
+            node.children[j] = Child::Resident(m);
+            node.children.remove(j + 1);
         }
         Ins::Split { left, sep, right } => {
-            keys[j] = sep;
-            children[j] = Child::Resident(left);
-            children[j + 1] = Child::Resident(right);
-            Ok(Node::new_interior(keys, children))
+            node.keys[j] = sep;
+            node.children[j] = Child::Resident(left);
+            node.children[j + 1] = Child::Resident(right);
         }
     }
+    Ok(())
 }
 
 /// In-order walk — a leaf walk in key order (records are leaf-only, v24). Clones each
@@ -1842,6 +1956,120 @@ mod tests {
         assert_eq!(other.get(&key(1000), None).unwrap(), Some(row(-1000)));
         assert_eq!(other.get(&key(2500), None).unwrap(), Some(row(2500)));
         check_invariants(&other);
+    }
+
+    /// Every node's keys (leaf records or interior separators), rows, and weights in preorder —
+    /// the full structure the serializer turns into bytes.
+    fn shape_dump(pm: &PMap) -> Vec<(bool, Vec<Vec<u8>>, Vec<Row>, Vec<u32>)> {
+        fn walk(node: &Node, out: &mut Vec<(bool, Vec<Vec<u8>>, Vec<Row>, Vec<u32>)>) {
+            out.push((
+                node.is_leaf(),
+                node.keys.clone(),
+                node.vals.clone(),
+                node.weights.clone(),
+            ));
+            for c in &node.children {
+                walk(c.resident(), out);
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(r) = pm.root.as_ref() {
+            walk(r, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn remove_in_place_matches_path_copy() {
+        // Variable weights make merges overflow and split back, not only collapse. The `copy` map
+        // is pinned before every mutation, so each remove path-copies; `edit` is never aliased, so
+        // its dirty paths are edited in place. The trees must stay structurally identical.
+        let weight = |k: u64| 16 + (k * 7 % 45) as u32;
+        let mut edit = PMap::new();
+        let mut copy = PMap::new();
+        for k in shuffled(3000) {
+            edit.insert(key(k), row(k as i64), weight(k), CAP, SHAPE, None)
+                .unwrap();
+            copy.insert(key(k), row(k as i64), weight(k), CAP, SHAPE, None)
+                .unwrap();
+        }
+        assert_eq!(shape_dump(&edit), shape_dump(&copy));
+        let order = shuffled(3000);
+        for (step, &k) in order.iter().enumerate() {
+            let pin = copy.clone();
+            let a = edit.remove(&key(k), CAP, SHAPE, None).unwrap();
+            let b = copy.remove(&key(k), CAP, SHAPE, None).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(pin.get(&key(k), None).unwrap(), Some(row(k as i64)));
+            drop(pin);
+            // Interleave re-inserts (churn) and misses so in-place inserts and removes mix.
+            if step % 7 == 0 {
+                let r = k + 10_000;
+                edit.insert(key(r), row(1), weight(r), CAP, SHAPE, None)
+                    .unwrap();
+                copy.insert(key(r), row(1), weight(r), CAP, SHAPE, None)
+                    .unwrap();
+            }
+            assert_eq!(edit.remove(&key(99_999), CAP, SHAPE, None).unwrap(), None);
+            if step % 97 == 0 || step + 1 == order.len() {
+                assert_eq!(shape_dump(&edit), shape_dump(&copy), "step {step}");
+                check_invariants(&edit);
+            }
+            assert_eq!(edit.count(), copy.count());
+        }
+        assert_eq!(shape_dump(&edit), shape_dump(&copy));
+    }
+
+    #[test]
+    fn remove_reuses_only_unique_dirty_paths() {
+        fn path(pm: &PMap, key: &[u8]) -> Vec<*const Node> {
+            let mut node = pm.root.as_ref().expect("nonempty map");
+            let mut out = Vec::new();
+            loop {
+                out.push(Arc::as_ptr(node));
+                if node.is_leaf() {
+                    return out;
+                }
+                node = node.children[node.child_slot(key)].resident();
+            }
+        }
+        let mut pm = PMap::new();
+        for k in 0..2000 {
+            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+                .unwrap();
+        }
+        assert!(pm.height() > 2, "test needs a multi-level dirty path");
+        // A full leaf losing one record stays above half a page, so no merge: every node on the
+        // unaliased dirty path keeps its address.
+        let before = path(&pm, &key(777));
+        assert_eq!(
+            pm.remove(&key(777), CAP, SHAPE, None).unwrap(),
+            Some(row(777))
+        );
+        assert_eq!(path(&pm, &key(778)), before);
+        // A snapshot alias forces a path copy and keeps the pinned row.
+        let pin = pm.clone();
+        let shared_before = path(&pm, &key(778));
+        pm.remove(&key(778), CAP, SHAPE, None).unwrap();
+        assert_ne!(path(&pm, &key(779)), shared_before);
+        assert_eq!(pin.get(&key(778), None).unwrap(), Some(row(778)));
+        assert_eq!(pm.get(&key(778), None).unwrap(), None);
+        drop(pin);
+        // A clean root is rebuilt even when unique.
+        let mut clean = PMap::new();
+        clean.insert(key(1), row(1), W, CAP, SHAPE, None).unwrap();
+        clean.insert(key(2), row(2), W, CAP, SHAPE, None).unwrap();
+        let clean_root = Arc::as_ptr(clean.root.as_ref().unwrap());
+        clean
+            .root
+            .as_ref()
+            .unwrap()
+            .page
+            .store(9, Ordering::Relaxed);
+        clean.remove(&key(1), CAP, SHAPE, None).unwrap();
+        assert_ne!(Arc::as_ptr(clean.root.as_ref().unwrap()), clean_root);
+        assert_eq!(clean.get(&key(2), None).unwrap(), Some(row(2)));
+        check_invariants(&clean);
     }
 
     #[test]
