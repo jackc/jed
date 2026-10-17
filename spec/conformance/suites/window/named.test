@@ -2,8 +2,9 @@
 #
 # A `WINDOW name AS (definition)` clause names a window definition that `OVER name` references; it is
 # exactly equivalent to inlining the definition. Multiple functions can share one named window, and
-# one clause can define several. A reference to an undefined window is 42704 (PG). (The shared
-# partition/sort OPTIMIZATION is a deferred follow-on; this slice is the naming surface.)
+# one clause can define several. A reference to an undefined window is 42704 (PG). Functions over
+# one window share a single partition/sort pass (window.md §5.2); the whole-clause rules are in
+# named_rules.test.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_named, query.window_ranking, query.window_aggregate, query.order_by, types.i32, resource.cost_metering
 
 statement ok

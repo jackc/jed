@@ -886,6 +886,21 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			return nil, err
 		}
 	}
+	// The query ORDER BY may carry window calls too (`ORDER BY row_number() OVER w`), so its keys are
+	// desugared against the same WINDOW clause (window.md §5.3).
+	orderBy := sel.OrderBy
+	if hasWindowSyntax && orderByHasWindow(sel.OrderBy) {
+		orderBy = append([]orderKey(nil), sel.OrderBy...)
+		for i := range orderBy {
+			if orderBy[i].Expr != nil {
+				d, derr := desugarNamedWindows(*orderBy[i].Expr, windowsResolved)
+				if derr != nil {
+					return nil, derr
+				}
+				orderBy[i].Expr = &d
+			}
+		}
+	}
 	projections, columnNames, columnTypes, columnDerivs, columnTypmods, err := resolveProjections(s, items, projAgg, ptypes)
 	if err != nil {
 		return nil, err
@@ -905,6 +920,12 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	var group *joinGroupLayout
 	if sel.JoinGroup {
 		group = joinGroupOutputs(s, &projections, &columnNames, &columnTypes, &columnDerivs, &columnTypmods)
+	}
+	// Validate every WINDOW-clause entry's keys and frame, referenced or not (window.md §5.3).
+	if len(windowsResolved) > 0 {
+		if err := validateWindowClause(s, windowsResolved, projAgg, ptypes); err != nil {
+			return nil, err
+		}
 	}
 	aggSpecs := projAgg.specs
 	windowSpecs := projAgg.windowSpecs
@@ -1005,9 +1026,9 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// expression is resolved here (introducing a new aggregate in a grouped query if it names one),
 	// collected into orderExprs, and given a placeholder sort slot orderExprBase+k rebased to
 	// final_width+k below — the window-key precedent (window.md §5.1).
-	order := make([]orderSlot, 0, len(sel.OrderBy))
+	order := make([]orderSlot, 0, len(orderBy))
 	var orderExprs []*rExpr
-	for _, key := range sel.OrderBy {
+	for _, key := range orderBy {
 		// Classify the key into a row slot (a column / ordinal-to-column) or a source expression (a
 		// general expression, or an ordinal pointing at a computed projection).
 		var slotRes resolved
@@ -1301,8 +1322,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				}
 			}
 		}
-		for i := range sel.OrderBy {
-			key := &sel.OrderBy[i]
+		for i := range orderBy {
+			key := &orderBy[i]
 			inList := false
 			switch {
 			case key.Ordinal != nil:

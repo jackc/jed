@@ -1244,6 +1244,15 @@ function resolveFuncCallExpr(
   if (e.withinGroup !== undefined && e.withinGroup !== null) {
     throw noAggOverload(e.name);
   }
+  // An `OVER name` the desugar pass did not reach (window.md §5.3) sits where a window function
+  // cannot run (WHERE, HAVING, GROUP BY, a JOIN ON, …) — 42P20, PostgreSQL's context check, which
+  // precedes its name lookup; in a window context it names no WINDOW-clause entry — 42704.
+  if (e.overName !== undefined && e.overName !== null) {
+    if (ag.window !== undefined) {
+      throw engineError("undefined_object", `window "${e.overName}" does not exist`);
+    }
+    throw engineError("windowing_error", "window functions are not allowed here");
+  }
   // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
   if (e.over !== undefined && e.over !== null) {
     // GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in PostgreSQL

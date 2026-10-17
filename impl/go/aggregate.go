@@ -1962,6 +1962,13 @@ func extendWindow(base, ext windowDef, baseName string) (windowDef, error) {
 func resolveWindowClause(windows []namedWindow) ([]namedWindow, error) {
 	resolved := make([]namedWindow, 0, len(windows))
 	for _, nw := range windows {
+		// A name defined twice in one clause is 42P20 — checked before the base lookup, as
+		// PostgreSQL's transformWindowDefinitions does.
+		for i := range resolved {
+			if resolved[i].Name == nw.Name {
+				return nil, newError(WindowingError, fmt.Sprintf("window %q is already defined", nw.Name))
+			}
+		}
 		r := nw.Def
 		if nw.Def.Base != "" {
 			base, err := lookupWindow(resolved, nw.Def.Base)

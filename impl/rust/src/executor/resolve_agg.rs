@@ -2948,6 +2948,79 @@ pub(crate) fn resolve_window_def(
     Ok((partition, order, frame))
 }
 
+/// Validate every resolved `WINDOW`-clause entry's keys and frame (spec/design/window.md §5.3), even
+/// an entry no `OVER` references — PostgreSQL's `transformWindowDefinitions` transforms the whole
+/// clause, so an unreferenced entry's unknown column (`42703`), nested window function (`42P20`),
+/// non-grouping column in a grouped query (`42803`), or bad frame is still an error. The keys resolve
+/// exactly as a referenced window's do (`resolve_window_call`): under the query's grouped `Collect`
+/// when it groups, else `Forbidden`. The resolution is discarded — any aggregate it collects is
+/// truncated away and its materialized keys dropped — so validation changes no plan, result, or cost.
+/// A negative frame offset (`22013`) is not an error here: PostgreSQL raises it only when an active
+/// window runs, so an unreferenced entry carrying one is accepted.
+pub(crate) fn validate_window_clause(
+    scope: &Scope,
+    windows: &[(String, WindowDef)],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<()> {
+    for (_, wd) in windows {
+        let mut scratch_keys: Vec<RExpr> = Vec::new();
+        match agg {
+            AggCtx::Collect {
+                group_keys,
+                group_key_exprs,
+                specs: agg_specs,
+                grouping_specs,
+            }
+            | AggCtx::GroupedWindow {
+                group_keys,
+                group_key_exprs,
+                agg_specs,
+                grouping_specs,
+                ..
+            } => {
+                let (n_aggs, n_groupings) = (agg_specs.len(), grouping_specs.len());
+                let mut sub = AggCtx::Collect {
+                    group_keys: group_keys.clone(),
+                    group_key_exprs: group_key_exprs.clone(),
+                    specs: std::mem::take(agg_specs),
+                    grouping_specs: std::mem::take(grouping_specs),
+                };
+                let r =
+                    resolve_window_def(scope, wd, &mut sub, &mut scratch_keys, params).map(|_| ());
+                if let AggCtx::Collect {
+                    mut specs,
+                    grouping_specs: mut gs,
+                    ..
+                } = sub
+                {
+                    specs.truncate(n_aggs);
+                    gs.truncate(n_groupings);
+                    *agg_specs = specs;
+                    *grouping_specs = gs;
+                }
+                accept_runtime_frame_error(r)?;
+            }
+            AggCtx::Window { .. } | AggCtx::Forbidden => {
+                let mut sub = AggCtx::Forbidden;
+                accept_runtime_frame_error(
+                    resolve_window_def(scope, wd, &mut sub, &mut scratch_keys, params).map(|_| ()),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop the one frame error PostgreSQL defers to execution (a negative offset, `22013`) from a
+/// WINDOW-clause validation result (`validate_window_clause`).
+fn accept_runtime_frame_error(r: Result<()>) -> Result<()> {
+    match r {
+        Err(e) if e.code() == "22013" => Ok(()),
+        other => other,
+    }
+}
+
 /// Map a resolved window-key expression to the slot the window stage indexes (spec/design/window.md
 /// §5.1). A bare column / aggregate (`RExpr::Column`) keeps its real row slot — the input slot for a
 /// plain query, the grouped-row slot for a grouped one — so a column-only window is byte-identical to

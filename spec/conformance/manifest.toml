@@ -718,7 +718,7 @@ description = "Frame exclusion (window.md §6): EXCLUDE CURRENT ROW / GROUP / TI
 
 [[capability]]
 id = "query.window_named"
-description = "Named windows (window.md §5, S5): the WINDOW name AS (definition) clause + OVER name reference, equivalent to inlining the definition (multiple functions may share a named window; one clause may define several). A reference to an undefined window name is 42704. The shared partition/sort optimization is a deferred follow-on. Builds on query.window"
+description = "Named windows (window.md §5, S5): the WINDOW name AS (definition) clause + OVER name reference, equivalent to inlining the definition (multiple functions may share a named window; one clause may define several). A reference to an undefined window name (including an enclosing query's, which a subquery cannot see) is 42704; a name defined twice is 42P20; every WINDOW entry is validated even when unreferenced; OVER name in WHERE/HAVING/GROUP BY/JOIN ON is 42P20; named windows also serve the query ORDER BY. Functions over one window share a single partition/sort pass. Builds on query.window"
 
 [[capability]]
 id = "query.window_grouped"

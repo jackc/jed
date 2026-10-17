@@ -69,8 +69,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Everyday scalar functions** — `concat_ws`, `format()` (PostgreSQL's `%s`/`%I`/`%L`),
   `array_to_string`, `string_to_array`, and a `gen_random_uuid` alias of `uuidv4` (through the
   entropy seam). (`to_char` is tracked under `timestamp` below.) _(size: M)_
-- [ ] **Named windows** — the `WINDOW w AS (…)` clause + `OVER w` and window sharing, slice S5 of
-  [window.md](spec/design/window.md). _(size: S)_
+- [x] **Named windows** — the `WINDOW w AS (…)` clause + `OVER w`, base-window extension, and the
+  shared partition/sort pass, slice S5 of [window.md](spec/design/window.md) §5.3: PostgreSQL's
+  whole-clause rules (a duplicate name `42P20`, every entry validated even when unreferenced,
+  `OVER name` outside the select list / `ORDER BY` `42P20`, named windows in the query `ORDER BY`),
+  NoREC `window_share`, benchmark `window_shared_named`. PostgreSQL's prefix-compatible sort sharing
+  stays open (window.md §11).
 - [ ] **Revisit `DISTINCT ON`** — recorded out of scope in [grammar.md §11](spec/design/grammar.md), but
   it is one of PostgreSQL's most-used extensions; decide whether to implement it or keep the
   non-goal. _(size: M if implemented)_

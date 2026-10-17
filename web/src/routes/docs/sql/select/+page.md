@@ -268,6 +268,32 @@ Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 
 <LiveSql demo="filtered" {seed} query={filtered} rows={6} />
 
+## Window functions and named windows
+
+A window function (`row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`,
+`lead`, `first_value`, `last_value`, `nth_value`, or any aggregate) with an `OVER` clause computes a
+value for each row from a set of related rows, without collapsing them. A `WINDOW` clause (after
+`HAVING`, before `ORDER BY`) names window definitions so several functions can share one, and a
+definition may extend an earlier one:
+
+```sql
+SELECT id, category,
+       rank() OVER w                                   AS price_rank,
+       sum(price) OVER (w ROWS UNBOUNDED PRECEDING)    AS running_total,
+       lag(price) OVER w                               AS previous_price
+FROM product
+WINDOW w AS (PARTITION BY category ORDER BY price)
+ORDER BY id;
+```
+
+The rules are PostgreSQL's. `OVER w` copies `w` whole, frame included. `OVER (w …)` and
+`WINDOW w2 AS (w …)` extend `w`: they keep its `PARTITION BY`, keep its `ORDER BY` or add one if it
+has none, and supply their own frame. Adding a `PARTITION BY`, replacing an existing `ORDER BY`, or
+extending a window that has a frame is an error (`42P20`), as is defining a name twice. A name that
+is not defined at the same query level is `42704`. Every `WINDOW` entry is checked even when no
+`OVER` uses it. Functions whose windows have the same `PARTITION BY` and `ORDER BY` share a single
+partition-and-sort pass.
+
 ## Set operations (`UNION` / `INTERSECT` / `EXCEPT`)
 
 `UNION`, `INTERSECT`, and `EXCEPT` combine two queries' rows; the bare form removes duplicates and

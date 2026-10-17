@@ -73,8 +73,10 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
    `0A000` at resolve. Capability `query.window_frame`.
 5. **S5 — named windows + sharing** *(follow-on)*. The `WINDOW w AS (…)` clause + `OVER w`
    reuse/extension, and the shared partition/sort pass (multiple windows, one sort — a
-   cost-relevant optimization, so it carries a NoREC relation + a benchmark). Capability
-   `query.window_named`.
+   cost-relevant optimization, so it carries a NoREC relation — `window_share` — and a benchmark —
+   `window_shared_named`). The whole-clause rules (a duplicate name, validation of unreferenced
+   entries, `OVER name` in a disallowed clause, named windows in the query `ORDER BY`) are §5.3.
+   Capability `query.window_named`.
 6. **S6 — explicit `RANGE`/`GROUPS` frames + value offsets.** `GROUPS BETWEEN …` (peer-group
    integer offsets, requires an `ORDER BY` → `42P20`); `RANGE BETWEEN …` with `UNBOUNDED`/`CURRENT
    ROW` bounds over any ordering (peer/edge based), and value-based `n PRECEDING`/`FOLLOWING`
@@ -431,6 +433,37 @@ missing `OVER name`. The crucial distinction: the merge rules apply only to the 
 extend** form (`OVER (b … )` / `WINDOW w AS (b … )`). A bare **`OVER b`** is a pure reference that
 copies `b` whole, so a framed `b` is fine via `OVER b` but `42P20` via `OVER (b)` — oracle-verified.
 
+**The whole-clause rules** (PostgreSQL `transformWindowDefinitions` / `transformWindowFuncCall`,
+oracle-verified in `window/named_rules.test`):
+
+- **A name defined twice** in one `WINDOW` clause is `42P20` (`window "w" is already defined`),
+  checked before that entry's base lookup.
+- **Names are identifiers scoped to one query level.** An unquoted name folds to lower case like any
+  identifier; a quoted one keeps its case. A subquery cannot see its enclosing query's `WINDOW`
+  clause, so an `OVER w` there that its own clause does not define is `42704`.
+- **Every entry is validated, referenced or not** (`validate_window_clause`). After the select list
+  resolves, each resolved entry's `PARTITION BY`/`ORDER BY` keys and frame are resolved exactly as a
+  referenced window's are — under the query's grouped context when it groups, else with aggregates
+  forbidden — and the result is discarded (any aggregate it collected is truncated away), so the check
+  changes no plan, row, or cost. An unknown column is `42703`, a window function inside a key `42P20`,
+  a non-grouping column in a grouped query `42803`, `COLLATE` on a non-text key `42804`. A negative
+  frame offset (`22013`) is the one exception: PostgreSQL checks it only when an active window runs,
+  so an unreferenced entry carrying one is accepted. An aggregate in any entry's keys makes the query
+  an aggregate query (`windows_have_aggregate`), as in PostgreSQL: `SELECT 1 FROM t WINDOW w AS (ORDER
+  BY sum(v))` returns one row, and a bare non-grouped column beside it is `42803`.
+- **`OVER name` outside the select list and query `ORDER BY`** — in `WHERE`, `HAVING`, `GROUP BY`, or
+  a `JOIN ON` — is `42P20`, the same context error an inline `OVER` gets (PostgreSQL checks the context
+  before it looks the name up). The desugar pass rewrites the select list **and the query `ORDER BY`**
+  keys, so `ORDER BY row_number() OVER w` and `ORDER BY sum(v) OVER (w ORDER BY id)` work, and an
+  ordinal or alias naming a named-window item resolves through the desugared item.
+
+**Divergence D5 — an unreferenced entry's keys are not evaluated.** PostgreSQL adds every `WINDOW`
+entry's keys to the target list as hidden columns and evaluates them for each row even when no
+function uses the window, so `SELECT id FROM t WINDOW w AS (ORDER BY 1/(v-10))` raises `22012` on a
+row with `v = 10`. jed validates such an entry but never evaluates it, so the query succeeds. Matching
+PostgreSQL would mean computing and charging cost for values nothing reads; no corpus entry exercises
+the difference.
+
 ## 6. Frames
 
 A frame restricts the rows a frame-sensitive function (the aggregates, `first/last/nth_value`)
@@ -606,6 +639,9 @@ Deliberate divergences from PostgreSQL, each registered in
   defers the timestamp/date families (only integer/decimal ordering keys take a value offset this
   slice), so they are `0A000` — a deferred follow-on, not a permanent refusal like D3. (A `date`
   key with an *integer* offset is `0A000` in PG too, so only the interval-offset shapes diverge.)
+- **D5 — an unreferenced `WINDOW` entry's keys are validated but not evaluated** (§5.3). PostgreSQL
+  evaluates them per row, so a run-time error in one (`ORDER BY 1/(v-10)`) fails the query there and
+  not in jed. No corpus entry exhibits it, so it has no override entry.
 
 ## 11. Deferred / out of scope
 
@@ -625,8 +661,14 @@ Deliberate divergences from PostgreSQL, each registered in
   D3, now landed). Non-literal/expression frame offsets are also out (literals only, like the `ROWS`
   narrowing).
 - **Wider sharing / sliding** — *cost-lowering only, never correctness; the landed core is §5.2/§8.*
-  The shared partition/sort pass groups specs with an **identical** partition+order; PostgreSQL's
-  prefix-**compatible** sharing (a shorter `ORDER BY` reusing a longer one's sort) is not yet done.
+  The shared partition/sort pass groups specs with an **identical** partition+order. PostgreSQL's
+  prefix-**compatible** sharing (a shorter `ORDER BY` reusing a longer one's sort) is not done, and is
+  not a straight port: jed pins the order of rows that tie on a window's `ORDER BY` to primary-key
+  order (D1), and a longer sort orders those ties by its extra keys instead. Reusing it is sound only
+  for functions that ignore the order within peer groups (`rank`, `dense_rank`, `percent_rank`,
+  `cume_dist`, and a fold whose result does not depend on input order), so it needs a per-function
+  check. Partitioning once for specs with the same `PARTITION BY` but different `ORDER BY` is sound
+  but would change the deterministic query-memory charge for the partition tables.
   The frame slide carries the accumulator for an expanding frame (every aggregate) and a moving
   `count`/`count(*)` (the invertible un-fold); a **moving `sum`/`avg`/`min`/`max`/float still re-folds
   from scratch** — a safely-invertible decimal/float sum (guarding the result scale, the

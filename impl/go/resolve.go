@@ -2111,6 +2111,15 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if e.FuncCall.WithinGroup != nil {
 			return nil, resolvedType{}, noAggOverload(e.FuncCall.Name)
 		}
+		// An `OVER name` the desugar pass did not reach (window.md §5.3) sits where a window function
+		// cannot run (WHERE, HAVING, GROUP BY, a JOIN ON, …) — 42P20, PostgreSQL's context check, which
+		// precedes its name lookup; in a window context it names no WINDOW-clause entry — 42704.
+		if e.FuncCall.OverName != "" {
+			if ag.windowing {
+				return nil, resolvedType{}, newError(UndefinedObject, fmt.Sprintf("window %q does not exist", e.FuncCall.OverName))
+			}
+			return nil, resolvedType{}, newError(WindowingError, "window functions are not allowed here")
+		}
 		// A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
 		if e.FuncCall.Over != nil {
 			if e.FuncCall.Name == "grouping" {

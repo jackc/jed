@@ -204,6 +204,10 @@
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
 #              tables (one bounded, one not), both reach the SAME by-construction end state (the bound
 #              is transparent under mutation).
+#   window_share — the shared window partition/sort pass (window.md §5.2): functions over one named
+#              window, the same definition inline, the definition reached through a base-extending
+#              named window, each function alone, and the shared functions interleaved with another
+#              window must all return the by-construction rows.
 #   window   — the window frame sliding-window optimization (window.md §5.2): an explicit expanding
 #              `ROWS UNBOUNDED PRECEDING..CURRENT ROW` aggregate (the sliding path) must equal the
 #              DEFAULT-frame aggregate (the separate running-pass path) — distinct ids ⇒ no peers ⇒
@@ -420,6 +424,10 @@ CTE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row qu
              expr.between expr.comparison_value types.i32].freeze
 WINDOW_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                 query.order_by query.window query.window_aggregate query.window_frame types.i32].freeze
+WINDOW_SHARE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                      query.order_by query.window query.window_ranking query.window_offset
+                      query.window_aggregate query.window_named query.window_base_extend
+                      types.i32].freeze
 GIN_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan dml.insert
              dml.insert_multi_row query.select query.order_by types.i32 types.array
              func.array_containment].freeze
@@ -3471,6 +3479,65 @@ def gen_window_frame(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: window sharing (several functions over one window, one partition/sort pass) ------
+# Window functions whose definitions share an identical PARTITION BY + ORDER BY are partitioned and
+# sorted ONCE (window.md §5.2, `group_window_specs`), each then writing its own result column. The
+# sharing is a pure wall-clock optimization, so every spelling must agree with the rows known by
+# construction: the functions over one named window (`OVER w` — one shared group), the same
+# definition repeated inline, the definition reached by extending a named base (`OVER (wp ORDER BY
+# v)`), each function computed ALONE (an unshared single-spec group), and the shared functions
+# interleaved with a different window (so a grouping slip would write a result into the wrong
+# column). Ties on `v` exercise peer handling; `lag` follows the pinned PK tie-break (window.md D1).
+def gen_window_share(seed)
+  rng = Random.new(seed)
+  n = rng.rand(9..14)
+  rows = (1..n).map { |id| [id, rng.rand(1..3), rng.rand(0..4)] } # [id, g, v]
+
+  out = header(seed, WINDOW_SHARE_REQ, "window sharing (functions over one window vs each alone)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, g i32, v i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, g, v| "(#{id}, #{g}, #{v})" }.join(', ')}")
+
+  # By construction over PARTITION BY g ORDER BY v (ties sequenced by id, the PK tie-break).
+  res = {}
+  rows.group_by { |r| r[1] }.each_value do |part|
+    sorted = part.sort_by { |id, _g, v| [v, id] }
+    sorted.each_with_index do |(id, _g, v), pos|
+      smaller = sorted.count { |r| r[2] < v }
+      peers_through = sorted.select { |r| r[2] <= v }
+      res[id] = {
+        rk: smaller + 1,
+        dr: sorted.map { |r| r[2] }.uniq.count { |x| x < v } + 1,
+        s: peers_through.sum { |r| r[2] },
+        c: peers_through.size,
+        lag: pos.zero? ? "NULL" : sorted[pos - 1][2].to_s,
+      }
+    end
+  end
+  ids = rows.map(&:first)
+  rn_desc = ids.sort.reverse.each_with_index.to_h { |id, i| [id, i + 1] }
+  cols = ->(*keys) { ids.flat_map { |id| [id.to_s] + keys.map { |k| k == :rnd ? rn_desc[id].to_s : res[id][k].to_s } } }
+  w = "PARTITION BY g ORDER BY v"
+
+  out << "# five functions over ONE named window — one shared partition/sort group"
+  q(out, "IIIIII", "SELECT id, rank() OVER w, dense_rank() OVER w, sum(v) OVER w, count(*) OVER w, lag(v) OVER w FROM t WINDOW w AS (#{w}) ORDER BY id",
+    cols.call(:rk, :dr, :s, :c, :lag))
+  out << "# the same definition repeated inline — MUST match"
+  q(out, "IIIIII", "SELECT id, rank() OVER (#{w}), dense_rank() OVER (#{w}), sum(v) OVER (#{w}), count(*) OVER (#{w}), lag(v) OVER (#{w}) FROM t ORDER BY id",
+    cols.call(:rk, :dr, :s, :c, :lag))
+  out << "# reached by extending a named base (OVER (wp ORDER BY v)) and by a chained entry — MUST match"
+  q(out, "IIIIII", "SELECT id, rank() OVER (wp ORDER BY v), dense_rank() OVER w2, sum(v) OVER (wp ORDER BY v), count(*) OVER w2, lag(v) OVER (wp ORDER BY v) FROM t WINDOW wp AS (PARTITION BY g), w2 AS (wp ORDER BY v) ORDER BY id",
+    cols.call(:rk, :dr, :s, :c, :lag))
+  out << "# each function ALONE (an unshared single-spec group) — MUST match its column"
+  %i[rk dr s c lag].zip(["rank()", "dense_rank()", "sum(v)", "count(*)", "lag(v)"]).each do |k, f|
+    q(out, "II", "SELECT id, #{f} OVER w FROM t WINDOW w AS (#{w}) ORDER BY id", cols.call(k))
+  end
+  out << "# shared functions interleaved with a different window — each result lands in its own column"
+  q(out, "IIIII", "SELECT id, rank() OVER w, row_number() OVER (ORDER BY id DESC), sum(v) OVER w, lag(v) OVER w FROM t WINDOW w AS (#{w}) ORDER BY id",
+    cols.call(:rk, :rnd, :s, :lag))
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: predicate algebra (commutativity / De Morgan / double-negation / IN / BETWEEN) ----
 # Algebraic-equivalence oracle (like TLP, NOT an optimization pair): one predicate written several
 # logically-equivalent ways must return identical rows under 3VL. Commutativity and De Morgan are
@@ -4667,6 +4734,7 @@ SCENARIOS = {
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
   "window" => method(:gen_window_frame),
+  "window_share" => method(:gen_window_share),
   "predicate" => method(:gen_predicate),
   "setop_logic" => method(:gen_setop_logic),
   "join_comm" => method(:gen_join_comm),
