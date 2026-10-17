@@ -152,3 +152,7 @@ export function pageServiceAttachmentRoleForTesting(
   const svc = internal.core.attachments.get(name)?.svc ?? null;
   return svc === null ? "none" : pageServiceRoleForTesting(svc.db);
 }
+
+// backupForTesting backs up a handle's main database to a new file, page-identical or compacted
+// (spec/design/page-service.md §9). The host API's name and shape are not yet decided; test-only.
+export { backupForTesting } from "./backup.ts";

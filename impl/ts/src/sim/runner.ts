@@ -14,7 +14,8 @@ import type { Engine } from "../executor.ts";
 // The Node file host registers the file compactor, the attach opener, and the directory barrier the
 // engine reaches through Engine.fileHost (here the simulated filesystem).
 import { close as closeEngine, createVia, openServiceWith } from "../file.ts";
-import { loadEnginePaged, trailingRun } from "../format.ts";
+import { backupForTesting } from "../backup.ts";
+import { loadEngine, loadEnginePaged, trailingRun } from "../format.ts";
 import { growthStep, Pager } from "../pager.ts";
 import type { PageClient } from "../pageservice/client.ts";
 import { readFreeListChain } from "../pageservice/delta.ts";
@@ -137,6 +138,16 @@ export function parseTrace(text: string): SimTrace {
         break;
       case "corrupt":
         parseParams(st, f.slice(1), n + 1);
+        break;
+      case "backup":
+        if (
+          (f.length !== 2 && f.length !== 3) ||
+          (f[1] !== "page_identical" && f[1] !== "compacted")
+        ) {
+          throw new Error(`line ${n + 1}: backup page_identical|compacted [p<N>]`);
+        }
+        st.mode = f[1]!;
+        st.pid = f.length === 3 ? parsePid(f[2]!, n + 1) : -1; // no p<N>: the lowest running process
         break;
       case "check":
       case "reopen":
@@ -538,6 +549,7 @@ export class SimRunner {
   private digestErr: unknown = null; // why the most recent digest failed
   diagnostics = new Map<string, string>(); // artifact name → contents, written on a violation
   imagePrefix = ""; // when set, each recovery's image is written to <prefix>.step<N>[.<db>].img
+  private backups = 0; // backup steps run, naming each destination
 
   constructor(tr: SimTrace) {
     this.tr = tr;
@@ -906,6 +918,10 @@ export class SimRunner {
         this.emit(`{"i":${i},"op":"open","sid":${goQuote(st.sid)},"skip":true}`);
         return true;
       }
+      if (st.kind === "backup") {
+        this.emit(`{"i":${i},"op":"backup","pid":${st.pid},"skip":true}`);
+        return true;
+      }
       if (this.procs.size === 0) {
         this.fail(i, "no process is running");
         return false;
@@ -938,6 +954,9 @@ export class SimRunner {
         break;
       case "compact":
         this.stepCompact(i, st.sid);
+        break;
+      case "backup":
+        this.stepBackup(i, st);
         break;
       case "attach":
         this.stepAttach(i, st.sid);
@@ -1713,6 +1732,88 @@ export class SimRunner {
     this.observeGrowth(d);
   }
 
+  // stepBackup is `backup page_identical|compacted [p<N>]` (spec/design/page-service.md §9): the
+  // process backs main up into a new file through the simulated filesystem, while every other session
+  // keeps its pins and its writer gate. A backup that fails leaves no destination. One that succeeds is
+  // checked at once, as a new process would open it: its version is the pinned snapshot's
+  // (page-identical) or the one after it (compacted), the snapshot is the newest committed
+  // generation, its contents are that generation's, and the integrity checker accepts the image. Its
+  // image hash makes the cores' backups byte-identical (§8.4).
+  private stepBackup(i: number, st: SimStep): void {
+    const d = this.main();
+    this.backups++;
+    const dest = `${d.file}.backup${this.backups}`;
+    try {
+      backupForTesting(this.database, dest, st.mode === "page_identical");
+    } catch (e) {
+      if (e instanceof SimDeadlock) throw e;
+      const code = errCode(e);
+      if (code.startsWith("non-engine")) {
+        this.fail(i, code);
+        return;
+      }
+      this.emit(`{"i":${i},"op":"backup","form":${goQuote(st.mode)},"error":${goQuote(code)}}`);
+      if (code === "XX001") this.fail(i, "corruption: backup reported XX001: " + errText(e));
+      else if (this.fs.files.has(dest)) this.fail(i, "a failed backup left its destination");
+      return;
+    }
+    const f = this.fs.files.get(dest);
+    if (f === undefined) {
+      this.fail(i, "a successful backup left no destination");
+      return;
+    }
+    const image = f.cache.slice();
+    if (this.imagePrefix !== "") {
+      writeFileSync(`${this.imagePrefix}.step${i}.backup.img`, image);
+    }
+    let copy: Database;
+    try {
+      copy = Database.fromEngine(loadEngine(image.slice(), this.environment), null);
+    } catch (e) {
+      this.fail(i, "the backup does not open: " + errText(e));
+      return;
+    }
+    let v: bigint;
+    let dg: string | null;
+    try {
+      v = versionOf(copy);
+      const rs = copy.readSession();
+      try {
+        dg = this.digest(rs, d);
+      } finally {
+        rs.close();
+      }
+    } finally {
+      copy.close();
+    }
+    const snapshot = st.mode === "compacted" ? v - 1n : v;
+    if (dg === null) {
+      this.fail(i, "the backup cannot be read: " + errText(this.digestErr));
+      return;
+    }
+    if (snapshot < d.version) {
+      this.fail(i, `the backup copied version ${snapshot}, older than the committed ${d.version}`);
+      return;
+    }
+    if (!d.inHistory(snapshot, dg)) {
+      this.fail(i, `the backup holds contents (digest ${dg}) version ${snapshot} never had`);
+      return;
+    }
+    let counts: [number, number, number];
+    try {
+      counts = checkImage(image, v);
+    } catch (e) {
+      this.fail(i, "backup integrity: " + errText(e));
+      return;
+    }
+    const [live, pages, free] = counts;
+    this.emit(
+      `{"i":${i},"op":"backup","form":${goQuote(st.mode)},"version":${v},"digest":${goQuote(dg)},` +
+        `"live":${live},"pages":${pages},"free":${free},` +
+        `"image":"${imageHash(image, pages, this.pageSize)}"}`,
+    );
+  }
+
   // stepAttach attaches file database name to the running process (S4), first creating its file
   // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
   // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
@@ -2222,6 +2323,9 @@ export class SimRunner {
       case "exit":
       case "kill":
         return st.pid;
+      case "backup":
+        if (st.pid >= 0) return st.pid;
+        break;
       case "on":
       case "commit":
       case "rollback":
