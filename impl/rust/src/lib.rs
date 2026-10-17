@@ -1109,6 +1109,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_agg",
     // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
     "func.json_object_agg",
+    // corr(Y, X) — the correlation coefficient (aggregates.md §23).
+    "func.corr",
     // covar_samp(Y, X) — the sample covariance (aggregates.md §23).
     "func.covar_samp",
     // covar_pop(Y, X) — the population covariance; exact over integer/decimal (aggregates.md §23).
