@@ -28,6 +28,11 @@ import {
 import { Delta, type DeltaBase, DeltaFailure, legal } from "../src/pageservice/delta.ts";
 import { endpointPath } from "../src/pageservice/endpoint.ts";
 import {
+  ACK_CRASH,
+  ACK_HANG_UP,
+  ACK_NORMAL,
+  OWNER_SERVING,
+  OWNER_YIELDING,
   PS_RESOLUTION_WINDOW_COMMITS,
   ServiceState,
   WINDOW_ARENA,
@@ -342,4 +347,24 @@ test("pageservice state: the resolution window answers commit_status", () => {
   assert.equal(kept.length, PS_RESOLUTION_WINDOW_COMMITS);
   assert.equal(kept[0], 13n);
   s.unlock();
+});
+
+test("pageservice state: the handoff state and the ack hooks are shared and consumed once", () => {
+  const s = new ServiceState();
+  const other = new ServiceState(s.buffer);
+  assert.equal(other.ownerState(), OWNER_SERVING);
+  s.lock();
+  s.setOwnerStateLocked(OWNER_YIELDING);
+  s.setRequesterLocked(42n);
+  s.unlock();
+  other.lock();
+  assert.equal(other.ownerState(), OWNER_YIELDING);
+  assert.equal(other.requesterLocked(), 42n);
+  other.unlock();
+  assert.equal(other.takeAckHook(), ACK_NORMAL);
+  s.armAckHook(ACK_HANG_UP);
+  assert.equal(other.takeAckHook(), ACK_HANG_UP);
+  assert.equal(other.takeAckHook(), ACK_NORMAL);
+  s.armAckHook(ACK_CRASH);
+  assert.equal(other.takeAckHook(), ACK_CRASH);
 });

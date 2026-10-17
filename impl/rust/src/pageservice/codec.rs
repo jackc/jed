@@ -73,6 +73,8 @@ pub const HELLO_FLAG_READ_ONLY: u8 = 0x01;
 pub const HELLO_OK_FLAG_CONNECTION_READ_ONLY: u8 = 0x01;
 /// `hello_ok.flags` bit 1: the owner's own handle is read-only.
 pub const HELLO_OK_FLAG_OWNER_READ_ONLY: u8 = 0x02;
+/// `hello_ok.flags` bit 2: the owner's ownership preference is `yield` (README.md §6.5).
+pub const HELLO_OK_FLAG_OWNER_YIELDS: u8 = 0x04;
 /// `error.flags` bit 0: fatal — the owner closes the connection after this frame.
 pub const ERROR_FLAG_FATAL: u8 = 0x01;
 /// The owner record's `flags` bit 0: the owner serves.

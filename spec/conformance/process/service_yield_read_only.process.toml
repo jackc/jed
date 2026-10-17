@@ -1,0 +1,79 @@
+schema_version = 1
+name = "service-read-only-owner-yields-to-writer"
+description = "Page service phase 4: an owner whose handle is read-only hands ownership to the first client that writes; the write is delayed, not refused, and the former owner continues as a read-only client."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open-service-read-only"
+
+[[step]]
+actor = "a"
+command = "role"
+expect = "owner"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (2)"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "owner"
+
+[[step]]
+actor = "a"
+command = "role"
+expect = "client"
+retry_ms = 5000
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (3)"
+expect_error = "25006"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"

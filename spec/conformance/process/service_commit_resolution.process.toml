@@ -1,6 +1,6 @@
 schema_version = 1
 name = "service-commit-resolution"
-description = "Page service phase 3: when the owner drops the connection after a client commit is durable but before acknowledging it (a test hook), the client resolves the outcome with commit_status on a new connection: the commit succeeded, and only later requests on the lost connection fail 08006."
+description = "Page service: when the owner drops the connection after a client commit is durable but before acknowledging it (a test hook), the client re-elects, reconnects to the same owner, and resolves the outcome with commit_status: the commit succeeded, and the client carries on over the new connection."
 requires = ["file.page_service"]
 
 [[step]]
@@ -36,7 +36,12 @@ sql = "INSERT INTO t VALUES (2)"
 actor = "b"
 command = "query_i64"
 sql = "SELECT count(*) FROM t"
-expect_error = "08006"
+expect = "2"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
 
 [[step]]
 actor = "a"

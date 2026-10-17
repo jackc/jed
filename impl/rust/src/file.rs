@@ -35,6 +35,28 @@ pub const DEFAULT_FILE_LOCK_TIMEOUT_MS: u64 = 5_000;
 /// A page-service owner's default idle-in-transaction timeout (spec/design/page-service.md §11.1).
 pub const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS: u64 = 60_000;
 
+/// A page-service owner's default yield grace: how long a yielding owner lets running transactions
+/// finish (spec/pageservice/README.md §6.5).
+pub const DEFAULT_YIELD_GRACE_MS: u64 = 5_000;
+
+/// A page-service owner's default shutdown grace: how long a closing owner lets its clients'
+/// transactions finish (spec/pageservice/README.md §6.5).
+pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;
+
+/// An opener's ownership preference under the page service (spec/design/page-service.md §8.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ownership {
+    /// Become owner when the database is free, and ask a yielding owner to yield. The default, for
+    /// applications.
+    #[default]
+    Prefer,
+    /// Become owner when the database is free, and hand ownership to a `Prefer` requester. For
+    /// tools: the CLI, an SSH helper, a backup.
+    Yield,
+    /// Never own: an open with no owner fails `55006`, and a client never promotes.
+    Never,
+}
+
 /// Settings for a newly-created database file (spec/design/api.md §2). `page_size` is fixed
 /// into the file's meta at creation and cannot change thereafter.
 #[derive(Clone, Copy, Debug)]
@@ -91,6 +113,18 @@ pub struct CreateOptions {
     /// [`Locking::Service`] reads it. Default
     /// [`DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS`] (60 s).
     pub idle_in_transaction_timeout_ms: u64,
+    /// The page-service handoff options (spec/pageservice/README.md §6.5): an owner's yield and
+    /// shutdown graces (`None`: [`DEFAULT_YIELD_GRACE_MS`], [`DEFAULT_SHUTDOWN_GRACE_MS`]), its
+    /// idle-session timeout (`None` or `Some(0)`: never), and its connection limit (`0`: unlimited;
+    /// `53300` beyond it). Only [`Locking::Service`] reads them, as an owner's limits; a client keeps
+    /// them for the day it becomes owner.
+    pub yield_grace_ms: Option<u64>,
+    pub shutdown_grace_ms: Option<u64>,
+    pub idle_session_timeout_ms: Option<u64>,
+    pub max_connections: usize,
+    /// The ownership preference under the page service (spec/design/page-service.md §8.2). Only
+    /// [`Locking::Service`] reads it.
+    pub ownership: Ownership,
 }
 
 impl Default for CreateOptions {
@@ -104,6 +138,11 @@ impl Default for CreateOptions {
             environment: Environment::default(),
             max_storage_bytes: 0,
             idle_in_transaction_timeout_ms: DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+            yield_grace_ms: None,
+            shutdown_grace_ms: None,
+            idle_session_timeout_ms: None,
+            max_connections: 0,
+            ownership: Ownership::Prefer,
         }
     }
 }
@@ -160,6 +199,18 @@ pub struct OpenOptions {
     /// [`Locking::Service`] reads it. Default
     /// [`DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS`] (60 s).
     pub idle_in_transaction_timeout_ms: u64,
+    /// The page-service handoff options (spec/pageservice/README.md §6.5): an owner's yield and
+    /// shutdown graces (`None`: [`DEFAULT_YIELD_GRACE_MS`], [`DEFAULT_SHUTDOWN_GRACE_MS`]), its
+    /// idle-session timeout (`None` or `Some(0)`: never), and its connection limit (`0`: unlimited;
+    /// `53300` beyond it). Only [`Locking::Service`] reads them, as an owner's limits; a client keeps
+    /// them for the day it becomes owner.
+    pub yield_grace_ms: Option<u64>,
+    pub shutdown_grace_ms: Option<u64>,
+    pub idle_session_timeout_ms: Option<u64>,
+    pub max_connections: usize,
+    /// The ownership preference under the page service (spec/design/page-service.md §8.2). Only
+    /// [`Locking::Service`] reads it.
+    pub ownership: Ownership,
 }
 
 impl Default for OpenOptions {
@@ -174,6 +225,11 @@ impl Default for OpenOptions {
             environment: Environment::default(),
             max_storage_bytes: 0,
             idle_in_transaction_timeout_ms: DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+            yield_grace_ms: None,
+            shutdown_grace_ms: None,
+            idle_session_timeout_ms: None,
+            max_connections: 0,
+            ownership: Ownership::Prefer,
         }
     }
 }

@@ -201,6 +201,32 @@ impl BlockStore for ClosedBlockStore {
     }
 }
 
+/// The byte store of revoked storage: a page-service owner that released ownership no longer touches
+/// the file (spec/pageservice/README.md §6.5), so every operation fails with the revocation's error.
+pub(crate) struct RevokedBlockStore(pub(crate) EngineError);
+
+impl BlockStore for RevokedBlockStore {
+    fn read_at(&mut self, _offset: u64, _len: usize) -> Result<Vec<u8>> {
+        Err(self.0.clone())
+    }
+
+    fn write_at(&mut self, _offset: u64, _bytes: &[u8]) -> Result<()> {
+        Err(self.0.clone())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        Err(self.0.clone())
+    }
+
+    fn size(&mut self) -> Result<u64> {
+        Err(self.0.clone())
+    }
+
+    fn set_size(&mut self, _bytes: u64) -> Result<()> {
+        Err(self.0.clone())
+    }
+}
+
 /// The pure in-memory storage host (bplus-reshape.md B3): a growable byte vector with the same
 /// positioned-read/write and zero-fill growth semantics as a file host, but with no durability work
 /// to do. It is the block-device building block for both in-memory databases (B3) and, since the

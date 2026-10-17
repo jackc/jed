@@ -12,6 +12,10 @@
 //! The connection is multiplexed (README.md §2): one reader thread reads every reply and hands it to
 //! the request it answers, so a `begin_write` waiting for the owner's gate never stalls this
 //! process's page reads.
+//!
+//! A [`PsConnection`] is one connection. When it ends, the handle re-elects (`shared/handoff.rs`,
+//! README.md §6.5) and installs a new role with a new connection; this one stays broken (`08006`)
+//! for the transactions begun on it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -20,32 +24,25 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::blockstore::BlockStore;
-use crate::coordinator::LockHost;
 use crate::error::{EngineError, Result, SqlState};
 use crate::pageservice::codec::{
-    BeginRead, BeginWrite, COMMIT_STATUS_COMMITTED, COMMIT_STATUS_NOT_COMMITTED, CommitBegin,
-    CommitPages, CommitStatus, ERROR_FLAG_FATAL, EndRead, HELLO_FLAG_READ_ONLY,
-    HELLO_OK_FLAG_CONNECTION_READ_ONLY, Hello, Id16, IndexedPage, MAX_FRAME_LENGTH, Message,
-    PROTOCOL_VERSION, ReadBegun, ReadPages, WriteBegun, encode_frame, read_frame,
+    BeginRead, BeginWrite, CommitBegin, CommitPages, CommitStatus, ERROR_FLAG_FATAL, EndRead,
+    HELLO_FLAG_READ_ONLY, HELLO_OK_FLAG_CONNECTION_READ_ONLY, HELLO_OK_FLAG_OWNER_READ_ONLY,
+    HELLO_OK_FLAG_OWNER_YIELDS, Hello, Id16, IndexedPage, MAX_FRAME_LENGTH, Message,
+    NOTICE_YIELD_BEGUN, NOTICE_YIELD_CANCELLED, PROTOCOL_VERSION, ReadBegun, ReadPages, WriteBegun,
+    encode_frame, read_frame,
 };
-use crate::pageservice::endpoint;
 
-/// The process-local open-path claim a client keeps while connected (the duplicate-open guard,
-/// locking.md §3.1); released when the client closes.
-pub(crate) struct PathClaim {
-    pub(crate) host: Arc<dyn LockHost>,
-    pub(crate) path: PathBuf,
-}
+/// How long a client that saw another connection's yield notice skips its presence tries after
+/// its connection ends, so the requester takes ownership (README.md §6.5).
+pub(crate) const HANDOFF_PAUSE: Duration = Duration::from_millis(2000);
 
-impl Drop for PathClaim {
-    fn drop(&mut self) {
-        self.host.release_path(&self.path);
-    }
-}
+/// The re-election trigger a handle installs on its connection ([`PsConnection::set_on_break`]).
+pub(crate) type OnBreak = Arc<dyn Fn() + Send + Sync>;
 
 /// The send half of a connection, behind [`PsConnection::outbox`]: the send lock.
 struct Outbox {
@@ -59,8 +56,12 @@ type Reply = Result<Message>;
 /// The requests waiting for replies, behind [`PsConnection::waiters`].
 struct Waiters {
     pending: HashMap<u32, mpsc::Sender<Reply>>,
-    /// The sticky failure after the connection is lost (`08006`) or poisoned by a fatal error.
+    /// The sticky failure after the connection is lost (`08006`) or poisoned by a fatal error, and
+    /// when it was set (the handoff pause counts from it).
     broken: Option<EngineError>,
+    broken_at: Option<Instant>,
+    /// Called once when the connection breaks, to start the handle's re-election.
+    on_break: Option<OnBreak>,
 }
 
 /// The cache this process holds (README.md §3.2): the owner incarnation it came from and the
@@ -78,14 +79,26 @@ pub(crate) struct PsConnection {
     db_path: PathBuf,
     outbox: Mutex<Outbox>,
     waiters: Mutex<Waiters>,
+    /// Signalled (with `waiters`) when the connection breaks.
+    broke: Condvar,
     /// A second handle on the socket, so [`close`](Self::close) can shut it down while the reader
     /// thread is blocked on it.
     control: UnixStream,
     page_size: AtomicU32,
     /// `hello_ok` said the connection is read-only.
     read_only: AtomicBool,
-    /// The open timeout, which also bounds resolving a commit whose acknowledgement was lost.
-    timeout_ms: u64,
+    /// The owner's `hello_ok` flags (README.md §3.1, §6.5): its own handle is read-only; its
+    /// ownership preference is `yield`.
+    owner_read_only: AtomicBool,
+    owner_yields: AtomicBool,
+    /// This connection's id (`hello_ok`), which a yield notice names.
+    connection_id: AtomicU64,
+    /// Set by a yield-begun notice naming another connection and cleared by a yield-cancelled one
+    /// (README.md §6.5).
+    handoff_paused: AtomicBool,
+    /// A commit whose connection was lost after `commit_end` was sent: `(txid, digest)`, for the
+    /// handle's re-election to resolve (README.md §6.4–§6.5).
+    lost_commit: Mutex<Option<(u64, u64)>>,
     /// The newest version a local reader pins (0 when none). With `write_txid`, what `read_pages`
     /// names; both change under the send lock before any message releasing a version is sent.
     held_max: AtomicU64,
@@ -100,7 +113,6 @@ pub(crate) struct PsConnection {
     /// The adopted version's meta page, served for page indices 0 and 1.
     meta: Mutex<Vec<u8>>,
     pub(crate) cache: Mutex<CacheId>,
-    claim: Mutex<Option<PathClaim>>,
 }
 
 fn connection_lost(detail: &str) -> EngineError {
@@ -131,13 +143,14 @@ pub(crate) enum Connect {
     Connected(Arc<PsConnection>),
     /// A failed connect or a dropped connection: the opener retries.
     Retry,
-    /// The owner refused the client (`0A000`, protocol or format mismatch): the open fails.
+    /// The owner refused the client (`0A000`, protocol or format mismatch; `53300`, its connection
+    /// limit): the election decides.
     Refused(EngineError),
 }
 
 /// Dial the owner's endpoint, start the reader thread, and run `hello`, asking for a read-only
-/// connection when `read_only`. `timeout_ms` is the open timeout.
-pub(crate) fn connect(db_path: &Path, endpoint: &str, read_only: bool, timeout_ms: u64) -> Connect {
+/// connection when `read_only`.
+pub(crate) fn connect(db_path: &Path, endpoint: &str, read_only: bool) -> Connect {
     let Ok(stream) = UnixStream::connect(endpoint) else {
         return Connect::Retry;
     };
@@ -150,11 +163,18 @@ pub(crate) fn connect(db_path: &Path, endpoint: &str, read_only: bool, timeout_m
         waiters: Mutex::new(Waiters {
             pending: HashMap::new(),
             broken: None,
+            broken_at: None,
+            on_break: None,
         }),
+        broke: Condvar::new(),
         control,
         page_size: AtomicU32::new(0),
         read_only: AtomicBool::new(false),
-        timeout_ms,
+        owner_read_only: AtomicBool::new(false),
+        owner_yields: AtomicBool::new(false),
+        connection_id: AtomicU64::new(0),
+        handoff_paused: AtomicBool::new(false),
+        lost_commit: Mutex::new(None),
         held_max: AtomicU64::new(0),
         write_txid: AtomicU64::new(0),
         gate_held: AtomicBool::new(false),
@@ -165,7 +185,6 @@ pub(crate) fn connect(db_path: &Path, endpoint: &str, read_only: bool, timeout_m
             incarnation: [0; 16],
             adopted: 0,
         }),
-        claim: Mutex::new(None),
     });
     let reading = Arc::clone(&conn);
     std::thread::spawn(move || reading.read_loop(reader));
@@ -183,6 +202,16 @@ pub(crate) fn connect(db_path: &Path, endpoint: &str, read_only: bool, timeout_m
                 ok.flags & HELLO_OK_FLAG_CONNECTION_READ_ONLY != 0,
                 Ordering::Release,
             );
+            conn.owner_read_only.store(
+                ok.flags & HELLO_OK_FLAG_OWNER_READ_ONLY != 0,
+                Ordering::Release,
+            );
+            conn.owner_yields.store(
+                ok.flags & HELLO_OK_FLAG_OWNER_YIELDS != 0,
+                Ordering::Release,
+            );
+            conn.connection_id
+                .store(ok.connection_id, Ordering::Release);
             Connect::Connected(conn)
         }
         Ok(_) => {
@@ -210,9 +239,97 @@ impl PsConnection {
         self.read_only.load(Ordering::Acquire)
     }
 
-    /// Hold `claim` until the client closes.
-    pub(crate) fn keep_claim(&self, claim: PathClaim) {
-        *self.claim.lock().expect("claim lock poisoned") = Some(claim);
+    /// Whether the owner's own handle is read-only (`hello_ok` bit 1).
+    pub(crate) fn owner_read_only(&self) -> bool {
+        self.owner_read_only.load(Ordering::Acquire)
+    }
+
+    /// Whether the owner's ownership preference is `yield` (`hello_ok` bit 2).
+    pub(crate) fn owner_yields(&self) -> bool {
+        self.owner_yields.load(Ordering::Acquire)
+    }
+
+    /// Whether the connection ended (or was closed).
+    pub(crate) fn is_broken(&self) -> bool {
+        self.waiters
+            .lock()
+            .expect("page-service waiters lock poisoned")
+            .broken
+            .is_some()
+    }
+
+    /// Install the re-election trigger, called once when the connection breaks. `false` when it
+    /// is broken already: the caller starts the re-election itself.
+    pub(crate) fn set_on_break(&self, on_break: OnBreak) -> bool {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("page-service waiters lock poisoned");
+        if waiters.broken.is_some() {
+            return false;
+        }
+        waiters.on_break = Some(on_break);
+        true
+    }
+
+    /// Wait until the connection breaks, at most until `deadline` (`None`: no deadline). `true`
+    /// when it broke.
+    pub(crate) fn wait_broken(&self, deadline: Option<Instant>) -> bool {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("page-service waiters lock poisoned");
+        loop {
+            if waiters.broken.is_some() {
+                return true;
+            }
+            match deadline {
+                None => {
+                    waiters = self
+                        .broke
+                        .wait(waiters)
+                        .expect("page-service waiters lock poisoned");
+                }
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return false;
+                    }
+                    waiters = self
+                        .broke
+                        .wait_timeout(waiters, deadline - now)
+                        .expect("page-service waiters lock poisoned")
+                        .0;
+                }
+            }
+        }
+    }
+
+    /// When this client's handoff pause ends: `HANDOFF_PAUSE` after the connection ended, when a
+    /// yield notice named another connection (README.md §6.5); `None` when not paused.
+    pub(crate) fn handoff_pause_until(&self) -> Option<Instant> {
+        if !self.handoff_paused.load(Ordering::Acquire) {
+            return None;
+        }
+        let waiters = self
+            .waiters
+            .lock()
+            .expect("page-service waiters lock poisoned");
+        Some(waiters.broken_at.unwrap_or_else(Instant::now) + HANDOFF_PAUSE)
+    }
+
+    /// Act on an owner notice (README.md §3.7, §6.5): another connection's yield pauses this
+    /// client's presence tries after the connection ends; a cancelled yield lifts the pause. Every
+    /// other notice is ignored.
+    fn notice(&self, kind: u8, connection_id: u64) {
+        match kind {
+            NOTICE_YIELD_BEGUN => self.handoff_paused.store(
+                connection_id != self.connection_id.load(Ordering::Acquire),
+                Ordering::Release,
+            ),
+            NOTICE_YIELD_CANCELLED => self.handoff_paused.store(false, Ordering::Release),
+            _ => {}
+        }
     }
 
     /// Read every reply frame and hand it to the request it answers. On a lost connection or a
@@ -231,6 +348,12 @@ impl PsConnection {
                         return;
                     }
                 };
+            if let Message::Notice(notice) = &message
+                && id == 0
+            {
+                self.notice(notice.kind, notice.connection_id);
+                continue;
+            }
             if let Message::HelloOk(ok) = &message
                 && crate::format::page_size_valid(ok.page_size as usize)
             {
@@ -257,25 +380,33 @@ impl PsConnection {
         }
     }
 
-    /// Make `error` the connection's sticky failure, shut the socket down, and fail every waiting
-    /// request with it.
+    /// Make `error` the connection's sticky failure, shut the socket down, fail every waiting
+    /// request with it, and (the first time) start the handle's re-election.
     fn break_with(&self, error: EngineError) {
-        let (pending, broken) = {
+        let (pending, broken, on_break) = {
             let mut waiters = self
                 .waiters
                 .lock()
                 .expect("page-service waiters lock poisoned");
+            let mut on_break = None;
             if waiters.broken.is_none() {
                 waiters.broken = Some(error);
+                waiters.broken_at = Some(Instant::now());
+                on_break = waiters.on_break.take();
+                self.broke.notify_all();
             }
             (
                 std::mem::take(&mut waiters.pending),
                 waiters.broken.clone().expect("set above"),
+                on_break,
             )
         };
         let _ = self.control.shutdown(Shutdown::Both);
         for waiter in pending.into_values() {
             let _ = waiter.send(Err(broken.clone()));
+        }
+        if let Some(on_break) = on_break {
+            on_break();
         }
     }
 
@@ -438,6 +569,22 @@ impl PsConnection {
         let _ = self.send_locked(&mut outbox, &Message::Abort, false);
     }
 
+    /// `request_ownership` (README.md §3.6): the owner's `ownership_reply` status.
+    pub(crate) fn request_ownership(&self) -> Result<u8> {
+        match self.round_trip(|| Ok(Message::RequestOwnership))? {
+            Message::OwnershipReply(reply) => Ok(reply.status),
+            _ => Err(violation("unexpected reply to request_ownership")),
+        }
+    }
+
+    /// `commit_status` (README.md §3.5): the owner's answer for the commit `(txid, digest)`.
+    pub(crate) fn commit_status(&self, txid: u64, digest: u64) -> Result<u8> {
+        match self.round_trip(|| Ok(Message::CommitStatus(CommitStatus { txid, digest })))? {
+            Message::CommitStatusReply(reply) => Ok(reply.status),
+            _ => Err(violation("unexpected reply to commit_status")),
+        }
+    }
+
     /// Send `end_read` for a duplicate pin a `read_begun` carried.
     pub(crate) fn end_read(&self, txid: u64) {
         self.send(&Message::EndRead(EndRead { txid }));
@@ -488,6 +635,14 @@ impl PsConnection {
         self.meta.lock().expect("meta lock poisoned").clone()
     }
 
+    /// The commit whose acknowledgement the last commit lost, `(txid, digest)`; clears it.
+    pub(crate) fn take_lost_commit(&self) -> Option<(u64, u64)> {
+        self.lost_commit
+            .lock()
+            .expect("lost-commit lock poisoned")
+            .take()
+    }
+
     /// Whether the last commit failed with the owner certainly not committing it; clears the mark.
     pub(crate) fn take_uncommitted(&self) -> bool {
         self.uncommitted.swap(false, Ordering::AcqRel)
@@ -501,8 +656,9 @@ impl PsConnection {
 
     /// Send a CommitDelta (README.md §3.5): `commit_begin` with the meta and the manifest chain,
     /// the body pages in ascending index order in frame-sized chunks, then `commit_end`, and wait
-    /// for the owner. A connection lost after `commit_end` was sent leaves the outcome unknown;
-    /// [`resolve_commit`](Self::resolve_commit) asks.
+    /// for the owner. A connection lost after `commit_end` was sent leaves the outcome unknown: the
+    /// commit is recorded for [`take_lost_commit`](Self::take_lost_commit), and the handle's
+    /// re-election resolves it.
     fn commit(&self, meta: Vec<u8>, mut pages: BTreeMap<u32, Vec<u8>>) -> Result<()> {
         self.uncommitted.store(false, Ordering::Release);
         let Some(m) = crate::format::meta_fields(&meta) else {
@@ -574,59 +730,20 @@ impl PsConnection {
             Ok(Message::Committed(done)) if done.txid == m.txid => Ok(()),
             Ok(_) => Err(violation("unexpected reply to commit_end")),
             Err(e) if e.state == SqlState::ConnectionFailure => {
-                self.resolve_commit(m.txid, digest, e)
+                *self.lost_commit.lock().expect("lost-commit lock poisoned") =
+                    Some((m.txid, digest));
+                Err(e)
             }
             Err(e) => Err(self.not_committed(e)),
         }
     }
 
-    /// Settle a commit whose acknowledgement was lost (page-service.md §8.4): reconnect to whichever
-    /// process owns the database until the open timeout passes and ask `commit_status`. This
-    /// connection stays broken (`08006`) either way; only this commit's outcome is resolved.
-    fn resolve_commit(&self, txid: u64, digest: u64, lost: EngineError) -> Result<()> {
-        // The open timeout bounds the search; 0 makes one attempt, as at open.
-        let timeout = self.timeout_ms;
-        let deadline = Instant::now() + Duration::from_millis(timeout);
-        loop {
-            let uid = endpoint::current_uid(&endpoint::bundle_dir(&self.db_path)).ok();
-            if let Some(record) = endpoint::read_owner_record(&self.db_path)
-                && record.serving
-                && Some(record.uid) == uid
-                && let Connect::Connected(other) =
-                    connect(&self.db_path, &record.endpoint, true, timeout)
-            {
-                let reply =
-                    other.round_trip(|| Ok(Message::CommitStatus(CommitStatus { txid, digest })));
-                other.close();
-                if let Ok(Message::CommitStatusReply(status)) = reply {
-                    return match status.status {
-                        COMMIT_STATUS_COMMITTED => Ok(()),
-                        COMMIT_STATUS_NOT_COMMITTED => Err(self.not_committed(lost)),
-                        _ => Err(EngineError::new(
-                            SqlState::TransactionResolutionUnknown,
-                            "lost the connection to the database owner during commit; whether the transaction committed is unknown",
-                        )),
-                    };
-                }
-            }
-            if Instant::now() > deadline {
-                return Err(EngineError::new(
-                    SqlState::TransactionResolutionUnknown,
-                    "lost the connection to the database owner during commit, and no owner answered whether it committed",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Close the connection (the owner releases every pin and the gate at EOF) and release the
-    /// open-path claim. Idempotent.
+    /// Close the connection (the owner releases every pin and the gate at EOF). Idempotent.
     pub(crate) fn close(&self) {
         self.break_with(EngineError::new(
             SqlState::ConnectionFailure,
             "the page-service connection is closed",
         ));
-        self.claim.lock().expect("claim lock poisoned").take();
     }
 }
 

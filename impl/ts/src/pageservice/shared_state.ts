@@ -40,6 +40,21 @@ const META_MAX = 65536;
 // The resolution window holds the (txid, digest) pairs of this many published commits (README §4).
 export const PS_RESOLUTION_WINDOW_COMMITS = PS_INVALIDATION_WINDOW_COMMITS;
 
+// The owner's handoff states (spec/pageservice/README.md §6.5): serving; yielding to a requester
+// (draining); closing (a graceful close's drain); releasing (the drain ended, ownership is being
+// released — a requester's disconnect no longer cancels anything). While not serving, client begins
+// are parked unanswered and the engine thread's own begins wait.
+export const OWNER_SERVING = 0;
+export const OWNER_YIELDING = 1;
+export const OWNER_CLOSING = 2;
+export const OWNER_RELEASING = 3;
+
+// The commit-acknowledgement test hooks (README §6.4, §6.5): drop the connection, or end the process,
+// instead of acknowledging the next client commit after it is durable.
+export const ACK_NORMAL = 0;
+export const ACK_HANG_UP = 1;
+export const ACK_CRASH = 2;
+
 // The writer gate's states.
 export const GATE_FREE = 0;
 export const GATE_ENGINE = 1;
@@ -57,7 +72,8 @@ const EPOCH = 6;
 const POISONED = 7;
 const RESOLUTION_COUNT = 8;
 const RESOLUTION_NEXT = 9;
-const HANG_UP_NEXT_ACK = 10;
+const ACK_HOOK = 10;
+const OWNER_STATE = 11;
 const HEADER_I32 = 16;
 
 // BigInt64 slots.
@@ -69,6 +85,8 @@ const LIVE_AT_COMPACTION = 3;
 // published, or -1 when none did. Readers that register later pin the committed version, which is never
 // older than the free list's generation, so a stale (older) value only withholds a grant.
 const ENGINE_OLDEST = 4;
+// REQUESTER is the connection id a yielding owner yields to (0: none).
+const REQUESTER = 5;
 const BIG_SLOTS = 8;
 
 // Byte offsets of the other regions (each 8-byte aligned).
@@ -197,13 +215,35 @@ export class ServiceState {
     Atomics.store(this.header, POISONED, 1);
   }
 
-  // armHangUp arms the commit-resolution test hook; takeHangUp consumes it (worker).
-  armHangUp(): void {
-    Atomics.store(this.header, HANG_UP_NEXT_ACK, 1);
+  // armAckHook arms a commit-acknowledgement test hook (ACK_HANG_UP or ACK_CRASH); takeAckHook
+  // consumes it (worker).
+  armAckHook(hook: number): void {
+    Atomics.store(this.header, ACK_HOOK, hook);
   }
 
-  takeHangUp(): boolean {
-    return Atomics.compareExchange(this.header, HANG_UP_NEXT_ACK, 1, 0) === 1;
+  takeAckHook(): number {
+    return Atomics.exchange(this.header, ACK_HOOK, ACK_NORMAL);
+  }
+
+  // --- handoff (README §6.5) ---
+
+  // ownerState is the owner's handoff state (OWNER_*); read without the lock, changed with it.
+  ownerState(): number {
+    return Atomics.load(this.header, OWNER_STATE);
+  }
+
+  setOwnerStateLocked(state: number): void {
+    Atomics.store(this.header, OWNER_STATE, state);
+    Atomics.notify(this.header, OWNER_STATE);
+  }
+
+  // requesterLocked is the connection id a yield goes to (0: none).
+  requesterLocked(): bigint {
+    return this.big[REQUESTER]!;
+  }
+
+  setRequesterLocked(connectionId: bigint): void {
+    this.big[REQUESTER] = connectionId;
   }
 
   // --- the rest is called with the lock held ---

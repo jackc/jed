@@ -11,9 +11,16 @@
 // client pins, the write pin included — page counts only grow between compactions and a pin blocks
 // compaction, so it bounds every page of every older pinned version. The engine thread is the only
 // sender, so no end_read, abort, or commit_end can overtake a read_pages naming the version it
-// releases. Node-only.
+// releases.
+//
+// A PageClient is one connection. When it ends, the handle re-elects (spec/pageservice/README.md
+// §6.5; shared.ts and pageservice/handoff.ts) and installs a new role with a new PageClient; this one
+// stays broken (08006) for the transactions begun on it. The socket worker records the connection's
+// end and the owner's notices in a status buffer this thread reads with atomic loads, and announces the
+// end on an event port, so the handle can re-elect while its engine thread is idle. Node-only.
 
 import { tmpdir } from "node:os";
+import { MessageChannel, type MessagePort } from "node:worker_threads";
 
 import type { BlockStore } from "../blockstore.ts";
 import { crc64Update, parseCommitMeta } from "../commit_manifest.ts";
@@ -28,22 +35,32 @@ import type { ClientReadBegun, PageClientHandle } from "../shared.ts";
 import { FileSpillSink } from "../spillfile.ts";
 import { ERRORS } from "../sqlstate.ts";
 import { type BlockingChannel, ProcessWorker } from "./blocking.ts";
+import {
+  LOST_AT_OFFSET,
+  NOTICE_CONN_OFFSET,
+  STATUS_BYTES,
+  STATUS_LOST,
+  STATUS_PAUSED,
+} from "./client_status.ts";
 import type { ClientAnswer, ClientRequest } from "./client_worker.ts";
 import {
   decodeFrame,
   encodeFrame,
-  PS_COMMIT_STATUS_COMMITTED,
-  PS_COMMIT_STATUS_NOT_COMMITTED,
   PS_ERROR_FLAG_FATAL,
   PS_HELLO_FLAG_READ_ONLY,
   PS_HELLO_OK_FLAG_CONNECTION_READ_ONLY,
+  PS_HELLO_OK_FLAG_OWNER_READ_ONLY,
+  PS_HELLO_OK_FLAG_OWNER_YIELDS,
   PS_INVALIDATE_ALL,
   PS_MAX_FRAME_LENGTH,
   PS_PROTOCOL_VERSION,
   type PsIndexedPage,
   type PsMessage,
 } from "./codec.ts";
-import { currentUid, readOwnerRecord } from "./endpoint.ts";
+
+// HANDOFF_PAUSE_MS is how long a client that saw another connection's yield skips presence tries after
+// its connection ends, so the requester takes ownership (README §6.5).
+export const HANDOFF_PAUSE_MS = 2000;
 
 function pageSizeValid(size: number): boolean {
   return size >= 256 && size <= 65536 && (size & (size - 1)) === 0;
@@ -76,17 +93,27 @@ function errClientReadOnly(): EngineError {
   );
 }
 
-// sleepMs blocks the engine thread for ms milliseconds (commit resolution's retry pause).
-function sleepMs(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 // NotCommitted marks a commit failure after which the owner certainly did not commit (the delta never
 // completed, or the owner refused it): the client's pager may continue.
 class NotCommitted extends Error {
   readonly failure: unknown;
   constructor(failure: unknown) {
     super(failure instanceof Error ? failure.message : String(failure));
+    this.failure = failure;
+  }
+}
+
+// CommitLost is a commit whose connection was lost after commit_end was written: the outcome is
+// unknown until the handle re-elects and asks (README §6.5). failure is what a not-committed answer
+// reports (08006).
+export class CommitLost extends Error {
+  readonly txid: bigint;
+  readonly digest: bigint;
+  readonly failure: EngineError;
+  constructor(txid: bigint, digest: bigint, failure: EngineError) {
+    super(failure.message);
+    this.txid = txid;
+    this.digest = digest;
     this.failure = failure;
   }
 }
@@ -110,9 +137,10 @@ export class PageClient implements PageClientHandle {
   readOnly = false;
   // reuseGrant is the write transaction's reuse grant (write_begun).
   reuseGrant = false;
-  // timeoutMs bounds commit resolution's search for an owner: exactly the open's file_lock_timeout_ms
-  // (0: one attempt).
-  timeoutMs = 5000;
+  // connectionId, ownerReadOnly, and ownerYields are hello_ok's (README §3.1, §6.5).
+  connectionId = 0n;
+  ownerReadOnly = false;
+  ownerYields = false;
   // store is the pager's byte store, whose buffered commit a failure discards.
   store: ServiceBlockStore | null = null;
   private meta: Uint8Array = new Uint8Array(0);
@@ -128,12 +156,62 @@ export class PageClient implements PageClientHandle {
   // unsent is set when the connection was found lost before the last request could be written.
   private unsent = false;
   private closed = false;
-  // release frees the process-local open-path claim when the client closes.
-  release: (() => void) | null = null;
+  // discard holds the request ids whose replies nobody waits for (a fire-and-forget
+  // request_ownership); they are dropped when they arrive.
+  private readonly discard = new Set<number>();
+  // The status buffer the socket worker writes (client_worker.ts), and the event port it announces the
+  // connection's end on; attached is set once both went to the worker.
+  private readonly status = new SharedArrayBuffer(STATUS_BYTES);
+  private readonly statusFlags = new Int32Array(this.status, 0, 2);
+  private readonly events: MessagePort;
+  private readonly remoteEvents: MessagePort;
+  private attached = false;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
     this.channel = socketWorker.acquire();
+    const { port1, port2 } = new MessageChannel();
+    this.events = port1;
+    this.remoteEvents = port2;
+    this.events.unref();
+  }
+
+  // onLost installs the handler run (on the event loop) when the connection ends.
+  onLost(handler: () => void): void {
+    this.events.on("message", handler);
+    this.events.unref();
+  }
+
+  // lost reports whether the connection has ended (noticed by the socket worker or by this thread).
+  lost(): boolean {
+    return this.broken !== null || Atomics.load(this.statusFlags, STATUS_LOST) === 1;
+  }
+
+  // waitForLoss blocks until the connection ends or deadlineMs (Date.now() scale; Infinity: no
+  // deadline) passes; it reports whether the connection ended.
+  waitForLoss(deadlineMs: number): boolean {
+    for (;;) {
+      if (this.lost()) return true;
+      const remaining = deadlineMs - Date.now();
+      if (remaining <= 0) return false;
+      Atomics.wait(
+        this.statusFlags,
+        STATUS_LOST,
+        0,
+        Number.isFinite(remaining) ? remaining : undefined,
+      );
+    }
+  }
+
+  // handoffPauseUntil is when this client's handoff pause ends (README §6.5; 0: not paused): a
+  // yield-begun notice naming another connection pauses presence tries for HANDOFF_PAUSE_MS after the
+  // connection ends.
+  handoffPauseUntil(): number {
+    if (Atomics.load(this.statusFlags, STATUS_PAUSED) !== 1) return 0;
+    const requester = new BigInt64Array(this.status, NOTICE_CONN_OFFSET, 1)[0]!;
+    if (requester === this.connectionId) return 0;
+    const lostAt = new Float64Array(this.status, LOST_AT_OFFSET, 1)[0]!;
+    return (lostAt > 0 ? lostAt : Date.now()) + HANDOFF_PAUSE_MS;
   }
 
   // connect dials the endpoint and runs hello, asking for a read-only connection for a read-only
@@ -142,11 +220,15 @@ export class PageClient implements PageClientHandle {
     this.broken = null;
     this.nextId = 0;
     this.pageSize = 0;
-    const answer = this.channel.request({
-      op: "connect",
-      conn: this.conn,
-      endpoint,
-    } as ClientRequest) as ClientAnswer;
+    const request: ClientRequest = { op: "connect", conn: this.conn, endpoint };
+    let answer: ClientAnswer;
+    if (this.attached) answer = this.channel.request(request) as ClientAnswer;
+    else {
+      this.attached = true;
+      request.status = this.status;
+      request.events = this.remoteEvents;
+      answer = this.channel.request(request, [this.remoteEvents]) as ClientAnswer;
+    }
     if (!("ok" in answer)) {
       return { ok: false, retry: true, error: connectionLost("lost" in answer ? answer.lost : "") };
     }
@@ -163,7 +245,8 @@ export class PageClient implements PageClientHandle {
     } catch (error) {
       this.channel.post({ op: "disconnect", conn: this.conn } as ClientRequest);
       const e = error as EngineError;
-      return { ok: false, retry: e.code() === "08006", error: e };
+      // A full owner (53300) is retried by a re-election; the election decides.
+      return { ok: false, retry: e.code() === "08006" || e.code() === "53300", error: e };
     }
     if (reply.kind !== "hello_ok" || !pageSizeValid(reply.pageSize)) {
       this.channel.post({ op: "disconnect", conn: this.conn } as ClientRequest);
@@ -174,7 +257,10 @@ export class PageClient implements PageClientHandle {
       };
     }
     this.pageSize = reply.pageSize;
+    this.connectionId = reply.connectionId;
     this.readOnly = (reply.flags & PS_HELLO_OK_FLAG_CONNECTION_READ_ONLY) !== 0;
+    this.ownerReadOnly = (reply.flags & PS_HELLO_OK_FLAG_OWNER_READ_ONLY) !== 0;
+    this.ownerYields = (reply.flags & PS_HELLO_OK_FLAG_OWNER_YIELDS) !== 0;
     return { ok: true };
   }
 
@@ -210,7 +296,10 @@ export class PageClient implements PageClientHandle {
         throw error;
       }
       const reply = decoded.message;
-      if (decoded.requestId === 0 && reply.kind === "notice") {
+      if (
+        (decoded.requestId === 0 && reply.kind === "notice") ||
+        (decoded.requestId !== id && this.discard.delete(decoded.requestId))
+      ) {
         answer = this.channel.request({
           op: "next",
           conn: this.conn,
@@ -253,9 +342,33 @@ export class PageClient implements PageClientHandle {
   }
 
   // request runs one request/reply round trip for a caller outside the engine paths (commit
-  // resolution's commit_status).
+  // resolution's commit_status, a writer's request_ownership).
   request(m: PsMessage): PsMessage {
     return this.roundTrip(m);
+  }
+
+  // askOwnership sends request_ownership and waits for the reply (README §6.5 case 2); the handoff
+  // itself arrives as the connection's end.
+  askOwnership(): void {
+    this.roundTrip({ kind: "request_ownership" });
+  }
+
+  // commitStatus asks whether a commit happened (README §3.5): 0 committed, 1 not, 2 unknown.
+  commitStatus(txid: bigint, digest: bigint): number {
+    const reply = this.roundTrip({ kind: "commit_status", txid, digest });
+    if (reply.kind !== "commit_status_reply") {
+      this.breakWith(engineError("protocol_violation", "unexpected reply to commit_status"));
+      throw this.broken!;
+    }
+    return reply.status;
+  }
+
+  // requestOwnershipNoWait sends request_ownership without waiting for the reply (README §6.5 case 1):
+  // the outcome arrives as the connection's end. A failure to send is ignored.
+  requestOwnershipNoWait(): void {
+    if (this.broken !== null || this.closed) return;
+    const id = this.send({ kind: "request_ownership" }, false);
+    this.discard.add(id);
   }
 
   // beginRead runs begin_read for the client's cache and records the pin it carries: held from now on
@@ -343,6 +456,11 @@ export class PageClient implements PageClientHandle {
     return { error, notCommitted: false };
   }
 
+  // lostCommit recognizes a commit whose acknowledgement was lost (CommitLost), or returns null.
+  lostCommit(error: unknown): { txid: bigint; digest: bigint; failure: EngineError } | null {
+    return error instanceof CommitLost ? error : null;
+  }
+
   currentMeta(): Uint8Array {
     return this.meta;
   }
@@ -423,52 +541,13 @@ export class PageClient implements PageClientHandle {
       reply = this.awaitReply(id);
     } catch (error) {
       if (error instanceof EngineError && error.code() === "08006" && !this.unsent) {
-        this.resolveCommit(m.txid, digest, error);
-        return;
+        throw new CommitLost(m.txid, digest, error);
       }
       throw new NotCommitted(error);
     }
     if (reply.kind !== "committed" || reply.txid !== m.txid) {
       this.breakWith(engineError("protocol_violation", "unexpected reply to commit_end"));
       throw this.broken!;
-    }
-  }
-
-  // resolveCommit settles a commit whose acknowledgement was lost (page-service.md §8.4): it reconnects
-  // to whichever process owns the database until the open timeout passes and asks commit_status. The
-  // handle stays broken (08006) either way; only this commit's outcome is resolved.
-  private resolveCommit(txid: bigint, digest: bigint, lost: EngineError): void {
-    const deadline = Date.now() + this.timeoutMs;
-    for (;;) {
-      const record = readOwnerRecord(this.dbPath);
-      if (record?.serving && record.uid === currentUid()) {
-        const other = new PageClient(this.dbPath);
-        try {
-          if (other.connect(record.endpoint, true).ok) {
-            const reply = other.request({ kind: "commit_status", txid, digest });
-            if (reply.kind === "commit_status_reply") {
-              if (reply.status === PS_COMMIT_STATUS_COMMITTED) return;
-              if (reply.status === PS_COMMIT_STATUS_NOT_COMMITTED) throw new NotCommitted(lost);
-              throw engineError(
-                "transaction_resolution_unknown",
-                "lost the connection to the database owner during commit; whether the transaction committed is unknown",
-              );
-            }
-          }
-        } catch (error) {
-          if (error instanceof NotCommitted) throw error;
-          if (error instanceof EngineError && error.code() === "08007") throw error;
-        } finally {
-          other.close();
-        }
-      }
-      if (Date.now() >= deadline) {
-        throw engineError(
-          "transaction_resolution_unknown",
-          "lost the connection to the database owner during commit, and no owner answered whether it committed",
-        );
-      }
-      sleepMs(10);
     }
   }
 
@@ -492,8 +571,7 @@ export class PageClient implements PageClientHandle {
     }
     this.channel.post({ op: "forget", conn: this.conn } as ClientRequest);
     socketWorker.release();
-    this.release?.();
-    this.release = null;
+    this.events.close();
   }
 }
 

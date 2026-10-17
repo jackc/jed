@@ -701,6 +701,16 @@ name = "with_check_option_violation"
 class = "with check option violation"
 template = "new row violates check option for view \"{view}\""
 
+# --- insufficient resources (class 53) ----------------------------------------
+# A page-service owner already serves its maximum number of connections (page-service.md §11.1;
+# spec/pageservice/README.md §6.5): a further `hello` is refused with PostgreSQL's code. Host-observed,
+# never reachable from SQL alone; the real-process corpus asserts it.
+[[error]]
+code = "53300"
+name = "too_many_connections"
+class = "insufficient resources"
+template = "{detail}"
+
 # --- program limit exceeded (class 54)--------------------------------------
 # A caller-imposed (or engine-fixed) limit was exceeded. The §13 untrusted-query
 # safety gates live here.

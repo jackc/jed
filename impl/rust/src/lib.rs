@@ -124,7 +124,10 @@ pub(crate) use executor::Engine;
 // public seam is `query -> Rows`; `Outcome` stays crate-visible for the executor's own dispatch + the
 // white-box test drain helper (`query_outcome`), never nameable outside the crate.
 pub(crate) use executor::Outcome;
-pub use file::{CreateOptions, DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS, Locking, OpenOptions};
+pub use file::{
+    CreateOptions, DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS, DEFAULT_SHUTDOWN_GRACE_MS,
+    DEFAULT_YIELD_GRACE_MS, Locking, OpenOptions, Ownership,
+};
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use seam::{
     AdvancingClock, ClockSource, ManualClock, RandomSource, SeededRandom, advancing_clock,

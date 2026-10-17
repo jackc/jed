@@ -16,9 +16,15 @@
 //! (`Shared::adopt_foreign`), so nothing a client commits can fail after it is durable
 //! (page-service.md §7).
 //!
-//! Lock order: the commit lock, then a connection's state, then the reader registry; a connection's
-//! state before the storage and the gate's own mutex. Nothing takes a connection's state while
-//! holding the registry, the storage, or the gate's mutex.
+//! Handoff (README.md §6.5): an owner whose preference is `yield`, or whose own handle is read-only,
+//! answers `request_ownership` by draining and releasing ownership (`shared/handoff.rs`); a graceful
+//! close drains its clients first. While draining, client begins are parked unanswered and the
+//! owner's own begins wait ([`PageServiceOwner::wait_admission`]).
+//!
+//! Lock order: the commit lock, then a connection's state, then the handoff state, then the reader
+//! registry; a connection's state before the storage and the gate's own mutex. Nothing takes a
+//! connection's state while holding the handoff state, the registry, the storage, or the gate's
+//! mutex.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::File;
@@ -27,19 +33,23 @@ use std::net::Shutdown;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::coordinator::FileCoordinator;
 use crate::error::{EngineError, Result, SqlState};
+use crate::file::Ownership;
 use crate::pageservice::codec::{
-    BeginWrite, COMMIT_STATUS_COMMITTED, COMMIT_STATUS_NOT_COMMITTED, COMMIT_STATUS_UNKNOWN,
-    CommitBegin, CommitPages, CommitStatusReply, Committed, ERROR_FLAG_FATAL, ErrorReply,
-    HELLO_FLAG_READ_ONLY, HELLO_OK_FLAG_CONNECTION_READ_ONLY, HELLO_OK_FLAG_OWNER_READ_ONLY, Hello,
-    HelloOk, INVALIDATE_ALL, INVALIDATE_EXACT, INVALIDATION_WINDOW_COMMITS, Id16,
-    MAX_INVALIDATION_ENTRIES, MAX_READ_PAGES_CAP, Message, OwnerRecord, PROTOCOL_VERSION, Pages,
-    encode_frame, max_read_pages, read_frame,
+    BeginRead, BeginWrite, COMMIT_STATUS_COMMITTED, COMMIT_STATUS_NOT_COMMITTED,
+    COMMIT_STATUS_UNKNOWN, CommitBegin, CommitPages, CommitStatusReply, Committed,
+    ERROR_FLAG_FATAL, ErrorReply, HELLO_FLAG_READ_ONLY, HELLO_OK_FLAG_CONNECTION_READ_ONLY,
+    HELLO_OK_FLAG_OWNER_READ_ONLY, HELLO_OK_FLAG_OWNER_YIELDS, Hello, HelloOk, INVALIDATE_ALL,
+    INVALIDATE_EXACT, INVALIDATION_WINDOW_COMMITS, Id16, MAX_INVALIDATION_ENTRIES,
+    MAX_READ_PAGES_CAP, Message, NOTICE_SHUTDOWN_BEGUN, NOTICE_YIELD_BEGUN, NOTICE_YIELD_CANCELLED,
+    Notice, OWNERSHIP_REFUSED, OWNERSHIP_YIELDING, OwnerRecord, OwnershipReply, PROTOCOL_VERSION,
+    Pages, encode_frame, max_read_pages, read_frame,
 };
 use crate::pageservice::delta::{Delta, DeltaBase, begin_delta};
 use crate::pageservice::endpoint;
@@ -47,6 +57,62 @@ use crate::shared::Shared;
 
 /// The resolution window keeps the newest commits, like the invalidation window (README.md §4).
 const RESOLUTION_WINDOW_COMMITS: usize = INVALIDATION_WINDOW_COMMITS as usize;
+
+/// How often a draining owner checks for running transactions (README.md §6.5).
+const DRAIN_POLL: Duration = Duration::from_millis(10);
+
+/// The commit-acknowledgement test hooks (README.md §6.4–§6.5): acknowledge normally, drop the
+/// connection, or exit the process instead of acknowledging the next client commit.
+const ACK_NORMAL: u8 = 0;
+const ACK_HANG_UP: u8 = 1;
+const ACK_CRASH: u8 = 2;
+
+/// An owner's limits (page-service.md §11.1), read from its own handle's options.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OwnerLimits {
+    pub(crate) idle_in_transaction: Option<Duration>,
+    pub(crate) idle_session: Option<Duration>,
+    pub(crate) yield_grace: Duration,
+    pub(crate) shutdown_grace: Duration,
+    /// `0` is unlimited.
+    pub(crate) max_connections: usize,
+}
+
+impl OwnerLimits {
+    pub(crate) fn from_options(opts: &crate::file::OpenOptions) -> OwnerLimits {
+        let positive = |ms: u64| (ms > 0).then(|| Duration::from_millis(ms));
+        OwnerLimits {
+            idle_in_transaction: positive(opts.idle_in_transaction_timeout_ms),
+            idle_session: opts.idle_session_timeout_ms.and_then(positive),
+            yield_grace: Duration::from_millis(
+                opts.yield_grace_ms
+                    .unwrap_or(crate::file::DEFAULT_YIELD_GRACE_MS),
+            ),
+            shutdown_grace: Duration::from_millis(
+                opts.shutdown_grace_ms
+                    .unwrap_or(crate::file::DEFAULT_SHUTDOWN_GRACE_MS),
+            ),
+            max_connections: opts.max_connections,
+        }
+    }
+}
+
+/// An owner's handoff state (README.md §6.5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnerState {
+    Serving,
+    Yielding,
+    Closing,
+}
+
+/// The handoff state behind [`PageServiceOwner::handoff`].
+struct HandoffState {
+    state: OwnerState,
+    /// The connection a yield answers.
+    requester: Option<u64>,
+    /// A yield is draining: the owner's own transaction begins wait ([`PageServiceOwner::wait_admission`]).
+    draining: bool,
+}
 
 /// A fresh incarnation id: 16 random bytes, redrawn if all zero (README.md §4).
 pub(crate) fn new_incarnation() -> Result<Id16> {
@@ -297,6 +363,11 @@ impl WriterGate {
         }
     }
 
+    /// Whether the gate is held (a drain waits for its holder).
+    pub(crate) fn is_held(&self) -> bool {
+        self.state.lock().expect("writer gate lock poisoned").held
+    }
+
     /// Take the gate only if it is free (compaction never waits).
     pub(crate) fn try_acquire(&self) -> bool {
         let mut state = self.state.lock().expect("writer gate lock poisoned");
@@ -334,8 +405,8 @@ pub(crate) type ConnPins = BTreeMap<u64, usize>;
 struct Conns {
     closed: bool,
     next_id: u64,
-    /// A second handle on each open connection, so close can shut it down.
-    open: HashMap<u64, UnixStream>,
+    /// The open connections, so close can shut them down and a notice can reach each.
+    open: HashMap<u64, Arc<ServerConn>>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -353,6 +424,12 @@ struct WriteTxn {
     finishing: bool,
 }
 
+/// A begin a draining owner left unanswered (README.md §6.5); a cancelled yield answers it.
+enum Parked {
+    Read(u32, BeginRead),
+    Write(u32, BeginWrite),
+}
+
 /// One connection's mutable state, behind [`ServerConn::state`].
 struct ConnState {
     read_only: bool,
@@ -366,6 +443,11 @@ struct ConnState {
     closed: bool,
     /// When the held write transaction is revoked unless a frame arrives first.
     idle_deadline: Option<Instant>,
+    /// When the connection is closed for the idle-session timeout unless a frame arrives first
+    /// (page-service.md §11.1).
+    session_deadline: Option<Instant>,
+    /// Begins a draining owner left unanswered.
+    parked: Vec<Parked>,
 }
 
 /// One client connection on the owner side.
@@ -373,6 +455,8 @@ struct ServerConn {
     id: u64,
     /// The write half: replies come from the serve thread and from a `begin_write`'s gate waiter.
     sender: Mutex<UnixStream>,
+    /// A second handle on the socket, so the owner can shut it down without the send lock.
+    control: UnixStream,
     /// Set when the serve thread ends, so a gate waiter gives up.
     closed: AtomicBool,
     state: Mutex<ConnState>,
@@ -399,13 +483,9 @@ impl ServerConn {
         self.send(request_id, &error_reply(error, ERROR_FLAG_FATAL));
     }
 
-    /// Drop the connection (the commit-resolution test hook).
+    /// Drop the connection (the commit-resolution test hook, the idle-session timeout, a release).
     fn hang_up(&self) {
-        let _ = self
-            .sender
-            .lock()
-            .expect("page-service sender lock poisoned")
-            .shutdown(Shutdown::Both);
+        let _ = self.control.shutdown(Shutdown::Both);
     }
 }
 
@@ -416,7 +496,15 @@ pub(crate) struct PageServiceOwner {
     db_path: PathBuf,
     page_size: u32,
     read_only: bool,
-    idle_timeout: Option<Duration>,
+    preference: Ownership,
+    limits: OwnerLimits,
+    incarnation: Id16,
+    uid: u32,
+    /// Presence EX for this ownership; releasing ownership drops it.
+    coord: Mutex<Option<FileCoordinator>>,
+    /// The handoff state; `admission` wakes the owner's own begins when a drain ends.
+    handoff: Mutex<HandoffState>,
+    admission: Condvar,
     /// The owner's own read handle on the database: page reads are positioned reads on it,
     /// independent of the pager's lock, so a client never waits on the owner's commit. Compaction
     /// replaces it.
@@ -431,23 +519,24 @@ pub(crate) struct PageServiceOwner {
     /// The txid of the newest client commit published here; the owner's roots adopt it at their
     /// next transaction begin (`Shared::adopt_foreign`).
     pub(crate) foreign: AtomicU64,
-    /// The commit-resolution test hook: drop the connection instead of acknowledging the next
-    /// client commit.
-    hang_up_next_ack: AtomicBool,
+    /// The commit-acknowledgement test hook (`ACK_*`).
+    next_ack: AtomicU8,
 }
 
 impl PageServiceOwner {
-    /// Serve the database at `db_path` for `shared`, whose registry already holds the window for
-    /// `incarnation`: write the owner record, bind the endpoint, and start accepting. An owner that
-    /// cannot bind (no private endpoint directory) still owns and records `flags = 0`.
-    /// `idle_timeout_ms` is the idle-in-transaction timeout (0 disables it).
-    pub(crate) fn start(
-        shared: &Arc<Shared>,
+    /// Prepare the owner of the database at `db_path` for `shared` under `incarnation`: its read
+    /// handle and endpoint path. `coord` holds presence EX for this ownership. [`serve`](Self::serve)
+    /// starts serving once the role is installed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        shared: Weak<Shared>,
         db_path: &Path,
         incarnation: Id16,
         page_size: u32,
         read_only: bool,
-        idle_timeout_ms: u64,
+        preference: Ownership,
+        limits: OwnerLimits,
+        coord: Option<FileCoordinator>,
     ) -> Result<Arc<PageServiceOwner>> {
         let file = File::open(db_path).map_err(|e| {
             EngineError::new(
@@ -457,25 +546,24 @@ impl PageServiceOwner {
         })?;
         let uid = endpoint::current_uid(&endpoint::bundle_dir(db_path))?;
         let endpoint_path = endpoint::endpoint_path(db_path, uid, &incarnation);
-        let record = OwnerRecord {
-            serving: endpoint_path.is_some(),
-            uid,
-            incarnation,
-            pid: std::process::id(),
-            endpoint: endpoint_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        };
-        endpoint::write_owner_record(db_path, &record)?;
-        let owner = Arc::new(PageServiceOwner {
-            shared: Arc::downgrade(shared),
+        Ok(Arc::new(PageServiceOwner {
+            shared,
             db_path: db_path.to_path_buf(),
             page_size,
             read_only,
-            idle_timeout: (idle_timeout_ms > 0).then(|| Duration::from_millis(idle_timeout_ms)),
+            preference,
+            limits,
+            incarnation,
+            uid,
+            coord: Mutex::new(coord),
+            handoff: Mutex::new(HandoffState {
+                state: OwnerState::Serving,
+                requester: None,
+                draining: false,
+            }),
+            admission: Condvar::new(),
             file: RwLock::new(file),
-            endpoint: endpoint_path.clone(),
+            endpoint: endpoint_path,
             conns: Mutex::new(Conns {
                 closed: false,
                 next_id: 0,
@@ -486,24 +574,51 @@ impl PageServiceOwner {
             gate: WriterGate::new(),
             commit_lock: Mutex::new(()),
             foreign: AtomicU64::new(0),
-            hang_up_next_ack: AtomicBool::new(false),
-        });
-        let Some(path) = endpoint_path else {
-            return Ok(owner);
+            next_ack: AtomicU8::new(ACK_NORMAL),
+        }))
+    }
+
+    /// Write the owner record, bind the endpoint, and start accepting. An owner that cannot bind (no
+    /// private endpoint directory, or a failed bind) still owns and records that it does not serve.
+    pub(crate) fn serve(self: &Arc<Self>) -> Result<()> {
+        let record = OwnerRecord {
+            serving: self.endpoint.is_some(),
+            uid: self.uid,
+            incarnation: self.incarnation,
+            pid: std::process::id(),
+            endpoint: self
+                .endpoint
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        endpoint::write_owner_record(&self.db_path, &record)?;
+        let Some(path) = &self.endpoint else {
+            return Ok(());
         };
         // Only a presence-EX holder reaches here, so a file already at the path is a dead owner's.
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).map_err(|e| {
-            let _ = std::fs::remove_file(endpoint::owner_record_path(db_path));
-            EngineError::new(
-                SqlState::IoError,
-                format!("bind page-service endpoint: {e}"),
-            )
-        })?;
-        let acceptor = Arc::clone(&owner);
-        *owner.accept.lock().expect("accept lock poisoned") =
+        let _ = std::fs::remove_file(path);
+        let listener = match UnixListener::bind(path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = endpoint::write_owner_record(
+                    &self.db_path,
+                    &OwnerRecord {
+                        serving: false,
+                        endpoint: String::new(),
+                        ..record
+                    },
+                );
+                return Err(EngineError::new(
+                    SqlState::IoError,
+                    format!("bind page-service endpoint: {e}"),
+                ));
+            }
+        };
+        let acceptor = Arc::clone(self);
+        *self.accept.lock().expect("accept lock poisoned") =
             Some(thread::spawn(move || acceptor.accept_loop(listener)));
-        Ok(owner)
+        Ok(())
     }
 
     fn accept_loop(self: Arc<Self>, listener: UnixListener) {
@@ -515,23 +630,222 @@ impl PageServiceOwner {
             if conns.closed {
                 return;
             }
-            let Ok(control) = stream.try_clone() else {
+            let (Ok(control), Ok(sender)) = (stream.try_clone(), stream.try_clone()) else {
                 continue;
             };
             conns.next_id += 1;
             let id = conns.next_id;
-            conns.open.insert(id, control);
+            let conn = Arc::new(ServerConn {
+                id,
+                sender: Mutex::new(sender),
+                control,
+                closed: AtomicBool::new(false),
+                state: Mutex::new(ConnState {
+                    read_only: false,
+                    pins: ConnPins::new(),
+                    write: None,
+                    waiting: false,
+                    revoked: None,
+                    closed: false,
+                    idle_deadline: None,
+                    session_deadline: self.limits.idle_session.map(|t| Instant::now() + t),
+                    parked: Vec::new(),
+                }),
+                idle: Condvar::new(),
+                watchdog: Mutex::new(None),
+            });
+            conns.open.insert(id, Arc::clone(&conn));
             conns.threads.retain(|t| !t.is_finished());
             let owner = Arc::clone(&self);
             conns
                 .threads
-                .push(thread::spawn(move || owner.serve(id, stream)));
+                .push(thread::spawn(move || owner.serve_connection(conn, stream)));
         }
     }
 
     /// Make the next client commit drop its connection instead of acknowledging (test hook).
     pub(crate) fn hang_up_next_ack(&self) {
-        self.hang_up_next_ack.store(true, Ordering::Release);
+        self.next_ack.store(ACK_HANG_UP, Ordering::Release);
+    }
+
+    /// Make the next client commit exit the process instead of acknowledging, after the commit is
+    /// durable (test hook, README.md §6.5).
+    pub(crate) fn crash_before_next_ack(&self) {
+        self.next_ack.store(ACK_CRASH, Ordering::Release);
+    }
+
+    /// The open connections.
+    fn connections(&self) -> Vec<Arc<ServerConn>> {
+        self.conns
+            .lock()
+            .expect("connections lock poisoned")
+            .open
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Send a notice to every connection (README.md §3.7).
+    fn broadcast(&self, kind: u8, connection_id: u64) {
+        let notice = Message::Notice(Notice {
+            kind,
+            connection_id,
+        });
+        for conn in self.connections() {
+            conn.send(0, &notice);
+        }
+    }
+
+    /// Block an owner session's transaction begin while a yield drains (README.md §6.5).
+    pub(crate) fn wait_admission(&self) {
+        let mut handoff = self.handoff.lock().expect("handoff lock poisoned");
+        while handoff.draining {
+            handoff = self.admission.wait(handoff).expect("handoff lock poisoned");
+        }
+    }
+
+    /// Whether client begins are answered rather than parked.
+    fn admitting(&self) -> bool {
+        self.handoff.lock().expect("handoff lock poisoned").state == OwnerState::Serving
+    }
+
+    /// Release the owner's own waiting begins.
+    pub(crate) fn end_drain(&self) {
+        self.handoff.lock().expect("handoff lock poisoned").draining = false;
+        self.admission.notify_all();
+    }
+
+    /// Whether no transaction a drain waits for is running: with `own`, the owner's own readers and
+    /// writer as well as every connection's; otherwise only the connections'.
+    fn drained(&self, shared: &Shared, own: bool) -> bool {
+        if own && (shared.has_live_readers() || self.gate.is_held()) {
+            return false;
+        }
+        self.connections().iter().all(|conn| {
+            let state = conn.state.lock().expect("connection state lock poisoned");
+            state.pins.is_empty() && state.write.is_none()
+        })
+    }
+
+    /// Whether the connection `id` ended.
+    fn connection_gone(&self, id: u64) -> bool {
+        let conn = self
+            .conns
+            .lock()
+            .expect("connections lock poisoned")
+            .open
+            .get(&id)
+            .cloned();
+        conn.is_none_or(|conn| conn.closed.load(Ordering::Acquire))
+    }
+
+    /// Wait for running transactions to finish, up to `grace` (README.md §6.5). `true` when the
+    /// yield's `requester` disconnected first (the yield is cancelled).
+    fn drain(&self, shared: &Shared, grace: Duration, own: bool, requester: Option<u64>) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            if requester.is_some_and(|id| self.connection_gone(id)) {
+                return true;
+            }
+            if self.drained(shared, own) || Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(DRAIN_POLL);
+        }
+    }
+
+    /// Answer `request_ownership` (README.md §6.5): an owner whose preference is `yield`, or whose
+    /// handle is read-only, yields to the first requester while it is serving.
+    fn request_ownership(self: &Arc<Self>, conn: &ServerConn) -> Message {
+        let reply = |status| Message::OwnershipReply(OwnershipReply { status });
+        let mut handoff = self.handoff.lock().expect("handoff lock poisoned");
+        if handoff.state == OwnerState::Yielding && handoff.requester == Some(conn.id) {
+            return reply(OWNERSHIP_YIELDING);
+        }
+        if handoff.state != OwnerState::Serving
+            || (self.preference != Ownership::Yield && !self.read_only)
+        {
+            return reply(OWNERSHIP_REFUSED);
+        }
+        handoff.state = OwnerState::Yielding;
+        handoff.requester = Some(conn.id);
+        handoff.draining = true;
+        drop(handoff);
+        let owner = Arc::clone(self);
+        let requester = conn.id;
+        thread::spawn(move || owner.yield_to(requester));
+        reply(OWNERSHIP_YIELDING)
+    }
+
+    /// Run an accepted ownership request: notice, drain for the yield grace, then release ownership
+    /// and re-elect as a paused client — or, when the requester disconnected first, cancel
+    /// (README.md §6.5).
+    fn yield_to(self: Arc<Self>, requester: u64) {
+        self.broadcast(NOTICE_YIELD_BEGUN, requester);
+        let Some(shared) = self.shared.upgrade() else {
+            self.end_drain();
+            return;
+        };
+        if self.drain(&shared, self.limits.yield_grace, true, Some(requester)) {
+            self.cancel_yield(&shared);
+            return;
+        }
+        shared.yield_ownership(&self);
+    }
+
+    /// Resume serving after the requester disconnected: notice, admit again, and answer the parked
+    /// begins.
+    fn cancel_yield(self: &Arc<Self>, shared: &Shared) {
+        self.broadcast(NOTICE_YIELD_CANCELLED, 0);
+        {
+            let mut handoff = self.handoff.lock().expect("handoff lock poisoned");
+            if handoff.state == OwnerState::Yielding {
+                handoff.state = OwnerState::Serving;
+            }
+            handoff.requester = None;
+        }
+        self.end_drain();
+        for conn in self.connections() {
+            let mut state = conn.state.lock().expect("connection state lock poisoned");
+            for parked in std::mem::take(&mut state.parked) {
+                match parked {
+                    Parked::Read(request_id, m) => {
+                        match shared.page_service_begin_read(
+                            &mut state.pins,
+                            &m.incarnation,
+                            m.last_txid,
+                        ) {
+                            Some(begun) => {
+                                conn.send(request_id, &Message::ReadBegun(begun));
+                            }
+                            None => conn.hang_up(),
+                        }
+                    }
+                    Parked::Write(request_id, m) => {
+                        let owner = Arc::clone(self);
+                        let waiter = Arc::clone(&conn);
+                        thread::spawn(move || owner.wait_for_gate(waiter, request_id, m));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A serving owner's close (README.md §6.5): notice, then drain its clients' transactions for
+    /// the shutdown grace. The caller then releases ownership.
+    pub(crate) fn close_gracefully(&self, shared: &Shared) {
+        self.handoff.lock().expect("handoff lock poisoned").state = OwnerState::Closing;
+        self.end_drain();
+        if self.accept.lock().expect("accept lock poisoned").is_none() {
+            return;
+        }
+        self.broadcast(NOTICE_SHUTDOWN_BEGUN, 0);
+        self.drain(shared, self.limits.shutdown_grace, false, None);
+    }
+
+    /// Release presence EX (the end of a release, after the endpoint and record are removed).
+    pub(crate) fn release_presence(&self) {
+        drop(self.coord.lock().expect("coordinator lock poisoned").take());
     }
 
     /// Reopen the read handle after compaction replaced the file. The caller holds the writer gate
@@ -547,16 +861,16 @@ impl PageServiceOwner {
         Ok(())
     }
 
-    /// Stop serving: no new connections, every client sees EOF (releasing its pins and the gate),
-    /// and the endpoint and owner record are removed. The caller still holds presence EX. A client
-    /// commit past its point of no return finishes first (its serve thread is joined).
+    /// Stop serving: no new connections, and every client sees EOF (releasing its pins and the
+    /// gate). A client commit past its point of no return finishes first (its serve thread is
+    /// joined). The caller still holds presence EX; [`remove_serving`](Self::remove_serving) follows.
     pub(crate) fn shutdown(&self) {
         self.gate.close();
-        let (streams, threads) = {
+        let (conns, threads) = {
             let mut conns = self.conns.lock().expect("connections lock poisoned");
             conns.closed = true;
             (
-                conns.open.drain().map(|(_, s)| s).collect::<Vec<_>>(),
+                conns.open.values().cloned().collect::<Vec<_>>(),
                 std::mem::take(&mut conns.threads),
             )
         };
@@ -566,12 +880,16 @@ impl PageServiceOwner {
             let _ = UnixStream::connect(path);
             join_unless_current(accept);
         }
-        for stream in streams {
-            let _ = stream.shutdown(Shutdown::Both);
+        for conn in conns {
+            conn.hang_up();
         }
         for thread in threads {
             join_unless_current(thread);
         }
+    }
+
+    /// Remove the endpoint and the owner record, while presence EX is still held.
+    pub(crate) fn remove_serving(&self) {
         if let Some(path) = &self.endpoint {
             let _ = std::fs::remove_file(path);
         }
@@ -586,8 +904,8 @@ impl PageServiceOwner {
         {
             let mut conns = self.conns.lock().expect("connections lock poisoned");
             conns.closed = true;
-            for stream in conns.open.values() {
-                let _ = stream.shutdown(Shutdown::Both);
+            for conn in conns.open.values() {
+                conn.hang_up();
             }
         }
         if let Some(path) = &self.endpoint {
@@ -598,27 +916,9 @@ impl PageServiceOwner {
 
     /// Run one connection until EOF or a protocol violation, then abort its write transaction
     /// (unless past the point of no return) and release its pins.
-    fn serve(self: Arc<Self>, id: u64, mut stream: UnixStream) {
-        let Ok(sender) = stream.try_clone() else {
-            return;
-        };
-        let conn = Arc::new(ServerConn {
-            id,
-            sender: Mutex::new(sender),
-            closed: AtomicBool::new(false),
-            state: Mutex::new(ConnState {
-                read_only: false,
-                pins: ConnPins::new(),
-                write: None,
-                waiting: false,
-                revoked: None,
-                closed: false,
-                idle_deadline: None,
-            }),
-            idle: Condvar::new(),
-            watchdog: Mutex::new(None),
-        });
-        if self.idle_timeout.is_some() {
+    fn serve_connection(self: Arc<Self>, conn: Arc<ServerConn>, mut stream: UnixStream) {
+        let id = conn.id;
+        if self.limits.idle_in_transaction.is_some() || self.limits.idle_session.is_some() {
             let owner = Arc::clone(&self);
             let watched = Arc::clone(&conn);
             *conn.watchdog.lock().expect("watchdog lock poisoned") =
@@ -644,6 +944,7 @@ impl PageServiceOwner {
         {
             let mut state = conn.state.lock().expect("connection state lock poisoned");
             state.closed = true;
+            state.parked.clear();
             if state.write.as_ref().is_some_and(|w| !w.finishing) {
                 self.abort_write_locked(shared.as_deref(), &mut state);
             }
@@ -689,6 +990,13 @@ impl PageServiceOwner {
             let reply = match message {
                 Message::BeginRead(m) => {
                     let mut state = conn.state.lock().expect("connection state lock poisoned");
+                    if !self.admitting() {
+                        // Parked while the owner drains (README.md §6.5).
+                        state.parked.push(Parked::Read(request_id, m));
+                        drop(state);
+                        drop(shared);
+                        continue;
+                    }
                     match shared.page_service_begin_read(
                         &mut state.pins,
                         &m.incarnation,
@@ -714,6 +1022,7 @@ impl PageServiceOwner {
                 Message::CommitPages(m) => self.commit_pages(&shared, conn, m),
                 Message::CommitEnd => self.commit_end(&shared, conn, request_id),
                 Message::Abort => self.abort(&shared, conn),
+                Message::RequestOwnership => Ok(Some(self.request_ownership(conn))),
                 Message::CommitStatus(m) => {
                     // A commit past its point of no return holds the commit lock until published.
                     drop(self.commit_lock.lock().expect("commit lock poisoned"));
@@ -775,6 +1084,30 @@ impl PageServiceOwner {
         }
         if self.read_only {
             flags |= HELLO_OK_FLAG_OWNER_READ_ONLY;
+        }
+        if self.preference == Ownership::Yield {
+            flags |= HELLO_OK_FLAG_OWNER_YIELDS;
+        }
+        let limit = self.limits.max_connections;
+        if limit > 0
+            && self
+                .conns
+                .lock()
+                .expect("connections lock poisoned")
+                .open
+                .len()
+                > limit
+        {
+            conn.fail(
+                request_id,
+                &EngineError::new(
+                    SqlState::TooManyConnections,
+                    format!(
+                        "the database owner already serves its maximum number of connections ({limit})"
+                    ),
+                ),
+            );
+            return false;
         }
         conn.send(
             request_id,
@@ -862,6 +1195,11 @@ impl PageServiceOwner {
             return Ok(Some(idle_revoked()));
         }
         state.waiting = true;
+        if !self.admitting() {
+            // Parked while the owner drains (README.md §6.5); a cancelled yield starts the wait.
+            state.parked.push(Parked::Write(request_id, m));
+            return Ok(None);
+        }
         let owner = Arc::clone(self);
         let waiter = Arc::clone(conn);
         thread::spawn(move || owner.wait_for_gate(waiter, request_id, m));
@@ -908,37 +1246,66 @@ impl PageServiceOwner {
         conn.send(request_id, &Message::WriteBegun(begun));
     }
 
-    /// Restart the idle-in-transaction timer on every received frame.
+    /// Restart the idle-in-transaction and idle-session timers on every received frame.
     fn touch(&self, conn: &ServerConn) {
         let mut state = conn.state.lock().expect("connection state lock poisoned");
         if state.write.as_ref().is_some_and(|w| !w.finishing) {
             self.arm_idle(conn, &mut state);
         }
+        self.arm_session(conn, &mut state);
     }
 
     fn arm_idle(&self, conn: &ServerConn, state: &mut ConnState) {
-        if let Some(timeout) = self.idle_timeout {
+        if let Some(timeout) = self.limits.idle_in_transaction {
             state.idle_deadline = Some(Instant::now() + timeout);
             conn.idle.notify_all();
         }
     }
 
+    /// (Re)start the idle-session timer (page-service.md §11.1).
+    fn arm_session(&self, conn: &ServerConn, state: &mut ConnState) {
+        if let Some(timeout) = self.limits.idle_session {
+            state.session_deadline = Some(Instant::now() + timeout);
+            conn.idle.notify_all();
+        }
+    }
+
     /// The connection's idle watchdog: revoke a write transaction that received nothing for the
-    /// idle-in-transaction timeout (page-service.md §11.1).
+    /// idle-in-transaction timeout, and close a connection idle between transactions for the
+    /// idle-session timeout, without an error frame (page-service.md §11.1).
     fn watch_idle(&self, conn: Arc<ServerConn>) {
         let mut state = conn.state.lock().expect("connection state lock poisoned");
         loop {
             if state.closed {
                 return;
             }
-            let Some(deadline) = state.idle_deadline else {
+            let now = Instant::now();
+            if let Some(deadline) = state.session_deadline
+                && now >= deadline
+            {
+                let busy = !state.pins.is_empty()
+                    || state.write.is_some()
+                    || state.waiting
+                    || !state.parked.is_empty();
+                if busy {
+                    self.arm_session(&conn, &mut state);
+                } else {
+                    state.session_deadline = None;
+                    conn.hang_up();
+                }
+                continue;
+            }
+            let next = match (state.idle_deadline, state.session_deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let Some(deadline) = next else {
                 state = conn
                     .idle
                     .wait(state)
                     .expect("connection state lock poisoned");
                 continue;
             };
-            let now = Instant::now();
             if now < deadline {
                 state = conn
                     .idle
@@ -1146,16 +1513,18 @@ impl PageServiceOwner {
             state.write = None;
         }
         drop(commit);
-        if self.hang_up_next_ack.swap(false, Ordering::AcqRel) {
-            conn.hang_up();
-        } else {
-            conn.send(
-                request_id,
-                &Message::Committed(Committed { txid: delta.txid }),
-            );
+        match self.next_ack.swap(ACK_NORMAL, Ordering::AcqRel) {
+            ACK_HANG_UP => conn.hang_up(),
+            ACK_CRASH => std::process::exit(70),
+            _ => {
+                conn.send(
+                    request_id,
+                    &Message::Committed(Committed { txid: delta.txid }),
+                );
+            }
         }
-        if shared.adopt_foreign().is_ok() {
-            shared.maintenance_commit();
+        if shared.adopt_foreign(self).is_ok() {
+            shared.maintenance_commit(self);
         }
         self.gate.release();
         Ok(None)

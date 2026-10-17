@@ -1,6 +1,6 @@
 schema_version = 1
-name = "service-owner-exit-and-reelection"
-description = "Page service: a client whose owner dies fails with 08006 (no promotion until phase 4); presence is released by process death, so the next opener is elected owner."
+name = "service-owner-exit-and-promotion"
+description = "Page service phase 4: when the owner dies, its client promotes itself to owner at once and carries on; a transaction open across the change fails 08006 at its next statement, and the next opener is a client of the promoted owner."
 requires = ["file.page_service"]
 
 [[step]]
@@ -25,7 +25,16 @@ argument = "open-service"
 
 [[step]]
 actor = "b"
-command = "query_i64"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "read_open"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
 sql = "SELECT id FROM t ORDER BY id"
 expect = "1,2,3"
 
@@ -33,32 +42,59 @@ expect = "1,2,3"
 actor = "a"
 command = "kill"
 
+# The open read transaction began under the lost connection.
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect_error = "08006"
+# The client notices the lost connection asynchronously.
+retry_ms = 2000
+
+[[step]]
+actor = "b"
+command = "read_close"
+
+# Autocommit statements run under the new role: b promoted itself.
 [[step]]
 actor = "b"
 command = "query_i64"
 sql = "SELECT id FROM t ORDER BY id"
-expect_error = "08006"
+expect = "1,2,3"
 
 [[step]]
 actor = "b"
-command = "close"
-
-# The killed owner's presence lock died with it: the next opener is the owner and can write.
-[[step]]
-actor = "b"
-command = "start"
-argument = "open-service"
+command = "role"
+expect = "owner"
 
 [[step]]
 actor = "b"
 command = "exec"
 sql = "INSERT INTO t VALUES (4)"
 
-# And the first core, opening again, is now a client of it.
+[[step]]
+actor = "b"
+command = "read_open"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3,4"
+
+[[step]]
+actor = "b"
+command = "read_close"
+
 [[step]]
 actor = "a"
 command = "start"
 argument = "open-service"
+
+[[step]]
+actor = "a"
+command = "role"
+expect = "client"
 
 [[step]]
 actor = "a"

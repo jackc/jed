@@ -63,7 +63,7 @@ A client may pipeline: it may send further requests before earlier replies arriv
 
 [messages.toml](messages.toml) is the catalog. Request codes are `0x01`–`0x3F`, reply codes
 `0x40`–`0x7D`, and `0x7E`/`0x7F` are `notice` and `error`. A message's `phase` is the
-page-service.md §16 phase that first uses it. Phases 2 and 3 have landed. **Messages of phases not
+page-service.md §16 phase that first uses it. Phases 2, 3, and 4 have landed. **Messages of phases not
 yet landed are provisional: the phase that lands them may revise their bodies.** The protocol version stays **1** until the first
 release that ships the page service; after that, any change to a landed message needs a new version.
 
@@ -80,7 +80,8 @@ The first frame on a connection, and only the first, is `hello`; any other first
   from the file's, it replies `error` `0A000` (fatal) with the supported versions in the detail.
 - `hello_ok`: `protocol u16`, `format_version u16`, `page_size u32`, `connection_id u64` (unique
   among this owner's connections; never 0), `flags u8` (bit 0: the connection is read-only; bit 1:
-  the owner's own handle is read-only; bits 2–7 are 0), `max_read_pages u32`, the most indices one
+  the owner's own handle is read-only; bit 2: the owner's ownership preference is `yield`, §6.5; bits 3–7
+  are 0), `max_read_pages u32`, the most indices one
   `read_pages` may name: `min(1024, floor((max_frame_length − 9) / page_size))`.
 
 `page` fields in either direction are decoded with this connection's `page_size`. A client whose
@@ -89,8 +90,7 @@ closes the connection.
 
 A connection is read-only exactly when the client asked for it (bit 0 of `hello`'s `flags`; a client
 whose own handle is read-only asks). An owner whose own handle is read-only reports it in bit 1 and
-answers `begin_write` with `25006` (phase 4 hands ownership to the writer instead, page-service.md
-§8.2).
+answers `begin_write` with `25006`; a writing client then asks it for ownership instead (§6.5).
 
 ### 3.2 `begin_read` → `read_begun` (phase 2)
 
@@ -200,19 +200,25 @@ resolution window (§4): 0 when the window holds `txid` with this digest, 1 when
 another digest or `txid` is above the committed `txid`, 2 otherwise. A commit's `digest` is CRC-64/ECMA-182
 (the validated-COW manifest CRC, initial value 0) of the complete meta page the commit published.
 
-### 3.6 Ownership, backup, replication (phases 4–7, provisional)
+### 3.6 Ownership (phase 4); backup and replication (phases 6–7, provisional)
 
 | Message | Body | Reply |
 |---|---|---|
-| `request_ownership` | empty | `ownership_reply`: `status u8` (0 the owner is yielding, 1 refused) |
+| `request_ownership` | empty | `ownership_reply`: `status u8` (0 the owner is yielding to this connection, 1 refused) |
 | `snapshot_stream` | reserved (phase 6) | — |
 | `subscribe` | reserved (phase 7) | — |
+
+`request_ownership` asks the owner to yield (page-service.md §8.2; the rules are §6.5). It is
+answered at once; a connection that requests again while the owner is yielding to it is answered 0
+again, and any other request during a yield or a close is refused. It needs no write transaction
+and is allowed on a read-only connection.
 
 ### 3.7 `notice` and `error`
 
 - `notice` (owner → client, `request_id` 0): `kind u8`, `connection_id u64`. Kinds: `1` yield begun,
   naming the requester's connection; `2` yield cancelled; `3` shutdown begun. Unused
-  `connection_id` is 0. Phase 4.
+  `connection_id` is 0. A notice answers no request; a client acts on it as §6.5 says and otherwise
+  ignores it, and a notice of an unknown kind is ignored. Phase 4.
 - `error`: `sqlstate sqlstate`, `message string`, `detail string`, `flags u8` (bit 0: fatal — the
   owner closes the connection after this frame; bits 1–7 are 0). It answers the request whose
   `request_id` it carries. A protocol violation is answered with a fatal `08P01` carrying the
@@ -283,9 +289,9 @@ checks it on `connect`, so only processes of the owner's user can connect (page-
 
 Windows serving is not yet specified (page-service.md §14): `locking = service` fails `0A000` there.
 
-## 6. Roles under `locking = service` (phases 2–3)
+## 6. Roles under `locking = service` (phases 2–4)
 
-The behavior every core implements for the read and write paths. It is host state, so the real-process corpus
+The behavior every core implements for the read path, the write path, and handoff. It is host state, so the real-process corpus
 (`spec/conformance/process/`) and the corpus-through-a-client run (§7) check it, not byte fixtures.
 
 ### 6.1 Election at open
@@ -304,9 +310,12 @@ The behavior every core implements for the read and write paths. It is host stat
 3. On timeout fail `55006` naming the path, adding "owned by another user's process" or "owned by a
    non-serving process" when the last record read said so.
 
+An opener whose ownership preference is `never` (§6.5) skips the `presence EX` try and fails `55006`
+when no owner answers. A `hello` refused with `53300` (the owner's connection limit, §6.5) fails the
+open at once, like `0A000`.
+
 `create` under `locking = service` takes `presence EX` with the exclusive acquisition loop and is the
-owner. There is no promotion before phase 4: a client whose owner exits fails every later request
-with `08006` until it is reopened. File attachments do not support `locking = service` yet (`0A000`);
+owner, whatever its ownership preference. A client whose owner exits re-elects (§6.5). File attachments do not support `locking = service` yet (`0A000`);
 the cross-owner gate order of page-service.md §5.5 lands with them.
 
 ### 6.2 The owner
@@ -322,9 +331,9 @@ the cross-owner gate order of page-service.md §5.5 lands with them.
   in-commit reclamation, and compaction (`55006` while any client pins) exactly as local readers do.
 - Pages are read from the file at their index; the owner may use a separate read handle so a page
   read never waits for its own commit's barrier. Compaction resets the window (§4).
-- It answers ownership and reserved requests with a fatal `08P01`.
-- On close it stops accepting, closes every connection (clients see EOF), and removes its endpoint
-  and owner record before releasing `presence`.
+- It answers `request_ownership` as §6.5 says, and reserved requests with a fatal `08P01`.
+- On close it drains (§6.5), stops accepting, closes every connection (clients see EOF), and removes
+  its endpoint and owner record before releasing `presence`.
 
 ### 6.3 The client
 
@@ -375,8 +384,8 @@ the cross-owner gate order of page-service.md §5.5 lands with them.
   with that error and the handle stays usable unless the connection is lost. A connection lost after
   `commit_end` was written: the client reconnects to whichever process owns the database (the owner
   record) until its open timeout and asks `commit_status`. Committed: the commit succeeds; not
-  committed: it fails `08006`; unknown, or no owner answered: `08007`. The lost connection stays lost
-  (`08006` for every later request) until the handle is reopened (promotion is phase 4).
+  committed: it fails `08006`; unknown, or no owner answered: `08007`. Phase 4 runs this search as the
+  re-election of §6.5.
 - **Rollback.** A write transaction that ends without a commit reaching the owner sends `abort`.
 - **Owner publication of a client commit.** At the point of no return the owner writes and syncs the
   meta, then, under the lock that orders pins against publication, records the new page count and
@@ -398,6 +407,121 @@ the cross-owner gate order of page-service.md §5.5 lands with them.
 - **Test hook.** Each core exposes a test-only call that makes a serving owner drop the connection
   instead of acknowledging its next client commit, after the commit is durable, so the real-process
   corpus can exercise `commit_status` resolution.
+
+### 6.5 Handoff (phase 4)
+
+How ownership moves between processes (page-service.md §8): promotion when the owner leaves,
+yielding to a preferred process, the graceful close, and the owner's limits.
+
+**Options.** Every opener has an ownership preference (page-service.md §8.2): `prefer` (the
+default), `yield`, or `never`. An owner reads its limits from its own handle's options (§11.1):
+
+| Option | Default | Meaning |
+|---|---|---|
+| yield grace | 5000 ms | how long a yielding owner lets running transactions finish |
+| shutdown grace | 30000 ms | the same, for a graceful close |
+| idle-session timeout | 0 (off) | a connection idle this long between transactions is closed |
+| maximum connections | 0 (unlimited) | further `hello`s are refused with `53300` |
+| idle-in-transaction timeout | 60000 ms | §6.4 |
+
+A client keeps its limits for the day it becomes owner. A `0` turns a timeout off.
+
+**Roles change between transactions.** A process's role (owner or client) changes by promotion,
+reconnection, or yielding. Each change installs fresh storage for the main database: a new connection
+and an empty page cache for a client (reusing the cache is a later optimization), the local file for an
+owner. Every transaction begun under the previous role (an explicit read or write block, a read-only
+session's pinned snapshot) fails `08006` at its next statement and at `COMMIT`, without publishing; a
+`ROLLBACK` succeeds. A cursor of the old role that reads only cached pages may finish; any page it would
+fetch fails `08006`. Autocommit statements and transaction begins run on the current role. A role
+change never waits for the old role's transactions: their commits check the role, under the lock that
+orders commits, before they write.
+
+**Re-election.** A client whose connection ends (end of stream, a write or read error, or a fatal
+error frame) re-elects: it runs the §6.1 loop again under its open timeout (it keeps its process-local
+path claim). It starts at once where the core can work in the background (Go and Rust; TS on its
+event loop when the engine thread is idle) and at the latest at the next transaction begin. While it
+runs, a transaction begin waits for it. It ends in one of three ways:
+
+- **Promotion.** The client takes `presence EX` (it skips the try when its preference is `never`, or
+  while a handoff pauses it, below). Under `arrival SH` it validates the marker, as at open, then opens
+  the file as an owner opening it does: recovery, and the stabilization a writable handle performs
+  (validated-cow.md §3). It draws a new incarnation, records the committed meta, seeds its windows from
+  the recovered meta slots (§4), writes the owner record, and binds and serves (§6.2). Its committed
+  state becomes the recovered one.
+- **Reconnection.** It connects to the owner the record names and completes `hello`. Its next begin
+  sends the new owner an incarnation it does not know, so the whole cache is invalidated (§3.2).
+- **Failure.** The open timeout passes with neither. Every request fails `08006`; the next
+  transaction begin re-elects again.
+
+A transaction begin (`begin_read` or `begin_write`) that fails `08006` because the connection ended
+before the begin was answered had not started a transaction: the client re-elects and sends the begin
+again under its new role. So does a begin sent while a draining owner leaves it unanswered (below). A
+client whose transactions were all between requests continues transparently.
+
+**Resolving a lost commit.** The §6.4 search for an unacknowledged commit is this re-election. If it
+promotes the client, the client answers its own question from its resolution window, as an owner
+answers `commit_status`. If it reconnects, the client asks the new owner. If it fails, the commit fails
+`08007`. A commit resolved as committed is durable, but the process does not publish its own copy of
+it: its new role's committed state (the recovered or reconnected one) already holds it.
+
+**Asking for ownership.** A client sends `request_ownership` in two cases:
+
+1. Its preference is `prefer` and the owner's `hello_ok` reports a `yield` preference (bit 2). It
+   sends the request right after `hello`, at open and after each reconnection, and does not wait for
+   the outcome.
+2. A write transaction begins while the owner is read-only (`hello_ok` bit 1). Unless its preference is `never`, or
+   this user cannot open the file read-write (the client opens it read-write and closes it unused,
+   before asking), it requests ownership and waits for the handoff under its session's
+   `lock_timeout_ms` (`55P03` on expiry; `0` waits without a deadline). When the wait ends with this
+   process the owner, the write transaction begins as an owner's; when it ends with another owner, the
+   client sends `begin_write` to it. The two exceptions keep today's answer, `25006`.
+
+The owner answers 0 and yields when its preference is `yield` or its own handle is read-only, and it
+is neither yielding nor closing. It answers 1 otherwise, so two `prefer` processes never yield to each
+other.
+
+**Yield.** An owner that answered 0:
+
+1. Sends `notice` kind 1, naming the requester's connection, to every connection.
+2. Drains (below) for its yield grace.
+3. Releases ownership (below) and re-elects as a client, paused (below).
+
+If the requester's connection ends before step 3, the owner cancels the yield: it sends `notice` kind 2
+to every connection, admits transactions again, and answers the begins it left unanswered.
+
+**Handoff pause.** A client that receives `notice` kind 1 naming another connection, and the yielding
+owner itself, skips its `presence EX` tries for **2000 ms** after its connection ends, so that the
+requester, which does not pause, takes ownership. During the pause the client still reconnects to any
+owner the record names. `notice` kind 2 lifts the pause. If the requester dies after the release, the
+pause expires and ordinary re-election picks an owner.
+
+**Draining.** A draining owner stops admitting transactions. Its own sessions' transaction begins wait
+until the drain ends and then run under the process's role at that point. A client's `begin_read` or
+`begin_write` is left unanswered; the connection keeps serving that client's other requests, so its open
+transactions can finish. Running transactions are the owner's own (its reader pins and its writer) and
+every connection's pins, write transaction, and commit. The drain ends when none is left or its grace
+has passed. A client commit past its point of no return always completes.
+
+**Releasing ownership.** The owner closes every connection (clients see end of stream, so their open
+transactions fail `08006`), waits for any client commit past its point of no return, and ends its own
+role: every transaction its sessions began fails `08006` at its next statement, an own commit already
+writing finishes first, and its storage refuses further access, so the process no longer reads or
+writes the file. It removes its endpoint and owner record, closes the file, and releases `presence`.
+
+**Graceful close.** Closing a serving owner sends `notice` kind 3 to every connection, drains for the
+shutdown grace, and releases ownership. Only its clients' transactions are waited for: the host closing
+the handle ends the owner's own sessions, as before. A client ignores kind 3; it re-elects when the
+connection ends.
+
+**Owner limits.** A connection with no pin, no write transaction, and no begin waiting for an answer
+that sends no frame for the idle-session timeout is closed without an error frame; its client
+re-elects as after any lost connection, so it reconnects (and may be closed again after the next idle
+period). When the owner already serves the maximum number of connections, a
+further `hello` is answered with a fatal `53300` (PostgreSQL's `too_many_connections`). The opener's
+election fails at once; a re-electing client keeps trying until its open timeout.
+
+**Test hook.** Each core exposes a test-only call that reports a handle's role: `owner`, `client`, or
+`none` (not under the page service). The real-process corpus uses it.
 
 ## 7. The corpus through a client
 

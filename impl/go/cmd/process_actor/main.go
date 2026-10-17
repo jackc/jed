@@ -27,16 +27,44 @@ func run() error {
 	if len(os.Args) < 3 {
 		return fmt.Errorf("usage: process_actor create|open PATH")
 	}
+	// Positional arguments after the path: the open timeout, then the page-service owner's
+	// idle-in-transaction timeout (spec/design/page-service.md §11.1). key=value arguments set the
+	// handoff options (spec/pageservice/README.md §6.5): ownership=prefer|yield|never, yield_grace,
+	// shutdown_grace, idle_session (milliseconds), max_connections.
 	timeout := uint64(5000)
-	if len(os.Args) > 3 {
-		timeout, _ = strconv.ParseUint(os.Args[3], 10, 64)
-	}
-	// The page-service owner's idle-in-transaction timeout (spec/design/page-service.md §11.1).
 	var idle *uint64
-	if len(os.Args) > 4 {
-		ms, _ := strconv.ParseUint(os.Args[4], 10, 64)
+	var positional []string
+	options := map[string]string{}
+	for _, arg := range os.Args[3:] {
+		if key, value, ok := strings.Cut(arg, "="); ok {
+			options[key] = value
+		} else {
+			positional = append(positional, arg)
+		}
+	}
+	if len(positional) > 0 {
+		timeout, _ = strconv.ParseUint(positional[0], 10, 64)
+	}
+	if len(positional) > 1 {
+		ms, _ := strconv.ParseUint(positional[1], 10, 64)
 		idle = &ms
 	}
+	millis := func(key string) *uint64 {
+		value, ok := options[key]
+		if !ok {
+			return nil
+		}
+		ms, _ := strconv.ParseUint(value, 10, 64)
+		return &ms
+	}
+	ownership := jed.OwnershipPrefer
+	switch options["ownership"] {
+	case "yield":
+		ownership = jed.OwnershipYield
+	case "never":
+		ownership = jed.OwnershipNever
+	}
+	maxConnections, _ := strconv.Atoi(options["max_connections"])
 	var db *jed.Database
 	var err error
 	if os.Args[1] == "owner-idle" {
@@ -54,9 +82,15 @@ func run() error {
 	}
 	readOnly := os.Args[1] == "open-service-read-only"
 	if os.Args[1] == "create" || os.Args[1] == "create-service" {
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle})
+		db, err = jed.CreateDatabase(jed.CreateOptions{
+			Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle,
+			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
+		})
 	} else {
-		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle, ReadOnly: readOnly})
+		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{
+			Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle, ReadOnly: readOnly,
+			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
+		})
 	}
 	if err != nil {
 		return err
@@ -120,6 +154,12 @@ func run() error {
 		case "HANGUP_NEXT_ACK":
 			// The commit-resolution test hook (spec/pageservice/README.md §6.4).
 			jed.HangUpNextPageServiceAckForTesting(db)
+		case "CRASH_NEXT_ACK":
+			// Exit instead of acknowledging the next client commit (spec/pageservice/README.md §6.5).
+			jed.CrashBeforeNextPageServiceAckForTesting(db)
+		case "ROLE":
+			// The page-service role test hook (spec/pageservice/README.md §6.5).
+			value = jed.PageServiceRoleForTesting(db)
 		case "TXID":
 			value = strconv.FormatUint(db.Txid(), 10)
 		case "PAGE_COUNT":

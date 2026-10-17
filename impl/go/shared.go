@@ -125,11 +125,16 @@ type sharedCore struct {
 	attachments     map[string]*attachment
 	attachmentCount atomic.Int64
 	coordinator     *fileCoordinator
-	// service is set on a page-service owner (page-service.md §4.1); client on a page client (§4.2).
-	// At most one is set, and only under the test-only LockingService.
-	service   *pageServiceOwner
-	client    *psClient
-	planEpoch atomic.Uint64
+	// handoff and role are set under the test-only LockingService (page-service.md §4, §8): role is the
+	// handle's current role — the owner, a page client, or neither between roles — replaced between
+	// transactions by pageservice_handoff.go. liveGen is the role generation the live registry belongs
+	// to (guarded by liveMu): a pin of an older role deregisters as a no-op. writerRole is the role the
+	// current writer took its gate under (guarded by writeMu).
+	handoff    *serviceHandoff
+	role       atomic.Pointer[serviceRole]
+	liveGen    uint64
+	writerRole *serviceRole
+	planEpoch  atomic.Uint64
 	// env is the handle's Environment (spec/design/environment.md), supplied in the create/open
 	// options (or a fresh empty one), shared (by pointer) into every minted session's sessionState and
 	// every attachment's snapshot. Never nil; immutable for the handle's lifetime.
@@ -138,23 +143,11 @@ type sharedCore struct {
 
 func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
 	c.writeMu.Lock()
-	if c.client != nil {
-		// A page client's writer takes the owner's gate (page-service.md §5.5).
-		if err := c.clientBeginWrite(timeoutMs); err != nil {
-			c.writeMu.Unlock()
-			return err
-		}
-		return nil
-	}
-	if c.service != nil {
-		// A page-service owner's writer shares the gate with client write transactions, then adopts
-		// any client commit published since its last transaction (page-service.md §5.5, §7).
-		if err := c.service.acquireGate(timeoutMs, nil); err != nil {
-			c.writeMu.Unlock()
-			return err
-		}
-		if err := c.adoptForeign(); err != nil {
-			c.service.releaseGate()
+	if c.handoff != nil {
+		// Under the page service a writer takes the owner's gate — its own, or through begin_write — and
+		// an owner then adopts any client commit published since its last transaction (page-service.md
+		// §5.5, §7).
+		if err := c.beginServiceWrite(timeoutMs); err != nil {
 			c.writeMu.Unlock()
 			return err
 		}
@@ -213,10 +206,8 @@ func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
 }
 
 func (c *sharedCore) releaseWriter() {
-	if c.client != nil {
-		c.clientEndWrite()
-	} else if c.service != nil {
-		c.service.releaseGate()
+	if c.handoff != nil {
+		c.releaseServiceWrite()
 	}
 	for i := len(c.heldCoordinators) - 1; i >= 0; i-- {
 		c.heldCoordinators[i].unlockWriter()
@@ -242,7 +233,7 @@ func (c *sharedCore) writableCoordinators() []*fileCoordinator {
 }
 
 func (c *sharedCore) hasSharedCoordinator() bool {
-	if c.client != nil || c.service != nil {
+	if c.handoff != nil {
 		return true
 	}
 	if c.coordinator != nil && c.coordinator.lease() == leaseShared {
@@ -289,13 +280,10 @@ func (c *sharedCore) attachment(name string) *attachment {
 }
 
 func (c *sharedCore) refreshShared() error {
-	if c.service != nil {
-		return c.adoptForeign()
-	}
-	if c.client != nil {
+	if c.handoff != nil {
 		// A page client refreshes only at a read begin that pins a local reader (refreshAndPin): a
 		// begin_read pin taken here would have no reader to keep it (spec/pageservice/README.md §6.3).
-		return nil
+		return c.adoptForeign(c.pageOwner())
 	}
 	if !c.hasSharedCoordinator() {
 		return nil
@@ -703,6 +691,9 @@ type budgetCtx struct {
 	// stagesRows is whether the commit stages any record version; one that stages none and does not
 	// grow the catalog is admitted over the limit (the repair exemption, memory.md §8.3).
 	stagesRows bool
+	// guard, when set, is checked under storage.mu before the commit writes anything: a page-service
+	// commit fails 08006 when the handle's role changed since its transaction began (README.md §6.5).
+	guard func() error
 }
 
 // budgetDomain is one dirtied attachment's working snapshot, as precheckBudgets takes it.
@@ -729,8 +720,16 @@ func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 	//     page dead at generation G is only safe to overwrite once no reader pins a version older than G.
 	// Both consult the SAME registry; single-handle / all-readers-current keeps oldest_live == committed, so
 	// both hold and the behavior (and on-disk bytes) are identical to an ungated commit.
-	if c.client != nil {
-		return c.persistClient(snap, stagesRows)
+	var guard func() error
+	if c.handoff != nil {
+		r := c.writerRole
+		if r == nil || r.client == nil && r.owner == nil {
+			return errStaleRole()
+		}
+		if r.client != nil {
+			return c.persistClient(snap, stagesRows, r)
+		}
+		guard = c.roleGuard(r)
 	}
 	oldest := c.oldestLiveVersion(snap.txid)
 	shared := c.coordinator != nil && c.coordinator.lease() == leaseShared
@@ -741,6 +740,7 @@ func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 		prev:       c.roots.Load().committed,
 		canCompact: c.canCompactCommitted(),
 		stagesRows: stagesRows,
+		guard:      guard,
 	}
 	if shared && c.storage.path != "" {
 		err := c.storage.commitShared(snap, c.coordinator, budget)
@@ -757,13 +757,18 @@ func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 // list only under the owner's reuse grant, and never compacting for its storage budget. The store's
 // sync sends the CommitDelta. A failure after which the owner certainly did not commit leaves the
 // pager usable; any other (the outcome unknown) keeps it poisoned until reopen.
-func (c *sharedCore) persistClient(snap *snapshot, stagesRows bool) error {
-	budget := &budgetCtx{name: "main", prev: c.roots.Load().committed, stagesRows: stagesRows}
-	err := c.storage.commitDurable(snap, false, c.client.reuseGrant, budget)
+func (c *sharedCore) persistClient(snap *snapshot, stagesRows bool, r *serviceRole) error {
+	budget := &budgetCtx{name: "main", prev: c.roots.Load().committed, stagesRows: stagesRows, guard: c.roleGuard(r)}
+	err := c.storage.commitDurable(snap, false, r.client.reuseGrant, budget)
 	if err == nil {
 		return nil
 	}
-	_ = c.storage.paging.withPager(func(p *pager) error {
+	// A lost acknowledgement: the outcome is resolved by re-election (README.md §6.5).
+	var lost *psCommitLost
+	if errors.As(err, &lost) {
+		return c.resolveLostCommit(r, lost)
+	}
+	_ = r.paging.withPager(func(p *pager) error {
 		if store, ok := p.store.(*serviceBlockStore); ok {
 			store.discard()
 		}
@@ -775,7 +780,7 @@ func (c *sharedCore) persistClient(snap *snapshot, stagesRows bool) error {
 		}
 		return nil
 	})
-	c.storage.paging.pool.invalidateAll()
+	r.paging.pool.invalidateAll()
 	return err
 }
 
@@ -861,6 +866,11 @@ func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator, bu
 func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budget *budgetCtx) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if budget != nil && budget.guard != nil {
+		if err := budget.guard(); err != nil {
+			return err
+		}
+	}
 	if st.path != "" {
 		if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
 			return err
@@ -1216,49 +1226,43 @@ func (c *sharedCore) oldestLiveVersion(newTxid uint64) uint64 {
 // version the writer's watermark had already judged free to reclaim. The caller deregisters via
 // deregisterPin (idiomatically on Session.Close / cursor Close). Publish (roots.Store) takes the same
 // lock, so a reader either sees the new committed and pins it, or is counted at the old version.
-func (c *sharedCore) pinLatest() (*roots, uint64) {
+func (c *sharedCore) pinLatest() (*roots, uint64, uint64) {
 	c.liveMu.Lock()
 	defer c.liveMu.Unlock()
 	rt := c.roots.Load()
 	v := rt.committed.txid
 	c.live[v]++
-	return rt, v
+	return rt, v, c.liveGen
 }
 
 // refreshAndPin is a read begin: refresh against other processes (shared mode's meta refresh, or a
 // page client's begin_read), then pin the latest committed version for a local reader. A page client's
 // begin_read pin stays reserved until the local pin is registered, so no concurrent reader's end can
 // release it in between (spec/pageservice/README.md §6.3).
-func (c *sharedCore) refreshAndPin() (*roots, uint64, error) {
-	if c.client == nil {
-		if err := c.refreshShared(); err != nil {
-			return nil, 0, err
-		}
-		rt, v := c.pinLatest()
-		return rt, v, nil
+func (c *sharedCore) refreshAndPin() (*roots, uint64, uint64, error) {
+	if c.handoff != nil {
+		return c.beginServiceRead()
 	}
-	reserved, err := c.clientRefresh()
-	if err != nil {
-		return nil, 0, err
+	if err := c.refreshShared(); err != nil {
+		return nil, 0, 0, err
 	}
-	c.liveMu.Lock()
-	defer c.liveMu.Unlock()
-	rt := c.roots.Load()
-	v := rt.committed.txid
-	c.live[v]++
-	c.client.unreserve(reserved)
-	return rt, v, nil
+	rt, v, gen := c.pinLatest()
+	return rt, v, gen, nil
 }
 
-// deregisterPin drops one reader pin on version v (the inverse of pinLatest / the per-query pin),
-// advancing the watermark when the last pin at v closes.
-func (c *sharedCore) deregisterPin(v uint64) {
+// deregisterPin drops one reader pin on version v registered under role generation gen (the inverse of
+// pinLatest / the per-query pin), advancing the watermark when the last pin at v closes. A pin of an
+// older page-service role is gone already: the role change started an empty registry.
+func (c *sharedCore) deregisterPin(gen, v uint64) {
 	c.liveMu.Lock()
 	defer c.liveMu.Unlock()
+	if gen != c.liveGen || c.live[v] == 0 {
+		return
+	}
 	if c.live[v]--; c.live[v] <= 0 {
 		delete(c.live, v)
-		if c.client != nil {
-			c.client.releasePin(v)
+		if cl := c.pageClient(); cl != nil {
+			cl.releasePin(v)
 		}
 	}
 }
@@ -1638,9 +1642,15 @@ type CreateOptions struct {
 	Locking   Locking
 	// nil is the 5s default; &0 requests one immediate acquisition attempt.
 	FileLockTimeoutMs *uint64
-	// IdleInTransactionTimeoutMs is OpenOptions.IdleInTransactionTimeoutMs for a creator that becomes
-	// the page-service owner.
+	// IdleInTransactionTimeoutMs, IdleSessionTimeoutMs, YieldGraceMs, ShutdownGraceMs, MaxConnections,
+	// and Ownership are the OpenOptions fields of the same names, for a creator under the page service:
+	// it is the owner, and keeps them for later roles.
 	IdleInTransactionTimeoutMs *uint64
+	IdleSessionTimeoutMs       *uint64
+	YieldGraceMs               *uint64
+	ShutdownGraceMs            *uint64
+	MaxConnections             int
+	Ownership                  Ownership
 	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
 	// time-zone data, the host functions, and the random + clock sources, shared by every session,
 	// attachment, and temp domain of the handle. Not stored in the file — a host reopens with its own.
@@ -1684,7 +1694,20 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		return nil, err
 	}
 	if opts.Locking == LockingService {
-		return startServiceOwner(e, coordinator, path, opts.MaxStorageBytes, idleInTransactionTimeoutMs(opts.IdleInTransactionTimeoutMs))
+		openOpts := OpenOptions{
+			SkipFsync:                  opts.SkipFsync,
+			Locking:                    LockingService,
+			FileLockTimeoutMs:          opts.FileLockTimeoutMs,
+			IdleInTransactionTimeoutMs: opts.IdleInTransactionTimeoutMs,
+			IdleSessionTimeoutMs:       opts.IdleSessionTimeoutMs,
+			YieldGraceMs:               opts.YieldGraceMs,
+			ShutdownGraceMs:            opts.ShutdownGraceMs,
+			MaxConnections:             opts.MaxConnections,
+			Ownership:                  opts.Ownership,
+			Environment:                env,
+			MaxStorageBytes:            opts.MaxStorageBytes,
+		}
+		return startServiceOwner(e, coordinator, newServiceHandoff(osLocks, path, openOpts))
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
@@ -2011,7 +2034,7 @@ func (db *Database) Compact(name string) error {
 	if readOnly {
 		return newError(ReadOnlySqlTransaction, `cannot compact read-only database "`+name+`"`)
 	}
-	if c.client != nil && lname == "main" {
+	if c.pageClient() != nil && lname == "main" {
 		// Compaction is an owner operation (page-service.md §6).
 		return newError(ObjectInUse, `cannot compact database "`+name+`" while another process has it open`)
 	}
@@ -2020,13 +2043,17 @@ func (db *Database) Compact(name string) error {
 		return newError(ObjectInUse, `cannot compact database "`+name+`" while a write transaction is open`)
 	}
 	defer c.writeMu.Unlock()
-	if c.service != nil {
+	if c.handoff != nil && lname == "main" {
 		// The owner's gate is shared with client write transactions (page-service.md §6).
-		if !c.service.tryGate() {
+		o := c.pageOwner()
+		if o == nil {
+			return newError(ObjectInUse, `cannot compact database "`+name+`" while another process has it open`)
+		}
+		if !o.tryGate() {
 			return newError(ObjectInUse, `cannot compact database "`+name+`" while a write transaction is open`)
 		}
-		defer c.service.releaseGate()
-		if err := c.adoptForeign(); err != nil {
+		defer o.releaseGate()
+		if err := c.adoptForeign(o); err != nil {
 			return err
 		}
 	}
@@ -2082,8 +2109,8 @@ func (c *sharedCore) compactLocked(lname, name string) error {
 	}
 	if main {
 		c.roots.Store(&roots{committed: compacted, attached: rt.attached})
-		if c.service != nil {
-			if err := c.service.compacted(compacted.txid); err != nil {
+		if o := c.pageOwner(); o != nil {
+			if err := o.compacted(compacted.txid); err != nil {
 				return err
 			}
 		}
@@ -2167,7 +2194,7 @@ func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
 // by and never blocking a writer — and a write through it is 25006. The caller must Close it to
 // deregister (advancing the watermark), idiomatically `defer s.Close()`. (The old SharedDB.Read().)
 func (s *Database) ReadSession() *Session {
-	rt, v := s.core.pinLatest() // atomic load+register (transactions.md §8): no load→register gap
+	rt, v, gen := s.core.pinLatest() // atomic load+register (transactions.md §8): no load→register gap
 	snap := rt.committed
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
@@ -2176,7 +2203,7 @@ func (s *Database) ReadSession() *Session {
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
 	refresh := s.core.hasSharedCoordinator()
-	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpoch.Load()}
+	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, pinGen: gen, roleGen: gen, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpoch.Load()}
 }
 
 // WriteSession opens a READ WRITE session with an eager open write block (spec/design/session.md
@@ -2203,7 +2230,7 @@ func (s *Database) WriteSession() *Session {
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	_, _ = engine.beginTx(true, true)
-	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid, planEpoch: s.core.planEpoch.Load()}
+	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid, roleGen: s.core.writerGen(), planEpoch: s.core.planEpoch.Load()}
 }
 
 // Session mints an ADDITIONAL configured session over this database (spec/design/session.md
@@ -2217,13 +2244,13 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	// version in the watermark like a read session (atomic load+register, §8). A writable core mints the
 	// autocommit lazy-gate one — no persistent pin (each autocommit read pins per statement).
 	if s.core.readOnlyMode() {
-		rt, v := s.core.pinLatest()
+		rt, v, gen := s.core.pinLatest()
 		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts, s.core.env)}
 		engine.core = s.core
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
 		refresh := s.core.hasSharedCoordinator()
-		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpoch.Load()}
+		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, pinGen: gen, roleGen: gen, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpoch.Load()}
 	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
@@ -2294,10 +2321,13 @@ func (db *Database) UpgradeCollations() (int, error) {
 // methods autocommit, so there is never uncommitted work to discard. Idempotent.
 func (db *Database) Close() error {
 	c := db.core
-	if c.service != nil {
-		// Stop serving first: clients see EOF while presence EX is still held (page-service.md §4.1).
-		c.service.close()
-		c.service = nil
+	if c.handoff != nil {
+		// A serving owner drains its clients and stops serving while presence EX is still held; a client
+		// closes its connection (page-service.md §4.1; README.md §6.5).
+		if c.handoff.closed.Load() {
+			return nil
+		}
+		c.closeService()
 	}
 	c.writeMu.Lock()
 	if st := c.storage; st.paging != nil {
@@ -2358,6 +2388,10 @@ type Session struct {
 	pendingErr        error
 	refreshOnNextRead bool
 	planEpoch         uint64
+	// pinGen is the role generation pinVersion was registered under; roleGen is the page-service role
+	// generation the session's open transaction or pinned snapshot began under (README.md §6.5).
+	pinGen  uint64
+	roleGen uint64
 }
 
 // queryValues is the unexported raw (sql, []Value) -> *Rows seam this session's ergonomic
@@ -2385,6 +2419,11 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	if s.pendingErr != nil {
 		return nil, s.pendingErr
 	}
+	if stmt.Rollback == nil {
+		if err := s.staleRole(); err != nil {
+			return nil, err
+		}
+	}
 	if s.engine.session.tx == nil && !s.engine.stmtIsWriteWithViews(stmt) && s.access == accessReadOnly {
 		if err := s.refreshInitialRead(); err != nil {
 			return nil, err
@@ -2398,22 +2437,22 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	// it (its Close deregisters), else the defer releases it (a materialized dispatch / an error return),
 	// so a read that pins no long-lived snapshot leaks nothing.
 	autoPin := false
-	var autoPinVer uint64
+	var autoPinVer, autoPinGen uint64
 	if s.access != accessReadOnly && s.engine.session.tx == nil && !s.engine.stmtIsWriteWithViews(stmt) {
 		// refreshAndPin: shared mode's meta refresh or a page client's begin_read, then the atomic
 		// load+register.
-		rt, v, err := s.core.refreshAndPin()
+		rt, v, gen, err := s.core.refreshAndPin()
 		if err != nil {
 			return nil, err
 		}
 		s.baseVersion = v
 		s.engine.committed = rt.committed
 		s.engine.attachedCommitted = rt.attached
-		autoPinVer = v
+		autoPinVer, autoPinGen = v, gen
 		autoPin = true
 		defer func() {
 			if autoPin { // no cursor adopted the provisional pin — release it
-				s.core.deregisterPin(autoPinVer)
+				s.core.deregisterPin(autoPinGen, autoPinVer)
 			}
 		}()
 	}
@@ -2441,15 +2480,17 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	// the deregister runs on cursor Close (Go has no destructor), advancing oldestLiveTxid.
 	pin := func(rows *Rows) *Rows {
 		version := s.baseVersion
+		var gen uint64
 		if autoPin {
 			// The autocommit read's provisional pin (registered atomically above) transfers to this cursor;
 			// its Close deregisters it, so the defer must not (autoPin cleared).
-			version = autoPinVer
+			version, gen = autoPinVer, autoPinGen
 			autoPin = false
 		} else {
 			// A read-only session / open read-only block already holds its snapshot pin (registered
 			// atomically at mint / begin), so this per-cursor pin is on an already-protected version.
 			s.core.liveMu.Lock()
+			gen = s.core.liveGen
 			s.core.live[version]++
 			s.core.liveMu.Unlock()
 		}
@@ -2459,7 +2500,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 		s.engine.openStreams++
 		rows.attachPin(func() {
 			s.engine.openStreams--
-			s.core.deregisterPin(version)
+			s.core.deregisterPin(gen, version)
 		})
 		// A drain-time fault inside an open block aborts it (the open-time lane errors are poisoned at the
 		// returns below); a no-op for an autocommit read.
@@ -2498,15 +2539,16 @@ func (s *Session) refreshInitialRead() error {
 	}
 	// Pin the new version before releasing the old one: a page client's owner pin on a version lives
 	// only while some local reader pins it (spec/pageservice/README.md §6.3).
-	rt, v, err := s.core.refreshAndPin()
+	rt, v, gen, err := s.core.refreshAndPin()
 	if err != nil {
 		return err
 	}
 	if s.pinned {
-		s.core.deregisterPin(s.pinVersion)
+		s.core.deregisterPin(s.pinGen, s.pinVersion)
 	}
 	s.baseVersion = v
 	s.pinVersion = v
+	s.pinGen, s.roleGen = gen, gen
 	s.pinned = true
 	s.engine.committed = rt.committed
 	s.engine.attachedCommitted = rt.attached
@@ -2599,11 +2641,12 @@ func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 			return outcome{}, err
 		}
 		s.gateHeld = true
+		s.roleGen = s.core.writerGen()
 		s.refreshCommitted()
 	} else {
 		// A READ ONLY block pins its snapshot atomically (load+register under one lock, §8), so the
 		// version it reads can never be reclaimed in a load→register gap.
-		rt, v, err := s.core.refreshAndPin()
+		rt, v, gen, err := s.core.refreshAndPin()
 		if err != nil {
 			return outcome{}, err
 		}
@@ -2612,6 +2655,7 @@ func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 		s.engine.attachedCommitted = rt.attached
 		s.pinned = true
 		s.pinVersion = v
+		s.pinGen, s.roleGen = gen, gen
 	}
 	out, err := s.engine.beginTx(writable, modeSet)
 	if err != nil && s.gateHeld {
@@ -2630,6 +2674,14 @@ func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 func (s *Session) endBlock(commit bool) (outcome, error) {
 	var out outcome
 	var err error
+	if commit && s.engine.session.tx != nil {
+		if stale := s.staleRole(); stale != nil {
+			// The block began under a page-service role that has since changed: COMMIT fails and ends it.
+			_, _ = s.engine.rollbackTx()
+			s.finishBlock()
+			return outcome{}, stale
+		}
+	}
 	if commit {
 		failed := s.engine.session.tx != nil && s.engine.session.tx.failed
 		out, err = s.engine.commitTx() // inner in-memory swap: committed := working
@@ -2654,9 +2706,35 @@ func (s *Session) finishBlock() {
 		s.gateHeld = false
 	}
 	if s.pinned {
-		s.core.deregisterPin(s.pinVersion)
+		s.core.deregisterPin(s.pinGen, s.pinVersion)
 		s.pinned = false
 	}
+}
+
+// staleRole fails a statement of a transaction (or a read-only session's pinned snapshot) that began
+// under a page-service role the handle no longer has (README.md §6.5).
+func (s *Session) staleRole() error {
+	if s.core.handoff == nil {
+		return nil
+	}
+	open := s.engine.session.tx != nil || (s.access == accessReadOnly && s.pinned && !s.refreshOnNextRead)
+	if !open {
+		return nil
+	}
+	r := s.core.role.Load()
+	if s.roleGen != r.gen || (r.client != nil && r.client.brokenErr() != nil) {
+		return errStaleRole()
+	}
+	return nil
+}
+
+// writerGen is the role generation the current writer took its gate under (0 when not under the page
+// service). Caller holds writeMu.
+func (c *sharedCore) writerGen() uint64 {
+	if c.writerRole != nil {
+		return c.writerRole.gen
+	}
+	return 0
 }
 
 // refreshCommitted re-pins the latest committed root as this session's base (spec/design/session.md
@@ -2720,19 +2798,30 @@ func (s *Session) publish() error {
 	s.core.liveMu.Lock()
 	// A page client's reader may already have adopted this version, or the owner's maintenance commit
 	// after it, through begin_read; never move the roots back.
-	if s.core.client == nil || snap.txid > s.core.roots.Load().committed.txid {
+	var r *serviceRole
+	if s.core.handoff != nil {
+		r = s.core.writerRole
+		if s.core.role.Load() != r {
+			// A lost acknowledgement resolved as committed under a new role (README.md §6.5): that role's
+			// committed state already holds the commit, so this copy of it is not published.
+			s.engine.committed = s.core.roots.Load().committed
+			s.core.liveMu.Unlock()
+			return nil
+		}
+	}
+	if r == nil || r.client == nil || snap.txid > s.core.roots.Load().committed.txid {
 		s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
 	}
-	if changes.main && s.core.service != nil {
+	if changes.main && r != nil && r.owner != nil {
 		// The page service publishes the same version with its meta and written pages (README.md §4).
 		st := s.core.storage
-		s.core.service.published(snap.txid, st.lastMeta, st.lastWritten)
+		r.owner.published(snap.txid, st.lastMeta, st.lastWritten)
 	}
 	s.core.liveMu.Unlock()
-	if changes.main && s.core.client != nil {
+	if changes.main && r != nil && r.client != nil {
 		// A page client adopts its own commit: the owner published exactly this version, and no other
 		// commit came between its base and it (README.md §6.4).
-		s.core.clientAdoptOwnCommit(snap.txid)
+		s.core.clientAdoptOwnCommit(r.client, snap.txid, s.core.storage.lastMeta)
 	}
 	s.core.adoptAttachments(staged, s.engine.attachedCommitted)
 	return nil
@@ -2812,6 +2901,11 @@ func (s *Session) withBlock(writable, modeSet bool, fn func(tx *Transaction) err
 // is Open the run joins that transaction. In-script transaction control is 0A000.
 func (s *Session) ExecuteScript(sql string) (ScriptSummary, error) {
 	ownsWrapper := s.engine.session.tx == nil
+	if !ownsWrapper {
+		if err := s.staleRole(); err != nil {
+			return ScriptSummary{}, err
+		}
+	}
 	if ownsWrapper {
 		if _, err := s.beginBlock(true, true); err != nil {
 			return ScriptSummary{}, err

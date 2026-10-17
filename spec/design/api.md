@@ -154,8 +154,16 @@ reading pages through it and committing through it (phases 2–3); a client open
 read-only connection. Unix only (`0A000` elsewhere); file attachments reject it (`0A000`). Under
 `service` only, `idle_in_transaction_timeout_ms` (Go `IdleInTransactionTimeoutMs`, TS
 `idleInTransactionTimeoutMs`; default **60000**, `0` disables) is the owner's idle-in-transaction
-timeout for client write transactions (page-service.md §11.1). It is spelled `Locking::Service` / `LockingService` / `"service"`, is never documented as
-a production option, and must never share a database with a shared or exclusive opener.
+timeout for client write transactions (page-service.md §11.1). Handoff (phase 4,
+[spec/pageservice/README.md](../pageservice/README.md) §6.5): a client whose owner leaves re-elects —
+it promotes itself or reconnects to the new owner — and continues; `ownership` (Rust `Ownership::{Prefer,
+Yield, Never}`, Go `OwnershipPrefer`/`OwnershipYield`/`OwnershipNever`, TS `"prefer" | "yield" |
+"never"`; default prefer) is the opener's ownership preference; and the owner limits are
+`yield_grace_ms` (default 5000), `shutdown_grace_ms` (30000), `idle_session_timeout_ms` (0, off), and
+`max_connections` (0, unlimited; `53300` beyond it), spelled in each core's case like
+`idle_in_transaction_timeout_ms`. It is spelled `Locking::Service` / `LockingService` / `"service"`, is
+never documented as a production option, and must never share a database with a shared or exclusive
+opener.
 
 `file_lock_timeout_ms` (default **5000**, `0` = fail immediately) bounds shared join / exclusive open
 and returns `55006` on expiry. It is distinct from the session `lock_timeout_ms` (`0` = no deadline),

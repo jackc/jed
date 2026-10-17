@@ -1,0 +1,75 @@
+schema_version = 1
+name = "service-graceful-close"
+description = "Page service phase 4: a closing owner drains its clients' transactions within its shutdown grace: a client's open read transaction keeps reading while the owner waits, a new begin waits too, and when the owner is gone the client promotes itself and runs the begin there."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (1), (2)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "b"
+command = "read_open"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+# The owner begins closing; it waits for b's read transaction.
+[[step]]
+actor = "a"
+command = "close"
+async = true
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "2"
+
+[[step]]
+actor = "b"
+command = "read_close"
+
+# The drain ends; the owner exits.
+[[step]]
+actor = "a"
+command = "await"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (3)"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "owner"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3"
+
+[[step]]
+actor = "b"
+command = "close"

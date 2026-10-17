@@ -84,7 +84,8 @@ import {
 } from "./ergonomic.ts";
 import { metaChecksum } from "./commit_manifest.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
-import { engineError } from "./errors.ts";
+import type { BlockStore } from "./blockstore.ts";
+import { EngineError, engineError } from "./errors.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
 import { Pager } from "./pager.ts";
 import { SharedPaging } from "./paging.ts";
@@ -164,10 +165,107 @@ export interface ServiceOwnerHandle {
   clearLocalOldest(): void;
   // onHandoff installs the engine thread's handler for a gate handed over between transactions.
   onHandoff(handler: () => void): void;
-  // hangUpNextAck arms the commit-resolution test hook (README §6.4).
+  // hangUpNextAck arms the commit-resolution test hook (README §6.4); crashBeforeNextAck makes the
+  // process exit instead of acknowledging the next client commit (README §6.5).
   hangUpNextAck(): void;
+  crashBeforeNextAck(): void;
   // close stops serving (clients see EOF) and removes the endpoint and owner record.
   close(): void;
+  // --- handoff (spec/pageservice/README.md §6.5) ---
+  // onYield installs the engine thread's handler for an accepted ownership request.
+  onYield(handler: () => void): void;
+  // admitting: the owner serves normally (no drain); yielding: it drains for a yield.
+  admitting(): boolean;
+  yielding(): boolean;
+  // beginRelease ends a yield's drain: true when still yielding (now releasing), false when the
+  // requester disconnected and the yield was cancelled.
+  beginRelease(): boolean;
+  // beginClosing starts a graceful close's drain (notice kind 3 to every connection).
+  beginClosing(): void;
+  // clientsIdle: no connection pins a snapshot or holds the writer gate (own: nor does this thread).
+  clientsIdle(own: boolean): boolean;
+  // resolve answers commit_status from the owner's resolution window (README §3.5).
+  resolve(txid: bigint, digest: bigint): number;
+}
+
+// ServiceRole is what a page-service role change installs (spec/pageservice/README.md §6.5): the
+// main domain's storage for the role (null for none, between roles) and the owner's service and
+// presence coordinator, or the client's connection.
+export type ServiceRole = {
+  kind: "owner" | "client" | "none";
+  engine: Engine | null;
+  service: ServiceOwnerHandle | null;
+  client: PageClientHandle | null;
+  coordinator: FileCoordinatorHost | null;
+};
+
+// ServiceHandoffHost is a handle's page-service state that outlives its roles (the Node
+// implementation is pageservice/handoff.ts, injected by file.ts so this module stays browser-clean):
+// the ownership preference and grace periods, and the election a role change runs.
+export interface ServiceHandoffHost {
+  readonly ownership: "prefer" | "yield" | "never";
+  readonly yieldGraceMs: number;
+  readonly shutdownGraceMs: number;
+  // elect runs the election loop under the open timeout, keeping the path claim: it returns the new
+  // role (an owner opened with recovery and serving, or an opened client). 55006 on timeout.
+  elect(pauseUntilMs: number): ServiceRole;
+  // canOpenReadWrite reports whether this user can open the file read-write (opened and closed).
+  canOpenReadWrite(): boolean;
+  // releasePath releases the process-local open-path claim when the handle closes.
+  releasePath(): void;
+}
+
+// HANDOFF_PAUSE_MS is how long a yielding owner skips presence tries after releasing ownership, so the
+// requester takes it (README §6.5); DRAIN_POLL_MS is how often a drain checks for running
+// transactions.
+const HANDOFF_PAUSE_MS = 2000;
+const DRAIN_POLL_MS = 10;
+
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function isCode(error: unknown, code: string): boolean {
+  return error instanceof EngineError && error.code() === code;
+}
+
+function errStaleRole(): Error {
+  return engineError(
+    "connection_failure",
+    "the transaction began before this process's connection to the database owner changed",
+  );
+}
+
+function errNoOwner(): Error {
+  return engineError(
+    "connection_failure",
+    "lost the connection to the database owner, and no process took ownership in time",
+  );
+}
+
+// RevokedBlockStore is the byte store of storage whose role ended (README §6.5): the process no longer
+// owns the file, so every access fails 08006. Pages already in the pool still serve the snapshots that
+// cached them.
+class RevokedBlockStore implements BlockStore {
+  private fail(): never {
+    throw engineError("connection_failure", "this process no longer owns the database");
+  }
+  readAt(_offset: number, _len: number): Uint8Array {
+    this.fail();
+  }
+  writeAt(_offset: number, _bytes: Uint8Array): void {
+    this.fail();
+  }
+  sync(): void {
+    this.fail();
+  }
+  size(): number {
+    this.fail();
+  }
+  setSize(_bytes: number): void {
+    this.fail();
+  }
+  close(): void {}
 }
 
 // ClientReadBegun is a page client's begin_read reply as the core uses it (spec/pageservice/README.md
@@ -209,6 +307,24 @@ export interface PageClientHandle {
   // releasePin sends end_read for a held version.
   releasePin(v: bigint): void;
   close(): void;
+  // --- handoff (spec/pageservice/README.md §6.5) ---
+  // ownerReadOnly and ownerYields are the owner's hello_ok flags.
+  readonly ownerReadOnly: boolean;
+  readonly ownerYields: boolean;
+  // lost: the connection ended; waitForLoss blocks until it does or deadlineMs passes.
+  lost(): boolean;
+  waitForLoss(deadlineMs: number): boolean;
+  // onLost installs the event-loop handler for the connection's end.
+  onLost(handler: () => void): void;
+  // handoffPauseUntil is when the handoff pause after this connection's end ends (0: none).
+  handoffPauseUntil(): number;
+  // requestOwnershipNoWait sends request_ownership without waiting; askOwnership waits for the reply.
+  requestOwnershipNoWait(): void;
+  askOwnership(): void;
+  // commitStatus asks the owner whether a commit happened (README §3.5).
+  commitStatus(txid: bigint, digest: bigint): number;
+  // lostCommit recognizes a commit failure whose acknowledgement was lost.
+  lostCommit(error: unknown): { txid: bigint; digest: bigint; failure: Error } | null;
 }
 
 const pathEncoder = new TextEncoder();
@@ -283,12 +399,32 @@ class SharedCore {
   readOnly = false;
   coordinator: FileCoordinatorHost | null;
   // service is set on a page-service owner, client on a page client (spec/design/page-service.md §4);
-  // at most one is set, and only under the test-only `locking = service`.
+  // at most one is set, and only under the test-only `locking = service`. They are the current role's
+  // (spec/pageservice/README.md §6.5): handoff is set under the page service, and roleKind/roleGen
+  // name the current role — owner, client, or none between roles. A role change installs fresh main
+  // storage and committed snapshot together with the role and starts an empty live registry; a pin of
+  // an older role deregisters as a no-op, and a commit whose writer began under an older role fails
+  // 08006 without writing.
   service: ServiceOwnerHandle | null = null;
   client: PageClientHandle | null = null;
-  // On a page-service owner: whether this thread holds the service's writer gate, the service epoch it
-  // last caught up with, and whether its last publication reported a local reader to the service.
-  private serviceGateHeld = false;
+  handoff: ServiceHandoffHost | null = null;
+  roleKind: "owner" | "client" | "none" = "none";
+  roleGen = 0;
+  // handoffClosed is set when the handle closes; pauseUntilMs is the handoff pause of a role with no
+  // connection (after a yield released ownership).
+  handoffClosed = false;
+  private pauseUntilMs = 0;
+  // writerGen is the role generation the current writer took its gate under; gateService and
+  // writerClient are the service whose gate this thread holds and the client whose write transaction
+  // is open, so a role change never releases the new role's gate.
+  private writerGen = 0;
+  private gateService: ServiceOwnerHandle | null = null;
+  private writerClient: PageClientHandle | null = null;
+  // A yield's drain (README §6.5): its deadline, and the event-loop timer polling it.
+  private yieldDeadline: number | null = null;
+  private yieldTimer: ReturnType<typeof setTimeout> | null = null;
+  // On a page-service owner: the service epoch it last caught up with, and whether its last
+  // publication reported a local reader to the service.
   private serviceEpoch = 0;
   private serviceLocalOldest = false;
   planEpoch = 0;
@@ -308,26 +444,18 @@ class SharedCore {
       throw engineError("active_sql_transaction", "there is already a writer in progress");
     }
     this.writerActive = true;
-    if (this.client !== null) {
-      // A page client's writer takes the owner's gate (page-service.md §5.5).
+    if (this.handoff !== null) {
+      // Under the page service a writer takes the owner's gate — its own, or through begin_write — and
+      // an owner then adopts any client commit published since its last transaction (page-service.md
+      // §5.5, §7; README §6.5).
       try {
-        this.clientBeginWrite(timeoutMs);
-      } catch (error) {
-        this.writerActive = false;
-        throw error;
-      }
-      return;
-    }
-    if (this.service !== null) {
-      // A page-service owner's writer shares the gate with client write transactions, then adopts
-      // any client commit published since its last transaction (page-service.md §5.5, §7).
-      try {
-        this.serviceTakeGate(timeoutMs);
+        this.beginServiceWrite(timeoutMs);
       } catch (error) {
         this.releaseServiceGate();
         this.writerActive = false;
         throw error;
       }
+      if (this.service === null) return;
     }
     try {
       this.acquireCoordinators(timeoutMs);
@@ -388,9 +516,330 @@ class SharedCore {
       for (const coordinator of this.heldWriterCoordinators.reverse()) coordinator.unlockWriter();
       this.heldWriterCoordinators.length = 0;
     }
-    this.client?.endWrite();
+    this.writerClient?.endWrite();
+    this.writerClient = null;
     this.releaseServiceGate();
     this.writerActive = false;
+  }
+
+  // --- page-service roles and handoff (spec/pageservice/README.md §6.5) ---
+
+  // installRole publishes a new role with its storage and committed snapshot (none keeps the old,
+  // revoked storage), starting an empty live registry.
+  installRole(role: ServiceRole, pauseUntilMs = 0): void {
+    this.roleGen++;
+    this.roleKind = role.kind;
+    this.service = role.service;
+    this.client = role.client;
+    this.coordinator = role.coordinator;
+    this.pauseUntilMs = pauseUntilMs;
+    this.live = new Map();
+    this.serviceEpoch = role.service?.epoch() ?? 0;
+    this.serviceLocalOldest = false;
+    this.yieldDeadline = null;
+    if (this.yieldTimer !== null) clearTimeout(this.yieldTimer);
+    this.yieldTimer = null;
+    if (role.engine !== null) {
+      const engine = role.engine;
+      engine.reclaimWithinSession = true;
+      engine.storageBudget.limit = this.storage.storageBudget.limit;
+      this.storage = engine;
+      this.committed = engine.committed;
+    }
+    this.planEpoch++;
+    this.watchRole();
+  }
+
+  // watchRole wires the current role's events: an owner's handed gate and accepted ownership request,
+  // a client's connection end (re-elected on the event loop). A client releases its open-time pin and
+  // asks a yielding owner for ownership when it prefers to own (README §6.5 case 1).
+  private watchRole(): void {
+    const gen = this.roleGen;
+    const service = this.service;
+    if (service !== null) {
+      service.onHandoff(() => this.serviceHandoff());
+      service.onYield(() => this.yieldRequested(gen));
+    }
+    const client = this.client;
+    if (client !== null) {
+      this.releaseIdlePins();
+      client.onLost(() => this.backgroundReelect(gen));
+      if (this.handoff?.ownership === "prefer" && client.ownerYields) {
+        client.requestOwnershipNoWait();
+      }
+    }
+  }
+
+  // backgroundReelect re-elects on the event loop when role gen's connection ended (README §6.5).
+  private backgroundReelect(gen: number): void {
+    if (gen !== this.roleGen || this.handoffClosed || this.client === null || !this.client.lost()) {
+      return;
+    }
+    try {
+      this.reelect();
+    } catch {
+      // The next transaction begin re-elects again.
+    }
+  }
+
+  // reelect replaces the current role — a client whose connection ended, or none after a yield — by
+  // running the election under the open timeout. With no owner in time the role stays: 08006.
+  reelect(): void {
+    const handoff = this.handoff!;
+    if (this.handoffClosed) {
+      throw engineError("connection_failure", "the database handle is closed");
+    }
+    const pause = this.client !== null ? this.client.handoffPauseUntil() : this.pauseUntilMs;
+    let role: ServiceRole;
+    try {
+      role = handoff.elect(pause);
+    } catch (error) {
+      if (isCode(error, "55006")) throw errNoOwner();
+      throw error;
+    }
+    const old = this.client;
+    this.installRole(role);
+    old?.close();
+  }
+
+  // writerRoleChanged reports whether the current writer took its gate under an older role.
+  writerRoleChanged(): boolean {
+    return this.handoff !== null && (this.writerGen !== this.roleGen || this.roleKind === "none");
+  }
+
+  // beginServiceWrite takes the writer gate of the current role (caller set writerActive): the
+  // owner's gate, or the owner's through begin_write. A writer meeting a read-only owner asks it for
+  // ownership first; a begin the lost connection never answered is sent again after re-electing.
+  private beginServiceWrite(timeoutMs: number): void {
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY;
+    for (;;) {
+      const gen = this.roleGen;
+      if (this.roleKind === "owner") {
+        this.waitAdmission();
+        if (gen !== this.roleGen) continue;
+        this.serviceTakeGate(timeoutMs);
+        this.writerGen = this.roleGen;
+        return;
+      }
+      if (this.roleKind === "none") {
+        this.reelect();
+        continue;
+      }
+      const client = this.client!;
+      if (client.lost()) {
+        this.reelect();
+        continue;
+      }
+      if (client.ownerReadOnly && !client.readOnly) {
+        this.requestWriteOwnership(client, deadline);
+        continue;
+      }
+      try {
+        this.clientBeginWrite(timeoutMs);
+      } catch (error) {
+        if (client.lost() && isCode(error, "08006")) continue;
+        throw error;
+      }
+      this.writerClient = client;
+      this.writerGen = this.roleGen;
+      return;
+    }
+  }
+
+  // requestWriteOwnership is a writer's request to a read-only owner (README §6.5 case 2): unless this
+  // handle never owns or cannot open the file read-write, it asks for ownership and waits, under the
+  // session's lock timeout, for the connection to end, then re-elects.
+  private requestWriteOwnership(client: PageClientHandle, deadline: number): void {
+    const handoff = this.handoff!;
+    if (handoff.ownership === "never" || !handoff.canOpenReadWrite()) {
+      throw engineError(
+        "read_only_sql_transaction",
+        "the database owner opened the file read-only",
+      );
+    }
+    try {
+      client.askOwnership();
+    } catch {
+      // A lost connection is the handoff's end too.
+    }
+    if (!client.waitForLoss(deadline)) {
+      throw engineError(
+        "lock_not_available",
+        "could not obtain the database writer lock: the read-only owner did not hand over ownership in time",
+      );
+    }
+    this.reelect();
+  }
+
+  // beginServiceRead is a page-service read begin: it pins the current role's newest snapshot for a
+  // local reader, re-electing first when the connection ended and retrying a begin the lost connection
+  // never answered.
+  private beginServiceRead(): bigint {
+    for (;;) {
+      const gen = this.roleGen;
+      if (this.roleKind === "owner") {
+        this.waitAdmission();
+        if (gen !== this.roleGen) continue;
+        this.serviceRefresh();
+      } else if (this.roleKind === "none") {
+        this.reelect();
+        continue;
+      } else {
+        const client = this.client!;
+        if (client.lost()) {
+          this.reelect();
+          continue;
+        }
+        try {
+          this.clientRefresh();
+        } catch (error) {
+          if (client.lost() && isCode(error, "08006")) continue;
+          throw error;
+        }
+      }
+      const version = this.committed.txid;
+      this.register(version);
+      return version;
+    }
+  }
+
+  // waitAdmission holds an owner's own transaction begin while a yield drains, then lets the drain end
+  // (releasing ownership, or not when the yield was cancelled); the caller re-reads the role.
+  private waitAdmission(): void {
+    const service = this.service!;
+    if (service.admitting() || !service.yielding()) return;
+    if (this.yieldTimer !== null) clearTimeout(this.yieldTimer);
+    this.yieldTimer = null;
+    this.yieldDeadline ??= Date.now() + this.handoff!.yieldGraceMs;
+    for (;;) {
+      const step = this.drainStep();
+      if (step === "wait") {
+        sleepMs(DRAIN_POLL_MS);
+        continue;
+      }
+      if (step === "release") this.releaseAndReelect();
+      return;
+    }
+  }
+
+  // yieldRequested starts a yield's drain on the event loop (README §6.5): it polls until the running
+  // transactions finished or the yield grace passed, then releases ownership.
+  private yieldRequested(gen: number): void {
+    if (gen !== this.roleGen || this.handoffClosed || this.yieldTimer !== null) return;
+    const service = this.service;
+    if (service === null || !service.yielding()) return;
+    this.yieldDeadline ??= Date.now() + this.handoff!.yieldGraceMs;
+    const tick = (): void => {
+      this.yieldTimer = null;
+      if (gen !== this.roleGen || this.handoffClosed) return;
+      const step = this.drainStep();
+      if (step === "wait") {
+        this.yieldTimer = setTimeout(tick, DRAIN_POLL_MS);
+        (this.yieldTimer as { unref?: () => void }).unref?.();
+        return;
+      }
+      if (step === "release") this.releaseAndReelect();
+    };
+    tick();
+  }
+
+  // drainStep checks a yield's drain once: cancelled (the requester disconnected), wait, or release
+  // (no own reader, own writer, or client transaction runs, or the grace passed).
+  private drainStep(): "wait" | "cancelled" | "release" {
+    const service = this.service!;
+    if (!service.yielding()) {
+      this.yieldDeadline = null;
+      return "cancelled";
+    }
+    this.serviceHandoff(); // a handed gate is a maintenance commit to run, not a transaction to wait for
+    const drained = this.live.size === 0 && service.clientsIdle(true);
+    if (!drained && Date.now() < (this.yieldDeadline ?? 0)) return "wait";
+    this.yieldDeadline = null;
+    return service.beginRelease() ? "release" : "cancelled";
+  }
+
+  // releaseAndReelect ends a yield: release ownership, then re-elect as a client paused for the
+  // handoff pause, so the requester takes ownership.
+  private releaseAndReelect(): void {
+    this.releaseOwnership(Date.now() + HANDOFF_PAUSE_MS);
+    try {
+      this.reelect();
+    } catch {
+      // The next transaction begin re-elects again.
+    }
+  }
+
+  // releaseOwnership ends the owner role (README §6.5): the service stops serving (every connection
+  // closes; a client commit past its point of no return already completed on the service worker) and
+  // removes its endpoint and owner record, the role becomes none, the old storage refuses every further
+  // access (closing the file), and presence is released. The caller drained first.
+  private releaseOwnership(pauseUntilMs: number): void {
+    const service = this.service!;
+    const storage = this.storage;
+    const coordinator = this.coordinator;
+    service.close();
+    this.installRole(
+      { kind: "none", engine: null, service: null, client: null, coordinator: null },
+      pauseUntilMs,
+    );
+    const paging = storage.paging;
+    if (paging !== null) {
+      paging.swapStore(new RevokedBlockStore()).close();
+      paging.poison();
+    }
+    coordinator?.close();
+  }
+
+  // closeService ends the handle's page-service role at close (README §6.5): a serving owner sends
+  // notice kind 3, drains its clients' transactions for the shutdown grace, and stops serving; a
+  // client closes its connection. The caller closes the storage and the coordinator afterwards.
+  closeService(): void {
+    this.handoffClosed = true;
+    if (this.yieldTimer !== null) clearTimeout(this.yieldTimer);
+    this.yieldTimer = null;
+    const service = this.service;
+    if (service !== null) {
+      service.beginClosing();
+      const deadline = Date.now() + this.handoff!.shutdownGraceMs;
+      for (;;) {
+        this.serviceHandoff();
+        if (service.clientsIdle(false) || Date.now() >= deadline) break;
+        sleepMs(DRAIN_POLL_MS);
+      }
+      service.close();
+    }
+    this.service = null;
+    this.client?.close();
+    this.roleKind = "none";
+    this.roleGen++;
+  }
+
+  // resolveLostCommit settles a client commit whose acknowledgement was lost (README §6.4–§6.5): the
+  // re-election promotes this process, which answers from its own resolution window, or reconnects it
+  // to the new owner, which it asks; with no owner in time the outcome is unknown (08007).
+  private resolveLostCommit(lost: { txid: bigint; digest: bigint; failure: Error }): void {
+    const unknown = (detail: string): Error =>
+      engineError(
+        "transaction_resolution_unknown",
+        `lost the connection to the database owner during commit; ${detail}`,
+      );
+    try {
+      this.reelect();
+    } catch {
+      throw unknown("no owner answered whether it committed");
+    }
+    let status: number;
+    if (this.service !== null) status = this.service.resolve(lost.txid, lost.digest);
+    else if (this.client !== null) {
+      try {
+        status = this.client.commitStatus(lost.txid, lost.digest);
+      } catch {
+        throw unknown("whether the transaction committed is unknown");
+      }
+    } else throw unknown("whether the transaction committed is unknown");
+    if (status === 0) return; // committed
+    if (status === 1) throw lost.failure; // not committed
+    throw unknown("whether the transaction committed is unknown");
   }
 
   // --- the page-service owner (spec/pageservice/README.md §6.4) ---
@@ -400,7 +849,7 @@ class SharedCore {
   private serviceTakeGate(timeoutMs: number): void {
     const service = this.service!;
     const handed = service.acquireGate(timeoutMs);
-    this.serviceGateHeld = true;
+    this.gateService = service;
     if (handed) this.runMaintenance();
     if (service.poisoned()) {
       this.storage.paging?.poison();
@@ -417,14 +866,15 @@ class SharedCore {
   // tryServiceGate takes the service's gate only if it is free now (compaction never waits).
   tryServiceGate(): boolean {
     if (!this.service!.tryGate()) return false;
-    this.serviceGateHeld = true;
+    this.gateService = this.service;
     return true;
   }
 
   private releaseServiceGate(): void {
-    if (!this.serviceGateHeld) return;
-    this.serviceGateHeld = false;
-    this.service!.releaseGate();
+    const service = this.gateService;
+    if (service === null) return;
+    this.gateService = null;
+    service.releaseGate();
   }
 
   // serviceRefresh is an owner's transaction begin: one atomic load while no client committed and no
@@ -664,6 +1114,12 @@ class SharedCore {
     try {
       persistImpl(this.storage, snap, false, client.reuseGrant, budget);
     } catch (error) {
+      // A lost acknowledgement: the outcome is resolved by re-election (README §6.5).
+      const lost = client.lostCommit(error);
+      if (lost !== null) {
+        this.resolveLostCommit(lost);
+        return;
+      }
       client.discardPending();
       const settled = client.failedCommit(error);
       if (settled.notCommitted) this.storage.paging?.abandonDurableCommit();
@@ -678,6 +1134,7 @@ class SharedCore {
   // refresh and the registration with nothing in between, so no end_read for the version can be sent
   // before its reader is registered (README §6.3).
   refreshAndPin(): bigint {
+    if (this.handoff !== null) return this.beginServiceRead();
     if (this.client !== null) this.clientRefresh();
     else this.refreshShared();
     const version = this.committed.txid;
@@ -877,6 +1334,8 @@ class SharedCore {
   // stagesRows is whether the commit staged any record version (the committed-storage repair
   // exemption, memory.md §8.3).
   persist(snap: Snapshot, stagesRows: boolean): void {
+    // A page-service commit checks the role its writer began under before it writes (README §6.5).
+    if (this.writerRoleChanged()) throw errStaleRole();
     if (this.client !== null) {
       this.persistClient(snap, stagesRows);
       return;
@@ -1025,7 +1484,10 @@ class SharedCore {
     this.live.set(version, (this.live.get(version) ?? 0) + 1);
   }
 
-  deregister(version: bigint): void {
+  // deregister drops one reader pin on version registered under role generation gen; a pin of an older
+  // page-service role is gone already (the role change started an empty registry).
+  deregister(version: bigint, gen: number): void {
+    if (gen !== this.roleGen) return;
     const c = (this.live.get(version) ?? 0) - 1;
     if (c <= 0) {
       this.live.delete(version);
@@ -1211,7 +1673,11 @@ export class Database {
   static fromEngine(
     engine: Engine,
     coordinator: FileCoordinatorHost | null = null,
-    pageService: { service?: ServiceOwnerHandle; client?: PageClientHandle } = {},
+    pageService: {
+      service?: ServiceOwnerHandle;
+      client?: PageClientHandle;
+      handoff?: ServiceHandoffHost;
+    } = {},
   ): Database {
     // v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
     // persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at each
@@ -1219,6 +1685,19 @@ export class Database {
     engine.reclaimWithinSession = true;
     const core = new SharedCore(engine.committed, engine, coordinator);
     core.readOnly = engine.readOnly;
+    if (pageService.handoff !== undefined) {
+      // Under the page service the opened role is the first one (README §6.5): its events are wired,
+      // and a client's open-time pin is released at once (no local reader follows an open).
+      core.handoff = pageService.handoff;
+      core.installRole({
+        kind: pageService.service !== undefined ? "owner" : "client",
+        engine: null,
+        service: pageService.service ?? null,
+        client: pageService.client ?? null,
+        coordinator,
+      });
+      return Database.over(core);
+    }
     core.service = pageService.service ?? null;
     core.client = pageService.client ?? null;
     // A gate the service hands over between transactions is taken at the next event-loop turn.
@@ -1384,7 +1863,7 @@ export class Database {
         `cannot compact database "${name}": its storage host cannot replace the file atomically`,
       );
     }
-    if (c.client !== null && lname === "main") {
+    if ((c.client !== null || (c.handoff !== null && c.service === null)) && lname === "main") {
       // Compaction is an owner operation (page-service.md §6).
       throw engineError(
         "object_in_use",
@@ -1620,11 +2099,28 @@ export class Database {
   // close closes the backing byte store (an in-memory store's close is a no-op). The bare
   // convenience methods autocommit, so there is never uncommitted work to discard. Idempotent.
   close(): void {
+    const handoff = this.core.handoff;
+    if (handoff !== null) {
+      // A serving owner drains its clients and stops serving while presence EX is still held; a client
+      // closes its connection (page-service.md §4.1; README §6.5). The path claim goes last.
+      if (this.core.handoffClosed) return;
+      this.core.closeService();
+      try {
+        this.closeStorage();
+      } finally {
+        handoff.releasePath();
+      }
+      return;
+    }
     // A page-service owner stops serving first: clients see EOF while presence EX is still held
     // (page-service.md §4.1). A client's connection closes with its byte store below.
     this.core.service?.close();
     this.core.service = null;
     this.core.client?.close();
+    this.closeStorage();
+  }
+
+  private closeStorage(): void {
     const st = this.core.storage;
     if (st.paging !== null) {
       st.paging.close();
@@ -1800,6 +2296,10 @@ export class Session {
   private baseVersion: bigint;
   private planEpoch: number;
   private closed = false;
+  // roleGen is the page-service role generation the open transaction or pinned snapshot began under,
+  // pinGen the one pinnedVersion was registered under (spec/pageservice/README.md §6.5).
+  private roleGen: number;
+  private pinGen: number;
 
   constructor(
     core: SharedCore,
@@ -1816,6 +2316,21 @@ export class Session {
     this.pinnedVersion = pinnedVersion;
     this.gateHeld = gateHeld;
     this.planEpoch = core.planEpoch;
+    this.roleGen = core.roleGen;
+    this.pinGen = core.roleGen;
+  }
+
+  // checkRole fails a statement of a transaction (or a read-only session's pinned snapshot) that began
+  // under a page-service role the handle no longer has, or whose connection ended (README §6.5).
+  private checkRole(): void {
+    const core = this.core;
+    if (core.handoff === null) return;
+    const open =
+      this.engine.session.tx !== null || (this.access === "ro" && this.pinnedVersion !== null);
+    if (!open) return;
+    if (this.roleGen !== core.roleGen || core.client?.lost()) {
+      throw errStaleRole();
+    }
   }
 
   // execute runs a (possibly mutating) statement on this session, binding $N params (spec/design/
@@ -1855,21 +2370,26 @@ export class Session {
     // pin, and an open block uses its working set.
     // On a page client that re-pin is a begin_read whose pin stays registered for this statement
     // (spec/pageservice/README.md §6.3); a cursor that outlives it registers its own.
+    if (stmt.kind !== "rollback") this.checkRole();
     let autoPin: bigint | null = null;
+    let autoPinGen = 0;
     if (
       this.access !== "ro" &&
       this.engine.session.tx === null &&
       !this.engine.stmtIsWriteWithViews(stmt)
     ) {
-      if (this.core.client !== null) autoPin = this.core.refreshAndPin();
-      else this.core.refreshShared();
+      // Under the page service the read begins on the current role (re-electing when needed).
+      if (this.core.handoff !== null || this.core.client !== null) {
+        autoPin = this.core.refreshAndPin();
+        autoPinGen = this.core.roleGen;
+      } else this.core.refreshShared();
       this.refreshCommitted();
     }
     if (autoPin === null) return this.routeStmt(stmt, params, holder, insertHolder);
     try {
       return this.routeStmt(stmt, params, holder, insertHolder);
     } finally {
-      this.core.deregister(autoPin);
+      this.core.deregister(autoPin, autoPinGen);
     }
   }
 
@@ -1900,6 +2420,7 @@ export class Session {
     // runs on cursor close (JS has no destructor), advancing oldestLiveTxid.
     const pin = (built: { columnNames: string[]; columnTypes: string[]; cursor: Cursor }): Rows => {
       const version = this.baseVersion;
+      const gen = this.core.roleGen;
       this.core.register(version);
       // A live streaming cursor also blocks within-session temp compaction: it faults its pinned temp
       // tree lazily, so a temp commit must not reclaim a page it may still read (temp-tables.md §6). The
@@ -1908,7 +2429,7 @@ export class Session {
       const rows = new Rows(built.columnNames, built.columnTypes, built.cursor, null);
       rows.attachPin(() => {
         this.engine.openStreams--;
-        this.core.deregister(version);
+        this.core.deregister(version, gen);
       });
       // A drain-time fault inside an open block aborts it (the open-time lane errors are poisoned at the
       // catch below); a no-op for an autocommit read.
@@ -2056,7 +2577,9 @@ export class Session {
       this.core.refreshAndPin();
       this.refreshCommitted();
       this.pinnedVersion = this.baseVersion;
+      this.pinGen = this.core.roleGen;
     }
+    this.roleGen = this.core.roleGen;
     return this.engine.beginTx(writable);
   }
 
@@ -2066,6 +2589,15 @@ export class Session {
   // — finishBlock runs in `finally` so a persist I/O failure (file-backed) never leaks the writer gate.
   private endBlock(commit: boolean): Outcome {
     try {
+      if (commit && this.engine.session.tx !== null) {
+        try {
+          this.checkRole();
+        } catch (error) {
+          // The block began under a page-service role that has since changed: COMMIT fails and ends it.
+          this.engine.rollbackTx();
+          throw error;
+        }
+      }
       if (commit) {
         const failed = this.engine.session.tx?.failed ?? false;
         const out = this.engine.commitTx(); // inner in-memory swap: committed := working
@@ -2100,7 +2632,7 @@ export class Session {
   private finishBlock(): void {
     this.releaseGate();
     if (this.pinnedVersion !== null) {
-      this.core.deregister(this.pinnedVersion);
+      this.core.deregister(this.pinnedVersion, this.pinGen);
       this.pinnedVersion = null;
     }
   }
@@ -2136,6 +2668,13 @@ export class Session {
       snap.txid = this.baseVersion + 1n; // main-domain version and reclamation watermark
       // durable before publish (packs into the byte store, any host)
       this.core.persist(snap, this.engine.commitStagesRows);
+      if (this.core.writerRoleChanged()) {
+        // A lost acknowledgement resolved as committed under a new role (README §6.5): that role's
+        // committed state already holds the commit, so this copy of it is not published.
+        this.engine.committed = this.core.committed;
+        this.baseVersion = this.core.committed.txid;
+        return;
+      }
       if (afterPersistHook !== null) {
         // The persist→publish window (test seam; §8 fallback-reader race point). core.committed is still the
         // PRIOR published root here — a reader pinned inside the hook gets that fallback version.
@@ -2251,6 +2790,7 @@ export class Session {
   // is Open the run joins that transaction. In-script transaction control is 0A000.
   executeScript(sql: string): ScriptSummary {
     const ownsWrapper = this.engine.session.tx === null;
+    if (!ownsWrapper) this.checkRole();
     if (ownsWrapper) this.beginBlock(true);
     try {
       const summary = this.engine.runScriptBody(sql);

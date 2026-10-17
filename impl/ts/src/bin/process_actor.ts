@@ -12,19 +12,45 @@ import {
   type Environment,
   EnvironmentBuilder,
   attachFile,
+  crashBeforeNextPageServiceAckForTesting,
   hangUpNextPageServiceAckForTesting,
   intValue,
   openDatabase,
+  pageServiceRoleForTesting,
   render,
   type Session,
 } from "../tooling.ts";
 
-const [action, path, timeoutText, idleText] = process.argv.slice(2);
+const [action, path, ...rest] = process.argv.slice(2);
 if (action === undefined || path === undefined) {
   throw new Error(
-    "usage: process_actor.ts create|open PATH [timeout_ms [idle_timeout_ms]] | owner-idle REPO_ROOT",
+    "usage: process_actor.ts create|open PATH [timeout_ms [idle_timeout_ms]] [key=value...] | owner-idle REPO_ROOT",
   );
 }
+// Positional arguments after the path: the open timeout, then the page-service owner's
+// idle-in-transaction timeout (spec/design/page-service.md §11.1). key=value arguments set the
+// handoff options (spec/pageservice/README.md §6.5): ownership=prefer|yield|never, yield_grace,
+// shutdown_grace, idle_session (milliseconds), max_connections.
+const positional: string[] = [];
+const options = new Map<string, string>();
+for (const arg of rest) {
+  const eq = arg.indexOf("=");
+  if (eq < 0) positional.push(arg);
+  else options.set(arg.slice(0, eq), arg.slice(eq + 1));
+}
+const [timeoutText, idleText] = positional;
+const millis = (key: string): number | undefined =>
+  options.has(key) ? Number(options.get(key)) : undefined;
+const ownershipText = options.get("ownership");
+const ownership: "prefer" | "yield" | "never" =
+  ownershipText === "yield" || ownershipText === "never" ? ownershipText : "prefer";
+const handoffOptions = {
+  ownership,
+  yieldGraceMs: millis("yield_grace"),
+  shutdownGraceMs: millis("shutdown_grace"),
+  idleSessionTimeoutMs: millis("idle_session"),
+  maxConnections: millis("max_connections"),
+};
 if (action === "owner-idle") {
   // The corpus-through-a-client driver (spec/pageservice/README.md §7): open and close databases as
   // their page-service owner on command.
@@ -50,8 +76,20 @@ let database: Database;
 try {
   database =
     action === "create" || action === "create-service"
-      ? createDatabase({ path, locking, fileLockTimeoutMs, idleInTransactionTimeoutMs })
-      : openDatabase(path, { locking, fileLockTimeoutMs, idleInTransactionTimeoutMs, readOnly });
+      ? createDatabase({
+          path,
+          locking,
+          fileLockTimeoutMs,
+          idleInTransactionTimeoutMs,
+          ...handoffOptions,
+        })
+      : openDatabase(path, {
+          locking,
+          fileLockTimeoutMs,
+          idleInTransactionTimeoutMs,
+          readOnly,
+          ...handoffOptions,
+        });
 } catch (error) {
   replyError(error);
   process.exit(1);
@@ -122,19 +160,36 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
         // The commit-resolution test hook (spec/pageservice/README.md §6.4).
         hangUpNextPageServiceAckForTesting(database);
         break;
+      case "CRASH_NEXT_ACK":
+        // End the process instead of acknowledging the next client commit (README §6.5).
+        crashBeforeNextPageServiceAckForTesting(database);
+        break;
+      case "ROLE":
+        // The page-service role test hook (spec/pageservice/README.md §6.5).
+        value = pageServiceRoleForTesting(database);
+        break;
       case "TXID":
         value = database.txid.toString();
         break;
       case "PAGE_COUNT":
         value = database.pageCount.toString();
         break;
-      case "CLOSE":
-        reader?.close();
-        writer?.close();
-        database.close();
+      case "CLOSE": {
+        // Acknowledged at once; the close itself may take a while (an owner drains its clients first,
+        // README §6.5), and the exit status reports its outcome.
         replyOK("");
-        process.exit(0);
+        let status = 0;
+        try {
+          reader?.close();
+          writer?.close();
+          database.close();
+        } catch (error) {
+          console.error(error);
+          status = 1;
+        }
+        process.exit(status);
         break;
+      }
       default:
         throw new Error(`unknown actor command ${command}`);
     }

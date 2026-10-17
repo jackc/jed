@@ -431,19 +431,33 @@ The page service's read path (page-service.md phase 2) runs here too, under the 
 owner and the second opener a page client, then checks fresh reads after the owner's commits, a pinned
 read session, correct reads after the owner reuses freed pages (the client's invalidation list),
 compaction refused while a client pins and allowed after, and `25006` for a write through a client
-opened `read_only`. `service_owner_exit` kills the owner: the client fails `08006` (no promotion
-before phase 4) and the next opener is elected owner, which a later opener then writes through.
+opened `read_only`.
 The write path (phase 3): `service_writes` commits through clients of both cores (autocommit, explicit
 commit and rollback, DDL both ways, churn under the reuse grant, compaction after client commits, a
 client's compaction refused); `service_gate` shares the writer gate between owner and client writers
 (`55P03` at the lock timeout while readers keep reading) and kills a client holding it;
 `service_idle_timeout` revokes an idle client write transaction (`25P03` at its COMMIT, the gate freed
 for the owner); `service_commit_resolution` drops a commit's acknowledgement with the test hook and
-checks the client resolves it as committed; `service_client_churn` repeats a client UPDATE and bounds
-the owner's page count, which only the owner's maintenance commits keep down. The driver adds a
-`sleep` step, a step `repeat` count, `expect_max` for an upper bound, and extra actor arguments after
-the action word (the owner's idle-in-transaction timeout). A step's `retry_ms` bounds an outcome that holds only eventually,
-such as an owner observing a client's asynchronous `end_read`.
+checks the client resolves it as committed over a new connection; `service_client_churn` repeats a
+client UPDATE and bounds the owner's page count, which only the owner's maintenance commits keep down.
+Handoff (phase 4, spec/pageservice/README.md §6.5): `service_owner_exit` kills the owner, so the client
+promotes itself and carries on — its open read transaction fails `08006`, autocommit statements succeed,
+and a later opener is its client; `service_commit_crash` makes the owner exit instead of acknowledging a
+client commit, and the client, promoted, resolves the commit as committed from its own resolution
+window; `service_shutdown_drain` closes the owner while a client reads, so the owner drains (the
+client's transaction keeps reading) and the client promotes once it is gone; `service_yield` hands
+ownership from a `yield` owner to a `prefer` opener, the former owner continuing as its client;
+`service_yield_read_only` hands ownership from a read-only owner to the first client that writes;
+`service_never` checks that an `ownership = never` opener fails `55006` with no owner and never
+promotes; `service_limits` refuses a connection over `max_connections` (`53300`) and reconnects a client
+transparently after the idle-session timeout closed its connection. The driver adds a `sleep` step, a
+step `repeat` count, `expect_max` for an upper bound, and extra actor arguments after the action word
+(the open timeout and the owner's idle-in-transaction timeout positionally, handoff options as
+`key=value`). A step's `retry_ms` bounds an outcome that holds only eventually, such as an owner
+observing a client's asynchronous `end_read` or a handoff completing. An `async` step sends its
+command without waiting; a later `await` step on the same actor checks its reply (or, after an async
+`close`, waits for the actor to exit). A `start` step may `expect_error` a failed open, and every actor
+must exit with status 0 after `close`.
 
 The corpus, not per-core copies, covers:
 

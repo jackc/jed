@@ -4,13 +4,25 @@
 // for each answer. The engine thread is single-threaded and waits for one answer at a time, so one
 // answer channel serves every connection. The worker only splits each byte stream into frames by
 // their length prefix; decoding happens on the engine thread, which knows the connection's page size.
-// Node-only.
+//
+// Two things reach the engine thread without a request (spec/pageservice/README.md §6.5): owner
+// notices, which the worker consumes itself and records in the connection's status buffer (a
+// SharedArrayBuffer the engine thread reads with atomic loads), and the connection's end, which it
+// records there too (waking an engine thread waiting for it) and announces on the connection's event
+// port, so the engine thread re-elects at its next idle event-loop turn. Node-only.
 
 import { createConnection, type Socket } from "node:net";
 import { type MessagePort, workerData } from "node:worker_threads";
 
 import { signalAnswer } from "./blocking.ts";
-import { PS_MAX_FRAME_LENGTH } from "./codec.ts";
+import {
+  PS_CODE_NOTICE,
+  PS_MAX_FRAME_LENGTH,
+  PS_NOTICE_YIELD_BEGUN,
+  PS_NOTICE_YIELD_CANCELLED,
+} from "./codec.ts";
+
+import { LOST_AT_OFFSET, NOTICE_CONN_OFFSET, STATUS_LOST, STATUS_PAUSED } from "./client_status.ts";
 
 // The engine thread's requests, each for connection `conn`: connect to an endpoint, send a frame
 // (reply: whether it waits for the next frame; otherwise it waits until the frame is handed to the
@@ -18,7 +30,14 @@ import { PS_MAX_FRAME_LENGTH } from "./codec.ts";
 // on), wait for the connection's next frame without sending (the engine thread skipping a frame that
 // answers another request), drop the connection (no answer), or forget it entirely (no answer).
 export type ClientRequest =
-  | { op: "connect"; conn: number; endpoint: string }
+  | {
+      op: "connect";
+      conn: number;
+      endpoint: string;
+      // status and events are sent with a connection's first connect (events in the transfer list).
+      status?: SharedArrayBuffer;
+      events?: MessagePort;
+    }
   | { op: "send"; conn: number; frame: Uint8Array; reply: boolean }
   | { op: "next"; conn: number }
   | { op: "disconnect"; conn: number }
@@ -44,6 +63,42 @@ class Connection {
   acking = false;
   buffered = new Uint8Array(0);
   readonly frames: Uint8Array[] = [];
+  status: Int32Array | null = null;
+  noticeConn: BigInt64Array | null = null;
+  lostAt: Float64Array | null = null;
+  events: MessagePort | null = null;
+
+  attach(status: SharedArrayBuffer, events: MessagePort | undefined): void {
+    this.status = new Int32Array(status, 0, 2);
+    this.noticeConn = new BigInt64Array(status, NOTICE_CONN_OFFSET, 1);
+    this.lostAt = new Float64Array(status, LOST_AT_OFFSET, 1);
+    if (events !== undefined) this.events = events;
+  }
+
+  // markLost records the connection's end in the status buffer, wakes a waiting engine thread, and
+  // announces it on the event port (once per connect).
+  private markLost(): void {
+    const status = this.status;
+    if (status === null || Atomics.load(status, STATUS_LOST) === 1) return;
+    this.lostAt![0] = Date.now();
+    Atomics.store(status, STATUS_LOST, 1);
+    Atomics.notify(status, STATUS_LOST);
+    this.events?.postMessage("lost");
+  }
+
+  // notice acts on an owner notice frame (README §3.7): record a yield begun (with the requester's
+  // connection id) or cancelled; ignore any other kind.
+  private notice(frame: Uint8Array): void {
+    if (frame.length < 18 || this.status === null) return;
+    const kind = frame[9]!;
+    if (kind === PS_NOTICE_YIELD_BEGUN) {
+      const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+      this.noticeConn![0] = view.getBigInt64(10);
+      Atomics.store(this.status, STATUS_PAUSED, 1);
+    } else if (kind === PS_NOTICE_YIELD_CANCELLED) {
+      Atomics.store(this.status, STATUS_PAUSED, 0);
+    }
+  }
 
   answer(a: ClientAnswer): void {
     this.waiting = false;
@@ -55,6 +110,7 @@ class Connection {
     if (this.lost === null) this.lost = reason;
     this.socket?.destroy();
     this.socket = null;
+    this.markLost();
     if ((this.waiting && this.frames.length === 0) || this.acking) {
       this.answer({ lost: this.lost });
     }
@@ -78,8 +134,12 @@ class Connection {
         return;
       }
       if (joined.length - start < 4 + length) break;
-      this.frames.push(joined.slice(start, start + 4 + length));
+      const frame = joined.slice(start, start + 4 + length);
       start += 4 + length;
+      const requestId =
+        ((frame[5]! << 24) | (frame[6]! << 16) | (frame[7]! << 8) | frame[8]!) >>> 0;
+      if (requestId === 0 && frame[4] === PS_CODE_NOTICE) this.notice(frame);
+      else this.frames.push(frame);
     }
     this.buffered = joined.slice(start);
     if (this.waiting && this.frames.length > 0) this.answer({ frame: this.frames.shift()! });
@@ -91,6 +151,10 @@ class Connection {
     this.buffered = new Uint8Array(0);
     this.frames.length = 0;
     this.waiting = true;
+    if (this.status !== null) {
+      Atomics.store(this.status, STATUS_LOST, 0);
+      Atomics.store(this.status, STATUS_PAUSED, 0);
+    }
     const s = createConnection(endpoint);
     this.socket = s;
     s.on("connect", () => {
@@ -142,6 +206,7 @@ class Connection {
     this.lost = "disconnected";
     this.socket?.destroy();
     this.socket = null;
+    this.markLost();
   }
 }
 
@@ -155,6 +220,7 @@ port.on("message", (request: ClientRequest) => {
         c = new Connection();
         connections.set(request.conn, c);
       }
+      if (request.status !== undefined) c.attach(request.status, request.events);
       c.connect(request.endpoint);
       return;
     case "send":
@@ -170,6 +236,7 @@ port.on("message", (request: ClientRequest) => {
       return;
     case "forget":
       c?.disconnect();
+      c?.events?.close();
       connections.delete(request.conn);
       return;
   }

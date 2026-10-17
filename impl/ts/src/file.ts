@@ -39,16 +39,8 @@ import {
   registerFileCompactor,
 } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
-import {
-  canonicalOpenPath,
-  FileCoordinator,
-  osLocks,
-  resolvedLocking,
-  timeoutValue,
-} from "./coordinator.ts";
-import { openPageClient } from "./pageservice/client.ts";
-import { electService } from "./pageservice/election.ts";
-import { ServiceOwner } from "./pageservice/owner.ts";
+import { canonicalOpenPath, FileCoordinator, osLocks, resolvedLocking } from "./coordinator.ts";
+import { type Ownership, ServiceHandoff } from "./pageservice/handoff.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -81,9 +73,15 @@ export type CreateOptions = {
   skipFsync?: boolean;
   locking?: Locking;
   fileLockTimeoutMs?: number;
-  // idleInTransactionTimeoutMs is OpenOptions.idleInTransactionTimeoutMs for a creator that becomes the
-  // page-service owner.
+  // idleInTransactionTimeoutMs, idleSessionTimeoutMs, yieldGraceMs, shutdownGraceMs, maxConnections,
+  // and ownership are the OpenOptions fields of the same names, for a creator under the page service:
+  // it is the owner, whatever its ownership preference, and keeps them for later roles.
   idleInTransactionTimeoutMs?: number;
+  idleSessionTimeoutMs?: number;
+  yieldGraceMs?: number;
+  shutdownGraceMs?: number;
+  maxConnections?: number;
+  ownership?: Ownership;
   // The handle's Environment (spec/design/environment.md): its loaded Unicode and time-zone data,
   // host functions, and random + clock sources, fixed for the handle's lifetime and shared by every
   // session, attachment, and temp domain. Not stored in the file — a reopening host supplies its own.
@@ -184,6 +182,20 @@ export type OpenOptions = {
   // nothing for this long is revoked (25P03 at its next request). Absent is the 60 s default; 0
   // disables it. Only `locking = "service"` reads it.
   idleInTransactionTimeoutMs?: number;
+  // idleSessionTimeoutMs closes a page-service connection idle between transactions for this long
+  // (page-service.md §11.1); absent or 0 never does. yieldGraceMs and shutdownGraceMs are how long a
+  // yielding or closing owner lets running transactions finish (absent: 5 s and 30 s). maxConnections
+  // bounds an owner's connections (53300 beyond it); absent or 0 is unlimited. Only `locking =
+  // "service"` reads them, as an owner's limits; a client keeps them for the day it becomes owner.
+  idleSessionTimeoutMs?: number;
+  yieldGraceMs?: number;
+  shutdownGraceMs?: number;
+  maxConnections?: number;
+  // ownership is the opener's ownership preference under the page service (page-service.md §8.2):
+  // "prefer" (the default) becomes owner when the database is free and asks a yielding owner to
+  // yield; "yield" hands ownership to a prefer requester (for tools); "never" never owns (an open with
+  // no owner fails 55006, and a client never promotes). Only `locking = "service"` reads it.
+  ownership?: Ownership;
   // The handle's Environment (spec/design/environment.md): the file's referenced collations, zones,
   // and host functions resolve against it at open, and it supplies the random + clock sources. A
   // handle setting like the rest — not stored in the file. Absent ⇒ a fresh empty environment (§7).
@@ -461,7 +473,20 @@ export function createDatabase(opts: CreateOptions = {}): Database {
       });
       engine.storageBudget.limit = maxStorageBytes;
       if (opts.locking === "service") {
-        return startServiceOwner(engine, coordinator!, opts.idleInTransactionTimeoutMs);
+        // The creator is the owner (README §6.1); its handle keeps the path claim across roles.
+        coordinator!.keepPathClaim();
+        const path = coordinator!.path;
+        const environment = engine.environment;
+        const handoff = new ServiceHandoff(
+          path,
+          opts,
+          false,
+          opts.fileLockTimeoutMs,
+          {},
+          environment,
+          () => open(path, { skipFsync: opts.skipFsync, environment, locking: "none" }),
+        );
+        return startServiceOwner(engine, coordinator!, handoff);
       }
       return Database.fromEngine(engine, coordinator);
     } catch (error) {
@@ -498,18 +523,19 @@ export function openDatabase(path: string, opts: OpenOptions = {}): Database {
 function openServiceDatabase(path: string, opts: OpenOptions): Database {
   resolvedLocking("service");
   const real = canonicalOpenPath(path);
-  const election = electService(osLocks, real, opts.fileLockTimeoutMs, opts.readOnly ?? false);
   const environment = opts.environment ?? new Environment();
+  const handoff = new ServiceHandoff(
+    real,
+    opts,
+    opts.readOnly ?? false,
+    opts.fileLockTimeoutMs,
+    opts,
+    environment,
+    () => open(real, { ...opts, locking: "none", environment }),
+  );
+  const election = handoff.electAtOpen();
   if (election.client !== null) {
-    const client = election.client;
-    client.timeoutMs = timeoutValue(opts.fileLockTimeoutMs);
-    try {
-      const engine = openPageClient(client, opts, environment);
-      return Database.fromEngine(engine, null, { client });
-    } catch (error) {
-      client.close();
-      throw error;
-    }
+    return Database.fromEngine(election.engine, null, { client: election.client, handoff });
   }
   const coordinator = FileCoordinator.fromElection(osLocks, real, election.owner);
   let engine: Engine;
@@ -517,26 +543,27 @@ function openServiceDatabase(path: string, opts: OpenOptions): Database {
     engine = open(real, { ...opts, locking: "none", environment });
   } catch (error) {
     coordinator.close();
+    handoff.releasePath();
     throw error;
   }
-  return startServiceOwner(engine, coordinator, opts.idleInTransactionTimeoutMs);
+  return startServiceOwner(engine, coordinator, handoff);
 }
 
 // startServiceOwner lifts an opened or created engine into a serving owner's handle; the caller's
-// coordinator holds presence EX. A failure to serve closes the handle (releasing presence).
+// coordinator holds presence EX. A failure to serve releases presence and the path claim.
 function startServiceOwner(
   engine: Engine,
   coordinator: FileCoordinator,
-  idleTimeoutMs?: number,
+  handoff: ServiceHandoff,
 ): Database {
-  let service: ServiceOwner;
+  let role: ReturnType<ServiceHandoff["startOwner"]>;
   try {
-    service = ServiceOwner.start(engine, coordinator.path, idleTimeoutMs);
+    role = handoff.startOwner(coordinator, engine);
   } catch (error) {
-    Database.fromEngine(engine, coordinator).close();
+    handoff.releasePath();
     throw error;
   }
-  return Database.fromEngine(engine, coordinator, { service });
+  return Database.fromEngine(engine, coordinator, { service: role.service!, handoff });
 }
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an

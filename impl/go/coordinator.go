@@ -46,6 +46,9 @@ type fileCoordinator struct {
 	done    chan struct{}
 	started atomic.Bool
 	once    sync.Once
+	// keepPath leaves the process-local path claim at close: a page-service owner's claim belongs to its
+	// handle, which keeps the path through role changes (page-service.md §8).
+	keepPath bool
 }
 
 func prepareOpenCoordinator(path string, mode Locking, timeout *uint64) (*fileCoordinator, string, error) {
@@ -175,6 +178,7 @@ func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *ui
 	_ = host.unlock(files.arrival)
 	c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid(), stop: make(chan struct{}), done: make(chan struct{})}
 	c.state.Store(uint32(state))
+	c.keepPath = state == leaseServiceOwner
 	closeFiles = false
 	return c, nil
 }
@@ -205,7 +209,9 @@ func (c *fileCoordinator) close() {
 			<-c.done
 		}
 		c.host.closeFiles(c.files)
-		c.host.releasePath(c.path)
+		if !c.keepPath {
+			c.host.releasePath(c.path)
+		}
 	})
 }
 

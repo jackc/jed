@@ -4,8 +4,8 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use jed::{
-    AttachSource, CreateOptions, Database, EngineError, Environment, Locking, OpenOptions, Session,
-    SessionOptions, Value,
+    AttachSource, CreateOptions, Database, EngineError, Environment, Locking, OpenOptions,
+    Ownership, Session, SessionOptions, Value,
 };
 
 fn main() {
@@ -24,12 +24,38 @@ fn run() -> Result<(), EngineError> {
         // databases as their page-service owner on command. PATH is the repository root.
         return owner_idle(&path);
     }
-    let timeout = args.next().and_then(|s| s.parse().ok()).unwrap_or(5000);
-    // The page-service owner's idle-in-transaction timeout (spec/design/page-service.md §11.1).
-    let idle = args
-        .next()
+    // Positional arguments after the path: the open timeout, then the page-service owner's
+    // idle-in-transaction timeout (spec/design/page-service.md §11.1). key=value arguments set the
+    // handoff options (spec/pageservice/README.md §6.5): ownership=prefer|yield|never, yield_grace,
+    // shutdown_grace, idle_session (milliseconds), max_connections.
+    let mut positional = Vec::new();
+    let mut options = std::collections::HashMap::new();
+    for arg in args {
+        match arg.split_once('=') {
+            Some((key, value)) => {
+                options.insert(key.to_string(), value.to_string());
+            }
+            None => positional.push(arg),
+        }
+    }
+    let timeout = positional
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
+    let idle = positional
+        .get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(jed::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS);
+    let millis = |key: &str| options.get(key).map(|v| v.parse().unwrap_or(0));
+    let ownership = match options.get("ownership").map(String::as_str) {
+        Some("yield") => Ownership::Yield,
+        Some("never") => Ownership::Never,
+        _ => Ownership::Prefer,
+    };
+    let max_connections = options
+        .get("max_connections")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let locking = match action.as_str() {
         "open-exclusive" => Locking::Exclusive,
         // The test-only page-service mode (spec/design/page-service.md §16).
@@ -42,6 +68,11 @@ fn run() -> Result<(), EngineError> {
             locking,
             file_lock_timeout_ms: timeout,
             idle_in_transaction_timeout_ms: idle,
+            idle_session_timeout_ms: millis("idle_session"),
+            yield_grace_ms: millis("yield_grace"),
+            shutdown_grace_ms: millis("shutdown_grace"),
+            max_connections,
+            ownership,
             ..CreateOptions::default()
         })?
     } else {
@@ -52,6 +83,11 @@ fn run() -> Result<(), EngineError> {
                 file_lock_timeout_ms: timeout,
                 idle_in_transaction_timeout_ms: idle,
                 read_only: action == "open-service-read-only",
+                idle_session_timeout_ms: millis("idle_session"),
+                yield_grace_ms: millis("yield_grace"),
+                shutdown_grace_ms: millis("shutdown_grace"),
+                max_connections,
+                ownership,
                 ..OpenOptions::default()
             },
         )?
@@ -144,14 +180,23 @@ fn run() -> Result<(), EngineError> {
                 database.hang_up_next_page_service_ack_for_testing();
                 Ok(String::new())
             }
+            "CRASH_NEXT_ACK" => {
+                // Exit instead of acknowledging the next client commit (spec/pageservice/README.md
+                // §6.5).
+                database.crash_before_next_page_service_ack_for_testing();
+                Ok(String::new())
+            }
+            // The page-service role test hook (spec/pageservice/README.md §6.5).
+            "ROLE" => Ok(database.page_service_role_for_testing().to_string()),
             "TXID" => Ok(database.txid().to_string()),
             "PAGE_COUNT" => Ok(database.page_count().to_string()),
             "CLOSE" => {
+                // Acknowledged at once: an owner then drains its clients before it exits
+                // (spec/pageservice/README.md §6.5), and the harness waits for the exit status.
                 drop(reader.take());
                 drop(writer.take());
-                database.close()?;
                 reply_ok("");
-                return Ok(());
+                return database.close();
             }
             other => panic!("unknown actor command {other}"),
         };

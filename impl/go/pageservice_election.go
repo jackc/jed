@@ -1,37 +1,56 @@
 package jed
 
-// Election at open under the test-only LockingService (spec/design/page-service.md §4.3): the opener
-// that takes presence EX owns the database and serves it; every other opener connects to the owner's
-// endpoint as a read-only page client (phase 2). The OS lock is the only authority — the owner record
-// only tells a client where to connect and words its timeout error.
+// Election under the test-only LockingService (spec/design/page-service.md §4.3; spec/pageservice/
+// README.md §6.1, §6.5): the opener that takes presence EX owns the database and serves it; every other
+// opener connects to the owner's endpoint as a page client. A client whose connection ends runs the
+// same election again (re-election). The OS lock is the only authority — the owner record only tells
+// a client where to connect and words its timeout error.
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"time"
 )
 
-// serviceElection is the outcome of an open-time election: exactly one of owner and client is set.
+// serviceElection is the outcome of an election: exactly one of owner and client is set. A client
+// arrives opened: clientEngine is its engine over the connection (openPageClient).
 type serviceElection struct {
-	owner  *fileCoordinator
-	client *psClient
-	path   string
+	owner        *fileCoordinator
+	client       *psClient
+	clientEngine *engine
+}
+
+// electOptions shape one election: never skips presence tries (OwnershipNever), pauseUntil skips them
+// until then (the handoff pause), and reelect marks a re-election, which keeps the handle's existing
+// process-local path claim. opts and env open the client's engine.
+type electOptions struct {
+	never      bool
+	pauseUntil time.Time
+	reelect    bool
+	opts       OpenOptions
+	env        *Environment
 }
 
 // electService runs the election for the database at path (already resolved as prepareOpenCoordinator
-// resolves it). It retries until the open timeout: presence may free up, and a new owner may not have
-// bound its endpoint yet.
-func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool) (serviceElection, error) {
-	if !host.claimPath(path) {
+// resolves it). It retries until the open timeout: presence may free up, a new owner may not have bound
+// its endpoint yet, and a draining owner closes the connection of a client that opened during the drain.
+func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool, eo electOptions) (serviceElection, error) {
+	if !eo.reelect && !host.claimPath(path) {
 		return serviceElection{}, newError(ObjectInUse, "database is already open in this process: "+path+" (share one Database handle)")
 	}
 	files, err := host.openBundle(path)
 	if err != nil {
-		host.releasePath(path)
+		if !eo.reelect {
+			host.releasePath(path)
+		}
 		return serviceElection{}, err
 	}
 	fail := func(err error) (serviceElection, error) {
 		host.closeFiles(files)
-		host.releasePath(path)
+		if !eo.reelect {
+			host.releasePath(path)
+		}
 		return serviceElection{}, err
 	}
 	deadline := fileLockDeadline(host, timeoutOpt)
@@ -44,16 +63,19 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool)
 	}
 	reason := ""
 	for {
-		owned, err := host.tryLock(files.presence, true)
-		if err != nil {
-			_ = host.unlock(files.arrival)
-			return fail(classifyLockError(err))
-		}
-		if owned {
-			_ = host.unlock(files.arrival)
-			c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid(), stop: make(chan struct{}), done: make(chan struct{})}
-			c.setLease(leaseServiceOwner)
-			return serviceElection{owner: c, path: path}, nil
+		if !eo.never && !time.Now().Before(eo.pauseUntil) {
+			owned, err := host.tryLock(files.presence, true)
+			if err != nil {
+				_ = host.unlock(files.arrival)
+				return fail(classifyLockError(err))
+			}
+			if owned {
+				_ = host.unlock(files.arrival)
+				c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid(), stop: make(chan struct{}), done: make(chan struct{})}
+				c.setLease(leaseServiceOwner)
+				c.keepPath = true
+				return serviceElection{owner: c}, nil
+			}
 		}
 		record, ok := readOwnerRecord(path)
 		switch {
@@ -67,13 +89,19 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool)
 			reason = ""
 			cl, retry, err := connectPageClient(path, record.endpoint, readOnly)
 			if err == nil {
-				// A client holds no bundle lock while connected (page-service.md §4.2).
-				_ = host.unlock(files.arrival)
-				host.closeFiles(files)
-				cl.release = func() { host.releasePath(path) }
-				return serviceElection{client: cl, path: path}, nil
-			}
-			if !retry {
+				e, err := openPageClient(cl, eo.opts, eo.env)
+				if err == nil {
+					// A client holds no bundle lock while connected (page-service.md §4.2).
+					_ = host.unlock(files.arrival)
+					host.closeFiles(files)
+					return serviceElection{client: cl, clientEngine: e}, nil
+				}
+				cl.close()
+				if !isConnectionFailure(err) {
+					_ = host.unlock(files.arrival)
+					return fail(err)
+				}
+			} else if !retry || (isTooManyConnections(err) && !eo.reelect) {
 				_ = host.unlock(files.arrival)
 				return fail(err)
 			}
@@ -87,6 +115,11 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool)
 		}
 		host.pause()
 	}
+}
+
+func isTooManyConnections(err error) bool {
+	var engine *EngineError
+	return errors.As(err, &engine) && engine.Code() == "53300"
 }
 
 // resolveServicePath resolves an open path as prepareOpenCoordinator does (symlinks, hard links).
@@ -120,60 +153,54 @@ func openServiceDatabase(path string, opts OpenOptions) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
-	election, err := electService(osLocks, real, opts.FileLockTimeoutMs, opts.ReadOnly)
+	if opts.Environment == nil {
+		opts.Environment = NewEnvironment()
+	}
+	h := newServiceHandoff(osLocks, real, opts)
+	election, err := electService(osLocks, real, opts.FileLockTimeoutMs, opts.ReadOnly, electOptions{never: opts.Ownership == OwnershipNever, opts: opts, env: opts.Environment})
 	if err != nil {
 		return nil, err
-	}
-	env := opts.Environment
-	if env == nil {
-		env = NewEnvironment()
 	}
 	if election.client != nil {
-		e, err := openPageClient(election.client, opts, env)
-		if err != nil {
-			election.client.close()
-			return nil, err
-		}
+		e := election.clientEngine
 		e.spill = osSpillHost{dir: os.TempDir()}
 		c := sharedCoreFromEngineCoordinated(e, nil)
-		c.client = election.client
-		c.client.timeoutMs = defaultFileLockTimeoutMs
-		if opts.FileLockTimeoutMs != nil {
-			c.client.timeoutMs = *opts.FileLockTimeoutMs
-		}
-		c.storage.serviceClient = true
-		c.storage.recordCommits = true
+		c.handoff = h
 		c.storage.budget.limit = opts.MaxStorageBytes
+		r := &serviceRole{gen: 1, client: election.client}
+		c.installRole(r, e)
+		c.watchClient(r)
+		c.requestOwnershipIfPreferred(election.client)
 		return databaseOver(c), nil
 	}
-	opts.Locking = LockingNone
-	opts.Environment = env
-	e, err := openWithOptions(real, opts)
+	ownerOpts := opts
+	ownerOpts.Locking = LockingNone
+	e, err := openWithOptions(real, ownerOpts)
 	if err != nil {
 		election.owner.close()
+		osLocks.releasePath(real)
 		return nil, err
 	}
-	return startServiceOwner(e, election.owner, real, opts.MaxStorageBytes, idleInTransactionTimeoutMs(opts.IdleInTransactionTimeoutMs))
-}
-
-// idleInTransactionTimeoutMs resolves the owner's idle-in-transaction timeout option (nil: 60 s).
-func idleInTransactionTimeoutMs(value *uint64) uint64 {
-	if value == nil {
-		return defaultIdleInTransactionTimeoutMs
-	}
-	return *value
+	return startServiceOwner(e, election.owner, h)
 }
 
 // startServiceOwner lifts an opened or created engine into a serving owner's shared core.
-func startServiceOwner(e *engine, coord *fileCoordinator, real string, maxStorageBytes int64, idleTimeoutMs uint64) (*Database, error) {
-	c := sharedCoreFromEngineCoordinated(e, coord)
-	c.storage.budget.limit = maxStorageBytes
-	service, err := startPageServiceOwner(c, real, idleTimeoutMs)
+func startServiceOwner(e *engine, coord *fileCoordinator, h *serviceHandoff) (*Database, error) {
+	c := sharedCoreFromEngineCoordinated(e, nil)
+	c.handoff = h
+	c.storage.budget.limit = h.opts.MaxStorageBytes
+	o, err := newPageServiceOwner(c, e.paging, e.committed.txid, h, coord)
 	if err != nil {
+		_ = e.paging.close()
+		coord.close()
+		h.host.releasePath(h.path)
+		return nil, err
+	}
+	c.installRole(&serviceRole{gen: 1, owner: o}, e)
+	if err := o.start(); err != nil {
 		db := databaseOver(c)
 		_ = db.Close()
 		return nil, err
 	}
-	c.service = service
 	return databaseOver(c), nil
 }

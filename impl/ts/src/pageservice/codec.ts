@@ -61,6 +61,7 @@ export const PS_HELLO_FLAG_READ_ONLY = 0x01;
 // hello_ok.flags
 export const PS_HELLO_OK_FLAG_CONNECTION_READ_ONLY = 0x01;
 export const PS_HELLO_OK_FLAG_OWNER_READ_ONLY = 0x02;
+export const PS_HELLO_OK_FLAG_OWNER_YIELDS = 0x04;
 // error.flags
 export const PS_ERROR_FLAG_FATAL = 0x01;
 // read_begun.invalidate / write_begun.invalidate

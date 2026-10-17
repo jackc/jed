@@ -113,9 +113,12 @@ from a page service), though both are servers.
    never change an outcome.
 4. A stale endpoint left by a crashed owner is harmless: only a `presence EX` holder may replace it.
 
-A client that is not configured `ownership = never` (§8.2) also polls `presence EX` in the
-background with non-blocking try-locks, so it can promote when the owner leaves. The polls pause
-during a yield handoff (§8.2).
+A client learns that the owner left from its connection: the owner releases `presence EX` only after
+closing every connection (or by dying, which closes them). So a client polls `presence EX`, with
+non-blocking try-locks, only after its connection ends: it re-elects, promoting itself unless it is
+configured `ownership = never` (§8.2), or reconnecting to whichever process took ownership. The polls
+pause during a yield handoff (§8.2). The exact rules are
+[spec/pageservice/README.md](../pageservice/README.md) §6.5.
 
 ## 5. The page service
 
@@ -378,7 +381,8 @@ transaction. Two `prefer` processes never yield to each other.
 **Handoff ordering.** An OS lock cannot be handed to a chosen process, so other pollers must stand
 aside. When a yield begins, the owner tells every connected client which connection requested
 ownership. Every other client, including the yielding tool once it is a client, pauses its
-`presence EX` polls for a handoff window; only the requester keeps polling. If the requester's
+`presence EX` polls for a handoff window of 2 seconds after its connection ends; only the requester
+keeps polling. If the requester's
 connection drops before the owner releases, the owner cancels the yield and keeps ownership. If the
 requester dies after the release, the handoff window expires, every client resumes polling, and
 ordinary promotion (§8.1) picks an owner, possibly the yielding tool again, which a later `prefer`

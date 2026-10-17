@@ -208,6 +208,9 @@ pub(crate) struct FileCoordinator {
     probe: Mutex<Option<JoinHandle<()>>>,
     probe_started: AtomicBool,
     opener_pid: u32,
+    /// Leave the process-local path claim at drop: a page-service owner's claim belongs to its
+    /// handle, which keeps the path through role changes (page-service.md §8).
+    keep_path: bool,
 }
 
 /// An RAII whole-file lock used for the short commit/meta adoption gates.
@@ -256,6 +259,7 @@ impl FileCoordinator {
             probe: Mutex::new(None),
             probe_started: AtomicBool::new(false),
             opener_pid,
+            keep_path: true,
         }
     }
 
@@ -355,6 +359,7 @@ impl FileCoordinator {
                     probe: Mutex::new(None),
                     probe_started: AtomicBool::new(false),
                     opener_pid,
+                    keep_path: false,
                 })
             }
             Err(e) => {
@@ -368,6 +373,12 @@ impl FileCoordinator {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Leave the process-local path claim at drop: the claim belongs to the page-service handle
+    /// this coordinator's presence EX made the owner (page-service.md §8).
+    pub(crate) fn keep_path_claim(&mut self) {
+        self.keep_path = true;
     }
 
     pub(crate) fn state(&self) -> LeaseState {
@@ -505,7 +516,9 @@ impl Drop for FileCoordinator {
             }
         }
         self.host.close_files(&self.files);
-        self.host.release_path(&self.path);
+        if !self.keep_path {
+            self.host.release_path(&self.path);
+        }
     }
 }
 

@@ -34,13 +34,41 @@ class Actor
     action, *extra = action.split
     @stdin, @stdout, @stderr, @wait = Open3.popen3(*command, action, path, *extra)
     line = read_line(START_TIMEOUT)
-    raise "#{core} actor failed to start: #{line || @stderr.read}" unless line == "READY\n"
+    return if line == "READY\n"
+    # A failed open answers ERR <sqlstate> and exits; a `start` step with expect_error checks the code.
+    status, code = line.to_s.chomp.split("\t", 3)
+    raise StartFailed, code if status == "ERR"
+    raise "#{core} actor failed to start: #{line || @stderr.read}"
   end
 
+  class StartFailed < StandardError; end
+
   def command(name, argument = "")
+    send_command(name, argument)
+    reply
+  end
+
+  # An `async` step sends its command and leaves the reply for a later `await` step.
+  def send_command(name, argument = "")
     @stdin.puts(argument.empty? ? name : "#{name}\t#{argument}")
     @stdin.flush
+  end
+
+  def reply
     parse(read_line(Actor.command_timeout))
+  end
+
+  # An `async` close: the actor acknowledges CLOSE at once, then closes its database (an owner drains its
+  # clients first, spec/pageservice/README.md §6.5); `await` waits for it to exit.
+  def start_close
+    command("CLOSE")
+  end
+
+  def finish_close
+    @wait.join(Actor.command_timeout) or raise "actor did not exit after CLOSE"
+    status = @wait.value
+    raise "actor exited with #{status.exitstatus} after CLOSE; stderr=#{@stderr.read}" unless status.success?
+    close_pipes
   end
 
   def kill
@@ -52,8 +80,7 @@ class Actor
   def close
     return unless @wait.alive?
     command("CLOSE")
-    @wait.join(Actor.command_timeout) or raise "actor did not exit after CLOSE"
-    close_pipes
+    finish_close
   end
 
   def cleanup
@@ -121,6 +148,7 @@ def run_scenario(path, first_core, second_core)
       File.binwrite(File.join(dir, "shared.jed"), File.binread(fixture_path))
     end
     actors = {}
+    closing = {}
     begin
       data.fetch("step").each_with_index do |step, index|
         begin
@@ -129,7 +157,13 @@ def run_scenario(path, first_core, second_core)
           if command == "start"
             core = actor_name == "a" ? first_core : second_core
             actor_path = File.join(dir, "#{step.fetch('path', 'shared')}.jed")
-            actors[actor_name] = Actor.new(core, step.fetch("argument"), actor_path)
+            begin
+              actors[actor_name] = Actor.new(core, step.fetch("argument"), actor_path)
+            rescue Actor::StartFailed => failed
+              raise "start failed with #{failed.message}" unless step["expect_error"] == failed.message
+              next
+            end
+            raise "expected start to fail with #{step['expect_error']}" if step["expect_error"]
             next
           end
           if command == "sleep"
@@ -138,17 +172,43 @@ def run_scenario(path, first_core, second_core)
             next
           end
           actor = actors.fetch(actor_name)
+          if command == "await"
+            # The reply of this actor's earlier `async` step: an exit after an async close, or a command's
+            # reply checked against this step's expectation.
+            if closing.delete(actor_name)
+              actor.finish_close
+              actors.delete(actor_name)
+              next
+            end
+            result = actor.reply
+            if expected = step["expect_error"]
+              raise "expected #{expected}, got #{result.inspect}" unless result[0] == :error && result[1] == expected
+            else
+              raise "command failed: #{result.inspect}" unless result[0] == :ok
+              raise "expected #{step.fetch('expect', '').inspect}, got #{result[1].inspect}" unless result[1] == step.fetch("expect", "")
+            end
+            next
+          end
           if command == "kill"
             actor.kill
             actors.delete(actor_name)
             next
           end
           if command == "close"
-            actor.close
-            actors.delete(actor_name)
+            if step["async"]
+              actor.start_close
+              closing[actor_name] = true
+            else
+              actor.close
+              actors.delete(actor_name)
+            end
             next
           end
           wire, argument = actor_command(step, dir)
+          if step["async"]
+            actor.send_command(wire, argument)
+            next
+          end
           # `repeat`: run the command this many times; every run must satisfy the step.
           (step.fetch("repeat", 1) - 1).times do
             result = actor.command(wire, argument)

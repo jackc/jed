@@ -115,6 +115,16 @@ impl SharedPaging {
         self.pool.invalidate_all();
     }
 
+    /// Make every later access through this paging fail with `error` and close its store: a
+    /// page-service owner that released ownership no longer touches the file
+    /// (spec/pageservice/README.md §6.5). Leaves already in the pool still serve the snapshots that
+    /// cached them.
+    pub(crate) fn revoke(&self, error: crate::error::EngineError) {
+        let mut pager = self.pager();
+        drop(pager.swap_store(Box::new(crate::blockstore::RevokedBlockStore(error))));
+        pager.poison();
+    }
+
     /// The pool's leaf-page capacity — carried over to the replacement pool when compaction
     /// reopens the database (spec/design/api.md §2.6).
     pub(crate) fn capacity(&self) -> usize {

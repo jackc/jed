@@ -124,6 +124,18 @@ type OpenOptions struct {
 	// nothing for this long is revoked (25P03 at its next request). nil is the 60 s default; &0
 	// disables it. Only LockingService reads it.
 	IdleInTransactionTimeoutMs *uint64
+	// IdleSessionTimeoutMs closes a page-service connection idle between transactions for this long
+	// (page-service.md §11.1); nil or &0 never does. YieldGraceMs and ShutdownGraceMs are how long a
+	// yielding or closing owner lets running transactions finish (nil: 5 s and 30 s). MaxConnections
+	// bounds an owner's connections (53300 beyond it); 0 is unlimited. Only LockingService reads them,
+	// as an owner's limits; a client keeps them for the day it becomes owner.
+	IdleSessionTimeoutMs *uint64
+	YieldGraceMs         *uint64
+	ShutdownGraceMs      *uint64
+	MaxConnections       int
+	// Ownership is the opener's ownership preference under the page service (page-service.md §8.2):
+	// OwnershipPrefer (the default), OwnershipYield, or OwnershipNever. Only LockingService reads it.
+	Ownership Ownership
 	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
 	// time-zone data the file's references resolve against, the host functions, and the random + clock
 	// sources. Shared by the handle's sessions, attachments, and temp domains; not stored in the file,

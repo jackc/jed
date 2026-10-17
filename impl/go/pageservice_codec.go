@@ -61,6 +61,7 @@ const (
 	psHelloFlagReadOnly        uint8 = 1 << 0 // hello: the client asks for a read-only connection
 	psHelloOKFlagReadOnly      uint8 = 1 << 0 // hello_ok: the connection is read-only
 	psHelloOKFlagOwnerReadOnly uint8 = 1 << 1 // hello_ok: the owner's own handle is read-only
+	psHelloOKFlagOwnerYields   uint8 = 1 << 2 // hello_ok: the owner's ownership preference is yield
 	psErrorFlagFatal           uint8 = 1 << 0 // error: the owner closes the connection after it
 	psOwnerFlagServing         uint8 = 1 << 0 // owner record: the owner serves
 )

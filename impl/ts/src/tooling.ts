@@ -120,3 +120,21 @@ export function hangUpNextPageServiceAckForTesting(db: object): void {
   const internal = db as { core: { service: { hangUpNextAck(): void } | null } };
   internal.core.service?.hangUpNextAck();
 }
+
+// crashBeforeNextPageServiceAckForTesting makes a serving page-service owner end its process instead of
+// acknowledging its next client commit, after the commit is durable, so the client resolves the commit
+// under the next owner — itself, when it is the only other process (spec/pageservice/README.md §6.5).
+// Test-only; no effect on a handle that is not a page-service owner.
+export function crashBeforeNextPageServiceAckForTesting(db: object): void {
+  const internal = db as { core: { service: { crashBeforeNextAck(): void } | null } };
+  internal.core.service?.crashBeforeNextAck();
+}
+
+// pageServiceRoleForTesting reports a handle's page-service role: "owner", "client", or "none" (not
+// under the page service, or between roles). Test-only (spec/pageservice/README.md §6.5).
+export function pageServiceRoleForTesting(db: object): "owner" | "client" | "none" {
+  const internal = db as {
+    core: { handoff: object | null; roleKind: "owner" | "client" | "none" };
+  };
+  return internal.core.handoff === null ? "none" : internal.core.roleKind;
+}

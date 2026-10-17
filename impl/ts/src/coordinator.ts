@@ -282,6 +282,9 @@ export class FileCoordinator implements FileCoordinatorHost {
   private readonly openerPid: number;
   private stopProbe: (() => void) | null = null;
   private closed = false;
+  // keepPath leaves the process-local path claim at close: a page-service owner's claim belongs to its
+  // handle, which keeps the path through role changes (spec/pageservice/README.md §6.5).
+  private keepPath = false;
 
   private constructor(host: LockHost, path: string, files: LockFiles, state: LeaseState) {
     this.host = host;
@@ -361,7 +364,15 @@ export class FileCoordinator implements FileCoordinatorHost {
   // fromElection wraps the bundle an elected page-service owner holds (presence EX, arrival released):
   // it behaves as an exclusive lease — no join-window probe (spec/pageservice/README.md §6.1).
   static fromElection(host: LockHost, path: string, files: LockFiles): FileCoordinator {
-    return new FileCoordinator(host, path, files, "exclusive");
+    const coordinator = new FileCoordinator(host, path, files, "exclusive");
+    coordinator.keepPath = true;
+    return coordinator;
+  }
+
+  // keepPathClaim makes close leave the process-local path claim (a page-service creator's handle
+  // releases it itself).
+  keepPathClaim(): void {
+    this.keepPath = true;
   }
 
   checkPid(): void {
@@ -434,6 +445,6 @@ export class FileCoordinator implements FileCoordinatorHost {
     if (this.stopProbe !== null) this.stopProbe();
     this.stopProbe = null;
     this.host.closeFiles(this.files);
-    this.host.releasePath(this.path);
+    if (!this.keepPath) this.host.releasePath(this.path);
   }
 }

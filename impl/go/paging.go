@@ -173,3 +173,24 @@ func (s *sharedPaging) setCapacity(capacity int) {
 func (s *sharedPaging) residentLeaves() int {
 	return s.pool.resident()
 }
+
+// revoke makes every later access through this paging fail with err and closes the store: a page-service
+// owner that released ownership no longer touches the file (spec/pageservice/README.md §6.5). Pages
+// already in the pool still serve the snapshots that cached them.
+func (s *sharedPaging) revoke(err error) {
+	s.pagerMu.Lock()
+	defer s.pagerMu.Unlock()
+	_ = s.pgr.store.close()
+	s.pgr.store = revokedStore{err: err}
+	s.pgr.poisoned = true
+}
+
+// revokedStore is the byte store of revoked storage: every operation fails.
+type revokedStore struct{ err error }
+
+func (r revokedStore) readAt(int64, int) ([]byte, error) { return nil, r.err }
+func (r revokedStore) writeAt(int64, []byte) error       { return r.err }
+func (r revokedStore) sync() error                       { return r.err }
+func (r revokedStore) size() (int64, error)              { return 0, r.err }
+func (r revokedStore) setSize(int64) error               { return r.err }
+func (r revokedStore) close() error                      { return nil }

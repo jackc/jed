@@ -13,6 +13,14 @@
 // commit_status (from any connection) never observes it half published. When a client commit leaves
 // the high-water past the reclamation threshold, the worker hands the gate to the engine thread, which
 // runs the maintenance commit and releases it (README §6.4; the worker has no engine).
+//
+// Handoff (README §6.5). The worker answers request_ownership and keeps the shared handoff state: an
+// accepted request sets it to yielding, sends notice kind 1 to every connection, and tells the engine
+// thread, which drains and releases ownership (a release stops serving here). While the owner does not
+// serve — yielding, closing, or releasing — client begins are parked unanswered; a requester that
+// disconnects during the drain cancels the yield (notice kind 2) and the parked begins are answered.
+// The owner's limits: a connection idle between transactions for the idle-session timeout is closed
+// without an error frame, and a hello beyond the maximum connections is refused with 53300.
 
 import {
   closeSync,
@@ -24,6 +32,7 @@ import {
   writeSync,
 } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
+import process from "node:process";
 import { type MessagePort, workerData } from "node:worker_threads";
 
 import "../crc32_node.ts";
@@ -37,8 +46,13 @@ import {
   PS_HELLO_FLAG_READ_ONLY,
   PS_HELLO_OK_FLAG_CONNECTION_READ_ONLY,
   PS_HELLO_OK_FLAG_OWNER_READ_ONLY,
+  PS_HELLO_OK_FLAG_OWNER_YIELDS,
   PS_INVALIDATE_ALL,
   PS_INVALIDATE_EXACT,
+  PS_NOTICE_YIELD_BEGUN,
+  PS_NOTICE_YIELD_CANCELLED,
+  PS_OWNERSHIP_REFUSED,
+  PS_OWNERSHIP_YIELDING,
   PS_PROTOCOL_VERSION,
   psMaxReadPages,
   type PsBeginWrite,
@@ -48,7 +62,15 @@ import {
   type PsMessage,
 } from "./codec.ts";
 import { Delta, type DeltaBase, DeltaFailure, readFreeListChain } from "./delta.ts";
-import { GATE_FREE, GATE_WORKER, ServiceState } from "./shared_state.ts";
+import {
+  ACK_CRASH,
+  ACK_HANG_UP,
+  GATE_FREE,
+  GATE_WORKER,
+  OWNER_SERVING,
+  OWNER_YIELDING,
+  ServiceState,
+} from "./shared_state.ts";
 
 // OwnerServe asks the worker to serve one owned database (owner.ts); OwnerStop stops serving it.
 // notify is the engine thread's port for gate handoffs (a maintenance commit, README §6.4).
@@ -62,11 +84,19 @@ export type OwnerServe = {
   formatVersion: number;
   incarnation: Uint8Array;
   ownerReadOnly: boolean;
+  // preferYield: the owner's ownership preference is yield (hello_ok bit 2, README §6.5).
+  preferYield: boolean;
   noSync: boolean;
   idleTimeoutMs: number;
+  // idleSessionTimeoutMs closes a connection idle between transactions (0: never); maxConnections
+  // refuses further hellos with 53300 (0: unlimited). README §6.5.
+  idleSessionTimeoutMs: number;
+  maxConnections: number;
   notify: MessagePort;
 };
 export type OwnerStop = { op: "stop"; id: number };
+// OwnerNotice sends a notice to every connection of one database (a graceful close's kind 3).
+export type OwnerNotice = { op: "notice"; id: number; kind: number };
 // OwnerPoison makes the worker stop serving one database whose owner handle failed a commit.
 export type OwnerPoison = { op: "poison"; id: number };
 
@@ -123,8 +153,11 @@ class Served {
   readonly formatVersion: number;
   readonly incarnation: Uint8Array;
   readonly ownerReadOnly: boolean;
+  readonly preferYield: boolean;
   readonly noSync: boolean;
   readonly idleTimeoutMs: number;
+  readonly idleSessionTimeoutMs: number;
+  readonly maxConnections: number;
   readonly notify: MessagePort;
   readonly connections = new Set<Connection>();
   readonly server: Server;
@@ -143,8 +176,11 @@ class Served {
     this.formatVersion = m.formatVersion;
     this.incarnation = m.incarnation;
     this.ownerReadOnly = m.ownerReadOnly;
+    this.preferYield = m.preferYield;
     this.noSync = m.noSync;
     this.idleTimeoutMs = m.idleTimeoutMs;
+    this.idleSessionTimeoutMs = m.idleSessionTimeoutMs;
+    this.maxConnections = m.maxConnections;
     this.notify = m.notify;
     this.fd = openSync(m.dbPath, this.ownerReadOnly ? "r" : "r+");
     this.fdGeneration = this.state.fileGeneration();
@@ -211,6 +247,35 @@ class Served {
     for (const connection of this.connections) connection.destroy();
   }
 
+  // broadcast sends a notice to every connection (README §3.7).
+  broadcast(kind: number, connectionId: bigint): void {
+    for (const connection of this.connections) connection.notice(kind, connectionId);
+  }
+
+  // cancelYield resumes serving after the requester disconnected during the drain (README §6.5):
+  // notice kind 2, then the parked begins are answered. A drain that already ended (releasing) is
+  // not cancelled.
+  cancelYield(requester: bigint): void {
+    this.state.lock();
+    let cancelled = false;
+    try {
+      if (
+        this.state.ownerState() === OWNER_YIELDING &&
+        this.state.requesterLocked() === requester
+      ) {
+        this.state.setOwnerStateLocked(OWNER_SERVING);
+        this.state.setRequesterLocked(0n);
+        cancelled = true;
+      }
+    } finally {
+      this.state.unlock();
+    }
+    if (!cancelled) return;
+    this.broadcast(PS_NOTICE_YIELD_CANCELLED, 0n);
+    for (const connection of this.connections) connection.answerParked();
+    this.notify.postMessage("cancel");
+  }
+
   closeFile(): void {
     try {
       closeSync(this.fd);
@@ -251,6 +316,11 @@ class Connection {
   private revoked = false;
   private revokedBase = 0n;
   private idle: ReturnType<typeof setTimeout> | null = null;
+  // parked holds begins left unanswered while the owner does not serve (README §6.5); a cancelled
+  // yield answers them.
+  private parked: (() => void)[] = [];
+  // session closes the connection after the idle-session timeout (page-service.md §11.1).
+  private session: ReturnType<typeof setTimeout> | null = null;
 
   constructor(db: Served, socket: Socket) {
     this.db = db;
@@ -261,7 +331,29 @@ class Connection {
     socket.on("close", () => {
       this.teardown();
       this.db.connections.delete(this);
+      this.db.cancelYield(this.id);
     });
+    this.armSession();
+  }
+
+  // notice sends an unsolicited notice (request id 0).
+  notice(kind: number, connectionId: bigint): void {
+    this.send(0, { kind: "notice", noticeKind: kind, connectionId });
+  }
+
+  // answerParked answers the begins parked during a cancelled yield.
+  answerParked(): void {
+    const parked = this.parked;
+    this.parked = [];
+    for (const run of parked) {
+      if (this.dead) return;
+      run();
+    }
+  }
+
+  // admitting reports whether begins are answered rather than parked.
+  private admitting(): boolean {
+    return this.db.state.ownerState() === OWNER_SERVING;
   }
 
   destroy(): void {
@@ -272,6 +364,9 @@ class Connection {
   // and every pin.
   private teardown(): void {
     this.dead = true;
+    this.parked = [];
+    if (this.session !== null) clearTimeout(this.session);
+    this.session = null;
     if (this.write !== null && !this.write.finishing) this.abortWrite();
     this.releasePins();
   }
@@ -311,6 +406,18 @@ class Connection {
     }
     switch (m.kind) {
       case "begin_read":
+        if (!this.admitting()) {
+          // Parked while the owner drains (README §6.5); a cancelled yield answers it.
+          const { incarnation, lastTxid } = m;
+          this.parked.push(() => {
+            try {
+              this.send(requestId, this.beginRead(incarnation, lastTxid));
+            } catch (error) {
+              this.fail(requestId, error);
+            }
+          });
+          return null;
+        }
         return this.beginRead(m.incarnation, m.lastTxid);
       case "read_pages":
         return this.readPages(m.txid, m.indices);
@@ -333,6 +440,8 @@ class Connection {
         return null;
       case "commit_status":
         return this.commitStatus(m.txid, m.digest);
+      case "request_ownership":
+        return this.requestOwnership();
       default:
         throw violation(`unexpected message ${m.kind}`);
     }
@@ -361,6 +470,15 @@ class Connection {
       flags |= PS_HELLO_OK_FLAG_CONNECTION_READ_ONLY;
     }
     if (this.db.ownerReadOnly) flags |= PS_HELLO_OK_FLAG_OWNER_READ_ONLY;
+    if (this.db.preferYield) flags |= PS_HELLO_OK_FLAG_OWNER_YIELDS;
+    const limit = this.db.maxConnections;
+    if (limit > 0 && this.db.connections.size > limit) {
+      throw new Failure(
+        "53300",
+        `the database owner already serves its maximum number of connections (${limit})`,
+        true,
+      );
+    }
     return {
       kind: "hello_ok",
       protocol: PS_PROTOCOL_VERSION,
@@ -370,6 +488,37 @@ class Connection {
       flags,
       maxReadPages: this.db.maxReadPages,
     };
+  }
+
+  // requestOwnership answers request_ownership (README §6.5): an owner whose preference is yield, or
+  // whose handle is read-only, yields to the first requester while it serves; the requester asking
+  // again is answered 0 again; anyone else, or any request while yielding or closing, is refused.
+  private requestOwnership(): PsMessage {
+    const state = this.db.state;
+    state.lock();
+    let accepted = false;
+    let status = PS_OWNERSHIP_REFUSED;
+    try {
+      const current = state.ownerState();
+      if (current === OWNER_YIELDING && state.requesterLocked() === this.id) {
+        status = PS_OWNERSHIP_YIELDING;
+      } else if (current === OWNER_SERVING && (this.db.preferYield || this.db.ownerReadOnly)) {
+        state.setOwnerStateLocked(OWNER_YIELDING);
+        state.setRequesterLocked(this.id);
+        status = PS_OWNERSHIP_YIELDING;
+        accepted = true;
+      }
+    } finally {
+      state.unlock();
+    }
+    if (accepted) {
+      // The reply goes first, then the notice to every connection, then the engine thread drains.
+      queueMicrotask(() => {
+        this.db.broadcast(PS_NOTICE_YIELD_BEGUN, this.id);
+        this.db.notify.postMessage("yield");
+      });
+    }
+    return { kind: "ownership_reply", status };
   }
 
   // pinCommittedLocked pins the committed snapshot for this connection. The caller holds the lock.
@@ -477,6 +626,11 @@ class Connection {
       throw idleRevoked();
     }
     this.waiting = true;
+    if (!this.admitting()) {
+      // Parked while the owner drains (README §6.5); a cancelled yield starts the wait.
+      this.parked.push(() => void this.waitForGate(requestId, m));
+      return;
+    }
     void this.waitForGate(requestId, m);
   }
 
@@ -584,9 +738,30 @@ class Connection {
     };
   }
 
-  // touch restarts the idle-in-transaction timer on every received frame.
+  // touch restarts the idle-in-transaction and idle-session timers on every received frame.
   private touch(): void {
     if (this.write !== null && !this.write.finishing) this.armIdle();
+    this.armSession();
+  }
+
+  // armSession (re)starts the idle-session timer (page-service.md §11.1).
+  private armSession(): void {
+    const timeout = this.db.idleSessionTimeoutMs;
+    if (timeout <= 0 || this.dead) return;
+    if (this.session !== null) clearTimeout(this.session);
+    this.session = setTimeout(() => this.idleSessionExpired(), timeout);
+  }
+
+  // idleSessionExpired closes a connection idle between transactions — no pin, no write transaction,
+  // no begin waiting — without an error frame; a busy connection's timer starts again.
+  private idleSessionExpired(): void {
+    this.session = null;
+    if (this.dead) return;
+    if (this.pins.size > 0 || this.write !== null || this.waiting || this.parked.length > 0) {
+      this.armSession();
+      return;
+    }
+    this.socket.destroy();
   }
 
   private armIdle(): void {
@@ -759,7 +934,9 @@ class Connection {
     if (n <= 1) this.pins.delete(w.base);
     else this.pins.set(w.base, n - 1);
     this.write = null;
-    if (state.takeHangUp()) this.socket.destroy();
+    const hook = state.takeAckHook();
+    if (hook === ACK_CRASH) process.kill(process.pid, "SIGKILL");
+    if (hook === ACK_HANG_UP) this.socket.destroy();
     else this.send(requestId, { kind: "committed", txid: d.txid });
     if (maintenance) {
       state.handGate();
@@ -866,10 +1043,13 @@ function stop(id: number): void {
   for (const connection of db.connections) connection.destroy();
 }
 
-port.on("message", (message: OwnerServe | OwnerStop | OwnerPoison) => {
+port.on("message", (message: OwnerServe | OwnerStop | OwnerPoison | OwnerNotice) => {
   if (message.op === "serve") serve(message);
   else if (message.op === "stop") stop(message.id);
-  else {
+  else if (message.op === "notice") {
+    served.get(message.id)?.broadcast(message.kind, 0n);
+    signalAnswer(port, flag, { sent: true });
+  } else {
     served.get(message.id)?.stopServing();
     signalAnswer(port, flag, { poisoned: true });
   }

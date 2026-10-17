@@ -11,6 +11,11 @@ package jed
 // published structurally — meta, page accounting, invalidation window, resolution window — and the
 // owner's own sessions adopt its catalog at their next transaction begin (adoptForeign), so nothing a
 // client commits can fail after it is durable (page-service.md §7).
+//
+// Handoff (README.md §6.5): an owner whose preference is yield, or whose own handle is read-only,
+// answers request_ownership by draining and releasing ownership (pageservice_handoff.go); a graceful
+// close drains its clients first. While draining, client begins are parked unanswered and the owner's
+// own begins wait (waitAdmission).
 
 import (
 	"crypto/rand"
@@ -44,6 +49,23 @@ const psResolutionWindowCommits = psInvalidationWindowCommits
 // transactions (page-service.md §11.1).
 const defaultIdleInTransactionTimeoutMs = 60000
 
+// ownerState is an owner's handoff state (README.md §6.5).
+type ownerState uint8
+
+const (
+	ownerServing ownerState = iota
+	ownerYielding
+	ownerClosing
+)
+
+// Commit-acknowledgement test hooks (README.md §6.4): drop the connection, or exit the process, instead
+// of acknowledging the next client commit after it is durable.
+const (
+	psAckNormal int32 = iota
+	psAckHangUp
+	psAckCrash
+)
+
 // pageServiceOwner is the serving state of an owner. meta, metaTxid, window, windowStart, and
 // resolution change only together with the published version, under core.liveMu, so begin_read
 // observes a consistent (snapshot, meta, invalidation window) triple.
@@ -53,7 +75,10 @@ type pageServiceOwner struct {
 	incarnation id16
 	pageSize    uint32
 	readOnly    bool
-	idleTimeout time.Duration
+	preference  Ownership
+	limits      ownerLimits
+	// coord holds presence EX for this ownership; releasing ownership closes it.
+	coord *fileCoordinator
 
 	// Guarded by core.liveMu.
 	meta        []byte
@@ -71,9 +96,15 @@ type pageServiceOwner struct {
 	// foreign is the txid of the newest client commit published here; the owner's committed roots
 	// adopt it at their next transaction begin (adoptForeign).
 	foreign atomic.Uint64
-	// hangUpNextAck is the commit-resolution test hook: drop the connection instead of the next
-	// client commit's acknowledgement (HangUpNextPageServiceAckForTesting).
-	hangUpNextAck atomic.Bool
+	// nextAck is the commit-resolution test hook (psAck*).
+	nextAck atomic.Int32
+
+	// stateMu guards state, requester, and drainDone. drainDone is closed when a yield's drain ends, which
+	// releases the owner's own waiting begins (waitAdmission).
+	stateMu   sync.Mutex
+	state     ownerState
+	requester *psServerConn
+	drainDone chan struct{}
 
 	// fileMu guards file, the owner's own read handle on the database: page reads use positioned reads
 	// on it, independent of the pager's lock, so a client never waits on the owner's commit. Compaction
@@ -131,6 +162,10 @@ type psServerConn struct {
 	closed      bool
 	done        chan struct{}
 	idle        *time.Timer
+	// parked holds begins a draining owner left unanswered; a cancelled yield answers them.
+	parked []func()
+	// session closes the connection after the idle-session timeout (page-service.md §11.1).
+	session *time.Timer
 }
 
 func newIncarnation() id16 {
@@ -143,56 +178,64 @@ func newIncarnation() id16 {
 	return id
 }
 
-// startPageServiceOwner makes c the serving owner of the database at dbPath: it records the committed
-// meta, writes the owner record, binds the endpoint, and starts accepting. The caller holds presence
-// EX. An owner that cannot bind (no private endpoint directory) still owns and records flags = 0.
-func startPageServiceOwner(c *sharedCore, dbPath string, idleTimeoutMs uint64) (*pageServiceOwner, error) {
+// newPageServiceOwner prepares the owner of the database whose committed snapshot txid is read through
+// paging: its incarnation, committed meta, and windows. The caller holds presence EX (coord); start
+// begins serving.
+func newPageServiceOwner(c *sharedCore, paging *sharedPaging, txid uint64, h *serviceHandoff, coord *fileCoordinator) (*pageServiceOwner, error) {
 	o := &pageServiceOwner{
 		core:        c,
-		dbPath:      dbPath,
+		dbPath:      h.path,
 		incarnation: newIncarnation(),
 		pageSize:    c.storage.pageSize,
-		readOnly:    c.storage.readOnly,
-		idleTimeout: time.Duration(idleTimeoutMs) * time.Millisecond,
+		readOnly:    h.opts.ReadOnly,
+		preference:  h.ownership,
+		limits:      h.limits,
+		coord:       coord,
 		conns:       map[*psServerConn]struct{}{},
 		gate:        make(chan struct{}, 1),
 		closing:     make(chan struct{}),
 	}
-	txid := c.roots.Load().committed.txid
-	meta, err := o.readCommittedMeta(txid)
+	meta, err := readCommittedMeta(paging, txid)
 	if err != nil {
 		return nil, err
 	}
 	o.meta, o.metaTxid, o.windowStart = meta, txid, txid
-	o.seedResolution(txid, meta)
-	c.storage.recordCommits = true
-	if o.file, err = os.Open(dbPath); err != nil {
+	o.seedResolution(paging, txid, meta)
+	if o.file, err = os.Open(h.path); err != nil {
 		return nil, newError(IoError, "open database for page service: "+err.Error())
 	}
+	return o, nil
+}
+
+// start writes the owner record, binds the endpoint, and starts accepting. An owner that cannot bind (no
+// private endpoint directory, or a failed bind) still owns and records that it does not serve.
+func (o *pageServiceOwner) start() error {
 	uid := currentUID()
-	o.endpoint = endpointPath(dbPath, uid, o.incarnation)
+	o.endpoint = endpointPath(o.dbPath, uid, o.incarnation)
 	record := ownerRecord{serving: o.endpoint != "", uid: uid, incarnation: o.incarnation, pid: uint32(os.Getpid()), endpoint: o.endpoint}
-	if err := writeOwnerRecord(dbPath, record); err != nil {
-		_ = o.file.Close()
-		return nil, err
+	if err := writeOwnerRecord(o.dbPath, record); err != nil {
+		return err
 	}
 	if o.endpoint == "" {
-		return o, nil
+		return nil
 	}
-	if o.listener, err = listenEndpoint(o.endpoint); err != nil {
-		_ = o.file.Close()
-		return nil, newError(IoError, "bind page-service endpoint: "+err.Error())
+	listener, err := listenEndpoint(o.endpoint)
+	if err != nil {
+		o.endpoint = ""
+		_ = writeOwnerRecord(o.dbPath, ownerRecord{uid: uid, incarnation: o.incarnation, pid: uint32(os.Getpid())})
+		return newError(IoError, "bind page-service endpoint: "+err.Error())
 	}
+	o.listener = listener
 	o.wg.Add(1)
 	go o.acceptLoop()
-	return o, nil
+	return nil
 }
 
 // readCommittedMeta reads the meta slot that published txid. Every commit writes slot txid & 1, so it
 // is the one to read; the parse check guards a slot a later commit already overwrote.
-func (o *pageServiceOwner) readCommittedMeta(txid uint64) ([]byte, error) {
+func readCommittedMeta(paging *sharedPaging, txid uint64) ([]byte, error) {
 	var meta []byte
-	err := o.core.storage.paging.withPager(func(p *pager) error {
+	err := paging.withPager(func(p *pager) error {
 		for _, slot := range []uint32{uint32(txid & 1), uint32(txid&1) ^ 1} {
 			block, err := p.readBlock(slot)
 			if err != nil {
@@ -210,9 +253,9 @@ func (o *pageServiceOwner) readCommittedMeta(txid uint64) ([]byte, error) {
 
 // seedResolution starts the resolution window with the recovered meta slots (README.md §4): the
 // committed one and, when the other slot holds the commit just before it, that one too.
-func (o *pageServiceOwner) seedResolution(txid uint64, meta []byte) {
+func (o *pageServiceOwner) seedResolution(paging *sharedPaging, txid uint64, meta []byte) {
 	if txid > 0 {
-		_ = o.core.storage.paging.withPager(func(p *pager) error {
+		_ = paging.withPager(func(p *pager) error {
 			block, err := p.readBlock(uint32(txid&1) ^ 1)
 			if err == nil {
 				if m, ok := parseMeta(block); ok && m.txid == txid-1 {
@@ -251,7 +294,7 @@ func (o *pageServiceOwner) recordResolution(txid uint64, meta []byte) {
 // compacted resets the window after compaction replaced the file: every older cache is invalid.
 // Called under core.liveMu with the writer gate held and no pins, so no page read is in flight.
 func (o *pageServiceOwner) compacted(txid uint64) error {
-	meta, err := o.readCommittedMeta(txid)
+	meta, err := readCommittedMeta(o.core.storage.paging, txid)
 	if err != nil {
 		return err
 	}
@@ -350,19 +393,17 @@ func (o *pageServiceOwner) tryGate() bool {
 
 func (o *pageServiceOwner) releaseGate() { <-o.gate }
 
-// close stops serving: no new connections, every client sees EOF (releasing its pins and the gate),
-// and the endpoint and owner record are removed while presence EX is still held. A client commit past
-// its point of no return finishes first.
-func (o *pageServiceOwner) close() {
+// stopServing stops accepting and closes every connection (clients see EOF, releasing their pins and
+// the gate). A client commit past its point of no return still finishes on its connection's goroutine;
+// wg.Wait waits for it. Also the response to a write or sync failure in a client commit (page-service.md
+// §5.6): the storage handle is poisoned, so no connection may stay.
+func (o *pageServiceOwner) stopServing() {
 	o.connMu.Lock()
 	if !o.closed {
 		o.closed = true
 		close(o.closing)
 	}
-	conns := make([]*psServerConn, 0, len(o.conns))
-	for sc := range o.conns {
-		conns = append(conns, sc)
-	}
+	conns := o.connList()
 	o.connMu.Unlock()
 	if o.listener != nil {
 		_ = o.listener.Close()
@@ -370,7 +411,26 @@ func (o *pageServiceOwner) close() {
 	for _, sc := range conns {
 		_ = sc.conn.Close()
 	}
-	o.wg.Wait()
+}
+
+// connList snapshots the connections. Caller holds connMu.
+func (o *pageServiceOwner) connList() []*psServerConn {
+	conns := make([]*psServerConn, 0, len(o.conns))
+	for sc := range o.conns {
+		conns = append(conns, sc)
+	}
+	return conns
+}
+
+func (o *pageServiceOwner) connections() []*psServerConn {
+	o.connMu.Lock()
+	defer o.connMu.Unlock()
+	return o.connList()
+}
+
+// removeServing removes the endpoint and the owner record and closes the read handle, while presence EX
+// is still held.
+func (o *pageServiceOwner) removeServing() {
 	if o.endpoint != "" {
 		_ = os.Remove(o.endpoint)
 	}
@@ -383,26 +443,164 @@ func (o *pageServiceOwner) close() {
 	o.fileMu.Unlock()
 }
 
-// stopServing is the owner's response to a write or sync failure in a client commit (page-service.md
-// §5.6): its storage handle is poisoned, so it closes every connection and accepts no more. The
-// owner's own handle then refuses commits until it is reopened.
-func (o *pageServiceOwner) stopServing() {
-	o.connMu.Lock()
-	if !o.closed {
-		o.closed = true
-		close(o.closing)
+// broadcast sends a notice to every connection.
+func (o *pageServiceOwner) broadcast(n psNotice) {
+	for _, sc := range o.connections() {
+		sc.send(0, n)
 	}
-	conns := make([]*psServerConn, 0, len(o.conns))
-	for sc := range o.conns {
-		conns = append(conns, sc)
+}
+
+// waitAdmission blocks an owner session's transaction begin while a yield drains (README.md §6.5).
+func (o *pageServiceOwner) waitAdmission() {
+	o.stateMu.Lock()
+	done := o.drainDone
+	o.stateMu.Unlock()
+	if done != nil {
+		<-done
 	}
-	o.connMu.Unlock()
-	if o.listener != nil {
-		_ = o.listener.Close()
+}
+
+// admitting reports whether client begins are answered rather than parked.
+func (o *pageServiceOwner) admitting() bool {
+	o.stateMu.Lock()
+	defer o.stateMu.Unlock()
+	return o.state == ownerServing
+}
+
+// drained reports whether no transaction a drain waits for is running: with own set, the owner's own
+// readers and writer as well as every connection's; otherwise only the connections'.
+func (o *pageServiceOwner) drained(own bool) bool {
+	c := o.core
+	if own {
+		c.liveMu.Lock()
+		readers := len(c.live)
+		c.liveMu.Unlock()
+		if readers > 0 || len(o.gate) > 0 {
+			return false
+		}
 	}
-	for _, sc := range conns {
-		_ = sc.conn.Close()
+	for _, sc := range o.connections() {
+		c.liveMu.Lock()
+		pinned := len(sc.pins) > 0
+		c.liveMu.Unlock()
+		sc.mu.Lock()
+		writing := sc.write != nil
+		sc.mu.Unlock()
+		if pinned || writing {
+			return false
+		}
 	}
+	return true
+}
+
+// drain waits for running transactions to finish, up to grace (README.md §6.5). It reports true when
+// the yield's requester disconnected first (the yield is cancelled).
+func (o *pageServiceOwner) drain(grace time.Duration, own bool, requester *psServerConn) bool {
+	deadline := time.Now().Add(grace)
+	for {
+		if requester != nil {
+			requester.mu.Lock()
+			gone := requester.closed
+			requester.mu.Unlock()
+			if gone {
+				return true
+			}
+		}
+		if o.drained(own) || !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(psDrainPoll)
+	}
+}
+
+// requestOwnership answers request_ownership (README.md §6.5): an owner whose preference is yield, or
+// whose handle is read-only, yields to the first requester while it is serving.
+func (sc *psServerConn) requestOwnership() psMessage {
+	o := sc.owner
+	o.stateMu.Lock()
+	defer o.stateMu.Unlock()
+	switch {
+	case o.state == ownerYielding && o.requester == sc:
+		return psOwnershipReply{status: psOwnershipYielding}
+	case o.state != ownerServing, o.preference != OwnershipYield && !o.readOnly:
+		return psOwnershipReply{status: psOwnershipRefused}
+	}
+	o.state, o.requester, o.drainDone = ownerYielding, sc, make(chan struct{})
+	go o.yield(sc)
+	return psOwnershipReply{status: psOwnershipYielding}
+}
+
+// yield runs an accepted ownership request: notice, drain for the yield grace, then release ownership and
+// re-elect as a paused client — or, when the requester disconnected first, cancel (README.md §6.5).
+func (o *pageServiceOwner) yield(requester *psServerConn) {
+	c := o.core
+	o.broadcast(psNotice{kind: psNoticeYieldBegun, connectionID: requester.id})
+	if o.drain(o.limits.yieldGrace, true, requester) {
+		o.cancelYield()
+		return
+	}
+	h := c.handoff
+	h.mu.Lock()
+	r := c.role.Load()
+	if r.owner != o || h.closed.Load() {
+		h.mu.Unlock()
+		o.endDrain()
+		return
+	}
+	next := &serviceRole{gen: r.gen + 1, pauseUntil: time.Now().Add(psHandoffPause)}
+	c.releaseOwnership(r, next)
+	h.mu.Unlock()
+	o.endDrain()
+	_ = c.reelect(next)
+}
+
+// cancelYield resumes serving after the requester disconnected: notice, admit again, and answer the
+// parked begins.
+func (o *pageServiceOwner) cancelYield() {
+	o.stateMu.Lock()
+	if o.state != ownerYielding {
+		// A close began during the drain: it owns the outcome.
+		o.stateMu.Unlock()
+		return
+	}
+	o.state, o.requester = ownerServing, nil
+	o.stateMu.Unlock()
+	o.broadcast(psNotice{kind: psNoticeYieldCancelled})
+	o.endDrain()
+	for _, sc := range o.connections() {
+		sc.mu.Lock()
+		parked := sc.parked
+		sc.parked = nil
+		sc.mu.Unlock()
+		for _, run := range parked {
+			run()
+		}
+	}
+}
+
+// endDrain releases the owner's own waiting begins.
+func (o *pageServiceOwner) endDrain() {
+	o.stateMu.Lock()
+	done := o.drainDone
+	o.drainDone = nil
+	o.stateMu.Unlock()
+	if done != nil {
+		close(done)
+	}
+}
+
+// closeGracefully is a serving owner's close (README.md §6.5): notice, then drain its clients'
+// transactions for the shutdown grace. The caller then releases ownership.
+func (o *pageServiceOwner) closeGracefully() {
+	o.stateMu.Lock()
+	o.state = ownerClosing
+	o.stateMu.Unlock()
+	o.endDrain()
+	if o.listener == nil {
+		return
+	}
+	o.broadcast(psNotice{kind: psNoticeShutdownBegun})
+	o.drain(o.limits.shutdownGrace, false, nil)
 }
 
 func (o *pageServiceOwner) acceptLoop() {
@@ -420,6 +618,7 @@ func (o *pageServiceOwner) acceptLoop() {
 		}
 		o.nextConn++
 		sc := &psServerConn{owner: o, conn: conn, id: o.nextConn, pins: map[uint64]int{}, done: make(chan struct{})}
+		sc.armSessionLocked()
 		o.conns[sc] = struct{}{}
 		o.wg.Add(1)
 		o.connMu.Unlock()
@@ -435,6 +634,10 @@ func (sc *psServerConn) serve() {
 		_ = sc.conn.Close()
 		sc.mu.Lock()
 		sc.closed = true
+		sc.parked = nil
+		if sc.session != nil {
+			sc.session.Stop()
+		}
 		if sc.write != nil && !sc.write.finishing {
 			sc.abortWriteLocked()
 		}
@@ -471,7 +674,7 @@ func (sc *psServerConn) serve() {
 		var reply psMessage
 		switch m := msg.(type) {
 		case psBeginRead:
-			reply = sc.beginRead(m)
+			reply = sc.beginReadOrPark(requestID, m)
 		case psReadPages:
 			reply, err = sc.readPages(m)
 		case psEndRead:
@@ -488,6 +691,8 @@ func (sc *psServerConn) serve() {
 			err = sc.abort()
 		case psCommitStatus:
 			reply = sc.commitStatus(m)
+		case psRequestOwnership:
+			reply = sc.requestOwnership()
 		default:
 			err = newError(ProtocolViolation, "unexpected message")
 		}
@@ -520,11 +725,34 @@ func (sc *psServerConn) hello(requestID uint32, m psHello) bool {
 	if o.readOnly {
 		flags |= psHelloOKFlagOwnerReadOnly
 	}
+	if o.preference == OwnershipYield {
+		flags |= psHelloOKFlagOwnerYields
+	}
+	if limit := o.limits.maxConnections; limit > 0 {
+		o.connMu.Lock()
+		count := len(o.conns)
+		o.connMu.Unlock()
+		if count > limit {
+			sc.fail(requestID, newError(TooManyConnections, "the database owner already serves its maximum number of connections ("+strconv.Itoa(limit)+")"))
+			return false
+		}
+	}
 	maxRead := uint32((psMaxFrameLength - psHeaderLength) / int(o.pageSize))
 	if maxRead > psMaxReadPagesCap {
 		maxRead = psMaxReadPagesCap
 	}
 	return sc.send(requestID, psHelloOK{protocol: psProtocolVersion, formatVersion: formatVersion, pageSize: o.pageSize, connectionID: sc.id, flags: flags, maxReadPages: maxRead})
+}
+
+// beginReadOrPark answers begin_read, or parks it while the owner drains (README.md §6.5).
+func (sc *psServerConn) beginReadOrPark(requestID uint32, m psBeginRead) psMessage {
+	if !sc.owner.admitting() {
+		sc.mu.Lock()
+		sc.parked = append(sc.parked, func() { sc.send(requestID, sc.beginRead(m)) })
+		sc.mu.Unlock()
+		return nil
+	}
+	return sc.beginRead(m)
 }
 
 // beginRead pins the committed snapshot for this connection (README.md §3.2).
@@ -649,6 +877,11 @@ func (sc *psServerConn) beginWrite(requestID uint32, m psBeginWrite) (psMessage,
 		return errIdleRevoked(), nil
 	}
 	sc.waiting = true
+	if !o.admitting() {
+		// Parked while the owner drains (README.md §6.5); a cancelled yield starts the wait.
+		sc.parked = append(sc.parked, func() { go sc.waitForGate(requestID, m) })
+		return nil, nil
+	}
 	go sc.waitForGate(requestID, m)
 	return nil, nil
 }
@@ -703,24 +936,58 @@ func (sc *psServerConn) waitForGate(requestID uint32, m psBeginWrite) {
 	sc.send(requestID, psWriteBegun{incarnation: o.incarnation, txid: txid, invalidate: invalidate, indices: indices, reuseGrant: grant, meta: meta})
 }
 
-// touch restarts the idle-in-transaction timer on every received frame.
+// touch restarts the idle-in-transaction and idle-session timers on every received frame.
 func (sc *psServerConn) touch() {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	if sc.write != nil && !sc.write.finishing {
 		sc.armIdleLocked()
 	}
+	sc.armSessionLocked()
 }
 
 func (sc *psServerConn) armIdleLocked() {
-	if sc.owner.idleTimeout <= 0 {
+	timeout := sc.owner.limits.idleInTransaction
+	if timeout <= 0 {
 		return
 	}
 	if sc.idle == nil {
-		sc.idle = time.AfterFunc(sc.owner.idleTimeout, sc.revoke)
+		sc.idle = time.AfterFunc(timeout, sc.revoke)
 	} else {
-		sc.idle.Reset(sc.owner.idleTimeout)
+		sc.idle.Reset(timeout)
 	}
+}
+
+// armSessionLocked (re)starts the idle-session timer (page-service.md §11.1).
+func (sc *psServerConn) armSessionLocked() {
+	timeout := sc.owner.limits.idleSession
+	if timeout <= 0 {
+		return
+	}
+	if sc.session == nil {
+		sc.session = time.AfterFunc(timeout, sc.idleSessionExpired)
+	} else {
+		sc.session.Reset(timeout)
+	}
+}
+
+// idleSessionExpired closes a connection idle between transactions for the idle-session timeout,
+// without an error frame; a busy connection's timer starts again.
+func (sc *psServerConn) idleSessionExpired() {
+	c := sc.owner.core
+	c.liveMu.Lock()
+	pinned := len(sc.pins) > 0
+	c.liveMu.Unlock()
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.closed {
+		return
+	}
+	if pinned || sc.write != nil || sc.waiting || len(sc.parked) > 0 {
+		sc.armSessionLocked()
+		return
+	}
+	_ = sc.conn.Close()
 }
 
 func (sc *psServerConn) stopIdleLocked() {
@@ -941,13 +1208,16 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 	sc.mu.Lock()
 	sc.write = nil
 	sc.mu.Unlock()
-	if o.hangUpNextAck.CompareAndSwap(true, false) {
+	switch o.nextAck.Swap(psAckNormal) {
+	case psAckHangUp:
 		_ = sc.conn.Close()
-	} else {
+	case psAckCrash:
+		os.Exit(70)
+	default:
 		sc.send(requestID, psCommitted{txid: d.txid})
 	}
-	if c.adoptForeign() == nil {
-		c.maintenanceCommit()
+	if c.adoptForeign(o) == nil {
+		c.maintenanceCommit(o)
 	}
 	o.releaseGate()
 	return nil
@@ -989,8 +1259,7 @@ func (sc *psServerConn) fail(requestID uint32, err error) {
 // adoptForeign brings the owner's committed roots up to the newest client commit (page-service.md §7):
 // its catalog is loaded here, at an owner transaction begin, never in the commit path. A failure (a
 // collation this owner's environment lacks, say) fails only the transaction that needed it.
-func (c *sharedCore) adoptForeign() error {
-	o := c.service
+func (c *sharedCore) adoptForeign(o *pageServiceOwner) error {
 	if o == nil || o.foreign.Load() <= c.roots.Load().committed.txid {
 		return nil
 	}
@@ -1010,7 +1279,7 @@ func (c *sharedCore) adoptForeign() error {
 	}
 	c.liveMu.Lock()
 	rt := c.roots.Load()
-	if loaded.committed.txid > rt.committed.txid {
+	if c.pageOwner() == o && loaded.committed.txid > rt.committed.txid {
 		c.roots.Store(&roots{committed: loaded.committed, attached: rt.attached})
 	}
 	c.liveMu.Unlock()
@@ -1022,7 +1291,11 @@ func (c *sharedCore) adoptForeign() error {
 // a client commit never walks the database, so when the high-water passes the reclamation threshold
 // and no pin holds back reclamation, the owner commits the unchanged snapshot at the next txid with
 // in-commit reclamation. Called holding the gate, after the catalog adoption.
-func (c *sharedCore) maintenanceCommit() {
+func (c *sharedCore) maintenanceCommit(o *pageServiceOwner) {
+	r := c.role.Load()
+	if r.owner != o {
+		return
+	}
 	st := c.storage
 	rt := c.roots.Load()
 	newTxid := rt.committed.txid + 1
@@ -1034,16 +1307,16 @@ func (c *sharedCore) maintenanceCommit() {
 	}
 	snap := rt.committed.clone()
 	snap.txid = newTxid
-	budget := &budgetCtx{name: "main", prev: rt.committed}
+	budget := &budgetCtx{name: "main", prev: rt.committed, guard: c.roleGuard(r)}
 	if err := st.commitDurable(snap, true, true, budget); err != nil {
-		if st.paging.commitRequiresReopen() {
-			c.service.stopServing()
+		if r.paging != nil && r.paging.commitRequiresReopen() {
+			o.stopServing()
 		}
 		return
 	}
 	c.liveMu.Lock()
 	c.roots.Store(&roots{committed: snap, attached: rt.attached})
-	c.service.published(snap.txid, st.lastMeta, st.lastWritten)
+	o.published(snap.txid, st.lastMeta, st.lastWritten)
 	c.liveMu.Unlock()
 	c.planEpoch.Add(1)
 }
@@ -1052,7 +1325,16 @@ func (c *sharedCore) maintenanceCommit() {
 // acknowledging its next client commit, after the commit is durable — the case commit_status resolves
 // (page-service.md §8.4). Test-only; no effect on a handle that is not a page-service owner.
 func HangUpNextPageServiceAckForTesting(db *Database) {
-	if o := db.core.service; o != nil {
-		o.hangUpNextAck.Store(true)
+	if o := db.core.pageOwner(); o != nil {
+		o.nextAck.Store(psAckHangUp)
+	}
+}
+
+// CrashBeforeNextPageServiceAckForTesting makes a serving owner exit its process instead of
+// acknowledging its next client commit, after the commit is durable, so the client resolves the commit
+// under the next owner — itself, when it is the only other process (README.md §6.5). Test-only.
+func CrashBeforeNextPageServiceAckForTesting(db *Database) {
+	if o := db.core.pageOwner(); o != nil {
+		o.nextAck.Store(psAckCrash)
 	}
 }

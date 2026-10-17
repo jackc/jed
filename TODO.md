@@ -460,6 +460,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] **Phase 4 — handoff.** Promotion, ownership preference and yield, graceful close, the grace
     periods; the process-corpus rewrite; simulation testing of owner + clients; retire shared mode,
     the `shared` and test-only `service` values, and locking.md §4–§5; a new bundle marker.
+    - [x] **Handoff** (test-only `locking = service`, Rust, Go, TS; spec/pageservice/README.md §6.5):
+      re-election (promotion or reconnection) with transparent retry of unanswered begins and `08006`
+      for transactions begun under the old role; lost-ack resolution through re-election;
+      `ownership = prefer | yield | never`, yield with notices, drain, and the 2 s handoff pause; a
+      read-only owner yields to a writer; graceful close; idle-session timeout; `max_connections`
+      (`53300`). Proven by the `service_*` process scenarios in every pairing.
+    - [ ] Retire shared mode (attachments owner-only until the attachment item above), new marker.
+    - [ ] Simulation testing of owner + clients over a simulated transport.
   - [ ] **Phase 5 — SSH.** `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead
     and subtree fetch.
   - [ ] **Phase 6 — backup.** Page-identical and compacted forms.

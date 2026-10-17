@@ -1,0 +1,60 @@
+schema_version = 1
+name = "service-owner-limits"
+description = "Page service phase 4: an owner refuses connections beyond max_connections with 53300, and closes a connection idle between transactions for its idle-session timeout; that client reconnects transparently at its next statement."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create-service 5000 60000 max_connections=1 idle_session=300"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open-service"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open-service"
+expect_error = "53300"
+
+[[step]]
+actor = "b"
+command = "sleep"
+argument = "600"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t"
+expect = "1"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (2)"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"
