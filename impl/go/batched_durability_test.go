@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -225,6 +226,67 @@ func TestRelaxedNewestMetaVouchesForTheWholeBatch(t *testing.T) {
 		t.Fatalf("recovery over a half-landed batch returned %v, want the floor's rows", rows)
 	}
 	_ = reopened.Close()
+}
+
+// TestRelaxedBackgroundFlushWithConcurrentReaders runs readers on their own goroutines while a writer
+// commits across many background cap flushes (run under -race): readers fault pages while a flush
+// holds the pager, and every reader sees a consistent snapshot.
+func TestRelaxedBackgroundFlushWithConcurrentReaders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "readers.jed")
+	db := relaxedDB(t, path, 256, false)
+	mustExecDB(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i64)")
+	mustExecDB(t, db, "INSERT INTO t SELECT g, 0 FROM generate_series(1, 200) g")
+	done := make(chan struct{})
+	errs := make(chan error, 4)
+	for r := 0; r < 4; r++ {
+		go func() {
+			for {
+				select {
+				case <-done:
+					errs <- nil
+					return
+				default:
+				}
+				s := db.ReadSession()
+				rows, err := s.queryValues("SELECT count(*), min(v), max(v) FROM t", nil)
+				if err != nil {
+					s.Close()
+					errs <- err
+					return
+				}
+				rows.Next()
+				var n, lo, hi int64
+				if err := rows.Scan(&n, &lo, &hi); err != nil || n != 200 || lo != hi {
+					rows.Close()
+					s.Close()
+					errs <- fmt.Errorf("reader saw count %d, v from %d to %d (%v)", n, lo, hi, err)
+					return
+				}
+				rows.Close()
+				s.Close()
+			}
+		}()
+	}
+	for i := 0; i < 150; i++ {
+		mustExecDB(t, db, "UPDATE t SET v = v + 1")
+	}
+	close(done)
+	for r := 0; r < 4; r++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDatabase(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := queryInts(t, reopened, "SELECT count(*) FROM t WHERE v = 150"); got != 200 {
+		t.Fatalf("reopened with %d rows at v = 150, want all 200", got)
+	}
 }
 
 // failingSyncStore fails every barrier, as a dying device would.

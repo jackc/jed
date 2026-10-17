@@ -135,6 +135,8 @@ pub struct Bench {
     pub readers: usize,
     /// The bench calls the bench host functions (benchmarks.md §8.2); drivers without them skip it.
     pub host_functions: bool,
+    /// `write_durable` under each engine's relaxed-durability mode (benchmarks.md §8).
+    pub relaxed: bool,
     pub setup_sql: Vec<String>,
     pub sql_override: Vec<(String, String)>,
     pub setup_sql_override: Vec<(String, Vec<String>)>,
@@ -259,6 +261,7 @@ pub fn load_corpus(corpus_dir: &str) -> BoxResult<Vec<Bench>> {
                 .get("host_functions")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            relaxed: t.get("relaxed").and_then(|v| v.as_bool()).unwrap_or(false),
             setup_sql: str_list(t, "setup_sql"),
             sql_override: t
                 .get("sql_override")
@@ -445,6 +448,10 @@ pub struct Config {
     pub variant: &'static str,
     /// dataset is "small" | "large" | "scratch"; "scratch" must yield a fresh, empty database.
     pub open: fn(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>>,
+    /// A fresh scratch database under jed's `synchronous = off`, for a `relaxed` bench
+    /// (benchmarks.md §8). A jed driver without it skips such a bench; PostgreSQL and SQLite switch
+    /// modes through the bench's setup_sql_override instead.
+    pub open_relaxed: Option<fn(data_dir: &str) -> BoxResult<Box<dyn Engine>>>,
 }
 
 // --- one JSONL result line (benchmarks.md §6; field order is the contract) ---
@@ -554,7 +561,18 @@ fn run_one(
     data_dir: &str,
     want: &str,
 ) -> BoxResult<Option<ResultLine>> {
-    let mut eng = (cfg.open)(data_dir, &b.dataset)?;
+    let mut eng = if b.relaxed && cfg.engine == "jed" {
+        let Some(open_relaxed) = cfg.open_relaxed else {
+            eprintln!(
+                "  skip: {}/{}/{} has no relaxed durability mode",
+                cfg.engine, cfg.lang, cfg.variant
+            );
+            return Ok(None);
+        };
+        open_relaxed(data_dir)?
+    } else {
+        (cfg.open)(data_dir, &b.dataset)?
+    };
 
     if b.dataset != "scratch" {
         let stored = eng.stored_fingerprint()?;
