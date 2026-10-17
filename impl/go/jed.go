@@ -362,6 +362,7 @@ var SupportedCapabilities = []string{
 	// 128 bytes), accelerating @> / <@ / ? / ?| / ?& (gin.md §2.1/§4.1).
 	"query.gin_jsonb_ops",
 	"query.gin_disjunction",
+	"query.gin_jsonb_jsonpath",
 	"query.is_null",
 	"query.order_by",
 	// Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

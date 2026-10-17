@@ -1538,6 +1538,10 @@ func (s ginStrategy) accessSelectivity() selectivityExpr {
 		return estimatorSelectivityClass(accessGinJsonbExistsAny)
 	case ginJsonbExistsAll:
 		return estimatorSelectivityClass(accessGinJsonbExistsAll)
+	case ginJsonPathExists:
+		return estimatorSelectivityClass(accessGinJsonbPathExists)
+	case ginJsonPathMatch:
+		return estimatorSelectivityClass(accessGinJsonbPathMatch)
 	default:
 		return estimatorSelectivityClass(accessGinEqual)
 	}

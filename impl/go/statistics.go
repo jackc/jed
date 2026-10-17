@@ -285,12 +285,44 @@ func (db *engine) statisticsGinEstimate(rel scopeRel, column int, opclass ginOpc
 		half := termFacts.UntrackedRows/2 + termFacts.UntrackedRows%2
 		return max64(min64(statisticsScale(n, half, fact.AnalyzedRows), current.nonnullRows), 1)
 	}
+	tree := query.tree
+	if tree == nil {
+		tree = ginTreeFromTerms(strategy.isAny(), query.terms)
+	}
+	rows, entries := ginTreeEstimate(tree, termRows, n, current.nonnullRows)
+	return &ginTermEstimate{rows: rows, entries: entries, totalEntries: totalEntries}
+}
+
+// ginTreeEstimate is a GIN query tree's (rows, gin_entry) estimate (statistics.md §6.1), following
+// the gather's evaluation (gin.md §2.2/§6): a term reads its rows. An Or sums its leaves and children
+// (rows capped at the non-NULL rows). An And folds its leaves rarest-first under independence — the
+// first read whole, each later term probed at the survivors — then each child in order, whose entries
+// add whole and whose rows scale the survivors.
+func ginTreeEstimate(t *ginTree, termRows func([]byte) int64, n, nonnull int64) (int64, int64) {
+	switch t.kind {
+	case ginTreeTerm:
+		r := termRows(t.term)
+		return r, r
+	case ginTreeOr:
+		var sum, entries int64
+		for _, term := range t.leaves {
+			r := termRows(term)
+			sum = satEstimateAdd(sum, r)
+			entries = satEstimateAdd(entries, r)
+		}
+		for _, child := range t.rest {
+			r, e := ginTreeEstimate(child, termRows, n, nonnull)
+			sum = satEstimateAdd(sum, r)
+			entries = satEstimateAdd(entries, e)
+		}
+		return min64(sum, nonnull), entries
+	}
 	type pricedTerm struct {
 		rows int64
 		term []byte
 	}
-	priced := make([]pricedTerm, len(query.terms))
-	for i, term := range query.terms {
+	priced := make([]pricedTerm, len(t.leaves))
+	for i, term := range t.leaves {
 		priced[i] = pricedTerm{rows: termRows(term), term: term}
 	}
 	sort.Slice(priced, func(i, j int) bool {
@@ -299,21 +331,24 @@ func (db *engine) statisticsGinEstimate(rel scopeRel, column int, opclass ginOpc
 		}
 		return bytes.Compare(priced[i].term, priced[j].term) < 0
 	})
+	rest := t.rest
 	var rows, entries int64
-	if strategy.isAny() {
-		sum := int64(0)
-		for _, p := range priced {
-			sum = satEstimateAdd(sum, p.rows)
-		}
-		rows, entries = min64(sum, current.nonnullRows), sum
-	} else if len(priced) > 0 {
+	if len(priced) > 0 {
 		rows, entries = priced[0].rows, priced[0].rows
 		for _, p := range priced[1:] {
 			entries = satEstimateAdd(entries, rows)
 			rows = statisticsScale(rows, p.rows, n)
 		}
+	} else if len(rest) > 0 {
+		rows, entries = ginTreeEstimate(rest[0], termRows, n, nonnull)
+		rest = rest[1:]
 	}
-	return &ginTermEstimate{rows: rows, entries: entries, totalEntries: totalEntries}
+	for _, child := range rest {
+		r, e := ginTreeEstimate(child, termRows, n, nonnull)
+		entries = satEstimateAdd(entries, e)
+		rows = statisticsScale(rows, r, n)
+	}
+	return rows, entries
 }
 
 // statisticsGinTotalEntries is a term-eligible column's estimated total GIN term occurrences at its
@@ -363,7 +398,7 @@ func statisticsGinOperandValue(operand *rExpr) (Value, bool) {
 // (statistics.md §6.1). Array = keeps its structural equality estimate as a logical leaf.
 func (db *engine) statisticsGinLeafSelectivity(expr *rExpr, rel scopeRel) (selectivityExpr, bool) {
 	switch expr.kind {
-	case reArrayFunc, reQuantified, reJsonContains, reJsonHasKey:
+	case reArrayFunc, reQuantified, reJsonContains, reJsonHasKey, reJsonPathFn:
 	default:
 		return selectivityExpr{}, false
 	}

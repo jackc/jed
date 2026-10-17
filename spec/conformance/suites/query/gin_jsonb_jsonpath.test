@@ -1,0 +1,214 @@
+# GIN jsonb_ops jsonpath strategies — `doc @? path` and `doc @@ path` over a GIN-indexed jsonb column
+# (spec/design/gin.md §2.2). PostgreSQL's jsonb_ops extracts an AND/OR tree of terms from the path:
+# every `accessors == scalar` statement requires a KEY term per `.key` accessor and the scalar's term
+# (a string may be a key or a value, unless strict mode pins it), `&&` / `||` / `!` combine them, and
+# `exists (…)` / a path's filters contribute their own statements. A path with nothing extractable
+# (no equality, an item method, `!=`, `<`, `like_regex`, a variable) falls back to the full scan. The
+# gather is lossy and the operator always rechecks, so rows are the full scan's — the oracle agrees.
+#
+# The `# cost:` assertions pin that the bound is taken (or the fallback full scan is), cross-core
+# identical; query/gin_jsonb_jsonpath_explain.test pins the plans. Format:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_scan, query.gin_mutation, query.gin_jsonb_ops, query.gin_jsonb_jsonpath, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, types.i32, types.jsonb, types.jsonpath, expr.jsonpath_filter, expr.jsonpath_match, expr.jsonpath_methods, expr.jsonpath_predicates, expr.jsonpath_any, resource.cost_metering
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, doc jsonb)
+
+statement ok
+CREATE INDEX d_doc_gin ON d USING gin (doc)
+
+statement ok
+INSERT INTO d VALUES
+  (1, '{"a": 1, "b": "x", "tags": ["red", "blue"]}'),
+  (2, '{"a": 2, "b": "y", "tags": ["red"]}'),
+  (3, '{"a": [1, 2], "c": {"d": "x"}}'),
+  (4, '{"a": 1.0, "b": true}'),
+  (5, '["x", {"a": 1}]'),
+  (6, '"x"'),
+  (7, '{"b": ["x"], "n": null}'),
+  (8, '{}'),
+  (9, NULL),
+  (10, '{"c": {"d": "y", "e": [{"f": 3}]}}')
+
+# ---- @@: equality predicates --------------------------------------------------------------------
+
+# key a + number 1 (lax unwraps row 3's array; row 4's 1.0 is the same number)
+# cost: 96
+query I nosort
+SELECT id FROM d WHERE doc @@ '$.a == 1' ORDER BY id
+----
+1
+3
+4
+5
+
+# a string in lax mode is a key OR a value term: rows 1 (value), 7 (array element = key term)
+# cost: 59
+query I nosort
+SELECT id FROM d WHERE doc @@ '$.b == "x"' ORDER BY id
+----
+1
+7
+
+# strict mode: a member's string is a value term only; row 7's array is not unwrapped
+# cost: 39
+query I nosort
+SELECT id FROM d WHERE doc @@ 'strict $.b == "x"' ORDER BY id
+----
+1
+
+# strict [*]: an array element string is a key term
+# cost: 54
+query I nosort
+SELECT id FROM d WHERE doc @@ 'strict $.tags[*] == "blue"' ORDER BY id
+----
+1
+
+# nested keys
+# cost: 44
+query I nosort
+SELECT id FROM d WHERE doc @@ '$.c.d == "x"' ORDER BY id
+----
+3
+
+# && and ||
+# cost: 63
+query I nosort
+SELECT id FROM d WHERE doc @@ '$.a == 1 && $.b == "x"' ORDER BY id
+----
+1
+
+# cost: 160
+query I nosort
+SELECT id FROM d WHERE doc @@ '$.a == 2 || $.c.d == "y"' ORDER BY id
+----
+2
+3
+10
+
+# ! flips the operator: !(A || B) extracts nothing (an AND of negations), so the full scan
+# cost: 396
+query I nosort
+SELECT id FROM d WHERE doc @@ '!($.a == 2 || $.c.d == "y")' ORDER BY id
+----
+1
+4
+5
+6
+7
+8
+
+# !(!A && B) is A || !B: a negated && with one unextractable side is not narrowed to the other side
+# (PostgreSQL's index scan narrows it and drops rows; its sequential scan returns these)
+# cost: 383
+query I nosort
+SELECT id FROM d WHERE doc @@ '!(!($.a == 1) && $.b == "x")' ORDER BY id
+----
+1
+2
+3
+4
+5
+6
+8
+10
+
+# a comparison other than == extracts nothing
+# cost: 160
+query I nosort
+SELECT id FROM d WHERE doc @@ '$.a > 1' ORDER BY id
+----
+2
+3
+
+# exists inside a predicate: only its filters count, so `exists ($.n)` alone is a full scan
+# cost: 182
+query I nosort
+SELECT id FROM d WHERE doc @@ 'exists ($.n)' ORDER BY id
+----
+7
+
+# cost: 63
+query I nosort
+SELECT id FROM d WHERE doc @@ 'exists ($.c.e[*] ? (@.f == 3))' ORDER BY id
+----
+10
+
+# ---- @?: a path's filters ------------------------------------------------------------------------
+
+# cost: 113
+query I nosort
+SELECT id FROM d WHERE doc @? '$ ? (@.a == 1)' ORDER BY id
+----
+1
+3
+4
+5
+
+# a filter on a later accessor keeps the earlier keys
+# cost: 44
+query I nosort
+SELECT id FROM d WHERE doc @? '$.c ? (@.d == "y")' ORDER BY id
+----
+10
+
+# .** reaches any depth: the scalar may be a key or a value
+# cost: 231
+query I nosort
+SELECT id FROM d WHERE doc @? 'strict $.** ? (@ == "x")' ORDER BY id
+----
+1
+3
+5
+6
+7
+
+# a filter whose comparison has a jsonb-array element as the scalar side's partner
+# cost: 89
+query I nosort
+SELECT id FROM d WHERE doc @? '$.tags[*] ? (@ == "red")' ORDER BY id
+----
+1
+2
+
+# a path without a filter extracts nothing: the full scan
+# cost: 93
+query I nosort
+SELECT id FROM d WHERE doc @? '$.n' ORDER BY id
+----
+7
+
+# an item method ends the walk: only the filters before it count
+# cost: 274
+query I nosort
+SELECT id FROM d WHERE doc @? '$.tags.size() ? (@ == 2)' ORDER BY id
+----
+1
+
+# ---- NULL and the mutation bound ---------------------------------------------------------------
+
+# cost: 0
+query I nosort
+SELECT id FROM d WHERE doc @? NULL ORDER BY id
+----
+
+# cost: 43
+statement ok
+UPDATE d SET doc = '{"a": 5}' WHERE doc @@ '$.c.d == "x"'
+
+# cost: 32
+statement ok
+DELETE FROM d WHERE doc @? '$ ? (@.a == 5)'
+
+query I nosort
+SELECT id FROM d ORDER BY id
+----
+1
+2
+4
+5
+6
+7
+8
+9
+10

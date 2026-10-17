@@ -233,6 +233,8 @@ import {
   ACCESS_GIN_JSONB_CONTAINS,
   ACCESS_GIN_JSONB_EXISTS,
   ACCESS_GIN_JSONB_EXISTS_ALL,
+  ACCESS_GIN_JSONB_PATH_EXISTS,
+  ACCESS_GIN_JSONB_PATH_MATCH,
   ACCESS_GIN_JSONB_EXISTS_ANY,
   ACCESS_GIN_MEMBER,
   ACCESS_GIN_OVERLAPS,
@@ -443,6 +445,12 @@ import {
 } from "./types.ts";
 import { StmtRng } from "./seam.ts";
 import { ginJsonbIndexTerms, ginJsonbKeyTerm } from "./gin_jsonb.ts";
+import {
+  type GinTree,
+  ginTreeFromTerms,
+  ginTreeMapTerms,
+  jsonPathGinTree,
+} from "./gin_jsonpath.ts";
 import {
   type Interval,
   intervalEncodeKey,
@@ -10965,7 +10973,7 @@ export class Engine {
         : ginOrArms(query).map(
             (arm) => ginMatch(arm, gb.colGlobal, ginStrategyOpclass(gb.strategy))!,
           );
-    const queries: { strategy: GinStrategy; terms: Uint8Array[] }[] = [];
+    const queries: GinTree[] = [];
     for (const arm of arms) {
       const qv = evalExpr(arm.query, queryRow, env, env.exec.session.scratchMeter());
       const extracted = ginQueryTerms(arm.strategy, gb.elemType, qv);
@@ -10977,10 +10985,11 @@ export class Engine {
         const u = store.scanWithUnits(mask);
         return { entries: u.entries, pages: u.pages, slabs: u.slabs };
       }
-      queries.push({
-        strategy: arm.strategy,
-        terms: extracted.terms.map((t) => ginTaggedTerm(gb.tag, t)),
-      });
+      const tree =
+        extracted.kind === "tree"
+          ? extracted.tree
+          : ginTreeFromTerms(ginStrategyIsAny(arm.strategy), extracted.terms);
+      queries.push(ginTreeMapTerms(tree, (t) => ginTaggedTerm(gb.tag, t)));
     }
 
     // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
@@ -10995,8 +11004,8 @@ export class Engine {
     // each arm's candidates, arms in source order (gin.md §6.3).
     const cand =
       queries.length === 1
-        ? gather.arm(queries[0]!.strategy, queries[0]!.terms)
-        : unionPostings(queries.map((q) => gather.arm(q.strategy, q.terms)));
+        ? gather.eval(queries[0]!)
+        : unionPostings(queries.map((q) => gather.eval(q)));
     meter.charge(COSTS.ginEntry * BigInt(gather.entries));
     let pages = gather.pages;
 
@@ -23970,7 +23979,11 @@ export type GinStrategy =
   | "jsonContains"
   | "jsonHasKey"
   | "jsonHasAnyKey"
-  | "jsonHasAllKeys";
+  | "jsonHasAllKeys"
+  // jsonb_ops `col @? P` / `col @@ P` (gin.md §2.2): the AND/OR term tree PostgreSQL extracts from
+  // the jsonpath; nothing extractable falls back to the full scan.
+  | "jsonPathExists"
+  | "jsonPathMatch";
 
 // GinOpclass is a GIN index's operator class, implied by its column type (gin.md §1): array_ops over
 // an array column, jsonb_ops over a jsonb column. It decides which strategies the matcher accepts.
@@ -23989,7 +24002,9 @@ export function ginStrategyOpclass(s: GinStrategy): GinOpclass {
   return s === "jsonContains" ||
     s === "jsonHasKey" ||
     s === "jsonHasAnyKey" ||
-    s === "jsonHasAllKeys"
+    s === "jsonHasAllKeys" ||
+    s === "jsonPathExists" ||
+    s === "jsonPathMatch"
     ? "jsonb"
     : "array";
 }
@@ -24013,6 +24028,10 @@ function ginAccessClass(s: GinStrategy): string {
       return ACCESS_GIN_JSONB_EXISTS_ANY;
     case "jsonHasAllKeys":
       return ACCESS_GIN_JSONB_EXISTS_ALL;
+    case "jsonPathExists":
+      return ACCESS_GIN_JSONB_PATH_EXISTS;
+    case "jsonPathMatch":
+      return ACCESS_GIN_JSONB_PATH_MATCH;
   }
 }
 
@@ -25022,24 +25041,64 @@ function statisticsGinEstimate(
     if (rows > current.nonnullRows) rows = current.nonnullRows;
     return rows < 1n ? 1n : rows;
   };
-  const priced: [bigint, Uint8Array][] = query.terms.map((term) => [termRows(term), term]);
-  priced.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : compareBytes(a[1], b[1])));
-  if (strategy === "overlaps" || strategy === "jsonHasAnyKey") {
-    const sum = priced.reduce((acc, [rows]) => saturatingEstimateAdd(acc, rows), 0n);
-    return {
-      rows: sum < current.nonnullRows ? sum : current.nonnullRows,
-      entries: sum,
-      totalEntries,
-    };
-  }
-  const first = priced[0]?.[0] ?? 0n;
-  let rows = first;
-  let entries = first;
-  for (let i = 1; i < priced.length; i++) {
-    entries = saturatingEstimateAdd(entries, rows);
-    rows = statisticsScale(rows, priced[i]![0], n);
-  }
+  const tree =
+    query.kind === "tree" ? query.tree : ginTreeFromTerms(ginStrategyIsAny(strategy), query.terms);
+  const { rows, entries } = ginTreeEstimate(tree, termRows, n, current.nonnullRows);
   return { rows, entries, totalEntries };
+}
+
+// ginTreeEstimate is a GIN query tree's (rows, gin_entry) estimate (statistics.md §6.1), following the
+// gather's evaluation (gin.md §2.2/§6): a term reads its rows. An or sums its leaves and children
+// (rows capped at the non-NULL rows). An and folds its leaves rarest-first under independence — the
+// first read whole, each later term probed at the survivors — then each child in order, whose entries
+// add whole and whose rows scale the survivors.
+function ginTreeEstimate(
+  t: GinTree,
+  termRows: (term: Uint8Array) => bigint,
+  n: bigint,
+  nonnull: bigint,
+): { rows: bigint; entries: bigint } {
+  if (t.kind === "term") {
+    const r = termRows(t.term);
+    return { rows: r, entries: r };
+  }
+  if (t.kind === "or") {
+    let sum = 0n;
+    let entries = 0n;
+    for (const term of t.leaves) {
+      const r = termRows(term);
+      sum = saturatingEstimateAdd(sum, r);
+      entries = saturatingEstimateAdd(entries, r);
+    }
+    for (const c of t.rest) {
+      const e = ginTreeEstimate(c, termRows, n, nonnull);
+      sum = saturatingEstimateAdd(sum, e.rows);
+      entries = saturatingEstimateAdd(entries, e.entries);
+    }
+    return { rows: sum < nonnull ? sum : nonnull, entries };
+  }
+  const priced: [bigint, Uint8Array][] = t.leaves.map((term) => [termRows(term), term]);
+  priced.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : compareBytes(a[1], b[1])));
+  let rest = t.rest;
+  let rows = 0n;
+  let entries = 0n;
+  if (priced.length > 0) {
+    rows = priced[0]![0];
+    entries = rows;
+    for (let i = 1; i < priced.length; i++) {
+      entries = saturatingEstimateAdd(entries, rows);
+      rows = statisticsScale(rows, priced[i]![0], n);
+    }
+  } else if (rest.length > 0) {
+    ({ rows, entries } = ginTreeEstimate(rest[0]!, termRows, n, nonnull));
+    rest = rest.slice(1);
+  }
+  for (const c of rest) {
+    const e = ginTreeEstimate(c, termRows, n, nonnull);
+    entries = saturatingEstimateAdd(entries, e.entries);
+    rows = statisticsScale(rows, e.rows, n);
+  }
+  return { rows, entries };
 }
 
 // statisticsGinTotalEntries is a term-eligible column's estimated total GIN term occurrences at its
@@ -25088,7 +25147,8 @@ function statisticsGinLeafSelectivity(
     expr.kind !== "arrayFunc" &&
     expr.kind !== "quantified" &&
     expr.kind !== "jsonContains" &&
-    expr.kind !== "jsonHasKey"
+    expr.kind !== "jsonHasKey" &&
+    expr.kind !== "jsonPathFn"
   )
     return null;
   for (let column = 0; column < rel.table.columns.length; column++) {
@@ -27938,6 +27998,20 @@ function ginMatchOperand(
               : "jsonHasAllKeys";
         return { strategy, query: filter.arg };
       }
+    } else if (
+      filter.kind === "jsonPathFn" &&
+      !filter.tz &&
+      filter.args.length === 2 &&
+      (filter.pathFnKind === "existsSilent" || filter.pathFnKind === "matchSilent") &&
+      isColumnRef(filter.args[0]!, colGlobal) &&
+      queryOK(filter.args[1]!)
+    ) {
+      // `col @? P` / `col @@ P` (gin.md §2.2): only the operators — the jsonpath functions take vars
+      // and a silent flag, and PostgreSQL indexes neither.
+      return {
+        strategy: filter.pathFnKind === "existsSilent" ? "jsonPathExists" : "jsonPathMatch",
+        query: filter.args[1]!,
+      };
     }
     return null;
   }
@@ -28566,8 +28640,15 @@ export function isGinElementType(elem: Type): boolean {
 // matches the index cannot enumerate.
 export type GinQuery =
   | { kind: "terms"; terms: Uint8Array[] }
+  // A jsonpath strategy's AND/OR term tree (gin.md §2.2).
+  | { kind: "tree"; tree: GinTree }
   | { kind: "empty" }
   | { kind: "fullScan" };
+
+// ginStrategyIsAny reports whether the strategy's posting lists combine by union (mode ANY: &&, ?|).
+export function ginStrategyIsAny(s: GinStrategy): boolean {
+  return s === "overlaps" || s === "jsonHasAnyKey";
+}
 
 // ginQueryTerms is a GIN query value's terms under its strategy (which implies the opclass) — what
 // the gather reads, and what the planner prices from GIN term statistics (statistics.md §6.1).
@@ -28645,6 +28726,20 @@ function arrayQueryTerms(strategy: GinStrategy, elemType: ScalarType, qv: Value)
 // document); a key-less ?| matches nothing.
 function jsonbQueryTerms(strategy: GinStrategy, qv: Value): GinQuery {
   if (qv.kind === "null") return { kind: "empty" };
+  if (strategy === "jsonPathExists" || strategy === "jsonPathMatch") {
+    // `@?` / `@@` (gin.md §2.2): the tree PostgreSQL extracts from the path, or the full scan when
+    // nothing is extractable. The path text is a jsonpath value's canonical text, already compiled at
+    // resolve; a term never depends on the environment's casing table.
+    if (qv.kind !== "jsonpath") throw new Error("resolver guarantees a jsonpath @? / @@ operand");
+    let path;
+    try {
+      path = jsonPathCompile(qv.text, undefined);
+    } catch {
+      return { kind: "fullScan" };
+    }
+    const tree = jsonPathGinTree(path, strategy === "jsonPathExists");
+    return tree === null ? { kind: "fullScan" } : { kind: "tree", tree };
+  }
   if (strategy === "jsonContains") {
     if (qv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb @> operand");
     const terms = ginJsonbIndexTerms(qv.node);
@@ -28941,15 +29036,33 @@ class GinGather {
   }
 
   // postingList is a term's whole posting list (a prefix range scan).
-  // arm is one strategy's candidates over its distinct query terms: mode ANY (&&, ?|) → the union of
-  // every whole posting list; mode ALL → intersection. = ANY (member) and ? are a single term, so the
-  // intersection is that lone posting list; array = (equal) gathers the same superset as @> over Q's
-  // distinct non-NULL terms (the residual = makes it exact downstream); two or more terms take the
-  // skip-scan intersection (gin.md §6.2).
-  arm(strategy: GinStrategy, terms: Uint8Array[]): Uint8Array[] {
-    return strategy === "overlaps" || strategy === "jsonHasAnyKey"
-      ? unionPostings(terms.map((t) => this.postingList(t)))
-      : this.intersect(terms);
+  // eval is the candidates of a query tree (gin.md §2.2/§6), ascending. A term is its whole posting
+  // list. An or unions its leaves' lists (in byte order), then its children's candidates (in order).
+  // An and intersects its leaves by the skip-scan (§6.2) — or, with no leaf, starts from its first
+  // child — then intersects each following child's candidates in order, stopping once none
+  // survives. Mode ALL is an and of terms and mode ANY an or, so = ANY and ? (one term) read that
+  // lone list, array = gathers the same superset as @> (the residual makes it exact), and the
+  // jsonb_ops gathers are supersets the residual rechecks.
+  eval(t: GinTree): Uint8Array[] {
+    if (t.kind === "term") return this.postingList(t.term);
+    if (t.kind === "or")
+      return unionPostings([
+        ...t.leaves.map((term) => this.postingList(term)),
+        ...t.rest.map((c) => this.eval(c)),
+      ]);
+    let rest = t.rest;
+    let cand: Uint8Array[];
+    if (t.leaves.length > 0) cand = this.intersect(t.leaves);
+    else if (rest.length > 0) {
+      cand = this.eval(rest[0]!);
+      rest = rest.slice(1);
+    } else cand = [];
+    for (const child of rest) {
+      if (cand.length === 0) break;
+      const found = new Set(this.eval(child).map(byteKey));
+      cand = cand.filter((k) => found.has(byteKey(k)));
+    }
+    return cand;
   }
 
   postingList(term: Uint8Array): Uint8Array[] {

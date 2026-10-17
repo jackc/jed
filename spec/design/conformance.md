@@ -642,6 +642,9 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   strategy matches, so the `OR` full scans (gin.md §6.3);
   **gin_multi** — a multi-column GIN over `(a, b)` serves `b @> Q`, `k = ANY(b)`, and `a && Q` through
   each column's tagged terms (gin.md §4.4), compared with `Q <@ b` / `COALESCE(a, a) && Q` full scans;
+  **gin_jsonpath** — GIN `jsonb_ops` `@?` / `@@` (lax/strict `==`, `&&`/`||`, filter paths) gather
+  through the extracted term tree (gin.md §2.2), compared with the same predicates over
+  `doc::text::jsonb`, against by-construction rows;
   **gist_inl** — GiST range `@>` and scalar `=` sibling bounds are compared with equivalent `<@`
   and paired-inequality full-scan spellings, including NULL/empty range queries;
   **topk** — a blocking ORDER BY LIMIT/OFFSET heap is compared with a DISTINCT-gated full sort over

@@ -416,7 +416,7 @@ pub(crate) fn statistics_gin_estimate(
     let current = current_column_statistics(rel, column, catalog)?;
     let n = current.rows;
     let total_entries = statistics_scale(n, term_facts.occurrences, fact.analyzed_rows);
-    let terms = match gin_query_terms(opclass, strategy, &value) {
+    let tree = match gin_query_terms(opclass, strategy, &value) {
         GinQuery::Empty => {
             return Some(GinTermEstimate {
                 rows: 0,
@@ -425,7 +425,10 @@ pub(crate) fn statistics_gin_estimate(
             });
         }
         GinQuery::FullScan => return None,
-        GinQuery::Terms(terms) => terms,
+        GinQuery::Terms(terms) => {
+            crate::gin_jsonpath::GinTree::from_terms(strategy.is_any(), terms)
+        }
+        GinQuery::Tree(tree) => tree,
     };
     let term_rows = |term: &[u8]| -> i64 {
         if current.nonnull_rows == 0 {
@@ -442,32 +445,74 @@ pub(crate) fn statistics_gin_estimate(
             .min(current.nonnull_rows)
             .max(1)
     };
-    let mut priced: Vec<(i64, Vec<u8>)> = terms
-        .into_iter()
-        .map(|term| (term_rows(term.as_slice()), term))
-        .collect();
-    priced.sort();
-    let (rows, entries) = if strategy.is_any() {
-        let sum = priced
-            .iter()
-            .fold(0i64, |acc, (rows, _)| acc.saturating_add(*rows));
-        (sum.min(current.nonnull_rows), sum)
-    } else {
-        let mut iter = priced.iter();
-        let first = iter.next().map_or(0, |(rows, _)| *rows);
-        let mut rows = first;
-        let mut entries = first;
-        for (term_rows, _) in iter {
-            entries = entries.saturating_add(rows);
-            rows = statistics_scale(rows, *term_rows, n);
-        }
-        (rows, entries)
-    };
+    let (rows, entries) = gin_tree_estimate(&tree, &term_rows, n, current.nonnull_rows);
     Some(GinTermEstimate {
         rows,
         entries,
         total_entries,
     })
+}
+
+/// A GIN query tree's `(rows, gin_entry)` estimate (statistics.md §6.1), following the gather's
+/// evaluation (gin.md §2.2/§6): a term reads its rows. An `Or` sums its leaves and children (rows
+/// capped at the non-NULL rows). An `And` folds its leaves rarest-first under independence — the
+/// first read whole, each later term probed at the survivors — then each child in order, whose
+/// entries add whole and whose rows scale the survivors.
+fn gin_tree_estimate(
+    tree: &crate::gin_jsonpath::GinTree,
+    term_rows: &impl Fn(&[u8]) -> i64,
+    n: i64,
+    nonnull: i64,
+) -> (i64, i64) {
+    use crate::gin_jsonpath::GinTree;
+    match tree {
+        GinTree::Term(term) => {
+            let rows = term_rows(term);
+            (rows, rows)
+        }
+        GinTree::Or(leaves, rest) => {
+            let mut sum = 0i64;
+            let mut entries = 0i64;
+            for term in leaves {
+                let rows = term_rows(term);
+                sum = crate::estimator::sat_add(sum, rows);
+                entries = crate::estimator::sat_add(entries, rows);
+            }
+            for child in rest {
+                let (rows, e) = gin_tree_estimate(child, term_rows, n, nonnull);
+                sum = crate::estimator::sat_add(sum, rows);
+                entries = crate::estimator::sat_add(entries, e);
+            }
+            (sum.min(nonnull), entries)
+        }
+        GinTree::And(leaves, rest) => {
+            let mut priced: Vec<(i64, &Vec<u8>)> =
+                leaves.iter().map(|term| (term_rows(term), term)).collect();
+            priced.sort();
+            let mut rest = rest.iter();
+            let (mut rows, mut entries) = match priced.split_first() {
+                Some((&(first, _), tail)) => {
+                    let mut rows = first;
+                    let mut entries = first;
+                    for &(term_rows, _) in tail {
+                        entries = crate::estimator::sat_add(entries, rows);
+                        rows = statistics_scale(rows, term_rows, n);
+                    }
+                    (rows, entries)
+                }
+                None => match rest.next() {
+                    Some(first) => gin_tree_estimate(first, term_rows, n, nonnull),
+                    None => (0, 0),
+                },
+            };
+            for child in rest {
+                let (child_rows, e) = gin_tree_estimate(child, term_rows, n, nonnull);
+                entries = crate::estimator::sat_add(entries, e);
+                rows = statistics_scale(rows, child_rows, n);
+            }
+            (rows, entries)
+        }
+    }
 }
 
 /// A term-eligible column's estimated total GIN term occurrences at its current row count
@@ -522,6 +567,7 @@ fn statistics_gin_leaf_selectivity(
             | RExpr::Quantified { .. }
             | RExpr::JsonContains { .. }
             | RExpr::JsonHasKey { .. }
+            | RExpr::JsonPathFn { .. }
     ) {
         return None;
     }

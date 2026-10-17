@@ -70,6 +70,11 @@ pub(crate) enum GinStrategy {
     /// `jsonb_ops` `col ?& K`: the key terms of `K`'s non-NULL elements, mode ALL; none falls back
     /// to the full scan.
     JsonHasAllKeys,
+    /// `jsonb_ops` `col @? P`: the AND/OR term tree PostgreSQL extracts from the jsonpath's equality
+    /// filters (gin.md §2.2); nothing extractable falls back to the full scan.
+    JsonPathExists,
+    /// `jsonb_ops` `col @@ P`: the term tree of the jsonpath predicate (gin.md §2.2).
+    JsonPathMatch,
 }
 
 impl GinStrategy {
@@ -90,6 +95,8 @@ impl GinStrategy {
             GinStrategy::JsonHasKey => ACCESS_GIN_JSONB_EXISTS,
             GinStrategy::JsonHasAnyKey => ACCESS_GIN_JSONB_EXISTS_ANY,
             GinStrategy::JsonHasAllKeys => ACCESS_GIN_JSONB_EXISTS_ALL,
+            GinStrategy::JsonPathExists => ACCESS_GIN_JSONB_PATH_EXISTS,
+            GinStrategy::JsonPathMatch => ACCESS_GIN_JSONB_PATH_MATCH,
         }
     }
 }
@@ -4326,6 +4333,20 @@ where
                 HasKeyKind::All => GinStrategy::JsonHasAllKeys,
             };
             Some((strategy, arg.as_ref()))
+        }
+        // `col @? P` / `col @@ P` (gin.md §2.2): only the operators — the jsonpath functions take
+        // vars and a silent flag, and PostgreSQL indexes neither.
+        RExpr::JsonPathFn {
+            kind: kind @ (JsonPathFnKind::ExistsSilent | JsonPathFnKind::MatchSilent),
+            tz: false,
+            args,
+        } if args.len() == 2 && is_column(&args[0], col_global) && query_ok(&args[1]) => {
+            let strategy = if *kind == JsonPathFnKind::ExistsSilent {
+                GinStrategy::JsonPathExists
+            } else {
+                GinStrategy::JsonPathMatch
+            };
+            Some((strategy, &args[1]))
         }
         _ => None,
     }

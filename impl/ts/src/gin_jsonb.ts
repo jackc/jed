@@ -50,7 +50,7 @@ export function ginJsonbKeyTerm(key: string): Uint8Array {
 
 // scalarTerm is a scalar's term; asKey marks a string that is an array element (or the top-level
 // scalar), which PostgreSQL indexes as a KEY.
-function scalarTerm(n: JsonNode, asKey: boolean): Uint8Array {
+export function ginJsonbScalarTerm(n: JsonNode, asKey: boolean): Uint8Array {
   switch (n.kind) {
     case "null":
       return Uint8Array.of(FLAG_NULL);
@@ -74,12 +74,12 @@ function walk(n: JsonNode, out: Uint8Array[]): void {
     for (const m of n.members) {
       out.push(ginJsonbKeyTerm(m.key));
       if (isContainer(m.value)) walk(m.value, out);
-      else out.push(scalarTerm(m.value, false));
+      else out.push(ginJsonbScalarTerm(m.value, false));
     }
   } else if (n.kind === "array") {
     for (const e of n.elements) {
       if (isContainer(e)) walk(e, out);
-      else out.push(scalarTerm(e, e.kind === "string"));
+      else out.push(ginJsonbScalarTerm(e, e.kind === "string"));
     }
   }
 }
@@ -100,7 +100,7 @@ function cmpBytes(a: Uint8Array, b: Uint8Array): number {
 export function ginJsonbIndexTerms(doc: JsonNode): Uint8Array[] {
   const raw: Uint8Array[] = [];
   if (isContainer(doc)) walk(doc, raw);
-  else raw.push(scalarTerm(doc, doc.kind === "string"));
+  else raw.push(ginJsonbScalarTerm(doc, doc.kind === "string"));
   raw.sort(cmpBytes);
   const out: Uint8Array[] = [];
   for (const t of raw) {
