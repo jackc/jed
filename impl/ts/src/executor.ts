@@ -32236,6 +32236,7 @@ export type AggPlan =
   | "min"
   | "max"
   | "boolAnd" // bool_and(x) — TRUE iff every non-NULL input is TRUE (aggregates.md §23)
+  | "boolOr" // bool_or(x) — TRUE iff some non-NULL input is TRUE (aggregates.md §23)
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
   // a group's values into one JSON array, one element per input row in scan order. Each element is
   // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
@@ -32731,8 +32732,10 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       }
       break;
     case "boolAnd":
-      // The running conjunction of the non-NULL inputs (aggregates.md §23); NULLs are skipped.
-      if (v.kind === "bool" && (a.cur === null || !v.value)) a.cur = v;
+    case "boolOr":
+      // The running conjunction (disjunction) of the non-NULL inputs (aggregates.md §23); NULLs are
+      // skipped. A FALSE input decides bool_and, a TRUE one bool_or.
+      if (v.kind === "bool" && (a.cur === null || v.value === (a.plan === "boolOr"))) a.cur = v;
       break;
     case "jsonAgg":
       // Called once per group row, NULL-valued rows INCLUDED. `seen` marks the group non-empty even
@@ -32879,6 +32882,7 @@ export function finalizeAcc(a: Acc): Value {
     case "min":
     case "max":
     case "boolAnd":
+    case "boolOr":
       return a.cur ?? nullValue();
     case "jsonAgg": {
       // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array (json:
@@ -35587,6 +35591,7 @@ export function aggregatePlan(
   if (surface === "min" && code === "same_as_input") return ["min", t, undefined];
   if (surface === "max" && code === "same_as_input") return ["max", t, undefined];
   if (surface === "bool_and" && code === "boolean") return ["boolAnd", { kind: "bool" }, undefined];
+  if (surface === "bool_or" && code === "boolean") return ["boolOr", { kind: "bool" }, undefined];
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (B4). The (surface, result-code) pair
   // selects the result type + the two flags; the result code is "jsonb" or "json". asJson = the json
   // result type; strict = the _strict variant (skip a NULL-valued row).
@@ -37224,6 +37229,7 @@ function packedStateBytes(accs: Acc[]): number {
       case "min":
       case "max":
       case "boolAnd":
+      case "boolOr":
         n += valueBytes(a.cur ?? nullValue());
         break;
       default:

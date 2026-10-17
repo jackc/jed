@@ -1053,6 +1053,10 @@ id = "func.bool_and"
 description = "bool_and(boolean) -> boolean (aggregates.md §23): TRUE iff every non-NULL input is TRUE; NULL inputs skipped; NULL over an empty or all-NULL group. Composes with GROUP BY, DISTINCT, FILTER, the in-aggregate ORDER BY, and OVER (a window aggregate). A non-boolean argument is 42883. Cost: an ordinary aggregate (aggregate_accumulate per folded row). Builds on query.aggregates"
 
 [[capability]]
+id = "func.bool_or"
+description = "bool_or(boolean) -> boolean (aggregates.md §23): TRUE iff some non-NULL input is TRUE; NULL inputs skipped; NULL over an empty or all-NULL group. Composes like bool_and. Builds on func.bool_and"
+
+[[capability]]
 id = "func.json_object_agg"
 description = "json/jsonb object aggregates (B4, spec/design/json-sql-functions.md §4): jsonb_object_agg(key, value) / json_object_agg(key, value) aggregate the group's (key, value) pairs into a single JSON object; jsonb_object_agg_unique / json_object_agg_unique additionally error 22030 ('duplicate JSON object key value') on a duplicate key. The key is always a JSON string (§2.2: a number/boolean its text, a datetime its ISO 8601 form, any other scalar its text output; an array/composite/json/jsonb key → 22023); a NULL key → 22004 (json_object_agg) / 22023 'field name must not be null' (jsonb_object_agg). The value is its JSON image (§2.2); a float key or value is a ledgered deferred 0A000. An empty group → SQL NULL. jsonb_object_agg canonicalizes (last-wins dedup, canonical key order, spaced); json_object_agg keeps the group's row order + duplicate keys and uses PG's idiosyncratic '{ … }' brace-padded ', ' / ' : ' spacing. These are 2-argument aggregates, hand-resolved (the single-operand aggregate catalog can't express a key/value pair) — the key/value pair is carried as a Row operand. Deterministic under an ORDER BY of the source. Oracle-pinned (postgres:18). Builds on func.json_agg"
 

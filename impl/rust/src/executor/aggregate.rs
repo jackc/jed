@@ -124,6 +124,10 @@ impl Acc {
                 cur: None,
                 is_and: true,
             },
+            AggPlan::BoolOr => Acc::Bool {
+                cur: None,
+                is_and: false,
+            },
             AggPlan::JsonAgg { compact, strict } => Acc::JsonAgg {
                 elems: Vec::new(),
                 compact,
