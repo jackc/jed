@@ -2,7 +2,7 @@
 
 > **Status: S1–S10 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
 > retired with shared mode and succeeded by S8, an owner and its page clients), including spill faults, temp-table spill, file
-> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, batched durability (S9), and trailing truncation (S10). A seeded simulator that runs long, randomized
+> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, batched durability (S9), trailing truncation (S10), and backups (page-service.md §9). A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
 > becomes a regression test. It targets the **storage, commit, and recovery state machine**
@@ -134,6 +134,7 @@ check
 | `crash process` / `crash power survive=‰ tear=‰` | An immediate crash between steps. |
 | `reopen` | Ends every session (rolling back a writer), closes cleanly, and opens again. |
 | `compact [<db>]` | Host compaction of `main` or a file attachment (api.md §2.6), through the simulated filesystem. |
+| `backup page_identical\|compacted [p<N>]` | A backup of `main` (page-service.md §9) by process `p` (default: the lowest running), into a new file `<main>.backup<K>` through the simulated filesystem, while every other session keeps its pin and writer gate. Its oracle is §8.3's *Backups*. |
 | `attach <name>` | Attaches the file database `<name>.jed` read-write (attached-databases.md §4), first creating it through the simulated filesystem if it does not exist. Every later process re-attaches every attachment whose file exists. In a service trace it attaches the file in every running process under the page service, main's owner first (S11). |
 | `corrupt flips=N [reseal=1]` | Bit rot in the main file (§6.3). Ends every session cleanly, flips bits, opens and reads, then repairs. |
 | `check` | Runs the integrity checkers (§8.3). |
@@ -439,6 +440,16 @@ instead when the engine next holds nothing pending (after the batch cap's flush 
 against the newest generation's high-water. And after every step the file must be at least as long
 as the durable floor's `page_count`: while a batch is pending the floor is the one generation recovery
 is sure to find, and a shrink that cut its pages would leave it unusable.
+
+**Backups** (page-service.md §9) are checked at the step that takes them, as a new process would
+open the file: a failed backup leaves no destination; a successful one opens, its contents are a
+generation the history records at the version it copied (its own `txid` for the page-identical
+form, one below for the compacted one), that version is no older than the newest committed, and the
+image checker accepts it. Its transcript line carries the image hash, so the cores' backups of one
+history are byte-identical, and `--check-images` decodes it with `spec/fileformat/verify.rb` too. A
+fault on a backup step may cut its writes (the temp file's sync, the directory's) or, in a service
+trace, end the connection its page reads use. Whether a completed backup survives a later power
+loss is not checked: like `create`, it is durable only once its directory barrier completes.
 
 **Two more violations** need no checker: any statement or commit that reports `XX001` (corruption
 must never surface outside corruption mode), and **snapshot isolation** — when a reader closes, its
