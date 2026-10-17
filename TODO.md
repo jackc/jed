@@ -58,11 +58,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ PG surface still narrower around names — a derived CHECK/FK name's collision walk avoids only its own table's constraint names, where PostgreSQL avoids every constraint name in the schema ([constraints.md §6.7](spec/design/constraints.md)).
 - [x] **Named + optional (DEFAULT) function arguments** — PG named notation `f(name => value)` + DEFAULT params; `make_interval`, then `make_timestamp`/`make_timestamptz`; `VARIADIC` (landed as **AF6** with the array type). → [functions.md §11](spec/design/functions.md)
   - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
-- [ ] **Common aggregates** — PARTIAL ([aggregates.md §23](spec/design/aggregates.md)). Landed:
-  `bool_and`, `bool_or`, `every`, `bit_and`, `bit_or`, `bit_xor`, `array_agg`, `string_agg`, `var_pop`, `var_samp`, `variance`, `stddev_pop`, `stddev_samp`, `stddev`, `covar_pop`,
-  `covar_samp`, `corr`, `regr_count`, `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`, `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`. Still missing: the rest of the two-argument statistical
-  set — the other `regr_*` (exact over `decimal`, PostgreSQL's `float8` results over floats). Each needs its
-  spill/query-memory accounting (memory.md §6). _(size: M)_
+- [x] **Common aggregates** — PostgreSQL's everyday aggregates, each with its spill/query-memory
+  accounting: `bool_and`/`bool_or`/`every`, `bit_and`/`bit_or`/`bit_xor`, `array_agg` (arrays of
+  arrays stack a dimension), `string_agg` (text or bytea), the variance/standard-deviation family
+  (`var_pop`, `var_samp`, `variance`, `stddev_pop`, `stddev_samp`, `stddev`), and the two-argument
+  `covar_pop`, `covar_samp`, `corr`, `regr_count`, `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`,
+  `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`. The statistical set is exact over
+  integer/decimal input and PostgreSQL's `float8` algorithms over floats; the exact two-argument forms
+  are a ledgered divergence (PostgreSQL has only `float8` ones). → [aggregates.md §23](spec/design/aggregates.md)
 - [ ] **`NULLIF(a, b)`** — the SQL conditional beside `COALESCE`/`GREATEST`/`LEAST` (grammar.md §51–§52);
   absent from the grammar today. _(size: S)_
 - [ ] **Everyday scalar functions** — `concat_ws`, `format()` (PostgreSQL's `%s`/`%I`/`%L`),
