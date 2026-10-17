@@ -757,6 +757,7 @@ in-aggregate `ORDER BY` key must be one of the arguments (§22).
 | `string_agg(x, d)` | `text, text` / `bytea, bytea` | `text` / `bytea` | the non-NULL values joined by the delimiters |
 | `var_pop(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the population variance |
 | `var_samp(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | the sample variance |
+| `variance(x)` | integer / `decimal` / float | `decimal` / `decimal` / `f64` | PostgreSQL's alias of `var_samp` |
 
 **Boolean aggregates.** `bool_and` and `bool_or` are the running conjunction and disjunction of
 their non-NULL inputs; `every` is the SQL standard's name for `bool_and`. They are order-insensitive ([determinism.md](determinism.md) §7). Their packed
@@ -834,3 +835,4 @@ bounded-spill lane: exact `[int N, decimal Σx, decimal Σx²]`, float `[f64 N, 
 
 - `var_pop` is the population variance.
 - `var_samp` is the sample variance; NULL over fewer than two inputs.
+- `variance` is PostgreSQL's historical alias of `var_samp`.

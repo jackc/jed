@@ -6069,7 +6069,7 @@ impl MomentStat {
     pub(crate) fn from_surface(surface: &str) -> Option<MomentStat> {
         Some(match surface {
             "var_pop" => MomentStat::VarPop,
-            "var_samp" => MomentStat::VarSamp,
+            "var_samp" | "variance" => MomentStat::VarSamp,
             _ => return None,
         })
     }
