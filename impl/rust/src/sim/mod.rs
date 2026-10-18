@@ -2895,6 +2895,35 @@ impl<'a> Runner<'a> {
         ));
     }
 
+    /// Raise each database's floor to its published version after every process closed cleanly under
+    /// synchronous = off, when the close left every byte of the file and its directory entry durable:
+    /// a clean close flushes the batch (validated-cow.md §4). A generation a recovered process adopted
+    /// and never had to stabilize (it wrote nothing) may still be pending, and keeps its floor (§8.2).
+    /// So does a database whose owner died: what it published may be gone until a process observes
+    /// the database again.
+    fn close_flushed(&mut self) {
+        if !self.relaxed {
+            return;
+        }
+        for name in self.order() {
+            let (file, version, floor) = {
+                let d = &self.dbs[&name];
+                if d.owner_lost {
+                    continue;
+                }
+                (d.file.clone(), d.version, d.floor)
+            };
+            let durable = {
+                let disk = self.disk();
+                disk.file(&file)
+                    .is_some_and(|id| !disk.has_pending(id) && disk.entry_durable(&file))
+            };
+            if durable && version > floor {
+                self.dbs.get_mut(&name).unwrap().floor = version;
+            }
+        }
+    }
+
     /// End every session cleanly, close the Database, and reopen it: the result must be exactly the
     /// last committed version of every database.
     fn step_reopen(&mut self, i: usize) -> bool {
@@ -2904,7 +2933,9 @@ impl<'a> Runner<'a> {
                 return false;
             }
         }
-        // Close flushed every batch, so a shrink a relaxed commit deferred has happened.
+        // Close flushed every batch, so a shrink a relaxed commit deferred has happened, and the floor
+        // the file is held to is the version it flushed (validated-cow.md §4), not the one before it.
+        self.close_flushed();
         for name in self.order() {
             if !self.check_truncated(i, &name) {
                 return false;

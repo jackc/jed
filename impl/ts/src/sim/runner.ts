@@ -1981,6 +1981,23 @@ export class SimRunner {
     this.emit(`{"i":${i},"op":"check",${mainLine}${dbsJSON(entries)}}`);
   }
 
+  // closeFlushed raises each database's floor to its published version after every process closed
+  // cleanly under synchronous = off, when the close left every byte of the file and its directory
+  // entry durable: a clean close flushes the batch (validated-cow.md §4). A generation a recovered
+  // process adopted and never had to stabilize (it wrote nothing) may still be pending, and keeps its
+  // floor (§8.2). So does a database whose owner died: what it published may be gone until a process
+  // observes the database again.
+  private closeFlushed(): void {
+    if (!this.relaxed) return;
+    for (const d of this.order()) {
+      const f = this.fs.files.get(d.file);
+      if (f === undefined || d.ownerLost) continue;
+      if (!f.hasPending() && this.fs.entryDurable(d.file) && d.version > d.floor) {
+        d.floor = d.version;
+      }
+    }
+  }
+
   // stepReopen ends every session cleanly, closes the Database, and reopens it: the result must be
   // exactly the last committed version of every database.
   private stepReopen(i: number): boolean {
@@ -1993,7 +2010,9 @@ export class SimRunner {
         return false;
       }
     }
-    // Close flushed every batch, so a shrink a relaxed commit deferred has happened.
+    // Close flushed every batch, so a shrink a relaxed commit deferred has happened, and the floor the
+    // file is held to is the version it flushed (validated-cow.md §4), not the one before it.
+    this.closeFlushed();
     for (const d of this.order()) if (!this.checkTruncated(i, d)) return false;
     this.fs.processDeath();
     try {

@@ -552,6 +552,11 @@ export class SimFile implements BlockStore {
     else vs.push(bytes.slice());
   }
 
+  // hasPending reports whether any write is still pending, not yet covered by a barrier.
+  hasPending(): boolean {
+    return this.pending.size > 0;
+  }
+
   // metaPending reports whether a meta-slot write is still pending, not yet covered by a barrier: the
   // disk fact the relaxed-durability oracle checks an engine's flush claim against (§8.2).
   metaPending(): boolean {
