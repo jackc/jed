@@ -1,0 +1,166 @@
+# INSERT … ON CONFLICT DO UPDATE and EXCLUDE constraints across the merged arbiter features
+# (spec/design/upsert.md §2/§5, gist.md §7): a DO UPDATE that re-keys the conflicting row (SET of a
+# primary-key column) is checked against every exclusion constraint like any updated row — its
+# vacated old version never conflicts, its new values must conflict with no other stored or new
+# row (23P01) — and a decorated or partial column-list target arbitrates only its unique index, so
+# an exclusion conflict outside it is still 23P01 while an arbiter hit is handled first. Both
+# access methods (gist over a range, btree `=`), partial and not. Every record is oracle-probed.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.index_partial, ddl.exclusion_constraint, ddl.exclusion_btree, ddl.exclusion_partial, ddl.collate_column, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.insert_on_conflict_exclusion, dml.insert_on_conflict_rekey, dml.insert_on_conflict_decorations, dml.upsert_partial_arbiter, dml.returning, query.select, query.order_by, expr.arithmetic, types.i32, types.text, types.range
+
+# --- re-keying DO UPDATE over a GiST exclusion -------------------------------------------------------
+statement ok
+CREATE TABLE rx (id i32 PRIMARY KEY, span int4range, EXCLUDE USING gist (span WITH &&))
+
+statement ok
+INSERT INTO rx VALUES (1, '[1,5)'), (2, '[10,20)')
+
+# The moved row keeps its span: its own vacated old version is no conflict.
+query IT nosort
+INSERT INTO rx VALUES (1, '[100,101)') ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100 RETURNING id, span
+----
+101
+[1,5)
+
+# Re-key and new span overlapping only the row's old version.
+query IT nosort
+INSERT INTO rx VALUES (101, 'empty') ON CONFLICT (id) DO UPDATE SET id = 1, span = '[2,6)' RETURNING id, span
+----
+1
+[2,6)
+
+# Re-key whose new span overlaps another stored row.
+statement error 23P01
+INSERT INTO rx VALUES (1, 'empty') ON CONFLICT (id) DO UPDATE SET id = 3, span = '[15,16)'
+
+# Re-key whose new span overlaps a row the same statement inserted.
+statement error 23P01
+INSERT INTO rx VALUES (5, '[30,40)'), (1, 'empty') ON CONFLICT (id) DO UPDATE SET id = 6, span = '[35,36)'
+
+# A proposal with no arbiter conflict is inserted, and its exclusion conflict is an error.
+statement error 23P01
+INSERT INTO rx VALUES (7, '[3,4)') ON CONFLICT (id) DO UPDATE SET id = 8
+
+query IT nosort
+SELECT id, span FROM rx ORDER BY id
+----
+1
+[2,6)
+2
+[10,20)
+
+# --- re-keying DO UPDATE over a btree exclusion --------------------------------------------------------
+statement ok
+CREATE TABLE bx (id i32 PRIMARY KEY, code text, EXCLUDE (code WITH =))
+
+statement ok
+INSERT INTO bx VALUES (1, 'a'), (2, 'b')
+
+query IT nosort
+INSERT INTO bx VALUES (1, 'z') ON CONFLICT (id) DO UPDATE SET id = 10 RETURNING id, code
+----
+10
+a
+
+statement error 23P01
+INSERT INTO bx VALUES (2, 'z') ON CONFLICT (id) DO UPDATE SET id = 20, code = 'a'
+
+query IT nosort
+INSERT INTO bx VALUES (2, 'z') ON CONFLICT (id) DO UPDATE SET id = 20, code = excluded.code RETURNING id, code
+----
+20
+z
+
+# Two re-keys in one statement whose new codes collide.
+statement error 23P01
+INSERT INTO bx VALUES (10, 'q'), (20, 'q') ON CONFLICT (id) DO UPDATE SET id = bx.id + 1, code = excluded.code
+
+query IT nosort
+SELECT id, code FROM bx ORDER BY id
+----
+10
+a
+20
+z
+
+# --- a decorated, partial target beside a partial exclusion -------------------------------------------
+statement ok
+CREATE TABLE dx (id i32 PRIMARY KEY, name text COLLATE "C", status text, span int4range, EXCLUDE USING gist (span WITH &&) WHERE (status = 'active'))
+
+statement ok
+CREATE UNIQUE INDEX dx_name ON dx (name) WHERE status = 'active'
+
+statement ok
+INSERT INTO dx VALUES (1, 'a', 'active', '[1,5)'), (2, 'b', 'inactive', '[1,5)'), (3, 'e', 'active', '[10,20)')
+
+# No arbiter conflict, an exclusion conflict: 23P01.
+statement error 23P01
+INSERT INTO dx VALUES (4, 'c', 'active', '[2,3)') ON CONFLICT (name COLLATE "C" text_ops) WHERE status = 'active' DO NOTHING
+
+# An arbiter hit is skipped, though the row would also be excluded.
+query I nosort
+INSERT INTO dx VALUES (4, 'a', 'active', '[2,3)') ON CONFLICT (name COLLATE "C") WHERE status = 'active' DO NOTHING RETURNING id
+----
+
+# A row the partial exclusion does not cover is inserted.
+query I nosort
+INSERT INTO dx VALUES (5, 'd', 'inactive', '[2,3)') ON CONFLICT (name text_ops) WHERE status = 'active' DO NOTHING RETURNING id
+----
+5
+
+# DO UPDATE through the decorated partial arbiter: the new span overlaps only the row's old version.
+query IT nosort
+INSERT INTO dx VALUES (6, 'a', 'active', 'empty') ON CONFLICT (name COLLATE "C" text_ops) WHERE status = 'active' DO UPDATE SET span = '[3,4)' RETURNING id, span
+----
+1
+[3,4)
+
+# The new span overlaps another participating row.
+statement error 23P01
+INSERT INTO dx VALUES (6, 'a', 'active', 'empty') ON CONFLICT (name COLLATE "C") WHERE status = 'active' DO UPDATE SET span = '[15,16)'
+
+# Leaving the predicate takes the row out of the exclusion; re-keyed through the partial arbiter.
+query ITTT nosort
+INSERT INTO dx VALUES (6, 'a', 'active', 'empty') ON CONFLICT (name COLLATE "C") WHERE status = 'active' DO UPDATE SET id = 60, status = 'inactive', span = '[15,16)' RETURNING id, name, status, span
+----
+60
+a
+inactive
+[15,16)
+
+statement ok
+INSERT INTO dx VALUES (8, 'g', 'active', '[30,40)')
+
+# Re-keyed through the partial arbiter into a participating overlap.
+statement error 23P01
+INSERT INTO dx VALUES (7, 'e', 'active', 'empty') ON CONFLICT (name COLLATE "C" text_ops) WHERE status = 'active' DO UPDATE SET id = 70, span = '[35,36)'
+
+query IT nosort
+INSERT INTO dx VALUES (7, 'e', 'active', 'empty') ON CONFLICT (name COLLATE "C" text_ops) WHERE status = 'active' DO UPDATE SET id = 70, span = '[3,5)' RETURNING id, span
+----
+70
+[3,5)
+
+query ITTT nosort
+SELECT id, name, status, span FROM dx ORDER BY id
+----
+2
+b
+inactive
+[1,5)
+5
+d
+inactive
+[2,3)
+8
+g
+active
+[30,40)
+60
+a
+inactive
+[15,16)
+70
+e
+active
+[3,5)

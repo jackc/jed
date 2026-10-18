@@ -400,7 +400,10 @@ participating rows only. Everything a partial index's predicate obeys, this one 
 - **Reads.** A partial GiST backing index is constraint-only, never a read access path (the
   multi-column backing-index precedent above; GiST has no predicate-implication gate yet). A partial
   **btree** exclusion's backing index (§7.2) is an ordinary partial ordered index and is used under
-  the indexes.md §9 syntactic-implication rule.
+  the same rule as any partial B-tree index: it serves a read only when the query's WHERE implies its
+  predicate under the indexes.md §9.1 prover (so `WHERE live AND code = 'a'` may use the index
+  behind `EXCLUDE (code WITH =) WHERE (live)`; `WHERE code = 'a'` may not). The `REINDEX`
+  rebuild (indexes.md §10) keeps the predicate on both kinds of backing index.
 - **`ALTER TABLE … ADD … WHERE`** validates only the participating existing rows: each unordered pair
   of rows whose predicate is TRUE charges one `constraint_check` (alter.md §5).
 - **Introspection.** `jed_indexes.predicate` shows the backing index's predicate and
@@ -515,7 +518,7 @@ Each is its own vertical slice with a NoREC/oracle obligation ([conformance.md �
   its own small slice; the codec already length-prefixes the bound, so no node-format change.
 - **General-expression** WITH operands. (The `WHERE (predicate)` partial form, §7.1, `EXCLUDE USING
   btree`, §7.2, and `ALTER TABLE … ADD CONSTRAINT … EXCLUDE` have landed.) A GiST predicate-implication
-  gate, so a partial GiST index could serve reads (indexes.md §9's syntactic rule) — and with it
+  gate, so a partial GiST index could serve reads (the indexes.md §9.1 prover, extended to GiST) — and with it
   `CREATE INDEX … USING gist … WHERE`, still `0A000`.
 - **`DEFERRABLE` / `INITIALLY DEFERRED`** — jed has no deferred-constraint machinery yet; its own
   axis (a constraint queue checked at commit), not GiST-specific.
