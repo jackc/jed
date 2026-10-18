@@ -6,7 +6,7 @@
 # typmod cast carries (PostgreSQL's exprTypmod — create-table-as.md §2), ALTER COLUMN TYPE re-rounds
 # the stored values, and a constant DEFAULT is stored rounded. jed-specific catalog text, so
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: introspect.columns, introspect.type_fields, ddl.create_table, ddl.create_table_as, ddl.alter_table, ddl.primary_key, ddl.column_default, dml.insert, query.select, query.where_eq, query.order_by, query.union, query.cte, query.derived_table, cast.explicit, types.i32, types.timestamp, types.timestamptz, types.interval, types.composite, types.timestamp_precision, types.interval_qualifier
+# requires: introspect.columns, introspect.type_fields, ddl.view, ddl.view_replace, ddl.create_table, ddl.create_table_as, ddl.alter_table, ddl.primary_key, ddl.column_default, dml.insert, query.select, query.where_eq, query.order_by, query.union, query.cte, query.derived_table, cast.explicit, types.i32, types.timestamp, types.timestamptz, types.interval, types.composite, types.timestamp_precision, types.interval_qualifier
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a timestamp(3), b timestamptz(0), c timestamp(6), d timestamp(9), e interval day to second(3), f interval(2), g interval year, h interval minute to second, i interval, j timestamp)
@@ -151,3 +151,26 @@ SELECT ordinal, type FROM jed_type_fields WHERE type_name = 'stamp' ORDER BY ord
 timestamp(2)
 2
 interval hour to second(1)
+
+# --- a view column shows the typmod its body keeps, and a replacement must keep it ----------------
+statement ok
+CREATE VIEW vt AS SELECT a, e, j::timestamptz(2) AS j2 FROM t
+
+query IT nosort
+SELECT ordinal, type FROM jed_columns WHERE table_name = 'vt' ORDER BY ordinal
+----
+1
+timestamp(3)
+2
+interval day to second(3)
+3
+timestamptz(2)
+
+statement error 42P16
+CREATE OR REPLACE VIEW vt AS SELECT a::timestamp(4) AS a, e, j::timestamptz(2) AS j2 FROM t
+
+statement error 42P16
+CREATE OR REPLACE VIEW vt AS SELECT a, e::interval day to second AS e, j::timestamptz(2) AS j2 FROM t
+
+statement ok
+CREATE OR REPLACE VIEW vt AS SELECT a, e, j::timestamptz(2) AS j2, f FROM t

@@ -945,6 +945,14 @@ impl Engine {
 /// the typmod the column keeps applied at a scalar leaf (`varchar(3)`, `decimal(5,2)`), and an
 /// untyped NULL as `text`. An array keeps no element typmod (create-table-as.md §5).
 pub(crate) fn view_column_type_text(t: &ResolvedType, tm: Typmod) -> String {
+    if let Some(temporal) = tm.temporal
+        && matches!(
+            t,
+            ResolvedType::Timestamp | ResolvedType::Timestamptz | ResolvedType::Interval
+        )
+    {
+        return t.type_name() + &crate::catalog::temporal_typmod_text(temporal);
+    }
     match (t, tm.varchar_len, tm.decimal) {
         (ResolvedType::Null, _, _) => "text".to_string(),
         (ResolvedType::Text, Some(n), _) => format!("varchar({n})"),
