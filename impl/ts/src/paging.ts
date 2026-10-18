@@ -16,6 +16,7 @@ import type { BlockStore } from "./blockstore.ts";
 import type { ColType } from "./catalog.ts";
 import type { PNode } from "./pmap.ts";
 import { BufferPool } from "./bufferpool.ts";
+import { runSync, type Steps } from "./execution.ts";
 import { engineError } from "./errors.ts";
 import { decodeLeafNode, sameLeafShape } from "./format.ts";
 import type { ManifestEntry } from "./commit_manifest.ts";
@@ -52,6 +53,10 @@ export class SharedPaging {
   // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
   // with a caller-supplied decoder is consistent (pager.md §4).
   faultLeaf(page: number, colTypes: ColType[]): PNode {
+    return runSync(this.faultLeafSteps(page, colTypes));
+  }
+
+  *faultLeafSteps(page: number, colTypes: ColType[]): Steps<PNode> {
     // Materialize any external value by following its overflow chain through the pager (the leaf
     // block holds only the pointer — spec/design/large-values.md §12).
     // Lazy decode (spec/design/large-values.md §14): an external/compressed value stays an
@@ -59,9 +64,10 @@ export class SharedPaging {
     // columns a query touches through readBlock below; `this` is stamped into each deferred
     // external value so a touched-set miss self-resolves (the B4 demand-fault backstop,
     // format.ts resolveUnfetchedSelf).
-    const node = this.pool.getOrLoad(page, () =>
-      decodeLeafNode(this.pager.readBlock(page), page, colTypes, this),
-    );
+    const paging = this;
+    const node = yield* this.pool.getOrLoadSteps(page, function* () {
+      return decodeLeafNode(yield* paging.pager.readBlockSteps(page), page, colTypes, paging);
+    });
     // The pool is keyed by page alone, so a pointer into another tree's leaf can return a node
     // decoded for that tree's columns. Its directories were validated against those columns, not
     // these, so serving it would index regions that do not exist (storage.md §7).
@@ -74,6 +80,10 @@ export class SharedPaging {
   // interior skeleton this way (format.ts loadEnginePaged).
   readBlock(index: number): Uint8Array {
     return this.pager.readBlock(index);
+  }
+
+  readBlockSteps(index: number): Steps<Uint8Array> {
+    return this.pager.readBlockSteps(index);
   }
 
   // reserve / writeBlock / sync / close drive the commit write path (file.ts persistImpl) and handle

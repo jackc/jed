@@ -393,8 +393,10 @@ OPFS adapters. It is reasonable to specialize scheduling, crypto, storage, and p
 The runtime is specified in [ts-runtime.md](ts-runtime.md): **async-only application entry points**
 with execution off the application thread, typed bounded transport and session scheduling are
 implemented. Synchronous internal computation remains; atomic cancellation polls checkpoints.
-Cooperative blocking-kernel interruption without shared memory and explicit async page/crypto
-suspension remain follow-ons. Synchronous modules remain internal for conformance and tooling.
+Retained continuations support cooperative interruption at logical page boundaries and common
+execution loops, including hosts without shared memory; Node data-page reads may await I/O.
+Sorting, parsing/planning and long scalar kernels remain synchronous. Async storage lifecycle,
+commit and crypto remain follow-ons. Synchronous modules remain internal for conformance and tooling.
 
 | Concern | Node candidate | Browser candidate |
 |---|---|---|
@@ -411,9 +413,9 @@ Rust's presence.
 
 Keep parser, planner, type rules, execution semantics, costs and byte formats shared within each
 existing core; do not fork TS into separately maintained Node and browser SQL engines solely to
-change its I/O and crypto providers. A future suspension-capable TS execution path should preserve
-its synchronous resident fast path and avoid duplicating operator implementations. This needs
-design work at demand-paging call sites, not just an async facade around today's worker.
+change its I/O and crypto providers. The retained-continuation TS path shares operator
+implementations between synchronous and asynchronous drivers. Further async storage and crypto
+work must preserve this shared semantic path and its synchronous resident fast path.
 
 An optional Node package backed by the **existing** Rust core adds binding/distribution work, not
 a fourth independently implemented SQL engine. Select such a backend explicitly when opening a

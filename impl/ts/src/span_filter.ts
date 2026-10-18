@@ -1,3 +1,4 @@
+import { runSync, type Steps } from "./execution.ts";
 // Encoded-span predicates for the columnar lanes (spec/design/packed-leaf.md §11 Track A4).
 //
 // A columnar lane (aggColumnar / projectColumnar) evaluates its WHERE per stored record while it walks
@@ -13,9 +14,15 @@
 import type { ColType } from "./catalog.ts";
 import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
-import { evalExpr, evalFilter, operatorCost } from "./eval.ts";
+import {
+  evalExpr,
+  evalExprSteps,
+  evalFilterSteps,
+  operatorCost,
+  synchronousEvalEnv,
+} from "./eval.ts";
 import { collectTouched, type EvalEnv, type RExpr } from "./executor.ts";
-import { encodeValue, fixedValueWidth, resolveUnfetchedSelf } from "./format.ts";
+import { encodeValue, fixedValueWidth, resolveUnfetchedSelfSteps } from "./format.ts";
 import { colAt, type PNode, type Span } from "./pmap.ts";
 import type { Row } from "./storage.ts";
 import { inRange, isBytea, isInteger, isText, widthBytes } from "./types.ts";
@@ -55,9 +62,13 @@ export class ScratchRow {
   // ensure resolves column c of record i into the scratch row, once per record — the inline decode,
   // chain read, or decompression the row path's resolveColumns performs.
   ensure(n: PNode, i: number, c: number): void {
+    return runSync(this.ensureSteps(n, i, c));
+  }
+
+  *ensureSteps(n: PNode, i: number, c: number): Steps<void> {
     if (this.stamp[c] === this.generation) return;
     const v = colAt(n, i, c);
-    this.vals[c] = v.kind === "unfetched" ? resolveUnfetchedSelf(v.ref) : v;
+    this.vals[c] = v.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(v.ref) : v;
     this.stamp[c] = this.generation;
   }
 
@@ -65,19 +76,23 @@ export class ScratchRow {
   // else read straight from the leaf (not stored). Callers use it only for a variable-width column read
   // beside a predicate — where reusing the predicate's decode pays — and readLeafColumn otherwise.
   read(n: PNode, i: number, c: number): Value {
+    return runSync(this.readSteps(n, i, c));
+  }
+
+  *readSteps(n: PNode, i: number, c: number): Steps<Value> {
     if (this.allFilled === this.generation) {
       const v = this.vals[c]!;
-      return v.kind === "unfetched" ? resolveUnfetchedSelf(v.ref) : v;
+      return v.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(v.ref) : v;
     }
     if (this.stamp[c] === this.generation) return this.vals[c]!;
-    return readLeafColumn(n, i, c);
+    return yield* readLeafColumnSteps(n, i, c);
   }
 }
 
 // readLeafColumn returns record i's column c read straight from the leaf, a deferred value resolved.
-export function readLeafColumn(n: PNode, i: number, c: number): Value {
+export function* readLeafColumnSteps(n: PNode, i: number, c: number): Steps<Value> {
   const v = colAt(n, i, c);
-  return v.kind === "unfetched" ? resolveUnfetchedSelf(v.ref) : v;
+  return v.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(v.ref) : v;
 }
 
 // laneReuse reports, per column, whether a lane should reuse the value its filter resolved (a
@@ -109,18 +124,18 @@ export function compileLaneFilter(
 }
 
 // laneKeep reports whether record i of n passes, starting a new scratch record.
-export function laneKeep(
+export function* laneKeepSteps(
   f: LaneFilter,
   n: PNode,
   i: number,
   scratch: ScratchRow,
   env: EvalEnv,
   m: Meter,
-): boolean {
+): Steps<boolean> {
   scratch.nextRecord();
-  if (f.kind === "span") return spanEvalFilter(f.pred, n, i, scratch, env, m);
+  if (f.kind === "span") return yield* spanEvalFilterSteps(f.pred, n, i, scratch, env, m);
   scratch.fillAll(n, i, f.cols);
-  return evalFilter(f.expr, scratch.vals, env, m);
+  return yield* evalFilterSteps(f.expr, scratch.vals, env, m);
 }
 
 function hasAtom(p: SpanPred): boolean {
@@ -197,30 +212,31 @@ export function compileSpanPred(
 
 // spanEvalFilter reports whether record i of n passes — evalFilter over the record's row, with
 // identical charges.
-export function spanEvalFilter(
+export function* spanEvalFilterSteps(
   p: SpanPred,
   n: PNode,
   i: number,
   scratch: ScratchRow,
   env: EvalEnv,
   m: Meter,
-): boolean {
+): Steps<boolean> {
   switch (p.kind) {
     case "and":
       m.guard();
       m.charge(operatorCost("and"));
       return (
-        spanEvalFilter(p.lhs, n, i, scratch, env, m) && spanEvalFilter(p.rhs, n, i, scratch, env, m)
+        (yield* spanEvalFilterSteps(p.lhs, n, i, scratch, env, m)) &&
+        (yield* spanEvalFilterSteps(p.rhs, n, i, scratch, env, m))
       );
     case "atom": {
       const keep = evalSpan(p.atom, n, i, m);
       if (keep !== null) return keep;
-      scratch.ensure(n, i, p.atom.col);
-      return isTrue(evalExpr(p.atom.expr, scratch.vals, env, m));
+      yield* scratch.ensureSteps(n, i, p.atom.col);
+      return isTrue(yield* evalExprSteps(p.atom.expr, scratch.vals, env, m));
     }
     default:
-      for (const c of p.cols) scratch.ensure(n, i, c);
-      return isTrue(evalExpr(p.expr, scratch.vals, env, m));
+      for (const c of p.cols) yield* scratch.ensureSteps(n, i, c);
+      return isTrue(yield* evalExprSteps(p.expr, scratch.vals, env, m));
   }
 }
 
@@ -538,4 +554,30 @@ function compileSpanAtom(
     default:
       return null;
   }
+}
+
+export function readLeafColumn(n: PNode, i: number, c: number): Value {
+  return runSync(readLeafColumnSteps(n, i, c));
+}
+
+export function laneKeep(
+  f: LaneFilter,
+  n: PNode,
+  i: number,
+  scratch: ScratchRow,
+  env: EvalEnv,
+  m: Meter,
+): boolean {
+  return runSync(laneKeepSteps(f, n, i, scratch, synchronousEvalEnv(env), m));
+}
+
+export function spanEvalFilter(
+  p: SpanPred,
+  n: PNode,
+  i: number,
+  scratch: ScratchRow,
+  env: EvalEnv,
+  m: Meter,
+): boolean {
+  return runSync(spanEvalFilterSteps(p, n, i, scratch, synchronousEvalEnv(env), m));
 }

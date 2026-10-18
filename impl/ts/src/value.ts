@@ -1,3 +1,4 @@
+import type { Steps } from "./execution.ts";
 // Runtime values and three-valued (Kleene) logic.
 //
 // A Value is SQL NULL, an integer, a boolean, or text. Integers are held as `bigint`
@@ -166,6 +167,7 @@ export function isSentinelTypeRef(t: TypeRef): boolean {
 // handle (the open-time reachability walk, whose values are discarded right after chain-marking).
 export interface UnfetchedPager {
   readBlock(index: number): Uint8Array;
+  readBlockSteps(index: number): Steps<Uint8Array>;
 }
 
 // intValue builds a non-null integer value.

@@ -1,3 +1,4 @@
+import { runSync, type Steps } from "./execution.ts";
 // Error `Detail` — PostgreSQL's DETAIL sentence naming the values that broke a constraint
 // (spec/design/error-fields.md §9). Built only after the error is decided, from values the statement
 // already holds: unmetered, so it can never change the code, the cost, or which error fires. Every
@@ -6,8 +7,8 @@
 
 import type { Column, ExclusionConstraint, ForeignKey, IndexDef, Table } from "./catalog.ts";
 import type { EvalEnv, ResolvedIndex } from "./executor.ts";
-import { evalExpr } from "./eval.ts";
-import { resolveUnfetchedSelf } from "./format.ts";
+import { evalExprSteps, synchronousEvalEnv } from "./eval.ts";
+import { resolveUnfetchedSelfSteps } from "./format.ts";
 import { quoteIdentifier } from "./parser.ts";
 import type { SessionState } from "./session.ts";
 import type { Row } from "./storage.ts";
@@ -59,9 +60,9 @@ function detailVisible(session: SessionState, relation: string): boolean {
 // detailValue renders one value through the result-cell renderer in the session zone (§9.3): a
 // top-level NULL is `null`, and the text is clipped. undefined if a deferred value cannot be resolved
 // or the value cannot render (an out-of-range zoned instant) — the detail is then omitted, never wrong.
-function detailValue(session: SessionState, v: Value): string | undefined {
+function* detailValueSteps(session: SessionState, v: Value): Steps<string | undefined> {
   try {
-    const r = v.kind === "unfetched" ? resolveUnfetchedSelf(v.ref) : v;
+    const r = v.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(v.ref) : v;
     if (r.kind === "null") return "null";
     if (r.kind === "text") return clip(r.text);
     return clip(renderIn(r, session.timeZone));
@@ -70,10 +71,10 @@ function detailValue(session: SessionState, v: Value): string | undefined {
   }
 }
 
-function detailValues(session: SessionState, values: Value[]): string[] | undefined {
+function* detailValuesSteps(session: SessionState, values: Value[]): Steps<string[] | undefined> {
   const out: string[] = [];
   for (const v of values) {
-    const s = detailValue(session, v);
+    const s = yield* detailValueSteps(session, v);
     if (s === undefined) return undefined;
     out.push(s);
   }
@@ -81,14 +82,14 @@ function detailValues(session: SessionState, values: Value[]): string[] | undefi
 }
 
 // columnKeyPhrase is the key phrase over plain-column ordinals of row.
-function columnKeyPhrase(
+function* columnKeyPhraseSteps(
   session: SessionState,
   columns: Column[],
   ordinals: number[],
   row: Row,
-): string | undefined {
+): Steps<string | undefined> {
   const labels = ordinals.map((o) => columnLabel(columns, o));
-  const values = detailValues(
+  const values = yield* detailValuesSteps(
     session,
     ordinals.map((o) => row[o]!),
   );
@@ -97,23 +98,23 @@ function columnKeyPhrase(
 
 // pkDetail — 23505 on the primary key: `Key (id)=(1) already exists.` (or `is duplicated.` from a DDL
 // build — pass ending).
-export function pkDetail(
+export function* pkDetailSteps(
   session: SessionState,
   relation: string,
   columns: Column[],
   pk: number[],
   row: Row,
   ending: string,
-): string | undefined {
+): Steps<string | undefined> {
   if (!detailVisible(session, relation)) return undefined;
-  const phrase = columnKeyPhrase(session, columns, pk, row);
+  const phrase = yield* columnKeyPhraseSteps(session, columns, pk, row);
   return phrase === undefined ? undefined : phrase + " " + ending;
 }
 
 // indexDetail — 23505 on a unique index: the index's key labels (a column's quoted name, an
 // expression's persisted canonical text) and the row's key values, evaluated afresh (unmetered) for an
 // expression key.
-export function indexDetail(
+export function* indexDetailSteps(
   session: SessionState,
   relation: string,
   columns: Column[],
@@ -122,7 +123,7 @@ export function indexDetail(
   row: Row,
   env: EvalEnv,
   ending: string,
-): string | undefined {
+): Steps<string | undefined> {
   if (!detailVisible(session, relation)) return undefined;
   const labels: string[] = [];
   const values: string[] = [];
@@ -134,12 +135,12 @@ export function indexDetail(
     if (rk.kind === "column") v = row[rk.column]!;
     else {
       try {
-        v = evalExpr(rk.expr, row, env, session.scratchMeter());
+        v = yield* evalExprSteps(rk.expr, row, env, session.scratchMeter());
       } catch {
         return undefined;
       }
     }
-    const s = detailValue(session, v);
+    const s = yield* detailValueSteps(session, v);
     if (s === undefined) return undefined;
     values.push(s);
   }
@@ -148,6 +149,108 @@ export function indexDetail(
 
 // indexDetailByName — 23505 on a unique index found by name on table's catalog entry (the raise sites
 // that hold only the resolved index).
+export function* indexDetailByNameSteps(
+  session: SessionState,
+  table: Table,
+  rindex: ResolvedIndex,
+  row: Row,
+  env: EvalEnv,
+  ending: string,
+): Steps<string | undefined> {
+  const def = table.indexes.find((d) => d.name === rindex.name);
+  if (def === undefined) return undefined;
+  return yield* indexDetailSteps(session, table.name, table.columns, def, rindex, row, env, ending);
+}
+
+// failingRowDetail — 23514 / 23502: `Failing row contains (…).` — every column of the candidate row.
+export function* failingRowDetailSteps(
+  session: SessionState,
+  relation: string,
+  row: Row,
+): Steps<string | undefined> {
+  if (!detailVisible(session, relation)) return undefined;
+  const values = yield* detailValuesSteps(session, row);
+  return values === undefined ? undefined : "Failing row contains (" + values.join(", ") + ").";
+}
+
+// fkChildDetail — 23503 child side: `Key (p)=(99) is not present in table "t".` — degraded to the
+// value-free `Key is not present in table "t".` without SELECT on the child (§9.4).
+export function* fkChildDetailSteps(
+  session: SessionState,
+  relation: string,
+  columns: Column[],
+  fk: ForeignKey,
+  row: Row,
+): Steps<string | undefined> {
+  const tail = 'is not present in table "' + fk.refTable + '".';
+  if (!detailVisible(session, relation)) return "Key " + tail;
+  const phrase = yield* columnKeyPhraseSteps(session, columns, fk.columns, row);
+  return phrase === undefined ? undefined : phrase + " " + tail;
+}
+
+// fkParentDetail — 23503 parent side: `Key (id)=(1) is still referenced from table "c".` — the
+// parent's referenced columns over values, the removed/changed parent tuple in FK slot order;
+// value-free without SELECT on the parent (§9.4).
+export function* fkParentDetailSteps(
+  session: SessionState,
+  parent: Table,
+  fk: ForeignKey,
+  child: string,
+  values: Value[],
+): Steps<string | undefined> {
+  const tail = 'is still referenced from table "' + child + '".';
+  if (!detailVisible(session, parent.name)) return "Key " + tail;
+  const labels = fk.refColumns.map((o) => columnLabel(parent.columns, o));
+  const rendered = yield* detailValuesSteps(session, values);
+  return rendered === undefined ? undefined : keyPhrase(labels, rendered) + " " + tail;
+}
+
+// exclusionDetail — 23P01: `Key (r)=(new) conflicts with existing key (r)=(other).` (existing false
+// gives the DDL build's `conflicts with key`).
+export function* exclusionDetailSteps(
+  session: SessionState,
+  relation: string,
+  columns: Column[],
+  exc: ExclusionConstraint,
+  row: Row,
+  other: Row,
+  existing: boolean,
+): Steps<string | undefined> {
+  if (!detailVisible(session, relation)) return undefined;
+  const ordinals = exc.elements.map((e) => e.column);
+  const fresh = yield* columnKeyPhraseSteps(session, columns, ordinals, row);
+  const old = yield* columnKeyPhraseSteps(session, columns, ordinals, other);
+  if (fresh === undefined || old === undefined) return undefined;
+  const with_ = existing ? "existing key" : "key";
+  return fresh + " conflicts with " + with_ + " " + old.slice("Key ".length) + ".";
+}
+
+export function pkDetail(
+  session: SessionState,
+  relation: string,
+  columns: Column[],
+  pk: number[],
+  row: Row,
+  ending: string,
+): string | undefined {
+  return runSync(pkDetailSteps(session, relation, columns, pk, row, ending));
+}
+
+export function indexDetail(
+  session: SessionState,
+  relation: string,
+  columns: Column[],
+  def: IndexDef,
+  rindex: ResolvedIndex,
+  row: Row,
+  env: EvalEnv,
+  ending: string,
+): string | undefined {
+  return runSync(
+    indexDetailSteps(session, relation, columns, def, rindex, row, synchronousEvalEnv(env), ending),
+  );
+}
+
 export function indexDetailByName(
   session: SessionState,
   table: Table,
@@ -156,24 +259,19 @@ export function indexDetailByName(
   env: EvalEnv,
   ending: string,
 ): string | undefined {
-  const def = table.indexes.find((d) => d.name === rindex.name);
-  if (def === undefined) return undefined;
-  return indexDetail(session, table.name, table.columns, def, rindex, row, env, ending);
+  return runSync(
+    indexDetailByNameSteps(session, table, rindex, row, synchronousEvalEnv(env), ending),
+  );
 }
 
-// failingRowDetail — 23514 / 23502: `Failing row contains (…).` — every column of the candidate row.
 export function failingRowDetail(
   session: SessionState,
   relation: string,
   row: Row,
 ): string | undefined {
-  if (!detailVisible(session, relation)) return undefined;
-  const values = detailValues(session, row);
-  return values === undefined ? undefined : "Failing row contains (" + values.join(", ") + ").";
+  return runSync(failingRowDetailSteps(session, relation, row));
 }
 
-// fkChildDetail — 23503 child side: `Key (p)=(99) is not present in table "t".` — degraded to the
-// value-free `Key is not present in table "t".` without SELECT on the child (§9.4).
 export function fkChildDetail(
   session: SessionState,
   relation: string,
@@ -181,15 +279,9 @@ export function fkChildDetail(
   fk: ForeignKey,
   row: Row,
 ): string | undefined {
-  const tail = 'is not present in table "' + fk.refTable + '".';
-  if (!detailVisible(session, relation)) return "Key " + tail;
-  const phrase = columnKeyPhrase(session, columns, fk.columns, row);
-  return phrase === undefined ? undefined : phrase + " " + tail;
+  return runSync(fkChildDetailSteps(session, relation, columns, fk, row));
 }
 
-// fkParentDetail — 23503 parent side: `Key (id)=(1) is still referenced from table "c".` — the
-// parent's referenced columns over values, the removed/changed parent tuple in FK slot order;
-// value-free without SELECT on the parent (§9.4).
 export function fkParentDetail(
   session: SessionState,
   parent: Table,
@@ -197,15 +289,9 @@ export function fkParentDetail(
   child: string,
   values: Value[],
 ): string | undefined {
-  const tail = 'is still referenced from table "' + child + '".';
-  if (!detailVisible(session, parent.name)) return "Key " + tail;
-  const labels = fk.refColumns.map((o) => columnLabel(parent.columns, o));
-  const rendered = detailValues(session, values);
-  return rendered === undefined ? undefined : keyPhrase(labels, rendered) + " " + tail;
+  return runSync(fkParentDetailSteps(session, parent, fk, child, values));
 }
 
-// exclusionDetail — 23P01: `Key (r)=(new) conflicts with existing key (r)=(other).` (existing false
-// gives the DDL build's `conflicts with key`).
 export function exclusionDetail(
   session: SessionState,
   relation: string,
@@ -215,11 +301,5 @@ export function exclusionDetail(
   other: Row,
   existing: boolean,
 ): string | undefined {
-  if (!detailVisible(session, relation)) return undefined;
-  const ordinals = exc.elements.map((e) => e.column);
-  const fresh = columnKeyPhrase(session, columns, ordinals, row);
-  const old = columnKeyPhrase(session, columns, ordinals, other);
-  if (fresh === undefined || old === undefined) return undefined;
-  const with_ = existing ? "existing key" : "key";
-  return fresh + " conflicts with " + with_ + " " + old.slice("Key ".length) + ".";
+  return runSync(exclusionDetailSteps(session, relation, columns, exc, row, other, existing));
 }

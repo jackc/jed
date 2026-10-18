@@ -2,7 +2,7 @@
 // execution, ordered within a session, and dispatched exactly once. A writer waiter is retained
 // as a continuation, never retried SQL, so the owning session can still reach COMMIT/ROLLBACK.
 import { PreparedStatement, type Rows } from "../api.ts";
-import { withCancellation } from "../cancel.ts";
+import { COOPERATE, runAsync, shouldCooperate, type Steps } from "../execution.ts";
 import { EngineError, engineError } from "../errors.ts";
 import type { SessionOptions } from "../executor.ts";
 import { PrivilegeSet } from "../privileges.ts";
@@ -23,7 +23,6 @@ type SessionHandle = { session: Session; transaction?: number };
 type StatementHandle = { statement: PreparedStatement; session: number };
 type CursorHandle = {
   rows: Rows;
-  iterator: Iterator<Value[]>;
   session: number;
   owner: SessionHandle;
   pending?: Value[];
@@ -106,6 +105,7 @@ export class RuntimeServer {
   private nextHandle = 1;
   private lastRequest = 0;
   private running = false;
+  private activeJob: Job | null = null;
   private scheduled = false;
   private closing = false;
   private closed = false;
@@ -202,9 +202,12 @@ export class RuntimeServer {
   private cancelQueued(session?: number): void {
     for (const job of [...this.jobs]) {
       if (session !== undefined && (job.request.session ?? 0) !== session) continue;
-      // An asynchronous open is the only currently suspended operation. It must finish before its
-      // resources can be released; the following close owns them even if open succeeds.
-      if (this.running && job === this.jobs[0] && job.request.op === "open") continue;
+      // A suspended continuation owns its cursor, pins, and statement scopes until its finally
+      // blocks have unwound. Close cancels it and waits; only queued work can be removed now.
+      if (job === this.activeJob) {
+        if (job.request.op !== "open") job.canceled = true;
+        continue;
+      }
       this.finish(job, new TransportError("CLOSED", "operation canceled by close"));
     }
   }
@@ -237,6 +240,7 @@ export class RuntimeServer {
         )
           continue;
         if (sessionId !== 0) seenSessions.add(sessionId);
+        this.activeJob = job;
         try {
           if (canceled(job)) throw canceledError();
           if (job.request.op === "open") {
@@ -249,7 +253,22 @@ export class RuntimeServer {
             this.limits = configured;
             this.finish(job, undefined, null);
           } else {
-            const result = withCancellation(cancellationCheck(job), () => this.dispatch(job));
+            const cursorRequest =
+              job.request.op === "fetch"
+                ? this.cursors.get(job.request.args.cursor as number)?.request
+                : undefined;
+            const check = () =>
+              canceled(job) || (cursorRequest !== undefined && canceled(cursorRequest));
+            const poll =
+              cancellationCheck(job) !== undefined ||
+              (cursorRequest !== undefined && cancellationCheck(cursorRequest) !== undefined)
+                ? check
+                : undefined;
+            const result = await runAsync(this.dispatchSteps(job), {
+              check,
+              poll,
+              schedule: this.scheduleTask,
+            });
             if (result === PARKED) continue;
             if (result !== MORE) this.finish(job, undefined, result);
             else {
@@ -275,6 +294,8 @@ export class RuntimeServer {
           this.finish(job, error);
           progressed = true;
           break;
+        } finally {
+          this.activeJob = null;
         }
       }
     } finally {
@@ -376,7 +397,7 @@ export class RuntimeServer {
     return true;
   }
 
-  private dispatch(job: Job): unknown {
+  private *dispatchSteps(job: Job): Steps<unknown> {
     const { op, args } = job.request;
     const sessionId = job.request.session ?? 0;
     if (op === "close") {
@@ -416,7 +437,7 @@ export class RuntimeServer {
         this.closeCursor(args.cursor as number);
       return null;
     }
-    if (op === "fetch") return this.fetch(job);
+    if (op === "fetch") return yield* this.fetchSteps(job);
     const owner = this.owner(job);
     const session = owner.session;
     switch (op) {
@@ -462,7 +483,7 @@ export class RuntimeServer {
       case "script":
         job.statement ??= new PreparedStatement({ kind: "begin", writable: true });
         if (this.waits(job, job.statement)) return PARKED;
-        return session.executeScript(args.sql as string);
+        return yield* session.executeScriptSteps(args.sql as string);
       case "query":
       case "execute":
       case "batch": {
@@ -482,7 +503,7 @@ export class RuntimeServer {
         if (op === "query") {
           if (this.cursors.size >= this.limits.maxCursors)
             throw new TransportError("QUEUE_FULL", "cursor limit reached");
-          const rows = session.queryPrepared(statement, job.params);
+          const rows = yield* session.queryPreparedSteps(statement, job.params);
           const id = this.nextHandle++;
           const reply = {
             cursor: id,
@@ -501,7 +522,6 @@ export class RuntimeServer {
           }
           this.cursors.set(id, {
             rows,
-            iterator: rows[Symbol.iterator](),
             owner,
             session: sessionId,
             request: job,
@@ -509,7 +529,7 @@ export class RuntimeServer {
           if (!session.inTransaction()) owner.transaction = undefined;
           return reply;
         }
-        const result = session.executePrepared(statement, job.params);
+        const result = yield* session.executePreparedSteps(statement, job.params);
         if (!session.inTransaction()) owner.transaction = undefined;
         if (op !== "batch") return result;
         job.batchResults.push(result);
@@ -523,7 +543,7 @@ export class RuntimeServer {
     }
   }
 
-  private fetch(job: Job): unknown {
+  private *fetchSteps(job: Job): Steps<unknown> {
     const id = job.request.args.cursor as number;
     const cursor = this.cursors.get(id);
     if (cursor === undefined || cursor.session !== (job.request.session ?? 0)) {
@@ -537,39 +557,33 @@ export class RuntimeServer {
     let done = false;
     try {
       budget.reserve(128);
-      withCancellation(
-        job.request.cancel !== undefined || cursor.request.request.cancel !== undefined
-          ? () => canceled(job) || canceled(cursor.request)
-          : undefined,
-        () => {
-          while (rows.length < this.limits.maxBatchRows) {
-            if (canceled(job) || canceled(cursor.request)) throw canceledError();
-            let row = cursor.pending;
-            if (row === undefined) {
-              const next = cursor.iterator.next();
-              if (next.done) {
-                done = true;
-                break;
-              }
-              row = next.value;
-            }
-            const size = measureValues(row, new WireBudget(Number.MAX_SAFE_INTEGER));
-            if (size > this.limits.maxBatchBytes - 128) {
-              throw new TransportError(
-                "RESULT_TOO_LARGE",
-                "one result row exceeds the worker batch byte budget",
-                "unknown",
-              );
-            }
-            if (size > budget.remaining) {
-              cursor.pending = row;
-              break;
-            }
-            cursor.pending = undefined;
-            rows.push(encodeValues(row, budget));
+      while (rows.length < this.limits.maxBatchRows) {
+        if (shouldCooperate()) yield COOPERATE;
+        if (canceled(job) || canceled(cursor.request)) throw canceledError();
+        let row = cursor.pending;
+        if (row === undefined) {
+          const next = yield* cursor.rows.nextSteps();
+          if (next.done) {
+            done = true;
+            break;
           }
-        },
-      );
+          row = next.value;
+        }
+        const size = measureValues(row, new WireBudget(Number.MAX_SAFE_INTEGER));
+        if (size > this.limits.maxBatchBytes - 128) {
+          throw new TransportError(
+            "RESULT_TOO_LARGE",
+            "one result row exceeds the worker batch byte budget",
+            "unknown",
+          );
+        }
+        if (size > budget.remaining) {
+          cursor.pending = row;
+          break;
+        }
+        cursor.pending = undefined;
+        rows.push(encodeValues(row, budget));
+      }
       const cost = cursor.rows.cost;
       if (done) this.closeCursor(id);
       return { rows, done, cost };

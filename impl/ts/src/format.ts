@@ -1,3 +1,4 @@
+import { ioSteps, runSync, type Steps } from "./execution.ts";
 import { compareTextC } from "./value.ts";
 // On-disk single-file format: serialize / load (spec/fileformat/format.md).
 //
@@ -5274,6 +5275,14 @@ export function resolveUnfetched(
   ref: Unfetched,
   fetch: (page: number) => Uint8Array,
 ): Value {
+  return runSync(resolveUnfetchedSteps(ty, ref, (page) => ioSteps(() => fetch(page))));
+}
+
+export function* resolveUnfetchedSteps(
+  ty: ColType,
+  ref: Unfetched,
+  fetch: (page: number) => Steps<Uint8Array>,
+): Steps<Value> {
   const sink: number[] = [];
   if (ref.form === 0x00) {
     // Inline-deferred (lazy-record.md §5b, L2): the bytes are already owned — no chain read, no
@@ -5281,13 +5290,16 @@ export function resolveUnfetched(
     return readInlineBody(ty, ref.comp!, { pos: 0 }, "construct");
   }
   if (ref.form === TAG_EXTERNAL) {
-    return valueFromPayload(ty, readOverflowChain(ref.firstPage, ref.storedLen, fetch, sink));
+    return valueFromPayload(
+      ty,
+      yield* readOverflowChainSteps(ref.firstPage, ref.storedLen, fetch, sink),
+    );
   }
   if (ref.form === TAG_INLINE_COMP) {
     return valueFromPayload(ty, lz4Decompress(ref.comp!, ref.rawLen));
   }
   if (ref.form === TAG_EXTERNAL_COMP) {
-    const comp = readOverflowChain(ref.firstPage, ref.storedLen, fetch, sink);
+    const comp = yield* readOverflowChainSteps(ref.firstPage, ref.storedLen, fetch, sink);
     return valueFromPayload(ty, lz4Decompress(comp, ref.rawLen));
   }
   throw engineError("data_corrupted", "invalid unfetched value form");
@@ -5301,16 +5313,20 @@ export function resolveUnfetched(
 // the cost basis + prefetch hint. A spill-run-file reload carries sentinel handles (spill.ts — it
 // rides the sort output unread by contract), so touching one stays the loud pre-B4 poison.
 export function resolveUnfetchedSelf(ref: Unfetched): Value {
+  return runSync(resolveUnfetchedSelfSteps(ref));
+}
+
+export function* resolveUnfetchedSelfSteps(ref: Unfetched): Steps<Value> {
   if (isSentinelTypeRef(ref.ty)) {
     throw new Error("BUG: unfetched large value escaped the storage layer (spill pass-through)");
   }
   const ty = ref.ty.cols[ref.ty.idx]!;
   if (ref.form === 0x00 || ref.form === TAG_INLINE_COMP) {
     // Inline forms own their bytes — no pager involved.
-    const fetch = (): Uint8Array => {
+    const fetch = (_page: number): Uint8Array => {
       throw new Error("an inline deferred value reads no overflow pages");
     };
-    return resolveUnfetched(ty, ref, fetch);
+    return yield* resolveUnfetchedSteps(ty, ref, (page) => ioSteps(() => fetch(page)));
   }
   // A deferred external value is reachable only through a snapshot whose stores hold the paging
   // context, so a dead handle here is an internal wiring bug (the reachability walk's values never
@@ -5319,7 +5335,7 @@ export function resolveUnfetchedSelf(ref: Unfetched): Value {
   if (paging === null) {
     throw new Error("a deferred external value carries no paging handle");
   }
-  return resolveUnfetched(ty, ref, (p) => paging.readBlock(p));
+  return yield* resolveUnfetchedSteps(ty, ref, (p) => paging.readBlockSteps(p));
 }
 
 // chainPages returns the page indices of the overflow chain carrying `length` payload bytes from
@@ -5665,6 +5681,17 @@ function readOverflowChain(
   fetch: (page: number) => Uint8Array,
   visited: number[],
 ): Uint8Array {
+  return runSync(
+    readOverflowChainSteps(first, length, (page) => ioSteps(() => fetch(page)), visited),
+  );
+}
+
+export function* readOverflowChainSteps(
+  first: number,
+  length: number,
+  fetch: (page: number) => Steps<Uint8Array>,
+  visited: number[],
+): Steps<Uint8Array> {
   // The stored length is validated only as the chain delivers it, so the buffer starts at most
   // DECODE_PREALLOC_CAP and grows with the data rather than letting one corrupt field size it.
   let out = new Uint8Array(Math.min(length, DECODE_PREALLOC_CAP));
@@ -5677,7 +5704,7 @@ function readOverflowChain(
     if (seen.has(p)) throw engineError("data_corrupted", "overflow chain revisits a page");
     seen.add(p);
     visited.push(p);
-    const pg = parsePage(fetch(p));
+    const pg = parsePage(yield* fetch(p));
     if (pg.pageType !== PAGE_OVERFLOW)
       throw engineError("data_corrupted", "expected an overflow page");
     const n = pg.itemCount;

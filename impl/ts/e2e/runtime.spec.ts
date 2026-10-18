@@ -62,3 +62,17 @@ test("ordinary browsers cancel at batch boundaries and keep the application even
     responsive: true,
   });
 });
+
+test("ordinary browsers cancel resident scans before their first result batch", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const result = await page.evaluate(() => window.jedRuntime.cooperativeCancellationScenario());
+  expect(result).toEqual({
+    isolated: false,
+    code: "57014",
+    progressed: true,
+    status: "Failed",
+    recovered: "7",
+  });
+});
