@@ -409,6 +409,7 @@ export function substituteBodyColumns(e: RExpr, body: SelectPlan, want: Resolved
       target: widen,
       typmod: null,
       varcharLen: null,
+      temporal: null,
       operand: slot,
       trap: "none",
     };
