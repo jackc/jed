@@ -507,7 +507,7 @@ defaults, which `mixed.toml` restates):
 |---|---|
 | `mixed` | The baseline: every action, value shape, and fault kind |
 | `reuse-under-pins` | Readers held across many small commits, so reclamation and reuse run around pinned snapshots |
-| `large-values` | Overflow chains, LZ4-compressed records, `UPDATE`s that grow and shrink values, and `update_narrow` `UPDATE`s that assign only a fixed-width column, so the rewrite keeps every chain (large-values.md §15) |
+| `large-values` | Overflow chains, LZ4-compressed records, `UPDATE`s that grow and shrink values, and `update_narrow` `UPDATE`s that assign only a fixed-width column, so the rewrite keeps every chain (large-values.md §15); half the traces relaxed |
 | `big-commits` | Transactions dirtying hundreds of pages: manifest overflow, free-list/manifest planning retries |
 | `ddl-churn` | `CREATE`/`DROP`/`ALTER` of tables and indexes, `REINDEX`, sequences, catalog-chain growth |
 | `crash-storm` | Repeated process and power crashes |

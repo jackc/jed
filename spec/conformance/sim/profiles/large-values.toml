@@ -1,9 +1,12 @@
 # Overflow chains and LZ4-compressed records: UPDATEs that grow and shrink values, and UPDATEs that
 # assign only a fixed-width column, so the rewrite keeps every large value's chain
-# (simulation-testing.md §9; large-values.md §15).
+# (simulation-testing.md §9; large-values.md §15). Half the traces run under synchronous = off, so a
+# relaxed batch rewrites rows around kept chains and leaves the chains it frees unreused until the
+# next flush (validated-cow.md §4).
 
 description = "Overflow chains, LZ4-compressed records, values that grow and shrink, kept chains"
 
+synchronous = ["on", "off"]
 page_sizes = [256, 512]
 batch = [1, 12]
 

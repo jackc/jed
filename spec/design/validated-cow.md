@@ -175,14 +175,18 @@ The rules:
 3. **Reuse only what the floor had free.** The first commit of a batch — one that begins with
    nothing pending — plans exactly as under `synchronous = on`, and records the free list it starts
    from: the floor's own free list, which excludes the floor's dependencies (§2). A commit that begins
-   with a non-empty pending set may reuse a page — for tree, catalog, free-list chain, or manifest —
-   only if that page was on the recorded list; the free list is scanned in ascending order and every
-   other free page is skipped and stays listed, then the high-water serves the rest. A page freed
+   with a non-empty pending set may reuse a page — for tree, catalog, overflow chain, GIN posting
+   run, GiST, free-list chain, or manifest — only if that page was on the recorded list; the free list
+   is scanned in ascending order and every other free page is skipped and stays listed, then the high-water serves the rest. A page freed
    during the batch may still be live in the floor, so it waits for the next batch. Since a page
    reused in the batch becomes pending, and pending pages never return to a free list (rule 4), no
    page is written twice between two flushes: each pending digest stays exact, and no dependency of
    the floor is ever overwritten. A batch's orphans become reusable once a flush moves the floor past
-   them, so relaxed churn does not grow the file without bound.
+   them, so relaxed churn does not grow the file without bound. Pages a commit does **not** rewrite
+   are not pending: an overflow chain kept on rewrite ([large-values.md](large-values.md) §15), a clean
+   subtree, or a GIN run left in place is inherited from the generation that wrote it — durable if
+   that was the floor or earlier, already pending (and listed) if it was written in this batch. Only
+   pages written since the floor need a manifest entry, so a kept chain adds none.
 4. **Free-list exclusion.** A commit's persisted free list excludes the whole pending set, since
    every pending page is a dependency of its manifest. Reclamation still runs; a page orphaned
    during a batch is listed by the first reclamation after the floor moves past it.
@@ -200,10 +204,16 @@ generation (in the slot it was written to) and the pending set empties. The flus
   the error `close` reports.
 - **A page client's `begin_write`.** The owner flushes before granting the gate
   ([page-service.md](page-service.md) §6), so a client plans against a durable floor with its own
-  manifest only (the client cannot see the owner's pending set).
-- **Compaction** writes a new, already durable image and empties the pending set; any trailing
-  truncation of the file likewise runs only when nothing is pending.
+  manifest only (the client cannot see the owner's pending set). The floor and pending set belong
+  to one file domain, so when file attachments join the service each attachment's owner flushes
+  that attachment's pending set before granting its gate, independently of `main`; a client never
+  commits on top of another process's pending batch.
+- **Compaction** writes a new, already durable image and empties the pending set.
 - **Stabilization** of an adopted generation (§3) is a flush.
+
+Trailing truncation of the file (not yet built) must run only when nothing is pending, right after a
+flush: pages above the floor's high-water may hold the batch's pending pages, and the floor's own
+dependencies must stay in the file until a newer generation is durable.
 
 The cap flush may run **in the background** (a goroutine in Go, a thread in Rust): the commit that
 reached the cap returns at once, and the domain's next commit, compaction, flush, or close first waits
