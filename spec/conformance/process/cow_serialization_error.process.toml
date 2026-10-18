@@ -5,7 +5,7 @@ requires = ["file.page_service"]
 fixture = "fileformat/fixtures/cow_inline.jed"
 byte_identical = true
 # The serialization error: a CHECK whose text exceeds its u16 length field (format.md *Catalog*;
-# `{{repeat x 70000}}` is expanded by the driver). A long catalog entry itself spans pages since v43.
+# `{{repeat x 70000}}` is expanded by the driver). A long catalog entry itself spans pages since v48.
 
 [[step]]
 actor = "a"

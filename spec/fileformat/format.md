@@ -774,7 +774,7 @@ poisoned-handle behavior are part of the durable protocol, not additional on-dis
 | offset | size | field |
 |---|---|---|
 | 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior**; `7` = **free-list**; `8` = **commit manifest overflow** (v33, above) |
-| 1 | 1 | `page_flags` (u8) — on a catalog page (v43), bit0 `continued`: the page's last entry continues on the next chain page (*Catalog*); bits 1–7 reserved, `0`. `0` on every other page type |
+| 1 | 1 | `page_flags` (u8) — on a catalog page (v48), bit0 `continued`: the page's last entry continues on the next chain page (*Catalog*); bits 1–7 reserved, `0`. `0` on every other page type |
 | 2 | 2 | reserved (0) |
 | 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |
 | 8 | 4 | `next_page` (u32) — catalog / overflow / free-list / manifest: next page of the chain, or 0. B-tree nodes write `0` here. |
@@ -813,7 +813,7 @@ view (5)**, each object group in ascending
 name byte order (v37: every group, collations included, sorts by its exact name). Each page's `item_count` is the number of entries (of any kind) it holds;
 entries are packed greedily into the chain, kind-tagged in stream order, exactly as table entries
 were through v8, each wholly on one page (the `RECORD_MAX = C/2` cap is a B-tree-record rule and does
-**not** apply to catalog entries). **An entry longer than `C` (v43)** — through v42 `0A000` — starts a
+**not** apply to catalog entries). **An entry longer than `C` (v48)** — through v47 `0A000` — starts a
 fresh page (the page before it closes, even if it has room) and spans `ceil(len / C)` consecutive chain
 pages: the first holds the entry's first `C` bytes with `item_count = 1`, each later one the next `C`
 bytes (the last the remainder, zero-filled) with `item_count = 0`, and every page of the run but the
@@ -1018,7 +1018,7 @@ bounds are nondecreasing. Terms are distinct and ordered by descending `row_coun
 bytes; a summary's bit2 must equal the column's term eligibility, and a term-ineligible summary has
 no term items. Bad flags/counts/order/references/types/bytes are `XX001`.
 
-### View entry (`entry_kind = 5`, v38; `check_option` v39; v43)
+### View entry (`entry_kind = 5`, v38; `check_option` v39; v48)
 
 A view entry records a `CREATE VIEW` definition ([../design/views.md](../design/views.md)). It owns
 no B-tree.
@@ -1032,22 +1032,22 @@ no B-tree.
 | per output column (×`col_count`): | |
 | &nbsp;&nbsp;`col_name_len` | u16 — ≥ 1 |
 | &nbsp;&nbsp;`col_name` | UTF-8 — the output column name, in output order |
-| &nbsp;&nbsp;`col_flags` | u8 (v43) — bit0 `has_default`; bits 1–7 reserved (`XX001`) |
+| &nbsp;&nbsp;`col_flags` | u8 (v48) — bit0 `has_default`; bits 1–7 reserved (`XX001`) |
 | &nbsp;&nbsp;`default_len` | u32 — only when bit0: the column default's canonical text (views.md §16.1) |
 | &nbsp;&nbsp;`default` | `default_len` bytes UTF-8 |
 | `def_len` | u32 |
 | `def` | `def_len` bytes UTF-8 — the definition: the body's canonical token text (*Check-expression text* below) after `*` expansion and `RENAME` rewrites (views.md §5/§7) |
 | `dep_count` | u16 — the tables, views, sequences, and composite types the body uses (≥ 1 is not required: a body over only CTEs, `VALUES`, functions, or `jed_` relations has none) |
 | per dependency (×`dep_count`): | |
-| &nbsp;&nbsp;`dep_kind` | u8 — `0` = table, `1` = view, `2` = sequence (v43), `3` = composite type (v43); other values `XX001` |
+| &nbsp;&nbsp;`dep_kind` | u8 — `0` = table, `1` = view, `2` = sequence (v48), `3` = composite type (v48); other values `XX001` |
 | &nbsp;&nbsp;`dep_name_len` | u16 |
 | &nbsp;&nbsp;`dep_name` | UTF-8 — the exact table or view name, in the same database |
 | &nbsp;&nbsp;`dep_col_count` | u16 — `0` for a view, sequence, or type dependency (a non-zero count there is `XX001`); for a table, the number of its referenced columns (may be `0`, e.g. `SELECT count(*) FROM t`) |
 | &nbsp;&nbsp;per referenced column (×`dep_col_count`): `u16` length + UTF-8 | the exact column name |
 | `check_option` | u8 (v39) — `0` = none, `1` = `WITH LOCAL CHECK OPTION`, `2` = `WITH CASCADED CHECK OPTION` (views.md §15.6); other values `XX001` |
-| `view_flags` | u8 (v43) — bit0 `security_barrier`, bit1 `security_invoker` (views.md §16.2); bits 2–7 reserved (`XX001`) |
+| `view_flags` | u8 (v48) — bit0 `security_barrier`, bit1 `security_invoker` (views.md §16.2); bits 2–7 reserved (`XX001`) |
 
-Dependencies are emitted in ascending byte order of `dep_name`, then `dep_kind` (v43: a composite
+Dependencies are emitted in ascending byte order of `dep_name`, then `dep_kind` (v48: a composite
 type may share a table's name). Each dependency's columns are emitted in ascending byte order of the column name. Output
 columns are emitted in output order. The reader trusts these orders and rejects, as `XX001`:
 a dependency naming no table, view, sequence, or composite type of its kind in this catalog, a listed column missing from its

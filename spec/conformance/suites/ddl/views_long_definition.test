@@ -1,4 +1,4 @@
-# Catalog entries longer than one page (spec/fileformat/format.md *Catalog*, format_version 43;
+# Catalog entries longer than one page (spec/fileformat/format.md *Catalog*, format_version 48;
 # views.md §3): a view definition, or a table entry, that does not fit one catalog page spans a run
 # of consecutive catalog pages and reads back intact, in memory and after a reopen (disk mode). The
 # view here has 1200 output columns, the table 600. Every record is PostgreSQL-oracle-checked.

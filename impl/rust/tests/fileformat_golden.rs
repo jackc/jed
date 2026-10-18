@@ -1821,7 +1821,7 @@ fn view_table_db() -> Session {
     db
 }
 
-/// The `view_options_table.jed` golden (format_version 43, spec/design/views.md §6/§16): column
+/// The `view_options_table.jed` golden (format_version 48, spec/design/views.md §6/§16): column
 /// defaults, the view flags byte, sequence and type dependencies, and a view entry spanning catalog
 /// pages.
 fn view_options_table_db() -> Session {

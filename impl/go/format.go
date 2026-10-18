@@ -1462,7 +1462,7 @@ func loadEngineSharedPaging(paging *sharedPaging, env *Environment) (*engine, er
 			return nil, newError(DataCorrupted, "expected a catalog page")
 		}
 		live.catalog++
-		// A catalog entry longer than a page continues on the following chain pages (v43): header
+		// A catalog entry longer than a page continues on the following chain pages (v48): header
 		// byte 1 bit0 continued on every page of the run but the last.
 		next := pg.nextPage
 		payload := pg.payload
@@ -3672,9 +3672,9 @@ func viewCatalogEntries(s *snapshot) [][]byte {
 }
 
 // viewEntryBytes serializes a view catalog entry's BODY (after its entry_kind = 5 byte) — format.md
-// *View entry*: the name; the output columns, each its name, a flags byte (bit0 has_default, v43), and
+// *View entry*: the name; the output columns, each its name, a flags byte (bit0 has_default, v48), and
 // the default's text when set; the definition (u32 length); the dependency list (in (name, kind) byte
-// order, each table's columns in name byte order); the check option; and the view flags byte (v43:
+// order, each table's columns in name byte order); the check option; and the view flags byte (v48:
 // bit0 security_barrier, bit1 security_invoker).
 func viewEntryBytes(v *viewDef) []byte {
 	var out []byte
@@ -4737,7 +4737,7 @@ func fkActionFromCode(c byte) (fkAction, error) {
 // checkCatalogTextLengths refuses a catalog that stores an expression text — a column DEFAULT, a
 // CHECK, an expression index key, a partial-index predicate — longer than 65535 bytes: each has a u16
 // length (format.md *Catalog*), so a longer one cannot be written. 0A000, before any page is
-// (views.md §3; a catalog entry itself may span pages since v43).
+// (views.md §3; a catalog entry itself may span pages since v48).
 func checkCatalogTextLengths(s *snapshot) error {
 	tooLong := func(t string) bool { return len(t) > 0xFFFF }
 	for _, table := range s.tablesSorted() {
@@ -4769,7 +4769,7 @@ func checkCatalogTextLengths(s *snapshot) error {
 	return nil
 }
 
-// catalogPage is one page of the catalog chain (format.md *Catalog*, v43): its entry count, whether
+// catalogPage is one page of the catalog chain (format.md *Catalog*, v48): its entry count, whether
 // its last entry continues on the next page (header byte 1, bit0 continued), and its payload.
 type catalogPage struct {
 	itemCount uint32
@@ -4777,7 +4777,7 @@ type catalogPage struct {
 	payload   []byte
 }
 
-// catalogLayout lays the catalog entries out on pages of capacity (format.md *Catalog*, v43): entries
+// catalogLayout lays the catalog entries out on pages of capacity (format.md *Catalog*, v48): entries
 // are packed greedily, each wholly on one page; an entry longer than capacity starts a fresh page and
 // spans as many pages as it needs — the first holds the entry's first capacity bytes with itemCount 1,
 // each later one the next bytes with itemCount 0, and every page but the last has continued set. The
@@ -4814,7 +4814,7 @@ func catalogLayout(entries [][]byte, capacity int) []catalogPage {
 	return out
 }
 
-// makeCatalogPage is a catalog page's full bytes: makePage with header byte 1 bit0 continued (v43).
+// makeCatalogPage is a catalog page's full bytes: makePage with header byte 1 bit0 continued (v48).
 func makeCatalogPage(ps int, cp *catalogPage, nextPage uint32) []byte {
 	p := makePage(ps, pageCatalog, cp.itemCount, nextPage, cp.payload)
 	if cp.continued {
@@ -4953,7 +4953,7 @@ func selectMeta(image []byte, ps int) (meta, error) {
 // page is a parsed page: header fields + a borrowed payload slice.
 type page struct {
 	pageType byte
-	// flags is header byte 1: on a catalog page, bit0 continued (v43); 0 elsewhere.
+	// flags is header byte 1: on a catalog page, bit0 continued (v48); 0 elsewhere.
 	flags     byte
 	itemCount uint32
 	nextPage  uint32

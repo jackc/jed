@@ -425,9 +425,9 @@ const (
 	viewDepTable viewDepKind = 0
 	viewDepView  viewDepKind = 1
 	// viewDepSequence is a sequence the body names in a constant nextval / currval / setval argument
-	// (§6, v43).
+	// (§6, v48).
 	viewDepSequence viewDepKind = 2
-	// viewDepType is a composite type the body names or outputs (§6, v43).
+	// viewDepType is a composite type the body names or outputs (§6, v48).
 	viewDepType viewDepKind = 3
 )
 

@@ -1116,7 +1116,7 @@ func viewTableDB(t *testing.T) *Session {
 	return db
 }
 
-// viewOptionsTableDB is the view_options_table.jed golden (format_version 43, spec/design/views.md
+// viewOptionsTableDB is the view_options_table.jed golden (format_version 48, spec/design/views.md
 // §6/§16): column defaults, the view flags byte, sequence and type dependencies, and a view entry
 // spanning catalog pages.
 func viewOptionsTableDB(t *testing.T) *Session {

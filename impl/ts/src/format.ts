@@ -1679,10 +1679,10 @@ function viewCatalogEntries(snap: Snapshot): Uint8Array[] {
 }
 
 // viewEntryBytes serializes a view catalog entry's BODY (after its entry_kind = 5 byte) — format.md
-// *View entry*: the name; the output columns, each its name, a flags byte (bit0 has_default, v43),
+// *View entry*: the name; the output columns, each its name, a flags byte (bit0 has_default, v48),
 // and the default's text when set; the definition (u32 length); the dependency list (in (name, kind)
 // byte order, each table's columns in name byte order); the check option; and the view flags byte
-// (v43: bit0 security_barrier, bit1 security_invoker).
+// (v48: bit0 security_barrier, bit1 security_invoker).
 export function viewEntryBytes(v: ViewDef): Uint8Array {
   const w = new ByteWriter();
   wstr(w, v.name);
@@ -3842,7 +3842,7 @@ export function loadEnginePaged(
     if (pg.pageType !== PAGE_CATALOG || (pg.flags & ~1) !== 0)
       throw engineError("data_corrupted", "expected a catalog page");
     live.catalog++;
-    // A catalog entry longer than a page continues on the following chain pages (v43): header byte
+    // A catalog entry longer than a page continues on the following chain pages (v48): header byte
     // 1 bit0 continued on every page of the run but the last.
     let next = pg.nextPage;
     let payload = pg.payload;
@@ -4318,11 +4318,11 @@ function checkCatalogTextLengths(snap: Snapshot): void {
   }
 }
 
-// CatalogPage is one page of the catalog chain (format.md *Catalog*, v43): its entry count, whether
+// CatalogPage is one page of the catalog chain (format.md *Catalog*, v48): its entry count, whether
 // its last entry continues on the next page (header byte 1, bit0 continued), and its payload.
 type CatalogPage = { itemCount: number; continued: boolean; payload: Uint8Array };
 
-// catalogLayout lays the catalog entries out on pages of capacity cap (format.md *Catalog*, v43):
+// catalogLayout lays the catalog entries out on pages of capacity cap (format.md *Catalog*, v48):
 // entries are packed greedily, each wholly on one page; an entry longer than cap starts a fresh page
 // and spans as many pages as it needs — the first holds the entry's first cap bytes with
 // itemCount = 1, each later one the next bytes with itemCount = 0, and every page but the last has
@@ -4360,7 +4360,7 @@ export function catalogLayout(entries: Uint8Array[], cap: number): CatalogPage[]
   return out;
 }
 
-// makeCatalogPage is a catalog page's full bytes: makePage with header byte 1 bit0 continued (v43).
+// makeCatalogPage is a catalog page's full bytes: makePage with header byte 1 bit0 continued (v48).
 function makeCatalogPage(ps: number, cp: CatalogPage, nextPage: number): Uint8Array {
   const p = makePage(ps, PAGE_CATALOG, cp.itemCount, nextPage, cp.payload);
   if (cp.continued) {
@@ -4393,7 +4393,7 @@ export function makePage(
 }
 
 // Page is a parsed page: header fields + a borrowed payload slice.
-// flags is header byte 1: on a catalog page, bit0 continued (v43); 0 elsewhere.
+// flags is header byte 1: on a catalog page, bit0 continued (v48); 0 elsewhere.
 type Page = {
   pageType: number;
   flags: number;

@@ -520,9 +520,9 @@ pub struct ViewDef {
 pub enum ViewDepKind {
     Table,
     View,
-    /// A sequence the body names in a constant `nextval` / `currval` / `setval` argument (§6, v43).
+    /// A sequence the body names in a constant `nextval` / `currval` / `setval` argument (§6, v48).
     Sequence,
-    /// A composite type the body names or outputs (§6, v43).
+    /// A composite type the body names or outputs (§6, v48).
     Type,
 }
 
