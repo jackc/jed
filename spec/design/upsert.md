@@ -288,6 +288,9 @@ re-checked (`23503`), and a parent-side reference to the old key takes its `ON U
 `NO ACTION`/`RESTRICT` is `23503` while a child still references the old key, `CASCADE` /
 `SET NULL` / `SET DEFAULT` rewrite the children after the target rows reach their new state
 (constraints.md §6.5). A row whose assignment leaves the key value unchanged is not re-keyed.
+The arbiter may be any inferred one, a partial unique index included: the re-keyed row's partial
+entries follow it like any index entry, and an update that also leaves the predicate takes the row
+out of the partial index, so a later proposal with that key is an ordinary insert (probed).
 
 **Narrowings on `SET` (each relaxable, §9):** assigning a
 **`GENERATED ALWAYS AS IDENTITY`** column anything but `DEFAULT` is **`428C9`** (the standing
