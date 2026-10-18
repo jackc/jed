@@ -588,7 +588,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   waiters, prepared/batched execution, transaction callbacks, cleanup, failure uncertainty and
   atomic cancellation on Node/shared-memory browsers plus cooperative cancellation at logical
   page boundaries and common execution loops on every host. Retained continuations share sync
-  and async semantic paths, including awaitable Node data-page reads. Website examples/live panels use it;
+  and async semantic paths, including awaitable Node data-page reads. The immediate-expression
+  prototype removes generator traversal for common resident expressions; pending operands retain
+  their state without replay. Broaden this only with throughput and cancellation measurements.
+  Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
   for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar
   kernels stay synchronous unless measurements justify extra pause points. Remaining: async

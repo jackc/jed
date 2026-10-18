@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createDatabase, type Database, EngineError, type Session } from "../src/lib.ts";
 import { setAfterPersistHook } from "../src/shared.ts";
+import { Environment } from "../src/environment.ts";
 import {
   Engine,
   execute,
@@ -130,6 +131,41 @@ test("streaming early exit charges less", () => {
     );
   } finally {
     s.close();
+  }
+});
+
+test("direct row iteration and close do not evaluate or charge another row", () => {
+  const calls: bigint[] = [];
+  const builder = Environment.builder();
+  builder.registerFunction({
+    name: "visit_row",
+    argTypes: ["i64"],
+    result: "i64",
+    volatility: "volatile",
+    kernel(args) {
+      const arg = args[0]!;
+      if (arg.kind !== "int") throw new Error("integer argument required");
+      calls.push(arg.int);
+      return arg;
+    },
+  });
+  const db = createDatabase({ environment: builder.build() });
+  const session = db.session();
+  try {
+    session.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
+    session.execute("INSERT INTO t VALUES (1), (2), (3)");
+    const rows = session.query("SELECT visit_row(id) FROM t ORDER BY id");
+    assert.deepEqual(calls, []);
+    assert.deepEqual(rows[Symbol.iterator]().next(), { done: false, value: [intValue(1n)] });
+    const cost = rows.cost;
+    assert.deepEqual(calls, [1n]);
+    rows.close();
+    rows.close();
+    assert.deepEqual(calls, [1n]);
+    assert.equal(rows.cost, cost);
+  } finally {
+    session.close();
+    db.close();
   }
 });
 

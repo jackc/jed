@@ -8279,8 +8279,6 @@ export class Engine {
     const row: Row = new Array(n);
     let nullCol = -1;
     for (let i = 0; i < n; i++) {
-      if (shouldCooperate()) yield COOPERATE;
-
       const col = table.columns[i]!;
       const p = provided[i]!;
       const candidate: Value =
@@ -14930,7 +14928,6 @@ export class Engine {
       const combined = row.concat(others !== null ? others[i]! : row.map(() => nullValue()));
       const vals: Value[] = [];
       for (const node of nodes) {
-        if (shouldCooperate()) yield COOPERATE;
         vals.push(yield* evalExprSteps(node, combined, env, meter));
       }
       meter.admitRow(vals); // a RETURNING result row (memory.md §5.1)
@@ -31791,8 +31788,6 @@ export function* indexEntryKeySteps(
 ): Steps<Uint8Array> {
   const parts: Uint8Array[] = [];
   for (let i = 0; i < rindex.keys.length; i++) {
-    if (shouldCooperate()) yield COOPERATE;
-
     // The §2.16 ordered slot: the order's presence tag + the slot's order-preserving key
     // (range-aware §2.11, composite §2.15, collated-text-aware §2.12), inverted for DESC — or the
     // order's NULL byte.
@@ -33029,8 +33024,6 @@ export function* indexPrefixKeySteps(
   if (!(yield* indexRowQualifiesSteps(rindex, row, env))) return null;
   const parts: Uint8Array[] = [];
   for (let i = 0; i < rindex.keys.length; i++) {
-    if (shouldCooperate()) yield COOPERATE;
-
     const b = yield* indexSlotKeySteps(rindex.keys[i]!, colTypes, colls, row, env);
     if (b === null) return null; // NULLS DISTINCT: a NULL slot never conflicts
     // the order's present slot (§2.16) — the same bytes the entry key carries
@@ -33647,8 +33640,6 @@ export function* fkProbeSteps(
 ): Steps<FkProbe | null> {
   // MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
   for (const o of ordinals) {
-    if (shouldCooperate()) yield COOPERATE;
-
     if (row[o]!.kind === "null") return null;
   }
   // Each value as its equal of the parent column's type (§6.2 step 5); a value with none matches no
@@ -33656,8 +33647,6 @@ export function* fkProbeSteps(
   // ordinals[i]).
   const parentValues: Value[] = new Array(parent.columns.length);
   for (let i = 0; i < fk.refColumns.length; i++) {
-    if (shouldCooperate()) yield COOPERATE;
-
     const pcol = fk.refColumns[i]!;
     const v = yield* fkValueAsSteps(parent.columns[pcol]!.type, row[ordinals[i]!]!);
     if (v === null) return { kind: "absent" };
@@ -33671,8 +33660,6 @@ export function* fkProbeSteps(
   if (parent.pk.length > 0 && sameSet(pkSet, refSet)) {
     const parts: Uint8Array[] = [];
     for (const pcol of parent.pk) {
-      if (shouldCooperate()) yield COOPERATE;
-
       parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!));
     }
     return { kind: "pk", bytes: concatBytes(parts) };
@@ -33684,8 +33671,6 @@ export function* fkProbeSteps(
   const idxCols = indexColumnOrdinals(idx)!; // an FK target is a plain-column unique index
   const parts: Uint8Array[] = [];
   for (let i = 0; i < idxCols.length; i++) {
-    if (shouldCooperate()) yield COOPERATE;
-
     const pcol = idxCols[i]!;
     // The parent index's §2.16 ordered present slot (a DESC key inverts its body).
     const body = encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!);
