@@ -101,6 +101,20 @@ stays **explicit** either way (§6) — within-family widening is the *only* imp
 The widening is scalar-only: an `f32[]` never compares with an `f64[]` (`42804`, array.md §5 —
 PostgreSQL has no `real[] = double precision[]` operator either).
 
+**Where the cast sits — one rule for every core.** The values are PostgreSQL's (`float4` widens to
+`float8`, then the pair compares under the total order of §3 or computes at `f64`), so
+`0.1::f32 = 0.1::f64` is FALSE and `0.1::f32 > 0.1::f64` is TRUE. The resolver places the widening
+as an explicit `cast(x as f64)` node on the `f32` operand of every comparison operator
+(`IS [NOT] DISTINCT FROM` and the `IN`-list / `BETWEEN` / simple-`CASE` desugarings included),
+arithmetic operator, and `f64`-result float function (all but `abs`), and on the `f32` arms of
+`CASE` / `COALESCE` / `GREATEST` / `LEAST`. Two `f32` operands get no cast. Comparisons made inside
+one node — `NULLIF` (whose result keeps `a`'s width), row and record comparisons, `= ANY` / `ALL`
+over arrays and subqueries, `IN (subquery)` — widen at the value level instead. The placement is
+observable, so it is part of the cross-core contract: the cast charges one `operator_eval`, shows
+in `EXPLAIN (VERBOSE)`, and keeps the pair out of key-bound detection (a cast operand is not a key
+source), so `f32col = f64value` scans with a residual filter in every core (cost.md "Mixed-width
+floats"). Pinned by `types/float_mixed_width.test`.
+
 **Everything below applies to each width** (the total order §3, the trap model §3, the kernel
 §5, the exact-sum aggregates §7, the functions §8, rendering §9), differing only by width:
 `f32` arithmetic rounds to binary32 (Rust `f32`, Go `f32`, **TS `Math.fround` on every

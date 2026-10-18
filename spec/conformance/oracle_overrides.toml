@@ -322,6 +322,21 @@ sql = "SELECT CAST(f64 '2.5' AS i32)"
 reason = "jed: float→int rounds HALF AWAY FROM ZERO (2.5 → 3) — jed's single engine-wide rounding mode, no float in the value path (float.md §5, decimal.md §3). PostgreSQL's float8→int4 cast applies rint() (round half to EVEN), so 2.5 → 2. A documented divergence on the cast's rounding mode (same half-away vs half-even split as the decimal casts)."
 
 [[override]]
+file = "types/float_mixed_width.test"
+sql = "SELECT id = b FROM t"
+reason = "jed: i32 vs f64 is not comparable (42804) — float is a strict island; only the f32 → f64 widening is implicit (float.md §2/§6). PostgreSQL implicitly coerces the integer to double precision and compares."
+
+[[override]]
+file = "types/float_mixed_width.test"
+sql = "SELECT 1.5::decimal < a FROM t"
+reason = "jed: decimal vs f32 is not comparable (42804) — float is a strict island (float.md §2/§6). PostgreSQL implicitly coerces the numeric to real and compares."
+
+[[override]]
+file = "types/float_mixed_width.test"
+sql = "SELECT id + b FROM t"
+reason = "jed: i32 + f64 is a 42804 — float arithmetic requires both operands in the float family (float.md §5/§6). PostgreSQL implicitly coerces the integer to double precision and adds."
+
+[[override]]
 file = "types/float.test"
 sql = "SELECT id FROM t WHERE id = d"
 reason = "jed: i64 vs f64 is not comparable (42804) — the strict type system requires an explicit cast across the int/float families (no implicit int→float promotion; float.md §2/§11). PostgreSQL implicitly coerces the bigint to double precision and compares, returning an (empty) result with no error."

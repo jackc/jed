@@ -40648,6 +40648,17 @@ export function resolveScalarFunc(
     rargs[0]?.kind === "constText" && rargs[0].value.toLowerCase() === "epoch";
   params.nonimmutable ||= desc.volatility !== "immutable" && !epoch;
   const result = scalarResultType(desc.result, tys);
+  // A float function that computes at f64 takes its f32 arguments through the implicit f32 → f64
+  // cast (float.md §2, cost.md "Mixed-width floats"); abs keeps its operand's width.
+  // (A mixed-width pow pair was already widened to f64 above.)
+  const powWidened = func === "pow" && argWidth === "f64";
+  if (func !== "abs" && result === "f64" && !powWidened) {
+    for (let i = 0; i < rargs.length; i++) {
+      const t = tys[i]!;
+      if (t.kind === "float" && t.ty === "f32") rargs[i] = widenFloatTo(rargs[i]!, "f32", "f64");
+    }
+    if (argWidth === "f32") argWidth = "f64";
+  }
   return scalarFuncNode(func, rargs, result, argWidth);
 }
 

@@ -1,0 +1,605 @@
+# Mixed-width float comparisons and arithmetic: f32 meets f64 (spec/design/float.md §2,
+# spec/design/cost.md "Mixed-width floats"). The values follow PostgreSQL: the f32 operand widens
+# EXACTLY to f64 (float4 → float8), then the pair compares under the total order (-0 = +0,
+# NaN = NaN, NaN the largest) or computes at f64. So 0.1::f32 (0.100000001490116…) is NOT equal to
+# 0.1::f64, and 16777217 stored as f32 rounds to 16777216 first.
+#
+# The widening is metered and planned identically in every core:
+#   - A comparison operator (= <> < <= > >=, IS [NOT] DISTINCT FROM, and the IN-list / BETWEEN /
+#     simple-CASE comparisons that desugar to them), an arithmetic operator, and a float function
+#     that computes at f64 wrap the f32 operand in an implicit f32 → f64 CAST node, which charges
+#     one operator_eval each time it is evaluated. Two f32 operands need no cast.
+#   - A comparison inside one node against values it did not resolve as operands — NULLIF, a row
+#     or record comparison, = ANY / ALL over an array or a subquery, IN (subquery) — widens the
+#     values inside that node and charges nothing extra (as the set-operation unification does).
+#   - A cast operand is not a key source, so `f32col = f64value` (or the reverse) never bounds an
+#     index or an index-nested-loop inner: it scans, and the comparison is the residual filter.
+# Oracle-checked against PostgreSQL 18 (rows only — cost is jed's). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.join_inner, query.join_left, query.join_using, query.hash_join, query.index_nested_loop, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.subquery_quantified, query.aggregates, query.aggregate_filter, query.group_by, query.group_by_expr, query.union, query.is_distinct_from, types.composite_bare_row, expr.in_list, expr.between, expr.case, expr.nullif, expr.arithmetic, expr.unary_minus, cast.operator, cast.string_literal, types.i32, types.f32, types.f64, types.array, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a f32, b f64)
+
+statement ok
+INSERT INTO t VALUES (1, 1.5, 1.5), (2, 0.1, 0.1), (3, 'NaN', 'NaN'), (4, '-0', '0'), (5, 'Infinity', 'Infinity'), (6, '-Infinity', 1e300), (7, NULL, 1)
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, a f32, b f64)
+
+statement ok
+INSERT INTO u VALUES (1, 1.5, 1.5), (2, 0.1, 0.1), (3, 'NaN', 'NaN'), (4, '0', '-0'), (5, 16777217, 16777217)
+
+statement ok
+CREATE INDEX u_a ON u (a)
+
+statement ok
+CREATE INDEX u_b ON u (b)
+
+# --- comparison operators: one cast per mixed comparison ------------------------------------------
+
+# 1 page + 7 scanned + 7 produced + 4 compares × 7 + 4 casts × 7 = 71.
+# cost: 71
+query IBBBB nosort
+SELECT id, a = b, a < b, b > a, a <> b FROM t ORDER BY id
+----
+1
+true
+false
+false
+false
+2
+false
+false
+false
+true
+3
+true
+false
+false
+false
+4
+true
+false
+false
+false
+5
+true
+false
+false
+false
+6
+false
+true
+true
+true
+7
+NULL
+NULL
+NULL
+NULL
+
+# cost: 26
+query I nosort
+SELECT id FROM t WHERE a = b ORDER BY id
+----
+1
+3
+4
+5
+
+# 0.1::f32 widens to 0.100000001490116…, which is greater than 0.1::f64.
+# cost: 13
+query BBB nosort
+SELECT 0.1::f32 = 0.1::f64, 0.1::f32 < 0.1::f64, 0.1::f32 > 0.1::f64
+----
+false
+false
+true
+
+# Same-width f32 operands (a literal adapts to the f32 column) take no cast.
+# cost: 50
+query BBBB nosort
+SELECT a = a, a < a, a = 1.5, a > 0.5::f32 FROM t ORDER BY id
+----
+true
+false
+true
+true
+true
+false
+false
+false
+true
+false
+false
+true
+true
+false
+false
+false
+true
+false
+false
+true
+true
+false
+false
+false
+NULL
+NULL
+NULL
+NULL
+
+# cost: 29
+query B nosort
+SELECT a IS DISTINCT FROM b FROM t ORDER BY id
+----
+false
+true
+false
+false
+false
+true
+true
+
+# cost: 29
+query B nosort
+SELECT a IS NOT DISTINCT FROM b FROM t ORDER BY id
+----
+true
+false
+true
+true
+true
+false
+false
+
+# IN (list), NOT IN, BETWEEN and simple CASE desugar to comparisons, each casting its f32 operand.
+# cost: 45
+query B nosort
+SELECT a IN (b, 2.0::f64) FROM t ORDER BY id
+----
+true
+false
+true
+true
+true
+false
+NULL
+
+# cost: 52
+query B nosort
+SELECT a NOT IN (b, 2.0::f64) FROM t ORDER BY id
+----
+false
+true
+false
+false
+false
+true
+NULL
+
+# cost: 54
+query B nosort
+SELECT a BETWEEN b AND 2.0::f64 FROM t ORDER BY id
+----
+true
+true
+false
+true
+false
+false
+NULL
+
+# cost: 36
+query I nosort
+SELECT CASE a WHEN b THEN 1 ELSE 0 END FROM t ORDER BY id
+----
+1
+0
+1
+1
+1
+0
+0
+
+# cost: 33
+query B nosort
+SELECT a = (SELECT b FROM u WHERE id = 1) FROM t ORDER BY id
+----
+true
+false
+false
+false
+false
+false
+NULL
+
+# --- arithmetic and functions: the result is f64, one cast per f32 operand ------------------------
+
+# cost: 29
+query R nosort
+SELECT a + b FROM t ORDER BY id
+----
+3
+0.20000000149011612
+NaN
+0
+Infinity
+-Infinity
+NULL
+
+# cost: 29
+query R nosort
+SELECT b - a FROM t ORDER BY id
+----
+0
+-1.4901161138336505e-09
+NaN
+0
+NaN
+Infinity
+NULL
+
+# cost: 8
+query RR nosort
+SELECT 0.1::f32 * 3::f32, 0.1::f32 * 3::f64
+----
+0.3
+0.30000000447034836
+
+# cost: 36
+query R nosort
+SELECT -a + b FROM t ORDER BY id
+----
+0
+-1.4901161138336505e-09
+NaN
+0
+NaN
+Infinity
+NULL
+
+# A float function that computes at f64 casts its f32 argument; abs keeps the f32 width.
+# cost: 35
+query RR nosort
+SELECT sqrt(abs(a)), round(a) FROM t WHERE id IN (1, 2, 4) ORDER BY id
+----
+1.224744871391589
+2
+0.3162277683729184
+0
+0
+-0
+
+# cost: 7
+query RR nosort
+SELECT sqrt(2::f32), sqrt(0.1::f32)
+----
+1.4142135623730951
+0.3162277683729184
+
+# cost: 10
+query RR nosort
+SELECT power(2::f32, 0.5::f32), power(0.1::f32, 2::f64)
+----
+1.4142135623730951
+0.010000000298023226
+
+# cost: 27
+query R nosort
+SELECT sum(a + b) FROM t WHERE id IN (1, 2, 4)
+----
+3.200000001490116
+
+# cost: 24
+query R nosort
+SELECT max(a) FILTER (WHERE a < b) FROM t
+----
+-Infinity
+
+# cost: 32
+query BI nosort
+SELECT a = b AS eq, count(*) FROM t GROUP BY a = b ORDER BY 1
+----
+false
+2
+true
+4
+NULL
+1
+
+# --- comparisons inside one node: no cast -----------------------------------------------------------
+
+# cost: 22
+query R nosort
+SELECT NULLIF(a, b) FROM t ORDER BY id
+----
+NULL
+0.1
+NULL
+NULL
+NULL
+-Infinity
+NULL
+
+# cost: 606
+query B nosort
+SELECT a = ANY(ARRAY[b, 2.0::f64]) FROM t ORDER BY id
+----
+true
+false
+true
+true
+true
+false
+NULL
+
+# cost: 36
+query B nosort
+SELECT ROW(a, 1) = ROW(b, 1) FROM t ORDER BY id
+----
+true
+false
+true
+true
+true
+false
+NULL
+
+# cost: 36
+query B nosort
+SELECT ROW(a, 1) < ROW(b, 2) FROM t ORDER BY id
+----
+true
+false
+true
+true
+true
+true
+NULL
+
+# cost: 36
+query B nosort
+SELECT ROW(a) IS DISTINCT FROM ROW(b) FROM t ORDER BY id
+----
+false
+true
+false
+false
+false
+true
+true
+
+# A record's NULL-safe equality compares field by field: promoted pairs by value (1 = 1.0,
+# f32 = f64), -0 = +0 and NaN = NaN under the float total order, 1.0 = 1.00 regardless of scale.
+# cost: 92
+query BBB nosort
+SELECT ROW(id) IS DISTINCT FROM ROW(id::decimal + 0.0), ROW(a, id) IS NOT DISTINCT FROM ROW(b, id), ROW(1.0, a) IS NOT DISTINCT FROM ROW(1.00, b) FROM t ORDER BY id
+----
+false
+true
+true
+false
+false
+false
+false
+true
+true
+false
+true
+true
+false
+true
+true
+false
+false
+false
+false
+false
+false
+
+# cost: 15
+query BBB nosort
+SELECT ROW(-0::f64) IS NOT DISTINCT FROM ROW(0::f64), ROW('NaN'::f64) IS NOT DISTINCT FROM ROW('NaN'::f64), ROW(NULL::i32, 1) IS NOT DISTINCT FROM ROW(NULL::i32, 1)
+----
+true
+true
+true
+
+# cost: 68
+query I nosort
+SELECT id FROM t WHERE (a, id) IN ((1.5::f64, 1), (4::f64, 3)) ORDER BY id
+----
+1
+
+# cost: 64
+query I nosort
+SELECT id FROM t WHERE a IN (SELECT b FROM u) ORDER BY id
+----
+1
+3
+4
+
+# cost: 64
+query I nosort
+SELECT id FROM t WHERE b IN (SELECT a FROM u) ORDER BY id
+----
+1
+3
+4
+
+# cost: 64
+query I nosort
+SELECT id FROM t WHERE a NOT IN (SELECT b FROM u) ORDER BY id
+----
+2
+5
+6
+
+# cost: 57
+query I nosort
+SELECT id FROM t WHERE a = ANY(SELECT b FROM u) ORDER BY id
+----
+1
+3
+4
+
+# cost: 31
+query I nosort
+SELECT id FROM t WHERE b < ALL(SELECT a FROM u WHERE a < 1) ORDER BY id
+----
+
+# cost: 26
+query R rowsort
+SELECT a FROM t UNION SELECT b FROM u
+----
+-0
+-Infinity
+0.1
+0.10000000149011612
+1.5
+16777217
+Infinity
+NULL
+NaN
+
+# --- access paths: a cast operand never bounds a key ----------------------------------------------
+
+# u_a holds f32 keys; the f64 probe is compared after widening, so it scans (16777217 as f32 is
+# 16777216, which equals no f64 16777217).
+# cost: 22
+query I nosort
+SELECT id FROM u WHERE a = 1.5::f64 ORDER BY id
+----
+1
+
+# cost: 21
+query I nosort
+SELECT id FROM u WHERE a = 16777217::f64 ORDER BY id
+----
+
+# cost: 22
+query I nosort
+SELECT id FROM u WHERE b = 1.5::f32 ORDER BY id
+----
+1
+
+# cost: 25
+query I nosort
+SELECT id FROM u WHERE a > 0.1::f64 ORDER BY id
+----
+1
+2
+3
+5
+
+# cost: 23
+query I nosort
+SELECT id FROM u WHERE b < 0.1::f32 ORDER BY id
+----
+2
+4
+
+# cost: 56
+query I nosort
+SELECT id FROM u WHERE a IN (1.5::f64, 0.1::f64, 16777217::f64) ORDER BY id
+----
+1
+
+# A same-width f32 equality does bound the f32 index.
+# cost: 5
+query I nosort
+SELECT id FROM u WHERE a = 1.5 ORDER BY id
+----
+1
+
+# --- joins: the mixed pair is a residual filter, never an index-nested-loop or hash key ------------
+
+# cost: 87
+query II rowsort
+SELECT t.id, u.id FROM t JOIN u ON t.a = u.b
+----
+1
+1
+3
+3
+4
+4
+
+# cost: 87
+query II rowsort
+SELECT t.id, u.id FROM t JOIN u ON t.b = u.a
+----
+1
+1
+3
+3
+4
+4
+
+# cost: 91
+query II rowsort
+SELECT t.id, u.id FROM t LEFT JOIN u ON t.b = u.a
+----
+1
+1
+2
+NULL
+3
+3
+4
+4
+5
+NULL
+6
+NULL
+7
+NULL
+
+# cost: 133
+query I nosort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t.b) ORDER BY id
+----
+1
+3
+4
+
+# cost: 133
+query I nosort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) ORDER BY id
+----
+1
+3
+4
+
+# A same-width f32 join key takes no cast.
+# cost: 30
+query II rowsort
+SELECT t.id, u.id FROM t JOIN u ON t.a = u.a
+----
+1
+1
+2
+2
+3
+3
+4
+4
+
+# cost: 31
+query I nosort
+SELECT count(*) FROM t JOIN u USING (a)
+----
+4
+
+# --- float vs another family stays a strict island -----------------------------------------------
+
+statement error 42804
+SELECT id = b FROM t
+
+statement error 42804
+SELECT 1.5::decimal < a FROM t
+
+statement error 42804
+SELECT id + b FROM t

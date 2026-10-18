@@ -260,6 +260,12 @@ The exact math functions take an integer next to a `numeric`, as in PostgreSQL: 
 `power(x, 3)` on a `f64` column returns `f64`. A float column next to an integer column still needs
 a cast (`42883`), and so does a call with only integers, such as `power(2, 3)`.
 
+An `f32` next to an `f64` widens exactly to `f64` first, as PostgreSQL widens `real` to
+`double precision`, so the comparison or arithmetic runs at `f64`. The widened `f32` keeps its
+binary value: `0.1::f32 = 0.1::f64` is false, because the `f32` nearest 0.1 is 0.100000001490116….
+The widening is an implicit cast (`cast(a as f64)` in `EXPLAIN (VERBOSE)`), so a comparison of an
+`f32` column with an `f64` value scans rather than using an index on that column.
+
 ## Integers with defined overflow
 
 Integers are fixed-width (`i16`, `i32`, `i64`) and **trap on overflow** — there is no silent

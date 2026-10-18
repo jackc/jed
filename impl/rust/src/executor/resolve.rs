@@ -239,7 +239,9 @@ fn resolve_arith(
                 // A float paired with a non-float, non-NULL family — the strict island
                 // (int/decimal × float is 42804, spec/design/float.md §6).
                 None => {
-                    return Err(type_error("arithmetic operators require numeric operands"));
+                    return Err(type_error(
+                        "arithmetic operators require operands of the same family",
+                    ));
                 }
             }
         }
@@ -311,12 +313,12 @@ fn resolve_comparison(
         classify_comparable(&lt, &rt)?;
         // A mixed-width float comparison promotes the f32 side to f64 first (the
         // implicit cast — spec/design/float.md §2/§3), so the runtime compare sees one width.
-        let (rl, rr) =
-            if matches!(lt, ResolvedType::Float(_)) && matches!(rt, ResolvedType::Float(_)) {
+        let (rl, rr) = match (&lt, &rt) {
+            (ResolvedType::Float(a), ResolvedType::Float(b)) if a != b => {
                 (widen_float_to_f64(rl, &lt), widen_float_to_f64(rr, &rt))
-            } else {
-                (rl, rr)
-            };
+            }
+            _ => (rl, rr),
+        };
         let cop = match op {
             BinaryOp::Eq => CmpOp::Eq,
             BinaryOp::Ne => CmpOp::Ne,

@@ -114,6 +114,21 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
   cost track how many literals the parser happened to fold, an accidental property; cost
   must track genuine evaluation work. A **decimal** arithmetic/comparison node additionally
   charges size-scaled `decimal_work` — the dedicated subsection below.
+- **Mixed-width floats.** The `f32 → f64` widening ([float.md](float.md) §2) is an implicit
+  **`cast` node** wherever the resolver builds an expression node over an `f32` operand that must
+  be `f64`: a comparison operator (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, and the
+  `IN`-list / `BETWEEN` / simple-`CASE` comparisons that desugar to them), an arithmetic operator,
+  a float function whose result is `f64` (every one but `abs`, which keeps its operand's width), and
+  a `CASE` / `COALESCE` / `GREATEST` / `LEAST` arm (§ "Set operations" below). The cast charges one
+  `operator_eval` each time it is evaluated; two `f32` operands need none. A comparison made
+  **inside one node** against values the resolver did not take as operands — `NULLIF`, a row or
+  record comparison, `= ANY` / `ALL` over an array or a subquery, `IN (subquery)` — widens those
+  values inside the node and charges nothing extra, as do the set-operation and `VALUES` unifications.
+  A cast operand is not a key source, so a mixed-width pair never bounds a scan, an index, or an
+  index-nested-loop inner: `f32col = f64value` scans with the comparison as its residual filter.
+  The integer tower and the integer → `decimal` promotion are value conversions inside the
+  comparison or arithmetic node (no cast, nothing charged); a promoted *column* source of a key bound
+  is converted to the key's type as § "Bounded scan / index-nested-loop" states.
 - **Eager operands, except the sanctioned short-circuits.** Both operands of every other binary
   node (`compare`, `arith`, `distinct`, …) are **always** evaluated. A core **must not introduce**
   a short-circuit anywhere this section does not sanction one: skipping an operand in one core

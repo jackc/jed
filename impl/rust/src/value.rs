@@ -565,6 +565,10 @@ fn numeric_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Decimal(x), Value::Decimal(y)) => Some(x.cmp_value(y)),
         (Value::Int(x), Value::Decimal(y)) => Some(Decimal::from_i64(*x).cmp_value(y)),
         (Value::Decimal(x), Value::Int(y)) => Some(x.cmp_value(&Decimal::from_i64(*y))),
+        // A mixed-width float pair (a row field, an IN-subquery row, …) compares at f64 under the
+        // total order — the f32 → f64 widening is exact (spec/design/float.md §2/§3).
+        (Value::Float32(x), Value::Float64(y)) => Some(total_cmp_f64(f64::from(*x), *y)),
+        (Value::Float64(x), Value::Float32(y)) => Some(total_cmp_f64(*x, f64::from(*y))),
         _ => None,
     }
 }
@@ -908,9 +912,12 @@ impl Value {
         match (self, other) {
             (Value::Null, Value::Null) => true,
             (Value::Null, _) | (_, Value::Null) => false,
-            // Two composites are "not distinct" iff structurally equal — NULL-safe, so a NULL
-            // field equals a NULL field (the value-level `PartialEq`, not the 3VL `eq3`).
-            (Value::Composite(a), Value::Composite(b)) => a == b,
+            // Two composites are "not distinct" iff every field pair is not distinct — NULL-safe,
+            // so a NULL field equals a NULL field (not the 3VL `eq3`), and a promoted field pair
+            // (int vs decimal, f32 vs f64 — an anonymous record) compares by value.
+            (Value::Composite(a), Value::Composite(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.not_distinct_from(y))
+            }
             // Two arrays are "not distinct" iff structurally equal (the same btree equality as
             // `==`/`eq3`; NULL elements are mutually equal).
             (Value::Array(a), Value::Array(b)) => a == b,
