@@ -69,6 +69,9 @@ class OracleImport
         sql, i = take_sql(i + 1)
         out << line << sql.join
         check_error(sql, declared)
+        # It changes no data, but inside the test's own transaction it fails the block, which a later
+        # probe must see (PgOracle#contain_failed).
+        @oracle.add_failed(applied_sql(sql.join), declared)
       when /^query\s+(\S+)\s+(\S+)/
         coltypes = Regexp.last_match(1)
         sortmode = Regexp.last_match(2)
