@@ -202,3 +202,87 @@ func TestChainSharingRewriteCostsDoNotDependOnResidency(t *testing.T) {
 		t.Fatal("in-memory and paged rows differ")
 	}
 }
+
+// The statements of TestChainSharingKeptChainsStayExclusive, in three sessions over the file (each
+// phase starts from a fresh open, so its rows are read from disk). FILLER is replaced with a
+// 900-byte incompressible value.
+var chainOwnershipPhases = [][]string{
+	{
+		"BEGIN",
+		"SAVEPOINT a",
+		"UPDATE t SET n = n + 1000",
+		"UPDATE t SET id = id + 100 WHERE id <= 3",
+		"ROLLBACK TO SAVEPOINT a",
+		"UPDATE t SET n = n + 1 WHERE id <= 3",
+		"SAVEPOINT b",
+		"UPDATE t SET id = id + 200 WHERE id = 1",
+		"RELEASE SAVEPOINT b",
+		"SAVEPOINT c",
+		"UPDATE t SET id = id + 400 WHERE id = 2",
+		"ROLLBACK TO SAVEPOINT c",
+		"COMMIT",
+	},
+	{
+		"INSERT INTO t VALUES (2, 'ignored', 0) ON CONFLICT (id) DO UPDATE SET id = 300",
+		"INSERT INTO t SELECT id + 1000, body, n FROM t WHERE id IN (201, 300)",
+	},
+	{
+		"DELETE FROM t WHERE id IN (201, 300)",
+		"INSERT INTO t VALUES (13, 'FILLER', 13)",
+		"UPDATE t SET n = n + 1",
+	},
+}
+
+// A chain belongs to exactly one record per snapshot (large-values.md §15.3), across savepoint
+// rollbacks, primary-key re-keys (UPDATE and upsert DO UPDATE), and row copies: rows rolled back to a
+// savepoint keep their original chains, a re-keyed row takes its chain along, and a copy gets its
+// own. After each phase the live checker and the image checker (live page count, chain exclusivity)
+// pass, and the rows equal an in-memory replay.
+func TestChainSharingKeptChainsStayExclusive(t *testing.T) {
+	SetVerifyLivePages(true)
+	t.Cleanup(func() { SetVerifyLivePages(false) })
+	path := filepath.Join(t.TempDir(), "chain_share_ownership.jed")
+	mem := newInMemoryWithPageSize(lazyPageSize, NewEnvironment()).Session(SessionOptions{})
+	chainSeed(t, mem)
+	chainCreate(t, path)
+	originals := renderedRows(t, mem, "SELECT body FROM t WHERE id IN (1, 2) ORDER BY id")
+	const q = "SELECT id, body, n FROM t ORDER BY id"
+	for i, phase := range chainOwnershipPhases {
+		host, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := host.Session(SessionOptions{})
+		for _, sql := range phase {
+			sql = strings.ReplaceAll(sql, "FILLER", fillerText(900))
+			mustExec(t, mem, sql)
+			mustExec(t, s, sql)
+		}
+		if got, want := renderedRows(t, s, q), renderedRows(t, mem, q); !reflect.DeepEqual(got, want) {
+			t.Fatalf("phase %d: rows differ from the in-memory replay", i)
+		}
+		if err := simCheckLive(host); err != nil {
+			t.Fatalf("phase %d: live check: %v", i, err)
+		}
+		txid := host.Txid()
+		s.Close()
+		if err := host.Close(); err != nil {
+			t.Fatal(err)
+		}
+		image, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := simIntegrity(image, txid); err != nil {
+			t.Fatalf("phase %d: image check: %v", i, err)
+		}
+	}
+	db, err := openWithOptions(path, OpenOptions{SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := renderedRows(t, db, "SELECT body FROM t WHERE id IN (1201, 1300) ORDER BY id"); !reflect.DeepEqual(got, originals) {
+		t.Fatal("the copies should keep their own chains")
+	}
+}

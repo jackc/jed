@@ -648,7 +648,10 @@ All three cores pin the physical behavior in mirrored `chain_sharing` tests: wit
 payload corrupt on disk, an UPDATE of another column, a re-key, and a neighboring INSERT succeed and
 leave the corruption in place (no chain was read or rewritten); an UPDATE that reads the column but
 does not assign it writes no overflow page; compaction afterwards preserves rows and costs; and the
-same statements cost the same on resident and on disk-read rows. The simulation generator's
+same statements cost the same on resident and on disk-read rows. A further mirrored test runs
+UPDATEs and re-keys inside savepoints that are rolled back or released, an upsert `DO UPDATE` re-key,
+and an `INSERT … SELECT` copy, then checks after every commit that the rows match an in-memory replay
+and the live and image checkers pass. The simulation generator's
 `update_narrow` step (the `large-values` profile) assigns only a fixed-width column, sometimes with a
 `WHERE` that reads a variable-width one, and the image checkers (each core and `verify.rb
 --check-image`) check chain exclusivity: no overflow page is named by two stored values.

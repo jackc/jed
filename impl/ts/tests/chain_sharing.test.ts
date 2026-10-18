@@ -16,6 +16,7 @@ import { createDatabase, openDatabase, verifyLivePages } from "../src/tooling.ts
 import { render } from "../src/value.ts";
 import { type Handle, errCode, fillerText, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
+import { checkImage, checkLive } from "../src/sim/check.ts";
 
 const PAGE_SIZE = 256;
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
@@ -216,4 +217,80 @@ test("chain sharing: rewrite costs do not depend on residency", () => {
       paged.close();
     }
   });
+});
+
+// The statements of the ownership test below, in three sessions over the file (each phase starts from
+// a fresh open, so its rows are read from disk). FILLER is replaced with a 900-byte incompressible
+// value.
+const OWNERSHIP_PHASES: string[][] = [
+  [
+    "BEGIN",
+    "SAVEPOINT a",
+    "UPDATE t SET n = n + 1000",
+    "UPDATE t SET id = id + 100 WHERE id <= 3",
+    "ROLLBACK TO SAVEPOINT a",
+    "UPDATE t SET n = n + 1 WHERE id <= 3",
+    "SAVEPOINT b",
+    "UPDATE t SET id = id + 200 WHERE id = 1",
+    "RELEASE SAVEPOINT b",
+    "SAVEPOINT c",
+    "UPDATE t SET id = id + 400 WHERE id = 2",
+    "ROLLBACK TO SAVEPOINT c",
+    "COMMIT",
+  ],
+  [
+    "INSERT INTO t VALUES (2, 'ignored', 0) ON CONFLICT (id) DO UPDATE SET id = 300",
+    "INSERT INTO t SELECT id + 1000, body, n FROM t WHERE id IN (201, 300)",
+  ],
+  [
+    "DELETE FROM t WHERE id IN (201, 300)",
+    "INSERT INTO t VALUES (13, 'FILLER', 13)",
+    "UPDATE t SET n = n + 1",
+  ],
+];
+
+// A chain belongs to exactly one record per snapshot (large-values.md §15.3), across savepoint
+// rollbacks, primary-key re-keys (UPDATE and upsert DO UPDATE), and row copies: rows rolled back to a
+// savepoint keep their original chains, a re-keyed row takes its chain along, and a copy gets its
+// own. After each phase the live checker and the image checker (live page count, chain exclusivity)
+// pass, and the rows equal an in-memory replay.
+test("chain sharing: kept chains stay exclusive across savepoints and re-keys", () => {
+  verifyLivePages.enabled = true;
+  try {
+    withDir("jed-chain-ownership-", (dir) => {
+      const path = join(dir, "ownership.jed");
+      const mem = memDb(PAGE_SIZE).session();
+      seed(mem);
+      createSeeded(path);
+      const originals = rendered(mem, "SELECT body FROM t WHERE id IN (1, 2) ORDER BY id");
+      const q = "SELECT id, body, n FROM t ORDER BY id";
+      OWNERSHIP_PHASES.forEach((phase, i) => {
+        const db = openDatabase(path, { skipFsync: true });
+        const s = db.session();
+        for (const raw of phase) {
+          const sql = raw.replace("FILLER", fillerText(900));
+          mem.execute(sql);
+          s.execute(sql);
+        }
+        assert.deepEqual(rendered(s, q), rendered(mem, q), `phase ${i}`);
+        checkLive(db);
+        const txid = db.txid;
+        s.close();
+        db.close();
+        checkImage(new Uint8Array(readFileSync(path)), txid);
+      });
+      const db = openDatabase(path, { skipFsync: true });
+      try {
+        assert.deepEqual(
+          rendered(db, "SELECT body FROM t WHERE id IN (1201, 1300) ORDER BY id"),
+          originals,
+          "the copies kept their own chains",
+        );
+      } finally {
+        db.close();
+      }
+    });
+  } finally {
+    verifyLivePages.enabled = false;
+  }
 });
