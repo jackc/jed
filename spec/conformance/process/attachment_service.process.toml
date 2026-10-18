@@ -147,6 +147,48 @@ command = "query_i64"
 sql = "SELECT id FROM work.t ORDER BY id"
 expect = "1,2,3,4,5"
 
+# A savepoint's frame covers the attachment: the client rolls back to it and commits the rest through
+# the owner.
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO work.t VALUES (50)"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "SAVEPOINT s"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO work.t VALUES (51)"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "ROLLBACK TO SAVEPOINT s"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM work.t WHERE id >= 50 ORDER BY id"
+expect = "50"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "DELETE FROM work.t WHERE id = 50"
+
 # A writable transaction takes the gate of every read-write attachment, even one that writes only main.
 [[step]]
 actor = "b"
