@@ -5,8 +5,10 @@ package jed
 // The expression VM is an opt-in experiment, with no runtime switch in ordinary builds.
 const expressionVMEnabled = false
 
-type expressionVMType struct{}
-type expressionVMState struct{}
+type (
+	expressionVMType  struct{}
+	expressionVMState struct{}
+)
 
 func (*rExpr) setExpressionVMType(resolvedType) {}
 func (*costMeter) expressionVMActive() bool     { return false }

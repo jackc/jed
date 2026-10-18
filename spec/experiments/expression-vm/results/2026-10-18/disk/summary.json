@@ -1,0 +1,272 @@
+[
+  {
+    "core": "go",
+    "case": "arithmetic_scan",
+    "tree_ns": 5358373.35,
+    "vm_ns": 6003089.45,
+    "change_percent": 12.031936893684358,
+    "paired_change_percent": 15.843632723457123,
+    "paired_min_percent": 6.879399144282283,
+    "paired_max_percent": 32.30013709028818
+  },
+  {
+    "core": "go",
+    "case": "boolean_scan",
+    "tree_ns": 2434980.225,
+    "vm_ns": 2914787.125,
+    "change_percent": 19.70475550781936,
+    "paired_change_percent": 20.233983137880763,
+    "paired_min_percent": 18.317310958077314,
+    "paired_max_percent": 22.25767045438145
+  },
+  {
+    "core": "go",
+    "case": "conditional_scan",
+    "tree_ns": 4536404.975,
+    "vm_ns": 5053636.425,
+    "change_percent": 11.40179178998455,
+    "paired_change_percent": 12.409063587373726,
+    "paired_min_percent": 7.2537995794786925,
+    "paired_max_percent": 27.15872339229797
+  },
+  {
+    "core": "go",
+    "case": "metered_scan",
+    "tree_ns": 5249053.375,
+    "vm_ns": 5881140.475,
+    "change_percent": 12.041925559577681,
+    "paired_change_percent": 13.562178247044399,
+    "paired_min_percent": 9.941509560322515,
+    "paired_max_percent": 24.268896298439003
+  },
+  {
+    "core": "go",
+    "case": "point_lookup",
+    "tree_ns": 1023.2146,
+    "vm_ns": 1101.52858,
+    "change_percent": 7.653719952784099,
+    "paired_change_percent": 7.653719952784099,
+    "paired_min_percent": 5.64294139987036,
+    "paired_max_percent": 12.228568590164635
+  },
+  {
+    "core": "go",
+    "case": "point_adhoc",
+    "tree_ns": 8856.79205,
+    "vm_ns": 16320.4001,
+    "change_percent": 84.26988019889212,
+    "paired_change_percent": 87.7852411759813,
+    "paired_min_percent": 59.03353104861975,
+    "paired_max_percent": 95.32052127158161
+  },
+  {
+    "core": "go",
+    "case": "columnar_control",
+    "tree_ns": 671921.62,
+    "vm_ns": 700565.46,
+    "change_percent": 4.26297341049986,
+    "paired_change_percent": 3.067814845180572,
+    "paired_min_percent": 0.35914307981339544,
+    "paired_max_percent": 4.97494097622555
+  },
+  {
+    "core": "go",
+    "case": "expensive_control",
+    "tree_ns": 490188883.0,
+    "vm_ns": 490114929.3333333,
+    "change_percent": -0.015086769453864779,
+    "paired_change_percent": 0.18666681580759015,
+    "paired_min_percent": -0.15153831850590604,
+    "paired_max_percent": 1.3147668052760908
+  },
+  {
+    "core": "go",
+    "case": "fallback_control",
+    "tree_ns": 4428646.025,
+    "vm_ns": 4768520.2,
+    "change_percent": 7.674448874021267,
+    "paired_change_percent": 7.211695701057974,
+    "paired_min_percent": 0.9960691988486259,
+    "paired_max_percent": 9.40634849071358
+  },
+  {
+    "core": "rust",
+    "case": "arithmetic_scan",
+    "tree_ns": 5965616.525,
+    "vm_ns": 4906850.7,
+    "change_percent": -17.74780226927174,
+    "paired_change_percent": -16.785043512337893,
+    "paired_min_percent": -17.84535463415494,
+    "paired_max_percent": -0.9743794672298467
+  },
+  {
+    "core": "rust",
+    "case": "boolean_scan",
+    "tree_ns": 3066891.375,
+    "vm_ns": 2149022.825,
+    "change_percent": -29.92830321549943,
+    "paired_change_percent": -29.875145115805392,
+    "paired_min_percent": -30.367853344659135,
+    "paired_max_percent": -27.205604252381466
+  },
+  {
+    "core": "rust",
+    "case": "conditional_scan",
+    "tree_ns": 4897422.6,
+    "vm_ns": 4644407.425,
+    "change_percent": -5.166292469839129,
+    "paired_change_percent": -6.678263933526152,
+    "paired_min_percent": -10.059154530567206,
+    "paired_max_percent": -2.684871609227546
+  },
+  {
+    "core": "rust",
+    "case": "metered_scan",
+    "tree_ns": 6012173.375,
+    "vm_ns": 5048632.75,
+    "change_percent": -16.026494329099418,
+    "paired_change_percent": -16.496704633012904,
+    "paired_min_percent": -19.060452909843097,
+    "paired_max_percent": -12.67043316982458
+  },
+  {
+    "core": "rust",
+    "case": "point_lookup",
+    "tree_ns": 1606.65399,
+    "vm_ns": 1887.78771,
+    "change_percent": 17.498087438229316,
+    "paired_change_percent": 17.858207575775165,
+    "paired_min_percent": 13.95118966377873,
+    "paired_max_percent": 29.507446301993355
+  },
+  {
+    "core": "rust",
+    "case": "point_adhoc",
+    "tree_ns": 6027.08685,
+    "vm_ns": 6490.03515,
+    "change_percent": 7.681128736347986,
+    "paired_change_percent": 7.681128736347986,
+    "paired_min_percent": 2.235380525762709,
+    "paired_max_percent": 10.332235856392757
+  },
+  {
+    "core": "rust",
+    "case": "columnar_control",
+    "tree_ns": 1024939.972,
+    "vm_ns": 1035898.994,
+    "change_percent": 1.069235496652099,
+    "paired_change_percent": 0.22918881138334068,
+    "paired_min_percent": -7.280103168973473,
+    "paired_max_percent": 13.798089782176959
+  },
+  {
+    "core": "rust",
+    "case": "expensive_control",
+    "tree_ns": 293326036.3333333,
+    "vm_ns": 294958017.3333333,
+    "change_percent": 0.5563709994517607,
+    "paired_change_percent": 0.47100509021955617,
+    "paired_min_percent": 0.20451774000083134,
+    "paired_max_percent": 1.3595465475380264
+  },
+  {
+    "core": "rust",
+    "case": "fallback_control",
+    "tree_ns": 4491970.9,
+    "vm_ns": 4734922.575,
+    "change_percent": 5.408576333386295,
+    "paired_change_percent": 6.8855776657491985,
+    "paired_min_percent": 1.5737490140910637,
+    "paired_max_percent": 12.986914051469011
+  },
+  {
+    "core": "ts",
+    "case": "arithmetic_scan",
+    "tree_ns": 16393276.175,
+    "vm_ns": 16478794.325,
+    "change_percent": 0.5216660116445393,
+    "paired_change_percent": 0.7238110840891654,
+    "paired_min_percent": -13.601619543922261,
+    "paired_max_percent": 7.292609311525067
+  },
+  {
+    "core": "ts",
+    "case": "boolean_scan",
+    "tree_ns": 11113088.1,
+    "vm_ns": 12857937.2,
+    "change_percent": 15.700848263769274,
+    "paired_change_percent": 17.485270776455163,
+    "paired_min_percent": 9.703446992172559,
+    "paired_max_percent": 23.635595042209733
+  },
+  {
+    "core": "ts",
+    "case": "conditional_scan",
+    "tree_ns": 10473750.8,
+    "vm_ns": 11007328.625,
+    "change_percent": 5.094429256422628,
+    "paired_change_percent": 5.094429256422628,
+    "paired_min_percent": -13.502603735110185,
+    "paired_max_percent": 19.325791089197942
+  },
+  {
+    "core": "ts",
+    "case": "metered_scan",
+    "tree_ns": 15843751.15,
+    "vm_ns": 16494974.4,
+    "change_percent": 4.110284514283102,
+    "paired_change_percent": 3.320491246333157,
+    "paired_min_percent": -4.552919672433974,
+    "paired_max_percent": 6.244095927325777
+  },
+  {
+    "core": "ts",
+    "case": "point_lookup",
+    "tree_ns": 5722.77093,
+    "vm_ns": 6569.20048,
+    "change_percent": 14.790554442129334,
+    "paired_change_percent": 15.055579410648413,
+    "paired_min_percent": 5.522175916068961,
+    "paired_max_percent": 25.997840959614372
+  },
+  {
+    "core": "ts",
+    "case": "point_adhoc",
+    "tree_ns": 35282.56505,
+    "vm_ns": 37242.9534,
+    "change_percent": 5.5562523507626915,
+    "paired_change_percent": 6.463237293922619,
+    "paired_min_percent": 3.581806645994523,
+    "paired_max_percent": 19.228588370447874
+  },
+  {
+    "core": "ts",
+    "case": "columnar_control",
+    "tree_ns": 3340125.106,
+    "vm_ns": 3409285.644,
+    "change_percent": 2.0705972322941912,
+    "paired_change_percent": 2.6914799307430126,
+    "paired_min_percent": -1.7282305952045496,
+    "paired_max_percent": 8.950839226195217
+  },
+  {
+    "core": "ts",
+    "case": "expensive_control",
+    "tree_ns": 1901135977.6666667,
+    "vm_ns": 1843039674.0,
+    "change_percent": -3.055873138436449,
+    "paired_change_percent": -2.9827779460712134,
+    "paired_min_percent": -5.098360534750457,
+    "paired_max_percent": 11.765122144004359
+  },
+  {
+    "core": "ts",
+    "case": "fallback_control",
+    "tree_ns": 14744214.025,
+    "vm_ns": 14642092.775,
+    "change_percent": -0.6926191509892932,
+    "paired_change_percent": -0.6926191509892932,
+    "paired_min_percent": -6.290807104577667,
+    "paired_max_percent": 29.484203219961614
+  }
+]

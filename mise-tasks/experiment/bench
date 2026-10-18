@@ -6,6 +6,7 @@
 #USAGE flag "--filter <name>" help="Workload-name substring"
 #USAGE flag "--iterations <n>" help="Override iterations for smoke checks"
 #USAGE flag "--cpu <n>" help="Pin benchmark processes to one logical CPU (Linux taskset)"
+#USAGE flag "--baseline <rev>" default="172e3b0ae9f604f5284147d77ac7eb14b07917a7" help="Commit containing the original tree evaluator"
 
 require "json"
 require "open3"
@@ -35,7 +36,10 @@ commands = {
                     "--features", "expression-vm", "expression_vm_workloads", "--", "--nocapture", "--test-threads=1"]],
   "ts" => [ROOT, %w[node impl/ts/src/bin/expression_vm.ts]],
 }
-base = `git merge-base HEAD origin/master`.strip
+baseline = ENV.fetch("usage_baseline", "172e3b0ae9f604f5284147d77ac7eb14b07917a7")
+base, baseline_status = Open3.capture2("git", "rev-parse", "--verify", "#{baseline}^{commit}")
+abort "cannot resolve baseline #{baseline}" unless baseline_status.success?
+base = base.strip
 metadata = { "base" => base, "revision" => `git rev-parse HEAD`.strip, "storage" => storage, "repeats" => repeats,
              "system" => `uname -a`.strip, "started_at" => Time.now.utc.iso8601, "cpu_affinity" => cpu }
 metadata["cpu"] = File.readlines("/proc/cpuinfo").find { it.start_with?("model name") }&.strip if File.exist?("/proc/cpuinfo")

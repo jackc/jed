@@ -12,11 +12,13 @@ import (
 	"sync/atomic"
 )
 
-type expressionVMType struct{ vmLeafType uint8 }
-type expressionVMState struct {
-	vmRegisters []Value
-	vmTree      bool
-}
+type (
+	expressionVMType  struct{ vmLeafType uint8 }
+	expressionVMState struct {
+		vmRegisters []Value
+		vmTree      bool
+	}
+)
 
 func (e *rExpr) setExpressionVMType(t resolvedType) {
 	switch t.kind {
@@ -29,11 +31,13 @@ func (e *rExpr) setExpressionVMType(t resolvedType) {
 	}
 }
 
-var expressionVMRun atomic.Bool
-var expressionVMCache sync.Map
-var expressionVMCompiled atomic.Int64
-var expressionVMFallbacks atomic.Int64
-var expressionVMInstructions atomic.Int64
+var (
+	expressionVMRun          atomic.Bool
+	expressionVMCache        sync.Map
+	expressionVMCompiled     atomic.Int64
+	expressionVMFallbacks    atomic.Int64
+	expressionVMInstructions atomic.Int64
+)
 
 // SetExpressionVMExperimentForTooling selects and resets the opt-in evaluator.
 // It exists only in expression_vm builds; the host harness calls it between
@@ -105,6 +109,7 @@ func compileExpressionVM(e *rExpr, filter bool) *expressionVMProgram {
 	}
 	return p
 }
+
 func (p *expressionVMProgram) emit(i expressionVMInstruction) int {
 	pc := len(p.code)
 	p.code = append(p.code, i)

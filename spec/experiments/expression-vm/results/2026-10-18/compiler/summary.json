@@ -1,0 +1,625 @@
+[
+  {
+    "core": "go",
+    "case": "column",
+    "median_compile_ns": 123.1638,
+    "min_compile_ns": 120.7855,
+    "max_compile_ns": 123.7423
+  },
+  {
+    "core": "go",
+    "case": "param",
+    "median_compile_ns": 524.5909,
+    "min_compile_ns": 508.2854,
+    "max_compile_ns": 556.7428
+  },
+  {
+    "core": "go",
+    "case": "add",
+    "median_compile_ns": 284.2183,
+    "min_compile_ns": 266.4571,
+    "max_compile_ns": 308.3814
+  },
+  {
+    "core": "go",
+    "case": "subtract",
+    "median_compile_ns": 286.6884,
+    "min_compile_ns": 275.1106,
+    "max_compile_ns": 292.3572
+  },
+  {
+    "core": "go",
+    "case": "multiply",
+    "median_compile_ns": 269.7901,
+    "min_compile_ns": 268.1862,
+    "max_compile_ns": 276.8186
+  },
+  {
+    "core": "go",
+    "case": "divide",
+    "median_compile_ns": 276.7678,
+    "min_compile_ns": 274.44,
+    "max_compile_ns": 295.7327
+  },
+  {
+    "core": "go",
+    "case": "remainder",
+    "median_compile_ns": 270.4804,
+    "min_compile_ns": 263.0632,
+    "max_compile_ns": 274.2156
+  },
+  {
+    "core": "go",
+    "case": "negate",
+    "median_compile_ns": 145.6158,
+    "min_compile_ns": 143.7299,
+    "max_compile_ns": 152.6874
+  },
+  {
+    "core": "go",
+    "case": "wide",
+    "median_compile_ns": 530.2176,
+    "min_compile_ns": 521.7503,
+    "max_compile_ns": 550.1012
+  },
+  {
+    "core": "go",
+    "case": "narrow",
+    "median_compile_ns": 146.6965,
+    "min_compile_ns": 145.729,
+    "max_compile_ns": 149.8941
+  },
+  {
+    "core": "go",
+    "case": "equal",
+    "median_compile_ns": 272.365,
+    "min_compile_ns": 262.8271,
+    "max_compile_ns": 272.6552
+  },
+  {
+    "core": "go",
+    "case": "less",
+    "median_compile_ns": 268.2784,
+    "min_compile_ns": 263.1709,
+    "max_compile_ns": 271.8869
+  },
+  {
+    "core": "go",
+    "case": "greater_equal",
+    "median_compile_ns": 267.3282,
+    "min_compile_ns": 262.2702,
+    "max_compile_ns": 273.5977
+  },
+  {
+    "core": "go",
+    "case": "bool_equal",
+    "median_compile_ns": 265.2248,
+    "min_compile_ns": 262.1164,
+    "max_compile_ns": 274.7545
+  },
+  {
+    "core": "go",
+    "case": "is_null",
+    "median_compile_ns": 145.0148,
+    "min_compile_ns": 144.5041,
+    "max_compile_ns": 146.8357
+  },
+  {
+    "core": "go",
+    "case": "is_not_null",
+    "median_compile_ns": 143.0855,
+    "min_compile_ns": 143.0398,
+    "max_compile_ns": 145.7379
+  },
+  {
+    "core": "go",
+    "case": "not",
+    "median_compile_ns": 143.8906,
+    "min_compile_ns": 143.6693,
+    "max_compile_ns": 151.2481
+  },
+  {
+    "core": "go",
+    "case": "and",
+    "median_compile_ns": 275.7177,
+    "min_compile_ns": 268.4006,
+    "max_compile_ns": 276.0883
+  },
+  {
+    "core": "go",
+    "case": "or",
+    "median_compile_ns": 273.8369,
+    "min_compile_ns": 267.7427,
+    "max_compile_ns": 279.1377
+  },
+  {
+    "core": "go",
+    "case": "nested_bool",
+    "median_compile_ns": 844.6853,
+    "min_compile_ns": 842.2193,
+    "max_compile_ns": 846.6244
+  },
+  {
+    "core": "go",
+    "case": "skip_divide",
+    "median_compile_ns": 517.0477,
+    "min_compile_ns": 511.6294,
+    "max_compile_ns": 522.0274
+  },
+  {
+    "core": "go",
+    "case": "skip_or",
+    "median_compile_ns": 519.5967,
+    "min_compile_ns": 507.2512,
+    "max_compile_ns": 521.7072
+  },
+  {
+    "core": "go",
+    "case": "filter_null",
+    "median_compile_ns": 512.6388,
+    "min_compile_ns": 507.5384,
+    "max_compile_ns": 514.7146
+  },
+  {
+    "core": "go",
+    "case": "filter_chain",
+    "median_compile_ns": 850.2691,
+    "min_compile_ns": 825.0777,
+    "max_compile_ns": 854.0321
+  },
+  {
+    "core": "go",
+    "case": "filter_or",
+    "median_compile_ns": 854.625,
+    "min_compile_ns": 821.1074,
+    "max_compile_ns": 868.2232
+  },
+  {
+    "core": "go",
+    "case": "searched_case",
+    "median_compile_ns": 877.7334,
+    "min_compile_ns": 857.9329,
+    "max_compile_ns": 917.9936
+  },
+  {
+    "core": "go",
+    "case": "simple_case",
+    "median_compile_ns": 883.5135,
+    "min_compile_ns": 859.113,
+    "max_compile_ns": 903.3721
+  },
+  {
+    "core": "go",
+    "case": "coalesce",
+    "median_compile_ns": 510.6735,
+    "min_compile_ns": 497.992,
+    "max_compile_ns": 513.0553
+  },
+  {
+    "core": "go",
+    "case": "coalesce_lazy",
+    "median_compile_ns": 514.7207,
+    "min_compile_ns": 499.2537,
+    "max_compile_ns": 521.6902
+  },
+  {
+    "core": "rust",
+    "case": "column",
+    "median_compile_ns": 50.7082,
+    "min_compile_ns": 50.5644,
+    "max_compile_ns": 55.2172
+  },
+  {
+    "core": "rust",
+    "case": "param",
+    "median_compile_ns": 85.6537,
+    "min_compile_ns": 84.6713,
+    "max_compile_ns": 85.6706
+  },
+  {
+    "core": "rust",
+    "case": "add",
+    "median_compile_ns": 69.2652,
+    "min_compile_ns": 67.8686,
+    "max_compile_ns": 72.7719
+  },
+  {
+    "core": "rust",
+    "case": "subtract",
+    "median_compile_ns": 69.5179,
+    "min_compile_ns": 69.3604,
+    "max_compile_ns": 74.2461
+  },
+  {
+    "core": "rust",
+    "case": "multiply",
+    "median_compile_ns": 69.2928,
+    "min_compile_ns": 67.5022,
+    "max_compile_ns": 69.8608
+  },
+  {
+    "core": "rust",
+    "case": "divide",
+    "median_compile_ns": 69.2034,
+    "min_compile_ns": 68.2257,
+    "max_compile_ns": 71.4127
+  },
+  {
+    "core": "rust",
+    "case": "remainder",
+    "median_compile_ns": 68.5098,
+    "min_compile_ns": 67.903,
+    "max_compile_ns": 71.5339
+  },
+  {
+    "core": "rust",
+    "case": "negate",
+    "median_compile_ns": 23.521,
+    "min_compile_ns": 22.1627,
+    "max_compile_ns": 23.7794
+  },
+  {
+    "core": "rust",
+    "case": "wide",
+    "median_compile_ns": 90.6506,
+    "min_compile_ns": 86.128,
+    "max_compile_ns": 90.9337
+  },
+  {
+    "core": "rust",
+    "case": "narrow",
+    "median_compile_ns": 21.5186,
+    "min_compile_ns": 21.427,
+    "max_compile_ns": 21.5254
+  },
+  {
+    "core": "rust",
+    "case": "equal",
+    "median_compile_ns": 70.2146,
+    "min_compile_ns": 70.0667,
+    "max_compile_ns": 71.3476
+  },
+  {
+    "core": "rust",
+    "case": "less",
+    "median_compile_ns": 77.7767,
+    "min_compile_ns": 76.5553,
+    "max_compile_ns": 78.2022
+  },
+  {
+    "core": "rust",
+    "case": "greater_equal",
+    "median_compile_ns": 76.8242,
+    "min_compile_ns": 76.5945,
+    "max_compile_ns": 78.0252
+  },
+  {
+    "core": "rust",
+    "case": "bool_equal",
+    "median_compile_ns": 77.2318,
+    "min_compile_ns": 76.5174,
+    "max_compile_ns": 78.8835
+  },
+  {
+    "core": "rust",
+    "case": "is_null",
+    "median_compile_ns": 21.8711,
+    "min_compile_ns": 21.5231,
+    "max_compile_ns": 21.8776
+  },
+  {
+    "core": "rust",
+    "case": "is_not_null",
+    "median_compile_ns": 21.7975,
+    "min_compile_ns": 21.7326,
+    "max_compile_ns": 22.1976
+  },
+  {
+    "core": "rust",
+    "case": "not",
+    "median_compile_ns": 22.299,
+    "min_compile_ns": 22.0376,
+    "max_compile_ns": 22.4677
+  },
+  {
+    "core": "rust",
+    "case": "and",
+    "median_compile_ns": 71.7597,
+    "min_compile_ns": 70.1788,
+    "max_compile_ns": 71.8077
+  },
+  {
+    "core": "rust",
+    "case": "or",
+    "median_compile_ns": 75.4524,
+    "min_compile_ns": 74.2572,
+    "max_compile_ns": 75.7047
+  },
+  {
+    "core": "rust",
+    "case": "nested_bool",
+    "median_compile_ns": 113.2423,
+    "min_compile_ns": 112.3091,
+    "max_compile_ns": 114.3395
+  },
+  {
+    "core": "rust",
+    "case": "skip_divide",
+    "median_compile_ns": 108.7585,
+    "min_compile_ns": 107.5272,
+    "max_compile_ns": 109.2722
+  },
+  {
+    "core": "rust",
+    "case": "skip_or",
+    "median_compile_ns": 111.4202,
+    "min_compile_ns": 110.526,
+    "max_compile_ns": 112.4675
+  },
+  {
+    "core": "rust",
+    "case": "filter_null",
+    "median_compile_ns": 97.7026,
+    "min_compile_ns": 97.1338,
+    "max_compile_ns": 98.1412
+  },
+  {
+    "core": "rust",
+    "case": "filter_chain",
+    "median_compile_ns": 125.9638,
+    "min_compile_ns": 124.7291,
+    "max_compile_ns": 126.3586
+  },
+  {
+    "core": "rust",
+    "case": "filter_or",
+    "median_compile_ns": 136.6114,
+    "min_compile_ns": 136.4927,
+    "max_compile_ns": 137.2022
+  },
+  {
+    "core": "rust",
+    "case": "searched_case",
+    "median_compile_ns": 135.1329,
+    "min_compile_ns": 134.8205,
+    "max_compile_ns": 135.6678
+  },
+  {
+    "core": "rust",
+    "case": "simple_case",
+    "median_compile_ns": 135.0481,
+    "min_compile_ns": 133.8258,
+    "max_compile_ns": 135.8771
+  },
+  {
+    "core": "rust",
+    "case": "coalesce",
+    "median_compile_ns": 101.6272,
+    "min_compile_ns": 100.8169,
+    "max_compile_ns": 101.7998
+  },
+  {
+    "core": "rust",
+    "case": "coalesce_lazy",
+    "median_compile_ns": 106.3209,
+    "min_compile_ns": 105.1516,
+    "max_compile_ns": 106.3602
+  },
+  {
+    "core": "rust",
+    "case": "fallback_function",
+    "median_compile_ns": 12.7598,
+    "min_compile_ns": 12.6335,
+    "max_compile_ns": 13.0777
+  },
+  {
+    "core": "rust",
+    "case": "fallback_decimal",
+    "median_compile_ns": 11.1775,
+    "min_compile_ns": 10.9611,
+    "max_compile_ns": 11.1836
+  },
+  {
+    "core": "ts",
+    "case": "column",
+    "median_compile_ns": 383.7667,
+    "min_compile_ns": 360.9671,
+    "max_compile_ns": 392.0238
+  },
+  {
+    "core": "ts",
+    "case": "param",
+    "median_compile_ns": 456.4588,
+    "min_compile_ns": 357.5855,
+    "max_compile_ns": 503.3894
+  },
+  {
+    "core": "ts",
+    "case": "add",
+    "median_compile_ns": 239.8414,
+    "min_compile_ns": 130.755,
+    "max_compile_ns": 248.7144
+  },
+  {
+    "core": "ts",
+    "case": "subtract",
+    "median_compile_ns": 65.2712,
+    "min_compile_ns": 57.388,
+    "max_compile_ns": 251.2274
+  },
+  {
+    "core": "ts",
+    "case": "multiply",
+    "median_compile_ns": 66.9205,
+    "min_compile_ns": 51.4516,
+    "max_compile_ns": 143.4836
+  },
+  {
+    "core": "ts",
+    "case": "divide",
+    "median_compile_ns": 59.5353,
+    "min_compile_ns": 50.3036,
+    "max_compile_ns": 276.8314
+  },
+  {
+    "core": "ts",
+    "case": "remainder",
+    "median_compile_ns": 59.585,
+    "min_compile_ns": 49.4775,
+    "max_compile_ns": 61.5439
+  },
+  {
+    "core": "ts",
+    "case": "negate",
+    "median_compile_ns": 457.0521,
+    "min_compile_ns": 120.8428,
+    "max_compile_ns": 483.799
+  },
+  {
+    "core": "ts",
+    "case": "wide",
+    "median_compile_ns": 916.2661,
+    "min_compile_ns": 904.8548,
+    "max_compile_ns": 1181.2652
+  },
+  {
+    "core": "ts",
+    "case": "narrow",
+    "median_compile_ns": 47.445,
+    "min_compile_ns": 39.4851,
+    "max_compile_ns": 56.3265
+  },
+  {
+    "core": "ts",
+    "case": "equal",
+    "median_compile_ns": 205.0937,
+    "min_compile_ns": 153.8651,
+    "max_compile_ns": 606.6102
+  },
+  {
+    "core": "ts",
+    "case": "less",
+    "median_compile_ns": 68.3143,
+    "min_compile_ns": 62.1241,
+    "max_compile_ns": 229.9619
+  },
+  {
+    "core": "ts",
+    "case": "greater_equal",
+    "median_compile_ns": 80.0085,
+    "min_compile_ns": 65.9421,
+    "max_compile_ns": 83.4279
+  },
+  {
+    "core": "ts",
+    "case": "bool_equal",
+    "median_compile_ns": 75.4214,
+    "min_compile_ns": 62.2203,
+    "max_compile_ns": 461.96
+  },
+  {
+    "core": "ts",
+    "case": "is_null",
+    "median_compile_ns": 126.8598,
+    "min_compile_ns": 118.5494,
+    "max_compile_ns": 127.5354
+  },
+  {
+    "core": "ts",
+    "case": "is_not_null",
+    "median_compile_ns": 181.8602,
+    "min_compile_ns": 142.6136,
+    "max_compile_ns": 476.4003
+  },
+  {
+    "core": "ts",
+    "case": "not",
+    "median_compile_ns": 226.1024,
+    "min_compile_ns": 208.3026,
+    "max_compile_ns": 284.3102
+  },
+  {
+    "core": "ts",
+    "case": "and",
+    "median_compile_ns": 156.0216,
+    "min_compile_ns": 134.5505,
+    "max_compile_ns": 168.6023
+  },
+  {
+    "core": "ts",
+    "case": "or",
+    "median_compile_ns": 307.7618,
+    "min_compile_ns": 301.3413,
+    "max_compile_ns": 319.8302
+  },
+  {
+    "core": "ts",
+    "case": "nested_bool",
+    "median_compile_ns": 565.5731,
+    "min_compile_ns": 532.6262,
+    "max_compile_ns": 637.8454
+  },
+  {
+    "core": "ts",
+    "case": "skip_divide",
+    "median_compile_ns": 128.7154,
+    "min_compile_ns": 127.6778,
+    "max_compile_ns": 321.9399
+  },
+  {
+    "core": "ts",
+    "case": "skip_or",
+    "median_compile_ns": 370.7871,
+    "min_compile_ns": 114.9208,
+    "max_compile_ns": 399.1286
+  },
+  {
+    "core": "ts",
+    "case": "filter_null",
+    "median_compile_ns": 616.8301,
+    "min_compile_ns": 577.1338,
+    "max_compile_ns": 691.8343
+  },
+  {
+    "core": "ts",
+    "case": "filter_chain",
+    "median_compile_ns": 294.7251,
+    "min_compile_ns": 284.1872,
+    "max_compile_ns": 347.2066
+  },
+  {
+    "core": "ts",
+    "case": "filter_or",
+    "median_compile_ns": 232.5259,
+    "min_compile_ns": 185.9819,
+    "max_compile_ns": 390.6273
+  },
+  {
+    "core": "ts",
+    "case": "searched_case",
+    "median_compile_ns": 691.5135,
+    "min_compile_ns": 682.267,
+    "max_compile_ns": 834.5436
+  },
+  {
+    "core": "ts",
+    "case": "simple_case",
+    "median_compile_ns": 1018.6599,
+    "min_compile_ns": 670.4638,
+    "max_compile_ns": 1322.228
+  },
+  {
+    "core": "ts",
+    "case": "coalesce",
+    "median_compile_ns": 267.5316,
+    "min_compile_ns": 237.2096,
+    "max_compile_ns": 269.2615
+  },
+  {
+    "core": "ts",
+    "case": "coalesce_lazy",
+    "median_compile_ns": 534.2127,
+    "min_compile_ns": 409.3576,
+    "max_compile_ns": 732.1905
+  }
+]

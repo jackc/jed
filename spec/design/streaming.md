@@ -88,6 +88,12 @@ Volcano operator-tree rewrite, and *not* a bytecode VM. The rationale:
 
 ### Relationship to a future bytecode VM
 
+The later [expression VM experiment](expression-vm-experiment.md) demonstrates that independently
+lowered physical programs can preserve the same cost/error contract without identical bytecode.
+It remains opt-in: selective Rust scalar scans improve, while setup costs, other-core results and
+resource accounting do not justify replacing the executor.
+
+
 A bytecode VM (SQLite's VDBE) and a Volcano tree are both pull/demand-driven — **a VDBE is just the
 *compiled* form** (the operator tree linearized into an opcode loop with a program counter). No
 scope choice here forecloses one, and the chosen scope is a **step toward** one:
