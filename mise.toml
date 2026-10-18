@@ -317,6 +317,46 @@ run = [{ task = "unit:rust" }, { task = "unit:go" }, { task = "unit:ts" }]
 description = "Run the Rust core's unit + integration tests (release)"
 run = "cargo test --release --manifest-path impl/rust/Cargo.toml"
 
+[tasks."experiment:go"]
+description = "Check the opt-in Go expression VM (internal evaluator equivalence)"
+dir = "{{config_root}}/impl/go"
+run = "go test -tags expression_vm -run '^TestExpressionVMDifferential$' -count=1"
+
+[tasks."experiment:go:bench"]
+description = "Run one Go expression VM timing process (JED_EXPR_VM_MODE=tree|vm)"
+dir = "{{config_root}}/impl/go"
+run = "go test -tags expression_vm -run '^TestExpressionVMBenchmark$' -count=1 -v"
+
+[tasks."experiment:go:compile"]
+description = "Measure Go expression compilation separately from query timing"
+dir = "{{config_root}}/impl/go"
+env = { JED_EXPR_VM_COMPILE = "1" }
+run = "go test -tags expression_vm -run '^TestExpressionVMCompile$' -count=1 -v"
+
+[tasks."experiment:rust"]
+description = "Check the opt-in Rust expression VM"
+run = "cargo test --release --manifest-path impl/rust/Cargo.toml --features expression-vm expression_vm -- --nocapture"
+
+[tasks."experiment:ts"]
+description = "Check the opt-in TypeScript expression VM"
+dir = "{{config_root}}/impl/ts"
+run = "node --test tests/expression_vm.test.ts"
+
+[tasks."experiment:conformance:rust"]
+description = "Walk the corpus with the opt-in Rust VM (set JED_EXPR_VM_MODE=vm)"
+run = [
+  "cargo run --release --quiet --manifest-path impl/rust/Cargo.toml --features expression-vm --bin conformance",
+  "cargo run --release --quiet --manifest-path impl/rust/Cargo.toml --features expression-vm --bin conformance -- disk",
+]
+
+[tasks."experiment:conformance:go"]
+description = "Walk the corpus with the opt-in Go VM (set JED_EXPR_VM_MODE=vm)"
+dir = "{{config_root}}/impl/go"
+run = [
+  "go run -tags expression_vm ./cmd/conformance",
+  "go run -tags expression_vm ./cmd/conformance disk",
+]
+
 [tasks."unit:go"]
 description = "Run the Go core's unit tests"
 dir = "{{config_root}}/impl/go"

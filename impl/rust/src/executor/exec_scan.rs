@@ -1120,6 +1120,8 @@ impl Engine {
                 self.session.env.functions(),
             );
             let stream = StreamingScan {
+                #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+                expression_vm: expression_vm::Site::new(&plan, &snap, &bound_params),
                 engine: snap,
                 plan,
                 params: bound_params,
@@ -1151,6 +1153,14 @@ impl Engine {
         let mut meter = snap.session.new_meter();
         meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
         let stream = BufferedScan {
+            #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+            expression_vm: expression_vm::Site::with_filter(
+                &plan,
+                &snap,
+                &bound_params,
+                None,
+                true,
+            ),
             engine: snap,
             plan,
             params: bound_params,

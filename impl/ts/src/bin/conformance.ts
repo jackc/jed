@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
+import { withExpressionVm } from "../expression_vm.ts";
 import { Decimal } from "../decimal.ts";
 import { OwnerActor } from "./conformance_service.ts";
 import { DEFAULT_WORK_MEM } from "../spill.ts";
@@ -1710,4 +1711,4 @@ function main(): number {
   return failed !== 0 ? 1 : 0;
 }
 
-process.exit(main());
+process.exit(withExpressionVm(process.env.JED_EXPR_VM_MODE === "vm", main));

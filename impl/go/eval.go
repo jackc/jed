@@ -1278,6 +1278,10 @@ func dateClockValue(exec *engine, rng *stmtRng, m *costMeter, offsetDays int64) 
 // TRUE), PostgreSQL's qual-list rule; each AND node charges on entry as in eval, and every other
 // node evaluates as a value (spec/design/cost.md §3).
 func (e *rExpr) evalFilter(row storedRow, env *evalEnv, m *costMeter) (bool, error) {
+	if expressionVMEnabled && m.expressionVMActive() {
+		v, err := e.evalExpressionVM(row, env, m, true)
+		return v.IsTrue(), err
+	}
 	if e.kind != reAnd {
 		v, err := e.eval(row, env, m)
 		return v.IsTrue(), err
@@ -1294,6 +1298,9 @@ func (e *rExpr) evalFilter(row storedRow, env *evalEnv, m *costMeter) (bool, err
 }
 
 func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
+	if expressionVMEnabled && m.expressionVMActive() {
+		return e.evalExpressionVM(row, env, m, false)
+	}
 	// Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). eval recurses once
 	// per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot;
 	// it is a no-op when no ceiling is set (spec/design/cost.md §6).

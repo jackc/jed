@@ -149,6 +149,10 @@ pub use value::{ArrayVal, RangeVal, Value};
 /// relations (introspection.md) — never these accessors.
 #[doc(hidden)]
 pub mod tooling {
+    #[cfg(feature = "expression-vm")]
+    pub mod expression_vm {
+        pub use crate::executor::expression_vm::{Stats, reset_stats, set_enabled, stats};
+    }
     // The CLI renders query results + dumps schema using these internal types (returned by
     // `Database::table` / `Session::table`).
     pub use crate::ast::CheckOption;

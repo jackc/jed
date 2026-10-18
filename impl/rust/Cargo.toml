@@ -27,6 +27,8 @@ required-features = ["sim"]
 
 [features]
 sim = []
+expression-vm = []
+expression-vm-baseline = ["expression-vm"]
 
 [dependencies]
 # OS entropy for the uuid generators' production path (spec/design/entropy.md §6). Rust `std`

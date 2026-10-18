@@ -83,7 +83,12 @@ impl ScratchRow {
 /// predicate the span compiler cannot help with.
 pub(crate) enum LaneFilter<'a> {
     Span(SpanPred<'a>),
-    Plain { expr: &'a RExpr, cols: Vec<usize> },
+    Plain {
+        expr: &'a RExpr,
+        cols: Vec<usize>,
+        #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+        vm: Option<std::cell::RefCell<expression_vm::Runner>>,
+    },
 }
 
 impl<'a> LaneFilter<'a> {
@@ -100,6 +105,9 @@ impl<'a> LaneFilter<'a> {
         LaneFilter::Plain {
             expr: filter,
             cols: (0..mask.len()).filter(|&c| mask[c]).collect(),
+            #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+            vm: expression_vm::Runner::compile_lane(filter, col_types, env.params)
+                .map(std::cell::RefCell::new),
         }
     }
 
@@ -115,11 +123,18 @@ impl<'a> LaneFilter<'a> {
         scratch.next_record();
         match self {
             LaneFilter::Span(p) => p.eval_filter(node, i, scratch, env, m),
-            LaneFilter::Plain { expr, cols } => {
+            LaneFilter::Plain { expr, cols, .. } => {
                 for &c in cols {
                     scratch.vals[c] = node.col_at(i, c)?;
                 }
                 scratch.all_filled = scratch.generation;
+                #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+                if let LaneFilter::Plain { vm: Some(vm), .. } = self {
+                    return vm
+                        .borrow_mut()
+                        .eval(&scratch.vals, env, m)
+                        .map(|v| v.is_true());
+                }
                 expr.eval_filter(&scratch.vals, env, m)
             }
         }

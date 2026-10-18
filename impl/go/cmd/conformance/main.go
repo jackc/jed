@@ -108,6 +108,7 @@ func run() int {
 
 	passed, failed, skipped := 0, 0, 0
 	for _, file := range files {
+		resetExpressionVMExperiment()
 		data, err := os.ReadFile(file)
 		if err != nil {
 			fmt.Printf("FAIL %s: %v\n", file, err)

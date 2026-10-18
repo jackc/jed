@@ -1,0 +1,159 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure the opt-in expression VM sequentially across all cores, checking answers and costs"
+#USAGE flag "--repeats <n>" default="5" help="Independent process pairs per core"
+#USAGE flag "--storage <kind>" default="disk" help="memory or disk"
+#USAGE flag "--filter <name>" help="Workload-name substring"
+#USAGE flag "--iterations <n>" help="Override iterations for smoke checks"
+#USAGE flag "--cpu <n>" help="Pin benchmark processes to one logical CPU (Linux taskset)"
+
+require "json"
+require "open3"
+require "time"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+repeats = Integer(ENV.fetch("usage_repeats", "5"))
+storage = ENV.fetch("usage_storage", "disk")
+cpu = ENV["usage_cpu"] && Integer(ENV["usage_cpu"])
+abort "CPU must be nonnegative" if cpu && cpu.negative?
+abort "positive repeats and memory|disk storage required" unless repeats.positive? && %w[memory disk].include?(storage)
+dir = File.join(ROOT, "bench/results/expression-vm-#{stamp}-#{Process.pid}")
+FileUtils.mkdir_p(dir)
+env = { "JED_EXPR_VM_STORAGE" => storage }
+env["JED_EXPR_VM_INPUTS"] = File.join(ROOT, "spec/experiments/expression-vm")
+env["JED_EXPR_VM_FILTER"] = ENV["usage_filter"] if ENV["usage_filter"]
+env["JED_EXPR_VM_ITERATIONS"] = ENV["usage_iterations"] if ENV["usage_iterations"]
+workloads_path = File.join(ROOT, "spec/experiments/expression-vm/workloads.tsv")
+workloads_hash = Digest::SHA256.file(workloads_path).hexdigest
+expected_names = File.readlines(workloads_path).reject { it.strip.empty? || it.start_with?("#") }
+                     .map { it.split("\t").first }.select { it.include?(env.fetch("JED_EXPR_VM_FILTER", "")) }.sort
+abort "no matching workloads" if expected_names.empty?
+commands = {
+  "go" => [GO_DIR, %w[go test -tags expression_vm -run ^TestExpressionVMBenchmark$ -count=1 -v]],
+  "rust" => [ROOT, ["cargo", "test", "--release", "--manifest-path", RUST_MANIFEST,
+                    "--features", "expression-vm", "expression_vm_workloads", "--", "--nocapture", "--test-threads=1"]],
+  "ts" => [ROOT, %w[node impl/ts/src/bin/expression_vm.ts]],
+}
+base = `git merge-base HEAD origin/master`.strip
+metadata = { "base" => base, "revision" => `git rev-parse HEAD`.strip, "storage" => storage, "repeats" => repeats,
+             "system" => `uname -a`.strip, "started_at" => Time.now.utc.iso8601, "cpu_affinity" => cpu }
+metadata["cpu"] = File.readlines("/proc/cpuinfo").find { it.start_with?("model name") }&.strip if File.exist?("/proc/cpuinfo")
+sources = `git ls-files --cached --others --exclude-standard`.lines.map(&:chomp).select do |path|
+  path.match?(%r{\Aimpl/(go|rust|ts)/.*\.(go|rs|ts)\z}) || path == "impl/rust/Cargo.toml"
+end.sort
+source_hash = Digest::SHA256.new
+sources.each { |path| source_hash.update(path).update("\0").update(File.binread(path)).update("\0") }
+metadata["source_sha256"] = source_hash.hexdigest
+metadata["workloads_sha256"] = workloads_hash
+metadata["runner_sha256"] = Digest::SHA256.file(__FILE__).hexdigest
+%w[rustc go node ruby].each do |tool|
+  version, = Open3.capture2(tool, tool == "go" ? "version" : "--version")
+  metadata[tool] = version.strip
+end
+File.write(File.join(dir, "environment.json"), JSON.pretty_generate(metadata) + "\n")
+# TypeScript has no compile-time feature gate. Use the original evaluator in a disposable
+# source tree, with the identical host driver, so disabled VM hooks cannot flatter the VM.
+ts_baseline = File.join(dir, "baseline/impl/ts")
+FileUtils.mkdir_p(ts_baseline)
+FileUtils.cp_r(File.join(TS_DIR, "src"), ts_baseline)
+FileUtils.cp(File.join(TS_DIR, "package.json"), ts_baseline)
+File.symlink(File.join(TS_DIR, "node_modules"), File.join(ts_baseline, "node_modules"))
+File.symlink(File.join(TS_DIR, "jed_lock.node"), File.join(ts_baseline, "jed_lock.node"))
+original, status = Open3.capture2("git", "show", "#{base}:impl/ts/src/eval.ts")
+abort "cannot load baseline evaluator" unless status.success?
+File.write(File.join(ts_baseline, "src/eval.ts"), original)
+File.write(File.join(ts_baseline, "src/expression_vm.ts"), <<~TS)
+  export const expressionVmStats = { compiled: 0, fallbacks: 0, instructions: 0, slots: 0 };
+  export function resetExpressionVmStats(_clear = false): void {}
+  export function withExpressionVm<T>(_mode: boolean, run: () => T): T { return run(); }
+TS
+native = File.join(TS_DIR, "native-lock")
+File.symlink(native, File.join(ts_baseline, "native-lock"))
+results = []
+repeats.times do |repeat|
+  commands.each do |core, (cwd, argv)|
+    modes = repeat.even? ? %w[tree vm] : %w[vm tree]
+    modes.each do |mode|
+      command = argv.dup
+      if core == "go" && mode == "tree"
+        command[command.index("expression_vm")] = "expression_vm,expression_vm_baseline"
+      end
+      if core == "rust" && mode == "tree"
+        command[command.index("expression-vm")] = "expression-vm,expression-vm-baseline"
+      end
+      command = ["node", File.join(ts_baseline, "src/bin/expression_vm.ts")] if core == "ts" && mode == "tree"
+      command = ["taskset", "-c", cpu.to_s, *command] if cpu
+      label = "#{core}-#{mode}-#{repeat + 1}"
+      puts "#{label} (#{storage})"
+      $stdout.flush
+      process_rows = []
+      File.open(File.join(dir, "#{label}.log"), "w") do |log|
+        Open3.popen2e(env.merge("JED_EXPR_VM_MODE" => mode), *command, chdir: cwd) do |stdin, pipe, waiter|
+          stdin.close
+          pipe.each_line do |line|
+            log.write(line)
+            start = line.index('{"')
+            next unless start
+
+            row = JSON.parse(line[start..])
+            next unless row.key?("core")
+            abort "wrong core/mode in #{label}" unless row.fetch("core") == core && row.fetch("mode") == mode
+            abort "wrong storage in #{label}" unless row.fetch("storage") == storage
+            row["repeat"] = repeat + 1
+            process_rows << row
+          end
+          log.flush
+          abort "#{label} failed: #{File.read(log.path)}" unless waiter.value.success?
+        end
+      end
+      names = process_rows.map { it.fetch("case") }.sort
+      abort "#{label}: expected #{expected_names.inspect}, got #{names.inspect}" unless names == expected_names
+      if mode == "vm"
+        process_rows.each do |row|
+          next unless %w[arithmetic_scan boolean_scan conditional_scan metered_scan].include?(row.fetch("case"))
+
+          abort "VM unused in #{label} #{row['case']}" unless row.fetch("compiled").positive?
+          abort "VM did not evaluate rows in #{label}" if row.key?("evaluations") && !row["evaluations"].positive?
+        end
+      end
+      results.concat(process_rows)
+      File.write(File.join(dir, "results.jsonl"), results.map { JSON.generate(it) }.join("\n") + "\n")
+    end
+  end
+end
+final_source_hash = Digest::SHA256.new
+sources.each { |path| final_source_hash.update(path).update("\0").update(File.binread(path)).update("\0") }
+abort "engine sources changed during timing" unless final_source_hash.hexdigest == metadata["source_sha256"]
+abort "workloads changed during timing" unless Digest::SHA256.file(workloads_path).hexdigest == workloads_hash
+
+# Core drivers use the same FNV bytes; normalize hex/decimal encodings before comparing.
+def checksum(value) = Integer(value.to_s, 16)
+
+results.group_by { it.fetch("case") }.each do |name, rows|
+  signatures = rows.map { [checksum(it.fetch("checksum")), it.fetch("cost").to_i] }.uniq
+  abort "answer/cost mismatch for #{name}: #{rows.inspect}" unless signatures.length == 1
+end
+def median(values)
+  ordered = values.sort
+  mid = ordered.length / 2
+  ordered.length.odd? ? ordered[mid] : (ordered[mid - 1] + ordered[mid]) / 2.0
+end
+summary = results.group_by { [it.fetch("core"), it.fetch("case")] }.map do |(core, name), rows|
+  modes = rows.group_by { it.fetch("mode") }
+  times = modes.transform_values { |samples| median(samples.map { it.fetch("elapsed_ns").to_f / it.fetch("iterations") }) }
+  paired = rows.group_by { it.fetch("repeat") }.values.map do |samples|
+    pair = samples.to_h { [it.fetch("mode"), it.fetch("elapsed_ns").to_f / it.fetch("iterations")] }
+    (pair.fetch("vm") / pair.fetch("tree") - 1) * 100
+  end
+  { "core" => core, "case" => name, "tree_ns" => times.fetch("tree"), "vm_ns" => times.fetch("vm"),
+    "change_percent" => (times.fetch("vm") / times.fetch("tree") - 1) * 100,
+    "paired_change_percent" => median(paired), "paired_min_percent" => paired.min, "paired_max_percent" => paired.max }
+end
+File.write(File.join(dir, "summary.json"), JSON.pretty_generate(summary) + "\n")
+puts "core  workload                 tree µs       VM µs     change"
+summary.each do |r|
+  puts format("%-5s %-22s %11.2f %11.2f %+9.2f%%", r["core"], r["case"],
+              r["tree_ns"] / 1000, r["vm_ns"] / 1000, r["paired_change_percent"])
+end
+puts "Verified checksums/costs. Results: #{dir}"

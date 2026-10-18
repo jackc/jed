@@ -57,8 +57,10 @@ These are internal evaluator equivalence tests, not replacements for the SQL cor
 19th b, 23rd p, and 29th q is NULL. Setup and warmup are excluded from timing.
 Columns are separated by literal tabs: name, execution (`prepared` or `adhoc`), iterations,
 SQL. Prepared queries are prepared once; ad-hoc queries include parsing/planning on each call.
-Every timed query is fully drained. Checksums consume every value outside or inside timing
-consistently in both modes. Cost and checksum must match. A metered scan control installs a
+Every timed query is fully drained and its row/cell count consumed. Full FNV-1a checksums
+(rendered UTF-8, NUL after each cell, newline after each row) are verified before and after
+timing. Rendering/hashing is excluded from the timed drain, especially because per-byte
+BigInt hashing in TS would overwhelm the engine work. Cost and checksum must match. A metered scan control installs a
 nonbinding cost ceiling; no speculative batching may change deterministic abort behavior.
 
 Run cores sequentially, with independent processes and alternating tree/VM order. Report
@@ -66,10 +68,63 @@ paired process medians, not the fastest sample. Report preparation/compilation o
 program/cache footprint and allocations where measurable, and state where instrumentation or
 coverage differs across cores. Do not compare absolute times across languages as a VM effect.
 
+The disk workload closes and reopens its database after setup, then warms the read path.
+Scan workloads warm three executions; point workloads warm up to 100. Go's baseline build
+tag and Rust's baseline feature compile the evaluator hooks away. TypeScript's baseline is
+a disposable source tree with the base revision's original evaluator and the same host driver,
+so the tree walker does not pay disabled experimental checks on each recursive node.
+
 ## Decision gate
 
 Correctness is mandatory: shared SQL corpus, internal differential checks including budget
 boundaries, and existing resource/stack tests. Performance adoption requires material gains
 on real expression-heavy queries without meaningful regressions in point lookup, ad-hoc,
 columnar and expensive-function controls. Microbenchmarks alone do not justify adoption.
-No new dependency is needed. Results and a decision will be recorded here after measurement.
+No new dependency is needed. Results and a decision are recorded below after measurement.
+
+## Implementations and measurement limits
+
+The experiments deliberately share behavior, not a physical opcode layout:
+
+- **Go:** `-tags expression_vm` enables a process cache keyed by retained expression pointer
+  and value/filter context. A meter owns the reusable registers. The ordinary build uses empty
+  annotation/state types and constant-folds its hooks away. The separate
+  `expression_vm,expression_vm_baseline` build compiles the evaluator hooks away while retaining
+  the experiment driver. It still has the experiment's larger expression/meter layout, so this
+  is an execution baseline, not an assertion of unchanged production object sizes. The cache is
+  reset between workloads; its unbounded retention is unsuitable for adoption as written.
+- **Rust:** `--features expression-vm` uses compact integer/boolean/NULL registers and statically
+  checks input kinds. Programs and scratch belong to the cursor or plain columnar predicate.
+  Programs compile once per execution, including prepared executions; no plan is mutated and no
+  process cache retains source trees. `expression-vm-baseline` removes the production hooks and
+  fields while retaining the test driver. A thread-local evaluation counter remains in the VM
+  measurement to demonstrate that benchmark rows actually execute it.
+- **TypeScript:** an internal synchronous scope opts into identity-keyed WeakMap program caches;
+  execution environments own reusable scratch, with separate scratch on reentrancy and cleanup
+  on errors. Type-erased column/parameter nodes mean this VM is only partially specialized:
+  existing generic comparison/cast kernels also handle loaded noninteger values, and date
+  subtraction retains its source-family dispatch despite its integer result type. Unsupported
+  expression kinds fall back as a whole. The production entrypoints never opt into the scope,
+  but the branch adds disabled hooks; the clean benchmark baseline therefore restores the
+  original evaluator in an isolated copy, rather than measuring those hooks as tree cost.
+
+No implementation reads an environment variable or clock inside a scalar kernel. Experiment
+drivers read host configuration; compiler microbenchmarks read time in the harness. The normal
+planner, schema invalidation, source error decoration and value kernels remain in place.
+
+Go's `program_bytes` counts supported program headers and instruction capacities, excluding
+map overhead and all retained source trees, including unsupported expressions. Compiler probes
+run separately from query timing; they compile each shared expression 10,000 times after resolving
+it once. Go allocation counts/bytes in the end-to-end records cover the timed drain. Rust's program/scratch byte counts accumulate over timed
+compilations and must be divided by their counts; they are not peak retained memory. TS reports
+instruction/slot counts, not guessed JavaScript object sizes. These diagnostics do not establish
+equal heap usage across cores or a whole-engine memory bound.
+
+Verification before timing: the new `compiled_branches.test` regenerated byte-identically from
+this checkout's PostgreSQL 18 oracle; shared metadata/fixtures/codegen verification passed.
+Every VM passed the full corpus in memory (578 passed, 2 skipped) and disk (515 passed,
+65 skipped). Production units passed in Go, Rust (993 library tests plus binary tests) and TS
+(905 tests). Internal fixture comparisons sweep cost ceilings; Go additionally checks lifetime
+budgets, cancellation poll order and concurrent cache use under the race detector; TS checks
+lifetime budgets, prepared schema invalidation and parameter changes. Existing TS resource/stack
+checks passed. No browser or multi-process stress run is claimed for this experiment.
