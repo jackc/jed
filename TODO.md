@@ -151,7 +151,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ the partial-index `WHERE index_predicate` / `COLLATE`/opclass inference decorations; relaxing the DO UPDATE PK-column assignment (`0A000`) — the standalone UPDATE re-keying has landed, but the conflict-path re-key is still deferred. → [upsert.md §10](spec/design/upsert.md)
 - [x] **`ALTER TABLE`** — catalog-only rename/default/nullability/constraint edits plus the
   `ADD`/`DROP COLUMN`, `ALTER COLUMN … TYPE … [USING]`, and `ADD`/`DROP PRIMARY KEY` rewrite slices
-  have landed, and identity management (`ALTER COLUMN … ADD GENERATED … AS IDENTITY`, `SET GENERATED`,
+  have landed, as has identity management (`ALTER COLUMN … ADD GENERATED … AS IDENTITY`, `SET GENERATED`,
   `SET <sequence_option>` / `RESTART`, `DROP IDENTITY`, the identity-only `SEQUENCE NAME` option,
   `jed_columns.identity_generation`, identity columns in the CLI dump). The rest of PG's menu
   (OWNER/RLS/triggers/partitions/tablespaces/schemas/storage knobs) is deliberately out of scope,
