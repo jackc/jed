@@ -982,12 +982,16 @@ export class SimRunner {
         this.fs.dead ||
         this.fs.fired !== "" ||
         d.version <= d.floor ||
-        !this.engineFlushed(d)
+        !this.engineFlushed(d) ||
+        !this.fs.entryDurable(d.file)
       ) {
         continue;
       }
       // The engine holds nothing pending: it treats the published version as flushed, and will
       // overwrite only the other slot. Hold it to that, after checking the claim against the disk.
+      // Its directory entry must be durable too: a process that died between compaction's rename and
+      // its directory barrier leaves the new file readable, and a power loss before the next opener's
+      // first commit syncs the directory brings the older file back (validated-cow.md §3).
       if (f.metaPending()) {
         this.fail(
           i,

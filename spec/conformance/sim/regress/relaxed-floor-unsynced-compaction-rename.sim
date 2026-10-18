@@ -1,0 +1,33 @@
+# Under synchronous = off the runner moved main's floor to a compaction's version as soon as the
+# engine held nothing pending, while that compaction's process had died between its rename and its
+# directory sync. A later power loss reverted the rename and recovered the older file, below that
+# floor: a false durability violation. The engine syncs the directory only at its first commit after
+# open (validated-cow.md §3), so the floor now waits for the file's directory entry to be durable
+# (simulation-testing.md §8.2). Shrunk from attachments seed 70.
+# format: simulation
+# profile: attachments
+# seed: 70
+# page_size: 512
+# cache_bytes: 2048
+# synchronous: off
+# clock: 1700000000000000
+on w19 INSERT INTO a2.t5 (id, c1, c2, c3, c4) SELECT g, decode(md5(g::text), 'hex'), (g * 34 + 44) % 1000, (g * 84 + 38) % 1000, md5(g::text) FROM generate_series(8, 39) g
+on w19 UPDATE a2.t5 SET c2 = (id * 2) % 1000, c4 = c4 || 'xxxxxxxxxxxxxxxxxxxx' WHERE id BETWEEN 6 AND 33
+open r20 read
+commit w19
+attach a1
+open w20 write
+on w20 INSERT INTO a2.t5 (id, c1, c2, c3, c4) SELECT g, decode(md5(g::text), 'hex'), (g * 9 + 30) % 1000, (g * 21 + 44) % 1000, NULL FROM generate_series(40, 54) g
+fault process_crash issue=545 nth=3
+compact
+attach a2
+fault process_crash issue=396 nth=2
+compact
+open w26 write
+commit w26
+attach a1
+attach a2
+open r22 read
+open w27 write
+fault power_loss survive=539 tear=0 nth=2
+compact

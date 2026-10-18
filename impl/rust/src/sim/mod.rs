@@ -1787,12 +1787,16 @@ impl<'a> Runner<'a> {
                     || !disk.fired.is_empty()
                     || d.version <= d.floor
                     || !flushed.get(name).copied().unwrap_or(false)
+                    || !disk.entry_durable(&d.file)
                 {
                     continue;
                 }
                 // The engine holds nothing pending: it treats the published version as flushed, and
                 // will overwrite only the other slot. Hold it to that, after checking the claim
-                // against the disk.
+                // against the disk. Its directory entry must be durable too: a process that died
+                // between compaction's rename and its directory barrier leaves the new file
+                // readable, and a power loss before the next opener's first commit syncs the
+                // directory brings the older file back (validated-cow.md §3).
                 if disk.meta_pending(id) {
                     violation = Some(format!(
                         "durability: the engine treats version {} of {name} as flushed, but no barrier covered its meta",

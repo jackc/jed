@@ -591,6 +591,12 @@ func (fs *simFS) remove(path string) {
 	}
 }
 
+// entryDurable reports whether path's directory entry is durable: a power loss would keep the file a
+// reader of that name sees now, not revert a pending create or rename (§6.1).
+func (fs *simFS) entryDurable(path string) bool {
+	return fs.files[path] == fs.durable[path]
+}
+
 // syncDir is a fault point only when it has something to make durable: a directory barrier with no
 // pending change cannot lose anything, and counting it would shift every later barrier's number.
 func (fs *simFS) syncDir(string) {
