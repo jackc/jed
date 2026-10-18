@@ -63,12 +63,12 @@ else
   admin("CREATE DATABASE #{name} TEMPLATE template0 ENCODING #{encoding} #{clause};")
 end
 
-# --reset clears replayed corpus state. Probes run inside BEGIN…ROLLBACK, so they normally leave
-# nothing — but a .test that contains its OWN transaction control (suites/transactions/*.test) ends
-# the probe's transaction with a real COMMIT, and whatever it created survives. Later files then
-# replay their DDL onto a dirty database and can collide (the documented "run per-file, drop first"
-# gotcha). Recreating the schema is the cheap fix, and it keeps the database's locale — which
-# DROP DATABASE would force us to re-derive.
+# --reset clears replayed corpus state. Probes run inside BEGIN…ROLLBACK, and a .test's own
+# transaction control is mapped onto a savepoint inside it (PgOracle's Containment note), so they
+# leave nothing — but an older importer, which let a test's COMMIT end the probe's transaction, or a
+# hand-run psql may have left objects behind, and later files replaying their DDL onto them collide.
+# Recreating the schema is the cheap fix, and it keeps the database's locale — which DROP DATABASE
+# would force us to re-derive.
 if reset
   out, err, status = Open3.capture3(*%W[psql -U postgres -d #{name} -q -A -t -X -v ON_ERROR_STOP=1],
                                     "-c", "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")

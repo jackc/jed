@@ -464,9 +464,21 @@ Every corpus entry MUST obey:
     probe never inherits a server default. `TimeZone` is deliberately absent — it is per-record
     (`# timezone:`) and set from the record itself.
 
-  **Sweeping many files:** reset between them (`mise run oracle:reset`). Probes roll back, but a
-  `.test` carrying its own transaction control commits its objects for real, and a later file
-  replaying onto that state fails in a way that looks exactly like a regression.
+  **A test's own transaction control stays inside the probe.** Each probe runs in one
+  `BEGIN…ROLLBACK`, and a `.test`'s own `BEGIN` / `COMMIT` / `ROLLBACK` is mapped onto a savepoint
+  inside it (`BEGIN` → `SAVEPOINT`, `COMMIT` → `RELEASE`, `ROLLBACK` → `ROLLBACK TO` + `RELEASE`;
+  its own savepoints nest inside), so a file can neither commit objects that a later probe or file
+  replays onto nor undo its prefix mid-probe. `BEGIN READ ONLY` sets `transaction_read_only` in the
+  savepoint and its `COMMIT` rolls back to it, so read-only never outlives the transaction. Outside
+  a test transaction, `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` raise PostgreSQL's 25P01. A
+  `statement error` record inside the test's transaction replays as a raise of its declared
+  SQLSTATE, so the block fails as it did in jed (no data change, later statements 25P02, `COMMIT`
+  rolls back); a failing `COMMIT` ends the transaction rolled back, and a rejected nested `BEGIN`
+  changes nothing. Keeping the wrapper also keeps statements PostgreSQL refuses in a transaction
+  block (`REINDEX DATABASE`, `VACUUM`) from running against the cluster. What a savepoint cannot
+  reproduce is a real commit's own effects — `ON COMMIT DELETE ROWS` / `ON COMMIT DROP` temp
+  tables keep their rows inside a probe — so those files carry overrides or divergence warnings.
+  `mise run oracle:reset` remains for state an older importer or a hand-run psql left behind.
 
   `spec/conformance/verify.rb` checks the table is structurally complete (every asserted key
   present and well-typed, every pin a non-empty string) so a typo cannot make an assertion
