@@ -4029,6 +4029,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_char",
@@ -4046,6 +4048,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_char",
@@ -4063,6 +4067,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_char",
@@ -4080,6 +4086,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_char",
@@ -4097,6 +4105,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_char",
@@ -4114,6 +4124,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_timestamp",
@@ -4131,6 +4143,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_date",
@@ -4148,6 +4162,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_number",
@@ -4165,6 +4181,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "to_timestamp",
@@ -4182,6 +4200,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "uuid_extract_version",
@@ -4256,6 +4276,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "volatile",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "uuidv7",
@@ -4824,6 +4846,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "array_to_string",
@@ -4841,6 +4865,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "string_to_array",
@@ -4858,6 +4884,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "string_to_array",
@@ -4875,6 +4903,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "concat",
@@ -5614,6 +5644,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "overlay",
@@ -6543,6 +6575,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "concat_ws",
@@ -6560,6 +6594,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "format",
@@ -6577,6 +6613,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "stable",
         variadic: true,
         cost: 0,
+        traps: true,
+        preserves_equality: false,
     },
     OperatorDesc {
         name: "regexp_replace",
