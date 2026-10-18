@@ -259,7 +259,7 @@ module Sim
   def shrink(opts, trace)
     core = opts[:core] or abort "sim shrink: --core is required"
     build([core])
-    out = opts[:out_dir] || stamp_dir("shrink")
+    out = opts[:out] || stamp_dir("shrink")
     lines = File.readlines(trace, chomp: true).reject { |l| l.strip.empty? }
     header = lines.take_while { |l| l.start_with?("#") }
     steps = lines.drop(header.size)
