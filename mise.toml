@@ -94,6 +94,63 @@ _.path = [
 description = "Engine test suites (alias for test)"
 run = [{ task = "test" }]
 
+# Frozen experiments are deliberately absent from every normal composite task.
+[tasks."ruby-native:conformance"]
+description = "Explicit opt-in: audit the experimental pure Ruby core against the corpus"
+usage = 'arg "[filter]" help="Corpus path substring"'
+run = 'ruby impl/ruby-native/bin/conformance.rb ${usage_filter:+"$usage_filter"}'
+
+[tasks."ruby-native:test"]
+description = "Explicit opt-in: pure Ruby experimental host/storage tests"
+run = "ruby -Iimpl/ruby-native/lib -e 'Dir[\"impl/ruby-native/test/*_test.rb\"].sort.each { |f| require_relative f }'"
+
+[tasks."ruby-native:storage-test"]
+description = "Explicit opt-in: experimental Ruby storage byte and durability tests"
+run = "ruby impl/ruby-native/test/storage_test.rb"
+
+[tasks."ruby-native:bench"]
+description = "Explicit opt-in: experimental Ruby against the shared benchmark corpus"
+usage = '''
+arg "<corpus_dir>" help="Benchmark corpus directory"
+arg "<data_dir>" help="Prepared benchmark databases"
+arg "<out>" help="Result JSONL path"
+arg "[filter]" help="Benchmark name substring"
+'''
+run = 'ruby bench/ruby-native/bench_jed.rb "$usage_corpus_dir" "$usage_data_dir" "$usage_out" "${usage_filter:-}"'
+
+[tasks."ruby-native:compare:build"]
+description = "Explicit opt-in: build experimental comparison drivers"
+run = "ruby bench/ruby-native/compare.rb --build-only"
+
+[tasks."ruby-native:compare"]
+description = "Explicit opt-in: preliminary memory workload comparison, interpreter and available JITs"
+run = "ruby bench/ruby-native/compare.rb"
+
+[tasks."ruby-native:compare:verify"]
+description = "Explicit opt-in: validate preliminary benchmark answers without measuring timings"
+run = "ruby bench/ruby-native/compare.rb --verify-only"
+
+[tasks."ruby-native:storage-bench"]
+description = "Explicit opt-in: experimental Ruby CRC and durable snapshot microbenchmarks"
+run = "ruby bench/ruby-native/storage_bench.rb"
+
+[tasks."ruby-native:compare:source-check"]
+description = "Explicit opt-in: restore and verify the preserved original Ruby benchmark source"
+run = "ruby bench/ruby-native/source.rb"
+
+[tasks."ruby-native:bench:setup"]
+description = "Explicit opt-in: generate standard jed-only benchmark datasets using cached Go dependencies"
+run = "ruby bench/ruby-native/setup.rb"
+
+[tasks."ruby-native:bench:smoke-go"]
+description = "Explicit opt-in: canonical Go one-execution checksums for the full Ruby benchmark smoke"
+usage = 'flag "--compare-only" help="Compare recorded smoke results without rerunning Go"'
+run = 'ruby bench/ruby-native/shared_go_smoke.rb ${usage_compare_only:+--compare-only}'
+
+[tasks."ruby-native:interop"]
+description = "Explicit opt-in: actual Ruby/Go durable file handoff using only local core dependencies"
+run = "ruby bench/ruby-native/interoperability.rb"
+
 # `test` and `ci` run their steps concurrently, each step's output buffered and printed in order;
 # the step lists live in scripts/gate.rb, where `ci` is `test` plus its extra steps by construction.
 [tasks.ci]

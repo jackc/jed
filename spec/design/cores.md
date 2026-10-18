@@ -23,6 +23,12 @@ failing test the day it is written. Everything below follows from taking that li
 
 ## 1. The principle: a core only earns its place if it can *disagree*
 
+**Frozen experiments are separate from supported cores.** The explicitly requested
+pure Ruby experiment (`impl/ruby-native`) investigates native Ruby execution,
+including Ruby's JITs. It is not in normal tests, benchmarks, CI, or the future
+feature maintenance obligation. Its current incomplete coverage does not constitute
+promotion or conformance parity. See [ruby-native-experiment.md](ruby-native-experiment.md).
+
 The value of an implementation, *for the spec*, is proportional to the new divergence it
 can surface. The corollary is sharp:
 

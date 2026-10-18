@@ -119,6 +119,14 @@ choice governs *which approach*, never *whether to conform* — though a wrapped
 distribution artifact, never an independent conformance voice (it can only echo Rust).
 Decide per language, on the merits, and record the call in `spec/design/cores.md`.
 
+**Opt-in frozen experiments.** `impl/ruby-native` is the pure Ruby core experiment,
+separate from the Rust binding in `impl/ruby`. Experimental cores are excluded from
+normal tests, benchmarks, CI, and the lockstep maintenance obligation. Run or update
+them only when explicitly requested; future features do not refresh them. Their
+recorded baseline revision, coverage, omissions, and performance are part of the
+experiment, and promotion requires a separate decision. See
+[ruby-native-experiment.md](spec/design/ruby-native-experiment.md).
+
 4. **Java**, **C#**, **Swift** (and later reach languages) — **native or wrapped, chosen
    per language on best-experience grounds**, not by a blanket rule. Current leanings
    (`spec/design/cores.md` §2): **C#** is the strongest *native* candidate (value-type
