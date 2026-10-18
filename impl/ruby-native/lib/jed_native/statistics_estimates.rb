@@ -4,6 +4,14 @@ module JedNative
   # Statistics are already resident catalog facts. All interpolation uses exact
   # integer fractions; no sampled row or index leaf is read while planning.
   module StatisticsEstimates
+    def estimate_scan_candidate(stored, predicate, access, statement)
+      previous = @native_estimate_table
+      @native_estimate_table = stored
+      super
+    ensure
+      @native_estimate_table = previous
+    end
+
     def scan_access_plan(stored, predicate, statement = nil)
       previous = @native_estimate_table
       @native_estimate_table = stored

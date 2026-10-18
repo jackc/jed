@@ -6,6 +6,10 @@ require_relative 'memory_storage'
 module JedNative
   module StorageLimits
     attr_accessor :max_temp_storage_bytes
+    def storage_reuse_allowed_provider=(provider)
+      @storage_reuse_allowed_provider = provider
+      @memory_domains.each_value { |domain| domain.reuse_allowed_provider = provider }
+    end
 
     def initialize(max_storage_bytes: 0, max_temp_storage_bytes: 0, page_size: 8192, **options)
       @native_page_size = page_size
@@ -39,6 +43,9 @@ module JedNative
     end
 
     def persist
+      # COMMIT can apply ON COMMIT DELETE ROWS after the last statement's
+      # inventory refresh. Publish the resulting tree, including an empty root.
+      refresh_primary_indexes
       states = {}
       states['main'] = export_storage unless @storage
       @attachments.each do |name, attachment|
@@ -49,6 +56,7 @@ module JedNative
       staged = []
       states.each do |name, state|
         domain = @memory_domains[name] ||= MemoryStorage.new(statistics_codec, page_size: name == 'main' ? storage_page_size : 8192)
+        domain.reuse_allowed_provider = @storage_reuse_allowed_provider
         next if storage_signature(state) == storage_signature(domain.state)
         limit = name == 'temp' ? 0 : @storage_limits.fetch(name, 0)
         plan = domain.prepare(state, limit: limit, stages_rows: storage_stages_rows?(domain.state, state))

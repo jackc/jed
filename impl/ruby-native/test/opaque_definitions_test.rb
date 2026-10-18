@@ -26,6 +26,7 @@ module NativeOpaqueDefinitionTests
   def run
     fixture = File.binread(File.expand_path('../../../spec/fileformat/fixtures/unparsable_definitions.jed', __dir__))
     JedNative.from_image(fixture) do |db|
+      db = db.session
       reject_without_work(db, 'UPDATE c SET v = 1 WHERE id = 999')
       reject_without_work(db, 'DELETE FROM x WHERE id = 999')
       reject_without_work(db, 'INSERT INTO d(id) SELECT id FROM t WHERE id = 999')

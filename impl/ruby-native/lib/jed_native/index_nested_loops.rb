@@ -2,7 +2,7 @@
 
 module JedNative
   module IndexNestedLoops
-    def join_index_plan(left, source, kind, on, using, choose: true)
+    def join_index_plan(left, source, kind, on, using, choose: true, all: false)
       return unless %i[inner cross left left_outer].include?(kind) && source[:kind] == :table
       stored = @tables[source[:name]]
       return unless stored && !@ctes.key?(source[:name])
@@ -20,6 +20,7 @@ module JedNative
       end
       original_on = source[:native_original_on] || on
       nodes = [original_on, source[:native_join_where], source[:native_access_predicate]].compact.flat_map { |node| ast_conjunctions(node) }
+      nodes.uniq!
       nodes.select! do |node|
         pushdown_column_nodes(node).all? do |column|
           column[:native_ordinal] || scope.any? { |entry| entry[:name] == column[:name] && (!column[:table] || entry[:table] == column[:table]) }
@@ -30,10 +31,18 @@ module JedNative
       candidates = scan_access_candidates(stored, predicate).reject { |candidate| candidate[:kind] == :full }
       candidates.select! do |candidate|
         bounds = candidate[:parts]&.flat_map { |part| part[:comparisons].map(&:last).compact } || candidate[:arms]&.map(&:last) || []
+        bounds += candidate[:terms] || [] if %i[primary_interval secondary_interval].include?(candidate[:kind])
         bounds.any? { |bound| expression_nodes(bound).any? { |expression| expression.kind == :outer } }
       end
       return if candidates.empty?
       candidates.each { |candidate| estimate_scan_candidate(stored, predicate, candidate, nil) }
+      local_filter = source[:native_pushed_filter] && compile_filter(source[:native_pushed_filter], columns)
+      candidates.each { |candidate| candidate[:output_rows] = estimate_predicate(candidate[:scan_rows], local_filter) }
+      if all
+        return candidates.sort_by { |candidate| [AccessPlanning::ACCESS_RANK.fetch(candidate[:kind]), candidate[:name].to_s.b] }.map do |candidate|
+          { stored: stored, columns: columns, predicate: predicate, access: candidate, filter: local_filter }
+        end
+      end
       selected = candidates.min_by { |candidate| [candidate[:pipeline_cost], AccessPlanning::ACCESS_RANK.fetch(candidate[:kind]), candidate[:name].to_s.b] }
       if choose && %i[inner cross].include?(kind)
         local = source[:native_access_predicate] && compile_filter(source[:native_access_predicate], columns)
@@ -58,7 +67,7 @@ module JedNative
         return if inl_cost > ordinary_cost
       end
       { stored: stored, columns: columns, predicate: predicate, access: selected,
-        filter: source[:native_pushed_filter] && compile_filter(source[:native_pushed_filter], columns) }
+        filter: local_filter }
     end
 
     def join_bound_expression(expression, width)

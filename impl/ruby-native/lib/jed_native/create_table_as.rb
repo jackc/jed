@@ -2,6 +2,32 @@
 
 module JedNative
   module CreateTableAs
+    def explain_query(statement)
+      inner = statement[:statement]
+      if inner[:kind] == :create_table && inner[:query]
+        view_query_columns(inner[:query])
+        if relation_exists?(inner[:name])
+          raise Error.new('42P07', 'relation already exists') unless inner[:if_not_exists]
+          columns, types = %w[depth node detail], %w[i32 text text]
+          if statement[:costs]
+            columns += %w[est_rows est_cost]
+            types += %w[i64 i64]
+          end
+          if statement[:analyze]
+            columns << 'actual_cost'
+            types << 'i64'
+          end
+          if statement[:lane]
+            columns << 'lane'
+            types << 'text'
+          end
+          return Result.new(columns: columns, column_types: types, rows: [])
+        end
+        raise Error.new('42939', 'reserved relation name') if inner[:name].start_with?('jed_')
+      end
+      super
+    end
+
     def create_table(statement)
       return super unless statement[:query]
       query = statement[:query]

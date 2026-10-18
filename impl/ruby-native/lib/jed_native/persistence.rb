@@ -58,12 +58,12 @@ module JedNative
       end
       publications.each do |domain, storage, state, signature|
         storage.commit(state)
+        adopt_storage_pages(storage, domain)
         if domain
-          @attachments[domain][:storage_signature] = signature
+          @attachments[domain][:storage_signature] = storage_signature(export_attachment_storage(domain))
         else
-          @persisted_snapshot = signature
+          @persisted_snapshot = storage_signature(export_storage)
         end
-        invalidate_storage_profiles(domain)
       end
       refresh_primary_indexes unless publications.empty?
       @dirty = false
@@ -124,6 +124,31 @@ module JedNative
 
     private
 
+    def adopt_storage_pages(storage, domain)
+      catalog = storage.load[:tables].to_h { |entry| [entry[:name], entry] }
+      catalog_types = @types
+      @tables.transform_values! do |table|
+        next table if table[:temporary] || table[:database] != domain
+        entry = catalog.fetch(table[:local_name] || table[:name])
+        raw = entry[:rows]
+        rows = raw.converted { |type, value| Types.from_storage_value(type, value, catalog_types) }
+        raw_indexes = entry[:indexes].to_h { |index| [index[:name], index] }
+        indexes = table[:indexes].map do |index|
+          stored = raw_indexes.delete(index[:local_name] || index[:name])
+          next index unless stored
+          index.merge(storage_tree_profile: stored[:tree_profile], storage_gist_profile: stored[:gist_profile], storage_index: stored)
+        end
+        # Unique/exclusion backing indexes also become regular paged indexes.
+        raw_indexes.each_value { |index| indexes << import_index(entry, index) }
+        rowids = entry[:pk].empty? ? rows.rowids(FileFormat.new) : PageSequence.new(rows.length, ->(index) { index })
+        clean = table.reject { |key, _| key.to_s.start_with?('native_') }
+        clean.merge(rows: rows, rowids: rowids, indexes: indexes,
+                    storage_rows: rows, storage_statistics: entry[:statistics], storage_tree_profile: rows.profile,
+                    storage_tree_rows: rows, storage_keys: rows.keys)
+      end
+      refresh_primary_indexes
+    end
+
     def export_collations
       references = (@storage_collations || []).to_h { |entry| [entry[:name], entry] }
       default = respond_to?(:default_collation) ? default_collation : 'C'
@@ -157,7 +182,7 @@ module JedNative
     def storage_signature(value)
       case value
       when Hash
-        value.reject { |key, _| %i[evaluate where physical_tree physical_gist tree_profile].include?(key) }.transform_values { |item| storage_signature(item) }
+        value.reject { |key, _| %i[evaluate where physical_tree physical_gist tree_profile gist_profile].include?(key) }.transform_values { |item| storage_signature(item) }
       when Array then value.map { |item| storage_signature(item) }
       else value
       end
@@ -175,14 +200,18 @@ module JedNative
       elsif type == 'text'
         result[:varchar_len] = modifier&.dig(:precision)
       elsif %w[timestamp timestamptz interval].include?(type) && modifier
-        result[:temporal] = { precision: modifier[:precision], fields: modifier[:fields] || 0 }
+        fields = modifier[:fields]
+        fields = DateTimeUnits::INTERVAL_QUALIFIER_CODES.fetch(fields) if fields.is_a?(String)
+        result[:temporal] = { precision: modifier[:precision], fields: fields || 0 }
       end
       result[:collation] = column[:collation] if column[:collation] && column[:collation] != 'C'
       if column[:default]
-        if type.end_with?('[]') || FileFormat::RANGE_ELEM.key?(type)
+        container = type.end_with?('[]') || FileFormat::RANGE_ELEM.key?(type) || @types.key?(type)
+        null_default = container && column[:default][:kind] == :literal && column[:default][:value].nil?
+        if !null_default && (type.end_with?('[]') || FileFormat::RANGE_ELEM.key?(type))
           raise Error.new('0A000', 'container column defaults have no supported file representation')
         end
-        result[:default_expr] = catalog_expression(column[:default])
+        result[:default_expr] = catalog_expression(column[:default]) unless null_default
       end
       identity = column[:identity]
       result[:identity] = identity.is_a?(Hash) ? identity[:mode] : identity if identity
@@ -229,8 +258,12 @@ module JedNative
           exclusions << { name: name, index: name, elements: elements.map { |element| [column_ordinal(table, element[:expr][:name]), element[:op]] } }
         end
       end
-      rows = table[:rows].map do |row|
+      rows = if table[:rows].is_a?(PagedRows)
+        table[:rows].raw || table[:rows]
+      else
+        table[:rows].map do |row|
         row.each_with_index.map { |value, index| storage_value(columns[index][:type], value) }
+        end
       end
       result = { name: table[:name], columns: columns, rows: rows, pk_order: pk_order,
                  checks: checks.sort_by { |check| check[:name].b }, indexes: indexes.sort_by { |index| index[:name].b },
@@ -240,15 +273,18 @@ module JedNative
         metadata = table[:native_secondary_metadata]&.[](index[:name]) || table[:native_auxiliary_indexes]&.[](index[:name])
         if index[:kind] == 'gist'
           index[:physical_gist] = metadata[:tree] if metadata
+          index[:physical_gist] = index[:gist_profile][:tree] if !metadata && index[:gist_profile]
           index[:physical_gist] = nil if !metadata && index[:root_page] == 0
         elsif metadata && metadata.key?(:physical_tree)
           index[:physical_tree] = metadata[:physical_tree]
         elsif index[:tree_profile]
-          index[:physical_tree] = statistics_codec.tree_from_profile(index[:tree_profile], [])
+          index[:physical_tree] = index[:tree_profile][:paged_rows] ? index[:tree_profile][:tree] : statistics_codec.tree_from_profile(index[:tree_profile], [])
         end
       end
       result[:rebuild_generation] = table[:index_rebuild_generation] if table[:index_rebuild_generation]
-      if pk_order.empty? && table[:rowids]
+      if table[:rows].is_a?(PagedRows)
+        result[:storage_keys] = table[:rows].keys
+      elsif pk_order.empty? && table[:rowids]
         codec = FileFormat.new
         result[:storage_keys] = table[:rowids].map { |rowid| codec.encode_int(8, rowid) }
       end
@@ -372,15 +408,20 @@ module JedNative
 
           constraints << { kind: :unique, name: index[:name], columns: index[:columns] }
         end
-        rows = stored[:rows].map { |row| row.each_with_index.map { |value, i| from_storage_value(columns[i][:type], value) } }
+        rows = if stored[:rows].is_a?(PagedRows)
+          catalog_types = @types
+          stored[:rows].converted { |type, value| Types.from_storage_value(type, value, catalog_types) }
+        else
+          stored[:rows].map { |row| row.each_with_index.map { |value, i| from_storage_value(columns[i][:type], value) } }
+        end
         rowids = if stored[:pk].empty?
                    codec = FileFormat.new
-                   stored[:storage_keys].map { |key| codec.decode_int(8, key) }
+                   rows.is_a?(PagedRows) ? rows.rowids(codec) : stored[:storage_keys].map { |key| codec.decode_int(8, key) }
                  else
-                   (0...rows.length).to_a
+                   rows.is_a?(PagedRows) ? PageSequence.new(rows.length, ->(index) { index }) : (0...rows.length).to_a
                  end
         [stored[:name], { name: stored[:name], columns: columns, constraints: constraints, indexes: indexes,
-                         rows: rows, rowids: rowids, next_rowid: (rowids.max || -1) + 1, temporary: false,
+                         rows: rows, rowids: rowids, next_rowid: (rows.is_a?(PagedRows) ? rowids.last || -1 : rowids.max || -1) + 1, temporary: false,
                          storage_rows: rows, storage_statistics: stored[:statistics], storage_tree_profile: stored[:tree_profile], storage_tree_rows: rows,
                          storage_keys: stored[:storage_keys],
                          collation_skew: columns.filter_map { |column| column[:collation] if skewed_collations.include?(column[:collation]) }.uniq }]
@@ -409,7 +450,9 @@ module JedNative
                  elsif column[:varchar_len]
                    { precision: column[:varchar_len] }
                  elsif column[:temporal]
-                   column[:temporal]
+                   temporal = column[:temporal]
+                   fields = temporal[:fields]
+                   temporal.merge(fields: fields.to_i.zero? ? nil : DateTimeUnits::INTERVAL_QUALIFIER_CODES.key(fields))
                  end
       default = if column[:default_expr]
                   parse_stored_expression(column[:default_expr], "default of column #{column[:name].inspect}")
@@ -432,6 +475,7 @@ module JedNative
       predicate = index[:predicate] ? parse_stored_expression(index[:predicate], "index #{index[:name].inspect} of table #{table[:name].inspect}") : nil
       unparsed = opaque_definition?(predicate) || elements.any? { |element| opaque_definition?(element[:expr]) }
       { kind: :create_index, name: index[:name], table: table[:name], method: index[:kind], unique: index[:unique], storage_index: index, unparsed: unparsed,
+        storage_gist_profile: index[:gist_profile],
         elements: elements, columns: elements.map { |element| element[:expr][:name] }, storage_tree_profile: index[:tree_profile],
         where: predicate }
     end

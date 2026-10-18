@@ -2,6 +2,18 @@
 
 module JedNative
   module SchemaResolution
+    def dispatch(statement)
+      if statement[:kind] == :create_type
+        fields = statement[:fields].map { |field| field[:name] }
+        raise Error.new('42701', 'duplicate composite field') unless fields.uniq.length == fields.length
+      elsif statement[:kind] == :drop_type && statement[:cascade]
+        names = statement[:names] || [statement[:name]]
+        stored = @tables.values.any? { |table| table[:columns].any? { |column| names.include?(column[:type].delete_suffix('[]')) } }
+        stored ||= @types.any? { |name, fields| !names.include?(name) && fields.any? { |field| names.include?(field[:type].delete_suffix('[]')) } }
+        raise Error.new('0A000', 'DROP TYPE CASCADE cannot rewrite stored columns') if stored
+      end
+      super
+    end
     def relation_exists?(name)
       super || @tables.values.any? do |table|
         table[:constraints].any? { |constraint| %i[unique exclude].include?(constraint[:kind]) && constraint[:name] == name }
@@ -31,22 +43,28 @@ module JedNative
 
     def name_constraints(table)
       existing = @tables[table[:name]]&.dig(:constraints) || []
-      explicit = []
+      explicit = {}
       table[:constraints].each do |constraint|
         next unless constraint[:name]
         relation = %i[unique exclude].include?(constraint[:kind])
         name = constraint[:name]
-        if explicit.include?(name)
-          raise Error.new(relation ? '42P07' : '42710', 'duplicate constraint name')
+        if explicit.key?(name)
+          raise Error.new(relation && %i[unique exclude].include?(explicit[name]) ? '42P07' : '42710', 'duplicate constraint name')
         end
         if relation && (name == table[:name] || relation_exists?(name) && existing.none? { |item| item[:name] == name })
           raise Error.new('42P07', 'constraint index relation already exists')
         end
-        explicit << name
+        explicit[name] = constraint[:kind]
       end
-      used = explicit + @tables.values.reject { |other| other[:name] == table[:name] }.flat_map { |other| other[:constraints].filter_map { |constraint| constraint[:name] } }
-      table[:constraints].each do |constraint|
-        next if constraint[:name]
+      used = @tables.values.reject { |other| other[:name] == table[:name] || !!other[:temporary] != !!table[:temporary] }.flat_map { |other| other[:constraints].filter_map { |constraint| constraint[:name] } }
+      named = []
+      table[:constraints].sort_by { |constraint| constraint[:definition_order] || -1 }.each do |constraint|
+        if constraint[:name]
+          raise Error.new('42710', 'duplicate constraint name') if named.include?(constraint[:name])
+          named << constraint[:name]
+          used << constraint[:name]
+          next
+        end
         kind = constraint[:kind]
         label = { primary_key: 'pkey', unique: 'key', check: 'check', foreign_key: 'fkey', exclude: 'excl' }.fetch(kind)
         columns = constraint[:columns] || schema_column_names(constraint[:elements] || constraint[:expr])
@@ -55,13 +73,14 @@ module JedNative
         suffix = 0
         name = object_name(table[:name], part, label)
         unless kind == :primary_key
-          while used.include?(name) || %i[unique exclude].include?(kind) && (name == table[:name] || relation_exists?(name))
+          while used.include?(name) || %i[unique exclude].include?(kind) && (explicit.key?(name) || name == table[:name] || relation_exists?(name))
             suffix += 1
             name = object_name(table[:name], part, "#{label}#{suffix}")
           end
         end
         constraint[:name] = name
         used << name
+        named << name
       end
     end
 
@@ -85,6 +104,13 @@ module JedNative
     end
 
     def validate_definition(table)
+      primary = table[:constraints].find { |constraint| constraint[:kind] == :primary_key }
+      groups = @tables.key?(table[:name]) ? {} : table[:constraints].select { |constraint| constraint[:kind] == :unique }.group_by { |constraint| constraint[:columns] }
+      groups.each do |columns, constraints|
+        survivor = constraints.find { |constraint| constraint[:name] } || constraints.first
+        survivor = nil if primary && primary[:columns] == columns
+        table[:constraints] -= constraints.reject { |constraint| constraint.equal?(survivor) }
+      end
       table[:constraints].each do |constraint|
         next unless constraint[:kind] == :exclude
         method = constraint[:method] || 'btree'
@@ -156,6 +182,13 @@ module JedNative
       Result.new
     end
 
+    def reindex_targets(statement)
+      if statement[:object] == :database && statement[:name] && @attachments.key?(statement[:name])
+        return @tables.values.select { |table| table[:database] == statement[:name] }.sort_by { |table| table[:name].b }.map { |table| [table, catalog_indexes(table)] }
+      end
+      super
+    end
+
     def drop_table(statement)
       names = (statement[:names] || [statement[:name]]).uniq
       names.each do |name|
@@ -165,8 +198,44 @@ module JedNative
     end
 
     def alter_table(statement)
-      if statement[:action] == :rename_constraint && statement[:new_name].start_with?('jed_')
+      table = @tables[statement[:name]]
+      raise Error.new('42809', 'relation is not a table') if !table && !@views.key?(statement[:name]) && relation_exists?(statement[:name])
+      constraint = table && table[:constraints].find { |item| item[:name] == statement[:column] }
+      if table && table[:database] && !%w[main temp].include?(table[:database])
+        forbidden = (statement[:actions] || []).any? { |action| action[:kind] == :add_constraint && %i[foreign_key exclude].include?(action.dig(:constraint, :kind)) }
+        raise Error.new('0A000', 'attached constraints are not supported') if forbidden
+      end
+      if statement[:action] == :rename_constraint && constraint && %i[unique exclude].include?(constraint[:kind]) && statement[:new_name].start_with?('jed_')
         raise Error.new('42939', 'reserved constraint name')
+      end
+      if table && (statement[:actions] || []).any? { |action| action[:kind] == :set_type }
+        columns = table[:columns].map(&:dup)
+        statement[:actions].each do |action|
+          if action[:kind] == :add_column
+            columns << action[:column].merge(type: Types.normalize(Sequences::SERIAL_TYPES[action[:column][:type]] || action[:column][:type]))
+            next
+          elsif action[:kind] == :drop_column
+            columns.reject! { |column| column[:name] == action[:column] }
+            next
+          end
+          next unless action[:kind] == :set_type
+          column = columns.find { |candidate| candidate[:name] == action[:column] }
+          raise Error.new('42703', 'column does not exist') unless column
+          validate_type(Types.normalize(action[:type]), action[:type_mod])
+          compile(action[:using], table_columns(table)) if action[:using]
+          column[:type] = Types.normalize(action[:type])
+        end
+        table[:indexes].each do |index|
+          (index[:elements] || []).each do |element|
+            node = element[:expr]
+            type = compile(node, table_columns(table.merge(columns: columns))).type
+            if %w[gin gist].include?(index[:method])
+              auxiliary_type_gate(index[:method], type)
+            elsif %w[json jsonpath].include?(type)
+              raise Error.new('0A000', 'type has no ordered keys')
+            end
+          end
+        end
       end
       super
     end

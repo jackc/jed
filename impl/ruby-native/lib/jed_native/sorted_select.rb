@@ -145,7 +145,7 @@ module JedNative
       end
       rows.sort!(&compare) unless sorter
       ordered = sorter || rows
-      output = []
+      output = cursor_output(columns)
       ordered.each_with_index do |entry, index|
         next if index < offset
         break if limit && output.length >= limit

@@ -54,14 +54,23 @@ module JedNative
   # A bounded page reader implementing the codec's image seam. Recovery can
   # inspect manifests and catalogs without copying the entire file into a String.
   class FileImage
-    attr_reader :bytesize
+    DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
+    attr_reader :bytesize, :cache_pages
 
-    def initialize(file, page_size)
+    def initialize(file, page_size, cache_bytes: DEFAULT_CACHE_BYTES)
       @file = file
       @page_size = page_size
       @bytesize = file.size
+      @cache_pages = [1, cache_bytes / page_size].max
       @cache = {}
     end
+
+    def invalidate(pages = nil)
+      pages ? pages.each { |page| @cache.delete(page) } : @cache.clear
+      @bytesize = @file.size
+    end
+
+    def cached_pages = @cache.length
 
     def byteslice(offset, length)
       return nil if offset.negative? || offset > @bytesize
@@ -70,17 +79,45 @@ module JedNative
       out = +"".b
       while length.positive?
         page, within = offset.divmod(@page_size)
-        bytes = @cache[page]
+        bytes = @cache.delete(page)
         unless bytes
           bytes = @file.pread(@page_size, page * @page_size)
-          @cache.shift if @cache.size >= 256
-          @cache[page] = bytes
+          @cache.shift if @cache.size >= @cache_pages
         end
+        @cache[page] = bytes
         count = [length, @page_size - within].min
         part = bytes.byteslice(within, count)
         raise IOError, "short database page read" unless part && part.bytesize == count
 
         out << part
+        offset += count
+        length -= count
+      end
+      out
+    end
+  end
+
+  # Commit preparation reads new pages from its private body and clean pages
+  # from the existing pager. Publication switches the same views to the file.
+  class PageOverlay
+    attr_reader :cache_pages
+    def initialize(image, pages)
+      @image, @pages = image, pages
+      @page_size, @cache_pages = pages.page_size, image.cache_pages
+    end
+    def bytesize = @pages ? @pages.bytesize : @image.bytesize
+    def cached_pages = @image.cached_pages
+    def publish = (@pages = nil)
+    def byteslice(offset, length)
+      return @image.byteslice(offset, length) unless @pages
+      return nil if offset.negative? || offset > bytesize
+      length = [length, bytesize - offset].min
+      out = +''.b
+      while length.positive?
+        page, within = offset.divmod(@page_size)
+        count = [length, @page_size - within].min
+        bytes = @pages.pages[page]
+        out << (bytes ? bytes.byteslice(within, count) : @image.byteslice(offset, count))
         offset += count
         length -= count
       end

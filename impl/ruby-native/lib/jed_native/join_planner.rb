@@ -45,9 +45,8 @@ module JedNative
       scopes = sources.map { |source| analyzer.relation_columns(source) }
       labels = sources.map { |source| source[:alias] || source[:name] }
       raise Error.new('42712', 'table name specified more than once') unless labels.uniq.length == labels.length
-      scans = sources.each_with_index.map do |source, index|
-        predicate = source[:native_access_predicate] && compile_filter(source[:native_access_predicate], scopes[index])
-        scan_access_plan(@tables.fetch(source[:name]), predicate)
+      inventories = sources.each_with_index.map do |source, index|
+        join_scan_candidates(source, scopes[index])
       end
       candidates = []
       [[0, 1], [1, 0]].each do |outer_index, inner_index|
@@ -57,6 +56,7 @@ module JedNative
         original = second[:native_original_on] || edge[:on]
         gate = original && compile_filter(original, scope)
         filter = where && compile_filter(where, scope)
+        inventories[0].product(inventories[1]).each do |scans|
         outer_rows, inner_rows = scans[outer_index][:output_rows], scans[inner_index][:output_rows]
         pairs = [outer_rows * inner_rows, QueryPlans::MAX_ESTIMATE].min
         joined_rows = estimate_join_rows(pairs, on, scope, sources)
@@ -87,13 +87,14 @@ module JedNative
           candidates << base.merge(algorithm: :hash, cost: cost, keys: keys)
         end
         metadata = Relation.new(columns: scopes[outer_index], rows: [])
-        if (index = join_index_plan(metadata, base[:inner], edge[:kind], edge[:on], nil, choose: false))
+        (join_index_plan(metadata, base[:inner], edge[:kind], edge[:on], nil, choose: false, all: true) || []).each do |index|
           scan = index[:access]
           local_work = expression_work(index[:filter])
-          inl_on = join_unbound_terms(on, index, scopes[outer_index].length)
           inl_where = join_unbound_terms(filter, index, scopes[outer_index].length)
           inl_pairs = outer_rows * scan[:output_rows]
-          inl_joined = estimate_predicate(inl_pairs, inl_on)
+          # The access estimate already accounts for the sibling join bound.
+          # ON still runs for every candidate, without a second selectivity fold.
+          inl_joined = inl_pairs
           inl_output = estimate_predicate(inl_joined, inl_where)
           inl_starts = if ordered && target.zero?
             0
@@ -101,16 +102,33 @@ module JedNative
             [outer_rows, (target * outer_rows + inl_output - 1) / inl_output].min
           else outer_rows
           end
-          filtered_pairs = estimate_predicate(inl_starts * scan[:scan_rows], inl_on)
-          cost = scans[outer_index][:pipeline_cost] + inl_starts * (scan[:scan_cost] + scan[:scan_rows] * (local_work + expression_work(on))) +
+          filtered_pairs = inl_starts * scan[:output_rows]
+          cost = scans[outer_index][:pipeline_cost] + inl_starts * (scan[:scan_cost] + scan[:scan_rows] * local_work + scan[:output_rows] * expression_work(on)) +
             filtered_pairs * residual_work + (ordered ? [inl_output, target].min : inl_output)
           candidates << base.merge(algorithm: :index, cost: cost, index: index, rows: inl_output, join_rows: filtered_pairs, output_count: ordered ? [inl_output, target].min : inl_output)
         end
+        end
       end
-      candidates.min_by { |candidate| [[candidate[:cost], QueryPlans::MAX_ESTIMATE].min, candidate[:reverse] ? 1 : 0, JOIN_RANK.fetch(candidate[:algorithm])] }
+      candidates.min_by do |candidate|
+        accesses = [candidate[:scans][0], candidate[:index] ? candidate[:index][:access] : candidate[:scans][1]]
+        [[candidate[:cost], QueryPlans::MAX_ESTIMATE].min, candidate[:reverse] ? 1 : 0,
+         accesses.map { |access| [AccessPlanning::ACCESS_RANK.fetch(access[:kind]), access[:name].to_s.b] }, JOIN_RANK.fetch(candidate[:algorithm])]
+      end
     end
 
     private
+
+    def join_scan_candidates(source, scope)
+      stored = @tables.fetch(source[:name])
+      predicate = source[:native_access_predicate] && compile_filter(source[:native_access_predicate], scope)
+      filter = source[:native_pushed_filter] && compile_filter(source[:native_pushed_filter], scope)
+      scan_access_candidates(stored, predicate).reject { |access| access[:kind] == :secondary && access[:parts].empty? }.each do |access|
+        estimate_scan_candidate(stored, predicate, access, nil)
+        access[:output_rows] = [access[:scan_rows], estimate_predicate(stored[:rows].length, filter)].min
+        access[:logical_rows] = estimate_predicate(stored[:rows].length, filter)
+        access[:pipeline_cost] = access[:scan_cost] + access[:scan_rows] * expression_work(filter)
+      end.sort_by { |access| [AccessPlanning::ACCESS_RANK.fetch(access[:kind]), access[:name].to_s.b] }
+    end
 
     def estimate_join_rows(rows, expression, scope, sources)
       return rows unless expression
@@ -140,7 +158,7 @@ module JedNative
 
     def join_unbound_terms(expression, index, width)
       return unless expression
-      bound = (index[:access][:parts] || []).flat_map { |part| part[:terms] }
+      bound = index[:access][:terms] || (index[:access][:parts] || []).flat_map { |part| part[:terms] }
       remaining = conjunctions(expression).reject do |term|
         local = join_bound_expression(term, width)
         bound.any? { |used| same_key_expression?(local, used) }

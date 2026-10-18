@@ -77,7 +77,7 @@ module JedNative
           table_name, ordinal = old[:owned_by]
           t = @tables[table_name]
           columns = t[:columns].map(&:dup)
-          columns[ordinal][:default] = { kind: :call, name: 'nextval', args: [{ kind: :literal, type: 'text', value: stmt[:new_name] }] }
+          columns[ordinal][:default] = identity_default(stmt[:new_name])
           @tables[table_name] = t.merge(columns: columns)
         end
       else
@@ -164,7 +164,7 @@ module JedNative
                                      identity ? identity[:options] : {})
         identities[ordinal] = identity[:mode] if identity
         column.reject { |key, _| key == :identity }.merge(type: type, nullable: false,
-          default: { kind: :call, name: 'nextval', args: [{ kind: :literal, type: 'text', value: name }] })
+          default: identity_default(name))
       end
       result = super(stmt.merge(columns: columns))
       unless identities.empty?

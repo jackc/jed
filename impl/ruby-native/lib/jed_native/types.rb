@@ -443,9 +443,12 @@ module JedNative
     }.freeze
     INTEGER_BITS = {'i16' => 16, 'i32' => 32, 'i64' => 64}.freeze
     RANGES = {'i32range' => 'i32', 'i64range' => 'i64', 'numrange' => 'decimal', 'tsrange' => 'timestamp', 'tstzrange' => 'timestamptz', 'daterange' => 'date'}.freeze
+    BUILTIN_NAMES = (ALIASES.keys + ALIASES.values + RANGES.keys + %w[unknown null record date interval bytea uuid json jsonb jsonpath boolean decimal i16 i32 i64 f32 f64 text timestamp timestamptz]).uniq.freeze
     module_function
     def normalize(type)
-      text = type.to_s.strip.downcase.gsub(/\s+/, ' ')
+      text = type.to_s.strip.gsub(/\s+/, ' ')
+      base_name = text.sub(/(?:\[\d*\])+\z/, '').sub(/\(.*\)\z/, '')
+      text = BUILTIN_NAMES.include?(base_name.downcase) ? text.downcase : type.to_s
       return 'unknown' if text == 'null'
       return normalize(text.sub(/(?:\[\d*\])+\z/, '')) + '[]' if /\[\d*\]\z/.match?(text)
       match = /\A([^()]+)(\(.*\))?\z/.match(text)
@@ -694,9 +697,9 @@ end
         return ArrayValue.new([a] + b.to_a, element_type: b.element_type) if b.is_a?(ArrayValue)
         return a.concat_json(b) if a.respond_to?(:concat_json)
         return a.to_s + b.to_s
-      when '@>' then return a.respond_to?(:contains?) ? a.contains?(b) : b.all? { |v| !v.nil? && a.include?(v) }
+      when '@>' then return a.respond_to?(:contains?) ? a.contains?(b) : b.all? { |v| !v.nil? && a.any? { |item| !item.nil? && compare(item, v).zero? } }
       when '<@' then return binary('@>', b, a)
-      when '&&' then return a.is_a?(RangeValue) ? a.overlaps?(b) : a.any? { |v| !v.nil? && b.include?(v) }
+      when '&&' then return a.is_a?(RangeValue) ? a.overlaps?(b) : a.any? { |v| !v.nil? && b.any? { |item| !item.nil? && compare(item, v).zero? } }
       when '-|-' then return a.adjacent?(b)
       when '<<' then return a.strictly_left?(b) if a.is_a?(RangeValue)
       when '>>' then return b.strictly_left?(a) if a.is_a?(RangeValue)

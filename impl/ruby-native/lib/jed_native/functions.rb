@@ -19,6 +19,7 @@ module JedNative
     def return_type(name, arg_types)
       name = name.to_s.downcase
       arg_types = arg_types.map { |t| Types.normalize(t) }
+      return 'decimal' if name == 'extract'
       return 'text[]' if name == 'regexp_matches'
       return 'text' if name == 'regexp_split_to_table'
       return JsonPathFunctions.result_type(name) if defined?(JsonPathFunctions) && JsonPathFunctions.function?(name)

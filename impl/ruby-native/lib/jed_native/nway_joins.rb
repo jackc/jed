@@ -67,12 +67,7 @@ module JedNative
           ast: edge[:on], gate: inputs[index + 1][:native_original_on] || edge[:on], kind: edge[:kind] }
       end
       access = inputs.each_with_index.map do |source, index|
-        table = @tables.fetch(source[:name])
-        predicate = source[:native_access_predicate] && compile_filter(source[:native_access_predicate], scopes[index])
-        scan_access_candidates(table, predicate).each do |candidate|
-          estimate_scan_candidate(table, predicate, candidate, nil)
-          candidate[:logical_rows] = estimate_predicate(table[:rows].length, predicate)
-        end.sort_by { |candidate| nway_access_key(candidate) }
+        join_scan_candidates(source, scopes[index])
       end
       context = { sources: inputs, scopes: scopes, scope: scope, offsets: offsets, predicates: predicates,
                   available: access, where: where, statement: statement }
@@ -164,20 +159,20 @@ module JedNative
       keys = gate && hash_join_keys(compile_filter(gate, scope), left_scope.length)
       kind = fixed ? ready.first&.dig(:kind) || :cross : ready.empty? ? :cross : :inner
       source = context[:sources][ordinal].merge(native_original_on: gate, native_join_where: context[:where])
-      index = join_index_plan(Relation.new(columns: left_scope, rows: []), source, kind, join_conjunctions(ready.map { |entry| entry[:ast] }), nil, choose: false)
-      if index
+      indexes = join_index_plan(Relation.new(columns: left_scope, rows: []), source, kind, join_conjunctions(ready.map { |entry| entry[:ast] }), nil, choose: false, all: !fixed)
+      indexes = fixed ? [indexes].compact : indexes || []
+      indexes = indexes.map do |index|
         index = index.merge(access: index[:access].dup)
         index[:access][:pipeline_cost] = index[:access][:scan_cost] + index[:access][:scan_rows] * expression_work(index[:filter])
+        index
       end
       choices = context[:available][ordinal].flat_map do |access|
         algorithms = [:nested]
         algorithms.unshift(:hash) if keys && (!fixed || %i[left left_outer].include?(kind))
         algorithms.map { |algorithm| [access, algorithm, nil] }
       end
-      choices << [index[:access], :index, index] if index
-      if fixed && index
-        choices = [[index[:access], :index, index]]
-      end
+      choices = [] if fixed && !indexes.empty?
+      indexes.each { |index| choices << [index[:access], :index, index] }
       choices.map do |access, algorithm, bound|
         pairs = [state[:rows] * access[:output_rows], QueryPlans::MAX_ESTIMATE].min
         logical = algorithm == :index ? pairs : [state[:logical] * access[:logical_rows], QueryPlans::MAX_ESTIMATE].min

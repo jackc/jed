@@ -1,0 +1,379 @@
+# frozen_string_literal: true
+
+module JedNative
+  class DeferredLivePages
+    include Enumerable
+    def initialize(known, tables)
+      @known, @tables = known, tables
+    end
+    def each
+      return enum_for(:each) unless block_given?
+      reached = @known.dup
+      walk = lambda do |node|
+        next unless node
+        reached.add(node[:page])
+        reached.merge(node[:overflow_pages] || [])
+        node[:children].each { |child| walk.call(child) }
+      end
+      walk_gist = lambda do |node|
+        next unless node
+        reached.add(node[:page])
+        node[:children].each { |_, child| walk_gist.call(child) } unless node[:leaf]
+      end
+      @tables.each do |table|
+        walk.call(table[:rows].tree) if table[:rows].is_a?(PagedRows)
+        table[:indexes].each do |index|
+          walk.call(index[:tree_profile][:tree]) if index.dig(:tree_profile, :paged_rows)
+          walk_gist.call(index[:gist_profile][:tree]) if index[:gist_profile]
+        end
+      end
+      reached.each { |page| yield page }
+    end
+  end
+
+  # Decoded leaves are refaultable. Routing nodes stay resident, while neither
+  # row values nor leaf key arrays escape this bounded cache unless a query or
+  # pending write actually retains them.
+  class LeafPool
+    attr_reader :codec, :image, :page_size
+    def initialize(codec, image, page_size, limit)
+      @codec, @image, @page_size = codec, image, page_size
+      @limit, @cache = [limit, 1].max, {}
+    end
+
+    def page(index)
+      @codec.read_page(@image, @page_size, index)
+    rescue Error
+      raise
+    rescue StandardError => error
+      raise Error.new('XX001', error.message)
+    end
+
+    def leaf(index, columns)
+      key = [index, columns]
+      value = @cache.delete(key)
+      unless value
+        raw = page(index)
+        raise Error.new('XX001', 'expected a B-tree leaf') unless raw[:type] == FileFormat::PAGE_LEAF
+        keys, regions = @codec.parse_pax_leaf(raw[:payload], raw[:item_count], columns)
+        raise Error.new('XX001', 'leaf keys are not strictly ascending') unless keys.each_cons(2).all? { |a, b| a < b }
+        value = { keys: keys, regions: regions, count: raw[:item_count] }
+        @cache.shift if @cache.length >= @limit
+      end
+      @cache[key] = value
+    rescue Error
+      raise
+    rescue StandardError => error
+      raise Error.new('XX001', error.message)
+    end
+
+    def cached_leaves = @cache.length
+  end
+
+  class PagedLeaf
+    attr_reader :page, :pool, :columns
+    EMPTY = [].freeze
+    def initialize(pool, page, columns)
+      @pool, @page, @columns = pool, page, columns
+    end
+
+    def [](key)
+      case key
+      when :page then @page
+      when :children then EMPTY
+      when :keys then data[:keys]
+      when :recs then records
+      when :overflow_pages then overflow_pages
+      end
+    end
+
+    def data = @pool.leaf(@page, @columns)
+    def count
+      raw = @pool.page(@page)
+      raise Error.new('XX001', 'expected a B-tree leaf') unless raw[:type] == FileFormat::PAGE_LEAF
+      raw[:item_count]
+    end
+
+    def value(slot, column)
+      region = data[:regions].fetch(column)
+      @pool.codec.leaf_value(region, @columns[column][:type], slot, ->(page) { @pool.page(page) })
+    rescue Error
+      raise
+    rescue StandardError => error
+      raise Error.new('XX001', error.message)
+    end
+
+    def units(slot, selected = nil)
+      pages = slabs = 0
+      data[:regions].each_with_index do |region, column|
+        next if region[:width] || selected && !selected.include?(column)
+        low = slot.zero? ? 0 : region[:ends][slot - 1]
+        length = region[:ends][slot] - low
+        next if length.zero?
+        bytes = region[:body].byteslice(low, length)
+        capacity = @pool.page_size - FileFormat::PAGE_HEADER
+        case bytes.getbyte(0)
+        when FileFormat::TAG_EXTERNAL
+          pages += (bytes.byteslice(5, 4).unpack1('N') + capacity - 1) / capacity
+        when FileFormat::TAG_INLINE_COMP
+          slabs += (bytes.byteslice(1, 4).unpack1('N') + capacity - 1) / capacity
+        when FileFormat::TAG_EXTERNAL_COMP
+          pages += (bytes.byteslice(5, 4).unpack1('N') + capacity - 1) / capacity
+          slabs += (bytes.byteslice(9, 4).unpack1('N') + capacity - 1) / capacity
+        end
+      end
+      [pages, slabs]
+    rescue Error
+      raise
+    rescue StandardError => error
+      raise Error.new('XX001', error.message)
+    end
+
+    def overflow_pages
+      pages = Set.new
+      data[:regions].each do |region|
+        next if region[:width]
+        previous = 0
+        region[:ends].each do |finish|
+          bytes = region[:body].byteslice(previous, finish - previous)
+          previous = finish
+          next unless [FileFormat::TAG_EXTERNAL, FileFormat::TAG_EXTERNAL_COMP].include?(bytes.getbyte(0))
+          page = bytes.byteslice(1, 4).unpack1('N')
+          until page.zero?
+            raise Error.new('XX001', 'overflow page reached twice') unless pages.add?(page)
+            raw = @pool.page(page)
+            raise Error.new('XX001', 'expected an overflow page') unless raw[:type] == FileFormat::PAGE_OVERFLOW
+            page = raw[:next_page]
+          end
+        end
+      end
+      pages.to_a
+    end
+
+    def records
+      codec, capacity = @pool.codec, @pool.page_size - FileFormat::PAGE_HEADER
+      shape = { columns: @columns }
+      self[:keys].each_with_index.map do |key, slot|
+        row = @columns.each_index.map { |column| value(slot, column) }
+        forms, comps, size = codec.plan_record(shape, key, row, capacity)
+        { key: key, row: row, table: shape, forms: forms, comps: comps, size: size }
+      end
+    end
+  end
+
+  # A virtual sequence keeps the existing executor's ordinal interface without
+  # retaining a Ruby array for every committed row or index entry.
+  class PageSequence
+    include Enumerable
+    def initialize(length, getter, iterator = nil)
+      @length, @getter, @iterator = length, getter, iterator
+    end
+    def length = @length.respond_to?(:call) ? @length.call : @length
+    alias size length
+    def empty? = length.zero?
+    def [](index, count = nil)
+      return Array.new(count) { |i| self[index + i] }.compact if count
+      return index.map { |i| self[i] }.compact if index.is_a?(Range)
+      index += length if index.negative?
+      return nil unless index.between?(0, length - 1)
+      @getter.call(index)
+    end
+    def fetch(index) = self[index] || raise(IndexError, 'row ordinal out of bounds')
+    def first = self[0]
+    def last = self[-1]
+    def each
+      return enum_for(:each) unless block_given?
+      if @iterator
+        @iterator.call { |value| yield value }
+      else
+        length.times { |index| yield self[index] }
+      end
+      self
+    end
+    def each_index = block_given? ? length.times { |index| yield index } : (0...length).each
+    def reverse_each = block_given? ? (length - 1).downto(0) { |index| yield self[index] } : enum_for(:reverse_each)
+    def bsearch_index
+      low, high = 0, length
+      while low < high
+        middle = (low + high) / 2
+        yield(self[middle]) ? high = middle : low = middle + 1
+      end
+      low == length ? nil : low
+    end
+    def +(other) = to_a + other.to_a
+    def dup = to_a
+    def ==(other) = equal?(other) || to_a == other
+  end
+
+  class PagedRow < Array
+    attr_reader :storage_leaf, :storage_slot
+    def initialize(leaf, slot, converter = nil)
+      super(leaf.columns.length)
+      @storage_leaf, @storage_slot, @converter = leaf, slot, converter
+      @loaded = {}
+    end
+    def [](index, count = nil)
+      return to_a[index, count] if count
+      return to_a[index] if index.is_a?(Range)
+      index += length if index.negative?
+      return nil unless index.between?(0, length - 1)
+      unless @loaded[index]
+        value = @storage_leaf.value(@storage_slot, index)
+        value = @converter.call(@storage_leaf.columns[index][:type], value) if @converter
+        self[index] = value
+        @loaded[index] = true
+      end
+      super(index)
+    end
+    def each
+      return enum_for(:each) unless block_given?
+      length.times { |index| yield self[index] }
+      self
+    end
+    def each_with_index
+      return enum_for(:each_with_index) unless block_given?
+      length.times { |index| yield self[index], index }
+      self
+    end
+    def map = block_given? ? each.map { |value| yield value } : enum_for(:map)
+    def to_a = each.to_a
+    alias to_ary to_a
+    def dup = to_a
+    def +(other) = to_a + other.to_a
+    def zip(*others, &block) = to_a.zip(*others, &block)
+    def values_at(*indices) = indices.map { |index| self[index] }
+    def ==(other) = to_a == other.to_a
+  end
+
+  class PagedRows < PageSequence
+    attr_reader :tree, :pool, :columns, :raw, :profile, :entries
+    def initialize(pool, root, columns, row_count, converter: nil, raw: nil)
+      @pool, @columns, @converter, @raw = pool, columns, converter, raw
+      @leaves, seen = [], Set.new
+      @tree, height = load_skeleton(root, seen)
+      @profile = { tree: @tree, height: height, node_count: seen.length, paged_rows: self }
+      length = row_count || -> { actual_count }
+      super(length, ->(index) { leaf, slot = locate(index); leaf && PagedRow.new(leaf, slot, @converter) },
+            ->(&block) { each_leaf_row { |leaf, slot, _| block.call(PagedRow.new(leaf, slot, @converter)) } })
+      @entries = PageSequence.new(length, ->(index) { leaf, slot = locate(index); leaf && [leaf[:keys][slot], index] },
+                                  ->(&block) { each_leaf_row { |leaf, slot, ordinal| block.call([leaf[:keys][slot], ordinal]) } })
+    end
+
+    def converted(&converter)
+      result = dup_view
+      result.instance_variable_set(:@raw, self)
+      result.instance_variable_set(:@converter, converter)
+      result
+    end
+
+    def dup_view
+      # Reuse the resident routing skeleton and bounded pool across raw and
+      # typed views. Rebuilding the closures binds them to the correct view.
+      self.class.new(@pool, @tree ? @tree[:page] : 0, @columns, length, raw: @raw)
+    end
+
+    def keys = @keys ||= PageSequence.new(@length, ->(index) { @entries[index]&.first }, ->(&block) { @entries.each { |key, _| block.call(key) } })
+    def rowids(codec) = PageSequence.new(length, ->(index) { codec.decode_int(8, keys[index]) })
+    def actual_count
+      ensure_offsets
+      @offsets.last || 0
+    end
+
+    def point(key)
+      leaf, slot = point_slot(key)
+      leaf && PagedRow.new(leaf, slot, @converter)
+    end
+
+    def ordinal_for_key(key)
+      leaf, slot = point_slot(key)
+      raise Error.new('XX001', 'index entry references absent row') unless leaf
+      ordinal_for_leaf_slot(leaf, slot)
+    end
+
+    def ordinal_for_leaf_slot(leaf, slot)
+      ensure_offsets
+      @leaf_numbers ||= @leaves.each_with_index.to_h
+      @offsets[@leaf_numbers.fetch(leaf)] + slot
+    end
+
+    def point_slot(key)
+      node = @tree
+      while node && !node[:children].empty?
+        index = node[:keys].bsearch_index { |boundary| boundary > key } || node[:keys].length
+        node = node[:children][index]
+      end
+      return [nil, nil] unless node
+      slot = node[:keys].bsearch_index { |stored| stored >= key }
+      slot && node[:keys][slot] == key ? [node, slot] : [nil, nil]
+    end
+
+    def scan_units(ordinals = nil, columns = nil)
+      return [0, 0] if columns&.empty?
+      pages = slabs = 0
+      if ordinals
+        ordinals.each do |ordinal|
+          leaf, slot = ordinal.is_a?(PagedRow) ? [ordinal.storage_leaf, ordinal.storage_slot] : locate(ordinal)
+          a, b = leaf.units(slot, columns)
+          pages += a; slabs += b
+        end
+      else
+        each_leaf_row do |leaf, slot, _|
+          a, b = leaf.units(slot, columns)
+          pages += a; slabs += b
+        end
+      end
+      [pages, slabs]
+    end
+
+    private
+
+    def load_skeleton(page, seen)
+      return [nil, 0] if page.zero?
+      raise Error.new('XX001', 'B-tree page reached twice') unless seen.add?(page)
+      raw = @pool.page(page)
+      if raw[:type] == FileFormat::PAGE_LEAF
+        leaf = PagedLeaf.new(@pool, page, @columns)
+        @leaves << leaf
+        return [leaf, 1]
+      end
+      raise Error.new('XX001', 'expected a B-tree interior') unless raw[:type] == FileFormat::PAGE_INTERIOR
+      pointers = Array.new(raw[:item_count] + 1) { |index| raw[:payload].byteslice(index * 4, 4).unpack1('N') }
+      first, height = load_skeleton(pointers.shift, seen)
+      children = [first]
+      pointers.each do |child|
+        if height == 1
+          raise Error.new('XX001', 'B-tree page reached twice') unless seen.add?(child)
+          leaf = PagedLeaf.new(@pool, child, @columns)
+          children << leaf
+          @leaves << leaf
+        else
+          node, child_height = load_skeleton(child, seen)
+          raise Error.new('XX001', 'unbalanced B-tree') unless child_height == height
+          children << node
+        end
+      end
+      [{ page: page, keys: @pool.codec.interior_keys(raw), recs: [], children: children }, height + 1]
+    end
+
+    def each_leaf_row
+      ordinal = 0
+      @leaves.each do |leaf|
+        leaf.data[:count].times do |slot|
+          yield leaf, slot, ordinal
+          ordinal += 1
+        end
+      end
+    end
+
+    def ensure_offsets
+      @offsets ||= @leaves.each_with_object([0]) { |leaf, offsets| offsets << offsets.last + leaf.count }
+    end
+
+    def locate(index)
+      ensure_offsets
+      return [nil, nil] unless index.between?(0, @offsets.last - 1)
+      leaf = @offsets.bsearch_index { |offset| offset > index } - 1
+      [@leaves[leaf], index - @offsets[leaf]]
+    end
+  end
+end

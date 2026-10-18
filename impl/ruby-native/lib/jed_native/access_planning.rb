@@ -96,15 +96,15 @@ module JedNative
       secondary = %i[secondary secondary_interval].include?(candidate[:kind])
       metadata = secondary ? stored[:native_secondary_metadata][candidate[:name]] : stored[:native_primary_metadata]
       keys = secondary ? metadata[:expressions] : metadata[:columns].each_with_index.map { |column, i| Expression.new(kind: :column, type: metadata[:types][i], value: column) }
-      return :blocking if keys.empty? || orders.length > keys.length
-      directions = orders.map { |order| order[:direction] == :desc }
+      return :blocking if keys.empty? || secondary && orders.length > keys.length
+      directions = orders.take(keys.length).map { |order| order[:direction] == :desc }
       return :blocking unless directions.uniq.length == 1
-      return :blocking if directions.first && (secondary || orders.length != keys.length)
+      return :blocking if directions.first && (secondary || orders.length < keys.length)
       return :blocking if secondary && metadata[:orders].any? { |descending, nulls_first| descending || nulls_first }
       source = statement[:from].first
       scope = table_columns(stored, source[:alias] || source[:name])
       projections = expand_stars(statement[:columns], scope)
-      valid = orders.each_with_index.all? do |order, i|
+      valid = orders.take(keys.length).each_with_index.all? do |order, i|
         node = order[:expr]
         if node[:kind] == :literal && node[:value].is_a?(Integer)
           node = projections[node[:value] - 1]&.dig(:expr)
@@ -294,7 +294,7 @@ module JedNative
       rows = candidate_selectivity(count, access, stored)
       index = case access[:kind]
       when :secondary, :secondary_interval then stored[:native_secondary_metadata][access[:name]]
-      when :gin, :gist then stored[:native_auxiliary_indexes][access[:name]]
+      when :gin then stored[:native_auxiliary_indexes][access[:name]]
       else structure
       end
       pages = if access[:kind] == :full
@@ -304,7 +304,7 @@ module JedNative
       else
         [[candidate_selectivity(index[:node_count], access, stored), index[:height]].max, index[:node_count]].min
       end
-      work = access[:kind] == :gin ? rows : access[:kind] == :gist ? [pages - 1, 0].max : 0
+      work = access[:kind] == :gin ? rows : access[:kind] == :gist ? pages : 0
       original_rows = rows
       order = scan_candidate_order(statement, stored, access)
       limit = statement && statement[:limit] && statement[:limit][:kind] == :literal && statement[:limit][:value]
@@ -313,10 +313,10 @@ module JedNative
         target = [limit + offset, 0].max
         cap = required_scan_input(predicate, target, rows)
         rows = [rows, cap].min
-        if %i[primary_interval secondary_interval].include?(access[:kind])
-          pages = rows.zero? ? 0 : [pages, rows * index[:height]].min
-        elsif %i[full primary].include?(access[:kind]) && rows < original_rows
+        if %i[full primary primary_interval].include?(access[:kind]) && rows < original_rows
           pages = rows.zero? ? 0 : [pages, [rows, structure[:height]].max].min
+        elsif access[:native_order_only] && rows < original_rows
+          pages = rows.zero? ? 0 : [[rows, index[:height]].max, index[:node_count]].min
         end
       end
       fetches = %i[secondary secondary_interval gin gist].include?(access[:kind]) ? rows * structure[:height] : 0
