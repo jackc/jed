@@ -392,8 +392,12 @@ module JedNative
         if statement[:on_conflict]
           conflict = statement[:on_conflict].dup
           raise Error.new('42704', 'views have no named constraints') if conflict[:constraint]
+          raise Error.new('0A000', 'partial conflict inference through a view is not supported') if conflict[:predicate]
           if conflict[:elements]
-            conflict[:elements] = conflict[:elements].map { |node| rewrite_view_value(node, plan[:columns], qualifiers, nil) }
+            conflict[:elements] = conflict[:elements].map do |node|
+              resolve_conflict_element(node, view_schema(view))
+              rewrite_view_value(node, plan[:columns], qualifiers, nil).merge(node.slice(:opclass, :direction, :nulls))
+            end
             conflict[:columns] = conflict[:elements].map { |node| node[:name] }
           end
           conflict[:assignments] = rewrite_view_assignments(conflict[:assignments] || [], view, plan, qualifiers, label)

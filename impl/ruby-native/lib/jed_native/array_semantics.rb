@@ -5,6 +5,7 @@ module JedNative
     def compile(node, columns)
       if node[:kind] == :call
         if node[:variadic]
+          return super if node[:name].start_with?('json') || %w[concat concat_ws format].include?(node[:name])
           raise Error.new('42883', 'function has no variadic overload') unless %w[num_nulls num_nonnulls].include?(node[:name])
           argument = compile(node[:args].first, columns)
           raise Error.new('42804', 'VARIADIC argument must be an array') unless argument.type.end_with?('[]')
@@ -45,8 +46,12 @@ module JedNative
     def contextual_binary(operator, left, right)
       if %w[|| @> <@ &&].include?(operator)
         [[left, right], [right, left]].each do |value, sibling|
-          next unless sibling.type.end_with?('[]') && value.kind == :array
+          next unless sibling.type.end_with?('[]')
           target = sibling.type.delete_suffix('[]')
+          if operator == '||' && value.kind == :literal && value.extra&.dig(:untyped) && literal_adapts?(value, target)
+            value.value, value.type = cast_value(value.value, target), target
+          end
+          next unless value.kind == :array
           if value.args.all? { |child| child.kind == :literal && child.extra&.dig(:untyped) && literal_adapts?(child, target) }
             value.args.each { |child| child.value = cast_value(child.value, target); child.type = target }
             value.type = sibling.type

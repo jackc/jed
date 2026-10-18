@@ -62,7 +62,29 @@ module JedNative
           node
         end
       end
-      (statement[:group_by] || []).map { |node| resolve.call(node) }
+      nodes = (statement[:group_by] || []).map { |node| resolve.call(node) }
+      return nodes if nodes.empty? || nodes.any? { |node| %i[rollup cube grouping_sets].include?(node[:kind]) }
+
+      # A complete base-table primary key determines the remaining columns.
+      # They become ordinary master grouping keys, including in joins; derived
+      # relations and grouping sets do not confer this dependency.
+      slots = nodes.filter_map { |node| compile(node, columns).value if node[:kind] == :column }
+      sources = (statement[:from] || []) + (statement[:joins] || []).map { |join| join[:relation] }
+      sources.each do |source|
+        next unless source[:kind] == :table && !@ctes.key?(source[:name]) && (stored = @tables[source[:name]])
+        primary = stored[:constraints].find { |constraint| constraint[:kind] == :primary_key }
+        next unless primary && !primary[:columns].empty?
+        label = source[:alias] || source[:name]
+        primary_slots = primary[:columns].map { |name| columns.index { |column| column[:table] == label && column[:name] == name } }
+        next unless primary_slots.all? { |slot| slot && slots.include?(slot) }
+
+        columns.each_with_index do |column, slot|
+          next unless column[:table] == label && !slots.include?(slot)
+          nodes << { kind: :column, name: column[:name], table: label }
+          slots << slot
+        end
+      end
+      nodes
     end
 
     def validate_aggregate_scope(statement, columns, grouped)

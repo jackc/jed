@@ -43,7 +43,9 @@ require_relative 'jed_native/interval_scans'
 require_relative 'jed_native/auxiliary_scans'
 require_relative 'jed_native/hash_joins'
 require_relative 'jed_native/join_planner'
+require_relative 'jed_native/nway_joins'
 require_relative 'jed_native/join_pushdown'
+require_relative 'jed_native/body_pushdown'
 require_relative 'jed_native/index_nested_loops'
 require_relative 'jed_native/streaming_select'
 require_relative 'jed_native/timezones'
@@ -51,9 +53,12 @@ require_relative 'jed_native/range_constructors'
 require_relative 'jed_native/datetime_functions'
 require_relative 'jed_native/argument_resolution'
 require_relative 'jed_native/collations'
+require_relative 'jed_native/collation_upgrade'
 require_relative 'jed_native/domains'
 require_relative 'jed_native/queryplan'
 require_relative 'jed_native/join_explain'
+require_relative 'jed_native/nway_explain'
+require_relative 'jed_native/relation_explain'
 require_relative 'jed_native/access_planning'
 require_relative 'jed_native/statistics_estimates'
 require_relative 'jed_native/create_table_as'
@@ -67,10 +72,20 @@ require_relative 'jed_native/composite_values'
 require_relative 'jed_native/strict_context'
 require_relative 'jed_native/array_semantics'
 require_relative 'jed_native/function_resolution'
+require_relative 'jed_native/scalar_edges'
 require_relative 'jed_native/capabilities'
 require_relative 'jed_native/filter_predicates'
 require_relative 'jed_native/sorted_select'
+require_relative 'jed_native/spill_storage'
+require_relative 'jed_native/spill_select'
+require_relative 'jed_native/spill_aggregates'
+require_relative 'jed_native/explain_composition'
 require_relative 'jed_native/query_memory'
+require_relative 'jed_native/contradictions'
+require_relative 'jed_native/opaque_definitions'
+require_relative 'jed_native/predicate_implication'
+require_relative 'jed_native/schema_resolution'
+require_relative 'jed_native/storage_limits'
 
 module JedNative
   VERSION = '0.0.0.experimental'
@@ -134,6 +149,11 @@ module JedNative
     end
 
     def close = @engine.close
+    def upgrade_collations = @engine.upgrade_collations
+    def set_max_storage_bytes(bytes, database = 'main') = @engine.set_max_storage_bytes(bytes, database)
+    def max_temp_storage_bytes=(bytes)
+      @engine.max_temp_storage_bytes = bytes
+    end
     def render(value, type = nil) = @engine.render_value(value, type)
     def timezone = @engine.timezone
     def timezone=(name)
@@ -159,6 +179,10 @@ module JedNative
     def max_query_memory_bytes=(value)
       @engine.max_query_memory_bytes = value
     end
+    def work_mem=(value)
+      @engine.work_mem = value
+    end
+    def set_work_mem(value) = (@engine.work_mem = value)
   end
 
   def self.memory(**options)
@@ -174,9 +198,31 @@ module JedNative
   def self.create(path, **options, &block) = file_database(path, true, options, &block)
   def self.open(path, **options, &block) = file_database(path, false, options, &block)
 
+  def self.from_image(bytes, **options)
+    require_relative 'jed_native/persistence'
+    db = Database.new(**options)
+    codec = FileFormat.new(collation_key: ->(name, value) { db.engine.resolve_collation(name).sort_key(value) })
+    state = codec.decode_image(bytes)
+    db.engine.instance_variable_set(:@native_page_size, bytes.byteslice(8, 4).unpack1('N'))
+    db.engine.send(:import_storage, state)
+    db.engine.seed_memory_image(bytes, state)
+    return db unless block_given?
+    begin
+      yield db
+    ensure
+      db.close
+    end
+  rescue Error
+    db&.close
+    raise
+  rescue StandardError => error
+    db&.close
+    raise Error.new('XX001', error.message)
+  end
+
   def self.file_database(path, create, options)
     require_relative 'jed_native/persistence'
-    engine_options = options.select { |key, _| %i[environment max_cost max_scalar_bytes max_sql_length lifetime_max_cost allow_ddl allow_temp_ddl default_privileges max_query_memory_bytes].include?(key) }
+    engine_options = options.select { |key, _| %i[environment max_cost max_scalar_bytes max_sql_length lifetime_max_cost allow_ddl allow_temp_ddl default_privileges max_query_memory_bytes work_mem max_temp_storage_bytes].include?(key) }
     storage_options = options.reject { |key, _| engine_options.key?(key) }
     db = Database.new(**engine_options)
     db.engine.attach_storage(path: path, create: create, **storage_options)

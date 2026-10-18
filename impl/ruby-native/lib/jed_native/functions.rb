@@ -281,6 +281,8 @@ module JedNative
       when 'unnest' then a.to_a
       when 'generate_series' then series(args, context)
       when 'i32range', 'int4range', 'i64range', 'int8range', 'numrange', 'tsrange', 'tstzrange', 'daterange'
+        raise Error.new('22000', 'range bound flags must not be NULL') if args.length == 3 && c.nil?
+        raise Error.new('42601', 'invalid range bound flags') if c && !%w[[] [) (] ()].include?(c)
         RangeValue.new(a, b, c || '[)', element_type: Types::RANGES.fetch(Types.normalize(name)))
       when 'isempty' then a.empty
       when 'lower_inc' then a.lower_inc
@@ -662,10 +664,10 @@ when 'hex'
       end
       TimestampValue.new(DateValue.from_parts(year, month, date).days * TimestampValue::DAY + time, zoned: value.is_a?(TimestampValue) && value.zoned)
     end
-    def age(a, b)
+    def age(a, b, ordered: false)
       a = TimestampValue.parse(a)
       b = TimestampValue.parse(b)
-      return -age(b, a) if a < b
+      return -age(b, a) if !ordered && a < b
       ay, am, ad = DateValue.new(a.micros.div(TimestampValue::DAY)).parts
       by, bm, bd = DateValue.new(b.micros.div(TimestampValue::DAY)).parts
       months, days, micros = (ay - by) * 12 + am - bm, ad - bd, a.micros % TimestampValue::DAY - b.micros % TimestampValue::DAY

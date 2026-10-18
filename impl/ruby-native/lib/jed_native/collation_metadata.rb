@@ -98,7 +98,7 @@ module JedNative
     end
 
     def column_collation(column)
-      column[:collation_label] || (column[:collation] ? collation_label(column[:collation]) : collatable_type?(column[:type]) ? collation_label(default_collation, default: true) : nil)
+      column[:collation_label] || (collation_label(column[:collation] || 'C') if collatable_type?(column[:type]))
     end
 
     def merge_query_collation(left, right)

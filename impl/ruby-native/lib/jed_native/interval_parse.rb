@@ -11,7 +11,7 @@ module JedNative
       'week' => :week, 'weeks' => :week, 'w' => :week,
       'day' => :day, 'days' => :day, 'd' => :day,
       'hour' => :hour, 'hours' => :hour, 'h' => :hour, 'hr' => :hour, 'hrs' => :hour,
-      'minute' => :minute, 'minutes' => :minute, 'm' => :minute, 'min' => :minute, 'mins' => :minute, 'mm' => :minute,
+      'minute' => :minute, 'minutes' => :minute, 'min' => :minute, 'mins' => :minute, 'mm' => :minute,
       'second' => :second, 'seconds' => :second, 's' => :second, 'sec' => :second, 'secs' => :second,
       'millisecond' => :millisecond, 'milliseconds' => :millisecond, 'ms' => :millisecond, 'msecond' => :millisecond, 'mseconds' => :millisecond,
       'microsecond' => :microsecond, 'microseconds' => :microsecond, 'us' => :microsecond, 'usecond' => :microsecond, 'useconds' => :microsecond
@@ -50,8 +50,10 @@ module JedNative
         else raise Error.new('22007', 'invalid input syntax for interval')
         end
         text = text[m[0].length..]
+        raise Error.new('22007', 'interval fields must be separated') unless text.empty? || /\A[\s,]/.match?(text)
       end
       raise Error.new('22007', 'invalid input syntax for interval') if tokens.empty?
+      raise Error.new('22007', 'unitless field before ago') if ago && tokens.last[0].nil?
       (tokens.length - 1).downto(0) do |index|
         token = tokens[index]
         next if token[0]

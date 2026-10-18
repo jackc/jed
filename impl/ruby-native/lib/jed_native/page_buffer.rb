@@ -17,7 +17,7 @@ module JedNative
     def bytesize = @page_size * @page_count
 
     def resize(page_count)
-      raise ArgumentError, "invalid page count" unless page_count.between?(@page_count, 0xFFFF_FFFF)
+      raise ArgumentError, "invalid page count" unless page_count.between?(3, 0xFFFF_FFFF) && @pages.keys.none? { |page| page >= page_count }
 
       @page_count = page_count
     end

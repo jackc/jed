@@ -4,7 +4,12 @@ module JedNative
   # A CTE keeps its declaration scope. Query bodies can be evaluated at their
   # reference sites; writable bodies always produce one materialized buffer.
   module CTEs
-    CTEBinding = Struct.new(:columns, :rows, :query, :ctes, :outer, :side_effect, keyword_init: true)
+    CTEBinding = Struct.new(:columns, :rows, :query, :ctes, :outer, :side_effect, :native_body_pushable, keyword_init: true)
+
+    def cte_body_pushable?(name)
+      binding = @ctes[name]
+      binding.is_a?(CTEBinding) && binding.native_body_pushable == true
+    end
 
     def dispatch(statement)
       owns_structure = !@cte_structure_active
@@ -97,7 +102,12 @@ module JedNative
           next
         end
         references = cte_reference_count(primary, cte[:name])
-        items.drop(ordinal + 1).each { |later| references += cte_reference_count(later[:query], cte[:name]) }
+        read_from_mutation = %i[insert update delete].include?(primary[:kind]) && references.positive?
+        items.drop(ordinal + 1).each do |later|
+          count = cte_reference_count(later[:query], cte[:name])
+          references += count
+          read_from_mutation ||= %i[insert update delete].include?(later[:query][:kind]) && count.positive?
+        end
         modifying = %i[insert update delete].include?(body[:kind])
         if modifying && !body[:returning] && references.positive?
           raise Error.new('0A000', 'data-modifying CTE has no RETURNING clause')
@@ -110,6 +120,7 @@ module JedNative
         declaration = @ctes.dup
         materialized = modifying || references.positive? && (cte[:materialized] == true || cte[:materialized].nil? && references > 1)
         if materialized
+          definition_start = @cost
           if modifying
             result = dispatch(body)
             relation = Relation.new(columns: columns, rows: result.rows)
@@ -117,8 +128,10 @@ module JedNative
             relation = select(body)
           end
           @ctes[cte[:name]] = CTEBinding.new(columns: columns, rows: relation.rows, side_effect: modifying && !body[:returning])
+          explain_cte_definition(cte[:name], definition_start) if respond_to?(:explain_cte_definition)
         else
-          @ctes[cte[:name]] = CTEBinding.new(columns: columns, query: body, ctes: declaration, outer: @outer.dup)
+          @ctes[cte[:name]] = CTEBinding.new(columns: columns, query: body, ctes: declaration, outer: @outer.dup,
+                                           native_body_pushable: references == 1 && !read_from_mutation && !@cte_mutation)
         end
       end
     end
@@ -127,11 +140,12 @@ module JedNative
       binding = source[:kind] == :table && !source[:database] && @ctes[source[:name]]
       return super unless binding.is_a?(CTEBinding)
       raise Error.new('0A000', 'data-modifying CTE has no RETURNING clause') if binding.side_effect
+      body = respond_to?(:explain_cte_source_query) ? explain_cte_source_query(source, binding) : source[:native_body_query] || binding.query
       if binding.query
         previous_ctes, previous_outer = @ctes, @outer
         begin
           @ctes, @outer = binding.ctes.dup, binding.outer.dup
-          relation = select(binding.query)
+          relation = select(body)
         ensure
           @ctes, @outer = previous_ctes, previous_outer
         end

@@ -190,7 +190,7 @@ module JedNative
       when Array then node.each { |child| schema_expression_structure(child, context) }
       when Hash
         case node[:kind]
-        when :subquery, :exists, :array_query then raise Error.new('0A000', "subquery in #{context}")
+        when :subquery, :exists, :array_query, :select, :values, :set_operation then raise Error.new('0A000', "subquery in #{context}")
         when :param then raise Error.new('42P02', 'parameter in schema expression')
         when :call
           raise Error.new('42P20', "window function in #{context}") if node[:over]

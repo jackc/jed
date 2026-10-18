@@ -18,7 +18,12 @@ module JedNative
           raise Error.new('428C9', 'GENERATED ALWAYS requires DEFAULT or OVERRIDING')
         end
       end
-      defaults = t[:columns].map { |c| c[:default] && compile(c[:default], []) }
+      defaults = t[:columns].each_with_index.map do |column, ordinal|
+        position = indices.index(ordinal)
+        needed = stmt[:default_values] || position.nil? || column[:identity] && stmt[:overriding] == 'user' ||
+                 (stmt[:rows] || []).any? { |row| row[position]&.dig(:kind) == :default }
+        column[:default] && needed ? compile(column[:default], []) : nil
+      end
       source = stmt[:query] && select(stmt[:query])
       inputs = source ? source.rows : stmt[:rows]
       conflict = stmt[:on_conflict]
@@ -56,7 +61,7 @@ module JedNative
         end
         profile_accumulate(:values, @cost - values_start) if @explain_profile_frames
         validate_candidate(t, candidate, checks)
-        target = conflict && conflict_row(arbiters, candidate, rows)
+        target = conflict && conflict_row(arbiters, candidate, rows, affected)
         if target
           next if conflict[:action] == :nothing
           raise Error.new('21000', 'ON CONFLICT cannot affect a row twice') if affected[target]
@@ -286,18 +291,19 @@ module JedNative
         raise Error.new('42704', 'unknown conflict constraint') if arbiters.empty?
         raise Error.new('42809', 'exclusion arbiter cannot update') if conflict[:action] == :update && arbiters.any? { |a| a[:kind] == :exclude }
       elsif conflict[:elements]
+        decorations_match = true
         names = conflict[:elements].map do |element|
-          node = element[:kind] == :collate ? element[:expr] : element
-          raise Error.new('42P10', 'conflict target must name columns') unless node[:kind] == :column
-          mutation_target_indices(t, [node[:name]])
-          raise Error.new('42704', 'collation is not loaded') if element[:kind] == :collate && element[:name] != 'C'
-          raise Error.new('0A000', 'conflict operator classes are not implemented') if element[:opclass]
-          node[:name]
+          name, matches = resolve_conflict_element(element, t[:columns])
+          decorations_match &&= matches
+          name
         end.uniq.sort
-        compile(conflict[:predicate], scope) if conflict[:predicate]
+        if conflict[:predicate]
+          schema_expression_structure(conflict[:predicate], :conflict)
+          premise = compile(conflict[:predicate], scope)
+        end
         arbiters.select! do |arbiter|
-          arbiter[:kind] != :exclude && arbiter[:columns]&.compact&.sort == names &&
-            (!arbiter[:where] || predicate_implies?(conflict[:predicate], arbiter[:where]))
+          decorations_match && arbiter[:kind] != :exclude && arbiter[:columns]&.compact&.sort == names &&
+            (!arbiter[:where] || partial_predicate_implied?(compile(arbiter[:where], scope), premise ? conjunctions(premise) : []))
         end
         raise Error.new('42P10', 'no matching unique conflict constraint') if arbiters.empty?
         arbiters.sort_by! { |arbiter| [arbiter[:kind] == :primary_key ? 0 : arbiter[:where] ? 2 : 1, arbiter[:name].b] }
@@ -311,6 +317,29 @@ module JedNative
       end
     end
 
+    def resolve_conflict_element(element, columns)
+      raise Error.new('42P10', 'ordering is not allowed in ON CONFLICT') if element[:direction] || element[:nulls]
+      node = element[:kind] == :collate ? element[:expr] : element
+      raise Error.new('42P10', 'conflict target must name columns') unless node[:kind] == :column
+      column = columns.find { |candidate| candidate[:name] == node[:name] }
+      raise Error.new('42703', "unknown column #{node[:name]}") unless column
+      matches = true
+      if element[:kind] == :collate
+        resolve_collation(element[:name])
+        matches &&= collatable_type?(column[:type]) && (column[:collation] || 'C') == element[:name]
+      end
+      if element[:opclass]
+        opclass = element[:opclass] == 'varchar_ops' ? 'text_ops' : element[:opclass]
+        unless FunctionCatalog::BTREE_OPCLASSES.value?(opclass) || %w[array_ops range_ops record_ops].include?(opclass)
+          raise Error.new('42704', "operator class #{opclass} does not exist for btree")
+        end
+        type = column[:type]
+        actual = type.end_with?('[]') ? 'array_ops' : Types::RANGES.key?(type) ? 'range_ops' : @types.key?(type) ? 'record_ops' : FunctionCatalog::BTREE_OPCLASSES[type]
+        matches &&= opclass == actual
+      end
+      [node[:name], matches]
+    end
+
     def predicate_implies?(provided, required)
       return false unless provided
       return true if provided == required
@@ -320,12 +349,16 @@ module JedNative
       false
     end
 
-    def conflict_row(arbiters, candidate, rows)
+    def conflict_row(arbiters, candidate, rows, affected = {})
       arbiters.each do |arbiter|
         next if arbiter[:predicate] && evaluate(arbiter[:predicate], candidate) != true
         key = arbiter[:expressions].map { |expr| evaluate(expr, candidate) }
         next if key.any?(&:nil?)
+        # Probe unaffected committed rows before the overlay: a new key may
+        # temporarily coincide with a committed key that this statement moves.
+        [false, true].each do |already_affected|
         rows.each_with_index do |row, index|
+          next unless !!affected[index] == already_affected
           next if arbiter[:predicate] && evaluate(arbiter[:predicate], row) != true
           other = arbiter[:expressions].map { |expr| evaluate(expr, row) }
           next if other.any?(&:nil?)
@@ -334,6 +367,7 @@ module JedNative
             Types.binary(op, key[position], other[position], type: 'boolean') == true
           end
           return index if matches
+        end
         end
       end
       nil
