@@ -2186,11 +2186,18 @@ func (db *Database) Close() error {
 		st.paging = nil
 	}
 	// Release any still-attached file databases (an in-memory attachment's close is a no-op), so the
-	// host need not detach before Close (attached-databases.md §4). Order-independent (just closing).
+	// host need not detach before Close (attached-databases.md §4). In name order: a relaxed
+	// attachment's close flushes its batch (validated-cow.md §4), so the order is the order of I/O.
 	c.attachmentsMu.Lock()
 	coordinators := make([]*fileCoordinator, 0, len(c.attachments))
 	var inners []*Database
-	for _, att := range c.attachments {
+	names := make([]string, 0, len(c.attachments))
+	for name := range c.attachments {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		att := c.attachments[name]
 		if att.svc != nil {
 			inners = append(inners, att.svc)
 			continue
