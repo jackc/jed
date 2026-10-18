@@ -1,202 +1,388 @@
-// The main-thread client for the jed engine Web Worker (worker.ts) — the ONLY engine API the Svelte
-// UI sees (spec/design/hosts.md §5). It owns ONE lazily-spawned worker shared across every live
-// example and the tool: the ~engine bundle loads once, off the main thread, and each database is a
-// handle (JedDb) keyed by an id inside that one worker. query/run are always async whether a db is
-// in-memory or OPFS-backed — one uniform path, so a docs widget and the tool share this abstraction.
-//
-// Browser-only: it constructs a Worker, so every method must be called client-side (inside onMount /
-// an event handler), never during SSR/prerender.
-
+// Display facade for the shared typed browser runtime. Each database owns an
+// execution worker; examples and the tool use identical session/cursor lifecycles.
+import {
+  createDatabase,
+  openDatabase,
+  type AsyncDatabase,
+  type AsyncSession
+} from '$jed/browser/async.ts';
+import { EngineError } from '$jed/errors.ts';
+import { render } from '$jed/value.ts';
+import { splitSql } from './split.ts';
 import type {
   DbMode,
-  OpenSpec,
+  FileReply,
+  FileRequest,
   OpfsFileInfo,
-  Reply,
-  Req,
   RunResult,
   SchemaResult
 } from './protocol.ts';
 
-// A request body is a Req without its rid (the transport assigns it). Distributes over the union.
-type ReqBody = Req extends infer R ? (R extends { rid: number } ? Omit<R, 'rid'> : never) : never;
-
-// DEFAULT_MEMORY_MAX_COST is the cost ceiling applied to in-memory demo/example databases by default
-// (CLAUDE.md §13): generous enough for real demos (thousands of rows), low enough that a runaway
-// query — e.g. SELECT * FROM generate_series(1, 1e12) — aborts with a clean 54P01 instead of hanging
-// the worker. The tool overrides this (default unlimited, user-settable).
 export const DEFAULT_MEMORY_MAX_COST = 5_000_000n;
+// The types reference currently mounts 37 independent live examples. Keep the
+// site's explicit bound above that page while the general library default is 32.
+const WEBSITE_RUNTIME = { maxWorkers: 64 };
 
-// JedError mirrors an engine error on the main thread: a SQLSTATE code plus message (the structured
-// error survives the worker boundary). The result grid renders code + message prominently.
 export class JedError extends Error {
-  readonly code: string;
-  constructor(code: string, message: string) {
+  constructor(
+    readonly code: string,
+    message: string
+  ) {
     super(message);
     this.name = 'JedError';
-    this.code = code;
   }
 }
 
-let worker: Worker | null = null;
-let nextRid = 1;
-let nextDbSeq = 1;
-const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
-
-function ensureWorker(): Worker {
-  if (worker !== null) return worker;
-  // The new URL(..., import.meta.url) form lets Vite emit the worker as its own ES-module chunk
-  // (the proven impl/ts pattern). Spawned lazily on first use so a reader who never runs an example
-  // never pays for the engine.
-  const w = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
-  w.addEventListener('message', (ev: MessageEvent<Reply>) => {
-    const reply = ev.data;
-    const p = pending.get(reply.rid);
-    if (p === undefined) return;
-    pending.delete(reply.rid);
-    if (reply.ok) p.resolve(reply.result);
-    else p.reject(new JedError(reply.error.code, reply.error.message));
-  });
-  worker = w;
-  return w;
+async function displayed<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof EngineError) throw new JedError(error.code(), error.message);
+    throw error;
+  }
 }
 
-function call(body: ReqBody): Promise<unknown> {
-  const w = ensureWorker();
-  const rid = nextRid++;
-  const msg = { rid, ...body } as Req;
-  return new Promise<unknown>((resolve, reject) => {
-    pending.set(rid, { resolve, reject });
-    // Transfer the bytes of an import so a large file image isn't structured-clone-copied.
-    if (body.op === 'importBytes') {
-      w.postMessage(msg, [body.bytes.buffer]);
-    } else {
-      w.postMessage(msg);
+function commandTag(sql: string, count: number | null): string {
+  // This is only a display label. The engine parses and validates the statement in
+  // its worker; no parser, planning, or database state is copied onto the UI thread.
+  let start = 0;
+  while (start < sql.length) {
+    if (/\s/.test(sql[start]!)) {
+      start++;
+      continue;
     }
-  });
+    if (sql.startsWith('--', start)) {
+      const end = sql.indexOf('\n', start + 2);
+      start = end < 0 ? sql.length : end + 1;
+      continue;
+    }
+    if (sql.startsWith('/*', start)) {
+      start += 2;
+      let depth = 1;
+      while (start < sql.length && depth > 0) {
+        if (sql.startsWith('/*', start)) {
+          depth++;
+          start += 2;
+        } else if (sql.startsWith('*/', start)) {
+          depth--;
+          start += 2;
+        } else start++;
+      }
+      continue;
+    }
+    break;
+  }
+  const words =
+    sql
+      .slice(start)
+      .toUpperCase()
+      .match(/^[A-Z]+(?:\s+[A-Z]+){0,4}/)?.[0]
+      .split(/\s+/) ?? [];
+  switch (words[0]) {
+    case 'INSERT':
+      return `INSERT 0 ${count ?? 0}`;
+    case 'UPDATE':
+      return `UPDATE ${count ?? 0}`;
+    case 'DELETE':
+      return `DELETE ${count ?? 0}`;
+    case 'BEGIN':
+    case 'COMMIT':
+    case 'ROLLBACK':
+      return words[0];
+    case 'CREATE':
+    case 'DROP':
+    case 'ALTER': {
+      const object = words
+        .slice(1)
+        .find((word) => ['TABLE', 'INDEX', 'TYPE', 'VIEW'].includes(word));
+      return object === undefined ? 'OK' : `${words[0]} ${object}`;
+    }
+    default:
+      return 'OK';
+  }
 }
 
-// JedDb is one open database (in-memory or OPFS-backed), driven through the shared worker.
+const openNames = new Set<string>();
+let nextDbSeq = 1;
+type Settings = { maxCost?: bigint; workMem?: number };
+
 export class JedDb {
-  readonly id: string;
-  readonly mode: DbMode;
+  readonly id = `db-${nextDbSeq++}`;
   private closed = false;
 
-  constructor(id: string, mode: DbMode) {
-    this.id = id;
-    this.mode = mode;
+  constructor(
+    private database: AsyncDatabase,
+    private session: AsyncSession,
+    readonly mode: DbMode,
+    private settings: Settings,
+    private readonly name?: string
+  ) {}
+
+  run(sql: string): Promise<RunResult[]> {
+    return displayed(async () => {
+      const results: RunResult[] = [];
+      // A script keeps the editor's existing autocommit policy: each statement
+      // commits separately unless SQL explicitly opens a transaction.
+      for (const statement of splitSql(sql)) {
+        const cursor = await this.session.query(statement.sql);
+        try {
+          const rows: string[][] = [];
+          for await (const row of cursor) rows.push(row.map(render));
+          results.push(
+            cursor.columnNames.length > 0
+              ? {
+                  kind: 'query',
+                  columnNames: cursor.columnNames,
+                  columnTypes: cursor.columnTypes,
+                  rows,
+                  rowCount: rows.length,
+                  cost: cursor.cost.toString()
+                }
+              : {
+                  kind: 'statement',
+                  rowsAffected: cursor.rowsAffected,
+                  cost: cursor.cost.toString(),
+                  tag: commandTag(statement.sql, cursor.rowsAffected)
+                }
+          );
+        } finally {
+          await cursor.close();
+        }
+      }
+      return results;
+    });
   }
 
-  // run executes an editor buffer (one or more `;`-separated statements) and returns every
-  // statement's outcome — the last query is what a grid shows; the per-statement tags are a log.
-  async run(sql: string): Promise<RunResult[]> {
-    return (await call({ op: 'run', id: this.id, sql })) as RunResult[];
+  schema(): Promise<SchemaResult> {
+    return displayed(async () => {
+      const tables = await this.session.all('SELECT name FROM jed_tables ORDER BY name');
+      const columns = await this.session.all(
+        'SELECT table_name, name, type, not_null, pk_ordinal FROM jed_columns ORDER BY table_name, ordinal'
+      );
+      const indexes: { table: string; name: string; columns: string[]; unique: boolean }[] = [];
+      const indexRows = await this.session.query(
+        'SELECT table_name, name, columns, is_unique FROM jed_indexes ORDER BY table_name, name'
+      );
+      try {
+        for await (const row of indexRows) {
+          indexes.push({
+            table: render(row[0]!),
+            name: render(row[1]!),
+            columns: row[2]?.kind === 'array' ? row[2].elements.map(render) : [],
+            unique: row[3]?.kind === 'bool' && row[3].value
+          });
+        }
+      } finally {
+        await indexRows.close();
+      }
+      const types = await this.session.all('SELECT name FROM jed_types ORDER BY name');
+      const fields = await this.session.all(
+        'SELECT type_name, name, type FROM jed_type_fields ORDER BY type_name, ordinal'
+      );
+      return {
+        tables: tables.map((table) => {
+          const cols = columns.filter((column) => column.table_name === table.name);
+          return {
+            name: String(table.name),
+            columns: cols.map((column) => ({
+              name: String(column.name),
+              type: String(column.type),
+              notNull: column.not_null === true,
+              primaryKey: column.pk_ordinal !== null
+            })),
+            primaryKey: cols
+              .filter((column) => column.pk_ordinal !== null)
+              .sort((a, b) => Number(a.pk_ordinal) - Number(b.pk_ordinal))
+              .map((column) => String(column.name)),
+            indexes: indexes
+              .filter((index) => index.table === table.name)
+              .map((index) => ({
+                name: index.name,
+                columns: index.columns,
+                unique: index.unique
+              }))
+          };
+        }),
+        types: types.map((type) => ({
+          name: String(type.name),
+          fields: fields
+            .filter((field) => field.type_name === type.name)
+            .map((field) => ({ name: String(field.name), type: String(field.type) }))
+        })),
+        inTransaction: (await this.session.status()).inTransaction
+      };
+    });
   }
 
-  // schema returns the visible catalog for a sidebar (tables/columns/PK/indexes + composite types).
-  async schema(): Promise<SchemaResult> {
-    return (await call({ op: 'schema', id: this.id })) as SchemaResult;
-  }
-
-  // reset replaces an in-memory database with a fresh one under the same id (a live example's
-  // "reset to seed"). A no-op-ish convenience that is cheaper than close + reopen.
   async reset(): Promise<void> {
-    await call({ op: 'reset', id: this.id });
+    if (this.mode !== 'memory') throw new JedError('XX000', 'only in-memory examples can be reset');
+    if (this.closed) throw new JedError('XX000', 'database is closed');
+    await this.database.close();
+    this.database = await createDatabase({ runtime: WEBSITE_RUNTIME });
+    try {
+      this.session = await this.database.session(this.settings);
+    } catch (error) {
+      await this.database.close();
+      throw error;
+    }
   }
 
-  // setMaxCost changes the cost ceiling on this handle live (0 = unlimited) — the tool's max_cost
-  // control. A query aborts with 54P01 the instant accrued cost reaches it.
   async setMaxCost(value: bigint): Promise<void> {
-    await call({ op: 'setMaxCost', id: this.id, value: value.toString() });
+    await displayed(() => this.session.configure({ maxCost: value }));
+    this.settings = { ...this.settings, maxCost: value };
   }
 
   async commit(): Promise<void> {
-    await call({ op: 'commit', id: this.id });
+    await displayed(() => this.session.execute('COMMIT'));
   }
 
   async rollback(): Promise<void> {
-    await call({ op: 'rollback', id: this.id });
+    await displayed(() => this.session.execute('ROLLBACK'));
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    await call({ op: 'close', id: this.id });
+    try {
+      await this.database.close();
+    } finally {
+      if (this.name !== undefined) openNames.delete(this.name);
+    }
   }
 }
 
-// --- factories ---------------------------------------------------------------------------------
-
-// openMemory creates a fresh transient in-memory database (the home hero + every live docs example).
-export async function openMemory(
-  opts: { maxCost?: bigint; workMem?: number } = {}
+async function wrap(
+  database: AsyncDatabase,
+  mode: DbMode,
+  settings: Settings,
+  name?: string
 ): Promise<JedDb> {
-  const id = `mem-${nextDbSeq++}`;
-  const spec: OpenSpec = {
-    id,
-    mode: 'memory',
-    maxCost: (opts.maxCost ?? DEFAULT_MEMORY_MAX_COST).toString(),
-    workMem: opts.workMem
-  };
-  await call({ op: 'open', spec });
-  return new JedDb(id, 'memory');
+  try {
+    return new JedDb(database, await database.session(settings), mode, settings, name);
+  } catch (error) {
+    await database.close();
+    throw error;
+  }
 }
 
-// createOpfsDb creates a new OPFS-backed database file (58P02 if it already exists).
-export async function createOpfsDb(
+export async function openMemory(options: Settings = {}): Promise<JedDb> {
+  const settings = { ...options, maxCost: options.maxCost ?? DEFAULT_MEMORY_MAX_COST };
+  return displayed(async () =>
+    wrap(await createDatabase({ runtime: WEBSITE_RUNTIME }), 'memory', settings)
+  );
+}
+
+async function openFile(
   name: string,
-  opts: { maxCost?: bigint; workMem?: number; pageSize?: number } = {}
+  create: boolean,
+  options: Settings & { pageSize?: number; readOnly?: boolean }
 ): Promise<JedDb> {
-  const id = `opfs-${nextDbSeq++}`;
-  const spec: OpenSpec = {
-    id,
-    mode: 'opfs',
-    name,
-    create: true,
-    pageSize: opts.pageSize,
-    maxCost: opts.maxCost?.toString(),
-    workMem: opts.workMem
-  };
-  await call({ op: 'open', spec });
-  return new JedDb(id, 'opfs');
+  if (openNames.has(name))
+    throw new JedError('XX000', `database ${name} is already open in this tab`);
+  openNames.add(name); // Reserve before async acquisition, including simultaneous opens.
+  try {
+    return await displayed(async () => {
+      const database = create
+        ? await createDatabase({ path: name, pageSize: options.pageSize, runtime: WEBSITE_RUNTIME })
+        : await openDatabase(name, {
+            readOnly: options.readOnly,
+            workMem: options.workMem,
+            runtime: WEBSITE_RUNTIME
+          });
+      return wrap(database, 'opfs', options, name);
+    });
+  } catch (error) {
+    openNames.delete(name);
+    throw error;
+  }
 }
 
-// openOpfsDb opens an existing OPFS-backed database file (58P01 if absent; XX001 if malformed).
-export async function openOpfsDb(
+export function createOpfsDb(
   name: string,
-  opts: { maxCost?: bigint; workMem?: number; readOnly?: boolean } = {}
+  options: Settings & { pageSize?: number } = {}
 ): Promise<JedDb> {
-  const id = `opfs-${nextDbSeq++}`;
-  const spec: OpenSpec = {
-    id,
-    mode: 'opfs',
-    name,
-    create: false,
-    readOnly: opts.readOnly,
-    maxCost: opts.maxCost?.toString(),
-    workMem: opts.workMem
-  };
-  await call({ op: 'open', spec });
-  return new JedDb(id, 'opfs');
+  return openFile(name, true, options);
 }
 
-// --- OPFS file management (the tool's file manager) -------------------------------------------
+export function openOpfsDb(
+  name: string,
+  options: Settings & { readOnly?: boolean } = {}
+): Promise<JedDb> {
+  return openFile(name, false, options);
+}
+
+// The remaining utility worker only lists/imports/exports closed OPFS files. It
+// contains no SQL engine and cannot diverge from the shared runtime scheduler.
+type FileBody = FileRequest extends infer R
+  ? R extends { rid: number }
+    ? Omit<R, 'rid'>
+    : never
+  : never;
+let fileWorker: Worker | null = null;
+let nextRid = 1;
+const pending = new Map<number, { resolve(value: unknown): void; reject(error: unknown): void }>();
+
+function ensureFileWorker(): Worker {
+  if (fileWorker !== null) return fileWorker;
+  const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+  worker.addEventListener('message', (event: MessageEvent<FileReply>) => {
+    const reply = event.data;
+    const request = pending.get(reply.rid);
+    if (request === undefined) return;
+    pending.delete(reply.rid);
+    if (reply.ok) request.resolve(reply.result);
+    else request.reject(new JedError(reply.error.code, reply.error.message));
+  });
+  const fail = () => {
+    worker.terminate();
+    fileWorker = null;
+    for (const request of pending.values()) request.reject(new Error('OPFS file worker failed'));
+    pending.clear();
+  };
+  worker.addEventListener('error', fail);
+  worker.addEventListener('messageerror', fail);
+  fileWorker = worker;
+  return worker;
+}
+
+function fileCall(body: FileBody): Promise<unknown> {
+  if (pending.size >= 32) return Promise.reject(new Error('OPFS file-manager queue is full'));
+  const worker = ensureFileWorker();
+  const rid = nextRid++;
+  return new Promise((resolve, reject) => {
+    pending.set(rid, { resolve, reject });
+    try {
+      worker.postMessage(
+        { rid, ...body },
+        body.op === 'importBytes' ? [body.bytes.buffer as ArrayBuffer] : []
+      );
+    } catch (error) {
+      pending.delete(rid);
+      reject(error);
+    }
+  });
+}
 
 export function opfsSupported(): Promise<boolean> {
-  return call({ op: 'opfsSupported' }) as Promise<boolean>;
+  return fileCall({ op: 'opfsSupported' }) as Promise<boolean>;
 }
-
 export function listOpfsFiles(): Promise<OpfsFileInfo[]> {
-  return call({ op: 'listFiles' }) as Promise<OpfsFileInfo[]>;
+  return fileCall({ op: 'listFiles' }) as Promise<OpfsFileInfo[]>;
 }
-
 export function exportOpfsFile(name: string): Promise<Uint8Array> {
-  return call({ op: 'exportBytes', name }) as Promise<Uint8Array>;
+  return fileCall({ op: 'exportBytes', name }) as Promise<Uint8Array>;
 }
-
 export function importOpfsFile(name: string, bytes: Uint8Array, overwrite: boolean): Promise<void> {
-  return call({ op: 'importBytes', name, bytes, overwrite }) as Promise<void>;
+  if (openNames.has(name))
+    return Promise.reject(
+      new JedError('XX000', `database ${name} is open; close it before importing`)
+    );
+  return fileCall({ op: 'importBytes', name, bytes, overwrite }) as Promise<void>;
 }
-
 export function deleteOpfsFile(name: string): Promise<void> {
-  return call({ op: 'deleteFile', name }) as Promise<void>;
+  if (openNames.has(name))
+    return Promise.reject(
+      new JedError('XX000', `database ${name} is open; close it before deleting`)
+    );
+  return fileCall({ op: 'deleteFile', name }) as Promise<void>;
 }
