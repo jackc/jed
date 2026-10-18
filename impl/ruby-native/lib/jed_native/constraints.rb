@@ -146,7 +146,8 @@ module JedNative
         if %w[to_json to_jsonb array_to_json row_to_json json_scalar json_build_array jsonb_build_array json_build_object jsonb_build_object].include?(name)
           reject_index_dependency if types.any? { |type| type_contains_timestamptz?(type) }
         end
-        if name == 'date_part' && types[1] == 'timestamptz'
+        reject_index_dependency if name == 'date_trunc' && types[1] == 'timestamptz' && types.length == 2
+        if %w[extract date_part].include?(name) && types[1] == 'timestamptz'
           field = expression.args[0]
           reject_index_dependency unless field.kind == :literal && field.value.to_s.downcase == 'epoch'
         end

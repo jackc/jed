@@ -6,6 +6,7 @@ require_relative '../lib/jed_native'
 vectors = TomlRB.load_file(File.expand_path('../../../spec/cost/memory_sizes.toml', __dir__)).fetch('vector')
 vectors.each do |vector|
   JedNative.memory do |database|
+    database = database.session
     (vector['setup'] || []).each { |sql| database.execute(sql) }
     result = database.query(vector.fetch('sql'))
     bytes = if vector['measure'] == 'row'

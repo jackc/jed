@@ -45,5 +45,6 @@ units = TomlRB.load_file(File.join(root, 'spec/types/datetime_units.toml'))
 lines = ["# frozen_string_literal: true", "# Generated from spec/types/datetime_units.toml; processors are handwritten.", "module JedNative", "  module DateTimeUnits", "    TOKEN_MAX_LEN = #{units.fetch('token_max_len')}"]
 %w[delta date].each { |name| lines << "    #{name.upcase} = #{units.fetch(name).to_h { |entry| [entry.fetch('token'), entry.values_at('type', 'value')] }.inspect}.freeze" }
 lines << "    INTERVAL_QUALIFIERS = #{units.fetch('interval_qualifier').to_h { |entry| [entry.fetch('name'), [entry.fetch('least'), !!entry['mm_ss']]] }.inspect}.freeze"
+lines << "    INTERVAL_QUALIFIER_CODES = #{units.fetch('interval_qualifier').to_h { |entry| [entry.fetch('name'), entry.fetch('code')] }.inspect}.freeze"
 lines.concat(["  end", "end", ""])
 File.write(File.join(root, 'impl/ruby-native/lib/jed_native/datetime_units.rb'), lines.join("\n"))

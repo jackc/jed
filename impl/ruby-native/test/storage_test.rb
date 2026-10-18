@@ -142,7 +142,8 @@ module RubyStorageTest
   def self.sql_reopen
     Dir.mktmpdir('jed-ruby-sql') do |dir|
       path = File.join(dir, 'sql.jed')
-      db = JedNative.create(path, page_size: 256)
+      database = JedNative.create(path, page_size: 256)
+      db = database.session
       db.execute("create table t (id i32 primary key, v text default 'hello', n decimal(9,2))")
       db.execute('insert into t (id,n) values (1,12.50)')
       db.execute('create index t_v on t (v desc)')
@@ -152,26 +153,34 @@ module RubyStorageTest
       db.execute('commit')
       assert(db.engine.instance_variable_get(:@storage).meta[:txid] == txid, 'empty transaction wrote main')
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       assert(db.query('select id,v,n from t').rows.map { |row| row.map(&:to_s) } == [['1', 'hello', '12.50']])
       assert(db.query('select * from visible').rows == [[1, 'hello']])
       db.execute('insert into t (id) values (2)')
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       assert(db.query('select id,v from t order by id').rows == [[1, 'hello'], [2, 'hello']])
       db.close
+      database.close
     end
   end
 
   def self.view_catalog_reopen
     Dir.mktmpdir('jed-ruby-view') do |dir|
       path = File.join(dir, 'views.jed')
-      db = JedNative.create(path, page_size: 256)
+      database = JedNative.create(path, page_size: 256)
+      db = database.session
       db.execute('create table source (id i32 primary key, value i32)')
       db.execute('create view visible with (security_barrier=true) as select id,value from source where value > 0 with local check option')
       db.execute('alter view visible alter column value set default 7')
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       row = db.query('select check_option,security_barrier from jed_views').rows.first
       assert(row == ['LOCAL', true], "view options were not restored: #{row.inspect}")
       db.execute('insert into visible (id) values (1)')
@@ -182,18 +191,22 @@ module RubyStorageTest
       definition = db.query('select definition from jed_views').rows.first.first
       assert(definition.include?('backing'), 'renamed view dependency retained old definition')
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       db.execute('insert into public_rows (id) values (2)')
       assert(db.query('select id,value from backing order by id').rows == [[1, 7], [2, 9]])
       error('2BP01') { db.execute('drop table backing') }
       db.close
+      database.close
     end
   end
 
   def self.view_query_reopen
     Dir.mktmpdir('jed-ruby-view-query') do |dir|
       path = File.join(dir, 'query.jed')
-      db = JedNative.create(path, page_size: 256)
+      database = JedNative.create(path, page_size: 256)
+      db = database.session
       db.execute('create table t (id i32 primary key, bucket i32)')
       db.execute('insert into t values (1,1),(2,1),(3,2)')
       definitions = {
@@ -204,36 +217,46 @@ module RubyStorageTest
       definitions.each { |name, query| db.execute("create view #{name} as #{query}") }
       expected = definitions.to_h { |name, _| [name, db.query("select * from #{name} order by 1").rows] }
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       definitions.each do |name, _|
         actual = db.query("select * from #{name} order by 1").rows
         assert(actual == expected[name], "stored view #{name} changed query semantics: #{actual.inspect}")
       end
       db.close
+      database.close
     end
   end
 
   def self.exclusion_reopen
     Dir.mktmpdir('jed-ruby-exclusion') do |dir|
       path = File.join(dir, 'exclude.jed')
-      db = JedNative.create(path, page_size: 256)
+      database = JedNative.create(path, page_size: 256)
+      db = database.session
       db.execute('create table booking (id i32 primary key, room i32, span i32range, live boolean, exclude using gist (room with =, span with &&) where (live))')
       db.execute("insert into booking values (1,2,'[1,4)'::i32range,true)")
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       error('23P01') { db.execute("insert into booking values (2,2,'[3,5)'::i32range,true)") }
       db.execute("insert into booking values (2,2,'[3,5)'::i32range,false)")
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       assert(db.query('select id from booking order by id').rows == [[1], [2]])
       db.close
+      database.close
     end
   end
 
   def self.statistics_reopen
     Dir.mktmpdir('jed-ruby-statistics') do |dir|
       path = File.join(dir, 'stats.jed')
-      db = JedNative.create(path, page_size: 256)
+      database = JedNative.create(path, page_size: 256)
+      db = database.session
       db.execute('create table t (id i32 primary key, v text, tags i32[])')
       db.execute("insert into t values (1,'a',array[1,1,2]),(2,'a',array[2]),(3,null,null)")
       db.execute('create index t_v on t (v desc nulls last)')
@@ -251,9 +274,12 @@ module RubyStorageTest
       db.execute('reindex index t_v')
       assert(db.engine.instance_variable_get(:@storage).meta[:txid] > txid, 'REINDEX did not commit the rebuilt index')
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       assert(db.query('select column_name,is_stale from jed_statistics order by column_name').rows == [['id', true], ['tags', true], ['v', false]])
       db.close
+      database.close
     end
   end
 
@@ -269,7 +295,8 @@ module RubyStorageTest
   def self.temporal_containers_reopen
     Dir.mktmpdir('ruby-native-temporal') do |directory|
       path = File.join(directory, 'temporal.jed')
-      db = JedNative.create(path)
+      database = JedNative.create(path)
+      db = database.session
       db.execute('create type stamp as (at timestamptz, code i32)')
       db.execute('create table t (id i32 primary key, dates date[], stamps stamp[], span tstzrange)')
       db.execute(<<~SQL)
@@ -280,13 +307,18 @@ module RubyStorageTest
       SQL
       expected = db.query('select dates::text, stamps::text, span::text from t').rows
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       assert(db.query('select dates::text, stamps::text, span::text from t').rows == expected, 'temporal container storage round trip changed values')
       db.execute('insert into t select 2, dates, stamps, span from t')
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       assert(db.query('select dates::text, stamps::text, span::text from t order by id').rows == expected * 2)
       db.close
+      database.close
     end
   end
 
@@ -294,7 +326,8 @@ module RubyStorageTest
     bundle = File.expand_path('../../../spec/collation/fixtures/unicode.jucd', __dir__)
     environment = JedNative::Environment.new.load_unicode_data(File.binread(bundle))
     bytes = File.binread(File.join(FIXTURES, 'collation_skew_corrupt.jed'))
-    db = JedNative.from_image(bytes, environment: environment)
+    database = JedNative.from_image(bytes, environment: environment)
+    db = database.session
     db.execute('begin read only')
     error('25006') { db.upgrade_collations }
     db.execute('rollback')
@@ -308,30 +341,38 @@ module RubyStorageTest
     db.execute('rollback')
     assert(db.upgrade_collations == 1)
     assert(db.upgrade_collations == 0)
-    assert(db.query("select id from t where name = 'Z'").cost == 5)
+    assert(db.execute("select id from t where name = 'Z'").cost == 5)
     db.close
+    database.close
 
     Dir.mktmpdir('ruby-native-collation') do |directory|
       path = File.join(directory, 'collation.jed')
       File.binwrite(path, bytes)
-      db = JedNative.open(path, environment: environment, read_only: true)
+      database = JedNative.open(path, environment: environment, read_only: true)
+      db = database.session
       error('25006') { db.upgrade_collations }
       db.close
-      db = JedNative.open(path, environment: environment)
+      database.close
+      database = JedNative.open(path, environment: environment)
+      db = database.session
       assert(db.upgrade_collations == 1)
       db.close
-      db = JedNative.open(path, environment: environment)
+      database.close
+      database = JedNative.open(path, environment: environment)
+      db = database.session
       assert(db.upgrade_collations == 0)
       db.execute("insert into t values (5, 'c')")
       assert(db.query('select id from t order by name').rows == [[1], [3], [4], [5], [2]])
       db.close
+      database.close
     end
   end
 
   def self.incremental_reclamation
     Dir.mktmpdir('ruby-native-incremental') do |directory|
       path = File.join(directory, 'tree.jed')
-      db = JedNative.create(path, page_size: 256)
+      database = JedNative.create(path, page_size: 256)
+      db = database.session
       db.execute('create table t (id i32 primary key, v text)')
       db.transaction do
         120.times { |id| db.execute('insert into t values ($1, $2)', id, "value-#{id}" * 2) }
@@ -345,11 +386,14 @@ module RubyStorageTest
       assert((state[:free_pages] & state[:meta][:protected]).empty?, 'manifest dependencies became reusable')
       db.execute('delete from t where id >= 20 and id < 100')
       db.close
-      db = JedNative.open(path)
+      database.close
+      database = JedNative.open(path)
+      db = database.session
       assert(db.query('select count(*) from t').rows == [[40]])
       db.execute("insert into t values (60, 'restored')")
       assert(db.query('select v from t where id = 60').rows == [['restored']])
       db.close
+      database.close
     end
   end
 end

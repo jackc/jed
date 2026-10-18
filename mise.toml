@@ -112,6 +112,10 @@ run = "ruby -Iimpl/ruby-native/lib -e 'Dir[\"impl/ruby-native/test/*_test.rb\"].
 description = "Explicit opt-in: experimental Ruby storage byte and durability tests"
 run = "ruby impl/ruby-native/test/storage_test.rb"
 
+[tasks."ruby-native:pager-test"]
+description = "Explicit opt-in: experimental Ruby page caches and pinned roots"
+run = "ruby impl/ruby-native/test/paged_storage_test.rb"
+
 [tasks."ruby-native:domains-test"]
 description = "Explicit opt-in: experimental Ruby attachment lifecycle and independent durability tests"
 run = "ruby impl/ruby-native/test/domains_test.rb"

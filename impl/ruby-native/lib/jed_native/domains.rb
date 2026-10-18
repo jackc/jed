@@ -67,12 +67,12 @@ module JedNative
       @durable_writer = nil unless @transaction
       statement = route_domains(statement)
       super
-    rescue StandardError
+    rescue StandardError => error
       if committing
         restore(committing)
         @transaction, @failed, @dirty, @read_only, @savepoints = nil, false, false, false, []
       else
-        @failed = true if @transaction
+        @failed = true if @transaction && !(statement[:kind] == :begin && error.is_a?(Error) && error.sqlstate == '25001')
       end
       raise
     ensure

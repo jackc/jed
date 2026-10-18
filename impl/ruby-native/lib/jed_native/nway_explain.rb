@@ -18,11 +18,12 @@ module JedNative
         source = plan[:sources][ordinal]
         access = plan[:accesses][position]
         local = source[:native_access_predicate] && plan_compile(source[:native_access_predicate], plan[:scopes][ordinal])
-        node = plan_scan(@tables.fetch(source[:name]), local, statement, access)
+        node = plan_scan(@tables.fetch(source[:name]), local, statement.merge(native_scan_source: source), access)
         node.phase, node.actual = nil, 0
         node.rows, node.cost = access[:output_rows], access[:pipeline_cost]
-        if local
-          node.detail += @explain_options[:verbose] ? "; filter=#{plan_expression(plan_compile(source[:native_access_predicate], plan[:scope]))}" : "; filter:conjuncts=#{conjunctions(local).length}"
+        if source[:native_pushed_filter]
+          local = plan_compile(source[:native_pushed_filter], plan[:scopes][ordinal])
+          node.detail += @explain_options[:verbose] ? "; filter=#{plan_expression(plan_compile(source[:native_pushed_filter], plan[:scope]))}" : "; filter:conjuncts=#{conjunctions(local).length}"
         end
         source[:native_scan_profile] = node
         if position.positive? && (step = plan[:steps][position - 1])[:algorithm] == :index

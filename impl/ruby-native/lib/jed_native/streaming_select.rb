@@ -20,20 +20,25 @@ module JedNative
       limit = statement[:limit] ? evaluate(compile(statement[:limit], []), []) : nil
       raise Error.new('2201X', 'negative OFFSET') if offset.negative?
       raise Error.new('2201W', 'negative LIMIT') if limit && limit.negative?
-      previous = [@native_stream_scan, @native_reverse_scan, @native_scan_columns]
+      previous = [@native_stream_scan, @native_reverse_scan, @native_scan_columns, @native_ordered_scan]
       @native_stream_scan, @native_reverse_scan = true, order == :reverse
+      @native_ordered_scan = %i[forward reverse].include?(order)
       @native_scan_columns = scan_column_inventory(statement)
       scan_start = @cost if @explain_profile_frames
       input = execute_scan_access(stored, predicate, access)
       unless input
-        charge(full_scan_pages(stored))
-        charge_scan_payload(stored)
-        ordinals = stored[:native_primary_entries]&.map(&:last) || stored[:rows].each_index.to_a
-        input = scan_rows(stored, ordinals)
+        if %i[forward reverse].include?(order)
+          input = storage_stream_rows(stored, reverse: order == :reverse)
+        else
+          charge(full_scan_pages(stored))
+          charge_scan_payload(stored)
+          ordinals = stored[:native_primary_entries]&.map(&:last) || stored[:rows].each_index.to_a
+          input = scan_rows(stored, ordinals)
+        end
       end
       profile_accumulate(:scan, @cost - scan_start) if @explain_profile_frames
       scan_resume = @cost if @explain_profile_frames
-      output = []
+      output = cursor_output(columns)
       memory_owner = query_memory_owner if @query_memory && query_memory_collect_result?
       if statement[:distinct]
         seen = spill_available? ? SpillStateMap.new(self) : {}
@@ -64,8 +69,8 @@ module JedNative
             end
             result_row = expressions.map { |expression| evaluate(expression, row) } unless seen
             query_memory_add_row(memory_owner, result_row, columns) if memory_owner
-            output << result_row
             charge
+            output << result_row
             break if limit && output.length >= limit
           ensure
             scan_resume = @cost if @explain_profile_frames
@@ -80,7 +85,7 @@ module JedNative
     ensure
       seen.close if seen && !seen.is_a?(Hash)
       query_memory_release(seen_owner) if seen_owner
-      @native_stream_scan, @native_reverse_scan, @native_scan_columns = previous if previous
+      @native_stream_scan, @native_reverse_scan, @native_scan_columns, @native_ordered_scan = previous if previous
     end
 
     def streaming_select_shape?(statement)
@@ -100,10 +105,10 @@ module JedNative
       orders = statement[:order_by] || []
       return :none if orders.empty?
       primary = stored.dig(:native_primary_metadata, :columns) || []
-      return :blocking if primary.empty? || orders.length > primary.length
-      directions = orders.map { |order| order[:direction] == :desc }
-      return :blocking unless directions.uniq.length == 1 && (!directions[0] || orders.length == primary.length)
-      valid = orders.each_with_index.all? do |order, i|
+      return :blocking if primary.empty?
+      directions = orders.take(primary.length).map { |order| order[:direction] == :desc }
+      return :blocking unless directions.uniq.length == 1 && (!directions[0] || orders.length >= primary.length)
+      resolved = orders.map do |order|
         ast = order[:expr]
         expression = if ast[:kind] == :literal && ast[:value].is_a?(Integer)
           projections[ast[:value] - 1]
@@ -112,8 +117,9 @@ module JedNative
         else
           compile(ast, scope)
         end
-        expression&.kind == :column && expression.value == primary[i]
+        expression
       end
+      valid = resolved.take(primary.length).each_with_index.all? { |expression, i| expression&.kind == :column && expression.value == primary[i] }
       valid ? (directions[0] ? :reverse : :forward) : :blocking
     end
 

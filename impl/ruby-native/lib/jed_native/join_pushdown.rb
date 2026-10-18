@@ -42,6 +42,10 @@ module JedNative
             access[target] << term
           else
             residual << term
+            bound_target = access_predicate_target(term, scope, offsets, scopes)
+            eligible = bound_target && !inputs[bound_target][:lateral] && !nullable[bound_target] &&
+              (item[:kind] == :inner && bound_target <= right || %i[left left_outer].include?(item[:kind]) && bound_target == right || %i[right right_outer].include?(item[:kind]) && bound_target < right)
+            access[bound_target] << term if eligible
           end
         end
         case item[:kind]
@@ -62,6 +66,8 @@ module JedNative
           # A strict bare-key WHERE can bound a nullable relation without
           # moving its residual: null extensions still face the WHERE.
           access[target] << term if target && pushdown_strict_bound?(term)
+          bound_target = access_predicate_target(term, scope, offsets, scopes)
+          access[bound_target] << term if bound_target && !inputs[bound_target][:lateral] && !nullable[bound_target]
         end
       end
       inputs = inputs.each_with_index.map do |source, index|
@@ -126,6 +132,22 @@ module JedNative
       return unless pushdown_safe?(expression)
       indices = expression_nodes(expression).select { |item| item.kind == :column }.map(&:value)
       return if indices.empty?
+      targets = indices.map { |ordinal| offsets.each_index.find { |i| ordinal >= offsets[i] && ordinal < offsets[i] + scopes[i].length } }.uniq
+      targets.first if targets.length == 1
+    end
+
+    def access_predicate_target(node, scope, offsets, scopes)
+      return unless metadata_expression?(node)
+      references = pushdown_column_nodes(node)
+      return if references.empty?
+      indices = references.map do |reference|
+        matches = scope.each_index.select do |ordinal|
+          column = scope[ordinal]
+          column[:name] == reference[:name] && (reference[:table] ? column[:table] == reference[:table] : !column[:qualified_only])
+        end
+        return unless matches.length == 1
+        matches.first
+      end
       targets = indices.map { |ordinal| offsets.each_index.find { |i| ordinal >= offsets[i] && ordinal < offsets[i] + scopes[i].length } }.uniq
       targets.first if targets.length == 1
     end

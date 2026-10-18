@@ -6,9 +6,11 @@ module JedNative
   module RelationExplain
     def explain_query(statement)
       @explain_rewritten_from = {}
+      @explain_group_components = {}
       super
     ensure
       @explain_rewritten_from = nil
+      @explain_group_components = nil
     end
 
     def plan_select(statement)
@@ -33,11 +35,20 @@ module JedNative
       sources.each_with_index do |source, index|
         grouped = joins.select { |edge| (edge[:from_index] || 0) == index }
         if sources.length > 1 && !grouped.empty?
-          source = { kind: :join_group, from: [source], joins: grouped.map { |edge| edge.merge(from_index: 0) } }
+          original_id = source.object_id
+          source = { kind: :join_group, from: [source], joins: grouped.map { |edge| edge.merge(from_index: 0) },
+                     native_inline_group: index.zero? || grouped.all? { |edge| %i[inner cross].include?(edge[:kind]) } }
+          @explain_group_components[original_id] = source if @explain_group_components
           grouped = []
         end
         current = query_source_columns(source, @ctes.transform_values(&:columns), outer + prefix, analyzer)
-        right = plan_relation(source, statement, scope)
+        previous = @outer
+        @outer = @outer + [[prefix, Array.new(prefix.length)]] if lateral_source_dependency?(source, prefix)
+        begin
+          right = plan_relation(source, statement, scope)
+        ensure
+          @outer = previous
+        end
         if node
           node = plan_relation_join(node, right, source, { kind: :cross }, prefix, current, statement)
         else
@@ -76,10 +87,10 @@ module JedNative
         label = 'Subquery' + (source[:alias] ? " #{source[:alias]}" : '')
         plan_node(label, '-', child.rows, child.cost, [child])
       when :join_group
-        query = { kind: :select, from: source[:from], joins: source[:joins], columns: [] }
+        query = { kind: :select, from: source[:from], joins: source[:joins], columns: [{ expr: { kind: :star } }] }
+        source[:native_group_statement] = query
         child = plan_select(query)
-        # A parenthesized join is a relation, not a projecting SELECT.
-        child.cost -= child.rows
+        child.cost -= child.rows if source[:native_inline_group]
         label = 'Subquery' + (source[:alias] ? " #{source[:alias]}" : '')
         plan_node(label, '-', child.rows, child.cost, [child])
       when :function, :call, :srf
@@ -116,7 +127,7 @@ module JedNative
           end
         else
           predicate = source[:native_access_predicate] && plan_compile(source[:native_access_predicate], columns)
-          plan_scan(@tables.fetch(name), predicate, statement)
+          plan_scan(@tables.fetch(name), predicate, statement.merge(native_scan_source: source))
         end
       else raise Error.new('0A000', "relation #{source[:kind]} has no plan")
       end

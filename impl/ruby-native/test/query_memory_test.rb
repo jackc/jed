@@ -17,6 +17,7 @@ module NativeQueryMemoryTests
 
   def run
     JedNative.memory do |db|
+      db = db.session
       db.query('CREATE TABLE p (id i32 PRIMARY KEY)')
       db.query('CREATE TABLE c (id i32 PRIMARY KEY, p i32 REFERENCES p(id) ON UPDATE CASCADE)')
       db.query('INSERT INTO p VALUES (1)')

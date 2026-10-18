@@ -37,6 +37,9 @@ module JedNative
         @tables = @tables.transform_values do |table|
           next table if table[:database] || (table[:collation_skew].to_a & changed).empty?
           clean = table.reject { |key, _| key.to_s.start_with?('native_') || %i[storage_tree_profile storage_tree_rows].include?(key) }
+          if clean[:rows].is_a?(PagedRows)
+            clean = clean.merge(rows: clean[:rows].map(&:to_a), rowids: clean[:rowids].to_a)
+          end
           clean.merge(collation_skew: table[:collation_skew] - changed,
                       indexes: table[:indexes].map { |index| index.reject { |key, _| key == :storage_tree_profile } })
         end

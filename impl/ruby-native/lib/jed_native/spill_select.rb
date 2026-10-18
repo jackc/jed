@@ -87,7 +87,7 @@ module JedNative
         expressions = columns.each_with_index.map { |column, index| Expression.new(kind: :column, type: column[:type], value: index) }
       end
       profile_checkpoint(:distinct) if @explain_profile_frames
-      output = []
+      output = cursor_output(columns)
       output_owner = query_memory_owner if @query_memory && query_memory_collect_result?
       unless limit == 0
         rows.each_with_index do |row, index|
@@ -95,8 +95,8 @@ module JedNative
           break if limit && output.length >= limit
           values = expressions.map { |expression| evaluate(expression, row) }
           query_memory_add_row(output_owner, values, columns) if output_owner
-          output << values
           charge
+          output << values
         end
       end
       profile_checkpoint(:root) if @explain_profile_frames
