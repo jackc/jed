@@ -51,9 +51,11 @@ large results with async iteration. SQL errors remain `EngineError` with SQLSTAT
 requests are never automatically replayed.
 
 Pass `{signal}` to `query`/`execute` for cancellation. Node and cross-origin-isolated browsers
-poll shared flags during metered work. Ordinary browsers cancel between operations and row
-batches; a currently executing synchronous blocking kernel cannot yet process cancel messages.
-Async page/crypto suspension and universal cooperative cancellation remain follow-ons.
+poll shared flags during metered work. All hosts also yield at logical page boundaries and
+common execution loops, including warm scans, so browsers without shared memory can cancel
+mid-query. Cancellation is best effort: sorting, parsing/planning and long scalar functions
+remain synchronous. Node data-page reads can await I/O through retained continuations; storage
+lifecycle, commit and async crypto integration remain follow-ons.
 
 Node's `extensionModule` accepts a trusted file URL exporting `configure(builder)`. That module
 registers host functions on the worker's `EnvironmentBuilder` before storage opens. Application

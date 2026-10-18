@@ -39,10 +39,11 @@ separate from SQL cost and query-memory limits. An oversized row or full queue r
 failure invalidates all handles and reports an unknown outcome: never retry a write automatically.
 
 An `AbortSignal` can be passed to `query` or `execute` as the third argument. Node and isolated
-browsers use atomic cancellation checkpoints during resident CPU work. Ordinary browsers observe
-cancellation before operations and between result batches; a synchronous CPU-heavy statement
-cannot yet be interrupted mid-execution. Blocking operators retain their existing memory limits
-and may materialize rows before a batch becomes available.
+browsers use atomic cancellation checkpoints during resident CPU work. Every host also yields at
+page boundaries and common execution loops, including warm scans, so ordinary browsers can
+process cancellation during a query. Cancellation is best effort: sorting, parsing/planning, and
+long scalar functions may delay it. Execution runs in a dedicated worker. Blocking operators
+retain their existing memory limits and may materialize rows before a batch becomes available.
 
 
 ## Durability

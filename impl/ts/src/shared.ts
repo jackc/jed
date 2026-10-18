@@ -1,4 +1,5 @@
 import { withoutCancellation } from "./cancel.ts";
+import { runSync, type Steps } from "./execution.ts";
 // Shared database core + the per-caller Session handle for the TS core (CLAUDE.md §3,
 // spec/design/session.md §2.4, transactions.md §8/§10).
 //
@@ -64,7 +65,7 @@ import {
   type TxStatus,
   type FileCoordinatorHost,
 } from "./executor.ts";
-import { PreparedStatement, Rows, rowsFromOutcome, Transaction } from "./api.ts";
+import { drainRunSteps, PreparedStatement, Rows, rowsFromOutcome, Transaction } from "./api.ts";
 import {
   loadEngine,
   loadEnginePaged,
@@ -78,7 +79,6 @@ import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
 import { throwIfAborted } from "./cancel.ts";
 import {
-  drainRun,
   type JsParam,
   type Row as ErgoRow,
   type RunResult,
@@ -2608,7 +2608,11 @@ export class Session {
   // api.md §5). Routes by the session's state (read-only / open block / autocommit) with the
   // lazy-gate lifecycle (§2.4).
   execute(sql: string, params: Value[] = []): RunResult {
-    return drainRun(this.query(sql, params));
+    return runSync(this.executeSteps(sql, params));
+  }
+
+  *executeSteps(sql: string, params: Value[] = []): Steps<RunResult> {
+    return yield* drainRunSteps(yield* this.querySteps(sql, params));
   }
 
   // query runs a query on this session, returning a row cursor. A single-table no-blocking-operator
@@ -2621,7 +2625,11 @@ export class Session {
   // DEFERRED cursor (streaming.md §7) that defers the whole run to the first pull and yields the result
   // one row at a time; a data-modifying WITH (a write) still falls back to the materialized dispatch path.
   query(sql: string, params: Value[] = []): Rows {
-    return this.queryStmt(this.engine.parse(sql), params, null, null); // one-shot: no cross-call plan cache (still plans once)
+    return runSync(this.querySteps(sql, params)); // one-shot: no cross-call plan cache (still plans once)
+  }
+
+  *querySteps(sql: string, params: Value[] = []): Steps<Rows> {
+    return yield* this.queryStmtSteps(this.engine.parse(sql), params, null, null);
   }
 
   // queryStmt routes an already-parsed query AST through the session's lazy lanes — the autocommit
@@ -2630,12 +2638,12 @@ export class Session {
   // write, a data-modifying WITH). Shared by query (parse-then-route, holder null) and a prepared
   // query (queryPrepared passes the statement's ScanCacheHolder), so a prepared query streams and
   // pins its snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
-  private queryStmt(
+  private *queryStmtSteps(
     stmt: Statement,
     params: Value[],
     holder: ScanCacheHolder | null,
     insertHolder: InsertCacheHolder | null,
-  ): Rows {
+  ): Steps<Rows> {
     // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
     // re-pins the latest committed so the snapshot is current; a read-only session uses its existing
     // pin, and an open block uses its working set.
@@ -2663,9 +2671,9 @@ export class Session {
       } else this.core.refreshShared();
       this.refreshCommitted();
     }
-    if (autoPin === null) return this.routeStmt(stmt, params, holder, insertHolder);
+    if (autoPin === null) return yield* this.routeStmtSteps(stmt, params, holder, insertHolder);
     try {
-      return this.routeStmt(stmt, params, holder, insertHolder);
+      return yield* this.routeStmtSteps(stmt, params, holder, insertHolder);
     } finally {
       // Main's pin first, then the attachments' in the order they were taken.
       const atts = this.stmtAtts ?? [];
@@ -2677,12 +2685,12 @@ export class Session {
 
   // routeStmt is queryStmt after the autocommit re-pin: the plan-cache epoch check, the lazy lanes,
   // and the materialized dispatch.
-  private routeStmt(
+  private *routeStmtSteps(
     stmt: Statement,
     params: Value[],
     holder: ScanCacheHolder | null,
     insertHolder: InsertCacheHolder | null,
-  ): Rows {
+  ): Steps<Rows> {
     const epoch = this.core.planEpochNow();
     if (this.planEpoch !== epoch) {
       if (holder !== null) holder.cache = null;
@@ -2730,7 +2738,7 @@ export class Session {
       // One plan-once scan lane serves both streaming and buffered shapes (an ad-hoc call plans once,
       // holder null; a prepared statement reuses its cached plan). Both are live readers and pin their
       // snapshot in the watermark.
-      const scanned = this.engine.tryScanQuery(stmt, params, holder);
+      const scanned = yield* this.engine.tryScanQuerySteps(stmt, params, holder);
       if (scanned !== null) return pin(scanned);
       // A top-level set operation / pure-query WITH is served by a lazy DEFERRED cursor (streaming.md
       // §7): it defers the whole run to the first pull and yields the result one row at a time; it is a
@@ -2746,7 +2754,7 @@ export class Session {
     // The dispatch fall-through handles transaction control (a nested BEGIN's 25001 must NOT poison) and
     // self-poisons on a regular statement error (executeStmtParams), so its nuanced poisoning is left
     // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
-    const outcome = this.dispatch(stmt, params, insertHolder);
+    const outcome = yield* this.dispatchSteps(stmt, params, insertHolder);
     return rowsFromOutcome(outcome, this.engine.session);
   }
 
@@ -2806,7 +2814,7 @@ export class Session {
   // executePrepared runs a prepared statement on this session, binding $N params, and returns its
   // command tag — the prepared analogue of execute (spec/design/api.md §2.4).
   executePrepared(stmt: PreparedStatement, params: Value[] = []): RunResult {
-    return drainRun(this.queryPrepared(stmt, params));
+    return runSync(this.executePreparedSteps(stmt, params));
   }
 
   // queryPrepared runs a prepared query on this session (its pinned snapshot, privileges, temp
@@ -2814,7 +2822,15 @@ export class Session {
   // ad-hoc query — so a prepared query streams and pins its snapshot identically — but reuses its
   // cached plan across executes (and across sessions of one database, spec/design/api.md §2.4).
   queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
-    return this.queryStmt(stmt.ast, params, stmt.scHolder, stmt.icHolder);
+    return runSync(this.queryPreparedSteps(stmt, params));
+  }
+
+  *queryPreparedSteps(stmt: PreparedStatement, params: Value[] = []): Steps<Rows> {
+    return yield* this.queryStmtSteps(stmt.ast, params, stmt.scHolder, stmt.icHolder);
+  }
+
+  *executePreparedSteps(stmt: PreparedStatement, params: Value[] = []): Steps<RunResult> {
+    return yield* drainRunSteps(yield* this.queryPreparedSteps(stmt, params));
   }
 
   // --- better-sqlite3-style ergonomic methods (spec/design/api.md §11): a reusable prepared
@@ -2838,11 +2854,11 @@ export class Session {
     return new ErgoStatement(this, sql).all(...params);
   }
 
-  private dispatch(
+  private *dispatchSteps(
     stmt: Statement,
     params: Value[],
     insertHolder: InsertCacheHolder | null,
-  ): Outcome {
+  ): Steps<Outcome> {
     if (this.access === "ro") {
       if (this.engine.stmtIsWriteWithViews(stmt)) {
         throw engineError(
@@ -2850,7 +2866,7 @@ export class Session {
           "cannot execute a write statement against a read-only snapshot",
         );
       }
-      return this.engine.executeStmtParams(stmt, params, insertHolder);
+      return yield* this.engine.executeStmtParamsSteps(stmt, params, insertHolder);
     }
     if (stmt.kind === "begin") return this.beginBlock(stmt.writable);
     if (stmt.kind === "commit") return this.endBlock(true);
@@ -2858,19 +2874,19 @@ export class Session {
     if (this.engine.session.tx !== null) {
       // Inside an open block (an eager write session, or this session after BEGIN): run on the
       // working set. The gate is already held for a writable block.
-      return this.engine.executeStmtParams(stmt, params, insertHolder);
+      return yield* this.engine.executeStmtParamsSteps(stmt, params, insertHolder);
     }
     if (!this.engine.stmtIsWriteWithViews(stmt)) {
       // Autocommit read: pin the latest committed for this one statement (PG-faithful); no gate.
       this.refreshCommitted();
-      return this.engine.executeStmtParams(stmt, params, insertHolder);
+      return yield* this.engine.executeStmtParamsSteps(stmt, params, insertHolder);
     }
     // Autocommit write — the lazy gate (§2.4): take it (throwing 25001 if another writer is open),
     // capture the latest committed as the working base, run, publish on success, release.
     this.acquireGate();
     try {
       this.refreshCommitted();
-      const out = this.engine.executeStmtParams(stmt, params, insertHolder);
+      const out = yield* this.engine.executeStmtParamsSteps(stmt, params, insertHolder);
       this.publish();
       return out;
     } finally {
@@ -3118,11 +3134,15 @@ export class Session {
   // whole run is one implicit transaction (all-or-nothing, published through the shared core); when it
   // is Open the run joins that transaction. In-script transaction control is 0A000.
   executeScript(sql: string): ScriptSummary {
+    return runSync(this.executeScriptSteps(sql));
+  }
+
+  *executeScriptSteps(sql: string): Steps<ScriptSummary> {
     const ownsWrapper = this.engine.session.tx === null;
     if (!ownsWrapper) this.checkRole();
     if (ownsWrapper) this.beginBlock(true);
     try {
-      const summary = this.engine.runScriptBody(sql);
+      const summary = yield* this.engine.runScriptBodySteps(sql);
       if (ownsWrapper) this.endBlock(true);
       return summary;
     } catch (e) {
