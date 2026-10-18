@@ -16,6 +16,13 @@ export default defineConfig({
   // OPFS files are origin-scoped; keep specs from racing the exclusive handle.
   fullyParallel: false,
   workers: 1,
+  // Every live panel on a page shares one engine Web Worker and autoruns in turn, so an assertion on
+  // a panel far down the page (the select page has 28, types 37) waits for the engine to load and
+  // every earlier panel to run: up to ~3 s on an idle machine, past Playwright's 5 s default when
+  // the gate loads the machine. These bound how long a correct page may take; a wrong answer still
+  // fails, just later. No retries: a flake stays visible.
+  timeout: 60_000,
+  expect: { timeout: 20_000 },
   use: { baseURL: `http://localhost:${PORT}` },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   // Build (incl. the Pagefind index), then serve the `build/` artifact WHOLESALE via a tiny static
