@@ -1920,5 +1920,10 @@ reason = "jed pairs foreign-key columns only when its comparison matrix defines 
 
 [[override]]
 file = "ddl/foreign_key_cross_type.test"
+sql = "CREATE TABLE ck_kb (k kb REFERENCES pk_ka)"
+reason = "jed pairs foreign-key columns only when its comparison matrix defines their equality (constraints.md §6.2 step 5, §6.7). PostgreSQL's record_ops compares any two composite types field by field, so a column of one named composite may reference a column of another with matching fields. A jed composite compares only with its own type (composite.md §5: any other pair is 42804), so the FK pairing is too."
+
+[[override]]
+file = "ddl/foreign_key_cross_type.test"
 sql = "UPDATE pn SET v = 5.25 WHERE v = 5"
 reason = "jed re-checks every row an ON UPDATE CASCADE rewrites (constraints.md §6.6, §6.7). The cascade assigns decimal 5.25 to an i32 column, which rounds to the child's own 5; no parent 5 remains, so jed raises 23503. PostgreSQL skips the RI check of an updated row whose key value is unchanged (ri_KeysEqual) and commits an orphan. jed keeps referential integrity."

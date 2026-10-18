@@ -831,22 +831,25 @@ func sortedUnique(v []int) []int {
 }
 
 // typesEqual reports whether two column types are equal — the FK same-type pairing test
-// (spec/design/constraints.md §6.2), mirroring Rust's Type PartialEq. Two scalars are equal
-// when their scalar types match; a composite/array on either side (never a referenced PK/UNIQUE
-// column) differs from a scalar, so a mismatched local column correctly fails 42804.
+// (spec/design/constraints.md §6.2), mirroring Rust's Type PartialEq. Two scalars are equal when
+// their scalar types match; a composite, array, or range is equal only to the same kind with the
+// same composite name or an equal element type (so int8range never pairs with int4range), and any
+// of them differs from a scalar, so a mismatched local column correctly fails 42804.
 func typesEqual(a, b dataType) bool {
-	if a.Comp != nil || a.Array != nil || b.Comp != nil || b.Array != nil {
-		// Composite/array equality is not reachable for an FK pairing (referenced columns are
-		// keyable scalars); treat any non-scalar pair as unequal unless structurally identical.
-		if (a.Comp != nil) != (b.Comp != nil) || (a.Array != nil) != (b.Array != nil) {
-			return false
-		}
-		if a.Comp != nil {
-			return a.Comp.Name == b.Comp.Name
-		}
-		if a.Array != nil {
-			return typesEqual(*a.Array, *b.Array)
-		}
+	if (a.Comp != nil) != (b.Comp != nil) || (a.Array != nil) != (b.Array != nil) ||
+		(a.Range != nil) != (b.Range != nil) || (a.Record != nil) != (b.Record != nil) {
+		return false
+	}
+	switch {
+	case a.Comp != nil:
+		return a.Comp.Name == b.Comp.Name
+	case a.Array != nil:
+		return typesEqual(*a.Array, *b.Array)
+	case a.Range != nil:
+		return typesEqual(*a.Range, *b.Range)
+	case a.Record != nil:
+		// An anonymous record is never a stored column, so never an FK column.
+		return false
 	}
 	return a.Scalar == b.Scalar
 }
