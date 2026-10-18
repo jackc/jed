@@ -1,0 +1,20 @@
+# `disconnect p0` while p0 owned the attachment a2 and was a page client of main. The Rust runner
+# severed every connection of p0, including the one p1's writer held to p0 as a2's owner, so p1's
+# commit failed 08006 there while Go and TypeScript, which end only p0's connection to main's owner,
+# committed it (simulation-testing.md §5). Shrunk from service-attachments seed 37.
+# format: simulation
+# profile: service-attachments
+# seed: 37
+# page_size: 512
+# cache_bytes: 2048
+# processes: service
+# clock: 1700000000000000
+spawn p2
+attach a2
+spawn p1
+kill p0
+backup page_identical p2
+spawn p0
+open w9 write p1
+disconnect p0
+commit w9

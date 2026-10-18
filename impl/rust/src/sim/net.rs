@@ -26,6 +26,9 @@ const SETTLE_LIMIT: Duration = Duration::from_secs(120);
 struct End {
     peer: usize,
     pid: u32,
+    /// The endpoint the connection was dialed to, and whether this is the dialing (client) side.
+    endpoint: String,
+    dialed: bool,
     inbox: VecDeque<u8>,
     eof: bool,
     closed: bool,
@@ -226,13 +229,24 @@ impl SimNet {
         self.cond.notify_all();
     }
 
-    /// End every connection of process `pid` (the `disconnect` step): both ends see end of stream.
-    pub(crate) fn disconnect(&self, pid: u32) {
+    /// End process `pid`'s connection to the owner serving `db_path` (the `disconnect` step): both
+    /// ends see end of stream. The connections it serves as an owner, and those to other databases'
+    /// owners, are untouched.
+    pub(crate) fn disconnect(&self, pid: u32, db_path: &Path) {
         let mut st = self.lock();
+        // The engine keys a record by the path it resolved, so match the file's name.
+        let Some(endpoint) = st
+            .records
+            .iter()
+            .find(|(k, _)| k.file_name() == db_path.file_name())
+            .map(|(_, r)| r.endpoint.clone())
+        else {
+            return;
+        };
         let ends: Vec<usize> = st
             .ends
             .iter()
-            .filter(|(_, e)| e.pid == pid && !e.closed)
+            .filter(|(_, e)| e.pid == pid && e.dialed && e.endpoint == endpoint && !e.closed)
             .map(|(id, _)| *id)
             .collect();
         for id in ends {
@@ -298,17 +312,19 @@ impl SimNet {
         let server_pid = st.listeners[&lid].pid;
         let client = st.new_id();
         let server = st.new_id();
-        let end = |peer, pid, handles| End {
+        let end = |peer, pid, dialed, handles| End {
             peer,
             pid,
+            endpoint: endpoint.to_string(),
+            dialed,
             inbox: VecDeque::new(),
             eof: false,
             closed: false,
             waiting: false,
             handles,
         };
-        st.ends.insert(client, end(server, pid, 1));
-        st.ends.insert(server, end(client, server_pid, 0));
+        st.ends.insert(client, end(server, pid, true, 1));
+        st.ends.insert(server, end(client, server_pid, false, 0));
         st.listeners
             .get_mut(&lid)
             .expect("checked above")
