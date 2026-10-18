@@ -881,6 +881,8 @@ func viewColumnTypeText(t resolvedType, tm typmod) string {
 		return fmt.Sprintf("varchar(%d)", *tm.VarcharLen)
 	case t.kind == rtDecimal && tm.Decimal != nil:
 		return fmt.Sprintf("decimal(%d,%d)", tm.Decimal.Precision, tm.Decimal.Scale)
+	case (t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval) && tm.Temporal != nil:
+		return rtName(t) + temporalTypmodText(*tm.Temporal)
 	}
 	return rtName(t)
 }

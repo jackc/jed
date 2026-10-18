@@ -20,7 +20,7 @@
 import type { TableRef, TableRefPos } from "./ast.ts";
 import type { Table, ViewDef, ViewDep, ViewDepKind } from "./catalog.ts";
 import { type EngineError, engineError } from "./errors.ts";
-import type { ResolvedType } from "./executor.ts";
+import { type ResolvedType, temporalTypmodText } from "./executor.ts";
 import type { Typmod } from "./resolve.ts";
 import { rtName } from "./scope.ts";
 import { lex } from "./lexer.ts";
@@ -105,6 +105,12 @@ export function viewColumnTypeText(t: ResolvedType, tm: Typmod): string {
   if (t.kind === "text" && tm.varcharLen !== null) return `varchar(${tm.varcharLen})`;
   if (t.kind === "decimal" && tm.decimal !== null) {
     return `decimal(${tm.decimal.precision},${tm.decimal.scale})`;
+  }
+  if (
+    (t.kind === "timestamp" || t.kind === "timestamptz" || t.kind === "interval") &&
+    tm.temporal !== null
+  ) {
+    return rtName(t) + temporalTypmodText(tm.temporal);
   }
   return rtName(t);
 }
