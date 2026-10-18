@@ -2676,6 +2676,10 @@ impl<'a> Runner<'a> {
         rs.close();
         let _ = copy.close();
         let main_version = self.main_db().version;
+        // A dead owner's batch may be lost back to the floor (§8.2): a backup that promotes its
+        // process, or reaches a new owner, may then copy any version from the floor up.
+        let owner_lost = self.main_db().owner_lost;
+        let floor = self.main_db().floor;
         let dg = match dg {
             None => {
                 let why = self
@@ -2685,7 +2689,7 @@ impl<'a> Runner<'a> {
                 self.fail(i, format!("the backup cannot be read: {why}"));
                 return;
             }
-            Some(_) if snapshot < main_version => {
+            Some(_) if snapshot < main_version && (!owner_lost || snapshot < floor) => {
                 self.fail(
                     i,
                     format!(
@@ -2703,6 +2707,14 @@ impl<'a> Runner<'a> {
             }
             Some(dg) => dg,
         };
+        if owner_lost {
+            // The backup's pin is the first look at main since its owner died: what it copied is
+            // now the committed generation, as observe records for a session.
+            let m = self.main_db_mut();
+            m.version = snapshot;
+            m.last_digest = dg.clone();
+            m.owner_lost = false;
+        }
         let (live, pages, free) = match check::integrity(&image, v) {
             Ok(r) => r,
             Err(e) => {

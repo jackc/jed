@@ -1791,13 +1791,22 @@ export class SimRunner {
       this.fail(i, "the backup cannot be read: " + errText(this.digestErr));
       return;
     }
-    if (snapshot < d.version) {
+    // A dead owner's batch may be lost back to the floor (§8.2): a backup that promotes its process,
+    // or reaches a new owner, may then copy any version from the floor up.
+    if (snapshot < d.version && (!d.ownerLost || snapshot < d.floor)) {
       this.fail(i, `the backup copied version ${snapshot}, older than the committed ${d.version}`);
       return;
     }
     if (!d.inHistory(snapshot, dg)) {
       this.fail(i, `the backup holds contents (digest ${dg}) version ${snapshot} never had`);
       return;
+    }
+    if (d.ownerLost) {
+      // The backup's pin is the first look at main since its owner died: what it copied is now the
+      // committed generation, as observe records for a session.
+      d.version = snapshot;
+      d.lastDigest = dg;
+      d.ownerLost = false;
     }
     let counts: [number, number, number];
     try {

@@ -1899,12 +1899,20 @@ func (r *simRunner) stepBackup(i int, st simStep) {
 	case !ok:
 		r.fail(i, "the backup cannot be read: %v", r.digestErr)
 		return
-	case snapshot < d.version:
+	case snapshot < d.version && (!d.ownerLost || snapshot < d.floor):
+		// A dead owner's batch may be lost back to the floor (§8.2): a backup that promotes its
+		// process, or reaches a new owner, may then copy any version from the floor up.
 		r.fail(i, "the backup copied version %d, older than the committed %d", snapshot, d.version)
 		return
 	case !d.history[snapshot][dg]:
 		r.fail(i, "the backup holds contents (digest %s) version %d never had", dg, snapshot)
 		return
+	}
+	if d.ownerLost {
+		// The backup's pin is the first look at main since its owner died: what it copied is now
+		// the committed generation, as observe records for a session.
+		d.version, d.lastDigest = snapshot, dg
+		d.ownerLost = false
 	}
 	live, pages, free, err := simIntegrity(image, v)
 	if err != nil {
