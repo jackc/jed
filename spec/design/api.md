@@ -1108,7 +1108,7 @@ The ergonomic `Query`/`Exec`/`QueryRow` take a cancellation handle — Go `conte
 It is captured on the operation and **polled at the existing cost-meter checkpoint** (the single
 `Guard()` chokepoint already run at the unbounded-work points for `max_cost`, [cost.md](cost.md)
 §6) — so cancellation is **one more condition at a seam that already exists**, not a new
-cross-cutting concern. A flipped token aborts deterministically with **`57014 query_canceled`**
+cross-cutting concern. An observed cancellation aborts with **`57014 query_canceled`**
 (PostgreSQL's exact code for a canceled statement / `statement_timeout`), which **rolls back like
 any error** (autocommit write → table untouched; inside a block → poisons it, transactions.md §6),
 exactly as the `54P01` cost abort does.
@@ -1116,9 +1116,16 @@ exactly as the `54P01` cost abort does.
 It is **not** in the conformance corpus — whether a cancel lands at row 1k or 5k is timing, hence
 nondeterministic — so it is **per-core unit-tested only**, the same treatment benchmarks get
 (CLAUDE.md §10). This does not weaken the determinism contract: a cancel yields an *error*, never
-wrong rows or a different cost; the contract is about queries that *complete*. Overhead is zero
-when the token cannot fire (Go's background context has a nil `Done` channel; skip the poll); for a
-live token, a one-goroutine watcher setting an atomic keeps the hot path to a single atomic load.
+wrong rows; completed statements retain identical deterministic cost. Go skips the poll for a
+background context (nil `Done`); a live context uses a cached `Done` channel with no watcher
+goroutine. Rust polls its shared atomic token. Neither changes cost accrual or cost-limit checks.
+Eligible columnar scans and aggregate folds may keep their optimized execution when cancellation
+is armed: they check between batches of up to 256 records, independently of deterministic cost
+ceilings. A finite statement or lifetime cost limit still selects the scalar enforcement path. A canceled
+batch retains its consumed scan/fold cost in the session lifetime total; it does not erase work
+merely because the successful path accrues those units in bulk.
+Cancellation remains best effort: parsing, sorting, individual scalar kernels, host callbacks, and
+commit work are not made preemptible. The existing commit boundary is unchanged.
 
 **Per-core reality** (CLAUDE.md §2). Go and Rust have real threads, so a cancel from another
 thread interrupts a running statement at the next checkpoint. **TS cannot preempt synchronous
@@ -1127,9 +1134,11 @@ is honored only at operation boundaries, not mid-statement — a deliberate best
 language divergence, not a uniform-shape failure.
 
 The meter `Guard()` is the primary mechanism; the cursor *also* captures the token and re-checks it
-in `Next()` — largely redundant over today's materialized result (the meter already aborted the
-run), but the forward-compatible hook for the streaming cursor (§4), where `Next()` becomes where
-work (and thus cancellation) happens.
+in Go's `Next()`. Streaming and deferred cursors execute after `Query` returns, so their frozen
+engines and meters retain the operation's cancellation state for the entire cursor lifetime.
+Restoring the live session after `Query` must not disarm the cursor or affect another operation.
+Go closes cursor resources and reader pins on exhaustion or terminal iteration error; an early
+exit still requires `Close`. Once closed or exhausted, later cancellation cannot change its result.
 
 ### 11.5 Status and naming
 
@@ -1148,7 +1157,9 @@ registered **`57014 query_canceled`** at the next metering point, not only at th
 boundary (`ctxErr`). The poll is `nil` (zero-overhead, untouched hot path, the §8 cost determinism
 intact) unless a cancelable ctx is active; a non-cancelable background ctx (nil `Done`) arms
 nothing. Verified by `impl/go/cancellation_test.go` (the meter-`Guard` unit test, the boundary
-abort, and a white-box mid-execution abort). The **`Queryer`** interface
+abort, synchronized cancellation inside `Next` across all ergonomic handles and prepared/Exec
+paths, transaction poisoning/rollback, cleanup/isolation, and batch/cost-limit regressions).
+Reproducible overhead and response-latency measurements are in `bench/cancellation/README.md`. The **`Queryer`** interface
 (`Query`/`QueryRow`/`Exec` + the `*Prepared` trio) is satisfied by `Database`, `Session`, and
 `Transaction`, so a data-access function written against it runs unchanged on a handle, a durable
 session, or inside a transaction (pgx's `Querier`). The raw `[]Value` query method on

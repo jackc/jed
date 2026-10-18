@@ -1,0 +1,6 @@
+    cancellation_bench_test.go:208: SELECT sum(v) FROM t: cancellation response median=2959ns p95=5392ns max=10612ns
+    cancellation_bench_test.go:208: SELECT v FROM t: cancellation response median=22751ns p95=429694ns max=533729ns
+    cancellation_bench_test.go:208: SELECT v FROM t ORDER BY id LIMIT 1000000: cancellation response median=1294ns p95=5116ns max=1844776ns
+test shared::cancellation_bench::cancellation_latency_measurement ... SELECT sum(v) FROM t: cancellation response median=2974ns p95=9703ns max=10239ns
+SELECT v FROM t: cancellation response median=158322ns p95=192588ns max=232379ns
+SELECT v FROM t ORDER BY id LIMIT 1000000: cancellation response median=362ns p95=480ns max=507ns

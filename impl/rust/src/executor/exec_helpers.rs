@@ -37,6 +37,9 @@ pub(crate) fn fold_agg_whole(
         meter.charge(COSTS.aggregate_accumulate * nsurv as i64);
         let oc = operand_col(spec);
         for j in 0..nsurv {
+            if j & 255 == 0 {
+                meter.guard()?;
+            }
             let v = match oc {
                 Some(c) => src.at(j, c).clone(),
                 None => Value::Null, // COUNT(*) folds no value
@@ -74,6 +77,9 @@ pub(crate) fn group_by_int_key(
 
     meter.charge(COSTS.aggregate_accumulate * nsurv as i64 * specs.len() as i64);
     for j in 0..nsurv {
+        if j & 255 == 0 {
+            meter.guard()?;
+        }
         let kv = src.at(j, key_col);
         let gi = match kv {
             Value::Int(k) => match index.get(k) {

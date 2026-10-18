@@ -59,9 +59,9 @@ package jed
 //     order (both bucket the same post-WHERE rows in scan order) — so even a LIMIT without ORDER BY
 //     keeps the same rows, not merely the same multiset.
 //
-// The path is gated to the UNMETERED lane (costMeter.unmetered — no ceiling / lifetime budget /
-// cancellation armed), which is the conformance/bench case: with nothing to abort, Guard is a
-// no-op, so a bulk aggregate_accumulate charge reproduces the scalar total with no per-row Guard.
+// The path requires no cost ceiling / lifetime budget (costMeter.canBatchCosts). Bulk charges
+// preserve the scalar total. Cancellation is polled
+// at batch boundaries (at most 256 scan/fold records).
 // A metered query keeps the scalar path, so its deterministic abort row is unchanged.
 
 // colBatch is a decoded integer column pulled from a set of rows for a vectorized fold. Its int lane
@@ -259,6 +259,7 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 		accs := newAccsForSpecs(plan.aggSpecs, db.session.timeZone)
 		// The whole-table group's entry (memory.md §6.2), returned once the group is finalized.
 		charge := meter.stateCharge()
+		defer charge.releaseAll() // includes cancellation during the fallback fold
 		if charge.active() {
 			if err := charge.reserve(meter, memEntryBytes(nil)); err != nil {
 				return emitter{}, err
@@ -332,7 +333,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	if store == nil {
 		return nil, false, nil
 	}
-	// File-backed only (see the doc comment): an in-memory store's row path is already zero-copy.
+	// Packed-page stores include committed memory databases. Unpacked working stores decline.
 	if store.paging == nil {
 		return nil, false, nil
 	}
@@ -424,9 +425,16 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 
 	nsurv := 0
 	rowCount, nodes := 0, 0
+	visited := 0
 	if scan {
 		var werr error
 		rowCount, nodes, werr = store.rows.foldScan(b, store.leafSrc(), func(n *pnode, i int) error {
+			if visited&255 == 0 {
+				if err := meter.Guard(); err != nil {
+					return err
+				}
+			}
+			visited++
 			if spillable {
 				p, d := n.recordScanUnits(i, store.colTypes, store.cap, mask)
 				unitPages += p
@@ -504,14 +512,18 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 			return nil
 		})
 		if werr != nil {
+			if e, ok := werr.(*EngineError); ok && e.Code() == "57014" {
+				// Bulk accrual must not erase work already done by a canceled scan.
+				meter.Charge(costs.PageRead*int64(nodes+unitPages) + costs.ValueDecompress*int64(unitSlabs) + costs.StorageRowRead*int64(visited))
+				meter.Charge(costs.AggregateAccumulate * int64(nsurv) * int64(len(plan.aggSpecs)))
+			}
 			return nil, false, werr
 		}
 	}
 
 	// Charge the identical cost totals: the scan block (page_read × (nodes + chain pages) — the same
 	// node visits; value_decompress × slabs; storage_row_read × rowCount) and aggregate_accumulate once
-	// per (survivor × spec), all bulk on the unmetered lane (the caller gates, so Guard is a no-op —
-	// order of charging is invisible). The filter's operator_eval was charged per scanned row inside
+	// per (survivor × spec), all bulk without cost ceilings (the caller gates). The filter's operator_eval was charged per scanned row inside
 	// foldScan.
 	meter.Charge(costs.PageRead*int64(nodes+unitPages) + costs.ValueDecompress*int64(unitSlabs) + costs.StorageRowRead*int64(rowCount))
 	meter.Charge(costs.AggregateAccumulate * int64(nsurv) * int64(len(plan.aggSpecs)))
@@ -611,7 +623,7 @@ func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMet
 	if store == nil {
 		return emitter{}, false, nil
 	}
-	// File-backed only (see aggColumnar): an in-memory store's row path is already zero-copy.
+	// Packed-page stores include committed memory databases (see aggColumnar).
 	if store.paging == nil {
 		return emitter{}, false, nil
 	}
@@ -660,9 +672,16 @@ func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMet
 	reuse := laneReuse(store.colTypes, span != nil)
 	cols := make([][]Value, len(mask))
 	rowCount, nodes, unitPages, unitSlabs, nEmit := 0, 0, 0, 0, 0
+	visited := 0
 	if scan {
 		var err error
 		rowCount, nodes, err = store.rows.foldScan(b, store.leafSrc(), func(n *pnode, i int) error {
+			if visited&255 == 0 {
+				if err := meter.Guard(); err != nil {
+					return err
+				}
+			}
+			visited++
 			if spillable {
 				p, d := n.recordScanUnits(i, store.colTypes, store.cap, mask)
 				unitPages += p
@@ -691,13 +710,16 @@ func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMet
 			return nil
 		})
 		if err != nil {
+			if e, ok := err.(*EngineError); ok && e.Code() == "57014" {
+				meter.Charge(costs.PageRead*int64(nodes+unitPages) + costs.ValueDecompress*int64(unitSlabs) + costs.StorageRowRead*int64(visited))
+			}
 			return emitter{}, false, err
 		}
 	}
 	// Charge the scan cost block identically to materializeRel + scanSource: page_read × (nodes + chain
 	// pages), value_decompress × slabs, storage_row_read × rowCount. On the unmetered lane (the caller
-	// gates) this bulk charge reproduces the scanSource's per-row accrual (Guard is a no-op); the
-	// filter's operator_eval was charged per scanned record inside the walk.
+	// gates) this bulk charge reproduces the scanSource's per-row accrual. The filter's operator_eval
+	// was charged per scanned record inside the walk.
 	meter.Charge(costs.PageRead*int64(nodes+unitPages) + costs.ValueDecompress*int64(unitSlabs) + costs.StorageRowRead*int64(rowCount))
 	// The gathered lanes are operator state, reserved once the bulk gather completes (memory.md §6.5)
 	// and returned when the emission completes.
@@ -782,7 +804,12 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 	defer charge.releaseAll()
 
 	meter.Charge(costs.AggregateAccumulate * int64(len(survivors)) * int64(len(plan.aggSpecs)))
-	for _, r := range survivors {
+	for ri, r := range survivors {
+		if ri&255 == 0 {
+			if err := meter.Guard(); err != nil {
+				return nil, err
+			}
+		}
 		kv := r[keyIdx]
 		var gi int
 		if kv.Kind == ValNull {
@@ -827,6 +854,11 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 
 	out := make([]storedRow, 0, len(groups))
 	for i := range groups {
+		if i&255 == 0 {
+			if err := meter.Guard(); err != nil {
+				return nil, err
+			}
+		}
 		srow, ferr := finalizeGroup([]Value{groups[i].key}, groups[i].accs)
 		if ferr != nil {
 			return nil, ferr
@@ -845,12 +877,20 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 // floatSum.add — matching the scalar arm exactly).
 func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter) error {
 	meter.Charge(costs.AggregateAccumulate * int64(len(survivors)))
+	if err := meter.Guard(); err != nil {
+		return err
+	}
 	switch spec.plan {
 	case planCountStar:
 		a.count += int64(len(survivors))
 	case planCount:
 		b := extractIntColumn(survivors, spec.operand.index)
 		for i := 0; i < b.n; i++ {
+			if i&255 == 0 {
+				if err := meter.Guard(); err != nil {
+					return err
+				}
+			}
 			if !b.nulls[i] {
 				a.count++
 			}
@@ -858,6 +898,11 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 	case planSumInt:
 		b := extractIntColumn(survivors, spec.operand.index)
 		for i := 0; i < b.n; i++ {
+			if i&255 == 0 {
+				if err := meter.Guard(); err != nil {
+					return err
+				}
+			}
 			if b.nulls[i] {
 				continue
 			}
@@ -878,6 +923,11 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 		// eval dispatch, not the O(1) add.
 		idx := spec.operand.index
 		for i := range survivors {
+			if i&255 == 0 {
+				if err := meter.Guard(); err != nil {
+					return err
+				}
+			}
 			v := survivors[i][idx]
 			if v.Kind != ValNull {
 				a.floatSum.add(v)
@@ -886,6 +936,11 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 	case planMin, planMax:
 		idx := spec.operand.index
 		for i := range survivors {
+			if i&255 == 0 {
+				if err := meter.Guard(); err != nil {
+					return err
+				}
+			}
 			v := survivors[i][idx]
 			if v.Kind == ValNull {
 				continue

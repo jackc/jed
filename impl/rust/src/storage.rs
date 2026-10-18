@@ -530,7 +530,7 @@ impl TableStore {
         &self,
         b: &KeyBound,
         visit: &mut dyn FnMut(&crate::pmap::Node, usize) -> Result<()>,
-    ) -> Result<(usize, usize)> {
+    ) -> (usize, usize, Result<()>) {
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.fold_scan(b, src_ref, visit)

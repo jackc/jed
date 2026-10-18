@@ -296,7 +296,7 @@ type sessionState struct {
 	// active. newMeter copies it into the statement's meter, whose Guard() polls it at each metering
 	// checkpoint, so a flipped handle aborts a long-running statement (57014) — not only at the
 	// cursor boundary. Set/cleared by engine.armCancel around a single statement (ergonomic.go); a
-	// single atomic load on the hot path.
+	// cached context Done channel check on the hot path.
 	cancel func() bool
 	// maxSQLLength is the maximum input SQL length in bytes (CLAUDE.md §13; cost.md §7); 0 =
 	// unlimited; default DefaultMaxSQLLength (1 MiB). Over-limit input is rejected 54000 at parse,

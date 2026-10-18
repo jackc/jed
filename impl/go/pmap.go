@@ -769,7 +769,7 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []stor
 // (packed-leaf.md §11 Tracks A2–A4): visit reads each record's touched columns (via n.colAt, or their
 // stored bytes) instead of reconstructing a row. It visits the IDENTICAL nodes rangeEntriesCounted
 // does and returns (rowCount, nodeCount), so the caller charges the identical page_read /
-// storage_row_read. visit's error aborts the walk.
+// storage_row_read. Errors preserve the partial counts for cancellation accounting.
 func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) error) (rowCount, nodes int, err error) {
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
@@ -798,7 +798,7 @@ func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) 
 	}
 	if m.root != nil {
 		if e := walk(m.root); e != nil {
-			return 0, 0, e
+			return rowCount, nodes, e
 		}
 	}
 	return rowCount, nodes, nil

@@ -1,0 +1,48 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled-24         	  457504	      1424 ns/op	    1968 B/op	      29 allocs/op
+BenchmarkCancellation/cheap/disabled-24         	  421965	      1362 ns/op	    1968 B/op	      29 allocs/op
+BenchmarkCancellation/cheap/disabled-24         	  405643	      1278 ns/op	    1968 B/op	      29 allocs/op
+BenchmarkCancellation/cheap/enabled-24          	  467547	      1268 ns/op	    1608 B/op	      23 allocs/op
+BenchmarkCancellation/cheap/enabled-24          	  419685	      1276 ns/op	    1608 B/op	      23 allocs/op
+BenchmarkCancellation/cheap/enabled-24          	  429976	      1262 ns/op	    1608 B/op	      23 allocs/op
+BenchmarkCancellation/stream/disabled-24        	     758	    779873 ns/op	  961750 B/op	   20019 allocs/op
+BenchmarkCancellation/stream/disabled-24        	     848	    774522 ns/op	  961752 B/op	   20019 allocs/op
+BenchmarkCancellation/stream/disabled-24        	     751	    778215 ns/op	  961756 B/op	   20019 allocs/op
+BenchmarkCancellation/stream/enabled-24         	     687	    881119 ns/op	  961765 B/op	   20020 allocs/op
+BenchmarkCancellation/stream/enabled-24         	     656	    903161 ns/op	  961768 B/op	   20020 allocs/op
+BenchmarkCancellation/stream/enabled-24         	     673	    894645 ns/op	  961767 B/op	   20020 allocs/op
+BenchmarkCancellation/aggregate/disabled-24     	    4275	    143205 ns/op	    2856 B/op	      20 allocs/op
+BenchmarkCancellation/aggregate/disabled-24     	    4644	    144530 ns/op	    2856 B/op	      20 allocs/op
+BenchmarkCancellation/aggregate/disabled-24     	    3987	    141624 ns/op	    2856 B/op	      20 allocs/op
+BenchmarkCancellation/aggregate/enabled-24      	     300	   2018552 ns/op	 5279475 B/op	   10094 allocs/op
+BenchmarkCancellation/aggregate/enabled-24      	     286	   2025824 ns/op	 5279470 B/op	   10094 allocs/op
+BenchmarkCancellation/aggregate/enabled-24      	     289	   1968549 ns/op	 5279470 B/op	   10094 allocs/op
+BenchmarkCancellation/projection/disabled-24    	     943	    655099 ns/op	 1792605 B/op	   10036 allocs/op
+BenchmarkCancellation/projection/disabled-24    	     943	    655745 ns/op	 1792599 B/op	   10036 allocs/op
+BenchmarkCancellation/projection/disabled-24    	     951	    650070 ns/op	 1792605 B/op	   10036 allocs/op
+BenchmarkCancellation/projection/enabled-24     	     284	   2143360 ns/op	 5597919 B/op	   20087 allocs/op
+BenchmarkCancellation/projection/enabled-24     	     290	   2056657 ns/op	 5597930 B/op	   20087 allocs/op
+BenchmarkCancellation/projection/enabled-24     	     288	   1969789 ns/op	 5597939 B/op	   20087 allocs/op
+BenchmarkCancellationMechanism/watcher/1-24     	 2258844	       269.8 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/watcher/1-24     	 2259958	       266.2 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/watcher/1-24     	 2218017	       270.5 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/channel/1-24     	125709830	         4.662 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/channel/1-24     	121545108	         4.695 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/channel/1-24     	126352742	         4.657 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/watcher/1000-24  	  529874	      1038 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/watcher/1000-24  	  713055	      1082 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/watcher/1000-24  	  530541	      1160 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/channel/1000-24  	  185211	      2996 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/channel/1000-24  	  206380	      3114 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/channel/1000-24  	  183904	      2908 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationCaller/context-24          	 3751179	       141.9 ns/op	     208 B/op	       3 allocs/op
+BenchmarkCancellationCaller/context-24          	 4133623	       132.5 ns/op	     208 B/op	       3 allocs/op
+BenchmarkCancellationCaller/context-24          	 4618852	       137.5 ns/op	     208 B/op	       3 allocs/op
+BenchmarkCancellationCaller/deadline-24         	 1635189	       361.3 ns/op	     384 B/op	       5 allocs/op
+BenchmarkCancellationCaller/deadline-24         	 1601011	       356.1 ns/op	     384 B/op	       5 allocs/op
+BenchmarkCancellationCaller/deadline-24         	 1595638	       358.5 ns/op	     384 B/op	       5 allocs/op
+PASS
+ok  	github.com/jackc/jed/impl/go	32.452s

@@ -320,7 +320,7 @@ impl Engine {
         // fast-path below — they all require `!is_agg` — so this front-position placement is only for
         // clarity, mirroring the Go core's ordering.)
         if fast
-            && meter.is_unmetered()
+            && meter.can_batch_costs()
             && (!self.blocking_spill_eligible(plan) || self.bounded_whole_aggregate(plan))
             && self.explain_actual.borrow().is_none()
             && self.vectorized_agg_eligible(plan)
@@ -423,7 +423,7 @@ impl Engine {
         // (project_columnar declines otherwise, falling through to the identical-cost row path).
         // Cost-neutral by construction.
         if fast
-            && meter.is_unmetered()
+            && meter.can_batch_costs()
             && self.explain_actual.borrow().is_none()
             && vectorized_project_eligible(plan)
         {

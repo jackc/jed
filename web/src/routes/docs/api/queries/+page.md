@@ -263,3 +263,20 @@ Unlike PostgreSQL, a statement never switches to a "generic" plan after some num
 and there is no `plan_cache_mode`: the plan of an execution depends only on the statement, its
 values, and the database — never on which values earlier runs happened to bind. `EXPLAIN` accepts
 bound values and shows the plan they get.
+
+## Cancellation
+
+Go's `Query`, `QueryPrepared`, `Exec`, and `QueryRow` accept a `context.Context` on database,
+session, and transaction handles. Keep that context alive while consuming the rows: cancellation
+also interrupts engine work inside a long `Rows.Next()` after `Query` has returned. Check
+`Rows.Err()` for SQLSTATE `57014`, and `defer rows.Close()` when you might stop early. Exhaustion
+and terminal errors release the cursor automatically.
+
+Rust's `query_cancelable` and `execute_cancelable` accept a clonable `CancellationToken`; another
+thread can call `cancel()` while the query runs. After manually draining Rust rows, call `error()`
+to check for an execution error.
+
+Cancellation during execution fails an open transaction, which must then be rolled back. It is
+best effort, without a fixed wall-clock response guarantee: sorting, individual scalar kernels,
+host callbacks, and commit work can delay observation. Cancellation does not change completed-query
+cost totals or deterministic cost limits.

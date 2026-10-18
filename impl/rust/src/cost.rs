@@ -497,20 +497,12 @@ impl Meter {
         }
     }
 
-    /// Whether NO enforcement is armed — no per-statement ceiling, no session lifetime budget, and no
-    /// cancellation poll — so [`guard`](Meter::guard) is a no-op. The gate for the Track A2/A3 columnar
-    /// fast path (packed-leaf.md §11): it charges the scan block in bulk (not per row with an
-    /// intervening guard), which reproduces the row path's exact total only when there is nothing to
-    /// abort against; a metered query keeps the row path so its deterministic `54P01`/`54P02`/`57014`
-    /// abort row is unchanged. This is the conformance/bench lane (no ceiling / budget / cancellation).
+    /// Bulk accrual is safe without deterministic cost ceilings. Cancellation remains
+    /// best effort and is polled by batch loops at least every 256 records; it does not
+    /// change the cost schedule or the scalar cost-limit abort points.
     #[inline]
-    pub fn is_unmetered(&self) -> bool {
-        self.limit <= 0
-            && self.cancel.is_none()
-            && match &self.lifetime {
-                None => true,
-                Some(l) => l.limit <= 0,
-            }
+    pub fn can_batch_costs(&self) -> bool {
+        self.limit <= 0 && self.lifetime.as_ref().is_none_or(|l| l.limit <= 0)
     }
 
     /// Enforce the ceilings: abort if the per-statement `max_cost` (`54P01`) **or** the session

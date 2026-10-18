@@ -183,12 +183,11 @@ type Rows struct {
 	// current is the row the last successful Next produced; valid reports whether there is one.
 	current []Value
 	valid   bool
-	// ctx is captured at Query time (ergonomic.go); Next polls it so a canceled context aborts
-	// iteration. Today the result is already materialized, so this is the forward-compatible hook
-	// for the streaming cursor (CLAUDE.md §9) — the deeper integration threads ctx through the
-	// cost meter's Guard() so the materialize itself aborts (spec/design/api.md §11).
+	closed  bool
+	// ctx is captured at Query time for the entry check. The cursor's snapshot and
+	// meters independently retain the operation's poll throughout execution inside Next.
 	ctx ctxIface
-	// err holds a terminal error reached during iteration (a canceled ctx, a future mid-stream
+	// err holds a terminal error reached during iteration (cancellation or a mid-stream
 	// fault). Surfaced by Err() after the loop — the bufio.Scanner / database/sql idiom.
 	err error
 	// onErr fires once when a terminal iteration error is first set (a drain-time streaming/deferred
@@ -237,11 +236,12 @@ func (r *Rows) setErr(err error) {
 // context has been canceled (Err then reports the cancellation).
 func (r *Rows) Next() bool {
 	r.valid = false
-	if r.err != nil {
+	if r.closed || r.err != nil {
 		return false
 	}
 	if err := ctxErr(r.ctx); err != nil {
 		r.setErr(err)
+		r.Close()
 		return false
 	}
 	row, ok, err := r.cursor.nextRow()
@@ -250,9 +250,11 @@ func (r *Rows) Next() bool {
 		// arithmetic trap): stop iteration; Err() surfaces it (streaming.md §6). setErr also aborts an
 		// open block (attachBlockPoison) — PG aborts a transaction on a drain-time statement error too.
 		r.setErr(err)
+		r.Close()
 		return false
 	}
 	if !ok {
+		r.Close()
 		return false
 	}
 	r.current = row
