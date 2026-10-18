@@ -594,8 +594,8 @@ struct SimDb {
     /// Set when a relaxed commit lowered the high-water: the next flush (the batch cap, close) must
     /// shorten the file (format.md *Trailing truncation*).
     shrink_due: bool,
-    /// Set when an owner died under synchronous = off: until a process observes main again, it may
-    /// have recovered any version from the floor up.
+    /// Set when an owner died: until a process observes the database again, it may have recovered
+    /// any version from the floor up.
     owner_lost: bool,
 }
 
@@ -1283,12 +1283,12 @@ impl<'a> Runner<'a> {
     /// than dropped (a drop would end its page-service role cleanly), and the network closes its
     /// listener and connections, as the kernel closes a dead process's sockets.
     fn drop_proc(&mut self, pid: u32) {
-        if self.relaxed
-            && let Some(p) = self.procs.get(&pid)
-        {
-            // A dead owner's batch may be lost back to the floor (validated-cow.md §4): the
-            // simulated process crash may drop writes of the step that acknowledged a commit. Each
-            // database it owned (main or an attachment under the service) has its own batch.
+        if let Some(p) = self.procs.get(&pid) {
+            // A dead owner may take every version above the floor with it (§8.2): under
+            // synchronous = off the simulated process crash may drop writes of the step that
+            // acknowledged a commit, and under either mode a generation it adopted but never
+            // stabilized (validated-cow.md §3) may be dropped by a failed stabilization sync. Each
+            // database it owned (main or an attachment under the service) has its own floor.
             let owned: Vec<String> = self
                 .dbs
                 .keys()

@@ -373,8 +373,8 @@ class SimDB {
   // shrinkDue is set when a relaxed commit lowered the high-water: the next flush (the batch cap, close)
   // must shorten the file (format.md *Trailing truncation*).
   shrinkDue = false;
-  // ownerLost is set when an owner died under synchronous = off: until a process observes main again,
-  // it may have recovered any version from the floor up.
+  // ownerLost is set when an owner died: until a process observes the database again, it may have
+  // recovered any version from the floor up.
   ownerLost = false;
 
   constructor(name: string, file: string) {
@@ -2299,10 +2299,12 @@ export class SimRunner {
   // and the kernel releases its locks.
   private dropProc(pid: number): void {
     const p = this.procs.get(pid);
-    if (this.relaxed && p !== undefined) {
-      // A dead owner's batch may be lost back to the floor (validated-cow.md §4): the simulated
-      // process crash may drop writes of the step that acknowledged a commit. Each database it owned
-      // (main or an attachment under the service) has its own batch.
+    if (p !== undefined) {
+      // A dead owner may take every version above the floor with it (§8.2): under synchronous = off
+      // the simulated process crash may drop writes of the step that acknowledged a commit, and under
+      // either mode a generation it adopted but never stabilized (validated-cow.md §3) may be dropped
+      // by a failed stabilization sync. Each database it owned (main or an attachment under the
+      // service) has its own floor.
       for (const d of this.dbs.values()) {
         const c = serviceCoreOf(p.db, d);
         if (c !== null && c.service !== null) d.ownerLost = true;

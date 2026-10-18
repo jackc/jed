@@ -364,6 +364,11 @@ belongs to the corpus.
   from the floor up, since the simulated process crash may drop writes of the step that acknowledged
   a commit (§6.3) — a more pessimistic model than the in-order issue that makes a real process crash
   lose no acknowledged relaxed commit.
+- **Under either mode**, a page-service owner that dies may take every version above the floor with
+  it, so until a process observes the database again it may see any version from the floor up. A
+  generation an owner adopted without stabilizing it (a read-only adoption needs no sync,
+  validated-cow.md §3) is above the floor, and a failed stabilization sync before the owner's next
+  write may drop part of it from the cache (`io_error op=sync`, §6.3).
 - **Recovering below the floor is a durability violation.** Recovering above the latest attempted
   version, or failing with `XX001` outside corruption mode, is a corruption violation.
 - Each database has its own floor. An attachment's floor is **0** from the moment `attach` starts

@@ -1,0 +1,29 @@
+# An owner died at its commit's barrier with every write issued, and the promoted owner adopted that
+# generation without stabilizing it (a read-only adoption needs no sync, validated-cow.md §3). Its
+# stabilization sync before the next client commit failed and dropped some of the generation's pages,
+# so the next owner recovered the version before it. That version is the floor, so this is allowed,
+# but the runner let a dead owner's database regress only under synchronous = off and reported an
+# isolation violation (simulation-testing.md §8.2). Shrunk from service-attachments seed 197.
+# format: simulation
+# profile: service-attachments
+# seed: 197
+# page_size: 512
+# processes: service
+# clock: 1700000000000000
+open w5 write p0
+on w5 CREATE TABLE t2 (id i64 PRIMARY KEY, c1 bytea, c2 bytea, c3 bytea, c4 i32)
+commit w5
+spawn p2
+spawn p1
+open w6 write p1
+on w6 INSERT INTO t2 (id, c1, c2, c3, c4) SELECT g, decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), decode(md5(g::text), 'hex'), (g * 24 + 20) % 1000 FROM generate_series(1, 35) g ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1, c2 = excluded.c2, c3 = excluded.c3, c4 = excluded.c4
+commit w6
+open w22 write p0
+on w22 UPDATE t2 SET c2 = decode(repeat(md5(id::text), 8), 'hex'), c4 = (id * 7) % 1000 WHERE id % 4 = 3
+fault process_crash issue=1000 nth=1
+commit w22
+open w28 write p1
+on w28 CREATE TABLE t5 (id i64 PRIMARY KEY, c1 text)
+fault io_error op=sync nth=1
+commit w28
+open w29 write p2
