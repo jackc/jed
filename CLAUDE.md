@@ -642,7 +642,7 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   barriers remain additional; this is one barrier for steady-state commits. No WAL, body redo,
   or new host durability primitive. The same v33 bytes and protocol bind Rust, Go, TypeScript,
   and shared-file access. [spec/design/validated-cow.md](spec/design/validated-cow.md).
-- **Batched durability — `synchronous = off` (format v43).** A relaxed commit is atomic and
+- **Batched durability — `synchronous = off` (format v49).** A relaxed commit is atomic and
   visible once its pages and meta are written; one later **flush** makes a run of commits durable.
   Every commit pending after the newest durable meta (the floor) writes the slot not holding it, lists
   every page written since the floor in its manifest, reuses only pages the floor already had free,
