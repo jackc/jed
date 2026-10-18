@@ -7017,6 +7017,19 @@ pub(crate) fn encode_value_key(pk_ty: ScalarType, v: &Value, coll: Option<&Colla
         Value::Null => BoundKey::Null,
         Value::Bool(b) => BoundKey::Key(encode_bool(*b)),
         Value::Uuid(u) => BoundKey::Key(u.to_vec()),
+        // A promoted source (an integer sibling/outer column against a decimal key, or a decimal
+        // one against an integer key — the comparison widened int → decimal) is first converted
+        // to the key's type, as an `= ANY` element is (cost.md §3): an integer is the equal
+        // decimal; a decimal is that integer when it is integral and in range, else it equals no
+        // key (OutOfRange: an empty equality, a dropped range half-bound).
+        Value::Int(n) if pk_ty.is_decimal() => BoundKey::Key(Decimal::from_i64(*n).encode_key()),
+        Value::Decimal(d) if pk_ty.is_integer() => match d
+            .to_i64_round()
+            .filter(|&n| pk_ty.in_range(n) && Decimal::from_i64(n).cmp_value(d).is_eq())
+        {
+            Some(n) => BoundKey::Key(encode_int(pk_ty, n)),
+            None => BoundKey::OutOfRange,
+        },
         Value::Int(n) => {
             if pk_ty.in_range(*n) {
                 BoundKey::Key(encode_int(pk_ty, *n))

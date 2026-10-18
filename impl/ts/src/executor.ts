@@ -31447,6 +31447,16 @@ export function encodeTextBound(s: string, coll: Collation | null): BoundKey {
 // value's key form (collated sort key vs raw bytes — encodeTextBound).
 export function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | null): BoundKey {
   if (v.kind === "null") return { kind: "null" };
+  // A promoted source (an integer sibling/outer column against a decimal key, or a decimal one
+  // against an integer key — the comparison widened int → decimal) is first converted to the key's
+  // type, as an `= ANY` element is (pointValue, cost.md §3): an integer is the equal decimal; a
+  // decimal is that integer when it is integral and in range, else it equals no key (outOfRange: an
+  // empty equality, a dropped range half-bound).
+  if ((isDecimal(pkType) && v.kind === "int") || (isInteger(pkType) && v.kind === "decimal")) {
+    const pv = pointValue(pkType, v);
+    if (pv === null) return { kind: "outOfRange" };
+    v = pv;
+  }
   if (v.kind === "bool") return { kind: "key", key: encodeBool(v.value) };
   if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
   if (v.kind === "text") return encodeTextBound(v.text, coll);
