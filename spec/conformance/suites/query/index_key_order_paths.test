@@ -1,0 +1,282 @@
+# Ordered (DESC / NULLS FIRST) index keys through the access paths that skip key slots
+# (spec/design/indexes.md §5.1/§9/§10/§11, encoding.md §2.16): a DESC variable-width text element
+# after an equality prefix (its inverted terminated body is stepped over by the unified key-slot
+# skipper to recover the storage key), a range and a key set on a DESC text element (endpoints
+# swapped, probes emitted in physical order), a partial DESC index (full partial walk, range, and a
+# bounded UPDATE), and REINDEX, which rebuilds an ordered index with its options. Each cost pins the
+# index engagement (strictly below the full scan) and is identical to the equivalent ASC index's;
+# the post-REINDEX costs equal the pre-REINDEX ones, so the rebuilt indexes keep their order.
+# Rows agree with the PostgreSQL oracle.
+# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, ddl.reindex, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.index_range, query.index_prefix, query.index_variable_width_tail, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.index_partial_full_scan, query.index_partial_access_paths, query.order_by, query.order_by_keys, query.order_by_index_scan, query.limit, query.set_returning, expr.in_list, func.array_quantified, types.array, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE k (id i32 PRIMARY KEY, g i32, name text, score i32)
+
+# 90 rows: g in 0..2; name 'n<id>' (NULL every 11th row); score id % 40 (NULL every 7th row).
+statement ok
+INSERT INTO k SELECT n, n % 3, CASE WHEN n % 11 = 0 THEN NULL ELSE 'n' || n END, CASE WHEN n % 7 = 0 THEN NULL ELSE n % 40 END FROM generate_series(1, 90) AS n
+
+# the full scan, for comparison
+# cost: 561
+query I nosort
+SELECT count(*) FROM k WHERE g + 0 = 1 AND name > 'n4' AND name < 'n55'
+----
+5
+
+statement ok
+CREATE INDEX k_g_name ON k (g, name DESC)
+
+statement ok
+CREATE INDEX k_name ON k (name DESC NULLS LAST)
+
+statement ok
+CREATE INDEX k_live ON k (score DESC) WHERE score > 10
+
+# --- a DESC text element after the equality prefix --------------------------------------------
+
+# the trailing DESC text slot (its NULL tag FE, or FF + the inverted body) is skipped to the PK
+# cost: 161
+query IT rowsort
+SELECT id, name FROM k WHERE g = 2 AND id < 30
+----
+11
+NULL
+14
+n14
+17
+n17
+2
+n2
+20
+n20
+23
+n23
+26
+n26
+29
+n29
+5
+n5
+8
+n8
+
+# a range on the DESC text element: the logical (n4, n55) maps to swapped byte endpoints
+# cost: 56
+query IT rowsort
+SELECT id, name FROM k WHERE g = 1 AND name > 'n4' AND name < 'n55'
+----
+40
+n40
+43
+n43
+46
+n46
+49
+n49
+52
+n52
+
+# a key set over (g, name DESC): each member's points are its ordered slots
+# cost: 114
+query IT rowsort
+SELECT id, name FROM k WHERE g IN (0, 2) AND name IN ('n3', 'n12', 'n27', 'n33', 'n80', 'n81')
+----
+12
+n12
+27
+n27
+3
+n3
+80
+n80
+81
+n81
+
+# ORDER BY matching (g, name DESC) under an equality on g and a range on name walks the bounded
+# index (the range keeps the NULLs, which tie, out of the window)
+# cost: 32
+query IT nosort
+SELECT id, name FROM k WHERE g = 0 AND name < 'n99' ORDER BY g, name DESC LIMIT 4
+----
+90
+n90
+9
+n9
+87
+n87
+84
+n84
+
+# --- a leading DESC NULLS LAST text element -----------------------------------------------------
+
+# cost: 63
+query IT rowsort
+SELECT id, name FROM k WHERE name >= 'n7' AND name <= 'n75'
+----
+7
+n7
+70
+n70
+71
+n71
+72
+n72
+73
+n73
+74
+n74
+75
+n75
+
+# cost: 24
+query IT rowsort
+SELECT id, name FROM k WHERE name = ANY (ARRAY['n5', 'n50', 'n9', NULL])
+----
+5
+n5
+50
+n50
+9
+n9
+
+# cost: 16
+query IT nosort
+SELECT id, name FROM k ORDER BY name DESC NULLS LAST LIMIT 5
+----
+90
+n90
+9
+n9
+89
+n89
+87
+n87
+86
+n86
+
+# --- a partial DESC index -------------------------------------------------------------------------
+
+# the WHERE implies the predicate: the full partial walk serves ORDER BY score DESC; 39, 39, 38, 38
+# are the top four (no tie crosses the LIMIT)
+# cost: 17
+query II rowsort
+SELECT id, score FROM k WHERE score > 10 ORDER BY score DESC LIMIT 4
+----
+38
+38
+39
+39
+78
+38
+79
+39
+
+# a range inside the partial index's predicate
+# cost: 31
+query II rowsort
+SELECT id, score FROM k WHERE score > 25 AND score < 29
+----
+26
+26
+27
+27
+66
+26
+67
+27
+68
+28
+
+# an index-bounded UPDATE through the partial DESC index (moves 31 -> 32 and 32 -> 33)
+# cost: 25
+statement ok
+UPDATE k SET score = score + 1 WHERE score > 30 AND score < 33
+
+# cost: 37
+query II rowsort
+SELECT id, score FROM k WHERE score >= 31 AND score <= 33
+----
+31
+32
+32
+33
+33
+33
+71
+32
+72
+33
+73
+33
+
+# an index-bounded DELETE through the DESC text element
+# cost: 11
+statement ok
+DELETE FROM k WHERE g = 1 AND name > 'n8' AND name < 'n85'
+
+# --- REINDEX rebuilds the ordered indexes with their options --------------------------------------
+
+statement ok
+REINDEX INDEX k_name
+
+statement ok
+REINDEX TABLE k
+
+# the same walks and bounds after the rebuild: same rows, same costs
+# cost: 16
+query IT nosort
+SELECT id, name FROM k ORDER BY name DESC NULLS LAST LIMIT 5
+----
+90
+n90
+9
+n9
+89
+n89
+87
+n87
+86
+n86
+
+# cost: 17
+query II rowsort
+SELECT id, score FROM k WHERE score > 10 ORDER BY score DESC LIMIT 4
+----
+38
+38
+39
+39
+78
+38
+79
+39
+
+# cost: 56
+query IT rowsort
+SELECT id, name FROM k WHERE g = 1 AND name > 'n4' AND name < 'n55'
+----
+40
+n40
+43
+n43
+46
+n46
+49
+n49
+52
+n52
+
+# cost: 114
+query IT rowsort
+SELECT id, name FROM k WHERE g IN (0, 2) AND name IN ('n3', 'n12', 'n27', 'n33', 'n80', 'n81')
+----
+12
+n12
+27
+n27
+3
+n3
+80
+n80
+81
+n81

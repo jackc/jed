@@ -1,0 +1,148 @@
+# A COLLATED text element declared DESC (spec/design/indexes.md §5.1/§11, encoding.md §2.12/§2.16):
+# its slot is FF (DESC NULLS FIRST) or FE (DESC NULLS LAST) + the bitwise-inverted UCA sort key, whose
+# three 0x0000 level separators and terminated identical level read as FFFF / FFFE under inversion,
+# so the unified key-slot skipper still steps over it to recover an entry's storage key. A range on
+# the DESC element swaps its sort-key endpoints; a set on it emits its probes in physical order. The
+# queries and rows are collated_index_vartail.test's over DESC indexes, and each cost equals the
+# one the equivalent ASC index gives.
+# Format: ../../../design/conformance.md.
+# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.collate_column, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.set_returning, query.index_range, query.index_variable_width_tail, query.or_in_point_lookup, query.interval_set, query.composite_key_set, query.order_by, query.order_by_index_scan, query.limit, expr.in_list, query.logical_connectives, types.i32, types.text, null.three_valued, resource.cost_metering
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE cv (id i32 PRIMARY KEY, g i32, name text COLLATE "unicode")
+
+statement ok
+INSERT INTO cv SELECT n, n % 3, 'x' || n FROM generate_series(1, 24) AS n
+
+statement ok
+INSERT INTO cv VALUES (25, 1, 'a'), (26, 1, 'A'), (27, 1, 'b'), (28, 1, 'B'), (29, 1, NULL), (30, 1, 'z')
+
+statement ok
+CREATE INDEX cv_g_name ON cv (g, name DESC)
+
+# the trailing collated slot is skipped to reach the storage key
+# cost: 33
+query IT rowsort
+SELECT id, name FROM cv WHERE g = 2
+----
+11
+x11
+14
+x14
+17
+x17
+2
+x2
+20
+x20
+23
+x23
+5
+x5
+8
+x8
+
+# a range on the collated element after the equality prefix: unicode order a < A < b < B < … < z
+# cost: 37
+query IT rowsort
+SELECT id, name FROM cv WHERE g = 1 AND name > 'a' AND name < 'x'
+----
+26
+A
+27
+b
+28
+B
+
+statement ok
+CREATE INDEX cv_name ON cv (name DESC NULLS LAST)
+
+# a bare range on a collated leading element
+# cost: 25
+query IT rowsort
+SELECT id, name FROM cv WHERE name >= 'B' AND name <= 'x1'
+----
+1
+x1
+28
+B
+
+# An index tuple interval set steps over a collated slot too (cost.md §3 "Multi-column secondary
+# indexes"): a set on g with a final range on the collated name probes each g prefix.
+# cost: 43
+query IT rowsort
+SELECT id, name FROM cv WHERE g IN (0, 1) AND name > 'a' AND name < 'x'
+----
+26
+A
+27
+b
+28
+B
+
+# a set on the collated element itself, its points encoded as sort keys
+# cost: 27
+query IT rowsort
+SELECT id, name FROM cv WHERE g IN (1, 2) AND name IN ('B', 'x2', 'x3')
+----
+2
+x2
+28
+B
+
+# a leading collated range union on the single-column index
+# cost: 40
+query IT rowsort
+SELECT id, name FROM cv WHERE name < 'b' OR name > 'x8'
+----
+25
+a
+26
+A
+30
+z
+9
+x9
+
+# a leading DESC collated range with a set on the trailing element: the collated slot is stepped over
+statement ok
+CREATE INDEX cv_name_g ON cv (name DESC, g)
+
+# cost: 231
+query IT rowsort
+SELECT id, name FROM cv WHERE name >= 'B' AND name <= 'x2' AND g IN (1, 2)
+----
+1
+x1
+10
+x10
+11
+x11
+13
+x13
+14
+x14
+16
+x16
+17
+x17
+19
+x19
+2
+x2
+28
+B
+
+# ORDER BY name DESC NULLS LAST walks cv_name forward: z, then the x-strings descending
+# cost: 10
+query IT nosort
+SELECT id, name FROM cv ORDER BY name DESC NULLS LAST LIMIT 3
+----
+30
+z
+9
+x9
+8
+x8
