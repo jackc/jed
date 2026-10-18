@@ -4030,6 +4030,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_char",
@@ -4047,6 +4049,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_char",
@@ -4064,6 +4068,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_char",
@@ -4081,6 +4087,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_char",
@@ -4098,6 +4106,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_char",
@@ -4115,6 +4125,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_timestamp",
@@ -4132,6 +4144,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_date",
@@ -4149,6 +4163,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_number",
@@ -4166,6 +4182,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "to_timestamp",
@@ -4183,6 +4201,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "uuid_extract_version",
@@ -4257,6 +4277,8 @@ var operators = []operatorDesc{
 		Volatility:    "volatile",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "uuidv7",
@@ -4825,6 +4847,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "array_to_string",
@@ -4842,6 +4866,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "string_to_array",
@@ -4859,6 +4885,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "string_to_array",
@@ -4876,6 +4904,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "concat",
@@ -5615,6 +5645,8 @@ var operators = []operatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "overlay",
@@ -6544,6 +6576,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "concat_ws",
@@ -6561,6 +6595,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "format",
@@ -6578,6 +6614,8 @@ var operators = []operatorDesc{
 		Volatility:    "stable",
 		Variadic:      true,
 		Cost:          0,
+		Traps:         true,
+		PreservesEq:   false,
 	},
 	{
 		Name:          "regexp_replace",

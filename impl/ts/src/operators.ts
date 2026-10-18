@@ -3922,6 +3922,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_char",
@@ -3938,6 +3940,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_char",
@@ -3954,6 +3958,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_char",
@@ -3970,6 +3976,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_char",
@@ -3986,6 +3994,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_char",
@@ -4002,6 +4012,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_timestamp",
@@ -4018,6 +4030,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_date",
@@ -4034,6 +4048,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_number",
@@ -4050,6 +4066,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "to_timestamp",
@@ -4066,6 +4084,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "uuid_extract_version",
@@ -4136,6 +4156,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "volatile",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "uuidv7",
@@ -4674,6 +4696,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "array_to_string",
@@ -4690,6 +4714,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "string_to_array",
@@ -4706,6 +4732,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "string_to_array",
@@ -4722,6 +4750,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "concat",
@@ -5440,6 +5470,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "overlay",
@@ -6320,6 +6352,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "concat_ws",
@@ -6336,6 +6370,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "format",
@@ -6352,6 +6388,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "stable",
     variadic: true,
     cost: 0,
+    traps: true,
+    preservesEquality: false,
   },
   {
     name: "regexp_replace",
