@@ -26,7 +26,7 @@ module JedNative
     def initialize(source)
       @tokens, @index, @depth, @filter_depth, @subscript_depth = JsonPathLexer.new(source).tokens, 0, 0, 0, 0
     end
-    def parse
+    def parse(canonical: false)
       raise Error.new('22P02', 'invalid input syntax for type jsonpath') if at?(:eof)
       strict = false
       if keyword?('strict') || keyword?('lax')
@@ -36,10 +36,20 @@ module JedNative
       root = expression
       error unless at?(:eof)
       source = (strict ? 'strict ' : '') + render(root, top: true)
-      raise Error.new('54001', 'JSON path nesting limit exceeded') if tree_depth(root) > 256
+      JsonPathParser.new(source).parse(canonical: true) unless canonical
       JsonPathValue.new(root, strict, source)
     end
     private
+    def deepen
+      @depth += 1
+      raise Error.new('54001', 'JSON path nesting limit exceeded') if @depth > 256
+    end
+    def nested
+      deepen
+      value = yield
+      @depth -= 1
+      value
+    end
     def error = raise(Error.new('42601', 'invalid JSON path syntax'))
     def token = @tokens[@index]
     def at?(kind) = token[0] == kind
@@ -63,8 +73,7 @@ module JedNative
     end
     def predicate?(node) = PREDICATES.include?(node[:kind])
     def expression(minimum = 0)
-      @depth += 1
-      raise Error.new('54001', 'JSON path nesting limit exceeded') if @depth > 256
+      previous_depth = @depth
       left = prefix
       loop do
         if minimum <= 3 && keyword?('is')
@@ -104,6 +113,7 @@ module JedNative
         priority = PRIORITY[token[0]]
         break unless priority && priority >= minimum
         op = advance[0]
+        deepen if priority != 3
         right = expression(priority + 1)
         kind = priority <= 2 ? :connective : priority == 3 ? :comparison : :arithmetic
         if kind == :connective
@@ -115,12 +125,12 @@ module JedNative
       end
       left
     ensure
-      @depth -= 1
+      @depth = previous_depth
     end
     def prefix
       if at?('+') || at?('-')
         op = advance[0]
-        value = expression(6)
+        value = nested { expression(6) }
         error if predicate?(value)
         return { kind: :literal, value: op == '-' ? -value[:value] : value[:value] } if value[:kind] == :literal && value[:value].is_a?(Numeric)
         return { kind: :unary, op: op, expr: value }
@@ -132,13 +142,13 @@ module JedNative
         return { kind: :not, expr: value }
       end
       value = if accept('(')
-        inside = expression
+        inside = nested { expression }
         expect(')')
         inside.merge(parenthesized: true)
       elsif keyword?('exists')
         advance
         expect('(')
-        inside = expression
+        inside = nested { expression }
         error if predicate?(inside)
         expect(')')
         { kind: :exists, expr: inside }
@@ -197,6 +207,7 @@ module JedNative
           end
         elsif accept('[')
           @subscript_depth += 1
+          deepen
           if accept('*')
             step = { kind: :elements }
           else
@@ -217,12 +228,15 @@ module JedNative
           end
           expect(']')
           @subscript_depth -= 1
+          @depth -= 1
           steps << step
         elsif accept('?')
           expect('(')
+          deepen
           @filter_depth += 1
           condition = expression
           @filter_depth -= 1
+          @depth -= 1
           error unless predicate?(condition)
           expect(')')
           steps << { kind: :filter, expr: condition }
@@ -262,11 +276,6 @@ module JedNative
       error unless numeric_token[2].match?(/\A(?:0|[1-9][0-9]*)\z/)
       raise Error.new('22003', 'JSON path level is out of range') if number.coefficient > 2_147_483_647
       number.coefficient
-    end
-    def tree_depth(node)
-      return 0 unless node.is_a?(Hash) || node.is_a?(Array)
-      children = node.is_a?(Hash) ? node.values : node
-      1 + (children.map { |child| tree_depth(child) }.max || 0)
     end
     def render(node, parent: 0, top: false)
       kind = node[:kind]

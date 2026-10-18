@@ -7,14 +7,26 @@ module JedNative
     include Comparable
     attr_reader :value, :binary, :source
     def initialize(value, binary: true, source: nil)
+      self.class.validate_depth(value)
       @value, @binary, @source = value, binary, source
       freeze
     end
     def sql_type = @binary ? 'jsonb' : 'json'
+    def self.validate_depth(value)
+      pending = [[value, 0]]
+      until pending.empty?
+        node, depth = pending.pop
+        next unless node.is_a?(Hash) || node.is_a?(Array)
+        depth += 1
+        raise Error.new('54001', 'JSON nesting limit exceeded') if depth > 256
+        children = node.is_a?(Hash) ? node.values : node
+        children.each { |child| pending << [child, depth] }
+      end
+    end
     def self.parse(text, binary: false)
-      return new(text.value, binary: binary, source: binary ? nil : text.to_s) if text.is_a?(self)
+      text = text.to_s if text.is_a?(self)
       raise Error.new('22P02', 'invalid input syntax for JSON') unless text.is_a?(String)
-      parser = JsonParser.new(text)
+      parser = JsonParser.new(text, unicode: binary)
       new(parser.parse, binary: binary, source: binary ? nil : text)
     end
     def self.from_ruby(value, binary: true)
@@ -52,7 +64,7 @@ module JedNative
       when String then escape(value)
       when Integer, Decimal then value.to_s
       when Array
-        return '[]' if value.empty?
+        return pretty ? "[\n#{' ' * (4 * level)}]" : '[]' if value.empty?
         children = value.map { |v| render(v, spaces: spaces, pretty: pretty, level: level + 1) }
         return "[\n#{' ' * (4 * (level + 1))}#{children.join(",\n" + ' ' * (4 * (level + 1)))}\n#{' ' * (4 * level)}]" if pretty
         '[' + children.join(spaces ? ', ' : ',') + ']'
@@ -66,6 +78,12 @@ module JedNative
       end
     end
     def to_s = @source || self.class.render(@value, spaces: @binary)
+    def tree
+      parser = JsonParser.new(to_s, unicode: false, spans: true)
+      parser.parse
+      parser.last_tree
+    end
+    def decoded_value = @binary ? @value : JsonParser.new(to_s).parse
     def self.payload(value)
       case value
       when String then value.bytesize
@@ -135,12 +153,12 @@ module JedNative
       else Types.compare(a, b)
       end
     end
-    def self.contains_node?(a, b)
+    def self.contains_node?(a, b, top: true)
       if a.is_a?(Hash) && b.is_a?(Hash)
-        b.all? { |k, v| a.key?(k) && contains_node?(a[k], v) }
+        b.all? { |k, v| a.key?(k) && node_rank(a[k]) == node_rank(v) && contains_node?(a[k], v, top: false) }
       elsif a.is_a?(Array)
-        if b.is_a?(Array) then b.all? { |v| a.any? { |u| contains_node?(u, v) } }
-        else a.any? { |u| !u.is_a?(Array) && !u.is_a?(Hash) && compare_nodes(u, b).zero? }
+        if b.is_a?(Array) then b.all? { |v| a.any? { |u| node_rank(u) == node_rank(v) && contains_node?(u, v, top: false) } }
+        else top && a.any? { |u| !u.is_a?(Array) && !u.is_a?(Hash) && compare_nodes(u, b).zero? }
         end
       else compare_nodes(a, b).zero?
       end
@@ -152,11 +170,12 @@ module JedNative
       self.class.new(result)
     end
     def operator(op, key)
+      return verbatim_operator(op, key) if !@binary && %w[-> ->> #> #>>].include?(op)
       case op
       when '?', '?|', '?&'
-        exists = ->(k) { @value.is_a?(Hash) ? @value.key?(k) : @value.is_a?(Array) && @value.include?(k) }
+        exists = ->(k) { @value.is_a?(Hash) ? @value.key?(k) : @value.is_a?(Array) ? @value.include?(k) : @value.is_a?(String) && @value == k }
         return exists.call(key) if op == '?'
-        return op == '?|' ? key.any?(&exists) : key.all?(&exists)
+        return op == '?|' ? key.compact.any?(&exists) : key.compact.all?(&exists)
       when '->', '->>'
         node = @value
         if node.is_a?(Hash) && key.is_a?(String)
@@ -174,8 +193,7 @@ module JedNative
           if node.is_a?(Hash)
             return nil unless node.key?(part)
             node = node[part]
-          elsif node.is_a?(Array) && /\A-?\d+\z/.match?(part)
-            index = part.to_i
+          elsif node.is_a?(Array) && (index = self.class.path_index(part))
             return nil unless index >= -node.length && index < node.length
             node = node[index]
           else return nil
@@ -188,11 +206,18 @@ module JedNative
     end
     def eql?(other) = other.is_a?(JsonValue) && self == other
     def hash = self.class.render(@value).hash
+    def self.path_index(text)
+      return nil unless text.is_a?(String) && /\A[ \t\r\n\v\f]*[+-]?\d+\z/.match?(text)
+      number = text.to_i
+      number.between?(-2_147_483_648, 2_147_483_647) ? number : nil
+    end
   end
 
   class JsonParser
-    def initialize(text)
+    attr_reader :last_tree
+    def initialize(text, unicode: true, spans: false)
       @text, @index, @depth = text, 0, 0
+      @unicode, @spans = unicode, spans
     end
     def parse
       value = node
@@ -206,9 +231,12 @@ module JedNative
     end
     def node
       whitespace
+      start = @index
       @depth += 1
-      raise Error.new('54001', 'JSON nesting limit exceeded') if @depth > 128
+      raise Error.new('54001', 'JSON nesting limit exceeded') if @depth > 257
       char = @text[@index]
+      raise Error.new('54001', 'JSON nesting limit exceeded') if @depth > 256 && (char == '[' || char == '{')
+      children = []
       value = case char
               when '"' then string
               when '['
@@ -218,6 +246,7 @@ module JedNative
                 unless @text[@index] == ']'
                   loop do
                     list << node
+                    children << @last_tree if @spans
                     whitespace
                     break unless @text[@index] == ','
                     @index += 1
@@ -234,11 +263,14 @@ module JedNative
                   loop do
                     whitespace
                     error unless @text[@index] == '"'
+                    key_start = @index
                     key = string
+                    key_finish = @index
                     whitespace
                     error unless @text[@index] == ':'
                     @index += 1
                     object[key] = node
+                    children << [key, @last_tree, key_start, key_finish] if @spans
                     whitespace
                     break unless @text[@index] == ','
                     @index += 1
@@ -257,6 +289,7 @@ module JedNative
                 Decimal.parse(m[0])
               end
       @depth -= 1
+      @last_tree = { start: start, finish: @index, value: value, children: children, kind: char == '{' ? :object : char == '[' ? :array : :scalar } if @spans
       value
     end
     def literal(word, value)
@@ -287,6 +320,10 @@ module JedNative
             error unless hex && /\A[0-9a-fA-F]{4}\z/.match?(hex)
             code = hex.to_i(16)
             @index += 4
+            unless @unicode
+              output << (code.between?(0xd800, 0xdfff) ? "\\u#{hex}" : code.chr(Encoding::UTF_8))
+              next
+            end
             if (0xd800..0xdbff).cover?(code)
               error unless @text[@index, 2] == '\\u'
               low = @text[@index + 2, 4]

@@ -100,6 +100,10 @@ description = "Explicit opt-in: audit the experimental pure Ruby core against th
 usage = 'arg "[filter]" help="Corpus path substring"'
 run = 'ruby impl/ruby-native/bin/conformance.rb ${usage_filter:+"$usage_filter"}'
 
+[tasks."ruby-native:codegen"]
+description = "Explicitly regenerate the frozen Ruby experiment's mechanical catalog and schedule"
+run = ["ruby impl/ruby-native/tools/generate_catalog.rb", "ruby impl/ruby-native/tools/generate_schedule.rb"]
+
 [tasks."ruby-native:test"]
 description = "Explicit opt-in: pure Ruby experimental host/storage tests"
 run = "ruby -Iimpl/ruby-native/lib -e 'Dir[\"impl/ruby-native/test/*_test.rb\"].sort.each { |f| require_relative f }'"

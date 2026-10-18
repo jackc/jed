@@ -20,7 +20,7 @@ module JedNative
         spec[:path] = Expression.new(kind: :literal, type: 'jsonpath', value: JsonPathValue.parse(spec[:path].value))
       end
       spec[:passing] = compile_json_passing(node[:passing], columns)
-      Expression.new(kind: :json_sql, type: spec[:type], extra: spec)
+      Expression.new(kind: :json_sql, type: spec[:type], args: [spec[:context], spec[:path]] + spec[:passing].map { |binding| binding[:expression] }, extra: spec)
     end
 
     def compile_json_spec(node, columns, table_column: false)
@@ -129,7 +129,7 @@ module JedNative
           raise Error.new('0A000', 'nonfinite JSON path numbers are not supported') unless value.finite?
           Decimal.parse(Kernel.format(type == 'f32' ? '%.6g' : '%.15g', value))
         else
-          JsonValue.from_ruby(value).value
+          json_image_value(value, type, binding[:expression]).value
         end
         result[binding[:name]] = item unless result.key?(binding[:name])
       end
@@ -146,10 +146,10 @@ module JedNative
       document = json_document(document)
       path = JsonPathValue.parse(path)
       vars = evaluate_json_passing(spec[:passing], row, group)
-      json_path_result(spec, document, path, vars, row, group)
+      json_path_result(spec, document, path, vars, row, group, constant: respond_to?(:constant_expression?) && constant_expression?(expression))
     end
 
-    def json_path_result(spec, document, path, vars, row, group = nil, source_text: nil)
+    def json_path_result(spec, document, path, vars, row, group = nil, source_text: nil, constant: false)
       empty = false
       begin
         evaluator = JsonPathEvaluator.new(path, document, vars: vars, context: self, passing: true,
@@ -161,7 +161,7 @@ module JedNative
           return spec[:type] == 'boolean' ? value : cast_value(value, spec[:type])
         end
         if spec[:kind] == :json_query && (spec[:wrapper] == :unconditional || spec[:wrapper] == :conditional && items.length != 1)
-          charge(JsonValue.payload(items))
+          charge(JsonValue.payload(items)) unless constant
           return json_result_value(items, spec[:type])
         end
         empty = items.empty?
@@ -200,7 +200,7 @@ module JedNative
       end
       result
     rescue Error => error
-      raise if error.sqlstate == '2203F'
+      raise if error.sqlstate == '2203F' || %w[date timestamp timestamptz interval].include?(type)
       raise Error.new('2203A', error.message)
     end
 
@@ -219,7 +219,8 @@ module JedNative
         return value if value.nil? || expr.type == spec[:type]
         if expr.type == 'jsonb' || expr.type == 'boolean' && spec[:type] != 'i32'
           begin
-            json_scalar_value(value.is_a?(JsonValue) ? value.value : value, spec[:type], spec[:type_mod])
+            item = value.is_a?(JsonValue) ? value.value : value
+            %w[json jsonb].include?(spec[:type]) ? json_result_value(item, spec[:type]) : json_scalar_value(item, spec[:type], spec[:type_mod])
           rescue Error => failure
             raise Error.new('42804', failure.message)
           end
@@ -280,8 +281,9 @@ module JedNative
           rows << base
         else
           nested.each do |node, position, child_width|
-            children = JsonPathEvaluator.new(node[:program], item, vars: vars, context: self,
-              passing: true, variable_bases: vars.length, source_text: node[:path]).run[:items]
+            evaluation = JsonPathEvaluator.new(node[:program], item, vars: vars, context: self,
+              passing: true, variable_bases: vars.length, source_text: node[:path]).run(silent: true)
+            children = evaluation[:error] ? [] : evaluation[:items]
             child_rows = json_table_expand(node[:columns], children, vars)
             child_rows = [Array.new(child_width)] if child_rows.empty?
             child_rows.each do |child|
@@ -312,8 +314,9 @@ module JedNative
       unless document.nil? || path_text.nil?
         document = json_document(document)
         program = JsonPathValue.parse(path_text)
-        items = JsonPathEvaluator.new(program, document, vars: vars, context: self, passing: true,
-          variable_bases: vars.length, source_text: path_text.to_s).run[:items]
+        evaluation = JsonPathEvaluator.new(program, document, vars: vars, context: self, passing: true,
+          variable_bases: vars.length, source_text: path_text.to_s).run(silent: true)
+        items = evaluation[:error] ? [] : evaluation[:items]
         rows = json_table_expand(tree, items, vars)
       end
       charge(rows.length)

@@ -113,6 +113,7 @@ module JedNative
 
     def nested
       @depth += 1
+      @depth_peak = [@depth_peak || 0, @depth].max
       raise Error.new('54001', 'statement too complex: nesting depth exceeds 256') if @depth > MAX_EXPR_DEPTH
       yield
     ensure
@@ -256,6 +257,7 @@ module JedNative
         expect(')')
       end
       object = identifier
+      unsupported('REINDEX SCHEMA is not supported') if object == 'schema'
       syntax('expected INDEX, TABLE, DATABASE or SYSTEM') unless %w[index table database system].include?(object)
       options[:concurrently] = true if at?('concurrently') && (identifier_token?(1) || %w[database system].include?(object)) && accept('concurrently')
       name, database = identifier_token? ? qualified_name : [nil, nil]
@@ -297,8 +299,10 @@ module JedNative
           yes = literal(true, 'boolean')
           no = literal(false, 'boolean')
           if accept('to')
+            syntax('CYCLE marks must be unsigned constants') if at?('-') || at?('+')
             yes = expression(31)
             expect('default')
+            syntax('CYCLE marks must be unsigned constants') if at?('-') || at?('+')
             no = expression(31)
           end
           expect('using')
@@ -312,6 +316,8 @@ module JedNative
     end
 
     def query
+      previous_peak, query_base = @depth_peak, @depth
+      @depth_peak = @depth
       result = set_expression(0)
       if accept('order')
         expect('by')
@@ -330,7 +336,9 @@ module JedNative
           break
         end
       end
-      result
+      result.merge(native_query_base: query_base, native_depth: @depth_peak - query_base)
+    ensure
+      @depth_peak = [previous_peak || 0, @depth_peak || 0].max
     end
 
     def set_expression(minimum)
@@ -419,7 +427,7 @@ module JedNative
       joins = []
       loop do
         relations << table_reference
-        joins.concat(join_clauses)
+        joins.concat(join_clauses.map { |join| join.merge(from_index: relations.length - 1) })
         break unless accept(',')
       end
       [relations, joins]
@@ -448,6 +456,7 @@ module JedNative
                    end
       end
       relation[:lateral] = lateral
+      relation[:native_ref_depth] = @depth + 1 if relation[:kind] == :table
       if relation[:kind] == :function && accept('with')
         syntax('WITH ORDINALITY is not supported')
       end
@@ -631,6 +640,7 @@ module JedNative
     end
 
     def complexity!(extra)
+      @depth_peak = [@depth_peak || 0, @depth + extra].max
       raise Error.new('54001', 'statement too complex: nesting depth exceeds 256') if @depth + extra > MAX_EXPR_DEPTH
     end
 
@@ -760,6 +770,7 @@ module JedNative
           end
           value = { kind: :subscript, expr: value, specs: specs }
         elsif accept('.')
+          syntax('a row field base needs an enclosing pair of parentheses') if value[:kind] == :row && value[:bare_row]
           value = accept('*') ? { kind: :field_star, expr: value } : { kind: :field, expr: value, name: identifier }
         else
           break
@@ -784,7 +795,11 @@ module JedNative
           value = { kind: :subquery, query: nested { at?('with') ? with_statement : query } }
         else
           value = expression
-          value = { kind: :row, args: [value] + separated { expression } } if accept(',')
+          if accept(',')
+            value = { kind: :row, args: [value] + separated { expression }, bare_row: true }
+          elsif value[:kind] == :row
+            value = value.merge(bare_row: false)
+          end
         end
         expect(')')
         return value
@@ -1169,7 +1184,7 @@ module JedNative
                  columns = name_list
                  references.merge(kind: :foreign_key, columns: columns)
                elsif accept('exclude')
-                 method = accept('using') ? identifier : 'gist'
+                 method = accept('using') ? identifier : 'btree'
                  expect('(')
                  elements = separated do
                    expr = expression
@@ -1283,10 +1298,11 @@ module JedNative
       expect('(')
       elements = separated do
         expr = expression
+        direction_explicit = at?('desc') || at?('asc')
         direction = accept('desc') ? :desc : (accept('asc'); :asc)
         nulls = nil
         nulls = accept('first') ? :first : (expect('last'); :last) if accept('nulls')
-        { expr: expr, direction: direction, nulls: nulls }
+        { expr: expr, direction: direction, direction_explicit: direction_explicit, nulls: nulls }
       end
       expect(')')
       include_columns = accept('include') ? name_list : []

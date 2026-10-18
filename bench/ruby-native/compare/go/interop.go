@@ -40,6 +40,18 @@ func interop(path, phase string) {
 		panic("persisted view differs")
 	}
 	view.Close()
+	spans, err := session.Query(ctx, "SELECT count(*) FROM spans WHERE span && '[2.0,6.0]'::numrange")
+	must(err)
+	if !spans.Next() || spans.Row()[0].Int != 3 {
+		panic("decimal/unbounded GiST tree differs")
+	}
+	spans.Close()
+	stats, err := session.Query(ctx, "SELECT count(*) FROM jed_statistics WHERE table_name = 't'")
+	must(err)
+	if !stats.Next() || stats.Row()[0].Int != 3 {
+		panic("persisted ANALYZE facts differ")
+	}
+	stats.Close()
 	if phase == "update" {
 		_, err = session.Exec(ctx, "UPDATE t SET v = 'from-go' WHERE id = 2")
 		must(err)

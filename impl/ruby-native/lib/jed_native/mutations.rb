@@ -43,13 +43,13 @@ module JedNative
           node = supplied[ordinal]
           if stmt[:default_values] || !supplied.key?(ordinal) || column[:identity] && stmt[:overriding] == 'user' || !source && node[:kind] == :default
             expr = defaults[ordinal]
-            value = expr && evaluate(expr, [])
+            value = expr && assignment_value(expr)
           elsif source
             value = node
             expr = Expression.new(kind: :source, type: source.columns[indices.index(ordinal)][:type])
           else
             expr = compile(node, [])
-            value = evaluate(expr, [])
+            value = assignment_value(expr)
           end
           assign(value, column.merge(nullable: true), expr)
         end
@@ -99,7 +99,10 @@ module JedNative
       checks = mutation_checks(t)
       changes = []
       candidates = primary_scan(t, predicate)
-      charge unless candidates || t[:rows].empty?
+      unless candidates
+        charge(full_scan_pages(t))
+        charge_scan_payload(t)
+      end
       selected = candidates&.to_h { |row| [row.object_id, true] }
       rows = t[:rows].map do |row|
         next row if selected && !selected[row.object_id]
@@ -129,7 +132,10 @@ module JedNative
       return_scope, return_exprs, return_columns = mutation_returning(stmt, t, :delete)
       changes, rows, rowids = [], [], []
       candidates = primary_scan(t, predicate)
-      charge unless candidates || t[:rows].empty?
+      unless candidates
+        charge(full_scan_pages(t))
+        charge_scan_payload(t)
+      end
       selected = candidates&.to_h { |row| [row.object_id, true] }
       t[:rows].each_with_index do |row, index|
         if selected && !selected[row.object_id]
