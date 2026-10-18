@@ -103,6 +103,14 @@ NULL
 5
 abc
 
+# --- a match after a newline: the search steps over every code point, a newline too -----------
+query TTT nosort
+SELECT substring('ab' || chr(10) || 'cd' FROM 'c.'), substring('x' || chr(10) || 'y42' FROM 'y([0-9]+)'), substring('a' || chr(10) || 'b' FROM 'b$')
+----
+cd
+42
+b
+
 # --- errors ----------------------------------------------------------------------------------------
 # an invalid pattern
 statement error 2201B
