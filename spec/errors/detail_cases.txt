@@ -16,6 +16,8 @@
 #   code: <sqlstate>           its SQLSTATE
 #   detail: <text>             its exact Detail; the text runs to end of line (leading `detail: ` removed)
 #   no-detail                  instead of `detail:`: the Detail field must be absent
+#   message: <text>            optional: the exact primary message, byte for byte (for the few messages
+#                              whose bytes are themselves a cross-core rule, not informational text)
 #
 # Expected text matches PostgreSQL 18's DETAIL wherever a PostgreSQL equivalent exists. A case marked
 # `# jed:` differs from PostgreSQL by design (error-fields.md §9.7).
@@ -410,4 +412,21 @@ detail: Returned type text at ordinal position 2, but query expects i32.
 case: duplicate column-definition name has no detail
 run: SELECT * FROM unnest(ARRAY[ROW(1, 'a'::text)]) AS u(a i32, a text)
 code: 42701
+no-detail
+
+# --- 22007 formatting: a quoted input slice that splits a UTF-8 character -------------------------
+# formatting.md §2: the message quotes a byte slice of the input; each maximal ill-formed
+# subsequence becomes one U+FFFD. PostgreSQL emits the raw bytes (not valid UTF-8) and also attaches
+# a Detail and a Hint here, which jed does not carry yet; these cases pin only the message bytes.
+
+case: to_timestamp slice splits a 3-byte character
+run: SELECT to_timestamp('20€401', 'YYYYMM')
+code: 22007
+message: invalid value "20�" for "YYYY"
+no-detail
+
+case: to_timestamp slice splits a 4-byte character
+run: SELECT to_timestamp('2😀01', 'YYYYMM')
+code: 22007
+message: invalid value "2�" for "YYYY"
 no-detail

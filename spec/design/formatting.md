@@ -72,6 +72,15 @@ encodes its UTF-16 strings first — so a multibyte character is one literal nod
 search never splits a pattern, and the three cores agree byte for byte. PostgreSQL caches parsed
 templates; jed parses per call (the template may be a column).
 
+Because the processing is byte-wise, an error message that quotes a slice of the input (`invalid
+value "…" for "YYYY"`, which takes exactly the field's width in bytes) can end, or start, inside a
+multibyte character. PostgreSQL puts the raw bytes in the message, which is then not valid UTF-8.
+jed's messages are strings, so every core instead replaces each **maximal ill-formed subsequence**
+with one U+FFFD — Unicode's "substitution of maximal subparts" (§3.9), the rule of Rust's
+`String::from_utf8_lossy` and the WHATWG `TextDecoder`, hand-written in Go (`lossyUTF8`) because its
+`utf8` decoder replaces byte by byte. So `to_timestamp('20€401', 'YYYYMM')` reports `invalid value
+"20�" for "YYYY"` in every core, byte for byte; `spec/errors/detail_cases.txt` pins it.
+
 ## 3. `to_char` over datetimes and intervals
 
 The value is broken into PostgreSQL's `fmt_tm` (year, month, day, hour, minute, second, microsecond,

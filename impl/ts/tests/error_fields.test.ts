@@ -144,6 +144,7 @@ type DetailCase = {
   run: string;
   code: string;
   detail: string | undefined;
+  message: string | undefined;
 };
 
 function parseDetailCases(text: string): DetailCase[] {
@@ -165,6 +166,7 @@ function parseDetailCases(text: string): DetailCase[] {
         run: "",
         code: "",
         detail: undefined,
+        message: undefined,
       });
       continue;
     }
@@ -180,6 +182,7 @@ function parseDetailCases(text: string): DetailCase[] {
     else if (key === "run") c.run = v;
     else if (key === "code") c.code = v;
     else if (key === "detail") c.detail = v;
+    else if (key === "message") c.message = v;
     else if (line !== "no-detail") throw new Error(`unknown detail_cases directive: ${line}`);
   }
   return cases;
@@ -214,6 +217,12 @@ test("error fields: detail shared cases", () => {
       failures.push(`${c.name}: expected ${c.code} but succeeded`);
     } catch (e) {
       if (!(e instanceof EngineError)) throw e;
+      // TS prefixes the SQLSTATE to Error.message (errors.ts); the other cores keep it apart.
+      if (c.message !== undefined && e.message !== `${c.code}: ${c.message}`) {
+        failures.push(
+          `${c.name}: message ${JSON.stringify(e.message)}, want ${JSON.stringify(c.message)}`,
+        );
+      }
       if (e.code() !== c.code || e.detail !== c.detail) {
         failures.push(
           `${c.name}: got ${e.code()} ${JSON.stringify(e.detail)} (${e.message}), ` +
