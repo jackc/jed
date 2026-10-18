@@ -28,6 +28,7 @@ class Actor
               when "rust" then [File.join(ROOT, "impl/rust/target/release/process_actor")]
               when "go" then [File.join(ROOT, "impl/go/process_actor")]
               when "node" then ["node", File.join(ROOT, "impl/ts/src/bin/process_actor.ts")]
+              when "ruby-native" then ["ruby", File.join(ROOT, "impl/ruby-native/bin/process_actor.rb")]
               else raise "unknown actor core #{core}"
               end
     # `action` may carry extra actor arguments after the action word ("create 5000 300": the

@@ -128,7 +128,7 @@ module JedNative
       if terms[:mode] == :any
         result = terms[:terms].empty? ? [] : gather_gin_terms(stored, name, terms[:terms], :any)
         children.each { |child| result.concat(gather_gin_terms(stored, name, child, :tree)) }
-        result.uniq
+        result.uniq { |row| auxiliary_row_identity(row) }
       else
         result = if terms[:terms].empty?
                    gather_gin_terms(stored, name, children.shift, :tree)
@@ -137,8 +137,8 @@ module JedNative
                  end
         children.each do |child|
           break if result.empty?
-          candidates = gather_gin_terms(stored, name, child, :tree).to_h { |ordinal| [ordinal, true] }
-          result.select! { |ordinal| candidates[ordinal] }
+          candidates = gather_gin_terms(stored, name, child, :tree).to_h { |row| [auxiliary_row_identity(row), true] }
+          result.select! { |row| candidates[auxiliary_row_identity(row)] }
         end
         result
       end

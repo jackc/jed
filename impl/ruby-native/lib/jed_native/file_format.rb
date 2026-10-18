@@ -566,8 +566,7 @@ module JedNative
       cb, pos = take(buf, pos, 1)
       code = cb.getbyte(0)
       if code == 14
-        nl, pos = take(buf, pos, 2)
-        name, pos = take(buf, pos, nl.unpack1("n"))
+        name, pos = take_str(buf, pos)
         [name, pos]
       else
         [CODETYPE.fetch(code), pos]
@@ -1737,7 +1736,10 @@ module JedNative
         size += ptr - cur[i]
         cur[i] = ptr
       end
-      raise "record exceeds page capacity" if size > max
+      # RECORD_MAX controls disposition, not admission. A wide fixed-width row
+      # cannot shrink to that target, but can still occupy a legal single-row
+      # leaf. Include the real column directories and bitmaps in this check.
+      raise Error.new('0A000', 'record exceeds page capacity after spilling') if size + leaf_overhead(1, cols) > cap
 
       [forms, comps, size]
     end
@@ -1906,6 +1908,7 @@ module JedNative
     end
     
     def write_page(image, ps, index, type, item_count, next_page, payload, flags: 0)
+      raise Error.new('0A000', 'page payload exceeds page capacity') if payload.bytesize > ps - PAGE_HEADER
       off = index * ps
       image[off, 1] = [type].pack("C")
       image[off + 1, 1] = [flags].pack("C")
@@ -2032,12 +2035,12 @@ module JedNative
     # Build a table's B-tree from its (key, record) pairs in key order. nil for an empty table.
     def build_tree(pairs, cap)
       root = nil
-      k = pairs.empty? ? 0 : pairs[0][1][:table][:columns].size
-      max = record_max(cap, k)
       pairs.each do |key, rec|
-        # rec is a record plan; rec[:size] is the post-spill on-disk size. A record still over
-        # RECORD_MAX after externalizing every spillable value is genuinely unsupported (0A000).
-        raise "record of #{rec[:size]}B exceeds RECORD_MAX #{max} after spilling" if rec[:size] > max
+        # The packing target may be smaller than a legal single-record leaf,
+        # notably for wide rows and secondary keys larger than half a page.
+        if rec[:size] + leaf_overhead(1, rec[:table][:columns]) > cap
+          raise Error.new('0A000', 'record exceeds page capacity after spilling')
+        end
     
         if root.nil?
           root = { keys: [key], recs: [rec], children: [] }
@@ -2210,7 +2213,7 @@ module JedNative
       [s.force_encoding("UTF-8"), pos]
     end
     
-    def read_meta(image, ps, slot)
+    def read_meta(image, ps, slot, manifest: true, validate_body: true)
       off = slot * ps
       return nil if off + ps > image.bytesize
     
@@ -2228,12 +2231,16 @@ module JedNative
       return nil unless (2...meta[:page_count]).cover?(meta[:root_page])
       return nil unless meta[:live] <= meta[:page_count] - 2
       return nil unless meta[:free_head].zero? || (2...meta[:page_count]).cover?(meta[:free_head])
-      return nil unless valid_manifest?(image, ps, m, meta)
+      if manifest
+        return nil unless valid_manifest?(image, ps, m, meta, validate_body: validate_body)
+      else
+        meta[:protected] = []
+      end
     
       meta
     end
     
-    def valid_manifest?(image, ps, m, meta)
+    def valid_manifest?(image, ps, m, meta, validate_body: true)
       head, count, chain_count = m.byteslice(36, 12).unpack("N3")
       digest = m.byteslice(48, 8).unpack1("Q>")
       return false unless m.byteslice(60, 4) == "\x00".b * 4
@@ -2273,11 +2280,14 @@ module JedNative
       return false if count.positive? && meta[:free_head].positive? && !ids.include?(meta[:free_head])
       return false unless refs.all? do |index, expected|
         next false unless index >= 2 && index < meta[:page_count]
+        next true unless validate_body
         block = image.byteslice(index * ps, ps)
         (1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N") &&
           crc64(block) == expected
       end
       meta[:protected] = ids + chain
+      meta[:manifest] = refs
+      meta[:manifest_pages] = chain
       true
     end
     
@@ -2329,20 +2339,17 @@ module JedNative
     # Decode a composite-type catalog entry's body (inverse of composite_type_entry_bytes); the caller
     # has consumed the entry_kind byte. A nested-composite field stores the referenced type's NAME.
     def decode_composite_type_entry(buf, pos)
-      nl, pos = take(buf, pos, 2)
-      name, pos = take(buf, pos, nl.unpack1("n"))
+      name, pos = take_str(buf, pos)
       fc, pos = take(buf, pos, 2)
       fields = []
       fc.unpack1("n").times do
-        fnl, pos = take(buf, pos, 2)
-        fname, pos = take(buf, pos, fnl.unpack1("n"))
+        fname, pos = take_str(buf, pos)
         tcb, pos = take(buf, pos, 1)
         code = tcb.getbyte(0)
         precision = nil
         scale = nil
         if code == 14
-          tnl, pos = take(buf, pos, 2)
-          tname, pos = take(buf, pos, tnl.unpack1("n"))
+          tname, pos = take_str(buf, pos)
           type = tname
         elsif code == 15
           # An array-typed field (spec/design/array.md §12): the element-type descriptor (inverse of
@@ -2381,13 +2388,11 @@ module JedNative
     end
     
     def decode_table_entry(buf, pos)
-      name_len, pos = take(buf, pos, 2)
-      name, pos = take(buf, pos, name_len.unpack1("n"))
+      name, pos = take_str(buf, pos)
       col_count, pos = take(buf, pos, 2)
       columns = []
       col_count.unpack1("n").times do
-        cnl, pos = take(buf, pos, 2)
-        cname, pos = take(buf, pos, cnl.unpack1("n"))
+        cname, pos = take_str(buf, pos)
         tc, pos = take(buf, pos, 1)
         # A composite column (v9, type_code 14): flags, then the type NAME in the typmod slot
         # (spec/design/composite.md §3), then (v44, flags bit3) the expression DEFAULT's text. Only
@@ -2398,8 +2403,7 @@ module JedNative
           raise "reserved flag bit0 set (retired primary_key bit — v5)" if (cf & 0b01) != 0
           raise "invalid composite column flags (v44)" if (cf & ~0b1010 & 0xff) != 0
     
-          tnl, pos = take(buf, pos, 2)
-          tname, pos = take(buf, pos, tnl.unpack1("n"))
+          tname, pos = take_str(buf, pos)
           cdefault_expr = nil
           if (cf & 0b1000) != 0
             del, pos = take(buf, pos, 2)
@@ -2513,10 +2517,8 @@ module JedNative
       checks = []
       cc, pos = take(buf, pos, 2)
       cc.unpack1("n").times do
-        nl, pos = take(buf, pos, 2)
-        cname, pos = take(buf, pos, nl.unpack1("n"))
-        el, pos = take(buf, pos, 2)
-        expr, pos = take(buf, pos, el.unpack1("n"))
+        cname, pos = take_str(buf, pos)
+        expr, pos = take_str(buf, pos)
         # v35: check_flags (bit0 has_host_deps; reserved bits must be 0), then the optional dep list.
         cfb, pos = take(buf, pos, 1)
         raise "a check_flags reserved bit is set (v35)" if (cfb.getbyte(0) & 0xFE) != 0
@@ -2529,8 +2531,7 @@ module JedNative
       indexes = []
       ic, pos = take(buf, pos, 2)
       ic.unpack1("n").times do
-        nl, pos = take(buf, pos, 2)
-        iname, pos = take(buf, pos, nl.unpack1("n"))
+        iname, pos = take_str(buf, pos)
         kc, pos = take(buf, pos, 2)
         cols = []
         kc.unpack1("n").times do
@@ -2538,8 +2539,7 @@ module JedNative
           ord = ob.unpack1("n")
           if ord == 0xFFFF
             # An expression key element (v26): the sentinel + u16 length + canonical text.
-            el, pos = take(buf, pos, 2)
-            et, pos = take(buf, pos, el.unpack1("n"))
+            et, pos = take_str(buf, pos)
             cols << { expr: et }
           else
             cols << ord
@@ -2559,8 +2559,7 @@ module JedNative
         # v27: the partial-index predicate canonical text follows index_root_page when bit1 is set.
         predicate = nil
         if has_predicate
-          pl, pos = take(buf, pos, 2)
-          predicate, pos = take(buf, pos, pl.unpack1("n"))
+          predicate, pos = take_str(buf, pos)
         end
         # v31: the host-function dependency list follows the predicate when bit2 is set (extensibility.md §8.1).
         host_deps = []
@@ -2605,16 +2604,14 @@ module JedNative
       fks = []
       fc, pos = take(buf, pos, 2)
       fc.unpack1("n").times do
-        nl, pos = take(buf, pos, 2)
-        fname, pos = take(buf, pos, nl.unpack1("n"))
+        fname, pos = take_str(buf, pos)
         lc, pos = take(buf, pos, 2)
         local = []
         lc.unpack1("n").times do
           ob, pos = take(buf, pos, 2)
           local << ob.unpack1("n")
         end
-        rtl, pos = take(buf, pos, 2)
-        rtable, pos = take(buf, pos, rtl.unpack1("n"))
+        rtable, pos = take_str(buf, pos)
         rc, pos = take(buf, pos, 2)
         ref = []
         rc.unpack1("n").times do
@@ -2633,10 +2630,8 @@ module JedNative
       exclusions = []
       ec, pos = take(buf, pos, 2)
       ec.unpack1("n").times do
-        nl, pos = take(buf, pos, 2)
-        ename, pos = take(buf, pos, nl.unpack1("n"))
-        il, pos = take(buf, pos, 2)
-        iname, pos = take(buf, pos, il.unpack1("n"))
+        ename, pos = take_str(buf, pos)
+        iname, pos = take_str(buf, pos)
         elc, pos = take(buf, pos, 2)
         elements = []
         elc.unpack1("n").times do
@@ -3235,11 +3230,11 @@ module JedNative
       pos
     end
     
-    def decode_image(image, page_size: nil, lazy: false)
+    def decode_image(image, page_size: nil, lazy: false, meta: nil)
       raise "truncated database header" if image.bytesize < 12
       ps = page_size || image.byteslice(8, 4).unpack1("N")
       raise "invalid page size" unless valid_page_size?(ps)
-      meta = select_meta(image, ps)
+      meta ||= select_meta(image, ps)
       free_pages = validate_free_list!(image, ps, meta)
       pool = LeafPool.new(self, image, ps, image.respond_to?(:cache_pages) ? image.cache_pages : meta[:page_count]) if lazy
       # Every page the decode reads from the catalog root is live (v34): the catalog chain, each tree
@@ -3402,8 +3397,7 @@ module JedNative
     
     
     def decode_sequence_entry(buf, pos)
-      nl, pos = take(buf, pos, 2)
-      name, pos = take(buf, pos, nl.unpack1("n"))
+      name, pos = take_str(buf, pos)
       fields = {}
       %i[increment min_value max_value start cache last_value].each do |f|
         raw, pos = take(buf, pos, 8)
@@ -3416,8 +3410,7 @@ module JedNative
       # The OWNED BY tail (v13): present iff bit2 (has_owner) is set.
       owned_by = nil
       if (flags & 0b100) != 0
-        tl, pos = take(buf, pos, 2)
-        table, pos = take(buf, pos, tl.unpack1("n"))
+        table, pos = take_str(buf, pos)
         col_raw, pos = take(buf, pos, 2)
         owned_by = [table, col_raw.unpack1("n")]
       end

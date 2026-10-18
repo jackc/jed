@@ -46,12 +46,13 @@ class NativeCorpus
     @summary[:corpus_root] = corpus
     @summary[:available_records] = paths.sum { |path| File.read(path).scan(/^(?:statement|query) /).length }
     @summary[:source_sha256] = source_digest
+    file_timeout = Float(ENV.fetch('JED_NATIVE_FILE_TIMEOUT', '10'))
     paths.each do |path|
       begin
-        Timeout.timeout(10) { run_file(path) }
+        Timeout.timeout(file_timeout) { run_file(path) }
       rescue Timeout::Error
         @summary[:timed_out_files] += 1
-        fail_record(path, 0, 'harness timeout: file exceeded 10 seconds')
+        fail_record(path, 0, "harness timeout: file exceeded #{file_timeout} seconds")
       rescue SystemStackError => error
         fail_record(path, 0, "unbounded recursion: #{error.message}")
       end

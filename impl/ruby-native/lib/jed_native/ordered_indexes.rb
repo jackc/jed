@@ -58,10 +58,11 @@ module JedNative
 
     def execute_scan_access(stored, predicate, access)
       return super unless access[:native_order_only]
-      initial = stored[:native_secondary_metadata][access[:name]][:height]
-      charge(initial)
+      # An order-only walk prepays the complete index-tree block; LIMIT bounds
+      # table lookups and projections, as specified by cost.md §3.
+      charge(stored[:native_secondary_metadata][access[:name]][:node_count])
       iterator = Enumerator.new do |output|
-        storage_scan_entries(stored, access[:name], charge_pages: true, prepaid_pages: initial).each do |_, ordinal|
+        storage_scan_entries(stored, access[:name]).each do |_, ordinal|
           charge(stored[:native_primary_metadata][:height])
           charge_scan_payload(stored, [ordinal])
           output << storage_row(stored, ordinal)

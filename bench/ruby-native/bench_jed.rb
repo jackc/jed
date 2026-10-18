@@ -16,6 +16,13 @@ require_relative 'source'
 module NativeRubyBench
   Parameter = Struct.new(*Bench::Param.members, :elem_min, :elem_max)
 
+  def self.environment
+    JedNative::Environment.new
+      .register_function(name: 'bench_mix_row', args: ['i32'], returns: 'i64', volatility: :immutable) { |value| value * 2_654_435_761 % 1_000_003 }
+      .register_function(name: 'bench_mix_batch', args: ['i32'], returns: 'i64', volatility: :immutable,
+        batch_kernel: ->(columns, output) { columns.first.each { |value| output << value * 2_654_435_761 % 1_000_003 } })
+  end
+
   # The native API binds bigint arrays directly. The Rust-binding Ruby harness
   # only has scalar streams, so add this generator locally to this explicit lane.
   module ArrayParameterStream
@@ -163,10 +170,12 @@ module NativeRubyBench
     workload_data = TomlRB.load_file(File.join(corpus_dir, 'benchmarks.toml')).fetch('bench').to_h do |entry|
       [entry.fetch('name'), entry]
     end
+    synchronous = :on
     config = { engine: 'jed', lang: 'ruby-native', variant: 'core', open: lambda do |dir, dataset|
       scratch = dataset == 'scratch' ? Dir.mktmpdir('scratch-ruby-native-', dir) : nil
       path = scratch ? File.join(scratch, 'scratch.jed') : File.join(dir, "#{dataset}.jed")
-      db = scratch ? JedNative.create(path) : JedNative.open(path)
+      options = { environment: environment, synchronous: synchronous }
+      db = scratch ? JedNative.create(path, **options) : JedNative.open(path, **options)
       engine = Engine.new(db, dir, dataset, scratch)
       handles << engine
       engine
@@ -180,16 +189,7 @@ module NativeRubyBench
           Parameter.new(*parameter.to_a, raw['elem_min'], raw['elem_max'])
         end
 
-        unsupported = if workload.relaxed
-                        'batched synchronous=off durability is not implemented'
-                      elsif workload.host_functions
-                        'host-defined function registration is not implemented'
-                      end
-        if unsupported
-          outcomes << { bench: workload.name, status: 'unsupported', reason: unsupported }
-          warn "ruby-native: #{workload.name}: UNSUPPORTED: #{unsupported}"
-          next
-        end
+        synchronous = workload.relaxed ? :off : :on
         begin
           warn "jed/ruby-native/core: #{workload.name} (#{workload.dataset}) ..."
           if workload.dataset != 'scratch' && Bench.read_sidecar(data_dir, workload.dataset, 'jed') != fingerprint

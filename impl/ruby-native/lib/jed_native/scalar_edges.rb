@@ -3,7 +3,9 @@
 module JedNative
   module ScalarEdges
     def compile(node, columns)
-      if node[:kind] == :literal && Types::INTEGER_BITS.key?(node[:type])
+      if node[:kind] == :call && node[:name] != node[:name].downcase && FunctionCatalog::SIGNATURES.key?(node[:name].downcase)
+        raise Error.new('42883', "function #{node[:name]} does not exist")
+      elsif node[:kind] == :literal && Types::INTEGER_BITS.key?(node[:type])
         Types.check_integer(node[:value], node[:type]) unless node[:value].nil?
       elsif node[:kind] == :call && node[:name] == 'nullif'
         arguments = node[:args].map { |arg| compile(arg, columns) }
@@ -64,6 +66,7 @@ module JedNative
       if %w[+ - *].include?(operator) && (Types::RANGES.key?(left) || Types::RANGES.key?(right))
         raise Error.new('42883', 'range operators require identical range types') unless left == right
       elsif operator == '||' && !left.end_with?('[]') && !right.end_with?('[]')
+        return 'bytea' if [left, right].include?('bytea') && [left, right].all? { |type| %w[bytea null unknown].include?(type) }
         return 'text' if [left, right].any? { |type| %w[text null unknown].include?(type) }
         return 'bytea' if left == 'bytea' && right == 'bytea'
         return 'jsonb' if left == 'jsonb' && right == 'jsonb'

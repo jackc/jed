@@ -19,7 +19,8 @@ module JedNative
         on = join_conjunctions(terms)
       end
       original_on = source[:native_original_on] || on
-      nodes = [original_on, source[:native_join_where], source[:native_access_predicate]].compact.flat_map { |node| ast_conjunctions(node) }
+      where = source[:native_join_where] if %i[inner cross].include?(kind)
+      nodes = [original_on, where, source[:native_access_predicate]].compact.flat_map { |node| ast_conjunctions(node) }
       nodes.uniq!
       nodes.select! do |node|
         pushdown_column_nodes(node).all? do |column|
@@ -29,6 +30,7 @@ module JedNative
       return if nodes.empty?
       predicate = join_bound_expression(compile_filter(join_conjunctions(nodes), scope), left.columns.length)
       candidates = scan_access_candidates(stored, predicate).reject { |candidate| candidate[:kind] == :full }
+      candidates.reject! { |candidate| candidate[:name] && stored[:indexes].any? { |index| index[:name] == candidate[:name] && index[:unparsed] } }
       candidates.select! do |candidate|
         bounds = candidate[:parts]&.flat_map { |part| part[:comparisons].map(&:last).compact } || candidate[:arms]&.map(&:last) || []
         bounds += candidate[:terms] || [] if %i[primary_interval secondary_interval].include?(candidate[:kind])

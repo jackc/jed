@@ -211,10 +211,6 @@ module JedNative
         { kind: :analyze, table: name, database: database, columns: at?('(') ? name_list : nil }
       when 'explain' then explain_statement
       when 'reindex' then reindex_statement
-      when 'truncate'
-        advance
-        accept('table')
-        { kind: :truncate, tables: separated { identifier } }
       else
         syntax('expected SQL statement')
       end

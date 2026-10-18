@@ -15,7 +15,13 @@ module JedNative
     end
 
     def select(statement)
-      return statement[:relation] if statement[:kind] == :view_source
+      if statement[:kind] == :view_source
+        source = select(statement[:query])
+        defaults = statement[:defaults].map { |name, node| [name, compile(node, [])] }
+        columns = source.columns + defaults.map { |name, expression| { name: name, type: expression.type } }
+        rows = source.rows.map { |row| row + defaults.map { |_, expression| evaluate(expression, []) } }
+        return Relation.new(columns: columns, rows: rows)
+      end
       super
     end
 
@@ -384,12 +390,8 @@ module JedNative
         elsif statement[:query]
           extra = insert_defaults.keys - names
           unless extra.empty?
-            source = select(statement[:query])
-            defaults = extra.map { |name| compile(insert_defaults[name], []) }
-            columns = source.columns + extra.each_with_index.map { |name, index| { name: name, type: defaults[index].type } }
-            rows = source.rows.map { |row| row + defaults.map { |expression| evaluate(expression, []) } }
             rewritten[:columns] += extra.map { |name| writable_view_column(plan, name) }
-            rewritten[:query] = { kind: :view_source, relation: Relation.new(columns: columns, rows: rows) }
+            rewritten[:query] = { kind: :view_source, query: statement[:query], defaults: extra.to_h { |name| [name, insert_defaults[name]] } }
           end
         end
         if statement[:on_conflict]
@@ -541,7 +543,7 @@ module JedNative
 
     def conjunction(left, right)
       return left || right unless left && right
-      { kind: :view_filter, left: left, right: right }
+      { kind: :binary, op: 'and', left: left, right: right }
     end
 
     def relabel_view_targets(value, label)

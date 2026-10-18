@@ -164,7 +164,7 @@ module JedNative
       storage = @engine.instance_variable_get(:@storage)
       storage ? shared_file_txid : @engine.instance_variable_get(:@memory_domains)['main']&.state&.object_id
     end
-    def shared_capture(child, pin: false)
+    def shared_capture(child, pin: false, read: false)
       @shared_mutex.synchronize do
         shared_open!
         destination = child.engine

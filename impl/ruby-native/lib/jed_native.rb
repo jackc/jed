@@ -92,9 +92,12 @@ require_relative 'jed_native/predicate_implication'
 require_relative 'jed_native/schema_resolution'
 require_relative 'jed_native/mutation_resolution'
 require_relative 'jed_native/foreign_key_work'
+require_relative 'jed_native/function_relations'
+require_relative 'jed_native/view_mutations'
 require_relative 'jed_native/storage_limits'
 require_relative 'jed_native/deep_queries'
 require_relative 'jed_native/paged_access'
+require_relative 'jed_native/paged_deltas'
 require_relative 'jed_native/gin_queries'
 require_relative 'jed_native/join_edges'
 
@@ -249,3 +252,13 @@ end
 
 require_relative 'jed_native/sessions'
 require_relative 'jed_native/cursors'
+require_relative 'jed_native/page_service_database'
+require_relative 'jed_native/deep_expressions'
+require_relative 'jed_native/host_functions'
+
+require_relative 'jed_native/deep_stack'
+
+require_relative 'jed_native/paged_constraints'
+require_relative 'jed_native/storage_rewrite'
+
+require_relative 'jed_native/host_batches'

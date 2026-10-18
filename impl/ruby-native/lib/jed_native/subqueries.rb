@@ -112,7 +112,7 @@ module JedNative
              end
       type = 'text' if type == 'unknown'
       type += '[]' if kind == :array_query
-      if metadata[:correlated]
+      if metadata[:correlated] || @native_values_order_subquery
         Expression.new(kind: :query_value, type: type, value: query,
                        extra: { scope: columns, query_kind: kind, row_value: !!row_fields, negated: node[:negated] })
       else

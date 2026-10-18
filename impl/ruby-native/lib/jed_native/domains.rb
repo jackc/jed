@@ -21,21 +21,17 @@ module JedNative
       attachment = { read_only: mode == :read_only }
       unless source.nil? || source == :memory
         require_relative 'persistence'
+        if @storage && !source.is_a?(Storage)
+          inherited = { locking: @storage.instance_variable_get(:@locking),
+                        file_lock_timeout_ms: @storage.instance_variable_get(:@service_timeout) || 5000,
+                        fsync: @storage.instance_variable_get(:@sync),
+                        cache_bytes: @storage.instance_variable_get(:@cache_bytes) }
+          inherited.merge!(@storage.instance_variable_get(:@service_options) || {})
+          options = inherited.merge(options)
+        end
         storage = source.is_a?(Storage) ? source : Storage.new(path: source, create: false, read_only: attachment[:read_only], **options)
         attachment[:storage] = storage
-        attachment[:stored_catalog] = storage.load
-        loader = Engine.new(environment: @environment)
-        loader.send(:import_storage, attachment[:stored_catalog])
-        loader.tables.each do |local_name, table|
-          key = domain_key(name, local_name)
-          constraints = table[:constraints].map do |constraint|
-            constraint[:kind] == :foreign_key ? constraint.merge(table: domain_key(name, constraint[:table])) : constraint
-          end
-          indexes = table[:indexes].map { |index| index.merge(name: domain_key(name, index[:name]), local_name: index[:name]) }
-          @tables[key] = table.merge(name: key, local_name: local_name, database: name, constraints: constraints, indexes: indexes)
-        end
-        attachment[:views] = loader.instance_variable_get(:@views)
-        attachment[:types] = loader.instance_variable_get(:@types)
+        import_attachment_catalog(name, attachment, storage.load)
       end
       @attachments[name] = attachment
       remember_attachment_storage(name) if attachment[:storage] && respond_to?(:remember_attachment_storage, true)
@@ -44,6 +40,25 @@ module JedNative
     rescue StandardError
       storage&.close unless defined?(Storage) && source.is_a?(Storage) || @attachments.key?(name)
       raise
+    end
+
+    def import_attachment_catalog(name, attachment, catalog)
+      attachment[:stored_catalog] = catalog
+      storage = attachment[:storage]
+      attachment[:service_publication] = [storage.service_generation, storage.meta[:txid]] if storage
+      loader = Engine.new(environment: @environment)
+      loader.send(:import_storage, catalog)
+      @tables = @tables.reject { |_, table| table[:database] == name }
+      loader.tables.each do |local_name, table|
+        key = domain_key(name, local_name)
+        constraints = table[:constraints].map do |constraint|
+          constraint[:kind] == :foreign_key ? constraint.merge(table: domain_key(name, constraint[:table])) : constraint
+        end
+        indexes = table[:indexes].map { |index| index.merge(name: domain_key(name, index[:name]), local_name: index[:name]) }
+        @tables[key] = table.merge(name: key, local_name: local_name, database: name, constraints: constraints, indexes: indexes)
+      end
+      attachment[:views] = loader.instance_variable_get(:@views)
+      attachment[:types] = loader.instance_variable_get(:@types)
     end
 
     def detach(name)

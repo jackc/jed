@@ -197,7 +197,13 @@ module JedNative
             raise Error.new('42P01', 'table qualifier is not visible after a set operation') if output[:kind] == :column && output[:table]
             raise Error.new('0A000', 'set-operation ORDER BY accepts output columns or positions') unless output[:kind] == :column
           end
-          compile(node, relation.columns)
+          old_values_tail = @native_values_order_subquery
+          begin
+            @native_values_order_subquery = stmt[:kind] == :values
+            compile(node, relation.columns)
+          ensure
+            @native_values_order_subquery = old_values_tail
+          end
         end
       end
       rows = relation.rows

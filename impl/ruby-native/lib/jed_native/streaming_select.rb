@@ -45,7 +45,8 @@ module JedNative
         seen_owner = query_memory_owner if @query_memory && seen.is_a?(Hash)
       end
       unless limit == 0
-        input.each do |row|
+        remaining = limit && -> { offset + limit - output.length }
+        host_batch_rows(input, [predicate, *expressions], pulled: true, remaining: remaining).each do |row|
           begin
             charge
             profile_accumulate(:scan, @cost - scan_resume) if @explain_profile_frames
