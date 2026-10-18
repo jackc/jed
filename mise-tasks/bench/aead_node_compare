@@ -1,0 +1,18 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Compare TypeScript, Rust/WASM, and native Rust/Node-API on warm file-backed SQL"
+require 'open3'
+require_relative '../../scripts/lib/tasks'
+include Tasks
+dir = File.expand_path(ENV.fetch('JED_AEAD_NODE_RESULTS', "bench/results/aead-node-#{stamp}-#{Process.pid}"))
+FileUtils.mkdir_p(dir)
+sh 'mise', 'run', 'node:build', env: {'CARGO_NET_OFFLINE'=>'true'}
+sh 'cargo', 'build', '--release', '--target', 'wasm32-wasip1', '--locked', '--offline', '--manifest-path', 'impl/wasm/Cargo.toml'
+cpu = ENV.fetch('JED_AEAD_CPU', File.read('/proc/self/status')[/^Cpus_allowed_list:\s*(.+)$/,1].split(/[,-]/).first)
+esbuild = ENV['JED_ESBUILD'] || Dir.glob('/home/jack/.npm/_npx/*/node_modules/esbuild/bin/esbuild').first
+hashes = ENV['JED_NOBLE_HASHES'] || ["#{ROOT}/impl/ts/node_modules/@noble/hashes", '/home/jack/dev/jed/impl/ts/node_modules/@noble/hashes'].find { |p| File.directory?(p) }
+abort 'Existing esbuild and approved @noble/hashes installation required; no download performed' unless esbuild && hashes
+sh esbuild, 'bench/aead/browser/node_compare.mjs', '--bundle', '--format=esm', '--platform=node', "--alias:@noble/hashes=#{hashes}", "--outfile=#{dir}/sql.mjs"
+revision,status = Open3.capture2('git','rev-parse','HEAD')
+abort 'git revision failed' unless status.success?
+sh 'taskset', '-c', cpu, 'node', '--experimental-wasi-unstable-preview1', "#{dir}/sql.mjs", dir, env: {'JED_AEAD_CPU'=>cpu,'JED_BENCH_REVISION'=>revision.strip}

@@ -373,10 +373,12 @@ sits so the options stay open (CLAUDE.md §9).
 - **Encryption at rest (file-level)** — kept open, not built (CLAUDE.md §9); **designed in
   [encryption.md](encryption.md)**. The insertion point is a **page codec in the core, just
   above the block seam** (a thin layer, not a per-host duty — hosts.md §6), encrypting page
-  bodies with a standardized AEAD under a **deterministic `(page_index, txid)` nonce** that
-  keeps the §8 cross-core byte-identity, while the auth tag *closes* the tamper gap the
-  `format_version` 7 CRC explicitly leaves open (above). The crypto comes from a **vetted
-  library, never hand-rolled** (CLAUDE.md §14, the build gate). The present requirement is only
+  bodies with standardized AEAD and envelope encryption. Credential changes rewrap the data
+  key; data-key rotation rewrites live pages. Nonce/domain safety across crashes, restores and
+  writable copies remains unresolved: `(page_index, txid)` alone is insufficient. Identical
+  crypto inputs must produce identical bytes. Authenticated pages and metadata address tampering;
+  whole-file rollback needs a separate contract. Vetted libraries use safe APIs, with reviewed
+  accelerated backends under CLAUDE.md §14. The present requirement is only
   that the format and seam not foreclose it — concretely, don't bake in assumptions that page
   bytes are plaintext-comparable on disk (already satisfied — hosts keep page bytes opaque).
 - **Replication** — kept open, not built; **designed in [replication.md](replication.md)**.

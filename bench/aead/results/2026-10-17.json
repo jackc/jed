@@ -1,0 +1,2100 @@
+{
+  "metadata": {
+    "date_utc": "2026-10-17T23:07:02Z",
+    "revision": "172e3b0ae9f604f5284147d77ac7eb14b07917a7",
+    "working_tree": "M AGENTS.md\n M CLAUDE.md\n M TODO.md\n M spec/design/README.md\n M spec/design/encryption.md\n M spec/design/hosts.md\n M spec/design/storage.md\n?? bench/aead/\n?? mise-tasks/bench/aead",
+    "samples": 5,
+    "sample_ms": 100,
+    "warmup_samples": 1,
+    "batch_operations": 64,
+    "cpu_affinity": "0",
+    "os": "Linux gandolf 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "go": "go version go1.27.1 linux/amd64",
+    "node": "v26.10.0",
+    "node_versions": {
+      "node": "26.10.0",
+      "acorn": "8.18.0",
+      "ada": "4.0.0",
+      "amaro": "1.1.11",
+      "ares": "1.34.8",
+      "brotli": "1.2.0",
+      "cldr": "48.0",
+      "icu": "78.3",
+      "libffi": "3.8.0",
+      "lief": "0.17.0",
+      "llhttp": "9.4.3",
+      "merve": "1.2.2",
+      "modules": "147",
+      "napi": "10",
+      "nbytes": "0.1.4",
+      "ncrypto": "0.0.1",
+      "nghttp2": "1.70.0",
+      "nghttp3": "",
+      "ngtcp2": "",
+      "openssl": "3.5.8",
+      "simdjson": "4.6.11",
+      "simdutf": "7.7.0",
+      "sqlite": "3.53.4",
+      "tz": "2026c",
+      "undici": "8.10.2",
+      "unicode": "17.0",
+      "uv": "1.52.1",
+      "uvwasi": "0.0.23",
+      "v8": "14.6.202.34-node.34",
+      "zlib": "1.3.2.1-motley-285e94b",
+      "zstd": "1.5.7"
+    },
+    "cpu_info": "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 198\nmodel name\t: Intel(R) Core(TM) Ultra 9 285K\nstepping\t: 2\nmicrocode\t: 0x11b\ncpu MHz\t\t: 1281.399\ncache size\t: 36864 KB\nphysical id\t: 0\nsiblings\t: 24\ncore id\t\t: 0\ncpu cores\t: 24\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\npower management:",
+    "environment": {},
+    "source_sha256": {
+      "bench/aead/rust/src/main.rs": "d8d59f9596b704678b8c02d8860fb23b683b3eef1afd6578b0134f90fabafd24",
+      "bench/aead/rust/Cargo.lock": "e7878d773350b39e0f2696aeb39064240e3636db6df36a07eb29e7e474a29a7b",
+      "bench/aead/rust/Cargo.toml": "d25737869da7a0fd464c1ea049ad73ed7f12880479b171c07ca5c6cf8784ce44",
+      "bench/aead/go/main.go": "72ad21a34fac3f6b70d91722a8b9180250ba3e3a6a67ae86e8387f40f138b76b",
+      "bench/aead/go/go.mod": "03adcbae8ca9b5639e7aba8900bd45745f01a6559e198f6ba336c8f952f36e33",
+      "bench/aead/go/go.sum": "29025c5d36db542e961df27da21810c6901df208558510cbc2793a51b1901450",
+      "bench/aead/ts/main.ts": "13afe98f98688bdb5f72cdcb3a856bd07bc6a49e4d1546dede85501e3b435409",
+      "bench/aead/ts/package-lock.json": "6285ed08461bb7c746342c8fd7a2d08dfea4839bdeae277200f678b5071d8895",
+      "bench/aead/ts/package.json": "869dd4bf5fa21d76ce70708609f63afd1616a0b8fe47f3cc78dd1caca119b12b"
+    }
+  },
+  "raw_directory": "bench/results/aead-20261017-230702-21",
+  "validation": {
+    "backends": [
+      "rustcrypto",
+      "go",
+      "noble-js",
+      "node-native",
+      "node-webcrypto"
+    ],
+    "checks": [
+      "whole ciphertext/tag equality for all sizes (WebCrypto AES only)",
+      "round trip",
+      "ciphertext corruption rejected",
+      "tag corruption rejected",
+      "AAD corruption rejected",
+      "wrong key rejected"
+    ],
+    "fixtures": [
+      {
+        "algorithm": "aes-256-gcm",
+        "bytes": 4096,
+        "ciphertext_and_tag_sha256": "880f793e989aab5ae3a8841243f8503188cda48892f9804b99f8bec1924337d8"
+      },
+      {
+        "algorithm": "aes-256-gcm",
+        "bytes": 8192,
+        "ciphertext_and_tag_sha256": "cffdd7e647d1ab5a37d156658d13b93c69b27735d0266202e8c1bf5ba3c5146c"
+      },
+      {
+        "algorithm": "aes-256-gcm",
+        "bytes": 16384,
+        "ciphertext_and_tag_sha256": "342ab331b0cf9161bd6b51e3195020618d58a1e6d259651aeac6a77f1ebc857f"
+      },
+      {
+        "algorithm": "aes-256-gcm",
+        "bytes": 65536,
+        "ciphertext_and_tag_sha256": "eb147287d6ffe7ca571f830173705f991431537a45fd6262c20557726e9989a2"
+      },
+      {
+        "algorithm": "chacha20-poly1305",
+        "bytes": 4096,
+        "ciphertext_and_tag_sha256": "09ca4e64535031e58456654bccdf2cb8994233720aecb950d345ff61662c6940"
+      },
+      {
+        "algorithm": "chacha20-poly1305",
+        "bytes": 8192,
+        "ciphertext_and_tag_sha256": "d42ff1eb7184af17be4a5d8d7bd950fe8a6cd3059f55ff4860d2e7b87e0a4ae9"
+      },
+      {
+        "algorithm": "chacha20-poly1305",
+        "bytes": 16384,
+        "ciphertext_and_tag_sha256": "ec3b1485ca3e4be569aa9eb4fa3ea785979a89843c222b4b4c2b5d557947da61"
+      },
+      {
+        "algorithm": "chacha20-poly1305",
+        "bytes": 65536,
+        "ciphertext_and_tag_sha256": "e4643cdfdd1cc1c4d4ea724409d4d84777db077bd78b417deef86dcc73c99394"
+      }
+    ]
+  },
+  "timings": [
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        1346.352376722653,
+        1368.3086553196147,
+        1367.1788194444443,
+        1369.4967134092901,
+        1368.4905182793345
+      ],
+      "median_ns": 1368.3086553196147,
+      "min_ns": 1346.352376722653,
+      "max_ns": 1369.4967134092901,
+      "mib_per_second": 2854.801791111643
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        1392.0572545636687,
+        1385.4158632535461,
+        1386.133435837766,
+        1383.380918141593,
+        1384.433361935341
+      ],
+      "median_ns": 1385.4158632535461,
+      "min_ns": 1383.380918141593,
+      "max_ns": 1392.0572545636687,
+      "mib_per_second": 2819.5505072581327
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "reused-in-place",
+      "operation": "seal",
+      "ns_samples": [
+        1336.8679560521814,
+        1337.2770396706587,
+        1339.0556314267353,
+        1338.5796767979452,
+        1337.3800791274593
+      ],
+      "median_ns": 1337.3800791274593,
+      "min_ns": 1336.8679560521814,
+      "max_ns": 1339.0556314267353,
+      "mib_per_second": 2920.822629980055
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "reused-in-place",
+      "operation": "open",
+      "ns_samples": [
+        1375.3255002198769,
+        1376.274180237676,
+        1375.3233014511873,
+        1374.3602682497801,
+        1377.2265418502202
+      ],
+      "median_ns": 1375.3255002198769,
+      "min_ns": 1374.3602682497801,
+      "max_ns": 1377.2265418502202,
+      "mib_per_second": 2840.2367289601607
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        2624.6403366191275,
+        2612.5785423622706,
+        2614.2807796822744,
+        2612.5626565108514,
+        2609.1900563439067
+      ],
+      "median_ns": 2612.5785423622706,
+      "min_ns": 2609.1900563439067,
+      "max_ns": 2624.6403366191275,
+      "mib_per_second": 2990.340720220417
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        2668.5935100255974,
+        2674.0108974358973,
+        2672.0612713675214,
+        2664.450862436116,
+        2689.2524699312717
+      ],
+      "median_ns": 2672.0612713675214,
+      "min_ns": 2664.450862436116,
+      "max_ns": 2689.2524699312717,
+      "mib_per_second": 2923.7727756151635
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "reused-in-place",
+      "operation": "seal",
+      "ns_samples": [
+        2602.916259359401,
+        2603.7116264559068,
+        2600.956608777038,
+        2601.677490640599,
+        2601.4715838186357
+      ],
+      "median_ns": 2601.677490640599,
+      "min_ns": 2600.956608777038,
+      "max_ns": 2603.7116264559068,
+      "mib_per_second": 3002.870274315347
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "reused-in-place",
+      "operation": "open",
+      "ns_samples": [
+        2671.406356837607,
+        2671.5451655982906,
+        2679.547356592466,
+        2671.592334401709,
+        2676.4757598458905
+      ],
+      "median_ns": 2671.592334401709,
+      "min_ns": 2671.406356837607,
+      "max_ns": 2679.547356592466,
+      "mib_per_second": 2924.2859770929736
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        5218.398385416666,
+        5191.042306893688,
+        5208.276110880399,
+        5190.774420529801,
+        5196.995016611296
+      ],
+      "median_ns": 5196.995016611296,
+      "min_ns": 5190.774420529801,
+      "max_ns": 5218.398385416666,
+      "mib_per_second": 3006.545118873001
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        5289.855257601352,
+        5300.651800847458,
+        5279.883868243243,
+        5286.12621410473,
+        5284.441617398648
+      ],
+      "median_ns": 5286.12621410473,
+      "min_ns": 5279.883868243243,
+      "max_ns": 5300.651800847458,
+      "mib_per_second": 2955.8507245454193
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "reused-in-place",
+      "operation": "seal",
+      "ns_samples": [
+        5166.650629125413,
+        5154.607216282895,
+        5151.5859375,
+        5166.71333539604,
+        5177.752069536424
+      ],
+      "median_ns": 5166.650629125413,
+      "min_ns": 5151.5859375,
+      "max_ns": 5177.752069536424,
+      "mib_per_second": 3024.202935634711
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "reused-in-place",
+      "operation": "open",
+      "ns_samples": [
+        5300.490677966101,
+        5321.531037414966,
+        5317.706420068027,
+        5301.00063559322,
+        5302.940783898305
+      ],
+      "median_ns": 5302.940783898305,
+      "min_ns": 5300.490677966101,
+      "max_ns": 5321.531037414966,
+      "mib_per_second": 2946.4783101940898
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        20956.419375,
+        21046.96791666667,
+        20974.00625,
+        21026.675,
+        20968.925625
+      ],
+      "median_ns": 20974.00625,
+      "min_ns": 20956.419375,
+      "max_ns": 21046.96791666667,
+      "mib_per_second": 2979.87896327627
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        21475.249785958906,
+        21518.752782534248,
+        21507.28681506849,
+        21524.56720890411,
+        21492.016481164384
+      ],
+      "median_ns": 21507.28681506849,
+      "min_ns": 21475.249785958906,
+      "max_ns": 21524.56720890411,
+      "mib_per_second": 2905.9918406914576
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "reused-in-place",
+      "operation": "seal",
+      "ns_samples": [
+        21002.406666666666,
+        21001.720625,
+        20939.809375,
+        20989.107708333333,
+        20974.958125
+      ],
+      "median_ns": 20989.107708333333,
+      "min_ns": 20939.809375,
+      "max_ns": 21002.406666666666,
+      "mib_per_second": 2977.7349694187114
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "reused-in-place",
+      "operation": "open",
+      "ns_samples": [
+        21555.369863013697,
+        21555.388270547945,
+        21573.979880136987,
+        21597.891909246577,
+        21569.97859589041
+      ],
+      "median_ns": 21569.97859589041,
+      "min_ns": 21555.369863013697,
+      "max_ns": 21597.891909246577,
+      "mib_per_second": 2897.545758896011
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        2815.416385135135,
+        2816.334769144144,
+        2815.2406699640287,
+        2815.816300675676,
+        2818.0188344594594
+      ],
+      "median_ns": 2815.816300675676,
+      "min_ns": 2815.2406699640287,
+      "max_ns": 2818.0188344594594,
+      "mib_per_second": 1387.2531383040387
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        2819.036739864865,
+        2830.1433657323687,
+        2827.437245705244,
+        2827.4295886075947,
+        2827.5062160940324
+      ],
+      "median_ns": 2827.437245705244,
+      "min_ns": 2819.036739864865,
+      "max_ns": 2830.1433657323687,
+      "mib_per_second": 1381.5514405964009
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 4096,
+      "mode": "reused-in-place",
+      "operation": "seal",
+      "ns_samples": [
+        2812.952759667266,
+        2818.8331925675675,
+        2829.2025316455697,
+        2819.526829954955,
+        2826.5053966998194
+      ],
+      "median_ns": 2819.526829954955,
+      "min_ns": 2812.952759667266,
+      "max_ns": 2829.2025316455697,
+      "mib_per_second": 1385.427497443749
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 4096,
+      "mode": "reused-in-place",
+      "operation": "open",
+      "ns_samples": [
+        2776.3042295737123,
+        2780.094693605684,
+        2780.6089579626337,
+        2795.0998046875,
+        2777.674039742451
+      ],
+      "median_ns": 2780.094693605684,
+      "min_ns": 2776.3042295737123,
+      "max_ns": 2795.0998046875,
+      "mib_per_second": 1405.0780388828168
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        4673.771361940298,
+        4654.855561755952,
+        4669.050559701493,
+        4660.129557291667,
+        4683.767402694611
+      ],
+      "median_ns": 4669.050559701493,
+      "min_ns": 4654.855561755952,
+      "max_ns": 4683.767402694611,
+      "mib_per_second": 1673.2523882755895
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        4692.389827327327,
+        4697.539977477478,
+        4687.080043038922,
+        4696.085257132132,
+        4687.818721931138
+      ],
+      "median_ns": 4692.389827327327,
+      "min_ns": 4687.080043038922,
+      "max_ns": 4697.539977477478,
+      "mib_per_second": 1664.9298731537428
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 8192,
+      "mode": "reused-in-place",
+      "operation": "seal",
+      "ns_samples": [
+        4639.586517062315,
+        4657.793759300595,
+        4640.572236646884,
+        4647.892711424332,
+        4672.368470149254
+      ],
+      "median_ns": 4647.892711424332,
+      "min_ns": 4639.586517062315,
+      "max_ns": 4672.368470149254,
+      "mib_per_second": 1680.8692637842503
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 8192,
+      "mode": "reused-in-place",
+      "operation": "open",
+      "ns_samples": [
+        4649.791496661721,
+        4656.385695684524,
+        4649.085033382789,
+        4613.405466445428,
+        4630.411103920118
+      ],
+      "median_ns": 4649.085033382789,
+      "min_ns": 4613.405466445428,
+      "max_ns": 4656.385695684524,
+      "mib_per_second": 1680.438181685705
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        8333.465093085106,
+        8333.147190824468,
+        8313.293633643618,
+        8326.028590425532,
+        8286.918485449736
+      ],
+      "median_ns": 8326.028590425532,
+      "min_ns": 8286.918485449736,
+      "max_ns": 8333.465093085106,
+      "mib_per_second": 1876.6450091184981
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        8355.786597593584,
+        8357.400818850267,
+        8355.241688829787,
+        8359.932235962568,
+        8388.73445855615
+      ],
+      "median_ns": 8357.400818850267,
+      "min_ns": 8355.241688829787,
+      "max_ns": 8388.73445855615,
+      "mib_per_second": 1869.6004103043058
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 16384,
+      "mode": "reused-in-place",
+      "operation": "seal",
+      "ns_samples": [
+        8323.814660904256,
+        8324.248503989362,
+        8325.24060837766,
+        8323.596575797872,
+        8325.269198803191
+      ],
+      "median_ns": 8324.248503989362,
+      "min_ns": 8323.596575797872,
+      "max_ns": 8325.269198803191,
+      "mib_per_second": 1877.0463174557779
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 16384,
+      "mode": "reused-in-place",
+      "operation": "open",
+      "ns_samples": [
+        8282.24429563492,
+        8389.608622994652,
+        8347.515458776596,
+        8283.269675925925,
+        8311.557679521276
+      ],
+      "median_ns": 8311.557679521276,
+      "min_ns": 8282.24429563492,
+      "max_ns": 8389.608622994652,
+      "mib_per_second": 1879.9123584858473
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        30872.239583333332,
+        30916.78400735294,
+        30878.257352941175,
+        30962.428615196077,
+        30834.132659313724
+      ],
+      "median_ns": 30878.257352941175,
+      "min_ns": 30834.132659313724,
+      "max_ns": 30962.428615196077,
+      "mib_per_second": 2024.077955100236
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        31202.914522058825,
+        31197.25980392157,
+        31225.825980392157,
+        31251.7334375,
+        31199.091911764706
+      ],
+      "median_ns": 31202.914522058825,
+      "min_ns": 31197.25980392157,
+      "max_ns": 31251.7334375,
+      "mib_per_second": 2003.0180179423874
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 65536,
+      "mode": "reused-in-place",
+      "operation": "seal",
+      "ns_samples": [
+        31346.9928125,
+        31681.206875,
+        31898.02901785714,
+        31663.4378125,
+        31251.2946875
+      ],
+      "median_ns": 31663.4378125,
+      "min_ns": 31251.2946875,
+      "max_ns": 31898.02901785714,
+      "mib_per_second": 1973.8854754213212
+    },
+    {
+      "kind": "timing",
+      "backend": "rustcrypto",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 65536,
+      "mode": "reused-in-place",
+      "operation": "open",
+      "ns_samples": [
+        31665.428125,
+        31888.820790816328,
+        31425.07625,
+        31164.86550245098,
+        31381.626875
+      ],
+      "median_ns": 31425.07625,
+      "min_ns": 31164.86550245098,
+      "max_ns": 31888.820790816328,
+      "mib_per_second": 1988.8575449359491
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 4096,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        669.6797276670951,
+        668.8268814184852,
+        673.8344288793104,
+        671.2878946520618,
+        670.2509380360206
+      ],
+      "operation": "seal",
+      "median_ns": 670.2509380360206,
+      "min_ns": 668.8268814184852,
+      "max_ns": 673.8344288793104,
+      "mib_per_second": 5828.041078832583
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 4096,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        669.794182651093,
+        672.3430104345955,
+        672.7124475355145,
+        671.6061734858248,
+        674.9813579913607
+      ],
+      "operation": "open",
+      "median_ns": 672.3430104345955,
+      "min_ns": 669.794182651093,
+      "max_ns": 674.9813579913607,
+      "mib_per_second": 5809.906460505986
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 4096,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        459.21793729797236,
+        456.0629696162825,
+        459.63080882352943,
+        460.5187518420277,
+        459.0059425477239
+      ],
+      "operation": "seal",
+      "median_ns": 459.21793729797236,
+      "min_ns": 456.0629696162825,
+      "max_ns": 460.5187518420277,
+      "mib_per_second": 8506.30971208199
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 4096,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        407.1290996287129,
+        403.73066552570396,
+        404.3432770051746,
+        404.64823116261005,
+        404.05244958634955
+      ],
+      "operation": "open",
+      "median_ns": 404.3432770051746,
+      "min_ns": 403.73066552570396,
+      "max_ns": 407.1290996287129,
+      "mib_per_second": 9660.726966779788
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 8192,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        1195.5919448163734,
+        1201.3082877304148,
+        1203.490293013857,
+        1197.7196360153257,
+        1201.5761073212914
+      ],
+      "operation": "seal",
+      "median_ns": 1201.3082877304148,
+      "min_ns": 1195.5919448163734,
+      "max_ns": 1203.490293013857,
+      "mib_per_second": 6503.326481464515
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 8192,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        1276.3188137755103,
+        1281.75546875,
+        1272.5768398819218,
+        1279.3259640957447,
+        1274.747249388753
+      ],
+      "operation": "open",
+      "median_ns": 1276.3188137755103,
+      "min_ns": 1272.5768398819218,
+      "max_ns": 1281.75546875,
+      "mib_per_second": 6121.1195162826525
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 8192,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        861.790595713892,
+        865.1918518133998,
+        865.3769206810631,
+        867.0035877703828,
+        868.8466769733185
+      ],
+      "operation": "seal",
+      "median_ns": 865.3769206810631,
+      "min_ns": 861.790595713892,
+      "max_ns": 868.8466769733185,
+      "mib_per_second": 9027.858050398963
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 8192,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        776.5709295827123,
+        782.673948422634,
+        778.9081885276532,
+        776.8308974279324,
+        777.544970460199
+      ],
+      "operation": "open",
+      "median_ns": 777.544970460199,
+      "min_ns": 776.5709295827123,
+      "max_ns": 782.673948422634,
+      "mib_per_second": 10047.650356964024
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 16384,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        2300.585546875,
+        2297.9056295955884,
+        2296.3349623715126,
+        2296.6246787812042,
+        2330.106347801788
+      ],
+      "operation": "seal",
+      "median_ns": 2297.9056295955884,
+      "min_ns": 2296.3349623715126,
+      "max_ns": 2330.106347801788,
+      "mib_per_second": 6799.670012014317
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 16384,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        2317.601597222222,
+        2293.541697214076,
+        2292.7551548753668,
+        2294.407968291789,
+        2296.9009957782673
+      ],
+      "operation": "open",
+      "median_ns": 2294.407968291789,
+      "min_ns": 2292.7551548753668,
+      "max_ns": 2317.601597222222,
+      "mib_per_second": 6810.035623975355
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 16384,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        1686.8294734358144,
+        1691.1100514069265,
+        1681.1860719086021,
+        1682.2965386167923,
+        1691.537371482684
+      ],
+      "operation": "seal",
+      "median_ns": 1686.8294734358144,
+      "min_ns": 1681.1860719086021,
+      "max_ns": 1691.537371482684,
+      "mib_per_second": 9262.939879852975
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 16384,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        1509.6758303140098,
+        1522.155869644596,
+        1512.089654859768,
+        1504.8138083493743,
+        1512.6057145450145
+      ],
+      "operation": "open",
+      "median_ns": 1512.089654859768,
+      "min_ns": 1504.8138083493743,
+      "max_ns": 1522.155869644596,
+      "mib_per_second": 10333.381985507382
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 65536,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        9041.745484104047,
+        9064.598265895953,
+        9041.509934971098,
+        9076.007496387283,
+        9079.920339595375
+      ],
+      "operation": "seal",
+      "median_ns": 9064.598265895953,
+      "min_ns": 9041.509934971098,
+      "max_ns": 9079.920339595375,
+      "mib_per_second": 6894.9553159069255
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 65536,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        8452.065540540541,
+        8390.723429144386,
+        8345.965093085106,
+        8405.150201612903,
+        8448.711993243243
+      ],
+      "operation": "open",
+      "median_ns": 8405.150201612903,
+      "min_ns": 8345.965093085106,
+      "max_ns": 8452.065540540541,
+      "mib_per_second": 7435.9170866460645
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 65536,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        7134.934931506849,
+        7144.874571917808,
+        7141.652040525114,
+        7195.765553325688,
+        7198.887829701835
+      ],
+      "operation": "seal",
+      "median_ns": 7144.874571917808,
+      "min_ns": 7134.934931506849,
+      "max_ns": 7198.887829701835,
+      "mib_per_second": 8747.529347212028
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "backend": "go",
+      "bytes": 65536,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        6640.18266684322,
+        6602.5774657173,
+        6542.483067468619,
+        6547.286872384937,
+        6511.818033854167
+      ],
+      "operation": "open",
+      "median_ns": 6547.286872384937,
+      "min_ns": 6511.818033854167,
+      "max_ns": 6640.18266684322,
+      "mib_per_second": 9545.938832100317
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 4096,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        1207.3824444980694,
+        1223.5211267605634,
+        1204.5301064137134,
+        1205.6470269097222,
+        1212.4497551396432
+      ],
+      "operation": "seal",
+      "median_ns": 1207.3824444980694,
+      "min_ns": 1204.5301064137134,
+      "max_ns": 1223.5211267605634,
+      "mib_per_second": 3235.3046193444516
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 4096,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        1217.1823890186915,
+        1209.455301857585,
+        1213.1865416343169,
+        1214.2097537878788,
+        1196.8001411753446
+      ],
+      "operation": "open",
+      "median_ns": 1213.1865416343169,
+      "min_ns": 1196.8001411753446,
+      "max_ns": 1217.1823890186915,
+      "mib_per_second": 3219.826354764687
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 4096,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        1052.212394781145,
+        1045.6954222408026,
+        1050.4605594758063,
+        1047.9027417057641,
+        1047.4999371648794
+      ],
+      "operation": "seal",
+      "median_ns": 1047.9027417057641,
+      "min_ns": 1045.6954222408026,
+      "max_ns": 1052.212394781145,
+      "mib_per_second": 3727.683729161211
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 4096,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        1020.7881184683214,
+        1020.5065172160574,
+        1031.3999793729372,
+        1031.987149339934,
+        1027.9779296875
+      ],
+      "operation": "open",
+      "median_ns": 1027.9779296875,
+      "min_ns": 1020.5065172160574,
+      "max_ns": 1031.987149339934,
+      "mib_per_second": 3799.9356670891566
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 8192,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        2247.5673715876437,
+        2251.741321942446,
+        2231.690553673324,
+        2255.996572871573,
+        2296.909485132159
+      ],
+      "operation": "seal",
+      "median_ns": 2251.741321942446,
+      "min_ns": 2231.690553673324,
+      "max_ns": 2296.909485132159,
+      "mib_per_second": 3469.537075093782
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 8192,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        2364.437760022693,
+        2350.9638862781953,
+        2308.2392679098966,
+        2350.7153665413534,
+        2340.6138426272455
+      ],
+      "operation": "open",
+      "median_ns": 2350.7153665413534,
+      "min_ns": 2308.2392679098966,
+      "max_ns": 2364.437760022693,
+      "mib_per_second": 3323.4563874462865
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 8192,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        2013.5363643685566,
+        2005.3324318910256,
+        1991.5778264331211,
+        2000.0959678708439,
+        1992.4314888535032
+      ],
+      "operation": "seal",
+      "median_ns": 2000.0959678708439,
+      "min_ns": 1991.5778264331211,
+      "max_ns": 2013.5363643685566,
+      "mib_per_second": 3906.0625717458033
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 8192,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        1976.4217564791404,
+        1982.893638959391,
+        1945.9516072540473,
+        1981.7383753168567,
+        1982.9291825095056
+      ],
+      "operation": "open",
+      "median_ns": 1981.7383753168567,
+      "min_ns": 1945.9516072540473,
+      "max_ns": 1982.9291825095056,
+      "mib_per_second": 3942.2459075865013
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 16384,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        4362.606197771588,
+        4352.489800347223,
+        4441.369762073864,
+        4431.998849150142,
+        4462.97516025641
+      ],
+      "operation": "seal",
+      "median_ns": 4431.998849150142,
+      "min_ns": 4352.489800347223,
+      "max_ns": 4462.97516025641,
+      "mib_per_second": 3525.497305351551
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 16384,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        4632.803531804734,
+        4603.706939338235,
+        4607.6085018382355,
+        4506.226900216138,
+        4498.1547234195405
+      ],
+      "operation": "open",
+      "median_ns": 4603.706939338235,
+      "min_ns": 4498.1547234195405,
+      "max_ns": 4632.803531804734,
+      "mib_per_second": 3394.004050624046
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 16384,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        3902.261767456359,
+        3852.033943965517,
+        3908.1473828125,
+        3899.284990648379,
+        3932.1737594221104
+      ],
+      "operation": "seal",
+      "median_ns": 3902.261767456359,
+      "min_ns": 3852.033943965517,
+      "max_ns": 3932.1737594221104,
+      "mib_per_second": 4004.0881240483677
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 16384,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        3841.1233875921375,
+        3848.3510826167076,
+        3865.0652777777777,
+        3835.8337162990197,
+        3872.805422339109
+      ],
+      "operation": "open",
+      "median_ns": 3848.3510826167076,
+      "min_ns": 3835.8337162990197,
+      "max_ns": 3872.805422339109,
+      "mib_per_second": 4060.18049407688
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 65536,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        17838.766335227272,
+        17340.482657967033,
+        17477.3015625,
+        17601.825491573032,
+        17630.01404494382
+      ],
+      "operation": "seal",
+      "median_ns": 17601.825491573032,
+      "min_ns": 17340.482657967033,
+      "max_ns": 17838.766335227272,
+      "mib_per_second": 3550.768074022902
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 65536,
+      "kind": "timing",
+      "mode": "allocating",
+      "ns_samples": [
+        17361.56111111111,
+        17416.813715277778,
+        17440.95954861111,
+        17422.915277777778,
+        17518.85625
+      ],
+      "operation": "open",
+      "median_ns": 17422.915277777778,
+      "min_ns": 17361.56111111111,
+      "max_ns": 17518.85625,
+      "mib_per_second": 3587.2297490716846
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 65536,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        15851.88731060606,
+        15836.601325757576,
+        15815.161300505051,
+        15608.246596534653,
+        15900.935763888889
+      ],
+      "operation": "seal",
+      "median_ns": 15836.601325757576,
+      "min_ns": 15608.246596534653,
+      "max_ns": 15900.935763888889,
+      "mib_per_second": 3946.5538542254226
+    },
+    {
+      "algorithm": "chacha20-poly1305",
+      "backend": "go",
+      "bytes": 65536,
+      "kind": "timing",
+      "mode": "reused-in-place",
+      "ns_samples": [
+        15929.909880050505,
+        15906.859532828283,
+        16067.566485969388,
+        16000.65943877551,
+        16150.019168814433
+      ],
+      "operation": "open",
+      "median_ns": 16000.65943877551,
+      "min_ns": 15906.859532828283,
+      "max_ns": 16150.019168814433,
+      "mib_per_second": 3906.0890108403537
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        61425.433293269234,
+        61023.85817307692,
+        60677.60817307692,
+        59974.54224537037,
+        60376.77283653846
+      ],
+      "median_ns": 60677.60817307692,
+      "min_ns": 59974.54224537037,
+      "max_ns": 61425.433293269234,
+      "mib_per_second": 64.37712555936294
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        61935.92788461538,
+        60762.8359375,
+        61156.439903846156,
+        65739.642578125,
+        60836.27403846154
+      ],
+      "median_ns": 61156.439903846156,
+      "min_ns": 60762.8359375,
+      "max_ns": 65739.642578125,
+      "mib_per_second": 63.87307708136121
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        112546.69196428571,
+        112000.79910714286,
+        112096.93080357143,
+        111746.49441964286,
+        112512.46316964286
+      ],
+      "median_ns": 112096.93080357143,
+      "min_ns": 111746.49441964286,
+      "max_ns": 112546.69196428571,
+      "mib_per_second": 69.69414723485981
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        111254.37291666666,
+        111258.03333333334,
+        111638.42633928571,
+        111579.84479166666,
+        111218.87604166666
+      ],
+      "median_ns": 111258.03333333334,
+      "min_ns": 111218.87604166666,
+      "max_ns": 111638.42633928571,
+      "mib_per_second": 70.21964855871082
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        213959.486328125,
+        213662.490234375,
+        225472.984375,
+        213651.7578125,
+        213446.119140625
+      ],
+      "median_ns": 213662.490234375,
+      "min_ns": 213446.119140625,
+      "max_ns": 225472.984375,
+      "mib_per_second": 73.12935453883509
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        213723.38671875,
+        214065.3046875,
+        213899.185546875,
+        214434.068359375,
+        214511.814453125
+      ],
+      "median_ns": 214065.3046875,
+      "min_ns": 213723.38671875,
+      "max_ns": 214511.814453125,
+      "mib_per_second": 72.99174437823972
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        783322.875,
+        753356.6979166666,
+        759993.5364583334,
+        759135.0885416666,
+        757217.328125
+      ],
+      "median_ns": 759135.0885416666,
+      "min_ns": 753356.6979166666,
+      "max_ns": 783322.875,
+      "mib_per_second": 82.33053766499631
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        756164.9166666666,
+        754617.5572916666,
+        752836.03125,
+        757816.3072916666,
+        752272.875
+      ],
+      "median_ns": 754617.5572916666,
+      "min_ns": 752272.875,
+      "max_ns": 757816.3072916666,
+      "mib_per_second": 82.82341087359988
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        19104.82431402439,
+        16707.75864361702,
+        17714.37113764045,
+        16187.159793814433,
+        16158.752899484536
+      ],
+      "median_ns": 16707.75864361702,
+      "min_ns": 16158.752899484536,
+      "max_ns": 19104.82431402439,
+      "mib_per_second": 233.79856528465783
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        16249.014819587628,
+        17026.915251358696,
+        16570.758388157894,
+        16129.900773195875,
+        16527.161842105263
+      ],
+      "median_ns": 16527.161842105263,
+      "min_ns": 16129.900773195875,
+      "max_ns": 17026.915251358696,
+      "mib_per_second": 236.35334592345313
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        30820.336397058825,
+        30512.73828125,
+        32009.382653061224,
+        29207.54658564815,
+        29331.06076388889
+      ],
+      "median_ns": 30512.73828125,
+      "min_ns": 29207.54658564815,
+      "max_ns": 32009.382653061224,
+      "mib_per_second": 256.04060599178547
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        29966.000589622643,
+        30106.34405048077,
+        29373.278645833332,
+        30701.08057598039,
+        29149.833912037036
+      ],
+      "median_ns": 29966.000589622643,
+      "min_ns": 29149.833912037036,
+      "max_ns": 30701.08057598039,
+      "mib_per_second": 260.7121352959428
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        60493.93689903846,
+        55700.19665948276,
+        57428.463169642855,
+        55487.6875,
+        56035.857142857145
+      ],
+      "median_ns": 56035.857142857145,
+      "min_ns": 55487.6875,
+      "max_ns": 60493.93689903846,
+      "mib_per_second": 278.83931462252485
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        56034.888950892855,
+        58153.741898148146,
+        58124.072916666664,
+        57898.08217592593,
+        57907.82366071428
+      ],
+      "median_ns": 57907.82366071428,
+      "min_ns": 56034.888950892855,
+      "max_ns": 58153.741898148146,
+      "mib_per_second": 269.82537094724705
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        226491.552734375,
+        223147.8671875,
+        223166.939453125,
+        214823.18359375,
+        214222.193359375
+      ],
+      "median_ns": 223147.8671875,
+      "min_ns": 214222.193359375,
+      "max_ns": 226491.552734375,
+      "mib_per_second": 280.0833401982927
+    },
+    {
+      "kind": "timing",
+      "backend": "noble-js",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        213802.38671875,
+        222161.66015625,
+        221623.4140625,
+        219017.255859375,
+        213952.654296875
+      ],
+      "median_ns": 219017.255859375,
+      "min_ns": 213802.38671875,
+      "max_ns": 222161.66015625,
+      "mib_per_second": 285.3656427881169
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        3327.8475066489364,
+        3236.7206586438924,
+        3170.966087728195,
+        3011.640594894027,
+        3007.724609375
+      ],
+      "median_ns": 3170.966087728195,
+      "min_ns": 3007.724609375,
+      "max_ns": 3327.8475066489364,
+      "mib_per_second": 1231.8800932994498
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        2811.402315647482,
+        3023.792220744681,
+        2719.5702177209705,
+        2685.193782216495,
+        2724.116942508711
+      ],
+      "median_ns": 2724.116942508711,
+      "min_ns": 2685.193782216495,
+      "max_ns": 3023.792220744681,
+      "mib_per_second": 1433.9509215058263
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        4107.564919619423,
+        4059.354301948052,
+        4072.8382975260415,
+        4146.941188660478,
+        4148.813536140584
+      ],
+      "median_ns": 4107.564919619423,
+      "min_ns": 4059.354301948052,
+      "max_ns": 4148.813536140584,
+      "mib_per_second": 1901.978459959155
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        3765.3150602409637,
+        4118.3144736842105,
+        4032.1185164304125,
+        3875.1104192450493,
+        3807.670734489051
+      ],
+      "median_ns": 3875.1104192450493,
+      "min_ns": 3765.3150602409637,
+      "max_ns": 4118.3144736842105,
+      "mib_per_second": 2016.0715837155512
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        7208.804651497696,
+        8412.368279569893,
+        8236.000575657894,
+        8680.363508597884,
+        6976.145368303572
+      ],
+      "median_ns": 8236.000575657894,
+      "min_ns": 6976.145368303572,
+      "max_ns": 8680.363508597884,
+      "mib_per_second": 1897.1586823561959
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        7589.171116504855,
+        7060.720912388393,
+        8360.969996675532,
+        6397.419579081633,
+        7482.800613038277
+      ],
+      "median_ns": 7482.800613038277,
+      "min_ns": 6397.419579081633,
+      "max_ns": 8360.969996675532,
+      "mib_per_second": 2088.1219222618984
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        17900.985085227272,
+        18625.30003720238,
+        17796.489701704544,
+        17980.62908380682,
+        24898.098958333332
+      ],
+      "median_ns": 17980.62908380682,
+      "min_ns": 17796.489701704544,
+      "max_ns": 24898.098958333332,
+      "mib_per_second": 3475.962921469021
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        14421.445240825688,
+        14656.544392523365,
+        15254.833282766991,
+        19737.384452160495,
+        19636.666796875
+      ],
+      "median_ns": 15254.833282766991,
+      "min_ns": 14421.445240825688,
+      "max_ns": 19737.384452160495,
+      "mib_per_second": 4097.062146893779
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        4072.046427408854,
+        4025.675008033419,
+        3928.7989949748744,
+        4030.320070876289,
+        3916.6463424185463
+      ],
+      "median_ns": 4025.675008033419,
+      "min_ns": 3916.6463424185463,
+      "max_ns": 4072.046427408854,
+      "mib_per_second": 970.3341656256154
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        3720.682552083333,
+        3740.002840909091,
+        3846.465678746929,
+        3747.890512589928,
+        3706.462603672986
+      ],
+      "median_ns": 3740.002840909091,
+      "min_ns": 3706.462603672986,
+      "max_ns": 3846.465678746929,
+      "mib_per_second": 1044.4510782912932
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        6087.565114299611,
+        6413.4137423155735,
+        6385.771875,
+        6251.1035,
+        6378.915433673469
+      ],
+      "median_ns": 6378.915433673469,
+      "min_ns": 6087.565114299611,
+      "max_ns": 6413.4137423155735,
+      "mib_per_second": 1224.7379795566537
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        5675.921535326087,
+        5634.340265287769,
+        6072.962630703422,
+        5498.297368421053,
+        5861.830231741573
+      ],
+      "median_ns": 5675.921535326087,
+      "min_ns": 5498.297368421053,
+      "max_ns": 6072.962630703422,
+      "mib_per_second": 1376.4284709321946
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        10450.8203125,
+        9787.43974609375,
+        9799.19794921875,
+        10635.1306335034,
+        9905.303204113925
+      ],
+      "median_ns": 9905.303204113925,
+      "min_ns": 9787.43974609375,
+      "max_ns": 10635.1306335034,
+      "mib_per_second": 1577.4378308288976
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        9475.524526515152,
+        9225.06240862573,
+        9452.122835090362,
+        8770.145775139665,
+        9458.595820783132
+      ],
+      "median_ns": 9452.122835090362,
+      "min_ns": 8770.145775139665,
+      "max_ns": 9475.524526515152,
+      "mib_per_second": 1653.0678105444474
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        28758.815625,
+        33451.952792553195,
+        32428.67410714286,
+        27939.176339285714,
+        27850.269188596492
+      ],
+      "median_ns": 28758.815625,
+      "min_ns": 27850.269188596492,
+      "max_ns": 33451.952792553195,
+      "mib_per_second": 2173.246659910043
+    },
+    {
+      "kind": "timing",
+      "backend": "node-native",
+      "algorithm": "chacha20-poly1305",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        24887.715029761905,
+        25657.544569672133,
+        24443.843017578125,
+        24398.887259615385,
+        24311.91298076923
+      ],
+      "median_ns": 24443.843017578125,
+      "min_ns": 24311.91298076923,
+      "max_ns": 25657.544569672133,
+      "mib_per_second": 2556.881090876538
+    },
+    {
+      "kind": "timing",
+      "backend": "node-webcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        10567.088471283783,
+        9786.03349609375,
+        9236.846783088235,
+        9780.12783203125,
+        8906.637517755682
+      ],
+      "median_ns": 9780.12783203125,
+      "min_ns": 8906.637517755682,
+      "max_ns": 10567.088471283783,
+      "mib_per_second": 399.4068448887242
+    },
+    {
+      "kind": "timing",
+      "backend": "node-webcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 4096,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        10597.11887668919,
+        9594.197079613095,
+        9848.751609848485,
+        9509.50293560606,
+        9403.34683757485
+      ],
+      "median_ns": 9594.197079613095,
+      "min_ns": 9403.34683757485,
+      "max_ns": 10597.11887668919,
+      "mib_per_second": 407.14715026028284
+    },
+    {
+      "kind": "timing",
+      "backend": "node-webcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        11028.73602552817,
+        11881.40009469697,
+        11345.169157608696,
+        11546.736557904413,
+        11675.314508928572
+      ],
+      "median_ns": 11546.736557904413,
+      "min_ns": 11028.73602552817,
+      "max_ns": 11881.40009469697,
+      "mib_per_second": 676.5980985901933
+    },
+    {
+      "kind": "timing",
+      "backend": "node-webcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        12227.305297851563,
+        11638.125925925926,
+        10908.002170138889,
+        11891.018914473685,
+        11377.067821557972
+      ],
+      "median_ns": 11638.125925925926,
+      "min_ns": 10908.002170138889,
+      "max_ns": 12227.305297851563,
+      "mib_per_second": 671.2850548039107
+    },
+    {
+      "kind": "timing",
+      "backend": "node-webcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        15741.25703125,
+        17802.033356741573,
+        16059.291613520409,
+        17301.019574175825,
+        16280.088216145834
+      ],
+      "median_ns": 16280.088216145834,
+      "min_ns": 15741.25703125,
+      "max_ns": 17802.033356741573,
+      "mib_per_second": 959.7613841246789
+    },
+    {
+      "kind": "timing",
+      "backend": "node-webcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 16384,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        15976.812926136363,
+        14384.355217889908,
+        14771.814858490567,
+        16850.56552419355,
+        14843.8375
+      ],
+      "median_ns": 14843.8375,
+      "min_ns": 14384.355217889908,
+      "max_ns": 16850.56552419355,
+      "mib_per_second": 1052.6253739977954
+    },
+    {
+      "kind": "timing",
+      "backend": "node-webcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "seal",
+      "ns_samples": [
+        45071.84375,
+        43999.35503472222,
+        46215.4140625,
+        42571.41849662162,
+        42752.96959459459
+      ],
+      "median_ns": 43999.35503472222,
+      "min_ns": 42571.41849662162,
+      "max_ns": 46215.4140625,
+      "mib_per_second": 1420.4753672111317
+    },
+    {
+      "kind": "timing",
+      "backend": "node-webcrypto",
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "mode": "allocating",
+      "operation": "open",
+      "ns_samples": [
+        40175.78004807692,
+        42711.322027439026,
+        38437.063643292684,
+        41151.708333333336,
+        35566.80575284091
+      ],
+      "median_ns": 40175.78004807692,
+      "min_ns": 35566.80575284091,
+      "max_ns": 42711.322027439026,
+      "mib_per_second": 1555.6636342893275
+    }
+  ]
+}

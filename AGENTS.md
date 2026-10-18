@@ -125,7 +125,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   DML without other effects preserves statistics and does not persist (transactions.md §2.1).
 - Key encoding must preserve logical order in raw byte order.
 - Do not assume on-disk page bytes are plaintext-comparable; leave room for the
-  encryption-at-rest design.
+  encryption-at-rest design. The deferred design uses envelope encryption: credential changes
+  rewrap the data key; data-key rotation rewrites live pages. Nonce safety across failed commits,
+  restores and writable copies is unresolved; `(page_index, txid)` alone is insufficient.
 - Multi-process file access is the page service (`spec/design/page-service.md`,
   `spec/design/locking.md`), landed across Rust, Go, and Node/TypeScript: the
   process holding `presence EX` on the stable `<path>.lock/` bundle owns the file
@@ -201,8 +203,14 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
   deterministic cross-core behavior, provide a significant platform-specific
   speedup while remaining byte-identical, or are vetted cryptography.
 - Always get explicit human confirmation before adding a dependency.
-- Dependencies must not introduce unsafe, cgo, FFI, nondeterminism, locale or
-  library-version-sensitive behavior, or divergence across cores.
+- Engine code and dependency APIs remain memory-safe. Vetted crypto backends may use explicitly
+  reviewed assembly/intrinsics and narrowly approved Rust unsafe internals behind safe APIs;
+  evaluate constant-time behavior separately. Go stays free of cgo/external C-library FFI.
+  Dependencies must not introduce nondeterminism, locale or library-version-sensitive behavior,
+  or divergence across cores. Identical crypto inputs must produce identical bytes.
+- The isolated AEAD benchmark dependencies are approved (2026-10-17): RustCrypto aes-gcm and
+  chacha20poly1305, Go x/crypto/chacha20poly1305, and TS @noble/ciphers, including their standard
+  accelerated backends for measurement. This selects no production cipher or engine dependency.
 - Bench modules are not cores, but new benchmark dependencies still require
   explicit confirmation.
 

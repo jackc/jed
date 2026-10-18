@@ -19,6 +19,18 @@ is the permanent blocking-sort top-k lane: one million fixed
 rows, K=100, cross-engine checksum equality, and the scan-dominated timing/memory payoff. This document is the
 canonical record for the `bench/` subsystem.
 
+**Page-sized AEAD experiment (2026-10-17).** `mise run bench:aead` measures AES-256-GCM and
+ChaCha20-Poly1305 at 4/8/16/64 KiB in isolated benchmark packages across RustCrypto, Go,
+pure-JS Noble, native Node and Node WebCrypto (AES only). It verifies complete ciphertext/tag
+identity and authentication failures before measuring; it needs no database or oracle. The
+104 timing cases, pinned dependencies, allocation distinctions and initial results are recorded
+in [bench/aead/README.md](../../bench/aead/README.md). These are primitive/API measurements,
+not integrated database overhead or a production crypto dependency selection.
+The browser/lifecycle follow-up adds real Chromium-worker WebCrypto versus JS and Rust/WASM,
+native Go HKDF/writer-key amortization and XChaCha randomness, and five whole-engine TS versus
+Rust/WASI SQL controls under Node. See the [separate report](../../bench/aead/results/2026-10-17-browser-lifecycle.md)
+for measured boundaries; no encrypted OPFS or async engine is implemented.
+
 **Blocking spill result (2026-10-04).** `mise run bench:spill` drives the shared
 `bench/corpus/spill.toml` workload through independent Rust, Go and TypeScript
 workers. It creates 32,768 rows with a 2,048-byte text payload (about 66 MiB logical
@@ -1377,6 +1389,14 @@ why the comparison must be refreshed after core work: the wrapper now wins INSER
 pure TS but remains 2.82× slower than native Rust on rollback INSERT, while pure TS still wins DELETE.
 The comparison therefore supports a workload split, not the slogan that either Node engine always
 wins or that a native wrapper runs at Rust speed.
+
+**2026-10-18 narrow follow-up.** The encryption/browser investigation rebuilt the existing native
+Node binding and compared it with TS and Rust/WASI on five prepared warm-read queries over identical
+10,000-row files. Seven 300 ms samples per case preserve the result-conversion boundary; all result
+arrays agree. Native Rust wins sorting and the 1,000-row return, TS wins `SELECT 1`, and WASM wins
+the point and aggregate probes. The repeated native-versus-WASM aggregate gap remains unprofiled.
+See [the full method and results](../../bench/aead/results/2026-10-18-node.md); this small read-only
+set does not replace the full-corpus write/concurrency evidence above or select a production package.
 
 ## 8. Write benchmarks and the scratch database
 
