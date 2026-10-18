@@ -17,6 +17,7 @@ max_readers = 2
 batch = [1, 40]
 
 [weights]
+backup = 2
 open_write = 14
 open_read = 3
 close_read = 4
@@ -38,6 +39,7 @@ crash_power = 5
 crash_process = 3
 
 [faults]
+backup_fault = 200
 commit_fault = 250
 chain = 400
 power_loss = 10

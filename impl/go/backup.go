@@ -26,7 +26,7 @@ func BackupForTesting(db *Database, dest string, pageIdentical bool) error {
 	return db.core.backup(dest, pageIdentical)
 }
 
-// backupMetaRetries bounds the re-pins a page-identical backup makes when two commits overwrite its
+// backupMetaRetries bounds the re-pins a page-identical backup makes when later commits overwrite its
 // pinned version's meta slot between the pin and the read (each retry pins a newer version).
 const backupMetaRetries = 1000
 
@@ -60,7 +60,7 @@ func (c *sharedCore) backup(dest string, pageIdentical bool) error {
 				return err
 			}
 			if !found {
-				// Two commits after the pin overwrote its meta slot: pin the newer version instead.
+				// A later commit overwrote its meta slot: pin the newer version instead.
 				c.deregisterPin(gen, v)
 				if attempt >= backupMetaRetries {
 					return newError(ObjectInUse, "could not read a stable meta page for the backup")
@@ -89,8 +89,10 @@ func (c *sharedCore) backup(dest string, pageIdentical bool) error {
 	}
 }
 
-// backupMeta reads the meta that published version v. Every commit writes slot txid & 1, so a later
-// commit two versions on can overwrite it after the pin: found=false then.
+// backupMeta reads the meta that published version v. A commit writes the slot that does not hold the
+// durable floor (validated-cow.md §4): txid & 1 under synchronous = on, so a commit two versions on can
+// overwrite it after the pin, and one slot for a whole relaxed batch, so the next commit of the batch
+// can. Either slot may hold it, and found=false means a later commit overwrote it.
 func backupMeta(paging *sharedPaging, v uint64) (meta, bool, error) {
 	var mt meta
 	found := false

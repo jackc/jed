@@ -57,7 +57,7 @@ export function backupForTesting(db: object, dest: string, pageIdentical: boolea
   backup((db as { core: BackupCore }).core, dest, pageIdentical);
 }
 
-// BACKUP_META_RETRIES bounds the re-pins a page-identical backup makes when two commits overwrite its
+// BACKUP_META_RETRIES bounds the re-pins a page-identical backup makes when later commits overwrite its
 // pinned version's meta slot between the pin and the read (each retry pins a newer version).
 const BACKUP_META_RETRIES = 1000;
 
@@ -87,7 +87,7 @@ function backup(c: BackupCore, dest: string, pageIdentical: boolean): void {
         if (paging === null) throw engineError("io_error", "database storage is closed");
         const mt = backupMeta(paging, v);
         if (mt === null) {
-          // Two commits after the pin overwrote its meta slot: pin the newer version instead.
+          // A later commit overwrote its meta slot: pin the newer version instead.
           if (attempt >= BACKUP_META_RETRIES) {
             throw engineError("object_in_use", "could not read a stable meta page for the backup");
           }
@@ -108,8 +108,10 @@ function backup(c: BackupCore, dest: string, pageIdentical: boolean): void {
   }
 }
 
-// backupMeta reads the meta that published version v. Every commit writes slot txid & 1, so a later
-// commit two versions on can overwrite it after the pin: null then.
+// backupMeta reads the meta that published version v. A commit writes the slot that does not hold the
+// durable floor (validated-cow.md §4): txid & 1 under synchronous = on, so a commit two versions on can
+// overwrite it after the pin, and one slot for a whole relaxed batch, so the next commit of the batch
+// can. Either slot may hold it, and null means a later commit overwrote it.
 function backupMeta(paging: SharedPaging, v: bigint): CommitMeta | null {
   const first = Number(v & 1n);
   for (const slot of [first, first ^ 1]) {

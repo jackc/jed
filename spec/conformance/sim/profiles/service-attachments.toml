@@ -20,6 +20,7 @@ attachments = 2
 attached_writes = 500
 
 [weights]
+backup = 2
 spawn = 8
 exit = 1
 kill = 1
@@ -31,6 +32,7 @@ crash_power = 1
 crash_process = 1
 
 [faults]
+backup_fault = 200
 commit_fault = 250
 attach_fault = 200
 nth_max = 2

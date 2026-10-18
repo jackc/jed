@@ -22,7 +22,7 @@ use crate::filehost::{FileHost, OsFileHost, WriteAt};
 use crate::format::{LoadAt, Meta, PAGE_FREELIST, ROOT_PAGE};
 use crate::paging::SharedPaging;
 
-/// Bounds the re-pins a backup makes when two commits overwrite its pinned version's meta slot
+/// Bounds the re-pins a backup makes when later commits overwrite its pinned version's meta slot
 /// between the pin and the read (each retry pins a newer version).
 const BACKUP_META_RETRIES: usize = 1000;
 
@@ -61,8 +61,10 @@ fn backup_paging(snap: &Snapshot) -> Result<Arc<SharedPaging>> {
     })
 }
 
-/// The meta that published version `v`. Every commit writes slot `txid & 1`, so a later commit two
-/// versions on can overwrite it after the pin: `None` then.
+/// The meta that published version `v`. A commit writes the slot that does not hold the durable floor
+/// (validated-cow.md §4): `txid & 1` under `synchronous = on`, so a commit two versions on can overwrite
+/// it after the pin, and one slot for a whole relaxed batch, so the next commit of the batch can. Either
+/// slot may hold it, and `None` means a later commit overwrote it.
 fn backup_meta(paging: &SharedPaging, v: u64) -> Result<Option<Meta>> {
     let mut pager = paging.pager();
     for slot in [(v & 1) as u32, (v & 1) as u32 ^ 1] {
@@ -130,7 +132,7 @@ impl Shared {
             match result {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
-                    // Two commits after the pin overwrote its meta slot: pin the newer version.
+                    // A later commit overwrote its meta slot: pin the newer version.
                     if attempt >= BACKUP_META_RETRIES {
                         return Err(EngineError::new(
                             SqlState::ObjectInUse,
