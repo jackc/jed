@@ -1579,7 +1579,6 @@ function closeDomain(st: Engine): unknown {
   return error;
 }
 
-
 // --- File attachments under the page service (spec/design/page-service.md §5.5; spec/pageservice/
 // README.md §6.6). An attachment opened under `locking = "auto"` has its own coordination domain: an
 // inner handle elected on the attached file exactly as an open is — the owner, serving it, or a page
