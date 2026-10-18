@@ -1,17 +1,18 @@
 import { createDatabase, render } from 'jed-ts';
 
-// Open a database. createDatabase/openDatabase return a Database — the handle you run SQL through. A
-// path gives a single-file database on disk; `createDatabase({})` (no path) is a transient in-memory one.
-// Each bare execute() autocommits durably (it runs on a fresh session); for a multi-statement
-// transaction use db.update(...) or mint a Session.
-const db = createDatabase({ path: 'people.jed' });
+// Node uses a long-lived execution worker. For the same API with browser OPFS,
+// import from 'jed-ts/browser'; path names an origin-private file there.
+// Omit path to create a transient in-memory database on either platform.
+const db = await createDatabase({ path: 'people.jed', backend: 'typescript' });
+try {
+  await db.execute('CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)');
+  await db.execute("INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')");
 
-db.execute('CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)');
-db.execute("INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')");
-
-// query() returns a row cursor; execute() is for statements that produce no rows.
-for (const row of db.query('SELECT name FROM person ORDER BY id')) {
-  console.log(render(row[0]));
+  // Each bare operation autocommits. Delivery fetches bounded typed batches;
+  // leaving the loop early closes its cursor and releases the read snapshot.
+  for await (const row of await db.query('SELECT name FROM person ORDER BY id')) {
+    console.log(render(row[0]));
+  }
+} finally {
+  await db.close(); // releases sessions, transactions, storage, and the worker
 }
-
-db.close();

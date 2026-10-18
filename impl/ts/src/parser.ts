@@ -3,6 +3,7 @@
 // reserved-keyword table); the lexer folds every bare word to lowercase, so keywords match
 // byte-exactly here (and a quoted identifier is never a keyword — grammar.md §3).
 
+import { cancellationCheckpoint } from "./cancel.ts";
 import type {
   AlterColumnAction,
   AlterTableEdit,
@@ -463,6 +464,7 @@ class Parser {
     const closeAt: number[] = new Array<number>(n).fill(n);
     const open: number[] = [];
     for (let i = 0; i < n; i++) {
+      if ((i & 255) === 0) cancellationCheckpoint();
       const kind = this.tokens[i].kind;
       if (kind === "lparen") {
         open.push(i);
@@ -472,6 +474,7 @@ class Parser {
     }
     const q: boolean[] = new Array<boolean>(n).fill(false);
     for (let i = n - 1; i >= 0; i--) {
+      if ((i & 255) === 0) cancellationCheckpoint();
       if (this.tokens[i].kind !== "lparen") continue;
       const inner =
         this.isSelectAtIndex(i + 1) ||
@@ -6524,6 +6527,7 @@ class Parser {
   }
 
   private advance(): Token {
+    cancellationCheckpoint();
     this.note(this.pos);
     const t = this.tokens[this.pos]!;
     if (this.pos + 1 < this.tokens.length) this.pos++;

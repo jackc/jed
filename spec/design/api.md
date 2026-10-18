@@ -14,9 +14,10 @@ drives it through this surface. Before this, the only entry point was a one-shot
 `execute(db, sql)` against an in-memory database; this doc is the formal surface that adds
 durable database files, prepared statements, bind parameters, and a row cursor.
 
-The [browser/Node runtime proposal](ts-runtime.md) explores an async-only public JS surface,
-worker execution and bounded typed result delivery. It does not change the current APIs
-documented here; adoption and migration require a separate implementation decision.
+The [browser/Node runtime](ts-runtime.md#10-implemented-async-host-contract) implements async-only
+application entry points with worker execution, bounded typed delivery and session scheduling.
+The TS signatures below describe the synchronous internal core retained for conformance/tooling;
+application code uses the async lifecycle in ts-runtime.md §10. Go and Rust APIs are unchanged.
 
 ## 1. The shape (same across cores)
 
@@ -1136,11 +1137,13 @@ merely because the successful path accrues those units in bulk.
 Cancellation remains best effort: parsing, sorting, individual scalar kernels, host callbacks, and
 commit work are not made preemptible. The existing commit boundary is unchanged.
 
-**Per-core reality** (CLAUDE.md §2). Go and Rust have real threads, so a cancel from another
-thread interrupts a running statement at the next checkpoint. **TS cannot preempt synchronous
-execution** (one event loop; nothing else runs until the call returns), so an `AbortSignal` there
-is honored only at operation boundaries, not mid-statement — a deliberate best-experience-per-
-language divergence, not a uniform-shape failure.
+**Per-core reality** (CLAUDE.md §2). Go and Rust poll thread-safe cancellation at checkpoints.
+The TS async runtime maps `AbortSignal` to a shared atomic flag on Node and supported isolated
+browsers, polling parser/resolver and meter checkpoints during synchronous execution. Ordinary
+browsers without shared memory cancel between operations/fetches; interruption of a blocking
+kernel awaits cooperative continuation work. The internal synchronous `*Cancelable` methods
+continue checking the local signal at entry. Commit cancellation stops at the last safe point
+before storage/publication; a later abort cannot turn a completed commit into a rollback reply.
 
 The meter carries separate cost guards and cancellation checkpoints; the cursor also captures
 the token and re-checks it in Go's `Next()`. Streaming and deferred cursors execute after `Query` returns, so their frozen
@@ -1218,25 +1221,15 @@ without shadowing the raw pair). Verified by `impl/rust/tests/ergonomic.rs` (the
 `get`, the `Option`/error-code conversions, `query_map`/`query_row`, and the on-Session/Transaction
 surface).
 
-**Landed (TS, cancellation — `impl/ts/src/cancel.ts`):** the cancellation mirror, and the
-**deliberate per-language divergence** §11.4 calls out. The handle is the platform **`AbortSignal`**
-(an `AbortController`) — the same primitive `fetch` and the web APIs use, so there is *no* custom
-token type (Rust ships `CancellationToken` only because JS has one built in). The cancelable methods
-`executeCancelable` / `queryCancelable` on **`Session`, `Database`, *and* `Transaction`** take an
-optional `AbortSignal` and throw the registered **`57014 query_canceled`** when it is already
-aborted. Crucially the check is at the **operation boundary only**, *not* the cost meter: TS runs on
-one event loop, so nothing (no timer, no other thread) runs *during* a synchronous `query()`/
-`execute()` — the signal's `aborted` state is frozen at entry, so a meter poll would re-read the same
-value N times. The meter and `SessionState` are therefore left **untouched** (the §8 cost determinism
-is trivially intact — no TS cost path changed), unlike the Go/Rust mid-statement poll. It is still
-useful: it skips work for an already-canceled operation (a client that disconnected before the
-handler ran). Mid-statement cancellation in TS would need an async streaming cursor that `await`s
-(§4); the boundary check is the forward-compatible seam. Verified by
-`impl/ts/tests/cancellation.test.ts` (the `throwIfAborted` unit test, the boundary abort on
-`Database`/`Session`, the un-aborted-completes regression, the transaction roll-back, and a
-boundary-only-semantics test proving an abort after a synchronous query has no retroactive effect).
-**Cancellation is now mirrored across all three cores** (Go meter poll via `context.Context`, Rust
-meter poll via `CancellationToken`, TS boundary via `AbortSignal`).
+**Landed (TS, cancellation — `impl/ts/src/cancel.ts`, `src/async`):** the async runtime's
+`query`/`execute` and prepared methods accept `{signal}` and carry cancellation through cursor
+fetches. The scoped hook polls shared flags without changing cost, and is absent on ordinary
+noncancelable work so existing fast paths remain available. `57014` aborts the statement and
+poisons an open block. Node tests flip a flag while resident SQL is running; browser tests cover
+the non-shared-memory boundary behavior. Commit tests distinguish safe pre-write rollback from
+late abort after durable work begins. The internal `executeCancelable`/`queryCancelable` surface
+retains its operation-entry behavior (`cancellation.test.ts`). No bounded cancellation latency is
+claimed for every long scalar kernel or for ordinary-browser blocking execution.
 
 **Landed (TS, ergonomic — `impl/ts/src/ergonomic.ts`, better-sqlite3-style):** the better-sqlite3
 idiom, **additive** — the raw `Value[]` `execute`/`query` are unchanged. `db.prepare(sql)` (on

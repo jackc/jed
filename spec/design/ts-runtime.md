@@ -1,13 +1,16 @@
-# TypeScript runtime for browser and Node — proposed design
+# TypeScript runtime for browser and Node
 
-> **Proposal, not implemented or ratified.** Records the direction from the encryption,
-> browser/WASM and Node-native investigations. Existing public APIs and shipping choices
-> remain in force until a separately reviewed implementation/migration. No new production
-> dependency, encrypted file format, or replacement of the independent TS core is approved here.
+> **Async API and worker runtime implemented.** The package entry points now use the
+> independent TS core in dedicated Node/browser workers. Lifecycle, typed transport, scheduling,
+> batching, cleanup and shared-flag cancellation are specified in §10. The synchronous core
+> remains internal for conformance and host tooling. Cooperative interruption of blocking kernels
+> without shared memory and asynchronous page/crypto suspension remain follow-on work; the
+> implementation does not claim those acceptance gates are met. No production encryption
+> dependency, encrypted format, Rust delivery default or parallel-reader pool is selected.
 > See [cores.md](cores.md), [api.md](api.md), [hosts.md](hosts.md) and
 > [encryption.md](encryption.md) for the surrounding contracts.
 
-## 1. Proposed direction
+## 1. Direction
 
 Use an **async-only public JavaScript API** on both Node and the browser. Database operations
 execute off the application's main thread/event loop. Retain synchronous internal computation
@@ -20,23 +23,23 @@ maintained parsers, planners, evaluators or type systems. Rust/Go embedding APIs
 Rust/WASM and Rust/Node-API remain possible delivery packages using the existing Rust core;
 neither becomes another independent conformance voice.
 
-Do not add a public synchronous JS API in the proposed initial surface. Its strongest case is
+Do not add a public synchronous JS API in the application surface. Its strongest case is
 minimum overhead for tiny in-process calls, but it would require a second lifecycle contract
 and constrain async-only providers. Measure batching and worker overhead before reconsidering
 that tradeoff. Internal synchronous entry points can continue serving the core and test harness.
 
-## 2. Current state and evidence
+## 2. Starting state and evidence
 
-The browser client already returns promises and sends messages to a dedicated worker. The
+Before this migration the browser client returned promises and sent messages to a dedicated worker. The
 worker runs synchronous TS SQL and OPFS I/O. Its current result protocol renders values as
 strings, and its dispatch has no explicit operation scheduler. Async open/create already
 require care; introducing awaits inside queries would create more interleavings.
 
-The Node TS embedding API currently runs SQL synchronously. Its page-service coordination
+The internal Node TS embedding API runs SQL synchronously. Its page-service coordination
 worker does not offload application SQL. The blocking page-service channel uses shared memory
 and `Atomics.wait`; moving coordination into a worker has not made the calling engine async.
-TS cancellation currently checks `AbortSignal` only at operation entry; it is not wired into
-the meter for interruption during a running statement.
+Before this migration TS cancellation checked `AbortSignal` only at operation entry. The
+worker runtime now installs the checkpoint hook described in §10.
 
 Relevant implementation seams:
 
@@ -61,7 +64,7 @@ by these probes. Responsiveness, throughput and individual-call latency need sep
 
 ## 3. Execution and host adapters
 
-| Concern | Node proposal | Browser proposal |
+| Concern | Node adapter / candidate | Browser adapter / candidate |
 |---|---|---|
 | Public API | Promises and async result iteration | Same operation/lifecycle shape |
 | SQL execution | Long-lived `worker_threads` execution worker | Dedicated Web Worker |
@@ -229,7 +232,7 @@ thread would need a deliberate async RPC/reentrancy contract and measurements. D
 transparent compatibility or quietly run SQL back on the main thread. Host extensions remain
 outside built-in safety/determinism guarantees; the codec and built-ins gain no arbitrary host access.
 
-## 9. Proposed sequence and acceptance gates
+## 9. Sequence and acceptance gates
 
 1. Specify the async lifecycle, typed wire contract, ordering, bounded admission and error model;
    prototype Node execution-worker and browser scheduler adapters over the existing TS core.
@@ -253,7 +256,113 @@ queue memory. Compare TS, WASM and native Rust at equivalent public boundaries o
 browser/Node versions and ARM as well as x86. Re-run size measurements for complete packages.
 The existing primitive and synchronous SQL benchmarks are baseline evidence only.
 
-Open decisions: exact API/migration policy, request and result wire encoding, worker sharing,
-queue limits/admission errors, continuation representation, checkpoint frequency, extension
-registration, minimum platform versions and fallbacks, and eventual engine-package defaults.
-No public sync interface is proposed; changing that would need a concrete use case and evidence.
+The first [Node async boundary report](../../bench/ts/results/2026-10-18-async/report.md)
+measures direct versus worker latency and bounded result delivery. On that x86 host, prepared
+execution had medians of 5.61/24.11 µs and a 100-statement batch 547/1,060 µs. A resident
+aggregate blocked the direct caller's timer for about 90 ms, while the worker caller's largest
+gap was 2.28 ms. These are warm in-memory observations, not file/browser or ARM conclusions.
+
+Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
+admission errors and Node extension registration. Remaining decisions include cooperative
+continuation representation and checkpoint frequency, async page/crypto providers, worker pools,
+broader platform measurements and optional engine-package defaults. A public synchronous
+application interface would still need a concrete use case and evidence.
+
+## 10. Implemented async host contract
+
+`jed-ts` exports the Node worker API; `jed-ts/browser` exports the browser worker API.
+Both expose `createDatabase(options)` and `openDatabase(path, options)` returning an
+`AsyncDatabase`. `backend` is fixed to `typescript` (the default); another value fails
+with `UNSUPPORTED`. A path selects a Node file or an OPFS name; create without a path
+selects the same page-backed in-memory host. `jed-ts/internal` and repository-relative
+core modules retain synchronous entry points for conformance and existing host tooling;
+they are not the application entry point. Rust and Go APIs are unchanged.
+
+The database offers async `session`, `readSession`, `query`, `execute`, `prepare`,
+`batch`, `executeScript`, `view`, `update`, and `close`. Database conveniences use a fresh
+session per operation; a batch uses one transient session. Explicit sessions retain temp
+tables, SQL transaction state, settings and session variables. `begin(writable)` returns a
+transaction proxy with its own worker handle token: unrelated calls on its parent session
+fail `BUSY` until that transaction ends. A transaction callback awaits application work
+without surrendering ownership. `view`/`update` roll back on exceptions and commit on
+success. Do not await a competing writer from inside the callback that holds the writer.
+
+`query(sql, Value[], {signal})` and prepared `query(Value[], {signal})` return async,
+single-pass rows. Column names/types and command count are returned at open; cost is final
+after drain. `next()` fetches only on demand, `return()`/early loop exit and `close()` release
+the cursor, and `Symbol.asyncDispose` supports explicit resource management. `execute`
+drains/discards results and retains the command tag. `run/get/all` accept the existing JS
+parameter mapping and object rows; `all` is a bounded collector. Prepared statements are
+worker-owned, reusable on their originating handle, and have async `close`/disposal.
+`batch` executes statements or prepared bindings in order, stopping on the first error.
+It introduces no transaction: preceding autocommits stay committed, while statements in
+an explicit block share that block. `executeScript` retains the existing atomic script rule.
+
+Requests carry protocol version 1, strictly increasing request IDs, a session ID, an
+optional transaction ID and operation-specific data. Values carry their own version 1
+tag and an explicit recursive kind. Structured clone carries exact bigints; floats use IEEE
+bit payloads (preserving NaN payloads, infinities and negative zero). Dedicated byte arrays
+are copied; decimal
+sign/scale/base-10000 limbs are rehydrated as `Decimal`. Array shape/lower bounds, composite
+fields, ranges and JSONB numbers recurse through the same contract. Unfetched storage
+references, cyclic/malformed values, arbitrary prototypes and closures are rejected.
+This wire version is independent of the database file version. Engine errors retain
+SQLSTATE and all public structured fields; diagnostic text has a finite transport limit.
+
+Runtime limits are host budgets, never SQL cost units or heap-size guarantees. Defaults:
+
+| Limit | Default |
+|---|---:|
+| outstanding ordinary requests | 128 |
+| outstanding request payload | 8 MiB |
+| rows per fetch | 128 |
+| bytes per result batch, including overhead | 256 KiB |
+| client-held result batches / `all` collector | 2 MiB |
+| explicit sessions / cursors | 64 each |
+| prepared statements | 256 |
+| execution workers per application isolate | 32 |
+
+Options under `runtime` override these positive finite limits. Inputs are preflighted
+before wire copying; result delivery and client decoding operate in bounded batches.
+Multiple concurrent `next` calls are serialized and bounded. A row larger than a batch
+fails `RESULT_TOO_LARGE` and closes its cursor. Exhausted queue/result credits fail
+`QUEUE_FULL`; the caller can consume/close existing work before submitting more. Control
+requests have a separate finite admission reserve. The worker independently bounds its
+queue and handles. Blocking operators still obey the core's query-memory/spill policy;
+transport batching does not make every executor operator streaming.
+
+Session operations retain submission order. The scheduler parses a waiting statement once,
+then parks it before execution if another local session owns the writer. It services other
+sessions, including the owner releasing its gate, without retrying executed SQL. Writer
+waits honor session lock timeout and cancellation. Each batch statement and fetch is an
+event-loop task turn. This provides inter-operation scheduling, not CPU-parallel reads.
+File page-service waits remain inside the execution worker and preserve owner-only reuse.
+
+`close` stops ordinary admission, rejects queued operations, completes an already running
+operation/open, closes cursors/statements, rolls back open transactions, and closes storage
+before terminating the worker. Close is idempotent. Session close follows the same policy
+within that session. A worker error, undecodable reply or unexpected Node worker exit
+rejects outstanding operations and invalidates all handles with `WORKER_FAILED` and
+`outcome: "unknown"`; a write might have committed before the reply was lost. Requests are
+never replayed. A result-size failure can also follow an autocommitted statement with
+`RETURNING`; a transport error does not imply rollback. Other host codes are `CLOSED`, `BUSY`, `QUEUE_FULL`, `RESULT_TOO_LARGE`,
+`WORKER_LIMIT`, `PROTOCOL` and `UNSUPPORTED`; these are not SQLSTATEs.
+
+`AbortSignal` is mapped to a shared atomic flag on Node, and on cross-origin-isolated
+browsers where available. Parser/resolver and meter checkpoints poll it during synchronous
+work without changing cost. Cancellation uses `57014` and preserves failed-block semantics.
+The last safe commit checkpoint precedes storage/publication; once that boundary passes,
+commit completes and reports its real outcome even if the signal changes. Worker termination
+is never ordinary cancellation. A browser without shared memory still works and processes
+cancellation between operations/fetches. **Its synchronous resident query, blocking operator,
+or long scalar kernel cannot currently be interrupted by a cancel message.** Full cooperative
+continuations, bounded latency across every kernel, async cache faults and WebCrypto commits
+remain unimplemented. No SQL replay or whole-file preload substitutes for those features.
+
+Data-only Unicode/time-zone bundles can be provided at open. Node additionally accepts a
+trusted `extensionModule` file URL exporting `configure(EnvironmentBuilder)`; it loads and
+registers host functions inside the execution worker before opening storage. Arbitrary
+application closures cannot cross the port. There is no application-thread callback RPC.
+Host extensions retain their existing safety/determinism exclusion. Browser applications
+needing custom host code supply a custom worker build; no dynamic browser extension loader
+is promised by this package.

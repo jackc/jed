@@ -25,6 +25,26 @@ TypeScript.
 
 <CodeTabs topic="open-database" />
 
+TypeScript's public entry points are asynchronous: import from `jed-ts` on Node or
+`jed-ts/browser` in a browser. Both execute SQL in a dedicated worker and return the same typed
+session, prepared-statement, transaction, and async-row interfaces. The `typescript` backend is
+currently the only available backend. Browser paths name OPFS files; ordinary browser usage does
+not require cross-origin isolation. A handle owns one long-lived worker and `await db.close()`
+releases it, rolling back open transactions.
+
+The `runtime` open option bounds queued requests and bytes, result batches, total retained result
+bytes, sessions, prepared statements, cursors, and workers. Those physical transport budgets are
+separate from SQL cost and query-memory limits. An oversized row or full queue rejects with a
+`TransportError`; SQL errors retain their `EngineError` SQLSTATE and diagnostic fields. Worker
+failure invalidates all handles and reports an unknown outcome: never retry a write automatically.
+
+An `AbortSignal` can be passed to `query` or `execute` as the third argument. Node and isolated
+browsers use atomic cancellation checkpoints during resident CPU work. Ordinary browsers observe
+cancellation before operations and between result batches; a synchronous CPU-heavy statement
+cannot yet be interrupted mid-execution. Blocking operators retain their existing memory limits
+and may materialize rows before a batch becomes available.
+
+
 ## Durability
 
 A bare `execute` **autocommits durably**: it runs on a fresh session that commits before the call

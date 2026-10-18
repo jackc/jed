@@ -4,22 +4,22 @@
 
 <svelte:head>
 	<title>Queries & parameters — jed</title>
-	<meta name="description" content="Bind parameters and read typed result rows from jed — in each language's native idiom: rusqlite for Rust, database/sql for Go, better-sqlite3 for TypeScript." />
+	<meta name="description" content="Bind parameters and read typed result rows from jed — in each language's native idiom: rusqlite for Rust, database/sql for Go, an asynchronous worker API for TypeScript." />
 </svelte:head>
 
 # Queries & parameters
 
 Running a query means two things: **binding parameters** into the SQL, and **reading the rows** back
 out. jed gives each language an ergonomic layer for both — and deliberately **not** the same shape in
-every language. Each core adopts its ecosystem's _de facto_ embedded-SQL idiom, so the code feels
-native rather than translated:
+every language. Rust and Go use familiar embedded-SQL interfaces; TypeScript keeps database work off the application thread:
 
 - **Rust** — [rusqlite](https://docs.rs/rusqlite)'s traits: `run`, `query_row`, `query_map`, with
   `ToValue` / `FromValue` doing the conversions and `row.get::<T>(…)` reading a typed column.
 - **Go** — [`database/sql`](https://pkg.go.dev/database/sql) / [pgx](https://github.com/jackc/pgx):
   `Exec`, `Query`, `QueryRow` taking `...any` args, with `Scan(&dest)` and struct mapping.
-- **TypeScript** — [better-sqlite3](https://github.com/WiseLibs/better-sqlite3): `db.prepare(sql)`
-  returns a `Statement` with `run` / `get` / `all` / `iterate`, and rows come back as plain objects.
+- **TypeScript** — `await db.prepare(sql)` returns a worker-owned statement. Its `run`, `get`,
+  and `all` methods return promises, with object rows for `get` and `all`. Use
+  `for await (const row of await statement.query())` for bounded batches of typed values.
 
 Use the **language selector** in the top bar to switch this example between the three.
 
@@ -61,7 +61,7 @@ binds the array of `id`'s type, which is how you pass a list:
   A bare `Vec` is a list of separate parameters, and `Vec<u8>` binds as `bytea`.
 - **Go** — pass a slice: `session.Query(ctx, "… WHERE id = ANY($1)", []int64{1, 3})`. A nil slice
   binds `NULL`; `[]byte` stays `bytea`.
-- **TypeScript** — pass a JS array: `db.prepare("… WHERE id = ANY($1)").all([1, 3])`.
+- **TypeScript** — pass a JS array: `(await db.prepare("… WHERE id = ANY($1)")).all([1, 3])`.
 
 On a primary key or an indexed column, `id = ANY($1)` looks up each element of the list, like
 `id IN (1, 3)` ([EXPLAIN](/docs/sql/explain) shows it as an interval set). On a composite primary key,
@@ -80,7 +80,8 @@ How a row arrives depends on the idiom:
 - **Go** scans columns into pointers with `Scan(&a, &b)`, or maps a whole row into a struct by column
   name with `RowToStructByName`. `QueryRow(...).Scan(...)` returns `jed.ErrNoRows` on an empty result.
 - **TypeScript** returns each row as an **object keyed by output column name** — `get` gives the first
-  (or `undefined`), `all` gives an array, `iterate` yields them lazily.
+  (or `undefined`) and `all` gives an array, both through promises. `query` yields positional
+  typed values through async iteration with bounded batch fetching.
 
 ### NULL
 
@@ -127,7 +128,7 @@ if errors.As(err, &ee) && ee.Code() == "23505" {
 ```ts
 // TypeScript — fields are optional string properties on EngineError
 try {
-  session.execute("INSERT INTO users (email) VALUES ($1)", ["a@b.com"]);
+  await session.run("INSERT INTO users (email) VALUES ($1)", "a@b.com");
 } catch (e) {
   if (e instanceof EngineError && e.code() === "23505") {
     console.log("duplicate on", e.constraintName); // users_email_key
@@ -191,7 +192,7 @@ identity column, and a `DROP` that other objects depend on:
 // TypeScript: underline the offending character. Positions count code points, so index
 // Array.from(sql), not the UTF-16 string.
 try {
-  session.execute(sql);
+  await session.execute(sql);
 } catch (e) {
   if (e instanceof EngineError && e.position !== undefined) {
     const chars = Array.from(sql);
@@ -227,19 +228,19 @@ itself; reach for the native ergonomic form — the recommended default — for 
 For a hot statement — a point lookup run thousands of times — jed offers an explicit **prepared
 statement**: the SQL is parsed once, and its **resolved query plan is cached** and reused across
 executes (planning dominates the latency of a trivial lookup, so this is the single biggest win for
-high-frequency queries). A prepared statement is a **standalone value bound to no session**: you run
-it by handing it to whichever handle should execute it — a `Database`, a durable `Session`, or an
-open `Transaction` — and that handle supplies the privileges, snapshot, and transaction state the
-run observes. Prepare once at startup, run it from every request:
+high-frequency queries). Rust and Go prepared statements can be passed to the handle that should execute them.
+TypeScript prepared statements stay in their execution worker and retain the database, session,
+or transaction that prepared them; explicitly close them when finished.
 
 - **Rust** — `db.prepare(sql)` → `session.query_prepared(&stmt, &params)` /
   `session.execute_prepared(&stmt, &params)` (also on `Database` and `Transaction`).
 - **Go** — `db.Prepare(sql)` → `session.QueryPrepared(ctx, stmt, args...)` /
   `ExecPrepared` / `QueryRowPrepared` (also on `Database` and `Transaction`; the statement is safe
   to share across goroutines, each running it on its own session).
-- **TypeScript** — `db.prepareStatement(sql)` → `session.queryPrepared(stmt, params)` /
-  `executePrepared(stmt, params)` (also on `Database` and `Transaction`). The better-sqlite3-style
-  `db.prepare(sql)` `Statement` above uses the same machinery internally — its plan is cached too.
+- **TypeScript** — `await session.prepare(sql)` → `await stmt.query(params)` or
+  `await stmt.execute(params)` for typed parameters. `stmt.get`, `stmt.all`, and `stmt.run` accept
+  native JavaScript parameters. `await stmt.batch(bindings)` amortizes messaging across repeated
+  executions without changing the surrounding transaction boundary. Finish with `await stmt.close()`.
 
 The cache is transparent and always correct: a schema change (`CREATE`/`DROP`/`ALTER`) invalidates
 it and the next execute re-plans; reusing a cached plan is by construction result- and
