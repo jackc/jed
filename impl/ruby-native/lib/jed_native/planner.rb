@@ -104,7 +104,7 @@ module JedNative
     end
 
     def statistics_codec
-      codec = FileFormat.new
+      codec = FileFormat.new(collation_key: ->(name, value) { resolve_collation(name).sort_key(value) })
       codec.instance_variable_set(:@ctypes, @types)
       codec
     end

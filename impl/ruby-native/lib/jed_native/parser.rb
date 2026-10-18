@@ -1413,6 +1413,7 @@ module JedNative
       end
       syntax('expected TABLE, VIEW or SEQUENCE') unless %w[table view].include?(object)
       result[:actions] = separated do
+        unsupported('ALTER OWNER and SET SCHEMA are not supported') if at?('owner') || at?('set') && at?('schema', 1)
         if accept('add')
           if table_constraint_start?
             { kind: :add_constraint, constraint: table_constraint }

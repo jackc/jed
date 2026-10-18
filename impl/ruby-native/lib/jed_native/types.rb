@@ -150,7 +150,11 @@ module JedNative
   class DateValue
     include Comparable
     attr_reader :days
-    def initialize(days) = (@days = days; freeze)
+    def initialize(days)
+      raise Error.new('22008', 'date out of range') unless days.is_a?(Float) || days.between?(-2_147_483_647, 2_147_483_646)
+      @days = days
+      freeze
+    end
     def self.from_parts(year, month, day)
       raise Error.new('22008', 'date field value out of range') unless (1..12).cover?(month)
       leap = (year % 4).zero? && (!(year % 100).zero? || (year % 400).zero?)
@@ -164,14 +168,27 @@ module JedNative
     end
     def self.parse(text)
       return text if text.is_a?(self)
+      return new(0) if text.to_s.strip.downcase == 'epoch'
       return new(Float::INFINITY) if text == 'infinity'
       return new(-Float::INFINITY) if text == '-infinity'
-      m = /\A\s*(\d+)-(\d{1,2})-(\d{1,2})(?:[ T]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?(?:\s+(BC|AD))?\s*\z/i.match(text.to_s)
+      source = text.to_s.strip
+      return new(Float::INFINITY) if %w[infinity +infinity].include?(source.downcase)
+      return new(-Float::INFINITY) if source.downcase == '-infinity'
+      m = /\A(?:(BC|AD)\s+)?(\d+)-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?\s*(Z|[+-]\d{1,2}(?::\d{2}(?::\d{2})?)?)?(?:\s+(BC|AD))?\z/i.match(source)
       raise Error.new('22007', 'invalid input syntax for date') unless m
-      year = m[1].to_i
+      year = m[2].to_i
       raise Error.new('22008', 'year zero is not supported') if year.zero?
-      year = 1 - year if m[4]&.upcase == 'BC'
-      from_parts(year, m[2].to_i, m[3].to_i)
+      year = 1 - year if (m[1] || m[10])&.upcase == 'BC'
+      hour, minute, second = m[5].to_i, m[6].to_i, m[7].to_i
+      fraction = m[8] && Decimal.parse(m[8])
+      if hour > 24 || minute > 59 || second > 59 || hour == 24 && (minute != 0 || second != 0 || fraction && !fraction.zero?)
+        raise Error.new('22008', 'date time field out of range')
+      end
+      if m[9] && m[9].upcase != 'Z'
+        hours, minutes, seconds = m[9][1..].split(':').map(&:to_i)
+        raise Error.new('22008', 'date offset out of range') if hours > 15 || (minutes || 0) > 59 || (seconds || 0) > 59
+      end
+      from_parts(year, m[3].to_i, m[4].to_i)
     end
     def parts
       z = @days + 719_468
@@ -206,18 +223,21 @@ module JedNative
     def self.parse(text, zoned: false)
       return new(text.micros, zoned: zoned) if text.is_a?(self)
       return new(text.days * DAY, zoned: zoned) if text.is_a?(DateValue)
-      return new(text == 'infinity' ? Float::INFINITY : -Float::INFINITY, zoned: zoned) if %w[infinity -infinity].include?(text)
+      special = text.to_s.strip.downcase
+      return new(special == '-infinity' ? -Float::INFINITY : Float::INFINITY, zoned: zoned) if %w[infinity +infinity -infinity].include?(special)
       m = /\A\s*(\d+-\d+-\d+)(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?\s*(Z|[+-]\d{1,2}(?::?\d{2})?|UTC)?\s*(BC|AD)?\s*\z/i.match(text.to_s)
       raise Error.new('22007', 'invalid input syntax for timestamp') unless m
       date = DateValue.parse(m[1] + (m[7] ? ' ' + m[7] : ''))
       hour, minute, second = m[2].to_i, m[3].to_i, m[4].to_i
-      raise Error.new('22008', 'timestamp field value out of range') if hour > 24 || minute > 59 || second > 60
+      raise Error.new('22008', 'timestamp field value out of range') if hour > 24 || minute > 59 || second > 59 || hour == 24 && (minute != 0 || second != 0 || m[5] && !Decimal.parse(m[5]).zero?)
       fraction = m[5] ? Decimal.parse(m[5]).round(6).coefficient : 0
       value = date.days * DAY + (hour * 3600 + minute * 60 + second) * 1_000_000 + fraction
-      if zoned && m[6] && (offset = /\A([+-])(\d{1,2})(?::?(\d{2}))?\z/.match(m[6]))
+      if m[6] && (offset = /\A([+-])(\d{1,2})(?::?(\d{2}))?\z/.match(m[6]))
+        raise Error.new('22008', 'timestamp offset out of range') if offset[2].to_i > 15 || offset[3].to_i > 59
         seconds = (offset[2].to_i * 60 + offset[3].to_i) * 60
-        value -= seconds * 1_000_000 * (offset[1] == '-' ? -1 : 1)
+        value -= seconds * 1_000_000 * (offset[1] == '-' ? -1 : 1) if zoned
       end
+      raise Error.new('22008', 'timestamp out of range') unless value.between?(-(1 << 63) + 1, (1 << 63) - 2)
       new(value, zoned: zoned)
     end
     def to_s
@@ -251,20 +271,27 @@ module JedNative
     def +(other) = self.class.new(@months + other.months, @days + other.days, @micros + other.micros)
     def -@ = self.class.new(-@months, -@days, -@micros)
     def -(other) = self + -other
-    def *(factor) = self.class.new((@months * factor).to_i, (@days * factor).to_i, (@micros * factor).round.to_i)
+    def *(factor)
+      factor = Decimal.parse(factor).to_r
+      months = @months * factor
+      days = @days * factor + (months - months.to_i) * 30
+      micros = @micros * factor + (days - days.to_i) * TimestampValue::DAY
+      rounded = (micros.abs + Rational(1, 2)).floor * (micros.negative? ? -1 : 1)
+      self.class.new(months.to_i, days.to_i, rounded)
+    end
     def to_s
       pieces = []
       years = @months.negative? ? -(-@months / 12) : @months / 12
       months = @months - years * 12
       pieces << "#{years} #{years == 1 ? 'year' : 'years'}" unless years.zero?
-      pieces << "#{months} #{months == 1 ? 'mon' : 'mons'}" unless months.zero?
-      pieces << "#{@days} #{@days == 1 ? 'day' : 'days'}" unless @days.zero?
+      pieces << "#{months.positive? && years.negative? ? '+' : ''}#{months} #{months == 1 ? 'mon' : 'mons'}" unless months.zero?
+      pieces << "#{@days.positive? && @months.negative? ? '+' : ''}#{@days} #{@days == 1 ? 'day' : 'days'}" unless @days.zero?
       if !@micros.zero? || pieces.empty?
         seconds, fraction = @micros.abs.divmod(1_000_000)
         hours, rest = seconds.divmod(3600)
         minute, second = rest.divmod(60)
         frac = fraction.zero? ? '' : '.' + fraction.to_s.rjust(6, '0').sub(/0+\z/, '')
-        pieces << "#{@micros.negative? ? '-' : (@months.negative? || @days.negative?) ? '+' : ''}#{format('%02d:%02d:%02d', hours, minute, second)}#{frac}"
+        pieces << "#{@micros.negative? ? '-' : (@days.negative? || @days.zero? && @months.negative?) ? '+' : ''}#{format('%02d:%02d:%02d', hours, minute, second)}#{frac}"
       end
       pieces.join(' ')
     end
@@ -321,7 +348,7 @@ module JedNative
       super(values)
       @type_name, @field_names = type_name, field_names
     end
-    def to_s = '(' + map { |v| v.nil? ? '' : Types.container_quote(Types.format(v), /[(),"\\\s]/) }.join(',') + ')'
+    def to_s = '(' + map { |v| v.nil? ? '' : Types.record_quote(v == true ? 't' : v == false ? 'f' : Types.format(v)) }.join(',') + ')'
   end
 
   class RangeValue
@@ -377,6 +404,7 @@ module JedNative
       @upper_inc == other.upper_inc ? 0 : (@upper_inc ? 1 : -1)
     end
     def contains?(value)
+      return true if value.is_a?(RangeValue) && value.empty
       return false if @empty
       return value.empty || (contains_bound?(value.lower, value.lower_inc, true) && contains_bound?(value.upper, value.upper_inc, false)) if value.is_a?(RangeValue)
       (@lower.nil? || Types.compare(value, @lower).positive? || (@lower_inc && Types.compare(value, @lower).zero?)) &&
@@ -473,6 +501,10 @@ end
         elsif value == false then number = 0
         elsif value.is_a?(Integer) then number = value
         else
+          prefix = /\A[+-]?[0-9](?:[0-9_]*[0-9])?/.match(value.to_s.strip)
+          if prefix && prefix[0].delete('_').to_i.abs > (1 << (INTEGER_BITS[type] - 1))
+            raise Error.new('22003', 'integer out of range')
+          end
           number = parse_integer_text(value.to_s)
         end
         check_integer(number, type)
@@ -513,21 +545,47 @@ end
         return false if %w[false f fa fal fals no n off of 0].include?(text)
         raise Error.new('22P02', 'invalid input syntax for boolean')
       when 'text'
-        format(value)
+        format(value, source_type)
       when 'bytea'
         return value if value.is_a?(Bytea)
         text = value.to_s
         if text.start_with?('\\x')
-          hex = text[2..].delete(" \t\n\r")
+          body = text[2..]
+          raise Error.new('22P02', 'invalid hexadecimal bytea') unless /\A(?:[ \t\n\r]*[0-9a-fA-F]{2})*[ \t\n\r]*\z/.match?(body)
+          hex = body.delete(" \t\n\r")
           raise Error.new('22P02', 'invalid hexadecimal bytea') unless hex.length.even? && /\A[0-9a-f]*\z/i.match?(hex)
           Bytea.new([hex].pack('H*'))
         else
-          raise Error.new('22P02', 'invalid bytea escape') if /\\(?!\\|[0-3][0-7]{2})/.match?(text)
-          Bytea.new(text.b.gsub(/\\(?:\\|[0-3][0-7]{2})/) { |s| s == '\\\\' ? '\\' : s[1..].to_i(8).chr })
+          bytes = +''.b
+          offset = 0
+          while offset < text.bytesize
+            byte = text.getbyte(offset)
+            offset += 1
+            if byte == 92
+              if text.getbyte(offset) == 92
+                bytes << 92
+                offset += 1
+              elsif (octal = text.byteslice(offset, 3)) && /\A[0-3][0-7]{2}\z/.match?(octal)
+                bytes << octal.to_i(8)
+                offset += 3
+              else
+                raise Error.new('22P02', 'invalid bytea escape')
+              end
+            else
+              bytes << byte
+            end
+          end
+          Bytea.new(bytes)
         end
       when 'uuid'
         return value if value.is_a?(UUID)
-        hex = value.to_s.delete('{}-')
+        text = value.to_s
+        if text.start_with?('{')
+          raise Error.new('22P02', 'invalid input syntax for uuid') unless text.end_with?('}')
+          text = text[1...-1]
+        end
+        raise Error.new('22P02', 'invalid input syntax for uuid') unless /\A[0-9a-f]{4}(?:[0-9a-f]{4}|-[0-9a-f]{4})*\z/i.match?(text)
+        hex = text.delete('-')
         raise Error.new('22P02', 'invalid input syntax for uuid') unless /\A[0-9a-f]{32}\z/i.match?(hex)
         UUID.new([hex[0, 8], hex[8, 4], hex[12, 4], hex[16, 4], hex[20, 12]].join('-').downcase)
       when 'date'
@@ -631,14 +689,14 @@ end
       when '<=', 'le' then return compare(a, b) <= 0
       when '>=', 'ge' then return compare(a, b) >= 0
       when '||'
-        return ArrayValue.new(a + b, element_type: a.element_type) if a.is_a?(ArrayValue) && b.is_a?(Array)
+        return ArrayValue.new(a + b, element_type: a.element_type) if a.is_a?(ArrayValue) && b.is_a?(ArrayValue)
         return ArrayValue.new(a.to_a + [b], element_type: a.element_type) if a.is_a?(ArrayValue)
         return ArrayValue.new([a] + b.to_a, element_type: b.element_type) if b.is_a?(ArrayValue)
         return a.concat_json(b) if a.respond_to?(:concat_json)
         return a.to_s + b.to_s
-      when '@>' then return a.respond_to?(:contains?) ? a.contains?(b) : b.all? { |v| a.include?(v) }
+      when '@>' then return a.respond_to?(:contains?) ? a.contains?(b) : b.all? { |v| !v.nil? && a.include?(v) }
       when '<@' then return binary('@>', b, a)
-      when '&&' then return a.is_a?(RangeValue) ? a.overlaps?(b) : a.any? { |v| b.include?(v) }
+      when '&&' then return a.is_a?(RangeValue) ? a.overlaps?(b) : a.any? { |v| !v.nil? && b.include?(v) }
       when '-|-' then return a.adjacent?(b)
       when '<<' then return a.strictly_left?(b) if a.is_a?(RangeValue)
       when '>>' then return b.strictly_left?(a) if a.is_a?(RangeValue)
@@ -650,7 +708,7 @@ end
         return op.start_with?('!') ? !result : result
       when '->', '->>', '#>', '#>>', '?', '?|', '?&' then return a.operator(op, b)
       end
-      if a.is_a?(TimestampValue) || a.is_a?(DateValue) || b.is_a?(IntervalValue)
+      if a.is_a?(TimestampValue) || a.is_a?(DateValue) || a.is_a?(IntervalValue) || b.is_a?(IntervalValue) || b.is_a?(DateValue) || b.is_a?(TimestampValue)
         return datetime_binary(op, a, b)
       end
       if a.is_a?(RangeValue) && %w[+ - *].include?(op)
@@ -724,12 +782,26 @@ end
       return text unless text.empty? || pattern.match?(text)
       '"' + text.gsub(/["\\]/) { |char| '\\' + char } + '"'
     end
+    def record_quote(text)
+      return text unless text.empty? || /[(),"\\\s]/.match?(text)
+      '"' + text.gsub(/["\\]/) { |char| char + char } + '"'
+    end
     def split_container(text, null_word: false)
       values, current, quoted, was_quoted, escaped = [], +'', false, false, false
-      text.each_char do |char|
+      position = 0
+      while position < text.length
+        char = text[position]
+        position += 1
         if escaped then current << char; escaped = false
         elsif char == '\\' then escaped = true
-        elsif char == '"' then quoted = !quoted; was_quoted = true
+        elsif char == '"'
+          if quoted && text[position] == '"'
+            current << '"'
+            position += 1
+          else
+            quoted = !quoted
+          end
+          was_quoted = true
         elsif char == ',' && !quoted
           value = was_quoted ? current : current.strip
           values << ((!was_quoted && (value.empty? || (null_word && value.upcase == 'NULL'))) ? nil : value)

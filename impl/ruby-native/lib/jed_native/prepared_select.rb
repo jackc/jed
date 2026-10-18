@@ -114,27 +114,53 @@ module JedNative
           charge(full_scan_pages(stored))
           charge_scan_payload(stored)
         end
-        candidates || stored[:rows]
+        candidates || (stored[:native_primary_entries] ? stored[:native_primary_entries].map { |_, ordinal| stored[:rows][ordinal] } : stored[:rows])
       else
         [[]]
       end
       charge(input.length) if stored
+      if @query_memory
+        gathered_owner = query_memory_owner
+        output_owner = query_memory_owner if query_memory_collect_result?
+        if !stored
+          query_memory_add(gathered_owner, MemorySchedule::ROW) unless input.empty? || plan.predicate&.kind == :literal && plan.predicate.value != true
+        elsif !plan.predicate && plan.projections.all? { |expression| expression.kind == :column }
+          gathered = plan.projections.map do |expression|
+            input.map do |row|
+              value = row[expression.value]
+              query_memory_add(gathered_owner, LogicalMemory.value_bytes(value, expression.type))
+              value
+            end
+          end
+        end
+      end
+      profile_checkpoint(:scan) if @explain_profile_frames
       output, sort_keys = [], []
       row_index = 0
       while row_index < input.length
         row = input[row_index]
         row_index += 1
-        next if plan.predicate && evaluate(plan.predicate, row) != true
+        filter_start = @cost if @explain_profile_frames
+        accepted = !plan.predicate || evaluate(plan.predicate, row) == true
+        profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
+        next unless accepted
         values = Array.new(plan.projections.length)
         column_index = 0
         while column_index < values.length
-          values[column_index] = evaluate(plan.projections[column_index], row)
+          values[column_index] = gathered ? gathered[column_index][row_index - 1] : evaluate(plan.projections[column_index], row)
           column_index += 1
         end
+        query_memory_add_row(output_owner, values, plan.columns) if output_owner
         output << values
         unless plan.orders.empty?
+          sort_start = @cost if @explain_profile_frames
           sort_keys << plan.orders.map { |kind, expression, _| kind == :output ? values[expression] : evaluate(expression, row) }
+          profile_accumulate(:sort, @cost - sort_start) if @explain_profile_frames
         end
+      end
+      if @explain_profile_frames
+        profile_inherit(:filter, :scan)
+        profile_inherit(:sort, plan.predicate ? :filter : :scan)
       end
       unless plan.orders.empty?
         indices = (0...output.length).to_a
@@ -151,12 +177,21 @@ module JedNative
         output = indices.map { |index| output[index] }
       end
       charge(output.length)
-      Relation.new(columns: plan.columns, rows: output)
+      profile_checkpoint(:root) if @explain_profile_frames
+      result = Relation.new(columns: plan.columns, rows: output)
+      query_memory_attach(result, output_owner) if output_owner
+      result
+    ensure
+      query_memory_release(gathered_owner) if gathered_owner && @query_memory
     end
 
     private
 
     def cacheable_select?(statement)
+      return false if @query_memory && !(statement[:order_by] || []).empty?
+      if @query_memory && query_memory_collect_result? && statement[:from]&.any?
+        return false if statement[:where] || !statement[:columns].all? { |projection| %i[column star].include?(projection[:expr][:kind]) }
+      end
       return false unless @outer.empty? && @ctes.empty?
       return false unless statement[:kind] == :select
       return false if statement[:with] || statement[:distinct] || statement[:distinct_on] || statement[:having] || statement[:limit] || statement[:offset]

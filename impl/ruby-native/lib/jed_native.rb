@@ -37,11 +37,40 @@ require_relative 'jed_native/indexes'
 require_relative 'jed_native/resolution'
 require_relative 'jed_native/logical_memory'
 require_relative 'jed_native/scalar_kernels'
+require_relative 'jed_native/scalar_work'
 require_relative 'jed_native/scans'
 require_relative 'jed_native/interval_scans'
+require_relative 'jed_native/auxiliary_scans'
+require_relative 'jed_native/hash_joins'
+require_relative 'jed_native/join_planner'
+require_relative 'jed_native/join_pushdown'
+require_relative 'jed_native/index_nested_loops'
+require_relative 'jed_native/streaming_select'
 require_relative 'jed_native/timezones'
 require_relative 'jed_native/range_constructors'
+require_relative 'jed_native/datetime_functions'
+require_relative 'jed_native/argument_resolution'
+require_relative 'jed_native/collations'
 require_relative 'jed_native/domains'
+require_relative 'jed_native/queryplan'
+require_relative 'jed_native/join_explain'
+require_relative 'jed_native/access_planning'
+require_relative 'jed_native/statistics_estimates'
+require_relative 'jed_native/create_table_as'
+require_relative 'jed_native/query_columns'
+require_relative 'jed_native/collation_metadata'
+require_relative 'jed_native/width_bucket'
+require_relative 'jed_native/temporal_modifiers'
+require_relative 'jed_native/datetime_arithmetic'
+require_relative 'jed_native/date_clock'
+require_relative 'jed_native/composite_values'
+require_relative 'jed_native/strict_context'
+require_relative 'jed_native/array_semantics'
+require_relative 'jed_native/function_resolution'
+require_relative 'jed_native/capabilities'
+require_relative 'jed_native/filter_predicates'
+require_relative 'jed_native/sorted_select'
+require_relative 'jed_native/query_memory'
 
 module JedNative
   VERSION = '0.0.0.experimental'
@@ -77,6 +106,7 @@ module JedNative
     alias execute_prepared query_prepared
 
     def execute_script(sql)
+      raise Error.new('54000', 'SQL input exceeds max_sql_length') if @max_sql_length.positive? && sql.bytesize > @max_sql_length
       statements = Parser.new(sql).parse
       if statements.any? { |s| %i[begin commit rollback savepoint release rollback_to].include?(s[:kind]) }
         raise Error.new('0A000', 'transaction control in execute_script')
@@ -111,8 +141,23 @@ module JedNative
     end
     def attach(name, source = :memory, mode = :read_write, **options) = @engine.attach(name, source, mode, **options)
     def detach(name) = @engine.detach(name)
+    def grant(privileges, object) = @engine.grant(privileges, object)
+    def revoke(privileges, object) = @engine.revoke(privileges, object)
+    def reset_privileges = @engine.reset_privileges
+    def default_privileges=(value)
+      @engine.default_privileges = value
+    end
+    def allow_ddl=(value)
+      @engine.allow_ddl = value
+    end
+    def allow_temp_ddl=(value)
+      @engine.allow_temp_ddl = value
+    end
     def max_cost=(value)
       @engine.max_cost = value
+    end
+    def max_query_memory_bytes=(value)
+      @engine.max_query_memory_bytes = value
     end
   end
 
@@ -131,7 +176,7 @@ module JedNative
 
   def self.file_database(path, create, options)
     require_relative 'jed_native/persistence'
-    engine_options = options.select { |key, _| %i[environment max_cost max_scalar_bytes max_sql_length lifetime_max_cost].include?(key) }
+    engine_options = options.select { |key, _| %i[environment max_cost max_scalar_bytes max_sql_length lifetime_max_cost allow_ddl allow_temp_ddl default_privileges max_query_memory_bytes].include?(key) }
     storage_options = options.reject { |key, _| engine_options.key?(key) }
     db = Database.new(**engine_options)
     db.engine.attach_storage(path: path, create: create, **storage_options)

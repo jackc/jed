@@ -44,6 +44,21 @@ module JedNative
       charge(primary_scan_units(stored, ordinals, columns).sum)
     end
 
+    def scan_rows(stored, ordinals, lookup: false)
+      reverse = @native_reverse_scan
+      iterator = Enumerator.new do |output|
+        sequence = reverse ? ordinals.reverse_each : ordinals.each
+        sequence.each do |ordinal|
+          if lookup
+            charge(stored.dig(:native_primary_metadata, :height) || 1)
+            charge_scan_payload(stored, [ordinal])
+          end
+          output << stored[:rows][ordinal]
+        end
+      end
+      @native_stream_scan ? iterator : iterator.to_a
+    end
+
     private
 
     def scan_column_inventory(statement, mutation: false)
@@ -96,6 +111,8 @@ module JedNative
           return [] if operator == 'is null'
           value = evaluate(source, [])
           return [] if value.nil?
+          value = normalize_scan_bound(key.type, value)
+          return [] if value == :unmatchable
           if (bits = Types::INTEGER_BITS[key.type]) && !value.between?(-(1 << (bits - 1)), (1 << (bits - 1)) - 1)
             return []
           end
@@ -113,6 +130,8 @@ module JedNative
         comparisons.each do |operator, source|
           value = evaluate(source, [])
           return [] if value.nil?
+          value = normalize_scan_bound(metadata[:types][i], value)
+          next if value == :unmatchable
           if (bits = Types::INTEGER_BITS[metadata[:types][i]])
             minimum, maximum = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
             if value < minimum
@@ -141,15 +160,16 @@ module JedNative
       ordinals = entries[first...last].map(&:last)
       charge(primary_page_count(stored, lower, upper))
       charge_scan_payload(stored, ordinals)
-      ordinals.map { |ordinal| stored[:rows][ordinal] }
+      scan_rows(stored, ordinals)
     end
 
-    def secondary_scan(stored, predicate)
+    def secondary_scan(stored, predicate, selected_name: nil, allow_full: false)
       indexes = stored[:native_secondary_indexes]
       return nil unless indexes && predicate
       terms = conjunctions(predicate)
       choices = []
       indexes.keys.sort_by(&:b).each do |name|
+        next if selected_name && name != selected_name
         details = stored[:native_secondary_metadata][name]
         next if details[:predicate] && !conjunctions(details[:predicate]).all? { |part| terms.any? { |term| same_key_expression?(part, term) } }
         equalities = []
@@ -166,6 +186,8 @@ module JedNative
               empty = true
               break
             end
+            value = normalize_scan_bound(expression.type, value) unless value.nil?
+            return [] if value == :unmatchable
             equalities << value
           else
             range = [ordinal, comparisons]
@@ -173,7 +195,7 @@ module JedNative
           end
         end
         return [] if empty
-        next if equalities.empty? && !range
+        next if equalities.empty? && !range && !allow_full
         prefix = secondary_prefix_key(stored, name, equalities)
         lower = prefix.empty? ? nil : prefix
         upper = prefix.empty? ? nil : prefix_successor(prefix)
@@ -182,6 +204,8 @@ module JedNative
           comparisons.each do |operator, value_expression|
             value = evaluate(value_expression, [])
             return [] if value.nil?
+            value = normalize_scan_bound(details[:types][ordinal], value)
+            next if value == :unmatchable
             key = secondary_prefix_key(stored, name, equalities + [value])
             if details[:orders][ordinal][0]
               operator = { '<' => '>', '<=' => '>=', '>' => '<', '>=' => '<=' }.fetch(operator)
@@ -212,9 +236,8 @@ module JedNative
         entries.empty? ? 0 : 1
       end
       ordinals = entries[first...last].map(&:last)
-      charge(pages + (last - first) * (stored.dig(:native_primary_metadata, :height) || 1))
-      charge_scan_payload(stored, ordinals)
-      ordinals.map { |ordinal| stored[:rows][ordinal] }
+      charge(pages)
+      scan_rows(stored, ordinals, lookup: true)
     end
 
     def conjunctions(expression)
@@ -235,9 +258,20 @@ module JedNative
         end
         next unless same_key_expression?(key, left) && %i[literal param outer].include?(right.kind)
         compatible = key.type == right.type || %w[null unknown].include?(right.type) || Types::INTEGER_BITS.key?(key.type) && Types::INTEGER_BITS.key?(right.type)
+        compatible ||= right.kind == :outer && (Types::INTEGER_BITS.key?(key.type) && right.type == 'decimal' || key.type == 'decimal' && Types::INTEGER_BITS.key?(right.type))
         next unless compatible
         [operator, right]
       end
+    end
+
+    def normalize_scan_bound(type, value)
+      if Types::INTEGER_BITS.key?(type) && value.is_a?(Decimal)
+        return :unmatchable unless value == value.trunc
+        integer = value.to_i
+        bits = Types::INTEGER_BITS[type]
+        return integer.between?(-(1 << (bits - 1)), (1 << (bits - 1)) - 1) ? integer : :unmatchable
+      end
+      type == 'decimal' && value.is_a?(Integer) ? Decimal.new(value) : value
     end
 
     def same_key_expression?(left, right)

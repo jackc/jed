@@ -35,6 +35,7 @@ module JedNative
       next_id = t[:next_rowid]
       changes, affected = [], {}
       inputs.each do |input|
+        values_start = @cost if @explain_profile_frames
         unless stmt[:default_values] || input.length == indices.length
           raise Error.new('42601', 'INSERT column count mismatch')
         end
@@ -53,6 +54,7 @@ module JedNative
           end
           assign(value, column.merge(nullable: true), expr)
         end
+        profile_accumulate(:values, @cost - values_start) if @explain_profile_frames
         validate_candidate(t, candidate, checks)
         target = conflict && conflict_row(arbiters, candidate, rows)
         if target
@@ -104,15 +106,21 @@ module JedNative
         charge_scan_payload(t)
       end
       selected = candidates&.to_h { |row| [row.object_id, true] }
+      profile_checkpoint(:scan) if @explain_profile_frames
       rows = t[:rows].map do |row|
         next row if selected && !selected[row.object_id]
         charge
-        next row if predicate && evaluate(predicate, row) != true
+        profile_accumulate(:scan, 1) if @explain_profile_frames
+        filter_start = @cost if @explain_profile_frames
+        accepted = !predicate || evaluate(predicate, row) == true
+        profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
+        next row unless accepted
         replacement = apply_assignments(t, row, row, assignments)
         validate_candidate(t, replacement, checks)
         changes << [row, replacement]
         replacement
       end
+      profile_inherit(:filter, :scan) if @explain_profile_frames
       validate_rows(t.merge(constraints: t[:constraints].reject { |c| c[:kind] == :check }), rows)
       changes.each { |_, replacement| validate_view_candidate(t, replacement) } if respond_to?(:validate_view_candidate, true)
       result = project_mutation(stmt, t, :update, changes, return_scope, return_exprs, return_columns)
@@ -137,6 +145,7 @@ module JedNative
         charge_scan_payload(t)
       end
       selected = candidates&.to_h { |row| [row.object_id, true] }
+      profile_checkpoint(:scan) if @explain_profile_frames
       t[:rows].each_with_index do |row, index|
         if selected && !selected[row.object_id]
           rows << row
@@ -144,13 +153,18 @@ module JedNative
           next
         end
         charge
-        if !predicate || evaluate(predicate, row) == true
+        profile_accumulate(:scan, 1) if @explain_profile_frames
+        filter_start = @cost if @explain_profile_frames
+        accepted = !predicate || evaluate(predicate, row) == true
+        profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
+        if accepted
           changes << [row, nil]
         else
           rows << row
           rowids << t[:rowids][index]
         end
       end
+      profile_inherit(:filter, :scan) if @explain_profile_frames
       result = project_mutation(stmt, t, :delete, changes, return_scope, return_exprs, return_columns)
       unless changes.empty?
         @tables[t[:name]] = t.merge(rows: rows, rowids: rowids)
@@ -205,7 +219,7 @@ module JedNative
     def mutation_checks(t)
       scope = table_columns(t)
       t[:constraints].select { |c| c[:kind] == :check }.sort_by { |c| c[:name].to_s.b }.map do |check|
-        compile_filter(check[:expr], scope)
+        compile_boolean_value(check[:expr], scope)
       end
     end
 
@@ -238,6 +252,7 @@ module JedNative
     def project_mutation(stmt, t, operation, changes, scope, expressions, columns)
       return Result.new(rows_affected: changes.length) unless expressions
       null_row = Array.new(t[:columns].length)
+      memory_owner = query_memory_owner if @query_memory
       rows = changes.map do |before, after|
         current = operation == :delete ? before : after
         context = current.dup
@@ -246,6 +261,7 @@ module JedNative
         end
         values = expressions.map { |expression| evaluate(expression, context) }
         charge
+        query_memory_add_row(memory_owner, values, columns) if @query_memory
         values
       end
       Result.new(columns: columns.map { |c| c[:name] }, column_types: columns.map { |c| c[:type] }, rows: rows, rows_affected: changes.length)
