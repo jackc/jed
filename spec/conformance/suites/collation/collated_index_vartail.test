@@ -6,7 +6,7 @@
 # its endpoints as sort keys, so it range-scans the index in collation order. Engagement is pinned
 # the cost way: each query reads only its range, strictly less than a full scan of the 30 rows.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.collate_column, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.set_returning, query.index_range, query.index_variable_width_tail, types.i32, types.text, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.collate_column, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.set_returning, query.index_range, query.index_variable_width_tail, query.or_in_point_lookup, query.interval_set, query.composite_key_set, expr.in_list, query.logical_connectives, types.i32, types.text, null.three_valued, resource.cost_metering
 
 # load-collation: unicode = collation/17.0.0/root.allkeys
 
@@ -68,3 +68,40 @@ SELECT id, name FROM cv WHERE name >= 'B' AND name <= 'x1'
 x1
 28
 B
+
+# An index tuple interval set steps over a collated slot too (cost.md §3 "Multi-column secondary
+# indexes"): a set on g with a final range on the collated name probes each g prefix.
+# cost: 43
+query IT rowsort
+SELECT id, name FROM cv WHERE g IN (0, 1) AND name > 'a' AND name < 'x'
+----
+26
+A
+27
+b
+28
+B
+
+# a set on the collated element itself, its points encoded as sort keys
+# cost: 27
+query IT rowsort
+SELECT id, name FROM cv WHERE g IN (1, 2) AND name IN ('B', 'x2', 'x3')
+----
+2
+x2
+28
+B
+
+# a leading collated range union on the single-column index
+# cost: 40
+query IT rowsort
+SELECT id, name FROM cv WHERE name < 'b' OR name > 'x8'
+----
+25
+a
+26
+A
+30
+z
+9
+x9
