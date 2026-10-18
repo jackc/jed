@@ -66,8 +66,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `regr_sxy`, `regr_slope`, `regr_intercept`, `regr_r2`. The variance/stddev family is exact over
   integer/decimal input (as in PostgreSQL) and uses PostgreSQL's `float8` algorithms over floats; the
   two-argument set widens any numeric arguments to `f64`, as PostgreSQL does. → [aggregates.md §23](spec/design/aggregates.md)
-- [ ] **Everyday scalar functions** — `array_to_string`, `string_to_array`, and a `gen_random_uuid` alias of `uuidv4` (through the
-  entropy seam). (`to_char` is tracked under `timestamp` below.) _(size: M)_
+- [ ] **Everyday scalar functions** — `array_to_string`, `string_to_array`, and a `gen_random_uuid`
+  alias of `uuidv4` (through the entropy seam). (`to_char` is tracked under `timestamp` below.) _(size: M)_
 - [x] **Named windows** — the `WINDOW w AS (…)` clause + `OVER w`, base-window extension, and the
   shared partition/sort pass, slice S5 of [window.md](spec/design/window.md) §5.3: PostgreSQL's
   whole-clause rules (a duplicate name `42P20`, every entry validated even when unreferenced,
