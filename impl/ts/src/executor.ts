@@ -12280,10 +12280,24 @@ export class Engine {
         ),
       );
       // The check option (views.md §15.6), after the row's own NOT NULL / CHECK / PK / UNIQUE
-      // checks and its index keys, before the batch FOREIGN KEY and EXCLUDE passes.
+      // checks and its index keys, before the batch EXCLUDE and FOREIGN KEY passes.
       evalViewChecks(viewChecks, row, env, meter);
       prepared.push({ key, row });
     }
+
+    // EXCLUDE constraints (spec/design/gist.md §7), before FK existence (PostgreSQL checks an
+    // exclusion constraint as each row is inserted, a foreign key at the end of the statement, so
+    // 23P01 wins over 23503; constraints.md §7) — a batch pass over the statement's END STATE: each new row must conflict with no STORED row (probe the backing index —
+    // a GiST tree whose leaf recheck is the full (expr_i op_i) conjunction, or for a btree exclusion,
+    // §7.2, the ordered index for an equal key) and no OTHER new row of this batch (pairwise — the
+    // index holds only stored rows). The NULL rule / empty-range exempt a row, as does a partial
+    // constraint's not-TRUE predicate (§7.1). Unmetered validation, before any write.
+    this.validateExclusions(
+      dbScope,
+      this.table(table.name) ?? table,
+      prepared.map((pr) => pr.row),
+      new Set<string>(),
+    );
 
     // FOREIGN KEY existence (constraints.md §6.4) — after all candidate rows are prepared, so the
     // check sees the statement's batch END STATE (a later row may supply an earlier row's parent
@@ -12322,19 +12336,6 @@ export class Engine {
         this.fkChildCheck(relation, table.columns, fk, probe, pr.row, fkTemp);
       }
     }
-
-    // EXCLUDE constraints (spec/design/gist.md §7), after FK existence — a batch pass over the
-    // statement's END STATE: each new row must conflict with no STORED row (probe the backing index —
-    // a GiST tree whose leaf recheck is the full (expr_i op_i) conjunction, or for a btree exclusion,
-    // §7.2, the ordered index for an equal key) and no OTHER new row of this batch (pairwise — the
-    // index holds only stored rows). The NULL rule / empty-range exempt a row, as does a partial
-    // constraint's not-TRUE predicate (§7.1). Unmetered validation, before any write.
-    this.validateExclusions(
-      dbScope,
-      this.table(table.name) ?? table,
-      prepared.map((pr) => pr.row),
-      new Set<string>(),
-    );
 
     // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
     meter.charge(COSTS.valueCompress * cunits);
@@ -12480,6 +12481,9 @@ export class Engine {
     }
     evalViewChecks(viewChecks, row, maintenanceEnv, meter);
 
+    // EXCLUDE before FOREIGN KEY, as the batch path (constraints.md §7).
+    this.validateExclusions(dbScope, this.table(table.name) ?? table, [row], new Set<string>());
+
     const relation = table.name;
     const { fks, temp: fkTemp } = this.targetForeignKeys(dbScope, table.name);
     for (const fk of fks) {
@@ -12502,8 +12506,6 @@ export class Engine {
       }
       this.fkChildCheck(relation, table.columns, fk, probe, row, fkTemp);
     }
-
-    this.validateExclusions(dbScope, this.table(table.name) ?? table, [row], new Set<string>());
 
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
@@ -13283,6 +13285,17 @@ export class Engine {
       }
     }
 
+    // EXCLUDE (gist.md §7) over the END STATE, before FOREIGN KEY as INSERT and UPDATE: each
+    // inserted row and each updated NEW row must conflict with no stored row the statement keeps (an
+    // updated row's old version is vacated) and with no other new row. A conflict a DO NOTHING
+    // arbiter covers was skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
+    this.validateExclusions(
+      dbScope,
+      table,
+      updates.map((u) => u.newRow).concat(inserts),
+      new Set<string>(updates.map((u) => u.key.join(","))),
+    );
+
     // FOREIGN KEY child-side (constraints.md §6.4): each inserted row, and each updated row that
     // assigned an FK local column, must reference an existing parent key — the committed parent
     // state plus (for a self-reference) the statement's end state.
@@ -13319,17 +13332,6 @@ export class Engine {
         this.fkChildCheck(relation, table.columns, fk, probe, row, fkTemp);
       }
     }
-
-    // EXCLUDE (gist.md §7) over the END STATE, as INSERT and UPDATE: each inserted row and each
-    // updated NEW row must conflict with no stored row the statement keeps (an updated row's old
-    // version is vacated) and with no other new row. A conflict a DO NOTHING arbiter covers was
-    // skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
-    this.validateExclusions(
-      dbScope,
-      table,
-      updates.map((u) => u.newRow).concat(inserts),
-      new Set<string>(updates.map((u) => u.key.join(","))),
-    );
 
     // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE — a
     // re-keyed row's references follow its key change as a re-keying UPDATE's do (constraints.md

@@ -1,0 +1,62 @@
+# A foreign-key failure against an exclusion-constraint failure (constraints.md §6.4/§7,
+# writable-cte.md §7, gist.md §7). PostgreSQL checks an exclusion constraint as each row is inserted
+# but a foreign key only at the end of the statement, so when one statement violates both, the
+# exclusion violation (23P01) is reported, whichever row or sub-statement carries which. Errors
+# verified against the live PostgreSQL 18 oracle.
+# requires: ddl.create_table, ddl.primary_key, ddl.foreign_key, ddl.exclusion_constraint, dml.insert, dml.insert_multi_row, dml.update, dml.insert_on_conflict, dml.returning, dml.with_clause, query.select, query.order_by, query.cte, query.cte_data_modifying, types.i32, types.range
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, pid i32 REFERENCES p, r int4range, EXCLUDE USING gist (r WITH &&))
+
+statement ok
+INSERT INTO p VALUES (1)
+
+statement ok
+INSERT INTO b VALUES (1, 1, '[1,5)'), (5, 1, '[50,60)')
+
+# One row violating both.
+statement error 23P01
+INSERT INTO b VALUES (2, 99, '[2,3)')
+
+# An earlier row's foreign key, a later row's exclusion constraint.
+statement error 23P01
+INSERT INTO b VALUES (2, 99, '[10,11)'), (3, 1, '[2,3)')
+
+# An UPDATE violating both.
+statement error 23P01
+UPDATE b SET pid = 99, r = '[1,2)' WHERE id = 5
+
+# An upsert's inserted row violating both, and an upsert's updated row violating both.
+statement error 23P01
+INSERT INTO b VALUES (6, 99, '[2,3)') ON CONFLICT (id) DO NOTHING
+
+statement error 23P01
+INSERT INTO b VALUES (5, 1, '[0,1)') ON CONFLICT (id) DO UPDATE SET pid = 99, r = '[1,2)'
+
+# A CTE's foreign key, the primary's exclusion constraint.
+statement error 23P01
+WITH c AS (INSERT INTO b VALUES (2, 99, '[10,11)') RETURNING id) INSERT INTO b VALUES (3, 1, '[2,3)')
+
+# A CTE's exclusion constraint, the primary's foreign key.
+statement error 23P01
+WITH c AS (INSERT INTO b VALUES (2, 1, '[2,3)') RETURNING id) INSERT INTO b VALUES (3, 99, '[20,21)')
+
+# A CTE's foreign key, a later CTE's exclusion constraint.
+statement error 23P01
+WITH c AS (INSERT INTO b VALUES (2, 99, '[10,11)')), d AS (INSERT INTO b VALUES (3, 1, '[2,3)')) SELECT 1
+
+# An UPDATE's foreign key, a CTE's exclusion constraint.
+statement error 23P01
+WITH c AS (INSERT INTO b VALUES (3, 1, '[2,3)')) UPDATE b SET pid = 99 WHERE id = 5
+
+# ... nothing changed.
+query II nosort
+SELECT id, pid FROM b ORDER BY id
+----
+1
+1
+5
+1

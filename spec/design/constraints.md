@@ -971,9 +971,12 @@ precedence and deterministic cost, so a specialized execution path must reproduc
 5. Compute the row's `value_compress` units, then evaluate every index's predicate/expression in
    catalog order to prepare its phase-2 entry prefix. A unique index is therefore evaluated once for
    its constraint probe and again for its maintained entry, as it is on the general path today.
-6. After every candidate reaches that point, validate foreign keys in name order against the
-   statement end state, then exclusion constraints in name order against stored rows and the other
-   candidates.
+6. After every candidate reaches that point, validate exclusion constraints in name order against
+   stored rows and the other candidates, then foreign keys in name order against the statement end
+   state. PostgreSQL checks an exclusion constraint as each row is inserted but a foreign key only at
+   the end of the statement, so when one statement violates both it reports `23P01`, whichever row
+   carries which; `UPDATE` and `ON CONFLICT` use the same order, and inside a data-modifying `WITH`
+   the foreign keys wait for the whole statement (§6.4).
 7. Charge the accumulated compression units and enforce the cost ceiling. Although the units are
    computed at step 5, this deferred guard is load-bearing: FK/exclusion errors win over `54P01`.
 8. Evaluate `RETURNING` over the validated candidates while the pre-statement read pin is still
