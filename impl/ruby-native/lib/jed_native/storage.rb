@@ -2,18 +2,25 @@
 
 require_relative "error"
 require_relative "file_format"
+require_relative "commit_plan"
+require_relative "free_list_plan"
 
 module JedNative
   # Experimental local-file host. It owns protocol-v2's crash-clean exclusive
   # lock and writes the shared v49 format. It does not serve page clients.
-  # Commits currently serialize a complete snapshot to fresh pages; recovery
-  # follows the validated-COW manifest contract, including adopted generations.
+  # Commits encode dirty B+tree paths, preserve clean pages, and reclaim obsolete
+  # generations under the validated-COW manifest protection contract.
   class Storage
     OPEN_PATHS = {}
     PATH_MUTEX = Mutex.new
     PAGE_SIZES = (8..16).map { |exponent| 1 << exponent }.freeze
 
     attr_reader :path, :page_size, :meta
+    def read_only? = @read_only
+    def max_storage_bytes=(bytes)
+      raise Error.new('22023', 'max_storage_bytes must be an integer') unless bytes.is_a?(Integer)
+      @max_storage_bytes = [bytes, 0].max
+    end
 
     def collation_key=(provider)
       @codec.instance_variable_set(:@collation_key, provider)
@@ -26,7 +33,7 @@ module JedNative
       @pid = Process.pid
       @sync = fsync
       @read_only = read_only
-      @max_storage_bytes = max_storage_bytes
+      self.max_storage_bytes = max_storage_bytes
       @mutex = Mutex.new
       @closed = false
       @poisoned = false
@@ -68,6 +75,8 @@ module JedNative
       @page_size ||= discover_page_size
       @snapshot = decode_file
       @meta = @snapshot.fetch(:meta)
+      @free_pages = @snapshot.fetch(:free_pages)
+      @live_at_compaction = @meta[:page_count] - @free_pages.length
       @needs_stabilization = !create
       @needs_directory_sync = !create
     rescue Error
@@ -99,17 +108,16 @@ module JedNative
     def commit(snapshot)
       @mutex.synchronize do
         ensure_open(write: true)
-        pages = build(snapshot, start_page: @meta.fetch(:page_count))
-        root = pages.byteslice(20, 4).unpack1("N")
-        live = pages.page_count - @meta.fetch(:page_count)
-        if @max_storage_bytes.positive? && live * @page_size > @max_storage_bytes
+        plan = plan_commit(snapshot)
+        pages, root, live = plan.pages, plan.root, plan.live
+        if @max_storage_bytes.positive? && live > @meta[:live] && live * @page_size > @max_storage_bytes
           raise Error.new("54P06", "database storage limit exceeded")
         end
         txid = @meta.fetch(:txid) + 1
         raise Error.new("54000", "transaction id overflow") if txid > 0xFFFF_FFFF_FFFF_FFFF
 
         slot = (@meta[:slot] || (@meta[:txid] & 1)) ^ 1
-        prepare_manifest(pages, txid, root, live, slot)
+        free_plan = FreeListPlan.new(@codec, plan, @page_size, @live_at_compaction, txid, slot, truncate: @sync)
         begin
           if @needs_directory_sync
             sync_directory if @sync
@@ -126,12 +134,23 @@ module JedNative
           end
           write_at(@file, pages.pages.fetch(slot), slot * @page_size)
           durable_sync(@file) if @sync
+          if @sync && @file.size > pages.page_count * @page_size
+            begin
+              @file.truncate(pages.page_count * @page_size)
+            rescue SystemCallError, IOError
+              # A completed commit is durable already. Excess trailing bytes
+              # are outside its logical high-water and may be trimmed later.
+            end
+          end
         rescue SystemCallError, IOError => error
           @poisoned = true
           raise Error.new("58030", error.message)
         end
         @meta = { txid: txid, root_page: root, page_count: pages.page_count,
-                  free_head: 0, live: live, slot: slot }
+                  free_head: free_plan.head, live: live, slot: slot, protected: free_plan.protected }
+        @page_ids = plan.adopt
+        @overflow_ids = plan.overflow_ids
+        @free_pages, @live_at_compaction = free_plan.free, free_plan.live_at_compaction
         @snapshot = snapshot.merge(meta: @meta)
         @meta
       end
@@ -149,6 +168,17 @@ module JedNative
 
     private
 
+    def plan_commit(snapshot)
+      CommitPlan.new(@codec, snapshot, @page_size, PageAllocator.new(@meta.fetch(:page_count), @free_pages),
+                     page_ids: @page_ids || {}.compare_by_identity, overflow_ids: @overflow_ids || {}.compare_by_identity)
+    rescue NotImplementedError => error
+      raise Error.new('0A000', error.message)
+    rescue Error
+      raise
+    rescue StandardError => error
+      raise Error.new('54000', "cannot encode database: #{error.message}")
+    end
+
     def build(snapshot, start_page: FileFormat::ROOT_PAGE)
       @codec.build_pages(snapshot[:types] || [], snapshot[:sequences] || [],
                          snapshot[:tables] || [], @page_size, snapshot[:collations] || [],
@@ -159,34 +189,6 @@ module JedNative
       raise
     rescue StandardError => error
       raise Error.new("54000", "cannot encode database: #{error.message}")
-    end
-
-    def prepare_manifest(pages, txid, root, live, slot)
-      references = pages.pages.keys.sort.filter_map do |page|
-        [page, @codec.crc64(pages.pages.fetch(page))] if page >= 2
-      end
-      inline_capacity = (@page_size - 64) / 12
-      chain_capacity = (@page_size - 32) / 12
-      remaining = [references.length - inline_capacity, 0].max
-      chain_count = (remaining + chain_capacity - 1) / chain_capacity
-      first_manifest = chain_count.zero? ? 0 : pages.page_count
-      pages.resize(pages.page_count + chain_count)
-      chain_digest = 0
-      chain_count.times do |ordinal|
-        page = first_manifest + ordinal
-        entries = references.slice(inline_capacity + ordinal * chain_capacity, chain_capacity) || []
-        following = ordinal + 1 < chain_count ? page + 1 : 0
-        payload = [txid, ordinal, 0].pack("Q>NN") + entries.flatten.pack("NQ>" * entries.length)
-        @codec.write_page(pages, @page_size, page, 8, entries.length, following, payload)
-        chain_digest = @codec.crc64([page].pack("N") + pages.pages.fetch(page), chain_digest)
-      end
-      @codec.write_meta(pages, @page_size, slot, @page_size, txid, root, pages.page_count, live)
-      offset = slot * @page_size
-      pages[offset + 36, 12] = [first_manifest, references.length, chain_count].pack("N3")
-      pages[offset + 48, 8] = [chain_digest].pack("Q>")
-      inline = references.first(inline_capacity)
-      pages[offset + 64, inline.length * 12] = inline.flatten.pack("NQ>" * inline.length)
-      pages[offset + 32, 4] = [@codec.meta_crc(pages.pages.fetch(slot))].pack("N")
     end
 
     def discover_page_size

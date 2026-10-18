@@ -110,7 +110,7 @@ module JedNative
     end
 
     def create_table(statement)
-      if default_collation != 'C' && statement[:columns]
+      if statement[:columns]
         statement = statement.merge(columns: statement[:columns].map do |column|
           collatable_type?(Types.normalize(column[:type])) && !column[:collation] ? column.merge(collation: default_collation) : column
         end)
@@ -139,7 +139,7 @@ module JedNative
       end
       if expression.kind == :column
         column = columns[expression.value]
-        label = column[:collation_label] || (column[:collation] ? collation_label(column[:collation]) : collation_label(default_collation, default: true) if collatable_type?(expression.type))
+        label = column[:collation_label] || (collation_label(column[:collation] || 'C') if collatable_type?(expression.type))
       elsif expression.kind == :outer
         column = @outer[-1 - expression.value[0]][0][expression.value[1]]
         label = column[:collation_label] || (collation_label(column[:collation]) if column[:collation])

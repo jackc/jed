@@ -700,6 +700,19 @@ end
       when '-|-' then return a.adjacent?(b)
       when '<<' then return a.strictly_left?(b) if a.is_a?(RangeValue)
       when '>>' then return b.strictly_left?(a) if a.is_a?(RangeValue)
+      when '&<', '&>'
+        return false if a.empty || b.empty
+        if op == '&<'
+          return true if b.upper.nil?
+          return false if a.upper.nil?
+          comparison = compare(a.upper, b.upper)
+          return comparison.negative? || comparison.zero? && (!a.upper_inc || b.upper_inc)
+        else
+          return true if b.lower.nil?
+          return false if a.lower.nil?
+          comparison = compare(a.lower, b.lower)
+          return comparison.positive? || comparison.zero? && (!a.lower_inc || b.lower_inc)
+        end
       when 'like', 'ilike', 'not like', 'not ilike'
         result = Functions.like(a, b, insensitive: op.include?('ilike'))
         return op.start_with?('not ') ? !result : result

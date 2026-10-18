@@ -12,6 +12,7 @@ module JedNative
     end
 
     def contextual_binary(operator, left, right)
+      return super if operator == '||'
       [[left, right], [right, left]].each do |constant, other|
         next unless constant.kind == :literal && constant.extra&.dig(:untyped) && constant.value.is_a?(String) && other.type == 'date'
         if (offset = date_clock_offset(constant.value))

@@ -57,10 +57,6 @@ module JedNative
         raise Error.new('0A000', 'a transaction may write at most one durable database')
       end
       publications.each do |domain, storage, state, signature|
-        skewed = @tables.values.find { |table| table[:database] == domain && !table[:collation_skew].to_a.empty? }
-        if skewed
-          raise Error.new('XX002', 'snapshot persistence requires an explicit collation upgrade before rebuilding skewed trees')
-        end
         storage.commit(state)
         if domain
           @attachments[domain][:storage_signature] = signature
@@ -77,7 +73,7 @@ module JedNative
       state = export_storage
       codec = statistics_codec
       codec.build_image(state[:types], state[:sequences], state[:tables],
-                        @storage&.page_size || 8192, state[:collations], views: state[:views])
+                        storage_page_size, state[:collations], views: state[:views])
     end
 
     def close
@@ -149,8 +145,8 @@ module JedNative
     end
 
     def invalidate_storage_profiles(domain)
-      # The append-only snapshot writer replaces every tree in the changed
-      # domain, even if a particular table's rows stayed unchanged.
+      # Imported scan profiles have served their purpose; the immutable native
+      # tree now carries the actual shape across subsequent edits and commits.
       @tables.transform_values! do |table|
         next table unless table[:database] == domain && table[:storage_tree_profile]
         table.reject { |key, _| %i[storage_tree_profile storage_tree_rows native_page_signature native_secondary_signature native_auxiliary_signature].include?(key) }
@@ -161,7 +157,7 @@ module JedNative
     def storage_signature(value)
       case value
       when Hash
-        value.reject { |key, _| %i[evaluate where].include?(key) }.transform_values { |item| storage_signature(item) }
+        value.reject { |key, _| %i[evaluate where physical_tree physical_gist tree_profile].include?(key) }.transform_values { |item| storage_signature(item) }
       when Array then value.map { |item| storage_signature(item) }
       else value
       end
@@ -203,7 +199,7 @@ module JedNative
         case constraint[:kind]
         when :check
           name = constraint[:name] || "#{table[:name]}_check#{position.zero? ? '' : position}"
-          checks << { name: name, expr: catalog_expression(constraint[:expr]), host_deps: [] }
+          checks << { name: name, expr: catalog_expression(constraint[:expr]), host_deps: constraint.dig(:storage_check, :host_deps) || [] }
         when :unique
           name = constraint[:name] || "#{table[:name]}_#{constraint[:columns].join('_')}_key"
           unless indexes.any? { |index| index[:name] == name }
@@ -239,6 +235,18 @@ module JedNative
       result = { name: table[:name], columns: columns, rows: rows, pk_order: pk_order,
                  checks: checks.sort_by { |check| check[:name].b }, indexes: indexes.sort_by { |index| index[:name].b },
                  fks: fks.sort_by { |fk| fk[:name].b }, exclusions: exclusions.sort_by { |exclusion| exclusion[:name].b } }
+      result[:physical_tree] = table[:native_primary_tree] if table.key?(:native_primary_tree)
+      result[:indexes].each do |index|
+        metadata = table[:native_secondary_metadata]&.[](index[:name]) || table[:native_auxiliary_indexes]&.[](index[:name])
+        if index[:kind] == 'gist'
+          index[:physical_gist] = metadata[:tree] if metadata
+          index[:physical_gist] = nil if !metadata && index[:root_page] == 0
+        elsif metadata && metadata.key?(:physical_tree)
+          index[:physical_tree] = metadata[:physical_tree]
+        elsif index[:tree_profile]
+          index[:physical_tree] = statistics_codec.tree_from_profile(index[:tree_profile], [])
+        end
+      end
       result[:rebuild_generation] = table[:index_rebuild_generation] if table[:index_rebuild_generation]
       if pk_order.empty? && table[:rowids]
         codec = FileFormat.new
@@ -256,6 +264,7 @@ module JedNative
     end
 
     def export_index(table, index)
+      return index[:storage_index].dup if index[:unparsed]
       elements = index[:elements] || (index[:columns] || []).map { |name| { expr: { kind: :column, name: name } } }
       scope = table_columns(table)
       cols = elements.map do |element|
@@ -329,7 +338,11 @@ module JedNative
         [type[:name], type[:fields].map { |field| import_column(field) }]
       end
       @tables = state[:tables].to_h do |stored|
-        columns = stored[:columns].map { |column| import_column(column) }
+        columns = stored[:columns].map do |column|
+          imported = import_column(column)
+          imported[:default][:detail] = "default of column #{column[:name].inspect} of table #{stored[:name].inspect}" if opaque_definition?(imported[:default])
+          imported
+        end
         constraints = []
         unless stored[:pk].empty?
           constraints << { kind: :primary_key, columns: stored[:pk].map { |index| columns[index][:name] } }
@@ -337,7 +350,8 @@ module JedNative
         stored[:checks].each do |check|
           raise Error.new('XX002', 'CHECK requires unavailable host functions') unless check[:host_deps].to_a.empty?
 
-          constraints << { kind: :check, name: check[:name], expr: Parser.new(check[:expr]).parse_expression }
+          constraints << { kind: :check, name: check[:name], storage_check: check,
+                           expr: parse_stored_expression(check[:expr], "check constraint #{check[:name].inspect} of table #{stored[:name].inspect}") }
         end
         stored[:fks].each do |fk|
           parent = state[:tables].find { |candidate| candidate[:name] == fk[:ref_table] }
@@ -368,20 +382,21 @@ module JedNative
         [stored[:name], { name: stored[:name], columns: columns, constraints: constraints, indexes: indexes,
                          rows: rows, rowids: rowids, next_rowid: (rowids.max || -1) + 1, temporary: false,
                          storage_rows: rows, storage_statistics: stored[:statistics], storage_tree_profile: stored[:tree_profile], storage_tree_rows: rows,
+                         storage_keys: stored[:storage_keys],
                          collation_skew: columns.filter_map { |column| column[:collation] if skewed_collations.include?(column[:collation]) }.uniq }]
       end
       @sequences = state[:sequences].to_h do |sequence|
         [sequence[:name], sequence.merge(value: sequence[:last_value], called: sequence[:is_called])]
       end
       @views = state[:views].to_h do |view|
-        query = Parser.new(view[:definition]).parse.first
+        query = parse_stored_query(view[:definition], "view #{view[:name].inspect}")
         dependencies = view[:deps].select { |dependency| dependency[:kind] < 2 }.to_h { |dependency| [dependency[:name], dependency[:columns]] }
         [view[:name], { kind: :create_view, name: view[:name], columns: view[:columns], query: query,
                        storage_view: view, storage_query: Marshal.load(Marshal.dump(query)),
                        dependencies: dependencies,
                        sequence_dependencies: view[:deps].select { |dependency| dependency[:kind] == 2 }.map { |dependency| dependency[:name] },
                        type_dependencies: view[:deps].select { |dependency| dependency[:kind] == 3 }.map { |dependency| dependency[:name] },
-                       defaults: (view[:defaults] || {}).transform_values { |sql| Parser.new(sql).parse_expression },
+                       defaults: (view[:defaults] || {}).transform_values { |sql| parse_stored_expression(sql, "default of view #{view[:name].inspect}") },
                        check_option: [nil, :local, :cascaded][view[:check_option] || 0],
                        options: { 'security_barrier' => !!view[:security_barrier], 'security_invoker' => !!view[:security_invoker] } }]
       end
@@ -397,7 +412,7 @@ module JedNative
                    column[:temporal]
                  end
       default = if column[:default_expr]
-                  Parser.new(column[:default_expr]).parse_expression
+                  parse_stored_expression(column[:default_expr], "default of column #{column[:name].inspect}")
                 elsif column.key?(:default) && column[:default] != :none
                   { kind: :literal, type: column[:type], value: from_storage_value(column[:type], column[:default]) }
                 end
@@ -410,13 +425,15 @@ module JedNative
       raise Error.new('XX002', 'index requires unavailable pinned timezone data') if index[:timezone_deps]
 
       elements = index[:cols].each_with_index.map do |column, position|
-        expression = column.is_a?(Hash) ? Parser.new(column[:expr]).parse_expression : { kind: :column, name: table[:columns][column][:name] }
+        expression = column.is_a?(Hash) ? parse_stored_expression(column[:expr], "index #{index[:name].inspect} of table #{table[:name].inspect}") : { kind: :column, name: table[:columns][column][:name] }
         desc, first = FileFormat::ORDER_SYMBOLS.fetch(index[:orders]&.at(position) || :asc)
         { expr: expression, direction: desc ? :desc : :asc, nulls: first ? :first : :last }
       end
-      { kind: :create_index, name: index[:name], table: table[:name], method: index[:kind], unique: index[:unique],
+      predicate = index[:predicate] ? parse_stored_expression(index[:predicate], "index #{index[:name].inspect} of table #{table[:name].inspect}") : nil
+      unparsed = opaque_definition?(predicate) || elements.any? { |element| opaque_definition?(element[:expr]) }
+      { kind: :create_index, name: index[:name], table: table[:name], method: index[:kind], unique: index[:unique], storage_index: index, unparsed: unparsed,
         elements: elements, columns: elements.map { |element| element[:expr][:name] }, storage_tree_profile: index[:tree_profile],
-        where: index[:predicate] ? Parser.new(index[:predicate]).parse_expression : nil }
+        where: predicate }
     end
 
     def export_view(name, view)

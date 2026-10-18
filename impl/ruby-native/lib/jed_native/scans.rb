@@ -90,6 +90,11 @@ module JedNative
           end
         end
         visit.call(statement)
+        unless mutation || (statement[:group_by] || []).empty?
+          analyzer = ParameterBindings.new(self, statement)
+          scope = query_input_columns(statement, @ctes.transform_values(&:columns), [], analyzer)
+          visit.call(resolve_group_nodes(statement, scope))
+        end
         stored[:constraints].each { |constraint| visit.call(constraint[:expr]) if constraint[:kind] == :check } if mutation
         result[stored[:name]] = ordinals.uniq.sort
       end
@@ -171,7 +176,7 @@ module JedNative
       indexes.keys.sort_by(&:b).each do |name|
         next if selected_name && name != selected_name
         details = stored[:native_secondary_metadata][name]
-        next if details[:predicate] && !conjunctions(details[:predicate]).all? { |part| terms.any? { |term| same_key_expression?(part, term) } }
+        next unless partial_predicate_implied?(details[:predicate], terms)
         equalities = []
         range = nil
         empty = false
@@ -276,6 +281,11 @@ module JedNative
 
     def same_key_expression?(left, right)
       return false unless left.is_a?(Expression) && right.is_a?(Expression)
+      if left.kind == :column && right.kind == :column && left.value == right.value &&
+         Types::INTEGER_BITS.key?(left.type) && Types::INTEGER_BITS.key?(right.type) &&
+         (left.extra&.dig(:native_body_type) || right.extra&.dig(:native_body_type))
+        return true
+      end
       return false unless [left.kind, left.type, left.value] == [right.kind, right.type, right.value]
       return false if left.kind == :cast && left.extra&.dig(:type_mod) != right.extra&.dig(:type_mod)
       a, b = left.args || [], right.args || []

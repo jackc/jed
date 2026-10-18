@@ -4,6 +4,12 @@ module JedNative
   # Native B-tree search inventory. Keys are the shared byte-order contract,
   # including nullable slots, direction, and the row storage-key suffix.
   module SecondaryIndexes
+    def storage_page_size(table = nil)
+      return 8192 if table && table[:temporary]
+      return @attachments&.dig(table[:database], :storage)&.page_size || 8192 if table && table[:database]
+      @storage&.page_size || @native_page_size || 8192
+    end
+
     def refresh_primary_indexes
       super
       refresh_primary_pages
@@ -61,7 +67,7 @@ module JedNative
 
     def refresh_primary_pages
       @tables.each do |name, stored|
-        page_size = @storage&.page_size || 8192
+        page_size = storage_page_size(stored)
         signature = [stored[:rows].object_id, stored[:columns].object_id, stored[:constraints].object_id, page_size]
         next if stored[:native_page_signature] == signature
         codec = statistics_codec
@@ -69,15 +75,16 @@ module JedNative
         ordinals = names.map { |column| stored[:columns].index { |item| item[:name] == column } }
         types = ordinals.map { |ordinal| stored[:columns][ordinal][:type] }
         row_positions = stored[:rows].each_with_index.to_h { |row, index| [row.object_id, index] }
-        rows = statistics_storage_rows(stored, codec)
-        entries = rows.map { |key, row| [key.freeze, row_positions.fetch(row.object_id)].freeze }.freeze
-        if stored[:storage_tree_profile] && stored[:storage_tree_rows].equal?(stored[:rows])
-          profile = stored[:storage_tree_profile]
+        rows = if stored[:storage_keys] && stored[:storage_tree_rows].equal?(stored[:rows])
+          stored[:storage_keys].zip(stored[:rows])
         else
-          shape = { columns: stored[:columns] }
-          cap = page_size - FileFormat::PAGE_HEADER
-          scan_units = {}
-          pairs = rows.map do |key, row|
+          statistics_storage_rows(stored, codec)
+        end
+        entries = rows.map { |key, row| [key.freeze, row_positions.fetch(row.object_id)].freeze }.freeze
+        shape = { columns: stored[:columns] }
+        cap = page_size - FileFormat::PAGE_HEADER
+        scan_units = {}
+        pairs = rows.map do |key, row|
             values = row.each_with_index.map { |value, index| statistics_value(stored[:columns][index][:type], value) }
             forms, comps, size = codec.plan_record(shape, key, values, cap)
             units = {}
@@ -94,13 +101,18 @@ module JedNative
             end
             scan_units[row_positions.fetch(row.object_id)] = units.freeze unless units.empty?
             [key, { key: key, row: values, table: shape, forms: forms, comps: comps, size: size }]
-          end
-          profile = compact_tree_profile(codec.build_tree(pairs, cap)).merge(scan_units: scan_units.freeze)
         end
+        tree = if stored[:storage_tree_profile] && stored[:storage_tree_rows].equal?(stored[:rows])
+          codec.tree_from_profile(stored[:storage_tree_profile], pairs)
+        else
+          codec.patch_tree(stored[:native_primary_tree], pairs, cap)
+        end
+        profile = compact_tree_profile(tree).merge(scan_units: scan_units.freeze)
         metadata = profile.merge(columns: ordinals.freeze, types: types.freeze,
                                  collations: ordinals.map { |ordinal| stored[:columns][ordinal][:collation] == 'C' ? nil : stored[:columns][ordinal][:collation] }.freeze).freeze
         @tables[name] = stored.merge(native_page_signature: signature, native_primary_metadata: metadata,
-                                    native_primary_entries: entries, native_primary_codec: codec, native_row_positions: row_positions.freeze)
+                                    native_primary_entries: entries, native_primary_codec: codec, native_row_positions: row_positions.freeze,
+                                    native_primary_tree: tree)
       end
     rescue RuntimeError, KeyError => error
       raise Error.new('54000', error.message)
@@ -342,11 +354,9 @@ module JedNative
             ordinals.freeze
           end
           entries.sort_by!(&:first)
-          profile = if !fresh && definition[:storage_tree_profile] && table[:storage_tree_rows].equal?(table[:rows])
-                      definition[:storage_tree_profile]
-                    else
-                      secondary_tree_profile(codec, entries)
-                    end
+          imported = definition[:storage_tree_profile] if !fresh && table[:storage_tree_rows].equal?(table[:rows])
+          previous = table[:native_auxiliary_indexes]&.dig(definition[:name], :physical_tree) unless fresh
+          profile = secondary_tree_profile(codec, entries, table, previous: previous, imported: imported)
           details.merge!(profile, entries: entries.freeze, postings: postings.freeze)
         else
           shape = { columns: table[:columns] }
@@ -404,13 +414,14 @@ module JedNative
         end }
     end
 
-    def secondary_tree_profile(codec, entries)
+    def secondary_tree_profile(codec, entries, table = nil, previous: nil, imported: nil)
       columns = { columns: [] }
       pairs = entries.map do |key, _|
         [key, { key: key, row: [], table: columns, forms: [], comps: [], size: key.bytesize }]
       end
-      page_size = @storage&.page_size || 8192
-      compact_tree_profile(codec.build_tree(pairs, page_size - FileFormat::PAGE_HEADER))
+      page_size = storage_page_size(table)
+      tree = imported ? codec.tree_from_profile(imported, pairs) : codec.patch_tree(previous, pairs, page_size - FileFormat::PAGE_HEADER)
+      compact_tree_profile(tree).merge(physical_tree: tree)
     end
 
     def compact_tree_profile(root)
@@ -451,11 +462,9 @@ module JedNative
           entries << [(prefix + row_keys.fetch(row.object_id)).freeze, ordinal].freeze
         end
         indexes[index[:name]] = entries.sort_by(&:first).freeze
-        profile = if !fresh && index[:storage_tree_profile] && table[:storage_tree_rows].equal?(table[:rows])
-                    index[:storage_tree_profile]
-                  else
-                    secondary_tree_profile(codec, indexes[index[:name]])
-                  end
+        imported = index[:storage_tree_profile] if !fresh && table[:storage_tree_rows].equal?(table[:rows])
+        previous = table[:native_secondary_metadata]&.dig(index[:name], :physical_tree) unless fresh
+        profile = secondary_tree_profile(codec, indexes[index[:name]], table, previous: previous, imported: imported)
         details.merge!(profile)
         details.freeze
       end

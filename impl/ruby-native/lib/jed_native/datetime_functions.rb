@@ -159,12 +159,15 @@ module JedNative
           end
           values = [TimestampValue.new(today, zoned: args.first.zoned), args.first]
         end
+        negative = values[0] < values[1]
+        values = values.reverse if negative
         values = values.map do |value|
           next value unless value.zoned
           context.charge
           TimestampValue.new(context.resolve_timezone.instant_to_local(value.micros))
         end
-        return age(*values)
+        result = age(*values, ordered: true)
+        return negative ? -result : result
       end
       super
     end

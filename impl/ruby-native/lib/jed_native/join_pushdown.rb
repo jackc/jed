@@ -5,7 +5,8 @@ module JedNative
   # non-trapping, relation-local conjuncts as rows enter the join.
   module JoinPushdown
     def materialize_from(sources, joins, predicate = nil)
-      rewritten = rewrite_join_inputs(sources, joins, predicate)
+      rewritten = @explain_runtime_plans && @explain_rewritten_from&.[](@native_scan_statement&.object_id)
+      rewritten ||= rewrite_join_inputs(sources, joins, predicate)
       rewritten ? super(*rewritten) : super
     end
 
@@ -13,12 +14,12 @@ module JedNative
       return if sources.empty? || sources.length > 1 && !joins.empty?
       return if joins.any? { |item| item[:using] || item[:natural] }
       inputs = sources + joins.map { |item| item[:relation] || item[:right] }
-      return if inputs.length < 2 || inputs.any? { |source| source[:kind] == :join_group }
+      return if inputs.any? { |source| source[:kind] == :join_group }
       labels = inputs.filter_map { |source| source[:alias] || (source[:kind] == :table && source[:name]) }
       raise Error.new('42712', 'table name specified more than once') unless labels.uniq.length == labels.length
       analyzer = ParameterBindings.new(self, nil)
       scopes = []
-      inputs.each { |source| scopes << analyzer.relation_columns(source, @outer.flat_map(&:first) + scopes.flatten) }
+      inputs.each { |source| scopes << query_source_columns(source, @ctes.transform_values(&:columns), @outer.flat_map(&:first) + scopes.flatten, analyzer) }
       scope = scopes.flatten
       offsets, offset = [], 0
       scopes.each { |columns| offsets << offset; offset += columns.length }
@@ -64,11 +65,18 @@ module JedNative
         end
       end
       inputs = inputs.each_with_index.map do |source, index|
-        source.merge(native_pushed_filter: join_conjunctions(pushed[index]),
+        source, remaining = push_into_body(source, pushed[index], scopes[index])
+        if inputs.length == 1
+          residual.concat(remaining)
+          remaining = []
+        end
+        source.merge(native_pushed_filter: join_conjunctions(remaining),
                      native_access_predicate: join_conjunctions(access[index]))
       end
       rewritten = rewritten.each_with_index.map do |item, index|
-        source = inputs[sources.length + index].merge(native_original_on: joins[index][:on], native_join_where: predicate, native_wide_outer: inputs.length > 2 && joins.any? { |edge| !%i[inner cross].include?(edge[:kind]) })
+        source = inputs[sources.length + index].merge(native_original_on: joins[index][:on], native_join_where: predicate,
+          native_fixed_hash: inputs.length == 2,
+          native_wide_outer: inputs.length > 2 && joins.any? { |edge| !%i[inner cross].include?(edge[:kind]) })
         item.merge(relation: source)
       end
       [inputs.first(sources.length), rewritten, join_conjunctions(residual)]
@@ -128,6 +136,10 @@ module JedNative
       when :column, :literal, :param then true
       when :binary then pushdown_syntax?(node[:left]) && pushdown_syntax?(node[:right])
       when :unary, :cast then pushdown_syntax?(node[:expr] || node[:operand])
+      when :in
+        !node[:query] && pushdown_syntax?(node[:expr] || node[:left]) && (node[:values] || node[:list] || []).all? { |child| pushdown_syntax?(child) }
+      when :between
+        [node[:expr], node[:low] || node[:lower], node[:high] || node[:upper]].all? { |child| pushdown_syntax?(child) }
       when :call then FunctionCatalog::SAFE_FUNCTIONS.key?(node[:name]) && (node[:args] || []).all? { |child| pushdown_syntax?(child) }
       else false
       end
@@ -153,8 +165,8 @@ module JedNative
           return false
         end
         if %w[< <= > >=].include?(expression.value)
-          label = expression.extra && expression.extra[:collation]
-          return false if label && label != 'C'
+          label = expression.instance_variable_get(:@native_collation)
+          return false if label && label.name != 'C'
         end
         args.all? { |arg| pushdown_safe?(arg) }
       else false
