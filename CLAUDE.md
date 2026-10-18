@@ -99,6 +99,11 @@ language, because hardening the spec was never the reason to add it.
    the browser build imports no native code. A separate experimental Node-API package (`impl/node`)
    wraps the whole Rust core for a shipping-performance comparison; it is a reach artifact, never a
    fourth conformance voice.
+   **Proposed follow-on, not implemented or ratified:** `spec/design/ts-runtime.md` explores an
+   async-only public JS API on browser and Node, off-thread execution, bounded worker transport,
+   cancellation and explicit page/crypto suspension. Keep one TS semantic core with platform
+   adapters; synchronous internal kernels remain useful. Existing APIs and shipping preferences
+   remain in force pending a separate migration decision; no production backend is selected here.
 
 **Beyond the differential set — best experience per language.** For every language past
 core #3 the question is not "how much new divergence does it surface" (usually little) but
