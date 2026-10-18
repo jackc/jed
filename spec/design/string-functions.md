@@ -571,15 +571,12 @@ variadic resolver and evaluate on its `RExpr::Variadic` / `reVariadic` / `variad
 the text PostgreSQL's output function produces — the result-cell rendering (a decimal keeps its
 scale, bytea is `\x` hex, jsonb is canonical, a row is `record_out`). The one difference from the
 `::text` cast (§5) is a boolean, which is `t`/`f` (PostgreSQL's `boolout`), not `true`/`false`.
-A boolean nested in an array or row keeps jed's container rendering (`{true,false}`, `(true,1)`),
-where PostgreSQL's `array_out` / `record_out` write `{t,f}` / `(t,1)`; that is a divergence of jed's
-container text output as a whole, not of these functions, and is left to it. A
-finite `timestamptz` at any depth renders in the session zone and charges one `timezone` unit before
+A boolean nested in an array or row is `t`/`f` too (`{t,f}`, `(t,1)`), as in PostgreSQL's
+`array_out` / `record_out`. A finite `timestamptz` at any depth renders in the session zone and charges one `timezone` unit before
 rendering. `format` renders only the arguments its specifiers select. A `*` width argument of an
 integer type is read directly (outside i32 is `22003`); any other type goes through the text → i32
-cast, so a non-integer is that cast's `22P02` / `22003`. That cast reads jed's integer-literal
-grammar, so a text width of `'0x10'` is `22P02` where PostgreSQL reads 16 (the same documented
-narrowing as `'0x10'::int`).
+cast, so a non-integer is that cast's `22P02` / `22003`. That cast accepts PostgreSQL 16+'s
+integer input forms, so a text width of `'0x10'` or `'1_0'` reads 16 or 10, as in PostgreSQL.
 
 **Volatility.** All three are `stable`, as PostgreSQL declares them, so none may appear in an index
 expression (`42P17`).

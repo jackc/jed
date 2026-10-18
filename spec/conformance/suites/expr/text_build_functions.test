@@ -181,6 +181,24 @@ SELECT format('[%*s]', '3', 'a')
 ----
 [  a]
 
+# a text width argument reads PostgreSQL 16+'s integer input forms: radix prefixes and _ separators
+query T nosort
+SELECT format('[%*s][%*s][%*s]', '0x4', 'a', ' -0b11 ', 'b', '1_0', 'c')
+----
+[   a][b  ][         c]
+
+# a boolean nested in an array or row is t/f, as PostgreSQL's array_out / record_out
+query T nosort
+SELECT format('%s %s %L', ARRAY[true, false, NULL], ROW(true, 1), ARRAY[true])
+----
+{t,f,NULL} (t,1) '{t}'
+
+query TT nosort
+SELECT concat(ARRAY[true], ROW(false, 'x')), concat_ws('|', ARRAY[false], ROW(true))
+----
+{t}(f,x)
+{f}|(t)
+
 # extra arguments are ignored
 query T nosort
 SELECT format('%s', 1, 2)
