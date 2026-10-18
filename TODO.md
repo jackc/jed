@@ -335,6 +335,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ compaction options — repack half-empty leaves (today nodes are kept as-is so costs are unchanged), change `page_size` during the rewrite, and stream the GiST R-tree pages instead of building one index's pages at a time. _(size: M)_
 - [x] **Blocking sort and hash-operator spill** — `ORDER BY`, hash `JOIN`, `GROUP BY`/aggregate and `DISTINCT` use bounded row/state buffers under `work_mem` on native file hosts. Ordered disk hash partitions preserve JOIN candidate order, aggregate fold order, first occurrence and exact costs; direct scan feeds and cost prepasses stream. Aggregate DISTINCT and growing ordered-set/hypothetical collections spill, with bounded external ordering and descriptor counts. Shared forced-spill corpus checks run in CI; `mise run bench:spill` checks wide-input results/costs and measures RSS. → [spill.md](spec/design/spill.md)
   - [ ] **Remaining query-memory owners** — Q1 (row buffers, result collectors), Q2 (operator state), Q3 (pending writes), and the storage limit (Q4a in-memory, Q4c file-backed — memory.md §8.7) have landed; remaining scalar kernels and host scratch support for OPFS/WASI remain. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
+- [ ] **Expression VM experiment** — evaluate independently lowered typed expression programs
+  against the recursive evaluators in all three cores, including exact cost/error boundaries and
+  end-to-end prepared/ad-hoc controls. Opt-in only; production adoption is evidence-gated.
+  See [expression-vm-experiment.md](spec/design/expression-vm-experiment.md).
 - [x] **Point-lookup, cold-read, and INSERT performance work** — the measured point-lookup,
   checksum/PAX/buffer-pool, concurrent-fault, and INSERT execution/tree slices have landed; final
   timings, allocation evidence, checksums, and decisions live in
