@@ -317,7 +317,7 @@ run = 'ruby scripts/sim.rb replay "${usage_trace}" --cores "${usage_cores}"'
 description = "Shrink a failing simulation trace to a minimal one (ddmin over steps)"
 usage = '''
 arg "<trace>" help="The failing .sim file"
-arg "[core]" default="go" help="The core it fails on"
+arg "[core]" default="go" help="The core it fails on, or two (go,rust) whose disagreement to shrink"
 '''
 run = 'ruby scripts/sim.rb shrink "${usage_trace}" --core "${usage_core}"'
 

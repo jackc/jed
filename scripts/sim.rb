@@ -10,6 +10,7 @@
 #   ruby scripts/sim.rb regress [--cores go,rust,ts]          # the committed regression corpus
 #   ruby scripts/sim.rb replay TRACE.sim [--cores ...]         # rerun one trace, print transcripts
 #   ruby scripts/sim.rb shrink TRACE.sim --core go [-o OUT]    # ddmin over steps
+#   ruby scripts/sim.rb shrink TRACE.sim --core go,rust        # ... keeping a cross-core disagreement
 #
 # Results land in bench/results/sim/<stamp>/: every trace, each core's transcript, and a crash
 # image for a failed recovery. The mise tasks sim:sweep / sim:regress / sim:replay wrap this.
@@ -256,13 +257,45 @@ module Sim
     run_core(core, [path], out)[File.basename(path, ".sim")]
   end
 
+  # The class of a cross-core disagreement: the first pair of transcript lines that differ, with
+  # step indexes and numbers removed as violation_class does. nil when the transcripts agree.
+  def disagreement_class(out, tag, cores)
+    a, b = cores.map { |c| (transcript(out, "shrink-#{tag}", c) || "").lines }
+    i = (0...[a.size, b.size].max).find { |k| a[k] != b[k] } or return nil
+    violation_class("#{a[i]} | #{b[i]}".gsub(/"i":\d+,/, ""))
+  end
+
+  # Shrink a disagreement between two cores (`--core go,rust`): a candidate is kept while their
+  # transcripts still first differ the same way.
+  def shrink_disagreement(cores, header, steps, out)
+    run = lambda do |candidate, tag|
+      Dir[File.join(out, "shrink-#{tag}.*.jsonl")].each { |f| File.delete(f) }
+      cores.each { |c| run_one(c, header, candidate, out, tag) }
+      disagreement_class(out, tag, cores)
+    end
+    target = run.call(steps, "base") or abort "sim shrink: #{cores.join(' and ')} agree; nothing to shrink"
+    puts "sim shrink: #{steps.size} steps, target #{target.inspect}"
+    tries = 0
+    steps = ddmin(steps, lambda { |candidate|
+      tries += 1
+      run.call(candidate, "try") == target
+    })
+    [steps, tries]
+  end
+
   def shrink(opts, trace)
     core = opts[:core] or abort "sim shrink: --core is required"
-    build([core])
+    cores = core.split(",")
+    abort "sim shrink: --core takes one core, or two whose disagreement to shrink" if cores.size > 2
+    build(cores)
     out = opts[:out] || stamp_dir("shrink")
     lines = File.readlines(trace, chomp: true).reject { |l| l.strip.empty? }
     header = lines.take_while { |l| l.start_with?("#") }
     steps = lines.drop(header.size)
+    if cores.size == 2
+      steps, tries = shrink_disagreement(cores, header, steps, out)
+      return write_shrunk(opts, header, steps, tries)
+    end
     base = run_one(core, header, steps, out, "base")
     abort "sim shrink: the trace passes on #{core}; nothing to shrink" if base.nil? || base["status"] == "pass"
     target = violation_class(base["violation"])
@@ -273,7 +306,10 @@ module Sim
       r = run_one(core, header, candidate, out, "try")
       r && r["status"] == "fail" && violation_class(r["violation"]) == target
     end
-    steps = ddmin(steps, fails)
+    write_shrunk(opts, header, ddmin(steps, fails), tries)
+  end
+
+  def write_shrunk(opts, header, steps, tries)
     result = (header + steps).join("\n") + "\n"
     puts "sim shrink: #{steps.size} steps after #{tries} runs"
     if opts[:output]
@@ -319,7 +355,7 @@ if $PROGRAM_NAME == __FILE__
     o.on("--seeds RANGE", "e.g. 1..200") { |v| opts[:seeds] = Sim.parse_seeds(v) }
     o.on("--steps N", Integer) { |v| opts[:steps] = v }
     o.on("--cores LIST", "comma-separated subset of go,rust,ts") { |v| opts[:cores] = v.split(",") }
-    o.on("--core NAME", "the core to shrink against") { |v| opts[:core] = v }
+    o.on("--core NAME", "the core to shrink against, or two (go,rust) to shrink their disagreement") { |v| opts[:core] = v }
     o.on("--jobs N", Integer, "runner processes per core") { |v| opts[:jobs] = v }
     o.on("--out DIR", "results directory") { |v| opts[:out] = v }
     o.on("-o FILE", "shrink: write the minimal trace here") { |v| opts[:output] = v }
