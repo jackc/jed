@@ -29,6 +29,10 @@ files in the same change.
 - Rust wrappers are acceptable for later language packages when that gives the
   best user experience, but wrappers echo Rust and are not independent
   conformance voices.
+- The proposed browser/Node runtime (`spec/design/ts-runtime.md`) uses an async-only public JS
+  API, off-thread execution and one TS semantic core with platform adapters, retaining synchronous
+  internal kernels. It is not implemented or ratified; existing APIs and shipping preferences
+  remain in force pending a separate migration decision. No production backend is selected.
 - SQL is the primary access path and every built-in capability must be reachable
   through SQL, while storage must keep room for non-SQL access paths later.
 

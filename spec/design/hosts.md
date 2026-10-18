@@ -208,6 +208,10 @@ for the normative bundle and ownership rules.
 
 ## 5. The OPFS host (the build target)
 
+The [proposed browser/Node runtime](ts-runtime.md) adds worker scheduling and explicit internal
+suspension for async crypto while retaining the OPFS byte device. It is not implemented;
+the following describes the current host and synchronous engine integration.
+
 The browser host backs the database on the Origin Private File System via a
 `FileSystemSyncAccessHandle` — the one browser API that offers **synchronous** file I/O
 (`read(buf, {at})`, `write(buf, {at})`, `truncate(n)`, `getSize()`, `flush()`), which is what
