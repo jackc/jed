@@ -592,13 +592,14 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   rest** can be added later **without a reshape**. Not built now; the only present requirement
   is that nothing foreclose it (don't assume page bytes are plaintext-comparable on disk) —
   already satisfied (hosts keep page bytes opaque). **Designed in `spec/design/encryption.md`:**
-  a page codec **in the core above the block seam** (not a per-host duty), a standardized AEAD
-  under a **deterministic `(page_index, txid)` nonce** that keeps the §8 cross-core
-  byte-identity (the asymmetry with LZ4 — AEADs *are* standardized, so a library agrees
-  byte-for-byte), the auth tag *closing* the tamper gap the `format_version` 7 CRC leaves open,
-  and the key as a handle setting the engine never persists. When it lands, the crypto comes
-  from a **vetted library, never a hand-rolled algorithm** — the dependency policy (§14), the
-  build gate.
+  a page codec **in the core above the block seam**, standardized AEAD, and envelope encryption:
+  a random data key is stored only wrapped by a host key or passphrase-derived wrapping key.
+  Credential changes rewrap bounded metadata; data-key rotation rewrites all live pages.
+  `(page_index, txid)` alone does **not** guarantee nonce uniqueness across failed commits,
+  restores or writable copies; the nonce/domain protocol remains open, with security preceding
+  unconditional file byte identity. Identical crypto inputs still require identical bytes.
+  Vetted libraries expose safe APIs; explicitly reviewed assembly/intrinsics behind those APIs
+  are permitted under §14, while engine code stays safe and Go stays free of cgo/external FFI.
 - Writable commits persist only changed database domains. Empty/read-only work in a writable
   transaction and temporary-only changes do not rewrite main, advance its txid, or issue a
   durability barrier. Attachment-only commits publish their roots independently of main; zero-row
@@ -1311,11 +1312,14 @@ standing maintenance and supply-chain commitment across every core; it is **neve
 an agent's own initiative — same spirit as the heavy-operation rule in §12. Propose it, name
 which clause above justifies it and why, and wait for a yes.
 
-**Guardrails that bind every dependency, no exceptions:**
+**Guardrails that bind every dependency (bounded approved crypto backends below):**
 
-- **Memory safety (§13).** A dependency must not introduce an `unsafe` / cgo / FFI or
-  otherwise non-memory-safe path. The Go core stays **pure Go — no cgo, no FFI** (§2); a
-  dependency does not relax that.
+- **Memory safety (§13).** Engine code and dependency public APIs remain memory-safe. Vetted
+  crypto backends may use explicitly reviewed assembly/hardware intrinsics and narrowly approved
+  Rust `unsafe` internals behind safe APIs. Review the exact backend and supported targets; this
+  is not permission for arbitrary unsafe code. Evaluate constant-time behavior separately. The
+  Go core stays **free of cgo and external C-library FFI** (§2); Go-library assembly does not
+  introduce either. Every new dependency still requires explicit human confirmation.
 - **Determinism + cross-core byte-identity (§8).** A dependency may never leak
   nondeterminism (iteration order, float formatting, locale/library-version-sensitive
   behavior — the ICU-collation trap in [spec/design/types.md](spec/design/types.md) §11 is
@@ -1336,3 +1340,9 @@ exact-pinned `@noble/hashes = 2.4.0`. That is the TS core's first runtime depend
 JavaScript with no transitive dependencies, synchronous in Node and the browser alike. `sha2`'s
 SHA-NI/SIMD backends use `unsafe` intrinsics, chosen at runtime by `cpufeatures`; its portable
 fallback is safe Rust. That use of `unsafe` was accepted knowingly, and nothing else inherits it.
+
+**Approved AEAD benchmark dependencies (2026-10-17, clause 3).** The isolated `bench/aead/`
+experiment may use exact-pinned RustCrypto `aes-gcm` / `chacha20poly1305`, Go
+`golang.org/x/crypto/chacha20poly1305`, and TypeScript `@noble/ciphers`, with lockfiles/checksums.
+This approval includes their standard accelerated backends for measurement only; it selects no
+production cipher or engine dependency. See `bench/aead/README.md` for versions and methodology.

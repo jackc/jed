@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Compare browser WebCrypto, pure JS, and JS-wrapped Rust/WASM AEAD"
+require 'json'
+require 'open3'
+require_relative '../../scripts/lib/tasks'
+include Tasks
+dir = File.expand_path(ENV.fetch('JED_AEAD_BROWSER_RESULTS', "bench/results/aead-browser-#{stamp}-#{Process.pid}"))
+FileUtils.mkdir_p(dir)
+base = File.join(ROOT, 'bench/aead')
+wasm_env = { 'CARGO_PROFILE_RELEASE_LTO'=>'true', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS'=>'1', 'CARGO_PROFILE_RELEASE_STRIP'=>'symbols' }
+wasm_env['RUSTFLAGS'] = '-C target-feature=+simd128' if ENV['JED_AEAD_WASM_SIMD']=='1'
+sh 'cargo', 'build', '--release', '--lib', '--target', 'wasm32-wasip1', '--locked', '--offline', '--manifest-path', "#{base}/rust/Cargo.toml", env: wasm_env
+esbuild = ENV['JED_ESBUILD'] || Dir.glob('/home/jack/.npm/_npx/*/node_modules/esbuild/bin/esbuild').first
+playwright = ENV['JED_PLAYWRIGHT'] || ["#{ROOT}/impl/ts/node_modules/playwright-core/index.mjs", '/home/jack/dev/jed/impl/ts/node_modules/playwright-core/index.mjs'].find { |p| File.file?(p) }
+abort 'Set JED_ESBUILD and JED_PLAYWRIGHT to existing tools; no downloads performed' unless esbuild && playwright
+sh esbuild, "#{base}/browser/probe.js", '--bundle', '--format=esm', '--platform=browser', "--outfile=#{dir}/probe.js"
+FileUtils.cp("#{base}/rust/target/wasm32-wasip1/release/jed_aead_bench.wasm", "#{dir}/crypto.wasm")
+allowed = File.read('/proc/self/status')[/^Cpus_allowed_list:\s*(.+)$/, 1]
+cpu = ENV.fetch('JED_AEAD_CPU', allowed.split(/[,-]/).first)
+sh 'taskset', '-c', cpu, 'node', "#{base}/browser/run.mjs", dir, playwright, env: { 'JED_AEAD_CPU' => cpu }
+puts "Browser AEAD results: #{dir}/results.json"

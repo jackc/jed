@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Install the explicitly approved, locked AEAD benchmark dependencies"
+
+require_relative "../../scripts/lib/tasks"
+include Tasks
+base = File.join(ROOT, "bench/aead")
+sh "cargo", "fetch", "--locked", "--manifest-path", "#{base}/rust/Cargo.toml"
+sh "go", "mod", "download", chdir: "#{base}/go"
+sh "npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", chdir: "#{base}/ts"

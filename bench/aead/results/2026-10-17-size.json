@@ -1,0 +1,316 @@
+{
+  "metadata": {
+    "date_utc": "2026-10-17T23:24:12Z",
+    "os": "Linux x86_64",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "go": "go version go1.27.1 linux/amd64",
+    "node": "v26.10.0",
+    "esbuild": "0.28.2",
+    "rust_profile": "release, strip=true; default opt-level=3, no explicit LTO",
+    "go_flags": "CGO_ENABLED=0 -trimpath -ldflags=-s -w",
+    "caveat": "jed embedding executes runtime SQL. AEAD called separately, not integrated into pager. No KDF, wrapping or file codec. JS library exports only, not complete jed bundle.",
+    "probe_driver_sha256": "a697777693d5f499c7b97e88f7c4a393a2c75bad7b74f31c7e940f55b3d3c06d",
+    "revision": "172e3b0ae9f604f5284147d77ac7eb14b07917a7",
+    "raw_directory": "bench/results/aead-size-20261017-232328-21",
+    "source_sha256": {
+      "bench/results/aead-size-20261017-232328-21/rust/src/main.rs": "b8bf766e4c4de73862ec12cd9b65859ff7f6f6c0b7a5a082bb44b0d19a7ad58b",
+      "bench/results/aead-size-20261017-232328-21/rust/Cargo.lock": "76ffb37983b0758c600a6a1bfaa66404899831a7202353e1f224f6cb84c93acc",
+      "bench/results/aead-size-20261017-232328-21/rust/Cargo.toml": "258506b97b9cae7dad5634e6ecbf0521a4cdd083ab69666863920bff20d24038",
+      "bench/results/aead-size-20261017-232328-21/go/aes.go": "8bfd4a50df697c586d2b6cdb4160932cf193a7e2e934f1bc89495bd3782059d0",
+      "bench/results/aead-size-20261017-232328-21/go/chacha.go": "39b87887098ff496079c3764c25b7dcb990435aec18c23787e0677634cff4591",
+      "bench/results/aead-size-20261017-232328-21/go/main.go": "b15b33cbab6834cb6c8d0dd18fa879050011572890aa51abd0f5a95d7c5f1983",
+      "bench/results/aead-size-20261017-232328-21/go/go.mod": "77315941d6ec5061c977f3904caa351c227e8760bf83657ec5e14cdc8717f05f",
+      "bench/results/aead-size-20261017-232328-21/go/go.sum": "29025c5d36db542e961df27da21810c6901df208558510cbc2793a51b1901450",
+      "bench/results/aead-size-20261017-232328-21/js/aes.js": "d69fd67416c20ffa8bac960de14c3d56445eec9c2c9666f2d90d203e0b58ff4a",
+      "bench/results/aead-size-20261017-232328-21/js/base.js": "e947c250bc0757a28c0c6985e169ed80be8432e2d020ee6a53d868de65601fbf",
+      "bench/results/aead-size-20261017-232328-21/js/both.js": "bf9643a92462743d5efd81b07f5d6577dc3ac52db0697d92408924f76bc07a04",
+      "bench/results/aead-size-20261017-232328-21/js/chacha.js": "dc8a8a010362fefce8a88af9f1282bfc7ba2dd95d1f0f8a6d9410808e535a673"
+    }
+  },
+  "rows": [
+    {
+      "lang": "rust",
+      "variant": "base",
+      "bytes": 8292528,
+      "delta_bytes": 0
+    },
+    {
+      "lang": "rust",
+      "variant": "aes",
+      "bytes": 8342888,
+      "delta_bytes": 50360
+    },
+    {
+      "lang": "rust",
+      "variant": "chacha",
+      "bytes": 8324536,
+      "delta_bytes": 32008
+    },
+    {
+      "lang": "rust",
+      "variant": "both",
+      "bytes": 8371344,
+      "delta_bytes": 78816
+    },
+    {
+      "lang": "go",
+      "variant": "base",
+      "bytes": 9330848,
+      "delta_bytes": 0
+    },
+    {
+      "lang": "go",
+      "variant": "aes",
+      "bytes": 9384096,
+      "delta_bytes": 53248
+    },
+    {
+      "lang": "go",
+      "variant": "chacha",
+      "bytes": 9404576,
+      "delta_bytes": 73728
+    },
+    {
+      "lang": "go",
+      "variant": "both",
+      "bytes": 9453728,
+      "delta_bytes": 122880
+    },
+    {
+      "lang": "js-minified",
+      "variant": "base",
+      "bytes": 31,
+      "delta_bytes": 0
+    },
+    {
+      "lang": "js-gzip",
+      "variant": "base",
+      "bytes": 51,
+      "delta_bytes": 0
+    },
+    {
+      "lang": "js-minified",
+      "variant": "aes",
+      "bytes": 8790,
+      "delta_bytes": 8759
+    },
+    {
+      "lang": "js-gzip",
+      "variant": "aes",
+      "bytes": 3815,
+      "delta_bytes": 3764
+    },
+    {
+      "lang": "js-minified",
+      "variant": "chacha",
+      "bytes": 11098,
+      "delta_bytes": 11067
+    },
+    {
+      "lang": "js-gzip",
+      "variant": "chacha",
+      "bytes": 4749,
+      "delta_bytes": 4698
+    },
+    {
+      "lang": "js-minified",
+      "variant": "both",
+      "bytes": 16862,
+      "delta_bytes": 16831
+    },
+    {
+      "lang": "js-gzip",
+      "variant": "both",
+      "bytes": 7004,
+      "delta_bytes": 6953
+    }
+  ],
+  "dependencies": {
+    "aes-gcm": {
+      "packages": 21,
+      "download_bytes": 1592555,
+      "missing_archives": 0,
+      "packages_list": [
+        [
+          "aes-gcm",
+          "0.11.1"
+        ],
+        [
+          "aead",
+          "0.6.1"
+        ],
+        [
+          "crypto-common",
+          "0.2.2"
+        ],
+        [
+          "getrandom",
+          "0.4.3"
+        ],
+        [
+          "cfg-if",
+          "1.0.5"
+        ],
+        [
+          "libc",
+          "0.2.191"
+        ],
+        [
+          "rand_core",
+          "0.10.1"
+        ],
+        [
+          "hybrid-array",
+          "0.4.15"
+        ],
+        [
+          "typenum",
+          "1.20.1"
+        ],
+        [
+          "inout",
+          "0.2.4"
+        ],
+        [
+          "aes",
+          "0.9.3"
+        ],
+        [
+          "cipher",
+          "0.5.2"
+        ],
+        [
+          "block-buffer",
+          "0.12.1"
+        ],
+        [
+          "cpubits",
+          "0.1.1"
+        ],
+        [
+          "cpufeatures",
+          "0.3.1"
+        ],
+        [
+          "ctr",
+          "0.10.1"
+        ],
+        [
+          "ctutils",
+          "0.4.3"
+        ],
+        [
+          "cmov",
+          "0.5.4"
+        ],
+        [
+          "ghash",
+          "0.6.0"
+        ],
+        [
+          "polyval",
+          "0.7.3"
+        ],
+        [
+          "universal-hash",
+          "0.6.1"
+        ]
+      ]
+    },
+    "chacha20poly1305": {
+      "packages": 18,
+      "download_bytes": 1399301,
+      "missing_archives": 0,
+      "packages_list": [
+        [
+          "chacha20poly1305",
+          "0.11.0"
+        ],
+        [
+          "aead",
+          "0.6.1"
+        ],
+        [
+          "crypto-common",
+          "0.2.2"
+        ],
+        [
+          "getrandom",
+          "0.4.3"
+        ],
+        [
+          "cfg-if",
+          "1.0.5"
+        ],
+        [
+          "libc",
+          "0.2.191"
+        ],
+        [
+          "rand_core",
+          "0.10.1"
+        ],
+        [
+          "hybrid-array",
+          "0.4.15"
+        ],
+        [
+          "typenum",
+          "1.20.1"
+        ],
+        [
+          "inout",
+          "0.2.4"
+        ],
+        [
+          "chacha20",
+          "0.10.2"
+        ],
+        [
+          "cipher",
+          "0.5.2"
+        ],
+        [
+          "block-buffer",
+          "0.12.1"
+        ],
+        [
+          "cpufeatures",
+          "0.3.1"
+        ],
+        [
+          "poly1305",
+          "0.9.1"
+        ],
+        [
+          "universal-hash",
+          "0.6.1"
+        ],
+        [
+          "ctutils",
+          "0.4.3"
+        ],
+        [
+          "cmov",
+          "0.5.4"
+        ]
+      ]
+    },
+    "go": {
+      "aes": "standard library",
+      "chacha_modules": {
+        "golang.org/x/crypto v0.58.0": 2344115,
+        "golang.org/x/sys v0.49.0": 2115196
+      }
+    },
+    "noble": {
+      "version": "2.4.0",
+      "runtime_dependencies": 0,
+      "installed_file_bytes": 548134
+    }
+  },
+  "validation": [
+    "All eight native executables executed runtime SQL successfully",
+    "Each enabled AEAD completed an encrypt/decrypt round trip with runtime input"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "jed-aead-bench",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@noble/ciphers": "2.4.0" }
+}

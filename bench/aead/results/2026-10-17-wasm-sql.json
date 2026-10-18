@@ -1,0 +1,155 @@
+{
+  "rows": [
+    {
+      "name": "constant",
+      "sql": "SELECT 1",
+      "backend": "typescript",
+      "ns_samples": [
+        1172.5844247206558,
+        1197.3064564402778,
+        930.8874946474785,
+        966.3968669668914,
+        977.6104544876874
+      ],
+      "median_ns": 977.6104544876874
+    },
+    {
+      "name": "constant",
+      "sql": "SELECT 1",
+      "backend": "rust-wasm",
+      "ns_samples": [
+        1296.8411934802054,
+        1236.8579733089252,
+        1236.9697565682052,
+        1236.1674722177588,
+        1186.906116102691
+      ],
+      "median_ns": 1236.8579733089252
+    },
+    {
+      "name": "point",
+      "sql": "SELECT v FROM t WHERE id = 5000",
+      "backend": "typescript",
+      "ns_samples": [
+        4631.28569443801,
+        3122.763458656008,
+        3101.372367808965,
+        2924.373991110068,
+        3448.96475619008
+      ],
+      "median_ns": 3122.763458656008
+    },
+    {
+      "name": "point",
+      "sql": "SELECT v FROM t WHERE id = 5000",
+      "backend": "rust-wasm",
+      "ns_samples": [
+        1983.668372609693,
+        1855.9594662311451,
+        1838.1653401466767,
+        1953.7189158126607,
+        2047.1777927900323
+      ],
+      "median_ns": 1953.7189158126607
+    },
+    {
+      "name": "aggregate",
+      "sql": "SELECT sum(v) FROM t",
+      "backend": "typescript",
+      "ns_samples": [
+        4784510.380952378,
+        5025218.700000005,
+        3725892.07407408,
+        3616376.035714292,
+        3645372.750000011
+      ],
+      "median_ns": 3725892.07407408
+    },
+    {
+      "name": "aggregate",
+      "sql": "SELECT sum(v) FROM t",
+      "backend": "rust-wasm",
+      "ns_samples": [
+        1242619.7037037036,
+        1239897.9382716091,
+        1231612.0243902432,
+        1230881.2073170752,
+        1291866.2435897426
+      ],
+      "median_ns": 1239897.9382716091
+    },
+    {
+      "name": "sort",
+      "sql": "SELECT id, v FROM t ORDER BY v DESC, id LIMIT 100",
+      "backend": "typescript",
+      "ns_samples": [
+        1809109.535714283,
+        1837003.4000000074,
+        1850031.4363636293,
+        1806494.0357142924,
+        1804925.5714285632
+      ],
+      "median_ns": 1809109.535714283
+    },
+    {
+      "name": "sort",
+      "sql": "SELECT id, v FROM t ORDER BY v DESC, id LIMIT 100",
+      "backend": "rust-wasm",
+      "ns_samples": [
+        640331.108280256,
+        647922.4129032269,
+        651006.7012987015,
+        644730.141025641,
+        646299.2645161296
+      ],
+      "median_ns": 646299.2645161296
+    },
+    {
+      "name": "return1000",
+      "sql": "SELECT id, v FROM t WHERE id < 1000 ORDER BY id",
+      "backend": "typescript",
+      "ns_samples": [
+        327995.37377049105,
+        328637.53442623006,
+        316141.6782334409,
+        316472.7634069379,
+        315929.6277602522
+      ],
+      "median_ns": 316472.7634069379
+    },
+    {
+      "name": "return1000",
+      "sql": "SELECT id, v FROM t WHERE id < 1000 ORDER BY id",
+      "backend": "rust-wasm",
+      "ns_samples": [
+        454505.9728506783,
+        446593.1026785727,
+        446334.5511111119,
+        446823.66517857224,
+        443280.19911504636
+      ],
+      "median_ns": 446593.1026785727
+    }
+  ],
+  "sink": 102,
+  "metadata": {
+    "date_utc": "2026-10-17T23:56:29.183Z",
+    "node": "v26.10.0",
+    "samples": 5,
+    "sample_ms": 100,
+    "warmup_samples": 1,
+    "cpu_affinity": "0",
+    "revision": "172e3b0ae9f604f5284147d77ac7eb14b07917a7",
+    "bundle_sha256": "c42fa22872218fc8092b5744628280195dd6d1d05bfaf9ebab417a07b635eb38",
+    "wasm_bytes": 4656541,
+    "wasm_gzip_bytes": 1564991,
+    "wasm_sha256": "dd4bb38632b07d1229b4a006190f87b5780ea5085fe658c8d71053dbcb81b182",
+    "source_sha256": {
+      "bench/aead/browser/sql.mjs": "1689c3956b120a13390314f25b7842c0b04f067b1bbff14ba3c7892e2186ba33",
+      "mise-tasks/bench/aead_wasm_sql": "893aae220dd9c5c89d3452b1863e5f9780ab4c527dbb9064ce4240947729af6e",
+      "impl/wasm/src/lib.rs": "9cf9c0717cb3b9d8c675551d70f9f5143153e160b40c1a06dee8bb4650bb6b79",
+      "impl/wasm/Cargo.toml": "b25b98876ff4866d4a9e959aea9ce004cc2da31d8cd6d86a0dc5ffed3200eae4",
+      "impl/wasm/Cargo.lock": "f2bb5b7dc951432d6c247baa6dcd0c61c02bb3f65da9e5c394f3a38523783087"
+    }
+  }
+}
