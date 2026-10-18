@@ -248,6 +248,7 @@ import {
   datumToJsonb,
   jsonKeyText,
 } from "./row_json.ts";
+import { expressionVmEnabled, tryExpressionVm, withTreeEvaluation } from "./expression_vm.ts";
 // passingBindings evaluates a resolved PASSING clause into its jsonpath variables
 // (json-sql-functions.md §5.4): each value as a jsonb item (SQL NULL is JSON null), ordered for lookup
 // by passingVars. resolveJsonPassing converts every other type to jsonb.
@@ -311,6 +312,11 @@ export function passingBindings(
 // PostgreSQL's qual-list rule; each AND node charges on entry as in evalExpr, and every other node
 // evaluates as a value (spec/design/cost.md §3).
 export function evalFilter(e: RExpr, row: Row, env: EvalEnv, m: Meter): boolean {
+  if (expressionVmEnabled()) {
+    const result = tryExpressionVm(e, row, env, m, true);
+    if (result !== undefined) return isTrue(result);
+    return withTreeEvaluation(() => evalFilter(e, row, env, m));
+  }
   if (e.kind !== "and") return isTrue(evalExpr(e, row, env, m));
   m.guard();
   m.charge(operatorCost("and"));
@@ -322,6 +328,11 @@ export function evalFilter(e: RExpr, row: Row, env: EvalEnv, m: Meter): boolean 
 type Of<K extends RExpr["kind"]> = Extract<RExpr, { kind: K }>;
 
 export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
+  if (expressionVmEnabled()) {
+    const result = tryExpressionVm(e, row, env, m, false);
+    if (result !== undefined) return result;
+    return withTreeEvaluation(() => evalExpr(e, row, env, m));
+  }
   // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). evalExpr recurses once
   // per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot; it
   // is a no-op when no ceiling is set (spec/design/cost.md §6).
@@ -609,26 +620,30 @@ function evalArrayCastNode(e: Of<"arrayCast">, row: Row, env: EvalEnv, m: Meter)
 function evalNegNode(e: Of<"neg">, row: Row, env: EvalEnv, m: Meter): Value {
   m.charge(operatorCost("neg"));
   const v = evalExpr(e.operand, row, env, m);
+  return evalNegValue(e.result, v);
+}
+
+export function evalNegValue(result: ScalarType, v: Value): Value {
   if (v.kind === "null") return nullValue();
-  if (isInterval(e.result)) {
+  if (isInterval(result)) {
     if (v.kind !== "interval") throw typeError("internal: non-interval unary minus");
     return intervalValue(intervalNeg(v.iv));
   }
-  if (isDecimal(e.result)) {
+  if (isDecimal(result)) {
     return decimalValue(
       (v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate(),
     );
   }
-  if (isFloat(e.result)) {
+  if (isFloat(result)) {
     // Negation flips the sign (no overflow); -NaN is NaN, -Inf is -Inf per IEEE. f32 stays
     // binary32 (negation never changes the width's representability, but fround keeps the path
     // uniform). float.md §5.
     if (v.kind !== "f32" && v.kind !== "f64") throw typeError("internal: non-float unary minus");
-    return e.result === "f32" ? float32Value(-v.value) : float64Value(-v.value);
+    return result === "f32" ? float32Value(-v.value) : float64Value(-v.value);
   }
   if (v.kind !== "int") throw typeError("internal: boolean unary minus");
   const n = -v.int;
-  if (!inRange(e.result, n)) throw overflow(e.result);
+  if (!inRange(result, n)) throw overflow(result);
   return intValue(n);
 }
 
@@ -710,6 +725,16 @@ function evalCompareNode(e: Of<"compare">, row: Row, env: EvalEnv, m: Meter): Va
   m.charge(operatorCost(e.op));
   const a = evalExpr(e.lhs, row, env, m);
   const b = evalExpr(e.rhs, row, env, m);
+  return evalCompareValues(e.op, e.collation, a, b, m);
+}
+
+export function evalCompareValues(
+  op: BinaryOp,
+  collation: Collation | null,
+  a: Value,
+  b: Value,
+  m: Meter,
+): Value {
   // A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
   // where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
   m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
@@ -719,13 +744,13 @@ function evalCompareNode(e: Of<"compare">, row: Row, env: EvalEnv, m: Meter): Va
   // point of each operand (cost.md "collate"). =/<> are byte-equality even under a deterministic
   // collation (§7), so they take the plain path and charge no collate. A NULL operand ⇒ Unknown
   // (no sort key). [...s] counts code points (NOT s.length — the UTF-16 trap, §8).
-  if (e.collation !== null && (e.op === "lt" || e.op === "gt" || e.op === "le" || e.op === "ge")) {
+  if (collation !== null && (op === "lt" || op === "gt" || op === "le" || op === "ge")) {
     if (a.kind === "text" && b.kind === "text") {
       m.charge(COSTS.collate * BigInt([...a.text].length + [...b.text].length));
       m.guard();
-      const c = collatedCmp(e.collation, a.text, b.text);
+      const c = collatedCmp(collation, a.text, b.text);
       let res: boolean;
-      switch (e.op) {
+      switch (op) {
         case "lt":
           res = c < 0;
           break;
@@ -743,9 +768,9 @@ function evalCompareNode(e: Of<"compare">, row: Row, env: EvalEnv, m: Meter): Va
     // Two text[] values walk their element pairs under the collation, charging collate per
     // compared pair (collation.md §11).
     if (a.kind === "array" && b.kind === "array") {
-      const c = collatedArrayCmp(e.collation, a, b, m);
+      const c = collatedArrayCmp(collation, a, b, m);
       let res: boolean;
-      switch (e.op) {
+      switch (op) {
         case "lt":
           res = c < 0;
           break;
@@ -770,7 +795,7 @@ function evalCompareNode(e: Of<"compare">, row: Row, env: EvalEnv, m: Meter): Va
   // covers =/<>, C/default-collation ordering, and all bytea.
   m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(a, b) - 1));
   m.guard();
-  switch (e.op) {
+  switch (op) {
     case "eq":
       return from3(eq3(a, b));
     case "ne":

@@ -59,6 +59,10 @@ fn record_peak(ordinal: usize, db: &Database) {
 }
 
 fn main() -> ExitCode {
+    #[cfg(feature = "expression-vm")]
+    jed::tooling::expression_vm::set_enabled(
+        std::env::var("JED_EXPR_VM_MODE").is_ok_and(|v| v == "vm"),
+    );
     let suites = suites_dir();
     let mut files = Vec::new();
     collect_tests(&suites, &mut files);

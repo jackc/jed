@@ -75,6 +75,8 @@ pub(crate) use error_detail::{DUPLICATED, EXISTS};
 mod blocking_spill;
 mod eval;
 mod exec_emit;
+#[cfg(feature = "expression-vm")]
+pub(crate) mod expression_vm;
 pub(crate) use exec_emit::FkKeyedTarget;
 mod exec_scan;
 mod hash_join;

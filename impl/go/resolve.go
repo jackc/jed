@@ -1933,6 +1933,14 @@ func containerParamType(s *scope, rt resolvedType) (colType, bool) {
 }
 
 func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	r, ty, err := resolveNodeTree(s, e, ctx, ag, params)
+	if expressionVMEnabled && err == nil {
+		r.setExpressionVMType(ty)
+	}
+	return r, ty, err
+}
+
+func resolveNodeTree(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
 	// matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT a+b
 	// … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own path

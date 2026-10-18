@@ -240,6 +240,8 @@ impl StreamingFeed {
 }
 
 pub(crate) struct StreamingScan {
+    #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+    pub(crate) expression_vm: expression_vm::Site,
     pub(crate) engine: Engine,
     /// The resolved plan, shared (`Rc`) so a prepared statement's plan cache and this cursor hold the
     /// same allocation — a cache hit rebinds params + rebuilds the cursor but re-plans nothing
@@ -347,6 +349,16 @@ impl crate::cursor::RowStream for StreamingScan {
                     {
                         ra.set_row(b, i, &env, &self.meter);
                     }
+                    #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+                    if let Some(vm) = &mut self.expression_vm.filter {
+                        vm.eval(row, &filter_env, &mut self.meter)?.is_true()
+                    } else {
+                        f.eval_filter(row, &filter_env, &mut self.meter)?
+                    }
+                    #[cfg(not(all(
+                        feature = "expression-vm",
+                        not(feature = "expression-vm-baseline")
+                    )))]
                     f.eval_filter(row, &filter_env, &mut self.meter)?
                 }
                 None => true,
@@ -367,7 +379,22 @@ impl crate::cursor::RowStream for StreamingScan {
                 // even for a duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT
                 // window the survivors — exactly `exec_streaming_scan`.
                 set_project_row(&self.meter);
+                #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+                let projected = self.expression_vm.project(
+                    &self.plan.projections,
+                    row,
+                    &project_env,
+                    &mut self.meter,
+                )?;
+                #[cfg(not(all(
+                    feature = "expression-vm",
+                    not(feature = "expression-vm-baseline")
+                )))]
                 let mut projected = Vec::with_capacity(self.plan.projections.len());
+                #[cfg(not(all(
+                    feature = "expression-vm",
+                    not(feature = "expression-vm-baseline")
+                )))]
                 for p in &self.plan.projections {
                     projected.push(p.eval(row, &project_env, &mut self.meter)?);
                 }
@@ -389,7 +416,16 @@ impl crate::cursor::RowStream for StreamingScan {
             }
             self.meter.charge(COSTS.row_produced);
             set_project_row(&self.meter);
+            #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+            let projected = self.expression_vm.project(
+                &self.plan.projections,
+                row,
+                &project_env,
+                &mut self.meter,
+            )?;
+            #[cfg(not(all(feature = "expression-vm", not(feature = "expression-vm-baseline"))))]
             let mut projected = Vec::with_capacity(self.plan.projections.len());
+            #[cfg(not(all(feature = "expression-vm", not(feature = "expression-vm-baseline"))))]
             for p in &self.plan.projections {
                 projected.push(p.eval(row, &project_env, &mut self.meter)?);
             }
@@ -433,6 +469,8 @@ impl crate::cursor::RowStream for StreamingScan {
 /// projection of the rows it never pulls, and a fully-drained query observes the same rows + total cost
 /// as the eager path (streaming.md §6).
 pub(crate) struct BufferedScan {
+    #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+    pub(crate) expression_vm: expression_vm::Site,
     pub(crate) engine: Engine,
     /// The resolved plan, shared (`Rc`) with a prepared statement's plan cache (see [`StreamingScan`]).
     pub(crate) plan: std::rc::Rc<SelectPlan>,
@@ -641,6 +679,15 @@ impl crate::cursor::RowStream for BufferedScan {
                     }
                     None => base,
                 };
+                #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+                return self
+                    .expression_vm
+                    .project(&self.plan.projections, row, &env, &mut self.meter)
+                    .map(Some);
+                #[cfg(not(all(
+                    feature = "expression-vm",
+                    not(feature = "expression-vm-baseline")
+                )))]
                 Ok(Some(
                     self.plan
                         .projections
@@ -719,10 +766,27 @@ impl crate::cursor::RowStream for BufferedScan {
                     }
                     None => base,
                 };
+                #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+                return self
+                    .expression_vm
+                    .project(&self.plan.projections, row, &env, &mut self.meter)
+                    .map(Some);
+                #[cfg(not(all(
+                    feature = "expression-vm",
+                    not(feature = "expression-vm-baseline")
+                )))]
                 let mut out = Vec::with_capacity(self.plan.projections.len());
+                #[cfg(not(all(
+                    feature = "expression-vm",
+                    not(feature = "expression-vm-baseline")
+                )))]
                 for p in &self.plan.projections {
                     out.push(p.eval(row, &env, &mut self.meter)?);
                 }
+                #[cfg(not(all(
+                    feature = "expression-vm",
+                    not(feature = "expression-vm-baseline")
+                )))]
                 Ok(Some(out))
             }
             BufState::Buffer {
@@ -756,10 +820,30 @@ impl crate::cursor::RowStream for BufferedScan {
                         host_batch: batch.as_ref(),
                         ..base
                     };
+                    #[cfg(all(
+                        feature = "expression-vm",
+                        not(feature = "expression-vm-baseline")
+                    ))]
+                    return self
+                        .expression_vm
+                        .project(&self.plan.projections, &rows[i], &env, &mut self.meter)
+                        .map(Some);
+                    #[cfg(not(all(
+                        feature = "expression-vm",
+                        not(feature = "expression-vm-baseline")
+                    )))]
                     let mut out = Vec::with_capacity(self.plan.projections.len());
+                    #[cfg(not(all(
+                        feature = "expression-vm",
+                        not(feature = "expression-vm-baseline")
+                    )))]
                     for p in &self.plan.projections {
                         out.push(p.eval(&rows[i], &env, &mut self.meter)?);
                     }
+                    #[cfg(not(all(
+                        feature = "expression-vm",
+                        not(feature = "expression-vm-baseline")
+                    )))]
                     Ok(Some(out))
                 } else {
                     let row = std::mem::take(&mut rows[i]);

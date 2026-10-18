@@ -1102,8 +1102,9 @@ const (
 // row. Arithmetic/neg nodes carry their (promotion-tower) result type in `result` so the
 // computed value can be range-checked against it.
 type rExpr struct {
-	kind  rExprKind
-	index int // reColumn, reParam
+	expressionVMType // empty in ordinary builds; experiment-only resolved leaf type
+	kind             rExprKind
+	index            int // reColumn, reParam
 	// plan is a reParam's planning frame (plan_params.go): what the estimator may know of its value.
 	plan     *planFrame
 	cInt     int64          // reConstInt

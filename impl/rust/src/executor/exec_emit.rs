@@ -755,11 +755,39 @@ impl Engine {
             // After a pushdown only the residual remains (planner.md §3.2); the pushed conjuncts
             // already ran as each relation was read.
             let filter = plan.post_join_filter();
+            // Compile the actual residual only. A multi-conjunct synthetic chain keeps its
+            // existing tree path; never substitute the complete pre-pushdown WHERE.
+            #[cfg(all(feature = "expression-vm", not(feature = "expression-vm-baseline")))]
+            let mut vm_filter = expression_vm::Site::with_filter(
+                plan,
+                self,
+                params,
+                filter
+                    .as_ref()
+                    .and_then(|f| (f.conjuncts.len() == 1).then(|| f.conjuncts[0])),
+                false,
+            )
+            .filter;
             let mut rows: Vec<Row> = Vec::new();
             for row in running {
                 let keep = match &filter {
                     None => true,
-                    Some(f) => f.eval_filter(&row, &env, meter)?,
+                    Some(f) => {
+                        #[cfg(all(
+                            feature = "expression-vm",
+                            not(feature = "expression-vm-baseline")
+                        ))]
+                        if let Some(vm) = &mut vm_filter {
+                            vm.eval(&row, &env, meter)?.is_true()
+                        } else {
+                            f.eval_filter(&row, &env, meter)?
+                        }
+                        #[cfg(not(all(
+                            feature = "expression-vm",
+                            not(feature = "expression-vm-baseline")
+                        )))]
+                        f.eval_filter(&row, &env, meter)?
+                    }
                 };
                 if keep {
                     rows.push(row);

@@ -33,7 +33,8 @@ import (
 // pointer through the executor and the recursive expression evaluator; the accrued
 // (per-statement) total is reported on outcome, while the session cumulative is updated live.
 type costMeter struct {
-	ceilingHit uint8 // first crossed ceiling: 1 statement, 2 lifetime
+	expressionVMState       // empty in ordinary builds; execution-owned experiment registers
+	ceilingHit        uint8 // first crossed ceiling: 1 statement, 2 lifetime
 
 	scalarBytes *int64
 	scalarLimit int64

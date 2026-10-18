@@ -3,8 +3,8 @@ arithmetic_scan	prepared	40	SELECT (a + b) * 3 - a % 7 + b * b FROM t
 boolean_scan	prepared	40	SELECT id FROM t WHERE (a + b) * 3 > 70 AND (a % 7 = 0 OR b * 2 < 9)
 conditional_scan	prepared	40	SELECT CASE WHEN p THEN COALESCE(a, 0) * 3 WHEN q THEN COALESCE(b, 1) + 7 ELSE a + b END FROM t
 metered_scan	prepared	40	SELECT (a + b) * 3 - a % 7 + b * b FROM t
-point_lookup	prepared	4000	SELECT a + b FROM t WHERE id = 1001
-point_adhoc	adhoc	2000	SELECT a + b FROM t WHERE id = 1001
-columnar_control	prepared	40	SELECT sum(a), count(b), min(a), max(b) FROM t
-expensive_control	prepared	20	SELECT sqrt((COALESCE(a, 0) + 100)::decimal) FROM t
+point_lookup	prepared	100000	SELECT a + b FROM t WHERE id = 1001
+point_adhoc	adhoc	20000	SELECT a + b FROM t WHERE id = 1001
+columnar_control	prepared	500	SELECT sum(a), count(b), min(a), max(b) FROM t
+expensive_control	prepared	3	SELECT sqrt((COALESCE(a, 0) + 100)::decimal) FROM t
 fallback_control	prepared	40	SELECT abs(a) + b FROM t
