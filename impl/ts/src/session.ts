@@ -25,7 +25,7 @@ import type { Acc, AggSpec, EvalEnv, ResolvedFrame, SelectPlan } from "./executo
 import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
 import { nullValue } from "./value.ts";
-import { evalExpressionsSteps, evalFilterSteps } from "./eval.ts";
+import { evalExpressionsMaybeSteps, evalFilterMaybeSteps, isPendingEval } from "./eval.ts";
 import {
   COOPERATE,
   runSync,
@@ -722,13 +722,15 @@ function* streamRowsSequence(
       const row = yield* store.resolveColumnsSteps(rawRow, sp.relMasks[0]!);
       if (sp.filter !== null) {
         if (at >= 0) ra!.setRow(ra!.filter, at, env, meter);
-        if (!(yield* evalFilterSteps(sp.filter, row, filterEnv, meter))) continue;
+        const passes = evalFilterMaybeSteps(sp.filter, row, filterEnv, meter);
+        if (!(isPendingEval(passes) ? yield* passes : passes)) continue;
       }
       if (distinct) {
         // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even for a
         // duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window the survivors.
         if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
-        const tuple = yield* evalExpressionsSteps(sp.projections, row, projectEnv, meter);
+        const projected = evalExpressionsMaybeSteps(sp.projections, row, projectEnv, meter);
+        const tuple = isPendingEval(projected) ? yield* projected : projected;
         const key = distinctRowKey(tuple);
         // A new value reserves its dedup entry until the scan ends (memory.md §6.2).
         if (!meter.costFirst(() => seen.insert(key, tuple))) continue;
@@ -743,10 +745,8 @@ function* streamRowsSequence(
         meter.charge(COSTS.rowProduced);
         produced += 1n;
         if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
-        yield {
-          kind: "item",
-          value: yield* evalExpressionsSteps(sp.projections, row, projectEnv, meter),
-        };
+        const projected = evalExpressionsMaybeSteps(sp.projections, row, projectEnv, meter);
+        yield { kind: "item", value: isPendingEval(projected) ? yield* projected : projected };
       }
       // The LIMIT short-circuit (cost.md §3): once the window is full, stop WITHOUT pulling another row —
       // so no further leaf is faulted (the streaming early-exit win). The check is after the yield, so the
@@ -829,12 +829,12 @@ function* bufferedRowsSequence(
           meter.charge(COSTS.rowProduced);
         }
         if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
-        const r = row;
+        const projected = em.sortedIdentity
+          ? row
+          : evalExpressionsMaybeSteps(plan.projections, row, projectEnv, meter);
         yield {
           kind: "item",
-          value: em.sortedIdentity
-            ? r
-            : yield* evalExpressionsSteps(plan.projections, r, projectEnv, meter),
+          value: isPendingEval(projected) ? yield* projected : projected,
         };
       }
     } finally {
@@ -879,10 +879,8 @@ function* bufferedRowsSequence(
       yield { kind: "item", value: row };
     } else {
       batch?.setRow(i, em.rows, em.end, env, meter);
-      yield {
-        kind: "item",
-        value: yield* evalExpressionsSteps(plan.projections, em.rows[i]!, benv, meter),
-      };
+      const projected = evalExpressionsMaybeSteps(plan.projections, em.rows[i]!, benv, meter);
+      yield { kind: "item", value: isPendingEval(projected) ? yield* projected : projected };
     }
   }
 }

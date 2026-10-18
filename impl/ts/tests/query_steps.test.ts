@@ -293,6 +293,68 @@ test("message-only cancellation interrupts generated work and releases its curso
   }
 });
 
+test("message cancellation reaches resident operators before their first output row", async (t) => {
+  let visits = 0;
+  const builder = Environment.builder();
+  builder.registerFunction({
+    name: "visit_progress",
+    argTypes: ["i64"],
+    result: "i64",
+    volatility: "volatile",
+    kernel(args) {
+      visits++;
+      return args[0]!;
+    },
+  });
+  const db = createDatabase({ environment: builder.build() });
+  const session = db.session();
+  const cases = [
+    {
+      name: "aggregate over generated input",
+      sql: "SELECT sum(visit_progress(g::i64)) FROM generate_series(1,1000000) AS g",
+    },
+    {
+      name: "join rejecting all candidate pairs",
+      sql: "SELECT count(*) FROM generate_series(1,100) AS a CROSS JOIN generate_series(1,100) AS b WHERE visit_progress(a::i64+b::i64)<0",
+    },
+    {
+      name: "recursive input to a blocking aggregate",
+      sql: "WITH RECURSIVE r(n) AS (SELECT visit_progress(1::i64) UNION ALL SELECT visit_progress(n+1) FROM r WHERE n<1000000) SELECT sum(n) FROM r",
+    },
+  ];
+  try {
+    for (const probe of cases) {
+      await t.test(probe.name, async () => {
+        visits = 0;
+        let canceled = false;
+        session.begin(true);
+        await assert.rejects(
+          runAsync(collectSteps(session, probe.sql), {
+            quantum: 32,
+            check: () => canceled,
+            schedule(resume) {
+              setImmediate(() => {
+                // Arm only after expression execution starts. In particular, the join must
+                // reach its candidate loop, rather than cancel while materializing its inputs.
+                if (visits >= 32) canceled = true;
+                resume();
+              });
+            },
+          }),
+          hasState("57014"),
+        );
+        assert.ok(visits >= 32 && visits < 10_000);
+        assert.throws(() => session.execute("SELECT 1"), hasState("25P02"));
+        session.rollback();
+        assert.deepEqual(collectSync(session, "SELECT 7").values, [[intValue(7n)]]);
+      });
+    }
+  } finally {
+    session.close();
+    db.close();
+  }
+});
+
 test("async blocking operators spill with identical results and release scratch resources", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "jed-query-spill-steps-"));
   const path = join(dir, "data.jed");
