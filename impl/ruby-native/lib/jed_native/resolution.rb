@@ -24,6 +24,12 @@ module JedNative
         expression.type = expression.type.sub(/(?:\[\])+\z/, '') + '[]'
       when :cast
         arg = expression.args.first
+        # An array cast with the same element type is the identity (array.md
+        # §7), including a constructor whose elements already have that type.
+        return arg if expression.type.end_with?('[]') && expression.type == arg.type && !expression.extra&.dig(:type_mod)
+        if arg.kind == :literal && arg.value.nil? && (expression.type.end_with?('[]') || Types::RANGES.key?(expression.type) || @types.key?(expression.type))
+          return Expression.new(kind: :literal, type: expression.type, value: nil)
+        end
         if arg.kind == :literal && arg.value.is_a?(String)
           value = cast_value(arg.value, expression.type, source_type: arg.type)
           value = explicit_modifier(value, expression.type, expression.extra[:type_mod])

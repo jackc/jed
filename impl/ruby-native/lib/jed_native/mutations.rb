@@ -4,6 +4,7 @@ module JedNative
   # Mutations build a private end state. Expressions and RETURNING read the
   # pre-statement table until validation finishes and the replacement is published.
   module Mutations
+    INSERT_DEFAULT = Object.new.freeze
     def insert(stmt)
       t = table(stmt[:table])
       if stmt[:default_values] && (stmt[:columns] || stmt[:overriding])
@@ -26,6 +27,47 @@ module JedNative
       end
       source = stmt[:query] && select(stmt[:query])
       inputs = source ? source.rows : stmt[:rows]
+      # Resolve every VALUES slot first so its uncorrelated subqueries fold in
+      # row-major order. Materialize all rows before RETURNING and conflict
+      # subqueries are allowed to run (cost.md §3).
+      prepared = inputs.map do |input|
+        unless stmt[:default_values] || input.length == indices.length
+          raise Error.new('42601', 'INSERT column count mismatch')
+        end
+        input.each_with_index.map do |node, position|
+          column = t[:columns][indices[position]]
+          if source
+            Expression.new(kind: :source, type: source.columns[position][:type])
+          elsif stmt[:default_values] || node[:kind] == :default || column[:identity] && stmt[:overriding] == 'user'
+            nil
+          else
+            compile(node, [])
+          end
+        end
+      end
+      candidates = inputs.each_with_index.map do |input, row_index|
+        values_start = @cost if @explain_profile_frames
+        candidate = Array.new(t[:columns].length)
+        assigned = {}
+        indices.each_with_index do |ordinal, position|
+          next if stmt[:default_values]
+          column = t[:columns][ordinal]
+          expr = prepared[row_index][position]
+          if column[:identity] && stmt[:overriding] == 'user' || !source && input[position][:kind] == :default
+            candidate[ordinal] = INSERT_DEFAULT
+          else
+            value = source ? input[position] : assignment_value(expr)
+            candidate[ordinal] = assign(value, column.merge(nullable: true), expr)
+          end
+          assigned[ordinal] = true
+        end
+        t[:columns].each_with_index do |column, ordinal|
+          next if assigned[ordinal]
+          candidate[ordinal] = INSERT_DEFAULT
+        end
+        profile_accumulate(:values, @cost - values_start) if @explain_profile_frames
+        candidate
+      end
       conflict = stmt[:on_conflict]
       scope = table_columns(t, stmt[:alias] || t[:name])
       return_scope, return_exprs, return_columns = mutation_returning(stmt, t, :insert)
@@ -39,27 +81,15 @@ module JedNative
       rows, rowids = t[:rows].dup, t[:rowids].dup
       next_id = t[:next_rowid]
       changes, affected = [], {}
-      inputs.each do |input|
-        values_start = @cost if @explain_profile_frames
-        unless stmt[:default_values] || input.length == indices.length
-          raise Error.new('42601', 'INSERT column count mismatch')
+      candidates.each do |candidate|
+        # Defaults retain their per-candidate schedule: sequence defaults in an
+        # ON CONFLICT update interleave with the next candidate's defaults.
+        candidate.each_index do |ordinal|
+          next unless candidate[ordinal].equal?(INSERT_DEFAULT)
+          expr = defaults[ordinal]
+          value = expr && assignment_value(expr)
+          candidate[ordinal] = assign(value, t[:columns][ordinal].merge(nullable: true), expr)
         end
-        supplied = indices.zip(input).to_h
-        candidate = t[:columns].each_with_index.map do |column, ordinal|
-          node = supplied[ordinal]
-          if stmt[:default_values] || !supplied.key?(ordinal) || column[:identity] && stmt[:overriding] == 'user' || !source && node[:kind] == :default
-            expr = defaults[ordinal]
-            value = expr && assignment_value(expr)
-          elsif source
-            value = node
-            expr = Expression.new(kind: :source, type: source.columns[indices.index(ordinal)][:type])
-          else
-            expr = compile(node, [])
-            value = assignment_value(expr)
-          end
-          assign(value, column.merge(nullable: true), expr)
-        end
-        profile_accumulate(:values, @cost - values_start) if @explain_profile_frames
         validate_candidate(t, candidate, checks)
         target = conflict && conflict_row(arbiters, candidate, rows, affected)
         if target

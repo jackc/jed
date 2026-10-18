@@ -4,6 +4,7 @@ require "set"
 require_relative "lz4"
 require_relative "page_buffer"
 require_relative "persistent_tree"
+require_relative "paged_rows"
 
 module JedNative
   # Experimental v49 codec. Adapted from the independently handwritten Ruby
@@ -1445,6 +1446,7 @@ module JedNative
     # the range body (ranges) or `[min, max]` length-prefixed (scalars). For a single-column index this is
     # exactly the one component's bytes (gist.md §4.1/§6).
     def gist_encode_bound(ops, bound)
+      return bound if bound.is_a?(String)
       out = +"".b
       ops.each_index do |k|
         op = ops[k]
@@ -3233,12 +3235,13 @@ module JedNative
       pos
     end
     
-    def decode_image(image, page_size: nil)
+    def decode_image(image, page_size: nil, lazy: false)
       raise "truncated database header" if image.bytesize < 12
       ps = page_size || image.byteslice(8, 4).unpack1("N")
       raise "invalid page size" unless valid_page_size?(ps)
       meta = select_meta(image, ps)
       free_pages = validate_free_list!(image, ps, meta)
+      pool = LeafPool.new(self, image, ps, image.respond_to?(:cache_pages) ? image.cache_pages : meta[:page_count]) if lazy
       # Every page the decode reads from the catalog root is live (v34): the catalog chain, each tree
       # and GiST node, and each overflow page. The meta's count must equal that reachable set.
       @reached = Set.new
@@ -3313,6 +3316,20 @@ module JedNative
           raise "unknown catalog entry kind #{kind}" unless kind.zero?
     
           entry, pos = decode_table_entry(payload, pos)
+          if lazy
+            rows = PagedRows.new(pool, entry[:root_data_page], entry[:columns], entry[:row_count])
+            entry[:indexes].each do |index|
+              if index[:kind] == 'gist'
+                operations = index[:cols].all? { |column| column.is_a?(Integer) } ? gist_opclasses_for(entry, index) : nil
+                index[:gist_profile] = read_gist_tree(image, ps, index[:root_page], operations)
+              else
+                index_rows = PagedRows.new(pool, index[:root_page], [], nil)
+                index[:tree_profile] = index_rows.profile
+              end
+            end
+            tables << entry.merge(pk_order: entry[:pk], rows: rows, storage_keys: rows.keys, tree_profile: rows.profile)
+            next
+          end
           storage_keys = []
           profile = {}
           rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns], storage_keys, profile)
@@ -3340,10 +3357,12 @@ module JedNative
       reached = @reached
       @reached = nil
       @claimed = nil
-      raise "live page count #{meta[:live]} does not match #{reached.size} reachable pages" unless meta[:live] == reached.size
+      paged = tables.any? { |table| table[:rows].is_a?(PagedRows) }
+      raise "live page count #{meta[:live]} does not match #{reached.size} reachable pages" unless paged || meta[:live] == reached.size
       raise "a free-list page is reachable" unless (free_pages & reached.to_a).empty?
       { types: types, sequences: sequences, collations: collations, tables: tables,
-        statistics: statistics, views: views, meta: meta, free_pages: free_pages, live_pages: reached.to_a }
+        statistics: statistics, views: views, meta: meta, free_pages: free_pages,
+        live_pages: paged ? DeferredLivePages.new(reached, tables) : reached.to_a }
     end
 
     def validate_catalog(types, tables)
@@ -3359,10 +3378,12 @@ module JedNative
       tables.each do |table|
         width = table[:columns].length
         raise "invalid primary-key ordinal" unless table[:pk].uniq == table[:pk] && table[:pk].all? { |column| column < width }
-        keys = table[:storage_keys]
-        raise "storage keys are not strictly ascending" unless keys.each_cons(2).all? { |left, right| left < right }
-        if table[:pk].empty?
-          raise "invalid synthetic rowid" unless keys.all? { |key| key.bytesize == 8 && decode_int(8, key) >= 0 }
+        unless table[:rows].is_a?(PagedRows)
+          keys = table[:storage_keys]
+          raise "storage keys are not strictly ascending" unless keys.each_cons(2).all? { |left, right| left < right }
+          if table[:pk].empty?
+            raise "invalid synthetic rowid" unless keys.all? { |key| key.bytesize == 8 && decode_int(8, key) >= 0 }
+          end
         end
         table[:fks].each do |fk|
           parent = by_name[fk[:ref_table]]

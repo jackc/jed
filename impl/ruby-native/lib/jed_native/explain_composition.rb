@@ -23,13 +23,27 @@ module JedNative
         expressions = statement[:rows].flatten.map { |expression| plan_compile(expression, []) }
         count = statement[:rows].length
         result = plan_node('Values', "rows=#{count}", count, count + expressions.sum { |expression| expression_work(expression) }, [], :values)
-        plan_composition_tail(result, statement)
+        if !(statement[:order_by] || []).empty? || statement[:limit] || statement[:offset]
+          result = plan_node('Subquery *VALUES*', '-', count, result.cost, [result], :scan)
+          result = plan_composition_tail(result, statement)
+          result.cost += result.rows
+        end
+        result
       else
         super
       end
       plan_nodes(node).each do |child|
         child.instance_variable_set(:@native_plan_owner, statement.object_id) unless child.instance_variable_defined?(:@native_plan_owner)
         child.actual ||= 0
+      end
+      if statement[:kind] == :select && statement[:limit] && (statement[:group_by] || []).empty? && !statement[:distinct] && !contains_aggregate?([statement[:columns], statement[:having]]) && window_nodes([statement[:columns], statement[:order_by]]).empty?
+        limit = plan_constant(plan_compile(statement[:limit], []))
+        offset = statement[:offset] ? plan_constant(plan_compile(statement[:offset], [])) : 0
+        if limit.is_a?(Integer) && offset.is_a?(Integer) && limit + offset <= QueryPlans::MAX_ESTIMATE
+          owned_plan_nodes(node).each do |child|
+            child.detail = child.detail.sub(/\Akeys=\d+/) { |detail| "#{detail}, top-k=#{limit.zero? ? 0 : limit + offset}" } if child.label == 'Sort' && !child.detail.include?('top-k=')
+          end
+        end
       end
       @explain_plans[statement.object_id] = node
       node
@@ -45,11 +59,24 @@ module JedNative
       scope = stored ? table_columns(stored, source[:alias] || source[:name]) : []
       predicate = statement[:where] && plan_compile(statement[:where], scope)
       node = stored ? plan_scan(stored, predicate, statement) : plan_node('Result', '-', 1, 0, [], :scan)
+      if windows && stored && statement[:limit]
+        limit = plan_constant(plan_compile(statement[:limit], []))
+        offset = statement[:offset] ? plan_constant(plan_compile(statement[:offset], [])) : 0
+        if limit.is_a?(Integer) && offset.is_a?(Integer)
+          prefix = window_scan_prefix(statement.merge(limit: { kind: :literal, type: 'i64', value: limit }, offset: { kind: :literal, type: 'i64', value: offset }))
+        end
+      end
+      if prefix
+        node.rows = [node.rows, prefix[:count]].min
+        node.cost = node.rows.zero? ? 0 : node.rows + [stored[:native_primary_metadata][:node_count], [node.rows, stored[:native_primary_metadata][:height]].max].min
+        node.detail += '; ordered: pk ordered'
+        node.detail += ' (reverse)' if prefix[:descending]
+      end
       if predicate
         detail = @explain_options[:verbose] ? "filter=#{plan_expression(predicate)}" : "conjuncts=#{conjunctions(predicate).length}"
         node = plan_node('Filter', detail, estimate_predicate(node.rows, predicate), node.cost + node.rows * expression_work(predicate), [node], :filter)
       end
-      join_plan_output(node, statement, scope, false)
+      join_plan_output(node, statement, scope, !!prefix)
     end
 
     def plan_relation(source, statement, scope)
@@ -203,6 +230,7 @@ module JedNative
         contribution += child.cost * count if mutation_reader && !materialized
       end
       main = build_query_plan(main_statement)
+      @explain_rewritten_from[statement.object_id] = @explain_rewritten_from[main_statement.object_id] if @explain_rewritten_from&.key?(main_statement.object_id)
       @explain_cte_main[statement.object_id] = { plan: main, statement: main_statement }
       root = plan_node('WITH', "ctes=#{items.length}", main.rows, contribution + main.cost, definitions + [main])
       root.lane = writable_with?(statement) ? 'buffered' : 'deferred'
@@ -240,7 +268,7 @@ module JedNative
       if grouped
         rows = groups.empty? ? 1 : estimate_distinct_rows(node.rows, groups)
         rows *= sets.length
-        cost = node.cost + node.rows * sets.length * (calls.length + groups.sum { |expression| expression_work(expression) } + calls.sum { |expression| expression.args.sum { |argument| expression_work(argument) } })
+        cost = node.cost + node.rows * (calls.length + groups.sum { |expression| expression_work(expression) } + calls.sum { |expression| expression.args.sum { |argument| expression_work(argument) } })
         detail = "groups=#{groups.length} aggs=#{calls.length}"
         detail += "; sets=#{sets.length}" if sets.length > 1
         outputs = outputs.map { |expression| spill_rewrite(expression, groups, calls) }

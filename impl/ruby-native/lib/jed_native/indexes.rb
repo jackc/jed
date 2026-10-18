@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'gin_maintenance'
+
 module JedNative
   # Native B-tree search inventory. Keys are the shared byte-order contract,
   # including nullable slots, direction, and the row storage-key suffix.
@@ -339,25 +341,74 @@ module JedNative
         entries, postings = [], {}
         if details[:kind] == 'gin'
           shape = table.merge(native_auxiliary_indexes: { definition[:name] => details }, native_auxiliary_codec: codec)
+          row_terms = {}
           table[:rows].each_with_index do |row, ordinal|
             next if details[:predicate] && evaluate(details[:predicate], row) != true
+            terms = []
             details[:columns].each_with_index do |column, position|
               gin_terms(shape, definition[:name], position, row[column]).each do |term|
                 (postings[term] ||= []) << ordinal
+                terms << term
               end
             end
+            row_terms[row_keys.fetch(row.object_id)] = terms.sort
           end
+          packed_runs = {}
           postings.each do |term, ordinals|
             ordinals.sort_by! { |ordinal| row_keys.fetch(table[:rows][ordinal].object_id) }
             keys = ordinals.map { |ordinal| row_keys.fetch(table[:rows][ordinal].object_id) }
-            codec.gin_pack_runs(term, keys).each { |key| entries << [key.freeze, nil].freeze }
+            packed_runs[term] = codec.gin_pack_runs(term, keys)
+            packed_runs[term].each { |key| entries << [key.freeze, nil].freeze }
             ordinals.freeze
           end
           entries.sort_by!(&:first)
           imported = definition[:storage_tree_profile] if !fresh && table[:storage_tree_rows].equal?(table[:rows])
-          previous = table[:native_auxiliary_indexes]&.dig(definition[:name], :physical_tree) unless fresh
-          profile = secondary_tree_profile(codec, entries, table, previous: previous, imported: imported)
-          details.merge!(profile, entries: entries.freeze, postings: postings.freeze)
+          previous_metadata = table[:native_auxiliary_indexes]&.[](definition[:name]) unless fresh
+          if previous_metadata && previous_metadata[:row_terms]
+            tree = previous_metadata[:physical_tree]
+            runs = previous_metadata[:runs].transform_values(&:dup)
+            old = previous_metadata[:row_terms]
+            capacity = storage_page_size(table) - FileFormat::PAGE_HEADER
+            old.sort_by(&:first).each do |key, terms|
+              (terms - (row_terms[key] || [])).each do |term|
+                tree = codec.gin_edit_posting(tree, runs[term] ||= [], term, key, false, capacity)
+              end
+            end
+            row_terms.each do |key, terms|
+              (terms - (old[key] || [])).each do |term|
+                tree = codec.gin_edit_posting(tree, runs[term] ||= [], term, key, true, capacity)
+              end
+            end
+            entries = runs.values.flatten.sort.map { |key| [key, nil] }
+            profile = compact_tree_profile(tree).merge(physical_tree: tree)
+          else
+            profile = secondary_tree_profile(codec, entries, table, imported: imported)
+            if imported
+              entries = []
+              walk = lambda do |node|
+                next unless node
+                if node[:children].empty?
+                  entries.concat(node[:keys].map { |key| [key, nil] })
+                else
+                  node[:children].each { |child| walk.call(child) }
+                end
+              end
+              walk.call(profile[:tree])
+            end
+            runs = packed_runs
+            if imported
+              runs = postings.keys.to_h { |term| [term, []] }
+              terms = runs.keys.sort
+              entries.each do |key, _|
+                after = terms.bsearch_index { |term| term > key } || terms.length
+                term = terms[after - 1] if after.positive?
+                raise Error.new('XX001', 'GIN run has an unknown term') unless term && key.start_with?(term)
+                runs[term] << key
+              end
+            end
+          end
+          details.merge!(profile, entries: entries.freeze, postings: postings.freeze, row_terms: row_terms.freeze,
+                         runs: runs.transform_values(&:freeze).freeze)
         else
           shape = { columns: table[:columns] }
           ops = codec.gist_opclasses_for(shape, cols: details[:columns])

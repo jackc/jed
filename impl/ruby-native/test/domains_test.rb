@@ -21,6 +21,7 @@ module NativeDomainTests
 
   def run
     JedNative.memory do |db|
+      db = db.session
       db.attach('Refs')
       error('42710') { db.attach('Refs') }
       error('42710') { db.attach('main') }
@@ -52,10 +53,12 @@ module NativeDomainTests
       main_path = File.join(directory, 'main.jed')
       ref_path = File.join(directory, 'ref.jed')
       JedNative.create(ref_path) do |db|
+        db = db.session
         db.execute('CREATE TABLE t (id i32 PRIMARY KEY, value text)')
         db.execute("INSERT INTO t VALUES (1, 'original')")
       end
       JedNative.create(main_path) do |db|
+        db = db.session
         db.execute('CREATE TABLE t (id i32 PRIMARY KEY)')
         db.attach('ref', ref_path)
         original_main = File.binread(main_path)
@@ -80,9 +83,11 @@ module NativeDomainTests
         db.execute('INSERT INTO t VALUES (3)')
       end
       JedNative.open(ref_path) do |db|
+        db = db.session
         assert(db.query('SELECT id, value FROM t').rows == [[1, 'savepoint']], 'standalone reopen sees attachment commits')
       end
       JedNative.open(main_path) do |db|
+        db = db.session
         assert(db.query('SELECT * FROM t').rows == [[3]], 'main commits remain independent')
         error('42P01') { db.query('SELECT * FROM ref.t') }
       end

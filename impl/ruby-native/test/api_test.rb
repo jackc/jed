@@ -23,6 +23,7 @@ module NativeApiTests
 
   def run
     JedNative.memory do |db|
+      db = db.session
       db.execute('CREATE TABLE items (id i16 PRIMARY KEY, v i32)')
       db.execute('INSERT INTO items VALUES (1,10)')
       statement = db.prepare('SELECT v FROM items WHERE id = $1')
@@ -51,6 +52,7 @@ module NativeApiTests
       result.columns[0].replace('mutated name')
       assert(db.query_prepared(statement, 3).rows == [['owned']], 'result strings do not alias stored cells')
       JedNative.memory do |other|
+        other = other.session
         other.execute('CREATE TABLE items (id i16 PRIMARY KEY, v text)')
         other.execute("INSERT INTO items VALUES (1,'other')")
         assert(other.query_prepared(statement, 1).rows == [['other']], 'statement binds to execution handle')

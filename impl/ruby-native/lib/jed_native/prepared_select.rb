@@ -107,12 +107,19 @@ module JedNative
       elsif plan.lookup
         key = evaluate(plan.lookup, [])
         if !key.nil? && stored[:native_primary_ordinal]
-          normalized = normalize_scan_bound(stored[:columns][stored[:native_primary_ordinal]][:type], key)
+          key_type = stored[:columns][stored[:native_primary_ordinal]][:type]
+          normalized = normalize_scan_bound(key_type, key)
           key = normalized == :unmatchable ? nil : normalized
+          bits = Types::INTEGER_BITS[key_type]
+          key = nil if key && bits && !key.between?(-(1 << (bits - 1)), (1 << (bits - 1)) - 1)
         end
         charge(stored.dig(:native_primary_metadata, :height) || 1) unless key.nil? || stored[:rows].empty?
         row = key.nil? ? nil : plan.index[key]
-        charge_scan_payload(stored, [stored[:native_row_positions][row.object_id]]) if row && stored[:native_row_positions]
+        if row.is_a?(PagedRow)
+          charge_scan_payload(stored, [row])
+        elsif row && stored[:native_row_positions]
+          charge_scan_payload(stored, [stored[:native_row_positions][row.object_id]])
+        end
         row ? [row] : []
       elsif stored
         candidates = primary_scan(stored, plan.predicate)

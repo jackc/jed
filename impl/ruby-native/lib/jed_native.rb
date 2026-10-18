@@ -44,6 +44,7 @@ require_relative 'jed_native/auxiliary_scans'
 require_relative 'jed_native/hash_joins'
 require_relative 'jed_native/join_planner'
 require_relative 'jed_native/nway_joins'
+require_relative 'jed_native/record_shapes'
 require_relative 'jed_native/join_pushdown'
 require_relative 'jed_native/body_pushdown'
 require_relative 'jed_native/index_nested_loops'
@@ -60,6 +61,9 @@ require_relative 'jed_native/join_explain'
 require_relative 'jed_native/nway_explain'
 require_relative 'jed_native/relation_explain'
 require_relative 'jed_native/access_planning'
+require_relative 'jed_native/tuple_intervals'
+require_relative 'jed_native/ordered_indexes'
+require_relative 'jed_native/subquery_access'
 require_relative 'jed_native/statistics_estimates'
 require_relative 'jed_native/create_table_as'
 require_relative 'jed_native/query_columns'
@@ -80,14 +84,22 @@ require_relative 'jed_native/spill_storage'
 require_relative 'jed_native/spill_select'
 require_relative 'jed_native/spill_aggregates'
 require_relative 'jed_native/explain_composition'
+require_relative 'jed_native/explain_subqueries'
 require_relative 'jed_native/query_memory'
 require_relative 'jed_native/contradictions'
 require_relative 'jed_native/opaque_definitions'
 require_relative 'jed_native/predicate_implication'
 require_relative 'jed_native/schema_resolution'
+require_relative 'jed_native/mutation_resolution'
+require_relative 'jed_native/foreign_key_work'
 require_relative 'jed_native/storage_limits'
+require_relative 'jed_native/deep_queries'
+require_relative 'jed_native/paged_access'
+require_relative 'jed_native/gin_queries'
+require_relative 'jed_native/join_edges'
 
 module JedNative
+  Engine.prepend(RecordShapes)
   VERSION = '0.0.0.experimental'
 
   class Statement
@@ -202,7 +214,7 @@ module JedNative
     require_relative 'jed_native/persistence'
     db = Database.new(**options)
     codec = FileFormat.new(collation_key: ->(name, value) { db.engine.resolve_collation(name).sort_key(value) })
-    state = codec.decode_image(bytes)
+    state = codec.decode_image(bytes, lazy: true)
     db.engine.instance_variable_set(:@native_page_size, bytes.byteslice(8, 4).unpack1('N'))
     db.engine.send(:import_storage, state)
     db.engine.seed_memory_image(bytes, state)
@@ -234,3 +246,6 @@ module JedNative
     end
   end
 end
+
+require_relative 'jed_native/sessions'
+require_relative 'jed_native/cursors'

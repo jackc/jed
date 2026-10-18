@@ -68,6 +68,7 @@ module JedNative
         (statement[:from] || []) + (statement[:joins] || []).map { |item| item[:relation] }
       end
       result = {}
+      sources = [statement[:native_scan_source]] if statement[:native_scan_source]
       sources.each do |source|
         next unless source[:kind] == :table && (stored = @tables[source[:name]])
         labels = [source[:alias] || source[:name]]
@@ -159,6 +160,9 @@ module JedNative
         end
       end
       return [] if lower && upper && lower >= upper
+      if @native_stream_scan && @native_ordered_scan
+        return storage_stream_rows(stored, lower: lower, upper: upper, reverse: @native_reverse_scan)
+      end
       entries = stored[:native_primary_entries]
       first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
       last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
@@ -206,6 +210,9 @@ module JedNative
         upper = prefix.empty? ? nil : prefix_successor(prefix)
         if range
           ordinal, comparisons = range
+          present, = stored[:native_secondary_codec].ordered_slot_tags(*details[:orders][ordinal])
+          lower = prefix + [present].pack('C')
+          upper = prefix_successor(lower)
           comparisons.each do |operator, value_expression|
             value = evaluate(value_expression, [])
             return [] if value.nil?

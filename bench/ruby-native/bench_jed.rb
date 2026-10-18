@@ -39,8 +39,9 @@ module NativeRubyBench
   Bench::ParamStream.prepend(ArrayParameterStream)
 
   class Engine
+    attr_reader :database
     def initialize(db, data_dir, dataset, scratch_dir = nil)
-      @db, @data_dir, @dataset, @scratch_dir = db, data_dir, dataset, scratch_dir
+      @database, @db, @data_dir, @dataset, @scratch_dir = db, db.session, data_dir, dataset, scratch_dir
       @closed = false
     end
 
@@ -51,9 +52,14 @@ module NativeRubyBench
     def stored_fingerprint = Bench.read_sidecar(@data_dir, @dataset, 'jed')
 
     def query_prepared(args, sum)
-      result = @db.query_prepared(@statement, *args)
-      if sum
-        result.rows.each do |row|
+      self.class.drain(@db.query_prepared(@statement, *args), sum)
+    end
+
+    def self.drain(result, sum)
+      count = 0
+      result.each do |row|
+        count += 1
+        if sum
           row.each do |value|
             case value
             when nil then sum.null
@@ -65,7 +71,7 @@ module NativeRubyBench
           sum.end_row
         end
       end
-      result.rows.length
+      count
     end
 
     def close
@@ -73,9 +79,72 @@ module NativeRubyBench
 
       @closed = true
       @db.close
+      @database.close
     ensure
       FileUtils.remove_entry(@scratch_dir) if @scratch_dir && File.directory?(@scratch_dir)
     end
+  end
+
+  # Reader sessions share one file and page cache. MRI's global VM lock still
+  # serializes Ruby execution; these threads measure that runtime honestly.
+  def self.run_concurrent(config, workload, readers, data_dir, fingerprint)
+    raise 'concurrent_read requires positive readers' unless readers.positive?
+    engine = config[:open].call(data_dir, workload.dataset)
+    sessions = Array.new(readers) { engine.database.read_session }
+    stream = Bench::ParamStream.new(workload)
+    warmup = Array.new(workload.warmup) { stream.next_args }
+    measured = Array.new(workload.iterations) { stream.next_args }
+    sql = workload.sql_for(config[:engine])
+    sums = Array.new(readers) { Bench::Checksum.new }
+    latencies = Array.new(readers) { [] }
+    rows = Array.new(readers, 0)
+    pass = lambda do |parameters, timed|
+      threads = sessions.each_with_index.map do |session, index|
+        base, extra = parameters.length.divmod(readers)
+        first = base * index + [index, extra].min
+        last = first + base + (index < extra ? 1 : 0)
+        Thread.new do
+          parameters[first...last].each do |args|
+            start = Bench.now_ns if timed
+            count = Engine.drain(session.query(sql, *args), timed ? sums[index] : nil)
+            next unless timed
+            latencies[index] << Bench.now_ns - start
+            rows[index] += count
+            if workload.expect_rows_per_iter && count != workload.expect_rows_per_iter
+              raise "expected #{workload.expect_rows_per_iter} rows per iteration, got #{count}"
+            end
+          end
+        end
+      end
+      errors = threads.filter_map do |thread|
+        begin
+          thread.value
+          nil
+        rescue Exception => error
+          error
+        end
+      end
+      raise errors.first unless errors.empty?
+    end
+    pass.call(warmup, false)
+    started_at = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    start = Bench.now_ns
+    pass.call(measured, true)
+    elapsed = Bench.now_ns - start
+    combined = Bench::Checksum.new
+    sums.each { |sum| combined.text(sum.hex) }
+    all = latencies.flatten.sort
+    result = Bench::ResultLine.new(workload.name, workload.dataset, workload.iterations,
+      workload.warmup, elapsed, elapsed / workload.iterations, all.first,
+      Bench.percentile(all, 50), Bench.percentile(all, 90), Bench.percentile(all, 99),
+      rows.sum, combined.hex, fingerprint, started_at)
+    result.define_singleton_method(:to_json_line) do |configuration|
+      JSON.generate(JSON.parse(super(configuration)).merge('readers' => readers))
+    end
+    result
+  ensure
+    sessions&.each(&:close)
+    engine&.close
   end
 
   def self.main
@@ -91,8 +160,8 @@ module NativeRubyBench
     source_hash = NativeRubySource.digest(source)
     fingerprint = Bench.corpus_fingerprint(corpus_dir)
     handles = []
-    parameter_data = TomlRB.load_file(File.join(corpus_dir, 'benchmarks.toml')).fetch('bench').to_h do |entry|
-      [entry.fetch('name'), entry.fetch('param', [])]
+    workload_data = TomlRB.load_file(File.join(corpus_dir, 'benchmarks.toml')).fetch('bench').to_h do |entry|
+      [entry.fetch('name'), entry]
     end
     config = { engine: 'jed', lang: 'ruby-native', variant: 'core', open: lambda do |dir, dataset|
       scratch = dataset == 'scratch' ? Dir.mktmpdir('scratch-ruby-native-', dir) : nil
@@ -107,13 +176,11 @@ module NativeRubyBench
       Bench.load_corpus(corpus_dir).each do |workload|
         next unless workload.runs_on?('jed') && workload.name.include?(filter)
         workload.params = workload.params.each_with_index.map do |parameter, index|
-          raw = parameter_data.fetch(workload.name).fetch(index)
+          raw = workload_data.fetch(workload.name).fetch('param', []).fetch(index)
           Parameter.new(*parameter.to_a, raw['elem_min'], raw['elem_max'])
         end
 
-        unsupported = if workload.kind == 'concurrent_read'
-                        'independent concurrent sessions are not implemented'
-                      elsif workload.relaxed
+        unsupported = if workload.relaxed
                         'batched synchronous=off durability is not implemented'
                       elsif workload.host_functions
                         'host-defined function registration is not implemented'
@@ -130,11 +197,14 @@ module NativeRubyBench
           end
           execution = workload.dup
           execution.warmup, execution.iterations = 0, 1 if smoke
-          result = if smoke
-                     Timeout.timeout(timeout) { Bench.run_one(config, execution, corpus_dir, data_dir, fingerprint) }
-                   else
-                     Bench.run_one(config, execution, corpus_dir, data_dir, fingerprint)
-                   end
+          run = lambda do
+            if workload.kind == 'concurrent_read'
+              run_concurrent(config, execution, workload_data.fetch(workload.name).fetch('readers'), data_dir, fingerprint)
+            else
+              Bench.run_one(config, execution, corpus_dir, data_dir, fingerprint)
+            end
+          end
+          result = smoke ? Timeout.timeout(timeout) { run.call } : run.call
           if smoke
             outcomes << { bench: workload.name, status: 'smoke_pass', checksum: result.checksum,
                           rows: result.rows_total, iterations: 1, batch: workload.batch }

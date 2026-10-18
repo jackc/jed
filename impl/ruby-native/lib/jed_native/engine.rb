@@ -36,13 +36,14 @@ module JedNative
       @cost, @scalar_bytes, @params = 0, 0, params
       @statement_clock, @uuid_counter = nil, 0
       @foreign_key_checks = {}
+      raise Error.new('25001', 'already in transaction') if statement[:kind] == :begin && @transaction
       if @failed && !%i[rollback rollback_to commit].include?(statement[:kind])
         raise Error.new('25P02', 'transaction is aborted')
       end
       before = snapshot
       previous_dirty = @dirty
       begin
-        if @read_only && !temporary_statement?(statement) && !%i[select values set_operation setop with commit rollback rollback_to savepoint release].include?(statement[:kind])
+        if @read_only && !(statement[:kind] == :explain && !statement[:analyze]) && !temporary_statement?(statement) && !%i[select values set_operation setop with commit rollback rollback_to savepoint release].include?(statement[:kind])
           raise Error.new('25006', 'read-only transaction')
         end
         result = dispatch(statement)
@@ -155,7 +156,10 @@ module JedNative
 
     def snapshot = [@tables.dup, @views.dup, @types.dup, @sequences.transform_values(&:dup)]
     def transaction_open? = !@transaction.nil?
-    def restore(state) = (@tables, @views, @types, @sequences = state)
+    def restore(state)
+      @tables, @views, @types = state.take(3).map(&:dup)
+      @sequences = state[3].transform_values(&:dup)
+    end
     def persist = (@dirty = false)
     def close = (@closed = true)
 
@@ -692,13 +696,7 @@ module JedNative
         group_nodes = respond_to?(:resolve_group_nodes) ? resolve_group_nodes(stmt, rel.columns) : (stmt[:group_by] || [])
         grouped = !group_nodes.empty? || compiled.any? { |e| aggregate_expr?(e) } || contains_aggregate?(stmt[:having]) || contains_aggregate?(stmt[:windows])
         complex_groups = group_nodes.any? { |g| %i[grouping_sets rollup cube].include?(g[:kind]) }
-        group_exprs = (complex_groups ? [] : group_nodes).map do |g|
-          if g[:kind] == :literal && g[:value].is_a?(Integer)
-            compiled[g[:value] - 1] || raise(Error.new('42P10', 'GROUP BY position out of range'))
-          else
-            compile(g, rel.columns)
-          end
-        end
+        group_exprs = (complex_groups ? [] : group_nodes).map { |g| compile(g, rel.columns) }
         group_exprs.each { |expression| ensure_comparable_type(expression.type) }
         compiled.each { |expression| ensure_comparable_type(expression.type) } if stmt[:distinct]
         validate_aggregate_scope(stmt, rel.columns, grouped) if respond_to?(:validate_aggregate_scope)
@@ -724,7 +722,7 @@ module JedNative
         columns = projections.zip(compiled).map { |p, e| { name: p[:alias] || expression_name(p[:expr]), type: e.type } }
         prepare_window_values(stmt, rel.columns, contexts) if respond_to?(:prepare_window_values)
         profile_checkpoint(:window) if @explain_profile_frames
-        defer_projection = !grouped && !stmt[:distinct] && !contains_window?(stmt[:columns])
+        defer_projection = !stmt[:distinct] && (cursor_output? || !grouped && !contains_window?(stmt[:columns]))
         if defer_projection
           output_owner = query_memory_owner if @query_memory && query_memory_collect_result?
           results = contexts.map { |row, group| [nil, row, group, {}] }
@@ -799,15 +797,25 @@ module JedNative
         raise Error.new('2201W', 'negative LIMIT') if limit && limit.negative?
         results = results.drop(offset)
         results = results.take(limit) if limit
+        cursor_rows = cursor_output(columns) if cursor_output?
         if defer_projection
           results.each do |entry|
             entry[0] = compiled.each_with_index.map { |expression, index| entry[3].fetch(index) { evaluate(expression, entry[1], entry[2]) } }
             query_memory_add_row(output_owner, entry[0], columns) if output_owner
+            if cursor_rows
+              charge
+              cursor_rows << entry[0]
+              entry[0] = nil
+            end
           end
         end
-        charge(results.length)
+        if cursor_rows && !defer_projection
+          results.each { |entry| charge; cursor_rows << entry[0] }
+        elsif !cursor_rows
+          charge(results.length)
+        end
         profile_checkpoint(:root) if @explain_profile_frames
-        result = Relation.new(columns: columns, rows: results.map(&:first))
+        result = Relation.new(columns: columns, rows: cursor_rows || results.map(&:first))
         query_memory_attach(result, output_owner) if output_owner
         result
       ensure
@@ -827,7 +835,9 @@ module JedNative
           rel = select(source[:native_body_query] || @views[name][:query])
         else
           t = table(name)
-          bound = source[:native_access_predicate] && compile_filter(source[:native_access_predicate], table_columns(t, source[:alias] || name))
+          bound_columns = table_columns(t, source[:alias] || name)
+          bound_columns = bound_columns.each_with_index.map { |column, i| column.merge(name: source[:columns]&.[](i) || column[:name]) } if source[:columns]
+          bound = source[:native_access_predicate] && compile_filter(source[:native_access_predicate], bound_columns)
           input = if source[:native_access_plan]
             execute_scan_access(t, bound, source[:native_access_plan])
           else
@@ -845,6 +855,7 @@ module JedNative
         rel = select(source[:query])
       when :join_group
         rel, = materialize_from(source[:from], source[:joins])
+        charge(rel.rows.length) unless source[:native_inline_group]
       when :function, :call, :srf
         call = source[:expr] || source[:call] || source
         args = (call[:args] || []).map { |a| evaluate(compile(a, []), []) }
@@ -1059,7 +1070,9 @@ module JedNative
         # form an outer scope, so a RIGHT JOIN can reference an earlier comma
         # sibling without depending on its own nullable left input.
         if !group_joins.empty? && sources.length > 1
-          component = { kind: :join_group, from: [source], joins: group_joins.map { |item| item.merge(from_index: 0) } }
+          component = @explain_runtime_plans && @explain_group_components&.[](source.object_id)
+          component ||= { kind: :join_group, from: [source], joins: group_joins.map { |item| item.merge(from_index: 0) },
+                        native_inline_group: index.zero? || group_joins.all? { |item| %i[inner cross].include?(item[:kind]) } }
           relation = index.zero? ? source_relation(component) : join(relation, component, :cross, nil, nil)
         else
           relation = index.zero? ? source_relation(source) : join(relation, source, :cross, nil, nil)

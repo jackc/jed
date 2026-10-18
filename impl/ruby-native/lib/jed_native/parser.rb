@@ -49,7 +49,7 @@ module JedNative
       statements = []
       until current.kind == :eof
         next if accept(';')
-        statements << statement
+        statements << normalize_select_into(statement)
         syntax('unexpected trailing token') unless current.kind == :eof || accept(';')
       end
       statements
@@ -63,6 +63,30 @@ module JedNative
     end
 
     private
+
+    def normalize_select_into(node)
+      return node.merge(statement: normalize_select_into(node[:statement])) if node[:kind] == :explain
+      query = node[:kind] == :create_view ? node[:query] : node
+      leftmost = query
+      leftmost = leftmost[:left] while leftmost && %i[setop set_operation].include?(leftmost[:kind])
+      sites = []
+      visit = lambda do |value|
+        case value
+        when Array then value.each { |child| visit.call(child) }
+        when Hash
+          sites << value if value[:kind] == :select && value[:into]
+          value.each_value { |child| visit.call(child) }
+        end
+      end
+      visit.call(node)
+      return node if sites.empty?
+      unless %i[select setop set_operation create_view].include?(node[:kind]) && sites.length == 1 && sites.first.equal?(leftmost)
+        syntax('INTO is only allowed on the leftmost top-level SELECT')
+      end
+      unsupported('SELECT INTO is not allowed in a view') if node[:kind] == :create_view
+      target = leftmost.delete(:into)
+      target.merge(kind: :create_table, query: node, columns: [], constraints: [])
+    end
 
     def current
       @tokens[@index]
@@ -1000,10 +1024,11 @@ module JedNative
     end
 
     def type_name
+      quoted = current.kind == :identifier
       name = identifier
-      if name == 'double' && accept('precision')
+      if !quoted && name == 'double' && accept('precision')
         name = 'double precision'
-      elsif name == 'character' && accept('varying')
+      elsif !quoted && name == 'character' && accept('varying')
         name = 'character varying'
       end
       modifier = nil
@@ -1168,6 +1193,7 @@ module JedNative
     end
 
     def table_constraint
+      definition_order = @index
       name = accept('constraint') ? identifier : nil
       result = if accept('primary')
                  expect('key')
@@ -1204,6 +1230,7 @@ module JedNative
                  syntax('expected table constraint')
                end
       result[:name] = name
+      result[:definition_order] = definition_order
       result
     end
 
@@ -1230,8 +1257,9 @@ module JedNative
           column[:unique] = true
           column[:unique_name] = constraint_name
         elsif accept('check')
+          definition_order = @index
           expect('(')
-          column[:checks] << { kind: :check, expr: expression, name: constraint_name }
+          column[:checks] << { kind: :check, expr: expression, name: constraint_name, definition_order: definition_order }
           expect(')')
         elsif at?('references')
           column[:references] = references.merge(name: constraint_name)
@@ -1297,7 +1325,9 @@ module JedNative
       method = accept('using') ? identifier : 'btree'
       expect('(')
       elements = separated do
+        parenthesized = at?('(')
         expr = expression
+        syntax('index expression must be parenthesized') unless parenthesized || %i[column call].include?(expr[:kind])
         direction_explicit = at?('desc') || at?('asc')
         direction = accept('desc') ? :desc : (accept('asc'); :asc)
         nulls = nil
@@ -1635,7 +1665,8 @@ module JedNative
           syntax('expected OLD or NEW') unless %w[old new].include?(kind)
           expect('as')
           name = identifier
-          syntax('duplicate RETURNING alias') if result[:returning_aliases].key?(kind.to_sym) || result[:returning_aliases].value?(name)
+          syntax('duplicate RETURNING alias') if result[:returning_aliases].key?(kind.to_sym)
+          raise Error.new('42712', 'duplicate RETURNING relation alias') if result[:returning_aliases].value?(name)
           result[:returning_aliases][kind.to_sym] = name
         end
         expect(')')

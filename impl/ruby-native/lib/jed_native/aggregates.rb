@@ -269,7 +269,9 @@ module JedNative
       name = node[:name]
       if name == 'grouping'
         raise Error.new('42601', 'invalid GROUPING syntax') if node[:over] || node[:distinct] || (node[:args] || []).empty? || node[:args].any? { |arg| arg[:kind] == :star }
-        return Expression.new(kind: :grouping, type: 'i32', args: node[:args].map { |arg| compile(arg, columns) })
+        arguments = node[:args].map { |arg| compile(arg, columns) }
+        raise Error.new('42803', 'GROUPING cannot refer to outer grouping columns') if arguments.any? { |argument| argument.kind == :outer }
+        return Expression.new(kind: :grouping, type: 'i32', args: arguments)
       end
       is_aggregate = Functions.aggregate?(name)
       raise Error.new('42809', 'DISTINCT is only valid for aggregate functions') if node[:distinct] && !is_aggregate

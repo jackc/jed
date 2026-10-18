@@ -3,7 +3,9 @@
 require 'json'
 require File.join(ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('../../../impl/ruby-native', __dir__)), 'lib/jed_native')
 
-db = JedNative.memory
+database = JedNative.memory
+# The archived first-working baseline predates the explicit Session surface.
+db = database.respond_to?(:session) ? database.session : database
 repetitions = validation_iterations = 0
 verify_only = ARGV.include?('--verify-only')
 File.foreach(ARGV.fetch(0)) do |line|
@@ -58,3 +60,4 @@ File.foreach(ARGV.fetch(0)) do |line|
   end
 end
 db.close
+database.close unless db.equal?(database)

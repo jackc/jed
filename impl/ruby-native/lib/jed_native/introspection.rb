@@ -140,6 +140,7 @@ module JedNative
           end
         end
       when 'jed_sequences'
+        return [] unless %w[main temp].include?(scope)
         @sequences.sort_by { |sequence_name, _| sequence_name.b }.filter_map do |sequence_name, sequence|
           owner, ordinal = sequence[:owned_by]
           temporary = sequence[:temporary] || (owner && @tables[owner]&.dig(:temporary))
@@ -148,9 +149,9 @@ module JedNative
            sequence[:called] ? sequence[:value] : nil, owner, owner && @tables[owner]&.dig(:columns, ordinal, :name)]
         end
       when 'jed_types'
-        scope == 'temp' ? [] : @types.keys.sort_by(&:b).map { |type| [type, 'composite'] }
+        scope != 'main' ? [] : @types.keys.sort_by(&:b).map { |type| [type, 'composite'] }
       when 'jed_type_fields'
-        scope == 'temp' ? [] : @types.sort_by { |type, _| type.b }.flat_map do |type, fields|
+        scope != 'main' ? [] : @types.sort_by { |type, _| type.b }.flat_map do |type, fields|
           fields.each_with_index.map { |column, index| [type, column[:name], index + 1, introspection_type(column), column[:nullable] == false] }
         end
       when 'jed_views'
@@ -239,7 +240,7 @@ module JedNative
       node = column[:default]
       return nil unless node
       return catalog_expression(node) if column[:view_default]
-      if node[:kind] == :literal || node[:kind] == :unary && node[:expr]&.dig(:kind) == :literal
+      if node[:kind] == :literal || node[:kind] == :unary && %w[+ -].include?(node[:op]) && node[:expr]&.dig(:kind) == :literal
         cost, scalar = @cost, @scalar_bytes
         begin
           expression = compile(node, [])
@@ -294,7 +295,12 @@ module JedNative
         text += " over #{catalog_window(node[:over])}" if node[:over]
         text
       when :star then node[:table] ? "#{catalog_identifier(node[:table], node[:table_quoted])} . *" : '*'
-      when :cast then "#{catalog_expression(node[:expr], 70)} :: #{SQLRender.type_name(node[:type], node[:type_mod])}"
+      when :cast
+        if node[:expr][:kind] == :literal && node[:expr][:value].is_a?(String) && node[:expr][:untyped] == false
+          "#{SQLRender.type_name(node[:type], node[:type_mod])} #{SQLRender.string(node[:expr][:value])}"
+        else
+          "#{catalog_expression(node[:expr], 70)} :: #{SQLRender.type_name(node[:type], node[:type_mod])}"
+        end
       when :subquery then "( #{catalog_query(node[:query])} )"
       when :array_query then "array ( #{catalog_query(node[:query])} )"
       when :quantified

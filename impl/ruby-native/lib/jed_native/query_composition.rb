@@ -17,6 +17,7 @@ module JedNative
     end
 
     def select_values(stmt, relation_only: false)
+      raise Error.new('42803', 'aggregate functions are not allowed in VALUES') if local_aggregate?(stmt[:rows])
       width = stmt[:rows].first&.length || 0
       raise Error.new('42601', 'VALUES width mismatch') unless stmt[:rows].all? { |row| row.length == width }
       compiled = stmt[:rows].map do |row|
@@ -48,6 +49,14 @@ module JedNative
       relation
     end
 
+    def sql_set_key(value)
+      case value
+      when Float then value.nan? ? :sql_nan : value
+      when Array then value.map { |item| sql_set_key(item) }
+      else value
+      end
+    end
+
     def select_set(stmt)
       left, right = select(stmt[:left]), select(stmt[:right])
       raise Error.new('42601', 'set-operation width mismatch') unless left.columns.length == right.columns.length
@@ -73,17 +82,17 @@ module JedNative
         state_owner = query_memory_owner
         types = columns.map { |column| column[:type] }
         remember = lambda do |set, row|
-          unless set.key?(row)
+          unless set.key?(sql_set_key(row))
             query_memory_add(state_owner, MemorySchedule::ENTRY + query_memory_key_bytes(row, types))
-            set[row] = 0
+            set[sql_set_key(row)] = 0
           end
-          set[row] += 1
+          set[sql_set_key(row)] += 1
         end
         seen = {}
         rows = if operation == 'union'
           (lrows + rrows).select do |row|
             next true if stmt[:all]
-            next false if seen.key?(row)
+            next false if seen.key?(sql_set_key(row))
             remember.call(seen, row)
             true
           end
@@ -91,11 +100,11 @@ module JedNative
           counts = {}
           rrows.each { |row| remember.call(counts, row) }
           lrows.select do |row|
-            found = counts.fetch(row, 0).positive?
-            counts[row] -= 1 if found && stmt[:all]
+            found = counts.fetch(sql_set_key(row), 0).positive?
+            counts[sql_set_key(row)] -= 1 if found && stmt[:all]
             next false unless operation == 'intersect' ? found : !found
             next true if stmt[:all]
-            next false if seen.key?(row)
+            next false if seen.key?(sql_set_key(row))
             remember.call(seen, row)
             true
           end
@@ -109,13 +118,13 @@ module JedNative
         end
       else
         rows = case operation
-             when 'union' then stmt[:all] ? lrows + rrows : (lrows + rrows).uniq
+             when 'union' then stmt[:all] ? lrows + rrows : (lrows + rrows).uniq { |row| sql_set_key(row) }
              when 'intersect', 'except'
-               counts = rrows.tally
-               input = stmt[:all] ? lrows : lrows.uniq
+               counts = rrows.map { |row| sql_set_key(row) }.tally
+               input = stmt[:all] ? lrows : lrows.uniq { |row| sql_set_key(row) }
                input.select do |row|
-                 found = counts.fetch(row, 0).positive?
-                 counts[row] -= 1 if found && stmt[:all]
+                 found = counts.fetch(sql_set_key(row), 0).positive?
+                 counts[sql_set_key(row)] -= 1 if found && stmt[:all]
                  operation == 'intersect' ? found : !found
                end
              else raise Error.new('42601', 'unknown set operation')
@@ -127,13 +136,17 @@ module JedNative
     end
 
     def source_relation(source)
+      if source[:columns] && source[:kind] == :subquery
+        width = query_metadata(source[:query], @outer.flat_map(&:first))[:columns].length
+        raise Error.new('42P10', 'too many derived column aliases') if source[:columns].length > width
+      end
       query = source[:query]
       if source[:kind] == :subquery && query[:kind] == :values &&
           (query[:order_by] || []).empty? && !query[:limit] && !query[:offset] && !query[:with]
         relation = select_values(query, relation_only: true)
         names = source[:columns] || []
         if names.length > relation.columns.length
-          raise Error.new('42601', 'too many VALUES column aliases')
+          raise Error.new('42P10', 'too many VALUES column aliases')
         end
         columns = relation.columns.each_with_index.map do |column, index|
           column.merge(name: names[index] || column[:name], table: source[:alias])
@@ -179,8 +192,10 @@ module JedNative
           Expression.new(kind: :column, type: relation.columns[index][:type], value: index)
         else
           if set_operation
-            raise Error.new('42P01', 'table qualifier is not visible after a set operation') if node[:kind] == :column && node[:table]
-            raise Error.new('0A000', 'set-operation ORDER BY accepts output columns or positions') unless node[:kind] == :column
+            output = node
+            output = output[:expr] while output[:kind] == :collate
+            raise Error.new('42P01', 'table qualifier is not visible after a set operation') if output[:kind] == :column && output[:table]
+            raise Error.new('0A000', 'set-operation ORDER BY accepts output columns or positions') unless output[:kind] == :column
           end
           compile(node, relation.columns)
         end
