@@ -208,9 +208,10 @@ for the normative bundle and ownership rules.
 
 ## 5. The OPFS host (the build target)
 
-The [proposed browser/Node runtime](ts-runtime.md) adds worker scheduling and explicit internal
-suspension for async crypto while retaining the OPFS byte device. It is not implemented;
-the following describes the current host and synchronous engine integration.
+The [browser/Node runtime](ts-runtime.md#10-implemented-async-host-contract) implements shared
+worker scheduling and bounded typed delivery while retaining the OPFS byte device. Explicit
+internal suspension for async page/crypto providers remains a follow-on. The following describes
+the byte host and synchronous internal engine integration.
 
 The browser host backs the database on the Origin Private File System via a
 `FileSystemSyncAccessHandle` — the one browser API that offers **synchronous** file I/O
@@ -258,10 +259,10 @@ OPFS just has to reproduce them. No new conformance capability, no format-versio
 - **Worker-thread requirement: engine-in-Worker + async RPC.** Sync access handles are Worker-only in
   most engines and acquisition is async (`getDirectory` → `getFileHandle` → `createSyncAccessHandle`), so
   the whole TS core runs in a dedicated Web Worker and the main thread drives it over `postMessage`
-  (`src/browser/worker.ts` + `client.ts`). The engine and the `BlockStore` seam stay **synchronous**;
-  only the acquisition edge (`opfs.ts`) and the client surface are async — hence the async browser entry
-  points (`createOpfs`/`openOpfs`), a documented per-platform divergence from the synchronous file
-  create/open (api.md §6). `db.path` is left null for OPFS (it is durable via `db.paging`, but has no
+  (`src/browser/worker.ts` + `async.ts`, using the common `src/async` runtime). The engine and the
+  `BlockStore` seam stay **synchronous** internally; both browser and Node application entry points
+  are async. `createOpfs`/`openOpfs` are worker-internal acquisition helpers. `db.path` is left null
+  for OPFS (it is durable via `db.paging`, but has no
   filesystem path), which keeps disk-spill off (the `ORDER BY` external merge sort has no OPFS backing
   yet — a later enhancement; sorts stay resident, spill.md §2). The txid-advance signal was re-keyed
   from `path` to the `persistHook` so an OPFS commit still advances txid (observably identical for the

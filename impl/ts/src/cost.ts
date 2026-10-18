@@ -20,6 +20,7 @@
 //     partial cost counts automatically and the cumulative is session state that survives a
 //     transaction rollback.
 
+import { cancellationCheckpoint, hasCancellation } from "./cancel.ts";
 import { DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { EngineError, engineError } from "./errors.ts";
 import { rowBytes, rowBytesMasked, valueBytes } from "./memsize.ts";
@@ -374,11 +375,15 @@ export class Meter {
   // lifetime budget — so guard() is a no-op. The gate for the Track A2/A3 columnar fast path
   // (packed-leaf.md §11): it charges the scan block in bulk (not per row with an intervening guard),
   // which reproduces the row path's exact total only when there is nothing to abort against; a metered
-  // query keeps the row path so its deterministic 54P01/54P02 abort row is unchanged. (Cancellation is
-  // boundary-only in the TS core — an AbortSignal checked at the cursor yield, not a per-guard poll — so
-  // it never moves the deterministic cost abort and is not part of this gate.)
+  // query keeps the row path so its deterministic 54P01/54P02 abort row is unchanged. Cancellation
+  // also keeps the row path so a worker flag is
+  // observed at the existing row checkpoints; polling never adds logical cost.
   isUnmetered(): boolean {
-    return this.limit <= 0n && (this.lifetime === undefined || this.lifetime.limit <= 0n);
+    return (
+      !hasCancellation() &&
+      this.limit <= 0n &&
+      (this.lifetime === undefined || this.lifetime.limit <= 0n)
+    );
   }
 
   // guard enforces the ceilings: it throws if the per-statement maxCost (54P01) OR the session
@@ -389,6 +394,7 @@ export class Meter {
   // so the abort is deterministic and cross-core identical (spec/design/cost.md §6, session.md §5.4).
   // The throw unwinds to the public API boundary, exactly like every other SQL error in the TS core.
   guard(): void {
+    cancellationCheckpoint();
     const stmtOver = this.limit > 0n && this.accrued >= this.limit;
     const l = this.lifetime;
     const lifeOver = l !== undefined && l.limit > 0n && l.total >= l.limit;

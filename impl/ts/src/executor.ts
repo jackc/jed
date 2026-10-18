@@ -1,3 +1,4 @@
+import { cancellationCheckpoint, withoutCancellation } from "./cancel.ts";
 // Statement executor (CLAUDE.md §10). Mirrors executor.go / executor.rs: dispatch a
 // parsed statement; analyze (resolve types, predicates, projections against the
 // catalog); run. Errors throw EngineError. Results are produced deterministically
@@ -3678,6 +3679,18 @@ export class Engine {
   // persistHook, §9), then swap it in as committed. A durable-write failure leaves committed untouched
   // and rethrows. Returns to autocommit.
   commitTx(): Outcome {
+    // Last safe cancellation point: discard the transaction before any commit preparation,
+    // page writes, or root publication. Cancellation after this point cannot undo the commit.
+    try {
+      cancellationCheckpoint();
+    } catch (error) {
+      this.rollbackTx();
+      throw error;
+    }
+    return withoutCancellation(() => this.commitTxUncancelable());
+  }
+
+  private commitTxUncancelable(): Outcome {
     this.stagedAttachments = [];
     this.commitChanges = { main: false, attached: false };
     const tx = this.session.tx;
@@ -15367,6 +15380,7 @@ export class Engine {
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): QueryPlan {
+    cancellationCheckpoint();
     // planSelectPushed directly, not planSelect: one frame fewer per nested query level
     // (spec/design/cost.md §7.1).
     if (qe.kind === "select") return this.planSelectPushed(qe, parent, ctes, ptypes, []);

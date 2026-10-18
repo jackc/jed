@@ -23,6 +23,12 @@ schema, and the function itself is never written to the file: a reopening host b
 an index or `CHECK` that uses a host function records which implementation it was built against
 (below).
 
+For Node TypeScript, register functions in a trusted worker-local module that exports
+`configure(builder)`, as shown below. Pass its file URL as `extensionModule` to
+`await createDatabase(...)` or `await openDatabase(...)`. Application closures and `Environment`
+instances cannot cross the worker boundary. The browser adapter currently accepts Unicode and
+time-zone bundles as bytes, but does not provide this module-loading extension hook.
+
 <CodeTabs topic="host-functions" />
 
 ## A function's shape
