@@ -1487,10 +1487,23 @@ impl Engine {
                 )?);
             }
             // The check option (views.md §15.6), after the row's own NOT NULL / CHECK / PK / UNIQUE
-            // checks and its index keys, before the batch FOREIGN KEY and EXCLUDE passes.
+            // checks and its index keys, before the batch EXCLUDE and FOREIGN KEY passes.
             eval_view_checks(view_checks, &row, &env, meter)?;
             entry_prefixes.push(row_prefixes);
             prepared.push((key, row));
+        }
+
+        // EXCLUDE constraints (spec/design/gist.md §7), before FK existence (PostgreSQL checks an
+        // exclusion constraint as each row is inserted, a foreign key at the end of the statement,
+        // so 23P01 wins over 23503; constraints.md §7) — a batch pass over the statement's END
+        // STATE: each new row must conflict with no STORED row (probe the backing GiST tree, whose
+        // leaf recheck is the full `(expr_i op_i)` conjunction) and no OTHER new row of this batch
+        // (pairwise — the resident tree holds only stored rows). The NULL rule / empty-range exempt
+        // a row, as does a partial constraint's not-TRUE predicate (§7.1); a btree exclusion probes
+        // its ordered index for an equal key (§7.2). Unmetered validation, before any write.
+        {
+            let rows: Vec<&Row> = prepared.iter().map(|(_, r)| r).collect();
+            self.validate_exclusions(table, &relation, &rows, &HashSet::new())?;
         }
 
         // FOREIGN KEY existence (constraints.md §6.4) — after all candidate rows are prepared, so
@@ -1536,18 +1549,6 @@ impl Engine {
                 }
                 self.fk_child_check(&relation, columns, fk, Some(probe), row, fk_temp)?;
             }
-        }
-
-        // EXCLUDE constraints (spec/design/gist.md §7), after FK existence — a batch pass over the
-        // statement's END STATE: each new row must conflict with no STORED row (probe the backing
-        // GiST tree, whose leaf recheck is the full `(expr_i op_i)` conjunction) and no OTHER new
-        // row of this batch (pairwise — the resident tree holds only stored rows). The NULL rule /
-        // empty-range exempt a row, as does a partial constraint's not-TRUE predicate (§7.1); a
-        // btree exclusion probes its ordered index for an equal key (§7.2). Unmetered validation,
-        // before any write.
-        {
-            let rows: Vec<&Row> = prepared.iter().map(|(_, r)| r).collect();
-            self.validate_exclusions(table, &relation, &rows, &HashSet::new())?;
         }
 
         // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
@@ -1713,6 +1714,9 @@ impl Engine {
         }
         eval_view_checks(view_checks, &row, &env, meter)?;
 
+        // EXCLUDE before FOREIGN KEY, as the batch path (constraints.md §7).
+        self.validate_exclusions(table, &relation, &[&row], &HashSet::new())?;
+
         let (fks, fk_temp) = self.target_foreign_keys(db_scope, table);
         for fk in fks {
             let Some(parent) = self.fk_snap(fk_temp).table(&fk.ref_table) else {
@@ -1737,8 +1741,6 @@ impl Engine {
             }
             self.fk_child_check(&relation, columns, &fk, Some(probe), &row, fk_temp)?;
         }
-
-        self.validate_exclusions(table, &relation, &[&row], &HashSet::new())?;
 
         meter.charge(COSTS.value_compress * cunits);
         meter.guard()?;
@@ -2340,6 +2342,22 @@ impl Engine {
             }
         }
 
+        // EXCLUDE (gist.md §7) over the END STATE, before FOREIGN KEY as INSERT and UPDATE: each
+        // inserted row and each updated NEW row must conflict with no stored row the statement keeps
+        // (an updated row's old version is vacated) and with no other new row. A conflict a DO
+        // NOTHING arbiter covers was skipped in phase 1, so what remains is a non-arbiter conflict
+        // — 23P01.
+        {
+            let rewritten: HashSet<&[u8]> =
+                updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
+            let rows: Vec<&Row> = updates
+                .iter()
+                .map(|(_, _, nr, _)| nr)
+                .chain(inserts.iter())
+                .collect();
+            self.validate_exclusions(table, &relation, &rows, &rewritten)?;
+        }
+
         // FOREIGN KEY child-side (constraints.md §6.4): each inserted row, and each updated row
         // that assigned an FK local column, must reference an existing parent key — the committed
         // parent state plus (for a self-reference) the statement's end state.
@@ -2390,21 +2408,6 @@ impl Engine {
                 }
                 self.fk_child_check(&relation, columns, fk, Some(probe), row, fk_temp)?;
             }
-        }
-
-        // EXCLUDE (gist.md §7) over the END STATE, as INSERT and UPDATE: each inserted row and each
-        // updated NEW row must conflict with no stored row the statement keeps (an updated row's old
-        // version is vacated) and with no other new row. A conflict a DO NOTHING arbiter covers was
-        // skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
-        {
-            let rewritten: HashSet<&[u8]> =
-                updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
-            let rows: Vec<&Row> = updates
-                .iter()
-                .map(|(_, _, nr, _)| nr)
-                .chain(inserts.iter())
-                .collect();
-            self.validate_exclusions(table, &relation, &rows, &rewritten)?;
         }
 
         // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE.

@@ -2176,13 +2176,31 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			rowPrefixes[k] = eks
 		}
 		// The check option (views.md §15.6), after the row's own NOT NULL / CHECK / PK / UNIQUE
-		// checks and its index keys, before the batch FOREIGN KEY and EXCLUDE passes.
+		// checks and its index keys, before the batch EXCLUDE and FOREIGN KEY passes.
 		if len(viewChecks) > 0 {
 			if err := evalViewChecks(viewChecks, row, &evalEnv{exec: db, rng: rng}, meter); err != nil {
 				return nil, err
 			}
 		}
 		prepared = append(prepared, preparedRow{key: key, row: row, prefixes: rowPrefixes})
+	}
+
+	// EXCLUDE constraints (spec/design/gist.md §7), before FK existence (PostgreSQL checks an
+	// exclusion constraint as each row is inserted, a foreign key at the end of the statement, so
+	// 23P01 wins over 23503; constraints.md §7) — a batch pass over the
+	// statement's END STATE: each new row must conflict with no STORED row (probe the backing GiST
+	// tree, whose leaf recheck is the full (expr_i op_i) conjunction) and no OTHER new row of this
+	// batch (pairwise — the resident tree holds only stored rows). The NULL rule / empty-range exempt
+	// a row, as does a partial constraint's not-TRUE predicate (§7.1); a btree exclusion probes its
+	// ordered index for an equal key (§7.2). Unmetered validation, before any write.
+	if len(table.Exclusions) > 0 {
+		newRows := make([]storedRow, len(prepared))
+		for i, pr := range prepared {
+			newRows[i] = pr.row
+		}
+		if err := db.validateExclusions(dbScope, table, store.colTypes, newRows, nil); err != nil {
+			return nil, err
+		}
 	}
 
 	// FOREIGN KEY existence (constraints.md §6.4) — after all candidate rows are prepared, so the
@@ -2238,22 +2256,6 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			if err := db.fkChildCheck(relation, table.Columns, fk, probe, true, pr.row, fkTemp); err != nil {
 				return nil, err
 			}
-		}
-	}
-
-	// EXCLUDE constraints (spec/design/gist.md §7), after FK existence — a batch pass over the
-	// statement's END STATE: each new row must conflict with no STORED row (probe the backing GiST
-	// tree, whose leaf recheck is the full (expr_i op_i) conjunction) and no OTHER new row of this
-	// batch (pairwise — the resident tree holds only stored rows). The NULL rule / empty-range exempt
-	// a row, as does a partial constraint's not-TRUE predicate (§7.1); a btree exclusion probes its
-	// ordered index for an equal key (§7.2). Unmetered validation, before any write.
-	if len(table.Exclusions) > 0 {
-		newRows := make([]storedRow, len(prepared))
-		for i, pr := range prepared {
-			newRows[i] = pr.row
-		}
-		if err := db.validateExclusions(dbScope, table, store.colTypes, newRows, nil); err != nil {
-			return nil, err
 		}
 	}
 
@@ -2405,6 +2407,11 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		return nil, err
 	}
 
+	// EXCLUDE before FOREIGN KEY, as the batch path (constraints.md §7).
+	if err := db.validateExclusions(dbScope, table, store.colTypes, []storedRow{row}, nil); err != nil {
+		return nil, err
+	}
+
 	relation := table.Name
 	fkTemp, _ := db.fkDomain(dbScope, table.Name)
 	for fki := range table.ForeignKeys {
@@ -2441,10 +2448,6 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		if err := db.fkChildCheck(relation, table.Columns, fk, probe, true, row, fkTemp); err != nil {
 			return nil, err
 		}
-	}
-
-	if err := db.validateExclusions(dbScope, table, store.colTypes, []storedRow{row}, nil); err != nil {
-		return nil, err
 	}
 
 	meter.Charge(costs.ValueCompress * cunits)
@@ -3222,6 +3225,23 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		}
 	}
 
+	// EXCLUDE (gist.md §7) over the END STATE, before FOREIGN KEY as INSERT and UPDATE: each inserted row and each
+	// updated NEW row must conflict with no stored row the statement keeps (an updated row's old
+	// version is vacated) and with no other new row. A conflict a DO NOTHING arbiter covers was
+	// skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
+	{
+		rewritten := make(map[string]struct{}, len(updates))
+		excRows := make([]storedRow, 0, len(updates)+len(inserts))
+		for _, u := range updates {
+			rewritten[string(u.key)] = struct{}{}
+			excRows = append(excRows, u.newRow)
+		}
+		excRows = append(excRows, inserts...)
+		if err := db.validateExclusions(dbScope, table, store.colTypes, excRows, rewritten); err != nil {
+			return 0, nil, err
+		}
+	}
+
 	// FOREIGN KEY child-side (constraints.md §6.4): each inserted row, and each updated row that
 	// assigned an FK local column, must reference an existing parent key — the committed parent
 	// state plus (for a self-reference) the statement's end state.
@@ -3297,23 +3317,6 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			if err := db.fkChildCheck(relation, table.Columns, fk, probe, true, row, fkTemp); err != nil {
 				return 0, nil, err
 			}
-		}
-	}
-
-	// EXCLUDE (gist.md §7) over the END STATE, as INSERT and UPDATE: each inserted row and each
-	// updated NEW row must conflict with no stored row the statement keeps (an updated row's old
-	// version is vacated) and with no other new row. A conflict a DO NOTHING arbiter covers was
-	// skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
-	{
-		rewritten := make(map[string]struct{}, len(updates))
-		excRows := make([]storedRow, 0, len(updates)+len(inserts))
-		for _, u := range updates {
-			rewritten[string(u.key)] = struct{}{}
-			excRows = append(excRows, u.newRow)
-		}
-		excRows = append(excRows, inserts...)
-		if err := db.validateExclusions(dbScope, table, store.colTypes, excRows, rewritten); err != nil {
-			return 0, nil, err
 		}
 	}
 
