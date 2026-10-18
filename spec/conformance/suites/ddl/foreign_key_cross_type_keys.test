@@ -1,0 +1,229 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# Cross-type foreign keys (constraints.md §6.2 step 5, §6.7) through the other key paths: a
+# referenced UNIQUE index and a referencing index in DESC order, an upsert that re-keys a referenced
+# row or rewrites a referencing one, and savepoints. Each probe takes the referencing value as
+# its exact equal of the paired type, whatever the index order. Rows verified against the live
+# PostgreSQL 18 oracle.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_key_order, ddl.foreign_key, ddl.foreign_key_cross_type, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, dml.insert_on_conflict_rekey, txn.explicit, txn.savepoint, query.select, query.order_by, query.where_eq, types.i16, types.i32, types.i64
+
+# --- a DESC referenced unique index and a DESC referencing index ---------------------------------
+
+statement ok
+CREATE TABLE pd (id i32 PRIMARY KEY, code i16)
+
+statement ok
+CREATE UNIQUE INDEX pd_code ON pd (code DESC NULLS FIRST)
+
+statement ok
+CREATE TABLE cd (id i32 PRIMARY KEY, code i64 REFERENCES pd (code) ON UPDATE CASCADE)
+
+statement ok
+CREATE INDEX cd_code ON cd (code DESC)
+
+statement ok
+INSERT INTO pd VALUES (1, 100), (2, 200), (3, -5)
+
+statement ok
+INSERT INTO cd VALUES (10, 100), (11, 200), (12, NULL), (13, -5)
+
+# Outside the referenced i16's range, and absent.
+statement error 23503
+INSERT INTO cd VALUES (14, 70000)
+
+statement error 23503
+INSERT INTO cd VALUES (14, 300)
+
+statement error 23503
+DELETE FROM pd WHERE code = 200
+
+statement ok
+UPDATE pd SET code = 150 WHERE code = 100
+
+statement ok
+UPDATE cd SET code = -5 WHERE id = 13
+
+query II nosort
+SELECT id, code FROM cd ORDER BY id
+----
+10
+150
+11
+200
+12
+NULL
+13
+-5
+
+# A two-column DESC/ASC referenced index, each column paired with a different type.
+statement ok
+CREATE TABLE pm (a i16, b i32, PRIMARY KEY (b, a))
+
+statement ok
+CREATE UNIQUE INDEX pm_ab ON pm (a DESC, b ASC)
+
+statement ok
+CREATE TABLE cm (id i32 PRIMARY KEY, a i64, b i16, FOREIGN KEY (a, b) REFERENCES pm (a, b))
+
+statement ok
+INSERT INTO pm VALUES (1, 10), (2, 10), (1, 20)
+
+statement ok
+INSERT INTO cm VALUES (1, 1, 10), (2, 2, 10), (3, 1, 20)
+
+statement error 23503
+INSERT INTO cm VALUES (4, 2, 20)
+
+statement error 23503
+DELETE FROM pm WHERE a = 2
+
+# --- an upsert that re-keys a referenced row, or rewrites a referencing one -----------------------
+
+statement ok
+CREATE TABLE pr (id i16 PRIMARY KEY)
+
+statement ok
+CREATE TABLE cr (id i32 PRIMARY KEY, pid i64 REFERENCES pr ON UPDATE CASCADE)
+
+statement ok
+CREATE TABLE crn (id i32 PRIMARY KEY, pid i32 REFERENCES pr)
+
+statement ok
+INSERT INTO pr VALUES (1), (2)
+
+statement ok
+INSERT INTO cr VALUES (10, 1)
+
+statement ok
+INSERT INTO crn VALUES (20, 2)
+
+# The re-key cascades to the wider referencing column.
+statement ok
+INSERT INTO pr VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 3
+
+query II nosort
+SELECT id, pid FROM cr ORDER BY id
+----
+10
+3
+
+# A NO ACTION reference refuses the re-key.
+statement error 23503
+INSERT INTO pr VALUES (2) ON CONFLICT (id) DO UPDATE SET id = 4
+
+# A referencing row an upsert rewrites: outside the referenced i16's range, then a parent key.
+statement error 23503
+INSERT INTO cr VALUES (10, 3) ON CONFLICT (id) DO UPDATE SET pid = 70000
+
+statement ok
+INSERT INTO cr VALUES (10, 3) ON CONFLICT (id) DO UPDATE SET pid = 2
+
+# The re-key's cascade does not fit a narrower referencing column.
+statement ok
+CREATE TABLE pw (id i64 PRIMARY KEY)
+
+statement ok
+CREATE TABLE cw (id i32 PRIMARY KEY, pid i16 REFERENCES pw ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO pw VALUES (1)
+
+statement ok
+INSERT INTO cw VALUES (1, 1)
+
+statement error 22003
+INSERT INTO pw VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 5000000000
+
+statement ok
+INSERT INTO pw VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 32767
+
+query II nosort
+SELECT id, pid FROM cw ORDER BY id
+----
+1
+32767
+
+query II nosort
+SELECT id, pid FROM cr ORDER BY id
+----
+10
+2
+
+query I nosort
+SELECT id FROM pr ORDER BY id
+----
+2
+3
+
+# --- savepoints --------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE ps (id i64 PRIMARY KEY)
+
+statement ok
+CREATE TABLE cs (id i32 PRIMARY KEY, pid i32 REFERENCES ps)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO ps VALUES (1), (5000000000)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO cs VALUES (1, 1)
+
+statement ok
+ROLLBACK TO SAVEPOINT a
+
+# The rolled-back child no longer holds its parent.
+statement ok
+DELETE FROM ps WHERE id = 1
+
+statement ok
+SAVEPOINT b
+
+statement error 23503
+INSERT INTO cs VALUES (2, 1)
+
+statement ok
+ROLLBACK TO SAVEPOINT b
+
+statement ok
+INSERT INTO ps VALUES (2)
+
+statement ok
+SAVEPOINT c
+
+statement ok
+INSERT INTO cs VALUES (2, 2)
+
+statement ok
+RELEASE SAVEPOINT c
+
+statement ok
+SAVEPOINT d
+
+statement error 23503
+DELETE FROM ps WHERE id = 2
+
+statement ok
+ROLLBACK TO SAVEPOINT d
+
+statement ok
+DELETE FROM ps WHERE id = 5000000000
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM ps ORDER BY id
+----
+2
+
+query II nosort
+SELECT id, pid FROM cs ORDER BY id
+----
+2
+2

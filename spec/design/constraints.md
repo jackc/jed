@@ -833,8 +833,11 @@ and compression work **does** accrue to the originating statement's cost and to 
   `datetime_ops` family — the `timestamp`↔`timestamptz` equality depends on the session `TimeZone`,
   so the same rows would satisfy the constraint under one setting and not another). jed's float,
   `date`, `timestamp`, and `timestamptz` are strict comparison islands (`i32 = f64` is itself
-  `42804`), so these FKs are `42804`. The strict type system (CLAUDE.md §4) and determinism (§10)
-  are the overriding reasons.
+  `42804`), so these FKs are `42804`. Likewise PostgreSQL pairs two *different* named composite
+  types (its `record_ops` compares any two composites field by field); a jed composite compares
+  only with its own type ([composite.md](composite.md) §5), so that FK is `42804` too. A range or
+  array pairs only with the same element type, in both. The strict type system (CLAUDE.md §4) and
+  determinism (§10) are the overriding reasons.
 - **A cascaded row is always re-checked.** PostgreSQL skips the RI check of an updated row whose
   key value did not change. When an `ON UPDATE CASCADE` from a `decimal` parent rounds the new value
   back to the integer child's old value (parent `5` → `5.25`, child stays `5`), PostgreSQL commits an

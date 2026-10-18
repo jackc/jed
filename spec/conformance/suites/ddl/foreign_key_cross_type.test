@@ -4,7 +4,7 @@
 # matches a parent key it EQUALS, so a value the referenced type cannot hold matches nothing; an
 # ON UPDATE CASCADE assigns the parent's new value with PostgreSQL's assignment cast. Rows verified
 # against the live PostgreSQL 18 oracle; the pairs jed still rejects are ledgered divergences.
-# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.foreign_key, ddl.foreign_key_cross_type, ddl.secondary_index, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, types.text, types.varchar_length, types.date, types.timestamp, types.timestamptz, cast.explicit
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.foreign_key, ddl.foreign_key_cross_type, ddl.secondary_index, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, types.text, types.varchar_length, types.date, types.timestamp, types.timestamptz, types.range, types.array, types.composite, ddl.composite_key, cast.explicit
 
 # --- integer types, either direction ----------------------------------------------
 
@@ -271,3 +271,34 @@ CREATE TABLE cx4 (v timestamptz REFERENCES pts)
 # A float never references an integer, in jed or PostgreSQL.
 statement error 42804
 CREATE TABLE cx5 (v f64 REFERENCES p64)
+
+# Two different named composite types: PostgreSQL compares any two composites field by field, but a
+# jed composite compares only with its own type (composite.md §5).
+statement ok
+CREATE TYPE ka AS (x i32)
+
+statement ok
+CREATE TYPE kb AS (x i32)
+
+statement ok
+CREATE TABLE pk_ka (k ka PRIMARY KEY)
+
+statement error 42804
+CREATE TABLE ck_kb (k kb REFERENCES pk_ka)
+
+# Container types pair only when their element types are equal, in jed and PostgreSQL alike: a range
+# or array of one integer type never references one of another.
+statement ok
+CREATE TABLE pr4 (k int4range PRIMARY KEY)
+
+statement error 42804
+CREATE TABLE cr8 (k int8range REFERENCES pr4)
+
+statement error 42804
+CREATE TABLE crd (k daterange REFERENCES pr4)
+
+statement ok
+CREATE TABLE pa4 (k i32[] PRIMARY KEY)
+
+statement error 42804
+CREATE TABLE ca8 (k i64[] REFERENCES pa4)
