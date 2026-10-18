@@ -149,7 +149,8 @@ type detailCase struct {
 	revokes           [][2]string
 	run               string
 	code              string
-	detail            string // "" = the Detail must be absent (`no-detail`)
+	detail            string  // "" = the Detail must be absent (`no-detail`)
+	message           *string // nil = the message is not checked
 }
 
 func parseDetailCases(t *testing.T, text string) []detailCase {
@@ -188,6 +189,8 @@ func parseDetailCases(t *testing.T, text string) []detailCase {
 			c.code = v
 		} else if v, ok := strings.CutPrefix(line, "detail: "); ok {
 			c.detail = v
+		} else if v, ok := strings.CutPrefix(line, "message: "); ok {
+			c.message = &v
 		} else if line != "no-detail" {
 			t.Fatalf("unknown detail_cases directive: %q", line)
 		}
@@ -243,6 +246,9 @@ func TestErrorFieldsDetailSharedCases(t *testing.T) {
 		if !errors.As(err, &e) {
 			failures = append(failures, fmt.Sprintf("%s: non-engine error %v", c.name, err))
 			continue
+		}
+		if c.message != nil && e.Message != *c.message {
+			failures = append(failures, fmt.Sprintf("%s: message %q, want %q", c.name, e.Message, *c.message))
 		}
 		if e.Code() != c.code || e.Detail != c.detail {
 			failures = append(failures, fmt.Sprintf("%s: got %s %q (%s), want %s %q",

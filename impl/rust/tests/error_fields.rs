@@ -196,6 +196,7 @@ struct DetailCase {
     run: String,
     code: String,
     detail: Option<String>,
+    message: Option<String>,
 }
 
 fn parse_detail_cases(text: &str) -> Vec<DetailCase> {
@@ -230,6 +231,8 @@ fn parse_detail_cases(text: &str) -> Vec<DetailCase> {
             c.code = v.to_string();
         } else if let Some(v) = line.strip_prefix("detail: ") {
             c.detail = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("message: ") {
+            c.message = Some(v.to_string());
         } else if line != "no-detail" {
             panic!("unknown detail_cases directive: {line}");
         }
@@ -273,6 +276,11 @@ fn detail_shared_cases() {
         match db.query_outcome(&c.run, &[]) {
             Ok(_) => failures.push(format!("{}: expected {} but succeeded", c.name, c.code)),
             Err(e) => {
+                if let Some(m) = &c.message
+                    && &e.message != m
+                {
+                    failures.push(format!("{}: message {:?}, want {:?}", c.name, e.message, m));
+                }
                 if e.code() != c.code || e.detail != c.detail {
                     failures.push(format!(
                         "{}: got {} {:?} ({}), want {} {:?}",

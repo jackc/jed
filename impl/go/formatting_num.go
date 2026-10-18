@@ -1253,7 +1253,7 @@ func toNumberText(input, tmpl string, m *costMeter) (Value, error) {
 // parseNumericIn reads the processor's digits as numeric_in does: [sign] digits [. digits],
 // surrounded by optional whitespace.
 func parseNumericIn(s string) (Decimal, error) {
-	bad := newError(InvalidTextRepresentation, "invalid input syntax for type numeric: \""+s+"\"")
+	bad := newError(InvalidTextRepresentation, "invalid input syntax for type numeric: \""+lossyUTF8(s)+"\"")
 	i := 0
 	for i < len(s) && isSpaceC(s[i]) {
 		i++

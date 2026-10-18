@@ -15,6 +15,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // --- template nodes --------------------------------------------------------------------------
@@ -239,6 +240,63 @@ func asciiUpperStr(s string) string {
 		}
 	}
 	return string(b)
+}
+
+// lossyUTF8 is s with each maximal ill-formed subsequence replaced by one U+FFFD — Unicode's
+// "substitution of maximal subparts" (§3.9), the rule Rust's String::from_utf8_lossy and the
+// WHATWG TextDecoder apply. An error message that quotes a byte slice of the input can split a
+// character (formatting.md §2); this keeps the message bytes identical across the cores.
+func lossyUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, w := utf8.DecodeRuneInString(s[i:])
+		if r != utf8.RuneError || w > 1 {
+			b.WriteString(s[i : i+w])
+			i += w
+			continue
+		}
+		b.WriteRune(utf8.RuneError)
+		i += utf8MaximalSubpart(s[i:])
+	}
+	return b.String()
+}
+
+// utf8MaximalSubpart is the length (at least 1) of the longest prefix of s, which starts with an
+// ill-formed sequence, that is still the start of some well-formed sequence (Unicode Table 3-7).
+func utf8MaximalSubpart(s string) int {
+	c := s[0]
+	var need int
+	lo, hi := byte(0x80), byte(0xBF)
+	switch {
+	case c >= 0xC2 && c <= 0xDF:
+		need = 1
+	case c == 0xE0:
+		need, lo = 2, 0xA0
+	case c >= 0xE1 && c <= 0xEC, c == 0xEE, c == 0xEF:
+		need = 2
+	case c == 0xED:
+		need, hi = 2, 0x9F
+	case c == 0xF0:
+		need, lo = 3, 0x90
+	case c >= 0xF1 && c <= 0xF3:
+		need = 3
+	case c == 0xF4:
+		need, hi = 3, 0x8F
+	default:
+		return 1
+	}
+	n := 1
+	for k := 0; k < need && n < len(s); k++ {
+		if s[n] < lo || s[n] > hi {
+			break
+		}
+		n++
+		lo, hi = 0x80, 0xBF
+	}
+	return n
 }
 
 func asciiLowerStr(s string) string {
@@ -901,12 +959,12 @@ func (r *dchReader) parseIntLen(dest *int32, ln int, i int) (int, error) {
 		var last int
 		result, last, erange = cStrtol(cp, 0)
 		if last > 0 && last < ln {
-			return -1, newError(InvalidDatetimeFormat, "invalid value \""+cp+"\" for \""+n.key.name+"\"")
+			return -1, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+n.key.name+"\"")
 		}
 		r.pos += last
 	}
 	if r.pos == init {
-		return -1, newError(InvalidDatetimeFormat, "invalid value \""+cp+"\" for \""+n.key.name+"\"")
+		return -1, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+n.key.name+"\"")
 	}
 	if erange || result < math.MinInt32 || result > math.MaxInt32 {
 		return -1, newError(DatetimeFieldOverflow, "value for \""+n.key.name+"\" in source string is out of range")
@@ -950,7 +1008,7 @@ func (r *dchReader) seqSearch(words []string, i int) (int, error) {
 				break
 			}
 		}
-		return 0, newError(InvalidDatetimeFormat, "invalid value \""+cp+"\" for \""+r.nodes[i].key.name+"\"")
+		return 0, newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(cp)+"\" for \""+r.nodes[i].key.name+"\"")
 	}
 	r.pos += ln
 	return idx, nil
@@ -1197,7 +1255,7 @@ func dchFromChar(nodes []fmtNode, in string, out *tmFromChar) error {
 		case dchY_YYY:
 			matched, millennia, years, nch := scanYYYY(in[r.pos:])
 			if matched < 2 {
-				return newError(InvalidDatetimeFormat, "invalid value \""+in[r.pos:]+"\" for \"Y,YYY\"")
+				return newError(InvalidDatetimeFormat, "invalid value \""+lossyUTF8(in[r.pos:])+"\" for \"Y,YYY\"")
 			}
 			m64 := int64(millennia) * 1000
 			y64 := int64(years) + m64
