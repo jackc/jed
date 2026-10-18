@@ -1628,7 +1628,7 @@ impl<'a> Runner<'a> {
                     return true;
                 };
                 drop(client);
-                self.net.disconnect(pid);
+                self.net.disconnect(pid, Path::new(MAIN_FILE));
                 self.net.settle();
                 self.emit(format!("{{\"i\":{i},\"op\":\"disconnect\",\"pid\":{pid}}}"));
                 return true;

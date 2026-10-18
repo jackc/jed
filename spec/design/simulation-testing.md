@@ -139,7 +139,7 @@ check
 | `corrupt flips=N [reseal=1]` | Bit rot in the main file (§6.3). Ends every session cleanly, flips bits, opens and reads, then repairs. |
 | `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
-| `spawn <p>`, `exit <p>`, `kill <p>`, `disconnect <p>` | Multi-process traces only (S8): start process `p` (owner when none runs, else a page client), close it cleanly (an owner drains its clients for its shutdown grace), crash it alone, or end its connection to the owner. `open <sid> <mode> p<N>` opens a session in `p` (default `p0`). |
+| `spawn <p>`, `exit <p>`, `kill <p>`, `disconnect <p>` | Multi-process traces only (S8): start process `p` (owner when none runs, else a page client), close it cleanly (an owner drains its clients for its shutdown grace), crash it alone, or end its connection to main's owner (not the connections it serves as an owner, nor those to an attachment's owner). `open <sid> <mode> p<N>` opens a session in `p` (default `p0`). |
 
 **Every faulted step and every crash ends the process.** After the step, the runner abandons the
 `Database` and its sessions and opens the disk as a new process would; that recovery and its oracle
