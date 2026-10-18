@@ -20,7 +20,9 @@ schema_version = 1
 #    fail to open; invalidate them.
 # 10: the on-disk format bumped 45 → 46 (ordered index keys), so v45 datasets fail to open;
 #    invalidate them.
-generator_version = 10
+# 11: the on-disk format bumped 46 → 47 (multi-column GIN + GIN posting runs), so v46 datasets
+#    fail to open; invalidate them.
+generator_version = 11
 
 [[dataset]]
 name = "small"

@@ -1,4 +1,4 @@
-//! GIN posting runs (spec/design/gin.md §4.5, `format_version` 43).
+//! GIN posting runs (spec/design/gin.md §4.5, `format_version` 47).
 //!
 //! A GIN entry tree stores each term's posting list as **runs**: one record key holds the term, the
 //! run's last (largest) storage key, then the run's earlier storage keys front-coded, then the coded

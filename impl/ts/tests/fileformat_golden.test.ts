@@ -548,7 +548,7 @@ function ginDecimalByteaTableDB(): Engine {
 // gin.md §2.1/§4.1): keys at two levels, an array string element (a KEY term) beside a member string
 // value (a STRING term), 1.5/1.50 as ONE number term, a top-level string, `{}` and a SQL NULL (no
 // entries), and a negative number. An ordered index i_n sits beside it.
-// ginMultiTableDB is the v43 multi-column GIN golden (gin.md §4.4): every entry is column_tag ‖ term ‖
+// ginMultiTableDB is the v47 multi-column GIN golden (gin.md §4.4): every entry is column_tag ‖ term ‖
 // storage key over an i32[] and a jsonb column; NULL and empty values contribute nothing.
 function ginMultiTableDB(): Engine {
   const db = goldenDb();

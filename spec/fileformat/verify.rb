@@ -1320,7 +1320,7 @@ GIN_DECIMAL_BYTEA_TABLE = {
 #   INSERT (1, '{"a": 1, "b": [true, null, "x"], "c": {"d": "e"}}', 1),
 #          (2, '["x", 1.5, 1.50, false, {"a": 2}]', 2), (3, '"x"', 3), (4, '{}', 4), (5, NULL, 5),
 #          (6, '-0.001', 6)
-# A MULTI-column GIN index (v43, the gin_multi golden, spec/design/gin.md §4.4) over an i32[] and a
+# A MULTI-column GIN index (v47, the gin_multi golden, spec/design/gin.md §4.4) over an i32[] and a
 # jsonb column: every entry is column_tag ‖ term ‖ storage key, tag 0 for `nums`, 1 for `doc`, so all
 # `nums` entries sort before all `doc` entries and the two columns' posting lists never mix. Row 2's
 # duplicate element is one entry; a NULL or empty value contributes no entry for its column only. The
@@ -2951,10 +2951,10 @@ end
 # equality: a float term's key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so {-0,0} and
 # {NaN,NaN} are one term each (Ruby's uniq would keep two distinct NaN objects).
 #
-# A MULTI-column GIN index (v43, gin.md §4.4) prefixes each column's terms with its 0-based key position
+# A MULTI-column GIN index (v47, gin.md §4.4) prefixes each column's terms with its 0-based key position
 # as one byte: column_tag ‖ term ‖ storage_key. A single-column index has no tag.
 #
-# Since v43 the tree's records are POSTING RUNS (gin.md §4.5): each term's storage keys, ascending,
+# Since v47 the tree's records are POSTING RUNS (gin.md §4.5): each term's storage keys, ascending,
 # packed greedily into run keys of at most GIN_RUN_MAX_BYTES (a run of one key may be longer). A run
 # key is term ‖ last ‖ body ‖ u16 BE len(body), the body front-coding every key but the last, in
 # ascending order, as varint(shared) ‖ varint(suffix length) ‖ suffix against the previous key (the

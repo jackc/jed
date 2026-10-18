@@ -875,7 +875,7 @@ fn gin_decimal_bytea_table_db() -> Session {
     db
 }
 
-/// A multi-column GIN index over an i32[] and a jsonb column (the v43 golden, spec/design/gin.md
+/// A multi-column GIN index over an i32[] and a jsonb column (the v47 golden, spec/design/gin.md
 /// §4.4): every entry is column_tag ‖ term ‖ storage key; NULL and empty values contribute nothing.
 fn gin_multi_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
