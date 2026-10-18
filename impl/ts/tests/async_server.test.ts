@@ -20,12 +20,16 @@ import type {
 } from "../src/async/protocol.ts";
 import { RuntimeServer } from "../src/async/server.ts";
 import { EngineError } from "../src/errors.ts";
+import { Rows } from "../src/api.ts";
+import { newQueryAccount } from "../src/cost.ts";
+import { Cursor } from "../src/cursor.ts";
+import { ioSteps, type Steps } from "../src/execution.ts";
 import { createDatabase } from "../src/file.ts";
 import { PrivilegeSet } from "../src/privileges.ts";
-import type { Database } from "../src/shared.ts";
+import { type Database, setAfterPersistHook } from "../src/shared.ts";
 import { render } from "../src/value.ts";
 
-function harness(core: Database, limits: Partial<RuntimeLimits> = {}) {
+function harness(core: Database, limits: Partial<RuntimeLimits> = {}, sharedCancellation = true) {
   let receive: (reply: RuntimeReply) => void = () => {};
   const server = new RuntimeServer({
     open: () => core,
@@ -39,7 +43,7 @@ function harness(core: Database, limits: Partial<RuntimeLimits> = {}) {
     onFailure: () => {},
     terminate: () => {},
   };
-  const connection = new RuntimeConnection(transport, limits, true);
+  const connection = new RuntimeConnection(transport, limits, sharedCancellation);
   return { server, connection, db: new AsyncDatabase(connection) };
 }
 
@@ -363,4 +367,240 @@ test("canceling a queued cursor fetch closes it and preserves failed transaction
   } finally {
     await db.close();
   }
+});
+
+// This host-lifecycle seam deliberately suspends one row at its page read. The SQL concurrency
+// semantics remain in the corpus above; here we verify worker control handling and continuation
+// ownership while a provider promise is pending, including hosts without SharedArrayBuffer.
+function suspendedHarness() {
+  const core = createDatabase();
+  let release!: () => void;
+  let notifyStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    notifyStarted = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const events: string[] = [];
+  const originalSession = core.session.bind(core);
+  let queries = 0;
+  core.session = (...args) => {
+    const session = originalSession(...args);
+    session.queryPreparedSteps = function* (): Steps<Rows> {
+      if (queries++ > 0) {
+        events.push("next statement");
+        return new Rows([], [], Cursor.buffered([], 0n, newQueryAccount(0n)), null);
+      }
+      let finished = false;
+      return new Rows(
+        ["n"],
+        ["i32"],
+        Cursor.streaming({
+          nextRow: () => {
+            throw new Error("unexpected synchronous row pull");
+          },
+          *nextRowSteps() {
+            try {
+              events.push("row started");
+              yield* ioSteps(
+                () => {},
+                async () => {
+                  notifyStarted();
+                  await pending;
+                },
+              );
+              return undefined;
+            } finally {
+              finished = true;
+              events.push("row unwound");
+            }
+          },
+          cost: () => 0n,
+          queryAccount: () => newQueryAccount(0n),
+          guardCost: () => {},
+          close: () => {
+            assert.equal(finished, true, "close must wait for the suspended row to unwind");
+            events.push("cursor closed");
+          },
+        }),
+        null,
+      );
+    };
+    return session;
+  };
+  return { ...harness(core, {}, false), release, started, events };
+}
+
+test("message cancellation unwinds suspended fetch before queued SQL runs", async () => {
+  const { db, connection, started, release, events } = suspendedHarness();
+  await connection.call("open");
+  const controller = new AbortController();
+  const rows = await db.query("SELECT 1", [], { signal: controller.signal });
+  const fetching = rows.next();
+  const rejected = assert.rejects(
+    fetching,
+    (error: unknown) => error instanceof EngineError && error.code() === "57014",
+  );
+  await started;
+  const queued = db.execute("SELECT 2");
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(events, ["row started"]);
+  release();
+  await rejected;
+  await queued;
+  assert.deepEqual(events, ["row started", "row unwound", "cursor closed", "next statement"]);
+  await db.close();
+});
+
+test("close waits for suspended fetch cleanup before releasing its session", async () => {
+  const { db, connection, started, release, events } = suspendedHarness();
+  await connection.call("open");
+  const rows = await db.query("SELECT 1");
+  const rejected = assert.rejects(
+    rows.next(),
+    (error: unknown) => error instanceof EngineError && error.code() === "57014",
+  );
+  await started;
+  let closed = false;
+  const closing = db.close().then(() => {
+    closed = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(closed, false);
+  assert.deepEqual(events, ["row started"]);
+  release();
+  await rejected;
+  await closing;
+  assert.deepEqual(events, ["row started", "row unwound", "cursor closed"]);
+});
+
+test("resident filtered scans accept message cancellation before producing a row", async () => {
+  const core = createDatabase();
+  core.execute("CREATE TABLE t (id i32)");
+  core.execute("INSERT INTO t SELECT g FROM generate_series(1, 2000) g");
+  const { db, connection } = harness(core, {}, false);
+  await connection.call("open");
+  const session = await db.session();
+  const tx = await session.begin(false);
+  const controller = new AbortController();
+  const rows = await tx.query("SELECT id FROM t WHERE id % 2 = -1", [], {
+    signal: controller.signal,
+  });
+  const fetching = rows.next();
+  const cancel = setTimeout(() => controller.abort(), 0);
+  try {
+    await assert.rejects(
+      fetching,
+      (error: unknown) => error instanceof EngineError && error.code() === "57014",
+    );
+    await assert.rejects(
+      tx.execute("SELECT 1"),
+      (error: unknown) => error instanceof EngineError && error.code() === "25P02",
+    );
+    await tx.rollback();
+    assert.deepEqual(await session.all("SELECT 1 AS n"), [{ n: 1n }]);
+  } finally {
+    clearTimeout(cancel);
+    await session.close();
+    await db.close();
+  }
+});
+
+test("canceled suspended scripts discard earlier writes and release the writer", async () => {
+  const core = createDatabase();
+  core.execute("CREATE TABLE source (id i32)");
+  core.execute("CREATE TABLE target (id i32)");
+  core.execute("INSERT INTO source SELECT g FROM generate_series(1, 2000) g");
+  const { db, connection } = harness(core, {}, false);
+  await connection.call("open");
+  const controller = new AbortController();
+  const script = db.executeScript(
+    "INSERT INTO target VALUES (1); SELECT id FROM source WHERE id % 2 = -1; INSERT INTO target VALUES (3)",
+    { signal: controller.signal },
+  );
+  const rejected = assert.rejects(
+    script,
+    (error: unknown) => error instanceof EngineError && error.code() === "57014",
+  );
+  const after = db.execute("INSERT INTO target VALUES (2)");
+  void after.catch(() => {});
+  const cancel = setTimeout(() => controller.abort(), 0);
+  try {
+    await rejected;
+    await after;
+    assert.deepEqual(await db.all("SELECT id FROM target"), [{ id: 2n }]);
+  } finally {
+    clearTimeout(cancel);
+    await db.close();
+  }
+});
+
+test("abort after durable commit reports success while discarding RETURNING rows", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "jed-async-committed-"));
+  const core = createDatabase({
+    path: join(directory, "database.jed"),
+    locking: "none",
+    skipFsync: true,
+  });
+  core.execute("CREATE TABLE t (id i32)");
+  const { db, connection } = harness(core);
+  await connection.call("open");
+  const controller = new AbortController();
+  let persisted = false;
+  setAfterPersistHook(() => {
+    persisted = true;
+    controller.abort();
+  });
+  try {
+    // The hook flips the SAB and delivers a control request while publication is masked. The
+    // committed statement must finish its buffered discard without another cancellation point.
+    const result = await db.execute(
+      "INSERT INTO t SELECT g FROM generate_series(1, 2000) g RETURNING id",
+      [],
+      { signal: controller.signal },
+    );
+    assert.equal(persisted, true);
+    assert.ok(result.cost > 0n);
+    setAfterPersistHook(null);
+    assert.equal((await db.get("SELECT count(*) AS n FROM t"))!.n, 2000n);
+  } finally {
+    setAfterPersistHook(null);
+    await db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("row close releases its snapshot pin once when source cleanup fails", () => {
+  let released = 0;
+  const rows = new Rows(
+    [],
+    [],
+    Cursor.streaming({
+      nextRow: () => undefined,
+      cost: () => 0n,
+      queryAccount: () => newQueryAccount(0n),
+      guardCost: () => {},
+      close: () => {
+        throw new Error("source cleanup failed");
+      },
+    }),
+    null,
+  );
+  rows.attachPin(() => {
+    released++;
+  });
+  assert.throws(() => rows.close(), /source cleanup failed/);
+  assert.throws(() => rows.close(), /source cleanup failed/);
+  assert.equal(released, 1);
+
+  const detached = new Rows([], [], Cursor.buffered([], 0n, newQueryAccount(0n)), null);
+  detached.attachPin(() => {
+    released++;
+    throw new Error("pin cleanup failed");
+  });
+  assert.throws(() => detached.close(), /pin cleanup failed/);
+  detached.close();
+  assert.equal(released, 2);
 });

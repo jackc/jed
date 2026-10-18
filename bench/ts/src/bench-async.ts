@@ -336,7 +336,7 @@ const report = `# TypeScript async boundary measurements
 
 Measured ${results.measuredAt}, base revision ${results.revision} (${results.workingTree} working tree), ${results.host.node}, ${results.host.platform}/${results.host.architecture}, ${results.host.cpu}.
 
-${results.workingTree === "modified" ? "The measurements include the uncommitted async implementation; the revision identifies its base commit.\n\n" : ""}Run with \`mise run bench:ts_async\`. This standalone harness adds no dependencies. Settings are in results.json; JED_ASYNC_SAMPLES, JED_ASYNC_WARMUP, JED_ASYNC_BATCH_SAMPLES, JED_ASYNC_LARGE_SAMPLES, JED_ASYNC_STARTUP_SAMPLES, JED_ASYNC_ROWS and JED_ASYNC_HEARTBEAT_ROWS override them. JED_ASYNC_RESULTS chooses the output directory.
+${results.workingTree === "modified" ? "The measurements include uncommitted working-tree changes; the revision identifies their base commit.\n\n" : ""}Run with \`mise run bench:ts_async\`. This standalone harness adds no dependencies. Settings are in results.json; JED_ASYNC_SAMPLES, JED_ASYNC_WARMUP, JED_ASYNC_BATCH_SAMPLES, JED_ASYNC_LARGE_SAMPLES, JED_ASYNC_STARTUP_SAMPLES, JED_ASYNC_ROWS and JED_ASYNC_HEARTBEAT_ROWS override them. JED_ASYNC_RESULTS chooses the output directory.
 
 The direct path uses the synchronous internal TS core. The worker path uses the same production AsyncDatabase and RuntimeConnection proxies over a real Node execution worker; its transport wrapper only counts requests and returned rows. Startup uses the public createDatabase factory. Both use in-memory storage and persistent sessions. Samples alternate direct/worker order, follow ${config.warmup} warmups, and check values, command tags and logical costs for equality outside the timed region. Cheap-query and large-result times include complete typed iteration and cursor close. Prepared-execute drains/discards results in the worker. Batch-100 is 100 autocommit SELECT statements in one request; its latency is for the whole batch.
 
@@ -367,7 +367,7 @@ A ${heartbeats.direct.intervalMs} ms interval runs while a warmed decimal aggreg
 | Direct core | ${number(heartbeats.direct.durationMs)} | ${heartbeats.direct.ticksDuringWork} | ${number(heartbeats.direct.gapMs.p50)} | ${number(heartbeats.direct.gapMs.p95)} | ${number(heartbeats.direct.gapMs.max)} |
 | Node worker | ${number(heartbeats.worker.durationMs)} | ${heartbeats.worker.ticksDuringWork} | ${number(heartbeats.worker.gapMs.p50)} | ${number(heartbeats.worker.gapMs.p95)} | ${number(heartbeats.worker.gapMs.max)} |
 
-These are warm in-memory measurements on this host. They do not measure durable commits, cold file reads, browser OPFS, cancellation latency, parallel readers, encryption, or another architecture. Result batching bounds delivery; the aggregate still uses the core's existing blocking execution path.
+These are warm in-memory measurements on this host. They do not measure durable commits, cold file reads, browser OPFS, cancellation latency, parallel readers, encryption, or another architecture. Result batching bounds delivery. The aggregate consumes its full input before producing a result; cooperative worker turns are separate from result-batch delivery.
 `;
 writeFileSync(join(directory, "report.md"), report);
 process.stdout.write(`Results: ${directory}\n`);

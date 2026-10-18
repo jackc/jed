@@ -7,8 +7,8 @@ import type { Statement } from "./ast.ts";
 import type { SessionState } from "./session.ts";
 import { throwIfAborted } from "./cancel.ts";
 import { Cursor } from "./cursor.ts";
+import { runSync, type Steps } from "./execution.ts";
 import {
-  drainRun,
   type JsParam,
   type Row as ErgoRow,
   type RunResult,
@@ -53,7 +53,7 @@ export function executePrepared(
   stmt: PreparedStatement,
   params: Value[] = [],
 ): RunResult {
-  return drainRun(queryPrepared(db, stmt, params));
+  return runSync(executePreparedSteps(db, stmt, params));
 }
 
 // queryPrepared runs a prepared query on a bare Engine handle, returning a row cursor. The prepared
@@ -62,7 +62,38 @@ export function executePrepared(
 // but reuses its cached plan across executes (spec/design/api.md §2.4). The shared-core surface is
 // Database/Session/Transaction.queryPrepared.
 export function queryPrepared(db: Engine, stmt: PreparedStatement, params: Value[] = []): Rows {
-  return queryStmt(db, stmt.ast, params, stmt.scHolder, stmt.icHolder);
+  return runSync(queryPreparedSteps(db, stmt, params));
+}
+
+export function* queryPreparedSteps(
+  db: Engine,
+  stmt: PreparedStatement,
+  params: Value[] = [],
+): Steps<Rows> {
+  return yield* queryStmtSteps(db, stmt.ast, params, stmt.scHolder, stmt.icHolder);
+}
+
+export function* executePreparedSteps(
+  db: Engine,
+  stmt: PreparedStatement,
+  params: Value[] = [],
+): Steps<RunResult> {
+  return yield* drainRunSteps(yield* queryPreparedSteps(db, stmt, params));
+}
+
+export function* querySteps(db: Engine, sql: string, params: Value[] = []): Steps<Rows> {
+  return yield* queryStmtSteps(db, db.parse(sql), params, null, null);
+}
+
+export function* drainRunSteps(rows: Rows): Steps<RunResult> {
+  try {
+    while (!(yield* rows.nextSteps()).done) {
+      /* drain and discard */
+    }
+    return { changes: rows.rowsAffected ?? 0, cost: rows.cost };
+  } finally {
+    rows.close();
+  }
 }
 
 // Rows is a cursor over a query's rows (spec/design/api.md §4). It is a thin wrapper over a Cursor
@@ -164,15 +195,16 @@ export class Rows implements Iterable<Value[]> {
   // advancing oldestLiveTxid. Idempotent; a no-op for a buffered cursor (it pins nothing). The
   // ergonomic iterators close on loop exit; a raw streaming Rows must be closed (JS has no destructor).
   close(): void {
-    this.cursor.close();
-    if (this.onClose) {
-      this.onClose();
-      this.onClose = undefined;
+    const releasePin = this.onClose;
+    this.onClose = undefined;
+    try {
+      this.cursor.close();
+    } finally {
+      releasePin?.();
     }
   }
 
   [Symbol.iterator](): Iterator<Value[]> {
-    const cursor = this.cursor;
     const self = this;
     return {
       // nextRow may throw mid-drain for a streaming cursor (a 54P01 cost abort or an arithmetic trap);
@@ -180,18 +212,22 @@ export class Rows implements Iterable<Value[]> {
       // propagates, fire the block-poison hook once: a drain-time read fault inside an open block aborts
       // it, so the next statement is 25P02 rather than wrongly running (transactions.md §6).
       next(): IteratorResult<Value[]> {
-        let row: Value[] | undefined;
-        try {
-          row = cursor.nextRow();
-        } catch (e) {
-          self.fireErr();
-          throw e;
-        }
-        return row !== undefined
-          ? { done: false, value: row }
-          : { done: true, value: undefined as unknown as Value[] };
+        return runSync(self.nextSteps());
       },
     };
+  }
+
+  *nextSteps(): Steps<IteratorResult<Value[]>> {
+    let row: Value[] | undefined;
+    try {
+      row = yield* this.cursor.nextRowSteps();
+    } catch (error) {
+      this.fireErr();
+      throw error;
+    }
+    return row !== undefined
+      ? { done: false, value: row }
+      : { done: true, value: undefined as unknown as Value[] };
   }
 }
 
@@ -232,7 +268,7 @@ export function prepare(db: Engine, sql: string): PreparedStatement {
 // at a time. (This is the bare single-handle Engine; the watermark pin lives on the shared-core
 // Session.query path.)
 export function query(db: Engine, sql: string, params: Value[] = []): Rows {
-  return queryStmt(db, db.parse(sql), params, null, null);
+  return runSync(querySteps(db, sql, params));
 }
 
 // queryStmt routes an already-parsed query AST through the plan-once scan (streaming/buffered) then
@@ -241,13 +277,13 @@ export function query(db: Engine, sql: string, params: Value[] = []): Rows {
 // null) and a prepared query (PreparedStatement.query passes its ScanCacheHolder), so a prepared query
 // streams identically to an ad-hoc one but reuses its cached plan across executes. (This is the bare
 // single-handle Engine; the watermark pin lives on the shared-core Session.query path.)
-function queryStmt(
+function* queryStmtSteps(
   db: Engine,
   stmt: Statement,
   params: Value[],
   holder: ScanCacheHolder | null,
   insertHolder: InsertCacheHolder | null,
-): Rows {
+): Steps<Rows> {
   // attachBlockPoison: a DRAIN-time read fault inside an open block aborts it (open-time lane errors are
   // poisoned by the catch below); a no-op for an autocommit read. The hook re-checks the block at error
   // time, so poisoning an already-ended block is harmless (transactions.md §6).
@@ -267,7 +303,7 @@ function queryStmt(
     !db.stmtIsWriteWithViews(stmt);
   try {
     if (isRead) db.gateReadLanes(stmt);
-    const scanned = db.tryScanQuery(stmt, params, holder);
+    const scanned = yield* db.tryScanQuerySteps(stmt, params, holder);
     if (scanned !== null) {
       return attachPoison(new Rows(scanned.columnNames, scanned.columnTypes, scanned.cursor, null));
     }
@@ -285,7 +321,7 @@ function queryStmt(
   // control) self-poisons in executeStmtParams's block branch with the right nuance (a nested BEGIN's
   // 25001 must NOT poison), so it is left intact — only the lazy-lane reads above, which bypass it, are
   // poisoned by the catch.
-  const outcome = db.executeStmtParams(stmt, params, insertHolder);
+  const outcome = yield* db.executeStmtParamsSteps(stmt, params, insertHolder);
   return rowsFromOutcome(outcome, db.session);
 }
 
@@ -319,13 +355,25 @@ export class Transaction {
   // write in a READ ONLY transaction is 25006; a statement error aborts the block (every later
   // statement but commit/rollback is then 25P02).
   execute(sql: string, params: Value[] = []): RunResult {
-    return drainRun(this.query(sql, params));
+    return runSync(this.executeSteps(sql, params));
+  }
+
+  *executeSteps(sql: string, params: Value[] = []): Steps<RunResult> {
+    return yield* drainRunSteps(yield* this.querySteps(sql, params));
+  }
+
+  *executePreparedSteps(stmt: PreparedStatement, params: Value[] = []): Steps<RunResult> {
+    return yield* drainRunSteps(yield* this.queryPreparedSteps(stmt, params));
   }
 
   // query runs a query within this transaction, returning a row cursor over the total query seam (a
   // non-query statement is a Rows with no output columns, carrying the command tag).
   query(sql: string, params: Value[] = []): Rows {
-    const outcome = this.db.executeStmtParams(this.db.parse(sql), params);
+    return runSync(this.querySteps(sql, params));
+  }
+
+  *querySteps(sql: string, params: Value[] = []): Steps<Rows> {
+    const outcome = yield* this.db.executeStmtParamsSteps(this.db.parse(sql), params);
     return rowsFromOutcome(outcome, this.db.session);
   }
 
@@ -346,7 +394,7 @@ export class Transaction {
   // executePrepared runs a prepared statement within this transaction, binding params, and returns
   // its command tag — the prepared analogue of execute (spec/design/api.md §2.4).
   executePrepared(stmt: PreparedStatement, params: Value[] = []): RunResult {
-    return drainRun(this.queryPrepared(stmt, params));
+    return runSync(this.executePreparedSteps(stmt, params));
   }
 
   // queryPrepared runs a prepared query within this transaction (against its working set), returning
@@ -354,7 +402,11 @@ export class Transaction {
   // SELECT lane), but it still threads the independent INSERT cache so a row-only block whose visible
   // schema matches committed state can fill and reuse immutable DML resolution (api.md §2.4).
   queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
-    const outcome = this.db.executeStmtParams(stmt.ast, params, stmt.icHolder);
+    return runSync(this.queryPreparedSteps(stmt, params));
+  }
+
+  *queryPreparedSteps(stmt: PreparedStatement, params: Value[] = []): Steps<Rows> {
+    const outcome = yield* this.db.executeStmtParamsSteps(stmt.ast, params, stmt.icHolder);
     return rowsFromOutcome(outcome, this.db.session);
   }
 

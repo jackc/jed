@@ -19,6 +19,9 @@ import { engineError } from "./errors.ts";
 export interface BlockStore {
   // readAt reads len bytes at byte offset. A short read past size() is the host's error (58030).
   readAt(offset: number, len: number): Uint8Array;
+  // Optional await-capable read for the runtime's retained page-fault continuation. The sync
+  // internal API continues to call readAt; both return the same bytes and short-read padding.
+  readAtAsync?(offset: number, len: number): Promise<Uint8Array>;
   // writeAt stages a write of bytes at byte offset — staged, not durable until sync (or setSize's
   // grow). Positioned: it must not move a shared cursor (hosts.md §2.1).
   writeAt(offset: number, bytes: Uint8Array): void;

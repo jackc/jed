@@ -1127,9 +1127,11 @@ live token, a one-goroutine watcher setting an atomic keeps the hot path to a si
 
 **Per-core reality** (CLAUDE.md §2). Go and Rust poll thread-safe cancellation at checkpoints.
 The TS async runtime maps `AbortSignal` to a shared atomic flag on Node and supported isolated
-browsers, polling parser/resolver and meter checkpoints during synchronous execution. Ordinary
-browsers without shared memory cancel between operations/fetches; interruption of a blocking
-kernel awaits cooperative continuation work. The internal synchronous `*Cancelable` methods
+browsers, polling parser/resolver and meter checkpoints during synchronous execution. All hosts
+also yield at logical page boundaries and common execution loops, including warm scans, so
+browsers without shared memory can process cancellation during a query. Cancellation is best
+effort: sorting, parsing/planning and long scalar kernels remain synchronous, with no guaranteed
+maximum latency. The internal synchronous `*Cancelable` methods
 continue checking the local signal at entry. Commit cancellation stops at the last safe point
 before storage/publication; a later abort cannot turn a completed commit into a rollback reply.
 
