@@ -799,7 +799,10 @@ tag is below every present tag (`0x00 < 0x01`, `0xFE < 0xFF`), under `NULLS LAST
 
 **Reading an ordered slot.** A slot is NULL iff its first byte is the order's NULL tag; otherwise
 the body follows the order's present tag (inverted for `DESC`, so a reader that skips a fixed-width
-body skips the same width, and a reader that needs the bare body inverts it back). A range bound over
+body skips the same width, a reader that skips a self-delimited body — terminator, decimal class,
+collated level separators — reads each byte through the inversion (XOR `0xFF`) and finds the same
+end, as the unified key-slot skipper does (indexes.md §5.1), and a reader that needs the bare body
+inverts it back). A range bound over
 a `DESC` element swaps endpoints: logical `≥ v` becomes physical `< succ(tag ‖ ~v)`, `> v` becomes
 `< tag ‖ ~v`, `< v` becomes `≥ succ(tag ‖ ~v)`, `≤ v` becomes `≥ tag ‖ ~v`, all within the element's
 present region `[tag, tag + 1)` (which excludes the NULL slot — a range is never true for NULL).
