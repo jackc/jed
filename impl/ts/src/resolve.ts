@@ -2141,7 +2141,15 @@ function resolveCastExpr(
     ) {
       const trap = castTrapClass(inner.type, target, typmod);
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, temporal: null, operand: inner.node, trap },
+        node: {
+          kind: "cast",
+          target,
+          typmod,
+          varcharLen: null,
+          temporal: null,
+          operand: inner.node,
+          trap,
+        },
         type: { kind: "bool" },
       };
     }
@@ -2152,7 +2160,15 @@ function resolveCastExpr(
     if (target === "i32") {
       const trap = castTrapClass(inner.type, target, typmod);
       return {
-        node: { kind: "cast", target, typmod, varcharLen: null, temporal: null, operand: inner.node, trap },
+        node: {
+          kind: "cast",
+          target,
+          typmod,
+          varcharLen: null,
+          temporal: null,
+          operand: inner.node,
+          trap,
+        },
         type: { kind: "int", ty: "i32" },
       };
     }
@@ -2210,7 +2226,15 @@ function resolveCastExpr(
       : { kind: "int", ty: target };
   const trap = castTrapClass(inner.type, target, typmod);
   return {
-    node: { kind: "cast", target, typmod, varcharLen: null, temporal: null, operand: inner.node, trap },
+    node: {
+      kind: "cast",
+      target,
+      typmod,
+      varcharLen: null,
+      temporal: null,
+      operand: inner.node,
+      trap,
+    },
     type: resultType,
   };
 }
