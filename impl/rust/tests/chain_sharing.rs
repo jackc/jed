@@ -271,3 +271,85 @@ fn rewrite_costs_do_not_depend_on_residency() {
     drop(paged);
     remove_db(&path);
 }
+
+/// The statements of [`kept_chains_stay_exclusive_across_savepoints_and_rekeys`], in three
+/// sessions over the file (each phase starts from a fresh open, so its rows are read from disk).
+const OWNERSHIP_PHASES: [&[&str]; 3] = [
+    &[
+        "BEGIN",
+        "SAVEPOINT a",
+        "UPDATE t SET n = n + 1000",
+        "UPDATE t SET id = id + 100 WHERE id <= 3",
+        "ROLLBACK TO SAVEPOINT a",
+        "UPDATE t SET n = n + 1 WHERE id <= 3",
+        "SAVEPOINT b",
+        "UPDATE t SET id = id + 200 WHERE id = 1",
+        "RELEASE SAVEPOINT b",
+        "SAVEPOINT c",
+        "UPDATE t SET id = id + 400 WHERE id = 2",
+        "ROLLBACK TO SAVEPOINT c",
+        "COMMIT",
+    ],
+    &[
+        "INSERT INTO t VALUES (2, 'ignored', 0) ON CONFLICT (id) DO UPDATE SET id = 300",
+        "INSERT INTO t SELECT id + 1000, body, n FROM t WHERE id IN (201, 300)",
+    ],
+    &[
+        "DELETE FROM t WHERE id IN (201, 300)",
+        "INSERT INTO t VALUES (13, 'FILLER', 13)",
+        "UPDATE t SET n = n + 1",
+    ],
+];
+
+fn ownership_sql(sql: &str) -> String {
+    sql.replace("FILLER", &filler_text(900))
+}
+
+/// A chain belongs to exactly one record per snapshot (large-values.md §15.3), across savepoint
+/// rollbacks, primary-key re-keys (UPDATE and upsert DO UPDATE), and row copies: rows rolled back
+/// to a savepoint keep their original chains, a re-keyed row takes its chain along, and a copy gets
+/// its own. The live-page self-check runs at every commit; deleting the original rows frees their
+/// chains for reuse, so a shared chain would surface as a wrong or corrupt copy.
+#[test]
+fn kept_chains_stay_exclusive_across_savepoints_and_rekeys() {
+    jed::tooling::VERIFY_LIVE_PAGES.store(true, std::sync::atomic::Ordering::Relaxed);
+    let path = tmp("jed_chain_share_ownership.jed");
+    let mut mem = Database::create(CreateOptions {
+        page_size: PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    seed(&mut mem);
+    {
+        let mut db = create(&path);
+        seed(&mut db);
+    }
+    let originals = rendered(
+        &mut mem,
+        "SELECT body FROM t WHERE id IN (1, 2) ORDER BY id",
+    );
+    for phase in OWNERSHIP_PHASES {
+        let mut db = open(&path).session(SessionOptions::default());
+        for sql in phase {
+            let sql = ownership_sql(sql);
+            mem.query_outcome(&sql, &[]).unwrap();
+            db.query_outcome(&sql, &[]).unwrap();
+        }
+        let q = "SELECT id, body, n FROM t ORDER BY id";
+        assert_eq!(rendered(&mut db, q), rendered(&mut mem, q));
+    }
+    let mut db = open(&path).session(SessionOptions::default());
+    let q = "SELECT id, body, n FROM t ORDER BY id";
+    assert_eq!(rendered(&mut db, q), rendered(&mut mem, q));
+    assert_eq!(
+        rendered(
+            &mut db,
+            "SELECT body FROM t WHERE id IN (1201, 1300) ORDER BY id"
+        ),
+        originals,
+        "the copies kept their own chains"
+    );
+    drop(db);
+    remove_db(&path);
+}
