@@ -6,7 +6,7 @@
 # rounds through the cast's typmod, on INSERT/UPDATE assignment, and through a composite field.
 # p > 6 is reduced to 6 (PostgreSQL also warns; jed has no warning channel — that one record lives in
 # introspection/temporal_typmod.test). All rows oracle-checked against PostgreSQL.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.select_no_from, query.where_eq, query.order_by, query.values_query, cast.explicit, cast.string_literal, types.i32, types.text, types.date, types.timestamp, types.timestamptz, types.interval, types.composite, types.timestamp_precision, harness.params
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.select_no_from, query.where_eq, query.order_by, query.values_query, cast.explicit, cast.string_literal, types.i32, types.text, types.date, types.timestamp, types.timestamptz, types.interval, types.composite, types.timestamp_precision, harness.params, func.to_char
 
 # --- casts of a literal: rounded at resolve ------------------------------------------------------
 query TTTT nosort
@@ -170,6 +170,17 @@ query T nosort
 SELECT (s).at FROM ev
 ----
 2020-01-01 00:00:01
+
+# --- to_char formats the rounded value ------------------------------------------------------------
+query T nosort
+SELECT to_char(timestamp '2020-01-01 00:00:00.567891'::timestamp(2), 'HH24:MI:SS.US')
+----
+00:00:00.570000
+
+query T nosort
+SELECT to_char(x, 'SS.MS') FROM (VALUES (timestamp '2020-01-01 00:00:59.9996'::timestamp(3))) v(x)
+----
+00.000
 
 # --- typmod errors -------------------------------------------------------------------------------
 # a second modifier is a syntax error
