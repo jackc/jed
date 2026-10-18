@@ -75,6 +75,8 @@ fn text_to_f64_finite() {
     assert_eq!(at(&mut db, "s :: float8", 4), Value::Float64(1000.0));
 }
 
+// 3.14 is test data here, not an approximation of π.
+#[allow(clippy::approx_constant)]
 #[test]
 fn text_to_f32_frounds() {
     let mut db = seeded(&["0.5", "3.14"]);

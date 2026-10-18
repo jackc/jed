@@ -41,7 +41,7 @@ def test_steps(checked:)
 end
 
 # The merge gate: `test` (with the Rust corpus walks under debug assertions + overflow checks) plus
-# spec-data + byte-fixture verification + codegen drift, formatting, the TS linter, the downstream
+# spec-data + byte-fixture verification + codegen drift, formatting, the TS linter, Rust clippy, the downstream
 # web type check, the real-process shared-file corpus, deterministic simulation (the regression
 # traces plus a fixed sweep), the real-browser e2e suites (headless Chromium: the TS core's OPFS host
 # and the website), and generative differential testing.
@@ -51,6 +51,7 @@ def ci_steps
     step("verify"),
     step("fmt"),
     step("lint"),
+    step("lint:rust"),
     step("web:check"),
     *test_steps(checked: true),
     step("concurrency:process"),
