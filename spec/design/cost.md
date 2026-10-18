@@ -914,7 +914,13 @@ the residual filter (the bound is a **superset** of the matching rows) and the *
 only the inner re-scan cost drops. A constant term co-occurring on the same key (`b.pk = a.x AND
 b.pk = 5`) rides along and tightens the per-outer seek. It is fully deterministic and byte-identical
 across cores (the outer rows, the key codec, and the overlap rule are all shared); a NULL sibling
-value gives a 3VL-empty bound (the inner reads nothing). **Reading the `ON` is sound here** (unlike the
+value gives a 3VL-empty bound (the inner reads nothing). A sibling (or correlated outer) column of
+a **promoted** numeric type is converted to the key's type per outer row, as a promoted `= ANY`
+element is (above): an integer of another width is range-checked, an integer against a `decimal`
+key is the equal decimal, and a `decimal` against an integer key is that integer when it is
+integral and in range — otherwise it equals no key, so an equality bound is empty and a range
+endpoint is dropped (a wider, still-sound scan; the full predicate is the residual). A mixed-width
+float pair is never a source (its `f32` side is a cast, § "Mixed-width floats"). **Reading the `ON` is sound here** (unlike the
 constant path): the inner is re-materialized per outer row, so a LEFT join's NULL-extension is driven
 per outer row by whether *its* bounded scan (re-checked against the full `ON`) yields a match — an
 empty bound NULL-extends that outer row, exactly as a full scan with no match would. **Gated to the

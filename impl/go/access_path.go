@@ -3727,6 +3727,18 @@ func encodeValueKey(pkType scalarType, v Value, coll *Collation) (key []byte, is
 	if v.IsNull() {
 		return nil, true, false
 	}
+	// A promoted source (an integer sibling/outer column against a decimal key, or a decimal one
+	// against an integer key — the comparison widened int → decimal) is first converted to the key's
+	// type, as an `= ANY` element is (pointValue, cost.md §3): an integer is the equal decimal; a
+	// decimal is that integer when it is integral and in range, else it equals no key (ok=false: an
+	// empty equality, a dropped range half-bound).
+	if (pkType.IsDecimal() && v.Kind == ValInt) || (pkType.IsInteger() && v.Kind == ValDecimal) {
+		pv, ok := pointValue(pkType, v)
+		if !ok {
+			return nil, false, false
+		}
+		v = pv
+	}
 	switch {
 	case pkType.IsBool():
 		return encodeBool(v.boolVal()), false, true
