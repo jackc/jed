@@ -37,7 +37,11 @@ module JedNative
       when :query_value
         charge
         relation = correlated(expression.extra[:scope], row) { select(expression.value) }
-        query_expression_value(expression.extra[:query_kind], relation, expression.type, expression.extra[:row_value], expression.extra[:negated])
+        begin
+          query_expression_value(expression.extra[:query_kind], relation, expression.type, expression.extra[:row_value], expression.extra[:negated])
+        ensure
+          query_memory_release(relation) if @query_memory
+        end
       when :row_query_compare
         charge
         left, right = expression.args.map { |argument| evaluate(argument, row, group) }
@@ -50,7 +54,9 @@ module JedNative
         unknown = false
         values.each do |right|
           charge
-          value = Types.binary(expression.extra[:op], left, right, type: 'boolean')
+          scalar_work(expr_operator = expression.extra[:op], left, right)
+          charge if [expression.args[0].type, expression.args[1].type.delete_suffix('[]')].sort == %w[f32 f64]
+          value = Types.binary(expr_operator, left, right, type: 'boolean')
           return !all if value == !all
           unknown ||= value.nil?
         end
@@ -60,7 +66,8 @@ module JedNative
         left = evaluate(expression.args.first, row, group)
         data = expression.extra
         choices = if data[:correlated]
-                    correlated(data[:scope], row) { select(expression.value) }.rows
+                    query_relation = correlated(data[:scope], row) { select(expression.value) }
+                    query_relation.rows
                   else data[:rows]
                   end
         all = data[:quantifier] == 'all'
@@ -69,6 +76,7 @@ module JedNative
         choices.each do |values|
           charge
           right = data[:row_value] ? values : values.first
+          scalar_work(data[:op], left, right) unless data[:row_value]
           value = data[:row_value] ? compare_sql_rows(data[:op], left, right) : Types.binary(data[:op], left, right, type: 'boolean')
           unknown ||= value.nil?
           if all
@@ -82,6 +90,8 @@ module JedNative
         data[:negated] && !result.nil? ? !result : result
       else super
       end
+    ensure
+      query_memory_release(query_relation) if @query_memory && query_relation
     end
 
     private

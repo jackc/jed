@@ -9,8 +9,25 @@ module JedNative
   module Persistence
     FOREIGN_ACTIONS = %i[no_action restrict cascade set_null set_default].freeze
 
+    def primary_scan(stored, predicate)
+      return nil unless stored[:collation_skew].to_a.empty?
+      super
+    end
+
+    def dispatch(statement)
+      if %i[insert update delete create_index alter_table].include?(statement[:kind])
+        stored = @tables[statement[:table] || statement[:name]]
+        if stored && !stored[:collation_skew].to_a.empty?
+          raise Error.new('XX002', "table requires collation upgrade: #{stored[:collation_skew].join(', ')}")
+        end
+      end
+      super
+    end
+
     def attach_storage(storage = nil, **options)
+      options[:collation_key] ||= ->(name, value) { resolve_collation(name).sort_key(value) }
       storage ||= Storage.new(**options)
+      storage.collation_key = options[:collation_key]
       @storage = storage
       import_storage(storage.load)
       @persisted_snapshot = storage_signature(export_storage)
@@ -40,6 +57,10 @@ module JedNative
         raise Error.new('0A000', 'a transaction may write at most one durable database')
       end
       publications.each do |domain, storage, state, signature|
+        skewed = @tables.values.find { |table| table[:database] == domain && !table[:collation_skew].to_a.empty? }
+        if skewed
+          raise Error.new('XX002', 'snapshot persistence requires an explicit collation upgrade before rebuilding skewed trees')
+        end
         storage.commit(state)
         if domain
           @attachments[domain][:storage_signature] = signature
@@ -54,7 +75,7 @@ module JedNative
 
     def to_image
       state = export_storage
-      codec = FileFormat.new
+      codec = statistics_codec
       codec.build_image(state[:types], state[:sequences], state[:tables],
                         @storage&.page_size || 8192, state[:collations], views: state[:views])
     end
@@ -76,7 +97,7 @@ module JedNative
             cache: sequence[:cache] || 1, cycle: !!sequence[:cycle], last_value: sequence[:value],
             is_called: sequence[:called], owned_by: sequence[:owned_by] }
         end,
-        collations: [],
+        collations: export_collations,
         views: @views.reject { |_, view| view[:temporary] || view[:database] }.map { |name, view| export_view(name, view) }
       }
     end
@@ -101,10 +122,31 @@ module JedNative
     end
 
     def remember_attachment_storage(domain)
+      @attachments.fetch(domain)[:storage].collation_key = ->(name, value) { resolve_collation(name).sort_key(value) }
       @attachments.fetch(domain)[:storage_signature] = storage_signature(export_attachment_storage(domain))
     end
 
     private
+
+    def export_collations
+      references = (@storage_collations || []).to_h { |entry| [entry[:name], entry] }
+      default = respond_to?(:default_collation) ? default_collation : 'C'
+      references.transform_values! { |entry| entry.merge(default: entry[:name] == default) }
+      if default != 'C' && !references.key?(default)
+        loaded = resolve_collation(default)
+        references[default] = { name: default, default: true, unicode: loaded.unicode_version, cldr: loaded.cldr_version, desc: loaded.description }
+      end
+      @tables.each_value do |table|
+        next if table[:temporary] || table[:database]
+        table[:columns].each do |column|
+          name = column[:collation]
+          next unless name && name != 'C' && !references.key?(name)
+          loaded = resolve_collation(name)
+          references[name] = { name: name, default: false, unicode: loaded.unicode_version, cldr: loaded.cldr_version, desc: loaded.description }
+        end
+      end
+      references.values.sort_by { |entry| entry[:name].b }
+    end
 
     def invalidate_storage_profiles(domain)
       # The append-only snapshot writer replaces every tree in the changed
@@ -139,9 +181,7 @@ module JedNative
       elsif %w[timestamp timestamptz interval].include?(type) && modifier
         result[:temporal] = { precision: modifier[:precision], fields: modifier[:fields] || 0 }
       end
-      if column[:collation] && column[:collation] != 'C'
-        raise Error.new('0A000', 'persisting non-C collations is not implemented in the Ruby experiment')
-      end
+      result[:collation] = column[:collation] if column[:collation] && column[:collation] != 'C'
       if column[:default]
         if type.end_with?('[]') || FileFormat::RANGE_ELEM.key?(type)
           raise Error.new('0A000', 'container column defaults have no supported file representation')
@@ -275,8 +315,15 @@ module JedNative
     end
 
     def import_storage(state)
-      if !state[:collations].to_a.empty?
-        raise Error.new('0A000', 'non-C collation catalogs are not implemented in the Ruby experiment')
+      @storage_collations = state[:collations] || []
+      @default_collation = @storage_collations.find { |entry| entry[:default] }&.dig(:name) || 'C'
+      skewed_collations = @storage_collations.filter_map do |entry|
+        begin
+          loaded = resolve_collation(entry[:name])
+        rescue Error
+          raise Error.new('XX002', "required collation #{entry[:name]} is unavailable")
+        end
+        entry[:name] if [entry[:unicode], entry[:cldr]] != [loaded.unicode_version, loaded.cldr_version]
       end
       @types = state[:types].to_h do |type|
         [type[:name], type[:fields].map { |field| import_column(field) }]
@@ -320,7 +367,8 @@ module JedNative
                  end
         [stored[:name], { name: stored[:name], columns: columns, constraints: constraints, indexes: indexes,
                          rows: rows, rowids: rowids, next_rowid: (rowids.max || -1) + 1, temporary: false,
-                         storage_rows: rows, storage_statistics: stored[:statistics], storage_tree_profile: stored[:tree_profile], storage_tree_rows: rows }]
+                         storage_rows: rows, storage_statistics: stored[:statistics], storage_tree_profile: stored[:tree_profile], storage_tree_rows: rows,
+                         collation_skew: columns.filter_map { |column| column[:collation] if skewed_collations.include?(column[:collation]) }.uniq }]
       end
       @sequences = state[:sequences].to_h do |sequence|
         [sequence[:name], sequence.merge(value: sequence[:last_value], called: sequence[:is_called])]

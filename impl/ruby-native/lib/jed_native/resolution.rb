@@ -20,6 +20,8 @@ module JedNative
       end
       expression = super
       case expression.kind
+      when :array
+        expression.type = expression.type.sub(/(?:\[\])+\z/, '') + '[]'
       when :cast
         arg = expression.args.first
         if arg.kind == :literal && (arg.value.nil? || arg.value.is_a?(String))

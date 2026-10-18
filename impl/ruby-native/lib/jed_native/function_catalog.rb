@@ -330,5 +330,34 @@ module JedNative
       "jsonb_build_object" => [[["any"], "immutable"]],
       "json_build_object" => [[["any"], "immutable"]],
     }.freeze
+
+    ARGUMENTS = {
+      "make_interval" => [[["years", "months", "weeks", "days", "hours", "mins", "secs"], ["integer", "integer", "integer", "integer", "integer", "integer", "float"], ["0", "0", "0", "0", "0", "0", "0"]]],
+      "make_timestamp" => [[["year", "month", "mday", "hour", "min", "sec"], ["integer", "integer", "integer", "integer", "integer", "float"], []]],
+      "make_timestamptz" => [[["year", "month", "mday", "hour", "min", "sec"], ["integer", "integer", "integer", "integer", "integer", "float"], []], [["year", "month", "mday", "hour", "min", "sec", "timezone"], ["integer", "integer", "integer", "integer", "integer", "float", "text"], []]],
+      "make_date" => [[["year", "month", "day"], ["integer", "integer", "integer"], []]],
+    }.freeze
+
+    SAFE_FUNCTIONS = {
+      "lower" => [["anyrange"], ["text"]],
+      "upper" => [["anyrange"], ["text"]],
+      "length" => [["text"], ["bytea"]],
+      "char_length" => [["text"]],
+      "character_length" => [["text"]],
+      "octet_length" => [["text"], ["bytea"]],
+      "bit_length" => [["text"], ["bytea"]],
+      "btrim" => [["text"], ["text", "text"], ["bytea", "bytea"]],
+      "ltrim" => [["text"], ["text", "text"], ["bytea", "bytea"]],
+      "rtrim" => [["text"], ["text", "text"], ["bytea", "bytea"]],
+      "reverse" => [["text"]],
+      "strpos" => [["text", "text"]],
+      "position" => [["text", "text"], ["bytea", "bytea"]],
+      "starts_with" => [["text", "text"]],
+      "ascii" => [["text"]],
+      "initcap" => [["text"]],
+      "md5" => [["text"], ["bytea"]],
+    }.freeze
+    SAFE_CASTS = [["i16", "i32"], ["i16", "i64"], ["i32", "i64"], ["i16", "decimal"], ["i32", "decimal"], ["i64", "decimal"], ["i16", "f64"], ["i32", "f64"], ["i64", "f64"], ["f32", "f64"], ["i16", "f32"], ["i32", "f32"], ["i64", "f32"], ["boolean", "i32"], ["i32", "boolean"], ["uuid", "text"], ["i16", "text"], ["i32", "text"], ["i64", "text"], ["decimal", "text"], ["f32", "text"], ["f64", "text"], ["boolean", "text"]].freeze
+    CAST_MODES = {["i16", "i32"] => "implicit", ["i16", "i64"] => "implicit", ["i32", "i64"] => "implicit", ["i32", "i16"] => "assignment", ["i64", "i16"] => "assignment", ["i64", "i32"] => "assignment", ["i16", "decimal"] => "implicit", ["i32", "decimal"] => "implicit", ["i64", "decimal"] => "implicit", ["decimal", "i16"] => "explicit", ["decimal", "i32"] => "explicit", ["decimal", "i64"] => "explicit", ["i16", "f64"] => "explicit", ["i32", "f64"] => "explicit", ["i64", "f64"] => "explicit", ["decimal", "f64"] => "explicit", ["f64", "i16"] => "explicit", ["f64", "i32"] => "explicit", ["f64", "i64"] => "explicit", ["f64", "decimal"] => "explicit", ["f32", "f64"] => "implicit", ["f64", "f32"] => "explicit", ["i16", "f32"] => "explicit", ["i32", "f32"] => "explicit", ["i64", "f32"] => "explicit", ["decimal", "f32"] => "explicit", ["f32", "i16"] => "explicit", ["f32", "i32"] => "explicit", ["f32", "i64"] => "explicit", ["f32", "decimal"] => "explicit", ["boolean", "i32"] => "explicit", ["i32", "boolean"] => "explicit", ["timestamptz", "timestamp"] => "explicit", ["timestamp", "timestamptz"] => "explicit", ["timestamptz", "date"] => "explicit", ["date", "timestamptz"] => "explicit", ["timestamp", "date"] => "explicit", ["date", "timestamp"] => "explicit", ["text", "uuid"] => "explicit", ["uuid", "text"] => "explicit", ["uuid", "bytea"] => "explicit", ["bytea", "uuid"] => "explicit", ["text", "i16"] => "explicit", ["text", "i32"] => "explicit", ["text", "i64"] => "explicit", ["text", "decimal"] => "explicit", ["text", "f32"] => "explicit", ["text", "f64"] => "explicit", ["text", "boolean"] => "explicit", ["text", "date"] => "explicit", ["text", "timestamp"] => "explicit", ["text", "timestamptz"] => "explicit", ["text", "interval"] => "explicit", ["text", "bytea"] => "explicit", ["i16", "text"] => "explicit", ["i32", "text"] => "explicit", ["i64", "text"] => "explicit", ["decimal", "text"] => "explicit", ["f32", "text"] => "explicit", ["f64", "text"] => "explicit", ["boolean", "text"] => "explicit", ["bytea", "text"] => "explicit", ["timestamp", "text"] => "explicit", ["timestamptz", "text"] => "explicit", ["date", "text"] => "explicit", ["interval", "text"] => "explicit", ["json", "text"] => "explicit", ["jsonb", "text"] => "explicit", ["jsonpath", "text"] => "explicit"}.freeze
   end
 end

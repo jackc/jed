@@ -17,6 +17,13 @@ Value, type, name, error-code, and cost mismatches also fail. Full audits remain
 red. The latest comprehensive audit will be recorded after implementation stops
 changing; intermediate runs are diagnostic, not a release gate.
 
+The October 18 implementation checkpoint includes a diagnostic run against a
+copied, immutable source tree (SHA-256
+`f01752a7c5847f9f47df2d10645b7d384cc864d85054abab90b6dc4c0500e88d`):
+679 files, 20,135 authored records, 19,798 executed, 18,779 passed, 1,019 failed,
+40 unsupported harness files, and no timeouts. The source hash was unchanged
+throughout the run. This is progress evidence, not a passing conformance claim.
+
 Executed independent checks include:
 
 - Native API: prepared statements, parameter inference and coercion, atomic
@@ -28,10 +35,16 @@ Executed independent checks include:
   serialization failures, and metadata reopening.
 - A real Ruby → Go → Ruby → Go file handoff covering decimal typmods, an index,
   overflow text, a view, updates, and inserts.
+- Immutable timezone and Unicode bundle loading: 16 shared timezone vectors,
+  46 shared collation sort-key vectors, casing, and byte round-trips.
+- Logical query-memory scheduling, ownership and pending writes; the current
+  memory audit passes 241 of 242 executable records, with spill still pending.
+- Actual bounded scans and two-input physical join selection: 30/30 bounded
+  LIMIT records and 32/32 P7 join-planning records at this checkpoint.
 
 None of these scoped results establishes whole-core conformance. In particular,
-the SQL planner, deterministic costs, resource accounts, environment bundles,
-page service, and the full host API still require implementation and verification.
+the remaining SQL planner, deterministic costs, spill/resource accounts, page
+service, and the full host API still require implementation and verification.
 
 ## Recorded prototype baseline
 
@@ -78,7 +91,9 @@ The engine reads and writes the current v49 shared file format, including
 validated COW content manifests. The current pure Ruby file host takes exclusive
 protocol-v2 ownership with Ruby's built-in `flock`. It does not yet serve or join
 the multi-process page service. Commits append a complete snapshot; page reuse,
-incremental domain persistence, and bounded page residency are unfinished.
+incremental page persistence, and bounded page residency are unfinished. Changed
+attachment domains persist independently and temporary-only work leaves main
+unchanged.
 Large-file performance must not be inferred from the small in-memory comparison.
 
 ## Completion criteria

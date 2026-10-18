@@ -17,7 +17,18 @@ module JedNative
         maximum = %w[array_to_json row_to_json].include?(name) ? 2 : 1
         raise Error.new('42883', 'invalid JSON function arity') unless args.length.between?(1, maximum)
         raise Error.new('42883', 'array_to_json requires an array') if name == 'array_to_json' && !args[0].type.end_with?('[]') && !%w[null unknown].include?(args[0].type)
-        raise Error.new('42804', 'row_to_json requires a record') if name == 'row_to_json' && args[0].type != 'record' && !@types.key?(args[0].type)
+        if name == 'row_to_json' && !%w[record unknown null].include?(args[0].type) && !@types.key?(args[0].type)
+          code = args[0].kind == :literal && args[0].extra&.dig(:untyped) && args[0].type == 'text' ? '0A000' : '42883'
+          raise Error.new(code, 'row_to_json requires a record')
+        end
+        if args.length == 2
+          argument = args[1]
+          if argument.kind == :literal && (argument.value.nil? || argument.value.is_a?(String) && argument.extra&.dig(:untyped))
+            args[1] = Expression.new(kind: :literal, type: 'boolean', value: cast_value(argument.value, 'boolean'))
+          elsif argument.type != 'boolean'
+            raise Error.new('42883', 'JSON pretty flag requires boolean')
+          end
+        end
       end
       Expression.new(kind: :json_image, value: name, args: args, type: name.start_with?('jsonb') || name == 'to_jsonb' ? 'jsonb' : 'json', extra: node)
     end
@@ -114,7 +125,7 @@ module JedNative
         pairs = []
         0.step(values.length - 1, 2) do |i|
           key = values[i]
-          raise Error.new('22023', 'JSON object key must not be null') if key.nil?
+          raise Error.new(binary ? '22023' : '22004', 'JSON object key must not be null') if key.nil?
           raise Error.new('22023', 'JSON object key must be scalar') if key.is_a?(Array) || key.is_a?(JsonValue)
           pairs << JsonValue.escape(json_key_text(key, args[i].type)) + ' : ' + json_image_text(values[i + 1], args[i + 1].type, args[i + 1])
         end

@@ -9,7 +9,11 @@ module JedNative
         args = args.each_with_index.map do |arg, index|
           target = index < 2 ? element : 'text'
           if arg[:kind] == :literal && (arg[:untyped] || arg[:value].nil?)
-            { kind: :cast, type: target, expr: arg }
+            if arg[:value].is_a?(Integer)
+              { kind: :literal, value: cast_value(arg[:value], target), type: target }
+            else
+              { kind: :cast, type: target, expr: arg }
+            end
           else arg
           end
         end

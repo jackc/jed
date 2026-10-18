@@ -80,9 +80,14 @@ module JedNative
     def compile(node, columns)
       if node[:kind] == :binary && JSON_OPERATORS.include?(node[:op])
         left = compile(node[:left], columns)
+        right = nil
+        if node[:op] == '<@' && left.kind == :literal && left.extra&.dig(:untyped)
+          right = compile(node[:right], columns)
+          left = json_adapt_argument(left, 'jsonb') if right.type == 'jsonb'
+        end
         if %w[json jsonb].include?(left.type)
           op = node[:op]
-          right = compile(node[:right], columns)
+          right ||= compile(node[:right], columns)
           wanted = case op
           when '#>', '#>>', '#-', '?|', '?&' then 'text[]'
           when '@>', '<@', '||' then 'jsonb'
@@ -92,6 +97,10 @@ module JedNative
           type = %w[? ?| ?& @> <@].include?(op) ? 'boolean' : %w[->> #>>].include?(op) ? 'text' : left.type
           return Expression.new(kind: :json_operator, value: op, type: type, args: [left, right])
         end
+        # The ordinary operator still needs the operand that we resolved while
+        # selecting the JSON overload. Reusing it keeps left-deep trees linear.
+        node = node.merge(left: { kind: :resolved_expression, expression: left })
+        node = node.merge(right: { kind: :resolved_expression, expression: right }) if right
       elsif node[:kind] == :call && JSON_MUTATORS.include?(node[:name])
         name = node[:name]
         slots = ['jsonb_in', 'path', 'replacement', name == 'jsonb_insert' ? 'insert_after' : 'create_if_missing', 'null_value_treatment']
