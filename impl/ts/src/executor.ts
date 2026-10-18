@@ -17818,18 +17818,16 @@ export class Engine {
     }));
     const mismatch = "function return row and query-specified return row do not match";
     if (fields.length !== columns.length) {
-      throw engineError(
-        "datatype_mismatch",
-        `${mismatch}: returned row contains ${fields.length} attribute${fields.length === 1 ? "" : "s"}, but query expects ${columns.length}`,
+      throw engineError("datatype_mismatch", mismatch).withDetail(
+        `Returned row contains ${fields.length} attribute${fields.length === 1 ? "" : "s"}, but query expects ${columns.length}.`,
       );
     }
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i]!;
       const col = columns[i]!;
       if (!recordFieldFits(typeFromResolved(f.type), col.type)) {
-        throw engineError(
-          "datatype_mismatch",
-          `${mismatch}: returned type ${rtName(f.type)} at ordinal position ${i + 1}, but query expects ${rtName(resolvedTypeOfCol(col.type, this))}`,
+        throw engineError("datatype_mismatch", mismatch).withDetail(
+          `Returned type ${rtName(f.type)} at ordinal position ${i + 1}, but query expects ${rtName(resolvedTypeOfCol(col.type, this))}.`,
         );
       }
     }

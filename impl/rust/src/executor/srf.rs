@@ -919,27 +919,27 @@ impl Engine {
         }
         let mismatch = "function return row and query-specified return row do not match";
         if rec.fields.len() != columns.len() {
-            return Err(EngineError::new(
-                SqlState::DatatypeMismatch,
-                format!(
-                    "{mismatch}: returned row contains {} attribute{}, but query expects {}",
+            return Err(
+                EngineError::new(SqlState::DatatypeMismatch, mismatch).with_detail(Some(format!(
+                    "Returned row contains {} attribute{}, but query expects {}.",
                     rec.fields.len(),
                     if rec.fields.len() == 1 { "" } else { "s" },
                     columns.len()
-                ),
-            ));
+                ))),
+            );
         }
         for (i, ((_, fty), col)) in rec.fields.iter().zip(&columns).enumerate() {
             if !record_field_fits(&type_from_resolved(fty)?, &col.ty) {
-                return Err(EngineError::new(
-                    SqlState::DatatypeMismatch,
-                    format!(
-                        "{mismatch}: returned type {} at ordinal position {}, but query expects {}",
-                        fty.type_name(),
-                        i + 1,
-                        resolved_type_of_col(&col.ty, self).type_name()
-                    ),
-                ));
+                return Err(
+                    EngineError::new(SqlState::DatatypeMismatch, mismatch).with_detail(Some(
+                        format!(
+                            "Returned type {} at ordinal position {}, but query expects {}.",
+                            fty.type_name(),
+                            i + 1,
+                            resolved_type_of_col(&col.ty, self).type_name()
+                        ),
+                    )),
+                );
             }
         }
         Ok(Box::new(Table {
