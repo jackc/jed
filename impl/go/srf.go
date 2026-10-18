@@ -536,8 +536,9 @@ func (db *engine) resolveUnnestRecord(rec *compositeRType, defs []typeFieldDef, 
 		if len(rec.fields) == 1 {
 			plural = ""
 		}
-		return nil, newError(DatatypeMismatch, fmt.Sprintf("%s: returned row contains %d attribute%s, but query expects %d",
-			mismatch, len(rec.fields), plural, len(columns)))
+		return nil, newError(DatatypeMismatch, mismatch).
+			withDetail(fmt.Sprintf("Returned row contains %d attribute%s, but query expects %d.",
+				len(rec.fields), plural, len(columns)))
 	}
 	for i, f := range rec.fields {
 		fty, err := typeFromResolved(f.ty)
@@ -545,8 +546,9 @@ func (db *engine) resolveUnnestRecord(rec *compositeRType, defs []typeFieldDef, 
 			return nil, err
 		}
 		if !recordFieldFits(fty, columns[i].Type) {
-			return nil, newError(DatatypeMismatch, fmt.Sprintf("%s: returned type %s at ordinal position %d, but query expects %s",
-				mismatch, rtName(f.ty), i+1, rtName(resolvedTypeOfCol(columns[i].Type, db.readSnap()))))
+			return nil, newError(DatatypeMismatch, mismatch).
+				withDetail(fmt.Sprintf("Returned type %s at ordinal position %d, but query expects %s.",
+					rtName(f.ty), i+1, rtName(resolvedTypeOfCol(columns[i].Type, db.readSnap()))))
 		}
 	}
 	tname := "unnest"

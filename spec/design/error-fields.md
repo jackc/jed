@@ -240,6 +240,8 @@ when `Detail` is set ([cli.md](cli.md) §5).
 | 22P02 | an unpaired surrogate `\u` escape, decoded (same sites) | `Unicode low surrogate must follow a high surrogate.` / `Unicode high surrogate must not follow a high surrogate.` |
 | 22P02 | a JSON `\u` escape without four hex digits ([json.md](json.md) §4.2) | `"\u" must be followed by four hexadecimal digits.` |
 | 42P10 | a reference from the right side of a `RIGHT` / `FULL` join to that join's left side ([grammar.md](grammar.md) §44) | `The combining JOIN type must be INNER or LEFT for a LATERAL reference.` |
+| 42804 | a column-definition list on `unnest(record[])` whose column count differs from the record's ([composite.md](composite.md) §13) | `Returned row contains {n} attribute[s], but query expects {m}.` |
+| 42804 | the same list, a field type that does not fit its column | `Returned type {ft} at ordinal position {i}, but query expects {ct}.` |
 
 `{row}` is every column of the target table in ordinal order, from the candidate (new) row.
 
@@ -341,6 +343,7 @@ There is no format bump and no cost-schedule change.
   expression key (§9.3).
 - The privilege gate checks base-table `SELECT` only. There are no column privileges, and a view-only
   writer sees no values (§9.4).
+- The `unnest(record[])` type-mismatch sentence names types by jed's canonical names (`i32`), not PostgreSQL's (`integer`).
 - `Detail` is a structured field. It is never appended to the rendered message (§9.1).
 
 ### 9.8 Testing

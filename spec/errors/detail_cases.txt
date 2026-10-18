@@ -388,3 +388,26 @@ setup: CREATE TABLE t (a int, b int)
 run: SELECT * FROM t RIGHT JOIN LATERAL (SELECT t.a) s ON true
 code: 42P10
 detail: The combining JOIN type must be INNER or LEFT for a LATERAL reference.
+
+# --- 42804 unnest(record[]) column-definition list (composite.md §13) -----------------------------
+
+case: unnest record coldef too few columns
+run: SELECT * FROM unnest(ARRAY[ROW(1, 'a'::text)]) AS u(a i32)
+code: 42804
+detail: Returned row contains 2 attributes, but query expects 1.
+
+case: unnest record coldef one attribute
+run: SELECT * FROM unnest(ARRAY[ROW(1)]) AS u(a i32, b i32)
+code: 42804
+detail: Returned row contains 1 attribute, but query expects 2.
+
+# jed: the expected type is jed's canonical name (`i32`); PostgreSQL prints `integer`.
+case: unnest record coldef field type mismatch
+run: SELECT * FROM unnest(ARRAY[ROW(1, 'a'::text)]) AS u(a i32, b i32)
+code: 42804
+detail: Returned type text at ordinal position 2, but query expects i32.
+
+case: duplicate column-definition name has no detail
+run: SELECT * FROM unnest(ARRAY[ROW(1, 'a'::text)]) AS u(a i32, a text)
+code: 42701
+no-detail
