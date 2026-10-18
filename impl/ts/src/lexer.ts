@@ -1,3 +1,4 @@
+import { cancellationCheckpoint } from "./cancel.ts";
 // Hand-written lexer (CLAUDE.md §5: parsers are per-language, not codegen'd). Produces
 // tokens terminated by an "eof" token. Integer literals may carry a leading '-' and are
 // parsed to bigint; a value outside the i64 range is a structured 42601 syntax error
@@ -44,7 +45,10 @@ function numIdentStart(c: string | undefined): boolean {
 function numIdentLen(sql: string, p: number): number {
   if (!numIdentStart(sql[p])) return 0;
   let q = p + 1;
-  while (q < sql.length && (numIdentStart(sql[q]) || isDigit(sql[q]!) || sql[q] === "$")) q++;
+  while (q < sql.length && (numIdentStart(sql[q]) || isDigit(sql[q]!) || sql[q] === "$")) {
+    cancellationCheckpoint();
+    q++;
+  }
   return q - p;
 }
 
@@ -64,6 +68,7 @@ export function radixDigitValue(c: string | undefined, base: number): number {
 // leading digit).
 function digitRunEnd(sql: string, p: number, base: number): number {
   for (;;) {
+    cancellationCheckpoint();
     if (radixDigitValue(sql[p], base) >= 0) p++;
     else if (sql[p] === "_" && radixDigitValue(sql[p + 1], base) >= 0) p += 2;
     else return p;
@@ -77,6 +82,7 @@ function integerMagnitude(written: string, digits: string, base: number): bigint
   let v = 0n;
   const b = BigInt(base);
   for (const c of digits) {
+    cancellationCheckpoint();
     if (c === "_") continue;
     v = v * b + BigInt(radixDigitValue(c, base));
     if (v > MAX_MAGNITUDE) {
@@ -155,6 +161,7 @@ function scanNumber(sql: string, start: number): [Token, number] {
       // coefficient the shared builder may materialize).
       let v = 0;
       for (let k = digitsStart; k < expEnd; k++) {
+        cancellationCheckpoint();
         if (sql[k] !== "_" && v < EXP_LIMIT)
           v = Math.min(v * 10 + (sql.charCodeAt(k) - 48), EXP_LIMIT);
       }
@@ -209,6 +216,7 @@ export function charPositions(sql: string, starts: number[]): number[] {
   let chars = 0;
   for (const s of starts) {
     while (b < s) {
+      cancellationCheckpoint();
       if (!isPairLowHalf(sql, b)) chars++;
       b++;
     }
@@ -248,6 +256,7 @@ function lexRaw(sql: string, st: LexState): Token[] {
   const n = sql.length;
 
   while (i < n) {
+    cancellationCheckpoint();
     // The previous iteration's tokens started at its tokStart; this one's start at i.
     while (st.starts.length < tokens.length) st.starts.push(st.tokStart);
     st.tokStart = i;
@@ -297,6 +306,7 @@ function lexRaw(sql: string, st: LexState): Token[] {
         // string, even abutting a token (`1--2` is `1` — PG behavior).
         i += 2;
         while (i < n && sql[i] !== "\n" && sql[i] !== "\r") {
+          cancellationCheckpoint();
           i++;
         }
       } else {
@@ -312,6 +322,7 @@ function lexRaw(sql: string, st: LexState): Token[] {
         i += 2;
         let depth = 1;
         while (depth > 0) {
+          cancellationCheckpoint();
           if (i + 1 >= n) {
             throw engineError("syntax_error", "unterminated /* comment");
           }
@@ -568,6 +579,7 @@ function lexRaw(sql: string, st: LexState): Token[] {
       i++; // consume "$"
       const digitStart = i;
       while (i < n && isDigit(sql[i]!)) {
+        cancellationCheckpoint();
         i++;
       }
       const digits = sql.slice(digitStart, i);
@@ -588,6 +600,7 @@ function lexRaw(sql: string, st: LexState): Token[] {
     } else if (isAlpha(c)) {
       const start = i;
       while (i < n && (isAlpha(sql[i]!) || isDigit(sql[i]!))) {
+        cancellationCheckpoint();
         i++;
       }
       // Identifier-length gate (CLAUDE.md §13; spec/design/cost.md §7). A word is an identifier or
@@ -621,6 +634,7 @@ function scanQuotedBody(sql: string, i: number, quote: string): [string | null, 
   const n = sql.length;
   let s = "";
   while (i < n) {
+    cancellationCheckpoint();
     if (sql[i] === quote) {
       if (i + 1 < n && sql[i + 1] === quote) {
         s += quote;
@@ -647,6 +661,7 @@ function applyUnicodeEscapes(sql: string, tokens: Token[], st: LexState, uesc: n
   const outStarts: number[] = [];
   let idx = 0;
   while (idx < tokens.length) {
+    cancellationCheckpoint();
     const tok = tokens[idx]!;
     if (!isUesc.has(idx)) {
       out.push(tok);
@@ -708,6 +723,7 @@ function utf16AtUtf8Offset(sql: string, from: number, bytes: number): number {
   let u = from;
   let acc = 0;
   while (u < sql.length && acc < bytes) {
+    cancellationCheckpoint();
     const cp = sql.codePointAt(u)!;
     acc += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
     u += cp > 0xffff ? 2 : 1;
@@ -757,6 +773,7 @@ function udeescape(raw: string, esc: string): string {
   let pairFirst = 0;
   let i = 0;
   while (i < raw.length) {
+    cancellationCheckpoint();
     if (raw[i] !== esc) {
       if (pairFirst !== 0) throw invalidPair(i);
       out += raw[i];

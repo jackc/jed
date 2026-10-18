@@ -78,7 +78,11 @@
       if (seed.trim().length > 0) await db.run(seed);
       ready = true;
       if (autorun && sql.trim().length > 0) await run();
-    })();
+    })().catch((e) => {
+      if (disposed) return;
+      error = e instanceof JedError ? e : new JedError('XX000', String(e));
+      ready = true;
+    });
     return () => {
       disposed = true;
       db?.close();

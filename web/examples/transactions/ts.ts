@@ -1,15 +1,17 @@
 import { openDatabase } from 'jed-ts';
 
-const db = openDatabase('bank.jed');
+const db = await openDatabase('bank.jed');
+try {
+  // The worker owns this transaction throughout the callback's awaits. It
+  // commits on success and rolls back if the callback throws. view() is read-only.
+  await db.update(async (tx) => {
+    await tx.execute('UPDATE account SET balance = balance - 100 WHERE id = 1');
+    await tx.execute('UPDATE account SET balance = balance + 100 WHERE id = 2');
+  });
 
-// Empty or SELECT-only writable transactions commit without database writes or fsync.
-// update() runs a read-write transaction: it mints a session, runs the callback, commits on success,
-// and rolls back if the callback throws — so the two writes are atomic. view() is the read-only
-// sibling. (For an explicit block spanning calls, mint a session with db.session({}) and drive
-// begin/commit/rollback on it.)
-db.update((tx) => {
-  tx.execute('UPDATE account SET balance = balance - 100 WHERE id = 1');
-  tx.execute('UPDATE account SET balance = balance + 100 WHERE id = 2');
-});
-
-db.close();
+  // A batch preserves its surrounding transaction boundary. On the database
+  // handle each statement autocommits; use tx.batch(...) inside update for an
+  // atomic batch. Empty transactions do not rewrite storage or issue fsync.
+} finally {
+  await db.close();
+}

@@ -4,6 +4,7 @@
 // main thread and talks to the engine-in-Worker via the async client (src/browser/client.ts).
 
 import { OpfsDatabase, OpfsError } from "../src/browser/client.ts";
+import * as runtime from "./runtime_scenarios.ts";
 
 const SELECT = "SELECT k, v FROM t ORDER BY k";
 
@@ -53,10 +54,12 @@ declare global {
       readScenario: (name: string) => Promise<string[][]>;
       errorScenario: (name: string) => Promise<string>;
     };
+    jedRuntime: typeof runtime;
   }
 }
 
 window.jed = { writeScenario, readScenario, errorScenario };
+window.jedRuntime = runtime;
 
 // A by-hand smoke for the demo page: write then read, render the rows. The e2e ignores this and calls
 // window.jed.* directly.

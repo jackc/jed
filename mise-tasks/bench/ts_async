@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure the native TS core against its real Node async execution worker"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+if ARGV.include?("--help")
+  puts "Usage: mise run bench:ts_async"
+  puts "JED_ASYNC_RESULTS sets the report directory (default bench/results/ts-async-TIMESTAMP-PID)."
+  puts "JED_ASYNC_SAMPLES, JED_ASYNC_WARMUP, JED_ASYNC_BATCH_SAMPLES, JED_ASYNC_LARGE_SAMPLES,"
+  puts "JED_ASYNC_STARTUP_SAMPLES, JED_ASYNC_ROWS, JED_ASYNC_HEARTBEAT_ROWS tune the workload."
+  exit
+end
+abort "Unexpected arguments; use --help" unless ARGV.empty?
+abort "Install the existing impl/ts dependencies before benchmarking" unless File.directory?(File.join(TS_DIR, "node_modules/@noble/hashes"))
+
+directory = File.expand_path(ENV.fetch("JED_ASYNC_RESULTS", "bench/results/ts-async-#{stamp}-#{Process.pid}"))
+revision, revision_ok = capture("git", "rev-parse", "HEAD")
+status, status_ok = capture("git", "status", "--porcelain")
+abort "Could not read benchmark revision" unless revision_ok && status_ok
+sh "node", "bench/ts/src/bench-async.ts", directory,
+   env: { "JED_BENCH_REVISION" => revision.strip, "JED_BENCH_DIRTY" => (!status.empty?).to_s }
