@@ -6,7 +6,7 @@
 # under the session envelope (§16.2), and temporary views — temp.jed_views / temp.jed_columns, the
 # temp. qualifier, the preclude-overlaps rules under OR REPLACE (§10), and the allow_temp_ddl gate.
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: ddl.sequence, ddl.view, ddl.view_default, ddl.view_options, ddl.view_temp, ddl.view_alter, ddl.view_replace, dml.view_write, introspect.views, introspect.columns, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.temp_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.aggregates, types.i32, types.text, types.timestamptz, types.decimal, session.privileges, session.allow_ddl, session.allow_temp_ddl
+# requires: ddl.sequence, ddl.view, ddl.view_default, ddl.view_options, ddl.view_temp, ddl.view_alter, ddl.view_replace, dml.view_write, introspect.views, introspect.columns, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.temp_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.aggregates, types.i32, types.text, types.timestamptz, types.decimal, session.privileges, session.allow_ddl, session.allow_temp_ddl, types.varchar_length, types.timestamp, types.interval
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text, ts timestamptz, d decimal)
@@ -52,6 +52,46 @@ query T nosort
 SELECT column_default FROM jed_columns WHERE table_name = 'v' AND name = 'd'
 ----
 NULL
+
+# a view column carrying a body typmod shows it beside its default; identity_generation is NULL
+statement ok
+CREATE TABLE tmod (id i32 PRIMARY KEY, s varchar(5), ts timestamp(3), iv interval second(2), n decimal(6,2))
+
+statement ok
+CREATE VIEW vmod AS SELECT id, s, ts, iv, n FROM tmod
+
+statement ok
+ALTER VIEW vmod ALTER s SET DEFAULT 'abc', ALTER n SET DEFAULT 1.5
+
+query TTTT nosort
+SELECT name, type, column_default, identity_generation FROM jed_columns WHERE table_name = 'vmod' ORDER BY ordinal
+----
+id
+i32
+NULL
+NULL
+s
+varchar(5)
+'abc'
+NULL
+ts
+timestamp(3)
+NULL
+NULL
+iv
+interval second(2)
+NULL
+NULL
+n
+decimal(6,2)
+1.5
+NULL
+
+statement ok
+DROP VIEW vmod
+
+statement ok
+DROP TABLE tmod
 
 # --- options in jed_views ---------------------------------------------------------------------------
 

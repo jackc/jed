@@ -1146,6 +1146,25 @@ impl Engine {
         })
     }
 
+    /// The view check of an ALTER TABLE action that drops the sequences a column owns — DROP COLUMN
+    /// and DROP IDENTITY (views.md §6.2): a view depending on one of them blocks the action (2BP01,
+    /// naming `describe`) unless `cascade`, which returns the views to drop with it.
+    pub(crate) fn owned_sequence_views(
+        &self,
+        seqs: &[String],
+        cascade: bool,
+        describe: &str,
+    ) -> Result<BTreeSet<String>> {
+        if seqs.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let dropped: Vec<(ViewDepKind, String)> = seqs
+            .iter()
+            .map(|s| (ViewDepKind::Sequence, s.clone()))
+            .collect();
+        self.drop_dependent_views(&dropped, cascade, |_| describe.to_string())
+    }
+
     /// The views a drop of the objects `dropped` (`(kind, name)`) reaches (views.md §6/§6.1): under
     /// RESTRICT the first view in name byte order that depends on one of them is 2BP01, naming
     /// what (`what`, e.g. `sequence s`) it depends on; under CASCADE the closure of those views is

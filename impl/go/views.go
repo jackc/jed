@@ -578,6 +578,20 @@ type viewObject struct {
 	name string
 }
 
+// ownedSequenceViews is the view check of an ALTER TABLE action that drops the sequences a column
+// owns — DROP COLUMN and DROP IDENTITY (views.md §6.2): a view depending on one of them blocks the
+// action (2BP01, naming describe) unless cascade, which returns the views to drop with it.
+func (db *engine) ownedSequenceViews(seqs []string, cascade bool, describe string) ([]string, error) {
+	if len(seqs) == 0 {
+		return nil, nil
+	}
+	objects := make([]viewObject, len(seqs))
+	for i, s := range seqs {
+		objects[i] = viewObject{kind: viewDepSequence, name: s}
+	}
+	return db.dropDependentViews(objects, cascade, func(viewDep) string { return describe })
+}
+
 // viewDependingOn is a view whose dependency list names a dropped object, with that dependency.
 type viewDependingOn struct {
 	view string

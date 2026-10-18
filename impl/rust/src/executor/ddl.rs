@@ -2630,6 +2630,19 @@ impl Engine {
                                         .is_some_and(|owner| usize::from(owner.column) == old_ci)
                                 })
                                 .collect();
+                            // The views depending on those sequences go with them under CASCADE
+                            // (views.md §6.2); under RESTRICT such a view blocks the drop (2BP01).
+                            let closure = self.owned_sequence_views(
+                                &owned,
+                                cascade,
+                                &format!("column {name} of table {}", original.name),
+                            )?;
+                            if !closure.is_empty() {
+                                if let Some(vp) = &mut view_plan {
+                                    vp.forget(&closure);
+                                }
+                                cascade_dropped_views.extend(closure);
+                            }
                             for key in owned {
                                 dropped_owned_sequences.insert(key.clone());
                                 self.remove_sequence_routed(&key);
@@ -3398,6 +3411,13 @@ impl Engine {
                                     pending_serials.remove(si);
                                 }
                                 IdentitySeqSlot::Existing(key) => {
+                                    // A view depending on the sequence blocks the drop (2BP01;
+                                    // views.md §6.2).
+                                    self.owned_sequence_views(
+                                        std::slice::from_ref(&key),
+                                        false,
+                                        &format!("sequence {key}"),
+                                    )?;
                                     dropped_owned_sequences.insert(key.clone());
                                     self.remove_sequence_routed(&key);
                                 }

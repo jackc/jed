@@ -4,7 +4,7 @@
 # chain of views applies the default of the view nearest the target first; UPDATE … SET c = DEFAULT
 # assigns the target view's default, else NULL. Every record is PostgreSQL-oracle-checked; the
 # jed-specific behavior (introspection, the stored text, the dump) is in views_defaults_jed.test.
-# requires: ddl.view, ddl.view_default, dml.view_write, dml.view_on_conflict, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.sequence, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.insert_default_values, dml.update, dml.insert_on_conflict, dml.returning, query.select, query.select_star, query.where_eq, query.order_by, types.i32, types.i64, types.text
+# requires: ddl.view, ddl.view_default, dml.view_write, dml.view_on_conflict, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.sequence, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.insert_default_values, dml.update, dml.insert_on_conflict, dml.returning, query.select, query.select_star, query.where_eq, query.order_by, types.i32, types.i64, types.text, types.varchar_length, types.timestamp, types.decimal
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32 DEFAULT 5, b text DEFAULT 'base', c i32)
@@ -287,3 +287,42 @@ ALTER VIEW IF EXISTS nosuch ALTER COLUMN a SET DEFAULT 1
 
 statement error 42809
 ALTER VIEW t ALTER COLUMN a SET DEFAULT 1
+
+# --- defaults on columns with typmods: CREATE OR REPLACE VIEW still refuses a typmod change (42P16)
+# and keeps the defaults across a compatible replace -------------------------------------------------
+statement ok
+CREATE TABLE tm (id i32 PRIMARY KEY, s varchar(5), ts timestamp(3), d decimal(6,2))
+
+statement ok
+CREATE VIEW vm AS SELECT id, s, ts, d FROM tm
+
+statement ok
+ALTER VIEW vm ALTER COLUMN s SET DEFAULT 'abc'
+
+statement ok
+ALTER VIEW vm ALTER COLUMN d SET DEFAULT 1.5
+
+statement error 42P16
+CREATE OR REPLACE VIEW vm AS SELECT id, s::varchar(6) AS s, ts, d FROM tm
+
+statement error 42P16
+CREATE OR REPLACE VIEW vm AS SELECT id, s, ts::timestamp(2) AS ts, d FROM tm
+
+statement ok
+CREATE OR REPLACE VIEW vm AS SELECT id, s, ts, d, 1 AS extra FROM tm WHERE id > 0
+
+statement ok
+INSERT INTO vm (id) VALUES (1)
+
+query ITD nosort
+SELECT id, s, d FROM tm
+----
+1
+abc
+1.50
+
+statement ok
+DROP VIEW vm
+
+statement ok
+DROP TABLE tm

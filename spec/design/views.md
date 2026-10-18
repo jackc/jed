@@ -451,8 +451,12 @@ matches it (pinned against the PG 18 oracle):
   dropped, with the closure of §6.1. (`CASCADE` of an owned sequence, or of a type a table column or
   composite field uses, stays `0A000` — PostgreSQL would also drop the column default or column.)
   `DROP TABLE t` drops the sequences `t` owns (sequences.md §12), so a view depending on one of them
-  blocks the `DROP TABLE` (`2BP01`) unless `CASCADE`. `ALTER SEQUENCE s RENAME TO s2` rewrites the view
-  (§7.2). jed has no `ALTER TYPE … RENAME`.
+  blocks the `DROP TABLE` (`2BP01`) unless `CASCADE`. The same holds for the actions that drop a
+  column's owned sequence: `ALTER TABLE t DROP COLUMN c` of an `IDENTITY` or `serial` column is `2BP01`
+  while a view depends on its sequence, and `CASCADE` drops those views with it; `ALTER TABLE t ALTER
+  COLUMN c DROP IDENTITY` has no `CASCADE`, so such a view always blocks it (`2BP01`), as in
+  PostgreSQL. `ALTER SEQUENCE s RENAME TO s2` rewrites the view (§7.2). jed has no `ALTER TYPE …
+  RENAME`.
 - **Collations and host functions record nothing.** SQL cannot drop either: a collation comes from a
   bundle loaded into the environment, a host function from the host's registration
   ([extensibility.md](extensibility.md) §7). A view stores no value derived from them, so a changed

@@ -1,0 +1,58 @@
+# skip: disk — temporary views and tables cannot survive the disk-mode per-record reopen
+# (spec/design/conformance.md §3).
+# CREATE TABLE AS / SELECT INTO from a temporary view (spec/design/views.md §10,
+# create-table-as.md): the new table is a persistent table holding the rows, with no dependency on
+# the view, so dropping the temporary relations afterwards leaves it intact. A view over a temporary
+# table is itself temporary. Every record is PostgreSQL-oracle-checked.
+# requires: ddl.view, ddl.view_temp, ddl.view_cascade, ddl.temp_table, ddl.create_table_as, ddl.create_table, ddl.drop_table, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.i32
+
+statement ok
+CREATE TEMP TABLE tmp (a i32)
+
+statement ok
+INSERT INTO tmp VALUES (1), (2)
+
+statement ok
+CREATE TEMP VIEW tv AS SELECT a FROM tmp
+
+statement ok
+CREATE VIEW tv2 AS SELECT a * 10 AS b FROM tmp
+
+statement ok
+CREATE TABLE ctas1 AS SELECT * FROM tv
+
+statement ok
+CREATE TABLE ctas2 AS SELECT * FROM tv2
+
+statement ok
+SELECT * INTO ctas3 FROM tv2
+
+statement error 2BP01
+DROP TABLE tmp
+
+statement ok
+DROP TABLE tmp CASCADE
+
+statement error 42P01
+SELECT * FROM tv2
+
+query I nosort
+SELECT a FROM ctas1 ORDER BY a
+----
+1
+2
+
+query I nosort
+SELECT b FROM ctas2 ORDER BY b
+----
+10
+20
+
+query I nosort
+SELECT b FROM ctas3 ORDER BY b
+----
+10
+20
+
+statement ok
+DROP TABLE ctas1, ctas2, ctas3
