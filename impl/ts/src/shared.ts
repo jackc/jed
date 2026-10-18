@@ -1,3 +1,4 @@
+import { withoutCancellation } from "./cancel.ts";
 // Shared database core + the per-caller Session handle for the TS core (CLAUDE.md §3,
 // spec/design/session.md §2.4, transactions.md §8/§10).
 //
@@ -2142,11 +2143,12 @@ export class Database {
   // the session serves reads from that snapshot for its life — observing one stable version even as a
   // writer interleaves commits — and a write through it is 25006. The caller must close() it to
   // deregister (advancing the watermark), since JS has no destructor. (The old SharedDb.read().)
-  readSession(): Session {
+  readSession(opts?: SessionOptions): Session {
     this.core.checkPid();
     const pinned = this.core.refreshAndPinAll();
     const snap = this.core.committed; // pinned (immutable — no clone)
     const engine = databaseFromSnapshot(snap, this.core);
+    if (opts !== undefined) engine.session = new SessionState(this.core.environment, opts);
     // The attached roots are pinned together with the committed root (attached-databases.md §5), so the
     // session sees a consistent cross-database snapshot; it routes attachment persists via the core.
     // Each service attachment's pinned snapshot is overlaid (page-service.md §5.5).
@@ -2774,6 +2776,33 @@ export class Session {
     return new PreparedStatement(this.engine.parse(sql));
   }
 
+  // The async worker scheduler parks a statement BEFORE its first execution when another local
+  // session holds the writer gate. This is an admission check, never an execute/catch/retry path:
+  // SQL, entropy, host functions and cost must run exactly once. Existing transaction errors still
+  // reach the normal dispatcher; only a fresh autocommit write or writable BEGIN needs to wait.
+  // @internal The synchronous embedding API keeps its existing immediate-gate behavior.
+  waitsForWriter(stmt: PreparedStatement): boolean {
+    if (
+      this.access === "ro" ||
+      this.gateHeld ||
+      this.engine.session.tx !== null ||
+      !this.core.writerActive
+    ) {
+      return false;
+    }
+    if (stmt.ast.kind === "begin") return stmt.ast.writable !== false;
+    // A view may have acquired sequence-mutating dependencies since this session's last query.
+    // Classify against the same committed catalog its eventual autocommit statement will use.
+    this.refreshCommitted();
+    return this.engine.stmtIsWriteWithViews(stmt.ast);
+  }
+
+  // @internal Cancellation can arrive while a worker request is parked or parsing, before the
+  // ordinary executor error boundary. Preserve the same failed-block rule as a metered SQL error.
+  failCurrentStatement(): void {
+    this.engine.failOpenBlock();
+  }
+
   // executePrepared runs a prepared statement on this session, binding $N params, and returns its
   // command tag — the prepared analogue of execute (spec/design/api.md §2.4).
   executePrepared(stmt: PreparedStatement, params: Value[] = []): RunResult {
@@ -2947,6 +2976,12 @@ export class Session {
   // updated only on success, so a persist I/O failure throws and leaves the shared committed state (and
   // this session's version) unchanged. In-memory persist is a no-op.
   private publish(): void {
+    // Engine.commitTx already passed the last safe cancellation point. A shared-core
+    // publication follows its in-memory swap and must finish the same commit transition.
+    withoutCancellation(() => this.publishUncancelable());
+  }
+
+  private publishUncancelable(): void {
     // Taken first, so any failure below drops the staged attachment commits unadopted.
     const staged = this.engine.stagedAttachments;
     this.engine.stagedAttachments = [];

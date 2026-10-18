@@ -582,11 +582,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - **Full-text search.** PostgreSQL (`tsvector`/`tsquery` + GIN) and SQLite (FTS5) both ship it. In
   jed it would be a type pair, a tokenizer/stemmer data bundle loaded through the `Environment` (the
   collation precedent), and a GIN operator class. Large; not scheduled.
-- **Browser/Node async runtime (proposal).** [ts-runtime.md](spec/design/ts-runtime.md) proposes
-  an async-only public JS API, off-thread execution, one TS semantic core with platform adapters,
-  bounded typed transport, cancellation and explicit page/crypto suspension. Specify lifecycle
-  and scheduling first, then prototype and measure before choosing packaging or an API migration.
-  Not implemented or ratified; existing APIs and shipping preferences remain in force.
+- **Browser/Node async runtime.** [ts-runtime.md §10](spec/design/ts-runtime.md) implements
+  async-only application entry points over dedicated workers, versioned lossless values and
+  structured errors, bounded admission/results/handles, session ordering with parked writer
+  waiters, prepared/batched execution, transaction callbacks, cleanup, failure uncertainty and
+  atomic cancellation on Node/shared-memory browsers. Website examples/live panels use it;
+  the shared concurrency schedules run through the async scheduler. Synchronous internals remain
+  for conformance/tooling. Remaining: cooperative interruption of blocking kernels without shared
+  memory, full bounded cancellation latency, explicit async page/crypto continuations, broader
+  public-boundary workload/ARM/package-size measurements, and optional Rust delivery parity.
+  Encryption protocol/provider selection is separate; no SQL replay or whole-file preload.
 - **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep
   open, **designed in [encryption.md](spec/design/encryption.md)**: a page codec in the core
   above the block seam, standardized AEAD and envelope encryption (cheap credential rewrap,
