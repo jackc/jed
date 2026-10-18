@@ -714,6 +714,14 @@ const DEC_DIGITS: i64 = 4;
 const MAX_DISPLAY_SCALE: i64 = MAX_PRECISION as i64;
 /// PG NUMERIC_MAX_RESULT_SCALE = NUMERIC_MAX_PRECISION·2 (2000) — the exp/power input bound base.
 const MAX_RESULT_SCALE: i64 = MAX_PRECISION as i64 * 2;
+/// numeric.c's truncated log10(e), used by the transcendentals' f64 weight estimates. Kept verbatim
+/// rather than `std::f64::consts::LOG10_E` (a different f64): Go and TS use the same literal, and an
+/// estimate truncated to an integer must agree across cores.
+#[allow(clippy::approx_constant)]
+const PG_LOG10_E: f64 = 0.434294481903252;
+/// numeric.c's truncated log10(2) — kept verbatim for the same reason as [`PG_LOG10_E`].
+#[allow(clippy::approx_constant)]
+const PG_LOG10_2: f64 = 0.301029995663981;
 /// PG NUMERIC_WEIGHT_MAX = PG_INT16_MAX (32767) — the base-10⁴ weight ceiling for power overflow.
 const NUMERIC_WEIGHT_MAX: i64 = 32767;
 
@@ -886,7 +894,7 @@ impl Decimal {
             }
             return Ok(Decimal::zero(rscale.max(0) as u32));
         }
-        let dweight = (val * 0.434294481903252) as i64; // decimal weight ≈ x·log10(e)
+        let dweight = (val * PG_LOG10_E) as i64; // decimal weight ≈ x·log10(e)
         // Reduce x into roughly [-0.01, 0.01] by halving ndiv2 times, for fast Taylor convergence.
         let ndiv2: i64;
         if val.abs() > 0.01 {
@@ -902,7 +910,7 @@ impl Decimal {
         } else {
             ndiv2 = 0;
         }
-        let mut sig_digits = 1 + dweight + rscale + (ndiv2 as f64 * 0.301029995663981) as i64;
+        let mut sig_digits = 1 + dweight + rscale + (ndiv2 as f64 * PG_LOG10_2) as i64;
         sig_digits = sig_digits.max(0) + 8;
         let local_rscale = sig_digits - 1;
         // Taylor: exp(x) = 1 + x + x²/2! + x³/3! + …
@@ -932,7 +940,7 @@ impl Decimal {
     /// `exp(numeric)` (PG `numeric_exp`): choose rscale, then call `exp_var`.
     pub fn dec_exp_metered(&self, mut m: Option<&mut Meter>) -> Result<Decimal> {
         decimal_math_step(m.as_deref_mut(), 0, false, &[self])?;
-        let mut val = self.to_f64_estimate() * 0.434294481903252;
+        let mut val = self.to_f64_estimate() * PG_LOG10_E;
         val = val.clamp(-(MAX_RESULT_SCALE as f64), MAX_RESULT_SCALE as f64);
         let mut rscale = MIN_SIG_DIGITS - (val as i64);
         rscale = rscale.max(self.scale as i64).max(0).min(MAX_DISPLAY_SCALE);
@@ -963,7 +971,7 @@ impl Decimal {
             fact = fact.mul_var(&two, 0);
             nsqrt += 1;
         }
-        let local_rscale = rscale + ((nsqrt + 1) as f64 * 0.301029995663981) as i64 + 8;
+        let local_rscale = rscale + ((nsqrt + 1) as f64 * PG_LOG10_2) as i64 + 8;
         // z = (x−1)/(x+1)
         let numer = x.sub_uncapped(&one);
         let denom = x.add_uncapped(&one);
@@ -1197,7 +1205,7 @@ impl Decimal {
             }
             return Ok(Decimal::zero(MAX_DISPLAY_SCALE as u32));
         }
-        val *= 0.434294481903252;
+        val *= PG_LOG10_E;
         let vi = val as i64;
         let mut rscale = MIN_SIG_DIGITS - vi;
         rscale = rscale

@@ -128,6 +128,14 @@ run = [{ task = "lint:check" }]
 description = "Lint the TypeScript cores with Biome's tailored ruleset (errors fail; warnings advise)"
 run = "biome lint impl/ts impl/node bench/ts migrate/ts"
 
+# Clippy over the Rust core, every target (lib, bins, in-crate tests). Only clippy's deny-by-default
+# lints fail the gate (correctness bugs such as a float literal approximating a std constant); the
+# warn-level backlog stays advisory and is silenced here so the gate log stays readable — run
+# `cargo clippy --all-targets` in impl/rust to see it. A check build (~10s cold), so cheap to gate.
+[tasks."lint:rust"]
+description = "Run clippy over the Rust core's every target (deny-level lints fail; warnings silenced)"
+run = "cargo clippy --manifest-path impl/rust/Cargo.toml --all-targets --quiet -- -A warnings"
+
 [tasks."lint:fix"]
 description = "Apply Biome's SAFE lint fixes to the TS cores (unsafe fixes stay per-rule + manual)"
 run = "biome lint --write impl/ts impl/node bench/ts migrate/ts"
