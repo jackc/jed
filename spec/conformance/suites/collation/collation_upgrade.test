@@ -1,4 +1,4 @@
-# Collation upgrade / REINDEX migration — clearing a version-skew end to end (spec/design/collation.md
+# Collation upgrade (upgrade_collations) — clearing a version-skew end to end (spec/design/collation.md
 # §12). The deferred 2d follow-on: a host op (`db.upgrade_collations()`, driven here by the new
 # `# upgrade-collations:` harness directive) rebuilds a version-SKEWED table's collated keys against
 # the LOADED Unicode version and re-pins the stamp — so the table is read-write again AND its collated

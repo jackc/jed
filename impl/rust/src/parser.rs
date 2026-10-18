@@ -636,7 +636,7 @@ impl Parser {
     }
 
     /// `REINDEX [(option, …)] {INDEX | TABLE} [CONCURRENTLY] [db.]name` or `REINDEX [(option, …)]
-    /// {DATABASE | SYSTEM} [CONCURRENTLY] [name]` (spec/design/indexes.md §10, grammar.md §61).
+    /// {DATABASE | SYSTEM} [CONCURRENTLY] [name]` (spec/design/indexes.md §10, grammar.md §59).
     /// Options are `VERBOSE [boolean]` and `CONCURRENTLY [boolean]`, repeatable (the last value
     /// wins, as PostgreSQL); an unknown option is 42601, `TABLESPACE` and `REINDEX SCHEMA` are
     /// 0A000 (jed has neither tablespaces nor schemas). The positional `CONCURRENTLY` is recognized

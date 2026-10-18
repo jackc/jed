@@ -1181,7 +1181,7 @@ Recorded per CLAUDE.md §1:
   references **loaded, pinned, version-stamped** data and catches any skew with a graded open-time
   verdict (§12, [compatibility.md](compatibility.md)) — so jed still has **no
   collation-corruption-on-upgrade failure mode**, the central divergence. The cost is that a Unicode
-  bump makes an old file *read-only until `REINDEX`* on the new binary (§12), where PG's baked-nothing
+  bump makes an old file *read-only until `upgrade_collations()`* on the new binary (§12), where PG's baked-nothing
   model and jed's old baked model each avoided that in their own way.
 - **Collated indexes store UCA sort keys** (memcmp-ordered, §8); PG stores the original and
   compares with a runtime comparator. (Reason: the single-`memcmp`-order storage contract,

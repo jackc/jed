@@ -1,0 +1,134 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# REINDEX INDEX / REINDEX TABLE inside a savepoint (spec/design/indexes.md §10, transactions.md §11):
+# ROLLBACK TO undoes the rebuild together with everything else since the savepoint — an index created
+# and rebuilt there is gone, rows written there are gone from every index — and RELEASE keeps it. The
+# rebuilt index answers and enforces exactly as before either way.
+# Oracle-checked against PostgreSQL 18. Format: ../../../design/conformance.md.
+# requires: ddl.reindex, txn.savepoint, txn.explicit, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, types.text
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')
+
+statement ok
+CREATE INDEX t_a ON t (a)
+
+statement ok
+CREATE UNIQUE INDEX t_b ON t (b)
+
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO t VALUES (3, 30, 'z')
+
+statement ok
+REINDEX TABLE t
+
+statement ok
+CREATE INDEX t_ab ON t (a, b)
+
+statement ok
+REINDEX INDEX t_ab
+
+query I nosort
+SELECT id FROM t WHERE a = 30
+----
+3
+
+statement ok
+ROLLBACK TO a
+
+# the row written before the rebuild is gone from every index
+query I nosort
+SELECT id FROM t WHERE a = 30
+----
+
+query I nosort
+SELECT id FROM t WHERE b = 'z'
+----
+
+# the index created and rebuilt inside the savepoint is gone
+statement error 42704
+DROP INDEX t_ab
+
+statement ok
+ROLLBACK TO a
+
+# the pre-existing indexes still answer and enforce
+query IT rowsort
+SELECT id, b FROM t WHERE a = 10 OR a = 20
+----
+1
+x
+2
+y
+
+statement error 23505
+INSERT INTO t VALUES (9, 90, 'x')
+
+statement ok
+ROLLBACK TO a
+
+# a failed statement after a rebuild, then ROLLBACK TO: the index is intact
+statement ok
+REINDEX INDEX t_b
+
+statement error 23505
+INSERT INTO t VALUES (9, 90, 'y')
+
+statement ok
+ROLLBACK TO a
+
+statement ok
+INSERT INTO t VALUES (4, 40, 'w')
+
+query I nosort
+SELECT id FROM t WHERE b = 'w'
+----
+4
+
+# RELEASE keeps the rebuild and the writes around it
+statement ok
+SAVEPOINT b
+
+statement ok
+INSERT INTO t VALUES (5, 50, 'v')
+
+statement ok
+REINDEX TABLE t
+
+statement ok
+RELEASE b
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM t WHERE a = 50
+----
+5
+
+statement error 23505
+INSERT INTO t VALUES (6, 60, 'v')
+
+query IIT nosort
+SELECT id, a, b FROM t ORDER BY id
+----
+1
+10
+x
+2
+20
+y
+4
+40
+w
+5
+50
+v
