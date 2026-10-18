@@ -428,7 +428,8 @@ arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_p
   B-tree operator class its unique index must use, as in PostgreSQL: `ON CONFLICT (email COLLATE "C")`
   or `ON CONFLICT (id int4_ops)`. jed keys each column under its own collation and its type's
   default class (`text_ops`, `int4_ops`, `numeric_ops`, …), so a decoration that names anything else
-  matches no index (`42P10`); an unknown collation or class is `42704`.
+  matches no index (`42P10`); an unknown collation or class is `42704`. Decorations combine with a
+  partial index's `WHERE`: `ON CONFLICT (owner COLLATE "C") WHERE balance > 0`.
 
 `RETURNING` can also compare row versions. `old.balance` is the value before the change and
 `new.balance` the value after it; an `INSERT` has an all-`NULL` old row and a `DELETE` an all-`NULL`

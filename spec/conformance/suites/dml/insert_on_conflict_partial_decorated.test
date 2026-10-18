@@ -1,0 +1,150 @@
+# INSERT ... ON CONFLICT with both inference decorations and a WHERE index_predicate
+# (spec/design/upsert.md §2), and DO UPDATE re-keying through a partial arbiter (§5). The
+# decorations narrow partial and non-partial candidates alike; PostgreSQL's resolution order holds
+# across the two features — every element (ASC/DESC 42P10, column 42703, collation / class 42704),
+# then the WHERE (subquery 0A000, column 42703, aggregate 42803), and only then the index search
+# (42P10). Every record is oracle-probed against PostgreSQL. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.upsert_partial_arbiter, dml.insert_on_conflict_decorations, dml.insert_on_conflict_rekey, dml.returning, query.select, query.order_by, types.i32, types.text, ddl.collate_column, expr.arithmetic
+
+statement ok
+CREATE TABLE pd (id i32 PRIMARY KEY, name text COLLATE "C", status text, n i32)
+
+statement ok
+CREATE UNIQUE INDEX pd_name ON pd (name) WHERE status = 'active'
+
+statement ok
+INSERT INTO pd VALUES (1, 'a', 'active', 1), (2, 'b', 'inactive', 2)
+
+# A decorated target with an implying WHERE infers the partial index.
+query ITTI nosort
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name COLLATE "C" text_ops) WHERE status = 'active' DO UPDATE SET n = pd.n + 10 RETURNING *
+----
+1
+a
+active
+11
+
+statement ok
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name COLLATE "C") WHERE status = 'active' DO NOTHING
+
+statement ok
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name text_ops) WHERE status = 'active' AND n > 0 DO NOTHING
+
+# A decoration the key does not satisfy rules the partial index out, WHERE or not.
+statement error 42P10
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name int4_ops) WHERE status = 'active' DO NOTHING
+
+# A satisfied decoration does not make a partial index inferable without an implying WHERE.
+statement error 42P10
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name COLLATE "C") DO NOTHING
+
+statement error 42P10
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name COLLATE "C") WHERE status = 'inactive' DO NOTHING
+
+# --- resolution order: elements, then the WHERE, then the search ---------------------------------
+
+statement error 42P10
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name DESC) WHERE nosuch = 1 DO NOTHING
+
+statement error 42703
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (nosuch COLLATE "C") WHERE (SELECT true) DO NOTHING
+
+statement error 42704
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name COLLATE "nosuch") WHERE nosuch = 1 DO NOTHING
+
+statement error 42704
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name nosuch_ops) WHERE (SELECT true) DO NOTHING
+
+statement error 42703
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name int4_ops) WHERE nosuch = 1 DO NOTHING
+
+statement error 0A000
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name int4_ops) WHERE (SELECT true) DO NOTHING
+
+statement error 42803
+INSERT INTO pd VALUES (3, 'a', 'active', 3) ON CONFLICT (name COLLATE "C") WHERE count(*) > 0 DO NOTHING
+
+query ITTI rowsort
+SELECT * FROM pd
+----
+1
+a
+active
+11
+2
+b
+inactive
+2
+
+# --- DO UPDATE re-keying through a partial arbiter -----------------------------------------------
+
+statement ok
+CREATE TABLE pr (id i32 PRIMARY KEY, k i32, status text)
+
+statement ok
+CREATE UNIQUE INDEX pr_k ON pr (k) WHERE status = 'active'
+
+statement ok
+INSERT INTO pr VALUES (1, 10, 'active'), (2, 20, 'inactive')
+
+# The conflicting row moves to the proposed row's key.
+query ITIT nosort
+INSERT INTO pr VALUES (5, 10, 'active') ON CONFLICT (k) WHERE status = 'active' DO UPDATE SET id = excluded.id RETURNING id, status, k, pr.status
+----
+5
+active
+10
+active
+
+# A re-key onto another row's key is a primary-key violation.
+statement error 23505
+INSERT INTO pr VALUES (6, 10, 'active') ON CONFLICT (k) WHERE status = 'active' DO UPDATE SET id = 2
+
+# Re-keyed and moved out of the predicate: the row leaves the partial index.
+query IIT nosort
+INSERT INTO pr VALUES (6, 10, 'active') ON CONFLICT (k int4_ops) WHERE status = 'active' DO UPDATE SET id = 7, status = 'inactive' RETURNING *
+----
+7
+10
+inactive
+
+# COLLATE on a non-collatable key column matches nothing.
+statement error 42P10
+INSERT INTO pr VALUES (6, 10, 'active') ON CONFLICT (k COLLATE "C") WHERE status = 'active' DO UPDATE SET id = 7, status = 'inactive' RETURNING *
+
+# ... so a new active row with that key is an ordinary insert, and a proposal outside the predicate
+# never conflicts.
+query IIT rowsort
+INSERT INTO pr VALUES (8, 10, 'active'), (9, 10, 'inactive') ON CONFLICT (k int4_ops) WHERE status = 'active' DO UPDATE SET id = 0 RETURNING *
+----
+8
+10
+active
+9
+10
+inactive
+
+# A second proposal for the key a re-key just moved a row onto affects it a second time.
+statement error 21000
+INSERT INTO pr VALUES (11, 10, 'active'), (12, 10, 'active') ON CONFLICT (k) WHERE status = 'active' DO UPDATE SET id = excluded.id
+
+query IIT rowsort
+SELECT * FROM pr
+----
+2
+20
+inactive
+7
+10
+inactive
+8
+10
+active
+9
+10
+inactive
+
+query I nosort
+SELECT id FROM pr WHERE k = 10 AND status = 'active'
+----
+8
