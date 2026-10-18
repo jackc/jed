@@ -1,0 +1,85 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure page-sized AEAD operations across Rust, Go and TS (no database or oracle)"
+
+require "json"
+require "open3"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+samples = Integer(ENV.fetch("JED_AEAD_SAMPLES", "5"))
+millis = Integer(ENV.fetch("JED_AEAD_SAMPLE_MS", "100"))
+abort "samples and sample duration must be positive" unless samples.positive? && millis.positive?
+dir = File.expand_path(ENV.fetch("JED_AEAD_RESULTS", "bench/results/aead-#{stamp}-#{Process.pid}"))
+FileUtils.mkdir_p(dir)
+base = File.join(ROOT, "bench/aead")
+sh "cargo", "build", "--release", "--locked", "--offline", "--manifest-path", "#{base}/rust/Cargo.toml"
+sh "go", "build", "-mod=readonly", "-o", "#{base}/go/aead-bench", ".", chdir: "#{base}/go", env: { "CGO_ENABLED" => "0", "GOPROXY" => "off" }
+abort "install the approved locked bench/aead/ts dependencies first" unless File.directory?("#{base}/ts/node_modules/@noble/ciphers")
+# On Linux pin each sequential worker to the same allowed logical CPU. Never run timing workers
+# concurrently. Override JED_AEAD_CPU to select a particular allowed performance/efficiency core.
+allowed = File.exist?("/proc/self/status") ? File.read("/proc/self/status")[/^Cpus_allowed_list:\s*(.+)$/, 1] : nil
+cpu = ENV.fetch("JED_AEAD_CPU", allowed&.split(/[,-]/)&.first)
+prefix = cpu ? ["taskset", "-c", cpu] : []
+commands = {
+  "rustcrypto" => ["#{base}/rust/target/release/jed-aead-bench"],
+  "go" => ["#{base}/go/aead-bench"],
+  "noble-js" => ["node", "#{base}/ts/main.ts", "noble-js"],
+  "node-native" => ["node", "#{base}/ts/main.ts", "node-native"],
+  "node-webcrypto" => ["node", "#{base}/ts/main.ts", "node-webcrypto"],
+}
+capture = ->(*cmd) { out, status = Open3.capture2e(*cmd); abort out unless status.success?; out.strip }
+metadata = {
+  "date_utc" => Time.now.utc.iso8601, "revision" => capture.call("git", "rev-parse", "HEAD"),
+  "working_tree" => capture.call("git", "status", "--short"), "samples" => samples, "sample_ms" => millis,
+  "warmup_samples" => 1, "batch_operations" => 64, "cpu_affinity" => cpu,
+  "os" => capture.call("uname", "-a"), "rust" => capture.call("rustc", "--version"),
+  "go" => capture.call("go", "version"), "node" => capture.call("node", "--version"),
+  "node_versions" => JSON.parse(capture.call("node", "-p", "JSON.stringify(process.versions)")),
+  "cpu_info" => File.exist?("/proc/cpuinfo") ? File.read("/proc/cpuinfo").split("\n\n").first : nil,
+  "environment" => ENV.select { |k, _| %w[RUSTFLAGS GOAMD64 GODEBUG NODE_OPTIONS].include?(k) },
+  "source_sha256" => Dir.glob("#{base}/{rust/src/*,rust/Cargo.*,go/*.go,go/go.*,ts/main.ts,ts/package*.json}").to_h { |p| [p.delete_prefix("#{ROOT}/"), Digest::SHA256.file(p).hexdigest] },
+}
+File.write("#{dir}/metadata.json", JSON.pretty_generate(metadata) + "\n")
+fixtures = {}
+rows = []
+[0, samples].each do |sample_count|
+  commands.each do |name, command|
+    puts "#{sample_count.zero? ? 'Validate' : 'Measure'} #{name}"
+    $stdout.flush
+    output, status = Open3.capture2(*prefix, *command, sample_count.to_s, millis.to_s)
+    abort "#{name} failed" unless status.success?
+    File.write("#{dir}/#{sample_count.zero? ? 'validate-' : ''}#{name}.jsonl", output)
+    parsed = output.lines.map { |line| JSON.parse(line) }
+    found = parsed.select { |row| row.fetch("kind") == "fixture" }
+    expected = name == "node-webcrypto" ? 4 : 8
+    abort "missing fixtures from #{name}" unless found.length == expected
+    found.each do |row|
+      key = row.values_at("algorithm", "bytes")
+      value = row.fetch("hex")
+      abort "incorrect fixture length" unless value.length == (row.fetch("bytes") + 16) * 2
+      abort "ciphertext mismatch: #{name} #{key}" if fixtures.key?(key) && fixtures[key] != value
+      fixtures[key] = value
+    end
+    next if sample_count.zero?
+    measured = parsed.select { |row| row.fetch("kind") == "timing" }
+    expected_rows = %w[rustcrypto go].include?(name) ? 32 : expected * 2
+    abort "missing timings from #{name}" unless measured.length == expected_rows
+    measured.each do |row|
+      values = row.fetch("ns_samples")
+      abort "invalid samples" unless values.length == samples && values.all? { |x| x.finite? && x.positive? }
+      row["median_ns"] = values.sort[values.length / 2]
+      row["min_ns"] = values.min; row["max_ns"] = values.max
+      row["mib_per_second"] = row.fetch("bytes") * 1e9 / row["median_ns"] / 1024**2
+    end
+    rows.concat(measured)
+  end
+  puts "All cross-backend ciphertext/tag fixtures agree." if sample_count.zero?
+end
+File.write("#{dir}/summary.json", JSON.pretty_generate(rows) + "\n")
+report = ["# AEAD microbenchmark", "", "CPU affinity: #{cpu || 'unbound'}; #{samples} samples × #{millis} ms after one warmup per case.", "", "| Backend | Algorithm | Bytes | Buffer | Operation | Median µs | MiB/s | Min–max µs |", "|---|---|---:|---|---|---:|---:|---:|"]
+rows.each do |r|
+  report << format("| %s | %s | %d | %s | %s | %.3f | %.1f | %.3f–%.3f |", *r.values_at("backend", "algorithm", "bytes", "mode", "operation"), r["median_ns"] / 1000, r["mib_per_second"], r["min_ns"] / 1000, r["max_ns"] / 1000)
+end
+File.write("#{dir}/summary.md", report.join("\n") + "\n")
+puts "AEAD results: #{dir}/summary.md (#{rows.length} timing cases; cross-backend fixtures verified)"

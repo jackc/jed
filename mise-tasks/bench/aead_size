@@ -1,0 +1,142 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure linked AEAD size deltas in SQL embeddings and tree-shaken JS bundles"
+
+require 'json'
+require 'open3'
+require 'zlib'
+require 'stringio'
+require_relative '../../scripts/lib/tasks'
+include Tasks
+
+dir = File.expand_path(ENV.fetch('JED_AEAD_SIZE_RESULTS', "bench/results/aead-size-#{stamp}-#{Process.pid}"))
+base = File.join(ROOT, 'bench/aead')
+FileUtils.mkdir_p(["#{dir}/rust/src", "#{dir}/go", "#{dir}/js"])
+capture = ->(*cmd) { out, status = Open3.capture2e(*cmd); abort out unless status.success?; out.strip }
+# Reuse already approved versions and their lockfiles. No new third-party dependency.
+manifest = File.read("#{base}/rust/Cargo.toml").sub('jed-aead-bench', 'jed-aead-size')
+manifest.sub!('aes-gcm = "=0.11.1"', 'aes-gcm = { version = "=0.11.1", optional = true }')
+manifest.sub!('chacha20poly1305 = "=0.11.0"', 'chacha20poly1305 = { version = "=0.11.0", optional = true }')
+manifest << "\njed = { path = #{File.join(ROOT, 'impl/rust').to_json} }\n\n[features]\naes = [\"dep:aes-gcm\"]\nchacha = [\"dep:chacha20poly1305\"]\n\n[profile.release]\nstrip = true\n"
+File.write("#{dir}/rust/Cargo.toml", manifest)
+FileUtils.cp("#{base}/rust/Cargo.lock", "#{dir}/rust/Cargo.lock")
+File.write("#{dir}/rust/src/main.rs", <<~'RS')
+  #[cfg(any(feature = "aes", feature = "chacha"))]
+  fn crypto(input: &[u8]) {
+      #[cfg(feature = "aes")]
+      {
+          use aes_gcm::{Aes256Gcm, aead::{Aead, KeyInit, Payload}};
+          let c = Aes256Gcm::new_from_slice(std::hint::black_box(&[1u8;32])).unwrap();
+          let nonce = [2u8;12];
+          let sealed = c.encrypt((&nonce).into(), Payload { msg: input, aad: b"page" }).unwrap();
+          let opened = c.decrypt((&nonce).into(), Payload { msg: &sealed, aad: b"page" }).unwrap();
+          assert_eq!(opened, input);
+          println!("{}", sealed.len());
+      }
+      #[cfg(feature = "chacha")]
+      {
+          use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
+          let c = ChaCha20Poly1305::new_from_slice(std::hint::black_box(&[1u8;32])).unwrap();
+          let nonce = [2u8;12];
+          let sealed = c.encrypt((&nonce).into(), Payload { msg: input, aad: b"page" }).unwrap();
+          let opened = c.decrypt((&nonce).into(), Payload { msg: &sealed, aad: b"page" }).unwrap();
+          assert_eq!(opened, input);
+          println!("{}", sealed.len());
+      }
+  }
+  fn main() {
+      let sql = std::env::args().nth(1).unwrap();
+      let db = jed::Database::create(Default::default()).unwrap();
+      let mut session = db.session(Default::default());
+      let mut rows = session.query(&sql, &[]).unwrap();
+      let mut count = 0;
+      for _ in rows.by_ref() { count += 1; }
+      rows.error().unwrap();
+      println!("{count}");
+      #[cfg(any(feature = "aes", feature = "chacha"))]
+      crypto(sql.as_bytes());
+  }
+RS
+modfile = File.read("#{base}/go/go.mod").sub('module jed-aead-bench', 'module jed-aead-size')
+modfile << "\nrequire github.com/jackc/jed/impl/go v0.0.0\nreplace github.com/jackc/jed/impl/go => #{File.join(ROOT, 'impl/go')}\n"
+File.write("#{dir}/go/go.mod", modfile)
+FileUtils.cp("#{base}/go/go.sum", "#{dir}/go/go.sum")
+File.write("#{dir}/go/main.go", <<~'GO')
+  package main
+  import (
+    "context"
+    "fmt"
+    "os"
+    jed "github.com/jackc/jed/impl/go"
+  )
+  var ciphers []func([]byte)
+  func main() {
+    sql := os.Args[1]
+    db, err := jed.CreateDatabase(jed.CreateOptions{}); if err != nil { panic(err) }
+    session := db.Session(jed.SessionOptions{})
+    rows, err := session.Query(context.Background(), sql); if err != nil { panic(err) }
+    count := 0; for rows.Next() { count++ }; rows.Close(); if rows.Err()!=nil { panic(rows.Err()) }
+    fmt.Println(count)
+    for _, c := range ciphers { c([]byte(sql)) }
+  }
+GO
+{'aes'=>['"crypto/aes"; "crypto/cipher"', 'block, err := aes.NewCipher(key); if err != nil { panic(err) }; c, err := cipher.NewGCM(block)'],
+ 'chacha'=>['"golang.org/x/crypto/chacha20poly1305"', 'c, err := chacha20poly1305.New(key)']}.each do |name, (imports, init)|
+  File.write("#{dir}/go/#{name}.go", <<~GO)
+    //go:build #{name}
+    package main
+    import ("bytes"; "fmt"; #{imports})
+    func init() {
+      ciphers = append(ciphers, func(input []byte) {
+        key:=bytes.Repeat([]byte{1},32); nonce:=bytes.Repeat([]byte{2},12)
+        #{init}; if err != nil { panic(err) }
+        sealed:=c.Seal(nil,nonce,input,[]byte("page"))
+        opened,err:=c.Open(nil,nonce,sealed,[]byte("page")); if err!=nil { panic(err) }
+        if !bytes.Equal(opened,input) { panic("round trip") }; fmt.Println(len(sealed))
+      })
+    }
+  GO
+end
+
+rows = []
+variants = {'base'=>[], 'aes'=>['aes'], 'chacha'=>['chacha'], 'both'=>['aes','chacha']}
+sh 'cargo', 'generate-lockfile', '--offline', '--manifest-path', "#{dir}/rust/Cargo.toml"
+variants.each do |variant, features|
+  args = ['cargo', 'build', '--release', '--offline', '--locked', '--manifest-path', "#{dir}/rust/Cargo.toml"]
+  args += ['--features', features.join(',')] unless features.empty?
+  sh(*args)
+  dest = "#{dir}/rust-#{variant}"
+  FileUtils.cp("#{dir}/rust/target/release/jed-aead-size", dest)
+  sh dest, 'SELECT 1'
+  rows << {lang:'rust', variant:variant, bytes:File.size(dest)}
+end
+variants.each do |variant, features|
+  dest="#{dir}/go-#{variant}"
+  args=['go','build','-mod=readonly','-trimpath','-ldflags=-s -w','-o',dest]
+  args += ['-tags', features.join(',')] unless features.empty?
+  sh(*args, '.', chdir:"#{dir}/go", env:{'CGO_ENABLED'=>'0','GOPROXY'=>'off'})
+  sh dest, 'SELECT 1'
+  rows << {lang:'go', variant:variant, bytes:File.size(dest)}
+end
+
+esbuild = ENV['JED_ESBUILD'] || Dir[File.join(Dir.home, '.npm/_npx/*/node_modules/esbuild/bin/esbuild')].first
+abort 'Set JED_ESBUILD to an already installed esbuild executable' unless esbuild
+{'base'=>'export const ciphers = [];',
+ 'aes'=>"export { gcm } from #{File.join(base,'ts/node_modules/@noble/ciphers/aes.js').to_json};",
+ 'chacha'=>"export { chacha20poly1305 } from #{File.join(base,'ts/node_modules/@noble/ciphers/chacha.js').to_json};",
+ 'both'=>"export { gcm } from #{File.join(base,'ts/node_modules/@noble/ciphers/aes.js').to_json};\nexport { chacha20poly1305 } from #{File.join(base,'ts/node_modules/@noble/ciphers/chacha.js').to_json};"}.each do |variant, source|
+  entry="#{dir}/js/#{variant}.js"; output="#{dir}/js/#{variant}.mjs"
+  File.write(entry,source)
+  sh esbuild, entry, '--bundle', '--minify', '--format=esm', '--platform=browser', "--outfile=#{output}"
+  io=StringIO.new; gz=Zlib::GzipWriter.new(io); gz.mtime=0; gz.write(File.binread(output)); gz.close
+  File.binwrite("#{output}.gz",io.string)
+  rows << {lang:'js-minified',variant:variant,bytes:File.size(output)}
+  rows << {lang:'js-gzip',variant:variant,bytes:io.string.bytesize}
+end
+rows.each { |r| r[:delta_bytes] = r[:bytes] - rows.find { |x| x[:lang]==r[:lang] && x[:variant]=='base' }[:bytes] }
+metadata={date_utc:Time.now.utc.iso8601, os:capture.call('uname','-sm'), rust:capture.call('rustc','--version'), go:capture.call('go','version'), node:capture.call('node','--version'), esbuild:capture.call(esbuild,'--version'),
+  rust_profile:'release, strip=true; default opt-level=3, no explicit LTO', go_flags:'CGO_ENABLED=0 -trimpath -ldflags=-s -w',
+  caveat:'jed embedding executes runtime SQL. AEAD called separately, not integrated into pager. No KDF, wrapping or file codec. JS library exports only, not complete jed bundle.'}
+File.write("#{dir}/sizes.json",JSON.pretty_generate({metadata:metadata,rows:rows})+"\n")
+rows.each { |r| puts "%s %-6s %10d bytes (%+d)" % [r[:lang],r[:variant],r[:bytes],r[:delta_bytes]] }
+puts "Size results: #{dir}/sizes.json"

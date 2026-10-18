@@ -73,8 +73,8 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   replica apply recipe, keyless replicas, PITR at commit granularity, and the write-amplification
   trade (CLAUDE.md §9).
 - [encryption.md](encryption.md) — encryption at rest (a deferred door): a page codec above
-  the seam, a standardized AEAD with a deterministic `(page_index, txid)` nonce that keeps §8
-  byte-identity, the auth tag closing the CRC tamper gap, and the §14 crypto-dependency gate.
+  the seam, envelope encryption and separate credential/data-key rotation, open crash/fork-safe
+  nonce rules, authenticated metadata, page-sized AEAD measurements and the §14 dependency gate.
 - [api.md](api.md) — the host/embedding API: open/create/commit/close a database file,
   prepare/execute/query, the `Rows` cursor, `$N` bind parameters, and the structured-error
   surface — the same shape across cores (CLAUDE.md §1/§2).

@@ -41,6 +41,12 @@
 # local state; harness build artifacts mirror the per-core ignores above.
 /bench/data/
 /bench/results/
+# Keep compact reports in the historical result trees; raw evidence stays on the research branch.
+/bench/ts/results/**
+!/bench/ts/results/*/
+!/bench/ts/results/*/report.md
+/bench/aead/results/*
+!/bench/aead/results/*.md
 /bench/go/bin/
 /bench/rust/target/
 /bench/ts/node_modules
