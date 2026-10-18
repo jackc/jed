@@ -209,7 +209,11 @@ or any insert this statement already planned, conflict with `R` under that const
 so, else plan an insert. The no-target skip asks the same of every exclusion constraint, after the
 PK / unique checks. Every remaining exclusion conflict — of a planned insert or an updated row's new
 values, against stored rows the statement keeps or against each other — is validated against the
-end state after the FOREIGN KEY checks, trapping **`23P01`**.
+end state after the FOREIGN KEY checks, trapping **`23P01`**. A DO UPDATE that re-keys its row (§5) is
+no exception: the row's vacated old version is not a stored row the statement keeps, and its new
+values are checked like any other updated row's. A decorated or partial column-list target (§2) never
+infers an exclusion constraint, so an exclusion conflict outside it is `23P01` whenever the arbiter
+does not first claim the row.
 
 ## 4. The second-affect rule (`21000`)
 
