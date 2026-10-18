@@ -22,6 +22,15 @@
 import type { ColType } from "./catalog.ts";
 import type { Row } from "./storage.ts";
 import type { Value } from "./value.ts";
+import {
+  COOPERATE,
+  ioSteps,
+  runSync,
+  shouldCooperate,
+  syncStepIterator,
+  type StepIterator,
+  type Steps,
+} from "./execution.ts";
 
 // TypeScript has no object-uniqueness query, so a private object identity is the ownership proof for
 // dirty INSERT transients (transactions.md §3). The module-private symbol makes the node stamp
@@ -188,16 +197,19 @@ export function onDiskRef(page: number): Child {
 // never faults.
 export interface LeafSource {
   loadLeaf(page: number): PNode;
+  loadLeafSteps?(page: number): Steps<PNode>;
 }
 
 // resolveChild resolves c to a resident node, faulting an OnDisk leaf through src. A resident ref
 // returns its node directly; an OnDisk leaf with no source is an internal wiring bug (an in-memory
 // tree builds no OnDisk ref, and every file-backed traversal supplies a source), so it throws.
-function resolveChild(c: Child, src: LeafSource | null): PNode {
+function* resolveChildSteps(c: Child, src: LeafSource | null): Steps<PNode> {
   if (c.node !== null) return c.node;
   if (src === null)
     throw new Error(`demand-paged leaf ${c.page} reached with no buffer-pool source`);
-  return src.loadLeaf(c.page);
+  return yield* src.loadLeafSteps === undefined
+    ? ioSteps(() => src.loadLeaf(c.page))
+    : src.loadLeafSteps(c.page);
 }
 
 function isLeaf(n: PNode): boolean {
@@ -423,17 +435,28 @@ export class PMap {
     return this.getCounted(key, src).row;
   }
 
+  *getSteps(key: Uint8Array, src: LeafSource | null): Steps<Row | undefined> {
+    return (yield* this.getCountedSteps(key, src)).row;
+  }
+
   // One direct root→leaf point descent plus its visited-node count. Reconstructs a hit once and
   // creates neither a range bound nor an emitted storage-key object.
   getCounted(
     key: Uint8Array,
     src: LeafSource | null,
   ): { row: Row | undefined; nodes: number; rowsReconstructed: number } {
+    return runSync(this.getCountedSteps(key, src));
+  }
+
+  *getCountedSteps(
+    key: Uint8Array,
+    src: LeafSource | null,
+  ): Steps<{ row: Row | undefined; nodes: number; rowsReconstructed: number }> {
     let n = this.root;
     if (n === null) return { row: undefined, nodes: 0, rowsReconstructed: 0 };
     let nodes = 1;
     while (!isLeaf(n)) {
-      n = resolveChild(n.children[childSlot(n, key)], src);
+      n = yield* resolveChildSteps(n.children[childSlot(n, key)], src);
       nodes++;
     }
     const { index, found } = search(n, key);
@@ -456,6 +479,17 @@ export class PMap {
     shape: LeafShape,
     src: LeafSource | null,
   ): Row | undefined {
+    return runSync(this.insertSteps(key, val, weight, cap, shape, src));
+  }
+
+  *insertSteps(
+    key: Uint8Array,
+    val: Row,
+    weight: number,
+    cap: number,
+    shape: LeafShape,
+    src: LeafSource | null,
+  ): Steps<Row | undefined> {
     const generation = this.currentMutationGeneration();
     if (this.root === null) {
       this.root = newLeaf([key], [val], [weight], generation);
@@ -463,7 +497,17 @@ export class PMap {
       return undefined;
     }
     const ctx: InsCtx = { old: undefined, replaced: false };
-    const out = nodeInsert(this.root, key, val, weight, ctx, generation, src, cap, shape);
+    const out = yield* nodeInsertSteps(
+      this.root,
+      key,
+      val,
+      weight,
+      ctx,
+      generation,
+      src,
+      cap,
+      shape,
+    );
     this.root =
       out.whole !== null
         ? out.whole
@@ -477,8 +521,17 @@ export class PMap {
   // threshold). src faults OnDisk leaves the delete descends into / rebalances against
   // (spec/design/pager.md §4).
   remove(key: Uint8Array, cap: number, shape: LeafShape, src: LeafSource | null): Row | undefined {
+    return runSync(this.removeSteps(key, cap, shape, src));
+  }
+
+  *removeSteps(
+    key: Uint8Array,
+    cap: number,
+    shape: LeafShape,
+    src: LeafSource | null,
+  ): Steps<Row | undefined> {
     if (this.root === null) return undefined;
-    const res = nodeRemove(this.root, key, src, cap, shape);
+    const res = yield* nodeRemoveSteps(this.root, key, src, cap, shape);
     if (!res.ok) return undefined;
     const newRoot = res.node;
     // The root may have drained: an empty leaf becomes the empty map; a 0-key interior root hands
@@ -487,7 +540,7 @@ export class PMap {
     if (nodeLen(newRoot) === 0) {
       // The lone surviving child becomes the new root — fault it if it is an OnDisk leaf (a tree of
       // height 2 can collapse to its single bottom child).
-      this.root = isLeaf(newRoot) ? null : resolveChild(newRoot.children[0], src);
+      this.root = isLeaf(newRoot) ? null : yield* resolveChildSteps(newRoot.children[0], src);
     } else {
       this.root = newRoot;
     }
@@ -501,19 +554,7 @@ export class PMap {
   // dropped (GC) once its rows are collected, so the resident leaf set stays bounded by the pool,
   // not the tree (pager.md §4).
   inorder(src: LeafSource | null): { keys: Uint8Array[]; vals: Row[] } {
-    const keys: Uint8Array[] = [];
-    const vals: Row[] = [];
-    const walk = (n: PNode): void => {
-      if (isLeaf(n)) {
-        for (let i = 0; i < nodeLen(n); i++) {
-          keys.push(keyAt(n, i));
-          vals.push(rowAt(n, i));
-        }
-        return;
-      }
-      for (const c of n.children) walk(resolveChild(c, src));
-    };
-    if (this.root !== null) walk(this.root);
+    const { keys, vals } = this.rangeEntriesCounted(unboundedBound(), src);
     return { keys, vals };
   }
 
@@ -591,26 +632,33 @@ export class PMap {
     b: KeyBound,
     src: LeafSource | null,
   ): { keys: Uint8Array[]; vals: Row[]; nodes: number } {
+    return runSync(this.rangeEntriesCountedSteps(b, src));
+  }
+
+  *rangeEntriesCountedSteps(
+    b: KeyBound,
+    src: LeafSource | null,
+  ): Steps<{ keys: Uint8Array[]; vals: Row[]; nodes: number }> {
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
-    let nodes = 0;
-    const walk = (n: PNode): void => {
-      nodes++;
-      if (isLeaf(n)) {
-        const [ef, el] = entryWindow(b, n);
-        for (let i = ef; i < el; i++) {
-          keys.push(keyAt(n, i));
-          vals.push(rowAt(n, i));
-        }
-        return;
+    const iterator = new TreeStepIterator(
+      this.root,
+      b,
+      src,
+      false,
+      (node, index): [Uint8Array, Row] => [keyAt(node, index), rowAt(node, index)],
+    );
+    try {
+      for (;;) {
+        const item = yield* iterator.nextSteps();
+        if (item.done) break;
+        keys.push(item.value[0]);
+        vals.push(item.value[1]);
       }
-      const [cf, cl] = childWindow(b, n);
-      for (let i = cf; i <= cl; i++) {
-        walk(resolveChild(n.children[i], src));
-      }
-    };
-    if (this.root !== null) walk(this.root);
-    return { keys, vals, nodes };
+      return { keys, vals, nodes: iterator.nodesVisited };
+    } finally {
+      yield* iterator.returnSteps();
+    }
   }
 
   // foldScan is the columnar lanes' walk (packed-leaf.md §11 Tracks A2–A4): rangeEntriesCounted's
@@ -623,23 +671,42 @@ export class PMap {
     src: LeafSource | null,
     visit: (n: PNode, i: number) => void,
   ): { rowCount: number; nodes: number } {
+    return runSync(
+      this.foldScanSteps(
+        b,
+        src,
+        // biome-ignore lint/correctness/useYield: A synchronous visitor is a continuation with no effects.
+        function* (node, index) {
+          visit(node, index);
+        },
+      ),
+    );
+  }
+
+  *foldScanSteps(
+    b: KeyBound,
+    src: LeafSource | null,
+    visit: (n: PNode, i: number) => Steps<void>,
+  ): Steps<{ rowCount: number; nodes: number }> {
     let rowCount = 0;
-    let nodes = 0;
-    const walk = (n: PNode): void => {
-      nodes++;
-      if (isLeaf(n)) {
-        const [ef, el] = entryWindow(b, n);
-        for (let i = ef; i < el; i++) {
-          visit(n, i);
-          rowCount++;
-        }
-        return;
+    const iterator = new TreeStepIterator(
+      this.root,
+      b,
+      src,
+      false,
+      (node, index): [PNode, number] => [node, index],
+    );
+    try {
+      for (;;) {
+        const item = yield* iterator.nextSteps();
+        if (item.done) break;
+        yield* visit(item.value[0], item.value[1]);
+        rowCount++;
       }
-      const [cf, cl] = childWindow(b, n);
-      for (let i = cf; i <= cl; i++) walk(resolveChild(n.children[i], src));
-    };
-    if (this.root !== null) walk(this.root);
-    return { rowCount, nodes };
+      return { rowCount, nodes: iterator.nodesVisited };
+    } finally {
+      yield* iterator.returnSteps();
+    }
   }
 
   // overlapNodeCount is the number of B+tree nodes a bounded scan over b visits — the page_read it
@@ -671,21 +738,9 @@ export class PMap {
     src: LeafSource | null,
     visit: (key: Uint8Array, row: Row) => boolean,
   ): void {
-    const walk = (n: PNode): boolean => {
-      if (isLeaf(n)) {
-        const [ef, el] = entryWindow(b, n);
-        for (let i = ef; i < el; i++) {
-          if (!visit(keyAt(n, i), rowAt(n, i))) return false;
-        }
-        return true;
-      }
-      const [cf, cl] = childWindow(b, n);
-      for (let i = cf; i <= cl; i++) {
-        if (!walk(resolveChild(n.children[i], src))) return false;
-      }
-      return true;
-    };
-    if (this.root !== null) walk(this.root);
+    for (const [key, row] of this.scanRangeIter(b, src)) {
+      if (!visit(key, row)) return;
+    }
   }
 
   // scanRangeRev is scanRange in reverse: it visits the in-bound (key, row) pairs in DESCENDING key
@@ -699,21 +754,9 @@ export class PMap {
     src: LeafSource | null,
     visit: (key: Uint8Array, row: Row) => boolean,
   ): void {
-    const walk = (n: PNode): boolean => {
-      if (isLeaf(n)) {
-        const [ef, el] = entryWindow(b, n);
-        for (let i = el - 1; i >= ef; i--) {
-          if (!visit(keyAt(n, i), rowAt(n, i))) return false;
-        }
-        return true;
-      }
-      const [cf, cl] = childWindow(b, n);
-      for (let i = cl; i >= cf; i--) {
-        if (!walk(resolveChild(n.children[i], src))) return false;
-      }
-      return true;
-    };
-    if (this.root !== null) walk(this.root);
+    for (const [key, row] of this.scanRangeRevIter(b, src)) {
+      if (!visit(key, row)) return;
+    }
   }
 
   // scanRangeIter is the PULL-model equivalent of scanRange (the S2 pull B+tree scan cursor,
@@ -727,22 +770,36 @@ export class PMap {
   // a faulted leaf's row alive as long as a pulled row references it, even after the pool evicts the
   // leaf. A faulted-leaf read error in resolveChild propagates as a thrown exception.
   scanRangeIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+    return syncStepIterator(this.scanRangeStepsIter(b, src));
+  }
+
+  scanRangeStepsIter(
+    b: KeyBound,
+    src: LeafSource | null,
+    reverse = false,
+  ): StepIterator<[Uint8Array, Row]> {
     this.freezeMutationGeneration();
-    return this.root === null ? emptyPairIter() : walkIter(this.root, b, src);
+    return new TreeStepIterator(this.root, b, src, reverse, (node, index) => [
+      keyAt(node, index),
+      rowAt(node, index),
+    ]);
   }
 
   // scanRangeRevIter is scanRangeIter in reverse — the pull-model equivalent of scanRangeRev,
   // yielding the in-bound pairs in DESCENDING key order (the exact reverse of scanRangeIter).
   scanRangeRevIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
-    this.freezeMutationGeneration();
-    return this.root === null ? emptyPairIter() : walkRevIter(this.root, b, src);
+    return syncStepIterator(this.scanRangeStepsIter(b, src, true));
   }
 
   // SELECT's row-only pull form: identical range traversal without allocating an unused [key,row]
   // tuple for every emitted record.
   scanRowsIter(b: KeyBound, src: LeafSource | null, reverse: boolean): Generator<Row> {
+    return syncStepIterator(this.scanRowsStepsIter(b, src, reverse));
+  }
+
+  scanRowsStepsIter(b: KeyBound, src: LeafSource | null, reverse: boolean): StepIterator<Row> {
     this.freezeMutationGeneration();
-    return this.root === null ? emptyRowIter() : walkRowsIter(this.root, b, src, reverse);
+    return new TreeStepIterator(this.root, b, src, reverse, rowAt);
   }
 
   // demoteCleanLeaves demotes every CLEAN, PERSISTED resident leaf to its OnDisk(page) reference —
@@ -794,59 +851,77 @@ export class PMap {
   }
 }
 
-function* emptyPairIter(): Generator<[Uint8Array, Row]> {}
-function* emptyRowIter(): Generator<Row> {}
+// Both public synchronous generators and runtime pulls drive this one retained traversal. A
+// page read suspends before entering its child; no row or earlier traversal is replayed.
+type ScanFrame = { node: PNode; next: number; last: number };
 
-// walkIter mirrors PMap.scanRange's recursive in-order walk, yielding [key, row] instead of calling a
-// visit callback — so it is identical by construction (same structure, same windowing, same descent
-// order; only leaves yield, v24).
-function* walkIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
-  if (isLeaf(n)) {
-    const [ef, el] = entryWindow(b, n);
-    for (let i = ef; i < el; i++) yield [keyAt(n, i), rowAt(n, i)];
-    return;
-  }
-  const [cf, cl] = childWindow(b, n);
-  for (let i = cf; i <= cl; i++) {
-    yield* walkIter(resolveChild(n.children[i], src), b, src);
-  }
-}
+class TreeStepIterator<T> implements StepIterator<T> {
+  private readonly frames: ScanFrame[] = [];
+  private readonly bound: KeyBound;
+  private readonly source: LeafSource | null;
+  private readonly reverse: boolean;
+  private readonly project: (node: PNode, index: number) => T;
+  private closed = false;
+  private traversed = 0;
+  nodesVisited = 0;
 
-// walkRevIter mirrors PMap.scanRangeRev's reverse walk, yielding instead of pushing.
-function* walkRevIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
-  if (isLeaf(n)) {
-    const [ef, el] = entryWindow(b, n);
-    for (let i = el - 1; i >= ef; i--) yield [keyAt(n, i), rowAt(n, i)];
-    return;
+  constructor(
+    root: PNode | null,
+    bound: KeyBound,
+    source: LeafSource | null,
+    reverse: boolean,
+    project: (node: PNode, index: number) => T,
+  ) {
+    this.bound = bound;
+    this.source = source;
+    this.reverse = reverse;
+    this.project = project;
+    if (root !== null) this.enter(root);
   }
-  const [cf, cl] = childWindow(b, n);
-  for (let i = cl; i >= cf; i--) {
-    yield* walkRevIter(resolveChild(n.children[i], src), b, src);
-  }
-}
 
-function* walkRowsIter(
-  n: PNode,
-  b: KeyBound,
-  src: LeafSource | null,
-  reverse: boolean,
-): Generator<Row> {
-  if (isLeaf(n)) {
-    const [ef, el] = entryWindow(b, n);
-    if (reverse) {
-      for (let i = el - 1; i >= ef; i--) yield rowAt(n, i);
-    } else {
-      for (let i = ef; i < el; i++) yield rowAt(n, i);
+  private enter(node: PNode): void {
+    this.nodesVisited++;
+    const leaf = isLeaf(node);
+    const [first, end] = leaf ? entryWindow(this.bound, node) : childWindow(this.bound, node);
+    const last = leaf ? end - 1 : end;
+    this.frames.push({
+      node,
+      next: this.reverse ? last : first,
+      last: this.reverse ? first : last,
+    });
+  }
+
+  *nextSteps(): Steps<IteratorResult<T>> {
+    if (this.closed) return { done: true, value: undefined };
+    try {
+      while (this.frames.length > 0) {
+        const frame = this.frames[this.frames.length - 1]!;
+        if (this.reverse ? frame.next < frame.last : frame.next > frame.last) {
+          this.frames.pop();
+          continue;
+        }
+        const index = frame.next;
+        frame.next += this.reverse ? -1 : 1;
+        if (isLeaf(frame.node)) {
+          if ((++this.traversed & 63) === 0 && shouldCooperate(64)) yield COOPERATE;
+          return { done: false, value: this.project(frame.node, index) };
+        }
+        this.enter(yield* resolveChildSteps(frame.node.children[index]!, this.source));
+      }
+      this.closed = true;
+      return { done: true, value: undefined };
+    } catch (error) {
+      this.closed = true;
+      this.frames.length = 0;
+      throw error;
     }
-    return;
   }
-  const [cf, cl] = childWindow(b, n);
-  if (reverse) {
-    for (let i = cl; i >= cf; i--)
-      yield* walkRowsIter(resolveChild(n.children[i], src), b, src, true);
-  } else {
-    for (let i = cf; i <= cl; i++)
-      yield* walkRowsIter(resolveChild(n.children[i], src), b, src, false);
+
+  // biome-ignore lint/correctness/useYield: Closing this iterator releases only resident traversal state.
+  *returnSteps(): Steps<IteratorResult<T>> {
+    this.closed = true;
+    this.frames.length = 0;
+    return { done: true, value: undefined };
   }
 }
 
@@ -992,7 +1067,7 @@ function buildInterior(
 // via childSlot); on overwrite it sets ctx and rebuilds with the value+weight replaced (which may
 // now overflow). Splits propagate back up: a leaf split copies its boundary key up, an interior
 // receiving a separator may push-split in turn.
-function nodeInsert(
+function* nodeInsertSteps(
   n: PNode,
   key: Uint8Array,
   val: Row,
@@ -1002,7 +1077,7 @@ function nodeInsert(
   src: LeafSource | null,
   cap: number,
   shape: LeafShape,
-): InsOut {
+): Steps<InsOut> {
   if (isLeaf(n)) {
     const { index, found } = search(n, key);
     // Only this active generation may own a dirty node. Clone/cursor/publication invalidates the
@@ -1044,8 +1119,8 @@ function nodeInsert(
   // Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
   // becomes a dirty resident node on the rebuilt path).
   const i = childSlot(n, key);
-  const sub = nodeInsert(
-    resolveChild(n.children[i], src),
+  const sub = yield* nodeInsertSteps(
+    yield* resolveChildSteps(n.children[i], src),
     key,
     val,
     weight,
@@ -1093,13 +1168,13 @@ type RemOut = { ok: boolean; node: PNode; removed: Row | undefined };
 // equal to the key just routes right — it is never itself deleted or replaced; separators may go
 // stale, format.md "Delete"). Returns the rebuilt subtree (possibly underfull — the caller
 // rebalances it) and the removed row; the touched child is rebalanced via rebalanceChild.
-function nodeRemove(
+function* nodeRemoveSteps(
   n: PNode,
   key: Uint8Array,
   src: LeafSource | null,
   cap: number,
   shape: LeafShape,
-): RemOut {
+): Steps<RemOut> {
   if (isLeaf(n)) {
     const { index, found } = search(n, key);
     if (!found) return { ok: false, node: n, removed: undefined };
@@ -1112,34 +1187,44 @@ function nodeRemove(
     };
   }
   const i = childSlot(n, key);
-  const res = nodeRemove(resolveChild(n.children[i], src), key, src, cap, shape);
+  const res = yield* nodeRemoveSteps(
+    yield* resolveChildSteps(n.children[i], src),
+    key,
+    src,
+    cap,
+    shape,
+  );
   if (!res.ok) return { ok: false, node: n, removed: undefined };
   const children = n.children.slice();
   children[i] = residentRef(res.node);
   const rebuilt = newInterior(n.keys.slice(), children);
-  return { ok: true, node: rebalanceChild(rebuilt, i, src, cap, shape), removed: res.removed };
+  return {
+    ok: true,
+    node: yield* rebalanceChildSteps(rebuilt, i, src, cap, shape),
+    removed: res.removed,
+  };
 }
 
 // rebalanceChild: if children[i] is underfull (payload < cap/2), merge it with an adjacent sibling
 // (prefer the right one), then split the merged node back if it overflows — the unified rebalance
 // (no borrow). The returned parent may itself have lost a key and become underfull; its own parent
 // handles that as the recursion unwinds.
-function rebalanceChild(
+function* rebalanceChildSteps(
   n: PNode,
   i: number,
   src: LeafSource | null,
   cap: number,
   shape: LeafShape,
-): PNode {
+): Steps<PNode> {
   // children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
-  if (payload(resolveChild(n.children[i], src), shape) >= cap / 2) return n;
+  if (payload(yield* resolveChildSteps(n.children[i], src), shape) >= cap / 2) return n;
   if (n.children.length < 2) {
     // A 0-key interior (one child, the degenerate max-separator shape) has no sibling to merge
     // with — its own parent merges IT away; the root case collapses in PMap.remove.
     return n;
   }
   const j = i + 1 < n.children.length ? i : i - 1;
-  return mergeAt(n, j, src, cap, shape);
+  return yield* mergeAtSteps(n, j, src, cap, shape);
 }
 
 // mergeAt merges children[j] and children[j+1] into one node M (format.md "Delete"): a LEAF merge
@@ -1150,17 +1235,17 @@ function rebalanceChild(
 // separator replace the pair (the parent's key count is unchanged). An INTERIOR M that overflows
 // but admits no valid split (near-cap separators) ABANDONS the merge — the parent is returned
 // unchanged (format.md "Delete", the deterministic abandon rule).
-function mergeAt(
+function* mergeAtSteps(
   n: PNode,
   j: number,
   src: LeafSource | null,
   cap: number,
   shape: LeafShape,
-): PNode {
+): Steps<PNode> {
   // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
   // still be an OnDisk leaf the delete never touched.
-  const left = resolveChild(n.children[j], src);
-  const right = resolveChild(n.children[j + 1], src);
+  const left = yield* resolveChildSteps(n.children[j], src);
+  const right = yield* resolveChildSteps(n.children[j + 1], src);
 
   let merged: InsOut;
   if (isLeaf(left)) {

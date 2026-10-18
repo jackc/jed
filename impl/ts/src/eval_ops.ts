@@ -63,7 +63,8 @@ import type { InputZone, ZoneRef } from "./timezone.ts";
 import { valueCmp } from "./window.ts";
 import type { Row } from "./storage.ts";
 import type { Meter } from "./cost.ts";
-import { evalExpr } from "./eval.ts";
+import { evalExprSteps, synchronousEvalEnv } from "./eval.ts";
+import { runSync, type Steps } from "./execution.ts";
 import {
   canonicalName,
   isBool,
@@ -574,13 +575,13 @@ export function buildNestedArray(subs: Value[]): Value {
 // evalSubscript evaluates an array subscript `base[..][..]` (spec/design/array.md §6). A NULL array
 // or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
 // access a (renumbered) sub-array.
-export function evalSubscript(
+export function* evalSubscriptSteps(
   e: { base: RExpr; subscripts: RSubscript[]; isSlice: boolean },
   row: Row,
   env: EvalEnv,
   m: Meter,
-): Value {
-  const base = evalExpr(e.base, row, env, m);
+): Steps<Value> {
+  const base = yield* evalExprSteps(e.base, row, env, m);
   if (base.kind === "null") return nullValue();
   if (base.kind !== "array") throw typeError("internal: subscript on a non-array value");
   if (e.isSlice) {
@@ -590,15 +591,15 @@ export function evalSubscript(
     const his: (bigint | null)[] = [];
     for (const s of e.subscripts) {
       if (!s.isSlice) {
-        const v = evalExpr(s.index, row, env, m);
+        const v = yield* evalExprSteps(s.index, row, env, m);
         if (v.kind === "null") return nullValue();
         if (v.kind !== "int") throw typeError("internal: non-integer array subscript");
         los.push(1n); // scalar i → 1:i
         his.push(v.int);
       } else {
-        const lo = evalOptBound(s.lower, row, env, m);
+        const lo = yield* evalOptBoundSteps(s.lower, row, env, m);
         if (lo === "null") return nullValue();
-        const hi = evalOptBound(s.upper, row, env, m);
+        const hi = yield* evalOptBoundSteps(s.upper, row, env, m);
         if (hi === "null") return nullValue();
         los.push(lo);
         his.push(hi);
@@ -610,7 +611,7 @@ export function evalSubscript(
   const idxs: bigint[] = [];
   for (const s of e.subscripts) {
     if (s.isSlice) throw typeError("internal: slice spec in element access");
-    const v = evalExpr(s.index, row, env, m);
+    const v = yield* evalExprSteps(s.index, row, env, m);
     if (v.kind === "null") return nullValue();
     if (v.kind !== "int") throw typeError("internal: non-integer array subscript");
     idxs.push(v.int);
@@ -620,14 +621,14 @@ export function evalSubscript(
 
 // evalOptBound evaluates an optional slice-bound expression: null expr → null (defer to the array
 // bound); a NULL value → "null" (the whole result is NULL); an integer → its bigint.
-export function evalOptBound(
+export function* evalOptBoundSteps(
   e: RExpr | null,
   row: Row,
   env: EvalEnv,
   m: Meter,
-): bigint | null | "null" {
+): Steps<bigint | null | "null"> {
   if (e === null) return null;
-  const v = evalExpr(e, row, env, m);
+  const v = yield* evalExprSteps(e, row, env, m);
   if (v.kind === "null") return "null";
   if (v.kind !== "int") throw typeError("internal: non-integer array slice bound");
   return v.int;
@@ -1358,4 +1359,21 @@ export function validateDecimalTypmod(tm: TypeMod): DecimalTypmod {
     );
   }
   return { precision: Number(p), scale: Number(s) };
+}
+
+export function evalSubscript(
+  e: { base: RExpr; subscripts: RSubscript[]; isSlice: boolean },
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): Value {
+  return runSync(evalSubscriptSteps(e, row, synchronousEvalEnv(env), m));
+}
+export function evalOptBound(
+  e: RExpr | null,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): bigint | null | "null" {
+  return runSync(evalOptBoundSteps(e, row, synchronousEvalEnv(env), m));
 }

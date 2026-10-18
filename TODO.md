@@ -586,10 +586,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   async-only application entry points over dedicated workers, versioned lossless values and
   structured errors, bounded admission/results/handles, session ordering with parked writer
   waiters, prepared/batched execution, transaction callbacks, cleanup, failure uncertainty and
-  atomic cancellation on Node/shared-memory browsers. Website examples/live panels use it;
+  atomic cancellation on Node/shared-memory browsers plus cooperative cancellation at logical
+  page boundaries and common execution loops on every host. Retained continuations share sync
+  and async semantic paths, including awaitable Node data-page reads. Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
-  for conformance/tooling. Remaining: cooperative interruption of blocking kernels without shared
-  memory, full bounded cancellation latency, explicit async page/crypto continuations, broader
+  for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar
+  kernels stay synchronous unless measurements justify extra pause points. Remaining: async
+  storage lifecycle/commit and crypto providers, broader
   public-boundary workload/ARM/package-size measurements, and optional Rust delivery parity.
   Encryption protocol/provider selection is separate; no SQL replay or whole-file preload.
 - **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep

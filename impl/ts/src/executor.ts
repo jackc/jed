@@ -1,4 +1,13 @@
 import { cancellationCheckpoint, withoutCancellation } from "./cancel.ts";
+import {
+  callSteps,
+  runSync,
+  COOPERATE,
+  shouldCooperate,
+  type Steps,
+  type StepIterator,
+} from "./execution.ts";
+import { evalExprSteps, evalFilterSteps, evalExpressionsSteps } from "./eval.ts";
 // Statement executor (CLAUDE.md §10). Mirrors executor.go / executor.rs: dispatch a
 // parsed statement; analyze (resolve types, predicates, projections against the
 // catalog); run. Errors throw EngineError. Results are produced deterministically
@@ -81,7 +90,7 @@ import {
   PLAN_MEMO_CAPACITY,
   Planning,
   planMemoKey,
-  restartPlanning,
+  restartPlanningSteps,
   withPlanValues,
 } from "./plan_params.ts";
 import {
@@ -173,11 +182,7 @@ import {
   whereContradicts,
   whereContradiction,
 } from "./rewrite.ts";
-import {
-  type Collation,
-  serializeTable,
-  sortKey as collationSortKey,
-} from "./collation.ts";
+import { type Collation, serializeTable, sortKey as collationSortKey } from "./collation.ts";
 import { Environment } from "./environment.ts";
 import { COSTS, MEMORY_ENTRY, MEMORY_ROW, MEMORY_VALUE } from "./costs.ts";
 import {
@@ -260,11 +265,7 @@ import {
 import { Cursor, type RowSource } from "./cursor.ts";
 // Type-only (erased) — no runtime cycle: the executor↔api value edge stays one-directional.
 import type { RunResult } from "./ergonomic.ts";
-import {
-  InputZone,
-  type TimeZoneInfo,
-  type ZoneRef,
-} from "./timezone.ts";
+import { InputZone, type TimeZoneInfo, type ZoneRef } from "./timezone.ts";
 import { datumToJson, datumToJsonb, jsonAggBreaksLine, jsonKeyText } from "./row_json.ts";
 import {
   crc32Ieee,
@@ -273,6 +274,7 @@ import {
   pagePayload,
   recordCompressUnits,
   resolveUnfetchedSelf,
+  resolveUnfetchedSelfSteps,
   typeCodeForScalar,
   compareViewDeps,
 } from "./format.ts";
@@ -328,12 +330,16 @@ import {
   DETAIL_DUPLICATED,
   DETAIL_EXISTS,
   exclusionDetail,
-  failingRowDetail,
+  exclusionDetailSteps,
+  failingRowDetailSteps,
   fkChildDetail,
-  fkParentDetail,
+  fkChildDetailSteps,
+  fkParentDetailSteps,
   indexDetail,
-  indexDetailByName,
+  indexDetailSteps,
+  indexDetailByNameSteps,
   pkDetail,
+  pkDetailSteps,
 } from "./error_detail.ts";
 import { QUOTED_KEYWORDS } from "./pg_keywords_gen.ts";
 import { type PrivilegeSet, Privileges } from "./privileges.ts";
@@ -379,12 +385,19 @@ import {
   outputCompositeNames,
   parseViewOptions,
 } from "./views.ts";
-import { type KeyBound, type PNode, colAt, colIsNull, compareBytes, unboundedBound } from "./pmap.ts";
+import {
+  type KeyBound,
+  type PNode,
+  colAt,
+  colIsNull,
+  compareBytes,
+  unboundedBound,
+} from "./pmap.ts";
 import {
   compileLaneFilter,
-  laneKeep,
+  laneKeepSteps,
   laneReuse,
-  readLeafColumn,
+  readLeafColumnSteps,
   ScratchRow,
 } from "./span_filter.ts";
 import {
@@ -454,11 +467,11 @@ import { StmtRng } from "./seam.ts";
 import { ginJsonbIndexTerms, ginJsonbKeyTerm } from "./gin_jsonb.ts";
 import {
   ginDecodeRun,
-  ginRunAtOrAfter,
+  ginRunAtOrAfterSteps,
   type IndexEntry,
   indexBuildInsert,
-  indexEntryInsert,
-  indexEntryRemove,
+  indexEntryInsertSteps,
+  indexEntryRemoveSteps,
   sortIndexEntries,
 } from "./gin_runs.ts";
 import {
@@ -585,7 +598,7 @@ import {
   evalFilter,
   floatToIntHalfAway,
   makeFloatCast,
-  passingBindings,
+  passingBindingsSteps,
   subqueryRowValue,
   toDecimal,
 } from "./eval.ts";
@@ -747,9 +760,9 @@ import { Snapshot, txStatusOf } from "./snapshot.ts";
 import type { AttachmentCore, LaneAt, ReadPin } from "./session.ts";
 import {
   SessionState,
-  foldAggWhole,
+  foldAggWholeSteps,
   frameBackwardSafe,
-  groupByIntKey,
+  groupByIntKeySteps,
   isAttachmentScope,
   operandCol,
   pullStreamingScanEligible,
@@ -757,14 +770,14 @@ import {
   vectorizedProjectEligible,
   vectorizedSpecEligible,
 } from "./session.ts";
-import { bufferedRows, streamRows } from "./session.ts";
+import { bufferedRowsSteps, streamRowsSteps } from "./session.ts";
 export * from "./session.ts";
 export * from "./eval.ts";
 import {
-  applyWindowStage,
+  applyWindowStageSteps,
   checkAssign,
   keyCmp,
-  materializeOrderExprs,
+  materializeOrderExprsSteps,
   sortRows,
   TopKKeeper,
   topKRows,
@@ -950,7 +963,10 @@ export function finalEmitter(rows: Value[][]): Emitter {
 // sortedEmitter wraps the streaming external sort's output (positioned past the OFFSET, with `remaining`
 // windowed rows still to emit) as a "sorted" Emitter — emission pulls + projects + charges rowProduced
 // per row, so the output array is never built (spec/design/streaming.md §4/§7).
-export function sortedEmitter(sorted: Pick<SortedRows, "next" | "close">, remaining: number): Emitter {
+export function sortedEmitter(
+  sorted: Pick<SortedRows, "next" | "close">,
+  remaining: number,
+): Emitter {
   return { rows: [], start: 0, end: remaining, mode: "sorted", sorted };
 }
 
@@ -1121,11 +1137,19 @@ function finishSelectSlots(plan: SelectPlan, sel: Select, scope: Scope): void {
 // cteBufferRows reads a MATERIALIZED CTE's buffer for one reference: cte_scan_row per row, guarded so
 // a runaway scan aborts 54P01, and the reference copies the buffer into its own relation rows.
 function cteBufferRows(buf: Row[], mask: boolean[], meter: Meter): Row[] {
+  return runSync(cteBufferRowsSteps(buf, mask, meter));
+}
+
+function* cteBufferRowsSteps(buf: Row[], mask: boolean[], meter: Meter): Steps<Row[]> {
   for (let i = 0; i < buf.length; i++) {
+    if (shouldCooperate()) yield COOPERATE;
     meter.guard();
     meter.charge(COSTS.cteScanRow);
   }
-  for (const row of buf) meter.admitRowMasked(row, mask);
+  for (const row of buf) {
+    if (shouldCooperate()) yield COOPERATE;
+    meter.admitRowMasked(row, mask);
+  }
   return buf.slice();
 }
 
@@ -1226,7 +1250,9 @@ export const MAX_RESULT_CHARS = 0x3fffffffn;
 // truncated to its first `length` characters; an empty fill cannot pad (returns the truncated
 // string); a length ≤ 0 is empty. A length above MAX_RESULT_CHARS traps 54000. Matches PG lpad/rpad.
 function textPrefix(s: string, count: number): { end: number; chars: number; bytes: number } {
-  let end = 0, chars = 0, bytes = 0;
+  let end = 0,
+    chars = 0,
+    bytes = 0;
   for (const c of s) {
     if (chars === count) break;
     end += c.length;
@@ -1237,16 +1263,24 @@ function textPrefix(s: string, count: number): { end: number; chars: number; byt
   return { end, chars, bytes };
 }
 
-export function padChars(s: string, length: bigint, fill: string, left: boolean, meter: Meter): string {
+export function padChars(
+  s: string,
+  length: bigint,
+  fill: string,
+  left: boolean,
+  meter: Meter,
+): string {
   if (length > MAX_RESULT_CHARS)
     throw engineError("program_limit_exceeded", "requested length too large");
   if (length <= 0n) return "";
-  const sb = textPrefix(s, Infinity), fb = textPrefix(fill, Infinity);
+  const sb = textPrefix(s, Infinity),
+    fb = textPrefix(fill, Infinity);
   meter.charge(COSTS.scalarByte * BigInt(sb.bytes + fb.bytes));
   meter.guard();
   const prefix = textPrefix(s, Number(length));
   const need = Number(length) - prefix.chars;
-  let cycles = 0, tail = { end: 0, chars: 0, bytes: 0 };
+  let cycles = 0,
+    tail = { end: 0, chars: 0, bytes: 0 };
   if (need > 0 && fb.chars > 0) {
     cycles = Math.floor(need / fb.chars);
     tail = textPrefix(fill, need % fb.chars);
@@ -1788,7 +1822,12 @@ export function overlayChars(s: string, r: string, start: bigint, count: bigint)
 }
 
 // overlayBytes is overlay over BYTES (string-functions.md §4): overlayChars's splice over a bytea.
-export function overlayBytes(b: Uint8Array, r: Uint8Array, start: bigint, count: bigint): Uint8Array {
+export function overlayBytes(
+  b: Uint8Array,
+  r: Uint8Array,
+  start: bigint,
+  count: bigint,
+): Uint8Array {
   const tail = overlayTailStart(start, count);
   const head = substrBytes(b, 1n, start - 1n);
   const rest = substrBytes(b, tail, null);
@@ -1801,7 +1840,12 @@ export function overlayBytes(b: Uint8Array, r: Uint8Array, start: bigint, count:
 
 // trimBytes is btrim/ltrim/rtrim(bytea, bytes) (string-functions.md §4): remove from the chosen
 // end(s) the longest run of bytes each present in the set bytes. An empty set trims nothing.
-export function trimBytes(b: Uint8Array, set: Uint8Array, doLeft: boolean, doRight: boolean): Uint8Array {
+export function trimBytes(
+  b: Uint8Array,
+  set: Uint8Array,
+  doLeft: boolean,
+  doRight: boolean,
+): Uint8Array {
   let start = 0;
   let end = b.length;
   if (doLeft) while (start < end && set.includes(b[start]!)) start++;
@@ -1891,10 +1935,7 @@ type EstimateCteContext = { bindings: CteBinding[]; modes: CteMode[]; bodies: Es
 
 // Internal selection predicate exported only from this implementation module so the per-core
 // invariant test can pin the fast-path boundary without adding anything to the public lib.ts API.
-export function singleValuesInsertEligible(
-  candidateCount: number,
-  hasConflict: boolean,
-): boolean {
+export function singleValuesInsertEligible(candidateCount: number, hasConflict: boolean): boolean {
   return candidateCount === 1 && !hasConflict;
 }
 
@@ -1923,7 +1964,6 @@ function locateLit(iv: InsertValue, e: unknown): unknown {
 
 const ZERO_STORAGE_KEY = new Uint8Array(8);
 const EMPTY_STORAGE_KEY = new Uint8Array(0);
-
 
 // FkDeferredCheck is one foreign-key check saved for later. A "parent" entry is an inbound NO
 // ACTION/RESTRICT probe saved until every generated write in the recursive closure has finished
@@ -2363,8 +2403,12 @@ export class Engine {
   // spill). It never changes what a query observes (results + cost are invariant — spill.md §6),
   // only when an operator spills; an in-memory database ignores it. A handle setting, not stored in
   // the file (mirrors setMaxCost).
-  setMaxScalarBytes(bytes: bigint): void { this.session.maxScalarBytes = bytes; }
-  get maxScalarBytes(): bigint { return this.session.scalarLimit(); }
+  setMaxScalarBytes(bytes: bigint): void {
+    this.session.maxScalarBytes = bytes;
+  }
+  get maxScalarBytes(): bigint {
+    return this.session.scalarLimit();
+  }
   // setMaxQueryMemoryBytes sets the live query-memory budget per statement (spec/design/memory.md §2);
   // non-positive restores the default, unlimited. Over-budget fails 54P05.
   setMaxQueryMemoryBytes(bytes: bigint): void {
@@ -2478,7 +2522,11 @@ export class Engine {
   // passes. The qualifier is matched byte-exactly (a bare spelling is already folded — grammar.md §3).
   // checkTargetQualifier is checkTableQualifier for a DML target: its 42P01 points at the target's
   // name (spec/design/error-fields.md §10.2).
-  private checkTargetQualifier(qualifier: string | undefined, name: string, loc: number | undefined): void {
+  private checkTargetQualifier(
+    qualifier: string | undefined,
+    name: string,
+    loc: number | undefined,
+  ): void {
     try {
       this.checkTableQualifier(qualifier, name);
     } catch (err) {
@@ -3130,6 +3178,10 @@ export class Engine {
   // ScriptSummary. Separated so executeScript's wrapper commit/rollback runs once on either path —
   // and so Session.executeScript (shared.ts) can reuse it under a shared-core-aware wrapper (§2.4).
   runScriptBody(sql: string): ScriptSummary {
+    return runSync(this.runScriptBodySteps(sql));
+  }
+
+  *runScriptBodySteps(sql: string): Steps<ScriptSummary> {
     let statementsRun = 0;
     let rowsAffectedTotal = 0;
     let cost = 0n;
@@ -3139,6 +3191,7 @@ export class Engine {
     let counted = 0;
     let before = 0;
     for (const span of splitStatements(sql)) {
+      if (shouldCooperate()) yield COOPERATE;
       before += charCount(sql, counted, span.offset);
       counted = span.offset;
       let out: Outcome;
@@ -3146,14 +3199,19 @@ export class Engine {
         const ast = this.parse(span.text);
         // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
         // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
-        if (ast.kind === "begin" || ast.kind === "commit" || ast.kind === "rollback" || ast.kind === "savepoint") {
+        if (
+          ast.kind === "begin" ||
+          ast.kind === "commit" ||
+          ast.kind === "rollback" ||
+          ast.kind === "savepoint"
+        ) {
           throw engineError(
             "feature_not_supported",
             "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; " +
               "use splitStatements to run a self-managed multi-statement transaction",
           );
         }
-        out = this.executeStmtParams(ast, []);
+        out = yield* this.executeStmtParamsSteps(ast, []);
       } catch (e) {
         if (e instanceof EngineError) e.shiftPosition(before);
         throw e;
@@ -3526,6 +3584,14 @@ export class Engine {
     params: Value[],
     insertHolder: InsertCacheHolder | null = null,
   ): Outcome {
+    return runSync(this.executeStmtParamsSteps(stmt, params, insertHolder));
+  }
+
+  *executeStmtParamsSteps(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null = null,
+  ): Steps<Outcome> {
     this.session.resetStatementMemory();
     switch (stmt.kind) {
       case "begin":
@@ -3572,7 +3638,7 @@ export class Engine {
         }
         // The INSERT cache's visible-vs-committed signature guard permits row-only blocks to fill
         // while preventing working DDL from publishing a plan.
-        const outcome = this.dispatchStmt(stmt, params, insertHolder, true);
+        const outcome = yield* this.dispatchStmtSteps(stmt, params, insertHolder, true);
         // Enforce the post-statement budgets (temp storage, pending writes): an over-budget statement
         // throws, which aborts the block (its staged rows roll back at ROLLBACK).
         this.checkStatementBudgets(outcome.cost);
@@ -3591,7 +3657,7 @@ export class Engine {
     // error. Because the write mutates only working, an error leaves committed untouched (no restore
     // needed); rolled-back rowid allocations vanish with working (§7).
     if (!this.stmtIsWriteWithViews(stmt)) {
-      return this.dispatchStmt(stmt, params, null, false);
+      return yield* this.dispatchStmtSteps(stmt, params, null, false);
     }
     // On a read-only handle the implicit transaction is READ ONLY (PostgreSQL hot-standby
     // behavior — api.md §2.1), so an autocommit write fails exactly like a write inside a
@@ -3605,7 +3671,7 @@ export class Engine {
     this.session.tx = this.newTx(true);
     let outcome: Outcome;
     try {
-      outcome = this.dispatchStmt(stmt, params, insertHolder, true);
+      outcome = yield* this.dispatchStmtSteps(stmt, params, insertHolder, true);
       // Enforce the post-statement budgets before committing: an over-budget implicit transaction is
       // discarded (rolling back its temp + main changes) and commits nothing.
       this.checkStatementBudgets(outcome.cost);
@@ -3816,7 +3882,8 @@ export class Engine {
       const canCompact = core.canCompactCommitted();
       // In-memory attachments stage first, in name order; the (at most one) file attachment commits
       // last, so only main's persist follows its durable point.
-      const isFile = (name: string): boolean => (core.attachments.get(name)?.storage.path ?? null) !== null;
+      const isFile = (name: string): boolean =>
+        (core.attachments.get(name)?.storage.path ?? null) !== null;
       const names = [...tx.attachDirty].sort((a, b) =>
         isFile(a) !== isFile(b) ? (isFile(a) ? 1 : -1) : compareTextC(a, b),
       );
@@ -3915,8 +3982,16 @@ export class Engine {
   savepointStmt(op: SavepointOp, name: string): Outcome {
     const tx = this.session.tx;
     if (tx === null) {
-      const what = op === "define" ? "SAVEPOINT" : op === "release" ? "RELEASE SAVEPOINT" : "ROLLBACK TO SAVEPOINT";
-      throw engineError("no_active_sql_transaction", what + " can only be used in transaction blocks");
+      const what =
+        op === "define"
+          ? "SAVEPOINT"
+          : op === "release"
+            ? "RELEASE SAVEPOINT"
+            : "ROLLBACK TO SAVEPOINT";
+      throw engineError(
+        "no_active_sql_transaction",
+        what + " can only be used in transaction blocks",
+      );
     }
     if (tx.failed && op !== "rollbackTo") {
       throw engineError(
@@ -3938,11 +4013,14 @@ export class Engine {
       tx.failed = true;
       throw engineError("invalid_savepoint_specification", "savepoint does not exist: " + name);
     }
-    const cloneAttached = (m: Map<string, Snapshot> | undefined): Map<string, Snapshot> | undefined =>
+    const cloneAttached = (
+      m: Map<string, Snapshot> | undefined,
+    ): Map<string, Snapshot> | undefined =>
       m === undefined ? undefined : new Map([...m].map(([k, v]) => [k, v.clone()]));
     const forgetStagedKeys = (): void => {
       tx.working.forgetStagedKeys();
-      if (tx.attachWorking !== undefined) for (const snap of tx.attachWorking.values()) snap.forgetStagedKeys();
+      if (tx.attachWorking !== undefined)
+        for (const snap of tx.attachWorking.values()) snap.forgetStagedKeys();
     };
     if (op === "define") {
       frames.push({
@@ -4316,6 +4394,15 @@ export class Engine {
     insertHolder: InsertCacheHolder | null = null,
     allowInsertFill = false,
   ): Outcome {
+    return runSync(this.dispatchStmtSteps(stmt, params, insertHolder, allowInsertFill));
+  }
+
+  private *dispatchStmtSteps(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null = null,
+    allowInsertFill = false,
+  ): Steps<Outcome> {
     // Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost has
     // reached lifetime_max_cost, every further statement is rejected 54P02 BEFORE it can accrue —
     // checked ahead of privileges/existence, so an exhausted session runs nothing. A no-op when the
@@ -4328,14 +4415,14 @@ export class Engine {
     // physical access-mode gate (25006) is checked earlier in executeStmtParams, so it wins when both
     // apply.
     this.checkPrivileges(stmt);
-    const out = this.dispatchStmtBody(stmt, params, insertHolder, allowInsertFill);
+    const out = yield* this.dispatchStmtBodySteps(stmt, params, insertHolder, allowInsertFill);
     // Keep each GiST index's resident R-tree current: after a statement that mutated the main image,
     // rebuild it from the (now-updated) leaf store so the next read descends a fresh tree (gist.md
     // §3/§4.1). A no-op for reads / temp-only writes (mainDirty unset), preserving the
     // temp-no-file-write invariant. GiST on a temp table is 0A000, so only the main snapshot is
     // refreshed.
     const tx = this.session.tx;
-    if (tx?.mainDirty) tx.working.rebuildGistTrees();
+    if (tx?.mainDirty) yield* tx.working.rebuildGistTreesSteps();
     return out;
   }
 
@@ -4345,6 +4432,15 @@ export class Engine {
     insertHolder: InsertCacheHolder | null = null,
     allowInsertFill = false,
   ): Outcome {
+    return runSync(this.dispatchStmtBodySteps(stmt, params, insertHolder, allowInsertFill));
+  }
+
+  private *dispatchStmtBodySteps(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null = null,
+    allowInsertFill = false,
+  ): Steps<Outcome> {
     // The database a table-naming error concerns (spec/design/error-fields.md §12): the statement's
     // target qualifier, else the implicit scope. UPDATE and DELETE stamp their own (they also run as
     // writable-CTE children).
@@ -4354,7 +4450,7 @@ export class Engine {
       targetDb = stmt.db;
     }
     try {
-      return this.dispatchStmtTarget(stmt, params, insertHolder, allowInsertFill);
+      return yield* this.dispatchStmtTargetSteps(stmt, params, insertHolder, allowInsertFill);
     } catch (e) {
       throw this.stampDatabase(targetDb, e);
     }
@@ -4366,6 +4462,15 @@ export class Engine {
     insertHolder: InsertCacheHolder | null,
     allowInsertFill: boolean,
   ): Outcome {
+    return runSync(this.dispatchStmtTargetSteps(stmt, params, insertHolder, allowInsertFill));
+  }
+
+  private *dispatchStmtTargetSteps(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null,
+    allowInsertFill: boolean,
+  ): Steps<Outcome> {
     switch (stmt.kind) {
       case "analyze":
         rejectParamsForDDL(params);
@@ -4416,7 +4521,7 @@ export class Engine {
         rejectParamsForDDL(params);
         return this.executeAlterView(stmt);
       case "insert":
-        return this.executeInsertCached(
+        return yield* this.executeInsertCachedSteps(
           stmt,
           params,
           EMPTY_CTE_CTX,
@@ -4424,17 +4529,17 @@ export class Engine {
           allowInsertFill,
         );
       case "select":
-        return this.executeSelect(stmt, params);
+        return yield* this.executeSelectSteps(stmt, params);
       case "setOp":
-        return this.executeSetOp(stmt, params);
+        return yield* this.executeSetOpSteps(stmt, params);
       case "with":
-        return this.executeWith(stmt, params);
+        return yield* this.executeWithSteps(stmt, params);
       case "update":
-        return this.executeUpdate(stmt, params, EMPTY_CTE_CTX);
+        return yield* this.executeUpdateSteps(stmt, params, EMPTY_CTE_CTX);
       case "delete":
-        return this.executeDelete(stmt, params, EMPTY_CTE_CTX);
+        return yield* this.executeDeleteSteps(stmt, params, EMPTY_CTE_CTX);
       case "explain":
-        return this.executeExplain(stmt, params);
+        return yield* this.executeExplainSteps(stmt, params);
       default:
         // Transaction control (begin/commit/rollback) is handled by executeStmtParams before
         // dispatch; it never reaches here.
@@ -4469,8 +4574,7 @@ export class Engine {
           throw engineError("duplicate_column", `column ${name} appears more than once`);
         seen.add(key);
         const column = table.columns.findIndex((candidate) => candidate.name === key);
-        if (column < 0)
-          throw engineError("undefined_column", `column does not exist: ${name}`);
+        if (column < 0) throw engineError("undefined_column", `column does not exist: ${name}`);
         columns.push(column);
       }
     }
@@ -4482,19 +4586,14 @@ export class Engine {
       statistics: collectColumnStatistics(table, store, collations, column, meter),
     }));
     const database =
-      analyze.db === undefined
-        ? this.isTempTable(analyze.name)
-          ? "temp"
-          : "main"
-        : analyze.db;
+      analyze.db === undefined ? (this.isTempTable(analyze.name) ? "temp" : "main") : analyze.db;
     let target: Snapshot;
     if (database === "temp") {
       this.session.tx!.tempDirty = true;
       target = this.session.tx!.tempWorking;
     } else if (database === "main") target = this.working();
     else target = this.attachWriteSnap(database)!;
-    for (const fact of facts)
-      target.putColumnStatistics(table.name, fact.column, fact.statistics);
+    for (const fact of facts) target.putColumnStatistics(table.name, fact.column, fact.statistics);
     if (database !== "temp") target.bumpEstimatorRevision(table.name);
     return { kind: "statement", cost: meter.accrued, rowsAffected: 0 };
   }
@@ -4502,7 +4601,10 @@ export class Engine {
   // --- P5 whole-plan estimates ---------------------------------------------------------------
 
   private estimateSumExprNodes(exprs: RExpr[]): bigint {
-    return exprs.reduce((total, expr) => saturatingEstimateAdd(total, estimatorOperatorNodes(expr)), 0n);
+    return exprs.reduce(
+      (total, expr) => saturatingEstimateAdd(total, estimatorOperatorNodes(expr)),
+      0n,
+    );
   }
 
   private addExpressionSubqueries(
@@ -4528,34 +4630,108 @@ export class Engine {
         }
         return;
       }
-      case "inValues": add(expr.lhs); return;
-      case "quantified": add(expr.lhs); add(expr.array); return;
-      case "widthBucketArray": add(expr.operand); add(expr.thresholds); return;
-      case "cast": case "arrayCast": case "compositeCast": case "neg": case "not": case "isNull":
-      case "isJson": case "jsonCtor": add(expr.operand); return;
-      case "arith": case "compare": case "and": case "or": case "distinct":
-      case "like": case "regex": add(expr.lhs); add(expr.rhs); return;
-      case "jsonGet": case "jsonHasKey": case "jsonDelete": add(expr.base); add(expr.arg); return;
-      case "jsonContains": case "jsonConcat": add(expr.a); add(expr.b); return;
-      case "casing": add(expr.arg); return;
-      case "atTimeZone": add(expr.zone); add(expr.value); return;
-      case "dateTrunc": add(expr.unit); add(expr.value); add(expr.zone); return;
-      case "extract": add(expr.value); return;
-      case "dateConvert": add(expr.inner); return;
+      case "inValues":
+        add(expr.lhs);
+        return;
+      case "quantified":
+        add(expr.lhs);
+        add(expr.array);
+        return;
+      case "widthBucketArray":
+        add(expr.operand);
+        add(expr.thresholds);
+        return;
+      case "cast":
+      case "arrayCast":
+      case "compositeCast":
+      case "neg":
+      case "not":
+      case "isNull":
+      case "isJson":
+      case "jsonCtor":
+        add(expr.operand);
+        return;
+      case "arith":
+      case "compare":
+      case "and":
+      case "or":
+      case "distinct":
+      case "like":
+      case "regex":
+        add(expr.lhs);
+        add(expr.rhs);
+        return;
+      case "jsonGet":
+      case "jsonHasKey":
+      case "jsonDelete":
+        add(expr.base);
+        add(expr.arg);
+        return;
+      case "jsonContains":
+      case "jsonConcat":
+        add(expr.a);
+        add(expr.b);
+        return;
+      case "casing":
+        add(expr.arg);
+        return;
+      case "atTimeZone":
+        add(expr.zone);
+        add(expr.value);
+        return;
+      case "dateTrunc":
+        add(expr.unit);
+        add(expr.value);
+        add(expr.zone);
+        return;
+      case "extract":
+        add(expr.value);
+        return;
+      case "dateConvert":
+        add(expr.inner);
+        return;
       case "case":
         add(expr.els);
-        for (const arm of expr.arms) { add(arm.cond); add(arm.result); }
+        for (const arm of expr.arms) {
+          add(arm.cond);
+          add(arm.result);
+        }
         return;
-      case "greatestLeast": case "nullIf": case "coalesce": case "scalarFunc": case "hostFunc": case "arrayFunc":
-      case "regexFunc": case "rangeFunc": case "rangeCtor": case "rangeOp":
-      case "rangeSetOp": case "variadic": case "jsonBuild": case "jsonSetInsert":
-      case "jsonObjectFromArrays": case "jsonImage": case "jsonPathFn": case "jsonSqlFn":
-        addMany(expr.args); return;
-      case "row": addMany(expr.fields); return;
-      case "array": addMany(expr.elements); return;
-      case "field": add(expr.base); return;
-      case "subscript": add(expr.base); addMany(rSubscriptBounds(expr.subscripts)); return;
-      default: return;
+      case "greatestLeast":
+      case "nullIf":
+      case "coalesce":
+      case "scalarFunc":
+      case "hostFunc":
+      case "arrayFunc":
+      case "regexFunc":
+      case "rangeFunc":
+      case "rangeCtor":
+      case "rangeOp":
+      case "rangeSetOp":
+      case "variadic":
+      case "jsonBuild":
+      case "jsonSetInsert":
+      case "jsonObjectFromArrays":
+      case "jsonImage":
+      case "jsonPathFn":
+      case "jsonSqlFn":
+        addMany(expr.args);
+        return;
+      case "row":
+        addMany(expr.fields);
+        return;
+      case "array":
+        addMany(expr.elements);
+        return;
+      case "field":
+        add(expr.base);
+        return;
+      case "subscript":
+        add(expr.base);
+        addMany(rSubscriptBounds(expr.subscripts));
+        return;
+      default:
+        return;
     }
   }
 
@@ -4611,11 +4787,16 @@ export class Engine {
     const indexFetch = bound !== null && ["index", "gin", "gist", "indexSet"].includes(bound.kind);
     if (indexFetch) {
       let reduction = saturatingEstimateMultiply(delta, height);
-      if (reduction > plan.root.units[UNIT_PAGE_READ]!) reduction = plan.root.units[UNIT_PAGE_READ]!;
+      if (reduction > plan.root.units[UNIT_PAGE_READ]!)
+        reduction = plan.root.units[UNIT_PAGE_READ]!;
       plan.root.units[UNIT_PAGE_READ] = plan.root.units[UNIT_PAGE_READ]! - reduction;
     } else if (sp.phys.indexOrder !== null && bound === null) {
       const index = this.estimatorIndexStore(rel.db, sp.phys.indexOrder.nameKey);
-      const indexPages = estimatorClampPages(cap, BigInt(index.nodeCount()), BigInt(index.height()));
+      const indexPages = estimatorClampPages(
+        cap,
+        BigInt(index.nodeCount()),
+        BigInt(index.height()),
+      );
       plan.root.units[UNIT_PAGE_READ] = saturatingEstimateAdd(
         indexPages,
         saturatingEstimateMultiply(cap, height),
@@ -4632,24 +4813,52 @@ export class Engine {
     let indexName = "";
     if (bound !== null) {
       switch (bound.kind) {
-        case "pk": kind = "pk"; break;
-        case "index": kind = "btree"; indexName = bound.index.nameKey; break;
-        case "gist": kind = "gist"; indexName = bound.gist.nameKey; break;
-        case "gin": kind = "gin"; indexName = bound.gin.nameKey; break;
-        case "pkSet": kind = "pk_interval"; break;
-        case "indexSet": kind = "index_interval"; indexName = bound.indexSet.nameKey; break;
+        case "pk":
+          kind = "pk";
+          break;
+        case "index":
+          kind = "btree";
+          indexName = bound.index.nameKey;
+          break;
+        case "gist":
+          kind = "gist";
+          indexName = bound.gist.nameKey;
+          break;
+        case "gin":
+          kind = "gin";
+          indexName = bound.gin.nameKey;
+          break;
+        case "pkSet":
+          kind = "pk_interval";
+          break;
+        case "indexSet":
+          kind = "index_interval";
+          indexName = bound.indexSet.nameKey;
+          break;
       }
     }
     return {
-      identity: { kind, indexName }, bound, residual,
-      scanOrder: kind === "btree" || kind === "index_interval"
-        ? { kind: "indexKey", indexName, reversible: false }
-        : { kind: "storageKey", reversible: true },
+      identity: { kind, indexName },
+      bound,
+      residual,
+      scanOrder:
+        kind === "btree" || kind === "index_interval"
+          ? { kind: "indexKey", indexName, reversible: false }
+          : { kind: "storageKey", reversible: true },
     };
   }
 
-  private estimateSelectedScan(rel: ScopeRel, bound: ScanBound | null, residual: RExpr | null): PlanEstimate {
-    const estimate = estimateScanCandidates([this.estimateScanCandidate(bound, residual)], rel, this, false)[0];
+  private estimateSelectedScan(
+    rel: ScopeRel,
+    bound: ScanBound | null,
+    residual: RExpr | null,
+  ): PlanEstimate {
+    const estimate = estimateScanCandidates(
+      [this.estimateScanCandidate(bound, residual)],
+      rel,
+      this,
+      false,
+    )[0];
     if (estimate === undefined) return emptyPlanEstimate();
     const units = [...estimate.units];
     units[UNIT_OPERATOR_EVAL] = 0n;
@@ -4661,7 +4870,12 @@ export class Engine {
   private estimatePlanRelScope(rel: PlanRel): ScopeRel | null {
     const table = this.lkpTableScoped(rel.db, rel.tableName);
     if (table === undefined) return null;
-    return { label: rel.tableName, table, offset: rel.offset, ...(rel.db === undefined ? {} : { db: rel.db }) };
+    return {
+      label: rel.tableName,
+      table,
+      offset: rel.offset,
+      ...(rel.db === undefined ? {} : { db: rel.db }),
+    };
   }
 
   private estimateColumnStatistics(
@@ -4760,14 +4974,9 @@ export class Engine {
         left.statistics.ndv !== null &&
         right.statistics.ndv !== null
       ) {
-        const population = saturatingEstimateMultiply(
-          left.statistics.rows,
-          right.statistics.rows,
-        );
+        const population = saturatingEstimateMultiply(left.statistics.rows, right.statistics.rows);
         const denominator =
-          left.statistics.ndv > right.statistics.ndv
-            ? left.statistics.ndv
-            : right.statistics.ndv;
+          left.statistics.ndv > right.statistics.ndv ? left.statistics.ndv : right.statistics.ndv;
         let rows = ceilEstimateMultiplyDivide(
           left.statistics.nonnullRows,
           right.statistics.nonnullRows,
@@ -4780,8 +4989,7 @@ export class Engine {
     const owner = this.estimateExpressionOwner(sp, expr);
     if (owner.kind === "one") {
       const scope = this.estimatePlanRelScope(sp.rels[owner.ordinal]!);
-      if (scope !== null)
-        return estimatorPredicateSelectivityWithStatistics(expr, scope, this);
+      if (scope !== null) return estimatorPredicateSelectivityWithStatistics(expr, scope, this);
     }
     switch (expr.kind) {
       case "and":
@@ -4811,10 +5019,7 @@ export class Engine {
     for (const global of globals) {
       const current = this.estimateColumnStatistics(sp, global)?.statistics;
       if (current === undefined || current.ndv === null) return null;
-      groups = saturatingEstimateMultiply(
-        groups,
-        current.ndv + (current.nullRows > 0n ? 1n : 0n),
-      );
+      groups = saturatingEstimateMultiply(groups, current.ndv + (current.nullRows > 0n ? 1n : 0n));
     }
     return groups > inputRows ? inputRows : groups;
   }
@@ -4822,8 +5027,10 @@ export class Engine {
   private estimateHashWidth(sp: SelectPlan, global: number, type: Type): bigint {
     const scalar = typeAsScalar(type);
     if (scalar !== undefined && isFixedWidth(scalar)) return BigInt(widthBytes(scalar));
-    return this.estimateColumnStatistics(sp, global)?.statistics.averageWidth ??
-      DEFAULT_VARIABLE_KEY_BYTES;
+    return (
+      this.estimateColumnStatistics(sp, global)?.statistics.averageWidth ??
+      DEFAULT_VARIABLE_KEY_BYTES
+    );
   }
 
   private estimateSrfRows(srf: SrfPlan): bigint {
@@ -4860,22 +5067,39 @@ export class Engine {
     if (srf.kind === "jed_types") return saturatingEstimateAdd(0n, BigInt(snap.types.size));
     if (srf.kind === "jed_type_fields") {
       let fields = 0n;
-      for (const ty of snap.types.values()) fields = saturatingEstimateAdd(fields, BigInt(ty.fields.length));
+      for (const ty of snap.types.values())
+        fields = saturatingEstimateAdd(fields, BigInt(ty.fields.length));
       return fields;
     }
     let rows = 0n;
     // jed_columns lists the main database's view columns after its tables' (introspection.md §5).
-    if (srf.kind === "jed_columns" && (srf.introspectScope === "main" || srf.introspectScope === "temp")) {
-      for (const view of snap.viewsSorted()) rows = saturatingEstimateAdd(rows, BigInt(view.columns.length));
+    if (
+      srf.kind === "jed_columns" &&
+      (srf.introspectScope === "main" || srf.introspectScope === "temp")
+    ) {
+      for (const view of snap.viewsSorted())
+        rows = saturatingEstimateAdd(rows, BigInt(view.columns.length));
     }
     for (const table of snap.tablesSorted()) {
       switch (srf.kind) {
-        case "jed_tables": rows = saturatingEstimateAdd(rows, 1n); break;
-        case "jed_columns": rows = saturatingEstimateAdd(rows, BigInt(table.columns.length)); break;
-        case "jed_indexes": rows = saturatingEstimateAdd(rows, BigInt(table.indexes.length)); break;
+        case "jed_tables":
+          rows = saturatingEstimateAdd(rows, 1n);
+          break;
+        case "jed_columns":
+          rows = saturatingEstimateAdd(rows, BigInt(table.columns.length));
+          break;
+        case "jed_indexes":
+          rows = saturatingEstimateAdd(rows, BigInt(table.indexes.length));
+          break;
         case "jed_constraints": {
-          rows = saturatingEstimateAdd(rows, BigInt(table.checks.length + table.fks.length + table.exclusions.length));
-          rows = saturatingEstimateAdd(rows, BigInt(table.indexes.filter((index) => index.unique).length));
+          rows = saturatingEstimateAdd(
+            rows,
+            BigInt(table.checks.length + table.fks.length + table.exclusions.length),
+          );
+          rows = saturatingEstimateAdd(
+            rows,
+            BigInt(table.indexes.filter((index) => index.unique).length),
+          );
           break;
         }
       }
@@ -4885,7 +5109,11 @@ export class Engine {
 
   // estimateRelation estimates one FROM relation as the executor reads it. A WHERE contradiction
   // reads no relation (planner.md §3.1), so its whole rendered subtree estimates zero.
-  private estimateRelation(sp: SelectPlan, index: number, ctx: EstimateCteContext | null): EstimatedPlan {
+  private estimateRelation(
+    sp: SelectPlan,
+    index: number,
+    ctx: EstimateCteContext | null,
+  ): EstimatedPlan {
     const plan = this.estimateRelationRead(sp, index, ctx);
     if (whereContradiction(sp)) {
       const root = emptyPlanEstimate();
@@ -4894,7 +5122,11 @@ export class Engine {
     return plan;
   }
 
-  private estimateRelationRead(sp: SelectPlan, index: number, ctx: EstimateCteContext | null): EstimatedPlan {
+  private estimateRelationRead(
+    sp: SelectPlan,
+    index: number,
+    ctx: EstimateCteContext | null,
+  ): EstimatedPlan {
     const rel = sp.rels[index]!;
     if (rel.srf === undefined && rel.cte === undefined && rel.derived === undefined) {
       return this.estimateRelationProduced(sp, index, ctx);
@@ -4912,14 +5144,22 @@ export class Engine {
         root.logicalRows,
       );
       root.rows = root.logicalRows < produced ? root.logicalRows : produced;
-      addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(pushed), produced));
+      addPlanUnit(
+        root,
+        UNIT_OPERATOR_EVAL,
+        saturatingEstimateMultiply(estimatorOperatorNodes(pushed), produced),
+      );
       plan.root = root;
       plan.nodes[0] = root;
     }
     return plan;
   }
 
-  private estimateRelationProduced(sp: SelectPlan, index: number, ctx: EstimateCteContext | null): EstimatedPlan {
+  private estimateRelationProduced(
+    sp: SelectPlan,
+    index: number,
+    ctx: EstimateCteContext | null,
+  ): EstimatedPlan {
     const rel = sp.rels[index]!;
     if (rel.derived !== undefined) {
       const body = this.estimateQueryPlan(rel.derived, ctx);
@@ -4935,7 +5175,9 @@ export class Engine {
       return leafEstimatedPlan(clonePlanEstimate(body.root));
     }
     if (rel.srf !== undefined) {
-      const rows = rel.srf.kind.startsWith("jed_") ? this.estimateCatalogRows(rel.srf) : this.estimateSrfRows(rel.srf);
+      const rows = rel.srf.kind.startsWith("jed_")
+        ? this.estimateCatalogRows(rel.srf)
+        : this.estimateSrfRows(rel.srf);
       const estimate = emptyPlanEstimate(rows);
       addPlanUnit(estimate, UNIT_GENERATED_ROW, rows);
       addPlanUnit(estimate, UNIT_OPERATOR_EVAL, this.estimateSumExprNodes(rel.srf.args));
@@ -4971,12 +5213,20 @@ export class Engine {
       } else {
         estimate.rows = estimate.logicalRows < scanRows ? estimate.logicalRows : scanRows;
       }
-      addPlanUnit(estimate, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(pushed), scanRows));
+      addPlanUnit(
+        estimate,
+        UNIT_OPERATOR_EVAL,
+        saturatingEstimateMultiply(estimatorOperatorNodes(pushed), scanRows),
+      );
     }
     return leafEstimatedPlan(estimate);
   }
 
-  private estimateJoinTree(sp: SelectPlan, n: number, ctx: EstimateCteContext | null): EstimatedPlan {
+  private estimateJoinTree(
+    sp: SelectPlan,
+    n: number,
+    ctx: EstimateCteContext | null,
+  ): EstimatedPlan {
     if (
       sp.phys.relationOrder.length === sp.rels.length &&
       sp.phys.joinSteps.length + 1 === sp.rels.length
@@ -4992,10 +5242,15 @@ export class Engine {
     const rightPerCallLogical = right.root.logicalRows;
     const boundByOuter = sp.phys.relINLBounds[n - 1] !== null;
     if (boundByOuter || sp.rels[n - 1]!.lateral === true) {
-      right = { root: repeatPlanEstimate(right.root, left.root.rows), nodes: right.nodes.map((node) => repeatPlanEstimate(node, left.root.rows)) };
+      right = {
+        root: repeatPlanEstimate(right.root, left.root.rows),
+        nodes: right.nodes.map((node) => repeatPlanEstimate(node, left.root.rows)),
+      };
     }
-    const physicalPairs = boundByOuter || sp.rels[n - 1]!.lateral === true
-      ? right.root.rows : saturatingEstimateMultiply(left.root.rows, right.root.rows);
+    const physicalPairs =
+      boundByOuter || sp.rels[n - 1]!.lateral === true
+        ? right.root.rows
+        : saturatingEstimateMultiply(left.root.rows, right.root.rows);
     const logicalPairs = boundByOuter
       ? physicalPairs
       : saturatingEstimateMultiply(left.root.logicalRows, rightPerCallLogical);
@@ -5010,8 +5265,14 @@ export class Engine {
     }
     const preservedLeft = left.root.rows;
     const preservedRight = right.root.rows;
-    if (join.kind === "left") { rows = rows < preservedLeft ? preservedLeft : rows; logicalRows = logicalRows < preservedLeft ? preservedLeft : logicalRows; }
-    if (join.kind === "right") { rows = rows < preservedRight ? preservedRight : rows; logicalRows = logicalRows < preservedRight ? preservedRight : logicalRows; }
+    if (join.kind === "left") {
+      rows = rows < preservedLeft ? preservedLeft : rows;
+      logicalRows = logicalRows < preservedLeft ? preservedLeft : logicalRows;
+    }
+    if (join.kind === "right") {
+      rows = rows < preservedRight ? preservedRight : rows;
+      logicalRows = logicalRows < preservedRight ? preservedRight : logicalRows;
+    }
     if (join.kind === "full") {
       const preserved = preservedLeft > preservedRight ? preservedLeft : preservedRight;
       rows = rows < preserved ? preserved : rows;
@@ -5036,10 +5297,21 @@ export class Engine {
         );
       }
       addPlanUnit(root, UNIT_HASH_BUILD, saturatingEstimateMultiply(right.root.rows, buildBytes));
-      addPlanUnit(root, UNIT_HASH_PROBE, saturatingEstimateAdd(saturatingEstimateMultiply(left.root.rows, probeBytes), saturatingEstimateMultiply(rows, framedBytes)));
+      addPlanUnit(
+        root,
+        UNIT_HASH_PROBE,
+        saturatingEstimateAdd(
+          saturatingEstimateMultiply(left.root.rows, probeBytes),
+          saturatingEstimateMultiply(rows, framedBytes),
+        ),
+      );
       invocations = rows;
     }
-    addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(on), invocations));
+    addPlanUnit(
+      root,
+      UNIT_OPERATOR_EVAL,
+      saturatingEstimateMultiply(estimatorOperatorNodes(on), invocations),
+    );
     this.addExpressionSubqueries(root, on, invocations, ctx);
     return parentEstimatedPlan(root, left, right);
   }
@@ -5076,12 +5348,15 @@ export class Engine {
         fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows);
       }
     }
-    const stepKind = step.onIndices.reduce<JoinKind>((kind, onIndex) => {
-      const candidate = sp.joins[onIndex]!.kind;
-      return candidate === "left" || candidate === "right" || candidate === "full"
-        ? candidate
-        : kind;
-    }, step.onIndices.length === 0 ? "cross" : "inner");
+    const stepKind = step.onIndices.reduce<JoinKind>(
+      (kind, onIndex) => {
+        const candidate = sp.joins[onIndex]!.kind;
+        return candidate === "left" || candidate === "right" || candidate === "full"
+          ? candidate
+          : kind;
+      },
+      step.onIndices.length === 0 ? "cross" : "inner",
+    );
     if (stepKind === "left" || stepKind === "full") {
       if (fullRows < outer.root.rows) fullRows = outer.root.rows;
       if (fullLogicalRows < outer.root.logicalRows) fullLogicalRows = outer.root.logicalRows;
@@ -5100,7 +5375,10 @@ export class Engine {
       const postFilterRows =
         postFilter === null
           ? fullRows
-          : estimateSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, postFilter), fullRows);
+          : estimateSelectivity(
+              this.estimatePredicateSelectivityWithStatistics(sp, postFilter),
+              fullRows,
+            );
       if (target === 0n) {
         outerCalls = 0n;
         deliveredRows = 0n;
@@ -5159,10 +5437,7 @@ export class Engine {
     }
     let onNodes = 0n;
     for (const onIndex of step.onIndices) {
-      onNodes = saturatingEstimateAdd(
-        onNodes,
-        estimatorOperatorNodes(joinOn(sp, onIndex)),
-      );
+      onNodes = saturatingEstimateAdd(onNodes, estimatorOperatorNodes(joinOn(sp, onIndex)));
     }
     addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(onNodes, invocations));
     for (const onIndex of step.onIndices) {
@@ -5181,10 +5456,7 @@ export class Engine {
 
   // P7 estimate in selected physical order. A join top-N caps only outer-driven work that the
   // executor actually skips; ordinary base materialization and the hash build remain complete.
-  private estimateTwoRelationJoin(
-    sp: SelectPlan,
-    ctx: EstimateCteContext | null,
-  ): EstimatedPlan {
+  private estimateTwoRelationJoin(sp: SelectPlan, ctx: EstimateCteContext | null): EstimatedPlan {
     const outerOrdinal = physicalRelOrdinal(sp, 0);
     const innerOrdinal = physicalRelOrdinal(sp, 1);
     const outer = this.estimateRelation(sp, outerOrdinal, ctx);
@@ -5213,9 +5485,13 @@ export class Engine {
     if (sp.phys.joinPkOrdered && sp.limit !== null) {
       const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
       const postFilter = postJoinFilter(sp);
-      const postFilterRows = postFilter === null
-        ? fullRows
-        : estimateSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, postFilter), fullRows);
+      const postFilterRows =
+        postFilter === null
+          ? fullRows
+          : estimateSelectivity(
+              this.estimatePredicateSelectivityWithStatistics(sp, postFilter),
+              fullRows,
+            );
       if (target === 0n) {
         outerCalls = 0n;
         deliveredRows = 0n;
@@ -5283,14 +5559,24 @@ export class Engine {
   private estimateSelectPlan(sp: SelectPlan, ctx: EstimateCteContext | null): EstimatedPlan {
     // A FROM-less SELECT reads one virtual row, unless a WHERE contradiction removes it
     // (planner.md §3.1).
-    let plan = sp.rels.length === 0
-      ? leafEstimatedPlan(emptyPlanEstimate(whereContradiction(sp) ? 0n : 1n))
-      : this.estimateJoinTree(sp, sp.rels.length, ctx);
-    if (sp.limit !== null && !sp.distinct && (streamingScanEligible(sp) || sp.phys.indexOrder !== null || this.windowTopNEligible(sp))) {
+    let plan =
+      sp.rels.length === 0
+        ? leafEstimatedPlan(emptyPlanEstimate(whereContradiction(sp) ? 0n : 1n))
+        : this.estimateJoinTree(sp, sp.rels.length, ctx);
+    if (
+      sp.limit !== null &&
+      !sp.distinct &&
+      (streamingScanEligible(sp) || sp.phys.indexOrder !== null || this.windowTopNEligible(sp))
+    ) {
       const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
-      const cap = sp.filter === null
-        ? target
-        : this.requiredEstimateInput(this.estimatePredicateSelectivityWithStatistics(sp, sp.filter), target, plan.root.rows);
+      const cap =
+        sp.filter === null
+          ? target
+          : this.requiredEstimateInput(
+              this.estimatePredicateSelectivityWithStatistics(sp, sp.filter),
+              target,
+              plan.root.rows,
+            );
       this.capStreamingScanEstimate(plan, sp, cap);
     }
     const filter = postJoinFilter(sp);
@@ -5302,7 +5588,10 @@ export class Engine {
       );
       const rows = logicalRows > plan.root.rows ? plan.root.rows : logicalRows;
       const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
-      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(estimatorOperatorNodes(filter), inputRows);
+      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(
+        estimatorOperatorNodes(filter),
+        inputRows,
+      );
       plan = wrapEstimatedPlan(plan, rows, logicalRows, local);
       this.addExpressionSubqueries(plan.root, filter, inputRows, ctx);
       plan.nodes[0] = plan.root;
@@ -5317,22 +5606,43 @@ export class Engine {
             const maxGroups = this.estimatePow(DEFAULT_DISTINCT_VALUES, sp.groupKeys.length);
             return inputRows > maxGroups ? maxGroups : inputRows;
           })();
-        if (sp.groupSets.length > 1) rows = saturatingEstimateMultiply(rows, BigInt(sp.groupSets.length));
+        if (sp.groupSets.length > 1)
+          rows = saturatingEstimateMultiply(rows, BigInt(sp.groupSets.length));
       } else if (sp.groupSets.length > 1) rows = BigInt(sp.groupSets.length);
       const groupRows = rows;
       const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
-      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(this.estimateSumExprNodes(sp.groupExprs), inputRows);
+      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(
+        this.estimateSumExprNodes(sp.groupExprs),
+        inputRows,
+      );
       for (const agg of sp.aggSpecs) {
-        let nodes = saturatingEstimateAdd(estimatorOperatorNodes(agg.operand), estimatorOperatorNodes(agg.filter ?? null));
-        if (agg.hypo != null) nodes = saturatingEstimateAdd(nodes, this.estimateSumExprNodes(agg.hypo.keys));
-        if (agg.order != null) nodes = saturatingEstimateAdd(nodes, this.estimateSumExprNodes(agg.order.keys));
-        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(local[UNIT_OPERATOR_EVAL]!, saturatingEstimateMultiply(nodes, inputRows));
-        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(local[UNIT_OPERATOR_EVAL]!, saturatingEstimateMultiply(estimatorOperatorNodes(agg.osaFrac ?? null), rows));
+        let nodes = saturatingEstimateAdd(
+          estimatorOperatorNodes(agg.operand),
+          estimatorOperatorNodes(agg.filter ?? null),
+        );
+        if (agg.hypo != null)
+          nodes = saturatingEstimateAdd(nodes, this.estimateSumExprNodes(agg.hypo.keys));
+        if (agg.order != null)
+          nodes = saturatingEstimateAdd(nodes, this.estimateSumExprNodes(agg.order.keys));
+        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(
+          local[UNIT_OPERATOR_EVAL]!,
+          saturatingEstimateMultiply(nodes, inputRows),
+        );
+        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(
+          local[UNIT_OPERATOR_EVAL]!,
+          saturatingEstimateMultiply(estimatorOperatorNodes(agg.osaFrac ?? null), rows),
+        );
       }
-      local[UNIT_AGGREGATE_ACCUMULATE] = saturatingEstimateMultiply(inputRows, BigInt(sp.aggSpecs.length));
+      local[UNIT_AGGREGATE_ACCUMULATE] = saturatingEstimateMultiply(
+        inputRows,
+        BigInt(sp.aggSpecs.length),
+      );
       let logicalRows = rows;
       if (sp.having !== null) {
-        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(local[UNIT_OPERATOR_EVAL]!, saturatingEstimateMultiply(estimatorOperatorNodes(sp.having), rows));
+        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(
+          local[UNIT_OPERATOR_EVAL]!,
+          saturatingEstimateMultiply(estimatorOperatorNodes(sp.having), rows),
+        );
         rows = estimateSelectivity(estimatorPredicateSelectivity(sp.having), rows);
         logicalRows = rows;
       }
@@ -5341,8 +5651,10 @@ export class Engine {
       for (const agg of sp.aggSpecs) {
         this.addExpressionSubqueries(plan.root, agg.operand, inputRows, ctx);
         this.addExpressionSubqueries(plan.root, agg.filter ?? null, inputRows, ctx);
-        if (agg.hypo != null) this.addExpressionListSubqueries(plan.root, agg.hypo.keys, inputRows, ctx);
-        if (agg.order != null) this.addExpressionListSubqueries(plan.root, agg.order.keys, inputRows, ctx);
+        if (agg.hypo != null)
+          this.addExpressionListSubqueries(plan.root, agg.hypo.keys, inputRows, ctx);
+        if (agg.order != null)
+          this.addExpressionListSubqueries(plan.root, agg.order.keys, inputRows, ctx);
         this.addExpressionSubqueries(plan.root, agg.osaFrac ?? null, groupRows, ctx);
       }
       this.addExpressionSubqueries(plan.root, sp.having, groupRows, ctx);
@@ -5351,9 +5663,19 @@ export class Engine {
     if (sp.hasWindow) {
       const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
       let nodes = this.estimateSumExprNodes(sp.windowKeys);
-      for (const spec of sp.windowSpecs) nodes = saturatingEstimateAdd(nodes, saturatingEstimateAdd(this.estimateSumExprNodes(spec.args), estimatorOperatorNodes(spec.filter ?? null)));
+      for (const spec of sp.windowSpecs)
+        nodes = saturatingEstimateAdd(
+          nodes,
+          saturatingEstimateAdd(
+            this.estimateSumExprNodes(spec.args),
+            estimatorOperatorNodes(spec.filter ?? null),
+          ),
+        );
       local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(nodes, plan.root.rows);
-      local[UNIT_WINDOW_RESULT] = saturatingEstimateMultiply(plan.root.rows, BigInt(sp.windowSpecs.length));
+      local[UNIT_WINDOW_RESULT] = saturatingEstimateMultiply(
+        plan.root.rows,
+        BigInt(sp.windowSpecs.length),
+      );
       plan = wrapEstimatedPlan(plan, plan.root.rows, plan.root.logicalRows, local);
       this.addExpressionListSubqueries(plan.root, sp.windowKeys, plan.root.rows, ctx);
       for (const spec of sp.windowSpecs) {
@@ -5366,7 +5688,9 @@ export class Engine {
     if (sp.distinct) {
       distinctInputRows = plan.root.rows;
       const globals = sp.projections.every((projection) => projection.kind === "column")
-        ? sp.projections.map((projection) => (projection as Extract<RExpr, { kind: "column" }>).index)
+        ? sp.projections.map(
+            (projection) => (projection as Extract<RExpr, { kind: "column" }>).index,
+          )
         : [];
       const rows =
         this.estimateSimpleDistinctRows(sp, globals, plan.root.rows) ??
@@ -5379,7 +5703,10 @@ export class Engine {
     const orderElided = sp.phys.pkOrdered || sp.phys.indexOrder !== null || sp.phys.joinPkOrdered;
     if (sp.order.length > 0 && !orderElided) {
       const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
-      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(this.estimateSumExprNodes(sp.orderExprs), plan.root.rows);
+      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(
+        this.estimateSumExprNodes(sp.orderExprs),
+        plan.root.rows,
+      );
       plan = wrapEstimatedPlan(plan, plan.root.rows, plan.root.logicalRows, local);
       this.addExpressionListSubqueries(plan.root, sp.orderExprs, plan.root.rows, ctx);
       plan.nodes[0] = plan.root;
@@ -5389,7 +5716,11 @@ export class Engine {
       plan = wrapEstimatedPlan(plan, rows, rows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
     }
     const projectionRows = distinctInputRows ?? plan.root.rows;
-    addPlanUnit(plan.root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(this.estimateSumExprNodes(sp.projections), projectionRows));
+    addPlanUnit(
+      plan.root,
+      UNIT_OPERATOR_EVAL,
+      saturatingEstimateMultiply(this.estimateSumExprNodes(sp.projections), projectionRows),
+    );
     this.addExpressionListSubqueries(plan.root, sp.projections, projectionRows, ctx);
     addPlanUnit(plan.root, UNIT_ROW_PRODUCED, plan.root.rows);
     plan.nodes[0] = plan.root;
@@ -5427,9 +5758,16 @@ export class Engine {
       }
     }
     const root = addPlanEstimates(lhs.root, rhs.root);
-    root.rows = rows; root.logicalRows = rows;
+    root.rows = rows;
+    root.logicalRows = rows;
     let out = parentEstimatedPlan(root, lhs, rhs);
-    if (plan.order.length > 0) out = wrapEstimatedPlan(out, out.root.rows, out.root.logicalRows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
+    if (plan.order.length > 0)
+      out = wrapEstimatedPlan(
+        out,
+        out.root.rows,
+        out.root.logicalRows,
+        Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n),
+      );
     if (plan.limit !== null || plan.offset !== null) {
       rows = this.estimateWindowRows(out.root.rows, plan.limit, plan.offset);
       out = wrapEstimatedPlan(out, rows, rows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
@@ -5437,10 +5775,7 @@ export class Engine {
     return out;
   }
 
-  private estimateWithPlan(
-    plan: WithPlan,
-    inherited: EstimateCteContext | null,
-  ): EstimatedPlan {
+  private estimateWithPlan(plan: WithPlan, inherited: EstimateCteContext | null): EstimatedPlan {
     let inheritedBindings: CteBinding[] = [];
     let inheritedModes: CteMode[] = [];
     let inheritedBodies: EstimatedPlan[] = [];
@@ -5467,7 +5802,10 @@ export class Engine {
     let bindingContribution = emptyPlanEstimate();
     for (let i = 0; i < plan.bindings.length; i++) {
       const binding = plan.bindings[i]!;
-      const body = binding.source.kind === "query" ? this.estimateQueryPlan(binding.source.plan, ctx) : leafEstimatedPlan(emptyPlanEstimate());
+      const body =
+        binding.source.kind === "query"
+          ? this.estimateQueryPlan(binding.source.plan, ctx)
+          : leafEstimatedPlan(emptyPlanEstimate());
       ctx.bodies[localBase + i] = body;
       const mode = plan.modes[i] ?? "inline";
       let cteEstimate = emptyPlanEstimate(body.root.rows);
@@ -5481,7 +5819,8 @@ export class Engine {
     }
     const body = this.estimateQueryPlan(plan.body, ctx);
     const root = addPlanEstimates(bindingContribution, body.root);
-    root.rows = body.root.rows; root.logicalRows = body.root.logicalRows;
+    root.rows = body.root.rows;
+    root.logicalRows = body.root.logicalRows;
     return { root, nodes: [root, ...definitionNodes, ...body.nodes] };
   }
 
@@ -5491,19 +5830,34 @@ export class Engine {
     filter: RExpr | null,
     ctx: EstimateCteContext | null,
   ): EstimatedPlan {
-    const rel: ScopeRel = { label: table.name, table, offset: 0, ...(db === undefined ? {} : { db }) };
+    const rel: ScopeRel = {
+      label: table.name,
+      table,
+      offset: 0,
+      ...(db === undefined ? {} : { db }),
+    };
     const contradiction = whereContradicts(filter);
     let scan = leafEstimatedPlan(
-      this.estimateSelectedScan(rel, this.planMutationScan(db, table, filter, contradiction).bound, filter),
+      this.estimateSelectedScan(
+        rel,
+        this.planMutationScan(db, table, filter, contradiction).bound,
+        filter,
+      ),
     );
     // A WHERE contradiction reads no relation (planner.md §3.1): the target scan estimates zero, so
     // the Filter above it runs over no row and only its uncorrelated subqueries remain.
     if (contradiction) scan = leafEstimatedPlan(emptyPlanEstimate(0n));
     if (filter === null) return scan;
-    const logicalRows = estimateSelectivity(estimatorPredicateSelectivity(filter), scan.root.logicalRows);
+    const logicalRows = estimateSelectivity(
+      estimatorPredicateSelectivity(filter),
+      scan.root.logicalRows,
+    );
     const rows = logicalRows > scan.root.rows ? scan.root.rows : logicalRows;
     const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
-    local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(estimatorOperatorNodes(filter), scan.root.rows);
+    local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(
+      estimatorOperatorNodes(filter),
+      scan.root.rows,
+    );
     const plan = wrapEstimatedPlan(scan, rows, logicalRows, local);
     this.addExpressionSubqueries(plan.root, filter, scan.root.rows, ctx);
     plan.nodes[0] = plan.root;
@@ -5523,13 +5877,17 @@ export class Engine {
     if (inner.kind === "insert") {
       // A write through an updatable view estimates its base-table statement (views.md §15.5).
       const ins = this.rewriteInsertTarget(inner).ins;
-      if (this.lkpTableScoped(ins.db, ins.table) === undefined) throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
-      const source = ins.source.kind === "query"
-        ? this.estimateQueryPlan(
-            this.planQuery(ins.source.query, null, bindings, new ParamTypes()),
-            ctx,
-          )
-        : leafEstimatedPlan(emptyPlanEstimate(BigInt(ins.source.rows.length)));
+      if (this.lkpTableScoped(ins.db, ins.table) === undefined)
+        throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(
+          ins.tableLoc,
+        );
+      const source =
+        ins.source.kind === "query"
+          ? this.estimateQueryPlan(
+              this.planQuery(ins.source.query, null, bindings, new ParamTypes()),
+              ctx,
+            )
+          : leafEstimatedPlan(emptyPlanEstimate(BigInt(ins.source.rows.length)));
       return parentEstimatedPlan(source.root, source).nodes;
     }
     if (inner.kind === "update" || inner.kind === "delete") {
@@ -5538,7 +5896,10 @@ export class Engine {
       if (inner.kind === "update") ({ upd: stmt, vw } = this.rewriteUpdateTarget(inner));
       else ({ del: stmt, vw } = this.rewriteDeleteTarget(inner));
       const table = this.lkpTableScoped(stmt.db, stmt.table);
-      if (table === undefined) throw engineError("undefined_table", "table does not exist: " + stmt.table).atTarget(stmt.tableLoc);
+      if (table === undefined)
+        throw engineError("undefined_table", "table does not exist: " + stmt.table).atTarget(
+          stmt.tableLoc,
+        );
       const filter = this.explainDmlFilter(table, stmt.filter, bindings, vw);
       const scan = this.estimateMutationScan(table, stmt.db, filter, ctx);
       return parentEstimatedPlan(scan.root, scan).nodes;
@@ -5553,16 +5914,17 @@ export class Engine {
     let contribution = emptyPlanEstimate();
     for (let i = 0; i < wp.bindings.length; i++) {
       const binding = wp.bindings[i]!;
-      const body = binding.source.kind === "query"
-        ? this.estimateQueryPlan(binding.source.plan, ctx)
-        : (() => {
-            const nodes = this.estimateExplainScoped(
-              binding.source.dm.stmt,
-              wp.bindings.slice(0, i),
-              ctx,
-            );
-            return { root: nodes[0]!, nodes };
-          })();
+      const body =
+        binding.source.kind === "query"
+          ? this.estimateQueryPlan(binding.source.plan, ctx)
+          : (() => {
+              const nodes = this.estimateExplainScoped(
+                binding.source.dm.stmt,
+                wp.bindings.slice(0, i),
+                ctx,
+              );
+              return { root: nodes[0]!, nodes };
+            })();
       ctx.bodies.push(body);
       let cteEstimate = emptyPlanEstimate(body.root.rows);
       if (binding.source.kind === "dml" || (wp.modes[i] === "materialize" && binding.refs > 0)) {
@@ -5572,16 +5934,17 @@ export class Engine {
       definitionNodes.push(cteEstimate);
       if (!binding.expanded) definitionNodes.push(...body.nodes);
     }
-    const primary = wp.primary !== null
-      ? this.estimateQueryPlan(wp.primary, ctx)
-      : (() => {
-          const nodes = this.estimateExplainScoped(
-            wp.body as Insert | Update | Delete,
-            wp.bindings,
-            ctx,
-          );
-          return { root: nodes[0]!, nodes };
-        })();
+    const primary =
+      wp.primary !== null
+        ? this.estimateQueryPlan(wp.primary, ctx)
+        : (() => {
+            const nodes = this.estimateExplainScoped(
+              wp.body as Insert | Update | Delete,
+              wp.bindings,
+              ctx,
+            );
+            return { root: nodes[0]!, nodes };
+          })();
     const root = addPlanEstimates(contribution, primary.root);
     root.rows = primary.root.rows;
     root.logicalRows = primary.root.logicalRows;
@@ -5594,6 +5957,10 @@ export class Engine {
   // per emitted plan row. EXPLAIN ANALYZE (analyze true) delegates to executeExplainAnalyze, which also
   // runs the inner statement.
   private executeExplain(ex: Explain, params: Value[]): Outcome {
+    return runSync(this.executeExplainSteps(ex, params));
+  }
+
+  private *executeExplainSteps(ex: Explain, params: Value[]): Steps<Outcome> {
     // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7) renders the plan of the query the statement
     // runs. Its checks before anything is created run first — the target, the query's analysis, the
     // name — and an IF NOT EXISTS that skips a taken name renders no plan. Only ANALYZE runs the
@@ -5617,15 +5984,23 @@ export class Engine {
         types.types = planning.probeTypes();
         planning.bind(bindParams(params, types.finalize(), this.inputZone()));
       }
-      return this.executeExplainPlanned(ex, run, params);
+      return yield* this.executeExplainPlannedSteps(ex, run, params);
     } finally {
       planning.end();
     }
   }
 
   private executeExplainPlanned(ex: Explain, run: Statement | null, params: Value[]): Outcome {
+    return runSync(this.executeExplainPlannedSteps(ex, run, params));
+  }
+
+  private *executeExplainPlannedSteps(
+    ex: Explain,
+    run: Statement | null,
+    params: Value[],
+  ): Steps<Outcome> {
     if (ex.analyze) {
-      return this.executeExplainAnalyze(ex, run, params);
+      return yield* this.executeExplainAnalyzeSteps(ex, run, params);
     }
     const estimates = this.estimateExplain(ex.inner).map((estimate) => ({
       rows: estimate.rows,
@@ -5647,6 +6022,14 @@ export class Engine {
   // `run`, when given, is the statement executed in place of the rendered inner — a `CREATE TABLE …
   // AS`, whose rendered plan is its query's (create-table-as.md §7).
   private executeExplainAnalyze(ex: Explain, run: Statement | null, params: Value[]): Outcome {
+    return runSync(this.executeExplainAnalyzeSteps(ex, run, params));
+  }
+
+  private *executeExplainAnalyzeSteps(
+    ex: Explain,
+    run: Statement | null,
+    params: Value[],
+  ): Steps<Outcome> {
     const inner = ex.inner;
     // Render the plan tree first (plan-only, no execution — pre-mutation).
     const estimates = this.estimateExplain(inner).map((estimate) => ({
@@ -5670,7 +6053,7 @@ export class Engine {
     this.explainActualFoldSuppress = 0;
     let innerOut: Outcome;
     try {
-      innerOut = this.dispatchStmtBody(run ?? inner, params);
+      innerOut = yield* this.dispatchStmtBodySteps(run ?? inner, params);
     } finally {
       this.explainActualProfile = previousProfile;
       this.explainActualFrames = previousFrames;
@@ -5691,6 +6074,7 @@ export class Engine {
     const cteUsed = new Map<string, number>();
     let suppressedDepth: number | null = null;
     for (const [index, row] of body.rows.entries()) {
+      if (shouldCooperate()) yield COOPERATE;
       if (suppressedDepth !== null) {
         if (row.depth > suppressedDepth) continue;
         suppressedDepth = null;
@@ -5719,6 +6103,7 @@ export class Engine {
     const r = new ExplainRender([rootEstimate], [innerOut.cost]);
     r.emit(0, "Analyze", `cost=${innerOut.cost} rows=${actualRows}`);
     for (const row of body.rows) {
+      if (shouldCooperate()) yield COOPERATE;
       r.rows.push({ ...row, depth: row.depth + 1 });
     }
     return this.explainOutcome(r.rows, ex, run ?? inner);
@@ -5856,14 +6241,13 @@ export class Engine {
           this.renderExplainWithDml(r, inner, depth);
           return;
         }
-      default:
-        {
-          const plan = this.planExplainInner(inner);
-          // A top-level pure WITH is orchestrated directly by runWith rather than execQueryPlan.
-          // Its wrapper is frame 0; only CTE/body query plans open execution frames.
-          if (inner.kind === "with" && plan.kind === "with") this.renderWithPlan(r, plan, depth);
-          else this.renderQueryPlan(r, plan, depth);
-        }
+      default: {
+        const plan = this.planExplainInner(inner);
+        // A top-level pure WITH is orchestrated directly by runWith rather than execQueryPlan.
+        // Its wrapper is frame 0; only CTE/body query plans open execution frames.
+        if (inner.kind === "with" && plan.kind === "with") this.renderWithPlan(r, plan, depth);
+        else this.renderQueryPlan(r, plan, depth);
+      }
     }
   }
 
@@ -5914,7 +6298,9 @@ export class Engine {
     // A write through an updatable view renders its base-table statement (views.md §15.5).
     const ins = this.rewriteInsertTarget(written).ins;
     if (this.lkpTable(ins.table) === undefined) {
-      throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
+      throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(
+        ins.tableLoc,
+      );
     }
     r.emit(depth, "Insert " + ins.table, insertDetail(ins));
     if (ins.source.kind === "query") {
@@ -5938,7 +6324,9 @@ export class Engine {
     const { upd, vw } = this.rewriteUpdateTarget(written);
     const table = this.lkpTable(upd.table);
     if (table === undefined) {
-      throw engineError("undefined_table", "table does not exist: " + upd.table).atTarget(upd.tableLoc);
+      throw engineError("undefined_table", "table does not exist: " + upd.table).atTarget(
+        upd.tableLoc,
+      );
     }
     const filter = this.explainDmlFilter(table, upd.filter, bindings, vw);
     r.emit(depth, "Update " + upd.table, `sets=${upd.assignments.length}`);
@@ -5964,7 +6352,9 @@ export class Engine {
     const { del, vw } = this.rewriteDeleteTarget(written);
     const table = this.lkpTable(del.table);
     if (table === undefined) {
-      throw engineError("undefined_table", "table does not exist: " + del.table).atTarget(del.tableLoc);
+      throw engineError("undefined_table", "table does not exist: " + del.table).atTarget(
+        del.tableLoc,
+      );
     }
     const filter = this.explainDmlFilter(table, del.filter, bindings, vw);
     r.emit(depth, "Delete " + del.table, "-");
@@ -6006,7 +6396,9 @@ export class Engine {
   ): void {
     let d = depth;
     if (filter !== null) {
-      let detail = r.verbose ? `filter=${renderRExpr(filter)}` : `conjuncts=${conjunctCount(filter)}`;
+      let detail = r.verbose
+        ? `filter=${renderRExpr(filter)}`
+        : `conjuncts=${conjunctCount(filter)}`;
       if (whereContradicts(filter)) detail += "; contradiction";
       r.emit(d, "Filter", detail);
       d++;
@@ -6047,25 +6439,27 @@ export class Engine {
     const assigned = new Array<boolean>(mask.length).fill(false);
     for (const assignment of upd.assignments) {
       const idx = columnIndex(table, assignment.column);
-      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + assignment.column);
+      if (idx < 0)
+        throw engineError("undefined_column", "column does not exist: " + assignment.column);
       assigned[idx] = true;
       if (assignment.isDefault) continue;
       const col = table.columns[idx]!;
-      const source = col.type.kind === "scalar"
-        ? resolve(
-            scope,
-            assignment.value,
-            col.type.scalar,
-            { collecting: false, groupKeys: [], specs: [] },
-            ptypes,
-          ).node
-        : resolveContainerAssign(
-            scope,
-            col,
-            assignment.value,
-            { collecting: false, groupKeys: [], specs: [] },
-            ptypes,
-          );
+      const source =
+        col.type.kind === "scalar"
+          ? resolve(
+              scope,
+              assignment.value,
+              col.type.scalar,
+              { collecting: false, groupKeys: [], specs: [] },
+              ptypes,
+            ).node
+          : resolveContainerAssign(
+              scope,
+              col,
+              assignment.value,
+              { collecting: false, groupKeys: [], specs: [] },
+              ptypes,
+            );
       collectTouched(source, 0, mask);
     }
     if (upd.returning !== null) {
@@ -6208,7 +6602,9 @@ export class Engine {
     }
     const filter = postJoinFilter(sp);
     if (filter !== null) {
-      let detail = r.verbose ? `filter=${renderRExpr(filter)}` : `conjuncts=${conjunctCount(filter)}`;
+      let detail = r.verbose
+        ? `filter=${renderRExpr(filter)}`
+        : `conjuncts=${conjunctCount(filter)}`;
       if (whereContradiction(sp)) detail += "; contradiction";
       r.emit(d, "Filter", detail);
       d++;
@@ -6286,30 +6682,35 @@ export class Engine {
     const ons = step.onIndices
       .map((index) => joinOn(sp, index))
       .filter((on): on is RExpr => on !== null);
-    const kind = step.onIndices.reduce<JoinKind>((current, index) => {
-      const candidate = sp.joins[index]!.kind;
-      return candidate === "left" || candidate === "right" || candidate === "full"
-        ? candidate
-        : current;
-    }, step.onIndices.length === 0 ? "cross" : "inner");
+    const kind = step.onIndices.reduce<JoinKind>(
+      (current, index) => {
+        const candidate = sp.joins[index]!.kind;
+        return candidate === "left" || candidate === "right" || candidate === "full"
+          ? candidate
+          : current;
+      },
+      step.onIndices.length === 0 ? "cross" : "inner",
+    );
     let detail: string = kind;
     if (!r.verbose && ons.length > 0) {
       const conjuncts = ons.reduce((n, on) => n + conjunctCount(on), 0);
-      detail = ons.length === 1
-        ? `${kind}; on:conjuncts=${conjuncts}`
-        : `${kind}; on:predicates=${ons.length},conjuncts=${conjuncts}`;
+      detail =
+        ons.length === 1
+          ? `${kind}; on:conjuncts=${conjuncts}`
+          : `${kind}; on:predicates=${ons.length},conjuncts=${conjuncts}`;
     } else if (ons.length === 1) detail = `${kind}; on=${renderRExpr(ons[0]!)}`;
     else if (ons.length > 1) detail = `${kind}; on=[${ons.map(renderRExpr).join(", ")}]`;
     if (step.hashJoin !== null) {
-      const onDetail = ons.length === 0
-        ? ""
-        : !r.verbose
-        ? ons.length === 1
-          ? `; on:conjuncts=${conjunctCount(ons[0]!)}`
-          : `; on:predicates=${ons.length},conjuncts=${ons.reduce((n, on) => n + conjunctCount(on), 0)}`
-        : ons.length === 1
-        ? `; on=${renderRExpr(ons[0]!)}`
-        : `; on=[${ons.map(renderRExpr).join(", ")}]`;
+      const onDetail =
+        ons.length === 0
+          ? ""
+          : !r.verbose
+            ? ons.length === 1
+              ? `; on:conjuncts=${conjunctCount(ons[0]!)}`
+              : `; on:predicates=${ons.length},conjuncts=${ons.reduce((n, on) => n + conjunctCount(on), 0)}`
+            : ons.length === 1
+              ? `; on=${renderRExpr(ons[0]!)}`
+              : `; on=[${ons.map(renderRExpr).join(", ")}]`;
       detail = `${kind}; keys=${step.hashJoin.keys.length}${onDetail}`;
     }
     r.emit(depth, step.hashJoin === null ? "Nested Loop" : "Hash Join", withNote(detail, note));
@@ -6339,17 +6740,29 @@ export class Engine {
         );
         return;
       }
-      r.emit(depth, "SRF " + rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
+      r.emit(
+        depth,
+        "SRF " + rel.tableName,
+        withNote(pushedFilterDetail(sp, i, "", r.verbose), note),
+      );
       return;
     }
     if (rel.cte !== undefined) {
-      r.emit(depth, "CTE Scan " + rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
+      r.emit(
+        depth,
+        "CTE Scan " + rel.tableName,
+        withNote(pushedFilterDetail(sp, i, "", r.verbose), note),
+      );
       // A CTE inlined at its reference renders the body planned there (planner.md §3.4).
       if (rel.derived !== undefined) this.renderQueryPlan(r, rel.derived, depth + 1);
       return;
     }
     if (rel.derived !== undefined) {
-      r.emit(depth, subqueryNode(rel.tableName), withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
+      r.emit(
+        depth,
+        subqueryNode(rel.tableName),
+        withNote(pushedFilterDetail(sp, i, "", r.verbose), note),
+      );
       this.renderQueryPlan(r, rel.derived, depth + 1);
       return;
     }
@@ -6526,13 +6939,7 @@ export class Engine {
     const plan = this.ctasPrepare(ct, cta, params);
     if (plan === null) return { kind: "statement", cost: 0n, rowsAffected: null };
     const { targetTemp, attachName } = this.createTableTarget(ct);
-    const columns = ctasColumns(
-      ct,
-      cta,
-      plan,
-      targetTemp,
-      this.readSnap().defaultCollation,
-    );
+    const columns = ctasColumns(ct, cta, plan, targetTemp, this.readSnap().defaultCollation);
     this.createTableWithColumns(ct, columns);
     if (!cta.withData) return { kind: "statement", cost: 0n, rowsAffected: null };
     // Fill the new table: the rows, cost, and errors are exactly `INSERT INTO t <query>`'s. The target
@@ -6806,9 +7213,7 @@ export class Engine {
         // scalar to become keyable, so EVERY scalar is now keyable). Still rejected 0A000: only the
         // recursive composite container. timestamp / timestamptz / date share the i64/i32 int-be-signflip
         // key (timestamp.md §6).
-        if (
-          !this.typeIsKeyable(colType)
-        ) {
+        if (!this.typeIsKeyable(colType)) {
           throw engineError(
             "feature_not_supported",
             "a " + typeCanonicalName(colType) + " primary key is not supported yet",
@@ -7019,9 +7424,7 @@ export class Engine {
       }
       for (const i of indices) {
         const ty = columns[i]!.type;
-        if (
-          !this.typeIsKeyable(ty)
-        ) {
+        if (!this.typeIsKeyable(ty)) {
           throw engineError(
             "feature_not_supported",
             "a " + typeCanonicalName(ty) + " primary key is not supported yet",
@@ -7059,9 +7462,7 @@ export class Engine {
       }
       for (const i of indices) {
         const ty = columns[i]!.type;
-        if (
-          !this.typeIsKeyable(ty)
-        ) {
+        if (!this.typeIsKeyable(ty)) {
           throw engineError(
             "feature_not_supported",
             "a " + typeCanonicalName(ty) + " unique constraint member is not supported yet",
@@ -7115,8 +7516,7 @@ export class Engine {
     // collision (byte-exact; bare names are already folded) is 42710; derived names never yield to a
     // later explicit one (oracle-probed).
     const checks: CheckConstraint[] = [];
-    const nameTaken = (name: string): boolean =>
-      checks.some((c) => c.name === name);
+    const nameTaken = (name: string): boolean => checks.some((c) => c.name === name);
     // A derived name also walks past every constraint name of the table's database domain — its
     // schema (constraints.md §6.7, PostgreSQL's ChooseConstraintName); an explicit one is checked
     // against this table alone.
@@ -7136,12 +7536,7 @@ export class Engine {
       } else {
         const cols = checkReferencedColumns(def.expr, columns);
         const column = cols.length === 1 ? columns[cols[0]!]!.name : null;
-        name = chooseObjectName(
-          table.name,
-          column,
-          "check",
-          (n) => nameTaken(n) || schemaTaken(n),
-        );
+        name = chooseObjectName(table.name, column, "check", (n) => nameTaken(n) || schemaTaken(n));
       }
       checks.push({ name, exprText: def.text, expr: def.expr, hostDeps: checkDeps[ci] });
     }
@@ -7171,11 +7566,8 @@ export class Engine {
       survivors.push(ru);
     }
     const relationTaken = (n: string): boolean =>
-      this.relationExists(n) ||
-      table.name === n ||
-      table.indexes.some((ix) => ix.name === n);
-    const checkNameTaken = (n: string): boolean =>
-      table.checks.some((c) => c.name === n);
+      this.relationExists(n) || table.name === n || table.indexes.some((ix) => ix.name === n);
+    const checkNameTaken = (n: string): boolean => table.checks.some((c) => c.name === n);
     for (const ru of survivors) {
       let name: string;
       if (ru.name !== null) {
@@ -7391,9 +7783,7 @@ export class Engine {
       // namespace (42P07) then the table's constraint names (42710); a derived `<table>_<cols>_excl`
       // suffix-walks both.
       const relTaken = (n: string): boolean =>
-        this.relationExists(n) ||
-        table.name === n ||
-        table.indexes.some((ix) => ix.name === n);
+        this.relationExists(n) || table.name === n || table.indexes.some((ix) => ix.name === n);
       const conTaken = (n: string): boolean =>
         table.checks.some((c) => c.name === n) ||
         table.fks.some((f) => f.name === n) ||
@@ -7533,10 +7923,7 @@ export class Engine {
     this.putTable(table);
     // The table is brand new (no rows), so each backing index store starts empty.
     for (const ix of table.indexes) {
-      this.working().putIndexStore(
-        ix.name,
-        new TableStore(pagePayload(this.pageSize), []),
-      );
+      this.working().putIndexStore(ix.name, new TableStore(pagePayload(this.pageSize), []));
     }
     // Stage each serial column's OWNED sequence now that the table validated
     // (spec/design/sequences.md §12). The names were resolved (collision-free) during the column
@@ -7617,6 +8004,7 @@ export class Engine {
       params: [],
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, [], EMPTY_CTE_CTX),
       environment: this.session.environment,
       rng,
       ctes: EMPTY_CTE_CTX,
@@ -7631,11 +8019,7 @@ export class Engine {
   // cannot newly fail (an aggregate/window/subquery/param was rejected then, and re-resolving under
   // the Forbidden agg mode is inert). Returns an owned ResolvedIndex, so the write paths can hold it
   // while mutating stores.
-  resolveIndex(
-    table: Table,
-    def: IndexDef,
-    ptypes: ParamTypes = new ParamTypes(),
-  ): ResolvedIndex {
+  resolveIndex(table: Table, def: IndexDef, ptypes: ParamTypes = new ParamTypes()): ResolvedIndex {
     // An index whose stored expression did not parse can neither be maintained nor used: the read
     // path swallows this error and skips the index, a write propagates it
     // (spec/design/unparsable-definitions.md §3.4).
@@ -7663,11 +8047,7 @@ export class Engine {
     // validated boolean + immutable at CREATE INDEX, so this cannot newly fail.
     let predicate: RExpr | undefined;
     if (def.predicate) {
-      predicate = resolveBooleanFilter(
-        Scope.index(this, table),
-        def.predicate.expr,
-        ptypes,
-      );
+      predicate = resolveBooleanFilter(Scope.index(this, table), def.predicate.expr, ptypes);
     }
     // Reopen soundness (extensibility.md §8.1/§11, step 4): if this index depends on host functions,
     // verify each still matches the dependency persisted with the index. A mismatch is XX002, which
@@ -7708,7 +8088,18 @@ export class Engine {
     storageKey: Uint8Array,
     row: Row,
   ): Uint8Array[] {
-    return indexEntryKeys(
+    return runSync(this.indexEntriesSteps(columns, colTypes, colls, rindex, storageKey, row));
+  }
+
+  private *indexEntriesSteps(
+    columns: Column[],
+    colTypes: ColType[],
+    colls: (Collation | null)[],
+    rindex: ResolvedIndex,
+    storageKey: Uint8Array,
+    row: Row,
+  ): Steps<Uint8Array[]> {
+    return yield* indexEntryKeysSteps(
       columns,
       colTypes,
       colls,
@@ -7728,7 +8119,22 @@ export class Engine {
     rindex: ResolvedIndex,
     row: Row,
   ): Uint8Array | null {
-    return indexPrefixKey(colTypes, colls, rindex, row, this.maintenanceEnv(new StmtRng()));
+    return runSync(this.indexPrefixSteps(colTypes, colls, rindex, row));
+  }
+
+  private *indexPrefixSteps(
+    colTypes: ColType[],
+    colls: (Collation | null)[],
+    rindex: ResolvedIndex,
+    row: Row,
+  ): Steps<Uint8Array | null> {
+    return yield* indexPrefixKeySteps(
+      colTypes,
+      colls,
+      rindex,
+      row,
+      this.maintenanceEnv(new StmtRng()),
+    );
   }
 
   // arbiterProbeKey is a candidate row's arbiter key for ON CONFLICT (spec/design/upsert.md §3),
@@ -7742,7 +8148,26 @@ export class Engine {
     rindexes: ResolvedIndex[],
     row: Row,
   ): Uint8Array | null {
-    return arbiterKey(arb, colTypes, pk, colls, rindexes, row, this.maintenanceEnv(new StmtRng()));
+    return runSync(this.arbiterProbeKeySteps(arb, colTypes, pk, colls, rindexes, row));
+  }
+
+  private *arbiterProbeKeySteps(
+    arb: Arbiter,
+    colTypes: ColType[],
+    pk: number[],
+    colls: (Collation | null)[],
+    rindexes: ResolvedIndex[],
+    row: Row,
+  ): Steps<Uint8Array | null> {
+    return yield* arbiterKeySteps(
+      arb,
+      colTypes,
+      pk,
+      colls,
+      rindexes,
+      row,
+      this.maintenanceEnv(new StmtRng()),
+    );
   }
 
   // resolveDefaultExprs resolves each column's EXPRESSION default (constraints.md §2) to an
@@ -7796,18 +8221,28 @@ export class Engine {
   // materialization (a DEFAULT keyword) and insertRows (an omitted column), sharing ONE StmtRng
   // so a multi-row DEFAULT uuidv7() stays monotonic. defaultRExpr is null for a constant/no default.
   private evalDefault(col: Column, defaultRExpr: RExpr | null, rng: StmtRng, meter: Meter): Value {
+    return runSync(this.evalDefaultSteps(col, defaultRExpr, rng, meter));
+  }
+
+  private *evalDefaultSteps(
+    col: Column,
+    defaultRExpr: RExpr | null,
+    rng: StmtRng,
+    meter: Meter,
+  ): Steps<Value> {
     if (defaultRExpr === null) return col.default ?? nullValue();
     meter.guard();
     const env: EvalEnv = {
       params: [],
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, [], EMPTY_CTE_CTX),
       environment: this.session.environment,
       rng,
       ctes: EMPTY_CTE_CTX,
       exec: this,
     };
-    return evalExpr(defaultRExpr, [], env, meter);
+    return yield* evalExprSteps(defaultRExpr, [], env, meter);
   }
 
   // buildInsertRow builds + coerces one INSERT candidate row in column order (constraints.md §7 step
@@ -7826,14 +8261,30 @@ export class Engine {
     rng: StmtRng,
     meter: Meter,
   ): Row {
+    return runSync(
+      this.buildInsertRowSteps(table, colTypes, provided, values, defaultExprs, rng, meter),
+    );
+  }
+
+  private *buildInsertRowSteps(
+    table: Table,
+    colTypes: ColType[],
+    provided: number[],
+    values: Value[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    meter: Meter,
+  ): Steps<Row> {
     const n = table.columns.length;
     const row: Row = new Array(n);
     let nullCol = -1;
     for (let i = 0; i < n; i++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const col = table.columns[i]!;
       const p = provided[i]!;
       const candidate: Value =
-        p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
+        p >= 0 ? values[p]! : yield* this.evalDefaultSteps(col, defaultExprs[i]!, rng, meter);
       if (col.notNull && candidate.kind === "null") {
         if (nullCol < 0) nullCol = i;
         row[i] = candidate;
@@ -7857,7 +8308,8 @@ export class Engine {
         throw err;
       }
     }
-    if (nullCol >= 0) throw this.notNullRowViolation(table.name, table.columns[nullCol]!.name, row);
+    if (nullCol >= 0)
+      throw yield* this.notNullRowViolationSteps(table.name, table.columns[nullCol]!.name, row);
     return row;
   }
 
@@ -7873,8 +8325,31 @@ export class Engine {
     rng: StmtRng,
     meter: Meter,
   ): Row {
+    return runSync(
+      this.buildInsertRowAtSteps(r, table, colTypes, provided, values, defaultExprs, rng, meter),
+    );
+  }
+
+  private *buildInsertRowAtSteps(
+    r: number,
+    table: Table,
+    colTypes: ColType[],
+    provided: number[],
+    values: Value[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    meter: Meter,
+  ): Steps<Row> {
     try {
-      return this.buildInsertRow(table, colTypes, provided, values, defaultExprs, rng, meter);
+      return yield* this.buildInsertRowSteps(
+        table,
+        colTypes,
+        provided,
+        values,
+        defaultExprs,
+        rng,
+        meter,
+      );
     } catch (e) {
       if (e instanceof EngineError) e.atRow(r);
       throw e;
@@ -7884,9 +8359,17 @@ export class Engine {
   // notNullRowViolation is the 23502 for a NULL in NOT NULL column of the complete candidate row
   // (error-fields.md §9.5): the table stamped, the failing row as its Detail.
   private notNullRowViolation(relation: string, column: string, row: Row): EngineError {
+    return runSync(this.notNullRowViolationSteps(relation, column, row));
+  }
+
+  private *notNullRowViolationSteps(
+    relation: string,
+    column: string,
+    row: Row,
+  ): Steps<EngineError> {
     return notNullViolation(column)
       .withTable(relation)
-      .withDetail(failingRowDetail(this.session, relation, row));
+      .withDetail(yield* failingRowDetailSteps(this.session, relation, row));
   }
 
   // executeDropTable runs a DROP TABLE [IF EXISTS] a [, …] [CASCADE | RESTRICT]: remove each named
@@ -8058,7 +8541,11 @@ export class Engine {
           const edits: ViewEdit[] = [];
           for (const a of at.action.actions) {
             if (a.kind === "alterColumn" && a.edit.action.kind === "setDefault") {
-              edits.push({ kind: "setDefault", column: a.edit.column, default: a.edit.action.default });
+              edits.push({
+                kind: "setDefault",
+                column: a.edit.column,
+                default: a.edit.action.default,
+              });
             } else if (a.kind === "alterColumn" && a.edit.action.kind === "dropDefault") {
               edits.push({ kind: "dropDefault", column: a.edit.column });
             } else {
@@ -8094,10 +8581,8 @@ export class Engine {
     };
     let renameTable = false;
     let indexRename: { oldName: string; newName: string } | undefined;
-    const tempScope =
-      at.db === undefined ? this.isTempTable(at.name) : at.db === "temp";
-    const attachmentScope =
-      at.db !== undefined && at.db !== "main" && at.db !== "temp";
+    const tempScope = at.db === undefined ? this.isTempTable(at.name) : at.db === "temp";
+    const attachmentScope = at.db !== undefined && at.db !== "main" && at.db !== "temp";
     const relationTaken = (name: string) =>
       attachmentScope
         ? snap.table(name) !== undefined ||
@@ -8278,23 +8763,15 @@ export class Engine {
           throw engineError("undefined_object", `constraint does not exist: ${old}`);
         if (exists(next))
           throw engineError("duplicate_object", `constraint already exists: ${next}`);
-        table.checks = table.checks.map((c) =>
-          c.name === old ? { ...c, name: next } : c,
-        );
-        table.fks = table.fks.map((f) =>
-          f.name === old ? { ...f, name: next } : f,
-        );
+        table.checks = table.checks.map((c) => (c.name === old ? { ...c, name: next } : c));
+        table.fks = table.fks.map((f) => (f.name === old ? { ...f, name: next } : f));
         table.exclusions = table.exclusions.map((e) => {
           if (e.name !== old) return e;
           indexRename = { oldName: old, newName: next };
           return { ...e, name: next, index: next };
         });
         table.indexes = table.indexes.map((i) => {
-          if (
-            (!i.unique && indexRename === undefined) ||
-            i.name !== old
-          )
-            return i;
+          if ((!i.unique && indexRename === undefined) || i.name !== old) return i;
           indexRename = { oldName: old, newName: next };
           return { ...i, name: next };
         });
@@ -8322,10 +8799,7 @@ export class Engine {
           if (action.kind === "addColumn") {
             if (columnIndex(table, action.column.name) >= 0) {
               if (action.ifNotExists) continue;
-              throw engineError(
-                "duplicate_column",
-                `column already exists: ${action.column.name}`,
-              );
+              throw engineError("duplicate_column", `column already exists: ${action.column.name}`);
             }
             if (action.foreignKeys.length > 0 && attachmentScope)
               throw engineError(
@@ -8374,13 +8848,15 @@ export class Engine {
                     constraint: { kind: "check", def },
                   }) as const,
               ),
-              ...action.uniques.filter(() => !col.primaryKey).map(
-                (def) =>
-                  ({
-                    kind: "addConstraint",
-                    constraint: { kind: "unique", def },
-                  }) as const,
-              ),
+              ...action.uniques
+                .filter(() => !col.primaryKey)
+                .map(
+                  (def) =>
+                    ({
+                      kind: "addConstraint",
+                      constraint: { kind: "unique", def },
+                    }) as const,
+                ),
               ...action.foreignKeys.map(
                 (def) =>
                   ({
@@ -8422,18 +8898,19 @@ export class Engine {
             // Which checks and indexes reference the column is read from their parsed expressions, so
             // an unparsed one blocks the drop (spec/design/unparsable-definitions.md §3.2/§3.4).
             assertTableParsed(table, false);
-            const usesExpr = (expr: Expr) => checkReferencedColumns(expr, table.columns).includes(ci);
+            const usesExpr = (expr: Expr) =>
+              checkReferencedColumns(expr, table.columns).includes(ci);
             const indexUses = (index: IndexDef) =>
               index.keys.some((key) =>
                 key.kind === "column" ? key.column === ci : usesExpr(key.expr),
-              ) || (index.predicate !== undefined && usesExpr(index.predicate.expr));
+              ) ||
+              (index.predicate !== undefined && usesExpr(index.predicate.expr));
             // PostgreSQL owns an FK through its local (referencing) columns. Dropping one removes
             // the whole FK under RESTRICT. A self-FK that uses the column only on the referenced
             // side remains a dependency.
             const fkUsesLocalColumn = (fk: ForeignKey) => fk.columns.includes(ci);
             const fkUsesSelfRefColumn = (fk: ForeignKey) =>
-              fk.refTable === table.name &&
-              fk.refColumns.includes(ci);
+              fk.refTable === table.name && fk.refColumns.includes(ci);
             const selfRefFkDep = table.fks.some(
               (fk) => fkUsesSelfRefColumn(fk) && !fkUsesLocalColumn(fk),
             );
@@ -8474,13 +8951,8 @@ export class Engine {
                 for (const [key, child] of snap.tables)
                   if (key !== oldKey)
                     for (const fk of child.fks)
-                      if (
-                        fk.refTable === original.name &&
-                        fk.refColumns.includes(source.column)
-                      )
-                        cascadeDroppedColumnFks.add(
-                          `${key}\0${fk.name}`,
-                        );
+                      if (fk.refTable === original.name && fk.refColumns.includes(source.column))
+                        cascadeDroppedColumnFks.add(`${key}\0${fk.name}`);
             }
             // PostgreSQL treats same-table CHECKs, indexes (including UNIQUE), and EXCLUDE
             // constraints as internally dependent on their columns. They disappear even under
@@ -8507,8 +8979,7 @@ export class Engine {
             // A local-side FK is internally owned by the dropped column and disappears without
             // CASCADE. CASCADE also removes referenced-side-only self-FKs.
             table.fks = table.fks.filter((fk) => {
-              const keep =
-                !fkUsesLocalColumn(fk) && !(action.cascade && fkUsesSelfRefColumn(fk));
+              const keep = !fkUsesLocalColumn(fk) && !(action.cascade && fkUsesSelfRefColumn(fk));
               if (!keep) added.delete(fk.name);
               return keep;
             });
@@ -8520,9 +8991,7 @@ export class Engine {
             table.indexes = table.indexes.map((index) => ({
               ...index,
               keys: index.keys.map((key) =>
-                key.kind === "column" && key.column > ci
-                  ? { ...key, column: key.column - 1 }
-                  : key,
+                key.kind === "column" && key.column > ci ? { ...key, column: key.column - 1 } : key,
               ),
             }));
             table.fks = table.fks.map((fk) => ({
@@ -8560,9 +9029,9 @@ export class Engine {
               for (const key of owned) snap.removeSequence(key);
             }
             for (let i = pendingSerials.length - 1; i >= 0; i--) {
-              const seq = pendingSerials[i]!, owner = seq.ownedBy;
-              if (owner === undefined || owner.table !== table.name)
-                continue;
+              const seq = pendingSerials[i]!,
+                owner = seq.ownedBy;
+              if (owner === undefined || owner.table !== table.name) continue;
               if (owner.column === ci) pendingSerials.splice(i, 1);
               else if (owner.column > ci)
                 pendingSerials[i] = { ...seq, ownedBy: { ...owner, column: owner.column - 1 } };
@@ -8579,19 +9048,14 @@ export class Engine {
             for (const name of action.columns) {
               const ci = columnIndex(table, name);
               if (ci < 0)
-                throw engineError(
-                  "undefined_column",
-                  `column ${name} named in key does not exist`,
-                );
+                throw engineError("undefined_column", `column ${name} named in key does not exist`);
               if (pk.includes(ci))
                 throw engineError(
                   "duplicate_column",
                   `column ${name} appears twice in primary key`,
                 );
               const type = table.columns[ci]!.type;
-              if (
-                !this.typeIsKeyable(type)
-              )
+              if (!this.typeIsKeyable(type))
                 throw engineError(
                   "feature_not_supported",
                   `a ${typeCanonicalName(type)} primary key is not supported yet`,
@@ -8609,17 +9073,14 @@ export class Engine {
               throw engineError("undefined_object", "primary key does not exist");
             const oldPk = sortedUnique(table.pk);
             const localDeps = table.fks.some(
-              (fk) =>
-                fk.refTable === table.name &&
-                sameSet(sortedUnique(fk.refColumns), oldPk),
+              (fk) => fk.refTable === table.name && sameSet(sortedUnique(fk.refColumns), oldPk),
             );
             const incomingDeps = [...snap.tables].some(
               ([key, child]) =>
                 key !== oldKey &&
                 child.fks.some(
                   (fk) =>
-                    fk.refTable === original.name &&
-                    sameSet(sortedUnique(fk.refColumns), oldPk),
+                    fk.refTable === original.name && sameSet(sortedUnique(fk.refColumns), oldPk),
                 ),
             );
             if (!action.cascade && (localDeps || incomingDeps))
@@ -8629,9 +9090,7 @@ export class Engine {
               ).hinted(DROP_CASCADE);
             if (action.cascade) {
               table.fks = table.fks.filter(
-                (fk) =>
-                  fk.refTable !== table.name ||
-                  !sameSet(sortedUnique(fk.refColumns), oldPk),
+                (fk) => fk.refTable !== table.name || !sameSet(sortedUnique(fk.refColumns), oldPk),
               );
               cascadeUniqueCols.push(oldPk);
             }
@@ -8701,9 +9160,7 @@ export class Engine {
               }
               for (const ci of cols) {
                 const ty = table.columns[ci]!.type;
-                if (
-                  !this.typeIsKeyable(ty)
-                )
+                if (!this.typeIsKeyable(ty))
                   throw engineError(
                     "feature_not_supported",
                     `a ${typeCanonicalName(ty)} unique constraint member is not supported yet`,
@@ -8896,9 +9353,7 @@ export class Engine {
             const ex = table.exclusions.find((e) => e.name === k);
             if (ex) {
               table.exclusions = table.exclusions.filter((e) => e !== ex);
-              table.indexes = table.indexes.filter(
-                (i) => i.name !== ex.index,
-              );
+              table.indexes = table.indexes.filter((i) => i.name !== ex.index);
               found = true;
             }
             const ux = table.indexes.find((i) => i.unique && i.name === k);
@@ -8910,10 +9365,8 @@ export class Engine {
               });
               const hasOriginalCols = originalCols.length === cols.length;
               const localDeps = table.fks.filter(
-                  (f) =>
-                    f.refTable === table.name &&
-                    sameSet(sortedUnique(f.refColumns), cols),
-                );
+                (f) => f.refTable === table.name && sameSet(sortedUnique(f.refColumns), cols),
+              );
               const externalDeps: ForeignKey[] = [];
               for (const [key, ot] of snap.tables)
                 if (ot.name !== table.name && hasOriginalCols)
@@ -8922,9 +9375,7 @@ export class Engine {
                       (f) =>
                         f.refTable === table.name &&
                         sameSet(sortedUnique(f.refColumns), sortedUnique(originalCols)) &&
-                        !cascadeDroppedColumnFks.has(
-                          `${key}\0${f.name}`,
-                        ) &&
+                        !cascadeDroppedColumnFks.has(`${key}\0${f.name}`) &&
                         !cascadeUniqueCols.some((prior) =>
                           sameSet(prior, sortedUnique(f.refColumns)),
                         ),
@@ -8939,9 +9390,7 @@ export class Engine {
               if (action.cascade && hasOriginalCols)
                 cascadeUniqueCols.push(sortedUnique(originalCols));
               if (action.cascade)
-                table.fks = table.fks.filter(
-                  (f) => !localDeps.some((d) => d.name === f.name),
-                );
+                table.fks = table.fks.filter((f) => !localDeps.some((d) => d.name === f.name));
               table.indexes = table.indexes.filter((i) => i !== ux);
               found = true;
             }
@@ -9092,10 +9541,7 @@ export class Engine {
                 tempScope,
                 attachmentScope,
               );
-              if (
-                oldColumn.primaryKey &&
-                (!this.typeIsKeyable(target.type))
-              )
+              if (oldColumn.primaryKey && !this.typeIsKeyable(target.type))
                 throw engineError(
                   "feature_not_supported",
                   `a ${typeCanonicalName(target.type)} primary key is not supported yet`,
@@ -9120,7 +9566,9 @@ export class Engine {
                 new ParamTypes(),
               );
               if (!resolvedTypeEqual(resolved.type, resolvedTypeOfCol(target.type, this)))
-                throw typeError(`USING expression is not of type ${typeCanonicalName(target.type)}`);
+                throw typeError(
+                  `USING expression is not of type ${typeCanonicalName(target.type)}`,
+                );
               target = {
                 ...target,
                 primaryKey: oldColumn.primaryKey,
@@ -9135,14 +9583,30 @@ export class Engine {
                   typeMod: edit.action.typeMod,
                 };
                 const node = resolve(
-                  Scope.single(this, { ...table, columns: [oldColumn], pk: [], checks: [], indexes: [], fks: [], exclusions: [] }),
+                  Scope.single(this, {
+                    ...table,
+                    columns: [oldColumn],
+                    pk: [],
+                    checks: [],
+                    indexes: [],
+                    fks: [],
+                    exclusions: [],
+                  }),
                   defaultCast,
                   null,
                   { collecting: false, groupKeys: [], specs: [] },
                   new ParamTypes(),
                 ).node;
                 const m = this.session.newMeter();
-                target = { ...target, default: evalExpr(node, [oldColumn.default], this.maintenanceEnv(new StmtRng()), m) };
+                target = {
+                  ...target,
+                  default: evalExpr(
+                    node,
+                    [oldColumn.default],
+                    this.maintenanceEnv(new StmtRng()),
+                    m,
+                  ),
+                };
                 prepCost += m.accrued;
               } else if (oldColumn.defaultExpr !== null) {
                 if (oldColumn.defaultExpr.unparsed) {
@@ -9154,7 +9618,13 @@ export class Engine {
                   typeName: edit.action.typeName,
                   typeMod: edit.action.typeMod,
                 };
-                resolve(Scope.empty(this), defaultCast, null, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
+                resolve(
+                  Scope.empty(this),
+                  defaultCast,
+                  null,
+                  { collecting: false, groupKeys: [], specs: [] },
+                  new ParamTypes(),
+                );
                 const tm = edit.action.typeMod,
                   tmText = tm === null ? "" : renderTypeMod(tm),
                   typeSql =
@@ -9174,10 +9644,8 @@ export class Engine {
               if (oldColumn.identity !== null) {
                 const oldScalar = typeAsScalar(oldColumn.type),
                   newScalar = typeAsScalar(target.type),
-                  oldDtype =
-                    oldScalar === undefined ? undefined : seqDataTypeForScalar(oldScalar),
-                  newDtype =
-                    newScalar === undefined ? undefined : seqDataTypeForScalar(newScalar);
+                  oldDtype = oldScalar === undefined ? undefined : seqDataTypeForScalar(oldScalar),
+                  newDtype = newScalar === undefined ? undefined : seqDataTypeForScalar(newScalar);
                 if (oldDtype === undefined || newDtype === undefined)
                   throw new Error("identity column is integer");
                 const slot = identitySequenceSlot(ci);
@@ -9199,8 +9667,7 @@ export class Engine {
               for (const check of table.checks) addedConstraints.add(check.name);
               for (const index of table.indexes) addedConstraints.add(index.name);
               for (const fk of table.fks) addedConstraints.add(fk.name);
-              for (const exclusion of table.exclusions)
-                addedConstraints.add(exclusion.name);
+              for (const exclusion of table.exclusions) addedConstraints.add(exclusion.name);
               break;
             }
           }
@@ -9224,8 +9691,7 @@ export class Engine {
           if (k.kind === "column" && typeChangedColumns[k.column])
             this.checkIndexColumnType(index.kind, table.columns[k.column]!.type);
       for (const fk of table.fks) {
-        const parent =
-          fk.refTable === table.name ? table : snap.table(fk.refTable)!;
+        const parent = fk.refTable === table.name ? table : snap.table(fk.refTable)!;
         fk.columns.forEach((local, i) => {
           const ref = fk.refColumns[i]!;
           if (!fkTypesComparable(table.columns[local]!.type, parent.columns[ref]!.type))
@@ -9263,9 +9729,7 @@ export class Engine {
     const alterPageSize = attachmentScope ? this.attachPageSize(at.db!) : this.pageSize;
     const rewriteNeeded =
       columnSources.length !== original.columns.length ||
-      columnSources.some(
-        (source, i) => source.kind !== "original" || source.column !== i,
-      );
+      columnSources.some((source, i) => source.kind !== "original" || source.column !== i);
     const clearStatistics = rowSteps.some(
       (step) => step.kind === "drop" || step.kind === "setType",
     );
@@ -9277,10 +9741,9 @@ export class Engine {
       }) ||
       table.pk.some((column) => typeChangedColumns[column]);
     const tableRewriteNeeded = rewriteNeeded || rowSteps.length > 0 || pkRekeyed;
-    const rewriteColTypes =
-      !tableRewriteNeeded
-        ? null
-        : table.columns.map((c) => resolveColType(c.type, this.readSnap().types));
+    const rewriteColTypes = !tableRewriteNeeded
+      ? null
+      : table.columns.map((c) => resolveColType(c.type, this.readSnap().types));
     const meter = this.session.newMeter();
     meter.charge(prepCost);
     meter.guard();
@@ -9295,7 +9758,9 @@ export class Engine {
       const scan = store.scanWithUnits(original.columns.map(() => true));
       rewriteNextRowid = store.nextSyntheticRowid();
       if (pkRekeyed && table.pk.length === 0) rewriteNextRowid = 0n;
-      meter.charge(COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs));
+      meter.charge(
+        COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs),
+      );
       const rng = new StmtRng();
       const env = this.maintenanceEnv(rng);
       const colls = this.columnCollations(table.columns);
@@ -9378,15 +9843,16 @@ export class Engine {
       // Presence in this map is also the publication-time identity marker for a newly-added backing
       // index. Seed empty indexes so DROP+ADD name reuse cannot retain the old store.
       for (const index of table.indexes)
-        if (addedConstraints.has(index.name))
-          constraintEntries.set(index.name, []);
+        if (addedConstraints.has(index.name)) constraintEntries.set(index.name, []);
       const store = this.lkpStoreScoped(at.db, original.name),
         all =
           rewriteRows === null
             ? store.scanWithUnits(table.columns.map(() => true))
             : { entries: rewriteRows, pages: 0, slabs: 0 };
       if (rewriteRows === null)
-        meter.charge(COSTS.pageRead * BigInt(all.pages) + COSTS.valueDecompress * BigInt(all.slabs));
+        meter.charge(
+          COSTS.pageRead * BigInt(all.pages) + COSTS.valueDecompress * BigInt(all.slabs),
+        );
       // Only the checks this statement validates (an ADD CONSTRAINT, or every check after ALTER COLUMN
       // TYPE) are resolved, so an existing stale check never blocks an unrelated ADD (spec/design/
       // extensibility.md §7.1.2). Each validated check is evaluated against EVERY row with the current
@@ -9460,17 +9926,21 @@ export class Engine {
             }
           }
           const es = constraintEntries.get(k) ?? [];
-          for (const ek of this.indexEntries(table.columns, alterColTypes, colls, ri, entry.key, row))
+          for (const ek of this.indexEntries(
+            table.columns,
+            alterColTypes,
+            colls,
+            ri,
+            entry.key,
+            row,
+          ))
             es.push({ key: ek, skeyLen: entry.key.length });
           constraintEntries.set(k, es);
         }
       }
       for (const fk of table.fks)
         if (addedConstraints.has(fk.name)) {
-          const parent =
-            fk.refTable === table.name
-              ? table
-              : snap.table(fk.refTable)!;
+          const parent = fk.refTable === table.name ? table : snap.table(fk.refTable)!;
           const pc = this.columnCollations(parent.columns);
           for (const entry of all.entries) {
             const row = store.resolveInlineColumns(entry.row);
@@ -9544,7 +10014,14 @@ export class Engine {
         const resolved = this.resolveIndex(table, index);
         const entries: IndexEntry[] = [];
         for (const row of rewriteRows!)
-          for (const ek of this.indexEntries(table.columns, rewriteColTypes!, colls, resolved, row.key, row.row))
+          for (const ek of this.indexEntries(
+            table.columns,
+            rewriteColTypes!,
+            colls,
+            resolved,
+            row.key,
+            row.row,
+          ))
             entries.push({ key: ek, skeyLen: row.key.length });
         sortIndexEntries(entries);
         constraintEntries.set(index.name, entries);
@@ -9572,17 +10049,14 @@ export class Engine {
       ws.alterTableRewrite(table, rewriteColTypes!, rewriteRows, rewriteNextRowid, alterPageSize);
     } else ws.alterTableCatalog(oldKey, table, renameTable, indexRename);
     if (clearStatistics) ws.clearStatistics(table.name);
-    if (rekeyed)
-      ws.rebuildAlterIndexes(original, table, constraintEntries, alterPageSize);
+    if (rekeyed) ws.rebuildAlterIndexes(original, table, constraintEntries, alterPageSize);
     else
       ws.syncAlterConstraintIndexes(original, table, constraintEntries, alterPageSize, indexRename);
     for (const cols of cascadeUniqueCols) {
       for (const [key, child] of [...ws.tables]) {
         if (child.name === table.name) continue;
         const fks = child.fks.filter(
-          (fk) =>
-            fk.refTable !== table.name ||
-            !sameSet(sortedUnique(fk.refColumns), cols),
+          (fk) => fk.refTable !== table.name || !sameSet(sortedUnique(fk.refColumns), cols),
         );
         if (fks.length !== child.fks.length) {
           ws.bumpCatGen(); // direct catalog writes must still mark main changed (changedSince)
@@ -9667,7 +10141,16 @@ export class Engine {
       return {
         ...col,
         default: withAssignmentHint(() =>
-          storeValue(lit, sty, col.decimal, col.varcharLen, col.temporal, false, col.name, this.inputZone()),
+          storeValue(
+            lit,
+            sty,
+            col.decimal,
+            col.varcharLen,
+            col.temporal,
+            false,
+            col.name,
+            this.inputZone(),
+          ),
         ),
         defaultExpr: null,
       };
@@ -9702,10 +10185,7 @@ export class Engine {
     let temporal: TemporalTypmod | null = null;
     if (serialKind !== undefined) {
       if (def.typeMod !== null)
-        throw engineError(
-          "syntax_error",
-          `type modifier is not allowed for type ${def.typeName}`,
-        );
+        throw engineError("syntax_error", `type modifier is not allowed for type ${def.typeName}`);
       type = scalarT(serialKind);
     } else if (def.typeName.endsWith("[]")) {
       if (def.typeMod !== null)
@@ -9776,11 +10256,7 @@ export class Engine {
       varcharLen,
       temporal,
       primaryKey: def.primaryKey,
-      notNull:
-        def.primaryKey ||
-        def.notNull ||
-        serialKind !== undefined ||
-        def.identity !== null,
+      notNull: def.primaryKey || def.notNull || serialKind !== undefined || def.identity !== null,
       default: null,
       defaultExpr: null,
       identity: null,
@@ -9792,9 +10268,7 @@ export class Engine {
           "invalid_table_definition",
           `multiple primary keys for table ${table.name} are not allowed`,
         );
-      if (
-        !this.typeIsKeyable(type)
-      )
+      if (!this.typeIsKeyable(type))
         throw engineError(
           "feature_not_supported",
           `a ${typeCanonicalName(type)} primary key is not supported yet`,
@@ -9842,8 +10316,7 @@ export class Engine {
       col = {
         ...col,
         defaultExpr: { exprText, expr: parseExpression(exprText) },
-        identity:
-          def.identity === null ? null : def.identity.always ? "always" : "byDefault",
+        identity: def.identity === null ? null : def.identity.always ? "always" : "byDefault",
       };
     } else if (type.kind === "array" || type.kind === "range") {
       // A bare DEFAULT NULL is the same as no default (see executeCreateTable).
@@ -9910,12 +10383,16 @@ export class Engine {
   // `parentTable` is the referenced table's name, in the FK's domain (`temp`). Unmetered, like the
   // PK/UNIQUE probes (cost.md §3).
   private fkProbeHits(probe: FkProbe, parentTable: string, temp: boolean): boolean {
+    return runSync(this.fkProbeHitsSteps(probe, parentTable, temp));
+  }
+
+  private *fkProbeHitsSteps(probe: FkProbe, parentTable: string, temp: boolean): Steps<boolean> {
     if (probe.kind === "absent") return false;
     if (probe.kind === "pk") {
-      return this.fkSnap(temp).store(parentTable).get(probe.bytes) !== undefined;
+      return (yield* this.fkSnap(temp).store(parentTable).getSteps(probe.bytes)) !== undefined;
     }
     const index = this.fkSnap(temp).indexStore(probe.index);
-    return index.rangeEntries(uniqueProbeBound(probe.prefix)).length > 0;
+    return (yield* index.rangeEntriesSteps(uniqueProbeBound(probe.prefix))).length > 0;
   }
 
   // fkChildReferences reports whether any row of `childTable` references the parent tuple via `fk` —
@@ -9935,40 +10412,53 @@ export class Engine {
     temp: boolean,
     meter: Meter,
   ): boolean {
+    return runSync(
+      this.fkChildReferencesSteps(childTable, fk, parent, values, target, temp, meter),
+    );
+  }
+
+  private *fkChildReferencesSteps(
+    childTable: string,
+    fk: ForeignKey,
+    parent: Table,
+    values: Value[],
+    target: Uint8Array,
+    temp: boolean,
+    meter: Meter,
+  ): Steps<boolean> {
     const snap = this.fkSnap(temp);
     const child = snap.table(childTable);
     if (child === undefined) throw engineError("data_corrupted", "foreign-key child exists");
     const store = snap.store(childTable);
     const path = fkChooseReversePath(snap, fk, child, parent);
     if (path !== null) {
-      const prefix = this.fkReversePrefix(path, fk, child, values);
+      const prefix = yield* this.fkReversePrefixSteps(path, fk, child, values);
       if (prefix === null) return false;
       const bound = uniqueProbeBound(prefix);
       const tree = path.index === null ? store : snap.indexStore(path.index);
       meter.charge(COSTS.pageRead * BigInt(tree.overlapNodeCount(bound)));
       meter.guard();
-      let found = false;
-      tree.scanRange(bound, () => {
-        found = true;
-        return false;
-      });
-      return found;
+      const first = yield* tree.scanStepsIter(bound, false).nextSteps();
+      return !first.done;
     }
     const mask = store.columnTypes().map(() => false);
-    for (const column of fk.columns) mask[column] = true;
-    const { pages, slabs } = store.scanUnits(mask);
+    for (const column of fk.columns) {
+      if (shouldCooperate()) yield COOPERATE;
+      mask[column] = true;
+    }
+    const { pages, slabs } = yield* store.scanUnitsSteps(mask);
     meter.charge(COSTS.pageRead * BigInt(pages) + COSTS.valueDecompress * BigInt(slabs));
     meter.guard();
     // target is in the parent's stored-key byte space, so the child probe encodes a collated parent
     // key column with the PARENT's collation (§2.12).
     const parentColls = this.columnCollations(parent.columns);
     let found = false;
-    store.scanRange(unboundedBound(), (_key, stored) => {
+    yield* store.scanRangeSteps(unboundedBound(), function* (_key, stored) {
       meter.charge(COSTS.storageRowRead);
       meter.guard();
       // Persisted child rows may defer even inline values. Leave unrelated payloads deferred.
-      const row = store.resolveColumns(stored, mask);
-      const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
+      const row = yield* store.resolveColumnsSteps(stored, mask);
+      const probe = yield* fkProbeSteps(fk, parent, parentColls, row, fk.columns);
       if (probe !== null && bytesEq(fkProbeBytes(probe), target)) {
         found = true;
         return false;
@@ -9989,11 +10479,22 @@ export class Engine {
     child: Table,
     values: Value[],
   ): Uint8Array | null {
+    return runSync(this.fkReversePrefixSteps(path, fk, child, values));
+  }
+
+  private *fkReversePrefixSteps(
+    path: FkReversePath,
+    fk: ForeignKey,
+    child: Table,
+    values: Value[],
+  ): Steps<Uint8Array | null> {
     const childColls = this.columnCollations(child.columns);
     const parts: Uint8Array[] = [];
     for (let i = 0; i < path.cols.length; i++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const c = path.cols[i]!;
-      const value = fkValueAs(child.columns[c]!.type, values[fk.columns.indexOf(c)]!);
+      const value = yield* fkValueAsSteps(child.columns[c]!.type, values[fk.columns.indexOf(c)]!);
       if (value === null) return null;
       const b = encodeTypedKey(child.columns[c]!.type, value, childColls[c] ?? null);
       if (path.index !== null) keyOrderPushPresent(parts, path.orders[i]!, b);
@@ -10012,6 +10513,16 @@ export class Engine {
     next: Value[][] | null,
     temp: boolean,
   ): FkKeyedTarget {
+    return runSync(this.newFkKeyedTargetSteps(parent, fk, old, next, temp));
+  }
+
+  private *newFkKeyedTargetSteps(
+    parent: Table,
+    fk: ForeignKey,
+    old: Value[][],
+    next: Value[][] | null,
+    temp: boolean,
+  ): Steps<FkKeyedTarget> {
     const t: FkKeyedTarget = {
       temp,
       parent,
@@ -10021,15 +10532,24 @@ export class Engine {
       next: next !== null ? [] : null,
       keys: new Map(),
     };
-    old.forEach((tuple, i) => {
-      const probe = fkProbe(fk, parent, t.parentColls, tuple, fkSlotOrdinals(tuple.length));
-      if (probe === null) return;
+    for (let i = 0; i < old.length; i++) {
+      if (shouldCooperate()) yield COOPERATE;
+
+      const tuple = old[i]!;
+      const probe = yield* fkProbeSteps(
+        fk,
+        parent,
+        t.parentColls,
+        tuple,
+        fkSlotOrdinals(tuple.length),
+      );
+      if (probe === null) continue;
       const key = fkProbeBytes(probe).join(",");
-      if (t.keys.has(key)) return;
+      if (t.keys.has(key)) continue;
       t.keys.set(key, t.tuples.length);
       t.tuples.push(tuple);
       if (next !== null) t.next!.push(next[i]!);
-    });
+    }
     return t;
   }
 
@@ -10039,13 +10559,21 @@ export class Engine {
   // (or the full-scan block); the caller charges it, then storageRowRead per entry, then applies
   // fkKeyedMatch as the row filter.
   private fkKeyedScan(t: FkKeyedTarget, childTable: string, mask: boolean[]): MutationScanBatch {
+    return runSync(this.fkKeyedScanSteps(t, childTable, mask));
+  }
+
+  private *fkKeyedScanSteps(
+    t: FkKeyedTarget,
+    childTable: string,
+    mask: boolean[],
+  ): Steps<MutationScanBatch> {
     const snap = this.fkSnap(t.temp);
     const child = snap.table(childTable);
     if (child === undefined) throw engineError("data_corrupted", "foreign-key child exists");
     const store = snap.store(childTable);
     const path = fkChooseReversePath(snap, t.fk, child, t.parent);
     if (path === null) {
-      const r = store.scanWithUnits(mask);
+      const r = yield* store.scanWithUnitsSteps(mask);
       return { entries: r.entries, pages: r.pages, slabs: r.slabs, empty: false };
     }
     const suffix: KeySlot[] = [];
@@ -10053,6 +10581,8 @@ export class Engine {
       const ix = child.indexes.find((i) => i.name === path.index);
       if (ix !== undefined) {
         for (let i = path.cols.length; i < ix.keys.length; i++) {
+          if (shouldCooperate()) yield COOPERATE;
+
           const key = ix.keys[i]!;
           if (key.kind !== "column") continue;
           const col = child.columns[key.column]!;
@@ -10064,13 +10594,15 @@ export class Engine {
     const out: MutationScanBatch = { entries: [], pages: 0, slabs: 0, empty: false };
     const seen = new Set<string>();
     for (const tuple of t.tuples) {
-      const prefix = this.fkReversePrefix(path, t.fk, child, tuple);
+      if (shouldCooperate()) yield COOPERATE;
+
+      const prefix = yield* this.fkReversePrefixSteps(path, t.fk, child, tuple);
       if (prefix === null) continue;
       const bound = uniqueProbeBound(prefix);
       const r =
         path.index === null
-          ? store.rangeScanWithUnits(bound, mask)
-          : indexStoreBoundEntries(
+          ? yield* store.rangeScanWithUnitsSteps(bound, mask)
+          : yield* indexStoreBoundEntriesSteps(
               snap.indexStore(path.index),
               store,
               suffix,
@@ -10081,6 +10613,8 @@ export class Engine {
       out.pages += r.pages;
       out.slabs += r.slabs;
       for (const e of r.entries) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const key = e.key.join(",");
         if (seen.has(key)) continue;
         seen.add(key);
@@ -10156,7 +10690,7 @@ export class Engine {
     // Resolve the access method (spec/design/gin.md §3): undefined / "btree" is the ordered
     // B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
     // parser) so the error is the resolve-time undefined_object, after the table-exists check.
-    const method = (ci.using ?? "btree");
+    const method = ci.using ?? "btree";
     let kind: "btree" | "gin" | "gist";
     if (method === "btree") kind = "btree";
     else if (method === "gin") kind = "gin";
@@ -10598,7 +11132,16 @@ export class Engine {
           const k = prefix.join(",");
           if (seenPrefixes.has(k)) {
             throw uniqueViolation(table.name, def.name).withDetail(
-              indexDetail(this.session, table.name, columns, def, rindex, row, env, DETAIL_DUPLICATED),
+              indexDetail(
+                this.session,
+                table.name,
+                columns,
+                def,
+                rindex,
+                row,
+                env,
+                DETAIL_DUPLICATED,
+              ),
             );
           }
           seenPrefixes.add(k);
@@ -10894,14 +11437,10 @@ export class Engine {
       const exprText = nextvalDefaultText(newName);
       // Route to the owner's scope so a renamed owned TEMP sequence rewrites its column default in the
       // temp snapshot (temp-tables.md §8).
-      this.setColumnDefaultExprRouted(
-        existing.ownedBy.table,
-        existing.ownedBy.column,
-        {
-          exprText,
-          expr: parseExpression(exprText),
-        },
-      );
+      this.setColumnDefaultExprRouted(existing.ownedBy.table, existing.ownedBy.column, {
+        exprText,
+        expr: parseExpression(exprText),
+      });
     }
     // The views that name the sequence keep naming it (views.md §7.2).
     this.renameSequenceInViews(existing.name, newName);
@@ -10934,7 +11473,18 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { rows: Row[]; pages: number; slabs: number } {
-    const r = this.indexBoundEntries(tableName, ib, params, outer, mask, left);
+    return runSync(this.indexBoundRowsSteps(tableName, ib, params, outer, mask, left));
+  }
+
+  *indexBoundRowsSteps(
+    tableName: string,
+    ib: IndexBound,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+  ): Steps<{ rows: Row[]; pages: number; slabs: number }> {
+    const r = yield* this.indexBoundEntriesSteps(tableName, ib, params, outer, mask, left);
     return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
   }
 
@@ -10947,9 +11497,20 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { entries: Entry[]; pages: number; slabs: number } {
+    return runSync(this.indexBoundEntriesSteps(tableName, ib, params, outer, mask, left));
+  }
+
+  *indexBoundEntriesSteps(
+    tableName: string,
+    ib: IndexBound,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+  ): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
     const built = buildIndexBound(ib, params, outer, left);
     if (built === null) return { entries: [], pages: 0, slabs: 0 };
-    return this.indexScanBoundEntries(
+    return yield* this.indexScanBoundEntriesSteps(
       tableName,
       ib.nameKey,
       ib.suffix,
@@ -10974,7 +11535,25 @@ export class Engine {
     prefixByteLen: number,
     mask: boolean[],
   ): { rows: Row[]; pages: number; slabs: number } {
-    const r = this.indexScanBoundEntries(tableName, nameKey, suffix, b, prefixByteLen, mask);
+    return runSync(this.indexScanBoundSteps(tableName, nameKey, suffix, b, prefixByteLen, mask));
+  }
+
+  *indexScanBoundSteps(
+    tableName: string,
+    nameKey: string,
+    suffix: KeySlot[],
+    b: KeyBound,
+    prefixByteLen: number,
+    mask: boolean[],
+  ): Steps<{ rows: Row[]; pages: number; slabs: number }> {
+    const r = yield* this.indexScanBoundEntriesSteps(
+      tableName,
+      nameKey,
+      suffix,
+      b,
+      prefixByteLen,
+      mask,
+    );
     return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
   }
 
@@ -10987,7 +11566,20 @@ export class Engine {
     prefixByteLen: number,
     mask: boolean[],
   ): { entries: Entry[]; pages: number; slabs: number } {
-    return indexStoreBoundEntries(
+    return runSync(
+      this.indexScanBoundEntriesSteps(tableName, nameKey, suffix, b, prefixByteLen, mask),
+    );
+  }
+
+  *indexScanBoundEntriesSteps(
+    tableName: string,
+    nameKey: string,
+    suffix: KeySlot[],
+    b: KeyBound,
+    prefixByteLen: number,
+    mask: boolean[],
+  ): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
+    return yield* indexStoreBoundEntriesSteps(
       this.lkpIndexStore(nameKey),
       this.lkpStore(tableName),
       suffix,
@@ -10996,7 +11588,6 @@ export class Engine {
       mask,
     );
   }
-
 
   // Execute canonical logical intervals over the row's own B-tree. Storage keys are retained for
   // mutation consumers, and each disjoint interval's page/slab block is summed.
@@ -11008,12 +11599,27 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { entries: Entry[]; pages: number; slabs: number } {
+    return runSync(this.pkKeySetRowsSteps(store, ks, params, outer, mask, left));
+  }
+
+  *pkKeySetRowsSteps(
+    store: TableStore,
+    ks: PkKeySet,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+  ): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
     const entries: Entry[] = [];
     let pages = 0;
     let slabs = 0;
     for (const b of pkKeySetIntervals(ks, params, outer, left)) {
-      const u = store.rangeScanWithUnits(b, mask);
-      for (const e of u.entries) entries.push(e);
+      if (shouldCooperate()) yield COOPERATE;
+      const u = yield* store.rangeScanWithUnitsSteps(b, mask);
+      for (const e of u.entries) {
+        if (shouldCooperate()) yield COOPERATE;
+        entries.push(e);
+      }
       pages += u.pages;
       slabs += u.slabs;
     }
@@ -11030,7 +11636,18 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { rows: Row[]; pages: number; slabs: number } {
-    const r = this.indexKeySetEntries(tableName, ks, params, outer, mask, left);
+    return runSync(this.indexKeySetRowsSteps(tableName, ks, params, outer, mask, left));
+  }
+
+  *indexKeySetRowsSteps(
+    tableName: string,
+    ks: IndexKeySet,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+  ): Steps<{ rows: Row[]; pages: number; slabs: number }> {
+    const r = yield* this.indexKeySetEntriesSteps(tableName, ks, params, outer, mask, left);
     return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
   }
 
@@ -11042,11 +11659,24 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { entries: Entry[]; pages: number; slabs: number } {
+    return runSync(this.indexKeySetEntriesSteps(tableName, ks, params, outer, mask, left));
+  }
+
+  *indexKeySetEntriesSteps(
+    tableName: string,
+    ks: IndexKeySet,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+  ): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
     const entries: Entry[] = [];
     let pages = 0;
     let slabs = 0;
     for (const probe of indexKeySetProbes(ks, params, outer, left)) {
-      const r = this.indexScanBoundEntries(
+      if (shouldCooperate()) yield COOPERATE;
+
+      const r = yield* this.indexScanBoundEntriesSteps(
         tableName,
         ks.nameKey,
         probe.suffix,
@@ -11054,7 +11684,10 @@ export class Engine {
         probe.prefixLen,
         mask,
       );
-      for (const entry of r.entries) entries.push(entry);
+      for (const entry of r.entries) {
+        if (shouldCooperate()) yield COOPERATE;
+        entries.push(entry);
+      }
       pages += r.pages;
       slabs += r.slabs;
     }
@@ -11072,40 +11705,54 @@ export class Engine {
     meter: Meter,
     mask: boolean[],
   ): MutationScanBatch {
+    return runSync(
+      this.executeMutationScanSteps(plan, tableName, filter, params, env, meter, mask),
+    );
+  }
+
+  private *executeMutationScanSteps(
+    plan: MutationScanPlan,
+    tableName: string,
+    filter: RExpr | null,
+    params: Value[],
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+  ): Steps<MutationScanBatch> {
     // A WHERE contradiction (planner.md §3.1) reads no page and no row, and so charges nothing.
     if (plan.contradiction) return { entries: [], pages: 0, slabs: 0, empty: true };
     const store = this.lkpStoreScoped(plan.db, tableName);
     const b = plan.bound;
     if (b === null) {
-      const r = store.scanWithUnits(mask);
+      const r = yield* store.scanWithUnitsSteps(mask);
       return { entries: r.entries, pages: r.pages, slabs: r.slabs, empty: false };
     }
     switch (b.kind) {
       case "pk": {
-        const r = scanEntries(store, b.pk, params, mask);
+        const r = yield* scanEntriesSteps(store, b.pk, params, mask);
         if (r.entries === null) return { entries: [], pages: 0, slabs: 0, empty: true };
         return { entries: r.entries, pages: r.overlap, slabs: r.slabs, empty: false };
       }
       case "index": {
-        const r = this.indexBoundEntries(tableName, b.index, params, [], mask, []);
+        const r = yield* this.indexBoundEntriesSteps(tableName, b.index, params, [], mask, []);
         return { ...r, empty: false };
       }
       case "gin": {
         const q = filter !== null ? ginQueryOperand(filter, b.gin) : null;
-        const r = this.ginBoundRows(tableName, b.gin, q, [], env, meter, mask);
+        const r = yield* this.ginBoundRowsSteps(tableName, b.gin, q, [], env, meter, mask);
         return { ...r, empty: false };
       }
       case "gist": {
         const q = filter !== null ? gistQueryOperand(filter, b.gist) : null;
-        const r = this.gistBoundRows(tableName, b.gist, q, [], env, meter, mask);
+        const r = yield* this.gistBoundRowsSteps(tableName, b.gist, q, [], env, meter, mask);
         return { ...r, empty: false };
       }
       case "pkSet": {
-        const r = this.pkKeySetRows(store, b.pkSet, params, [], mask, []);
+        const r = yield* this.pkKeySetRowsSteps(store, b.pkSet, params, [], mask, []);
         return { ...r, empty: false };
       }
       case "indexSet": {
-        const r = this.indexKeySetEntries(tableName, b.indexSet, params, [], mask, []);
+        const r = yield* this.indexKeySetEntriesSteps(tableName, b.indexSet, params, [], mask, []);
         // Retain first-probe order while guaranteeing that phase 2 can never receive the same row
         // twice if a future index-key generalization makes point-probe result sets overlap.
         const seen = new Set<string>();
@@ -11141,6 +11788,21 @@ export class Engine {
     mask: boolean[],
     keysOnly = false,
   ): { entries: Entry[]; pages: number; slabs: number } {
+    return runSync(
+      this.ginBoundRowsSteps(tableName, gb, query, queryRow, env, meter, mask, keysOnly),
+    );
+  }
+
+  *ginBoundRowsSteps(
+    tableName: string,
+    gb: GinBound,
+    query: RExpr | null,
+    queryRow: Row,
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+    keysOnly = false,
+  ): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
     const store = this.lkpStore(tableName);
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
     // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
@@ -11155,14 +11817,15 @@ export class Engine {
           );
     const queries: GinTree[] = [];
     for (const arm of arms) {
-      const qv = evalExpr(arm.query, queryRow, env, env.exec.session.scratchMeter());
+      if (shouldCooperate()) yield COOPERATE;
+      const qv = yield* evalExprSteps(arm.query, queryRow, env, env.exec.session.scratchMeter());
       const extracted = ginQueryTerms(arm.strategy, gb.elemType, qv);
       if (extracted.kind === "empty") continue;
       if (extracted.kind === "fullScan") {
         // Rows the index cannot enumerate (they carry no terms) may match: scan them all and let the
         // residual filter keep the right ones (gin.md §6 / §2.1). One such arm makes the whole
         // disjunction fall back.
-        const u = store.scanWithUnits(mask);
+        const u = yield* store.scanWithUnitsSteps(mask);
         return { entries: u.entries, pages: u.pages, slabs: u.slabs };
       }
       const tree =
@@ -11182,21 +11845,28 @@ export class Engine {
     // The candidate storage keys, ascending byte (= storage-key) order, so the point lookups and
     // emitted rows follow storage order exactly as a full scan (gin.md §6/§8). A disjunction unions
     // each arm's candidates, arms in source order (gin.md §6.3).
-    const cand =
-      queries.length === 1
-        ? gather.eval(queries[0]!)
-        : unionPostings(queries.map((q) => gather.eval(q)));
+    let cand: Uint8Array[];
+    if (queries.length === 1) cand = yield* gather.evalSteps(queries[0]!);
+    else {
+      const postings: Uint8Array[][] = [];
+      for (const query of queries) {
+        if (shouldCooperate()) yield COOPERATE;
+        postings.push(yield* gather.evalSteps(query));
+      }
+      cand = unionPostings(postings);
+    }
     meter.charge(COSTS.ginEntry * BigInt(gather.entries));
     let pages = gather.pages;
 
     let slabs = 0;
     const entries: Entry[] = [];
     for (const key of cand) {
+      if (shouldCooperate()) yield COOPERATE;
       if (keysOnly) {
         entries.push({ key, row: [] });
         continue;
       }
-      const u = store.getWithUnits(key, mask);
+      const u = yield* store.getWithUnitsSteps(key, mask);
       pages += u.pages;
       slabs += u.slabs;
       if (u.row === undefined)
@@ -11225,10 +11895,25 @@ export class Engine {
     mask: boolean[],
     keysOnly = false,
   ): { entries: Entry[]; pages: number; slabs: number } {
+    return runSync(
+      this.gistBoundRowsSteps(tableName, gb, query, queryRow, env, meter, mask, keysOnly),
+    );
+  }
+
+  *gistBoundRowsSteps(
+    tableName: string,
+    gb: GistBound,
+    query: RExpr | null,
+    queryRow: Row,
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+    keysOnly = false,
+  ): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
     const store = this.lkpStore(tableName);
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
     // Extracting a constant or once-per-outer sibling query is a planning step, NOT metered.
-    const qv = evalExpr(query, queryRow, env, env.exec.session.scratchMeter());
+    const qv = yield* evalExprSteps(query, queryRow, env, env.exec.session.scratchMeter());
     // Form the resident-tree search query from the constant, handling strategy-specific degenerate
     // cases. A NULL query is never TRUE for any row (all strategies).
     let gq: GistQuery;
@@ -11243,7 +11928,7 @@ export class Engine {
           // col @> 'empty' is TRUE for every row, but an empty bound is absorbed by the union, so it
           // is invisible to the overlap-descend (a false-negative trap, gist.md §5). Fall back to the
           // full scan; the residual @> keeps every row.
-          const u = store.scanWithUnits(mask);
+          const u = yield* store.scanWithUnitsSteps(mask);
           return { entries: u.entries, pages: u.pages, slabs: u.slabs };
         }
         return { entries: [], pages: 0, slabs: 0 }; // col && 'empty' overlaps nothing
@@ -11265,16 +11950,18 @@ export class Engine {
     skeys.sort(cmpBytes);
     const deduped: Uint8Array[] = [];
     for (const k of skeys) {
+      if (shouldCooperate()) yield COOPERATE;
       if (deduped.length === 0 || cmpBytes(deduped[deduped.length - 1]!, k) !== 0) deduped.push(k);
     }
     let slabs = 0;
     const entries: Entry[] = [];
     for (const key of deduped) {
+      if (shouldCooperate()) yield COOPERATE;
       if (keysOnly) {
         entries.push({ key, row: [] });
         continue;
       }
-      const u = store.getWithUnits(key, mask);
+      const u = yield* store.getWithUnitsSteps(key, mask);
       pages += u.pages;
       slabs += u.slabs;
       if (u.row === undefined)
@@ -11302,16 +11989,27 @@ export class Engine {
     holder: InsertCacheHolder | null,
     allowFill: boolean,
   ): Outcome {
+    return runSync(this.executeInsertCachedSteps(ins, params, ctx, holder, allowFill));
+  }
+
+  private *executeInsertCachedSteps(
+    ins: Insert,
+    params: Value[],
+    ctx: CteCtx,
+    holder: InsertCacheHolder | null,
+    allowFill: boolean,
+  ): Steps<Outcome> {
     // INSERT ... SELECT and ON CONFLICT keep the general planner. Writable-CTE INSERTs call
     // executeInsert directly, so this route is necessarily a top-level plain VALUES statement. A write
     // through a view (views.md §15) also takes the general path, which retargets it.
     if (ins.source.kind !== "values" || ins.onConflict !== null) {
-      return this.executeInsert(ins, params, ctx);
+      return yield* this.executeInsertSteps(ins, params, ctx);
     }
     checkCatalogRelWrite(ins.table);
     this.checkAttachmentWritable(ins.db);
-    if (this.dmlTargetView(ins.db, ins.table) !== undefined) return this.executeInsert(ins, params, ctx);
-    return this.executeInsertValuesCached(ins, params, ctx, holder, allowFill);
+    if (this.dmlTargetView(ins.db, ins.table) !== undefined)
+      return yield* this.executeInsertSteps(ins, params, ctx);
+    return yield* this.executeInsertValuesCachedSteps(ins, params, ctx, holder, allowFill);
   }
 
   // The exact catalog signature of a persistent INSERT target. A bare name that currently resolves
@@ -11368,10 +12066,7 @@ export class Engine {
 
   private insertSignatureMatches(a: InsertTargetSignature, b: InsertTargetSignature): boolean {
     return (
-      a.core === b.core &&
-      a.database === b.database &&
-      a.catGen === b.catGen &&
-      a.table === b.table
+      a.core === b.core && a.database === b.database && a.catGen === b.catGen && a.table === b.table
     );
   }
 
@@ -11435,11 +12130,25 @@ export class Engine {
     ctx: CteCtx,
     meter: Meter,
   ): void {
+    return runSync(this.foldValueExprsSteps(valueExprs, bound, ctx, meter));
+  }
+
+  private *foldValueExprsSteps(
+    valueExprs: (RExpr | null)[][],
+    bound: Value[],
+    ctx: CteCtx,
+    meter: Meter,
+  ): Steps<void> {
     const foldCost = { value: 0n };
     for (const row of valueExprs) {
+      if (shouldCooperate()) yield COOPERATE;
+
       for (let p = 0; p < row.length; p++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const node = row[p]!;
-        if (node !== null) row[p] = this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost);
+        if (node !== null)
+          row[p] = yield* this.foldUncorrelatedInRExprSteps(node, bound, ctx, foldCost);
       }
     }
     meter.charge(foldCost.value);
@@ -11454,6 +12163,16 @@ export class Engine {
     ctx: CteCtx,
     meter: Meter,
   ): Value {
+    return runSync(this.evalValueExprSteps(node, params, rng, ctx, meter));
+  }
+
+  private *evalValueExprSteps(
+    node: RExpr | null | undefined,
+    params: Value[],
+    rng: StmtRng,
+    ctx: CteCtx,
+    meter: Meter,
+  ): Steps<Value> {
     if (node === null || node === undefined) {
       throw new Error("every VALUES expression slot is resolved before materialization");
     }
@@ -11462,12 +12181,13 @@ export class Engine {
       params,
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctx),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, params, ctx),
       environment: this.session.environment,
       rng,
       ctes: ctx,
       exec: this,
     };
-    return evalExpr(node, [], env, meter);
+    return yield* evalExprSteps(node, [], env, meter);
   }
 
   private executeInsertValuesCached(
@@ -11477,13 +12197,26 @@ export class Engine {
     holder: InsertCacheHolder | null,
     allowFill: boolean,
   ): Outcome {
+    return runSync(this.executeInsertValuesCachedSteps(ins, params, ctx, holder, allowFill));
+  }
+
+  private *executeInsertValuesCachedSteps(
+    ins: Insert,
+    params: Value[],
+    ctx: CteCtx,
+    holder: InsertCacheHolder | null,
+    allowFill: boolean,
+  ): Steps<Outcome> {
     // Keep every dynamic authorization/routing/collation gate ahead of cache lookup. The outer
     // dispatch already checked lifetime admission and privileges for this execution.
     checkCatalogRelWrite(ins.table);
     this.checkAttachmentWritable(ins.db);
     this.checkTargetQualifier(ins.db, ins.table, ins.tableLoc);
     const table = this.lkpTableScoped(ins.db, ins.table);
-    if (!table) throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
+    if (!table)
+      throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(
+        ins.tableLoc,
+      );
     this.ensureCollationsWritable(table.columns);
 
     const signature = this.insertTargetSignature(ins.db, ins.table);
@@ -11500,7 +12233,7 @@ export class Engine {
     }
 
     const committedSignature = this.committedInsertTargetSignature(ins.db, ins.table);
-    const outcome = this.executeInsertValuesPlan(ins, plan, params, ctx);
+    const outcome = yield* this.executeInsertValuesPlanSteps(ins, plan, params, ctx);
     // A working transaction may consume an exactly matching committed entry and may publish only
     // while its visible schema signature still equals committed state. Uncacheable expression
     // shapes, temp targets, and working DDL leave the existing slot untouched.
@@ -11632,6 +12365,15 @@ export class Engine {
     params: Value[],
     ctx: CteCtx,
   ): Outcome {
+    return runSync(this.executeInsertValuesPlanSteps(ins, plan, params, ctx));
+  }
+
+  private *executeInsertValuesPlanSteps(
+    ins: Insert,
+    plan: InsertValuesPlan,
+    params: Value[],
+    ctx: CteCtx,
+  ): Steps<Outcome> {
     const bound = bindParams(params, plan.ptys, this.inputZone());
     const meter = this.session.newMeter();
     const rng = new StmtRng();
@@ -11642,20 +12384,24 @@ export class Engine {
     const useSingle = singleValuesInsertEligible(rowsIn.length, false);
     // Uncorrelated subqueries in VALUES expression slots fold once, before any row is materialized
     // (cost.md §3). Any subquery makes the plan uncacheable, so a cached plan has nothing to fold.
-    if (!plan.cacheable) this.foldValueExprs(plan.valueExprs, bound, ctx, meter);
+    if (!plan.cacheable) yield* this.foldValueExprsSteps(plan.valueExprs, bound, ctx, meter);
     for (let r = 0; r < rowsIn.length; r++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const values = rowsIn[r]!;
       const rv: Value[] = new Array(plan.arity);
       for (let i = 0; i < plan.table.columns.length; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const col = plan.table.columns[i]!;
         const p = plan.provided[i]!;
         if (p < 0) continue;
         const iv = values[p]!;
         const ct = plan.colTypes[i]!;
         if (iv.kind === "default") {
-          rv[p] = this.evalDefault(col, plan.defaultExprs[i]!, rng, meter);
+          rv[p] = yield* this.evalDefaultSteps(col, plan.defaultExprs[i]!, rng, meter);
         } else if (iv.kind === "expr") {
-          rv[p] = this.evalValueExpr(plan.valueExprs[r]![p], bound, rng, ctx, meter);
+          rv[p] = yield* this.evalValueExprSteps(plan.valueExprs[r]![p], bound, rng, ctx, meter);
         } else if (
           ct.kind === "scalar" &&
           ct.scalar === "date" &&
@@ -11682,15 +12428,18 @@ export class Engine {
     let returning = plan.returning?.nodes ?? null;
     if (!plan.cacheable && returning !== null) {
       const foldCost = { value: 0n };
-      returning = returning.map((node) =>
-        this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost),
-      );
+      const folded: RExpr[] = [];
+      for (const node of returning) {
+        if (shouldCooperate()) yield COOPERATE;
+        folded.push(yield* this.foldUncorrelatedInRExprSteps(node, bound, ctx, foldCost));
+      }
+      returning = folded;
       meter.charge(foldCost.value);
     }
     let returned: Value[][] | null;
     try {
       returned = useSingle
-        ? this.insertOne(
+        ? yield* this.insertOneSteps(
             plan.table,
             store,
             ins.db,
@@ -11709,7 +12458,7 @@ export class Engine {
             ctx,
             meter,
           )
-        : this.insertRows(
+        : yield* this.insertRowsSteps(
             plan.table,
             store,
             ins.db,
@@ -11742,11 +12491,15 @@ export class Engine {
   }
 
   private executeInsert(written: Insert, params: Value[], ctx: CteCtx): Outcome {
+    return runSync(this.executeInsertSteps(written, params, ctx));
+  }
+
+  private *executeInsertSteps(written: Insert, params: Value[], ctx: CteCtx): Steps<Outcome> {
     // A SELECT source or ON CONFLICT clause is planned before the values are bound; a probe that
     // read one restarts the statement with the values visible (estimator.md §6.1).
     const planning = Planning.begin();
     try {
-      return this.executeInsertPlanned(written, params, ctx, planning);
+      return yield* this.executeInsertPlannedSteps(written, params, ctx, planning);
     } catch (e) {
       // A writable-CTE child names its own target database (spec/design/error-fields.md §12).
       throw this.stampDatabase(written.db, e);
@@ -11761,6 +12514,15 @@ export class Engine {
     ctx: CteCtx,
     planning: Planning,
   ): Outcome {
+    return runSync(this.executeInsertPlannedSteps(written, params, ctx, planning));
+  }
+
+  private *executeInsertPlannedSteps(
+    written: Insert,
+    params: Value[],
+    ctx: CteCtx,
+    planning: Planning,
+  ): Steps<Outcome> {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
     checkCatalogRelWrite(written.table);
@@ -11781,7 +12543,9 @@ export class Engine {
     }
     const found = this.lkpTableScoped(ins.db, ins.table); // scope-aware temp-first (temp-tables.md §3)
     if (!found) {
-      throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
+      throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(
+        ins.tableLoc,
+      );
     }
     // An INSERT through a view fills its columns from the view column defaults first (views.md
     // §16.1).
@@ -11814,6 +12578,8 @@ export class Engine {
     if (ins.columns !== null) {
       provided.fill(-1);
       for (let p = 0; p < ins.columns.length; p++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const name = ins.columns[p]!;
         const idx = columnIndex(table, name);
         if (idx < 0) {
@@ -11832,7 +12598,10 @@ export class Engine {
       }
       arity = ins.columns.length;
     } else {
-      for (let i = 0; i < n; i++) provided[i] = i;
+      for (let i = 0; i < n; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+        provided[i] = i;
+      }
     }
 
     // IDENTITY column handling (spec/design/sequences.md §13). OVERRIDING USER VALUE discards any
@@ -11841,6 +12610,8 @@ export class Engine {
     // GENERATED ALWAYS gate below so a User-overridden ALWAYS column needs no further check.
     if (ins.overriding === "user") {
       for (let i = 0; i < n; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (table.columns[i]!.identity !== null) provided[i] = -1;
       }
     }
@@ -11858,6 +12629,8 @@ export class Engine {
     const alwaysTargeted: { col: number; pos: number }[] = [];
     if (ins.overriding !== "system") {
       for (let i = 0; i < n; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const col = table.columns[i]!;
         if (col.identity === "always" && provided[i]! >= 0) {
           alwaysTargeted.push({ col: i, pos: provided[i]! });
@@ -11888,27 +12661,37 @@ export class Engine {
           ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw, ins.alias)
           : null;
       const cplan =
-        ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes) : null;
+        ins.onConflict !== null
+          ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes)
+          : null;
       const bound = bindParams(params, ptypes.finalize(), this.inputZone());
-      if (planning.bind(bound)) return restartPlanning(bound, () => this.executeInsert(written, params, ctx));
+      if (planning.bind(bound))
+        return yield* restartPlanningSteps(bound, () =>
+          this.executeInsertSteps(written, params, ctx),
+        );
       const meter = this.session.newMeter();
       const foldCost = { value: 0n };
-      this.foldUncorrelatedInPlan(plan, bound, ctx, foldCost);
+      yield* this.foldUncorrelatedInPlanSteps(plan, bound, ctx, foldCost);
       // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
       // pre-statement snapshot (grammar.md §32). They see the statement's CTE bindings
       // (writable-cte.md) via `ctx`.
       if (ret !== null) {
-        ret.nodes = ret.nodes.map((node) =>
-          this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost),
-        );
+        const folded: RExpr[] = [];
+        for (const node of ret.nodes) {
+          if (shouldCooperate()) yield COOPERATE;
+          folded.push(yield* this.foldUncorrelatedInRExprSteps(node, bound, ctx, foldCost));
+        }
+        ret.nodes = folded;
       }
-      this.foldConflictPlan(cplan, bound, foldCost);
+      yield* this.foldConflictPlanSteps(cplan, bound, foldCost);
       // A check option's uncorrelated subqueries fold once too (views.md §15.6).
       for (const vc of viewChecks) {
-        vc.check = this.foldUncorrelatedInRExpr(vc.check, bound, ctx, foldCost);
+        if (shouldCooperate()) yield COOPERATE;
+
+        vc.check = yield* this.foldUncorrelatedInRExprSteps(vc.check, bound, ctx, foldCost);
       }
       meter.charge(foldCost.value);
-      const q = this.execQueryPlan(plan, [], bound, ctx);
+      const q = yield* this.execQueryPlanSteps(plan, [], bound, ctx);
       // Arity: the SELECT's output column count must match the target — checked before any row is
       // produced, so it fires even when the source returns zero rows.
       if (q.columnNames.length !== arity) {
@@ -11923,6 +12706,8 @@ export class Engine {
       // checking). The per-row storeValue in insertRows then still range-checks values (22003)
       // and enforces NOT NULL.
       for (let i = 0; i < n; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const p = provided[i]!;
         if (p < 0) continue;
         const col = table.columns[i]!;
@@ -11964,7 +12749,7 @@ export class Engine {
       // RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
       // one ceiling over the whole statement.
       meter.charge(q.cost);
-      const { affected, returned } = this.runInsertRows(
+      const { affected, returned } = yield* this.runInsertRowsSteps(
         table,
         store,
         ins.db,
@@ -11992,6 +12777,8 @@ export class Engine {
     const ptypes = new ParamTypes();
     const valueExprs: (RExpr | null)[][] = [];
     for (const values of rowsIn) {
+      if (shouldCooperate()) yield COOPERATE;
+
       if (values.length !== arity) {
         const which = ins.columns !== null ? "target columns are" : "columns are";
         throw engineError(
@@ -12000,6 +12787,8 @@ export class Engine {
         );
       }
       for (let i = 0; i < n; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const p = provided[i]!;
         if (p >= 0 && p < values.length) {
           const iv = values[p]!;
@@ -12018,6 +12807,8 @@ export class Engine {
     // before any row is materialized; an all-DEFAULT column is fine. Arity is validated above, so
     // values[pos] is in range.
     for (const at of alwaysTargeted) {
+      if (shouldCooperate()) yield COOPERATE;
+
       if (rowsIn.some((values) => values[at.pos]!.kind !== "default")) {
         throw generatedAlwaysInsert(table.columns[at.col]!.name);
       }
@@ -12029,9 +12820,14 @@ export class Engine {
         ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw, ins.alias)
         : null;
     const cplan =
-      ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes) : null;
+      ins.onConflict !== null
+        ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes)
+        : null;
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
-    if (planning.bind(bound)) return restartPlanning(bound, () => this.executeInsert(written, params, ctx));
+    if (planning.bind(bound))
+      return yield* restartPlanningSteps(bound, () =>
+        this.executeInsertSteps(written, params, ctx),
+      );
 
     // INSERT ... VALUES reads no rows; with only literal values and constant defaults it
     // evaluates no expression tree (leaves), so a plain fully-inline insert still costs zero. An
@@ -12043,7 +12839,7 @@ export class Engine {
     const meter = this.session.newMeter();
     // Uncorrelated subqueries in VALUES expression slots fold once, before any row is materialized
     // (cost.md §3) — a VALUES slot has no outer row to correlate with.
-    this.foldValueExprs(valueExprs, bound, ctx, meter);
+    yield* this.foldValueExprsSteps(valueExprs, bound, ctx, meter);
 
     // Materialize each row into its value-position-indexed candidates (length arity, checked
     // above), resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
@@ -12053,9 +12849,13 @@ export class Engine {
     let singleValues: Value[] | null = null;
     const rows: Value[][] = [];
     for (let r = 0; r < rowsIn.length; r++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const values = rowsIn[r]!;
       const rv: Value[] = new Array(arity);
       for (let i = 0; i < n; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const col = table.columns[i]!;
         const p = provided[i]!;
         if (p >= 0) {
@@ -12065,11 +12865,11 @@ export class Engine {
           // (composite-aware — composite.md §1/§4); coerceForStore in insertRows then range-checks.
           const ct = store.columnTypes()[i]!;
           if (iv.kind === "default") {
-            rv[p] = this.evalDefault(col, defaultExprs[i]!, stmtRng, meter);
+            rv[p] = yield* this.evalDefaultSteps(col, defaultExprs[i]!, stmtRng, meter);
           } else if (iv.kind === "expr") {
             // A general expression → its resolved tree, evaluated for this row (metered);
             // insertRows then store-coerces the value.
-            rv[p] = this.evalValueExpr(valueExprs[r]![p], bound, stmtRng, ctx, meter);
+            rv[p] = yield* this.evalValueExprSteps(valueExprs[r]![p], bound, stmtRng, ctx, meter);
           } else if (
             ct.kind === "scalar" &&
             ct.scalar === "date" &&
@@ -12103,12 +12903,19 @@ export class Engine {
     // (cost.md §3), reading the pre-statement snapshot (grammar.md §32).
     const foldCost = { value: 0n };
     if (ret !== null) {
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost));
+      const folded: RExpr[] = [];
+      for (const node of ret.nodes) {
+        if (shouldCooperate()) yield COOPERATE;
+        folded.push(yield* this.foldUncorrelatedInRExprSteps(node, bound, ctx, foldCost));
+      }
+      ret.nodes = folded;
     }
-    this.foldConflictPlan(cplan, bound, foldCost);
+    yield* this.foldConflictPlanSteps(cplan, bound, foldCost);
     // A check option's uncorrelated subqueries fold once too (views.md §15.6).
     for (const vc of viewChecks) {
-      vc.check = this.foldUncorrelatedInRExpr(vc.check, bound, ctx, foldCost);
+      if (shouldCooperate()) yield COOPERATE;
+
+      vc.check = yield* this.foldUncorrelatedInRExprSteps(vc.check, bound, ctx, foldCost);
     }
     meter.charge(foldCost.value);
     let inserted: { affected: number; returned: Value[][] | null };
@@ -12116,7 +12923,7 @@ export class Engine {
       inserted = useSingle
         ? {
             affected: 1,
-            returned: this.insertOne(
+            returned: yield* this.insertOneSteps(
               table,
               store,
               ins.db,
@@ -12136,7 +12943,7 @@ export class Engine {
               meter,
             ),
           }
-        : this.runInsertRows(
+        : yield* this.runInsertRowsSteps(
             table,
             store,
             ins.db,
@@ -12196,6 +13003,52 @@ export class Engine {
     ctes: CteCtx,
     meter: Meter,
   ): Value[][] | null {
+    return runSync(
+      this.insertRowsSteps(
+        table,
+        store,
+        dbScope,
+        pk,
+        checks,
+        viewChecks,
+        defaultExprs,
+        rindexes,
+        colls,
+        colTypes,
+        rng,
+        provided,
+        rows,
+        returning,
+        params,
+        ctes,
+        meter,
+      ),
+    );
+  }
+
+  private *insertRowsSteps(
+    table: Table,
+    store: TableStore,
+    // dbScope is the INSERT target's explicit database qualifier (attached-databases.md §5): its
+    // existence probe + unique-index probes resolve through the scope-aware funnels, so an attachment
+    // target hits its own snapshot. undefined for a bare (implicit-scope) target — the temp-first funnel.
+    dbScope: string | undefined,
+    pk: number[],
+    checks: NamedCheck[],
+    // The check-option checks of a write through a view (views.md §15.6), nearest the table first.
+    viewChecks: ViewCheck[],
+    defaultExprs: (RExpr | null)[],
+    rindexes: ResolvedIndex[],
+    colls: (Collation | null)[],
+    colTypes: ColType[],
+    rng: StmtRng,
+    provided: number[],
+    rows: Value[][],
+    returning: RExpr[] | null,
+    params: Value[],
+    ctes: CteCtx,
+    meter: Meter,
+  ): Steps<Value[][] | null> {
     // The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree), for
     // composite-aware store coercion (spec/design/composite.md §4).
     // Phase-1 existence probes read the VISIBLE snapshot (the read pin under a data-modifying WITH —
@@ -12223,8 +13076,19 @@ export class Engine {
     const entryPrefixes: Uint8Array[][][] = [];
     let cunits = 0n;
     for (let r = 0; r < rows.length; r++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const values = rows[r]!;
-      const row = this.buildInsertRowAt(r, table, colTypes, provided, values, defaultExprs, rng, meter);
+      const row = yield* this.buildInsertRowAtSteps(
+        r,
+        table,
+        colTypes,
+        provided,
+        values,
+        defaultExprs,
+        rng,
+        meter,
+      );
 
       // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
       // NULL (storeValue above), before the key/duplicate check (PG's per-row order,
@@ -12238,12 +13102,13 @@ export class Engine {
           params: [],
           outer: [],
           runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
+          runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, [], EMPTY_CTE_CTX),
           environment: this.session.environment,
           rng,
           ctes: EMPTY_CTE_CTX,
           exec: this,
         };
-        evalChecks(checks, table.name, row, env, meter);
+        yield* evalChecksSteps(checks, table.name, row, env, meter);
       }
 
       let key: Uint8Array | null = null;
@@ -12254,9 +13119,9 @@ export class Engine {
         // The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
         // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
         const seen = key.join(",");
-        if (seenKeys.has(seen) || readStore.get(key) !== undefined) {
+        if (seenKeys.has(seen) || (yield* readStore.getSteps(key)) !== undefined) {
           throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
-            pkDetail(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
+            yield* pkDetailSteps(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
           );
         }
         seenKeys.add(seen);
@@ -12267,15 +13132,17 @@ export class Engine {
       // existing entry and no earlier row of this batch. Unmetered validation, like the
       // PK duplicate check (cost.md §3).
       for (let u = 0; u < uniqDefs.length; u++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const def = uniqDefs[u]!;
-        const prefix = indexPrefixKey(colTypes, colls, def, row, env);
+        const prefix = yield* indexPrefixKeySteps(colTypes, colls, def, row, env);
         if (prefix === null) continue;
         const istore = this.lkpIndexStoreScoped(dbScope, def.name);
-        const stored = istore.rangeEntries(uniqueProbeBound(prefix));
+        const stored = yield* istore.rangeEntriesSteps(uniqueProbeBound(prefix));
         const k = prefix.join(",");
         if (stored.length > 0 || seenPrefixes[u]!.has(k)) {
           throw uniqueViolation(table.name, def.name).withDetail(
-            indexDetailByName(this.session, table, def, row, env, DETAIL_EXISTS),
+            yield* indexDetailByNameSteps(this.session, table, def, row, env, DETAIL_EXISTS),
           );
         }
         seenPrefixes[u]!.add(k);
@@ -12287,14 +13154,25 @@ export class Engine {
       // Compute this row's per-index entry keys WITHOUT the suffix (phase 1 — evaluates every
       // expression key, so an eval error aborts here before any write; unmetered). Phase 2 appends the
       // final storage key.
-      entryPrefixes.push(
-        rindexes.map((rindex) =>
-          indexEntryKeys(table.columns, colTypes, colls, rindex, new Uint8Array(0), row, env),
-        ),
-      );
+      const prefixes: Uint8Array[][] = [];
+      for (const rindex of rindexes) {
+        if (shouldCooperate()) yield COOPERATE;
+        prefixes.push(
+          yield* indexEntryKeysSteps(
+            table.columns,
+            colTypes,
+            colls,
+            rindex,
+            new Uint8Array(0),
+            row,
+            env,
+          ),
+        );
+      }
+      entryPrefixes.push(prefixes);
       // The check option (views.md §15.6), after the row's own NOT NULL / CHECK / PK / UNIQUE
       // checks and its index keys, before the batch EXCLUDE and FOREIGN KEY passes.
-      evalViewChecks(viewChecks, row, env, meter);
+      yield* evalViewChecksSteps(viewChecks, row, env, meter);
       prepared.push({ key, row });
     }
 
@@ -12305,7 +13183,7 @@ export class Engine {
     // §7.2, the ordered index for an equal key) and no OTHER new row of this batch (pairwise — the
     // index holds only stored rows). The NULL rule / empty-range exempt a row, as does a partial
     // constraint's not-TRUE predicate (§7.1). Unmetered validation, before any write.
-    this.validateExclusions(
+    yield* this.validateExclusionsSteps(
       dbScope,
       this.table(table.name) ?? table,
       prepared.map((pr) => pr.row),
@@ -12320,6 +13198,8 @@ export class Engine {
     const relation = table.name;
     const { fks, temp: fkTemp } = this.targetForeignKeys(dbScope, table.name);
     for (const fk of fks) {
+      if (shouldCooperate()) yield COOPERATE;
+
       // The parent exists (validated at CREATE TABLE; DROP TABLE refuses to drop a referenced
       // table — §6.10), so a consistent catalog always finds it, in the FK's own domain
       // (temp-tables.md §8).
@@ -12333,20 +13213,24 @@ export class Engine {
       const batch = new Set<string>();
       if (fk.refTable === relation) {
         for (const pr of prepared) {
-          const p = fkProbe(fk, parent, parentColls, pr.row, fk.refColumns);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const p = yield* fkProbeSteps(fk, parent, parentColls, pr.row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
       }
       for (const pr of prepared) {
-        const probe = fkProbe(fk, parent, parentColls, pr.row, fk.columns);
+        if (shouldCooperate()) yield COOPERATE;
+
+        const probe = yield* fkProbeSteps(fk, parent, parentColls, pr.row, fk.columns);
         if (probe === null) {
           // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
           if (fkMatchFullViolated(fk, pr.row))
-            this.fkChildCheck(relation, table.columns, fk, null, pr.row, fkTemp);
+            yield* this.fkChildCheckSteps(relation, table.columns, fk, null, pr.row, fkTemp);
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        this.fkChildCheck(relation, table.columns, fk, probe, pr.row, fkTemp);
+        yield* this.fkChildCheckSteps(relation, table.columns, fk, probe, pr.row, fkTemp);
       }
     }
 
@@ -12359,7 +13243,7 @@ export class Engine {
     // the pre-statement snapshot and a 54P01 here leaves the store untouched.
     const returned =
       returning !== null
-        ? this.projectReturning(
+        ? yield* this.projectReturningSteps(
             returning,
             prepared.map((pr) => pr.row),
             null,
@@ -12377,16 +13261,22 @@ export class Engine {
     // unchanged).
     const indexInserts: IndexEntry[][] = table.indexes.map(() => []);
     for (let ri = 0; ri < prepared.length; ri++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const pr = prepared[ri]!;
       const key = pr.key ?? encodeInt("i64", store.allocRowid());
       // Append the final storage key to each phase-1 entry prefix (byte-identical to building the
       // entry with the key directly — indexes.md §3/§4).
       for (let k = 0; k < table.indexes.length; k++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         for (const p of entryPrefixes[ri]![k]!) {
+          if (shouldCooperate()) yield COOPERATE;
+
           indexInserts[k]!.push({ key: concatBytes([p, key]), skeyLen: key.length });
         }
       }
-      if (!store.insert(key, pr.row)) {
+      if (!(yield* store.insertSteps(key, pr.row))) {
         // A collision here can only happen under the writable-CTE read pin (writable-cte.md §7): an
         // EARLIER data-modifying sub-statement of the same WITH staged this key, which phase 1
         // (reading the pin) did not see. Matches PostgreSQL's unique violation; the whole statement
@@ -12396,10 +13286,14 @@ export class Engine {
       }
     }
     for (let k = 0; k < table.indexes.length; k++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const def = table.indexes[k]!;
       const istore = this.writeIndexStoreScoped(dbScope, def.name);
       for (const ek of indexInserts[k]!) {
-        if (!indexEntryInsert(istore, def.kind, ek.key, ek.skeyLen)) {
+        if (shouldCooperate()) yield COOPERATE;
+
+        if (!(yield* indexEntryInsertSteps(istore, def.kind, ek.key, ek.skeyLen))) {
           // A cross-sub-statement unique-index collision under the read pin (as above).
           throw uniqueViolation(table.name, def.name);
         }
@@ -12432,10 +13326,60 @@ export class Engine {
     ctes: CteCtx,
     meter: Meter,
   ): Value[][] | null {
+    return runSync(
+      this.insertOneSteps(
+        table,
+        store,
+        dbScope,
+        pk,
+        checks,
+        viewChecks,
+        defaultExprs,
+        rindexes,
+        colls,
+        colTypes,
+        rng,
+        provided,
+        values,
+        returning,
+        params,
+        ctes,
+        meter,
+      ),
+    );
+  }
+
+  private *insertOneSteps(
+    table: Table,
+    store: TableStore,
+    dbScope: string | undefined,
+    pk: number[],
+    checks: NamedCheck[],
+    viewChecks: ViewCheck[],
+    defaultExprs: (RExpr | null)[],
+    rindexes: ResolvedIndex[],
+    colls: (Collation | null)[],
+    colTypes: ColType[],
+    rng: StmtRng,
+    provided: number[],
+    values: Value[],
+    returning: RExpr[] | null,
+    params: Value[],
+    ctes: CteCtx,
+    meter: Meter,
+  ): Steps<Value[][] | null> {
     const readStore = this.lkpStoreScoped(dbScope, table.name);
     const maintenanceEnv = this.maintenanceEnv(rng);
 
-    const row = this.buildInsertRow(table, colTypes, provided, values, defaultExprs, rng, meter);
+    const row = yield* this.buildInsertRowSteps(
+      table,
+      colTypes,
+      provided,
+      values,
+      defaultExprs,
+      rng,
+      meter,
+    );
 
     if (checks.length > 0) {
       meter.guard();
@@ -12443,34 +13387,44 @@ export class Engine {
         params: [],
         outer: [],
         runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
+        runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, [], EMPTY_CTE_CTX),
         environment: this.session.environment,
         rng,
         ctes: EMPTY_CTE_CTX,
         exec: this,
       };
-      evalChecks(checks, table.name, row, checkEnv, meter);
+      yield* evalChecksSteps(checks, table.name, row, checkEnv, meter);
     }
 
     let key: Uint8Array | null = null;
     if (pk.length > 0) {
       key = encodePkKey(colTypes, pk, colls, row);
-      if (readStore.get(key) !== undefined) {
+      if ((yield* readStore.getSteps(key)) !== undefined) {
         throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
-          pkDetail(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
+          yield* pkDetailSteps(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
         );
       }
     }
 
     for (const rindex of rindexes) {
+      if (shouldCooperate()) yield COOPERATE;
+
       if (!rindex.unique) continue;
-      const prefix = indexPrefixKey(colTypes, colls, rindex, row, maintenanceEnv);
+      const prefix = yield* indexPrefixKeySteps(colTypes, colls, rindex, row, maintenanceEnv);
       if (prefix === null) continue;
-      const stored = this.lkpIndexStoreScoped(dbScope, rindex.name).rangeEntries(
+      const stored = yield* this.lkpIndexStoreScoped(dbScope, rindex.name).rangeEntriesSteps(
         uniqueProbeBound(prefix),
       );
       if (stored.length > 0)
         throw uniqueViolation(table.name, rindex.name).withDetail(
-          indexDetailByName(this.session, table, rindex, row, maintenanceEnv, DETAIL_EXISTS),
+          yield* indexDetailByNameSteps(
+            this.session,
+            table,
+            rindex,
+            row,
+            maintenanceEnv,
+            DETAIL_EXISTS,
+          ),
         );
     }
 
@@ -12480,8 +13434,10 @@ export class Engine {
     // outer row dimension is absent, and a direct loop avoids the general path's mapped arrays.
     const indexEntries: Uint8Array[][] = [];
     for (const rindex of rindexes) {
+      if (shouldCooperate()) yield COOPERATE;
+
       indexEntries.push(
-        indexEntryKeys(
+        yield* indexEntryKeysSteps(
           table.columns,
           colTypes,
           colls,
@@ -12492,32 +13448,39 @@ export class Engine {
         ),
       );
     }
-    evalViewChecks(viewChecks, row, maintenanceEnv, meter);
+    yield* evalViewChecksSteps(viewChecks, row, maintenanceEnv, meter);
 
     // EXCLUDE before FOREIGN KEY, as the batch path (constraints.md §7).
-    this.validateExclusions(dbScope, this.table(table.name) ?? table, [row], new Set<string>());
+    yield* this.validateExclusionsSteps(
+      dbScope,
+      this.table(table.name) ?? table,
+      [row],
+      new Set<string>(),
+    );
 
     const relation = table.name;
     const { fks, temp: fkTemp } = this.targetForeignKeys(dbScope, table.name);
     for (const fk of fks) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const parent = this.fkSnap(fkTemp).table(fk.refTable);
       if (parent === undefined) continue;
       const parentColls = this.columnCollations(parent.columns);
       const supplied =
         fk.refTable === relation
-          ? fkProbe(fk, parent, parentColls, row, fk.refColumns)
+          ? yield* fkProbeSteps(fk, parent, parentColls, row, fk.refColumns)
           : null;
-      const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
+      const probe = yield* fkProbeSteps(fk, parent, parentColls, row, fk.columns);
       if (probe === null) {
         // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
         if (fkMatchFullViolated(fk, row))
-          this.fkChildCheck(relation, table.columns, fk, null, row, fkTemp);
+          yield* this.fkChildCheckSteps(relation, table.columns, fk, null, row, fkTemp);
         continue;
       }
       if (supplied !== null && cmpBytes(fkProbeBytes(supplied), fkProbeBytes(probe)) === 0) {
         continue;
       }
-      this.fkChildCheck(relation, table.columns, fk, probe, row, fkTemp);
+      yield* this.fkChildCheckSteps(relation, table.columns, fk, probe, row, fkTemp);
     }
 
     meter.charge(COSTS.valueCompress * cunits);
@@ -12525,12 +13488,16 @@ export class Engine {
 
     const returned =
       returning !== null
-        ? this.projectReturning(returning, [row], null, params, ctes, meter)
+        ? yield* this.projectReturningSteps(returning, [row], null, params, ctes, meter)
         : null;
 
     key ??= encodeInt("i64", store.allocRowid());
     for (const entries of indexEntries) {
+      if (shouldCooperate()) yield COOPERATE;
+
       for (let i = 0; i < entries.length; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const prefix = entries[i]!;
         const entry = new Uint8Array(prefix.length + key.length);
         entry.set(prefix, 0);
@@ -12538,14 +13505,18 @@ export class Engine {
         entries[i] = entry;
       }
     }
-    if (!store.insert(key, row)) {
+    if (!(yield* store.insertSteps(key, row))) {
       throw uniqueViolation(table.name, pkeyName(table.name));
     }
     for (let i = 0; i < table.indexes.length; i++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const def = table.indexes[i]!;
       const istore = this.writeIndexStoreScoped(dbScope, def.name);
       for (const entry of indexEntries[i]!) {
-        if (!indexEntryInsert(istore, def.kind, entry, key.length))
+        if (shouldCooperate()) yield COOPERATE;
+
+        if (!(yield* indexEntryInsertSteps(istore, def.kind, entry, key.length)))
           throw uniqueViolation(table.name, def.name);
       }
     }
@@ -12566,11 +13537,22 @@ export class Engine {
     row: Row,
     temp: boolean,
   ): void {
+    return runSync(this.fkChildCheckSteps(relation, columns, fk, probe, row, temp));
+  }
+
+  private *fkChildCheckSteps(
+    relation: string,
+    columns: Column[],
+    fk: ForeignKey,
+    probe: FkProbe | null,
+    row: Row,
+    temp: boolean,
+  ): Steps<void> {
     if (this.fkStatementDefer) {
       this.fkDeferredChecks.push({ kind: "child", relation, columns, fk, probe, row, temp });
       return;
     }
-    this.fkChildVerdict(relation, columns, fk, probe, row, temp);
+    yield* this.fkChildVerdictSteps(relation, columns, fk, probe, row, temp);
   }
 
   // fkChildVerdict is the immediate child-side verdict behind fkChildCheck.
@@ -12582,10 +13564,21 @@ export class Engine {
     row: Row,
     temp: boolean,
   ): void {
+    return runSync(this.fkChildVerdictSteps(relation, columns, fk, probe, row, temp));
+  }
+
+  private *fkChildVerdictSteps(
+    relation: string,
+    columns: Column[],
+    fk: ForeignKey,
+    probe: FkProbe | null,
+    row: Row,
+    temp: boolean,
+  ): Steps<void> {
     if (probe === null) throw fkViolationMatchFull(relation, fk.name);
-    if (!this.fkProbeHits(probe, fk.refTable, temp))
+    if (!(yield* this.fkProbeHitsSteps(probe, fk.refTable, temp)))
       throw fkViolationInsert(relation, fk.name).withDetail(
-        fkChildDetail(this.session, relation, columns, fk, row),
+        yield* fkChildDetailSteps(this.session, relation, columns, fk, row),
       );
   }
 
@@ -12608,7 +13601,11 @@ export class Engine {
   // unless the constraint is partial and its predicate is not TRUE for the row (gist.md §7.1 —
   // PostgreSQL's partial exclusion; the predicate eval is unmetered, like a partial index's).
   exclusionParticipates(chk: ExclusionCheck, row: Row): boolean {
-    return indexRowQualifies(chk.rindex, row, this.maintenanceEnv(new StmtRng()));
+    return runSync(this.exclusionParticipatesSteps(chk, row));
+  }
+
+  *exclusionParticipatesSteps(chk: ExclusionCheck, row: Row): Steps<boolean> {
+    return yield* indexRowQualifiesSteps(chk.rindex, row, this.maintenanceEnv(new StmtRng()));
   }
 
   // exclusionKey is a row's exclusion probe key (gist.md §7), or null when the row can never
@@ -12623,13 +13620,23 @@ export class Engine {
     colls: (Collation | null)[],
     row: Row,
   ): ExclusionKey | null {
+    return runSync(this.exclusionKeySteps(chk, columns, colTypes, colls, row));
+  }
+
+  *exclusionKeySteps(
+    chk: ExclusionCheck,
+    columns: Column[],
+    colTypes: ColType[],
+    colls: (Collation | null)[],
+    row: Row,
+  ): Steps<ExclusionKey | null> {
     if (chk.rindex.kind === "btree") {
       // indexPrefix applies the predicate and the NULL rule.
-      const prefix = this.indexPrefix(colTypes, colls, chk.rindex, row);
+      const prefix = yield* this.indexPrefixSteps(colTypes, colls, chk.rindex, row);
       return prefix === null ? null : { kind: "btree", prefix };
     }
-    if (!this.exclusionParticipates(chk, row)) return null;
-    const probe = exclusionProbeQuery(columns, chk.exc, row);
+    if (!(yield* this.exclusionParticipatesSteps(chk, row))) return null;
+    const probe = yield* exclusionProbeQuerySteps(columns, chk.exc, row);
     return probe === null ? null : { kind: "gist", query: probe.query, strats: probe.strats };
   }
 
@@ -12645,13 +13652,25 @@ export class Engine {
     key: ExclusionKey,
     rewritten: Set<string>,
   ): Row | null {
+    return runSync(this.exclusionStoredConflictSteps(dbScope, table, chk, key, rewritten));
+  }
+
+  private *exclusionStoredConflictSteps(
+    dbScope: string | undefined,
+    table: Table,
+    chk: ExclusionCheck,
+    key: ExclusionKey,
+    rewritten: Set<string>,
+  ): Steps<Row | null> {
     let hit: Uint8Array | null = null;
     if (key.kind === "btree") {
       // Entries sharing the prefix sit adjacent in storage-key order (indexes.md §8).
-      const entries = this.lkpIndexStoreScoped(dbScope, chk.rindex.name).rangeEntries(
+      const entries = yield* this.lkpIndexStoreScoped(dbScope, chk.rindex.name).rangeEntriesSteps(
         uniqueProbeBound(key.prefix),
       );
       for (const e of entries) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const suffix = e.key.slice(key.prefix.length);
         if (!rewritten.has(suffix.join(","))) {
           hit = suffix;
@@ -12667,7 +13686,7 @@ export class Engine {
     }
     if (hit === null) return null;
     // A matched entry always names a stored row; one that does not is a corrupt index.
-    const other = this.lkpStoreScoped(dbScope, table.name).get(hit);
+    const other = yield* this.lkpStoreScoped(dbScope, table.name).getSteps(hit);
     if (other === undefined)
       throw engineError("data_corrupted", "an exclusion index entry references a stored row");
     return other;
@@ -12685,14 +13704,34 @@ export class Engine {
     row: Row,
     planned: Row[],
   ): boolean {
+    return runSync(
+      this.exclusionConflictsPlannedSteps(dbScope, table, chk, colTypes, colls, row, planned),
+    );
+  }
+
+  private *exclusionConflictsPlannedSteps(
+    dbScope: string | undefined,
+    table: Table,
+    chk: ExclusionCheck,
+    colTypes: ColType[],
+    colls: (Collation | null)[],
+    row: Row,
+    planned: Row[],
+  ): Steps<boolean> {
     const columns = table.columns;
-    const key = this.exclusionKey(chk, columns, colTypes, colls, row);
+    const key = yield* this.exclusionKeySteps(chk, columns, colTypes, colls, row);
     if (key === null) return false;
-    if (this.exclusionStoredConflict(dbScope, table, chk, key, new Set<string>()) !== null)
+    if (
+      (yield* this.exclusionStoredConflictSteps(dbScope, table, chk, key, new Set<string>())) !==
+      null
+    )
       return true;
     for (const p of planned) {
-      const pk = this.exclusionKey(chk, columns, colTypes, colls, p);
-      if (pk !== null && exclusionKeysConflict(columns, chk.exc, key, row, pk, p)) return true;
+      if (shouldCooperate()) yield COOPERATE;
+
+      const pk = yield* this.exclusionKeySteps(chk, columns, colTypes, colls, p);
+      if (pk !== null && (yield* exclusionKeysConflictSteps(columns, chk.exc, key, row, pk, p)))
+        return true;
     }
     return false;
   }
@@ -12708,31 +13747,68 @@ export class Engine {
     rows: Row[],
     rewritten: Set<string>,
   ): void {
+    return runSync(this.validateExclusionsSteps(dbScope, table, rows, rewritten));
+  }
+
+  private *validateExclusionsSteps(
+    dbScope: string | undefined,
+    table: Table,
+    rows: Row[],
+    rewritten: Set<string>,
+  ): Steps<void> {
     if (table.exclusions.length === 0 || rows.length === 0) return;
     const tcols = table.columns;
     const checks = this.exclusionChecks(table);
     const colTypes = this.lkpStoreScoped(dbScope, table.name).columnTypes();
     const colls = this.columnCollations(tcols);
     for (const chk of checks) {
-      const keys = rows.map((row) => this.exclusionKey(chk, tcols, colTypes, colls, row));
+      if (shouldCooperate()) yield COOPERATE;
+
+      const keys: (ExclusionKey | null)[] = [];
+      for (const row of rows) {
+        if (shouldCooperate()) yield COOPERATE;
+        keys.push(yield* this.exclusionKeySteps(chk, tcols, colTypes, colls, row));
+      }
       for (let i = 0; i < rows.length; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const key = keys[i]!;
         if (key === null) continue;
-        const other = this.exclusionStoredConflict(dbScope, table, chk, key, rewritten);
+        const other = yield* this.exclusionStoredConflictSteps(dbScope, table, chk, key, rewritten);
         if (other !== null)
           throw exclusionViolation(table.name, chk.exc.name).withDetail(
-            exclusionDetail(this.session, table.name, tcols, chk.exc, rows[i]!, other, true),
+            yield* exclusionDetailSteps(
+              this.session,
+              table.name,
+              tcols,
+              chk.exc,
+              rows[i]!,
+              other,
+              true,
+            ),
           );
       }
       for (let i = 0; i < rows.length; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const ki = keys[i]!;
         if (ki === null) continue;
         for (let j = 0; j < i; j++) {
+          if (shouldCooperate()) yield COOPERATE;
+
           const kj = keys[j]!;
           if (kj === null) continue;
-          if (exclusionKeysConflict(tcols, chk.exc, ki, rows[i]!, kj, rows[j]!))
+          if (yield* exclusionKeysConflictSteps(tcols, chk.exc, ki, rows[i]!, kj, rows[j]!))
             throw exclusionViolation(table.name, chk.exc.name).withDetail(
-              exclusionDetail(this.session, table.name, tcols, chk.exc, rows[i]!, rows[j]!, true),
+              yield* exclusionDetailSteps(
+                this.session,
+                table.name,
+                tcols,
+                chk.exc,
+                rows[i]!,
+                rows[j]!,
+                true,
+              ),
             );
         }
       }
@@ -12786,7 +13862,9 @@ export class Engine {
       ).node;
     }
     const target =
-      vw === null ? oc.target : viewConflictTarget(vw, table, oc.target, (c) => checkConflictNames(this, c));
+      vw === null
+        ? oc.target
+        : viewConflictTarget(vw, table, oc.target, (c) => checkConflictNames(this, c));
     const arb = resolveArbiter(this, table, target, indexPredicate);
     if (!oc.doUpdate) {
       return { arb, doUpdate: false, assignments: [], filter: null };
@@ -12898,22 +13976,31 @@ export class Engine {
     table: Table,
     ak: Uint8Array,
   ): { key: Uint8Array; row: Row } | null {
+    return runSync(this.arbiterExistingSteps(arb, store, table, ak));
+  }
+
+  private *arbiterExistingSteps(
+    arb: Arbiter,
+    store: TableStore,
+    table: Table,
+    ak: Uint8Array,
+  ): Steps<{ key: Uint8Array; row: Row } | null> {
     if (arb.kind === "pk") {
-      const row = store.get(ak);
+      const row = yield* store.getSteps(ak);
       if (row === undefined) return null;
-      return { key: ak, row: store.resolveAll(row) };
+      return { key: ak, row: yield* store.resolveAllSteps(row) };
     }
     if (arb.kind === "exclusion") throw new Error("an exclusion arbiter has no existing-row probe");
     const def = table.indexes[arb.indexPos]!;
-    const entries = this.readSnap()
+    const entries = yield* this.readSnap()
       .indexStore(def.name)
-      .rangeEntries(uniqueProbeBound(ak));
+      .rangeEntriesSteps(uniqueProbeBound(ak));
     if (entries.length === 0) return null;
     const suffix = entries[0]!.key.slice(ak.length);
-    const row = store.get(suffix);
+    const row = yield* store.getSteps(suffix);
     if (row === undefined)
       throw engineError("data_corrupted", "a unique-index entry points at a live row");
-    return { key: suffix, row: store.resolveAll(row) };
+    return { key: suffix, row: yield* store.resolveAllSteps(row) };
   }
 
   // rowConflictsCommitted reports whether a candidate row conflicts with a COMMITTED row on the
@@ -12927,13 +14014,30 @@ export class Engine {
     rindexes: ResolvedIndex[],
     row: Row,
   ): boolean {
-    if (pk.length > 0 && store.get(encodePkKey(store.columnTypes(), pk, colls, row)) !== undefined) return true;
+    return runSync(this.rowConflictsCommittedSteps(store, table, pk, colls, rindexes, row));
+  }
+
+  private *rowConflictsCommittedSteps(
+    store: TableStore,
+    table: Table,
+    pk: number[],
+    colls: (Collation | null)[],
+    rindexes: ResolvedIndex[],
+    row: Row,
+  ): Steps<boolean> {
+    if (
+      pk.length > 0 &&
+      (yield* store.getSteps(encodePkKey(store.columnTypes(), pk, colls, row))) !== undefined
+    )
+      return true;
     for (const rindex of rindexes) {
+      if (shouldCooperate()) yield COOPERATE;
+
       if (!rindex.unique) continue;
-      const prefix = this.indexPrefix(store.columnTypes(), colls, rindex, row);
+      const prefix = yield* this.indexPrefixSteps(store.columnTypes(), colls, rindex, row);
       if (prefix === null) continue;
       if (
-        this.readSnap().indexStore(rindex.name).rangeEntries(uniqueProbeBound(prefix))
+        (yield* this.readSnap().indexStore(rindex.name).rangeEntriesSteps(uniqueProbeBound(prefix)))
           .length > 0
       ) {
         return true;
@@ -12949,13 +14053,31 @@ export class Engine {
     bound: Value[],
     foldCost: { value: bigint },
   ): void {
+    return runSync(this.foldConflictPlanSteps(plan, bound, foldCost));
+  }
+
+  private *foldConflictPlanSteps(
+    plan: ConflictPlan | null,
+    bound: Value[],
+    foldCost: { value: bigint },
+  ): Steps<void> {
     if (plan === null || !plan.doUpdate) return;
-    plan.assignments = plan.assignments.map((ap) => ({
-      ...ap,
-      source: this.foldUncorrelatedInRExpr(ap.source, bound, EMPTY_CTE_CTX, foldCost),
-    }));
+    const assignments: AssignPlan[] = [];
+    for (const ap of plan.assignments) {
+      if (shouldCooperate()) yield COOPERATE;
+      assignments.push({
+        ...ap,
+        source: yield* this.foldUncorrelatedInRExprSteps(ap.source, bound, EMPTY_CTE_CTX, foldCost),
+      });
+    }
+    plan.assignments = assignments;
     if (plan.filter !== null) {
-      plan.filter = this.foldUncorrelatedInRExpr(plan.filter, bound, EMPTY_CTE_CTX, foldCost);
+      plan.filter = yield* this.foldUncorrelatedInRExprSteps(
+        plan.filter,
+        bound,
+        EMPTY_CTE_CTX,
+        foldCost,
+      );
     }
   }
 
@@ -12984,8 +14106,51 @@ export class Engine {
     ctes: CteCtx,
     meter: Meter,
   ): { affected: number; returned: Value[][] | null } {
+    return runSync(
+      this.runInsertRowsSteps(
+        table,
+        store,
+        dbScope,
+        pk,
+        checks,
+        viewChecks,
+        defaultExprs,
+        rng,
+        provided,
+        rows,
+        conflict,
+        returning,
+        params,
+        ctes,
+        meter,
+      ),
+    );
+  }
+
+  private *runInsertRowsSteps(
+    table: Table,
+    store: TableStore,
+    // dbScope is the INSERT target's explicit database qualifier (attached-databases.md §5), threaded
+    // to insertRows so its existence / unique-index probes resolve stores in the right database.
+    // undefined for a bare (implicit-scope) target. ON CONFLICT is reached only for a reserved scope
+    // (an attachment target is gated 0A000 up front); it still retains this scope for generated
+    // parent-side FK actions.
+    dbScope: string | undefined,
+    pk: number[],
+    checks: NamedCheck[],
+    viewChecks: ViewCheck[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    provided: number[],
+    rows: Value[][],
+    conflict: ConflictPlan | null,
+    returning: RExpr[] | null,
+    params: Value[],
+    ctes: CteCtx,
+    meter: Meter,
+  ): Steps<{ affected: number; returned: Value[][] | null }> {
     if (conflict !== null) {
-      return this.insertRowsOnConflict(
+      return yield* this.insertRowsOnConflictSteps(
         table,
         store,
         dbScope,
@@ -13006,7 +14171,7 @@ export class Engine {
     const rindexes = this.resolveTableIndexes(table);
     const colls = this.columnCollations(table.columns);
     const colTypes = store.columnTypes();
-    const returned = this.insertRows(
+    const returned = yield* this.insertRowsSteps(
       table,
       store,
       dbScope,
@@ -13051,6 +14216,44 @@ export class Engine {
     ctes: CteCtx,
     meter: Meter,
   ): { affected: number; returned: Value[][] | null } {
+    return runSync(
+      this.insertRowsOnConflictSteps(
+        table,
+        store,
+        dbScope,
+        pk,
+        checks,
+        viewChecks,
+        defaultExprs,
+        rng,
+        provided,
+        rows,
+        plan,
+        returning,
+        params,
+        ctes,
+        meter,
+      ),
+    );
+  }
+
+  private *insertRowsOnConflictSteps(
+    table: Table,
+    store: TableStore,
+    dbScope: string | undefined,
+    pk: number[],
+    checks: NamedCheck[],
+    viewChecks: ViewCheck[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    provided: number[],
+    rows: Value[][],
+    plan: ConflictPlan,
+    returning: RExpr[] | null,
+    params: Value[],
+    ctes: CteCtx,
+    meter: Meter,
+  ): Steps<{ affected: number; returned: Value[][] | null }> {
     const relation = table.name;
     const colTypes = store.columnTypes();
     // Phase-1 existence/arbiter probes read the VISIBLE snapshot (the read pin under a data-modifying
@@ -13066,7 +14269,10 @@ export class Engine {
     const rindexes = this.resolveTableIndexes(table);
     // The unique-index positions in table.indexes (no-target skip test + end-state pass).
     const uniqIdx: number[] = [];
-    for (let i = 0; i < table.indexes.length; i++) if (table.indexes[i]!.unique) uniqIdx.push(i);
+    for (let i = 0; i < table.indexes.length; i++) {
+      if (shouldCooperate()) yield COOPERATE;
+      if (table.indexes[i]!.unique) uniqIdx.push(i);
+    }
     // The exclusion constraints (gist.md §7), parallel to table.exclusions — the no-target DO
     // NOTHING arbiter skips on any of them, an ON CONSTRAINT exclusion arbiter on its own
     // (upsert.md §2).
@@ -13091,6 +14297,7 @@ export class Engine {
       params: [],
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, [], EMPTY_CTE_CTX),
       environment: this.session.environment,
       rng,
       ctes: EMPTY_CTE_CTX,
@@ -13100,29 +14307,54 @@ export class Engine {
     // insert, and each updated row, right after its CHECK constraints and the conflict decision. A
     // row DO NOTHING skips, or that a DO UPDATE WHERE leaves alone, is not checked. (A view's WHERE
     // reads no parameter or statement CTE, as in insertRows.)
-    const viewCheck = (row: Row): void => {
-      if (viewChecks.length > 0) evalViewChecks(viewChecks, row, checkEnv(), meter);
+    const viewCheck = function* (row: Row): Steps<void> {
+      if (viewChecks.length > 0) yield* evalViewChecksSteps(viewChecks, row, checkEnv(), meter);
     };
 
     for (let r = 0; r < rows.length; r++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const values = rows[r]!;
       // Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL before
       // CHECK before conflict; constraints.md §4.4).
-      const row = this.buildInsertRowAt(r, table, colTypes, provided, values, defaultExprs, rng, meter);
+      const row = yield* this.buildInsertRowAtSteps(
+        r,
+        table,
+        colTypes,
+        provided,
+        values,
+        defaultExprs,
+        rng,
+        meter,
+      );
       if (checks.length > 0) {
         meter.guard();
-        evalChecks(checks, relation, row, checkEnv(), meter);
+        yield* evalChecksSteps(checks, relation, row, checkEnv(), meter);
       }
 
       if (plan.arb === null) {
         // No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an earlier planned
         // insert); else insert (upsert.md §2/§3).
         const pkk = pk.length > 0 ? encodePkKey(colTypes, pk, colls, row) : null;
-        let conflictHit = this.rowConflictsCommitted(store, table, pk, colls, rindexes, row);
+        let conflictHit = yield* this.rowConflictsCommittedSteps(
+          store,
+          table,
+          pk,
+          colls,
+          rindexes,
+          row,
+        );
         if (!conflictHit && pkk !== null && insPk.has(pkk.join(","))) conflictHit = true;
         if (!conflictHit) {
           for (let u = 0; u < uniqIdx.length; u++) {
-            const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[uniqIdx[u]!]!, row);
+            if (shouldCooperate()) yield COOPERATE;
+
+            const prefix = yield* this.indexPrefixSteps(
+              store.columnTypes(),
+              colls,
+              rindexes[uniqIdx[u]!]!,
+              row,
+            );
             if (prefix !== null && insPrefixes[u]!.has(prefix.join(","))) {
               conflictHit = true;
               break;
@@ -13134,7 +14366,19 @@ export class Engine {
         // constraint for a no-target DO NOTHING).
         let excluded = false;
         for (const chk of excChecks) {
-          if (this.exclusionConflictsPlanned(dbScope, table, chk, colTypes, colls, row, inserts)) {
+          if (shouldCooperate()) yield COOPERATE;
+
+          if (
+            yield* this.exclusionConflictsPlannedSteps(
+              dbScope,
+              table,
+              chk,
+              colTypes,
+              colls,
+              row,
+              inserts,
+            )
+          ) {
             excluded = true;
             break;
           }
@@ -13142,10 +14386,17 @@ export class Engine {
         if (excluded) continue; // skip
         if (pkk !== null) insPk.add(pkk.join(","));
         for (let u = 0; u < uniqIdx.length; u++) {
-          const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[uniqIdx[u]!]!, row);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const prefix = yield* this.indexPrefixSteps(
+            store.columnTypes(),
+            colls,
+            rindexes[uniqIdx[u]!]!,
+            row,
+          );
           if (prefix !== null) insPrefixes[u]!.add(prefix.join(","));
         }
-        viewCheck(row);
+        yield* viewCheck(row);
         inserts.push(row);
         continue;
       }
@@ -13155,25 +14406,42 @@ export class Engine {
       // insert; any other conflict is caught by the end-state validation.
       if (plan.arb.kind === "exclusion") {
         const chk = excChecks[plan.arb.exclusionPos]!;
-        if (this.exclusionConflictsPlanned(dbScope, table, chk, colTypes, colls, row, inserts))
+        if (
+          yield* this.exclusionConflictsPlannedSteps(
+            dbScope,
+            table,
+            chk,
+            colTypes,
+            colls,
+            row,
+            inserts,
+          )
+        )
           continue; // skip
-        viewCheck(row);
+        yield* viewCheck(row);
         inserts.push(row);
         continue;
       }
 
       // Arbiter present (DO UPDATE always; DO NOTHING with a target).
-      const ak = this.arbiterProbeKey(plan.arb, store.columnTypes(), pk, colls, rindexes, row);
+      const ak = yield* this.arbiterProbeKeySteps(
+        plan.arb,
+        store.columnTypes(),
+        pk,
+        colls,
+        rindexes,
+        row,
+      );
       if (ak === null) {
         // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
-        viewCheck(row);
+        yield* viewCheck(row);
         inserts.push(row);
         continue;
       }
       const akKey = ak.join(",");
       // §3 step 2: an UNAFFECTED committed row holding the arbiter key. A committed row this
       // statement already updated is found, if at all, by its new key (step 3).
-      let existing = this.arbiterExisting(plan.arb, readStore, table, ak);
+      let existing = yield* this.arbiterExistingSteps(plan.arb, readStore, table, ak);
       if (existing !== null && affectedStored.has(existing.key.join(","))) existing = null;
       if (existing === null) {
         // §3 step 3: a row this statement already inserted or updated holds the key — it may not
@@ -13190,7 +14458,7 @@ export class Engine {
         // No conflict on the arbiter → insert (a non-arbiter conflict is caught by the end-state
         // validation below).
         affectedArb.add(akKey);
-        viewCheck(row);
+        yield* viewCheck(row);
         inserts.push(row);
         continue;
       }
@@ -13201,6 +14469,7 @@ export class Engine {
         params,
         outer: [],
         runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, EMPTY_CTE_CTX),
+        runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, params, EMPTY_CTE_CTX),
         environment: this.session.environment,
         rng,
         ctes: EMPTY_CTE_CTX,
@@ -13208,12 +14477,15 @@ export class Engine {
       };
       // An optional WHERE that is not TRUE skips the update (existing row unchanged, not returned,
       // and still unaffected — a later proposal may conflict with it again, upsert.md §4).
-      if (plan.filter !== null && !evalFilter(plan.filter, combined, env, meter)) continue;
+      if (plan.filter !== null && !(yield* evalFilterSteps(plan.filter, combined, env, meter)))
+        continue;
       const newRow = existing.row.slice();
       let nullCol: string | null = null;
       for (const ap of plan.assignments) {
+        if (shouldCooperate()) yield COOPERATE;
+
         try {
-          const raw = evalExpr(ap.source, combined, env, meter);
+          const raw = yield* evalExprSteps(ap.source, combined, env, meter);
           // NOT NULL over the complete new row (error-fields.md §9.5).
           if (ap.notNull && raw.kind === "null") {
             nullCol ??= ap.name;
@@ -13225,12 +14497,19 @@ export class Engine {
           throw stampTable(e, table.name);
         }
       }
-      if (nullCol !== null) throw this.notNullRowViolation(relation, nullCol, newRow);
-      if (checks.length > 0) evalChecks(checks, relation, newRow, checkEnv(), meter);
-      viewCheck(newRow);
+      if (nullCol !== null) throw yield* this.notNullRowViolationSteps(relation, nullCol, newRow);
+      if (checks.length > 0) yield* evalChecksSteps(checks, relation, newRow, checkEnv(), meter);
+      yield* viewCheck(newRow);
       // Assigning a key member re-keys the row (upsert.md §5).
       const newKey = pkAssigned ? encodePkKey(colTypes, pk, colls, newRow) : existing.key;
-      const nak = this.arbiterProbeKey(plan.arb, store.columnTypes(), pk, colls, rindexes, newRow);
+      const nak = yield* this.arbiterProbeKeySteps(
+        plan.arb,
+        store.columnTypes(),
+        pk,
+        colls,
+        rindexes,
+        newRow,
+      );
       if (nak !== null) affectedArb.add(nak.join(","));
       affectedStored.add(existing.key.join(","));
       updates.push({ key: existing.key, newKey, newRow, oldRow: existing.row });
@@ -13248,13 +14527,22 @@ export class Engine {
         key: encodePkKey(colTypes, pk, colls, row),
         row,
       }));
-      if (rekeyed) for (const u of updates) keyed.push({ key: u.newKey, row: u.newRow });
+      if (rekeyed)
+        for (const u of updates) {
+          if (shouldCooperate()) yield COOPERATE;
+          keyed.push({ key: u.newKey, row: u.newRow });
+        }
       const seen = new Set<string>();
       for (const { key, row } of keyed) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const ks = key.join(",");
-        if ((readStore.get(key) !== undefined && !rewritten.has(ks)) || seen.has(ks)) {
+        if (
+          ((yield* readStore.getSteps(key)) !== undefined && !rewritten.has(ks)) ||
+          seen.has(ks)
+        ) {
           throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
-            pkDetail(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
+            yield* pkDetailSteps(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
           );
         }
         seen.add(ks);
@@ -13267,21 +14555,30 @@ export class Engine {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
       const newRows = updates.map((u) => u.newRow).concat(inserts);
       for (const ix of uniqIdx) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const def = table.indexes[ix]!;
         const istore = this.lkpIndexStore(def.name);
         const batch = new Set<string>();
         for (const newRow of newRows) {
-          const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[ix]!, newRow);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const prefix = yield* this.indexPrefixSteps(
+            store.columnTypes(),
+            colls,
+            rindexes[ix]!,
+            newRow,
+          );
           if (prefix === null) continue;
           const k = prefix.join(",");
           const conflict =
             batch.has(k) ||
-            istore
-              .rangeEntries(uniqueProbeBound(prefix))
-              .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
+            (yield* istore.rangeEntriesSteps(uniqueProbeBound(prefix))).some(
+              (e) => !rewritten.has(e.key.slice(prefix.length).join(",")),
+            );
           if (conflict) {
             throw uniqueViolation(table.name, def.name).withDetail(
-              indexDetail(
+              yield* indexDetailSteps(
                 this.session,
                 table.name,
                 table.columns,
@@ -13302,7 +14599,7 @@ export class Engine {
     // inserted row and each updated NEW row must conflict with no stored row the statement keeps (an
     // updated row's old version is vacated) and with no other new row. A conflict a DO NOTHING
     // arbiter covers was skipped in phase 1, so what remains is a non-arbiter conflict — 23P01.
-    this.validateExclusions(
+    yield* this.validateExclusionsSteps(
       dbScope,
       table,
       updates.map((u) => u.newRow).concat(inserts),
@@ -13315,6 +14612,8 @@ export class Engine {
     const assigned = new Set<number>(plan.doUpdate ? plan.assignments.map((a) => a.idx) : []);
     const { fks, temp: fkTemp } = this.targetForeignKeys(dbScope, relation);
     for (const fk of fks) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const parent = this.fkSnap(fkTemp).table(fk.refTable);
       if (parent === undefined) continue;
       // The probe matches the parent's stored key, so a collated parent key column uses the
@@ -13324,25 +14623,31 @@ export class Engine {
       const batch = new Set<string>();
       if (fk.refTable === relation) {
         for (const row of inserts) {
-          const p = fkProbe(fk, parent, parentColls, row, fk.refColumns);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const p = yield* fkProbeSteps(fk, parent, parentColls, row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
         for (const u of updates) {
-          const p = fkProbe(fk, parent, parentColls, u.newRow, fk.refColumns);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const p = yield* fkProbeSteps(fk, parent, parentColls, u.newRow, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
       }
       const toCheck = inserts.concat(checkUpdates ? updates.map((u) => u.newRow) : []);
       for (const row of toCheck) {
-        const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
+        if (shouldCooperate()) yield COOPERATE;
+
+        const probe = yield* fkProbeSteps(fk, parent, parentColls, row, fk.columns);
         if (probe === null) {
           // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
           if (fkMatchFullViolated(fk, row))
-            this.fkChildCheck(relation, table.columns, fk, null, row, fkTemp);
+            yield* this.fkChildCheckSteps(relation, table.columns, fk, null, row, fkTemp);
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        this.fkChildCheck(relation, table.columns, fk, probe, row, fkTemp);
+        yield* this.fkChildCheckSteps(relation, table.columns, fk, probe, row, fkTemp);
       }
     }
 
@@ -13356,10 +14661,15 @@ export class Engine {
     let cunits = 0n;
     const placeholder = new Uint8Array(8);
     for (const row of inserts) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const kb = pk.length > 0 ? encodePkKey(colTypes, pk, colls, row) : placeholder;
       cunits += BigInt(store.writeCompressUnits(kb, row));
     }
-    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.newKey, u.newRow));
+    for (const u of updates) {
+      if (shouldCooperate()) yield COOPERATE;
+      cunits += BigInt(store.writeCompressUnits(u.newKey, u.newRow));
+    }
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
@@ -13371,14 +14681,18 @@ export class Engine {
       const prows: Row[] = [];
       const olds: Row[] = [];
       for (const row of inserts) {
+        if (shouldCooperate()) yield COOPERATE;
+
         prows.push(row);
         olds.push(nullRow);
       }
       for (const u of updates) {
+        if (shouldCooperate()) yield COOPERATE;
+
         prows.push(u.newRow);
         olds.push(u.oldRow);
       }
-      returned = this.projectReturning(returning, prows, olds, params, ctes, meter);
+      returned = yield* this.projectReturningSteps(returning, prows, olds, params, ctes, meter);
     }
 
     const affected = inserts.length + updates.length;
@@ -13387,22 +14701,60 @@ export class Engine {
     // key — an error aborts before any write): each inserted row's entry PREFIXES (empty suffix; phase
     // 2 appends its storage key — the rowid is allocated there) and each updated row's old/new entry
     // sets (keys already known).
-    const insertPrefixes: Uint8Array[][][] = inserts.map((row) =>
-      rindexes.map((rindex) =>
-        this.indexEntries(table.columns, store.columnTypes(), colls, rindex, new Uint8Array(0), row),
-      ),
-    );
+    const insertPrefixes: Uint8Array[][][] = [];
+    for (const row of inserts) {
+      if (shouldCooperate()) yield COOPERATE;
+
+      const prefixes: Uint8Array[][] = [];
+      for (const rindex of rindexes) {
+        if (shouldCooperate()) yield COOPERATE;
+        prefixes.push(
+          yield* this.indexEntriesSteps(
+            table.columns,
+            store.columnTypes(),
+            colls,
+            rindex,
+            new Uint8Array(0),
+            row,
+          ),
+        );
+      }
+      insertPrefixes.push(prefixes);
+    }
     const indexMoves: IndexMove[][] = table.indexes.map(() => []);
     for (const u of updates) {
+      if (shouldCooperate()) yield COOPERATE;
+
       for (let k = 0; k < table.indexes.length; k++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         // A re-keyed row moves EVERY entry (the storage-key suffix changed); otherwise only the
         // entries whose indexed values changed move.
-        const oldEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.key, u.oldRow);
-        const newEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.newKey, u.newRow);
+        const oldEks = yield* this.indexEntriesSteps(
+          table.columns,
+          store.columnTypes(),
+          colls,
+          rindexes[k]!,
+          u.key,
+          u.oldRow,
+        );
+        const newEks = yield* this.indexEntriesSteps(
+          table.columns,
+          store.columnTypes(),
+          colls,
+          rindexes[k]!,
+          u.newKey,
+          u.newRow,
+        );
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0)
-          indexMoves[k]!.push({ removals, insertions, oldLen: u.key.length, newLen: u.newKey.length });
+          indexMoves[k]!.push({
+            removals,
+            insertions,
+            oldLen: u.key.length,
+            newLen: u.newKey.length,
+          });
       }
     }
     // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table; append each
@@ -13411,17 +14763,29 @@ export class Engine {
     // vacated first and its new key placed after the inserts — the re-keying UPDATE's two-pass,
     // since an insert or a moved row may land on a key another moved row vacates; each index
     // likewise removes every moved entry before adding any.
-    if (rekeyed) for (const u of updates) store.remove(u.key);
+    if (rekeyed)
+      for (const u of updates) {
+        if (shouldCooperate()) yield COOPERATE;
+        yield* store.removeSteps(u.key);
+      }
     const indexAdds: IndexEntry[][] = table.indexes.map(() => []);
     for (let ri = 0; ri < inserts.length; ri++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const row = inserts[ri]!;
       const key =
-        pk.length > 0 ? encodePkKey(colTypes, pk, colls, row) : encodeInt("i64", store.allocRowid());
+        pk.length > 0
+          ? encodePkKey(colTypes, pk, colls, row)
+          : encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
-        for (const p of insertPrefixes[ri]![k]!)
+        if (shouldCooperate()) yield COOPERATE;
+
+        for (const p of insertPrefixes[ri]![k]!) {
+          if (shouldCooperate()) yield COOPERATE;
           indexAdds[k]!.push({ key: concatBytes([p, key]), skeyLen: key.length });
+        }
       }
-      if (!store.insert(key, row)) {
+      if (!(yield* store.insertSteps(key, row))) {
         // Reachable only under the writable-CTE read pin (writable-cte.md §7), as for INSERT:
         // phase 1's end-state check caught every in-statement duplicate.
         throw uniqueViolation(table.name, pkeyName(table.name));
@@ -13429,13 +14793,21 @@ export class Engine {
     }
     if (rekeyed) {
       for (const u of updates) {
+        if (shouldCooperate()) yield COOPERATE;
+
         // A cross-sub-statement collision under the read pin (as above).
-        if (!store.insert(u.newKey, u.newRow)) throw uniqueViolation(table.name, pkeyName(table.name));
+        if (!(yield* store.insertSteps(u.newKey, u.newRow)))
+          throw uniqueViolation(table.name, pkeyName(table.name));
       }
     } else {
-      for (const u of updates) store.replace(u.key, u.newRow);
+      for (const u of updates) {
+        if (shouldCooperate()) yield COOPERATE;
+        yield* store.replaceSteps(u.key, u.newRow);
+      }
     }
     for (let k = 0; k < table.indexes.length; k++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const kind = table.indexes[k]!.kind;
       const name = table.indexes[k]!.name;
       const istore = this.writeIndexStore(name);
@@ -13445,19 +14817,41 @@ export class Engine {
         rekeyed
           ? uniqueViolation(table.name, name)
           : engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
-      if (rekeyed) for (const mv of indexMoves[k]!) for (const oldEk of mv.removals) indexEntryRemove(istore, kind, oldEk, mv.oldLen);
+      if (rekeyed)
+        for (const mv of indexMoves[k]!) {
+          if (shouldCooperate()) yield COOPERATE;
+          for (const oldEk of mv.removals) {
+            if (shouldCooperate()) yield COOPERATE;
+            yield* indexEntryRemoveSteps(istore, kind, oldEk, mv.oldLen);
+          }
+        }
       for (const ek of indexAdds[k]!) {
-        if (!indexEntryInsert(istore, kind, ek.key, ek.skeyLen)) throw collision();
+        if (shouldCooperate()) yield COOPERATE;
+
+        if (!(yield* indexEntryInsertSteps(istore, kind, ek.key, ek.skeyLen))) throw collision();
       }
       for (const mv of indexMoves[k]!) {
-        if (!rekeyed) for (const oldEk of mv.removals) indexEntryRemove(istore, kind, oldEk, mv.oldLen);
+        if (shouldCooperate()) yield COOPERATE;
+
+        if (!rekeyed)
+          for (const oldEk of mv.removals) {
+            if (shouldCooperate()) yield COOPERATE;
+            yield* indexEntryRemoveSteps(istore, kind, oldEk, mv.oldLen);
+          }
         for (const newEk of mv.insertions) {
-          if (!indexEntryInsert(istore, kind, newEk, mv.newLen)) throw collision();
+          if (shouldCooperate()) yield COOPERATE;
+
+          if (!(yield* indexEntryInsertSteps(istore, kind, newEk, mv.newLen))) throw collision();
         }
       }
     }
     this.syncPendingWrites(meter);
-    this.applyFkUpdateActions(table, fkUpdates, meter, this.fkDomain(dbScope, table.name));
+    yield* this.applyFkUpdateActionsSteps(
+      table,
+      fkUpdates,
+      meter,
+      this.fkDomain(dbScope, table.name),
+    );
     return { affected, returned };
   }
 
@@ -13505,30 +14899,53 @@ export class Engine {
     ctes: CteCtx,
     meter: Meter,
   ): Value[][] {
+    return runSync(this.projectReturningSteps(nodes, rows, others, params, ctes, meter));
+  }
+
+  private *projectReturningSteps(
+    nodes: RExpr[],
+    rows: Row[],
+    others: Row[] | null,
+    params: Value[],
+    ctes: CteCtx,
+    meter: Meter,
+  ): Steps<Value[][]> {
     const env: EvalEnv = {
       params,
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, params, ctes),
       environment: this.session.environment,
       rng: new StmtRng(),
       ctes,
       exec: this,
     };
     const out: Value[][] = [];
-    rows.forEach((row, i) => {
+    for (let i = 0; i < rows.length; i++) {
+      if (shouldCooperate()) yield COOPERATE;
+
+      const row = rows[i]!;
       meter.guard();
       meter.charge(COSTS.rowProduced);
       const combined = row.concat(others !== null ? others[i]! : row.map(() => nullValue()));
-      const vals = nodes.map((node) => evalExpr(node, combined, env, meter));
+      const vals: Value[] = [];
+      for (const node of nodes) {
+        if (shouldCooperate()) yield COOPERATE;
+        vals.push(yield* evalExprSteps(node, combined, env, meter));
+      }
       meter.admitRow(vals); // a RETURNING result row (memory.md §5.1)
       out.push(vals);
-    });
+    }
     return out;
   }
 
   // Generated statements share the originating statement's remaining ceiling and lifetime
   // counter. Their accrued statement cost is folded into the caller without charging lifetime twice.
   private runFkActionUpdate(update: Update, params: Value[], meter: Meter): void {
+    return runSync(this.runFkActionUpdateSteps(update, params, meter));
+  }
+
+  private *runFkActionUpdateSteps(update: Update, params: Value[], meter: Meter): Steps<void> {
     meter.guard();
     if (this.session.fkActionDepth >= 256) {
       throw engineError(
@@ -13540,7 +14957,7 @@ export class Engine {
     this.session.maxCost = savedLimit > 0n ? savedLimit - meter.accrued : 0n;
     this.session.fkActionDepth++;
     try {
-      const out = this.executeUpdate(update, params, EMPTY_CTE_CTX);
+      const out = yield* this.executeUpdateSteps(update, params, EMPTY_CTE_CTX);
       meter.accrued += out.cost;
     } finally {
       this.session.fkActionDepth--;
@@ -13550,6 +14967,10 @@ export class Engine {
   }
 
   private runFkActionDelete(del: Delete, params: Value[], meter: Meter): void {
+    return runSync(this.runFkActionDeleteSteps(del, params, meter));
+  }
+
+  private *runFkActionDeleteSteps(del: Delete, params: Value[], meter: Meter): Steps<void> {
     meter.guard();
     if (this.session.fkActionDepth >= 256) {
       throw engineError(
@@ -13561,7 +14982,7 @@ export class Engine {
     this.session.maxCost = savedLimit > 0n ? savedLimit - meter.accrued : 0n;
     this.session.fkActionDepth++;
     try {
-      const out = this.executeDelete(del, params, EMPTY_CTE_CTX);
+      const out = yield* this.executeDeleteSteps(del, params, EMPTY_CTE_CTX);
       meter.accrued += out.cost;
     } finally {
       this.session.fkActionDepth--;
@@ -13580,17 +15001,28 @@ export class Engine {
     temp: boolean,
     meter: Meter,
   ): void {
+    return runSync(this.runFkDeleteActionSteps(parent, child, fk, oldTuples, temp, meter));
+  }
+
+  private *runFkDeleteActionSteps(
+    parent: Table,
+    child: Table,
+    fk: ForeignKey,
+    oldTuples: Value[][],
+    temp: boolean,
+    meter: Meter,
+  ): Steps<void> {
     if (oldTuples.length === 0) return;
-    const fkTarget = this.newFkKeyedTarget(parent, fk, oldTuples, null, temp);
+    const fkTarget = yield* this.newFkKeyedTargetSteps(parent, fk, oldTuples, null, temp);
     const db = temp ? "temp" : "main";
     if (fk.onDelete === "cascade") {
-      this.runFkActionDelete(
+      yield* this.runFkActionDeleteSteps(
         { kind: "delete", table: child.name, db, filter: null, returning: null, fkTarget },
         [],
         meter,
       );
     } else if (fk.onDelete === "setNull" || fk.onDelete === "setDefault") {
-      this.runFkActionUpdate(
+      yield* this.runFkActionUpdateSteps(
         {
           kind: "update",
           table: child.name,
@@ -13618,6 +15050,17 @@ export class Engine {
     temp: boolean,
     meter: Meter,
   ): void {
+    return runSync(this.runFkUpdateActionSteps(parent, child, fk, transitions, temp, meter));
+  }
+
+  private *runFkUpdateActionSteps(
+    parent: Table,
+    child: Table,
+    fk: ForeignKey,
+    transitions: [Value[], Value[]][],
+    temp: boolean,
+    meter: Meter,
+  ): Steps<void> {
     if (transitions.length === 0) return;
     const oldTuples = transitions.map(([oldTuple]) => oldTuple);
     const newTuples =
@@ -13627,6 +15070,8 @@ export class Engine {
       // Each assignment is a placeholder self-reference; executeUpdate substitutes the row's
       // mapped new value before coercion and validation (constraints.md §6.6 "Keyed target").
       for (const column of fk.columns) {
+        if (shouldCooperate()) yield COOPERATE;
+
         assignments.push({
           column: child.columns[column]!.name,
           isDefault: false,
@@ -13635,6 +15080,8 @@ export class Engine {
       }
     } else if (fk.onUpdate === "setNull" || fk.onUpdate === "setDefault") {
       for (const column of fk.columns) {
+        if (shouldCooperate()) yield COOPERATE;
+
         assignments.push({
           column: child.columns[column]!.name,
           isDefault: fk.onUpdate === "setDefault",
@@ -13644,8 +15091,8 @@ export class Engine {
     } else {
       return;
     }
-    const fkTarget = this.newFkKeyedTarget(parent, fk, oldTuples, newTuples, temp);
-    this.runFkActionUpdate(
+    const fkTarget = yield* this.newFkKeyedTargetSteps(parent, fk, oldTuples, newTuples, temp);
+    yield* this.runFkActionUpdateSteps(
       {
         kind: "update",
         table: child.name,
@@ -13664,11 +15111,17 @@ export class Engine {
   // the whole statement — writable-cte.md §7). The queue order is the deterministic depth-first
   // action visitation order; no check can enqueue more work.
   private flushFkDeferredChecks(meter: Meter): void {
+    return runSync(this.flushFkDeferredChecksSteps(meter));
+  }
+
+  private *flushFkDeferredChecksSteps(meter: Meter): Steps<void> {
     const checks = this.fkDeferredChecks;
     this.fkDeferredChecks = [];
     for (const check of checks) {
+      if (shouldCooperate()) yield COOPERATE;
+
       if (check.kind === "child") {
-        this.fkChildVerdict(
+        yield* this.fkChildVerdictSteps(
           check.relation,
           check.columns,
           check.fk,
@@ -13678,9 +15131,13 @@ export class Engine {
         );
         continue;
       }
-      if (check.update && this.fkProbeHits(check.probe, check.parent.name, check.temp)) continue;
       if (
-        this.fkChildReferences(
+        check.update &&
+        (yield* this.fkProbeHitsSteps(check.probe, check.parent.name, check.temp))
+      )
+        continue;
+      if (
+        yield* this.fkChildReferencesSteps(
           check.childTable,
           check.fk,
           check.parent,
@@ -13691,7 +15148,13 @@ export class Engine {
         )
       ) {
         throw fkViolationDelete(check.parent.name, check.fk.name, check.childTable).withDetail(
-          fkParentDetail(this.session, check.parent, check.fk, check.childTable, check.values),
+          yield* fkParentDetailSteps(
+            this.session,
+            check.parent,
+            check.fk,
+            check.childTable,
+            check.values,
+          ),
         );
       }
     }
@@ -13715,6 +15178,15 @@ export class Engine {
     meter: Meter,
     domain: boolean | null,
   ): void {
+    return runSync(this.applyFkDeleteActionsSteps(parent, rows, meter, domain));
+  }
+
+  private *applyFkDeleteActionsSteps(
+    parent: Table,
+    rows: Row[],
+    meter: Meter,
+    domain: boolean | null,
+  ): Steps<void> {
     if (rows.length === 0) return;
     // An attached-database table has no foreign keys (attached-databases.md §8).
     if (domain === null) return;
@@ -13731,20 +15203,28 @@ export class Engine {
       const referencers = this.fkReferencers(parent.name, temp);
       const parentColls = this.columnCollations(parent.columns);
       for (const { childTable, fk } of referencers) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (fk.onDelete === "noAction" || fk.onDelete === "restrict") continue;
         const child = this.fkSnap(temp).table(childTable);
         if (child === undefined) throw engineError("data_corrupted", "foreign-key child exists");
         const oldTuples: Value[][] = [];
         for (const row of rows) {
-          if (fkProbe(fk, parent, parentColls, row, fk.refColumns) !== null)
+          if (shouldCooperate()) yield COOPERATE;
+
+          if ((yield* fkProbeSteps(fk, parent, parentColls, row, fk.refColumns)) !== null)
             oldTuples.push(fk.refColumns.map((column) => row[column]!));
         }
-        this.runFkDeleteAction(parent, child, fk, oldTuples, temp, meter);
+        yield* this.runFkDeleteActionSteps(parent, child, fk, oldTuples, temp, meter);
       }
       for (const { childTable, fk } of referencers) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (fk.onDelete !== "noAction" && fk.onDelete !== "restrict") continue;
         for (const row of rows) {
-          const probe = fkProbe(fk, parent, parentColls, row, fk.refColumns);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const probe = yield* fkProbeSteps(fk, parent, parentColls, row, fk.refColumns);
           if (probe !== null) {
             this.fkDeferredChecks.push({
               kind: "parent",
@@ -13759,7 +15239,7 @@ export class Engine {
           }
         }
       }
-      if (root) this.flushFkDeferredChecks(meter);
+      if (root) yield* this.flushFkDeferredChecksSteps(meter);
     } finally {
       this.session.readPin = savedPin;
       if (root) this.fkDeferredChecks = [];
@@ -13772,6 +15252,15 @@ export class Engine {
     meter: Meter,
     domain: boolean | null,
   ): void {
+    return runSync(this.applyFkUpdateActionsSteps(parent, updates, meter, domain));
+  }
+
+  private *applyFkUpdateActionsSteps(
+    parent: Table,
+    updates: { row: Row; oldRow: Row }[],
+    meter: Meter,
+    domain: boolean | null,
+  ): Steps<void> {
     if (updates.length === 0) return;
     // An attached-database table has no foreign keys (attached-databases.md §8).
     if (domain === null) return;
@@ -13788,29 +15277,39 @@ export class Engine {
       const referencers = this.fkReferencers(parent.name, temp);
       const parentColls = this.columnCollations(parent.columns);
       for (const { childTable, fk } of referencers) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (fk.onUpdate === "noAction" || fk.onUpdate === "restrict") continue;
         const child = this.fkSnap(temp).table(childTable);
         if (child === undefined) throw engineError("data_corrupted", "foreign-key child exists");
         const transitions: [Value[], Value[]][] = [];
         for (const u of updates) {
-          const oldProbe = fkProbe(fk, parent, parentColls, u.oldRow, fk.refColumns);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const oldProbe = yield* fkProbeSteps(fk, parent, parentColls, u.oldRow, fk.refColumns);
           if (oldProbe === null) continue;
-          const newProbe = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
-          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))) continue;
+          const newProbe = yield* fkProbeSteps(fk, parent, parentColls, u.row, fk.refColumns);
+          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe)))
+            continue;
           transitions.push([
             fk.refColumns.map((column) => u.oldRow[column]!),
             fk.refColumns.map((column) => u.row[column]!),
           ]);
         }
-        this.runFkUpdateAction(parent, child, fk, transitions, temp, meter);
+        yield* this.runFkUpdateActionSteps(parent, child, fk, transitions, temp, meter);
       }
       for (const { childTable, fk } of referencers) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (fk.onUpdate !== "noAction" && fk.onUpdate !== "restrict") continue;
         for (const u of updates) {
-          const oldProbe = fkProbe(fk, parent, parentColls, u.oldRow, fk.refColumns);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const oldProbe = yield* fkProbeSteps(fk, parent, parentColls, u.oldRow, fk.refColumns);
           if (oldProbe === null) continue;
-          const newProbe = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
-          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))) continue;
+          const newProbe = yield* fkProbeSteps(fk, parent, parentColls, u.row, fk.refColumns);
+          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe)))
+            continue;
           this.fkDeferredChecks.push({
             kind: "parent",
             parent,
@@ -13823,7 +15322,7 @@ export class Engine {
           });
         }
       }
-      if (root) this.flushFkDeferredChecks(meter);
+      if (root) yield* this.flushFkDeferredChecksSteps(meter);
     } finally {
       this.session.readPin = savedPin;
       if (root) this.fkDeferredChecks = [];
@@ -13834,12 +15333,16 @@ export class Engine {
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
   private executeDelete(written: Delete, params: Value[], ctx: CteCtx): Outcome {
+    return runSync(this.executeDeleteSteps(written, params, ctx));
+  }
+
+  private *executeDeleteSteps(written: Delete, params: Value[], ctx: CteCtx): Steps<Outcome> {
     // The statement resolves before its values are bound; a subquery plan that read one restarts
     // the statement with the values visible (estimator.md §6.1). After binding, the target scan is
     // planned with the values (the custom plan).
     const planning = Planning.begin();
     try {
-      return this.executeDeletePlanned(written, params, ctx, planning);
+      return yield* this.executeDeletePlannedSteps(written, params, ctx, planning);
     } catch (e) {
       // The error names the target's database (spec/design/error-fields.md §12).
       throw this.stampDatabase(written.db, e);
@@ -13854,6 +15357,15 @@ export class Engine {
     ctx: CteCtx,
     planning: Planning,
   ): Outcome {
+    return runSync(this.executeDeletePlannedSteps(written, params, ctx, planning));
+  }
+
+  private *executeDeletePlannedSteps(
+    written: Delete,
+    params: Value[],
+    ctx: CteCtx,
+    planning: Planning,
+  ): Steps<Outcome> {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
     checkCatalogRelWrite(written.table);
@@ -13866,7 +15378,9 @@ export class Engine {
     this.checkTargetQualifier(del.db, del.table, del.tableLoc); // attached-databases.md §3
     const table = this.lkpTableScoped(del.db, del.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + del.table).atTarget(del.tableLoc);
+      throw engineError("undefined_table", "table does not exist: " + del.table).atTarget(
+        del.tableLoc,
+      );
     }
     // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): a
     // DELETE must locate + remove a stored key, which a skewed encoding cannot match.
@@ -13887,7 +15401,10 @@ export class Engine {
         ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes, vw)
         : null;
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
-    if (planning.bind(bound)) return restartPlanning(bound, () => this.executeDelete(written, params, ctx));
+    if (planning.bind(bound))
+      return yield* restartPlanningSteps(bound, () =>
+        this.executeDeleteSteps(written, params, ctx),
+      );
 
     // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
     // spec/design/grammar.md §26, cost.md §3); a correlated one stays and re-runs per row via the
@@ -13900,20 +15417,26 @@ export class Engine {
     const contradiction = whereContradicts(filter);
     if (filter !== null) {
       const cost = { value: 0n };
-      filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, cost);
+      filter = yield* this.foldUncorrelatedInRExprSteps(filter, bound, ctx, cost);
       meter.charge(cost.value);
     }
     // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
     // pre-statement snapshot (grammar.md §32).
     if (ret !== null) {
       const cost = { value: 0n };
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, ctx, cost));
+      const folded: RExpr[] = [];
+      for (const node of ret.nodes) {
+        if (shouldCooperate()) yield COOPERATE;
+        folded.push(yield* this.foldUncorrelatedInRExprSteps(node, bound, ctx, cost));
+      }
+      ret.nodes = folded;
       meter.charge(cost.value);
     }
     const env: EvalEnv = {
       params: bound,
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, bound, ctx),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, bound, ctx),
       environment: this.session.environment,
       rng: new StmtRng(),
       ctes: ctx,
@@ -13934,14 +15457,22 @@ export class Engine {
     if (filter !== null) collectTouched(filter, 0, mask);
     if (ret !== null) {
       const retMask: boolean[] = new Array(2 * table.columns.length).fill(false);
-      for (const node of ret.nodes) collectTouched(node, 0, retMask);
+      for (const node of ret.nodes) {
+        if (shouldCooperate()) yield COOPERATE;
+        collectTouched(node, 0, retMask);
+      }
       for (let i = 0; i < mask.length; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (retMask[i]) mask[i] = true;
       }
     }
     // A generated action's keyed target reads the FK columns for its membership test (§6.11).
     if (del.fkTarget !== undefined) {
-      for (const column of del.fkTarget.fk.columns) mask[column] = true;
+      for (const column of del.fkTarget.fk.columns) {
+        if (shouldCooperate()) yield COOPERATE;
+        mask[column] = true;
+      }
     }
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
     // scan"); an empty bound deletes nothing — with RETURNING that is still a query result
@@ -13954,8 +15485,8 @@ export class Engine {
     const scanBefore = meter.accrued;
     const scan =
       del.fkTarget !== undefined
-        ? this.fkKeyedScan(del.fkTarget, del.table, mask)
-        : this.executeMutationScan(
+        ? yield* this.fkKeyedScanSteps(del.fkTarget, del.table, mask)
+        : yield* this.executeMutationScanSteps(
             this.planMutationScan(del.db, table, filter, contradiction),
             del.table,
             filter,
@@ -13970,11 +15501,14 @@ export class Engine {
       if (filter !== null) this.recordExplainActual("Filter", scanActual);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
     }
-    const blockCost = COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs);
+    const blockCost =
+      COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs);
     meter.charge(blockCost);
     scanActual += blockCost;
     let filterActual = scanActual;
     for (const e of scan.entries) {
+      if (shouldCooperate()) yield COOPERATE;
+
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
@@ -13982,11 +15516,11 @@ export class Engine {
       filterActual += COSTS.storageRowRead;
       // Materialize the filter's columns if the lazy load left them unfetched — exactly the
       // touched set the block above charged (large-values.md §14).
-      const row = store.resolveColumns(e.row, mask);
+      const row = yield* store.resolveColumnsSteps(e.row, mask);
       const beforeFilter = meter.accrued;
-      let keep = filter === null || evalFilter(filter, row, env, meter);
+      let keep = filter === null || (yield* evalFilterSteps(filter, row, env, meter));
       filterActual += meter.accrued - beforeFilter;
-      if (del.fkTarget !== undefined) keep = fkKeyedMatch(del.fkTarget, row) !== null;
+      if (del.fkTarget !== undefined) keep = (yield* fkKeyedMatchSteps(del.fkTarget, row)) !== null;
       if (keep) {
         // The FK parent-side probe + index-entry removal below read this row's key/index columns
         // directly; resolve its inline-deferred values (lazy-record.md §5b — a key column is always
@@ -14005,7 +15539,7 @@ export class Engine {
     // snapshot, and a 54P01 here deletes nothing (all-or-nothing).
     const returned =
       ret !== null
-        ? this.projectReturning(
+        ? yield* this.projectReturningSteps(
             ret.nodes,
             matched.map((m) => m.row),
             null,
@@ -14018,25 +15552,47 @@ export class Engine {
     // against the stored row) BEFORE the removals below. Resolve the table's indexes once;
     // toRemove[kx] is index kx's entries (rindexes order = indexes order).
     const rindexes = this.resolveTableIndexes(table);
-    const toRemove: IndexEntry[][] = rindexes.map((rindex) => {
+    const toRemove: IndexEntry[][] = [];
+    for (const rindex of rindexes) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const acc: IndexEntry[] = [];
-      for (const m of matched)
-        for (const ek of this.indexEntries(table.columns, store.columnTypes(), colls, rindex, m.key, m.row))
+      for (const m of matched) {
+        if (shouldCooperate()) yield COOPERATE;
+        for (const ek of yield* this.indexEntriesSteps(
+          table.columns,
+          store.columnTypes(),
+          colls,
+          rindex,
+          m.key,
+          m.row,
+        )) {
+          if (shouldCooperate()) yield COOPERATE;
           acc.push({ key: ek, skeyLen: m.key.length });
-      return acc;
-    });
+        }
+      }
+      toRemove.push(acc);
+    }
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
     // unmetered write work; an index removal cannot fail).
     const writeStore = this.writeStoreScoped(del.db, del.table);
-    for (const m of matched) writeStore.remove(m.key);
+    for (const m of matched) {
+      if (shouldCooperate()) yield COOPERATE;
+      yield* writeStore.removeSteps(m.key);
+    }
     for (let kx = 0; kx < table.indexes.length; kx++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const def = table.indexes[kx]!;
       const istore = this.writeIndexStoreScoped(del.db, def.name);
-      for (const ek of toRemove[kx]!) indexEntryRemove(istore, def.kind, ek.key, ek.skeyLen);
+      for (const ek of toRemove[kx]!) {
+        if (shouldCooperate()) yield COOPERATE;
+        yield* indexEntryRemoveSteps(istore, def.kind, ek.key, ek.skeyLen);
+      }
     }
     this.syncPendingWrites(meter);
     if (matched.length > 0) this.markEstimatorMutation(del.db, del.table);
-    this.applyFkDeleteActions(
+    yield* this.applyFkDeleteActionsSteps(
       table,
       matched.map((m) => m.row),
       meter,
@@ -14059,10 +15615,14 @@ export class Engine {
   // a collision with another row's key traps 23505 (<table>_pkey). A duplicate target
   // column traps 42701. No WHERE updates every row.
   private executeUpdate(written: Update, params: Value[], ctx: CteCtx): Outcome {
+    return runSync(this.executeUpdateSteps(written, params, ctx));
+  }
+
+  private *executeUpdateSteps(written: Update, params: Value[], ctx: CteCtx): Steps<Outcome> {
     // As DELETE: resolve probing, then plan the target scan with the bound values.
     const planning = Planning.begin();
     try {
-      return this.executeUpdatePlanned(written, params, ctx, planning);
+      return yield* this.executeUpdatePlannedSteps(written, params, ctx, planning);
     } catch (e) {
       // The error names the target's database (spec/design/error-fields.md §12).
       throw this.stampDatabase(written.db, e);
@@ -14077,6 +15637,15 @@ export class Engine {
     ctx: CteCtx,
     planning: Planning,
   ): Outcome {
+    return runSync(this.executeUpdatePlannedSteps(written, params, ctx, planning));
+  }
+
+  private *executeUpdatePlannedSteps(
+    written: Update,
+    params: Value[],
+    ctx: CteCtx,
+    planning: Planning,
+  ): Steps<Outcome> {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
     checkCatalogRelWrite(written.table);
@@ -14089,7 +15658,9 @@ export class Engine {
     this.checkTargetQualifier(upd.db, upd.table, upd.tableLoc); // attached-databases.md §3
     const table = this.lkpTableScoped(upd.db, upd.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + upd.table).atTarget(upd.tableLoc);
+      throw engineError("undefined_table", "table does not exist: " + upd.table).atTarget(
+        upd.tableLoc,
+      );
     }
     // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): an
     // UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
@@ -14122,6 +15693,8 @@ export class Engine {
     if (upd.assignments.some((a) => a.isDefault)) {
       const need = table.columns.map(() => false);
       for (const a of upd.assignments) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const idx = columnIndex(table, a.column);
         if (a.isDefault && idx >= 0) need[idx] = true;
       }
@@ -14130,6 +15703,8 @@ export class Engine {
     const pkMembers = pkIndices(table);
     const plans: AssignPlan[] = [];
     for (const a of upd.assignments) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const idx = columnIndex(table, a.column);
       if (idx < 0) {
         throw engineError("undefined_column", "column does not exist: " + a.column).withPosition(
@@ -14142,6 +15717,8 @@ export class Engine {
         throw generatedAlwaysUpdate(a.column);
       }
       for (const p of plans) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (p.idx === idx) {
           throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
         }
@@ -14237,7 +15814,10 @@ export class Engine {
     // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
     // any scan.
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
-    if (planning.bind(bound)) return restartPlanning(bound, () => this.executeUpdate(written, params, ctx));
+    if (planning.bind(bound))
+      return yield* restartPlanningSteps(bound, () =>
+        this.executeUpdateSteps(written, params, ctx),
+      );
 
     // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
     // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and re-runs
@@ -14250,19 +15830,31 @@ export class Engine {
     // The stage-2 contradiction proof (planner.md §3.1) reads the resolved WHERE before folding.
     const contradiction = whereContradicts(filter);
     const foldCost = { value: 0n };
-    for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, ctx, foldCost);
-    if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, foldCost);
+    for (const p of plans) {
+      if (shouldCooperate()) yield COOPERATE;
+      p.source = yield* this.foldUncorrelatedInRExprSteps(p.source, bound, ctx, foldCost);
+    }
+    if (filter !== null)
+      filter = yield* this.foldUncorrelatedInRExprSteps(filter, bound, ctx, foldCost);
     if (ret !== null) {
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost));
+      const folded: RExpr[] = [];
+      for (const node of ret.nodes) {
+        if (shouldCooperate()) yield COOPERATE;
+        folded.push(yield* this.foldUncorrelatedInRExprSteps(node, bound, ctx, foldCost));
+      }
+      ret.nodes = folded;
     }
     for (const vc of viewChecks) {
-      vc.check = this.foldUncorrelatedInRExpr(vc.check, bound, ctx, foldCost);
+      if (shouldCooperate()) yield COOPERATE;
+
+      vc.check = yield* this.foldUncorrelatedInRExprSteps(vc.check, bound, ctx, foldCost);
     }
     meter.charge(foldCost.value);
     const env: EvalEnv = {
       params: bound,
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, bound, ctx),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, bound, ctx),
       environment: this.session.environment,
       rng: new StmtRng(),
       ctes: ctx,
@@ -14281,10 +15873,16 @@ export class Engine {
     // value without logically re-reading it (large-values.md §14).
     const mask: boolean[] = new Array(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
-    for (const p of plans) collectTouched(p.source, 0, mask);
+    for (const p of plans) {
+      if (shouldCooperate()) yield COOPERATE;
+      collectTouched(p.source, 0, mask);
+    }
     // A generated action's keyed target reads the FK columns for its membership test (§6.11).
     if (upd.fkTarget !== undefined) {
-      for (const column of upd.fkTarget.fk.columns) mask[column] = true;
+      for (const column of upd.fkTarget.fk.columns) {
+        if (shouldCooperate()) yield COOPERATE;
+        mask[column] = true;
+      }
     }
     // The RETURNING mask spans the [base | other] projection row (new at 0, old at ncols):
     // the NEW side joins minus the assigned columns (an assigned column's returned value is
@@ -14293,8 +15891,13 @@ export class Engine {
     if (ret !== null) {
       const ncols = table.columns.length;
       const retMask: boolean[] = new Array(2 * ncols).fill(false);
-      for (const node of ret.nodes) collectTouched(node, 0, retMask);
+      for (const node of ret.nodes) {
+        if (shouldCooperate()) yield COOPERATE;
+        collectTouched(node, 0, retMask);
+      }
       for (let i = 0; i < ncols; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (retMask[i] && !plans.some((p) => p.idx === i)) mask[i] = true; // new side
         if (retMask[ncols + i]) mask[i] = true; // old side — always a storage read
       }
@@ -14310,8 +15913,8 @@ export class Engine {
     const scanBefore = meter.accrued;
     const scan =
       upd.fkTarget !== undefined
-        ? this.fkKeyedScan(upd.fkTarget, upd.table, mask)
-        : this.executeMutationScan(
+        ? yield* this.fkKeyedScanSteps(upd.fkTarget, upd.table, mask)
+        : yield* this.executeMutationScanSteps(
             this.planMutationScan(upd.db, table, filter, contradiction),
             upd.table,
             filter,
@@ -14326,22 +15929,25 @@ export class Engine {
       if (filter !== null) this.recordExplainActual("Filter", scanActual);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
     }
-    const blockCost = COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs);
+    const blockCost =
+      COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs);
     meter.charge(blockCost);
     scanActual += blockCost;
     let filterActual = scanActual;
     const assignedCol: boolean[] = table.columns.map((_, i) => plans.some((p) => p.idx === i));
     for (const e of scan.entries) {
+      if (shouldCooperate()) yield COOPERATE;
+
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       scanActual += COSTS.storageRowRead;
       filterActual += COSTS.storageRowRead;
       // Materialize the filter's + assignment sources' columns if the lazy load left them
       // unfetched — exactly the touched set the block above charged (large-values.md §14).
-      const filtered = store.resolveColumns(e.row, mask);
+      const filtered = yield* store.resolveColumnsSteps(e.row, mask);
       if (filter !== null) {
         const beforeFilter = meter.accrued;
-        const keep = evalFilter(filter, filtered, env, meter);
+        const keep = yield* evalFilterSteps(filter, filtered, env, meter);
         filterActual += meter.accrued - beforeFilter;
         if (!keep) continue;
       }
@@ -14349,7 +15955,7 @@ export class Engine {
       // CASCADE substitutes that tuple's new values for its placeholder assignments (§6.6).
       let mapped: Value[] | null = null;
       if (upd.fkTarget !== undefined) {
-        const i = fkKeyedMatch(upd.fkTarget, filtered);
+        const i = yield* fkKeyedMatchSteps(upd.fkTarget, filtered);
         if (i === null) continue;
         if (upd.fkTarget.next !== null) mapped = upd.fkTarget.next[i]!;
       }
@@ -14360,8 +15966,10 @@ export class Engine {
       const newRow = row.slice();
       let nullCol: string | null = null;
       for (const p of plans) {
+        if (shouldCooperate()) yield COOPERATE;
+
         try {
-          let raw = evalExpr(p.source, row, env, meter);
+          let raw = yield* evalExprSteps(p.source, row, env, meter);
           if (mapped !== null)
             raw = fkCascadeValue(mapped[upd.fkTarget!.fk.columns.indexOf(p.idx)]!, p.target);
           // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
@@ -14375,31 +15983,38 @@ export class Engine {
           throw stampTable(e, table.name);
         }
       }
-      if (nullCol !== null) throw this.notNullRowViolation(table.name, nullCol, newRow);
+      if (nullCol !== null) throw yield* this.notNullRowViolationSteps(table.name, nullCol, newRow);
       // An unassigned non-key column carries its stored large value over deferred — taken from the
       // stored row, so the statement reading it does not matter — and the rewrite neither re-reads
       // nor recompresses it while the commit keeps its chain (large-values.md §15); every other
       // deferred value is resolved — unmetered, part of the rewrite like commit work (§14). CHECK and
       // RETURNING read a carried value through the evaluator's demand fault, also unmetered.
       for (let i = 0; i < newRow.length; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const carried = !assignedCol[i] && !pkMembers.includes(i);
         const sv = e.row[i]!;
         const nv = newRow[i]!;
         if (carried && sv.kind === "unfetched" && sv.ref.form !== 0x00) newRow[i] = sv;
-        else if (nv.kind === "unfetched") newRow[i] = store.resolveValue(i, nv.ref);
+        else if (nv.kind === "unfetched") newRow[i] = yield* store.resolveValueSteps(i, nv.ref);
       }
       // CHECK constraints, in name order, on the post-assignment row — after the
       // assignments coerced (22003/23502 in checkAssign above) (constraints.md §4.4). Every check
       // evaluates (not only those mentioning assigned columns); TRUE and NULL pass, the first FALSE
       // aborts the statement (phase 1 — nothing has been written).
-      evalChecks(checks, table.name, newRow, env, meter);
+      yield* evalChecksSteps(checks, table.name, newRow, env, meter);
       // The row's NEW storage key: recomputed from the post-assignment row when a key member
       // was assigned (re-keying), else the unchanged old key.
       const newKey = pkChanged ? encodePkKey(store.columnTypes(), pkMembers, colls, newRow) : e.key;
       // A carried value stays deferred only where the new row's plan stores it in its stored form;
       // the rest are resolved, so the stored row plans exactly as a resident one would
       // (large-values.md §15).
-      updates.push({ key: e.key, newKey, row: store.settleCarried(newKey, newRow), oldRow: row });
+      updates.push({
+        key: e.key,
+        newKey,
+        row: yield* store.settleCarriedSteps(newKey, newRow),
+        oldRow: row,
+      });
     }
     this.recordExplainActual("Scan " + upd.table, scanActual);
     if (filter !== null) this.recordExplainActual("Filter", filterActual);
@@ -14414,11 +16029,21 @@ export class Engine {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
       const batch = new Set<string>();
       for (const u of updates) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const nk = u.newKey.join(",");
-        const collides = batch.has(nk) || (store.get(u.newKey) !== undefined && !rewritten.has(nk));
+        const collides =
+          batch.has(nk) || ((yield* store.getSteps(u.newKey)) !== undefined && !rewritten.has(nk));
         if (collides) {
           throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
-            pkDetail(this.session, table.name, table.columns, pkMembers, u.row, DETAIL_EXISTS),
+            yield* pkDetailSteps(
+              this.session,
+              table.name,
+              table.columns,
+              pkMembers,
+              u.row,
+              DETAIL_EXISTS,
+            ),
           );
         }
         batch.add(nk);
@@ -14435,21 +16060,25 @@ export class Engine {
     if (updates.length > 0 && table.indexes.some((d) => d.unique)) {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
       for (const rindex of rindexes) {
+        if (shouldCooperate()) yield COOPERATE;
+
         if (!rindex.unique) continue;
         const istore = this.lkpIndexStoreScoped(upd.db, rindex.name);
         const batch = new Set<string>();
         for (const u of updates) {
-          const prefix = this.indexPrefix(store.columnTypes(), colls, rindex, u.row);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const prefix = yield* this.indexPrefixSteps(store.columnTypes(), colls, rindex, u.row);
           if (prefix === null) continue;
           const k = prefix.join(",");
           const conflict =
             batch.has(k) ||
-            istore
-              .rangeEntries(uniqueProbeBound(prefix))
-              .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
+            (yield* istore.rangeEntriesSteps(uniqueProbeBound(prefix))).some(
+              (e) => !rewritten.has(e.key.slice(prefix.length).join(",")),
+            );
           if (conflict) {
             throw uniqueViolation(table.name, rindex.name).withDetail(
-              indexDetailByName(this.session, table, rindex, u.row, env, DETAIL_EXISTS),
+              yield* indexDetailByNameSteps(this.session, table, rindex, u.row, env, DETAIL_EXISTS),
             );
           }
           batch.add(k);
@@ -14459,7 +16088,10 @@ export class Engine {
 
     // The check option (views.md §15.6): each new row, in scan order, after the end-state PK and
     // UNIQUE checks and before EXCLUDE and FOREIGN KEY.
-    for (const u of updates) evalViewChecks(viewChecks, u.row, env, meter);
+    for (const u of updates) {
+      if (shouldCooperate()) yield COOPERATE;
+      yield* evalViewChecksSteps(viewChecks, u.row, env, meter);
+    }
 
     // EXCLUDE end-state validation (spec/design/gist.md §7), mirroring UNIQUE's: each updated NEW row
     // must conflict with no OTHER row in the statement's END STATE — neither a STORED row that is NOT
@@ -14469,7 +16101,7 @@ export class Engine {
     // documented UNIQUE end-state divergence). Unmetered, phase 1, before any write.
     if (updates.length > 0) {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
-      this.validateExclusions(
+      yield* this.validateExclusionsSteps(
         upd.db,
         table,
         updates.map((u) => u.row),
@@ -14486,6 +16118,8 @@ export class Engine {
     const assigned = new Set<number>(plans.map((p) => p.idx));
     const { fks: updFks, temp: fkTemp } = this.targetForeignKeys(upd.db, upd.table);
     for (const fk of updFks) {
+      if (shouldCooperate()) yield COOPERATE;
+
       if (!fk.columns.some((c) => assigned.has(c))) continue; // this FK's local columns were not assigned
       const parent = this.fkSnap(fkTemp).table(fk.refTable);
       if (parent === undefined) continue;
@@ -14495,20 +16129,24 @@ export class Engine {
       const batch = new Set<string>();
       if (fk.refTable === relation) {
         for (const u of updates) {
-          const p = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
+          if (shouldCooperate()) yield COOPERATE;
+
+          const p = yield* fkProbeSteps(fk, parent, parentColls, u.row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
       }
       for (const u of updates) {
-        const probe = fkProbe(fk, parent, parentColls, u.row, fk.columns);
+        if (shouldCooperate()) yield COOPERATE;
+
+        const probe = yield* fkProbeSteps(fk, parent, parentColls, u.row, fk.columns);
         if (probe === null) {
           // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
           if (fkMatchFullViolated(fk, u.row))
-            this.fkChildCheck(relation, table.columns, fk, null, u.row, fkTemp);
+            yield* this.fkChildCheckSteps(relation, table.columns, fk, null, u.row, fkTemp);
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        this.fkChildCheck(relation, table.columns, fk, probe, u.row, fkTemp);
+        yield* this.fkChildCheckSteps(relation, table.columns, fk, probe, u.row, fkTemp);
       }
     }
 
@@ -14519,7 +16157,10 @@ export class Engine {
     // — meter the attempts (value_compress, cost.md §3) and enforce the ceiling BEFORE phase 2
     // writes anything, preserving all-or-nothing.
     let cunits = 0n;
-    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.newKey, u.row));
+    for (const u of updates) {
+      if (shouldCooperate()) yield COOPERATE;
+      cunits += BigInt(store.writeCompressUnits(u.newKey, u.row));
+    }
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
@@ -14529,7 +16170,7 @@ export class Engine {
     // writes nothing (all-or-nothing).
     const returned =
       ret !== null
-        ? this.projectReturning(
+        ? yield* this.projectReturningSteps(
             ret.nodes,
             updates.map((u) => u.row),
             updates.map((u) => u.oldRow),
@@ -14547,17 +16188,40 @@ export class Engine {
     // only entries whose indexed columns changed.
     const indexMoves: IndexMove[][] = table.indexes.map(() => []);
     for (const u of updates) {
+      if (shouldCooperate()) yield COOPERATE;
+
       for (let k = 0; k < table.indexes.length; k++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         // The row's old and new entry SETS (one entry for an ordered index, one per term for GIN —
         // gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched, keeping the
         // copy-on-write dirty set byte-identical across cores. Computed (evaluating any expression
         // key) before the phase-2 writes.
-        const oldEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.key, u.oldRow);
-        const newEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.newKey, u.row);
+        const oldEks = yield* this.indexEntriesSteps(
+          table.columns,
+          store.columnTypes(),
+          colls,
+          rindexes[k]!,
+          u.key,
+          u.oldRow,
+        );
+        const newEks = yield* this.indexEntriesSteps(
+          table.columns,
+          store.columnTypes(),
+          colls,
+          rindexes[k]!,
+          u.newKey,
+          u.row,
+        );
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0) {
-          indexMoves[k]!.push({ removals, insertions, oldLen: u.key.length, newLen: u.newKey.length });
+          indexMoves[k]!.push({
+            removals,
+            insertions,
+            oldLen: u.key.length,
+            newLen: u.newKey.length,
+          });
         }
       }
     }
@@ -14571,9 +16235,14 @@ export class Engine {
     // moved row's not-yet-removed old entry.
     const writeStore = this.writeStoreScoped(upd.db, upd.table);
     if (pkChanged) {
-      for (const u of updates) writeStore.remove(u.key);
       for (const u of updates) {
-        if (!writeStore.insert(u.newKey, u.row)) {
+        if (shouldCooperate()) yield COOPERATE;
+        yield* writeStore.removeSteps(u.key);
+      }
+      for (const u of updates) {
+        if (shouldCooperate()) yield COOPERATE;
+
+        if (!(yield* writeStore.insertSteps(u.newKey, u.row))) {
           // Reachable only under the writable-CTE read pin (writable-cte.md §7): an earlier
           // sub-statement staged this key, unseen by phase 1. Aborts all-or-nothing, matching
           // INSERT. For a single statement, phase 1's end-state check caught every duplicate.
@@ -14581,27 +16250,50 @@ export class Engine {
         }
       }
       for (let k = 0; k < table.indexes.length; k++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const kind = table.indexes[k]!.kind;
         const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name);
-        for (const mv of indexMoves[k]!)
-          for (const oldEk of mv.removals) indexEntryRemove(istore, kind, oldEk, mv.oldLen);
-        for (const mv of indexMoves[k]!)
+        for (const mv of indexMoves[k]!) {
+          if (shouldCooperate()) yield COOPERATE;
+          for (const oldEk of mv.removals) {
+            if (shouldCooperate()) yield COOPERATE;
+            yield* indexEntryRemoveSteps(istore, kind, oldEk, mv.oldLen);
+          }
+        }
+        for (const mv of indexMoves[k]!) {
+          if (shouldCooperate()) yield COOPERATE;
           for (const newEk of mv.insertions) {
-            if (!indexEntryInsert(istore, kind, newEk, mv.newLen)) {
+            if (shouldCooperate()) yield COOPERATE;
+
+            if (!(yield* indexEntryInsertSteps(istore, kind, newEk, mv.newLen))) {
               // A cross-sub-statement collision under the read pin (as above).
               throw uniqueViolation(table.name, table.indexes[k]!.name);
             }
           }
+        }
       }
     } else {
-      for (const u of updates) writeStore.replace(u.key, u.row);
+      for (const u of updates) {
+        if (shouldCooperate()) yield COOPERATE;
+        yield* writeStore.replaceSteps(u.key, u.row);
+      }
       for (let k = 0; k < table.indexes.length; k++) {
+        if (shouldCooperate()) yield COOPERATE;
+
         const kind = table.indexes[k]!.kind;
         const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name);
         for (const mv of indexMoves[k]!) {
-          for (const oldEk of mv.removals) indexEntryRemove(istore, kind, oldEk, mv.oldLen);
+          if (shouldCooperate()) yield COOPERATE;
+
+          for (const oldEk of mv.removals) {
+            if (shouldCooperate()) yield COOPERATE;
+            yield* indexEntryRemoveSteps(istore, kind, oldEk, mv.oldLen);
+          }
           for (const newEk of mv.insertions) {
-            if (!indexEntryInsert(istore, kind, newEk, mv.newLen)) {
+            if (shouldCooperate()) yield COOPERATE;
+
+            if (!(yield* indexEntryInsertSteps(istore, kind, newEk, mv.newLen))) {
               throw engineError(
                 "data_corrupted",
                 "index entry keys are unique (storage-key suffix)",
@@ -14613,7 +16305,7 @@ export class Engine {
     }
     this.syncPendingWrites(meter);
     if (updates.length > 0) this.markEstimatorMutation(upd.db, upd.table);
-    this.applyFkUpdateActions(table, updates, meter, this.fkDomain(upd.db, upd.table));
+    yield* this.applyFkUpdateActionsSteps(table, updates, meter, this.fkDomain(upd.db, upd.table));
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,
@@ -14626,7 +16318,11 @@ export class Engine {
   // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query
   // Outcome (the projection types are internal — only INSERT ... SELECT consumes them).
   private executeSelect(sel: Select, params: Value[]): Outcome {
-    const r = this.runSelect(sel, params);
+    return runSync(this.executeSelectSteps(sel, params));
+  }
+
+  private *executeSelectSteps(sel: Select, params: Value[]): Steps<Outcome> {
+    const r = yield* this.runSelectSteps(sel, params);
     return {
       kind: "query",
       columnNames: r.columnNames,
@@ -14639,7 +16335,11 @@ export class Engine {
   // executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
   // Outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
   private executeSetOp(so: SetOp, params: Value[]): Outcome {
-    const r = this.runSetOp(so, params);
+    return runSync(this.executeSetOpSteps(so, params));
+  }
+
+  private *executeSetOpSteps(so: SetOp, params: Value[]): Steps<Outcome> {
+    const r = yield* this.runSetOpSteps(so, params);
     return {
       kind: "query",
       columnNames: r.columnNames,
@@ -14659,6 +16359,10 @@ export class Engine {
   // and finally EXECUTE against an empty outer-row environment. Correlated subqueries that survive
   // the fold are re-executed per outer row by the evaluator.
   private runQueryExpr(qe: QueryExpr, params: Value[]): SelectResult {
+    return runSync(this.runQueryExprSteps(qe, params));
+  }
+
+  private *runQueryExprSteps(qe: QueryExpr, params: Value[]): Steps<SelectResult> {
     const planning = Planning.begin();
     try {
       const ptypes = new ParamTypes();
@@ -14668,8 +16372,8 @@ export class Engine {
       // plan (estimator.md §6.1).
       if (planning.bind(bound)) plan = this.planQuery(qe, null, [], new ParamTypes());
       const subqueryCost = { value: 0n };
-      this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, subqueryCost);
-      const r = this.execQueryPlan(plan, [], bound, EMPTY_CTE_CTX);
+      yield* this.foldUncorrelatedInPlanSteps(plan, bound, EMPTY_CTE_CTX, subqueryCost);
+      const r = yield* this.execQueryPlanSteps(plan, [], bound, EMPTY_CTE_CTX);
       return { ...r, cost: r.cost + subqueryCost.value };
     } finally {
       planning.end();
@@ -14678,25 +16382,37 @@ export class Engine {
 
   // runSelect runs a lone SELECT — the entry point executeSelect and INSERT ... SELECT use.
   private runSelect(sel: Select, params: Value[]): SelectResult {
-    return this.runQueryExpr(sel, params);
+    return runSync(this.runSelectSteps(sel, params));
+  }
+
+  private *runSelectSteps(sel: Select, params: Value[]): Steps<SelectResult> {
+    return yield* this.runQueryExprSteps(sel, params);
   }
 
   // runSetOp runs a set operation as a top-level statement.
   private runSetOp(so: SetOp, params: Value[]): SelectResult {
-    return this.runQueryExpr(so, params);
+    return runSync(this.runSetOpSteps(so, params));
+  }
+
+  private *runSetOpSteps(so: SetOp, params: Value[]): Steps<SelectResult> {
+    return yield* this.runQueryExprSteps(so, params);
   }
 
   // executeWith runs a WITH query (spec/design/cte.md) as a top-level statement: runWith, then wrap
   // as a query Outcome.
   private executeWith(wq: WithQuery, params: Value[]): Outcome {
+    return runSync(this.executeWithSteps(wq, params));
+  }
+
+  private *executeWithSteps(wq: WithQuery, params: Value[]): Steps<Outcome> {
     // A WITH containing any data-modifying part (a data-modifying CTE or a data-modifying primary)
     // runs through the writable-CTE orchestrator (spec/design/writable-cte.md): it pins the
     // pre-statement snapshot and runs the parts in lexical order, all-or-nothing. A pure-query WITH
     // keeps the existing read-only path (cte.md) unchanged.
     if (withHasDml(wq)) {
-      return this.executeWithDml(wq, params);
+      return yield* this.executeWithDmlSteps(wq, params);
     }
-    const r = this.runWith(wq, params);
+    const r = yield* this.runWithSteps(wq, params);
     return {
       kind: "query",
       columnNames: r.columnNames,
@@ -14760,7 +16476,10 @@ export class Engine {
             lname,
             [...table.columns.map((c) => c.name), ...sc.names],
             [...anchorPlan.columnTypes, ...sc.types],
-            [...queryPlanColumnDerivs(anchorPlan), ...sc.types.map((): Deriv => ({ kind: "none" }))],
+            [
+              ...queryPlanColumnDerivs(anchorPlan),
+              ...sc.types.map((): Deriv => ({ kind: "none" })),
+            ],
             [...queryPlanColumnTypmods(anchorPlan), ...sc.types.map(() => TYPMOD_NONE)],
             null,
           );
@@ -14933,15 +16652,27 @@ export class Engine {
   // earlier buffers); (5) fold + EXECUTE the main body with the CTE context. Cost composes like set
   // operations — a sum of the parts.
   private runWith(wq: WithQuery, params: Value[]): SelectResult {
+    return runSync(this.runWithSteps(wq, params));
+  }
+
+  private *runWithSteps(wq: WithQuery, params: Value[]): Steps<SelectResult> {
     const planning = Planning.begin();
     try {
-      return this.runWithPlanned(wq, params, planning);
+      return yield* this.runWithPlannedSteps(wq, params, planning);
     } finally {
       planning.end();
     }
   }
 
   private runWithPlanned(wq: WithQuery, params: Value[], planning: Planning): SelectResult {
+    return runSync(this.runWithPlannedSteps(wq, params, planning));
+  }
+
+  private *runWithPlannedSteps(
+    wq: WithQuery,
+    params: Value[],
+    planning: Planning,
+  ): Steps<SelectResult> {
     const bodyQuery = cteBodyAsQuery(wq.body);
     if (bodyQuery === null) {
       throw new Error("runWith is the pure-query path");
@@ -14957,13 +16688,19 @@ export class Engine {
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
     if (planning.bind(bound)) ({ bindings, plan } = planAll(new ParamTypes()));
     const modes = cteModes(bindings);
-    const { buffers, totalCost } = this.materializeCtes(bindings, modes, bound, EMPTY_CTE_CTX, []);
+    const { buffers, totalCost } = yield* this.materializeCtesSteps(
+      bindings,
+      modes,
+      bound,
+      EMPTY_CTE_CTX,
+      [],
+    );
 
     // (5) Fold + execute the main body against the full CTE context.
     const ctx = topLevelCteCtx(modes, bindings, buffers);
     const subqueryCost = { value: 0n };
-    this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
-    const r = this.execQueryPlan(plan, [], bound, ctx);
+    yield* this.foldUncorrelatedInPlanSteps(plan, bound, ctx, subqueryCost);
+    const r = yield* this.execQueryPlanSteps(plan, [], bound, ctx);
     releaseCteBuffers(this.session.queryAccount, buffers);
     const result = { ...r, cost: r.cost + subqueryCost.value + totalCost };
     this.recordExplainActualParent("WITH", result.cost);
@@ -14983,9 +16720,20 @@ export class Engine {
     inherited: CteCtx,
     outer: Row[],
   ): { buffers: Row[][]; totalCost: bigint } {
+    return runSync(this.materializeCtesSteps(bindings, modes, bound, inherited, outer));
+  }
+
+  private *materializeCtesSteps(
+    bindings: CteBinding[],
+    modes: CteMode[],
+    bound: Value[],
+    inherited: CteCtx,
+    outer: Row[],
+  ): Steps<{ buffers: Row[][]; totalCost: bigint }> {
     const totalCost = { value: 0n };
     const buffers: Row[][] = [];
     for (let i = 0; i < bindings.length; i++) {
+      if (shouldCooperate()) yield COOPERATE;
       const before = totalCost.value;
       const binding = bindings[i]!;
       const bodyVisible =
@@ -14997,7 +16745,7 @@ export class Engine {
       const rt = bindings[i]!.recursive;
       let buf: Row[];
       if (rt) {
-        buf = this.materializeRecursive(
+        buf = yield* this.materializeRecursiveSteps(
           i,
           rt,
           modes,
@@ -15023,7 +16771,7 @@ export class Engine {
         if (src.kind !== "query") {
           throw new Error("the data-modifying arm was handled above");
         }
-        const r = this.execQueryPlan(src.plan, outer, bound, ctx);
+        const r = yield* this.execQueryPlanSteps(src.plan, outer, bound, ctx);
         totalCost.value += r.cost;
         buf = r.rows;
       } else {
@@ -15052,6 +16800,32 @@ export class Engine {
     outer: Row[],
     totalCost: { value: bigint },
   ): Row[] {
+    return runSync(
+      this.materializeRecursiveSteps(
+        ci,
+        rt,
+        modes,
+        bindings,
+        priorBuffers,
+        params,
+        inherited,
+        outer,
+        totalCost,
+      ),
+    );
+  }
+
+  private *materializeRecursiveSteps(
+    ci: number,
+    rt: RecursiveTerm,
+    modes: CteMode[],
+    bindings: CteBinding[],
+    priorBuffers: Row[][],
+    params: Value[],
+    inherited: CteCtx,
+    outer: Row[],
+    totalCost: { value: bigint },
+  ): Steps<Row[]> {
     const anchorSrc = bindings[ci]!.source;
     if (anchorSrc.kind !== "query") {
       throw new Error("a recursive CTE's anchor is a query plan");
@@ -15074,7 +16848,7 @@ export class Engine {
     const acct = this.session.queryAccount;
 
     // Evaluate the anchor: its rows seed both the result and the first working table.
-    const ar = this.execQueryPlan(
+    const ar = yield* this.execQueryPlanSteps(
       anchorPlan,
       outer,
       params,
@@ -15087,6 +16861,7 @@ export class Engine {
       params,
       outer,
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, EMPTY_CTE_CTX),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, params, EMPTY_CTE_CTX),
       environment: this.session.environment,
       rng: new StmtRng(),
       ctes: EMPTY_CTE_CTX,
@@ -15119,6 +16894,7 @@ export class Engine {
     const result: Row[] = [];
     let working: Row[] = [];
     for (const row of anchorRows) {
+      if (shouldCooperate()) yield COOPERATE;
       if (keep(row)) {
         acct.admitRow(row);
         result.push(row);
@@ -15132,14 +16908,18 @@ export class Engine {
     // CTEs keep their full buffers. Build the buffer array once and swap slot ci per iteration. The
     // copy of the earlier buffers is itself a row buffer.
     const rhsBuffers: Row[][] = priorBuffers.slice(0, ci);
-    for (const buf of rhsBuffers) acct.reserve(acct.measureRows(buf));
+    for (const buf of rhsBuffers) {
+      if (shouldCooperate()) yield COOPERATE;
+      acct.reserve(acct.measureRows(buf));
+    }
     rhsBuffers.push([]); // slot ci
 
     while (working.length > 0) {
+      if (shouldCooperate()) yield COOPERATE;
       acct.release(acct.measureRows(rhsBuffers[ci]!));
       rhsBuffers[ci] = working;
       working = [];
-      const rr = this.execQueryPlan(
+      const rr = yield* this.execQueryPlanSteps(
         rt.plan,
         outer,
         params,
@@ -15166,6 +16946,7 @@ export class Engine {
         newRows = r.rows;
       }
       for (const row of newRows) {
+        if (shouldCooperate()) yield COOPERATE;
         if (keep(row)) {
           acct.admitRow(row);
           result.push(row);
@@ -15175,7 +16956,10 @@ export class Engine {
         }
       }
     }
-    for (const buf of rhsBuffers) acct.release(acct.measureRows(buf));
+    for (const buf of rhsBuffers) {
+      if (shouldCooperate()) yield COOPERATE;
+      acct.release(acct.measureRows(buf));
+    }
     seenCharge.releaseAll();
     return result;
   }
@@ -15187,6 +16971,10 @@ export class Engine {
   // primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or
   // block) wrapper publishes the accumulated working only if this returns without throwing (§6).
   private executeWithDml(wq: WithQuery, params: Value[]): Outcome {
+    return runSync(this.executeWithDmlSteps(wq, params));
+  }
+
+  private *executeWithDmlSteps(wq: WithQuery, params: Value[]): Steps<Outcome> {
     // Pin the pre-statement snapshot of every database domain (main, temp, each attachment). A write
     // statement runs with a transaction open (autocommit opened one), and nothing is written yet, so
     // each pin equals that domain's working state. Cleared on every exit path so the next statement
@@ -15196,7 +16984,7 @@ export class Engine {
     // working state every sub-statement produced, in the order the checks were queued.
     this.fkStatementDefer = true;
     try {
-      return this.runWithDml(wq, params);
+      return yield* this.runWithDmlSteps(wq, params);
     } finally {
       this.session.readPin = null;
       this.fkStatementDefer = false;
@@ -15208,17 +16996,29 @@ export class Engine {
   // query primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
   // primary — every read against the pin, every write into the transaction's working.
   private runWithDml(wq: WithQuery, params: Value[]): Outcome {
+    return runSync(this.runWithDmlSteps(wq, params));
+  }
+
+  private *runWithDmlSteps(wq: WithQuery, params: Value[]): Steps<Outcome> {
     // Every part is planned before the values are bound; a probe that read one restarts the
     // statement with the values visible (estimator.md §6.1).
     const planning = Planning.begin();
     try {
-      return this.runWithDmlPlanned(wq, params, planning);
+      return yield* this.runWithDmlPlannedSteps(wq, params, planning);
     } finally {
       planning.end();
     }
   }
 
   private runWithDmlPlanned(wq: WithQuery, params: Value[], planning: Planning): Outcome {
+    return runSync(this.runWithDmlPlannedSteps(wq, params, planning));
+  }
+
+  private *runWithDmlPlannedSteps(
+    wq: WithQuery,
+    params: Value[],
+    planning: Planning,
+  ): Steps<Outcome> {
     const { ctes, body, recursive } = wq;
     const ptypes = new ParamTypes();
     // (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
@@ -15235,19 +17035,26 @@ export class Engine {
     //      is correct for a query CTE referenced only by a data-modifying part (§3). Query bodies / a
     //      query primary were already plan-counted in (1)/(2).
     for (const cte of ctes) {
+      if (shouldCooperate()) yield COOPERATE;
+
       if (cteBodyIsDataModifying(cte.body)) {
         for (const b of bindings) {
+          if (shouldCooperate()) yield COOPERATE;
+
           b.refs += countCteRefsDml(cte.body, b.name);
         }
       }
     }
     if (cteBodyIsDataModifying(body)) {
       for (const b of bindings) {
+        if (shouldCooperate()) yield COOPERATE;
+
         b.refs += countCteRefsDml(body, b.name);
       }
     }
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
-    if (planning.bind(bound)) return restartPlanning(bound, () => this.runWithDml(wq, params));
+    if (planning.bind(bound))
+      return yield* restartPlanningSteps(bound, () => this.runWithDmlSteps(wq, params));
     const modes = cteModes(bindings);
 
     // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its
@@ -15255,6 +17062,8 @@ export class Engine {
     const totalCost = { value: 0n };
     const buffers: Row[][] = [];
     for (let i = 0; i < bindings.length; i++) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const before = totalCost.value;
       const binding = bindings[i]!;
       const bodyVisible =
@@ -15266,7 +17075,7 @@ export class Engine {
       const rt = bindings[i]!.recursive;
       let buf: Row[];
       if (rt) {
-        buf = this.materializeRecursive(
+        buf = yield* this.materializeRecursiveSteps(
           i,
           rt,
           modes,
@@ -15279,7 +17088,7 @@ export class Engine {
         );
       } else if (bindings[i]!.source.kind === "dml") {
         const ctx = topLevelCteCtx(modes.slice(0, i), bindings.slice(0, i), buffers);
-        const { rows, cost } = this.execDmCte(i, bindings, bound, ctx);
+        const { rows, cost } = yield* this.execDmCteSteps(i, bindings, bound, ctx);
         totalCost.value += cost;
         buf = rows;
       } else if (modes[i] === "materialize") {
@@ -15288,7 +17097,7 @@ export class Engine {
         if (src.kind !== "query") {
           throw new Error("the data-modifying arm was handled above");
         }
-        const r = this.execQueryPlan(src.plan, [], bound, ctx);
+        const r = yield* this.execQueryPlanSteps(src.plan, [], bound, ctx);
         totalCost.value += r.cost;
         buf = r.rows;
       } else {
@@ -15304,8 +17113,8 @@ export class Engine {
     if (body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr") {
       const plan = primaryPlan!;
       const subqueryCost = { value: 0n };
-      this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
-      const r = this.execQueryPlan(plan, [], bound, ctx);
+      yield* this.foldUncorrelatedInPlanSteps(plan, bound, ctx, subqueryCost);
+      const r = yield* this.execQueryPlanSteps(plan, [], bound, ctx);
       outcome = {
         kind: "query",
         columnNames: r.columnNames,
@@ -15314,22 +17123,19 @@ export class Engine {
         cost: r.cost + subqueryCost.value,
       };
     } else if (body.kind === "insert") {
-      outcome = this.executeInsert(body, params, ctx);
+      outcome = yield* this.executeInsertSteps(body, params, ctx);
     } else if (body.kind === "update") {
-      outcome = this.executeUpdate(body, params, ctx);
+      outcome = yield* this.executeUpdateSteps(body, params, ctx);
     } else {
-      outcome = this.executeDelete(body, params, ctx);
+      outcome = yield* this.executeDeleteSteps(body, params, ctx);
     }
-    if (body.kind === "insert")
-      this.recordExplainActual("Insert " + body.table, outcome.cost);
-    else if (body.kind === "update")
-      this.recordExplainActual("Update " + body.table, outcome.cost);
-    else if (body.kind === "delete")
-      this.recordExplainActual("Delete " + body.table, outcome.cost);
+    if (body.kind === "insert") this.recordExplainActual("Insert " + body.table, outcome.cost);
+    else if (body.kind === "update") this.recordExplainActual("Update " + body.table, outcome.cost);
+    else if (body.kind === "delete") this.recordExplainActual("Delete " + body.table, outcome.cost);
     // (5) Settle every foreign-key check the parts queued, against the end state of the whole
     //     statement (§7). A parent-side reverse match is metered (constraints.md §6.11).
     const fkMeter = this.session.newMeter();
-    this.flushFkDeferredChecks(fkMeter);
+    yield* this.flushFkDeferredChecksSteps(fkMeter);
     releaseCteBuffers(this.session.queryAccount, buffers);
     outcome = addOutcomeCost(outcome, totalCost.value + fkMeter.accrued);
     this.recordExplainActualParent("WITH", outcome.cost);
@@ -15346,6 +17152,15 @@ export class Engine {
     params: Value[],
     ctx: CteCtx,
   ): { rows: Row[]; cost: bigint } {
+    return runSync(this.execDmCteSteps(i, bindings, params, ctx));
+  }
+
+  private *execDmCteSteps(
+    i: number,
+    bindings: CteBinding[],
+    params: Value[],
+    ctx: CteCtx,
+  ): Steps<{ rows: Row[]; cost: bigint }> {
     const src = bindings[i]!.source;
     if (src.kind !== "dml") {
       throw new Error("execDmCte requires a data-modifying binding");
@@ -15353,11 +17168,11 @@ export class Engine {
     const stmt = src.dm.stmt;
     let outcome: Outcome;
     if (stmt.kind === "insert") {
-      outcome = this.executeInsert(stmt, params, ctx);
+      outcome = yield* this.executeInsertSteps(stmt, params, ctx);
     } else if (stmt.kind === "update") {
-      outcome = this.executeUpdate(stmt, params, ctx);
+      outcome = yield* this.executeUpdateSteps(stmt, params, ctx);
     } else {
-      outcome = this.executeDelete(stmt, params, ctx);
+      outcome = yield* this.executeDeleteSteps(stmt, params, ctx);
     }
     this.recordExplainActual(
       `${stmt.kind === "insert" ? "Insert" : stmt.kind === "update" ? "Update" : "Delete"} ${stmt.table}`,
@@ -15674,7 +17489,10 @@ export class Engine {
   // or null. For INSERT / UPDATE (checkCols) the body must also output at least one plain column
   // reference. A stored body has no `*`; at CREATE VIEW a `*` or `label.*` item counts as plain
   // column references, which it expands to (§1.1 step 4).
-  private updatableShape(body: QueryExpr, checkCols: boolean): { sel: Select; tref: TableRef } | null {
+  private updatableShape(
+    body: QueryExpr,
+    checkCols: boolean,
+  ): { sel: Select; tref: TableRef } | null {
     if (body.kind !== "select") return null;
     const sel = body;
     if (
@@ -15794,7 +17612,13 @@ export class Engine {
       setCur.push(idx);
     }
     // 5. Each view from the target down: updatable, then its target columns.
-    type Level = { view: ViewDef; rename: string[] | undefined; label: string; cols: LayerCol[]; filter: Expr | null };
+    type Level = {
+      view: ViewDef;
+      rename: string[] | undefined;
+      label: string;
+      cols: LayerCol[];
+      filter: Expr | null;
+    };
     const levels: Level[] = [];
     let levelView = view;
     let rename: string[] | undefined;
@@ -15852,7 +17676,10 @@ export class Engine {
     for (const list of [cur, setCur]) {
       list.forEach((c, i) => {
         if (list.slice(0, i).includes(c)) {
-          throw engineError("duplicate_column", `column ${table.columns[c]!.name} assigned more than once`);
+          throw engineError(
+            "duplicate_column",
+            `column ${table.columns[c]!.name} assigned more than once`,
+          );
         }
       });
     }
@@ -16027,7 +17854,8 @@ export class Engine {
   // (viewConflictTarget). It returns a copy of the statement (the written one is left intact) and
   // the write, or the statement unchanged and null when the target is not a view.
   rewriteInsertTarget(ins: Insert): { ins: Insert; vw: ViewWrite | null } {
-    const set = ins.onConflict !== null && ins.onConflict.doUpdate ? ins.onConflict.assignments : [];
+    const set =
+      ins.onConflict !== null && ins.onConflict.doUpdate ? ins.onConflict.assignments : [];
     const vw = this.prepareViewWrite(
       ins.db,
       ins.table,
@@ -16043,7 +17871,12 @@ export class Engine {
     if (onConflict !== null && onConflict.doUpdate) {
       const assignments = onConflict.assignments.map((a, i) =>
         a.isDefault
-          ? { ...a, column: vw.conflictSet[i]!, isDefault: false, value: this.viewSetDefault(vw.view, a.column) }
+          ? {
+              ...a,
+              column: vw.conflictSet[i]!,
+              isDefault: false,
+              value: this.viewSetDefault(vw.view, a.column),
+            }
           : { ...a, column: vw.conflictSet[i]! },
       );
       onConflict = { ...onConflict, assignments };
@@ -16066,7 +17899,12 @@ export class Engine {
     const { db: _db, ...rest } = upd;
     const assignments = upd.assignments.map((a, i) =>
       a.isDefault
-        ? { ...a, column: vw.targets[i]!, isDefault: false, value: this.viewSetDefault(vw.view, a.column) }
+        ? {
+            ...a,
+            column: vw.targets[i]!,
+            isDefault: false,
+            value: this.viewSetDefault(vw.view, a.column),
+          }
         : { ...a, column: vw.targets[i]! },
     );
     return { upd: { ...rest, table: vw.table, assignments }, vw };
@@ -16653,9 +18491,7 @@ export class Engine {
   // security_invoker views (views.md §16.2): each such view's body reads its relations as the reader,
   // as a derived table would, and a security_invoker view it reads in turn is checked the same way. A
   // definer view's body is not entered.
-  private invokerReadPrivs(
-    pending: { db: string | undefined; name: string }[],
-  ): PrivReq["tables"] {
+  private invokerReadPrivs(pending: { db: string | undefined; name: string }[]): PrivReq["tables"] {
     const out: PrivReq["tables"] = [];
     const seen = new Set<string>();
     while (pending.length > 0) {
@@ -17061,12 +18897,26 @@ export class Engine {
     params: Value[],
     ctes: CteCtx,
   ): SelectResult {
+    return runSync(this.execQueryPlanSteps(plan, outer, params, ctes));
+  }
+
+  private *execQueryPlanSteps(
+    plan: QueryPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): Steps<SelectResult> {
     this.beginExplainActualFrame();
     try {
-      if (plan.kind === "select") return this.execSelectPlan(plan, outer, params, ctes);
-      if (plan.kind === "values") return this.execValuesPlan(plan, outer, params, ctes);
-      if (plan.kind === "with") return this.execWithPlan(plan, outer, params, ctes);
-      return this.execSetOpPlan(plan, outer, params, ctes);
+      // Break recursive query delegation at the driver, keeping the accepted nesting depth within
+      // the same stack budget as synchronous execution. Frames and finally scopes stay retained.
+      if (plan.kind === "select")
+        return yield* callSteps(this.execSelectPlanSteps(plan, outer, params, ctes));
+      if (plan.kind === "values")
+        return yield* callSteps(this.execValuesPlanSteps(plan, outer, params, ctes));
+      if (plan.kind === "with")
+        return yield* callSteps(this.execWithPlanSteps(plan, outer, params, ctes));
+      return yield* callSteps(this.execSetOpPlanSteps(plan, outer, params, ctes));
     } finally {
       this.endExplainActualFrame();
     }
@@ -17080,9 +18930,18 @@ export class Engine {
     params: Value[],
     ctes: CteCtx,
   ): SelectResult {
+    return runSync(this.execHiddenQueryPlanSteps(plan, outer, params, ctes));
+  }
+
+  private *execHiddenQueryPlanSteps(
+    plan: QueryPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): Steps<SelectResult> {
     this.beginExplainActualFrame();
     try {
-      return this.execQueryPlan(plan, outer, params, ctes);
+      return yield* this.execQueryPlanSteps(plan, outer, params, ctes);
     } finally {
       this.discardExplainActualFrame();
     }
@@ -17094,14 +18953,18 @@ export class Engine {
   // LATERAL nested-WITH derived-table body correlates to its left siblings, and a CTE body reads an
   // enclosing query level — each binding records `outer` as its body frame). The materialization cost
   // folds into the body's cost — the same shape as the top-level runWith (cte.md §3).
-  private execWithPlan(
+  private execWithPlan(plan: WithPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
+    return runSync(this.execWithPlanSteps(plan, outer, params, ctes));
+  }
+
+  private *execWithPlanSteps(
     plan: WithPlan,
     outer: Row[],
     params: Value[],
     ctes: CteCtx,
-  ): SelectResult {
+  ): Steps<SelectResult> {
     const inherited = prefixCteCtx(ctes, plan.inheritedCount);
-    const { buffers, totalCost } = this.materializeCtes(
+    const { buffers, totalCost } = yield* this.materializeCtesSteps(
       plan.bindings,
       plan.modes,
       params,
@@ -17109,7 +18972,7 @@ export class Engine {
       outer,
     );
     const ctx = extendCteCtx(inherited, outer, plan.modes, plan.bindings, buffers);
-    const r = this.execQueryPlan(plan.body, outer, params, ctx);
+    const r = yield* this.execQueryPlanSteps(plan.body, outer, params, ctx);
     releaseCteBuffers(this.session.queryAccount, buffers);
     r.cost += totalCost;
     this.recordExplainActualParent("WITH", r.cost);
@@ -17216,8 +19079,17 @@ export class Engine {
     params: Value[],
     ctes: CteCtx,
   ): SelectResult {
-    const left = this.execQueryPlan(plan.lhs, outer, params, ctes);
-    const right = this.execQueryPlan(plan.rhs, outer, params, ctes);
+    return runSync(this.execSetOpPlanSteps(plan, outer, params, ctes));
+  }
+
+  private *execSetOpPlanSteps(
+    plan: SetOpPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): Steps<SelectResult> {
+    const left = yield* this.execQueryPlanSteps(plan.lhs, outer, params, ctes);
+    const right = yield* this.execQueryPlanSteps(plan.rhs, outer, params, ctes);
 
     // Both arms arrive charged (memory.md §5.2). Coercion growth is reserved; rows the combine or the
     // LIMIT/OFFSET window drops are released (§5.3).
@@ -17357,10 +19229,20 @@ export class Engine {
     params: Value[],
     ctes: CteCtx,
   ): SelectResult {
+    return runSync(this.execValuesPlanSteps(plan, outer, params, ctes));
+  }
+
+  private *execValuesPlanSteps(
+    plan: ValuesPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): Steps<SelectResult> {
     const env: EvalEnv = {
       params,
       outer,
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, params, ctes),
       environment: this.session.environment,
       rng: new StmtRng(),
       ctes,
@@ -17369,13 +19251,17 @@ export class Engine {
     const meter = this.session.newMeter();
     const rows: Value[][] = [];
     for (const row of plan.rows) {
+      if (shouldCooperate()) yield COOPERATE;
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
       meter.charge(COSTS.rowProduced);
       const out: Value[] = [];
       for (let ci = 0; ci < plan.columnTypes.length; ci++) {
+        if (shouldCooperate()) yield COOPERATE;
         // Widen to the column's unified type (the set-operation rule): int → decimal, f32 → f64;
         // every other unified type is a value no-op.
-        out.push(widenToUnified(evalExpr(row[ci]!, [], env, meter), plan.columnTypes[ci]!));
+        out.push(
+          widenToUnified(yield* evalExprSteps(row[ci]!, [], env, meter), plan.columnTypes[ci]!),
+        );
       }
       meter.admitRow(out); // a materialized relation row (memory.md §5.1)
       rows.push(out);
@@ -17552,51 +19438,52 @@ export class Engine {
         // row-less VALUES stand-in with the view's output columns: a shape is read only for its own
         // outputs and pushability, never for its relations' bodies.
         if (viewItem != null && shaping) this.viewSiteBase(viewItem.site);
-        const standIn = viewItem != null && shaping ? this.viewColumns.get(viewItem.viewName) : undefined;
+        const standIn =
+          viewItem != null && shaping ? this.viewColumns.get(viewItem.viewName) : undefined;
         let plan =
           standIn !== undefined
             ? standIn
             : viewItem != null
-            ? this.planBodyFirst(shapeBodies, () =>
-                this.planViewReference(
-                  viewItem.viewName,
-                  tref.subquery!,
-                  writtenItems[i]!,
-                  viewItem.site,
-                  ptypes,
-                ),
-              )
-            : i > 0 && parenJoinReachesLeft(tref)
-              ? this.planParenJoinBody(
-                  tref.subquery!,
-                  rels,
-                  subRels,
-                  lateralParentScope,
-                  parent,
-                  ctes,
-                  ptypes,
-                  shapeBodies,
-                  rightSide,
-                  sharesParentLevel,
-                  (hit) => {
-                    joinLateral = hit;
-                  },
-                  // The relations to the join's left, for a hint (error-fields.md §11.8).
-                  (unseenParent) =>
-                    unseenFrame(tableRefs, sel.joins, rels, subRels, i, unseenParent),
+              ? this.planBodyFirst(shapeBodies, () =>
+                  this.planViewReference(
+                    viewItem.viewName,
+                    tref.subquery!,
+                    writtenItems[i]!,
+                    viewItem.site,
+                    ptypes,
+                  ),
                 )
-              : // A non-LATERAL item to the right of others cannot see them; a hint can
-                // (error-fields.md §11.8).
-                this.planDerivedItem(
-                  i > 0 && tref.lateral !== true
-                    ? unseenFrame(tableRefs, sel.joins, rels, subRels, i, bodyParent)
-                    : null,
-                  shapeBodies,
-                  tref,
-                  bodyParent,
-                  ctes,
-                  ptypes,
-                );
+              : i > 0 && parenJoinReachesLeft(tref)
+                ? this.planParenJoinBody(
+                    tref.subquery!,
+                    rels,
+                    subRels,
+                    lateralParentScope,
+                    parent,
+                    ctes,
+                    ptypes,
+                    shapeBodies,
+                    rightSide,
+                    sharesParentLevel,
+                    (hit) => {
+                      joinLateral = hit;
+                    },
+                    // The relations to the join's left, for a hint (error-fields.md §11.8).
+                    (unseenParent) =>
+                      unseenFrame(tableRefs, sel.joins, rels, subRels, i, unseenParent),
+                  )
+                : // A non-LATERAL item to the right of others cannot see them; a hint can
+                  // (error-fields.md §11.8).
+                  this.planDerivedItem(
+                    i > 0 && tref.lateral !== true
+                      ? unseenFrame(tableRefs, sel.joins, rels, subRels, i, bodyParent)
+                      : null,
+                    shapeBodies,
+                    tref,
+                    bodyParent,
+                    ctes,
+                    ptypes,
+                  );
         if (rightSide && lateralEligible && queryPlanReferencesOuter(plan, 0)) {
           detached = true;
           plan = this.planAgain(ctes, () =>
@@ -17612,9 +19499,12 @@ export class Engine {
           tref.subquery !== undefined &&
           queryPlanReferencesOuter(plan, 0)
         ) {
-          plan = this.planAgain(ctes, () => this.planQuery(tref.subquery!, bodyParent, ctes, ptypes));
+          plan = this.planAgain(ctes, () =>
+            this.planQuery(tref.subquery!, bodyParent, ctes, ptypes),
+          );
         }
-        lateral = joinLateral || (lateralEligible && !detached && queryPlanReferencesOuter(plan, 0));
+        lateral =
+          joinLateral || (lateralEligible && !detached && queryPlanReferencesOuter(plan, 0));
         shaped[i] = shapeBodies && tref.subquery !== undefined && !lateral;
         const label = tref.alias === null ? "" : tref.alias;
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
@@ -17649,11 +19539,7 @@ export class Engine {
             ctes,
             ptypes,
           );
-          if (
-            rightSide &&
-            lateralEligible &&
-            r.srf.args.some((a) => rexprReferencesOuter(a, 0))
-          ) {
+          if (rightSide && lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0))) {
             // Correlated only outside this FROM (the left side refused above).
             detached = true;
             const args = tref.args;
@@ -17674,7 +19560,8 @@ export class Engine {
           // A table function's own 42883 (no function for these argument types) points at its name,
           // like a call in an expression (spec/design/error-fields.md §10.2); an argument's error
           // keeps its own.
-          if (err instanceof EngineError && err.state === "undefined_function") err.locate(tref.loc);
+          if (err instanceof EngineError && err.state === "undefined_function")
+            err.locate(tref.loc);
           throw err;
         }
         applySrfColumnAliases(r.table, tref.alias ?? tref.name, tref.columnAliases ?? null);
@@ -17819,7 +19706,7 @@ export class Engine {
       if (rightSide && lateral) {
         throw new Error("BUG: a RIGHT/FULL join's right side correlated to its left");
       }
-      const label = (tref.alias ?? t.name);
+      const label = tref.alias ?? t.name;
       // An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no qualifier,
       // so two of them never collide and the duplicate-label check is skipped (its bare columns still
       // resolve, and stay ambiguous via resolveBare). Every other relation has a non-empty label.
@@ -18003,7 +19890,9 @@ export class Engine {
       let at: number | undefined;
       if (
         sel.items.kind === "list" &&
-        !sel.items.items.some((it) => it.expr.kind === "qualifiedStar" || it.expr.kind === "fieldStar")
+        !sel.items.items.some(
+          (it) => it.expr.kind === "qualifiedStar" || it.expr.kind === "fieldStar",
+        )
       ) {
         const it = sel.items.items[jsonCol];
         at = it === undefined ? undefined : exprLocation(it.expr);
@@ -18035,7 +19924,10 @@ export class Engine {
       };
       const { node, type } = resolve(scope, sel.having, null, hctx, ptypes);
       if (type.kind !== "bool" && type.kind !== "null") {
-        throw positionedAt(typeError("argument of HAVING must be boolean"), exprLocation(sel.having));
+        throw positionedAt(
+          typeError("argument of HAVING must be boolean"),
+          exprLocation(sel.having),
+        );
       }
       having = node;
       aggSpecs = hctx.specs;
@@ -18106,7 +19998,8 @@ export class Engine {
     // Body-pushed conjuncts from an enclosing SELECT (planner.md §3.2) join the WHERE as a left-deep
     // AND after the body's own WHERE, in source order.
     let fullFilter = filter;
-    for (const c of pushed) fullFilter = fullFilter === null ? c : { kind: "and", lhs: fullFilter, rhs: c };
+    for (const c of pushed)
+      fullFilter = fullFilter === null ? c : { kind: "and", lhs: fullFilter, rhs: c };
 
     // Assemble the owned LOGICAL plan (table NAMES + offsets/widths replace the scope's tables, so
     // the plan outlives the scope and a correlated subquery can re-execute it per row). Resolve
@@ -18287,7 +20180,12 @@ export class Engine {
             orderExprs.push(
               r.layer === undefined
                 ? { kind: "outerColumn", level: r.level, index: r.index }
-                : resolveColumnRef(scope, { collecting: false, groupKeys: [], specs: [] }, r, key.column).node,
+                : resolveColumnRef(
+                    scope,
+                    { collecting: false, groupKeys: [], specs: [] },
+                    r,
+                    key.column,
+                  ).node,
             );
             order.push({
               idx: ORDER_EXPR_BASE + k,
@@ -19436,17 +21334,27 @@ export class Engine {
   // recursive expansion (parent→child LEFT OUTER, sibling NESTED paths UNIONed). Port of
   // impl/rust/src/executor.rs `json_table_rows`.
   private jsonTableRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
+    return runSync(this.jsonTableRowsSteps(srf, env, meter));
+  }
+
+  private *jsonTableRowsSteps(srf: SrfPlan, env: EvalEnv, meter: Meter): Steps<Row[]> {
     const plan = srf.jtPlan;
     if (plan === undefined) throw new Error("a json_table SRF carries its plan");
     // The PASSING values are evaluated first, as PostgreSQL's JSON_TABLE does (even for a NULL
     // context).
-    const bindings = passingBindings(srf.args.slice(1), plan.passingNames, [], env, meter);
+    const bindings = yield* passingBindingsSteps(
+      srf.args.slice(1),
+      plan.passingNames,
+      [],
+      env,
+      meter,
+    );
     const vars: JsonPathVars = {
       kind: "passing",
       vars: bindings,
       count: plan.passingNames.length,
     };
-    const ctx = evalExpr(srf.args[0]!, [], env, meter);
+    const ctx = yield* evalExprSteps(srf.args[0]!, [], env, meter);
     if (ctx.kind === "null") return [];
     // A json context is converted to jsonb, as PostgreSQL casts it (jsonpath.md §5).
     const node = jsonpathContextNode(ctx);
@@ -19462,13 +21370,15 @@ export class Engine {
       items = [];
     }
     // Expand the column tree over the root sequence → sparse rows, then materialize.
-    const sparse = expandJtLevel(plan.columns, items, vars, env, meter);
+    const sparse = yield* expandJtLevelSteps(plan.columns, items, vars, env, meter);
     const out: Row[] = [];
     for (const assignment of sparse) {
+      if (shouldCooperate()) yield COOPERATE;
       meter.guard();
       meter.charge(COSTS.generatedRow);
       const row: Value[] = new Array(plan.width).fill(nullValue());
       for (const [idx, v] of assignment) {
+        if (shouldCooperate()) yield COOPERATE;
         row[idx] = v;
       }
       out.push(row);
@@ -19940,8 +21850,7 @@ export class Engine {
           nonnull === 0n
             ? nullValue()
             : intValue(
-                statistics.widthSum / nonnull +
-                  (statistics.widthSum % nonnull === 0n ? 0n : 1n),
+                statistics.widthSum / nonnull + (statistics.widthSum % nonnull === 0n ? 0n : 1n),
               );
         out.push([
           textValue(table.name),
@@ -20055,15 +21964,24 @@ export class Engine {
   }
 
   private generateSeriesRows(srf: SrfPlan, env: EvalEnv, meter: Meter, mask: boolean[]): Row[] {
-    const evalInt = (e: RExpr): bigint | null => {
-      const v = evalExpr(e, [], env, meter);
+    return runSync(this.generateSeriesRowsSteps(srf, env, meter, mask));
+  }
+
+  private *generateSeriesRowsSteps(
+    srf: SrfPlan,
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+  ): Steps<Row[]> {
+    const evalInt = function* (e: RExpr): Steps<bigint | null> {
+      const v = yield* evalExprSteps(e, [], env, meter);
       if (v.kind === "int") return v.int;
       if (v.kind === "null") return null;
       throw new Error("the resolver restricts generate_series args to integers");
     };
-    const start = evalInt(srf.args[0]!);
-    const stop = evalInt(srf.args[1]!);
-    const step = srf.args.length === 3 ? evalInt(srf.args[2]!) : 1n;
+    const start = yield* evalInt(srf.args[0]!);
+    const stop = yield* evalInt(srf.args[1]!);
+    const step = srf.args.length === 3 ? yield* evalInt(srf.args[2]!) : 1n;
     // Any NULL argument yields zero rows (PG).
     if (start === null || stop === null || step === null) return [];
     if (step === 0n)
@@ -20071,6 +21989,7 @@ export class Engine {
     const out: Row[] = [];
     let cur = start;
     for (;;) {
+      if (shouldCooperate()) yield COOPERATE;
       const inRange = step > 0n ? cur <= stop : cur >= stop;
       if (!inRange) break;
       meter.guard();
@@ -20093,12 +22012,22 @@ export class Engine {
   // a NULL element is produced as a NULL row). Each produced element charges one generatedRow AT THE SOURCE,
   // guarded so a maxCost ceiling aborts a runaway unnest (54P01) mid-generation, exactly like generate_series.
   private unnestRows(srf: SrfPlan, env: EvalEnv, meter: Meter, mask: boolean[]): Row[] {
-    const v = evalExpr(srf.args[0]!, [], env, meter);
+    return runSync(this.unnestRowsSteps(srf, env, meter, mask));
+  }
+
+  private *unnestRowsSteps(
+    srf: SrfPlan,
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+  ): Steps<Row[]> {
+    const v = yield* evalExprSteps(srf.args[0]!, [], env, meter);
     // A NULL array → zero rows (PG; the empty_on_null discipline).
     if (v.kind === "null") return [];
     if (v.kind !== "array") throw new Error("the resolver restricts unnest's argument to an array");
     const out: Row[] = [];
     for (const e of v.elements) {
+      if (shouldCooperate()) yield COOPERATE;
       meter.guard();
       meter.charge(COSTS.generatedRow);
       const row = [e];
@@ -20113,17 +22042,30 @@ export class Engine {
   // NULLs (as in PostgreSQL); a NULL array yields no rows. A field value outside a narrower declared
   // integer type is 22003. Each row charges one generatedRow, like unnest.
   private unnestRecordRows(srf: SrfPlan, env: EvalEnv, meter: Meter, mask: boolean[]): Row[] {
-    const v = evalExpr(srf.args[0]!, [], env, meter);
+    return runSync(this.unnestRecordRowsSteps(srf, env, meter, mask));
+  }
+
+  private *unnestRecordRowsSteps(
+    srf: SrfPlan,
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+  ): Steps<Row[]> {
+    const v = yield* evalExprSteps(srf.args[0]!, [], env, meter);
     if (v.kind === "null") return [];
     if (v.kind !== "array") throw new Error("the resolver restricts unnest's argument to an array");
     const cols = srf.recordCols!;
     const out: Row[] = [];
     for (const e of v.elements) {
+      if (shouldCooperate()) yield COOPERATE;
       meter.guard();
       meter.charge(COSTS.generatedRow);
       let row: Row;
       if (e.kind === "composite") {
-        for (let i = 0; i < e.fields.length; i++) checkRecordFieldValue(e.fields[i]!, cols[i]!.type);
+        for (let i = 0; i < e.fields.length; i++) {
+          if (shouldCooperate()) yield COOPERATE;
+          checkRecordFieldValue(e.fields[i]!, cols[i]!.type);
+        }
         row = [...e.fields];
       } else {
         row = cols.map((): Value => ({ kind: "null" }));
@@ -20139,11 +22081,16 @@ export class Engine {
   // per-row values (each match's text[], or each split piece) and each charges one generatedRow,
   // guarded.
   private regexSrfRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
-    const v = evalExpr(srf.args[0]!, [], env, meter);
+    return runSync(this.regexSrfRowsSteps(srf, env, meter));
+  }
+
+  private *regexSrfRowsSteps(srf: SrfPlan, env: EvalEnv, meter: Meter): Steps<Row[]> {
+    const v = yield* evalExprSteps(srf.args[0]!, [], env, meter);
     if (v.kind === "null") return [];
     if (v.kind !== "array") throw new Error("a regexp SRF call yields an array of its rows");
     const out: Row[] = [];
     for (const item of v.elements) {
+      if (shouldCooperate()) yield COOPERATE;
       meter.guard();
       meter.charge(COSTS.generatedRow);
       out.push([item]);
@@ -20155,7 +22102,11 @@ export class Engine {
   // NULL argument yields zero rows (empty_on_null). array_elements[_text] over a non-array, or
   // object_keys over a non-object, is 22023. Each produced row charges one generatedRow.
   private jsonSrfRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
-    const arg = evalExpr(srf.args[0]!, [], env, meter);
+    return runSync(this.jsonSrfRowsSteps(srf, env, meter));
+  }
+
+  private *jsonSrfRowsSteps(srf: SrfPlan, env: EvalEnv, meter: Meter): Steps<Row[]> {
+    const arg = yield* evalExprSteps(srf.args[0]!, [], env, meter);
     // A NULL argument → zero rows (PG; the empty_on_null discipline).
     if (arg.kind === "null") return [];
     // The json array_elements / each variants walk the verbatim text (json.md §4) instead of a
@@ -20191,6 +22142,7 @@ export class Engine {
         if (node.kind !== "array")
           throw engineError("invalid_parameter_value", "cannot extract elements from a scalar");
         for (const e of node.elements) {
+          if (shouldCooperate()) yield COOPERATE;
           meter.guard();
           meter.charge(COSTS.generatedRow);
           let v: Value;
@@ -20214,6 +22166,7 @@ export class Engine {
             "cannot call jsonb_object_keys on a non-object",
           );
         for (const m of node.members) {
+          if (shouldCooperate()) yield COOPERATE;
           meter.guard();
           meter.charge(COSTS.generatedRow);
           out.push([textValue(m.key)]);
@@ -20228,6 +22181,7 @@ export class Engine {
             "cannot call " + srf.kind + " on a non-object",
           );
         for (const m of node.members) {
+          if (shouldCooperate()) yield COOPERATE;
           meter.guard();
           meter.charge(COSTS.generatedRow);
           // (key text, value): jsonb_each keeps the value node; _text renders ->>-style (a string
@@ -20256,6 +22210,7 @@ export class Engine {
               "cannot call json_to_recordset on a non-array",
             );
           for (const e of node.elements) {
+            if (shouldCooperate()) yield COOPERATE;
             meter.guard();
             meter.charge(COSTS.generatedRow);
             out.push(jsonRecordRow(e, cols, env, meter));
@@ -20272,9 +22227,9 @@ export class Engine {
       // STRICT: a NULL path, vars, or silent → zero rows. The vars object is checked before
       // evaluation; silent mode returns the items found before a SQL/JSON error (jsonpath.md §5).
       case "jsonb_path_query": {
-        const path = evalExpr(srf.args[1]!, [], env, meter);
-        const varsVal = evalExpr(srf.args[2]!, [], env, meter);
-        const silentVal = evalExpr(srf.args[3]!, [], env, meter);
+        const path = yield* evalExprSteps(srf.args[1]!, [], env, meter);
+        const varsVal = yield* evalExprSteps(srf.args[2]!, [], env, meter);
+        const silentVal = yield* evalExprSteps(srf.args[3]!, [], env, meter);
         if (path.kind !== "jsonpath" || varsVal.kind !== "jsonb" || silentVal.kind !== "bool") {
           return out;
         }
@@ -20288,6 +22243,7 @@ export class Engine {
           ? jsonPathEvalSilent(compiled, node, opts, meter).seq
           : jsonPathEval(compiled, node, opts, meter);
         for (const item of items) {
+          if (shouldCooperate()) yield COOPERATE;
           meter.guard();
           meter.charge(COSTS.generatedRow);
           out.push([jsonbValue(item)]);
@@ -20394,6 +22350,14 @@ export class Engine {
     params: Value[],
     holder: ScanCacheHolder | null,
   ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } | null {
+    return runSync(this.tryScanQuerySteps(stmt, params, holder));
+  }
+
+  *tryScanQuerySteps(
+    stmt: Statement,
+    params: Value[],
+    holder: ScanCacheHolder | null,
+  ): Steps<{ columnNames: string[]; columnTypes: string[]; cursor: Cursor } | null> {
     if (stmt.kind !== "select" || this.stmtIsWriteWithViews(stmt)) return null;
     const snap = this.readSnap();
     // The cache entry's identity key: the shared core when this engine belongs to one, else the bare
@@ -20417,23 +22381,29 @@ export class Engine {
       const c = holder.cache;
       const bound = bindParams(params, c.ptys, this.inputZone(), c.plabels);
       if (!c.sensitive && !(c.nullRead && bound.some((v) => v.kind === "null"))) {
-        return this.buildScanRows(c.sp, bound, 0n, c.resultTypes);
+        return yield* this.buildScanRowsSteps(c.sp, bound, 0n, c.resultTypes);
       }
       const key = planMemoKey(bound);
       if (c.sensitive) {
         const hit = c.memo.find((m) => m.key === key);
-        if (hit !== undefined) return this.buildScanRows(hit.sp, bound, 0n, c.resultTypes);
+        if (hit !== undefined)
+          return yield* this.buildScanRowsSteps(hit.sp, bound, 0n, c.resultTypes);
       }
       const ptypes = new ParamTypes();
       const plan = withPlanValues(bound, () => this.planQuery(stmt, null, [], ptypes));
       if (plan.kind !== "select") return null;
       const subqueryCost = { value: 0n };
-      this.foldUncorrelatedInSelect(plan, bound, EMPTY_CTE_CTX, subqueryCost);
-      if (c.sensitive && snap === this.committed && !ptypes.uncacheable && this.planCacheable(plan)) {
+      yield* this.foldUncorrelatedInSelectSteps(plan, bound, EMPTY_CTE_CTX, subqueryCost);
+      if (
+        c.sensitive &&
+        snap === this.committed &&
+        !ptypes.uncacheable &&
+        this.planCacheable(plan)
+      ) {
         if (c.memo.length === PLAN_MEMO_CAPACITY) c.memo.shift();
         c.memo.push({ key, sp: plan });
       }
-      return this.buildScanRows(plan, bound, subqueryCost.value, c.resultTypes);
+      return yield* this.buildScanRowsSteps(plan, bound, subqueryCost.value, c.resultTypes);
     }
     // MISS: plan in a probe frame, bind, and plan again with the values when the probe read one
     // (estimator.md §6.1).
@@ -20473,7 +22443,7 @@ export class Engine {
     // added to the cursor's reported cost below. A cacheable plan has no subquery, so this is a no-op
     // (and is skipped on a hit) — cost stays identical.
     const subqueryCost = { value: 0n };
-    this.foldUncorrelatedInSelect(sp, bound, EMPTY_CTE_CTX, subqueryCost);
+    yield* this.foldUncorrelatedInSelectSteps(sp, bound, EMPTY_CTE_CTX, subqueryCost);
     // Fill only from committed state, so a working transaction can consume an entry whose exact
     // signature matches but can never publish its working revision into the committed cache slot.
     // Also require a reusable plan.
@@ -20497,7 +22467,7 @@ export class Engine {
         memo: customReusable ? [{ key: planMemoKey(bound), sp }] : [],
       };
     }
-    return this.buildScanRows(sp, bound, subqueryCost.value, resultTypes);
+    return yield* this.buildScanRowsSteps(sp, bound, subqueryCost.value, resultTypes);
   }
 
   // buildScanRows classifies a resolved plan as direct-pull or buffered. The direct branch handles
@@ -20511,6 +22481,15 @@ export class Engine {
     subqueryCost: bigint,
     resultTypes: string[],
   ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } {
+    return runSync(this.buildScanRowsSteps(sp, bound, subqueryCost, resultTypes));
+  }
+
+  *buildScanRowsSteps(
+    sp: SelectPlan,
+    bound: Value[],
+    subqueryCost: bigint,
+    resultTypes: string[],
+  ): Steps<{ columnNames: string[]; columnTypes: string[]; cursor: Cursor }> {
     if (pullStreamingScanEligible(sp)) {
       // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
       // (e.g. pk = NULL) admits no row.
@@ -20536,7 +22515,7 @@ export class Engine {
         | null = null;
       let su: { pages: number; slabs: number };
       if (point.kind === "key" && store.anySpillableTouched(sp.relMasks[0]!)) {
-        const got = store.getWithUnits(point.key, sp.relMasks[0]!);
+        const got = yield* store.getWithUnitsSteps(point.key, sp.relMasks[0]!);
         su = { pages: got.pages, slabs: got.slabs };
         pointInput = { kind: "prefetched", row: got.row };
       } else if (point.kind === "key") {
@@ -20546,7 +22525,9 @@ export class Engine {
         su = { pages: 0, slabs: 0 };
         pointInput = { kind: "prefetched", row: undefined };
       } else {
-        su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(keyB, sp.relMasks[0]!);
+        su = empty
+          ? { pages: 0, slabs: 0 }
+          : yield* store.overlapScanUnitsSteps(keyB, sp.relMasks[0]!);
       }
       const meter = snap.session.newMeter();
       meter.accrued = subqueryCost; // the folded constant cost (lifetime already charged)
@@ -20556,24 +22537,14 @@ export class Engine {
         params: bound,
         outer: [],
         runSubquery: (p, o) => snap.execHiddenQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+        runSubquerySteps: (p, o) => snap.execHiddenQueryPlanSteps(p, o, bound, EMPTY_CTE_CTX),
         environment: snap.session.environment,
         rng: new StmtRng(),
         ctes: EMPTY_CTE_CTX,
         exec: snap,
       };
-      const gen = streamRows(sp, env, meter, store, keyB, empty, pointInput);
-      const source: RowSource = {
-        nextRow: () => {
-          const r = gen.next();
-          return r.done ? undefined : r.value;
-        },
-        cost: () => meter.accrued,
-        queryAccount: () => meter.query,
-        guardCost: () => meter.guard(),
-        close: () => {
-          gen.return(undefined);
-        },
-      };
+      const gen = streamRowsSteps(sp, env, meter, store, keyB, empty, pointInput);
+      const source = stepRowSource(gen, meter);
       return {
         columnNames: sp.columnNames,
         columnTypes: resultTypes,
@@ -20589,24 +22560,14 @@ export class Engine {
       params: bound,
       outer: [],
       runSubquery: (p, o) => snap.execHiddenQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+      runSubquerySteps: (p, o) => snap.execHiddenQueryPlanSteps(p, o, bound, EMPTY_CTE_CTX),
       environment: snap.session.environment,
       rng: new StmtRng(),
       ctes: EMPTY_CTE_CTX,
       exec: snap,
     };
-    const gen = bufferedRows(snap, sp, env, meter, bound);
-    const source: RowSource = {
-      nextRow: () => {
-        const r = gen.next();
-        return r.done ? undefined : r.value;
-      },
-      cost: () => meter.accrued,
-      queryAccount: () => meter.query,
-      guardCost: () => meter.guard(),
-      close: () => {
-        gen.return(undefined);
-      },
-    };
+    const gen = bufferedRowsSteps(snap, sp, env, meter, bound);
+    const source = stepRowSource(gen, meter);
     return {
       columnNames: sp.columnNames,
       columnTypes: resultTypes,
@@ -20733,31 +22694,35 @@ export class Engine {
     // Run the whole set op / WITH on the FIRST pull (streaming.md §7), reusing the eager runSetOp /
     // runWith verbatim so the rows + cost match execute() exactly.
     const run =
-      stmt.kind === "setOp" ? () => snap.runSetOp(stmt, params) : () => snap.runWith(stmt, params);
+      stmt.kind === "setOp"
+        ? () => snap.runSetOpSteps(stmt, params)
+        : () => snap.runWithSteps(stmt, params);
     let ran = false;
     let rows: Value[][] = [];
     let idx = 0;
     let cost = 0n; // 0 until the first pull runs the query, then SelectResult.cost (final)
     let done = false;
+    const nextRowSteps = function* (): Steps<Value[] | undefined> {
+      if (done) return undefined;
+      if (!ran) {
+        // A mid-run cost abort / arithmetic trap throws HERE (during iteration), not at query() (§6).
+        const r = yield* run();
+        rows = r.rows;
+        cost = r.cost;
+        ran = true;
+      }
+      if (idx >= rows.length) {
+        done = true;
+        return undefined;
+      }
+      // The row leaves engine ownership: release its query-memory charge (memory.md §5.3).
+      const row = rows[idx++]!;
+      snap.session.queryAccount.releaseRow(row);
+      return row;
+    };
     const source: RowSource = {
-      nextRow: () => {
-        if (done) return undefined;
-        if (!ran) {
-          // A mid-run cost abort / arithmetic trap throws HERE (during iteration), not at query() (§6).
-          const r = run();
-          rows = r.rows;
-          cost = r.cost;
-          ran = true;
-        }
-        if (idx >= rows.length) {
-          done = true;
-          return undefined;
-        }
-        // The row leaves engine ownership: release its query-memory charge (memory.md §5.3).
-        const row = rows[idx++]!;
-        snap.session.queryAccount.releaseRow(row);
-        return row;
-      },
+      nextRow: () => runSync(nextRowSteps()),
+      nextRowSteps,
       cost: () => cost,
       queryAccount: () => snap.session.queryAccount,
       guardCost: () => {
@@ -20799,6 +22764,15 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): SelectResult {
+    return runSync(this.execStreamingScanSteps(plan, env, meter, params));
+  }
+
+  private *execStreamingScanSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Steps<SelectResult> {
     const profileStart = meter.accrued;
     let filterWork = 0n;
     let distinctWork = 0n;
@@ -20814,25 +22788,30 @@ export class Engine {
     const distinct = plan.distinct;
     const seen = new SpillSet(this.session.workMem, this.spillSink, meter.stateCharge());
     try {
-    let passed = 0n;
-    // A host call in the WHERE or projection reads each table interval ahead into a window and replays
-    // it row by row (extensibility.md §4.2.1 "In-hand and pulled sites"); the filter's and the
-    // projection's prefetches each run on their own env.
-    const hostFns = this.session.environment.hostFunctions();
-    const ra = ReadAhead.forSite(plan.filter, plan.projections, hostFns);
-    const filterEnv: EvalEnv = ra?.filter ? { ...env, hostBatch: ra.filter } : env;
-    const projectEnv: EvalEnv = ra?.project ? { ...env, hostBatch: ra.project } : env;
-    // processRow runs one scanned row through the pipeline; `at` is its read-ahead window index, or -1.
-    const processRow = (rawRow: Row, guarded: boolean, at: number): boolean => {
+      let passed = 0n;
+      // A host call in the WHERE or projection reads each table interval ahead into a window and replays
+      // it row by row (extensibility.md §4.2.1 "In-hand and pulled sites"); the filter's and the
+      // projection's prefetches each run on their own env.
+      const hostFns = this.session.environment.hostFunctions();
+      const ra = ReadAhead.forSite(plan.filter, plan.projections, hostFns);
+      const filterEnv: EvalEnv = ra?.filter ? { ...env, hostBatch: ra.filter } : env;
+      const projectEnv: EvalEnv = ra?.project ? { ...env, hostBatch: ra.project } : env;
+      // processRow runs one scanned row through the pipeline; `at` is its read-ahead window index, or -1.
+      const processRow = function* (
+        this: Engine,
+        rawRow: Row,
+        guarded: boolean,
+        at: number,
+      ): Steps<boolean> {
         if (!guarded) meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
         // Materialize the touched columns if the lazy load left them unfetched
         // (large-values.md §14) — a fresh copy only when needed (resolveColumns).
-        const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
+        const row = yield* store.resolveColumnsSteps(rawRow, plan.relMasks[0]!);
         if (plan.filter !== null) {
           if (at >= 0) ra!.setRow(ra!.filter, at, env, meter);
           const before = meter.accrued;
-          const keep = evalFilter(plan.filter, row, filterEnv, meter);
+          const keep = yield* evalFilterSteps(plan.filter, row, filterEnv, meter);
           filterWork += meter.accrued - before;
           if (!keep) return true;
         }
@@ -20841,7 +22820,7 @@ export class Engine {
           // the OFFSET/LIMIT then window the DISTINCT rows.
           const before = meter.accrued;
           if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
-          const tuple = plan.projections.map((p) => evalExpr(p, row, projectEnv, meter));
+          const tuple = yield* evalExpressionsSteps(plan.projections, row, projectEnv, meter);
           distinctWork += meter.accrued - before;
           const key = distinctRowKey(tuple);
           // A duplicate of an already-emitted/seen value; a new one reserves its entry (memory.md §6.2).
@@ -20858,7 +22837,7 @@ export class Engine {
           const before = meter.accrued;
           meter.charge(COSTS.rowProduced);
           if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
-          const projected = plan.projections.map((p) => evalExpr(p, row, projectEnv, meter));
+          const projected = yield* evalExpressionsSteps(plan.projections, row, projectEnv, meter);
           outputWork += meter.accrued - before;
           meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
           out.push(projected);
@@ -20866,151 +22845,171 @@ export class Engine {
         // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every survivor
         // after OFFSET, in primary-key scan order).
         return limit === null ? true : BigInt(out.length) < limit;
-    };
-    const canPull = limit !== 0n;
-    const scanTable = (bound: KeyBound, reverse: boolean): boolean => {
-      const su = store.overlapScanUnits(bound, plan.relMasks[0]!);
-      meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
-      if (!canPull) return false;
-      if (ra !== null) {
-        // Read the interval ahead: the pull charges nothing, and a storage error is deferred to the
-        // row at which the per-row pull would have met it (§4.2.1).
-        ra.restart();
-        const input = store.scanRowsIter(bound, reverse)[Symbol.iterator]();
-        const pull = (): Row | null => {
-          const r = input.next();
-          return r.done === true ? null : r.value;
-        };
-        try {
-          for (;;) {
-            const remaining = limit === null ? null : offset + limit - passed;
-            const i = ra.next(readAheadCap(meter, COSTS.storageRowRead, remaining), pull);
-            if (i === null) return true;
-            if (!processRow(ra.rows[i]!, false, i)) return false;
+      }.bind(this);
+      const canPull = limit !== 0n;
+      const scanTable = function* (
+        this: Engine,
+        bound: KeyBound,
+        reverse: boolean,
+      ): Steps<boolean> {
+        const su = yield* store.overlapScanUnitsSteps(bound, plan.relMasks[0]!);
+        meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+        if (!canPull) return false;
+        if (ra !== null) {
+          // Read the interval ahead: the pull charges nothing, and a storage error is deferred to the
+          // row at which the per-row pull would have met it (§4.2.1).
+          ra.restart();
+          const input = store.scanRowsStepsIter(bound, reverse);
+          const pull = function* (): Steps<Row | null> {
+            const r = yield* input.nextSteps();
+            return r.done === true ? null : r.value;
+          };
+          try {
+            for (;;) {
+              if (shouldCooperate()) yield COOPERATE;
+              const remaining = limit === null ? null : offset + limit - passed;
+              const i = yield* ra.nextSteps(
+                readAheadCap(meter, COSTS.storageRowRead, remaining),
+                pull,
+              );
+              if (i === null) return true;
+              if (!(yield* processRow(ra.rows[i]!, false, i))) return false;
+            }
+          } finally {
+            if (input.returnSteps !== undefined) yield* input.returnSteps();
           }
-        } finally {
-          input.return?.(undefined);
         }
-      }
-      let more = true;
-      const visit = (_key: Uint8Array, row: Row): boolean => (more = processRow(row, false, -1));
-      if (reverse) store.scanRangeRev(bound, visit);
-      else store.scanRange(bound, visit);
-      return more;
-    };
-    const scanIndex = (
-      nameKey: string,
-      bound: KeyBound,
-      prefixLen: number,
-      suffix: KeySlot[],
-    ): boolean => {
-      const istore = this.lkpIndexStore(nameKey);
-      const su = istore.overlapScanUnits(bound, []);
-      meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
-      if (!canPull) return false;
-      let more = true;
-      istore.scanRange(bound, (entryKey) => {
-        meter.guard();
-        // A corrupt entry shorter than its components yields an empty storage key (no row).
-        const rowKey = indexEntryRowKey(entryKey, prefixLen, suffix) ?? new Uint8Array(0);
-        const u = store.getWithUnits(rowKey, plan.relMasks[0]!);
-        if (u.row === undefined)
-          throw engineError("data_corrupted", "an index entry references a stored row");
-        meter.charge(COSTS.pageRead * BigInt(u.pages) + COSTS.valueDecompress * BigInt(u.slabs));
-        more = processRow(u.row, true, -1);
+        let more = true;
+        const visit = function* (_key: Uint8Array, row: Row): Steps<boolean> {
+          more = yield* processRow(row, false, -1);
+          return more;
+        };
+        if (reverse) yield* store.scanRangeRevSteps(bound, visit);
+        else yield* store.scanRangeSteps(bound, visit);
         return more;
-      });
-      return more;
-    };
-
-    const sb = plan.phys.relBounds[0]!;
-    if (sb === null) {
-      scanTable(unboundedBound(), plan.phys.pkReverse);
-    } else if (sb.kind === "pk") {
-      const bound = buildKeyBound(sb.pk, params, env.outer, []);
-      if (bound !== null) scanTable(bound, plan.phys.pkReverse);
-    } else if (sb.kind === "pkSet") {
-      if (canPull) {
-        const intervals = pkKeySetIntervals(sb.pkSet, params, env.outer, []);
-        if (plan.phys.pkReverse) intervals.reverse();
-        for (const bound of intervals) {
-          if (!scanTable(bound, plan.phys.pkReverse)) break;
-        }
-      }
-    } else if (sb.kind === "index") {
-      const built = buildIndexBound(sb.index, params, env.outer, []);
-      if (built !== null)
-        scanIndex(sb.index.nameKey, built.bound, built.prefixLen, sb.index.suffix);
-    } else if (sb.kind === "indexSet") {
-      if (canPull) {
-        const ks = sb.indexSet;
-        for (const probe of indexKeySetProbes(ks, params, env.outer, [])) {
-          if (!scanIndex(ks.nameKey, probe.bound, probe.prefixLen, probe.suffix))
-            break;
-        }
-      }
-    } else if (sb.kind === "gin" || sb.kind === "gist") {
-      const gathered =
-        sb.kind === "gin"
-          ? this.ginBoundRows(
-              plan.rels[0]!.tableName,
-              sb.gin,
-              plan.filter === null ? null : ginQueryOperand(plan.filter, sb.gin),
-              [],
-              env,
-              meter,
-              plan.relMasks[0]!,
-              true,
-            )
-          : this.gistBoundRows(
-              plan.rels[0]!.tableName,
-              sb.gist,
-              plan.filter === null ? null : gistQueryOperand(plan.filter, sb.gist),
-              [],
-              env,
-              meter,
-              plan.relMasks[0]!,
-              true,
-            );
-      meter.charge(
-        COSTS.pageRead * BigInt(gathered.pages) +
-          COSTS.valueDecompress * BigInt(gathered.slabs),
-      );
-      const entries = plan.phys.pkReverse ? gathered.entries.reverse() : gathered.entries;
-      if (canPull) {
-        for (const candidate of entries) {
-          meter.guard();
-          let row = candidate.row;
-          if (row.length === 0) {
-            const u = store.getWithUnits(candidate.key, plan.relMasks[0]!);
+      }.bind(this);
+      const scanIndex = function* (
+        this: Engine,
+        nameKey: string,
+        bound: KeyBound,
+        prefixLen: number,
+        suffix: KeySlot[],
+      ): Steps<boolean> {
+        const istore = this.lkpIndexStore(nameKey);
+        const su = yield* istore.overlapScanUnitsSteps(bound, []);
+        meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+        if (!canPull) return false;
+        let more = true;
+        yield* istore.scanRangeSteps(
+          bound,
+          function* (this: Engine, entryKey: Uint8Array): Steps<boolean> {
+            meter.guard();
+            // A corrupt entry shorter than its components yields an empty storage key (no row).
+            const rowKey = indexEntryRowKey(entryKey, prefixLen, suffix) ?? new Uint8Array(0);
+            const u = yield* store.getWithUnitsSteps(rowKey, plan.relMasks[0]!);
             if (u.row === undefined)
-              throw engineError("data_corrupted", "an opclass entry references a stored row");
+              throw engineError("data_corrupted", "an index entry references a stored row");
             meter.charge(
               COSTS.pageRead * BigInt(u.pages) + COSTS.valueDecompress * BigInt(u.slabs),
             );
-            row = u.row;
+            more = yield* processRow(u.row, true, -1);
+            return more;
+          }.bind(this),
+        );
+        return more;
+      }.bind(this);
+
+      const sb = plan.phys.relBounds[0]!;
+      if (sb === null) {
+        yield* scanTable(unboundedBound(), plan.phys.pkReverse);
+      } else if (sb.kind === "pk") {
+        const bound = buildKeyBound(sb.pk, params, env.outer, []);
+        if (bound !== null) yield* scanTable(bound, plan.phys.pkReverse);
+      } else if (sb.kind === "pkSet") {
+        if (canPull) {
+          const intervals = pkKeySetIntervals(sb.pkSet, params, env.outer, []);
+          if (plan.phys.pkReverse) intervals.reverse();
+          for (const bound of intervals) {
+            if (shouldCooperate()) yield COOPERATE;
+            if (!(yield* scanTable(bound, plan.phys.pkReverse))) break;
           }
-          if (!processRow(row, true, -1)) break;
+        }
+      } else if (sb.kind === "index") {
+        const built = buildIndexBound(sb.index, params, env.outer, []);
+        if (built !== null)
+          yield* scanIndex(sb.index.nameKey, built.bound, built.prefixLen, sb.index.suffix);
+      } else if (sb.kind === "indexSet") {
+        if (canPull) {
+          const ks = sb.indexSet;
+          for (const probe of indexKeySetProbes(ks, params, env.outer, [])) {
+            if (shouldCooperate()) yield COOPERATE;
+            if (!(yield* scanIndex(ks.nameKey, probe.bound, probe.prefixLen, probe.suffix))) break;
+          }
+        }
+      } else if (sb.kind === "gin" || sb.kind === "gist") {
+        const gathered =
+          sb.kind === "gin"
+            ? yield* this.ginBoundRowsSteps(
+                plan.rels[0]!.tableName,
+                sb.gin,
+                plan.filter === null ? null : ginQueryOperand(plan.filter, sb.gin),
+                [],
+                env,
+                meter,
+                plan.relMasks[0]!,
+                true,
+              )
+            : yield* this.gistBoundRowsSteps(
+                plan.rels[0]!.tableName,
+                sb.gist,
+                plan.filter === null ? null : gistQueryOperand(plan.filter, sb.gist),
+                [],
+                env,
+                meter,
+                plan.relMasks[0]!,
+                true,
+              );
+        meter.charge(
+          COSTS.pageRead * BigInt(gathered.pages) + COSTS.valueDecompress * BigInt(gathered.slabs),
+        );
+        const entries = plan.phys.pkReverse ? gathered.entries.reverse() : gathered.entries;
+        if (canPull) {
+          for (const candidate of entries) {
+            if (shouldCooperate()) yield COOPERATE;
+            meter.guard();
+            let row = candidate.row;
+            if (row.length === 0) {
+              const u = yield* store.getWithUnitsSteps(candidate.key, plan.relMasks[0]!);
+              if (u.row === undefined)
+                throw engineError("data_corrupted", "an opclass entry references a stored row");
+              meter.charge(
+                COSTS.pageRead * BigInt(u.pages) + COSTS.valueDecompress * BigInt(u.slabs),
+              );
+              row = u.row;
+            }
+            if (!(yield* processRow(row, true, -1))) break;
+          }
         }
       }
+      seen.release(); // the scan ended (memory.md §6.2)
+      const totalWork = meter.accrued - profileStart;
+      const scanWork = totalWork - filterWork - distinctWork - outputWork;
+      const scanNode = "Scan " + plan.rels[0]!.tableName;
+      if (selectActualRootNode(plan) !== scanNode) this.recordExplainActual(scanNode, scanWork);
+      const throughFilter = scanWork + filterWork;
+      if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
+        this.recordExplainActualParent("Filter", throughFilter);
+      if (plan.distinct && selectActualRootNode(plan) !== "Distinct")
+        this.recordExplainActualParent("Distinct", throughFilter + distinctWork);
+      return {
+        columnNames: plan.columnNames,
+        columnTypes: plan.columnTypes,
+        rows: out,
+        cost: meter.accrued,
+      };
+    } finally {
+      seen.close();
     }
-    seen.release(); // the scan ended (memory.md §6.2)
-    const totalWork = meter.accrued - profileStart;
-    const scanWork = totalWork - filterWork - distinctWork - outputWork;
-    const scanNode = "Scan " + plan.rels[0]!.tableName;
-    if (selectActualRootNode(plan) !== scanNode) this.recordExplainActual(scanNode, scanWork);
-    const throughFilter = scanWork + filterWork;
-    if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
-      this.recordExplainActualParent("Filter", throughFilter);
-    if (plan.distinct && selectActualRootNode(plan) !== "Distinct")
-      this.recordExplainActualParent("Distinct", throughFilter + distinctWork);
-    return {
-      columnNames: plan.columnNames,
-      columnTypes: plan.columnTypes,
-      rows: out,
-      cost: meter.accrued,
-    };
-    } finally { seen.close(); }
   }
 
   // windowTopNEligible reports whether a plain (non-grouped) window query can serve its LIMIT with a
@@ -21103,6 +23102,15 @@ export class Engine {
   // execStreamingScan's LIMIT stop. pageRead is the full block up front (only per-row work
   // short-circuits, like the streaming scan).
   private execWindowTopN(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
+    return runSync(this.execWindowTopNSteps(plan, env, meter, params));
+  }
+
+  private *execWindowTopNSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Steps<Emitter> {
     const profileStart = meter.accrued;
     let filterWork = 0n;
     const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
@@ -21117,7 +23125,9 @@ export class Engine {
       if (b === null) empty = true;
       else bound = b;
     }
-    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
+    const su = empty
+      ? { pages: 0, slabs: 0 }
+      : yield* store.overlapScanUnitsSteps(bound, plan.relMasks[0]!);
     meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
 
     const limit = plan.limit!; // non-null (windowTopNEligible)
@@ -21131,27 +23141,27 @@ export class Engine {
     const memMask = memoryMask(plan, meter);
     const rows: Row[] = [];
     if (!empty && limit !== 0n) {
-      const visit = (_key: Uint8Array, rawRow: Row): boolean => {
+      const visit = function* (this: Engine, _key: Uint8Array, rawRow: Row): Steps<boolean> {
         meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
-        const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
+        const row = yield* store.resolveColumnsSteps(rawRow, plan.relMasks[0]!);
         if (plan.filter !== null) {
           const before = meter.accrued;
-          const keep = evalFilter(plan.filter, row, env, meter);
+          const keep = yield* evalFilterSteps(plan.filter, row, env, meter);
           filterWork += meter.accrued - before;
           if (!keep) return true;
         }
         meter.admitRowMasked(row, memMask); // a row buffer (memory.md §5.1)
         rows.push(row);
         return BigInt(rows.length) < cap; // stop once the OFFSET+LIMIT window is filled
-      };
-      if (plan.phys.pkReverse) store.scanRangeRev(bound, visit);
-      else store.scanRange(bound, visit);
+      }.bind(this);
+      if (plan.phys.pkReverse) yield* store.scanRangeRevSteps(bound, visit);
+      else yield* store.scanRangeSteps(bound, visit);
     }
 
     // The window stage over the collected prefix — identical to the eager path (§5.2), just fewer rows.
     const beforeWindow = meter.accrued;
-    applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter);
+    yield* applyWindowStageSteps(rows, plan.windowSpecs, plan.windowKeys, env, meter);
     const scanAndFilter = beforeWindow - profileStart;
     const scanWork = scanAndFilter - filterWork;
     const scanNode = selectActualRelNode(plan.rels[0]!);
@@ -21185,6 +23195,15 @@ export class Engine {
     env: EvalEnv,
     meter: Meter,
   ): SelectResult {
+    return runSync(this.execIndexOrderScanSteps(plan, io, env, meter));
+  }
+
+  private *execIndexOrderScanSteps(
+    plan: SelectPlan,
+    io: IndexOrder,
+    env: EvalEnv,
+    meter: Meter,
+  ): Steps<SelectResult> {
     const profileStart = meter.accrued;
     let filterWork = 0n;
     let outputWork = 0n;
@@ -21199,40 +23218,43 @@ export class Engine {
     if (limit !== 0n) {
       let passed = 0n;
       // An index store has no payload columns, so its rows carry nothing to mask — whole-row scan.
-      istore.scanRange(unboundedBound(), (ekey) => {
-        meter.guard(); // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
-        // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3): the
-        // entry key is `<index columns> ‖ storage_key`, and storage_key is exactly io.pkWidth bytes.
-        // An entry shorter than the suffix is corrupt: it names no row.
-        if (ekey.length < io.pkWidth)
-          throw engineError("data_corrupted", "an index entry references a stored row");
-        const rowKey = ekey.slice(ekey.length - io.pkWidth);
-        const u = store.getWithUnits(rowKey, plan.relMasks[0]!);
-        if (u.row === undefined)
-          throw engineError("data_corrupted", "an index entry references a stored row");
-        meter.charge(
-          COSTS.pageRead * BigInt(u.pages) +
-            COSTS.valueDecompress * BigInt(u.slabs) +
-            COSTS.storageRowRead,
-        );
-        const row = store.resolveColumns(u.row, plan.relMasks[0]!);
-        if (plan.filter !== null) {
+      yield* istore.scanRangeSteps(
+        unboundedBound(),
+        function* (this: Engine, ekey: Uint8Array): Steps<boolean> {
+          meter.guard(); // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
+          // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3): the
+          // entry key is `<index columns> ‖ storage_key`, and storage_key is exactly io.pkWidth bytes.
+          // An entry shorter than the suffix is corrupt: it names no row.
+          if (ekey.length < io.pkWidth)
+            throw engineError("data_corrupted", "an index entry references a stored row");
+          const rowKey = ekey.slice(ekey.length - io.pkWidth);
+          const u = yield* store.getWithUnitsSteps(rowKey, plan.relMasks[0]!);
+          if (u.row === undefined)
+            throw engineError("data_corrupted", "an index entry references a stored row");
+          meter.charge(
+            COSTS.pageRead * BigInt(u.pages) +
+              COSTS.valueDecompress * BigInt(u.slabs) +
+              COSTS.storageRowRead,
+          );
+          const row = yield* store.resolveColumnsSteps(u.row, plan.relMasks[0]!);
+          if (plan.filter !== null) {
+            const before = meter.accrued;
+            const keep = yield* evalFilterSteps(plan.filter, row, env, meter);
+            filterWork += meter.accrued - before;
+            if (!keep) return true;
+          }
+          passed += 1n;
+          if (passed <= offset) return true;
           const before = meter.accrued;
-          const keep = evalFilter(plan.filter, row, env, meter);
-          filterWork += meter.accrued - before;
-          if (!keep) return true;
-        }
-        passed += 1n;
-        if (passed <= offset) return true;
-        const before = meter.accrued;
-        meter.charge(COSTS.rowProduced);
-        const projected = plan.projections.map((p) => evalExpr(p, row, env, meter));
-        outputWork += meter.accrued - before;
-        meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
-        out.push(projected);
-        // Stop once a LIMIT window is filled (a top-N over the index order).
-        return limit === null ? true : BigInt(out.length) < limit;
-      });
+          meter.charge(COSTS.rowProduced);
+          const projected = yield* evalExpressionsSteps(plan.projections, row, env, meter);
+          outputWork += meter.accrued - before;
+          meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
+          out.push(projected);
+          // Stop once a LIMIT window is filled (a top-N over the index order).
+          return limit === null ? true : BigInt(out.length) < limit;
+        }.bind(this),
+      );
     }
     const totalWork = meter.accrued - profileStart;
     const scanWork = totalWork - filterWork - outputWork;
@@ -21265,6 +23287,15 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): Emitter {
+    return runSync(this.execStreamingSortSteps(plan, env, meter, params));
+  }
+
+  private *execStreamingSortSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Steps<Emitter> {
     const profileStart = meter.accrued;
     let filterWork = 0n;
     const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
@@ -21280,7 +23311,9 @@ export class Engine {
       if (b === null) empty = true;
       else bound = b;
     }
-    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
+    const su = empty
+      ? { pages: 0, slabs: 0 }
+      : yield* store.overlapScanUnitsSteps(bound, plan.relMasks[0]!);
     meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
 
     // Build the sorted source in ORDER BY order, deferring the window's rowProduced + projection to the
@@ -21301,21 +23334,24 @@ export class Engine {
       const charge = meter.stateCharge();
       if (!empty) {
         // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-        store.scanRange(bound, (_key, rawRow) => {
-          meter.guard();
-          meter.charge(COSTS.storageRowRead);
-          const row = store.resolveColumns(rawRow, mask);
-          if (plan.filter !== null) {
-            const before = meter.accrued;
-            const keep = evalFilter(plan.filter, row, env, meter);
-            filterWork += meter.accrued - before;
-            if (!keep) return true;
-          }
-          const owned = nullUntouched(row, mask);
-          if (charge.active()) charge.reserve(meter, rowBytes(owned));
-          rows.push(owned);
-          return true;
-        });
+        yield* store.scanRangeSteps(
+          bound,
+          function* (this: Engine, _key: Uint8Array, rawRow: Row): Steps<boolean> {
+            meter.guard();
+            meter.charge(COSTS.storageRowRead);
+            const row = yield* store.resolveColumnsSteps(rawRow, mask);
+            if (plan.filter !== null) {
+              const before = meter.accrued;
+              const keep = yield* evalFilterSteps(plan.filter, row, env, meter);
+              filterWork += meter.accrued - before;
+              if (!keep) return true;
+            }
+            const owned = nullUntouched(row, mask);
+            if (charge.active()) charge.reserve(meter, rowBytes(owned));
+            rows.push(owned);
+            return true;
+          }.bind(this),
+        );
       }
       total = BigInt(rows.length);
       let retained = rows;
@@ -21324,7 +23360,11 @@ export class Engine {
         charge.releaseAll();
         const topK = plan.phys.topK;
         retained = meter.costFirst(() => topKRows(rows, plan.order, topK, meter.query));
-        if (charge.active()) for (const row of retained) charge.reserve(meter, rowBytes(row));
+        if (charge.active())
+          for (const row of retained) {
+            if (shouldCooperate()) yield COOPERATE;
+            charge.reserve(meter, rowBytes(row));
+          }
       } else meter.costFirst(() => sortRows(retained, plan.order, meter.query));
       sorted = new SortedRows(retained, null, charge);
     } else {
@@ -21341,23 +23381,26 @@ export class Engine {
       try {
         if (!empty) {
           // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-          store.scanRange(bound, (_key, rawRow) => {
-            meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-            meter.charge(COSTS.storageRowRead);
-            const row = store.resolveColumns(rawRow, mask);
-            if (plan.filter !== null) {
-              const before = meter.accrued;
-              const keep = evalFilter(plan.filter, row, env, meter);
-              filterWork += meter.accrued - before;
-              if (!keep) return true;
-            }
-            survivorCount++;
-            // Sort state holds only the touched columns (memory.md §6.1); a structure reserving
-            // without the meter reports a reached cost ceiling first (§6.7).
-            const owned = nullUntouched(row, mask);
-            meter.costFirst(() => (keeper !== null ? keeper.push(owned) : sorter!.push(owned)));
-            return true; // never stop early — the sort must see every row
-          });
+          yield* store.scanRangeSteps(
+            bound,
+            function* (this: Engine, _key: Uint8Array, rawRow: Row): Steps<boolean> {
+              meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+              meter.charge(COSTS.storageRowRead);
+              const row = yield* store.resolveColumnsSteps(rawRow, mask);
+              if (plan.filter !== null) {
+                const before = meter.accrued;
+                const keep = yield* evalFilterSteps(plan.filter, row, env, meter);
+                filterWork += meter.accrued - before;
+                if (!keep) return true;
+              }
+              survivorCount++;
+              // Sort state holds only the touched columns (memory.md §6.1); a structure reserving
+              // without the meter reports a reached cost ceiling first (§6.7).
+              const owned = nullUntouched(row, mask);
+              meter.costFirst(() => (keeper !== null ? keeper.push(owned) : sorter!.push(owned)));
+              return true; // never stop early — the sort must see every row
+            }.bind(this),
+          );
         }
         total = survivorCount;
         if (keeper !== null) {
@@ -21380,7 +23423,10 @@ export class Engine {
     let end = total;
     if (plan.limit !== null && plan.limit < total - start) end = start + plan.limit;
     try {
-      for (let i = 0n; i < start; i++) sorted.next(); // skip the OFFSET rows (unwindowed)
+      for (let i = 0n; i < start; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+        sorted.next();
+      } // skip the OFFSET rows (unwindowed)
     } catch (e) {
       sorted.close(); // release any spilled runs if the OFFSET skip throws
       throw e;
@@ -21391,8 +23437,7 @@ export class Engine {
     if (selectActualRootNode(plan) !== scanNode) this.recordExplainActual(scanNode, scanWork);
     if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
       this.recordExplainActualParent("Filter", blockingWork);
-    if (selectActualRootNode(plan) !== "Sort")
-      this.recordExplainActualParent("Sort", blockingWork);
+    if (selectActualRootNode(plan) !== "Sort") this.recordExplainActualParent("Sort", blockingWork);
     return sortedEmitter(sorted, Number(end - start));
   }
 
@@ -21410,6 +23455,16 @@ export class Engine {
     params: Value[],
     outer: Row[],
   ): SelectResult {
+    return runSync(this.execStreamingJoinSteps(plan, env, meter, params, outer));
+  }
+
+  private *execStreamingJoinSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    outer: Row[],
+  ): Steps<SelectResult> {
     // After a pushdown only the residual WHERE remains over joined rows (planner.md §3.2).
     const residual = postJoinFilter(plan);
     const profileStart = meter.accrued;
@@ -21419,13 +23474,29 @@ export class Engine {
     const outerOrdinal = physicalRelOrdinal(plan, 0);
     const innerOrdinal = physicalRelOrdinal(plan, 1);
     let before = meter.accrued;
-    const leftRows = this.materializeRel(plan, outerOrdinal, outer, [], env, params, meter);
+    const leftRows = yield* this.materializeRelSteps(
+      plan,
+      outerOrdinal,
+      outer,
+      [],
+      env,
+      params,
+      meter,
+    );
     relWork.set(outerOrdinal, meter.accrued - before);
     const rightINL = plan.phys.relINLBounds[innerOrdinal] !== null;
     let rightRows: Row[] = [];
     if (!rightINL) {
       before = meter.accrued;
-      rightRows = this.materializeRel(plan, innerOrdinal, outer, [], env, params, meter);
+      rightRows = yield* this.materializeRelSteps(
+        plan,
+        innerOrdinal,
+        outer,
+        [],
+        env,
+        params,
+        meter,
+      );
       relWork.set(innerOrdinal, meter.accrued - before);
     }
     const on = joinOn(plan, 0);
@@ -21438,7 +23509,7 @@ export class Engine {
       const hashTable =
         plan.phys.hashJoin === null
           ? null
-          : new HashJoinTable(
+          : yield* HashJoinTable.buildSteps(
               plan.phys.hashJoin,
               plan.rels[innerOrdinal]!.offset,
               plan.rels[outerOrdinal]!.offset,
@@ -21448,13 +23519,14 @@ export class Engine {
       let passed = 0n;
       // biome-ignore lint/suspicious/noLabelVar: `outer` is a loop label for the nested-join break/continue, not a variable.
       outer: for (const left of leftRows) {
+        if (shouldCooperate()) yield COOPERATE;
         // The previous outer row's INL re-materialization is consumed (memory.md §5.3).
         meter.releaseRowsMasked(inlRows, plan.relMasks[innerOrdinal]!);
         let innerRows = rightRows;
         if (rightINL) {
           const outerLogical = placePhysicalRelationRow(plan, outerOrdinal, left);
           before = meter.accrued;
-          inlRows = this.materializeRel(
+          inlRows = yield* this.materializeRelSteps(
             plan,
             innerOrdinal,
             outer,
@@ -21464,16 +23536,14 @@ export class Engine {
             meter,
           );
           innerRows = inlRows;
-          relWork.set(
-            innerOrdinal,
-            (relWork.get(innerOrdinal) ?? 0n) + meter.accrued - before,
-          );
+          relWork.set(innerOrdinal, (relWork.get(innerOrdinal) ?? 0n) + meter.accrued - before);
         } else if (hashTable !== null) {
-          innerRows = hashTable
-            .probe(plan.phys.hashJoin!, left, meter)
-            .map((ri) => rightRows[ri]!);
+          innerRows = (yield* hashTable.probeSteps(plan.phys.hashJoin!, left, meter)).map(
+            (ri) => rightRows[ri]!,
+          );
         }
         for (const right of innerRows) {
+          if (shouldCooperate()) yield COOPERATE;
           const combined = combinePhysicalRelationRows(
             plan,
             outerOrdinal,
@@ -21482,11 +23552,11 @@ export class Engine {
             right,
           );
           // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
-          if (on !== null && !evalFilter(on, combined, env, meter)) continue;
+          if (on !== null && !(yield* evalFilterSteps(on, combined, env, meter))) continue;
           // The residual WHERE over the combined row (per surviving pair).
           if (residual !== null) {
             before = meter.accrued;
-            const keep = evalFilter(residual, combined, env, meter);
+            const keep = yield* evalFilterSteps(residual, combined, env, meter);
             filterWork += meter.accrued - before;
             if (!keep) continue;
           }
@@ -21495,7 +23565,7 @@ export class Engine {
           meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
           before = meter.accrued;
           meter.charge(COSTS.rowProduced);
-          const projected = plan.projections.map((p) => evalExpr(p, combined, env, meter));
+          const projected = yield* evalExpressionsSteps(plan.projections, combined, env, meter);
           outputWork += meter.accrued - before;
           meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
           out.push(projected);
@@ -21513,6 +23583,7 @@ export class Engine {
     }
     const totalWork = meter.accrued - profileStart;
     for (const ordinal of [outerOrdinal, innerOrdinal]) {
+      if (shouldCooperate()) yield COOPERATE;
       const node = selectActualRelNode(plan.rels[ordinal]!);
       if (selectActualRootNode(plan) !== node)
         this.recordExplainActual(node, relWork.get(ordinal) ?? 0n);
@@ -21541,21 +23612,37 @@ export class Engine {
     params: Value[],
     outer: Row[],
   ): SelectResult {
+    return runSync(this.execStreamingNWayJoinSteps(plan, env, meter, params, outer));
+  }
+
+  private *execStreamingNWayJoinSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    outer: Row[],
+  ): Steps<SelectResult> {
     // After a pushdown only the residual WHERE remains over joined rows (planner.md §3.2).
     const residual = postJoinFilter(plan);
     const profileStart = meter.accrued;
     let filterWork = 0n;
     let outputWork = 0n;
     const relWork = new Array<bigint>(plan.rels.length).fill(0n);
-    const materialized: Row[][] = plan.rels.map((rel, ordinal) => {
-      if (rel.lateral || plan.phys.relINLBounds[ordinal] !== null) return [];
+    const materialized: Row[][] = [];
+    for (let ordinal = 0; ordinal < plan.rels.length; ordinal++) {
+      if (shouldCooperate()) yield COOPERATE;
+      const rel = plan.rels[ordinal]!;
+      if (rel.lateral || plan.phys.relINLBounds[ordinal] !== null) {
+        materialized.push([]);
+        continue;
+      }
       const before = meter.accrued;
-      const rows = this.materializeRel(plan, ordinal, outer, [], env, params, meter);
+      const rows = yield* this.materializeRelSteps(plan, ordinal, outer, [], env, params, meter);
       relWork[ordinal] = meter.accrued - before;
-      return rows;
-    });
+      materialized.push(rows);
+    }
     const finalPosition = plan.rels.length - 1;
-    const running = this.execCostedNWayJoin(
+    const running = yield* this.execCostedNWayJoinSteps(
       plan,
       env,
       meter,
@@ -21571,7 +23658,13 @@ export class Engine {
     const hashTable =
       step.hashJoin === null
         ? null
-        : new HashJoinTable(step.hashJoin, plan.rels[inner]!.offset, 0, innerRows, meter);
+        : yield* HashJoinTable.buildSteps(
+            step.hashJoin,
+            plan.rels[inner]!.offset,
+            0,
+            innerRows,
+            meter,
+          );
 
     const limit = plan.limit;
     const offset = plan.offset ?? 0n;
@@ -21581,26 +23674,29 @@ export class Engine {
     if (limit !== 0n) {
       // biome-ignore lint/suspicious/noLabelVar: `outerRows` labels the final nested-loop exit.
       outerRows: for (const left of running) {
+        if (shouldCooperate()) yield COOPERATE;
         // The previous left row's INL re-materialization is consumed (memory.md §5.3).
         meter.releaseRowsMasked(inlRows, plan.relMasks[inner]!);
         let candidates = innerRows;
         if (innerINL) {
           const before = meter.accrued;
-          inlRows = this.materializeRel(plan, inner, outer, left, env, params, meter);
+          inlRows = yield* this.materializeRelSteps(plan, inner, outer, left, env, params, meter);
           candidates = inlRows;
           relWork[inner] = relWork[inner]! + meter.accrued - before;
         } else if (hashTable !== null) {
-          candidates = hashTable
-            .probe(step.hashJoin!, left, meter)
-            .map((index) => innerRows[index]!);
+          candidates = (yield* hashTable.probeSteps(step.hashJoin!, left, meter)).map(
+            (index) => innerRows[index]!,
+          );
         }
         for (const right of candidates) {
+          if (shouldCooperate()) yield COOPERATE;
           const combined = left.slice();
           combined.splice(plan.rels[inner]!.offset, right.length, ...right);
           let keep = true;
           for (const onIndex of step.onIndices) {
+            if (shouldCooperate()) yield COOPERATE;
             const on = joinOn(plan, onIndex);
-            if (on !== null && !evalFilter(on, combined, env, meter)) {
+            if (on !== null && !(yield* evalFilterSteps(on, combined, env, meter))) {
               keep = false;
               break;
             }
@@ -21608,7 +23704,7 @@ export class Engine {
           if (!keep) continue;
           if (residual !== null) {
             const before = meter.accrued;
-            const keep = evalFilter(residual, combined, env, meter);
+            const keep = yield* evalFilterSteps(residual, combined, env, meter);
             filterWork += meter.accrued - before;
             if (!keep) continue;
           }
@@ -21617,9 +23713,7 @@ export class Engine {
           meter.guard();
           const before = meter.accrued;
           meter.charge(COSTS.rowProduced);
-          const projected = plan.projections.map((projection) =>
-            evalExpr(projection, combined, env, meter),
-          );
+          const projected = yield* evalExpressionsSteps(plan.projections, combined, env, meter);
           outputWork += meter.accrued - before;
           meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
           rows.push(projected);
@@ -21633,18 +23727,20 @@ export class Engine {
       meter.releaseRowsMasked(inlRows, plan.relMasks[inner]!);
       meter.releaseRowsMasked(running, memoryMask(plan, meter));
       for (let ordinal = 0; ordinal < materialized.length; ordinal++) {
+        if (shouldCooperate()) yield COOPERATE;
         meter.releaseRowsMasked(materialized[ordinal]!, plan.relMasks[ordinal]!);
       }
     }
-    for (const ordinal of plan.phys.relationOrder)
+    for (const ordinal of plan.phys.relationOrder) {
+      if (shouldCooperate()) yield COOPERATE;
       this.recordExplainActual(selectActualRelNode(plan.rels[ordinal]!), relWork[ordinal]!);
+    }
     const throughJoin = meter.accrued - profileStart - filterWork - outputWork;
     this.recordExplainActualParent(
       step.hashJoin === null ? "Nested Loop" : "Hash Join",
       throughJoin,
     );
-    if (residual !== null)
-      this.recordExplainActualParent("Filter", throughJoin + filterWork);
+    if (residual !== null) this.recordExplainActualParent("Filter", throughJoin + filterWork);
     return {
       columnNames: plan.columnNames,
       columnTypes: plan.columnTypes,
@@ -21673,11 +23769,7 @@ export class Engine {
       "f64",
       "date",
     ]);
-    if (
-      table.columns.some(
-        (col, i) => plan.relMasks[0]![i] && !fixed.has(typeAsScalar(col.type)!),
-      )
-    )
+    if (table.columns.some((col, i) => plan.relMasks[0]![i] && !fixed.has(typeAsScalar(col.type)!)))
       return false;
     const rowBudget = 8 + 40 * table.columns.length;
     return k <= BigInt(Math.floor(this.session.workMem / rowBudget));
@@ -21718,6 +23810,18 @@ export class Engine {
     params: Value[],
     meter: Meter,
   ): Row[] {
+    return runSync(this.materializeRelSteps(plan, ri, outer, left, baseEnv, params, meter));
+  }
+
+  private *materializeRelSteps(
+    plan: SelectPlan,
+    ri: number,
+    outer: Row[],
+    left: Row,
+    baseEnv: EvalEnv,
+    params: Value[],
+    meter: Meter,
+  ): Steps<Row[]> {
     // A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated, or
     // run, and nothing is charged.
     if (whereContradiction(plan)) return [];
@@ -21732,26 +23836,26 @@ export class Engine {
     if (rel.srf !== undefined) {
       // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
       // charging generated_row per element (its args read outer — implicitly lateral, §44).
-      rows = this.materializeSrfRows(plan, ri, outer, baseEnv, meter);
+      rows = yield* this.materializeSrfRowsSteps(plan, ri, outer, baseEnv, meter);
     } else if (rel.cte !== undefined) {
       // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
       // MATERIALIZED CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts
       // 54P01); an INLINE CTE runs its body in place. (A CTE is never lateral.)
-      rows = this.materializeCteRows(plan, ri, baseEnv, params, meter);
+      rows = yield* this.materializeCteRowsSteps(plan, ri, baseEnv, params, meter);
     } else if (rel.derived !== undefined) {
       // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
       // cte_scan_row. Non-lateral it was planned against the enclosing scope and reads this query's
       // outer as its own; a LATERAL body (§44) reads the left-hand row from outer.
-      const r = this.execQueryPlan(rel.derived, outer, params, baseEnv.ctes);
+      const r = yield* this.execQueryPlanSteps(rel.derived, outer, params, baseEnv.ctes);
       meter.charge(r.cost);
       rebaseRowsMasked(meter, r.rows, plan.relMasks[ri]!);
       rows = r.rows;
     } else {
-      return this.materializeBaseRows(plan, ri, outer, left, baseEnv, params, meter);
+      return yield* this.materializeBaseRowsSteps(plan, ri, outer, left, baseEnv, params, meter);
     }
     const pushed = pushedFilter(plan, ri).local;
     if (pushed === null) return rows;
-    return this.filterComputedRel(plan, ri, rows, pushed, outer, baseEnv, meter);
+    return yield* this.filterComputedRelSteps(plan, ri, rows, pushed, outer, baseEnv, meter);
   }
 
   // filterComputedRel runs a computed relation's scan-pushed filter (planner.md §3.2) over its
@@ -21766,11 +23870,24 @@ export class Engine {
     baseEnv: EvalEnv,
     meter: Meter,
   ): Row[] {
+    return runSync(this.filterComputedRelSteps(plan, ri, rows, pushed, outer, baseEnv, meter));
+  }
+
+  private *filterComputedRelSteps(
+    plan: SelectPlan,
+    ri: number,
+    rows: Row[],
+    pushed: RExpr,
+    outer: Row[],
+    baseEnv: EvalEnv,
+    meter: Meter,
+  ): Steps<Row[]> {
     const env: EvalEnv = { ...baseEnv, outer };
     const mask = plan.relMasks[ri]!;
     const kept: Row[] = [];
     for (const row of rows) {
-      if (evalFilter(pushed, row, env, meter)) kept.push(row);
+      if (shouldCooperate()) yield COOPERATE;
+      if (yield* evalFilterSteps(pushed, row, env, meter)) kept.push(row);
       else meter.releaseRowMasked(row, mask);
     }
     return kept;
@@ -21784,17 +23901,27 @@ export class Engine {
     baseEnv: EvalEnv,
     meter: Meter,
   ): Row[] {
+    return runSync(this.materializeSrfRowsSteps(plan, ri, outer, baseEnv, meter));
+  }
+
+  private *materializeSrfRowsSteps(
+    plan: SelectPlan,
+    ri: number,
+    outer: Row[],
+    baseEnv: EvalEnv,
+    meter: Meter,
+  ): Steps<Row[]> {
     const srf = plan.rels[ri]!.srf!;
     const env: EvalEnv = { ...baseEnv, outer };
     const mask = plan.relMasks[ri]!;
     let srfRows: Row[];
     switch (srf.kind) {
       case "unnest":
-        return this.unnestRows(srf, env, meter, mask);
+        return yield* this.unnestRowsSteps(srf, env, meter, mask);
       case "unnest_record":
-        return this.unnestRecordRows(srf, env, meter, mask);
+        return yield* this.unnestRecordRowsSteps(srf, env, meter, mask);
       case "generate_series":
-        return this.generateSeriesRows(srf, env, meter, mask);
+        return yield* this.generateSeriesRowsSteps(srf, env, meter, mask);
       case "jsonb_array_elements":
       case "jsonb_array_elements_text":
       case "jsonb_object_keys":
@@ -21807,14 +23934,14 @@ export class Engine {
       case "json_each_text":
       case "json_record":
       case "jsonb_path_query":
-        srfRows = this.jsonSrfRows(srf, env, meter);
+        srfRows = yield* this.jsonSrfRowsSteps(srf, env, meter);
         break;
       case "regexp_matches":
       case "regexp_split_to_table":
-        srfRows = this.regexSrfRows(srf, env, meter);
+        srfRows = yield* this.regexSrfRowsSteps(srf, env, meter);
         break;
       case "json_table":
-        srfRows = this.jsonTableRows(srf, env, meter);
+        srfRows = yield* this.jsonTableRowsSteps(srf, env, meter);
         break;
       case "jed_tables":
         srfRows = this.jedTablesRows(srf, meter);
@@ -21844,7 +23971,10 @@ export class Engine {
         srfRows = this.jedViewsRows(srf, meter);
         break;
     }
-    for (const row of srfRows) meter.admitRowMasked(row, mask);
+    for (const row of srfRows) {
+      if (shouldCooperate()) yield COOPERATE;
+      meter.admitRowMasked(row, mask);
+    }
     return srfRows;
   }
 
@@ -21856,10 +23986,20 @@ export class Engine {
     params: Value[],
     meter: Meter,
   ): Row[] {
+    return runSync(this.materializeCteRowsSteps(plan, ri, env, params, meter));
+  }
+
+  private *materializeCteRowsSteps(
+    plan: SelectPlan,
+    ri: number,
+    env: EvalEnv,
+    params: Value[],
+    meter: Meter,
+  ): Steps<Row[]> {
     const rel = plan.rels[ri]!;
     const ci = rel.cte!;
     if (env.ctes.modes[ci] === "materialize") {
-      return cteBufferRows(env.ctes.buffers[ci]!, plan.relMasks[ri]!, meter);
+      return yield* cteBufferRowsSteps(env.ctes.buffers[ci]!, plan.relMasks[ri]!, meter);
     }
     // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
     // (writable-cte.md §3), so its buffer was filled above. A reference that planned the body
@@ -21876,7 +24016,7 @@ export class Engine {
     }
     // The body runs in the frame of the WITH node that declared it (cte.md §7) — not this
     // reference site's, which may sit deeper.
-    const r = this.execQueryPlan(body, env.ctes.outers[ci]!, params, env.ctes);
+    const r = yield* this.execQueryPlanSteps(body, env.ctes.outers[ci]!, params, env.ctes);
     meter.charge(r.cost);
     // The body's charged result becomes this relation's rows (memory.md §5.2), re-measured under
     // the relation's touched mask.
@@ -21894,6 +24034,18 @@ export class Engine {
     params: Value[],
     meter: Meter,
   ): Row[] {
+    return runSync(this.materializeBaseRowsSteps(plan, ri, outer, left, baseEnv, params, meter));
+  }
+
+  private *materializeBaseRowsSteps(
+    plan: SelectPlan,
+    ri: number,
+    outer: Row[],
+    left: Row,
+    baseEnv: EvalEnv,
+    params: Value[],
+    meter: Meter,
+  ): Steps<Row[]> {
     const rel = plan.rels[ri]!;
     const env: EvalEnv = { ...baseEnv, outer };
     const mask = plan.relMasks[ri]!;
@@ -21935,7 +24087,7 @@ export class Engine {
     }
     const relBound = plan.phys.relINLBounds[ri] ?? plan.phys.relBounds[ri]!;
     if (relBound !== null && relBound.kind === "index") {
-      const r = this.indexBoundRows(
+      const r = yield* this.indexBoundRowsSteps(
         rel.tableName,
         relBound.index,
         params,
@@ -21950,6 +24102,7 @@ export class Engine {
       let m: { strategy: GinStrategy; query: RExpr } | null = null;
       if (inl) {
         for (const filter of [...inlFilters, plan.filter]) {
+          if (shouldCooperate()) yield COOPERATE;
           if (filter === null) continue;
           m = ginSiblingMatch(
             filter,
@@ -21964,7 +24117,7 @@ export class Engine {
         const q = access === null ? null : ginQueryOperand(access, relBound.gin);
         if (q !== null) m = { strategy: relBound.gin.strategy, query: q };
       }
-      const r = this.ginBoundRows(
+      const r = yield* this.ginBoundRowsSteps(
         rel.tableName,
         relBound.gin,
         m?.query ?? null,
@@ -21981,10 +24134,12 @@ export class Engine {
       let q: RExpr | null = null;
       if (inl) {
         for (const filter of [...inlFilters, plan.filter]) {
+          if (shouldCooperate()) yield COOPERATE;
           if (filter === null) continue;
           q =
             relBound.gist.strategy === "equal"
-              ? (gistScalarSiblingMatch(filter, relBound.gist.colGlobal, siblingRange)?.query ?? null)
+              ? (gistScalarSiblingMatch(filter, relBound.gist.colGlobal, siblingRange)?.query ??
+                null)
               : (gistSiblingMatch(filter, relBound.gist.colGlobal, siblingRange)?.query ?? null);
           if (q !== null) break;
         }
@@ -21992,7 +24147,7 @@ export class Engine {
         const access = accessPredicate(plan);
         if (access !== null) q = gistQueryOperand(access, relBound.gist);
       }
-      const r = this.gistBoundRows(
+      const r = yield* this.gistBoundRowsSteps(
         rel.tableName,
         relBound.gist,
         q,
@@ -22013,7 +24168,7 @@ export class Engine {
         // Read-only SELECT feed: reconstruct only the touched columns (Track A1) — a Packed leaf skips
         // decoding the untouched ones. Cost- and result-identical for a consumer that reads only the
         // touched set (packed-leaf.md §11).
-        const u = store.rangeScanWithUnits(b, plan.relMasks[ri]!);
+        const u = yield* store.rangeScanWithUnitsSteps(b, plan.relMasks[ri]!);
         rows = u.entries.map((e) => e.row);
         nodeCount = u.pages;
         slabs = u.slabs;
@@ -22021,13 +24176,20 @@ export class Engine {
     } else if (relBound !== null && relBound.kind === "pkSet") {
       // Merged PK point-set (cost.md §3 "OR / IN-list"): a union of point probes over the distinct
       // sorted keys; the whole WHERE stays the residual filter downstream.
-      const r = this.pkKeySetRows(store, relBound.pkSet, params, outer, plan.relMasks[ri]!, left);
+      const r = yield* this.pkKeySetRowsSteps(
+        store,
+        relBound.pkSet,
+        params,
+        outer,
+        plan.relMasks[ri]!,
+        left,
+      );
       rows = r.entries.map((e) => e.row);
       nodeCount = r.pages;
       slabs = r.slabs;
     } else if (relBound !== null && relBound.kind === "indexSet") {
       // Merged secondary-index point-set (cost.md §3 "OR / IN-list").
-      const r = this.indexKeySetRows(
+      const r = yield* this.indexKeySetRowsSteps(
         rel.tableName,
         relBound.indexSet,
         params,
@@ -22040,7 +24202,7 @@ export class Engine {
       slabs = r.slabs;
     } else {
       // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
-      const u = store.scanWithUnits(plan.relMasks[ri]!);
+      const u = yield* store.scanWithUnitsSteps(plan.relMasks[ri]!);
       rows = u.entries.map((e) => e.row);
       nodeCount = u.pages;
       slabs = u.slabs;
@@ -22048,7 +24210,8 @@ export class Engine {
     // Materialize this relation's touched columns where the lazy load left unfetched references
     // (large-values.md §14) — exactly the static set the cost block charges.
     for (let i = 0; i < rows.length; i++) {
-      rows[i] = store.resolveColumns(rows[i]!, plan.relMasks[ri]!);
+      if (shouldCooperate()) yield COOPERATE;
+      rows[i] = yield* store.resolveColumnsSteps(rows[i]!, plan.relMasks[ri]!);
     }
     meter.charge(COSTS.valueDecompress * BigInt(slabs));
     // The relation's pushed WHERE conjuncts (planner.md §3.2) run on each admitted row, after its
@@ -22056,7 +24219,8 @@ export class Engine {
     const pushed = pushedFilter(plan, ri).local;
     const tableRows: Row[] = [];
     for (const row of scanSource(rows, nodeCount, meter)) {
-      if (pushed !== null && !evalFilter(pushed, row, env, meter)) continue;
+      if (shouldCooperate()) yield COOPERATE;
+      if (pushed !== null && !(yield* evalFilterSteps(pushed, row, env, meter))) continue;
       meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
       tableRows.push(row);
     }
@@ -22069,6 +24233,15 @@ export class Engine {
     params: Value[],
     ctes: CteCtx,
   ): SelectResult {
+    return runSync(this.execSelectPlanSteps(plan, outer, params, ctes));
+  }
+
+  private *execSelectPlanSteps(
+    plan: SelectPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): Steps<SelectResult> {
     // Run the blocking part to an Emitter, then drive the emission EAGERLY into an array (the
     // materialized execute() path the conformance corpus drives — byte-unchanged). The lazy query()
     // path drives the SAME Emitter row by row via a bufferedRows generator (streaming.md §4); both
@@ -22079,14 +24252,15 @@ export class Engine {
       // A subquery inherits the same CTE context (a CTE reference works at any nesting depth —
       // cte.md §2/§5).
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, params, ctes),
       environment: this.session.environment,
       rng: new StmtRng(),
       ctes,
       exec: this,
     };
     const meter = this.session.newMeter();
-    const em = this.execSelectEmit(plan, env, meter, params);
-    const rows = this.drainEmitterEager(em, plan, env, meter);
+    const em = yield* this.execSelectEmitSteps(plan, env, meter, params);
+    const rows = yield* this.drainEmitterEagerSteps(em, plan, env, meter);
     this.recordExplainActualParent(selectActualRootNode(plan), meter.accrued);
     return {
       columnNames: plan.columnNames,
@@ -22100,6 +24274,15 @@ export class Engine {
   // (spec/design/streaming.md §4). The lazy query() drive (bufferedRows) emits the same rows one at a
   // time instead; both charge the identical units in the identical order, so totals agree (§6).
   private drainEmitterEager(em: Emitter, plan: SelectPlan, env: EvalEnv, meter: Meter): Value[][] {
+    return runSync(this.drainEmitterEagerSteps(em, plan, env, meter));
+  }
+
+  private *drainEmitterEagerSteps(
+    em: Emitter,
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+  ): Steps<Value[][]> {
     if (em.mode === "final") return em.rows;
     if (em.mode === "sorted") {
       // The streaming sort's lazy output: pull every windowed row from the SortedRows iterator, charging
@@ -22117,6 +24300,7 @@ export class Engine {
       try {
         const out: Value[][] = [];
         for (let i = 0; i < em.end; i++) {
+          if (shouldCooperate()) yield COOPERATE;
           let pulled: Row | null;
           let at = -1; // the row's read-ahead window index, or -1
           if (ra !== null) {
@@ -22137,7 +24321,7 @@ export class Engine {
           if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
           const o = em.sortedIdentity
             ? row
-            : plan.projections.map((p) => evalExpr(p, row, projectEnv, meter));
+            : yield* evalExpressionsSteps(plan.projections, row, projectEnv, meter);
           // Sort/spool residency is operator state; the collected result is a row buffer (memory.md
           // §5.1).
           meter.admitRow(o);
@@ -22156,6 +24340,7 @@ export class Engine {
       const projCols = em.projCols!;
       const out: Value[][] = [];
       for (let j = em.start; j < em.end; j++) {
+        if (shouldCooperate()) yield COOPERATE;
         meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
         const o = projCols.map((c) => cols[c]![j]!);
@@ -22174,6 +24359,7 @@ export class Engine {
         meter.releaseRows(em.rows.slice(em.end));
       }
       for (let i = em.start; i < em.end; i++) {
+        if (shouldCooperate()) yield COOPERATE;
         meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
         out.push(em.rows[i]!);
@@ -22185,10 +24371,11 @@ export class Engine {
     const batch = HostBatch.forExprs(plan.projections, this.session.environment.hostFunctions());
     const benv: EvalEnv = batch === null ? env : { ...env, hostBatch: batch };
     for (let i = em.start; i < em.end; i++) {
+      if (shouldCooperate()) yield COOPERATE;
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
       meter.charge(COSTS.rowProduced);
       batch?.setRow(i, em.rows, em.end, env, meter);
-      const o = plan.projections.map((p) => evalExpr(p, em.rows[i]!, benv, meter));
+      const o = yield* evalExpressionsSteps(plan.projections, em.rows[i]!, benv, meter);
       meter.admitRow(o); // the buffered result collector (memory.md §5.1)
       out.push(o);
     }
@@ -22217,6 +24404,15 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): Emitter | null {
+    return runSync(this.projectColumnarSteps(plan, env, meter, params));
+  }
+
+  private *projectColumnarSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Steps<Emitter | null> {
     const rel = plan.rels[0]!;
     const store = this.lkpStoreScoped(rel.db, rel.tableName);
     // File-backed only: an in-memory store's row path is already zero-copy.
@@ -22226,6 +24422,7 @@ export class Engine {
     const projCols: number[] = [];
     const gather: boolean[] = new Array(mask.length).fill(false);
     for (const p of plan.projections) {
+      if (shouldCooperate()) yield COOPERATE;
       if (p.kind !== "column") return null;
       const idx = p.index;
       if (idx < 0 || idx >= mask.length || !mask[idx]) return null;
@@ -22233,7 +24430,10 @@ export class Engine {
       gather[idx] = true;
     }
     const gatherCols: number[] = [];
-    for (let c = 0; c < mask.length; c++) if (gather[c]) gatherCols.push(c);
+    for (let c = 0; c < mask.length; c++) {
+      if (shouldCooperate()) yield COOPERATE;
+      if (gather[c]) gatherCols.push(c);
+    }
     // A touched variable-width column adds each admitted record's large-value units (chain pages,
     // decompress slabs) to the scan block, read off its stored tag (Track A4).
     const spillable = store.anySpillableTouched(mask);
@@ -22258,14 +24458,18 @@ export class Engine {
     let pages = 0;
     if (doScan) {
       const reuse = laneReuse(store.columnTypes(), span !== null);
-      const visit = (n: PNode, i: number): void => {
+      const visit = function* (this: Engine, n: PNode, i: number): Steps<void> {
         if (spillable) store.laneScanUnits(n, i, mask, units);
-        if (span !== null && !laneKeep(span, n, i, scratch, env, meter)) return;
-        for (const c of gatherCols)
-          cols[c]!.push(reuse[c] ? scratch.read(n, i, c) : readLeafColumn(n, i, c));
+        if (span !== null && !(yield* laneKeepSteps(span, n, i, scratch, env, meter))) return;
+        for (const c of gatherCols) {
+          if (shouldCooperate()) yield COOPERATE;
+          cols[c]!.push(
+            reuse[c] ? yield* scratch.readSteps(n, i, c) : yield* readLeafColumnSteps(n, i, c),
+          );
+        }
         nEmit++;
-      };
-      const r = store.foldScanMasked(b, visit);
+      }.bind(this);
+      const r = yield* store.foldScanMaskedSteps(b, visit);
       rowCount = r.rowCount;
       pages = r.nodes;
     }
@@ -22283,7 +24487,10 @@ export class Engine {
     const charge = meter.stateCharge();
     if (charge.active()) {
       let bytes = 0;
-      for (const lane of cols) bytes += keyBytes(lane);
+      for (const lane of cols) {
+        if (shouldCooperate()) yield COOPERATE;
+        bytes += keyBytes(lane);
+      }
       charge.reserve(meter, bytes);
     }
     return {
@@ -22365,22 +24572,34 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): Emitter {
+    return runSync(this.execVectorizedAggSteps(plan, env, meter, params));
+  }
+
+  private *execVectorizedAggSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Steps<Emitter> {
     const gset = plan.groupSets[0]!;
 
     // Columnar fast path (packed-leaf.md §11 Tracks A2–A4): a file-backed aggregate folds only its
     // touched columns during the tree walk — never a full-width row — evaluating any WHERE per record on
     // the stored bytes where it can. Declines (null) to the row path below for an in-memory store.
     // Cost-neutral by construction (aggColumnar charges the identical scan block).
-    let srows = this.aggColumnar(plan, gset, env, params, meter);
+    let srows = yield* this.aggColumnarSteps(plan, gset, env, params, meter);
     if (srows !== null) {
       // Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
-      for (const r of srows) meter.admitRow(r);
+      for (const r of srows) {
+        if (shouldCooperate()) yield COOPERATE;
+        meter.admitRow(r);
+      }
     } else {
       // Row path: scan the single base relation through the same path the eager executor uses (so the
       // pageRead / valueDecompress / storageRowRead block is charged identically — materializeRel), then
       // apply the residual WHERE per scanned row through the ordinary evaluator (its operatorEval charges
       // + 3VL survivor test byte-identical to the scalar WHERE loop).
-      const rows = this.materializeRel(plan, 0, env.outer, [], env, params, meter);
+      const rows = yield* this.materializeRelSteps(plan, 0, env.outer, [], env, params, meter);
       // The same row-buffer accounting as the scalar aggregate branch (memory.md §5).
       const mask = plan.relMasks[0]!;
       let survivors: Row[];
@@ -22389,15 +24608,24 @@ export class Engine {
       } else {
         survivors = [];
         for (const r of rows) {
-          if (evalFilter(plan.filter, r, env, meter)) survivors.push(r);
+          if (shouldCooperate()) yield COOPERATE;
+          if (yield* evalFilterSteps(plan.filter, r, env, meter)) survivors.push(r);
           else meter.releaseRowMasked(r, mask);
         }
       }
       const at: LaneAt = (j, col) => survivors[j]![col]!;
       srows =
         gset.keyCols.length === 0
-          ? [foldAggWhole(plan.aggSpecs, at, survivors.length, this.session.timeZone, meter)]
-          : groupByIntKey(
+          ? [
+              yield* foldAggWholeSteps(
+                plan.aggSpecs,
+                at,
+                survivors.length,
+                this.session.timeZone,
+                meter,
+              ),
+            ]
+          : yield* groupByIntKeySteps(
               plan.aggSpecs,
               gset.keyCols[0]!,
               at,
@@ -22405,7 +24633,10 @@ export class Engine {
               this.session.timeZone,
               meter,
             );
-      for (const r of srows) meter.admitRow(r);
+      for (const r of srows) {
+        if (shouldCooperate()) yield COOPERATE;
+        meter.admitRow(r);
+      }
       meter.releaseRowsMasked(survivors, mask);
     }
 
@@ -22435,6 +24666,16 @@ export class Engine {
     params: Value[],
     meter: Meter,
   ): Value[][] | null {
+    return runSync(this.aggColumnarSteps(plan, gset, env, params, meter));
+  }
+
+  private *aggColumnarSteps(
+    plan: SelectPlan,
+    gset: GroupSet,
+    env: EvalEnv,
+    params: Value[],
+    meter: Meter,
+  ): Steps<Value[][] | null> {
     const rel = plan.rels[0]!;
     const store = this.lkpStoreScoped(rel.db, rel.tableName);
     // File-backed only: an in-memory store's row path is already zero-copy.
@@ -22447,6 +24688,7 @@ export class Engine {
     // ordinal — else its gathered lane would be empty. Also declines a (never-expected) non-zero offset.
     const need = (idx: number): boolean => idx >= 0 && idx < mask.length && mask[idx] === true;
     for (const spec of plan.aggSpecs) {
+      if (shouldCooperate()) yield COOPERATE;
       if (spec.operand !== null && spec.operand.kind === "column" && !need(spec.operand.index)) {
         return null;
       }
@@ -22472,7 +24714,9 @@ export class Engine {
     // (float.md §7, packed-leaf.md §11). The WHERE compiles once into span atoms over the stored bytes
     // plus generic predicates over a reusable scratch row (Track A4) — byte-identical survivors +
     // operator_eval to the row path's evalFilter.
-    const whole: Acc[] = grouped ? [] : plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
+    const whole: Acc[] = grouped
+      ? []
+      : plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
     const groups: { key: Value; accs: Acc[] }[] = [];
     const index = new Map<bigint, number>();
     let nullGi = -1;
@@ -22490,9 +24734,9 @@ export class Engine {
 
     if (doScan) {
       const reuse = laneReuse(store.columnTypes(), span !== null);
-      const visit = (n: PNode, i: number): void => {
+      const visit = function* (this: Engine, n: PNode, i: number): Steps<void> {
         if (spillable) store.laneScanUnits(n, i, mask, units);
-        if (span !== null && !laneKeep(span, n, i, scratch, env, meter)) return;
+        if (span !== null && !(yield* laneKeepSteps(span, n, i, scratch, env, meter))) return;
         nsurv++;
         let accs: Acc[];
         if (grouped) {
@@ -22504,7 +24748,10 @@ export class Engine {
               if (charge.active()) charge.reserve(meter, entryBytes([kv]));
               gi = groups.length;
               index.set(kv.int, gi);
-              groups.push({ key: kv, accs: plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone)) });
+              groups.push({
+                key: kv,
+                accs: plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone)),
+              });
             } else {
               gi = g;
             }
@@ -22513,7 +24760,10 @@ export class Engine {
             if (nullGi < 0) {
               if (charge.active()) charge.reserve(meter, entryBytes([nullValue()]));
               nullGi = groups.length;
-              groups.push({ key: nullValue(), accs: plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone)) });
+              groups.push({
+                key: nullValue(),
+                accs: plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone)),
+              });
             }
             gi = nullGi;
           }
@@ -22522,18 +24772,23 @@ export class Engine {
           accs = whole;
         }
         for (let s = 0; s < plan.aggSpecs.length; s++) {
+          if (shouldCooperate()) yield COOPERATE;
           const spec = plan.aggSpecs[s]!;
           const oc = operandCol(spec);
           let v: Value;
-          if (oc === null) v = nullValue(); // COUNT(*) folds no value
+          if (oc === null)
+            v = nullValue(); // COUNT(*) folds no value
           else if (spec.plan === "count")
             // COUNT(col) folds only nullness — the value is never decoded (Track A4).
             v = colIsNull(n, i, oc) ? nullValue() : { kind: "bool", value: true };
-          else v = reuse[oc] ? scratch.read(n, i, oc) : readLeafColumn(n, i, oc);
+          else
+            v = reuse[oc]
+              ? yield* scratch.readSteps(n, i, oc)
+              : yield* readLeafColumnSteps(n, i, oc);
           foldAcc(accs[s]!, v, meter);
         }
-      };
-      const r = store.foldScanMasked(b, visit);
+      }.bind(this);
+      const r = yield* store.foldScanMaskedSteps(b, visit);
       rowCount = r.rowCount;
       pages = r.nodes;
     }
@@ -22564,29 +24819,44 @@ export class Engine {
     materialized: Row[][],
     relWork: bigint[],
   ): Row[] {
+    return runSync(
+      this.execCostedTwoRelationJoinSteps(plan, env, meter, params, materialized, relWork),
+    );
+  }
+
+  private *execCostedTwoRelationJoinSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    materialized: Row[][],
+    relWork: bigint[],
+  ): Steps<Row[]> {
     const outerOrdinal = physicalRelOrdinal(plan, 0);
     const innerOrdinal = physicalRelOrdinal(plan, 1);
     const outerRows = materialized[outerOrdinal]!;
     const innerRows = materialized[innerOrdinal]!;
     const innerINL = plan.phys.relINLBounds[innerOrdinal] !== null;
-    const hashTable = plan.phys.hashJoin === null
-      ? null
-      : new HashJoinTable(
-          plan.phys.hashJoin,
-          plan.rels[innerOrdinal]!.offset,
-          plan.rels[outerOrdinal]!.offset,
-          innerRows,
-          meter,
-        );
+    const hashTable =
+      plan.phys.hashJoin === null
+        ? null
+        : yield* HashJoinTable.buildSteps(
+            plan.phys.hashJoin,
+            plan.rels[innerOrdinal]!.offset,
+            plan.rels[outerOrdinal]!.offset,
+            innerRows,
+            meter,
+          );
     const on = joinOn(plan, 0);
     const mask = memoryMask(plan, meter);
     const out: Row[] = [];
     for (const outerRow of outerRows) {
+      if (shouldCooperate()) yield COOPERATE;
       let candidates = innerRows;
       if (innerINL) {
         const outerLogical = placePhysicalRelationRow(plan, outerOrdinal, outerRow);
         const before = meter.accrued;
-        candidates = this.materializeRel(
+        candidates = yield* this.materializeRelSteps(
           plan,
           innerOrdinal,
           env.outer,
@@ -22597,11 +24867,12 @@ export class Engine {
         );
         relWork[innerOrdinal] = relWork[innerOrdinal]! + meter.accrued - before;
       } else if (hashTable !== null) {
-        candidates = hashTable
-          .probe(plan.phys.hashJoin!, outerRow, meter)
-          .map((index) => innerRows[index]!);
+        candidates = (yield* hashTable.probeSteps(plan.phys.hashJoin!, outerRow, meter)).map(
+          (index) => innerRows[index]!,
+        );
       }
       for (const innerRow of candidates) {
+        if (shouldCooperate()) yield COOPERATE;
         const combined = combinePhysicalRelationRows(
           plan,
           outerOrdinal,
@@ -22609,7 +24880,7 @@ export class Engine {
           innerOrdinal,
           innerRow,
         );
-        if (on === null || evalFilter(on, combined, env, meter)) {
+        if (on === null || (yield* evalFilterSteps(on, combined, env, meter))) {
           meter.admitRowMasked(combined, mask);
           out.push(combined);
         }
@@ -22630,40 +24901,66 @@ export class Engine {
     relWork: bigint[],
     stepCount: number,
   ): Row[] {
+    return runSync(
+      this.execCostedNWayJoinSteps(plan, env, meter, params, materialized, relWork, stepCount),
+    );
+  }
+
+  private *execCostedNWayJoinSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    materialized: Row[][],
+    relWork: bigint[],
+    stepCount: number,
+  ): Steps<Row[]> {
     const driver = plan.phys.relationOrder[0]!;
     const mask = memoryMask(plan, meter);
     let running: Row[] = [];
     for (const row of materialized[driver]!) {
+      if (shouldCooperate()) yield COOPERATE;
       const placed = placePhysicalRelationRow(plan, driver, row);
       meter.admitRowMasked(placed, mask);
       running.push(placed);
     }
     for (let position = 0; position < stepCount; position++) {
+      if (shouldCooperate()) yield COOPERATE;
       const step = plan.phys.joinSteps[position]!;
       const inner = plan.phys.relationOrder[position + 1]!;
       const innerRows = materialized[inner]!;
       const innerINL = plan.phys.relINLBounds[inner] !== null;
       const innerLateral = plan.rels[inner]!.lateral;
-      const stepKind = step.onIndices.reduce<JoinKind>((kind, onIndex) => {
-        const candidate = plan.joins[onIndex]!.kind;
-        return candidate === "left" || candidate === "right" || candidate === "full"
-          ? candidate
-          : kind;
-      }, step.onIndices.length === 0 ? "cross" : "inner");
+      const stepKind = step.onIndices.reduce<JoinKind>(
+        (kind, onIndex) => {
+          const candidate = plan.joins[onIndex]!.kind;
+          return candidate === "left" || candidate === "right" || candidate === "full"
+            ? candidate
+            : kind;
+        },
+        step.onIndices.length === 0 ? "cross" : "inner",
+      );
       const emitLeft = stepKind === "left" || stepKind === "full";
       const emitRight = stepKind === "right" || stepKind === "full";
       const hashTable =
         step.hashJoin === null
           ? null
-          : new HashJoinTable(step.hashJoin, plan.rels[inner]!.offset, 0, innerRows, meter);
+          : yield* HashJoinTable.buildSteps(
+              step.hashJoin,
+              plan.rels[inner]!.offset,
+              0,
+              innerRows,
+              meter,
+            );
       const next: Row[] = [];
       const rightMatched = new Array<boolean>(innerRows.length).fill(false);
       for (const left of running) {
+        if (shouldCooperate()) yield COOPERATE;
         let candidates = innerRows;
         let candidateIndices: number[] | null = null;
         if (innerINL) {
           const before = meter.accrued;
-          candidates = this.materializeRel(
+          candidates = yield* this.materializeRelSteps(
             plan,
             inner,
             env.outer,
@@ -22675,7 +24972,7 @@ export class Engine {
           relWork[inner] = relWork[inner]! + meter.accrued - before;
         } else if (innerLateral) {
           const before = meter.accrued;
-          candidates = this.materializeRel(
+          candidates = yield* this.materializeRelSteps(
             plan,
             inner,
             [...env.outer, left],
@@ -22686,18 +24983,20 @@ export class Engine {
           );
           relWork[inner] = relWork[inner]! + meter.accrued - before;
         } else if (hashTable !== null) {
-          candidateIndices = hashTable.probe(step.hashJoin!, left, meter);
+          candidateIndices = yield* hashTable.probeSteps(step.hashJoin!, left, meter);
           candidates = candidateIndices.map((index) => innerRows[index]!);
         }
         let leftMatched = false;
         for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+          if (shouldCooperate()) yield COOPERATE;
           const right = candidates[candidateIndex]!;
           const combined = left.slice();
           combined.splice(plan.rels[inner]!.offset, right.length, ...right);
           let keep = true;
           for (const onIndex of step.onIndices) {
+            if (shouldCooperate()) yield COOPERATE;
             const on = joinOn(plan, onIndex);
-            if (on !== null && !evalFilter(on, combined, env, meter)) {
+            if (on !== null && !(yield* evalFilterSteps(on, combined, env, meter))) {
               keep = false;
               break;
             }
@@ -22720,6 +25019,7 @@ export class Engine {
       }
       if (emitRight) {
         for (let index = 0; index < innerRows.length; index++) {
+          if (shouldCooperate()) yield COOPERATE;
           if (rightMatched[index]) continue;
           const combined = Array.from({ length: logicalJoinRowWidth(plan) }, () => nullValue());
           combined.splice(plan.rels[inner]!.offset, innerRows[index]!.length, ...innerRows[index]!);
@@ -22764,7 +25064,23 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): Emitter {
-    return meter.costFirst(() => this.execBoundedBlockingLane(plan, env, meter, params));
+    return runSync(this.execBoundedBlockingSteps(plan, env, meter, params));
+  }
+
+  private *execBoundedBlockingSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Steps<Emitter> {
+    try {
+      return yield* this.execBoundedBlockingLaneSteps(plan, env, meter, params);
+    } catch (error) {
+      // Preserve Meter.costFirst's precedence while retaining the suspended lane.
+      if (error instanceof EngineError && error.state === "query_memory_limit_exceeded")
+        meter.guard();
+      throw error;
+    }
   }
 
   // Every spill structure of the lane charges its resident elements to the statement's query-memory
@@ -22778,6 +25094,15 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): Emitter {
+    return runSync(this.execBoundedBlockingLaneSteps(plan, env, meter, params));
+  }
+
+  private *execBoundedBlockingLaneSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Steps<Emitter> {
     if (
       plan.rels.length >= 3 &&
       (plan.phys.relationOrder.length !== plan.rels.length ||
@@ -22829,6 +25154,7 @@ export class Engine {
           ? [physicalRelOrdinal(plan, 0), physicalRelOrdinal(plan, 1)]
           : plan.rels.map((_, i) => i);
       for (const ordinal of scanOrder) {
+        if (shouldCooperate()) yield COOPERATE;
         const rel = plan.rels[ordinal]!;
         const mask = plan.relMasks[ordinal]!;
         const out = spool();
@@ -22844,7 +25170,7 @@ export class Engine {
           rel.derived !== undefined ||
           needsEagerScan(plan.phys.relBounds[ordinal])
         ) {
-          const materialized = this.materializeRel(
+          const materialized = yield* this.materializeRelSteps(
             plan,
             ordinal,
             env.outer,
@@ -22856,7 +25182,10 @@ export class Engine {
           // Spool residency is operator state bounded by workMem (memory.md §6.6): the rows leave the
           // query-memory row account and enter the spool with their untouched slots NULLed.
           meter.releaseRowsMasked(materialized, mask);
-          for (const row of materialized) out.push(nullUntouched(row, mask));
+          for (const row of materialized) {
+            if (shouldCooperate()) yield COOPERATE;
+            out.push(nullUntouched(row, mask));
+          }
           relations[ordinal] = out;
           relWork[ordinal] = meter.accrued - before;
           continue;
@@ -22868,18 +25197,22 @@ export class Engine {
         // The relation's pushed WHERE conjuncts (planner.md §3.2), exactly as materializeRel runs them.
         const pushed = pushedFilter(plan, ordinal).local;
         if (bound !== null) {
-          const units = store.overlapScanUnits(bound, mask);
+          const units = yield* store.overlapScanUnitsSteps(bound, mask);
           meter.charge(
             COSTS.valueDecompress * BigInt(units.slabs) + COSTS.pageRead * BigInt(units.pages),
           );
-          store.scanRange(bound, (_key, raw) => {
-            meter.guard();
-            meter.charge(COSTS.storageRowRead);
-            const row = store.resolveColumns(raw, mask);
-            if (pushed !== null && !evalFilter(pushed, row, env, meter)) return true;
-            out.push(nullUntouched(row, mask));
-            return true;
-          });
+          yield* store.scanRangeSteps(
+            bound,
+            function* (this: Engine, _key: Uint8Array, raw: Row): Steps<boolean> {
+              meter.guard();
+              meter.charge(COSTS.storageRowRead);
+              const row = yield* store.resolveColumnsSteps(raw, mask);
+              if (pushed !== null && !(yield* evalFilterSteps(pushed, row, env, meter)))
+                return true;
+              out.push(nullUntouched(row, mask));
+              return true;
+            }.bind(this),
+          );
         }
         relations[ordinal] = out;
         relWork[ordinal] = meter.accrued - before;
@@ -22887,27 +25220,47 @@ export class Engine {
       // A LATERAL or index-nested-loop relation is re-materialized per left row; its rows leave the
       // query-memory row account and enter a per-row spool, discarded once the left row is joined
       // (memory.md §5.3/§6.6). null for an ordinary relation.
-      const dynamicRows = (ordinal: number, logical: Row): RowSpool | null => {
+      const dynamicRows = function* (
+        this: Engine,
+        ordinal: number,
+        logical: Row,
+      ): Steps<RowSpool | null> {
         const rel = plan.rels[ordinal]!;
         if (!rel.lateral && plan.phys.relINLBounds[ordinal] === null) return null;
         const before = meter.accrued;
         const result = rel.lateral
-          ? this.materializeRel(plan, ordinal, [...env.outer, logical], [], env, params, meter)
-          : this.materializeRel(plan, ordinal, env.outer, logical, env, params, meter);
+          ? yield* this.materializeRelSteps(
+              plan,
+              ordinal,
+              [...env.outer, logical],
+              [],
+              env,
+              params,
+              meter,
+            )
+          : yield* this.materializeRelSteps(plan, ordinal, env.outer, logical, env, params, meter);
         relWork[ordinal] = relWork[ordinal]! + meter.accrued - before;
         const mask = plan.relMasks[ordinal]!;
         meter.releaseRowsMasked(result, mask);
         const rows = new RowSpool(budget, sink, new StateCharge(acct));
-        for (const row of result) rows.push(nullUntouched(row, mask));
+        for (const row of result) {
+          if (shouldCooperate()) yield COOPERATE;
+          rows.push(nullUntouched(row, mask));
+        }
         return rows;
-      };
+      }.bind(this);
       // A bounded hash table over an inner relation: each build row with a non-NULL key is resident as
       // ENTRY + row_bytes([key, row-composite]) (memory.md §6.6), in the shape every core stores.
-      const buildHashTable = (hp: HashJoinPlan, inner: number): SpillMultiMap => {
+      const buildHashTable = function* (
+        this: Engine,
+        hp: HashJoinPlan,
+        inner: number,
+      ): Steps<SpillMultiMap> {
         const table = hashRows();
         const buildIndices = hp.keys.map((k) => k.right - plan.rels[inner]!.offset);
         const types = hp.keys.map((k) => k.type);
         for (const row of relations[inner]!) {
+          if (shouldCooperate()) yield COOPERATE;
           const key = hashJoinRowKey(row, buildIndices, types, COSTS.hashBuild, meter);
           if (key === null) continue;
           table.append(
@@ -22917,10 +25270,15 @@ export class Engine {
           );
         }
         return table;
-      };
+      }.bind(this);
       // Probe a bounded hash table with a full-width left row: the matching build rows, in build order,
       // collected into a per-row spool (charged while resident, discarded once the left row is joined).
-      const probeHashTable = (hp: HashJoinPlan, table: SpillMultiMap, left: Row): RowSpool => {
+      const probeHashTable = function* (
+        this: Engine,
+        hp: HashJoinPlan,
+        table: SpillMultiMap,
+        left: Row,
+      ): Steps<RowSpool> {
         const matches = new RowSpool(budget, sink, new StateCharge(acct));
         const types = hp.keys.map((k) => k.type);
         const key = hashJoinRowKey(
@@ -22932,25 +25290,29 @@ export class Engine {
         );
         if (key === null) return matches;
         for (const entry of table.get(hashJoinFnv1a(key).toString())) {
+          if (shouldCooperate()) yield COOPERATE;
           const stored = (entry[0]! as { bytes: Uint8Array }).bytes;
           meter.guard();
           meter.charge(COSTS.hashProbe * BigInt(Math.max(1, Math.min(stored.length, key.length))));
           if (bytesEq(stored, key)) matches.push(entry.slice(1));
         }
         return matches;
-      };
+      }.bind(this);
       const physical =
         plan.phys.relationOrder.length === n && (n === 2 || plan.phys.joinSteps.length + 1 === n);
       const joinOrder = physical ? plan.phys.relationOrder : plan.rels.map((_, i) => i);
       // The join steps, in the physical relation order: the driver's rows are placed full-width, then
       // each step joins the running rows with one inner relation (nested loop or bounded hash).
-      const joinSteps = (count: number): RowSpool => {
+      const joinSteps = function* (this: Engine, count: number): Steps<RowSpool> {
         const driver = joinOrder[0]!;
         let running = spool();
-        for (const row of relations[driver]!)
+        for (const row of relations[driver]!) {
+          if (shouldCooperate()) yield COOPERATE;
           running.push(placePhysicalRelationRow(plan, driver, row));
+        }
         relations[driver]!.close();
         for (let position = 0; position < count; position++) {
+          if (shouldCooperate()) yield COOPERATE;
           const inner = joinOrder[position + 1]!;
           const nway = physical && n >= 3;
           const onIndices = nway ? plan.phys.joinSteps[position]!.onIndices : [position];
@@ -22959,7 +25321,7 @@ export class Engine {
             : position === 0
               ? plan.phys.hashJoin
               : null;
-          const table = hp === null ? null : buildHashTable(hp, inner);
+          const table = hp === null ? null : yield* buildHashTable(hp, inner);
           const emitLeft = onIndices.some((i) => {
             const kind = plan.joins[i]!.kind;
             return kind === "left" || kind === "full";
@@ -22973,19 +25335,22 @@ export class Engine {
           const rightMatches = map();
           const next = spool();
           for (const left of running) {
+            if (shouldCooperate()) yield COOPERATE;
             const owned =
-              dynamicRows(inner, left) ??
-              (table === null ? null : probeHashTable(hp!, table, left));
+              (yield* dynamicRows(inner, left)) ??
+              (table === null ? null : yield* probeHashTable(hp!, table, left));
             try {
               let matched = false;
               let ordinal = 0;
               for (const right of owned ?? relations[inner]!) {
+                if (shouldCooperate()) yield COOPERATE;
                 const combined = left.slice();
                 combined.splice(plan.rels[inner]!.offset, right.length, ...right);
                 let keep = true;
                 for (const index of onIndices) {
+                  if (shouldCooperate()) yield COOPERATE;
                   const on = joinOn(plan, index);
-                  if (on !== null && !evalFilter(on, combined, env, meter)) {
+                  if (on !== null && !(yield* evalFilterSteps(on, combined, env, meter))) {
                     keep = false;
                     break;
                   }
@@ -23006,6 +25371,7 @@ export class Engine {
           if (emitRight) {
             let ordinal = 0;
             for (const right of relations[inner]!) {
+              if (shouldCooperate()) yield COOPERATE;
               if (rightMatches.get(String(ordinal)) === undefined)
                 next.push(placePhysicalRelationRow(plan, inner, right));
               ordinal++;
@@ -23018,38 +25384,44 @@ export class Engine {
           table?.close();
           running = next;
           if (nway && position + 1 < plan.phys.joinSteps.length)
-            this.recordExplainActualParent(hp === null ? "Nested Loop" : "Hash Join", meter.accrued);
+            this.recordExplainActualParent(
+              hp === null ? "Nested Loop" : "Hash Join",
+              meter.accrued,
+            );
         }
         return running;
-      };
+      }.bind(this);
       let rows: RowSpool;
       if (plan.phys.joinPkOrdered) {
         // Streaming top-N: every step but the last completes, then the final step streams its
         // filtered, projected rows into the output spool and stops once the LIMIT window fills.
-        const running = joinSteps(n - 2);
+        const running = yield* joinSteps(n - 2);
         const nway = n >= 3;
         const inner = joinOrder[n - 1]!;
         const hp = nway ? plan.phys.joinSteps[n - 2]!.hashJoin : plan.phys.hashJoin;
         const onIndices = nway ? plan.phys.joinSteps[n - 2]!.onIndices : [0];
         const table =
-          hp !== null && (nway || plan.limit !== 0n) ? buildHashTable(hp, inner) : null;
+          hp !== null && (nway || plan.limit !== 0n) ? yield* buildHashTable(hp, inner) : null;
         if (table !== null) relations[inner]!.close();
         const output = spool();
         let passed = 0n;
         if (plan.limit !== 0n) {
           // biome-ignore lint/suspicious/noLabelVar: `probe` labels the top-N exit.
           probe: for (const left of running) {
+            if (shouldCooperate()) yield COOPERATE;
             const owned =
-              dynamicRows(inner, left) ??
-              (table === null ? null : probeHashTable(hp!, table, left));
+              (yield* dynamicRows(inner, left)) ??
+              (table === null ? null : yield* probeHashTable(hp!, table, left));
             try {
               for (const right of owned ?? relations[inner]!) {
+                if (shouldCooperate()) yield COOPERATE;
                 const combined = left.slice();
                 combined.splice(plan.rels[inner]!.offset, right.length, ...right);
                 let keep = true;
                 for (const index of onIndices) {
+                  if (shouldCooperate()) yield COOPERATE;
                   const on = joinOn(plan, index);
-                  if (on !== null && !evalFilter(on, combined, env, meter)) {
+                  if (on !== null && !(yield* evalFilterSteps(on, combined, env, meter))) {
                     keep = false;
                     break;
                   }
@@ -23057,7 +25429,7 @@ export class Engine {
                 if (!keep) continue;
                 if (residual !== null) {
                   const before = meter.accrued;
-                  const pass = evalFilter(residual, combined, env, meter);
+                  const pass = yield* evalFilterSteps(residual, combined, env, meter);
                   filterWork += meter.accrued - before;
                   if (!pass) continue;
                 }
@@ -23065,7 +25437,12 @@ export class Engine {
                 meter.guard();
                 const before = meter.accrued;
                 meter.charge(COSTS.rowProduced);
-                const projected = plan.projections.map((p) => evalExpr(p, combined, env, meter));
+                const projected = yield* evalExpressionsSteps(
+                  plan.projections,
+                  combined,
+                  env,
+                  meter,
+                );
                 outputWork += meter.accrued - before;
                 output.push(projected);
                 if (plan.limit !== null && BigInt(output.length) >= plan.limit) break probe;
@@ -23082,7 +25459,7 @@ export class Engine {
         running.close();
         rows = output;
       } else if (n >= 2) {
-        rows = joinSteps(n - 1);
+        rows = yield* joinSteps(n - 1);
       } else if (n === 0) {
         rows = spool();
         rows.push([]);
@@ -23092,6 +25469,7 @@ export class Engine {
           ? plan.phys.relationOrder
           : plan.rels.map((_, i) => i);
       for (const ordinal of ordinals) {
+        if (shouldCooperate()) yield COOPERATE;
         const node = selectActualRelNode(plan.rels[ordinal]!);
         if (selectActualRootNode(plan) !== node) this.recordExplainActual(node, relWork[ordinal]!);
       }
@@ -23106,50 +25484,56 @@ export class Engine {
             ? meter.accrued - profileStart - filterWork - outputWork
             : meter.accrued,
         );
-      if (
-        plan.phys.joinPkOrdered &&
-        residual !== null &&
-        selectActualRootNode(plan) !== "Filter"
-      )
+      if (plan.phys.joinPkOrdered && residual !== null && selectActualRootNode(plan) !== "Filter")
         this.recordExplainActualParent("Filter", meter.accrued - profileStart - outputWork);
       if (!plan.phys.joinPkOrdered) {
         // The WHERE pass always copies its survivors into a fresh spool (every row without a WHERE).
         const filtered = spool();
-        for (const row of rows)
-          if (residual === null || evalFilter(residual, row, env, meter))
+        for (const row of rows) {
+          if (shouldCooperate()) yield COOPERATE;
+          if (residual === null || (yield* evalFilterSteps(residual, row, env, meter)))
             filtered.push(row);
+        }
         rows.close();
         rows = filtered;
         if (residual !== null && selectActualRootNode(plan) !== "Filter")
           this.recordExplainActualParent("Filter", meter.accrued);
       }
-      const applyWindow = (input: RowSpool): RowSpool => {
+      const applyWindow = function* (this: Engine, input: RowSpool): Steps<RowSpool> {
         // Window partition state remains an upstream materialization owner. While materialized it is a
         // query-memory row buffer (memory.md §5.1): pre-projection rows under the touched mask, or
         // projected-shape group rows for a grouped window.
         const mask = plan.isAgg ? [] : memoryMask(plan, meter);
         const materialized: Row[] = [];
         for (const row of input) {
+          if (shouldCooperate()) yield COOPERATE;
           meter.admitRowMasked(row, mask);
           materialized.push(row);
         }
-        applyWindowStage(materialized, plan.windowSpecs, plan.windowKeys, env, meter);
+        yield* applyWindowStageSteps(materialized, plan.windowSpecs, plan.windowKeys, env, meter);
         meter.releaseRowsMasked(materialized, mask);
         const out = spool();
-        for (const row of materialized) out.push(row);
+        for (const row of materialized) {
+          if (shouldCooperate()) yield COOPERATE;
+          out.push(row);
+        }
         input.close(); // the window stage completed (memory.md §6.6)
         if (selectActualRootNode(plan) !== "Window")
           this.recordExplainActualParent("Window", meter.accrued);
         return out;
-      };
-      if (plan.hasWindow && !plan.isAgg) rows = applyWindow(rows);
+      }.bind(this);
+      if (plan.hasWindow && !plan.isAgg) rows = yield* applyWindow(rows);
       if (plan.isAgg) {
         if (plan.groupExprs.length > 0) {
           const extended = spool();
           for (const original of rows) {
+            if (shouldCooperate()) yield COOPERATE;
             meter.guard();
             const row = original.slice();
-            for (const expr of plan.groupExprs) row.push(evalExpr(expr, row, env, meter));
+            for (const expr of plan.groupExprs) {
+              if (shouldCooperate()) yield COOPERATE;
+              row.push(yield* evalExprSteps(expr, row, env, meter));
+            }
             extended.push(row);
           }
           rows.close();
@@ -23157,6 +25541,7 @@ export class Engine {
         }
         const grouped = spool();
         for (const gset of plan.groupSets) {
+          if (shouldCooperate()) yield COOPERATE;
           // Per grouping set: the group states (keyed by the group key, valued in the packed shape
           // every core measures), the first-occurrence key spool, the DISTINCT-aggregate and unique-key
           // sets, and the retained aggregate inputs (memory.md §6.6).
@@ -23165,36 +25550,50 @@ export class Engine {
           const seen = map();
           const unique = map();
           const collections = hashRows();
-          const fresh = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
+          const fresh = (): Acc[] =>
+            plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
           if (gset.keyCols.length === 0) {
             const accs = fresh();
             states.set("", encodeBlockingAccs([], accs), 0, packedStateBytes(accs));
             order.push([]);
           }
           for (const row of rows) {
+            if (shouldCooperate()) yield COOPERATE;
             meter.guard();
             const keys = gset.keyCols.map((index) => row[index]!);
             const key = distinctRowKey(keys);
             const previous = states.get(key);
             const accs =
-              previous === undefined ? fresh() : decodeBlockingAccs(previous, plan.aggSpecs, this.session.timeZone).accs;
+              previous === undefined
+                ? fresh()
+                : decodeBlockingAccs(previous, plan.aggSpecs, this.session.timeZone).accs;
             if (previous === undefined) order.push(keys);
             for (let si = 0; si < plan.aggSpecs.length; si++) {
+              if (shouldCooperate()) yield COOPERATE;
               const spec = plan.aggSpecs[si]!;
-              if (spec.filter != null && !isTrue(evalExpr(spec.filter, row, env, meter))) continue;
+              if (
+                spec.filter != null &&
+                !isTrue(yield* evalExprSteps(spec.filter, row, env, meter))
+              )
+                continue;
               meter.charge(COSTS.aggregateAccumulate);
               const collectionKey = blockingCollectionKey(key, si);
               if (spec.hypo != null) {
                 collections.append(
                   collectionKey,
-                  spec.hypo.keys.map((expr) => evalExpr(expr, row, env, meter)),
+                  yield* evalExpressionsSteps(spec.hypo.keys, row, env, meter),
                 );
                 continue;
               }
               const value =
-                spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
+                spec.operand === null
+                  ? nullValue()
+                  : yield* evalExprSteps(spec.operand, row, env, meter);
               // An in-aggregate ORDER BY's keys follow the argument (aggregates.md §22).
-              const tuple = spec.order != null ? aggOrderTuple(spec.order, value, row, env, meter) : null;
+              const tuple =
+                spec.order != null
+                  ? yield* aggOrderTupleSteps(spec.order, value, row, env, meter)
+                  : null;
               if (spec.distinct) {
                 if (value.kind === "null" && !aggDistinctKeepsNull(spec.plan)) continue;
                 // The entry is (group ordinal, aggregate ordinal, value).
@@ -23229,12 +25628,18 @@ export class Engine {
             );
           }
           for (const keys of order) {
+            if (shouldCooperate()) yield COOPERATE;
             const key = distinctRowKey(keys);
-            const group = decodeBlockingAccs(states.get(key)!, plan.aggSpecs, this.session.timeZone);
+            const group = decodeBlockingAccs(
+              states.get(key)!,
+              plan.aggSpecs,
+              this.session.timeZone,
+            );
             const row = gset.slotSrc.map((src) => (src < 0 ? nullValue() : keys[src]!));
-            for (let si = 0; si < group.accs.length; si++)
+            for (let si = 0; si < group.accs.length; si++) {
+              if (shouldCooperate()) yield COOPERATE;
               row.push(
-                finalizeBlockingCollection(
+                yield* finalizeBlockingCollectionSteps(
                   group.accs[si]!,
                   plan.aggSpecs[si]!,
                   blockingCollectionKey(key, si),
@@ -23247,8 +25652,11 @@ export class Engine {
                   meter,
                 ),
               );
-            for (const positions of plan.groupingSpecs)
+            }
+            for (const positions of plan.groupingSpecs) {
+              if (shouldCooperate()) yield COOPERATE;
               row.push(intValue(groupingValue(positions, gset.mask)));
+            }
             grouped.push(row);
           }
           states.close();
@@ -23261,21 +25669,27 @@ export class Engine {
         rows = grouped;
         if (plan.having !== null) {
           const filtered = spool();
-          for (const row of rows)
-            if (evalFilter(plan.having, row, env, meter)) filtered.push(row);
+          for (const row of rows) {
+            if (shouldCooperate()) yield COOPERATE;
+            if (yield* evalFilterSteps(plan.having, row, env, meter)) filtered.push(row);
+          }
           rows.close();
           rows = filtered;
         }
         if (selectActualRootNode(plan) !== "Aggregate")
           this.recordExplainActualParent("Aggregate", meter.accrued);
-        if (plan.hasWindow) rows = applyWindow(rows);
+        if (plan.hasWindow) rows = yield* applyWindow(rows);
       }
       if (!plan.phys.joinPkOrdered && plan.order.length > 0) {
         // Finish expression evaluation for every row before collation decoration can fail.
         const extended = spool();
         for (const original of rows) {
+          if (shouldCooperate()) yield COOPERATE;
           const row = original.slice();
-          for (const expr of plan.orderExprs) row.push(evalExpr(expr, row, env, meter));
+          for (const expr of plan.orderExprs) {
+            if (shouldCooperate()) yield COOPERATE;
+            row.push(yield* evalExprSteps(expr, row, env, meter));
+          }
           extended.push(row);
         }
         rows.close();
@@ -23298,8 +25712,10 @@ export class Engine {
         );
         resources.push(sorter);
         for (const row of extended) {
+          if (shouldCooperate()) yield COOPERATE;
           const decorated = row.slice();
           for (const order of plan.order) {
+            if (shouldCooperate()) yield COOPERATE;
             const value = row[order.idx]!;
             decorated.push(
               order.collation !== null && (value.kind === "text" || value.kind === "array")
@@ -23312,7 +25728,10 @@ export class Engine {
         extended.close();
         const sorted = sorter.finishSpool();
         rows = spool();
-        for (const row of sorted) rows.push(row);
+        for (const row of sorted) {
+          if (shouldCooperate()) yield COOPERATE;
+          rows.push(row);
+        }
         sorted.close();
         sorter.close(); // the sorted output was consumed (memory.md §6.4)
         if (selectActualRootNode(plan) !== "Sort")
@@ -23322,7 +25741,8 @@ export class Engine {
         const seen = map();
         const unique = spool();
         for (const row of rows) {
-          const projected = plan.projections.map((p) => evalExpr(p, row, env, meter));
+          if (shouldCooperate()) yield COOPERATE;
+          const projected = yield* evalExpressionsSteps(plan.projections, row, env, meter);
           if (seen.insert(distinctRowKey(projected), keyBytes(projected))) unique.push(projected);
         }
         rows.close();
@@ -23340,7 +25760,10 @@ export class Engine {
       const remaining =
         plan.limit !== null && plan.limit < total - start ? plan.limit : total - start;
       const iterator = rows[Symbol.iterator]();
-      for (let i = 0n; i < start; i++) iterator.next();
+      for (let i = 0n; i < start; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+        iterator.next();
+      }
       // The output spool stays charged until its emission completes (close — memory.md §6.6).
       const sorted = {
         next: (): Row | null => {
@@ -23363,7 +25786,11 @@ export class Engine {
         sortedFinal: plan.phys.joinPkOrdered,
       };
     } finally {
-      if (!transferred) for (const resource of resources) resource.close();
+      if (!transferred)
+        for (const resource of resources) {
+          if (shouldCooperate()) yield COOPERATE;
+          resource.close();
+        }
     }
   }
 
@@ -23375,10 +25802,19 @@ export class Engine {
   // (a bufferedRows generator, the query() path). The env's StmtRng threads the per-statement entropy
   // through both the blocking part and the (possibly deferred) projection (streaming.md §6).
   execSelectEmit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
+    return runSync(this.execSelectEmitSteps(plan, env, meter, params));
+  }
+
+  *execSelectEmitSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Steps<Emitter> {
     // A WHERE contradiction (planner.md §3.1) skips every scan lane: the eager pipeline below runs
     // over an empty FROM (materializeRel reads nothing), so aggregates still see their empty input.
     const fast = !whereContradiction(plan);
-    const streamed = this.execSelectFast(plan, env, meter, params, fast);
+    const streamed = yield* this.execSelectFastSteps(plan, env, meter, params, fast);
     if (streamed !== null) return streamed;
 
     // Materialize each relation once, in primary-key order (base tables drain a scanSource — the
@@ -23393,19 +25829,31 @@ export class Engine {
     const materialized: Row[][] = [];
     const relWork = new Array<bigint>(plan.rels.length).fill(0n);
     for (let ri = 0; ri < plan.rels.length; ri++) {
+      if (shouldCooperate()) yield COOPERATE;
       const rel = plan.rels[ri]!;
       if (rel.lateral === true || plan.phys.relINLBounds[ri] !== null) {
         materialized.push([]);
         continue;
       }
       const before = meter.accrued;
-      materialized.push(this.materializeRel(plan, ri, env.outer, [], env, params, meter));
+      materialized.push(
+        yield* this.materializeRelSteps(plan, ri, env.outer, [], env, params, meter),
+      );
       relWork[ri] = meter.accrued - before;
     }
     // The join and everything after it run in a frame of their own: materializing a derived
     // relation recurses into its body's execSelectEmit, so this frame stays small
     // (spec/design/cost.md §7.1).
-    return this.execSelectJoined(plan, env, meter, params, fast, memMask, materialized, relWork);
+    return yield* this.execSelectJoinedSteps(
+      plan,
+      env,
+      meter,
+      params,
+      fast,
+      memMask,
+      materialized,
+      relWork,
+    );
   }
 
   // execSelectFast runs a SELECT through the first fast path that takes it, or returns null for the
@@ -23417,6 +25865,16 @@ export class Engine {
     params: Value[],
     fast: boolean,
   ): Emitter | null {
+    return runSync(this.execSelectFastSteps(plan, env, meter, params, fast));
+  }
+
+  private *execSelectFastSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    fast: boolean,
+  ): Steps<Emitter | null> {
     // The packed whole-table fold already has one finite accumulator and no retained input.
     // Keep that fast path when its touched-column gate proves it will not gather rows.
     if (
@@ -23427,10 +25885,10 @@ export class Engine {
       this.vectorizedAggEligible(plan)
     ) {
       const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
-      if (store.isFileBacked()) return this.execVectorizedAgg(plan, env, meter, params);
+      if (store.isFileBacked()) return yield* this.execVectorizedAggSteps(plan, env, meter, params);
     }
     if (fast && this.boundedBlockingEligible(plan))
-      return this.execBoundedBlocking(plan, env, meter, params);
+      return yield* this.execBoundedBlockingSteps(plan, env, meter, params);
     // Vectorized single-table aggregate (the PAX/vectorization program's executor track): a
     // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either whole-table or
     // grouped by a single integer column, folds columnar / int64-bucketed instead of the row-at-a-time
@@ -23445,21 +25903,23 @@ export class Engine {
       this.explainActualProfile === null &&
       this.vectorizedAggEligible(plan)
     ) {
-      return this.execVectorizedAgg(plan, env, meter, params);
+      return yield* this.execVectorizedAggSteps(plan, env, meter, params);
     }
 
     // Bounded streaming scan (spec/design/cost.md §3): a single-table query whose chosen access path
     // supplies its observable order stops row fetch/filter/project work at the LIMIT window. GIN/GiST
     // candidate gathering remains complete.
     if (fast && streamingScanEligible(plan)) {
-      return finalEmitter(this.execStreamingScan(plan, env, meter, params).rows);
+      return finalEmitter((yield* this.execStreamingScanSteps(plan, env, meter, params)).rows);
     }
 
     // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): compatible bounded
     // plans were caught above, so this fallback handles the no-bound LIMIT shape. Walk the ordering
     // index + point-lookup; the eager sort is elided.
     if (fast && plan.phys.indexOrder !== null) {
-      return finalEmitter(this.execIndexOrderScan(plan, plan.phys.indexOrder, env, meter).rows);
+      return finalEmitter(
+        (yield* this.execIndexOrderScanSteps(plan, plan.phys.indexOrder, env, meter)).rows,
+      );
     }
 
     // Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
@@ -23490,7 +25950,7 @@ export class Engine {
       // The streaming sort yields its output LAZILY (streaming.md §4/§7) — execStreamingSort runs the
       // scan + sort + OFFSET skip and returns a "sorted" Emitter over the SortedRows pull iterator; the
       // window's rowProduced + projection is charged by the emitter drive.
-      return this.execStreamingSort(plan, env, meter, params);
+      return yield* this.execStreamingSortSteps(plan, env, meter, params);
     }
 
     // Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
@@ -23500,8 +25960,8 @@ export class Engine {
     if (fast && plan.phys.joinPkOrdered) {
       const result =
         plan.phys.joinSteps.length + 1 === plan.rels.length && plan.rels.length >= 3
-          ? this.execStreamingNWayJoin(plan, env, meter, params, env.outer)
-          : this.execStreamingJoin(plan, env, meter, params, env.outer);
+          ? yield* this.execStreamingNWayJoinSteps(plan, env, meter, params, env.outer)
+          : yield* this.execStreamingJoinSteps(plan, env, meter, params, env.outer);
       return finalEmitter(result.rows);
     }
 
@@ -23510,7 +25970,7 @@ export class Engine {
     // scans only that prefix instead of the whole table — the window analog of the streaming LIMIT
     // short-circuit. Ineligible window queries fall through to the eager materialize below.
     if (fast && this.windowTopNEligible(plan)) {
-      return this.execWindowTopN(plan, env, meter, params);
+      return yield* this.execWindowTopNSteps(plan, env, meter, params);
     }
 
     // Columnar projection fast path (packed-leaf.md §11 Track A2/A3): a bare-column projection over a
@@ -23527,7 +25987,7 @@ export class Engine {
       this.explainActualProfile === null &&
       vectorizedProjectEligible(plan)
     ) {
-      const em = this.projectColumnar(plan, env, meter, params);
+      const em = yield* this.projectColumnarSteps(plan, env, meter, params);
       if (em !== null) return em;
     }
     return null;
@@ -23545,6 +26005,21 @@ export class Engine {
     materialized: Row[][],
     relWork: bigint[],
   ): Emitter {
+    return runSync(
+      this.execSelectJoinedSteps(plan, env, meter, params, fast, memMask, materialized, relWork),
+    );
+  }
+
+  private *execSelectJoinedSteps(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    fast: boolean,
+    memMask: boolean[],
+    materialized: Row[][],
+    relWork: bigint[],
+  ): Steps<Emitter> {
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
     // so far (starting with the first table's rows). For each join, concatenate every running
     // row with every right-table row; CROSS keeps all pairs, INNER keeps a pair iff its ON
@@ -23563,7 +26038,7 @@ export class Engine {
       plan.phys.relationOrder.length === plan.rels.length &&
       plan.rels.length >= 3
     ) {
-      running = this.execCostedNWayJoin(
+      running = yield* this.execCostedNWayJoinSteps(
         plan,
         env,
         meter,
@@ -23573,7 +26048,14 @@ export class Engine {
         plan.phys.joinSteps.length,
       );
     } else if (plan.phys.relationOrder.length === 2) {
-      running = this.execCostedTwoRelationJoin(plan, env, meter, params, materialized, relWork);
+      running = yield* this.execCostedTwoRelationJoinSteps(
+        plan,
+        env,
+        meter,
+        params,
+        materialized,
+        relWork,
+      );
     } else {
       if (plan.rels.length === 0) {
         if (fast) {
@@ -23588,107 +26070,147 @@ export class Engine {
         materialized[0] = [];
       }
       for (let k = 0; k < plan.joins.length; k++) {
-      const on = joinOn(plan, k);
-      const kind = plan.joins[k]!.kind;
-      const emitLeft = kind === "left" || kind === "full";
-      const emitRight = kind === "right" || kind === "full";
-      // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even when
-      // `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
-      // (= the width of every running row) and is that many columns wide.
-      const leftPad = plan.rels[k + 1]!.offset;
-      const rightPad = plan.rels[k + 1]!.colCount;
-      const next: Row[] = [];
-      // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row, with
-      // that row pushed onto the outer-row stack as the body's immediate outer (the correlated-
-      // subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL to a correlated
-      // lateral is 42P10), so there is no unmatched-right emission.
-      if (plan.rels[k + 1]!.lateral === true) {
-        for (const left of running) {
-          const before = meter.accrued;
-          const rightRows = this.materializeRel(
-            plan,
-            k + 1,
-            [...env.outer, left],
-            [],
-            env,
-            params,
+        if (shouldCooperate()) yield COOPERATE;
+        const on = joinOn(plan, k);
+        const kind = plan.joins[k]!.kind;
+        const emitLeft = kind === "left" || kind === "full";
+        const emitRight = kind === "right" || kind === "full";
+        // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even when
+        // `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
+        // (= the width of every running row) and is that many columns wide.
+        const leftPad = plan.rels[k + 1]!.offset;
+        const rightPad = plan.rels[k + 1]!.colCount;
+        const next: Row[] = [];
+        // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row, with
+        // that row pushed onto the outer-row stack as the body's immediate outer (the correlated-
+        // subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL to a correlated
+        // lateral is 42P10), so there is no unmatched-right emission.
+        if (plan.rels[k + 1]!.lateral === true) {
+          for (const left of running) {
+            if (shouldCooperate()) yield COOPERATE;
+            const before = meter.accrued;
+            const rightRows = yield* this.materializeRelSteps(
+              plan,
+              k + 1,
+              [...env.outer, left],
+              [],
+              env,
+              params,
+              meter,
+            );
+            relWork[k + 1] = relWork[k + 1]! + meter.accrued - before;
+            let leftMatched = false;
+            for (const right of rightRows) {
+              if (shouldCooperate()) yield COOPERATE;
+              const combined = left.concat(right);
+              if (on === null || (yield* evalFilterSteps(on, combined, env, meter))) {
+                meter.admitRowMasked(combined, memMask);
+                next.push(combined);
+                leftMatched = true;
+              }
+            }
+            if (emitLeft && !leftMatched) {
+              const combined = left.concat(nullRow(rightPad));
+              meter.admitRowMasked(combined, memMask);
+              next.push(combined);
+            }
+            // The per-left-row re-materialization is consumed (memory.md §5.3).
+            meter.releaseRowsMasked(rightRows, plan.relMasks[k + 1]!);
+          }
+          meter.releaseRowsMasked(running, memMask);
+          running = next;
+          continue;
+        }
+        // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER combined
+        // left-hand row, its scan bounded per outer row by the SIBLING columns of that row (a
+        // per-outer-row seek instead of a full scan). Detection restricts this to the RIGHT/nullable side
+        // of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT emission (RIGHT/FULL are
+        // excluded — a preserved side cannot be bounded per outer row). The whole ON/WHERE stays applied
+        // (the ON here, the WHERE below), so rows are unchanged.
+        if (plan.phys.relINLBounds[k + 1] !== null) {
+          for (const left of running) {
+            if (shouldCooperate()) yield COOPERATE;
+            const before = meter.accrued;
+            const rightRows = yield* this.materializeRelSteps(
+              plan,
+              k + 1,
+              env.outer,
+              left,
+              env,
+              params,
+              meter,
+            );
+            relWork[k + 1] = relWork[k + 1]! + meter.accrued - before;
+            let leftMatched = false;
+            for (const right of rightRows) {
+              if (shouldCooperate()) yield COOPERATE;
+              const combined = left.concat(right);
+              if (on === null || (yield* evalFilterSteps(on, combined, env, meter))) {
+                meter.admitRowMasked(combined, memMask);
+                next.push(combined);
+                leftMatched = true;
+              }
+            }
+            if (emitLeft && !leftMatched) {
+              const combined = left.concat(nullRow(rightPad));
+              meter.admitRowMasked(combined, memMask);
+              next.push(combined);
+            }
+            // The per-left-row re-materialization is consumed (memory.md §5.3).
+            meter.releaseRowsMasked(rightRows, plan.relMasks[k + 1]!);
+          }
+          meter.releaseRowsMasked(running, memMask);
+          running = next;
+          continue;
+        }
+        const rightRows = materialized[k + 1]!;
+        // The hash rule is exactly two inputs, so it can only own join 0. Build the right input once,
+        // then probe running rows in left order. Bucket indices retain right order and the full ON is
+        // rechecked, reproducing nested-loop enumeration and LEFT null-extension.
+        if (k === 0 && plan.phys.hashJoin !== null) {
+          const table = yield* HashJoinTable.buildSteps(
+            plan.phys.hashJoin,
+            plan.rels[1]!.offset,
+            plan.rels[0]!.offset,
+            rightRows,
             meter,
           );
-          relWork[k + 1] = relWork[k + 1]! + meter.accrued - before;
-          let leftMatched = false;
-          for (const right of rightRows) {
-            const combined = left.concat(right);
-            if (on === null || evalFilter(on, combined, env, meter)) {
+          for (const left of running) {
+            if (shouldCooperate()) yield COOPERATE;
+            const candidates = yield* table.probeSteps(plan.phys.hashJoin, left, meter);
+            let leftMatched = false;
+            for (const ri of candidates) {
+              if (shouldCooperate()) yield COOPERATE;
+              const combined = left.concat(rightRows[ri]!);
+              if (yield* evalFilterSteps(on!, combined, env, meter)) {
+                meter.admitRowMasked(combined, memMask);
+                next.push(combined);
+                leftMatched = true;
+              }
+            }
+            if (emitLeft && !leftMatched) {
+              const combined = left.concat(nullRow(rightPad));
               meter.admitRowMasked(combined, memMask);
               next.push(combined);
-              leftMatched = true;
             }
           }
-          if (emitLeft && !leftMatched) {
-            const combined = left.concat(nullRow(rightPad));
-            meter.admitRowMasked(combined, memMask);
-            next.push(combined);
-          }
-          // The per-left-row re-materialization is consumed (memory.md §5.3).
-          meter.releaseRowsMasked(rightRows, plan.relMasks[k + 1]!);
+          meter.releaseRowsMasked(running, memMask);
+          table.release(); // the join step completed (memory.md §6.2)
+          running = next;
+          continue;
         }
-        meter.releaseRowsMasked(running, memMask);
-        running = next;
-        continue;
-      }
-      // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER combined
-      // left-hand row, its scan bounded per outer row by the SIBLING columns of that row (a
-      // per-outer-row seek instead of a full scan). Detection restricts this to the RIGHT/nullable side
-      // of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT emission (RIGHT/FULL are
-      // excluded — a preserved side cannot be bounded per outer row). The whole ON/WHERE stays applied
-      // (the ON here, the WHERE below), so rows are unchanged.
-      if (plan.phys.relINLBounds[k + 1] !== null) {
+        const rightMatched: boolean[] = new Array(rightRows.length).fill(false);
         for (const left of running) {
-          const before = meter.accrued;
-          const rightRows = this.materializeRel(plan, k + 1, env.outer, left, env, params, meter);
-          relWork[k + 1] = relWork[k + 1]! + meter.accrued - before;
+          if (shouldCooperate()) yield COOPERATE;
           let leftMatched = false;
-          for (const right of rightRows) {
-            const combined = left.concat(right);
-            if (on === null || evalFilter(on, combined, env, meter)) {
-              meter.admitRowMasked(combined, memMask);
-              next.push(combined);
-              leftMatched = true;
-            }
-          }
-          if (emitLeft && !leftMatched) {
-            const combined = left.concat(nullRow(rightPad));
-            meter.admitRowMasked(combined, memMask);
-            next.push(combined);
-          }
-          // The per-left-row re-materialization is consumed (memory.md §5.3).
-          meter.releaseRowsMasked(rightRows, plan.relMasks[k + 1]!);
-        }
-        meter.releaseRowsMasked(running, memMask);
-        running = next;
-        continue;
-      }
-      const rightRows = materialized[k + 1]!;
-      // The hash rule is exactly two inputs, so it can only own join 0. Build the right input once,
-      // then probe running rows in left order. Bucket indices retain right order and the full ON is
-      // rechecked, reproducing nested-loop enumeration and LEFT null-extension.
-      if (k === 0 && plan.phys.hashJoin !== null) {
-        const table = new HashJoinTable(
-          plan.phys.hashJoin,
-          plan.rels[1]!.offset,
-          plan.rels[0]!.offset,
-          rightRows,
-          meter,
-        );
-        for (const left of running) {
-          const candidates = table.probe(plan.phys.hashJoin, left, meter);
-          let leftMatched = false;
-          for (const ri of candidates) {
+          for (let ri = 0; ri < rightRows.length; ri++) {
+            if (shouldCooperate()) yield COOPERATE;
             const combined = left.concat(rightRows[ri]!);
-            if (evalFilter(on!, combined, env, meter)) {
+            if (on === null || (yield* evalFilterSteps(on, combined, env, meter))) {
               meter.admitRowMasked(combined, memMask);
               next.push(combined);
               leftMatched = true;
+              rightMatched[ri] = true;
             }
           }
           if (emitLeft && !leftMatched) {
@@ -23697,38 +26219,16 @@ export class Engine {
             next.push(combined);
           }
         }
-        meter.releaseRowsMasked(running, memMask);
-        table.release(); // the join step completed (memory.md §6.2)
-        running = next;
-        continue;
-      }
-      const rightMatched: boolean[] = new Array(rightRows.length).fill(false);
-      for (const left of running) {
-        let leftMatched = false;
-        for (let ri = 0; ri < rightRows.length; ri++) {
-          const combined = left.concat(rightRows[ri]!);
-          if (on === null || evalFilter(on, combined, env, meter)) {
-            meter.admitRowMasked(combined, memMask);
-            next.push(combined);
-            leftMatched = true;
-            rightMatched[ri] = true;
+        if (emitRight) {
+          for (let ri = 0; ri < rightRows.length; ri++) {
+            if (shouldCooperate()) yield COOPERATE;
+            if (!rightMatched[ri]) {
+              const combined = nullRow(leftPad).concat(rightRows[ri]!);
+              meter.admitRowMasked(combined, memMask);
+              next.push(combined);
+            }
           }
         }
-        if (emitLeft && !leftMatched) {
-          const combined = left.concat(nullRow(rightPad));
-          meter.admitRowMasked(combined, memMask);
-          next.push(combined);
-        }
-      }
-      if (emitRight) {
-        for (let ri = 0; ri < rightRows.length; ri++) {
-          if (!rightMatched[ri]) {
-            const combined = nullRow(leftPad).concat(rightRows[ri]!);
-            meter.admitRowMasked(combined, memMask);
-            next.push(combined);
-          }
-        }
-      }
         meter.releaseRowsMasked(running, memMask);
         running = next;
       }
@@ -23737,6 +26237,7 @@ export class Engine {
     // into `running` left an empty buffer here.
     if (meter.queryMemoryActive()) {
       for (let ri = 0; ri < materialized.length; ri++) {
+        if (shouldCooperate()) yield COOPERATE;
         meter.releaseRowsMasked(materialized[ri]!, plan.relMasks[ri]!);
       }
     }
@@ -23753,20 +26254,19 @@ export class Engine {
       ? plan.phys.relationOrder
       : plan.rels.map((_, ordinal) => ordinal);
     for (const ordinal of relationOrder) {
+      if (shouldCooperate()) yield COOPERATE;
       const node = selectActualRelNode(plan.rels[ordinal]!);
-      if (selectActualRootNode(plan) !== node)
-        this.recordExplainActual(node, relWork[ordinal]!);
+      if (selectActualRootNode(plan) !== node) this.recordExplainActual(node, relWork[ordinal]!);
     }
 
     if (plan.rels.length > 1) {
       const lastStep = plan.phys.joinSteps.at(-1);
       const node =
         (plan.rels.length === 2 && plan.phys.hashJoin !== null) ||
-          (lastStep !== undefined && lastStep.hashJoin !== null)
+        (lastStep !== undefined && lastStep.hashJoin !== null)
           ? "Hash Join"
           : "Nested Loop";
-      if (selectActualRootNode(plan) !== node)
-        this.recordExplainActualParent(node, meter.accrued);
+      if (selectActualRootNode(plan) !== node) this.recordExplainActualParent(node, meter.accrued);
     }
 
     // WHERE over the combined rows. A WHERE arithmetic can throw (22003/22012); each surviving
@@ -23775,7 +26275,8 @@ export class Engine {
     const filter = postJoinFilter(plan);
     let rows: Row[] = [];
     for (const row of running) {
-      if (filter === null || evalFilter(filter, row, env, meter)) rows.push(row);
+      if (shouldCooperate()) yield COOPERATE;
+      if (filter === null || (yield* evalFilterSteps(filter, row, env, meter))) rows.push(row);
       else meter.releaseRowMasked(row, memMask);
     }
     if (filter !== null) {
@@ -23791,7 +26292,7 @@ export class Engine {
     // over the GROUPED rows instead, inside the aggregate branch below — so it is gated to plain
     // (non-aggregate) windows here.
     if (plan.hasWindow && !plan.isAgg) {
-      applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter);
+      yield* applyWindowStageSteps(rows, plan.windowSpecs, plan.windowKeys, env, meter);
       if (selectActualRootNode(plan) !== "Window")
         this.recordExplainActualParent("Window", meter.accrued);
     }
@@ -23806,7 +26307,7 @@ export class Engine {
       // post-WHERE (post-window) row and append the value, so its sort slot finalWidth+k reads the
       // appended column and the slot-based sort below is unchanged — the window-key precedent. The
       // evaluation is metered per node (cost.md §3); a no-op for a column/ordinal-only ORDER BY.
-      materializeOrderExprs(rows, plan.orderExprs, env, meter);
+      yield* materializeOrderExprsSteps(rows, plan.orderExprs, env, meter);
       if (plan.phys.topK !== null) {
         // Rows the top-k selection drops are discarded (memory.md §5.3): release the input, then
         // re-reserve the kept rows (never more than was released).
@@ -23814,7 +26315,10 @@ export class Engine {
         const topK = plan.phys.topK;
         const input = rows;
         rows = meter.costFirst(() => topKRows(input, plan.order, topK, meter.query));
-        for (const row of rows) meter.admitRowMasked(row, memMask);
+        for (const row of rows) {
+          if (shouldCooperate()) yield COOPERATE;
+          meter.admitRowMasked(row, memMask);
+        }
       } else {
         const input = rows;
         meter.costFirst(() => sortRows(input, plan.order, meter.query));
@@ -23847,7 +26351,8 @@ export class Engine {
       // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
-      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
+      const newAccs = (): Acc[] =>
+        plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
       // One DISTINCT dedup set per DISTINCT aggregate (null for a plain aggregate — COUNT(DISTINCT
       // x), aggregates.md §5). Keyed on distinctRowKey, the same value-canonical form as the
       // group-key bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
@@ -23871,10 +26376,12 @@ export class Engine {
       // materializeOrderExprs / applyWindowStage precedent).
       if (plan.groupExprs.length > 0) {
         for (let ri = 0; ri < rows.length; ri++) {
+          if (shouldCooperate()) yield COOPERATE;
           meter.guard();
           const row = rows[ri]!.slice();
           for (const ge of plan.groupExprs) {
-            const v = evalExpr(ge, row, env, meter);
+            if (shouldCooperate()) yield COOPERATE;
+            const v = yield* evalExprSteps(ge, row, env, meter);
             meter.admitValue(v); // an appended slot grows the buffered row (memory.md §5.1)
             row.push(v);
           }
@@ -23883,6 +26390,7 @@ export class Engine {
       }
       let groupRows: Value[][] = [];
       for (const gset of plan.groupSets) {
+        if (shouldCooperate()) yield COOPERATE;
         const index = new Map<string, number>();
         // Per group: key, accumulators, DISTINCT sets, and the group's query-memory charge — its
         // entry plus everything its accumulators retain (memory.md §6.2/§6.3).
@@ -23901,6 +26409,7 @@ export class Engine {
           index.set("", 0);
         }
         for (const row of rows) {
+          if (shouldCooperate()) yield COOPERATE;
           meter.guard(); // enforce the cost ceiling per folded row (CLAUDE.md §13)
           const keys = gset.keyCols.map((gk) => row[gk]!);
           const k = distinctRowKey(keys);
@@ -23915,14 +26424,16 @@ export class Engine {
           const group = groups[gi]!;
           const accs = group.accs;
           const seen = group.seen;
-          plan.aggSpecs.forEach((spec, i) => {
+          for (let i = 0; i < plan.aggSpecs.length; i++) {
+            if (shouldCooperate()) yield COOPERATE;
+            const spec = plan.aggSpecs[i]!;
             // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL) contributes
             // nothing to THIS aggregate — its operand is not evaluated and it is not accumulated
             // (aggregates.md §11). The filter's own operatorEvals are charged (it is evaluated per row,
             // like the operand); aggregateAccumulate is charged only for a row that passes. The
             // pass/fold decision is deterministic (scan order is cross-core identical).
             if (spec.filter !== undefined && spec.filter !== null) {
-              if (!isTrue(evalExpr(spec.filter, row, env, meter))) return;
+              if (!isTrue(yield* evalExprSteps(spec.filter, row, env, meter))) continue;
             }
             meter.charge(COSTS.aggregateAccumulate);
             // A hypothetical-set aggregate (rank/dense_rank/… — aggregates.md §19) buffers the row's
@@ -23930,21 +26441,24 @@ export class Engine {
             // hypothetical row itself is evaluated per group at finalize. No DISTINCT (rejected at resolve).
             if (spec.hypo !== undefined && spec.hypo !== null) {
               const hp = spec.hypo;
-              const tuple = hp.keys.map((k) => evalExpr(k, row, env, meter));
+              const tuple = yield* evalExpressionsSteps(hp.keys, row, env, meter);
               if (meter.queryMemoryActive()) {
                 const bytes = rowBytes(tuple);
                 meter.reserveQuery(bytes);
                 group.charge += bytes;
               }
               accs[i]!.hypoRows!.push(tuple);
-              return;
+              continue;
             }
-            const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
+            const v =
+              spec.operand === null
+                ? nullValue()
+                : yield* evalExprSteps(spec.operand, row, env, meter);
             // An in-aggregate ORDER BY's keys are evaluated per passing row, after the argument and
             // before the DISTINCT check (aggregates.md §22).
             const tuple =
               spec.order !== undefined && spec.order !== null
-                ? aggOrderTuple(spec.order, v, row, env, meter)
+                ? yield* aggOrderTupleSteps(spec.order, v, row, env, meter)
                 : null;
             // DISTINCT: skip any value already folded into this group — the FIRST occurrence in scan
             // order wins, so the set of folded values (and the decimalWork fold charges) is
@@ -23952,9 +26466,9 @@ export class Engine {
             // array aggregates, which fold it (aggregates.md §5).
             const dedup = seen[i];
             if (dedup) {
-              if (v.kind === "null" && !aggDistinctKeepsNull(spec.plan)) return;
+              if (v.kind === "null" && !aggDistinctKeepsNull(spec.plan)) continue;
               const dk = distinctRowKey([v]);
-              if (dedup.has(dk)) return;
+              if (dedup.has(dk)) continue;
               dedup.add(dk);
               if (meter.queryMemoryActive()) {
                 const bytes = entryBytes([v]);
@@ -23971,18 +26485,23 @@ export class Engine {
                 group.charge += bytes;
               }
               accs[i]!.ordRows!.push(tuple);
-              return;
+              continue;
             }
             group.charge += foldAccCharged(accs[i]!, v, meter);
-          });
+          }
         }
         // Build one synthetic row per group of this set: each master grouping column's value (NULL
         // where this set doesn't group it), then the aggregate results, then each GROUPING() value
         // (computed from this set's mask — spec/design/aggregates.md §12).
         for (const g of groups) {
+          if (shouldCooperate()) yield COOPERATE;
           const srow: Value[] = [];
-          for (const src of gset.slotSrc) srow.push(src < 0 ? nullValue() : g.keys[src]!);
+          for (const src of gset.slotSrc) {
+            if (shouldCooperate()) yield COOPERATE;
+            srow.push(src < 0 ? nullValue() : g.keys[src]!);
+          }
           for (let si = 0; si < g.accs.length; si++) {
+            if (shouldCooperate()) yield COOPERATE;
             const a = g.accs[si]!;
             // An ordered-set aggregate's percentile fraction (the direct argument) is evaluated PER
             // GROUP here, against the synthetic row's grouping-key values (aggregates.md §13/§17) — so
@@ -23995,7 +26514,7 @@ export class Engine {
             ) {
               const fe = plan.aggSpecs[si]!.osaFrac;
               if (fe !== undefined && fe !== null) {
-                a.osaFrac = evalExpr(fe, srow, env, env.exec.session.scratchMeter());
+                a.osaFrac = yield* evalExprSteps(fe, srow, env, env.exec.session.scratchMeter());
               }
             }
             // A hypothetical-set aggregate is finalized INLINE here (not via finalizeAcc) because it
@@ -24004,7 +26523,11 @@ export class Engine {
             // among the buffered key tuples (aggregates.md §19).
             const hp = plan.aggSpecs[si]!.hypo;
             if (hp !== undefined && hp !== null) {
-              const hyp = hp.args.map((arg) => evalExpr(arg, srow, env, env.exec.session.scratchMeter()));
+              const hyp: Value[] = [];
+              for (const arg of hp.args) {
+                if (shouldCooperate()) yield COOPERATE;
+                hyp.push(yield* evalExprSteps(arg, srow, env, env.exec.session.scratchMeter()));
+              }
               srow.push(finalizeHypothetical(a.plan, a.hypoRows!, hyp, hp.sorts));
               continue;
             }
@@ -24015,6 +26538,7 @@ export class Engine {
               const spec = plan.aggSpecs[si]!;
               const inner = newAccFromSpecUnordered(spec, this.session.timeZone);
               for (const v of sortAggOrderRows(a.ordRows, spec.order!)) {
+                if (shouldCooperate()) yield COOPERATE;
                 meter.guard();
                 g.charge += foldAccCharged(inner, v, meter);
               }
@@ -24024,6 +26548,7 @@ export class Engine {
             srow.push(finalizeAccMetered(a, meter));
           }
           for (const positions of plan.groupingSpecs) {
+            if (shouldCooperate()) yield COOPERATE;
             srow.push(intValue(groupingValue(positions, gset.mask)));
           }
           // The finalized group's operator state gives way to its row (memory.md §6.2).
@@ -24038,11 +26563,13 @@ export class Engine {
       // evaluated against each group's synthetic row (charging its operatorEvals per group);
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
       if (plan.having !== null) {
-        groupRows = groupRows.filter((srow) => {
-          if (evalFilter(plan.having!, srow, env, meter)) return true;
-          meter.releaseRow(srow);
-          return false;
-        });
+        const kept: Value[][] = [];
+        for (const srow of groupRows) {
+          if (shouldCooperate()) yield COOPERATE;
+          if (yield* evalFilterSteps(plan.having, srow, env, meter)) kept.push(srow);
+          else meter.releaseRow(srow);
+        }
+        groupRows = kept;
       }
       if (selectActualRootNode(plan) !== "Aggregate")
         this.recordExplainActualParent("Aggregate", meter.accrued);
@@ -24052,14 +26579,14 @@ export class Engine {
       // rebased slot — §5.1). The group-key slots the ORDER BY below sorts on are unchanged (they
       // precede the appended results).
       if (plan.hasWindow) {
-        applyWindowStage(groupRows, plan.windowSpecs, plan.windowKeys, env, meter);
+        yield* applyWindowStageSteps(groupRows, plan.windowSpecs, plan.windowKeys, env, meter);
         if (selectActualRootNode(plan) !== "Window")
           this.recordExplainActualParent("Window", meter.accrued);
       }
       // ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
       // expression key is materialized against the grouped row and appended — grammar.md §10).
       if (plan.order.length > 0) {
-        materializeOrderExprs(groupRows, plan.orderExprs, env, meter);
+        yield* materializeOrderExprsSteps(groupRows, plan.orderExprs, env, meter);
         meter.costFirst(() => sortRows(groupRows, plan.order, meter.query));
         if (selectActualRootNode(plan) !== "Sort")
           this.recordExplainActualParent("Sort", meter.accrued);
@@ -24074,7 +26601,8 @@ export class Engine {
         const distinctRows: Value[][] = [];
         let seenCharge = 0; // the dedup set's entries (memory.md §6.2)
         for (const srow of groupRows) {
-          const tuple = plan.projections.map((p) => evalExpr(p, srow, env, meter));
+          if (shouldCooperate()) yield COOPERATE;
+          const tuple = yield* evalExpressionsSteps(plan.projections, srow, env, meter);
           const key = distinctRowKey(tuple);
           if (!seen.has(key)) {
             seen.add(key);
@@ -24109,7 +26637,8 @@ export class Engine {
       const distinctRows: Value[][] = [];
       let seenCharge = 0; // the dedup set's entries (memory.md §6.2)
       for (const row of rows) {
-        const tuple = plan.projections.map((p) => evalExpr(p, row, env, meter));
+        if (shouldCooperate()) yield COOPERATE;
+        const tuple = yield* evalExpressionsSteps(plan.projections, row, env, meter);
         const key = distinctRowKey(tuple);
         if (!seen.has(key)) {
           seen.add(key);
@@ -24155,7 +26684,16 @@ export class Engine {
     ctes: CteCtx,
     cost: { value: bigint },
   ): void {
-    this.foldUncorrelatedInPlanAt(
+    return runSync(this.foldUncorrelatedInPlanSteps(plan, bound, ctes, cost));
+  }
+
+  private *foldUncorrelatedInPlanSteps(
+    plan: QueryPlan,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+  ): Steps<void> {
+    yield* this.foldUncorrelatedInPlanAtSteps(
       plan,
       bound,
       ctes,
@@ -24171,16 +26709,28 @@ export class Engine {
     cost: { value: bigint },
     frame: number,
   ): void {
+    return runSync(this.foldUncorrelatedInPlanAtSteps(plan, bound, ctes, cost, frame));
+  }
+
+  private *foldUncorrelatedInPlanAtSteps(
+    plan: QueryPlan,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+    frame: number,
+  ): Steps<void> {
     if (plan.kind === "select") {
-      this.foldUncorrelatedInSelectAt(plan, bound, ctes, cost, frame);
+      yield* this.foldUncorrelatedInSelectAtSteps(plan, bound, ctes, cost, frame);
       return;
     }
     if (plan.kind === "values") {
       // A VALUES-body value may itself hold an (uncorrelated) scalar subquery to fold once before
       // the rows are produced (grammar.md §42; the §26 fold).
       for (const row of plan.rows) {
+        if (shouldCooperate()) yield COOPERATE;
         for (let c = 0; c < row.length; c++) {
-          row[c] = this.foldUncorrelatedInRExpr(row[c]!, bound, ctes, cost);
+          if (shouldCooperate()) yield COOPERATE;
+          row[c] = yield* this.foldUncorrelatedInRExprSteps(row[c]!, bound, ctes, cost);
         }
       }
       return;
@@ -24193,8 +26743,8 @@ export class Engine {
       // execWithPlan).
       return;
     }
-    this.foldUncorrelatedInPlanAt(plan.lhs, bound, ctes, cost, frame + 1);
-    this.foldUncorrelatedInPlanAt(plan.rhs, bound, ctes, cost, frame + 1);
+    yield* this.foldUncorrelatedInPlanAtSteps(plan.lhs, bound, ctes, cost, frame + 1);
+    yield* this.foldUncorrelatedInPlanAtSteps(plan.rhs, bound, ctes, cost, frame + 1);
   }
 
   private foldUncorrelatedInSelect(
@@ -24203,7 +26753,16 @@ export class Engine {
     ctes: CteCtx,
     cost: { value: bigint },
   ): void {
-    this.foldUncorrelatedInSelectAt(
+    return runSync(this.foldUncorrelatedInSelectSteps(sp, bound, ctes, cost));
+  }
+
+  private *foldUncorrelatedInSelectSteps(
+    sp: SelectPlan,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+  ): Steps<void> {
+    yield* this.foldUncorrelatedInSelectAtSteps(
       sp,
       bound,
       ctes,
@@ -24219,32 +26778,61 @@ export class Engine {
     cost: { value: bigint },
     frame: number,
   ): void {
-    for (const j of sp.joins)
-      if (j.on !== null) j.on = this.foldUncorrelatedInRExpr(j.on, bound, ctes, cost);
+    return runSync(this.foldUncorrelatedInSelectAtSteps(sp, bound, ctes, cost, frame));
+  }
+
+  private *foldUncorrelatedInSelectAtSteps(
+    sp: SelectPlan,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+    frame: number,
+  ): Steps<void> {
+    for (const j of sp.joins) {
+      if (shouldCooperate()) yield COOPERATE;
+      if (j.on !== null) j.on = yield* this.foldUncorrelatedInRExprSteps(j.on, bound, ctes, cost);
+    }
     if (sp.filter !== null) {
       const before = cost.value;
-      sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
+      sp.filter = yield* this.foldUncorrelatedInRExprSteps(sp.filter, bound, ctes, cost);
       this.recordExplainActualFolded(frame, "Filter", cost.value - before);
     }
     // The fold replaces a folded conjunct node (Go overwrites it in place), so the pushdown's
     // residual WHERE, residual ONs, and access predicate are re-derived from the folded predicates
     // (planner.md §3.2/§3.3).
     refreshPushdownResiduals(sp);
-    if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
+    if (sp.having !== null)
+      sp.having = yield* this.foldUncorrelatedInRExprSteps(sp.having, bound, ctes, cost);
     for (const s of sp.aggSpecs) {
+      if (shouldCooperate()) yield COOPERATE;
       if (s.operand !== null)
-        s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, ctes, cost);
+        s.operand = yield* this.foldUncorrelatedInRExprSteps(s.operand, bound, ctes, cost);
       if (s.order != null)
-        s.order.keys = s.order.keys.map((k) => this.foldUncorrelatedInRExpr(k, bound, ctes, cost));
+        s.order.keys = yield* this.foldUncorrelatedInRExprsSteps(s.order.keys, bound, ctes, cost);
     }
-    sp.projections = sp.projections.map((p) => this.foldUncorrelatedInRExpr(p, bound, ctes, cost));
+    sp.projections = yield* this.foldUncorrelatedInRExprsSteps(sp.projections, bound, ctes, cost);
     // A set-returning relation's arguments may themselves contain an (uncorrelated) subquery to
     // fold once before the generator runs (functions.md §10).
     for (const rel of sp.rels) {
+      if (shouldCooperate()) yield COOPERATE;
       if (rel.srf !== undefined) {
-        rel.srf.args = rel.srf.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
+        rel.srf.args = yield* this.foldUncorrelatedInRExprsSteps(rel.srf.args, bound, ctes, cost);
       }
     }
+  }
+
+  private *foldUncorrelatedInRExprsSteps(
+    exprs: RExpr[],
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+  ): Steps<RExpr[]> {
+    const folded: RExpr[] = [];
+    for (const expr of exprs) {
+      if (shouldCooperate()) yield COOPERATE;
+      folded.push(yield* this.foldUncorrelatedInRExprSteps(expr, bound, ctes, cost));
+    }
+    return folded;
   }
 
   // foldUncorrelatedInRExpr folds this node if it is an uncorrelated "subquery", else recurses into
@@ -24255,20 +26843,30 @@ export class Engine {
     ctes: CteCtx,
     cost: { value: bigint },
   ): RExpr {
+    return runSync(this.foldUncorrelatedInRExprSteps(e, bound, ctes, cost));
+  }
+
+  private *foldUncorrelatedInRExprSteps(
+    e: RExpr,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+  ): Steps<RExpr> {
     switch (e.kind) {
       case "subquery": {
         // Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
         // globally-uncorrelated subquery nested inside it is already a constant before we run it.
-        if (e.lhs !== null) e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
+        if (e.lhs !== null)
+          e.lhs = yield* this.foldUncorrelatedInRExprSteps(e.lhs, bound, ctes, cost);
         if (this.explainActualProfile != null) this.explainActualFoldSuppress++;
         try {
-          this.foldUncorrelatedInPlan(e.plan, bound, ctes, cost);
+          yield* this.foldUncorrelatedInPlanSteps(e.plan, bound, ctes, cost);
         } finally {
           if (this.explainActualProfile != null) this.explainActualFoldSuppress--;
         }
         if (queryPlanReferencesOuter(e.plan, 0)) return e; // correlated — re-run per outer row
         // Uncorrelated: execute ONCE and fold to a constant / inValues.
-        const r = this.execHiddenQueryPlan(e.plan, [], bound, ctes);
+        const r = yield* this.execHiddenQueryPlanSteps(e.plan, [], bound, ctes);
         cost.value += r.cost;
         if (e.subKind === "scalar") {
           if (r.rows.length > 1) {
@@ -24318,7 +26916,7 @@ export class Engine {
       case "isNull":
       case "isJson":
       case "jsonCtor":
-        e.operand = this.foldUncorrelatedInRExpr(e.operand, bound, ctes, cost);
+        e.operand = yield* this.foldUncorrelatedInRExprSteps(e.operand, bound, ctes, cost);
         return e;
       case "arith":
       case "compare":
@@ -24327,45 +26925,51 @@ export class Engine {
       case "distinct":
       case "like":
       case "regex":
-        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
-        e.rhs = this.foldUncorrelatedInRExpr(e.rhs, bound, ctes, cost);
+        e.lhs = yield* this.foldUncorrelatedInRExprSteps(e.lhs, bound, ctes, cost);
+        e.rhs = yield* this.foldUncorrelatedInRExprSteps(e.rhs, bound, ctes, cost);
         return e;
       case "jsonGet":
       case "jsonHasKey":
       case "jsonDelete":
-        e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
-        e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
+        e.base = yield* this.foldUncorrelatedInRExprSteps(e.base, bound, ctes, cost);
+        e.arg = yield* this.foldUncorrelatedInRExprSteps(e.arg, bound, ctes, cost);
         return e;
       case "jsonContains":
       case "jsonConcat":
-        e.a = this.foldUncorrelatedInRExpr(e.a, bound, ctes, cost);
-        e.b = this.foldUncorrelatedInRExpr(e.b, bound, ctes, cost);
+        e.a = yield* this.foldUncorrelatedInRExprSteps(e.a, bound, ctes, cost);
+        e.b = yield* this.foldUncorrelatedInRExprSteps(e.b, bound, ctes, cost);
         return e;
       case "casing":
-        e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
+        e.arg = yield* this.foldUncorrelatedInRExprSteps(e.arg, bound, ctes, cost);
         return e;
       case "atTimeZone":
-        e.zone = this.foldUncorrelatedInRExpr(e.zone, bound, ctes, cost);
-        e.value = this.foldUncorrelatedInRExpr(e.value, bound, ctes, cost);
+        e.zone = yield* this.foldUncorrelatedInRExprSteps(e.zone, bound, ctes, cost);
+        e.value = yield* this.foldUncorrelatedInRExprSteps(e.value, bound, ctes, cost);
         return e;
       case "dateTrunc":
-        e.unit = this.foldUncorrelatedInRExpr(e.unit, bound, ctes, cost);
-        e.value = this.foldUncorrelatedInRExpr(e.value, bound, ctes, cost);
-        if (e.zone) e.zone = this.foldUncorrelatedInRExpr(e.zone, bound, ctes, cost);
+        e.unit = yield* this.foldUncorrelatedInRExprSteps(e.unit, bound, ctes, cost);
+        e.value = yield* this.foldUncorrelatedInRExprSteps(e.value, bound, ctes, cost);
+        if (e.zone) e.zone = yield* this.foldUncorrelatedInRExprSteps(e.zone, bound, ctes, cost);
         return e;
       case "extract":
-        e.value = this.foldUncorrelatedInRExpr(e.value, bound, ctes, cost);
+        e.value = yield* this.foldUncorrelatedInRExprSteps(e.value, bound, ctes, cost);
         return e;
       case "dateConvert":
-        e.inner = this.foldUncorrelatedInRExpr(e.inner, bound, ctes, cost);
+        e.inner = yield* this.foldUncorrelatedInRExprSteps(e.inner, bound, ctes, cost);
         return e;
-      case "case":
-        e.arms = e.arms.map((arm) => ({
-          cond: this.foldUncorrelatedInRExpr(arm.cond, bound, ctes, cost),
-          result: this.foldUncorrelatedInRExpr(arm.result, bound, ctes, cost),
-        }));
-        e.els = this.foldUncorrelatedInRExpr(e.els, bound, ctes, cost);
+      case "case": {
+        const arms: typeof e.arms = [];
+        for (const arm of e.arms) {
+          if (shouldCooperate()) yield COOPERATE;
+          arms.push({
+            cond: yield* this.foldUncorrelatedInRExprSteps(arm.cond, bound, ctes, cost),
+            result: yield* this.foldUncorrelatedInRExprSteps(arm.result, bound, ctes, cost),
+          });
+        }
+        e.arms = arms;
+        e.els = yield* this.foldUncorrelatedInRExprSteps(e.els, bound, ctes, cost);
         return e;
+      }
       case "greatestLeast":
       case "nullIf":
       case "coalesce":
@@ -24384,53 +26988,77 @@ export class Engine {
       case "jsonImage":
       case "jsonPathFn":
       case "jsonSqlFn":
-        e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
+        e.args = yield* this.foldUncorrelatedInRExprsSteps(e.args, bound, ctes, cost);
         return e;
       case "row":
-        e.fields = e.fields.map((f) => this.foldUncorrelatedInRExpr(f, bound, ctes, cost));
+        e.fields = yield* this.foldUncorrelatedInRExprsSteps(e.fields, bound, ctes, cost);
         return e;
       case "array":
-        e.elements = e.elements.map((el) => this.foldUncorrelatedInRExpr(el, bound, ctes, cost));
+        e.elements = yield* this.foldUncorrelatedInRExprsSteps(e.elements, bound, ctes, cost);
         return e;
       case "field":
-        e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
+        e.base = yield* this.foldUncorrelatedInRExprSteps(e.base, bound, ctes, cost);
         return e;
-      case "subscript":
-        e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
-        e.subscripts = e.subscripts.map((s) =>
-          s.isSlice
-            ? {
-                isSlice: true,
-                lower:
-                  s.lower === null
-                    ? null
-                    : this.foldUncorrelatedInRExpr(s.lower, bound, ctes, cost),
-                upper:
-                  s.upper === null
-                    ? null
-                    : this.foldUncorrelatedInRExpr(s.upper, bound, ctes, cost),
-              }
-            : {
-                isSlice: false,
-                index: this.foldUncorrelatedInRExpr(s.index, bound, ctes, cost),
-              },
-        );
+      case "subscript": {
+        e.base = yield* this.foldUncorrelatedInRExprSteps(e.base, bound, ctes, cost);
+        const subscripts: RSubscript[] = [];
+        for (const s of e.subscripts) {
+          if (shouldCooperate()) yield COOPERATE;
+          subscripts.push(
+            s.isSlice
+              ? {
+                  isSlice: true,
+                  lower:
+                    s.lower === null
+                      ? null
+                      : yield* this.foldUncorrelatedInRExprSteps(s.lower, bound, ctes, cost),
+                  upper:
+                    s.upper === null
+                      ? null
+                      : yield* this.foldUncorrelatedInRExprSteps(s.upper, bound, ctes, cost),
+                }
+              : {
+                  isSlice: false,
+                  index: yield* this.foldUncorrelatedInRExprSteps(s.index, bound, ctes, cost),
+                },
+          );
+        }
+        e.subscripts = subscripts;
         return e;
+      }
       case "inValues":
-        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
+        e.lhs = yield* this.foldUncorrelatedInRExprSteps(e.lhs, bound, ctes, cost);
         return e;
       case "quantified":
-        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
-        e.array = this.foldUncorrelatedInRExpr(e.array, bound, ctes, cost);
+        e.lhs = yield* this.foldUncorrelatedInRExprSteps(e.lhs, bound, ctes, cost);
+        e.array = yield* this.foldUncorrelatedInRExprSteps(e.array, bound, ctes, cost);
         return e;
       case "widthBucketArray":
-        e.operand = this.foldUncorrelatedInRExpr(e.operand, bound, ctes, cost);
-        e.thresholds = this.foldUncorrelatedInRExpr(e.thresholds, bound, ctes, cost);
+        e.operand = yield* this.foldUncorrelatedInRExprSteps(e.operand, bound, ctes, cost);
+        e.thresholds = yield* this.foldUncorrelatedInRExprSteps(e.thresholds, bound, ctes, cost);
         return e;
       default:
         return e; // leaves: column, outerColumn, param, const*
     }
   }
+}
+
+// Both public drivers pull exactly the same row continuation.
+function stepRowSource(iterator: StepIterator<Row>, meter: Meter): RowSource {
+  const nextRowSteps = function* (): Steps<Row | undefined> {
+    const next = yield* iterator.nextSteps();
+    return next.done ? undefined : next.value;
+  };
+  return {
+    nextRow: () => runSync(nextRowSteps()),
+    nextRowSteps,
+    cost: () => meter.accrued,
+    queryAccount: () => meter.query,
+    guardCost: () => meter.guard(),
+    close: () => {
+      if (iterator.returnSteps !== undefined) runSync(iterator.returnSteps());
+    },
+  };
 }
 
 // scanSource streams a base table's already-materialized rows as a pull-based generator — the
@@ -25145,8 +27773,7 @@ export function inventorySingleRelationCandidates(
 function sortScanCandidates(candidates: ScanCandidate[]): void {
   candidates.sort((a, b) => {
     const rank =
-      SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) -
-      SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
+      SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
     if (rank !== 0) return rank;
     return compareName({ name: a.identity.indexName }, { name: b.identity.indexName });
   });
@@ -25218,12 +27845,7 @@ export function inventoryScanCandidates(
   }
   if (pkIntervals !== null) {
     candidates.push(
-      storageOrderCandidate(
-        "pk_interval",
-        "",
-        { kind: "pkSet", pkSet: pkIntervals },
-        filter,
-      ),
+      storageOrderCandidate("pk_interval", "", { kind: "pkSet", pkSet: pkIntervals }, filter),
     );
   }
   for (const idx of rel.table.indexes) {
@@ -25358,33 +27980,55 @@ function statisticsColumn(expr: RExpr, rel: ScopeRel): number | null {
 
 function statisticsReverseOp(op: BinaryOp): BinaryOp {
   switch (op) {
-    case "lt": return "gt";
-    case "le": return "ge";
-    case "gt": return "lt";
-    case "ge": return "le";
-    default: return op;
+    case "lt":
+      return "gt";
+    case "le":
+      return "ge";
+    case "gt":
+      return "lt";
+    case "ge":
+      return "le";
+    default:
+      return op;
   }
 }
 
 function statisticsConstantValue(expr: RExpr): Value | null {
   switch (expr.kind) {
-    case "constNull": return nullValue();
-    case "constInt": return intValue(expr.value);
-    case "constBool": return boolValue(expr.value);
-    case "constText": return textValue(expr.value);
-    case "constDecimal": return decimalValue(expr.value);
-    case "constFloat": return expr.ty === "f32" ? float32Value(expr.value) : float64Value(expr.value);
-    case "constBytea": return byteaValue(expr.value);
-    case "constUuid": return uuidValue(expr.value);
-    case "constTimestamp": return timestampValue(expr.value);
-    case "constTimestamptz": return timestamptzValue(expr.value);
-    case "constDate": return dateValue(expr.value);
-    case "constInterval": return intervalValue(expr.value);
-    case "constJson": return jsonValue(expr.value);
-    case "constJsonb": return jsonbValue(expr.value);
-    case "constJsonPath": return jsonPathValue(expr.value);
-    case "constRange": return expr.value;
-    default: return null;
+    case "constNull":
+      return nullValue();
+    case "constInt":
+      return intValue(expr.value);
+    case "constBool":
+      return boolValue(expr.value);
+    case "constText":
+      return textValue(expr.value);
+    case "constDecimal":
+      return decimalValue(expr.value);
+    case "constFloat":
+      return expr.ty === "f32" ? float32Value(expr.value) : float64Value(expr.value);
+    case "constBytea":
+      return byteaValue(expr.value);
+    case "constUuid":
+      return uuidValue(expr.value);
+    case "constTimestamp":
+      return timestampValue(expr.value);
+    case "constTimestamptz":
+      return timestamptzValue(expr.value);
+    case "constDate":
+      return dateValue(expr.value);
+    case "constInterval":
+      return intervalValue(expr.value);
+    case "constJson":
+      return jsonValue(expr.value);
+    case "constJsonb":
+      return jsonbValue(expr.value);
+    case "constJsonPath":
+      return jsonPathValue(expr.value);
+    case "constRange":
+      return expr.value;
+    default:
+      return null;
   }
 }
 
@@ -25396,13 +28040,17 @@ function statisticsComparison(
   const lhsColumn = statisticsColumn(expr.lhs, rel);
   if (
     lhsColumn !== null &&
-    (statisticsConstantValue(expr.rhs) !== null || expr.rhs.kind === "constNull" || expr.rhs.kind === "param")
+    (statisticsConstantValue(expr.rhs) !== null ||
+      expr.rhs.kind === "constNull" ||
+      expr.rhs.kind === "param")
   )
     return { column: lhsColumn, op: expr.op, literal: expr.rhs };
   const rhsColumn = statisticsColumn(expr.rhs, rel);
   if (
     rhsColumn !== null &&
-    (statisticsConstantValue(expr.lhs) !== null || expr.lhs.kind === "constNull" || expr.lhs.kind === "param")
+    (statisticsConstantValue(expr.lhs) !== null ||
+      expr.lhs.kind === "constNull" ||
+      expr.lhs.kind === "param")
   )
     return { column: rhsColumn, op: statisticsReverseOp(expr.op), literal: expr.lhs };
   return null;
@@ -25519,10 +28167,7 @@ function statisticsEqualityRows(current: CurrentColumnStatistics, key: Uint8Arra
   const mcv = current.mcv.find((entry) => compareBytes(entry.key, key) === 0);
   if (mcv !== undefined) return mcv.rows;
   if (current.completeMcv) return 0n;
-  let mcvRows = current.mcv.reduce(
-    (sum, entry) => saturatingEstimateAdd(sum, entry.rows),
-    0n,
-  );
+  let mcvRows = current.mcv.reduce((sum, entry) => saturatingEstimateAdd(sum, entry.rows), 0n);
   if (mcvRows > current.nonnullRows) mcvRows = current.nonnullRows;
   const remainingNdv =
     current.ndv === null || current.ndv - BigInt(current.mcv.length) < 1n
@@ -25533,13 +28178,20 @@ function statisticsEqualityRows(current: CurrentColumnStatistics, key: Uint8Arra
 
 function statisticsKeySatisfies(order: number, op: BinaryOp): boolean {
   switch (op) {
-    case "eq": return order === 0;
-    case "ne": return order !== 0;
-    case "lt": return order < 0;
-    case "le": return order <= 0;
-    case "gt": return order > 0;
-    case "ge": return order >= 0;
-    default: return false;
+    case "eq":
+      return order === 0;
+    case "ne":
+      return order !== 0;
+    case "lt":
+      return order < 0;
+    case "le":
+      return order <= 0;
+    case "gt":
+      return order > 0;
+    case "ge":
+      return order >= 0;
+    default:
+      return false;
   }
 }
 
@@ -25590,13 +28242,20 @@ function statisticsComparisonRows(
   key: Uint8Array,
 ): bigint {
   switch (op) {
-    case "eq": return statisticsEqualityRows(current, key);
-    case "ne": return current.nonnullRows - statisticsEqualityRows(current, key);
-    case "lt": return statisticsLessRows(current, key, false);
-    case "le": return statisticsLessRows(current, key, true);
-    case "gt": return current.nonnullRows - statisticsLessRows(current, key, true);
-    case "ge": return current.nonnullRows - statisticsLessRows(current, key, false);
-    default: return 0n;
+    case "eq":
+      return statisticsEqualityRows(current, key);
+    case "ne":
+      return current.nonnullRows - statisticsEqualityRows(current, key);
+    case "lt":
+      return statisticsLessRows(current, key, false);
+    case "le":
+      return statisticsLessRows(current, key, true);
+    case "gt":
+      return current.nonnullRows - statisticsLessRows(current, key, true);
+    case "ge":
+      return current.nonnullRows - statisticsLessRows(current, key, false);
+    default:
+      return 0n;
   }
 }
 
@@ -25615,7 +28274,8 @@ function statisticsBoundSourceSelectivity(
     if (blind !== null) return statisticsSelectivity(blind, current.rows);
   }
   const key = statisticsLiteralKey(source, rel, column, engine);
-  if (key !== null) return statisticsSelectivity(statisticsComparisonRows(current, op, key), current.rows);
+  if (key !== null)
+    return statisticsSelectivity(statisticsComparisonRows(current, op, key), current.rows);
   // An unbound parameter or a runtime outer/sibling column: the generic estimate.
   if (source.kind === "param" || source.kind === "column" || source.kind === "outerColumn") {
     if (op !== "eq" || current.ndv === null) return null;
@@ -25691,7 +28351,10 @@ function statisticsBoundTermsSelectivity(
     );
   }
   const rows = saturatingEstimateAdd(mcvRows, histogramRows);
-  return statisticsSelectivity(rows > current.nonnullRows ? current.nonnullRows : rows, current.rows);
+  return statisticsSelectivity(
+    rows > current.nonnullRows ? current.nonnullRows : rows,
+    current.rows,
+  );
 }
 
 // GinTermEstimate is a GIN-served predicate's estimate from term statistics (statistics.md §6.1):
@@ -25928,11 +28591,7 @@ function ginCandidateTermEstimate(
   return { rows: estimate.rows, entries: estimate.entries, pages };
 }
 
-function statisticsLeafSelectivity(
-  expr: RExpr,
-  rel: ScopeRel,
-  engine: Engine,
-): Selectivity | null {
+function statisticsLeafSelectivity(expr: RExpr, rel: ScopeRel, engine: Engine): Selectivity | null {
   const gin = statisticsGinLeafSelectivity(expr, rel, engine);
   if (gin !== null) return gin;
   if (expr.kind === "isNull") {
@@ -25940,7 +28599,10 @@ function statisticsLeafSelectivity(
     if (column === null) return null;
     const current = currentColumnStatistics(engine, rel, column);
     if (current === null) return null;
-    return statisticsSelectivity(expr.negated ? current.nonnullRows : current.nullRows, current.rows);
+    return statisticsSelectivity(
+      expr.negated ? current.nonnullRows : current.nullRows,
+      current.rows,
+    );
   }
   if (expr.kind === "column") {
     const column = statisticsColumn(expr, rel);
@@ -26124,10 +28786,7 @@ function statisticsNegatedPairedRangeSelectivity(
   if (a === null || b === null || a.column !== b.column) return null;
   const lower = a.op === "gt" || a.op === "ge" ? a : b;
   const upper = lower === a ? b : a;
-  if (
-    (lower.op !== "gt" && lower.op !== "ge") ||
-    (upper.op !== "lt" && upper.op !== "le")
-  )
+  if ((lower.op !== "gt" && lower.op !== "ge") || (upper.op !== "lt" && upper.op !== "le"))
     return null;
   const lowerNull = estimatorIsNull(lower.literal);
   const upperNull = estimatorIsNull(upper.literal);
@@ -26243,10 +28902,7 @@ function statisticsPairedRangeSelectivity(
   if (a === null || b === null || a.column !== b.column) return null;
   const lower = a.op === "gt" || a.op === "ge" ? a : b;
   const upper = lower === a ? b : a;
-  if (
-    (lower.op !== "gt" && lower.op !== "ge") ||
-    (upper.op !== "lt" && upper.op !== "le")
-  )
+  if ((lower.op !== "gt" && lower.op !== "ge") || (upper.op !== "lt" && upper.op !== "le"))
     return null;
   const lowerKey = statisticsLiteralKey(lower.literal, rel, a.column, engine);
   const upperKey = statisticsLiteralKey(upper.literal, rel, a.column, engine);
@@ -26294,7 +28950,10 @@ function statisticsPairedRangeSelectivity(
     );
   }
   const rows = saturatingEstimateAdd(mcvRows, histogramRows);
-  return statisticsSelectivity(rows > current.nonnullRows ? current.nonnullRows : rows, current.rows);
+  return statisticsSelectivity(
+    rows > current.nonnullRows ? current.nonnullRows : rows,
+    current.rows,
+  );
 }
 
 function estimatorPredicateSelectivity(expr: RExpr | null): Selectivity {
@@ -26407,7 +29066,9 @@ function estimatorPredicateSelectivity(expr: RExpr | null): Selectivity {
 function estimatorEqualityDisjunction(elems: RExpr[]): Selectivity {
   const parts: Selectivity[] = [];
   for (const elem of elems) {
-    parts.push(estimatorIsNull(elem) ? { kind: "zero" } : fractionSelectivity(SELECTIVITY_EQUALITY));
+    parts.push(
+      estimatorIsNull(elem) ? { kind: "zero" } : fractionSelectivity(SELECTIVITY_EQUALITY),
+    );
   }
   return orSelectivities(parts);
 }
@@ -26625,7 +29286,10 @@ export function estimatorLiteralCmp(lhs: RExpr, rhs: RExpr): number | null {
   }
 }
 
-export function estimatorComparisonSatisfied(order: number, op: EstimatorComparison["op"]): boolean {
+export function estimatorComparisonSatisfied(
+  order: number,
+  op: EstimatorComparison["op"],
+): boolean {
   switch (op) {
     case "eq":
       return order === 0;
@@ -26700,9 +29364,7 @@ function estimatorEqualitySourcesImpossible(sources: RExpr[], keyType: ScalarTyp
     (source, i) =>
       estimatorIsNull(source) ||
       (source.kind === "constInt" && isInteger(keyType) && !inRange(keyType, source.value)) ||
-      sources
-        .slice(0, i)
-        .some((prior) => estimatorBoundsContradict("eq", prior, "eq", source)),
+      sources.slice(0, i).some((prior) => estimatorBoundsContradict("eq", prior, "eq", source)),
   );
 }
 
@@ -26885,8 +29547,8 @@ function estimatorIntervalSelectivity(
       structural.kind === "zero"
         ? structural
         : uniquePoints && spec.terms.length > 0 && spec.terms.every((bound) => bound.op === "eq")
-        ? ({ kind: "unique" } as const)
-        : structural;
+          ? ({ kind: "unique" } as const)
+          : structural;
     parts.push(term);
   }
   const result = orSelectivities(parts);
@@ -26940,7 +29602,9 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       return result;
     }
     case "gist":
-      return selectivityClass(bound.gist.strategy === "equal" ? ACCESS_GIST_EQUAL : ACCESS_GIST_RANGE);
+      return selectivityClass(
+        bound.gist.strategy === "equal" ? ACCESS_GIST_EQUAL : ACCESS_GIST_RANGE,
+      );
     case "gin":
       return ginStructuralSelectivity(bound.gin);
     case "pkSet":
@@ -27363,7 +30027,8 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
       break;
     case "case":
       children = sum(expr.els);
-      for (const arm of expr.arms) children = saturatingEstimateAdd(children, sum(arm.cond, arm.result));
+      for (const arm of expr.arms)
+        children = saturatingEstimateAdd(children, sum(arm.cond, arm.result));
       break;
     case "greatestLeast":
     case "nullIf":
@@ -27576,7 +30241,14 @@ function buildIndexIntervalSetPlan(
   // set's own disjunction is a NULL-rejecting conjunct on this relation's key.
   const partialOk =
     idx.predicate === undefined || partialIndexImplied(filter, rel.table, rel.offset, idx, engine);
-  return buildIndexIntervalSetPlanConjuncts(flattenConjuncts(filter), rel, idx, snap, null, partialOk);
+  return buildIndexIntervalSetPlanConjuncts(
+    flattenConjuncts(filter),
+    rel,
+    idx,
+    snap,
+    null,
+    partialOk,
+  );
 }
 
 // buildIndexIntervalSetPlanConjuncts is buildIndexIntervalSetPlan over an AND-chain's conjuncts;
@@ -27795,8 +30467,7 @@ function walkTupleMembers(
 function pointSpecs(specs: IntervalSpec[]): boolean {
   return specs.every(
     (spec) =>
-      spec.array !== undefined ||
-      (spec.terms.length > 0 && spec.terms.every((t) => t.op === "eq")),
+      spec.array !== undefined || (spec.terms.length > 0 && spec.terms.every((t) => t.op === "eq")),
   );
 }
 
@@ -27850,7 +30521,11 @@ export function reduceIntervalUnion(
 // pointValue.
 // keySetUsesSibling reports an interval or tuple set with a sibling column among its sources (a
 // comparison source, an array operand, or an ARRAY[...] element): an index-nested-loop set.
-function keySetUsesSibling(specs: IntervalSpec[], clip: BoundTerm[], tuple: TupleMember[]): boolean {
+function keySetUsesSibling(
+  specs: IntervalSpec[],
+  clip: BoundTerm[],
+  tuple: TupleMember[],
+): boolean {
   const termsUse = (terms: BoundTerm[]): boolean => terms.some((t) => t.src.kind === "column");
   const specsUse = (specs: IntervalSpec[]): boolean =>
     specs.some(
@@ -27870,14 +30545,17 @@ function keySetUsesSibling(specs: IntervalSpec[], clip: BoundTerm[], tuple: Tupl
 // intervalSetConjunctKind reports a conjunct kind that may reduce to an interval set: an OR, an
 // `= ANY` array, or a membership subquery (or its folded IN list).
 function intervalSetConjunctKind(e: RExpr): boolean {
-  return e.kind === "or" || e.kind === "quantified" || e.kind === "subquery" || e.kind === "inValues";
+  return (
+    e.kind === "or" || e.kind === "quantified" || e.kind === "subquery" || e.kind === "inValues"
+  );
 }
 
 // specsHaveSubquery reports a membership-subquery point source among an interval set's disjuncts.
 function specsHaveSubquery(specs: IntervalSpec[]): boolean {
   return specs.some(
     (spec) =>
-      spec.array !== undefined && (spec.array.kind === "subquery" || spec.array.kind === "inValues"),
+      spec.array !== undefined &&
+      (spec.array.kind === "subquery" || spec.array.kind === "inValues"),
   );
 }
 
@@ -27934,7 +30612,10 @@ function asArrayPointSpec(
   )
     return null;
   const cmpColl = e.collation !== null ? e.collation.name : null;
-  if (cmpColl !== colColl || !isArrayPointSource(e.array, keyType, e.elemExact === true, siblingRange)) {
+  if (
+    cmpColl !== colColl ||
+    !isArrayPointSource(e.array, keyType, e.elemExact === true, siblingRange)
+  ) {
     return null;
   }
   return { terms: [], array: e.array };
@@ -28092,14 +30773,10 @@ export function detectINLBound(
   snap: Snapshot,
   engine: Engine,
 ): ScanBound | null {
-  return inventoryINLCandidates(
-    on,
-    whereFilter,
-    rel,
-    [{ start: 0, end: rel.offset }],
-    snap,
-    engine,
-  )[0]?.bound ?? null;
+  return (
+    inventoryINLCandidates(on, whereFilter, rel, [{ start: 0, end: rel.offset }], snap, engine)[0]
+      ?.bound ?? null
+  );
 }
 
 // partialIndexImplied reports whether the WHERE filter implies a partial index's resolved predicate
@@ -28197,10 +30874,7 @@ export function inventoryINLCandidates(
     // A PARTIAL index holds only its qualifying rows (indexes.md §9), so it is an INL inner only when
     // the join's conditions imply its predicate (§9.3). One whose predicate did not parse never
     // resolves, so it stays out.
-    if (
-      idx.predicate !== undefined &&
-      !inlPartialAdmissible(on, whereFilter, rel, idx, engine)
-    ) {
+    if (idx.predicate !== undefined && !inlPartialAdmissible(on, whereFilter, rel, idx, engine)) {
       continue;
     }
     // The index-nested-loop sibling bound is column-only this slice (an expression index takes the
@@ -28361,14 +31035,17 @@ export function inventoryINLCandidates(
             ...ginBoundOf(idx.name, colType, m.strategy, colGlobal),
             tag: ginColumnTag(cols.length, pos),
           };
-          candidates.push(storageOrderCandidate("gin", idx.name, { kind: "gin", gin }, whereFilter));
+          candidates.push(
+            storageOrderCandidate("gin", idx.name, { kind: "gin", gin }, whereFilter),
+          );
           break columns;
         }
       }
     }
   }
   candidates.sort((a, b) => {
-    const rank = SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
+    const rank =
+      SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
     if (rank !== 0) return rank;
     return compareTextC(a.identity.indexName, b.identity.indexName);
   });
@@ -28484,8 +31161,7 @@ export function orderSatisfiedByIndexes(
     // only when the WHERE implies its predicate (§9.1). The caller is a single-relation scan, so no
     // row is NULL-extended.
     if (idx.predicate !== undefined) {
-      const implied =
-        filter !== null && partialIndexImplied(filter, table, offset, idx, engine);
+      const implied = filter !== null && partialIndexImplied(filter, table, offset, idx, engine);
       if (!implied) continue;
     }
     // ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression index key
@@ -28590,9 +31266,7 @@ export function buildGinBoundForIndex(
 // Returns the OR node; ginOrArms lists its disjuncts.
 export function ginOrMatch(filter: RExpr, colGlobal: number, opclass: GinOpclass): RExpr | null {
   if (filter.kind === "and")
-    return (
-      ginOrMatch(filter.lhs, colGlobal, opclass) ?? ginOrMatch(filter.rhs, colGlobal, opclass)
-    );
+    return ginOrMatch(filter.lhs, colGlobal, opclass) ?? ginOrMatch(filter.rhs, colGlobal, opclass);
   if (filter.kind !== "or") return null;
   return ginOrArms(filter).every((arm) => ginMatch(arm, colGlobal, opclass) !== null)
     ? filter
@@ -28714,13 +31388,10 @@ function ginMatchOperand(
     const a = filter.args[0]!;
     const b = filter.args[1]!;
     if (filter.func === "contains") {
-      if (isColumnRef(a, colGlobal) && queryOK(b))
-        return { strategy: "contains", query: b };
+      if (isColumnRef(a, colGlobal) && queryOK(b)) return { strategy: "contains", query: b };
     } else if (filter.func === "overlaps") {
-      if (isColumnRef(a, colGlobal) && queryOK(b))
-        return { strategy: "overlaps", query: b };
-      if (isColumnRef(b, colGlobal) && queryOK(a))
-        return { strategy: "overlaps", query: a };
+      if (isColumnRef(a, colGlobal) && queryOK(b)) return { strategy: "overlaps", query: b };
+      if (isColumnRef(b, colGlobal) && queryOK(a)) return { strategy: "overlaps", query: a };
     }
   }
   // `col = Q` — exact array equality (gin.md §6). Commutative: the column may be either operand, the
@@ -28812,10 +31483,8 @@ function gistScalarMatchOperand(
     );
   }
   if (filter.kind === "compare" && filter.op === "eq") {
-    if (isColumnRef(filter.lhs, colGlobal) && queryOK(filter.rhs))
-      return { query: filter.rhs };
-    if (isColumnRef(filter.rhs, colGlobal) && queryOK(filter.lhs))
-      return { query: filter.lhs };
+    if (isColumnRef(filter.lhs, colGlobal) && queryOK(filter.rhs)) return { query: filter.rhs };
+    if (isColumnRef(filter.rhs, colGlobal) && queryOK(filter.lhs)) return { query: filter.lhs };
   }
   return null;
 }
@@ -28868,14 +31537,11 @@ function gistMatchOperand(
     const b = filter.args[1]!;
     if (filter.op === "overlaps") {
       // && — symmetric in its operands.
-      if (isColumnRef(a, colGlobal) && queryOK(b))
-        return { strategy: "overlaps", query: b };
-      if (isColumnRef(b, colGlobal) && queryOK(a))
-        return { strategy: "overlaps", query: a };
+      if (isColumnRef(a, colGlobal) && queryOK(b)) return { strategy: "overlaps", query: b };
+      if (isColumnRef(b, colGlobal) && queryOK(a)) return { strategy: "overlaps", query: a };
     } else if (filter.op === "contains") {
       // @> — the indexed column must be the container (LEFT).
-      if (isColumnRef(a, colGlobal) && queryOK(b))
-        return { strategy: "contains", query: b };
+      if (isColumnRef(a, colGlobal) && queryOK(b)) return { strategy: "contains", query: b };
     }
   }
   return null;
@@ -29074,12 +31740,22 @@ export function indexSlotKey(
   row: Row,
   env: EvalEnv,
 ): Uint8Array | null {
+  return runSync(indexSlotKeySteps(key, colTypes, colls, row, env));
+}
+
+export function* indexSlotKeySteps(
+  key: ResolvedKey,
+  colTypes: ColType[],
+  colls: (Collation | null)[],
+  row: Row,
+  env: EvalEnv,
+): Steps<Uint8Array | null> {
   if (key.kind === "column") {
-    const v = row[key.column]!;
+    const v = yield* residentValueSteps(row[key.column]!);
     if (v.kind === "null") return null;
     return encodeColTypeKey(colTypes[key.column]!, v, colls[key.column]!);
   }
-  const v = evalExpr(key.expr, row, env, env.exec.session.scratchMeter());
+  const v = yield* evalExprSteps(key.expr, row, env, env.exec.session.scratchMeter());
   if (v.kind === "null") return null;
   return encodeTypedKey(key.type, v, key.coll);
 }
@@ -29102,12 +31778,25 @@ export function indexEntryKey(
   row: Row,
   env: EvalEnv,
 ): Uint8Array {
+  return runSync(indexEntryKeySteps(colTypes, colls, rindex, storageKey, row, env));
+}
+
+export function* indexEntryKeySteps(
+  colTypes: ColType[],
+  colls: (Collation | null)[],
+  rindex: ResolvedIndex,
+  storageKey: Uint8Array,
+  row: Row,
+  env: EvalEnv,
+): Steps<Uint8Array> {
   const parts: Uint8Array[] = [];
   for (let i = 0; i < rindex.keys.length; i++) {
+    if (shouldCooperate()) yield COOPERATE;
+
     // The §2.16 ordered slot: the order's presence tag + the slot's order-preserving key
     // (range-aware §2.11, composite §2.15, collated-text-aware §2.12), inverted for DESC — or the
     // order's NULL byte.
-    const b = indexSlotKey(rindex.keys[i]!, colTypes, colls, row, env);
+    const b = yield* indexSlotKeySteps(rindex.keys[i]!, colTypes, colls, row, env);
     keyOrderPushSlot(parts, rindex.orders[i]!, b);
   }
   parts.push(storageKey);
@@ -29119,8 +31808,16 @@ export function indexEntryKey(
 // WHERE rule — FALSE and NULL are excluded). The predicate eval is unmetered maintenance work (like a
 // key expression's — cost.md §3), so a throwaway Meter absorbs its charge.
 export function indexRowQualifies(rindex: ResolvedIndex, row: Row, env: EvalEnv): boolean {
+  return runSync(indexRowQualifiesSteps(rindex, row, env));
+}
+
+export function* indexRowQualifiesSteps(
+  rindex: ResolvedIndex,
+  row: Row,
+  env: EvalEnv,
+): Steps<boolean> {
   if (rindex.predicate === undefined) return true;
-  return evalFilter(rindex.predicate, row, env, env.exec.session.scratchMeter());
+  return yield* evalFilterSteps(rindex.predicate, row, env, env.exec.session.scratchMeter());
 }
 
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
@@ -29140,12 +31837,24 @@ export function indexEntryKeys(
   row: Row,
   env: EvalEnv,
 ): Uint8Array[] {
-  if (!indexRowQualifies(rindex, row, env)) return []; // partial index: a non-qualifying row → no entry
+  return runSync(indexEntryKeysSteps(columns, colTypes, colls, rindex, storageKey, row, env));
+}
+
+export function* indexEntryKeysSteps(
+  columns: Column[],
+  colTypes: ColType[],
+  colls: (Collation | null)[],
+  rindex: ResolvedIndex,
+  storageKey: Uint8Array,
+  row: Row,
+  env: EvalEnv,
+): Steps<Uint8Array[]> {
+  if (!(yield* indexRowQualifiesSteps(rindex, row, env))) return []; // partial index: a non-qualifying row → no entry
   if (rindex.kind === "gin")
-    return ginEntries(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
+    return yield* ginEntriesSteps(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
   if (rindex.kind === "gist")
-    return gistEntries(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
-  return [indexEntryKey(colTypes, colls, rindex, storageKey, row, env)];
+    return yield* gistEntriesSteps(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
+  return [yield* indexEntryKeySteps(colTypes, colls, rindex, storageKey, row, env)];
 }
 
 // indexEntryKeysColumns returns the entry keys for a COLUMN-ONLY index, WITHOUT an eval env
@@ -29161,14 +31870,27 @@ export function indexEntryKeysColumns(
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
+  return runSync(indexEntryKeysColumnsSteps(columns, colTypes, colls, def, storageKey, row));
+}
+
+export function* indexEntryKeysColumnsSteps(
+  columns: Column[],
+  colTypes: ColType[],
+  colls: (Collation | null)[],
+  def: IndexDef,
+  storageKey: Uint8Array,
+  row: Row,
+): Steps<Uint8Array[]> {
   const cols = indexColumnOrdinals(def);
   if (cols === null) throw new Error("indexEntryKeysColumns called on an expression index");
-  if (def.kind === "gin") return ginEntries(columns, cols, storageKey, row);
-  if (def.kind === "gist") return gistEntries(columns, cols, storageKey, row);
+  if (def.kind === "gin") return yield* ginEntriesSteps(columns, cols, storageKey, row);
+  if (def.kind === "gist") return yield* gistEntriesSteps(columns, cols, storageKey, row);
   const parts: Uint8Array[] = [];
   for (let i = 0; i < cols.length; i++) {
+    if (shouldCooperate()) yield COOPERATE;
+
     const ci = cols[i]!;
-    const v = row[ci]!;
+    const v = yield* residentValueSteps(row[ci]!);
     keyOrderPushSlot(
       parts,
       indexKeyOrder(def, i),
@@ -29202,10 +31924,21 @@ export function gistEntries(
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
+  return runSync(gistEntriesSteps(columns, cols, storageKey, row));
+}
+
+export function* gistEntriesSteps(
+  columns: Column[],
+  cols: number[],
+  storageKey: Uint8Array,
+  row: Row,
+): Steps<Uint8Array[]> {
   const inputs: GistLeafInput[] = [];
   for (const ci of cols) {
+    if (shouldCooperate()) yield COOPERATE;
+
     const colType = columns[ci]!.type;
-    const v = residentValue(row[ci]!); // a spilled range (a numrange over huge decimals) may be deferred
+    const v = yield* residentValueSteps(row[ci]!); // a spilled range (a numrange over huge decimals) may be deferred
     if (v.kind === "null") return []; // any NULL excluded column → row not indexed (NULL rule)
     if (colType.kind === "range" && v.kind === "range") {
       inputs.push({ range: { kind: "scalar", scalar: typeScalar(colType.elem) }, value: v });
@@ -29231,10 +31964,20 @@ export function exclusionProbeQuery(
   exc: ExclusionConstraint,
   row: Row,
 ): { query: GistQuery[]; strats: GistStrategy[] } | null {
+  return runSync(exclusionProbeQuerySteps(columns, exc, row));
+}
+
+export function* exclusionProbeQuerySteps(
+  columns: Column[],
+  exc: ExclusionConstraint,
+  row: Row,
+): Steps<{ query: GistQuery[]; strats: GistStrategy[] } | null> {
   const query: GistQuery[] = [];
   const strats: GistStrategy[] = [];
   for (const el of exc.elements) {
-    const v = residentValue(row[el.column]!); // an UPDATE's carried-over spilled range may be deferred
+    if (shouldCooperate()) yield COOPERATE;
+
+    const v = yield* residentValueSteps(row[el.column]!); // an UPDATE's carried-over spilled range may be deferred
     if (v.kind === "null") return null; // NULL rule: exempt
     if (el.op === "overlaps") {
       if (v.kind !== "range" || v.empty) return null; // empty && anything is FALSE → exempt
@@ -29272,8 +32015,19 @@ export function exclusionKeysConflict(
   kb: ExclusionKey,
   b: Row,
 ): boolean {
+  return runSync(exclusionKeysConflictSteps(columns, exc, ka, a, kb, b));
+}
+
+export function* exclusionKeysConflictSteps(
+  columns: Column[],
+  exc: ExclusionConstraint,
+  ka: ExclusionKey,
+  a: Row,
+  kb: ExclusionKey,
+  b: Row,
+): Steps<boolean> {
   if (ka.kind === "btree" && kb.kind === "btree") return bytesEq(ka.prefix, kb.prefix);
-  return exclusionPairConflicts(columns, exc, a, b);
+  return yield* exclusionPairConflictsSteps(columns, exc, a, b);
 }
 
 // exclusionPairConflicts reports whether the (expr_i op_i) conjunction holds between two rows
@@ -29287,9 +32041,20 @@ export function exclusionPairConflicts(
   a: Row,
   b: Row,
 ): boolean {
+  return runSync(exclusionPairConflictsSteps(columns, exc, a, b));
+}
+
+export function* exclusionPairConflictsSteps(
+  columns: Column[],
+  exc: ExclusionConstraint,
+  a: Row,
+  b: Row,
+): Steps<boolean> {
   for (const el of exc.elements) {
-    const va = residentValue(a[el.column]!);
-    const vb = residentValue(b[el.column]!);
+    if (shouldCooperate()) yield COOPERATE;
+
+    const va = yield* residentValueSteps(a[el.column]!);
+    const vb = yield* residentValueSteps(b[el.column]!);
     if (va.kind === "null" || vb.kind === "null") return false;
     let ok: boolean;
     if (el.op === "overlaps") {
@@ -29622,8 +32387,20 @@ export function ginEntries(
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
+  return runSync(ginEntriesSteps(columns, cols, storageKey, row));
+}
+
+export function* ginEntriesSteps(
+  columns: Column[],
+  cols: number[],
+  storageKey: Uint8Array,
+  row: Row,
+): Steps<Uint8Array[]> {
   const out: Uint8Array[] = [];
-  cols.forEach((ci, pos) => {
+  for (let pos = 0; pos < cols.length; pos++) {
+    if (shouldCooperate()) yield COOPERATE;
+
+    const ci = cols[pos]!;
     const colType = columns[ci]!.type;
     if (!typeIsJsonb(colType) && colType.kind !== "array")
       throw new Error("a GIN index column is an array or jsonb (CREATE INDEX gate)");
@@ -29631,20 +32408,27 @@ export function ginEntries(
     // A large array or document spills like any variable-width value, so a stored row's value may
     // be deferred; it must be resolved — skipping it would silently drop (or fail to remove) its
     // posting entries.
-    for (const term of ginValueTerms(colType, residentValue(row[ci]!))) {
+    for (const term of ginValueTerms(colType, yield* residentValueSteps(row[ci]!))) {
+      if (shouldCooperate()) yield COOPERATE;
+
       const tagged = ginTaggedTerm(tag, term);
       const entry = new Uint8Array(tagged.length + storageKey.length);
       entry.set(tagged, 0);
       entry.set(storageKey, tagged.length);
       out.push(entry);
     }
-  });
+  }
   return out;
 }
 
 // IndexMove is one index's phase-2 entry moves for one row: the entries to remove (each ending in an
 // oldLen-byte storage key) and to insert (each ending in a newLen-byte storage key).
-type IndexMove = { removals: Uint8Array[]; insertions: Uint8Array[]; oldLen: number; newLen: number };
+type IndexMove = {
+  removals: Uint8Array[];
+  insertions: Uint8Array[];
+  oldLen: number;
+  newLen: number;
+};
 
 // GIN_MAX_KEY_COLUMNS is the most key columns a GIN index takes (gin.md §4.4) — PostgreSQL's
 // INDEX_MAX_KEYS; each entry's column tag is one byte.
@@ -29727,10 +32511,13 @@ class GinGather {
 
   // read scans b of the entry tree, charging its overlap nodes and one gin_entry per posting, and
   // returns the storage keys of its posting runs (gin.md §4.5) in ascending order.
-  private read(b: KeyBound, term: Uint8Array): Uint8Array[] {
-    const scan = this.istore.rangeScanWithUnits(b, []);
+  private *readSteps(b: KeyBound, term: Uint8Array): Steps<Uint8Array[]> {
+    const scan = yield* this.istore.rangeScanWithUnitsSteps(b, []);
     this.pages += scan.pages;
-    return this.decodeRuns(term, scan.entries.map((e) => e.key));
+    return this.decodeRuns(
+      term,
+      scan.entries.map((e) => e.key),
+    );
   }
 
   // decodeRuns is the storage keys of a term's run records, charging one gin_entry each.
@@ -29748,31 +32535,39 @@ class GinGather {
   // survives. Mode ALL is an and of terms and mode ANY an or, so = ANY and ? (one term) read that
   // lone list, array = gathers the same superset as @> (the residual makes it exact), and the
   // jsonb_ops gathers are supersets the residual rechecks.
-  eval(t: GinTree): Uint8Array[] {
-    if (t.kind === "term") return this.postingList(t.term);
-    if (t.kind === "or")
-      return unionPostings([
-        ...t.leaves.map((term) => this.postingList(term)),
-        ...t.rest.map((c) => this.eval(c)),
-      ]);
+  *evalSteps(t: GinTree): Steps<Uint8Array[]> {
+    if (t.kind === "term") return yield* this.postingListSteps(t.term);
+    if (t.kind === "or") {
+      const postings: Uint8Array[][] = [];
+      for (const term of t.leaves) {
+        if (shouldCooperate()) yield COOPERATE;
+        postings.push(yield* this.postingListSteps(term));
+      }
+      for (const child of t.rest) {
+        if (shouldCooperate()) yield COOPERATE;
+        postings.push(yield* this.evalSteps(child));
+      }
+      return unionPostings(postings);
+    }
     let rest = t.rest;
     let cand: Uint8Array[];
-    if (t.leaves.length > 0) cand = this.intersect(t.leaves);
+    if (t.leaves.length > 0) cand = yield* this.intersectSteps(t.leaves);
     else if (rest.length > 0) {
-      cand = this.eval(rest[0]!);
+      cand = yield* this.evalSteps(rest[0]!);
       rest = rest.slice(1);
     } else cand = [];
     for (const child of rest) {
+      if (shouldCooperate()) yield COOPERATE;
       if (cand.length === 0) break;
-      const found = new Set(this.eval(child).map(byteKey));
+      const found = new Set((yield* this.evalSteps(child)).map(byteKey));
       cand = cand.filter((k) => found.has(byteKey(k)));
     }
     return cand;
   }
 
   // postingList is a term's whole posting list (a prefix range scan).
-  postingList(term: Uint8Array): Uint8Array[] {
-    return this.read(GinGather.postingBound(term), term);
+  *postingListSteps(term: Uint8Array): Steps<Uint8Array[]> {
+    return yield* this.readSteps(GinGather.postingBound(term), term);
   }
 
   // intersect is the ALL-mode intersection (gin.md §6.2). The terms are ordered by their posting
@@ -29782,33 +32577,44 @@ class GinGather {
   // — runs of consecutive candidates whose probe keys fall in one leaf — each reading the runs from
   // its first probe key through the run past its last, charging the nodes that range overlaps and one
   // gin_entry per step of the cheaper leaf-local match. Stops once no candidate survives.
-  intersect(terms: Uint8Array[]): Uint8Array[] {
+  *intersectSteps(terms: Uint8Array[]): Steps<Uint8Array[]> {
     const istore = this.istore;
     if (terms.length === 0) return [];
-    if (terms.length === 1) return this.postingList(terms[0]!);
+    if (terms.length === 1) return yield* this.postingListSteps(terms[0]!);
     const height = istore.height();
-    const ordered = terms
-      .map((t) => {
-        const bound = GinGather.postingBound(t);
-        const span = istore.overlapNodeCount(bound);
-        if (span > height)
-          return { span, runs: Infinity, bytes: Infinity, t, peeked: null as Uint8Array[] | null };
-        const scan = istore.rangeScanWithUnits(bound, []);
-        this.pages += scan.pages;
-        const keys = scan.entries.map((e) => e.key);
-        const bytes = keys.reduce((acc, k) => acc + k.length, 0);
-        return { span, runs: keys.length, bytes, t, peeked: keys as Uint8Array[] | null };
-      })
-      .sort(
-        (a, b) =>
-          a.span - b.span ||
-          (a.runs === b.runs ? 0 : a.runs < b.runs ? -1 : 1) ||
-          (a.bytes === b.bytes ? 0 : a.bytes < b.bytes ? -1 : 1) ||
-          cmpBytes(a.t, b.t),
-      );
+    const ordered: {
+      span: number;
+      runs: number;
+      bytes: number;
+      t: Uint8Array;
+      peeked: Uint8Array[] | null;
+    }[] = [];
+    for (const t of terms) {
+      if (shouldCooperate()) yield COOPERATE;
+      const bound = GinGather.postingBound(t);
+      const span = istore.overlapNodeCount(bound);
+      if (span > height) {
+        ordered.push({ span, runs: Infinity, bytes: Infinity, t, peeked: null });
+        continue;
+      }
+      const scan = yield* istore.rangeScanWithUnitsSteps(bound, []);
+      this.pages += scan.pages;
+      const keys = scan.entries.map((e) => e.key);
+      const bytes = keys.reduce((acc, k) => acc + k.length, 0);
+      ordered.push({ span, runs: keys.length, bytes, t, peeked: keys });
+    }
+    ordered.sort(
+      (a, b) =>
+        a.span - b.span ||
+        (a.runs === b.runs ? 0 : a.runs < b.runs ? -1 : 1) ||
+        (a.bytes === b.bytes ? 0 : a.bytes < b.bytes ? -1 : 1) ||
+        cmpBytes(a.t, b.t),
+    );
     const driver = ordered[0]!;
     let candidates =
-      driver.peeked !== null ? this.decodeRuns(driver.t, driver.peeked) : this.postingList(driver.t);
+      driver.peeked !== null
+        ? this.decodeRuns(driver.t, driver.peeked)
+        : yield* this.postingListSteps(driver.t);
     const probe = (term: Uint8Array, key: Uint8Array): Uint8Array => {
       const out = new Uint8Array(term.length + key.length);
       out.set(term, 0);
@@ -29822,16 +32628,19 @@ class GinGather {
       hiInc: true,
     });
     for (let ti = 1; ti < ordered.length && candidates.length > 0; ti++) {
+      if (shouldCooperate()) yield COOPERATE;
       const term = ordered[ti]!.t;
       const survivors: Uint8Array[] = [];
       let i = 0;
       while (i < candidates.length) {
+        if (shouldCooperate()) yield COOPERATE;
         const first = probe(term, candidates[i]!);
         let j = i;
         while (
           j + 1 < candidates.length &&
           istore.overlapNodeCount(span(first, probe(term, candidates[j + 1]!))) === height
         ) {
+          if (shouldCooperate()) yield COOPERATE;
           j++;
         }
         // One leaf: the runs from term ‖ c_i through the run holding (or following) c_j — the first
@@ -29845,8 +32654,8 @@ class GinGather {
         // and charges either way.
         const probed =
           group.length <= GIN_GROUP_LOOKUPS
-            ? ginProbeGroupLookups(istore, term, group)
-            : ginProbeGroupScan(istore, term, group, first, last);
+            ? yield* ginProbeGroupLookupsSteps(istore, term, group)
+            : yield* ginProbeGroupScanSteps(istore, term, group, first, last);
         this.pages += istore.overlapNodeCount(span(first, probed.end ?? last));
         this.entries += group.length;
         survivors.push(...probed.found);
@@ -29877,17 +32686,18 @@ function ginContainsKey(keys: Uint8Array[], key: Uint8Array): boolean {
 // ginProbeGroupLookups is one leaf group's surviving candidates by a lookup per candidate — the first
 // run at or after term ‖ c holds c if any run does — and the key of the run at or after the last
 // candidate (null when none).
-function ginProbeGroupLookups(
+function* ginProbeGroupLookupsSteps(
   istore: TableStore,
   term: Uint8Array,
   group: Uint8Array[],
-): { end: Uint8Array | null; found: Uint8Array[] } {
+): Steps<{ end: Uint8Array | null; found: Uint8Array[] }> {
   const found: Uint8Array[] = [];
   let end: Uint8Array | null = null;
   let decodedRun: Uint8Array | null = null;
   let keys: Uint8Array[] = [];
   for (const c of group) {
-    const run = ginRunAtOrAfter(istore, term, c);
+    if (shouldCooperate()) yield COOPERATE;
+    const run = yield* ginRunAtOrAfterSteps(istore, term, c);
     if (run === null) break; // no later candidate has a run either
     if (decodedRun === null || cmpBytes(decodedRun, run) !== 0) {
       keys = ginDecodeRun(term.length, run);
@@ -29901,16 +32711,17 @@ function ginProbeGroupLookups(
 
 // ginProbeGroupScan is one leaf group's surviving candidates by one scan of its runs, from
 // term ‖ c_first through the first run past last (= term ‖ c_last), and that run's key.
-function ginProbeGroupScan(
+function* ginProbeGroupScanSteps(
   istore: TableStore,
   term: Uint8Array,
   group: Uint8Array[],
   first: Uint8Array,
   last: Uint8Array,
-): { end: Uint8Array | null; found: Uint8Array[] } {
+): Steps<{ end: Uint8Array | null; found: Uint8Array[] }> {
   const runs: Uint8Array[] = [];
   let past = false;
-  istore.scanRange({ ...GinGather.postingBound(term), lo: first }, (k) => {
+  // biome-ignore lint/correctness/useYield: the step visitor interface also admits resident-only callbacks.
+  yield* istore.scanRangeSteps({ ...GinGather.postingBound(term), lo: first }, function* (k) {
     runs.push(k.slice());
     past = cmpBytes(k, last) > 0;
     return !past;
@@ -29919,10 +32730,12 @@ function ginProbeGroupScan(
   let decodedAt = -1;
   let keys: Uint8Array[] = [];
   for (const c of group) {
+    if (shouldCooperate()) yield COOPERATE;
     const key = concatBytes([term, c]);
     let lo = 0;
     let hi = runs.length;
     while (lo < hi) {
+      if (shouldCooperate()) yield COOPERATE;
       const mid = (lo + hi) >>> 1;
       if (cmpBytes(runs[mid]!, key) < 0) lo = mid + 1;
       else hi = mid;
@@ -30133,8 +32946,7 @@ export function resolveArbiter(
   if (pk.length > 0 && target.name === pkey) return { kind: "pk" };
   for (let i = 0; i < table.indexes.length; i++) {
     const def = table.indexes[i]!;
-    if (def.unique && def.name === target.name)
-      return { kind: "index", indexPos: i };
+    if (def.unique && def.name === target.name) return { kind: "index", indexPos: i };
   }
   const ex = table.exclusions.findIndex((e) => e.name === target.name);
   if (ex >= 0) return { kind: "exclusion", exclusionPos: ex };
@@ -30165,9 +32977,21 @@ export function arbiterKey(
   row: Row,
   env: EvalEnv,
 ): Uint8Array | null {
+  return runSync(arbiterKeySteps(arb, colTypes, pk, colls, rindexes, row, env));
+}
+
+export function* arbiterKeySteps(
+  arb: Arbiter,
+  colTypes: ColType[],
+  pk: number[],
+  colls: (Collation | null)[],
+  rindexes: ResolvedIndex[],
+  row: Row,
+  env: EvalEnv,
+): Steps<Uint8Array | null> {
   if (arb.kind === "pk") return encodePkKey(colTypes, pk, colls, row);
   if (arb.kind === "exclusion") throw new Error("an exclusion arbiter has no arbiter key");
-  return indexPrefixKey(colTypes, colls, rindexes[arb.indexPos]!, row, env);
+  return yield* indexPrefixKeySteps(colTypes, colls, rindexes[arb.indexPos]!, row, env);
 }
 
 // leastKey is the byte-wise least of keys, or null when there are none — the deterministic pick of
@@ -30190,12 +33014,24 @@ export function indexPrefixKey(
   row: Row,
   env: EvalEnv,
 ): Uint8Array | null {
+  return runSync(indexPrefixKeySteps(colTypes, colls, rindex, row, env));
+}
+
+export function* indexPrefixKeySteps(
+  colTypes: ColType[],
+  colls: (Collation | null)[],
+  rindex: ResolvedIndex,
+  row: Row,
+  env: EvalEnv,
+): Steps<Uint8Array | null> {
   // A partial index constrains only its qualifying rows (indexes.md §9): a non-qualifying row is
   // exempt from uniqueness, exactly like a NULL-bearing prefix (returns null).
-  if (!indexRowQualifies(rindex, row, env)) return null;
+  if (!(yield* indexRowQualifiesSteps(rindex, row, env))) return null;
   const parts: Uint8Array[] = [];
   for (let i = 0; i < rindex.keys.length; i++) {
-    const b = indexSlotKey(rindex.keys[i]!, colTypes, colls, row, env);
+    if (shouldCooperate()) yield COOPERATE;
+
+    const b = yield* indexSlotKeySteps(rindex.keys[i]!, colTypes, colls, row, env);
     if (b === null) return null; // NULLS DISTINCT: a NULL slot never conflicts
     // the order's present slot (§2.16) — the same bytes the entry key carries
     keyOrderPushPresent(parts, rindex.orders[i]!, b);
@@ -30312,7 +33148,11 @@ function fkSlotOrdinals(n: number): number[] {
 // (null = none). A row with any NULL FK column references nothing (MATCH SIMPLE). Unmetered set
 // membership (§6.11).
 function fkKeyedMatch(t: FkKeyedTarget, row: Row): number | null {
-  const probe = fkProbe(t.fk, t.parent, t.parentColls, row, t.fk.columns);
+  return runSync(fkKeyedMatchSteps(t, row));
+}
+
+function* fkKeyedMatchSteps(t: FkKeyedTarget, row: Row): Steps<number | null> {
+  const probe = yield* fkProbeSteps(t.fk, t.parent, t.parentColls, row, t.fk.columns);
   if (probe === null) return null;
   return t.keys.get(fkProbeBytes(probe).join(",")) ?? null;
 }
@@ -30329,20 +33169,32 @@ function indexStoreBoundEntries(
   prefixByteLen: number,
   mask: boolean[],
 ): { entries: Entry[]; pages: number; slabs: number } {
+  return runSync(indexStoreBoundEntriesSteps(istore, store, suffix, b, prefixByteLen, mask));
+}
+
+function* indexStoreBoundEntriesSteps(
+  istore: TableStore,
+  store: TableStore,
+  suffix: KeySlot[],
+  b: KeyBound,
+  prefixByteLen: number,
+  mask: boolean[],
+): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
   // The index store has no payload columns, so its mask is empty and its fused scan
   // contributes only the index-tree page_read count (no spill/compress units).
-  const iscan = istore.rangeScanWithUnits(b, []);
+  const iscan = yield* istore.rangeScanWithUnitsSteps(b, []);
   let pages = iscan.pages;
   let slabs = 0;
   const rows: Entry[] = [];
   for (const e of iscan.entries) {
+    if (shouldCooperate()) yield COOPERATE;
     // Skip the equality prefix by its known byte length, then each remaining key component by its
     // self-delimiting slot (indexes.md §5.1); the suffix after them is the row's storage key
     // (indexes.md §3). An entry too short for its slots is corrupt: it names no row.
     const rowKey = indexEntryRowKey(e.key, prefixByteLen, suffix);
     if (rowKey === null)
       throw engineError("data_corrupted", "an index entry references a stored row");
-    const u = store.getWithUnits(rowKey, mask);
+    const u = yield* store.getWithUnitsSteps(rowKey, mask);
     pages += u.pages;
     slabs += u.slabs;
     if (u.row === undefined)
@@ -30373,7 +33225,11 @@ export function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
 // checks fault the value in to compute the same key bytes the INSERT wrote (never an internal error,
 // never a skipped entry). The fetch is unmetered, like the evaluator's backstop it shares.
 export function residentValue(value: Value): Value {
-  return value.kind === "unfetched" ? resolveUnfetchedSelf(value.ref) : value;
+  return runSync(residentValueSteps(value));
+}
+
+export function* residentValueSteps(value: Value): Steps<Value> {
+  return value.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(value.ref) : value;
 }
 
 // collatedTextKey is the order-preserving key body for a text value (encoding.md §2.12): the
@@ -30505,9 +33361,37 @@ export class HashJoinTable {
     this.hash = hash;
     this.probeOffset = probeOffset;
     this.charge = meter.stateCharge();
+    runSync(this.buildRowsSteps(plan, buildOffset, rows, meter));
+  }
+
+  static *buildSteps(
+    plan: HashJoinPlan,
+    buildOffset: number,
+    probeOffset: number,
+    rows: Row[],
+    meter: Meter,
+    hash: HashJoinHash = hashJoinFnv1a,
+  ): Steps<HashJoinTable> {
+    const table = new HashJoinTable(plan, buildOffset, probeOffset, [], meter, hash);
+    try {
+      yield* table.buildRowsSteps(plan, buildOffset, rows, meter);
+      return table;
+    } catch (error) {
+      table.release();
+      throw error;
+    }
+  }
+
+  private *buildRowsSteps(
+    plan: HashJoinPlan,
+    buildOffset: number,
+    rows: Row[],
+    meter: Meter,
+  ): Steps<void> {
     const indices = plan.keys.map((key) => key.right - buildOffset);
     const types = plan.keys.map((key) => key.type);
     for (let row = 0; row < rows.length; row++) {
+      if (shouldCooperate()) yield COOPERATE;
       const encoded = hashJoinRowKey(rows[row]!, indices, types, COSTS.hashBuild, meter);
       if (encoded === null) continue;
       if (this.charge.active()) this.charge.reserve(meter, entryBytesAt(rows[row]!, indices));
@@ -30519,6 +33403,10 @@ export class HashJoinTable {
   }
 
   probe(plan: HashJoinPlan, row: Row, meter: Meter): number[] {
+    return runSync(this.probeSteps(plan, row, meter));
+  }
+
+  *probeSteps(plan: HashJoinPlan, row: Row, meter: Meter): Steps<number[]> {
     const encoded = hashJoinRowKey(
       row,
       plan.keys.map((key) => key.left - this.probeOffset),
@@ -30530,8 +33418,11 @@ export class HashJoinTable {
     const bucket = this.entries.get(this.hash(encoded)) ?? [];
     const rows: number[] = [];
     for (const entry of bucket) {
+      if (shouldCooperate()) yield COOPERATE;
       meter.guard();
-      meter.charge(COSTS.hashProbe * BigInt(Math.max(1, Math.min(entry.key.length, encoded.length))));
+      meter.charge(
+        COSTS.hashProbe * BigInt(Math.max(1, Math.min(entry.key.length, encoded.length))),
+      );
       if (bytesEq(entry.key, encoded)) rows.push(entry.row);
     }
     return rows;
@@ -30684,9 +33575,13 @@ export function fkTypesComparable(local: Type, referenced: Type): boolean {
 // value encodes to exactly the key bytes of every equal stored value. Same-type values pass
 // unchanged.
 export function fkValueAs(target: Type, v: Value): Value | null {
+  return runSync(fkValueAsSteps(target, v));
+}
+
+export function* fkValueAsSteps(target: Type, v: Value): Steps<Value | null> {
   if (target.kind !== "scalar") return v;
   const t = target.scalar;
-  v = residentValue(v);
+  v = yield* residentValueSteps(v);
   if (v.kind === "int" && isInteger(t)) return inRange(t, v.int) ? v : null;
   if (v.kind === "int" && t === "decimal") return decimalValue(Decimal.fromBigInt(v.int));
   if (v.kind === "decimal" && isInteger(t)) {
@@ -30740,8 +33635,20 @@ export function fkProbe(
   row: Row,
   ordinals: number[],
 ): FkProbe | null {
+  return runSync(fkProbeSteps(fk, parent, parentColls, row, ordinals));
+}
+
+export function* fkProbeSteps(
+  fk: ForeignKey,
+  parent: Table,
+  parentColls: (Collation | null)[],
+  row: Row,
+  ordinals: number[],
+): Steps<FkProbe | null> {
   // MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
   for (const o of ordinals) {
+    if (shouldCooperate()) yield COOPERATE;
+
     if (row[o]!.kind === "null") return null;
   }
   // Each value as its equal of the parent column's type (§6.2 step 5); a value with none matches no
@@ -30749,8 +33656,10 @@ export function fkProbe(
   // ordinals[i]).
   const parentValues: Value[] = new Array(parent.columns.length);
   for (let i = 0; i < fk.refColumns.length; i++) {
+    if (shouldCooperate()) yield COOPERATE;
+
     const pcol = fk.refColumns[i]!;
-    const v = fkValueAs(parent.columns[pcol]!.type, row[ordinals[i]!]!);
+    const v = yield* fkValueAsSteps(parent.columns[pcol]!.type, row[ordinals[i]!]!);
     if (v === null) return { kind: "absent" };
     parentValues[pcol] = v;
   }
@@ -30762,6 +33671,8 @@ export function fkProbe(
   if (parent.pk.length > 0 && sameSet(pkSet, refSet)) {
     const parts: Uint8Array[] = [];
     for (const pcol of parent.pk) {
+      if (shouldCooperate()) yield COOPERATE;
+
       parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!));
     }
     return { kind: "pk", bytes: concatBytes(parts) };
@@ -30773,6 +33684,8 @@ export function fkProbe(
   const idxCols = indexColumnOrdinals(idx)!; // an FK target is a plain-column unique index
   const parts: Uint8Array[] = [];
   for (let i = 0; i < idxCols.length; i++) {
+    if (shouldCooperate()) yield COOPERATE;
+
     const pcol = idxCols[i]!;
     // The parent index's §2.16 ordered present slot (a DESC key inverts its body).
     const body = encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!);
@@ -31257,14 +34170,7 @@ export function buildKeyBound(
   };
   if (bp.range !== null) {
     for (const t of bp.range.terms) {
-      const encoded = encodeBoundKey(
-        bp.range.colType,
-        t.src,
-        params,
-        outer,
-        bp.range.coll,
-        left,
-      );
+      const encoded = encodeBoundKey(bp.range.colType, t.src, params, outer, bp.range.coll, left);
       if (encoded.kind === "null") return null;
       if (encoded.kind === "outOfRange") continue;
       const endpoint = concatBytes([p, encoded.key]);
@@ -31477,10 +34383,8 @@ export function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | n
   if (v.kind === "bytea") return { kind: "key", key: encodeTerminated(v.bytes) };
   if (v.kind === "decimal") return { kind: "key", key: v.dec.encodeKey() };
   if (v.kind === "interval") return { kind: "key", key: intervalEncodeKey(v.iv) };
-  if (v.kind === "f32" && pkType === "f32")
-    return { kind: "key", key: encodeFloat32Key(v.value) };
-  if (v.kind === "f64" && pkType === "f64")
-    return { kind: "key", key: encodeFloat64Key(v.value) };
+  if (v.kind === "f32" && pkType === "f32") return { kind: "key", key: encodeFloat32Key(v.value) };
+  if (v.kind === "f64" && pkType === "f64") return { kind: "key", key: encodeFloat64Key(v.value) };
   if (v.kind === "int")
     return inRange(pkType, v.int)
       ? { kind: "key", key: encodeInt(pkType, v.int) }
@@ -31642,7 +34546,12 @@ export function pkKeySetIntervals(
 // memberPoints is a point member's sorted, de-duplicated encoded points (never merged), each inside
 // the member's clip. A member with no set has the single point its equalities agree on.
 // null when a membership subquery among its sources is not yet folded, so it has no points.
-function memberPoints(m: TupleMember, params: Value[], outer: Row[], left: Row): Uint8Array[] | null {
+function memberPoints(
+  m: TupleMember,
+  params: Value[],
+  outer: Row[],
+  left: Row,
+): Uint8Array[] | null {
   const clip = buildLogicalInterval(m.colType, m.clip, params, outer, m.coll, left);
   if (clip === null) return [];
   if (m.specs === null) return clip.lo !== null ? [clip.lo] : [];
@@ -31680,7 +34589,12 @@ function memberPoints(m: TupleMember, params: Value[], outer: Row[], left: Row):
 
 // finalMemberIntervals is the final member's canonical logical intervals: its set clipped by its
 // clip, or with no set the one interval its clip describes.
-function finalMemberIntervals(m: TupleMember, params: Value[], outer: Row[], left: Row): KeyBound[] {
+function finalMemberIntervals(
+  m: TupleMember,
+  params: Value[],
+  outer: Row[],
+  left: Row,
+): KeyBound[] {
   if (m.specs !== null) {
     return canonicalIntervalSet(m.colType, m.specs, m.clip, params, outer, m.coll, left);
   }
@@ -31700,7 +34614,12 @@ function expandTuplePrefixes(
   params: Value[],
   outer: Row[],
   left: Row,
-): { prefixes: Uint8Array[]; finalIntervals: KeyBound[]; consumed: number; hasFinal: boolean } | null {
+): {
+  prefixes: Uint8Array[];
+  finalIntervals: KeyBound[];
+  consumed: number;
+  hasFinal: boolean;
+} | null {
   let prefixes: Uint8Array[] = [new Uint8Array(0)];
   let finalIntervals: KeyBound[] = [];
   let hasFinal = false;
@@ -31815,7 +34734,6 @@ function indexKeySetProbes(
   ).map((bound) => ({ bound, prefixLen: 0, suffix: ks.slots }));
 }
 
-
 // compareLoEndpoint orders two lower endpoints, an unbounded (null) one first — Option<Vec<u8>>
 // ordering (None < Some).
 function compareLoEndpoint(a: Uint8Array | null, b: Uint8Array | null): number {
@@ -31924,14 +34842,23 @@ export function scanEntries(
   params: Value[],
   mask: boolean[],
 ): { entries: Entry[] | null; overlap: number; slabs: number } {
+  return runSync(scanEntriesSteps(store, pkBound, params, mask));
+}
+
+export function* scanEntriesSteps(
+  store: TableStore,
+  pkBound: PkBound | null,
+  params: Value[],
+  mask: boolean[],
+): Steps<{ entries: Entry[] | null; overlap: number; slabs: number }> {
   if (pkBound !== null) {
     // Top-level statement: no enclosing query, so the bound never has a correlated source.
     const b = buildKeyBound(pkBound, params, [], []);
     if (b === null) return { entries: null, overlap: 0, slabs: 0 };
-    const u = store.rangeScanWithUnits(b, mask);
+    const u = yield* store.rangeScanWithUnitsSteps(b, mask);
     return { entries: u.entries, overlap: u.pages, slabs: u.slabs };
   }
-  const u = store.scanWithUnits(mask);
+  const u = yield* store.scanWithUnitsSteps(mask);
   return { entries: u.entries, overlap: u.pages, slabs: u.slabs };
 }
 
@@ -32573,10 +35500,7 @@ function collectIndexHostDeps(node: RExpr, reg: HostFunctions, out: HostFuncDep[
 // has no volatility gate — the built-in rule admits CHECK (ts < now()), and nothing relies on a
 // check being immutable — but each host function must declare a component identity (42P17) so a
 // swapped implementation is detectable. undefined for a check that calls no host function.
-function collectCheckHostDeps(
-  node: RExpr,
-  reg: HostFunctions | null,
-): HostFuncDep[] | undefined {
+function collectCheckHostDeps(node: RExpr, reg: HostFunctions | null): HostFuncDep[] | undefined {
   if (reg === null) return undefined;
   const deps: HostFuncDep[] = [];
   collectHostDeps(node, reg, false, "a check constraint", deps);
@@ -33126,7 +36050,8 @@ export function matchGroupOuter(
   if (gke === undefined) return null;
   for (let p = 0; p < gke.length; p++) {
     const o = gke[p]?.outer;
-    if (o !== undefined && o.level === level && o.index === index) return { slot: p, ty: gke[p]!.ty };
+    if (o !== undefined && o.level === level && o.index === index)
+      return { slot: p, ty: gke[p]!.ty };
   }
   return null;
 }
@@ -34916,11 +37841,25 @@ export function applyJsonBehavior(
   env: EvalEnv,
   meter: Meter,
 ): Value {
+  return runSync(
+    applyJsonBehaviorSteps(behavior, clause, defaults, underlying, returning, env, meter),
+  );
+}
+
+export function* applyJsonBehaviorSteps(
+  behavior: JsonOnBehavior,
+  clause: "empty" | "error",
+  defaults: JsonDefaults,
+  underlying: EngineError,
+  returning: ScalarType,
+  env: EvalEnv,
+  meter: Meter,
+): Steps<Value> {
   switch (behavior) {
     case "default": {
       const expr = clause === "empty" ? defaults.onEmpty : defaults.onError;
       if (expr === null) throw new Error("a DEFAULT behavior carries its expression");
-      const v = evalExpr(expr, defaults.row, env, meter);
+      const v = yield* evalExprSteps(expr, defaults.row, env, meter);
       if (v.kind !== "jsonb" || returning === "jsonb") return v;
       try {
         return coerceJsonMember(v.node, scalarT(returning), TYPMOD_NONE, env, meter);
@@ -34977,12 +37916,42 @@ export function evalJsonSqlResult(
   env: EvalEnv,
   meter: Meter,
 ): Value {
+  return runSync(
+    evalJsonSqlResultSteps(
+      kind,
+      seq,
+      returning,
+      decimal,
+      wrapper,
+      onEmpty,
+      onError,
+      defaults,
+      constant,
+      env,
+      meter,
+    ),
+  );
+}
+
+export function* evalJsonSqlResultSteps(
+  kind: JsonSqlKind,
+  seq: JsonNode[],
+  returning: ScalarType,
+  decimal: DecimalTypmod | null,
+  wrapper: JsonWrapper,
+  onEmpty: JsonOnBehavior,
+  onError: JsonOnBehavior,
+  defaults: JsonDefaults,
+  constant: boolean,
+  env: EvalEnv,
+  meter: Meter,
+): Steps<Value> {
   switch (kind) {
     case "exists":
       return boolValue(seq.length > 0);
     case "value": {
       if (seq.length === 0) {
-        return applyJsonBehavior(
+        return yield* applyJsonBehaviorSteps(
           onEmpty,
           "empty",
           defaults,
@@ -34993,7 +37962,7 @@ export function evalJsonSqlResult(
         );
       }
       if (seq.length > 1) {
-        return applyJsonBehavior(
+        return yield* applyJsonBehaviorSteps(
           onError,
           "error",
           defaults,
@@ -35009,7 +37978,7 @@ export function evalJsonSqlResult(
       const item = seq[0]!;
       // JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
       if (item.kind === "array" || item.kind === "object") {
-        return applyJsonBehavior(
+        return yield* applyJsonBehaviorSteps(
           onError,
           "error",
           defaults,
@@ -35025,16 +37994,18 @@ export function evalJsonSqlResult(
       // Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is a
       // SQL/JSON error honored by ON ERROR.
       try {
-        return coerceJsonMember(
-          item,
-          scalarT(returning),
-          { ...TYPMOD_NONE, decimal },
-          env,
-          meter,
-        );
+        return coerceJsonMember(item, scalarT(returning), { ...TYPMOD_NONE, decimal }, env, meter);
       } catch (e) {
         if (isSqljsonError(e)) {
-          return applyJsonBehavior(onError, "error", defaults, e, returning, env, meter);
+          return yield* applyJsonBehaviorSteps(
+            onError,
+            "error",
+            defaults,
+            e,
+            returning,
+            env,
+            meter,
+          );
         }
         throw e;
       }
@@ -35053,7 +38024,7 @@ export function evalJsonSqlResult(
           break;
         case "without": {
           if (seq.length === 0) {
-            return applyJsonBehavior(
+            return yield* applyJsonBehaviorSteps(
               onEmpty,
               "empty",
               defaults,
@@ -35064,7 +38035,7 @@ export function evalJsonSqlResult(
             );
           }
           if (seq.length > 1) {
-            return applyJsonBehavior(
+            return yield* applyJsonBehaviorSteps(
               onError,
               "error",
               defaults,
@@ -35157,20 +38128,32 @@ export function expandJtLevel(
   env: EvalEnv,
   meter: Meter,
 ): JtAssign[] {
+  return runSync(expandJtLevelSteps(cols, items, vars, env, meter));
+}
+
+export function* expandJtLevelSteps(
+  cols: JtCol[],
+  items: JsonNode[],
+  vars: JsonPathVars,
+  env: EvalEnv,
+  meter: Meter,
+): Steps<JtAssign[]> {
   const rows: JtAssign[] = [];
   for (let i = 0; i < items.length; i++) {
+    if (shouldCooperate()) yield COOPERATE;
     meter.guard();
     const item = items[i]!;
     const ord = BigInt(i + 1);
     // This level's non-nested columns (regular / exists / ordinality).
     const local: JtAssign = [];
     for (const col of cols) {
+      if (shouldCooperate()) yield COOPERATE;
       switch (col.kind) {
         case "ordinality":
           local.push([col.idx, intValue(ord)]);
           break;
         case "regular": {
-          const v = evalJtRegular(
+          const v = yield* evalJtRegularSteps(
             item,
             col.path,
             vars,
@@ -35198,8 +38181,9 @@ export function expandJtLevel(
     }
     // The NESTED siblings, expanded over this item (UNIONed + LEFT OUTER fill).
     const nested = cols.filter((c): c is JtCol & { kind: "nested" } => c.kind === "nested");
-    const nestedRows = expandJtNested(nested, item, vars, env, meter);
+    const nestedRows = yield* expandJtNestedSteps(nested, item, vars, env, meter);
     for (const nr of nestedRows) {
+      if (shouldCooperate()) yield COOPERATE;
       rows.push([...local, ...nr]);
     }
   }
@@ -35217,9 +38201,20 @@ export function expandJtNested(
   env: EvalEnv,
   meter: Meter,
 ): JtAssign[] {
+  return runSync(expandJtNestedSteps(children, item, vars, env, meter));
+}
+
+export function* expandJtNestedSteps(
+  children: (JtCol & { kind: "nested" })[],
+  item: JsonNode,
+  vars: JsonPathVars,
+  env: EvalEnv,
+  meter: Meter,
+): Steps<JtAssign[]> {
   if (children.length === 0) return [[]];
   const union: JtAssign[] = [];
   for (const child of children) {
+    if (shouldCooperate()) yield COOPERATE;
     const p = jsonPathCompileMetered(child.path, meter, env.environment.property());
     // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
     let childSeq: JsonNode[];
@@ -35229,7 +38224,7 @@ export function expandJtNested(
       if (!isSqljsonError(e)) throw e;
       childSeq = [];
     }
-    union.push(...expandJtLevel(child.columns, childSeq, vars, env, meter));
+    union.push(...(yield* expandJtLevelSteps(child.columns, childSeq, vars, env, meter)));
   }
   if (union.length === 0) union.push([]);
   return union;
@@ -35252,19 +38247,51 @@ export function evalJtRegular(
   env: EvalEnv,
   meter: Meter,
 ): Value {
+  return runSync(
+    evalJtRegularSteps(
+      item,
+      path,
+      vars,
+      query,
+      returning,
+      decimal,
+      wrapper,
+      onEmpty,
+      onError,
+      defaults,
+      env,
+      meter,
+    ),
+  );
+}
+
+export function* evalJtRegularSteps(
+  item: JsonNode,
+  path: string,
+  vars: JsonPathVars,
+  query: boolean,
+  returning: ScalarType,
+  decimal: DecimalTypmod | null,
+  wrapper: JsonWrapper,
+  onEmpty: JsonOnBehavior,
+  onError: JsonOnBehavior,
+  defaults: JsonDefaults,
+  env: EvalEnv,
+  meter: Meter,
+): Steps<Value> {
   const p = jsonPathCompileMetered(path, meter, env.environment.property());
   let seq: JsonNode[];
   try {
     seq = jsonPathEval(p, item, jtEval(vars), meter);
   } catch (e) {
     if (isSqljsonError(e)) {
-      return applyJsonBehavior(onError, "error", defaults, e, returning, env, meter);
+      return yield* applyJsonBehaviorSteps(onError, "error", defaults, e, returning, env, meter);
     }
     throw e;
   }
   const kind: JsonSqlKind = query ? "query" : "value";
   // A JSON_TABLE row item is never a constant operand, so a wrapped column charges its array.
-  return evalJsonSqlResult(
+  return yield* evalJsonSqlResultSteps(
     kind,
     seq,
     returning,
@@ -35423,7 +38450,9 @@ export type SelectPlan = {
 function pushedFilterDetail(sp: SelectPlan, i: number, detail: string, verbose: boolean): string {
   const pushed = pushedFilter(sp, i).glob;
   if (pushed === null) return detail === "" ? "-" : detail;
-  const part = verbose ? `filter=${renderRExpr(pushed)}` : `filter:conjuncts=${conjunctCount(pushed)}`;
+  const part = verbose
+    ? `filter=${renderRExpr(pushed)}`
+    : `filter:conjuncts=${conjunctCount(pushed)}`;
   return detail === "" ? part : `${detail}; ${part}`;
 }
 
@@ -35798,11 +38827,7 @@ export const EMPTY_CTE_CTX: CteCtx = { modes: [], bindings: [], buffers: [], out
 
 // topLevelCteCtx builds the context of a statement-top-level WITH: its bindings have no enclosing
 // outer-row environment.
-export function topLevelCteCtx(
-  modes: CteMode[],
-  bindings: CteBinding[],
-  buffers: Row[][],
-): CteCtx {
+export function topLevelCteCtx(modes: CteMode[], bindings: CteBinding[], buffers: Row[][]): CteCtx {
   return { modes, bindings, buffers, outers: bindings.map(() => []) };
 }
 
@@ -35841,6 +38866,7 @@ export type EvalEnv = {
   params: Value[];
   outer: Row[];
   runSubquery(plan: QueryPlan, outer: Row[]): SelectResult;
+  runSubquerySteps?(plan: QueryPlan, outer: Row[]): Steps<SelectResult>;
   // The entropy+clock seam (spec/design/entropy.md §5): `environment` is the handle's Environment
   // (its random + clock sources, spec/design/environment.md §4); `rng` is the per-statement uuidv7
   // counter + once-resolved clock. Only the volatile uuid generators and clock functions touch them.
@@ -36361,7 +39387,8 @@ export function newAccFromSpecUnordered(s: AggSpec, zone: ZoneRef): Acc {
 // aggregates.md §23): a NULL is 22004, an empty first input 2202E, a result past MAXDIM 54000, and an
 // input whose shape differs from the first's 2202E. The first input is kept in a.cur as the shape.
 function checkArrayAggInput(a: Acc, v: Value): void {
-  if (v.kind === "null") throw engineError("null_value_not_allowed", "cannot accumulate null arrays");
+  if (v.kind === "null")
+    throw engineError("null_value_not_allowed", "cannot accumulate null arrays");
   if (v.kind !== "array") throw new Error("a nested array_agg holds only arrays");
   const first = a.cur;
   if (first === null) {
@@ -36413,18 +39440,17 @@ const MOMENT_SURFACES: Record<string, [AggPlan, AggPlan]> = {
   var_samp: ["varSamp", "varSampFloat"],
   variance: ["varSamp", "varSampFloat"],
 };
-const MOMENT_STATS: Partial<
-  Record<AggPlan, { sample: boolean; stddev: boolean; float: boolean }>
-> = {
-  varPop: { sample: false, stddev: false, float: false },
-  stddevSamp: { sample: true, stddev: true, float: false },
-  stddevSampFloat: { sample: true, stddev: true, float: true },
-  stddevPop: { sample: false, stddev: true, float: false },
-  stddevPopFloat: { sample: false, stddev: true, float: true },
-  varPopFloat: { sample: false, stddev: false, float: true },
-  varSamp: { sample: true, stddev: false, float: false },
-  varSampFloat: { sample: true, stddev: false, float: true },
-};
+const MOMENT_STATS: Partial<Record<AggPlan, { sample: boolean; stddev: boolean; float: boolean }>> =
+  {
+    varPop: { sample: false, stddev: false, float: false },
+    stddevSamp: { sample: true, stddev: true, float: false },
+    stddevSampFloat: { sample: true, stddev: true, float: true },
+    stddevPop: { sample: false, stddev: true, float: false },
+    stddevPopFloat: { sample: false, stddev: true, float: true },
+    varPopFloat: { sample: false, stddev: false, float: true },
+    varSamp: { sample: true, stddev: false, float: false },
+    varSampFloat: { sample: true, stddev: false, float: true },
+  };
 
 // foldExactMoment adds one input to the exact one-argument moments (aggregates.md §23), skipping
 // NULL. Each fold charges decimal_work for the square and the two additions, by the `*` and `+`
@@ -36468,7 +39494,18 @@ function foldFloatMoment(a: Acc, v: Value): void {
 // The two-argument statistical aggregates (aggregates.md §23) over (Y, X) pairs whose arguments are
 // both non-NULL, numeric arguments widened to f64. PAIR_SURFACES maps each to its plan; PAIR_STATS
 // gives each plan its statistic.
-type PairStat = "covarPop" | "covarSamp" | "corr" | "regrAvgx" | "regrAvgy" | "regrSxx" | "regrSyy" | "regrSxy" | "regrSlope" | "regrIntercept" | "regrR2";
+type PairStat =
+  | "covarPop"
+  | "covarSamp"
+  | "corr"
+  | "regrAvgx"
+  | "regrAvgy"
+  | "regrSxx"
+  | "regrSyy"
+  | "regrSxy"
+  | "regrSlope"
+  | "regrIntercept"
+  | "regrR2";
 const PAIR_SURFACES: Record<string, AggPlan> = {
   covar_pop: "covarPop",
   regr_r2: "regrR2",
@@ -36513,7 +39550,14 @@ function foldFloatPair(a: Acc, v: Value): void {
   if (p === null) return;
   const y = percentileInputF64(p[0]);
   const x = percentileInputF64(p[1]);
-  const [n0, sx0, sxx0, sy0, syy0, sxy0] = a.pairF as [number, number, number, number, number, number];
+  const [n0, sx0, sxx0, sy0, syy0, sxy0] = a.pairF as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
   const n = n0 + 1;
   const sx = sx0 + x;
   const sy = sy0 + y;
@@ -36770,7 +39814,9 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
         if (a.cur === null) a.cur = v;
         else {
           const c = (a.cur as { int: bigint }).int;
-          a.cur = intValue(a.plan === "bitAnd" ? c & v.int : a.plan === "bitOr" ? c | v.int : c ^ v.int);
+          a.cur = intValue(
+            a.plan === "bitAnd" ? c & v.int : a.plan === "bitOr" ? c | v.int : c ^ v.int,
+          );
         }
       }
       break;
@@ -37309,9 +40355,20 @@ export function aggOrderTuple(
   env: EvalEnv,
   meter: Meter,
 ): Value[] {
+  return runSync(aggOrderTupleSteps(order, value, row, env, meter));
+}
+
+export function* aggOrderTupleSteps(
+  order: AggOrder,
+  value: Value,
+  row: Row,
+  env: EvalEnv,
+  meter: Meter,
+): Steps<Value[]> {
   const tuple: Value[] = [];
   for (let i = 0; i < order.keys.length; i++) {
-    let kv = evalExpr(order.keys[i]!, row, env, meter);
+    if (shouldCooperate()) yield COOPERATE;
+    let kv = yield* evalExprSteps(order.keys[i]!, row, env, meter);
     const coll = order.sorts[i]!.collation;
     if (coll !== null && (kv.kind === "text" || kv.kind === "array")) {
       kv = byteaValue(collatedSortKey(coll, kv)!);
@@ -37837,11 +40894,23 @@ export function evalChecks(
   env: EvalEnv,
   meter: Meter,
 ): void {
+  return runSync(evalChecksSteps(checks, relation, row, env, meter));
+}
+
+export function* evalChecksSteps(
+  checks: NamedCheck[],
+  relation: string,
+  row: Row,
+  env: EvalEnv,
+  meter: Meter,
+): Steps<void> {
   for (const c of checks) {
-    const v = evalExpr(c.node, row, env, meter);
+    if (shouldCooperate()) yield COOPERATE;
+
+    const v = yield* evalExprSteps(c.node, row, env, meter);
     if (v.kind === "bool" && !v.value) {
       throw checkViolation(relation, c.name).withDetail(
-        failingRowDetail(env.exec.session, relation, row),
+        yield* failingRowDetailSteps(env.exec.session, relation, row),
       );
     }
   }
@@ -37851,10 +40920,21 @@ export function evalChecks(
 // table first: each WHERE is a filter, so FALSE or NULL fails with 44000 naming the view. Metered
 // expression work.
 export function evalViewChecks(checks: ViewCheck[], row: Row, env: EvalEnv, meter: Meter): void {
+  return runSync(evalViewChecksSteps(checks, row, env, meter));
+}
+
+export function* evalViewChecksSteps(
+  checks: ViewCheck[],
+  row: Row,
+  env: EvalEnv,
+  meter: Meter,
+): Steps<void> {
   if (checks.length === 0) return;
   meter.guard();
   for (const c of checks) {
-    if (!evalFilter(c.check, row, env, meter)) throw checkOptionViolation(c.view);
+    if (shouldCooperate()) yield COOPERATE;
+
+    if (!(yield* evalFilterSteps(c.check, row, env, meter))) throw checkOptionViolation(c.view);
   }
 }
 
@@ -38714,7 +41794,10 @@ export function resolveOrderedSetAggregate(
     const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const rf = resolve(scope, e.filter, null, fsub, params);
     if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
-      throw positionedAt(typeError("argument of FILTER must be type boolean"), exprLocation(e.filter));
+      throw positionedAt(
+        typeError("argument of FILTER must be type boolean"),
+        exprLocation(e.filter),
+      );
     }
     filter = rf.node;
   }
@@ -39135,7 +42218,11 @@ export function resolveWindowCall(
     } else if (e.args.length >= 2) {
       // A multi-argument aggregate's arguments travel as one Row operand (aggregates.md §23).
       const r = resolveAggArgs(scope, lname, e.args, sub, params);
-      [aggPlan, result, aggFloatWidth, aggJsonFlags] = aggregatePlan(lname, r.desc.result, r.tys[0]!);
+      [aggPlan, result, aggFloatWidth, aggJsonFlags] = aggregatePlan(
+        lname,
+        r.desc.result,
+        r.tys[0]!,
+      );
       wargs.push({ kind: "row", fields: r.nodes });
     } else {
       // One operand, resolved in a fresh Forbidden sub-context (no aggregate/window nesting in a
@@ -39580,8 +42667,7 @@ export function argFamily(t: ResolvedType): string | null {
 export function familyMatches(slot: string, t: ResolvedType): boolean {
   // The pseudo-family of the two-argument statistical aggregates (aggregates.md §23): any integer,
   // decimal, or float argument, widened to f64.
-  if (slot === "numeric")
-    return t.kind === "int" || t.kind === "decimal" || t.kind === "float";
+  if (slot === "numeric") return t.kind === "int" || t.kind === "decimal" || t.kind === "float";
   return slot === "any" || argFamily(t) === slot;
 }
 
@@ -39652,7 +42738,7 @@ export function selectUnknownOverload(
       o.name === name &&
       o.argFamilies.length === tys.length &&
       o.argFamilies.every((slot, i) =>
-        literal(i) ? LITERAL_FAMILIES.has(slot) : unknown(i) || familyMatches(slot, tys[i]!)
+        literal(i) ? LITERAL_FAMILIES.has(slot) : unknown(i) || familyMatches(slot, tys[i]!),
       ),
   );
   if (candidates.length <= 1) return candidates[0];
@@ -39667,7 +42753,7 @@ export function selectUnknownOverload(
     else throw ambiguousFuncOverload(name);
   }
   const kept = candidates.filter((o) =>
-    picked.every((p, i) => p === null || o.argFamilies[i] === p)
+    picked.every((p, i) => p === null || o.argFamilies[i] === p),
   );
   if (kept.length !== 1) throw ambiguousFuncOverload(name);
   return kept[0];
@@ -39878,7 +42964,8 @@ export function aggregatePlan(
     return code === "f64"
       ? [moment[1], { kind: "float", ty: "f64" }, undefined]
       : [moment[0], { kind: "decimal" }, undefined];
-  if (surface === "string_agg" && code === "text") return ["stringAgg", { kind: "text" }, undefined];
+  if (surface === "string_agg" && code === "text")
+    return ["stringAgg", { kind: "text" }, undefined];
   if (surface === "string_agg" && code === "bytea")
     return ["stringAgg", { kind: "bytea" }, undefined];
   if (surface === "array_agg" && code === "array_of_input")
@@ -40167,7 +43254,10 @@ export function resolveFuncCall(
     if (anyFloat) {
       // A numeric literal beside a float operand adapts to f64 (functions.md §9.2).
       for (let i = 0; i < 3; i++) {
-        if ((tys[i]!.kind === "int" || tys[i]!.kind === "decimal") && isNumericLiteral(e.args[i]!)) {
+        if (
+          (tys[i]!.kind === "int" || tys[i]!.kind === "decimal") &&
+          isNumericLiteral(e.args[i]!)
+        ) {
           const r = floatLiteral(scope, e.args[i]!, ag, params);
           rargs[i] = r.node;
           tys[i] = r.type;
@@ -40636,7 +43726,11 @@ export function resolveScalarFunc(
   }
   // The regex overload substring(text, text) (regex.md §8e) runs on the regexFunc node, which owns
   // pattern precompilation and the regex cost units.
-  if ((name as string) === "substring" && desc.argFamilies.length === 2 && desc.argFamilies[1] === "text") {
+  if (
+    (name as string) === "substring" &&
+    desc.argFamilies.length === 2 &&
+    desc.argFamilies[1] === "text"
+  ) {
     return regexFuncNode(scope, "substring", -1, rargs, params);
   }
   // Eval-kernel aliases that share a backing kernel id: `power(x, y)` is PG's name for jed's pow (the
@@ -40668,8 +43762,10 @@ export function resolveScalarFunc(
     // in EEEE, so the integer width picks the kernel path (formatting.md §6).
     argWidth = tys[0]!.ty;
   }
-  const epoch = name === "date_part" &&
-    rargs[0]?.kind === "constText" && rargs[0].value.toLowerCase() === "epoch";
+  const epoch =
+    name === "date_part" &&
+    rargs[0]?.kind === "constText" &&
+    rargs[0].value.toLowerCase() === "epoch";
   params.nonimmutable ||= desc.volatility !== "immutable" && !epoch;
   const result = scalarResultType(desc.result, tys);
   // A float function that computes at f64 takes its f32 arguments through the implicit f32 → f64
@@ -41220,7 +44316,8 @@ function resolveArrayTextFunc(
   e.args.forEach((a, i) => {
     if (i === 0 && toString) {
       // An untyped operand (a bare string literal or $N) cannot bind the polymorphic type.
-      if ((a.kind === "literal" && a.literal.kind === "text") || a.kind === "param") throw untyped();
+      if ((a.kind === "literal" && a.literal.kind === "text") || a.kind === "param")
+        throw untyped();
       const r = resolve(scope, a, null, ag, params);
       if (r.type.kind === "null") throw untyped();
       if (r.type.kind !== "array") throw noFuncOverload(name);
@@ -41754,7 +44851,8 @@ function packedStateBytes(accs: Acc[]): number {
         break;
       case "arrayAggArray":
         // [bool seen, int ndim, (int length, int lower bound) per dimension of the first input].
-        n += (2 + 2 * (a.cur === null ? 0 : (a.cur as { dims: number[] }).dims.length)) * MEMORY_VALUE;
+        n +=
+          (2 + 2 * (a.cur === null ? 0 : (a.cur as { dims: number[] }).dims.length)) * MEMORY_VALUE;
         break;
       default:
         break;
@@ -41825,7 +44923,7 @@ function foldBlockingCollection(
 // finalizeBlockingCollection finalizes one aggregate of a bounded-lane group from its retained inputs.
 // Its sorters, spools, and dedup set are charged to `acct` while resident and released when the
 // aggregate is finalized (memory.md §6.4/§6.6).
-function finalizeBlockingCollection(
+function* finalizeBlockingCollectionSteps(
   a: Acc,
   spec: AggSpec,
   key: string,
@@ -41836,7 +44934,7 @@ function finalizeBlockingCollection(
   sink: SpillSink,
   acct: QueryAccount,
   meter: Meter,
-): Value {
+): Steps<Value> {
   // An in-aggregate ORDER BY (aggregates.md §22): stable-sort the spooled [keys…, argument] tuples
   // by the keys (collated keys were spooled as sort-key bytes), fold the arguments in that order into
   // the plan's own accumulator — spooling its retained input into a fresh collection exactly as the
@@ -41860,16 +44958,20 @@ function finalizeBlockingCollection(
     const folded = new SpillMultiMap(budget, sink, new StateCharge(acct));
     const unique = new SpillMap(budget, sink, new StateCharge(acct));
     try {
-      for (const row of collections.get(key)) sorter.push(row);
+      for (const row of collections.get(key)) {
+        if (shouldCooperate()) yield COOPERATE;
+        sorter.push(row);
+      }
       sorted = sorter.finishSpool();
       const inner = newAccFromSpecUnordered(spec, env.exec.session.timeZone);
       for (const row of sorted) {
+        if (shouldCooperate()) yield COOPERATE;
         meter.guard();
         const value = row[row.length - 1]!;
         if (!foldBlockingCollection(inner, spec, value, "", folded, unique, meter))
           foldAcc(inner, value, meter);
       }
-      return finalizeBlockingCollection(
+      return yield* finalizeBlockingCollectionSteps(
         inner,
         spec,
         "",
@@ -41890,9 +44992,11 @@ function finalizeBlockingCollection(
   }
   if (spec.hypo != null) {
     const hp = spec.hypo;
-    const hyp = hp.args.map((arg) =>
-      evalExpr(arg, synthetic, env, env.exec.session.scratchMeter()),
-    );
+    const hyp: Value[] = [];
+    for (const arg of hp.args) {
+      if (shouldCooperate()) yield COOPERATE;
+      hyp.push(yield* evalExprSteps(arg, synthetic, env, env.exec.session.scratchMeter()));
+    }
     let count = 0;
     let before = 0;
     let le = 0;
@@ -41900,6 +45004,7 @@ function finalizeBlockingCollection(
     const seen = new SpillMap(budget, sink, new StateCharge(acct));
     try {
       for (const tuple of collections.get(key)) {
+        if (shouldCooperate()) yield COOPERATE;
         count++;
         const cmp = hypoCmp(tuple, hyp, hp.sorts);
         if (cmp < 0) {
@@ -41928,13 +45033,19 @@ function finalizeBlockingCollection(
   if (a.plan === "stringAgg") {
     if (!a.seen) return nullValue();
     const rows: Value[][] = [];
-    for (const row of collections.get(key)) rows.push(row);
+    for (const row of collections.get(key)) {
+      if (shouldCooperate()) yield COOPERATE;
+      rows.push(row);
+    }
     return finalizeStringAgg(rows);
   }
   if (a.plan === "arrayAgg" || a.plan === "arrayAggArray") {
     if (!a.seen) return nullValue();
     const elems: Value[] = [];
-    for (const row of collections.get(key)) elems.push(row[0]!);
+    for (const row of collections.get(key)) {
+      if (shouldCooperate()) yield COOPERATE;
+      elems.push(row[0]!);
+    }
     return finalizeArrayAgg(a.plan, elems);
   }
   if (a.plan === "jsonAgg") {
@@ -41943,7 +45054,10 @@ function finalizeBlockingCollection(
       const breaks = jsonAggBreaksLine(a.jsonTypes[0]!);
       const parts: string[] = ["["];
       let i = 0;
-      for (const row of collections.get(key)) pushJsonAggElem(parts, i++, row[0]!, breaks);
+      for (const row of collections.get(key)) {
+        if (shouldCooperate()) yield COOPERATE;
+        pushJsonAggElem(parts, i++, row[0]!, breaks);
+      }
       parts.push("]");
       const output = parts.join("");
       // The aggregate nests each input one level (json.md §6.4).
@@ -41951,7 +45065,10 @@ function finalizeBlockingCollection(
       return jsonValue(output);
     }
     const elements: JsonNode[] = [];
-    for (const row of collections.get(key)) elements.push((row[0]! as { node: JsonNode }).node);
+    for (const row of collections.get(key)) {
+      if (shouldCooperate()) yield COOPERATE;
+      elements.push((row[0]! as { node: JsonNode }).node);
+    }
     const out: JsonNode = { kind: "array", elements };
     jsonCheckDepth(out);
     return jsonbValue(out);
@@ -41962,6 +45079,7 @@ function finalizeBlockingCollection(
       const parts: string[] = ["{ "];
       let i = 0;
       for (const pair of collections.get(key)) {
+        if (shouldCooperate()) yield COOPERATE;
         pushJsonObjectAggPair(parts, i++, (pair[0]! as { text: string }).text, pair[1]!);
       }
       parts.push(" }");
@@ -41984,12 +45102,14 @@ function finalizeBlockingCollection(
     try {
       // The values were converted as they were folded, in input order.
       for (const pair of collections.get(key)) {
+        if (shouldCooperate()) yield COOPERATE;
         const name = (pair[0]! as { text: string }).text;
         sorter.push([intValue(BigInt(utf8Length(name))), pair[0]!, pair[1]!]);
       }
       sorted = sorter.finishSpool();
       const members: JsonMember[] = [];
       for (const row of sorted) {
+        if (shouldCooperate()) yield COOPERATE;
         const member = {
           key: (row[1]! as { text: string }).text,
           value: (row[2]! as { node: JsonNode }).node,
@@ -42013,14 +45133,17 @@ function finalizeBlockingCollection(
   )
     return finalizeAcc(a);
   if (spec.osaFrac != null)
-    a.osaFrac = evalExpr(spec.osaFrac, synthetic, env, env.exec.session.scratchMeter());
+    a.osaFrac = yield* evalExprSteps(spec.osaFrac, synthetic, env, env.exec.session.scratchMeter());
   // The WITHIN GROUP sort; a collated key carries its sort-key bytes appended.
   const sorter = new SpoolSorter(
     (x, y) =>
       dirCmp(
         a.osaCollation == null
           ? valueCmp(x[0]!, y[0]!)
-          : cmpBytes((x[1]! as { bytes: Uint8Array }).bytes, (y[1]! as { bytes: Uint8Array }).bytes),
+          : cmpBytes(
+              (x[1]! as { bytes: Uint8Array }).bytes,
+              (y[1]! as { bytes: Uint8Array }).bytes,
+            ),
         a.osaDesc === true,
       ),
     budget,
@@ -42031,11 +45154,10 @@ function finalizeBlockingCollection(
   let ordered: RowSpool | null = null;
   try {
     for (const row of collections.get(key)) {
+      if (shouldCooperate()) yield COOPERATE;
       const value = row[0]!;
       sorter.push(
-        a.osaCollation == null
-          ? row
-          : [value, byteaValue(collatedSortKey(a.osaCollation, value)!)],
+        a.osaCollation == null ? row : [value, byteaValue(collatedSortKey(a.osaCollation, value)!)],
       );
     }
     sorted = sorter.finishSpool();
@@ -42045,6 +45167,7 @@ function finalizeBlockingCollection(
       let bestCount = 0;
       let runCount = 0;
       for (const row of sorted) {
+        if (shouldCooperate()) yield COOPERATE;
         if (runCount > 0 && valueCmp(run, row[0]!) === 0) runCount++;
         else {
           run = row[0]!;
@@ -42060,7 +45183,10 @@ function finalizeBlockingCollection(
     // The percentiles read their sorted input by position from a spool (charged while resident).
     const input = new RowSpool(budget, sink, new StateCharge(acct));
     ordered = input;
-    for (const row of sorted) input.push(row);
+    for (const row of sorted) {
+      if (shouldCooperate()) yield COOPERATE;
+      input.push(row);
+    }
     const n = input.length;
     const at = (ordinal: number): Value => {
       let index = 0;
@@ -42099,7 +45225,11 @@ function finalizeBlockingCollection(
 // caller reports it.
 // collectAssignmentDefaultPrivs adds the named functions of the column defaults an assignment list
 // selects with SET c = DEFAULT.
-function collectAssignmentDefaultPrivs(table: Table, assignments: Assignment[], req: PrivReq): void {
+function collectAssignmentDefaultPrivs(
+  table: Table,
+  assignments: Assignment[],
+  req: PrivReq,
+): void {
   const locals = new Set<string>();
   for (const assignment of assignments) {
     if (!assignment.isDefault) continue;
@@ -42243,7 +45373,9 @@ function checkColdefNames(defs: TypeFieldDef[]): void {
 // elements.
 function recordFieldFits(field: Type, decl: Type): boolean {
   if (field.kind === "array" || decl.kind === "array") {
-    return field.kind === "array" && decl.kind === "array" && recordFieldFits(field.elem, decl.elem);
+    return (
+      field.kind === "array" && decl.kind === "array" && recordFieldFits(field.elem, decl.elem)
+    );
   }
   if (field.kind === "range" || decl.kind === "range") {
     return (
@@ -42258,9 +45390,7 @@ function recordFieldFits(field: Type, decl: Type): boolean {
     return field.kind === "composite" && decl.kind === "composite" && field.name === decl.name;
   }
   if (field.kind !== "scalar" || decl.kind !== "scalar") return false;
-  return (
-    field.scalar === decl.scalar || (isInteger(field.scalar) && isInteger(decl.scalar))
-  );
+  return field.scalar === decl.scalar || (isInteger(field.scalar) && isInteger(decl.scalar));
 }
 
 // checkRecordFieldValue range-checks one record field value against its declared column type: an

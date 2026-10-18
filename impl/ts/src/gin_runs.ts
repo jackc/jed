@@ -9,6 +9,7 @@
 // every core.
 
 import { engineError } from "./errors.ts";
+import { COOPERATE, shouldCooperate, runSync, type Steps } from "./execution.ts";
 import { compareBytes, type KeyBound } from "./pmap.ts";
 import type { TableStore } from "./storage.ts";
 
@@ -165,28 +166,32 @@ export function ginRunAtOrAfter(
   term: Uint8Array,
   key: Uint8Array,
 ): Uint8Array | null {
+  return runSync(ginRunAtOrAfterSteps(store, term, key));
+}
+
+export function* ginRunAtOrAfterSteps(
+  store: TableStore,
+  term: Uint8Array,
+  key: Uint8Array,
+): Steps<Uint8Array | null> {
   const b = { ...ginTermBound(term), lo: concat(term, key) };
-  let found: Uint8Array | null = null;
-  store.scanRange(b, (k) => {
-    found = k.slice();
-    return false;
-  });
-  return found;
+  const first = yield* store.scanStepsIter(b, false).nextSteps();
+  return first.done ? null : first.value[0].slice();
 }
 
-function runBefore(store: TableStore, term: Uint8Array, key: Uint8Array): Uint8Array | null {
+function* runBeforeSteps(
+  store: TableStore,
+  term: Uint8Array,
+  key: Uint8Array,
+): Steps<Uint8Array | null> {
   const b = { ...ginTermBound(term), hi: concat(term, key) };
-  let found: Uint8Array | null = null;
-  store.scanRangeRev(b, (k) => {
-    found = k.slice();
-    return false;
-  });
-  return found;
+  const first = yield* store.scanStepsIter(b, true).nextSteps();
+  return first.done ? null : first.value[0].slice();
 }
 
-function replaceRun(store: TableStore, old: Uint8Array, runs: Uint8Array[]): void {
-  store.remove(old);
-  for (const r of runs) store.insert(r, []);
+function* replaceRunSteps(store: TableStore, old: Uint8Array, runs: Uint8Array[]): Steps<void> {
+  yield* store.removeSteps(old);
+  for (const r of runs) yield* store.insertSteps(r, []);
 }
 
 function searchKeys(keys: Uint8Array[], key: Uint8Array): { at: number; found: boolean } {
@@ -205,7 +210,15 @@ function searchKeys(keys: Uint8Array[], key: Uint8Array): { at: number; found: b
 // run joins the term's last run when that run stays within the limit, else starts a new run. false
 // when the posting is already present.
 export function ginInsert(store: TableStore, term: Uint8Array, key: Uint8Array): boolean {
-  const run = ginRunAtOrAfter(store, term, key);
+  return runSync(ginInsertSteps(store, term, key));
+}
+
+export function* ginInsertSteps(
+  store: TableStore,
+  term: Uint8Array,
+  key: Uint8Array,
+): Steps<boolean> {
+  const run = yield* ginRunAtOrAfterSteps(store, term, key);
   if (run !== null) {
     const keys = ginDecodeRun(term.length, run);
     const { at, found } = searchKeys(keys, key);
@@ -213,26 +226,34 @@ export function ginInsert(store: TableStore, term: Uint8Array, key: Uint8Array):
     keys.splice(at, 0, key.slice());
     const runs: Uint8Array[] = [];
     splitRuns(term, keys, runs);
-    replaceRun(store, run, runs);
+    yield* replaceRunSteps(store, run, runs);
     return true;
   }
-  const prev = runBefore(store, term, key);
+  const prev = yield* runBeforeSteps(store, term, key);
   if (prev !== null) {
     const keys = ginDecodeRun(term.length, prev);
     keys.push(key.slice());
     const grown = ginEncodeRun(term, keys);
     if (grown.length <= GIN_RUN_MAX_BYTES) {
-      replaceRun(store, prev, [grown]);
+      yield* replaceRunSteps(store, prev, [grown]);
       return true;
     }
   }
-  return store.insert(ginEncodeRun(term, [key.slice()]), []);
+  return yield* store.insertSteps(ginEncodeRun(term, [key.slice()]), []);
 }
 
 // ginRemove removes the posting (term, key) (gin.md §4.5): its run loses the key, and an emptied run is
 // removed. false when the posting is absent.
 export function ginRemove(store: TableStore, term: Uint8Array, key: Uint8Array): boolean {
-  const run = ginRunAtOrAfter(store, term, key);
+  return runSync(ginRemoveSteps(store, term, key));
+}
+
+export function* ginRemoveSteps(
+  store: TableStore,
+  term: Uint8Array,
+  key: Uint8Array,
+): Steps<boolean> {
+  const run = yield* ginRunAtOrAfterSteps(store, term, key);
   if (run === null) return false;
   const keys = ginDecodeRun(term.length, run);
   const { at, found } = searchKeys(keys, key);
@@ -240,7 +261,7 @@ export function ginRemove(store: TableStore, term: Uint8Array, key: Uint8Array):
   keys.splice(at, 1);
   const runs: Uint8Array[] = [];
   if (keys.length > 0) splitRuns(term, keys, runs);
-  replaceRun(store, run, runs);
+  yield* replaceRunSteps(store, run, runs);
   return true;
 }
 
@@ -256,11 +277,20 @@ export function indexEntryInsert(
   entry: Uint8Array,
   skeyLen: number,
 ): boolean {
+  return runSync(indexEntryInsertSteps(istore, kind, entry, skeyLen));
+}
+
+export function* indexEntryInsertSteps(
+  istore: TableStore,
+  kind: string,
+  entry: Uint8Array,
+  skeyLen: number,
+): Steps<boolean> {
   if (kind === "gin") {
     const split = entry.length - skeyLen;
-    return ginInsert(istore, entry.subarray(0, split), entry.subarray(split));
+    return yield* ginInsertSteps(istore, entry.subarray(0, split), entry.subarray(split));
   }
-  return istore.insert(entry, []);
+  return yield* istore.insertSteps(entry, []);
 }
 
 // indexEntryRemove removes one logical index entry (see indexEntryInsert). false when it is absent.
@@ -270,11 +300,20 @@ export function indexEntryRemove(
   entry: Uint8Array,
   skeyLen: number,
 ): boolean {
+  return runSync(indexEntryRemoveSteps(istore, kind, entry, skeyLen));
+}
+
+export function* indexEntryRemoveSteps(
+  istore: TableStore,
+  kind: string,
+  entry: Uint8Array,
+  skeyLen: number,
+): Steps<boolean> {
   if (kind === "gin") {
     const split = entry.length - skeyLen;
-    return ginRemove(istore, entry.subarray(0, split), entry.subarray(split));
+    return yield* ginRemoveSteps(istore, entry.subarray(0, split), entry.subarray(split));
   }
-  return istore.remove(entry);
+  return yield* istore.removeSteps(entry);
 }
 
 // sortIndexEntries sorts entries by key (then storage-key length), the build order.
@@ -287,14 +326,26 @@ export function sortIndexEntries(entries: IndexEntry[]): void {
 // posting runs (gin.md §4.5). Every insert is a right-edge append, so the built tree's shape is a
 // function of the entry set — part of the byte contract.
 export function indexBuildInsert(istore: TableStore, kind: string, entries: IndexEntry[]): void {
+  return runSync(indexBuildInsertSteps(istore, kind, entries));
+}
+
+export function* indexBuildInsertSteps(
+  istore: TableStore,
+  kind: string,
+  entries: IndexEntry[],
+): Steps<void> {
   const dup = () =>
     engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
   if (kind !== "gin") {
-    for (const e of entries) if (!istore.insert(e.key, [])) throw dup();
+    for (const e of entries) {
+      if (shouldCooperate()) yield COOPERATE;
+      if (!(yield* istore.insertSteps(e.key, []))) throw dup();
+    }
     return;
   }
   let i = 0;
   while (i < entries.length) {
+    if (shouldCooperate()) yield COOPERATE;
     const first = entries[i]!;
     const term = first.key.subarray(0, first.key.length - first.skeyLen);
     const keys: Uint8Array[] = [];
@@ -305,7 +356,8 @@ export function indexBuildInsert(istore: TableStore, kind: string, entries: Inde
       if (compareBytes(e.key.subarray(0, split), term) !== 0) break;
       keys.push(e.key.subarray(split));
     }
-    for (const run of ginPackRuns(term, keys)) if (!istore.insert(run, [])) throw dup();
+    for (const run of ginPackRuns(term, keys))
+      if (!(yield* istore.insertSteps(run, []))) throw dup();
     i = j;
   }
 }

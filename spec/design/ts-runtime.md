@@ -2,10 +2,11 @@
 
 > **Async API and worker runtime implemented.** The package entry points now use the
 > independent TS core in dedicated Node/browser workers. Lifecycle, typed transport, scheduling,
-> batching, cleanup and shared-flag cancellation are specified in §10. The synchronous core
-> remains internal for conformance and host tooling. Cooperative interruption of blocking kernels
-> without shared memory and asynchronous page/crypto suspension remain follow-on work; the
-> implementation does not claim those acceptance gates are met. No production encryption
+> batching, cleanup and cancellation are specified in §10. Retained continuations now allow
+> asynchronous data-page reads and cooperative cancellation at logical page boundaries and common
+> execution loops without shared memory. The synchronous core remains internal for conformance
+> and host tooling and drives the same algorithms. Cancellation is best effort; storage lifecycle,
+> commit and crypto still use synchronous boundaries. No production encryption
 > dependency, encrypted format, Rust delivery default or parallel-reader pool is selected.
 > See [cores.md](cores.md), [api.md](api.md), [hosts.md](hosts.md) and
 > [encryption.md](encryption.md) for the surrounding contracts.
@@ -163,17 +164,25 @@ then releases storage/worker resources. Shutdown policy and transport error name
 Map public `AbortSignal` to operation cancellation. A cancel message cannot interrupt a worker
 that is busy executing synchronous JavaScript. Two mechanisms are available:
 
-- A shared atomic flag written by the caller and polled at bounded engine checkpoints. This
-  needs a new meter/checkpoint hook; the current entry-only check is insufficient.
+- A shared atomic flag written by the caller and polled at the existing engine checkpoints.
 - Cooperative execution that retains its continuation and yields periodically to the worker
   event loop, allowing cancellation messages and control requests to run. A chain of already
   resolved promises is not a reliable task-queue yield.
 
-Propose cooperative scheduling as the browser baseline, with atomic cancellation where shared
-memory is supported and permitted. Do not make cross-origin isolation a silent prerequisite
-for the ordinary browser package. The feature matrix must specify both paths and their tested
-cancellation latency. Page/crypto awaits alone cannot bound latency for an entirely resident
-CPU-heavy query; parser/planner and long scalar kernels also need bounded checkpoints.
+Cooperative scheduling at page boundaries and common execution loops is the browser baseline,
+with atomic cancellation where shared memory is supported and permitted. A logical page boundary
+includes cached and resident leaves: a warm scan must periodically yield even when it performs no
+device I/O. Generated rows, recursive iterations and common join/group loops use the same
+suspension mechanism. Do not make cross-origin isolation a silent prerequisite for the ordinary
+browser package.
+
+Cancellation is **best effort**, with no guaranteed maximum latency. Sorting, parsing/planning,
+and long scalar kernels remain synchronous; a cancel message may wait for such a phase to finish.
+Do not replace those algorithms merely to provide more pause points. Measure actual delays before
+extending cooperative coverage. Cost/resource limits remain independent of cancellation, and
+host extensions remain outside the built-in guarantees. Execution already lives in a dedicated
+worker so a long kernel does not block the application thread; terminating that worker is still
+a crash, with the storage recovery and uncertain-outcome rules below.
 
 Cancellation must preserve the existing statement/transaction error rules. During commit, do
 not interrupt an irreversible storage sequence and report a clean rollback: define the last
@@ -184,11 +193,16 @@ stop at different prefixes, as with existing native cancellation.
 
 ## 7. Internal suspension and encrypted pages
 
-Keep expression evaluation and resident row/page work synchronous between explicit checkpoints.
-Prototype a resumable execution contract at cache misses, page-service waits, bounded CPU
-quanta and commit crypto. Possible representations include explicit continuations or a step
-driver; select one after inspecting pager/tree/lazy-decode call sites. Avoid a promise per row
-or expression and avoid maintaining duplicate sync/async operator implementations.
+Keep scalar kernels and resident work synchronous between explicit checkpoints. Represent
+suspendable execution with retained generators that yield page I/O or a scheduling checkpoint.
+Synchronous internal APIs and the async runtime drive the same authored execution path; expression
+traversal must propagate a lazy-value page fault or subquery suspension even though its scalar
+kernels stay synchronous. Avoid a promise per row or expression and avoid maintaining duplicate
+sync/async operator implementations. Re-enter operation-local cancellation and planning scopes
+for each resume; never leave a synchronous dynamic scope installed across an await. Recursive
+query delegation uses the driver's continuation stack so the existing nesting/stack limits hold.
+The first driver serializes
+engine operations across suspension while still receiving cancellation and queueing controls.
 
 Resume each operation exactly once. Never recover from a cache miss by rerunning SQL: that
 could repeat entropy, host-function effects, cost or staged writes. Do not preload the whole
@@ -262,9 +276,16 @@ execution had medians of 5.61/24.11 µs and a 100-statement batch 547/1,060 µs.
 aggregate blocked the direct caller's timer for about 90 ms, while the worker caller's largest
 gap was 2.28 ms. These are warm in-memory observations, not file/browser or ARM conclusions.
 
+The [continuation follow-up](../../bench/ts/results/2026-10-18-continuations/report.md)
+measures the added scheduling machinery on the same host. Worker prepared-call medians were
+27.69 µs and 100-statement batches 1,562.63 µs (about 15% and 47% above the initial bridge run).
+The worker aggregate kept the application's largest timer gap at 2.62 ms. The retained-generator
+path has measurable execution overhead; these separate warm runs do not isolate individual
+changes or establish cancellation latency for synchronous kernels.
+
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
-admission errors and Node extension registration. Remaining decisions include cooperative
-continuation representation and checkpoint frequency, async page/crypto providers, worker pools,
+admission errors, retained continuations and Node extension registration. Remaining decisions
+include async storage lifecycle/commit and crypto providers, worker pools,
 broader platform measurements and optional engine-package defaults. A public synchronous
 application interface would still need a concrete use case and evidence.
 
@@ -337,9 +358,26 @@ sessions, including the owner releasing its gate, without retrying executed SQL.
 waits honor session lock timeout and cancellation. Each batch statement and fetch is an
 event-loop task turn. This provides inter-operation scheduling, not CPU-parallel reads.
 File page-service waits remain inside the execution worker and preserve owner-only reuse.
+Within an operation, the shared generator driver retains execution state across data-page reads
+and periodically yields a real task turn for cached/resident page access, row generation,
+recursive queries and common scan/join/group loops. The initial physical quantum is 256
+checkpoint visits; it is not a SQL cost unit or a latency guarantee. Control messages can mark
+the active operation canceled, but another engine operation cannot run until it completes or
+unwinds. Session scopes, writer ownership and cursor pins therefore remain valid across awaits.
 
-`close` stops ordinary admission, rejects queued operations, completes an already running
-operation/open, closes cursors/statements, rolls back open transactions, and closes storage
+The page seam has an optional asynchronous byte read. Node file reads use it; a host exposing
+only synchronous reads (including OPFS sync handles) receives a task yield before the read.
+Cache insertion happens only after a successful resume, with invalidation guarding suspended
+loads. Expression traversal propagates lazy overflow reads and subquery suspension without
+replaying expressions or host calls. Open/recovery, DDL/statistics maintenance, spill device I/O,
+commit serialization/writes,
+and page-service coordination still have synchronous paths inside the execution worker. This
+slice does not yet make an async-only byte device or WebCrypto provider sufficient for every
+storage operation.
+
+`close` stops ordinary admission, rejects queued operations, requests cancellation of an active
+operation and waits for its cleanup (or completion past the commit boundary), completes an active
+open, closes cursors/statements, rolls back open transactions, and closes storage
 before terminating the worker. Close is idempotent. Session close follows the same policy
 within that session. A worker error, undecodable reply or unexpected Node worker exit
 rejects outstanding operations and invalidates all handles with `WORKER_FAILED` and
@@ -353,11 +391,12 @@ browsers where available. Parser/resolver and meter checkpoints poll it during s
 work without changing cost. Cancellation uses `57014` and preserves failed-block semantics.
 The last safe commit checkpoint precedes storage/publication; once that boundary passes,
 commit completes and reports its real outcome even if the signal changes. Worker termination
-is never ordinary cancellation. A browser without shared memory still works and processes
-cancellation between operations/fetches. **Its synchronous resident query, blocking operator,
-or long scalar kernel cannot currently be interrupted by a cancel message.** Full cooperative
-continuations, bounded latency across every kernel, async cache faults and WebCrypto commits
-remain unimplemented. No SQL replay or whole-file preload substitutes for those features.
+is never ordinary cancellation. A browser without shared memory processes cancellation at the
+same cooperative page and execution-loop boundaries, including resident scans. Sorting,
+parsing/planning and long scalar kernels remain synchronous: **cancellation has no guaranteed
+maximum latency**. Further pause points require evidence of a material delay. Async-only storage
+lifecycle and WebCrypto commits remain unimplemented. No SQL replay or whole-file preload
+substitutes for those features.
 
 Data-only Unicode/time-zone bundles can be provided at open. Node additionally accepts a
 trusted `extensionModule` file URL exporting `configure(EnvironmentBuilder)`; it loads and

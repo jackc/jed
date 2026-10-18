@@ -12,10 +12,12 @@
 // A probe plan that recorded nothing never consulted a value, so it is the custom plan for every
 // non-NULL binding (and for NULL ones too when no NULL test fired). Each plan→bind boundary plans in
 // a probe frame, binds, and plans again in a custom frame only when the probe was not value-blind.
-// The core is single-threaded and planning is synchronous, so the frames are one module-level stack,
-// strictly nested.
+// Planning is synchronous inside each continuation segment. The execution driver reinstalls that
+// continuation's frame stack on every resume, so suspended statements never expose their bound
+// parameters to unrelated work in the same realm.
 
 import type { ColType } from "./catalog.ts";
+import { runSync, type Steps } from "./execution.ts";
 import type { Value } from "./value.ts";
 import { render } from "./value.ts";
 
@@ -30,7 +32,22 @@ interface Frame {
   adopt: boolean;
 }
 
-const frames: Frame[] = [];
+export type PlanningFrames = Frame[];
+let frames: PlanningFrames = [];
+
+export function currentPlanningFrames(): PlanningFrames {
+  return frames;
+}
+
+export function withPlanningScope<T>(active: PlanningFrames, operation: () => T): T {
+  const previous = frames;
+  frames = active;
+  try {
+    return operation();
+  } finally {
+    frames = previous;
+  }
+}
 
 function top(): Frame | undefined {
   return frames[frames.length - 1];
@@ -147,6 +164,14 @@ export class Planning {
 }
 
 function withFrame<T>(bound: Value[], adopt: boolean, f: () => T): T {
+  // biome-ignore lint/correctness/useYield: A synchronous callback uses the same frame lifetime.
+  const steps = function* (): Steps<T> {
+    return f();
+  };
+  return runSync(withFrameSteps(bound, adopt, steps));
+}
+
+function* withFrameSteps<T>(bound: Value[], adopt: boolean, f: () => Steps<T>): Steps<T> {
   const frame: Frame = {
     custom: true,
     values: bound,
@@ -157,7 +182,7 @@ function withFrame<T>(bound: Value[], adopt: boolean, f: () => T): T {
   };
   frames.push(frame);
   try {
-    return f();
+    return yield* f();
   } finally {
     frames.pop();
   }
@@ -167,6 +192,10 @@ function withFrame<T>(bound: Value[], adopt: boolean, f: () => T): T {
 // Planning.begin adopts.
 export function restartPlanning<T>(bound: Value[], f: () => T): T {
   return withFrame(bound, true, f);
+}
+
+export function* restartPlanningSteps<T>(bound: Value[], f: () => Steps<T>): Steps<T> {
+  return yield* withFrameSteps(bound, true, f);
 }
 
 // withPlanValues runs f with the bound values visible to the estimator (planning after binding with

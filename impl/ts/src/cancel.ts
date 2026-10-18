@@ -22,13 +22,30 @@ export function hasCancellation(): boolean {
   return activeCheck !== undefined;
 }
 
+// A resumable driver captures its caller's polling scope, then reinstalls it only while one
+// synchronous continuation segment is running. The scope never remains installed across an await.
+export function currentCancellationCheck(): CancellationCheck | undefined {
+  return activeCheck;
+}
+
 // Installs a flag poll for all meters, including scratch meters created by scalar kernels.
 // Restoring in finally prevents cancellation leaking into another session or operation.
 export function withCancellation<T>(check: CancellationCheck | undefined, operation: () => T): T {
+  return withCancellationScope(check, () => {
+    cancellationCheckpoint();
+    return operation();
+  });
+}
+
+// Continuation drivers inject cancellation through Generator.throw so suspended finally blocks
+// run. Installing their poll must not throw before the continuation has resumed.
+export function withCancellationScope<T>(
+  check: CancellationCheck | undefined,
+  operation: () => T,
+): T {
   const previous = activeCheck;
   activeCheck = check;
   try {
-    cancellationCheckpoint();
     return operation();
   } finally {
     activeCheck = previous;
