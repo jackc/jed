@@ -212,7 +212,17 @@ export class Rows implements Iterable<Value[]> {
       // propagates, fire the block-poison hook once: a drain-time read fault inside an open block aborts
       // it, so the next statement is 25P02 rather than wrongly running (transactions.md §6).
       next(): IteratorResult<Value[]> {
-        return runSync(self.nextSteps());
+        // The source already drives its retained continuation synchronously. Pull it directly so
+        // resident/buffered rows avoid another driver plus two adapter generators per result row.
+        try {
+          const row = self.cursor.nextRow();
+          return row !== undefined
+            ? { done: false, value: row }
+            : { done: true, value: undefined as unknown as Value[] };
+        } catch (error) {
+          self.fireErr();
+          throw error;
+        }
       },
     };
   }

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { cancellationCheckpoint, hasCancellation, withCancellation } from "../src/cancel.ts";
 import { EngineError } from "../src/errors.ts";
+import { Planning, paramValue } from "../src/plan_params.ts";
+import { intValue } from "../src/value.ts";
 import {
   COOPERATE,
   callSteps,
@@ -112,6 +114,54 @@ test("cooperative resident loops admit cancellation without a shared flag", asyn
   );
   assert.equal(count, 3);
   assert.equal(cleaned, 1);
+});
+
+test("nested sync drains preserve planning and the async scheduling budget", async () => {
+  let tasks = 0;
+  function* inner(): Steps<number> {
+    assert.deepEqual(paramValue(0), intValue(1n));
+    const planning = Planning.begin();
+    planning.bind([intValue(2n)]);
+    try {
+      for (let i = 0; i < 100; i++) assert.equal(shouldCooperate(), false);
+      yield* ioSteps(() => {
+        assert.deepEqual(paramValue(0), intValue(2n));
+        assert.equal(shouldCooperate(), false);
+      });
+      return 7;
+    } finally {
+      planning.end();
+    }
+  }
+  function* outer(): Steps<number> {
+    const planning = Planning.begin();
+    planning.bind([intValue(1n)]);
+    try {
+      assert.equal(shouldCooperate(), false);
+      assert.equal(runSync(inner()), 7);
+      assert.deepEqual(paramValue(0), intValue(1n));
+      assert.equal(shouldCooperate(), true);
+      yield COOPERATE;
+      assert.deepEqual(paramValue(0), intValue(1n));
+      assert.equal(shouldCooperate(), false);
+      return 8;
+    } finally {
+      planning.end();
+    }
+  }
+  assert.equal(
+    await runAsync(outer(), {
+      quantum: 2,
+      schedule: (resume) => {
+        tasks++;
+        assert.equal(paramValue(0), null);
+        schedule(resume);
+      },
+    }),
+    8,
+  );
+  assert.equal(tasks, 1);
+  assert.equal(paramValue(0), null);
 });
 
 test("poll cancellation inside a segment and I/O failures unwind resources", async () => {
