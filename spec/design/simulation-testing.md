@@ -442,7 +442,11 @@ so its high-water must be exactly `max(P₀, w)`. Its shrink is deferred, so the
 instead when the engine next holds nothing pending (after the batch cap's flush or a clean close),
 against the newest generation's high-water. And after every step the file must be at least as long
 as the durable floor's `page_count`: while a batch is pending the floor is the one generation recovery
-is sure to find, and a shrink that cut its pages would leave it unusable.
+is sure to find, and a shrink that cut its pages would leave it unusable. A clean close (a `reopen`) flushes the
+batch, so when it leaves every byte of the file and its directory entry durable, the floor first
+becomes the published version before the file is held to it. A generation a recovered process
+adopted and never had to stabilize (it wrote nothing) may still be pending, and a database whose
+owner died may have lost what the runner last saw published; either keeps its floor.
 
 **Backups** (page-service.md §9) are checked at the step that takes them, as a new process would
 open the file: a failed backup leaves no destination; a successful one opens, its contents are a

@@ -285,6 +285,11 @@ impl SimFs {
         self.arena[id].barrier_ok
     }
 
+    /// Whether any write to file `id` is still pending, not yet covered by a barrier.
+    pub(crate) fn has_pending(&self, id: usize) -> bool {
+        !self.arena[id].pending.is_empty()
+    }
+
     /// Whether file `name`'s directory entry is durable: a power loss would keep the file a reader
     /// of that name sees now, not revert a pending create or rename (§6.1).
     pub(crate) fn entry_durable(&self, name: &str) -> bool {

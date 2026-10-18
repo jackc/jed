@@ -2090,6 +2090,24 @@ func (r *simRunner) stepCheck(i int) {
 	r.emit(`{"i":%d,"op":"check",%s%s}`, i, mainLine, simDbsJSON(entries))
 }
 
+// closeFlushed raises each database's floor to its published version after every process closed
+// cleanly under synchronous = off, when the close left every byte of the file and its directory entry
+// durable: a clean close flushes the batch (validated-cow.md §4). A generation a recovered process
+// adopted and never had to stabilize (it wrote nothing) may still be pending, and keeps its floor
+// (§8.2). So does a database whose owner died: what it published may be gone until a process observes
+// the database again.
+func (r *simRunner) closeFlushed() {
+	if !r.relaxed {
+		return
+	}
+	for _, d := range r.order() {
+		f := r.fs.files[d.file]
+		if f != nil && len(f.pending) == 0 && r.fs.entryDurable(d.file) && !d.ownerLost && d.version > d.floor {
+			d.floor = d.version
+		}
+	}
+}
+
 // stepReopen ends every session cleanly, closes the Database, and reopens it: the result must be
 // exactly the last committed version of every database.
 func (r *simRunner) stepReopen(i int) bool {
@@ -2099,7 +2117,9 @@ func (r *simRunner) stepReopen(i int) bool {
 			return false
 		}
 	}
-	// Close flushed every batch, so a shrink a relaxed commit deferred has happened.
+	// Close flushed every batch, so a shrink a relaxed commit deferred has happened, and the floor the
+	// file is held to is the version it flushed (validated-cow.md §4), not the one before it.
+	r.closeFlushed()
 	for _, d := range r.order() {
 		if !r.checkTruncated(i, d) {
 			return false
