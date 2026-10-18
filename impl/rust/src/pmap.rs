@@ -1071,19 +1071,21 @@ impl PMap {
     /// [`range_entries_counted`](PMap::range_entries_counted) (identical visited-node set → identical
     /// `page_read`), calling `visit(node, i)` per admitted leaf record — which reads only the record's
     /// touched columns via [`Node::col_at`] or their stored bytes — instead of reconstructing a row.
-    /// Returns `(row_count, node_count)`.
+    /// Preserves partial counts on error for cancellation accounting.
     pub(crate) fn fold_scan(
         &self,
         b: &KeyBound,
         src: Option<&dyn LeafSource>,
         visit: &mut dyn FnMut(&Node, usize) -> Result<()>,
-    ) -> Result<(usize, usize)> {
+    ) -> (usize, usize, Result<()>) {
         let mut row_count = 0usize;
         let mut nodes = 0usize;
-        if let Some(root) = &self.root {
-            fold_walk(root, b, src, visit, &mut row_count, &mut nodes)?;
-        }
-        Ok((row_count, nodes))
+        let result = if let Some(root) = &self.root {
+            fold_walk(root, b, src, visit, &mut row_count, &mut nodes)
+        } else {
+            Ok(())
+        };
+        (row_count, nodes, result)
     }
 
     /// The number of B+tree nodes a bounded scan over `b` visits — the `page_read` it charges

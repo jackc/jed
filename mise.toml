@@ -752,3 +752,24 @@ run = "ruby scripts/devdb.rb psql"
 [tasks."db:reset"]
 description = "Destroy this checkout's cluster and re-init (destructive; CONFIRM=yes)"
 run = "ruby scripts/devdb.rb reset"
+
+[tasks."bench:cancellation:go"]
+description = "Cancellation engine, watcher/channel and caller setup measurements"
+dir = "{{config_root}}/impl/go"
+run = "go test -run '^$' -bench '^BenchmarkCancellation' -benchmem -benchtime=500ms -count=3"
+
+[tasks."bench:cancellation:rust"]
+description = "Cancellation engine and caller token measurements"
+run = "cargo test --release --manifest-path impl/rust/Cargo.toml cancellation_benchmark -- --ignored --nocapture --test-threads=1"
+
+[tasks."bench:cancellation:latency"]
+description = "Timer-driven cancellation response latency in Go and Rust"
+run = [
+  "cd impl/go && JED_CANCEL_LATENCY=1 go test -run '^TestCancellationLatencyMeasurement$' -v",
+  "cargo test --release --manifest-path impl/rust/Cargo.toml cancellation_latency_measurement -- --ignored --nocapture --test-threads=1",
+]
+
+[tasks."test:cancellation:race"]
+description = "Go cursor cancellation and host API regressions under the race detector"
+dir = "{{config_root}}/impl/go"
+run = "go test -race -run 'Test.*(Cancel|Ergo|Streaming|Deferred|Drain|HostFunc)' ./..."

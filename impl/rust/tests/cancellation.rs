@@ -112,3 +112,111 @@ fn cancel_in_transaction_rolls_back() {
         "the cancelled transaction committed nothing"
     );
 }
+
+#[test]
+fn cancellation_batches_and_cost_limits() {
+    let mut db = Database::create(CreateOptions::default()).unwrap();
+    for sql in [
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
+        "INSERT INTO t SELECT i, i % 7 FROM generate_series(1, 2000) AS g(i)",
+    ] {
+        db.execute(sql, &[]).unwrap();
+    }
+    for sql in [
+        "SELECT sum(v), count(*) FROM t",
+        "SELECT v FROM t",
+        "SELECT v, count(*) FROM t GROUP BY v",
+    ] {
+        let token = CancellationToken::new();
+        let mut session = db.session(SessionOptions::default());
+        let mut rows = session.query_cancelable(sql, &[], &token).unwrap();
+        token.cancel(); // Query returned; cancellation must reach the batch scan before it does work.
+        assert!(rows.next().is_none());
+        assert_eq!(rows.error().unwrap_err().code(), "57014");
+        assert!(
+            rows.cost() > 0 && rows.cost() < 2000,
+            "cancellation should account only the accessed tree prefix"
+        );
+        assert_eq!(session.lifetime_cost(), rows.cost());
+        for limit in [0, 1, 2] {
+            let mut expected = None;
+            for enabled in [false, true] {
+                let mut s = db.session(SessionOptions::default());
+                if limit == 1 {
+                    s.set_max_cost(50);
+                }
+                if limit == 2 {
+                    s.set_lifetime_max_cost(50);
+                }
+                let token = CancellationToken::new();
+                let mut rows = if enabled {
+                    s.query_cancelable(sql, &[], &token)
+                } else {
+                    s.query(sql, &[])
+                }
+                .unwrap();
+                let n = rows.by_ref().count();
+                let got = (
+                    n,
+                    rows.cost(),
+                    rows.error().err().map(|e| e.code().to_owned()),
+                );
+                if let Some(want) = &expected {
+                    assert_eq!(&got, want);
+                } else {
+                    expected = Some(got);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cancel_during_next_with_executor_barrier() {
+    use jed::{Environment, HostFunction, ScalarType};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    let gate = Arc::new(Barrier::new(2));
+    let first = AtomicBool::new(true);
+    let g = gate.clone();
+    let env = Environment::builder()
+        .register_function(HostFunction::new(
+            "cancel_gate",
+            vec![ScalarType::Int32],
+            ScalarType::Int32,
+            Box::new(move |args| {
+                if first.swap(false, Ordering::Relaxed) {
+                    g.wait();
+                    g.wait();
+                }
+                Ok(args[0].clone())
+            }),
+        ))
+        .unwrap()
+        .build();
+    let mut db = Database::create(CreateOptions {
+        environment: env,
+        ..Default::default()
+    })
+    .unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3)", &[]).unwrap();
+    let token = CancellationToken::new();
+    let mut rows = db
+        .query_cancelable(
+            "SELECT sum(id) FROM t WHERE cancel_gate(id) > 0",
+            &[],
+            &token,
+        )
+        .unwrap();
+    let worker = std::thread::spawn(move || {
+        gate.wait();
+        token.cancel();
+        gate.wait();
+    });
+    assert!(rows.next().is_none());
+    assert_eq!(rows.error().unwrap_err().code(), "57014");
+    worker.join().unwrap();
+    assert_eq!(db.query("SELECT id FROM t", &[]).unwrap().count(), 3);
+}

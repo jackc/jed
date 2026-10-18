@@ -2802,7 +2802,12 @@ impl Engine {
         };
         let mut n_emit = 0usize;
         let (row_count, pages) = if do_scan {
+            let mut visited = 0usize;
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
+                if visited & 255 == 0 {
+                    meter.guard()?;
+                }
+                visited += 1;
                 if spillable {
                     let u = node.record_scan_units(i, col_types, cap, mask);
                     units.pages += u.pages;
@@ -2827,14 +2832,26 @@ impl Engine {
                 n_emit += 1;
                 Ok(())
             };
-            store.fold_scan_masked(&b, &mut visit)?
+            let (rows, pages, result) = store.fold_scan_masked(&b, &mut visit);
+            if let Err(e) = result {
+                if e.state == SqlState::QueryCanceled {
+                    // Preserve consumed work even though successful scans charge in bulk.
+                    meter.charge(
+                        COSTS.page_read * (pages + units.pages) as i64
+                            + COSTS.value_decompress * units.decompress as i64
+                            + COSTS.storage_row_read * visited as i64,
+                    );
+                }
+                return Err(e);
+            }
+            (rows, pages)
         } else {
             (0, 0)
         };
         // Charge the scan cost block identically to materialize_rel + ScanSource: page_read × (nodes +
         // chain pages), value_decompress × slabs, storage_row_read × row_count. On the unmetered lane (the
-        // caller gates) this bulk charge reproduces the per-row accrual (guard is a no-op); the filter's
-        // operator_eval was charged per scanned record inside the walk.
+        // caller gates) this bulk charge reproduces the per-row accrual. The filter's operator_eval
+        // was charged per scanned record inside the walk.
         meter.charge(
             COSTS.page_read * (pages + units.pages) as i64
                 + COSTS.value_decompress * units.decompress as i64
@@ -3157,7 +3174,12 @@ impl Engine {
         }
 
         let (row_count, pages) = if do_scan {
+            let mut visited = 0usize;
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
+                if visited & 255 == 0 {
+                    meter.guard()?;
+                }
+                visited += 1;
                 if spillable {
                     let u = node.record_scan_units(i, col_types, cap, mask);
                     units.pages += u.pages;
@@ -3241,7 +3263,22 @@ impl Engine {
                 }
                 Ok(())
             };
-            store.fold_scan_masked(&b, &mut visit)?
+            let (rows, pages, result) = store.fold_scan_masked(&b, &mut visit);
+            if let Err(e) = result {
+                if e.state == SqlState::QueryCanceled {
+                    // Preserve consumed work even though successful scans charge in bulk.
+                    meter.charge(
+                        COSTS.page_read * (pages + units.pages) as i64
+                            + COSTS.value_decompress * units.decompress as i64
+                            + COSTS.storage_row_read * visited as i64,
+                    );
+                    meter.charge(
+                        COSTS.aggregate_accumulate * nsurv as i64 * plan.agg_specs.len() as i64,
+                    );
+                }
+                return Err(e);
+            }
+            (rows, pages)
         } else {
             (0, 0)
         };

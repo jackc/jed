@@ -32,7 +32,6 @@ import (
 	"math"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -316,16 +315,23 @@ func (r *Rows) Values() ([]any, error) {
 	return out, nil
 }
 
-// Err returns the terminal error reached during iteration (a canceled ctx today; mid-stream
-// faults once the cursor streams). Check it after the loop.
+// Err returns the terminal iteration error, including cancellation or a streaming execution fault.
+// Check it after the loop.
 func (r *Rows) Err() error { return r.err }
 
 // Close releases the cursor's pinned read snapshot (spec/design/streaming.md §5): it closes the
 // underlying cursor and deregisters the reader-liveness watermark pin (if any), advancing
 // oldestLiveTxid. A no-op for a buffered cursor (it pins nothing). Idempotent. The ergonomic
-// iterators (All/Collect/Scan) close automatically on loop exit; a raw streaming Rows must be Closed
-// (Go has no destructor), or its pin is held until then.
+// iterators (All/Collect/Scan) close automatically on loop exit, as does Next on exhaustion or
+// error. A caller that stops early must Close (Go has no destructor).
 func (r *Rows) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	r.valid = false
+	r.ctx = nil
+	r.onErr = nil
 	r.cursor.close()
 	if r.onClose != nil {
 		r.onClose()
@@ -876,32 +882,29 @@ func ctxErr(ctx ctxIface) error {
 	}
 }
 
-// armCancel installs a cancellation poll on this engine's session for the duration of one
-// statement, returning a restore func that clears it (call via `defer eng.armCancel(ctx)()`). The
-// meter minted during the statement copies the poll (sessionState.newMeter) and consults it at each
-// Guard() checkpoint, so a flipped ctx aborts a long-running statement with 57014 — not only at the
-// cursor boundary (api.md §11.4). A nil or non-cancelable ctx (background context: nil Done channel)
-// installs nothing, so the hot path stays untouched in the overwhelmingly common case. For a live
-// ctx, one watcher goroutine flips an atomic on Done, keeping the per-checkpoint poll to a single
-// atomic load (the watcher is torn down by the returned restore — no leak). The engine that runs a
-// statement is single-goroutine for its duration, so session.cancel is set/read/cleared without a
-// data race; only the atomic crosses goroutines.
+// armCancel temporarily installs an operation-owned poll. Meters and snapshot engines
+// copy the closure, whose cached Done channel remains live after Query returns. Restoring
+// the session cannot disarm an existing cursor or let its cancellation affect a later call.
+// There is no watcher to stop on query errors, exhaustion, early Close, or drain errors.
 func (e *engine) armCancel(ctx context.Context) func() {
-	if ctx == nil || ctx.Done() == nil {
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+	previous := e.session.cancel
+	if done == nil && previous == nil {
 		return func() {}
 	}
-	var canceled atomic.Bool
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			canceled.Store(true)
-		case <-done:
+	e.session.cancel = nil
+	if done != nil {
+		e.session.cancel = func() bool {
+			select {
+			case <-done:
+				return true
+			default:
+				return false
+			}
 		}
-	}()
-	e.session.cancel = func() bool { return canceled.Load() }
-	return func() {
-		close(done)
-		e.session.cancel = nil
 	}
+	return func() { e.session.cancel = previous }
 }

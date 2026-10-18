@@ -11,7 +11,7 @@
 //!
 //! Rust has real threads (CLAUDE.md §2), so the token is the whole mechanism: thread A runs the
 //! query while thread B (a timeout, a request-cancel) flips a clone of the *same* token. No watcher
-//! is needed — the token *is* the shared atomic the Go core spins up a goroutine to feed. It is the
+//! is needed. Go polls a cached context Done channel instead. This token is the
 //! Rust spelling of Go's `context.Context` cancellation; TS, which cannot preempt synchronous
 //! execution, honors its `AbortSignal` only at boundaries (api.md §11.4).
 //!

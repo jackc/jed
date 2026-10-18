@@ -6016,3 +6016,7 @@ mod attach;
 
 #[path = "backup.rs"]
 mod backup;
+
+#[cfg(test)]
+#[path = "cancellation_bench.rs"]
+mod cancellation_bench;

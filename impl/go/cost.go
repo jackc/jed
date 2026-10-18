@@ -62,7 +62,7 @@ type costMeter struct {
 	// chokepoint so a host's cancellation handle (Go context.Context, …) interrupts a long-running
 	// statement at the next metering point — NOT only at the cursor boundary. nil ⇒ no cancellation
 	// (the default; zero overhead, and the path every conformance / cost test takes — cost is
-	// unaffected, the §8 determinism contract intact). The poll is a single atomic load (armCancel).
+	// unaffected, the §8 determinism contract intact). The poll checks a cached context Done channel (armCancel).
 	cancel func() bool
 }
 
@@ -71,13 +71,11 @@ func newMeter() *costMeter {
 	return &costMeter{scalarLimit: defaultScalarBytes}
 }
 
-// unmetered reports that no enforcement is armed — no per-statement ceiling, no session lifetime
-// budget, and no cancellation poll — so Guard is a pure no-op. The vectorized fast paths (batch.go)
-// gate on this: with nothing to abort, they may bulk-charge a whole scan's units at once and skip
-// per-row Guard, and the accrued total still matches the row-at-a-time path exactly (CLAUDE.md §8).
-// A metered meter keeps the scalar path, so its deterministic abort row is unchanged.
-func (m *costMeter) unmetered() bool {
-	return m.Limit == 0 && m.lifetimeLimit == 0 && m.cancel == nil
+// canBatchCosts permits bulk cost accrual only without deterministic cost ceilings.
+// Cancellation does not constrain the cost schedule: batch loops poll at least every
+// 256 records, while scalar execution keeps its existing Guard checkpoints.
+func (m *costMeter) canBatchCosts() bool {
+	return m.Limit == 0 && m.lifetimeLimit == 0
 }
 
 // headroom reports the cost still payable before a ceiling trips — the smaller remaining

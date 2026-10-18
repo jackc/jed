@@ -1,0 +1,25 @@
+test shared::cancellation_bench::cancellation_benchmark ... cheap/disabled 1602.7 ns/op 623936.3 ops/s
+cheap/disabled 1576.2 ns/op 634452.7 ops/s
+cheap/disabled 1570.3 ns/op 636831.3 ops/s
+cheap/enabled 1628.7 ns/op 613979.7 ops/s
+cheap/enabled 1630.9 ns/op 613168.5 ops/s
+cheap/enabled 1627.0 ns/op 614647.0 ops/s
+stream/disabled 718159.8 ns/op 1392.4 ops/s
+stream/disabled 716445.5 ns/op 1395.8 ops/s
+stream/disabled 715414.3 ns/op 1397.8 ops/s
+stream/enabled 715634.0 ns/op 1397.4 ops/s
+stream/enabled 717380.2 ns/op 1394.0 ops/s
+stream/enabled 715977.6 ns/op 1396.7 ops/s
+aggregate/disabled 210815.8 ns/op 4743.5 ops/s
+aggregate/disabled 210185.1 ns/op 4757.7 ops/s
+aggregate/disabled 210593.3 ns/op 4748.5 ops/s
+aggregate/enabled 1498917.3 ns/op 667.1 ops/s
+aggregate/enabled 1502118.7 ns/op 665.7 ops/s
+aggregate/enabled 1495719.2 ns/op 668.6 ops/s
+projection/disabled 323408.0 ns/op 3092.1 ops/s
+projection/disabled 323315.7 ns/op 3093.0 ops/s
+projection/disabled 323372.4 ns/op 3092.4 ops/s
+projection/enabled 1435816.4 ns/op 696.5 ops/s
+projection/enabled 1441169.3 ns/op 693.9 ops/s
+projection/enabled 1437105.3 ns/op 695.8 ops/s
+token creation/drop 13.8 ns/op

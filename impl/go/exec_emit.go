@@ -469,7 +469,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// The whole-table packed-leaf fold owns only running scalar accumulators.
 	// Keep it ahead of spilling when it accepts the plan; grouped and declined
 	// row/gather paths continue through the bounded operator pipeline below.
-	if fast && meter.unmetered() && db.explainActual == nil && db.vectorizedAggEligible(plan) && len(plan.groupSets) == 1 && len(plan.groupSets[0].keyCols) == 0 {
+	if fast && meter.canBatchCosts() && db.explainActual == nil && db.vectorizedAggEligible(plan) && len(plan.groupSets) == 1 && len(plan.groupSets[0].keyCols) == 0 {
 		rows, ok, err := db.aggColumnar(plan, &plan.groupSets[0], env, meter)
 		if err != nil {
 			return emitter{}, err
@@ -493,7 +493,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// deterministic abort row stays the scalar path's; results and accrued cost are byte-identical
 	// either way (the conformance corpus proves both). Ineligible / metered ⇒ this is skipped and the
 	// general aggregate branch runs unchanged.
-	if fast && meter.unmetered() && db.explainActual == nil && db.vectorizedAggEligible(plan) {
+	if fast && meter.canBatchCosts() && db.explainActual == nil && db.vectorizedAggEligible(plan) {
 		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
 	}
 
@@ -505,7 +505,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// path. Gated to the unmetered lane (so a metered query's per-eval Guards stay the row path's) and to
 	// file-backed stores with no spillable touched column (projectColumnar declines otherwise, falling
 	// through to the identical-cost row path). Cost-neutral by construction.
-	if fast && meter.unmetered() && db.explainActual == nil && db.vectorizedProjectEligible(plan) {
+	if fast && meter.canBatchCosts() && db.explainActual == nil && db.vectorizedProjectEligible(plan) {
 		em, ok, err := db.projectColumnar(plan, env, meter)
 		if err != nil {
 			return emitter{}, err
