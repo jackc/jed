@@ -3001,6 +3001,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if err := classifyComparable(lt, rt); err != nil {
 			return nil, resolvedType{}, err
 		}
+		rl, rr = widenMixedFloatPair(rl, lt, rr, rt)
 		return &rExpr{kind: reDistinct, lhs: rl, rhs: rr, negated: e.IsDistinct.Negated},
 			resolvedType{kind: rtBool}, nil
 	case exprIn:
@@ -4089,6 +4090,11 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 				return nil, resolvedType{}, typeError("arithmetic operators require operands of the same family")
 			}
 			st := promoteFloat(l, r)
+			// A mixed-width pair widens its f32 operand through the implicit f32 → f64 cast
+			// (float.md §2, cost.md "Mixed-width floats"), so the arithmetic runs at one width.
+			if st == scalarFloat64 {
+				rl, rr = widenFloatToF64(rl, lt), widenFloatToF64(rr, rt)
+			}
 			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: st}, resolvedTypeOf(st), nil
 		}
 		if err := requireNumericOperand(lt); err != nil {
@@ -4137,6 +4143,7 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		if err := classifyComparable(lt, rt); err != nil {
 			return nil, resolvedType{}, err
 		}
+		rl, rr = widenMixedFloatPair(rl, lt, rr, rt)
 		// Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text or
 		// text[]×text[] comparison is collatable; a COLLATE on a non-collatable operand was already
 		// rejected 42804 at the Collate node. Each operand's derivation (explicit COLLATE / implicit column collation / none)
@@ -4469,6 +4476,17 @@ func widenFloatToF64(node *rExpr, t resolvedType) *rExpr {
 		return &rExpr{kind: reCast, operand: node, result: scalarFloat64}
 	}
 	return node
+}
+
+// widenMixedFloatPair widens the f32 side of a mixed-width float comparison (=, <>, <, <=, >, >=,
+// IS [NOT] DISTINCT FROM, and the IN-list / BETWEEN / simple-CASE comparisons that desugar to them)
+// through the implicit f32 → f64 cast (float.md §2, cost.md "Mixed-width floats"). Any other pair is
+// returned unchanged.
+func widenMixedFloatPair(rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType) (*rExpr, *rExpr) {
+	if isFloatKind(lt.kind) && isFloatKind(rt.kind) && lt.kind != rt.kind {
+		return widenFloatToF64(rl, lt), widenFloatToF64(rr, rt)
+	}
+	return rl, rr
 }
 
 // castToText converts a resolved operand of type ity to text (casts.toml, types.md §5) — the

@@ -4163,6 +4163,13 @@ func adoptScalarOverload(s *scope, fc *funcCallExpr, desc *operatorDesc, rargs [
 	params.nonimmutable = params.nonimmutable || (desc.Volatility != "immutable" && !epoch)
 	fn := scalarFuncID(name, tys)
 	result := scalarResultType(desc.Result, tys)
+	// A float function that computes at f64 takes its f32 arguments through the implicit f32 → f64
+	// cast (float.md §2, cost.md "Mixed-width floats"); abs keeps its operand's width.
+	if fn != sfFloatAbs && result == scalarFloat64 {
+		for i := range rargs {
+			rargs[i] = widenFloatToF64(rargs[i], tys[i])
+		}
+	}
 	return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, resolvedTypeOf(result), nil
 }
 

@@ -491,6 +491,11 @@ function numericCmp(a: Value, b: Value): number | undefined {
   if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
   if (a.kind === "int" && b.kind === "decimal") return Decimal.fromBigInt(a.int).cmpValue(b.dec);
   if (a.kind === "decimal" && b.kind === "int") return a.dec.cmpValue(Decimal.fromBigInt(b.int));
+  // A mixed-width float pair (a row field, an IN-subquery row, …) compares at f64 under the total
+  // order — an f32 value is already its exact f64 widening as a JS number (float.md §2/§3).
+  if ((a.kind === "f32" && b.kind === "f64") || (a.kind === "f64" && b.kind === "f32")) {
+    return floatTotalCmp(a.value, b.value);
+  }
   return undefined;
 }
 

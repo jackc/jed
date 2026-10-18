@@ -2414,8 +2414,17 @@ function resolveIsDistinctExpr(
   // is always a definite boolean (functions.md §3).
   const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
   classifyComparable(p.lt, p.rt);
+  // A mixed-width float pair widens its f32 side through the implicit f32 → f64 cast, exactly as
+  // `=` does (float.md §2).
+  let lhs = p.rl;
+  let rhs = p.rr;
+  if (p.lt.kind === "float" && p.rt.kind === "float") {
+    const w = promoteFloat(p.lt.ty, p.rt.ty);
+    lhs = widenFloatTo(p.rl, p.lt.ty, w);
+    rhs = widenFloatTo(p.rr, p.rt.ty, w);
+  }
   return {
-    node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated },
+    node: { kind: "distinct", lhs, rhs, negated: e.negated },
     type: { kind: "bool" },
   };
 }

@@ -6035,6 +6035,14 @@ fn resolve_node(
             // is 42804). The result is always a definite boolean (functions.md §3).
             let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
             classify_comparable(&lt, &rt)?;
+            // A mixed-width float pair widens its f32 side through the implicit f32 → f64 cast,
+            // exactly as `=` does (spec/design/float.md §2).
+            let (rl, rr) = match (&lt, &rt) {
+                (ResolvedType::Float(a), ResolvedType::Float(b)) if a != b => {
+                    (widen_float_to_f64(rl, &lt), widen_float_to_f64(rr, &rt))
+                }
+                _ => (rl, rr),
+            };
             Ok((
                 RExpr::Distinct {
                     lhs: Box::new(rl),
