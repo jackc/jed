@@ -584,10 +584,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   collation precedent), and a GIN operator class. Large; not scheduled.
 - **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep
   open, **designed in [encryption.md](spec/design/encryption.md)**: a page codec in the core
-  above the block seam, a standardized AEAD under a deterministic `(page_index, txid)` nonce
-  (keeps §8 byte-identity; the auth tag closes the `format_version` 7 CRC tamper gap), crypto
-  from a vetted library (§14). The only present requirement is non-foreclosure — already
-  satisfied.
+  above the block seam, standardized AEAD and envelope encryption (cheap credential rewrap,
+  full live-page rewrite for data-key rotation). Crash/restore/fork-safe nonce allocation and
+  authenticated metadata transitions remain open; `(page_index, txid)` alone is insufficient.
+  Vetted crypto uses safe APIs with explicitly reviewed accelerated backends (§14). Page-sized
+  AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
+  `bench/aead/`. Prefer one initial suite; AES with fresh derived writer keys versus random-nonce
+  XChaCha and async browser page/commit work remain investigations (encryption.md §3.1/§8.1),
+  not a selected cipher or scheduled implementation. The only present storage requirement is
+  non-foreclosure — already satisfied.
 - **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
   [replication.md](spec/design/replication.md). Ship the **per-commit page-delta** in `txid`
   order, as a tee at the block seam (below the encryption codec → keyless backup replicas). No

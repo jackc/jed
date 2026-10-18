@@ -1,0 +1,455 @@
+{
+  "rows": [
+    {
+      "backend": "noble-js/aes-256-gcm",
+      "bytes": 8192,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        287539.06255587935,
+        298502.6041666667,
+        166296.87501117587,
+        139531.2499565383,
+        138815.1041852931
+      ],
+      "median_ns": 166296.87501117587
+    },
+    {
+      "backend": "noble-js/aes-256-gcm",
+      "bytes": 8192,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        137447.91666977108,
+        137539.0624937912,
+        143167.61366684327,
+        142223.01136363635,
+        139570.31249689558
+      ],
+      "median_ns": 139570.31249689558
+    },
+    {
+      "backend": "rust-wasm/aes-256-gcm",
+      "bytes": 8192,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        54835.66812271702,
+        56816.40624866954,
+        54261.85343671461,
+        54795.25864638131,
+        57480.46874733908
+      ],
+      "median_ns": 54835.66812271702
+    },
+    {
+      "backend": "rust-wasm/aes-256-gcm",
+      "bytes": 8192,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        53046.87498137355,
+        53653.645825882755,
+        56629.464296357975,
+        52348.95832836628,
+        52479.166661699615
+      ],
+      "median_ns": 53046.87498137355
+    },
+    {
+      "backend": "webcrypto/aes-256-gcm",
+      "bytes": 8192,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        8249.463784853984,
+        8571.918395336876,
+        8538.25136612022,
+        8017.960230917255,
+        8270.344028715814
+      ],
+      "median_ns": 8270.344028715814
+    },
+    {
+      "backend": "webcrypto/aes-256-gcm",
+      "bytes": 8192,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        6949.879020462801,
+        7040.766035344645,
+        6754.474839581222,
+        7168.3033470884975,
+        6889.424733034792
+      ],
+      "median_ns": 6949.879020462801
+    },
+    {
+      "backend": "webcrypto-batch16/aes-256-gcm",
+      "bytes": 8192,
+      "operation": "seal",
+      "batch": 16,
+      "ns_samples": [
+        8077.761630024713,
+        8041.452439286409,
+        8224.095399246404,
+        8072.9838676991,
+        8236.166011242683
+      ],
+      "median_ns": 8077.761630024713
+    },
+    {
+      "backend": "webcrypto-batch16/aes-256-gcm",
+      "bytes": 8192,
+      "operation": "open",
+      "batch": 16,
+      "ns_samples": [
+        6296.576033576138,
+        6896.291210592448,
+        6392.190693772887,
+        7494.419644631091,
+        6284.2336693900315
+      ],
+      "median_ns": 6392.190693772887
+    },
+    {
+      "backend": "noble-js/xchacha20-poly1305",
+      "bytes": 8192,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        36802.325570999186,
+        42491.554056067725,
+        42685.81082893384,
+        37054.86917305132,
+        40192.30768944208
+      ],
+      "median_ns": 40192.30768944208
+    },
+    {
+      "backend": "noble-js/xchacha20-poly1305",
+      "bytes": 8192,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        35985.440354455604,
+        38597.56096470647,
+        38074.776796357975,
+        35105.90276370446,
+        38382.24086637904
+      ],
+      "median_ns": 38074.776796357975
+    },
+    {
+      "backend": "rust-wasm/xchacha20-poly1305",
+      "bytes": 8192,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        16442.871099570766,
+        17620.25983313496,
+        17582.514040758102,
+        16606.90789944247,
+        17694.873588808467
+      ],
+      "median_ns": 17582.514040758102
+    },
+    {
+      "backend": "rust-wasm/xchacha20-poly1305",
+      "bytes": 8192,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        16257.248713260458,
+        15297.330093108912,
+        16426.59505402359,
+        16262.081182878657,
+        16218.588917909823
+      ],
+      "median_ns": 16257.248713260458
+    },
+    {
+      "backend": "noble-js/aes-256-gcm",
+      "bytes": 65536,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        947499.9997764826,
+        941171.8752235174,
+        944531.2498137355,
+        949374.9998509884,
+        954296.8752793968
+      ],
+      "median_ns": 947499.9997764826
+    },
+    {
+      "backend": "noble-js/aes-256-gcm",
+      "bytes": 65536,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        950664.0625186265,
+        946328.1249627471,
+        941679.687704891,
+        941875.0000186265,
+        947226.5625372529
+      ],
+      "median_ns": 946328.1249627471
+    },
+    {
+      "backend": "rust-wasm/aes-256-gcm",
+      "bytes": 65536,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        420195.31270489097,
+        419453.12498137355,
+        438300.7811848074,
+        416035.15623137355,
+        416015.625
+      ],
+      "median_ns": 419453.12498137355
+    },
+    {
+      "backend": "rust-wasm/aes-256-gcm",
+      "bytes": 65536,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        431660.15623137355,
+        413300.7812779397,
+        414082.03123137355,
+        417402.3438245058,
+        427949.2187779397
+      ],
+      "median_ns": 417402.3438245058
+    },
+    {
+      "backend": "webcrypto/aes-256-gcm",
+      "bytes": 65536,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        39424.51713871759,
+        39942.092646044286,
+        39060.9137158243,
+        40910.02044014648,
+        38946.65108477215
+      ],
+      "median_ns": 39424.51713871759
+    },
+    {
+      "backend": "webcrypto/aes-256-gcm",
+      "bytes": 65536,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        36168.173618385634,
+        39020.678888202594,
+        37502.75632380913,
+        36004.3196690177,
+        36925.064588922025
+      ],
+      "median_ns": 36925.064588922025
+    },
+    {
+      "backend": "webcrypto-batch16/aes-256-gcm",
+      "bytes": 65536,
+      "operation": "seal",
+      "batch": 16,
+      "ns_samples": [
+        42070.31252352815,
+        41819.12250274065,
+        37325.148803314994,
+        39526.336480798964,
+        42369.61920924534
+      ],
+      "median_ns": 41819.12250274065
+    },
+    {
+      "backend": "webcrypto-batch16/aes-256-gcm",
+      "bytes": 65536,
+      "operation": "open",
+      "batch": 16,
+      "ns_samples": [
+        38632.812510643686,
+        35282.65447847629,
+        37550.52396637237,
+        34568.37017068547,
+        37430.763467700184
+      ],
+      "median_ns": 37430.763467700184
+    },
+    {
+      "backend": "noble-js/xchacha20-poly1305",
+      "bytes": 65536,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        261718.75,
+        269895.8332960804,
+        270755.2084078391,
+        270260.4165921609,
+        260846.3540673256
+      ],
+      "median_ns": 269895.8332960804
+    },
+    {
+      "backend": "noble-js/xchacha20-poly1305",
+      "bytes": 65536,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        271914.06255587935,
+        270338.54167287546,
+        260585.9374937912,
+        269960.93755587935,
+        269231.7708084981
+      ],
+      "median_ns": 269960.93755587935
+    },
+    {
+      "backend": "rust-wasm/xchacha20-poly1305",
+      "bytes": 65536,
+      "operation": "seal",
+      "batch": 1,
+      "ns_samples": [
+        127145.43265218918,
+        124152.64425082848,
+        127974.75964404069,
+        127554.08653846153,
+        127662.25958386293
+      ],
+      "median_ns": 127554.08653846153
+    },
+    {
+      "backend": "rust-wasm/xchacha20-poly1305",
+      "bytes": 65536,
+      "operation": "open",
+      "batch": 1,
+      "ns_samples": [
+        122067.3076951733,
+        125240.38460105658,
+        125192.30772382938,
+        126598.55767224844,
+        125138.22116530858
+      ],
+      "median_ns": 125192.30772382938
+    },
+    {
+      "backend": "webcrypto",
+      "bytes": 0,
+      "operation": "random32+hkdf+aes-key",
+      "batch": 1,
+      "ns_samples": [
+        3643.7837049992713,
+        4275.545104541754,
+        3679.5819994848584,
+        4340.268273212042,
+        4979.088872055346
+      ],
+      "median_ns": 4275.545104541754
+    },
+    {
+      "backend": "browser-csprng",
+      "bytes": 24,
+      "operation": "random",
+      "batch": 1,
+      "ns_samples": [
+        380.4480155831507,
+        419.2798442807418,
+        369.54658326632756,
+        336.0887096133283,
+        408.5375816603891
+      ],
+      "median_ns": 380.4480155831507
+    }
+  ],
+  "fixtures": [
+    {
+      "algorithm": "aes-256-gcm",
+      "bytes": 8192,
+      "sha256": "cffdd7e647d1ab5a37d156658d13b93c69b27735d0266202e8c1bf5ba3c5146c"
+    },
+    {
+      "algorithm": "xchacha20-poly1305",
+      "bytes": 8192,
+      "sha256": "2eb2fabdf0ab7fd80c3ccf7e8d323021e6572544760016a0c8c7f57f5ff6f414"
+    },
+    {
+      "algorithm": "aes-256-gcm",
+      "bytes": 65536,
+      "sha256": "eb147287d6ffe7ca571f830173705f991431537a45fd6262c20557726e9989a2"
+    },
+    {
+      "algorithm": "xchacha20-poly1305",
+      "bytes": 65536,
+      "sha256": "c8f6ce971fcac74f6e8d1c30e5319216bfb135590cd0974499433c09e7da7196"
+    }
+  ],
+  "sink": 200,
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+  "crossOriginIsolated": true,
+  "wasmImports": [
+    {
+      "module": "wasi_snapshot_preview1",
+      "name": "environ_get",
+      "kind": "function"
+    },
+    {
+      "module": "wasi_snapshot_preview1",
+      "name": "environ_sizes_get",
+      "kind": "function"
+    },
+    {
+      "module": "wasi_snapshot_preview1",
+      "name": "fd_write",
+      "kind": "function"
+    },
+    {
+      "module": "wasi_snapshot_preview1",
+      "name": "proc_exit",
+      "kind": "function"
+    }
+  ],
+  "metadata": {
+    "date_utc": "2026-10-17T23:55:21.454Z",
+    "samples": 5,
+    "sample_ms": 100,
+    "warmup_samples": 1,
+    "cpu_affinity": "0",
+    "browser": "149.0.7827.55",
+    "node": "v26.10.0",
+    "wasm_build": {
+      "target": "wasm32-wasip1",
+      "lto": true,
+      "codegen_units": 1,
+      "strip": "symbols",
+      "simd128": true,
+      "rustflags": ""
+    },
+    "revision": "172e3b0ae9f604f5284147d77ac7eb14b07917a7",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cpu_info": "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 198\nmodel name\t: Intel(R) Core(TM) Ultra 9 285K\nstepping\t: 2\nmicrocode\t: 0x11b\ncpu MHz\t\t: 5400.000\ncache size\t: 36864 KB\nphysical id\t: 0\nsiblings\t: 24\ncore id\t\t: 0\ncpu cores\t: 24\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\npower management:",
+    "source_sha256": {
+      "bench/aead/browser/probe.js": "4a7cdbe257aed43a9f5ab93c7d9291a452644448cbdc3091b380bcabf35d761f",
+      "bench/aead/browser/run.mjs": "bccad48e54124e1e405dcdd9ee2c5d65002698a44428d6b0f80bb14f7db38252",
+      "bench/aead/rust/src/browser.rs": "cb8b3f439faea25c563188216facfb0ca24e84c5190e2fbe1ab608d05511d189",
+      "bench/aead/rust/Cargo.toml": "9684e536658469ba05fd63dd787fe9b7f376053edecdd6eb8732810f8e4718cc",
+      "bench/aead/rust/Cargo.lock": "e7878d773350b39e0f2696aeb39064240e3636db6df36a07eb29e7e474a29a7b",
+      "mise-tasks/bench/aead_browser": "75716c9022e7eadc499ac79d7543edd15420332d7cb039e794d0a497d86cc8e6"
+    },
+    "artifacts": {
+      "crypto.wasm": {
+        "bytes": 59800,
+        "gzip_bytes": 23570,
+        "sha256": "70e8ab52aa0434f0a9a52af54e5af95c9a8609abf0d03c82c34d20ee376e14a4"
+      },
+      "probe.js": {
+        "bytes": 42958,
+        "gzip_bytes": 11889,
+        "sha256": "ca549ec1240978f92c90ad3fbef64ac7bd50ff58eae52ea0766c5a97194e2e71"
+      }
+    }
+  }
+}
