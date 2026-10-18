@@ -139,6 +139,8 @@ queries over identical 10,000-row **file-backed** databases, with result convers
 Native Rust wins the sort and larger result-set probes; TS wins the constant query and WASM wins
 the point/aggregate probes. These measurements support explicit deployment choices, not a universal
 winner. The report retains seven 300 ms samples and the shorter initial run, validation and caveats.
+The follow-on [browser/Node runtime proposal](../../spec/design/ts-runtime.md) uses this evidence
+to motivate platform adapters and an async public API; it selects no production engine backend.
 
 
 ## Dependency and binary footprint

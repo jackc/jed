@@ -14,6 +14,10 @@ drives it through this surface. Before this, the only entry point was a one-shot
 `execute(db, sql)` against an in-memory database; this doc is the formal surface that adds
 durable database files, prepared statements, bind parameters, and a row cursor.
 
+The [browser/Node runtime proposal](ts-runtime.md) explores an async-only public JS surface,
+worker execution and bounded typed result delivery. It does not change the current APIs
+documented here; adoption and migration require a separate implementation decision.
+
 ## 1. The shape (same across cores)
 
 Six concepts. The names below are the *concept*; the idiomatic spelling per core is the
