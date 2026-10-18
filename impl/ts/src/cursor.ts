@@ -1,5 +1,6 @@
 import type { QueryAccount } from "./cost.ts";
 import type { Value } from "./value.ts";
+import type { Steps } from "./execution.ts";
 
 // Cursor is the pull source a Rows cursor drives (spec/design/streaming.md §4).
 //
@@ -25,6 +26,7 @@ export interface RowSource {
   // an arithmetic trap) — the throw propagates through Rows' iterator as the statement's error
   // (streaming.md §6).
   nextRow(): Value[] | undefined;
+  nextRowSteps?(): Steps<Value[] | undefined>;
   // cost is the cost accrued so far — final once the source is drained (streaming.md §6).
   cost(): bigint;
   // queryAccount is the statement's query-memory account (spec/design/memory.md §2), so an
@@ -78,6 +80,11 @@ export class Cursor {
   // nextRow pulls the next output row, or undefined at end. For streaming this does the per-row work
   // (and accrues cost — streaming.md §6), so it may throw mid-drain.
   nextRow(): Value[] | undefined {
+    return this.source.nextRow();
+  }
+
+  *nextRowSteps(): Steps<Value[] | undefined> {
+    if (this.source.nextRowSteps !== undefined) return yield* this.source.nextRowSteps();
     return this.source.nextRow();
   }
 

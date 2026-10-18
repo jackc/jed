@@ -209,15 +209,17 @@ for the normative bundle and ownership rules.
 ## 5. The OPFS host (the build target)
 
 The [browser/Node runtime](ts-runtime.md#10-implemented-async-host-contract) implements shared
-worker scheduling and bounded typed delivery while retaining the OPFS byte device. Explicit
-internal suspension for async page/crypto providers remains a follow-on. The following describes
-the byte host and synchronous internal engine integration.
+worker scheduling and bounded typed delivery while retaining the OPFS byte device. Its retained
+page continuations yield before synchronous OPFS data reads and periodically during resident
+work; Node can await the same page seam's asynchronous byte read. Storage lifecycle, commit and
+async crypto integration remain follow-ons. The following describes the byte host.
 
 The browser host backs the database on the Origin Private File System via a
 `FileSystemSyncAccessHandle` — the one browser API that offers **synchronous** file I/O
-(`read(buf, {at})`, `write(buf, {at})`, `truncate(n)`, `getSize()`, `flush()`), which is what
-the core needs (the engine is synchronous above the seam; transactions.md §10 notes the TS
-core's concurrency is isolation-across-async, not threads). The mapping is one-to-one:
+(`read(buf, {at})`, `write(buf, {at})`, `truncate(n)`, `getSize()`, `flush()`). These calls run in
+the dedicated execution worker; the cooperative driver controls when to yield around reads.
+Transactions still use isolation across asynchronous operations rather than concurrent execution
+inside one engine (transactions.md §10). The mapping is one-to-one:
 
 | `BlockStore` (§2) | OPFS |
 |---|---|

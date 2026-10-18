@@ -206,3 +206,45 @@ export async function cancellationScenario() {
     await db.close();
   }
 }
+
+export async function cooperativeCancellationScenario() {
+  const db = await createDatabase();
+  try {
+    await db.execute("CREATE TABLE t (k i32)");
+    await db.execute("INSERT INTO t SELECT g FROM generate_series(1, 200000) g");
+    const session = await db.session();
+    await session.execute("BEGIN READ ONLY");
+    const tx = session;
+    const controller = new AbortController();
+    const rows = await tx.query("SELECT k FROM t WHERE k % 2 = -1", [], {
+      signal: controller.signal,
+    });
+    const before = (await tx.status()).lifetimeCost;
+    const next = rows.next();
+    // This origin has no isolation headers, so the only cancellation path is the worker message.
+    // The scan produces no result batches; its row checkpoints must admit that message.
+    const timer = setTimeout(() => controller.abort(), 10);
+    let code = "";
+    try {
+      await next;
+    } catch (error) {
+      code = error instanceof EngineError ? error.code() : String(error);
+    } finally {
+      clearTimeout(timer);
+      await rows.close();
+    }
+    const after = await tx.status();
+    await tx.rollback();
+    const recovered = await session.get("SELECT 7 AS n");
+    await session.close();
+    return {
+      isolated: crossOriginIsolated,
+      code,
+      progressed: after.lifetimeCost > before,
+      status: after.status,
+      recovered: String(recovered?.n),
+    };
+  } finally {
+    await db.close();
+  }
+}

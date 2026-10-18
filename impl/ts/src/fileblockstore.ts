@@ -12,6 +12,7 @@ import {
   fstatSync,
   fsyncSync,
   ftruncateSync,
+  read,
   readSync,
   writeSync,
 } from "node:fs";
@@ -39,6 +40,16 @@ export class FileBlockStore implements BlockStore {
     const buf = new Uint8Array(len);
     readSync(this.fd, buf, 0, len, offset);
     return buf;
+  }
+
+  readAtAsync(offset: number, len: number): Promise<Uint8Array> {
+    const buf = new Uint8Array(len);
+    return new Promise((resolve, reject) => {
+      read(this.fd, buf, 0, len, offset, (error) => {
+        if (error !== null) reject(error);
+        else resolve(buf);
+      });
+    });
   }
 
   writeAt(offset: number, bytes: Uint8Array): void {

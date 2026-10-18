@@ -14,6 +14,7 @@
 import { type BlockStore, FailingBlockStore } from "./blockstore.ts";
 import { type ManifestEntry, manifestInlineCapacity } from "./commit_manifest.ts";
 import { type EngineError, engineError } from "./errors.ts";
+import { ioSteps, runSync, type Steps } from "./execution.ts";
 
 // PREALLOC_CHUNK_BYTES is the MAXIMUM file-growth step — ~1 MiB worth of pages. The file grows
 // geometrically (≈doubling its current size — reserve), so a small database's file stays proportional
@@ -194,7 +195,17 @@ export class Pager {
   // readBlock reads one page (block index) — random access, the demand-paging read path (P6.4b).
   // Converts the page index to a byte offset for the host's readAt.
   readBlock(index: number): Uint8Array {
-    return this.store.readAt(index * this.pageSize, this.pageSize);
+    return runSync(this.readBlockSteps(index));
+  }
+
+  *readBlockSteps(index: number): Steps<Uint8Array> {
+    const store = this.store;
+    const offset = index * this.pageSize;
+    const length = this.pageSize;
+    return yield* ioSteps(
+      () => store.readAt(offset, length),
+      store.readAtAsync === undefined ? undefined : () => store.readAtAsync!(offset, length),
+    );
   }
 
   // writeBlock writes one page (bytes) at block index. Overwrites in place — persistImpl always

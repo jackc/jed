@@ -1,3 +1,5 @@
+import { runSync, type Steps } from "./execution.ts";
+import { evalExprSteps, synchronousEvalEnv } from "./eval.ts";
 // or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a NULL
 // operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
 import type { ThreeValued, Value } from "./value.ts";
@@ -28,7 +30,6 @@ import {
   coerceForStore,
   collatedSortKey,
   distinctRowKey,
-  evalExpr,
   finalizeAcc,
   foldAccCharged,
   newAcc,
@@ -407,12 +408,12 @@ export function groupWindowSpecs(specs: WindowSpec[]): number[][] {
 // pre-sort row (before LIMIT, since the sort needs them all); the per-row evaluation is metered like a
 // projection (operator_eval per node, charged inside evalExpr). A no-op — and zero added cost — when
 // orderExprs is empty (a column/ordinal-only ORDER BY, byte-identical to before).
-export function materializeOrderExprs(
+export function* materializeOrderExprsSteps(
   rows: Row[],
   orderExprs: RExpr[],
   env: EvalEnv,
   meter: Meter,
-): void {
+): Steps<void> {
   if (orderExprs.length === 0) return;
   for (let i = 0; i < rows.length; i++) {
     // Detach from the (possibly shared) stored row before appending, exactly as the window stage does
@@ -421,7 +422,7 @@ export function materializeOrderExprs(
     const row = rows[i]!.slice();
     const vals: Value[] = [];
     for (const oe of orderExprs) {
-      const v = evalExpr(oe, row, env, meter);
+      const v = yield* evalExprSteps(oe, row, env, meter);
       meter.admitValue(v); // an appended slot grows the buffered row (memory.md §5.1)
       vals.push(v);
     }
@@ -447,13 +448,13 @@ function windowAcc(spec: WindowSpec, zone: ZoneRef): Acc {
   return acc;
 }
 
-export function applyWindowStage(
+export function* applyWindowStageSteps(
   rows: Row[],
   specs: WindowSpec[],
   windowKeys: RExpr[],
   env: EvalEnv,
   meter: Meter,
-): void {
+): Steps<void> {
   const n = rows.length;
   if (n === 0) return;
   // Copy each input row to a fresh array BEFORE appending: the scan yields references to the stored
@@ -474,7 +475,7 @@ export function applyWindowStage(
       const row = rows[i]!;
       const kv: Value[] = [];
       for (const ke of windowKeys) {
-        const v = evalExpr(ke, row, env, meter);
+        const v = yield* evalExprSteps(ke, row, env, meter);
         meter.admitValue(v); // an appended slot grows the buffered row (memory.md §5.1)
         kv.push(v);
       }
@@ -589,7 +590,7 @@ export function applyWindowStage(
         // n ≤ 0 → 22014. Position-based: bucket boundaries are by sorted position, not peers.
         case "ntile": {
           const np = ordered.length;
-          const nval = evalExpr(spec.args[0]!, rows[ordered[0]!]!, env, meter);
+          const nval = yield* evalExprSteps(spec.args[0]!, rows[ordered[0]!]!, env, meter);
           if (nval.kind === "null") {
             // NULL bucket count → NULL for every row (PG).
             for (const ri of ordered) {
@@ -639,7 +640,7 @@ export function applyWindowStage(
           const operands = meter.stateCharge();
           const vals: Value[] = new Array(np);
           for (let i = 0; i < np; i++) {
-            const v = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
+            const v = yield* evalExprSteps(spec.args[0]!, rows[ordered[i]!]!, env, meter);
             if (operands.active()) operands.reserve(meter, valueBytes(v));
             vals[i] = v;
           }
@@ -648,7 +649,7 @@ export function applyWindowStage(
           // out of range → default/NULL).
           let offset: number | null;
           if (spec.args.length >= 2) {
-            const ov = evalExpr(spec.args[1]!, rows[ordered[0]!]!, env, meter);
+            const ov = yield* evalExprSteps(spec.args[1]!, rows[ordered[0]!]!, env, meter);
             offset = ov.kind === "null" ? null : Number((ov as { int: bigint }).int);
           } else {
             offset = 1;
@@ -665,7 +666,7 @@ export function applyWindowStage(
               if (target >= 0 && target < np) {
                 results[ri] = vals[target]!;
               } else if (spec.args.length === 3) {
-                results[ri] = evalExpr(spec.args[2]!, rows[ri]!, env, meter);
+                results[ri] = yield* evalExprSteps(spec.args[2]!, rows[ri]!, env, meter);
               } else {
                 results[ri] = nullValue();
               }
@@ -686,10 +687,11 @@ export function applyWindowStage(
           // aggregate (aggregates.md §20). Evaluated per visited frame row (charging its
           // operatorEvals); a null filter keeps every row. A FILTER forces the naive re-fold path for
           // explicit frames (a filtered row cannot be cleanly un-folded).
-          const filterPass = (k: number): boolean =>
-            spec.filter == null
+          const filterPass = function* (k: number): Steps<boolean> {
+            return spec.filter == null
               ? true
-              : isTrue(evalExpr(spec.filter, rows[ordered[k]!]!, env, meter));
+              : isTrue(yield* evalExprSteps(spec.filter, rows[ordered[k]!]!, env, meter));
+          };
           if (spec.frame === null || spec.frame === undefined) {
             // DEFAULT frame: a single running pass, snapshotting the accumulator at each peer-group
             // boundary (window.md §6) — O(n).
@@ -711,9 +713,9 @@ export function applyWindowStage(
                 // The frame fold work (window.md §8) — metered so a running aggregate over a large
                 // partition stays cost-bounded.
                 meter.charge(COSTS.windowFrameStep);
-                if (!filterPass(k)) continue; // FILTER excludes this row from the running fold
+                if (!(yield* filterPass(k))) continue; // FILTER excludes this row from the running fold
                 const v = hasOperand
-                  ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
+                  ? yield* evalExprSteps(spec.args[0]!, rows[ordered[k]!]!, env, meter)
                   : nullValue();
                 accCharge += foldAccCharged(acc, v, meter);
               }
@@ -748,10 +750,10 @@ export function applyWindowStage(
             // The cached operands are transient operator state (memory.md §6.8): each reserves its
             // value_bytes when first cached, all released at the end of the partition.
             const operands = meter.stateCharge();
-            const evalAt = (k: number): Value => {
+            const evalAt = function* (k: number): Steps<Value> {
               if (!hasOperand) return nullValue();
               if (!valSet[k]) {
-                const v = evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter);
+                const v = yield* evalExprSteps(spec.args[0]!, rows[ordered[k]!]!, env, meter);
                 if (operands.active()) operands.reserve(meter, valueBytes(v));
                 vals[k] = v;
                 valSet[k] = true;
@@ -769,8 +771,8 @@ export function applyWindowStage(
                 for (let k = lo; k < hi; k++) {
                   if (ctx.isExcluded(pos, k, exclude)) continue;
                   meter.charge(COSTS.windowFrameStep);
-                  if (!filterPass(k)) continue;
-                  accCharge += foldAccCharged(acc, evalAt(k), meter);
+                  if (!(yield* filterPass(k))) continue;
+                  accCharge += foldAccCharged(acc, yield* evalAt(k), meter);
                 }
                 meter.guard();
                 meter.charge(COSTS.windowResult);
@@ -794,20 +796,20 @@ export function applyWindowStage(
                   accCharge = 0;
                   for (let k = lo; k < hi; k++) {
                     meter.charge(COSTS.windowFrameStep);
-                    accCharge += foldAccCharged(acc, evalAt(k), meter);
+                    accCharge += foldAccCharged(acc, yield* evalAt(k), meter);
                   }
                 } else {
                   // Un-fold rows leaving on the left (invertible only; empty when lo === curLo) …
                   const remHi = Math.min(lo, curHi);
                   for (let k = curLo; k < remHi; k++) {
                     meter.charge(COSTS.windowFrameStep);
-                    unfoldAcc(acc, evalAt(k), meter);
+                    unfoldAcc(acc, yield* evalAt(k), meter);
                   }
                   // … and fold rows entering on the right.
                   const addLo = Math.max(curHi, lo);
                   for (let k = addLo; k < hi; k++) {
                     meter.charge(COSTS.windowFrameStep);
-                    accCharge += foldAccCharged(acc, evalAt(k), meter);
+                    accCharge += foldAccCharged(acc, yield* evalAt(k), meter);
                   }
                 }
                 curLo = lo;
@@ -832,14 +834,14 @@ export function applyWindowStage(
           const operands = meter.stateCharge();
           const vals: Value[] = new Array(np);
           for (let i = 0; i < np; i++) {
-            const v = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
+            const v = yield* evalExprSteps(spec.args[0]!, rows[ordered[i]!]!, env, meter);
             if (operands.active()) operands.reserve(meter, valueBytes(v));
             vals[i] = v;
           }
           // nth_value's position — evaluated once; NULL → NULL for all; < 1 → 22016.
           let nth: number | null = 0; // unused for first/last
           if (spec.plan === "nthValue") {
-            const nv = evalExpr(spec.args[1]!, rows[ordered[0]!]!, env, meter);
+            const nv = yield* evalExprSteps(spec.args[1]!, rows[ordered[0]!]!, env, meter);
             if (nv.kind === "null") {
               nth = null;
             } else if (nv.kind === "int") {
@@ -1351,4 +1353,23 @@ export function checkAssign(p: AssignPlan, v: Value, iz: InputZone): Value {
   if (p.colType !== undefined)
     return coerceForStore(v, p.colType, p.decimal, p.varcharLen, p.temporal, p.notNull, p.name, iz);
   return storeValue(v, p.target, p.decimal, p.varcharLen, p.temporal, p.notNull, p.name, iz);
+}
+
+export function materializeOrderExprs(
+  rows: Row[],
+  orderExprs: RExpr[],
+  env: EvalEnv,
+  meter: Meter,
+): void {
+  return runSync(materializeOrderExprsSteps(rows, orderExprs, synchronousEvalEnv(env), meter));
+}
+
+export function applyWindowStage(
+  rows: Row[],
+  specs: WindowSpec[],
+  windowKeys: RExpr[],
+  env: EvalEnv,
+  meter: Meter,
+): void {
+  return runSync(applyWindowStageSteps(rows, specs, windowKeys, synchronousEvalEnv(env), meter));
 }

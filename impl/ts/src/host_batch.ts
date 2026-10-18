@@ -16,6 +16,8 @@
 
 import { Meter } from "./cost.ts";
 import { evalExpr } from "./eval.ts";
+import { EngineError } from "./errors.ts";
+import { runSync, type Steps } from "./execution.ts";
 import type { EvalEnv, RExpr } from "./executor.ts";
 import type { HostFunctions, HostOutcome } from "./extension.ts";
 import type { Row } from "./storage.ts";
@@ -288,6 +290,15 @@ export class ReadAhead {
   // (null at the source's end; a throw is a source error) once it is spent; null at the source's end;
   // or a throw of the deferred source error once every row read before it has been handed out.
   next(cap: number, pull: () => Row | null): number | null {
+    return runSync(
+      // biome-ignore lint/correctness/useYield: synchronous source adapted to the shared continuation path.
+      this.nextSteps(cap, function* () {
+        return pull();
+      }),
+    );
+  }
+
+  *nextSteps(cap: number, pull: () => Steps<Row | null>): Steps<number | null> {
     if (this.pos === this.rows.length) {
       if (this.hasDeferred) this.raiseDeferred();
       if (this.ended) return null;
@@ -298,8 +309,11 @@ export class ReadAhead {
       while (this.rows.length < Math.max(cap, 1)) {
         let row: Row | null;
         try {
-          row = pull();
+          row = yield* pull();
         } catch (e) {
+          // Cancellation unwinds the active continuation immediately; it is not a speculative
+          // storage fault to replay after rows already held by the read-ahead window.
+          if (e instanceof EngineError && e.code() === "57014") throw e;
           this.deferred = e;
           this.hasDeferred = true;
           break;
