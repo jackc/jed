@@ -959,16 +959,18 @@ impl PageServiceOwner {
     /// The owner's response to a write or sync failure in a client commit (page-service.md §5.6):
     /// its storage handle is poisoned, so it closes every connection and accepts no more. The
     /// owner's own handle then refuses commits until it is reopened.
+    ///
+    /// The endpoint closes before any connection does, as in the Go core: a client whose connection
+    /// ends re-elects at once, and its dial must find the endpoint refused. Hanging up first let that
+    /// dial race the close — accepted and dropped, or (when the accept thread exited on `closed`
+    /// before the listener was closed) queued on an endpoint nobody accepts from.
     pub(crate) fn stop_serving(&self) {
         self.gate.close();
-        {
-            let mut conns = self.conns.lock().expect("connections lock poisoned");
-            conns.closed = true;
-            for conn in conns.open.values() {
-                conn.hang_up();
-            }
-        }
+        self.conns.lock().expect("connections lock poisoned").closed = true;
         self.wake_accept();
+        for conn in self.connections() {
+            conn.hang_up();
+        }
     }
 
     /// Run one connection until EOF or a protocol violation, then abort its write transaction
@@ -1720,5 +1722,219 @@ mod tests {
         // A compaction joins it.
         w.reset(300, meta(300));
         assert_eq!(w.resolve(300, digest(300)), COMMIT_STATUS_COMMITTED);
+    }
+}
+
+#[cfg(test)]
+mod stop_serving_tests {
+    //! The order in which a poisoned owner stops serving (page-service.md §5.6): the endpoint closes
+    //! before any connection ends. A client whose connection ends re-elects at once, so hanging up
+    //! first let its dial race the close; under the simulator's network that dial could be queued on
+    //! an endpoint nobody accepted from, hanging the run whenever the machine was busy. The host's
+    //! endpoint and connections here record when each closes.
+
+    use super::*;
+    use crate::coordinator::{LockFiles, LockHandle, OsLockHost};
+    use crate::filehost::OsFileHost;
+    use crate::pageservice::codec::{Id16, OwnerRecord};
+
+    /// What closed, in order.
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    /// A closed flag, with a condvar for blocked accepts and reads.
+    struct Flag {
+        closed: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl Flag {
+        fn new() -> Arc<Flag> {
+            Arc::new(Flag {
+                closed: Mutex::new(false),
+                changed: Condvar::new(),
+            })
+        }
+
+        /// Close once; `true` the first time.
+        fn close(&self) -> bool {
+            let mut closed = self.closed.lock().unwrap();
+            let first = !*closed;
+            *closed = true;
+            self.changed.notify_all();
+            first
+        }
+
+        fn wait_closed(&self) {
+            let mut closed = self.closed.lock().unwrap();
+            while !*closed {
+                closed = self.changed.wait(closed).unwrap();
+            }
+        }
+    }
+
+    struct TestListener {
+        flag: Arc<Flag>,
+        log: Log,
+    }
+
+    impl PsListener for TestListener {
+        fn accept(&self) -> std::io::Result<Option<Box<dyn PsStream>>> {
+            self.flag.wait_closed();
+            Ok(None)
+        }
+
+        fn close(&self) {
+            if self.flag.close() {
+                self.log.lock().unwrap().push("endpoint closed");
+            }
+        }
+    }
+
+    /// A connection end that never carries a frame: a read blocks until the end is closed.
+    struct TestStream {
+        flag: Arc<Flag>,
+        log: Log,
+    }
+
+    impl std::io::Read for TestStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.flag.wait_closed();
+            Ok(0)
+        }
+    }
+
+    impl std::io::Write for TestStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PsStream for TestStream {
+        fn clone_stream(&self) -> std::io::Result<Box<dyn PsStream>> {
+            Ok(Box::new(TestStream {
+                flag: Arc::clone(&self.flag),
+                log: Arc::clone(&self.log),
+            }))
+        }
+
+        fn close_both(&self) {
+            if self.flag.close() {
+                self.log.lock().unwrap().push("connection closed");
+            }
+        }
+    }
+
+    /// The OS host's locks, with no owner record and the recording endpoint.
+    struct TestHost {
+        os: OsLockHost,
+        log: Log,
+    }
+
+    impl LockHost for TestHost {
+        fn claim_path(&self, path: &Path) -> bool {
+            self.os.claim_path(path)
+        }
+        fn release_path(&self, path: &Path) {
+            self.os.release_path(path)
+        }
+        fn open_bundle(&self, path: &Path) -> Result<LockFiles> {
+            self.os.open_bundle(path)
+        }
+        fn validate_marker(&self, path: &Path) -> Result<()> {
+            self.os.validate_marker(path)
+        }
+        fn close_files(&self, files: &LockFiles) {
+            self.os.close_files(files)
+        }
+        fn try_lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<bool> {
+            self.os.try_lock(handle, exclusive)
+        }
+        fn unlock(&self, handle: &LockHandle) -> std::io::Result<()> {
+            self.os.unlock(handle)
+        }
+        fn now(&self) -> Instant {
+            self.os.now()
+        }
+        fn pause(&self) {
+            self.os.pause()
+        }
+        fn pid(&self) -> u32 {
+            self.os.pid()
+        }
+        fn read_owner_record(&self, _db_path: &Path) -> Option<OwnerRecord> {
+            None
+        }
+        fn write_owner_record(&self, _db_path: &Path, _record: &OwnerRecord) -> Result<()> {
+            Ok(())
+        }
+        fn remove_owner_record(&self, _db_path: &Path) {}
+        fn current_uid(&self, _db_path: &Path) -> Result<u32> {
+            Ok(1000)
+        }
+        fn endpoint_path(&self, _db_path: &Path, _uid: u32, _inc: &Id16) -> Option<PathBuf> {
+            Some(PathBuf::from("test-endpoint"))
+        }
+        fn listen(&self, _endpoint: &Path) -> std::io::Result<Box<dyn PsListener>> {
+            Ok(Box::new(TestListener {
+                flag: Flag::new(),
+                log: Arc::clone(&self.log),
+            }))
+        }
+        fn dial(&self, _endpoint: &str) -> std::io::Result<Box<dyn PsStream>> {
+            Err(std::io::ErrorKind::ConnectionRefused.into())
+        }
+        fn remove_endpoint(&self, _endpoint: &Path) {}
+    }
+
+    #[test]
+    fn stop_serving_closes_the_endpoint_before_any_connection() {
+        let dir = std::env::temp_dir().join(format!("jed-stop-serving-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.jed");
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let owner = PageServiceOwner::new(
+            Weak::new(),
+            &path,
+            [7u8; 16],
+            4096,
+            false,
+            Ownership::Prefer,
+            OwnerLimits {
+                idle_in_transaction: None,
+                idle_session: None,
+                yield_grace: Duration::ZERO,
+                shutdown_grace: Duration::ZERO,
+                max_connections: 0,
+            },
+            None,
+            Arc::new(TestHost {
+                os: OsLockHost,
+                log: Arc::clone(&log),
+            }),
+            Arc::new(OsFileHost),
+        )
+        .unwrap();
+        owner.serve().unwrap();
+        for _ in 0..2 {
+            let stream = TestStream {
+                flag: Flag::new(),
+                log: Arc::clone(&log),
+            };
+            assert_eq!(owner.add_connection(Box::new(stream)), Added::Serving);
+        }
+
+        owner.stop_serving();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["endpoint closed", "connection closed", "connection closed"]
+        );
+        owner.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
