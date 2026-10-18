@@ -2602,7 +2602,7 @@ impl Engine {
                 return Err(corrupt("expected a catalog page"));
             }
             live.catalog += 1;
-            // A catalog entry longer than a page continues on the following chain pages (v43):
+            // A catalog entry longer than a page continues on the following chain pages (v48):
             // header byte 1 bit0 `continued` on every page of the run but the last.
             let mut next = page.next_page;
             let joined: Vec<u8>;
@@ -4438,7 +4438,7 @@ pub(crate) fn meta_page(
 /// The table catalog entry stores each expression text — a column DEFAULT, a CHECK, an expression
 /// index key, a partial-index predicate — with a `u16` length (format.md *Catalog*), so a longer one
 /// cannot be written: `0A000`, before any page is (views.md §3; a catalog entry itself may span
-/// pages since v43).
+/// pages since v48).
 fn check_catalog_text_lengths(snap: &Snapshot) -> Result<()> {
     let too_long = |t: &str| t.len() > u16::MAX as usize;
     for table in snap.tables_sorted() {
@@ -4470,7 +4470,7 @@ fn check_catalog_text_lengths(snap: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-/// One page of the catalog chain (format.md *Catalog*, v43): its entry count, whether its last
+/// One page of the catalog chain (format.md *Catalog*, v48): its entry count, whether its last
 /// entry continues on the next page (header byte 1, bit0 `continued`), and its payload.
 pub(crate) struct CatalogPage {
     item_count: u32,
@@ -4478,7 +4478,7 @@ pub(crate) struct CatalogPage {
     payload: Vec<u8>,
 }
 
-/// Lay the catalog entries out on pages of capacity `cap` (format.md *Catalog*, v43): entries are
+/// Lay the catalog entries out on pages of capacity `cap` (format.md *Catalog*, v48): entries are
 /// packed greedily, each wholly on one page; an entry longer than `cap` starts a fresh page and
 /// spans as many pages as it needs — the first holds the entry's first `cap` bytes with
 /// `item_count = 1`, each later one the next bytes with `item_count = 0`, and every page but the
@@ -4531,7 +4531,7 @@ pub(crate) fn catalog_layout(entries: &[Vec<u8>], cap: usize) -> Vec<CatalogPage
     out
 }
 
-/// A catalog page's full bytes: `make_page` with header byte 1 bit0 `continued` (v43).
+/// A catalog page's full bytes: `make_page` with header byte 1 bit0 `continued` (v48).
 fn make_catalog_page(ps: usize, cp: &CatalogPage, next_page: u32) -> Vec<u8> {
     let mut p = make_page(ps, PAGE_CATALOG, cp.item_count, next_page, &cp.payload);
     if cp.continued {
@@ -4818,7 +4818,7 @@ fn select_meta(image: &[u8], ps: usize) -> Result<Meta> {
 /// A parsed page: header fields + a borrowed payload slice.
 struct Page<'a> {
     page_type: u8,
-    /// Header byte 1: on a catalog page, bit0 `continued` (v43); 0 elsewhere.
+    /// Header byte 1: on a catalog page, bit0 `continued` (v48); 0 elsewhere.
     flags: u8,
     item_count: u32,
     next_page: u32,
@@ -5385,10 +5385,10 @@ fn view_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
 }
 
 /// Serialize a view catalog entry's BODY (after its `entry_kind = 5` byte) — format.md *View
-/// entry*: the name; the output columns, each its name, a flags byte (bit0 `has_default`, v43), and
+/// entry*: the name; the output columns, each its name, a flags byte (bit0 `has_default`, v48), and
 /// the default's text when set; the definition (`u32` length); the dependency list (in `(name,
 /// kind)` byte order, each table's columns in name byte order); the check option; and the view
-/// flags byte (v43: bit0 `security_barrier`, bit1 `security_invoker`).
+/// flags byte (v48: bit0 `security_barrier`, bit1 `security_invoker`).
 pub(crate) fn view_entry_bytes(v: &crate::catalog::ViewDef) -> Vec<u8> {
     let mut out = Vec::new();
     let put_str = |out: &mut Vec<u8>, s: &str| {

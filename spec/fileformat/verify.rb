@@ -1570,7 +1570,7 @@ VIEW_TABLE = {
   ]
 }.freeze
 
-# VIEW OPTIONS (v43 — spec/design/views.md §6/§16, format.md *View entry* and *Catalog*): pins a
+# VIEW OPTIONS (v48 — spec/design/views.md §6/§16, format.md *View entry* and *Catalog*): pins a
 # view column default (the column flags byte + the u32-length text — a folded constant and an
 # expression), the view flags byte (security_barrier, security_invoker), the sequence (2) and
 # composite-type (3) dependency kinds in (name, kind) order, and a view entry longer than a catalog
@@ -2800,11 +2800,11 @@ def sequence_entry_bytes(s)
 end
 
 # Serialize a view catalog entry's BODY (after the entry_kind=5 byte, v38 — format.md *View entry*):
-# the name; the output columns, each its name then (v43) a flags byte (bit0 has_default) and, when
+# the name; the output columns, each its name then (v48) a flags byte (bit0 has_default) and, when
 # set, the default's text (u32 length + canonical text); the definition (u32 length + canonical token
 # text); the dependency list in (name, kind) byte order — per dependency a kind byte (0 table, 1 view,
-# v43: 2 sequence, 3 composite type), the name, and a table's referenced column names in byte order
-# (none for any other kind); (v39) the check_option byte; (v43) the view flags byte (bit0
+# v48: 2 sequence, 3 composite type), the name, and a table's referenced column names in byte order
+# (none for any other kind); (v39) the check_option byte; (v48) the view flags byte (bit0
 # security_barrier, bit1 security_invoker).
 def view_entry_bytes(v)
   str = ->(x) { u16(x.bytesize) + x.b }
@@ -3639,7 +3639,7 @@ def emit_leaf_pax(recs, cap, alloc, pages)
   out
 end
 
-# Lay catalog entries out on pages of capacity `cap` (format.md *Catalog*, v43): packed greedily,
+# Lay catalog entries out on pages of capacity `cap` (format.md *Catalog*, v48): packed greedily,
 # each wholly on one page, except that an entry longer than `cap` starts a fresh page and spans as
 # many pages as it needs — the first with item_count 1, the rest 0, every page of the run but the
 # last flagged `continued` (header byte 1 bit0); the entry after it starts a fresh page.
@@ -5188,7 +5188,7 @@ def decode_image(image)
     pg = read_page(image, ps, cat)
     raise "expected a catalog page" unless pg[:type] == PAGE_CATALOG && (pg[:flags] & ~1).zero?
 
-    # A catalog entry longer than a page continues on the following chain pages (v43).
+    # A catalog entry longer than a page continues on the following chain pages (v48).
     nxt = pg[:next_page]
     payload = pg[:payload]
     if pg[:flags] & 1 == 1

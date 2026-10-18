@@ -228,7 +228,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   (§10), view column defaults and `ALTER VIEW … SET / RESET` options (`check_option`,
   `security_barrier`, `security_invoker` — §16), dependencies on sequences and composite types with
   `DROP SEQUENCE / DROP TYPE … CASCADE` (collations and host functions deliberately record none —
-  §6.2), and catalog entries longer than a page (`format_version` 43).
+  §6.2), and catalog entries longer than a page (`format_version` 48).
   → [views.md](spec/design/views.md)
   - [ ] _follow-on:_ materialized views, views in or over attached databases. (View
     columns in `jed_columns` have landed — [introspection.md §5](spec/design/introspection.md).) → [views.md §12](spec/design/views.md)

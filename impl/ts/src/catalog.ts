@@ -386,7 +386,7 @@ export type ViewDef = {
 };
 
 // ViewDepKind is what a view dependency names (format.md *View entry* dep_kind: table 0, view 1,
-// sequence 2, type 3 — v43).
+// sequence 2, type 3 — v48).
 export type ViewDepKind = "table" | "view" | "sequence" | "type";
 
 // ViewDep is one persisted view dependency (spec/design/views.md §6): a table with the exact set of

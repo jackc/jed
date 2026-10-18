@@ -5,7 +5,7 @@
 > (CLAUDE.md §2). The grammar is in [../grammar/grammar.ebnf](../grammar/grammar.ebnf) and
 > [grammar.md](grammar.md) §54. The byte layout is in [../fileformat/format.md](../fileformat/format.md)
 > (`format_version` 38; the check option, 39; column defaults, options, sequence and type dependencies,
-> and entries longer than a page, 43). The errors are codes in [../errors/registry.toml](../errors/registry.toml).
+> and entries longer than a page, 48). The errors are codes in [../errors/registry.toml](../errors/registry.toml).
 > PostgreSQL behavior was pinned against the live `postgres:18` oracle (CLAUDE.md §1).
 > A view with PostgreSQL's simple single-relation shape is **automatically updatable**: `INSERT`,
 > `UPDATE`, and `DELETE` on it write its base relation (§15), and `WITH [CASCADED | LOCAL] CHECK
@@ -116,7 +116,7 @@ ALTER VIEW [IF EXISTS] [main. | temp.]name action [, …]
    exists. Under `OR REPLACE`, a name taken by a view continues at §1.2 step 9, and a name taken by
    any other relation is **`42809`** (*"t" is not a view*).
 9. The catalog entry is written, in the main database or the session's temporary domain (§10).
-   An entry longer than a catalog page spans consecutive catalog pages (format.md *Catalog*, v43);
+   An entry longer than a catalog page spans consecutive catalog pages (format.md *Catalog*, v48);
    there is no length limit.
 
 ### 1.2 `CREATE OR REPLACE VIEW` (PG-matched)
@@ -196,7 +196,7 @@ Statements that name a relation of a specific kind treat a view as the wrong kin
 not automatically updatable (§15.1). The rejection happens when the DML target is resolved, before
 any column, value, or `RETURNING` check (§15.3).
 
-## 3. Persistence (`format_version` 38, check option 39, v43)
+## 3. Persistence (`format_version` 38, check option 39, v48)
 
 A view is a catalog entry with `entry_kind = 5` ([../fileformat/format.md](../fileformat/format.md)
 *View entry*). It records:
@@ -208,11 +208,11 @@ A view is a catalog entry with `entry_kind = 5` ([../fileformat/format.md](../fi
 - the **dependency list**: every table and view the body reads, with, for each table, the exact set
   of its columns the body references (§6);
 - the **check option**: none, `LOCAL`, or `CASCADED` (§15.6, `format_version` 39);
-- each output column's **default**, as canonical text (§16.1, v43);
-- the **options** `security_barrier` and `security_invoker` (§16.2, v43).
+- each output column's **default**, as canonical text (§16.1, v48);
+- the **options** `security_barrier` and `security_invoker` (§16.2, v48).
 
-The dependency list also names the sequences and composite types the body uses (§6, v43). An entry
-longer than one catalog page spans consecutive catalog pages (format.md *Catalog*, v43). A
+The dependency list also names the sequences and composite types the body uses (§6, v48). An entry
+longer than one catalog page spans consecutive catalog pages (format.md *Catalog*, v48). A
 temporary view's entry lives in the session's temporary domain, which is never written to the file
 (temp-tables.md §2).
 
@@ -432,7 +432,7 @@ Dropping views is a catalog edit with zero cost, like the drop itself. PostgreSQ
 *drop cascades to* notice; jed has no notice channel (§12). The statement is all-or-nothing: a
 later failure, or a rollback of its transaction, restores every view it dropped.
 
-### 6.2 Sequences, composite types, collations, and host functions (v43)
+### 6.2 Sequences, composite types, collations, and host functions (v48)
 
 PostgreSQL records a view's dependencies on the sequences and types its expressions name; jed
 matches it (pinned against the PG 18 oracle):
@@ -807,10 +807,10 @@ Deferred follow-ons, none foreclosed:
     the check option on every inserted and updated row.
 11. **V11 — `CREATE RECURSIVE VIEW`** (§17).
 12. **V12 — temporary views** (§10), including views that become temporary.
-13. **V13 — view column defaults** (§16.1), `format_version` 43.
+13. **V13 — view column defaults** (§16.1), `format_version` 48.
 14. **V14 — view options** (§16.2): `WITH ( … )`, `SET` / `RESET`, `security_invoker`.
-15. **V15 — sequence and composite-type dependencies** (§6.2), `format_version` 43.
-16. **V16 — definitions longer than one catalog page** (format.md *Catalog*, `format_version` 43).
+15. **V15 — sequence and composite-type dependencies** (§6.2), `format_version` 48.
+16. **V16 — definitions longer than one catalog page** (format.md *Catalog*, `format_version` 48).
 
 Capabilities: `ddl.view` (V1), `ddl.view_rename` (V2 + V4), `query.table_column_alias` (V3),
 `introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6), `dml.view_write` (V7),
@@ -1084,7 +1084,7 @@ check option costs its equivalent base statement, and a check option adds its `W
 
 ## 16. Column defaults and view options
 
-### 16.1 Column defaults (`format_version` 43)
+### 16.1 Column defaults (`format_version` 48)
 
 ```
 ALTER VIEW [IF EXISTS] v ALTER [COLUMN] c SET DEFAULT expr [, …]
@@ -1122,7 +1122,7 @@ write that applies it (extensibility.md §7.1.1), so a function it calls needs t
 default. `jed_columns.column_default` shows it; the dump writes it (§11). A default's sequence is no
 dependency (§12).
 
-### 16.2 View options (`format_version` 43)
+### 16.2 View options (`format_version` 48)
 
 ```
 CREATE VIEW v [(cols)] WITH ( option [= value] [, …] ) AS …
