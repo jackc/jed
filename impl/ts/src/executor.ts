@@ -18573,6 +18573,7 @@ export class Engine {
       type: this.resolveColdefType(d),
       decimal: null,
       varcharLen: null,
+      temporal: null,
       primaryKey: false,
       notNull: false,
       default: null,
@@ -33326,7 +33327,7 @@ export function applyJsonBehavior(
       const v = evalExpr(expr, defaults.row, env, meter);
       if (v.kind !== "jsonb" || returning === "jsonb") return v;
       try {
-        return coerceJsonMember(v.node, scalarT(returning), null, env, meter);
+        return coerceJsonMember(v.node, scalarT(returning), TYPMOD_NONE, env, meter);
       } catch (e) {
         if (!isSqljsonError(e)) throw e;
         throw engineError(
