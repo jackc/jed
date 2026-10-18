@@ -103,10 +103,12 @@ language, because hardening the spec was never the reason to add it.
    package entry points on browser and Node, dedicated execution workers, bounded typed transport,
    session scheduling, prepared/batched execution and cancellation. One TS semantic core serves
    both adapters; synchronous core APIs remain internal for conformance and tooling. Node and
-   shared-memory-capable browsers poll atomic cancellation flags; ordinary browsers currently
-   cancel between operations/fetches. Cooperative interruption of blocking kernels and explicit
-   async page/crypto suspension remain follow-ons. No encryption suite or Rust delivery default
-   is selected by this migration.
+   shared-memory-capable browsers poll atomic cancellation flags; all hosts also cooperate at
+   logical page boundaries and common execution loops through retained continuations shared by
+   sync and async drivers. Cancellation is best effort: sorting, parsing/planning and long scalar
+   kernels stay synchronous. Node data-page reads can await I/O; storage lifecycle, commit and
+   async crypto remain separate work. No encryption suite or Rust delivery default is selected
+   by this migration.
 
 **Beyond the differential set — best experience per language.** For every language past
 core #3 the question is not "how much new divergence does it surface" (usually little) but

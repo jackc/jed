@@ -15,8 +15,10 @@ import type { ColType } from "./catalog.ts";
 import { PMap, pmapFromSkeleton, unboundedBound } from "./pmap.ts";
 import type { KeyBound, LeafShape, LeafSource, PNode, Span } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
+import { runSync, type StepIterator, type Steps } from "./execution.ts";
 import {
   resolveUnfetched,
+  resolveUnfetchedSteps,
   deferredInStoredForm,
   anySpillable,
   anySpillableMasked,
@@ -66,6 +68,10 @@ class PagedSource implements LeafSource {
 
   loadLeaf(page: number): PNode {
     return this.paging.faultLeaf(page, this.colTypes);
+  }
+
+  loadLeafSteps(page: number): Steps<PNode> {
+    return this.paging.faultLeafSteps(page, this.colTypes);
   }
 }
 
@@ -228,11 +234,15 @@ export class TableStore {
   // (primary-key uniqueness); the caller decides how to surface that. May fault the target leaf
   // through the buffer pool (an I/O error then throws).
   insert(key: Uint8Array, row: Row): boolean {
+    return runSync(this.insertSteps(key, row));
+  }
+
+  *insertSteps(key: Uint8Array, row: Row): Steps<boolean> {
     const src = this.leafSrc();
-    if (this.rows.get(key, src) !== undefined) return false;
+    if ((yield* this.rows.getSteps(key, src)) !== undefined) return false;
     const [weight, stored] = this.weight(key, row);
+    yield* this.rows.insertSteps(key, row, weight, this.cap, this.shape, src);
     this.stage(key, stored);
-    this.rows.insert(key, row, weight, this.cap, this.shape, src);
     return true;
   }
 
@@ -257,15 +267,24 @@ export class TableStore {
   // replace overwrites the row stored at an existing key (UPDATE). The key is
   // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
   replace(key: Uint8Array, row: Row): void {
+    runSync(this.replaceSteps(key, row));
+  }
+
+  *replaceSteps(key: Uint8Array, row: Row): Steps<void> {
     const [weight, stored] = this.weight(key, row);
+    yield* this.rows.insertSteps(key, row, weight, this.cap, this.shape, this.leafSrc());
     this.stage(key, stored);
-    this.rows.insert(key, row, weight, this.cap, this.shape, this.leafSrc());
   }
 
   // remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the
   // delete descends into / rebalances against.
   remove(key: Uint8Array): boolean {
-    const removed = this.rows.remove(key, this.cap, this.shape, this.leafSrc()) !== undefined;
+    return runSync(this.removeSteps(key));
+  }
+
+  *removeSteps(key: Uint8Array): Steps<boolean> {
+    const removed =
+      (yield* this.rows.removeSteps(key, this.cap, this.shape, this.leafSrc())) !== undefined;
     if (removed) this.unstage(key);
     return removed;
   }
@@ -275,11 +294,19 @@ export class TableStore {
     return this.rows.get(key, this.leafSrc());
   }
 
+  getSteps(key: Uint8Array): Steps<Row | undefined> {
+    return this.rows.getSteps(key, this.leafSrc());
+  }
+
   // iterInKeyOrder returns the rows in primary-key (encoded byte) order. Eager: leaves fault through
   // the pool during the walk and are dropped (GC) as their rows are collected, so the resident leaf
   // set stays bounded by the pool, not the table (spec/design/pager.md §4).
   iterInKeyOrder(): Row[] {
     return this.rows.inorder(this.leafSrc()).vals;
+  }
+
+  *iterInKeyOrderSteps(): Steps<Row[]> {
+    return (yield* this.rows.rangeEntriesCountedSteps(unboundedBound(), this.leafSrc())).vals;
   }
 
   // nodeCount is the number of B-tree nodes (pages) in this store — the page_read count a full
@@ -309,10 +336,18 @@ export class TableStore {
     return keys.map((k, i) => ({ key: k, row: vals[i] }));
   }
 
+  entriesInKeyOrderSteps(): Steps<Entry[]> {
+    return this.rangeEntriesSteps(unboundedBound());
+  }
+
   // rangeRows returns the rows whose primary key lies within the bound, in key order — a bounded
   // B-tree scan that faults only the leaves the bound spans (spec/design/cost.md §3 "bounded scan").
   rangeRows(b: KeyBound): Row[] {
     return this.rows.rangeEntries(b, this.leafSrc()).vals;
+  }
+
+  *rangeRowsSteps(b: KeyBound): Steps<Row[]> {
+    return (yield* this.rows.rangeEntriesCountedSteps(b, this.leafSrc())).vals;
   }
 
   // rangeEntries returns the (key, row) pairs whose primary key lies within the bound, in key order
@@ -320,6 +355,11 @@ export class TableStore {
   rangeEntries(b: KeyBound): Entry[] {
     const { keys, vals } = this.rows.rangeEntries(b, this.leafSrc());
     return keys.map((k, i) => ({ key: k, row: vals[i] }));
+  }
+
+  *rangeEntriesSteps(b: KeyBound): Steps<Entry[]> {
+    const { keys, vals } = yield* this.rows.rangeEntriesCountedSteps(b, this.leafSrc());
+    return keys.map((key, i) => ({ key, row: vals[i]! }));
   }
 
   // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
@@ -336,17 +376,11 @@ export class TableStore {
   // walk is skipped entirely when no touched column type can spill, so fixed-width tables and
   // untouching queries pay nothing extra.
   scanUnits(mask: boolean[]): { pages: number; slabs: number } {
-    let pages = this.nodeCount();
-    let slabs = 0;
-    if (anySpillableMasked(this.colTypes, mask)) {
-      this.scanRange(unboundedBound(), (key, row) => {
-        const u = recordScanUnits(this.colTypes, key, row, this.cap, mask);
-        pages += u.pages;
-        slabs += u.decompress;
-        return true;
-      });
-    }
-    return { pages, slabs };
+    return runSync(this.scanUnitsSteps(mask));
+  }
+
+  scanUnitsSteps(mask: boolean[]): Steps<{ pages: number; slabs: number }> {
+    return this.countScanUnitsSteps(unboundedBound(), mask, this.nodeCount());
   }
 
   // overlapScanUnits is the up-front cost block a BOUNDED scan over b charges, as
@@ -355,15 +389,33 @@ export class TableStore {
   // spec/design/large-values.md §8/§12/§13). An empty bound or a point-lookup miss admits no record
   // and adds nothing beyond the path nodes.
   overlapScanUnits(b: KeyBound, mask: boolean[]): { pages: number; slabs: number } {
-    let pages = this.overlapNodeCount(b);
+    return runSync(this.overlapScanUnitsSteps(b, mask));
+  }
+
+  overlapScanUnitsSteps(b: KeyBound, mask: boolean[]): Steps<{ pages: number; slabs: number }> {
+    return this.countScanUnitsSteps(b, mask, this.overlapNodeCount(b));
+  }
+
+  private *countScanUnitsSteps(
+    b: KeyBound,
+    mask: boolean[],
+    pages: number,
+  ): Steps<{ pages: number; slabs: number }> {
     let slabs = 0;
     if (anySpillableMasked(this.colTypes, mask)) {
-      this.scanRange(b, (key, row) => {
-        const u = recordScanUnits(this.colTypes, key, row, this.cap, mask);
-        pages += u.pages;
-        slabs += u.decompress;
-        return true;
-      });
+      const iterator = this.scanStepsIter(b, false);
+      try {
+        for (;;) {
+          const item = yield* iterator.nextSteps();
+          if (item.done) break;
+          const [key, row] = item.value;
+          const u = recordScanUnits(this.colTypes, key, row, this.cap, mask);
+          pages += u.pages;
+          slabs += u.decompress;
+        }
+      } finally {
+        if (iterator.returnSteps !== undefined) yield* iterator.returnSteps();
+      }
     }
     return { pages, slabs };
   }
@@ -381,7 +433,14 @@ export class TableStore {
     b: KeyBound,
     mask: boolean[],
   ): { entries: Entry[]; pages: number; slabs: number } {
-    const { keys, vals, nodes } = this.rows.rangeEntriesCounted(b, this.leafSrc());
+    return runSync(this.rangeScanWithUnitsSteps(b, mask));
+  }
+
+  *rangeScanWithUnitsSteps(
+    b: KeyBound,
+    mask: boolean[],
+  ): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
+    const { keys, vals, nodes } = yield* this.rows.rangeEntriesCountedSteps(b, this.leafSrc());
     const entries = keys.map((k, i) => ({ key: k, row: vals[i] }));
     let pages = nodes;
     let slabs = 0;
@@ -400,6 +459,10 @@ export class TableStore {
   // node, so the count equals nodeCount).
   scanWithUnits(mask: boolean[]): { entries: Entry[]; pages: number; slabs: number } {
     return this.rangeScanWithUnits(unboundedBound(), mask);
+  }
+
+  scanWithUnitsSteps(mask: boolean[]): Steps<{ entries: Entry[]; pages: number; slabs: number }> {
+    return this.rangeScanWithUnitsSteps(unboundedBound(), mask);
   }
 
   // laneScanUnits adds the large-value scan units (chain pages, decompress slabs) record i of leaf n
@@ -438,6 +501,13 @@ export class TableStore {
     return this.rows.foldScan(b, this.leafSrc(), visit);
   }
 
+  foldScanMaskedSteps(
+    b: KeyBound,
+    visit: (n: PNode, i: number) => Steps<void>,
+  ): Steps<{ rowCount: number; nodes: number }> {
+    return this.rows.foldScanSteps(b, this.leafSrc(), visit);
+  }
+
   // isFileBacked reports whether this store has a demand-paging pool — the gate for the Track A2/A3
   // columnar gather (packed-leaf.md §11): an in-memory store's Decoded leaves already share their rows
   // zero-copy on the row path, so a lane gather would only add allocation with no packed-leaf win.
@@ -467,7 +537,14 @@ export class TableStore {
     key: Uint8Array,
     mask: boolean[],
   ): { row: Row | undefined; pages: number; slabs: number } {
-    const got = this.rows.getCounted(key, this.leafSrc());
+    return runSync(this.getWithUnitsSteps(key, mask));
+  }
+
+  *getWithUnitsSteps(
+    key: Uint8Array,
+    mask: boolean[],
+  ): Steps<{ row: Row | undefined; pages: number; slabs: number }> {
+    const got = yield* this.rows.getCountedSteps(key, this.leafSrc());
     let pages = got.nodes;
     let slabs = 0;
     if (got.row !== undefined && anySpillableMasked(this.colTypes, mask)) {
@@ -500,13 +577,21 @@ export class TableStore {
   // must never be mutated in place. Repeated scans therefore re-read (and are re-charged)
   // consistently.
   resolveColumns(row: Row, mask: boolean[]): Row {
+    return runSync(this.resolveColumnsSteps(row, mask));
+  }
+
+  *resolveColumnsSteps(row: Row, mask: boolean[]): Steps<Row> {
     if (!row.some((v, i) => mask[i] && v.kind === "unfetched")) return row;
     const paging = this.paging;
     if (paging === null) throw new Error("an unfetched value implies a paged store");
-    const fetch = (p: number): Uint8Array => paging.readBlock(p);
-    return row.map((v, i) =>
-      mask[i] && v.kind === "unfetched" ? resolveUnfetched(this.colTypes[i]!, v.ref, fetch) : v,
-    );
+    const fetch = (p: number): Steps<Uint8Array> => paging.readBlockSteps(p);
+    const resolved = row.slice();
+    for (let i = 0; i < row.length; i++) {
+      const value = row[i]!;
+      if (mask[i] && value.kind === "unfetched")
+        resolved[i] = yield* resolveUnfetchedSteps(this.colTypes[i]!, value.ref, fetch);
+    }
+    return resolved;
   }
 
   // resolveInlineColumns returns `row` with only its inline-deferred values — the form 0x00
@@ -538,9 +623,13 @@ export class TableStore {
 
   // resolveValue materializes one deferred value of column col through this store's pager.
   resolveValue(col: number, u: Unfetched): Value {
+    return runSync(this.resolveValueSteps(col, u));
+  }
+
+  *resolveValueSteps(col: number, u: Unfetched): Steps<Value> {
     const paging = this.paging;
     if (paging === null) throw new Error("an unfetched value implies a paged store");
-    return resolveUnfetched(this.colTypes[col]!, u, (p) => paging.readBlock(p));
+    return yield* resolveUnfetchedSteps(this.colTypes[col]!, u, (p) => paging.readBlockSteps(p));
   }
 
   // settleCarried settles the deferred values an UPDATE's new row carries over (large-values.md
@@ -550,11 +639,15 @@ export class TableStore {
   // own plan's output — the invariant the scan cost walk and the commit encoder rely on. `row` is the
   // caller's own copy and is updated in place.
   settleCarried(key: Uint8Array, row: Row): Row {
+    return runSync(this.settleCarriedSteps(key, row));
+  }
+
+  *settleCarriedSteps(key: Uint8Array, row: Row): Steps<Row> {
     if (!row.some((v) => v.kind === "unfetched")) return row;
     const kept = deferredInStoredForm(this.colTypes, key, row, this.cap);
     for (let i = 0; i < row.length; i++) {
       const v = row[i]!;
-      if (v.kind === "unfetched" && !kept[i]) row[i] = this.resolveValue(i, v.ref);
+      if (v.kind === "unfetched" && !kept[i]) row[i] = yield* this.resolveValueSteps(i, v.ref);
     }
     return row;
   }
@@ -563,7 +656,11 @@ export class TableStore {
   // this on a row it is about to re-store (UPDATE), so the stored row is fully resident and its
   // weight/disposition re-plan exactly like an eager writer's (large-values.md §14).
   resolveAll(row: Row): Row {
-    return this.resolveColumns(
+    return runSync(this.resolveAllSteps(row));
+  }
+
+  resolveAllSteps(row: Row): Steps<Row> {
+    return this.resolveColumnsSteps(
       row,
       this.colTypes.map(() => true),
     );
@@ -573,14 +670,57 @@ export class TableStore {
   // (without faulting further leaves) the moment visit returns false — the genuine LIMIT short-circuit
   // (spec/design/cost.md §3 "LIMIT short-circuit").
   scanRange(b: KeyBound, visit: (key: Uint8Array, row: Row) => boolean): void {
-    this.rows.scanRange(b, this.leafSrc(), visit);
+    runSync(
+      this.scanRangeSteps(
+        b,
+        // biome-ignore lint/correctness/useYield: A synchronous visitor is a continuation with no effects.
+        function* (key, row) {
+          return visit(key, row);
+        },
+      ),
+    );
+  }
+
+  scanRangeSteps(b: KeyBound, visit: (key: Uint8Array, row: Row) => Steps<boolean>): Steps<void> {
+    return this.visitRangeSteps(b, false, visit);
   }
 
   // scanRangeRev is scanRange in reverse: it yields the in-bound rows in DESCENDING key order — a
   // DESC reverse scan (spec/design/cost.md §3), stopping the same way on a false visit so a reverse
   // top-N short-circuits from the high end.
   scanRangeRev(b: KeyBound, visit: (key: Uint8Array, row: Row) => boolean): void {
-    this.rows.scanRangeRev(b, this.leafSrc(), visit);
+    runSync(
+      this.scanRangeRevSteps(
+        b,
+        // biome-ignore lint/correctness/useYield: A synchronous visitor is a continuation with no effects.
+        function* (key, row) {
+          return visit(key, row);
+        },
+      ),
+    );
+  }
+
+  scanRangeRevSteps(
+    b: KeyBound,
+    visit: (key: Uint8Array, row: Row) => Steps<boolean>,
+  ): Steps<void> {
+    return this.visitRangeSteps(b, true, visit);
+  }
+
+  private *visitRangeSteps(
+    b: KeyBound,
+    reverse: boolean,
+    visit: (key: Uint8Array, row: Row) => Steps<boolean>,
+  ): Steps<void> {
+    const iterator = this.scanStepsIter(b, reverse);
+    try {
+      for (;;) {
+        const item = yield* iterator.nextSteps();
+        if (item.done || !(yield* visit(item.value[0], item.value[1]))) return;
+      }
+    } finally {
+      if (iterator.returnSteps !== undefined) yield* iterator.returnSteps();
+    }
   }
 
   // scanIter is the PULL form of scanRange / scanRangeRev — a generator yielding (key, row) within b
@@ -594,8 +734,16 @@ export class TableStore {
     return reverse ? this.rows.scanRangeRevIter(b, src) : this.rows.scanRangeIter(b, src);
   }
 
+  scanStepsIter(b: KeyBound, reverse: boolean): StepIterator<[Uint8Array, Row]> {
+    return this.rows.scanRangeStepsIter(b, this.leafSrc(), reverse);
+  }
+
   scanRowsIter(b: KeyBound, reverse: boolean): Generator<Row> {
     return this.rows.scanRowsIter(b, this.leafSrc(), reverse);
+  }
+
+  scanRowsStepsIter(b: KeyBound, reverse: boolean): StepIterator<Row> {
+    return this.rows.scanRowsStepsIter(b, this.leafSrc(), reverse);
   }
 
   // treeRoot is the root B-tree node of this store, for the page-backed serializer

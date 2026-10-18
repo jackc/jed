@@ -11,6 +11,7 @@
 // P5.3's per-core concurrency.
 
 import type { PNode } from "./pmap.ts";
+import { ioSteps, runSync, type Steps } from "./execution.ts";
 
 // One resident page: its id, the cached node, and the CLOCK reference bit (set on access, cleared by
 // the sweeping hand to grant a second chance).
@@ -24,6 +25,7 @@ export class BufferPool {
   private slots: Slot[] = [];
   private index = new Map<number, number>();
   private hand = 0;
+  private generation = 0;
 
   constructor(capacity: number) {
     this.capacity = Math.max(1, capacity);
@@ -33,13 +35,20 @@ export class BufferPool {
   // reference bit), a miss calls load (read + decode the page), caches it — evicting one page under
   // CLOCK if at capacity — and returns it.
   getOrLoad(page: number, load: () => PNode): PNode {
+    return runSync(this.getOrLoadSteps(page, () => ioSteps(load)));
+  }
+
+  *getOrLoadSteps(page: number, load: () => Steps<PNode>): Steps<PNode> {
     const i = this.index.get(page);
     if (i !== undefined) {
       this.slots[i].referenced = true;
       return this.slots[i].node;
     }
-    const node = load();
-    this.insertSlot(page, node);
+    const generation = this.generation;
+    const node = yield* load();
+    // A failed or canceled load changes no cache state. An invalidation during a suspended
+    // load prevents its old decode from being installed into the newer cache generation.
+    if (generation === this.generation && !this.index.has(page)) this.insertSlot(page, node);
     return node;
   }
 
@@ -87,6 +96,7 @@ export class BufferPool {
   // invalidateAll drops every cached page — a page client told by the owner that its whole cache may be
   // stale (spec/pageservice/README.md §3.2).
   invalidateAll(): void {
+    this.generation++;
     this.slots = [];
     this.index = new Map();
     this.hand = 0;
@@ -99,6 +109,7 @@ export class BufferPool {
   // page is not resident — the common case, since a copy-on-write commit without reuse only ever writes
   // fresh, never-cached high-water pages (so the main file path pays only a map lookup).
   invalidate(page: number): void {
+    this.generation++;
     const i = this.index.get(page);
     if (i === undefined) return;
     this.index.delete(page);

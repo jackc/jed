@@ -25,7 +25,17 @@ import type { Acc, AggSpec, EvalEnv, ResolvedFrame, SelectPlan } from "./executo
 import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
 import { nullValue } from "./value.ts";
-import { evalExpr, evalFilter } from "./eval.ts";
+import { evalExpressionsSteps, evalFilterSteps } from "./eval.ts";
+import {
+  COOPERATE,
+  runSync,
+  sequenceSteps,
+  shouldCooperate,
+  syncStepIterator,
+  type SequenceSteps,
+  type StepIterator,
+  type Steps,
+} from "./execution.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { COSTS, DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { entryBytes } from "./memsize.ts";
@@ -522,27 +532,35 @@ export type LaneAt = (j: number, col: number) => Value;
 // state, hence finalizeAcc, to the scalar path), charging aggregateAccumulate once per (survivor × spec)
 // in bulk — the identical total to the scalar loop (per row × spec), cost-safe because the caller gates
 // to the unmetered lane (no per-row guard to preserve).
-export function foldAggWhole(
+export function foldAggWhole(...args: Parameters<typeof foldAggWholeSteps>): Value[] {
+  return runSync(foldAggWholeSteps(...args));
+}
+
+export function* foldAggWholeSteps(
   specs: AggSpec[],
   at: LaneAt,
   nsurv: number,
   zone: ZoneRef,
   meter: Meter,
-): Value[] {
+): Steps<Value[]> {
   const accs = specs.map((s) => newAccFromSpec(s, zone));
   // The whole-table group's entry (memory.md §6.2), returned once the group is finalized.
   const charge = meter.stateCharge();
   if (charge.active()) charge.reserve(meter, entryBytes([]));
-  specs.forEach((spec, si) => {
-    meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv));
-    const oc = operandCol(spec);
-    for (let j = 0; j < nsurv; j++) {
-      foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
+  try {
+    for (let si = 0; si < specs.length; si++) {
+      const spec = specs[si]!;
+      meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv));
+      const oc = operandCol(spec);
+      for (let j = 0; j < nsurv; j++) {
+        if (shouldCooperate()) yield COOPERATE;
+        foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
+      }
     }
-  });
-  const out = accs.map((a) => finalizeAcc(a));
-  charge.releaseAll();
-  return out;
+    return accs.map((a) => finalizeAcc(a));
+  } finally {
+    charge.releaseAll();
+  }
 }
 
 // groupByIntKey buckets `nsurv` survivors from `at` by their single INTEGER group-key column and folds
@@ -553,14 +571,18 @@ export function foldAggWhole(
 // (survivor × spec) in bulk — the identical total to the scalar loop. The bucketing is unmetered
 // (cost.md §3), so the bigint map is a free internal choice. The caller has verified every needed lane
 // is populated.
-export function groupByIntKey(
+export function groupByIntKey(...args: Parameters<typeof groupByIntKeySteps>): Value[][] {
+  return runSync(groupByIntKeySteps(...args));
+}
+
+export function* groupByIntKeySteps(
   specs: AggSpec[],
   keyCol: number,
   at: LaneAt,
   nsurv: number,
   zone: ZoneRef,
   meter: Meter,
-): Value[][] {
+): Steps<Value[][]> {
   const groups: { key: Value; accs: Acc[] }[] = [];
   const index = new Map<bigint, number>();
   let nullGi = -1;
@@ -568,44 +590,50 @@ export function groupByIntKey(
   // admitted, so the whole table is returned after the last finalize.
   const charge = meter.stateCharge();
 
-  meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(specs.length));
-  for (let j = 0; j < nsurv; j++) {
-    const kv = at(j, keyCol);
-    let gi: number;
-    if (kv.kind === "int") {
-      const g = index.get(kv.int);
-      if (g === undefined) {
-        if (charge.active()) charge.reserve(meter, entryBytes([kv]));
-        gi = groups.length;
-        index.set(kv.int, gi);
-        groups.push({ key: kv, accs: specs.map((s) => newAccFromSpec(s, zone)) });
+  try {
+    meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(specs.length));
+    for (let j = 0; j < nsurv; j++) {
+      if (shouldCooperate()) yield COOPERATE;
+      const kv = at(j, keyCol);
+      let gi: number;
+      if (kv.kind === "int") {
+        const g = index.get(kv.int);
+        if (g === undefined) {
+          if (charge.active()) charge.reserve(meter, entryBytes([kv]));
+          gi = groups.length;
+          index.set(kv.int, gi);
+          groups.push({ key: kv, accs: specs.map((s) => newAccFromSpec(s, zone)) });
+        } else {
+          gi = g;
+        }
       } else {
-        gi = g;
+        // A NULL integer key (the only other case for an integer column) buckets into one sentinel
+        // group, exactly as the scalar path groups all NULLs together.
+        if (nullGi < 0) {
+          if (charge.active()) charge.reserve(meter, entryBytes([nullValue()]));
+          nullGi = groups.length;
+          groups.push({ key: nullValue(), accs: specs.map((s) => newAccFromSpec(s, zone)) });
+        }
+        gi = nullGi;
       }
-    } else {
-      // A NULL integer key (the only other case for an integer column) buckets into one sentinel
-      // group, exactly as the scalar path groups all NULLs together.
-      if (nullGi < 0) {
-        if (charge.active()) charge.reserve(meter, entryBytes([nullValue()]));
-        nullGi = groups.length;
-        groups.push({ key: nullValue(), accs: specs.map((s) => newAccFromSpec(s, zone)) });
-      }
-      gi = nullGi;
+      const accs = groups[gi]!.accs;
+      specs.forEach((spec, si) => {
+        const oc = operandCol(spec);
+        foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
+      });
     }
-    const accs = groups[gi]!.accs;
-    specs.forEach((spec, si) => {
-      const oc = operandCol(spec);
-      foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
-    });
-  }
 
-  const out = groups.map((g) => {
-    const srow: Value[] = [g.key];
-    for (const a of g.accs) srow.push(finalizeAcc(a));
-    return srow;
-  });
-  charge.releaseAll();
-  return out;
+    const out: Value[][] = [];
+    for (const g of groups) {
+      if (shouldCooperate()) yield COOPERATE;
+      const srow: Value[] = [g.key];
+      for (const a of g.accs) srow.push(finalizeAcc(a));
+      out.push(srow);
+    }
+    return out;
+  } finally {
+    charge.releaseAll();
+  }
 }
 
 // streamRows is the lazy pull pipeline behind a streaming cursor (spec/design/streaming.md §3/§4, S3):
@@ -616,7 +644,27 @@ export function groupByIntKey(
 // abandons the generator (its for-of returns the inner scanIter) and faults no further leaves. The
 // LIMIT check sits AFTER the yield, so once the window is full the generator returns BEFORE the for-of
 // pulls another row (matching execStreamingScan's stop-after-the-limit-th-row, cost.md §3).
-export function* streamRows(
+export function streamRowsSteps(
+  ...args: Parameters<typeof streamRowsSequence>
+): StepIterator<Value[]> {
+  return sequenceSteps(streamRowsSequence(...args));
+}
+
+export function streamRows(...args: Parameters<typeof streamRowsSequence>): Generator<Value[]> {
+  return syncStepIterator(streamRowsSteps(...args));
+}
+
+export function bufferedRowsSteps(
+  ...args: Parameters<typeof bufferedRowsSequence>
+): StepIterator<Value[]> {
+  return sequenceSteps(bufferedRowsSequence(...args));
+}
+
+export function bufferedRows(...args: Parameters<typeof bufferedRowsSequence>): Generator<Value[]> {
+  return syncStepIterator(bufferedRowsSteps(...args));
+}
+
+function* streamRowsSequence(
   sp: SelectPlan,
   env: EvalEnv,
   meter: Meter,
@@ -627,17 +675,18 @@ export function* streamRows(
     | { kind: "deferred"; key: Uint8Array }
     | { kind: "prefetched"; row: Row | undefined }
     | null,
-): Generator<Value[]> {
+): SequenceSteps<Value[]> {
   if (empty || sp.limit === 0n) return;
   const offset = sp.offset ?? 0n;
   const distinct = sp.distinct;
   const seen = new SpillSet(env.exec.session.workMem, env.exec.spillSink, meter.stateCharge());
   // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
-  const input = (
-    point === null ? store.scanRowsIter(bound, sp.phys.pkReverse) : pointRows(store, point)
-  )[Symbol.iterator]();
-  const pull = (): Row | null => {
-    const r = input.next();
+  const input =
+    point === null
+      ? store.scanRowsStepsIter(bound, sp.phys.pkReverse)
+      : sequenceSteps(pointRowsSequence(store, point));
+  const pull = function* (): Steps<Row | null> {
+    const r = yield* input.nextSteps();
     return r.done === true ? null : r.value;
   };
   // A host call in the WHERE or projection reads the scan ahead into a window and replays it row by
@@ -658,27 +707,28 @@ export function* streamRows(
       let at = -1; // the row's read-ahead window index, or -1
       if (ra !== null) {
         const remaining = sp.limit === null ? null : offset + sp.limit - passed;
-        const i = ra.next(readAheadCap(meter, COSTS.storageRowRead, remaining), pull);
+        const i = yield* ra.nextSteps(readAheadCap(meter, COSTS.storageRowRead, remaining), pull);
         rawRow = i === null ? null : ra.rows[i]!;
         at = i ?? -1;
       } else {
-        rawRow = pull();
+        rawRow = yield* pull();
       }
       if (rawRow === null) break;
+      if (shouldCooperate()) yield COOPERATE;
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain
       // reads were already metered in the up-front block (cost.md §3).
-      const row = store.resolveColumns(rawRow, sp.relMasks[0]!);
+      const row = yield* store.resolveColumnsSteps(rawRow, sp.relMasks[0]!);
       if (sp.filter !== null) {
         if (at >= 0) ra!.setRow(ra!.filter, at, env, meter);
-        if (!evalFilter(sp.filter, row, filterEnv, meter)) continue;
+        if (!(yield* evalFilterSteps(sp.filter, row, filterEnv, meter))) continue;
       }
       if (distinct) {
         // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even for a
         // duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window the survivors.
         if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
-        const tuple = sp.projections.map((p) => evalExpr(p, row, projectEnv, meter));
+        const tuple = yield* evalExpressionsSteps(sp.projections, row, projectEnv, meter);
         const key = distinctRowKey(tuple);
         // A new value reserves its dedup entry until the scan ends (memory.md §6.2).
         if (!meter.costFirst(() => seen.insert(key, tuple))) continue;
@@ -686,14 +736,17 @@ export function* streamRows(
         if (passed <= offset) continue;
         meter.charge(COSTS.rowProduced);
         produced += 1n;
-        yield tuple;
+        yield { kind: "item", value: tuple };
       } else {
         passed += 1n;
         if (passed <= offset) continue;
         meter.charge(COSTS.rowProduced);
         produced += 1n;
         if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
-        yield sp.projections.map((p) => evalExpr(p, row, projectEnv, meter));
+        yield {
+          kind: "item",
+          value: yield* evalExpressionsSteps(sp.projections, row, projectEnv, meter),
+        };
       }
       // The LIMIT short-circuit (cost.md §3): once the window is full, stop WITHOUT pulling another row —
       // so no further leaf is faulted (the streaming early-exit win). The check is after the yield, so the
@@ -701,17 +754,18 @@ export function* streamRows(
       if (sp.limit !== null && produced >= sp.limit) return;
     }
   } finally {
-    input.return?.(undefined);
+    if (input.returnSteps !== undefined) yield* input.returnSteps();
     seen.close();
   }
 }
 
-function* pointRows(
+function* pointRowsSequence(
   store: TableStore,
   point: { kind: "deferred"; key: Uint8Array } | { kind: "prefetched"; row: Row | undefined },
-): Generator<Row> {
-  const row = point.kind === "prefetched" ? point.row : store.get(point.key);
-  if (row !== undefined) yield row;
+): SequenceSteps<Row> {
+  const row =
+    point.kind === "prefetched" ? point.row : (yield* store.getWithUnitsSteps(point.key, [])).row;
+  if (row !== undefined) yield { kind: "item", value: row };
 }
 
 // bufferedRows is the lazy pull pipeline behind a BUFFERED cursor for a blocking plan
@@ -724,20 +778,21 @@ function* pointRows(
 // abort surfaces during the first pull, not at query() — streaming.md §6), peak output memory is one
 // row, a caller's early exit (abandoning the generator) skips the projection of the rows it never pulls,
 // and a fully-drained query observes the same rows + total cost as the eager path (streaming.md §6).
-export function* bufferedRows(
+function* bufferedRowsSequence(
   engine: Engine,
   plan: SelectPlan,
   env: EvalEnv,
   meter: Meter,
   params: Value[],
-): Generator<Value[]> {
-  const em = engine.execSelectEmit(plan, env, meter, params);
+): SequenceSteps<Value[]> {
+  const em = yield* engine.execSelectEmitSteps(plan, env, meter, params);
   if (em.mode === "final") {
     // Already projected + charged — hand each row out (no further cost); it leaves engine ownership,
     // so its query-memory charge is released (memory.md §5.3).
     for (const row of em.rows) {
+      if (shouldCooperate()) yield COOPERATE;
       meter.releaseRow(row);
-      yield row;
+      yield { kind: "item", value: row };
     }
     return;
   }
@@ -756,6 +811,7 @@ export function* bufferedRows(
     const projectEnv: EvalEnv = ra === null ? env : { ...env, hostBatch: ra.project! };
     try {
       for (let i = 0; i < em.end; i++) {
+        if (shouldCooperate()) yield COOPERATE;
         let row: Row | null;
         let at = -1; // the row's read-ahead window index, or -1
         if (ra !== null) {
@@ -774,9 +830,12 @@ export function* bufferedRows(
         }
         if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
         const r = row;
-        yield em.sortedIdentity
-          ? r
-          : plan.projections.map((p) => evalExpr(p, r, projectEnv, meter));
+        yield {
+          kind: "item",
+          value: em.sortedIdentity
+            ? r
+            : yield* evalExpressionsSteps(plan.projections, r, projectEnv, meter),
+        };
       }
     } finally {
       sorted.close();
@@ -791,9 +850,10 @@ export function* bufferedRows(
     const projCols = em.projCols!;
     try {
       for (let j = em.start; j < em.end; j++) {
+        if (shouldCooperate()) yield COOPERATE;
         meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
-        yield projCols.map((c) => cols[c]![j]!);
+        yield { kind: "item", value: projCols.map((c) => cols[c]![j]!) };
       }
     } finally {
       // Exhausted or closed: the lanes' charge is returned with them (memory.md §6.5).
@@ -809,16 +869,20 @@ export function* bufferedRows(
       : null;
   const benv: EvalEnv = batch === null ? env : { ...env, hostBatch: batch };
   for (let i = em.start; i < em.end; i++) {
+    if (shouldCooperate()) yield COOPERATE;
     meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
     meter.charge(COSTS.rowProduced);
     if (em.mode === "identity") {
       // A pre-projected buffer row leaves engine ownership (memory.md §5.3).
       const row = em.rows[i]!;
       meter.releaseRow(row);
-      yield row;
+      yield { kind: "item", value: row };
     } else {
       batch?.setRow(i, em.rows, em.end, env, meter);
-      yield plan.projections.map((p) => evalExpr(p, em.rows[i]!, benv, meter));
+      yield {
+        kind: "item",
+        value: yield* evalExpressionsSteps(plan.projections, em.rows[i]!, benv, meter),
+      };
     }
   }
 }

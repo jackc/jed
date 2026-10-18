@@ -5,6 +5,7 @@
 // produces a new Snapshot and never mutates this one. (JavaScript has no shared-memory threads for
 // live objects, so P5.3b gives snapshot ISOLATION across async interleavings, not CPU parallelism.)
 import { type IndexEntry, indexBuildInsert, sortIndexEntries } from "./gin_runs.ts";
+import { COOPERATE, shouldCooperate, runSync, type Steps } from "./execution.ts";
 import type {
   ColType,
   CompositeType,
@@ -288,6 +289,10 @@ export class Snapshot {
   // a pure function of the leaf SET — content-deterministic, cross-core identical, and identical to the
   // on-disk persisted R-tree. Trees whose index has been dropped are removed.
   rebuildGistTrees(): void {
+    return runSync(this.rebuildGistTreesSteps());
+  }
+
+  *rebuildGistTreesSteps(): Steps<void> {
     const specs: { nameKey: string; ops: GistOpclass[] }[] = [];
     for (const t of this.tables.values()) {
       for (const idx of t.indexes) {
@@ -303,8 +308,9 @@ export class Snapshot {
     const live = new Set(specs.map((s) => s.nameKey));
     for (const k of [...this.gistTrees.keys()]) if (!live.has(k)) this.gistTrees.delete(k);
     for (const sp of specs) {
+      if (shouldCooperate()) yield COOPERATE;
       const store = this.indexStores.get(sp.nameKey);
-      const keys = store ? store.entriesInKeyOrder().map((e) => e.key) : [];
+      const keys = store ? (yield* store.entriesInKeyOrderSteps()).map((e) => e.key) : [];
       this.gistTrees.set(sp.nameKey, buildGistFromLeafKeys(sp.ops, keys));
     }
   }
