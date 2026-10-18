@@ -405,8 +405,8 @@ type simDB struct {
 	// shrinkDue is set when a relaxed commit lowered the high-water: the next flush (the batch cap, close)
 	// must shorten the file (format.md *Trailing truncation*, validated-cow.md §4).
 	shrinkDue bool
-	// ownerLost is set when an owner died under synchronous = off: until a process observes main
-	// again, it may have recovered any version from the floor up.
+	// ownerLost is set when an owner died: until a process observes the database again, it may have
+	// recovered any version from the floor up.
 	ownerLost bool
 }
 
@@ -2370,10 +2370,12 @@ func (r *simRunner) closeProc(pid int) error {
 // dropProc abandons process pid as a crash does: its sessions and Database vanish without closing,
 // and the kernel releases its locks.
 func (r *simRunner) dropProc(pid int) {
-	if p := r.procs[pid]; r.relaxed && p != nil && p.db != nil {
-		// A dead owner's batch may be lost back to the floor (validated-cow.md §4): the simulated
-		// process crash may drop writes of the step that acknowledged a commit. Each database it owned
-		// (main or an attachment under the service) has its own batch.
+	if p := r.procs[pid]; p != nil && p.db != nil {
+		// A dead owner may take every version above the floor with it (§8.2): under synchronous = off
+		// the simulated process crash may drop writes of the step that acknowledged a commit, and under
+		// either mode a generation it adopted but never stabilized (validated-cow.md §3) may be dropped
+		// by a failed stabilization sync. Each database it owned (main or an attachment under the
+		// service) has its own floor.
 		for _, d := range r.dbs {
 			if c := simServiceCore(p.db, d); c != nil && c.pageOwner() != nil {
 				d.ownerLost = true
