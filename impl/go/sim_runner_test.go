@@ -1927,6 +1927,19 @@ func (r *simRunner) stepBackup(i int, st simStep) {
 // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
 // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
 func (r *simRunner) stepAttach(i int, name string) {
+	// Attaching takes the writer gate. The generator never attaches while a writer is open; a trace
+	// that does (a shrinking artifact) would wait forever on this one thread, so it is invalid.
+	var writers []string
+	for sid, ss := range r.sessions {
+		if ss.write {
+			writers = append(writers, sid)
+		}
+	}
+	if len(writers) > 0 {
+		sort.Strings(writers)
+		r.fail(i, "attach %s while %s holds the writer gate", name, writers[0])
+		return
+	}
 	d := r.dbs[name]
 	if d != nil && r.dbVersion(d) != 0 && (!r.service || r.attachedInAll(name)) {
 		r.emit(`{"i":%d,"op":"attach","db":%q,"version":%d}`, i, name, d.version)

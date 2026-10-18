@@ -135,7 +135,7 @@ check
 | `reopen` | Ends every session (rolling back a writer), closes cleanly, and opens again. |
 | `compact [<db>]` | Host compaction of `main` or a file attachment (api.md §2.6), through the simulated filesystem. |
 | `backup page_identical\|compacted [p<N>]` | A backup of `main` (page-service.md §9) by process `p` (default: the lowest running), into a new file `<main>.backup<K>` through the simulated filesystem, while every other session keeps its pin and writer gate. Its oracle is §8.3's *Backups*. |
-| `attach <name>` | Attaches the file database `<name>.jed` read-write (attached-databases.md §4), first creating it through the simulated filesystem if it does not exist. Every later process re-attaches every attachment whose file exists. In a service trace it attaches the file in every running process under the page service, main's owner first (S11). |
+| `attach <name>` | Attaches the file database `<name>.jed` read-write (attached-databases.md §4), first creating it through the simulated filesystem if it does not exist. Every later process re-attaches every attachment whose file exists. In a service trace it attaches the file in every running process under the page service, main's owner first (S11). Attaching takes the writer gate, so the generator emits it only while no writer is open; a trace that attaches while one is (a shrinking artifact) is invalid, a violation of its own, as a second write-open is, rather than a wait that would hang a threaded core's single-threaded runner. |
 | `corrupt flips=N [reseal=1]` | Bit rot in the main file (§6.3). Ends every session cleanly, flips bits, opens and reads, then repairs. |
 | `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
