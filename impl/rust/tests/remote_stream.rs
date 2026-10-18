@@ -220,3 +220,61 @@ fn scans_read_ahead_without_changing_cost() {
     );
     remote.close().unwrap();
 }
+
+/// Take a page-identical and a compacted backup of `db` beside `path` under `tag`, and return their
+/// bytes.
+fn backups(db: &Database, path: &Path, tag: &str) -> (Vec<u8>, Vec<u8>) {
+    let identical = path.with_extension(format!("{tag}.identical.jed"));
+    let compacted = path.with_extension(format!("{tag}.compacted.jed"));
+    let _ = std::fs::remove_file(&identical);
+    let _ = std::fs::remove_file(&compacted);
+    db.backup_for_testing(&identical, true).unwrap();
+    db.backup_for_testing(&compacted, false).unwrap();
+    (
+        std::fs::read(&identical).unwrap(),
+        std::fs::read(&compacted).unwrap(),
+    )
+}
+
+/// A backup (page-service.md §9) through a stream client walks the same pinned version with
+/// `read_pages`, so both forms are byte-identical to the local handle's backup — whether `jed pages`
+/// relays to a live owner or owns the file itself.
+#[test]
+fn remote_backup_matches_the_local_backup() {
+    let path = tmp("backup.jed");
+    create(&path);
+    {
+        // Dead pages, so the free-list chain and the zeroed pages are exercised too.
+        let mut db = Database::open(&path).unwrap();
+        db.execute("DELETE FROM t WHERE id % 3 = 0", &[]).unwrap();
+        db.execute("UPDATE t SET v = 'short' WHERE id < 500", &[])
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    // Relayed: the local owner and the remote client back up the same committed version.
+    let owner = Database::open(&path).unwrap();
+    assert_eq!(owner.page_service_role_for_testing(), "owner");
+    let local = backups(&owner, &path, "local");
+    let remote = open_remote("pages", &path).unwrap();
+    assert_eq!(remote.page_service_role_for_testing(), "client");
+    let relayed = backups(&remote, &path, "relayed");
+    assert!(
+        local.0 == relayed.0,
+        "relayed page-identical backup differs"
+    );
+    assert!(local.1 == relayed.1, "relayed compacted backup differs");
+    remote.close().unwrap();
+    owner.close().unwrap();
+
+    // `jed pages` owns the file: nothing has committed since, so the backups are the same bytes.
+    let remote = open_remote("pages", &path).unwrap();
+    let owned = backups(&remote, &path, "owned");
+    assert!(local.0 == owned.0, "owned page-identical backup differs");
+    assert!(local.1 == owned.1, "owned compacted backup differs");
+    remote.close().unwrap();
+
+    let mut copy = open_after_server_exits(&path.with_extension("relayed.identical.jed"));
+    assert_eq!(scalar(&mut copy, "SELECT count(*) FROM t"), 2000 - 666);
+    copy.close().unwrap();
+}

@@ -472,7 +472,9 @@ return (§5.5) to finish, then answers:
 
 Both backup forms are page-service clients, so they work locally and over SSH alike. Each pins one
 committed snapshot the way a reader does (`begin_read`) and copies it into a new file; neither takes
-the writer gate, so a backup never waits for a writer and never sees an uncommitted write.
+the writer gate, so a backup never waits for a writer and never sees an uncommitted write. Over the
+stream transport (Rust, phase 5) a backup through `Database::open_remote` produces both forms
+byte-identical to the local handle's, whether `jed pages` relays or owns (`tests/remote_stream.rs`).
 
 - **Page-identical** (the `pg_basebackup` analogue). The backup walks the pinned snapshot with its own
   engine and copies every page reachable from it — the catalog chain, every table and index B+tree,
