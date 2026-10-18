@@ -74,19 +74,19 @@ module JedNative
         labels = [source[:alias] || source[:name]]
         labels.concat(%w[old new]) if mutation
         ordinals = []
-        visit = lambda do |node|
+        visit = lambda do |node, nested = false|
           case node
-          when Array then node.each { |child| visit.call(child) }
+          when Array then node.each { |child| visit.call(child, nested) }
           when Hash
-            if node[:kind] == :column && (!node[:table] || labels.include?(node[:table]))
+            if node[:kind] == :column && (node[:table] ? labels.include?(node[:table]) : !nested)
               ordinal = stored[:columns].index { |column| column[:name] == node[:name] }
               ordinals << ordinal if ordinal
-            elsif node[:kind] == :star && (!node[:table] || labels.include?(node[:table]))
+            elsif node[:kind] == :star && (node[:table] ? labels.include?(node[:table]) : !nested)
               ordinals.concat(stored[:columns].each_index.to_a)
             elsif node[:kind] == :call && node[:name] == 'count' && node[:args]&.first&.dig(:kind) == :star
-              visit.call(node[:filter])
+              visit.call(node[:filter], nested)
             else
-              node.each_value { |child| visit.call(child) }
+              node.each { |key, child| visit.call(child, nested || key == :query) }
             end
           end
         end
@@ -164,9 +164,13 @@ module JedNative
         return storage_stream_rows(stored, lower: lower, upper: upper, reverse: @native_reverse_scan)
       end
       entries = stored[:native_primary_entries]
-      first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
-      last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
-      ordinals = entries[first...last].map(&:last)
+      if stored[:rows].is_a?(PagedRows)
+        ordinals = storage_scan_entries(stored, lower: lower, upper: upper).map(&:last)
+      else
+        first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
+        last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
+        ordinals = entries[first...last].map(&:last)
+      end
       charge(primary_page_count(stored, lower, upper))
       charge_scan_payload(stored, ordinals)
       scan_rows(stored, ordinals)
@@ -210,10 +214,16 @@ module JedNative
         upper = prefix.empty? ? nil : prefix_successor(prefix)
         if range
           ordinal, comparisons = range
-          present, = stored[:native_secondary_codec].ordered_slot_tags(*details[:orders][ordinal])
-          lower = prefix + [present].pack('C')
-          upper = prefix_successor(lower)
+          encodable = comparisons.reject { |_, source| details[:types][ordinal] == 'decimal' && source.extra&.dig(:native_integer_bound) }
+          unless encodable.empty?
+            present, = stored[:native_secondary_codec].ordered_slot_tags(*details[:orders][ordinal])
+            lower = prefix + [present].pack('C')
+            upper = prefix_successor(lower)
+          end
           comparisons.each do |operator, value_expression|
+            # The shared bound encoder widens an integer-literal endpoint
+            # whose comparison adapted to decimal; the residual checks it.
+            next if details[:types][ordinal] == 'decimal' && value_expression.extra&.dig(:native_integer_bound)
             value = evaluate(value_expression, [])
             return [] if value.nil?
             value = normalize_scan_bound(details[:types][ordinal], value)
@@ -234,20 +244,25 @@ module JedNative
         end
         return [] if lower && upper && lower >= upper
         entries = indexes[name]
-        first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
-        last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
-        choices << [last - first, name.b, name, first, last, lower, upper]
+        if stored[:rows].is_a?(PagedRows)
+          selected = storage_scan_entries(stored, name, lower: lower, upper: upper).map(&:last)
+          choices << [selected.length, name.b, name, nil, nil, lower, upper, selected]
+        else
+          first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
+          last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
+          choices << [last - first, name.b, name, first, last, lower, upper, nil]
+        end
       end
       choice = choices.min
       return nil unless choice
-      _, _, name, first, last, lower, upper = choice
+      _, _, name, first, last, lower, upper, selected = choice
       entries = indexes[name]
       pages = if respond_to?(:secondary_page_count)
         secondary_page_count(stored, name, lower, upper)
       else
         entries.empty? ? 0 : 1
       end
-      ordinals = entries[first...last].map(&:last)
+      ordinals = selected || entries[first...last].map(&:last)
       charge(pages)
       scan_rows(stored, ordinals, lookup: true)
     end
@@ -263,6 +278,7 @@ module JedNative
         end
         next unless term.kind == :binary && %w[= < <= > >=].include?(term.value)
         left, right = term.args
+        next if [left, right].any? { |argument| argument.extra&.dig(:subquery_origin) }
         operator = term.value
         if same_key_expression?(key, right)
           left, right = right, left

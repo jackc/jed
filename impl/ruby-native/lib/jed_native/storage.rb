@@ -30,11 +30,14 @@ module JedNative
     end
 
     def initialize(path:, create: false, page_size: 8192, locking: :exclusive,
-                   file_lock_timeout_ms: 5000, fsync: true, read_only: false,
+                   file_lock_timeout_ms: 5000, fsync: true, synchronous: :on, read_only: false,
                    max_storage_bytes: 0, cache_bytes: FileImage::DEFAULT_CACHE_BYTES, collation_key: nil, expression: nil)
       @codec = FileFormat.new(collation_key: collation_key, expression: expression)
       @pid = Process.pid
       @sync = fsync
+      raise Error.new('22023', 'synchronous must be on or off') unless %i[on off].include?(synchronous.to_sym)
+      @synchronous = synchronous.to_sym
+      @durability_pending = {}
       @read_only = read_only
       unless cache_bytes.is_a?(Integer) && cache_bytes >= 0
         raise Error.new('22023', 'cache_bytes must be a nonnegative integer')
@@ -45,9 +48,10 @@ module JedNative
       @closed = false
       @poisoned = false
       @claimed = false
+      @creating = create
       @locking = locking.to_sym
-      unless %i[exclusive none].include?(@locking)
-        raise Error.new("0A000", "experimental Ruby file host requires locking: :exclusive or :none")
+      unless %i[auto exclusive none].include?(@locking)
+        raise Error.new("22023", "unknown file locking mode")
       end
       unless file_lock_timeout_ms.is_a?(Integer) && file_lock_timeout_ms >= 0
         raise Error.new("22023", "file_lock_timeout_ms must be nonnegative")
@@ -63,6 +67,10 @@ module JedNative
               end
       claim_path
       acquire_lock(file_lock_timeout_ms) unless @locking == :none
+      if @service_remote
+        service_open_client
+        return
+      end
       if create
         raise Error.new("25006", "cannot create a read-only database") if @read_only
         raise Error.new("0A000", "invalid page size") unless @codec.valid_page_size?(page_size)
@@ -87,6 +95,7 @@ module JedNative
       @live_at_compaction = @meta[:page_count] - @free_pages.length
       @needs_stabilization = !create
       @needs_directory_sync = !create
+      initialize_service_owner if @locking == :auto
     rescue Error
       release_resources
       raise
@@ -111,11 +120,21 @@ module JedNative
       build(snapshot).to_s
     end
 
+    def flush(shrink: true)
+      return if @service_remote
+      @mutex.synchronize do
+        ensure_open
+        flush_pending(shrink: shrink)
+      end
+    end
+
     # Serialization completes before the first storage mutation. A size/codec
     # error leaves the handle usable; an I/O failure poisons it until reopen.
     def commit(snapshot)
+      return @service_remote.commit(snapshot) if @service_remote
       @mutex.synchronize do
         ensure_open(write: true)
+        @durability_floor_slot ||= @meta[:slot] || (@meta[:txid] & 1)
         plan = plan_commit(snapshot)
         pages, root, live = plan.pages, plan.root, plan.live
         if @max_storage_bytes.positive? && live > @meta[:live] && live * @page_size > @max_storage_bytes
@@ -124,8 +143,11 @@ module JedNative
         txid = @meta.fetch(:txid) + 1
         raise Error.new("54000", "transaction id overflow") if txid > 0xFFFF_FFFF_FFFF_FFFF
 
-        slot = (@meta[:slot] || (@meta[:txid] & 1)) ^ 1
-        free_plan = FreeListPlan.new(@codec, plan, @page_size, @live_at_compaction, txid, slot, truncate: @sync)
+        slot = (@durability_floor_slot || @meta[:slot] || (@meta[:txid] & 1)) ^ 1
+        pending = @durability_pending
+        free_plan = FreeListPlan.new(@codec, plan, @page_size, @live_at_compaction, txid, slot,
+                                    truncate: pending.empty?, pending: pending,
+                                    deferred_free: @durability_deferred_free || [])
         overlay = PageOverlay.new(@image, pages)
         prepared_snapshot = published_snapshot(snapshot, plan, overlay)
         begin
@@ -143,8 +165,8 @@ module JedNative
             write_at(@file, pages.pages.fetch(page), page * @page_size)
           end
           write_at(@file, pages.pages.fetch(slot), slot * @page_size)
-          durable_sync(@file) if @sync
-          if @sync && @file.size > pages.page_count * @page_size
+          durable_sync(@file) if @sync && @synchronous == :on
+          if @synchronous == :on && @file.size > pages.page_count * @page_size
             begin
               @file.truncate(pages.page_count * @page_size)
             rescue SystemCallError, IOError
@@ -165,6 +187,20 @@ module JedNative
         @image.invalidate(pages.pages.keys)
         overlay.publish
         @snapshot = prepared_snapshot.merge(meta: @meta, free_pages: @free_pages)
+        if @synchronous == :on
+          reset_durability_floor(@meta)
+        else
+          pages.pages.each { |page, bytes| @durability_pending[page] = @codec.crc64(bytes) if page >= 2 && bytes.getbyte(0) != 8 }
+        end
+        @service_owner&.publish(@meta, pages.pages.fetch(slot), pages.pages.keys.reject { |page| page < 2 })
+        if @synchronous == :off && @durability_pending.length >= (@page_size - 64) / 12
+          begin
+            flush_pending
+          rescue Error
+            # This commit has published. A failed cap flush revokes the handle;
+            # subsequent operations and close surface the durability failure.
+          end
+        end
         @meta
       end
     end
@@ -173,6 +209,7 @@ module JedNative
       return if @closed
 
       ensure_pid
+      flush unless @poisoned
       @closed = true
       poisoned = @poisoned
       release_resources
@@ -180,6 +217,23 @@ module JedNative
     end
 
     private
+
+    def reset_durability_floor(meta = @meta)
+      @durability_floor_slot = meta[:slot] || (meta[:txid] & 1)
+      @durability_pending = {}
+      @durability_floor_free = nil
+      @durability_deferred_free = nil
+    end
+
+    def flush_pending(shrink: true)
+      return if @durability_pending.empty?
+      durable_sync(@file) if @sync
+      reset_durability_floor
+      @file.truncate(@meta[:page_count] * @page_size) if shrink && @file.size > @meta[:page_count] * @page_size
+    rescue SystemCallError, IOError => error
+      @poisoned = true
+      raise Error.new('58030', error.message)
+    end
 
     # Adopt the already validated commit roots directly. The owner foreground
     # path neither rereads meta pages nor reparses SQL after its own publication.
@@ -212,8 +266,12 @@ module JedNative
     end
 
     def plan_commit(snapshot)
-      reusable = !@reader_watermark_provider || @reader_watermark_provider.call >= @free_generation
-      CommitPlan.new(@codec, snapshot, @page_size, PageAllocator.new(@meta.fetch(:page_count), reusable ? @free_pages : []),
+      reusable = effective_reader_watermark >= @free_generation
+      @durability_floor_free = @free_pages.to_set if @durability_pending.empty?
+      allowed = reusable ? @free_pages : []
+      allowed = allowed.select { |page| @durability_floor_free.include?(page) } unless @durability_pending.empty?
+      @durability_deferred_free = @free_pages - allowed
+      CommitPlan.new(@codec, snapshot, @page_size, PageAllocator.new(@meta.fetch(:page_count), allowed),
                      page_ids: @page_ids || {}.compare_by_identity, overflow_ids: @overflow_ids || {}.compare_by_identity)
     rescue NotImplementedError => error
       raise Error.new('0A000', error.message)
@@ -221,6 +279,15 @@ module JedNative
       raise
     rescue StandardError => error
       raise Error.new('54000', "cannot encode database: #{error.message}")
+    end
+
+    def effective_reader_watermark
+      # Service pins already include every local session and cursor. Avoid
+      # taking Database's publication mutex while holding the storage mutex:
+      # foreign-root adoption necessarily takes those locks in the other order.
+      return @service_owner.oldest_pin if @service_owner
+      local = @reader_watermark_provider ? @reader_watermark_provider.call : @meta[:txid] + 1
+      local
     end
 
     def build(snapshot, start_page: FileFormat::ROOT_PAGE)
@@ -335,7 +402,13 @@ module JedNative
 
       File.open(File.join(@bundle, "protocol-v2"), flags, 0o600) { |marker| marker.close_on_exec = true }
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_ms / 1000.0
-      until @presence.flock(File::LOCK_EX | File::LOCK_NB)
+      until (@creating || (!@service_options || @service_options[:ownership] != :never) && (!@service_pause_until || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= @service_pause_until)) && @presence.flock(File::LOCK_EX | File::LOCK_NB)
+        if @locking == :auto && !@creating && try_page_service_client
+          @arrival.close
+          @presence.close
+          @arrival = @presence = nil
+          return
+        end
         raise Error.new("55006", "database is owned by another process") if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
         sleep 0.005
@@ -344,8 +417,11 @@ module JedNative
       @arrival.flock(File::LOCK_UN)
       @arrival.close
       @arrival = nil
-      incarnation = Random.urandom(16)
-      record = "JEDOWNER".b + [1, 0, Process.uid].pack("nCN") + incarnation + [@pid, 0].pack("N2")
+      write_owner_record(Random.urandom(16), '')
+    end
+
+    def write_owner_record(incarnation, endpoint)
+      record = "JEDOWNER".b + [1, endpoint.empty? ? 0 : 1, Process.euid].pack("nCN") + incarnation + [@pid, endpoint.bytesize].pack("N2") + endpoint.b
       record << [@codec.crc32(record)].pack("N")
       temporary = File.join(@bundle, "owner.tmp-#{incarnation.unpack1('H*')}")
       begin
@@ -370,6 +446,8 @@ module JedNative
     end
 
     def release_resources
+      @service_owner&.close
+      @service_remote&.close
       @file&.close unless @file&.closed?
       if @owns_presence
         begin
@@ -386,3 +464,5 @@ module JedNative
     end
   end
 end
+
+require_relative 'page_service_storage'

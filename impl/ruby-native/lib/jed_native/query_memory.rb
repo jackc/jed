@@ -343,11 +343,21 @@ module JedNative
     def query_memory_stage_changes(table, changes)
       return if changes.empty?
       codec = statistics_codec
-      positions = table[:rows].each_with_index.to_h { |row, index| [row.object_id, index] }
+      paged = table[:rows].is_a?(PagedRows) || table[:rows].is_a?(PendingRows)
+      primary = table[:constraints].any? { |constraint| constraint[:kind] == :primary_key }
+      positions = table[:rows].each_with_index.to_h { |row, index| [row.object_id, index] } unless paged
       next_id = table[:next_rowid]
       removed, added = {}, {}
       changes.each do |before, after|
-        rowid = before ? table[:rowids][positions.fetch(before.object_id)] : next_id
+        rowid = if !before
+          next_id
+        elsif table[:rows].is_a?(PendingRows)
+          table[:rows].rowid_for(before)
+        elsif paged && before.respond_to?(:storage_key)
+          primary ? 0 : codec.decode_int(8, before.storage_key)
+        else
+          table[:rowids][positions.fetch(before.object_id)]
+        end
         next_id += 1 unless before
         previous = before && !@query_memory_versions.empty? ? query_memory_storage_records(table, before, rowid, codec) : {}
         current = after ? query_memory_storage_records(table, after, rowid, codec) : {}

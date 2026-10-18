@@ -448,7 +448,7 @@ module JedNative
     def normalize(type)
       text = type.to_s.strip.gsub(/\s+/, ' ')
       base_name = text.sub(/(?:\[\d*\])+\z/, '').sub(/\(.*\)\z/, '')
-      text = BUILTIN_NAMES.include?(base_name.downcase) ? text.downcase : type.to_s
+      text = BUILTIN_NAMES.include?(base_name) ? text : type.to_s
       return 'unknown' if text == 'null'
       return normalize(text.sub(/(?:\[\d*\])+\z/, '')) + '[]' if /\[\d*\]\z/.match?(text)
       match = /\A([^()]+)(\(.*\))?\z/.match(text)

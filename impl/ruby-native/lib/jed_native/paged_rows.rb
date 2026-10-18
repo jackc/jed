@@ -179,6 +179,11 @@ module JedNative
       @getter.call(index)
     end
     def fetch(index) = self[index] || raise(IndexError, 'row ordinal out of bounds')
+    def at(index) = self[index]
+    def dig(index, *rest)
+      value = self[index]
+      rest.empty? || value.nil? ? value : value.dig(*rest)
+    end
     def first = self[0]
     def last = self[-1]
     def each
@@ -242,21 +247,22 @@ module JedNative
     def +(other) = to_a + other.to_a
     def zip(*others, &block) = to_a.zip(*others, &block)
     def values_at(*indices) = indices.map { |index| self[index] }
+    def storage_key = @storage_leaf[:keys][@storage_slot]
     def ==(other) = to_a == other.to_a
   end
 
   class PagedRows < PageSequence
     attr_reader :tree, :pool, :columns, :raw, :profile, :entries
-    def initialize(pool, root, columns, row_count, converter: nil, raw: nil)
+    def initialize(pool, root, columns, row_count, converter: nil, raw: nil, tree: :load)
       @pool, @columns, @converter, @raw = pool, columns, converter, raw
       @leaves, seen = [], Set.new
-      @tree, height = load_skeleton(root, seen)
+      @tree, height = tree == :load ? load_skeleton(root, seen) : adopt_tree(tree, seen)
       @profile = { tree: @tree, height: height, node_count: seen.length, paged_rows: self }
       length = row_count || -> { actual_count }
       super(length, ->(index) { leaf, slot = locate(index); leaf && PagedRow.new(leaf, slot, @converter) },
             ->(&block) { each_leaf_row { |leaf, slot, _| block.call(PagedRow.new(leaf, slot, @converter)) } })
-      @entries = PageSequence.new(length, ->(index) { leaf, slot = locate(index); leaf && [leaf[:keys][slot], index] },
-                                  ->(&block) { each_leaf_row { |leaf, slot, ordinal| block.call([leaf[:keys][slot], ordinal]) } })
+      @entries = PageSequence.new(length, ->(index) { leaf, slot = locate(index); leaf && [leaf[:keys][slot], row_at(leaf, slot)] },
+                                  ->(&block) { each_leaf_row { |leaf, slot, _| block.call([leaf[:keys][slot], row_at(leaf, slot)]) } })
     end
 
     def converted(&converter)
@@ -266,10 +272,39 @@ module JedNative
       result
     end
 
+    # A physical slot remains stable for the lifetime of this immutable tree.
+    # Passing it through a cursor avoids reading every leaf merely to compute
+    # its position in a hypothetical flat row array.
+    def row_at(leaf, slot) = PagedRow.new(leaf, slot, @converter)
+    def [](index, count = nil)
+      return index if index.is_a?(PagedRow) && count.nil?
+      super
+    end
+
+    def each_entry(lower: nil, upper: nil, reverse: false, &block)
+      return enum_for(:each_entry, lower: lower, upper: upper, reverse: reverse) unless block
+      walk = lambda do |node|
+        next unless node
+        if node[:children].empty?
+          keys = node[:keys]
+          first = lower ? keys.bsearch_index { |key| key >= lower } || keys.length : 0
+          last = upper ? keys.bsearch_index { |key| key >= upper } || keys.length : keys.length
+          slots = reverse ? (last - 1).downto(first) : (first...last).each
+          slots.each { |slot| block.call([keys[slot], row_at(node, slot)]) }
+        else
+          first = lower ? node[:keys].bsearch_index { |key| key > lower } || node[:keys].length : 0
+          last = upper ? node[:keys].bsearch_index { |key| key >= upper } || node[:keys].length : node[:children].length - 1
+          children = reverse ? last.downto(first) : (first..last).each
+          children.each { |slot| walk.call(node[:children][slot]) }
+        end
+      end
+      walk.call(@tree)
+    end
+
     def dup_view
       # Reuse the resident routing skeleton and bounded pool across raw and
       # typed views. Rebuilding the closures binds them to the correct view.
-      self.class.new(@pool, @tree ? @tree[:page] : 0, @columns, length, raw: @raw)
+      self.class.new(@pool, 0, @columns, length, raw: @raw, tree: @tree)
     end
 
     def keys = @keys ||= PageSequence.new(@length, ->(index) { @entries[index]&.first }, ->(&block) { @entries.each { |key, _| block.call(key) } })
@@ -326,6 +361,22 @@ module JedNative
     end
 
     private
+
+    def adopt_tree(node, seen)
+      return [nil, 0] unless node
+      seen.add(node.object_id)
+      if node[:children].empty?
+        leaf = node.is_a?(PagedLeaf) || node.is_a?(RecordLeaf) ? node : RecordLeaf.new(node, @columns, @pool.codec, @pool.page_size - FileFormat::PAGE_HEADER)
+        @leaves << leaf
+        return [leaf, 1]
+      end
+      height = 0
+      children = node[:children].map do |child|
+        adopted, height = adopt_tree(child, seen)
+        adopted
+      end
+      [node.merge(children: children), height + 1]
+    end
 
     def load_skeleton(page, seen)
       return [nil, 0] if page.zero?

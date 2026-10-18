@@ -101,6 +101,10 @@ module JedNative
         entries = child[:native_secondary_indexes][path[:name]]
       end
       upper = prefix_successor(prefix)
+      if child[:rows].is_a?(PagedRows)
+        name = path[:kind] == :secondary ? path[:name] : nil
+        return [pages, storage_scan_entries(child, name, lower: prefix, upper: upper).map(&:last)]
+      end
       first = entries.bsearch_index { |entry, _| entry >= prefix } || entries.length
       last = upper ? entries.bsearch_index { |entry, _| entry >= upper } || entries.length : entries.length
       [pages, entries[first...last].map(&:last)]
@@ -134,7 +138,7 @@ module JedNative
           charge_scan_payload(child, ordinals, locals)
           gathered.concat(ordinals)
         end
-        gathered.uniq.each { charge }
+        gathered.uniq { |row| auxiliary_row_identity(row) }.each { charge }
       else
         charge(full_scan_pages(child))
         charge_scan_payload(child, nil, locals)

@@ -425,7 +425,7 @@ module JedNative
       return right unless known?(left)
       return left unless known?(right)
       return left if left == right
-      Types.promote(left, right)
+      @engine.common_type(left, right)
     end
 
     def known?(type) = type && ![UNKNOWN, 'unknown[]'].include?(type)

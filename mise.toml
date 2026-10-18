@@ -112,9 +112,25 @@ run = "ruby -Iimpl/ruby-native/lib -e 'Dir[\"impl/ruby-native/test/*_test.rb\"].
 description = "Explicit opt-in: experimental Ruby storage byte and durability tests"
 run = "ruby impl/ruby-native/test/storage_test.rb"
 
+[tasks."ruby-native:rewrite-test"]
+description = "Explicit opt-in: experimental Ruby backup and compaction tests"
+run = "ruby impl/ruby-native/test/storage_rewrite_test.rb"
+
 [tasks."ruby-native:pager-test"]
 description = "Explicit opt-in: experimental Ruby page caches and pinned roots"
 run = "ruby impl/ruby-native/test/paged_storage_test.rb"
+
+[tasks."ruby-native:page-service-test"]
+description = "Explicit opt-in: experimental Ruby page-service wire and host tests"
+run = "ruby impl/ruby-native/test/page_service_test.rb"
+
+[tasks."ruby-native:process:build"]
+description = "Explicit opt-in: build the existing Go process actor for Ruby interoperability"
+run = "cd impl/go && go build -o process_actor ./cmd/process_actor"
+
+[tasks."ruby-native:process"]
+description = "Explicit opt-in: shared process corpus including experimental Ruby"
+run = "JED_PROCESS_CORES=${JED_PROCESS_CORES:-ruby-native,go} ruby scripts/process_conformance.rb"
 
 [tasks."ruby-native:domains-test"]
 description = "Explicit opt-in: experimental Ruby attachment lifecycle and independent durability tests"
@@ -857,3 +873,7 @@ run = [
 description = "Go cursor cancellation and host API regressions under the race detector"
 dir = "{{config_root}}/impl/go"
 run = "go test -race -run 'Test.*(Cancel|Ergo|Streaming|Deferred|Drain|HostFunc)' ./..."
+
+[tasks."ruby-native:durability-test"]
+description = "Opt-in experimental Ruby batched durability checks"
+run = "ruby impl/ruby-native/test/durability_test.rb"

@@ -26,12 +26,25 @@ module RubyPagedStorageTest
       assert(rows.is_a?(JedNative::PagedRows), 'opening a file materialized its rows')
       assert(rows.pool.cached_leaves.zero?, 'opening a file decoded data leaves')
       assert(reader.query('SELECT v FROM t WHERE id = 239').rows == [['value-239']], 'point read failed')
+      assert(!rows.instance_variable_defined?(:@offsets), 'point read scanned every leaf to calculate a row ordinal')
+      assert(reader.query("SELECT id FROM t WHERE v = 'value-239'").rows == [[239]], 'secondary point read failed')
+      assert(reader.query('SELECT id FROM t WHERE id IN (2, 239) ORDER BY id').rows == [[2], [239]], 'point-set cursor failed')
+      assert(!rows.instance_variable_defined?(:@offsets), 'bounded index access scanned every leaf')
       expected = reader.query('SELECT id, v FROM t ORDER BY v DESC LIMIT 17').rows
       assert(expected.length == 17, 'ordered secondary cursor lost rows')
       assert(rows.pool.cached_leaves <= 1, 'decoded leaf cache exceeded its capacity')
       assert(rows.pool.image.cached_pages <= 1, 'raw page cache exceeded its capacity')
 
       writer = database.session
+      writer.execute('BEGIN')
+      writer.execute("UPDATE t SET v = 'pending' WHERE id = 239")
+      pending = writer.engine.instance_variable_get(:@tables).fetch('t')[:rows]
+      assert(pending.is_a?(JedNative::PagedRows), 'pending update materialized committed rows')
+      changed = pending.instance_variable_get(:@leaves).count { |leaf| leaf.is_a?(JedNative::RecordLeaf) }
+      assert(changed.positive? && changed < pending.instance_variable_get(:@leaves).length, 'point update copied every primary leaf')
+      assert(writer.query('SELECT v FROM t WHERE id = 239').rows == [['pending']], 'pending tree did not expose its new value')
+      assert(reader.query('SELECT v FROM t WHERE id = 239').rows == [['value-239']], 'pending write escaped its transaction')
+      writer.execute('ROLLBACK')
       18.times do |generation|
         writer.execute("UPDATE t SET v = 'generation-#{generation}-' || id::text")
       end

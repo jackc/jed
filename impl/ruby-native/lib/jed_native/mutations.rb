@@ -78,7 +78,9 @@ module JedNative
         predicate = compile_filter(conflict[:where], update_scope)
       end
       checks = mutation_checks(t)
-      rows, rowids = t[:rows].dup, t[:rowids].dup
+      paged = t[:rows].is_a?(PagedRows)
+      rows = paged ? PendingRows.new(t) : t[:rows].dup
+      rowids = paged ? rows.rowids : t[:rowids].dup
       next_id = t[:next_rowid]
       changes, affected = [], {}
       candidates.each do |candidate|
@@ -110,8 +112,12 @@ module JedNative
           end
           validate_view_candidate(t, candidate) if respond_to?(:validate_view_candidate, true)
           affected[rows.length] = true
-          rows << candidate
-          rowids << next_id
+          if paged
+            rows.append(candidate, next_id)
+          else
+            rows << candidate
+            rowids << next_id
+          end
           next_id += 1
           changes << [nil, candidate]
         end
@@ -140,20 +146,25 @@ module JedNative
         charge(full_scan_pages(t))
         charge_scan_payload(t)
       end
-      selected = candidates&.to_h { |row| [row.object_id, true] }
+      paged = t[:rows].is_a?(PagedRows)
+      positions = !paged && candidates && t[:rows].each_with_index.to_h { |row, index| [row.object_id, index] }
       profile_checkpoint(:scan) if @explain_profile_frames
-      rows = t[:rows].map do |row|
-        next row if selected && !selected[row.object_id]
+      rows = paged ? PendingRows.new(t) : t[:rows].dup
+      (candidates || t[:rows]).each_with_index do |row, index|
         charge
         profile_accumulate(:scan, 1) if @explain_profile_frames
         filter_start = @cost if @explain_profile_frames
         accepted = !predicate || evaluate(predicate, row) == true
         profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
-        next row unless accepted
+        next unless accepted
         replacement = apply_assignments(t, row, row, assignments)
         validate_candidate(t, replacement, checks)
         changes << [row, replacement]
-        replacement
+        if paged
+          rows.replace(row, replacement)
+        else
+          rows[positions ? positions.fetch(row.object_id) : index] = replacement
+        end
       end
       profile_inherit(:filter, :scan) if @explain_profile_frames
       validate_rows(t.merge(constraints: t[:constraints].reject { |c| c[:kind] == :check }), rows)
@@ -173,20 +184,16 @@ module JedNative
       scope = table_columns(t, stmt[:alias] || t[:name])
       predicate = compile_filter(stmt[:where], scope)
       return_scope, return_exprs, return_columns = mutation_returning(stmt, t, :delete)
-      changes, rows, rowids = [], [], []
+      changes, removed = [], {}
       candidates = primary_scan(t, predicate)
       unless candidates
         charge(full_scan_pages(t))
         charge_scan_payload(t)
       end
-      selected = candidates&.to_h { |row| [row.object_id, true] }
+      paged = t[:rows].is_a?(PagedRows)
+      positions = !paged && candidates && t[:rows].each_with_index.to_h { |row, index| [row.object_id, index] }
       profile_checkpoint(:scan) if @explain_profile_frames
-      t[:rows].each_with_index do |row, index|
-        if selected && !selected[row.object_id]
-          rows << row
-          rowids << t[:rowids][index]
-          next
-        end
+      (candidates || t[:rows]).each_with_index do |row, index|
         charge
         profile_accumulate(:scan, 1) if @explain_profile_frames
         filter_start = @cost if @explain_profile_frames
@@ -194,14 +201,24 @@ module JedNative
         profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
         if accepted
           changes << [row, nil]
-        else
-          rows << row
-          rowids << t[:rowids][index]
+          removed[positions ? positions.fetch(row.object_id) : index] = true
         end
       end
       profile_inherit(:filter, :scan) if @explain_profile_frames
       result = project_mutation(stmt, t, :delete, changes, return_scope, return_exprs, return_columns)
       unless changes.empty?
+        if paged
+          rows = PendingRows.new(t)
+          changes.each { |row, _| rows.replace(row, nil) }
+          rowids = rows.rowids
+        else
+          rows, rowids = [], []
+          t[:rows].each_with_index do |row, index|
+            next if removed[index]
+            rows << row
+            rowids << t[:rowids][index]
+          end
+        end
         @tables[t[:name]] = t.merge(rows: rows, rowids: rowids)
         enforce_references(t, changes, :delete)
         @dirty = true

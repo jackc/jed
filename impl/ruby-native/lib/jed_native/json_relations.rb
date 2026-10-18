@@ -15,7 +15,7 @@ module JedNative
         columns = @types[arguments[0].type]
         raise Error.new('0A000', 'populate_record requires a named composite') unless columns
       elsif name.end_with?('object_keys')
-        columns = [{ name: name, type: 'text' }]
+        columns = [{ name: source[:alias] || name, type: 'text' }]
       elsif name.include?('_each')
         columns = [{ name: 'key', type: 'text' }, { name: 'value', type: name.end_with?('_text') ? 'text' : type }]
       else

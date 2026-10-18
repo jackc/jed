@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'key_reader'
+require_relative 'pending_rows'
 
 module JedNative
   class PagedIntegerLookup
@@ -51,8 +52,7 @@ module JedNative
             next
           end
           secondary[index[:name]] = details
-          getter = lambda do |position|
-            key = raw.entries[position][0]
+          lookup = lambda do |key|
             offset = 0
             details[:types].each_with_index do |type, slot|
               desc, first = details[:orders][slot]
@@ -65,9 +65,12 @@ module JedNative
                 raise Error.new('XX001', 'invalid index slot tag')
               end
             end
-            [key, rows.ordinal_for_key(key.byteslice(offset..))]
+            rows.point(key.byteslice(offset..)) || raise(Error.new('XX001', 'index entry references absent row'))
           end
-          entries[index[:name]] = PageSequence.new(-> { raw.entries.length }, getter)
+          details[:row_lookup] = lookup
+          getter = ->(position) { key = raw.entries[position][0]; [key, lookup.call(key)] }
+          entries[index[:name]] = PageSequence.new(-> { raw.entries.length }, getter,
+            ->(&block) { raw.each_entry { |key, _| block.call([key, lookup.call(key)]) } })
         end
         @tables[name] = table.merge(native_paged_signature: signature, native_paged_rows: rows, native_primary_ordinal: ordinal,
           native_primary_index: ordinal && PagedIntegerLookup.new(rows, codec, types.first),
@@ -101,11 +104,11 @@ module JedNative
             first = lower ? keys.bsearch_index { |key| key >= lower } || keys.length : 0
             last = upper ? keys.bsearch_index { |key| key >= upper } || keys.length : keys.length
             slots = reverse ? (last - 1).downto(first) : (first...last).each
-            if node.is_a?(PagedLeaf)
+            if metadata[:paged_rows]
               rows = metadata[:paged_rows]
               slots.each do |slot|
-                ordinal = rows.ordinal_for_leaf_slot(node, slot)
-                output << (index_name ? entries[ordinal] : [keys[slot], ordinal])
+                row = index_name ? metadata[:row_lookup].call(keys[slot]) : rows.row_at(node, slot)
+                output << [keys[slot], row]
               end
             else
               offset = entries.bsearch_index { |key, _| key >= keys.first } if first < last
@@ -143,7 +146,7 @@ module JedNative
       if statement[:kind] == :reindex
         reindex_targets(statement).each { |table, _| materialize_paged_table(table) }
       end
-      if %i[insert update delete truncate alter_table create_index reindex analyze].include?(statement[:kind])
+      if %i[truncate alter_table create_index reindex analyze].include?(statement[:kind])
         table = @tables[statement[:table] || statement[:name]]
         original = table if table && table[:rows].is_a?(PagedRows) && %i[insert update delete].include?(statement[:kind])
         materialize_paged_table(table) if table

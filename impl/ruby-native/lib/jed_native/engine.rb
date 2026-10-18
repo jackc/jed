@@ -539,7 +539,9 @@ module JedNative
             @foreign_key_checks[name] = true
             next
           end
-          rows, rowids, child_changes = [], [], []
+          paged = child[:rows].is_a?(PagedRows)
+          rows = paged ? PendingRows.new(child) : []
+          rowids, child_changes = paged ? rows.rowids : [], []
           child[:rows].each_with_index do |row, index|
             key = child_indices.map { |i| row[i] }
             matched_key = if !key.any?(&:nil?)
@@ -551,6 +553,7 @@ module JedNative
               visited[token] = true
               if action == :cascade && operation == :delete
                 child_changes << [row, nil]
+                rows.replace(row, nil) if paged
                 next
               end
               replacement = row.dup
@@ -564,10 +567,13 @@ module JedNative
                 replacement[i] = assign(replacement[i], child[:columns][i])
               end
               child_changes << [row, replacement]
+              rows.replace(row, replacement) if paged
               row = replacement
             end
-            rows << row
-            rowids << child[:rowids]&.dig(index)
+            unless paged
+              rows << row
+              rowids << child[:rowids]&.dig(index)
+            end
           end
           query_memory_stage_changes(child, child_changes) unless child[:temporary]
           @tables[name] = child.merge(rows: rows, rowids: rowids)
@@ -653,6 +659,7 @@ module JedNative
         raise Error.new('0A000', 'DISTINCT ON is not supported') if stmt[:distinct_on]
         from = stmt[:from] || []
         from = [from] unless from.is_a?(Array)
+        raise Error.new('42601', 'SELECT * requires a FROM relation') if from.empty? && (stmt[:columns] || []).any? { |item| item.dig(:expr, :kind) == :star }
         rel = Relation.new(columns: [], rows: [[]])
         predicate = nil
         where_node = stmt[:where]
@@ -694,7 +701,7 @@ module JedNative
         projections = expand_stars(stmt[:columns] || stmt[:projections], rel.columns)
         compiled = projections.map { |p| compile(p[:expr], rel.columns) }
         group_nodes = respond_to?(:resolve_group_nodes) ? resolve_group_nodes(stmt, rel.columns) : (stmt[:group_by] || [])
-        grouped = !group_nodes.empty? || compiled.any? { |e| aggregate_expr?(e) } || contains_aggregate?(stmt[:having]) || contains_aggregate?(stmt[:windows])
+        grouped = !group_nodes.empty? || !!stmt[:having] || compiled.any? { |e| aggregate_expr?(e) } || contains_aggregate?(stmt[:windows])
         complex_groups = group_nodes.any? { |g| %i[grouping_sets rollup cube].include?(g[:kind]) }
         group_exprs = (complex_groups ? [] : group_nodes).map { |g| compile(g, rel.columns) }
         group_exprs.each { |expression| ensure_comparable_type(expression.type) }
@@ -799,11 +806,16 @@ module JedNative
         results = results.take(limit) if limit
         cursor_rows = cursor_output(columns) if cursor_output?
         if defer_projection
-          results.each do |entry|
-            entry[0] = compiled.each_with_index.map { |expression, index| entry[3].fetch(index) { evaluate(expression, entry[1], entry[2]) } }
+          host_batch_rows(results, compiled, row_at: ->(entry) { entry[1] }).each do |entry|
+            charge(0)
+            @cost += 1
+            @lifetime_cost += 1
+            entry[0] = compiled.each_with_index.map do |expression, index|
+              charge(0)
+              entry[3].fetch(index) { evaluate(expression, entry[1], entry[2]) }
+            end
             query_memory_add_row(output_owner, entry[0], columns) if output_owner
             if cursor_rows
-              charge
               cursor_rows << entry[0]
               entry[0] = nil
             end
@@ -811,8 +823,19 @@ module JedNative
         end
         if cursor_rows && !defer_projection
           results.each { |entry| charge; cursor_rows << entry[0] }
-        elsif !cursor_rows
-          charge(results.length)
+        elsif !cursor_rows && !defer_projection
+          # The output checkpoint precedes each row's accrual. There is no
+          # trailing guard after the final produced row (cost.md §6).
+          if @max_cost.positive? || @lifetime_max_cost.positive?
+            results.length.times do
+              charge(0)
+              @cost += 1
+              @lifetime_cost += 1
+            end
+          else
+            @cost += results.length
+            @lifetime_cost += results.length
+          end
         end
         profile_checkpoint(:root) if @explain_profile_frames
         result = Relation.new(columns: columns, rows: cursor_rows || results.map(&:first))
@@ -863,11 +886,11 @@ module JedNative
         case name
         when 'generate_series'
           first, last, step = args
-          step ||= 1
-          raise Error.new('22023', 'zero series step') if step.zero?
+          step = 1 if args.length < 3
+          raise Error.new('22023', 'zero series step') if step && step.zero?
           rows = []
           memory_owner = query_memory_owner if @query_memory
-          unless first.nil? || last.nil?
+          unless first.nil? || last.nil? || step.nil?
             while step.positive? ? first <= last : first >= last
               charge
               query_memory_add_row(memory_owner, [first]) if @query_memory
@@ -977,7 +1000,7 @@ module JedNative
         candidates = hash_table ? hash_join_candidates(hash_table, lrow) : right.rows.each_index
         candidates.each do |index|
           rrow = right.rows[index]
-          row = lrow + rrow
+          row = lrow + rrow.to_a
           next if on_trees ? !on_trees.all? { |expression| evaluate(expression, row) == true } : predicate && evaluate(predicate, row) != true
           next if window && window[:filter] && evaluate(window[:filter], row) != true
           query_memory_add_row(memory_owner, row, columns, memory_mask) if @query_memory
@@ -998,7 +1021,7 @@ module JedNative
       if %i[right full right_outer full_outer].include?(kind)
         right.rows.each_with_index do |row, index|
           next if right_seen[index]
-          combined = Array.new(left.columns.length) + row
+          combined = Array.new(left.columns.length) + row.to_a
           query_memory_add_row(memory_owner, combined, columns, memory_mask) if @query_memory
           rows << combined
         end
@@ -1043,7 +1066,7 @@ module JedNative
         prefix_columns = @join_group_outer.flat_map(&:first)
         prefix_values = @join_group_outer.flat_map(&:last)
         columns = prefix_columns + columns
-        row = prefix_values + row
+        row = prefix_values + row.to_a
       end
       correlated(columns, row) do
         if source[:kind] == :join_group
@@ -1174,6 +1197,9 @@ module JedNative
     end
 
     def expand_stars(projections, columns)
+      if columns.empty? && projections.any? { |projection| projection.dig(:expr, :kind) == :star }
+        raise Error.new('42601', 'SELECT * requires a FROM relation')
+      end
       projections.flat_map do |projection|
         expr = projection[:expr]
         if expr[:kind] == :star
