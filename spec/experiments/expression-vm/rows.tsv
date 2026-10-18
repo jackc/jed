@@ -1,0 +1,8 @@
+# id	a	b	p	q
+1	5	2	true	false
+2	-9	3	false	true
+3	NULL	0	NULL	false
+4	2147483647	1	true	NULL
+5	-2147483648	-1	false	NULL
+6	0	NULL	NULL	true
+7	12	4	NULL	NULL

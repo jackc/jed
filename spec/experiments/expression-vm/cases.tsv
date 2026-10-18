@@ -1,0 +1,32 @@
+# name	context	expression
+column	value	a
+param	value	$1 + a * $2
+add	value	a + b
+subtract	value	a - b
+multiply	value	a * b
+divide	value	a / b
+remainder	value	a % b
+negate	value	-a
+wide	value	a::i64 * b::i64 + 9::i64
+narrow	value	a::i16
+equal	value	a = b
+less	value	a < b
+greater_equal	value	a >= b
+bool_equal	value	p = q
+is_null	value	a IS NULL
+is_not_null	value	p IS NOT NULL
+not	value	NOT p
+and	value	p AND q
+or	value	p OR q
+nested_bool	value	(p AND q) OR (NOT p AND NOT q)
+skip_divide	value	p AND a / b > 0
+skip_or	value	q OR a / b > 0
+filter_null	filter	p AND a / b > 0
+filter_chain	filter	p AND q AND a / b > 0
+filter_or	filter	(p OR q) AND a / b > 0
+searched_case	value	CASE WHEN p THEN a + b WHEN q THEN a / b ELSE 0 END
+simple_case	value	CASE b WHEN 0 THEN 0 WHEN 1 THEN a ELSE b END
+coalesce	value	COALESCE(a, b, 99)
+coalesce_lazy	value	COALESCE(a, 12 / b)
+fallback_function	value	abs(a) + b
+fallback_decimal	value	a::decimal / 3::decimal

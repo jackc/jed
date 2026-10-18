@@ -1,0 +1,41 @@
+# Nested lazy expressions used by the expression VM experiment. These SQL expectations remain
+# shared conformance, independent of the selected internal evaluator.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, expr.arithmetic, expr.comparison_value, expr.case, expr.coalesce, null.three_valued, types.i32, types.boolean, types.boolean_storable
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, p boolean)
+
+statement ok
+INSERT INTO t VALUES (1, 12, 3, true), (2, NULL, 0, false), (3, 6, 2, NULL), (4, 2147483647, 0, false)
+
+query I nosort
+SELECT CASE WHEN p THEN a / b ELSE COALESCE(a, 7) END FROM t ORDER BY id
+----
+4
+7
+6
+2147483647
+
+query I nosort
+SELECT COALESCE(a, CASE WHEN b = 0 THEN 9 ELSE 10 / b END) FROM t ORDER BY id
+----
+12
+9
+6
+2147483647
+
+query I nosort
+SELECT CASE WHEN p THEN CASE WHEN a > 10 THEN a + b ELSE a - b END ELSE b END FROM t ORDER BY id
+----
+15
+0
+2
+0
+
+query I nosort
+SELECT CASE b WHEN 0 THEN 0 ELSE a / b END FROM t ORDER BY id
+----
+4
+0
+3
+0
