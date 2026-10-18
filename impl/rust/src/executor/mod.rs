@@ -8,14 +8,14 @@ pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
     AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
     AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, BinaryOp, CheckOption,
-    ConflictAction, ConflictColumn, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateTableAs,
-    CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable,
-    DropType, DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue,
-    JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper,
-    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Reindex,
-    ReindexKind, ReturningClause, Select, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos,
-    Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, Update,
-    WindowDef, WithExpr, WithQuery,
+    ConflictAction, ConflictColumn, ConflictTarget, CreateIndex, CreateSequence, CreateTable,
+    CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex,
+    DropSequence, DropTable, DropType, DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert,
+    InsertSource, InsertValue, JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing,
+    JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding,
+    QueryExpr, RefAction, Reindex, ReindexKind, ReturningClause, Select, SelectItems, SeqOptions,
+    SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef,
+    TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,

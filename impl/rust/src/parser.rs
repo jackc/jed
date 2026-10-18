@@ -7,15 +7,15 @@
 use crate::ast::{
     AlterColumnAction, AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence,
     AlterTable, AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, Assignment,
-    BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictColumn, ConflictTarget, CreateIndex, CreateSequence,
-    CreateTable, CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete,
-    DropIndex, DropSequence, DropTable, DropType, DropView, ExcludeDef, Expr, ForeignKeyDef,
-    GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
-    JoinClause, JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable,
-    JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction,
-    Reindex, ReindexKind, ReturningClause, SavepointOp, Select, SelectItem, SelectItems,
-    SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos,
-    TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictColumn, ConflictTarget, CreateIndex,
+    CreateSequence, CreateTable, CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef,
+    Delete, DropIndex, DropSequence, DropTable, DropType, DropView, ExcludeDef, Expr,
+    ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource,
+    InsertValue, JoinClause, JoinKind, JsonBehavior, JsonOnBehavior, JsonPassing,
+    JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding,
+    QueryExpr, RefAction, Reindex, ReindexKind, ReturningClause, SavepointOp, Select, SelectItem,
+    SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement, SubscriptSpec, TableRef,
+    TableRefPos, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::ast::{CycleClause, SearchClause};
