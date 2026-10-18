@@ -140,6 +140,19 @@ run = "cargo clippy --manifest-path impl/rust/Cargo.toml --all-targets --quiet -
 description = "Apply Biome's SAFE lint fixes to the TS cores (unsafe fixes stay per-rule + manual)"
 run = "biome lint --write impl/ts impl/node bench/ts migrate/ts"
 
+# tsc over the TS core's three programs: the Node engine + tests, the main-thread browser client,
+# and the Web Worker (the DOM and WebWorker libs conflict, so they are separate configs). Node runs
+# the core by type-stripping, which checks no types, and web:check's svelte-check sees only the
+# modules the website imports — so without this a broken call site reaches the gate unseen.
+[tasks."typecheck:ts"]
+description = "Type-check the TS core with tsc (Node engine + tests, browser client, Web Worker)"
+run = [
+  "ruby scripts/npm_ci.rb impl/ts",
+  "npx --prefix impl/ts tsc -p impl/ts/tsconfig.json",
+  "npx --prefix impl/ts tsc -p impl/ts/tsconfig.browser.json",
+  "npx --prefix impl/ts tsc -p impl/ts/tsconfig.worker.json",
+]
+
 # svelte-check follows the website's $jed imports into the browser-consumed TS core modules,
 # catching drift at that downstream boundary as well as errors in the Svelte application.
 [tasks."web:check"]
