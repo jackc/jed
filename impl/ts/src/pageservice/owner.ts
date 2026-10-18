@@ -116,6 +116,10 @@ class WorkerOwnerLink implements OwnerLink {
   stop(): void {
     this.channel.request({ op: "stop", id: this.id } satisfies OwnerStop);
     serviceWorker.release();
+    // A closed port stays a GC root until the event loop next turns, and its listener's closure holds
+    // the whole storage engine: a host that opens and closes in one synchronous run would keep every
+    // engine it closed. Detach the listener first so the engine is collectable at once.
+    this.notify.removeAllListeners();
     this.notify.close();
   }
 

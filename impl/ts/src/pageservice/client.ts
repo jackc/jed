@@ -176,6 +176,9 @@ export class WorkerLink implements ClientLink {
   close(): void {
     this.channel.post({ op: "forget", conn: this.conn } as ClientRequest);
     socketWorker.release();
+    // As WorkerOwnerLink.stop: detach the listener so the closed port, a GC root until the event loop
+    // turns, does not keep the engine its handler reaches.
+    this.events.removeAllListeners();
     this.events.close();
   }
 
