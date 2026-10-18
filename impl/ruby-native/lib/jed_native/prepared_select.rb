@@ -104,12 +104,16 @@ module JedNative
       end
       input = if plan.lookup
         key = evaluate(plan.lookup, [])
-        charge unless key.nil? || stored[:rows].empty?
+        charge(stored.dig(:native_primary_metadata, :height) || 1) unless key.nil? || stored[:rows].empty?
         row = key.nil? ? nil : plan.index[key]
+        charge_scan_payload(stored, [stored[:native_row_positions][row.object_id]]) if row && stored[:native_row_positions]
         row ? [row] : []
       elsif stored
         candidates = primary_scan(stored, plan.predicate)
-        charge unless candidates || stored[:rows].empty?
+        unless candidates
+          charge(full_scan_pages(stored))
+          charge_scan_payload(stored)
+        end
         candidates || stored[:rows]
       else
         [[]]
@@ -197,6 +201,7 @@ module JedNative
           [:input, compile(node, columns), order]
         end
       end
+      orders.each { |kind, expression, _| ensure_comparable_type(kind == :output ? outputs[expression][:type] : expression.type) }
       parameters = []
       visit = lambda do |expression|
         return unless expression.is_a?(Expression)

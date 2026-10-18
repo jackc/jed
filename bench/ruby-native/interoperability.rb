@@ -22,6 +22,9 @@ Dir.mktmpdir('jed-ruby-interop') do |directory|
   db.execute('CREATE VIEW visible AS SELECT id,v FROM t')
   db.execute('INSERT INTO t VALUES ($1,$2,$3)', 1, 'ruby', JedNative::Decimal.parse('12.50'))
   db.execute('INSERT INTO t VALUES ($1,$2,$3)', 2, 'overflow' * 500, nil)
+  db.execute('ANALYZE t')
+  db.execute('CREATE TABLE spans (id i32 PRIMARY KEY, span numrange, EXCLUDE USING gist (span WITH &&))')
+  db.execute("INSERT INTO spans VALUES (1,'(,0.5)'),(2,'[1.25,2.5]'),(3,'(3.0,4.0)'),(4,'[5.5,6.5]'),(5,'(7.5,8.5)'),(6,'[9.5,)')")
   db.close
   abort 'Go could not adopt Ruby file' unless system(binary, '--interop', path, 'update')
   db = JedNative.open(path)

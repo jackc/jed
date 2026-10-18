@@ -22,14 +22,33 @@ module JedNative
     end
 
     def persist
+      publications = []
       if @storage
         state = export_storage
         signature = storage_signature(state)
-        unless signature == @persisted_snapshot
-          @storage.commit(state)
+        publications << [nil, @storage, state, signature] unless signature == @persisted_snapshot
+      end
+      (@attachments || {}).each do |domain, attachment|
+        next unless attachment[:storage]
+        state = export_attachment_storage(domain)
+        signature = storage_signature(state)
+        next if signature == attachment[:storage_signature]
+        raise Error.new('25006', 'attachment is read-only') if attachment[:read_only]
+        publications << [domain, attachment[:storage], state, signature]
+      end
+      if publications.length > 1
+        raise Error.new('0A000', 'a transaction may write at most one durable database')
+      end
+      publications.each do |domain, storage, state, signature|
+        storage.commit(state)
+        if domain
+          @attachments[domain][:storage_signature] = signature
+        else
           @persisted_snapshot = signature
         end
+        invalidate_storage_profiles(domain)
       end
+      refresh_primary_indexes unless publications.empty?
       @dirty = false
     end
 
@@ -42,26 +61,60 @@ module JedNative
 
     def close
       @storage&.close
+      (@attachments || {}).each_value { |attachment| attachment[:storage]&.close }
     ensure
       super
     end
 
     def export_storage
       {
-        tables: @tables.values.reject { |table| table[:temporary] }.map { |table| export_table(table) },
+        tables: @tables.values.reject { |table| table[:temporary] || table[:database] }.map { |table| export_table(table) },
         types: @types.map { |name, fields| { name: name, fields: fields.map { |field| export_column(field, composite: true) } } },
-        sequences: @sequences.reject { |_, sequence| sequence[:temporary] || @tables[sequence[:owned_by]&.first]&.dig(:temporary) }.map do |name, sequence|
+        sequences: @sequences.reject { |_, sequence| sequence[:database] || sequence[:temporary] || @tables[sequence[:owned_by]&.first]&.dig(:temporary) }.map do |name, sequence|
           { name: name, increment: sequence[:increment], min_value: sequence[:min_value] || 1,
             max_value: sequence[:max_value] || ((1 << 63) - 1), start: sequence[:start] || 1,
             cache: sequence[:cache] || 1, cycle: !!sequence[:cycle], last_value: sequence[:value],
             is_called: sequence[:called], owned_by: sequence[:owned_by] }
         end,
         collations: [],
-        views: @views.reject { |_, view| view[:temporary] }.map { |name, view| export_view(name, view) }
+        views: @views.reject { |_, view| view[:temporary] || view[:database] }.map { |name, view| export_view(name, view) }
       }
     end
 
+    def export_attachment_storage(domain)
+      attachment = @attachments.fetch(domain)
+      base = attachment[:stored_catalog] || { types: [], sequences: [], views: [], collations: [] }
+      stored_tables = @tables.values.select { |table| table[:database] == domain }
+      names = stored_tables.to_h { |table| [table[:name], table[:local_name] || table[:name]] }
+      tables = stored_tables.map do |table|
+        state = export_table(table)
+        index_names = table[:indexes].to_h { |index| [index[:name], index[:local_name] || index[:name]] }
+        local = ->(name) { names[name] || index_names[name] || name.to_s.split("\0").last }
+        state[:name] = names.fetch(table[:name])
+        state[:indexes] = state[:indexes].map { |index| index.merge(name: local.call(index[:name])) }
+        state[:fks] = state[:fks].map { |fk| fk.merge(name: local.call(fk[:name]), ref_table: local.call(fk[:ref_table])) }
+        state[:checks] = state[:checks].map { |check| check.merge(name: local.call(check[:name])) }
+        state[:exclusions] = state[:exclusions].map { |exclusion| exclusion.merge(name: local.call(exclusion[:name]), index: local.call(exclusion[:index])) }
+        state
+      end
+      base.merge(tables: tables)
+    end
+
+    def remember_attachment_storage(domain)
+      @attachments.fetch(domain)[:storage_signature] = storage_signature(export_attachment_storage(domain))
+    end
+
     private
+
+    def invalidate_storage_profiles(domain)
+      # The append-only snapshot writer replaces every tree in the changed
+      # domain, even if a particular table's rows stayed unchanged.
+      @tables.transform_values! do |table|
+        next table unless table[:database] == domain && table[:storage_tree_profile]
+        table.reject { |key, _| %i[storage_tree_profile storage_tree_rows native_page_signature native_secondary_signature native_auxiliary_signature].include?(key) }
+             .merge(indexes: table[:indexes].map { |index| index.reject { |key, _| key == :storage_tree_profile } })
+      end
+    end
 
     def storage_signature(value)
       case value
@@ -135,7 +188,7 @@ module JedNative
           end
           name = constraint[:name] || "#{table[:name]}_#{elements.map { |element| element[:expr][:name] }.join('_')}_excl"
           unless indexes.any? { |index| index[:name] == name }
-            indexes << export_index(table, { name: name, method: 'gist', elements: elements, where: constraint[:where] })
+            indexes << export_index(table, { name: name, method: constraint[:method] || 'gist', elements: elements, where: constraint[:where] })
           end
           exclusions << { name: name, index: name, elements: elements.map { |element| [column_ordinal(table, element[:expr][:name]), element[:op]] } }
         end
@@ -146,6 +199,7 @@ module JedNative
       result = { name: table[:name], columns: columns, rows: rows, pk_order: pk_order,
                  checks: checks.sort_by { |check| check[:name].b }, indexes: indexes.sort_by { |index| index[:name].b },
                  fks: fks.sort_by { |fk| fk[:name].b }, exclusions: exclusions.sort_by { |exclusion| exclusion[:name].b } }
+      result[:rebuild_generation] = table[:index_rebuild_generation] if table[:index_rebuild_generation]
       if pk_order.empty? && table[:rowids]
         codec = FileFormat.new
         result[:storage_keys] = table[:rowids].map { |rowid| codec.encode_int(8, rowid) }
@@ -202,27 +256,22 @@ module JedNative
     end
 
     def unmetered_storage_evaluate(expression, table, stored_row, type)
-      cost, scalar_bytes = @cost, @scalar_bytes
+      cost, lifetime = @cost, @lifetime_cost
+      maximum, lifetime_maximum = @max_cost, @lifetime_max_cost
+      @max_cost, @lifetime_max_cost = 0, 0
       row = stored_row.each_with_index.map { |value, i| from_storage_value(table[:columns][i][:type], value) }
       storage_value(type, evaluate(expression, row))
     ensure
-      @cost, @scalar_bytes = cost, scalar_bytes
+      @cost, @lifetime_cost = cost, lifetime
+      @max_cost, @lifetime_max_cost = maximum, lifetime_maximum
     end
 
     def storage_value(type, value)
-      return nil if value.nil?
-      if @types.key?(type)
-        return @types[type].each_with_index.map { |field, i| storage_value(field[:type], value[i]) }
-      end
-      Types.storage_value(type, value)
+      Types.storage_value(type, value, @types)
     end
 
     def from_storage_value(type, value)
-      return nil if value.nil?
-      if @types.key?(type)
-        return @types[type].each_with_index.map { |field, i| from_storage_value(field[:type], value[i]) }
-      end
-      Types.from_storage_value(type, value)
+      Types.from_storage_value(type, value, @types)
     end
 
     def import_storage(state)
@@ -254,7 +303,7 @@ module JedNative
         stored[:exclusions].each do |exclusion|
           backing = indexes.find { |index| index[:name] == exclusion[:index] }
           raise Error.new('XX001', 'exclusion constraint has no backing index') unless backing
-          constraints << { kind: :exclude, name: exclusion[:name], method: 'gist', where: backing[:where],
+          constraints << { kind: :exclude, name: exclusion[:name], method: backing[:method], where: backing[:where],
                            elements: exclusion[:elements].map { |ordinal, operator| { expr: { kind: :column, name: columns[ordinal][:name] }, op: operator } } }
         end
         indexes.each do |index|
@@ -271,7 +320,7 @@ module JedNative
                  end
         [stored[:name], { name: stored[:name], columns: columns, constraints: constraints, indexes: indexes,
                          rows: rows, rowids: rowids, next_rowid: (rowids.max || -1) + 1, temporary: false,
-                         storage_rows: rows, storage_statistics: stored[:statistics] }]
+                         storage_rows: rows, storage_statistics: stored[:statistics], storage_tree_profile: stored[:tree_profile], storage_tree_rows: rows }]
       end
       @sequences = state[:sequences].to_h do |sequence|
         [sequence[:name], sequence.merge(value: sequence[:last_value], called: sequence[:is_called])]
@@ -318,7 +367,7 @@ module JedNative
         { expr: expression, direction: desc ? :desc : :asc, nulls: first ? :first : :last }
       end
       { kind: :create_index, name: index[:name], table: table[:name], method: index[:kind], unique: index[:unique],
-        elements: elements, columns: elements.map { |element| element[:expr][:name] },
+        elements: elements, columns: elements.map { |element| element[:expr][:name] }, storage_tree_profile: index[:tree_profile],
         where: index[:predicate] ? Parser.new(index[:predicate]).parse_expression : nil }
     end
 

@@ -230,13 +230,64 @@ module RubyStorageTest
     end
   end
 
+  def self.statistics_reopen
+    Dir.mktmpdir('jed-ruby-statistics') do |dir|
+      path = File.join(dir, 'stats.jed')
+      db = JedNative.create(path, page_size: 256)
+      db.execute('create table t (id i32 primary key, v text, tags i32[])')
+      db.execute("insert into t values (1,'a',array[1,1,2]),(2,'a',array[2]),(3,null,null)")
+      db.execute('create index t_v on t (v desc nulls last)')
+      db.execute('analyze t')
+      expected = [['id', 0, 3, 3, 4, 3, 0, nil], ['tags', 1, nil, 3, 0, 0, 0, 2], ['v', 1, 1, 3, 3, 1, 0, nil]]
+      facts = db.query('select column_name,null_count,distinct_count,sample_rows,average_width,mcv_count,histogram_count,term_count from jed_statistics order by column_name').rows
+      assert(facts[0] == expected[0] && facts[2] == expected[2], "scalar statistics changed: #{facts.inspect}")
+      assert(facts[1].values_at(0,1,2,3,5,6,7) == expected[1].values_at(0,1,2,3,5,6,7), 'array term statistics changed')
+      db.execute('alter table t add column more i32')
+      assert(db.query('select is_stale from jed_statistics').rows.all? { |row| row == [false] }, 'ADD COLUMN made statistics stale')
+      db.execute('update t set v=v where id=1')
+      db.execute('analyze t (v)')
+      assert(db.query('select column_name,is_stale from jed_statistics order by column_name').rows == [['id', true], ['tags', true], ['v', false]])
+      txid = db.engine.instance_variable_get(:@storage).meta[:txid]
+      db.execute('reindex index t_v')
+      assert(db.engine.instance_variable_get(:@storage).meta[:txid] > txid, 'REINDEX did not commit the rebuilt index')
+      db.close
+      db = JedNative.open(path)
+      assert(db.query('select column_name,is_stale from jed_statistics order by column_name').rows == [['id', true], ['tags', true], ['v', false]])
+      db.close
+    end
+  end
+
   def self.run
-    tests = %i[golden_decode golden_encode durable_recovery locking storage_limit_and_serialization io_failure sql_reopen view_query_reopen view_catalog_reopen exclusion_reopen]
+    tests = %i[golden_decode golden_encode durable_recovery locking storage_limit_and_serialization io_failure sql_reopen view_query_reopen view_catalog_reopen exclusion_reopen statistics_reopen temporal_containers_reopen]
     tests.each do |name|
       public_send(name)
       puts "ruby-native storage: #{name} passed"
     end
     puts "ruby-native storage: #{tests.length} tests passed (106 shared images, 65 byte-exact encodes)"
+  end
+
+  def self.temporal_containers_reopen
+    Dir.mktmpdir('ruby-native-temporal') do |directory|
+      path = File.join(directory, 'temporal.jed')
+      db = JedNative.create(path)
+      db.execute('create type stamp as (at timestamptz, code i32)')
+      db.execute('create table t (id i32 primary key, dates date[], stamps stamp[], span tstzrange)')
+      db.execute(<<~SQL)
+        insert into t values
+        (1, array[date '-infinity', date '2000-01-01', date 'infinity'],
+         array[row(timestamptz '-infinity', 1)::stamp, row(timestamptz '2024-01-15 12:00:00+00', 2)::stamp, row(timestamptz 'infinity', 3)::stamp],
+         '[-infinity,infinity]'::tstzrange)
+      SQL
+      expected = db.query('select dates::text, stamps::text, span::text from t').rows
+      db.close
+      db = JedNative.open(path)
+      assert(db.query('select dates::text, stamps::text, span::text from t').rows == expected, 'temporal container storage round trip changed values')
+      db.execute('insert into t select 2, dates, stamps, span from t')
+      db.close
+      db = JedNative.open(path)
+      assert(db.query('select dates::text, stamps::text, span::text from t order by id').rows == expected * 2)
+      db.close
+    end
   end
 end
 

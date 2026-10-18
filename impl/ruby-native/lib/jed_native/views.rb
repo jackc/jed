@@ -6,6 +6,7 @@ module JedNative
   # a sequence or visit rows which might fail when the view is later read.
   module Views
     def dispatch(statement)
+      validate_view_limits(statement)
       return alter_view(statement) if statement[:kind] == :alter_view
       if statement[:kind] == :drop_type
         drop_catalog_view_dependencies(:type_dependencies, statement[:names] || [statement[:name]], statement[:cascade])
@@ -283,6 +284,55 @@ module JedNative
 
     private
 
+    def validate_view_limits(statement)
+      return if @views.empty?
+      query = statement[:kind] == :create_view ? statement[:query] : statement
+      base = query[:native_query_base] || 0
+      enclosing = statement[:kind] == :create_view ? 1 : 0
+      cache = {}
+      view_references(query).each do |source|
+        depth, count = view_expansion_metrics(source[:name], cache, [])
+        reference = (source[:native_ref_depth] || 1) - base
+        raise Error.new('54001', 'view expansion exceeds nesting depth') if enclosing + reference + depth > Parser::MAX_EXPR_DEPTH
+        raise Error.new('54001', 'view expands to more than 1024 definitions') if count > 1024
+      end
+    end
+
+    def view_expansion_metrics(name, cache, active)
+      return cache[name] if cache.key?(name)
+      raise Error.new('42P17', 'recursive view definition') if active.include?(name)
+      query = @views.fetch(name)[:query]
+      depth, count = [query[:native_depth] || 1, 1].max, 1
+      base = query[:native_query_base] || 0
+      view_references(query).each do |source|
+        child_depth, child_count = view_expansion_metrics(source[:name], cache, active + [name])
+        depth = [depth, (source[:native_ref_depth] || 1) - base + child_depth].max
+        count = [1025, count + child_count].min
+      end
+      cache[name] = [depth, count]
+    end
+
+    def view_references(node, ctes = {}, result = [])
+      case node
+      when Array then node.each { |child| view_references(child, ctes, result) }
+      when Hash
+        if node[:kind] == :table
+          result << node if @views.key?(node[:name]) && !ctes[node[:name]] && [nil, 'main', 'temp'].include?(node[:database])
+        elsif node[:with]
+          scope = ctes.dup
+          node[:with].each do |cte|
+            scope[cte[:name]] = true if node[:recursive]
+            view_references(cte[:query], scope, result)
+            scope[cte[:name]] = true
+          end
+          node.each { |key, value| view_references(value, scope, result) unless key == :with }
+        else
+          node.each_value { |value| view_references(value, ctes, result) }
+        end
+      end
+      result
+    end
+
     def rewrite_view_mutation(statement, operation)
       view = @views[statement[:table]]
       plan = view_write_plan(view, operation)
@@ -548,14 +598,17 @@ module JedNative
       if query[:with]
         query[:with] = query[:with].map do |cte|
           body = cte[:query]
+          additions = []
           if query[:recursive] && body[:kind] == :set_operation
             seed = view_query_columns(body[:left], ctes, outer)
-            ctes[cte[:name]] = seed.each_with_index.map { |column, index| column.merge(name: cte[:columns]&.at(index) || column[:name]) }
+            seed = seed.each_with_index.map { |column, index| column.merge(name: cte[:columns]&.at(index) || column[:name]) }
+            additions = cte_search_cycle_columns(cte, seed)
+            ctes[cte[:name]] = seed + additions.map { |column| column.merge(star_hidden: true) }
           end
           frozen_body = freeze_view_query(body, ctes, outer, dependencies)
           ctes[cte[:name]] = view_query_columns(frozen_body, ctes, outer).each_with_index.map do |column, index|
             column.merge(name: cte[:columns]&.at(index) || column[:name])
-          end
+          end + additions
           cte.merge(query: frozen_body)
         end
       end
@@ -580,7 +633,7 @@ module JedNative
         query[:columns] = query[:columns].flat_map do |item|
           if item[:expr][:kind] == :star
             expand_stars([item], scope).map do |expanded|
-              expanded.merge(expr: expanded[:expr].merge(quoted: true, table_quoted: true), generated_star: true)
+              expanded.merge(expr: expanded[:expr].reject { |key, _| key == :native_ordinal }.merge(quoted: true, table_quoted: true), generated_star: true)
             end
           else
             [item]
@@ -736,7 +789,7 @@ module JedNative
       return query unless query.is_a?(Hash)
       if query[:kind] == :table && query[:name] == relation && query[:view_bound_relation]
         columns = @tables[relation] ? @tables[relation][:columns] : view_schema(@views[relation])
-        aliases = query[:columns] || columns.map { |column| column[:name] == new_name ? old_name : column[:name] }
+        aliases = columns.each_with_index.map { |column, index| query[:columns]&.[](index) || (column[:name] == new_name ? old_name : column[:name]) }
         changed = query.merge(columns: aliases, columns_quoted: Array.new(aliases.length, true))
         changed.merge!(alias: query[:name], alias_quoted: true, alias_explicit: true) unless query[:alias]
         return changed

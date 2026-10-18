@@ -378,8 +378,8 @@ module JedNative
         expression.type == 'bytea' && output ? Bytea.new(output) : output
       when *MOMENTS then aggregate_moment(name, nonnull, expression.type)
       when *PAIRS then aggregate_pair_moment(name, rows)
-      when /\Ajsonb?_agg/ then aggregate_json_array(name, values)
-      when /\Ajsonb?_object_agg/ then aggregate_json_object(name, rows)
+      when /\Ajsonb?_agg/ then aggregate_json_array(name, values, expression)
+      when /\Ajsonb?_object_agg/ then aggregate_json_object(name, rows, expression)
       else raise Error.new('0A000', "aggregate #{name} is not implemented")
       end
     end
@@ -409,20 +409,20 @@ module JedNative
       rows.map!(&:first)
     end
 
-    def aggregate_json_array(name, values)
+    def aggregate_json_array(name, values, expression)
       return nil if values.empty?
       binary = name.start_with?('jsonb')
       values = values.compact if name.end_with?('_strict')
       converted = values.map do |value|
         charge
-        JsonValue.from_ruby(value, binary: binary)
+        json_image_value(value, expression.args[0].type, expression.args[0], binary: binary)
       end
       data = converted.map(&:value)
       source = binary ? nil : '[' + converted.map(&:to_s).join(', ') + ']'
       JsonValue.new(data, binary: binary, source: source)
     end
 
-    def aggregate_json_object(name, rows)
+    def aggregate_json_object(name, rows, expression)
       return nil if rows.empty?
       binary = name.start_with?('jsonb')
       strict = name.end_with?('_strict')
@@ -432,12 +432,12 @@ module JedNative
       seen = {}
       rows.each do |key, value|
         raise Error.new('22004', 'JSON object key must not be null') if key.nil?
-        key = Types.format(key)
+        key = json_key_text(key, expression.args[0].type)
         raise Error.new('22030', 'duplicate JSON object key') if unique && seen[key]
         seen[key] = true
         next if strict && value.nil?
         charge
-        converted = JsonValue.from_ruby(value, binary: binary)
+        converted = json_image_value(value, expression.args[1].type, expression.args[1], binary: binary)
         data[key] = converted.value
         pairs << JsonValue.escape(key) + ' : ' + converted.to_s
       end
