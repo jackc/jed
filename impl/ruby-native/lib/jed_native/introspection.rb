@@ -107,7 +107,7 @@ module JedNative
         end
         catalog_views(scope).each do |view_name, view|
           view_schema(view).each_with_index do |column, index|
-            column = column.merge(default: view[:defaults]&.dig(column[:name]))
+            column = column.merge(default: view[:defaults]&.dig(column[:name]), view_default: true)
             rows << [view_name, column[:name], index + 1, introspection_type(column), false, nil, introspection_default(column), nil]
           end
         end
@@ -238,6 +238,7 @@ module JedNative
     def introspection_default(column)
       node = column[:default]
       return nil unless node
+      return catalog_expression(node) if column[:view_default]
       if node[:kind] == :literal || node[:kind] == :unary && node[:expr]&.dig(:kind) == :literal
         cost, scalar = @cost, @scalar_bytes
         begin

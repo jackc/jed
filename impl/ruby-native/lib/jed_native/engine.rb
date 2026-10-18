@@ -11,13 +11,16 @@ module JedNative
     attr_accessor :max_cost
     attr_accessor :lifetime_max_cost
     attr_reader :lifetime_cost
-    attr_writer :max_scalar_bytes
+    def max_scalar_bytes=(amount)
+      @max_scalar_bytes = amount.positive? ? amount : 64 * 1024 * 1024
+    end
 
     def initialize(environment: nil, max_cost: 0, lifetime_max_cost: 0, max_scalar_bytes: 64 * 1024 * 1024, **options)
       raise Error.new('0A000', "unsupported settings: #{options.keys.join(', ')}") unless options.empty?
       @environment = environment
       @tables, @views, @types, @sequences = {}, {}, {}, {}
       @cost, @max_cost, @max_scalar_bytes = 0, max_cost, max_scalar_bytes
+      self.max_scalar_bytes = max_scalar_bytes
       @lifetime_cost, @lifetime_max_cost = 0, lifetime_max_cost
       @params, @ctes, @outer = [], {}, []
       @transaction, @failed, @dirty = nil, false, false
@@ -312,7 +315,7 @@ module JedNative
       source_type = source&.type || Types.infer(value)
       literal = source && %i[literal param].include?(source.kind)
       numeric = %w[i16 i32 i64 decimal f32 f64]
-      unless source_type == target || literal || source_type == 'record' || (source_type.end_with?('[]') && target.end_with?('[]')) || (numeric.include?(source_type) && numeric.include?(target)) || source_type == 'unknown' || source_type == 'jsonb' && target == 'json'
+      unless source_type == target || literal || source_type == 'record' || (source_type.end_with?('[]') && target.end_with?('[]')) || (numeric.include?(source_type) && numeric.include?(target)) || %w[null unknown].include?(source_type) || source_type == 'jsonb' && target == 'json'
         raise Error.new('42804', "cannot assign #{source_type} to #{target}")
       end
       if value.nil?
@@ -562,6 +565,7 @@ module JedNative
             rows << row
             rowids << child[:rowids]&.dig(index)
           end
+          query_memory_stage_changes(child, child_changes) unless child[:temporary]
           @tables[name] = child.merge(rows: rows, rowids: rowids)
           validate_rows(@tables[name], rows)
           enforce_references(child, child_changes, operation, visited)
@@ -657,6 +661,7 @@ module JedNative
           if scan
             charge(scan.length)
             rel = Relation.new(columns: scope, rows: scan)
+            query_memory_relation(rel, mask: query_memory_mask(scope)) if @query_memory
           else
             rel = source_relation(source)
           end
@@ -664,7 +669,13 @@ module JedNative
           rel, where_node = materialize_from(from, stmt[:joins] || [], where_node)
         end
         predicate ||= compile_filter(where_node, rel.columns)
-        rel = Relation.new(columns: rel.columns, rows: rel.rows.select { |row| !predicate || evaluate(predicate, row) == true })
+        profile_checkpoint(:scan) if @explain_profile_frames
+        rel = if @query_memory
+          query_memory_filter(rel) { |row| !predicate || evaluate(predicate, row) == true }
+        else
+          Relation.new(columns: rel.columns, rows: rel.rows.select { |row| !predicate || evaluate(predicate, row) == true })
+        end
+        profile_checkpoint(:filter) if @explain_profile_frames
         projections = expand_stars(stmt[:columns] || stmt[:projections], rel.columns)
         compiled = projections.map { |p| compile(p[:expr], rel.columns) }
         group_nodes = respond_to?(:resolve_group_nodes) ? resolve_group_nodes(stmt, rel.columns) : (stmt[:group_by] || [])
@@ -698,12 +709,37 @@ module JedNative
         else
           rel.rows.map { |row| [row, nil] }
         end
+        profile_checkpoint(:aggregate) if @explain_profile_frames
         columns = projections.zip(compiled).map { |p, e| { name: p[:alias] || expression_name(p[:expr]), type: e.type } }
         prepare_window_values(stmt, rel.columns, contexts) if respond_to?(:prepare_window_values)
-        results = contexts.map do |row, group|
-          [compiled.map { |e| evaluate(e, row, group) }, row, group]
+        profile_checkpoint(:window) if @explain_profile_frames
+        defer_projection = !grouped && !stmt[:distinct] && !contains_window?(stmt[:columns])
+        if defer_projection
+          output_owner = query_memory_owner if @query_memory && query_memory_collect_result?
+          results = contexts.map { |row, group| [nil, row, group, {}] }
+        elsif @query_memory
+          output_owner = query_memory_owner if stmt[:distinct] || query_memory_collect_result?
+          distinct_owner = query_memory_owner if stmt[:distinct]
+          seen = {} if stmt[:distinct]
+          results = contexts.filter_map do |row, group|
+            values = compiled.map { |e| evaluate(e, row, group) }
+            if seen
+              next if seen.key?(values)
+              query_memory_add(distinct_owner, MemorySchedule::ENTRY + query_memory_key_bytes(values, compiled.map(&:type)))
+              seen[values] = true
+            end
+            query_memory_add_row(output_owner, values, columns) if output_owner
+            [values, row, group]
+          end
+          query_memory_release(distinct_owner) if distinct_owner
+          query_memory_release(rel) if stmt[:distinct]
+        else
+          results = contexts.map do |row, group|
+            [compiled.map { |e| evaluate(e, row, group) }, row, group]
+          end
+          results = results.uniq { |entry| entry[0] } if stmt[:distinct]
         end
-        results = results.uniq { |entry| entry[0] } if stmt[:distinct]
+        profile_checkpoint(:distinct) if @explain_profile_frames
         orders = stmt[:order_by] || []
         unless orders.empty?
           order_exprs = orders.map do |order|
@@ -719,8 +755,18 @@ module JedNative
             end
           end
           order_exprs.each { |kind, expression, _| ensure_comparable_type(kind == :output ? columns[expression][:type] : expression.type) }
+          sort_memory_owner = query_memory_owner if @query_memory
           keyed = results.map do |entry|
-            keys = order_exprs.map { |kind, expression, _| kind == :output ? entry[0][expression] : evaluate(expression, entry[1], entry[2]) }
+            keys = order_exprs.map do |kind, expression, _|
+              if kind == :output && defer_projection
+                entry[3].fetch(expression) { entry[3][expression] = evaluate(compiled[expression], entry[1], entry[2]) }
+              elsif kind == :output
+                entry[0][expression]
+              else
+                evaluate(expression, entry[1], entry[2])
+              end
+            end
+            query_memory_add(sort_memory_owner, query_memory_collation_bytes(keys, sort_memory_owner)) if @query_memory
             [entry, keys]
           end
           keyed.sort! do |a, b|
@@ -732,7 +778,9 @@ module JedNative
             comparison
           end
           results = keyed.map(&:first)
+          query_memory_release(sort_memory_owner) if @query_memory
         end
+        profile_checkpoint(:sort) if @explain_profile_frames
         offset = stmt[:offset] ? evaluate(compile(stmt[:offset], []), []) : 0
         limit = stmt[:limit] ? evaluate(compile(stmt[:limit], []), []) : nil
         offset ||= 0
@@ -740,8 +788,17 @@ module JedNative
         raise Error.new('2201W', 'negative LIMIT') if limit && limit.negative?
         results = results.drop(offset)
         results = results.take(limit) if limit
+        if defer_projection
+          results.each do |entry|
+            entry[0] = compiled.each_with_index.map { |expression, index| entry[3].fetch(index) { evaluate(expression, entry[1], entry[2]) } }
+            query_memory_add_row(output_owner, entry[0], columns) if output_owner
+          end
+        end
         charge(results.length)
-        Relation.new(columns: columns, rows: results.map(&:first))
+        profile_checkpoint(:root) if @explain_profile_frames
+        result = Relation.new(columns: columns, rows: results.map(&:first))
+        query_memory_attach(result, output_owner) if output_owner
+        result
       ensure
         @ctes = old_ctes
         @window_values = old_windows
@@ -759,10 +816,19 @@ module JedNative
           rel = select(@views[name][:query])
         else
           t = table(name)
-          charge(full_scan_pages(t))
-          charge_scan_payload(t)
-          charge(t[:rows].length)
-          rel = Relation.new(columns: table_columns(t), rows: t[:rows])
+          bound = source[:native_access_predicate] && compile_filter(source[:native_access_predicate], table_columns(t, source[:alias] || name))
+          input = if source[:native_access_plan]
+            execute_scan_access(t, bound, source[:native_access_plan])
+          else
+            bound && primary_scan(t, bound)
+          end
+          unless input
+            charge(full_scan_pages(t))
+            charge_scan_payload(t)
+            input = t[:native_primary_entries] ? t[:native_primary_entries].map { |_, index| t[:rows][index] } : t[:rows]
+          end
+          charge(input.length)
+          rel = Relation.new(columns: table_columns(t), rows: input)
         end
       when :subquery, :derived
         rel = select(source[:query])
@@ -778,18 +844,29 @@ module JedNative
           step ||= 1
           raise Error.new('22023', 'zero series step') if step.zero?
           rows = []
+          memory_owner = query_memory_owner if @query_memory
           unless first.nil? || last.nil?
             while step.positive? ? first <= last : first >= last
               charge
+              query_memory_add_row(memory_owner, [first]) if @query_memory
               rows << [first]
               first += step
             end
           end
           rel = Relation.new(columns: [{ name: name, type: 'i64' }], rows: rows)
+          query_memory_attach(rel, memory_owner) if @query_memory
         when 'unnest'
           values = args.first
           items = values.respond_to?(:elements) ? values.elements : Array(values)
-          rel = Relation.new(columns: [{ name: name, type: Types.infer(items.find { |v| !v.nil? }) }], rows: items.map { |v| [v] })
+          memory_owner = query_memory_owner if @query_memory
+          rows = items.map do |value|
+            charge
+            row = [value]
+            query_memory_add_row(memory_owner, row) if @query_memory
+            row
+          end
+          rel = Relation.new(columns: [{ name: name, type: Types.infer(items.find { |v| !v.nil? }) }], rows: rows)
+          query_memory_attach(rel, memory_owner) if @query_memory
         else raise Error.new('0A000', "table function #{name} is not implemented")
         end
       else raise Error.new('0A000', "FROM #{source[:kind]} is not implemented")
@@ -805,7 +882,9 @@ module JedNative
         ordinal = source[:kind] == :join_group && !alias_name ? c[:source_ordinal] : i
         c.merge(table: alias_name || c[:table], name: name, source_ordinal: ordinal)
       end
-      Relation.new(columns: columns, rows: rel.rows)
+      result = Relation.new(columns: columns, rows: rel.rows)
+      query_memory_transfer(rel, result) if @query_memory
+      result
     end
 
     def join(left, source, kind, on, using)
@@ -815,7 +894,11 @@ module JedNative
       if dependency && right_preserved
         raise Error.new('42P10', 'invalid lateral reference in RIGHT/FULL JOIN')
       end
-      right = if lateral
+      index_plan = source[:native_index_plan]
+      index_plan ||= join_index_plan(left, source, kind, on, using) unless lateral || source[:native_join_algorithm]
+      right = if index_plan
+        Relation.new(columns: index_plan[:columns], rows: [])
+      elsif lateral
         if left.rows.empty?
           metadata = ParameterBindings.new(self, nil).relation_columns(source, left.columns)
           Relation.new(columns: metadata, rows: [])
@@ -846,22 +929,50 @@ module JedNative
         raise Error.new('42703', "unknown USING column #{name}") unless l && r
         [l, r]
       end
+      unless pairs.empty?
+        using_predicates = pairs.map do |li, ri|
+          { kind: :binary, op: '=', left: { kind: :column, native_ordinal: li },
+            right: { kind: :column, native_ordinal: left.columns.length + ri } }
+        end
+        predicate = compile_filter(join_conjunctions(using_predicates), columns)
+      end
       rows, right_seen = [], {}
+      memory_owner = query_memory_owner if @query_memory
+      memory_mask = query_memory_mask(columns) if @query_memory
+      hash_gate = source[:native_original_on] ? compile_filter(source[:native_original_on], columns) : predicate
+      hash_table = hash_join_table(left, right, predicate, kind, gate: hash_gate, force: source[:native_join_algorithm] == :hash) unless lateral || index_plan || source[:native_wide_outer] || source[:native_join_algorithm] == :nested
+      window = source[:native_join_window]
       left.rows.each_with_index do |lrow, left_index|
+        break if window && rows.length >= window[:target]
+        right = join_index_relation(index_plan, left, lrow) if index_plan
         right = lateral_source_relation(source, left.columns, lrow) if lateral && left_index.positive?
         matched = false
-        right.rows.each_with_index do |rrow, index|
+        candidates = hash_table ? hash_join_candidates(hash_table, lrow) : right.rows.each_index
+        candidates.each do |index|
+          rrow = right.rows[index]
           row = lrow + rrow
-          next unless pairs.all? { |li, ri| !lrow[li].nil? && !rrow[ri].nil? && Types.compare(lrow[li], rrow[ri]).zero? }
           next if predicate && evaluate(predicate, row) != true
+          next if window && window[:filter] && evaluate(window[:filter], row) != true
+          query_memory_add_row(memory_owner, row, columns, memory_mask) if @query_memory
           rows << row
           matched = true
           right_seen[index] = true
+          break if window && rows.length >= window[:target]
         end
-        rows << (lrow + Array.new(right.columns.length)) if !matched && %i[left full left_outer full_outer].include?(kind)
+        if !matched && %i[left full left_outer full_outer].include?(kind)
+          row = lrow + Array.new(right.columns.length)
+          query_memory_add_row(memory_owner, row, columns, memory_mask) if @query_memory
+          rows << row
+        end
+        query_memory_release(right) if @query_memory && (lateral || index_plan)
       end
       if %i[right full right_outer full_outer].include?(kind)
-        right.rows.each_with_index { |row, i| rows << (Array.new(left.columns.length) + row) unless right_seen[i] }
+        right.rows.each_with_index do |row, index|
+          next if right_seen[index]
+          combined = Array.new(left.columns.length) + row
+          query_memory_add_row(memory_owner, combined, columns, memory_mask) if @query_memory
+          rows << combined
+        end
       end
       unless pairs.empty?
         merged = pairs.map { |li, ri| left.columns[li].merge(table: nil, type: common_type(left.columns[li][:type], right.columns[ri][:type])) }
@@ -876,20 +987,34 @@ module JedNative
         end
         columns = merged + visible.map { |i| columns[i] } + hidden.map { |i| columns[i].merge(qualified_only: true) }
       end
-      Relation.new(columns: columns, rows: rows)
+      result = Relation.new(columns: columns, rows: rows)
+      query_memory_attach(result, memory_owner, memory_mask) if @query_memory
+      result
+    ensure
+      if @query_memory
+        query_memory_release(left)
+        query_memory_release(right) if right
+        hash_join_release(hash_table) if hash_table && respond_to?(:hash_join_release)
+      end
     end
 
     def lateral_source_dependency?(source, columns)
       if source[:kind] == :join_group
         (source[:from] + source[:joins].map { |item| item[:relation] }).any? { |item| lateral_source_dependency?(item, columns) }
       elsif source[:lateral] || %i[function call srf json_table].include?(source[:kind])
-        source_uses_columns?(source[:expr] || source, columns)
+        source_uses_columns?(source[:query] || source[:expr] || source.reject { |key, _| key.to_s.start_with?('native_') }, columns)
       else
         false
       end
     end
 
     def lateral_source_relation(source, columns, row)
+      if source[:kind] != :join_group && @join_group_outer&.any?
+        prefix_columns = @join_group_outer.flat_map(&:first)
+        prefix_values = @join_group_outer.flat_map(&:last)
+        columns = prefix_columns + columns
+        row = prefix_values + row
+      end
       correlated(columns, row) do
         if source[:kind] == :join_group
           @join_group_outer ||= []
@@ -907,6 +1032,7 @@ module JedNative
 
     def materialize_from(sources, joins, predicate = nil)
       relation = Relation.new(columns: [], rows: [[]])
+      query_memory_relation(relation) if @query_memory && sources.empty?
       pushable = joins.all? { |item| %i[inner cross].include?(item[:kind]) }
       sources.each_with_index do |source, index|
         group_joins = joins.select { |item| (item[:from_index] || 0) == index }
@@ -915,9 +1041,9 @@ module JedNative
         # sibling without depending on its own nullable left input.
         if !group_joins.empty? && sources.length > 1
           component = { kind: :join_group, from: [source], joins: group_joins.map { |item| item.merge(from_index: 0) } }
-          relation = join(relation, component, :cross, nil, nil)
+          relation = index.zero? ? source_relation(component) : join(relation, component, :cross, nil, nil)
         else
-          relation = join(relation, source, :cross, nil, nil)
+          relation = index.zero? ? source_relation(source) : join(relation, source, :cross, nil, nil)
           group_joins.each do |item|
             relation = join(relation, item[:relation] || item[:right], item[:kind] || item[:type], item[:on], item[:natural] ? :natural : item[:using])
           end
@@ -927,7 +1053,11 @@ module JedNative
           local, remaining = terms.partition { |term| local_filter?(term, relation.columns) }
           unless local.empty?
             expression = compile_filter(join_conjunctions(local), relation.columns)
-            relation = Relation.new(columns: relation.columns, rows: relation.rows.select { |row| evaluate(expression, row) == true })
+            relation = if @query_memory
+              query_memory_filter(relation) { |row| evaluate(expression, row) == true }
+            else
+              Relation.new(columns: relation.columns, rows: relation.rows.select { |row| evaluate(expression, row) == true })
+            end
             predicate = join_conjunctions(remaining)
           end
         end
@@ -964,6 +1094,11 @@ module JedNative
       when Array then node.any? { |item| source_uses_columns?(item, columns) }
       when Hash
         if node[:kind] == :column
+          unless node[:table]
+            prefix = (@join_group_outer || []).flat_map(&:first)
+            matches = (prefix + columns).select { |column| column[:name] == node[:name] && !column[:qualified_only] }
+            raise Error.new('42702', "ambiguous column #{node[:name]}") if matches.length > 1
+          end
           columns.any? { |column| column[:name] == node[:name] && (!node[:table] || column[:table] == node[:table]) }
         else
           node.values.any? { |value| source_uses_columns?(value, columns) }
@@ -1104,7 +1239,9 @@ module JedNative
         raise Error.new(node[:table] == 'excluded' ? '42P09' : '42702', "ambiguous column #{node[:name]}") if matches.length > 1
         if matches.empty?
           @outer.reverse_each.with_index do |outer, depth|
-            i = outer[0].index { |c| c[:name] == node[:name] && (node[:table] ? c[:table] == node[:table] : !c[:qualified_only]) }
+            positions = outer[0].each_index.select { |index| outer[0][index][:name] == node[:name] && (node[:table] ? outer[0][index][:table] == node[:table] : !outer[0][index][:qualified_only]) }
+            raise Error.new('42702', "ambiguous column #{node[:name]}") if positions.length > 1
+            i = positions.first
             return Expression.new(kind: :outer, type: outer[0][i][:type], value: [depth, i]) if i
           end
           code = node[:table] && !columns.any? { |c| c[:table] == node[:table] } ? '42P01' : '42703'
@@ -1141,7 +1278,7 @@ module JedNative
         when 'coalesce', 'greatest', 'least', 'nullif' then args.map(&:type).reduce('unknown') { |a, b| common_type(a, b) }
         else Functions.return_type(name, args.map(&:type))
         end
-        extra = node.merge(filter_expr: node[:filter] ? compile_filter(node[:filter], columns) : nil)
+        extra = node.merge(filter_expr: compile_boolean_value(node[:filter], columns))
         Expression.new(kind: kind, type: type || 'unknown', value: name, args: args, extra: extra)
       when :case
         operand = node[:operand] ? compile(node[:operand], columns) : nil

@@ -27,17 +27,18 @@ module JedNative
       return super if candidates.empty?
       name, intervals = candidates.first
       entries = name ? stored[:native_secondary_indexes][name] : stored[:native_primary_entries]
-      ordinals = []
-      intervals.each do |lower, upper|
-        first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
-        last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
-        charge(name ? secondary_page_count(stored, name, lower, upper) : primary_page_count(stored, lower, upper))
-        found = entries[first...last].map(&:last)
-        charge(found.length * (stored.dig(:native_primary_metadata, :height) || 1)) if name
-        charge_scan_payload(stored, found)
-        ordinals.concat(found)
+      intervals = intervals.reverse if @native_reverse_scan
+      iterator = Enumerator.new do |output|
+        intervals.each do |lower, upper|
+          first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
+          last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
+          charge(name ? secondary_page_count(stored, name, lower, upper) : primary_page_count(stored, lower, upper))
+          found = entries[first...last].map(&:last)
+          charge_scan_payload(stored, found) unless name
+          scan_rows(stored, found, lookup: !!name).each { |row| output << row }
+        end
       end
-      ordinals.uniq.map { |ordinal| stored[:rows][ordinal] }
+      @native_stream_scan ? iterator : iterator.to_a
     end
 
     private
@@ -79,7 +80,7 @@ module JedNative
         return nil unless permitted
         if %i[literal param outer].include?(source.kind)
           values = evaluate(source, []) || []
-        elsif source.kind == :array && source.args.all? { |arg| %i[literal param outer].include?(arg.kind) } && (exact || source.args.all? { |arg| %i[param outer].include?(arg.kind) || arg.kind == :literal && (arg.value.nil? || arg.extra&.dig(:untyped)) })
+        elsif source.kind == :array && source.args.all? { |arg| %i[literal param outer].include?(arg.kind) } && (exact || source.args.all? { |arg| %i[param outer].include?(arg.kind) || arg.kind == :literal && (arg.value.nil? || arg.value.is_a?(Integer) && arg.extra&.dig(:untyped)) })
           values = source.args.map { |arg| evaluate(arg, []) }
         else
           return nil

@@ -132,13 +132,30 @@ module JedNative
       compiled = keys.to_h { |key| [key, compile(key, relation.columns)] }
       key_values = relation.rows.map { |row| keys.to_h { |key| [key, evaluate(compiled[key], row)] } }
       having = compile_filter(statement[:having], relation.columns)
-      materialized = projection_aggregates(statement[:columns]).map { |node| compile(node, relation.columns) }
+      materialized = projection_aggregates([statement[:columns], statement[:having], statement[:order_by]]).map { |node| compile(node, relation.columns) }
       contexts = []
+      if @query_memory
+        rows_owner = query_memory_owner
+        group_owners = []
+        vector = @query_memory_contexts.last[:vector_group]
+        synthetic_rows = []
+      end
       sets.each do |set|
         groups = {}
+        owners = {} if @query_memory
         relation.rows.each_with_index do |row, index|
           key = set.map { |item| key_values[index][item] }
+          if @query_memory && !groups.key?(key)
+            owners[key] = query_memory_owner
+            query_memory_add(owners[key], MemorySchedule::ENTRY + query_memory_key_bytes(key))
+            group_owners << owners[key]
+          end
           (groups[key] ||= []) << row
+        end
+        if @query_memory && set.empty? && groups.empty?
+          owners[[]] = query_memory_owner
+          query_memory_add(owners[[]], MemorySchedule::ENTRY)
+          group_owners << owners[[]]
         end
         groups[[]] ||= [] if set.empty?
         groups.each do |values, group|
@@ -153,10 +170,28 @@ module JedNative
             row[expression.value] = nil if !index && expression.kind == :column
           end
           @aggregate_group_states[group.object_id] = state
-          materialized.each { |expression| aggregate(expression, group) }
-          next if having && evaluate(having, row, group) != true
+          if @query_memory
+            previous_aggregate_owner = @query_memory_aggregate_owner
+            @query_memory_aggregate_owner = owners[values]
+          end
+          aggregate_values = materialized.map { |expression| aggregate(expression, group) }
+          accepted = !having || evaluate(having, row, group) == true
+          if @query_memory
+            @query_memory_aggregate_owner = previous_aggregate_owner
+            query_memory_release(owners[values]) unless vector
+            synthetic = keys.map { |key| state[:keys][aggregate_expression_key(compiled[key])] } + aggregate_values
+            if accepted
+              vector ? synthetic_rows << synthetic : query_memory_add_row(rows_owner, synthetic)
+            end
+          end
+          next unless accepted
           contexts << [row, group]
         end
+      end
+      if @query_memory
+        group_owners.each { |owner| query_memory_release(owner) } if vector
+        synthetic_rows.each { |row| query_memory_add_row(rows_owner, row) } if vector
+        query_memory_release(relation)
       end
       contexts
     end
@@ -315,7 +350,7 @@ module JedNative
         type += '[]' if args.first&.type&.end_with?('[]')
       end
       Expression.new(kind: :call, type: type, value: name, args: args,
-                     extra: node.merge(aggregate_cache_id: node.object_id, aggregate_order: orders, filter_expr: node[:filter] && compile_filter(node[:filter], columns)))
+                     extra: node.merge(aggregate_cache_id: node.object_id, aggregate_order: orders, filter_expr: compile_boolean_value(node[:filter], columns)))
     end
 
     def aggregate(expression, group)
@@ -387,12 +422,27 @@ module JedNative
     def aggregate_inputs(expression, group)
       rows = []
       orderings = expression.extra[:aggregate_order] || []
+      seen = {} if @query_memory && expression.extra[:distinct]
       group.each_with_index do |row, ordinal|
         next if expression.extra[:filter_expr] && evaluate(expression.extra[:filter_expr], row) != true
         charge
         values = expression.args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, row) }
         charge if PAIRS.include?(expression.value) || expression.value == 'string_agg' || expression.value.include?('object_agg')
         keys = orderings.map { |compiled, _| evaluate(compiled, row) }
+        if @query_memory && @query_memory_aggregate_owner
+          owner = @query_memory_aggregate_owner
+          if !orderings.empty?
+            query_memory_add_row(owner, keys + values)
+          end
+          if seen && values.none?(&:nil?) && !seen.key?(values)
+            query_memory_add(owner, MemorySchedule::ENTRY + query_memory_key_bytes(values))
+            seen[values] = true
+          end
+          retained = expression.value.match?(/\A(?:array_agg|string_agg|jsonb?_agg|jsonb?_object_agg)/)
+          retained &&= !values.first.nil? if expression.value == 'string_agg'
+          retained &&= !values.last.nil? if expression.value.end_with?('_strict')
+          query_memory_add(owner, query_memory_key_bytes(values, expression.args.map(&:type))) if retained
+        end
         rows << [values, keys, ordinal]
       end
       rows.uniq! { |entry| entry[0] } if expression.extra[:distinct]
@@ -418,7 +468,12 @@ module JedNative
         json_image_value(value, expression.args[0].type, expression.args[0], binary: binary)
       end
       data = converted.map(&:value)
-      source = binary ? nil : '[' + converted.map(&:to_s).join(', ') + ']'
+      source = unless binary
+        '[' + converted.each_with_index.map do |item, i|
+          separator = i.zero? ? '' : values[i].is_a?(ArrayValue) || values[i].is_a?(CompositeValue) ? ", \n " : ', '
+          separator + item.to_s
+        end.join + ']'
+      end
       JsonValue.new(data, binary: binary, source: source)
     end
 
@@ -431,7 +486,8 @@ module JedNative
       pairs = []
       seen = {}
       rows.each do |key, value|
-        raise Error.new('22004', 'JSON object key must not be null') if key.nil?
+        raise Error.new(binary ? '22023' : '22004', 'JSON object key must not be null') if key.nil?
+        raise Error.new('22023', 'JSON object key must be scalar') if key.is_a?(Array) || key.is_a?(JsonValue)
         key = json_key_text(key, expression.args[0].type)
         raise Error.new('22030', 'duplicate JSON object key') if unique && seen[key]
         seen[key] = true
@@ -450,7 +506,13 @@ module JedNative
       group.each do |row|
         next if expression.extra[:filter_expr] && evaluate(expression.extra[:filter_expr], row) != true
         charge
-        rows << orders.map { |compiled, _| evaluate(compiled, row) }
+        values = orders.map { |compiled, _| evaluate(compiled, row) }
+        if @query_memory && @query_memory_aggregate_owner
+          bytes = HYPOTHETICAL.include?(expression.value) ? query_memory_row_bytes(values) : values.first.nil? ? 0 : LogicalMemory.value_bytes(values.first, orders.first.first.type)
+          query_memory_add(@query_memory_aggregate_owner, bytes)
+          query_memory_add(@query_memory_aggregate_owner, query_memory_collation_bytes(values, @query_memory_aggregate_owner))
+        end
+        rows << values
       end
       rows.sort! do |left, right|
         comparison = 0

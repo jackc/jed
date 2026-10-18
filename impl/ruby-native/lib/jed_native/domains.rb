@@ -42,7 +42,7 @@ module JedNative
       refresh_primary_indexes
       nil
     rescue StandardError
-      storage&.close unless source.is_a?(Storage) || @attachments.key?(name)
+      storage&.close unless defined?(Storage) && source.is_a?(Storage) || @attachments.key?(name)
       raise
     end
 
@@ -91,6 +91,12 @@ module JedNative
     end
 
     def dispatch(statement)
+      if statement[:kind] == :drop_type
+        names = statement[:names] || [statement[:name]]
+        dependent = @tables.values.any? { |table| table[:columns].any? { |column| names.include?(column[:type].delete_suffix('[]')) } }
+        dependent ||= @types.any? { |name, fields| !names.include?(name) && fields.any? { |field| names.include?(field[:type].delete_suffix('[]')) } }
+        raise Error.new('2BP01', 'a relation or composite depends on the type') if dependent
+      end
       if statement[:kind] == :select && statement[:into]
         target = statement[:into]
         query = statement.reject { |key, _| key == :into }
@@ -107,11 +113,7 @@ module JedNative
       return true if statement[:kind] == :create_table && statement[:temporary]
       target = statement[:table] || statement[:name]
       if statement[:kind] == :create_view
-        return true if statement[:temporary]
-        # A view over session-local relations is itself temporary.
-        references = []
-        visit_view_nodes(statement[:query]) { |node| references << node[:name] if node[:kind] == :table }
-        return references.any? { |name| @tables[name]&.dig(:temporary) || @views[name]&.dig(:temporary) }
+        return statement[:temporary] || statement[:replace] && @views[statement[:name]]&.dig(:temporary)
       end
       if %i[insert update delete alter_table alter_view create_index analyze].include?(statement[:kind])
         return !!(@tables[target] || @views[target])&.dig(:temporary)
@@ -123,6 +125,12 @@ module JedNative
       if statement[:kind] == :drop_index
         return (statement[:names] || [target]).all? do |name|
           @tables.values.any? { |table| table[:temporary] && table[:indexes].any? { |index| index[:name] == name } }
+        end
+      end
+      if %i[drop_sequence alter_sequence].include?(statement[:kind])
+        return (statement[:names] || [target]).all? do |name|
+          sequence = @sequences[name]
+          sequence && (sequence[:temporary] || @tables[sequence[:owned_by]&.first]&.dig(:temporary))
         end
       end
       false

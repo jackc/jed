@@ -18,7 +18,7 @@ module JedNative
     }.freeze
     NUMBER = '[+-]?(?:\d+(?:\.\d*)?|\.\d+)'
     module_function
-    def parse(input)
+    def parse(input, fields: nil)
       return input if input.is_a?(IntervalValue)
       text = input.to_s.strip
       raise Error.new('22007', 'invalid input syntax for interval') if text.empty?
@@ -38,7 +38,7 @@ module JedNative
           tokens << [:year_month, Decimal.new(sign * (m[2].to_i * 12 + m[3].to_i))]
         elsif (m = /\A([+-]?)(\d+):(\d+(?:\.\d*)?)(?::(\d+(?:\.\d*)?))?/.match(text))
           sign = m[1] == '-' ? -1 : 1
-          second_mode = m[4].nil? && m[3].include?('.')
+          second_mode = m[4].nil? && (m[3].include?('.') || fields == 'minute to second')
           h, minute, second = if second_mode then [0, m[2].to_i, Decimal.parse(m[3])] else [m[2].to_i, m[3].to_i, Decimal.parse(m[4] || '0')] end
           raise Error.new('22008', 'interval field value out of range') if minute > 59 || second > 60
           tokens << [:time, Decimal.new(sign) * (Decimal.new(h * 3600 + minute * 60) + second)]
@@ -52,10 +52,11 @@ module JedNative
         text = text[m[0].length..]
       end
       raise Error.new('22007', 'invalid input syntax for interval') if tokens.empty?
-      tokens.each_with_index do |token, index|
+      (tokens.length - 1).downto(0) do |index|
+        token = tokens[index]
         next if token[0]
         following = tokens[index + 1]&.first
-        token[0] = if [:time, :hour].include?(following) then :day elsif following then following else :second end
+        token[0] = if [:time, :hour].include?(following) then :day elsif following then following else (fields ? fields.split.last.to_sym : :second) end
       end
       accumulate(tokens, ago ? -1 : 1)
     end

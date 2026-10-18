@@ -112,6 +112,14 @@ run = "ruby -Iimpl/ruby-native/lib -e 'Dir[\"impl/ruby-native/test/*_test.rb\"].
 description = "Explicit opt-in: experimental Ruby storage byte and durability tests"
 run = "ruby impl/ruby-native/test/storage_test.rb"
 
+[tasks."ruby-native:domains-test"]
+description = "Explicit opt-in: experimental Ruby attachment lifecycle and independent durability tests"
+run = "ruby impl/ruby-native/test/domains_test.rb"
+
+[tasks."ruby-native:query-memory-test"]
+description = "Explicit opt-in: experimental Ruby host memory budgets and staged-write rollback"
+run = "ruby impl/ruby-native/test/query_memory_test.rb"
+
 [tasks."ruby-native:bench"]
 description = "Explicit opt-in: experimental Ruby against the shared benchmark corpus"
 usage = '''

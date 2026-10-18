@@ -26,7 +26,7 @@ module JedNative
         end
         next unless constraint[:kind] == :check
         schema_expression_structure(constraint[:expr], :check)
-        compile_filter(constraint[:expr], columns)
+        compile_boolean_value(constraint[:expr], columns)
       end
       table[:constraints].each do |constraint|
         resolve_foreign_key(table, constraint) if constraint[:kind] == :foreign_key
@@ -127,6 +127,10 @@ module JedNative
       visit_index_children(expression.args)
       visit_index_children(expression.extra)
       case expression.kind
+      when :json_image
+        reject_index_dependency if expression.args.any? { |argument| json_zoned_argument?(argument) }
+      when :text_builder
+        reject_index_dependency
       when :jsonpath_function
         reject_index_dependency unless JsonPathFunctions.volatility(expression.value) == 'immutable'
       when :call
@@ -163,6 +167,10 @@ module JedNative
       when Array then value.each { |child| visit_index_children(child) }
       when Hash then value.each_value { |child| visit_index_children(child) }
       end
+    end
+
+    def json_zoned_argument?(expression)
+      type_contains_timestamptz?(expression.type) || expression.kind == :row && expression.args.any? { |child| json_zoned_argument?(child) }
     end
 
     def type_contains_timestamptz?(type, seen = {})

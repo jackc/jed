@@ -11,7 +11,7 @@ module JedNative
         end
         return types[1] == 'timestamptz' ? 'timestamp' : 'timestamptz'
       elsif name == 'date_trunc'
-        unless types.length.between?(2, 3) && %w[text unknown].include?(types[0]) && %w[timestamp timestamptz interval unknown].include?(types[1]) && (types.length == 2 || types[1] == 'timestamptz' && %w[text unknown].include?(types[2]))
+        unless types.length.between?(2, 3) && %w[text unknown null].include?(types[0]) && %w[timestamp timestamptz interval unknown null].include?(types[1]) && (types.length == 2 || types[1] == 'timestamptz' && %w[text unknown null].include?(types[2]))
           raise Error.new('42883', 'invalid date_trunc argument types')
         end
         return types[1] == 'unknown' ? 'timestamptz' : types[1]
@@ -154,7 +154,7 @@ module JedNative
         return prefix + render.call(0)
       elsif value.is_a?(CompositeValue)
         fields = @types[value.type_name]
-        return '(' + value.each_with_index.map { |element, index| element.nil? ? '' : Types.container_quote(render_value(element, fields&.[](index)&.dig(:type), meter: meter), /[(),"\\\s]/) }.join(',') + ')'
+        return '(' + value.each_with_index.map { |element, index| element.nil? ? '' : Types.record_quote(element == true ? 't' : element == false ? 'f' : render_value(element, fields&.[](index)&.dig(:type), meter: meter)) }.join(',') + ')'
       elsif value.is_a?(RangeValue)
         return 'empty' if value.empty
         bounds = [value.lower, value.upper].map { |bound| bound.nil? ? '' : Types.container_quote(render_value(bound, value.element_type, meter: meter), /[,()\[\]"\\\s]/) }
@@ -210,6 +210,8 @@ module JedNative
       if value.is_a?(TimestampValue) && value.zoned
         charge unless value.micros.is_a?(Float)
         return JsonValue.escape(render_timestamp(value, json: true))
+      elsif value.is_a?(RangeValue)
+        return JsonValue.escape(render_value(value, type, meter: true))
       end
       super
     end

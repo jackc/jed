@@ -26,19 +26,24 @@ module JedNative
         end
       end
       types = Array.new(width, 'unknown')
+      memory_owner = query_memory_owner if @query_memory
       rows = compiled.map do |row|
         charge
-        row.each_with_index.map do |expr, index|
+        values = row.each_with_index.map do |expr, index|
           type, value = values_cell(expr)
           types[index] = common_type(types[index], type)
           value
         end
+        query_memory_add_row(memory_owner, values) if @query_memory
+        values
       end
       columns = types.each_with_index.map do |type, index|
         { name: "column#{index + 1}", type: type == 'unknown' ? 'text' : type, table: '*VALUES*' }
       end
       rows.map! { |row| row.each_with_index.map { |value, index| cast_value(value, columns[index][:type]) } }
-      relation = apply_query_tail(stmt, Relation.new(columns: columns, rows: rows), set_operation: false)
+      relation = Relation.new(columns: columns, rows: rows)
+      query_memory_attach(relation, memory_owner) if @query_memory
+      relation = apply_query_tail(stmt, relation, set_operation: false)
       charge(relation.rows.length) unless relation_only
       relation
     end
@@ -56,7 +61,54 @@ module JedNative
       lrows, rrows = [left, right].map do |relation|
         relation.rows.map { |row| row.each_with_index.map { |value, index| cast_value(value, columns[index][:type]) } }
       end
-      rows = case operation
+      if @query_memory
+        memory_owner = query_memory_owner
+        [left, right].each do |relation|
+          owner = relation.instance_variable_get(:@native_memory_owner)
+          if owner
+            memory_owner.bytes += owner.bytes
+            owner.bytes = 0
+          end
+        end
+        state_owner = query_memory_owner
+        types = columns.map { |column| column[:type] }
+        remember = lambda do |set, row|
+          unless set.key?(row)
+            query_memory_add(state_owner, MemorySchedule::ENTRY + query_memory_key_bytes(row, types))
+            set[row] = 0
+          end
+          set[row] += 1
+        end
+        seen = {}
+        rows = if operation == 'union'
+          (lrows + rrows).select do |row|
+            next true if stmt[:all]
+            next false if seen.key?(row)
+            remember.call(seen, row)
+            true
+          end
+        else
+          counts = {}
+          rrows.each { |row| remember.call(counts, row) }
+          lrows.select do |row|
+            found = counts.fetch(row, 0).positive?
+            counts[row] -= 1 if found && stmt[:all]
+            next false unless operation == 'intersect' ? found : !found
+            next true if stmt[:all]
+            next false if seen.key?(row)
+            remember.call(seen, row)
+            true
+          end
+        end
+        query_memory_release(state_owner)
+        retained = rows.sum { |row| query_memory_row_bytes(row, columns) }
+        if retained > memory_owner.bytes
+          query_memory_add(memory_owner, retained - memory_owner.bytes)
+        else
+          query_memory_release(memory_owner, memory_owner.bytes - retained)
+        end
+      else
+        rows = case operation
              when 'union' then stmt[:all] ? lrows + rrows : (lrows + rrows).uniq
              when 'intersect', 'except'
                counts = rrows.tally
@@ -68,7 +120,10 @@ module JedNative
                end
              else raise Error.new('42601', 'unknown set operation')
              end
-      apply_query_tail(stmt, Relation.new(columns: columns, rows: rows), set_operation: true)
+      end
+      relation = Relation.new(columns: columns, rows: rows)
+      query_memory_attach(relation, memory_owner) if @query_memory
+      apply_query_tail(stmt, relation, set_operation: true)
     end
 
     def source_relation(source)
@@ -83,7 +138,9 @@ module JedNative
         columns = relation.columns.each_with_index.map do |column, index|
           column.merge(name: names[index] || column[:name], table: source[:alias])
         end
-        return Relation.new(columns: columns, rows: relation.rows)
+        result = Relation.new(columns: columns, rows: relation.rows)
+        query_memory_transfer(relation, result) if @query_memory
+        return result
       end
       super
     end
@@ -148,7 +205,15 @@ module JedNative
       raise Error.new('2201W', 'negative LIMIT') if limit && limit.negative?
       rows = rows.drop(offset) unless offset.zero?
       rows = rows.take(limit) if limit
-      Relation.new(columns: relation.columns, rows: rows)
+      result = Relation.new(columns: relation.columns, rows: rows)
+      if @query_memory
+        kept = rows.to_h { |row| [row.object_id, true] }
+        relation.rows.each do |row|
+          query_memory_release(relation, query_memory_row_bytes(row, relation.columns)) unless kept[row.object_id]
+        end
+        query_memory_transfer(relation, result)
+      end
+      result
     end
   end
   Engine.prepend(QueryComposition)
