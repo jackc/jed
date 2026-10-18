@@ -1,0 +1,24 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure AES writer-key setup/amortization and random-nonce XChaCha in Go"
+require 'json'
+require 'open3'
+require_relative '../../scripts/lib/tasks'
+include Tasks
+dir = File.expand_path(ENV.fetch('JED_AEAD_LIFECYCLE_RESULTS', "bench/results/aead-lifecycle-#{stamp}-#{Process.pid}"))
+FileUtils.mkdir_p(dir)
+sh 'go','build','-mod=readonly','-o',"#{dir}/lifecycle",'./cmd/lifecycle',chdir:'bench/aead/go',env:{'CGO_ENABLED'=>'0','GOPROXY'=>'off'}
+cpu = ENV.fetch('JED_AEAD_CPU',File.read('/proc/self/status')[/^Cpus_allowed_list:\s*(.+)$/,1].split(/[,-]/).first)
+samples = Integer(ENV.fetch('JED_AEAD_SAMPLES','5')); millis = Integer(ENV.fetch('JED_AEAD_SAMPLE_MS','100'))
+out,status = Open3.capture2('taskset','-c',cpu,"#{dir}/lifecycle",samples.to_s,millis.to_s)
+abort 'lifecycle probe failed' unless status.success?
+File.write("#{dir}/raw.jsonl",out)
+parsed = out.lines.map { |line| JSON.parse(line) }
+fixtures,timings = parsed.partition { |r| r['kind']=='fixture' }
+fixtures.each { |f| f['sha256'] = Digest::SHA256.hexdigest([f.delete('hex')].pack('H*')) }
+metadata = {date_utc:Time.now.utc.iso8601,cpu_affinity:cpu,samples:samples,sample_ms:millis,warmup_samples:1,
+  go:Open3.capture2('go','version').first.strip,revision:Open3.capture2('git','rev-parse','HEAD').first.strip,
+  source_sha256:Dir.glob('bench/aead/go/{cmd/lifecycle/*.go,go.*}').to_h { |p| [p,Digest::SHA256.file(p).hexdigest] }}
+File.write("#{dir}/results.json",JSON.pretty_generate({rows:timings,fixtures:fixtures,metadata:metadata})+"\n")
+timings.each { |r| puts "#{r['operation']} #{r['bytes']}: #{(r['median_ns']/1000).round(3)} us" }
+puts "Lifecycle results: #{dir}/results.json"
