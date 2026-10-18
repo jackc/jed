@@ -582,6 +582,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - **Full-text search.** PostgreSQL (`tsvector`/`tsquery` + GIN) and SQLite (FTS5) both ship it. In
   jed it would be a type pair, a tokenizer/stemmer data bundle loaded through the `Environment` (the
   collation precedent), and a GIN operator class. Large; not scheduled.
+- **Browser/Node async runtime (proposal).** [ts-runtime.md](spec/design/ts-runtime.md) proposes
+  an async-only public JS API, off-thread execution, one TS semantic core with platform adapters,
+  bounded typed transport, cancellation and explicit page/crypto suspension. Specify lifecycle
+  and scheduling first, then prototype and measure before choosing packaging or an API migration.
+  Not implemented or ratified; existing APIs and shipping preferences remain in force.
 - **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep
   open, **designed in [encryption.md](spec/design/encryption.md)**: a page codec in the core
   above the block seam, standardized AEAD and envelope encryption (cheap credential rewrap,

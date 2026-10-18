@@ -78,6 +78,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [api.md](api.md) — the host/embedding API: open/create/commit/close a database file,
   prepare/execute/query, the `Rows` cursor, `$N` bind parameters, and the structured-error
   surface — the same shape across cores (CLAUDE.md §1/§2).
+- [ts-runtime.md](ts-runtime.md) — proposed async-only public JS API for browser and Node:
+  off-thread execution, one TS core with platform adapters, bounded transport, cancellation,
+  transaction scheduling and page/crypto suspension; not implemented or ratified.
 - [planner.md](planner.md) — the deterministic logical/rewrite/physical planner stages,
   current rule inventory, access-path policies, and optimizer extension points.
 - [estimator.md](estimator.md) — the implemented Path-B plan-time cardinality/cost contract:

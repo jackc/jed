@@ -271,6 +271,10 @@ The linked report retains all 104 cases, samples, versions, allocation modes and
 
 ### 8.1 Browser execution and the Rust/WASM option
 
+The follow-on [browser/Node runtime proposal](ts-runtime.md) develops an async-only public JS
+API, worker scheduling, cancellation and internal page/crypto suspension. It is design work;
+the implementation observations and benchmark limitations below still apply.
+
 The browser **client already returns promises** (`impl/ts/src/browser/client.ts`). A dedicated
 worker runs the synchronous TS engine over synchronous OPFS access handles. That preserves the
 same synchronous pager/B-tree/executor contracts as Node, keeps promises out of resident query

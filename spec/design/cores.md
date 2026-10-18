@@ -385,6 +385,46 @@ Current leaning: keep native TS plus the narrow helper as the default proposal, 
 wrapper experiment, and revisit an optional or primary native package only with a
 production-complete API and workload-driven evidence.
 
+### 5.3 Platform specialization without another semantic core (proposal)
+
+The encryption/browser investigation reinforces the distinction between **delivery adapters**
+and **engine implementations**. The existing TS engine already has separate Node file and browser
+OPFS adapters. It is reasonable to specialize scheduling, crypto, storage, and packaging further.
+The proposed runtime is specified in [ts-runtime.md](ts-runtime.md): an **async-only public JS
+API** with execution off the application thread, retaining synchronous internal computation and
+adding explicit suspension/checkpoints. It is not implemented or a ratified API migration.
+
+| Concern | Node candidate | Browser candidate |
+|---|---|---|
+| Storage/coordination | OS files and page-service locks | Worker-owned OPFS handles |
+| Accelerated AES-GCM | Synchronous Node crypto for TS, or RustCrypto in a native package | Asynchronous WebCrypto, with explicit suspension in the worker |
+| Execution API | Async worker API with batching; no initial public sync variant | Async worker RPC with the same lifecycle; resident computation can remain synchronous |
+| Engine delivery | Independent TS or optional Rust/Node-API | Independent TS or Rust/WASM with browser adapters |
+
+This is a proposal for evaluation, not a ratified shipping matrix. In particular, native Node crypto
+can accelerate a TS codec without moving SQL execution to Rust. Node does not need to inherit all
+browser internal promise boundaries, and a synchronous native addon still blocks its calling JS thread
+while executing SQL. Threaded/batched APIs must be designed and measured rather than inferred from
+Rust's presence.
+
+Keep parser, planner, type rules, execution semantics, costs and byte formats shared within each
+existing core; do not fork TS into separately maintained Node and browser SQL engines solely to
+change its I/O and crypto providers. A future suspension-capable TS execution path should preserve
+its synchronous resident fast path and avoid duplicating operator implementations. This needs
+design work at demand-paging call sites, not just an async facade around today's worker.
+
+An optional Node package backed by the **existing** Rust core adds binding/distribution work, not
+a fourth independently implemented SQL engine. Select such a backend explicitly when opening a
+database; differences in host functions, supported value types and deployment requirements must
+remain visible. Require API parity and the common conformance/file contract before treating it
+as interchangeable. WASM remains a viable delivery choice, but native compilation or WASM alone
+does not establish an across-the-board performance advantage over TS.
+
+The current small, same-host three-way read comparison is reproducible with
+`mise run bench:aead_node_compare`; see [the report](../../bench/aead/results/2026-10-18-node.md).
+It complements the older full-corpus read/write/concurrency results above, rather than replacing
+them with five read-only probes. No production engine selection changes in this investigation.
+
 ## 6. Current recommendation / status
 
 The differential core set is **in place**: Rust + Go + the native TS core run in lockstep,
