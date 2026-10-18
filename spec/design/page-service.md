@@ -496,7 +496,21 @@ through its pager. Common rules ([spec/pageservice/README.md](../pageservice/REA
   compaction fail `55006` while it runs. A role change during a client's backup fails it `08006`.
 - Every copied page's CRC-32 is checked (`XX001`), and the reachable count must equal the snapshot
   meta's live count (`XX001`).
-- A backup copies the main database only. It is a host act: not metered, not reachable from SQL.
+- Under `synchronous = off` (validated-cow.md §4) the pinned snapshot may be newer than the durable
+  floor: its pages and meta are written but not yet synced. The backup copies it all the same, since
+  a published generation is complete in the file, and syncs its own file as above, so the copy is
+  durable even while the source batch is not. Every commit of a batch writes the same non-floor meta
+  slot, so the next one may overwrite the pinned version's meta before the backup reads it; the
+  backup then pins the newest version and walks that one instead.
+- Trailing truncation (format.md *Trailing truncation*) cuts only free pages the reader watermark
+  lets a commit reuse, so the pin keeps every page the snapshot reaches, and its free-list chain, in
+  the file while the backup reads.
+- An overflow chain kept on rewrite (large-values.md §15) is referenced by exactly one record of the
+  snapshot, so the walk reaches it once and counts it as the live count does. The walk reads the
+  catalog chain whole, so a catalog entry that spans several pages (format v48) is covered, and a GIN
+  index's posting runs (format v47) are records of its entry B+tree, so its tree walk covers them.
+- A backup copies the main database only, also when main has file attachments under the page
+  service. It is a host act: not metered, not reachable from SQL.
 - **The host API is not yet named.** Each core exposes a test-only entry point (`BackupForTesting`,
   `backup_for_testing`, `backupForTesting`); the public name and shape (a destination path and a
   form; attachments; progress) are a product decision, as is the CLI command.

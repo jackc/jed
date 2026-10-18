@@ -662,7 +662,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     `read_pages`, so the owner needs no new message (`snapshot_stream` stays reserved; page-service.md
     §9 records why the client walks). Proven by `backup*.process.toml` in every pairing (byte-identical
     backups across cores, the independent `verify.rb --check-image` decode, a compacted backup equal
-    to the compacted file) and the simulation's `backup` step (service and compaction profiles).
+    to the compacted file) and the simulation's `backup` step (service, compaction, relaxed, and service-attachments profiles).
     - [ ] _follow-on:_ **name the host API and the CLI command.** Today each core has only a test-only
       entry point (`BackupForTesting` / `backup_for_testing` / `backupForTesting`); the public shape (a
       destination path and a form, attachments, progress) is a product decision, and cli.md has no
