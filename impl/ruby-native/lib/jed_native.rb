@@ -18,11 +18,30 @@ require_relative 'jed_native/bindings'
 require_relative 'jed_native/regex_functions'
 require_relative 'jed_native/jsonpath_functions'
 require_relative 'jed_native/json_sql'
+require_relative 'jed_native/json_operations'
+require_relative 'jed_native/json_text'
+require_relative 'jed_native/json_relations'
+require_relative 'jed_native/json_images'
+require_relative 'jed_native/formatting_number'
+require_relative 'jed_native/formatting_datetime'
+require_relative 'jed_native/formatting_parse'
 require_relative 'jed_native/mutations'
 require_relative 'jed_native/sequences'
 require_relative 'jed_native/environment'
 require_relative 'jed_native/views'
+require_relative 'jed_native/ctes'
+require_relative 'jed_native/subqueries'
 require_relative 'jed_native/introspection'
+require_relative 'jed_native/planner'
+require_relative 'jed_native/indexes'
+require_relative 'jed_native/resolution'
+require_relative 'jed_native/logical_memory'
+require_relative 'jed_native/scalar_kernels'
+require_relative 'jed_native/scans'
+require_relative 'jed_native/interval_scans'
+require_relative 'jed_native/timezones'
+require_relative 'jed_native/range_constructors'
+require_relative 'jed_native/domains'
 
 module JedNative
   VERSION = '0.0.0.experimental'
@@ -85,6 +104,13 @@ module JedNative
     end
 
     def close = @engine.close
+    def render(value, type = nil) = @engine.render_value(value, type)
+    def timezone = @engine.timezone
+    def timezone=(name)
+      @engine.timezone = name
+    end
+    def attach(name, source = :memory, mode = :read_write, **options) = @engine.attach(name, source, mode, **options)
+    def detach(name) = @engine.detach(name)
     def max_cost=(value)
       @engine.max_cost = value
     end

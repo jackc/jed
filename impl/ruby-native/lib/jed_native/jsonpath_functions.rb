@@ -9,7 +9,7 @@ module JedNative
     def function?(name) = NAMES.include?(name.delete_suffix('_tz'))
     def volatility(name) = name.end_with?('_tz') ? 'stable' : 'immutable'
     def result_type(name) = %w[jsonb_path_exists jsonb_path_match].include?(name.delete_suffix('_tz')) ? 'boolean' : 'jsonb'
-    def call(name, args, context: nil, operator: false, set_returning: false)
+    def call(name, args, context: nil, operator: false, set_returning: false, constant: false)
       return nil if args.any?(&:nil?)
       document, path, variables, silent = args
       document = JsonValue.parse(document, binary: true) unless document.is_a?(JsonValue)
@@ -30,7 +30,7 @@ module JedNative
         end
         items[0]
       when 'jsonb_path_query_array'
-        context&.charge(JsonValue.payload(items))
+        context&.charge(JsonValue.payload(items)) unless constant
         JsonValue.new(items)
       when 'jsonb_path_query_first'
         items.empty? ? nil : JsonValue.new(items[0])
@@ -83,7 +83,7 @@ module JedNative
       return super unless expression.kind == :jsonpath_function
       charge
       args = expression.args.map { |arg| evaluate(arg, row, group) }
-      JsonPathFunctions.call(expression.value, args, context: self, operator: expression.extra[:operator])
+      JsonPathFunctions.call(expression.value, args, context: self, operator: expression.extra[:operator], constant: respond_to?(:constant_expression?) && constant_expression?(expression))
     end
 
     def source_relation(source)

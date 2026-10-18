@@ -13,7 +13,7 @@ module JedNative
     end
 
     def dispatch(stmt)
-      if @read_only && !%i[select values set_operation setop with commit rollback rollback_to savepoint release].include?(stmt[:kind])
+      if @read_only && !temporary_statement?(stmt) && !%i[select values set_operation setop with commit rollback rollback_to savepoint release].include?(stmt[:kind])
         raise Error.new('25006', 'read-only transaction')
       end
       case stmt[:kind]
