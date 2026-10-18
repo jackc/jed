@@ -369,6 +369,17 @@ impl PsListener for SimListener {
     }
 }
 
+/// Dropping the handle closes the endpoint, as the last close of a listening socket does: a later
+/// dial is refused rather than queued where no accept will ever take it (and its writer would wait
+/// for a reader forever).
+impl Drop for SimListener {
+    fn drop(&mut self) {
+        let mut st = self.net.lock();
+        st.close_listener(self.id);
+        self.net.cond.notify_all();
+    }
+}
+
 /// A handle on one end of a simulated connection.
 struct SimStream {
     net: Arc<SimNet>,
@@ -485,5 +496,27 @@ impl Drop for SimStream {
             st.close_end(self.id);
             self.net.cond.notify_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The last handle on an endpoint closes it: a later dial is refused, not queued on a listener
+    /// no accept will ever drain (where a hello's write would wait for a reader forever).
+    #[test]
+    fn a_dropped_listener_refuses_dials() {
+        let net = SimNet::new();
+        let listener = net.listen(Path::new("sim-endpoint-test"), 0);
+        let queued = net
+            .dial("sim-endpoint-test", 1)
+            .expect("a bound endpoint accepts dials");
+        drop(listener);
+        let refused = net.dial("sim-endpoint-test", 1).err().expect("refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        // The connection queued before the close ended with it.
+        drop(queued);
+        net.settle();
     }
 }
