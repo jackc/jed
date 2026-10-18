@@ -11,6 +11,7 @@ module JedNative
       expressions = projections.map { |entry| compile(entry[:expr], scope) }
       return super if expressions.any? { |expression| aggregate_expr?(expression) }
       columns = projections.zip(expressions).map { |entry, expression| { name: entry[:alias] || expression_name(entry[:expr]), type: expression.type } }
+      validate_aggregate_scope(statement, scope, false) if statement[:distinct]
       predicate = compile_filter(statement[:where], scope)
       access = scan_access_plan(stored, predicate, statement)
       order = access[:order]
@@ -34,6 +35,10 @@ module JedNative
       scan_resume = @cost if @explain_profile_frames
       output = []
       memory_owner = query_memory_owner if @query_memory && query_memory_collect_result?
+      if statement[:distinct]
+        seen = spill_available? ? SpillStateMap.new(self) : {}
+        seen_owner = query_memory_owner if @query_memory && seen.is_a?(Hash)
+      end
       unless limit == 0
         input.each do |row|
           begin
@@ -43,11 +48,21 @@ module JedNative
             accepted = !predicate || evaluate(predicate, row) == true
             profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
             next unless accepted
+            if seen
+              result_row = expressions.map { |expression| evaluate(expression, row) }
+              if seen.is_a?(Hash)
+                next if seen.key?(result_row)
+                query_memory_add(seen_owner, MemorySchedule::ENTRY + query_memory_key_bytes(result_row)) if seen_owner
+                seen[result_row] = true
+              else
+                next unless seen.insert(result_row)
+              end
+            end
             if offset.positive?
               offset -= 1
               next
             end
-            result_row = expressions.map { |expression| evaluate(expression, row) }
+            result_row = expressions.map { |expression| evaluate(expression, row) } unless seen
             query_memory_add_row(memory_owner, result_row, columns) if memory_owner
             output << result_row
             charge
@@ -63,11 +78,14 @@ module JedNative
       query_memory_attach(result, memory_owner) if memory_owner
       result
     ensure
+      seen.close if seen && !seen.is_a?(Hash)
+      query_memory_release(seen_owner) if seen_owner
       @native_stream_scan, @native_reverse_scan, @native_scan_columns = previous if previous
     end
 
     def streaming_select_shape?(statement)
-      return false unless statement[:kind] == :select && !statement[:with] && !statement[:distinct] && !statement[:distinct_on] && !statement[:having]
+      return false unless statement[:kind] == :select && !statement[:with] && !statement[:distinct_on] && !statement[:having]
+      return false if statement[:distinct] && (statement[:order_by] || []).empty?
       return false unless (statement[:joins] || []).empty? && (statement[:group_by] || []).empty? && (statement[:windows] || {}).empty?
       sources = statement[:from] || []
       return false unless sources.length == 1 && sources[0][:kind] == :table && @tables.key?(sources[0][:name]) && !@ctes.key?(sources[0][:name])

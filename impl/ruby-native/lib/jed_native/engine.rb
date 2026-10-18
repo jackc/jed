@@ -652,7 +652,18 @@ module JedNative
         rel = Relation.new(columns: [], rows: [[]])
         predicate = nil
         where_node = stmt[:where]
-        if from.length == 1 && from[0][:kind] == :table && !from[0][:columns] && !from[0][:column_aliases] && @tables.key?(from[0][:name]) && !@ctes.key?(from[0][:name]) && (stmt[:joins] || []).empty?
+        if where_node
+          analyzer = ParameterBindings.new(self, nil)
+          outer_scope = @outer.flat_map(&:first)
+          metadata = query_input_columns(stmt, @ctes.transform_values(&:columns), outer_scope, analyzer)
+          metadata = metadata.take(metadata.length - outer_scope.length)
+          resolved_where = compile_filter(where_node, metadata)
+          contradiction = where_contradiction?(resolved_where)
+        end
+        if contradiction
+          rel = Relation.new(columns: metadata, rows: [])
+          predicate = resolved_where
+        elsif from.length == 1 && from[0][:kind] == :table && !from[0][:columns] && !from[0][:column_aliases] && @tables.key?(from[0][:name]) && !@ctes.key?(from[0][:name]) && (stmt[:joins] || []).empty?
           source = from[0]
           stored = table(source[:name])
           scope = table_columns(stored, source[:alias] || source[:name])
@@ -813,7 +824,7 @@ module JedNative
           rel = @ctes[name]
           charge(rel.rows.length)
         elsif @views.key?(name)
-          rel = select(@views[name][:query])
+          rel = select(source[:native_body_query] || @views[name][:query])
         else
           t = table(name)
           bound = source[:native_access_predicate] && compile_filter(source[:native_access_predicate], table_columns(t, source[:alias] || name))
@@ -888,6 +899,7 @@ module JedNative
     end
 
     def join(left, source, kind, on, using)
+      profile_start = @cost if source[:native_join_profile]
       dependency = lateral_source_dependency?(source, left.columns)
       right_preserved = %i[right full right_outer full_outer].include?(kind)
       lateral = dependency || source[:lateral] && !right_preserved
@@ -896,7 +908,10 @@ module JedNative
       end
       index_plan = source[:native_index_plan]
       index_plan ||= join_index_plan(left, source, kind, on, using) unless lateral || source[:native_join_algorithm]
-      right = if index_plan
+      right = if source[:native_materialized]
+        original = source[:native_materialized]
+        Relation.new(columns: original.columns, rows: original.rows)
+      elsif index_plan
         Relation.new(columns: index_plan[:columns], rows: [])
       elsif lateral
         if left.rows.empty?
@@ -916,6 +931,7 @@ module JedNative
       begin
         @outer = outer.reject { |scope| (@join_group_outer || []).any? { |hidden| hidden.equal?(scope) } }
         predicate = compile_filter(on, columns)
+        on_trees = source[:native_on_trees]&.map { |node| compile_filter(node, columns) }
       ensure
         @outer = outer
       end
@@ -940,7 +956,7 @@ module JedNative
       memory_owner = query_memory_owner if @query_memory
       memory_mask = query_memory_mask(columns) if @query_memory
       hash_gate = source[:native_original_on] ? compile_filter(source[:native_original_on], columns) : predicate
-      hash_table = hash_join_table(left, right, predicate, kind, gate: hash_gate, force: source[:native_join_algorithm] == :hash) unless lateral || index_plan || source[:native_wide_outer] || source[:native_join_algorithm] == :nested
+      hash_table = hash_join_table(left, right, predicate, kind, gate: hash_gate, force: source[:native_join_algorithm] == :hash || source[:native_fixed_hash]) unless lateral || index_plan || source[:native_wide_outer] || source[:native_join_algorithm] == :nested
       window = source[:native_join_window]
       left.rows.each_with_index do |lrow, left_index|
         break if window && rows.length >= window[:target]
@@ -951,9 +967,10 @@ module JedNative
         candidates.each do |index|
           rrow = right.rows[index]
           row = lrow + rrow
-          next if predicate && evaluate(predicate, row) != true
+          next if on_trees ? !on_trees.all? { |expression| evaluate(expression, row) == true } : predicate && evaluate(predicate, row) != true
           next if window && window[:filter] && evaluate(window[:filter], row) != true
           query_memory_add_row(memory_owner, row, columns, memory_mask) if @query_memory
+          query_memory_add(memory_owner, (source[:native_full_join_width] - columns.length) * MemorySchedule::VALUE) if @query_memory && source[:native_full_join_width]
           rows << row
           matched = true
           right_seen[index] = true
@@ -962,6 +979,7 @@ module JedNative
         if !matched && %i[left full left_outer full_outer].include?(kind)
           row = lrow + Array.new(right.columns.length)
           query_memory_add_row(memory_owner, row, columns, memory_mask) if @query_memory
+          query_memory_add(memory_owner, (source[:native_full_join_width] - columns.length) * MemorySchedule::VALUE) if @query_memory && source[:native_full_join_width]
           rows << row
         end
         query_memory_release(right) if @query_memory && (lateral || index_plan)
@@ -989,6 +1007,7 @@ module JedNative
       end
       result = Relation.new(columns: columns, rows: rows)
       query_memory_attach(result, memory_owner, memory_mask) if @query_memory
+      source[:native_join_profile].actual = (source[:native_join_left_node].actual || 0) + @cost - profile_start if profile_start
       result
     ensure
       if @query_memory
@@ -1214,7 +1233,7 @@ module JedNative
     def compile_filter(node, columns)
       return nil unless node
       expression = compile(node, columns)
-      raise Error.new('42804', 'predicate must be boolean') unless %w[boolean unknown].include?(expression.type)
+      raise Error.new('42804', 'predicate must be boolean') unless %w[boolean unknown null].include?(expression.type)
       expression
     end
 

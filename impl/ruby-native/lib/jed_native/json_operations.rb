@@ -85,7 +85,12 @@ module JedNative
           right = compile(node[:right], columns)
           left = json_adapt_argument(left, 'jsonb') if right.type == 'jsonb'
         end
-        if %w[json jsonb].include?(left.type)
+        if node[:op] == '||'
+          right ||= compile(node[:right], columns)
+          text_concat = left.type == 'json' || right.type == 'json' ||
+            [left, right].any? { |argument| argument.type == 'text' && !(argument.kind == :literal && argument.extra&.dig(:untyped)) }
+        end
+        if %w[json jsonb].include?(left.type) && !text_concat
           op = node[:op]
           right ||= compile(node[:right], columns)
           wanted = case op

@@ -400,8 +400,7 @@ module JedNative
     def query_memory_storage_records(table, row, rowid, codec)
       key = query_memory_storage_key(table, row, rowid, codec)
       values = row.each_with_index.map { |value, index| statistics_value(table[:columns][index][:type], value) }
-      page_size = table[:database] ? @attachments&.dig(table[:database], :storage)&.page_size : @storage&.page_size
-      forms, compressed, bytes = codec.plan_record(table, key, values, (page_size || 8192) - FileFormat::PAGE_HEADER)
+      forms, compressed, bytes = codec.plan_record(table, key, values, storage_page_size(table) - FileFormat::PAGE_HEADER)
       forms.each_with_index do |form, index|
         bytes += codec.value_payload(table[:columns][index][:type], values[index]).bytesize if form == :external
         bytes += compressed[index].bytesize if form == :external_comp

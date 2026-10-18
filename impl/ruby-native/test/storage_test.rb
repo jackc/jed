@@ -258,7 +258,7 @@ module RubyStorageTest
   end
 
   def self.run
-    tests = %i[golden_decode golden_encode durable_recovery locking storage_limit_and_serialization io_failure sql_reopen view_query_reopen view_catalog_reopen exclusion_reopen statistics_reopen temporal_containers_reopen]
+    tests = %i[golden_decode golden_encode durable_recovery locking storage_limit_and_serialization io_failure sql_reopen view_query_reopen view_catalog_reopen exclusion_reopen statistics_reopen temporal_containers_reopen collation_upgrade incremental_reclamation]
     tests.each do |name|
       public_send(name)
       puts "ruby-native storage: #{name} passed"
@@ -286,6 +286,69 @@ module RubyStorageTest
       db.close
       db = JedNative.open(path)
       assert(db.query('select dates::text, stamps::text, span::text from t order by id').rows == expected * 2)
+      db.close
+    end
+  end
+
+  def self.collation_upgrade
+    bundle = File.expand_path('../../../spec/collation/fixtures/unicode.jucd', __dir__)
+    environment = JedNative::Environment.new.load_unicode_data(File.binread(bundle))
+    bytes = File.binread(File.join(FIXTURES, 'collation_skew_corrupt.jed'))
+    db = JedNative.from_image(bytes, environment: environment)
+    db.execute('begin read only')
+    error('25006') { db.upgrade_collations }
+    db.execute('rollback')
+    db.execute('begin')
+    assert(db.upgrade_collations == 1)
+    db.execute('rollback')
+    error('XX002') { db.execute("insert into t values (5, 'c')") }
+    db.execute('begin')
+    error('42P01') { db.query('select * from missing') }
+    error('25P02') { db.upgrade_collations }
+    db.execute('rollback')
+    assert(db.upgrade_collations == 1)
+    assert(db.upgrade_collations == 0)
+    assert(db.query("select id from t where name = 'Z'").cost == 5)
+    db.close
+
+    Dir.mktmpdir('ruby-native-collation') do |directory|
+      path = File.join(directory, 'collation.jed')
+      File.binwrite(path, bytes)
+      db = JedNative.open(path, environment: environment, read_only: true)
+      error('25006') { db.upgrade_collations }
+      db.close
+      db = JedNative.open(path, environment: environment)
+      assert(db.upgrade_collations == 1)
+      db.close
+      db = JedNative.open(path, environment: environment)
+      assert(db.upgrade_collations == 0)
+      db.execute("insert into t values (5, 'c')")
+      assert(db.query('select id from t order by name').rows == [[1], [3], [4], [5], [2]])
+      db.close
+    end
+  end
+
+  def self.incremental_reclamation
+    Dir.mktmpdir('ruby-native-incremental') do |directory|
+      path = File.join(directory, 'tree.jed')
+      db = JedNative.create(path, page_size: 256)
+      db.execute('create table t (id i32 primary key, v text)')
+      db.transaction do
+        120.times { |id| db.execute('insert into t values ($1, $2)', id, "value-#{id}" * 2) }
+      end
+      store = db.engine.instance_variable_get(:@storage)
+      db.execute("update t set v = 'edited' where id = 60")
+      assert(store.meta[:protected].length < store.meta[:live] / 2, 'point update rewrote the whole tree')
+      160.times { |id| db.execute('update t set v = $1 where id = 60', "edit-#{id}") }
+      assert(store.meta[:page_count] < 3 * store.meta[:live] + 16, 'churn did not reclaim obsolete pages')
+      state = JedNative::FileFormat.new.decode_image(File.binread(path))
+      assert((state[:free_pages] & state[:meta][:protected]).empty?, 'manifest dependencies became reusable')
+      db.execute('delete from t where id >= 20 and id < 100')
+      db.close
+      db = JedNative.open(path)
+      assert(db.query('select count(*) from t').rows == [[40]])
+      db.execute("insert into t values (60, 'restored')")
+      assert(db.query('select v from t where id = 60').rows == [['restored']])
       db.close
     end
   end

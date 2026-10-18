@@ -102,6 +102,9 @@ module JedNative
               raise Error.new('42703', 'column does not exist')
             end
             raise Error.new('0A000', 'dropping a primary-key column is not supported') if t[:constraints].any? { |constraint| constraint[:kind] == :primary_key && constraint[:columns].include?(action[:column]) }
+            dependent = t[:constraints].select { |constraint| constraint[:kind] == :exclude && schema_uses_column?(constraint[:where], action[:column]) }
+            raise Error.new('2BP01', 'exclusion predicate depends on column') if !dependent.empty? && !action[:cascade]
+            t[:constraints] -= dependent
             scan.call
             drop_incoming_foreign_keys(t, [action[:column]], action[:cascade])
             t[:columns].delete_at(index)
@@ -147,6 +150,7 @@ module JedNative
             drop_incoming_foreign_keys(t, found[:columns], action[:cascade]) if found && %i[primary_key unique].include?(found[:kind])
             scan.call if found && found[:kind] == :primary_key
             t[:constraints].delete(found)
+            t[:indexes].reject! { |index| index[:name] == found[:name] } if found && %i[unique exclude].include?(found[:kind])
           when :add_identity, :drop_identity, :set_generated, :set_identity_options, :alter_identity
             apply_identity_action(t, action)
           when :set_default, :drop_default, :set_not_null, :drop_not_null, :set_type
@@ -330,7 +334,7 @@ module JedNative
     def create_owned_sequence(table, column, ordinal, options, reserved: [])
       raise Error.new('22023', 'identity requires an integer column') unless Types::INTEGER_BITS.key?(column[:type])
       raise Error.new('42601', 'identity sequence options do not accept AS') if options.key?(:type)
-      base = "#{table[:name]}_#{column[:name]}_seq"
+      base = object_name(table[:name], column[:name], 'seq')
       name, suffix = options[:name] || base, 0
       if options[:name]
         raise Error.new('42939', 'reserved sequence name') if name.start_with?('jed_')
@@ -338,7 +342,7 @@ module JedNative
       else
         while relation_exists?(name) || reserved.include?(name)
           suffix += 1
-          name = "#{base}#{suffix}"
+          name = object_name(table[:name], column[:name], "seq#{suffix}")
         end
       end
       definition = sequence_definition(options.reject { |key, _| key == :name }.merge(type: column[:type]))

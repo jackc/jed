@@ -102,8 +102,14 @@ module JedNative
       plan.parameters.each do |parameter|
         cast_value(@params[parameter.value], parameter.type) if parameter.extra&.dig(:context_type)
       end
-      input = if plan.lookup
+      input = if where_contradiction?(plan.predicate)
+        []
+      elsif plan.lookup
         key = evaluate(plan.lookup, [])
+        if !key.nil? && stored[:native_primary_ordinal]
+          normalized = normalize_scan_bound(stored[:columns][stored[:native_primary_ordinal]][:type], key)
+          key = normalized == :unmatchable ? nil : normalized
+        end
         charge(stored.dig(:native_primary_metadata, :height) || 1) unless key.nil? || stored[:rows].empty?
         row = key.nil? ? nil : plan.index[key]
         charge_scan_payload(stored, [stored[:native_row_positions][row.object_id]]) if row && stored[:native_row_positions]

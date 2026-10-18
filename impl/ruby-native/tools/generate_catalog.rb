@@ -32,7 +32,9 @@ functions.each do |name, entries|
 end
 casts = TomlRB.load_file(File.join(root, 'spec/types/casts.toml')).fetch('cast')
 safe_casts = casts.select { |entry| entry['traps'] == false }.map { |entry| entry.values_at('from', 'to') }
-lines.concat(["    }.freeze", "    SAFE_CASTS = #{safe_casts.inspect}.freeze", "    CAST_MODES = #{casts.to_h { |entry| [entry.values_at('from', 'to'), entry.fetch('mode')] }.inspect}.freeze", "  end", "end", ""])
+scalars = TomlRB.load_file(File.join(root, 'spec/types/scalars.toml')).fetch('type')
+opclasses = scalars.filter_map { |entry| [entry.fetch('id'), entry['btree_opclass']] if entry['btree_opclass'] }.to_h
+lines.concat(["    }.freeze", "    SAFE_CASTS = #{safe_casts.inspect}.freeze", "    CAST_MODES = #{casts.to_h { |entry| [entry.values_at('from', 'to'), entry.fetch('mode')] }.inspect}.freeze", "    BTREE_OPCLASSES = #{opclasses.inspect}.freeze", "  end", "end", ""])
 File.write(File.join(root, 'impl/ruby-native/lib/jed_native/function_catalog.rb'), lines.join("\n"))
 formatting = TomlRB.load_file(File.join(root, 'spec/types/formatting.toml'))
 lines = ["# frozen_string_literal: true", "# Generated from spec/types/formatting.toml; processors are handwritten.", "module JedNative", "  module FormattingTables"]
