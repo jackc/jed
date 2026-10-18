@@ -21,11 +21,12 @@ end
 ```
 
 `JedNative.create(path)` and `JedNative.open(path)` use the shared v49 file format
-and a pure Ruby `flock` host. The current host takes exclusive protocol-v2 ownership;
-page-service clients are not implemented. Commits persist changed tree paths with
+and a pure Ruby `flock` host. Exclusive protocol-v2 ownership is the current default;
+`locking: :auto` enables the experimental page-service owner/client implementation.
+Commits persist changed tree paths with
 validated content manifests, reuse eligible pages, and publish changed attachment
-domains independently. File reads use lazy rows and a bounded page cache; bounded
-write residency is still being implemented. `locking: :none` is only for hosts that
+domains independently. File reads use lazy rows and a bounded page cache; ordinary
+DML stages changed rows over immutable pages. `locking: :none` is only for hosts that
 already exclude every other opener.
 
 `Database#query` and `#execute` accept positional `$N` parameters; `#prepare` creates
@@ -43,10 +44,17 @@ and `#execute_prepared` eagerly collect the result and expose its final cost and
 `rows_affected`. Cost parity and the supported cores' full host API are still
 being verified.
 
+An immutable `Environment` can register Ruby scalar or batch functions with
+`register_function(name:, args:, returns:, ...)`. Pass it as `environment:` when
+opening a database. Host functions are an explicit escape from built-in purity;
+persisted expressions pin eligible functions by component identity and version.
+
 Only explicitly selected tasks run this experiment:
 
 ```sh
 mise run ruby-native:test
+mise run ruby-native:page-service-test
+mise run ruby-native:process
 mise run ruby-native:conformance expr/arithmetic
 JED_NATIVE_REPORT=/tmp/ruby-audit.json mise run ruby-native:conformance
 mise run ruby-native:compare:build

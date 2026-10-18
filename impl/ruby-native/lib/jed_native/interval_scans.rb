@@ -30,10 +30,14 @@ module JedNative
       intervals = intervals.reverse if @native_reverse_scan
       iterator = Enumerator.new do |output|
         intervals.each do |lower, upper|
-          first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
-          last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
           charge(name ? secondary_page_count(stored, name, lower, upper) : primary_page_count(stored, lower, upper))
-          found = entries[first...last].map(&:last)
+          if stored[:rows].is_a?(PagedRows)
+            found = storage_scan_entries(stored, name, lower: lower, upper: upper).map(&:last)
+          else
+            first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
+            last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
+            found = entries[first...last].map(&:last)
+          end
           charge_scan_payload(stored, found) unless name
           scan_rows(stored, found, lookup: !!name).each { |row| output << row }
         end

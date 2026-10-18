@@ -205,7 +205,7 @@ module JedNative
       raise Error.new('25P02', 'transaction is aborted') if @engine.instance_variable_get(:@failed)
       @database.shared_open!
       transient_pin = !@engine.transaction_open? && !@pinned
-      @database.shared_capture(self, pin: true) if transient_pin
+      @database.shared_capture(self, pin: true, read: true) if transient_pin
       Rows.new(self, statement, params.map { |value| HostValues.copy(value) })
     rescue Error
       @engine.instance_variable_set(:@failed, true) if @engine.transaction_open? && $!.sqlstate != '25001'

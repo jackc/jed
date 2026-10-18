@@ -6,14 +6,12 @@ module JedNative
       @index, @rows = index, rows
     end
     def [](term)
-      entries = @index.entries
-      position = entries.bsearch_index { |key, _| key >= term } || entries.length
       ordinals = []
-      while position < entries.length
-        key = entries[position][0]
+      @index.each_entry(lower: term) do |key, _|
         break unless key.start_with?(term)
-        @index.pool.codec.gin_decode_run(term, key).each { |storage_key| ordinals << @rows.ordinal_for_key(storage_key) }
-        position += 1
+        @index.pool.codec.gin_decode_run(term, key).each do |storage_key|
+          ordinals << (@rows.point(storage_key) || raise(Error.new('XX001', 'index entry references absent row')))
+        end
       end
       ordinals
     end
@@ -21,7 +19,7 @@ module JedNative
 
   class PagedRowPositions
     def initialize(rows) = (@rows = rows)
-    def fetch(key) = @rows.ordinal_for_key(key)
+    def fetch(key) = @rows.point(key) || raise(Error.new('XX001', 'index entry references absent row'))
     alias [] fetch
   end
 

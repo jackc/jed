@@ -7,17 +7,17 @@ module JedNative
     COMPACT_GROWTH = 2
     attr_reader :free, :head, :live_at_compaction, :protected
 
-    def initialize(codec, commit, page_size, previous_live, txid, slot, truncate: true)
+    def initialize(codec, commit, page_size, previous_live, txid, slot, truncate: true, reclaim: true, pending: {}, deferred_free: [])
       @codec, @pages, @page_size = codec, commit.pages, page_size
       high = commit.allocator.high_water
       safe = commit.allocator.remaining
       unlisted = high - safe.length
-      compact = previous_live.zero? || unlisted > COMPACT_MIN_PAGES && unlisted > COMPACT_GROWTH * previous_live
+      compact = reclaim && (previous_live.zero? || unlisted > COMPACT_MIN_PAGES && unlisted > COMPACT_GROWTH * previous_live)
       candidates = if compact
-        reached = commit.live_pages | @pages.pages.keys.to_set
+        reached = commit.live_pages | @pages.pages.keys.to_set | pending.keys.to_set
         (2...high).reject { |page| reached.include?(page) }
       else
-        safe.dup
+        (safe + deferred_free).sort
       end
       @live_at_compaction = compact ? commit.live_pages.length : previous_live
       if truncate
@@ -29,7 +29,7 @@ module JedNative
       inline_capacity = (page_size - 64) / 12
       chain_capacity = (page_size - 32) / 12
       free_capacity = (page_size - 16) / 4
-      body_count = @pages.pages.length
+      body_count = pending.length + @pages.pages.length
       manifest_count = 0
       loop do
         allocation = PageAllocator.new(high, safe)
@@ -54,7 +54,7 @@ module JedNative
           entries = persisted.slice(index * free_capacity, free_capacity) || []
           @codec.write_page(@pages, page_size, page, 7, entries.length, free_ids[index + 1] || 0, entries.pack('N*'))
         end
-        references = @pages.pages.keys.sort.map { |page| [page, @codec.crc64(@pages.pages.fetch(page))] }
+        references = pending.merge(@pages.pages.to_h { |page, bytes| [page, @codec.crc64(bytes)] }).sort
         digest = 0
         manifest_ids.each_with_index do |page, index|
           entries = references.slice(inline_capacity + index * chain_capacity, chain_capacity) || []

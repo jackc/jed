@@ -162,6 +162,14 @@ module JedNative
 
     def tuple_impossible_disjunct?(terms, key)
       comparisons = key_comparisons(key, terms)
+      # Quantified promotion may produce a decimal operand against an integer
+      # key. It remains an exact point source only when that value is integral.
+      terms.each do |term|
+        next unless term.kind == :binary && term.value == '=' && same_key_expression?(term.args[0], key)
+        source = term.args[1]
+        next unless Types::INTEGER_BITS.key?(key.type) && source.type == 'decimal'
+        comparisons << ['=', source]
+      end
       equality = comparisons.find { |operator, source| operator == '=' && plan_constant(source) != :unknown }
       return false unless equality
       value = plan_constant(equality[1])

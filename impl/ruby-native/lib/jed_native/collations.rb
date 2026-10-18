@@ -222,7 +222,6 @@ module JedNative
     def order_compare(left, right, order)
       if !left.nil? && !right.nil? && (label = CollationRules.combine([CollationRules.label(left), CollationRules.label(right)]))
         raise Error.new(label.conflict ? '42P21' : '42P22', 'indeterminate collation') if label.conflict || label.none
-        charge(collation_comparison_points(left, right)) if label.table
       end
       super
     end

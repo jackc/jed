@@ -20,8 +20,9 @@ module JedNative
       pairs.each do |key, record|
         old = records[key]
         next if old && same_tree_record?(old, record)
-        maximum = record_max(capacity, record[:table][:columns].length)
-        raise Error.new('0A000', "record exceeds page capacity after spilling") if record[:size] > maximum
+        if record[:size] + leaf_overhead(1, record[:table][:columns]) > capacity
+          raise Error.new('0A000', 'record exceeds page capacity after spilling')
+        end
         if root
           result = put_tree_key(root, key, record, capacity)
           root = result[0] == :split ? { keys: [result[2]], recs: [], children: [result[1], result[3]] } : result[1]

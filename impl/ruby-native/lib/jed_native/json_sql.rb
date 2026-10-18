@@ -315,7 +315,7 @@ module JedNative
         document = json_document(document)
         program = JsonPathValue.parse(path_text)
         evaluation = JsonPathEvaluator.new(program, document, vars: vars, context: self, passing: true,
-          variable_bases: vars.length, source_text: path_text.to_s).run(silent: true)
+          variable_bases: vars.length, source_text: program.to_s).run(silent: true)
         items = evaluation[:error] ? [] : evaluation[:items]
         rows = json_table_expand(tree, items, vars)
       end

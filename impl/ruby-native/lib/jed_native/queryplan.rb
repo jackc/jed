@@ -106,7 +106,7 @@ module JedNative
         comparisons = key_comparisons(key, terms)
         break if comparisons.empty?
         equality = comparisons.find { |operator, _| %w[= is\ null].include?(operator) }
-        selected = equality ? [equality] : comparisons
+        selected = equality ? comparisons.select { |operator, _| %w[= is\ null].include?(operator) } : comparisons
         matched = terms.select { |term| !key_comparisons(key, [term]).empty? }
         parts << { key: key, comparisons: selected, point: !equality.nil?, terms: matched }
         break unless equality
@@ -342,7 +342,10 @@ module JedNative
       when :primary
         parts = access[:parts].flat_map do |part|
           name = stored[:columns][part[:key].value][:name]
-          part[:comparisons].map { |operator, source| "#{name} #{operator}#{source ? ' ' + plan_expression(source) : ''}" }
+          part[:comparisons].map do |operator, source|
+            value = source && (source.kind == :literal && source.value.nil? ? '<value>' : plan_expression(source))
+            "#{name} #{operator}#{source ? ' ' + value : ''}"
+          end
         end
         'PK bound: ' + parts.join(' and ')
       when :secondary

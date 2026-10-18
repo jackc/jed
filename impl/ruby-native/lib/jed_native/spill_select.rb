@@ -90,9 +90,9 @@ module JedNative
       output = cursor_output(columns)
       output_owner = query_memory_owner if @query_memory && query_memory_collect_result?
       unless limit == 0
-        rows.each_with_index do |row, index|
-          next if index < offset
-          break if limit && output.length >= limit
+        window = rows.lazy.drop(offset)
+        window = window.take(limit) if limit
+        host_batch_rows(window, expressions, pulled: true).each do |row|
           values = expressions.map { |expression| evaluate(expression, row) }
           query_memory_add_row(output_owner, values, columns) if output_owner
           charge

@@ -249,7 +249,7 @@ module JedNative
     def materialize_recursive_cte(cte)
       body = cte[:query]
       relation = select(body[:left])
-      metadata = view_query_columns(body[:left])
+      metadata = view_query_columns(body[:left], nil, @outer.flat_map(&:first))
       if cte[:columns] && cte[:columns].length > relation.columns.length
         raise Error.new('42P10', 'too many CTE column names')
       end
@@ -408,6 +408,29 @@ module JedNative
       changes = context[:changes] || []
       if changes.empty?
         @tables[name] = working
+        return
+      end
+      if working[:rows].is_a?(PagedRows) || working[:rows].is_a?(PendingRows)
+        rows = working[:rows].is_a?(PendingRows) ? working[:rows].dup : PendingRows.new(working)
+        next_id = working[:next_rowid]
+        changes.each do |old_row, new_row|
+          if old_row
+            if old_row.is_a?(PagedRow)
+              rows.replace(old_row, new_row)
+            else
+              key = query_memory_storage_key(before, old_row, before[:rows].rowid_for(old_row), statistics_codec)
+              original = rows.base_table[:rows].point(key)
+              rows.replace(original, new_row) if original
+            end
+          else
+            rows.append(new_row, next_id)
+            next_id += 1
+          end
+        end
+        result = @tables[name].merge(rows: rows, rowids: rows.rowids, next_rowid: next_id)
+        validate_rows(result.merge(constraints: result[:constraints].reject { |constraint| constraint[:kind] == :check }), rows)
+        @tables[name] = result
+        @cte_working_tables = @tables
         return
       end
       rows, rowids = working[:rows].dup, working[:rowids].dup
