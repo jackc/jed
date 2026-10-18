@@ -1,0 +1,8 @@
+[package]
+name = "jed-ruby-experiment-compare"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+jed = { path = "../../../../impl/rust" }

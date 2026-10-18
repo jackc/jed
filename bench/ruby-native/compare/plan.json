@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "description": "Preliminary prepared-query comparison over a 1000-row in-memory database; not full-core parity evidence.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {"name":"scalar","sql":"SELECT abs($1::i64) + 7","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"pk_hit","sql":"SELECT score FROM items WHERE id = $1","iterations":300,"warmup":100,"offset":0,"step":17,"span":1000},
+    {"name":"pk_miss","sql":"SELECT score FROM items WHERE id = $1","iterations":300,"warmup":100,"offset":1000,"step":17,"span":1000},
+    {"name":"filtered_scan","sql":"SELECT id, score FROM items WHERE score >= $1 ORDER BY id","iterations":30,"warmup":20,"offset":9700,"step":7,"span":300},
+    {"name":"aggregate","sql":"SELECT sum(score) FROM items WHERE bucket = $1","iterations":30,"warmup":20,"offset":0,"step":1,"span":10},
+    {"name":"group","sql":"SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket ORDER BY bucket","iterations":15,"warmup":10,"offset":0,"step":0,"span":0},
+    {"name":"sort_limit","sql":"SELECT id, score FROM items ORDER BY score DESC, id LIMIT 20","iterations":15,"warmup":10,"offset":0,"step":0,"span":0}
+  ]
+}

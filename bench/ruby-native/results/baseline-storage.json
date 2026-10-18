@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "phase": "baseline",
+  "created_at": "2026-10-18T20:07:10Z",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "platform": "x86_64-linux",
+  "filesystem": "ext2/ext3",
+  "repetitions": 5,
+  "ruby_source": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-baseline",
+  "ruby_source_sha256": "140356387cf9d419505ab7282050d94bb0ec5a46541f87fd866313a084c7a032",
+  "results": {
+    "crc32_8k": {
+      "iterations": 40,
+      "samples_ns": [
+        115328653,
+        114389260,
+        114793587,
+        115108891,
+        113022686
+      ],
+      "checksum": "b6675307"
+    },
+    "crc64_8k": {
+      "iterations": 40,
+      "samples_ns": [
+        307129753,
+        306855329,
+        307184628,
+        305957393,
+        304119231
+      ],
+      "checksum": "f4dba925fcc2a5b0"
+    },
+    "durable_full_snapshot_1_rows": {
+      "iterations": 10,
+      "samples_ns": [
+        367230511,
+        356365112,
+        364878035,
+        367522891,
+        356909744
+      ],
+      "final_txid": 55,
+      "live_pages": 2,
+      "physical_pages": 111
+    },
+    "durable_full_snapshot_100_rows": {
+      "iterations": 10,
+      "samples_ns": [
+        360268346,
+        358809175,
+        364038533,
+        358431723,
+        359622232
+      ],
+      "final_txid": 55,
+      "live_pages": 2,
+      "physical_pages": 111
+    }
+  }
+}

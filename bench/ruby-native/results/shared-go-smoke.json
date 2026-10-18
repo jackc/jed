@@ -1,0 +1,1257 @@
+{
+  "mode": "single_execution_smoke_no_timings",
+  "completed": true,
+  "outcomes": [
+    {
+      "bench": "point_lookup_pk_ramp",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "1a273fc3c4c7cf82",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "point_lookup_pk",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "1a273fc3c4c7cf82",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "point_lookup_pk_miss",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "cbf29ce484222325",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "composite_pk_lookup",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "87b699e60b37d3d2",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "interval_set_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 24,
+      "checksum": "e64a1489723e9ee3",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "any_array_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 8,
+      "checksum": "f40e9c7d8b3b8a01",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "composite_pk_any",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 8,
+      "checksum": "f7b2435a6c7a2215",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "index_tuple_any",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 8,
+      "checksum": "0b8c14fced986f01",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "any_array_pk_promoted",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "dfb630e89e74016d",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "any_array_pk_param",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 8,
+      "checksum": "849cbb0f7f61b420",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "composite_pk_any_param",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 8,
+      "checksum": "ff5a71261ef836ff",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "index_tuple_text",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 2,
+      "checksum": "78909ce8e8747373",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "subquery_in_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 8,
+      "checksum": "3c8449ecc08e486a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "any_or_leaf_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 4,
+      "checksum": "a190a536674e2593",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "inl_any_array",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 8,
+      "checksum": "5982400a597e1350",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "inl_tuple_set",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 3,
+      "checksum": "ac07906dfd09e7cb",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "bounded_index_limit",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 5,
+      "checksum": "dba35e426969bb19",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "order_only_index_limit",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 5,
+      "checksum": "4c2eef8580c5e6ad",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "index_vartail_prefix",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "f6f10530bc60734d",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "partial_index_implied_range",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 156,
+      "checksum": "c7be92182a4988f1",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "partial_index_live_topn",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 10,
+      "checksum": "c39b1b16882677d3",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gist_range_select",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 10,
+      "checksum": "750382eeadaa8759",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "join_inl_topn",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 10,
+      "checksum": "531393332356219a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "hash_join_equijoin",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "ce82fe1a52e94d20",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "hash_join_nested_fallback",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "ce82fe1a52e94d20",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "where_pushdown_join",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "de152c1478eae25a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "where_pushdown_join_residual",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "de152c1478eae25a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "where_contradiction",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "4eb8c6181d9224ca",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "derived_pushdown_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "e79f624940f81a92",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "derived_pushdown_pk_residual",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "e79f624940f81a92",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "safe_conjunct_pushdown_join",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "de152c1478eae25a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "widened_arm_pushdown_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 2,
+      "checksum": "8d935cf51102348d",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "grouped_pushdown_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "aaf7db2640a694f3",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "grouped_pushdown_pk_residual",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "aaf7db2640a694f3",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "setop_pushdown_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 2,
+      "checksum": "7b61035c4dda60a1",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "setop_pushdown_pk_residual",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 2,
+      "checksum": "7b61035c4dda60a1",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "window_pushdown_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "c3b686860034affe",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "window_pushdown_pk_residual",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "c3b686860034affe",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "cte_pushdown_pk",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "e79f624940f81a92",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "cte_pushdown_pk_residual",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "e79f624940f81a92",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "on_pushdown_join",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "de152c1478eae25a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "on_pushdown_join_residual",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "de152c1478eae25a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "join_reverse_inl",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "885617e1b0a03819",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "join_reverse_nested_fallback",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "885617e1b0a03819",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "join_nway_inl_3",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "833240765a0a4545",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "join_nway_inl_5",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "833240765a0a4545",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "join_nway_greedy_9",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "179e820b35045fba",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "statistics_uniform_before",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "833240765a0a4545",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "statistics_uniform_after",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "833240765a0a4545",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "statistics_skew_before",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "990b168e19cfa4df",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "statistics_skew_after",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "990b168e19cfa4df",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "secondary_lookup",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 13,
+      "checksum": "8489336be5932462",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "secondary_update",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "46b9d6e731035a45",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "costed_update",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "46b9d6e731035a45",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "dml_contradiction",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "46b9d6e731035a45",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "secondary_pointset_delete",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "46b9d6e731035a45",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "expr_lookup",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "cbf29ce484222325",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "partial_lookup",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "d0f9e217bf5b8c8f",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "in_list_pk",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 10,
+      "checksum": "709f47b1ac977809",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_inl",
+      "dataset": "gin",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 11893,
+      "checksum": "6320635bbd81da7a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gist_inl",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 500,
+      "checksum": "a381d0d01b3b8832",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gist_inl_nested_fallback",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 500,
+      "checksum": "a381d0d01b3b8832",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "in_list_secondary",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 86,
+      "checksum": "4bbe0c195541bb21",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "index_range",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 430,
+      "checksum": "702f7042ec3fd737",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "index_range_nonselective",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "476376f116ba93f0",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "full_scan_agg",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "1c9bb2aa47065b11",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "full_scan_minmax",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "5e707552ce47d88a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "full_scan_agg_filter",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "27337eb8e0090e30",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "group_by_agg",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "f1d2d2bf60c1c90d",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "group_by_agg_high_card",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 346,
+      "checksum": "9d771d4c859b47da",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "order_by_limit",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "694211052fd61083",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "order_by_pk_limit",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "e201e07fadb7a6a3",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "insert_rollback",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "ac02f0205c4f05c5",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "delete_rollback_serial",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "delete_rollback_random",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "delete_range_rollback",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "delete_insert_churn",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "insert_commit_durable",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "45b6df18185ef8c5",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "insert_commit_durable_text",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "45b6df18185ef8c5",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "update_commit_durable",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "update_untouched_large_rollback",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "1ca9195ead0b8612",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "update_untouched_large_durable",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "1ca9195ead0b8612",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "insert_commit_relaxed",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "45b6df18185ef8c5",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "update_commit_relaxed",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "text_scan",
+      "dataset": "text",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "ad88aba95182a966",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "text_point_read",
+      "dataset": "text",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "3916e7bae37043c5",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "cte_materialized",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "239f97b75a0b4fab",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "lateral_top_n_per_group",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 15,
+      "checksum": "c33d0804c1ffe8ab",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "index_nested_loop_join",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1000,
+      "checksum": "8c77be7897153c4f",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_contains",
+      "dataset": "gin",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 6,
+      "checksum": "a4d94775d92b87d4",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_overlaps",
+      "dataset": "gin",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 2349,
+      "checksum": "3a13041348b57f36",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_member",
+      "dataset": "gin",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1134,
+      "checksum": "442ab6397bd19d87",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_text_contains",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "24d88b4c3c57763d",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_text_member",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1031,
+      "checksum": "a575c4679514a63e",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_decimal_contains",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "b60a80c30271ddb5",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_bytea_contains",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "f238fa02505b0473",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_stats_common_tag",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_stats_rare_tag",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "64bf6e8e70932051",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "varscan_text_eq",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "31fa351a8f12676d",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "varscan_text_isnull",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "a187dedf691d9b30",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "varscan_bytea_eq",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "1ca9195ead0b8612",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "varscan_array_count",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "varscan_array_contains",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "833240765a0a4545",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "varscan_text_max",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "6404d5c146627026",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "varscan_project_needle",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "517981d6b6cfd6eb",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "custom_plan_gin_common_tag",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "d15532fc69e580ed",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "custom_plan_gin_rare_tag",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "cbf29ce484222325",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "custom_plan_mcv_common",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "fb114b43f4fc9cdd",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "custom_plan_mcv_rare",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "39a8bebffd2c4cde",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_jsonb_contains",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "45be261863e8d0ab",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_jsonb_path_match",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "64bf6e8e70932051",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_jsonb_exists",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1030,
+      "checksum": "df7932af3c129e80",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_array_eq",
+      "dataset": "gin",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "5014c4bf66ae2e5c",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_in",
+      "dataset": "gin",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 59,
+      "checksum": "2ff795c2d2471b5a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "gin_delete",
+      "dataset": "gin",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "56f8b69ee7c3fd4a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "regex_filter_scan",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "3e93241e761348c8",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "regex_replace_captures",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "977c3423f97f38a9",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "window_running_sum",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "7193ab1cca5687b9",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "window_moving_count",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 100,
+      "checksum": "a249ea5c7dddbb84",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "window_shared_named",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 10000,
+      "checksum": "4066cd4673bd9a21",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "concurrent_read_pk_r1",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "b8e7f1a2fd37c55a",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "concurrent_read_pk_r4",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "d062ccb5c8dde3cb",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "concurrent_read_pk_cold_r1",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "9b9b02b986c101bd",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "concurrent_read_pk_cold_r4",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "ea04160e4170cb52",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "fk_delete_parent_indexed",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "1ca9195ead0b8612",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "fk_delete_parent_unindexed",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "1ca9195ead0b8612",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "fk_cascade_delete_indexed",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "ac02f0205c4f05c5",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "fk_cascade_delete_unindexed",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 0,
+      "checksum": "ac02f0205c4f05c5",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "host_function_none",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 977,
+      "checksum": "cc58980fd33ef770",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "host_function_row",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 977,
+      "checksum": "dbd5515c01a3a23b",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "host_function_batch",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 977,
+      "checksum": "dbd5515c01a3a23b",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "host_function_stream_none",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1000,
+      "checksum": "b678323eeb1bc1cb",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "host_function_stream_row",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1000,
+      "checksum": "35e872758ae485ce",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "host_function_stream_batch",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1000,
+      "checksum": "35e872758ae485ce",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "json_float_render",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 10000,
+      "checksum": "bdf7aaa1a41a79a8",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "cold_open_pk_small",
+      "dataset": "small",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "a409d372af406971",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "cold_open_pk",
+      "dataset": "large",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "39bef220c212dfbd",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "index_desc_order_topn",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 10,
+      "checksum": "9c2ea189f4f7167d",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    },
+    {
+      "bench": "index_desc_range",
+      "dataset": "scratch",
+      "iterations": 1,
+      "warmup": 0,
+      "rows_total": 1,
+      "checksum": "4b4cae1a9d39f108",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6"
+    }
+  ]
+}

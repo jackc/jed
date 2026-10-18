@@ -29,6 +29,11 @@ files in the same change.
 - Rust wrappers are acceptable for later language packages when that gives the
   best user experience, but wrappers echo Rust and are not independent
   conformance voices.
+- Frozen experimental cores (currently `impl/ruby-native`) are opt-in: exclude them
+  from normal tests, benchmarks, CI, and future feature updates unless explicitly
+  requested. Record coverage and omissions against the experiment's source revision;
+  promotion to supported status requires a separate decision. See
+  `spec/design/ruby-native-experiment.md`.
 - SQL is the primary access path and every built-in capability must be reachable
   through SQL, while storage must keep room for non-SQL access paths later.
 

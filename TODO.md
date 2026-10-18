@@ -37,6 +37,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Core query / DML completeness
 
+- [ ] **Pure Ruby experiment (explicit opt-in only)** — complete the independent
+  `impl/ruby-native` port, verify current conformance and file/host boundaries, record
+  interpreter/YJIT/available-ZJIT baseline and optimized benchmarks against the other
+  cores. Freeze it after the experiment; subsequent features do not update it unless
+  requested. → [ruby-native-experiment.md](spec/design/ruby-native-experiment.md)
+
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, `LIKE`/`ILIKE … ESCAPE e` (desugared to PostgreSQL's `like_escape(p, e)`), and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ `SIMILAR TO` (deliberately excluded — the SQL-standard surface); Unicode-property char classes (`\p{…}`).
 - [x] **Left-to-right short-circuit `AND` / `OR`** — a FALSE left operand decides `AND` and a TRUE

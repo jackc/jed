@@ -22,6 +22,11 @@ The independent **Ruby** reference (`spec/**/verify.rb`) is not a SQL-engine cor
 verifies the byte-exact on-disk format and the spec fixtures, so the round-trip is
 `rust == go == ts == ruby` (CLAUDE.md §8).
 
+The opt-in [pure Ruby experiment](ruby-native/) is a separate, currently incomplete
+engine. It is excluded from normal tests, benchmarks, CI, and lockstep feature work.
+Its explicit tasks and measured coverage are documented in its own directory; do
+not update it for new supported-core features unless requested.
+
 ## Toolchain
 
 Tool versions are pinned in the repo-root [`mise.toml`](../mise.toml): `rust 1.92`,
