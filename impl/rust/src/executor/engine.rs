@@ -229,7 +229,8 @@ impl Engine {
     /// (the slice-2d verdict, spec/design/collation.md §12/§14): if any of `columns` carries a
     /// collation the file pinned to a different `(unicode, cldr)` than the loaded bundle provides,
     /// inserting/updating/deleting/index-building would mix two orderings in one tree and corrupt it,
-    /// so the whole table is **read-only** until a REINDEX migration (deferred) rebuilds + re-pins it.
+    /// so the whole table is **read-only** until the host operation upgrade_collations
+    /// rebuilds + re-pins it (SQL REINDEX refuses a skewed table).
     /// `XX002`, naming the collation + both versions. Reads never call this — they recompute against
     /// the loaded table (the heap-scan fallback, compatibility.md §8). Per-table granularity: one
     /// skewed column collation makes the table read-only (finer per-index gating is a follow-on).
@@ -244,7 +245,7 @@ impl Engine {
                     format!(
                         "collation \"{name}\" version mismatch: this database's keys were built under \
                          {fu}/{fc} but the loaded bundle is {lu}/{lc}; tables using it are read-only \
-                         until a REINDEX migration rebuilds them"
+                         until the host operation upgrade_collations rebuilds them"
                     ),
                 ));
             }

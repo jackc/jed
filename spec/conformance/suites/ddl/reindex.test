@@ -1,5 +1,5 @@
 # REINDEX INDEX / REINDEX TABLE — rebuild secondary indexes in place from their stored definitions
-# (spec/design/indexes.md §10, grammar.md §61). A rebuild is observably a no-op on rows: every query
+# (spec/design/indexes.md §10, grammar.md §59). A rebuild is observably a no-op on rows: every query
 # answers exactly as before, through the rebuilt index. Its cost is exactly the CREATE INDEX build scan
 # of each rebuilt index (page_read per table node + storage_row_read per row over the touched set),
 # summed in catalog order. Every index kind rebuilds: B-tree, UNIQUE (the UNIQUE constraint's backing
