@@ -308,9 +308,20 @@ module JedNative
         raise Error.new('0A000', 'age requires two timestamps in the Ruby experiment') unless b
         age(a, b)
       when 'to_timestamp'
-        raise Error.new('0A000', 'formatted timestamp parsing is not implemented') if b
-        TimestampValue.new((Decimal.parse(a) * 1_000_000).round.coefficient, zoned: true)
-      when 'to_date', 'to_char', 'to_number'
+        return DateFormatting.from_text(a, b, context: context) if b
+        raise Error.new('22008', 'timestamp cannot be NaN') if a.nan?
+        return TimestampValue.new(a, zoned: true) if a.infinite?
+        relative = (a - 946_684_800.0) * 1_000_000
+        raise Error.new('22008', 'timestamp is out of range') unless relative.finite? && relative >= -(2**63) && relative < 2**63
+        floor = relative.floor
+        difference = relative - floor
+        rounded = difference < 0.5 ? floor : difference > 0.5 ? floor + 1 : floor.even? ? floor : floor + 1
+        micros = rounded + 946_684_800_000_000
+        raise Error.new('22008', 'timestamp is out of range') unless micros.between?(-(2**63) + 1, 2**63 - 2)
+        TimestampValue.new(micros, zoned: true)
+      when 'to_number' then NumberFormatting.to_number(a, b, context: context)
+      when 'to_date' then DateFormatting.from_text(a, b, date: true, context: context)
+      when 'to_char'
         raise Error.new('0A000', 'format template functions are not implemented in the Ruby experiment')
       when 'uuid_extract_version' then (a[14] || '0').to_i(16)
       when 'uuid_extract_timestamp'
@@ -356,7 +367,7 @@ module JedNative
         rendered = a.pretty
         reserve(context, a.to_s.bytesize + rendered.bytesize)
         rendered
-      when 'json_strip_nulls', 'jsonb_strip_nulls' then JsonValue.new(strip_nulls(a.value, b || false), binary: name.start_with?('jsonb'))
+      when 'json_strip_nulls', 'jsonb_strip_nulls' then JsonValue.new(strip_nulls(a.decoded_value, b || false), binary: name.start_with?('jsonb'))
       when 'json_serialize' then a.to_s
       when /\Ajsonb?_path_/, 'json_exists', 'json_value', 'json_query'
         raise Error.new('0A000', 'SQL/JSON path is not implemented in the Ruby experiment')

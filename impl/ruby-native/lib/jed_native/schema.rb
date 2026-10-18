@@ -14,7 +14,7 @@ module JedNative
       original = table(stmt[:name])
       t = original.merge(columns: original[:columns].map(&:dup), constraints: Marshal.load(Marshal.dump(original[:constraints])), indexes: Marshal.load(Marshal.dump(original[:indexes] || [])), rows: original[:rows].map(&:dup))
       name_schema_constraints(t)
-      prior_constraints = t[:constraints].map { |constraint| constraint[:name] }
+      prior_constraints = t[:constraints].dup
       scanned = false
       scan = lambda do
         unless scanned
@@ -189,7 +189,13 @@ module JedNative
         end
       end
       validate_definition(t)
-      constraints = retype ? t[:constraints] : t[:constraints].reject { |constraint| prior_constraints.include?(constraint[:name]) }
+      constraints = if stmt[:action]
+                      []
+                    elsif retype
+                      t[:constraints]
+                    else
+                      t[:constraints].reject { |constraint| prior_constraints.any? { |prior| prior.equal?(constraint) } }
+                    end
       validate_alter_constraints(t, constraints)
       if retype || rekey
         t[:indexes].each do |index|

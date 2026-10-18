@@ -207,9 +207,9 @@ module JedNative
       return new(text.micros, zoned: zoned) if text.is_a?(self)
       return new(text.days * DAY, zoned: zoned) if text.is_a?(DateValue)
       return new(text == 'infinity' ? Float::INFINITY : -Float::INFINITY, zoned: zoned) if %w[infinity -infinity].include?(text)
-      m = /\A\s*(\d+-\d+-\d+)(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?\s*(Z|[+-]\d{1,2}(?::?\d{2})?|UTC)?\s*\z/i.match(text.to_s)
+      m = /\A\s*(\d+-\d+-\d+)(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?\s*(Z|[+-]\d{1,2}(?::?\d{2})?|UTC)?\s*(BC|AD)?\s*\z/i.match(text.to_s)
       raise Error.new('22007', 'invalid input syntax for timestamp') unless m
-      date = DateValue.parse(m[1])
+      date = DateValue.parse(m[1] + (m[7] ? ' ' + m[7] : ''))
       hour, minute, second = m[2].to_i, m[3].to_i, m[4].to_i
       raise Error.new('22008', 'timestamp field value out of range') if hour > 24 || minute > 59 || second > 60
       fraction = m[5] ? Decimal.parse(m[5]).round(6).coefficient : 0
@@ -227,7 +227,10 @@ module JedNative
       hour, rest = seconds.divmod(3600)
       minute, second = rest.divmod(60)
       fraction = micro.zero? ? '' : '.' + micro.to_s.rjust(6, '0').sub(/0+\z/, '')
-      "#{DateValue.new(days)} #{format('%02d:%02d:%02d', hour, minute, second)}#{fraction}#{@zoned ? '+00' : ''}"
+      date = DateValue.new(days).to_s
+      era = date.end_with?(' BC') ? ' BC' : ''
+      date = date.delete_suffix(' BC')
+      "#{date} #{format('%02d:%02d:%02d', hour, minute, second)}#{fraction}#{@zoned ? '+00' : ''}#{era}"
     end
     def <=>(other) = other.is_a?(TimestampValue) ? @micros <=> other.micros : nil
     def eql?(other) = other.is_a?(TimestampValue) && @micros == other.micros
@@ -495,7 +498,11 @@ end
         if number.infinite? && !value.is_a?(Float) && !/\A[+-]?(?:inf|infinity)\z/i.match?(value.to_s.strip)
           raise Error.new('22003', 'float out of range')
         end
-        narrowed = type == 'f32' ? [number].pack('f').unpack1('f') : number
+        narrowed = if type == 'f32' && number.finite? && number.abs > 3.4028234663852886e38 && number.abs < (2**128 - 2**103)
+          number.negative? ? -3.4028234663852886e38 : 3.4028234663852886e38
+        else
+          type == 'f32' ? [number].pack('f').unpack1('f') : number
+        end
         raise Error.new('22003', 'float out of range') if narrowed.infinite? && number.finite?
         narrowed
       when 'boolean'
@@ -742,46 +749,58 @@ module JedNative
   module Types
     PG_EPOCH_DAYS = 10_957
     module_function
-    def storage_value(type, value)
+    def storage_value(type, value, composites = {})
       return nil if value.nil?
       type = normalize(type)
       if type.end_with?('[]')
         elem = type[0...-2]
-        elements = value.map { |v| storage_value(elem, v) }
+        elements = value.map { |v| storage_value(elem, v, composites) }
         return elements unless value.respond_to?(:dimensions) && (value.dimensions.length > 1 || value.lower_bound != 1)
         return {dims: value.dimensions, lbounds: value.lower_bounds, elements: elements}
       end
       if RANGES.key?(type)
         return :empty if value.empty
-        return {lower: storage_value(value.element_type, value.lower), upper: storage_value(value.element_type, value.upper), lower_inc: value.lower_inc, upper_inc: value.upper_inc}
+        return {lower: storage_value(value.element_type, value.lower, composites), upper: storage_value(value.element_type, value.upper, composites), lower_inc: value.lower_inc, upper_inc: value.upper_inc}
+      end
+      if (fields = composites[type])
+        return fields.each_with_index.map { |field, index| storage_value(field[:type], value[index], composites) }
       end
       case base(type)
       when 'decimal' then value.to_s
-      when 'date' then value.days - PG_EPOCH_DAYS
-      when 'timestamp', 'timestamptz' then value.micros - PG_EPOCH_DAYS * TimestampValue::DAY
+      when 'date'
+        value.days.infinite? ? (value.days.positive? ? (1 << 31) - 1 : -(1 << 31)) : value.days - PG_EPOCH_DAYS
+      when 'timestamp', 'timestamptz'
+        value.micros.infinite? ? (value.micros.positive? ? (1 << 63) - 1 : -(1 << 63)) : value.micros - PG_EPOCH_DAYS * TimestampValue::DAY
       when 'interval' then [value.months, value.days, value.micros]
       when 'json', 'jsonpath' then value.to_s
       when 'jsonb' then json_storage_node(value.value)
       else value.is_a?(CompositeValue) ? value.to_a : value
       end
     end
-    def from_storage_value(type, value)
+    def from_storage_value(type, value, composites = {})
       return nil if value.nil?
       type = normalize(type)
       if type.end_with?('[]')
         elem = type[0...-2]
         elements = value.is_a?(Hash) ? value.fetch(:elements) : value
         lower = value.is_a?(Hash) ? value.fetch(:lbounds, [1])[0] : 1
-        return ArrayValue.new(elements.map { |v| from_storage_value(elem, v) }, element_type: elem, lower_bound: lower, dimensions: value.is_a?(Hash) ? value[:dims] : nil, lower_bounds: value.is_a?(Hash) ? value[:lbounds] : nil)
+        return ArrayValue.new(elements.map { |v| from_storage_value(elem, v, composites) }, element_type: elem, lower_bound: lower, dimensions: value.is_a?(Hash) ? value[:dims] : nil, lower_bounds: value.is_a?(Hash) ? value[:lbounds] : nil)
       end
       if RANGES.key?(type)
         return RangeValue.new(nil, nil, element_type: RANGES[type], empty: true) if value == :empty
-        return RangeValue.new(from_storage_value(RANGES[type], value[:lower]), from_storage_value(RANGES[type], value[:upper]), (value[:lower_inc] ? '[' : '(') + (value[:upper_inc] ? ']' : ')'), element_type: RANGES[type])
+        return RangeValue.new(from_storage_value(RANGES[type], value[:lower], composites), from_storage_value(RANGES[type], value[:upper], composites), (value[:lower_inc] ? '[' : '(') + (value[:upper_inc] ? ']' : ')'), element_type: RANGES[type])
+      end
+      if (fields = composites[type])
+        return CompositeValue.new(fields.each_with_index.map { |field, index| from_storage_value(field[:type], value[index], composites) }, type_name: type, field_names: fields.map { |field| field[:name] })
       end
       case base(type)
       when 'decimal' then Decimal.parse(value)
-      when 'date' then DateValue.new(value + PG_EPOCH_DAYS)
-      when 'timestamp', 'timestamptz' then TimestampValue.new(value + PG_EPOCH_DAYS * TimestampValue::DAY, zoned: type == 'timestamptz')
+      when 'date'
+        days = value == -(1 << 31) ? -Float::INFINITY : value == (1 << 31) - 1 ? Float::INFINITY : value + PG_EPOCH_DAYS
+        DateValue.new(days)
+      when 'timestamp', 'timestamptz'
+        micros = value == -(1 << 63) ? -Float::INFINITY : value == (1 << 63) - 1 ? Float::INFINITY : value + PG_EPOCH_DAYS * TimestampValue::DAY
+        TimestampValue.new(micros, zoned: type == 'timestamptz')
       when 'interval' then IntervalValue.new(*value)
       when 'bytea' then Bytea.new(value)
       when 'uuid' then UUID.new(value)
@@ -834,7 +853,7 @@ module JedNative
       index, values = 0, []
       parse_level = nil
       parse_level = lambda do |depth|
-        raise Error.new('54000', 'number of array dimensions exceeds six') if depth > 6
+        raise Error.new('22P02', 'number of array dimensions exceeds six') if depth > 6
         raise Error.new('22P02', 'malformed array literal') unless text[index] == '{'
         index += 1
         count, subshape, nested = 0, nil, nil
@@ -866,7 +885,7 @@ module JedNative
             raise Error.new('22P02', 'malformed array literal') if quoted || escaped
             value = value.strip unless was_quoted
             raise Error.new('22P02', 'malformed array literal') if value.empty? && !was_quoted
-            values << (!was_quoted && value.upcase == 'NULL' ? nil : cast(value, element_type))
+            values << (!was_quoted && value.upcase == 'NULL' ? nil : block_given? ? yield(value) : cast(value, element_type))
           end
           count += 1
           index += 1 while index < text.length && /\s/.match?(text[index])

@@ -27,7 +27,7 @@ end
 # directives as well as SQL mismatches. No capability filter hides missing work.
 class NativeCorpus
   ROOT = File.expand_path('../../..', __dir__)
-  SUPPORTED = %w[requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed].freeze
+  SUPPORTED = %w[requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed attach timezone load-timezone].freeze
   DIRECTIVES = %w[requires names types cost max_cost format fixture params clock clock_advance seed timezone collation unicode attach lifetime_max_cost max_query_memory_bytes max_scalar_bytes max_sql_length max_storage_bytes max_temp_storage_bytes work_mem allow_ddl allow_temp_ddl default_privileges grant revoke set load-collation load-timezone upgrade-collations].freeze
   attr_reader :summary
 
@@ -80,14 +80,16 @@ class NativeCorpus
     clock.reset
     random.reset
     environment = JedNative::Environment.new(clock: clock, random: random)
+    environment = environment.load_time_zone_data(File.binread(File.join(ROOT, 'spec/tz/fixtures/tzdata.jtz'))) if contents.match?(/^#\s*load-timezone:/)
     db = file ? JedNative.create(file, environment: environment) : JedNative.memory(environment: environment)
+    contents.scan(/^#\s*attach:\s*(.+)$/).flatten.each { |name| db.attach(name.strip) }
     pending = {}
     lines = contents.lines.map(&:chomp)
     i = 0
     while i < lines.length
       line = lines[i]
       i += 1
-      if (match = /^#\s*(names|types|cost|max_cost|params|max_scalar_bytes|max_sql_length|lifetime_max_cost|clock|clock_advance|seed):\s*(.*)$/.match(line))
+      if (match = /^#\s*(names|types|cost|max_cost|params|max_scalar_bytes|max_sql_length|lifetime_max_cost|clock|clock_advance|seed|timezone):\s*(.*)$/.match(line))
         pending[match[1]] = match[2]
         next
       end
@@ -118,6 +120,7 @@ class NativeCorpus
           clock.reset(pending['clock'] && Integer(pending['clock']))
         end
         random.reset(pending['seed'] && Integer(pending['seed']))
+        db.timezone = pending.fetch('timezone', 'UTC')
         db.max_cost = pending.fetch('max_cost', '0').to_i
         db.max_sql_length = pending.fetch('max_sql_length', '1048576').to_i
         db.engine.lifetime_max_cost = pending['lifetime_max_cost'].to_i if pending['lifetime_max_cost']
@@ -139,7 +142,7 @@ class NativeCorpus
             tags, sort = line.split[1, 2]
             tags *= result.columns.length if tags.length == 1
             raise "column count #{result.columns.length}, expected #{tags.length}" unless result.columns.length == tags.length
-            actual = result.rows.map { |row| row.each_with_index.map { |v, index| JedNative::Types.format(v, result.column_types[index]) } }
+            actual = result.rows.map { |row| row.each_with_index.map { |v, index| db.render(v, result.column_types[index]) } }
             actual.sort! if sort == 'rowsort'
             actual = actual.flatten
             actual.sort! if sort == 'valuesort'

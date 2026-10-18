@@ -136,13 +136,16 @@ module JedNative
       @scope_depth += 1
       previous_ctes = @ctes.dup
       (node[:with] || []).each do |cte|
+        additions = []
         if node[:recursive] && %i[set_operation setop].include?(cte[:query][:kind])
           seed = statement(cte[:query][:left], outer)
-          @ctes[cte[:name]] = seed.each_with_index.map { |column, i| column.merge(name: cte[:columns]&.[](i) || column[:name]) }
+          seed = seed.each_with_index.map { |column, i| column.merge(name: cte[:columns]&.[](i) || column[:name]) }
+          additions = @engine.cte_search_cycle_columns(cte, seed) if @engine.respond_to?(:cte_search_cycle_columns)
+          @ctes[cte[:name]] = seed + additions.map { |column| column.merge(star_hidden: true) }
         end
         columns = statement(cte[:query], outer)
         columns = columns.each_with_index.map { |column, i| column.merge(name: cte[:columns]&.[](i) || column[:name]) }
-        @ctes[cte[:name]] = columns
+        @ctes[cte[:name]] = columns + additions
       end
       case node[:kind]
       when :select
@@ -156,7 +159,7 @@ module JedNative
         output = (node[:columns] || []).flat_map do |projection|
           expr = projection[:expr]
           if expr[:kind] == :star
-            scope.select { |column| !expr[:table] || column[:table] == expr[:table] }
+            scope.select { |column| !column[:star_hidden] && (!expr[:table] || column[:table] == expr[:table]) }
           else
             [{ name: projection[:alias] || @engine.expression_name(expr), type: expression(expr, scope) }]
           end
@@ -202,7 +205,18 @@ module JedNative
           end
         end
         expression(node[:where], scope, 'boolean') if node[:where]
-        (node[:returning] || []).map { |item| { name: item[:alias] || @engine.expression_name(item[:expr]), type: expression(item[:expr], scope) } }
+        aliases = node[:returning_aliases] || {}
+        returning_scope = scope + %w[old new].flat_map do |name|
+          @engine.table_columns(table, aliases[name.to_sym] || name).map { |column| column.merge(binding_scope: @scope_depth, qualified_only: true) }
+        end
+        (node[:returning] || []).flat_map do |item|
+          expr = item[:expr]
+          if expr[:kind] == :star
+            returning_scope.select { |column| expr[:table] ? column[:table] == expr[:table] : !column[:qualified_only] }
+          else
+            [{ name: item[:alias] || @engine.expression_name(expr), type: expression(expr, returning_scope) }]
+          end
+        end
       when :create_table then statement(node[:query], outer)
       when :explain then statement(node[:statement], outer)
       else
@@ -242,6 +256,9 @@ module JedNative
           expression(call[:path], outer, 'jsonpath')
           (call[:passing] || []).each { |binding| expression(binding[:expr], outer) }
           @engine.json_table_columns(call[:columns])
+        elsif defined?(JsonRelations) && JsonRelations::JSON_RELATIONS.include?(call[:name])
+          (call[:args] || []).each { |arg| expression(arg, outer) }
+          @engine.json_relation_columns(node)
         else
           type = expression(call, outer)
           [{ name: call[:name] || 'value', type: type.sub(/\[\]\z/, '') }]
@@ -259,7 +276,7 @@ module JedNative
         @types[node[:index] - 1]
       when :literal then Types.normalize(node[:type] || Types.infer(node[:value]))
       when :column
-        matches = scope.select { |column| column[:name] == node[:name] && (!node[:table] || column[:table] == node[:table]) }
+        matches = scope.select { |column| column[:name] == node[:name] && (node[:table] ? column[:table] == node[:table] : !column[:qualified_only]) }
         if matches.length > 1
           depth = matches.map { |column| column[:binding_scope] || @scope_depth }.max
           matches = matches.select { |column| (column[:binding_scope] || @scope_depth) == depth }
@@ -289,6 +306,9 @@ module JedNative
         expression(node[:path], scope, 'jsonpath')
         (node[:passing] || []).each { |binding| expression(binding[:expr], scope) }
         Types.normalize(node[:returning] || (node[:kind] == :json_exists ? 'boolean' : node[:kind] == :json_query ? 'jsonb' : 'text'))
+      when :json_constructor
+        expression(node[:expr], scope, 'text')
+        'json'
       when :case
         operand = expression(node[:operand], scope) if node[:operand]
         values = node[:branches].map do |condition, value|
@@ -354,7 +374,10 @@ module JedNative
         rt = lt
       end
       if op == '||'
-        anchor = [lt, rt].find { |type| type.end_with?('[]') } || 'text'
+        anchor = [lt, rt].find { |type| type.end_with?('[]') }
+        anchor ||= 'jsonb' if lt == 'jsonb' && rt == 'jsonb'
+        anchor ||= 'bytea' if [lt, rt].include?('bytea') && [[left, lt], [right, rt]].all? { |arg, type| %w[bytea unknown].include?(type) || arg[:kind] == :literal && arg[:untyped] }
+        anchor ||= 'text'
         expression(left, scope, anchor) if left[:kind] == :param
         expression(right, scope, anchor) if right[:kind] == :param
         return anchor

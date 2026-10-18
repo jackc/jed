@@ -1402,26 +1402,32 @@ module JedNative
       ops.each_with_index.map { |op, k| gist_comp_leaf(op, row[cols[k]]) }
     end
     
-    # range_union (range.rs, strict = false) — the convex hull. `empty` contributes nothing; otherwise
-    # lower = the lesser lower bound, upper = the greater upper bound. GX1's range elements are the six
-    # discrete/continuous subtypes; this reference's GiST golden uses only FINITE, canonical `[)` i32
-    # ranges (so the bound comparison reduces to value min/max with the canonical inclusivity), matching
-    # the cores for that set. An infinite bound is not exercised by the golden (a defensive raise).
-    def gist_range_union(a, b)
+    # Convex hull under the subtype's canonical key order. Infinite bounds and
+    # inclusive ties retain the same range semantics for every supported subtype.
+    def gist_range_union(a, b, elem)
       return b if a == :empty
       return a if b == :empty
-      if [a[:lower], a[:upper], b[:lower], b[:upper]].any?(&:nil?) ||
-         !(a[:lower_inc] && b[:lower_inc]) || a[:upper_inc] || b[:upper_inc]
-        raise "GiST golden expects finite canonical [) ranges"
+      if a[:lower].nil? || b[:lower].nil?
+        lower, lower_inc = nil, false
+      else
+        comparison = key_body(elem, a[:lower]) <=> key_body(elem, b[:lower])
+        lower = comparison <= 0 ? a[:lower] : b[:lower]
+        lower_inc = comparison.zero? ? a[:lower_inc] || b[:lower_inc] : (comparison < 0 ? a[:lower_inc] : b[:lower_inc])
       end
-      { lower: [a[:lower], b[:lower]].min, upper: [a[:upper], b[:upper]].max,
-        lower_inc: true, upper_inc: false }
+      if a[:upper].nil? || b[:upper].nil?
+        upper, upper_inc = nil, false
+      else
+        comparison = key_body(elem, a[:upper]) <=> key_body(elem, b[:upper])
+        upper = comparison >= 0 ? a[:upper] : b[:upper]
+        upper_inc = comparison.zero? ? a[:upper_inc] || b[:upper_inc] : (comparison > 0 ? a[:upper_inc] : b[:upper_inc])
+      end
+      { lower: lower, upper: upper, lower_inc: lower_inc, upper_inc: upper_inc }
     end
-    
+
     # union of two COMPONENT bounds: the convex hull for a range; componentwise [min(min), max(max)]
     # (byte-wise, the order-preserving key order) for a scalar.
     def gist_comp_union(op, a, b)
-      return gist_range_union(a, b) if op[:kind] == :range
+      return gist_range_union(a, b, op[:elem]) if op[:kind] == :range
     
       amin, amax = a
       bmin, bmax = b
@@ -3015,12 +3021,15 @@ module JedNative
     # In-order walk of a table's B+tree -> rows in ascending key order (format.md v24: interior nodes
     # are a record-free routing skeleton; all records live in leaves). Independent of how the tree was
     # built. An external value's chain is followed through `fetch` (large-values.md §12).
-    def read_tree_rows(image, ps, root_page, columns, keys_out = nil)
+    def read_tree_rows(image, ps, root_page, columns, keys_out = nil, profile = nil)
       rows = []
       seen = Set.new
       fetch = ->(p) { read_page(image, ps, p) }
-      walk = lambda do |idx|
-        return if idx.zero?
+      height = 0
+      scan_units = {}
+      walk = lambda do |idx, depth|
+        return nil if idx.zero?
+        height = [height, depth].max
         raise "B-tree page reached twice" unless seen.add?(idx)
     
         pg = read_page(image, ps, idx)
@@ -3030,27 +3039,66 @@ module JedNative
           leaf_keys, regions = parse_pax_leaf(pg[:payload], n, columns)
           keys_out.concat(leaf_keys) if keys_out
           (0...n).each do |i|
+            if profile
+              units = {}
+              regions.each_with_index do |region, column|
+                next if region[:width]
+                lo = i.zero? ? 0 : region[:ends][i - 1]
+                length = region[:ends][i] - lo
+                next if length.zero?
+                bytes = region[:body].byteslice(lo, length)
+                capacity = ps - PAGE_HEADER
+                pages, slabs = case bytes.getbyte(0)
+                               when TAG_EXTERNAL then [(bytes.byteslice(5, 4).unpack1('N') + capacity - 1) / capacity, 0]
+                               when TAG_INLINE_COMP then [0, (bytes.byteslice(1, 4).unpack1('N') + capacity - 1) / capacity]
+                               when TAG_EXTERNAL_COMP then [(bytes.byteslice(5, 4).unpack1('N') + capacity - 1) / capacity,
+                                                            (bytes.byteslice(9, 4).unpack1('N') + capacity - 1) / capacity]
+                               else [0, 0]
+                               end
+                units[column] = [pages, slabs].freeze unless pages.zero? && slabs.zero?
+              end
+              scan_units[rows.length] = units.freeze unless units.empty?
+            end
             rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c[:type], i, fetch) }
           end
+          { keys: leaf_keys.freeze, children: [].freeze }.freeze if profile
         when PAGE_INTERIOR
           n = pg[:item_count]
           children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
-          children.each { |cp| walk.call(cp) }
+          child_nodes = children.map { |cp| walk.call(cp, depth + 1) }
+          { keys: interior_keys(pg).freeze, children: child_nodes.freeze }.freeze if profile
         else
           raise "expected a B-tree node page, got type #{pg[:type]}"
         end
       end
-      walk.call(root_page)
+      tree = walk.call(root_page, 1)
+      profile.merge!(tree: tree, node_count: seen.length, height: height, scan_units: scan_units.freeze) if profile
       rows
+    end
+
+    def interior_keys(page)
+      count = page[:item_count]
+      directory = 4 * (count + 1)
+      start = directory + 4 * count
+      previous = 0
+      Array.new(count) do |index|
+        finish = page[:payload].byteslice(directory + 4 * index, 4).unpack1('N')
+        raise 'invalid interior separator directory' if finish < previous || start + finish > page[:payload].bytesize
+        key = page[:payload].byteslice(start + previous, finish - previous)
+        previous = finish
+        key
+      end
     end
     
     # In-order walk of an INDEX B+tree -> entry keys in ascending order. An index record is its key
     # alone (format.md "Index trees"); interior separators are routing copies, not entries.
-    def read_tree_keys(image, ps, root_page)
+    def read_tree_keys(image, ps, root_page, profile = nil)
       keys = []
       seen = Set.new
-      walk = lambda do |idx|
-        return if idx.zero?
+      height = 0
+      walk = lambda do |idx, depth|
+        return nil if idx.zero?
+        height = [height, depth].max
         raise "B-tree page reached twice" unless seen.add?(idx)
     
         pg = read_page(image, ps, idx)
@@ -3060,15 +3108,18 @@ module JedNative
           # column directory. parse_pax_leaf returns the keys.
           leaf_keys, = parse_pax_leaf(pg[:payload], pg[:item_count], [])
           leaf_keys.each { |kk| keys << kk }
+          { keys: leaf_keys.freeze, children: [].freeze }.freeze if profile
         when PAGE_INTERIOR
           n = pg[:item_count]
           children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
-          children.each { |cp| walk.call(cp) }
+          child_nodes = children.map { |cp| walk.call(cp, depth + 1) }
+          { keys: interior_keys(pg).freeze, children: child_nodes.freeze }.freeze if profile
         else
           raise "expected a B-tree node page, got type #{pg[:type]}"
         end
       end
-      walk.call(root_page)
+      tree = walk.call(root_page, 1)
+      profile.merge!(tree: tree, node_count: seen.length, height: height) if profile
       keys
     end
     
@@ -3249,16 +3300,18 @@ module JedNative
     
           entry, pos = decode_table_entry(payload, pos)
           storage_keys = []
-          rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns], storage_keys)
+          profile = {}
+          rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns], storage_keys, profile)
           raise "persisted row_count does not match decoded rows" unless entry[:row_count] == rows.length
           entry[:indexes].each do |ix|
             if ix[:kind] == "gist"
               read_gist_keys(image, ps, ix[:root_page])
             else
-              read_tree_keys(image, ps, ix[:root_page])
+              ix[:tree_profile] = {}
+              read_tree_keys(image, ps, ix[:root_page], ix[:tree_profile])
             end
           end
-          tables << entry.merge(pk_order: entry[:pk], rows: rows, storage_keys: storage_keys)
+          tables << entry.merge(pk_order: entry[:pk], rows: rows, storage_keys: storage_keys, tree_profile: profile)
         end
         cat = nxt
       end

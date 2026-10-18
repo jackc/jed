@@ -53,12 +53,17 @@ module JedNative
   end
 
   class Environment
-    attr_reader :clock, :random
-    def initialize(clock: WallClock.new, random: OSRandom.new)
-      @clock, @random = clock, random
+    attr_reader :clock, :random, :timezones
+    def initialize(clock: WallClock.new, random: OSRandom.new, timezones: {})
+      @clock, @random, @timezones = clock, random, timezones.dup.freeze
       freeze
     end
-    def with(clock: @clock, random: @random) = self.class.new(clock: clock, random: random)
+    def with(clock: @clock, random: @random, timezones: @timezones) = self.class.new(clock: clock, random: random, timezones: timezones)
+    def load_time_zone_data(bytes)
+      require_relative 'timezone_data'
+      loaded = TimeZoneData.new(bytes).zones
+      with(timezones: loaded.merge(@timezones))
+    end
   end
 
   module HostInputs

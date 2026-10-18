@@ -20,3 +20,13 @@ functions.each do |name, entries|
 end
 lines.concat(["    }.freeze", "  end", "end", ""])
 File.write(File.join(root, 'impl/ruby-native/lib/jed_native/function_catalog.rb'), lines.join("\n"))
+formatting = TomlRB.load_file(File.join(root, 'spec/types/formatting.toml'))
+lines = ["# frozen_string_literal: true", "# Generated from spec/types/formatting.toml; processors are handwritten.", "module JedNative", "  module FormattingTables"]
+%w[num dch suffixes words].each { |name| lines << "    #{name.upcase} = #{formatting.fetch(name).inspect}.freeze" }
+lines.concat(["  end", "end", ""])
+File.write(File.join(root, 'impl/ruby-native/lib/jed_native/formatting_tables.rb'), lines.join("\n"))
+units = TomlRB.load_file(File.join(root, 'spec/types/datetime_units.toml'))
+lines = ["# frozen_string_literal: true", "# Generated from spec/types/datetime_units.toml; processors are handwritten.", "module JedNative", "  module DateTimeUnits", "    TOKEN_MAX_LEN = #{units.fetch('token_max_len')}"]
+%w[delta date].each { |name| lines << "    #{name.upcase} = #{units.fetch(name).to_h { |entry| [entry.fetch('token'), entry.values_at('type', 'value')] }.inspect}.freeze" }
+lines.concat(["  end", "end", ""])
+File.write(File.join(root, 'impl/ruby-native/lib/jed_native/datetime_units.rb'), lines.join("\n"))
