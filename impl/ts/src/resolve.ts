@@ -1,3 +1,4 @@
+import { cancellationCheckpoint } from "./cancel.ts";
 // resolveProjections resolves SELECT items into evaluable projections (any result type is
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
@@ -636,6 +637,7 @@ export function resolve(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
+  cancellationCheckpoint();
   try {
     return resolveNode(scope, e, ctx, ag, params);
   } catch (err) {

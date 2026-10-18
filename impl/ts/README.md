@@ -12,6 +12,57 @@ than return an error; discriminated unions rather than one-field-set structs).
 
 Style (CLAUDE.md §10): **boring, explicit code over clever abstraction.**
 
+## Async application API
+
+The `jed-ts` entry point executes SQL in a long-lived Node worker. `jed-ts/browser` uses
+a dedicated browser worker and OPFS (or memory when no path is supplied). Both expose the
+same async database/session/transaction/prepared/cursor lifecycle:
+
+```ts
+import { createDatabase } from "jed-ts"; // "jed-ts/browser" in a browser bundle
+
+const db = await createDatabase({ path: "app.jed" });
+try {
+  await db.execute("CREATE TABLE items (id i64 PRIMARY KEY, title text)");
+  await db.update(async (tx) => {
+    const insert = await tx.prepare("INSERT INTO items VALUES ($1, $2)");
+    try { await insert.run(1n, "first"); }
+    finally { await insert.close(); }
+  });
+  const rows = await db.query("SELECT * FROM items ORDER BY id");
+  for await (const row of rows) console.log(row); // lossless Value[]; early exit closes
+} finally {
+  await db.close();
+}
+```
+
+`query` yields typed values, including rehydrated decimals, exact integers, bytes and recursive
+containers. `get`/`all` return the existing ergonomic JS object mapping. A prepared statement's
+`query(params)`/`execute(params)` use `Value[]`; `run/get/all(...params)` accept native JS values.
+`batch` amortizes messaging without adding a transaction; `executeScript` is atomic.
+Database convenience calls use fresh sessions; use `await db.session()` to keep variables,
+temporary tables and explicit SQL transaction state. Close every session and prepared statement.
+
+`runtime` options bound outstanding requests, batches, client result memory, handles and worker
+count. Defaults and the migration contract are in [ts-runtime.md §10](../../spec/design/ts-runtime.md#10-implemented-async-host-contract).
+A single oversized row or `all` collection fails `TransportError("RESULT_TOO_LARGE")`; consume
+large results with async iteration. SQL errors remain `EngineError` with SQLSTATE and diagnostics.
+`WORKER_FAILED` with `outcome: "unknown"` means a lost response may follow a committed write;
+requests are never automatically replayed.
+
+Pass `{signal}` to `query`/`execute` for cancellation. Node and cross-origin-isolated browsers
+poll shared flags during metered work. Ordinary browsers cancel between operations and row
+batches; a currently executing synchronous blocking kernel cannot yet process cancel messages.
+Async page/crypto suspension and universal cooperative cancellation remain follow-ons.
+
+Node's `extensionModule` accepts a trusted file URL exporting `configure(builder)`. That module
+registers host functions on the worker's `EnvironmentBuilder` before storage opens. Application
+closures are not transferable. Unicode/time-zone bundles may be passed as data at open.
+
+The repository's synchronous core (`src/lib.ts`, also `jed-ts/internal`) remains available for
+conformance and existing host tooling. It does not offload work; application code uses the async
+entry points. No new runtime dependency or database format was introduced by this migration.
+
 ## Load-bearing decisions
 
 - **Uniform `bigint`.** Every integer (i16/i32/i64) is stored as a JS `bigint`,

@@ -385,14 +385,16 @@ Current leaning: keep native TS plus the narrow helper as the default proposal, 
 wrapper experiment, and revisit an optional or primary native package only with a
 production-complete API and workload-driven evidence.
 
-### 5.3 Platform specialization without another semantic core (proposal)
+### 5.3 Platform specialization without another semantic core
 
 The encryption/browser investigation reinforces the distinction between **delivery adapters**
 and **engine implementations**. The existing TS engine already has separate Node file and browser
 OPFS adapters. It is reasonable to specialize scheduling, crypto, storage, and packaging further.
-The proposed runtime is specified in [ts-runtime.md](ts-runtime.md): an **async-only public JS
-API** with execution off the application thread, retaining synchronous internal computation and
-adding explicit suspension/checkpoints. It is not implemented or a ratified API migration.
+The runtime is specified in [ts-runtime.md](ts-runtime.md): **async-only application entry points**
+with execution off the application thread, typed bounded transport and session scheduling are
+implemented. Synchronous internal computation remains; atomic cancellation polls checkpoints.
+Cooperative blocking-kernel interruption without shared memory and explicit async page/crypto
+suspension remain follow-ons. Synchronous modules remain internal for conformance and tooling.
 
 | Concern | Node candidate | Browser candidate |
 |---|---|---|
@@ -401,7 +403,7 @@ adding explicit suspension/checkpoints. It is not implemented or a ratified API 
 | Execution API | Async worker API with batching; no initial public sync variant | Async worker RPC with the same lifecycle; resident computation can remain synchronous |
 | Engine delivery | Independent TS or optional Rust/Node-API | Independent TS or Rust/WASM with browser adapters |
 
-This is a proposal for evaluation, not a ratified shipping matrix. In particular, native Node crypto
+Crypto and Rust delivery entries are candidates, not a selected shipping matrix. Native Node crypto
 can accelerate a TS codec without moving SQL execution to Rust. Node does not need to inherit all
 browser internal promise boundaries, and a synchronous native addon still blocks its calling JS thread
 while executing SQL. Threaded/batched APIs must be designed and measured rather than inferred from

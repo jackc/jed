@@ -17,7 +17,9 @@ signals an error — the safest default; there's a read-only `view` helper too. 
 every language (Rust, Go, **and** TypeScript), on the `Database` handle (where each call mints a fresh
 session) or on a session you've minted. For finer control, the explicit `begin` / `commit` /
 `rollback` form lives on a **session** — mint one with `db.session(...)` and drive the block across
-calls.
+calls. In TypeScript, await each operation: `await db.update(async (tx) => { ... })`,
+`await db.session(...)`, and `await session.begin()`. Use the transaction proxy returned by
+`begin()` throughout the block; it retains ownership across application awaits.
 
 A writable transaction that makes no persistent changes commits without rewriting the database or
 issuing an fsync. This includes empty transactions, SELECT-only work, and zero-row writes without

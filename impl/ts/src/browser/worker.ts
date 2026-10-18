@@ -1,115 +1,61 @@
 /// <reference lib="webworker" />
-// The engine running inside a dedicated Web Worker (spec/design/hosts.md §5). OPFS sync access handles
-// are only usable off the main thread, and the engine above the storage seam is synchronous, so the
-// whole TS core runs HERE; the main thread drives it over postMessage — the async RPC client is
-// client.ts. One worker owns at most one open database, i.e. one exclusive sync access handle, which is
-// the single-writer guarantee (CLAUDE.md §3). Browser/worker only.
-//
-// Imports deliberately avoid lib.ts: that barrel re-exports the Node `fs` host (file.ts → node:fs),
-// which a browser bundle cannot load. Everything here comes straight from the node-clean engine modules
-// (opfs.ts / executor.ts / parser.ts / value.ts / errors.ts) — the graph the import trace proved free of
-// `node:*`.
+// The platform edge owns OPFS acquisition; scheduling, sessions, typed values, and
+// lifecycle are shared with Node. This import graph contains no Node modules.
+import { RuntimeServer } from "../async/server.ts";
+import { Environment } from "../environment.ts";
+import { engineError } from "../errors.ts";
+import { DEFAULT_PAGE_SIZE } from "../executor.ts";
+import { createOpfs, openOpfs } from "../opfs.ts";
+import { buildInMemory, Database } from "../shared.ts";
+import type { BrowserDatabaseOptions, BrowserOpenOptions } from "./async.ts";
 
-import { EngineError } from "../errors.ts";
-import type { Engine, Outcome } from "../executor.ts";
-import {
-  closeOpfs,
-  createOpfs,
-  type DatabaseOptions,
-  type OpenOptions,
-  openOpfs,
-} from "../opfs.ts";
-import { parseSQL } from "../parser.ts";
-import { render } from "../value.ts";
+// One channel belongs to the worker's lifetime. Message tasks yield to control
+// requests without the nested-timer clamp that setTimeout adds to every batch.
+const turns = new MessageChannel();
+let pendingTurn: (() => void) | undefined;
+turns.port1.onmessage = () => {
+  const callback = pendingTurn;
+  pendingTurn = undefined;
+  callback?.();
+};
 
-// Req is the client→worker wire protocol (client.ts is the other end). Each request carries a unique id
-// the reply echoes.
-type Req =
-  | { id: number; op: "open"; name: string; opts?: OpenOptions }
-  | { id: number; op: "create"; name: string; opts?: DatabaseOptions }
-  | { id: number; op: "run"; sql: string }
-  | { id: number; op: "commit" }
-  | { id: number; op: "rollback" }
-  | { id: number; op: "close" };
-
-// RunResult is a serialized statement outcome: a query's rendered rows + column names, or a statement's
-// affected-row count. Rows are rendered to strings (render, value.ts) because Value carries class
-// instances (Decimal, …) that structured clone would not preserve across the worker boundary; cost is a
-// decimal string for the same JSON-friendly reason. This mirrors the CLI/conformance display form; a
-// typed-value wire form is a later enhancement.
-type RunResult =
-  | { kind: "query"; columnNames: string[]; rows: string[][]; cost: string }
-  | { kind: "statement"; rowsAffected: number | null; cost: string };
-
-// The single open database this worker owns (the exclusive OPFS handle, hosts.md §5). null until open/create.
-let db: Engine | null = null;
-
-function requireDb(): Engine {
-  // Protocol misuse (a run/commit before open), not a SQL engine error — a plain Error, which the
-  // message loop serializes with the generic XX000 code.
-  if (db === null) {
-    throw new Error("no database is open in this worker");
-  }
-  return db;
-}
-
-function serializeOutcome(out: Outcome): RunResult {
-  if (out.kind === "query") {
-    return {
-      kind: "query",
-      columnNames: out.columnNames,
-      rows: out.rows.map((r) => r.map(render)),
-      cost: out.cost.toString(),
-    };
-  }
-  return { kind: "statement", rowsAffected: out.rowsAffected, cost: out.cost.toString() };
-}
-
-async function handle(req: Req): Promise<unknown> {
-  switch (req.op) {
-    case "open":
-      if (db !== null) throw new Error("a database is already open in this worker");
-      db = await openOpfs(req.name, req.opts);
-      return null;
-    case "create":
-      if (db !== null) throw new Error("a database is already open in this worker");
-      db = await createOpfs(req.name, req.opts);
-      return null;
-    case "run":
-      // Parse + run one statement under autocommit (or the current explicit block); BEGIN/COMMIT/
-      // ROLLBACK in the SQL drive the block directly (transactions.md §4.2). Bind params is a later
-      // enhancement (Value is not trivially structured-cloneable) — params are empty for now.
-      return serializeOutcome(requireDb().executeStmtParams(parseSQL(req.sql), []));
-    case "commit":
-      requireDb().commitTx();
-      return null;
-    case "rollback":
-      requireDb().rollbackTx();
-      return null;
-    case "close":
-      if (db !== null) {
-        closeOpfs(db);
-        db = null;
-      }
-      return null;
-  }
-}
-
-// The message loop: run the request, post back {id, ok, result} or {id, ok:false, error:{code,message}}.
-// Serializing EngineError to {code,message} is what keeps api.md §5/§7's structured-error contract
-// intact across the worker boundary (the client rethrows a matching error).
-addEventListener("message", (ev: MessageEvent<Req>) => {
-  const req = ev.data;
-  handle(req).then(
-    (result) => postMessage({ id: req.id, ok: true, result }),
-    (e: unknown) =>
-      postMessage({
-        id: req.id,
-        ok: false,
-        error: {
-          code: e instanceof EngineError ? e.code() : "XX000",
-          message: e instanceof Error ? e.message : String(e),
-        },
-      }),
-  );
+const runtime = new RuntimeServer({
+  schedule(callback) {
+    // RuntimeServer keeps at most one dispatch task queued.
+    pendingTurn = callback;
+    turns.port2.postMessage(null);
+  },
+  async open(args) {
+    const options = args.options as BrowserDatabaseOptions & BrowserOpenOptions;
+    if (options.backend !== undefined && options.backend !== "typescript") {
+      throw engineError(
+        "feature_not_supported",
+        "the browser runtime supports the typescript backend",
+      );
+    }
+    const builder = Environment.builder();
+    if (options.unicodeData !== undefined) builder.loadUnicodeData(options.unicodeData);
+    if (options.timeZoneData !== undefined) builder.loadTimeZoneData(options.timeZoneData);
+    const environment = builder.build();
+    if (options.path === undefined) {
+      if (args.mode !== "create")
+        throw engineError("undefined_file", "opening OPFS requires a path");
+      return buildInMemory(
+        options.pageSize ?? DEFAULT_PAGE_SIZE,
+        environment,
+        options.maxStorageBytes,
+      );
+    }
+    const engine =
+      args.mode === "create"
+        ? await createOpfs(options.path, { ...options, environment })
+        : await openOpfs(options.path, { ...options, environment });
+    if (options.maxStorageBytes !== undefined) engine.storageBudget.limit = options.maxStorageBytes;
+    return Database.fromEngine(engine);
+  },
+  send(reply) {
+    postMessage(reply);
+  },
 });
+
+addEventListener("message", (event) => runtime.receive(event.data));

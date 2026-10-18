@@ -1,23 +1,21 @@
-import { createDatabase, splitStatements } from 'jed-ts';
+import { createDatabase, splitStatements, render } from 'jed-ts';
 
-const db = createDatabase({ path: 'app.jed' });
+const db = await createDatabase({ path: 'app.jed' });
+try {
+  // One implicit transaction: any statement error rolls the whole script back.
+  // Result rows are discarded inside the worker, leaving an O(1) summary.
+  const summary = await db.executeScript(
+    `CREATE TABLE account (id i32 PRIMARY KEY, balance i64);
+     INSERT INTO account VALUES (1, 100), (2, 50);
+     CREATE INDEX account_balance ON account (balance);`
+  );
+  console.log(`ran ${summary.statementsRun} statements`);
 
-// executeScript runs a whole migration as ONE implicit transaction: split it into statements, run
-// each in order, and commit all-or-nothing (any error rolls the lot back). It DISCARDS result rows —
-// you get back only an O(1) summary (statements run, rows affected, cost), so a huge import never
-// buffers results.
-const summary = db.executeScript(
-  `CREATE TABLE account (id i32 PRIMARY KEY, balance i64);
-   INSERT INTO account VALUES (1, 100), (2, 50);
-   CREATE INDEX account_balance ON account (balance);`
-);
-console.log(`ran ${summary.statementsRun} statements`);
-
-// splitStatements is the library-level primitive (no Database needed). When you DO want each
-// statement's rows, loop it yourself and run the spans through the normal path — the host owns the
-// policy (one transaction or autocommit, drain the rows or drop them).
-for (const stmt of splitStatements('SELECT id FROM account; SELECT balance FROM account')) {
-  db.query(stmt.text);
+  // To receive each statement's rows, split explicitly and choose the boundary.
+  // These calls each run under autocommit; use a session for explicit SQL BEGIN.
+  for (const stmt of splitStatements('SELECT id FROM account; SELECT balance FROM account')) {
+    for await (const row of await db.query(stmt.text)) console.log(row.map(render));
+  }
+} finally {
+  await db.close();
 }
-
-db.close();

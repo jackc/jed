@@ -1,27 +1,29 @@
-import { openDatabase } from 'jed-ts';
+import { openDatabase, render } from 'jed-ts';
 
-const db = openDatabase('app.jed');
+const db = await openDatabase('app.jed');
+try {
+  // Native JS parameters bind to $1, $2, …; integer results remain exact bigint.
+  const { changes } = await db.run(
+    'INSERT INTO account (id, name, balance) VALUES ($1, $2, $3)',
+    1,
+    'Ada',
+    100
+  );
+  console.log(`inserted ${changes} row`);
 
-// run() binds native JS params to $1, $2, … and returns a command tag ({ changes, cost }). Values
-// convert automatically: an integer-valued number → int, a bigint → int, a string → text, a
-// Uint8Array → bytea, null → NULL. No hand-built Value.
-const { changes } = db.run(
-  'INSERT INTO account (id, name, balance) VALUES ($1, $2, $3)',
-  1,
-  'Ada',
-  100
-);
-console.log(`inserted ${changes} row`);
+  const row = await db.get('SELECT balance FROM account WHERE id = $1', 1);
+  console.log(`balance = ${row?.balance}`);
 
-// get() returns the first row as a plain object keyed by output column name (or undefined). Result
-// values map int → bigint (i64 is exact — jed's identity), the other scalars to their JS type.
-const row = db.get('SELECT balance FROM account WHERE id = $1', 1);
-console.log(`balance = ${row?.balance}`); // 100n — a bigint
-
-// prepare() returns a reusable Statement; all() materializes every row, *iterate() yields lazily.
-const stmt = db.prepare('SELECT id, name FROM account ORDER BY id');
-for (const acct of stmt.iterate()) {
-  console.log(`${acct.id}: ${acct.name}`);
+  // Preparation lives in the worker. get/all/run accept native JS parameters;
+  // query accepts typed Value[] and yields typed rows through async iteration.
+  const stmt = await db.prepare('SELECT id, name FROM account ORDER BY id');
+  try {
+    for await (const acct of await stmt.query()) {
+      console.log(`${render(acct[0])}: ${render(acct[1])}`);
+    }
+  } finally {
+    await stmt.close();
+  }
+} finally {
+  await db.close();
 }
-
-db.close();
