@@ -12,7 +12,7 @@ module JedNative
     def alter_table(stmt)
       return Result.new if stmt[:if_exists] && !@tables.key?(stmt[:name])
       original = table(stmt[:name])
-      t = original.merge(columns: original[:columns].map(&:dup), constraints: Marshal.load(Marshal.dump(original[:constraints])), indexes: Marshal.load(Marshal.dump(original[:indexes] || [])), rows: original[:rows].map(&:dup))
+      t = original.merge(columns: original[:columns].map(&:dup), constraints: Marshal.load(Marshal.dump(original[:constraints])), indexes: copy_index_definitions(original[:indexes] || []), rows: original[:rows].map(&:dup))
       name_schema_constraints(t)
       prior_constraints = t[:constraints].dup
       scanned = false
@@ -123,7 +123,8 @@ module JedNative
             constraint = action[:constraint].dup
             rekey = true if constraint[:kind] == :primary_key
             raise Error.new('42710', 'duplicate constraint') if constraint[:name] && t[:constraints].any? { |c| c[:name] == constraint[:name] }
-            raise Error.new('42P07', 'relation already exists') if %i[unique exclude].include?(constraint[:kind]) && constraint[:name] && relation_exists?(constraint[:name])
+            own_removed = original[:constraints].any? { |item| item[:name] == constraint[:name] } && t[:constraints].none? { |item| item[:name] == constraint[:name] }
+            raise Error.new('42P07', 'relation already exists') if %i[unique exclude].include?(constraint[:kind]) && constraint[:name] && relation_exists?(constraint[:name]) && !own_removed
             raise Error.new('42P16', 'multiple primary keys') if constraint[:kind] == :primary_key && t[:constraints].any? { |c| c[:kind] == :primary_key }
             (constraint[:columns] || []).each do |name|
               column = t[:columns].find { |item| item[:name] == name }
@@ -328,7 +329,8 @@ module JedNative
     end
 
     def identity_default(name)
-      { kind: :call, name: 'nextval', args: [{ kind: :literal, type: 'text', value: name }] }
+      spelling = name.match?(/\A[a-z_][a-z_0-9]*\z/) ? name : SQLRender.identifier(name)
+      { kind: :call, name: 'nextval', args: [{ kind: :literal, type: 'text', value: spelling }] }
     end
 
     def create_owned_sequence(table, column, ordinal, options, reserved: [])
@@ -389,6 +391,16 @@ module JedNative
           name = column[:default][:args].first[:value]
           @sequences[name] = sequence_definition(options.merge(type: column[:type]), @sequences.fetch(name))
         end
+      end
+    end
+
+    def copy_index_definitions(value)
+      case value
+      when Hash
+        value.to_h { |key, item| [key, key.to_s.start_with?('storage_') ? item : copy_index_definitions(item)] }
+      when Array then value.map { |item| copy_index_definitions(item) }
+      when String then value.dup
+      else value
       end
     end
 

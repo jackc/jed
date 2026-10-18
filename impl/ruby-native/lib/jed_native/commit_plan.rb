@@ -25,7 +25,7 @@ module JedNative
   # Encoding is a preparation step: neither the file nor a node's committed page
   # identity changes until every page and manifest has been validated and synced.
   class CommitPlan
-    attr_reader :pages, :root, :live, :allocator, :assignments, :live_pages, :overflow_ids
+    attr_reader :pages, :root, :live, :allocator, :assignments, :live_pages, :overflow_ids, :table_catalog
 
     def initialize(codec, snapshot, page_size, allocator, page_ids: {}.compare_by_identity, overflow_ids: {}.compare_by_identity)
       @codec, @page_size, @allocator = codec, page_size, allocator
@@ -40,6 +40,7 @@ module JedNative
       snapshot.fetch(:sequences, []).sort_by { |sequence| sequence[:name].b }.each { |sequence| entries << "\x02".b + @codec.sequence_entry_bytes(sequence) }
       snapshot.fetch(:collations, []).sort_by { |collation| collation[:name].b }.each { |collation| entries << "\x03".b + @codec.collation_entry_bytes(collation) }
       tables = snapshot.fetch(:tables, []).sort_by { |table| table[:name].b }
+      @table_catalog = []
       tables.each do |table|
         tree = table.key?(:physical_tree) ? table[:physical_tree] : fresh_table_tree(table)
         data_root = write_tree(tree)
@@ -53,7 +54,11 @@ module JedNative
             write_tree(tree)
           end
         end
-        entries << "\x00".b + @codec.table_entry_bytes(table, data_root, roots, table[:row_count] || table[:rows].length)
+        encoded = @codec.table_entry_bytes(table, data_root, roots, table[:row_count] || table[:rows].length)
+        metadata, = @codec.decode_table_entry(encoded, 0)
+        metadata[:statistics] = table[:statistics] if table[:statistics]
+        @table_catalog << metadata
+        entries << "\x00".b + encoded
       end
       tables.each { |table| entries.concat(@codec.statistics_entries(table)) }
       snapshot.fetch(:views, []).sort_by { |view| view[:name].b }.each { |view| entries << "\x05".b + @codec.view_entry_bytes(view) }
@@ -101,6 +106,7 @@ module JedNative
 
     def tree_live_pages(node)
       return 0 unless node
+      return 1 + node[:overflow_pages].length if node.is_a?(PagedLeaf)
       if node[:children].empty?
         1 + node[:recs].sum do |record|
           record[:forms].each_with_index.sum do |form, column|

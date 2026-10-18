@@ -54,9 +54,8 @@ module JedNative
         unknown = false
         values.each do |right|
           charge
-          scalar_work(expr_operator = expression.extra[:op], left, right)
-          charge if [expression.args[0].type, expression.args[1].type.delete_suffix('[]')].sort == %w[f32 f64]
-          value = Types.binary(expr_operator, left, right, type: 'boolean')
+          scalar_work(expression.extra[:op], left, right) if left.is_a?(Decimal) || right.is_a?(Decimal)
+          value = Types.binary(expression.extra[:op], left, right, type: 'boolean')
           return !all if value == !all
           unknown ||= value.nil?
         end
@@ -65,7 +64,7 @@ module JedNative
         charge
         left = evaluate(expression.args.first, row, group)
         data = expression.extra
-        choices = if data[:correlated]
+        choices = if data[:correlated] || data[:native_unfolded]
                     query_relation = correlated(data[:scope], row) { select(expression.value) }
                     query_relation.rows
                   else data[:rows]
@@ -76,7 +75,7 @@ module JedNative
         choices.each do |values|
           charge
           right = data[:row_value] ? values : values.first
-          scalar_work(data[:op], left, right) unless data[:row_value]
+          scalar_work(data[:op], left, right) if !data[:row_value] && (left.is_a?(Decimal) || right.is_a?(Decimal))
           value = data[:row_value] ? compare_sql_rows(data[:op], left, right) : Types.binary(data[:op], left, right, type: 'boolean')
           unknown ||= value.nil?
           if all
@@ -149,20 +148,11 @@ module JedNative
         raise Error.new('42883', 'quantified comparison has incompatible operands') if quantified && error.sqlstate == '42804'
         raise
       end
-      rows = hoisted_query(query).rows unless metadata[:correlated]
-      if !quantified && !row_value && !metadata[:correlated]
-        return Expression.new(kind: :literal, type: 'boolean', value: !!node[:negated], extra: { subquery_origin: true }) if rows.empty?
-        comparisons = rows.map do |values|
-          right = Expression.new(kind: :literal, type: metadata[:columns].first[:type], value: values.first, extra: { subquery_origin: true })
-          arguments = [left, right]
-          arguments = arguments.map { |argument| widen_float(argument) } if arguments.map(&:type).sort == %w[f32 f64]
-          Expression.new(kind: :binary, type: 'boolean', value: '=', args: arguments)
-        end
-        expression = comparisons.reduce { |a, b| Expression.new(kind: :binary, type: 'boolean', value: 'or', args: [a, b]) }
-        return node[:negated] ? Expression.new(kind: :unary, type: 'boolean', value: 'not', args: [expression]) : expression
-      end
+      deferred = @native_derived_membership && !metadata[:correlated]
+      rows = hoisted_query(query).rows unless metadata[:correlated] || deferred
       Expression.new(kind: :query_membership, type: 'boolean', value: query, args: [left],
                      extra: { scope: columns, correlated: metadata[:correlated], rows: rows, row_value: row_value,
+                              native_unfolded: deferred, element_type: metadata[:columns].first[:type],
                               quantified: quantified, quantifier: quantified ? node[:quantifier] : 'any',
                               op: quantified ? node[:op] : '=', negated: node[:negated] })
     end

@@ -22,17 +22,26 @@ end
 
 `JedNative.create(path)` and `JedNative.open(path)` use the shared v49 file format
 and a pure Ruby `flock` host. The current host takes exclusive protocol-v2 ownership;
-page-service clients are not implemented. Commits append complete snapshots and
-validated content manifests. Incremental domain persistence, bounded residency,
-and page reuse remain unfinished. `locking: :none` is only for hosts that already
-exclude every other opener.
+page-service clients are not implemented. Commits persist changed tree paths with
+validated content manifests, reuse eligible pages, and publish changed attachment
+domains independently. File reads use lazy rows and a bounded page cache; bounded
+write residency is still being implemented. `locking: :none` is only for hosts that
+already exclude every other opener.
 
 `Database#query` and `#execute` accept positional `$N` parameters; `#prepare` creates
-a reusable parsed statement. Results expose `columns`, `column_types`, `rows`,
-`rows_affected`, and `cost`; enumeration yields rows with numeric or name access.
-`#transaction` and `#execute_script` provide atomic block/script execution. Errors
-carry a five-character `sqlstate`. Cost parity and the supported cores' full host
-API are still incomplete. Results currently collect rows eagerly.
+a reusable parsed statement. Each database convenience call uses a fresh session.
+Use `db.session` for session settings, temporary objects, or SQL transactions;
+`db.read_session` pins a committed snapshot. Sessions expose `#transaction` and
+`#execute_script` for atomic block/script execution. Errors carry a five-character
+`sqlstate`.
+
+`#query` and `#query_prepared` return a lazy `Rows` enumerable for reads. Rows have
+numeric and name access. Exhausting enumeration or calling `#close` releases the
+snapshot; `#rows` drains and collects the result. `columns` and `column_types` are
+available before iteration, while `cost` advances as the cursor runs. `#execute`
+and `#execute_prepared` eagerly collect the result and expose its final cost and
+`rows_affected`. Cost parity and the supported cores' full host API are still
+being verified.
 
 Only explicitly selected tasks run this experiment:
 

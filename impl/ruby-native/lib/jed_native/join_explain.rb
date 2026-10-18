@@ -30,7 +30,7 @@ module JedNative
         scope = analyzer.relation_columns(source)
         predicate = source[:native_access_predicate] && plan_compile(source[:native_access_predicate], scope)
         access = index == 1 && plan[:index] ? plan[:index][:access] : plan[:scans][index]
-        node = plan_scan(stored, predicate, statement, access)
+        node = plan_scan(stored, predicate, statement.merge(native_scan_source: source), access)
         node.phase = nil
         node.actual = 0
         if index == 1 && plan[:index]
@@ -105,8 +105,7 @@ module JedNative
       scopes = [first, second].map { |source| analyzer.relation_columns(source) }
       scope = scopes.flatten
       scans = [first, second].each_with_index.map do |source, index|
-        predicate = source[:native_access_predicate] && plan_compile(source[:native_access_predicate], scopes[index])
-        scan_access_plan(@tables.fetch(source[:name]), predicate)
+        join_scan_candidates(source, scopes[index]).min_by { |access| [access[:pipeline_cost], AccessPlanning::ACCESS_RANK.fetch(access[:kind]), access[:name].to_s.b] }
       end
       on = edge[:on] && plan_compile(edge[:on], scope)
       gate = second[:native_original_on] ? plan_compile(second[:native_original_on], scope) : on
@@ -123,7 +122,8 @@ module JedNative
         index = join_index_plan(Relation.new(columns: scopes[0], rows: []), second, kind, edge[:on], nil, choose: false)
         if index
           algorithm = :index
-          work = left * (index[:access][:scan_cost] + index[:access][:scan_rows] * expression_work(on)) - scans[1][:pipeline_cost]
+          rows = [left, left * index[:access][:output_rows]].max
+          work = left * (index[:access][:scan_cost] + index[:access][:scan_rows] * expression_work(index[:filter]) + index[:access][:output_rows] * expression_work(on)) - scans[1][:pipeline_cost]
         elsif (keys = hash_join_keys(gate, scopes[0].length))
           algorithm = :hash
           bytes = keys.sum { |_, _, type| FileFormat::STORAGE_WIDTH.fetch(type, 1) }

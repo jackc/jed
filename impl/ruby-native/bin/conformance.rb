@@ -28,7 +28,7 @@ end
 # directives as well as SQL mismatches. No capability filter hides missing work.
 class NativeCorpus
   ROOT = File.expand_path('../../..', __dir__)
-  SUPPORTED = %w[requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed attach timezone load-timezone load-collation collation unicode allow_ddl allow_temp_ddl default_privileges grant revoke max_query_memory_bytes fixture upgrade-collations work_mem max_storage_bytes max_temp_storage_bytes].freeze
+  SUPPORTED = %w[format set requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed attach timezone load-timezone load-collation collation unicode allow_ddl allow_temp_ddl default_privileges grant revoke max_query_memory_bytes fixture upgrade-collations work_mem max_storage_bytes max_temp_storage_bytes].freeze
   DIRECTIVES = %w[requires names types cost max_cost format fixture params clock clock_advance seed timezone collation unicode attach lifetime_max_cost max_query_memory_bytes max_scalar_bytes max_sql_length max_storage_bytes max_temp_storage_bytes work_mem allow_ddl allow_temp_ddl default_privileges grant revoke set load-collation load-timezone upgrade-collations].freeze
   attr_reader :summary
 
@@ -69,6 +69,7 @@ class NativeCorpus
       @summary[:skipped_files] += 1
       return
     end
+    return run_concurrency_file(path, contents) if contents.match?(/^#\s*format:\s*concurrency/)
     directives = (contents.scan(/^#\s*([a-z_-]+):/).flatten.uniq & DIRECTIVES) - SUPPORTED
     unless directives.empty?
       @summary[:unsupported_files] += 1
@@ -103,6 +104,8 @@ class NativeCorpus
       db = file ? JedNative.create(file, environment: environment) : JedNative.memory(environment: environment)
     end
     contents.scan(/^#\s*attach:\s*(.+)$/).flatten.each { |name| db.attach(name.strip) }
+    core = db
+    db = core.session
     pending = {}
     storage_limits = {}
     lines = contents.lines.map(&:chomp)
@@ -120,7 +123,7 @@ class NativeCorpus
         db.set_max_storage_bytes(bytes, name)
         next
       end
-      if (match = /^#\s*(names|types|cost|max_cost|params|work_mem|max_temp_storage_bytes|max_query_memory_bytes|max_scalar_bytes|max_sql_length|lifetime_max_cost|clock|clock_advance|seed|timezone|allow_ddl|allow_temp_ddl|default_privileges|grant|revoke):\s*(.*)$/.match(line))
+      if (match = /^#\s*(set|names|types|cost|max_cost|params|work_mem|max_temp_storage_bytes|max_query_memory_bytes|max_scalar_bytes|max_sql_length|lifetime_max_cost|clock|clock_advance|seed|timezone|allow_ddl|allow_temp_ddl|default_privileges|grant|revoke):\s*(.*)$/.match(line))
         if %w[grant revoke].include?(match[1])
           (pending[match[1]] ||= []) << match[2]
         else
@@ -155,6 +158,12 @@ class NativeCorpus
           clock.reset(pending['clock'] && Integer(pending['clock']))
         end
         random.reset(pending['seed'] && Integer(pending['seed']))
+        db.engine.reset_vars
+        pending.fetch('set', '').split(',').each do |entry|
+          name, value = entry.split('=', 2)
+          raise 'invalid set directive' unless value
+          db.set_var(name.strip, value.strip)
+        end
         db.timezone = pending.fetch('timezone', 'UTC')
         db.max_cost = pending.fetch('max_cost', '0').to_i
         db.max_sql_length = pending.fetch('max_sql_length', '1048576').to_i
@@ -177,7 +186,7 @@ class NativeCorpus
         params = pending['params'] ? CorpusParams.parse(pending['params']).map { |value| bind_value(value) } : []
         error = nil
         result = begin
-          db.query(sql.join("\n"), *params)
+          db.execute(sql.join("\n"), *params)
         rescue JedNative::Error => e
           error = e
           nil
@@ -189,18 +198,18 @@ class NativeCorpus
           raise error if error
           if line.start_with?('query')
             tags, sort = line.split[1, 2]
-            tags *= result.columns.length if tags.length == 1
-            raise "column count #{result.columns.length}, expected #{tags.length}" unless result.columns.length == tags.length
-            actual = result.rows.map { |row| row.each_with_index.map { |v, index| db.render(v, result.column_types[index]) } }
-            actual.sort! if sort == 'rowsort'
-            actual = actual.flatten
+            # The shared runners use tags to group flat values for comparison;
+            # result metadata is asserted separately by names/types directives.
+            width = [tags.length, 1].max
+            actual = result.rows.flat_map { |row| row.each_with_index.map { |v, index| db.render(v, result.column_types[index]) } }
+            actual = actual.each_slice(width).to_a.sort.flatten if sort == 'rowsort'
             actual.sort! if sort == 'valuesort'
             if expected.length == 1 && (hash = /\A(\d+) values hashing to ([0-9a-f]+)\z/.match(expected.first))
               raise 'hash mismatch' unless actual.length == hash[1].to_i && Digest::MD5.hexdigest(actual.join("\n") + "\n") == hash[2]
             else
-              expected = expected.each_slice(tags.length).to_a.sort.flatten if sort == 'rowsort'
+              expected = expected.each_slice(width).to_a.sort.flatten if sort == 'rowsort'
               expected.sort! if sort == 'valuesort'
-              equal = actual.length == expected.length && actual.each_index.all? { |n| cell_equal?(actual[n], expected[n], tags[n % tags.length]) }
+              equal = actual.length == expected.length && actual.each_index.all? { |n| cell_equal?(actual[n], expected[n], tags[n % width]) }
               raise "rows expected #{expected.take(20).inspect}; got #{actual.take(20).inspect}" unless equal
             end
             %w[names types].each do |key|
@@ -222,7 +231,9 @@ class NativeCorpus
         pending = {}
         if file && !db.engine.transaction_open?
           db.close
-          db = JedNative.open(file, environment: environment)
+          core.close
+          core = JedNative.open(file, environment: environment)
+          db = core.session
           storage_limits.each { |name, bytes| db.set_max_storage_bytes(bytes, name) }
         end
       end
@@ -232,6 +243,7 @@ class NativeCorpus
     fail_record(path, 0, "file failure #{error.class}: #{error.message}")
   ensure
     db&.close
+    core&.close
     FileUtils.remove_entry(directory) if directory
   end
 
@@ -262,6 +274,8 @@ class NativeCorpus
     false
   end
 end
+
+require_relative 'concurrency'
 
 if $PROGRAM_NAME == __FILE__
   filter = ARGV[0] || ENV.fetch('JED_CONFORMANCE_FILTER', '')

@@ -123,7 +123,7 @@ module JedNative
       type = Types.normalize(type || UNKNOWN)
       return if [UNKNOWN, 'record', 'unknown[]'].include?(type)
       index = node[:index] - 1
-      old = @types[index]
+      old = @types[index] || UNKNOWN
       raise Error.new('42804', 'conflicting parameter types') unless old == UNKNOWN || old == type
       @types[index] = type
       (@modifiers[index] ||= []) << modifier if modifier && !(@modifiers[index] || []).include?(modifier)
@@ -171,9 +171,9 @@ module JedNative
             scope.select { |column| !column[:star_hidden] && (expr[:table] ? column[:table] == expr[:table] : !column[:qualified_only] && column[:binding_scope] == @scope_depth) }
           elsif expr[:kind] == :field_star
             type = expression(expr[:expr], scope)
-            @engine.instance_variable_get(:@types)[type] || raise(Error.new('42809', 'star requires a composite value'))
+            @engine.instance_variable_get(:@types)[type] || record_fields(expr[:expr], scope) || raise(Error.new('42809', 'star requires a composite value'))
           else
-            [{ name: projection[:alias] || @engine.expression_name(expr), type: expression(expr, scope) }]
+            [{ name: projection[:alias] || @engine.expression_name(expr), type: expression(expr, scope), record_fields: record_fields(expr, scope) }]
           end
         end
         group_output = output.map { |column| column.merge(binding_scope: @scope_depth - 0.5) }
@@ -190,11 +190,11 @@ module JedNative
         width = rows.first&.length || 0
         Array.new(width) do |i|
           nodes = rows.map { |row| row[i] }
-          { name: "column#{i + 1}", type: unify(nodes, outer) }
+          { name: "column#{i + 1}", type: unify(nodes, outer), record_fields: common_record_fields(nodes.map { |item| record_fields(item, outer) }) }
         end
       when :set_operation, :setop
         left, right = statement(node[:left], outer), statement(node[:right], outer)
-        left.each_with_index.map { |column, i| column.merge(type: common(column[:type], right[i]&.dig(:type))) }
+        left.each_with_index.map { |column, i| column.merge(type: common(column[:type], right[i]&.dig(:type)), record_fields: common_record_fields([column[:record_fields], right[i]&.dig(:record_fields)])) }
       when :insert, :update, :delete
         view = @engine.instance_variable_get(:@views)[node[:table]]
         table = view ? { name: node[:table], columns: @engine.send(:view_schema, view) } : @engine.table(node[:table])
@@ -279,6 +279,7 @@ module JedNative
         end
       else []
       end
+      raise Error.new('42P10', 'too many relation column aliases') if node[:columns] && node[:columns].length > columns.length
       columns.each_with_index.map { |column, i| column.merge(table: name || column[:table], name: node[:columns]&.[](i) || column[:name]) }
     end
 
@@ -356,10 +357,14 @@ module JedNative
         return 'boolean' if node[:kind] == :exists
         type = columns.first&.dig(:type) || UNKNOWN
         node[:kind] == :array_query ? type + '[]' : type
+      when :rollup, :cube, :grouping_sets
+        node[:sets].flatten(1).each { |item| expression(item, scope) }
+        UNKNOWN
       when :collate then expression(node[:expr], scope, wanted)
       when :field
         type = expression(node[:expr], scope)
-        @engine.instance_variable_get(:@types)[type]&.find { |field| field[:name] == node[:name] }&.dig(:type) || UNKNOWN
+        fields = @engine.instance_variable_get(:@types)[type] || record_fields(node[:expr], scope)
+        fields&.find { |field| field[:name] == node[:name] }&.dig(:type) || UNKNOWN
       when :subscript
         type = expression(node[:expr], scope)
         (node[:specs] || []).each { |spec| spec.each_value { |v| expression(v, scope, 'i64') if v.is_a?(Hash) } }
@@ -513,8 +518,8 @@ module JedNative
       else
         binding = ParameterBindings.new(self, statement)
         binding.validate_schema_parameters
-        raise Error.new('42601', 'bind parameter count mismatch') unless @params.length == binding.count
         binding.resolve
+        raise Error.new('42601', 'bind parameter count mismatch') unless @params.length == binding.count
         @native_binding_plans.shift if @native_binding_plans.length >= 64
         @native_binding_plans[statement] = [schema, binding]
       end

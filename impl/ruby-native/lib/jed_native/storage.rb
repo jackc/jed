@@ -2,6 +2,8 @@
 
 require_relative "error"
 require_relative "file_format"
+require_relative "paged_rows"
+require_relative "paged_auxiliary"
 require_relative "commit_plan"
 require_relative "free_list_plan"
 
@@ -16,6 +18,7 @@ module JedNative
     PAGE_SIZES = (8..16).map { |exponent| 1 << exponent }.freeze
 
     attr_reader :path, :page_size, :meta
+    attr_writer :reader_watermark_provider
     def read_only? = @read_only
     def max_storage_bytes=(bytes)
       raise Error.new('22023', 'max_storage_bytes must be an integer') unless bytes.is_a?(Integer)
@@ -28,11 +31,15 @@ module JedNative
 
     def initialize(path:, create: false, page_size: 8192, locking: :exclusive,
                    file_lock_timeout_ms: 5000, fsync: true, read_only: false,
-                   max_storage_bytes: 0, collation_key: nil, expression: nil)
+                   max_storage_bytes: 0, cache_bytes: FileImage::DEFAULT_CACHE_BYTES, collation_key: nil, expression: nil)
       @codec = FileFormat.new(collation_key: collation_key, expression: expression)
       @pid = Process.pid
       @sync = fsync
       @read_only = read_only
+      unless cache_bytes.is_a?(Integer) && cache_bytes >= 0
+        raise Error.new('22023', 'cache_bytes must be a nonnegative integer')
+      end
+      @cache_bytes = cache_bytes
       self.max_storage_bytes = max_storage_bytes
       @mutex = Mutex.new
       @closed = false
@@ -75,6 +82,7 @@ module JedNative
       @page_size ||= discover_page_size
       @snapshot = decode_file
       @meta = @snapshot.fetch(:meta)
+      @free_generation = @meta[:txid]
       @free_pages = @snapshot.fetch(:free_pages)
       @live_at_compaction = @meta[:page_count] - @free_pages.length
       @needs_stabilization = !create
@@ -118,6 +126,8 @@ module JedNative
 
         slot = (@meta[:slot] || (@meta[:txid] & 1)) ^ 1
         free_plan = FreeListPlan.new(@codec, plan, @page_size, @live_at_compaction, txid, slot, truncate: @sync)
+        overlay = PageOverlay.new(@image, pages)
+        prepared_snapshot = published_snapshot(snapshot, plan, overlay)
         begin
           if @needs_directory_sync
             sync_directory if @sync
@@ -151,7 +161,10 @@ module JedNative
         @page_ids = plan.adopt
         @overflow_ids = plan.overflow_ids
         @free_pages, @live_at_compaction = free_plan.free, free_plan.live_at_compaction
-        @snapshot = snapshot.merge(meta: @meta)
+        @free_generation = txid
+        @image.invalidate(pages.pages.keys)
+        overlay.publish
+        @snapshot = prepared_snapshot.merge(meta: @meta, free_pages: @free_pages)
         @meta
       end
     end
@@ -168,8 +181,39 @@ module JedNative
 
     private
 
+    # Adopt the already validated commit roots directly. The owner foreground
+    # path neither rereads meta pages nor reparses SQL after its own publication.
+    def published_snapshot(snapshot, plan, image)
+      reader = FileFormat.new(collation_key: @codec.instance_variable_get(:@collation_key), expression: @codec.instance_variable_get(:@expression))
+      reader.instance_variable_set(:@ctypes, snapshot.fetch(:types, []).to_h { |type| [type[:name], type[:fields]] })
+      pool = LeafPool.new(reader, image, @page_size, image.cache_pages)
+      previous = @snapshot.fetch(:tables, []).to_h { |table| [table[:name], table] }
+      tables = plan.table_catalog.map do |entry|
+        old = previous[entry[:name]]
+        rows = if old && old[:root_data_page] == entry[:root_data_page] && old[:columns] == entry[:columns] && old[:rows].is_a?(PagedRows)
+                 old[:rows]
+               else
+                 PagedRows.new(pool, entry[:root_data_page], entry[:columns], entry[:row_count])
+               end
+        entry[:indexes].each do |index|
+          prior = old && old[:indexes].find { |item| item[:name] == index[:name] && item[:root_page] == index[:root_page] }
+          if prior && (prior[:tree_profile] || prior[:gist_profile])
+            index[:tree_profile], index[:gist_profile] = prior.values_at(:tree_profile, :gist_profile)
+          elsif index[:kind] == 'gist'
+            operations = index[:cols].all? { |column| column.is_a?(Integer) } ? reader.gist_opclasses_for(entry, index) : nil
+            index[:gist_profile] = reader.read_gist_tree(image, @page_size, index[:root_page], operations)
+          else
+            index[:tree_profile] = PagedRows.new(pool, index[:root_page], [], nil).profile
+          end
+        end
+        entry.merge(pk_order: entry[:pk], rows: rows, storage_keys: rows.keys, tree_profile: rows.profile)
+      end
+      snapshot.merge(tables: tables, meta: @meta, free_pages: @free_pages, live_pages: plan.live_pages)
+    end
+
     def plan_commit(snapshot)
-      CommitPlan.new(@codec, snapshot, @page_size, PageAllocator.new(@meta.fetch(:page_count), @free_pages),
+      reusable = !@reader_watermark_provider || @reader_watermark_provider.call >= @free_generation
+      CommitPlan.new(@codec, snapshot, @page_size, PageAllocator.new(@meta.fetch(:page_count), reusable ? @free_pages : []),
                      page_ids: @page_ids || {}.compare_by_identity, overflow_ids: @overflow_ids || {}.compare_by_identity)
     rescue NotImplementedError => error
       raise Error.new('0A000', error.message)
@@ -204,8 +248,9 @@ module JedNative
     end
 
     def decode_file
-      image = FileImage.new(@file, @page_size)
-      snapshot = @codec.decode_image(image, page_size: @page_size)
+      image = @image = FileImage.new(@file, @page_size, cache_bytes: @cache_bytes)
+      reader = FileFormat.new(collation_key: @codec.instance_variable_get(:@collation_key), expression: @codec.instance_variable_get(:@expression))
+      snapshot = reader.decode_image(image, page_size: @page_size, lazy: true)
       a = @codec.read_meta(image, @page_size, 0)
       b = @codec.read_meta(image, @page_size, 1)
       snapshot[:meta][:slot] = if a && b && a[:txid] == b[:txid]

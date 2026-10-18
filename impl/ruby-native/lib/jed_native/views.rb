@@ -276,6 +276,9 @@ module JedNative
               raise Error.new('42804', 'view default has incompatible type') unless compatible || literal && source == 'text'
               if expr.kind == :literal && expr.value.nil?
                 view[:defaults].delete(column[:name])
+              elsif expr.kind == :literal
+                value = cast_value(expr.value, column[:type], source_type: expr.type)
+                view[:defaults][column[:name]] = { kind: :literal, type: column[:type], value: value }
               else
                 view[:defaults][column[:name]] = action[:expr]
               end
@@ -808,6 +811,9 @@ module JedNative
         next view unless view_dependencies(view).key?(old_name)
         query = Marshal.load(Marshal.dump(view[:query]))
         visit_view_nodes(query) do |node|
+            if node[:view_binding]
+              node[:view_binding] = node[:view_binding].map { |relation, column, label| [relation == old_name ? new_name : relation, column, label] }
+            end
             if node[:kind] == :table && node[:name] == old_name && node[:view_bound_relation]
               node[:name] = new_name
               node[:quoted] = true
@@ -837,6 +843,9 @@ module JedNative
     def rewrite_bound_view_column(query, relation, old_name, new_name)
       return query.map { |item| rewrite_bound_view_column(item, relation, old_name, new_name) } if query.is_a?(Array)
       return query unless query.is_a?(Hash)
+      if query[:view_binding]
+        query = query.merge(view_binding: query[:view_binding].map { |bound_relation, column, label| [bound_relation, bound_relation == relation && column == old_name ? new_name : column, label] })
+      end
       if query[:kind] == :table && query[:name] == relation && query[:view_bound_relation]
         columns = @tables[relation] ? @tables[relation][:columns] : view_schema(@views[relation])
         aliases = columns.each_with_index.map { |column, index| query[:columns]&.[](index) || (column[:name] == new_name ? old_name : column[:name]) }

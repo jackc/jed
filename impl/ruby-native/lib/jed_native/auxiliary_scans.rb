@@ -208,15 +208,15 @@ module JedNative
           finish = start + 1
           while finish < candidates.length
             bound = next_term + row_keys[candidates[finish]]
-            break if gin_page_count(stored, name, lower, prefix_successor(bound)) != height
+            break if gin_page_count(stored, name, lower, bound + "\0".b) != height
             finish += 1
           end
           upper_probe = next_term + row_keys[candidates[finish - 1]]
           last_run = entries.bsearch_index { |key, _| key >= upper_probe }
           upper = if last_run && entries[last_run][0].start_with?(next_term)
-            prefix_successor(entries[last_run][0])
+            entries[last_run][0] + "\0".b
           else
-            prefix_successor(upper_probe)
+            upper_probe + "\0".b
           end
           charge(gin_page_count(stored, name, lower, upper) + finish - start)
           (start...finish).each { |index| survivors << candidates[index] if posting_set[candidates[index]] }
