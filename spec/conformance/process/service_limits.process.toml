@@ -23,12 +23,31 @@ actor = "b"
 command = "start"
 argument = "open"
 
+# b holds a read pin while c tries to connect, so its connection is busy, not idle, and keeps the one
+# slot however long the steps take. Were b idle here, a loaded machine could let its 300 ms
+# idle-session timeout lapse before c's open, freeing the slot. Should b's connection already have
+# idled out before this step, the read reconnects it.
+[[step]]
+actor = "b"
+command = "read_open"
+
+[[step]]
+actor = "b"
+command = "read_query_i64"
+sql = "SELECT id FROM t"
+expect = "1"
+
 [[step]]
 actor = "c"
 command = "start"
 argument = "open"
 expect_error = "53300"
 
+[[step]]
+actor = "b"
+command = "read_close"
+
+# Idle between transactions past the timeout: the owner closes b's connection.
 [[step]]
 actor = "b"
 command = "sleep"
