@@ -1,4 +1,4 @@
-# GIN posting-run vectors (../design/gin.md §4.5, format_version 43). A GIN entry tree record is a
+# GIN posting-run vectors (../design/gin.md §4.5, format_version 47). A GIN entry tree record is a
 # RUN of one term's posting list:
 #
 #   run  = term ‖ last ‖ body ‖ u16 BE len(body)

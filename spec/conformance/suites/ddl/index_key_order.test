@@ -8,7 +8,7 @@
 # inference (which ignores the order), and foreign keys referencing or served by a DESC index all
 # behave exactly as over an ASC index. Every keyable type is exercised under DESC, including the
 # variable-width / container keys whose inverted bodies must still be self-delimiting.
-# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.gin_index, ddl.gist_index, ddl.foreign_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.limit, query.is_null, types.i32, types.text, types.decimal, types.bytea, types.uuid, types.interval, types.f64, types.timestamp, types.date, types.boolean, types.array, types.range, types.composite
+# requires: ddl.index_key_order, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.gin_index, ddl.gin_multi_column, ddl.gist_index, ddl.foreign_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.limit, query.is_null, types.i32, types.text, types.decimal, types.bytea, types.uuid, types.interval, types.f64, types.timestamp, types.date, types.boolean, types.array, types.range, types.composite
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text, arr i32[], r int4range)
@@ -52,6 +52,10 @@ CREATE INDEX t_gin ON t USING gin (arr ASC)
 
 statement error 0A000
 CREATE INDEX t_gin ON t USING gin (arr NULLS FIRST)
+
+# a multi-column GIN rejects an option on any key element, not only the first
+statement error 0A000
+CREATE INDEX t_gin ON t USING gin (arr, arr DESC)
 
 statement error 0A000
 CREATE INDEX t_gist ON t USING gist (r DESC)

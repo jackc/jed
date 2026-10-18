@@ -454,7 +454,7 @@ bound's rows and `gin_entry` come from its column's facts unchanged; only its pa
 against the index's total entries, the sum of every key column's estimated term occurrences (a column
 without term facts contributes none).
 
-### 4.5 Posting runs (`format_version` 43)
+### 4.5 Posting runs (`format_version` 47)
 
 The entry tree does not store one record per `(term, row)` posting. Each term's posting list — its
 storage keys, ascending — is cut into **runs**, and each run is one record whose key is:
@@ -765,11 +765,11 @@ exactly as a table tree — is unchanged ([indexes.md §6](indexes.md)); a GIN e
 bytes* differ (term ‖ storage-key, §4), but the page/record framing does not. Each version
 is a clean break (CLAUDE.md §1); a reader accepts only version 13.
 
-**Multi-column GIN (`format_version` 43).** The catalog entry is unchanged — its key ordinal list
+**Multi-column GIN (`format_version` 47).** The catalog entry is unchanged — its key ordinal list
 already holds several columns — but a reader now admits a GIN index with 1–32 key columns (each with
 a GIN operator class; anything else is `XX001`), and a multi-column index's entries carry the column
 tag of §4.4. Older readers would misread such an index, hence the version bump; every single-column
-GIN is byte-identical to v42 in its terms. The same version stores every GIN tree's records as the
+GIN is byte-identical to v46 in its terms. The same version stores every GIN tree's records as the
 posting runs of §4.5, so every GIN golden's tree changed; `fixtures/gin_multi_table.jed` pins the
 tagged runs of a GIN over an `i32[]` and a `jsonb` column.
 

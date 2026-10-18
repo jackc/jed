@@ -504,7 +504,7 @@ func ginDecimalByteaTableDB(t *testing.T) *Session {
 	return db
 }
 
-// ginMultiTableDB is the v43 multi-column GIN golden (gin.md §4.4): every entry is column_tag ‖ term
+// ginMultiTableDB is the v47 multi-column GIN golden (gin.md §4.4): every entry is column_tag ‖ term
 // ‖ storage key over an i32[] and a jsonb column; NULL and empty values contribute nothing. Mirrors
 // verify.rb's GIN_MULTI_TABLE.
 func ginMultiTableDB(t *testing.T) *Session {
