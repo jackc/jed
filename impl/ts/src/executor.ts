@@ -3692,6 +3692,10 @@ export class Engine {
     }
     const cloneAttached = (m: Map<string, Snapshot> | undefined): Map<string, Snapshot> | undefined =>
       m === undefined ? undefined : new Map([...m].map(([k, v]) => [k, v.clone()]));
+    const forgetStagedKeys = (): void => {
+      tx.working.forgetStagedKeys();
+      if (tx.attachWorking !== undefined) for (const snap of tx.attachWorking.values()) snap.forgetStagedKeys();
+    };
     if (op === "define") {
       frames.push({
         name,
@@ -3704,6 +3708,9 @@ export class Engine {
         sessionSeq: new Map(this.session.sessionSeq),
         sessionLastName: this.session.sessionLastName,
       });
+      // The frame now holds the staged versions too, so a later rewrite or delete must not return
+      // their bytes (memory.md §7.2).
+      forgetStagedKeys();
     } else if (op === "release") {
       frames.length = at;
     } else {
@@ -3718,6 +3725,8 @@ export class Engine {
       tx.attachDirty = f.attachDirty === undefined ? undefined : new Set(f.attachDirty);
       this.session.sessionSeq = new Map(f.sessionSeq);
       this.session.sessionLastName = f.sessionLastName;
+      // The frame stays on the stack and keeps holding its versions (memory.md §7.2).
+      forgetStagedKeys();
       tx.failed = false; // recovery: the block is usable again
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };

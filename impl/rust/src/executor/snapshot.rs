@@ -1412,6 +1412,22 @@ impl Snapshot {
             .fold(0i64, |sum, store| sum.saturating_add(store.staged_bytes()))
     }
 
+    /// Forget every store's per-key staged record, keeping the balance (memory.md §7.2): run when a
+    /// savepoint frame starts sharing this snapshot's staged versions. Copies a store map only when
+    /// one of its stores records a key.
+    pub(crate) fn forget_staged_keys(&mut self) {
+        if self.stores.values().any(|s| s.has_staged_keys()) {
+            for store in std::sync::Arc::make_mut(&mut self.stores).values_mut() {
+                store.forget_staged_keys();
+            }
+        }
+        if self.index_stores.values().any(|s| s.has_staged_keys()) {
+            for store in std::sync::Arc::make_mut(&mut self.index_stores).values_mut() {
+                store.forget_staged_keys();
+            }
+        }
+    }
+
     /// Clear every store's staged bytes: this working snapshot is being published by a commit
     /// (memory.md §7). Copies a store map only when one of its stores changed since publication.
     pub(crate) fn clear_staged(&mut self) {

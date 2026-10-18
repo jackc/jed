@@ -166,6 +166,13 @@ export class TableStore {
     this.stagedKeys = new PMap();
   }
 
+  // forgetStagedKeys forgets which staged version each key holds, keeping the balance (memory.md
+  // §7.2): a savepoint frame now shares those versions, so a later rewrite or delete cannot release
+  // them.
+  forgetStagedKeys(): void {
+    if (!this.stagedKeys.isEmpty()) this.stagedKeys = new PMap();
+  }
+
   // stage records key's new version as staged with stored bytes, returning the bytes of the staged
   // version it displaces, if any (memory.md §7.1): the pending bytes are net.
   private stage(key: Uint8Array, stored: number): void {

@@ -1460,6 +1460,15 @@ impl ActiveTx {
         }
     }
 
+    /// Forget the per-key staged record of every pending domain (main and attachments), keeping the
+    /// balance: a savepoint frame shares the staged versions (memory.md §7.2).
+    fn forget_staged_keys(&mut self) {
+        self.working.forget_staged_keys();
+        for snap in self.attach_working.values_mut() {
+            snap.forget_staged_keys();
+        }
+    }
+
     /// The index of the newest savepoint named exactly `name` (names shadow — PostgreSQL).
     fn find_savepoint(&self, name: &str) -> Option<usize> {
         self.savepoints.iter().rposition(|f| f.name == name)

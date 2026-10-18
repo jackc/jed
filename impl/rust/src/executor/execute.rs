@@ -1109,6 +1109,9 @@ impl Engine {
                     session_last_name: self.session.session_last_name.clone(),
                 };
                 tx.savepoints.push(frame);
+                // The frame now holds the staged versions too, so a later rewrite or delete must not
+                // return their bytes (memory.md §7.2).
+                tx.forget_staged_keys();
             }
             SavepointOp::Release => {
                 let Some(at) = tx.find_savepoint(name) else {
@@ -1133,6 +1136,8 @@ impl Engine {
                 tx.attach_dirty = frame.attach_dirty.clone();
                 self.session.session_seq = frame.session_seq.clone();
                 self.session.session_last_name = frame.session_last_name.clone();
+                // The frame stays on the stack and keeps holding its versions (memory.md §7.2).
+                tx.forget_staged_keys();
                 // Recovery: the block is usable again. The flag is cleared in place, so a cursor
                 // born earlier in the block still poisons it if its drain later fails.
                 tx.failed.store(false, std::sync::atomic::Ordering::Relaxed);

@@ -603,9 +603,10 @@ snapshots restores, together:
 - the writes to each host-attached database, including the absence of any write
   ([attached-databases.md](attached-databases.md) §5);
 - the pending-write bytes ([memory.md](memory.md) §7). They are counted per store and travel with
-  the snapshots, so after `ROLLBACK TO` the balance is the frame's. The balance is cumulative, so
-  the older versions a frame retains were already charged when they were staged; savepoints add
-  no unaccounted residency.
+  the snapshots, so after `ROLLBACK TO` the balance is the frame's. A frame shares the versions
+  staged before it, so `SAVEPOINT` and `ROLLBACK TO` forget the per-key record that makes the
+  balance net (memory.md §7.2): a later rewrite or delete of such a version returns nothing, and
+  savepoints add no unaccounted residency.
 
 Prepared-plan caches need no invalidation. A cache entry is filled only from committed state
 ([api.md](api.md) §2.4), and catalog generations and estimator revisions are snapshot fields: after

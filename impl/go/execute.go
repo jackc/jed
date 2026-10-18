@@ -476,6 +476,9 @@ func (db *engine) savepointStmt(sp *savepointStmt) (outcome, error) {
 			sessionSeq:      cloneSeqState(db.session.sessionSeq),
 			sessionLastName: db.session.sessionLastName,
 		})
+		// The frame now holds the staged versions too, so a later rewrite or delete must not return
+		// their bytes (memory.md §7.2).
+		tx.forgetStagedKeys()
 	case savepointRelease:
 		tx.savepoints = tx.savepoints[:at]
 	case savepointRollbackTo:
@@ -490,9 +493,20 @@ func (db *engine) savepointStmt(sp *savepointStmt) (outcome, error) {
 		tx.attachDirty = cloneBoolSet(f.attachDirty)
 		db.session.sessionSeq = cloneSeqState(f.sessionSeq)
 		db.session.sessionLastName = f.sessionLastName
+		// The frame stays on the stack and keeps holding its versions (memory.md §7.2).
+		tx.forgetStagedKeys()
 		tx.failed = false // recovery: the block is usable again
 	}
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
+}
+
+// forgetStagedKeys forgets the per-key staged record of every pending domain (main and
+// attachments), keeping the balance: a savepoint frame shares the staged versions (memory.md §7.2).
+func (tx *activeTx) forgetStagedKeys() {
+	tx.working.forgetStagedKeys()
+	for _, snap := range tx.attachWorking {
+		snap.forgetStagedKeys()
+	}
 }
 
 // cloneSnapshots clones each snapshot of a per-attachment working map (nil stays nil).

@@ -576,9 +576,12 @@ bounded by the page reads the write performed, which `max_cost` meters.
 
 The bytes belong to the transaction's working snapshots, the main database's and
 each attached database's ([attached-databases.md](attached-databases.md) §5), and
-travel with them. A `ROLLBACK TO` a savepoint restores the balance the savepoint
-saw ([transactions.md](transactions.md) §11); the versions a savepoint retains were
-staged before it, so the cumulative balance already counts them. A rollback, a failed block's COMMIT, or a failed autocommit
+travel with them. A savepoint frame shares the versions staged before it
+([transactions.md](transactions.md) §11), so `SAVEPOINT` and `ROLLBACK TO` keep the balance but
+forget the per-key record (§7.1): a later rewrite or delete of a version a frame holds returns
+nothing, because the frame still holds it, while versions staged after the newest savepoint stay
+net. `ROLLBACK TO` restores the balance the savepoint saw. The record stays forgotten after
+`RELEASE` (conservative). A rollback, a failed block's COMMIT, or a failed autocommit
 statement discards them; a commit releases them. Session-local temp tables are
 excluded, since `max_temp_storage_bytes` bounds them ([temp-tables.md](temp-tables.md) §7).
 Bytes are tracked whether or not a budget is active, so a budget set in the middle

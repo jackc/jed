@@ -266,6 +266,17 @@ impl TableStore {
         self.staged_keys = PMap::new();
     }
 
+    /// Forget which staged version each key holds, keeping the balance (memory.md §7.2): a savepoint
+    /// frame now shares those versions, so a later rewrite or delete cannot release them.
+    pub(crate) fn forget_staged_keys(&mut self) {
+        self.staged_keys = PMap::new();
+    }
+
+    /// Whether the store records any staged key.
+    pub(crate) fn has_staged_keys(&self) -> bool {
+        !self.staged_keys.is_empty()
+    }
+
     /// Record `key`'s new version as staged with `stored` bytes, returning the bytes of the staged
     /// version it displaces, if any (memory.md §7.1): the pending bytes are net.
     fn stage(&mut self, key: &[u8], stored: i64) -> Result<()> {

@@ -200,6 +200,11 @@ func (s *tableStore) clearStaged() {
 	s.stagedKeys = pMap{}
 }
 
+// forgetStagedKeys forgets which staged version each key holds, keeping the balance (memory.md
+// §7.2): a savepoint frame now shares those versions, so a later rewrite or delete cannot release
+// them.
+func (s *tableStore) forgetStagedKeys() { s.stagedKeys = pMap{} }
+
 // stage records key's new version as staged with stored bytes, displacing the staged version it
 // replaces, if any (memory.md §7.1): the pending bytes are net.
 func (s *tableStore) stage(key []byte, stored int64) error {
