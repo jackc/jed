@@ -51,6 +51,10 @@ module JedNative
       end
       profile_accumulate(:scan, @cost - scan_start) if @explain_profile_frames
       scan_resume = @cost if @explain_profile_frames
+      touched = spill_mask(statement, scope) if spill_available?
+      spill_sort = spill_available? && !collated && (!capacity || !keys.all? { |expression| expression.kind == :column } ||
+        scope.each_with_index.any? { |column, index| touched[index] && !%w[i16 i32 i64 f32 f64 boolean date time timestamp timestamptz uuid interval].include?(column[:type]) } ||
+        capacity * (8 + 40 * scope.length) > @work_mem)
       if @query_memory
         owner = query_memory_owner
         output_owner = query_memory_owner if query_memory_collect_result?
@@ -65,8 +69,12 @@ module JedNative
         comparison.zero? ? left[2] <=> right[2] : comparison
       end
       rows = []
+      if spill_sort
+        added_keys = keys.each_index.reject { |index| keys[index].kind == :column }
+        sorter = ExternalSorter.new(self, measure: ->(entry) { LogicalMemory.row_bytes(entry[0] + added_keys.map { |index| entry[1][index] }) }, &compare)
+      end
       ordinal = 0
-      unless limit == 0
+      unless limit == 0 && !collated && !spill_sort
         input.each do |row|
           begin
           charge
@@ -79,7 +87,12 @@ module JedNative
           values = keys.map { |expression| evaluate(expression, row) }
           profile_accumulate(:sort, @cost - sort_start) if @explain_profile_frames
           entry = [row, values, ordinal]
+          entry[0] = row.each_with_index.map { |value, index| touched[index] ? value : nil } if touched && !collated
           ordinal += 1
+          if sorter
+            sorter.push(entry)
+            next
+          end
           if capacity && !collated && rows.length >= capacity
             next unless compare.call(entry, rows.first).negative?
             if @query_memory
@@ -102,7 +115,7 @@ module JedNative
         profile_inherit(:filter, :scan)
         profile_inherit(:sort, predicate ? :filter : :scan)
       end
-      if collated
+      if collated && !sorter
         if capacity
           query_memory_release(owner) if @query_memory
           heap = []
@@ -130,14 +143,17 @@ module JedNative
           rows.each { |entry| query_memory_add(owner, query_memory_collation_bytes(entry[1], owner)) } if @query_memory
         end
       end
-      rows.sort!(&compare)
-      rows = rows.drop(offset)
-      rows = rows.take(limit) if limit
-      output = rows.map do |row, _, _|
+      rows.sort!(&compare) unless sorter
+      ordered = sorter || rows
+      output = []
+      ordered.each_with_index do |entry, index|
+        next if index < offset
+        break if limit && output.length >= limit
+        row = entry[0]
         values = expressions.map { |expression| evaluate(expression, row) }
         query_memory_add_row(output_owner, values, columns) if output_owner
         charge
-        values
+        output << values
       end
       profile_checkpoint(:root) if @explain_profile_frames
       result = Relation.new(columns: columns, rows: output)
@@ -145,6 +161,7 @@ module JedNative
       result
     ensure
       query_memory_release(owner) if @query_memory && owner
+      sorter&.close
       @native_stream_scan, @native_scan_columns = previous if previous
     end
 

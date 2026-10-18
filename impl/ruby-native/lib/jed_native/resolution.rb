@@ -24,7 +24,7 @@ module JedNative
         expression.type = expression.type.sub(/(?:\[\])+\z/, '') + '[]'
       when :cast
         arg = expression.args.first
-        if arg.kind == :literal && (arg.value.nil? || arg.value.is_a?(String))
+        if arg.kind == :literal && arg.value.is_a?(String)
           value = cast_value(arg.value, expression.type, source_type: arg.type)
           value = explicit_modifier(value, expression.type, expression.extra[:type_mod])
           return Expression.new(kind: :literal, type: expression.type, value: value)

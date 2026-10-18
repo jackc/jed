@@ -271,8 +271,8 @@ module JedNative
           (call[:passing] || []).each { |binding| expression(binding[:expr], outer) }
           @engine.json_table_columns(call[:columns])
         elsif defined?(JsonRelations) && JsonRelations::JSON_RELATIONS.include?(call[:name])
-          (call[:args] || []).each { |arg| expression(arg, outer) }
-          @engine.json_relation_columns(node)
+          arguments = (call[:args] || []).map { |arg| Expression.new(kind: :metadata, type: expression(arg, outer)) }
+          @engine.json_relation_columns(node, arguments)
         else
           type = expression(call, outer)
           [{ name: node[:alias] || call[:name] || 'value', type: type.sub(/\[\]\z/, '') }]

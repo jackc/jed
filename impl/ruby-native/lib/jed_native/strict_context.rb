@@ -58,6 +58,7 @@ module JedNative
     def context_assignable?(expression, target)
       source = Types.normalize(expression.type)
       return true if source == target || source == 'unknown'
+      return true if source == 'jsonb' && target == 'json'
       return true if @types[target] && source == 'record'
       return literal_adapts?(expression, target) if expression.kind == :literal && expression.extra&.dig(:untyped)
       if expression.kind == :array && target.end_with?('[]')

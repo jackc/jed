@@ -59,8 +59,8 @@ module JedNative
         filter = where && compile_filter(where, scope)
         outer_rows, inner_rows = scans[outer_index][:output_rows], scans[inner_index][:output_rows]
         pairs = [outer_rows * inner_rows, QueryPlans::MAX_ESTIMATE].min
-        joined_rows = estimate_predicate(pairs, on)
-        output_rows = estimate_predicate(joined_rows, filter)
+        joined_rows = estimate_join_rows(pairs, on, scope, sources)
+        output_rows = estimate_join_rows(joined_rows, filter, scope, sources)
         ordered = join_driver_ordered?(statement, outer, scans[outer_index])
         target = ordered ? join_window_target(statement) : nil
         starts = if ordered && target.zero?
@@ -77,12 +77,12 @@ module JedNative
         nested = common + visited * expression_work(on)
         base = { reverse: outer_index == 1, outer: outer.merge(native_access_plan: scans[outer_index]),
                  inner: inner.merge(native_access_plan: scans[inner_index], native_original_on: original, native_join_where: second[:native_join_where]),
-                 ordered: ordered, target: target, rows: output_rows, join_rows: estimate_predicate(visited, on), output_count: output_work, scans: [scans[outer_index], scans[inner_index]],
+                 ordered: ordered, target: target, rows: output_rows, join_rows: estimate_join_rows(visited, on, scope, sources), output_count: output_work, scans: [scans[outer_index], scans[inner_index]],
                  on: on, filter: filter, sources: [outer, inner] }
         candidates << base.merge(algorithm: :nested, cost: nested)
         if (keys = hash_join_keys(gate, scopes[outer_index].length))
           bytes = keys.sum { |_, _, type| FileFormat::STORAGE_WIDTH.fetch(type, 1) }
-          matches = keys.reduce(visited) { |count, _| (count + 199) / 200 }
+          matches = estimate_join_rows(visited, on, scope, sources)
           cost = common + (inner_rows + starts) * bytes + matches * (bytes + 4 * keys.length + expression_work(on))
           candidates << base.merge(algorithm: :hash, cost: cost, keys: keys)
         end
@@ -111,6 +111,32 @@ module JedNative
     end
 
     private
+
+    def estimate_join_rows(rows, expression, scope, sources)
+      return rows unless expression
+      if expression.kind == :binary && expression.value == 'and'
+        return expression.args.reduce(rows) { |count, term| estimate_join_rows(count, term, scope, sources) }
+      end
+      if expression.kind == :binary && expression.value == 'or'
+        return [rows, expression.args.sum { |term| estimate_join_rows(rows, term, scope, sources) }].min
+      end
+      if expression.kind == :binary && expression.value == '=' && expression.args.all? { |term| term.kind == :column }
+        facts = expression.args.map do |term|
+          column = scope[term.value]
+          source = sources.find { |input| (input[:alias] || input[:name]) == column[:table] }
+          stored = source && @tables[source[:name]]
+          ordinal = stored && stored[:columns].index { |entry| entry[:name] == column[:name] }
+          ordinal && statistics_distribution(stored, ordinal)
+        end
+        if facts.all? { |fact| fact && fact[:ndv] }
+          left, right = facts
+          numerator = left[:nonnull] * right[:nonnull]
+          denominator = left[:rows] * right[:rows] * [left[:ndv], right[:ndv], 1].max
+          return denominator.zero? ? 0 : [QueryPlans::MAX_ESTIMATE, (rows * numerator + denominator - 1) / denominator].min
+        end
+      end
+      estimate_predicate(rows, expression)
+    end
 
     def join_unbound_terms(expression, index, width)
       return unless expression

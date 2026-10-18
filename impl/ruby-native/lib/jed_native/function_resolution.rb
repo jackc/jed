@@ -7,6 +7,8 @@ module JedNative
 
     def needed?(node)
       return false unless node[:kind] == :call && FunctionCatalog::SIGNATURES[node[:name]]
+      return false if JsonImages::JSON_IMAGES.include?(node[:name])
+      return false if Types::RANGES.key?(Types.normalize(node[:name])) || %w[make_timestamp make_timestamptz].include?(node[:name])
       return false if node[:name].start_with?('json') && !%w[json_typeof jsonb_typeof jsonb_array_length].include?(node[:name]) || node[:variadic] || node[:arg_names]
       node[:args].any? { |arg| arg[:kind] == :literal && (arg[:value].nil? || arg[:untyped] && arg[:type] == 'text') } || FunctionCatalog::SIGNATURES[node[:name]].any? { |entry| entry[2] }
     end

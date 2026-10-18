@@ -4,6 +4,7 @@
 require 'json'
 require 'digest'
 require 'tmpdir'
+require 'fileutils'
 require 'timeout'
 require 'time'
 require File.join(ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('..', __dir__)), 'lib/jed_native')
@@ -27,7 +28,7 @@ end
 # directives as well as SQL mismatches. No capability filter hides missing work.
 class NativeCorpus
   ROOT = File.expand_path('../../..', __dir__)
-  SUPPORTED = %w[requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed attach timezone load-timezone load-collation collation unicode allow_ddl allow_temp_ddl default_privileges grant revoke max_query_memory_bytes].freeze
+  SUPPORTED = %w[requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed attach timezone load-timezone load-collation collation unicode allow_ddl allow_temp_ddl default_privileges grant revoke max_query_memory_bytes fixture upgrade-collations work_mem max_storage_bytes max_temp_storage_bytes].freeze
   DIRECTIVES = %w[requires names types cost max_cost format fixture params clock clock_advance seed timezone collation unicode attach lifetime_max_cost max_query_memory_bytes max_scalar_bytes max_sql_length max_storage_bytes max_temp_storage_bytes work_mem allow_ddl allow_temp_ddl default_privileges grant revoke set load-collation load-timezone upgrade-collations].freeze
   attr_reader :summary
 
@@ -64,7 +65,7 @@ class NativeCorpus
   def run_file(path)
     @summary[:files] += 1
     contents = File.read(path)
-    if @mode == 'disk' && contents.match?(/^#\s*skip:\s*disk\b/)
+    if contents.match?(/^#\s*skip:\s*#{@mode}\b/)
       @summary[:skipped_files] += 1
       return
     end
@@ -82,15 +83,44 @@ class NativeCorpus
     environment = JedNative::Environment.new(clock: clock, random: random)
     environment = environment.load_time_zone_data(File.binread(File.join(ROOT, 'spec/tz/fixtures/tzdata.jtz'))) if contents.match?(/^#\s*load-timezone:/)
     environment = environment.load_unicode_data(File.binread(File.join(ROOT, 'spec/collation/fixtures/unicode.jucd'))) if contents.match?(/^#\s*load-collation:/)
-    db = file ? JedNative.create(file, environment: environment) : JedNative.memory(environment: environment)
+    fixture = contents[/^#\s*fixture:\s*(.+)$/, 1]
+    if fixture
+      fixture_path, expected_error = fixture.split(/\s+error\s+/, 2)
+      bytes = File.binread(File.join(ROOT, 'spec', fixture_path.strip))
+      begin
+        if file
+          File.binwrite(file, bytes)
+          db = JedNative.open(file, environment: environment)
+        else
+          db = JedNative.from_image(bytes, environment: environment)
+        end
+      rescue JedNative::Error => error
+        raise unless expected_error && error.sqlstate == expected_error.strip
+        return
+      end
+      raise "expected fixture open error #{expected_error}, got success" if expected_error
+    else
+      db = file ? JedNative.create(file, environment: environment) : JedNative.memory(environment: environment)
+    end
     contents.scan(/^#\s*attach:\s*(.+)$/).flatten.each { |name| db.attach(name.strip) }
     pending = {}
+    storage_limits = {}
     lines = contents.lines.map(&:chomp)
     i = 0
     while i < lines.length
       line = lines[i]
       i += 1
-      if (match = /^#\s*(names|types|cost|max_cost|params|max_query_memory_bytes|max_scalar_bytes|max_sql_length|lifetime_max_cost|clock|clock_advance|seed|timezone|allow_ddl|allow_temp_ddl|default_privileges|grant|revoke):\s*(.*)$/.match(line))
+      if line.match?(/^#\s*upgrade-collations:/)
+        db.upgrade_collations
+        next
+      end
+      if (match = /^#\s*max_storage_bytes:\s*(-?\d+)(?:\s+(\S+))?/.match(line))
+        name, bytes = match[2] || 'main', match[1].to_i
+        storage_limits[name] = bytes
+        db.set_max_storage_bytes(bytes, name)
+        next
+      end
+      if (match = /^#\s*(names|types|cost|max_cost|params|work_mem|max_temp_storage_bytes|max_query_memory_bytes|max_scalar_bytes|max_sql_length|lifetime_max_cost|clock|clock_advance|seed|timezone|allow_ddl|allow_temp_ddl|default_privileges|grant|revoke):\s*(.*)$/.match(line))
         if %w[grant revoke].include?(match[1])
           (pending[match[1]] ||= []) << match[2]
         else
@@ -131,6 +161,8 @@ class NativeCorpus
         db.engine.lifetime_max_cost = pending['lifetime_max_cost'].to_i if pending['lifetime_max_cost']
         db.engine.max_scalar_bytes = pending.fetch('max_scalar_bytes', '67108864').to_i
         db.max_query_memory_bytes = pending.fetch('max_query_memory_bytes', '0').to_i
+        db.max_temp_storage_bytes = pending.fetch('max_temp_storage_bytes', '0').to_i
+        db.work_mem = pending.fetch('work_mem', ENV.fetch('JED_NATIVE_WORK_MEM', JedNative::WorkMemory::DEFAULT_WORK_MEM.to_s)).to_i
         db.engine.allow_ddl = pending.fetch('allow_ddl', 'on') == 'on'
         db.engine.allow_temp_ddl = pending.key?('allow_temp_ddl') ? pending['allow_temp_ddl'] == 'on' : nil
         db.engine.default_privileges = pending.fetch('default_privileges', 'ALL')
@@ -191,6 +223,7 @@ class NativeCorpus
         if file && !db.engine.transaction_open?
           db.close
           db = JedNative.open(file, environment: environment)
+          storage_limits.each { |name, bytes| db.set_max_storage_bytes(bytes, name) }
         end
       end
     end

@@ -89,7 +89,10 @@ module JedNative
         plan[:scan_profile].actual += @cost - scan_start if scan_start
         filter_start = @cost if plan[:filter_profile]
         rows = rows.select { |candidate| evaluate(plan[:filter], candidate) == true } if plan[:filter]
-        plan[:filter_profile].actual += @cost - scan_start if filter_start
+        if filter_start
+          start = plan[:filter_profile].equal?(plan[:scan_profile]) ? filter_start : scan_start
+          plan[:filter_profile].actual += @cost - start
+        end
         relation = Relation.new(columns: plan[:columns], rows: rows)
         query_memory_relation(relation, mask: query_memory_mask(relation.columns)) if @query_memory
         relation

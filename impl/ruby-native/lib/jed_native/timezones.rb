@@ -41,6 +41,7 @@ module JedNative
       elsif name == 'date_trunc' && args[1].is_a?(TimestampValue) && args[1].zoned
         return nil if args.any?(&:nil?)
         unit, value, zone_name = args
+        datetime_unit(unit, truncate: true)
         return value if value.micros.is_a?(Float)
         zone = context.resolve_timezone(zone_name)
         context.charge
@@ -51,6 +52,7 @@ module JedNative
       elsif %w[extract date_part].include?(name) && args[1].is_a?(TimestampValue) && args[1].zoned
         return nil if args.any?(&:nil?)
         unit, value = args
+        unit = datetime_unit(unit)
         return super if unit.downcase == 'epoch' || value.micros.is_a?(Float)
         context.charge
         offset = context.timezone_at(value.micros)[0]

@@ -3,12 +3,14 @@
 require "set"
 require_relative "lz4"
 require_relative "page_buffer"
+require_relative "persistent_tree"
 
 module JedNative
   # Experimental v49 codec. Adapted from the independently handwritten Ruby
   # format verifier; the verifier remains separate and is never loaded here.
   # Instances hold their own composite catalog and decode reachability state.
   class FileFormat
+    include PersistentTrees
     MAGIC = "JEDB".b
     VERSION = 49
     PAGE_HEADER = 16 # v7: the 12-byte v6 header (page_type/item_count/next_page) + a 4-byte per-page crc32 at offset 12
@@ -2096,17 +2098,27 @@ module JedNative
           forms, comps, size = plan_record(t, key, row, cap)
           [key, { key: key, row: row, table: t, forms: forms, comps: comps, size: size }]
         end
-        root_data[ti], next_index = serialize_tree(build_tree(pairs, cap), next_index, cap, data_pages)
+        tree = t.key?(:physical_tree) ? t[:physical_tree] : build_tree(pairs, cap)
+        root_data[ti], next_index = serialize_tree(tree, next_index, cap, data_pages)
         # The table's index trees follow its data tree, in catalog (name) order (format.md
         # "Allocation & incremental commit" / "From-scratch image").
         (t[:indexes] || []).each do |ix|
           r, next_index =
             if ix[:kind] == "gist"
               # The on-disk form is the R-tree (pages 5/6), not the flat leaf B-tree (gist.md §4.1).
-              serialize_gist_index(t, ix, next_index, data_pages)
+              if ix.key?(:physical_gist)
+                ix[:physical_gist] ? gist_serialize(gist_opclasses_for(t, ix), ix[:physical_gist], next_index, data_pages) : [0, next_index]
+              else
+                serialize_gist_index(t, ix, next_index, data_pages)
+              end
             else
-              entries = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
-              serialize_tree(build_tree(entries, cap), next_index, cap, data_pages)
+              tree = if ix.key?(:physical_tree)
+                ix[:physical_tree]
+              else
+                entries = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
+                build_tree(entries, cap)
+              end
+              serialize_tree(tree, next_index, cap, data_pages)
             end
           index_roots[ti] << r
         end
@@ -3036,6 +3048,8 @@ module JedNative
         case pg[:type]
         when PAGE_LEAF
           n = pg[:item_count]
+          overflow_pages = []
+          leaf_fetch = ->(page) { overflow_pages << page; fetch.call(page) }
           leaf_keys, regions = parse_pax_leaf(pg[:payload], n, columns)
           keys_out.concat(leaf_keys) if keys_out
           (0...n).each do |i|
@@ -3059,14 +3073,14 @@ module JedNative
               end
               scan_units[rows.length] = units.freeze unless units.empty?
             end
-            rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c[:type], i, fetch) }
+            rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c[:type], i, leaf_fetch) }
           end
-          { keys: leaf_keys.freeze, children: [].freeze }.freeze if profile
+          { keys: leaf_keys.freeze, children: [].freeze, page: idx, overflow_pages: overflow_pages.freeze }.freeze if profile
         when PAGE_INTERIOR
           n = pg[:item_count]
           children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
           child_nodes = children.map { |cp| walk.call(cp, depth + 1) }
-          { keys: interior_keys(pg).freeze, children: child_nodes.freeze }.freeze if profile
+          { keys: interior_keys(pg).freeze, children: child_nodes.freeze, page: idx }.freeze if profile
         else
           raise "expected a B-tree node page, got type #{pg[:type]}"
         end
@@ -3108,12 +3122,12 @@ module JedNative
           # column directory. parse_pax_leaf returns the keys.
           leaf_keys, = parse_pax_leaf(pg[:payload], pg[:item_count], [])
           leaf_keys.each { |kk| keys << kk }
-          { keys: leaf_keys.freeze, children: [].freeze }.freeze if profile
+          { keys: leaf_keys.freeze, children: [].freeze, page: idx }.freeze if profile
         when PAGE_INTERIOR
           n = pg[:item_count]
           children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
           child_nodes = children.map { |cp| walk.call(cp, depth + 1) }
-          { keys: interior_keys(pg).freeze, children: child_nodes.freeze }.freeze if profile
+          { keys: interior_keys(pg).freeze, children: child_nodes.freeze, page: idx }.freeze if profile
         else
           raise "expected a B-tree node page, got type #{pg[:type]}"
         end
@@ -3329,7 +3343,7 @@ module JedNative
       raise "live page count #{meta[:live]} does not match #{reached.size} reachable pages" unless meta[:live] == reached.size
       raise "a free-list page is reachable" unless (free_pages & reached.to_a).empty?
       { types: types, sequences: sequences, collations: collations, tables: tables,
-        statistics: statistics, views: views, meta: meta, free_pages: free_pages }
+        statistics: statistics, views: views, meta: meta, free_pages: free_pages, live_pages: reached.to_a }
     end
 
     def validate_catalog(types, tables)

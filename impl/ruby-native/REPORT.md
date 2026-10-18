@@ -37,13 +37,17 @@ Executed independent checks include:
   overflow text, a view, updates, and inserts.
 - Immutable timezone and Unicode bundle loading: 16 shared timezone vectors,
   46 shared collation sort-key vectors, casing, and byte round-trips.
-- Logical query-memory scheduling, ownership and pending writes; the current
-  memory audit passes 241 of 242 executable records, with spill still pending.
-- Actual bounded scans and two-input physical join selection: 30/30 bounded
-  LIMIT records and 32/32 P7 join-planning records at this checkpoint.
+- Logical query-memory scheduling, ownership and pending writes: 242/242 memory
+  records and 64/64 disk records, including the 13 spill memory-limit records.
+- Real bounded disk spools, stable external sorting and partitioned aggregate
+  state: 865/865 aggregate records under forced spill with 96-byte `work_mem`.
+- Actual bounded scans and physical join selection: 30/30 bounded LIMIT,
+  32/32 two-input P7 and 94/94 multi-input P8 join-planning records.
+- WHERE contradiction proofs: 58/58 SELECT/UPDATE/DELETE records; ON CONFLICT:
+  349/349 records. Broader SQL and plan coverage remains incomplete.
 
 None of these scoped results establishes whole-core conformance. In particular,
-the remaining SQL planner, deterministic costs, spill/resource accounts, page
+the remaining SQL planner, deterministic costs, storage residency, page
 service, and the full host API still require implementation and verification.
 
 ## Recorded prototype baseline
@@ -90,8 +94,11 @@ coverage results and optimized timings are still pending.
 The engine reads and writes the current v49 shared file format, including
 validated COW content manifests. The current pure Ruby file host takes exclusive
 protocol-v2 ownership with Ruby's built-in `flock`. It does not yet serve or join
-the multi-process page service. Commits append a complete snapshot; page reuse,
-incremental page persistence, and bounded page residency are unfinished. Changed
+the multi-process page service. SQL commits persist changed B-tree paths, retain
+clean page identities, protect current manifest dependencies during free-page
+reuse, and reclaim trailing free pages. Memory and file storage limits use the
+shared page accounting; 48 memory, 35 file and 10 temporary-limit records pass.
+Lazy page/value residency remains unfinished. Changed
 attachment domains persist independently and temporary-only work leaves main
 unchanged.
 Large-file performance must not be inferred from the small in-memory comparison.

@@ -18,7 +18,7 @@ module JedNative
       # This validation cannot execute subquery bodies during plain EXPLAIN.
       plan_compile(statement[:where], original_scope) if statement[:where]
       plan_compile(edges.first[:on], original_scope) if edges.first[:on]
-      sources, edges, filter = rewrite_join_inputs(sources, edges, statement[:where])
+      sources, edges, filter = rewrite_join_inputs(sources, edges, statement[:where]) || [sources, edges, statement[:where]]
       plan = if two_base_join?(sources, edges)
         two_base_join_plan(sources.first, edges.first, filter, statement)
       else
@@ -42,11 +42,11 @@ module JedNative
         source[:native_scan_profile] = node
         if source[:native_pushed_filter]
           expression = plan_compile(source[:native_pushed_filter], scope)
-          detail = @explain_options[:verbose] ? "filter=#{plan_expression(expression)}" : "conjuncts=#{conjunctions(expression).length}"
-          filtered = plan_node('Filter', detail, access[:output_rows], node.cost + node.rows * expression_work(expression), [node])
-          filtered.actual = 0
-          source[:native_filter_profile] = filtered
-          node = filtered
+          detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_compile(source[:native_pushed_filter], original_scope))}" : "filter:conjuncts=#{conjunctions(expression).length}"
+          node.detail += '; ' + detail
+          node.cost += node.rows * expression_work(expression)
+          node.rows = access[:output_rows] * (index == 1 && plan[:index] ? plan[:scans][0][:output_rows] : 1)
+          source[:native_filter_profile] = node
         end
         node
       end
@@ -57,7 +57,7 @@ module JedNative
       detail = edges.first[:kind].to_s.sub('_outer', '')
       detail += "; keys=#{plan[:keys].length}" if plan[:algorithm] == :hash
       if plan[:on]
-        detail += @explain_options[:verbose] ? "; on=#{plan_expression(plan[:on])}" : "; on:conjuncts=#{conjunctions(plan[:on]).length}"
+        detail += @explain_options[:verbose] ? "; on=#{plan_expression(plan_compile(edges.first[:on], original_scope))}" : "; on:conjuncts=#{conjunctions(plan[:on]).length}"
       end
       detail += '; ordered: join pk ordered' if plan[:ordered]
       base_cost = plan[:cost] - plan[:output_count]
@@ -68,7 +68,7 @@ module JedNative
       @explain_join_plans[statement.object_id] = plan
       if plan[:filter]
         expression = plan[:filter]
-        detail = @explain_options[:verbose] ? "filter=#{plan_expression(expression)}" : "conjuncts=#{conjunctions(expression).length}"
+        detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_compile(filter, original_scope))}" : "conjuncts=#{conjunctions(expression).length}"
         node = plan_node('Filter', detail, estimate_predicate(node.rows, expression), node.cost + node.rows * expression_work(expression), [node], :filter)
       end
       projections = expand_stars(statement[:columns], original_scope)

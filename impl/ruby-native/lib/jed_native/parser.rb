@@ -1542,8 +1542,16 @@ module JedNative
           expect('(')
           conflict[:elements] = separated do
             expr = expression
-            opclass = identifier if identifier_token?
-            opclass ? expr.merge(opclass: opclass) : expr
+            if expr[:kind] == :collate && expr[:expr][:kind] == :collate
+              raise Error.new('42601', 'repeated COLLATE in conflict target')
+            end
+            expr = expr.merge(opclass: identifier) if identifier_token? && !%w[asc desc nulls].include?(current.value)
+            expr = expr.merge(direction: advance.value) if at?('asc') || at?('desc')
+            if accept('nulls')
+              raise Error.new('42601', 'expected FIRST or LAST') unless at?('first') || at?('last')
+              expr = expr.merge(nulls: advance.value)
+            end
+            expr
           end
           expect(')')
           conflict[:columns] = conflict[:elements].map { |expr| expr[:name] }
