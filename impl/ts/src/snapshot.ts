@@ -318,6 +318,14 @@ export class Snapshot {
     return sum;
   }
 
+  // forgetStagedKeys forgets every store's per-key staged record, keeping the balance (memory.md
+  // §7.2): run when a savepoint frame starts sharing this snapshot's staged versions. A working
+  // snapshot owns its store clones, so this never touches a frame or committed state.
+  forgetStagedKeys(): void {
+    for (const store of this.stores.values()) store.forgetStagedKeys();
+    for (const store of this.indexStores.values()) store.forgetStagedKeys();
+  }
+
   // clearStaged clears every store's staged bytes: this working snapshot is being published by a
   // commit (memory.md §7). A working snapshot owns its store clones, so this never touches committed
   // state.
