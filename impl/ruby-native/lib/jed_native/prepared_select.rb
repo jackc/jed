@@ -262,7 +262,7 @@ module JedNative
         if (ordinal = stored[:native_primary_ordinal])
           left, right = predicate.args
           left, right = right, left if right.kind == :column
-          if left.kind == :column && left.value == ordinal && %i[literal param].include?(right.kind) && Types::INTEGER_BITS.key?(right.type)
+          if left.kind == :column && left.value == ordinal && %i[literal param].include?(right.kind) && Types::INTEGER_BITS.key?(right.type) && !right.extra&.dig(:subquery_origin)
             lookup = right
             index = stored[:native_primary_index]
           end

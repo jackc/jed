@@ -181,8 +181,8 @@ module JedNative
       when :binary
         if %w[like ilike not\ like not\ ilike].include?(expression.value)
           pattern = plan_constant(args.last)
-          return false unless pattern.is_a?(String)
-          return false if (pattern[/\\+\z/] || '').length.odd?
+          return false unless pattern.nil? || pattern.is_a?(String)
+          return false if pattern && (pattern[/\\+\z/] || '').length.odd?
         elsif !%w[and or = != <> < <= > >= is\ distinct\ from is\ not\ distinct\ from].include?(expression.value)
           return false
         end

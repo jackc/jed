@@ -31,6 +31,8 @@ module JedNative
       @storage = storage
       import_storage(storage.load)
       @persisted_snapshot = storage_signature(export_storage)
+      @storage_publication = [storage.service_generation, storage.meta[:txid]]
+      storage.service_finish_open
       self
     rescue StandardError
       storage&.close
@@ -228,7 +230,7 @@ module JedNative
         case constraint[:kind]
         when :check
           name = constraint[:name] || "#{table[:name]}_check#{position.zero? ? '' : position}"
-          checks << { name: name, expr: catalog_expression(constraint[:expr]), host_deps: constraint.dig(:storage_check, :host_deps) || [] }
+          checks << { name: name, expr: catalog_expression(constraint[:expr]), host_deps: constraint[:host_deps] || constraint.dig(:storage_check, :host_deps) || [] }
         when :unique
           name = constraint[:name] || "#{table[:name]}_#{constraint[:columns].join('_')}_key"
           unless indexes.any? { |index| index[:name] == name }
@@ -300,7 +302,9 @@ module JedNative
     end
 
     def export_index(table, index)
-      return index[:storage_index].dup if index[:unparsed]
+      if index[:storage_index] && (index[:unparsed] || respond_to?(:host_index_usable?, true) && !host_index_usable?(index))
+        return index[:storage_index].dup
+      end
       elements = index[:elements] || (index[:columns] || []).map { |name| { expr: { kind: :column, name: name } } }
       scope = table_columns(table)
       cols = elements.map do |element|
@@ -320,6 +324,7 @@ module JedNative
         FileFormat::ORDER_SYMBOLS.key([desc, first])
       end
       result = { name: index[:name], cols: cols, unique: !!index[:unique], kind: index[:method] || 'btree', orders: orders }
+      result[:host_deps] = index[:host_deps] if index[:host_deps]
       if index[:where]
         reject_stateful_index(index[:where])
         predicate = compile(index[:where], scope)
@@ -384,9 +389,8 @@ module JedNative
           constraints << { kind: :primary_key, columns: stored[:pk].map { |index| columns[index][:name] } }
         end
         stored[:checks].each do |check|
-          raise Error.new('XX002', 'CHECK requires unavailable host functions') unless check[:host_deps].to_a.empty?
-
           constraints << { kind: :check, name: check[:name], storage_check: check,
+                           host_deps: check[:host_deps],
                            expr: parse_stored_expression(check[:expr], "check constraint #{check[:name].inspect} of table #{stored[:name].inspect}") }
         end
         stored[:fks].each do |fk|
@@ -464,7 +468,6 @@ module JedNative
     end
 
     def import_index(table, index)
-      raise Error.new('XX002', 'index requires unavailable host functions') unless index[:host_deps].to_a.empty?
       raise Error.new('XX002', 'index requires unavailable pinned timezone data') if index[:timezone_deps]
 
       elements = index[:cols].each_with_index.map do |column, position|
@@ -475,6 +478,7 @@ module JedNative
       predicate = index[:predicate] ? parse_stored_expression(index[:predicate], "index #{index[:name].inspect} of table #{table[:name].inspect}") : nil
       unparsed = opaque_definition?(predicate) || elements.any? { |element| opaque_definition?(element[:expr]) }
       { kind: :create_index, name: index[:name], table: table[:name], method: index[:kind], unique: index[:unique], storage_index: index, unparsed: unparsed,
+        host_deps: index[:host_deps],
         storage_gist_profile: index[:gist_profile],
         elements: elements, columns: elements.map { |element| element[:expr][:name] }, storage_tree_profile: index[:tree_profile],
         where: predicate }

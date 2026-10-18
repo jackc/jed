@@ -28,8 +28,8 @@ module JedNative
       else
         prepared = arms.map { |arm| gin_query_terms(stored, name, arm) }
         return nil if prepared.any?(&:nil?)
-        ordinals = prepared.flat_map { |terms, mode| gather_gin_terms(stored, name, terms, mode) }.uniq
-        keys = stored[:native_primary_entries].to_h { |key, ordinal| [ordinal, key] }
+        ordinals = prepared.flat_map { |terms, mode| gather_gin_terms(stored, name, terms, mode) }.uniq { |row| auxiliary_row_identity(row) }
+        keys = auxiliary_row_keys(stored)
         ordinals.sort_by! { |ordinal| keys[ordinal] }
       end
       scan_rows(stored, ordinals, lookup: true)
@@ -79,6 +79,13 @@ module JedNative
     end
 
     private
+
+    def auxiliary_row_identity(row) = row.is_a?(PagedRow) ? row.storage_key : row
+
+    def auxiliary_row_keys(stored)
+      return Hash.new { |_, row| row.storage_key } if stored[:rows].is_a?(PagedRows)
+      stored[:native_primary_entries].to_h { |key, ordinal| [ordinal, key] }
+    end
 
     def auxiliary_term(term, key, kind)
       if term.kind == :quantified && kind == 'gin' && term.extra[:op] == '=' && term.extra[:quantifier] != 'all'
@@ -177,7 +184,7 @@ module JedNative
           list = postings[term] || []
           charge(gin_page_count(stored, name, term, prefix_successor(term)) + list.length)
           list
-        end.uniq
+        end.uniq { |row| auxiliary_row_identity(row) }
       end
       height = metadata[:height]
       ordered = terms.map do |term|
@@ -186,9 +193,14 @@ module JedNative
         peeked = span == height
         if peeked
           charge(span)
-          first = entries.bsearch_index { |key, _| key >= term } || entries.length
-          last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
-          [span, last - first, entries[first...last].sum { |key, _| key.bytesize }, term, true]
+          if (paged = metadata[:paged_rows])
+            runs = paged.each_entry(lower: term, upper: upper).to_a
+          else
+            first = entries.bsearch_index { |key, _| key >= term } || entries.length
+            last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
+            runs = entries[first...last]
+          end
+          [span, runs.length, runs.sum { |key, _| key.bytesize }, term, true]
         else
           [span, Float::INFINITY, Float::INFINITY, term, false]
         end
@@ -197,12 +209,12 @@ module JedNative
       candidates = postings[term] || []
       charge(span) unless peeked
       charge(candidates.length)
-      row_keys = stored[:native_primary_entries].to_h { |key, ordinal| [ordinal, key] }
+      row_keys = auxiliary_row_keys(stored)
       ordered.each do |_span, _runs, _bytes, next_term, _peeked|
         break if candidates.empty?
         survivors = []
         start = 0
-        posting_set = (postings[next_term] || []).to_h { |ordinal| [ordinal, true] }
+        posting_set = (postings[next_term] || []).to_h { |ordinal| [auxiliary_row_identity(ordinal), true] }
         while start < candidates.length
           lower = next_term + row_keys[candidates[start]]
           finish = start + 1
@@ -212,14 +224,19 @@ module JedNative
             finish += 1
           end
           upper_probe = next_term + row_keys[candidates[finish - 1]]
-          last_run = entries.bsearch_index { |key, _| key >= upper_probe }
-          upper = if last_run && entries[last_run][0].start_with?(next_term)
-            entries[last_run][0] + "\0".b
+          if (paged = metadata[:paged_rows])
+            last_key = paged.each_entry(lower: upper_probe).first&.first
+          else
+            last_run = entries.bsearch_index { |key, _| key >= upper_probe }
+            last_key = last_run && entries[last_run][0]
+          end
+          upper = if last_key && last_key.start_with?(next_term)
+            last_key + "\0".b
           else
             upper_probe + "\0".b
           end
           charge(gin_page_count(stored, name, lower, upper) + finish - start)
-          (start...finish).each { |index| survivors << candidates[index] if posting_set[candidates[index]] }
+          (start...finish).each { |index| survivors << candidates[index] if posting_set[auxiliary_row_identity(candidates[index])] }
           start = finish
         end
         candidates = survivors

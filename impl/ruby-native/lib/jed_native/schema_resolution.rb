@@ -42,6 +42,22 @@ module JedNative
     end
 
     def name_constraints(table)
+      # Constraint names belong to one database, while attached tables share
+      # the executor catalog under internal qualified keys.
+      previous_tables, previous_views, previous_sequences = @tables, @views, @sequences
+      domain = table[:database] || domain_from_key(table[:name])
+      @tables = @tables.filter_map do |key, stored|
+        next unless (stored[:database] || domain_from_key(key)) == domain && !!stored[:temporary] == !!table[:temporary]
+        local = local_domain_name(key)
+        [local, stored.merge(name: local)]
+      end.to_h
+      @views, @sequences = {}, {} if domain
+      name_local_constraints(table.merge(name: local_domain_name(table[:name])))
+    ensure
+      @tables, @views, @sequences = previous_tables, previous_views, previous_sequences
+    end
+
+    def name_local_constraints(table)
       existing = @tables[table[:name]]&.dig(:constraints) || []
       explicit = {}
       table[:constraints].each do |constraint|

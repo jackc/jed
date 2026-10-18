@@ -80,6 +80,9 @@ module JedNative
         numeric = %w[i16 i32 i64 f32 f64 decimal]
         next unless comparison || numeric.include?(constant.type) && numeric.include?(other.type)
         if constant.kind == :literal
+          if Types::INTEGER_BITS.key?(constant.type) && other.type == 'decimal'
+            constant.extra = (constant.extra || {}).merge(native_integer_bound: true)
+          end
           constant.value = cast_value(constant.value, other.type)
         else
           cast_value(@params[constant.value], other.type)

@@ -27,6 +27,9 @@ module JedNative
           expression.kind == :cast && expression.type == 'text' && %w[decimal f32 f64].include?(expression.args.first.type)
         end
         indexed = body_output_slots(term, columns)
+        if indexed && (label = resolved.instance_variable_get(:@native_collation)) && label.name
+          indexed = preserve_body_collation(indexed, columns, label.name)
+        end
         rewritten = indexed && rewrite_body_predicate(query, indexed, columns.map { |column| column[:type] }, equality_preserved)
         if rewritten
           query = rewritten
@@ -43,6 +46,19 @@ module JedNative
     end
 
     private
+
+    def preserve_body_collation(node, columns, name)
+      case node
+      when Array then node.map { |child| preserve_body_collation(child, columns, name) }
+      when Hash
+        if node[:kind] == :body_output_slot && columns[node[:ordinal]][:collation_label]&.none
+          { kind: :collate, expr: node, name: name }
+        else
+          node.transform_values { |child| preserve_body_collation(child, columns, name) }
+        end
+      else node
+      end
+    end
 
     def body_output_slots(node, columns)
       case node

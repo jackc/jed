@@ -45,8 +45,14 @@ module JedNative
     private
 
     def estimate_distinct_rows(rows, expressions)
-      return super unless @native_estimate_table && expressions.all? { |expression| expression.kind == :column }
-      facts = expressions.map { |expression| statistics_distribution(@native_estimate_table, expression.value) }
+      stored = @native_estimate_table
+      statement = @native_subquery_plan_frame&.dig(:statement)
+      if !stored && statement && statement[:from].to_a.length == 1 && statement[:joins].to_a.empty?
+        source = statement[:from].first
+        stored = @tables[source[:name]] if source[:kind] == :table
+      end
+      return super unless stored && expressions.all? { |expression| expression.kind == :column }
+      facts = expressions.map { |expression| statistics_distribution(stored, expression.value) }
       return super unless facts.all? { |fact| fact && fact[:ndv] }
       [rows, facts.reduce(1) { |count, fact| [QueryPlans::MAX_ESTIMATE, count * (fact[:ndv] + (fact[:nulls].positive? ? 1 : 0))].min }].min
     end

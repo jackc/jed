@@ -74,7 +74,7 @@ module JedNative
         sorter = ExternalSorter.new(self, measure: ->(entry) { LogicalMemory.row_bytes(entry[0] + added_keys.map { |index| entry[1][index] }) }, &compare)
       end
       ordinal = 0
-      unless limit == 0 && !collated && !spill_sort
+      unless limit == 0 && keys.all? { |expression| expression.kind == :column } && !collated && !spill_sort
         input.each do |row|
           begin
           charge
@@ -86,6 +86,7 @@ module JedNative
           sort_start = @cost if @explain_profile_frames
           values = keys.map { |expression| evaluate(expression, row) }
           profile_accumulate(:sort, @cost - sort_start) if @explain_profile_frames
+          next if capacity == 0
           entry = [row, values, ordinal]
           entry[0] = row.each_with_index.map { |value, index| touched[index] ? value : nil } if touched && !collated
           ordinal += 1
@@ -146,9 +147,9 @@ module JedNative
       rows.sort!(&compare) unless sorter
       ordered = sorter || rows
       output = cursor_output(columns)
-      ordered.each_with_index do |entry, index|
-        next if index < offset
-        break if limit && output.length >= limit
+      window = ordered.lazy.drop(offset)
+      window = window.take(limit) if limit
+      host_batch_rows(window, expressions, pulled: true, row_at: ->(entry) { entry[0] }).each do |entry|
         row = entry[0]
         values = expressions.map { |expression| evaluate(expression, row) }
         query_memory_add_row(output_owner, values, columns) if output_owner

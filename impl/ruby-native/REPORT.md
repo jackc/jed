@@ -19,15 +19,20 @@ changing; intermediate runs are diagnostic, not a release gate.
 
 The October 18 implementation checkpoint includes a diagnostic run against a
 copied, immutable source tree (SHA-256
-`f01752a7c5847f9f47df2d10645b7d384cc864d85054abab90b6dc4c0500e88d`):
-679 files, 20,135 authored records, 19,798 executed, 18,779 passed, 1,019 failed,
-40 unsupported harness files, and no timeouts. The source hash was unchanged
-throughout the run. This is progress evidence, not a passing conformance claim.
+`6950c33f1685f28b16ad15c376097a29706f0832889606bba97c748ffbf151f7`):
+679 files, 20,266 executed checks including concurrency assertions, 20,161 passed,
+105 failed, no unsupported harness files, no timeouts, and two mode-specific
+skipped files. The source hash was unchanged throughout the run. Several failures
+have since been corrected; this remains progress evidence, not a passing
+conformance claim.
 
 Executed independent checks include:
 
 - Native API: prepared statements, parameter inference and coercion, atomic
   scripts, rollback, and isolation of mutable host inputs and returned values.
+- Independent sessions, writer blocking, pinned readers, and lazy cursors:
+  early close, frozen snapshots, and matching full-drain values, types and costs.
+  All 180 shared concurrency assertions pass in memory.
 - Pure Ruby regex VM: shared program and match/cost fixtures, bounded programs,
   and the SQL regex corpus.
 - Storage: 106 shared file images (97 accepted, nine deliberately rejected),
@@ -46,9 +51,10 @@ Executed independent checks include:
 - WHERE contradiction proofs: 58/58 SELECT/UPDATE/DELETE records; ON CONFLICT:
   349/349 records. Broader SQL and plan coverage remains incomplete.
 
-None of these scoped results establishes whole-core conformance. In particular,
-the remaining SQL planner, deterministic costs, storage residency, page
-service, and the full host API still require implementation and verification.
+None of these scoped results establishes whole-core conformance. Later changes
+add sparse pending writes, native page-service owners and clients, host function
+registration, and physical backup/compaction. Their full integration audit and
+performance measurements are still pending.
 
 ## Recorded prototype baseline
 
@@ -93,12 +99,15 @@ coverage results and optimized timings are still pending.
 
 The engine reads and writes the current v49 shared file format, including
 validated COW content manifests. The current pure Ruby file host takes exclusive
-protocol-v2 ownership with Ruby's built-in `flock`. It does not yet serve or join
-the multi-process page service. SQL commits persist changed B-tree paths, retain
+protocol-v2 ownership with Ruby's built-in `flock` by default. The opt-in
+`locking: :auto` path serves or joins the multi-process page service; lifecycle
+and cross-core process verification are ongoing. SQL commits persist changed B-tree paths, retain
 clean page identities, protect current manifest dependencies during free-page
 reuse, and reclaim trailing free pages. Memory and file storage limits use the
 shared page accounting; 48 memory, 35 file and 10 temporary-limit records pass.
-Lazy page/value residency remains unfinished. Changed
+File reads use lazy page-backed rows and a bounded cache. Ordinary mutations
+retain their changed rows over immutable tree pages; constraint checks use key
+probes or bounded spools. Changed
 attachment domains persist independently and temporary-only work leaves main
 unchanged.
 Large-file performance must not be inferred from the small in-memory comparison.
