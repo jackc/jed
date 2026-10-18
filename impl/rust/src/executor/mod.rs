@@ -3902,8 +3902,10 @@ pub(crate) enum RExpr {
         path: Box<RExpr>,
         /// The `PASSING` values, each already a JSON-item-shaped value (see [`resolve_json_passing`]),
         /// and the variable names they bind, in clause order.
-        passing: Vec<RExpr>,
-        passing_names: Vec<String>,
+        /// Boxed slices, not Vecs: this variant sets `RExpr`'s size, which every recursive
+        /// resolve/eval frame carries (the depth budget, cost.md §7.1).
+        passing: Box<[RExpr]>,
+        passing_names: Box<[String]>,
         /// The RETURNING scalar type (`Bool` for JSON_EXISTS; the JSON_VALUE scalar target;
         /// `Jsonb`/`Json` for JSON_QUERY) — drives the result coercion.
         returning: ScalarType,
@@ -5905,8 +5907,8 @@ fn resolve_json_sql_fn(
             kind,
             ctx: Box::new(rctx),
             path: Box::new(rpath),
-            passing,
-            passing_names,
+            passing: passing.into_boxed_slice(),
+            passing_names: passing_names.into_boxed_slice(),
             returning: returning_st,
             decimal: None,
             wrapper,
