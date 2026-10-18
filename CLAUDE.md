@@ -761,7 +761,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   landed.** One **owner** process (the `presence EX` holder in a stable, version-marked
   `<path>.lock/` bundle of crash-clean whole-file OS locks) alone touches the file; every other process
   is a **page client** running its own engine, whose pager reads pages from, and commits whole
-  `CommitDelta`s through, the owner over a same-user local socket, or over SSH (`jed ssh://host/path` runs `ssh host jed pages /path`, whose stdio carries the same protocol; Rust and the CLI, with client-side read-ahead). `locking = auto`
+  `CommitDelta`s through, the owner over a same-user local socket, or over SSH (`jed ssh://host/path` runs
+  `ssh host jed pages /path`, whose stdio carries the same protocol; Rust and the CLI, with
+  client-side read-ahead). `locking = auto`
   selects it on hosts that can serve (Unix local files); `exclusive` is a non-serving owner (a second
   opener waits, then fails `55006`), as `auto` is where serving is unavailable (Windows for now);
   `none` is the unsafe escape hatch. The owner's foreground path performs **no coordination syscall

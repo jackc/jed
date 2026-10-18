@@ -657,8 +657,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     opening `ssh://[user@]host[:port]/path` through the system `ssh`, and client-side read-ahead /
     subtree fetch over the unchanged `read_pages` for stream clients (spec/pageservice/README.md §5.3,
     page-service.md §5.3, cli.md §3). No wire change. Proven by `service_stream.process.toml` (a Rust
-    stream client against owners of every core), Rust host-API tests, and CLI e2e tests with a fake
-    `ssh`; `bench:page_service` adds `stream_cold_scan` with and without read-ahead.
+    stream client against owners of every core), Rust host-API tests (including a backup through the
+    stream, byte-identical to a local one), and CLI e2e tests with a fake `ssh`; `bench:page_service`
+    adds `stream_cold_scan` with and without read-ahead.
     - [ ] **Decide: configuring the remote binary and the ssh command** (maintainer). Today the CLI runs
       `ssh` from `PATH` and `jed` from the remote `PATH`, with no option for either (an environment
       variable, a flag, or a URL query are the candidates).
