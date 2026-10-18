@@ -1,0 +1,82 @@
+# Foreign keys inside a CREATE TABLE … AS query's data-modifying WITH (create-table-as.md §3,
+# writable-cte.md §7, constraints.md §6.4/§6.5): the checks wait for the end of the whole statement,
+# as in a plain writable WITH — a parent a later CTE inserts satisfies a child an earlier CTE writes,
+# and a failed check leaves no table and no write behind. SELECT … INTO is the same statement. Oracle-checked against PostgreSQL 18.
+# requires: ddl.create_table_as, ddl.select_into, ddl.create_table_as_writable_with, ddl.create_table, ddl.primary_key, ddl.foreign_key, dml.insert, dml.delete, dml.returning, query.select, query.order_by, query.cte, query.cte_data_modifying, types.i32
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p)
+
+statement ok
+INSERT INTO p VALUES (1)
+
+statement ok
+INSERT INTO c VALUES (1, 1)
+
+# A child with no parent.
+statement error 23503
+CREATE TABLE t AS WITH x AS (INSERT INTO c VALUES (2, 99) RETURNING id) SELECT id FROM x
+
+statement error 42P01
+SELECT * FROM t
+
+# A child whose parent a later CTE inserts.
+statement ok
+CREATE TABLE t AS WITH x AS (INSERT INTO c VALUES (2, 7) RETURNING id), y AS (INSERT INTO p VALUES (7) RETURNING id) SELECT id FROM x
+
+query I nosort
+SELECT id FROM t
+----
+2
+
+# A parent deleted while a child still references it.
+statement error 23503
+CREATE TABLE t2 AS WITH d AS (DELETE FROM p WHERE id = 1 RETURNING id) SELECT id FROM d
+
+statement error 42P01
+SELECT * FROM t2
+
+# A parent deleted while a later CTE deletes its child.
+statement ok
+CREATE TABLE t2 AS WITH d AS (DELETE FROM p WHERE id = 1 RETURNING id), e AS (DELETE FROM c WHERE pid = 1 RETURNING id) SELECT id FROM d
+
+query I nosort
+SELECT id FROM t2
+----
+1
+
+# SELECT … INTO, with a child with no parent, then with a parent a later CTE inserts.
+statement error 23503
+WITH x AS (INSERT INTO c VALUES (4, 98) RETURNING id) SELECT id INTO t4 FROM x
+
+statement error 42P01
+SELECT * FROM t4
+
+statement ok
+WITH x AS (INSERT INTO c VALUES (4, 8) RETURNING id), y AS (INSERT INTO p VALUES (8)) SELECT id INTO t4 FROM x
+
+query I nosort
+SELECT id FROM t4
+----
+4
+
+# WITH NO DATA runs no part of the query, so nothing is checked.
+statement ok
+CREATE TABLE t3 AS WITH x AS (INSERT INTO c VALUES (3, 99) RETURNING id) SELECT id FROM x WITH NO DATA
+
+query I nosort
+SELECT id FROM p ORDER BY id
+----
+7
+8
+
+query II nosort
+SELECT id, pid FROM c ORDER BY id
+----
+2
+7
+4
+8
