@@ -144,7 +144,9 @@ module JedNative
       columns = binding.columns.each_with_index.map do |column, index|
         column.merge(table: source[:alias] || source[:name], name: aliases&.[](index) || column[:name], source_ordinal: index)
       end
-      Relation.new(columns: columns, rows: relation.rows)
+      result = Relation.new(columns: columns, rows: relation.rows)
+      query_memory_transfer(relation, result) if @query_memory && binding.query
+      result
     end
 
     def insert(statement)
@@ -184,7 +186,7 @@ module JedNative
           validate_recursive_shape(cte) if node[:recursive] && cte_reference_count(body, cte[:name]).positive?
         end
         node.each do |key, child|
-          validate_cte_structure(child, key == :query && node[:kind] == :create_table_as)
+          validate_cte_structure(child, key == :query && %i[create_table create_table_as].include?(node[:kind]))
         end
       end
     end
@@ -233,14 +235,15 @@ module JedNative
     def materialize_recursive_cte(cte)
       body = cte[:query]
       relation = select(body[:left])
+      metadata = view_query_columns(body[:left])
       if cte[:columns] && cte[:columns].length > relation.columns.length
         raise Error.new('42P10', 'too many CTE column names')
       end
-      columns = relation.columns.each_with_index.map { |column, index| column.merge(name: cte[:columns]&.[](index) || column[:name]) }
+      columns = relation.columns.each_with_index.map { |column, index| column.merge(name: cte[:columns]&.[](index) || column[:name], type_mod: metadata[index]&.dig(:type_mod)) }
       added = cte_search_cycle_columns(cte, columns)
       recursive_scope = columns + added.map { |column| column.merge(star_hidden: true) }
       @ctes[cte[:name]] = Relation.new(columns: recursive_scope, rows: relation.rows)
-      recursive_columns = query_metadata(body[:right], @outer.flat_map(&:first))[:columns]
+      recursive_columns = view_query_columns(body[:right], nil, @outer.flat_map(&:first))
       raise Error.new('42601', 'recursive query column count differs') unless columns.length == recursive_columns.length
       columns.zip(recursive_columns).each do |anchor, recursive|
         if common_type(anchor[:type], recursive[:type]) != anchor[:type] || anchor[:type_mod] && anchor[:type_mod] != recursive[:type_mod]
@@ -251,6 +254,15 @@ module JedNative
       anchor_expressions, step_expressions, cycle_filter = cte_generated_expressions(cte, columns, added)
       rows = relation.rows.map { |row| row + anchor_expressions.map { |expression| evaluate(expression, row) } }
       rows = rows.uniq unless body[:all]
+      if @query_memory
+        result_owner = query_memory_owner
+        dedup_owner = query_memory_owner unless body[:all]
+        rows.each do |row|
+          query_memory_add(dedup_owner, MemorySchedule::ENTRY + query_memory_key_bytes(row)) if dedup_owner
+          query_memory_add_row(result_owner, row, recursive_scope)
+        end
+        working_owner = relation.instance_variable_get(:@native_memory_owner)
+      end
       working = rows
       seen = rows.to_h { |row| [row, true] }
       recursive_query = body[:right]
@@ -263,6 +275,7 @@ module JedNative
       until working.empty?
         @ctes[cte[:name]] = Relation.new(columns: recursive_scope, rows: working)
         next_relation = select(recursive_query)
+        query_memory_release(working_owner) if @query_memory
         working = next_relation.rows.filter_map do |row|
           own = row.first(columns.length).each_with_index.map { |value, index| cast_value(value, columns[index][:type]) }
           context = own + row.drop(columns.length)
@@ -273,9 +286,23 @@ module JedNative
           working = working.reject { |row| seen.key?(row) }.uniq
           working.each { |row| seen[row] = true }
         end
+        if @query_memory
+          working_owner = next_relation.instance_variable_get(:@native_memory_owner)
+          retained = working.sum { |row| query_memory_row_bytes(row, recursive_scope) }
+          query_memory_release(working_owner, working_owner.bytes - retained) if working_owner && working_owner.bytes > retained
+          working.each do |row|
+            query_memory_add(dedup_owner, MemorySchedule::ENTRY + query_memory_key_bytes(row)) if dedup_owner
+            query_memory_add_row(result_owner, row, recursive_scope)
+          end
+        end
         rows.concat(working)
       end
       @ctes[cte[:name]] = Relation.new(columns: columns + added, rows: rows)
+      if @query_memory
+        query_memory_release(working_owner)
+        query_memory_release(dedup_owner)
+        query_memory_attach(@ctes[cte[:name]], result_owner)
+      end
     end
 
     def cycle_mark_values(cycle)
@@ -400,6 +427,7 @@ module JedNative
     end
 
     def writable_with?(statement)
+      return writable_with?(statement[:query]) if statement[:kind] == :create_table && statement[:query]
       items = statement[:with] || []
       !items.empty? && (%i[insert update delete].include?(statement[:kind]) || items.any? { |cte| %i[insert update delete].include?(cte[:query][:kind]) })
     end

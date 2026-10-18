@@ -76,7 +76,7 @@ module JedNative
         end
         result = coerce(value, @types[index])
         (@modifiers[index] || []).each do |mod|
-          result = Types.cast(result, "decimal(#{mod[:precision]},#{mod[:scale] || 0})")
+          result = @engine.send(:explicit_modifier, result, @types[index], mod)
         end
         result
       end
@@ -149,17 +149,29 @@ module JedNative
       end
       case node[:kind]
       when :select
-        scope = (node[:from] || []).flat_map { |source| relation(source, outer) }
-        (node[:joins] || []).each do |join|
-          scope.concat(relation(join[:relation], scope + outer))
+        scope = []
+        (node[:from] || []).each_with_index do |source, index|
+          visible = source[:lateral] || %i[function join_group].include?(source[:kind]) ? scope + outer : outer
+          scope.concat(relation(source, visible))
+          (node[:joins] || []).select { |join| (join[:from_index] || 0) == index }.each do |join|
+          joined = join[:relation]
+          visible = joined[:lateral] || %i[function join_group].include?(joined[:kind]) ? scope + outer : outer
+          right = relation(joined, visible)
+          using = join[:using] || (join[:natural] ? scope.map { |column| column[:name] } & right.map { |column| column[:name] } : [])
+          right = right.map { |column| using.include?(column[:name]) ? column.merge(qualified_only: true) : column }
+          scope.concat(right)
           expression(join[:on], scope + outer, 'boolean') if join[:on]
+          end
         end
         scope = scope.map { |column| column.merge(binding_scope: @scope_depth) } + outer
         expression(node[:where], scope, 'boolean') if node[:where]
         output = (node[:columns] || []).flat_map do |projection|
           expr = projection[:expr]
           if expr[:kind] == :star
-            scope.select { |column| !column[:star_hidden] && (!expr[:table] || column[:table] == expr[:table]) }
+            scope.select { |column| !column[:star_hidden] && (expr[:table] ? column[:table] == expr[:table] : !column[:qualified_only] && column[:binding_scope] == @scope_depth) }
+          elsif expr[:kind] == :field_star
+            type = expression(expr[:expr], scope)
+            @engine.instance_variable_get(:@types)[type] || raise(Error.new('42809', 'star requires a composite value'))
           else
             [{ name: projection[:alias] || @engine.expression_name(expr), type: expression(expr, scope) }]
           end
@@ -184,7 +196,8 @@ module JedNative
         left, right = statement(node[:left], outer), statement(node[:right], outer)
         left.each_with_index.map { |column, i| column.merge(type: common(column[:type], right[i]&.dig(:type))) }
       when :insert, :update, :delete
-        table = @engine.table(node[:table])
+        view = @engine.instance_variable_get(:@views)[node[:table]]
+        table = view ? { name: node[:table], columns: @engine.send(:view_schema, view) } : @engine.table(node[:table])
         scope = @engine.table_columns(table, node[:alias] || node[:table]).map { |column| column.merge(binding_scope: @scope_depth) } + outer
         if node[:kind] == :insert
           columns = node[:columns] ? node[:columns].map { |name| table[:columns].find { |column| column[:name] == name } } : table[:columns]
@@ -238,7 +251,7 @@ module JedNative
       name = node[:alias] || node[:name]
       columns = case node[:kind]
       when :table
-        if @ctes.key?(node[:name])
+        if !node[:database] && @ctes.key?(node[:name])
           @ctes[node[:name]]
         elsif (view = @engine.instance_variable_get(:@views)[node[:name]])
           view[:schema] || statement(view[:query], outer).each_with_index.map { |column, i| column.merge(name: view[:columns]&.[](i) || column[:name]) }
@@ -249,6 +262,7 @@ module JedNative
         end
       when :subquery then statement(node[:query], outer)
       when :values then statement(node, outer)
+      when :join_group then statement(node.merge(kind: :select, columns: [{ expr: { kind: :star } }]), outer)
       when :function, :call, :srf
         call = node[:expr] || node[:call] || node
         if call[:kind] == :json_table
@@ -261,11 +275,11 @@ module JedNative
           @engine.json_relation_columns(node)
         else
           type = expression(call, outer)
-          [{ name: call[:name] || 'value', type: type.sub(/\[\]\z/, '') }]
+          [{ name: node[:alias] || call[:name] || 'value', type: type.sub(/\[\]\z/, '') }]
         end
       else []
       end
-      columns.each_with_index.map { |column, i| column.merge(table: name, name: node[:columns]&.[](i) || column[:name]) }
+      columns.each_with_index.map { |column, i| column.merge(table: name || column[:table], name: node[:columns]&.[](i) || column[:name]) }
     end
 
     def expression(node, scope, wanted = nil)
@@ -298,7 +312,7 @@ module JedNative
       when :binary then binary(node, scope, wanted)
       when :unary
         op = node[:op].to_s
-        arg = expression(node[:expr] || node[:operand], scope, op == 'not' ? 'boolean' : wanted)
+        arg = expression(node[:expr] || node[:operand], scope, op == 'not' ? 'boolean' : op.start_with?('is ') ? nil : wanted)
         op == 'not' || op.start_with?('is ') ? 'boolean' : arg
       when :call, :function, :srf then function(node, scope, wanted)
       when :json_value, :json_query, :json_exists
@@ -368,9 +382,9 @@ module JedNative
       end
       lt, rt = expression(left, scope), expression(right, scope)
       numeric = %w[i16 i32 i64 decimal f32 f64]
-      if left[:kind] == :literal && left[:untyped] && !%i[literal param].include?(right[:kind]) && numeric.include?(lt) && numeric.include?(rt)
+      if left[:kind] == :literal && left[:untyped] && !%i[literal param].include?(right[:kind]) && numeric.include?(lt) && numeric.include?(rt) && !(lt == 'decimal' && Types::INTEGER_BITS.key?(rt))
         lt = rt
-      elsif right[:kind] == :literal && right[:untyped] && !%i[literal param].include?(left[:kind]) && numeric.include?(lt) && numeric.include?(rt)
+      elsif right[:kind] == :literal && right[:untyped] && !%i[literal param].include?(left[:kind]) && numeric.include?(lt) && numeric.include?(rt) && !(rt == 'decimal' && Types::INTEGER_BITS.key?(lt))
         rt = lt
       end
       if op == '||'
@@ -413,6 +427,13 @@ module JedNative
 
     def function(node, scope, wanted)
       name, args = node[:name].downcase, node[:args] || []
+      if node[:within_group] && %w[mode percentile_disc percentile_cont].include?(name)
+        args.each { |arg| expression(arg, scope) }
+        type = expression(node[:within_group].first[:expr], scope)
+        type = 'f64' if name == 'percentile_cont' && type != 'interval'
+        type += '[]' if args.first && expression(args.first, scope).end_with?('[]')
+        return type
+      end
       if %w[coalesce greatest least nullif].include?(name)
         return unify(args, scope, wanted)
       end

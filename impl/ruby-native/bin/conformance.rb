@@ -27,7 +27,7 @@ end
 # directives as well as SQL mismatches. No capability filter hides missing work.
 class NativeCorpus
   ROOT = File.expand_path('../../..', __dir__)
-  SUPPORTED = %w[requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed attach timezone load-timezone].freeze
+  SUPPORTED = %w[requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed attach timezone load-timezone load-collation collation unicode allow_ddl allow_temp_ddl default_privileges grant revoke max_query_memory_bytes].freeze
   DIRECTIVES = %w[requires names types cost max_cost format fixture params clock clock_advance seed timezone collation unicode attach lifetime_max_cost max_query_memory_bytes max_scalar_bytes max_sql_length max_storage_bytes max_temp_storage_bytes work_mem allow_ddl allow_temp_ddl default_privileges grant revoke set load-collation load-timezone upgrade-collations].freeze
   attr_reader :summary
 
@@ -81,6 +81,7 @@ class NativeCorpus
     random.reset
     environment = JedNative::Environment.new(clock: clock, random: random)
     environment = environment.load_time_zone_data(File.binread(File.join(ROOT, 'spec/tz/fixtures/tzdata.jtz'))) if contents.match?(/^#\s*load-timezone:/)
+    environment = environment.load_unicode_data(File.binread(File.join(ROOT, 'spec/collation/fixtures/unicode.jucd'))) if contents.match?(/^#\s*load-collation:/)
     db = file ? JedNative.create(file, environment: environment) : JedNative.memory(environment: environment)
     contents.scan(/^#\s*attach:\s*(.+)$/).flatten.each { |name| db.attach(name.strip) }
     pending = {}
@@ -89,8 +90,12 @@ class NativeCorpus
     while i < lines.length
       line = lines[i]
       i += 1
-      if (match = /^#\s*(names|types|cost|max_cost|params|max_scalar_bytes|max_sql_length|lifetime_max_cost|clock|clock_advance|seed|timezone):\s*(.*)$/.match(line))
-        pending[match[1]] = match[2]
+      if (match = /^#\s*(names|types|cost|max_cost|params|max_query_memory_bytes|max_scalar_bytes|max_sql_length|lifetime_max_cost|clock|clock_advance|seed|timezone|allow_ddl|allow_temp_ddl|default_privileges|grant|revoke):\s*(.*)$/.match(line))
+        if %w[grant revoke].include?(match[1])
+          (pending[match[1]] ||= []) << match[2]
+        else
+          pending[match[1]] = match[2]
+        end
         next
       end
       next if line.empty? || line.start_with?('#')
@@ -125,6 +130,18 @@ class NativeCorpus
         db.max_sql_length = pending.fetch('max_sql_length', '1048576').to_i
         db.engine.lifetime_max_cost = pending['lifetime_max_cost'].to_i if pending['lifetime_max_cost']
         db.engine.max_scalar_bytes = pending.fetch('max_scalar_bytes', '67108864').to_i
+        db.max_query_memory_bytes = pending.fetch('max_query_memory_bytes', '0').to_i
+        db.engine.allow_ddl = pending.fetch('allow_ddl', 'on') == 'on'
+        db.engine.allow_temp_ddl = pending.key?('allow_temp_ddl') ? pending['allow_temp_ddl'] == 'on' : nil
+        db.engine.default_privileges = pending.fetch('default_privileges', 'ALL')
+        db.reset_privileges
+        %w[grant revoke].each do |action|
+          (pending[action] || []).each do |entry|
+            privilege, name = entry.split(/\s+ON\s+/i, 2)
+            raise "invalid #{action} directive" unless name
+            db.public_send(action, privilege, name)
+          end
+        end
         params = pending['params'] ? CorpusParams.parse(pending['params']).map { |value| bind_value(value) } : []
         error = nil
         result = begin

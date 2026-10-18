@@ -15,6 +15,10 @@ module JedNative
 
     attr_reader :path, :page_size, :meta
 
+    def collation_key=(provider)
+      @codec.instance_variable_set(:@collation_key, provider)
+    end
+
     def initialize(path:, create: false, page_size: 8192, locking: :exclusive,
                    file_lock_timeout_ms: 5000, fsync: true, read_only: false,
                    max_storage_bytes: 0, collation_key: nil, expression: nil)

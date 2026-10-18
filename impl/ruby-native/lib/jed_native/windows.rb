@@ -88,6 +88,11 @@ module JedNative
 
     def prepare_window_values(statement, columns, contexts)
       @window_values = {}
+      if @query_memory
+        previous_partition_owner = @query_memory_window_partition_owner
+        @query_memory_window_partition_owner = query_memory_owner
+        result_owner = query_memory_owner
+      end
       definitions = {}
       (statement[:windows] || {}).each do |name, spec|
         definitions[name] = resolve_window_spec(spec, definitions)
@@ -130,6 +135,17 @@ module JedNative
         partitions.each do |partition|
           evaluate_window_partition(node, expression, spec, frame, partition)
         end
+        if @query_memory
+          contexts.each do |row, group|
+            value = @window_values[[node.object_id, row.object_id, group&.object_id]]
+            query_memory_add(result_owner, LogicalMemory.value_bytes(value, expression.type))
+          end
+        end
+      end
+    ensure
+      if @query_memory && result_owner
+        query_memory_release(@query_memory_window_partition_owner)
+        @query_memory_window_partition_owner = previous_partition_owner
       end
     end
 
@@ -235,6 +251,10 @@ module JedNative
       contexts.each_with_index do |(row, group), ordinal|
         key = partition_exprs.map { |expression| evaluate(expression, row, group) }
         order = order_exprs.map { |expression| evaluate(expression, row, group) }
+        if @query_memory
+          query_memory_add(@query_memory_window_partition_owner, MemorySchedule::ENTRY + query_memory_key_bytes(key)) unless partitions.key?(key)
+          query_memory_add(@query_memory_window_partition_owner, query_memory_collation_bytes(order, @query_memory_window_partition_owner))
+        end
         (partitions[key] ||= []) << { row: row, group: group, order: order, ordinal: ordinal }
       end
       partitions.each_value do |partition|
@@ -311,6 +331,14 @@ module JedNative
       return if count.zero?
       name = expression.value
       args = expression.args
+      memory_owner = query_memory_owner if @query_memory
+      cached_values = if %w[lag lead first_value last_value nth_value].include?(name)
+        partition.map do |entry|
+          value = evaluate(args[0], entry[:row], entry[:group])
+          query_memory_add(memory_owner, LogicalMemory.value_bytes(value, args[0].type)) if @query_memory
+          value
+        end
+      end
       ntile = nil
       if name == 'ntile'
         first = partition.first
@@ -321,8 +349,15 @@ module JedNative
       aggregate_expr = nil
       if Functions.aggregate?(name)
         aggregate_rows = partition.map do |entry|
-          args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, entry[:row], entry[:group]) } +
-            [expression.extra[:filter_expr] ? evaluate(expression.extra[:filter_expr], entry[:row], entry[:group]) : true]
+          values = args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, entry[:row], entry[:group]) }
+          moving = frame[:start][:kind] != :unbounded || frame[:exclude] && frame[:exclude] != :no_others || expression.extra[:filter_expr]
+          retaining = name.match?(/\A(?:array_agg|string_agg|jsonb?_agg|jsonb?_object_agg)/)
+          if @query_memory && (moving || retaining)
+            args.each_with_index do |arg, index|
+              query_memory_add(memory_owner, LogicalMemory.value_bytes(values[index], arg.type)) unless arg.kind == :star
+            end
+          end
+          values + [expression.extra[:filter_expr] ? evaluate(expression.extra[:filter_expr], entry[:row], entry[:group]) : true]
         end
         synthetic_args = args.each_with_index.map { |arg, index| Expression.new(kind: :column, type: arg.type, value: index) }
         aggregate_expr = Expression.new(kind: :call, type: expression.type, value: name, args: synthetic_args,
@@ -352,8 +387,7 @@ module JedNative
                   if offset
                     target = index + (name == 'lead' ? offset : -offset)
                     if target.between?(0, count - 1)
-                      other = partition[target]
-                      evaluate(args[0], other[:row], other[:group])
+                      cached_values[target]
                     elsif args[2]
                       evaluate(args[2], entry[:row], entry[:group])
                     end
@@ -365,8 +399,7 @@ module JedNative
                     raise Error.new('22016', 'nth_value argument must be greater than zero') if nth && nth <= 0
                     target = name == 'last_value' ? indices.last : nth && indices[nth - 1]
                     if target
-                      other = partition[target]
-                      evaluate(args[0], other[:row], other[:group])
+                      cached_values[target]
                     end
                   else
                     if incremental
@@ -396,6 +429,8 @@ module JedNative
                 end
         @window_values[[node.object_id, entry[:row].object_id, entry[:group]&.object_id]] = value
       end
+    ensure
+      query_memory_release(memory_owner) if @query_memory && memory_owner
     end
 
     def window_accumulate(state, value, name, type)

@@ -99,7 +99,7 @@ module JedNative
       when 'least' then args.compact.min { |x, y| Types.compare(x, y) }
       when 'num_nulls' then args.count(nil)
       when 'num_nonnulls' then args.length - args.count(nil)
-      when 'abs' then a.abs
+      when 'abs' then Types::INTEGER_BITS.key?(arg_types&.first) ? Types.check_integer(a.abs, arg_types.first) : a.abs
       when 'sign'
         raise Error.new('42883', 'sign does not accept integer arguments') if a.is_a?(Integer)
         a.is_a?(Decimal) ? Decimal.new(a <=> 0) : a.nan? ? 0.0 : (a <=> 0).to_f
@@ -202,7 +202,8 @@ module JedNative
         start, finish = 0, a.length
         start += 1 while name != 'rtrim' && start < finish && chars.include?(a[start])
         finish -= 1 while name != 'ltrim' && finish > start && chars.include?(a[finish - 1])
-        a[start...finish]
+        result = a[start...finish]
+        a.is_a?(Bytea) ? Bytea.new(result) : result
       when 'lpad', 'rpad'
         n, fill = [b, 0].max, c || ' '
         return a[0, n] if n <= a.length || fill.empty?
@@ -232,8 +233,7 @@ module JedNative
         a.getbyte(b)
       when 'set_byte'
         raise Error.new('2202E', 'index out of valid range') unless (0...a.bytesize).cover?(b)
-        raise Error.new('22023', 'new byte must be between 0 and 255') unless (0..255).cover?(c)
-        result = Bytea.new(a); result.setbyte(b, c); result
+        result = Bytea.new(a); result.setbyte(b, c & 255); result
       when 'get_bit', 'set_bit'
         raise Error.new('2202E', 'index out of valid range') unless (0...(a.bytesize * 8)).cover?(b)
         byte, bit = b.divmod(8)
@@ -292,7 +292,9 @@ module JedNative
         raise Error.new('0A000', 'clock functions require an injected clock') unless context && context.respond_to?(:clock_value)
         value = context.clock_value(name)
         name == 'current_date' ? Types.cast(value, 'date') : value
-      when 'make_date' then DateValue.from_parts(a, b, c)
+      when 'make_date'
+        raise Error.new('22008', 'date year cannot be zero') if a.zero?
+        DateValue.from_parts(a.negative? ? a + 1 : a, b, c)
       when 'make_timestamp', 'make_timestamptz'
         date = DateValue.from_parts(a, b, c)
         hours, minutes, seconds = args[3], args[4], Decimal.parse(args[5])
@@ -323,12 +325,17 @@ module JedNative
       when 'to_date' then DateFormatting.from_text(a, b, date: true, context: context)
       when 'to_char'
         raise Error.new('0A000', 'format template functions are not implemented in the Ruby experiment')
-      when 'uuid_extract_version' then (a[14] || '0').to_i(16)
+      when 'uuid_extract_version' then (a[19].to_i(16) & 12) == 8 ? a[14].to_i(16) : nil
       when 'uuid_extract_timestamp'
+        return nil unless (a[19].to_i(16) & 12) == 8
         version = a[14].to_i(16)
-        return nil unless version == 7
-        milliseconds = a.delete('-')[0, 12].to_i(16)
-        TimestampValue.new(milliseconds * 1000, zoned: true)
+        hex = a.delete('-')
+        if version == 7
+          TimestampValue.new(hex[0, 12].to_i(16) * 1000, zoned: true)
+        elsif version == 1
+          ticks = ((hex[12, 4].to_i(16) & 0xfff) << 48) | (hex[8, 4].to_i(16) << 32) | hex[0, 8].to_i(16)
+          TimestampValue.new((ticks - 122_192_928_000_000_000).div(10), zoned: true)
+        end
       when 'uuidv4', 'uuidv7', 'gen_random_uuid'
         raise Error.new('0A000', 'UUID generators require an injected entropy source') unless context && context.respond_to?(:uuid_value)
         context.uuid_value(name, args[0])
@@ -443,20 +450,29 @@ module JedNative
         else tokens << [:literal, char]
         end
       end
-      raise Error.new('22025', 'LIKE pattern must not end with escape character') if escaped
+      tokens << [:escape, nil] if escaped
       chars = text.chars
-      context.charge((chars.length + 1) * (tokens.length + 1)) if context && context.respond_to?(:charge)
-      previous = Array.new(chars.length + 1, false)
-      previous[0] = true
-      tokens.each do |kind, literal|
-        current = Array.new(chars.length + 1, false)
-        current[0] = previous[0] if kind == :many
-        chars.each_index do |i|
-          current[i + 1] = kind == :many ? current[i] || previous[i + 1] : previous[i] && (kind == :one || chars[i] == literal)
+      input = token = 0
+      wildcard = retry_input = nil
+      while input < chars.length
+        kind, literal = tokens[token]
+        raise Error.new('22025', 'LIKE pattern must not end with escape character') if kind == :escape
+        if kind == :one || kind == :literal && literal == chars[input]
+          input += 1
+          token += 1
+        elsif kind == :many
+          wildcard, retry_input = token, input
+          token += 1
+        elsif wildcard
+          retry_input += 1
+          input = retry_input
+          token = wildcard + 1
+        else
+          return false
         end
-        previous = current
       end
-      previous[-1]
+      token += 1 while tokens[token]&.first == :many
+      token == tokens.length
     end
     def regex(_pattern, _flags = '') = raise(Error.new('0A000', 'bounded regular expressions are not implemented in the Ruby experiment'))
     def math(name, args, context: nil)
@@ -568,6 +584,23 @@ when 'hex'
         whole = days.negative? ? -(-days / 30) : days / 30
         months += whole
         days -= whole * 30
+        sign = days.zero? && name == 'justify_interval' ? micros <=> 0 : days <=> 0
+        if months.positive? && sign.negative?
+          months -= 1
+          days += 30
+        elsif months.negative? && sign.positive?
+          months += 1
+          days -= 30
+        end
+      end
+      if name != 'justify_days'
+        if days.positive? && micros.negative?
+          days -= 1
+          micros += TimestampValue::DAY
+        elsif days.negative? && micros.positive?
+          days += 1
+          micros -= TimestampValue::DAY
+        end
       end
       IntervalValue.new(months, days, micros)
     end

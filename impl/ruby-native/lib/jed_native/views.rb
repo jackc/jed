@@ -22,8 +22,13 @@ module JedNative
     def create_view(statement)
       name = statement[:name]
       raise Error.new('42939', 'reserved relation name') if name.start_with?('jed_')
+      old = @views[name]
+      raise Error.new('42P07', 'persistent view cannot become temporary') if old && !old[:temporary] && statement[:temporary]
       return Result.new if statement[:if_not_exists] && relation_name_taken?(name)
       query = statement[:query]
+      if old && !statement[:recursive] && view_reaches?(view_references(query).map { |source| source[:name] }, name)
+        raise Error.new('42P17', 'infinite recursion in view definition')
+      end
       if statement[:recursive]
         seed = query[:kind] == :set_operation ? query[:left] : query
         raise Error.new('42P10', 'too many recursive view column names') if statement[:columns].length > view_query_columns(seed).length
@@ -36,6 +41,7 @@ module JedNative
       end
       dependencies = {}
       frozen_query = freeze_view_query(query, {}, [], dependencies)
+      temporary = statement[:temporary] || old&.dig(:temporary) || dependencies.keys.any? { |dependency| (@tables[dependency] || @views[dependency])&.dig(:temporary) }
       schema = view_query_columns(frozen_query)
       options = statement[:options] || {}
       validate_view_options(options)
@@ -50,14 +56,15 @@ module JedNative
       schema = schema.each_with_index.map { |column, index| column.merge(name: names[index] || column[:name], type: Types.normalize(column[:type])) }
       raise Error.new('0A000', 'view must have at least one column') if schema.empty?
       raise Error.new('42701', 'duplicate view column') unless schema.map { |column| column[:name] }.uniq.length == schema.length
+      raise Error.new('0A000', 'view star expansion cannot be bound by name') if frozen_query[:native_ambiguous_star]
       raise Error.new('42P16', 'view column has pseudo-type record') if schema.any? { |column| %w[record record[]].include?(column[:type]) }
       schema.each { |column| column[:type] = 'text' if column[:type] == 'unknown' }
-      view = statement.merge(query: frozen_query, columns: schema.map { |column| column[:name] }, schema: schema,
+      view = statement.merge(query: frozen_query, columns: schema.map { |column| column[:name] }, schema: schema, temporary: temporary,
                              dependencies: dependencies, defaults: {}, check_option: check_option)
       view[:sequence_dependencies], view[:type_dependencies] = view_catalog_dependencies(frozen_query, schema)
       if (old = @views[name]) && statement[:replace]
         previous = view_schema(old)
-        if schema.length < previous.length || previous.each_with_index.any? { |column, index| column[:name] != schema[index][:name] || column[:type] != schema[index][:type] || column[:type_mod] != schema[index][:type_mod] }
+        if schema.length < previous.length || previous.each_with_index.any? { |column, index| column[:name] != schema[index][:name] || column[:type] != schema[index][:type] || column[:type_mod] != schema[index][:type_mod] || column[:collation] != schema[index][:collation] }
           raise Error.new('42P16', 'cannot change existing view columns')
         end
         if view_reaches?(dependencies.keys, name)
@@ -68,6 +75,7 @@ module JedNative
         raise Error.new(statement[:replace] ? '42809' : '42P07', 'relation already exists')
       end
       @views[name] = view
+      revalidate_view_bindings(name) if old
       @dirty = true
       Result.new
     end
@@ -187,6 +195,7 @@ module JedNative
         end
       end
       result = super
+      revalidate_view_bindings(statement[:name]) if (statement[:actions] || []).any? { |action| action[:kind] == :add_column }
       (statement[:actions] || []).each do |action|
         next unless action[:kind] == :drop_column
         ordinal = original_columns.index(action[:column])
@@ -223,7 +232,16 @@ module JedNative
       view = view.merge(schema: view_schema(view).map(&:dup), columns: view_schema(view).map { |column| column[:name] }, defaults: (view[:defaults] || {}).dup)
       case statement[:action]
       when :rename
+        raise Error.new('42939', 'reserved relation name') if statement[:new_name].start_with?('jed_')
         raise Error.new('42P07', 'relation already exists') if relation_name_taken?(statement[:new_name])
+        @views.each_value do |dependent|
+          next unless view_dependencies(dependent).key?(name)
+          visit_view_nodes(dependent[:query]) do |node|
+            if (node[:with] || []).any? { |cte| cte[:name] == statement[:new_name] }
+              raise Error.new('0A000', 'renamed view would be captured by a CTE')
+            end
+          end
+        end
         @views.delete(name)
         view[:name] = statement[:new_name]
         @views[view[:name]] = view
@@ -432,6 +450,7 @@ module JedNative
         child = view_write_plan(inner, operation, seen + [view[:name]])
         input_names = view_schema(inner).map { |column| column[:name] }
       else
+        raise Error.new('55000', 'catalog view is not updatable') if introspection_relation?(source[:name])
         base = table(source[:name])
         input_names = base[:columns].map { |column| column[:name] }
         child = { table: source[:name], columns: input_names.to_h { |name| [name, { kind: :column, name: name, view_target: true }] },
@@ -626,14 +645,20 @@ module JedNative
           using.each do |name|
             (scope + columns).select { |column| column[:name] == name }.each { |column| record_view_dependency(column, dependencies) }
           end
+          scope = scope.map { |column| using.include?(column[:name]) ? column.merge(using_merged: true) : column }
           columns = columns.map { |column| using.include?(column[:name]) ? column.merge(qualified_only: true) : column }
           scope.concat(columns)
           join.merge(relation: source, on: freeze_view_expression(join[:on], ctes, scope + outer, dependencies))
         end
         query[:columns] = query[:columns].flat_map do |item|
           if item[:expr][:kind] == :star
+            visible = scope.select { |column| item[:expr][:table] ? column[:table] == item[:expr][:table] : !column[:qualified_only] }
+            query[:native_ambiguous_star] = true if visible.group_by { |column| [column[:table], column[:name]] }.any? { |_, fields| fields.length > 1 }
             expand_stars([item], scope).map do |expanded|
-              expanded.merge(expr: expanded[:expr].reject { |key, _| key == :native_ordinal }.merge(quoted: true, table_quoted: true), generated_star: true)
+              original = scope[expanded[:expr][:native_ordinal]]
+              expression = expanded[:expr].reject { |key, _| key == :native_ordinal }.merge(quoted: true, table_quoted: true)
+              expression[:table] = nil if original&.dig(:using_merged) && !item[:expr][:table]
+              expanded.merge(expr: expression, generated_star: true)
             end
           else
             [item]
@@ -661,7 +686,9 @@ module JedNative
                   elsif (view = @views[source[:name]])
                     source = source.merge(view_bound_relation: true)
                     dependencies[source[:name]] ||= []
-                    view_schema(view)
+                    view_schema(view).map { |column| column.merge(view_relation: source[:name], view_column: column[:name]) }
+                  elsif (catalog = introspection_columns(source[:name], source[:database]))
+                    catalog
                   else
                     source = source.merge(view_bound_relation: true)
                     table = table(source[:name])
@@ -694,6 +721,7 @@ module JedNative
         return freeze_view_query(value, ctes, scope, dependencies) if %i[select values set_operation].include?(value[:kind])
         if value[:kind] == :column
           matches = scope.select { |column| column[:name] == value[:name] && (value[:table] ? column[:table] == value[:table] : !column[:qualified_only]) }
+          value = value.merge(view_binding: matches.map { |column| [column[:view_relation], column[:view_column], column[:table]] })
           matches.each { |column| record_view_dependency(column, dependencies) }
         elsif value[:kind] == :call && %w[nextval currval setval].include?(value[:name]) && value[:args]&.first&.dig(:kind) == :literal
           name = value[:args].first[:value]
@@ -708,6 +736,24 @@ module JedNative
       return unless column[:view_relation]
       names = (dependencies[column[:view_relation]] ||= [])
       names << column[:view_column] unless names.include?(column[:view_column])
+    end
+
+    def revalidate_view_bindings(relation)
+      @views.each do |name, view|
+        next if name == relation || !view_dependencies(view).key?(relation)
+        before = []
+        visit_view_nodes(view[:query]) { |node| before << node[:view_binding] if node[:kind] == :column }
+        next if before.all?(&:nil?)
+        begin
+          rebound = freeze_view_query(view[:query], {}, [], {})
+          after = []
+          visit_view_nodes(rebound) { |node| after << node[:view_binding] if node[:kind] == :column }
+          raise Error.new('0A000', 'schema change would alter a view binding') unless before == after
+          view_query_columns(rebound)
+        rescue Error
+          raise Error.new('0A000', 'schema change would alter a view binding')
+        end
+      end
     end
 
     def visit_view_nodes(value, &block)
