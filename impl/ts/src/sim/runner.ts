@@ -1827,6 +1827,16 @@ export class SimRunner {
   // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
   // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
   private stepAttach(i: number, name: string): void {
+    // Attaching takes the writer gate. The generator never attaches while a writer is open; a trace
+    // that does (a shrinking artifact) would wait forever in a threaded core, so it is invalid.
+    const writers = [...this.sessions]
+      .filter(([, ss]) => ss.write)
+      .map(([sid]) => sid)
+      .sort();
+    if (writers.length > 0) {
+      this.fail(i, `attach ${name} while ${writers[0]} holds the writer gate`);
+      return;
+    }
     let d = this.dbs.get(name);
     if (
       d !== undefined &&

@@ -2733,6 +2733,21 @@ impl<'a> Runner<'a> {
     /// simulated filesystem if it does not exist — create's temp file, sync, rename, and directory
     /// barrier, any of which a fault may interrupt. Already attached, it only reports.
     fn step_attach(&mut self, i: usize, name: &str) {
+        // Attaching takes the writer gate. The generator never attaches while a writer is open; a
+        // trace that does (a shrinking artifact) would wait forever on this one thread, so it is
+        // invalid.
+        let mut writers: Vec<&String> = self
+            .sessions
+            .iter()
+            .filter(|(_, ss)| ss.write)
+            .map(|(sid, _)| sid)
+            .collect();
+        writers.sort();
+        if let Some(sid) = writers.first() {
+            let msg = format!("attach {name} while {sid} holds the writer gate");
+            self.fail(i, msg);
+            return;
+        }
         if self.dbs.contains_key(name)
             && self.db_version(name) != 0
             && (!self.service || self.attached_in_all(name))
