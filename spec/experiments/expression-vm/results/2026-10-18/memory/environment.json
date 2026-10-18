@@ -1,0 +1,17 @@
+{
+  "base": "172e3b0ae9f604f5284147d77ac7eb14b07917a7",
+  "revision": "e9f39919721d4448137c47ac8f39b1c3f095a8c1",
+  "storage": "memory",
+  "repeats": 3,
+  "system": "Linux gandolf 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux",
+  "started_at": "2026-10-18T18:45:21Z",
+  "cpu_affinity": 3,
+  "cpu": "model name\t: Intel(R) Core(TM) Ultra 9 285K",
+  "source_sha256": "7ef324042545d25da103ce74f0b897c06a3b5c544577b327b8e2921a3fd5f3ec",
+  "workloads_sha256": "d6134ad6cc18af1289aabf187fc9f75606ae2170aa2905abb043dad1293e0f7b",
+  "runner_sha256": "48555589f2507f1afdc1d3e0ac5c60f17bee962e82c1022f7d099eed0a4fec4d",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "go": "go version go1.27.1 linux/amd64",
+  "node": "v26.10.0",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+}
