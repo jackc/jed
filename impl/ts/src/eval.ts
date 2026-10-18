@@ -379,19 +379,229 @@ function decodeUtf8Text(b: Uint8Array): string {
 // PostgreSQL's qual-list rule; each AND node charges on entry as in evalExpr, and every other node
 // evaluates as a value (spec/design/cost.md §3).
 export function* evalFilterSteps(e: RExpr, row: Row, env: EvalEnv, m: Meter): Steps<boolean> {
-  if (e.kind !== "and") return isTrue(yield* evalExprSteps(e, row, env, m));
+  const result = evalFilterMaybeSteps(e, row, env, m);
+  return isPendingEval(result) ? yield* result : result;
+}
+
+export function evalFilterMaybeSteps(
+  e: RExpr,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): EvalResult<boolean> {
+  if (e.kind !== "and") {
+    const value = evalExprMaybeSteps(e, row, env, m);
+    return isPendingEval(value) ? resumeFilterValue(value) : isTrue(value);
+  }
   m.guard();
   m.charge(operatorCost("and"));
-  return (
-    (yield* evalFilterSteps(e.lhs, row, env, m)) && (yield* evalFilterSteps(e.rhs, row, env, m))
-  );
+  const left = evalFilterMaybeSteps(e.lhs, row, env, m);
+  return isPendingEval(left)
+    ? resumeFilterLeft(e.rhs, left, row, env, m)
+    : left && evalFilterMaybeSteps(e.rhs, row, env, m);
+}
+
+function* resumeFilterValue(value: Steps<Value>): Steps<boolean> {
+  return isTrue(yield* value);
+}
+
+function* resumeFilterLeft(
+  rhs: RExpr,
+  left: Steps<boolean>,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): Steps<boolean> {
+  if (!(yield* left)) return false;
+  const right = evalFilterMaybeSteps(rhs, row, env, m);
+  return isPendingEval(right) ? yield* right : right;
 }
 
 // Of<K> is the RExpr variant evalExpr's case K narrows to; each large arm runs in a function of
 // its own (see evalExpr).
 type Of<K extends RExpr["kind"]> = Extract<RExpr, { kind: K }>;
 
+// Most expression nodes finish without an effect. Keep that traversal as ordinary calls and
+// construct a continuation only when a child actually needs one. Both drivers use this dispatch;
+// pending continuations retain evaluated operands and never restart an expression.
+export type EvalResult<T> = T | Steps<T>;
+
+export function isPendingEval<T>(value: EvalResult<T>): value is Steps<T> {
+  return typeof value === "object" && value !== null && "next" in value;
+}
+
 export function* evalExprSteps(e: RExpr, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+  const value = evalExprMaybeSteps(e, row, env, m);
+  return isPendingEval(value) ? yield* value : value;
+}
+
+type UnaryApply<E> = (e: E, value: Value, env: EvalEnv, m: Meter) => Value;
+type BinaryApply<E> = (e: E, left: Value, right: Value, env: EvalEnv, m: Meter) => Value;
+type CallApply<E> = (e: E, values: Value[], env: EvalEnv, m: Meter) => Value;
+
+function evalUnaryOperand<E>(
+  e: E,
+  operand: RExpr,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+  apply: UnaryApply<E>,
+): EvalResult<Value> {
+  const value = evalExprMaybeSteps(operand, row, env, m);
+  return isPendingEval(value) ? resumeUnary(e, value, env, m, apply) : apply(e, value, env, m);
+}
+
+function* resumeUnary<E>(
+  e: E,
+  value: Steps<Value>,
+  env: EvalEnv,
+  m: Meter,
+  apply: UnaryApply<E>,
+): Steps<Value> {
+  return apply(e, yield* value, env, m);
+}
+
+function evalBinaryOperands<E>(
+  e: E,
+  lhs: RExpr,
+  rhs: RExpr,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+  apply: BinaryApply<E>,
+): EvalResult<Value> {
+  const left = evalExprMaybeSteps(lhs, row, env, m);
+  return isPendingEval(left)
+    ? resumeBinaryLeft(e, left, rhs, row, env, m, apply)
+    : evalBinaryRight(e, left, rhs, row, env, m, apply);
+}
+
+function* resumeBinaryLeft<E>(
+  e: E,
+  left: Steps<Value>,
+  rhs: RExpr,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+  apply: BinaryApply<E>,
+): Steps<Value> {
+  const result = evalBinaryRight(e, yield* left, rhs, row, env, m, apply);
+  return isPendingEval(result) ? yield* result : result;
+}
+
+function evalBinaryRight<E>(
+  e: E,
+  left: Value,
+  rhs: RExpr,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+  apply: BinaryApply<E>,
+): EvalResult<Value> {
+  const right = evalExprMaybeSteps(rhs, row, env, m);
+  return isPendingEval(right)
+    ? resumeBinaryRight(e, left, right, env, m, apply)
+    : apply(e, left, right, env, m);
+}
+
+function* resumeBinaryRight<E>(
+  e: E,
+  left: Value,
+  right: Steps<Value>,
+  env: EvalEnv,
+  m: Meter,
+  apply: BinaryApply<E>,
+): Steps<Value> {
+  return apply(e, left, yield* right, env, m);
+}
+
+function evalCallOperands<E>(
+  e: E,
+  args: readonly RExpr[],
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+  apply: CallApply<E>,
+  strict = false,
+): EvalResult<Value> {
+  const values = collectOperands(args, row, env, m, strict);
+  return isPendingEval(values)
+    ? resumeCall(e, values, env, m, apply)
+    : values === null
+      ? nullValue()
+      : apply(e, values, env, m);
+}
+
+function* resumeCall<E>(
+  e: E,
+  values: Steps<Value[] | null>,
+  env: EvalEnv,
+  m: Meter,
+  apply: CallApply<E>,
+): Steps<Value> {
+  const resolved = yield* values;
+  return resolved === null ? nullValue() : apply(e, resolved, env, m);
+}
+
+function collectOperands(
+  args: readonly RExpr[],
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+  strict: boolean,
+): EvalResult<Value[] | null> {
+  const values: Value[] = [];
+  const pending = appendOperands(args, row, env, m, strict, values);
+  return pending === null
+    ? null
+    : pending === undefined
+      ? values
+      : resumeOperands(args, row, env, m, strict, values, pending);
+}
+
+// The filled prefix is also the next argument index. This one loop continues after every
+// suspension, so a long argument list retains one continuation rather than a chain of them.
+function appendOperands(
+  args: readonly RExpr[],
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+  strict: boolean,
+  values: Value[],
+): Steps<Value> | null | undefined {
+  while (values.length < args.length) {
+    const value = evalExprMaybeSteps(args[values.length]!, row, env, m);
+    if (isPendingEval(value)) return value;
+    if (strict && value.kind === "null") return null;
+    values.push(value);
+  }
+}
+
+function* resumeOperands(
+  args: readonly RExpr[],
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+  strict: boolean,
+  values: Value[],
+  pending: Steps<Value>,
+): Steps<Value[] | null> {
+  for (;;) {
+    const value = yield* pending;
+    if (strict && value.kind === "null") return null;
+    values.push(value);
+    const next = appendOperands(args, row, env, m, strict, values);
+    if (next === null) return null;
+    if (next === undefined) return values;
+    pending = next;
+  }
+}
+
+function applyNot(_e: Of<"not">, value: Value): Value {
+  return boolNot(value);
+}
+
+export function evalExprMaybeSteps(e: RExpr, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). evalExpr recurses once
   // per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot; it
   // is a no-op when no ceiling is set (spec/design/cost.md §6).
@@ -402,13 +612,13 @@ export function* evalExprSteps(e: RExpr, row: Row, env: EvalEnv, m: Meter): Step
       // demand-fault backstop (spec/design/bplus-reshape.md §5): deterministic rows, never a
       // NULL-fold; deliberately unmetered (§6).
       const v = row[e.index]!;
-      return v.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(v.ref) : v;
+      return v.kind === "unfetched" ? resolveUnfetchedSelfSteps(v.ref) : v;
     }
     case "outerColumn": {
       // A correlated reference: column `index` of the enclosing row `level` hops out (§26), with
       // the same demand-fault backstop as the column case.
       const v = env.outer[env.outer.length - e.level]![e.index]!;
-      return v.kind === "unfetched" ? yield* resolveUnfetchedSelfSteps(v.ref) : v;
+      return v.kind === "unfetched" ? resolveUnfetchedSelfSteps(v.ref) : v;
     }
     case "param":
       // The supplied value, already coerced to its inferred type by bindParams before execution
@@ -446,9 +656,9 @@ export function* evalExprSteps(e: RExpr, row: Row, env: EvalEnv, m: Meter): Step
     case "constNull":
       return nullValue();
     case "row":
-      return yield* evalRowNodeSteps(e, row, env, m);
+      return evalRowNode(e, row, env, m);
     case "array":
-      return yield* evalArrayNodeSteps(e, row, env, m);
+      return evalArrayNode(e, row, env, m);
     case "constArray":
       // A folded array constant (shape preserved) — return it directly.
       return e.value;
@@ -456,143 +666,148 @@ export function* evalExprSteps(e: RExpr, row: Row, env: EvalEnv, m: Meter): Step
       // A folded range constant (already canonical) — return it directly.
       return e.value;
     case "field":
-      return yield* evalFieldNodeSteps(e, row, env, m);
+      return evalFieldNode(e, row, env, m);
     case "subscript":
-      return yield* evalSubscriptNodeSteps(e, row, env, m);
+      return evalSubscriptNodeSteps(e, row, env, m);
     case "cast":
-      return yield* evalCastNodeSteps(e, row, env, m);
+      return evalCastNode(e, row, env, m);
     case "arrayCast":
-      return yield* evalArrayCastNodeSteps(e, row, env, m);
+      return evalArrayCastNode(e, row, env, m);
     case "compositeCast":
-      return yield* evalCompositeCastNodeSteps(e, row, env, m);
+      return evalCompositeCastNode(e, row, env, m);
     case "neg":
-      return yield* evalNegNodeSteps(e, row, env, m);
+      return evalNegNode(e, row, env, m);
     case "not": {
       m.charge(operatorCost("not"));
-      return boolNot(yield* evalExprSteps(e.operand, row, env, m));
+      return evalUnaryOperand(e, e.operand, row, env, m, applyNot);
     }
     case "arith":
-      return yield* evalArithNodeSteps(e, row, env, m);
+      return evalArithNode(e, row, env, m);
     case "compare":
-      return yield* evalCompareNodeSteps(e, row, env, m);
+      return evalCompareNode(e, row, env, m);
     // AND / OR short-circuit left to right (cost.md §3): a FALSE left operand decides AND, a TRUE
     // one decides OR, and the right operand is then never evaluated or charged.
     case "and":
-      return yield* evalAndNodeSteps(e, row, env, m);
+      return evalBooleanNode(e, row, env, m);
     case "or":
-      return yield* evalOrNodeSteps(e, row, env, m);
+      return evalBooleanNode(e, row, env, m);
     case "jsonGet":
-      return yield* evalJsonGetNodeSteps(e, row, env, m);
+      return evalJsonGetNodeSteps(e, row, env, m);
     case "jsonContains":
-      return yield* evalJsonContainsNodeSteps(e, row, env, m);
+      return evalJsonContainsNodeSteps(e, row, env, m);
     case "jsonHasKey":
-      return yield* evalJsonHasKeyNodeSteps(e, row, env, m);
+      return evalJsonHasKeyNodeSteps(e, row, env, m);
     case "jsonConcat":
-      return yield* evalJsonConcatNodeSteps(e, row, env, m);
+      return evalJsonConcatNodeSteps(e, row, env, m);
     case "jsonDelete":
-      return yield* evalJsonDeleteNodeSteps(e, row, env, m);
+      return evalJsonDeleteNodeSteps(e, row, env, m);
     case "isNull":
-      return yield* evalIsNullNodeSteps(e, row, env, m);
+      return evalIsNullNode(e, row, env, m);
     case "isJson":
-      return yield* evalIsJsonNodeSteps(e, row, env, m);
+      return evalIsJsonNode(e, row, env, m);
     case "jsonCtor":
-      return yield* evalJsonCtorNodeSteps(e, row, env, m);
+      return evalJsonCtorNode(e, row, env, m);
     case "distinct":
-      return yield* evalDistinctNodeSteps(e, row, env, m);
+      return evalDistinctNode(e, row, env, m);
     case "like":
-      return yield* evalLikeNodeSteps(e, row, env, m);
+      return evalLikeNodeSteps(e, row, env, m);
     case "regex":
-      return yield* evalRegexNodeSteps(e, row, env, m);
+      return evalRegexNodeSteps(e, row, env, m);
     case "regexFunc":
-      return yield* evalRegexFuncNodeSteps(e, row, env, m);
+      return evalRegexFuncNodeSteps(e, row, env, m);
     case "casing":
-      return yield* evalCasingNodeSteps(e, row, env, m);
+      return evalCasingNode(e, row, env, m);
     case "atTimeZone":
-      return yield* evalAtTimeZoneNodeSteps(e, row, env, m);
+      return evalAtTimeZoneNodeSteps(e, row, env, m);
     case "dateTrunc":
-      return yield* evalDateTruncNodeSteps(e, row, env, m);
+      return evalDateTruncNodeSteps(e, row, env, m);
     case "extract":
-      return yield* evalExtractNodeSteps(e, row, env, m);
+      return evalExtractNodeSteps(e, row, env, m);
     case "dateConvert":
-      return yield* evalDateConvertNodeSteps(e, row, env, m);
+      return evalDateConvertNode(e, row, env, m);
     case "dateClock":
       return evalDateClockNode(e, env, m);
     case "case":
-      return yield* evalCaseNodeSteps(e, row, env, m);
+      return evalCaseNodeSteps(e, row, env, m);
     case "coalesce":
-      return yield* evalCoalesceNodeSteps(e, row, env, m);
+      return evalCoalesceNodeSteps(e, row, env, m);
     case "greatestLeast":
-      return yield* evalGreatestLeastNodeSteps(e, row, env, m);
+      return evalGreatestLeastNodeSteps(e, row, env, m);
     case "nullIf":
-      return yield* evalNullIfNodeSteps(e, row, env, m);
+      return evalNullIfNode(e, row, env, m);
     case "hostFunc":
-      return yield* evalHostFuncNodeSteps(e, row, env, m);
+      return evalHostFuncNodeSteps(e, row, env, m);
     case "scalarFunc":
-      return yield* evalScalarFuncNodeSteps(e, row, env, m);
+      return evalScalarFuncNode(e, row, env, m);
     case "arrayFunc":
-      return yield* evalArrayFuncNodeSteps(e, row, env, m);
+      return evalArrayFuncNode(e, row, env, m);
     case "rangeFunc":
-      return yield* evalRangeFuncNodeSteps(e, row, env, m);
+      return evalRangeFuncNode(e, row, env, m);
     case "rangeCtor":
-      return yield* evalRangeCtorNodeSteps(e, row, env, m);
+      return evalRangeCtorNodeSteps(e, row, env, m);
     case "rangeOp":
-      return yield* evalRangeOpNodeSteps(e, row, env, m);
+      return evalRangeOpNodeSteps(e, row, env, m);
     case "rangeSetOp":
-      return yield* evalRangeSetOpNodeSteps(e, row, env, m);
+      return evalRangeSetOpNodeSteps(e, row, env, m);
     case "variadic":
-      return yield* evalVariadicNodeSteps(e, row, env, m);
+      return evalVariadicNodeSteps(e, row, env, m);
     case "jsonBuild":
-      return yield* evalJsonBuildNodeSteps(e, row, env, m);
+      return evalJsonBuildNodeSteps(e, row, env, m);
     case "jsonSetInsert":
-      return yield* evalJsonSetInsertNodeSteps(e, row, env, m);
+      return evalJsonSetInsertNodeSteps(e, row, env, m);
     case "jsonImage":
-      return yield* evalJsonImageNodeSteps(e, row, env, m);
+      return evalJsonImageNodeSteps(e, row, env, m);
     case "jsonObjectFromArrays":
-      return yield* evalJsonObjectFromArraysNodeSteps(e, row, env, m);
+      return evalJsonObjectFromArraysNodeSteps(e, row, env, m);
     case "jsonPathFn":
-      return yield* evalJsonPathFnNodeSteps(e, row, env, m);
+      return evalJsonPathFnNodeSteps(e, row, env, m);
     case "jsonSqlFn":
-      return yield* evalJsonSqlFnNodeSteps(e, row, env, m);
+      return evalJsonSqlFnNodeSteps(e, row, env, m);
     case "subquery":
-      return yield* evalSubqueryNodeSteps(e, row, env, m);
+      return evalSubqueryNodeSteps(e, row, env, m);
     case "inValues":
-      return yield* evalInValuesNodeSteps(e, row, env, m);
+      return evalInValuesNodeSteps(e, row, env, m);
     case "quantified":
-      return yield* evalQuantifiedNodeSteps(e, row, env, m);
+      return evalQuantifiedNodeSteps(e, row, env, m);
     case "widthBucketArray":
-      return yield* evalWidthBucketArrayNodeSteps(e, row, env, m);
+      return evalWidthBucketArrayNodeSteps(e, row, env, m);
   }
 }
 
-function* evalRowNodeSteps(e: Of<"row">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalRowNode(e: Of<"row">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   // A ROW(...) constructor — one operator_eval, then build the composite from the evaluated
   // fields (spec/design/composite.md §1, cost.md §9).
   m.charge(COSTS.operatorEval);
-  const vals: Value[] = new Array(e.fields.length);
-  for (let i = 0; i < e.fields.length; i++)
-    vals[i] = yield* evalExprSteps(e.fields[i]!, row, env, m);
+  return evalCallOperands(e, e.fields, row, env, m, applyRow);
+}
+
+function applyRow(_e: Of<"row">, vals: Value[], _env: EvalEnv, _m: Meter): Value {
   return compositeValue(vals);
 }
 
-function* evalArrayNodeSteps(e: Of<"array">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalArrayNode(e: Of<"array">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   // An ARRAY[...] constructor — one operator_eval. A `nested` constructor stacks its sub-arrays
   // into one higher dimension (spec/design/array.md §4); otherwise a flat 1-D array.
   m.charge(COSTS.operatorEval);
-  const elems: Value[] = new Array(e.elements.length);
-  for (let i = 0; i < e.elements.length; i++)
-    elems[i] = yield* evalExprSteps(e.elements[i]!, row, env, m);
-  const out = e.nested ? buildNestedArray(elems) : arrayValue(elems);
+  return evalCallOperands(e, e.elements, row, env, m, applyArray);
+}
+
+function applyArray(e: Of<"array">, vals: Value[], _env: EvalEnv, m: Meter): Value {
+  const out = e.nested ? buildNestedArray(vals) : arrayValue(vals);
   // A growth kernel (cost.md §8.1), free when every element is constant.
   if (!e.elements.every(rexprIsConstant)) chargeOutput(m, out);
   return out;
 }
 
-function* evalFieldNodeSteps(e: Of<"field">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalFieldNode(e: Of<"field">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   // Field selection — one operator_eval, then pull the resolved field ordinal out of the
   // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in range
   // by construction (resolve fixed it against the static field list).
   m.charge(COSTS.operatorEval);
-  const base = yield* evalExprSteps(e.base, row, env, m);
+  return evalUnaryOperand(e, e.base, row, env, m, applyField);
+}
+
+function applyField(e: Of<"field">, base: Value, _env: EvalEnv, _m: Meter): Value {
   if (base.kind === "null") return nullValue();
   if (base.kind !== "composite") throw typeError("internal: field access on a non-composite value");
   return base.fields[e.index]!;
@@ -611,9 +826,12 @@ function* evalSubscriptNodeSteps(
   return yield* evalSubscriptSteps(e, row, env, m);
 }
 
-function* evalCastNodeSteps(e: Of<"cast">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalCastNode(e: Of<"cast">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(COSTS.operatorEval);
-  const v = yield* evalExprSteps(e.operand, row, env, m);
+  return evalUnaryOperand(e, e.operand, row, env, m, applyCast);
+}
+
+function applyCast(e: Of<"cast">, v: Value, env: EvalEnv, m: Meter): Value {
   if (v.kind === "null") return nullValue();
   // Any scalar → text (casts.toml, types.md §5): the type's own output form, timestamptz in the
   // session zone.
@@ -658,17 +876,20 @@ function evalTemporalCast(v: Value, target: ScalarType, tm: TemporalTypmod): Val
   return out;
 }
 
-function* evalArrayCastNodeSteps(
+function evalArrayCastNode(
   e: Of<"arrayCast">,
   row: Row,
   env: EvalEnv,
   m: Meter,
-): Steps<Value> {
+): EvalResult<Value> {
   // The three array-involving casts (spec/design/array.md §7): array → text (array_out),
   // runtime text → T[] (array_in per row), and element-wise array → array (each element through
   // the scalar cast). The node carries the cast's operator_eval charge (no new cost unit).
   m.charge(COSTS.operatorEval);
-  const v = yield* evalExprSteps(e.operand, row, env, m);
+  return evalUnaryOperand(e, e.operand, row, env, m, applyArrayCast);
+}
+
+function applyArrayCast(e: Of<"arrayCast">, v: Value, env: EvalEnv, m: Meter): Value {
   if (v.kind === "null") return nullValue();
   if (e.toElem === null) {
     // array → text: render via array_out (PG-byte-exact §7). A timestamptz at any depth renders
@@ -714,18 +935,21 @@ function* evalArrayCastNodeSteps(
   return out;
 }
 
-function* evalCompositeCastNodeSteps(
+function evalCompositeCastNode(
   e: Of<"compositeCast">,
   row: Row,
   env: EvalEnv,
   m: Meter,
-): Steps<Value> {
+): EvalResult<Value> {
   // The two runtime composite casts (spec/design/composite.md §8): composite → text renders
   // record_out, and runtime text → composite parses record_in against the target composite's field
   // types (22P02 malformed / a field's own input error — the same errors the '(…)'::addr literal
   // path raises). One operator_eval, like arrayCast.
   m.charge(COSTS.operatorEval);
-  const v = yield* evalExprSteps(e.operand, row, env, m);
+  return evalUnaryOperand(e, e.operand, row, env, m, applyCompositeCast);
+}
+
+function applyCompositeCast(e: Of<"compositeCast">, v: Value, env: EvalEnv, m: Meter): Value {
   if (v.kind === "null") return nullValue();
   if (v.kind === "composite" && e.to === null) {
     // A timestamptz at any depth renders in the SESSION zone, one timezone unit per finite
@@ -745,9 +969,12 @@ function* evalCompositeCastNodeSteps(
   throw new Error("a compositeCast operand is text or composite (resolver-gated)");
 }
 
-function* evalNegNodeSteps(e: Of<"neg">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalNegNode(e: Of<"neg">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(operatorCost("neg"));
-  const v = yield* evalExprSteps(e.operand, row, env, m);
+  return evalUnaryOperand(e, e.operand, row, env, m, applyNeg);
+}
+
+function applyNeg(e: Of<"neg">, v: Value, _env: EvalEnv, _m: Meter): Value {
   if (v.kind === "null") return nullValue();
   if (isInterval(e.result)) {
     if (v.kind !== "interval") throw typeError("internal: non-interval unary minus");
@@ -771,10 +998,12 @@ function* evalNegNodeSteps(e: Of<"neg">, row: Row, env: EvalEnv, m: Meter): Step
   return intValue(n);
 }
 
-function* evalArithNodeSteps(e: Of<"arith">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalArithNode(e: Of<"arith">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(operatorCost(e.op));
-  const a = yield* evalExprSteps(e.lhs, row, env, m);
-  const b = yield* evalExprSteps(e.rhs, row, env, m);
+  return evalBinaryOperands(e, e.lhs, e.rhs, row, env, m, applyArith);
+}
+
+function applyArith(e: Of<"arith">, a: Value, b: Value, _env: EvalEnv, m: Meter): Value {
   if (a.kind === "null" || b.kind === "null") return nullValue();
   // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32, date ±
   // interval → timestamp. A Date operand is present iff this is date arithmetic (the resolver
@@ -845,10 +1074,12 @@ function* evalArithNodeSteps(e: Of<"arith">, row: Row, env: EvalEnv, m: Meter): 
   return evalArith(e.op, a.int, b.int, e.result);
 }
 
-function* evalCompareNodeSteps(e: Of<"compare">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalCompareNode(e: Of<"compare">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(operatorCost(e.op));
-  const a = yield* evalExprSteps(e.lhs, row, env, m);
-  const b = yield* evalExprSteps(e.rhs, row, env, m);
+  return evalBinaryOperands(e, e.lhs, e.rhs, row, env, m, applyCompare);
+}
+
+function applyCompare(e: Of<"compare">, a: Value, b: Value, _env: EvalEnv, m: Meter): Value {
   // A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
   // where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
   m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
@@ -925,20 +1156,38 @@ function* evalCompareNodeSteps(e: Of<"compare">, row: Row, env: EvalEnv, m: Mete
   }
 }
 
-function* evalAndNodeSteps(e: Of<"and">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
-  m.charge(operatorCost("and"));
-  const a = yield* evalExprSteps(e.lhs, row, env, m);
-  if (a.kind === "bool" && !a.value) return a;
-  const b = yield* evalExprSteps(e.rhs, row, env, m);
-  return boolAnd(a, b);
+function evalBooleanNode(e: Of<"and" | "or">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
+  m.charge(operatorCost(e.kind));
+  const left = evalExprMaybeSteps(e.lhs, row, env, m);
+  return isPendingEval(left)
+    ? resumeBooleanLeft(e, left, row, env, m)
+    : evalBooleanRight(e, left, row, env, m);
 }
 
-function* evalOrNodeSteps(e: Of<"or">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
-  m.charge(operatorCost("or"));
-  const a = yield* evalExprSteps(e.lhs, row, env, m);
-  if (a.kind === "bool" && a.value) return a;
-  const b = yield* evalExprSteps(e.rhs, row, env, m);
-  return boolOr(a, b);
+function* resumeBooleanLeft(
+  e: Of<"and" | "or">,
+  left: Steps<Value>,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): Steps<Value> {
+  const result = evalBooleanRight(e, yield* left, row, env, m);
+  return isPendingEval(result) ? yield* result : result;
+}
+
+function evalBooleanRight(
+  e: Of<"and" | "or">,
+  left: Value,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): EvalResult<Value> {
+  if (left.kind === "bool" && left.value === (e.kind === "or")) return left;
+  return evalBinaryRight(e, left, e.rhs, row, env, m, applyBoolean);
+}
+
+function applyBoolean(e: Of<"and" | "or">, left: Value, right: Value): Value {
+  return e.kind === "and" ? boolAnd(left, right) : boolOr(left, right);
 }
 
 function* evalJsonGetNodeSteps(e: Of<"jsonGet">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
@@ -1110,18 +1359,24 @@ function* evalJsonDeleteNodeSteps(
   return jsonbValue(result);
 }
 
-function* evalIsNullNodeSteps(e: Of<"isNull">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalIsNullNode(e: Of<"isNull">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(COSTS.operatorEval);
   // PG's `IS [NOT] NULL` (spec/design/composite.md §5): for a composite the two are NOT
   // negations but the all-fields rule (one level deep, not recursive); a scalar follows the
   // ordinary rule. isNullTest folds both cases. Replaces the old `(v is null) !== negated`.
-  const operand = yield* evalExprSteps(e.operand, row, env, m);
+  return evalUnaryOperand(e, e.operand, row, env, m, applyIsNull);
+}
+
+function applyIsNull(e: Of<"isNull">, operand: Value, _env: EvalEnv, _m: Meter): Value {
   return { kind: "bool", value: isNullTest(operand, e.negated) };
 }
 
-function* evalIsJsonNodeSteps(e: Of<"isJson">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalIsJsonNode(e: Of<"isJson">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(COSTS.operatorEval);
-  const v = yield* evalExprSteps(e.operand, row, env, m);
+  return evalUnaryOperand(e, e.operand, row, env, m, applyIsJson);
+}
+
+function applyIsJson(e: Of<"isJson">, v: Value, _env: EvalEnv, _m: Meter): Value {
   let ok: boolean;
   switch (v.kind) {
     case "null":
@@ -1152,9 +1407,12 @@ function* evalIsJsonNodeSteps(e: Of<"isJson">, row: Row, env: EvalEnv, m: Meter)
   return { kind: "bool", value: ok !== e.negated };
 }
 
-function* evalJsonCtorNodeSteps(e: Of<"jsonCtor">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalJsonCtorNode(e: Of<"jsonCtor">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(COSTS.operatorEval);
-  const v = yield* evalExprSteps(e.operand, row, env, m);
+  return evalUnaryOperand(e, e.operand, row, env, m, applyJsonCtor);
+}
+
+function applyJsonCtor(e: Of<"jsonCtor">, v: Value, _env: EvalEnv, _m: Meter): Value {
   if (v.kind === "null") return nullValue(); // STRICT
   if (v.kind !== "text") {
     throw new Error("BUG: resolver restricts JSON() to a text operand");
@@ -1174,10 +1432,12 @@ function* evalJsonCtorNodeSteps(e: Of<"jsonCtor">, row: Row, env: EvalEnv, m: Me
   return jsonValue(v.text);
 }
 
-function* evalDistinctNodeSteps(e: Of<"distinct">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalDistinctNode(e: Of<"distinct">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(COSTS.operatorEval);
-  const dl = yield* evalExprSteps(e.lhs, row, env, m);
-  const dr = yield* evalExprSteps(e.rhs, row, env, m);
+  return evalBinaryOperands(e, e.lhs, e.rhs, row, env, m, applyDistinct);
+}
+
+function applyDistinct(e: Of<"distinct">, dl: Value, dr: Value, _env: EvalEnv, m: Meter): Value {
   // IS [NOT] DISTINCT FROM is a comparison: a decimal pair charges its size-scaled
   // decimal_work like "compare" (spec/design/cost.md §3 "decimal_work").
   m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(dl, dr) - 1));
@@ -1416,9 +1676,12 @@ function* evalRegexFuncNodeSteps(
   }
 }
 
-function* evalCasingNodeSteps(e: Of<"casing">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalCasingNode(e: Of<"casing">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   m.charge(COSTS.operatorEval);
-  const v = yield* evalExprSteps(e.arg, row, env, m);
+  return evalUnaryOperand(e, e.arg, row, env, m, applyCasing);
+}
+
+function applyCasing(e: Of<"casing">, v: Value, env: EvalEnv, _m: Meter): Value {
   if (v.kind === "null") return nullValue();
   if (v.kind !== "text") {
     throw new Error("unreachable: resolver requires text upper/lower operand");
@@ -1530,14 +1793,17 @@ function* evalExtractNodeSteps(e: Of<"extract">, row: Row, env: EvalEnv, m: Mete
   return d === null ? nullValue() : decimalValue(d);
 }
 
-function* evalDateConvertNodeSteps(
+function evalDateConvertNode(
   e: Of<"dateConvert">,
   row: Row,
   env: EvalEnv,
   m: Meter,
-): Steps<Value> {
+): EvalResult<Value> {
   m.charge(COSTS.operatorEval);
-  const v = yield* evalExprSteps(e.inner, row, env, m);
+  return evalUnaryOperand(e, e.inner, row, env, m, applyDateConvert);
+}
+
+function applyDateConvert(e: Of<"dateConvert">, v: Value, env: EvalEnv, m: Meter): Value {
   if (v.kind === "null") return nullValue();
   return evalDateConvert(v, e.to, env, m);
 }
@@ -1623,14 +1889,16 @@ function* evalGreatestLeastNodeSteps(
   return best ?? nullValue();
 }
 
-function* evalNullIfNodeSteps(e: Of<"nullIf">, row: Row, env: EvalEnv, m: Meter): Steps<Value> {
+function evalNullIfNode(e: Of<"nullIf">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
   // NULLIF is EAGER (grammar.md §58): charge the node, evaluate a then b (both, always —
   // NULLIF(1, 1/0) traps), then compare them as `=` does, charging the same size-scaled work
   // (decimalWork / varlenCompare). Equal → NULL; otherwise — including when either side is NULL —
   // the result is a.
   m.charge(COSTS.operatorEval);
-  const a = yield* evalExprSteps(e.args[0]!, row, env, m);
-  const b = yield* evalExprSteps(e.args[1]!, row, env, m);
+  return evalBinaryOperands(e, e.args[0]!, e.args[1]!, row, env, m, applyNullIf);
+}
+
+function applyNullIf(e: Of<"nullIf">, a: Value, b: Value, _env: EvalEnv, m: Meter): Value {
   m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
   m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(a, b) - 1));
   m.guard();
@@ -1686,30 +1954,28 @@ function* evalHostFuncNodeSteps(e: Of<"hostFunc">, row: Row, env: EvalEnv, m: Me
   return out;
 }
 
-function* evalScalarFuncNodeSteps(
+function evalScalarFuncNode(
   e: Of<"scalarFunc">,
   row: Row,
   env: EvalEnv,
   m: Meter,
-): Steps<Value> {
-  // One operator_eval per call (the uniform weight); arguments charge their own.
+): EvalResult<Value> {
+  // Charge before arguments, whose strict NULL rule still stops at the first NULL.
   m.charge(COSTS.operatorEval);
+  return evalCallOperands(e, e.args, row, env, m, applyScalarFunc, e.func !== "quote_nullable");
+}
+
+function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Meter): Value {
   // quote_nullable is the one NON-STRICT scalar function: a NULL argument yields the text
   // 'NULL', not a propagated NULL, so it runs before the strict short-circuit loop below
   // (string-functions.md §3).
   if (e.func === "quote_nullable") {
-    const v = yield* evalExprSteps(e.args[0]!, row, env, m);
+    const v = vals[0]!;
     const out = textValue(
       v.kind === "null" ? "NULL" : quoteLiteralText((v as { text: string }).text),
     );
     // A growth kernel: quoting doubles every quote (cost.md §8.1).
     return growthResult(m, e.args, out);
-  }
-  const vals: Value[] = [];
-  for (const a of e.args) {
-    const v = yield* evalExprSteps(a, row, env, m);
-    if (v.kind === "null") return nullValue(); // NULL propagates
-    vals.push(v);
   }
   if (e.func === "make_interval") {
     // make_interval — six integer components plus the f64 secs. years/months → months
@@ -2439,18 +2705,20 @@ function* evalScalarFuncNodeSteps(
   return decimalValue(d.roundPlaces(places));
 }
 
-function* evalArrayFuncNodeSteps(
+function evalArrayFuncNode(
   e: Of<"arrayFunc">,
   row: Row,
   env: EvalEnv,
   m: Meter,
-): Steps<Value> {
+): EvalResult<Value> {
   // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval per call;
   // arguments charge their own. NULL handling is per-kernel (the introspectors propagate, the
   // builders are non-strict), so — unlike "scalarFunc" — there is no blanket NULL short-circuit.
   m.charge(COSTS.operatorEval);
-  const vals: Value[] = [];
-  for (const a of e.args) vals.push(yield* evalExprSteps(a, row, env, m));
+  return evalCallOperands(e, e.args, row, env, m, applyArrayFunc);
+}
+
+function applyArrayFunc(e: Of<"arrayFunc">, vals: Value[], env: EvalEnv, m: Meter): Value {
   // array_to_string renders its elements in the session zone (an amplifier that charges itself,
   // cost.md §8.1).
   if (e.func === "array_to_string") return arrayToStringValue(vals, env.exec.session.timeZone, m);
@@ -2464,17 +2732,19 @@ function* evalArrayFuncNodeSteps(
   return out;
 }
 
-function* evalRangeFuncNodeSteps(
+function evalRangeFuncNode(
   e: Of<"rangeFunc">,
   row: Row,
   env: EvalEnv,
   m: Meter,
-): Steps<Value> {
+): EvalResult<Value> {
   // A polymorphic range accessor (spec/design/range-functions.md §1, RF1). One operator_eval per
   // call; arguments charge their own. STRICT (a NULL range → NULL), handled in the kernel.
   m.charge(COSTS.operatorEval);
-  const vals: Value[] = [];
-  for (const a of e.args) vals.push(yield* evalExprSteps(a, row, env, m));
+  return evalCallOperands(e, e.args, row, env, m, applyRangeFunc);
+}
+
+function applyRangeFunc(e: Of<"rangeFunc">, vals: Value[], _env: EvalEnv, _m: Meter): Value {
   return evalRangeFunc(e.func, vals);
 }
 
@@ -3845,11 +4115,13 @@ export function synchronousEvalEnv(env: EvalEnv): EvalEnv {
 }
 
 export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
-  return runSync(evalExprSteps(e, row, synchronousEvalEnv(env), m));
+  const value = evalExprMaybeSteps(e, row, synchronousEvalEnv(env), m);
+  return isPendingEval(value) ? runSync(value) : value;
 }
 
 export function evalFilter(e: RExpr, row: Row, env: EvalEnv, m: Meter): boolean {
-  return runSync(evalFilterSteps(e, row, synchronousEvalEnv(env), m));
+  const value = evalFilterMaybeSteps(e, row, synchronousEvalEnv(env), m);
+  return isPendingEval(value) ? runSync(value) : value;
 }
 
 export function passingBindings(
@@ -3868,7 +4140,16 @@ export function* evalExpressionsSteps(
   env: EvalEnv,
   m: Meter,
 ): Steps<Value[]> {
-  const values: Value[] = [];
-  for (const expr of exprs) values.push(yield* evalExprSteps(expr, row, env, m));
-  return values;
+  const values = evalExpressionsMaybeSteps(exprs, row, env, m);
+  return isPendingEval(values) ? yield* values : values;
+}
+
+export function evalExpressionsMaybeSteps(
+  exprs: readonly RExpr[],
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): EvalResult<Value[]> {
+  // Non-strict projection evaluation always returns its collected values, including NULLs.
+  return collectOperands(exprs, row, env, m, false) as EvalResult<Value[]>;
 }

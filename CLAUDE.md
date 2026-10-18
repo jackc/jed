@@ -105,8 +105,10 @@ language, because hardening the spec was never the reason to add it.
    both adapters; synchronous core APIs remain internal for conformance and tooling. Node and
    shared-memory-capable browsers poll atomic cancellation flags; all hosts also cooperate at
    logical page boundaries and common execution loops through retained continuations shared by
-   sync and async drivers. Cancellation is best effort: sorting, parsing/planning and long scalar
-   kernels stay synchronous. Node data-page reads can await I/O; storage lifecycle, commit and
+   sync and async drivers. Common resident expressions return immediate values; pending operands
+   retain continuations without replay or duplicate evaluation semantics. Cancellation is best
+   effort: sorting, parsing/planning and long scalar kernels stay synchronous. Node data-page reads
+   can await I/O; storage lifecycle, commit and
    async crypto remain separate work. No encryption suite or Rust delivery default is selected
    by this migration.
 

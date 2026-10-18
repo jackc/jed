@@ -195,14 +195,29 @@ stop at different prefixes, as with existing native cancellation.
 
 Keep scalar kernels and resident work synchronous between explicit checkpoints. Represent
 suspendable execution with retained generators that yield page I/O or a scheduling checkpoint.
-Synchronous internal APIs and the async runtime drive the same authored execution path; expression
-traversal must propagate a lazy-value page fault or subquery suspension even though its scalar
-kernels stay synchronous. Avoid a promise per row or expression and avoid maintaining duplicate
-sync/async operator implementations. Re-enter operation-local cancellation and planning scopes
-for each resume; never leave a synchronous dynamic scope installed across an await. Recursive
-query delegation uses the driver's continuation stack so the existing nesting/stack limits hold.
-The first driver serializes
-engine operations across suspension while still receiving cancellation and queueing controls.
+The immediate-expression prototype returns ordinary values for common resident expressions,
+creating continuations only when their operands suspend. One semantic dispatch and shared scalar
+kernels serve both immediate and suspended evaluation; uncommon expression forms may still use
+generators. A pending operand retains previously evaluated operands and the next evaluation index,
+including short-circuit decisions, rather than replaying an expression. Synchronous internal APIs
+and the async runtime drive the same authored execution path; expression traversal must propagate
+a lazy-value page fault or subquery suspension. Avoid a promise or generator per resident expression
+node and avoid maintaining duplicate sync/async operator implementations. Re-enter operation-local
+cancellation and planning scopes for each async resume; never leave a synchronous dynamic scope
+installed across an await. A synchronous drain retains its ambient planning scope and installs
+cancellation tracking once; its recursive-call stack is allocated only when a call effect occurs.
+Direct cursor iteration avoids redundant adapter generators without prefetching another row.
+Recursive query delegation uses the driver's continuation stack so the existing nesting/stack
+limits hold. The driver serializes engine operations across suspension while still receiving
+cancellation and queueing controls.
+
+Cancellation checks belong at logical page traversal and row/operator progress boundaries, not
+inside the immediate-expression traversal. Physical device reads and final result emission alone
+are insufficient: a cached scan can reject every row, and blocking operators, generated inputs,
+recursive queries and pending-write loops can run for a long time without either event. Retain
+sparse progress checkpoints for those cases. Actual task-yield frequency and the cost of retaining
+continuations are separate measurements; increasing the scheduling quantum does not remove
+per-expression or per-row driver overhead.
 
 Resume each operation exactly once. Never recover from a cache miss by rerunning SQL: that
 could repeat entropy, host-function effects, cost or staged writes. Do not preload the whole
@@ -282,6 +297,13 @@ measures the added scheduling machinery on the same host. Worker prepared-call m
 The worker aggregate kept the application's largest timer gap at 2.62 ms. The retained-generator
 path has measurable execution overhead; these separate warm runs do not isolate individual
 changes or establish cancellation latency for synchronous kernels.
+
+The [immediate-expression prototype](../../bench/ts/results/2026-10-18-immediate/report.md)
+compares three runs per variant with longer warmup and fixed CPU affinity. Relative to the retained
+generator implementation, the 4,096-row typed result's median execution time falls about 47% in
+the direct core and 17% through the worker. Small calls show limited changes; direct prepared
+execution is about 1 µs slower. This supports avoiding per-expression continuation machinery,
+without claiming a universal gain or complete recovery of the original synchronous throughput.
 
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
 admission errors, retained continuations and Node extension registration. Remaining decisions

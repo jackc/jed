@@ -102,43 +102,61 @@ function scoped<T>(
 }
 
 export function runSync<T>(steps: Steps<T>): T {
-  const context = {
-    cooperative: false,
-    remaining: DEFAULT_QUANTUM,
-    quantum: DEFAULT_QUANTUM,
-    planning: currentPlanningFrames(),
-  };
+  // A synchronous drain never leaves this stack, so its planning and cancellation scopes do not
+  // need reinstalling for every segment. Suppress cooperative work in a nested synchronous call,
+  // restoring the caller's scheduling context only when the whole drain returns.
+  const previous = activeContext;
+  activeContext = undefined;
+  try {
+    return drainSync(steps);
+  } finally {
+    activeContext = previous;
+  }
+}
+
+function drainSync<T>(steps: Steps<T>): T {
   const check = currentCancellationCheck();
-  let canceled = false;
-  const poll =
-    check === undefined
-      ? undefined
-      : () => {
-          const requested = check();
-          if (requested) canceled = true;
-          return requested;
-        };
-  const stack: Steps<unknown>[] = [steps];
+  if (check === undefined) return advanceSync(steps);
+  const cancellation = { delivered: false };
+  return withCancellationScope(
+    () => {
+      const requested = check();
+      if (requested) cancellation.delivered = true;
+      return requested;
+    },
+    () => advanceSync(steps, cancellation),
+  );
+}
+
+function advanceSync<T>(steps: Steps<T>, cancellation?: { delivered: boolean }): T {
+  // Most row pulls finish in their first segment. Allocate the recursive-query stack only for an
+  // actual call effect; an ordinary resident row needs neither a stack array nor scope closures.
+  let stack: Steps<unknown>[] | undefined;
+  let current: Steps<unknown> = steps;
   let input: unknown;
   let failure: unknown;
   let failed = false;
   for (;;) {
-    const current = stack[stack.length - 1]!;
     let step: IteratorResult<ExecutionEffect, unknown>;
     try {
-      step = scoped(context, canceled || failed ? undefined : poll, () =>
-        failed ? current.throw(failure) : current.next(input),
-      );
+      step =
+        failed || cancellation?.delivered
+          ? withCancellationScope(undefined, () =>
+              failed ? current.throw(failure) : current.next(input),
+            )
+          : current.next(input);
     } catch (error) {
-      stack.pop();
-      if (stack.length === 0) throw error;
+      const parent = stack?.pop();
+      if (parent === undefined) throw error;
+      current = parent;
       failure = error;
       failed = true;
       continue;
     }
     if (step.done) {
-      stack.pop();
-      if (stack.length === 0) return step.value as T;
+      const parent = stack?.pop();
+      if (parent === undefined) return step.value as T;
+      current = parent;
       input = step.value;
       failed = false;
       continue;
@@ -146,14 +164,17 @@ export function runSync<T>(steps: Steps<T>): T {
     failed = false;
     input = undefined;
     if (step.value.kind === "call") {
-      stack.push(step.value.steps);
+      if (stack === undefined) stack = [];
+      stack.push(current);
+      current = step.value.steps;
       continue;
     }
     if (step.value.kind === "cooperate") continue;
     try {
-      // A nested synchronous driver restores its caller's poll between segments. Retain the
-      // delivered-cancellation mask while cleanup performs its synchronous I/O callback too.
-      input = scoped(context, canceled ? undefined : poll, step.value.sync);
+      // A sticky cancellation must not interrupt resource cleanup a second time.
+      input = cancellation?.delivered
+        ? withCancellationScope(undefined, step.value.sync)
+        : step.value.sync();
     } catch (error) {
       failure = error;
       failed = true;
