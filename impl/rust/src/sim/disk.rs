@@ -285,6 +285,12 @@ impl SimFs {
         self.arena[id].barrier_ok
     }
 
+    /// Whether file `name`'s directory entry is durable: a power loss would keep the file a reader
+    /// of that name sees now, not revert a pending create or rename (§6.1).
+    pub(crate) fn entry_durable(&self, name: &str) -> bool {
+        self.files.get(name) == self.durable.get(name)
+    }
+
     /// Whether a meta-slot write of file `id` is still pending, not yet covered by a barrier: the
     /// disk fact the relaxed-durability oracle checks an engine's flush claim against (§8.2).
     pub(crate) fn meta_pending(&self, id: usize) -> bool {

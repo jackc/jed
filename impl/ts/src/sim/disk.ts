@@ -274,6 +274,12 @@ export class SimFS implements FileHost {
     }
   }
 
+  // entryDurable reports whether path's directory entry is durable: a power loss would keep the file a
+  // reader of that name sees now, not revert a pending create or rename (§6.1).
+  entryDurable(path: string): boolean {
+    return this.files.get(path) === this.durable.get(path);
+  }
+
   // syncDir is a fault point only when it has something to make durable: a directory barrier with no
   // pending change cannot lose anything, and counting it would shift every later barrier's number.
   syncDir(_dir: string): void {

@@ -354,8 +354,11 @@ belongs to the corpus.
   held nothing pending as the step began, and the acknowledged-commit rule only to a page client's
   commit, which keeps its own barrier. The floor otherwise moves when the engine itself holds nothing
   pending at a step's end (no pending set, no adopted generation awaiting stabilization, no failed
-  barrier): it then treats its published version as flushed, and the runner holds it to that — after
-  checking the claim against the disk. A meta-slot write still pending there is a violation of its own
+  barrier) and the file's directory entry is durable: it then treats its published version as
+  flushed, and the runner holds it to that — after checking the claim against the disk. (A process
+  that died between compaction's rename and its directory sync leaves the new file readable with
+  nothing pending; until the next opener's first commit syncs the directory (validated-cow.md §3), a
+  power loss may still bring the older file back.) A meta-slot write still pending there is a violation of its own
   ("the engine treats version V as flushed, but no barrier covered its meta"). Under the page service
   the owner's state is the one consulted, and after an owner dies a process may recover any version
   from the floor up, since the simulated process crash may drop writes of the step that acknowledged
