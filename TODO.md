@@ -419,7 +419,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   format with additive changes only. Ratify or replace the
   [compatibility.md](spec/design/compatibility.md) proposal alongside. _(size: L + decision)_
 - [x] **Batched durability and group commit** — `synchronous = off` (a create/open handle setting,
-  `format_version` 43): a relaxed commit is visible once its pages and meta are written, and one
+  `format_version` 49): a relaxed commit is visible once its pages and meta are written, and one
   flush makes a run of commits durable — fsync coalescing across every committer of the handle.
   Pending commits write the slot not holding the newest durable meta, carry cumulative manifests,
   reuse only pages the floor had free, and keep the batch off the free list, so recovery lands between
