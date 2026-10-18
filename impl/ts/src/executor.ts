@@ -8487,11 +8487,23 @@ export class Engine {
             // The owned sequence is part of the dropped column. Release an existing one during action
             // processing so later actions can reuse its name and cannot advance it through a later
             // DEFAULT.
-            if (source.kind === "original")
-              for (const key of snap.sequencesOwnedBy(original.name)) {
-                const seq = snap.sequence(key);
-                if (seq?.ownedBy?.column === source.column) snap.removeSequence(key);
+            // The views depending on such a sequence go with it under CASCADE (views.md §6.2); under
+            // RESTRICT such a view blocks the drop (2BP01).
+            if (source.kind === "original") {
+              const owned = snap
+                .sequencesOwnedBy(original.name)
+                .filter((key) => snap.sequence(key)?.ownedBy?.column === source.column);
+              const closure = this.ownedSequenceViews(
+                owned,
+                action.cascade,
+                `column ${action.name} of table ${original.name}`,
+              );
+              if (closure.size > 0) {
+                if (viewPlan !== null) forgetViews(viewPlan, closure);
+                for (const name of closure) cascadeDroppedViews.add(name);
               }
+              for (const key of owned) snap.removeSequence(key);
+            }
             for (let i = pendingSerials.length - 1; i >= 0; i--) {
               const seq = pendingSerials[i]!, owner = seq.ownedBy;
               if (owner === undefined || owner.table !== table.name)
@@ -8984,7 +8996,11 @@ export class Engine {
               }
               const slot = identitySequenceSlot(ci);
               if (slot.kind === "pending") pendingSerials.splice(slot.index, 1);
-              else scopeWriteSnap().removeSequence(slot.key);
+              else {
+                // A view depending on the sequence blocks the drop (2BP01; views.md §6.2).
+                this.ownedSequenceViews([slot.key], false, `sequence ${slot.key}`);
+                scopeWriteSnap().removeSequence(slot.key);
+              }
               table.columns[ci] = { ...col, identity: null, default: null, defaultExpr: null };
               break;
             }
@@ -16057,6 +16073,18 @@ export class Engine {
       ).hinted(DROP_CASCADE);
     }
     return this.viewDropClosureAny(users.map(([v]) => v));
+  }
+
+  // ownedSequenceViews is the view check of an ALTER TABLE action that drops the sequences a column
+  // owns — DROP COLUMN and DROP IDENTITY (views.md §6.2): a view depending on one of them blocks the
+  // action (2BP01, naming describe) unless cascade, which returns the views to drop with it.
+  private ownedSequenceViews(seqs: string[], cascade: boolean, describe: string): Set<string> {
+    if (seqs.length === 0) return new Set();
+    return this.dropDependentViews(
+      seqs.map((s): [ViewDepKind, string] => ["sequence", s]),
+      cascade,
+      () => describe,
+    );
   }
 
   // executeCreateView runs CREATE VIEW (views.md §1.1).

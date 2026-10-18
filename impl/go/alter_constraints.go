@@ -24,7 +24,7 @@ type alterColumnSource struct {
 	typeChanged bool
 }
 
-func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *catTable, oldKey string, sources *[]alterColumnSource, pending *[]*sequenceDef, st *alterConstraintState) error {
+func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *catTable, oldKey string, sources *[]alterColumnSource, pending *[]*sequenceDef, st *alterConstraintState, ownedViews func([]string) error) error {
 	ci := t.ColumnIndex(d.Name)
 	if ci < 0 {
 		if d.IfExists {
@@ -205,12 +205,20 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	// An owned sequence is part of the dropped column, so release an existing one now rather than
 	// waiting for final ordinal remapping. Later actions must see the name as free, and a later
 	// DEFAULT must not be able to advance the removed sequence and resurrect it during flush.
+	// The views depending on such a sequence are checked first (ownedViews, views.md §6.2).
 	if source := droppedSource; source.original >= 0 {
+		var owned []string
 		for _, key := range snap.sequencesOwnedBy(original.Name) {
 			seq := snap.sequence(key)
 			if seq != nil && seq.OwnedBy != nil && int(seq.OwnedBy.Column) == source.original {
-				snap.removeSequence(key)
+				owned = append(owned, key)
 			}
+		}
+		if err := ownedViews(owned); err != nil {
+			return err
+		}
+		for _, key := range owned {
+			snap.removeSequence(key)
 		}
 	}
 	kept := (*pending)[:0]

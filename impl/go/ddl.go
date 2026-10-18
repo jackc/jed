@@ -2416,7 +2416,23 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 						cascadeDroppedViews = append(cascadeDroppedViews, closure...)
 					}
 				}
-				if err := dropAlterColumn(&table, a.DropColumn, snap, original, oldKey, &columnSources, &pendingSerials, constraintState); err != nil {
+				// The sequences the column owns go with it, and so do the views depending on them under
+				// CASCADE (views.md §6.2); under RESTRICT such a view blocks the drop (2BP01).
+				ownedViews := func(owned []string) error {
+					closure, err := db.ownedSequenceViews(owned, a.DropColumn.Cascade,
+						fmt.Sprintf("column %s of table %s", a.DropColumn.Name, original.Name))
+					if err != nil {
+						return err
+					}
+					if len(closure) > 0 {
+						if viewPlan != nil {
+							viewPlan.forget(closure)
+						}
+						cascadeDroppedViews = append(cascadeDroppedViews, closure...)
+					}
+					return nil
+				}
+				if err := dropAlterColumn(&table, a.DropColumn, snap, original, oldKey, &columnSources, &pendingSerials, constraintState, ownedViews); err != nil {
 					return outcome{}, err
 				}
 				if ci >= 0 {
@@ -2649,6 +2665,10 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				if pi >= 0 {
 					pendingSerials = slices.Delete(pendingSerials, pi, pi+1)
 				} else {
+					// A view depending on the sequence blocks the drop (2BP01; views.md §6.2).
+					if _, err := db.ownedSequenceViews([]string{key}, false, "sequence "+key); err != nil {
+						return outcome{}, err
+					}
 					db.removeSequenceRouted(key)
 				}
 				table.Columns[ci].Identity = nil
